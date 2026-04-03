@@ -1,0 +1,26 @@
+# Use root/example as user/password credentials
+version: '3.1'
+
+services:
+  db:
+    image: mysql
+    # NOTE: use of "mysql_native_password" is not recommended: https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password
+    # (this is just an example, not intended to be a production configuration)
+    command: --default-authentication-plugin=mysql_native_password
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 8jdgi5anfkr2gm00rza1wvhjm2i9o4fl
+      MYSQL_DATABASE: nestjs-backend
+      MYSQL_USER: toimc
+      MYSQL_PASSWORD: mch2lvy2o9vdo32md7bbs6kd2e7ctdcy
+    volumes:
+      - /home/mysql/db:/var/lib/mysql
+    ports:
+      - 12000:3306
+
+  # navicat
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 12005:8080
