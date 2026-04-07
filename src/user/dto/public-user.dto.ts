@@ -22,6 +22,10 @@ export class PublicUserDto {
   @Expose()
   avatarUrl: string | null;
 
+  @ApiPropertyOptional({ example: 'https://example.com/frame.png' })
+  @Expose()
+  avatarFrame: string | null;
+
   @ApiPropertyOptional({ example: 'https://example.com/cover.png' })
   @Expose()
   cover: string | null;
@@ -34,6 +38,14 @@ export class PublicUserDto {
   @Expose()
   phoneNumber: string | null;
 
+  @ApiPropertyOptional({ example: 'wxid_xxx' })
+  @Expose()
+  wechat: string | null;
+
+  @ApiPropertyOptional({ example: '123456789' })
+  @Expose()
+  qq: string | null;
+
   @ApiPropertyOptional({ example: 'Coding every day' })
   @Expose()
   whatsup: string | null;
@@ -45,6 +57,10 @@ export class PublicUserDto {
   @ApiPropertyOptional({ example: 'Hey there!' })
   @Expose()
   helloWords: string | null;
+
+  @ApiPropertyOptional({ example: '2000-01-01T00:00:00.000Z' })
+  @Expose()
+  birthday: Date | null;
 
   @ApiProperty({ example: 'unset', enum: ['male', 'female', 'other', 'unset'] })
   @Expose()

@@ -1,5 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  IsDateString,
   IsEmail,
   IsEnum,
   IsOptional,
@@ -21,6 +22,11 @@ export class UpdateUserDto {
   @IsUrl()
   avatarUrl?: string;
 
+  @ApiPropertyOptional({ example: 'https://example.com/frame.png' })
+  @IsOptional()
+  @IsUrl()
+  avatarFrame?: string;
+
   @ApiPropertyOptional({ example: 'https://example.com/cover.png' })
   @IsOptional()
   @IsUrl()
@@ -36,6 +42,18 @@ export class UpdateUserDto {
   @IsString()
   @MaxLength(20)
   phoneNumber?: string;
+
+  @ApiPropertyOptional({ example: 'wxid_xxx' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  wechat?: string;
+
+  @ApiPropertyOptional({ example: '123456789' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  qq?: string;
 
   @ApiPropertyOptional({ example: 'Coding every day' })
   @IsOptional()
@@ -54,6 +72,11 @@ export class UpdateUserDto {
   @IsString()
   @MaxLength(100)
   helloWords?: string;
+
+  @ApiPropertyOptional({ example: '2000-01-01' })
+  @IsOptional()
+  @IsDateString()
+  birthday?: string;
 
   @ApiPropertyOptional({ enum: Gender, example: Gender.unset })
   @IsOptional()

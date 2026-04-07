@@ -153,12 +153,16 @@ model User {
   passwordHash String
   nickname     String
   avatarUrl    String?
+  avatarFrame  String?
   cover        String?
   email        String?
   phoneNumber  String?
+  wechat       String?
+  qq           String?
   whatsup      String?
   persona      String?
   helloWords   String?
+  birthday     DateTime?
   gender       Gender     @default(unset)
   role         UserRole   @default(USER)
   status       UserStatus @default(ACTIVE)

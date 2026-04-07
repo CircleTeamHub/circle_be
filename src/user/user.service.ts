@@ -16,12 +16,16 @@ export interface CreateUserInput {
 export interface UpdateUserInput {
   nickname?: string;
   avatarUrl?: string;
+  avatarFrame?: string;
   cover?: string;
   email?: string;
   phoneNumber?: string;
+  wechat?: string;
+  qq?: string;
   whatsup?: string;
   persona?: string;
   helloWords?: string;
+  birthday?: string;
   gender?: Gender;
 }
 
@@ -31,12 +35,16 @@ const PUBLIC_SELECT = {
   username: true,
   nickname: true,
   avatarUrl: true,
+  avatarFrame: true,
   cover: true,
   email: true,
   phoneNumber: true,
+  wechat: true,
+  qq: true,
   whatsup: true,
   persona: true,
   helloWords: true,
+  birthday: true,
   gender: true,
   role: true,
   status: true,

@@ -21,12 +21,16 @@ const ME_SELECT = {
   username: true,
   nickname: true,
   avatarUrl: true,
+  avatarFrame: true,
   cover: true,
   email: true,
   phoneNumber: true,
+  wechat: true,
+  qq: true,
   whatsup: true,
   persona: true,
   helloWords: true,
+  birthday: true,
   gender: true,
   role: true,
   status: true,
@@ -41,12 +45,16 @@ export type SafeUser = {
   username: string;
   nickname: string;
   avatarUrl: string | null;
+  avatarFrame: string | null;
   cover: string | null;
   email: string | null;
   phoneNumber: string | null;
+  wechat: string | null;
+  qq: string | null;
   whatsup: string | null;
   persona: string | null;
   helloWords: string | null;
+  birthday: Date | null;
   gender: string;
   role: string;
   status: string;
