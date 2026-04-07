@@ -7,7 +7,7 @@ import {
   Body,
   Param,
   Query,
-  UnauthorizedException,
+  ForbiddenException,
   UseGuards,
   Req,
 } from '@nestjs/common';
@@ -16,15 +16,14 @@ import {
   ApiBody,
   ApiOkResponse,
   ApiOperation,
-  ApiQuery,
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { UserService } from './user.service';
 import { GetUserDto } from './dto/get-user.dto';
-import { CreateUserPipe } from './pipes/create-user.pipe';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { UpdateUserStatusDto } from './dto/update-user-status.dto';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -38,46 +37,24 @@ import { Role } from 'src/enum/roles.enum';
 export class UserController {
   constructor(private userService: UserService) {}
 
-  @Get('/profile')
-  @ApiOperation({ summary: 'Get a user profile by id' })
-  @ApiQuery({ name: 'id', required: true, type: String })
-  @ApiOkResponse({ description: 'User profile', type: PublicUserDto })
-  getUserProfile(@Query('id') id: string): any {
-    return this.userService.findProfile(id);
-  }
-
-  @Get('/logs')
-  getUserLogs(): any {
-    return this.userService.findUserLogs('');
-  }
-
-  @Get('/logsByGroup')
-  async getLogsByGroup(): Promise<any> {
-    return this.userService.findLogsByGroup('');
-  }
-
   @Get()
   @UseGuards(AdminGuard)
-  @Serialize(PublicUserDto)
-  @ApiOperation({ summary: 'List users (admin only)' })
-  @ApiOkResponse({
-    description: 'User list',
-    type: PublicUserDto,
-    isArray: true,
-  })
+  @ApiOperation({ summary: 'List users with pagination (admin only)' })
+  @ApiOkResponse({ description: 'Paginated user list' })
   @ApiUnauthorizedResponse({
     description: 'Missing token or insufficient permissions',
   })
-  getUsers(@Query() query: GetUserDto): any {
+  getUsers(@Query() query: GetUserDto) {
     return this.userService.findAll(query);
   }
 
   @Post()
   @UseGuards(AdminGuard)
+  @Serialize(PublicUserDto)
   @ApiOperation({ summary: 'Create a user (admin only)' })
   @ApiBody({ type: CreateUserDto })
   @ApiOkResponse({ description: 'Created user', type: PublicUserDto })
-  addUser(@Body(CreateUserPipe) dto: CreateUserDto): any {
+  addUser(@Body() dto: CreateUserDto) {
     return this.userService.create({
       username: dto.username,
       password: dto.password,
@@ -86,32 +63,45 @@ export class UserController {
   }
 
   @Get('/:id')
+  @Serialize(PublicUserDto)
   @ApiOperation({ summary: 'Get a user by id' })
   @ApiOkResponse({ description: 'User details', type: PublicUserDto })
-  getUser(@Param('id') id: string): any {
+  getUser(@Param('id') id: string) {
     return this.userService.findOne(id);
   }
 
   @Patch('/:id')
-  @ApiOperation({ summary: 'Update the current user' })
+  @Serialize(PublicUserDto)
+  @ApiOperation({ summary: 'Update a user (self or admin)' })
   @ApiOkResponse({ description: 'Updated user', type: PublicUserDto })
   updateUser(
     @Body() dto: UpdateUserDto,
     @Param('id') id: string,
     @Req() req: any,
-  ): any {
-    if (id !== req.user?.userId) {
-      throw new UnauthorizedException();
+  ) {
+    if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
+      throw new ForbiddenException('You can only update your own profile');
     }
     return this.userService.update(id, dto);
   }
 
+  @Patch('/:id/status')
+  @UseGuards(AdminGuard)
+  @Serialize(PublicUserDto)
+  @ApiOperation({ summary: 'Update user status (admin only)' })
+  @ApiBody({ type: UpdateUserStatusDto })
+  @ApiOkResponse({ description: 'Updated user', type: PublicUserDto })
+  updateUserStatus(@Param('id') id: string, @Body() dto: UpdateUserStatusDto) {
+    return this.userService.updateStatus(id, dto.status);
+  }
+
   @Delete('/:id')
-  @ApiOperation({ summary: 'Delete the current user or delete as admin' })
+  @Serialize(PublicUserDto)
+  @ApiOperation({ summary: 'Delete a user (self or admin)' })
   @ApiOkResponse({ description: 'Deleted user', type: PublicUserDto })
-  removeUser(@Param('id') id: string, @Req() req: any): any {
+  removeUser(@Param('id') id: string, @Req() req: any) {
     if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
-      throw new UnauthorizedException();
+      throw new ForbiddenException('You can only delete your own account');
     }
     return this.userService.remove(id);
   }

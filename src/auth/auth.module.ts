@@ -8,6 +8,7 @@ import { ConfigEnum } from 'src/enum/config.enum';
 import { JwtStrategy } from './auth.strategy';
 import { CaslAbilityService } from './casl-ability.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { OpenimModule } from 'src/openim/openim.module';
 
 @Global()
 @Module({
@@ -21,6 +22,7 @@ import { RefreshTokenService } from './refresh-token.service';
       }),
       inject: [ConfigService],
     }),
+    OpenimModule,
   ],
   providers: [
     AuthService,

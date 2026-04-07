@@ -19,6 +19,7 @@ import { AuthTokensDto } from './dto/auth-tokens.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { PublicUserDto } from 'src/user/dto/public-user.dto';
 import { SessionContext } from './refresh-token.service';
 
@@ -122,6 +123,20 @@ export class AuthController {
   @ApiOkResponse({ description: 'All device sessions revoked' })
   logoutAll(@Req() req: any) {
     return this.authService.logoutAll(req.user.userId);
+  }
+
+  @Post('change-password')
+  @UseGuards(JwtGuard)
+  @ApiOperation({ summary: 'Change password (invalidates all sessions)' })
+  @ApiBearerAuth()
+  @ApiBody({ type: ChangePasswordDto })
+  @ApiOkResponse({ description: 'Password changed successfully' })
+  changePassword(@Body() dto: ChangePasswordDto, @Req() req: any) {
+    return this.authService.changePassword(
+      req.user.userId,
+      dto.oldPassword,
+      dto.newPassword,
+    );
   }
 
   @Get('me')

@@ -5,9 +5,10 @@ import * as dotenv from 'dotenv';
 
 import { LogsModule } from './logs/logs.module';
 import { RolesModule } from './roles/roles.module';
-import { MenusModule } from './menus/menus.module';
 import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { OpenimModule } from './openim/openim.module';
+import { UploadModule } from './upload/upload.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -25,7 +26,8 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     LogsModule,
     RolesModule,
     AuthModule,
-    MenusModule,
+    OpenimModule,
+    UploadModule,
   ],
   controllers: [],
   providers: [Logger],

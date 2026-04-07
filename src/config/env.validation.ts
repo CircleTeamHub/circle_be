@@ -38,5 +38,12 @@ export function createEnvValidationSchema(
     APP_PORT: Joi.number().default(3000),
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
+    OPENIM_API_URL: Joi.string().uri().optional(),
+    OPENIM_ADMIN_SECRET: Joi.string().optional(),
+    MINIO_ENDPOINT: Joi.string().uri().optional(),
+    MINIO_ACCESS_KEY: Joi.string().optional(),
+    MINIO_SECRET_KEY: Joi.string().optional(),
+    MINIO_BUCKET: Joi.string().optional(),
+    MINIO_PUBLIC_URL: Joi.string().uri().optional(),
   });
 }
