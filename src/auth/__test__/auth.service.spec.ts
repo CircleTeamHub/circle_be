@@ -41,6 +41,8 @@ describe('AuthService', () => {
       Promise.resolve({ token: 'new-refresh-token', userId: 'uuid-1' }),
     ),
     revoke: jest.fn(() => Promise.resolve()),
+    listActiveSessions: jest.fn(() => Promise.resolve([])),
+    revokeAll: jest.fn(() => Promise.resolve()),
   };
 
   const mockJwt = {
@@ -144,5 +146,47 @@ describe('AuthService', () => {
     await expect(
       service.login({ username: 'testuser', password: 'wrongpass' }),
     ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('login forwards session metadata when issuing tokens', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      username: 'testuser',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await service.login(
+      { username: 'testuser', password: 'password1' },
+      {
+        deviceName: 'MacBook Pro',
+        ip: '127.0.0.1',
+        userAgent: 'PostmanRuntime',
+      },
+    );
+
+    expect(mockRefreshTokenService.create).toHaveBeenCalledWith('uuid-1', {
+      deviceName: 'MacBook Pro',
+      ip: '127.0.0.1',
+      userAgent: 'PostmanRuntime',
+    });
+  });
+
+  it('returns the active sessions for a user', async () => {
+    mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([
+      { id: 'session-1' },
+    ]);
+
+    const sessions = await service.sessions('uuid-1');
+
+    expect(sessions).toEqual([{ id: 'session-1' }]);
+  });
+
+  it('revokes all sessions for a user', async () => {
+    await service.logoutAll('uuid-1');
+
+    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
   });
 });

@@ -10,7 +10,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { generateAccountId } from 'src/utils/account-id';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
-import { RefreshTokenService } from './refresh-token.service';
+import { RefreshTokenService, SessionContext } from './refresh-token.service';
 
 export type SafeUser = {
   id: string;
@@ -31,7 +31,7 @@ export class AuthService {
     private jwt: JwtService,
   ) {}
 
-  async register(dto: RegisterDto) {
+  async register(dto: RegisterDto, sessionContext?: SessionContext) {
     const existing = await this.prisma.user.findUnique({
       where: { username: dto.username },
     });
@@ -51,10 +51,10 @@ export class AuthService {
       },
     });
 
-    return this.issueTokens(user.id, user.username, user.role);
+    return this.issueTokens(user.id, user.username, user.role, sessionContext);
   }
 
-  async login(dto: LoginDto) {
+  async login(dto: LoginDto, sessionContext?: SessionContext) {
     const user = await this.prisma.user.findUnique({
       where: { username: dto.username },
     });
@@ -72,12 +72,12 @@ export class AuthService {
       throw new ForbiddenException('Invalid credentials');
     }
 
-    return this.issueTokens(user.id, user.username, user.role);
+    return this.issueTokens(user.id, user.username, user.role, sessionContext);
   }
 
-  async refresh(refreshToken: string) {
+  async refresh(refreshToken: string, sessionContext?: SessionContext) {
     const { token: newRefreshToken, userId } =
-      await this.refreshTokenService.rotate(refreshToken);
+      await this.refreshTokenService.rotate(refreshToken, sessionContext);
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
@@ -94,6 +94,14 @@ export class AuthService {
 
   async logout(refreshToken: string): Promise<void> {
     await this.refreshTokenService.revoke(refreshToken);
+  }
+
+  async sessions(userId: string) {
+    return this.refreshTokenService.listActiveSessions(userId);
+  }
+
+  async logoutAll(userId: string): Promise<void> {
+    await this.refreshTokenService.revokeAll(userId);
   }
 
   async me(userId: string): Promise<SafeUser> {
@@ -118,10 +126,15 @@ export class AuthService {
     return user;
   }
 
-  private async issueTokens(userId: string, username: string, role: string) {
+  private async issueTokens(
+    userId: string,
+    username: string,
+    role: string,
+    sessionContext?: SessionContext,
+  ) {
     const [accessToken, refreshToken] = await Promise.all([
       this.signAccessToken(userId, username, role),
-      this.refreshTokenService.create(userId),
+      this.refreshTokenService.create(userId, sessionContext),
     ]);
     return { accessToken, refreshToken };
   }
