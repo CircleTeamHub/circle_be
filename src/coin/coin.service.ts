@@ -24,7 +24,9 @@ export class CoinService {
   // ─── Wallet ───────────────────────────────────────────────────────────────────
 
   async getWallet(userId: string): Promise<WalletDto> {
-    const wallet = await this.prisma.wallet.findUnique({ where: { userID: userId } });
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userID: userId },
+    });
     if (!wallet) {
       // Auto-create wallet on first access
       return this.prisma.wallet.create({
@@ -189,12 +191,18 @@ export class CoinService {
       }
     }
 
-    this.logger.log(`Gift sent: ${senderId} → ${recipientId} (${amount} coins)`);
+    this.logger.log(
+      `Gift sent: ${senderId} → ${recipientId} (${amount} coins)`,
+    );
   }
 
   // ─── Admin: top-up ────────────────────────────────────────────────────────────
 
-  async adminTopUp(targetUserId: string, amount: number, note?: string): Promise<WalletDto> {
+  async adminTopUp(
+    targetUserId: string,
+    amount: number,
+    note?: string,
+  ): Promise<WalletDto> {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
 
     return this.prisma.$transaction(async (tx) => {

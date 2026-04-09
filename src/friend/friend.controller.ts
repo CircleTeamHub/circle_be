@@ -84,7 +84,11 @@ export class FriendController {
     @Body() dto: SetRemarkDto,
     @Req() req: any,
   ): Promise<void> {
-    return this.friendService.setRemark(req.user.userId, friendUserId, dto.remark ?? null);
+    return this.friendService.setRemark(
+      req.user.userId,
+      friendUserId,
+      dto.remark ?? null,
+    );
   }
 
   // ─── Requests ────────────────────────────────────────────────────────────────
@@ -93,7 +97,10 @@ export class FriendController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Send a friend request' })
   @ApiNoContentResponse()
-  sendRequest(@Body() dto: SendFriendRequestDto, @Req() req: any): Promise<void> {
+  sendRequest(
+    @Body() dto: SendFriendRequestDto,
+    @Req() req: any,
+  ): Promise<void> {
     return this.friendService.sendRequest(
       req.user.userId,
       dto.targetId,
@@ -125,7 +132,11 @@ export class FriendController {
     @Param('requestId', ParseUUIDPipe) requestId: string,
     @Req() req: any,
   ): Promise<void> {
-    return this.friendService.handleRequest(req.user.userId, requestId, FriendState.ACCEPTED);
+    return this.friendService.handleRequest(
+      req.user.userId,
+      requestId,
+      FriendState.ACCEPTED,
+    );
   }
 
   @Post('requests/:requestId/reject')
@@ -136,7 +147,11 @@ export class FriendController {
     @Param('requestId', ParseUUIDPipe) requestId: string,
     @Req() req: any,
   ): Promise<void> {
-    return this.friendService.handleRequest(req.user.userId, requestId, FriendState.REJECTED);
+    return this.friendService.handleRequest(
+      req.user.userId,
+      requestId,
+      FriendState.REJECTED,
+    );
   }
 
   @Delete('requests/:requestId')
@@ -160,7 +175,9 @@ export class FriendController {
   @Get('activities/unread-count')
   @ApiOperation({ summary: 'Unread friend activity count' })
   @ApiOkResponse({ type: FriendActivityUnreadCountDto })
-  getUnreadActivityCount(@Req() req: any): Promise<FriendActivityUnreadCountDto> {
+  getUnreadActivityCount(
+    @Req() req: any,
+  ): Promise<FriendActivityUnreadCountDto> {
     return this.friendService.getUnreadActivityCount(req.user.userId);
   }
 
@@ -231,7 +248,11 @@ export class FriendController {
     @Body() dto: AssignTagDto,
     @Req() req: any,
   ): Promise<void> {
-    return this.friendService.assignTag(req.user.userId, friendUserId, dto.tagId);
+    return this.friendService.assignTag(
+      req.user.userId,
+      friendUserId,
+      dto.tagId,
+    );
   }
 
   @Delete(':friendUserId/tags/:tagId')

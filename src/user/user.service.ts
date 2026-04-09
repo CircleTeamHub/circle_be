@@ -145,7 +145,8 @@ export class UserService {
     return { data, total, page, limit: take };
   }
 
-  async findByExactAccountId(accountId: string) {
+  async findByExactAccountId(accountId: string | undefined) {
+    if (!accountId) return null;
     const normalized = accountId.trim();
 
     if (!normalized) {

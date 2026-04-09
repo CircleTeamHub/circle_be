@@ -28,13 +28,13 @@ describe('UploadService', () => {
     const service = new UploadService({
       get: (key: string) =>
         (
-          {
+          ({
             MINIO_ENDPOINT: 'http://localhost:9000',
             MINIO_ACCESS_KEY: 'minioadmin',
             MINIO_SECRET_KEY: 'minioadmin123',
             MINIO_BUCKET: 'circle',
             MINIO_PUBLIC_URL: 'http://localhost:9000',
-          } as Record<string, string>
+          }) as Record<string, string>
         )[key] ?? null,
     } as any);
 
@@ -44,7 +44,9 @@ describe('UploadService', () => {
 
     expect(send).toHaveBeenCalledTimes(2);
     expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
-    expect(send.mock.calls[1][0].constructor.name).toBe('PutBucketPolicyCommand');
+    expect(send.mock.calls[1][0].constructor.name).toBe(
+      'PutBucketPolicyCommand',
+    );
     expect(send.mock.calls[1][0].input).toMatchObject({
       Bucket: 'circle',
       Policy: buildPublicReadBucketPolicy('circle'),
@@ -60,17 +62,21 @@ describe('UploadService', () => {
     const service = new UploadService({
       get: (key: string) =>
         (
-          {
+          ({
             MINIO_ENDPOINT: 'http://localhost:9000',
             MINIO_ACCESS_KEY: 'minioadmin',
             MINIO_SECRET_KEY: 'minioadmin123',
             MINIO_BUCKET: 'circle',
             MINIO_PUBLIC_URL: 'http://10.0.0.195:9000',
-          } as Record<string, string>
+          }) as Record<string, string>
         )[key] ?? null,
     } as any);
 
-    const result = await service.presign('avatar.jpeg', 'image/jpeg', 'avatars');
+    const result = await service.presign(
+      'avatar.jpeg',
+      'image/jpeg',
+      'avatars',
+    );
     const signingClient = signedUrlMock.mock.calls[0]?.[0] as {
       config: { endpoint: () => Promise<{ hostname: string }> };
     };

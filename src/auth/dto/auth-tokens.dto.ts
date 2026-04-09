@@ -9,7 +9,8 @@ export class AuthTokensDto {
 
   @ApiPropertyOptional({
     example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
-    description: 'OpenIM IM token for SDK login. Empty string if OpenIM is not configured.',
+    description:
+      'OpenIM IM token for SDK login. Empty string if OpenIM is not configured.',
   })
   imToken: string;
 }

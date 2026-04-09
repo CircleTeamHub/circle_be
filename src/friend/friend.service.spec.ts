@@ -159,7 +159,9 @@ describe('FriendService', () => {
       },
     ]);
 
-    await expect(service.getFriendSettings('user-1', 'user-2')).resolves.toEqual({
+    await expect(
+      service.getFriendSettings('user-1', 'user-2'),
+    ).resolves.toEqual({
       remark: '深圳乔酷',
       assignedTags: [
         { id: 'tag-2', ownerID: 'user-1', name: '健身', color: null },
@@ -195,13 +197,10 @@ describe('FriendService', () => {
       pendingRemarkBySender: 'met at school',
     });
 
-    await service.sendRequest(
-      'user-1',
-      'user-2',
-      'hello',
-      'met at school',
-      ['tag-1', 'tag-2'],
-    );
+    await service.sendRequest('user-1', 'user-2', 'hello', 'met at school', [
+      'tag-1',
+      'tag-2',
+    ]);
 
     expect(prisma.friend.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -225,16 +224,14 @@ describe('FriendService', () => {
       role: 'USER',
     });
     prisma.block.findFirst.mockResolvedValue(null);
-    prisma.friend.findFirst
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({
-        id: 'request-old',
-        userID: 'user-2',
-        friendID: 'user-1',
-        state: FriendState.REJECTED,
-        message: 'old',
-        pendingRemarkBySender: 'old note',
-      });
+    prisma.friend.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: 'request-old',
+      userID: 'user-2',
+      friendID: 'user-1',
+      state: FriendState.REJECTED,
+      message: 'old',
+      pendingRemarkBySender: 'old note',
+    });
     prisma.friend.count.mockResolvedValue(0);
     prisma.friendTag.findMany.mockResolvedValue([{ id: 'tag-3' }]);
     prisma.friend.create.mockResolvedValue({
@@ -246,13 +243,7 @@ describe('FriendService', () => {
       pendingRemarkBySender: 'new note',
     });
 
-    await service.sendRequest(
-      'user-1',
-      'user-2',
-      'new',
-      'new note',
-      ['tag-3'],
-    );
+    await service.sendRequest('user-1', 'user-2', 'new', 'new note', ['tag-3']);
 
     expect(prisma.friend.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
@@ -287,14 +278,12 @@ describe('FriendService', () => {
       role: 'USER',
     });
     prisma.block.findFirst.mockResolvedValue(null);
-    prisma.friend.findFirst
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({
-        id: 'request-active',
-        userID: 'user-1',
-        friendID: 'user-2',
-        state: FriendState.PENDING,
-      });
+    prisma.friend.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: 'request-active',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+    });
     prisma.friend.count.mockResolvedValue(0);
     prisma.friendTag.findMany.mockResolvedValue([]);
     prisma.friend.create.mockRejectedValueOnce({
@@ -316,14 +305,12 @@ describe('FriendService', () => {
       role: 'USER',
     });
     prisma.block.findFirst.mockResolvedValue(null);
-    prisma.friend.findFirst
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({
-        id: 'request-active',
-        userID: 'user-1',
-        friendID: 'user-2',
-        state: FriendState.ACCEPTED,
-      });
+    prisma.friend.findFirst.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: 'request-active',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
     prisma.friend.count.mockResolvedValue(0);
     prisma.friendTag.findMany.mockResolvedValue([]);
     prisma.friend.create.mockRejectedValueOnce({
@@ -397,9 +384,9 @@ describe('FriendService', () => {
       operations(tx as any),
     );
 
-    await expect(service.sendRequest('user-1', 'user-2', 'hello')).rejects.toThrow(
-      'activity failed',
-    );
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello'),
+    ).rejects.toThrow('activity failed');
 
     expect(tx.friend.create).toHaveBeenCalled();
     expect(tx.friendActivity.createMany).toHaveBeenCalled();
@@ -451,13 +438,10 @@ describe('FriendService', () => {
     prisma.friendTag.findMany.mockResolvedValue([{ id: 'tag-1' }]);
 
     await expect(
-      service.sendRequest(
-        'user-1',
-        'user-2',
-        'hello',
-        'met at school',
-        ['tag-1', 'tag-2'],
-      ),
+      service.sendRequest('user-1', 'user-2', 'hello', 'met at school', [
+        'tag-1',
+        'tag-2',
+      ]),
     ).rejects.toThrow(NotFoundException);
 
     expect(prisma.friend.create).not.toHaveBeenCalled();
@@ -646,9 +630,11 @@ describe('FriendService', () => {
         findMany: jest.fn().mockResolvedValue([{ id: 'tag-1' }]),
       },
       pendingFriendTagOnRequest: {
-        findMany: jest.fn().mockResolvedValue([
-          { ownerID: 'user-1', requestID: 'request-1', tagID: 'tag-1' },
-        ]),
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            { ownerID: 'user-1', requestID: 'request-1', tagID: 'tag-1' },
+          ]),
       },
       friendTagOnFriend: {
         createMany: jest.fn(),

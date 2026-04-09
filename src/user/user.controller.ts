@@ -50,7 +50,9 @@ export class UserController {
 
   @Get('search/account')
   @Serialize(PublicUserDto)
-  @ApiOperation({ summary: 'Search a user by exact accountId for friend adding' })
+  @ApiOperation({
+    summary: 'Search a user by exact accountId for friend adding',
+  })
   @ApiOkResponse({ description: 'Matched user or null', type: PublicUserDto })
   searchUserByAccountId(@Query('accountId') accountId: string) {
     return this.userService.findByExactAccountId(accountId);

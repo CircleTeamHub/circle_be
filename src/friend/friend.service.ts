@@ -402,7 +402,8 @@ export class FriendService {
     ]);
 
     return {
-      remark: friendship.userID === userId ? friendship.remarkA : friendship.remarkB,
+      remark:
+        friendship.userID === userId ? friendship.remarkA : friendship.remarkB,
       assignedTags: assignedLinks.map((link) => link.tag),
       availableTags,
     };
@@ -480,7 +481,10 @@ export class FriendService {
     return { count };
   }
 
-  async getActivity(userId: string, activityId: string): Promise<FriendActivityDto> {
+  async getActivity(
+    userId: string,
+    activityId: string,
+  ): Promise<FriendActivityDto> {
     const activity = await this.prisma.friendActivity.findFirst({
       where: { id: activityId, viewerId: userId },
       include: FRIEND_ACTIVITY_INCLUDE,
@@ -862,7 +866,9 @@ export class FriendService {
       return;
     }
 
-    const pendingTagIds = pendingLinks.map((link: { tagID: string }) => link.tagID);
+    const pendingTagIds = pendingLinks.map(
+      (link: { tagID: string }) => link.tagID,
+    );
     const existingTags = await tx.friendTag.findMany({
       where: {
         ownerID: request.userID,
@@ -913,7 +919,9 @@ export class FriendService {
     });
 
     const existingKeys = new Set(
-      existingActivities.map((activity) => `${activity.requestId}:${activity.type}`),
+      existingActivities.map(
+        (activity) => `${activity.requestId}:${activity.type}`,
+      ),
     );
     const missingActivities: Array<{
       requestId: string;
@@ -1022,7 +1030,10 @@ export class FriendService {
       };
     }
 
-    if (request.state === FriendState.WITHDRAWN && request.friendID === userId) {
+    if (
+      request.state === FriendState.WITHDRAWN &&
+      request.friendID === userId
+    ) {
       return {
         actorId: request.userID,
         counterpartyId: request.userID,

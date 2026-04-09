@@ -52,7 +52,9 @@ describe('UserService', () => {
       updatedAt: new Date(),
     });
 
-    await expect(service.findByExactAccountId(' jimmy ')).resolves.toMatchObject({
+    await expect(
+      service.findByExactAccountId(' jimmy '),
+    ).resolves.toMatchObject({
       id: 'user-1',
       accountId: 'jimmy',
     });
