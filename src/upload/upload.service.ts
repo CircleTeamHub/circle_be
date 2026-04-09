@@ -40,6 +40,7 @@ export function buildPublicReadBucketPolicy(bucket: string) {
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
   private readonly client: S3Client;
+  private readonly publicClient: S3Client;
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly enabled: boolean;
@@ -58,6 +59,13 @@ export class UploadService implements OnModuleInit {
       region: 'us-east-1', // MinIO 需要填但值随意
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle: true, // MinIO 必须开启
+    });
+
+    this.publicClient = new S3Client({
+      endpoint: this.publicUrl,
+      region: 'us-east-1',
+      credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
+      forcePathStyle: true,
     });
   }
 
@@ -98,7 +106,9 @@ export class UploadService implements OnModuleInit {
       ContentType: contentType,
     });
 
-    const uploadUrl = await getSignedUrl(this.client, command, { expiresIn });
+    const uploadUrl = await getSignedUrl(this.publicClient, command, {
+      expiresIn,
+    });
 
     // 把 uploadUrl 里的内网地址替换为公开访问地址
     const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;

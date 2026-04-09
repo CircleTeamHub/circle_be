@@ -9,6 +9,8 @@ import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
+import { FriendModule } from './friend/friend.module';
+import { CoinModule } from './coin/coin.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -28,6 +30,8 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     AuthModule,
     OpenimModule,
     UploadModule,
+    FriendModule,
+    CoinModule,
   ],
   controllers: [],
   providers: [Logger],

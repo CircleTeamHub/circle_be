@@ -25,6 +25,24 @@ const refreshLimiter = rateLimit({
   legacyHeaders: false,
 } satisfies Partial<RateLimitOptions>);
 
+/** Friend request spam protection: 30 attempts / 15 min per IP. */
+const friendRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many friend requests, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
+/** Coin gift abuse protection: 20 attempts / 15 min per IP. */
+const coinGiftLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many gift attempts, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
 export const setupApp = (app: INestApplication) => {
   const config = getServerConfig();
 
@@ -72,4 +90,6 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/auth/register', authLimiter);
   app.use('/api/v1/auth/change-password', authLimiter);
   app.use('/api/v1/auth/refresh', refreshLimiter);
+  app.use('/api/v1/friend/requests', friendRequestLimiter);
+  app.use('/api/v1/coin/gift', coinGiftLimiter);
 };

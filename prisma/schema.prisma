@@ -17,6 +17,7 @@ enum UserStatus {
 
 enum UserRole {
   ADMIN
+  MEMBER
   USER
 }
 
@@ -174,6 +175,8 @@ model User {
   activities            Activity[]
   friendsAsUser         Friend[]              @relation("userFriends")
   friendsAsFriend       Friend[]              @relation("userFriendsTo")
+  blocksIssued          Block[]               @relation("blocker")
+  blocksReceived        Block[]               @relation("blocked")
   squads                Squad[]
   squadMembers          SquadMember[]
   squadRequests         SquadRequest[]        @relation("fromUser")
@@ -194,6 +197,12 @@ model User {
   recommendFeedbacks    RecommendationFeedback[]
   blockedContents       UserBlockedContent[]
   tags                  TagOnUser[]
+  wallet                Wallet?
+  coinTransactions      CoinTransaction[]
+  coinGiftsSent         CoinGift[]            @relation("giftSender")
+  coinGiftsReceived     CoinGift[]            @relation("giftRecipient")
+  friendTags            FriendTag[]
+  friendTagAssignments  FriendTagOnFriend[]   @relation("tagOwner")
 }
 
 model RefreshToken {
@@ -219,14 +228,62 @@ model Friend {
   userID    String
   friendID  String
   state     FriendState @default(PENDING)
+  message   String?
+  /// userID's private remark for friendID
+  remarkA   String?
+  /// friendID's private remark for userID
+  remarkB   String?
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
   user      User        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
   friend    User        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
+  tagLinks  FriendTagOnFriend[]
 
   @@unique([userID, friendID])
   @@index([userID])
   @@index([friendID])
+}
+
+// Friend tags — user-defined labels like "高中同学", "同事"
+model FriendTag {
+  id        String              @id @default(uuid())
+  ownerID   String
+  name      String
+  color     String?
+  createdAt DateTime            @default(now())
+  owner     User                @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  friends   FriendTagOnFriend[]
+
+  @@unique([ownerID, name])
+  @@index([ownerID])
+}
+
+// Junction: which tags an owner has applied to which friendship
+model FriendTagOnFriend {
+  id        String    @id @default(uuid())
+  ownerID   String
+  tagID     String
+  friendID  String    // the Friend record id
+  createdAt DateTime  @default(now())
+  owner     User      @relation("tagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
+  friendship Friend   @relation(fields: [friendID], references: [id], onDelete: Cascade)
+
+  @@unique([ownerID, tagID, friendID])
+  @@index([ownerID, friendID])
+}
+
+model Block {
+  id          String   @id @default(uuid())
+  blockerID   String
+  blockedID   String
+  createdAt   DateTime @default(now())
+  blocker     User     @relation("blocker", fields: [blockerID], references: [id], onDelete: Cascade)
+  blocked     User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
+
+  @@unique([blockerID, blockedID])
+  @@index([blockerID])
+  @@index([blockedID])
 }
 
 model Activity {
@@ -473,6 +530,52 @@ model TagOnSquad {
   squad   Squad  @relation(fields: [squadID], references: [id], onDelete: Cascade)
 
   @@index([squadID, order])
+}
+
+// ─── Coin / Wallet ────────────────────────────────────────────────────────────
+
+enum CoinTxType {
+  RECHARGE      // top-up by admin / payment
+  GIFT_SENT     // deducted when sending a gift
+  GIFT_RECEIVED // credited when receiving a gift
+  REFUND        // admin refund
+  ADJUSTMENT    // manual admin correction
+}
+
+model Wallet {
+  id        String   @id @default(uuid())
+  userID    String   @unique
+  balance   Int      @default(0)   // stored in smallest unit (1 coin = 1)
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+}
+
+model CoinTransaction {
+  id        String     @id @default(uuid())
+  userID    String
+  type      CoinTxType
+  amount    Int                        // positive = credit, negative = debit
+  balance   Int                        // balance after this tx
+  note      String?
+  relatedID String?                    // e.g. CoinGift.id for gift txs
+  createdAt DateTime   @default(now())
+  user      User       @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID, createdAt])
+}
+
+model CoinGift {
+  id          String   @id @default(uuid())
+  senderID    String
+  recipientID String
+  amount      Int
+  message     String?
+  createdAt   DateTime @default(now())
+  sender      User     @relation("giftSender",    fields: [senderID],    references: [id], onDelete: Cascade)
+  recipient   User     @relation("giftRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
+
+  @@index([senderID])
+  @@index([recipientID])
 }
 
 // ─── Notification ─────────────────────────────────────────────────────────────
