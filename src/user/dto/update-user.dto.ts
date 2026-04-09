@@ -10,6 +10,11 @@ import {
 } from 'class-validator';
 import { Gender } from 'src/generated/prisma';
 
+const URL_VALIDATION_OPTIONS = {
+  require_protocol: true,
+  require_tld: false,
+} as const;
+
 export class UpdateUserDto {
   @ApiPropertyOptional({ example: 'My Nickname' })
   @IsOptional()
@@ -19,17 +24,17 @@ export class UpdateUserDto {
 
   @ApiPropertyOptional({ example: 'https://example.com/avatar.png' })
   @IsOptional()
-  @IsUrl()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   avatarUrl?: string;
 
   @ApiPropertyOptional({ example: 'https://example.com/frame.png' })
   @IsOptional()
-  @IsUrl()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   avatarFrame?: string;
 
   @ApiPropertyOptional({ example: 'https://example.com/cover.png' })
   @IsOptional()
-  @IsUrl()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   cover?: string;
 
   @ApiPropertyOptional({ example: 'user@example.com' })

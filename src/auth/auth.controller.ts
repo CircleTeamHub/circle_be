@@ -20,7 +20,8 @@ import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
-import { PublicUserDto } from 'src/user/dto/public-user.dto';
+import { SelfUserDto } from 'src/user/dto/public-user.dto';
+import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
 
 function getHeaderValue(value: string | string[] | undefined): string | null {
@@ -141,9 +142,10 @@ export class AuthController {
 
   @Get('me')
   @UseGuards(JwtGuard)
+  @Serialize(SelfUserDto)
   @ApiOperation({ summary: 'Get current user profile' })
   @ApiBearerAuth()
-  @ApiOkResponse({ description: 'Current user profile', type: PublicUserDto })
+  @ApiOkResponse({ description: 'Current user profile', type: SelfUserDto })
   @ApiUnauthorizedResponse({ description: 'Missing or invalid bearer token' })
   me(@Req() req: any) {
     return this.authService.me(req.user.userId);

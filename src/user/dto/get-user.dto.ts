@@ -18,10 +18,10 @@ export class GetUserDto {
   limit?: number;
 
   @ApiPropertyOptional({
-    example: 'testuser',
-    description: 'Filter by username',
+    example: 'jimmyddddd',
+    description: 'Filter by accountId',
   })
   @IsOptional()
   @IsString()
-  username?: string;
+  accountId?: string;
 }

@@ -9,7 +9,6 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { generateAccountId } from 'src/utils/account-id';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshTokenService, SessionContext } from './refresh-token.service';
@@ -18,7 +17,6 @@ import { OpenimService } from 'src/openim/openim.service';
 const ME_SELECT = {
   id: true,
   accountId: true,
-  username: true,
   nickname: true,
   avatarUrl: true,
   avatarFrame: true,
@@ -42,7 +40,6 @@ const ME_SELECT = {
 export type SafeUser = {
   id: string;
   accountId: string;
-  username: string;
   nickname: string;
   avatarUrl: string | null;
   avatarFrame: string | null;
@@ -76,39 +73,46 @@ export class AuthService {
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
     const existing = await this.prisma.user.findUnique({
-      where: { username: dto.username },
+      where: { accountId: dto.accountId },
     });
     if (existing) {
-      throw new ConflictException('Username already taken');
+      throw new ConflictException('Account ID already taken');
     }
 
     const passwordHash = await argon2.hash(dto.password);
-    const accountId = generateAccountId();
 
     const user = await this.prisma.user.create({
       data: {
-        accountId,
-        username: dto.username,
+        accountId: dto.accountId,
         passwordHash,
-        nickname: dto.nickname || dto.username,
+        nickname: dto.nickname || dto.accountId,
         email: dto.email,
         phoneNumber: dto.phoneNumber,
       },
     });
 
-    // Sync user to OpenIM (non-blocking — failure should not break registration)
+    // Sync to OpenIM non-blocking. Mark openimSynced=true on success so
+    // login() can detect and retry if this first attempt failed.
     this.openim
       .registerUser(user.id, user.nickname, user.avatarUrl)
+      .then(() =>
+        this.prisma.user.update({
+          where: { id: user.id },
+          data: { openimSynced: true },
+        }),
+      )
       .catch((err) =>
-        this.logger.warn(`OpenIM registerUser failed: ${err?.message}`),
+        this.logger.warn(
+          `OpenIM registerUser failed for ${user.id}: ${err?.message}. Will retry on next login.`,
+        ),
       );
 
-    return this.issueTokens(user.id, user.username, user.role, sessionContext);
+    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
     const user = await this.prisma.user.findUnique({
-      where: { username: dto.username },
+      where: { accountId: dto.accountId },
     });
 
     if (!user) {
@@ -124,7 +128,25 @@ export class AuthService {
       throw new ForbiddenException('Invalid credentials');
     }
 
-    return this.issueTokens(user.id, user.username, user.role, sessionContext);
+    // Retry OpenIM registration for users that weren't synced at register time
+    // (e.g. OpenIM was down). Non-blocking — login succeeds regardless.
+    if (!user.openimSynced) {
+      this.openim
+        .registerUser(user.id, user.nickname, user.avatarUrl)
+        .then(() =>
+          this.prisma.user.update({
+            where: { id: user.id },
+            data: { openimSynced: true },
+          }),
+        )
+        .catch((err) =>
+          this.logger.warn(
+            `OpenIM re-sync failed for ${user.id}: ${err?.message}`,
+          ),
+        );
+    }
+
+    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -138,7 +160,7 @@ export class AuthService {
 
     const accessToken = await this.signAccessToken(
       user.id,
-      user.username,
+      user.accountId,
       user.role,
     );
     return { accessToken, refreshToken: newRefreshToken };
@@ -196,12 +218,12 @@ export class AuthService {
 
   private async issueTokens(
     userId: string,
-    username: string,
+    accountId: string,
     role: string,
     sessionContext?: SessionContext,
   ) {
     const [accessToken, refreshToken, imToken] = await Promise.all([
-      this.signAccessToken(userId, username, role),
+      this.signAccessToken(userId, accountId, role),
       this.refreshTokenService.create(userId, sessionContext),
       this.openim.getUserToken(userId).catch((err) => {
         this.logger.warn(`OpenIM getUserToken failed: ${err?.message}`);
@@ -213,9 +235,9 @@ export class AuthService {
 
   private signAccessToken(
     userId: string,
-    username: string,
+    accountId: string,
     role: string,
   ): Promise<string> {
-    return this.jwt.signAsync({ sub: userId, username, role });
+    return this.jwt.signAsync({ sub: userId, accountId, role });
   }
 }

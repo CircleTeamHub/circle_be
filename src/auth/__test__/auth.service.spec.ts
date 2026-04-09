@@ -17,7 +17,7 @@ describe('AuthService', () => {
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(
           users.find(
-            (u) => u.username === where.username || u.id === where.id,
+            (u) => u.accountId === where.accountId || u.id === where.id,
           ) ?? null,
         ),
       ),
@@ -88,7 +88,7 @@ describe('AuthService', () => {
 
   it('register creates user and returns tokens', async () => {
     const result = await service.register({
-      username: 'testuser',
+      accountId: 'testuser',
       password: 'password1',
       nickname: 'Test User',
     });
@@ -98,13 +98,13 @@ describe('AuthService', () => {
 
   it('register throws ConflictException if username taken', async () => {
     await service.register({
-      username: 'testuser',
+      accountId: 'testuser',
       password: 'password1',
       nickname: 'Test',
     });
     await expect(
       service.register({
-        username: 'testuser',
+        accountId: 'testuser',
         password: 'password1',
         nickname: 'Test',
       }),
@@ -115,13 +115,13 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      username: 'testuser',
+      accountId: 'testuser',
       passwordHash,
       status: 'ACTIVE',
     });
 
     const result = await service.login({
-      username: 'testuser',
+      accountId: 'testuser',
       password: 'password1',
     });
     expect(result.accessToken).toBe('access-token');
@@ -130,7 +130,7 @@ describe('AuthService', () => {
 
   it('login throws ForbiddenException for unknown user', async () => {
     await expect(
-      service.login({ username: 'noone', password: 'password1' }),
+      service.login({ accountId: 'noone', password: 'password1' }),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -138,13 +138,13 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      username: 'testuser',
+      accountId: 'testuser',
       passwordHash,
       status: 'ACTIVE',
     });
 
     await expect(
-      service.login({ username: 'testuser', password: 'wrongpass' }),
+      service.login({ accountId: 'testuser', password: 'wrongpass' }),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -152,14 +152,14 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      username: 'testuser',
+      accountId: 'testuser',
       passwordHash,
       status: 'ACTIVE',
       role: 'USER',
     });
 
     await service.login(
-      { username: 'testuser', password: 'password1' },
+      { accountId: 'testuser', password: 'password1' },
       {
         deviceName: 'MacBook Pro',
         ip: '127.0.0.1',

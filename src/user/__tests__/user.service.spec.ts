@@ -26,8 +26,7 @@ describe('UserService', () => {
   it('deletes a user without selecting the password hash', async () => {
     prisma.user.delete.mockResolvedValue({
       id: 'user-1',
-      accountId: 'ACC_TEST1',
-      username: 'tester',
+      accountId: 'tester',
       nickname: 'Tester',
       avatarUrl: null,
       status: 'ACTIVE',
@@ -41,7 +40,6 @@ describe('UserService', () => {
       select: {
         id: true,
         accountId: true,
-        username: true,
         nickname: true,
         avatarUrl: true,
         status: true,

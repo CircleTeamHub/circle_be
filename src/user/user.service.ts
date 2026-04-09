@@ -1,12 +1,22 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import * as argon2 from 'argon2';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { generateAccountId } from 'src/utils/account-id';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 
+const URL_FIELDS: (keyof UpdateUserInput)[] = [
+  'avatarUrl',
+  'avatarFrame',
+  'cover',
+];
+
 export interface CreateUserInput {
-  username: string;
+  accountId: string;
   password: string;
   nickname?: string;
   email?: string;
@@ -25,14 +35,13 @@ export interface UpdateUserInput {
   whatsup?: string;
   persona?: string;
   helloWords?: string;
-  birthday?: string;
+  birthday?: string | null;
   gender?: Gender;
 }
 
 const PUBLIC_SELECT = {
   id: true,
   accountId: true,
-  username: true,
   nickname: true,
   avatarUrl: true,
   avatarFrame: true,
@@ -53,15 +62,78 @@ const PUBLIC_SELECT = {
   updatedAt: true,
 } as const;
 
+function normalizeBirthdayInput(value: string | null | undefined) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === null) {
+    return null;
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return null;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return new Date(`${normalized}T00:00:00.000Z`);
+  }
+
+  return new Date(normalized);
+}
+
+function normalizeUpdateInput(input: UpdateUserInput) {
+  if (!('birthday' in input)) {
+    return input;
+  }
+
+  return {
+    ...input,
+    birthday: normalizeBirthdayInput(input.birthday),
+  };
+}
+
 @Injectable()
 export class UserService {
-  constructor(private prisma: PrismaService) {}
+  private readonly minioPublicUrl: string | null;
+
+  constructor(
+    private prisma: PrismaService,
+    private config: ConfigService,
+  ) {
+    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  /**
+   * Rejects URL fields that don't originate from our own storage.
+   * Prevents SSRF-capable URLs (cloud metadata, localhost, javascript:, data:)
+   * being stored and later rendered by clients.
+   *
+   * When MinIO is not configured we skip the check — upload is disabled anyway.
+   */
+  private assertUrlsAreSafe(input: UpdateUserInput): void {
+    if (!this.minioPublicUrl) return;
+
+    const prefix = this.minioPublicUrl.replace(/\/$/, '');
+    for (const field of URL_FIELDS) {
+      const value = input[field as keyof UpdateUserInput];
+      if (typeof value === 'string' && !value.startsWith(prefix)) {
+        throw new BadRequestException(
+          `${field} must be a URL served from this application's storage`,
+        );
+      }
+    }
+  }
 
   async findAll(query: GetUserDto) {
-    const { limit = 10, page = 1, username } = query;
+    const { limit = 10, page = 1, accountId } = query;
     const take = limit;
     const skip = (page - 1) * take;
-    const where = username ? { username: { contains: username } } : undefined;
+    const where = accountId
+      ? { accountId: { contains: accountId } }
+      : undefined;
 
     const [data, total] = await Promise.all([
       this.prisma.user.findMany({ where, select: PUBLIC_SELECT, take, skip }),
@@ -82,14 +154,12 @@ export class UserService {
 
   async create(input: CreateUserInput) {
     const passwordHash = await argon2.hash(input.password);
-    const accountId = generateAccountId();
 
     return this.prisma.user.create({
       data: {
-        accountId,
-        username: input.username,
+        accountId: input.accountId,
         passwordHash,
-        nickname: input.nickname || input.username,
+        nickname: input.nickname || input.accountId,
         email: input.email,
         phoneNumber: input.phoneNumber,
       },
@@ -98,10 +168,11 @@ export class UserService {
   }
 
   async update(id: string, input: UpdateUserInput) {
+    this.assertUrlsAreSafe(input);
     await this.findOne(id);
     return this.prisma.user.update({
       where: { id },
-      data: input,
+      data: normalizeUpdateInput(input),
       select: PUBLIC_SELECT,
     });
   }

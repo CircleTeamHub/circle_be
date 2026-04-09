@@ -5,7 +5,7 @@ import { RegisterDto } from './register.dto';
 describe('RegisterDto', () => {
   it('allows nickname to be omitted', async () => {
     const dto = new RegisterDto();
-    dto.username = 'testuser';
+    dto.accountId = 'testuser';
     dto.password = 'password123';
 
     const errors = await validate(dto);

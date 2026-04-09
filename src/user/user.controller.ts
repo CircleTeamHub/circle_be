@@ -27,7 +27,7 @@ import { UpdateUserStatusDto } from './dto/update-user-status.dto';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
-import { PublicUserDto } from './dto/public-user.dto';
+import { PublicUserDto, SelfUserDto } from './dto/public-user.dto';
 import { Role } from 'src/enum/roles.enum';
 
 @Controller('user')
@@ -56,7 +56,7 @@ export class UserController {
   @ApiOkResponse({ description: 'Created user', type: PublicUserDto })
   addUser(@Body() dto: CreateUserDto) {
     return this.userService.create({
-      username: dto.username,
+      accountId: dto.accountId,
       password: dto.password,
       nickname: dto.nickname,
     });
@@ -71,9 +71,9 @@ export class UserController {
   }
 
   @Patch('/:id')
-  @Serialize(PublicUserDto)
+  @Serialize(SelfUserDto)
   @ApiOperation({ summary: 'Update a user (self or admin)' })
-  @ApiOkResponse({ description: 'Updated user', type: PublicUserDto })
+  @ApiOkResponse({ description: 'Updated user', type: SelfUserDto })
   updateUser(
     @Body() dto: UpdateUserDto,
     @Param('id') id: string,

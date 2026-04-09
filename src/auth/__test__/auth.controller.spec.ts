@@ -35,13 +35,25 @@ describe('AuthController', () => {
     me: (_userId: string) =>
       Promise.resolve({
         id: 'uuid-1',
-        accountId: 'ACC_ABC123',
-        username: 'testuser',
+        accountId: 'testuser',
         nickname: 'Test User',
         avatarUrl: null,
+        avatarFrame: null,
+        cover: null,
+        email: null,
+        phoneNumber: null,
+        wechat: null,
+        qq: null,
+        whatsup: null,
+        persona: null,
+        helloWords: null,
+        birthday: null,
+        gender: 'unset',
         role: 'USER',
         status: 'ACTIVE',
+        lastOnline: null,
         createdAt: new Date(),
+        updatedAt: new Date(),
       }),
   };
 
@@ -60,7 +72,7 @@ describe('AuthController', () => {
 
   it('register returns tokens', async () => {
     const dto: RegisterDto = {
-      username: 'testuser',
+      accountId: 'testuser',
       password: 'password1',
       nickname: 'Test User',
     };
@@ -69,7 +81,7 @@ describe('AuthController', () => {
   });
 
   it('login returns tokens', async () => {
-    const dto: LoginDto = { username: 'testuser', password: 'password1' };
+    const dto: LoginDto = { accountId: 'testuser', password: 'password1' };
     const result = await controller.login(dto);
     expect(result).toEqual(mockTokenPayload);
   });

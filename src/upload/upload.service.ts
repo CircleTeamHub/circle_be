@@ -1,10 +1,16 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleInit,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   S3Client,
   PutObjectCommand,
   CreateBucketCommand,
   HeadBucketCommand,
+  PutBucketPolicyCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
@@ -13,6 +19,21 @@ export interface PresignResult {
   uploadUrl: string;
   fileUrl: string;
   key: string;
+}
+
+export function buildPublicReadBucketPolicy(bucket: string) {
+  return JSON.stringify({
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Sid: 'PublicReadGetObject',
+        Effect: 'Allow',
+        Principal: '*',
+        Action: ['s3:GetObject'],
+        Resource: [`arn:aws:s3:::${bucket}/*`],
+      },
+    ],
+  });
 }
 
 @Injectable()
@@ -48,6 +69,7 @@ export class UploadService implements OnModuleInit {
       return;
     }
     await this.ensureBucketExists();
+    await this.ensureBucketIsPublicReadable();
   }
 
   /**
@@ -63,6 +85,10 @@ export class UploadService implements OnModuleInit {
     folder = 'uploads',
     expiresIn = contentType.startsWith('video/') ? 1800 : 300,
   ): Promise<PresignResult> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
     const ext = filename.split('.').pop() ?? 'bin';
     const key = `${folder}/${randomUUID()}.${ext}`;
 
@@ -88,5 +114,14 @@ export class UploadService implements OnModuleInit {
       await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
       this.logger.log(`Bucket "${this.bucket}" created.`);
     }
+  }
+
+  private async ensureBucketIsPublicReadable() {
+    await this.client.send(
+      new PutBucketPolicyCommand({
+        Bucket: this.bucket,
+        Policy: buildPublicReadBucketPolicy(this.bucket),
+      }),
+    );
   }
 }

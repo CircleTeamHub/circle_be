@@ -47,25 +47,7 @@ Authorization: Bearer <accessToken>
 
 ---
 
-## Auth 接口
-
-### 注册
-
-```
-POST /auth/register
-```
-
-**Request Headers（可选）：**
-```
-x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
-```
-
-**Request Body：**
-```json
-{
-  "username": "testuser",        // 必填，4-20位
-  "password": "password123",     // 必填，6-64位
-  "nickname": "Test User",       // 可选，1-30位，默认同username
+nickname": "Test User",       // 可选，1-30位，默认同username
   "email": "user@example.com",   // 可选
   "phoneNumber": "+8613800138000" // 可选
 }
@@ -211,7 +193,25 @@ Authorization: Bearer <accessToken>
 ```
 
 **Response 200：** `{}`
+## Auth 接口
 
+### 注册
+
+```
+POST /auth/register
+```
+
+**Request Headers（可选）：**
+```
+x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
+```
+
+**Request Body：**
+```json
+{
+  "username": "testuser",        // 必填，4-20位
+  "password": "password123",     // 必填，6-64位
+  "
 ---
 
 ## User 接口

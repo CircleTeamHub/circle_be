@@ -1,12 +1,13 @@
 import { Expose } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
+/** Safe public profile — no PII. Used for GET /user/:id viewed by other users. */
 export class PublicUserDto {
   @ApiProperty({ example: '7f6dcb5e-0d94-463c-b6b3-165b1aa77845' })
   @Expose()
   id: string;
 
-  @ApiProperty({ example: 'ACC_ABC123' })
+  @ApiProperty({ example: 'jimmyddddd' })
   @Expose()
   accountId: string;
 
@@ -29,14 +30,6 @@ export class PublicUserDto {
   @ApiPropertyOptional({ example: 'https://example.com/cover.png' })
   @Expose()
   cover: string | null;
-
-  @ApiPropertyOptional({ example: 'user@example.com' })
-  @Expose()
-  email: string | null;
-
-  @ApiPropertyOptional({ example: '+8613800138000' })
-  @Expose()
-  phoneNumber: string | null;
 
   @ApiPropertyOptional({ example: 'wxid_xxx' })
   @Expose()
@@ -85,4 +78,18 @@ export class PublicUserDto {
   @ApiProperty({ example: '2026-04-02T00:00:00.000Z' })
   @Expose()
   updatedAt: Date;
+}
+
+/**
+ * Full self-view — includes PII (email, phoneNumber).
+ * Used for GET /auth/me and profile update responses seen by the owner.
+ */
+export class SelfUserDto extends PublicUserDto {
+  @ApiPropertyOptional({ example: 'user@example.com' })
+  @Expose()
+  email: string | null;
+
+  @ApiPropertyOptional({ example: '+8613800138000' })
+  @Expose()
+  phoneNumber: string | null;
 }

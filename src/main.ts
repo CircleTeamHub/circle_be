@@ -30,13 +30,19 @@ export function resolveAppPort(value: unknown): number {
 async function bootstrap() {
   const config = getServerConfig();
 
+  // In production, ALLOWED_ORIGINS must be set (comma-separated).
+  // In development/test, all origins are allowed for convenience.
+  const isProduction = process.env.NODE_ENV === 'production';
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map((o) =>
+    o.trim(),
+  );
+
+  const corsOptions = isProduction
+    ? { origin: allowedOrigins ?? [], credentials: true }
+    : true;
+
   const app = await NestFactory.create(AppModule, {
-    // 关闭整个nestjs日志
-    // logger: flag && [],
-    // logger: false,
-    // 允许跨域
-    cors: true,
-    // logger: ['error', 'warn'],
+    cors: corsOptions,
   });
   setupApp(app);
 

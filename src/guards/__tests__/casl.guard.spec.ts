@@ -52,7 +52,7 @@ describe('CaslGuard', () => {
     (ability.can as jest.Mock).mockReturnValue(false);
 
     await expect(
-      guard.canActivate(createContext({ username: 'tester' })),
+      guard.canActivate(createContext({ role: 'USER' })),
     ).resolves.toBe(false);
   });
 });

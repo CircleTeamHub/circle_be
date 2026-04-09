@@ -4,7 +4,26 @@ import { getServerConfig } from './config/server.config';
 import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
+import rateLimit, {
+  type Options as RateLimitOptions,
+} from 'express-rate-limit';
+
+/** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
+/** Moderate limit for token refresh: 60 requests / 15 min per IP. */
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+} satisfies Partial<RateLimitOptions>);
 
 export const setupApp = (app: INestApplication) => {
   const config = getServerConfig();
@@ -26,8 +45,9 @@ export const setupApp = (app: INestApplication) => {
   // 全局拦截器
   app.useGlobalPipes(
     new ValidationPipe({
-      // 去除在类上不存在的字段
       whitelist: true,
+      transform: true,
+      transformOptions: { enableImplicitConversion: true },
     }),
   );
 
@@ -39,11 +59,17 @@ export const setupApp = (app: INestApplication) => {
   // helmet头部安全
   app.use(helmet());
 
-  // rateLimit限流
+  // Global fallback rate limit: 300 req / min per IP
   app.use(
     rateLimit({
-      windowMs: 1 * 60 * 1000, // 1 minutes
-      max: 300, // limit each IP to 100 requests per windowMs
+      windowMs: 1 * 60 * 1000,
+      max: 300,
     }),
   );
+
+  // Tighter limits on sensitive auth routes
+  app.use('/api/v1/auth/login', authLimiter);
+  app.use('/api/v1/auth/register', authLimiter);
+  app.use('/api/v1/auth/change-password', authLimiter);
+  app.use('/api/v1/auth/refresh', refreshLimiter);
 };

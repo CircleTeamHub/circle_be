@@ -45,5 +45,11 @@ export function createEnvValidationSchema(
     MINIO_SECRET_KEY: Joi.string().optional(),
     MINIO_BUCKET: Joi.string().optional(),
     MINIO_PUBLIC_URL: Joi.string().uri().optional(),
+    // Comma-separated list of allowed CORS origins. Required in production.
+    ALLOWED_ORIGINS: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: Joi.string().required(),
+      otherwise: Joi.string().optional(),
+    }),
   });
 }
