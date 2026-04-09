@@ -37,6 +37,7 @@ export interface UpdateUserInput {
   helloWords?: string;
   birthday?: string | null;
   gender?: Gender;
+  city?: string | null;
 }
 
 const PUBLIC_SELECT = {
@@ -55,6 +56,7 @@ const PUBLIC_SELECT = {
   helloWords: true,
   birthday: true,
   gender: true,
+  city: true,
   role: true,
   status: true,
   lastOnline: true,
@@ -141,6 +143,25 @@ export class UserService {
     ]);
 
     return { data, total, page, limit: take };
+  }
+
+  async findByExactAccountId(accountId: string) {
+    const normalized = accountId.trim();
+
+    if (!normalized) {
+      return null;
+    }
+
+    return this.prisma.user.findFirst({
+      where: {
+        accountId: {
+          equals: normalized,
+          mode: 'insensitive',
+        },
+        status: 'ACTIVE',
+      },
+      select: PUBLIC_SELECT,
+    });
   }
 
   async findOne(id: string) {

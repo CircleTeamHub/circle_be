@@ -26,6 +26,7 @@ describe('UserService.update normalization', () => {
       helloWords: null,
       birthday: null,
       gender: 'unset',
+      city: null,
       role: 'USER',
       status: 'ACTIVE',
       lastOnline: null,
@@ -74,6 +75,25 @@ describe('UserService.update normalization', () => {
           phoneNumber: '13800138000',
           qq: '1234567',
         },
+      }),
+    );
+  });
+
+  it('persists city updates unchanged', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(prisma as any, config as any);
+
+    await service.update('user-1', {
+      city: '杭州',
+      gender: 'female' as any,
+    } as any);
+
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          city: '杭州',
+          gender: 'female',
+        }),
       }),
     );
   });

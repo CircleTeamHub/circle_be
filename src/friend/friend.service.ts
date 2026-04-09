@@ -10,7 +10,10 @@ import { FriendState } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   FriendProfileDto,
+  FriendActivityDto,
+  FriendActivityUnreadCountDto,
   FriendRequestDto,
+  FriendSettingsDto,
   FriendStatusDto,
 } from './dto/friend.dto';
 
@@ -37,6 +40,30 @@ const FRIEND_PROFILE_SELECT = {
   lastOnline: true,
 } as const;
 
+const FRIEND_ACTIVITY_TYPE = {
+  REQUEST_RECEIVED: 'REQUEST_RECEIVED',
+  REQUEST_SENT: 'REQUEST_SENT',
+  REQUEST_ACCEPTED_BY_OTHER: 'REQUEST_ACCEPTED_BY_OTHER',
+  REQUEST_REJECTED_BY_OTHER: 'REQUEST_REJECTED_BY_OTHER',
+  REQUEST_ACCEPTED_BY_ME: 'REQUEST_ACCEPTED_BY_ME',
+  REQUEST_REJECTED_BY_ME: 'REQUEST_REJECTED_BY_ME',
+  REQUEST_WITHDRAWN_BY_OTHER: 'REQUEST_WITHDRAWN_BY_OTHER',
+} as const;
+
+type FriendActivityType =
+  (typeof FRIEND_ACTIVITY_TYPE)[keyof typeof FRIEND_ACTIVITY_TYPE];
+
+const FRIEND_ACTIVITY_INCLUDE = {
+  counterparty: { select: MINI_USER_SELECT },
+  request: {
+    select: {
+      id: true,
+      state: true,
+      message: true,
+    },
+  },
+} as const;
+
 @Injectable()
 export class FriendService {
   private readonly logger = new Logger(FriendService.name);
@@ -49,6 +76,8 @@ export class FriendService {
     senderId: string,
     targetId: string,
     message?: string,
+    remark?: string,
+    tagIds?: string[],
   ): Promise<void> {
     if (senderId === targetId) {
       throw new BadRequestException('You cannot add yourself as a friend');
@@ -97,46 +126,70 @@ export class FriendService {
     // Enforce friend limit for the sender
     await this.assertBelowFriendLimit(senderId);
 
-    // Upsert: if a REJECTED record exists (either direction), reset it to PENDING
-    // so the user can retry after a rejection. Otherwise create fresh.
-    const rejectedRecord = await this.prisma.friend.findFirst({
-      where: {
-        OR: [
-          { userID: senderId, friendID: targetId },
-          { userID: targetId, friendID: senderId },
-        ],
-        state: FriendState.REJECTED,
-      },
-    });
-
-    if (rejectedRecord) {
-      // Always store the new request as sender → target
-      if (rejectedRecord.userID === senderId) {
-        await this.prisma.friend.update({
-          where: { id: rejectedRecord.id },
-          data: { state: FriendState.PENDING, message: message ?? null },
-        });
-      } else {
-        // Old record was target → sender; delete it and create fresh in correct direction
-        await this.prisma.friend.delete({ where: { id: rejectedRecord.id } });
-        await this.prisma.friend.create({
-          data: {
-            userID: senderId,
-            friendID: targetId,
-            state: FriendState.PENDING,
-            message: message ?? null,
-          },
-        });
-      }
-    } else {
-      await this.prisma.friend.create({
-        data: {
-          userID: senderId,
-          friendID: targetId,
-          state: FriendState.PENDING,
-          message: message ?? null,
+    const normalizedTagIds = Array.from(new Set(tagIds ?? []));
+    if (normalizedTagIds.length > 0) {
+      const ownedTags = await this.prisma.friendTag.findMany({
+        where: {
+          ownerID: senderId,
+          id: { in: normalizedTagIds },
         },
+        select: { id: true },
       });
+
+      if (ownedTags.length !== normalizedTagIds.length) {
+        throw new NotFoundException('Tag not found');
+      }
+    }
+
+    const pendingRemarkBySender = remark ?? null;
+    const requestData = {
+      userID: senderId,
+      friendID: targetId,
+      state: FriendState.PENDING,
+      message: message ?? null,
+      pendingRemarkBySender,
+    } as any;
+
+    try {
+      await this.prisma.$transaction(async (tx: any) => {
+        const nextRequestRecord = await tx.friend.create({
+          data: requestData,
+        });
+
+        await this.syncPendingFriendTagLinks(
+          tx,
+          senderId,
+          nextRequestRecord.id,
+          normalizedTagIds,
+        );
+
+        await this.createFriendActivities(tx, [
+          {
+            requestId: nextRequestRecord.id,
+            viewerId: senderId,
+            actorId: senderId,
+            counterpartyId: targetId,
+            type: FRIEND_ACTIVITY_TYPE.REQUEST_SENT,
+            messageSnapshot: nextRequestRecord.message ?? null,
+          },
+          {
+            requestId: nextRequestRecord.id,
+            viewerId: targetId,
+            actorId: senderId,
+            counterpartyId: senderId,
+            type: FRIEND_ACTIVITY_TYPE.REQUEST_RECEIVED,
+            messageSnapshot: nextRequestRecord.message ?? null,
+          },
+        ]);
+
+        return nextRequestRecord;
+      });
+    } catch (error) {
+      if (this.isPrismaUniqueConstraintError(error)) {
+        await this.throwActiveFriendConflict(senderId, targetId);
+      }
+
+      throw error;
     }
 
     this.logger.log(`Friend request sent: ${senderId} → ${targetId}`);
@@ -155,7 +208,23 @@ export class FriendService {
     ) {
       throw new NotFoundException('Pending request not found');
     }
-    await this.prisma.friend.delete({ where: { id: requestId } });
+    await this.prisma.$transaction(async (tx: any) => {
+      const updated = await tx.friend.update({
+        where: { id: requestId },
+        data: { state: FriendState.WITHDRAWN },
+      });
+
+      await this.createFriendActivities(tx, [
+        {
+          requestId: updated.id,
+          viewerId: updated.friendID,
+          actorId: senderId,
+          counterpartyId: senderId,
+          type: FRIEND_ACTIVITY_TYPE.REQUEST_WITHDRAWN_BY_OTHER,
+          messageSnapshot: updated.message ?? null,
+        },
+      ]);
+    });
   }
 
   // ─── Accept / Reject (recipient decides) ────────────────────────────────────
@@ -165,7 +234,7 @@ export class FriendService {
     requestId: string,
     decision: 'ACCEPTED' | 'REJECTED',
   ): Promise<void> {
-    const record = await this.prisma.friend.findUnique({
+    const record: any = await this.prisma.friend.findUnique({
       where: { id: requestId },
     });
     if (
@@ -181,9 +250,69 @@ export class FriendService {
       await this.assertBelowFriendLimit(recipientId);
     }
 
-    await this.prisma.friend.update({
-      where: { id: requestId },
-      data: { state: decision },
+    await this.prisma.$transaction(async (tx: any) => {
+      const data: any = { state: decision };
+
+      if (
+        decision === FriendState.ACCEPTED &&
+        record.pendingRemarkBySender !== null &&
+        record.pendingRemarkBySender !== undefined
+      ) {
+        // The sender is stored in userID, so the sender-owned active remark slot is remarkA.
+        data.remarkA = record.pendingRemarkBySender;
+      }
+
+      const nextRequest = await tx.friend.update({
+        where: { id: requestId },
+        data,
+      });
+
+      if (decision === FriendState.ACCEPTED) {
+        await this.promotePendingFriendTags(tx, nextRequest);
+      }
+
+      await this.createFriendActivities(
+        tx,
+        decision === FriendState.ACCEPTED
+          ? [
+              {
+                requestId: nextRequest.id,
+                viewerId: recipientId,
+                actorId: recipientId,
+                counterpartyId: nextRequest.userID,
+                type: FRIEND_ACTIVITY_TYPE.REQUEST_ACCEPTED_BY_ME,
+                messageSnapshot: nextRequest.message ?? null,
+              },
+              {
+                requestId: nextRequest.id,
+                viewerId: nextRequest.userID,
+                actorId: recipientId,
+                counterpartyId: recipientId,
+                type: FRIEND_ACTIVITY_TYPE.REQUEST_ACCEPTED_BY_OTHER,
+                messageSnapshot: nextRequest.message ?? null,
+              },
+            ]
+          : [
+              {
+                requestId: nextRequest.id,
+                viewerId: recipientId,
+                actorId: recipientId,
+                counterpartyId: nextRequest.userID,
+                type: FRIEND_ACTIVITY_TYPE.REQUEST_REJECTED_BY_ME,
+                messageSnapshot: nextRequest.message ?? null,
+              },
+              {
+                requestId: nextRequest.id,
+                viewerId: nextRequest.userID,
+                actorId: recipientId,
+                counterpartyId: recipientId,
+                type: FRIEND_ACTIVITY_TYPE.REQUEST_REJECTED_BY_OTHER,
+                messageSnapshot: nextRequest.message ?? null,
+              },
+            ],
+      );
+
+      return nextRequest;
     });
   }
 
@@ -235,6 +364,50 @@ export class FriendService {
       .filter((x): x is FriendProfileDto => x !== null);
   }
 
+  async getFriendSettings(
+    userId: string,
+    friendUserId: string,
+  ): Promise<FriendSettingsDto> {
+    const friendship = await this.prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userID: userId, friendID: friendUserId },
+          { userID: friendUserId, friendID: userId },
+        ],
+        state: FriendState.ACCEPTED,
+      },
+    });
+
+    if (!friendship) {
+      throw new NotFoundException('Friendship not found');
+    }
+
+    const [availableTags, assignedLinks] = await Promise.all([
+      this.prisma.friendTag.findMany({
+        where: { ownerID: userId },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.friendTagOnFriend.findMany({
+        where: {
+          ownerID: userId,
+          friendID: friendship.id,
+        },
+        include: {
+          tag: true,
+        },
+        orderBy: {
+          createdAt: 'asc',
+        },
+      }),
+    ]);
+
+    return {
+      remark: friendship.userID === userId ? friendship.remarkA : friendship.remarkB,
+      assignedTags: assignedLinks.map((link) => link.tag),
+      availableTags,
+    };
+  }
+
   async listIncomingRequests(userId: string): Promise<FriendRequestDto[]> {
     const records = await this.prisma.friend.findMany({
       where: { friendID: userId, state: FriendState.PENDING },
@@ -281,6 +454,60 @@ export class FriendService {
         message: r.message,
         user: userMap.get(r.friendID)!,
       }));
+  }
+
+  async listActivities(userId: string): Promise<FriendActivityDto[]> {
+    await this.backfillLegacyActivitiesForViewer(userId);
+
+    const activities = await this.prisma.friendActivity.findMany({
+      where: { viewerId: userId },
+      orderBy: { createdAt: 'desc' },
+      include: FRIEND_ACTIVITY_INCLUDE,
+    });
+
+    return activities.map((activity) => this.toFriendActivityDto(activity));
+  }
+
+  async getUnreadActivityCount(
+    userId: string,
+  ): Promise<FriendActivityUnreadCountDto> {
+    await this.backfillLegacyActivitiesForViewer(userId);
+
+    const count = await this.prisma.friendActivity.count({
+      where: { viewerId: userId, readAt: null },
+    });
+
+    return { count };
+  }
+
+  async getActivity(userId: string, activityId: string): Promise<FriendActivityDto> {
+    const activity = await this.prisma.friendActivity.findFirst({
+      where: { id: activityId, viewerId: userId },
+      include: FRIEND_ACTIVITY_INCLUDE,
+    });
+
+    if (!activity) {
+      throw new NotFoundException('Friend activity not found');
+    }
+
+    return this.toFriendActivityDto(activity);
+  }
+
+  async markActivityRead(userId: string, activityId: string): Promise<void> {
+    const result = await this.prisma.friendActivity.updateMany({
+      where: { id: activityId, viewerId: userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+
+    if (result.count === 0) {
+      const activity = await this.prisma.friendActivity.findFirst({
+        where: { id: activityId, viewerId: userId },
+      });
+
+      if (!activity) {
+        throw new NotFoundException('Friend activity not found');
+      }
+    }
   }
 
   // ─── Relationship status ─────────────────────────────────────────────────────
@@ -538,6 +765,303 @@ export class FriendService {
         return { ...u, friendsSince: f.updatedAt } as FriendProfileDto;
       })
       .filter((x): x is FriendProfileDto => x !== null);
+  }
+
+  private async createFriendActivities(
+    tx: any,
+    activities: Array<{
+      requestId: string;
+      viewerId: string;
+      actorId: string;
+      counterpartyId: string;
+      type: FriendActivityType;
+      messageSnapshot?: string | null;
+    }>,
+  ) {
+    if (activities.length === 0) {
+      return;
+    }
+
+    await tx.friendActivity.createMany({
+      data: activities,
+    });
+  }
+
+  private async throwActiveFriendConflict(
+    senderId: string,
+    targetId: string,
+  ): Promise<never> {
+    const active = await this.prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userID: senderId, friendID: targetId },
+          { userID: targetId, friendID: senderId },
+        ],
+        state: { in: [FriendState.PENDING, FriendState.ACCEPTED] },
+      },
+      select: { state: true },
+    });
+
+    throw new ConflictException(
+      active?.state === FriendState.ACCEPTED
+        ? 'Already friends'
+        : 'Friend request already pending',
+    );
+  }
+
+  private isPrismaUniqueConstraintError(error: unknown): boolean {
+    return (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code?: string }).code === 'P2002'
+    );
+  }
+
+  private async syncPendingFriendTagLinks(
+    tx: any,
+    ownerId: string,
+    requestId: string,
+    tagIds: string[],
+  ) {
+    await tx.pendingFriendTagOnRequest.deleteMany({
+      where: { requestID: requestId },
+    });
+
+    if (tagIds.length === 0) {
+      return;
+    }
+
+    await tx.pendingFriendTagOnRequest.createMany({
+      data: tagIds.map((tagID) => ({
+        ownerID: ownerId,
+        requestID: requestId,
+        tagID,
+      })),
+    });
+  }
+
+  private async promotePendingFriendTags(
+    tx: any,
+    request: {
+      id: string;
+      userID: string;
+    },
+  ) {
+    const pendingLinks = await tx.pendingFriendTagOnRequest.findMany({
+      where: {
+        requestID: request.id,
+        ownerID: request.userID,
+      },
+      select: {
+        tagID: true,
+      },
+    });
+
+    if (pendingLinks.length === 0) {
+      return;
+    }
+
+    const pendingTagIds = pendingLinks.map((link: { tagID: string }) => link.tagID);
+    const existingTags = await tx.friendTag.findMany({
+      where: {
+        ownerID: request.userID,
+        id: { in: pendingTagIds },
+      },
+      select: { id: true },
+    });
+
+    if (existingTags.length === 0) {
+      return;
+    }
+
+    await tx.friendTagOnFriend.createMany({
+      data: existingTags.map((tag: { id: string }) => ({
+        ownerID: request.userID,
+        tagID: tag.id,
+        friendID: request.id,
+      })),
+    });
+  }
+
+  private async backfillLegacyActivitiesForViewer(userId: string) {
+    const requests = await this.prisma.friend.findMany({
+      where: {
+        OR: [{ userID: userId }, { friendID: userId }],
+        state: {
+          in: [
+            FriendState.PENDING,
+            FriendState.ACCEPTED,
+            FriendState.REJECTED,
+            FriendState.WITHDRAWN,
+          ],
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (requests.length === 0) {
+      return;
+    }
+
+    const existingActivities = await this.prisma.friendActivity.findMany({
+      where: {
+        viewerId: userId,
+        requestId: { in: requests.map((request) => request.id) },
+      },
+      select: { requestId: true, type: true },
+    });
+
+    const existingKeys = new Set(
+      existingActivities.map((activity) => `${activity.requestId}:${activity.type}`),
+    );
+    const missingActivities: Array<{
+      requestId: string;
+      viewerId: string;
+      actorId: string;
+      counterpartyId: string;
+      type: FriendActivityType;
+      messageSnapshot?: string | null;
+      createdAt: Date;
+    }> = [];
+
+    for (const request of requests) {
+      const backfillActivity = this.getLegacyBackfillActivity(userId, request);
+
+      if (!backfillActivity) {
+        continue;
+      }
+
+      const key = `${request.id}:${backfillActivity.type}`;
+
+      if (existingKeys.has(key)) {
+        continue;
+      }
+
+      missingActivities.push({
+        requestId: request.id,
+        viewerId: userId,
+        actorId: backfillActivity.actorId,
+        counterpartyId: backfillActivity.counterpartyId,
+        type: backfillActivity.type,
+        messageSnapshot: request.message ?? null,
+        createdAt: request.updatedAt ?? request.createdAt,
+      });
+    }
+
+    if (missingActivities.length === 0) {
+      return;
+    }
+
+    await this.prisma.friendActivity.createMany({
+      data: missingActivities,
+    });
+  }
+
+  private getLegacyBackfillActivity(
+    userId: string,
+    request: {
+      id: string;
+      userID: string;
+      friendID: string;
+      state: FriendState | string;
+      message?: string | null;
+      createdAt: Date;
+      updatedAt: Date;
+    },
+  ): {
+    actorId: string;
+    counterpartyId: string;
+    type: FriendActivityType;
+  } | null {
+    if (request.state === FriendState.PENDING) {
+      if (request.userID === userId) {
+        return {
+          actorId: request.userID,
+          counterpartyId: request.friendID,
+          type: FRIEND_ACTIVITY_TYPE.REQUEST_SENT,
+        };
+      }
+
+      return {
+        actorId: request.userID,
+        counterpartyId: request.userID,
+        type: FRIEND_ACTIVITY_TYPE.REQUEST_RECEIVED,
+      };
+    }
+
+    if (request.state === FriendState.ACCEPTED) {
+      if (request.userID === userId) {
+        return {
+          actorId: request.friendID,
+          counterpartyId: request.friendID,
+          type: FRIEND_ACTIVITY_TYPE.REQUEST_ACCEPTED_BY_OTHER,
+        };
+      }
+
+      return {
+        actorId: request.friendID,
+        counterpartyId: request.userID,
+        type: FRIEND_ACTIVITY_TYPE.REQUEST_ACCEPTED_BY_ME,
+      };
+    }
+
+    if (request.state === FriendState.REJECTED) {
+      if (request.userID === userId) {
+        return {
+          actorId: request.friendID,
+          counterpartyId: request.friendID,
+          type: FRIEND_ACTIVITY_TYPE.REQUEST_REJECTED_BY_OTHER,
+        };
+      }
+
+      return {
+        actorId: request.friendID,
+        counterpartyId: request.userID,
+        type: FRIEND_ACTIVITY_TYPE.REQUEST_REJECTED_BY_ME,
+      };
+    }
+
+    if (request.state === FriendState.WITHDRAWN && request.friendID === userId) {
+      return {
+        actorId: request.userID,
+        counterpartyId: request.userID,
+        type: FRIEND_ACTIVITY_TYPE.REQUEST_WITHDRAWN_BY_OTHER,
+      };
+    }
+
+    return null;
+  }
+
+  private toFriendActivityDto(activity: {
+    id: string;
+    type: string;
+    requestId: string;
+    messageSnapshot: string | null;
+    readAt: Date | null;
+    createdAt: Date;
+    counterparty: {
+      id: string;
+      accountId: string;
+      nickname: string;
+      avatarUrl: string | null;
+    };
+    request: {
+      id: string;
+      state: string;
+      message: string | null;
+    };
+  }): FriendActivityDto {
+    return {
+      id: activity.id,
+      type: activity.type,
+      requestId: activity.requestId,
+      requestState: activity.request.state,
+      messageSnapshot: activity.messageSnapshot ?? activity.request.message,
+      readAt: activity.readAt,
+      createdAt: activity.createdAt,
+      counterparty: activity.counterparty,
+    };
   }
 
   // ─── Helper ───────────────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
+  ArrayUnique,
+  IsArray,
   IsEnum,
   IsHexColor,
   IsOptional,
@@ -18,6 +20,26 @@ export class SendFriendRequestDto {
   @IsString()
   @MaxLength(200)
   message?: string;
+
+  @ApiPropertyOptional({
+    example: 'met at a conference',
+    description: 'Sender-owned pending remark stored on the request',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  remark?: string;
+
+  @ApiPropertyOptional({
+    example: ['uuid-of-friend-tag'],
+    description: 'Sender-owned friend tag ids to attach to the pending request',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  tagIds?: string[];
 }
 
 export class HandleFriendRequestDto {
@@ -44,6 +66,19 @@ export class FriendProfileDto {
   @ApiProperty() friendsSince: Date;
 }
 
+export class FriendTagDto {
+  @ApiProperty() id: string;
+  @ApiProperty() ownerID: string;
+  @ApiProperty() name: string;
+  @ApiPropertyOptional() color: string | null;
+}
+
+export class FriendSettingsDto {
+  @ApiPropertyOptional() remark: string | null;
+  @ApiProperty({ type: [FriendTagDto] }) assignedTags: FriendTagDto[];
+  @ApiProperty({ type: [FriendTagDto] }) availableTags: FriendTagDto[];
+}
+
 export class FriendRequestDto {
   @ApiProperty() id: string;
   @ApiProperty() state: string;
@@ -63,6 +98,39 @@ export class FriendStatusDto {
   })
   status: 'NONE' | 'PENDING_SENT' | 'PENDING_RECEIVED' | 'ACCEPTED' | 'BLOCKED';
   @ApiPropertyOptional() requestId: string | null;
+}
+
+export class FriendActivityCounterpartyDto {
+  @ApiProperty() id: string;
+  @ApiProperty() accountId: string;
+  @ApiProperty() nickname: string;
+  @ApiPropertyOptional() avatarUrl: string | null;
+}
+
+export class FriendActivityDto {
+  @ApiProperty() id: string;
+  @ApiProperty({
+    enum: [
+      'REQUEST_RECEIVED',
+      'REQUEST_SENT',
+      'REQUEST_ACCEPTED_BY_OTHER',
+      'REQUEST_REJECTED_BY_OTHER',
+      'REQUEST_ACCEPTED_BY_ME',
+      'REQUEST_REJECTED_BY_ME',
+      'REQUEST_WITHDRAWN_BY_OTHER',
+    ],
+  })
+  type: string;
+  @ApiProperty() requestId: string;
+  @ApiProperty() requestState: string;
+  @ApiPropertyOptional() messageSnapshot: string | null;
+  @ApiPropertyOptional() readAt: Date | null;
+  @ApiProperty() createdAt: Date;
+  @ApiProperty() counterparty: FriendActivityCounterpartyDto;
+}
+
+export class FriendActivityUnreadCountDto {
+  @ApiProperty() count: number;
 }
 
 export class SetRemarkDto {

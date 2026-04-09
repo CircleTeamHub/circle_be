@@ -24,6 +24,9 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import {
   AssignTagDto,
   BlockUserDto,
+  FriendActivityDto,
+  FriendActivityUnreadCountDto,
+  FriendSettingsDto,
   CreateFriendTagDto,
   FriendProfileDto,
   FriendRequestDto,
@@ -47,6 +50,16 @@ export class FriendController {
   @ApiOkResponse({ type: [FriendProfileDto] })
   listFriends(@Req() req: any): Promise<FriendProfileDto[]> {
     return this.friendService.listFriends(req.user.userId);
+  }
+
+  @Get(':friendUserId/settings')
+  @ApiOperation({ summary: 'Get editable settings for a friend' })
+  @ApiOkResponse({ type: FriendSettingsDto })
+  getFriendSettings(
+    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Req() req: any,
+  ): Promise<FriendSettingsDto> {
+    return this.friendService.getFriendSettings(req.user.userId, friendUserId);
   }
 
   @Delete(':friendUserId')
@@ -81,7 +94,13 @@ export class FriendController {
   @ApiOperation({ summary: 'Send a friend request' })
   @ApiNoContentResponse()
   sendRequest(@Body() dto: SendFriendRequestDto, @Req() req: any): Promise<void> {
-    return this.friendService.sendRequest(req.user.userId, dto.targetId, dto.message);
+    return this.friendService.sendRequest(
+      req.user.userId,
+      dto.targetId,
+      dto.message,
+      dto.remark,
+      dto.tagIds,
+    );
   }
 
   @Get('requests/incoming')
@@ -129,6 +148,41 @@ export class FriendController {
     @Req() req: any,
   ): Promise<void> {
     return this.friendService.cancelRequest(req.user.userId, requestId);
+  }
+
+  @Get('activities')
+  @ApiOperation({ summary: 'Friend activity inbox' })
+  @ApiOkResponse({ type: [FriendActivityDto] })
+  listActivities(@Req() req: any): Promise<FriendActivityDto[]> {
+    return this.friendService.listActivities(req.user.userId);
+  }
+
+  @Get('activities/unread-count')
+  @ApiOperation({ summary: 'Unread friend activity count' })
+  @ApiOkResponse({ type: FriendActivityUnreadCountDto })
+  getUnreadActivityCount(@Req() req: any): Promise<FriendActivityUnreadCountDto> {
+    return this.friendService.getUnreadActivityCount(req.user.userId);
+  }
+
+  @Get('activities/:activityId')
+  @ApiOperation({ summary: 'Friend activity detail' })
+  @ApiOkResponse({ type: FriendActivityDto })
+  getActivity(
+    @Param('activityId', ParseUUIDPipe) activityId: string,
+    @Req() req: any,
+  ): Promise<FriendActivityDto> {
+    return this.friendService.getActivity(req.user.userId, activityId);
+  }
+
+  @Post('activities/:activityId/read')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Mark a single friend activity as read' })
+  @ApiNoContentResponse()
+  markActivityRead(
+    @Param('activityId', ParseUUIDPipe) activityId: string,
+    @Req() req: any,
+  ): Promise<void> {
+    return this.friendService.markActivityRead(req.user.userId, activityId);
   }
 
   // ─── Relationship status ─────────────────────────────────────────────────────

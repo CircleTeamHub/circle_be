@@ -49,6 +49,7 @@ describe('AuthController', () => {
         helloWords: null,
         birthday: null,
         gender: 'unset',
+        city: null,
         role: 'USER',
         status: 'ACTIVE',
         lastOnline: null,

@@ -35,7 +35,7 @@ export class CaslGuard implements CanActivate {
     const req = context.switchToHttp().getRequest();
     if (req.user) {
       // 获取当前用户的权限
-      const ability = this.caslAbilityService.forRoot(req.user.role);
+      const ability = await this.caslAbilityService.forRoot(req.user.role);
 
       let flag = true;
       if (handlers) {

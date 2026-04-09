@@ -87,4 +87,10 @@ export class UpdateUserDto {
   @IsOptional()
   @IsEnum(Gender)
   gender?: Gender;
+
+  @ApiPropertyOptional({ example: '杭州' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  city?: string;
 }

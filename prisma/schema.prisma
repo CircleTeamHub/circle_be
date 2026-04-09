@@ -32,6 +32,17 @@ enum FriendState {
   PENDING
   ACCEPTED
   REJECTED
+  WITHDRAWN
+}
+
+enum FriendActivityType {
+  REQUEST_RECEIVED
+  REQUEST_SENT
+  REQUEST_ACCEPTED_BY_OTHER
+  REQUEST_REJECTED_BY_OTHER
+  REQUEST_ACCEPTED_BY_ME
+  REQUEST_REJECTED_BY_ME
+  REQUEST_WITHDRAWN_BY_OTHER
 }
 
 enum ActionType {
@@ -163,6 +174,7 @@ model User {
   persona      String?
   helloWords   String?
   birthday     DateTime?
+  city         String?
   gender        Gender     @default(unset)
   role          UserRole   @default(USER)
   status        UserStatus @default(ACTIVE)
@@ -203,6 +215,10 @@ model User {
   coinGiftsReceived     CoinGift[]            @relation("giftRecipient")
   friendTags            FriendTag[]
   friendTagAssignments  FriendTagOnFriend[]   @relation("tagOwner")
+  pendingFriendTagAssignments PendingFriendTagOnRequest[] @relation("pendingTagOwner")
+  friendActivities      FriendActivity[]      @relation("friendActivityViewer")
+  friendActivitiesAuthored FriendActivity[]   @relation("friendActivityActor")
+  friendActivitiesCounterparty FriendActivity[] @relation("friendActivityCounterparty")
 }
 
 model RefreshToken {
@@ -229,6 +245,7 @@ model Friend {
   friendID  String
   state     FriendState @default(PENDING)
   message   String?
+  pendingRemarkBySender String?
   /// userID's private remark for friendID
   remarkA   String?
   /// friendID's private remark for userID
@@ -238,10 +255,31 @@ model Friend {
   user      User        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
   friend    User        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
   tagLinks  FriendTagOnFriend[]
+  pendingTagLinks PendingFriendTagOnRequest[]
+  activities FriendActivity[]
 
-  @@unique([userID, friendID])
   @@index([userID])
   @@index([friendID])
+}
+
+model FriendActivity {
+  id             String             @id @default(uuid())
+  requestId      String
+  viewerId       String
+  actorId        String
+  counterpartyId String
+  type           FriendActivityType
+  messageSnapshot String?
+  readAt         DateTime?
+  createdAt      DateTime           @default(now())
+  request        Friend             @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  viewer         User               @relation("friendActivityViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  actor          User               @relation("friendActivityActor", fields: [actorId], references: [id], onDelete: Cascade)
+  counterparty   User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@index([viewerId, createdAt])
+  @@index([viewerId, readAt])
 }
 
 // Friend tags — user-defined labels like "高中同学", "同事"
@@ -253,6 +291,7 @@ model FriendTag {
   createdAt DateTime            @default(now())
   owner     User                @relation(fields: [ownerID], references: [id], onDelete: Cascade)
   friends   FriendTagOnFriend[]
+  pendingRequests PendingFriendTagOnRequest[]
 
   @@unique([ownerID, name])
   @@index([ownerID])
@@ -271,6 +310,21 @@ model FriendTagOnFriend {
 
   @@unique([ownerID, tagID, friendID])
   @@index([ownerID, friendID])
+}
+
+model PendingFriendTagOnRequest {
+  id        String   @id @default(uuid())
+  ownerID   String
+  requestID String
+  tagID     String
+  createdAt DateTime @default(now())
+  owner     User     @relation("pendingTagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  request   Friend   @relation(fields: [requestID], references: [id], onDelete: Cascade)
+  tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
+
+  @@unique([ownerID, requestID, tagID])
+  @@index([ownerID, requestID])
+  @@index([requestID])
 }
 
 model Block {

@@ -5,6 +5,7 @@ import { ConflictException, ForbiddenException } from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
+import { OpenimService } from 'src/openim/openim.service';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -49,6 +50,11 @@ describe('AuthService', () => {
     signAsync: jest.fn(() => Promise.resolve('access-token')),
   };
 
+  const mockOpenimService = {
+    getUserToken: jest.fn(() => Promise.resolve('')),
+    registerUser: jest.fn(() => Promise.resolve()),
+  };
+
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
@@ -76,6 +82,7 @@ describe('AuthService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: RefreshTokenService, useValue: mockRefreshTokenService },
         { provide: JwtService, useValue: mockJwt },
+        { provide: OpenimService, useValue: mockOpenimService },
       ],
     }).compile();
 
@@ -188,5 +195,46 @@ describe('AuthService', () => {
     await service.logoutAll('uuid-1');
 
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('loads city in the self profile response', async () => {
+    mockPrisma.user.findUnique.mockResolvedValueOnce({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      nickname: 'Test User',
+      avatarUrl: null,
+      avatarFrame: null,
+      cover: null,
+      email: null,
+      phoneNumber: null,
+      wechat: null,
+      qq: null,
+      whatsup: null,
+      persona: null,
+      helloWords: null,
+      birthday: new Date('2026-04-01T00:00:00.000Z'),
+      gender: 'male',
+      city: '杭州',
+      role: 'USER',
+      status: 'ACTIVE',
+      lastOnline: null,
+      createdAt: new Date('2026-04-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-01T00:00:00.000Z'),
+    });
+
+    const me = await service.me('uuid-1');
+
+    expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'uuid-1' },
+      select: expect.objectContaining({
+        city: true,
+        birthday: true,
+        gender: true,
+      }),
+    });
+    expect(me).toMatchObject({
+      city: '杭州',
+      gender: 'male',
+    });
   });
 });

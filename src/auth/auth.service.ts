@@ -30,6 +30,7 @@ const ME_SELECT = {
   helloWords: true,
   birthday: true,
   gender: true,
+  city: true,
   role: true,
   status: true,
   lastOnline: true,
@@ -53,6 +54,7 @@ export type SafeUser = {
   helloWords: string | null;
   birthday: Date | null;
   gender: string;
+  city: string | null;
   role: string;
   status: string;
   lastOnline: Date | null;

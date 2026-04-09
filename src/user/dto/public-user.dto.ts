@@ -59,6 +59,10 @@ export class PublicUserDto {
   @Expose()
   gender: string;
 
+  @ApiPropertyOptional({ example: '杭州' })
+  @Expose()
+  city: string | null;
+
   @ApiProperty({ example: 'USER', enum: ['USER', 'ADMIN'] })
   @Expose()
   role: string;

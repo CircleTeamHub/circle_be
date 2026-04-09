@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { UnauthorizedException } from '@nestjs/common';
+import { ForbiddenException } from '@nestjs/common';
 import { Role } from 'src/enum/roles.enum';
 import { UserController } from '../user.controller';
 import { UserService } from '../user.service';
@@ -7,6 +7,7 @@ import { UserService } from '../user.service';
 describe('UserController', () => {
   let controller: UserController;
   const userService = {
+    findByExactAccountId: jest.fn(),
     remove: jest.fn((id: string) => ({ id })),
   };
 
@@ -22,6 +23,21 @@ describe('UserController', () => {
 
   it('should be defined', () => {
     expect(controller).toBeDefined();
+  });
+
+  it('allows authenticated users to search by exact accountId', async () => {
+    userService.findByExactAccountId.mockResolvedValue({
+      id: 'user-2',
+      accountId: 'jimmy',
+      nickname: 'Jimmy',
+    });
+
+    await expect(controller.searchUserByAccountId('jimmy')).resolves.toEqual({
+      id: 'user-2',
+      accountId: 'jimmy',
+      nickname: 'Jimmy',
+    });
+    expect(userService.findByExactAccountId).toHaveBeenCalledWith('jimmy');
   });
 
   it('allows a user to delete their own account', () => {
@@ -47,6 +63,6 @@ describe('UserController', () => {
       controller.removeUser('user-2', {
         user: { userId: 'user-1', role: Role.User },
       }),
-    ).toThrow(UnauthorizedException);
+    ).toThrow(ForbiddenException);
   });
 });
