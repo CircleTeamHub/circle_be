@@ -15,6 +15,7 @@ import {
   FriendRequestDto,
   FriendSettingsDto,
   FriendStatusDto,
+  ReportFriendDto,
 } from './dto/friend.dto';
 
 // Members (paid) get 5 000, regular users get 1 000.
@@ -332,6 +333,68 @@ export class FriendService {
       throw new NotFoundException('Friendship not found');
     }
     await this.prisma.friend.delete({ where: { id: record.id } });
+  }
+
+  async reportFriend(
+    reporterId: string,
+    friendUserId: string,
+    dto: ReportFriendDto,
+  ): Promise<void> {
+    if (reporterId === friendUserId) {
+      throw new BadRequestException('Cannot report yourself');
+    }
+
+    const target = await this.prisma.user.findUnique({
+      where: { id: friendUserId },
+      select: { id: true, status: true },
+    });
+    if (!target || target.status !== 'ACTIVE') {
+      throw new NotFoundException('User not found');
+    }
+
+    const friendship = await this.prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userID: reporterId, friendID: friendUserId },
+          { userID: friendUserId, friendID: reporterId },
+        ],
+        state: FriendState.ACCEPTED,
+      },
+      select: { id: true },
+    });
+    if (!friendship) {
+      throw new NotFoundException('Friendship not found');
+    }
+
+    // Prevent duplicate reports for the same reporter / target / category.
+    // This closes the spam vector where a user files dozens of identical reports.
+    const duplicate = await this.prisma.friendReport.findFirst({
+      where: {
+        reporterID: reporterId,
+        targetID: friendUserId,
+        category: dto.category,
+      },
+      select: { id: true },
+    });
+    if (duplicate) {
+      throw new ConflictException(
+        'You have already submitted a report for this category against this user',
+      );
+    }
+
+    await this.prisma.friendReport.create({
+      data: {
+        reporterID: reporterId,
+        targetID: friendUserId,
+        category: dto.category,
+        description: dto.description.trim(),
+        evidence: dto.evidence ?? [],
+      },
+    });
+
+    this.logger.warn(
+      `Friend report submitted: ${reporterId} → ${friendUserId} (${dto.category})`,
+    );
   }
 
   // ─── Lists ────────────────────────────────────────────────────────────────────

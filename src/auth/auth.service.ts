@@ -148,6 +148,15 @@ export class AuthService {
         );
     }
 
+    // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
+    this.prisma.user
+      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${user.id}: ${err?.message}`,
+        ),
+      );
+
     return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
   }
 
@@ -159,6 +168,15 @@ export class AuthService {
     if (!user) {
       throw new NotFoundException('User not found');
     }
+
+    // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
+    this.prisma.user
+      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${user.id}: ${err?.message}`,
+        ),
+      );
 
     const accessToken = await this.signAccessToken(
       user.id,
@@ -190,7 +208,21 @@ export class AuthService {
       throw new NotFoundException('User not found');
     }
 
-    return user;
+    // Update lastOnline and return in one round-trip. Fall back to the already-fetched
+    // user (with a synthetic lastOnline) so a transient DB error never breaks the me endpoint.
+    const now = new Date();
+    return this.prisma.user
+      .update({
+        where: { id: userId },
+        data: { lastOnline: now },
+        select: ME_SELECT,
+      })
+      .catch((err) => {
+        this.logger.warn(
+          `lastOnline update failed for ${userId}: ${err?.message}`,
+        );
+        return { ...user, lastOnline: now };
+      });
   }
 
   async changePassword(

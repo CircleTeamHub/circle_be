@@ -13,8 +13,9 @@
 4. [Upload 接口](#upload-接口)
 5. [Friend 接口](#friend-接口)
 6. [Coin 接口](#coin-接口)
-7. [错误处理](#错误处理)
-8. [前端集成建议](#前端集成建议)
+7. [Note 接口](#note-接口)
+8. [错误处理](#错误处理)
+9. [前端集成建议](#前端集成建议)
 
 ---
 
@@ -378,6 +379,7 @@ video/mp4 | video/quicktime | video/x-m4v
 avatars   — 用户头像
 covers    — 封面图（用户/Squad）
 posts     — 帖子图片/视频
+notes     — 笔记图片/视频
 ```
 
 **Response 201：**
@@ -958,6 +960,311 @@ POST /coin/gift
 - `403` — 对方不是你的好友
 - `404` — 对方用户不存在
 - `429` — 操作频率过高（20次/15分钟）
+
+---
+
+## Note 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/note`
+
+### NoteMedia 对象
+
+```json
+{
+  "id": "uuid",
+  "type": "IMAGE",
+  "objectKey": "notes/user-1/file.jpg",
+  "url": "http://localhost:9000/circle/notes/user-1/file.jpg",
+  "mimeType": "image/jpeg",
+  "size": 123456,
+  "width": 1080,
+  "height": 1440,
+  "durationMs": null,
+  "posterUrl": null,
+  "sortOrder": 0
+}
+```
+
+**type 枚举值：** `IMAGE` | `VIDEO`
+
+---
+
+### NoteSummary 对象
+
+```json
+{
+  "id": "uuid",
+  "title": "测试笔记",
+  "contentPreview": "正文前 120 字摘要",
+  "status": "ACTIVE",
+  "pinned": false,
+  "group": {
+    "id": "uuid",
+    "name": "上海"
+  },
+  "cover": {
+    "id": "uuid",
+    "type": "IMAGE",
+    "url": "http://localhost:9000/circle/notes/user-1/file.jpg"
+  },
+  "imageCount": 2,
+  "videoCount": 1,
+  "mediaCount": 3,
+  "createdAt": "2026-04-09T00:00:00.000Z",
+  "updatedAt": "2026-04-09T12:00:00.000Z"
+}
+```
+
+**status 枚举值：** `ACTIVE` | `UNLISTED` | `DELETED`
+
+---
+
+### NoteDetail 对象
+
+```json
+{
+  "id": "uuid",
+  "title": "测试笔记",
+  "content": "完整正文",
+  "contentPreview": "完整正文",
+  "status": "ACTIVE",
+  "pinned": false,
+  "group": null,
+  "cover": null,
+  "imageCount": 2,
+  "videoCount": 1,
+  "mediaCount": 3,
+  "createdAt": "2026-04-09T00:00:00.000Z",
+  "updatedAt": "2026-04-09T12:00:00.000Z",
+  "media": [
+    {
+      "id": "uuid",
+      "type": "IMAGE",
+      "objectKey": "notes/user-1/file.jpg",
+      "url": "http://localhost:9000/circle/notes/user-1/file.jpg",
+      "mimeType": "image/jpeg",
+      "size": 123456,
+      "width": 1080,
+      "height": 1440,
+      "durationMs": null,
+      "posterUrl": null,
+      "sortOrder": 0
+    }
+  ]
+}
+```
+
+---
+
+### 获取我的笔记列表
+
+```
+GET /note?status=ACTIVE&groupId=<uuid>&search=关键词
+Authorization: Bearer <accessToken>
+```
+
+**Query 参数：**
+- `status` 可选，默认返回非 `DELETED` 的笔记
+- `groupId` 可选，只看某个分组
+- `search` 可选，按标题/正文模糊搜索
+
+**Response 200：**
+```json
+[
+  {
+    "id": "uuid",
+    "title": "测试笔记",
+    "contentPreview": "正文前 120 字摘要",
+    "status": "ACTIVE",
+    "pinned": false,
+    "group": null,
+    "cover": null,
+    "imageCount": 2,
+    "videoCount": 1,
+    "mediaCount": 3,
+    "createdAt": "2026-04-09T00:00:00.000Z",
+    "updatedAt": "2026-04-09T12:00:00.000Z"
+  }
+]
+```
+
+---
+
+### 获取笔记详情
+
+```
+GET /note/:id
+Authorization: Bearer <accessToken>
+```
+
+**Response 200：** `NoteDetail`
+
+---
+
+### 创建笔记
+
+```
+POST /note
+Authorization: Bearer <accessToken>
+```
+
+**Request Body：**
+```json
+{
+  "title": "测试笔记",
+  "content": "完整正文",
+  "groupId": "uuid",
+  "status": "ACTIVE",
+  "pinned": false,
+  "media": [
+    {
+      "type": "IMAGE",
+      "objectKey": "notes/user-1/file.jpg",
+      "url": "http://localhost:9000/circle/notes/user-1/file.jpg",
+      "mimeType": "image/jpeg",
+      "size": 123456,
+      "width": 1080,
+      "height": 1440,
+      "sortOrder": 0
+    },
+    {
+      "type": "VIDEO",
+      "objectKey": "notes/user-1/file.mp4",
+      "url": "http://localhost:9000/circle/notes/user-1/file.mp4",
+      "mimeType": "video/mp4",
+      "size": 3456789,
+      "durationMs": 12000,
+      "posterUrl": "http://localhost:9000/circle/notes/user-1/file-cover.jpg",
+      "sortOrder": 1
+    }
+  ]
+}
+```
+
+**Response 201/200：** `NoteDetail`
+
+---
+
+### 更新笔记
+
+```
+PATCH /note/:id
+Authorization: Bearer <accessToken>
+```
+
+**Request Body：** 与创建笔记相同。  
+说明：媒体数组按“完整覆盖”处理，前端应传最新完整顺序。
+
+**Response 200：** `NoteDetail`
+
+---
+
+### 置顶 / 取消置顶
+
+```
+PATCH /note/:id/pin
+Authorization: Bearer <accessToken>
+```
+
+**Request Body：**
+```json
+{
+  "pinned": true
+}
+```
+
+**Response 200：**
+```json
+{
+  "id": "uuid",
+  "pinned": true
+}
+```
+
+---
+
+### 删除笔记
+
+```
+DELETE /note/:id
+Authorization: Bearer <accessToken>
+```
+
+> 软删除，`status` 更新为 `DELETED`
+
+**Response 204：** 无内容
+
+---
+
+### 获取笔记分组
+
+```
+GET /note/group
+Authorization: Bearer <accessToken>
+```
+
+**Response 200：**
+```json
+[
+  {
+    "id": "uuid",
+    "ownerID": "uuid",
+    "name": "上海",
+    "sortOrder": 0,
+    "noteCount": 12
+  }
+]
+```
+
+---
+
+### 新建笔记分组
+
+```
+POST /note/group
+Authorization: Bearer <accessToken>
+```
+
+**Request Body：**
+```json
+{
+  "name": "上海"
+}
+```
+
+**Response 200：** `NoteGroup`
+
+---
+
+### 修改笔记分组名称
+
+```
+PATCH /note/group/:id
+Authorization: Bearer <accessToken>
+```
+
+**Request Body：**
+```json
+{
+  "name": "深圳"
+}
+```
+
+**Response 200：** `NoteGroup`
+
+---
+
+### 删除笔记分组
+
+```
+DELETE /note/group/:id
+Authorization: Bearer <accessToken>
+```
+
+> 删除分组时，该分组下的笔记会自动变为未分组（`groupId = null`）
+
+**Response 204：** 无内容
 
 ---
 

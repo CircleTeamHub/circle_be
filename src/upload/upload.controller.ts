@@ -39,10 +39,13 @@ export class UploadController {
   })
   async presign(@Body() dto: PresignDto, @Req() req: any) {
     this.checkUserPresignLimit(req.user.userId);
+    // Pass userId for user-scoped folders so keys are namespaced per user,
+    // enabling server-side ownership verification at upload time.
     return this.uploadService.presign(
       dto.filename,
       dto.contentType,
       dto.folder ?? 'avatars',
+      req.user.userId,
     );
   }
 

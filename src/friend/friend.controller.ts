@@ -30,6 +30,7 @@ import {
   CreateFriendTagDto,
   FriendProfileDto,
   FriendRequestDto,
+  ReportFriendDto,
   FriendStatusDto,
   SendFriendRequestDto,
   SetRemarkDto,
@@ -71,6 +72,44 @@ export class FriendController {
     @Req() req: any,
   ): Promise<void> {
     return this.friendService.removeFriend(req.user.userId, friendUserId);
+  }
+
+  @Post(':friendUserId/blacklist')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Add a friend to the blacklist' })
+  @ApiNoContentResponse()
+  blacklistFriend(
+    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Req() req: any,
+  ): Promise<void> {
+    return this.friendService.blockUser(req.user.userId, friendUserId);
+  }
+
+  @Delete(':friendUserId/blacklist')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Remove a friend from the blacklist' })
+  @ApiNoContentResponse()
+  removeFriendFromBlacklist(
+    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Req() req: any,
+  ): Promise<void> {
+    return this.friendService.unblockUser(req.user.userId, friendUserId);
+  }
+
+  @Post(':friendUserId/report')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Submit a report against a friend' })
+  @ApiNoContentResponse()
+  reportFriend(
+    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
+    @Body() dto: ReportFriendDto,
+    @Req() req: any,
+  ): Promise<void> {
+    return this.friendService.reportFriend(
+      req.user.userId,
+      friendUserId,
+      dto,
+    );
   }
 
   // ─── Remark ───────────────────────────────────────────────────────────────────

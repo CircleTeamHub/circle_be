@@ -1,9 +1,11 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   ArrayUnique,
+  ArrayMaxSize,
   IsArray,
   IsEnum,
   IsHexColor,
+  IsNotEmpty,
   IsOptional,
   IsString,
   IsUUID,
@@ -52,6 +54,45 @@ export class BlockUserDto {
   @ApiProperty({ example: 'uuid-of-user-to-block' })
   @IsUUID()
   targetId: string;
+}
+
+export const FRIEND_REPORT_CATEGORIES = [
+  'harassment',
+  'spam',
+  'impersonation',
+  'fraud',
+  'other',
+] as const;
+
+export class ReportFriendDto {
+  @ApiProperty({
+    enum: FRIEND_REPORT_CATEGORIES,
+    example: 'harassment',
+  })
+  @IsEnum(FRIEND_REPORT_CATEGORIES)
+  category: (typeof FRIEND_REPORT_CATEGORIES)[number];
+
+  @ApiProperty({
+    example: 'Repeated abusive language in chat.',
+    maxLength: 500,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  description: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'Optional evidence references such as object keys or URLs.',
+    example: ['reports/chat-12345.png'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(5)
+  @ArrayUnique()
+  @IsString({ each: true })
+  @MaxLength(500, { each: true })
+  evidence?: string[];
 }
 
 export class FriendProfileDto {

@@ -11,6 +11,7 @@ import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
 import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
+import { NoteModule } from './note/note.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -32,6 +33,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     UploadModule,
     FriendModule,
     CoinModule,
+    NoteModule,
   ],
   controllers: [],
   providers: [Logger],

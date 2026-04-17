@@ -45,6 +45,17 @@ enum FriendActivityType {
   REQUEST_WITHDRAWN_BY_OTHER
 }
 
+enum NoteStatus {
+  ACTIVE
+  UNLISTED
+  DELETED
+}
+
+enum NoteMediaType {
+  IMAGE
+  VIDEO
+}
+
 enum ActionType {
   NEW_SQUAD
   JOIN_SQUAD
@@ -219,6 +230,10 @@ model User {
   friendActivities      FriendActivity[]      @relation("friendActivityViewer")
   friendActivitiesAuthored FriendActivity[]   @relation("friendActivityActor")
   friendActivitiesCounterparty FriendActivity[] @relation("friendActivityCounterparty")
+  friendReportsFiled    FriendReport[]        @relation("friendReportReporter")
+  friendReportsReceived FriendReport[]        @relation("friendReportTarget")
+  notes                 Note[]
+  noteGroups            NoteGroup[]
 }
 
 model RefreshToken {
@@ -260,6 +275,102 @@ model Friend {
 
   @@index([userID])
   @@index([friendID])
+}
+
+model FriendReport {
+  id          String   @id @default(uuid())
+  reporterID  String
+  targetID    String
+  category    String
+  description String
+  evidence    String[] @default([])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reporter User @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
+  target   User @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
+
+  @@index([reporterID, createdAt])
+  @@index([targetID, createdAt])
+}
+
+model Note {
+  id           String     @id @default(uuid())
+  ownerID      String
+  groupID      String?
+  title        String
+  content      String?
+  contentJson  Json?
+  status       NoteStatus @default(ACTIVE)
+  available    Boolean    @default(true)
+  pinned       Boolean    @default(false)
+  coverMediaID String?    @unique
+  mediaCount   Int        @default(0)
+  imageCount   Int        @default(0)
+  videoCount   Int        @default(0)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  owner      User       @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  group      NoteGroup? @relation(fields: [groupID], references: [id], onDelete: SetNull)
+  media      NoteMedia[] @relation("noteMediaItems")
+  coverMedia NoteMedia?  @relation("noteCoverMedia", fields: [coverMediaID], references: [id], onDelete: SetNull)
+  groupMemberships NoteGroupMembership[]
+
+  @@index([ownerID, status, updatedAt])
+  @@index([ownerID, pinned, updatedAt])
+  @@index([groupID])
+}
+
+model NoteMedia {
+  id         String        @id @default(uuid())
+  noteID     String
+  type       NoteMediaType
+  objectKey  String
+  url        String
+  mimeType   String?
+  size       Int?
+  width      Int?
+  height     Int?
+  durationMs Int?
+  posterUrl  String?
+  sortOrder  Int
+  createdAt  DateTime      @default(now())
+
+  note        Note  @relation("noteMediaItems", fields: [noteID], references: [id], onDelete: Cascade)
+  coverForNote Note? @relation("noteCoverMedia")
+
+  @@unique([noteID, sortOrder])
+  @@index([noteID, sortOrder])
+}
+
+model NoteGroup {
+  id        String    @id @default(uuid())
+  ownerID   String
+  name      String
+  sortOrder Int       @default(0)
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  owner User   @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  notes Note[]
+  memberships NoteGroupMembership[]
+
+  @@index([ownerID, deletedAt, sortOrder])
+}
+
+model NoteGroupMembership {
+  id        String   @id @default(uuid())
+  noteID    String
+  groupID   String
+  createdAt DateTime @default(now())
+
+  note  Note      @relation(fields: [noteID], references: [id], onDelete: Cascade)
+  group NoteGroup @relation(fields: [groupID], references: [id], onDelete: Cascade)
+
+  @@unique([noteID, groupID])
+  @@index([groupID])
 }
 
 model FriendActivity {

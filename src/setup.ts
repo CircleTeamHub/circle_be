@@ -43,6 +43,24 @@ const coinGiftLimiter = rateLimit({
   message: { message: 'Too many gift attempts, please try again later.' },
 } satisfies Partial<RateLimitOptions>);
 
+/** Note write abuse protection: 60 creates/updates per 15 min per IP. */
+const noteWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many note operations, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
+/** Friend report spam protection: 10 reports per hour per IP. */
+const friendReportLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many reports submitted, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
 export const setupApp = (app: INestApplication) => {
   const config = getServerConfig();
 
@@ -92,4 +110,13 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
   app.use('/api/v1/coin/gift', coinGiftLimiter);
+  app.use('/api/v1/note', noteWriteLimiter);
+  // Tighter limit on the report path — dynamic segment prevents an exact prefix
+  // match, so we use a middleware filter on the friend router.
+  app.use('/api/v1/friend', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' && /^\/[^/]+\/report$/.test(req.path)) {
+      return friendReportLimiter(req, res, next);
+    }
+    next();
+  });
 };

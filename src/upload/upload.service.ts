@@ -82,15 +82,18 @@ export class UploadService implements OnModuleInit {
 
   /**
    * 生成预签名上传 URL
-   * @param filename  原始文件名，用于提取扩展名
-   * @param contentType  MIME type，例如 image/jpeg
-   * @param folder  存储目录，例如 avatars、covers
-   * @param expiresIn  URL 有效秒数，默认 300（5 分钟）
+   * @param filename    原始文件名，用于提取扩展名
+   * @param contentType MIME type，例如 image/jpeg
+   * @param folder      存储目录，例如 avatars、covers
+   * @param userId      当前用户 ID。传入时 key 格式为 `folder/userId/uuid.ext`，
+   *                    使 assertMediaOwnership 可以按用户前缀校验所有权。
+   * @param expiresIn   URL 有效秒数，默认 300（5 分钟）
    */
   async presign(
     filename: string,
     contentType: string,
     folder = 'uploads',
+    userId?: string,
     expiresIn = contentType.startsWith('video/') ? 1800 : 300,
   ): Promise<PresignResult> {
     if (!this.enabled) {
@@ -98,7 +101,11 @@ export class UploadService implements OnModuleInit {
     }
 
     const ext = filename.split('.').pop() ?? 'bin';
-    const key = `${folder}/${randomUUID()}.${ext}`;
+    // Include userId in the path so the note service can enforce per-user
+    // media ownership at write time without trusting the client-supplied key.
+    const key = userId
+      ? `${folder}/${userId}/${randomUUID()}.${ext}`
+      : `${folder}/${randomUUID()}.${ext}`;
 
     const command = new PutObjectCommand({
       Bucket: this.bucket,

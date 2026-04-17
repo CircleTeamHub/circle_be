@@ -33,6 +33,7 @@ describe('AuthService', () => {
         users.push(user);
         return user;
       }),
+      update: jest.fn(),
     },
   };
 
@@ -75,6 +76,25 @@ describe('AuthService', () => {
       users.push(user);
       return user;
     });
+    mockPrisma.user.update.mockImplementation(
+      async ({ where, data, select }) => {
+        const user = users.find((u) => u.id === where.id);
+
+        if (!user) {
+          throw new Error('User not found');
+        }
+
+        Object.assign(user, data, { updatedAt: new Date() });
+
+        if (!select) {
+          return user;
+        }
+
+        return Object.fromEntries(
+          Object.keys(select).map((key) => [key, user[key]]),
+        );
+      },
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -197,8 +217,34 @@ describe('AuthService', () => {
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
   });
 
+  it('refresh updates lastOnline before returning new tokens', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      lastOnline: null,
+    });
+
+    const beforeRefresh = Date.now();
+    const result = await service.refresh('refresh-token');
+
+    expect(result.accessToken).toBe('access-token');
+    expect(result.refreshToken).toBe('new-refresh-token');
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'uuid-1' },
+        data: expect.objectContaining({
+          lastOnline: expect.any(Date),
+        }),
+      }),
+    );
+    expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
+  });
+
   it('loads city in the self profile response', async () => {
-    mockPrisma.user.findUnique.mockResolvedValueOnce({
+    users.push({
       id: 'uuid-1',
       accountId: 'testuser',
       nickname: 'Test User',
@@ -222,6 +268,7 @@ describe('AuthService', () => {
       updatedAt: new Date('2026-04-01T00:00:00.000Z'),
     });
 
+    const beforeMe = Date.now();
     const me = await service.me('uuid-1');
 
     expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
@@ -232,9 +279,24 @@ describe('AuthService', () => {
         gender: true,
       }),
     });
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'uuid-1' },
+        data: expect.objectContaining({
+          lastOnline: expect.any(Date),
+        }),
+        select: expect.objectContaining({
+          city: true,
+          birthday: true,
+          gender: true,
+        }),
+      }),
+    );
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
     });
+    expect(me.lastOnline).toBeInstanceOf(Date);
+    expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
   });
 });

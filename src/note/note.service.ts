@@ -13,6 +13,8 @@ import {
   ListNotesQueryDto,
   NoteDetailDto,
   NoteGroupDto,
+  NoteMediaType,
+  NoteStatus,
   NoteSummaryDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -59,13 +61,48 @@ function toPrismaJson(value: NoteContentBlock[] | null | undefined) {
   return value as Prisma.InputJsonValue;
 }
 
+// ── Typed row shapes returned by queries that use NOTE_INCLUDE ────────────────
+
+type NoteMediaRow = {
+  id: string;
+  type: NoteMediaType;
+  objectKey: string;
+  url: string;
+  mimeType: string | null;
+  size: number | null;
+  width: number | null;
+  height: number | null;
+  durationMs: number | null;
+  posterUrl: string | null;
+  sortOrder: number;
+};
+
+type NoteRow = {
+  id: string;
+  title: string;
+  content: string | null;
+  contentJson: unknown;
+  status: NoteStatus;
+  available: boolean;
+  pinned: boolean;
+  imageCount: number;
+  videoCount: number;
+  mediaCount: number;
+  createdAt: Date;
+  updatedAt: Date;
+  coverMedia: { id: string; type: NoteMediaType; url: string } | null;
+  groupMemberships: Array<{ group: { id: string; name: string } }>;
+  media: NoteMediaRow[];
+};
+
+type NoteGroupRow = {
+  id: string;
+  name: string;
+  sortOrder: number;
+  _count: { memberships: number };
+};
+
 const NOTE_INCLUDE = {
-  group: {
-    select: {
-      id: true,
-      name: true,
-    },
-  },
   media: {
     orderBy: {
       sortOrder: 'asc',
@@ -78,6 +115,21 @@ const NOTE_INCLUDE = {
       url: true,
     },
   },
+  groupMemberships: {
+    where: {
+      group: {
+        deletedAt: null,
+      },
+    },
+    include: {
+      group: {
+        select: {
+          id: true,
+          name: true,
+        },
+      },
+    },
+  },
 } as const;
 
 const MAX_GROUPS_PER_USER = 50;
@@ -85,6 +137,27 @@ const MAX_GROUPS_PER_USER = 50;
 @Injectable()
 export class NoteService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private async requireOwnedGroups(ownerID: string, groupIds: string[]) {
+    if (groupIds.length === 0) return [];
+
+    const groups = await this.prisma.noteGroup.findMany({
+      where: {
+        id: { in: groupIds },
+        ownerID,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    if (groups.length !== groupIds.length) {
+      throw new NotFoundException('Note group not found');
+    }
+
+    return groups;
+  }
 
   private async requireOwnedGroup(ownerID: string, groupId: string) {
     const group = await this.prisma.noteGroup.findFirst({
@@ -119,14 +192,16 @@ export class NoteService {
     return note;
   }
 
-  private assertMediaOwnership(
-    _ownerID: string,
-    media: CreateNoteDto['media'],
-  ) {
-    // Presign generates keys as `notes/{uuid}.ext` — check the folder prefix only.
-    const invalid = media.find((item) => !item.objectKey.startsWith('notes/'));
+  private assertMediaOwnership(ownerID: string, media: CreateNoteDto['media']) {
+    // Presign now generates keys as `notes/{userId}/{uuid}.ext`.
+    // Verify both the folder prefix and the user segment so a client cannot
+    // reference another user's uploaded media.
+    const prefix = `notes/${ownerID}/`;
+    const invalid = media.find((item) => !item.objectKey.startsWith(prefix));
     if (invalid) {
-      throw new BadRequestException('objectKey must start with notes/');
+      throw new BadRequestException(
+        `objectKey must start with notes/${ownerID}/`,
+      );
     }
   }
 
@@ -234,6 +309,8 @@ export class NoteService {
 
   private deriveNoteContent(input: CreateNoteDto | UpdateNoteDto) {
     const blocks = Array.isArray(input.contentJson) ? input.contentJson : [];
+    const extractedText =
+      blocks.length > 0 ? this.extractBlockText(blocks) : [];
 
     // Prefer explicitly provided media — the client sends full metadata including
     // objectKey. Only fall back to block-derived media when input.media is empty
@@ -243,9 +320,12 @@ export class NoteService {
 
     const derivedContent =
       blocks.length > 0
-        ? this.extractBlockText(blocks).join(' ').trim()
+        ? extractedText.join(' ').trim()
         : (input.content ?? '').trim();
-    const derivedTitle = input.title.trim();
+    const derivedTitle =
+      blocks.length > 0
+        ? (extractedText[0] ?? input.title).trim()
+        : input.title.trim();
 
     return {
       contentJson: blocks.length > 0 ? blocks : null,
@@ -255,7 +335,12 @@ export class NoteService {
     };
   }
 
-  private mapSummary(note: any): NoteSummaryDto {
+  private mapSummary(note: NoteRow): NoteSummaryDto {
+    const groups = (note.groupMemberships ?? []).map((membership: any) => ({
+      id: membership.group.id,
+      name: membership.group.name,
+    }));
+
     return {
       id: note.id,
       title: note.title,
@@ -263,12 +348,7 @@ export class NoteService {
       status: note.status,
       available: note.available,
       pinned: note.pinned,
-      group: note.group
-        ? {
-            id: note.group.id,
-            name: note.group.name,
-          }
-        : null,
+      groups,
       cover: note.coverMedia
         ? {
             id: note.coverMedia.id,
@@ -290,12 +370,12 @@ export class NoteService {
     };
   }
 
-  private mapDetail(note: any): NoteDetailDto {
+  private mapDetail(note: NoteRow): NoteDetailDto {
     return {
       ...this.mapSummary(note),
       content: note.content ?? null,
       contentJson: Array.isArray(note.contentJson) ? note.contentJson : null,
-      media: (note.media ?? []).map((item: any) => ({
+      media: note.media.map((item) => ({
         id: item.id,
         type: item.type,
         objectKey: item.objectKey,
@@ -311,12 +391,12 @@ export class NoteService {
     };
   }
 
-  private mapGroup(group: any): NoteGroupDto {
+  private mapGroup(group: NoteGroupRow): NoteGroupDto {
     return {
       id: group.id,
       name: group.name,
       sortOrder: group.sortOrder,
-      noteCount: group._count?.notes ?? 0,
+      noteCount: group._count.memberships,
     };
   }
 
@@ -324,9 +404,8 @@ export class NoteService {
     ownerID: string,
     input: CreateNoteDto,
   ): Promise<NoteDetailDto> {
-    if (input.groupId) {
-      await this.requireOwnedGroup(ownerID, input.groupId);
-    }
+    const uniqueGroupIds = [...new Set(input.groupIds ?? [])];
+    await this.requireOwnedGroups(ownerID, uniqueGroupIds);
 
     const derived = this.deriveNoteContent(input);
     this.assertMediaOwnership(ownerID, derived.media);
@@ -349,7 +428,7 @@ export class NoteService {
           title: derived.title,
           content: derived.content,
           contentJson: toPrismaJson(derived.contentJson),
-          groupID: input.groupId ?? null,
+          groupID: null,
           status: input.status ?? 'ACTIVE',
           available: true,
           pinned: input.pinned ?? false,
@@ -372,6 +451,15 @@ export class NoteService {
             durationMs: item.durationMs ?? null,
             posterUrl: item.posterUrl ?? null,
             sortOrder: item.sortOrder,
+          })),
+        });
+      }
+
+      if (uniqueGroupIds.length > 0) {
+        await tx.noteGroupMembership.createMany({
+          data: uniqueGroupIds.map((groupID) => ({
+            noteID: note.id,
+            groupID,
           })),
         });
       }
@@ -400,7 +488,18 @@ export class NoteService {
       where: {
         ownerID,
         status: query.status ?? { not: 'DELETED' },
-        groupID: query.groupId ?? undefined,
+        ...(query.groupId
+          ? {
+              groupMemberships: {
+                some: {
+                  groupID: query.groupId,
+                  group: {
+                    deletedAt: null,
+                  },
+                },
+              },
+            }
+          : {}),
         ...(query.search?.trim()
           ? {
               OR: [
@@ -439,9 +538,8 @@ export class NoteService {
     noteId: string,
     input: UpdateNoteDto,
   ): Promise<NoteDetailDto> {
-    if (input.groupId) {
-      await this.requireOwnedGroup(ownerID, input.groupId);
-    }
+    const uniqueGroupIds = [...new Set(input.groupIds ?? [])];
+    await this.requireOwnedGroups(ownerID, uniqueGroupIds);
 
     const derived = this.deriveNoteContent(input);
     this.assertMediaOwnership(ownerID, derived.media);
@@ -461,13 +559,17 @@ export class NoteService {
       // where a concurrent delete could cause this update to un-delete the note.
       const existing = await tx.note.findFirst({
         where: { id: noteId, ownerID, status: { not: 'DELETED' } },
-        select: { id: true },
+        select: { id: true, status: true },
       });
       if (!existing) {
         throw new NotFoundException('Note not found');
       }
 
       await tx.noteMedia.deleteMany({
+        where: { noteID: noteId },
+      });
+
+      await tx.noteGroupMembership.deleteMany({
         where: { noteID: noteId },
       });
 
@@ -490,14 +592,25 @@ export class NoteService {
         });
       }
 
+      if (uniqueGroupIds.length > 0) {
+        await tx.noteGroupMembership.createMany({
+          data: uniqueGroupIds.map((groupID) => ({
+            noteID: noteId,
+            groupID,
+          })),
+        });
+      }
+
       return tx.note.update({
         where: { id: noteId },
         data: {
           title: derived.title,
           content: derived.content,
           contentJson: toPrismaJson(derived.contentJson),
-          groupID: input.groupId ?? null,
-          status: input.status ?? 'ACTIVE',
+          groupID: null,
+          // Preserve the existing status when the caller omits it — omitting
+          // status on a PATCH must not silently promote an UNLISTED note to ACTIVE.
+          status: input.status ?? existing.status,
           pinned: input.pinned ?? false,
           coverMediaID,
           ...counts,
@@ -511,8 +624,10 @@ export class NoteService {
 
   async setPinned(ownerID: string, noteId: string, pinned: boolean) {
     await this.requireOwnedNote(ownerID, noteId);
+    // Include ownerID + status guard in the write to close the TOCTOU window
+    // between the ownership check above and this update.
     return this.prisma.note.update({
-      where: { id: noteId },
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       data: { pinned },
       select: {
         id: true,
@@ -523,8 +638,9 @@ export class NoteService {
 
   async setAvailable(ownerID: string, noteId: string, available: boolean) {
     await this.requireOwnedNote(ownerID, noteId);
+    // Include ownerID + status guard in the write to close the TOCTOU window.
     return this.prisma.note.update({
-      where: { id: noteId },
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       data: { available },
       select: {
         id: true,
@@ -543,20 +659,27 @@ export class NoteService {
   }
 
   async listGroups(ownerID: string): Promise<NoteGroupDto[]> {
-    const groups = await this.prisma.noteGroup.findMany({
-      where: {
-        ownerID,
-        deletedAt: null,
-      },
-      include: {
-        _count: {
-          select: {
-            notes: { where: { status: { not: 'DELETED' } } },
+    const groups =
+      (await this.prisma.noteGroup.findMany({
+        where: {
+          ownerID,
+          deletedAt: null,
+        },
+        include: {
+          _count: {
+            select: {
+              memberships: {
+                where: {
+                  note: {
+                    status: { not: 'DELETED' },
+                  },
+                },
+              },
+            },
           },
         },
-      },
-      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-    });
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      })) ?? [];
 
     return groups.map((group) => this.mapGroup(group));
   }
@@ -591,6 +714,7 @@ export class NoteService {
       data: {
         ownerID,
         name: normalizedName,
+        sortOrder: groupCount,
       },
     });
 
@@ -607,6 +731,8 @@ export class NoteService {
     groupId: string,
     input: UpdateNoteGroupDto,
   ): Promise<NoteGroupDto> {
+    const normalizedName = input.name.trim();
+
     const group = await this.prisma.noteGroup.findFirst({
       where: {
         id: groupId,
@@ -619,15 +745,32 @@ export class NoteService {
       throw new NotFoundException('Note group not found');
     }
 
+    // Only check for name conflicts when the name is actually changing.
+    if (group.name !== normalizedName) {
+      const conflict = await this.prisma.noteGroup.findFirst({
+        where: { ownerID, name: normalizedName, deletedAt: null },
+        select: { id: true },
+      });
+      if (conflict) {
+        throw new ConflictException('Note group already exists');
+      }
+    }
+
     const updated = await this.prisma.noteGroup.update({
       where: { id: groupId },
       data: {
-        name: input.name.trim(),
+        name: normalizedName,
       },
       include: {
         _count: {
           select: {
-            notes: { where: { status: { not: 'DELETED' } } },
+            memberships: {
+              where: {
+                note: {
+                  status: { not: 'DELETED' },
+                },
+              },
+            },
           },
         },
       },
@@ -650,20 +793,62 @@ export class NoteService {
     }
 
     await this.prisma.$transaction(async (tx) => {
-      await tx.note.updateMany({
-        where: {
-          ownerID,
-          groupID: groupId,
-        },
-        data: {
-          groupID: null,
-        },
-      });
+      await tx.noteGroupMembership.deleteMany({ where: { groupID: groupId } });
 
       await tx.noteGroup.update({
         where: { id: groupId },
         data: { deletedAt: new Date() },
       });
+
+      // Rebalance sortOrder in a single UPDATE … FROM (ROW_NUMBER) query instead
+      // of N individual updates, keeping the transaction lean regardless of how
+      // many groups the user has.
+      await tx.$executeRaw`
+        UPDATE "NoteGroup"
+        SET    "sortOrder" = ordered.rn
+        FROM   (
+          SELECT id,
+                 (ROW_NUMBER() OVER (
+                   ORDER BY "sortOrder" ASC, "createdAt" ASC
+                 ) - 1)::INT AS rn
+          FROM   "NoteGroup"
+          WHERE  "ownerID" = ${ownerID}
+            AND  "deletedAt" IS NULL
+        ) AS ordered
+        WHERE  "NoteGroup".id = ordered.id
+      `;
     });
+  }
+
+  async reorderGroups(
+    ownerID: string,
+    groupIds: string[],
+  ): Promise<NoteGroupDto[]> {
+    const uniqueGroupIds = [...new Set(groupIds)];
+
+    // Require the caller to supply every group — partial reorders leave stale
+    // sortOrder values that collide with the newly assigned ones.
+    const totalCount = await this.prisma.noteGroup.count({
+      where: { ownerID, deletedAt: null },
+    });
+    if (uniqueGroupIds.length !== totalCount) {
+      throw new BadRequestException(
+        `reorderGroups must include all ${totalCount} group(s); received ${uniqueGroupIds.length}`,
+      );
+    }
+
+    // Ownership check (also guards against cross-user IDs in the list).
+    await this.requireOwnedGroups(ownerID, uniqueGroupIds);
+
+    await this.prisma.$transaction(
+      uniqueGroupIds.map((groupId, index) =>
+        this.prisma.noteGroup.update({
+          where: { id: groupId },
+          data: { sortOrder: index },
+        }),
+      ),
+    );
+
+    return this.listGroups(ownerID);
   }
 }

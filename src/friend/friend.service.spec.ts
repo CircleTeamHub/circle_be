@@ -1,5 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  NotFoundException,
+} from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { FriendState, Prisma } from 'src/generated/prisma';
@@ -20,6 +24,8 @@ describe('FriendService', () => {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
       create: jest.fn(),
+      delete: jest.fn(),
+      findMany: jest.fn(),
     },
     friend: {
       create: jest.fn(),
@@ -52,6 +58,10 @@ describe('FriendService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
+    },
+    friendReport: {
+      create: jest.fn(),
+      findFirst: jest.fn(),
     },
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
@@ -471,6 +481,144 @@ describe('FriendService', () => {
       'met at school',
       ['tag-1'],
     );
+  });
+
+  it('rejects reporting yourself', async () => {
+    await expect(
+      service.reportFriend('user-1', 'user-1', {
+        category: 'spam',
+        description: 'self report',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.friendReport.create).not.toHaveBeenCalled();
+  });
+
+  it('creates a friend report for an active friendship', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      state: FriendState.ACCEPTED,
+      userID: 'user-1',
+      friendID: 'user-2',
+    });
+    // No duplicate report exists yet
+    prisma.friendReport.findFirst.mockResolvedValue(null);
+    prisma.friendReport.create.mockResolvedValue({
+      id: 'report-1',
+      reporterID: 'user-1',
+      targetID: 'user-2',
+    });
+
+    await service.reportFriend('user-1', 'user-2', {
+      category: 'harassment',
+      description: ' abusive language ',
+      evidence: ['s3://bucket/report-1.png'],
+    });
+
+    expect(prisma.friendReport.create).toHaveBeenCalledWith({
+      data: {
+        reporterID: 'user-1',
+        targetID: 'user-2',
+        category: 'harassment',
+        description: 'abusive language',
+        evidence: ['s3://bucket/report-1.png'],
+      },
+    });
+  });
+
+  it('rejects a duplicate report for the same reporter/target/category', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      state: FriendState.ACCEPTED,
+      userID: 'user-1',
+      friendID: 'user-2',
+    });
+    // Simulate an existing report for this combination
+    prisma.friendReport.findFirst.mockResolvedValue({ id: 'existing-report' });
+
+    await expect(
+      service.reportFriend('user-1', 'user-2', {
+        category: 'harassment',
+        description: 'again',
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    expect(prisma.friendReport.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects reporting a non-friend target through the friend API', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.reportFriend('user-1', 'user-2', {
+        category: 'fraud',
+        description: 'fake investment pitch',
+      }),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(prisma.friendReport.create).not.toHaveBeenCalled();
+  });
+
+  it('passes report payloads through the controller with the current user', async () => {
+    const serviceMock = {
+      reportFriend: jest.fn().mockResolvedValue(undefined),
+    };
+    const controller = new FriendController(serviceMock as any);
+
+    await controller.reportFriend(
+      'user-2',
+      {
+        category: 'impersonation',
+        description: 'pretending to be support',
+        evidence: ['proof-1'],
+      } as any,
+      { user: { userId: 'user-1' } } as any,
+    );
+
+    expect(serviceMock.reportFriend).toHaveBeenCalledWith('user-1', 'user-2', {
+      category: 'impersonation',
+      description: 'pretending to be support',
+      evidence: ['proof-1'],
+    });
+  });
+
+  it('supports the restful blacklist controller route', async () => {
+    const serviceMock = {
+      blockUser: jest.fn().mockResolvedValue(undefined),
+    };
+    const controller = new FriendController(serviceMock as any);
+
+    await controller.blacklistFriend('user-2', {
+      user: { userId: 'user-1' },
+    } as any);
+
+    expect(serviceMock.blockUser).toHaveBeenCalledWith('user-1', 'user-2');
+  });
+
+  it('supports the restful unblacklist controller route', async () => {
+    const serviceMock = {
+      unblockUser: jest.fn().mockResolvedValue(undefined),
+    };
+    const controller = new FriendController(serviceMock as any);
+
+    await controller.removeFriendFromBlacklist('user-2', {
+      user: { userId: 'user-1' },
+    } as any);
+
+    expect(serviceMock.unblockUser).toHaveBeenCalledWith('user-1', 'user-2');
   });
 
   it('marks a pending request as withdrawn and notifies the recipient', async () => {
