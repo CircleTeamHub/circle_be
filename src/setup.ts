@@ -61,6 +61,24 @@ const friendReportLimiter = rateLimit({
   message: { message: 'Too many reports submitted, please try again later.' },
 } satisfies Partial<RateLimitOptions>);
 
+/** Circle writes: 40 mutating requests / 15 min per IP. */
+const circleWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many circle operations, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
+/** Trace writes: 120 mutating requests / 15 min per IP. */
+const traceWriteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many moment operations, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
+
 export const setupApp = (app: INestApplication) => {
   const config = getServerConfig();
 
@@ -111,6 +129,30 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/friend/requests', friendRequestLimiter);
   app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', noteWriteLimiter);
+  app.use('/api/v1/circle', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' || req.method === 'DELETE') {
+      return circleWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/circle-invitation', (req: any, res: any, next: any) => {
+    if (req.method === 'POST') {
+      return circleWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/circle-plaza', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' || req.method === 'DELETE') {
+      return circleWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/trace', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' || req.method === 'DELETE') {
+      return traceWriteLimiter(req, res, next);
+    }
+    next();
+  });
   // Tighter limit on the report path — dynamic segment prevents an exact prefix
   // match, so we use a middleware filter on the friend router.
   app.use('/api/v1/friend', (req: any, res: any, next: any) => {

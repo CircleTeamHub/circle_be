@@ -12,6 +12,10 @@ import { UploadModule } from './upload/upload.module';
 import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
 import { NoteModule } from './note/note.module';
+import { CircleModule } from './circle/circle.module';
+import { CirclePlazaModule } from './circle-plaza/circle-plaza.module';
+import { CircleInvitationModule } from './circle-invitation/circle-invitation.module';
+import { TraceModule } from './trace/trace.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -34,6 +38,10 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     FriendModule,
     CoinModule,
     NoteModule,
+    CircleModule,
+    CirclePlazaModule,
+    CircleInvitationModule,
+    TraceModule,
   ],
   controllers: [],
   providers: [Logger],

@@ -1,0 +1,390 @@
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  CreateTraceCommentDto,
+  CreateTraceDto,
+  TraceCommentDto,
+  TraceDto,
+  TraceFeedQueryDto,
+} from './dto/trace.dto';
+
+const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
+const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
+
+@Injectable()
+export class TraceService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  // ─── Feed ──────────────────────────────────────────────────────────────────
+
+  async getFeed(
+    userId: string,
+    query: TraceFeedQueryDto,
+  ): Promise<{
+    items: TraceDto[];
+    total: number;
+    page: number;
+    limit: number;
+    hasMore: boolean;
+  }> {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = (page - 1) * limit;
+
+    const friendIds = await this.getAcceptedFriendIds(userId);
+    const visibleUserIds = [userId, ...friendIds];
+
+    const where = {
+      deleted: false,
+      fromID: { in: visibleUserIds },
+      OR: [
+        { fromID: userId },
+        { visibility: 'FRIENDS_ONLY' as const },
+        { visibility: 'PUBLIC' as const },
+      ],
+    };
+
+    const [traces, total] = await Promise.all([
+      this.prisma.trace.findMany({
+        where,
+        include: {
+          from: { select: { id: true, nickname: true, avatarUrl: true } },
+          likeStats: {
+            where: { deleted: false },
+            orderBy: { updatedAt: 'desc' },
+            take: TRACE_FEED_LIKE_PREVIEW_LIMIT,
+            include: { user: { select: { id: true, nickname: true } } },
+          },
+          comments: {
+            where: { deleted: false },
+            include: {
+              user: { select: { id: true, nickname: true } },
+              replyTo: {
+                include: { user: { select: { id: true, nickname: true } } },
+              },
+            },
+            orderBy: { createdAt: 'desc' },
+            take: TRACE_FEED_COMMENT_PREVIEW_LIMIT,
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.trace.count({ where }),
+    ]);
+
+    const friendIdSet = new Set(friendIds);
+
+    const items = traces.map((trace) =>
+      this.toTraceDto(trace, userId, friendIdSet),
+    );
+
+    return {
+      items,
+      total,
+      page,
+      limit,
+      hasMore: skip + traces.length < total,
+    };
+  }
+
+  async getNewCount(userId: string, since: string): Promise<number> {
+    const sinceAt = new Date(since);
+    if (Number.isNaN(sinceAt.getTime())) {
+      throw new BadRequestException('Invalid timestamp');
+    }
+
+    const friendIds = await this.getAcceptedFriendIds(userId);
+    const visibleUserIds = [userId, ...friendIds];
+
+    return this.prisma.trace.count({
+      where: {
+        deleted: false,
+        fromID: { in: visibleUserIds },
+        createdAt: { gt: sinceAt },
+        OR: [
+          { fromID: userId },
+          { visibility: 'FRIENDS_ONLY' },
+          { visibility: 'PUBLIC' },
+        ],
+      },
+    });
+  }
+
+  // ─── Create / Delete ───────────────────────────────────────────────────────
+
+  async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
+    const trace = await this.prisma.trace.create({
+      data: {
+        content: dto.content,
+        images: dto.images ?? [],
+        visibility: dto.visibility ?? 'FRIENDS_ONLY',
+        type: 'MOMENT',
+        fromID: userId,
+      },
+      include: {
+        from: { select: { id: true, nickname: true, avatarUrl: true } },
+      },
+    });
+
+    return {
+      id: trace.id,
+      content: trace.content,
+      images: trace.images,
+      visibility: trace.visibility,
+      author: {
+        id: trace.from.id,
+        nickname: trace.from.nickname,
+        avatarUrl: trace.from.avatarUrl,
+      },
+      likeCount: 0,
+      commentCount: 0,
+      isLikedByMe: false,
+      likedFriends: [],
+      comments: [],
+      createdAt: trace.createdAt.toISOString(),
+    };
+  }
+
+  async deleteTrace(userId: string, traceId: string): Promise<void> {
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+    });
+    if (!trace) throw new NotFoundException('Moment not found');
+    if (trace.fromID !== userId) {
+      throw new ForbiddenException('Only the author can delete');
+    }
+    await this.prisma.trace.update({
+      where: { id: traceId },
+      data: { deleted: true },
+    });
+  }
+
+  // ─── Like ──────────────────────────────────────────────────────────────────
+
+  async toggleLike(
+    userId: string,
+    traceId: string,
+  ): Promise<{ liked: boolean; likeCount: number }> {
+    const trace = await this.requireVisibleTrace(traceId, userId);
+
+    const existing = await this.prisma.traceLikeStat.findFirst({
+      where: { traceID: traceId, userID: userId },
+    });
+
+    if (existing) {
+      const nowLiked = existing.deleted;
+      await this.prisma.$transaction([
+        this.prisma.traceLikeStat.update({
+          where: { id: existing.id },
+          data: { deleted: !nowLiked },
+        }),
+        this.prisma.trace.update({
+          where: { id: traceId },
+          data: { likeCount: { increment: nowLiked ? 1 : -1 } },
+        }),
+      ]);
+      return {
+        liked: nowLiked,
+        likeCount: trace.likeCount + (nowLiked ? 1 : -1),
+      };
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.traceLikeStat.create({
+        data: { traceID: traceId, userID: userId },
+      }),
+      this.prisma.trace.update({
+        where: { id: traceId },
+        data: { likeCount: { increment: 1 } },
+      }),
+    ]);
+
+    return { liked: true, likeCount: trace.likeCount + 1 };
+  }
+
+  // ─── Comment ───────────────────────────────────────────────────────────────
+
+  async addComment(
+    userId: string,
+    traceId: string,
+    dto: CreateTraceCommentDto,
+  ): Promise<TraceCommentDto> {
+    await this.requireVisibleTrace(traceId, userId);
+
+    if (dto.replyToId) {
+      const replyTarget = await this.prisma.traceComment.findFirst({
+        where: { id: dto.replyToId, deleted: false },
+        select: { id: true, traceID: true },
+      });
+      if (!replyTarget) {
+        throw new BadRequestException('Reply target not found');
+      }
+      if (replyTarget.traceID !== traceId) {
+        throw new BadRequestException(
+          'Reply target must belong to the same trace',
+        );
+      }
+    }
+
+    const comment = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.traceComment.create({
+        data: {
+          content: dto.content,
+          traceID: traceId,
+          userID: userId,
+          replyToID: dto.replyToId ?? null,
+          parentID: dto.replyToId ?? null,
+        },
+        include: {
+          user: { select: { id: true, nickname: true } },
+          replyTo: {
+            include: { user: { select: { id: true, nickname: true } } },
+          },
+        },
+      });
+
+      await tx.trace.update({
+        where: { id: traceId },
+        data: { replyCount: { increment: 1 } },
+      });
+
+      return created;
+    });
+
+    return {
+      id: comment.id,
+      content: comment.content,
+      user: { id: comment.user.id, nickname: comment.user.nickname },
+      replyTo: comment.replyTo
+        ? {
+            id: comment.replyTo.user.id,
+            nickname: comment.replyTo.user.nickname,
+          }
+        : null,
+      createdAt: comment.createdAt.toISOString(),
+    };
+  }
+
+  async deleteComment(userId: string, commentId: string): Promise<void> {
+    const comment = await this.prisma.traceComment.findFirst({
+      where: { id: commentId, deleted: false },
+    });
+    if (!comment) throw new NotFoundException('Comment not found');
+    if (comment.userID !== userId) {
+      throw new ForbiddenException('Only the author can delete');
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.traceComment.update({
+        where: { id: commentId },
+        data: { deleted: true },
+      }),
+      this.prisma.trace.update({
+        where: { id: comment.traceID },
+        data: { replyCount: { decrement: 1 } },
+      }),
+    ]);
+  }
+
+  // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private async getAcceptedFriendIds(userId: string): Promise<string[]> {
+    const records = await this.prisma.friend.findMany({
+      where: {
+        OR: [{ userID: userId }, { friendID: userId }],
+        state: 'ACCEPTED',
+      },
+      select: { userID: true, friendID: true },
+    });
+    return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
+  }
+
+  private async requireVisibleTrace(traceId: string, viewerId: string) {
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+    });
+    if (!trace) {
+      throw new NotFoundException('Moment not found');
+    }
+    if (trace.fromID === viewerId || trace.visibility === 'PUBLIC') {
+      return trace;
+    }
+    if (trace.visibility === 'FRIENDS_ONLY') {
+      const friendIds = await this.getAcceptedFriendIds(viewerId);
+      if (friendIds.includes(trace.fromID)) {
+        return trace;
+      }
+    }
+
+    throw new ForbiddenException('You are not allowed to access this moment');
+  }
+
+  private toTraceDto(
+    trace: any,
+    viewerId: string,
+    friendIdSet: Set<string>,
+  ): TraceDto {
+    // Filter likes and comments to only show mutual friends (WeChat Moments logic)
+    const mutualLikes = trace.likeStats
+      .filter(
+        (ls: any) =>
+          ls.userID === viewerId ||
+          ls.userID === trace.fromID ||
+          friendIdSet.has(ls.userID),
+      )
+      .map((ls: any) => ({
+        id: ls.user.id,
+        nickname: ls.user.nickname,
+      }));
+
+    const mutualComments = [...trace.comments]
+      .reverse()
+      .filter(
+        (c: any) =>
+          c.userID === viewerId ||
+          c.userID === trace.fromID ||
+          friendIdSet.has(c.userID),
+      )
+      .map(
+        (c: any): TraceCommentDto => ({
+          id: c.id,
+          content: c.content,
+          user: { id: c.user.id, nickname: c.user.nickname },
+          replyTo:
+            c.replyTo && c.replyTo.user
+              ? { id: c.replyTo.user.id, nickname: c.replyTo.user.nickname }
+              : null,
+          createdAt: c.createdAt.toISOString(),
+        }),
+      );
+
+    const isLikedByMe = trace.likeStats.some(
+      (ls: any) => ls.userID === viewerId && !ls.deleted,
+    );
+
+    return {
+      id: trace.id,
+      content: trace.content,
+      images: trace.images,
+      visibility: trace.visibility,
+      author: {
+        id: trace.from.id,
+        nickname: trace.from.nickname,
+        avatarUrl: trace.from.avatarUrl,
+      },
+      likeCount: trace.likeCount,
+      commentCount: trace.replyCount,
+      isLikedByMe,
+      likedFriends: mutualLikes,
+      comments: mutualComments,
+      createdAt: trace.createdAt.toISOString(),
+    };
+  }
+}

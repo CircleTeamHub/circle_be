@@ -1,0 +1,91 @@
+import { ForbiddenException } from '@nestjs/common';
+import { Test, TestingModule } from '@nestjs/testing';
+import { OpenimService } from 'src/openim/openim.service';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { CircleInvitationService } from './circle-invitation.service';
+
+describe('CircleInvitationService', () => {
+  let service: CircleInvitationService;
+
+  const prisma = {
+    circleInvitation: {
+      findUnique: jest.fn(),
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+    circleInvitationVerifier: {
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+    circleMember: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+    },
+    circleActivity: {
+      create: jest.fn(),
+    },
+    circle: {
+      findFirst: jest.fn(),
+      update: jest.fn(),
+    },
+    user: {
+      findUnique: jest.fn(),
+    },
+    $transaction: jest.fn(async (input: any) => input(prisma)),
+  };
+
+  const openimService = {
+    addGroupMembers: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        CircleInvitationService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: OpenimService, useValue: openimService },
+      ],
+    }).compile();
+
+    service = module.get(CircleInvitationService);
+  });
+
+  it('rejects invitation detail access for unrelated users', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      requiredCount: 10,
+      approvedCount: 1,
+      status: 'PENDING',
+      createdAt: new Date('2026-04-21T00:00:00.000Z'),
+      circle: { id: 'circle-1', name: 'Trusted Circle' },
+      applicant: {
+        id: 'applicant-1',
+        nickname: 'Applicant',
+        avatarUrl: null,
+        accountId: 'applicant',
+      },
+      inviter: {
+        id: 'inviter-1',
+        nickname: 'Inviter',
+        avatarUrl: null,
+        accountId: 'inviter',
+      },
+      verifiers: [],
+    });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.getInvitationForViewer('outsider-1', 'inv-1'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+});

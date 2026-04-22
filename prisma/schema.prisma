@@ -101,6 +101,57 @@ enum SquadRequestState {
   EXPIRED
 }
 
+enum CirclePostStatus {
+  ACTIVE
+  DELETED
+}
+
+enum CircleMemberRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum CircleMemberStatus {
+  ACTIVE
+  PENDING
+  REJECTED
+}
+
+enum CircleCategory {
+  LIFE
+  FOOD
+  SPORTS
+  SOCIAL
+  GAMING
+  PHOTOGRAPHY
+  WORK
+  TRADE
+  CUSTOM
+}
+
+enum CircleInvitationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ADMIN_APPROVED
+}
+
+enum CircleInvitationVerifierStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CircleActivityType {
+  VERIFICATION_REQUESTED
+  VERIFICATION_APPROVED
+  VERIFICATION_REJECTED
+  INVITATION_ALL_APPROVED
+  INVITATION_SLOT_REJECTED
+  ADMIN_OVERRIDE_APPROVED
+}
+
 enum EventStatus {
   COMING
   LIVE
@@ -189,6 +240,9 @@ model User {
   gender        Gender     @default(unset)
   role          UserRole   @default(USER)
   status        UserStatus @default(ACTIVE)
+  vipLevel      Int        @default(0)
+  creditScore   Int        @default(100)
+  fancyNumber   Boolean    @default(false)
   openimSynced  Boolean    @default(false)
   lastOnline    DateTime?
   createdAt     DateTime   @default(now())
@@ -234,6 +288,15 @@ model User {
   friendReportsReceived FriendReport[]        @relation("friendReportTarget")
   notes                 Note[]
   noteGroups            NoteGroup[]
+  circles               Circle[]
+  circleMembers         CircleMember[]
+  circlePosts           CirclePost[]
+  circleInvitationsAsApplicant  CircleInvitation[]          @relation("invitationApplicant")
+  circleInvitationsAsInviter    CircleInvitation[]          @relation("invitationInviter")
+  circleVerifications           CircleInvitationVerifier[]  @relation("verifierUser")
+  circleVerificationsAdded      CircleInvitationVerifier[]  @relation("verifierAddedBy")
+  circleActivitiesViewed        CircleActivity[]            @relation("circleActivityViewer")
+  circleActivitiesActed         CircleActivity[]            @relation("circleActivityActor")
 }
 
 model RefreshToken {
@@ -619,6 +682,8 @@ model traceLikeStat {
   updatedAt DateTime @updatedAt
   trace     Trace    @relation(fields: [traceID], references: [id], onDelete: Cascade)
   user      User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@unique([traceID, userID])
 }
 
 model traceViewedStat {
@@ -932,4 +997,137 @@ model UserBlockedContent {
 
   @@unique([userID, traceID])
   @@index([userID, creatorID])
+}
+
+// ─── Circle Plaza ────────────────────────────────────────────────────────────
+
+model Circle {
+  id          String         @id @default(uuid())
+  name        String
+  description String         @default("")
+  avatarUrl   String?
+  ownerID     String
+  cities      String[]       @default([])
+  isPublic    Boolean        @default(true)
+  categories  String[]       @default([])
+  rules       String         @default("")
+  tags        String[]       @default([])
+  joinVipRestriction    Int?
+  joinCreditRestriction Int?
+  joinFancyRestriction  Boolean  @default(false)
+  maxMembers     Int?
+  memberCanPost  Boolean   @default(true)
+  groupID        String?   @unique
+  memberCount Int      @default(0)
+  postCount   Int      @default(0)
+  deleted     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner       User               @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  posts       CirclePost[]
+  members     CircleMember[]
+  invitations CircleInvitation[]
+  activities  CircleActivity[]
+
+  @@index([ownerID])
+}
+
+model CircleMember {
+  id        String             @id @default(uuid())
+  userID    String
+  circleID  String
+  role      CircleMemberRole   @default(MEMBER)
+  status    CircleMemberStatus @default(PENDING)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  user   User   @relation(fields: [userID], references: [id], onDelete: Cascade)
+  circle Circle @relation(fields: [circleID], references: [id], onDelete: Cascade)
+
+  @@unique([userID, circleID])
+  @@index([circleID])
+}
+
+model CirclePost {
+  id                String           @id @default(uuid())
+  content           String           @default("")
+  images            String[]         @default([])
+  tags              String[]         @default([])
+  city              String?
+  isHorn            Boolean          @default(false)
+  noteID            String?
+  vipRestriction    Int?
+  creditRestriction Int?
+  fancyRestriction  Boolean          @default(false)
+  viewCount         Int              @default(0)
+  status            CirclePostStatus @default(ACTIVE)
+  authorID          String
+  circleID          String
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  author User   @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  circle Circle @relation(fields: [circleID], references: [id], onDelete: Cascade)
+
+  @@index([circleID, createdAt(sort: Desc)])
+  @@index([authorID])
+  @@index([city, createdAt(sort: Desc)])
+}
+
+model CircleInvitation {
+  id            String                 @id @default(uuid())
+  circleID      String
+  applicantID   String
+  inviterID     String
+  requiredCount Int                    @default(10)
+  approvedCount Int                    @default(0)
+  status        CircleInvitationStatus @default(PENDING)
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+
+  circle     Circle                    @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  applicant  User                      @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
+  inviter    User                      @relation("invitationInviter", fields: [inviterID], references: [id], onDelete: Cascade)
+  verifiers  CircleInvitationVerifier[]
+  activities CircleActivity[]
+
+  @@index([circleID, status])
+  @@index([applicantID])
+}
+
+model CircleInvitationVerifier {
+  id           String                        @id @default(uuid())
+  invitationID String
+  verifierID   String
+  addedByID    String
+  status       CircleInvitationVerifierStatus @default(PENDING)
+  respondedAt  DateTime?
+  createdAt    DateTime                      @default(now())
+
+  invitation CircleInvitation @relation(fields: [invitationID], references: [id], onDelete: Cascade)
+  verifier   User             @relation("verifierUser", fields: [verifierID], references: [id], onDelete: Cascade)
+  addedBy    User             @relation("verifierAddedBy", fields: [addedByID], references: [id], onDelete: Cascade)
+
+  @@unique([invitationID, verifierID])
+  @@index([verifierID, status])
+}
+
+model CircleActivity {
+  id           String             @id @default(uuid())
+  circleID     String
+  invitationID String?
+  viewerID     String
+  actorID      String
+  type         CircleActivityType
+  readAt       DateTime?
+  createdAt    DateTime           @default(now())
+
+  circle     Circle            @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  invitation CircleInvitation? @relation(fields: [invitationID], references: [id], onDelete: SetNull)
+  viewer     User              @relation("circleActivityViewer", fields: [viewerID], references: [id], onDelete: Cascade)
+  actor      User              @relation("circleActivityActor", fields: [actorID], references: [id], onDelete: Cascade)
+
+  @@index([viewerID, readAt])
+  @@index([invitationID])
 }
