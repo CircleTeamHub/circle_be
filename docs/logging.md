@@ -61,8 +61,6 @@ Current events:
 - `rate_limit_hit`: explicit limiter hit with limiter name.
 - `business_event`: currently used for auth and selected friend actions.
 - `external_call_failed`: currently used for OpenIM and MinIO presign failures.
-- `audit_event`
-- `db_query_slow`
 - `security_event`: currently used for 401, 403, and rate limit hits.
 - `external_call_slow`: warning event for slow OpenIM or MinIO calls.
 
