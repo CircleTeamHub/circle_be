@@ -11,6 +11,8 @@ import {
   PlazaPostDto,
 } from './dto/circle-plaza.dto';
 
+const NEW_USER_BADGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 @Injectable()
 export class CirclePlazaService {
   constructor(private readonly prisma: PrismaService) {}
@@ -228,6 +230,9 @@ export class CirclePlazaService {
         avatarUrl: post.author.avatarUrl,
         avatarFrame: post.author.avatarFrame,
         accountId: post.author.accountId,
+        vipLevel: post.author.vipLevel ?? 0,
+        fancyNumber: post.author.fancyNumber ?? false,
+        isNewUser: this.isNewUser(post.author.createdAt),
       },
       circle: {
         id: post.circle.id,
@@ -236,5 +241,15 @@ export class CirclePlazaService {
       canInteract,
       createdAt: post.createdAt.toISOString(),
     };
+  }
+
+  private isNewUser(createdAt: Date | string | null | undefined): boolean {
+    if (!createdAt) return false;
+
+    const createdTime = new Date(createdAt).getTime();
+    if (Number.isNaN(createdTime)) return false;
+
+    const accountAge = Date.now() - createdTime;
+    return accountAge >= 0 && accountAge <= NEW_USER_BADGE_MS;
   }
 }

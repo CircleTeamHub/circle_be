@@ -55,6 +55,56 @@ describe('CoinService', () => {
     service = module.get<CoinService>(CoinService);
   });
 
+  it('recharges the current user wallet and records a recharge transaction', async () => {
+    const updatedAt = new Date('2026-04-22T12:00:00.000Z');
+    tx.wallet.upsert.mockResolvedValue({
+      id: 'wallet-1',
+      userID: 'user-1',
+      balance: 300,
+      updatedAt,
+    });
+    tx.coinTransaction.create.mockResolvedValue({
+      id: 'tx-1',
+      userID: 'user-1',
+      type: 'RECHARGE',
+      amount: 300,
+      balance: 300,
+      note: '用户积分充值',
+      relatedID: null,
+      createdAt: updatedAt,
+    });
+
+    const wallet = await service.recharge('user-1', 300, '用户积分充值');
+
+    expect(wallet).toEqual({
+      id: 'wallet-1',
+      userID: 'user-1',
+      balance: 300,
+      updatedAt,
+    });
+    expect(tx.wallet.upsert).toHaveBeenCalledWith({
+      where: { userID: 'user-1' },
+      update: { balance: { increment: 300 } },
+      create: { userID: 'user-1', balance: 300 },
+    });
+    expect(tx.coinTransaction.create).toHaveBeenCalledWith({
+      data: {
+        userID: 'user-1',
+        type: 'RECHARGE',
+        amount: 300,
+        balance: 300,
+        note: '用户积分充值',
+      },
+    });
+  });
+
+  it('rejects non-positive recharge amounts', async () => {
+    await expect(service.recharge('user-1', 0)).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   it('rejects gifts to missing or inactive recipients', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'recipient-1',

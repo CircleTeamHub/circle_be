@@ -96,4 +96,12 @@ export class SelfUserDto extends PublicUserDto {
   @ApiPropertyOptional({ example: '+8613800138000' })
   @Expose()
   phoneNumber: string | null;
+
+  @ApiProperty({ example: 3 })
+  @Expose()
+  vipLevel: number;
+
+  @ApiProperty({ example: 100 })
+  @Expose()
+  creditScore: number;
 }

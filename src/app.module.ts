@@ -11,7 +11,10 @@ import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
 import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
+import { CollectionModule } from './collection/collection.module';
 import { NoteModule } from './note/note.module';
+import { MembershipModule } from './membership/membership.module';
+import { MallModule } from './mall/mall.module';
 import { CircleModule } from './circle/circle.module';
 import { CirclePlazaModule } from './circle-plaza/circle-plaza.module';
 import { CircleInvitationModule } from './circle-invitation/circle-invitation.module';
@@ -37,6 +40,9 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     UploadModule,
     FriendModule,
     CoinModule,
+    MembershipModule,
+    MallModule,
+    CollectionModule,
     NoteModule,
     CircleModule,
     CirclePlazaModule,

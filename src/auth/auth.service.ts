@@ -33,6 +33,8 @@ const ME_SELECT = {
   birthday: true,
   gender: true,
   city: true,
+  vipLevel: true,
+  creditScore: true,
   role: true,
   status: true,
   lastOnline: true,
@@ -57,6 +59,8 @@ export type SafeUser = {
   birthday: Date | null;
   gender: string;
   city: string | null;
+  vipLevel: number;
+  creditScore: number;
   role: string;
   status: string;
   lastOnline: Date | null;

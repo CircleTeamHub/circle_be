@@ -119,6 +119,9 @@ export class PlazaPostAuthorDto {
   avatarUrl: string | null;
   avatarFrame: string | null;
   accountId: string;
+  vipLevel: number;
+  fancyNumber: boolean;
+  isNewUser: boolean;
 }
 
 export class PlazaPostCircleDto {

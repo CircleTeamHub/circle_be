@@ -243,7 +243,7 @@ describe('AuthService', () => {
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
   });
 
-  it('loads city in the self profile response', async () => {
+  it('loads city, VIP level, and credit score in the self profile response', async () => {
     users.push({
       id: 'uuid-1',
       accountId: 'testuser',
@@ -261,6 +261,8 @@ describe('AuthService', () => {
       birthday: new Date('2026-04-01T00:00:00.000Z'),
       gender: 'male',
       city: '杭州',
+      vipLevel: 3,
+      creditScore: 128,
       role: 'USER',
       status: 'ACTIVE',
       lastOnline: null,
@@ -275,6 +277,8 @@ describe('AuthService', () => {
       where: { id: 'uuid-1' },
       select: expect.objectContaining({
         city: true,
+        vipLevel: true,
+        creditScore: true,
         birthday: true,
         gender: true,
       }),
@@ -287,6 +291,8 @@ describe('AuthService', () => {
         }),
         select: expect.objectContaining({
           city: true,
+          vipLevel: true,
+          creditScore: true,
           birthday: true,
           gender: true,
         }),
@@ -295,6 +301,8 @@ describe('AuthService', () => {
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
+      vipLevel: 3,
+      creditScore: 128,
     });
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
