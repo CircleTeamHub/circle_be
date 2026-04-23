@@ -1,11 +1,14 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
 
 const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
 
 @Injectable()
 export class OpenimService implements OnModuleInit {
   private readonly logger = new Logger(OpenimService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private adminToken: string | null = null;
   private adminTokenExpiresAt: number = 0;
   /** In-flight refresh promise — shared across concurrent callers to prevent thundering herd. */
@@ -161,6 +164,7 @@ export class OpenimService implements OnModuleInit {
     body: Record<string, unknown>,
     token?: string,
   ): Promise<T> {
+    const start = Date.now();
     const { randomUUID } = await import('crypto');
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -171,26 +175,37 @@ export class OpenimService implements OnModuleInit {
       headers['token'] = token;
     }
 
-    const response = await fetch(`${this.apiUrl}${path}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(OPENIM_REQUEST_TIMEOUT_MS),
-    });
+    try {
+      const response = await fetch(`${this.apiUrl}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(OPENIM_REQUEST_TIMEOUT_MS),
+      });
 
-    const json = (await response.json()) as {
-      errCode: number;
-      errMsg?: string;
-      data?: T;
-    };
+      const json = (await response.json()) as {
+        errCode: number;
+        errMsg?: string;
+        data?: T;
+      };
 
-    if (json.errCode !== 0) {
-      this.logger.error(
-        `OpenIM API error [${path}]: ${json.errMsg ?? json.errCode}`,
-      );
-      throw new Error(`OpenIM error: ${json.errMsg ?? json.errCode}`);
+      if (json.errCode !== 0) {
+        this.logger.error(
+          `OpenIM API error [${path}]: ${json.errMsg ?? json.errCode}`,
+        );
+        throw new Error(`OpenIM error: ${json.errMsg ?? json.errCode}`);
+      }
+
+      return json.data as T;
+    } catch (error) {
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'openim',
+        operation: path,
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
     }
-
-    return json.data as T;
   }
 }

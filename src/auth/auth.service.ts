@@ -13,6 +13,8 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshTokenService, SessionContext } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const ME_SELECT = {
   id: true,
@@ -65,6 +67,7 @@ export type SafeUser = {
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly loggingConfig = createLoggingConfig();
 
   constructor(
     private prisma: PrismaService,
@@ -109,6 +112,15 @@ export class AuthService {
         ),
       );
 
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_register_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+
     return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
   }
 
@@ -118,15 +130,35 @@ export class AuthService {
     });
 
     if (!user) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        result: 'failure',
+        metadata: { reason: 'invalid_credentials' },
+      });
       throw new ForbiddenException('Invalid credentials');
     }
 
     if (user.status !== 'ACTIVE') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'inactive_account' },
+      });
       throw new ForbiddenException('Account is not active');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'invalid_credentials' },
+      });
       throw new ForbiddenException('Invalid credentials');
     }
 
@@ -157,7 +189,23 @@ export class AuthService {
         ),
       );
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    const tokens = await this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+    );
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_login_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+
+    return tokens;
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -196,6 +244,14 @@ export class AuthService {
 
   async logoutAll(userId: string): Promise<void> {
     await this.refreshTokenService.revokeAll(userId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_logout_all_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   async me(userId: string): Promise<SafeUser> {
@@ -248,6 +304,14 @@ export class AuthService {
 
     // Invalidate all existing sessions after password change
     await this.refreshTokenService.revokeAll(userId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_change_password_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   private async issueTokens(

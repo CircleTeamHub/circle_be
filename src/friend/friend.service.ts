@@ -8,6 +8,8 @@ import {
 } from '@nestjs/common';
 import { FriendState } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
   FriendProfileDto,
   FriendActivityDto,
@@ -68,6 +70,7 @@ const FRIEND_ACTIVITY_INCLUDE = {
 @Injectable()
 export class FriendService {
   private readonly logger = new Logger(FriendService.name);
+  private readonly loggingConfig = createLoggingConfig();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -151,8 +154,9 @@ export class FriendService {
       pendingRemarkBySender,
     } as any;
 
+    let request: { id: string };
     try {
-      await this.prisma.$transaction(async (tx: any) => {
+      request = await this.prisma.$transaction(async (tx: any) => {
         const nextRequestRecord = await tx.friend.create({
           data: requestData,
         });
@@ -194,6 +198,15 @@ export class FriendService {
     }
 
     this.logger.log(`Friend request sent: ${senderId} → ${targetId}`);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_request_sent',
+      actorId: senderId,
+      targetId,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: request.id,
+    });
   }
 
   // ─── Cancel request (sender withdraws) ───────────────────────────────────────
@@ -225,6 +238,15 @@ export class FriendService {
           messageSnapshot: updated.message ?? null,
         },
       ]);
+    });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_request_withdrawn',
+      actorId: senderId,
+      targetId: record.friendID,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: requestId,
     });
   }
 
@@ -314,6 +336,18 @@ export class FriendService {
       );
 
       return nextRequest;
+    });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent:
+        decision === FriendState.ACCEPTED
+          ? 'friend_request_accepted'
+          : 'friend_request_rejected',
+      actorId: recipientId,
+      targetId: record.userID,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: requestId,
     });
   }
 
@@ -652,6 +686,15 @@ export class FriendService {
     ]);
 
     this.logger.log(`Block created: ${blockerId} → ${targetId}`);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_block_created',
+      actorId: blockerId,
+      targetId,
+      result: 'success',
+      entityType: 'block',
+      entityId: `${blockerId}:${targetId}`,
+    });
   }
 
   async unblockUser(blockerId: string, targetId: string): Promise<void> {
