@@ -1,9 +1,11 @@
 import { LoggerService } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { getRequestContext } from './request-context';
+import { logSecurityEvent } from './security-event.logger';
 
 interface RateLimitLoggerOptions {
   enabled: boolean;
+  securityLogOn: boolean;
   limiterName: string;
   message?: unknown;
 }
@@ -54,6 +56,14 @@ export function createRateLimitHandler(
         'RateLimit',
       );
     }
+
+    logSecurityEvent(logger, {
+      enabled: options.securityLogOn,
+      securityEvent: 'rate_limit_hit',
+      statusCode,
+      userId: readUserId(req),
+      metadata: { limiterName: options.limiterName },
+    });
 
     return res.status(statusCode).json(responseMessage);
   };

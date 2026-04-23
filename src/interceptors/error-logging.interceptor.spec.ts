@@ -4,8 +4,23 @@ import { ErrorLoggingInterceptor } from './error-logging.interceptor';
 import { runWithRequestContext } from '../logging/request-context';
 
 describe('ErrorLoggingInterceptor', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = {
+      ...originalEnv,
+      NODE_ENV: 'development',
+      LOG_ON: 'true',
+      SECURITY_LOG_ON: 'true',
+    };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
   it('logs http errors with request context and rethrows them', async () => {
-    const logger = { error: jest.fn() };
+    const logger = { error: jest.fn(), warn: jest.fn() };
     const interceptor = new ErrorLoggingInterceptor(logger as any);
     const error = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
     const context = {} as any;
@@ -40,6 +55,15 @@ describe('ErrorLoggingInterceptor', () => {
       }),
       expect.any(String),
       'HttpError',
+    );
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'security_event',
+        securityEvent: 'access_forbidden',
+        statusCode: 403,
+      }),
+      'SecurityEvent',
     );
   });
 });

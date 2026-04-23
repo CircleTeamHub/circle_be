@@ -18,6 +18,9 @@ Development:
 - `BUSINESS_LOG_ON=true`
 - `EXTERNAL_LOG_ON=true`
 - `RATE_LIMIT_LOG_ON=true`
+- `SECURITY_LOG_ON=true`
+- `PERFORMANCE_LOG_ON=true`
+- `SLOW_EXTERNAL_MS=1000`
 - Console logs are human-readable.
 - Rotated log files are written under root `logs/`.
 
@@ -28,6 +31,8 @@ Test:
 - `BUSINESS_LOG_ON=false`
 - `EXTERNAL_LOG_ON=false`
 - `RATE_LIMIT_LOG_ON=false`
+- `SECURITY_LOG_ON=false`
+- `PERFORMANCE_LOG_ON=false`
 - Test output is quiet by default.
 - E2E runs may explicitly enable error and slow request logs.
 
@@ -43,6 +48,8 @@ If a client sends a safe `x-request-id`, the backend reuses it. Otherwise the ba
 - `rate_limit_hit`
 - `business_event`
 - `external_call_failed`
+- `security_event`
+- `external_call_slow`
 
 ## Event Types
 
@@ -54,12 +61,14 @@ Current events:
 - `rate_limit_hit`: explicit limiter hit with limiter name.
 - `business_event`: currently used for auth and selected friend actions.
 - `external_call_failed`: currently used for OpenIM and MinIO presign failures.
+- `audit_event`
+- `db_query_slow`
+- `security_event`: currently used for 401, 403, and rate limit hits.
+- `external_call_slow`: warning event for slow OpenIM or MinIO calls.
 
 Deferred production events:
 
 - `audit_event`
-- `security_event`
-- `external_call_slow`
 - `db_query_slow`
 
 ## Safe Logging Policy

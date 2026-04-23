@@ -23,6 +23,7 @@ describe('createRateLimitHandler', () => {
     const logger = { warn: jest.fn() };
     const handler = createRateLimitHandler(logger as any, {
       enabled: true,
+      securityLogOn: true,
       limiterName: 'auth_login',
       message: { message: 'Too many requests, please try again later.' },
     });
@@ -32,7 +33,8 @@ describe('createRateLimitHandler', () => {
 
     handler(req, res, undefined, { statusCode: 429 });
 
-    expect(logger.warn).toHaveBeenCalledWith(
+    expect(logger.warn).toHaveBeenNthCalledWith(
+      1,
       expect.objectContaining({
         event: 'rate_limit_hit',
         limiterName: 'auth_login',
@@ -41,6 +43,15 @@ describe('createRateLimitHandler', () => {
         userId: 'user-1',
       }),
       'RateLimit',
+    );
+    expect(logger.warn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        event: 'security_event',
+        securityEvent: 'rate_limit_hit',
+        statusCode: 429,
+      }),
+      'SecurityEvent',
     );
     expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('secret');
     expect(res.status).toHaveBeenCalledWith(429);
@@ -53,6 +64,7 @@ describe('createRateLimitHandler', () => {
     const logger = { warn: jest.fn() };
     const handler = createRateLimitHandler(logger as any, {
       enabled: false,
+      securityLogOn: false,
       limiterName: 'global',
       message: { message: 'Too many requests' },
     });

@@ -105,6 +105,7 @@ export const setupApp = (app: INestApplication) => {
         ? {
             handler: createRateLimitHandler(logger, {
               enabled: loggingConfig.rateLimitLogOn,
+              securityLogOn: loggingConfig.securityLogOn,
               limiterName,
               message: options.message,
             }) as RateLimitOptions['handler'],

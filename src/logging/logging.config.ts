@@ -5,6 +5,9 @@ export interface LoggingConfig {
   businessLogOn: boolean;
   externalLogOn: boolean;
   rateLimitLogOn: boolean;
+  securityLogOn: boolean;
+  performanceLogOn: boolean;
+  slowExternalMs: number;
 }
 
 function readBoolean(
@@ -58,5 +61,10 @@ export function createLoggingConfig(
       logOn && readBoolean(rawConfig['EXTERNAL_LOG_ON'], !isTest),
     rateLimitLogOn:
       logOn && readBoolean(rawConfig['RATE_LIMIT_LOG_ON'], !isTest),
+    securityLogOn:
+      logOn && readBoolean(rawConfig['SECURITY_LOG_ON'], !isTest),
+    performanceLogOn:
+      logOn && readBoolean(rawConfig['PERFORMANCE_LOG_ON'], !isTest),
+    slowExternalMs: readPositiveInteger(rawConfig['SLOW_EXTERNAL_MS'], 1000),
   };
 }

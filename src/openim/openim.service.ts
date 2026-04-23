@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
 
@@ -165,6 +166,7 @@ export class OpenimService implements OnModuleInit {
     token?: string,
   ): Promise<T> {
     const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
     const { randomUUID } = await import('crypto');
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -198,6 +200,7 @@ export class OpenimService implements OnModuleInit {
 
       return json.data as T;
     } catch (error) {
+      result = 'failure';
       logExternalCallFailure(this.logger, {
         enabled: this.loggingConfig.externalLogOn,
         service: 'openim',
@@ -206,6 +209,15 @@ export class OpenimService implements OnModuleInit {
         error,
       });
       throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'openim',
+        operation: path,
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
     }
   }
 }

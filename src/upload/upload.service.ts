@@ -16,6 +16,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 export interface PresignResult {
   uploadUrl: string;
@@ -118,11 +119,13 @@ export class UploadService implements OnModuleInit {
 
     let uploadUrl: string;
     const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
     try {
       uploadUrl = await getSignedUrl(this.publicClient, command, {
         expiresIn,
       });
     } catch (error) {
+      result = 'failure';
       logExternalCallFailure(this.logger, {
         enabled: this.loggingConfig.externalLogOn,
         service: 'minio',
@@ -131,6 +134,15 @@ export class UploadService implements OnModuleInit {
         error,
       });
       throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'minio',
+        operation: 'presign_put_object',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
     }
 
     // 把 uploadUrl 里的内网地址替换为公开访问地址

@@ -7,10 +7,14 @@ import {
   NestInterceptor,
 } from '@nestjs/common';
 import { Observable, catchError, throwError } from 'rxjs';
+import { createLoggingConfig } from 'src/logging/logging.config';
 import { getRequestContext } from '../logging/request-context';
+import { logSecurityEvent } from '../logging/security-event.logger';
 
 @Injectable()
 export class ErrorLoggingInterceptor implements NestInterceptor {
+  private readonly loggingConfig = createLoggingConfig();
+
   constructor(private readonly logger: LoggerService) {}
 
   intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -37,6 +41,16 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
           errorObject?.stack,
           'HttpError',
         );
+
+        if (statusCode === 401 || statusCode === 403) {
+          logSecurityEvent(this.logger, {
+            enabled: this.loggingConfig.securityLogOn,
+            securityEvent:
+              statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
+            statusCode,
+            reason: errorObject?.message ?? String(error),
+          });
+        }
 
         return throwError(() => error);
       }),
