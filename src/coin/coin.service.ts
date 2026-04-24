@@ -6,7 +6,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { FriendState, Prisma } from 'src/generated/prisma';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { CoinTransactionDto, WalletDto } from './dto/coin.dto';
 
 // Max coins a user can send in a single gift
@@ -19,7 +21,11 @@ const MAX_GIFT_TX_ATTEMPTS = 3;
 export class CoinService {
   private readonly logger = new Logger(CoinService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtimeService: RealtimeService,
+    private readonly notificationService: NotificationService,
+  ) {}
 
   // ─── Wallet ───────────────────────────────────────────────────────────────────
 
@@ -51,7 +57,7 @@ export class CoinService {
   ): Promise<WalletDto> {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
 
-    return this.prisma.$transaction(async (tx) => {
+    const wallet = await this.prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.upsert({
         where: { userID: userId },
         update: { balance: { increment: amount } },
@@ -70,6 +76,28 @@ export class CoinService {
 
       return wallet;
     });
+
+    await this.notificationService.createSystemNotification(
+      userId,
+      userId,
+      `积分已到账 ${amount}`,
+    );
+    await Promise.all([
+      this.realtimeService.broadcastWalletBalanceChanged(userId, {
+        reason: 'RECHARGE',
+        delta: amount,
+      }),
+      this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
+      Promise.resolve(
+        this.realtimeService.broadcastSystemNotificationCreated(
+          userId,
+          `积分已到账 ${amount}`,
+        ),
+      ),
+      this.realtimeService.broadcastSystemNotificationUnread(userId),
+    ]);
+
+    return wallet;
   }
 
   // ─── Gift ─────────────────────────────────────────────────────────────────────
@@ -233,7 +261,7 @@ export class CoinService {
   ): Promise<WalletDto> {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
 
-    return this.prisma.$transaction(async (tx) => {
+    const wallet = await this.prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.upsert({
         where: { userID: targetUserId },
         update: { balance: { increment: amount } },
@@ -252,6 +280,28 @@ export class CoinService {
 
       return wallet;
     });
+
+    await this.notificationService.createSystemNotification(
+      targetUserId,
+      targetUserId,
+      `积分已到账 ${amount}`,
+    );
+    await Promise.all([
+      this.realtimeService.broadcastWalletBalanceChanged(targetUserId, {
+        reason: 'RECHARGE',
+        delta: amount,
+      }),
+      this.realtimeService.broadcastWalletRechargeCompleted(targetUserId, amount),
+      Promise.resolve(
+        this.realtimeService.broadcastSystemNotificationCreated(
+          targetUserId,
+          `积分已到账 ${amount}`,
+        ),
+      ),
+      this.realtimeService.broadcastSystemNotificationUnread(targetUserId),
+    ]);
+
+    return wallet;
   }
 
   private isRetryableTransactionError(error: unknown): boolean {

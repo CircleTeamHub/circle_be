@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { FriendState } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
@@ -72,7 +73,10 @@ export class FriendService {
   private readonly logger = new Logger(FriendService.name);
   private readonly loggingConfig = createLoggingConfig();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtimeService: RealtimeService,
+  ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
 
@@ -198,6 +202,7 @@ export class FriendService {
     }
 
     this.logger.log(`Friend request sent: ${senderId} → ${targetId}`);
+    await this.broadcastFriendUnreadUpdates([senderId, targetId]);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'friend_request_sent',
@@ -239,6 +244,7 @@ export class FriendService {
         },
       ]);
     });
+    await this.broadcastFriendUnreadUpdates([senderId, record.friendID]);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'friend_request_withdrawn',
@@ -337,6 +343,7 @@ export class FriendService {
 
       return nextRequest;
     });
+    await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent:
@@ -609,6 +616,8 @@ export class FriendService {
         throw new NotFoundException('Friend activity not found');
       }
     }
+
+    await this.broadcastFriendUnreadUpdates([userId]);
   }
 
   // ─── Relationship status ─────────────────────────────────────────────────────
@@ -895,6 +904,15 @@ export class FriendService {
     await tx.friendActivity.createMany({
       data: activities,
     });
+  }
+
+  private async broadcastFriendUnreadUpdates(userIds: string[]) {
+    const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
+    await Promise.all(
+      uniqueUserIds.map((userId) =>
+        this.realtimeService.broadcastFriendUnreadCount(userId),
+      ),
+    );
   }
 
   private async throwActiveFriendConflict(

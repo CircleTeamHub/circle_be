@@ -27,6 +27,8 @@ import {
   CreateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
+  SelectCircleIconDto,
+  UploadCircleIconDto,
 } from './dto/circle.dto';
 
 @ApiTags('Circle')
@@ -96,6 +98,26 @@ export class CircleController {
     @Req() req: any,
   ): Promise<void> {
     return this.circleService.leaveCircle(req.user.userId, id);
+  }
+
+  @Post(':id/icon/upload')
+  @ApiOperation({ summary: 'Upload a circle icon asset' })
+  uploadIcon(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UploadCircleIconDto,
+    @Req() req: any,
+  ) {
+    return this.circleService.uploadCircleIcon(req.user.userId, id, dto);
+  }
+
+  @Post(':id/icon/select')
+  @ApiOperation({ summary: 'Select the current circle icon' })
+  selectIcon(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SelectCircleIconDto,
+    @Req() req: any,
+  ) {
+    return this.circleService.selectCircleIcon(req.user.userId, id, dto);
   }
 
   @Get('activities/list')

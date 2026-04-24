@@ -2,6 +2,7 @@ import { ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -43,6 +44,10 @@ describe('CircleInvitationService', () => {
     addGroupMembers: jest.fn(),
   };
 
+  const realtimeService = {
+    broadcastCircleUnreadCount: jest.fn(),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
@@ -51,6 +56,7 @@ describe('CircleInvitationService', () => {
         CircleInvitationService,
         { provide: PrismaService, useValue: prisma },
         { provide: OpenimService, useValue: openimService },
+        { provide: RealtimeService, useValue: realtimeService },
       ],
     }).compile();
 

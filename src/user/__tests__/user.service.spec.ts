@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { UserService } from '../user.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { IconService } from 'src/icon/icon.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -9,6 +11,12 @@ describe('UserService', () => {
     user: {
       findFirst: jest.fn(),
     },
+  };
+  const iconService = {
+    getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
+  };
+  const realtimeService = {
+    broadcastUserProfileSummary: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -18,6 +26,8 @@ describe('UserService', () => {
         UserService,
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        { provide: IconService, useValue: iconService },
+        { provide: RealtimeService, useValue: realtimeService },
       ],
     }).compile();
 

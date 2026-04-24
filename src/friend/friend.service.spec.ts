@@ -8,6 +8,7 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { FriendState, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
@@ -70,7 +71,13 @@ describe('FriendService', () => {
     ),
   };
 
+  const realtimeService = {
+    broadcastFriendUnreadCount: jest.fn(),
+  };
+
   beforeEach(async () => {
+    jest.clearAllMocks();
+
     for (const value of Object.values(prisma)) {
       if (jest.isMockFunction(value)) {
         value.mockReset();
@@ -90,7 +97,11 @@ describe('FriendService', () => {
     );
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [FriendService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        FriendService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: RealtimeService, useValue: realtimeService },
+      ],
     }).compile();
 
     service = module.get<FriendService>(FriendService);
@@ -147,6 +158,12 @@ describe('FriendService', () => {
         }),
       ]),
     });
+    expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalledWith(
+      'user-1',
+    );
+    expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalledWith(
+      'user-2',
+    );
   });
 
   it('returns editable friend settings with current remark and assigned tags', async () => {

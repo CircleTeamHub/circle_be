@@ -4,6 +4,8 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { NotificationService } from 'src/notification/notification.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   MembershipPlanDto,
   UpgradeMembershipResponseDto,
@@ -19,7 +21,11 @@ const VIP_PLANS: MembershipPlanDto[] = [
 
 @Injectable()
 export class MembershipService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtimeService: RealtimeService,
+    private readonly notificationService: NotificationService,
+  ) {}
 
   getPlans(): MembershipPlanDto[] {
     return VIP_PLANS;
@@ -34,7 +40,7 @@ export class MembershipService {
       throw new BadRequestException('Invalid VIP level');
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const currentUser = await tx.user.findUnique({
         where: { id: userId },
         select: { id: true, vipLevel: true },
@@ -83,5 +89,28 @@ export class MembershipService {
 
       return { user, wallet, plan };
     });
+
+    await this.notificationService.createSystemNotification(
+      userId,
+      userId,
+      `已成功兑换 VIP${level}`,
+    );
+    await Promise.all([
+      this.realtimeService.broadcastMembershipStatus(userId),
+      this.realtimeService.broadcastWalletBalanceChanged(userId, {
+        reason: 'PURCHASE',
+        delta: -plan.price,
+      }),
+      Promise.resolve(
+        this.realtimeService.broadcastSystemNotificationCreated(
+          userId,
+          `已成功兑换 VIP${level}`,
+        ),
+      ),
+      this.realtimeService.broadcastSystemNotificationUnread(userId),
+      this.realtimeService.broadcastUserProfileSummary(userId),
+    ]);
+
+    return result;
   }
 }

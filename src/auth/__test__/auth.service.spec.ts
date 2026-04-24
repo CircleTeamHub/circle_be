@@ -6,6 +6,7 @@ import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { IconService } from 'src/icon/icon.service';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -56,6 +57,10 @@ describe('AuthService', () => {
     registerUser: jest.fn(() => Promise.resolve()),
   };
 
+  const mockIconService = {
+    getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
+  };
+
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
@@ -103,6 +108,7 @@ describe('AuthService', () => {
         { provide: RefreshTokenService, useValue: mockRefreshTokenService },
         { provide: JwtService, useValue: mockJwt },
         { provide: OpenimService, useValue: mockOpenimService },
+        { provide: IconService, useValue: mockIconService },
       ],
     }).compile();
 
@@ -306,5 +312,55 @@ describe('AuthService', () => {
     });
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
+  });
+
+  it('includes displayIcons in the self profile response', async () => {
+    mockIconService.getDisplayIconsForUser.mockResolvedValueOnce([
+      {
+        id: 'vip-icon',
+        type: 'SYSTEM',
+        title: 'VIP5',
+        imageUrl: null,
+        fallbackIconName: 'diamond',
+        sortOrder: 0,
+      },
+    ]);
+
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      nickname: 'Test User',
+      avatarUrl: null,
+      avatarFrame: null,
+      cover: null,
+      email: null,
+      phoneNumber: null,
+      wechat: null,
+      qq: null,
+      whatsup: null,
+      persona: null,
+      helloWords: null,
+      birthday: null,
+      gender: 'male',
+      city: '杭州',
+      vipLevel: 5,
+      creditScore: 100,
+      role: 'USER',
+      status: 'ACTIVE',
+      lastOnline: null,
+      createdAt: new Date('2026-04-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-01T00:00:00.000Z'),
+    });
+
+    const me = await service.me('uuid-1');
+
+    expect(mockIconService.getDisplayIconsForUser).toHaveBeenCalledWith(
+      'uuid-1',
+    );
+    expect(me.displayIcons).toEqual([
+      expect.objectContaining({
+        title: 'VIP5',
+      }),
+    ]);
   });
 });

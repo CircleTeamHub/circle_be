@@ -19,6 +19,9 @@ import { CircleModule } from './circle/circle.module';
 import { CirclePlazaModule } from './circle-plaza/circle-plaza.module';
 import { CircleInvitationModule } from './circle-invitation/circle-invitation.module';
 import { TraceModule } from './trace/trace.module';
+import { IconModule } from './icon/icon.module';
+import { RealtimeModule } from './realtime/realtime.module';
+import { NotificationModule } from './notification/notification.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -45,9 +48,12 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     CollectionModule,
     NoteModule,
     CircleModule,
+    IconModule,
     CirclePlazaModule,
     CircleInvitationModule,
     TraceModule,
+    RealtimeModule,
+    NotificationModule,
   ],
   controllers: [],
   providers: [Logger],

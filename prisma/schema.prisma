@@ -118,6 +118,21 @@ enum CircleMemberStatus {
   REJECTED
 }
 
+enum IconAssetSourceType {
+  SYSTEM
+  CIRCLE
+}
+
+enum UserDisplayIconType {
+  SYSTEM
+  CIRCLE
+}
+
+enum SystemIconKey {
+  VIP
+  NEW_USER
+}
+
 enum CircleCategory {
   LIFE
   FOOD
@@ -243,6 +258,7 @@ model User {
   vipLevel      Int        @default(0)
   creditScore   Int        @default(100)
   fancyNumber   Boolean    @default(false)
+  iconPreferencesInitialized Boolean @default(false)
   openimSynced  Boolean    @default(false)
   lastOnline    DateTime?
   createdAt     DateTime   @default(now())
@@ -298,6 +314,8 @@ model User {
   circleVerificationsAdded      CircleInvitationVerifier[]  @relation("verifierAddedBy")
   circleActivitiesViewed        CircleActivity[]            @relation("circleActivityViewer")
   circleActivitiesActed         CircleActivity[]            @relation("circleActivityActor")
+  iconAssetsCreated             IconAsset[]                 @relation("iconAssetCreator")
+  displayIcons                  UserDisplayIcon[]
 }
 
 model RefreshToken {
@@ -833,6 +851,42 @@ model UserCollection {
   @@index([userID, type, createdAt])
 }
 
+model IconAsset {
+  id          String              @id @default(uuid())
+  name        String
+  sourceType  IconAssetSourceType
+  imageUrl    String?
+  circleID    String?
+  createdByID String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  circle           Circle?  @relation("circleIconAssets", fields: [circleID], references: [id], onDelete: Cascade)
+  createdBy        User?    @relation("iconAssetCreator", fields: [createdByID], references: [id], onDelete: SetNull)
+  currentForCircles Circle[] @relation("currentCircleIcon")
+
+  @@index([circleID])
+  @@index([sourceType])
+}
+
+model UserDisplayIcon {
+  id          String              @id @default(uuid())
+  userID      String
+  displayType UserDisplayIconType
+  systemKey   SystemIconKey?
+  circleID    String?
+  sortOrder   Int
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  user   User    @relation(fields: [userID], references: [id], onDelete: Cascade)
+  circle Circle? @relation(fields: [circleID], references: [id], onDelete: Cascade)
+
+  @@unique([userID, systemKey])
+  @@unique([userID, circleID])
+  @@index([userID, sortOrder])
+}
+
 // ─── Notification ─────────────────────────────────────────────────────────────
 
 model Notification {
@@ -1032,6 +1086,7 @@ model Circle {
   description String         @default("")
   avatarUrl   String?
   ownerID     String
+  currentIconAssetID String?
   cities      String[]       @default([])
   isPublic    Boolean        @default(true)
   categories  String[]       @default([])
@@ -1049,11 +1104,14 @@ model Circle {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  owner       User               @relation(fields: [ownerID], references: [id], onDelete: Cascade)
-  posts       CirclePost[]
-  members     CircleMember[]
-  invitations CircleInvitation[]
-  activities  CircleActivity[]
+  owner             User               @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  currentIconAsset  IconAsset?         @relation("currentCircleIcon", fields: [currentIconAssetID], references: [id], onDelete: SetNull)
+  iconAssets        IconAsset[]        @relation("circleIconAssets")
+  posts             CirclePost[]
+  members           CircleMember[]
+  invitations       CircleInvitation[]
+  activities        CircleActivity[]
+  displaySelections UserDisplayIcon[]
 
   @@index([ownerID])
 }

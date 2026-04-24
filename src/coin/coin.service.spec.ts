@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CoinService } from './coin.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
 
 describe('CoinService', () => {
   let service: CoinService;
@@ -45,11 +47,27 @@ describe('CoinService', () => {
     ),
   };
 
+  const realtimeService = {
+    broadcastWalletBalanceChanged: jest.fn(),
+    broadcastWalletRechargeCompleted: jest.fn(),
+    broadcastSystemNotificationCreated: jest.fn(),
+    broadcastSystemNotificationUnread: jest.fn(),
+  };
+
+  const notificationService = {
+    createSystemNotification: jest.fn(),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [CoinService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        CoinService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: RealtimeService, useValue: realtimeService },
+        { provide: NotificationService, useValue: notificationService },
+      ],
     }).compile();
 
     service = module.get<CoinService>(CoinService);
@@ -96,6 +114,29 @@ describe('CoinService', () => {
         note: '用户积分充值',
       },
     });
+    expect(notificationService.createSystemNotification).toHaveBeenCalledWith(
+      'user-1',
+      'user-1',
+      '积分已到账 300',
+    );
+    expect(realtimeService.broadcastWalletBalanceChanged).toHaveBeenCalledWith(
+      'user-1',
+      {
+        reason: 'RECHARGE',
+        delta: 300,
+      },
+    );
+    expect(realtimeService.broadcastWalletRechargeCompleted).toHaveBeenCalledWith(
+      'user-1',
+      300,
+    );
+    expect(realtimeService.broadcastSystemNotificationCreated).toHaveBeenCalledWith(
+      'user-1',
+      '积分已到账 300',
+    );
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
   });
 
   it('rejects non-positive recharge amounts', async () => {

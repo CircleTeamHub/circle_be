@@ -2,6 +2,8 @@ import { BadRequestException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipService } from './membership.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
 
 describe('MembershipService', () => {
   let service: MembershipService;
@@ -29,6 +31,18 @@ describe('MembershipService', () => {
     ),
   };
 
+  const realtimeService = {
+    broadcastMembershipStatus: jest.fn(),
+    broadcastWalletBalanceChanged: jest.fn(),
+    broadcastSystemNotificationCreated: jest.fn(),
+    broadcastSystemNotificationUnread: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
+  };
+
+  const notificationService = {
+    createSystemNotification: jest.fn(),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
@@ -36,6 +50,8 @@ describe('MembershipService', () => {
       providers: [
         MembershipService,
         { provide: PrismaService, useValue: prisma },
+        { provide: RealtimeService, useValue: realtimeService },
+        { provide: NotificationService, useValue: notificationService },
       ],
     }).compile();
 
@@ -104,6 +120,31 @@ describe('MembershipService', () => {
         note: '兑换 VIP3',
       },
     });
+    expect(notificationService.createSystemNotification).toHaveBeenCalledWith(
+      'user-1',
+      'user-1',
+      '已成功兑换 VIP3',
+    );
+    expect(realtimeService.broadcastMembershipStatus).toHaveBeenCalledWith(
+      'user-1',
+    );
+    expect(realtimeService.broadcastWalletBalanceChanged).toHaveBeenCalledWith(
+      'user-1',
+      {
+        reason: 'PURCHASE',
+        delta: -2100,
+      },
+    );
+    expect(realtimeService.broadcastSystemNotificationCreated).toHaveBeenCalledWith(
+      'user-1',
+      '已成功兑换 VIP3',
+    );
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
+    expect(realtimeService.broadcastUserProfileSummary).toHaveBeenCalledWith(
+      'user-1',
+    );
     expect(result.user.vipLevel).toBe(3);
     expect(result.wallet.balance).toBe(900);
   });

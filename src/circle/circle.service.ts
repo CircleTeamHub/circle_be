@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
 import {
   CircleDetailDto,
@@ -15,6 +16,8 @@ import {
   CreateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
+  SelectCircleIconDto,
+  UploadCircleIconDto,
 } from './dto/circle.dto';
 
 const MAX_JOIN_TX_ATTEMPTS = 3;
@@ -26,6 +29,7 @@ export class CircleService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
+    private readonly realtimeService: RealtimeService,
   ) {}
 
   async createCircle(
@@ -168,6 +172,14 @@ export class CircleService {
   ): Promise<CircleDetailDto> {
     const circle = await this.prisma.circle.findFirst({
       where: { id: circleId, deleted: false },
+      include: {
+        currentIconAsset: {
+          select: {
+            id: true,
+            imageUrl: true,
+          },
+        },
+      },
     });
     if (!circle) throw new NotFoundException('Circle not found');
 
@@ -175,10 +187,26 @@ export class CircleService {
       where: { userID_circleID: { userID: userId, circleID: circleId } },
     });
 
+    const availableIconAssets = await this.prisma.iconAsset.findMany({
+      where: {
+        OR: [
+          { sourceType: 'SYSTEM' },
+          { sourceType: 'CIRCLE', circleID: circleId },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        imageUrl: true,
+      },
+      orderBy: [{ sourceType: 'asc' }, { createdAt: 'desc' }],
+    });
+
     return {
       ...this.toCircleDto(circle),
       myRole: membership?.role ?? null,
       myStatus: membership?.status ?? null,
+      availableIconAssets,
     };
   }
 
@@ -300,6 +328,9 @@ export class CircleService {
     await this.prisma.$transaction(async (tx) => {
       const wasActive = membership.status === 'ACTIVE';
 
+      await tx.userDisplayIcon.deleteMany({
+        where: { userID: userId, circleID: circleId },
+      });
       await tx.circleMember.delete({ where: { id: membership.id } });
 
       if (wasActive) {
@@ -320,6 +351,52 @@ export class CircleService {
         );
       }
     }
+  }
+
+  async uploadCircleIcon(
+    userId: string,
+    circleId: string,
+    dto: UploadCircleIconDto,
+  ) {
+    await this.assertOwner(userId, circleId);
+
+    return this.prisma.iconAsset.create({
+      data: {
+        name: dto.name?.trim() || '圈子图标',
+        sourceType: 'CIRCLE',
+        imageUrl: dto.imageUrl,
+        circleID: circleId,
+        createdByID: userId,
+      },
+    });
+  }
+
+  async selectCircleIcon(
+    userId: string,
+    circleId: string,
+    dto: SelectCircleIconDto,
+  ): Promise<void> {
+    await this.assertOwner(userId, circleId);
+
+    const asset = await this.prisma.iconAsset.findFirst({
+      where: {
+        id: dto.iconAssetId,
+        OR: [
+          { sourceType: 'SYSTEM' },
+          { sourceType: 'CIRCLE', circleID: circleId },
+        ],
+      },
+      select: { id: true },
+    });
+
+    if (!asset) {
+      throw new NotFoundException('Circle icon asset not found');
+    }
+
+    await this.prisma.circle.update({
+      where: { id: circleId },
+      data: { currentIconAssetID: asset.id },
+    });
   }
 
   private async assertJoinRestrictions(
@@ -376,6 +453,25 @@ export class CircleService {
     );
   }
 
+  private async assertOwner(userId: string, circleId: string) {
+    const circle = await this.prisma.circle.findFirst({
+      where: { id: circleId, deleted: false },
+      select: {
+        id: true,
+        ownerID: true,
+      },
+    });
+
+    if (!circle) {
+      throw new NotFoundException('Circle not found');
+    }
+    if (circle.ownerID !== userId) {
+      throw new ForbiddenException('Only the owner can manage circle icons');
+    }
+
+    return circle;
+  }
+
   // ─── Circle Activities ────────────────────────────────────────────────────
 
   async getActivities(userId: string) {
@@ -425,6 +521,8 @@ export class CircleService {
       where: { id: activityId, viewerID: userId, readAt: null },
       data: { readAt: new Date() },
     });
+
+    await this.realtimeService.broadcastCircleUnreadCount(userId);
   }
 
   private toCircleDto(circle: any): CircleDto {
@@ -434,6 +532,8 @@ export class CircleService {
       description: circle.description,
       avatarUrl: circle.avatarUrl,
       ownerID: circle.ownerID,
+      currentIconAssetID: circle.currentIconAssetID ?? null,
+      currentIconUrl: circle.currentIconAsset?.imageUrl ?? null,
       cities: circle.cities,
       isPublic: circle.isPublic,
       categories: circle.categories,

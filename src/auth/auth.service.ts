@@ -15,6 +15,8 @@ import { RefreshTokenService, SessionContext } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { IconService } from 'src/icon/icon.service';
+import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 
 const ME_SELECT = {
   id: true,
@@ -66,6 +68,7 @@ export type SafeUser = {
   lastOnline: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  displayIcons: DisplayIconDto[];
 };
 
 @Injectable()
@@ -78,6 +81,7 @@ export class AuthService {
     private refreshTokenService: RefreshTokenService,
     private jwt: JwtService,
     private openim: OpenimService,
+    private iconService: IconService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
@@ -259,10 +263,13 @@ export class AuthService {
   }
 
   async me(userId: string): Promise<SafeUser> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: ME_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: ME_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(userId),
+    ]);
 
     if (!user) {
       throw new NotFoundException('User not found');
@@ -277,11 +284,12 @@ export class AuthService {
         data: { lastOnline: now },
         select: ME_SELECT,
       })
+      .then((nextUser) => ({ ...nextUser, displayIcons }))
       .catch((err) => {
         this.logger.warn(
           `lastOnline update failed for ${userId}: ${err?.message}`,
         );
-        return { ...user, lastOnline: now };
+        return { ...user, lastOnline: now, displayIcons };
       });
   }
 

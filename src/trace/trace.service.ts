@@ -4,7 +4,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   CreateTraceCommentDto,
   CreateTraceDto,
@@ -18,7 +20,11 @@ const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
 
 @Injectable()
 export class TraceService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notificationService: NotificationService,
+    private readonly realtimeService: RealtimeService,
+  ) {}
 
   // ─── Feed ──────────────────────────────────────────────────────────────────
 
@@ -216,7 +222,7 @@ export class TraceService {
     traceId: string,
     dto: CreateTraceCommentDto,
   ): Promise<TraceCommentDto> {
-    await this.requireVisibleTrace(traceId, userId);
+    const trace = await this.requireVisibleTrace(traceId, userId);
 
     if (dto.replyToId) {
       const replyTarget = await this.prisma.traceComment.findFirst({
@@ -257,6 +263,33 @@ export class TraceService {
 
       return created;
     });
+
+    const notifiedUserIds =
+      await this.notificationService.createTraceCommentNotifications({
+        actorId: userId,
+        traceId,
+        commentId: comment.id,
+        traceOwnerId: trace.fromID,
+        replyToCommentId: comment.replyTo?.id ?? null,
+        replyToUserId: comment.replyTo?.user.id ?? null,
+        content: comment.content,
+      });
+
+    await Promise.all(
+      notifiedUserIds.map(async (targetUserId) => {
+        await this.realtimeService.broadcastCircleUnreadCount(targetUserId);
+        this.realtimeService.broadcastCirclePostInteractionCreated(
+          targetUserId,
+          {
+            traceId,
+            commentId: comment.id,
+            interactionType: comment.replyTo ? 'REPLY' : 'COMMENT',
+            actorId: userId,
+            actorNickname: comment.user.nickname,
+          },
+        );
+      }),
+    );
 
     return {
       id: comment.id,
