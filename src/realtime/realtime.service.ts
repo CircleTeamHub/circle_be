@@ -1,7 +1,10 @@
-import { Injectable } from '@nestjs/common';
-import { NotificationType } from 'src/generated/prisma';
+import { Injectable, Logger } from '@nestjs/common';
 import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  DISCOVER_NOTIFICATION_TYPES,
+  PROFILE_NOTIFICATION_TYPES,
+} from 'src/notification/notification.constants';
 
 type BadgeSnapshot = {
   messagesUnread: number;
@@ -32,7 +35,6 @@ type RealtimeEvent =
   | {
       type: 'wallet.balance.changed';
       payload: {
-        balance: number;
         delta: number | null;
         reason: string;
         changedAt: string;
@@ -41,7 +43,6 @@ type RealtimeEvent =
   | {
       type: 'wallet.recharge.completed';
       payload: {
-        balance: number;
         delta: number;
         reason: 'RECHARGE';
         changedAt: string;
@@ -84,15 +85,9 @@ type RealtimeEvent =
       };
     };
 
-const DISCOVER_NOTIFICATION_TYPES = [
-  NotificationType.TRACE_COMMENT,
-  NotificationType.COMMENT_REPLY,
-] as const;
-
-const PROFILE_NOTIFICATION_TYPES = [NotificationType.SYSTEM] as const;
-
 @Injectable()
 export class RealtimeService {
+  private readonly logger = new Logger(RealtimeService.name);
   private readonly clients = new Map<string, Set<WebSocket>>();
 
   constructor(private readonly prisma: PrismaService) {}
@@ -101,6 +96,10 @@ export class RealtimeService {
     const group = this.clients.get(userId) ?? new Set<WebSocket>();
     group.add(socket);
     this.clients.set(userId, group);
+  }
+
+  getConnectionCount(userId: string): number {
+    return this.clients.get(userId)?.size ?? 0;
   }
 
   unregisterClient(userId: string, socket: WebSocket) {
@@ -117,7 +116,12 @@ export class RealtimeService {
   }
 
   async buildSnapshot(userId: string): Promise<BadgeSnapshot> {
-    const [contactsUnread, circleUnread, discoverNotificationUnread, profileUnread] = await Promise.all([
+    const [
+      contactsUnread,
+      circleUnread,
+      discoverNotificationUnread,
+      profileUnread,
+    ] = await Promise.all([
       this.prisma.friendActivity.count({
         where: { viewerId: userId, readAt: null },
       }),
@@ -236,22 +240,18 @@ export class RealtimeService {
     });
   }
 
-  async broadcastWalletBalanceChanged(
+  /**
+   * Signals that the wallet balance has changed. Does NOT include the absolute
+   * balance — the client refetches via the wallet REST endpoint to avoid
+   * leaking PII over the WebSocket transport.
+   */
+  broadcastWalletBalanceChanged(
     userId: string,
     payload?: { reason?: string; delta?: number | null },
   ) {
-    const wallet = await this.prisma.wallet.findUnique({
-      where: { userID: userId },
-      select: { balance: true },
-    });
-    if (!wallet) {
-      return;
-    }
-
     this.broadcast(userId, {
       type: 'wallet.balance.changed',
       payload: {
-        balance: wallet.balance,
         delta: payload?.delta ?? null,
         reason: payload?.reason ?? 'UNKNOWN',
         changedAt: new Date().toISOString(),
@@ -259,19 +259,10 @@ export class RealtimeService {
     });
   }
 
-  async broadcastWalletRechargeCompleted(userId: string, amount: number) {
-    const wallet = await this.prisma.wallet.findUnique({
-      where: { userID: userId },
-      select: { balance: true },
-    });
-    if (!wallet) {
-      return;
-    }
-
+  broadcastWalletRechargeCompleted(userId: string, amount: number) {
     this.broadcast(userId, {
       type: 'wallet.recharge.completed',
       payload: {
-        balance: wallet.balance,
         delta: amount,
         reason: 'RECHARGE',
         changedAt: new Date().toISOString(),
@@ -350,6 +341,27 @@ export class RealtimeService {
     });
   }
 
+  /**
+   * Fire-and-forget broadcast that never throws.
+   * Call this from service methods that run after a successful business operation
+   * so that a WS failure doesn't crash the HTTP response.
+   */
+  async safeBroadcastAll(
+    fns: Array<() => void | Promise<void>>,
+  ): Promise<void> {
+    await Promise.allSettled(
+      fns.map(async (fn) => {
+        try {
+          await fn();
+        } catch (error) {
+          this.logger.warn(
+            `Realtime broadcast failed: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      }),
+    );
+  }
+
   broadcast(userId: string, event: RealtimeEvent) {
     const group = this.clients.get(userId);
     if (!group || group.size === 0) {
@@ -360,7 +372,13 @@ export class RealtimeService {
 
     for (const socket of group) {
       if (socket.readyState === WebSocket.OPEN) {
-        socket.send(message);
+        try {
+          socket.send(message);
+        } catch (error) {
+          this.logger.warn(
+            `Failed to send to socket for ${userId}: ${error instanceof Error ? error.message : error}`,
+          );
+        }
       }
     }
   }

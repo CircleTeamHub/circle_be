@@ -148,25 +148,10 @@ export class MyCirclesQueryDto {
   tab: 'joined' | 'created' | 'applied';
 }
 
-export class UploadCircleIconDto {
-  @ApiProperty()
-  @IsString()
-  @IsNotEmpty()
-  imageUrl: string;
-
-  @ApiPropertyOptional()
-  @IsString()
-  @IsOptional()
-  @MaxLength(50)
-  name?: string;
-}
-
-export class SelectCircleIconDto {
-  @ApiProperty()
-  @IsString()
-  @IsNotEmpty()
-  iconAssetId: string;
-}
+export {
+  UploadCircleIconDto,
+  SelectCircleIconDto,
+} from 'src/icon/dto/icon.dto';
 
 // ── Response DTOs ────────────────────────────────────────────────────────────
 

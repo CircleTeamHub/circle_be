@@ -2,13 +2,10 @@ import { Injectable } from '@nestjs/common';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-
-const DISCOVER_NOTIFICATION_TYPES = [
-  NotificationType.TRACE_COMMENT,
-  NotificationType.COMMENT_REPLY,
-] as const;
-
-const PROFILE_NOTIFICATION_TYPES = [NotificationType.SYSTEM] as const;
+import {
+  DISCOVER_NOTIFICATION_TYPES,
+  PROFILE_NOTIFICATION_TYPES,
+} from './notification.constants';
 
 @Injectable()
 export class NotificationService {
@@ -55,7 +52,11 @@ export class NotificationService {
       data: { read: true },
     });
 
-    await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    // Skip the broadcast when no rows changed — saves a redundant unread-count
+    // query and avoids waking idle WS clients on no-op calls.
+    if (result.count > 0) {
+      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    }
 
     return result;
   }

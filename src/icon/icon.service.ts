@@ -16,6 +16,13 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
+const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
+const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
+
+type CachedDisplayIcons = {
+  data: DisplayIconDto[];
+  expiresAt: number;
+};
 
 type EligibleSystemIcon = {
   systemKey: SystemIconKeyDto;
@@ -38,10 +45,40 @@ type Eligibility = {
 
 @Injectable()
 export class IconService {
+  private readonly displayIconCache = new Map<string, CachedDisplayIcons>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
   ) {}
+
+  private invalidateDisplayIconCache(userId: string): void {
+    this.displayIconCache.delete(userId);
+  }
+
+  private getCachedDisplayIcons(userId: string): DisplayIconDto[] | null {
+    const entry = this.displayIconCache.get(userId);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      this.displayIconCache.delete(userId);
+      return null;
+    }
+    return entry.data;
+  }
+
+  private setCachedDisplayIcons(userId: string, data: DisplayIconDto[]): void {
+    if (this.displayIconCache.size >= DISPLAY_ICON_CACHE_MAX_ENTRIES) {
+      // Simple eviction: drop the oldest insertion-order entry.
+      const oldestKey = this.displayIconCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.displayIconCache.delete(oldestKey);
+      }
+    }
+    this.displayIconCache.set(userId, {
+      data,
+      expiresAt: Date.now() + DISPLAY_ICON_CACHE_TTL_MS,
+    });
+  }
 
   async getIconOptions(userId: string): Promise<IconOptionsResponseDto> {
     const eligibility = await this.resolveEligibility(userId);
@@ -70,9 +107,22 @@ export class IconService {
   }
 
   async getDisplayIconsForUser(userId: string): Promise<DisplayIconDto[]> {
+    const cached = this.getCachedDisplayIcons(userId);
+    if (cached) return cached;
+
     const eligibility = await this.resolveEligibility(userId);
     const selections = await this.ensureSelections(userId, eligibility);
-    return this.mapSelectionsToDisplayIcons(selections, eligibility);
+    const result = this.mapSelectionsToDisplayIcons(selections, eligibility);
+    this.setCachedDisplayIcons(userId, result);
+    return result;
+  }
+
+  /**
+   * Public cache invalidation for callers that mutate state IconService can't
+   * observe directly (e.g. circle icon swaps that affect circle eligibility).
+   */
+  invalidateDisplayIconCacheFor(userId: string): void {
+    this.invalidateDisplayIconCache(userId);
   }
 
   async updateDisplayIcons(
@@ -90,26 +140,30 @@ export class IconService {
       .sort((a, b) => a.sortOrder - b.sortOrder)
       .map((item, index) => ({ ...item, sortOrder: index }));
 
-    await this.prisma.userDisplayIcon.deleteMany({
-      where: { userID: userId },
-    });
-
-    if (normalized.length > 0) {
-      await this.prisma.userDisplayIcon.createMany({
-        data: normalized.map((item) => ({
-          userID: userId,
-          displayType: item.displayType,
-          systemKey: item.systemKey ?? null,
-          circleID: item.circleId ?? null,
-          sortOrder: item.sortOrder,
-        })),
+    await this.prisma.$transaction(async (tx) => {
+      await tx.userDisplayIcon.deleteMany({
+        where: { userID: userId },
       });
-    }
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { iconPreferencesInitialized: true },
+      if (normalized.length > 0) {
+        await tx.userDisplayIcon.createMany({
+          data: normalized.map((item) => ({
+            userID: userId,
+            displayType: item.displayType,
+            systemKey: item.systemKey ?? null,
+            circleID: item.circleId ?? null,
+            sortOrder: item.sortOrder,
+          })),
+        });
+      }
+
+      await tx.user.update({
+        where: { id: userId },
+        data: { iconPreferencesInitialized: true },
+      });
     });
+
+    this.invalidateDisplayIconCache(userId);
 
     const displayIcons = this.mapSelectionsToDisplayIcons(
       normalized.map((item) => ({
@@ -238,6 +292,7 @@ export class IconService {
           id: { in: stale.map((item) => item.id) },
         },
       });
+      this.invalidateDisplayIconCache(userId);
     }
 
     return selections
@@ -271,15 +326,25 @@ export class IconService {
           sortOrder: index,
         }));
 
-      await this.prisma.userDisplayIcon.createMany({
-        data: defaults.map(({ id, ...item }) => item),
-      });
-      await this.prisma.user.update({
-        where: { id: userId },
-        data: { iconPreferencesInitialized: true },
-      });
+      try {
+        await this.prisma.userDisplayIcon.createMany({
+          data: defaults.map(({ id, ...item }) => item),
+        });
+        await this.prisma.user.update({
+          where: { id: userId },
+          data: { iconPreferencesInitialized: true },
+        });
+        this.invalidateDisplayIconCache(userId);
 
-      return defaults;
+        return defaults;
+      } catch {
+        // Concurrent init race — re-read actual selections
+        this.invalidateDisplayIconCache(userId);
+        return this.prisma.userDisplayIcon.findMany({
+          where: { userID: userId },
+          orderBy: { sortOrder: 'asc' },
+        });
+      }
     }
 
     return selections;

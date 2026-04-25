@@ -77,25 +77,7 @@ export class CoinService {
       return wallet;
     });
 
-    await this.notificationService.createSystemNotification(
-      userId,
-      userId,
-      `积分已到账 ${amount}`,
-    );
-    await Promise.all([
-      this.realtimeService.broadcastWalletBalanceChanged(userId, {
-        reason: 'RECHARGE',
-        delta: amount,
-      }),
-      this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
-      Promise.resolve(
-        this.realtimeService.broadcastSystemNotificationCreated(
-          userId,
-          `积分已到账 ${amount}`,
-        ),
-      ),
-      this.realtimeService.broadcastSystemNotificationUnread(userId),
-    ]);
+    await this.notifyRecharge(userId, amount);
 
     return wallet;
   }
@@ -281,27 +263,39 @@ export class CoinService {
       return wallet;
     });
 
-    await this.notificationService.createSystemNotification(
-      targetUserId,
-      targetUserId,
-      `积分已到账 ${amount}`,
-    );
-    await Promise.all([
-      this.realtimeService.broadcastWalletBalanceChanged(targetUserId, {
-        reason: 'RECHARGE',
-        delta: amount,
-      }),
-      this.realtimeService.broadcastWalletRechargeCompleted(targetUserId, amount),
-      Promise.resolve(
-        this.realtimeService.broadcastSystemNotificationCreated(
-          targetUserId,
-          `积分已到账 ${amount}`,
-        ),
-      ),
-      this.realtimeService.broadcastSystemNotificationUnread(targetUserId),
-    ]);
+    await this.notifyRecharge(targetUserId, amount);
 
     return wallet;
+  }
+
+  private async notifyRecharge(userId: string, amount: number): Promise<void> {
+    try {
+      await this.notificationService.createSystemNotification(
+        userId,
+        userId,
+        `积分已到账 ${amount}`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to create recharge notification for ${userId}: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+
+    await this.realtimeService.safeBroadcastAll([
+      () =>
+        this.realtimeService.broadcastWalletBalanceChanged(userId, {
+          reason: 'RECHARGE',
+          delta: amount,
+        }),
+      () =>
+        this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
+      () =>
+        this.realtimeService.broadcastSystemNotificationCreated(
+          userId,
+          `积分已到账 ${amount}`,
+        ),
+      () => this.realtimeService.broadcastSystemNotificationUnread(userId),
+    ]);
   }
 
   private isRetryableTransactionError(error: unknown): boolean {

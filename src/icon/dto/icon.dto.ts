@@ -8,8 +8,10 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
   IsUUID,
   Max,
+  MaxLength,
   Min,
   ValidateIf,
   ValidateNested,
@@ -140,12 +142,13 @@ export class UpdateDisplayIconsDto {
 
 export class UploadCircleIconDto {
   @ApiProperty()
-  @IsString()
+  @IsUrl({ protocols: ['https'], require_protocol: true })
   imageUrl: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @MaxLength(50)
   name?: string;
 }
 

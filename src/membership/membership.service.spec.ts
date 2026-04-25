@@ -37,6 +37,9 @@ describe('MembershipService', () => {
     broadcastSystemNotificationCreated: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
+    safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
+      Promise.allSettled(fns.map((fn) => fn())),
+    ),
   };
 
   const notificationService = {
@@ -135,10 +138,9 @@ describe('MembershipService', () => {
         delta: -2100,
       },
     );
-    expect(realtimeService.broadcastSystemNotificationCreated).toHaveBeenCalledWith(
-      'user-1',
-      '已成功兑换 VIP3',
-    );
+    expect(
+      realtimeService.broadcastSystemNotificationCreated,
+    ).toHaveBeenCalledWith('user-1', '已成功兑换 VIP3');
     expect(
       realtimeService.broadcastSystemNotificationUnread,
     ).toHaveBeenCalledWith('user-1');

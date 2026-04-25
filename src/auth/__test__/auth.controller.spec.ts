@@ -57,6 +57,7 @@ describe('AuthController', () => {
         lastOnline: null,
         createdAt: new Date(),
         updatedAt: new Date(),
+        displayIcons: [],
       }),
   };
 

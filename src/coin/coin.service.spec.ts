@@ -52,6 +52,9 @@ describe('CoinService', () => {
     broadcastWalletRechargeCompleted: jest.fn(),
     broadcastSystemNotificationCreated: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
+    safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
+      Promise.allSettled(fns.map((fn) => fn())),
+    ),
   };
 
   const notificationService = {
@@ -126,14 +129,12 @@ describe('CoinService', () => {
         delta: 300,
       },
     );
-    expect(realtimeService.broadcastWalletRechargeCompleted).toHaveBeenCalledWith(
-      'user-1',
-      300,
-    );
-    expect(realtimeService.broadcastSystemNotificationCreated).toHaveBeenCalledWith(
-      'user-1',
-      '积分已到账 300',
-    );
+    expect(
+      realtimeService.broadcastWalletRechargeCompleted,
+    ).toHaveBeenCalledWith('user-1', 300);
+    expect(
+      realtimeService.broadcastSystemNotificationCreated,
+    ).toHaveBeenCalledWith('user-1', '积分已到账 300');
     expect(
       realtimeService.broadcastSystemNotificationUnread,
     ).toHaveBeenCalledWith('user-1');

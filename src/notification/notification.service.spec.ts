@@ -33,9 +33,7 @@ describe('NotificationService', () => {
   });
 
   it('builds discover/profile unread summary from notification domains', async () => {
-    prisma.notification.count
-      .mockResolvedValueOnce(2)
-      .mockResolvedValueOnce(1);
+    prisma.notification.count.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
 
     await expect(service.getUnreadSummary('user-1')).resolves.toEqual({
       discoverUnread: 2,
@@ -47,7 +45,9 @@ describe('NotificationService', () => {
   it('marks profile-domain notifications as read for a user', async () => {
     prisma.notification.updateMany.mockResolvedValue({ count: 4 });
 
-    await expect(service.markProfileNotificationsRead('user-1')).resolves.toEqual({
+    await expect(
+      service.markProfileNotificationsRead('user-1'),
+    ).resolves.toEqual({
       count: 4,
     });
 
@@ -60,8 +60,23 @@ describe('NotificationService', () => {
       },
       data: { read: true },
     });
-    expect(realtimeService.broadcastSystemNotificationUnread).toHaveBeenCalledWith(
-      'user-1',
-    );
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
+  });
+
+  it('skips broadcasting unread changes when no rows were updated', async () => {
+    prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.markProfileNotificationsRead('user-1'),
+    ).resolves.toEqual({
+      count: 0,
+    });
+
+    expect(prisma.notification.updateMany).toHaveBeenCalled();
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).not.toHaveBeenCalled();
   });
 });
