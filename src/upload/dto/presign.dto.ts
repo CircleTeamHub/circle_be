@@ -13,7 +13,13 @@ const ALLOWED_CONTENT_TYPES = [
   'video/x-m4v',
 ];
 
-const ALLOWED_FOLDERS = ['avatars', 'covers', 'posts', 'notes'] as const;
+const ALLOWED_FOLDERS = [
+  'avatars',
+  'covers',
+  'posts',
+  'notes',
+  'chat',
+] as const;
 export type UploadFolder = (typeof ALLOWED_FOLDERS)[number];
 
 export class PresignDto {

@@ -129,7 +129,13 @@ export class AuthService {
       entityId: user.id,
     });
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    return this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+      dto.platform,
+    );
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -202,6 +208,7 @@ export class AuthService {
       user.accountId,
       user.role,
       sessionContext,
+      dto.platform,
     );
 
     logBusinessEvent(this.logger, {
@@ -331,11 +338,12 @@ export class AuthService {
     accountId: string,
     role: string,
     sessionContext?: SessionContext,
+    platformID?: 1 | 2 | 5,
   ) {
     const [accessToken, refreshToken, imToken] = await Promise.all([
       this.signAccessToken(userId, accountId, role),
       this.refreshTokenService.create(userId, sessionContext),
-      this.openim.getUserToken(userId).catch((err) => {
+      this.openim.getUserToken(userId, platformID).catch((err) => {
         this.logger.warn(`OpenIM getUserToken failed: ${err?.message}`);
         return '';
       }),
