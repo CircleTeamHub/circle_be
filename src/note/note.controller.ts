@@ -33,6 +33,7 @@ import {
   SetPinnedDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
+  UpdateNoteGroupIdsDto,
 } from './dto/note.dto';
 import { NoteService } from './note.service';
 
@@ -72,6 +73,23 @@ export class NoteController {
     @Req() req: any,
   ): Promise<NoteDetailDto> {
     return this.noteService.updateNote(req.user.userId, id, dto);
+  }
+
+  @Patch(':id/groups')
+  @ApiOperation({ summary: 'Replace note group memberships only' })
+  @ApiOkResponse({
+    schema: { example: { id: 'uuid', groupIds: ['uuid-1', 'uuid-2'] } },
+  })
+  updateNoteGroupIds(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateNoteGroupIdsDto,
+    @Req() req: any,
+  ) {
+    return this.noteService.updateNoteGroupIds(
+      req.user.userId,
+      id,
+      dto.groupIds,
+    );
   }
 
   @Patch(':id/pin')

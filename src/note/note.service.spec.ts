@@ -21,6 +21,7 @@ describe('NoteService', () => {
       findMany: jest.fn(),
       findFirst: jest.fn(),
       findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
@@ -542,6 +543,105 @@ describe('NoteService', () => {
       imageCount: 1,
       videoCount: 1,
     });
+  });
+
+  it('replaces note group memberships in one round-trip', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', deletedAt: null },
+      { id: 'group-2', ownerID: 'user-1', name: '北京', deletedAt: null },
+    ]);
+    prisma.note.findFirst.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.findUniqueOrThrow.mockResolvedValueOnce({
+      id: 'note-1',
+      groupMemberships: [{ groupID: 'group-1' }, { groupID: 'group-2' }],
+    });
+
+    const result = await service.updateNoteGroupIds('user-1', 'note-1', [
+      'group-1',
+      'group-2',
+    ]);
+
+    // Old memberships wiped, new ones inserted — no fetch-detail + replace-everything.
+    expect(prisma.noteGroupMembership.deleteMany).toHaveBeenCalledWith({
+      where: { noteID: 'note-1' },
+    });
+    expect(prisma.noteGroupMembership.createMany).toHaveBeenCalledWith({
+      data: [
+        { noteID: 'note-1', groupID: 'group-1' },
+        { noteID: 'note-1', groupID: 'group-2' },
+      ],
+    });
+    // updateNote (full payload) must NOT be called — that was the N+1 path.
+    expect(prisma.noteMedia.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.noteMedia.createMany).not.toHaveBeenCalled();
+    expect(prisma.note.update).not.toHaveBeenCalled();
+
+    expect(result).toEqual({
+      id: 'note-1',
+      groupIds: ['group-1', 'group-2'],
+    });
+  });
+
+  it('rejects updateNoteGroupIds when one of the groups is not owned', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', deletedAt: null },
+      // group-2 missing → requireOwnedGroups throws NotFoundException
+    ]);
+
+    await expect(
+      service.updateNoteGroupIds('user-1', 'note-1', ['group-1', 'group-2']),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(prisma.noteGroupMembership.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('updateNoteGroupIds dedups group IDs before persisting', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', deletedAt: null },
+    ]);
+    prisma.note.findFirst.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.findUniqueOrThrow.mockResolvedValueOnce({
+      id: 'note-1',
+      groupMemberships: [{ groupID: 'group-1' }],
+    });
+
+    await service.updateNoteGroupIds('user-1', 'note-1', [
+      'group-1',
+      'group-1',
+      'group-1',
+    ]);
+
+    expect(prisma.noteGroupMembership.createMany).toHaveBeenCalledWith({
+      data: [{ noteID: 'note-1', groupID: 'group-1' }],
+    });
+  });
+
+  it('updateNoteGroupIds clears all memberships when groupIds is empty', async () => {
+    // requireOwnedGroups short-circuits for empty groupIds — don't queue findMany.
+    prisma.note.findFirst.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.findUniqueOrThrow.mockResolvedValueOnce({
+      id: 'note-1',
+      groupMemberships: [],
+    });
+
+    const result = await service.updateNoteGroupIds('user-1', 'note-1', []);
+
+    expect(prisma.noteGroup.findMany).not.toHaveBeenCalled();
+    expect(prisma.noteGroupMembership.deleteMany).toHaveBeenCalled();
+    // createMany must NOT be called for an empty list.
+    expect(prisma.noteGroupMembership.createMany).not.toHaveBeenCalled();
+    expect(result).toEqual({ id: 'note-1', groupIds: [] });
+  });
+
+  it('updateNoteGroupIds throws NotFound when the note is deleted or not owned', async () => {
+    prisma.noteGroup.findMany.mockResolvedValueOnce([
+      { id: 'group-1', ownerID: 'user-1', name: '上海', deletedAt: null },
+    ]);
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.updateNoteGroupIds('user-1', 'note-1', ['group-1']),
+    ).rejects.toThrow(NotFoundException);
   });
 
   it('pins a note for the owner only', async () => {

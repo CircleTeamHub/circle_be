@@ -22,6 +22,7 @@ import { TraceModule } from './trace/trace.module';
 import { IconModule } from './icon/icon.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { NotificationModule } from './notification/notification.module';
+import { ConversationGroupModule } from './conversation-group/conversation-group.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -54,6 +55,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     TraceModule,
     RealtimeModule,
     NotificationModule,
+    ConversationGroupModule,
   ],
   controllers: [],
   providers: [Logger],

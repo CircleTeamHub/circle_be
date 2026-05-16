@@ -145,6 +145,16 @@ export class CreateNoteDto {
 
 export class UpdateNoteDto extends CreateNoteDto {}
 
+// 单独更新一条 note 的 group 归属。前端"批量调分组成员"流程要避免对每个 note 做
+// fetch-detail-then-replace-all 的 N+1（参考 review #59）；这个 DTO 让前端只发 groupIds 一项。
+export class UpdateNoteGroupIdsDto {
+  @ApiProperty({ type: [String] })
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  @ArrayMaxSize(50)
+  groupIds: string[];
+}
+
 export class SetPinnedDto {
   @ApiProperty()
   @IsBoolean()
