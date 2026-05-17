@@ -157,6 +157,11 @@ export class MyCirclesQueryDto {
   tab: 'joined' | 'created' | 'applied';
 }
 
+export {
+  UploadCircleIconDto,
+  SelectCircleIconDto,
+} from 'src/icon/dto/icon.dto';
+
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
 export class CircleDto {
@@ -165,6 +170,8 @@ export class CircleDto {
   description: string;
   avatarUrl: string | null;
   ownerID: string;
+  currentIconAssetID: string | null;
+  currentIconUrl: string | null;
   cities: string[];
   isPublic: boolean;
   categories: string[];
@@ -184,4 +191,9 @@ export class CircleDto {
 export class CircleDetailDto extends CircleDto {
   myRole: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
   myStatus: 'ACTIVE' | 'PENDING' | 'REJECTED' | null;
+  availableIconAssets?: Array<{
+    id: string;
+    name: string;
+    imageUrl: string | null;
+  }>;
 }

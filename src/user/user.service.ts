@@ -7,9 +7,11 @@ import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
+import { IconService } from 'src/icon/icon.service';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -112,6 +114,8 @@ export class UserService {
     private prisma: PrismaService,
     private config: ConfigService,
     private refreshTokens: RefreshTokenService,
+    private iconService: IconService,
+    private realtimeService: RealtimeService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -169,12 +173,18 @@ export class UserService {
   }
 
   async findOne(id: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id },
-      select: PUBLIC_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id },
+        select: PUBLIC_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(id),
+    ]);
     if (!user) throw new NotFoundException(`User ${id} not found`);
-    return user;
+    return {
+      ...user,
+      displayIcons,
+    };
   }
 
   async create(input: CreateUserInput) {
@@ -193,38 +203,72 @@ export class UserService {
   async update(id: string, input: UpdateUserInput) {
     this.assertUrlsAreSafe(input);
     await this.findOne(id);
-    return this.prisma.user.update({
-      where: { id },
-      data: normalizeUpdateInput(input),
-      select: PUBLIC_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.update({
+        where: { id },
+        data: normalizeUpdateInput(input),
+        select: PUBLIC_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(id),
+    ]);
+    await this.realtimeService.broadcastUserProfileSummary(id);
+    return {
+      ...user,
+      displayIcons,
+    };
   }
 
   async remove(id: string) {
     await this.findOne(id);
-    const updated = await this.prisma.user.update({
-      where: { id },
-      data: { status: UserStatus.DELETED },
-      select: PUBLIC_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.update({
+        where: { id },
+        data: { status: UserStatus.DELETED },
+        select: PUBLIC_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(id),
+    ]);
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
-    return updated;
+    return {
+      ...user,
+      displayIcons,
+    };
   }
 
   async updateStatus(id: string, status: UserStatus) {
     await this.findOne(id);
-    const updated = await this.prisma.user.update({
-      where: { id },
-      data: { status },
-      select: PUBLIC_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.update({
+        where: { id },
+        data: { status },
+        select: PUBLIC_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(id),
+    ]);
     // BAN / DELETE must invalidate sessions immediately. ACTIVE → ACTIVE is a
     // no-op revoke call; cheaper than introducing a branch.
     if (status !== UserStatus.ACTIVE) {
       await this.refreshTokens.revokeAll(id);
     }
-    return updated;
+    await this.realtimeService.broadcastUserProfileSummary(id);
+    return {
+      ...user,
+      displayIcons,
+    };
+  }
+
+  async updateBasicProfile(id: string, input: UpdateUserInput) {
+    // Same storage-origin guard as `update` — an off-origin avatarUrl/cover
+    // would otherwise become a stored tracking / phishing vector.
+    this.assertUrlsAreSafe(input);
+    const user = await this.prisma.user.update({
+      where: { id },
+      data: normalizeUpdateInput(input),
+      select: PUBLIC_SELECT,
+    });
+    await this.realtimeService.broadcastUserProfileSummary(id);
+    return user;
   }
 }

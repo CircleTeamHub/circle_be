@@ -13,6 +13,10 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RefreshTokenService, SessionContext } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { IconService } from 'src/icon/icon.service';
+import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 
 const ME_SELECT = {
   id: true,
@@ -31,6 +35,8 @@ const ME_SELECT = {
   birthday: true,
   gender: true,
   city: true,
+  vipLevel: true,
+  creditScore: true,
   role: true,
   status: true,
   lastOnline: true,
@@ -55,22 +61,27 @@ export type SafeUser = {
   birthday: Date | null;
   gender: string;
   city: string | null;
+  vipLevel: number;
+  creditScore: number;
   role: string;
   status: string;
   lastOnline: Date | null;
   createdAt: Date;
   updatedAt: Date;
+  displayIcons: DisplayIconDto[];
 };
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  private readonly loggingConfig = createLoggingConfig();
 
   constructor(
     private prisma: PrismaService,
     private refreshTokenService: RefreshTokenService,
     private jwt: JwtService,
     private openim: OpenimService,
+    private iconService: IconService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
@@ -109,7 +120,22 @@ export class AuthService {
         ),
       );
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_register_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+
+    return this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+      dto.platform,
+    );
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -126,11 +152,27 @@ export class AuthService {
           `Login attempt for non-active account ${user.id} (status=${user.status})`,
         );
       }
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user?.id,
+        result: 'failure',
+        metadata: {
+          reason: user ? 'inactive_account' : 'invalid_credentials',
+        },
+      });
       throw new ForbiddenException('Invalid credentials');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'invalid_credentials' },
+      });
       throw new ForbiddenException('Invalid credentials');
     }
 
@@ -161,7 +203,24 @@ export class AuthService {
         ),
       );
 
-    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
+    const tokens = await this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+      dto.platform,
+    );
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_login_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+
+    return tokens;
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
@@ -211,13 +270,24 @@ export class AuthService {
 
   async logoutAll(userId: string): Promise<void> {
     await this.refreshTokenService.revokeAll(userId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_logout_all_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   async me(userId: string): Promise<SafeUser> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: ME_SELECT,
-    });
+    const [user, displayIcons] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: ME_SELECT,
+      }),
+      this.iconService.getDisplayIconsForUser(userId),
+    ]);
 
     if (!user) {
       throw new NotFoundException('User not found');
@@ -235,7 +305,7 @@ export class AuthService {
         ),
       );
 
-    return { ...user, lastOnline: now };
+    return { ...user, lastOnline: now, displayIcons };
   }
 
   async changePassword(
@@ -261,6 +331,14 @@ export class AuthService {
 
     // Invalidate all existing sessions after password change
     await this.refreshTokenService.revokeAll(userId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_change_password_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   private async issueTokens(
@@ -268,11 +346,12 @@ export class AuthService {
     accountId: string,
     role: string,
     sessionContext?: SessionContext,
+    platformID?: 1 | 2 | 5,
   ) {
     const [accessToken, refreshToken, imToken] = await Promise.all([
       this.signAccessToken(userId, accountId, role),
       this.refreshTokenService.create(userId, sessionContext),
-      this.openim.getUserToken(userId).catch((err) => {
+      this.openim.getUserToken(userId, platformID).catch((err) => {
         this.logger.warn(`OpenIM getUserToken failed: ${err?.message}`);
         return '';
       }),

@@ -3,6 +3,7 @@ import { UserModule } from './user/user.module';
 import { ConfigModule } from '@nestjs/config';
 import * as dotenv from 'dotenv';
 
+import { LogsModule } from './logs/logs.module';
 import { RolesModule } from './roles/roles.module';
 import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -10,11 +11,18 @@ import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
 import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
+import { CollectionModule } from './collection/collection.module';
 import { NoteModule } from './note/note.module';
+import { MembershipModule } from './membership/membership.module';
+import { MallModule } from './mall/mall.module';
 import { CircleModule } from './circle/circle.module';
 import { CirclePlazaModule } from './circle-plaza/circle-plaza.module';
 import { CircleInvitationModule } from './circle-invitation/circle-invitation.module';
 import { TraceModule } from './trace/trace.module';
+import { IconModule } from './icon/icon.module';
+import { RealtimeModule } from './realtime/realtime.module';
+import { NotificationModule } from './notification/notification.module';
+import { ConversationGroupModule } from './conversation-group/conversation-group.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -29,17 +37,25 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     }),
     PrismaModule,
     UserModule,
+    LogsModule,
     RolesModule,
     AuthModule,
     OpenimModule,
     UploadModule,
     FriendModule,
     CoinModule,
+    MembershipModule,
+    MallModule,
+    CollectionModule,
     NoteModule,
     CircleModule,
+    IconModule,
     CirclePlazaModule,
     CircleInvitationModule,
     TraceModule,
+    RealtimeModule,
+    NotificationModule,
+    ConversationGroupModule,
   ],
   controllers: [],
   providers: [Logger],

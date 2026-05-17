@@ -5,6 +5,8 @@ import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { UserStatus } from 'src/generated/prisma';
 import { UserService } from '../user.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { IconService } from 'src/icon/icon.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -21,6 +23,12 @@ describe('UserService', () => {
     revokeAll: jest.fn().mockResolvedValue(undefined),
   };
   const configGet = jest.fn(() => null);
+  const iconService = {
+    getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
+  };
+  const realtimeService = {
+    broadcastUserProfileSummary: jest.fn(),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -32,6 +40,8 @@ describe('UserService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: { get: getter } },
         { provide: RefreshTokenService, useValue: refreshTokens },
+        { provide: IconService, useValue: iconService },
+        { provide: RealtimeService, useValue: realtimeService },
       ],
     }).compile();
     return module.get<UserService>(UserService);
@@ -53,9 +63,9 @@ describe('UserService', () => {
       nickname: 'Jimmy',
     });
 
-    await expect(service.findByExactAccountId(' jimmy ')).resolves.toMatchObject(
-      { id: 'user-1', accountId: 'jimmy' },
-    );
+    await expect(
+      service.findByExactAccountId(' jimmy '),
+    ).resolves.toMatchObject({ id: 'user-1', accountId: 'jimmy' });
     expect(prisma.user.findFirst).toHaveBeenCalledWith({
       where: {
         accountId: { equals: 'jimmy', mode: 'insensitive' },
@@ -109,7 +119,10 @@ describe('UserService', () => {
   describe('findOne', () => {
     it('returns the user when found', async () => {
       prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
-      await expect(service.findOne('user-1')).resolves.toEqual({ id: 'user-1' });
+      await expect(service.findOne('user-1')).resolves.toEqual({
+        id: 'user-1',
+        displayIcons: [],
+      });
     });
 
     it('throws NotFoundException when missing', async () => {

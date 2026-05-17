@@ -6,6 +6,8 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CoinService } from './coin.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
 
 const IDEM = 'idem-key-1';
 
@@ -55,11 +57,30 @@ describe('CoinService', () => {
     ),
   };
 
+  const realtimeService = {
+    broadcastWalletBalanceChanged: jest.fn(),
+    broadcastWalletRechargeCompleted: jest.fn(),
+    broadcastSystemNotificationCreated: jest.fn(),
+    broadcastSystemNotificationUnread: jest.fn(),
+    safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
+      Promise.allSettled(fns.map((fn) => fn())),
+    ),
+  };
+
+  const notificationService = {
+    createSystemNotification: jest.fn(),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [CoinService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        CoinService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: RealtimeService, useValue: realtimeService },
+        { provide: NotificationService, useValue: notificationService },
+      ],
     }).compile();
 
     service = module.get<CoinService>(CoinService);

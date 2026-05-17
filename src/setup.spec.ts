@@ -1,6 +1,7 @@
 import { AllExceptionFilter } from './filters/all-exception.filter';
 import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
+import { ErrorLoggingInterceptor } from './interceptors/error-logging.interceptor';
 import { setupApp } from './setup';
 
 function buildAppMock() {
@@ -11,10 +12,25 @@ function buildAppMock() {
     useGlobalInterceptors: jest.fn(),
     use: jest.fn(),
     get: jest.fn().mockReturnValue({ httpAdapter: { reply: jest.fn() } }),
+    useLogger: jest.fn(),
   };
 }
 
+const getServerConfigMock = jest.fn<Record<string, unknown>, []>(() => ({
+  LOG_ON: 'false',
+}));
+
+jest.mock('./config/server.config', () => ({
+  getServerConfig: () => getServerConfigMock(),
+}));
+
 describe('setupApp', () => {
+  beforeEach(() => {
+    getServerConfigMock.mockReturnValue({
+      LOG_ON: 'false',
+    });
+  });
+
   it('registers the global response interceptor', () => {
     const app = buildAppMock();
     setupApp(app as any);
@@ -31,6 +47,38 @@ describe('setupApp', () => {
     expect(app.useGlobalFilters).toHaveBeenCalledWith(
       expect.any(AllExceptionFilter),
       expect.any(PrismaExceptionFilter),
+    );
+  });
+
+  it('registers request and error logging when enabled', () => {
+    getServerConfigMock.mockReturnValue({
+      LOG_ON: 'true',
+      HTTP_LOG_ON: 'true',
+      SLOW_REQUEST_MS: '750',
+    });
+    const app = {
+      setGlobalPrefix: jest.fn(),
+      useGlobalFilters: jest.fn(),
+      useGlobalPipes: jest.fn(),
+      useGlobalInterceptors: jest.fn(),
+      use: jest.fn(),
+      get: jest.fn(() => ({
+        log: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+      })),
+      useLogger: jest.fn(),
+    };
+
+    setupApp(app as any);
+
+    expect(app.useLogger).toHaveBeenCalled();
+    expect(app.use).toHaveBeenCalledWith(expect.any(Function));
+    expect(app.useGlobalInterceptors).toHaveBeenCalledWith(
+      expect.any(ErrorLoggingInterceptor),
+    );
+    expect(app.useGlobalInterceptors).toHaveBeenCalledWith(
+      expect.any(ResponseInterceptor),
     );
   });
 

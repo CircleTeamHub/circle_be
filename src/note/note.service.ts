@@ -661,6 +661,61 @@ export class NoteService {
     return this.mapDetail(updated);
   }
 
+  /**
+   * Replace a note's group memberships in a single round-trip. Used by the
+   * group-membership editor on the client which previously had to fetch each
+   * note's full detail, spread all the other fields, and PATCH with the full
+   * payload just to change group IDs (review #59).
+   */
+  async updateNoteGroupIds(
+    ownerID: string,
+    noteId: string,
+    groupIds: string[],
+  ): Promise<{ id: string; groupIds: string[] }> {
+    const uniqueGroupIds = [...new Set(groupIds)];
+    await this.requireOwnedGroups(ownerID, uniqueGroupIds);
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Re-verify ownership inside the transaction to prevent TOCTOU races
+      // where a concurrent delete could un-delete the note via this update.
+      const existing = await tx.note.findFirst({
+        where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+        select: { id: true },
+      });
+      if (!existing) {
+        throw new NotFoundException('Note not found');
+      }
+
+      await tx.noteGroupMembership.deleteMany({
+        where: { noteID: noteId },
+      });
+
+      if (uniqueGroupIds.length > 0) {
+        await tx.noteGroupMembership.createMany({
+          data: uniqueGroupIds.map((groupID) => ({
+            noteID: noteId,
+            groupID,
+          })),
+        });
+      }
+
+      return tx.note.findUniqueOrThrow({
+        where: { id: noteId },
+        select: {
+          id: true,
+          groupMemberships: {
+            select: { groupID: true },
+          },
+        },
+      });
+    });
+
+    return {
+      id: updated.id,
+      groupIds: updated.groupMemberships.map((item) => item.groupID),
+    };
+  }
+
   async setPinned(ownerID: string, noteId: string, pinned: boolean) {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status guard in the write to close the TOCTOU window

@@ -1,5 +1,6 @@
-import { Expose } from 'class-transformer';
+import { Expose, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 
 /** Safe public profile — no PII. Used for GET /user/:id viewed by other users. */
 export class PublicUserDto {
@@ -78,6 +79,11 @@ export class PublicUserDto {
   @ApiProperty({ example: '2026-04-02T00:00:00.000Z' })
   @Expose()
   updatedAt: Date;
+
+  @ApiProperty({ type: [DisplayIconDto] })
+  @Expose()
+  @Type(() => DisplayIconDto)
+  displayIcons: DisplayIconDto[];
 }
 
 /**
@@ -92,4 +98,12 @@ export class SelfUserDto extends PublicUserDto {
   @ApiPropertyOptional({ example: '+8613800138000' })
   @Expose()
   phoneNumber: string | null;
+
+  @ApiProperty({ example: 3 })
+  @Expose()
+  vipLevel: number;
+
+  @ApiProperty({ example: 100 })
+  @Expose()
+  creditScore: number;
 }

@@ -50,11 +50,14 @@ describe('AuthController', () => {
         birthday: null,
         gender: 'unset',
         city: null,
+        vipLevel: 0,
+        creditScore: 0,
         role: 'USER',
         status: 'ACTIVE',
         lastOnline: null,
         createdAt: new Date(),
         updatedAt: new Date(),
+        displayIcons: [],
       }),
   };
 

@@ -9,6 +9,7 @@ import {
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   InvitationDto,
   InvitationVerifierDto,
@@ -35,6 +36,7 @@ export class CircleInvitationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
+    private readonly realtimeService: RealtimeService,
   ) {}
 
   async invite(
@@ -216,6 +218,8 @@ export class CircleInvitationService {
         },
       });
     });
+
+    await this.realtimeService.broadcastCircleUnreadCount(verifierId);
   }
 
   async respond(
@@ -320,6 +324,25 @@ export class CircleInvitationService {
       admission?.groupID ?? null,
       admission?.applicantId,
     );
+
+    const notificationTarget = await this.prisma.circleInvitation.findUnique({
+      where: { id: invitationId },
+      select: { applicantID: true, circleID: true },
+    });
+
+    if (notificationTarget?.applicantID) {
+      await this.realtimeService.broadcastCircleUnreadCount(
+        notificationTarget.applicantID,
+      );
+      this.realtimeService.broadcastCircleInvitationReviewed(
+        notificationTarget.applicantID,
+        {
+          invitationId,
+          circleId: notificationTarget.circleID,
+          status: approve ? 'APPROVED' : 'REJECTED',
+        },
+      );
+    }
   }
 
   async adminApprove(adminId: string, invitationId: string): Promise<void> {
@@ -391,6 +414,25 @@ export class CircleInvitationService {
       admission?.groupID ?? null,
       admission?.applicantId,
     );
+
+    const notificationTarget = await this.prisma.circleInvitation.findUnique({
+      where: { id: invitationId },
+      select: { applicantID: true },
+    });
+
+    if (notificationTarget?.applicantID) {
+      await this.realtimeService.broadcastCircleUnreadCount(
+        notificationTarget.applicantID,
+      );
+      this.realtimeService.broadcastCircleInvitationReviewed(
+        notificationTarget.applicantID,
+        {
+          invitationId,
+          circleId: invitation.circleID,
+          status: 'ADMIN_APPROVED',
+        },
+      );
+    }
   }
 
   async getInvitationForViewer(

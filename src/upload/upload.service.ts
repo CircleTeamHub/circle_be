@@ -14,6 +14,9 @@ import {
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 export interface PresignResult {
   uploadUrl: string;
@@ -39,6 +42,7 @@ export function buildPublicReadBucketPolicy(bucket: string) {
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly client: S3Client;
   private readonly publicClient: S3Client;
   private readonly bucket: string;
@@ -128,9 +132,33 @@ export class UploadService implements OnModuleInit {
       ContentType: contentType,
     });
 
-    const uploadUrl = await getSignedUrl(this.publicClient, command, {
-      expiresIn,
-    });
+    let uploadUrl: string;
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
+    try {
+      uploadUrl = await getSignedUrl(this.publicClient, command, {
+        expiresIn,
+      });
+    } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'minio',
+        operation: 'presign_put_object',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'minio',
+        operation: 'presign_put_object',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
+    }
 
     // 把 uploadUrl 里的内网地址替换为公开访问地址
     const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;

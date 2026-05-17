@@ -1,6 +1,13 @@
 import { UserService } from '../user.service';
 
 describe('UserService.update normalization', () => {
+  const iconService = {
+    getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
+  };
+  const realtimeService = {
+    broadcastUserProfileSummary: jest.fn(() => Promise.resolve()),
+  };
+
   const prisma = {
     user: {
       findUnique: jest.fn(),
@@ -45,6 +52,8 @@ describe('UserService.update normalization', () => {
       prisma as any,
       config as any,
       refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -65,6 +74,8 @@ describe('UserService.update normalization', () => {
       prisma as any,
       config as any,
       refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
     );
 
     await service.update('user-1', {
@@ -96,6 +107,8 @@ describe('UserService.update normalization', () => {
       prisma as any,
       config as any,
       refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
     );
 
     await service.update('user-1', {

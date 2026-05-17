@@ -64,6 +64,13 @@ test/
 - `LOG_ON`
 - `LOG_LEVEL`
 - `TIMESTAMP`
+- `HTTP_LOG_ON`
+- `SLOW_REQUEST_MS`
+- `BUSINESS_LOG_ON`
+- `EXTERNAL_LOG_ON`
+- `RATE_LIMIT_LOG_ON`
+
+日志策略、字段和排查方式见 [docs/logging.md](/Users/yiboding/projects/circle_be/docs/logging.md)。
 
 ## 本地启动
 

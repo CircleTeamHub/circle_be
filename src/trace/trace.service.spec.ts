@@ -1,7 +1,9 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { TraceService } from './trace.service';
 
 describe('TraceService', () => {
@@ -34,6 +36,13 @@ describe('TraceService', () => {
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
   };
+  const notificationService = {
+    createTraceCommentNotifications: jest.fn(() => Promise.resolve([])),
+  };
+  const realtimeService = {
+    broadcastCircleUnreadCount: jest.fn(() => Promise.resolve()),
+    broadcastCirclePostInteractionCreated: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -43,6 +52,8 @@ describe('TraceService', () => {
         TraceService,
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        { provide: NotificationService, useValue: notificationService },
+        { provide: RealtimeService, useValue: realtimeService },
       ],
     }).compile();
 

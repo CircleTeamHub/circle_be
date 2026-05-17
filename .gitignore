@@ -5,7 +5,7 @@ build/
 tmp/
 temp/
 dist/
-logs/
+/logs/
 
 # Environment variables — never commit secrets. Use .env.example as the
 # tracked template, keep concrete values out of version control.

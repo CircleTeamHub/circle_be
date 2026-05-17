@@ -5,7 +5,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
@@ -26,6 +28,8 @@ export class TraceService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly notificationService: NotificationService,
+    private readonly realtimeService: RealtimeService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -245,7 +249,7 @@ export class TraceService {
     traceId: string,
     dto: CreateTraceCommentDto,
   ): Promise<TraceCommentDto> {
-    await this.requireVisibleTrace(traceId, userId);
+    const trace = await this.requireVisibleTrace(traceId, userId);
 
     if (dto.replyToId) {
       const replyTarget = await this.prisma.traceComment.findFirst({
@@ -286,6 +290,33 @@ export class TraceService {
 
       return created;
     });
+
+    const notifiedUserIds =
+      await this.notificationService.createTraceCommentNotifications({
+        actorId: userId,
+        traceId,
+        commentId: comment.id,
+        traceOwnerId: trace.fromID,
+        replyToCommentId: comment.replyTo?.id ?? null,
+        replyToUserId: comment.replyTo?.user.id ?? null,
+        content: comment.content,
+      });
+
+    await Promise.all(
+      notifiedUserIds.map(async (targetUserId) => {
+        await this.realtimeService.broadcastCircleUnreadCount(targetUserId);
+        this.realtimeService.broadcastCirclePostInteractionCreated(
+          targetUserId,
+          {
+            traceId,
+            commentId: comment.id,
+            interactionType: comment.replyTo ? 'REPLY' : 'COMMENT',
+            actorId: userId,
+            actorNickname: comment.user.nickname,
+          },
+        );
+      }),
+    );
 
     return {
       id: comment.id,

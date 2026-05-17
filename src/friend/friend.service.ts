@@ -8,6 +8,9 @@ import {
 } from '@nestjs/common';
 import { FriendState } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
   FriendProfileDto,
   FriendActivityDto,
@@ -71,8 +74,12 @@ const FRIEND_ACTIVITY_INCLUDE = {
 @Injectable()
 export class FriendService {
   private readonly logger = new Logger(FriendService.name);
+  private readonly loggingConfig = createLoggingConfig();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtimeService: RealtimeService,
+  ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
 
@@ -136,8 +143,9 @@ export class FriendService {
       pendingRemarkBySender,
     } as any;
 
+    let request: { id: string };
     try {
-      await this.prisma.$transaction(async (tx: any) => {
+      request = await this.prisma.$transaction(async (tx: any) => {
         // `Friend` has no DB-level unique constraint, so a check-then-insert
         // would race under concurrent requests for the same pair (e.g. a
         // double-tap). Serialize per user-pair with a transaction-scoped
@@ -203,6 +211,16 @@ export class FriendService {
     }
 
     this.logger.log(`Friend request sent: ${senderId} → ${targetId}`);
+    await this.broadcastFriendUnreadUpdates([senderId, targetId]);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_request_sent',
+      actorId: senderId,
+      targetId,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: request.id,
+    });
   }
 
   // ─── Cancel request (sender withdraws) ───────────────────────────────────────
@@ -240,6 +258,16 @@ export class FriendService {
           messageSnapshot: updated.message ?? null,
         },
       ]);
+    });
+    await this.broadcastFriendUnreadUpdates([senderId, record.friendID]);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_request_withdrawn',
+      actorId: senderId,
+      targetId: record.friendID,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: requestId,
     });
   }
 
@@ -347,6 +375,19 @@ export class FriendService {
       );
 
       return nextRequest;
+    });
+    await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent:
+        decision === FriendState.ACCEPTED
+          ? 'friend_request_accepted'
+          : 'friend_request_rejected',
+      actorId: recipientId,
+      targetId: record.userID,
+      result: 'success',
+      entityType: 'friend_request',
+      entityId: requestId,
     });
   }
 
@@ -620,6 +661,8 @@ export class FriendService {
         throw new NotFoundException('Friend activity not found');
       }
     }
+
+    await this.broadcastFriendUnreadUpdates([userId]);
   }
 
   // ─── Relationship status ─────────────────────────────────────────────────────
@@ -709,6 +752,15 @@ export class FriendService {
     }
 
     this.logger.log(`Block created: ${blockerId} → ${targetId}`);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_block_created',
+      actorId: blockerId,
+      targetId,
+      result: 'success',
+      entityType: 'block',
+      entityId: `${blockerId}:${targetId}`,
+    });
   }
 
   async unblockUser(blockerId: string, targetId: string): Promise<void> {
@@ -940,6 +992,15 @@ export class FriendService {
       data: activities,
       skipDuplicates: true,
     });
+  }
+
+  private async broadcastFriendUnreadUpdates(userIds: string[]) {
+    const uniqueUserIds = Array.from(new Set(userIds.filter(Boolean)));
+    await Promise.all(
+      uniqueUserIds.map((userId) =>
+        this.realtimeService.broadcastFriendUnreadCount(userId),
+      ),
+    );
   }
 
   private async throwActiveFriendConflict(

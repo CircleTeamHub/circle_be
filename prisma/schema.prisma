@@ -118,6 +118,21 @@ enum CircleMemberStatus {
   REJECTED
 }
 
+enum IconAssetSourceType {
+  SYSTEM
+  CIRCLE
+}
+
+enum UserDisplayIconType {
+  SYSTEM
+  CIRCLE
+}
+
+enum SystemIconKey {
+  VIP
+  NEW_USER
+}
+
 enum CircleCategory {
   LIFE
   FOOD
@@ -221,84 +236,89 @@ enum ParticipantRole {
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
-  id           String     @id @default(uuid())
-  accountId    String     @unique
-  passwordHash String
-  nickname     String
-  avatarUrl    String?
-  avatarFrame  String?
-  cover        String?
-  email        String?
-  phoneNumber  String?
-  wechat       String?
-  qq           String?
-  whatsup      String?
-  persona      String?
-  helloWords   String?
-  birthday     DateTime?
-  city         String?
-  gender        Gender     @default(unset)
-  role          UserRole   @default(USER)
-  status        UserStatus @default(ACTIVE)
-  vipLevel      Int        @default(0)
-  creditScore   Int        @default(100)
-  fancyNumber   Boolean    @default(false)
-  openimSynced  Boolean    @default(false)
-  lastOnline    DateTime?
+  id                         String     @id @default(uuid())
+  accountId                  String     @unique
+  passwordHash               String
+  nickname                   String
+  avatarUrl                  String?
+  avatarFrame                String?
+  cover                      String?
+  email                      String?
+  phoneNumber                String?
+  wechat                     String?
+  qq                         String?
+  whatsup                    String?
+  persona                    String?
+  helloWords                 String?
+  birthday                   DateTime?
+  city                       String?
+  gender                     Gender     @default(unset)
+  role                       UserRole   @default(USER)
+  status                     UserStatus @default(ACTIVE)
+  vipLevel                   Int        @default(0)
+  creditScore                Int        @default(100)
+  fancyNumber                Boolean    @default(false)
+  iconPreferencesInitialized Boolean    @default(false)
+  openimSynced               Boolean    @default(false)
+  lastOnline                 DateTime?
   /// Set once the one-time friend-activity backfill has run for this user.
-  activitiesBackfilledAt DateTime?
-  createdAt     DateTime   @default(now())
-  updatedAt     DateTime   @updatedAt
+  activitiesBackfilledAt     DateTime?
+  createdAt                  DateTime   @default(now())
+  updatedAt                  DateTime   @updatedAt
 
-  refreshTokens         RefreshToken[]
-  activities            Activity[]
-  friendsAsUser         Friend[]              @relation("userFriends")
-  friendsAsFriend       Friend[]              @relation("userFriendsTo")
-  blocksIssued          Block[]               @relation("blocker")
-  blocksReceived        Block[]               @relation("blocked")
-  squads                Squad[]
-  squadMembers          SquadMember[]
-  squadRequests         SquadRequest[]        @relation("fromUser")
-  squadRequestsReceived SquadRequest[]        @relation("toUser")
-  notifications         Notification[]        @relation("toUser")
-  notificationsSent     Notification[]        @relation("fromUser")
-  traces                Trace[]
-  traceComments         TraceComment[]
-  traceLikeStats        traceLikeStat[]
-  traceViewedStats      traceViewedStat[]
-  tracePreferences      UserTracePreference[]
-  badgesAuthored        BadgeTemplate[]
-  badgeSources          BadgeSource[]
-  badgeInstances        BadgeInstance[]
-  userBadgeCounts       UserBadgeCount[]
-  missions              Mission[]
-  missionParticipants   MissionParticipant[]
-  recommendFeedbacks    RecommendationFeedback[]
-  blockedContents       UserBlockedContent[]
-  tags                  TagOnUser[]
-  wallet                Wallet?
-  coinTransactions      CoinTransaction[]
-  coinGiftsSent         CoinGift[]            @relation("giftSender")
-  coinGiftsReceived     CoinGift[]            @relation("giftRecipient")
-  friendTags            FriendTag[]
-  friendTagAssignments  FriendTagOnFriend[]   @relation("tagOwner")
-  pendingFriendTagAssignments PendingFriendTagOnRequest[] @relation("pendingTagOwner")
-  friendActivities      FriendActivity[]      @relation("friendActivityViewer")
-  friendActivitiesAuthored FriendActivity[]   @relation("friendActivityActor")
-  friendActivitiesCounterparty FriendActivity[] @relation("friendActivityCounterparty")
-  friendReportsFiled    FriendReport[]        @relation("friendReportReporter")
-  friendReportsReceived FriendReport[]        @relation("friendReportTarget")
-  notes                 Note[]
-  noteGroups            NoteGroup[]
-  circles               Circle[]
-  circleMembers         CircleMember[]
-  circlePosts           CirclePost[]
-  circleInvitationsAsApplicant  CircleInvitation[]          @relation("invitationApplicant")
-  circleInvitationsAsInviter    CircleInvitation[]          @relation("invitationInviter")
-  circleVerifications           CircleInvitationVerifier[]  @relation("verifierUser")
-  circleVerificationsAdded      CircleInvitationVerifier[]  @relation("verifierAddedBy")
-  circleActivitiesViewed        CircleActivity[]            @relation("circleActivityViewer")
-  circleActivitiesActed         CircleActivity[]            @relation("circleActivityActor")
+  refreshTokens                RefreshToken[]
+  activities                   Activity[]
+  friendsAsUser                Friend[]                    @relation("userFriends")
+  friendsAsFriend              Friend[]                    @relation("userFriendsTo")
+  blocksIssued                 Block[]                     @relation("blocker")
+  blocksReceived               Block[]                     @relation("blocked")
+  squads                       Squad[]
+  squadMembers                 SquadMember[]
+  squadRequests                SquadRequest[]              @relation("fromUser")
+  squadRequestsReceived        SquadRequest[]              @relation("toUser")
+  notifications                Notification[]              @relation("toUser")
+  notificationsSent            Notification[]              @relation("fromUser")
+  traces                       Trace[]
+  traceComments                TraceComment[]
+  traceLikeStats               traceLikeStat[]
+  traceViewedStats             traceViewedStat[]
+  tracePreferences             UserTracePreference[]
+  badgesAuthored               BadgeTemplate[]
+  badgeSources                 BadgeSource[]
+  badgeInstances               BadgeInstance[]
+  userBadgeCounts              UserBadgeCount[]
+  missions                     Mission[]
+  missionParticipants          MissionParticipant[]
+  recommendFeedbacks           RecommendationFeedback[]
+  blockedContents              UserBlockedContent[]
+  tags                         TagOnUser[]
+  wallet                       Wallet?
+  coinTransactions             CoinTransaction[]
+  coinGiftsSent                CoinGift[]                  @relation("giftSender")
+  coinGiftsReceived            CoinGift[]                  @relation("giftRecipient")
+  collections                  UserCollection[]
+  friendTags                   FriendTag[]
+  friendTagAssignments         FriendTagOnFriend[]         @relation("tagOwner")
+  pendingFriendTagAssignments  PendingFriendTagOnRequest[] @relation("pendingTagOwner")
+  friendActivities             FriendActivity[]            @relation("friendActivityViewer")
+  friendActivitiesAuthored     FriendActivity[]            @relation("friendActivityActor")
+  friendActivitiesCounterparty FriendActivity[]            @relation("friendActivityCounterparty")
+  friendReportsFiled           FriendReport[]              @relation("friendReportReporter")
+  friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
+  notes                        Note[]
+  noteGroups                   NoteGroup[]
+  circles                      Circle[]
+  circleMembers                CircleMember[]
+  circlePosts                  CirclePost[]
+  circleInvitationsAsApplicant CircleInvitation[]          @relation("invitationApplicant")
+  circleInvitationsAsInviter   CircleInvitation[]          @relation("invitationInviter")
+  circleVerifications          CircleInvitationVerifier[]  @relation("verifierUser")
+  circleVerificationsAdded     CircleInvitationVerifier[]  @relation("verifierAddedBy")
+  circleActivitiesViewed       CircleActivity[]            @relation("circleActivityViewer")
+  circleActivitiesActed        CircleActivity[]            @relation("circleActivityActor")
+  iconAssetsCreated            IconAsset[]                 @relation("iconAssetCreator")
+  displayIcons                 UserDisplayIcon[]
+  conversationGroups           ConversationGroup[]
 }
 
 model RefreshToken {
@@ -320,23 +340,23 @@ model RefreshToken {
 // ─── Social ───────────────────────────────────────────────────────────────────
 
 model Friend {
-  id        String      @id @default(uuid())
-  userID    String
-  friendID  String
-  state     FriendState @default(PENDING)
-  message   String?
+  id                    String                      @id @default(uuid())
+  userID                String
+  friendID              String
+  state                 FriendState                 @default(PENDING)
+  message               String?
   pendingRemarkBySender String?
   /// userID's private remark for friendID
-  remarkA   String?
+  remarkA               String?
   /// friendID's private remark for userID
-  remarkB   String?
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
-  user      User        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
-  friend    User        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
-  tagLinks  FriendTagOnFriend[]
-  pendingTagLinks PendingFriendTagOnRequest[]
-  activities FriendActivity[]
+  remarkB               String?
+  createdAt             DateTime                    @default(now())
+  updatedAt             DateTime                    @updatedAt
+  user                  User                        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
+  friend                User                        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
+  tagLinks              FriendTagOnFriend[]
+  pendingTagLinks       PendingFriendTagOnRequest[]
+  activities            FriendActivity[]
 
   @@index([userID])
   @@index([friendID])
@@ -377,10 +397,10 @@ model Note {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
-  owner      User       @relation(fields: [ownerID], references: [id], onDelete: Cascade)
-  group      NoteGroup? @relation(fields: [groupID], references: [id], onDelete: SetNull)
-  media      NoteMedia[] @relation("noteMediaItems")
-  coverMedia NoteMedia?  @relation("noteCoverMedia", fields: [coverMediaID], references: [id], onDelete: SetNull)
+  owner            User                  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  group            NoteGroup?            @relation(fields: [groupID], references: [id], onDelete: SetNull)
+  media            NoteMedia[]           @relation("noteMediaItems")
+  coverMedia       NoteMedia?            @relation("noteCoverMedia", fields: [coverMediaID], references: [id], onDelete: SetNull)
   groupMemberships NoteGroupMembership[]
 
   @@index([ownerID, status, updatedAt])
@@ -403,7 +423,7 @@ model NoteMedia {
   sortOrder  Int
   createdAt  DateTime      @default(now())
 
-  note        Note  @relation("noteMediaItems", fields: [noteID], references: [id], onDelete: Cascade)
+  note         Note  @relation("noteMediaItems", fields: [noteID], references: [id], onDelete: Cascade)
   coverForNote Note? @relation("noteCoverMedia")
 
   @@unique([noteID, sortOrder])
@@ -419,8 +439,8 @@ model NoteGroup {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
-  owner User   @relation(fields: [ownerID], references: [id], onDelete: Cascade)
-  notes Note[]
+  owner       User                  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  notes       Note[]
   memberships NoteGroupMembership[]
 
   @@index([ownerID, deletedAt, sortOrder])
@@ -440,19 +460,19 @@ model NoteGroupMembership {
 }
 
 model FriendActivity {
-  id             String             @id @default(uuid())
-  requestId      String
-  viewerId       String
-  actorId        String
-  counterpartyId String
-  type           FriendActivityType
+  id              String             @id @default(uuid())
+  requestId       String
+  viewerId        String
+  actorId         String
+  counterpartyId  String
+  type            FriendActivityType
   messageSnapshot String?
-  readAt         DateTime?
-  createdAt      DateTime           @default(now())
-  request        Friend             @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  viewer         User               @relation("friendActivityViewer", fields: [viewerId], references: [id], onDelete: Cascade)
-  actor          User               @relation("friendActivityActor", fields: [actorId], references: [id], onDelete: Cascade)
-  counterparty   User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
+  readAt          DateTime?
+  createdAt       DateTime           @default(now())
+  request         Friend             @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  viewer          User               @relation("friendActivityViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  actor           User               @relation("friendActivityActor", fields: [actorId], references: [id], onDelete: Cascade)
+  counterparty    User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
 
   @@unique([requestId, viewerId, type])
   @@index([requestId])
@@ -462,13 +482,13 @@ model FriendActivity {
 
 // Friend tags — user-defined labels like "高中同学", "同事"
 model FriendTag {
-  id        String              @id @default(uuid())
-  ownerID   String
-  name      String
-  color     String?
-  createdAt DateTime            @default(now())
-  owner     User                @relation(fields: [ownerID], references: [id], onDelete: Cascade)
-  friends   FriendTagOnFriend[]
+  id              String                      @id @default(uuid())
+  ownerID         String
+  name            String
+  color           String?
+  createdAt       DateTime                    @default(now())
+  owner           User                        @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  friends         FriendTagOnFriend[]
   pendingRequests PendingFriendTagOnRequest[]
 
   @@unique([ownerID, name])
@@ -477,27 +497,27 @@ model FriendTag {
 
 // Junction: which tags an owner has applied to which friendship
 model FriendTagOnFriend {
-  id        String    @id @default(uuid())
-  ownerID   String
-  tagID     String
-  friendID  String    // the Friend record id
-  createdAt DateTime  @default(now())
-  owner     User      @relation("tagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
-  tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
-  friendship Friend   @relation(fields: [friendID], references: [id], onDelete: Cascade)
+  id         String    @id @default(uuid())
+  ownerID    String
+  tagID      String
+  friendID   String // the Friend record id
+  createdAt  DateTime  @default(now())
+  owner      User      @relation("tagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  tag        FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
+  friendship Friend    @relation(fields: [friendID], references: [id], onDelete: Cascade)
 
   @@unique([ownerID, tagID, friendID])
   @@index([ownerID, friendID])
 }
 
 model PendingFriendTagOnRequest {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   ownerID   String
   requestID String
   tagID     String
-  createdAt DateTime @default(now())
-  owner     User     @relation("pendingTagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
-  request   Friend   @relation(fields: [requestID], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+  owner     User      @relation("pendingTagOwner", fields: [ownerID], references: [id], onDelete: Cascade)
+  request   Friend    @relation(fields: [requestID], references: [id], onDelete: Cascade)
   tag       FriendTag @relation(fields: [tagID], references: [id], onDelete: Cascade)
 
   @@unique([ownerID, requestID, tagID])
@@ -506,12 +526,12 @@ model PendingFriendTagOnRequest {
 }
 
 model Block {
-  id          String   @id @default(uuid())
-  blockerID   String
-  blockedID   String
-  createdAt   DateTime @default(now())
-  blocker     User     @relation("blocker", fields: [blockerID], references: [id], onDelete: Cascade)
-  blocked     User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
+  id        String   @id @default(uuid())
+  blockerID String
+  blockedID String
+  createdAt DateTime @default(now())
+  blocker   User     @relation("blocker", fields: [blockerID], references: [id], onDelete: Cascade)
+  blocked   User     @relation("blocked", fields: [blockedID], references: [id], onDelete: Cascade)
 
   @@unique([blockerID, blockedID])
   @@index([blockerID])
@@ -547,11 +567,11 @@ model Squad {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  creator        User           @relation(fields: [creatorID], references: [id])
-  members        SquadMember[]
-  squadRequests  SquadRequest[]
-  events         Event[]
-  tags           TagOnSquad[]
+  creator       User           @relation(fields: [creatorID], references: [id])
+  members       SquadMember[]
+  squadRequests SquadRequest[]
+  events        Event[]
+  tags          TagOnSquad[]
 
   @@index([creatorID])
   @@index([visibility, status])
@@ -571,8 +591,8 @@ model SquadMember {
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 
-  fromSquad Squad     @relation(fields: [fromSquadID], references: [id], onDelete: Cascade)
-  user      User?     @relation(fields: [userID], references: [id])
+  fromSquad Squad   @relation(fields: [fromSquadID], references: [id], onDelete: Cascade)
+  user      User?   @relation(fields: [userID], references: [id])
   events    Event[]
 
   @@index([userID, fromSquadID, deleted])
@@ -601,14 +621,14 @@ model Event {
 }
 
 model SquadRequest {
-  id          String            @id @default(uuid())
-  fromUserID  String?
-  content     String?
-  status      SquadRequestState @default(PENDING)
-  toSquadID   String?
-  toUserID    String?
-  createdAt   DateTime          @default(now())
-  updatedAt   DateTime          @updatedAt
+  id         String            @id @default(uuid())
+  fromUserID String?
+  content    String?
+  status     SquadRequestState @default(PENDING)
+  toSquadID  String?
+  toUserID   String?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
 
   fromUser      User?          @relation("fromUser", fields: [fromUserID], references: [id])
   toSquad       Squad?         @relation(fields: [toSquadID], references: [id])
@@ -619,25 +639,60 @@ model SquadRequest {
   @@index([toSquadID])
 }
 
+// ─── Conversation Group ───────────────────────────────────────────────────────
+//
+// User-defined buckets for organizing chat conversations (private + group).
+// Per-user, no sharing across accounts.
+//   - pinnedToTabs: whether this bucket renders as a filter tab on the messages list.
+//   - sortOrder: reserved for v2 drag-reorder; v1 reads by createdAt.
+//
+// Membership is plain `conversationID` (OpenIM string id) — we don't FK to any
+// conversation table because conversations live in OpenIM, not Postgres.
+
+model ConversationGroup {
+  id           String                        @id @default(uuid())
+  ownerID      String
+  name         String
+  sortOrder    Int                           @default(0)
+  pinnedToTabs Boolean                       @default(true)
+  createdAt    DateTime                      @default(now())
+  updatedAt    DateTime                      @updatedAt
+  owner        User                          @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  memberships  ConversationGroupMembership[]
+
+  @@unique([ownerID, name])
+  @@index([ownerID])
+}
+
+model ConversationGroupMembership {
+  groupID        String
+  conversationID String
+  createdAt      DateTime          @default(now())
+  group          ConversationGroup @relation(fields: [groupID], references: [id], onDelete: Cascade)
+
+  @@id([groupID, conversationID])
+  @@index([conversationID])
+}
+
 // ─── Trace ────────────────────────────────────────────────────────────────────
 
 model Trace {
-  id          String          @id @default(uuid())
-  title       String          @default("")
-  content     String          @default("")
-  deleted     Boolean         @default(false)
-  visibility  TraceVisibility @default(PUBLIC)
-  images      String[]        @default([])
-  type        TraceType
-  fromID      String
-  likeCount   Int             @default(0)
-  replyCount  Int             @default(0)
-  shareCount  Int             @default(0)
-  viewCount   Int             @default(0)
-  latitude    Float?
-  longitude   Float?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  id         String          @id @default(uuid())
+  title      String          @default("")
+  content    String          @default("")
+  deleted    Boolean         @default(false)
+  visibility TraceVisibility @default(PUBLIC)
+  images     String[]        @default([])
+  type       TraceType
+  fromID     String
+  likeCount  Int             @default(0)
+  replyCount Int             @default(0)
+  shareCount Int             @default(0)
+  viewCount  Int             @default(0)
+  latitude   Float?
+  longitude  Float?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
 
   from          User                  @relation(fields: [fromID], references: [id], onDelete: Cascade)
   comments      TraceComment[]
@@ -720,12 +775,12 @@ model UserTracePreference {
 // ─── Tag ──────────────────────────────────────────────────────────────────────
 
 model Tag {
-  id        String     @id @default(uuid())
-  name      String     @unique
-  metadata  Json       @default("{}")
-  deleted   Boolean    @default(false)
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
+  id        String   @id @default(uuid())
+  name      String   @unique
+  metadata  Json     @default("{}")
+  deleted   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   traceTags TagOnTrace[]
   userTags  TagOnUser[]
@@ -769,17 +824,26 @@ model TagOnSquad {
 // ─── Coin / Wallet ────────────────────────────────────────────────────────────
 
 enum CoinTxType {
-  RECHARGE      // top-up by admin / payment
-  GIFT_SENT     // deducted when sending a gift
+  RECHARGE // top-up by admin / payment
+  GIFT_SENT // deducted when sending a gift
   GIFT_RECEIVED // credited when receiving a gift
-  REFUND        // admin refund
-  ADJUSTMENT    // manual admin correction
+  REFUND // admin refund
+  PURCHASE // deducted when buying membership or mall items
+  ADJUSTMENT // manual admin correction
+}
+
+enum CollectionType {
+  CHAT
+  VIDEO
+  VOICE
+  MESSAGE
+  NOTE
 }
 
 model Wallet {
   id        String   @id @default(uuid())
   userID    String   @unique
-  balance   Int      @default(0)   // stored in smallest unit (1 coin = 1)
+  balance   Int      @default(0) // stored in smallest unit (1 coin = 1)
   updatedAt DateTime @updatedAt
   user      User     @relation(fields: [userID], references: [id], onDelete: Cascade)
 }
@@ -788,10 +852,10 @@ model CoinTransaction {
   id        String     @id @default(uuid())
   userID    String
   type      CoinTxType
-  amount    Int                        // positive = credit, negative = debit
-  balance   Int                        // balance after this tx
+  amount    Int // positive = credit, negative = debit
+  balance   Int // balance after this tx
   note      String?
-  relatedID String?                    // e.g. CoinGift.id for gift txs
+  relatedID String? // e.g. CoinGift.id for gift txs
   createdAt DateTime   @default(now())
   user      User       @relation(fields: [userID], references: [id], onDelete: Cascade)
 
@@ -799,20 +863,71 @@ model CoinTransaction {
 }
 
 model CoinGift {
-  id          String   @id @default(uuid())
-  senderID    String
-  recipientID String
-  amount      Int
-  message     String?
+  id             String   @id @default(uuid())
+  senderID       String
+  recipientID    String
+  amount         Int
+  message        String?
   /// Client-supplied Idempotency-Key — a retry of the same gift reuses it
   /// and is rejected by the unique constraint instead of double-charging.
-  idempotencyKey String? @unique
-  createdAt   DateTime @default(now())
-  sender      User     @relation("giftSender",    fields: [senderID],    references: [id], onDelete: Cascade)
-  recipient   User     @relation("giftRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
+  idempotencyKey String?  @unique
+  createdAt      DateTime @default(now())
+  sender         User     @relation("giftSender", fields: [senderID], references: [id], onDelete: Cascade)
+  recipient      User     @relation("giftRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
 
   @@index([senderID])
   @@index([recipientID])
+}
+
+model UserCollection {
+  id        String         @id @default(uuid())
+  userID    String
+  type      CollectionType
+  title     String
+  summary   String?
+  sourceID  String?
+  payload   Json?
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  user      User           @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID, type, createdAt])
+}
+
+model IconAsset {
+  id          String              @id @default(uuid())
+  name        String
+  sourceType  IconAssetSourceType
+  imageUrl    String?
+  circleID    String?
+  createdByID String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  circle            Circle?  @relation("circleIconAssets", fields: [circleID], references: [id], onDelete: Cascade)
+  createdBy         User?    @relation("iconAssetCreator", fields: [createdByID], references: [id], onDelete: SetNull)
+  currentForCircles Circle[] @relation("currentCircleIcon")
+
+  @@index([circleID])
+  @@index([sourceType])
+}
+
+model UserDisplayIcon {
+  id          String              @id @default(uuid())
+  userID      String
+  displayType UserDisplayIconType
+  systemKey   SystemIconKey?
+  circleID    String?
+  sortOrder   Int
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  user   User    @relation(fields: [userID], references: [id], onDelete: Cascade)
+  circle Circle? @relation(fields: [circleID], references: [id], onDelete: Cascade)
+
+  @@unique([userID, systemKey])
+  @@unique([userID, circleID])
+  @@index([userID, sortOrder])
 }
 
 // ─── Notification ─────────────────────────────────────────────────────────────
@@ -933,13 +1048,13 @@ model Mission {
 }
 
 model MissionCheckin {
-  id         String        @id @default(uuid())
-  missionId  String
-  userId     String
-  status     CheckinStatus
-  content    String?
-  metadata   Json          @default("{}")
-  createdAt  DateTime      @default(now())
+  id        String        @id @default(uuid())
+  missionId String
+  userId    String
+  status    CheckinStatus
+  content   String?
+  metadata  Json          @default("{}")
+  createdAt DateTime      @default(now())
 
   mission Mission @relation(fields: [missionId], references: [id], onDelete: Cascade)
 
@@ -1009,33 +1124,37 @@ model UserBlockedContent {
 // ─── Circle Plaza ────────────────────────────────────────────────────────────
 
 model Circle {
-  id          String         @id @default(uuid())
-  name        String
-  description String         @default("")
-  avatarUrl   String?
-  ownerID     String
-  cities      String[]       @default([])
-  isPublic    Boolean        @default(true)
-  categories  String[]       @default([])
-  rules       String         @default("")
-  tags        String[]       @default([])
+  id                    String   @id @default(uuid())
+  name                  String
+  description           String   @default("")
+  avatarUrl             String?
+  ownerID               String
+  currentIconAssetID    String?
+  cities                String[] @default([])
+  isPublic              Boolean  @default(true)
+  categories            String[] @default([])
+  rules                 String   @default("")
+  tags                  String[] @default([])
   joinVipRestriction    Int?
   joinCreditRestriction Int?
   joinFancyRestriction  Boolean  @default(false)
-  maxMembers     Int?
-  memberCanPost  Boolean   @default(true)
-  groupID        String?   @unique
-  memberCount Int      @default(0)
-  postCount   Int      @default(0)
-  deleted     Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  maxMembers            Int?
+  memberCanPost         Boolean  @default(true)
+  groupID               String?  @unique
+  memberCount           Int      @default(0)
+  postCount             Int      @default(0)
+  deleted               Boolean  @default(false)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
-  owner       User               @relation(fields: [ownerID], references: [id], onDelete: Cascade)
-  posts       CirclePost[]
-  members     CircleMember[]
-  invitations CircleInvitation[]
-  activities  CircleActivity[]
+  owner             User               @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+  currentIconAsset  IconAsset?         @relation("currentCircleIcon", fields: [currentIconAssetID], references: [id], onDelete: SetNull)
+  iconAssets        IconAsset[]        @relation("circleIconAssets")
+  posts             CirclePost[]
+  members           CircleMember[]
+  invitations       CircleInvitation[]
+  activities        CircleActivity[]
+  displaySelections UserDisplayIcon[]
 
   @@index([ownerID])
 }
@@ -1093,9 +1212,9 @@ model CircleInvitation {
   createdAt     DateTime               @default(now())
   updatedAt     DateTime               @updatedAt
 
-  circle     Circle                    @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  applicant  User                      @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
-  inviter    User                      @relation("invitationInviter", fields: [inviterID], references: [id], onDelete: Cascade)
+  circle     Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  applicant  User                       @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
+  inviter    User                       @relation("invitationInviter", fields: [inviterID], references: [id], onDelete: Cascade)
   verifiers  CircleInvitationVerifier[]
   activities CircleActivity[]
 
@@ -1104,13 +1223,13 @@ model CircleInvitation {
 }
 
 model CircleInvitationVerifier {
-  id           String                        @id @default(uuid())
+  id           String                         @id @default(uuid())
   invitationID String
   verifierID   String
   addedByID    String
   status       CircleInvitationVerifierStatus @default(PENDING)
   respondedAt  DateTime?
-  createdAt    DateTime                      @default(now())
+  createdAt    DateTime                       @default(now())
 
   invitation CircleInvitation @relation(fields: [invitationID], references: [id], onDelete: Cascade)
   verifier   User             @relation("verifierUser", fields: [verifierID], references: [id], onDelete: Cascade)

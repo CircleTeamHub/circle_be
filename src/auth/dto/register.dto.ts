@@ -1,5 +1,6 @@
 import {
   IsEmail,
+  IsIn,
   IsNotEmpty,
   IsOptional,
   IsString,
@@ -37,4 +38,10 @@ export class RegisterDto {
   @IsString()
   @MaxLength(20)
   phoneNumber?: string;
+
+  /** OpenIM platform ID — see LoginDto.platform. */
+  @ApiPropertyOptional({ example: 1 })
+  @IsOptional()
+  @IsIn([1, 2, 5])
+  platform?: 1 | 2 | 5;
 }

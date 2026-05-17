@@ -11,6 +11,7 @@ import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { IconService } from 'src/icon/icon.service';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -61,6 +62,10 @@ describe('AuthService', () => {
     registerUser: jest.fn(() => Promise.resolve()),
   };
 
+  const mockIconService = {
+    getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
+  };
+
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
@@ -109,6 +114,7 @@ describe('AuthService', () => {
         { provide: RefreshTokenService, useValue: mockRefreshTokenService },
         { provide: JwtService, useValue: mockJwt },
         { provide: OpenimService, useValue: mockOpenimService },
+        { provide: IconService, useValue: mockIconService },
       ],
     }).compile();
 
@@ -249,7 +255,7 @@ describe('AuthService', () => {
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
   });
 
-  it('loads city in the self profile response', async () => {
+  it('loads city, VIP level, and credit score in the self profile response', async () => {
     users.push({
       id: 'uuid-1',
       accountId: 'testuser',
@@ -267,6 +273,8 @@ describe('AuthService', () => {
       birthday: new Date('2026-04-01T00:00:00.000Z'),
       gender: 'male',
       city: '杭州',
+      vipLevel: 3,
+      creditScore: 128,
       role: 'USER',
       status: 'ACTIVE',
       lastOnline: null,
@@ -281,6 +289,8 @@ describe('AuthService', () => {
       where: { id: 'uuid-1' },
       select: expect.objectContaining({
         city: true,
+        vipLevel: true,
+        creditScore: true,
         birthday: true,
         gender: true,
       }),
@@ -294,6 +304,8 @@ describe('AuthService', () => {
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
+      vipLevel: 3,
+      creditScore: 128,
     });
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
@@ -383,5 +395,55 @@ describe('AuthService', () => {
     await expect(service.me('missing-user-id')).rejects.toThrow(
       NotFoundException,
     );
+  });
+
+  it('includes displayIcons in the self profile response', async () => {
+    mockIconService.getDisplayIconsForUser.mockResolvedValueOnce([
+      {
+        id: 'vip-icon',
+        type: 'SYSTEM',
+        title: 'VIP5',
+        imageUrl: null,
+        fallbackIconName: 'diamond',
+        sortOrder: 0,
+      },
+    ]);
+
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      nickname: 'Test User',
+      avatarUrl: null,
+      avatarFrame: null,
+      cover: null,
+      email: null,
+      phoneNumber: null,
+      wechat: null,
+      qq: null,
+      whatsup: null,
+      persona: null,
+      helloWords: null,
+      birthday: null,
+      gender: 'male',
+      city: '杭州',
+      vipLevel: 5,
+      creditScore: 100,
+      role: 'USER',
+      status: 'ACTIVE',
+      lastOnline: null,
+      createdAt: new Date('2026-04-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-01T00:00:00.000Z'),
+    });
+
+    const me = await service.me('uuid-1');
+
+    expect(mockIconService.getDisplayIconsForUser).toHaveBeenCalledWith(
+      'uuid-1',
+    );
+    expect(me.displayIcons).toEqual([
+      expect.objectContaining({
+        title: 'VIP5',
+      }),
+    ]);
   });
 });

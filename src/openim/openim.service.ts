@@ -1,11 +1,15 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
 
 @Injectable()
 export class OpenimService implements OnModuleInit {
   private readonly logger = new Logger(OpenimService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private adminToken: string | null = null;
   private adminTokenExpiresAt: number = 0;
   /** In-flight refresh promise — shared across concurrent callers to prevent thundering herd. */
@@ -64,6 +68,15 @@ export class OpenimService implements OnModuleInit {
   // ─── User ────────────────────────────────────────────────────────────────────
 
   /**
+   * OpenIM v3.8 rejects userIDs containing characters its validator deems
+   * "illegal" (notably hyphens), so we strip them from PostgreSQL UUIDs before
+   * sending them across the boundary. Callers keep using `User.id` as-is.
+   */
+  static toImUserId(userId: string): string {
+    return userId.replace(/-/g, '');
+  }
+
+  /**
    * Register a user in OpenIM. Called during business registration.
    * Uses the circle_be User.id (UUID) as the OpenIM userID for 1:1 mapping.
    */
@@ -80,7 +93,7 @@ export class OpenimService implements OnModuleInit {
       {
         users: [
           {
-            userID,
+            userID: OpenimService.toImUserId(userID),
             nickname,
             faceURL: avatarUrl ?? '',
           },
@@ -100,7 +113,7 @@ export class OpenimService implements OnModuleInit {
     const adminToken = await this.getAdminToken();
     const res = await this.post<{ token: string }>(
       '/auth/get_user_token',
-      { userID, platformID },
+      { userID: OpenimService.toImUserId(userID), platformID },
       adminToken,
     );
     return res.token;
@@ -120,11 +133,11 @@ export class OpenimService implements OnModuleInit {
     await this.post(
       '/group/create_group',
       {
-        memberUserIDs,
+        memberUserIDs: memberUserIDs.map(OpenimService.toImUserId),
         groupInfo: {
           groupID,
           groupName,
-          ownerUserID,
+          ownerUserID: OpenimService.toImUserId(ownerUserID),
           groupType: 2, // 2 = work group
         },
       },
@@ -138,7 +151,11 @@ export class OpenimService implements OnModuleInit {
     const adminToken = await this.getAdminToken();
     await this.post(
       '/group/invite_user_to_group',
-      { groupID, invitedUserIDs: userIDs, reason: '' },
+      {
+        groupID,
+        invitedUserIDs: userIDs.map(OpenimService.toImUserId),
+        reason: '',
+      },
       adminToken,
     );
   }
@@ -149,7 +166,11 @@ export class OpenimService implements OnModuleInit {
     const adminToken = await this.getAdminToken();
     await this.post(
       '/group/kick_group',
-      { groupID, kickedUserIDs: [userID], reason: '' },
+      {
+        groupID,
+        kickedUserIDs: [OpenimService.toImUserId(userID)],
+        reason: '',
+      },
       adminToken,
     );
   }
@@ -161,6 +182,8 @@ export class OpenimService implements OnModuleInit {
     body: Record<string, unknown>,
     token?: string,
   ): Promise<T> {
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
     const { randomUUID } = await import('crypto');
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -171,26 +194,47 @@ export class OpenimService implements OnModuleInit {
       headers['token'] = token;
     }
 
-    const response = await fetch(`${this.apiUrl}${path}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(OPENIM_REQUEST_TIMEOUT_MS),
-    });
+    try {
+      const response = await fetch(`${this.apiUrl}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(OPENIM_REQUEST_TIMEOUT_MS),
+      });
 
-    const json = (await response.json()) as {
-      errCode: number;
-      errMsg?: string;
-      data?: T;
-    };
+      const json = (await response.json()) as {
+        errCode: number;
+        errMsg?: string;
+        data?: T;
+      };
 
-    if (json.errCode !== 0) {
-      this.logger.error(
-        `OpenIM API error [${path}]: ${json.errMsg ?? json.errCode}`,
-      );
-      throw new Error(`OpenIM error: ${json.errMsg ?? json.errCode}`);
+      if (json.errCode !== 0) {
+        this.logger.error(
+          `OpenIM API error [${path}]: ${json.errMsg ?? json.errCode}`,
+        );
+        throw new Error(`OpenIM error: ${json.errMsg ?? json.errCode}`);
+      }
+
+      return json.data as T;
+    } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'openim',
+        operation: path,
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'openim',
+        operation: path,
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
     }
-
-    return json.data as T;
   }
 }

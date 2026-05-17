@@ -6,7 +6,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { FriendState } from 'src/generated/prisma';
+import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   prismaErrorCode,
   runSerializableTransaction,
@@ -24,7 +26,11 @@ const MAX_ADMIN_TOPUP = 1_000_000;
 export class CoinService {
   private readonly logger = new Logger(CoinService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtimeService: RealtimeService,
+    private readonly notificationService: NotificationService,
+  ) {}
 
   // ─── Wallet ───────────────────────────────────────────────────────────────────
 
@@ -223,7 +229,7 @@ export class CoinService {
       throw new NotFoundException('User not found');
     }
 
-    return runSerializableTransaction(this.prisma, async (tx) => {
+    const wallet = await runSerializableTransaction(this.prisma, async (tx) => {
       const wallet = await tx.wallet.upsert({
         where: { userID: targetUserId },
         update: { balance: { increment: amount } },
@@ -242,5 +248,39 @@ export class CoinService {
 
       return wallet;
     });
+
+    await this.notifyRecharge(targetUserId, amount);
+
+    return wallet;
+  }
+
+  private async notifyRecharge(userId: string, amount: number): Promise<void> {
+    try {
+      await this.notificationService.createSystemNotification(
+        userId,
+        userId,
+        `积分已到账 ${amount}`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to create recharge notification for ${userId}: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+
+    await this.realtimeService.safeBroadcastAll([
+      () =>
+        this.realtimeService.broadcastWalletBalanceChanged(userId, {
+          reason: 'RECHARGE',
+          delta: amount,
+        }),
+      () =>
+        this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
+      () =>
+        this.realtimeService.broadcastSystemNotificationCreated(
+          userId,
+          `积分已到账 ${amount}`,
+        ),
+      () => this.realtimeService.broadcastSystemNotificationUnread(userId),
+    ]);
   }
 }
