@@ -6,13 +6,19 @@ tmp/
 temp/
 dist/
 logs/
+
+# Environment variables — never commit secrets. Use .env.example as the
+# tracked template, keep concrete values out of version control.
+.env
+.env.*
+!.env.example
 # General
 .DS_Store
 .AppleDouble
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
 
 # Thumbnails
 ._*

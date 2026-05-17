@@ -33,3 +33,9 @@ pids
 .svn
 *.zip
 
+# Never bake .env files into the image — runtime should mount them or set
+# environment variables on the container directly.
+.env
+.env.*
+!.env.example
+
