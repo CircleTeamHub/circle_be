@@ -245,6 +245,8 @@ model User {
   fancyNumber   Boolean    @default(false)
   openimSynced  Boolean    @default(false)
   lastOnline    DateTime?
+  /// Set once the one-time friend-activity backfill has run for this user.
+  activitiesBackfilledAt DateTime?
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
@@ -353,6 +355,7 @@ model FriendReport {
   reporter User @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
   target   User @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
 
+  @@unique([reporterID, targetID, category])
   @@index([reporterID, createdAt])
   @@index([targetID, createdAt])
 }
@@ -451,6 +454,7 @@ model FriendActivity {
   actor          User               @relation("friendActivityActor", fields: [actorId], references: [id], onDelete: Cascade)
   counterparty   User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
 
+  @@unique([requestId, viewerId, type])
   @@index([requestId])
   @@index([viewerId, createdAt])
   @@index([viewerId, readAt])
@@ -800,6 +804,9 @@ model CoinGift {
   recipientID String
   amount      Int
   message     String?
+  /// Client-supplied Idempotency-Key — a retry of the same gift reuses it
+  /// and is rejected by the unique constraint instead of double-charging.
+  idempotencyKey String? @unique
   createdAt   DateTime @default(now())
   sender      User     @relation("giftSender",    fields: [senderID],    references: [id], onDelete: Cascade)
   recipient   User     @relation("giftRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
