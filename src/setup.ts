@@ -1,6 +1,6 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
-import { WINSTON_MODULE_NEST_PROVIDER } from 'nest-winston';
-import { getServerConfig } from './config/server.config';
+import { INestApplication, Logger, ValidationPipe } from '@nestjs/common';
+import { HttpAdapterHost } from '@nestjs/core';
+import { AllExceptionFilter } from './filters/all-exception.filter';
 import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
 import helmet from 'helmet';
@@ -79,38 +79,49 @@ const traceWriteLimiter = rateLimit({
   message: { message: 'Too many moment operations, please try again later.' },
 } satisfies Partial<RateLimitOptions>);
 
-export const setupApp = (app: INestApplication) => {
-  const config = getServerConfig();
+/**
+ * Account lookup limiter. Without this, any authenticated user can probe the
+ * /user/search/account endpoint to enumerate accountIds at the global 300/min
+ * fallback rate.
+ */
+const accountSearchLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many account lookups, please try again later.' },
+} satisfies Partial<RateLimitOptions>);
 
-  const flag: boolean = config['LOG_ON'] === 'true';
-  // app.useLogger(app.get(WINSTON_MODULE_NEST_PROVIDER));
-  flag && app.useLogger(app.get(WINSTON_MODULE_NEST_PROVIDER));
+/** Logout — keep loose but bounded; matches refreshLimiter shape. */
+const logoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+} satisfies Partial<RateLimitOptions>);
+
+export const setupApp = (app: INestApplication) => {
+  const isProduction = process.env.NODE_ENV === 'production';
+
   app.setGlobalPrefix('api/v1');
 
-  app.useGlobalFilters(new PrismaExceptionFilter());
+  const httpAdapterHost = app.get(HttpAdapterHost);
+  app.useGlobalFilters(
+    new AllExceptionFilter(new Logger('Exception'), httpAdapterHost),
+    new PrismaExceptionFilter(),
+  );
   app.useGlobalInterceptors(new ResponseInterceptor());
 
-  // const httpAdapter = app.get(HttpAdapterHost);
-  // // 全局Filter只能有一个
-  // const logger = new Logger();
-  // app.useGlobalFilters(new HttpExceptionFilter(logger));
-  // app.useGlobalFilters(new AllExceptionFilter(logger, httpAdapter));
-
-  // 全局拦截器
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
+      forbidNonWhitelisted: true,
       transform: true,
       transformOptions: { enableImplicitConversion: true },
+      disableErrorMessages: isProduction,
     }),
   );
 
-  // app.useGlobalGuards()
-  // 弊端 -> 无法使用DI -> 无法访问userService
-
-  // app.useGlobalInterceptors(new SerializeInterceptor());
-
-  // helmet头部安全
   app.use(helmet());
 
   // Global fallback rate limit: 300 req / min per IP
@@ -126,6 +137,8 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/auth/register', authLimiter);
   app.use('/api/v1/auth/change-password', authLimiter);
   app.use('/api/v1/auth/refresh', refreshLimiter);
+  app.use('/api/v1/auth/logout', logoutLimiter);
+  app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
   app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', noteWriteLimiter);

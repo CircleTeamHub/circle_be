@@ -22,6 +22,9 @@ import {
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
 
+// Cap on how many organizational tags a single user can create.
+const MAX_FRIEND_TAGS_PER_USER = 50;
+
 // Minimal user shape returned inside friend/request payloads
 const MINI_USER_SELECT = {
   id: true,
@@ -106,24 +109,6 @@ export class FriendService {
       throw new ForbiddenException('Cannot send a friend request to this user');
     }
 
-    // Already friends?
-    const existing = await this.prisma.friend.findFirst({
-      where: {
-        OR: [
-          { userID: senderId, friendID: targetId },
-          { userID: targetId, friendID: senderId },
-        ],
-        state: { in: [FriendState.ACCEPTED, FriendState.PENDING] },
-      },
-    });
-    if (existing) {
-      throw new ConflictException(
-        existing.state === FriendState.ACCEPTED
-          ? 'Already friends'
-          : 'Friend request already pending',
-      );
-    }
-
     // Enforce friend limit for the sender
     await this.assertBelowFriendLimit(senderId);
 
@@ -153,6 +138,30 @@ export class FriendService {
 
     try {
       await this.prisma.$transaction(async (tx: any) => {
+        // `Friend` has no DB-level unique constraint, so a check-then-insert
+        // would race under concurrent requests for the same pair (e.g. a
+        // double-tap). Serialize per user-pair with a transaction-scoped
+        // advisory lock — released automatically on commit/rollback.
+        const pairKey = `friend:${[senderId, targetId].sort().join(':')}`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+        const existing = await tx.friend.findFirst({
+          where: {
+            OR: [
+              { userID: senderId, friendID: targetId },
+              { userID: targetId, friendID: senderId },
+            ],
+            state: { in: [FriendState.ACCEPTED, FriendState.PENDING] },
+          },
+        });
+        if (existing) {
+          throw new ConflictException(
+            existing.state === FriendState.ACCEPTED
+              ? 'Already friends'
+              : 'Friend request already pending',
+          );
+        }
+
         const nextRequestRecord = await tx.friend.create({
           data: requestData,
         });
@@ -215,6 +224,12 @@ export class FriendService {
         data: { state: FriendState.WITHDRAWN },
       });
 
+      // A withdrawn request can never be accepted, so its staged tag links
+      // are dead weight — drop them instead of leaving orphan rows.
+      await tx.pendingFriendTagOnRequest.deleteMany({
+        where: { requestID: requestId },
+      });
+
       await this.createFriendActivities(tx, [
         {
           requestId: updated.id,
@@ -247,6 +262,17 @@ export class FriendService {
     }
 
     if (decision === FriendState.ACCEPTED) {
+      // The sender (record.userID) may have been banned/deleted between
+      // sending the request and the recipient acting on it. Accepting would
+      // otherwise produce a live friendship with an inactive account.
+      const sender = await this.prisma.user.findUnique({
+        where: { id: record.userID },
+        select: { status: true },
+      });
+      if (!sender || sender.status !== 'ACTIVE') {
+        throw new NotFoundException('The requester is no longer available');
+      }
+
       // Enforce friend limit for the recipient too
       await this.assertBelowFriendLimit(recipientId);
     }
@@ -271,6 +297,13 @@ export class FriendService {
       if (decision === FriendState.ACCEPTED) {
         await this.promotePendingFriendTags(tx, nextRequest);
       }
+
+      // Once a request leaves PENDING the staged tag links have served their
+      // purpose (promoted on accept, irrelevant on reject) — clear them so
+      // they don't accumulate as orphan rows.
+      await tx.pendingFriendTagOnRequest.deleteMany({
+        where: { requestID: requestId },
+      });
 
       await this.createFriendActivities(
         tx,
@@ -367,7 +400,10 @@ export class FriendService {
     }
 
     // Prevent duplicate reports for the same reporter / target / category.
-    // This closes the spam vector where a user files dozens of identical reports.
+    // Fast path: an explicit pre-check gives a friendly message. The unique
+    // index `FriendReport_reporterID_targetID_category_key` is the authoritative
+    // backstop — the catch below turns the race-loser's P2002 into the same
+    // clean conflict instead of a leaked Prisma error.
     const duplicate = await this.prisma.friendReport.findFirst({
       where: {
         reporterID: reporterId,
@@ -382,15 +418,24 @@ export class FriendService {
       );
     }
 
-    await this.prisma.friendReport.create({
-      data: {
-        reporterID: reporterId,
-        targetID: friendUserId,
-        category: dto.category,
-        description: dto.description.trim(),
-        evidence: dto.evidence ?? [],
-      },
-    });
+    try {
+      await this.prisma.friendReport.create({
+        data: {
+          reporterID: reporterId,
+          targetID: friendUserId,
+          category: dto.category,
+          description: dto.description.trim(),
+          evidence: dto.evidence ?? [],
+        },
+      });
+    } catch (error) {
+      if (this.prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException(
+          'You have already submitted a report for this category against this user',
+        );
+      }
+      throw error;
+    }
 
     this.logger.warn(
       `Friend report submitted: ${reporterId} → ${friendUserId} (${dto.category})`,
@@ -583,28 +628,30 @@ export class FriendService {
     viewerId: string,
     targetId: string,
   ): Promise<FriendStatusDto> {
-    // Block wins over everything
-    const block = await this.prisma.block.findFirst({
-      where: {
-        OR: [
-          { blockerID: viewerId, blockedID: targetId },
-          { blockerID: targetId, blockedID: viewerId },
-        ],
-      },
-    });
+    // Block wins over everything. Run both lookups in parallel — the friend
+    // query result is simply discarded if a block exists.
+    const [block, record] = await Promise.all([
+      this.prisma.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: viewerId, blockedID: targetId },
+            { blockerID: targetId, blockedID: viewerId },
+          ],
+        },
+      }),
+      this.prisma.friend.findFirst({
+        where: {
+          OR: [
+            { userID: viewerId, friendID: targetId },
+            { userID: targetId, friendID: viewerId },
+          ],
+          state: { in: [FriendState.PENDING, FriendState.ACCEPTED] },
+        },
+      }),
+    ]);
     if (block) {
       return { status: 'BLOCKED', requestId: null };
     }
-
-    const record = await this.prisma.friend.findFirst({
-      where: {
-        OR: [
-          { userID: viewerId, friendID: targetId },
-          { userID: targetId, friendID: viewerId },
-        ],
-        state: { in: [FriendState.PENDING, FriendState.ACCEPTED] },
-      },
-    });
 
     if (!record) return { status: 'NONE', requestId: null };
     if (record.state === FriendState.ACCEPTED)
@@ -636,36 +683,48 @@ export class FriendService {
     });
     if (already) throw new ConflictException('User already blocked');
 
-    // Remove friendship if exists (any state) in a transaction
-    await this.prisma.$transaction([
-      this.prisma.friend.deleteMany({
-        where: {
-          OR: [
-            { userID: blockerId, friendID: targetId },
-            { userID: targetId, friendID: blockerId },
-          ],
-        },
-      }),
-      this.prisma.block.create({
-        data: { blockerID: blockerId, blockedID: targetId },
-      }),
-    ]);
+    // Remove friendship if exists (any state) in a transaction.
+    // The pre-check above is a fast path; the catch handles the race where a
+    // concurrent block call wins between the findUnique and the create, so the
+    // client still sees a clean 409 instead of a leaked Prisma constraint name.
+    try {
+      await this.prisma.$transaction([
+        this.prisma.friend.deleteMany({
+          where: {
+            OR: [
+              { userID: blockerId, friendID: targetId },
+              { userID: targetId, friendID: blockerId },
+            ],
+          },
+        }),
+        this.prisma.block.create({
+          data: { blockerID: blockerId, blockedID: targetId },
+        }),
+      ]);
+    } catch (error) {
+      if (this.isPrismaUniqueConstraintError(error)) {
+        throw new ConflictException('User already blocked');
+      }
+      throw error;
+    }
 
     this.logger.log(`Block created: ${blockerId} → ${targetId}`);
   }
 
   async unblockUser(blockerId: string, targetId: string): Promise<void> {
-    const record = await this.prisma.block.findUnique({
-      where: {
-        blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
-      },
-    });
-    if (!record) throw new NotFoundException('Block not found');
-    await this.prisma.block.delete({
-      where: {
-        blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
-      },
-    });
+    try {
+      await this.prisma.block.delete({
+        where: {
+          blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
+        },
+      });
+    } catch (error) {
+      // P2025 = record to delete does not exist.
+      if (this.prismaErrorCode(error) === 'P2025') {
+        throw new NotFoundException('Block not found');
+      }
+      throw error;
+    }
   }
 
   async listBlocked(userId: string) {
@@ -722,6 +781,24 @@ export class FriendService {
   async createTag(userId: string, name: string, color?: string) {
     const trimmed = name.trim();
     if (!trimmed) throw new BadRequestException('Tag name cannot be empty');
+
+    // Only enforce the cap when this would be a *new* tag — re-submitting an
+    // existing name is an idempotent color update and must stay allowed.
+    const existing = await this.prisma.friendTag.findUnique({
+      where: { ownerID_name: { ownerID: userId, name: trimmed } },
+      select: { id: true },
+    });
+    if (!existing) {
+      const tagCount = await this.prisma.friendTag.count({
+        where: { ownerID: userId },
+      });
+      if (tagCount >= MAX_FRIEND_TAGS_PER_USER) {
+        throw new BadRequestException(
+          `Friend tag limit reached (${MAX_FRIEND_TAGS_PER_USER}).`,
+        );
+      }
+    }
+
     return this.prisma.friendTag.upsert({
       where: { ownerID_name: { ownerID: userId, name: trimmed } },
       update: { color: color ?? undefined },
@@ -780,16 +857,24 @@ export class FriendService {
     friendUserId: string,
     tagId: string,
   ): Promise<void> {
-    const friendship = await this.prisma.friend.findFirst({
-      where: {
-        OR: [
-          { userID: userId, friendID: friendUserId },
-          { userID: friendUserId, friendID: userId },
-        ],
-        state: FriendState.ACCEPTED,
-      },
-    });
+    const [friendship, tag] = await Promise.all([
+      this.prisma.friend.findFirst({
+        where: {
+          OR: [
+            { userID: userId, friendID: friendUserId },
+            { userID: friendUserId, friendID: userId },
+          ],
+          state: FriendState.ACCEPTED,
+        },
+      }),
+      this.prisma.friendTag.findUnique({ where: { id: tagId } }),
+    ]);
+
     if (!friendship) throw new NotFoundException('Friendship not found');
+    // Validate tag ownership for parity with assignTag — a wrong/foreign
+    // tagId is a 404 rather than a silent no-op.
+    if (!tag || tag.ownerID !== userId)
+      throw new NotFoundException('Tag not found');
 
     await this.prisma.friendTagOnFriend.deleteMany({
       where: { ownerID: userId, tagID: tagId, friendID: friendship.id },
@@ -849,8 +934,11 @@ export class FriendService {
       return;
     }
 
+    // skipDuplicates: the (requestId, viewerId, type) unique index makes this
+    // idempotent if the same activity is ever written twice.
     await tx.friendActivity.createMany({
       data: activities,
+      skipDuplicates: true,
     });
   }
 
@@ -876,13 +964,15 @@ export class FriendService {
     );
   }
 
+  private prismaErrorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return (error as { code?: string }).code;
+    }
+    return undefined;
+  }
+
   private isPrismaUniqueConstraintError(error: unknown): boolean {
-    return (
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      (error as { code?: string }).code === 'P2002'
-    );
+    return this.prismaErrorCode(error) === 'P2002';
   }
 
   private async syncPendingFriendTagLinks(
@@ -954,6 +1044,17 @@ export class FriendService {
   }
 
   private async backfillLegacyActivitiesForViewer(userId: string) {
+    // One-time migration gate: skip the (potentially full-table) scan below
+    // once this viewer has been backfilled. Without this the backfill ran on
+    // every listActivities / getUnreadActivityCount call (a polled endpoint).
+    const viewer = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { activitiesBackfilledAt: true },
+    });
+    if (!viewer || viewer.activitiesBackfilledAt) {
+      return;
+    }
+
     const requests = await this.prisma.friend.findMany({
       where: {
         OR: [{ userID: userId }, { friendID: userId }],
@@ -970,6 +1071,7 @@ export class FriendService {
     });
 
     if (requests.length === 0) {
+      await this.markViewerBackfilled(userId);
       return;
     }
 
@@ -1021,11 +1123,23 @@ export class FriendService {
     }
 
     if (missingActivities.length === 0) {
+      await this.markViewerBackfilled(userId);
       return;
     }
 
+    // skipDuplicates is meaningful now that FriendActivity has a unique index
+    // on (requestId, viewerId, type) — a concurrent backfill can't double-write.
     await this.prisma.friendActivity.createMany({
       data: missingActivities,
+      skipDuplicates: true,
+    });
+    await this.markViewerBackfilled(userId);
+  }
+
+  private async markViewerBackfilled(userId: string): Promise<void> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { activitiesBackfilledAt: new Date() },
     });
   }
 

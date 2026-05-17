@@ -16,6 +16,18 @@ import {
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
 
+// Single include shape reused by loadInvitation and the list queries so the
+// list endpoints can hydrate in one round-trip instead of N+1.
+const INVITATION_INCLUDE = {
+  circle: true,
+  applicant: true,
+  inviter: true,
+  verifiers: {
+    include: { verifier: true },
+    orderBy: { createdAt: 'asc' },
+  },
+} as const;
+
 @Injectable()
 export class CircleInvitationService {
   private readonly logger = new Logger(CircleInvitationService.name);
@@ -46,20 +58,6 @@ export class CircleInvitationService {
     });
     if (applicantMembership?.status === 'ACTIVE') {
       throw new ConflictException('User is already a member of this circle');
-    }
-
-    // 3. Verify no existing PENDING invitation
-    const existingInvitation = await this.prisma.circleInvitation.findFirst({
-      where: {
-        circleID: circleId,
-        applicantID: applicantId,
-        status: 'PENDING',
-      },
-    });
-    if (existingInvitation) {
-      throw new ConflictException(
-        'There is already a pending invitation for this user',
-      );
     }
 
     // 4. Verify circle capacity
@@ -100,6 +98,25 @@ export class CircleInvitationService {
 
     // 6. Create invitation + auto-approve inviter as first verifier
     const invitation = await this.prisma.$transaction(async (tx) => {
+      // CircleInvitation has no DB-level unique constraint, so serialize
+      // concurrent invites for the same (circle, applicant) pair with a
+      // transaction-scoped advisory lock, then re-check inside the lock.
+      const pairKey = `circle-invite:${circleId}:${applicantId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+      const existingInvitation = await tx.circleInvitation.findFirst({
+        where: {
+          circleID: circleId,
+          applicantID: applicantId,
+          status: 'PENDING',
+        },
+      });
+      if (existingInvitation) {
+        throw new ConflictException(
+          'There is already a pending invitation for this user',
+        );
+      }
+
       const created = await tx.circleInvitation.create({
         data: {
           circleID: circleId,
@@ -160,7 +177,9 @@ export class CircleInvitationService {
         },
       });
       if (!membership || membership.status !== 'ACTIVE') {
-        throw new BadRequestException('该好友不在本圈子，请更换验证人再尝试');
+        throw new BadRequestException(
+          '验证人必须是本圈子的活跃成员，请更换验证人再尝试',
+        );
       }
 
       const existingVerifier = invitation.verifiers.find(
@@ -391,27 +410,26 @@ export class CircleInvitationService {
   }
 
   async getMyPendingVerifications(userId: string): Promise<InvitationDto[]> {
-    const pending = await this.prisma.circleInvitationVerifier.findMany({
-      where: { verifierID: userId, status: 'PENDING' },
-      select: { invitationID: true },
+    // Single hydrated query — no N+1 over individual invitation loads.
+    const invitations = await this.prisma.circleInvitation.findMany({
+      where: {
+        verifiers: { some: { verifierID: userId, status: 'PENDING' } },
+      },
       orderBy: { createdAt: 'desc' },
+      include: INVITATION_INCLUDE,
     });
 
-    return Promise.all(
-      pending.map((record) => this.fetchInvitationDto(record.invitationID)),
-    );
+    return invitations.map((inv) => this.toInvitationDto(inv));
   }
 
   async getMyApplications(userId: string): Promise<InvitationDto[]> {
     const invitations = await this.prisma.circleInvitation.findMany({
       where: { applicantID: userId },
       orderBy: { createdAt: 'desc' },
-      select: { id: true },
+      include: INVITATION_INCLUDE,
     });
 
-    return Promise.all(
-      invitations.map((invitation) => this.fetchInvitationDto(invitation.id)),
-    );
+    return invitations.map((inv) => this.toInvitationDto(inv));
   }
 
   async getPendingInvitationsForCircle(
@@ -433,26 +451,16 @@ export class CircleInvitationService {
     const invitations = await this.prisma.circleInvitation.findMany({
       where: { circleID: circleId, status: 'PENDING' },
       orderBy: { createdAt: 'desc' },
-      select: { id: true },
+      include: INVITATION_INCLUDE,
     });
 
-    return Promise.all(
-      invitations.map((invitation) => this.fetchInvitationDto(invitation.id)),
-    );
+    return invitations.map((inv) => this.toInvitationDto(inv));
   }
 
   private async loadInvitation(invitationId: string) {
     const inv = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
-      include: {
-        circle: true,
-        applicant: true,
-        inviter: true,
-        verifiers: {
-          include: { verifier: true },
-          orderBy: { createdAt: 'asc' },
-        },
-      },
+      include: INVITATION_INCLUDE,
     });
     if (!inv) throw new NotFoundException('Invitation not found');
     return inv;

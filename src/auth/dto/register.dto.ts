@@ -24,7 +24,7 @@ export class RegisterDto {
   @ApiPropertyOptional({ example: 'Jimmy' })
   @IsOptional()
   @IsString()
-  @Length(1, 30)
+  @Length(1, 50)
   nickname?: string;
 
   @ApiPropertyOptional({ example: 'user@example.com' })

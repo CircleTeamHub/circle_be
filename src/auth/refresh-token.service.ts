@@ -1,8 +1,12 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 
-const REFRESH_TOKEN_TTL_DAYS = 7;
+const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
+const MAX_DEVICE_NAME_LENGTH = 64;
+const MAX_USER_AGENT_LENGTH = 256;
+const MAX_IP_LENGTH = 64;
 
 export type SessionContext = {
   deviceName?: string | null;
@@ -14,24 +18,51 @@ function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+function truncate(value: string | null | undefined, max: number): string | null {
+  if (value === null || value === undefined) return null;
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+function normalizeContext(context?: SessionContext): SessionContext {
+  return {
+    deviceName: truncate(context?.deviceName, MAX_DEVICE_NAME_LENGTH),
+    ip: truncate(context?.ip, MAX_IP_LENGTH),
+    userAgent: truncate(context?.userAgent, MAX_USER_AGENT_LENGTH),
+  };
+}
+
 @Injectable()
 export class RefreshTokenService {
-  constructor(private prisma: PrismaService) {}
+  private readonly logger = new Logger(RefreshTokenService.name);
+  private readonly ttlDays: number;
+
+  constructor(
+    private prisma: PrismaService,
+    private config: ConfigService,
+  ) {
+    const raw = this.config.get<string | number>('REFRESH_EXPIRES_IN_DAYS');
+    const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : raw;
+    this.ttlDays =
+      typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0
+        ? parsed
+        : DEFAULT_REFRESH_TOKEN_TTL_DAYS;
+  }
 
   async create(userId: string, context?: SessionContext): Promise<string> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
     const expiredAt = new Date();
-    expiredAt.setDate(expiredAt.getDate() + REFRESH_TOKEN_TTL_DAYS);
+    expiredAt.setDate(expiredAt.getDate() + this.ttlDays);
 
+    const safe = normalizeContext(context);
     await this.prisma.refreshToken.create({
       data: {
         userId,
         token: tokenHash,
         expiredAt,
-        deviceName: context?.deviceName ?? null,
-        ip: context?.ip ?? null,
-        userAgent: context?.userAgent ?? null,
+        deviceName: safe.deviceName,
+        ip: safe.ip,
+        userAgent: safe.userAgent,
         lastUsedAt: new Date(),
       },
     });
@@ -56,6 +87,24 @@ export class RefreshTokenService {
     });
 
     if (revoked.count === 0) {
+      // Determine whether this is reuse of an already-revoked token
+      // (potential session hijack) vs an unknown/expired token.
+      const existing = await this.prisma.refreshToken.findUnique({
+        where: { token: tokenHash },
+        select: { userId: true, revokedAt: true, expiredAt: true },
+      });
+      if (existing?.revokedAt) {
+        // Reuse detected: the legitimate holder rotated this token, and now
+        // someone is replaying the old one. Assume compromise and kill the
+        // entire session chain for this user.
+        this.logger.warn(
+          `Refresh token reuse detected for user ${existing.userId}; revoking all sessions.`,
+        );
+        await this.revokeAll(existing.userId);
+        throw new UnauthorizedException(
+          'Refresh token reuse detected; all sessions revoked',
+        );
+      }
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 

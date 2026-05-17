@@ -20,6 +20,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import { CirclePlazaService } from './circle-plaza.service';
 import {
   CreatePlazaPostDto,
@@ -38,7 +39,7 @@ export class CirclePlazaController {
   @ApiOperation({ summary: 'Plaza feed (paginated, filterable by circle/city)' })
   feed(
     @Query() query: PlazaFeedQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<{ items: PlazaPostDto[]; total: number; page: number; limit: number; hasMore: boolean }> {
     return this.plazaService.getFeed(req.user.userId, query);
   }
@@ -48,7 +49,7 @@ export class CirclePlazaController {
   @ApiOkResponse({ type: PlazaPostDto })
   create(
     @Body() dto: CreatePlazaPostDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<PlazaPostDto> {
     return this.plazaService.createPost(req.user.userId, dto);
   }
@@ -58,7 +59,7 @@ export class CirclePlazaController {
   @ApiOkResponse({ type: PlazaPostDto })
   getPost(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<PlazaPostDto> {
     return this.plazaService.getPost(req.user.userId, id);
   }
@@ -69,7 +70,7 @@ export class CirclePlazaController {
   @ApiNoContentResponse()
   deletePost(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.plazaService.deletePost(req.user.userId, id);
   }

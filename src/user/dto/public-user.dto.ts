@@ -11,10 +11,6 @@ export class PublicUserDto {
   @Expose()
   accountId: string;
 
-  @ApiProperty({ example: 'testuser' })
-  @Expose()
-  username: string;
-
   @ApiProperty({ example: 'Test User' })
   @Expose()
   nickname: string;

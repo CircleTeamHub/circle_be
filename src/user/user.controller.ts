@@ -6,6 +6,7 @@ import {
   Post,
   Body,
   Param,
+  ParseUUIDPipe,
   Query,
   ForbiddenException,
   UseGuards,
@@ -29,6 +30,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { PublicUserDto, SelfUserDto } from './dto/public-user.dto';
 import { Role } from 'src/enum/roles.enum';
+import type { RequestWithUser } from 'src/auth/types';
 
 @Controller('user')
 @UseGuards(JwtGuard)
@@ -76,7 +78,7 @@ export class UserController {
   @Serialize(PublicUserDto)
   @ApiOperation({ summary: 'Get a user by id' })
   @ApiOkResponse({ description: 'User details', type: PublicUserDto })
-  getUser(@Param('id') id: string) {
+  getUser(@Param('id', ParseUUIDPipe) id: string) {
     return this.userService.findOne(id);
   }
 
@@ -86,8 +88,8 @@ export class UserController {
   @ApiOkResponse({ description: 'Updated user', type: SelfUserDto })
   updateUser(
     @Body() dto: UpdateUserDto,
-    @Param('id') id: string,
-    @Req() req: any,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
   ) {
     if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
       throw new ForbiddenException('You can only update your own profile');
@@ -101,7 +103,10 @@ export class UserController {
   @ApiOperation({ summary: 'Update user status (admin only)' })
   @ApiBody({ type: UpdateUserStatusDto })
   @ApiOkResponse({ description: 'Updated user', type: PublicUserDto })
-  updateUserStatus(@Param('id') id: string, @Body() dto: UpdateUserStatusDto) {
+  updateUserStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateUserStatusDto,
+  ) {
     return this.userService.updateStatus(id, dto.status);
   }
 
@@ -109,7 +114,10 @@ export class UserController {
   @Serialize(PublicUserDto)
   @ApiOperation({ summary: 'Delete a user (self or admin)' })
   @ApiOkResponse({ description: 'Deleted user', type: PublicUserDto })
-  removeUser(@Param('id') id: string, @Req() req: any) {
+  removeUser(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ) {
     if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
       throw new ForbiddenException('You can only delete your own account');
     }

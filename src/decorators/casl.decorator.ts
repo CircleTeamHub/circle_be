@@ -15,7 +15,7 @@ export type CaslHandlerType = PolicyHandlerCallback | PolicyHandlerCallback[];
 // GUARDS -> routes meta -> @CheckPolicies @Can @Cannot
 
 // @CheckPolicies -> handler -> ability => boolean
-export const CheckPolices = (...handlers: PolicyHandlerCallback[]) =>
+export const CheckPolicies = (...handlers: PolicyHandlerCallback[]) =>
   SetMetadata(CHECK_POLICIES_KEY.HANDLER, handlers);
 
 // @Can -> Action, Subject, Conditions

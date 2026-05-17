@@ -5,6 +5,7 @@ import {
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NoteService } from './note.service';
 
@@ -46,7 +47,12 @@ describe('NoteService', () => {
     jest.clearAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [NoteService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        NoteService,
+        { provide: PrismaService, useValue: prisma },
+        // No MINIO_PUBLIC_URL configured → media-url origin check is skipped.
+        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+      ],
     }).compile();
 
     service = module.get<NoteService>(NoteService);
@@ -599,7 +605,7 @@ describe('NoteService', () => {
     await service.deleteNote('user-1', 'note-1');
 
     expect(prisma.note.update).toHaveBeenCalledWith({
-      where: { id: 'note-1' },
+      where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
       data: { status: 'DELETED' },
       select: expect.any(Object),
     });
@@ -760,5 +766,105 @@ describe('NoteService', () => {
 
     expect(prisma.noteGroup.findMany).not.toHaveBeenCalled();
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects media whose url is not served from app storage when MinIO is configured', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'phishing note',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/legit.jpg',
+            url: 'https://evil.example.com/track.gif',
+            sortOrder: 0,
+          },
+        ],
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('accepts media whose url is under MINIO_PUBLIC_URL', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'ok note',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/legit.jpg',
+            url: 'http://10.0.0.195:9000/circle/notes/user-1/legit.jpg',
+            sortOrder: 0,
+          },
+        ],
+      } as any),
+    ).resolves.toBeDefined();
+  });
+
+  it('truncates contentJson-derived title and content to the DTO caps', async () => {
+    const hugeText = 'x'.repeat(50_000);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: 'c',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await service.createNote('user-1', {
+      title: 'ignored when contentJson present',
+      contentJson: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text', text: hugeText, styles: {} }],
+        },
+      ] as any,
+      media: [],
+    });
+
+    const createArg = prisma.note.create.mock.calls[0][0];
+    expect(createArg.data.title.length).toBe(120);
+    expect(createArg.data.content.length).toBe(20_000);
   });
 });

@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
@@ -22,11 +23,31 @@ const MAX_JOIN_TX_ATTEMPTS = 3;
 @Injectable()
 export class CircleService {
   private readonly logger = new Logger(CircleService.name);
+  private readonly minioPublicUrl: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  /**
+   * Rejects an avatar URL not served from this application's own storage.
+   * The circle avatar is rendered to every viewer of the circle, so an
+   * off-origin URL would be a tracking / phishing vector. Skipped when MinIO
+   * is unconfigured (upload disabled anyway).
+   */
+  private assertAvatarUrlIsSafe(avatarUrl: string | null | undefined): void {
+    if (!this.minioPublicUrl || !avatarUrl) return;
+    const prefix = this.minioPublicUrl.replace(/\/$/, '');
+    if (avatarUrl !== prefix && !avatarUrl.startsWith(`${prefix}/`)) {
+      throw new BadRequestException(
+        "avatarUrl must be served from this application's storage",
+      );
+    }
+  }
 
   async createCircle(
     userId: string,
@@ -41,6 +62,8 @@ export class CircleService {
       throw new ForbiddenException('Only VIP users can create circles');
     }
 
+    this.assertAvatarUrlIsSafe(dto.avatarUrl);
+
     const circle = await this.prisma.$transaction(async (tx) => {
       const created = await tx.circle.create({
         data: {
@@ -52,6 +75,7 @@ export class CircleService {
           cities: dto.cities ?? [],
           rules: dto.rules ?? '',
           tags: dto.tags ?? [],
+          isPublic: dto.isPublic ?? true,
           joinVipRestriction: dto.joinVipRestriction ?? null,
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
@@ -264,6 +288,16 @@ export class CircleService {
             `Retrying circle join after serialization conflict (attempt ${attempt})`,
           );
           continue;
+        }
+        // A concurrent join wins the race between the pre-check and the
+        // create — surface a clean conflict instead of a leaked P2002.
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002'
+        ) {
+          throw new ConflictException(
+            'Already a member or a join request is already pending',
+          );
         }
         throw error;
       }

@@ -43,8 +43,8 @@ describe('UserController', () => {
   it('allows a user to delete their own account', () => {
     expect(
       controller.removeUser('user-1', {
-        user: { userId: 'user-1', role: Role.User },
-      }),
+        user: { userId: 'user-1', accountId: 'self', role: Role.User },
+      } as any),
     ).toEqual({ id: 'user-1' });
     expect(userService.remove).toHaveBeenCalledWith('user-1');
   });
@@ -52,8 +52,12 @@ describe('UserController', () => {
   it('allows an admin to delete another user', () => {
     expect(
       controller.removeUser('user-2', {
-        user: { userId: 'user-1', role: Role.Admin },
-      }),
+        user: {
+          userId: 'user-1',
+          accountId: 'admin',
+          role: Role.Admin,
+        },
+      } as any),
     ).toEqual({ id: 'user-2' });
     expect(userService.remove).toHaveBeenCalledWith('user-2');
   });
@@ -61,8 +65,8 @@ describe('UserController', () => {
   it('denies deleting another user without admin access', () => {
     expect(() =>
       controller.removeUser('user-2', {
-        user: { userId: 'user-1', role: Role.User },
-      }),
+        user: { userId: 'user-1', accountId: 'self', role: Role.User },
+      } as any),
     ).toThrow(ForbiddenException);
   });
 });

@@ -4,9 +4,11 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   MaxLength,
   Min,
 } from 'class-validator';
+import { CoinTxType } from 'src/generated/prisma';
 
 export class SendGiftDto {
   @ApiProperty({ example: 'uuid-of-recipient' })
@@ -22,6 +24,9 @@ export class SendGiftDto {
   @IsOptional()
   @IsString()
   @MaxLength(100)
+  // The message is shown to the recipient in their transaction history;
+  // reject angle brackets so it cannot smuggle HTML/script markup.
+  @Matches(/^[^<>]*$/, { message: 'message contains invalid characters' })
   message?: string;
 }
 
@@ -34,7 +39,7 @@ export class WalletDto {
 
 export class CoinTransactionDto {
   @ApiProperty() id: string;
-  @ApiProperty() type: string;
+  @ApiProperty({ enum: CoinTxType }) type: CoinTxType;
   @ApiProperty() amount: number;
   @ApiProperty() balance: number;
   @ApiPropertyOptional() note: string | null;

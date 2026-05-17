@@ -36,6 +36,7 @@ describe('CircleInvitationService', () => {
     user: {
       findUnique: jest.fn(),
     },
+    $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 

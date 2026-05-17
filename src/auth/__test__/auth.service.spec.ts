@@ -1,7 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
 import { JwtService } from '@nestjs/jwt';
-import { ConflictException, ForbiddenException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
@@ -61,8 +66,9 @@ describe('AuthService', () => {
     jest.clearAllMocks();
     mockPrisma.user.findUnique.mockImplementation(({ where }) =>
       Promise.resolve(
-        users.find((u) => u.username === where.username || u.id === where.id) ??
-          null,
+        users.find(
+          (u) => u.accountId === where.accountId || u.id === where.id,
+        ) ?? null,
       ),
     );
     mockPrisma.user.create.mockImplementation(async ({ data }) => {
@@ -279,24 +285,103 @@ describe('AuthService', () => {
         gender: true,
       }),
     });
-    expect(mockPrisma.user.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { id: 'uuid-1' },
-        data: expect.objectContaining({
-          lastOnline: expect.any(Date),
-        }),
-        select: expect.objectContaining({
-          city: true,
-          birthday: true,
-          gender: true,
-        }),
-      }),
-    );
+    // me() now fires a lastOnline update without `select` (the response is
+    // synthesized from the already-fetched user) and does not await it.
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'uuid-1' },
+      data: { lastOnline: expect.any(Date) },
+    });
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
     });
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
+  });
+
+  it('login returns the same error for unknown vs inactive accounts', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'banneduser',
+      passwordHash,
+      status: 'BANNED',
+      role: 'USER',
+    });
+
+    await expect(
+      service.login({ accountId: 'banneduser', password: 'password1' }),
+    ).rejects.toThrow(/Invalid credentials/);
+    await expect(
+      service.login({ accountId: 'nosuchuser', password: 'password1' }),
+    ).rejects.toThrow(/Invalid credentials/);
+  });
+
+  it('refresh blocks inactive users and revokes their sessions', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'BANNED',
+      role: 'USER',
+      lastOnline: null,
+    });
+
+    await expect(service.refresh('refresh-token')).rejects.toThrow(
+      ForbiddenException,
+    );
+    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('changePassword rejects when the old password is wrong', async () => {
+    const passwordHash = await argon2.hash('current-password');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(
+      service.changePassword('uuid-1', 'wrong-old', 'new-password'),
+    ).rejects.toThrow(UnauthorizedException);
+    expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+  });
+
+  it('changePassword rotates the hash and revokes all sessions on success', async () => {
+    const passwordHash = await argon2.hash('current-password');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await service.changePassword('uuid-1', 'current-password', 'new-password');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'uuid-1' },
+        data: expect.objectContaining({
+          passwordHash: expect.any(String),
+        }),
+      }),
+    );
+    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('logout delegates to refreshTokenService.revoke', async () => {
+    await service.logout('some-refresh-token');
+    expect(mockRefreshTokenService.revoke).toHaveBeenCalledWith(
+      'some-refresh-token',
+    );
+  });
+
+  it('me throws NotFoundException when the user no longer exists', async () => {
+    await expect(service.me('missing-user-id')).rejects.toThrow(
+      NotFoundException,
+    );
   });
 });

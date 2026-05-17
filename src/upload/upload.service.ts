@@ -76,8 +76,19 @@ export class UploadService implements OnModuleInit {
       );
       return;
     }
-    await this.ensureBucketExists();
-    await this.ensureBucketIsPublicReadable();
+    // Bucket bootstrap must not crash the whole app: if MinIO is unreachable
+    // at boot, log and continue — `presign` surfaces a clean 503 to callers,
+    // the rest of the app stays up.
+    try {
+      await this.ensureBucketExists();
+      await this.ensureBucketIsPublicReadable();
+    } catch (error) {
+      this.logger.error(
+        `MinIO bucket bootstrap failed; upload features may be degraded: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
@@ -100,7 +111,11 @@ export class UploadService implements OnModuleInit {
       throw new ServiceUnavailableException('File upload is not configured');
     }
 
-    const ext = filename.split('.').pop() ?? 'bin';
+    // `split('.').pop()` returns the whole string when there is no dot, so
+    // gate on an actual extension and fall back to `bin`.
+    const ext = filename.includes('.')
+      ? filename.split('.').pop() || 'bin'
+      : 'bin';
     // Include userId in the path so the note service can enforce per-user
     // media ownership at write time without trusting the client-supplied key.
     const key = userId

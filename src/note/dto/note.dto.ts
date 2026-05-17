@@ -10,6 +10,7 @@ import {
   IsString,
   IsUrl,
   IsUUID,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -51,6 +52,11 @@ export class CreateNoteMediaDto {
   @ApiProperty()
   @IsString()
   @MaxLength(255)
+  // Restrict to a safe storage-key charset and reject `..` so a crafted key
+  // cannot smuggle path traversal or markup into stored data.
+  @Matches(/^(?!.*\.\.)[A-Za-z0-9._/-]+$/, {
+    message: 'objectKey contains invalid characters',
+  })
   objectKey: string;
 
   @ApiProperty()

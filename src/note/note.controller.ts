@@ -21,6 +21,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import {
   CreateNoteDto,
   CreateNoteGroupDto,
@@ -48,7 +49,7 @@ export class NoteController {
   @ApiOkResponse({ type: [NoteSummaryDto] })
   listNotes(
     @Query() query: ListNotesQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteSummaryDto[]> {
     return this.noteService.listNotes(req.user.userId, query);
   }
@@ -58,7 +59,7 @@ export class NoteController {
   @ApiOkResponse({ type: NoteDetailDto })
   createNote(
     @Body() dto: CreateNoteDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.createNote(req.user.userId, dto);
   }
@@ -69,7 +70,7 @@ export class NoteController {
   updateNote(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateNoteDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.updateNote(req.user.userId, id, dto);
   }
@@ -80,7 +81,7 @@ export class NoteController {
   setPinned(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SetPinnedDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.noteService.setPinned(req.user.userId, id, dto.pinned);
   }
@@ -91,7 +92,7 @@ export class NoteController {
   setAvailable(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SetNoteAvailableDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.noteService.setAvailable(req.user.userId, id, dto.available);
   }
@@ -102,7 +103,7 @@ export class NoteController {
   @ApiNoContentResponse()
   deleteNote(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.noteService.deleteNote(req.user.userId, id);
   }
@@ -110,7 +111,7 @@ export class NoteController {
   @Get('group')
   @ApiOperation({ summary: 'My note groups' })
   @ApiOkResponse({ type: [NoteGroupDto] })
-  listGroups(@Req() req: any): Promise<NoteGroupDto[]> {
+  listGroups(@Req() req: RequestWithUser): Promise<NoteGroupDto[]> {
     return this.noteService.listGroups(req.user.userId);
   }
 
@@ -119,7 +120,7 @@ export class NoteController {
   @ApiOkResponse({ type: NoteDetailDto })
   getNote(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.getNote(req.user.userId, id);
   }
@@ -129,7 +130,7 @@ export class NoteController {
   @ApiOkResponse({ type: NoteGroupDto })
   createGroup(
     @Body() dto: CreateNoteGroupDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteGroupDto> {
     return this.noteService.createGroup(req.user.userId, dto);
   }
@@ -139,7 +140,7 @@ export class NoteController {
   @ApiOkResponse({ type: [NoteGroupDto] })
   reorderGroups(
     @Body() dto: ReorderNoteGroupsDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteGroupDto[]> {
     return this.noteService.reorderGroups(req.user.userId, dto.groupIds);
   }
@@ -150,7 +151,7 @@ export class NoteController {
   updateGroup(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateNoteGroupDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<NoteGroupDto> {
     return this.noteService.updateGroup(req.user.userId, id, dto);
   }
@@ -161,7 +162,7 @@ export class NoteController {
   @ApiNoContentResponse()
   deleteGroup(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.noteService.deleteGroup(req.user.userId, id);
   }

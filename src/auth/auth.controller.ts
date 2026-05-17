@@ -23,6 +23,7 @@ import { ChangePasswordDto } from './dto/change-password.dto';
 import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
+import type { RequestWithUser } from './types';
 
 function getHeaderValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) {
@@ -106,6 +107,7 @@ export class AuthController {
 
   @Get('sessions')
   @UseGuards(JwtGuard)
+  @Serialize(AuthSessionDto)
   @ApiOperation({ summary: 'List active device sessions for the current user' })
   @ApiBearerAuth()
   @ApiOkResponse({
@@ -113,7 +115,7 @@ export class AuthController {
     type: AuthSessionDto,
     isArray: true,
   })
-  sessions(@Req() req: any) {
+  sessions(@Req() req: RequestWithUser) {
     return this.authService.sessions(req.user.userId);
   }
 
@@ -122,7 +124,7 @@ export class AuthController {
   @ApiOperation({ summary: 'Logout all devices for the current user' })
   @ApiBearerAuth()
   @ApiOkResponse({ description: 'All device sessions revoked' })
-  logoutAll(@Req() req: any) {
+  logoutAll(@Req() req: RequestWithUser) {
     return this.authService.logoutAll(req.user.userId);
   }
 
@@ -132,7 +134,7 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiBody({ type: ChangePasswordDto })
   @ApiOkResponse({ description: 'Password changed successfully' })
-  changePassword(@Body() dto: ChangePasswordDto, @Req() req: any) {
+  changePassword(@Body() dto: ChangePasswordDto, @Req() req: RequestWithUser) {
     return this.authService.changePassword(
       req.user.userId,
       dto.oldPassword,
@@ -147,7 +149,7 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiOkResponse({ description: 'Current user profile', type: SelfUserDto })
   @ApiUnauthorizedResponse({ description: 'Missing or invalid bearer token' })
-  me(@Req() req: any) {
+  me(@Req() req: RequestWithUser) {
     return this.authService.me(req.user.userId);
   }
 }

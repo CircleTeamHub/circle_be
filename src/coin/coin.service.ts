@@ -5,15 +5,20 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { FriendState, Prisma } from 'src/generated/prisma';
+import { FriendState } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  prismaErrorCode,
+  runSerializableTransaction,
+} from 'src/utils/prisma-tx';
 import { CoinTransactionDto, WalletDto } from './dto/coin.dto';
 
 // Max coins a user can send in a single gift
 const GIFT_MAX_SINGLE = 10_000;
 // Max coins a user can send per day (prevent drain attacks)
 const GIFT_DAILY_LIMIT = 50_000;
-const MAX_GIFT_TX_ATTEMPTS = 3;
+// Upper bound on a single admin top-up — guards against fat-finger / Int overflow.
+const MAX_ADMIN_TOPUP = 1_000_000;
 
 @Injectable()
 export class CoinService {
@@ -24,16 +29,13 @@ export class CoinService {
   // ─── Wallet ───────────────────────────────────────────────────────────────────
 
   async getWallet(userId: string): Promise<WalletDto> {
-    const wallet = await this.prisma.wallet.findUnique({
+    // upsert is race-safe: two concurrent first-access calls can't both
+    // insert and trip the `Wallet.userID` unique constraint.
+    return this.prisma.wallet.upsert({
       where: { userID: userId },
+      update: {},
+      create: { userID: userId },
     });
-    if (!wallet) {
-      // Auto-create wallet on first access
-      return this.prisma.wallet.create({
-        data: { userID: userId },
-      });
-    }
-    return wallet;
   }
 
   async getTransactions(userId: string): Promise<CoinTransactionDto[]> {
@@ -50,6 +52,7 @@ export class CoinService {
     senderId: string,
     recipientId: string,
     amount: number,
+    idempotencyKey: string,
     message?: string,
   ): Promise<void> {
     if (senderId === recipientId) {
@@ -83,112 +86,114 @@ export class CoinService {
       throw new ForbiddenException('You can only send coins to friends');
     }
 
+    // Idempotency fast path: if this key was already used, the gift already
+    // happened — return success without charging again.
+    const priorGift = await this.prisma.coinGift.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    });
+    if (priorGift) {
+      this.logger.log(`Duplicate gift suppressed (idempotencyKey reused)`);
+      return;
+    }
+
     // Execute atomically: deduct sender, credit recipient, create gift record, log txs
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
-    for (let attempt = 1; attempt <= MAX_GIFT_TX_ATTEMPTS; attempt += 1) {
-      try {
-        await this.prisma.$transaction(
-          async (tx) => {
-            const sentToday = await tx.coinTransaction.aggregate({
-              where: {
-                userID: senderId,
-                type: 'GIFT_SENT',
-                createdAt: { gte: todayStart },
-              },
-              _sum: { amount: true },
-            });
-            const totalSentToday = Math.abs(sentToday._sum.amount ?? 0);
-            if (totalSentToday + amount > GIFT_DAILY_LIMIT) {
-              throw new BadRequestException(
-                `Daily gift limit of ${GIFT_DAILY_LIMIT} coins reached`,
-              );
-            }
-
-            await Promise.all([
-              tx.wallet.upsert({
-                where: { userID: senderId },
-                update: {},
-                create: { userID: senderId },
-              }),
-              tx.wallet.upsert({
-                where: { userID: recipientId },
-                update: {},
-                create: { userID: recipientId },
-              }),
-            ]);
-
-            const debitResult = await tx.wallet.updateMany({
-              where: {
-                userID: senderId,
-                balance: { gte: amount },
-              },
-              data: { balance: { decrement: amount } },
-            });
-            if (debitResult.count !== 1) {
-              throw new BadRequestException('Insufficient coins');
-            }
-
-            const [updatedSender, updatedRecipient] = await Promise.all([
-              tx.wallet.findUniqueOrThrow({
-                where: { userID: senderId },
-                select: { balance: true },
-              }),
-              tx.wallet.update({
-                where: { userID: recipientId },
-                data: { balance: { increment: amount } },
-                select: { balance: true },
-              }),
-            ]);
-
-            const gift = await tx.coinGift.create({
-              data: {
-                senderID: senderId,
-                recipientID: recipientId,
-                amount,
-                message: message ?? null,
-              },
-            });
-
-            await tx.coinTransaction.createMany({
-              data: [
-                {
-                  userID: senderId,
-                  type: 'GIFT_SENT',
-                  amount: -amount,
-                  balance: updatedSender.balance,
-                  note: message ?? null,
-                  relatedID: gift.id,
-                },
-                {
-                  userID: recipientId,
-                  type: 'GIFT_RECEIVED',
-                  amount,
-                  balance: updatedRecipient.balance,
-                  note: message ?? null,
-                  relatedID: gift.id,
-                },
-              ],
-            });
+    try {
+      await runSerializableTransaction(this.prisma, async (tx) => {
+        const sentToday = await tx.coinTransaction.aggregate({
+          where: {
+            userID: senderId,
+            type: 'GIFT_SENT',
+            createdAt: { gte: todayStart },
           },
-          {
-            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-          },
-        );
-        break;
-      } catch (error) {
-        if (
-          this.isRetryableTransactionError(error) &&
-          attempt < MAX_GIFT_TX_ATTEMPTS
-        ) {
-          this.logger.warn(
-            `Retrying gift transaction after serialization conflict (attempt ${attempt})`,
+          _sum: { amount: true },
+        });
+        const totalSentToday = Math.abs(sentToday._sum.amount ?? 0);
+        if (totalSentToday + amount > GIFT_DAILY_LIMIT) {
+          throw new BadRequestException(
+            `Daily gift limit of ${GIFT_DAILY_LIMIT} coins reached`,
           );
-          continue;
         }
-        throw error;
+
+        // Prisma interactive transactions run on a single connection;
+        // issue queries sequentially rather than via Promise.all.
+        await tx.wallet.upsert({
+          where: { userID: senderId },
+          update: {},
+          create: { userID: senderId },
+        });
+        await tx.wallet.upsert({
+          where: { userID: recipientId },
+          update: {},
+          create: { userID: recipientId },
+        });
+
+        const debitResult = await tx.wallet.updateMany({
+          where: {
+            userID: senderId,
+            balance: { gte: amount },
+          },
+          data: { balance: { decrement: amount } },
+        });
+        if (debitResult.count !== 1) {
+          throw new BadRequestException('Insufficient coins');
+        }
+
+        const updatedSender = await tx.wallet.findUniqueOrThrow({
+          where: { userID: senderId },
+          select: { balance: true },
+        });
+        const updatedRecipient = await tx.wallet.update({
+          where: { userID: recipientId },
+          data: { balance: { increment: amount } },
+          select: { balance: true },
+        });
+
+        const gift = await tx.coinGift.create({
+          data: {
+            senderID: senderId,
+            recipientID: recipientId,
+            amount,
+            message: message ?? null,
+            idempotencyKey,
+          },
+        });
+
+        await tx.coinTransaction.createMany({
+          data: [
+            {
+              userID: senderId,
+              type: 'GIFT_SENT',
+              amount: -amount,
+              balance: updatedSender.balance,
+              note: message ?? null,
+              relatedID: gift.id,
+            },
+            {
+              userID: recipientId,
+              type: 'GIFT_RECEIVED',
+              amount,
+              balance: updatedRecipient.balance,
+              note: message ?? null,
+              relatedID: gift.id,
+            },
+          ],
+        });
+      });
+    } catch (error) {
+      // Lost the race against a concurrent request reusing the same key —
+      // the unique index rejected the second coinGift insert. The other
+      // request already charged; treat this one as an idempotent success.
+      if (prismaErrorCode(error) === 'P2002') {
+        this.logger.log(
+          `Concurrent duplicate gift suppressed (idempotencyKey)`,
+        );
+        return;
       }
+      throw error;
     }
 
     this.logger.log(
@@ -204,8 +209,21 @@ export class CoinService {
     note?: string,
   ): Promise<WalletDto> {
     if (amount <= 0) throw new BadRequestException('Amount must be positive');
+    if (amount > MAX_ADMIN_TOPUP) {
+      throw new BadRequestException(
+        `Amount exceeds the per-top-up cap of ${MAX_ADMIN_TOPUP}`,
+      );
+    }
 
-    return this.prisma.$transaction(async (tx) => {
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: { id: true, status: true },
+    });
+    if (!target || target.status !== 'ACTIVE') {
+      throw new NotFoundException('User not found');
+    }
+
+    return runSerializableTransaction(this.prisma, async (tx) => {
       const wallet = await tx.wallet.upsert({
         where: { userID: targetUserId },
         update: { balance: { increment: amount } },
@@ -224,12 +242,5 @@ export class CoinService {
 
       return wallet;
     });
-  }
-
-  private isRetryableTransactionError(error: unknown): boolean {
-    return (
-      error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === 'P2034'
-    );
   }
 }

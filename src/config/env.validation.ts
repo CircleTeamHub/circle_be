@@ -27,15 +27,20 @@ export function createEnvValidationSchema(
     ? Joi.string().allow('').optional()
     : Joi.string().required();
 
+  const isProduction = env['NODE_ENV'] === 'production';
+  const secretMin = isProduction ? 32 : 8;
+
   return Joi.object({
     NODE_ENV: Joi.string()
       .valid('development', 'production', 'test')
       .default('development'),
     DATABASE_URL: databaseUrlSchema,
-    SECRET: Joi.string().required(),
+    SECRET: Joi.string().min(secretMin).required(),
+    JWT_EXPIRES_IN: Joi.string().default('1h'),
+    REFRESH_EXPIRES_IN: Joi.string().default('30d'),
     LOG_ON: Joi.boolean(),
     LOG_LEVEL: Joi.string(),
-    APP_PORT: Joi.number().default(3000),
+    APP_PORT: Joi.number().integer().min(0).max(65535).default(3000),
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
     OPENIM_API_URL: Joi.string().uri().optional(),
@@ -51,5 +56,5 @@ export function createEnvValidationSchema(
       then: Joi.string().required(),
       otherwise: Joi.string().optional(),
     }),
-  });
+  }).unknown(true);
 }

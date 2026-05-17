@@ -20,6 +20,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import { CircleService } from './circle.service';
 import {
   CircleDetailDto,
@@ -41,7 +42,7 @@ export class CircleController {
   @ApiOkResponse({ type: CircleDetailDto })
   create(
     @Body() dto: CreateCircleDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<CircleDetailDto> {
     return this.circleService.createCircle(req.user.userId, dto);
   }
@@ -64,7 +65,7 @@ export class CircleController {
   @ApiOkResponse({ type: [CircleDto] })
   myCircles(
     @Query() query: MyCirclesQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<CircleDto[]> {
     return this.circleService.myCircles(req.user.userId, query);
   }
@@ -74,7 +75,7 @@ export class CircleController {
   @ApiOkResponse({ type: CircleDetailDto })
   detail(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<CircleDetailDto> {
     return this.circleService.getCircleDetail(req.user.userId, id);
   }
@@ -83,7 +84,7 @@ export class CircleController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Join a circle' })
   @ApiNoContentResponse()
-  join(@Param('id', ParseUUIDPipe) id: string, @Req() req: any): Promise<void> {
+  join(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser): Promise<void> {
     return this.circleService.joinCircle(req.user.userId, id);
   }
 
@@ -93,20 +94,20 @@ export class CircleController {
   @ApiNoContentResponse()
   leave(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.circleService.leaveCircle(req.user.userId, id);
   }
 
   @Get('activities/list')
   @ApiOperation({ summary: 'My circle activities (notifications)' })
-  activities(@Req() req: any) {
+  activities(@Req() req: RequestWithUser) {
     return this.circleService.getActivities(req.user.userId);
   }
 
   @Get('activities/unread-count')
   @ApiOperation({ summary: 'Unread circle activity count' })
-  unreadCount(@Req() req: any) {
+  unreadCount(@Req() req: RequestWithUser) {
     return this.circleService.getUnreadActivityCount(req.user.userId);
   }
 
@@ -116,7 +117,7 @@ export class CircleController {
   @ApiNoContentResponse()
   markRead(
     @Param('activityId', ParseUUIDPipe) activityId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.circleService.markActivityRead(req.user.userId, activityId);
   }

@@ -6,6 +6,8 @@ import {
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RefreshTokenService } from 'src/auth/refresh-token.service';
+import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 
@@ -19,8 +21,6 @@ export interface CreateUserInput {
   accountId: string;
   password: string;
   nickname?: string;
-  email?: string;
-  phoneNumber?: string;
 }
 
 export interface UpdateUserInput {
@@ -79,11 +79,18 @@ function normalizeBirthdayInput(value: string | null | undefined) {
     return null;
   }
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
-    return new Date(`${normalized}T00:00:00.000Z`);
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(normalized)
+    ? new Date(`${normalized}T00:00:00.000Z`)
+    : new Date(normalized);
+
+  if (Number.isNaN(parsed.getTime())) {
+    // The DTO's @IsDateString validator should already reject this, but the
+    // service is also called from places that bypass the pipe (e.g. internal
+    // jobs); fail fast instead of letting an Invalid Date hit Prisma.
+    throw new BadRequestException(`Invalid birthday value: ${value}`);
   }
 
-  return new Date(normalized);
+  return parsed;
 }
 
 function normalizeUpdateInput(input: UpdateUserInput) {
@@ -104,6 +111,7 @@ export class UserService {
   constructor(
     private prisma: PrismaService,
     private config: ConfigService,
+    private refreshTokens: RefreshTokenService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -113,20 +121,15 @@ export class UserService {
    * Prevents SSRF-capable URLs (cloud metadata, localhost, javascript:, data:)
    * being stored and later rendered by clients.
    *
-   * When MinIO is not configured we skip the check — upload is disabled anyway.
+   * Delegates to the shared `assertUrlsFromStorage` guard — which closes the
+   * `host.attacker.com` bypass that the previous bare `startsWith` allowed.
    */
   private assertUrlsAreSafe(input: UpdateUserInput): void {
-    if (!this.minioPublicUrl) return;
-
-    const prefix = this.minioPublicUrl.replace(/\/$/, '');
-    for (const field of URL_FIELDS) {
-      const value = input[field as keyof UpdateUserInput];
-      if (typeof value === 'string' && !value.startsWith(prefix)) {
-        throw new BadRequestException(
-          `${field} must be a URL served from this application's storage`,
-        );
-      }
-    }
+    assertUrlsFromStorage(
+      URL_FIELDS.map((field) => input[field] as string | undefined),
+      this.minioPublicUrl,
+      'profile image url',
+    );
   }
 
   async findAll(query: GetUserDto) {
@@ -182,8 +185,6 @@ export class UserService {
         accountId: input.accountId,
         passwordHash,
         nickname: input.nickname || input.accountId,
-        email: input.email,
-        phoneNumber: input.phoneNumber,
       },
       select: PUBLIC_SELECT,
     });
@@ -201,19 +202,29 @@ export class UserService {
 
   async remove(id: string) {
     await this.findOne(id);
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id },
       data: { status: UserStatus.DELETED },
       select: PUBLIC_SELECT,
     });
+    // A deleted user must lose every active session; otherwise an attacker
+    // (or the user themselves) can keep refreshing tokens for up to 7 days.
+    await this.refreshTokens.revokeAll(id);
+    return updated;
   }
 
   async updateStatus(id: string, status: UserStatus) {
     await this.findOne(id);
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id },
       data: { status },
       select: PUBLIC_SELECT,
     });
+    // BAN / DELETE must invalidate sessions immediately. ACTIVE → ACTIVE is a
+    // no-op revoke call; cheaper than introducing a branch.
+    if (status !== UserStatus.ACTIVE) {
+      await this.refreshTokens.revokeAll(id);
+    }
+    return updated;
   }
 }

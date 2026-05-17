@@ -3,7 +3,6 @@ import { UserModule } from './user/user.module';
 import { ConfigModule } from '@nestjs/config';
 import * as dotenv from 'dotenv';
 
-import { LogsModule } from './logs/logs.module';
 import { RolesModule } from './roles/roles.module';
 import { AuthModule } from './auth/auth.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -30,7 +29,6 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     }),
     PrismaModule,
     UserModule,
-    LogsModule,
     RolesModule,
     AuthModule,
     OpenimModule,

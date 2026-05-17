@@ -18,6 +18,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import { CircleInvitationService } from './circle-invitation.service';
 import {
   AddVerifierDto,
@@ -40,7 +41,7 @@ export class CircleInvitationController {
   @ApiOkResponse({ type: InvitationDto })
   invite(
     @Body() dto: InviteToCircleDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<InvitationDto> {
     return this.invitationService.invite(
       req.user.userId,
@@ -52,14 +53,14 @@ export class CircleInvitationController {
   @Get('pending')
   @ApiOperation({ summary: 'My pending verification requests (as verifier)' })
   @ApiOkResponse({ type: [InvitationDto] })
-  myPendingVerifications(@Req() req: any): Promise<InvitationDto[]> {
+  myPendingVerifications(@Req() req: RequestWithUser): Promise<InvitationDto[]> {
     return this.invitationService.getMyPendingVerifications(req.user.userId);
   }
 
   @Get('my-applications')
   @ApiOperation({ summary: 'My applications (as applicant)' })
   @ApiOkResponse({ type: [InvitationDto] })
-  myApplications(@Req() req: any): Promise<InvitationDto[]> {
+  myApplications(@Req() req: RequestWithUser): Promise<InvitationDto[]> {
     return this.invitationService.getMyApplications(req.user.userId);
   }
 
@@ -68,7 +69,7 @@ export class CircleInvitationController {
   @ApiOkResponse({ type: [InvitationDto] })
   circlePending(
     @Param('circleId', ParseUUIDPipe) circleId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<InvitationDto[]> {
     return this.invitationService.getPendingInvitationsForCircle(
       req.user.userId,
@@ -81,7 +82,7 @@ export class CircleInvitationController {
   @ApiOkResponse({ type: InvitationDto })
   getInvitation(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<InvitationDto> {
     return this.invitationService.getInvitationForViewer(req.user.userId, id);
   }
@@ -95,7 +96,7 @@ export class CircleInvitationController {
   addVerifier(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: AddVerifierDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.invitationService.addVerifier(
       req.user.userId,
@@ -111,7 +112,7 @@ export class CircleInvitationController {
   respond(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: RespondVerificationDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.invitationService.respond(req.user.userId, id, dto.approve);
   }
@@ -122,7 +123,7 @@ export class CircleInvitationController {
   @ApiNoContentResponse()
   adminApprove(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.invitationService.adminApprove(req.user.userId, id);
   }

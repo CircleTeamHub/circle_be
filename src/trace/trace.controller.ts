@@ -20,6 +20,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import { TraceService } from './trace.service';
 import {
   CreateTraceCommentDto,
@@ -41,7 +42,7 @@ export class TraceController {
   @ApiOperation({ summary: 'Friend moments feed' })
   feed(
     @Query() query: TraceFeedQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.traceService.getFeed(req.user.userId, query);
   }
@@ -50,7 +51,7 @@ export class TraceController {
   @ApiOperation({ summary: 'Count new moments since timestamp' })
   newCount(
     @Query() query: NewCountQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.traceService.getNewCount(req.user.userId, query.since);
   }
@@ -60,7 +61,7 @@ export class TraceController {
   @ApiOkResponse({ type: TraceDto })
   create(
     @Body() dto: CreateTraceDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<TraceDto> {
     return this.traceService.createTrace(req.user.userId, dto);
   }
@@ -71,7 +72,7 @@ export class TraceController {
   @ApiNoContentResponse()
   remove(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.traceService.deleteTrace(req.user.userId, id);
   }
@@ -80,7 +81,7 @@ export class TraceController {
   @ApiOperation({ summary: 'Toggle like on a moment' })
   like(
     @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.traceService.toggleLike(req.user.userId, id);
   }
@@ -91,7 +92,7 @@ export class TraceController {
   comment(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateTraceCommentDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<TraceCommentDto> {
     return this.traceService.addComment(req.user.userId, id, dto);
   }
@@ -102,7 +103,7 @@ export class TraceController {
   @ApiNoContentResponse()
   removeComment(
     @Param('commentId', ParseUUIDPipe) commentId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.traceService.deleteComment(req.user.userId, commentId);
   }

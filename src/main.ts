@@ -27,37 +27,65 @@ export function resolveAppPort(value: unknown): number {
   throw new Error(`Invalid APP_PORT value: ${String(value)}`);
 }
 
+type CorsOriginCallback = (err: Error | null, allow?: boolean) => void;
+
+export function resolveCorsOriginChecker(
+  env: NodeJS.ProcessEnv = process.env,
+): (origin: string | undefined, callback: CorsOriginCallback) => void {
+  const isProduction = env.NODE_ENV === 'production';
+  const allowedOrigins = (env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  // Dev/test: also allow localhost/loopback on any port. Avoid `cors: true`
+  // (reflect-any-origin) which lets any page on the LAN ride the user's
+  // credentials.
+  const devPatterns: RegExp[] = isProduction
+    ? []
+    : [
+        /^https?:\/\/localhost(:\d+)?$/,
+        /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
+        /^https?:\/\/\[::1\](:\d+)?$/,
+        /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
+        /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
+      ];
+
+  return (origin, callback) => {
+    // Same-origin / curl / mobile webviews have no Origin header — allow.
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    if (devPatterns.some((re) => re.test(origin))) return callback(null, true);
+    return callback(new Error(`CORS blocked: ${origin}`), false);
+  };
+}
+
 async function bootstrap() {
   const config = getServerConfig();
-
-  // In production, ALLOWED_ORIGINS must be set (comma-separated).
-  // In development/test, all origins are allowed for convenience.
   const isProduction = process.env.NODE_ENV === 'production';
-  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map((o) =>
-    o.trim(),
-  );
-
-  const corsOptions = isProduction
-    ? { origin: allowedOrigins ?? [], credentials: true }
-    : true;
 
   const app = await NestFactory.create(AppModule, {
-    cors: corsOptions,
+    cors: {
+      origin: resolveCorsOriginChecker(),
+      credentials: true,
+    },
   });
   setupApp(app);
 
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('NestJS Lesson API')
-    .setDescription('API documentation for the NestJS lesson project')
-    .setVersion('1.0')
-    .addBearerAuth()
-    .build();
-  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('docs', app, swaggerDocument, {
-    swaggerOptions: {
-      persistAuthorization: true,
-    },
-  });
+  if (!isProduction) {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('NestJS Lesson API')
+      .setDescription('API documentation for the NestJS lesson project')
+      .setVersion('1.0')
+      .addBearerAuth()
+      .build();
+    const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('docs', app, swaggerDocument, {
+      swaggerOptions: {
+        persistAuthorization: true,
+      },
+    });
+  }
 
   const port = resolveAppPort(config['APP_PORT'] ?? 3000);
   await app.listen(port);

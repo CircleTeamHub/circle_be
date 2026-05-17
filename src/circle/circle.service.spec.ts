@@ -1,5 +1,6 @@
 import { ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleService } from './circle.service';
@@ -44,6 +45,7 @@ describe('CircleService', () => {
         CircleService,
         { provide: PrismaService, useValue: prisma },
         { provide: OpenimService, useValue: openimService },
+        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
       ],
     }).compile();
 
@@ -74,5 +76,27 @@ describe('CircleService', () => {
 
     expect(prisma.circleMember.create).not.toHaveBeenCalled();
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
+    const { BadRequestException } = await import('@nestjs/common');
+    const guarded = new CircleService(
+      prisma as any,
+      openimService as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+
+    await expect(
+      guarded.createCircle('user-1', {
+        name: 'Evil Circle',
+        categories: ['LIFE'],
+        description: 'a'.repeat(20),
+        avatarUrl: 'https://evil.example.com/track.gif',
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });

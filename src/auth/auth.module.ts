@@ -16,10 +16,16 @@ import { OpenimModule } from 'src/openim/openim.module';
     PassportModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
-      useFactory: async (configService: ConfigService) => ({
-        secret: configService.get<string>(ConfigEnum.SECRET),
-        signOptions: { expiresIn: '15m' },
-      }),
+      useFactory: (configService: ConfigService) => {
+        // `@nestjs/jwt` types `expiresIn` as `number | StringValue`; widen
+        // through the literal cast since ConfigService returns generic string.
+        const expiresIn = (configService.get<string>('JWT_EXPIRES_IN') ??
+          '1h') as unknown as number;
+        return {
+          secret: configService.get<string>(ConfigEnum.SECRET),
+          signOptions: { expiresIn },
+        };
+      },
       inject: [ConfigService],
     }),
     OpenimModule,
@@ -31,6 +37,9 @@ import { OpenimModule } from 'src/openim/openim.module';
     CaslAbilityService,
   ],
   controllers: [AuthController],
-  exports: [CaslAbilityService],
+  // RefreshTokenService is exported so other modules (e.g. UserService when
+  // BAN/DELETE happens) can revoke a user's sessions without going through
+  // AuthService.
+  exports: [CaslAbilityService, RefreshTokenService],
 })
 export class AuthModule {}

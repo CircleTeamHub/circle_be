@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
@@ -42,17 +43,24 @@ describe('RefreshTokenService', () => {
         return record;
       }),
       updateMany: jest.fn(async ({ where, data }) => {
-        const matching = records.filter(
-          (record) =>
-            (where.userId ? record.userId === where.userId : true) &&
-            (where.token ? record.token === where.token : true) &&
-            (where.revokedAt === null ? record.revokedAt === null : true),
-        );
+        const matching = records.filter((record) => {
+          if (where.userId && record.userId !== where.userId) return false;
+          if (where.token && record.token !== where.token) return false;
+          if (where.revokedAt === null && record.revokedAt !== null) {
+            return false;
+          }
+          if (where.expiredAt?.gt && !(record.expiredAt > where.expiredAt.gt)) {
+            return false;
+          }
+          return true;
+        });
         matching.forEach((record) => Object.assign(record, data));
         return { count: matching.length };
       }),
     },
   };
+
+  const config = { get: jest.fn().mockReturnValue(undefined) };
 
   beforeEach(async () => {
     records.length = 0;
@@ -62,15 +70,17 @@ describe('RefreshTokenService', () => {
       providers: [
         RefreshTokenService,
         { provide: PrismaService, useValue: prisma },
+        { provide: ConfigService, useValue: config },
       ],
     }).compile();
 
     service = module.get<RefreshTokenService>(RefreshTokenService);
   });
 
-  it('stores device metadata when creating a session', async () => {
+  it('stores device metadata when creating a session, truncating overlong values', async () => {
+    const longName = 'x'.repeat(200);
     await service.create('user-1', {
-      deviceName: 'MacBook Pro',
+      deviceName: longName,
       ip: '127.0.0.1',
       userAgent: 'PostmanRuntime',
     });
@@ -79,7 +89,7 @@ describe('RefreshTokenService', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           userId: 'user-1',
-          deviceName: 'MacBook Pro',
+          deviceName: longName.slice(0, 64),
           ip: '127.0.0.1',
           userAgent: 'PostmanRuntime',
         }),
@@ -136,7 +146,48 @@ describe('RefreshTokenService', () => {
     expect(records[0].revokedAt).toBeInstanceOf(Date);
   });
 
-  it('rejects rotating an invalid refresh token', async () => {
+  it('rotates a valid refresh token and revokes the old record', async () => {
+    const raw = await service.create('user-1', {
+      deviceName: 'MacBook',
+      ip: '127.0.0.1',
+      userAgent: 'PostmanRuntime',
+    });
+
+    const { token: newRaw, userId } = await service.rotate(raw, {
+      ip: '10.0.0.1',
+    });
+
+    expect(userId).toBe('user-1');
+    expect(newRaw).not.toBe(raw);
+    expect(records).toHaveLength(2);
+
+    const oldRecord = records[0];
+    const newRecord = records[1];
+    expect(oldRecord.revokedAt).toBeInstanceOf(Date);
+    expect(newRecord.revokedAt).toBeNull();
+    expect(newRecord.ip).toBe('10.0.0.1');
+    // Carries over device name from the old session when not supplied.
+    expect(newRecord.deviceName).toBe('MacBook');
+  });
+
+  it('detects refresh token reuse and revokes all sessions for the user', async () => {
+    const raw = await service.create('user-1');
+
+    // Rotate once — valid. Second rotation with the same old token is a replay.
+    await service.rotate(raw);
+
+    // Second session created above; capture for the assertion below.
+    const newSessionAfterFirstRotate = records[1];
+    expect(newSessionAfterFirstRotate.revokedAt).toBeNull();
+
+    await expect(service.rotate(raw)).rejects.toThrow(UnauthorizedException);
+    await expect(service.rotate(raw)).rejects.toThrow(/reuse detected/i);
+
+    // Every active session for the user should now be revoked.
+    expect(newSessionAfterFirstRotate.revokedAt).toBeInstanceOf(Date);
+  });
+
+  it('rejects rotating an unknown refresh token', async () => {
     await expect(service.rotate('missing-token')).rejects.toThrow(
       UnauthorizedException,
     );

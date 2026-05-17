@@ -4,9 +4,12 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { assertUrlsFromStorage } from 'src/utils/storage-url';
+import { prismaErrorCode } from 'src/utils/prisma-tx';
 import {
   CreateNoteDto,
   CreateNoteGroupDto,
@@ -134,9 +137,21 @@ const NOTE_INCLUDE = {
 
 const MAX_GROUPS_PER_USER = 50;
 
+// Keep derived title/content in sync with the DTO's @MaxLength caps — text
+// extracted from contentJson blocks otherwise bypasses DTO validation.
+const MAX_NOTE_TITLE_LENGTH = 120;
+const MAX_NOTE_CONTENT_LENGTH = 20_000;
+
 @Injectable()
 export class NoteService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly minioPublicUrl: string | null;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {
+    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
 
   private async requireOwnedGroups(ownerID: string, groupIds: string[]) {
     if (groupIds.length === 0) return [];
@@ -203,6 +218,24 @@ export class NoteService {
         `objectKey must start with notes/${ownerID}/`,
       );
     }
+  }
+
+  /**
+   * Rejects media whose `url` / `posterUrl` is not served from this
+   * application's own storage. `objectKey` is already ownership-checked, but
+   * `url` is the field that actually gets rendered (and surfaced to other
+   * users via circle-plaza), so it must be pinned to MINIO_PUBLIC_URL.
+   *
+   * Requiring the prefix to be followed by `/` closes the
+   * `https://host.attacker.com` bypass that a bare `startsWith` would allow.
+   * Skipped entirely when MinIO is not configured (upload disabled anyway).
+   */
+  private assertMediaUrlsAreSafe(media: CreateNoteDto['media']) {
+    const urls: Array<string | null | undefined> = [];
+    for (const item of media) {
+      urls.push(item.url, item.posterUrl);
+    }
+    assertUrlsFromStorage(urls, this.minioPublicUrl, 'media url');
   }
 
   private buildMediaStats(media: CreateNoteDto['media']) {
@@ -329,8 +362,12 @@ export class NoteService {
 
     return {
       contentJson: blocks.length > 0 ? blocks : null,
-      title: derivedTitle,
-      content: derivedContent || null,
+      // Truncate: text derived from contentJson bypasses the DTO @MaxLength
+      // caps, so enforce them here before the value reaches the DB column.
+      title: derivedTitle.slice(0, MAX_NOTE_TITLE_LENGTH),
+      content: derivedContent
+        ? derivedContent.slice(0, MAX_NOTE_CONTENT_LENGTH)
+        : null,
       media: derivedMedia,
     };
   }
@@ -409,6 +446,7 @@ export class NoteService {
 
     const derived = this.deriveNoteContent(input);
     this.assertMediaOwnership(ownerID, derived.media);
+    this.assertMediaUrlsAreSafe(derived.media);
 
     const media = derived.media
       .slice()
@@ -543,6 +581,7 @@ export class NoteService {
 
     const derived = this.deriveNoteContent(input);
     this.assertMediaOwnership(ownerID, derived.media);
+    this.assertMediaUrlsAreSafe(derived.media);
 
     const media = derived.media
       .slice()
@@ -651,8 +690,10 @@ export class NoteService {
 
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     await this.requireOwnedNote(ownerID, noteId);
+    // Include ownerID + status in the write to close the TOCTOU window, for
+    // parity with setPinned / setAvailable.
     await this.prisma.note.update({
-      where: { id: noteId },
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
       data: { status: 'DELETED' },
       select: { id: true },
     });
@@ -710,13 +751,23 @@ export class NoteService {
       );
     }
 
-    const created = await this.prisma.noteGroup.create({
-      data: {
-        ownerID,
-        name: normalizedName,
-        sortOrder: groupCount,
-      },
-    });
+    // The `findFirst` above is a fast path; the partial unique index
+    // `NoteGroup_owner_name_active_key` is the authoritative race backstop.
+    let created;
+    try {
+      created = await this.prisma.noteGroup.create({
+        data: {
+          ownerID,
+          name: normalizedName,
+          sortOrder: groupCount,
+        },
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException('Note group already exists');
+      }
+      throw error;
+    }
 
     return {
       id: created.id,
@@ -756,25 +807,33 @@ export class NoteService {
       }
     }
 
-    const updated = await this.prisma.noteGroup.update({
-      where: { id: groupId },
-      data: {
-        name: normalizedName,
-      },
-      include: {
-        _count: {
-          select: {
-            memberships: {
-              where: {
-                note: {
-                  status: { not: 'DELETED' },
+    let updated;
+    try {
+      updated = await this.prisma.noteGroup.update({
+        where: { id: groupId },
+        data: {
+          name: normalizedName,
+        },
+        include: {
+          _count: {
+            select: {
+              memberships: {
+                where: {
+                  note: {
+                    status: { not: 'DELETED' },
+                  },
                 },
               },
             },
           },
         },
-      },
-    });
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException('Note group already exists');
+      }
+      throw error;
+    }
 
     return this.mapGroup(updated);
   }

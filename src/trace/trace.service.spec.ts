@@ -1,5 +1,6 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TraceService } from './trace.service';
 
@@ -17,6 +18,7 @@ describe('TraceService', () => {
     traceLikeStat: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
+      findMany: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
     },
@@ -37,7 +39,11 @@ describe('TraceService', () => {
     jest.clearAllMocks();
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [TraceService, { provide: PrismaService, useValue: prisma }],
+      providers: [
+        TraceService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+      ],
     }).compile();
 
     service = module.get(TraceService);
@@ -84,6 +90,7 @@ describe('TraceService', () => {
     prisma.friend.findMany.mockResolvedValue([]);
     prisma.trace.findMany.mockResolvedValue([]);
     prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
 
     await service.getFeed('viewer-1', { page: 1, limit: 20 });
 
@@ -101,5 +108,50 @@ describe('TraceService', () => {
         }),
       }),
     );
+  });
+
+  it('toggleLike increments likeCount atomically and returns the DB value', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.traceLikeStat.findUnique.mockResolvedValue(null);
+    prisma.traceLikeStat.create.mockResolvedValue({ id: 'like-1' });
+    prisma.trace.update.mockResolvedValue({ likeCount: 8 });
+
+    const result = await service.toggleLike('viewer-1', 'trace-1');
+
+    expect(result).toEqual({ liked: true, likeCount: 8 });
+    expect(prisma.trace.update).toHaveBeenCalledWith({
+      where: { id: 'trace-1' },
+      data: { likeCount: { increment: 1 } },
+      select: { likeCount: true },
+    });
+  });
+
+  it('toggleLike on an existing like unlikes and decrements', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.traceLikeStat.findUnique.mockResolvedValue({
+      id: 'like-1',
+      deleted: false,
+    });
+    prisma.traceLikeStat.update.mockResolvedValue({ id: 'like-1' });
+    prisma.trace.update.mockResolvedValue({ likeCount: 4 });
+
+    const result = await service.toggleLike('viewer-1', 'trace-1');
+
+    expect(result).toEqual({ liked: false, likeCount: 4 });
+    expect(prisma.trace.update).toHaveBeenCalledWith({
+      where: { id: 'trace-1' },
+      data: { likeCount: { increment: -1 } },
+      select: { likeCount: true },
+    });
   });
 });

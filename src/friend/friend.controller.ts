@@ -21,6 +21,7 @@ import {
 } from '@nestjs/swagger';
 import { FriendState } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import {
   AssignTagDto,
   BlockUserDto,
@@ -49,7 +50,7 @@ export class FriendController {
   @Get()
   @ApiOperation({ summary: 'My friend list' })
   @ApiOkResponse({ type: [FriendProfileDto] })
-  listFriends(@Req() req: any): Promise<FriendProfileDto[]> {
+  listFriends(@Req() req: RequestWithUser): Promise<FriendProfileDto[]> {
     return this.friendService.listFriends(req.user.userId);
   }
 
@@ -58,7 +59,7 @@ export class FriendController {
   @ApiOkResponse({ type: FriendSettingsDto })
   getFriendSettings(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<FriendSettingsDto> {
     return this.friendService.getFriendSettings(req.user.userId, friendUserId);
   }
@@ -69,7 +70,7 @@ export class FriendController {
   @ApiNoContentResponse()
   removeFriend(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.removeFriend(req.user.userId, friendUserId);
   }
@@ -80,7 +81,7 @@ export class FriendController {
   @ApiNoContentResponse()
   blacklistFriend(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.blockUser(req.user.userId, friendUserId);
   }
@@ -91,7 +92,7 @@ export class FriendController {
   @ApiNoContentResponse()
   removeFriendFromBlacklist(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.unblockUser(req.user.userId, friendUserId);
   }
@@ -103,13 +104,9 @@ export class FriendController {
   reportFriend(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
     @Body() dto: ReportFriendDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
-    return this.friendService.reportFriend(
-      req.user.userId,
-      friendUserId,
-      dto,
-    );
+    return this.friendService.reportFriend(req.user.userId, friendUserId, dto);
   }
 
   // ─── Remark ───────────────────────────────────────────────────────────────────
@@ -121,7 +118,7 @@ export class FriendController {
   setRemark(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
     @Body() dto: SetRemarkDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.setRemark(
       req.user.userId,
@@ -138,7 +135,7 @@ export class FriendController {
   @ApiNoContentResponse()
   sendRequest(
     @Body() dto: SendFriendRequestDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.sendRequest(
       req.user.userId,
@@ -152,14 +149,14 @@ export class FriendController {
   @Get('requests/incoming')
   @ApiOperation({ summary: 'Incoming friend requests' })
   @ApiOkResponse({ type: [FriendRequestDto] })
-  listIncoming(@Req() req: any): Promise<FriendRequestDto[]> {
+  listIncoming(@Req() req: RequestWithUser): Promise<FriendRequestDto[]> {
     return this.friendService.listIncomingRequests(req.user.userId);
   }
 
   @Get('requests/outgoing')
   @ApiOperation({ summary: 'Outgoing friend requests' })
   @ApiOkResponse({ type: [FriendRequestDto] })
-  listOutgoing(@Req() req: any): Promise<FriendRequestDto[]> {
+  listOutgoing(@Req() req: RequestWithUser): Promise<FriendRequestDto[]> {
     return this.friendService.listOutgoingRequests(req.user.userId);
   }
 
@@ -169,7 +166,7 @@ export class FriendController {
   @ApiNoContentResponse()
   acceptRequest(
     @Param('requestId', ParseUUIDPipe) requestId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.handleRequest(
       req.user.userId,
@@ -184,7 +181,7 @@ export class FriendController {
   @ApiNoContentResponse()
   rejectRequest(
     @Param('requestId', ParseUUIDPipe) requestId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.handleRequest(
       req.user.userId,
@@ -199,7 +196,7 @@ export class FriendController {
   @ApiNoContentResponse()
   cancelRequest(
     @Param('requestId', ParseUUIDPipe) requestId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.cancelRequest(req.user.userId, requestId);
   }
@@ -207,7 +204,7 @@ export class FriendController {
   @Get('activities')
   @ApiOperation({ summary: 'Friend activity inbox' })
   @ApiOkResponse({ type: [FriendActivityDto] })
-  listActivities(@Req() req: any): Promise<FriendActivityDto[]> {
+  listActivities(@Req() req: RequestWithUser): Promise<FriendActivityDto[]> {
     return this.friendService.listActivities(req.user.userId);
   }
 
@@ -215,7 +212,7 @@ export class FriendController {
   @ApiOperation({ summary: 'Unread friend activity count' })
   @ApiOkResponse({ type: FriendActivityUnreadCountDto })
   getUnreadActivityCount(
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<FriendActivityUnreadCountDto> {
     return this.friendService.getUnreadActivityCount(req.user.userId);
   }
@@ -225,7 +222,7 @@ export class FriendController {
   @ApiOkResponse({ type: FriendActivityDto })
   getActivity(
     @Param('activityId', ParseUUIDPipe) activityId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<FriendActivityDto> {
     return this.friendService.getActivity(req.user.userId, activityId);
   }
@@ -236,7 +233,7 @@ export class FriendController {
   @ApiNoContentResponse()
   markActivityRead(
     @Param('activityId', ParseUUIDPipe) activityId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.markActivityRead(req.user.userId, activityId);
   }
@@ -248,7 +245,7 @@ export class FriendController {
   @ApiOkResponse({ type: FriendStatusDto })
   getStatus(
     @Param('targetId', ParseUUIDPipe) targetId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<FriendStatusDto> {
     return this.friendService.getStatus(req.user.userId, targetId);
   }
@@ -257,13 +254,17 @@ export class FriendController {
 
   @Get('tags')
   @ApiOperation({ summary: 'My friend tags' })
-  listTags(@Req() req: any) {
+  listTags(@Req() req: RequestWithUser) {
     return this.friendService.listMyTags(req.user.userId);
   }
 
   @Post('tags')
-  @ApiOperation({ summary: 'Create a friend tag' })
-  createTag(@Body() dto: CreateFriendTagDto, @Req() req: any) {
+  @ApiOperation({
+    summary: 'Create or update a friend tag (idempotent by name)',
+    description:
+      'Re-submitting an existing tag name updates its color instead of failing.',
+  })
+  createTag(@Body() dto: CreateFriendTagDto, @Req() req: RequestWithUser) {
     return this.friendService.createTag(req.user.userId, dto.name, dto.color);
   }
 
@@ -273,7 +274,7 @@ export class FriendController {
   @ApiNoContentResponse()
   deleteTag(
     @Param('tagId', ParseUUIDPipe) tagId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.deleteTag(req.user.userId, tagId);
   }
@@ -285,7 +286,7 @@ export class FriendController {
   assignTag(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
     @Body() dto: AssignTagDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.assignTag(
       req.user.userId,
@@ -301,7 +302,7 @@ export class FriendController {
   removeTag(
     @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
     @Param('tagId', ParseUUIDPipe) tagId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.removeTag(req.user.userId, friendUserId, tagId);
   }
@@ -311,7 +312,7 @@ export class FriendController {
   @ApiOkResponse({ type: [FriendProfileDto] })
   listFriendsByTag(
     @Param('tagId', ParseUUIDPipe) tagId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<FriendProfileDto[]> {
     return this.friendService.listFriendsByTag(req.user.userId, tagId);
   }
@@ -322,7 +323,10 @@ export class FriendController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Block a user' })
   @ApiNoContentResponse()
-  blockUser(@Body() dto: BlockUserDto, @Req() req: any): Promise<void> {
+  blockUser(
+    @Body() dto: BlockUserDto,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
     return this.friendService.blockUser(req.user.userId, dto.targetId);
   }
 
@@ -332,14 +336,14 @@ export class FriendController {
   @ApiNoContentResponse()
   unblockUser(
     @Param('targetId', ParseUUIDPipe) targetId: string,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.unblockUser(req.user.userId, targetId);
   }
 
   @Get('blocked')
   @ApiOperation({ summary: 'My blocked users list' })
-  listBlocked(@Req() req: any) {
+  listBlocked(@Req() req: RequestWithUser) {
     return this.friendService.listBlocked(req.user.userId);
   }
 }

@@ -7,6 +7,9 @@ describe('UserService.update normalization', () => {
       update: jest.fn(),
     },
   };
+  const refreshTokens = {
+    revokeAll: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -38,7 +41,11 @@ describe('UserService.update normalization', () => {
 
   it('converts birthday updates from yyyy-mm-dd to Date', async () => {
     const config = { get: jest.fn().mockReturnValue(null) };
-    const service = new UserService(prisma as any, config as any);
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+    );
 
     await service.update('user-1', { birthday: '2018-04-04' });
 
@@ -54,7 +61,11 @@ describe('UserService.update normalization', () => {
 
   it('passes through non-date profile fields unchanged', async () => {
     const config = { get: jest.fn().mockReturnValue(null) };
-    const service = new UserService(prisma as any, config as any);
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+    );
 
     await service.update('user-1', {
       nickname: 'jimmy',
@@ -81,7 +92,11 @@ describe('UserService.update normalization', () => {
 
   it('persists city updates unchanged', async () => {
     const config = { get: jest.fn().mockReturnValue(null) };
-    const service = new UserService(prisma as any, config as any);
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+    );
 
     await service.update('user-1', {
       city: '杭州',

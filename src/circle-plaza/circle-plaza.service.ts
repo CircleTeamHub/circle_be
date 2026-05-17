@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   CreatePlazaPostDto,
@@ -13,7 +14,31 @@ import {
 
 @Injectable()
 export class CirclePlazaService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly minioPublicUrl: string | null;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {
+    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  /**
+   * Rejects post images not served from this application's own storage.
+   * A plaza post is shown to every feed viewer, so off-origin image URLs are
+   * a cross-user tracking / phishing vector. Skipped when MinIO is unconfigured.
+   */
+  private assertImagesAreSafe(images: string[] | undefined): void {
+    if (!this.minioPublicUrl || !images?.length) return;
+    const prefix = this.minioPublicUrl.replace(/\/$/, '');
+    for (const image of images) {
+      if (image !== prefix && !image.startsWith(`${prefix}/`)) {
+        throw new BadRequestException(
+          "post images must be served from this application's storage",
+        );
+      }
+    }
+  }
 
   async createPost(
     userId: string,
@@ -35,6 +60,8 @@ export class CirclePlazaService {
     if (membership.circle.deleted) {
       throw new NotFoundException('Circle not found');
     }
+
+    this.assertImagesAreSafe(dto.images);
 
     // Check if members are allowed to post (owners/admins always can)
     if (!membership.circle.memberCanPost && membership.role === 'MEMBER') {

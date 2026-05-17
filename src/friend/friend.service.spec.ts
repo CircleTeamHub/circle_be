@@ -19,6 +19,7 @@ describe('FriendService', () => {
     user: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      update: jest.fn(),
     },
     block: {
       findUnique: jest.fn(),
@@ -39,7 +40,10 @@ describe('FriendService', () => {
     },
     friendTag: {
       findMany: jest.fn(),
+      findUnique: jest.fn(),
+      count: jest.fn(),
       upsert: jest.fn(),
+      delete: jest.fn(),
     },
     friendTagOnFriend: {
       createMany: jest.fn(),
@@ -63,6 +67,7 @@ describe('FriendService', () => {
       create: jest.fn(),
       findFirst: jest.fn(),
     },
+    $executeRaw: jest.fn(),
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
         ? operations(prisma as any)
@@ -146,6 +151,7 @@ describe('FriendService', () => {
           type: 'REQUEST_RECEIVED',
         }),
       ]),
+      skipDuplicates: true,
     });
   });
 
@@ -278,6 +284,7 @@ describe('FriendService', () => {
           type: 'REQUEST_RECEIVED',
         }),
       ]),
+      skipDuplicates: true,
     });
   });
 
@@ -372,7 +379,9 @@ describe('FriendService', () => {
     prisma.friendTag.findMany.mockResolvedValue([]);
 
     const tx = {
+      $executeRaw: jest.fn(),
       friend: {
+        findFirst: jest.fn().mockResolvedValue(null),
         create: jest.fn().mockResolvedValue({
           id: 'request-1',
           userID: 'user-1',
@@ -653,6 +662,7 @@ describe('FriendService', () => {
           type: 'REQUEST_WITHDRAWN_BY_OTHER',
         }),
       ],
+      skipDuplicates: true,
     });
     expect(prisma.friendTagOnFriend.createMany).not.toHaveBeenCalled();
   });
@@ -683,6 +693,9 @@ describe('FriendService', () => {
           message: 'hello',
         }),
       },
+      pendingFriendTagOnRequest: {
+        deleteMany: jest.fn(),
+      },
       friendActivity: {
         createMany: jest.fn().mockRejectedValue(new Error('activity failed')),
       },
@@ -712,6 +725,11 @@ describe('FriendService', () => {
       message: 'hello',
       pendingRemarkBySender: 'met at school',
     });
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      status: 'ACTIVE',
+    });
+    prisma.friend.count.mockResolvedValue(0);
     prisma.friendTag.findMany.mockResolvedValue([{ id: 'tag-1' }]);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([
       { ownerID: 'user-1', requestID: 'request-1', tagID: 'tag-1' },
@@ -783,6 +801,7 @@ describe('FriendService', () => {
           .mockResolvedValue([
             { ownerID: 'user-1', requestID: 'request-1', tagID: 'tag-1' },
           ]),
+        deleteMany: jest.fn(),
       },
       friendTagOnFriend: {
         createMany: jest.fn(),
@@ -844,6 +863,9 @@ describe('FriendService', () => {
           message: 'hello',
         }),
       },
+      pendingFriendTagOnRequest: {
+        deleteMany: jest.fn(),
+      },
       friendActivity: {
         createMany: jest.fn().mockRejectedValue(new Error('activity failed')),
       },
@@ -891,6 +913,39 @@ describe('FriendService', () => {
     expect(prisma.friendTagOnFriend.createMany).not.toHaveBeenCalled();
   });
 
+  it('rejects accepting a request whose sender is no longer active', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    // The sender (user-1) has been banned since sending the request.
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      status: 'BANNED',
+    });
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('maps a concurrent block race (P2002) to a clean conflict', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.block.findUnique.mockResolvedValue(null);
+    prisma.$transaction.mockRejectedValueOnce({ code: 'P2002' });
+
+    await expect(service.blockUser('user-1', 'user-2')).rejects.toThrow(
+      ConflictException,
+    );
+  });
+
   it('marks exactly one friend activity as read for the viewer', async () => {
     prisma.friendActivity.updateMany.mockResolvedValue({ count: 1 });
 
@@ -903,6 +958,8 @@ describe('FriendService', () => {
   });
 
   it('backfills missing activities for legacy pending requests before listing inbox items', async () => {
+    // Viewer not yet backfilled — the one-time gate lets the scan run.
+    prisma.user.findUnique.mockResolvedValue({ activitiesBackfilledAt: null });
     prisma.friend.findMany.mockResolvedValue([
       {
         id: 'request-1',
@@ -950,6 +1007,7 @@ describe('FriendService', () => {
           type: 'REQUEST_RECEIVED',
         }),
       ],
+      skipDuplicates: true,
     });
     expect(activities).toHaveLength(1);
   });
@@ -965,5 +1023,106 @@ describe('FriendService', () => {
 
     expect(errors.some((error) => error.property === 'remark')).toBe(true);
     expect(errors.some((error) => error.property === 'tagIds')).toBe(true);
+  });
+
+  // ─── Phase 2b: tags / remark / activities ───────────────────────────────────
+
+  it('createTag rejects an empty (whitespace-only) tag name', async () => {
+    await expect(service.createTag('user-1', '   ')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(prisma.friendTag.upsert).not.toHaveBeenCalled();
+  });
+
+  it('createTag rejects a new tag once the per-user limit is reached', async () => {
+    prisma.friendTag.findUnique.mockResolvedValue(null);
+    prisma.friendTag.count.mockResolvedValue(50);
+
+    await expect(service.createTag('user-1', 'classmates')).rejects.toThrow(
+      /limit reached/i,
+    );
+    expect(prisma.friendTag.upsert).not.toHaveBeenCalled();
+  });
+
+  it('createTag still allows updating an existing tag at the limit', async () => {
+    prisma.friendTag.findUnique.mockResolvedValue({ id: 'tag-1' });
+    prisma.friendTag.upsert.mockResolvedValue({ id: 'tag-1' });
+
+    await service.createTag('user-1', 'classmates', '#FF0000');
+
+    expect(prisma.friendTag.count).not.toHaveBeenCalled();
+    expect(prisma.friendTag.upsert).toHaveBeenCalled();
+  });
+
+  it('assignTag rejects a tag that does not belong to the user', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friendTag.findUnique.mockResolvedValue({
+      id: 'tag-9',
+      ownerID: 'someone-else',
+    });
+
+    await expect(
+      service.assignTag('user-1', 'user-2', 'tag-9'),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.friendTagOnFriend.upsert).not.toHaveBeenCalled();
+  });
+
+  it('removeTag now rejects a foreign tag id instead of silently no-op', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friendTag.findUnique.mockResolvedValue({
+      id: 'tag-9',
+      ownerID: 'someone-else',
+    });
+
+    await expect(
+      service.removeTag('user-1', 'user-2', 'tag-9'),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.friendTagOnFriend.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('setRemark writes remarkB when the caller is the friendID side', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-2',
+      friendID: 'user-1',
+      state: FriendState.ACCEPTED,
+    });
+
+    await service.setRemark('user-1', 'user-2', '老同事');
+
+    expect(prisma.friend.update).toHaveBeenCalledWith({
+      where: { id: 'friendship-1' },
+      data: { remarkB: '老同事' },
+    });
+  });
+
+  it('getActivity does not leak another viewer activity', async () => {
+    prisma.friendActivity.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.getActivity('user-1', 'activity-of-someone-else'),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.friendActivity.findFirst).toHaveBeenCalledWith({
+      where: { id: 'activity-of-someone-else', viewerId: 'user-1' },
+      include: expect.any(Object),
+    });
+  });
+
+  it('unblockUser maps a missing block (P2025) to a 404', async () => {
+    prisma.block.delete.mockRejectedValueOnce({ code: 'P2025' });
+
+    await expect(service.unblockUser('user-1', 'user-2')).rejects.toThrow(
+      NotFoundException,
+    );
   });
 });

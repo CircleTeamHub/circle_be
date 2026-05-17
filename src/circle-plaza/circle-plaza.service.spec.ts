@@ -1,5 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CirclePlazaService } from './circle-plaza.service';
 
@@ -36,6 +37,7 @@ describe('CirclePlazaService', () => {
       providers: [
         CirclePlazaService,
         { provide: PrismaService, useValue: prisma },
+        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
       ],
     }).compile();
 
@@ -58,5 +60,29 @@ describe('CirclePlazaService', () => {
         noteId: 'note-1',
       }),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  it('rejects a post with off-origin images when MinIO is configured', async () => {
+    const guarded = new CirclePlazaService(
+      prisma as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      status: 'ACTIVE',
+      role: 'MEMBER',
+      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+    });
+
+    await expect(
+      guarded.createPost('user-1', {
+        circleId: 'circle-1',
+        content: 'hello plaza',
+        images: ['https://evil.example.com/track.gif'],
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 });

@@ -117,12 +117,16 @@ export class AuthService {
       where: { accountId: dto.accountId },
     });
 
-    if (!user) {
+    // Use the same error for "no such user" and "inactive user" so the
+    // endpoint cannot be used as an account-enumeration oracle. The actual
+    // reason is logged server-side for ops debugging.
+    if (!user || user.status !== 'ACTIVE') {
+      if (user && user.status !== 'ACTIVE') {
+        this.logger.warn(
+          `Login attempt for non-active account ${user.id} (status=${user.status})`,
+        );
+      }
       throw new ForbiddenException('Invalid credentials');
-    }
-
-    if (user.status !== 'ACTIVE') {
-      throw new ForbiddenException('Account is not active');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
@@ -169,6 +173,17 @@ export class AuthService {
       throw new NotFoundException('User not found');
     }
 
+    // Banned/deleted users must not be able to keep refreshing tokens just
+    // because they still hold a valid refresh token. Revoke their sessions
+    // and reject the rotation result.
+    if (user.status !== 'ACTIVE') {
+      this.logger.warn(
+        `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
+      );
+      await this.refreshTokenService.revokeAll(user.id);
+      throw new ForbiddenException('Account is not active');
+    }
+
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
@@ -208,21 +223,19 @@ export class AuthService {
       throw new NotFoundException('User not found');
     }
 
-    // Update lastOnline and return in one round-trip. Fall back to the already-fetched
-    // user (with a synthetic lastOnline) so a transient DB error never breaks the me endpoint.
+    // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
+    // and never produces a fabricated "success" response. The returned shape
+    // shows the optimistic timestamp; persistence is best-effort.
     const now = new Date();
-    return this.prisma.user
-      .update({
-        where: { id: userId },
-        data: { lastOnline: now },
-        select: ME_SELECT,
-      })
-      .catch((err) => {
+    this.prisma.user
+      .update({ where: { id: userId }, data: { lastOnline: now } })
+      .catch((err) =>
         this.logger.warn(
           `lastOnline update failed for ${userId}: ${err?.message}`,
-        );
-        return { ...user, lastOnline: now };
-      });
+        ),
+      );
+
+    return { ...user, lastOnline: now };
   }
 
   async changePassword(

@@ -9,6 +9,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   MaxLength,
 } from 'class-validator';
 
@@ -40,14 +41,9 @@ export class SendFriendRequestDto {
   @IsOptional()
   @IsArray()
   @ArrayUnique()
+  @ArrayMaxSize(20)
   @IsUUID('4', { each: true })
   tagIds?: string[];
-}
-
-export class HandleFriendRequestDto {
-  @ApiProperty({ enum: ['ACCEPTED', 'REJECTED'] })
-  @IsEnum(['ACCEPTED', 'REJECTED'])
-  decision: 'ACCEPTED' | 'REJECTED';
 }
 
 export class BlockUserDto {
@@ -92,6 +88,12 @@ export class ReportFriendDto {
   @ArrayUnique()
   @IsString({ each: true })
   @MaxLength(500, { each: true })
+  // Evidence is surfaced to moderators; reject angle brackets so a report
+  // cannot smuggle HTML/script markup into an admin console.
+  @Matches(/^[^<>]+$/, {
+    each: true,
+    message: 'evidence entries contain invalid characters',
+  })
   evidence?: string[];
 }
 
@@ -188,6 +190,7 @@ export class SetRemarkDto {
 export class CreateFriendTagDto {
   @ApiProperty({ example: '高中同学' })
   @IsString()
+  @IsNotEmpty()
   @MaxLength(30)
   name: string;
 

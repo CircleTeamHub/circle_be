@@ -105,7 +105,7 @@ export class CreateCircleDto {
   @IsOptional()
   joinFancyRestriction?: boolean;
 
-  @ApiPropertyOptional({ default: 500 })
+  @ApiPropertyOptional({ description: 'Max members; omit for no limit.' })
   @Type(() => Number)
   @IsInt()
   @Min(10)
@@ -117,6 +117,15 @@ export class CreateCircleDto {
   @IsBoolean()
   @IsOptional()
   memberCanPost?: boolean;
+
+  @ApiPropertyOptional({
+    default: true,
+    description:
+      'Public circles auto-admit on join; private circles require the invitation flow.',
+  })
+  @IsBoolean()
+  @IsOptional()
+  isPublic?: boolean;
 }
 
 export class ListCirclesQueryDto {

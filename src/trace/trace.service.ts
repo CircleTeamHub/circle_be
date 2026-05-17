@@ -4,7 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { assertUrlsFromStorage } from 'src/utils/storage-url';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   CreateTraceCommentDto,
   CreateTraceDto,
@@ -18,7 +21,14 @@ const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
 
 @Injectable()
 export class TraceService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly minioPublicUrl: string | null;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {
+    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
 
   // ─── Feed ──────────────────────────────────────────────────────────────────
 
@@ -81,8 +91,21 @@ export class TraceService {
 
     const friendIdSet = new Set(friendIds);
 
+    // Resolve the viewer's own like state from an authoritative query rather
+    // than the truncated `likeStats` preview — a like outside the top-20 would
+    // otherwise make `isLikedByMe` wrong.
+    const myLikes = await this.prisma.traceLikeStat.findMany({
+      where: {
+        userID: userId,
+        deleted: false,
+        traceID: { in: traces.map((trace) => trace.id) },
+      },
+      select: { traceID: true },
+    });
+    const likedTraceIds = new Set(myLikes.map((like) => like.traceID));
+
     const items = traces.map((trace) =>
-      this.toTraceDto(trace, userId, friendIdSet),
+      this.toTraceDto(trace, userId, friendIdSet, likedTraceIds),
     );
 
     return {
@@ -120,6 +143,8 @@ export class TraceService {
   // ─── Create / Delete ───────────────────────────────────────────────────────
 
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
+    assertUrlsFromStorage(dto.images ?? [], this.minioPublicUrl, 'trace image');
+
     const trace = await this.prisma.trace.create({
       data: {
         content: dto.content,
@@ -160,8 +185,9 @@ export class TraceService {
     if (trace.fromID !== userId) {
       throw new ForbiddenException('Only the author can delete');
     }
+    // Include fromID + deleted in the write to close the TOCTOU window.
     await this.prisma.trace.update({
-      where: { id: traceId },
+      where: { id: traceId, fromID: userId, deleted: false },
       data: { deleted: true },
     });
   }
@@ -172,41 +198,44 @@ export class TraceService {
     userId: string,
     traceId: string,
   ): Promise<{ liked: boolean; likeCount: number }> {
-    const trace = await this.requireVisibleTrace(traceId, userId);
+    await this.requireVisibleTrace(traceId, userId);
 
-    const existing = await this.prisma.traceLikeStat.findFirst({
-      where: { traceID: traceId, userID: userId },
-    });
+    // The read-decide-write must be one atomic unit: a plain check-then-write
+    // let two concurrent toggles both increment likeCount. Serializable +
+    // retry serializes them, and the like row's own lookup happens inside.
+    return runSerializableTransaction(this.prisma, async (tx) => {
+      const existing = await tx.traceLikeStat.findUnique({
+        where: { traceID_userID: { traceID: traceId, userID: userId } },
+      });
 
-    if (existing) {
-      const nowLiked = existing.deleted;
-      await this.prisma.$transaction([
-        this.prisma.traceLikeStat.update({
+      let liked: boolean;
+      let delta: number;
+
+      if (existing) {
+        // `deleted` is the soft-unlike flag — currently-deleted means a
+        // toggle now *likes* it.
+        liked = existing.deleted;
+        delta = liked ? 1 : -1;
+        await tx.traceLikeStat.update({
           where: { id: existing.id },
-          data: { deleted: !nowLiked },
-        }),
-        this.prisma.trace.update({
-          where: { id: traceId },
-          data: { likeCount: { increment: nowLiked ? 1 : -1 } },
-        }),
-      ]);
-      return {
-        liked: nowLiked,
-        likeCount: trace.likeCount + (nowLiked ? 1 : -1),
-      };
-    }
+          data: { deleted: !liked },
+        });
+      } else {
+        liked = true;
+        delta = 1;
+        await tx.traceLikeStat.create({
+          data: { traceID: traceId, userID: userId },
+        });
+      }
 
-    await this.prisma.$transaction([
-      this.prisma.traceLikeStat.create({
-        data: { traceID: traceId, userID: userId },
-      }),
-      this.prisma.trace.update({
+      const updated = await tx.trace.update({
         where: { id: traceId },
-        data: { likeCount: { increment: 1 } },
-      }),
-    ]);
+        data: { likeCount: { increment: delta } },
+        select: { likeCount: true },
+      });
 
-    return { liked: true, likeCount: trace.likeCount + 1 };
+      return { liked, likeCount: updated.likeCount };
+    });
   }
 
   // ─── Comment ───────────────────────────────────────────────────────────────
@@ -330,6 +359,7 @@ export class TraceService {
     trace: any,
     viewerId: string,
     friendIdSet: Set<string>,
+    likedTraceIds: Set<string>,
   ): TraceDto {
     // Filter likes and comments to only show mutual friends (WeChat Moments logic)
     const mutualLikes = trace.likeStats
@@ -365,9 +395,8 @@ export class TraceService {
         }),
       );
 
-    const isLikedByMe = trace.likeStats.some(
-      (ls: any) => ls.userID === viewerId && !ls.deleted,
-    );
+    // Authoritative — not derived from the truncated likeStats preview.
+    const isLikedByMe = likedTraceIds.has(trace.id);
 
     return {
       id: trace.id,

@@ -1,7 +1,9 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Post,
@@ -10,12 +12,14 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
+  ApiHeader,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
 import { CoinTransactionDto, SendGiftDto, WalletDto } from './dto/coin.dto';
 
@@ -29,26 +33,40 @@ export class CoinController {
   @Get('wallet')
   @ApiOperation({ summary: 'Get my wallet balance' })
   @ApiOkResponse({ type: WalletDto })
-  getWallet(@Req() req: any): Promise<WalletDto> {
+  getWallet(@Req() req: RequestWithUser): Promise<WalletDto> {
     return this.coinService.getWallet(req.user.userId);
   }
 
   @Get('transactions')
   @ApiOperation({ summary: 'My coin transaction history (last 50)' })
   @ApiOkResponse({ type: [CoinTransactionDto] })
-  getTransactions(@Req() req: any): Promise<CoinTransactionDto[]> {
+  getTransactions(@Req() req: RequestWithUser): Promise<CoinTransactionDto[]> {
     return this.coinService.getTransactions(req.user.userId);
   }
 
   @Post('gift')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Send coins to a friend' })
+  @ApiHeader({
+    name: 'idempotency-key',
+    required: true,
+    description:
+      'Unique per gift attempt. A retry with the same key is a no-op — it does not double-charge.',
+  })
   @ApiNoContentResponse()
-  sendGift(@Body() dto: SendGiftDto, @Req() req: any): Promise<void> {
+  sendGift(
+    @Body() dto: SendGiftDto,
+    @Headers('idempotency-key') idempotencyKey: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    if (!idempotencyKey || idempotencyKey.trim().length === 0) {
+      throw new BadRequestException('idempotency-key header is required');
+    }
     return this.coinService.sendGift(
       req.user.userId,
       dto.recipientId,
       dto.amount,
+      idempotencyKey.trim(),
       dto.message,
     );
   }
