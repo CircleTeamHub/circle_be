@@ -25,13 +25,6 @@ export class SendGiftDto {
   message?: string;
 }
 
-export class RechargeDto {
-  @ApiProperty({ example: 100, description: 'Number of points to recharge' })
-  @IsInt()
-  @Min(1)
-  amount: number;
-}
-
 export class WalletDto {
   @ApiProperty() id: string;
   @ApiProperty() userID: string;

@@ -50,38 +50,6 @@ export class CoinService {
     });
   }
 
-  async recharge(
-    userId: string,
-    amount: number,
-    note = '用户积分充值',
-  ): Promise<WalletDto> {
-    if (amount <= 0) throw new BadRequestException('Amount must be positive');
-
-    const wallet = await this.prisma.$transaction(async (tx) => {
-      const wallet = await tx.wallet.upsert({
-        where: { userID: userId },
-        update: { balance: { increment: amount } },
-        create: { userID: userId, balance: amount },
-      });
-
-      await tx.coinTransaction.create({
-        data: {
-          userID: userId,
-          type: 'RECHARGE',
-          amount,
-          balance: wallet.balance,
-          note,
-        },
-      });
-
-      return wallet;
-    });
-
-    await this.notifyRecharge(userId, amount);
-
-    return wallet;
-  }
-
   // ─── Gift ─────────────────────────────────────────────────────────────────────
 
   async sendGift(

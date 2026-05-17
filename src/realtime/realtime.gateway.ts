@@ -2,7 +2,6 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import type { Server } from 'http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import type { IncomingMessage } from 'http';
 import { RealtimeService } from './realtime.service';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -16,6 +15,7 @@ type AuthMessage = {
 
 type JwtPayload = {
   sub?: unknown;
+  accountId?: unknown;
   exp?: unknown;
 };
 
@@ -26,7 +26,10 @@ export class RealtimeGateway implements OnModuleDestroy {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private readonly userBySocket = new WeakMap<WebSocket, string>();
   private readonly alive = new WeakSet<WebSocket>();
-  private readonly expiryTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
+  private readonly expiryTimers = new WeakMap<
+    WebSocket,
+    ReturnType<typeof setTimeout>
+  >();
 
   constructor(
     private readonly jwtService: JwtService,
@@ -41,10 +44,13 @@ export class RealtimeGateway implements OnModuleDestroy {
     this.server = new WebSocketServer({
       server: httpServer,
       path: '/realtime',
+      // Clients only ever send a small `{ type: "auth", token }` frame; cap
+      // the payload so an oversized frame cannot exhaust memory pre-auth.
+      maxPayload: 16 * 1024,
     });
 
-    this.server.on('connection', (socket, request) => {
-      void this.handleConnection(socket, request);
+    this.server.on('connection', (socket) => {
+      void this.handleConnection(socket);
     });
 
     this.heartbeatTimer = setInterval(() => {
@@ -68,25 +74,16 @@ export class RealtimeGateway implements OnModuleDestroy {
     this.server = null;
   }
 
-  private async handleConnection(socket: WebSocket, request: IncomingMessage) {
+  private async handleConnection(socket: WebSocket) {
     this.alive.add(socket);
 
     socket.on('pong', () => {
       this.alive.add(socket);
     });
 
-    // Legacy URL-based auth (kept for backward compatibility — will be removed
-    // once all clients are migrated to message-based auth).
-    const legacyAuth = this.authenticateFromUrl(request);
-    if (legacyAuth) {
-      this.logger.warn(
-        `Realtime client used deprecated URL-token auth for user ${legacyAuth.userId}`,
-      );
-      await this.acceptAuthenticatedSocket(socket, legacyAuth.userId, legacyAuth.expMs);
-      return;
-    }
-
-    // Message-based auth: client must send `{ type: "auth", token }` within window.
+    // Message-based auth only: client must send `{ type: "auth", token }`
+    // within the auth window. URL-token auth was removed because a JWT placed
+    // in the upgrade URL leaks into proxy/access logs and `Referer` headers.
     const authTimeout = setTimeout(() => {
       socket.close(1008, 'Auth timeout');
     }, AUTH_TIMEOUT_MS);
@@ -106,13 +103,15 @@ export class RealtimeGateway implements OnModuleDestroy {
         return;
       }
 
-      void this.acceptAuthenticatedSocket(socket, verified.userId, verified.expMs);
+      void this.acceptAuthenticatedSocket(
+        socket,
+        verified.userId,
+        verified.expMs,
+      );
     });
 
     socket.on('error', (error) => {
-      this.logger.warn(
-        `Realtime socket error (pre-auth): ${error.message}`,
-      );
+      this.logger.warn(`Realtime socket error (pre-auth): ${error.message}`);
     });
 
     socket.on('close', () => {
@@ -190,23 +189,17 @@ export class RealtimeGateway implements OnModuleDestroy {
     }
   }
 
-  private authenticateFromUrl(
-    request: IncomingMessage,
-  ): { userId: string; expMs: number | null } | null {
-    const url = new URL(request.url ?? '/', 'ws://localhost');
-    const token = url.searchParams.get('token');
-    if (!token) return null;
-    return this.verifyToken(token);
-  }
-
   private verifyToken(
     token: string,
   ): { userId: string; expMs: number | null } | null {
     try {
       const payload = this.jwtService.verify<JwtPayload>(token);
+      // Only an access token is accepted: it always carries both `sub` and
+      // `accountId`. Refresh tokens are opaque random strings (not JWTs), so
+      // they cannot reach here — this also rejects any other token shape.
       if (typeof payload?.sub !== 'string') return null;
-      const expMs =
-        typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+      if (typeof payload?.accountId !== 'string') return null;
+      const expMs = typeof payload.exp === 'number' ? payload.exp * 1000 : null;
       return { userId: payload.sub, expMs };
     } catch {
       return null;

@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Expose, Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
   ArrayUnique,
   IsArray,
   IsBoolean,
@@ -31,7 +32,10 @@ export class ConversationGroupDto {
   @Expose()
   pinnedToTabs: boolean;
 
-  @ApiProperty({ type: [String], description: 'OpenIM conversationIDs that belong to this group.' })
+  @ApiProperty({
+    type: [String],
+    description: 'OpenIM conversationIDs that belong to this group.',
+  })
   @Expose()
   conversationIDs: string[];
 
@@ -57,7 +61,8 @@ export class CreateConversationGroupDto {
   pinnedToTabs?: boolean;
 
   @ApiPropertyOptional({
-    description: 'Initial sortOrder; defaults to 0. Reserved for v2 drag-reorder.',
+    description:
+      'Initial sortOrder; defaults to 0. Reserved for v2 drag-reorder.',
   })
   @IsOptional()
   @IsInt()
@@ -90,7 +95,10 @@ export class SetConversationGroupMembersDto {
       'Authoritative list of conversationIDs this group should contain. Server replaces existing membership with exactly this set.',
   })
   @IsArray()
+  @ArrayMaxSize(500)
   @IsString({ each: true })
+  @MinLength(1, { each: true })
+  @MaxLength(128, { each: true })
   @ArrayUnique()
   @Type(() => String)
   conversationIDs: string[];

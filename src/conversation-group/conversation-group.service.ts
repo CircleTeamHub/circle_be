@@ -26,9 +26,7 @@ export class ConversationGroupService {
       name: group.name,
       sortOrder: group.sortOrder,
       pinnedToTabs: group.pinnedToTabs,
-      conversationIDs: group.memberships
-        .map((m) => m.conversationID)
-        .sort(), // stable order so clients can diff cheaply
+      conversationIDs: group.memberships.map((m) => m.conversationID).sort(), // stable order so clients can diff cheaply
       createdAt: group.createdAt.toISOString(),
       updatedAt: group.updatedAt.toISOString(),
     };
@@ -115,19 +113,17 @@ export class ConversationGroupService {
     id: string,
     dto: SetConversationGroupMembersDto,
   ): Promise<ConversationGroupDto> {
-    await this.ensureOwnership(ownerID, id);
-
     // Dedupe + 过滤空串（客户端再保险一次）
     const target = Array.from(
       new Set(
-        dto.conversationIDs
-          .map((c) => c.trim())
-          .filter((c) => c.length > 0),
+        dto.conversationIDs.map((c) => c.trim()).filter((c) => c.length > 0),
       ),
     );
 
-    // 一个事务：先清空旧成员，再写入新成员；保证最终 membership === target
+    // 一个事务：在事务内重新校验拥有权（防 TOCTOU / 并发 remove），
+    // 再清空旧成员、写入新成员；保证最终 membership === target。
     const result = await this.prisma.$transaction(async (tx) => {
+      await this.ensureOwnership(ownerID, id, tx);
       await tx.conversationGroupMembership.deleteMany({
         where: { groupID: id },
       });
@@ -149,8 +145,12 @@ export class ConversationGroupService {
     return this.toDto(result);
   }
 
-  private async ensureOwnership(ownerID: string, id: string): Promise<void> {
-    const group = await this.prisma.conversationGroup.findUnique({
+  private async ensureOwnership(
+    ownerID: string,
+    id: string,
+    client: Prisma.TransactionClient | PrismaService = this.prisma,
+  ): Promise<void> {
+    const group = await client.conversationGroup.findUnique({
       where: { id },
       select: { ownerID: true },
     });

@@ -83,6 +83,17 @@ const traceWriteLimiterOptions = {
   message: { message: 'Too many moment operations, please try again later.' },
 } satisfies Partial<RateLimitOptions>;
 
+/** Conversation-group writes: 60 mutating requests / 15 min per IP. */
+const conversationGroupWriteLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message: 'Too many conversation group operations, please try again later.',
+  },
+} satisfies Partial<RateLimitOptions>;
+
 export const setupApp = (app: INestApplication) => {
   const config = getServerConfig();
   const loggingConfig = createLoggingConfig(
@@ -113,7 +124,10 @@ export const setupApp = (app: INestApplication) => {
         : {}),
     } satisfies Partial<RateLimitOptions>);
   const authLimiter = createLimiter('auth_login', authLimiterOptions);
-  const authRegisterLimiter = createLimiter('auth_register', authLimiterOptions);
+  const authRegisterLimiter = createLimiter(
+    'auth_register',
+    authLimiterOptions,
+  );
   const authChangePasswordLimiter = createLimiter(
     'auth_change_password',
     authLimiterOptions,
@@ -137,7 +151,14 @@ export const setupApp = (app: INestApplication) => {
     'circle_plaza_write',
     circleWriteLimiterOptions,
   );
-  const traceWriteLimiter = createLimiter('trace_write', traceWriteLimiterOptions);
+  const traceWriteLimiter = createLimiter(
+    'trace_write',
+    traceWriteLimiterOptions,
+  );
+  const conversationGroupWriteLimiter = createLimiter(
+    'conversation_group_write',
+    conversationGroupWriteLimiterOptions,
+  );
   const friendReportLimiter = createLimiter(
     'friend_report',
     friendReportLimiterOptions,
@@ -218,6 +239,12 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/trace', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
       return traceWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/conversation-groups', (req: any, res: any, next: any) => {
+    if (req.method !== 'GET') {
+      return conversationGroupWriteLimiter(req, res, next);
     }
     next();
   });

@@ -17,12 +17,7 @@ import {
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CoinService } from './coin.service';
-import {
-  CoinTransactionDto,
-  RechargeDto,
-  SendGiftDto,
-  WalletDto,
-} from './dto/coin.dto';
+import { CoinTransactionDto, SendGiftDto, WalletDto } from './dto/coin.dto';
 
 @ApiTags('Coin')
 @ApiBearerAuth()
@@ -43,13 +38,6 @@ export class CoinController {
   @ApiOkResponse({ type: [CoinTransactionDto] })
   getTransactions(@Req() req: any): Promise<CoinTransactionDto[]> {
     return this.coinService.getTransactions(req.user.userId);
-  }
-
-  @Post('recharge')
-  @ApiOperation({ summary: 'Recharge points into my wallet' })
-  @ApiOkResponse({ type: WalletDto })
-  recharge(@Body() dto: RechargeDto, @Req() req: any): Promise<WalletDto> {
-    return this.coinService.recharge(req.user.userId, dto.amount);
   }
 
   @Post('gift')

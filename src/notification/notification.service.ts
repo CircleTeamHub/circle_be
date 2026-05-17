@@ -133,7 +133,9 @@ export class NotificationService {
       );
     }
 
-    await Promise.all(notifications);
+    // Atomic: either both notifications land or neither does — a partial
+    // failure must not leave one orphaned notification behind.
+    await this.prisma.$transaction(notifications);
     return [...notifiedUserIds];
   }
 }
