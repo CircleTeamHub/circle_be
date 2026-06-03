@@ -252,6 +252,7 @@ model User {
   helloWords                 String?
   birthday                   DateTime?
   city                       String?
+  region                     String?
   gender                     Gender     @default(unset)
   role                       UserRole   @default(USER)
   status                     UserStatus @default(ACTIVE)

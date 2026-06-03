@@ -64,6 +64,10 @@ export class PublicUserDto {
   @Expose()
   city: string | null;
 
+  @ApiPropertyOptional({ example: '上海' })
+  @Expose()
+  region: string | null;
+
   @ApiProperty({ example: 'USER', enum: ['USER', 'ADMIN'] })
   @Expose()
   role: string;
