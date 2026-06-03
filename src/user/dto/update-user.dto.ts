@@ -93,4 +93,10 @@ export class UpdateUserDto {
   @IsString()
   @MaxLength(100)
   city?: string;
+
+  @ApiPropertyOptional({ example: '上海' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  region?: string;
 }

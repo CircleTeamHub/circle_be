@@ -35,6 +35,7 @@ const ME_SELECT = {
   birthday: true,
   gender: true,
   city: true,
+  region: true,
   vipLevel: true,
   creditScore: true,
   role: true,
@@ -61,6 +62,7 @@ export type SafeUser = {
   birthday: Date | null;
   gender: string;
   city: string | null;
+  region: string | null;
   vipLevel: number;
   creditScore: number;
   role: string;

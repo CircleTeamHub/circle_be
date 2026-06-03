@@ -40,6 +40,7 @@ export interface UpdateUserInput {
   birthday?: string | null;
   gender?: Gender;
   city?: string | null;
+  region?: string | null;
 }
 
 const PUBLIC_SELECT = {
@@ -59,6 +60,7 @@ const PUBLIC_SELECT = {
   birthday: true,
   gender: true,
   city: true,
+  region: true,
   role: true,
   status: true,
   lastOnline: true,
