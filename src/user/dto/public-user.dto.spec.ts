@@ -57,4 +57,25 @@ describe('SelfUserDto serialization', () => {
       }),
     ]);
   });
+
+  it('exposes region (inherited from PublicUserDto) and strips unknown/sensitive fields', () => {
+    const dto = plainToInstance(
+      SelfUserDto,
+      {
+        id: 'user-1',
+        city: '杭州',
+        region: '上海',
+        // Sensitive columns that must never leak through the response DTO.
+        passwordHash: 'argon2-hash',
+        openimSynced: true,
+      } as Record<string, unknown>,
+      { excludeExtraneousValues: true },
+    );
+
+    const leaked = dto as unknown as Record<string, unknown>;
+    expect(dto.region).toBe('上海');
+    expect(dto.city).toBe('杭州');
+    expect(leaked.passwordHash).toBeUndefined();
+    expect(leaked.openimSynced).toBeUndefined();
+  });
 });

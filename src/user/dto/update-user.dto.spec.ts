@@ -57,4 +57,21 @@ describe('UpdateUserDto', () => {
     const errors = build({});
     expect(errors).toHaveLength(0);
   });
+
+  it('accepts a valid region', () => {
+    const errors = build({ region: '上海' });
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects overlong region', () => {
+    const errors = build({ region: 'x'.repeat(101) });
+    const target = errors.find((e) => e.property === 'region');
+    expect(target?.constraints).toHaveProperty('maxLength');
+  });
+
+  it('rejects non-string region', () => {
+    const errors = build({ region: 123 });
+    const target = errors.find((e) => e.property === 'region');
+    expect(target?.constraints).toHaveProperty('isString');
+  });
 });

@@ -125,4 +125,29 @@ describe('UserService.update normalization', () => {
       }),
     );
   });
+
+  it('persists region updates through to prisma', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+    );
+
+    await service.update('user-1', {
+      region: '上海',
+      city: '杭州',
+    } as any);
+
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          region: '上海',
+          city: '杭州',
+        }),
+      }),
+    );
+  });
 });
