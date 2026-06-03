@@ -1,5 +1,5 @@
 import { plainToInstance } from 'class-transformer';
-import { SelfUserDto } from './public-user.dto';
+import { PublicUserDto, SelfUserDto } from './public-user.dto';
 
 describe('SelfUserDto serialization', () => {
   it('keeps nested display icon fields when excludeExtraneousValues is enabled', () => {
@@ -77,5 +77,34 @@ describe('SelfUserDto serialization', () => {
     expect(dto.city).toBe('杭州');
     expect(leaked.passwordHash).toBeUndefined();
     expect(leaked.openimSynced).toBeUndefined();
+  });
+});
+
+describe('PublicUserDto serialization (other-user view)', () => {
+  it('exposes region and city publicly, but never leaks PII or secrets', () => {
+    const dto = plainToInstance(
+      PublicUserDto,
+      {
+        id: 'user-1',
+        accountId: 'jimmy',
+        nickname: 'meiguici',
+        city: '杭州',
+        region: '上海',
+        // None of these may appear in the public (other-user) view.
+        email: 'secret@example.com',
+        phoneNumber: '+8613800138000',
+        passwordHash: 'argon2-hash',
+      } as Record<string, unknown>,
+      { excludeExtraneousValues: true },
+    );
+
+    const view = dto as unknown as Record<string, unknown>;
+    // region/city are intentionally public — same visibility as city (product decision).
+    expect(view.region).toBe('上海');
+    expect(view.city).toBe('杭州');
+    // PublicUserDto is the "no PII" view; PII and secrets must stay out.
+    expect(view.email).toBeUndefined();
+    expect(view.phoneNumber).toBeUndefined();
+    expect(view.passwordHash).toBeUndefined();
   });
 });
