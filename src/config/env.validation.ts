@@ -61,5 +61,12 @@ export function createEnvValidationSchema(
       then: Joi.string().required(),
       otherwise: Joi.string().optional(),
     }),
+    // Share-link JWT signing secret for temp chat. Required in production so a
+    // misconfigured deploy fails fast at boot instead of at the first link request.
+    TEMP_CHAT_LINK_SECRET: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: Joi.string().min(32).required(),
+      otherwise: Joi.string().min(8).optional(),
+    }),
   }).unknown(true);
 }

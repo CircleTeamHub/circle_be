@@ -121,27 +121,29 @@ export class TempChatService {
     ).slice(0, 20);
     const guestImId = newGuestId();
 
-    const room = await this.prisma.tempChat.findUnique({ where: { id: tcId } });
-    if (
-      !room ||
-      room.status !== 'ACTIVE' ||
-      room.expiresAt.getTime() <= Date.now()
-    ) {
-      throw new GoneException('临时聊天已结束');
-    }
-
-    // 原子占座：Serializable 事务内复查人数后建 guest 行，防并发超员。
-    const guest = await this.prisma.$transaction(
+    // 原子占座：Serializable 事务内复查房间状态 + 人数后再建 guest 行。
+    // 既防并发超员，也关上「访客加入与房间销毁(teardown)同时发生」的竞态窗口
+    // —— 房间状态在事务内复核，销毁后不可能再占到座。
+    const { guest, room } = await this.prisma.$transaction(
       async (tx) => {
+        const room = await tx.tempChat.findUnique({ where: { id: tcId } });
+        if (
+          !room ||
+          room.status !== 'ACTIVE' ||
+          room.expiresAt.getTime() <= Date.now()
+        ) {
+          throw new GoneException('临时聊天已结束');
+        }
         const count = await tx.tempChatGuest.count({
           where: { tempChatId: tcId },
         });
         if (count >= room.maxMembers) {
           throw new ConflictException('人数已满');
         }
-        return tx.tempChatGuest.create({
+        const guest = await tx.tempChatGuest.create({
           data: { tempChatId: tcId, imUserId: guestImId, displayName },
         });
+        return { guest, room };
       },
       { isolationLevel: 'Serializable' },
     );
