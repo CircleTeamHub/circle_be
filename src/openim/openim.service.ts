@@ -175,6 +175,37 @@ export class OpenimService implements OnModuleInit {
     );
   }
 
+  /**
+   * 解散群。解散后群消息对客户端不再可见，等价于「销毁即清」。
+   * 路径已核实：/group/dismiss_group（admin token）。
+   */
+  async dismissGroup(groupID: string): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/group/dismiss_group',
+      { groupID, deleteMember: true },
+      adminToken,
+    );
+  }
+
+  /**
+   * 强制某用户在指定端下线（清理访客会话）。
+   * ⚠️ 路径按部署的 OpenIM 版本确认；调用方需容忍其失败（best-effort）。
+   * platformID: 5 = Web
+   */
+  async forceLogout(userID: string, platformID = 5): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/auth/force_logout',
+      { userID: OpenimService.toImUserId(userID), platformID },
+      adminToken,
+    );
+  }
+
   // ─── HTTP helper ─────────────────────────────────────────────────────────────
 
   private async post<T = void>(
