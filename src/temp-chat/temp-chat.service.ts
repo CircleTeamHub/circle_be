@@ -1,10 +1,18 @@
-import { GoneException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  GoneException,
+  Injectable,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { LinkTokenService } from './link-token.service';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
-import { newGroupId } from './temp-chat.ids';
+import { JoinTempChatDto } from './dto/join-temp-chat.dto';
+import { newGroupId, newGuestId } from './temp-chat.ids';
 
 export interface CreateTempChatResult {
   id: string;
@@ -93,5 +101,106 @@ export class TempChatService {
       expiresAt: room.expiresAt.toISOString(),
       full: memberCount >= room.maxMembers,
     };
+  }
+
+  async join(
+    token: string,
+    dto: JoinTempChatDto,
+  ): Promise<{
+    imUserId: string;
+    imToken: string;
+    groupId: string;
+    wsUrl: string;
+    apiUrl: string;
+    displayName: string;
+  }> {
+    const { tcId } = this.linkToken.verify(token);
+    const displayName = (
+      dto.displayName?.trim() ||
+      `访客${Math.floor(1000 + Math.random() * 9000)}`
+    ).slice(0, 20);
+    const guestImId = newGuestId();
+
+    const room = await this.prisma.tempChat.findUnique({ where: { id: tcId } });
+    if (
+      !room ||
+      room.status !== 'ACTIVE' ||
+      room.expiresAt.getTime() <= Date.now()
+    ) {
+      throw new GoneException('临时聊天已结束');
+    }
+
+    // 原子占座：Serializable 事务内复查人数后建 guest 行，防并发超员。
+    const guest = await this.prisma.$transaction(
+      async (tx) => {
+        const count = await tx.tempChatGuest.count({
+          where: { tempChatId: tcId },
+        });
+        if (count >= room.maxMembers) {
+          throw new ConflictException('人数已满');
+        }
+        return tx.tempChatGuest.create({
+          data: { tempChatId: tcId, imUserId: guestImId, displayName },
+        });
+      },
+      { isolationLevel: 'Serializable' },
+    );
+
+    try {
+      await this.openim.registerUser(guestImId, displayName);
+      await this.openim.addGroupMembers(room.groupId, [guestImId]);
+      const imToken = await this.openim.getUserToken(guestImId, 5);
+      return {
+        imUserId: guestImId,
+        imToken,
+        groupId: room.groupId,
+        wsUrl: this.config.get<string>('OPENIM_IM_WS_URL', ''),
+        apiUrl: this.config.get<string>('OPENIM_IM_API_URL', ''),
+        displayName,
+      };
+    } catch (err) {
+      // 补偿：OpenIM 任一步失败，释放座位，让访客可重试。
+      await this.prisma.tempChatGuest
+        .delete({ where: { id: guest.id } })
+        .catch(() => undefined);
+      throw new ServiceUnavailableException('加入失败，请重试');
+    }
+  }
+
+  async end(hostUserId: string, id: string): Promise<{ status: string }> {
+    const room = await this.prisma.tempChat.findUniqueOrThrow({
+      where: { id },
+    });
+    if (room.hostUserId !== hostUserId) {
+      throw new ForbiddenException('只有创建者可以结束');
+    }
+    if (room.status !== 'ACTIVE') {
+      return { status: room.status };
+    }
+    await this.teardown(room, TempChatStatus.ENDED);
+    return { status: TempChatStatus.ENDED };
+  }
+
+  /** 解散群 + 强制访客下线 + 落库状态。幂等：仅对 ACTIVE 房调用。 */
+  async teardown(
+    room: { id: string; groupId: string },
+    status: TempChatStatus,
+  ): Promise<void> {
+    await this.openim.dismissGroup(room.groupId).catch(() => undefined);
+    const guests = await this.prisma.tempChatGuest.findMany({
+      where: { tempChatId: room.id, cleanedUp: false },
+      select: { imUserId: true },
+    });
+    for (const g of guests) {
+      await this.openim.forceLogout(g.imUserId).catch(() => undefined);
+    }
+    await this.prisma.tempChatGuest.updateMany({
+      where: { tempChatId: room.id },
+      data: { cleanedUp: true },
+    });
+    await this.prisma.tempChat.update({
+      where: { id: room.id },
+      data: { status, endedAt: new Date() },
+    });
   }
 }
