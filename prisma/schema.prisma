@@ -1258,3 +1258,41 @@ model CircleActivity {
   @@index([viewerID, readAt])
   @@index([invitationID])
 }
+
+enum TempChatStatus {
+  ACTIVE
+  ENDED
+  EXPIRED
+}
+
+model TempChat {
+  id         String         @id @default(uuid())
+  groupId    String         @unique
+  hostUserId String
+  title      String         @default("临时聊天")
+  status     TempChatStatus @default(ACTIVE)
+  maxMembers Int            @default(50)
+  expiresAt  DateTime
+  endedAt    DateTime?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  guests TempChatGuest[]
+
+  @@index([status, expiresAt])
+  @@index([hostUserId])
+}
+
+model TempChatGuest {
+  id          String   @id @default(uuid())
+  tempChatId  String
+  imUserId    String   @unique
+  displayName String
+  createdAt   DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  cleanedUp   Boolean  @default(false)
+
+  tempChat TempChat @relation(fields: [tempChatId], references: [id], onDelete: Cascade)
+
+  @@index([tempChatId])
+}
