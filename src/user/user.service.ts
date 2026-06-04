@@ -12,6 +12,7 @@ import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
+import { USER_PROFILE_SELECT } from './user.select';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -43,30 +44,7 @@ export interface UpdateUserInput {
   region?: string | null;
 }
 
-const PUBLIC_SELECT = {
-  id: true,
-  accountId: true,
-  nickname: true,
-  avatarUrl: true,
-  avatarFrame: true,
-  cover: true,
-  email: true,
-  phoneNumber: true,
-  wechat: true,
-  qq: true,
-  whatsup: true,
-  persona: true,
-  helloWords: true,
-  birthday: true,
-  gender: true,
-  city: true,
-  region: true,
-  role: true,
-  status: true,
-  lastOnline: true,
-  createdAt: true,
-  updatedAt: true,
-} as const;
+const PUBLIC_SELECT = USER_PROFILE_SELECT;
 
 function normalizeBirthdayInput(value: string | null | undefined) {
   if (value === undefined) {
@@ -97,15 +75,43 @@ function normalizeBirthdayInput(value: string | null | undefined) {
   return parsed;
 }
 
+// Optional text fields where a blank (empty / whitespace-only) value means
+// "clear it" — persisted as null instead of an empty string. Excludes required
+// fields (nickname) and format-validated fields (email, avatar URLs) that can
+// never legitimately arrive blank.
+const BLANKABLE_TEXT_FIELDS: ReadonlySet<keyof UpdateUserInput> = new Set([
+  'phoneNumber',
+  'wechat',
+  'qq',
+  'whatsup',
+  'persona',
+  'helloWords',
+  'city',
+  'region',
+]);
+
 function normalizeUpdateInput(input: UpdateUserInput) {
-  if (!('birthday' in input)) {
-    return input;
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(input)) {
+    // birthday gets dedicated date normalization below; non-strings pass through.
+    if (key === 'birthday' || typeof value !== 'string') {
+      result[key] = value;
+      continue;
+    }
+
+    const trimmed = value.trim();
+    result[key] =
+      trimmed === '' && BLANKABLE_TEXT_FIELDS.has(key as keyof UpdateUserInput)
+        ? null
+        : trimmed;
   }
 
-  return {
-    ...input,
-    birthday: normalizeBirthdayInput(input.birthday),
-  };
+  if ('birthday' in input) {
+    result.birthday = normalizeBirthdayInput(input.birthday);
+  }
+
+  return result as UpdateUserInput;
 }
 
 @Injectable()

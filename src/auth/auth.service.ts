@@ -17,33 +17,9 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { IconService } from 'src/icon/icon.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
+import { USER_ME_SELECT } from 'src/user/user.select';
 
-const ME_SELECT = {
-  id: true,
-  accountId: true,
-  nickname: true,
-  avatarUrl: true,
-  avatarFrame: true,
-  cover: true,
-  email: true,
-  phoneNumber: true,
-  wechat: true,
-  qq: true,
-  whatsup: true,
-  persona: true,
-  helloWords: true,
-  birthday: true,
-  gender: true,
-  city: true,
-  region: true,
-  vipLevel: true,
-  creditScore: true,
-  role: true,
-  status: true,
-  lastOnline: true,
-  createdAt: true,
-  updatedAt: true,
-} as const;
+const ME_SELECT = USER_ME_SELECT;
 
 export type SafeUser = {
   id: string;

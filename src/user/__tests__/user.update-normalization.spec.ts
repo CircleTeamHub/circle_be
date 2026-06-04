@@ -150,4 +150,75 @@ describe('UserService.update normalization', () => {
       }),
     );
   });
+
+  it('trims surrounding whitespace on text fields', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+    );
+
+    await service.update('user-1', {
+      region: '  上海  ',
+      nickname: '  jimmy  ',
+    } as any);
+
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          region: '上海',
+          nickname: 'jimmy',
+        }),
+      }),
+    );
+  });
+
+  it('converts blank/whitespace-only nullable fields to null', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+    );
+
+    await service.update('user-1', {
+      city: '   ',
+      region: '',
+      persona: '  ',
+    } as any);
+
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          city: null,
+          region: null,
+          persona: null,
+        }),
+      }),
+    );
+  });
+
+  it('keeps required nickname as empty string (never nulled) when blank', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+    );
+
+    await service.update('user-1', { nickname: '   ' } as any);
+
+    expect(prisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { nickname: '' },
+      }),
+    );
+  });
 });
