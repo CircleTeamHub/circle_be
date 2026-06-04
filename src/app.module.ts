@@ -2,6 +2,11 @@ import { Logger, Module } from '@nestjs/common';
 import { UserModule } from './user/user.module';
 import { ConfigModule } from '@nestjs/config';
 import * as dotenv from 'dotenv';
+import { ScheduleModule } from '@nestjs/schedule';
+// ThrottlerModule.forRoot is registered globally so @Throttle metadata works,
+// but the ThrottlerGuard is applied per-controller (see TempChatController),
+// not via a global APP_GUARD — rate limiting stays scoped to temp-chat.
+import { ThrottlerModule } from '@nestjs/throttler';
 
 import { LogsModule } from './logs/logs.module';
 import { RolesModule } from './roles/roles.module';
@@ -23,6 +28,7 @@ import { IconModule } from './icon/icon.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { NotificationModule } from './notification/notification.module';
 import { ConversationGroupModule } from './conversation-group/conversation-group.module';
+import { TempChatModule } from './temp-chat/temp-chat.module';
 import { createEnvValidationSchema } from './config/env.validation';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
@@ -35,6 +41,8 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
       load: [() => dotenv.config({ path: '.env', quiet: true })],
       validationSchema: createEnvValidationSchema(),
     }),
+    ScheduleModule.forRoot(),
+    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
     PrismaModule,
     UserModule,
     LogsModule,
@@ -56,6 +64,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     RealtimeModule,
     NotificationModule,
     ConversationGroupModule,
+    TempChatModule,
   ],
   controllers: [],
   providers: [Logger],
