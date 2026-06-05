@@ -29,7 +29,9 @@ export class RestorableMessageDto {
   @ApiProperty() groupID!: string;
   @ApiProperty() senderNickname!: string;
   @ApiProperty() senderFaceUrl!: string;
+  @ApiProperty() senderPlatformID!: number;
   @ApiProperty() sessionType!: number;
+  @ApiProperty() msgFrom!: number;
   @ApiProperty() contentType!: number;
   @ApiProperty() status!: number;
   @ApiProperty() seq!: number;

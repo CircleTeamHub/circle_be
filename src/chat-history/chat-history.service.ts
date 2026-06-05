@@ -12,6 +12,14 @@ import {
   RestorableMessageDto,
 } from './dto/chat-history.dto';
 
+type MessageAggregationResult = {
+  stats?: Array<{
+    serverMinSeq?: unknown;
+    serverMaxSeq?: unknown;
+  }>;
+  page?: Document[];
+};
+
 @Injectable()
 export class ChatHistoryService implements OnModuleDestroy {
   private mongoClient: MongoClient | null = null;
@@ -32,38 +40,31 @@ export class ChatHistoryService implements OnModuleDestroy {
     const currentImUserID = OpenimService.toImUserId(userId);
     await this.validateConversationAccess(conversationID, currentImUserID);
     const db = await this.getMongoDb();
-    const docs = await db
+    const pageSize = Math.max(1, Math.min(200, Number(limit) || 100));
+    const [result] = (await db
       .collection('msg')
-      .find(
-        { doc_id: { $regex: `^${this.escapeRegex(conversationID)}:` } },
-        { projection: { msgs: 1 } },
+      .aggregate(
+        this.buildMessagePagePipeline(
+          conversationID,
+          currentImUserID,
+          pageSize,
+          beforeSeq,
+        ),
       )
-      .toArray();
-
-    const allMessages = docs
-      .flatMap((doc) => this.readMessageWrappers(doc))
-      .filter((wrapper) => this.isVisibleWrapper(wrapper, currentImUserID))
+      .toArray()) as MessageAggregationResult[];
+    const stats = result?.stats?.[0];
+    const pageWrappers = result?.page ?? [];
+    const hasMore = pageWrappers.length > pageSize;
+    const messages = pageWrappers
+      .slice(0, pageSize)
       .map((wrapper) => this.toRestorableMessage(wrapper))
       .filter((message) => Number.isFinite(message.seq))
       .sort((left, right) => left.seq - right.seq);
-
-    const serverMinSeq = allMessages.length > 0 ? allMessages[0].seq : null;
-    const serverMaxSeq =
-      allMessages.length > 0 ? allMessages[allMessages.length - 1].seq : null;
-    const pageSize = Math.max(1, Math.min(200, Number(limit) || 100));
-    const eligibleMessages =
-      beforeSeq == null
-        ? allMessages
-        : allMessages.filter((message) => message.seq < beforeSeq);
-    const messages = eligibleMessages
-      .slice()
-      .sort((left, right) => right.seq - left.seq)
-      .slice(0, pageSize)
-      .sort((left, right) => left.seq - right.seq);
     const nextBeforeSeq = messages.length > 0 ? messages[0].seq : null;
-    const hasMore =
-      nextBeforeSeq != null &&
-      eligibleMessages.some((message) => message.seq < nextBeforeSeq);
+    const serverMinSeq =
+      stats?.serverMinSeq == null ? null : this.toNumber(stats.serverMinSeq);
+    const serverMaxSeq =
+      stats?.serverMaxSeq == null ? null : this.toNumber(stats.serverMaxSeq);
 
     return {
       conversationID,
@@ -73,6 +74,50 @@ export class ChatHistoryService implements OnModuleDestroy {
       serverMinSeq,
       serverMaxSeq,
     };
+  }
+
+  private buildMessagePagePipeline(
+    conversationID: string,
+    currentImUserID: string,
+    pageSize: number,
+    beforeSeq?: number,
+  ): Document[] {
+    const pagePipeline: Document[] = [];
+    if (beforeSeq != null) {
+      pagePipeline.push({ $match: { 'msg.seq': { $lt: beforeSeq } } });
+    }
+    pagePipeline.push(
+      { $sort: { 'msg.seq': -1 } },
+      { $limit: pageSize + 1 },
+    );
+
+    return [
+      { $match: { doc_id: { $regex: `^${this.escapeRegex(conversationID)}:` } } },
+      { $project: { msgs: 1 } },
+      { $unwind: '$msgs' },
+      { $replaceRoot: { newRoot: '$msgs' } },
+      {
+        $match: {
+          msg: { $ne: null },
+          'msg.seq': { $exists: true },
+          del_list: { $ne: currentImUserID },
+        },
+      },
+      {
+        $facet: {
+          stats: [
+            {
+              $group: {
+                _id: null,
+                serverMaxSeq: { $max: '$msg.seq' },
+                serverMinSeq: { $min: '$msg.seq' },
+              },
+            },
+          ],
+          page: pagePipeline,
+        },
+      },
+    ];
   }
 
   private async validateConversationAccess(
@@ -115,16 +160,6 @@ export class ChatHistoryService implements OnModuleDestroy {
     }
   }
 
-  private readMessageWrappers(doc: Document): Document[] {
-    return Array.isArray(doc.msgs) ? doc.msgs : [];
-  }
-
-  private isVisibleWrapper(wrapper: Document, currentImUserID: string): boolean {
-    if (!wrapper?.msg) return false;
-    if (!Array.isArray(wrapper.del_list)) return true;
-    return !wrapper.del_list.includes(currentImUserID);
-  }
-
   private toRestorableMessage(wrapper: Document): RestorableMessageDto {
     const msg = wrapper.msg as Document;
     return {
@@ -135,7 +170,9 @@ export class ChatHistoryService implements OnModuleDestroy {
       groupID: this.toString(msg.group_id),
       senderNickname: this.toString(msg.sender_nickname),
       senderFaceUrl: this.toString(msg.sender_face_url),
+      senderPlatformID: this.toNumber(msg.sender_platform_id),
       sessionType: this.toNumber(msg.session_type),
+      msgFrom: this.toNumber(msg.msg_from),
       contentType: this.toNumber(msg.content_type),
       status: this.toNumber(msg.status),
       seq: this.toNumber(msg.seq),
