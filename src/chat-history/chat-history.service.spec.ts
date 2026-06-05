@@ -36,8 +36,15 @@ describe('ChatHistoryService', () => {
     messages?: any[];
     groupMember?: any | null;
     sequence?: { min_seq?: number; max_seq?: number } | null;
+    messageShardExists?: boolean;
+    maxShardDocs?: number;
   }) {
     const msgFind = jest.fn();
+    const msgFindOne = jest
+      .fn()
+      .mockResolvedValue(
+        options.messageShardExists ? { _id: 'shard-0' } : null,
+      );
     const msgAggregate = jest.fn((pipeline: any[]) => {
       const docIDs = pipeline.find((stage) => stage?.$match?.doc_id)?.$match
         ?.doc_id?.$in;
@@ -63,7 +70,8 @@ describe('ChatHistoryService', () => {
         .find((stage) => stage?.$match?.['msg.seq']?.$gte);
       const minSeq = minSeqStage?.$match?.['msg.seq']?.$gte;
       const limit =
-        pipeline.find((stage) => typeof stage?.$limit === 'number')?.$limit ?? 201;
+        pipeline.find((stage) => typeof stage?.$limit === 'number')?.$limit ??
+        201;
       const page = visibleMessages
         .filter(
           (wrapper) =>
@@ -77,7 +85,9 @@ describe('ChatHistoryService', () => {
         toArray: jest.fn().mockResolvedValue(page),
       };
     });
-    const groupFindOne = jest.fn().mockResolvedValue(options.groupMember ?? null);
+    const groupFindOne = jest
+      .fn()
+      .mockResolvedValue(options.groupMember ?? null);
     const allSeqs = (options.messages ?? [])
       .map((message) => Number(message?.msg?.seq))
       .filter(Number.isFinite);
@@ -92,15 +102,34 @@ describe('ChatHistoryService', () => {
       );
     const db = {
       collection: jest.fn((name: string) => {
-        if (name === 'msg') return { aggregate: msgAggregate, find: msgFind };
+        if (name === 'msg')
+          return {
+            aggregate: msgAggregate,
+            find: msgFind,
+            findOne: msgFindOne,
+          };
         if (name === 'group_member') return { findOne: groupFindOne };
         if (name === 'seq') return { findOne: seqFindOne };
         throw new Error(`unexpected collection ${name}`);
       }),
     };
-    const service = new ChatHistoryService({ get: jest.fn() } as any);
+    const configGet = jest.fn((key: string) =>
+      key === 'OPENIM_HISTORY_MAX_SHARD_DOCS' &&
+      options.maxShardDocs !== undefined
+        ? options.maxShardDocs
+        : undefined,
+    );
+    const service = new ChatHistoryService({ get: configGet } as any);
     (service as any).getMongoDb = jest.fn().mockResolvedValue(db);
-    return { service, db, msgAggregate, msgFind, groupFindOne, seqFindOne };
+    return {
+      service,
+      db,
+      msgAggregate,
+      msgFind,
+      msgFindOne,
+      groupFindOne,
+      seqFindOne,
+    };
   }
 
   function wrapper(seq: number, overrides: Record<string, unknown> = {}) {
@@ -143,7 +172,11 @@ describe('ChatHistoryService', () => {
       ),
     });
 
-    const page = await service.getMessages(currentUserId, singleConversationID, 100);
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      100,
+    );
 
     expect(page.messages.map((message) => message.clientMsgID)).toEqual([
       'client-1',
@@ -181,12 +214,19 @@ describe('ChatHistoryService', () => {
       ],
     });
 
-    const page = await service.getMessages(currentUserId, groupConversationID, 100);
+    const page = await service.getMessages(
+      currentUserId,
+      groupConversationID,
+      100,
+    );
 
-    expect(groupFindOne).toHaveBeenCalledWith({
-      group_id: '2272071933',
-      user_id: currentImUserId,
-    });
+    expect(groupFindOne).toHaveBeenCalledWith(
+      {
+        group_id: '2272071933',
+        user_id: currentImUserId,
+      },
+      expect.objectContaining({ maxTimeMS: 5_000 }),
+    );
     expect(page.messages).toHaveLength(1);
     expect(page.messages[0].groupID).toBe('2272071933');
   });
@@ -196,7 +236,12 @@ describe('ChatHistoryService', () => {
       messages: [wrapper(1), wrapper(2), wrapper(3), wrapper(4), wrapper(5)],
     });
 
-    const page = await service.getMessages(currentUserId, singleConversationID, 2, 5);
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      2,
+      5,
+    );
 
     expect(page.messages.map((message) => message.seq)).toEqual([3, 4]);
     expect(page.nextBeforeSeq).toBe(3);
@@ -212,25 +257,31 @@ describe('ChatHistoryService', () => {
 
     expect(seqFindOne).toHaveBeenCalledWith(
       { conversation_id: singleConversationID },
-      { projection: { _id: 0, max_seq: 1, min_seq: 1 } },
+      {
+        projection: { _id: 0, max_seq: 1, min_seq: 1 },
+        maxTimeMS: 5_000,
+      },
     );
     expect(msgFind).not.toHaveBeenCalled();
-    expect(msgAggregate).toHaveBeenCalledWith([
-      { $match: { doc_id: { $in: [`${singleConversationID}:0`] } } },
-      { $project: { msgs: 1 } },
-      { $unwind: '$msgs' },
-      { $replaceRoot: { newRoot: '$msgs' } },
-      {
-        $match: {
-          msg: { $ne: null },
-          'msg.seq': { $exists: true },
-          del_list: { $ne: currentImUserId },
+    expect(msgAggregate).toHaveBeenCalledWith(
+      [
+        { $match: { doc_id: { $in: [`${singleConversationID}:0`] } } },
+        { $project: { msgs: 1 } },
+        { $unwind: '$msgs' },
+        { $replaceRoot: { newRoot: '$msgs' } },
+        {
+          $match: {
+            msg: { $ne: null },
+            'msg.seq': { $exists: true },
+            del_list: { $ne: currentImUserId },
+          },
         },
-      },
-      { $match: { 'msg.seq': { $lt: 3 } } },
-      { $sort: { 'msg.seq': -1 } },
-      { $limit: 3 },
-    ]);
+        { $match: { 'msg.seq': { $lt: 3 } } },
+        { $sort: { 'msg.seq': -1 } },
+        { $limit: 3 },
+      ],
+      { maxTimeMS: 5_000 },
+    );
   });
 
   it('continues through older exact shards until the page is full', async () => {
@@ -239,7 +290,11 @@ describe('ChatHistoryService', () => {
       sequence: { min_seq: 1, max_seq: 401 },
     });
 
-    const page = await service.getMessages(currentUserId, singleConversationID, 2);
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      2,
+    );
 
     expect(page.messages.map((message) => message.seq)).toEqual([1, 401]);
     expect(msgAggregate).toHaveBeenNthCalledWith(
@@ -247,12 +302,110 @@ describe('ChatHistoryService', () => {
       expect.arrayContaining([
         { $match: { doc_id: { $in: [`${singleConversationID}:4`] } } },
       ]),
+      expect.objectContaining({ maxTimeMS: 5_000 }),
     );
     expect(msgAggregate).toHaveBeenLastCalledWith(
       expect.arrayContaining([
         { $match: { doc_id: { $in: [`${singleConversationID}:0`] } } },
       ]),
+      expect.objectContaining({ maxTimeMS: 5_000 }),
     );
+  });
+
+  it('bounds the shard scan and returns a resume cursor for sparse history', async () => {
+    const { service, msgAggregate } = createService({
+      messages: [],
+      sequence: { min_seq: 1, max_seq: 100_000 },
+    });
+
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      2,
+    );
+
+    // A 1,000-shard conversation with no visible messages must not turn one
+    // read into ~1,000 sequential Mongo round-trips.
+    expect(msgAggregate.mock.calls.length).toBeLessThanOrEqual(20);
+    expect(page.messages).toEqual([]);
+    // The scan stopped early on the budget, so the client gets a cursor to
+    // keep walking older shards instead of believing it reached the end.
+    expect(page.hasMore).toBe(true);
+    expect(page.nextBeforeSeq).not.toBeNull();
+    expect(page.nextBeforeSeq!).toBeLessThan(100_000);
+  });
+
+  it('reports a Mongo read failure as a 503 without leaking driver detail', async () => {
+    const { service, seqFindOne } = createService({ messages: [wrapper(1)] });
+    seqFindOne.mockRejectedValueOnce(
+      new Error('connection refused mongodb://secret-host:27017'),
+    );
+
+    await expect(
+      service.getMessages(currentUserId, singleConversationID, 100),
+    ).rejects.toMatchObject({
+      status: 503,
+      response: expect.objectContaining({
+        message: 'OpenIM history store is unavailable',
+      }),
+    });
+  });
+
+  it('warns when the seq doc is missing but message shards exist', async () => {
+    const { service, msgFindOne } = createService({
+      messages: [],
+      sequence: null,
+      messageShardExists: true,
+    });
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      100,
+    );
+
+    expect(page.messages).toEqual([]);
+    expect(page.serverMaxSeq).toBeNull();
+    expect(msgFindOne).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('seq doc missing');
+    // The conversation id (which embeds participant IM ids) must not leak.
+    expect(warn.mock.calls[0][0]).not.toContain(currentImUserId);
+  });
+
+  it('stays silent for a genuinely empty conversation with no shards', async () => {
+    const { service } = createService({
+      messages: [],
+      sequence: null,
+      messageShardExists: false,
+    });
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      100,
+    );
+
+    expect(page.messages).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('honors the configurable shard-scan budget override', async () => {
+    const { service, msgAggregate } = createService({
+      messages: [],
+      sequence: { min_seq: 1, max_seq: 100_000 },
+      maxShardDocs: 5,
+    });
+
+    await service.getMessages(currentUserId, singleConversationID, 2);
+
+    expect(msgAggregate.mock.calls.length).toBeLessThanOrEqual(5);
   });
 
   it('does not restore messages below the OpenIM conversation min seq', async () => {
@@ -261,7 +414,11 @@ describe('ChatHistoryService', () => {
       sequence: { min_seq: 350, max_seq: 401 },
     });
 
-    const page = await service.getMessages(currentUserId, singleConversationID, 2);
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      2,
+    );
 
     expect(page.serverMinSeq).toBe(350);
     expect(page.messages.map((message) => message.seq)).toEqual([401]);
@@ -270,7 +427,9 @@ describe('ChatHistoryService', () => {
   it('uses bounded Mongo connection timeouts for the OpenIM history store', async () => {
     const config = {
       get: jest.fn((key: string) =>
-        key === 'OPENIM_MONGO_URI' ? 'mongodb://localhost:27017/openim_v3' : null,
+        key === 'OPENIM_MONGO_URI'
+          ? 'mongodb://localhost:27017/openim_v3'
+          : null,
       ),
     };
     const service = new ChatHistoryService(config as any);

@@ -47,8 +47,33 @@ export class ChatHistoryMessagePageDto {
   @ApiProperty() conversationID!: string;
   @ApiProperty({ type: [RestorableMessageDto] })
   messages!: RestorableMessageDto[];
-  @ApiProperty() hasMore!: boolean;
-  @ApiProperty({ nullable: true }) nextBeforeSeq!: number | null;
-  @ApiProperty({ nullable: true }) serverMinSeq!: number | null;
-  @ApiProperty({ nullable: true }) serverMaxSeq!: number | null;
+  @ApiProperty({
+    description:
+      'True when older messages remain below this page (or the per-request ' +
+      'shard scan budget was reached). Keep paginating with nextBeforeSeq.',
+  })
+  hasMore!: boolean;
+  @ApiProperty({
+    nullable: true,
+    description:
+      'Cursor for the next (older) page: pass as beforeSeq. Null when there ' +
+      'is nothing older to fetch.',
+  })
+  nextBeforeSeq!: number | null;
+  @ApiProperty({
+    nullable: true,
+    description:
+      "Conversation's authoritative oldest retained seq, from OpenIM's seq " +
+      "collection. NOTE: conversation-global — not the caller's oldest " +
+      'visible message. Null when no seq record exists.',
+  })
+  serverMinSeq!: number | null;
+  @ApiProperty({
+    nullable: true,
+    description:
+      "Conversation's authoritative newest seq, from OpenIM's seq " +
+      'collection (conversation-global, not caller-specific). Null when no ' +
+      'seq record exists.',
+  })
+  serverMaxSeq!: number | null;
 }

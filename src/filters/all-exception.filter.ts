@@ -69,7 +69,7 @@ export class AllExceptionFilter implements ExceptionFilter {
       headers?: Record<string, unknown>;
       body?: unknown;
       query?: unknown;
-      user?: { id?: string };
+      user?: { userId?: string };
     }>();
     const response = ctx.getResponse();
 
@@ -104,7 +104,7 @@ export class AllExceptionFilter implements ExceptionFilter {
       path: request.url,
       status,
       code,
-      userId: request.user?.id,
+      userId: request.user?.userId,
       ip: requestIp.getClientIp(request as never),
       query: scrub(request.query),
       // Body intentionally omitted by default to avoid leaking PII / secrets;
