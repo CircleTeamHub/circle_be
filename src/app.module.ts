@@ -30,6 +30,7 @@ import { NotificationModule } from './notification/notification.module';
 import { ConversationGroupModule } from './conversation-group/conversation-group.module';
 import { TempChatModule } from './temp-chat/temp-chat.module';
 import { createEnvValidationSchema } from './config/env.validation';
+import { ChatHistoryModule } from './chat-history/chat-history.module';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
 
@@ -65,6 +66,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     NotificationModule,
     ConversationGroupModule,
     TempChatModule,
+    ChatHistoryModule,
   ],
   controllers: [],
   providers: [Logger],
