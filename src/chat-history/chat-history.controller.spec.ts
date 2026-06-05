@@ -1,3 +1,6 @@
+import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { ThrottlerGuard } from '@nestjs/throttler';
+import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatHistoryController } from './chat-history.controller';
 
 describe('ChatHistoryController', () => {
@@ -16,6 +19,17 @@ describe('ChatHistoryController', () => {
       'si_a_b',
       50,
       10,
+    );
+  });
+
+  it('requires authentication and throttles restore reads', () => {
+    const guards = Reflect.getMetadata(GUARDS_METADATA, ChatHistoryController);
+    const getMessages = ChatHistoryController.prototype.getMessages;
+
+    expect(guards).toEqual([ThrottlerGuard, JwtGuard]);
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', getMessages)).toBe(30);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', getMessages)).toBe(
+      60_000,
     );
   });
 });

@@ -5,6 +5,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import {
@@ -15,12 +16,13 @@ import { ChatHistoryService } from './chat-history.service';
 
 @ApiTags('Chat History')
 @ApiBearerAuth()
-@UseGuards(JwtGuard)
+@UseGuards(ThrottlerGuard, JwtGuard)
 @Controller('chat-history')
 export class ChatHistoryController {
   constructor(private readonly service: ChatHistoryService) {}
 
   @Get('conversations/:conversationID/messages')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: 'Read restorable OpenIM history for a conversation' })
   @ApiOkResponse({ type: ChatHistoryMessagePageDto })
   getMessages(
