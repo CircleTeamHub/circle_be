@@ -129,15 +129,22 @@ export class OpenimService implements OnModuleInit {
   ): Promise<void> {
     if (!this.enabled) return;
 
+    const owner = OpenimService.toImUserId(ownerUserID);
+    // OpenIM 要求 ownerUserID 放在请求顶层；放进 groupInfo 会被判为空 → ArgsError("ownerUserID is empty")。
+    // owner 由服务端自动入群，若仍出现在 memberUserIDs 里会触发 ArgsError("group member repeated")，故剔除。
+    const members = memberUserIDs
+      .map(OpenimService.toImUserId)
+      .filter((id) => id !== owner);
+
     const adminToken = await this.getAdminToken();
     await this.post(
       '/group/create_group',
       {
-        memberUserIDs: memberUserIDs.map(OpenimService.toImUserId),
+        ownerUserID: owner,
+        memberUserIDs: members,
         groupInfo: {
           groupID,
           groupName,
-          ownerUserID: OpenimService.toImUserId(ownerUserID),
           groupType: 2, // 2 = work group
         },
       },
