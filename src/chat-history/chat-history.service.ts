@@ -12,13 +12,12 @@ import {
   RestorableMessageDto,
 } from './dto/chat-history.dto';
 
-type MessageAggregationResult = {
-  stats?: Array<{
-    serverMinSeq?: unknown;
-    serverMaxSeq?: unknown;
-  }>;
-  page?: Document[];
+type ConversationSequenceRange = {
+  minSeq: number;
+  maxSeq: number;
 };
+
+const OPENIM_MESSAGES_PER_DOC = 100;
 
 @Injectable()
 export class ChatHistoryService implements OnModuleDestroy {
@@ -41,19 +40,26 @@ export class ChatHistoryService implements OnModuleDestroy {
     await this.validateConversationAccess(conversationID, currentImUserID);
     const db = await this.getMongoDb();
     const pageSize = Math.max(1, Math.min(200, Number(limit) || 100));
-    const [result] = (await db
-      .collection('msg')
-      .aggregate(
-        this.buildMessagePagePipeline(
-          conversationID,
-          currentImUserID,
-          pageSize,
-          beforeSeq,
-        ),
-      )
-      .toArray()) as MessageAggregationResult[];
-    const stats = result?.stats?.[0];
-    const pageWrappers = result?.page ?? [];
+    const sequence = await this.readConversationSequence(db, conversationID);
+    if (!sequence || sequence.maxSeq <= 0 || sequence.maxSeq < sequence.minSeq) {
+      return {
+        conversationID,
+        messages: [],
+        hasMore: false,
+        nextBeforeSeq: null,
+        serverMinSeq: null,
+        serverMaxSeq: null,
+      };
+    }
+
+    const pageWrappers = await this.readMessagePageFromShards(
+      db,
+      conversationID,
+      currentImUserID,
+      pageSize,
+      sequence,
+      beforeSeq,
+    );
     const hasMore = pageWrappers.length > pageSize;
     const messages = pageWrappers
       .slice(0, pageSize)
@@ -61,38 +67,109 @@ export class ChatHistoryService implements OnModuleDestroy {
       .filter((message) => Number.isFinite(message.seq))
       .sort((left, right) => left.seq - right.seq);
     const nextBeforeSeq = messages.length > 0 ? messages[0].seq : null;
-    const serverMinSeq =
-      stats?.serverMinSeq == null ? null : this.toNumber(stats.serverMinSeq);
-    const serverMaxSeq =
-      stats?.serverMaxSeq == null ? null : this.toNumber(stats.serverMaxSeq);
 
     return {
       conversationID,
       messages,
       hasMore,
       nextBeforeSeq,
-      serverMinSeq,
-      serverMaxSeq,
+      serverMinSeq: sequence.minSeq,
+      serverMaxSeq: sequence.maxSeq,
     };
   }
 
-  private buildMessagePagePipeline(
+  private async readConversationSequence(
+    db: Db,
+    conversationID: string,
+  ): Promise<ConversationSequenceRange | null> {
+    const seq = await db.collection('seq').findOne(
+      { conversation_id: conversationID },
+      { projection: { _id: 0, max_seq: 1, min_seq: 1 } },
+    );
+    if (!seq) return null;
+
+    const maxSeq = this.toNumber(seq.max_seq);
+    const minSeq = Math.max(1, this.toNumber(seq.min_seq) || 1);
+    return { minSeq, maxSeq };
+  }
+
+  private async readMessagePageFromShards(
+    db: Db,
     conversationID: string,
     currentImUserID: string,
     pageSize: number,
+    sequence: ConversationSequenceRange,
+    beforeSeq?: number,
+  ): Promise<Document[]> {
+    const startSeq =
+      beforeSeq == null
+        ? sequence.maxSeq
+        : Math.min(sequence.maxSeq, beforeSeq - 1);
+    if (startSeq < sequence.minSeq) return [];
+
+    let nextDocIndex = this.getMessageDocIndex(startSeq);
+    const minDocIndex = this.getMessageDocIndex(sequence.minSeq);
+    const pageWrappers: Document[] = [];
+
+    while (pageWrappers.length < pageSize + 1 && nextDocIndex >= minDocIndex) {
+      const remaining = pageSize + 1 - pageWrappers.length;
+      const docIndexes = this.buildDocIndexWindow(
+        nextDocIndex,
+        minDocIndex,
+        remaining,
+      );
+      const docIDs = docIndexes.map((docIndex) =>
+        this.buildMessageDocID(conversationID, docIndex),
+      );
+      const wrappers = await db
+        .collection('msg')
+        .aggregate(
+          this.buildMessagePagePipeline(
+            docIDs,
+            currentImUserID,
+            remaining,
+            sequence.minSeq,
+            beforeSeq,
+          ),
+        )
+        .toArray();
+
+      pageWrappers.push(...wrappers);
+      nextDocIndex = docIndexes[docIndexes.length - 1] - 1;
+    }
+
+    return pageWrappers;
+  }
+
+  private buildDocIndexWindow(
+    startDocIndex: number,
+    minDocIndex: number,
+    neededMessages: number,
+  ): number[] {
+    const docCount = Math.max(
+      1,
+      Math.ceil(neededMessages / OPENIM_MESSAGES_PER_DOC),
+    );
+    const indexes: number[] = [];
+    for (
+      let docIndex = startDocIndex;
+      docIndex >= minDocIndex && indexes.length < docCount;
+      docIndex--
+    ) {
+      indexes.push(docIndex);
+    }
+    return indexes;
+  }
+
+  private buildMessagePagePipeline(
+    docIDs: string[],
+    currentImUserID: string,
+    limit: number,
+    minSeq: number,
     beforeSeq?: number,
   ): Document[] {
-    const pagePipeline: Document[] = [];
-    if (beforeSeq != null) {
-      pagePipeline.push({ $match: { 'msg.seq': { $lt: beforeSeq } } });
-    }
-    pagePipeline.push(
-      { $sort: { 'msg.seq': -1 } },
-      { $limit: pageSize + 1 },
-    );
-
-    return [
-      { $match: { doc_id: { $regex: `^${this.escapeRegex(conversationID)}:` } } },
+    const pipeline: Document[] = [
+      { $match: { doc_id: { $in: docIDs } } },
       { $project: { msgs: 1 } },
       { $unwind: '$msgs' },
       { $replaceRoot: { newRoot: '$msgs' } },
@@ -103,21 +180,16 @@ export class ChatHistoryService implements OnModuleDestroy {
           del_list: { $ne: currentImUserID },
         },
       },
-      {
-        $facet: {
-          stats: [
-            {
-              $group: {
-                _id: null,
-                serverMaxSeq: { $max: '$msg.seq' },
-                serverMinSeq: { $min: '$msg.seq' },
-              },
-            },
-          ],
-          page: pagePipeline,
-        },
-      },
     ];
+
+    if (minSeq > 1) {
+      pipeline.push({ $match: { 'msg.seq': { $gte: minSeq } } });
+    }
+    if (beforeSeq != null) {
+      pipeline.push({ $match: { 'msg.seq': { $lt: beforeSeq } } });
+    }
+    pipeline.push({ $sort: { 'msg.seq': -1 } }, { $limit: limit });
+    return pipeline;
   }
 
   private async validateConversationAccess(
@@ -258,7 +330,11 @@ export class ChatHistoryService implements OnModuleDestroy {
     return String(value);
   }
 
-  private escapeRegex(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  private getMessageDocIndex(seq: number): number {
+    return Math.floor((seq - 1) / OPENIM_MESSAGES_PER_DOC);
+  }
+
+  private buildMessageDocID(conversationID: string, docIndex: number): string {
+    return `${conversationID}:${docIndex}`;
   }
 }
