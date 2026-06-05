@@ -32,6 +32,20 @@ export interface TempChatMeta {
   full: boolean;
 }
 
+export interface TempChatListItem {
+  id: string;
+  groupId: string;
+  title: string;
+  status: string;
+  guestCount: number;
+  memberCount: number;
+  maxMembers: number;
+  expiresAt: string;
+  createdAt: string;
+  endedAt: string | null;
+  shareUrl: string | null;
+}
+
 @Injectable()
 export class TempChatService {
   constructor(
@@ -101,6 +115,46 @@ export class TempChatService {
       expiresAt: room.expiresAt.toISOString(),
       full: memberCount >= room.maxMembers,
     };
+  }
+
+  async listMine(hostUserId: string): Promise<TempChatListItem[]> {
+    const rows = await this.prisma.tempChat.findMany({
+      where: { hostUserId },
+      orderBy: [{ createdAt: 'desc' }],
+      include: { _count: { select: { guests: true } } },
+    });
+
+    const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
+    const now = Date.now();
+
+    return rows.map((row) => {
+      const guestCount = row._count.guests;
+      const remainingSeconds = Math.floor(
+        (row.expiresAt.getTime() - now) / 1000,
+      );
+      const effectiveStatus =
+        row.status === TempChatStatus.ACTIVE && remainingSeconds <= 0
+          ? TempChatStatus.EXPIRED
+          : row.status;
+      const shareUrl =
+        effectiveStatus === TempChatStatus.ACTIVE
+          ? `${base}/t/${this.linkToken.sign(row.id, Math.max(1, remainingSeconds))}`
+          : null;
+
+      return {
+        id: row.id,
+        groupId: row.groupId,
+        title: row.title,
+        status: effectiveStatus,
+        guestCount,
+        memberCount: guestCount + 1,
+        maxMembers: row.maxMembers,
+        expiresAt: row.expiresAt.toISOString(),
+        createdAt: row.createdAt.toISOString(),
+        endedAt: row.endedAt?.toISOString() ?? null,
+        shareUrl,
+      };
+    });
   }
 
   async join(

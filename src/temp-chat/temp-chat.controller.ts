@@ -3,6 +3,7 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
+  Get,
   NotFoundException,
   Param,
   Post,
@@ -28,6 +29,14 @@ export class TempChatController {
   @ApiOperation({ summary: '创建临时聊天（发起人）' })
   create(@Req() req: any, @Body() dto: CreateTempChatDto) {
     return this.service.create(req.user.userId, dto);
+  }
+
+  @Get('mine')
+  @UseGuards(JwtGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: '发起人的临时聊天列表' })
+  listMine(@Req() req: any) {
+    return this.service.listMine(req.user.userId);
   }
 
   // 公开端点：靠 link JWT + 限流保护。token 非法 → 404。

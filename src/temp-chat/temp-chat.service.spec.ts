@@ -141,6 +141,60 @@ describe('TempChatService', () => {
     });
   });
 
+  describe('listMine', () => {
+    it('lists rooms owned by the current user with newest first and guest counts', async () => {
+      const active = buildRow({
+        id: 'tc-active',
+        groupId: 'tmpActive',
+        title: '售前咨询',
+        createdAt: new Date('2026-06-05T03:00:00.000Z'),
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        _count: { guests: 2 },
+      });
+      const ended = buildRow({
+        id: 'tc-ended',
+        groupId: 'tmpEnded',
+        title: '已结束',
+        status: 'ENDED',
+        createdAt: new Date('2026-06-04T03:00:00.000Z'),
+        endedAt: new Date('2026-06-04T04:00:00.000Z'),
+        _count: { guests: 1 },
+      });
+      prisma.tempChat.findMany.mockResolvedValue([active, ended]);
+
+      const rooms = await service.listMine('host-1');
+
+      expect(prisma.tempChat.findMany).toHaveBeenCalledWith({
+        where: { hostUserId: 'host-1' },
+        orderBy: [{ createdAt: 'desc' }],
+        include: { _count: { select: { guests: true } } },
+      });
+      expect(rooms).toEqual([
+        expect.objectContaining({
+          id: 'tc-active',
+          groupId: 'tmpActive',
+          title: '售前咨询',
+          status: 'ACTIVE',
+          guestCount: 2,
+          memberCount: 3,
+          shareUrl: 'https://chat.example.com/t/signed-token',
+        }),
+        expect.objectContaining({
+          id: 'tc-ended',
+          groupId: 'tmpEnded',
+          status: 'ENDED',
+          guestCount: 1,
+          memberCount: 2,
+          shareUrl: null,
+        }),
+      ]);
+      expect(linkToken.sign).toHaveBeenCalledWith(
+        'tc-active',
+        expect.any(Number),
+      );
+    });
+  });
+
   describe('join', () => {
     beforeEach(() => {
       linkToken.verify.mockReturnValue({ tcId: 'tc-1' });
