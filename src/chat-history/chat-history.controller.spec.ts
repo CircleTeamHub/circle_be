@@ -1,5 +1,6 @@
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
+import { DECORATORS } from '@nestjs/swagger/dist/constants';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatHistoryController } from './chat-history.controller';
 
@@ -31,5 +32,14 @@ describe('ChatHistoryController', () => {
     expect(Reflect.getMetadata('THROTTLER:TTLdefault', getMessages)).toBe(
       60_000,
     );
+  });
+
+  it('documents expected auth, not-found, and rate-limit responses', () => {
+    const responses = Reflect.getMetadata(
+      DECORATORS.API_RESPONSE,
+      ChatHistoryController.prototype.getMessages,
+    );
+
+    expect(Object.keys(responses).sort()).toEqual(['200', '401', '404', '429']);
   });
 });

@@ -34,7 +34,10 @@ export class ChatHistoryService implements OnModuleDestroy {
     const db = await this.getMongoDb();
     const docs = await db
       .collection('msg')
-      .find({ doc_id: { $regex: `^${this.escapeRegex(conversationID)}:` } })
+      .find(
+        { doc_id: { $regex: `^${this.escapeRegex(conversationID)}:` } },
+        { projection: { msgs: 1 } },
+      )
       .toArray();
 
     const allMessages = docs
@@ -155,7 +158,11 @@ export class ChatHistoryService implements OnModuleDestroy {
       );
     }
 
-    this.mongoClient = new MongoClient(uri);
+    this.mongoClient = new MongoClient(uri, {
+      connectTimeoutMS: 3_000,
+      maxPoolSize: 5,
+      serverSelectionTimeoutMS: 3_000,
+    });
     await this.mongoClient.connect();
     this.mongoDb = this.mongoClient.db(this.getMongoDatabase());
     return this.mongoDb;

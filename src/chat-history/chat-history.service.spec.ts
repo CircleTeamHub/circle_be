@@ -1,8 +1,17 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { NotFoundException } from '@nestjs/common';
+import { MongoClient } from 'mongodb';
 import { ChatHistoryService } from './chat-history.service';
 import { ChatHistoryQueryDto } from './dto/chat-history.dto';
+
+jest.mock('mongodb', () => ({
+  MongoClient: jest.fn().mockImplementation(() => ({
+    close: jest.fn().mockResolvedValue(undefined),
+    connect: jest.fn().mockResolvedValue(undefined),
+    db: jest.fn().mockReturnValue({ collection: jest.fn() }),
+  })),
+}));
 
 describe('ChatHistory DTOs', () => {
   it('caps message page size through query validation metadata', () => {
@@ -143,5 +152,36 @@ describe('ChatHistoryService', () => {
     expect(page.messages.map((message) => message.seq)).toEqual([3, 4]);
     expect(page.nextBeforeSeq).toBe(3);
     expect(page.hasMore).toBe(true);
+  });
+
+  it('projects only message arrays when reading OpenIM history docs', async () => {
+    const { service, msgFind } = createService({ messages: [wrapper(1)] });
+
+    await service.getMessages(currentUserId, singleConversationID, 100);
+
+    expect(msgFind).toHaveBeenCalledWith(
+      { doc_id: { $regex: `^${singleConversationID}:` } },
+      { projection: { msgs: 1 } },
+    );
+  });
+
+  it('uses bounded Mongo connection timeouts for the OpenIM history store', async () => {
+    const config = {
+      get: jest.fn((key: string) =>
+        key === 'OPENIM_MONGO_URI' ? 'mongodb://localhost:27017/openim_v3' : null,
+      ),
+    };
+    const service = new ChatHistoryService(config as any);
+
+    await (service as any).getMongoDb();
+
+    expect(MongoClient).toHaveBeenCalledWith(
+      'mongodb://localhost:27017/openim_v3',
+      expect.objectContaining({
+        connectTimeoutMS: 3_000,
+        maxPoolSize: 5,
+        serverSelectionTimeoutMS: 3_000,
+      }),
+    );
   });
 });
