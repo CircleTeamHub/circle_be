@@ -1191,7 +1191,10 @@ model CirclePost {
   creditRestriction Int?
   fancyRestriction  Boolean          @default(false)
   viewCount         Int              @default(0)
-  signupCount       Int              @default(0)
+  signupCount             Int              @default(0)
+  signupVipRestriction    Int?
+  signupCreditRestriction Int?
+  signupFancyRestriction  Boolean          @default(false)
   status            CirclePostStatus @default(ACTIVE)
   authorID          String
   circleID          String
