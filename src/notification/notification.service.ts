@@ -80,6 +80,77 @@ export class NotificationService {
     });
   }
 
+  async getNotifications(userId: string, page = 1) {
+    const take = 20;
+    const skip = (Math.max(1, page) - 1) * take;
+    const rows = await this.prisma.notification.findMany({
+      where: { toUserID: userId, deleted: false },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+      include: {
+        fromUser: { select: { id: true, nickname: true, avatarUrl: true } },
+        fromTrace: { select: { id: true, content: true, images: true } },
+        fromReply: { select: { id: true, content: true } },
+      },
+    });
+    return rows.map((n) => ({
+      id: n.id,
+      type: n.type,
+      content: n.content,
+      read: n.read,
+      createdAt: n.createdAt.toISOString(),
+      fromUser: n.fromUser
+        ? {
+            id: n.fromUser.id,
+            nickname: n.fromUser.nickname,
+            avatarUrl: n.fromUser.avatarUrl,
+          }
+        : null,
+      fromTrace: n.fromTrace
+        ? {
+            id: n.fromTrace.id,
+            excerpt: n.fromTrace.content.slice(0, 60),
+            firstImage: n.fromTrace.images[0] ?? null,
+          }
+        : null,
+      fromReply: n.fromReply
+        ? { id: n.fromReply.id, content: n.fromReply.content }
+        : null,
+    }));
+  }
+
+  async markNotificationRead(userId: string, id: string): Promise<void> {
+    const result = await this.prisma.notification.updateMany({
+      where: { id, toUserID: userId, read: false, deleted: false },
+      data: { read: true },
+    });
+    if (result.count > 0) {
+      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    }
+  }
+
+  async markAllNotificationsRead(userId: string): Promise<{ count: number }> {
+    const result = await this.prisma.notification.updateMany({
+      where: { toUserID: userId, deleted: false, read: false },
+      data: { read: true },
+    });
+    if (result.count > 0) {
+      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    }
+    return { count: result.count };
+  }
+
+  async deleteNotification(userId: string, id: string): Promise<void> {
+    const result = await this.prisma.notification.updateMany({
+      where: { id, toUserID: userId, deleted: false },
+      data: { deleted: true },
+    });
+    if (result.count > 0) {
+      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    }
+  }
+
   async createTraceCommentNotifications(params: {
     actorId: string;
     traceId: string;
