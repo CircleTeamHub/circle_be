@@ -102,4 +102,61 @@ describe('CirclePlazaService', () => {
     ).rejects.toThrow(BadRequestException);
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
+
+  describe('signupForPost', () => {
+    const activePost = {
+      id: 'post-1',
+      authorID: 'author-1',
+      circleID: 'circle-1',
+      content: 'hi',
+    };
+
+    it('creates signup, increments count, and emits two activities', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+      prisma.circleActivity.create.mockResolvedValue({});
+
+      const result = await service.signupForPost('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: true, signupCount: 3 });
+      expect(prisma.circleActivity.create).toHaveBeenCalledTimes(2);
+      expect(realtime.broadcastCircleUnreadCount).toHaveBeenCalledWith(
+        'user-2',
+      );
+      expect(realtime.broadcastCircleUnreadCount).toHaveBeenCalledWith(
+        'author-1',
+      );
+    });
+
+    it('is idempotent when already signed up', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 5 });
+
+      const result = await service.signupForPost('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: true, signupCount: 5 });
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+      expect(prisma.circleActivity.create).not.toHaveBeenCalled();
+    });
+
+    it('emits only CONFIRMED when author signs up to own post', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
+      prisma.circleActivity.create.mockResolvedValue({});
+
+      await service.signupForPost('author-1', 'post-1');
+
+      expect(prisma.circleActivity.create).toHaveBeenCalledTimes(1);
+      expect(prisma.circleActivity.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ type: 'POST_SIGNUP_CONFIRMED' }),
+        }),
+      );
+    });
+  });
 });

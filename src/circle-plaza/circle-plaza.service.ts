@@ -211,6 +211,67 @@ export class CirclePlazaService {
     });
   }
 
+  async signupForPost(
+    userId: string,
+    postId: string,
+  ): Promise<{ signed: boolean; signupCount: number }> {
+    const post = await this.prisma.circlePost.findFirst({
+      where: { id: postId, status: 'ACTIVE', circle: { deleted: false } },
+      select: { id: true, authorID: true, circleID: true, content: true },
+    });
+    if (!post) throw new NotFoundException('Post not found');
+
+    const existing = await this.prisma.circlePostSignup.findUnique({
+      where: { postID_userID: { postID: postId, userID: userId } },
+      select: { id: true },
+    });
+    if (existing) {
+      const current = await this.prisma.circlePost.findUnique({
+        where: { id: postId },
+        select: { signupCount: true },
+      });
+      return { signed: true, signupCount: current?.signupCount ?? 0 };
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.circlePostSignup.create({
+        data: { postID: postId, userID: userId },
+      });
+      const p = await tx.circlePost.update({
+        where: { id: postId },
+        data: { signupCount: { increment: 1 } },
+        select: { signupCount: true },
+      });
+      await tx.circleActivity.create({
+        data: {
+          circleID: post.circleID,
+          postID: postId,
+          viewerID: userId,
+          actorID: userId,
+          type: 'POST_SIGNUP_CONFIRMED',
+        },
+      });
+      if (post.authorID !== userId) {
+        await tx.circleActivity.create({
+          data: {
+            circleID: post.circleID,
+            postID: postId,
+            viewerID: post.authorID,
+            actorID: userId,
+            type: 'POST_SIGNUP_RECEIVED',
+          },
+        });
+      }
+      return p;
+    });
+
+    await this.realtime.broadcastCircleUnreadCount(userId);
+    if (post.authorID !== userId) {
+      await this.realtime.broadcastCircleUnreadCount(post.authorID);
+    }
+    return { signed: true, signupCount: updated.signupCount };
+  }
+
   private checkCanInteract(
     post: any,
     viewer: {
