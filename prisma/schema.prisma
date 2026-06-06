@@ -165,6 +165,8 @@ enum CircleActivityType {
   INVITATION_ALL_APPROVED
   INVITATION_SLOT_REJECTED
   ADMIN_OVERRIDE_APPROVED
+  POST_SIGNUP_RECEIVED
+  POST_SIGNUP_CONFIRMED
 }
 
 enum EventStatus {
@@ -298,6 +300,7 @@ model User {
   coinGiftsSent                CoinGift[]                  @relation("giftSender")
   coinGiftsReceived            CoinGift[]                  @relation("giftRecipient")
   collections                  UserCollection[]
+  circlePostSignups            CirclePostSignup[]
   friendTags                   FriendTag[]
   friendTagAssignments         FriendTagOnFriend[]         @relation("tagOwner")
   pendingFriendTagAssignments  PendingFriendTagOnRequest[] @relation("pendingTagOwner")
@@ -1188,18 +1191,35 @@ model CirclePost {
   creditRestriction Int?
   fancyRestriction  Boolean          @default(false)
   viewCount         Int              @default(0)
+  signupCount       Int              @default(0)
   status            CirclePostStatus @default(ACTIVE)
   authorID          String
   circleID          String
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
 
-  author User   @relation(fields: [authorID], references: [id], onDelete: Cascade)
-  circle Circle @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  author     User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  circle     Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  signups    CirclePostSignup[]
+  activities CircleActivity[]
 
   @@index([circleID, createdAt(sort: Desc)])
   @@index([authorID])
   @@index([city, createdAt(sort: Desc)])
+}
+
+model CirclePostSignup {
+  id        String   @id @default(uuid())
+  postID    String
+  userID    String
+  createdAt DateTime @default(now())
+
+  post CirclePost @relation(fields: [postID], references: [id], onDelete: Cascade)
+  user User       @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@unique([postID, userID])
+  @@index([postID])
+  @@index([userID])
 }
 
 model CircleInvitation {
@@ -1244,6 +1264,7 @@ model CircleActivity {
   id           String             @id @default(uuid())
   circleID     String
   invitationID String?
+  postID       String?
   viewerID     String
   actorID      String
   type         CircleActivityType
@@ -1252,6 +1273,7 @@ model CircleActivity {
 
   circle     Circle            @relation(fields: [circleID], references: [id], onDelete: Cascade)
   invitation CircleInvitation? @relation(fields: [invitationID], references: [id], onDelete: SetNull)
+  post       CirclePost?       @relation(fields: [postID], references: [id], onDelete: SetNull)
   viewer     User              @relation("circleActivityViewer", fields: [viewerID], references: [id], onDelete: Cascade)
   actor      User              @relation("circleActivityActor", fields: [actorID], references: [id], onDelete: Cascade)
 
