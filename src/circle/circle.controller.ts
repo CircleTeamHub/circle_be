@@ -51,9 +51,7 @@ export class CircleController {
 
   @Get()
   @ApiOperation({ summary: 'List public circles' })
-  list(
-    @Query() query: ListCirclesQueryDto,
-  ): Promise<{
+  list(@Query() query: ListCirclesQueryDto): Promise<{
     items: CircleDto[];
     total: number;
     page: number;
@@ -86,7 +84,10 @@ export class CircleController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Join a circle' })
   @ApiNoContentResponse()
-  join(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser): Promise<void> {
+  join(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
     return this.circleService.joinCircle(req.user.userId, id);
   }
 
@@ -131,6 +132,12 @@ export class CircleController {
   @ApiOperation({ summary: 'Unread circle activity count' })
   unreadCount(@Req() req: RequestWithUser) {
     return this.circleService.getUnreadActivityCount(req.user.userId);
+  }
+
+  @Post('activities/read-all')
+  @ApiOperation({ summary: 'Mark all my circle activities as read' })
+  markAllRead(@Req() req: RequestWithUser): Promise<{ count: number }> {
+    return this.circleService.markAllActivitiesRead(req.user.userId);
   }
 
   @Post('activities/:activityId/read')

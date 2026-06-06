@@ -513,6 +513,7 @@ export class CircleService {
       where: { viewerID: userId },
       include: {
         circle: { select: { id: true, name: true } },
+        post: { select: { id: true, content: true } },
         actor: {
           select: {
             id: true,
@@ -540,6 +541,9 @@ export class CircleService {
       },
       readAt: a.readAt?.toISOString() ?? null,
       createdAt: a.createdAt.toISOString(),
+      post: a.post
+        ? { id: a.post.id, excerpt: a.post.content.slice(0, 60) }
+        : null,
     }));
   }
 
@@ -557,6 +561,17 @@ export class CircleService {
     });
 
     await this.realtimeService.broadcastCircleUnreadCount(userId);
+  }
+
+  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
+    const result = await this.prisma.circleActivity.updateMany({
+      where: { viewerID: userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+    if (result.count > 0) {
+      await this.realtimeService.broadcastCircleUnreadCount(userId);
+    }
+    return { count: result.count };
   }
 
   private toCircleDto(circle: any): CircleDto {
