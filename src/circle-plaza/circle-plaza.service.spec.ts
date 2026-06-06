@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -109,11 +109,20 @@ describe('CirclePlazaService', () => {
       authorID: 'author-1',
       circleID: 'circle-1',
       content: 'hi',
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+    };
+    const eligibleViewer = {
+      vipLevel: 9,
+      creditScore: 100,
+      fancyNumber: true,
     };
 
     it('creates signup, increments count, and emits two activities', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
       prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
       prisma.circleActivity.create.mockResolvedValue({});
@@ -146,6 +155,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       // Pre-check passes: the racing request has not committed yet.
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       // Inside the transaction the unique constraint fires for the loser.
       prisma.circlePostSignup.create.mockRejectedValue(
         Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
@@ -165,6 +175,7 @@ describe('CirclePlazaService', () => {
     it('emits only CONFIRMED when author signs up to own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
       prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
       prisma.circleActivity.create.mockResolvedValue({});
@@ -177,6 +188,48 @@ describe('CirclePlazaService', () => {
           data: expect.objectContaining({ type: 'POST_SIGNUP_CONFIRMED' }),
         }),
       );
+    });
+  });
+
+  describe('signup eligibility', () => {
+    const restrictedPost = {
+      id: 'post-1',
+      authorID: 'author-1',
+      circleID: 'circle-1',
+      signupVipRestriction: 3,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+    };
+
+    it('rejects signup when viewer VIP below signup restriction', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+    });
+
+    it('allows signup when viewer meets restriction', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 5,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
+      prisma.circleActivity.create.mockResolvedValue({});
+
+      const result = await service.signupForPost('user-2', 'post-1');
+      expect(result).toEqual({ signed: true, signupCount: 1 });
     });
   });
 
@@ -238,6 +291,9 @@ describe('CirclePlazaService', () => {
         vipRestriction: null,
         creditRestriction: null,
         fancyRestriction: false,
+        signupVipRestriction: null,
+        signupCreditRestriction: null,
+        signupFancyRestriction: false,
         viewCount: 0,
         signupCount: 2,
         createdAt: new Date('2026-06-05T00:00:00Z'),

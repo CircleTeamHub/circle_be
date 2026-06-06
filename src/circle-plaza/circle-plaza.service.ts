@@ -99,6 +99,9 @@ export class CirclePlazaService {
           vipRestriction: dto.vipRestriction ?? null,
           creditRestriction: dto.creditRestriction ?? null,
           fancyRestriction: dto.fancyRestriction ?? false,
+          signupVipRestriction: dto.signupVipRestriction ?? null,
+          signupCreditRestriction: dto.signupCreditRestriction ?? null,
+          signupFancyRestriction: dto.signupFancyRestriction ?? false,
           authorID: userId,
           circleID: dto.circleId,
         },
@@ -116,7 +119,7 @@ export class CirclePlazaService {
       return created;
     });
 
-    return this.toPlazaPostDto(post, true, false);
+    return this.toPlazaPostDto(post, true, false, true);
   }
 
   async getFeed(
@@ -173,6 +176,7 @@ export class CirclePlazaService {
         post,
         this.checkCanInteract(post, viewer),
         signedSet.has(post.id),
+        this.checkCanSignup(post, viewer),
       ),
     );
 
@@ -208,6 +212,7 @@ export class CirclePlazaService {
       post,
       this.checkCanInteract(post, viewer),
       Boolean(signed),
+      this.checkCanSignup(post, viewer),
     );
   }
 
@@ -237,11 +242,18 @@ export class CirclePlazaService {
     userId: string,
     postId: string,
   ): Promise<{ signed: boolean; signupCount: number }> {
-    // 报名故意不强制帖子的 VIP / 信用分 / 靓号 canInteract 限制：
-    // 产品决策 —— 每个圈子帖子都能报名。
+    // 报名资格门槛（signup*Restriction）独立于帖子查看/互动门槛
+    // （vipRestriction 等）；后者由 checkCanInteract 管，此处只看 signup* 字段。
     const post = await this.prisma.circlePost.findFirst({
       where: { id: postId, status: 'ACTIVE', circle: { deleted: false } },
-      select: { id: true, authorID: true, circleID: true },
+      select: {
+        id: true,
+        authorID: true,
+        circleID: true,
+        signupVipRestriction: true,
+        signupCreditRestriction: true,
+        signupFancyRestriction: true,
+      },
     });
     if (!post) throw new NotFoundException('Post not found');
 
@@ -257,6 +269,15 @@ export class CirclePlazaService {
         select: { signupCount: true },
       });
       return { signed: true, signupCount: current?.signupCount ?? 0 };
+    }
+
+    // 报名资格校验（独立于帖子查看限制 vipRestriction，仅看 signup* 门槛）
+    const viewer = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { vipLevel: true, creditScore: true, fancyNumber: true },
+    });
+    if (!this.checkCanSignup(post, viewer)) {
+      throw new ForbiddenException('您的等级不满足该帖子的报名要求');
     }
 
     let updated: { signupCount: number };
@@ -421,10 +442,38 @@ export class CirclePlazaService {
     return true;
   }
 
+  private checkCanSignup(
+    post: any,
+    viewer: {
+      vipLevel: number;
+      creditScore: number;
+      fancyNumber: boolean;
+    } | null,
+  ): boolean {
+    if (!viewer) return false;
+    if (
+      post.signupVipRestriction != null &&
+      viewer.vipLevel < post.signupVipRestriction
+    ) {
+      return false;
+    }
+    if (
+      post.signupCreditRestriction != null &&
+      viewer.creditScore < post.signupCreditRestriction
+    ) {
+      return false;
+    }
+    if (post.signupFancyRestriction && !viewer.fancyNumber) {
+      return false;
+    }
+    return true;
+  }
+
   private toPlazaPostDto(
     post: any,
     canInteract: boolean,
     signedByMe: boolean,
+    canSignup: boolean,
   ): PlazaPostDto {
     return {
       id: post.id,
@@ -442,6 +491,12 @@ export class CirclePlazaService {
       viewCount: post.viewCount,
       signupCount: post.signupCount ?? 0,
       signedByMe,
+      signupRestrictions: {
+        vipLevel: post.signupVipRestriction ?? null,
+        creditScore: post.signupCreditRestriction ?? null,
+        fancyNumber: post.signupFancyRestriction ?? false,
+      },
+      canSignup,
       author: {
         id: post.author.id,
         nickname: post.author.nickname,

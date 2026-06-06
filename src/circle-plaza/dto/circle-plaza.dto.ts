@@ -82,6 +82,31 @@ export class CreatePlazaPostDto {
   @IsBoolean()
   @IsOptional()
   fancyRestriction?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'Min VIP level to sign up, null = no restriction',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(10)
+  @IsOptional()
+  signupVipRestriction?: number;
+
+  @ApiPropertyOptional({
+    description: 'Min credit score to sign up, null = no restriction',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(100)
+  @IsOptional()
+  signupCreditRestriction?: number;
+
+  @ApiPropertyOptional({ default: false })
+  @IsBoolean()
+  @IsOptional()
+  signupFancyRestriction?: boolean;
 }
 
 export class PlazaFeedQueryDto {
@@ -142,6 +167,12 @@ export class PlazaPostDto {
   viewCount: number;
   signupCount: number;
   signedByMe: boolean;
+  signupRestrictions: {
+    vipLevel: number | null;
+    creditScore: number | null;
+    fancyNumber: boolean;
+  };
+  canSignup: boolean;
   author: PlazaPostAuthorDto;
   circle: PlazaPostCircleDto;
   canInteract: boolean;
