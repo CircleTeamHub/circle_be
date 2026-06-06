@@ -159,4 +159,49 @@ describe('CirclePlazaService', () => {
       );
     });
   });
+
+  describe('cancelSignup', () => {
+    it('removes signup and decrements count', async () => {
+      prisma.circlePostSignup.findUnique.mockResolvedValue({ id: 's-1' });
+      prisma.circlePostSignup.delete.mockResolvedValue({});
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 2 });
+
+      const result = await service.cancelSignup('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: false, signupCount: 2 });
+    });
+
+    it('is a no-op when not signed up', async () => {
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 4 });
+
+      const result = await service.cancelSignup('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: false, signupCount: 4 });
+      expect(prisma.circlePostSignup.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getPostSignups', () => {
+    it('maps signups to public user shape', async () => {
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        {
+          createdAt: new Date('2026-06-05T00:00:00Z'),
+          user: { id: 'u1', nickname: 'A', avatarUrl: null, accountId: '100' },
+        },
+      ]);
+
+      const result = await service.getPostSignups('post-1');
+
+      expect(result.items).toEqual([
+        {
+          id: 'u1',
+          nickname: 'A',
+          avatarUrl: null,
+          accountId: '100',
+          signedAt: '2026-06-05T00:00:00.000Z',
+        },
+      ]);
+    });
+  });
 });

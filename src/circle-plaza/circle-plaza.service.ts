@@ -272,6 +272,71 @@ export class CirclePlazaService {
     return { signed: true, signupCount: updated.signupCount };
   }
 
+  async cancelSignup(
+    userId: string,
+    postId: string,
+  ): Promise<{ signed: boolean; signupCount: number }> {
+    const existing = await this.prisma.circlePostSignup.findUnique({
+      where: { postID_userID: { postID: postId, userID: userId } },
+      select: { id: true },
+    });
+    if (!existing) {
+      const current = await this.prisma.circlePost.findUnique({
+        where: { id: postId },
+        select: { signupCount: true },
+      });
+      return { signed: false, signupCount: current?.signupCount ?? 0 };
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.circlePostSignup.delete({
+        where: { postID_userID: { postID: postId, userID: userId } },
+      });
+      return tx.circlePost.update({
+        where: { id: postId },
+        data: { signupCount: { decrement: 1 } },
+        select: { signupCount: true },
+      });
+    });
+
+    return { signed: false, signupCount: Math.max(0, updated.signupCount) };
+  }
+
+  async getPostSignups(postId: string): Promise<{
+    items: {
+      id: string;
+      nickname: string;
+      avatarUrl: string | null;
+      accountId: string;
+      signedAt: string;
+    }[];
+  }> {
+    const signups = await this.prisma.circlePostSignup.findMany({
+      where: { postID: postId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            nickname: true,
+            avatarUrl: true,
+            accountId: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+    return {
+      items: signups.map((s) => ({
+        id: s.user.id,
+        nickname: s.user.nickname,
+        avatarUrl: s.user.avatarUrl,
+        accountId: s.user.accountId,
+        signedAt: s.createdAt.toISOString(),
+      })),
+    };
+  }
+
   private checkCanInteract(
     post: any,
     viewer: {
