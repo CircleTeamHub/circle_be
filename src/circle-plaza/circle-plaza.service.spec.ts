@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { CirclePlazaService } from './circle-plaza.service';
 
 describe('CirclePlazaService', () => {
@@ -19,7 +20,17 @@ describe('CirclePlazaService', () => {
       findMany: jest.fn(),
       count: jest.fn(),
       findFirst: jest.fn(),
+      findUnique: jest.fn(),
       update: jest.fn(),
+    },
+    circlePostSignup: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      delete: jest.fn(),
+      findMany: jest.fn(),
+    },
+    circleActivity: {
+      create: jest.fn(),
     },
     circle: {
       update: jest.fn(),
@@ -30,6 +41,10 @@ describe('CirclePlazaService', () => {
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
+  const realtime = {
+    broadcastCircleUnreadCount: jest.fn(),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
@@ -38,6 +53,7 @@ describe('CirclePlazaService', () => {
         CirclePlazaService,
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        { provide: RealtimeService, useValue: realtime },
       ],
     }).compile();
 
@@ -68,6 +84,7 @@ describe('CirclePlazaService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      realtime as any,
     );
     prisma.circleMember.findUnique.mockResolvedValue({
       id: 'member-1',
