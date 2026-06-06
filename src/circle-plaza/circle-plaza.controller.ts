@@ -36,11 +36,19 @@ export class CirclePlazaController {
   constructor(private readonly plazaService: CirclePlazaService) {}
 
   @Get('feed')
-  @ApiOperation({ summary: 'Plaza feed (paginated, filterable by circle/city)' })
+  @ApiOperation({
+    summary: 'Plaza feed (paginated, filterable by circle/city)',
+  })
   feed(
     @Query() query: PlazaFeedQueryDto,
     @Req() req: RequestWithUser,
-  ): Promise<{ items: PlazaPostDto[]; total: number; page: number; limit: number; hasMore: boolean }> {
+  ): Promise<{
+    items: PlazaPostDto[];
+    total: number;
+    page: number;
+    limit: number;
+    hasMore: boolean;
+  }> {
     return this.plazaService.getFeed(req.user.userId, query);
   }
 
@@ -73,5 +81,29 @@ export class CirclePlazaController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.plazaService.deletePost(req.user.userId, id);
+  }
+
+  @Post('posts/:id/signup')
+  @ApiOperation({ summary: 'Sign up for a post' })
+  signup(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<{ signed: boolean; signupCount: number }> {
+    return this.plazaService.signupForPost(req.user.userId, id);
+  }
+
+  @Delete('posts/:id/signup')
+  @ApiOperation({ summary: 'Cancel signup for a post' })
+  cancelSignup(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<{ signed: boolean; signupCount: number }> {
+    return this.plazaService.cancelSignup(req.user.userId, id);
+  }
+
+  @Get('posts/:id/signups')
+  @ApiOperation({ summary: 'List users who signed up for a post' })
+  signups(@Param('id', ParseUUIDPipe) id: string) {
+    return this.plazaService.getPostSignups(id);
   }
 }
