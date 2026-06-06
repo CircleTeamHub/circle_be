@@ -140,6 +140,8 @@ export class PlazaPostDto {
     fancyNumber: boolean;
   };
   viewCount: number;
+  signupCount: number;
+  signedByMe: boolean;
   author: PlazaPostAuthorDto;
   circle: PlazaPostCircleDto;
   canInteract: boolean;

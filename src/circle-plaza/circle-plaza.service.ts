@@ -116,7 +116,7 @@ export class CirclePlazaService {
       return created;
     });
 
-    return this.toPlazaPostDto(post, true);
+    return this.toPlazaPostDto(post, true, false);
   }
 
   async getFeed(
@@ -159,8 +159,21 @@ export class CirclePlazaService {
       }),
     ]);
 
+    const postIds = posts.map((p) => p.id);
+    const mySignups = postIds.length
+      ? await this.prisma.circlePostSignup.findMany({
+          where: { userID: viewerId, postID: { in: postIds } },
+          select: { postID: true },
+        })
+      : [];
+    const signedSet = new Set(mySignups.map((s) => s.postID));
+
     const items = posts.map((post) =>
-      this.toPlazaPostDto(post, this.checkCanInteract(post, viewer)),
+      this.toPlazaPostDto(
+        post,
+        this.checkCanInteract(post, viewer),
+        signedSet.has(post.id),
+      ),
     );
 
     return {
@@ -186,7 +199,16 @@ export class CirclePlazaService {
 
     if (!post) throw new NotFoundException('Post not found');
 
-    return this.toPlazaPostDto(post, this.checkCanInteract(post, viewer));
+    const signed = await this.prisma.circlePostSignup.findUnique({
+      where: { postID_userID: { postID: postId, userID: viewerId } },
+      select: { id: true },
+    });
+
+    return this.toPlazaPostDto(
+      post,
+      this.checkCanInteract(post, viewer),
+      Boolean(signed),
+    );
   }
 
   async deletePost(userId: string, postId: string): Promise<void> {
@@ -362,7 +384,11 @@ export class CirclePlazaService {
     return true;
   }
 
-  private toPlazaPostDto(post: any, canInteract: boolean): PlazaPostDto {
+  private toPlazaPostDto(
+    post: any,
+    canInteract: boolean,
+    signedByMe: boolean,
+  ): PlazaPostDto {
     return {
       id: post.id,
       content: post.content,
@@ -377,6 +403,8 @@ export class CirclePlazaService {
         fancyNumber: post.fancyRestriction,
       },
       viewCount: post.viewCount,
+      signupCount: post.signupCount ?? 0,
+      signedByMe,
       author: {
         id: post.author.id,
         nickname: post.author.nickname,

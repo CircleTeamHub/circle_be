@@ -204,4 +204,43 @@ describe('CirclePlazaService', () => {
       ]);
     });
   });
+
+  describe('signedByMe in DTO', () => {
+    it('getPost returns signedByMe=true when viewer has signed up', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        content: 'x',
+        images: [],
+        tags: [],
+        city: null,
+        isHorn: false,
+        noteID: null,
+        vipRestriction: null,
+        creditRestriction: null,
+        fancyRestriction: false,
+        viewCount: 0,
+        signupCount: 2,
+        createdAt: new Date('2026-06-05T00:00:00Z'),
+        author: {
+          id: 'a',
+          nickname: 'A',
+          avatarUrl: null,
+          avatarFrame: null,
+          accountId: '1',
+        },
+        circle: { id: 'c', name: 'C' },
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.findUnique.mockResolvedValue({ id: 's-1' });
+
+      const dto = await service.getPost('viewer-1', 'post-1');
+
+      expect(dto.signupCount).toBe(2);
+      expect(dto.signedByMe).toBe(true);
+    });
+  });
 });
