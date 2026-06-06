@@ -237,12 +237,16 @@ export class CirclePlazaService {
     userId: string,
     postId: string,
   ): Promise<{ signed: boolean; signupCount: number }> {
+    // 报名故意不强制帖子的 VIP / 信用分 / 靓号 canInteract 限制：
+    // 产品决策 —— 每个圈子帖子都能报名。
     const post = await this.prisma.circlePost.findFirst({
       where: { id: postId, status: 'ACTIVE', circle: { deleted: false } },
-      select: { id: true, authorID: true, circleID: true, content: true },
+      select: { id: true, authorID: true, circleID: true },
     });
     if (!post) throw new NotFoundException('Post not found');
 
+    // Fast-path pre-check; the unique constraint inside the transaction is the
+    // real guard against concurrent double-taps (see catch block below).
     const existing = await this.prisma.circlePostSignup.findUnique({
       where: { postID_userID: { postID: postId, userID: userId } },
       select: { id: true },
@@ -255,43 +259,76 @@ export class CirclePlazaService {
       return { signed: true, signupCount: current?.signupCount ?? 0 };
     }
 
-    const updated = await this.prisma.$transaction(async (tx) => {
-      await tx.circlePostSignup.create({
-        data: { postID: postId, userID: userId },
-      });
-      const p = await tx.circlePost.update({
-        where: { id: postId },
-        data: { signupCount: { increment: 1 } },
-        select: { signupCount: true },
-      });
-      await tx.circleActivity.create({
-        data: {
-          circleID: post.circleID,
-          postID: postId,
-          viewerID: userId,
-          actorID: userId,
-          type: 'POST_SIGNUP_CONFIRMED',
-        },
-      });
-      if (post.authorID !== userId) {
+    let updated: { signupCount: number };
+    try {
+      updated = await this.prisma.$transaction(async (tx) => {
+        await tx.circlePostSignup.create({
+          data: { postID: postId, userID: userId },
+        });
+        // signupCount 是去规范化的软缓存；getPostSignups / COUNT(*) 才是真实来源。
+        const p = await tx.circlePost.update({
+          where: { id: postId },
+          data: { signupCount: { increment: 1 } },
+          select: { signupCount: true },
+        });
         await tx.circleActivity.create({
           data: {
             circleID: post.circleID,
             postID: postId,
-            viewerID: post.authorID,
+            viewerID: userId,
             actorID: userId,
-            type: 'POST_SIGNUP_RECEIVED',
+            type: 'POST_SIGNUP_CONFIRMED',
           },
         });
+        if (post.authorID !== userId) {
+          await tx.circleActivity.create({
+            data: {
+              circleID: post.circleID,
+              postID: postId,
+              viewerID: post.authorID,
+              actorID: userId,
+              type: 'POST_SIGNUP_RECEIVED',
+            },
+          });
+        }
+        return p;
+      });
+    } catch (error) {
+      // Two concurrent requests can both pass the pre-check; the loser hits the
+      // unique constraint (P2002). Treat it as "already signed up" and stay
+      // idempotent instead of surfacing a 409.
+      if (this.isPrismaUniqueConstraintError(error)) {
+        const current = await this.prisma.circlePost.findUnique({
+          where: { id: postId },
+          select: { signupCount: true },
+        });
+        return { signed: true, signupCount: current?.signupCount ?? 0 };
       }
-      return p;
-    });
+      throw error;
+    }
 
-    await this.realtime.broadcastCircleUnreadCount(userId);
-    if (post.authorID !== userId) {
-      await this.realtime.broadcastCircleUnreadCount(post.authorID);
+    // Broadcasts are best-effort: the signup is already persisted and the op is
+    // idempotent on retry, so a realtime failure must not turn this into a 500.
+    try {
+      await this.realtime.broadcastCircleUnreadCount(userId);
+      if (post.authorID !== userId) {
+        await this.realtime.broadcastCircleUnreadCount(post.authorID);
+      }
+    } catch {
+      // swallow: write is authoritative
     }
     return { signed: true, signupCount: updated.signupCount };
+  }
+
+  private prismaErrorCode(error: unknown): string | undefined {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+      return (error as { code?: string }).code;
+    }
+    return undefined;
+  }
+
+  private isPrismaUniqueConstraintError(error: unknown): boolean {
+    return this.prismaErrorCode(error) === 'P2002';
   }
 
   async cancelSignup(

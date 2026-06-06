@@ -142,6 +142,26 @@ describe('CirclePlazaService', () => {
       expect(prisma.circleActivity.create).not.toHaveBeenCalled();
     });
 
+    it('is idempotent when concurrent signup hits the P2002 unique constraint', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      // Pre-check passes: the racing request has not committed yet.
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      // Inside the transaction the unique constraint fires for the loser.
+      prisma.circlePostSignup.create.mockRejectedValue(
+        Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+      );
+      // Re-read of the current count after the constraint violation.
+      prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 7 });
+
+      const result = await service.signupForPost('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: true, signupCount: 7 });
+      expect(prisma.circlePost.findUnique).toHaveBeenCalledWith({
+        where: { id: 'post-1' },
+        select: { signupCount: true },
+      });
+    });
+
     it('emits only CONFIRMED when author signs up to own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);

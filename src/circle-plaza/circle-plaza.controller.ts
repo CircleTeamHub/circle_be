@@ -103,7 +103,15 @@ export class CirclePlazaController {
 
   @Get('posts/:id/signups')
   @ApiOperation({ summary: 'List users who signed up for a post' })
-  signups(@Param('id', ParseUUIDPipe) id: string) {
+  signups(@Param('id', ParseUUIDPipe) id: string): Promise<{
+    items: {
+      id: string;
+      nickname: string;
+      avatarUrl: string | null;
+      accountId: string;
+      signedAt: string;
+    }[];
+  }> {
     return this.plazaService.getPostSignups(id);
   }
 }
