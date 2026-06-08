@@ -27,7 +27,7 @@ describe('CircleInvitationService', () => {
       create: jest.fn(),
       update: jest.fn(),
     },
-    circleActivity: {
+    notification: {
       create: jest.fn(),
     },
     circle: {
@@ -46,7 +46,7 @@ describe('CircleInvitationService', () => {
   };
 
   const realtimeService = {
-    broadcastCircleUnreadCount: jest.fn(),
+    broadcastInteractionUnread: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -94,5 +94,32 @@ describe('CircleInvitationService', () => {
     await expect(
       service.getInvitationForViewer('outsider-1', 'inv-1'),
     ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('addVerifier sends a circle-verification interaction message', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'PENDING',
+      requiredCount: 10,
+      verifiers: [],
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+
+    await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+    expect(prisma.notification.create).toHaveBeenCalledWith({
+      data: {
+        toUserID: 'verifier-9',
+        fromUserID: 'applicant-1',
+        type: 'CIRCLE_VERIFICATION_REQUESTED',
+        fromCircleID: 'circle-1',
+        fromInvitationID: 'inv-1',
+      },
+    });
+    expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+      'verifier-9',
+    );
   });
 });

@@ -75,4 +75,21 @@ describe('OpenimService group/auth admin calls', () => {
       platformID: 5,
     });
   });
+
+  it('includes OpenIM errDlt details in thrown API errors', async () => {
+    fetchMock.mockImplementation(async (url: string) => ({
+      json: async () =>
+        url.endsWith('/auth/get_admin_token')
+          ? { errCode: 0, data: { token: 'admin-token' } }
+          : {
+              errCode: 1001,
+              errMsg: 'ArgsError',
+              errDlt: 'group member repeated',
+            },
+    }));
+
+    await expect(
+      service.createGroup('tmpABC', 'T', 'host-1', ['host-2']),
+    ).rejects.toThrow('OpenIM error: ArgsError (group member repeated)');
+  });
 });

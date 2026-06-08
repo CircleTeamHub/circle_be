@@ -243,14 +243,17 @@ export class OpenimService implements OnModuleInit {
       const json = (await response.json()) as {
         errCode: number;
         errMsg?: string;
+        errDlt?: string;
         data?: T;
       };
 
       if (json.errCode !== 0) {
+        const message = json.errMsg ?? String(json.errCode);
+        const detail = json.errDlt ? ` (${json.errDlt})` : '';
         this.logger.error(
-          `OpenIM API error [${path}]: ${json.errMsg ?? json.errCode}`,
+          `OpenIM API error [${path}]: ${message}${detail}`,
         );
-        throw new Error(`OpenIM error: ${json.errMsg ?? json.errCode}`);
+        throw new Error(`OpenIM error: ${message}${detail}`);
       }
 
       return json.data as T;

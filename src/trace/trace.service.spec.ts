@@ -40,7 +40,7 @@ describe('TraceService', () => {
     createTraceCommentNotifications: jest.fn(() => Promise.resolve([])),
   };
   const realtimeService = {
-    broadcastCircleUnreadCount: jest.fn(() => Promise.resolve()),
+    broadcastInteractionUnread: jest.fn(() => Promise.resolve()),
     broadcastCirclePostInteractionCreated: jest.fn(),
   };
 

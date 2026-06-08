@@ -3,7 +3,6 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
 import { CircleService } from './circle.service';
 
 describe('CircleService', () => {
@@ -31,11 +30,6 @@ describe('CircleService', () => {
     userDisplayIcon: {
       deleteMany: jest.fn(),
     },
-    circleActivity: {
-      findMany: jest.fn(),
-      count: jest.fn(),
-      updateMany: jest.fn(),
-    },
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -43,10 +37,6 @@ describe('CircleService', () => {
     createGroup: jest.fn(),
     addGroupMembers: jest.fn(),
     removeGroupMember: jest.fn(),
-  };
-
-  const realtimeService = {
-    broadcastCircleUnreadCount: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -58,7 +48,6 @@ describe('CircleService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: OpenimService, useValue: openimService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
-        { provide: RealtimeService, useValue: realtimeService },
       ],
     }).compile();
 
@@ -99,7 +88,6 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
-      realtimeService as any,
     );
     prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
 
@@ -136,15 +124,5 @@ describe('CircleService', () => {
       where: { id: 'circle-1' },
       data: { currentIconAssetID: 'asset-1' },
     });
-  });
-
-  it('broadcasts updated circle unread count after marking an activity read', async () => {
-    prisma.circleActivity.updateMany.mockResolvedValue({ count: 1 });
-
-    await service.markActivityRead('user-1', 'activity-1');
-
-    expect(realtimeService.broadcastCircleUnreadCount).toHaveBeenCalledWith(
-      'user-1',
-    );
   });
 });

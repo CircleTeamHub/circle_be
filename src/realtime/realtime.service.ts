@@ -10,6 +10,7 @@ type BadgeSnapshot = {
   messagesUnread: number;
   contactsUnread: number;
   discoverUnread: number;
+  signupUnread: number;
   profileUnread: number;
   systemUnread: number;
   syncedAt: string;
@@ -20,7 +21,8 @@ type RealtimeEvent =
   | {
       type:
         | 'friend.activity.unread.changed'
-        | 'circle.activity.unread.changed'
+        | 'interaction.unread.changed'
+        | 'circle.signup.unread.changed'
         | 'system.notification.unread.changed';
       payload: { count: number; changedAt: string };
     }
@@ -116,40 +118,35 @@ export class RealtimeService {
   }
 
   async buildSnapshot(userId: string): Promise<BadgeSnapshot> {
-    const [
-      contactsUnread,
-      circleUnread,
-      discoverNotificationUnread,
-      profileUnread,
-    ] = await Promise.all([
-      this.prisma.friendActivity.count({
-        where: { viewerId: userId, readAt: null },
-      }),
-      this.prisma.circleActivity.count({
-        where: { viewerID: userId, readAt: null },
-      }),
-      this.prisma.notification.count({
-        where: {
-          toUserID: userId,
-          deleted: false,
-          read: false,
-          type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-        },
-      }),
-      this.prisma.notification.count({
-        where: {
-          toUserID: userId,
-          deleted: false,
-          read: false,
-          type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-        },
-      }),
-    ]);
+    const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
+      await Promise.all([
+        this.prisma.friendActivity.count({
+          where: { viewerId: userId, readAt: null },
+        }),
+        this.prisma.notification.count({
+          where: {
+            toUserID: userId,
+            deleted: false,
+            read: false,
+            type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+          },
+        }),
+        this.countUnreadSignups(userId),
+        this.prisma.notification.count({
+          where: {
+            toUserID: userId,
+            deleted: false,
+            read: false,
+            type: { in: [...PROFILE_NOTIFICATION_TYPES] },
+          },
+        }),
+      ]);
 
     return {
       messagesUnread: 0,
       contactsUnread,
-      discoverUnread: circleUnread + discoverNotificationUnread,
+      discoverUnread,
+      signupUnread,
       profileUnread,
       systemUnread: profileUnread,
       syncedAt: new Date().toISOString(),
@@ -178,25 +175,44 @@ export class RealtimeService {
     });
   }
 
-  async broadcastCircleUnreadCount(userId: string) {
-    const [circleUnread, discoverNotificationUnread] = await Promise.all([
-      this.prisma.circleActivity.count({
-        where: { viewerID: userId, readAt: null },
-      }),
-      this.prisma.notification.count({
-        where: {
-          toUserID: userId,
-          deleted: false,
-          read: false,
-          type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-        },
-      }),
-    ]);
+  /** Unseen signups across the posts this user authored (signup-management badge). */
+  private countUnreadSignups(userId: string): Promise<number> {
+    return this.prisma.circlePostSignup.count({
+      where: {
+        seenByAuthor: false,
+        post: { authorID: userId, status: 'ACTIVE' },
+      },
+    });
+  }
+
+  /** "互动消息" unread — trace comments/replies + circle verification/invitation. */
+  async broadcastInteractionUnread(userId: string) {
+    const count = await this.prisma.notification.count({
+      where: {
+        toUserID: userId,
+        deleted: false,
+        read: false,
+        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+      },
+    });
 
     this.broadcast(userId, {
-      type: 'circle.activity.unread.changed',
+      type: 'interaction.unread.changed',
       payload: {
-        count: circleUnread + discoverNotificationUnread,
+        count,
+        changedAt: new Date().toISOString(),
+      },
+    });
+  }
+
+  /** "报名管理" unread — unseen signups on the author's own posts. */
+  async broadcastSignupUnread(userId: string) {
+    const count = await this.countUnreadSignups(userId);
+
+    this.broadcast(userId, {
+      type: 'circle.signup.unread.changed',
+      payload: {
+        count,
         changedAt: new Date().toISOString(),
       },
     });

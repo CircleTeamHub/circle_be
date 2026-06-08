@@ -207,19 +207,19 @@ export class CircleInvitationService {
         },
       });
 
-      // Create activity notification for the verifier
-      await tx.circleActivity.create({
+      // Interaction message for the verifier (互动消息).
+      await tx.notification.create({
         data: {
-          circleID: invitation.circleID,
-          invitationID: invitationId,
-          viewerID: verifierId,
-          actorID: callerId,
-          type: 'VERIFICATION_REQUESTED',
+          toUserID: verifierId,
+          fromUserID: callerId,
+          type: 'CIRCLE_VERIFICATION_REQUESTED',
+          fromCircleID: invitation.circleID,
+          fromInvitationID: invitationId,
         },
       });
     });
 
-    await this.realtimeService.broadcastCircleUnreadCount(verifierId);
+    await this.realtimeService.broadcastInteractionUnread(verifierId);
   }
 
   async respond(
@@ -256,13 +256,13 @@ export class CircleInvitationService {
       });
 
       if (!approve) {
-        await tx.circleActivity.create({
+        await tx.notification.create({
           data: {
-            circleID: invitation.circleID,
-            invitationID: invitationId,
-            viewerID: invitation.applicantID,
-            actorID: verifierId,
-            type: 'INVITATION_SLOT_REJECTED',
+            toUserID: invitation.applicantID,
+            fromUserID: verifierId,
+            type: 'CIRCLE_INVITATION_REJECTED',
+            fromCircleID: invitation.circleID,
+            fromInvitationID: invitationId,
           },
         });
         return null;
@@ -302,13 +302,13 @@ export class CircleInvitationService {
         updatedInvitation.applicantID,
       );
 
-      await tx.circleActivity.create({
+      await tx.notification.create({
         data: {
-          circleID: updatedInvitation.circleID,
-          invitationID: invitationId,
-          viewerID: updatedInvitation.applicantID,
-          actorID: verifierId,
-          type: 'INVITATION_ALL_APPROVED',
+          toUserID: updatedInvitation.applicantID,
+          fromUserID: verifierId,
+          type: 'CIRCLE_INVITATION_APPROVED',
+          fromCircleID: updatedInvitation.circleID,
+          fromInvitationID: invitationId,
         },
       });
 
@@ -331,7 +331,7 @@ export class CircleInvitationService {
     });
 
     if (notificationTarget?.applicantID) {
-      await this.realtimeService.broadcastCircleUnreadCount(
+      await this.realtimeService.broadcastInteractionUnread(
         notificationTarget.applicantID,
       );
       this.realtimeService.broadcastCircleInvitationReviewed(
@@ -392,13 +392,13 @@ export class CircleInvitationService {
         pendingInvitation.applicantID,
       );
 
-      await tx.circleActivity.create({
+      await tx.notification.create({
         data: {
-          circleID: pendingInvitation.circleID,
-          invitationID: invitationId,
-          viewerID: pendingInvitation.applicantID,
-          actorID: adminId,
-          type: 'ADMIN_OVERRIDE_APPROVED',
+          toUserID: pendingInvitation.applicantID,
+          fromUserID: adminId,
+          type: 'CIRCLE_ADMIN_OVERRIDE_APPROVED',
+          fromCircleID: pendingInvitation.circleID,
+          fromInvitationID: invitationId,
         },
       });
 
@@ -421,7 +421,7 @@ export class CircleInvitationService {
     });
 
     if (notificationTarget?.applicantID) {
-      await this.realtimeService.broadcastCircleUnreadCount(
+      await this.realtimeService.broadcastInteractionUnread(
         notificationTarget.applicantID,
       );
       this.realtimeService.broadcastCircleInvitationReviewed(

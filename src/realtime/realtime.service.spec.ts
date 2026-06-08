@@ -9,7 +9,7 @@ describe('RealtimeService', () => {
     friendActivity: {
       count: jest.fn(),
     },
-    circleActivity: {
+    circlePostSignup: {
       count: jest.fn(),
     },
     notification: {
@@ -30,18 +30,43 @@ describe('RealtimeService', () => {
     service = module.get(RealtimeService);
   });
 
-  it('builds a badge snapshot from current unread counts', async () => {
+  it('builds a badge snapshot keeping interaction and signup counts separate', async () => {
     prisma.friendActivity.count.mockResolvedValue(3);
-    prisma.circleActivity.count.mockResolvedValue(5);
+    prisma.circlePostSignup.count.mockResolvedValue(4);
     prisma.notification.count.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
 
     await expect(service.buildSnapshot('user-1')).resolves.toEqual({
       messagesUnread: 0,
       contactsUnread: 3,
-      discoverUnread: 7,
+      discoverUnread: 2,
+      signupUnread: 4,
       profileUnread: 1,
       systemUnread: 1,
       syncedAt: expect.any(String),
+    });
+  });
+
+  it('broadcastInteractionUnread emits the interaction-message unread count', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    prisma.notification.count.mockResolvedValue(5);
+
+    await service.broadcastInteractionUnread('user-1');
+
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'interaction.unread.changed',
+      payload: { count: 5, changedAt: expect.any(String) },
+    });
+  });
+
+  it('broadcastSignupUnread emits the signup-management unread count', async () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+    prisma.circlePostSignup.count.mockResolvedValue(2);
+
+    await service.broadcastSignupUnread('user-1');
+
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'circle.signup.unread.changed',
+      payload: { count: 2, changedAt: expect.any(String) },
     });
   });
 
