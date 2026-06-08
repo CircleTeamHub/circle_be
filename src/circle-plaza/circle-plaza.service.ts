@@ -7,10 +7,13 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { OpenimService } from 'src/openim/openim.service';
 import {
   CreatePlazaPostDto,
+  MyCirclePostDto,
   PlazaFeedQueryDto,
   PlazaPostDto,
+  PostSignupItemDto,
 } from './dto/circle-plaza.dto';
 
 @Injectable()
@@ -257,6 +260,11 @@ export class CirclePlazaService {
     });
     if (!post) throw new NotFoundException('Post not found');
 
+    // The author manages signups for their own post and never signs up for it.
+    if (post.authorID === userId) {
+      throw new ForbiddenException('不能给自己发布的帖子报名');
+    }
+
     // Fast-path pre-check; the unique constraint inside the transaction is the
     // real guard against concurrent double-taps (see catch block below).
     const existing = await this.prisma.circlePostSignup.findUnique({
@@ -292,26 +300,6 @@ export class CirclePlazaService {
           data: { signupCount: { increment: 1 } },
           select: { signupCount: true },
         });
-        await tx.circleActivity.create({
-          data: {
-            circleID: post.circleID,
-            postID: postId,
-            viewerID: userId,
-            actorID: userId,
-            type: 'POST_SIGNUP_CONFIRMED',
-          },
-        });
-        if (post.authorID !== userId) {
-          await tx.circleActivity.create({
-            data: {
-              circleID: post.circleID,
-              postID: postId,
-              viewerID: post.authorID,
-              actorID: userId,
-              type: 'POST_SIGNUP_RECEIVED',
-            },
-          });
-        }
         return p;
       });
     } catch (error) {
@@ -328,13 +316,11 @@ export class CirclePlazaService {
       throw error;
     }
 
-    // Broadcasts are best-effort: the signup is already persisted and the op is
-    // idempotent on retry, so a realtime failure must not turn this into a 500.
+    // Best-effort: the signup is persisted and idempotent on retry, so a
+    // realtime failure must not turn this into a 500. Only the post author has a
+    // signup-management badge to refresh (self-signup is rejected above).
     try {
-      await this.realtime.broadcastCircleUnreadCount(userId);
-      if (post.authorID !== userId) {
-        await this.realtime.broadcastCircleUnreadCount(post.authorID);
-      }
+      await this.realtime.broadcastSignupUnread(post.authorID);
     } catch {
       // swallow: write is authoritative
     }
@@ -375,14 +361,24 @@ export class CirclePlazaService {
       return tx.circlePost.update({
         where: { id: postId },
         data: { signupCount: { decrement: 1 } },
-        select: { signupCount: true },
+        select: { signupCount: true, authorID: true },
       });
     });
+
+    // Cancelling can drop an unseen signup, so refresh the author's badge.
+    try {
+      await this.realtime.broadcastSignupUnread(updated.authorID);
+    } catch {
+      // swallow: write is authoritative
+    }
 
     return { signed: false, signupCount: Math.max(0, updated.signupCount) };
   }
 
-  async getPostSignups(postId: string): Promise<{
+  async getPostSignups(
+    authorId: string,
+    postId: string,
+  ): Promise<{
     items: {
       id: string;
       nickname: string;
@@ -391,6 +387,7 @@ export class CirclePlazaService {
       signedAt: string;
     }[];
   }> {
+    await this.requireOwnPost(authorId, postId);
     const signups = await this.prisma.circlePostSignup.findMany({
       where: { postID: postId },
       include: {
@@ -415,6 +412,147 @@ export class CirclePlazaService {
         signedAt: s.createdAt.toISOString(),
       })),
     };
+  }
+
+  // ─── Signup management (报名管理) ───────────────────────────────────────────
+
+  /** Posts authored by the user, newest first, with per-post unread signup counts. */
+  async listMyPosts(
+    authorId: string,
+    page = 1,
+  ): Promise<{
+    items: MyCirclePostDto[];
+    total: number;
+    page: number;
+    limit: number;
+    hasMore: boolean;
+  }> {
+    const limit = 20;
+    const skip = (Math.max(1, page) - 1) * limit;
+    const where = { authorID: authorId, status: 'ACTIVE' as const };
+    const [posts, total] = await Promise.all([
+      this.prisma.circlePost.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          circleID: true,
+          content: true,
+          images: true,
+          signupCount: true,
+          status: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.circlePost.count({ where }),
+    ]);
+
+    const ids = posts.map((p) => p.id);
+    const unreadGroups = ids.length
+      ? await this.prisma.circlePostSignup.groupBy({
+          by: ['postID'],
+          where: { postID: { in: ids }, seenByAuthor: false },
+          _count: { _all: true },
+        })
+      : [];
+    const unreadByPost = new Map(
+      unreadGroups.map((g) => [g.postID, g._count._all]),
+    );
+
+    return {
+      items: posts.map((p) => ({
+        id: p.id,
+        circleId: p.circleID,
+        excerpt: p.content.slice(0, 60),
+        firstImage: p.images[0] ?? null,
+        signupCount: p.signupCount,
+        unreadSignupCount: unreadByPost.get(p.id) ?? 0,
+        status: p.status,
+        createdAt: p.createdAt.toISOString(),
+      })),
+      total,
+      page: Math.max(1, page),
+      limit,
+      hasMore: skip + posts.length < total,
+    };
+  }
+
+  /** Signers of one of the author's own posts, with identity for opening a chat. */
+  async getMyPostSignups(
+    authorId: string,
+    postId: string,
+  ): Promise<{ items: PostSignupItemDto[] }> {
+    await this.requireOwnPost(authorId, postId);
+    const signups = await this.prisma.circlePostSignup.findMany({
+      where: { postID: postId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            nickname: true,
+            avatarUrl: true,
+            accountId: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+    return {
+      items: signups.map((s) => ({
+        userId: s.user.id,
+        imUserId: OpenimService.toImUserId(s.user.id),
+        nickname: s.user.nickname,
+        avatarUrl: s.user.avatarUrl,
+        accountId: s.user.accountId,
+        signedAt: s.createdAt.toISOString(),
+        seen: s.seenByAuthor,
+      })),
+    };
+  }
+
+  /** Mark every unseen signup on the author's post as read; refresh the badge. */
+  async markPostSignupsSeen(
+    authorId: string,
+    postId: string,
+  ): Promise<{ count: number }> {
+    await this.requireOwnPost(authorId, postId);
+    const result = await this.prisma.circlePostSignup.updateMany({
+      where: { postID: postId, seenByAuthor: false },
+      data: { seenByAuthor: true, seenAt: new Date() },
+    });
+    if (result.count > 0) {
+      try {
+        await this.realtime.broadcastSignupUnread(authorId);
+      } catch {
+        // swallow: write is authoritative
+      }
+    }
+    return { count: result.count };
+  }
+
+  /** Total unseen signups across the author's active posts (报名管理 red dot). */
+  async getMySignupsUnreadCount(authorId: string): Promise<{ count: number }> {
+    const count = await this.prisma.circlePostSignup.count({
+      where: {
+        seenByAuthor: false,
+        post: { authorID: authorId, status: 'ACTIVE' },
+      },
+    });
+    return { count };
+  }
+
+  private async requireOwnPost(
+    authorId: string,
+    postId: string,
+  ): Promise<void> {
+    const post = await this.prisma.circlePost.findFirst({
+      where: { id: postId, authorID: authorId },
+      select: { id: true },
+    });
+    if (!post) throw new NotFoundException('Post not found');
   }
 
   private checkCanInteract(

@@ -121,33 +121,4 @@ export class CircleController {
   ) {
     return this.circleService.selectCircleIcon(req.user.userId, id, dto);
   }
-
-  @Get('activities/list')
-  @ApiOperation({ summary: 'My circle activities (notifications)' })
-  activities(@Req() req: RequestWithUser) {
-    return this.circleService.getActivities(req.user.userId);
-  }
-
-  @Get('activities/unread-count')
-  @ApiOperation({ summary: 'Unread circle activity count' })
-  unreadCount(@Req() req: RequestWithUser) {
-    return this.circleService.getUnreadActivityCount(req.user.userId);
-  }
-
-  @Post('activities/read-all')
-  @ApiOperation({ summary: 'Mark all my circle activities as read' })
-  markAllRead(@Req() req: RequestWithUser): Promise<{ count: number }> {
-    return this.circleService.markAllActivitiesRead(req.user.userId);
-  }
-
-  @Post('activities/:activityId/read')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Mark circle activity as read' })
-  @ApiNoContentResponse()
-  markRead(
-    @Param('activityId', ParseUUIDPipe) activityId: string,
-    @Req() req: RequestWithUser,
-  ): Promise<void> {
-    return this.circleService.markActivityRead(req.user.userId, activityId);
-  }
 }

@@ -9,7 +9,6 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
 import {
   CircleDetailDto,
@@ -32,7 +31,6 @@ export class CircleService {
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
     private readonly config: ConfigService,
-    private readonly realtimeService: RealtimeService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -504,74 +502,6 @@ export class CircleService {
     }
 
     return circle;
-  }
-
-  // ─── Circle Activities ────────────────────────────────────────────────────
-
-  async getActivities(userId: string) {
-    const activities = await this.prisma.circleActivity.findMany({
-      where: { viewerID: userId },
-      include: {
-        circle: { select: { id: true, name: true } },
-        post: { select: { id: true, content: true } },
-        actor: {
-          select: {
-            id: true,
-            nickname: true,
-            avatarUrl: true,
-            accountId: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
-
-    return activities.map((a) => ({
-      id: a.id,
-      circleId: a.circle.id,
-      circleName: a.circle.name,
-      invitationId: a.invitationID,
-      type: a.type,
-      actor: {
-        id: a.actor.id,
-        nickname: a.actor.nickname,
-        avatarUrl: a.actor.avatarUrl,
-        accountId: a.actor.accountId,
-      },
-      readAt: a.readAt?.toISOString() ?? null,
-      createdAt: a.createdAt.toISOString(),
-      post: a.post
-        ? { id: a.post.id, excerpt: a.post.content.slice(0, 60) }
-        : null,
-    }));
-  }
-
-  async getUnreadActivityCount(userId: string) {
-    const count = await this.prisma.circleActivity.count({
-      where: { viewerID: userId, readAt: null },
-    });
-    return { count };
-  }
-
-  async markActivityRead(userId: string, activityId: string): Promise<void> {
-    await this.prisma.circleActivity.updateMany({
-      where: { id: activityId, viewerID: userId, readAt: null },
-      data: { readAt: new Date() },
-    });
-
-    await this.realtimeService.broadcastCircleUnreadCount(userId);
-  }
-
-  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
-    const result = await this.prisma.circleActivity.updateMany({
-      where: { viewerID: userId, readAt: null },
-      data: { readAt: new Date() },
-    });
-    if (result.count > 0) {
-      await this.realtimeService.broadcastCircleUnreadCount(userId);
-    }
-    return { count: result.count };
   }
 
   private toCircleDto(circle: any): CircleDto {

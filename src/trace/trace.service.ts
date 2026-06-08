@@ -304,7 +304,7 @@ export class TraceService {
 
     await Promise.all(
       notifiedUserIds.map(async (targetUserId) => {
-        await this.realtimeService.broadcastCircleUnreadCount(targetUserId);
+        await this.realtimeService.broadcastInteractionUnread(targetUserId);
         this.realtimeService.broadcastCirclePostInteractionCreated(
           targetUserId,
           {

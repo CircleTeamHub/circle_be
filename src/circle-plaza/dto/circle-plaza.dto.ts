@@ -178,3 +178,24 @@ export class PlazaPostDto {
   canInteract: boolean;
   createdAt: string;
 }
+
+export class MyCirclePostDto {
+  id: string;
+  circleId: string;
+  excerpt: string;
+  firstImage: string | null;
+  signupCount: number;
+  unreadSignupCount: number;
+  status: string;
+  createdAt: string;
+}
+
+export class PostSignupItemDto {
+  userId: string;
+  imUserId: string;
+  nickname: string;
+  avatarUrl: string | null;
+  accountId: string;
+  signedAt: string;
+  seen: boolean;
+}

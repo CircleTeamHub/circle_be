@@ -8,6 +8,7 @@ describe('NotificationService', () => {
 
   const prisma = {
     notification: {
+      findFirst: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
       updateMany: jest.fn(),
@@ -16,6 +17,7 @@ describe('NotificationService', () => {
   };
 
   const realtimeService = {
+    broadcastInteractionUnread: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
   };
 
@@ -100,7 +102,20 @@ describe('NotificationService', () => {
 
       expect(prisma.notification.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { toUserID: 'user-1', deleted: false },
+          where: {
+            toUserID: 'user-1',
+            deleted: false,
+            type: {
+              in: [
+                'TRACE_COMMENT',
+                'COMMENT_REPLY',
+                'CIRCLE_VERIFICATION_REQUESTED',
+                'CIRCLE_INVITATION_APPROVED',
+                'CIRCLE_INVITATION_REJECTED',
+                'CIRCLE_ADMIN_OVERRIDE_APPROVED',
+              ],
+            },
+          },
           skip: 0,
           take: 20,
           orderBy: { createdAt: 'desc' },
@@ -115,23 +130,68 @@ describe('NotificationService', () => {
         fromUser: { id: 'u2', nickname: 'B', avatarUrl: null },
         fromTrace: { id: 't1', excerpt: 'my trace body', firstImage: 'img1' },
         fromReply: { id: 'r1', content: 'reply body' },
+        fromCircle: null,
+        fromInvitation: null,
       });
     });
 
-    it('markNotificationRead broadcasts only when a row changed', async () => {
+    it('markNotificationRead broadcasts interaction unread for discover-domain rows', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        type: 'CIRCLE_VERIFICATION_REQUESTED',
+        read: false,
+      });
       prisma.notification.updateMany.mockResolvedValue({ count: 1 });
       await service.markNotificationRead('user-1', 'n1');
+      expect(prisma.notification.findFirst).toHaveBeenCalledWith({
+        where: { id: 'n1', toUserID: 'user-1', deleted: false },
+        select: { type: true, read: true },
+      });
       expect(prisma.notification.updateMany).toHaveBeenCalledWith({
         where: { id: 'n1', toUserID: 'user-1', read: false, deleted: false },
         data: { read: true },
       });
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+        'user-1',
+      );
+      expect(
+        realtimeService.broadcastSystemNotificationUnread,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('markNotificationRead broadcasts system unread for profile-domain rows', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        type: 'SYSTEM',
+        read: false,
+      });
+      prisma.notification.updateMany.mockResolvedValue({ count: 1 });
+      await service.markNotificationRead('user-1', 'n1');
       expect(
         realtimeService.broadcastSystemNotificationUnread,
       ).toHaveBeenCalledWith('user-1');
+      expect(
+        realtimeService.broadcastInteractionUnread,
+      ).not.toHaveBeenCalled();
+    });
 
-      jest.clearAllMocks();
+    it('markNotificationRead skips broadcasting when no row changed', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        type: 'TRACE_COMMENT',
+        read: false,
+      });
       prisma.notification.updateMany.mockResolvedValue({ count: 0 });
       await service.markNotificationRead('user-1', 'n1');
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastSystemNotificationUnread,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('markNotificationRead skips broadcasting when the row is missing', async () => {
+      jest.clearAllMocks();
+      prisma.notification.findFirst.mockResolvedValue(null);
+      await service.markNotificationRead('user-1', 'n1');
+      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
       expect(
         realtimeService.broadcastSystemNotificationUnread,
       ).not.toHaveBeenCalled();
@@ -142,21 +202,62 @@ describe('NotificationService', () => {
       const result = await service.markAllNotificationsRead('user-1');
       expect(result).toEqual({ count: 4 });
       expect(prisma.notification.updateMany).toHaveBeenCalledWith({
-        where: { toUserID: 'user-1', deleted: false, read: false },
+        where: {
+          toUserID: 'user-1',
+          deleted: false,
+          read: false,
+          type: {
+            in: [
+              'TRACE_COMMENT',
+              'COMMENT_REPLY',
+              'CIRCLE_VERIFICATION_REQUESTED',
+              'CIRCLE_INVITATION_APPROVED',
+              'CIRCLE_INVITATION_REJECTED',
+              'CIRCLE_ADMIN_OVERRIDE_APPROVED',
+            ],
+          },
+        },
         data: { read: true },
       });
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+        'user-1',
+      );
     });
 
-    it('deleteNotification soft-deletes and broadcasts when changed', async () => {
+    it('deleteNotification soft-deletes and broadcasts interaction unread for unread discover rows', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        type: 'CIRCLE_INVITATION_APPROVED',
+        read: false,
+      });
       prisma.notification.updateMany.mockResolvedValue({ count: 1 });
       await service.deleteNotification('user-1', 'n1');
+      expect(prisma.notification.findFirst).toHaveBeenCalledWith({
+        where: { id: 'n1', toUserID: 'user-1', deleted: false },
+        select: { type: true, read: true },
+      });
       expect(prisma.notification.updateMany).toHaveBeenCalledWith({
         where: { id: 'n1', toUserID: 'user-1', deleted: false },
         data: { deleted: true },
       });
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+        'user-1',
+      );
       expect(
         realtimeService.broadcastSystemNotificationUnread,
-      ).toHaveBeenCalledWith('user-1');
+      ).not.toHaveBeenCalled();
+    });
+
+    it('deleteNotification does not broadcast for already-read rows', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        type: 'TRACE_COMMENT',
+        read: true,
+      });
+      prisma.notification.updateMany.mockResolvedValue({ count: 1 });
+      await service.deleteNotification('user-1', 'n1');
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastSystemNotificationUnread,
+      ).not.toHaveBeenCalled();
     });
   });
 });

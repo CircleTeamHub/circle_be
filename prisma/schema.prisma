@@ -158,17 +158,6 @@ enum CircleInvitationVerifierStatus {
   REJECTED
 }
 
-enum CircleActivityType {
-  VERIFICATION_REQUESTED
-  VERIFICATION_APPROVED
-  VERIFICATION_REJECTED
-  INVITATION_ALL_APPROVED
-  INVITATION_SLOT_REJECTED
-  ADMIN_OVERRIDE_APPROVED
-  POST_SIGNUP_RECEIVED
-  POST_SIGNUP_CONFIRMED
-}
-
 enum EventStatus {
   COMING
   LIVE
@@ -201,6 +190,10 @@ enum NotificationType {
   TRACE_LIKE
   TRACE_COMMENT
   COMMENT_REPLY
+  CIRCLE_VERIFICATION_REQUESTED
+  CIRCLE_INVITATION_APPROVED
+  CIRCLE_INVITATION_REJECTED
+  CIRCLE_ADMIN_OVERRIDE_APPROVED
 }
 
 enum MissionType {
@@ -318,8 +311,6 @@ model User {
   circleInvitationsAsInviter   CircleInvitation[]          @relation("invitationInviter")
   circleVerifications          CircleInvitationVerifier[]  @relation("verifierUser")
   circleVerificationsAdded     CircleInvitationVerifier[]  @relation("verifierAddedBy")
-  circleActivitiesViewed       CircleActivity[]            @relation("circleActivityViewer")
-  circleActivitiesActed        CircleActivity[]            @relation("circleActivityActor")
   iconAssetsCreated            IconAsset[]                 @relation("iconAssetCreator")
   displayIcons                 UserDisplayIcon[]
   conversationGroups           ConversationGroup[]
@@ -937,26 +928,30 @@ model UserDisplayIcon {
 // ─── Notification ─────────────────────────────────────────────────────────────
 
 model Notification {
-  id             String           @id @default(uuid())
-  content        String           @default("")
-  deleted        Boolean          @default(false)
-  read           Boolean          @default(false)
-  type           NotificationType
-  toUserID       String?
-  fromUserID     String
-  squadRequestID String?
-  fromTraceID    String?
-  fromReplyID    String?
-  toReplyID      String?
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
+  id               String           @id @default(uuid())
+  content          String           @default("")
+  deleted          Boolean          @default(false)
+  read             Boolean          @default(false)
+  type             NotificationType
+  toUserID         String?
+  fromUserID       String
+  squadRequestID   String?
+  fromTraceID      String?
+  fromReplyID      String?
+  toReplyID        String?
+  fromCircleID     String?
+  fromInvitationID String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
 
-  toUser       User?         @relation("toUser", fields: [toUserID], references: [id])
-  fromUser     User          @relation("fromUser", fields: [fromUserID], references: [id])
-  squadRequest SquadRequest? @relation(fields: [squadRequestID], references: [id])
-  fromTrace    Trace?        @relation(fields: [fromTraceID], references: [id])
-  fromReply    TraceComment? @relation("fromReply", fields: [fromReplyID], references: [id])
-  toReply      TraceComment? @relation("toReply", fields: [toReplyID], references: [id])
+  toUser         User?             @relation("toUser", fields: [toUserID], references: [id])
+  fromUser       User              @relation("fromUser", fields: [fromUserID], references: [id])
+  squadRequest   SquadRequest?     @relation(fields: [squadRequestID], references: [id])
+  fromTrace      Trace?            @relation(fields: [fromTraceID], references: [id])
+  fromReply      TraceComment?     @relation("fromReply", fields: [fromReplyID], references: [id])
+  toReply        TraceComment?     @relation("toReply", fields: [toReplyID], references: [id])
+  fromCircle     Circle?           @relation(fields: [fromCircleID], references: [id])
+  fromInvitation CircleInvitation? @relation(fields: [fromInvitationID], references: [id])
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
@@ -1157,7 +1152,7 @@ model Circle {
   posts             CirclePost[]
   members           CircleMember[]
   invitations       CircleInvitation[]
-  activities        CircleActivity[]
+  notifications     Notification[]
   displaySelections UserDisplayIcon[]
 
   @@index([ownerID])
@@ -1180,31 +1175,30 @@ model CircleMember {
 }
 
 model CirclePost {
-  id                String           @id @default(uuid())
-  content           String           @default("")
-  images            String[]         @default([])
-  tags              String[]         @default([])
-  city              String?
-  isHorn            Boolean          @default(false)
-  noteID            String?
-  vipRestriction    Int?
-  creditRestriction Int?
-  fancyRestriction  Boolean          @default(false)
-  viewCount         Int              @default(0)
+  id                      String           @id @default(uuid())
+  content                 String           @default("")
+  images                  String[]         @default([])
+  tags                    String[]         @default([])
+  city                    String?
+  isHorn                  Boolean          @default(false)
+  noteID                  String?
+  vipRestriction          Int?
+  creditRestriction       Int?
+  fancyRestriction        Boolean          @default(false)
+  viewCount               Int              @default(0)
   signupCount             Int              @default(0)
   signupVipRestriction    Int?
   signupCreditRestriction Int?
   signupFancyRestriction  Boolean          @default(false)
-  status            CirclePostStatus @default(ACTIVE)
-  authorID          String
-  circleID          String
-  createdAt         DateTime         @default(now())
-  updatedAt         DateTime         @updatedAt
+  status                  CirclePostStatus @default(ACTIVE)
+  authorID                String
+  circleID                String
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
 
-  author     User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
-  circle     Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  signups    CirclePostSignup[]
-  activities CircleActivity[]
+  author  User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  circle  Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  signups CirclePostSignup[]
 
   @@index([circleID, createdAt(sort: Desc)])
   @@index([authorID])
@@ -1212,10 +1206,12 @@ model CirclePost {
 }
 
 model CirclePostSignup {
-  id        String   @id @default(uuid())
-  postID    String
-  userID    String
-  createdAt DateTime @default(now())
+  id           String    @id @default(uuid())
+  postID       String
+  userID       String
+  seenByAuthor Boolean   @default(false)
+  seenAt       DateTime?
+  createdAt    DateTime  @default(now())
 
   post CirclePost @relation(fields: [postID], references: [id], onDelete: Cascade)
   user User       @relation(fields: [userID], references: [id], onDelete: Cascade)
@@ -1223,6 +1219,7 @@ model CirclePostSignup {
   @@unique([postID, userID])
   @@index([postID])
   @@index([userID])
+  @@index([postID, seenByAuthor])
 }
 
 model CircleInvitation {
@@ -1236,11 +1233,11 @@ model CircleInvitation {
   createdAt     DateTime               @default(now())
   updatedAt     DateTime               @updatedAt
 
-  circle     Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  applicant  User                       @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
-  inviter    User                       @relation("invitationInviter", fields: [inviterID], references: [id], onDelete: Cascade)
-  verifiers  CircleInvitationVerifier[]
-  activities CircleActivity[]
+  circle        Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  applicant     User                       @relation("invitationApplicant", fields: [applicantID], references: [id], onDelete: Cascade)
+  inviter       User                       @relation("invitationInviter", fields: [inviterID], references: [id], onDelete: Cascade)
+  verifiers     CircleInvitationVerifier[]
+  notifications Notification[]
 
   @@index([circleID, status])
   @@index([applicantID])
@@ -1261,27 +1258,6 @@ model CircleInvitationVerifier {
 
   @@unique([invitationID, verifierID])
   @@index([verifierID, status])
-}
-
-model CircleActivity {
-  id           String             @id @default(uuid())
-  circleID     String
-  invitationID String?
-  postID       String?
-  viewerID     String
-  actorID      String
-  type         CircleActivityType
-  readAt       DateTime?
-  createdAt    DateTime           @default(now())
-
-  circle     Circle            @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  invitation CircleInvitation? @relation(fields: [invitationID], references: [id], onDelete: SetNull)
-  post       CirclePost?       @relation(fields: [postID], references: [id], onDelete: SetNull)
-  viewer     User              @relation("circleActivityViewer", fields: [viewerID], references: [id], onDelete: Cascade)
-  actor      User              @relation("circleActivityActor", fields: [actorID], references: [id], onDelete: Cascade)
-
-  @@index([viewerID, readAt])
-  @@index([invitationID])
 }
 
 enum TempChatStatus {

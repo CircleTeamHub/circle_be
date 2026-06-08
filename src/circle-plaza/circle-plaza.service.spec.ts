@@ -1,4 +1,8 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -28,9 +32,9 @@ describe('CirclePlazaService', () => {
       create: jest.fn(),
       delete: jest.fn(),
       findMany: jest.fn(),
-    },
-    circleActivity: {
-      create: jest.fn(),
+      updateMany: jest.fn(),
+      count: jest.fn(),
+      groupBy: jest.fn(),
     },
     circle: {
       update: jest.fn(),
@@ -42,7 +46,7 @@ describe('CirclePlazaService', () => {
   };
 
   const realtime = {
-    broadcastCircleUnreadCount: jest.fn(),
+    broadcastSignupUnread: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -119,24 +123,20 @@ describe('CirclePlazaService', () => {
       fancyNumber: true,
     };
 
-    it('creates signup, increments count, and emits two activities', async () => {
+    it('creates signup, increments count, and refreshes only the author badge', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
       prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
-      prisma.circleActivity.create.mockResolvedValue({});
 
       const result = await service.signupForPost('user-2', 'post-1');
 
       expect(result).toEqual({ signed: true, signupCount: 3 });
-      expect(prisma.circleActivity.create).toHaveBeenCalledTimes(2);
-      expect(realtime.broadcastCircleUnreadCount).toHaveBeenCalledWith(
-        'user-2',
-      );
-      expect(realtime.broadcastCircleUnreadCount).toHaveBeenCalledWith(
-        'author-1',
-      );
+      // Signup no longer writes notification rows; the management view reads
+      // CirclePostSignup directly. Only the author's badge refreshes.
+      expect(realtime.broadcastSignupUnread).toHaveBeenCalledTimes(1);
+      expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
     });
 
     it('is idempotent when already signed up', async () => {
@@ -148,7 +148,7 @@ describe('CirclePlazaService', () => {
 
       expect(result).toEqual({ signed: true, signupCount: 5 });
       expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
-      expect(prisma.circleActivity.create).not.toHaveBeenCalled();
+      expect(realtime.broadcastSignupUnread).not.toHaveBeenCalled();
     });
 
     it('is idempotent when concurrent signup hits the P2002 unique constraint', async () => {
@@ -172,22 +172,96 @@ describe('CirclePlazaService', () => {
       });
     });
 
-    it('emits only CONFIRMED when author signs up to own post', async () => {
+    it('rejects an author signing up to their own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
-      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
-      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
-      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
-      prisma.circleActivity.create.mockResolvedValue({});
 
-      await service.signupForPost('author-1', 'post-1');
+      await expect(service.signupForPost('author-1', 'post-1')).rejects.toThrow(
+        ForbiddenException,
+      );
 
-      expect(prisma.circleActivity.create).toHaveBeenCalledTimes(1);
-      expect(prisma.circleActivity.create).toHaveBeenCalledWith(
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+      expect(realtime.broadcastSignupUnread).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('signup management', () => {
+    it('lists my posts with per-post unread signup counts', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([
+        {
+          id: 'post-1',
+          circleID: 'circle-1',
+          content: 'Hiking this weekend, who is in?',
+          images: ['img-1'],
+          signupCount: 5,
+          status: 'ACTIVE',
+          createdAt: new Date('2026-06-06T00:00:00Z'),
+        },
+      ]);
+      prisma.circlePost.count.mockResolvedValue(1);
+      prisma.circlePostSignup.groupBy.mockResolvedValue([
+        { postID: 'post-1', _count: { _all: 2 } },
+      ]);
+
+      const result = await service.listMyPosts('author-1', 1);
+
+      expect(result.items[0]).toEqual(
         expect.objectContaining({
-          data: expect.objectContaining({ type: 'POST_SIGNUP_CONFIRMED' }),
+          id: 'post-1',
+          signupCount: 5,
+          unreadSignupCount: 2,
+          firstImage: 'img-1',
         }),
       );
+      expect(result.total).toBe(1);
+    });
+
+    it('returns signers with OpenIM ids for my own post', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        {
+          createdAt: new Date('2026-06-06T00:00:00Z'),
+          seenByAuthor: false,
+          user: {
+            id: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
+            nickname: 'meiguici',
+            avatarUrl: null,
+            accountId: '123',
+          },
+        },
+      ]);
+
+      const result = await service.getMyPostSignups('author-1', 'post-1');
+
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
+          imUserId: '0a9ad3d6ef1d47bd9cbccda1cee57547',
+          nickname: 'meiguici',
+          seen: false,
+        }),
+      );
+    });
+
+    it('rejects reading signers of a post the caller does not own', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.getMyPostSignups('intruder', 'post-1'),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('marks signups seen and refreshes the author badge', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+      prisma.circlePostSignup.updateMany.mockResolvedValue({ count: 2 });
+
+      const result = await service.markPostSignupsSeen('author-1', 'post-1');
+
+      expect(result).toEqual({ count: 2 });
+      expect(prisma.circlePostSignup.updateMany).toHaveBeenCalledWith({
+        where: { postID: 'post-1', seenByAuthor: false },
+        data: { seenByAuthor: true, seenAt: expect.any(Date) },
+      });
+      expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
     });
   });
 
@@ -226,7 +300,6 @@ describe('CirclePlazaService', () => {
       });
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
       prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
-      prisma.circleActivity.create.mockResolvedValue({});
 
       const result = await service.signupForPost('user-2', 'post-1');
       expect(result).toEqual({ signed: true, signupCount: 1 });
@@ -257,6 +330,7 @@ describe('CirclePlazaService', () => {
 
   describe('getPostSignups', () => {
     it('maps signups to public user shape', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
       prisma.circlePostSignup.findMany.mockResolvedValue([
         {
           createdAt: new Date('2026-06-05T00:00:00Z'),
@@ -264,7 +338,7 @@ describe('CirclePlazaService', () => {
         },
       ]);
 
-      const result = await service.getPostSignups('post-1');
+      const result = await service.getPostSignups('author-1', 'post-1');
 
       expect(result.items).toEqual([
         {
@@ -275,6 +349,15 @@ describe('CirclePlazaService', () => {
           signedAt: '2026-06-05T00:00:00.000Z',
         },
       ]);
+    });
+
+    it('rejects reading signups for a post the caller does not own', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(null);
+
+      await expect(service.getPostSignups('user-2', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(prisma.circlePostSignup.findMany).not.toHaveBeenCalled();
     });
   });
 

@@ -14,6 +14,28 @@ export class NotificationService {
     private readonly realtimeService: RealtimeService,
   ) {}
 
+  private isDiscoverNotification(type: NotificationType): boolean {
+    return (DISCOVER_NOTIFICATION_TYPES as readonly NotificationType[]).includes(
+      type,
+    );
+  }
+
+  private isProfileNotification(type: NotificationType): boolean {
+    return (PROFILE_NOTIFICATION_TYPES as readonly NotificationType[]).includes(
+      type,
+    );
+  }
+
+  private async broadcastUnreadForType(userId: string, type: NotificationType) {
+    if (this.isDiscoverNotification(type)) {
+      await this.realtimeService.broadcastInteractionUnread(userId);
+      return;
+    }
+    if (this.isProfileNotification(type)) {
+      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    }
+  }
+
   async getUnreadSummary(userId: string) {
     const [discoverUnread, profileUnread] = await Promise.all([
       this.prisma.notification.count({
@@ -84,7 +106,11 @@ export class NotificationService {
     const take = 20;
     const skip = (Math.max(1, page) - 1) * take;
     const rows = await this.prisma.notification.findMany({
-      where: { toUserID: userId, deleted: false },
+      where: {
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+      },
       orderBy: { createdAt: 'desc' },
       skip,
       take,
@@ -92,6 +118,8 @@ export class NotificationService {
         fromUser: { select: { id: true, nickname: true, avatarUrl: true } },
         fromTrace: { select: { id: true, content: true, images: true } },
         fromReply: { select: { id: true, content: true } },
+        fromCircle: { select: { id: true, name: true } },
+        fromInvitation: { select: { id: true, status: true } },
       },
     });
     return rows.map((n) => ({
@@ -117,37 +145,60 @@ export class NotificationService {
       fromReply: n.fromReply
         ? { id: n.fromReply.id, content: n.fromReply.content }
         : null,
+      fromCircle: n.fromCircle
+        ? { id: n.fromCircle.id, name: n.fromCircle.name }
+        : null,
+      fromInvitation: n.fromInvitation
+        ? { id: n.fromInvitation.id, status: n.fromInvitation.status }
+        : null,
     }));
   }
 
   async markNotificationRead(userId: string, id: string): Promise<void> {
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, toUserID: userId, deleted: false },
+      select: { type: true, read: true },
+    });
+    if (!notification) return;
+
     const result = await this.prisma.notification.updateMany({
       where: { id, toUserID: userId, read: false, deleted: false },
       data: { read: true },
     });
     if (result.count > 0) {
-      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+      await this.broadcastUnreadForType(userId, notification.type);
     }
   }
 
   async markAllNotificationsRead(userId: string): Promise<{ count: number }> {
     const result = await this.prisma.notification.updateMany({
-      where: { toUserID: userId, deleted: false, read: false },
+      where: {
+        toUserID: userId,
+        deleted: false,
+        read: false,
+        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+      },
       data: { read: true },
     });
     if (result.count > 0) {
-      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+      await this.realtimeService.broadcastInteractionUnread(userId);
     }
     return { count: result.count };
   }
 
   async deleteNotification(userId: string, id: string): Promise<void> {
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, toUserID: userId, deleted: false },
+      select: { type: true, read: true },
+    });
+    if (!notification) return;
+
     const result = await this.prisma.notification.updateMany({
       where: { id, toUserID: userId, deleted: false },
       data: { deleted: true },
     });
-    if (result.count > 0) {
-      await this.realtimeService.broadcastSystemNotificationUnread(userId);
+    if (result.count > 0 && !notification.read) {
+      await this.broadcastUnreadForType(userId, notification.type);
     }
   }
 
