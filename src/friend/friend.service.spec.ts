@@ -6,9 +6,11 @@ import {
 } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { FriendState, Prisma } from 'src/generated/prisma';
+import { FriendState, NotificationType, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
+import { OpenimService } from 'src/openim/openim.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
@@ -68,6 +70,9 @@ describe('FriendService', () => {
       create: jest.fn(),
       findFirst: jest.fn(),
     },
+    friendSyncOutbox: {
+      createMany: jest.fn(),
+    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
@@ -78,6 +83,17 @@ describe('FriendService', () => {
 
   const realtimeService = {
     broadcastFriendUnreadCount: jest.fn(),
+    broadcastInteractionUnread: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+  };
+  const notificationService = {
+    createFriendRequestNotification: jest.fn(),
+  };
+  const openimService = {
+    addBlacklist: jest.fn(),
+    deleteFriend: jest.fn(),
+    importFriends: jest.fn(),
+    removeBlacklist: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -94,6 +110,11 @@ describe('FriendService', () => {
         }
       }
     }
+    notificationService.createFriendRequestNotification.mockReset();
+    for (const mock of Object.values(openimService)) {
+      mock.mockReset();
+      mock.mockResolvedValue(undefined);
+    }
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -106,6 +127,8 @@ describe('FriendService', () => {
         FriendService,
         { provide: PrismaService, useValue: prisma },
         { provide: RealtimeService, useValue: realtimeService },
+        { provide: NotificationService, useValue: notificationService },
+        { provide: OpenimService, useValue: openimService },
       ],
     }).compile();
 
@@ -170,6 +193,77 @@ describe('FriendService', () => {
     expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalledWith(
       'user-2',
     );
+  });
+
+  it('creates and broadcasts a friend request notification for the recipient', async () => {
+    const notification = {
+      id: 'notification-1',
+      type: NotificationType.FRIEND_REQUEST_RECEIVED,
+    };
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    notificationService.createFriendRequestNotification.mockResolvedValue(
+      notification,
+    );
+
+    await service.sendRequest('user-1', 'user-2', 'hello');
+
+    expect(
+      notificationService.createFriendRequestNotification,
+    ).toHaveBeenCalledWith({
+      type: NotificationType.FRIEND_REQUEST_RECEIVED,
+      toUserId: 'user-2',
+      fromUserId: 'user-1',
+      content: 'hello',
+    });
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'user-2',
+      notification,
+    );
+  });
+
+  it('does not fail a created friend request when notification delivery fails', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    notificationService.createFriendRequestNotification.mockRejectedValue(
+      new Error('notification unavailable'),
+    );
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello'),
+    ).resolves.toBeUndefined();
+
+    expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalled();
   });
 
   it('returns editable friend settings with current remark and assigned tags', async () => {
@@ -734,6 +828,10 @@ describe('FriendService', () => {
   });
 
   it('applies pending sender remark and tags when accepting a request', async () => {
+    const notification = {
+      id: 'notification-1',
+      type: NotificationType.FRIEND_REQUEST_ACCEPTED,
+    };
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
@@ -760,6 +858,9 @@ describe('FriendService', () => {
       pendingRemarkBySender: 'met at school',
       remarkA: 'met at school',
     });
+    notificationService.createFriendRequestNotification.mockResolvedValue(
+      notification,
+    );
 
     await service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED);
 
@@ -779,6 +880,137 @@ describe('FriendService', () => {
         },
       ],
     });
+    expect(
+      notificationService.createFriendRequestNotification,
+    ).toHaveBeenCalledWith({
+      type: NotificationType.FRIEND_REQUEST_ACCEPTED,
+      toUserId: 'user-1',
+      fromUserId: 'user-2',
+      content: 'hello',
+    });
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'user-1',
+      notification,
+    );
+  });
+
+  it('does not fail an accepted request when notification delivery fails', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
+    prisma.friend.update.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+      message: 'hello',
+    });
+    notificationService.createFriendRequestNotification.mockRejectedValue(
+      new Error('notification unavailable'),
+    );
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).resolves.toBeUndefined();
+  });
+
+  it('queues accepted friend request OpenIM sync in both directions', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
+    prisma.friend.update.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+      message: 'hello',
+    });
+
+    await service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED);
+
+    expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        { operation: 'IMPORT_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
+        { operation: 'IMPORT_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.importFriends).not.toHaveBeenCalled();
+  });
+
+  it('does not call OpenIM directly when accepting a friend request', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
+    prisma.friend.update.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+      message: 'hello',
+    });
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).resolves.toBeUndefined();
+    expect(openimService.importFriends).not.toHaveBeenCalled();
+  });
+
+  it('queues removeFriend OpenIM sync in both directions', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friend.delete.mockResolvedValue({});
+
+    await service.removeFriend('user-1', 'user-2');
+
+    expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        { operation: 'DELETE_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
+        { operation: 'DELETE_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.deleteFriend).not.toHaveBeenCalled();
+  });
+
+  it('does not call OpenIM directly when removing a friend', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friend.delete.mockResolvedValue({});
+
+    await expect(
+      service.removeFriend('user-1', 'user-2'),
+    ).resolves.toBeUndefined();
+    expect(openimService.deleteFriend).not.toHaveBeenCalled();
   });
 
   it('writes accept state, promoted tags, and activity history in the same transaction', async () => {
@@ -904,6 +1136,10 @@ describe('FriendService', () => {
   });
 
   it('does not apply pending metadata when rejecting a request', async () => {
+    const notification = {
+      id: 'notification-1',
+      type: NotificationType.FRIEND_REQUEST_REJECTED,
+    };
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
@@ -920,6 +1156,9 @@ describe('FriendService', () => {
       message: 'hello',
       pendingRemarkBySender: 'met at school',
     });
+    notificationService.createFriendRequestNotification.mockResolvedValue(
+      notification,
+    );
 
     await service.handleRequest('user-2', 'request-1', FriendState.REJECTED);
 
@@ -928,6 +1167,18 @@ describe('FriendService', () => {
       data: { state: FriendState.REJECTED },
     });
     expect(prisma.friendTagOnFriend.createMany).not.toHaveBeenCalled();
+    expect(
+      notificationService.createFriendRequestNotification,
+    ).toHaveBeenCalledWith({
+      type: NotificationType.FRIEND_REQUEST_REJECTED,
+      toUserId: 'user-1',
+      fromUserId: 'user-2',
+      content: 'hello',
+    });
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'user-1',
+      notification,
+    );
   });
 
   it('rejects accepting a request whose sender is no longer active', async () => {
@@ -961,6 +1212,38 @@ describe('FriendService', () => {
     await expect(service.blockUser('user-1', 'user-2')).rejects.toThrow(
       ConflictException,
     );
+  });
+
+  it('queues block OpenIM sync for blacklist and friendship removal', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.block.findUnique.mockResolvedValue(null);
+
+    await service.blockUser('user-1', 'user-2');
+
+    expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        { operation: 'ADD_BLACKLIST', userID: 'user-1', targetUserID: 'user-2' },
+        { operation: 'DELETE_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
+        { operation: 'DELETE_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.addBlacklist).not.toHaveBeenCalled();
+    expect(openimService.deleteFriend).not.toHaveBeenCalled();
+  });
+
+  it('does not call OpenIM directly when blocking a user', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.block.findUnique.mockResolvedValue(null);
+
+    await expect(service.blockUser('user-1', 'user-2')).resolves.toBeUndefined();
+    expect(openimService.addBlacklist).not.toHaveBeenCalled();
   });
 
   it('marks exactly one friend activity as read for the viewer', async () => {
@@ -1141,5 +1424,32 @@ describe('FriendService', () => {
     await expect(service.unblockUser('user-1', 'user-2')).rejects.toThrow(
       NotFoundException,
     );
+  });
+
+  it('queues unblock OpenIM blacklist removal', async () => {
+    prisma.block.delete.mockResolvedValue({});
+
+    await service.unblockUser('user-1', 'user-2');
+
+    expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'REMOVE_BLACKLIST',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.removeBlacklist).not.toHaveBeenCalled();
+  });
+
+  it('does not call OpenIM directly when unblocking a user', async () => {
+    prisma.block.delete.mockResolvedValue({});
+
+    await expect(
+      service.unblockUser('user-1', 'user-2'),
+    ).resolves.toBeUndefined();
+    expect(openimService.removeBlacklist).not.toHaveBeenCalled();
   });
 });

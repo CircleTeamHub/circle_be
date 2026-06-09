@@ -6,9 +6,10 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { FriendState } from 'src/generated/prisma';
+import { FriendState, NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
@@ -79,6 +80,7 @@ export class FriendService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    private readonly notificationService: NotificationService,
   ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
@@ -212,6 +214,12 @@ export class FriendService {
 
     this.logger.log(`Friend request sent: ${senderId} → ${targetId}`);
     await this.broadcastFriendUnreadUpdates([senderId, targetId]);
+    await this.createAndBroadcastFriendRequestNotification({
+      type: NotificationType.FRIEND_REQUEST_RECEIVED,
+      toUserId: targetId,
+      fromUserId: senderId,
+      content: message ?? '',
+    });
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'friend_request_sent',
@@ -236,7 +244,7 @@ export class FriendService {
     ) {
       throw new NotFoundException('Pending request not found');
     }
-    await this.prisma.$transaction(async (tx: any) => {
+    const nextRequest = await this.prisma.$transaction(async (tx: any) => {
       const updated = await tx.friend.update({
         where: { id: requestId },
         data: { state: FriendState.WITHDRAWN },
@@ -305,7 +313,7 @@ export class FriendService {
       await this.assertBelowFriendLimit(recipientId);
     }
 
-    await this.prisma.$transaction(async (tx: any) => {
+    const nextRequest = await this.prisma.$transaction(async (tx: any) => {
       const data: any = { state: decision };
 
       if (
@@ -374,9 +382,36 @@ export class FriendService {
             ],
       );
 
+      if (decision === FriendState.ACCEPTED) {
+        await tx.friendSyncOutbox.createMany({
+          data: [
+            {
+              operation: 'IMPORT_FRIEND',
+              userID: nextRequest.userID,
+              targetUserID: recipientId,
+            },
+            {
+              operation: 'IMPORT_FRIEND',
+              userID: recipientId,
+              targetUserID: nextRequest.userID,
+            },
+          ],
+          skipDuplicates: true,
+        });
+      }
+
       return nextRequest;
     });
     await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
+    await this.createAndBroadcastFriendRequestNotification({
+      type:
+        decision === FriendState.ACCEPTED
+          ? NotificationType.FRIEND_REQUEST_ACCEPTED
+          : NotificationType.FRIEND_REQUEST_REJECTED,
+      toUserId: record.userID,
+      fromUserId: recipientId,
+      content: nextRequest.message ?? '',
+    });
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent:
@@ -406,7 +441,24 @@ export class FriendService {
     if (!record) {
       throw new NotFoundException('Friendship not found');
     }
-    await this.prisma.friend.delete({ where: { id: record.id } });
+    await this.prisma.$transaction(async (tx: any) => {
+      await tx.friend.delete({ where: { id: record.id } });
+      await tx.friendSyncOutbox.createMany({
+        data: [
+          {
+            operation: 'DELETE_FRIEND',
+            userID: userId,
+            targetUserID: friendId,
+          },
+          {
+            operation: 'DELETE_FRIEND',
+            userID: friendId,
+            targetUserID: userId,
+          },
+        ],
+        skipDuplicates: true,
+      });
+    });
   }
 
   async reportFriend(
@@ -731,19 +783,39 @@ export class FriendService {
     // concurrent block call wins between the findUnique and the create, so the
     // client still sees a clean 409 instead of a leaked Prisma constraint name.
     try {
-      await this.prisma.$transaction([
-        this.prisma.friend.deleteMany({
+      await this.prisma.$transaction(async (tx: any) => {
+        await tx.friend.deleteMany({
           where: {
             OR: [
               { userID: blockerId, friendID: targetId },
               { userID: targetId, friendID: blockerId },
             ],
           },
-        }),
-        this.prisma.block.create({
+        });
+        await tx.block.create({
           data: { blockerID: blockerId, blockedID: targetId },
-        }),
-      ]);
+        });
+        await tx.friendSyncOutbox.createMany({
+          data: [
+            {
+              operation: 'ADD_BLACKLIST',
+              userID: blockerId,
+              targetUserID: targetId,
+            },
+            {
+              operation: 'DELETE_FRIEND',
+              userID: blockerId,
+              targetUserID: targetId,
+            },
+            {
+              operation: 'DELETE_FRIEND',
+              userID: targetId,
+              targetUserID: blockerId,
+            },
+          ],
+          skipDuplicates: true,
+        });
+      });
     } catch (error) {
       if (this.isPrismaUniqueConstraintError(error)) {
         throw new ConflictException('User already blocked');
@@ -765,10 +837,22 @@ export class FriendService {
 
   async unblockUser(blockerId: string, targetId: string): Promise<void> {
     try {
-      await this.prisma.block.delete({
-        where: {
-          blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
-        },
+      await this.prisma.$transaction(async (tx: any) => {
+        await tx.block.delete({
+          where: {
+            blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
+          },
+        });
+        await tx.friendSyncOutbox.createMany({
+          data: [
+            {
+              operation: 'REMOVE_BLACKLIST',
+              userID: blockerId,
+              targetUserID: targetId,
+            },
+          ],
+          skipDuplicates: true,
+        });
       });
     } catch (error) {
       // P2025 = record to delete does not exist.
@@ -1001,6 +1085,36 @@ export class FriendService {
         this.realtimeService.broadcastFriendUnreadCount(userId),
       ),
     );
+  }
+
+  private async createAndBroadcastFriendRequestNotification(params: {
+    type:
+      | typeof NotificationType.FRIEND_REQUEST_RECEIVED
+      | typeof NotificationType.FRIEND_REQUEST_ACCEPTED
+      | typeof NotificationType.FRIEND_REQUEST_REJECTED;
+    toUserId: string;
+    fromUserId: string;
+    content: string;
+  }): Promise<void> {
+    try {
+      const notification =
+        await this.notificationService.createFriendRequestNotification(params);
+      if (!notification) {
+        return;
+      }
+
+      await this.realtimeService.broadcastInteractionUnread(params.toUserId);
+      this.realtimeService.broadcastNotificationCreated(
+        params.toUserId,
+        notification,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Friend notification side effect failed: ${params.type} ${params.fromUserId} -> ${params.toUserId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   private async throwActiveFriendConflict(
@@ -1338,4 +1452,5 @@ export class FriendService {
       );
     }
   }
+
 }

@@ -1,12 +1,15 @@
 import { Module } from '@nestjs/common';
+import { NotificationModule } from 'src/notification/notification.module';
+import { OpenimModule } from 'src/openim/openim.module';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { FriendController } from './friend.controller';
+import { FriendSyncOutboxProcessor } from './friend-sync-outbox.processor';
 import { FriendService } from './friend.service';
 
 @Module({
-  imports: [RealtimeModule],
+  imports: [RealtimeModule, NotificationModule, OpenimModule],
   controllers: [FriendController],
-  providers: [FriendService],
+  providers: [FriendService, FriendSyncOutboxProcessor],
   exports: [FriendService],
 })
 export class FriendModule {}
