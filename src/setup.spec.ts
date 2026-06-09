@@ -108,4 +108,16 @@ describe('setupApp', () => {
       expect.any(Function),
     );
   });
+
+  it('adds dedicated rate limits for group writes and group reports', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const groupLimiters = app.use.mock.calls.filter(
+      ([path]) => path === '/api/v1/group',
+    );
+    expect(groupLimiters).toHaveLength(2);
+    expect(groupLimiters[0][1]).toEqual(expect.any(Function));
+    expect(groupLimiters[1][1]).toEqual(expect.any(Function));
+  });
 });

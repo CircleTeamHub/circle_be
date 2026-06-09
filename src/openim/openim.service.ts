@@ -5,6 +5,8 @@ import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
+const OPENIM_ADMIN_TOKEN_FAILURE_COOLDOWN_MS = 30_000;
+const OPENIM_HTTP_ERROR_BODY_LIMIT = 300;
 
 @Injectable()
 export class OpenimService implements OnModuleInit {
@@ -12,6 +14,7 @@ export class OpenimService implements OnModuleInit {
   private readonly loggingConfig = createLoggingConfig();
   private adminToken: string | null = null;
   private adminTokenExpiresAt: number = 0;
+  private adminTokenRetryAfter: number = 0;
   /** In-flight refresh promise — shared across concurrent callers to prevent thundering herd. */
   private adminTokenRefreshPromise: Promise<string> | null = null;
 
@@ -40,15 +43,25 @@ export class OpenimService implements OnModuleInit {
       return this.adminToken;
     }
 
+    if (Date.now() < this.adminTokenRetryAfter) {
+      throw new Error('OpenIM unavailable: admin token refresh is cooling down');
+    }
+
     // Return the in-flight promise to all concurrent callers so we only make
     // one refresh request even under a login burst (thundering herd prevention).
     if (this.adminTokenRefreshPromise) {
       return this.adminTokenRefreshPromise;
     }
 
-    this.adminTokenRefreshPromise = this.fetchAdminToken().finally(() => {
-      this.adminTokenRefreshPromise = null;
-    });
+    this.adminTokenRefreshPromise = this.fetchAdminToken()
+      .catch((error) => {
+        this.adminTokenRetryAfter =
+          Date.now() + OPENIM_ADMIN_TOKEN_FAILURE_COOLDOWN_MS;
+        throw error;
+      })
+      .finally(() => {
+        this.adminTokenRefreshPromise = null;
+      });
     return this.adminTokenRefreshPromise;
   }
 
@@ -62,6 +75,7 @@ export class OpenimService implements OnModuleInit {
     // Cache for 20 hours (tokens typically last 24h)
     this.adminToken = res.token;
     this.adminTokenExpiresAt = Date.now() + 20 * 60 * 60 * 1000;
+    this.adminTokenRetryAfter = 0;
     return this.adminToken;
   }
 
@@ -182,6 +196,86 @@ export class OpenimService implements OnModuleInit {
     );
   }
 
+  async isGroupMember(groupID: string, userID: string): Promise<boolean> {
+    if (!this.enabled) return false;
+
+    const imUserID = OpenimService.toImUserId(userID);
+    const adminToken = await this.getAdminToken();
+    const res = await this.post<{ members?: Array<{ userID: string }> }>(
+      '/group/get_group_members_info',
+      {
+        groupID,
+        userIDs: [imUserID],
+      },
+      adminToken,
+    );
+
+    return (res.members ?? []).some((member) => member.userID === imUserID);
+  }
+
+  async importFriends(
+    ownerUserID: string,
+    friendUserIDs: string[],
+  ): Promise<void> {
+    if (!this.enabled || friendUserIDs.length === 0) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/friend/import_friend',
+      {
+        ownerUserID: OpenimService.toImUserId(ownerUserID),
+        friendUserIDs: friendUserIDs.map(OpenimService.toImUserId),
+      },
+      adminToken,
+    );
+  }
+
+  async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/friend/delete_friend',
+      {
+        ownerUserID: OpenimService.toImUserId(ownerUserID),
+        friendUserID: OpenimService.toImUserId(friendUserID),
+      },
+      adminToken,
+    );
+  }
+
+  async addBlacklist(ownerUserID: string, blackUserID: string): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/friend/add_black',
+      {
+        ownerUserID: OpenimService.toImUserId(ownerUserID),
+        blackUserID: OpenimService.toImUserId(blackUserID),
+        ex: '',
+      },
+      adminToken,
+    );
+  }
+
+  async removeBlacklist(
+    ownerUserID: string,
+    blackUserID: string,
+  ): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/friend/remove_black',
+      {
+        ownerUserID: OpenimService.toImUserId(ownerUserID),
+        blackUserID: OpenimService.toImUserId(blackUserID),
+      },
+      adminToken,
+    );
+  }
+
   /**
    * 解散群。解散后群消息对客户端不再可见，等价于「销毁即清」。
    * 路径已核实：/group/dismiss_group（admin token）。
@@ -219,6 +313,7 @@ export class OpenimService implements OnModuleInit {
     path: string,
     body: Record<string, unknown>,
     token?: string,
+    retryOnAuthError = true,
   ): Promise<T> {
     const start = Date.now();
     let result: 'success' | 'failure' = 'success';
@@ -240,6 +335,12 @@ export class OpenimService implements OnModuleInit {
         signal: AbortSignal.timeout(OPENIM_REQUEST_TIMEOUT_MS),
       });
 
+      if (response.ok === false) {
+        const text = await response.text();
+        const detail = text.slice(0, OPENIM_HTTP_ERROR_BODY_LIMIT);
+        throw new Error(`OpenIM HTTP ${response.status}: ${detail}`);
+      }
+
       const json = (await response.json()) as {
         errCode: number;
         errMsg?: string;
@@ -248,6 +349,13 @@ export class OpenimService implements OnModuleInit {
       };
 
       if (json.errCode !== 0) {
+        if (token && retryOnAuthError && this.isAdminTokenError(json)) {
+          this.adminToken = null;
+          this.adminTokenExpiresAt = 0;
+          const freshToken = await this.getAdminToken();
+          return this.post(path, body, freshToken, false);
+        }
+
         const message = json.errMsg ?? String(json.errCode);
         const detail = json.errDlt ? ` (${json.errDlt})` : '';
         this.logger.error(
@@ -277,5 +385,21 @@ export class OpenimService implements OnModuleInit {
         result,
       });
     }
+  }
+
+  private isAdminTokenError(error: {
+    errCode: number;
+    errMsg?: string;
+    errDlt?: string;
+  }): boolean {
+    if ([1501, 1503].includes(error.errCode)) {
+      return true;
+    }
+
+    const message = `${error.errMsg ?? ''} ${error.errDlt ?? ''}`;
+    return (
+      /token/i.test(message) &&
+      /(invalid|expired|expire|鉴权|过期)/i.test(message)
+    );
   }
 }

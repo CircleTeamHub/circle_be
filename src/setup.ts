@@ -96,6 +96,24 @@ const conversationGroupWriteLimiterOptions = {
   },
 } satisfies Partial<RateLimitOptions>;
 
+/** Group membership writes: 60 mutating requests / 15 min per IP. */
+const groupWriteLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many group operations, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
+/** Group report spam protection: 10 reports per hour per IP. */
+const groupReportLimiterOptions = {
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many reports submitted, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
 /**
  * Account lookup limiter. Without this, any authenticated user can probe the
  * /user/search/account endpoint to enumerate accountIds at the global 300/min
@@ -187,6 +205,14 @@ export const setupApp = (app: INestApplication) => {
     'friend_report',
     friendReportLimiterOptions,
   );
+  const groupWriteLimiter = createLimiter(
+    'group_write',
+    groupWriteLimiterOptions,
+  );
+  const groupReportLimiter = createLimiter(
+    'group_report',
+    groupReportLimiterOptions,
+  );
 
   if (logger && loggingConfig.httpLogOn) {
     app.use(
@@ -264,6 +290,18 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/conversation-groups', (req: any, res: any, next: any) => {
     if (req.method !== 'GET') {
       return conversationGroupWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/group', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' && /^\/[^/]+\/report$/.test(req.path)) {
+      return groupReportLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/group', (req: any, res: any, next: any) => {
+    if (req.method === 'POST' || req.method === 'DELETE') {
+      return groupWriteLimiter(req, res, next);
     }
     next();
   });

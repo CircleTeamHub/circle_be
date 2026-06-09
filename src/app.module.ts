@@ -31,6 +31,7 @@ import { ConversationGroupModule } from './conversation-group/conversation-group
 import { TempChatModule } from './temp-chat/temp-chat.module';
 import { createEnvValidationSchema } from './config/env.validation';
 import { ChatHistoryModule } from './chat-history/chat-history.module';
+import { GroupModule } from './group/group.module';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
 
@@ -67,6 +68,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     ConversationGroupModule,
     TempChatModule,
     ChatHistoryModule,
+    GroupModule,
   ],
   controllers: [],
   providers: [Logger],
