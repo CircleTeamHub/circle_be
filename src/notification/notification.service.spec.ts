@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationService } from './notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationType } from 'src/generated/prisma';
+import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
 
 describe('NotificationService', () => {
   let service: NotificationService;
@@ -23,6 +25,9 @@ describe('NotificationService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    for (const nested of Object.values(prisma.notification)) {
+      nested.mockReset();
+    }
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -84,6 +89,85 @@ describe('NotificationService', () => {
   });
 
   describe('notification center', () => {
+    it('creates squad request notifications with realtime payload context', async () => {
+      prisma.notification.create.mockResolvedValue({
+        id: 'n-squad-1',
+        type: NotificationType.SQUAD_REQUEST_RECEIVED,
+        content: 'join',
+        read: false,
+        createdAt: new Date('2026-06-05T00:00:00Z'),
+        toUserID: 'owner-1',
+        fromUser: { id: 'user-2', nickname: 'B', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+        squadRequest: {
+          id: 'request-1',
+          status: 'PENDING',
+          toSquad: { id: 'squad-1', name: 'Running Club' },
+        },
+      });
+
+      const result = await service.createSquadRequestNotification({
+        type: NotificationType.SQUAD_REQUEST_RECEIVED,
+        toUserId: 'owner-1',
+        fromUserId: 'user-2',
+        squadRequestId: 'request-1',
+        content: 'join',
+      });
+
+      expect(prisma.notification.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            toUserID: 'owner-1',
+            fromUserID: 'user-2',
+            type: NotificationType.SQUAD_REQUEST_RECEIVED,
+            squadRequestID: 'request-1',
+            content: 'join',
+          },
+        }),
+      );
+      expect(result).toEqual(
+        expect.objectContaining({
+          id: 'n-squad-1',
+          type: NotificationType.SQUAD_REQUEST_RECEIVED,
+          squadRequest: {
+            id: 'request-1',
+            status: 'PENDING',
+            squad: { id: 'squad-1', name: 'Running Club' },
+          },
+        }),
+      );
+    });
+
+    it('deduplicates repeated trace-like notifications inside the cooldown window', async () => {
+      prisma.notification.findFirst.mockResolvedValue({
+        id: 'existing-like',
+      });
+
+      const result = await service.createTraceLikeNotification({
+        actorId: 'viewer-1',
+        traceId: 'trace-1',
+        traceOwnerId: 'author-1',
+      });
+
+      expect(result).toBeNull();
+      expect(prisma.notification.findFirst).toHaveBeenCalledWith({
+        where: {
+          toUserID: 'author-1',
+          fromUserID: 'viewer-1',
+          type: NotificationType.TRACE_LIKE,
+          deleted: false,
+          fromTraceID: 'trace-1',
+          createdAt: { gte: expect.any(Date) },
+        },
+        select: { id: true },
+      });
+      expect(prisma.notification.create).not.toHaveBeenCalled();
+    });
+
     it('getNotifications maps fromUser/fromTrace/fromReply and paginates', async () => {
       prisma.notification.findMany.mockResolvedValue([
         {
@@ -106,14 +190,7 @@ describe('NotificationService', () => {
             toUserID: 'user-1',
             deleted: false,
             type: {
-              in: [
-                'TRACE_COMMENT',
-                'COMMENT_REPLY',
-                'CIRCLE_VERIFICATION_REQUESTED',
-                'CIRCLE_INVITATION_APPROVED',
-                'CIRCLE_INVITATION_REJECTED',
-                'CIRCLE_ADMIN_OVERRIDE_APPROVED',
-              ],
+              in: [...DISCOVER_NOTIFICATION_TYPES],
             },
           },
           skip: 0,
@@ -131,7 +208,9 @@ describe('NotificationService', () => {
         fromTrace: { id: 't1', excerpt: 'my trace body', firstImage: 'img1' },
         fromReply: { id: 'r1', content: 'reply body' },
         fromCircle: null,
+        fromCirclePost: null,
         fromInvitation: null,
+        squadRequest: null,
       });
     });
 
@@ -168,9 +247,7 @@ describe('NotificationService', () => {
       expect(
         realtimeService.broadcastSystemNotificationUnread,
       ).toHaveBeenCalledWith('user-1');
-      expect(
-        realtimeService.broadcastInteractionUnread,
-      ).not.toHaveBeenCalled();
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
     });
 
     it('markNotificationRead skips broadcasting when no row changed', async () => {
@@ -207,14 +284,7 @@ describe('NotificationService', () => {
           deleted: false,
           read: false,
           type: {
-            in: [
-              'TRACE_COMMENT',
-              'COMMENT_REPLY',
-              'CIRCLE_VERIFICATION_REQUESTED',
-              'CIRCLE_INVITATION_APPROVED',
-              'CIRCLE_INVITATION_REJECTED',
-              'CIRCLE_ADMIN_OVERRIDE_APPROVED',
-            ],
+            in: [...DISCOVER_NOTIFICATION_TYPES],
           },
         },
         data: { read: true },

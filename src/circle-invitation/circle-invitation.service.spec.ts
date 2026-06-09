@@ -47,6 +47,8 @@ describe('CircleInvitationService', () => {
 
   const realtimeService = {
     broadcastInteractionUnread: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+    broadcastCircleInvitationReviewed: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -106,20 +108,69 @@ describe('CircleInvitationService', () => {
       verifiers: [],
     });
     prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.notification.create.mockResolvedValue({
+      id: 'notification-1',
+      type: 'CIRCLE_VERIFICATION_REQUESTED',
+      content: '',
+      read: false,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      fromUser: { id: 'applicant-1', nickname: 'Applicant', avatarUrl: null },
+      fromTrace: null,
+      fromReply: null,
+      fromCircle: { id: 'circle-1', name: 'Circle' },
+      fromInvitation: { id: 'inv-1', status: 'PENDING' },
+    });
 
     await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
 
-    expect(prisma.notification.create).toHaveBeenCalledWith({
-      data: {
-        toUserID: 'verifier-9',
-        fromUserID: 'applicant-1',
-        type: 'CIRCLE_VERIFICATION_REQUESTED',
-        fromCircleID: 'circle-1',
-        fromInvitationID: 'inv-1',
-      },
-    });
+    expect(prisma.notification.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: {
+          toUserID: 'verifier-9',
+          fromUserID: 'applicant-1',
+          type: 'CIRCLE_VERIFICATION_REQUESTED',
+          fromCircleID: 'circle-1',
+          fromInvitationID: 'inv-1',
+        },
+      }),
+    );
     expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
       'verifier-9',
     );
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'verifier-9',
+      expect.objectContaining({
+        type: 'CIRCLE_VERIFICATION_REQUESTED',
+        fromInvitation: expect.objectContaining({ id: 'inv-1' }),
+      }),
+    );
+  });
+
+  it('does not fail addVerifier when notification delivery fails', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'PENDING',
+      requiredCount: 10,
+      verifiers: [],
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.notification.create.mockRejectedValue(
+      new Error('notification unavailable'),
+    );
+
+    await expect(
+      service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+    ).resolves.toBeUndefined();
+
+    expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledWith({
+      data: {
+        invitationID: 'inv-1',
+        verifierID: 'verifier-9',
+        addedByID: 'applicant-1',
+        status: 'PENDING',
+      },
+    });
   });
 });

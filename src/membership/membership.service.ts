@@ -90,8 +90,9 @@ export class MembershipService {
       return { user, wallet, plan };
     });
 
+    let notification = null;
     try {
-      await this.notificationService.createSystemNotification(
+      notification = await this.notificationService.createSystemNotification(
         userId,
         userId,
         `已成功兑换 VIP${level}`,
@@ -112,6 +113,15 @@ export class MembershipService {
           userId,
           `已成功兑换 VIP${level}`,
         ),
+      ...(notification
+        ? [
+            () =>
+              this.realtimeService.broadcastNotificationCreated(
+                userId,
+                notification,
+              ),
+          ]
+        : []),
       () => this.realtimeService.broadcastSystemNotificationUnread(userId),
       () => this.realtimeService.broadcastUserProfileSummary(userId),
     ]);

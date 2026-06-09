@@ -7,6 +7,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { NotificationService } from 'src/notification/notification.service';
 import { CirclePlazaService } from './circle-plaza.service';
 
 describe('CirclePlazaService', () => {
@@ -47,10 +48,16 @@ describe('CirclePlazaService', () => {
 
   const realtime = {
     broadcastSignupUnread: jest.fn(),
+    broadcastInteractionUnread: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+  };
+  const notificationService = {
+    createCirclePostSignupNotification: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    notificationService.createCirclePostSignupNotification.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -58,6 +65,7 @@ describe('CirclePlazaService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         { provide: RealtimeService, useValue: realtime },
+        { provide: NotificationService, useValue: notificationService },
       ],
     }).compile();
 
@@ -89,6 +97,7 @@ describe('CirclePlazaService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       realtime as any,
+      notificationService as any,
     );
     prisma.circleMember.findUnique.mockResolvedValue({
       id: 'member-1',
@@ -124,19 +133,35 @@ describe('CirclePlazaService', () => {
     };
 
     it('creates signup, increments count, and refreshes only the author badge', async () => {
+      const notification = {
+        id: 'notification-1',
+        type: 'CIRCLE_POST_SIGNUP_CREATED',
+      };
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
       prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+      notificationService.createCirclePostSignupNotification.mockResolvedValue(
+        notification,
+      );
 
       const result = await service.signupForPost('user-2', 'post-1');
 
       expect(result).toEqual({ signed: true, signupCount: 3 });
-      // Signup no longer writes notification rows; the management view reads
-      // CirclePostSignup directly. Only the author's badge refreshes.
       expect(realtime.broadcastSignupUnread).toHaveBeenCalledTimes(1);
       expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
+      expect(
+        notificationService.createCirclePostSignupNotification,
+      ).toHaveBeenCalledWith({
+        toUserId: 'author-1',
+        fromUserId: 'user-2',
+        postId: 'post-1',
+      });
+      expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
+        'author-1',
+        notification,
+      );
     });
 
     it('is idempotent when already signed up', async () => {

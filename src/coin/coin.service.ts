@@ -255,8 +255,9 @@ export class CoinService {
   }
 
   private async notifyRecharge(userId: string, amount: number): Promise<void> {
+    let notification = null;
     try {
-      await this.notificationService.createSystemNotification(
+      notification = await this.notificationService.createSystemNotification(
         userId,
         userId,
         `积分已到账 ${amount}`,
@@ -280,6 +281,15 @@ export class CoinService {
           userId,
           `积分已到账 ${amount}`,
         ),
+      ...(notification
+        ? [
+            () =>
+              this.realtimeService.broadcastNotificationCreated(
+                userId,
+                notification,
+              ),
+          ]
+        : []),
       () => this.realtimeService.broadcastSystemNotificationUnread(userId),
     ]);
   }

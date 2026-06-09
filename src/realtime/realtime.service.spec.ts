@@ -58,6 +58,43 @@ describe('RealtimeService', () => {
     });
   });
 
+  it('broadcastNotificationCreated emits the unified foreground snackbar payload', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastNotificationCreated('user-1', {
+      id: 'notification-1',
+      type: 'TRACE_COMMENT',
+      content: 'Nice trace',
+      read: false,
+      createdAt: '2026-06-08T00:00:00.000Z',
+      fromUser: { id: 'actor-1', nickname: 'Alice', avatarUrl: null },
+      fromTrace: { id: 'trace-1', excerpt: 'Trace body', firstImage: null },
+      fromReply: { id: 'comment-1', content: 'Nice trace' },
+      fromCircle: null,
+      fromCirclePost: null,
+      fromInvitation: null,
+      squadRequest: null,
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'notification.created',
+      payload: {
+        id: 'notification-1',
+        type: 'TRACE_COMMENT',
+        content: 'Nice trace',
+        read: false,
+        createdAt: '2026-06-08T00:00:00.000Z',
+        fromUser: { id: 'actor-1', nickname: 'Alice', avatarUrl: null },
+        fromTrace: { id: 'trace-1', excerpt: 'Trace body', firstImage: null },
+        fromReply: { id: 'comment-1', content: 'Nice trace' },
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+        squadRequest: null,
+      },
+    });
+  });
+
   it('broadcastSignupUnread emits the signup-management unread count', async () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
     prisma.circlePostSignup.count.mockResolvedValue(2);

@@ -38,14 +38,18 @@ describe('TraceService', () => {
   };
   const notificationService = {
     createTraceCommentNotifications: jest.fn(() => Promise.resolve([])),
+    createTraceLikeNotification: jest.fn(),
   };
   const realtimeService = {
     broadcastInteractionUnread: jest.fn(() => Promise.resolve()),
     broadcastCirclePostInteractionCreated: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    notificationService.createTraceCommentNotifications.mockResolvedValue([]);
+    notificationService.createTraceLikeNotification.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -97,6 +101,80 @@ describe('TraceService', () => {
     ).rejects.toThrow(BadRequestException);
   });
 
+  it('broadcasts the created notification payload after adding a trace comment', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+    notificationService.createTraceCommentNotifications.mockResolvedValue([
+      {
+        targetUserId: 'author-1',
+        notification: {
+          id: 'notification-1',
+          type: 'TRACE_COMMENT',
+          content: 'hello',
+          read: false,
+          createdAt: '2026-06-08T00:00:00.000Z',
+          fromUser: { id: 'actor-1', nickname: 'Alice', avatarUrl: null },
+          fromTrace: { id: 'trace-1', excerpt: 'trace', firstImage: null },
+          fromReply: { id: 'comment-1', content: 'hello' },
+          fromCircle: null,
+          fromCirclePost: null,
+          fromInvitation: null,
+          squadRequest: null,
+        },
+      },
+    ]);
+
+    await service.addComment('actor-1', 'trace-1', { content: 'hello' });
+
+    expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+      'author-1',
+    );
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'author-1',
+      expect.objectContaining({ id: 'notification-1', type: 'TRACE_COMMENT' }),
+    );
+  });
+
+  it('does not fail an added trace comment when notification delivery fails', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+    notificationService.createTraceCommentNotifications.mockRejectedValue(
+      new Error('notification unavailable'),
+    );
+
+    await expect(
+      service.addComment('actor-1', 'trace-1', { content: 'hello' }),
+    ).resolves.toEqual(
+      expect.objectContaining({ id: 'comment-1', content: 'hello' }),
+    );
+  });
+
   it('caps embedded likes and comments in the feed query', async () => {
     prisma.friend.findMany.mockResolvedValue([]);
     prisma.trace.findMany.mockResolvedValue([]);
@@ -122,6 +200,10 @@ describe('TraceService', () => {
   });
 
   it('toggleLike increments likeCount atomically and returns the DB value', async () => {
+    const notification = {
+      id: 'notification-1',
+      type: 'TRACE_LIKE',
+    };
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'author-1',
@@ -131,6 +213,9 @@ describe('TraceService', () => {
     prisma.traceLikeStat.findUnique.mockResolvedValue(null);
     prisma.traceLikeStat.create.mockResolvedValue({ id: 'like-1' });
     prisma.trace.update.mockResolvedValue({ likeCount: 8 });
+    notificationService.createTraceLikeNotification.mockResolvedValue(
+      notification,
+    );
 
     const result = await service.toggleLike('viewer-1', 'trace-1');
 
@@ -139,6 +224,37 @@ describe('TraceService', () => {
       where: { id: 'trace-1' },
       data: { likeCount: { increment: 1 } },
       select: { likeCount: true },
+    });
+    expect(
+      notificationService.createTraceLikeNotification,
+    ).toHaveBeenCalledWith({
+      actorId: 'viewer-1',
+      traceId: 'trace-1',
+      traceOwnerId: 'author-1',
+    });
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'author-1',
+      notification,
+    );
+  });
+
+  it('does not fail a successful like when notification delivery fails', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.traceLikeStat.findUnique.mockResolvedValue(null);
+    prisma.traceLikeStat.create.mockResolvedValue({ id: 'like-1' });
+    prisma.trace.update.mockResolvedValue({ likeCount: 8 });
+    notificationService.createTraceLikeNotification.mockRejectedValue(
+      new Error('notification unavailable'),
+    );
+
+    await expect(service.toggleLike('viewer-1', 'trace-1')).resolves.toEqual({
+      liked: true,
+      likeCount: 8,
     });
   });
 
@@ -164,5 +280,9 @@ describe('TraceService', () => {
       data: { likeCount: { increment: -1 } },
       select: { likeCount: true },
     });
+    expect(
+      notificationService.createTraceLikeNotification,
+    ).not.toHaveBeenCalled();
+    expect(realtimeService.broadcastNotificationCreated).not.toHaveBeenCalled();
   });
 });

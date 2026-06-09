@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { NotificationService } from 'src/notification/notification.service';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -24,6 +25,7 @@ export class CirclePlazaService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly realtime: RealtimeService,
+    private readonly notificationService: NotificationService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -321,6 +323,16 @@ export class CirclePlazaService {
     // signup-management badge to refresh (self-signup is rejected above).
     try {
       await this.realtime.broadcastSignupUnread(post.authorID);
+      const notification =
+        await this.notificationService.createCirclePostSignupNotification({
+          toUserId: post.authorID,
+          fromUserId: userId,
+          postId,
+        });
+      if (notification) {
+        await this.realtime.broadcastInteractionUnread(post.authorID);
+        this.realtime.broadcastNotificationCreated(post.authorID, notification);
+      }
     } catch {
       // swallow: write is authoritative
     }

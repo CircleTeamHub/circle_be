@@ -11,11 +11,27 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
+  mapNotificationRealtimeDto,
+  NOTIFICATION_REALTIME_INCLUDE,
+} from 'src/notification/notification.dto';
+import {
   InvitationDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
+
+type CircleInvitationNotificationData = {
+  toUserID: string;
+  fromUserID: string;
+  type:
+    | 'CIRCLE_VERIFICATION_REQUESTED'
+    | 'CIRCLE_INVITATION_APPROVED'
+    | 'CIRCLE_INVITATION_REJECTED'
+    | 'CIRCLE_ADMIN_OVERRIDE_APPROVED';
+  fromCircleID: string;
+  fromInvitationID: string;
+};
 
 // Single include shape reused by loadInvitation and the list queries so the
 // list endpoints can hydrate in one round-trip instead of N+1.
@@ -154,7 +170,7 @@ export class CircleInvitationService {
     invitationId: string,
     verifierId: string,
   ): Promise<void> {
-    await this.runInvitationTransaction(async (tx) => {
+    const notificationData = await this.runInvitationTransaction(async (tx) => {
       const invitation = await tx.circleInvitation.findUnique({
         where: { id: invitationId },
         include: { verifiers: true },
@@ -207,19 +223,16 @@ export class CircleInvitationService {
         },
       });
 
-      // Interaction message for the verifier (互动消息).
-      await tx.notification.create({
-        data: {
-          toUserID: verifierId,
-          fromUserID: callerId,
-          type: 'CIRCLE_VERIFICATION_REQUESTED',
-          fromCircleID: invitation.circleID,
-          fromInvitationID: invitationId,
-        },
-      });
+      return {
+        toUserID: verifierId,
+        fromUserID: callerId,
+        type: 'CIRCLE_VERIFICATION_REQUESTED' as const,
+        fromCircleID: invitation.circleID,
+        fromInvitationID: invitationId,
+      };
     });
 
-    await this.realtimeService.broadcastInteractionUnread(verifierId);
+    await this.createAndBroadcastInvitationNotification(notificationData);
   }
 
   async respond(
@@ -227,7 +240,7 @@ export class CircleInvitationService {
     invitationId: string,
     approve: boolean,
   ): Promise<void> {
-    const admission = await this.runInvitationTransaction(async (tx) => {
+    const result = await this.runInvitationTransaction(async (tx) => {
       const verifierRecord = await tx.circleInvitationVerifier.findFirst({
         where: {
           invitationID: invitationId,
@@ -256,16 +269,16 @@ export class CircleInvitationService {
       });
 
       if (!approve) {
-        await tx.notification.create({
-          data: {
+        return {
+          admission: null,
+          notificationData: {
             toUserID: invitation.applicantID,
             fromUserID: verifierId,
-            type: 'CIRCLE_INVITATION_REJECTED',
+            type: 'CIRCLE_INVITATION_REJECTED' as const,
             fromCircleID: invitation.circleID,
             fromInvitationID: invitationId,
           },
-        });
-        return null;
+        };
       }
 
       const updatedRows = await tx.circleInvitation.updateMany({
@@ -285,7 +298,7 @@ export class CircleInvitationService {
       }
 
       if (updatedInvitation.approvedCount < updatedInvitation.requiredCount) {
-        return null;
+        return { admission: null, notificationData: null };
       }
 
       const finalized = await tx.circleInvitation.updateMany({
@@ -293,7 +306,7 @@ export class CircleInvitationService {
         data: { status: 'APPROVED' },
       });
       if (finalized.count === 0) {
-        return null;
+        return { admission: null, notificationData: null };
       }
 
       const admitted = await this.admitApplicant(
@@ -302,27 +315,26 @@ export class CircleInvitationService {
         updatedInvitation.applicantID,
       );
 
-      await tx.notification.create({
-        data: {
+      return {
+        admission: admitted
+          ? {
+              applicantId: updatedInvitation.applicantID,
+              groupID: updatedInvitation.circle.groupID,
+            }
+          : null,
+        notificationData: {
           toUserID: updatedInvitation.applicantID,
           fromUserID: verifierId,
-          type: 'CIRCLE_INVITATION_APPROVED',
+          type: 'CIRCLE_INVITATION_APPROVED' as const,
           fromCircleID: updatedInvitation.circleID,
           fromInvitationID: invitationId,
         },
-      });
-
-      return admitted
-        ? {
-            applicantId: updatedInvitation.applicantID,
-            groupID: updatedInvitation.circle.groupID,
-          }
-        : null;
+      };
     });
 
     await this.syncApplicantToGroup(
-      admission?.groupID ?? null,
-      admission?.applicantId,
+      result.admission?.groupID ?? null,
+      result.admission?.applicantId,
     );
 
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
@@ -331,9 +343,11 @@ export class CircleInvitationService {
     });
 
     if (notificationTarget?.applicantID) {
-      await this.realtimeService.broadcastInteractionUnread(
-        notificationTarget.applicantID,
-      );
+      if (result.notificationData) {
+        await this.createAndBroadcastInvitationNotification(
+          result.notificationData,
+        );
+      }
       this.realtimeService.broadcastCircleInvitationReviewed(
         notificationTarget.applicantID,
         {
@@ -366,7 +380,7 @@ export class CircleInvitationService {
       throw new ForbiddenException('Only circle owner or admin can override');
     }
 
-    const admission = await this.runInvitationTransaction(async (tx) => {
+    const result = await this.runInvitationTransaction(async (tx) => {
       const pendingInvitation = await tx.circleInvitation.findUnique({
         where: { id: invitationId },
         include: { circle: true },
@@ -383,7 +397,7 @@ export class CircleInvitationService {
         data: { status: 'ADMIN_APPROVED' },
       });
       if (finalized.count === 0) {
-        return null;
+        return { admission: null, notificationData: null };
       }
 
       const admitted = await this.admitApplicant(
@@ -392,27 +406,26 @@ export class CircleInvitationService {
         pendingInvitation.applicantID,
       );
 
-      await tx.notification.create({
-        data: {
+      return {
+        admission: admitted
+          ? {
+              applicantId: pendingInvitation.applicantID,
+              groupID: pendingInvitation.circle.groupID,
+            }
+          : null,
+        notificationData: {
           toUserID: pendingInvitation.applicantID,
           fromUserID: adminId,
-          type: 'CIRCLE_ADMIN_OVERRIDE_APPROVED',
+          type: 'CIRCLE_ADMIN_OVERRIDE_APPROVED' as const,
           fromCircleID: pendingInvitation.circleID,
           fromInvitationID: invitationId,
         },
-      });
-
-      return admitted
-        ? {
-            applicantId: pendingInvitation.applicantID,
-            groupID: pendingInvitation.circle.groupID,
-          }
-        : null;
+      };
     });
 
     await this.syncApplicantToGroup(
-      admission?.groupID ?? null,
-      admission?.applicantId,
+      result.admission?.groupID ?? null,
+      result.admission?.applicantId,
     );
 
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
@@ -421,9 +434,11 @@ export class CircleInvitationService {
     });
 
     if (notificationTarget?.applicantID) {
-      await this.realtimeService.broadcastInteractionUnread(
-        notificationTarget.applicantID,
-      );
+      if (result.notificationData) {
+        await this.createAndBroadcastInvitationNotification(
+          result.notificationData,
+        );
+      }
       this.realtimeService.broadcastCircleInvitationReviewed(
         notificationTarget.applicantID,
         {
@@ -643,6 +658,28 @@ export class CircleInvitationService {
     } catch (error) {
       this.logger.warn(
         `Failed to add user ${applicantId} to OpenIM group ${groupID}: ${error}`,
+      );
+    }
+  }
+
+  private async createAndBroadcastInvitationNotification(
+    data: CircleInvitationNotificationData,
+  ): Promise<void> {
+    try {
+      const notification = await this.prisma.notification.create({
+        data,
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      await this.realtimeService.broadcastInteractionUnread(data.toUserID);
+      this.realtimeService.broadcastNotificationCreated(
+        data.toUserID,
+        mapNotificationRealtimeDto(notification),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Circle invitation notification side effect failed: ${data.type} ${data.fromUserID} -> ${data.toUserID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
     }
   }

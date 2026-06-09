@@ -6,6 +6,13 @@ import {
   DISCOVER_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from './notification.constants';
+import {
+  mapNotificationRealtimeDto,
+  NOTIFICATION_REALTIME_INCLUDE,
+  type NotificationRealtimeDto,
+} from './notification.dto';
+
+const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 
 @Injectable()
 export class NotificationService {
@@ -15,9 +22,9 @@ export class NotificationService {
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
-    return (DISCOVER_NOTIFICATION_TYPES as readonly NotificationType[]).includes(
-      type,
-    );
+    return (
+      DISCOVER_NOTIFICATION_TYPES as readonly NotificationType[]
+    ).includes(type);
   }
 
   private isProfileNotification(type: NotificationType): boolean {
@@ -87,18 +94,138 @@ export class NotificationService {
     toUserId: string,
     fromUserId: string,
     content: string,
-  ) {
+  ): Promise<NotificationRealtimeDto | null> {
     if (!toUserId || !fromUserId || toUserId !== fromUserId) {
       return null;
     }
 
-    return this.prisma.notification.create({
+    const notification = await this.prisma.notification.create({
       data: {
         toUserID: toUserId,
         fromUserID: fromUserId,
         type: NotificationType.SYSTEM,
         content,
       },
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+    return mapNotificationRealtimeDto(notification);
+  }
+
+  private async createNotification(data: {
+    toUserID: string;
+    fromUserID: string;
+    type: NotificationType;
+    content?: string;
+    squadRequestID?: string;
+    fromTraceID?: string;
+    fromCirclePostID?: string;
+    dedupeWindowMs?: number;
+  }): Promise<NotificationRealtimeDto | null> {
+    if (
+      !data.toUserID ||
+      !data.fromUserID ||
+      data.toUserID === data.fromUserID
+    ) {
+      return null;
+    }
+
+    const { dedupeWindowMs, ...notificationData } = data;
+    if (dedupeWindowMs) {
+      const duplicate = await this.prisma.notification.findFirst({
+        where: {
+          toUserID: notificationData.toUserID,
+          fromUserID: notificationData.fromUserID,
+          type: notificationData.type,
+          deleted: false,
+          ...(notificationData.squadRequestID
+            ? { squadRequestID: notificationData.squadRequestID }
+            : {}),
+          ...(notificationData.fromTraceID
+            ? { fromTraceID: notificationData.fromTraceID }
+            : {}),
+          ...(notificationData.fromCirclePostID
+            ? { fromCirclePostID: notificationData.fromCirclePostID }
+            : {}),
+          createdAt: { gte: new Date(Date.now() - dedupeWindowMs) },
+        },
+        select: { id: true },
+      });
+      if (duplicate) {
+        return null;
+      }
+    }
+
+    const notification = await this.prisma.notification.create({
+      data: {
+        ...notificationData,
+        content: notificationData.content ?? '',
+      },
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+    return mapNotificationRealtimeDto(notification);
+  }
+
+  async createFriendRequestNotification(params: {
+    type:
+      | typeof NotificationType.FRIEND_REQUEST_RECEIVED
+      | typeof NotificationType.FRIEND_REQUEST_ACCEPTED
+      | typeof NotificationType.FRIEND_REQUEST_REJECTED;
+    toUserId: string;
+    fromUserId: string;
+    content?: string | null;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.fromUserId,
+      type: params.type,
+      content: params.content ?? '',
+    });
+  }
+
+  async createSquadRequestNotification(params: {
+    type:
+      | typeof NotificationType.SQUAD_REQUEST_RECEIVED
+      | typeof NotificationType.SQUAD_REQUEST_ACCEPTED
+      | typeof NotificationType.SQUAD_REQUEST_REJECTED;
+    toUserId: string;
+    fromUserId: string;
+    squadRequestId: string;
+    content?: string | null;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.fromUserId,
+      type: params.type,
+      content: params.content ?? '',
+      squadRequestID: params.squadRequestId,
+    });
+  }
+
+  async createTraceLikeNotification(params: {
+    actorId: string;
+    traceId: string;
+    traceOwnerId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.traceOwnerId,
+      fromUserID: params.actorId,
+      type: NotificationType.TRACE_LIKE,
+      fromTraceID: params.traceId,
+      dedupeWindowMs: NOTIFICATION_DEDUPE_WINDOW_MS,
+    });
+  }
+
+  async createCirclePostSignupNotification(params: {
+    toUserId: string;
+    fromUserId: string;
+    postId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.fromUserId,
+      type: NotificationType.CIRCLE_POST_SIGNUP_CREATED,
+      fromCirclePostID: params.postId,
+      dedupeWindowMs: NOTIFICATION_DEDUPE_WINDOW_MS,
     });
   }
 
@@ -114,44 +241,9 @@ export class NotificationService {
       orderBy: { createdAt: 'desc' },
       skip,
       take,
-      include: {
-        fromUser: { select: { id: true, nickname: true, avatarUrl: true } },
-        fromTrace: { select: { id: true, content: true, images: true } },
-        fromReply: { select: { id: true, content: true } },
-        fromCircle: { select: { id: true, name: true } },
-        fromInvitation: { select: { id: true, status: true } },
-      },
+      include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return rows.map((n) => ({
-      id: n.id,
-      type: n.type,
-      content: n.content,
-      read: n.read,
-      createdAt: n.createdAt.toISOString(),
-      fromUser: n.fromUser
-        ? {
-            id: n.fromUser.id,
-            nickname: n.fromUser.nickname,
-            avatarUrl: n.fromUser.avatarUrl,
-          }
-        : null,
-      fromTrace: n.fromTrace
-        ? {
-            id: n.fromTrace.id,
-            excerpt: n.fromTrace.content.slice(0, 60),
-            firstImage: n.fromTrace.images[0] ?? null,
-          }
-        : null,
-      fromReply: n.fromReply
-        ? { id: n.fromReply.id, content: n.fromReply.content }
-        : null,
-      fromCircle: n.fromCircle
-        ? { id: n.fromCircle.id, name: n.fromCircle.name }
-        : null,
-      fromInvitation: n.fromInvitation
-        ? { id: n.fromInvitation.id, status: n.fromInvitation.status }
-        : null,
-    }));
+    return rows.map(mapNotificationRealtimeDto);
   }
 
   async markNotificationRead(userId: string, id: string): Promise<void> {
@@ -210,7 +302,9 @@ export class NotificationService {
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
     content: string;
-  }) {
+  }): Promise<
+    Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
+  > {
     const notifications = [];
     const notifiedUserIds = new Set<string>();
 
@@ -230,6 +324,7 @@ export class NotificationService {
             fromTraceID: params.traceId,
             fromReplyID: params.commentId,
           },
+          include: NOTIFICATION_REALTIME_INCLUDE,
         }),
       );
     }
@@ -251,13 +346,26 @@ export class NotificationService {
             fromReplyID: params.commentId,
             toReplyID: params.replyToCommentId ?? null,
           },
+          include: NOTIFICATION_REALTIME_INCLUDE,
         }),
       );
     }
 
     // Atomic: either both notifications land or neither does — a partial
     // failure must not leave one orphaned notification behind.
-    await this.prisma.$transaction(notifications);
-    return [...notifiedUserIds];
+    const created = await this.prisma.$transaction(notifications);
+    return created
+      .map((notification) => ({
+        targetUserId: notification.toUserID,
+        notification: mapNotificationRealtimeDto(notification),
+      }))
+      .filter(
+        (
+          item,
+        ): item is {
+          targetUserId: string;
+          notification: NotificationRealtimeDto;
+        } => typeof item.targetUserId === 'string',
+      );
   }
 }

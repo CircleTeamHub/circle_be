@@ -5,6 +5,7 @@ import {
   DISCOVER_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from 'src/notification/notification.constants';
+import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
 
 type BadgeSnapshot = {
   messagesUnread: number;
@@ -69,6 +70,10 @@ type RealtimeEvent =
         status: string;
         changedAt: string;
       };
+    }
+  | {
+      type: 'notification.created';
+      payload: NotificationRealtimeDto;
     }
   | {
       type: 'system.notification.created';
@@ -315,6 +320,16 @@ export class RealtimeService {
         ...payload,
         changedAt: new Date().toISOString(),
       },
+    });
+  }
+
+  broadcastNotificationCreated(
+    userId: string,
+    notification: NotificationRealtimeDto,
+  ) {
+    this.broadcast(userId, {
+      type: 'notification.created',
+      payload: notification,
     });
   }
 

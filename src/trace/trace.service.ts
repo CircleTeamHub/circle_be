@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -23,6 +24,7 @@ const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
 
 @Injectable()
 export class TraceService {
+  private readonly logger = new Logger(TraceService.name);
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -202,12 +204,12 @@ export class TraceService {
     userId: string,
     traceId: string,
   ): Promise<{ liked: boolean; likeCount: number }> {
-    await this.requireVisibleTrace(traceId, userId);
+    const trace = await this.requireVisibleTrace(traceId, userId);
 
     // The read-decide-write must be one atomic unit: a plain check-then-write
     // let two concurrent toggles both increment likeCount. Serializable +
     // retry serializes them, and the like row's own lookup happens inside.
-    return runSerializableTransaction(this.prisma, async (tx) => {
+    const result = await runSerializableTransaction(this.prisma, async (tx) => {
       const existing = await tx.traceLikeStat.findUnique({
         where: { traceID_userID: { traceID: traceId, userID: userId } },
       });
@@ -240,6 +242,32 @@ export class TraceService {
 
       return { liked, likeCount: updated.likeCount };
     });
+
+    if (result.liked) {
+      try {
+        const notification =
+          await this.notificationService.createTraceLikeNotification({
+            actorId: userId,
+            traceId,
+            traceOwnerId: trace.fromID,
+          });
+        if (notification) {
+          await this.realtimeService.broadcastInteractionUnread(trace.fromID);
+          this.realtimeService.broadcastNotificationCreated(
+            trace.fromID,
+            notification,
+          );
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Trace like notification side effect failed: ${userId} -> ${trace.fromID} (${traceId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    return result;
   }
 
   // ─── Comment ───────────────────────────────────────────────────────────────
@@ -291,32 +319,44 @@ export class TraceService {
       return created;
     });
 
-    const notifiedUserIds =
-      await this.notificationService.createTraceCommentNotifications({
-        actorId: userId,
-        traceId,
-        commentId: comment.id,
-        traceOwnerId: trace.fromID,
-        replyToCommentId: comment.replyTo?.id ?? null,
-        replyToUserId: comment.replyTo?.user.id ?? null,
-        content: comment.content,
-      });
+    try {
+      const createdNotifications =
+        await this.notificationService.createTraceCommentNotifications({
+          actorId: userId,
+          traceId,
+          commentId: comment.id,
+          traceOwnerId: trace.fromID,
+          replyToCommentId: comment.replyTo?.id ?? null,
+          replyToUserId: comment.replyTo?.user.id ?? null,
+          content: comment.content,
+        });
 
-    await Promise.all(
-      notifiedUserIds.map(async (targetUserId) => {
-        await this.realtimeService.broadcastInteractionUnread(targetUserId);
-        this.realtimeService.broadcastCirclePostInteractionCreated(
-          targetUserId,
-          {
-            traceId,
-            commentId: comment.id,
-            interactionType: comment.replyTo ? 'REPLY' : 'COMMENT',
-            actorId: userId,
-            actorNickname: comment.user.nickname,
-          },
-        );
-      }),
-    );
+      await Promise.all(
+        createdNotifications.map(async ({ targetUserId, notification }) => {
+          await this.realtimeService.broadcastInteractionUnread(targetUserId);
+          this.realtimeService.broadcastNotificationCreated(
+            targetUserId,
+            notification,
+          );
+          this.realtimeService.broadcastCirclePostInteractionCreated(
+            targetUserId,
+            {
+              traceId,
+              commentId: comment.id,
+              interactionType: comment.replyTo ? 'REPLY' : 'COMMENT',
+              actorId: userId,
+              actorNickname: comment.user.nickname,
+            },
+          );
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Trace comment notification side effect failed: ${userId} on ${traceId}/${comment.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
 
     return {
       id: comment.id,
