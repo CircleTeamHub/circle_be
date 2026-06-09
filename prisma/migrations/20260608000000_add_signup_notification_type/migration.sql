@@ -1,0 +1,8 @@
+ALTER TYPE "NotificationType" ADD VALUE IF NOT EXISTS 'CIRCLE_POST_SIGNUP_CREATED';
+
+ALTER TABLE "Notification" ADD COLUMN "fromCirclePostID" TEXT;
+
+ALTER TABLE "Notification"
+ADD CONSTRAINT "Notification_fromCirclePostID_fkey"
+FOREIGN KEY ("fromCirclePostID") REFERENCES "CirclePost"("id")
+ON DELETE SET NULL ON UPDATE CASCADE;

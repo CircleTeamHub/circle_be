@@ -118,6 +118,32 @@ enum CircleMemberStatus {
   REJECTED
 }
 
+enum GroupSyncOperation {
+  ADD_MEMBER
+  REMOVE_MEMBER
+}
+
+enum GroupSyncStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum FriendSyncOperation {
+  IMPORT_FRIEND
+  DELETE_FRIEND
+  ADD_BLACKLIST
+  REMOVE_BLACKLIST
+}
+
+enum FriendSyncStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 enum IconAssetSourceType {
   SYSTEM
   CIRCLE
@@ -194,6 +220,7 @@ enum NotificationType {
   CIRCLE_INVITATION_APPROVED
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
+  CIRCLE_POST_SIGNUP_CREATED
 }
 
 enum MissionType {
@@ -302,6 +329,7 @@ model User {
   friendActivitiesCounterparty FriendActivity[]            @relation("friendActivityCounterparty")
   friendReportsFiled           FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
+  groupReportsFiled            GroupReport[]               @relation("groupReportReporter")
   notes                        Note[]
   noteGroups                   NoteGroup[]
   circles                      Circle[]
@@ -373,6 +401,62 @@ model FriendReport {
   @@unique([reporterID, targetID, category])
   @@index([reporterID, createdAt])
   @@index([targetID, createdAt])
+}
+
+model GroupReport {
+  id          String   @id @default(uuid())
+  reporterID  String
+  groupID     String
+  circleID    String?
+  category    String
+  description String
+  evidence    String[] @default([])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reporter User    @relation("groupReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
+  circle   Circle? @relation("groupReports", fields: [circleID], references: [id], onDelete: SetNull)
+
+  @@unique([reporterID, groupID, category])
+  @@index([reporterID, createdAt])
+  @@index([groupID, createdAt])
+  @@index([circleID, createdAt])
+}
+
+model GroupSyncOutbox {
+  id            String             @id @default(uuid())
+  operation     GroupSyncOperation
+  status        GroupSyncStatus    @default(PENDING)
+  groupID       String
+  userID        String
+  attempts      Int                @default(0)
+  lastError     String?
+  nextAttemptAt DateTime           @default(now())
+  lockedAt      DateTime?
+  processedAt   DateTime?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([groupID, userID, status])
+}
+
+model FriendSyncOutbox {
+  id            String              @id @default(uuid())
+  operation     FriendSyncOperation
+  status        FriendSyncStatus    @default(PENDING)
+  userID        String
+  targetUserID  String
+  attempts      Int                 @default(0)
+  lastError     String?
+  nextAttemptAt DateTime            @default(now())
+  lockedAt      DateTime?
+  processedAt   DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([userID, targetUserID, status])
 }
 
 model Note {
@@ -940,6 +1024,7 @@ model Notification {
   fromReplyID      String?
   toReplyID        String?
   fromCircleID     String?
+  fromCirclePostID String?
   fromInvitationID String?
   createdAt        DateTime         @default(now())
   updatedAt        DateTime         @updatedAt
@@ -951,6 +1036,7 @@ model Notification {
   fromReply      TraceComment?     @relation("fromReply", fields: [fromReplyID], references: [id])
   toReply        TraceComment?     @relation("toReply", fields: [toReplyID], references: [id])
   fromCircle     Circle?           @relation(fields: [fromCircleID], references: [id])
+  fromCirclePost CirclePost?       @relation(fields: [fromCirclePostID], references: [id])
   fromInvitation CircleInvitation? @relation(fields: [fromInvitationID], references: [id])
 
   @@index([fromUserID, toUserID])
@@ -1154,6 +1240,7 @@ model Circle {
   invitations       CircleInvitation[]
   notifications     Notification[]
   displaySelections UserDisplayIcon[]
+  groupReports      GroupReport[]      @relation("groupReports")
 
   @@index([ownerID])
 }
@@ -1196,9 +1283,10 @@ model CirclePost {
   createdAt               DateTime         @default(now())
   updatedAt               DateTime         @updatedAt
 
-  author  User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
-  circle  Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  signups CirclePostSignup[]
+  author        User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  circle        Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  signups       CirclePostSignup[]
+  notifications Notification[]
 
   @@index([circleID, createdAt(sort: Desc)])
   @@index([authorID])
