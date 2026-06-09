@@ -8,6 +8,32 @@ const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
 const OPENIM_ADMIN_TOKEN_FAILURE_COOLDOWN_MS = 30_000;
 const OPENIM_HTTP_ERROR_BODY_LIMIT = 300;
 
+/**
+ * Raw OpenIM message (sdkws.MsgData) as returned by /msg/pull_msg_by_seq.
+ * Field names mirror OpenIM's wire shape (camelCase); `content` is base64.
+ */
+export interface OpenimMessage {
+  clientMsgID: string;
+  serverMsgID: string;
+  sendID: string;
+  recvID: string;
+  groupID: string;
+  senderPlatformID: number;
+  senderNickname: string;
+  senderFaceURL: string;
+  sessionType: number;
+  msgFrom: number;
+  contentType: number;
+  content: string;
+  seq: number;
+  sendTime: number;
+  createTime: number;
+  status: number;
+  isRead: boolean;
+  attachedInfo: string;
+  ex: string;
+}
+
 @Injectable()
 export class OpenimService implements OnModuleInit {
   private readonly logger = new Logger(OpenimService.name);
@@ -44,7 +70,9 @@ export class OpenimService implements OnModuleInit {
     }
 
     if (Date.now() < this.adminTokenRetryAfter) {
-      throw new Error('OpenIM unavailable: admin token refresh is cooling down');
+      throw new Error(
+        'OpenIM unavailable: admin token refresh is cooling down',
+      );
     }
 
     // Return the in-flight promise to all concurrent callers so we only make
@@ -213,6 +241,73 @@ export class OpenimService implements OnModuleInit {
     return (res.members ?? []).some((member) => member.userID === imUserID);
   }
 
+  // ─── Message history (chat-history restore) ──────────────────────────────────
+
+  /**
+   * Conversation-global newest seq (OpenIM's authoritative max). Used as the
+   * upper bound for restore pagination. Returns 0 when empty/unavailable.
+   */
+  async getConversationMaxSeq(
+    userID: string,
+    conversationID: string,
+  ): Promise<number> {
+    if (!this.enabled) return 0;
+
+    const adminToken = await this.getAdminToken();
+    const res = await this.post<{
+      seqs?: Record<string, { maxSeq?: number }>;
+    }>(
+      '/msg/get_conversations_has_read_and_max_seq',
+      {
+        userID: OpenimService.toImUserId(userID),
+        conversationIDs: [conversationID],
+      },
+      adminToken,
+    );
+    return Number(res.seqs?.[conversationID]?.maxSeq ?? 0);
+  }
+
+  /**
+   * Pull a conversation's messages by seq range (OpenIM /msg/pull_msg_by_seq).
+   * Pulled as `userID` (admin token may act for any conversation member); OpenIM
+   * applies its own visibility/revoke/delete filtering. order=1 (Desc) returns
+   * the newest up-to `num` messages within [begin, end].
+   *
+   * NOTE: OpenIM's jsonpb serializes the map value's field as capital `Msgs`
+   * (not camelCase) — read `block.Msgs`, not `block.msgs`.
+   */
+  async pullConversationMessages(params: {
+    userID: string;
+    conversationID: string;
+    begin: number;
+    end: number;
+    num: number;
+  }): Promise<{ messages: OpenimMessage[]; isEnd: boolean }> {
+    if (!this.enabled) return { messages: [], isEnd: true };
+
+    const adminToken = await this.getAdminToken();
+    const res = await this.post<{
+      msgs?: Record<string, { Msgs?: OpenimMessage[]; isEnd?: boolean }>;
+    }>(
+      '/msg/pull_msg_by_seq',
+      {
+        userID: OpenimService.toImUserId(params.userID),
+        seqRanges: [
+          {
+            conversationID: params.conversationID,
+            begin: params.begin,
+            end: params.end,
+            num: params.num,
+          },
+        ],
+        order: 1,
+      },
+      adminToken,
+    );
+    const block = res.msgs?.[params.conversationID];
+    return { messages: block?.Msgs ?? [], isEnd: block?.isEnd ?? true };
+  }
+
   async importFriends(
     ownerUserID: string,
     friendUserIDs: string[],
@@ -358,9 +453,7 @@ export class OpenimService implements OnModuleInit {
 
         const message = json.errMsg ?? String(json.errCode);
         const detail = json.errDlt ? ` (${json.errDlt})` : '';
-        this.logger.error(
-          `OpenIM API error [${path}]: ${message}${detail}`,
-        );
+        this.logger.error(`OpenIM API error [${path}]: ${message}${detail}`);
         throw new Error(`OpenIM error: ${message}${detail}`);
       }
 
