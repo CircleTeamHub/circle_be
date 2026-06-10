@@ -42,6 +42,9 @@ describe('NoteService', () => {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
     },
+    noteShareLink: {
+      create: jest.fn(),
+    },
   };
 
   beforeEach(async () => {
@@ -382,6 +385,7 @@ describe('NoteService', () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
         id: 'note-1',
+        ownerID: 'user-1',
         title: '测试笔记',
         content: '这是一条很长很长的正文内容',
         status: 'ACTIVE',
@@ -412,6 +416,8 @@ describe('NoteService', () => {
     );
     expect(result[0]).toMatchObject({
       id: 'note-1',
+      ownerId: 'user-1',
+      canEdit: true,
       title: '测试笔记',
       contentPreview: expect.any(String),
       imageCount: 3,
@@ -420,7 +426,7 @@ describe('NoteService', () => {
     });
   });
 
-  it('returns a note detail only for the owner', async () => {
+  it('returns a note detail with owner edit metadata', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
       ownerID: 'user-1',
@@ -456,13 +462,58 @@ describe('NoteService', () => {
 
     expect(prisma.note.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ id: 'note-1', ownerID: 'user-1' }),
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-1' }, { available: true }],
+        },
       }),
     );
     expect(result.media).toHaveLength(2);
+    expect(result).toMatchObject({
+      ownerId: 'user-1',
+      canEdit: true,
+    });
   });
 
-  it('rejects reading a note owned by someone else', async () => {
+  it('lets non-owners read available notes without edit permission', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: '群里分享的笔记',
+      content: '完整正文',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getNote('user-2', 'note-1');
+
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-2' }, { available: true }],
+        },
+      }),
+    );
+    expect(result).toMatchObject({
+      id: 'note-1',
+      ownerId: 'user-1',
+      canEdit: false,
+    });
+  });
+
+  it('rejects reading a deleted or unavailable note owned by someone else', async () => {
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
     await expect(service.getNote('user-1', 'note-2')).rejects.toThrow(
@@ -810,6 +861,92 @@ describe('NoteService', () => {
     expect(prisma.noteGroupMembership.deleteMany).toHaveBeenCalledWith({
       where: { groupID: 'group-1' },
     });
+  });
+
+  it('creates a managed note share link for the current filtered note view', async () => {
+    prisma.noteGroup.findFirst.mockResolvedValueOnce({
+      id: 'group-1',
+      ownerID: 'user-1',
+      name: '上海',
+      deletedAt: null,
+    });
+    prisma.note.findMany.mockResolvedValueOnce([
+      { id: 'note-1' },
+      { id: 'note-2' },
+    ]);
+    prisma.noteShareLink.create.mockResolvedValueOnce({
+      id: 'share-1',
+      ownerID: 'user-1',
+      token: 'token-123',
+      title: '我的笔记',
+      status: 'ACTIVE',
+      group: null,
+      groupID: 'group-1',
+      search: '咖啡',
+      noteIDs: ['note-1', 'note-2'],
+      expiresAt: null,
+      revokedAt: null,
+      createdAt: new Date('2026-06-08T10:00:00.000Z'),
+      updatedAt: new Date('2026-06-08T10:00:00.000Z'),
+    });
+
+    const serviceWithBase = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
+        ),
+      } as any,
+    );
+
+    const result = await serviceWithBase.createShareLink('user-1', {
+      title: '我的笔记',
+      status: 'ACTIVE',
+      groupId: 'group-1',
+      search: ' 咖啡 ',
+      noteIds: ['note-1', 'note-2'],
+    });
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith({
+      where: {
+        id: { in: ['note-1', 'note-2'] },
+        ownerID: 'user-1',
+        status: { not: 'DELETED' },
+      },
+      select: { id: true },
+    });
+    expect(prisma.noteShareLink.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        ownerID: 'user-1',
+        title: '我的笔记',
+        status: 'ACTIVE',
+        groupID: 'group-1',
+        group: null,
+        search: '咖啡',
+        noteIDs: ['note-1', 'note-2'],
+      }),
+    });
+    expect(result).toEqual({
+      id: 'share-1',
+      token: 'token-123',
+      url: 'https://circle.im/s/token-123',
+      expiresAt: null,
+      revokedAt: null,
+      createdAt: new Date('2026-06-08T10:00:00.000Z'),
+    });
+  });
+
+  it('rejects a note share link when any requested note is missing or owned by someone else', async () => {
+    prisma.note.findMany.mockResolvedValueOnce([{ id: 'note-1' }]);
+
+    await expect(
+      service.createShareLink('user-1', {
+        title: '我的笔记',
+        noteIds: ['note-1', 'note-2'],
+      }),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
   });
 
   it('reorders custom groups by rewriting sortOrder from ordered ids', async () => {

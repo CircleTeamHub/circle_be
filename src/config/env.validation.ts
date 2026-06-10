@@ -68,5 +68,6 @@ export function createEnvValidationSchema(
       then: Joi.string().min(32).required(),
       otherwise: Joi.string().min(8).optional(),
     }),
+    NOTE_SHARE_WEB_BASE: Joi.string().uri().optional(),
   }).unknown(true);
 }

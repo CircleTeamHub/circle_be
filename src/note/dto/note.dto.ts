@@ -204,6 +204,51 @@ export class ListNotesQueryDto {
   limit?: number;
 }
 
+export class CreateNoteShareLinkDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  title: string;
+
+  @ApiPropertyOptional({ enum: NOTE_WRITABLE_STATUS })
+  @IsOptional()
+  @IsEnum(NOTE_WRITABLE_STATUS)
+  status?: NoteWritableStatus;
+
+  @ApiPropertyOptional({ enum: ['ungrouped'] })
+  @IsOptional()
+  @IsEnum(['ungrouped'])
+  group?: 'ungrouped';
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUUID()
+  groupId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  search?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(200)
+  @IsUUID(undefined, { each: true })
+  noteIds?: string[];
+}
+
+export class NoteShareLinkDto {
+  @ApiProperty() id: string;
+  @ApiProperty() token: string;
+  @ApiProperty() url: string;
+  @ApiPropertyOptional() expiresAt: Date | null;
+  @ApiPropertyOptional() revokedAt: Date | null;
+  @ApiProperty() createdAt: Date;
+}
+
 export class CreateNoteGroupDto {
   @ApiProperty()
   @IsString()
@@ -251,6 +296,8 @@ export class NoteMediaDto {
 
 export class NoteSummaryDto {
   @ApiProperty() id: string;
+  @ApiProperty() ownerId: string;
+  @ApiProperty() canEdit: boolean;
   @ApiProperty() title: string;
   @ApiPropertyOptional() contentPreview: string | null;
   @ApiProperty({ enum: NOTE_STATUS }) status: NoteStatus;

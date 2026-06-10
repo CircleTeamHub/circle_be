@@ -1,7 +1,11 @@
 import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { CreateNoteDto, ReorderNoteGroupsDto } from './note.dto';
+import {
+  CreateNoteDto,
+  CreateNoteShareLinkDto,
+  ReorderNoteGroupsDto,
+} from './note.dto';
 
 describe('CreateNoteDto', () => {
   it('rejects duplicated media sort orders', () => {
@@ -127,5 +131,35 @@ describe('ReorderNoteGroupsDto', () => {
     expect(
       validateSync(invalidDto).some((error) => error.property === 'groupIds'),
     ).toBe(true);
+  });
+});
+
+describe('CreateNoteShareLinkDto', () => {
+  it('accepts the current notes view filters and note ids', () => {
+    const dto = plainToInstance(CreateNoteShareLinkDto, {
+      title: '我的笔记',
+      status: 'ACTIVE',
+      groupId: '11111111-1111-4111-8111-111111111111',
+      search: '咖啡',
+      noteIds: [
+        '22222222-2222-4222-8222-222222222222',
+        '33333333-3333-4333-8333-333333333333',
+      ],
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+
+  it('rejects deleted status and non-uuid note ids', () => {
+    const dto = plainToInstance(CreateNoteShareLinkDto, {
+      title: '我的笔记',
+      status: 'DELETED',
+      noteIds: ['note-1'],
+    });
+
+    const errors = validateSync(dto);
+
+    expect(errors.some((error) => error.property === 'status')).toBe(true);
+    expect(errors.some((error) => error.property === 'noteIds')).toBe(true);
   });
 });

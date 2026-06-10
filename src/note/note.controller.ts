@@ -25,9 +25,11 @@ import type { RequestWithUser } from 'src/auth/types';
 import {
   CreateNoteDto,
   CreateNoteGroupDto,
+  CreateNoteShareLinkDto,
   ListNotesQueryDto,
   NoteDetailDto,
   NoteGroupDto,
+  NoteShareLinkDto,
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
@@ -124,6 +126,16 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.noteService.deleteNote(req.user.userId, id);
+  }
+
+  @Post('share-links')
+  @ApiOperation({ summary: 'Create managed note share link' })
+  @ApiOkResponse({ type: NoteShareLinkDto })
+  createShareLink(
+    @Body() dto: CreateNoteShareLinkDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteShareLinkDto> {
+    return this.noteService.createShareLink(req.user.userId, dto);
   }
 
   @Get('group')

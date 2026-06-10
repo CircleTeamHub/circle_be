@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
@@ -13,10 +13,12 @@ import { prismaErrorCode } from 'src/utils/prisma-tx';
 import {
   CreateNoteDto,
   CreateNoteGroupDto,
+  CreateNoteShareLinkDto,
   ListNotesQueryDto,
   NoteDetailDto,
   NoteGroupDto,
   NoteMediaType,
+  NoteShareLinkDto,
   NoteStatus,
   NoteSummaryDto,
   UpdateNoteDto,
@@ -82,6 +84,7 @@ type NoteMediaRow = {
 
 type NoteRow = {
   id: string;
+  ownerID: string;
   title: string;
   content: string | null;
   contentJson: unknown;
@@ -205,6 +208,18 @@ export class NoteService {
     }
 
     return note;
+  }
+
+  private createShareToken(): string {
+    return randomBytes(18).toString('base64url');
+  }
+
+  private buildShareUrl(token: string): string {
+    const base =
+      this.config.get<string>('NOTE_SHARE_WEB_BASE') ??
+      this.config.get<string>('TEMP_CHAT_WEB_BASE') ??
+      '';
+    return `${base.replace(/\/+$/, '')}/s/${token}`;
   }
 
   private assertMediaOwnership(ownerID: string, media: CreateNoteDto['media']) {
@@ -372,7 +387,7 @@ export class NoteService {
     };
   }
 
-  private mapSummary(note: NoteRow): NoteSummaryDto {
+  private mapSummary(note: NoteRow, viewerID: string): NoteSummaryDto {
     const groups = (note.groupMemberships ?? []).map((membership: any) => ({
       id: membership.group.id,
       name: membership.group.name,
@@ -380,6 +395,8 @@ export class NoteService {
 
     return {
       id: note.id,
+      ownerId: note.ownerID,
+      canEdit: note.ownerID === viewerID,
       title: note.title,
       contentPreview: this.buildPreview(note.content),
       status: note.status,
@@ -407,9 +424,9 @@ export class NoteService {
     };
   }
 
-  private mapDetail(note: NoteRow): NoteDetailDto {
+  private mapDetail(note: NoteRow, viewerID: string): NoteDetailDto {
     return {
-      ...this.mapSummary(note),
+      ...this.mapSummary(note, viewerID),
       content: note.content ?? null,
       contentJson: Array.isArray(note.contentJson) ? note.contentJson : null,
       media: note.media.map((item) => ({
@@ -511,7 +528,7 @@ export class NoteService {
       });
     });
 
-    return this.mapDetail(created);
+    return this.mapDetail(created, ownerID);
   }
 
   async listNotes(
@@ -563,12 +580,88 @@ export class NoteService {
       skip: ((query.page ?? 1) - 1) * (query.limit ?? 50),
     });
 
-    return notes.map((note) => this.mapSummary(note));
+    return notes.map((note) => this.mapSummary(note, ownerID));
+  }
+
+  async createShareLink(
+    ownerID: string,
+    dto: CreateNoteShareLinkDto,
+  ): Promise<NoteShareLinkDto> {
+    if (dto.group && dto.groupId) {
+      throw new BadRequestException(
+        'group and groupId cannot be used together',
+      );
+    }
+    if (dto.groupId) {
+      await this.requireOwnedGroup(ownerID, dto.groupId);
+    }
+
+    const noteIDs = Array.from(new Set(dto.noteIds ?? []));
+    if (noteIDs.length > 0) {
+      const notes = await this.prisma.note.findMany({
+        where: {
+          id: { in: noteIDs },
+          ownerID,
+          status: { not: 'DELETED' },
+        },
+        select: { id: true },
+      });
+      if (notes.length !== noteIDs.length) {
+        throw new NotFoundException('Note not found');
+      }
+    }
+
+    const title = dto.title.trim().slice(0, 120) || '我的笔记';
+    const search = dto.search?.trim() || null;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const token = this.createShareToken();
+      try {
+        const row = await this.prisma.noteShareLink.create({
+          data: {
+            ownerID,
+            token,
+            title,
+            status: dto.status ?? null,
+            group: dto.group ?? null,
+            groupID: dto.groupId ?? null,
+            search,
+            noteIDs,
+          },
+        });
+
+        return {
+          id: row.id,
+          token: row.token,
+          url: this.buildShareUrl(row.token),
+          expiresAt: row.expiresAt,
+          revokedAt: row.revokedAt,
+          createdAt: row.createdAt,
+        };
+      } catch (error) {
+        if (prismaErrorCode(error) === 'P2002' && attempt < 2) continue;
+        throw error;
+      }
+    }
+
+    throw new ConflictException('Unable to create share link');
   }
 
   async getNote(ownerID: string, noteId: string): Promise<NoteDetailDto> {
-    const note = await this.requireOwnedNote(ownerID, noteId);
-    return this.mapDetail(note);
+    const note = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID }, { available: true }],
+      },
+      include: NOTE_INCLUDE,
+    });
+
+    if (!note) {
+      throw new NotFoundException('Note not found');
+    }
+
+    return this.mapDetail(note, ownerID);
   }
 
   async updateNote(
@@ -658,7 +751,7 @@ export class NoteService {
       });
     });
 
-    return this.mapDetail(updated);
+    return this.mapDetail(updated, ownerID);
   }
 
   /**

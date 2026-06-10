@@ -331,6 +331,7 @@ model User {
   friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
   groupReportsFiled            GroupReport[]               @relation("groupReportReporter")
   notes                        Note[]
+  noteShareLinks               NoteShareLink[]
   noteGroups                   NoteGroup[]
   circles                      Circle[]
   circleMembers                CircleMember[]
@@ -485,6 +486,28 @@ model Note {
   @@index([ownerID, status, updatedAt])
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])
+}
+
+model NoteShareLink {
+  id        String     @id @default(uuid())
+  ownerID   String
+  token     String     @unique
+  title     String
+  status    NoteStatus?
+  group     String?
+  groupID   String?
+  search    String?
+  noteIDs   String[]   @default([])
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  owner User @relation(fields: [ownerID], references: [id], onDelete: Cascade)
+
+  @@index([ownerID, createdAt])
+  @@index([token])
+  @@index([expiresAt])
 }
 
 model NoteMedia {
