@@ -949,6 +949,84 @@ describe('NoteService', () => {
     expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
   });
 
+  it('rejects a note share link when group and groupId are both set', async () => {
+    await expect(
+      service.createShareLink('user-1', {
+        title: '我的笔记',
+        group: 'ungrouped',
+        groupId: '11111111-1111-1111-1111-111111111111',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
+  });
+
+  it('persists a bounded expiresAt when expiresInDays is supplied', async () => {
+    const now = new Date('2026-06-08T10:00:00.000Z');
+    jest.useFakeTimers().setSystemTime(now.getTime());
+
+    prisma.noteShareLink.create.mockResolvedValueOnce({
+      id: 'share-2',
+      ownerID: 'user-1',
+      token: 'token-456',
+      title: '我的笔记',
+      status: null,
+      group: null,
+      groupID: null,
+      search: null,
+      noteIDs: [],
+      expiresAt: new Date('2026-06-15T10:00:00.000Z'),
+      revokedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    try {
+      const result = await service.createShareLink('user-1', {
+        title: '我的笔记',
+        expiresInDays: 7,
+      });
+
+      expect(prisma.noteShareLink.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          ownerID: 'user-1',
+          expiresAt: new Date('2026-06-15T10:00:00.000Z'),
+        }),
+      });
+      expect(result.expiresAt).toEqual(new Date('2026-06-15T10:00:00.000Z'));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('retries token generation on a unique-token collision', async () => {
+    const collision = Object.assign(new Error('unique'), { code: 'P2002' });
+    prisma.noteShareLink.create
+      .mockRejectedValueOnce(collision)
+      .mockResolvedValueOnce({
+        id: 'share-3',
+        ownerID: 'user-1',
+        token: 'token-789',
+        title: '我的笔记',
+        status: null,
+        group: null,
+        groupID: null,
+        search: null,
+        noteIDs: [],
+        expiresAt: null,
+        revokedAt: null,
+        createdAt: new Date('2026-06-08T10:00:00.000Z'),
+        updatedAt: new Date('2026-06-08T10:00:00.000Z'),
+      });
+
+    const result = await service.createShareLink('user-1', {
+      title: '我的笔记',
+    });
+
+    expect(prisma.noteShareLink.create).toHaveBeenCalledTimes(2);
+    expect(result.token).toBe('token-789');
+  });
+
   it('reorders custom groups by rewriting sortOrder from ordered ids', async () => {
     // Exhaustive-list count check
     prisma.noteGroup.count.mockResolvedValueOnce(2);

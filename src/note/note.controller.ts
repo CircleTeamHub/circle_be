@@ -20,6 +20,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
@@ -129,6 +130,11 @@ export class NoteController {
   }
 
   @Post('share-links')
+  // Each call writes a new row with a unique token; throttle per-user/IP so a
+  // client cannot spam unbounded share-link rows. Guard is applied here only —
+  // ThrottlerModule is global but ThrottlerGuard is opt-in per route.
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: 'Create managed note share link' })
   @ApiOkResponse({ type: NoteShareLinkDto })
   createShareLink(
@@ -146,7 +152,9 @@ export class NoteController {
   }
 
   @Get(':id')
-  @ApiOperation({ summary: 'My note detail' })
+  @ApiOperation({
+    summary: 'Note detail (own note, or any note marked available)',
+  })
   @ApiOkResponse({ type: NoteDetailDto })
   getNote(
     @Param('id', ParseUUIDPipe) id: string,

@@ -238,6 +238,17 @@ export class CreateNoteShareLinkDto {
   @ArrayMaxSize(200)
   @IsUUID(undefined, { each: true })
   noteIds?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Link auto-expires this many days after creation (1-365).',
+    minimum: 1,
+    maximum: 365,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(365)
+  expiresInDays?: number;
 }
 
 export class NoteShareLinkDto {

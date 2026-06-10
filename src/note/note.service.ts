@@ -613,6 +613,10 @@ export class NoteService {
 
     const title = dto.title.trim().slice(0, 120) || '我的笔记';
     const search = dto.search?.trim() || null;
+    const expiresAt =
+      dto.expiresInDays != null
+        ? new Date(Date.now() + dto.expiresInDays * 24 * 60 * 60 * 1000)
+        : null;
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const token = this.createShareToken();
@@ -627,6 +631,7 @@ export class NoteService {
             groupID: dto.groupId ?? null,
             search,
             noteIDs,
+            expiresAt,
           },
         });
 
