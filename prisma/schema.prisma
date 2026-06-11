@@ -255,6 +255,38 @@ enum ParticipantRole {
   MEMBER
 }
 
+enum CallType {
+  AUDIO
+  VIDEO
+}
+
+enum CallStatus {
+  RINGING
+  ACTIVE
+  ENDED
+  CANCELED
+  MISSED
+  FAILED
+}
+
+enum CallParticipantStatus {
+  INVITED
+  JOINED
+  LEFT
+  REJECTED
+  MISSED
+}
+
+enum CallEndReason {
+  NORMAL
+  CANCELED
+  ALL_LEFT
+  NO_ANSWER
+  TIMEOUT
+  NETWORK
+  ERROR
+}
+
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
@@ -343,6 +375,8 @@ model User {
   iconAssetsCreated            IconAsset[]                 @relation("iconAssetCreator")
   displayIcons                 UserDisplayIcon[]
   conversationGroups           ConversationGroup[]
+  callSessionsInitiated        CallSession[]               @relation("callInitiator")
+  callParticipants             CallParticipant[]
 }
 
 model RefreshToken {
@@ -650,6 +684,53 @@ model Activity {
   user        User       @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([userID])
+}
+
+model CallSession {
+  id              String          @id @default(uuid())
+  conversationID  String
+  sessionType     Int
+  callType        CallType
+  status          CallStatus      @default(RINGING)
+  livekitRoomName String          @unique
+  initiatorID     String
+  startedAt       DateTime?
+  endedAt         DateTime?
+  expiresAt       DateTime
+  endedByID       String?
+  endReason       CallEndReason?
+  metadata        Json?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  initiator    User              @relation("callInitiator", fields: [initiatorID], references: [id], onDelete: Cascade)
+  participants CallParticipant[]
+
+  @@index([conversationID, createdAt])
+  @@index([initiatorID, status])
+  @@index([expiresAt, status])
+}
+
+model CallParticipant {
+  id          String                @id @default(uuid())
+  callID      String
+  userID      String
+  status      CallParticipantStatus @default(INVITED)
+  invitedAt   DateTime              @default(now())
+  joinedAt    DateTime?
+  leftAt      DateTime?
+  rejectedAt  DateTime?
+  missedAt    DateTime?
+  lastTokenAt DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  call CallSession @relation(fields: [callID], references: [id], onDelete: Cascade)
+  user User        @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@unique([callID, userID])
+  @@index([userID, status])
+  @@index([callID, status])
 }
 
 // ─── Squad ────────────────────────────────────────────────────────────────────

@@ -50,6 +50,18 @@ export function createEnvValidationSchema(
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
     OPENIM_API_URL: Joi.string().uri().optional(),
     OPENIM_ADMIN_SECRET: Joi.string().optional(),
+    LIVEKIT_URL: Joi.string().uri().optional(),
+    LIVEKIT_API_KEY: Joi.string().optional(),
+    LIVEKIT_API_SECRET: Joi.string().optional(),
+    LIVEKIT_WEBHOOK_SECRET: Joi.string().optional(),
+    LIVEKIT_TOKEN_TTL_SECONDS: Joi.number()
+      .integer()
+      .min(60)
+      .default(3600),
+    CALL_RING_TIMEOUT_SECONDS: Joi.number().integer().min(5).default(45),
+    CALL_MAX_PARTICIPANTS: Joi.number().integer().min(2).max(100).default(10),
+    CALL_ALLOW_OFFLINE_INVITE: Joi.boolean().default(false),
+    CALL_ENABLE_VIDEO: Joi.boolean().default(false),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),

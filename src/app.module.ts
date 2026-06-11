@@ -33,6 +33,7 @@ import { createEnvValidationSchema } from './config/env.validation';
 import { ChatHistoryModule } from './chat-history/chat-history.module';
 import { GroupModule } from './group/group.module';
 import { OutboxModule } from './outbox/outbox.module';
+import { CallModule } from './call/call.module';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
 
@@ -71,6 +72,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     ChatHistoryModule,
     GroupModule,
     OutboxModule,
+    CallModule,
   ],
   controllers: [],
   providers: [Logger],

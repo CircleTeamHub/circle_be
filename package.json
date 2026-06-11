@@ -53,6 +53,7 @@
       "express-rate-limit": "^8.3.2",
       "helmet": "^8.1.0",
       "joi": "^18.1.2",
+      "livekit-server-sdk": "^2.15.4",
       "module-alias": "^2.2.2",
       "mongodb": "^6.21.0",
       "nest-winston": "^1.10.2",

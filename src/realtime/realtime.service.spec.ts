@@ -95,6 +95,80 @@ describe('RealtimeService', () => {
     });
   });
 
+  it('broadcastCallInvite emits a token-free incoming call payload', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastCallInvite('user-2', {
+      callId: 'call-1',
+      conversationID: 'sg_group-1',
+      sessionType: 'group',
+      callType: 'AUDIO',
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      invitees: [{ id: 'user-2', nickname: 'Bob', avatarUrl: null }],
+      expiresAt: '2026-06-11T03:00:45.000Z',
+      createdAt: '2026-06-11T03:00:00.000Z',
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('user-2', {
+      type: 'call.invite',
+      payload: {
+        callId: 'call-1',
+        conversationID: 'sg_group-1',
+        sessionType: 'group',
+        callType: 'AUDIO',
+        initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        invitees: [{ id: 'user-2', nickname: 'Bob', avatarUrl: null }],
+        expiresAt: '2026-06-11T03:00:45.000Z',
+        createdAt: '2026-06-11T03:00:00.000Z',
+      },
+    });
+    expect(JSON.stringify(broadcast.mock.calls[0][1])).not.toContain('token');
+  });
+
+  it('broadcastCallParticipantJoined emits joined participant updates', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastCallParticipantJoined('user-1', {
+      callId: 'call-1',
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+      joinedAt: '2026-06-11T03:00:10.000Z',
+      changedAt: '2026-06-11T03:00:10.000Z',
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'call.participant.joined',
+      payload: {
+        callId: 'call-1',
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        joinedAt: '2026-06-11T03:00:10.000Z',
+        changedAt: '2026-06-11T03:00:10.000Z',
+      },
+    });
+  });
+
+  it('broadcastCallEnded emits terminal call state', () => {
+    const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+    service.broadcastCallEnded('user-1', {
+      callId: 'call-1',
+      status: 'ENDED',
+      endReason: 'ALL_LEFT',
+      endedAt: '2026-06-11T03:02:00.000Z',
+      changedAt: '2026-06-11T03:02:00.000Z',
+    });
+
+    expect(broadcast).toHaveBeenCalledWith('user-1', {
+      type: 'call.ended',
+      payload: {
+        callId: 'call-1',
+        status: 'ENDED',
+        endReason: 'ALL_LEFT',
+        endedAt: '2026-06-11T03:02:00.000Z',
+        changedAt: '2026-06-11T03:02:00.000Z',
+      },
+    });
+  });
+
   it('broadcastSignupUnread emits the signup-management unread count', async () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
     prisma.circlePostSignup.count.mockResolvedValue(2);

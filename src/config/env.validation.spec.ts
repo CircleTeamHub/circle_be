@@ -25,4 +25,19 @@ describe('createEnvValidationSchema', () => {
     expect(error).toBeUndefined();
     expect(value.ALLOW_START_WITHOUT_DB).toBe(true);
   });
+
+  it('normalizes optional call configuration defaults', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.LIVEKIT_TOKEN_TTL_SECONDS).toBe(3600);
+    expect(value.CALL_RING_TIMEOUT_SECONDS).toBe(45);
+    expect(value.CALL_MAX_PARTICIPANTS).toBe(10);
+    expect(value.CALL_ENABLE_VIDEO).toBe(false);
+  });
 });

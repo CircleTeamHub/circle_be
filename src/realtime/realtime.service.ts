@@ -17,8 +17,50 @@ type BadgeSnapshot = {
   syncedAt: string;
 };
 
+type CallUserLite = {
+  id: string;
+  nickname: string;
+  avatarUrl: string | null;
+};
+
+type CallInvitePayload = {
+  callId: string;
+  conversationID: string;
+  sessionType: 'group' | 'single';
+  callType: 'AUDIO' | 'VIDEO';
+  initiator: CallUserLite;
+  invitees: CallUserLite[];
+  expiresAt: string;
+  createdAt: string;
+};
+
+type CallParticipantPayload = {
+  callId: string;
+  user: CallUserLite;
+  joinedAt?: string;
+  leftAt?: string;
+  rejectedAt?: string;
+  missedAt?: string;
+  changedAt: string;
+};
+
+type CallStatePayload = {
+  callId: string;
+  status: 'ENDED' | 'CANCELED' | 'MISSED' | 'FAILED';
+  endReason: string | null;
+  endedAt: string | null;
+  changedAt: string;
+};
+
 type RealtimeEvent =
   | { type: 'badge.snapshot'; payload: BadgeSnapshot }
+  | { type: 'call.invite'; payload: CallInvitePayload }
+  | { type: 'call.participant.joined'; payload: CallParticipantPayload }
+  | { type: 'call.participant.left'; payload: CallParticipantPayload }
+  | { type: 'call.participant.rejected'; payload: CallParticipantPayload }
+  | { type: 'call.participant.missed'; payload: CallParticipantPayload }
+  | { type: 'call.canceled'; payload: CallStatePayload }
+  | { type: 'call.ended'; payload: CallStatePayload }
   | {
       type:
         | 'friend.activity.unread.changed'
@@ -330,6 +372,67 @@ export class RealtimeService {
     this.broadcast(userId, {
       type: 'notification.created',
       payload: notification,
+    });
+  }
+
+  broadcastCallInvite(userId: string, payload: CallInvitePayload) {
+    this.broadcast(userId, {
+      type: 'call.invite',
+      payload,
+    });
+  }
+
+  broadcastCallParticipantJoined(
+    userId: string,
+    payload: CallParticipantPayload,
+  ) {
+    this.broadcast(userId, {
+      type: 'call.participant.joined',
+      payload,
+    });
+  }
+
+  broadcastCallParticipantLeft(
+    userId: string,
+    payload: CallParticipantPayload,
+  ) {
+    this.broadcast(userId, {
+      type: 'call.participant.left',
+      payload,
+    });
+  }
+
+  broadcastCallParticipantRejected(
+    userId: string,
+    payload: CallParticipantPayload,
+  ) {
+    this.broadcast(userId, {
+      type: 'call.participant.rejected',
+      payload,
+    });
+  }
+
+  broadcastCallParticipantMissed(
+    userId: string,
+    payload: CallParticipantPayload,
+  ) {
+    this.broadcast(userId, {
+      type: 'call.participant.missed',
+      payload,
+    });
+  }
+
+  broadcastCallCanceled(userId: string, payload: CallStatePayload) {
+    this.broadcast(userId, {
+      type: 'call.canceled',
+      payload,
+    });
+  }
+
+  broadcastCallEnded(userId: string, payload: CallStatePayload) {
+    this.broadcast(userId, {
+      type: 'call.ended',
+      payload,
     });
   }
 
