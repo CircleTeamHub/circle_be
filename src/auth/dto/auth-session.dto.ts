@@ -10,6 +10,10 @@ export class AuthSessionDto {
   @Expose()
   deviceName: string | null;
 
+  @ApiProperty({ example: true })
+  @Expose()
+  isCurrent: boolean;
+
   @ApiPropertyOptional({ example: '127.0.0.1' })
   @Expose()
   ip: string | null;
