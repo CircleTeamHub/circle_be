@@ -487,13 +487,13 @@ describe('AuthService', () => {
         email: 'banned@example.com',
         password: 'password1',
       } as any),
-    ).rejects.toThrow(/Invalid credentials/);
+    ).rejects.toThrow(/邮箱或密码错误/);
     await expect(
       service.login({
         email: 'nosuch@example.com',
         password: 'password1',
       } as any),
-    ).rejects.toThrow(/Invalid credentials/);
+    ).rejects.toThrow(/邮箱或密码错误/);
   });
 
   it('refresh blocks inactive users and revokes their sessions', async () => {
