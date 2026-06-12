@@ -589,6 +589,8 @@ describe('AuthService', () => {
         where: { id: 'uuid-1' },
         data: {
           loginSecurityCodeHash: expect.any(String),
+          securityCodeAttempts: 0,
+          securityCodeLockedUntil: null,
         },
       }),
     );
@@ -630,7 +632,11 @@ describe('AuthService', () => {
 
     expect(mockPrisma.user.update).toHaveBeenCalledWith({
       where: { id: 'uuid-1' },
-      data: { loginSecurityCodeHash: null },
+      data: {
+        loginSecurityCodeHash: null,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
     });
     expect(users[0].loginSecurityCodeHash).toBeNull();
   });
@@ -651,6 +657,57 @@ describe('AuthService', () => {
     await expect(
       service.verifyLoginSecurityCode('uuid-1', '9999'),
     ).resolves.toEqual({ ok: false });
+  });
+
+  it('locks security code verification after 5 failed attempts', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+      securityCodeAttempts: 0,
+      securityCodeLockedUntil: null,
+    });
+
+    // First 4 wrong guesses just report failure.
+    for (let i = 0; i < 4; i++) {
+      await expect(
+        service.verifyLoginSecurityCode('uuid-1', '9999'),
+      ).resolves.toEqual({ ok: false });
+    }
+    expect(users[0].securityCodeAttempts).toBe(4);
+
+    // 5th wrong guess trips the lock.
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '9999'),
+    ).rejects.toThrow(ForbiddenException);
+    expect(users[0].securityCodeLockedUntil).toBeInstanceOf(Date);
+
+    // While locked, even the correct code is rejected.
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '1234'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('resets the failure counter after a successful verification', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+      securityCodeAttempts: 3,
+      securityCodeLockedUntil: null,
+    });
+
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '1234'),
+    ).resolves.toEqual({ ok: true });
+    expect(users[0].securityCodeAttempts).toBe(0);
+    expect(users[0].securityCodeLockedUntil).toBeNull();
   });
 
   it('rejects login security codes outside 4 to 6 digits', async () => {

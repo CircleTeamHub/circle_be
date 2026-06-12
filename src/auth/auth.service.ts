@@ -26,6 +26,11 @@ import { USER_ME_SELECT } from 'src/user/user.select';
 
 const ME_SELECT = USER_ME_SELECT;
 const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
+// Persistent per-account lockout for security-code verification. Backs up the
+// per-IP rate limiter so a distributed / IP-rotating attacker still can't
+// brute-force a 4-6 digit code.
+const MAX_SECURITY_CODE_ATTEMPTS = 5;
+const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
 
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
@@ -497,7 +502,11 @@ export class AuthService {
     const loginSecurityCodeHash = await argon2.hash(securityCode);
     await this.prisma.user.update({
       where: { id: userId },
-      data: { loginSecurityCodeHash },
+      data: {
+        loginSecurityCodeHash,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
     });
   }
 
@@ -527,7 +536,11 @@ export class AuthService {
 
     await this.prisma.user.update({
       where: { id: userId },
-      data: { loginSecurityCodeHash: null },
+      data: {
+        loginSecurityCodeHash: null,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
     });
   }
 
@@ -539,7 +552,11 @@ export class AuthService {
 
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { loginSecurityCodeHash: true },
+      select: {
+        loginSecurityCodeHash: true,
+        securityCodeAttempts: true,
+        securityCodeLockedUntil: true,
+      },
     });
 
     if (!user) {
@@ -550,9 +567,46 @@ export class AuthService {
       return { ok: false };
     }
 
-    return {
-      ok: await argon2.verify(user.loginSecurityCodeHash, securityCode),
-    };
+    const now = new Date();
+    if (user.securityCodeLockedUntil && user.securityCodeLockedUntil > now) {
+      throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+    }
+
+    const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
+
+    if (!valid) {
+      const attempts = user.securityCodeAttempts + 1;
+      const shouldLock = attempts >= MAX_SECURITY_CODE_ATTEMPTS;
+      // On lockout, reset the counter so the next window starts fresh after the
+      // lock expires. Read-then-write here is fine: any race only grants a
+      // couple of extra guesses, and the per-IP limiter already caps the rate.
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          securityCodeAttempts: shouldLock ? 0 : attempts,
+          securityCodeLockedUntil: shouldLock
+            ? new Date(now.getTime() + SECURITY_CODE_LOCK_MS)
+            : user.securityCodeLockedUntil,
+        },
+      });
+      if (shouldLock) {
+        this.logger.warn(
+          `Security code locked for user ${userId} after ${MAX_SECURITY_CODE_ATTEMPTS} failed attempts.`,
+        );
+        throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+      }
+      return { ok: false };
+    }
+
+    // Success: clear any accumulated failures / lock.
+    if (user.securityCodeAttempts !== 0 || user.securityCodeLockedUntil) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { securityCodeAttempts: 0, securityCodeLockedUntil: null },
+      });
+    }
+
+    return { ok: true };
   }
 
   private async issueTokens(

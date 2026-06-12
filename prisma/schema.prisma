@@ -267,6 +267,8 @@ model User {
   accountId                  String     @unique
   passwordHash               String
   loginSecurityCodeHash      String?
+  securityCodeAttempts       Int        @default(0)
+  securityCodeLockedUntil    DateTime?
   singleDeviceLoginEnabled   Boolean    @default(false)
   nickname                   String
   avatarUrl                  String?

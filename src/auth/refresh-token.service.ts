@@ -18,7 +18,10 @@ function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function truncate(value: string | null | undefined, max: number): string | null {
+function truncate(
+  value: string | null | undefined,
+  max: number,
+): string | null {
   if (value === null || value === undefined) return null;
   return value.length > max ? value.slice(0, max) : value;
 }
@@ -48,14 +51,17 @@ export class RefreshTokenService {
         : DEFAULT_REFRESH_TOKEN_TTL_DAYS;
   }
 
-  async create(userId: string, context?: SessionContext): Promise<string> {
+  async create(
+    userId: string,
+    context?: SessionContext,
+  ): Promise<{ token: string; sessionId: string }> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
     const expiredAt = new Date();
     expiredAt.setDate(expiredAt.getDate() + this.ttlDays);
 
     const safe = normalizeContext(context);
-    await this.prisma.refreshToken.create({
+    const session = await this.prisma.refreshToken.create({
       data: {
         userId,
         token: tokenHash,
@@ -67,13 +73,13 @@ export class RefreshTokenService {
       },
     });
 
-    return rawToken;
+    return { token: rawToken, sessionId: session.id };
   }
 
   async rotate(
     oldToken: string,
     context?: SessionContext,
-  ): Promise<{ token: string; userId: string }> {
+  ): Promise<{ token: string; userId: string; sessionId: string }> {
     const tokenHash = hashToken(oldToken);
     const now = new Date();
 
@@ -119,12 +125,16 @@ export class RefreshTokenService {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    const newToken = await this.create(record.userId, {
+    const newSession = await this.create(record.userId, {
       deviceName: context?.deviceName ?? record.deviceName ?? null,
       ip: context?.ip ?? record.ip ?? null,
       userAgent: context?.userAgent ?? record.userAgent ?? null,
     });
-    return { token: newToken, userId: record.userId };
+    return {
+      token: newSession.token,
+      userId: record.userId,
+      sessionId: newSession.sessionId,
+    };
   }
 
   async revoke(token: string): Promise<void> {
@@ -160,6 +170,31 @@ export class RefreshTokenService {
   async revokeAll(userId: string): Promise<void> {
     await this.prisma.refreshToken.updateMany({
       where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async revokeSession(userId: string, sessionId: string): Promise<void> {
+    await this.prisma.refreshToken.updateMany({
+      where: { id: sessionId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async revokeOtherSessions(
+    userId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    if (!currentSessionId) {
+      return;
+    }
+
+    await this.prisma.refreshToken.updateMany({
+      where: {
+        userId,
+        revokedAt: null,
+        id: { not: currentSessionId },
+      },
       data: { revokedAt: new Date() },
     });
   }
