@@ -17,6 +17,11 @@ describe('UserService.update normalization', () => {
   const refreshTokens = {
     revokeAll: jest.fn().mockResolvedValue(undefined),
   };
+  // update() does not exercise profile-privacy filtering, but UserService now
+  // requires the dependency (fail-closed). Provide a permissive stub.
+  const privacySettings = {
+    canViewProfileField: jest.fn().mockResolvedValue(true),
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -54,6 +59,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -76,6 +82,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', {
@@ -109,6 +116,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', {
@@ -134,6 +142,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', {
@@ -159,6 +168,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', {
@@ -184,6 +194,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', {
@@ -211,6 +222,7 @@ describe('UserService.update normalization', () => {
       refreshTokens as any,
       iconService as any,
       realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', { nickname: '   ' } as any);

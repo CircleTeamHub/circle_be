@@ -12,6 +12,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import {
   FriendProfileDto,
   FriendActivityDto,
@@ -81,6 +82,7 @@ export class FriendService {
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly notificationService: NotificationService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
@@ -116,6 +118,14 @@ export class FriendService {
     });
     if (block) {
       throw new ForbiddenException('Cannot send a friend request to this user');
+    }
+
+    const canReceiveStrangerMessage =
+      await this.privacySettings.canReceiveStrangerMessage(targetId, false);
+    if (!canReceiveStrangerMessage) {
+      throw new ForbiddenException(
+        'This user does not allow stranger messages',
+      );
     }
 
     // Enforce friend limit for the sender
@@ -1452,5 +1462,4 @@ export class FriendService {
       );
     }
   }
-
 }

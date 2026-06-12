@@ -7,6 +7,7 @@ import { UserService } from '../user.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -29,6 +30,9 @@ describe('UserService', () => {
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(),
   };
+  const privacySettings = {
+    canViewProfileField: jest.fn(),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -42,6 +46,7 @@ describe('UserService', () => {
         { provide: RefreshTokenService, useValue: refreshTokens },
         { provide: IconService, useValue: iconService },
         { provide: RealtimeService, useValue: realtimeService },
+        { provide: PrivacySettingsService, useValue: privacySettings },
       ],
     }).compile();
     return module.get<UserService>(UserService);
@@ -49,6 +54,7 @@ describe('UserService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    privacySettings.canViewProfileField.mockResolvedValue(true);
     service = await buildService();
   });
 
@@ -121,6 +127,26 @@ describe('UserService', () => {
       prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
       await expect(service.findOne('user-1')).resolves.toEqual({
         id: 'user-1',
+        displayIcons: [],
+      });
+    });
+
+    it('filters contact fields according to target privacy settings for other viewers', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'target-1',
+        phoneNumber: '13800000000',
+        wechat: 'wxid_target',
+        qq: '10001',
+      });
+      privacySettings.canViewProfileField.mockImplementation(
+        async (_targetId: string, field: string) => field === 'wechat',
+      );
+
+      await expect(service.findOne('target-1', 'viewer-1')).resolves.toEqual({
+        id: 'target-1',
+        phoneNumber: null,
+        wechat: 'wxid_target',
+        qq: null,
         displayIcons: [],
       });
     });

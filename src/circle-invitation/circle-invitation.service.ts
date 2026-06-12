@@ -10,6 +10,7 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
@@ -53,6 +54,7 @@ export class CircleInvitationService {
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
     private readonly realtimeService: RealtimeService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   async invite(
@@ -112,6 +114,19 @@ export class CircleInvitationService {
     }
     if (circle.joinFancyRestriction && !applicant.fancyNumber) {
       throw new ForbiddenException('Applicant needs a fancy number to join');
+    }
+
+    // Pass real friendship status: a FRIENDS_ONLY invite permission must let
+    // friends through. Hardcoding false here would collapse FRIENDS_ONLY into
+    // NONE and block invites even from friends.
+    const inviterIsFriend = await this.areFriends(inviterId, applicantId);
+    const canInviteApplicant =
+      await this.privacySettings.canBeInvitedToGroupOrCircle(
+        applicantId,
+        inviterIsFriend,
+      );
+    if (!canInviteApplicant) {
+      throw new ForbiddenException('User does not allow circle invites');
     }
 
     // 6. Create invitation + auto-approve inviter as first verifier
@@ -714,5 +729,19 @@ export class CircleInvitationService {
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2034'
     );
+  }
+
+  private async areFriends(a: string, b: string): Promise<boolean> {
+    const record = await this.prisma.friend.findFirst({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: a, friendID: b },
+          { userID: b, friendID: a },
+        ],
+      },
+      select: { userID: true },
+    });
+    return record !== null;
   }
 }

@@ -1,5 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { OpenimService, type OpenimMessage } from 'src/openim/openim.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import {
   ChatHistoryMessagePageDto,
   RestorableMessageDto,
@@ -16,7 +17,10 @@ import {
 export class ChatHistoryService {
   private static readonly MAX_PAGE_SIZE = 200;
 
-  constructor(private readonly openim: OpenimService) {}
+  constructor(
+    private readonly openim: OpenimService,
+    private readonly privacySettings: PrivacySettingsService,
+  ) {}
 
   async getMessages(
     userId: string,
@@ -53,9 +57,14 @@ export class ChatHistoryService {
       num: pageSize,
     });
 
+    const selfDestructCutoff = await this.getSelfDestructCutoff(userId);
+
     const messages = raw
       .map((message) => this.toRestorableMessage(message))
       .filter((message) => Number.isFinite(message.seq) && message.seq <= end)
+      .filter((message) =>
+        this.isWithinSelfDestructWindow(message, selfDestructCutoff),
+      )
       .sort((left, right) => left.seq - right.seq);
 
     // Cursor pagination: a full page implies older messages may remain; an
@@ -137,6 +146,23 @@ export class ChatHistoryService {
       ex: String(msg.ex ?? ''),
       isRead: Boolean(msg.isRead),
     };
+  }
+
+  private async getSelfDestructCutoff(userId: string): Promise<number | null> {
+    const { messageSelfDestructDays } =
+      await this.privacySettings.getSettings(userId);
+    if (!messageSelfDestructDays) return null;
+    return Date.now() - messageSelfDestructDays * 24 * 60 * 60 * 1000;
+  }
+
+  private isWithinSelfDestructWindow(
+    message: RestorableMessageDto,
+    cutoff: number | null,
+  ) {
+    if (cutoff == null) return true;
+    const timestamp = message.sendTime || message.createTime;
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return true;
+    return timestamp >= cutoff;
   }
 
   private emptyPage(conversationID: string): ChatHistoryMessagePageDto {

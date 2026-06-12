@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
@@ -32,6 +33,7 @@ export class TraceService {
     private readonly config: ConfigService,
     private readonly notificationService: NotificationService,
     private readonly realtimeService: RealtimeService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -53,7 +55,12 @@ export class TraceService {
     const skip = (page - 1) * limit;
 
     const friendIds = await this.getAcceptedFriendIds(userId);
-    const visibleUserIds = [userId, ...friendIds];
+    const friendIdSet = new Set(friendIds);
+    const visibleUserIds = await this.filterMomentVisibleAuthorIds(
+      userId,
+      [userId, ...friendIds],
+      friendIdSet,
+    );
 
     const where = {
       deleted: false,
@@ -95,8 +102,6 @@ export class TraceService {
       this.prisma.trace.count({ where }),
     ]);
 
-    const friendIdSet = new Set(friendIds);
-
     // Resolve the viewer's own like state from an authoritative query rather
     // than the truncated `likeStats` preview — a like outside the top-20 would
     // otherwise make `isLikedByMe` wrong.
@@ -130,7 +135,11 @@ export class TraceService {
     }
 
     const friendIds = await this.getAcceptedFriendIds(userId);
-    const visibleUserIds = [userId, ...friendIds];
+    const visibleUserIds = await this.filterMomentVisibleAuthorIds(
+      userId,
+      [userId, ...friendIds],
+      new Set(friendIds),
+    );
 
     return this.prisma.trace.count({
       where: {
@@ -406,6 +415,26 @@ export class TraceService {
     return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
   }
 
+  private async filterMomentVisibleAuthorIds(
+    viewerId: string,
+    authorIds: string[],
+    friendIdSet: Set<string>,
+  ): Promise<string[]> {
+    const checks = await Promise.all(
+      authorIds.map(async (authorId) => ({
+        authorId,
+        visible: await this.privacySettings.canViewMoments(
+          authorId,
+          authorId === viewerId,
+          friendIdSet.has(authorId),
+        ),
+      })),
+    );
+    return checks
+      .filter((check) => check.visible)
+      .map((check) => check.authorId);
+  }
+
   private async requireVisibleTrace(traceId: string, viewerId: string) {
     const trace = await this.prisma.trace.findFirst({
       where: { id: traceId, deleted: false },
@@ -413,12 +442,27 @@ export class TraceService {
     if (!trace) {
       throw new NotFoundException('Moment not found');
     }
-    if (trace.fromID === viewerId || trace.visibility === 'PUBLIC') {
+    if (trace.fromID === viewerId) {
+      return trace;
+    }
+    const friendIds =
+      trace.visibility === 'FRIENDS_ONLY' || trace.visibility === 'PUBLIC'
+        ? await this.getAcceptedFriendIds(viewerId)
+        : [];
+    const isFriend = friendIds.includes(trace.fromID);
+    const authorAllowsViewer = await this.privacySettings.canViewMoments(
+      trace.fromID,
+      false,
+      isFriend,
+    );
+    if (!authorAllowsViewer) {
+      throw new ForbiddenException('You are not allowed to access this moment');
+    }
+    if (trace.visibility === 'PUBLIC') {
       return trace;
     }
     if (trace.visibility === 'FRIENDS_ONLY') {
-      const friendIds = await this.getAcceptedFriendIds(viewerId);
-      if (friendIds.includes(trace.fromID)) {
+      if (isFriend) {
         return trace;
       }
     }

@@ -10,6 +10,7 @@ import {
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { InviteGroupMembersDto } from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
 
@@ -34,6 +35,7 @@ export class GroupService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   async inviteGroupMembers(
@@ -79,6 +81,8 @@ export class GroupService {
     if (activatingUserIDs.length === 0) {
       return { handled: true };
     }
+
+    await this.assertInviteTargetsAllowInvites(actorId, activatingUserIDs);
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
     await this.prisma.$transaction(async (tx) => {
@@ -447,6 +451,39 @@ export class GroupService {
 
   private openimGroupID(circle: CircleGroupLookup, fallbackGroupID: string) {
     return circle.groupID ?? fallbackGroupID;
+  }
+
+  private async assertInviteTargetsAllowInvites(
+    inviterId: string,
+    targetUserIDs: string[],
+  ) {
+    // Resolve the inviter's friends once, then check each target in parallel.
+    // Passing real friendship status keeps FRIENDS_ONLY invite permission
+    // meaningful (hardcoding false would make it behave like NONE), and the
+    // single friend query + Promise.all avoids the prior sequential N+1.
+    const friendSet = new Set(await this.getAcceptedFriendIds(inviterId));
+    const results = await Promise.all(
+      targetUserIDs.map((targetUserID) =>
+        this.privacySettings.canBeInvitedToGroupOrCircle(
+          targetUserID,
+          friendSet.has(targetUserID),
+        ),
+      ),
+    );
+    if (results.some((allowed) => !allowed)) {
+      throw new ForbiddenException('User does not allow group invites');
+    }
+  }
+
+  private async getAcceptedFriendIds(userId: string): Promise<string[]> {
+    const records = await this.prisma.friend.findMany({
+      where: {
+        OR: [{ userID: userId }, { friendID: userId }],
+        state: 'ACCEPTED',
+      },
+      select: { userID: true, friendID: true },
+    });
+    return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
   }
 
   private rawOpenimGroupID(groupID: string): string {

@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
@@ -11,6 +12,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
@@ -95,6 +97,9 @@ describe('FriendService', () => {
     importFriends: jest.fn(),
     removeBlacklist: jest.fn(),
   };
+  const privacySettings = {
+    canReceiveStrangerMessage: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -115,6 +120,8 @@ describe('FriendService', () => {
       mock.mockReset();
       mock.mockResolvedValue(undefined);
     }
+    privacySettings.canReceiveStrangerMessage.mockReset();
+    privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -129,6 +136,7 @@ describe('FriendService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: NotificationService, useValue: notificationService },
         { provide: OpenimService, useValue: openimService },
+        { provide: PrivacySettingsService, useValue: privacySettings },
       ],
     }).compile();
 
@@ -193,6 +201,24 @@ describe('FriendService', () => {
     expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalledWith(
       'user-2',
     );
+  });
+
+  it('rejects friend requests when the target disallows stranger messages', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.count.mockResolvedValue(0);
+    privacySettings.canReceiveStrangerMessage.mockResolvedValue(false);
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello'),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(prisma.friend.create).not.toHaveBeenCalled();
+    expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
   });
 
   it('creates and broadcasts a friend request notification for the recipient', async () => {
@@ -944,8 +970,16 @@ describe('FriendService', () => {
 
     expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
-        { operation: 'IMPORT_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
-        { operation: 'IMPORT_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+        {
+          operation: 'IMPORT_FRIEND',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+        {
+          operation: 'IMPORT_FRIEND',
+          userID: 'user-2',
+          targetUserID: 'user-1',
+        },
       ],
       skipDuplicates: true,
     });
@@ -990,8 +1024,16 @@ describe('FriendService', () => {
 
     expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
-        { operation: 'DELETE_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
-        { operation: 'DELETE_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-2',
+          targetUserID: 'user-1',
+        },
       ],
       skipDuplicates: true,
     });
@@ -1225,9 +1267,21 @@ describe('FriendService', () => {
 
     expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
-        { operation: 'ADD_BLACKLIST', userID: 'user-1', targetUserID: 'user-2' },
-        { operation: 'DELETE_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
-        { operation: 'DELETE_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
+        {
+          operation: 'ADD_BLACKLIST',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-2',
+          targetUserID: 'user-1',
+        },
       ],
       skipDuplicates: true,
     });
@@ -1242,7 +1296,9 @@ describe('FriendService', () => {
     });
     prisma.block.findUnique.mockResolvedValue(null);
 
-    await expect(service.blockUser('user-1', 'user-2')).resolves.toBeUndefined();
+    await expect(
+      service.blockUser('user-1', 'user-2'),
+    ).resolves.toBeUndefined();
     expect(openimService.addBlacklist).not.toHaveBeenCalled();
   });
 

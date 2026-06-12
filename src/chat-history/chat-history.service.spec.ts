@@ -4,6 +4,7 @@ import { NotFoundException } from '@nestjs/common';
 import { ChatHistoryService } from './chat-history.service';
 import { ChatHistoryQueryDto } from './dto/chat-history.dto';
 import type { OpenimMessage, OpenimService } from 'src/openim/openim.service';
+import type { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 
 describe('ChatHistory DTOs', () => {
   it('caps message page size through query validation metadata', () => {
@@ -52,8 +53,19 @@ describe('ChatHistoryService', () => {
     };
   }
 
-  function createService(openim: Partial<OpenimService>) {
-    return new ChatHistoryService(openim as OpenimService);
+  function createService(
+    openim: Partial<OpenimService>,
+    privacySettings?: Partial<PrivacySettingsService>,
+  ) {
+    return new ChatHistoryService(
+      openim as OpenimService,
+      {
+        getSettings: jest
+          .fn()
+          .mockResolvedValue({ messageSelfDestructDays: 0 }),
+        ...privacySettings,
+      } as PrivacySettingsService,
+    );
   }
 
   it('returns single-conversation messages, sorted ascending, when the user is a participant', async () => {
@@ -191,6 +203,35 @@ describe('ChatHistoryService', () => {
     expect(page.messages.map((message) => message.seq)).toEqual([4, 5]);
     expect(page.hasMore).toBe(true);
     expect(page.nextBeforeSeq).toBe(4);
+  });
+
+  it('filters restored messages older than the account self-destruct window', async () => {
+    const now = Date.now();
+    const service = createService(
+      {
+        getConversationMaxSeq: jest.fn().mockResolvedValue(3),
+        pullConversationMessages: jest.fn().mockResolvedValue({
+          messages: [
+            makeMsg(1, { sendTime: now - 3 * 24 * 60 * 60 * 1000 }),
+            makeMsg(2, { sendTime: now - 12 * 60 * 60 * 1000 }),
+          ],
+          isEnd: true,
+        }),
+      },
+      {
+        getSettings: jest
+          .fn()
+          .mockResolvedValue({ messageSelfDestructDays: 2 }),
+      },
+    );
+
+    const page = await service.getMessages(
+      currentUserId,
+      singleConversationID,
+      100,
+    );
+
+    expect(page.messages.map((message) => message.seq)).toEqual([2]);
   });
 
   it('stops paginating (hasMore false) when an under-filled page comes back', async () => {
