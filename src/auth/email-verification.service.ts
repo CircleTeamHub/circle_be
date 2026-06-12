@@ -3,6 +3,7 @@ import {
   ConflictException,
   Inject,
   Injectable,
+  Logger,
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
@@ -17,6 +18,8 @@ const MAX_ATTEMPTS = 5;
 
 @Injectable()
 export class EmailVerificationService {
+  private readonly logger = new Logger(EmailVerificationService.name);
+
   constructor(
     private prisma: PrismaService,
     @Inject(MAILER) private mailer: Mailer,
@@ -26,7 +29,21 @@ export class EmailVerificationService {
     return randomInt(0, 1_000_000).toString().padStart(6, '0');
   }
 
-  async requestCode(rawEmail: string, purpose: EmailCodePurpose): Promise<void> {
+  /**
+   * 开发占位：真实邮件投递接通前，dev 环境允许一个固定码直接通过验证。
+   * 生产环境（NODE_ENV=production）永远返回 null —— 绝不放后门进线上。
+   * 可用环境变量 EMAIL_CODE_DEV_BYPASS 改码，或设为 "off" 关闭。
+   */
+  private getDevBypassCode(): string | null {
+    if (process.env.NODE_ENV === 'production') return null;
+    const value = process.env.EMAIL_CODE_DEV_BYPASS ?? '999999';
+    return value.toLowerCase() === 'off' ? null : value;
+  }
+
+  async requestCode(
+    rawEmail: string,
+    purpose: EmailCodePurpose,
+  ): Promise<void> {
     const email = normalizeEmail(rawEmail);
 
     const last = await this.prisma.emailVerificationCode.findFirst({
@@ -75,6 +92,15 @@ export class EmailVerificationService {
     code: string,
   ): Promise<boolean> {
     const email = normalizeEmail(rawEmail);
+
+    // Dev 占位：固定码直接通过（无需先请求验证码）。生产环境此处恒为 null。
+    const bypass = this.getDevBypassCode();
+    if (bypass && code === bypass) {
+      this.logger.warn(
+        `[DEV] email code bypass used for ${email} (${purpose}) — disable in production`,
+      );
+      return true;
+    }
 
     const record = await this.prisma.emailVerificationCode.findFirst({
       where: {

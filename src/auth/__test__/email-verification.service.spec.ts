@@ -116,12 +116,12 @@ describe('EmailVerificationService', () => {
       expiresAt: new Date(Date.now() + 60000),
       createdAt: Date.now(),
     });
-    await expect(service.verifyCode('a@b.com', 'LOGIN', '123456')).resolves.toBe(
-      true,
-    );
-    await expect(service.verifyCode('a@b.com', 'LOGIN', '123456')).resolves.toBe(
-      false,
-    );
+    await expect(
+      service.verifyCode('a@b.com', 'LOGIN', '123456'),
+    ).resolves.toBe(true);
+    await expect(
+      service.verifyCode('a@b.com', 'LOGIN', '123456'),
+    ).resolves.toBe(false);
   });
 
   it('verifyCode returns false for wrong code and counts attempts', async () => {
@@ -136,9 +136,9 @@ describe('EmailVerificationService', () => {
       expiresAt: new Date(Date.now() + 60000),
       createdAt: Date.now(),
     });
-    await expect(service.verifyCode('a@b.com', 'LOGIN', '000000')).resolves.toBe(
-      false,
-    );
+    await expect(
+      service.verifyCode('a@b.com', 'LOGIN', '000000'),
+    ).resolves.toBe(false);
     expect(codes[0].attempts).toBe(1);
   });
 
@@ -154,8 +154,27 @@ describe('EmailVerificationService', () => {
       expiresAt: new Date(Date.now() - 1000),
       createdAt: Date.now(),
     });
-    await expect(service.verifyCode('a@b.com', 'LOGIN', '123456')).resolves.toBe(
-      false,
-    );
+    await expect(
+      service.verifyCode('a@b.com', 'LOGIN', '123456'),
+    ).resolves.toBe(false);
+  });
+
+  it('verifyCode accepts the dev bypass code without a stored record', async () => {
+    // 没有 seed 任何验证码记录，999999 仍应直接通过（dev 占位）。
+    await expect(
+      service.verifyCode('nobody@b.com', 'LOGIN', '999999'),
+    ).resolves.toBe(true);
+  });
+
+  it('verifyCode dev bypass can be disabled via EMAIL_CODE_DEV_BYPASS=off', async () => {
+    const prev = process.env.EMAIL_CODE_DEV_BYPASS;
+    process.env.EMAIL_CODE_DEV_BYPASS = 'off';
+    try {
+      await expect(
+        service.verifyCode('nobody@b.com', 'LOGIN', '999999'),
+      ).resolves.toBe(false);
+    } finally {
+      process.env.EMAIL_CODE_DEV_BYPASS = prev;
+    }
   });
 });
