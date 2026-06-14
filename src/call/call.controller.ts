@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Headers,
   Param,
   Post,
   Req,
@@ -25,8 +26,13 @@ export class CallController {
   createGroupCall(
     @Body() dto: CreateGroupCallDto,
     @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ) {
-    return this.callService.createGroupCall(req.user.userId, dto);
+    return this.callService.createGroupCall(
+      req.user.userId,
+      dto,
+      idempotencyKey,
+    );
   }
 
   @Post(':callId/accept')

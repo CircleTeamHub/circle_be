@@ -81,6 +81,33 @@ describe('LiveKitCallService', () => {
     );
   });
 
+  it('verifies and parses LiveKit webhook payloads', async () => {
+    const service = buildService({
+      LIVEKIT_URL: 'wss://livekit.example.com',
+      LIVEKIT_API_KEY: 'key',
+      LIVEKIT_API_SECRET: 'secret',
+    });
+    const receive = jest.fn().mockResolvedValue({ event: 'room_finished' });
+    (service as any).webhookReceiver = { receive };
+
+    await expect(
+      service.verifyWebhook('{"event":"room_finished"}', 'Bearer token'),
+    ).resolves.toEqual({ event: 'room_finished' });
+
+    expect(receive).toHaveBeenCalledWith(
+      '{"event":"room_finished"}',
+      'Bearer token',
+    );
+  });
+
+  it('rejects webhook verification when LiveKit is not configured', async () => {
+    const service = buildService({});
+
+    await expect(service.verifyWebhook('{}', 'Bearer token')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+  });
+
   it('swallows room deletion errors because business state is already terminal', async () => {
     const service = buildService({
       LIVEKIT_URL: 'wss://livekit.example.com',

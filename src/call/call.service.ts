@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -59,6 +60,11 @@ type CallWithParticipants = {
   createdAt?: Date;
 };
 
+type LiveKitWebhookEvent = {
+  event?: string;
+  room?: { name?: string };
+};
+
 const userLiteSelect = {
   id: true,
   nickname: true,
@@ -67,6 +73,8 @@ const userLiteSelect = {
 
 @Injectable()
 export class CallService {
+  private readonly logger = new Logger(CallService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
@@ -75,7 +83,11 @@ export class CallService {
     private readonly config: ConfigService,
   ) {}
 
-  async createGroupCall(initiatorID: string, dto: CreateGroupCallDto) {
+  async createGroupCall(
+    initiatorID: string,
+    dto: CreateGroupCallDto,
+    idempotencyKey?: string,
+  ) {
     const conversationID = this.normalizeID(dto.conversationID, 'Group not found');
     const inviteeIDs = this.uniqueIDs(dto.inviteeIDs).filter(
       (userID) => userID !== initiatorID,
@@ -91,6 +103,20 @@ export class CallService {
     await this.assertGroupMembers(conversationID, participantIDs, initiatorID);
     const users = await this.loadActiveUsers(participantIDs);
     await this.expireStaleRingingCallsForUsers(participantIDs);
+    const existing = await this.findIdempotentCreateCall(
+      initiatorID,
+      idempotencyKey,
+    );
+    if (existing) {
+      const token = await this.mintToken(existing, users.get(initiatorID)!);
+      return {
+        call: this.toCallDto(existing),
+        selfParticipant: this.toParticipantDto(
+          this.findParticipant(existing, initiatorID),
+        ),
+        livekit: this.buildTokenResponse(token),
+      };
+    }
     await this.assertNotBusy(participantIDs);
 
     const callId = randomUUID();
@@ -108,6 +134,7 @@ export class CallService {
     try {
       call = (await this.prisma.$transaction(
         async (tx) => {
+          await this.lockParticipantsForCall(participantIDs, tx);
           await this.assertNotBusy(participantIDs, tx);
           return tx.callSession.create({
             data: {
@@ -119,6 +146,7 @@ export class CallService {
               livekitRoomName,
               initiatorID,
               expiresAt,
+              metadata: idempotencyKey ? { idempotencyKey } : undefined,
               participants: {
                 create: participantIDs.map((userID) => ({
                   userID,
@@ -165,6 +193,9 @@ export class CallService {
         this.realtime.broadcastCallInvite(userID, invitePayload),
       ),
     );
+    this.logger.log(
+      `call.created callId=${call.id} conversationID=${conversationID} participants=${participantIDs.length}`,
+    );
 
     return {
       call: this.toCallDto(call),
@@ -177,6 +208,18 @@ export class CallService {
 
   async acceptCall(userID: string, callId: string) {
     const participant = await this.findParticipantForUser(callId, userID);
+    if (participant.status === CallParticipantStatus.JOINED) {
+      const call = participant.call as CallWithParticipants;
+      if (call.status !== CallStatus.RINGING && call.status !== CallStatus.ACTIVE) {
+        throw new ConflictException('CALL_ENDED');
+      }
+      const token = await this.mintToken(call, participant.user);
+      return {
+        call: this.toCallDto(call),
+        selfParticipant: this.toParticipantDto(participant),
+        livekit: this.buildTokenResponse(token),
+      };
+    }
     if (participant.status !== CallParticipantStatus.INVITED) {
       throw new ConflictException('CALL_NOT_INVITED');
     }
@@ -220,6 +263,7 @@ export class CallService {
     await this.broadcastToCallParticipants(call, (targetID) =>
       this.realtime.broadcastCallParticipantJoined(targetID, payload),
     );
+    this.logger.log(`call.participant_joined callId=${callId} userID=${userID}`);
 
     return {
       call: this.toCallDto(updatedCall as CallWithParticipants),
@@ -230,6 +274,9 @@ export class CallService {
 
   async rejectCall(userID: string, callId: string) {
     const participant = await this.findParticipantForUser(callId, userID);
+    if (participant.status === CallParticipantStatus.REJECTED) {
+      return participant;
+    }
     if (participant.status !== CallParticipantStatus.INVITED) {
       throw new ConflictException('CALL_NOT_INVITED');
     }
@@ -256,6 +303,7 @@ export class CallService {
       participant.call as CallWithParticipants,
       rejectedAt,
     );
+    this.logger.log(`call.participant_rejected callId=${callId} userID=${userID}`);
     return updatedParticipant;
   }
 
@@ -319,6 +367,7 @@ export class CallService {
         changedAt: leftAt.toISOString(),
       }),
     );
+    this.logger.log(`call.ended callId=${callId} reason=${CallEndReason.ALL_LEFT}`);
   }
 
   async cancelCall(userID: string, callId: string) {
@@ -331,6 +380,9 @@ export class CallService {
     }
     if (call.initiatorID !== userID) {
       throw new ForbiddenException('CALL_NOT_ALLOWED');
+    }
+    if (call.status === CallStatus.CANCELED) {
+      return this.toCallDto(call);
     }
     if (call.status !== CallStatus.RINGING) {
       throw new ConflictException('CALL_ALREADY_ACTIVE');
@@ -370,6 +422,7 @@ export class CallService {
         changedAt: endedAt.toISOString(),
       }),
     );
+    this.logger.log(`call.canceled callId=${callId} userID=${userID}`);
     return this.toCallDto(canceled);
   }
 
@@ -415,6 +468,25 @@ export class CallService {
     }
 
     return staleCalls.length;
+  }
+
+  async handleLiveKitWebhook(event: LiveKitWebhookEvent): Promise<void> {
+    if (event.event !== 'room_finished') {
+      return;
+    }
+    const roomName = event.room?.name?.trim();
+    if (!roomName) {
+      return;
+    }
+    const call = (await this.prisma.callSession.findUnique({
+      where: { livekitRoomName: roomName },
+      include: this.callInclude(),
+    })) as CallWithParticipants | null;
+    if (!call) {
+      this.logger.warn(`call.webhook_unknown_room room=${roomName}`);
+      return;
+    }
+    await this.endLiveKitFinishedCall(call, new Date());
   }
 
   private async findParticipantForUser(callId: string, userID: string) {
@@ -516,6 +588,17 @@ export class CallService {
     }
   }
 
+  private async lockParticipantsForCall(
+    userIDs: string[],
+    prisma: Pick<PrismaService, '$queryRaw'>,
+  ): Promise<void> {
+    for (const userID of [...userIDs].sort()) {
+      await prisma.$queryRaw`
+        SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${userID}`}, 0))
+      `;
+    }
+  }
+
   private async expireStaleRingingCallsForUsers(userIDs: string[]): Promise<void> {
     const now = new Date();
     const staleCalls = (await this.prisma.callSession.findMany({
@@ -570,6 +653,27 @@ export class CallService {
       throw new BadRequestException('CALL_INVITEE_INVALID');
     }
     return new Map(users.map((user) => [user.id, user]));
+  }
+
+  private async findIdempotentCreateCall(
+    initiatorID: string,
+    idempotencyKey?: string,
+  ): Promise<CallWithParticipants | null> {
+    const key = idempotencyKey?.trim();
+    if (!key) {
+      return null;
+    }
+    return (await this.prisma.callSession.findFirst({
+      where: {
+        initiatorID,
+        status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
+        metadata: {
+          path: ['idempotencyKey'],
+          equals: key,
+        },
+      },
+      include: this.callInclude(),
+    })) as CallWithParticipants | null;
   }
 
   private async mintToken(call: CallWithParticipants, user: UserLite) {
@@ -637,6 +741,7 @@ export class CallService {
         changedAt: changedAt.toISOString(),
       }),
     );
+    this.logger.log(`call.missed callId=${call.id} reason=${CallEndReason.NO_ANSWER}`);
   }
 
   private async failRingingCallAsError(
@@ -668,6 +773,49 @@ export class CallService {
         changedAt: changedAt.toISOString(),
       }),
     );
+    this.logger.log(`call.failed callId=${call.id} reason=${CallEndReason.ERROR}`);
+  }
+
+  private async endLiveKitFinishedCall(
+    call: CallWithParticipants,
+    changedAt: Date,
+  ): Promise<void> {
+    const result = await this.prisma.callSession.updateMany({
+      where: {
+        id: call.id,
+        status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
+      },
+      data: {
+        status: CallStatus.ENDED,
+        endReason: CallEndReason.NORMAL,
+        endedAt: changedAt,
+      },
+    });
+    if (result.count === 0) {
+      return;
+    }
+
+    await this.prisma.callParticipant.updateMany({
+      where: {
+        callID: call.id,
+        status: CallParticipantStatus.JOINED,
+      },
+      data: {
+        status: CallParticipantStatus.LEFT,
+        leftAt: changedAt,
+      },
+    });
+
+    await this.broadcastToCallParticipants(call, (targetID) =>
+      this.realtime.broadcastCallEnded(targetID, {
+        callId: call.id,
+        status: CallStatus.ENDED,
+        endReason: CallEndReason.NORMAL,
+        endedAt: changedAt.toISOString(),
+        changedAt: changedAt.toISOString(),
+      }),
+    );
+    this.logger.log(`call.ended callId=${call.id} reason=livekit_room_finished`);
   }
 
   private buildTokenResponse(token: string) {

@@ -4,6 +4,7 @@ import {
   AccessToken,
   RoomServiceClient,
   TrackSource,
+  WebhookReceiver,
 } from 'livekit-server-sdk';
 import type { CallType } from 'src/generated/prisma';
 
@@ -29,6 +30,7 @@ export class LiveKitCallService {
   private readonly apiSecret: string;
   private readonly tokenTtlSeconds: number;
   private readonly roomService: RoomServiceClient | null;
+  private readonly webhookReceiver: WebhookReceiver | null;
 
   constructor(private readonly config: ConfigService) {
     this.url = this.readConfig('LIVEKIT_URL');
@@ -41,6 +43,10 @@ export class LiveKitCallService {
     this.roomService =
       this.url && this.apiKey && this.apiSecret
         ? new RoomServiceClient(this.url, this.apiKey, this.apiSecret)
+        : null;
+    this.webhookReceiver =
+      this.apiKey && this.apiSecret
+        ? new WebhookReceiver(this.apiKey, this.apiSecret)
         : null;
   }
 
@@ -108,6 +114,13 @@ export class LiveKitCallService {
     });
 
     return token.toJwt();
+  }
+
+  async verifyWebhook(body: string, authHeader: string | undefined) {
+    if (!this.webhookReceiver) {
+      throw new ServiceUnavailableException('LiveKit is not configured');
+    }
+    return this.webhookReceiver.receive(body, authHeader);
   }
 
   private assertConfigured(): void {

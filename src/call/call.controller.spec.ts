@@ -26,13 +26,18 @@ describe('CallController', () => {
         inviteeIDs: ['user-2'],
       },
       { user: { userId: 'user-1' } } as any,
+      'request-1',
     );
 
-    expect(service.createGroupCall).toHaveBeenCalledWith('user-1', {
-      conversationID: 'sg_group-1',
-      callType: 'AUDIO',
-      inviteeIDs: ['user-2'],
-    });
+    expect(service.createGroupCall).toHaveBeenCalledWith(
+      'user-1',
+      {
+        conversationID: 'sg_group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2'],
+      },
+      'request-1',
+    );
   });
 
   it('passes accept, reject, leave, cancel, and join-token calls through', async () => {

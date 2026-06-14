@@ -61,16 +61,21 @@ export function resolveCorsOriginChecker(
   };
 }
 
-async function bootstrap() {
-  const config = getServerConfig();
-  const isProduction = process.env.NODE_ENV === 'production';
-
-  const app = await NestFactory.create(AppModule, {
+export function buildNestFactoryOptions() {
+  return {
     cors: {
       origin: resolveCorsOriginChecker(),
       credentials: true,
     },
-  });
+    rawBody: true,
+  };
+}
+
+async function bootstrap() {
+  const config = getServerConfig();
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  const app = await NestFactory.create(AppModule, buildNestFactoryOptions());
   setupApp(app);
 
   if (!isProduction) {

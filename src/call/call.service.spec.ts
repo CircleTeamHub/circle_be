@@ -20,11 +20,13 @@ describe('CallService', () => {
 
     prisma = {
       $transaction: jest.fn(async (callback) => callback(prisma)),
+      $queryRaw: jest.fn().mockResolvedValue([]),
       circle: { findFirst: jest.fn() },
       circleMember: { findMany: jest.fn() },
       user: { findMany: jest.fn() },
       callSession: {
         create: jest.fn(),
+        findFirst: jest.fn(),
         findMany: jest.fn(),
         findUnique: jest.fn(),
         update: jest.fn(),
@@ -182,6 +184,59 @@ describe('CallService', () => {
     expect(prisma.$transaction).toHaveBeenCalledWith(
       expect.any(Function),
       expect.objectContaining({ isolationLevel: 'Serializable' }),
+    );
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns an existing call for a repeated create idempotency key', async () => {
+    mockCircleMembers();
+    prisma.callSession.findFirst.mockResolvedValue({
+      id: 'call-1',
+      conversationID: 'sg_group-1',
+      sessionType: 3,
+      callType: 'AUDIO',
+      status: 'RINGING',
+      livekitRoomName: 'circle_call_1',
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      startedAt: null,
+      endedAt: null,
+      expiresAt: new Date('2026-06-11T03:00:45.000Z'),
+      endReason: null,
+      participants: [
+        {
+          userID: 'user-1',
+          status: 'JOINED',
+          invitedAt: now,
+          joinedAt: now,
+          leftAt: null,
+          user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        },
+        {
+          userID: 'user-2',
+          status: 'INVITED',
+          invitedAt: now,
+          joinedAt: null,
+          leftAt: null,
+          user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        },
+      ],
+    });
+
+    const result = await service.createGroupCall(
+      'user-1',
+      {
+        conversationID: 'sg_group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2'],
+      },
+      'request-1',
+    );
+
+    expect(result.call.id).toBe('call-1');
+    expect(livekit.createRoom).not.toHaveBeenCalled();
+    expect(prisma.callSession.create).not.toHaveBeenCalled();
+    expect(livekit.mintJoinToken).toHaveBeenCalledWith(
+      expect.objectContaining({ roomName: 'circle_call_1' }),
     );
   });
 
@@ -416,6 +471,33 @@ describe('CallService', () => {
     expect(result.livekit.token).toBe('livekit-token');
   });
 
+  it('treats repeated accept as idempotent when the participant already joined', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'JOINED',
+      invitedAt: now,
+      joinedAt: now,
+      leftAt: null,
+      call: {
+        id: 'call-1',
+        conversationID: 'sg_group-1',
+        sessionType: 3,
+        callType: 'AUDIO',
+        status: 'ACTIVE',
+        livekitRoomName: 'circle_call_1',
+        participants: [],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    const result = await service.acceptCall('user-2', 'call-1');
+
+    expect(prisma.callParticipant.update).not.toHaveBeenCalled();
+    expect(result.selfParticipant?.status).toBe('JOINED');
+    expect(result.livekit.token).toBe('livekit-token');
+  });
+
   it('ends the call when the last joined participant leaves', async () => {
     prisma.callParticipant.findUnique.mockResolvedValue({
       callID: 'call-1',
@@ -564,6 +646,29 @@ describe('CallService', () => {
     );
   });
 
+  it('treats repeated reject as idempotent when the participant already rejected', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'REJECTED',
+      invitedAt: now,
+      joinedAt: null,
+      leftAt: null,
+      rejectedAt: now,
+      call: {
+        id: 'call-1',
+        status: 'RINGING',
+        participants: [],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    const result = await service.rejectCall('user-2', 'call-1');
+
+    expect(prisma.callParticipant.update).not.toHaveBeenCalled();
+    expect(result.status).toBe('REJECTED');
+  });
+
   it('marks a ringing call missed when the last invitee rejects', async () => {
     prisma.callParticipant.findUnique.mockResolvedValue({
       callID: 'call-1',
@@ -654,6 +759,30 @@ describe('CallService', () => {
     expect(livekit.deleteRoom).not.toHaveBeenCalled();
   });
 
+  it('treats repeated cancel as idempotent when already canceled by initiator', async () => {
+    prisma.callSession.findUnique.mockResolvedValue({
+      id: 'call-1',
+      conversationID: 'sg_group-1',
+      sessionType: 3,
+      callType: 'AUDIO',
+      status: 'CANCELED',
+      livekitRoomName: 'circle_call_1',
+      initiatorID: 'user-1',
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      startedAt: null,
+      endedAt: now,
+      expiresAt: new Date('2026-06-11T03:00:45.000Z'),
+      endReason: 'CANCELED',
+      participants: [],
+    });
+
+    const result = await service.cancelCall('user-1', 'call-1');
+
+    expect(prisma.callParticipant.updateMany).not.toHaveBeenCalled();
+    expect(livekit.deleteRoom).not.toHaveBeenCalled();
+    expect(result.status).toBe('CANCELED');
+  });
+
   it('sweeps expired ringing calls in batches', async () => {
     prisma.callSession.findMany.mockResolvedValue([
       {
@@ -682,5 +811,31 @@ describe('CallService', () => {
     );
     expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
     expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_2');
+  });
+
+  it('marks LiveKit room_finished webhooks as ended', async () => {
+    prisma.callSession.findUnique.mockResolvedValue({
+      id: 'call-1',
+      livekitRoomName: 'circle_call_1',
+      status: 'ACTIVE',
+      participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+    });
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.handleLiveKitWebhook({
+      event: 'room_finished',
+      room: { name: 'circle_call_1' },
+    });
+
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'call-1', status: { in: ['RINGING', 'ACTIVE'] } },
+        data: expect.objectContaining({
+          status: 'ENDED',
+          endReason: 'NORMAL',
+        }),
+      }),
+    );
+    expect(realtime.broadcastCallEnded).toHaveBeenCalledTimes(2);
   });
 });
