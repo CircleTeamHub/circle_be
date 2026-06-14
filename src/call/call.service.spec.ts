@@ -1,4 +1,8 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CircleMemberStatus } from 'src/generated/prisma';
 import { CallService } from './call.service';
@@ -21,8 +25,10 @@ describe('CallService', () => {
       user: { findMany: jest.fn() },
       callSession: {
         create: jest.fn(),
+        findMany: jest.fn(),
         findUnique: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn(),
       },
       callParticipant: {
         count: jest.fn(),
@@ -33,6 +39,7 @@ describe('CallService', () => {
       },
     };
     openim = { isGroupMember: jest.fn() };
+    prisma.callSession.findMany.mockResolvedValue([]);
     livekit = {
       createRoom: jest.fn().mockResolvedValue(undefined),
       deleteRoom: jest.fn().mockResolvedValue(undefined),
@@ -42,6 +49,8 @@ describe('CallService', () => {
     realtime = {
       broadcastCallInvite: jest.fn(),
       broadcastCallParticipantJoined: jest.fn(),
+      broadcastCallParticipantLeft: jest.fn(),
+      broadcastCallParticipantRejected: jest.fn(),
       broadcastCallEnded: jest.fn(),
       safeBroadcastAll: jest.fn(async (callbacks: Array<() => unknown>) => {
         for (const callback of callbacks) {
@@ -170,6 +179,84 @@ describe('CallService', () => {
       token: 'livekit-token',
       expiresAt: '2026-06-11T04:00:00.000Z',
     });
+    expect(prisma.$transaction).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({ isolationLevel: 'Serializable' }),
+    );
+  });
+
+  it('deletes the LiveKit room when call persistence fails after room creation', async () => {
+    mockCircleMembers();
+    prisma.callSession.create.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      service.createGroupCall('user-1', {
+        conversationID: 'sg_group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2'],
+      }),
+    ).rejects.toThrow('db down');
+
+    expect(livekit.createRoom).toHaveBeenCalled();
+    expect(livekit.deleteRoom).toHaveBeenCalledWith(
+      expect.stringMatching(/^circle_call_/),
+    );
+  });
+
+  it('marks the call failed and deletes the room when token minting fails', async () => {
+    mockCircleMembers();
+    prisma.callSession.create.mockImplementation(({ data }: any) =>
+      Promise.resolve({
+        ...data,
+        createdAt: now,
+        updatedAt: now,
+        initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        participants: [
+          {
+            userID: 'user-1',
+            status: 'JOINED',
+            invitedAt: now,
+            joinedAt: now,
+            leftAt: null,
+            user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+          },
+          {
+            userID: 'user-2',
+            status: 'INVITED',
+            invitedAt: now,
+            joinedAt: null,
+            leftAt: null,
+            user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+          },
+        ],
+      }),
+    );
+    livekit.mintJoinToken.mockRejectedValue(new Error('livekit down'));
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      service.createGroupCall('user-1', {
+        conversationID: 'sg_group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2'],
+      }),
+    ).rejects.toThrow('livekit down');
+
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: 'RINGING',
+        }),
+        data: expect.objectContaining({
+          status: 'FAILED',
+          endReason: 'ERROR',
+        }),
+      }),
+    );
+    expect(livekit.deleteRoom).toHaveBeenCalledWith(
+      expect.stringMatching(/^circle_call_/),
+    );
+    expect(realtime.broadcastCallInvite).not.toHaveBeenCalled();
   });
 
   it('rejects group calls without invitees', async () => {
@@ -201,6 +288,70 @@ describe('CallService', () => {
         inviteeIDs: ['user-2'],
       }),
     ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('expires stale ringing calls before checking whether participants are busy', async () => {
+    mockCircleMembers();
+    let staleCallExpired = false;
+    prisma.callSession.findMany.mockResolvedValue([
+      {
+        id: 'stale-call',
+        livekitRoomName: 'circle_call_stale',
+        status: 'RINGING',
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+      },
+    ]);
+    prisma.callSession.updateMany.mockImplementation(() => {
+      staleCallExpired = true;
+      return Promise.resolve({ count: 1 });
+    });
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.findFirst.mockImplementation(() =>
+      Promise.resolve(staleCallExpired ? null : { id: 'stale-participant' }),
+    );
+    prisma.callSession.create.mockImplementation(({ data }: any) =>
+      Promise.resolve({
+        ...data,
+        createdAt: now,
+        updatedAt: now,
+        initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        participants: [
+          {
+            userID: 'user-1',
+            status: 'JOINED',
+            invitedAt: now,
+            joinedAt: now,
+            leftAt: null,
+            user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+          },
+          {
+            userID: 'user-2',
+            status: 'INVITED',
+            invitedAt: now,
+            joinedAt: null,
+            leftAt: null,
+            user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+          },
+        ],
+      }),
+    );
+
+    await service.createGroupCall('user-1', {
+      conversationID: 'group-1',
+      callType: 'AUDIO',
+      inviteeIDs: ['user-2'],
+    });
+
+    expect(prisma.callSession.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: 'RINGING',
+          expiresAt: { lte: now },
+        }),
+      }),
+    );
+    expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_stale');
+    expect(prisma.callParticipant.findFirst).toHaveBeenCalled();
   });
 
   it('accepts an invited participant and returns their LiveKit token', async () => {
@@ -307,5 +458,229 @@ describe('CallService', () => {
     );
     expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
     expect(realtime.broadcastCallEnded).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires invited participants to accept before minting a join token', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'INVITED',
+      call: {
+        id: 'call-1',
+        conversationID: 'sg_group-1',
+        sessionType: 3,
+        callType: 'AUDIO',
+        status: 'RINGING',
+        livekitRoomName: 'circle_call_1',
+        expiresAt: new Date('2026-06-11T03:00:45.000Z'),
+        participants: [],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    await expect(service.createJoinToken('user-2', 'call-1')).rejects.toThrow(
+      ConflictException,
+    );
+
+    expect(prisma.callParticipant.update).not.toHaveBeenCalled();
+    expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+  });
+
+  it('expires stale ringing calls before minting another token', async () => {
+    jest.setSystemTime(new Date('2026-06-11T03:01:00.000Z').getTime());
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-1',
+      status: 'JOINED',
+      call: {
+        id: 'call-1',
+        conversationID: 'sg_group-1',
+        sessionType: 3,
+        callType: 'AUDIO',
+        status: 'RINGING',
+        livekitRoomName: 'circle_call_1',
+        expiresAt: new Date('2026-06-11T03:00:45.000Z'),
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+      },
+      user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+    });
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(service.createJoinToken('user-1', 'call-1')).rejects.toThrow(
+      ConflictException,
+    );
+
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'call-1', status: 'RINGING' },
+        data: expect.objectContaining({
+          status: 'MISSED',
+          endReason: 'NO_ANSWER',
+        }),
+      }),
+    );
+    expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
+    expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+  });
+
+  it('broadcasts when an invited participant rejects', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'INVITED',
+      call: {
+        id: 'call-1',
+        status: 'RINGING',
+        participants: [
+          { userID: 'user-1' },
+          { userID: 'user-2' },
+        ],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.update.mockResolvedValue({
+      userID: 'user-2',
+      status: 'REJECTED',
+      invitedAt: now,
+      joinedAt: null,
+      leftAt: null,
+      rejectedAt: now,
+      missedAt: null,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.count.mockResolvedValue(1);
+
+    await service.rejectCall('user-2', 'call-1');
+
+    expect(realtime.broadcastCallParticipantRejected).toHaveBeenCalledTimes(2);
+    expect(realtime.broadcastCallParticipantRejected).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({
+        callId: 'call-1',
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        rejectedAt: now.toISOString(),
+      }),
+    );
+  });
+
+  it('marks a ringing call missed when the last invitee rejects', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'INVITED',
+      call: {
+        id: 'call-1',
+        livekitRoomName: 'circle_call_1',
+        status: 'RINGING',
+        participants: [
+          { userID: 'user-1' },
+          { userID: 'user-2' },
+        ],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.update.mockResolvedValue({
+      userID: 'user-2',
+      status: 'REJECTED',
+      invitedAt: now,
+      joinedAt: null,
+      leftAt: null,
+      rejectedAt: now,
+      missedAt: null,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.count.mockResolvedValue(0);
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callSession.findUnique.mockResolvedValue({
+      id: 'call-1',
+      livekitRoomName: 'circle_call_1',
+      status: 'MISSED',
+      endReason: 'NO_ANSWER',
+      endedAt: now,
+      participants: [
+        { userID: 'user-1' },
+        { userID: 'user-2' },
+      ],
+    });
+
+    await service.rejectCall('user-2', 'call-1');
+
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'call-1', status: 'RINGING' },
+        data: expect.objectContaining({
+          status: 'MISSED',
+          endReason: 'NO_ANSWER',
+        }),
+      }),
+    );
+    expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
+    expect(realtime.broadcastCallEnded).toHaveBeenCalledTimes(2);
+  });
+
+  it('broadcasts when a joined participant leaves and the call remains active', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'JOINED',
+      call: {
+        id: 'call-1',
+        livekitRoomName: 'circle_call_1',
+        status: 'ACTIVE',
+        participants: [
+          { userID: 'user-1' },
+          { userID: 'user-2' },
+        ],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.update.mockResolvedValue({
+      userID: 'user-2',
+      status: 'LEFT',
+      invitedAt: now,
+      joinedAt: now,
+      leftAt: now,
+      rejectedAt: null,
+      missedAt: null,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.count.mockResolvedValue(1);
+
+    await service.leaveCall('user-2', 'call-1');
+
+    expect(realtime.broadcastCallParticipantLeft).toHaveBeenCalledTimes(2);
+    expect(prisma.callSession.update).not.toHaveBeenCalled();
+    expect(livekit.deleteRoom).not.toHaveBeenCalled();
+  });
+
+  it('sweeps expired ringing calls in batches', async () => {
+    prisma.callSession.findMany.mockResolvedValue([
+      {
+        id: 'call-1',
+        livekitRoomName: 'circle_call_1',
+        status: 'RINGING',
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
+      },
+      {
+        id: 'call-2',
+        livekitRoomName: 'circle_call_2',
+        status: 'RINGING',
+        participants: [{ userID: 'user-3' }],
+      },
+    ]);
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect((service as any).sweepExpiredRingingCalls(10)).resolves.toBe(2);
+
+    expect(prisma.callSession.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { status: 'RINGING', expiresAt: { lte: now } },
+        take: 10,
+      }),
+    );
+    expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_1');
+    expect(livekit.deleteRoom).toHaveBeenCalledWith('circle_call_2');
   });
 });
