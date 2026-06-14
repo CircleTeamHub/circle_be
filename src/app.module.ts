@@ -34,6 +34,7 @@ import { ChatHistoryModule } from './chat-history/chat-history.module';
 import { GroupModule } from './group/group.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { CallModule } from './call/call.module';
+import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 
 const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
 
@@ -72,6 +73,7 @@ const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
     ChatHistoryModule,
     GroupModule,
     OutboxModule,
+    PrivacySettingsModule,
     CallModule,
   ],
   controllers: [],

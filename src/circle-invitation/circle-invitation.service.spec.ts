@@ -3,6 +3,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -37,6 +38,9 @@ describe('CircleInvitationService', () => {
     user: {
       findUnique: jest.fn(),
     },
+    friend: {
+      findFirst: jest.fn(),
+    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
@@ -50,9 +54,13 @@ describe('CircleInvitationService', () => {
     broadcastNotificationCreated: jest.fn(),
     broadcastCircleInvitationReviewed: jest.fn(),
   };
+  const privacySettings = {
+    canBeInvitedToGroupOrCircle: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -60,6 +68,7 @@ describe('CircleInvitationService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: OpenimService, useValue: openimService },
         { provide: RealtimeService, useValue: realtimeService },
+        { provide: PrivacySettingsService, useValue: privacySettings },
       ],
     }).compile();
 
@@ -96,6 +105,66 @@ describe('CircleInvitationService', () => {
     await expect(
       service.getInvitationForViewer('outsider-1', 'inv-1'),
     ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('rejects circle invites blocked by the applicant privacy setting', async () => {
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({ status: 'ACTIVE' })
+      .mockResolvedValueOnce(null);
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      maxMembers: null,
+      memberCount: 1,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: false,
+    });
+    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+    await expect(
+      service.invite('inviter-1', 'applicant-1', 'circle-1'),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('passes real friendship status to the invite privacy check (FRIENDS_ONLY)', async () => {
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({ status: 'ACTIVE' })
+      .mockResolvedValueOnce(null);
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      maxMembers: null,
+      memberCount: 1,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: false,
+    });
+    // Inviter and applicant are accepted friends.
+    prisma.friend.findFirst.mockResolvedValue({ userID: 'inviter-1' });
+    // Block before the transaction so we only assert the privacy-check args.
+    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+    await expect(
+      service.invite('inviter-1', 'applicant-1', 'circle-1'),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
+      'applicant-1',
+      true,
+    );
   });
 
   it('addVerifier sends a circle-verification interaction message', async () => {

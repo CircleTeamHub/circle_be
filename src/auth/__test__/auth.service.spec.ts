@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
 import { JwtService } from '@nestjs/jwt';
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   NotFoundException,
@@ -12,6 +13,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { IconService } from 'src/icon/icon.service';
+import { EmailVerificationService } from '../email-verification.service';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -24,7 +26,10 @@ describe('AuthService', () => {
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(
           users.find(
-            (u) => u.accountId === where.accountId || u.id === where.id,
+            (u) =>
+              u.accountId === where.accountId ||
+              u.id === where.id ||
+              u.email === where.email,
           ) ?? null,
         ),
       ),
@@ -44,12 +49,20 @@ describe('AuthService', () => {
   };
 
   const mockRefreshTokenService = {
-    create: jest.fn(() => Promise.resolve('refresh-token')),
+    create: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
     rotate: jest.fn(() =>
-      Promise.resolve({ token: 'new-refresh-token', userId: 'uuid-1' }),
+      Promise.resolve({
+        token: 'new-refresh-token',
+        userId: 'uuid-1',
+        sessionId: 'session-2',
+      }),
     ),
     revoke: jest.fn(() => Promise.resolve()),
     listActiveSessions: jest.fn(() => Promise.resolve([])),
+    revokeSession: jest.fn(() => Promise.resolve()),
+    revokeOtherSessions: jest.fn(() => Promise.resolve()),
     revokeAll: jest.fn(() => Promise.resolve()),
   };
 
@@ -66,13 +79,21 @@ describe('AuthService', () => {
     getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
   };
 
+  const mockEmailVerification = {
+    requestCode: jest.fn(() => Promise.resolve()),
+    verifyCode: jest.fn(() => Promise.resolve(true)),
+  };
+
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
     mockPrisma.user.findUnique.mockImplementation(({ where }) =>
       Promise.resolve(
         users.find(
-          (u) => u.accountId === where.accountId || u.id === where.id,
+          (u) =>
+            u.accountId === where.accountId ||
+            u.id === where.id ||
+            u.email === where.email,
         ) ?? null,
       ),
     );
@@ -115,6 +136,10 @@ describe('AuthService', () => {
         { provide: JwtService, useValue: mockJwt },
         { provide: OpenimService, useValue: mockOpenimService },
         { provide: IconService, useValue: mockIconService },
+        {
+          provide: EmailVerificationService,
+          useValue: mockEmailVerification,
+        },
       ],
     }).compile();
 
@@ -125,51 +150,71 @@ describe('AuthService', () => {
     expect(service).toBeDefined();
   });
 
-  it('register creates user and returns tokens', async () => {
+  it('register creates user with auto accountId and returns tokens', async () => {
     const result = await service.register({
-      accountId: 'testuser',
+      email: 'new@example.com',
+      code: '123456',
       password: 'password1',
       nickname: 'Test User',
-    });
+    } as any);
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('refresh-token');
+    expect(users[0].accountId).toMatch(/^ACC_/);
+    expect(users[0].email).toBe('new@example.com');
   });
 
-  it('register throws ConflictException if username taken', async () => {
-    await service.register({
-      accountId: 'testuser',
-      password: 'password1',
-      nickname: 'Test',
+  it('register throws BadRequest when code invalid', async () => {
+    mockEmailVerification.verifyCode.mockResolvedValueOnce(false);
+    await expect(
+      service.register({
+        email: 'x@example.com',
+        code: '000000',
+        password: 'password1',
+        nickname: 'X',
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('register throws Conflict when email already used', async () => {
+    users.push({
+      id: 'u0',
+      accountId: 'ACC_OLD000',
+      email: 'dupe@example.com',
+      status: 'ACTIVE',
     });
     await expect(
       service.register({
-        accountId: 'testuser',
+        email: 'dupe@example.com',
+        code: '123456',
         password: 'password1',
-        nickname: 'Test',
-      }),
+        nickname: 'Dupe',
+      } as any),
     ).rejects.toThrow(ConflictException);
   });
 
-  it('login returns tokens with correct credentials', async () => {
+  it('login by email returns tokens with correct password', async () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'testuser',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
+      role: 'USER',
     });
-
     const result = await service.login({
-      accountId: 'testuser',
+      email: 'a@example.com',
       password: 'password1',
-    });
+    } as any);
     expect(result.accessToken).toBe('access-token');
-    expect(result.refreshToken).toBe('refresh-token');
   });
 
-  it('login throws ForbiddenException for unknown user', async () => {
+  it('login throws ForbiddenException for unknown email', async () => {
     await expect(
-      service.login({ accountId: 'noone', password: 'password1' }),
+      service.login({
+        email: 'noone@example.com',
+        password: 'password1',
+      } as any),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -177,13 +222,49 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'testuser',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
+      role: 'USER',
     });
-
     await expect(
-      service.login({ accountId: 'testuser', password: 'wrongpass' }),
+      service.login({ email: 'a@example.com', password: 'wrongpass' } as any),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('loginWithCode returns tokens when code valid', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockEmailVerification.verifyCode.mockResolvedValueOnce(true);
+    const result = await service.loginWithCode({
+      email: 'a@example.com',
+      code: '123456',
+    } as any);
+    expect(result.accessToken).toBe('access-token');
+  });
+
+  it('loginWithCode throws ForbiddenException when code invalid', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
+      passwordHash: 'x',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockEmailVerification.verifyCode.mockResolvedValueOnce(false);
+    await expect(
+      service.loginWithCode({
+        email: 'a@example.com',
+        code: '000000',
+      } as any),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -191,14 +272,15 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'testuser',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
       role: 'USER',
     });
 
     await service.login(
-      { accountId: 'testuser', password: 'password1' },
+      { email: 'a@example.com', password: 'password1' } as any,
       {
         deviceName: 'MacBook Pro',
         ip: '127.0.0.1',
@@ -211,22 +293,97 @@ describe('AuthService', () => {
       ip: '127.0.0.1',
       userAgent: 'PostmanRuntime',
     });
+    expect(mockJwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'uuid-1', sid: 'session-1' }),
+    );
+  });
+
+  it('login revokes existing sessions first when single-device login is enabled', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'ACC_AAA111',
+      email: 'a@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: true,
+    });
+
+    await service.login({
+      email: 'a@example.com',
+      password: 'password1',
+    } as any);
+
+    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+      'uuid-1',
+      undefined,
+    );
   });
 
   it('returns the active sessions for a user', async () => {
     mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([
       { id: 'session-1' },
+      { id: 'session-2' },
     ]);
 
-    const sessions = await service.sessions('uuid-1');
+    const sessions = await service.sessions('uuid-1', 'session-2');
 
-    expect(sessions).toEqual([{ id: 'session-1' }]);
+    expect(sessions).toEqual([
+      { id: 'session-1', isCurrent: false },
+      { id: 'session-2', isCurrent: true },
+    ]);
   });
 
   it('revokes all sessions for a user', async () => {
     await service.logoutAll('uuid-1');
 
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('revokes a selected session for the current user', async () => {
+    await service.logoutSession('uuid-1', 'session-2');
+
+    expect(mockRefreshTokenService.revokeSession).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
+    );
+  });
+
+  it('revokes other sessions while keeping the current session', async () => {
+    await service.logoutOtherSessions('uuid-1', 'session-1');
+
+    expect(mockRefreshTokenService.revokeOtherSessions).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-1',
+    );
+  });
+
+  it('reads and updates the account-level single-device login setting', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      singleDeviceLoginEnabled: false,
+    });
+
+    await expect(service.getSingleDeviceLoginStatus('uuid-1')).resolves.toEqual(
+      { enabled: false },
+    );
+
+    await service.setSingleDeviceLogin('uuid-1', true, 'session-1');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'uuid-1' },
+      data: { singleDeviceLoginEnabled: true },
+    });
+    expect(mockRefreshTokenService.revokeOtherSessions).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-1',
+    );
   });
 
   it('refresh updates lastOnline before returning new tokens', async () => {
@@ -244,6 +401,9 @@ describe('AuthService', () => {
 
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('new-refresh-token');
+    expect(mockJwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ sub: 'uuid-1', sid: 'session-2' }),
+    );
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 'uuid-1' },
@@ -315,18 +475,25 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'banneduser',
+      accountId: 'ACC_BAN000',
+      email: 'banned@example.com',
       passwordHash,
       status: 'BANNED',
       role: 'USER',
     });
 
     await expect(
-      service.login({ accountId: 'banneduser', password: 'password1' }),
-    ).rejects.toThrow(/Invalid credentials/);
+      service.login({
+        email: 'banned@example.com',
+        password: 'password1',
+      } as any),
+    ).rejects.toThrow(/邮箱或密码错误/);
     await expect(
-      service.login({ accountId: 'nosuchuser', password: 'password1' }),
-    ).rejects.toThrow(/Invalid credentials/);
+      service.login({
+        email: 'nosuch@example.com',
+        password: 'password1',
+      } as any),
+    ).rejects.toThrow(/邮箱或密码错误/);
   });
 
   it('refresh blocks inactive users and revokes their sessions', async () => {
@@ -382,6 +549,186 @@ describe('AuthService', () => {
       }),
     );
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('returns login security code status from the account-level hash', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: null,
+    });
+
+    await expect(service.getLoginSecurityCodeStatus('uuid-1')).resolves.toEqual(
+      { enabled: false },
+    );
+
+    users[0].loginSecurityCodeHash = await argon2.hash('1234');
+
+    await expect(service.getLoginSecurityCodeStatus('uuid-1')).resolves.toEqual(
+      { enabled: true },
+    );
+  });
+
+  it('stores login security code as a hash when enabling it', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: null,
+    });
+
+    await service.setLoginSecurityCode('uuid-1', '1234');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'uuid-1' },
+        data: {
+          loginSecurityCodeHash: expect.any(String),
+          securityCodeAttempts: 0,
+          securityCodeLockedUntil: null,
+        },
+      }),
+    );
+    expect(users[0].loginSecurityCodeHash).not.toBe('1234');
+    await expect(
+      argon2.verify(users[0].loginSecurityCodeHash, '1234'),
+    ).resolves.toBe(true);
+  });
+
+  it('requires the old login security code before changing an existing code', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+    });
+
+    await expect(
+      service.setLoginSecurityCode('uuid-1', '5678', '0000'),
+    ).rejects.toThrow(UnauthorizedException);
+    await expect(
+      service.setLoginSecurityCode('uuid-1', '5678'),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('clears login security code after verifying the current code', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+    });
+
+    await service.disableLoginSecurityCode('uuid-1', '1234');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'uuid-1' },
+      data: {
+        loginSecurityCodeHash: null,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
+    });
+    expect(users[0].loginSecurityCodeHash).toBeNull();
+  });
+
+  it('verifies login security code without exposing the hash', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+    });
+
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '1234'),
+    ).resolves.toEqual({ ok: true });
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '9999'),
+    ).resolves.toEqual({ ok: false });
+  });
+
+  it('locks security code verification after 5 failed attempts', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+      securityCodeAttempts: 0,
+      securityCodeLockedUntil: null,
+    });
+
+    // First 4 wrong guesses just report failure.
+    for (let i = 0; i < 4; i++) {
+      await expect(
+        service.verifyLoginSecurityCode('uuid-1', '9999'),
+      ).resolves.toEqual({ ok: false });
+    }
+    expect(users[0].securityCodeAttempts).toBe(4);
+
+    // 5th wrong guess trips the lock.
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '9999'),
+    ).rejects.toThrow(ForbiddenException);
+    expect(users[0].securityCodeLockedUntil).toBeInstanceOf(Date);
+
+    // While locked, even the correct code is rejected.
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '1234'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('resets the failure counter after a successful verification', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: await argon2.hash('1234'),
+      securityCodeAttempts: 3,
+      securityCodeLockedUntil: null,
+    });
+
+    await expect(
+      service.verifyLoginSecurityCode('uuid-1', '1234'),
+    ).resolves.toEqual({ ok: true });
+    expect(users[0].securityCodeAttempts).toBe(0);
+    expect(users[0].securityCodeLockedUntil).toBeNull();
+  });
+
+  it('rejects login security codes outside 4 to 6 digits', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'USER',
+      loginSecurityCodeHash: null,
+    });
+
+    await expect(service.setLoginSecurityCode('uuid-1', '123')).rejects.toThrow(
+      BadRequestException,
+    );
+    await expect(
+      service.setLoginSecurityCode('uuid-1', '1234567'),
+    ).rejects.toThrow(BadRequestException);
+    await expect(
+      service.setLoginSecurityCode('uuid-1', '12ab'),
+    ).rejects.toThrow(BadRequestException);
   });
 
   it('logout delegates to refreshTokenService.revoke', async () => {

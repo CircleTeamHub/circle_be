@@ -28,7 +28,11 @@ import { UpdateUserStatusDto } from './dto/update-user-status.dto';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
-import { PublicUserDto, SelfUserDto } from './dto/public-user.dto';
+import {
+  ProfileUserDto,
+  PublicUserDto,
+  SelfUserDto,
+} from './dto/public-user.dto';
 import { Role } from 'src/enum/roles.enum';
 import type { RequestWithUser } from 'src/auth/types';
 
@@ -75,11 +79,11 @@ export class UserController {
   }
 
   @Get('/:id')
-  @Serialize(PublicUserDto)
+  @Serialize(ProfileUserDto)
   @ApiOperation({ summary: 'Get a user by id' })
-  @ApiOkResponse({ description: 'User details', type: PublicUserDto })
-  getUser(@Param('id', ParseUUIDPipe) id: string) {
-    return this.userService.findOne(id);
+  @ApiOkResponse({ description: 'User details', type: ProfileUserDto })
+  getUser(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.userService.findOne(id, req.user.userId);
   }
 
   @Patch('/:id')

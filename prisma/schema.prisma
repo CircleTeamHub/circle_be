@@ -15,6 +15,11 @@ enum UserStatus {
   DELETED
 }
 
+enum EmailCodePurpose {
+  REGISTER
+  LOGIN
+}
+
 enum UserRole {
   ADMIN
   MEMBER
@@ -293,11 +298,15 @@ model User {
   id                         String     @id @default(uuid())
   accountId                  String     @unique
   passwordHash               String
+  loginSecurityCodeHash      String?
+  securityCodeAttempts       Int        @default(0)
+  securityCodeLockedUntil    DateTime?
+  singleDeviceLoginEnabled   Boolean    @default(false)
   nickname                   String
   avatarUrl                  String?
   avatarFrame                String?
   cover                      String?
-  email                      String?
+  email                      String?    @unique
   phoneNumber                String?
   wechat                     String?
   qq                         String?
@@ -338,6 +347,7 @@ model User {
   traceLikeStats               traceLikeStat[]
   traceViewedStats             traceViewedStat[]
   tracePreferences             UserTracePreference[]
+  privacySetting               UserPrivacySetting?
   badgesAuthored               BadgeTemplate[]
   badgeSources                 BadgeSource[]
   badgeInstances               BadgeInstance[]
@@ -955,6 +965,28 @@ model UserTracePreference {
   @@index([traceID])
 }
 
+model UserPrivacySetting {
+  id                         String   @id @default(uuid())
+  userID                     String   @unique
+  messageSelfDestructDays    Int      @default(2)
+  momentsVisibility          String   @default("ALL")
+  allowStrangerMessages      Boolean  @default(true)
+  showPhone                  Boolean  @default(false)
+  showWechat                 Boolean  @default(true)
+  showQQ                     Boolean  @default(true)
+  addMeByAccount             Boolean  @default(true)
+  addMeByPhone               Boolean  @default(false)
+  addMeByQrCode              Boolean  @default(true)
+  addMeByGroup               Boolean  @default(true)
+  callPermission             String   @default("EVERYONE")
+  groupInvitePermission      String   @default("EVERYONE")
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+  user                       User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID])
+}
+
 // ─── Tag ──────────────────────────────────────────────────────────────────────
 
 model Tag {
@@ -1488,4 +1520,17 @@ model TempChatGuest {
   tempChat TempChat @relation(fields: [tempChatId], references: [id], onDelete: Cascade)
 
   @@index([tempChatId])
+}
+
+model EmailVerificationCode {
+  id         String           @id @default(cuid())
+  email      String
+  codeHash   String
+  purpose    EmailCodePurpose
+  expiresAt  DateTime
+  attempts   Int              @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime         @default(now())
+
+  @@index([email, purpose])
 }

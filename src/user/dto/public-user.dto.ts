@@ -111,3 +111,13 @@ export class SelfUserDto extends PublicUserDto {
   @Expose()
   creditScore: number;
 }
+
+/**
+ * Profile detail view for GET /user/:id. `phoneNumber` is included only after
+ * UserService applies the target user's privacy setting.
+ */
+export class ProfileUserDto extends PublicUserDto {
+  @ApiPropertyOptional({ example: '+8613800138000' })
+  @Expose()
+  phoneNumber: string | null;
+}

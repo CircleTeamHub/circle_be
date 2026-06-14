@@ -12,6 +12,7 @@ import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
@@ -45,6 +46,13 @@ export interface UpdateUserInput {
 }
 
 const PUBLIC_SELECT = USER_PROFILE_SELECT;
+
+type ProfilePrivacyUser = {
+  id: string;
+  phoneNumber?: string | null;
+  wechat?: string | null;
+  qq?: string | null;
+};
 
 function normalizeBirthdayInput(value: string | null | undefined) {
   if (value === undefined) {
@@ -124,6 +132,10 @@ export class UserService {
     private refreshTokens: RefreshTokenService,
     private iconService: IconService,
     private realtimeService: RealtimeService,
+    // Required dependency: profile privacy must fail closed. A missing provider
+    // is a wiring bug that should crash at startup, not silently expose
+    // phone/wechat/qq. PrivacySettingsModule is imported by UserModule.
+    private privacySettings: PrivacySettingsService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -180,7 +192,7 @@ export class UserService {
     });
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, viewerId?: string) {
     const [user, displayIcons] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id },
@@ -189,9 +201,43 @@ export class UserService {
       this.iconService.getDisplayIconsForUser(id),
     ]);
     if (!user) throw new NotFoundException(`User ${id} not found`);
+    const filteredUser = await this.applyProfilePrivacy(user, viewerId);
+    return {
+      ...filteredUser,
+      displayIcons,
+    };
+  }
+
+  private async applyProfilePrivacy<T extends ProfilePrivacyUser>(
+    user: T,
+    viewerId?: string,
+  ): Promise<T> {
+    const isSelf = viewerId === user.id;
+    // isFriend is intentionally hardcoded to false here: phone/wechat/qq
+    // visibility is a global show/hide switch in the current model, not
+    // friend-aware. If a "friends-only" profile tier is ever added, thread the
+    // real friendship status through instead of this literal.
+    const [canViewPhone, canViewWechat, canViewQQ] = await Promise.all([
+      this.privacySettings.canViewProfileField(
+        user.id,
+        'phoneNumber',
+        isSelf,
+        false,
+      ),
+      this.privacySettings.canViewProfileField(
+        user.id,
+        'wechat',
+        isSelf,
+        false,
+      ),
+      this.privacySettings.canViewProfileField(user.id, 'qq', isSelf, false),
+    ]);
+
     return {
       ...user,
-      displayIcons,
+      phoneNumber: canViewPhone ? user.phoneNumber : null,
+      wechat: canViewWechat ? user.wechat : null,
+      qq: canViewQQ ? user.qq : null,
     };
   }
 

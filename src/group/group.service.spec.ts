@@ -8,6 +8,7 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { GroupController } from './group.controller';
 import { GroupService } from './group.service';
 
@@ -30,12 +31,16 @@ describe('GroupService reportGroup', () => {
       findFirst: jest.Mock;
       create: jest.Mock;
     };
+    friend: { findMany: jest.Mock };
     userDisplayIcon: { deleteMany: jest.Mock };
   };
   let openim: {
     addGroupMembers: jest.Mock;
     isGroupMember: jest.Mock;
     removeGroupMember: jest.Mock;
+  };
+  let privacySettings: {
+    canBeInvitedToGroupOrCircle: jest.Mock;
   };
   let service: GroupService;
 
@@ -58,6 +63,7 @@ describe('GroupService reportGroup', () => {
         findFirst: jest.fn(),
         create: jest.fn(),
       },
+      friend: { findMany: jest.fn().mockResolvedValue([]) },
       userDisplayIcon: { deleteMany: jest.fn() },
     };
     openim = {
@@ -65,7 +71,14 @@ describe('GroupService reportGroup', () => {
       isGroupMember: jest.fn().mockResolvedValue(false),
       removeGroupMember: jest.fn().mockResolvedValue(undefined),
     };
-    service = new GroupService(prisma as any, openim as any);
+    privacySettings = {
+      canBeInvitedToGroupOrCircle: jest.fn().mockResolvedValue(true),
+    };
+    service = new GroupService(
+      prisma as any,
+      openim as any,
+      privacySettings as any,
+    );
   });
 
   it('creates a group report for an active circle member', async () => {
@@ -416,6 +429,61 @@ describe('GroupService reportGroup', () => {
       skipDuplicates: true,
     });
     expect(openim.addGroupMembers).not.toHaveBeenCalled();
+  });
+
+  it('rejects circle group invites blocked by the target privacy setting', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
+  });
+
+  it('passes real friendship status to the group invite privacy check (FRIENDS_ONLY)', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    // admin-1 is an accepted friend of new-user (stored friendID side).
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'admin-1', friendID: 'new-user' },
+    ]);
+    // Block before the transaction so we only assert the privacy-check args.
+    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
+      'new-user',
+      true,
+    );
   });
 
   it('returns unhandled for raw OpenIM group invites', async () => {

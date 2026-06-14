@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { TraceService } from './trace.service';
 
 describe('TraceService', () => {
@@ -45,9 +46,14 @@ describe('TraceService', () => {
     broadcastCirclePostInteractionCreated: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
   };
+  const privacySettings = {
+    canViewMoments: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    privacySettings.canViewMoments.mockReset();
+    privacySettings.canViewMoments.mockResolvedValue(true);
     notificationService.createTraceCommentNotifications.mockResolvedValue([]);
     notificationService.createTraceLikeNotification.mockReset();
 
@@ -58,6 +64,7 @@ describe('TraceService', () => {
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         { provide: NotificationService, useValue: notificationService },
         { provide: RealtimeService, useValue: realtimeService },
+        { provide: PrivacySettingsService, useValue: privacySettings },
       ],
     }).compile();
 
@@ -73,6 +80,22 @@ describe('TraceService', () => {
       likeCount: 0,
     });
     prisma.friend.findMany.mockResolvedValue([]);
+
+    await expect(service.toggleLike('viewer-1', 'trace-1')).rejects.toThrow(
+      ForbiddenException,
+    );
+  });
+
+  it('blocks access to a public trace when the author hides moments from the viewer', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+      likeCount: 0,
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.canViewMoments.mockResolvedValue(false);
 
     await expect(service.toggleLike('viewer-1', 'trace-1')).rejects.toThrow(
       ForbiddenException,

@@ -31,6 +31,34 @@ const refreshLimiterOptions = {
   legacyHeaders: false,
 } satisfies Partial<RateLimitOptions>;
 
+/**
+ * Email verification-code requests: 10 sends / 15 min per IP. The service also
+ * enforces a 60s per-email cooldown, but that does not stop one IP from
+ * fanning out across many addresses (mail-bombing / cost abuse), so cap per IP.
+ */
+const emailCodeLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many code requests, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
+/**
+ * Login security-code verification: 10 attempts / 15 min per IP. The security
+ * code is only 4-6 digits and verifyLoginSecurityCode has no server-side
+ * lockout, so without this an attacker holding a stolen access token could
+ * brute-force a 4-digit code at the global rate. See the persistent-lockout
+ * follow-up in the review's remaining recommendations.
+ */
+const securityCodeVerifyLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many attempts, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
 /** Friend request spam protection: 30 attempts / 15 min per IP. */
 const friendRequestLimiterOptions = {
   windowMs: 15 * 60 * 1000,
@@ -175,6 +203,14 @@ export const setupApp = (app: INestApplication) => {
     authLimiterOptions,
   );
   const refreshLimiter = createLimiter('auth_refresh', refreshLimiterOptions);
+  const emailCodeLimiter = createLimiter(
+    'auth_email_code',
+    emailCodeLimiterOptions,
+  );
+  const securityCodeVerifyLimiter = createLimiter(
+    'auth_security_code_verify',
+    securityCodeVerifyLimiterOptions,
+  );
   const friendRequestLimiter = createLimiter(
     'friend_requests',
     friendRequestLimiterOptions,
@@ -259,6 +295,10 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/auth/change-password', authChangePasswordLimiter);
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
+  // Email code sends and security-code verification are the two new
+  // unauthenticated-cost / brute-force surfaces from this branch.
+  app.use('/api/v1/auth/email/request-code', emailCodeLimiter);
+  app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
   app.use('/api/v1/coin/gift', coinGiftLimiter);

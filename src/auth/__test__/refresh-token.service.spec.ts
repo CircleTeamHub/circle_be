@@ -46,6 +46,12 @@ describe('RefreshTokenService', () => {
         const matching = records.filter((record) => {
           if (where.userId && record.userId !== where.userId) return false;
           if (where.token && record.token !== where.token) return false;
+          if (typeof where.id === 'string' && record.id !== where.id) {
+            return false;
+          }
+          if (where.id?.not && record.id === where.id.not) {
+            return false;
+          }
           if (where.revokedAt === null && record.revokedAt !== null) {
             return false;
           }
@@ -79,12 +85,16 @@ describe('RefreshTokenService', () => {
 
   it('stores device metadata when creating a session, truncating overlong values', async () => {
     const longName = 'x'.repeat(200);
-    await service.create('user-1', {
+    const session = await service.create('user-1', {
       deviceName: longName,
       ip: '127.0.0.1',
       userAgent: 'PostmanRuntime',
     });
 
+    expect(session).toMatchObject({
+      token: expect.any(String),
+      sessionId: 'session-1',
+    });
     expect(prisma.refreshToken.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -146,20 +156,101 @@ describe('RefreshTokenService', () => {
     expect(records[0].revokedAt).toBeInstanceOf(Date);
   });
 
+  it('revokes a single active session for the owning user', async () => {
+    const now = new Date();
+    records.push(
+      {
+        id: 'session-1',
+        userId: 'user-1',
+        token: 'token-1',
+        revokedAt: null,
+        expiredAt: new Date(now.getTime() + 1000 * 60),
+        createdAt: now,
+        lastUsedAt: now,
+      },
+      {
+        id: 'session-2',
+        userId: 'user-2',
+        token: 'token-2',
+        revokedAt: null,
+        expiredAt: new Date(now.getTime() + 1000 * 60),
+        createdAt: now,
+        lastUsedAt: now,
+      },
+    );
+
+    await service.revokeSession('user-1', 'session-1');
+    await service.revokeSession('user-1', 'session-2');
+
+    expect(records[0].revokedAt).toBeInstanceOf(Date);
+    expect(records[1].revokedAt).toBeNull();
+  });
+
+  it('revokes all active sessions except the current session', async () => {
+    const now = new Date();
+    records.push(
+      {
+        id: 'current',
+        userId: 'user-1',
+        token: 'token-1',
+        revokedAt: null,
+        expiredAt: new Date(now.getTime() + 1000 * 60),
+        createdAt: now,
+        lastUsedAt: now,
+      },
+      {
+        id: 'other',
+        userId: 'user-1',
+        token: 'token-2',
+        revokedAt: null,
+        expiredAt: new Date(now.getTime() + 1000 * 60),
+        createdAt: now,
+        lastUsedAt: now,
+      },
+    );
+
+    await service.revokeOtherSessions('user-1', 'current');
+
+    expect(records[0].revokedAt).toBeNull();
+    expect(records[1].revokedAt).toBeInstanceOf(Date);
+  });
+
+  it('does not revoke sessions when the current session id is missing', async () => {
+    const now = new Date();
+    records.push({
+      id: 'session-1',
+      userId: 'user-1',
+      token: 'token-1',
+      revokedAt: null,
+      expiredAt: new Date(now.getTime() + 1000 * 60),
+      createdAt: now,
+      lastUsedAt: now,
+    });
+
+    await service.revokeOtherSessions('user-1');
+
+    expect(records[0].revokedAt).toBeNull();
+  });
+
   it('rotates a valid refresh token and revokes the old record', async () => {
-    const raw = await service.create('user-1', {
+    const { token: raw } = await service.create('user-1', {
       deviceName: 'MacBook',
       ip: '127.0.0.1',
       userAgent: 'PostmanRuntime',
     });
 
-    const { token: newRaw, userId } = await service.rotate(raw, {
+    const {
+      token: newRaw,
+      userId,
+      sessionId,
+    } = await service.rotate(raw, {
       ip: '10.0.0.1',
     });
 
     expect(userId).toBe('user-1');
     expect(newRaw).not.toBe(raw);
     expect(records).toHaveLength(2);
+    expect(sessionId).toBe('session-2');
 
     const oldRecord = records[0];
     const newRecord = records[1];
@@ -171,7 +262,7 @@ describe('RefreshTokenService', () => {
   });
 
   it('detects refresh token reuse and revokes all sessions for the user', async () => {
-    const raw = await service.create('user-1');
+    const { token: raw } = await service.create('user-1');
 
     // Rotate once — valid. Second rotation with the same old token is a replay.
     await service.rotate(raw);

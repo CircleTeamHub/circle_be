@@ -5,6 +5,8 @@ export interface JwtPayload {
   sub: string;
   accountId: string;
   role: string;
+  /** Refresh-token session id used for device management. */
+  sid?: string;
   /** Issued-at, populated by @nestjs/jwt. */
   iat?: number;
   /** Expiration, populated by @nestjs/jwt. */
@@ -16,6 +18,7 @@ export interface AuthenticatedUser {
   userId: string;
   accountId: string;
   role: string;
+  sessionId?: string;
 }
 
 /** Express Request with the JWT-derived user attached. */

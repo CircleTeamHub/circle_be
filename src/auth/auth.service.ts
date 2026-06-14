@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -11,6 +12,10 @@ import * as argon2 from 'argon2';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { LoginWithCodeDto } from './dto/login-with-code.dto';
+import { EmailVerificationService } from './email-verification.service';
+import { generateUniqueAccountId } from './account-id.unique';
+import { normalizeEmail } from 'src/utils/email';
 import { RefreshTokenService, SessionContext } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -20,6 +25,18 @@ import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { USER_ME_SELECT } from 'src/user/user.select';
 
 const ME_SELECT = USER_ME_SELECT;
+const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
+// Persistent per-account lockout for security-code verification. Backs up the
+// per-IP rate limiter so a distributed / IP-rotating attacker still can't
+// brute-force a 4-6 digit code.
+const MAX_SECURITY_CODE_ATTEMPTS = 5;
+const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
+
+function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
+  if (!SECURITY_CODE_PATTERN.test(value)) {
+    throw new BadRequestException(`${fieldName} 必须为4-6位数字`);
+  }
+}
 
 export type SafeUser = {
   id: string;
@@ -60,25 +77,35 @@ export class AuthService {
     private jwt: JwtService,
     private openim: OpenimService,
     private iconService: IconService,
+    private emailVerification: EmailVerificationService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
-    const existing = await this.prisma.user.findUnique({
-      where: { accountId: dto.accountId },
-    });
+    const email = normalizeEmail(dto.email);
+
+    const codeOk = await this.emailVerification.verifyCode(
+      email,
+      'REGISTER',
+      dto.code,
+    );
+    if (!codeOk) {
+      throw new BadRequestException('验证码错误或已过期');
+    }
+
+    const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
-      throw new ConflictException('Account ID already taken');
+      throw new ConflictException('该邮箱已注册');
     }
 
     const passwordHash = await argon2.hash(dto.password);
+    const accountId = await generateUniqueAccountId(this.prisma);
 
     const user = await this.prisma.user.create({
       data: {
-        accountId: dto.accountId,
+        accountId,
         passwordHash,
-        nickname: dto.nickname || dto.accountId,
-        email: dto.email,
-        phoneNumber: dto.phoneNumber,
+        nickname: dto.nickname,
+        email,
       },
     });
 
@@ -117,9 +144,8 @@ export class AuthService {
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
-    const user = await this.prisma.user.findUnique({
-      where: { accountId: dto.accountId },
-    });
+    const email = normalizeEmail(dto.email);
+    const user = await this.prisma.user.findUnique({ where: { email } });
 
     // Use the same error for "no such user" and "inactive user" so the
     // endpoint cannot be used as an account-enumeration oracle. The actual
@@ -139,7 +165,7 @@ export class AuthService {
           reason: user ? 'inactive_account' : 'invalid_credentials',
         },
       });
-      throw new ForbiddenException('Invalid credentials');
+      throw new ForbiddenException('邮箱或密码错误');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
@@ -151,9 +177,56 @@ export class AuthService {
         result: 'failure',
         metadata: { reason: 'invalid_credentials' },
       });
-      throw new ForbiddenException('Invalid credentials');
+      throw new ForbiddenException('邮箱或密码错误');
     }
 
+    return this.finishLogin(user, sessionContext, dto.platform);
+  }
+
+  async loginWithCode(dto: LoginWithCodeDto, sessionContext?: SessionContext) {
+    const email = normalizeEmail(dto.email);
+
+    const codeOk = await this.emailVerification.verifyCode(
+      email,
+      'LOGIN',
+      dto.code,
+    );
+    if (!codeOk) {
+      throw new ForbiddenException('验证码错误或已过期');
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user || user.status !== 'ACTIVE') {
+      throw new ForbiddenException('验证码错误或已过期');
+    }
+
+    return this.finishLogin(user, sessionContext, dto.platform);
+  }
+
+  async requestEmailCode(
+    email: string,
+    purpose: 'register' | 'login',
+  ): Promise<void> {
+    await this.emailVerification.requestCode(
+      email,
+      purpose === 'register' ? 'REGISTER' : 'LOGIN',
+    );
+  }
+
+  /** 密码登录与验证码登录共用的收尾：OpenIM 重同步、lastOnline、发 token、记日志。 */
+  private async finishLogin(
+    user: {
+      id: string;
+      accountId: string;
+      role: string;
+      nickname: string;
+      avatarUrl: string | null;
+      openimSynced: boolean;
+      singleDeviceLoginEnabled: boolean;
+    },
+    sessionContext?: SessionContext,
+    platform?: 1 | 2 | 5,
+  ) {
     // Retry OpenIM registration for users that weren't synced at register time
     // (e.g. OpenIM was down). Non-blocking — login succeeds regardless.
     if (!user.openimSynced) {
@@ -186,7 +259,8 @@ export class AuthService {
       user.accountId,
       user.role,
       sessionContext,
-      dto.platform,
+      platform,
+      { revokeExistingSessions: user.singleDeviceLoginEnabled },
     );
 
     logBusinessEvent(this.logger, {
@@ -202,12 +276,15 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
-    const { token: newRefreshToken, userId } =
-      await this.refreshTokenService.rotate(refreshToken, sessionContext);
+    const {
+      token: newRefreshToken,
+      userId,
+      sessionId,
+    } = await this.refreshTokenService.rotate(refreshToken, sessionContext);
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException('用户不存在');
     }
 
     // Banned/deleted users must not be able to keep refreshing tokens just
@@ -218,7 +295,7 @@ export class AuthService {
         `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
       );
       await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException('Account is not active');
+      throw new ForbiddenException('账号已被禁用');
     }
 
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
@@ -234,6 +311,7 @@ export class AuthService {
       user.id,
       user.accountId,
       user.role,
+      sessionId,
     );
     return { accessToken, refreshToken: newRefreshToken };
   }
@@ -242,8 +320,12 @@ export class AuthService {
     await this.refreshTokenService.revoke(refreshToken);
   }
 
-  async sessions(userId: string) {
-    return this.refreshTokenService.listActiveSessions(userId);
+  async sessions(userId: string, currentSessionId?: string) {
+    const sessions = await this.refreshTokenService.listActiveSessions(userId);
+    return sessions.map((session) => ({
+      ...session,
+      isCurrent: currentSessionId ? session.id === currentSessionId : false,
+    }));
   }
 
   async logoutAll(userId: string): Promise<void> {
@@ -258,6 +340,59 @@ export class AuthService {
     });
   }
 
+  async logoutSession(userId: string, sessionId: string): Promise<void> {
+    await this.refreshTokenService.revokeSession(userId, sessionId);
+  }
+
+  async logoutOtherSessions(
+    userId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    await this.refreshTokenService.revokeOtherSessions(
+      userId,
+      currentSessionId,
+    );
+  }
+
+  async getSingleDeviceLoginStatus(
+    userId: string,
+  ): Promise<{ enabled: boolean }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { singleDeviceLoginEnabled: true },
+    });
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+    return { enabled: user.singleDeviceLoginEnabled };
+  }
+
+  async setSingleDeviceLogin(
+    userId: string,
+    enabled: boolean,
+    currentSessionId?: string,
+  ): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { singleDeviceLoginEnabled: enabled },
+    });
+
+    if (enabled) {
+      await this.refreshTokenService.revokeOtherSessions(
+        userId,
+        currentSessionId,
+      );
+    }
+  }
+
   async me(userId: string): Promise<SafeUser> {
     const [user, displayIcons] = await Promise.all([
       this.prisma.user.findUnique({
@@ -268,7 +403,7 @@ export class AuthService {
     ]);
 
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException('用户不存在');
     }
 
     // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
@@ -293,12 +428,12 @@ export class AuthService {
   ): Promise<void> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException('用户不存在');
     }
 
     const valid = await argon2.verify(user.passwordHash, oldPassword);
     if (!valid) {
-      throw new UnauthorizedException('Current password is incorrect');
+      throw new UnauthorizedException('当前密码不正确');
     }
 
     const passwordHash = await argon2.hash(newPassword);
@@ -319,21 +454,186 @@ export class AuthService {
     });
   }
 
+  async getLoginSecurityCodeStatus(
+    userId: string,
+  ): Promise<{ enabled: boolean }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { loginSecurityCodeHash: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    return { enabled: Boolean(user.loginSecurityCodeHash) };
+  }
+
+  async setLoginSecurityCode(
+    userId: string,
+    securityCode: string,
+    oldSecurityCode?: string,
+  ): Promise<void> {
+    assertValidSecurityCode(securityCode);
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { loginSecurityCodeHash: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    if (user.loginSecurityCodeHash) {
+      if (!oldSecurityCode) {
+        throw new UnauthorizedException('当前安全码不正确');
+      }
+      assertValidSecurityCode(oldSecurityCode, 'oldSecurityCode');
+      const oldCodeValid = await argon2.verify(
+        user.loginSecurityCodeHash,
+        oldSecurityCode,
+      );
+      if (!oldCodeValid) {
+        throw new UnauthorizedException('当前安全码不正确');
+      }
+    }
+
+    const loginSecurityCodeHash = await argon2.hash(securityCode);
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        loginSecurityCodeHash,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
+    });
+  }
+
+  async disableLoginSecurityCode(
+    userId: string,
+    securityCode: string,
+  ): Promise<void> {
+    assertValidSecurityCode(securityCode);
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { loginSecurityCodeHash: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    if (!user.loginSecurityCodeHash) {
+      return;
+    }
+
+    const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
+    if (!valid) {
+      throw new UnauthorizedException('安全码不正确');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        loginSecurityCodeHash: null,
+        securityCodeAttempts: 0,
+        securityCodeLockedUntil: null,
+      },
+    });
+  }
+
+  async verifyLoginSecurityCode(
+    userId: string,
+    securityCode: string,
+  ): Promise<{ ok: boolean }> {
+    assertValidSecurityCode(securityCode);
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        loginSecurityCodeHash: true,
+        securityCodeAttempts: true,
+        securityCodeLockedUntil: true,
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    if (!user.loginSecurityCodeHash) {
+      return { ok: false };
+    }
+
+    const now = new Date();
+    if (user.securityCodeLockedUntil && user.securityCodeLockedUntil > now) {
+      throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+    }
+
+    const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
+
+    if (!valid) {
+      const attempts = user.securityCodeAttempts + 1;
+      const shouldLock = attempts >= MAX_SECURITY_CODE_ATTEMPTS;
+      // On lockout, reset the counter so the next window starts fresh after the
+      // lock expires. Read-then-write here is fine: any race only grants a
+      // couple of extra guesses, and the per-IP limiter already caps the rate.
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          securityCodeAttempts: shouldLock ? 0 : attempts,
+          securityCodeLockedUntil: shouldLock
+            ? new Date(now.getTime() + SECURITY_CODE_LOCK_MS)
+            : user.securityCodeLockedUntil,
+        },
+      });
+      if (shouldLock) {
+        this.logger.warn(
+          `Security code locked for user ${userId} after ${MAX_SECURITY_CODE_ATTEMPTS} failed attempts.`,
+        );
+        throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+      }
+      return { ok: false };
+    }
+
+    // Success: clear any accumulated failures / lock.
+    if (user.securityCodeAttempts !== 0 || user.securityCodeLockedUntil) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { securityCodeAttempts: 0, securityCodeLockedUntil: null },
+      });
+    }
+
+    return { ok: true };
+  }
+
   private async issueTokens(
     userId: string,
     accountId: string,
     role: string,
     sessionContext?: SessionContext,
     platformID?: 1 | 2 | 5,
+    options?: { revokeExistingSessions?: boolean },
   ) {
-    const [accessToken, refreshToken, imToken] = await Promise.all([
-      this.signAccessToken(userId, accountId, role),
+    if (options?.revokeExistingSessions) {
+      await this.refreshTokenService.revokeAll(userId);
+    }
+
+    const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
       this.refreshTokenService.create(userId, sessionContext),
       this.openim.getUserToken(userId, platformID).catch((err) => {
         this.logger.warn(`OpenIM getUserToken failed: ${err?.message}`);
         return '';
       }),
     ]);
+    const accessToken = await this.signAccessToken(
+      userId,
+      accountId,
+      role,
+      sessionId,
+    );
     return { accessToken, refreshToken, imToken };
   }
 
@@ -341,7 +641,8 @@ export class AuthService {
     userId: string,
     accountId: string,
     role: string,
+    sessionId?: string,
   ): Promise<string> {
-    return this.jwt.signAsync({ sub: userId, accountId, role });
+    return this.jwt.signAsync({ sub: userId, accountId, role, sid: sessionId });
   }
 }
