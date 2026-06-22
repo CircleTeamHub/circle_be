@@ -62,9 +62,15 @@ export class TraceService {
       friendIdSet,
     );
 
+    // 单用户相册：authorId 收窄到某个作者。作者必须对 viewer 可见
+    // （本人或已接受好友且未被隐私屏蔽），否则返回空——不泄露存在性。
+    if (query.authorId && !visibleUserIds.includes(query.authorId)) {
+      return { items: [], total: 0, page, limit, hasMore: false };
+    }
+
     const where = {
       deleted: false,
-      fromID: { in: visibleUserIds },
+      fromID: query.authorId ? query.authorId : { in: visibleUserIds },
       OR: [
         { fromID: userId },
         { visibility: 'FRIENDS_ONLY' as const },

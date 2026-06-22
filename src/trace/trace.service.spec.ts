@@ -222,6 +222,46 @@ describe('TraceService', () => {
     );
   });
 
+  it('narrows the feed to a single author when authorId is a visible friend', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-1' },
+    ]);
+    privacySettings.canViewMoments.mockResolvedValue(true);
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', {
+      page: 1,
+      limit: 20,
+      authorId: 'friend-1',
+    });
+
+    expect(prisma.trace.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ fromID: 'friend-1' }),
+      }),
+    );
+  });
+
+  it('returns empty without querying when authorId is not visible to the viewer', async () => {
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const result = await service.getFeed('viewer-1', {
+      page: 1,
+      limit: 20,
+      authorId: 'stranger-1',
+    });
+
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(result.hasMore).toBe(false);
+    expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
   it('toggleLike increments likeCount atomically and returns the DB value', async () => {
     const notification = {
       id: 'notification-1',
