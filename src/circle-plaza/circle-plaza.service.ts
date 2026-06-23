@@ -30,6 +30,18 @@ export class CirclePlazaService {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
 
+  // 逗号分隔的过滤列表最多接受这么多项，防止恶意超长入参生成超大 IN 子句。
+  private static readonly MAX_FILTER_ITEMS = 50;
+
+  private parseCommaList(value: string | undefined): string[] {
+    if (!value) return [];
+    return value
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, CirclePlazaService.MAX_FILTER_ITEMS);
+  }
+
   /**
    * Rejects post images not served from this application's own storage.
    * A plaza post is shown to every feed viewer, so off-origin image URLs are
@@ -141,12 +153,27 @@ export class CirclePlazaService {
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const where: any = { status: 'ACTIVE', circle: { deleted: false } };
+    const where: any = {
+      status: 'ACTIVE',
+      circle: {
+        deleted: false,
+        members: {
+          some: { userID: viewerId, status: 'ACTIVE' },
+        },
+      },
+    };
+    const circleIds = this.parseCommaList(query.circleIds);
+    const cities = this.parseCommaList(query.cities);
+
     if (query.circleId) {
       where.circleID = query.circleId;
+    } else if (circleIds.length > 0) {
+      where.circleID = { in: circleIds };
     }
     if (query.city) {
       where.city = query.city;
+    } else if (cities.length > 0) {
+      where.city = { in: cities };
     }
 
     const [posts, total, viewer] = await Promise.all([

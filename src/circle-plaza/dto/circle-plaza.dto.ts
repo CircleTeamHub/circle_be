@@ -115,10 +115,20 @@ export class PlazaFeedQueryDto {
   @IsOptional()
   circleId?: string;
 
+  @ApiPropertyOptional({ description: 'Comma-separated circle IDs' })
+  @IsString()
+  @IsOptional()
+  circleIds?: string;
+
   @ApiPropertyOptional()
   @IsString()
   @IsOptional()
   city?: string;
+
+  @ApiPropertyOptional({ description: 'Comma-separated city names' })
+  @IsString()
+  @IsOptional()
+  cities?: string;
 
   @ApiPropertyOptional({ default: 1 })
   @Type(() => Number)

@@ -72,6 +72,115 @@ describe('CirclePlazaService', () => {
     service = module.get(CirclePlazaService);
   });
 
+  describe('getFeed', () => {
+    it('only returns posts from circles the viewer has actively joined', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      const result = await service.getFeed('viewer-1', {});
+
+      expect(result.items).toEqual([]);
+      const expectedMembershipScope = {
+        circle: {
+          deleted: false,
+          members: {
+            some: { userID: 'viewer-1', status: 'ACTIVE' },
+          },
+        },
+      };
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining(expectedMembershipScope),
+        }),
+      );
+      expect(prisma.circlePost.count).toHaveBeenCalledWith({
+        where: expect.objectContaining(expectedMembershipScope),
+      });
+    });
+
+    it('keeps selected circle and city filters inside the viewer membership scope', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', {
+        circleId: 'circle-1',
+        city: '上海',
+      });
+
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            circleID: 'circle-1',
+            city: '上海',
+            circle: {
+              deleted: false,
+              members: {
+                some: { userID: 'viewer-1', status: 'ACTIVE' },
+              },
+            },
+          }),
+        }),
+      );
+    });
+
+    it('keeps saved multi-circle and multi-city filters inside the viewer membership scope', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', {
+        circleIds: 'circle-1,circle-2',
+        cities: '上海,杭州',
+      } as any);
+
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            circleID: { in: ['circle-1', 'circle-2'] },
+            city: { in: ['上海', '杭州'] },
+            circle: {
+              deleted: false,
+              members: {
+                some: { userID: 'viewer-1', status: 'ACTIVE' },
+              },
+            },
+          }),
+        }),
+      );
+    });
+
+    it('caps comma-separated filters at 50 items to bound the IN clause', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      const manyIds = Array.from({ length: 60 }, (_, i) => `c${i}`).join(',');
+
+      await service.getFeed('viewer-1', { circleIds: manyIds } as any);
+
+      const where = prisma.circlePost.findMany.mock.calls[0][0].where;
+      expect(where.circleID.in).toHaveLength(50);
+    });
+  });
+
   it('rejects creating a post with a note owned by another user', async () => {
     prisma.circleMember.findUnique.mockResolvedValue({
       id: 'member-1',
