@@ -1,0 +1,66 @@
+# Backend quality checks for PRs and pushes to main.
+#
+# Mirrors the structure of squady's Forgejo `quality.yml` (analyze + test as a
+# blocking gate), adapted to this NestJS/Prisma service on GitHub-hosted runners.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  # AppModule's Joi schema requires these; tests mock Prisma and never connect.
+  DATABASE_URL: "postgresql://test:test@localhost:5432/test"
+  SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+
+jobs:
+  lint_test_build:
+    runs-on: ubuntu-latest
+    name: "Lint, Test & Build"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # `npm ci` runs the `postinstall` hook (`prisma generate`), which emits the
+      # client into src/generated/prisma that the rest of the build imports.
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx eslint "{src,apps,libs,test}/**/*.ts"
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Coverage Report
+        run: npm run test:cov
+
+      - name: Build Smoke
+        run: npm run build
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
