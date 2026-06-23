@@ -37,7 +37,9 @@ export class ConversationGroupController {
   constructor(private readonly service: ConversationGroupService) {}
 
   @Get()
-  @ApiOperation({ summary: 'List all conversation groups owned by current user' })
+  @ApiOperation({
+    summary: 'List all conversation groups owned by current user',
+  })
   @ApiOkResponse({ type: [ConversationGroupDto] })
   list(@Req() req: any) {
     return this.service.list(req.user.userId);
@@ -63,7 +65,9 @@ export class ConversationGroupController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a conversation group (memberships cascade)' })
+  @ApiOperation({
+    summary: 'Delete a conversation group (memberships cascade)',
+  })
   @ApiNoContentResponse()
   remove(@Req() req: any, @Param('id', ParseUUIDPipe) id: string) {
     return this.service.remove(req.user.userId, id);

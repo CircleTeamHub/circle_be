@@ -1,11 +1,4 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Put,
-  Req,
-  UseGuards,
-} from '@nestjs/common';
+import { Body, Controller, Get, Put, Req, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -28,7 +21,9 @@ export class IconController {
   constructor(private readonly iconService: IconService) {}
 
   @Get('options')
-  @ApiOperation({ summary: 'Get all eligible user icons and current selections' })
+  @ApiOperation({
+    summary: 'Get all eligible user icons and current selections',
+  })
   @ApiOkResponse({ type: IconOptionsResponseDto })
   options(@Req() req: any) {
     return this.iconService.getIconOptions(req.user.userId);

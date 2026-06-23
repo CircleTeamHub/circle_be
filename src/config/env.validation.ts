@@ -54,10 +54,7 @@ export function createEnvValidationSchema(
     LIVEKIT_API_KEY: Joi.string().optional(),
     LIVEKIT_API_SECRET: Joi.string().optional(),
     LIVEKIT_WEBHOOK_SECRET: Joi.string().optional(),
-    LIVEKIT_TOKEN_TTL_SECONDS: Joi.number()
-      .integer()
-      .min(60)
-      .default(3600),
+    LIVEKIT_TOKEN_TTL_SECONDS: Joi.number().integer().min(60).default(3600),
     CALL_RING_TIMEOUT_SECONDS: Joi.number().integer().min(5).default(45),
     CALL_MAX_PARTICIPANTS: Joi.number().integer().min(2).max(100).default(10),
     CALL_ALLOW_OFFLINE_INVITE: Joi.boolean().default(false),

@@ -16,7 +16,8 @@ function readPath(req: Request): string {
 }
 
 function readUserId(req: Request): string | undefined {
-  const user = (req as Request & { user?: { userId?: string; id?: string } }).user;
+  const user = (req as Request & { user?: { userId?: string; id?: string } })
+    .user;
   return user?.userId || user?.id;
 }
 

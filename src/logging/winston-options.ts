@@ -45,7 +45,9 @@ function createDailyRotateTransport(
   });
 }
 
-function getRawConfig(configService: ConfigServiceLike): Record<string, unknown> {
+function getRawConfig(
+  configService: ConfigServiceLike,
+): Record<string, unknown> {
   return {
     LOG_ON: configService.get(LogEnum.LOG_ON),
     LOG_LEVEL: configService.get(LogEnum.LOG_LEVEL),
@@ -82,18 +84,8 @@ export function createWinstonOptions(
       }),
       ...(loggingConfig.logOn
         ? [
-            createDailyRotateTransport(
-              'info',
-              'application',
-              14,
-              fileFormat,
-            ),
-            createDailyRotateTransport(
-              'warn',
-              'error',
-              14,
-              fileFormat,
-            ),
+            createDailyRotateTransport('info', 'application', 14, fileFormat),
+            createDailyRotateTransport('warn', 'error', 14, fileFormat),
           ]
         : []),
     ],

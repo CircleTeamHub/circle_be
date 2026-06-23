@@ -18,20 +18,21 @@ function readPath(req: Request): string {
 
 function readIp(req: Request): string | undefined {
   return (
-    (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ||
+    (req.headers['x-forwarded-for'] as string | undefined)
+      ?.split(',')[0]
+      ?.trim() ||
     req.ip ||
     req.socket?.remoteAddress
   );
 }
 
-function readHeader(
-  value: string | string[] | undefined,
-): string | undefined {
+function readHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
 function readUserId(req: Request): string | undefined {
-  const user = (req as Request & { user?: { userId?: string; id?: string } }).user;
+  const user = (req as Request & { user?: { userId?: string; id?: string } })
+    .user;
   return user?.userId || user?.id;
 }
 

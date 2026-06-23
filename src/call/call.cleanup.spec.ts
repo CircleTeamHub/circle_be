@@ -14,7 +14,9 @@ describe('CallCleanup', () => {
 
   it('does not throw when cleanup fails', async () => {
     const service = {
-      sweepExpiredRingingCalls: jest.fn().mockRejectedValue(new Error('db down')),
+      sweepExpiredRingingCalls: jest
+        .fn()
+        .mockRejectedValue(new Error('db down')),
     };
     const cleanup = new CallCleanup(service as any);
 

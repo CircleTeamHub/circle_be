@@ -1,3 +1,6 @@
+// scripts/seed-guard.js is a CommonJS helper (no allowJs / type decls), so a
+// require() interop import is intentional here.
+/* eslint-disable @typescript-eslint/no-require-imports */
 const {
   assertDevSeedAllowed,
   isLocalDatabaseUrl,

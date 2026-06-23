@@ -9,7 +9,9 @@ describe('CallWebhookController', () => {
         room: { name: 'circle_call_1' },
       }),
     };
-    const calls = { handleLiveKitWebhook: jest.fn().mockResolvedValue(undefined) };
+    const calls = {
+      handleLiveKitWebhook: jest.fn().mockResolvedValue(undefined),
+    };
     const controller = new CallWebhookController(livekit as any, calls as any);
     const req = { rawBody: Buffer.from('{"event":"room_finished"}') };
 

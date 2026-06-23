@@ -1,3 +1,6 @@
+// scripts/backfill-friend-sync-outbox.js is a CommonJS helper (no allowJs /
+// type decls), so a require() interop import is intentional here.
+/* eslint-disable @typescript-eslint/no-require-imports */
 const {
   backfillFriendSyncOutbox,
   buildFriendSyncOutboxRows,
@@ -83,11 +86,31 @@ describe('friend sync outbox backfill', () => {
     ).resolves.toEqual({ planned: 5, created: 5, dryRun: false });
     expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
-        { operation: 'IMPORT_FRIEND', userID: 'user-1', targetUserID: 'user-2' },
-        { operation: 'IMPORT_FRIEND', userID: 'user-2', targetUserID: 'user-1' },
-        { operation: 'ADD_BLACKLIST', userID: 'user-1', targetUserID: 'user-3' },
-        { operation: 'DELETE_FRIEND', userID: 'user-1', targetUserID: 'user-3' },
-        { operation: 'DELETE_FRIEND', userID: 'user-3', targetUserID: 'user-1' },
+        {
+          operation: 'IMPORT_FRIEND',
+          userID: 'user-1',
+          targetUserID: 'user-2',
+        },
+        {
+          operation: 'IMPORT_FRIEND',
+          userID: 'user-2',
+          targetUserID: 'user-1',
+        },
+        {
+          operation: 'ADD_BLACKLIST',
+          userID: 'user-1',
+          targetUserID: 'user-3',
+        },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-1',
+          targetUserID: 'user-3',
+        },
+        {
+          operation: 'DELETE_FRIEND',
+          userID: 'user-3',
+          targetUserID: 'user-1',
+        },
       ],
       skipDuplicates: true,
     });

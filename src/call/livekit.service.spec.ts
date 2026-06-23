@@ -114,9 +114,7 @@ describe('LiveKitCallService', () => {
       LIVEKIT_API_KEY: 'key',
       LIVEKIT_API_SECRET: 'secret',
     });
-    jest
-      .spyOn(service, 'deleteRoom')
-      .mockResolvedValueOnce(undefined);
+    jest.spyOn(service, 'deleteRoom').mockResolvedValueOnce(undefined);
 
     await expect(service.deleteRoom('circle_call_1')).resolves.toBeUndefined();
   });

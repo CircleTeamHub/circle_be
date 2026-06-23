@@ -10,7 +10,9 @@ describe('CallController', () => {
 
     expect(guards).toEqual([ThrottlerGuard, JwtGuard]);
     expect(Reflect.getMetadata('THROTTLER:LIMITdefault', createGroup)).toBe(10);
-    expect(Reflect.getMetadata('THROTTLER:TTLdefault', createGroup)).toBe(60_000);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', createGroup)).toBe(
+      60_000,
+    );
   });
 
   it('passes group call creation through with the current user', async () => {

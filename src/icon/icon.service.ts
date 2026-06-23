@@ -257,7 +257,10 @@ export class IconService {
     return { systemIcons, circleIcons };
   }
 
-  private async pruneInvalidSelections(userId: string, eligibility: Eligibility) {
+  private async pruneInvalidSelections(
+    userId: string,
+    eligibility: Eligibility,
+  ) {
     const selections = await this.prisma.userDisplayIcon.findMany({
       where: { userID: userId },
       orderBy: { sortOrder: 'asc' },

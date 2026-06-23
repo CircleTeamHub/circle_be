@@ -168,9 +168,9 @@ describe('ConversationGroupService', () => {
         ownerID: OTHER_OWNER_ID,
       });
 
-      await expect(
-        service.remove(OWNER_ID, 'group-1'),
-      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.remove(OWNER_ID, 'group-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
       expect(prisma.conversationGroup.delete).not.toHaveBeenCalled();
     });
 
@@ -196,8 +196,16 @@ describe('ConversationGroupService', () => {
       prisma.conversationGroup.findUniqueOrThrow.mockResolvedValue(
         buildGroupRow({
           memberships: [
-            { groupID: 'group-1', conversationID: 'c-a', createdAt: new Date() },
-            { groupID: 'group-1', conversationID: 'c-b', createdAt: new Date() },
+            {
+              groupID: 'group-1',
+              conversationID: 'c-a',
+              createdAt: new Date(),
+            },
+            {
+              groupID: 'group-1',
+              conversationID: 'c-b',
+              createdAt: new Date(),
+            },
           ],
         }),
       );
@@ -207,10 +215,14 @@ describe('ConversationGroupService', () => {
       });
 
       expect(prisma.$transaction).toHaveBeenCalled();
-      expect(prisma.conversationGroupMembership.deleteMany).toHaveBeenCalledWith({
+      expect(
+        prisma.conversationGroupMembership.deleteMany,
+      ).toHaveBeenCalledWith({
         where: { groupID: 'group-1' },
       });
-      expect(prisma.conversationGroupMembership.createMany).toHaveBeenCalledWith({
+      expect(
+        prisma.conversationGroupMembership.createMany,
+      ).toHaveBeenCalledWith({
         data: [
           { groupID: 'group-1', conversationID: 'c-a' },
           { groupID: 'group-1', conversationID: 'c-b' },
@@ -251,7 +263,9 @@ describe('ConversationGroupService', () => {
       await service.setMembers(OWNER_ID, 'group-1', { conversationIDs: [] });
 
       expect(prisma.conversationGroupMembership.deleteMany).toHaveBeenCalled();
-      expect(prisma.conversationGroupMembership.createMany).not.toHaveBeenCalled();
+      expect(
+        prisma.conversationGroupMembership.createMany,
+      ).not.toHaveBeenCalled();
     });
   });
 });

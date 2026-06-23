@@ -69,13 +69,7 @@ describe('CallService', () => {
       }),
     } as unknown as ConfigService;
 
-    service = new CallService(
-      prisma,
-      openim,
-      livekit,
-      realtime,
-      config,
-    );
+    service = new CallService(prisma, openim, livekit, realtime, config);
   });
 
   afterEach(() => {
@@ -423,8 +417,14 @@ describe('CallService', () => {
         livekitRoomName: 'circle_call_1',
         initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
         participants: [
-          { userID: 'user-1', user: { id: 'user-1', nickname: 'Alice', avatarUrl: null } },
-          { userID: 'user-2', user: { id: 'user-2', nickname: 'Bob', avatarUrl: null } },
+          {
+            userID: 'user-1',
+            user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+          },
+          {
+            userID: 'user-2',
+            user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+          },
         ],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
@@ -507,10 +507,7 @@ describe('CallService', () => {
         id: 'call-1',
         livekitRoomName: 'circle_call_1',
         status: 'ACTIVE',
-        participants: [
-          { userID: 'user-1' },
-          { userID: 'user-2' },
-        ],
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
     });
     prisma.callParticipant.update.mockResolvedValue({});
@@ -520,10 +517,7 @@ describe('CallService', () => {
       status: 'ENDED',
       endReason: 'ALL_LEFT',
       endedAt: now,
-      participants: [
-        { userID: 'user-1' },
-        { userID: 'user-2' },
-      ],
+      participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
     });
 
     await service.leaveCall('user-2', 'call-1');
@@ -614,10 +608,7 @@ describe('CallService', () => {
       call: {
         id: 'call-1',
         status: 'RINGING',
-        participants: [
-          { userID: 'user-1' },
-          { userID: 'user-2' },
-        ],
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
@@ -678,10 +669,7 @@ describe('CallService', () => {
         id: 'call-1',
         livekitRoomName: 'circle_call_1',
         status: 'RINGING',
-        participants: [
-          { userID: 'user-1' },
-          { userID: 'user-2' },
-        ],
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
@@ -703,10 +691,7 @@ describe('CallService', () => {
       status: 'MISSED',
       endReason: 'NO_ANSWER',
       endedAt: now,
-      participants: [
-        { userID: 'user-1' },
-        { userID: 'user-2' },
-      ],
+      participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
     });
 
     await service.rejectCall('user-2', 'call-1');
@@ -733,10 +718,7 @@ describe('CallService', () => {
         id: 'call-1',
         livekitRoomName: 'circle_call_1',
         status: 'ACTIVE',
-        participants: [
-          { userID: 'user-1' },
-          { userID: 'user-2' },
-        ],
+        participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
@@ -801,7 +783,9 @@ describe('CallService', () => {
     prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
 
-    await expect((service as any).sweepExpiredRingingCalls(10)).resolves.toBe(2);
+    await expect((service as any).sweepExpiredRingingCalls(10)).resolves.toBe(
+      2,
+    );
 
     expect(prisma.callSession.findMany).toHaveBeenCalledWith(
       expect.objectContaining({

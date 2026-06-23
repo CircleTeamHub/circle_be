@@ -6,7 +6,9 @@ import { ChatHistoryController } from './chat-history.controller';
 
 describe('ChatHistoryController', () => {
   it('passes current user, conversation id, and query options to service', async () => {
-    const service = { getMessages: jest.fn().mockResolvedValue({ messages: [] }) };
+    const service = {
+      getMessages: jest.fn().mockResolvedValue({ messages: [] }),
+    };
     const controller = new ChatHistoryController(service as any);
 
     await controller.getMessages(
