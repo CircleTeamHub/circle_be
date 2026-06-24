@@ -1,8 +1,12 @@
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
-import { DECORATORS } from '@nestjs/swagger/dist/constants';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatHistoryController } from './chat-history.controller';
+
+// Metadata key set by @nestjs/swagger's @ApiResponse (DECORATORS.API_RESPONSE).
+// Inlined because @nestjs/swagger@>=11.4 ships an `exports` map that blocks the
+// internal `@nestjs/swagger/dist/constants` deep import this test used to use.
+const SWAGGER_API_RESPONSE_METADATA = 'swagger/apiResponse';
 
 describe('ChatHistoryController', () => {
   it('passes current user, conversation id, and query options to service', async () => {
@@ -38,7 +42,7 @@ describe('ChatHistoryController', () => {
 
   it('documents expected auth, not-found, and rate-limit responses', () => {
     const responses = Reflect.getMetadata(
-      DECORATORS.API_RESPONSE,
+      SWAGGER_API_RESPONSE_METADATA,
       ChatHistoryController.prototype.getMessages,
     );
 

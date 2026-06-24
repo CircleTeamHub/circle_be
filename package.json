@@ -144,5 +144,9 @@
       "@root": ".",
       "src": "src/",
       "@/": "src/"
+   },
+   "overrides": {
+      "multer": "^2.2.0",
+      "picomatch": "^4.0.4"
    }
 }

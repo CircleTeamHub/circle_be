@@ -1,0 +1,7 @@
+# CVE-2026-33671 — picomatch 4.0.3 ReDoS.
+# Present ONLY in the npm CLI bundled with the node:22-slim base image
+# (/usr/local/lib/node_modules/npm/node_modules/picomatch), not in our app deps
+# (we pin picomatch >=4.0.4 via package.json overrides). npm is not invoked at
+# runtime — the production image runs `node dist/src/main.js` — so this code path
+# is not reachable. Will clear when the base image ships a patched npm.
+CVE-2026-33671
