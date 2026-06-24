@@ -64,3 +64,56 @@ jobs:
           END=$(date +%s)
           DURATION=$((END - JOB_START))
           echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  # Provisions a clean Postgres and applies the full migration chain from empty,
+  # so a broken-from-scratch migration history (see docs/migration-baseline.md)
+  # can never be merged again. Also asserts the schema matches the migrations.
+  migrations:
+    runs-on: ubuntu-latest
+    name: "Migrations (fresh DB)"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: circle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/circle_test?schema=public"
+      SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Apply Migrations from empty
+        run: npx prisma migrate deploy
+
+      - name: Schema/Migration Drift Check
+        run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
