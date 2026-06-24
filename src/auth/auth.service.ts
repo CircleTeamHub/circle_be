@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -16,6 +17,10 @@ import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
 import { generateUniqueAccountId } from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
+import {
+  ACCOUNT_ID_PATTERN,
+  ACCOUNT_ID_RULE_MESSAGE,
+} from 'src/utils/account-id';
 import { RefreshTokenService, SessionContext } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -452,6 +457,67 @@ export class AuthService {
       entityType: 'user',
       entityId: userId,
     });
+  }
+
+  /**
+   * 修改 accountId（登录 / 好友搜索用的句柄）。
+   * - 不影响会话：与改密码不同，改 accountId 不撤销登录态。
+   * - 唯一性：先查重给出明确 409，并发竞态最终由 DB 唯一约束（P2002）兜底。
+   * 返回与 /auth/me 完全一致的资料，调用方据此 setUser。
+   */
+  async changeAccountId(userId: string, accountId: string): Promise<SafeUser> {
+    // 统一归一为小写后存储：accountId 唯一性与好友精确查找都按大小写不敏感
+    // 处理，归一到小写后简单的精确查重 / DB 唯一约束即足以保证唯一性。
+    const normalized = accountId.trim().toLowerCase();
+    if (!ACCOUNT_ID_PATTERN.test(normalized)) {
+      throw new BadRequestException(ACCOUNT_ID_RULE_MESSAGE);
+    }
+
+    const current = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { accountId: true },
+    });
+    if (!current) {
+      throw new NotFoundException('用户不存在');
+    }
+    if (current.accountId === normalized) {
+      throw new BadRequestException('新账号不能和当前账号相同');
+    }
+
+    const taken = await this.prisma.user.findUnique({
+      where: { accountId: normalized },
+      select: { id: true },
+    });
+    if (taken) {
+      throw new ConflictException('该账号已被占用');
+    }
+
+    try {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: { accountId: normalized },
+      });
+    } catch (err) {
+      // 查重与写入之间被并发抢占：唯一约束兜底，转成友好的 409。
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        throw new ConflictException('该账号已被占用');
+      }
+      throw err;
+    }
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_change_account_id_success',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
+
+    return this.me(userId);
   }
 
   async getLoginSecurityCodeStatus(

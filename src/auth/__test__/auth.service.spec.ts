@@ -14,6 +14,7 @@ import { RefreshTokenService } from '../refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { IconService } from 'src/icon/icon.service';
 import { EmailVerificationService } from '../email-verification.service';
+import { Prisma } from 'src/generated/prisma';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -159,7 +160,7 @@ describe('AuthService', () => {
     } as any);
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('refresh-token');
-    expect(users[0].accountId).toMatch(/^ACC_/);
+    expect(users[0].accountId).toMatch(/^[a-z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
   });
 
@@ -178,7 +179,7 @@ describe('AuthService', () => {
   it('register throws Conflict when email already used', async () => {
     users.push({
       id: 'u0',
-      accountId: 'ACC_OLD000',
+      accountId: 'OLD000',
       email: 'dupe@example.com',
       status: 'ACTIVE',
     });
@@ -196,7 +197,7 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
@@ -222,7 +223,7 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
@@ -236,7 +237,7 @@ describe('AuthService', () => {
   it('loginWithCode returns tokens when code valid', async () => {
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash: 'x',
       status: 'ACTIVE',
@@ -253,7 +254,7 @@ describe('AuthService', () => {
   it('loginWithCode throws ForbiddenException when code invalid', async () => {
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash: 'x',
       status: 'ACTIVE',
@@ -272,7 +273,7 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
@@ -302,7 +303,7 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_AAA111',
+      accountId: 'AAA111',
       email: 'a@example.com',
       passwordHash,
       status: 'ACTIVE',
@@ -475,7 +476,7 @@ describe('AuthService', () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
       id: 'uuid-1',
-      accountId: 'ACC_BAN000',
+      accountId: 'BAN000',
       email: 'banned@example.com',
       passwordHash,
       status: 'BANNED',
@@ -549,6 +550,163 @@ describe('AuthService', () => {
       }),
     );
     expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+  });
+
+  it('changeAccountId rejects an invalid format without touching the DB', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'ab')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId rejects an unchanged account id', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'alice')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId rejects an id already taken by another user', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    users.push({
+      id: 'uuid-2',
+      accountId: 'bobby',
+      email: 'bob@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      ConflictException,
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId updates the handle and returns the refreshed profile without revoking sessions', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      nickname: 'Alice',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    const result = await service.changeAccountId('uuid-1', 'alice_2024');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'uuid-1' },
+        data: { accountId: 'alice_2024' },
+      }),
+    );
+    expect(result.accountId).toBe('alice_2024');
+    // 改 accountId 不应撤销登录态（与改密码不同）
+    expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId normalizes mixed-case input to lowercase before storing', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    const result = await service.changeAccountId('uuid-1', 'Alice_2024');
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { accountId: 'alice_2024' } }),
+    );
+    expect(result.accountId).toBe('alice_2024');
+  });
+
+  it('changeAccountId rejects a case-variant of an id taken by another user', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    users.push({
+      id: 'uuid-2',
+      accountId: 'bobby',
+      email: 'bob@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'BOBBY')).rejects.toThrow(
+      ConflictException,
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId maps a concurrent-race P2002 to Conflict (pre-check passes, DB unique constraint loses the race)', async () => {
+    // Only the actor exists, so the pre-check findUnique(accountId) returns null
+    // and the flow proceeds to update — simulating a competitor that claimed the
+    // same id in the window between our check and write.
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.user.update.mockImplementationOnce(() => {
+      throw new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed',
+        {
+          code: 'P2002',
+          clientVersion: 'test',
+        },
+      );
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      ConflictException,
+    );
+  });
+
+  it('changeAccountId rethrows a non-P2002 DB error untouched', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.user.update.mockImplementationOnce(() => {
+      throw new Error('connection reset');
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      'connection reset',
+    );
   });
 
   it('returns login security code status from the account-level hash', async () => {

@@ -32,6 +32,7 @@ import { RequestEmailCodeDto } from './dto/request-email-code.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { ChangeAccountIdDto } from './dto/change-account-id.dto';
 import {
   LoginSecurityCodeDto,
   SetLoginSecurityCodeDto,
@@ -233,6 +234,20 @@ export class AuthController {
       dto.oldPassword,
       dto.newPassword,
     );
+  }
+
+  @Post('change-account-id')
+  @UseGuards(JwtGuard)
+  @Serialize(SelfUserDto)
+  @ApiOperation({ summary: 'Change account ID (login & friend-search handle)' })
+  @ApiBearerAuth()
+  @ApiBody({ type: ChangeAccountIdDto })
+  @ApiOkResponse({ description: 'Account ID changed', type: SelfUserDto })
+  changeAccountId(
+    @Body() dto: ChangeAccountIdDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.authService.changeAccountId(req.user.userId, dto.accountId);
   }
 
   @Get('security-code')

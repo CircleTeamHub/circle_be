@@ -1,0 +1,11 @@
+-- accountId 的大小写不敏感唯一性此前只由应用层（AuthService.changeAccountId /
+-- UserService.findByExactAccountId 的小写归一）保证，DB 上的 "User_accountId_key"
+-- 是大小写敏感的。任何旁路写入（admin 工具 / 导入 / seed）一旦写入非小写值，就可能
+-- 出现 'Alice' 与 'alice' 共存，使精确查找结果非确定。
+--
+-- 此函数式唯一索引让 DB 自身强制该不变量。前置的 remove_account_id_prefix migration
+-- 已将所有 accountId 归一为小写，故对存量数据安全（不存在仅大小写不同的冲突）。
+--
+-- 注意：普通 CREATE INDEX 会持有写锁。User 表很大时改用 CONCURRENTLY，但需将该 migration
+-- 移出 Prisma 的事务包裹（单独以无事务方式执行）。当前规模直接建索引即可。
+CREATE UNIQUE INDEX "User_accountId_lower_key" ON "User" (lower("accountId"));

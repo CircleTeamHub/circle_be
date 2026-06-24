@@ -15,7 +15,10 @@ describe('TempChatCleanup', () => {
     ]);
     await job.sweep();
     expect(service.teardown).toHaveBeenCalledTimes(2);
-    expect(service.teardown).toHaveBeenCalledWith({ id: 'a', groupId: 'tmpA' }, TempChatStatus.EXPIRED);
+    expect(service.teardown).toHaveBeenCalledWith(
+      { id: 'a', groupId: 'tmpA' },
+      TempChatStatus.EXPIRED,
+    );
   });
 
   it('one failing room does not block the others', async () => {

@@ -27,7 +27,7 @@ describe('UserService.update normalization', () => {
     jest.clearAllMocks();
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
-      accountId: 'ACC_TEST1',
+      accountId: 'TEST01',
       nickname: 'Tester',
       avatarUrl: null,
       avatarFrame: null,

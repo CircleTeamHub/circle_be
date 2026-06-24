@@ -53,7 +53,9 @@ export class CircleInvitationController {
   @Get('pending')
   @ApiOperation({ summary: 'My pending verification requests (as verifier)' })
   @ApiOkResponse({ type: [InvitationDto] })
-  myPendingVerifications(@Req() req: RequestWithUser): Promise<InvitationDto[]> {
+  myPendingVerifications(
+    @Req() req: RequestWithUser,
+  ): Promise<InvitationDto[]> {
     return this.invitationService.getMyPendingVerifications(req.user.userId);
   }
 

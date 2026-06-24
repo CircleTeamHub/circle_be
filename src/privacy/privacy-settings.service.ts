@@ -97,8 +97,45 @@ export class PrivacySettingsService {
   ): Promise<boolean> {
     if (isSelf) return true;
     const settings = await this.getSettings(authorUserId);
-    if (settings.momentsVisibility === 'PRIVATE') return false;
-    if (settings.momentsVisibility === 'FRIENDS_ONLY') return isFriend;
+    return this.momentsVisibleFor(settings, isSelf, isFriend);
+  }
+
+  /**
+   * Batch variant of getSettings: one query for many users. Users without a row
+   * are simply absent from the map; callers fall back to defaults via
+   * momentsVisibleFor. Avoids the N+1 that a per-author getSettings loop causes
+   * when filtering a whole feed's authors.
+   */
+  async getSettingsMany(
+    userIds: string[],
+  ): Promise<Map<string, PrivacySettingsDto>> {
+    const byUser = new Map<string, PrivacySettingsDto>();
+    if (userIds.length === 0) return byUser;
+    const rows = await this.prisma.userPrivacySetting.findMany({
+      where: { userID: { in: userIds } },
+    });
+    for (const row of rows) {
+      const stored = row as StoredPrivacySettings;
+      byUser.set(stored.userID as string, this.toDto(stored));
+    }
+    return byUser;
+  }
+
+  /**
+   * Pure moments-visibility decision over already-loaded settings (or undefined
+   * = no row yet → defaults). Shared by canViewMoments and the batch feed path
+   * so both apply identical rules.
+   */
+  momentsVisibleFor(
+    settings: PrivacySettingsDto | undefined,
+    isSelf: boolean,
+    isFriend: boolean,
+  ): boolean {
+    if (isSelf) return true;
+    const visibility =
+      settings?.momentsVisibility ?? DEFAULT_PRIVACY_SETTINGS.momentsVisibility;
+    if (visibility === 'PRIVATE') return false;
+    if (visibility === 'FRIENDS_ONLY') return isFriend;
     return true;
   }
 

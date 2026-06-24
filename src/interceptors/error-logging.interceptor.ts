@@ -17,7 +17,10 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
 
   constructor(private readonly logger: LoggerService) {}
 
-  intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
+  intercept(
+    _context: ExecutionContext,
+    next: CallHandler,
+  ): Observable<unknown> {
     return next.handle().pipe(
       catchError((error: unknown) => {
         const requestContext = getRequestContext();

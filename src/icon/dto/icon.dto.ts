@@ -109,12 +109,18 @@ export class UpdateDisplayIconItemDto {
   displayType: DisplayIconTypeDto;
 
   @ApiPropertyOptional({ enum: SystemIconKeyDto })
-  @ValidateIf((value: UpdateDisplayIconItemDto) => value.displayType === DisplayIconTypeDto.SYSTEM)
+  @ValidateIf(
+    (value: UpdateDisplayIconItemDto) =>
+      value.displayType === DisplayIconTypeDto.SYSTEM,
+  )
   @IsEnum(SystemIconKeyDto)
   systemKey?: SystemIconKeyDto;
 
   @ApiPropertyOptional()
-  @ValidateIf((value: UpdateDisplayIconItemDto) => value.displayType === DisplayIconTypeDto.CIRCLE)
+  @ValidateIf(
+    (value: UpdateDisplayIconItemDto) =>
+      value.displayType === DisplayIconTypeDto.CIRCLE,
+  )
   @IsUUID()
   circleId?: string;
 

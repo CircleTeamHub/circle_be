@@ -140,13 +140,12 @@ describe('IconService', () => {
   });
 
   it('broadcasts user profile summary after updating display icons', async () => {
-    prisma.user.findUnique
-      .mockResolvedValueOnce({
-        id: 'user-1',
-        vipLevel: 5,
-        createdAt: new Date(),
-        iconPreferencesInitialized: true,
-      });
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-1',
+      vipLevel: 5,
+      createdAt: new Date(),
+      iconPreferencesInitialized: true,
+    });
     prisma.circleMember.findMany.mockResolvedValue([]);
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });
     prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 1 });

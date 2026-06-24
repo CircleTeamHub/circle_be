@@ -15,7 +15,9 @@ function createFilter() {
     verbose: jest.fn(),
   };
   const reply = jest.fn();
-  const httpAdapterHost = { httpAdapter: { reply } } as unknown as HttpAdapterHost;
+  const httpAdapterHost = {
+    httpAdapter: { reply },
+  } as unknown as HttpAdapterHost;
   const filter = new AllExceptionFilter(logger, httpAdapterHost);
   return { filter, logger, reply };
 }
@@ -44,7 +46,10 @@ describe('AllExceptionFilter', () => {
     filter.catch(new ForbiddenException('nope'), host);
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    const [, payload] = logger.warn.mock.calls[0] as [string, { userId?: string }];
+    const [, payload] = logger.warn.mock.calls[0] as [
+      string,
+      { userId?: string },
+    ];
     expect(payload.userId).toBe('user-123');
   });
 

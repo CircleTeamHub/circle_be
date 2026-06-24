@@ -3,12 +3,10 @@ FROM node:22-slim
 
 WORKDIR /app
 
-RUN corepack enable
-
 # Install deps first so a code-only change reuses the layer cache.
-COPY package.json pnpm-lock.yaml ./
+COPY package.json package-lock.json ./
 COPY prisma ./prisma
-RUN pnpm install --frozen-lockfile
+RUN npm ci
 
 COPY . .
 
@@ -16,4 +14,4 @@ VOLUME ["/app/logs"]
 
 EXPOSE 3000
 
-CMD ["pnpm", "run", "start:dev"]
+CMD ["npm", "run", "start:dev"]

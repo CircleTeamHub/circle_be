@@ -1,8 +1,7 @@
 import { LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
 
-const SENSITIVE_KEY_PATTERN =
-  /(password|token|secret|authorization|cookie)/i;
+const SENSITIVE_KEY_PATTERN = /(password|token|secret|authorization|cookie)/i;
 
 export interface SecurityEventPayload {
   enabled: boolean;
@@ -15,18 +14,9 @@ export interface SecurityEventPayload {
 
 function sanitizeText(value: string): string {
   return value
-    .replace(
-      /(authorization=)[^\s]+(?:\s+[^\s]+)*/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /(cookie=)[^\s]+(?:;\s*[^\s;=]+=[^\s;]+)*/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /(password|token|secret)=\S+/gi,
-      '$1=[redacted]',
-    );
+    .replace(/(authorization=)[^\s]+(?:\s+[^\s]+)*/gi, '$1[redacted]')
+    .replace(/(cookie=)[^\s]+(?:;\s*[^\s;=]+=[^\s;]+)*/gi, '$1[redacted]')
+    .replace(/(password|token|secret)=\S+/gi, '$1=[redacted]');
 }
 
 function sanitizeMetadata(

@@ -1,5 +1,13 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+  MinLength,
+} from 'class-validator';
 
 export class CreateTempChatDto {
   @ApiPropertyOptional({ minLength: 1, maxLength: 30, default: '临时聊天' })
@@ -9,7 +17,12 @@ export class CreateTempChatDto {
   @MaxLength(30)
   title?: string;
 
-  @ApiPropertyOptional({ minimum: 30, maximum: 10080, default: 4320, description: '有效期（分钟），默认 3 天，最长 7 天' })
+  @ApiPropertyOptional({
+    minimum: 30,
+    maximum: 10080,
+    default: 4320,
+    description: '有效期（分钟），默认 3 天，最长 7 天',
+  })
   @IsOptional()
   @IsInt()
   @Min(30)

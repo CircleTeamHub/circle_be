@@ -40,19 +40,13 @@ export class TraceController {
 
   @Get('feed')
   @ApiOperation({ summary: 'Friend moments feed' })
-  feed(
-    @Query() query: TraceFeedQueryDto,
-    @Req() req: RequestWithUser,
-  ) {
+  feed(@Query() query: TraceFeedQueryDto, @Req() req: RequestWithUser) {
     return this.traceService.getFeed(req.user.userId, query);
   }
 
   @Get('feed/new-count')
   @ApiOperation({ summary: 'Count new moments since timestamp' })
-  newCount(
-    @Query() query: NewCountQueryDto,
-    @Req() req: RequestWithUser,
-  ) {
+  newCount(@Query() query: NewCountQueryDto, @Req() req: RequestWithUser) {
     return this.traceService.getNewCount(req.user.userId, query.since);
   }
 
@@ -79,10 +73,7 @@ export class TraceController {
 
   @Post(':id/like')
   @ApiOperation({ summary: 'Toggle like on a moment' })
-  like(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: RequestWithUser,
-  ) {
+  like(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
     return this.traceService.toggleLike(req.user.userId, id);
   }
 

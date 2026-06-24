@@ -1,0 +1,103 @@
+# Security scanning: secret detection (blocking) + dependency audit (advisory).
+# CodeQL is intentionally omitted: this repo is private, so CodeQL would require
+# paid GitHub Advanced Security. Revisit if GHAS is enabled or the repo is public.
+
+name: Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 6 * * 1" # weekly Monday 06:00 UTC full scan
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    name: "Secret scan (TruffleHog)"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so PR/push diffs can be scanned
+
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # Only verified secrets fail the build → near-zero false positives.
+          extra_args: --only-verified
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    name: "Dependency audit (npm)"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # Blocking: production deps must carry no HIGH/CRITICAL advisory. The legacy
+      # backlog was cleared (multer / picomatch pinned via package.json overrides).
+      # If an unfixable advisory ever needs tolerating, prefer a scoped exception
+      # over re-adding a blanket `|| true`.
+      - name: npm audit (production deps, high+)
+        run: npm audit --omit=dev --audit-level=high
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs:
+      - secret-scan
+      - dependency-audit
+    if: ${{ always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Send Discord Notification
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE' > payload.json
+          const needs = JSON.parse(process.env.NEEDS_JSON);
+          const failedJobs = Object.entries(needs)
+            .filter(([, job]) => ['failure', 'cancelled'].includes(job.result))
+            .map(([name, job]) => `${name}: ${job.result}`);
+
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const refName = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
+          const shortSha = process.env.GITHUB_SHA.slice(0, 7);
+
+          const payload = {
+            username: 'GitHub Actions',
+            content: [
+              `:rotating_light: **Backend Security ${failedJobs.some((job) => job.endsWith('cancelled')) ? 'cancelled' : 'failed'}**`,
+              `**Repository:** ${process.env.GITHUB_REPOSITORY}`,
+              `**Ref:** ${refName}`,
+              `**Commit:** ${shortSha}`,
+              `**Actor:** ${process.env.GITHUB_ACTOR}`,
+              `**Jobs:** ${failedJobs.join(', ')}`,
+              `**Run:** ${runUrl}`,
+            ].join('\n'),
+          };
+
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+
+          curl --fail-with-body \
+            -H 'Content-Type: application/json' \
+            -d @payload.json \
+            "$DISCORD_WEBHOOK_URL"

@@ -113,6 +113,14 @@
       "collectCoverageFrom": [
          "**/*.(t|j)s"
       ],
+      "coverageThreshold": {
+         "global": {
+            "statements": 28,
+            "branches": 17,
+            "functions": 18,
+            "lines": 70
+         }
+      },
       "coverageDirectory": "../coverage",
       "testEnvironment": "node",
       "roots": [
@@ -136,5 +144,9 @@
       "@root": ".",
       "src": "src/",
       "@/": "src/"
+   },
+   "overrides": {
+      "multer": "^2.2.0",
+      "picomatch": "^4.0.4"
    }
 }

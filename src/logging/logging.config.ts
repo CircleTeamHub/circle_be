@@ -10,10 +10,7 @@ export interface LoggingConfig {
   slowExternalMs: number;
 }
 
-function readBoolean(
-  value: unknown,
-  defaultValue: boolean,
-): boolean {
+function readBoolean(value: unknown, defaultValue: boolean): boolean {
   if (typeof value === 'boolean') {
     return value;
   }
@@ -27,10 +24,7 @@ function readBoolean(
   return defaultValue;
 }
 
-function readPositiveInteger(
-  value: unknown,
-  defaultValue: number,
-): number {
+function readPositiveInteger(value: unknown, defaultValue: number): number {
   const numberValue =
     typeof value === 'number'
       ? value
@@ -52,17 +46,13 @@ export function createLoggingConfig(
 
   return {
     logOn,
-    httpLogOn:
-      logOn && readBoolean(rawConfig['HTTP_LOG_ON'], !isTest),
+    httpLogOn: logOn && readBoolean(rawConfig['HTTP_LOG_ON'], !isTest),
     slowRequestMs: readPositiveInteger(rawConfig['SLOW_REQUEST_MS'], 1000),
-    businessLogOn:
-      logOn && readBoolean(rawConfig['BUSINESS_LOG_ON'], !isTest),
-    externalLogOn:
-      logOn && readBoolean(rawConfig['EXTERNAL_LOG_ON'], !isTest),
+    businessLogOn: logOn && readBoolean(rawConfig['BUSINESS_LOG_ON'], !isTest),
+    externalLogOn: logOn && readBoolean(rawConfig['EXTERNAL_LOG_ON'], !isTest),
     rateLimitLogOn:
       logOn && readBoolean(rawConfig['RATE_LIMIT_LOG_ON'], !isTest),
-    securityLogOn:
-      logOn && readBoolean(rawConfig['SECURITY_LOG_ON'], !isTest),
+    securityLogOn: logOn && readBoolean(rawConfig['SECURITY_LOG_ON'], !isTest),
     performanceLogOn:
       logOn && readBoolean(rawConfig['PERFORMANCE_LOG_ON'], !isTest),
     slowExternalMs: readPositiveInteger(rawConfig['SLOW_EXTERNAL_MS'], 1000),

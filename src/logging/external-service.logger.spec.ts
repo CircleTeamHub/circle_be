@@ -22,6 +22,8 @@ describe('logExternalCallFailure', () => {
       }),
       'ExternalService',
     );
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('token=secret');
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
+      'token=secret',
+    );
   });
 });

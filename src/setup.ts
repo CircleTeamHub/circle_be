@@ -202,6 +202,10 @@ export const setupApp = (app: INestApplication) => {
     'auth_change_password',
     authLimiterOptions,
   );
+  const authChangeAccountIdLimiter = createLimiter(
+    'auth_change_account_id',
+    authLimiterOptions,
+  );
   const refreshLimiter = createLimiter('auth_refresh', refreshLimiterOptions);
   const emailCodeLimiter = createLimiter(
     'auth_email_code',
@@ -293,6 +297,7 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/auth/login', authLimiter);
   app.use('/api/v1/auth/register', authRegisterLimiter);
   app.use('/api/v1/auth/change-password', authChangePasswordLimiter);
+  app.use('/api/v1/auth/change-account-id', authChangeAccountIdLimiter);
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
   // Email code sends and security-code verification are the two new

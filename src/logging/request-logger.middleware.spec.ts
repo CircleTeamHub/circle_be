@@ -35,7 +35,10 @@ describe('createRequestLoggerMiddleware', () => {
   });
 
   it('logs one sanitized access event when the response finishes', () => {
-    dateSpy = jest.spyOn(Date, 'now').mockReturnValueOnce(1000).mockReturnValueOnce(1123);
+    dateSpy = jest
+      .spyOn(Date, 'now')
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1123);
     const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
     const middleware = createRequestLoggerMiddleware(logger, {
       enabled: true,
@@ -62,11 +65,16 @@ describe('createRequestLoggerMiddleware', () => {
       'HttpAccess',
     );
     expect(JSON.stringify(logger.log.mock.calls)).not.toContain('password');
-    expect(JSON.stringify(logger.log.mock.calls)).not.toContain('authorization');
+    expect(JSON.stringify(logger.log.mock.calls)).not.toContain(
+      'authorization',
+    );
   });
 
   it('logs slow requests as warnings and reads authenticated user at finish time', () => {
-    dateSpy = jest.spyOn(Date, 'now').mockReturnValueOnce(1000).mockReturnValueOnce(1600);
+    dateSpy = jest
+      .spyOn(Date, 'now')
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1600);
     const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
     const middleware = createRequestLoggerMiddleware(logger, {
       enabled: true,

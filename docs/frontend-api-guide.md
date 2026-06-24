@@ -224,7 +224,7 @@ x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
 ```json
 {
   "id": "3f2a1b4c-8d9e-4f5a-b6c7-d8e9f0a1b2c3",
-  "accountId": "ACC_AB12CD",
+  "accountId": "ab12cd",
   "username": "testuser",
   "nickname": "Test User",
   "avatarUrl": "http://localhost:9000/circle/avatars/xxx.jpg",
@@ -444,7 +444,7 @@ await api.patch(`/user/${userId}`, { avatarUrl: fileUrl });
 ```json
 {
   "id": "uuid",
-  "accountId": "ACC_AB12CD",
+  "accountId": "ab12cd",
   "nickname": "张三",
   "avatarUrl": "http://10.0.0.195:9000/circle/avatars/xxx.jpg",
   "avatarFrame": null,
@@ -464,7 +464,7 @@ await api.patch(`/user/${userId}`, { avatarUrl: fileUrl });
   "message": "我是张三，加个好友吧",
   "user": {
     "id": "uuid",
-    "accountId": "ACC_AB12CD",
+    "accountId": "ab12cd",
     "nickname": "张三",
     "avatarUrl": "http://10.0.0.195:9000/circle/avatars/xxx.jpg"
   }
@@ -827,7 +827,7 @@ GET /friend/blocked
 [
   {
     "id": "uuid",
-    "accountId": "ACC_AB12CD",
+    "accountId": "ab12cd",
     "nickname": "某用户",
     "avatarUrl": null,
     "blockedAt": "2026-04-09T00:00:00.000Z"

@@ -1,0 +1,271 @@
+# Backend quality checks for PRs and pushes to main.
+#
+# Mirrors the structure of squady's Forgejo `quality.yml` (analyze + test as a
+# blocking gate), adapted to this NestJS/Prisma service on GitHub-hosted runners.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  # AppModule's Joi schema requires these; tests mock Prisma and never connect.
+  DATABASE_URL: "postgresql://test:test@localhost:5432/test"
+  SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+
+jobs:
+  lint_test_build:
+    runs-on: ubuntu-latest
+    name: "Lint, Test & Build"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # `npm ci` runs the `postinstall` hook (`prisma generate`), which emits the
+      # client into src/generated/prisma that the rest of the build imports.
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx eslint "{src,apps,libs,test}/**/*.ts"
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Coverage Report
+        run: npm run test:cov
+
+      - name: Build Smoke
+        run: npm run build
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  # Provisions a clean Postgres, applies the full migration chain from empty (so a
+  # broken-from-scratch history — see docs/migration-baseline.md — can never be
+  # merged again), checks for schema drift, then boots the full app and runs the
+  # e2e suite against the real database.
+  migrations_e2e:
+    runs-on: ubuntu-latest
+    name: "Migrations & E2E (fresh DB)"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: circle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/circle_test?schema=public"
+      SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Apply Migrations from empty
+        run: npx prisma migrate deploy
+
+      - name: Schema/Migration Drift Check
+        run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      # NODE_ENV=test enables the email-code dev bypass so registration is
+      # deterministic; the suite boots the full AppModule against this DB.
+      - name: E2E Tests
+        run: npm run test:e2e
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  # Guards the EXISTING-database half of the 0_init squash (see
+  # docs/migration-baseline.md). `migrations_e2e` proves a fresh DB deploys from
+  # empty; this job proves a long-lived db-push-built database (schema present,
+  # 0_init absent from _prisma_migrations) upgrades cleanly via the documented
+  # `migrate resolve --applied 0_init` → `migrate deploy` runbook — the path that
+  # would otherwise break the first deploy after the squash.
+  migration_existing_db:
+    runs-on: ubuntu-latest
+    name: "Migration baseline reset (existing DB)"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: circle_existing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/circle_existing?schema=public"
+      SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Verify baseline-reset runbook on an existing DB
+        run: bash scripts/verify-migration-baseline.sh
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  # Verifies the production image builds and is free of fixable HIGH/CRITICAL
+  # CVEs (both blocking). Documented exceptions live in .trivyignore.
+  docker:
+    runs-on: ubuntu-latest
+    name: "Docker build & scan"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prod
+          push: false
+          load: true
+          tags: circle-be:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: circle-be:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1" # blocking — fails on any unignored fixable HIGH/CRITICAL
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs:
+      - lint_test_build
+      - migrations_e2e
+      - migration_existing_db
+      - docker
+    if: ${{ always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Send Discord Notification
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE' > payload.json
+          const needs = JSON.parse(process.env.NEEDS_JSON);
+          const failedJobs = Object.entries(needs)
+            .filter(([, job]) => ['failure', 'cancelled'].includes(job.result))
+            .map(([name, job]) => `${name}: ${job.result}`);
+
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const refName = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
+          const shortSha = process.env.GITHUB_SHA.slice(0, 7);
+
+          const payload = {
+            username: 'GitHub Actions',
+            content: [
+              `:rotating_light: **Backend CI ${failedJobs.some((job) => job.endsWith('cancelled')) ? 'cancelled' : 'failed'}**`,
+              `**Repository:** ${process.env.GITHUB_REPOSITORY}`,
+              `**Ref:** ${refName}`,
+              `**Commit:** ${shortSha}`,
+              `**Actor:** ${process.env.GITHUB_ACTOR}`,
+              `**Jobs:** ${failedJobs.join(', ')}`,
+              `**Run:** ${runUrl}`,
+            ].join('\n'),
+          };
+
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+
+          curl --fail-with-body \
+            -H 'Content-Type: application/json' \
+            -d @payload.json \
+            "$DISCORD_WEBHOOK_URL"

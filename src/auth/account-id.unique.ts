@@ -1,3 +1,4 @@
+import { ServiceUnavailableException } from '@nestjs/common';
 import { generateAccountId } from 'src/utils/account-id';
 
 type AccountIdGenerator = () => string;
@@ -31,5 +32,9 @@ export async function generateUniqueAccountId(
       return candidate;
     }
   }
-  throw new Error('Failed to generate a unique account ID');
+  // 10 次随机候选全部撞库概率极低，真发生通常意味着 DB 异常。抛 503 而非裸
+  // Error，让全局过滤器返回干净的 5xx，且语义上是"暂时不可用、可重试"。
+  throw new ServiceUnavailableException(
+    'Failed to generate a unique account ID',
+  );
 }

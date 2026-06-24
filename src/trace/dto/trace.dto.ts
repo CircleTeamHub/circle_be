@@ -67,6 +67,11 @@ export class TraceFeedQueryDto {
   @Max(100)
   @IsOptional()
   limit?: number;
+
+  @ApiPropertyOptional({ description: '只看某个用户的朋友圈' })
+  @IsUUID()
+  @IsOptional()
+  authorId?: string;
 }
 
 export class NewCountQueryDto {

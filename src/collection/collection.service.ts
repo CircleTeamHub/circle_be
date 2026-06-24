@@ -15,10 +15,7 @@ export class CollectionService {
     });
   }
 
-  create(
-    userId: string,
-    dto: CreateCollectionDto,
-  ): Promise<UserCollectionDto> {
+  create(userId: string, dto: CreateCollectionDto): Promise<UserCollectionDto> {
     const data: Prisma.UserCollectionUncheckedCreateInput = {
       userID: userId,
       type: dto.type,

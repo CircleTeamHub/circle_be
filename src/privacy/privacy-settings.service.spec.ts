@@ -6,6 +6,7 @@ describe('PrivacySettingsService', () => {
     userPrivacySetting: {
       findUnique: jest.fn(),
       upsert: jest.fn(),
+      findMany: jest.fn(),
     },
   };
 
@@ -101,5 +102,50 @@ describe('PrivacySettingsService', () => {
       service.canBeInvitedToGroupOrCircle('target-1', false),
     ).resolves.toBe(false);
     await expect(service.canBeCalled('target-1', true)).resolves.toBe(true);
+  });
+
+  describe('getSettingsMany', () => {
+    it('returns a map keyed by userID and skips the query when given no ids', async () => {
+      await expect(service.getSettingsMany([])).resolves.toEqual(new Map());
+      expect(prisma.userPrivacySetting.findMany).not.toHaveBeenCalled();
+    });
+
+    it('loads all rows in one query; absent users are simply missing', async () => {
+      prisma.userPrivacySetting.findMany.mockResolvedValue([
+        { userID: 'a', momentsVisibility: 'PRIVATE' },
+      ]);
+
+      const map = await service.getSettingsMany(['a', 'b']);
+
+      expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
+      expect(map.get('a')?.momentsVisibility).toBe('PRIVATE');
+      expect(map.has('b')).toBe(false);
+    });
+  });
+
+  describe('momentsVisibleFor', () => {
+    it('always allows the author to see their own moments', () => {
+      expect(service.momentsVisibleFor(undefined, true, false)).toBe(true);
+    });
+
+    it('defaults to visible when no settings row exists', () => {
+      expect(service.momentsVisibleFor(undefined, false, false)).toBe(true);
+    });
+
+    it('hides PRIVATE moments from everyone but the author', () => {
+      expect(
+        service.momentsVisibleFor(
+          { momentsVisibility: 'PRIVATE' } as any,
+          false,
+          true,
+        ),
+      ).toBe(false);
+    });
+
+    it('limits FRIENDS_ONLY moments to friends', () => {
+      const settings = { momentsVisibility: 'FRIENDS_ONLY' } as any;
+      expect(service.momentsVisibleFor(settings, false, true)).toBe(true);
+      expect(service.momentsVisibleFor(settings, false, false)).toBe(false);
+    });
   });
 });

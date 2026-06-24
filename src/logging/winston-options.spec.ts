@@ -34,7 +34,8 @@ describe('createWinstonOptions', () => {
       new ConfigServiceLike({ LOG_ON: 'false' }),
       'production',
     );
-    const consoleTransport = options.transports?.[0] as winston.transports.ConsoleTransportInstance;
+    const consoleTransport = options
+      .transports?.[0] as winston.transports.ConsoleTransportInstance;
     const transformed = consoleTransport.format?.transform({
       level: 'info',
       message: 'hello',

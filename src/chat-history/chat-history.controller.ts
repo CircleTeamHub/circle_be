@@ -26,7 +26,9 @@ export class ChatHistoryController {
 
   @Get('conversations/:conversationID/messages')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Read restorable OpenIM history for a conversation' })
+  @ApiOperation({
+    summary: 'Read restorable OpenIM history for a conversation',
+  })
   @ApiOkResponse({ type: ChatHistoryMessagePageDto })
   @ApiUnauthorizedResponse({ description: 'Missing or invalid access token' })
   @ApiNotFoundResponse({ description: 'Conversation not found or not visible' })

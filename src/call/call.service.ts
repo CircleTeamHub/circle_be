@@ -88,7 +88,10 @@ export class CallService {
     dto: CreateGroupCallDto,
     idempotencyKey?: string,
   ) {
-    const conversationID = this.normalizeID(dto.conversationID, 'Group not found');
+    const conversationID = this.normalizeID(
+      dto.conversationID,
+      'Group not found',
+    );
     const inviteeIDs = this.uniqueIDs(dto.inviteeIDs).filter(
       (userID) => userID !== initiatorID,
     );
@@ -189,8 +192,9 @@ export class CallService {
     };
 
     await this.realtime.safeBroadcastAll(
-      inviteeIDs.map((userID) => () =>
-        this.realtime.broadcastCallInvite(userID, invitePayload),
+      inviteeIDs.map(
+        (userID) => () =>
+          this.realtime.broadcastCallInvite(userID, invitePayload),
       ),
     );
     this.logger.log(
@@ -210,7 +214,10 @@ export class CallService {
     const participant = await this.findParticipantForUser(callId, userID);
     if (participant.status === CallParticipantStatus.JOINED) {
       const call = participant.call as CallWithParticipants;
-      if (call.status !== CallStatus.RINGING && call.status !== CallStatus.ACTIVE) {
+      if (
+        call.status !== CallStatus.RINGING &&
+        call.status !== CallStatus.ACTIVE
+      ) {
         throw new ConflictException('CALL_ENDED');
       }
       const token = await this.mintToken(call, participant.user);
@@ -225,7 +232,10 @@ export class CallService {
     }
 
     const call = participant.call as CallWithParticipants;
-    if (call.status !== CallStatus.RINGING && call.status !== CallStatus.ACTIVE) {
+    if (
+      call.status !== CallStatus.RINGING &&
+      call.status !== CallStatus.ACTIVE
+    ) {
       throw new ConflictException('CALL_ENDED');
     }
     if (call.expiresAt && call.expiresAt.getTime() < Date.now()) {
@@ -263,7 +273,9 @@ export class CallService {
     await this.broadcastToCallParticipants(call, (targetID) =>
       this.realtime.broadcastCallParticipantJoined(targetID, payload),
     );
-    this.logger.log(`call.participant_joined callId=${callId} userID=${userID}`);
+    this.logger.log(
+      `call.participant_joined callId=${callId} userID=${userID}`,
+    );
 
     return {
       call: this.toCallDto(updatedCall as CallWithParticipants),
@@ -303,7 +315,9 @@ export class CallService {
       participant.call as CallWithParticipants,
       rejectedAt,
     );
-    this.logger.log(`call.participant_rejected callId=${callId} userID=${userID}`);
+    this.logger.log(
+      `call.participant_rejected callId=${callId} userID=${userID}`,
+    );
     return updatedParticipant;
   }
 
@@ -367,7 +381,9 @@ export class CallService {
         changedAt: leftAt.toISOString(),
       }),
     );
-    this.logger.log(`call.ended callId=${callId} reason=${CallEndReason.ALL_LEFT}`);
+    this.logger.log(
+      `call.ended callId=${callId} reason=${CallEndReason.ALL_LEFT}`,
+    );
   }
 
   async cancelCall(userID: string, callId: string) {
@@ -429,7 +445,10 @@ export class CallService {
   async createJoinToken(userID: string, callId: string) {
     const participant = await this.findParticipantForUser(callId, userID);
     const call = participant.call as CallWithParticipants;
-    if (call.status !== CallStatus.RINGING && call.status !== CallStatus.ACTIVE) {
+    if (
+      call.status !== CallStatus.RINGING &&
+      call.status !== CallStatus.ACTIVE
+    ) {
       throw new ConflictException('CALL_ENDED');
     }
     if (
@@ -599,7 +618,9 @@ export class CallService {
     }
   }
 
-  private async expireStaleRingingCallsForUsers(userIDs: string[]): Promise<void> {
+  private async expireStaleRingingCallsForUsers(
+    userIDs: string[],
+  ): Promise<void> {
     const now = new Date();
     const staleCalls = (await this.prisma.callSession.findMany({
       where: {
@@ -644,7 +665,9 @@ export class CallService {
     await this.expireRingingCallAsMissed(call, changedAt);
   }
 
-  private async loadActiveUsers(userIDs: string[]): Promise<Map<string, UserLite>> {
+  private async loadActiveUsers(
+    userIDs: string[],
+  ): Promise<Map<string, UserLite>> {
     const users = await this.prisma.user.findMany({
       where: { id: { in: userIDs }, status: UserStatus.ACTIVE },
       select: userLiteSelect,
@@ -695,7 +718,9 @@ export class CallService {
     call: CallWithParticipants,
     broadcast: (userID: string) => void,
   ) {
-    const userIDs = this.uniqueIDs((call.participants ?? []).map((p) => p.userID));
+    const userIDs = this.uniqueIDs(
+      (call.participants ?? []).map((p) => p.userID),
+    );
     await this.realtime.safeBroadcastAll(
       userIDs.map((targetID) => () => broadcast(targetID)),
     );
@@ -741,7 +766,9 @@ export class CallService {
         changedAt: changedAt.toISOString(),
       }),
     );
-    this.logger.log(`call.missed callId=${call.id} reason=${CallEndReason.NO_ANSWER}`);
+    this.logger.log(
+      `call.missed callId=${call.id} reason=${CallEndReason.NO_ANSWER}`,
+    );
   }
 
   private async failRingingCallAsError(
@@ -773,7 +800,9 @@ export class CallService {
         changedAt: changedAt.toISOString(),
       }),
     );
-    this.logger.log(`call.failed callId=${call.id} reason=${CallEndReason.ERROR}`);
+    this.logger.log(
+      `call.failed callId=${call.id} reason=${CallEndReason.ERROR}`,
+    );
   }
 
   private async endLiveKitFinishedCall(
@@ -815,7 +844,9 @@ export class CallService {
         changedAt: changedAt.toISOString(),
       }),
     );
-    this.logger.log(`call.ended callId=${call.id} reason=livekit_room_finished`);
+    this.logger.log(
+      `call.ended callId=${call.id} reason=livekit_room_finished`,
+    );
   }
 
   private buildTokenResponse(token: string) {
@@ -842,7 +873,9 @@ export class CallService {
         call.startedAt && call.endedAt
           ? Math.max(
               0,
-              Math.floor((call.endedAt.getTime() - call.startedAt.getTime()) / 1000),
+              Math.floor(
+                (call.endedAt.getTime() - call.startedAt.getTime()) / 1000,
+              ),
             )
           : null,
       endReason: call.endReason ?? null,
@@ -866,7 +899,9 @@ export class CallService {
   }
 
   private findParticipant(call: CallWithParticipants, userID: string) {
-    return call.participants?.find((participant) => participant.userID === userID);
+    return call.participants?.find(
+      (participant) => participant.userID === userID,
+    );
   }
 
   private callInclude() {

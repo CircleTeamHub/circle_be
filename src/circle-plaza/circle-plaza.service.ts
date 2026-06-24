@@ -2,9 +2,11 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CirclePost, Prisma, User } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
@@ -17,8 +19,32 @@ import {
   PostSignupItemDto,
 } from './dto/circle-plaza.dto';
 
+// A plaza post joined with the relations every DTO mapping needs.
+type PlazaPostWithRelations = Prisma.CirclePostGetPayload<{
+  include: { author: true; circle: true };
+}>;
+
+// The viewer fields that gate post interaction / signup eligibility.
+type ViewerEntitlements = Pick<
+  User,
+  'vipLevel' | 'creditScore' | 'fancyNumber'
+>;
+
+// The post restriction fields each eligibility check reads. Picking them keeps
+// both the full-post and the narrowly-`select`ed callers type-safe — a typo'd
+// field name fails to compile instead of silently disabling a gate.
+type InteractRestrictionFields = Pick<
+  CirclePost,
+  'vipRestriction' | 'creditRestriction' | 'fancyRestriction'
+>;
+type SignupRestrictionFields = Pick<
+  CirclePost,
+  'signupVipRestriction' | 'signupCreditRestriction' | 'signupFancyRestriction'
+>;
+
 @Injectable()
 export class CirclePlazaService {
+  private readonly logger = new Logger(CirclePlazaService.name);
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -28,6 +54,18 @@ export class CirclePlazaService {
     private readonly notificationService: NotificationService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  // 逗号分隔的过滤列表最多接受这么多项，防止恶意超长入参生成超大 IN 子句。
+  private static readonly MAX_FILTER_ITEMS = 50;
+
+  private parseCommaList(value: string | undefined): string[] {
+    if (!value) return [];
+    return value
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, CirclePlazaService.MAX_FILTER_ITEMS);
   }
 
   /**
@@ -141,12 +179,27 @@ export class CirclePlazaService {
     const limit = query.limit ?? 20;
     const skip = (page - 1) * limit;
 
-    const where: any = { status: 'ACTIVE', circle: { deleted: false } };
+    const where: Prisma.CirclePostWhereInput = {
+      status: 'ACTIVE',
+      circle: {
+        deleted: false,
+        members: {
+          some: { userID: viewerId, status: 'ACTIVE' },
+        },
+      },
+    };
+    const circleIds = this.parseCommaList(query.circleIds);
+    const cities = this.parseCommaList(query.cities);
+
     if (query.circleId) {
       where.circleID = query.circleId;
+    } else if (circleIds.length > 0) {
+      where.circleID = { in: circleIds };
     }
     if (query.city) {
       where.city = query.city;
+    } else if (cities.length > 0) {
+      where.city = { in: cities };
     }
 
     const [posts, total, viewer] = await Promise.all([
@@ -183,6 +236,13 @@ export class CirclePlazaService {
         signedSet.has(post.id),
         this.checkCanSignup(post, viewer),
       ),
+    );
+
+    this.logger.debug(
+      `plaza feed: viewer=${viewerId} ` +
+        `circleFilter=${query.circleId ?? circleIds.length} ` +
+        `cityFilter=${query.city ?? cities.length} page=${page} ` +
+        `returned=${posts.length} total=${total}`,
     );
 
     return {
@@ -568,12 +628,8 @@ export class CirclePlazaService {
   }
 
   private checkCanInteract(
-    post: any,
-    viewer: {
-      vipLevel: number;
-      creditScore: number;
-      fancyNumber: boolean;
-    } | null,
+    post: InteractRestrictionFields,
+    viewer: ViewerEntitlements | null,
   ): boolean {
     if (!viewer) return false;
 
@@ -593,12 +649,8 @@ export class CirclePlazaService {
   }
 
   private checkCanSignup(
-    post: any,
-    viewer: {
-      vipLevel: number;
-      creditScore: number;
-      fancyNumber: boolean;
-    } | null,
+    post: SignupRestrictionFields,
+    viewer: ViewerEntitlements | null,
   ): boolean {
     if (!viewer) return false;
     if (
@@ -620,7 +672,7 @@ export class CirclePlazaService {
   }
 
   private toPlazaPostDto(
-    post: any,
+    post: PlazaPostWithRelations,
     canInteract: boolean,
     signedByMe: boolean,
     canSignup: boolean,
