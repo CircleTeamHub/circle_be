@@ -2,27 +2,25 @@
 FROM node:22-slim AS build-stage
 
 WORKDIR /app
-RUN corepack enable
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json package-lock.json ./
 COPY prisma ./prisma
-# pnpm install also runs the postinstall `prisma generate` step.
-RUN pnpm install --frozen-lockfile
+# npm ci also runs the postinstall `prisma generate` step.
+RUN npm ci
 
 COPY . .
-RUN pnpm run build && pnpm prune --prod
+RUN npm run build && npm prune --omit=dev
 
 # --- production stage -----------------------------------------------------
 FROM node:22-slim AS production-stage
 
 ENV NODE_ENV=production
 WORKDIR /app
-RUN corepack enable
 
 # Run as non-root.
 RUN groupadd --system app && useradd --system --gid app --shell /usr/sbin/nologin app
 
-COPY --from=build-stage --chown=app:app /app/package.json /app/pnpm-lock.yaml ./
+COPY --from=build-stage --chown=app:app /app/package.json /app/package-lock.json ./
 COPY --from=build-stage --chown=app:app /app/node_modules ./node_modules
 COPY --from=build-stage --chown=app:app /app/dist ./dist
 COPY --from=build-stage --chown=app:app /app/prisma ./prisma
