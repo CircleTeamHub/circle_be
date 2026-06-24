@@ -52,3 +52,51 @@ jobs:
       # `npm audit --omit=dev --audit-level=high` is clean.
       - name: npm audit (production deps, high+)
         run: npm audit --omit=dev --audit-level=high || true
+
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    needs:
+      - secret-scan
+      - dependency-audit
+    if: ${{ always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Send Discord Notification
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          node <<'NODE' > payload.json
+          const needs = JSON.parse(process.env.NEEDS_JSON);
+          const failedJobs = Object.entries(needs)
+            .filter(([, job]) => ['failure', 'cancelled'].includes(job.result))
+            .map(([name, job]) => `${name}: ${job.result}`);
+
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const refName = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
+          const shortSha = process.env.GITHUB_SHA.slice(0, 7);
+
+          const payload = {
+            username: 'GitHub Actions',
+            content: [
+              `:rotating_light: **Backend Security ${failedJobs.some((job) => job.endsWith('cancelled')) ? 'cancelled' : 'failed'}**`,
+              `**Repository:** ${process.env.GITHUB_REPOSITORY}`,
+              `**Ref:** ${refName}`,
+              `**Commit:** ${shortSha}`,
+              `**Actor:** ${process.env.GITHUB_ACTOR}`,
+              `**Jobs:** ${failedJobs.join(', ')}`,
+              `**Run:** ${runUrl}`,
+            ].join('\n'),
+          };
+
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+
+          curl --fail-with-body \
+            -H 'Content-Type: application/json' \
+            -d @payload.json \
+            "$DISCORD_WEBHOOK_URL"
