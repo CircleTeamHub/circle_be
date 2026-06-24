@@ -14,6 +14,7 @@ import { RefreshTokenService } from '../refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { IconService } from 'src/icon/icon.service';
 import { EmailVerificationService } from '../email-verification.service';
+import { Prisma } from 'src/generated/prisma';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -663,6 +664,49 @@ describe('AuthService', () => {
       ConflictException,
     );
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId maps a concurrent-race P2002 to Conflict (pre-check passes, DB unique constraint loses the race)', async () => {
+    // Only the actor exists, so the pre-check findUnique(accountId) returns null
+    // and the flow proceeds to update — simulating a competitor that claimed the
+    // same id in the window between our check and write.
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.user.update.mockImplementationOnce(() => {
+      throw new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed',
+        {
+          code: 'P2002',
+          clientVersion: 'test',
+        },
+      );
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      ConflictException,
+    );
+  });
+
+  it('changeAccountId rethrows a non-P2002 DB error untouched', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.user.update.mockImplementationOnce(() => {
+      throw new Error('connection reset');
+    });
+
+    await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      'connection reset',
+    );
   });
 
   it('returns login security code status from the account-level hash', async () => {
