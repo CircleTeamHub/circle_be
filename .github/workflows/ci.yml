@@ -124,8 +124,61 @@ jobs:
           DURATION=$((END - JOB_START))
           echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
 
-  # Verifies the production image actually builds (blocking) and scans it for
-  # OS/library CVEs (advisory until the dependency backlog is cleared).
+  # Guards the EXISTING-database half of the 0_init squash (see
+  # docs/migration-baseline.md). `migrations_e2e` proves a fresh DB deploys from
+  # empty; this job proves a long-lived db-push-built database (schema present,
+  # 0_init absent from _prisma_migrations) upgrades cleanly via the documented
+  # `migrate resolve --applied 0_init` → `migrate deploy` runbook — the path that
+  # would otherwise break the first deploy after the squash.
+  migration_existing_db:
+    runs-on: ubuntu-latest
+    name: "Migration baseline reset (existing DB)"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: circle_existing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/circle_existing?schema=public"
+      SECRET: "ci-secret-ci-secret-ci-secret-0123456789"
+    steps:
+      - name: Start Timer
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Verify baseline-reset runbook on an existing DB
+        run: bash scripts/verify-migration-baseline.sh
+
+      - name: Job Duration
+        if: always()
+        run: |
+          END=$(date +%s)
+          DURATION=$((END - JOB_START))
+          echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
+
+  # Verifies the production image builds and is free of fixable HIGH/CRITICAL
+  # CVEs (both blocking). Documented exceptions live in .trivyignore.
   docker:
     runs-on: ubuntu-latest
     name: "Docker build & scan"
@@ -150,15 +203,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Trivy image scan (advisory)
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@master
-        continue-on-error: true
         with:
           image-ref: circle-be:ci
           scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: "0" # advisory; flip to "1" once the CVE backlog is cleared
+          trivyignores: .trivyignore
+          exit-code: "1" # blocking — fails on any unignored fixable HIGH/CRITICAL
 
       - name: Job Duration
         if: always()
@@ -173,6 +226,7 @@ jobs:
     needs:
       - lint_test_build
       - migrations_e2e
+      - migration_existing_db
       - docker
     if: ${{ always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
     timeout-minutes: 5

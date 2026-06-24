@@ -47,11 +47,12 @@ jobs:
           node-version: "22"
           cache: npm
 
-      # Advisory only for now: there is an existing high-severity backlog that
-      # Dependabot will chip away at. Flip `|| true` off to make it blocking once
-      # `npm audit --omit=dev --audit-level=high` is clean.
+      # Blocking: production deps must carry no HIGH/CRITICAL advisory. The legacy
+      # backlog was cleared (multer / picomatch pinned via package.json overrides).
+      # If an unfixable advisory ever needs tolerating, prefer a scoped exception
+      # over re-adding a blanket `|| true`.
       - name: npm audit (production deps, high+)
-        run: npm audit --omit=dev --audit-level=high || true
+        run: npm audit --omit=dev --audit-level=high
 
   notify:
     name: Notify Discord
