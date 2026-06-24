@@ -65,12 +65,13 @@ jobs:
           DURATION=$((END - JOB_START))
           echo "Job completed in ${DURATION} seconds ($((DURATION / 60))m $((DURATION % 60))s)"
 
-  # Provisions a clean Postgres and applies the full migration chain from empty,
-  # so a broken-from-scratch migration history (see docs/migration-baseline.md)
-  # can never be merged again. Also asserts the schema matches the migrations.
-  migrations:
+  # Provisions a clean Postgres, applies the full migration chain from empty (so a
+  # broken-from-scratch history — see docs/migration-baseline.md — can never be
+  # merged again), checks for schema drift, then boots the full app and runs the
+  # e2e suite against the real database.
+  migrations_e2e:
     runs-on: ubuntu-latest
-    name: "Migrations (fresh DB)"
+    name: "Migrations & E2E (fresh DB)"
     services:
       postgres:
         image: postgres:16
@@ -110,6 +111,11 @@ jobs:
 
       - name: Schema/Migration Drift Check
         run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+
+      # NODE_ENV=test enables the email-code dev bypass so registration is
+      # deterministic; the suite boots the full AppModule against this DB.
+      - name: E2E Tests
+        run: npm run test:e2e
 
       - name: Job Duration
         if: always()
