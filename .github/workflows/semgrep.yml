@@ -1,0 +1,40 @@
+# Semgrep SAST — pattern-based scan for security bugs (injection, SSRF, unsafe
+# regex, etc.). Blocking: the app code (src/) is currently clean, so any new
+# finding fails the build. Uses public registry rulesets — no account/token.
+
+name: Semgrep
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: semgrep-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    name: "Semgrep SAST"
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Semgrep scan (blocking)
+        # --error => non-zero exit on any finding. src/generated is the generated
+        # Prisma client, not our code.
+        run: >-
+          semgrep scan
+          --config p/security-audit
+          --config p/typescript
+          --config p/nodejs
+          --exclude src/generated
+          --error
+          --metrics off
+          src
