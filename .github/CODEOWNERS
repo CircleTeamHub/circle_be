@@ -1,0 +1,9 @@
+# Default owner for everything in the repo.
+*                       @YiboDing1998
+
+# Security-/data-sensitive areas — always pull in an owner review.
+/src/auth/              @YiboDing1998
+/prisma/                @YiboDing1998
+/src/config/            @YiboDing1998
+/src/setup.ts           @YiboDing1998
+/.github/               @YiboDing1998
