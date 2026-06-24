@@ -71,6 +71,10 @@ export class TraceService {
     const where = {
       deleted: false,
       fromID: query.authorId ? query.authorId : { in: visibleUserIds },
+      // PRIVATE is excluded for everyone but the author. PUBLIC isn't creatable
+      // via CreateTraceDto (FRIENDS_ONLY | PRIVATE only) but is honored here on
+      // purpose, so legacy / other-origin PUBLIC rows still surface — do not
+      // drop the branch without a data backfill.
       OR: [
         { fromID: userId },
         { visibility: 'FRIENDS_ONLY' as const },
@@ -123,6 +127,14 @@ export class TraceService {
 
     const items = traces.map((trace) =>
       this.toTraceDto(trace, userId, friendIdSet, likedTraceIds),
+    );
+
+    // Feed query dimensions — helps diagnose "I can't see X's moments" reports
+    // (scope size vs. result count) without logging any content.
+    this.logger.debug(
+      `trace feed: viewer=${userId} authorId=${query.authorId ?? '-'} ` +
+        `visibleAuthors=${visibleUserIds.length} page=${page} ` +
+        `returned=${traces.length} total=${total}`,
     );
 
     return {
@@ -426,19 +438,17 @@ export class TraceService {
     authorIds: string[],
     friendIdSet: Set<string>,
   ): Promise<string[]> {
-    const checks = await Promise.all(
-      authorIds.map(async (authorId) => ({
-        authorId,
-        visible: await this.privacySettings.canViewMoments(
-          authorId,
-          authorId === viewerId,
-          friendIdSet.has(authorId),
-        ),
-      })),
+    // One settings query for all authors instead of one per author (was an
+    // O(friends) N+1 on every feed page).
+    const settingsByAuthor =
+      await this.privacySettings.getSettingsMany(authorIds);
+    return authorIds.filter((authorId) =>
+      this.privacySettings.momentsVisibleFor(
+        settingsByAuthor.get(authorId),
+        authorId === viewerId,
+        friendIdSet.has(authorId),
+      ),
     );
-    return checks
-      .filter((check) => check.visible)
-      .map((check) => check.authorId);
   }
 
   private async requireVisibleTrace(traceId: string, viewerId: string) {

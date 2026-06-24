@@ -33,6 +33,9 @@ describe('TraceService', () => {
     friend: {
       findMany: jest.fn(),
     },
+    userPrivacySetting: {
+      findMany: jest.fn(),
+    },
     $transaction: jest.fn(async (input: any) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
@@ -48,12 +51,30 @@ describe('TraceService', () => {
   };
   const privacySettings = {
     canViewMoments: jest.fn(),
+    // Batched feed path: getSettingsMany loads rows, momentsVisibleFor decides.
+    getSettingsMany: jest.fn(),
+    momentsVisibleFor: jest.fn(
+      (
+        settings: { momentsVisibility?: string } | undefined,
+        isSelf: boolean,
+        isFriend: boolean,
+      ) => {
+        if (isSelf) return true;
+        const visibility = settings?.momentsVisibility ?? 'ALL';
+        if (visibility === 'PRIVATE') return false;
+        if (visibility === 'FRIENDS_ONLY') return isFriend;
+        return true;
+      },
+    ),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     privacySettings.canViewMoments.mockReset();
     privacySettings.canViewMoments.mockResolvedValue(true);
+    privacySettings.getSettingsMany.mockReset();
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    prisma.userPrivacySetting.findMany.mockResolvedValue([]);
     notificationService.createTraceCommentNotifications.mockResolvedValue([]);
     notificationService.createTraceLikeNotification.mockReset();
 
@@ -260,6 +281,27 @@ describe('TraceService', () => {
     expect(result.total).toBe(0);
     expect(result.hasMore).toBe(false);
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  it('excludes a friend who hides their moments from the feed scope (batched privacy check)', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-open' },
+      { userID: 'viewer-1', friendID: 'friend-private' },
+    ]);
+    // friend-private has momentsVisibility=PRIVATE; getSettingsMany surfaces it.
+    privacySettings.getSettingsMany.mockResolvedValue(
+      new Map([['friend-private', { momentsVisibility: 'PRIVATE' }]]),
+    );
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    const whereArg = prisma.trace.findMany.mock.calls[0][0].where;
+    expect(whereArg.fromID.in).toContain('viewer-1');
+    expect(whereArg.fromID.in).toContain('friend-open');
+    expect(whereArg.fromID.in).not.toContain('friend-private');
   });
 
   it('toggleLike increments likeCount atomically and returns the DB value', async () => {
