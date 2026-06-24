@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Application dependencies. Grouped so routine minor/patch bumps arrive as one
+  # PR instead of dozens; majors come separately so they get real review.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Keep the GitHub Actions used by our workflows current (and patched).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

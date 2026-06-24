@@ -1,0 +1,54 @@
+# Security scanning: secret detection (blocking) + dependency audit (advisory).
+# CodeQL is intentionally omitted: this repo is private, so CodeQL would require
+# paid GitHub Advanced Security. Revisit if GHAS is enabled or the repo is public.
+
+name: Security
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 6 * * 1" # weekly Monday 06:00 UTC full scan
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    name: "Secret scan (TruffleHog)"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so PR/push diffs can be scanned
+
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          # Only verified secrets fail the build → near-zero false positives.
+          extra_args: --only-verified
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    name: "Dependency audit (npm)"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # Advisory only for now: there is an existing high-severity backlog that
+      # Dependabot will chip away at. Flip `|| true` off to make it blocking once
+      # `npm audit --omit=dev --audit-level=high` is clean.
+      - name: npm audit (production deps, high+)
+        run: npm audit --omit=dev --audit-level=high || true
