@@ -61,51 +61,6 @@ enum NoteMediaType {
   VIDEO
 }
 
-enum ActionType {
-  NEW_SQUAD
-  JOIN_SQUAD
-  GOAL_COMPLETE
-  TRACE
-  POST
-}
-
-enum SquadType {
-  SELF
-  GROUP
-  CHAT
-}
-
-enum SquadStatus {
-  ACTIVE
-  DELETED
-  EXPIRED
-}
-
-enum SquadVisibility {
-  PUBLIC
-  PROTECTED
-  PRIVATE
-}
-
-enum AddPolicy {
-  OPEN
-  INVITE_ONLY
-  PAID_ONLY
-  CLOSED
-}
-
-enum MemberRole {
-  admin
-  member
-}
-
-enum SquadRequestState {
-  APPROVED
-  REJECTED
-  PENDING
-  EXPIRED
-}
-
 enum CirclePostStatus {
   ACTIVE
   DELETED
@@ -189,13 +144,6 @@ enum CircleInvitationVerifierStatus {
   REJECTED
 }
 
-enum EventStatus {
-  COMING
-  LIVE
-  FINISHED
-  CANCELED
-}
-
 enum TraceType {
   MOMENT
 }
@@ -226,38 +174,6 @@ enum NotificationType {
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
   CIRCLE_POST_SIGNUP_CREATED
-}
-
-enum MissionType {
-  DAILY
-  CONTENT
-  CREATIVE
-}
-
-enum MissionStatus {
-  DRAFT
-  PUBLISHED
-  RUNNING
-  COMPLETED
-  FAILED
-  ARCHIVED
-}
-
-enum CheckinCycle {
-  DAILY
-  WEEKLY
-  FLEXIBLE
-}
-
-enum CheckinStatus {
-  PASSED
-  FAILED
-  PENDING
-}
-
-enum ParticipantRole {
-  CREATOR
-  MEMBER
 }
 
 enum CallType {
@@ -331,32 +247,17 @@ model User {
   updatedAt                  DateTime   @updatedAt
 
   refreshTokens                RefreshToken[]
-  activities                   Activity[]
   friendsAsUser                Friend[]                    @relation("userFriends")
   friendsAsFriend              Friend[]                    @relation("userFriendsTo")
   blocksIssued                 Block[]                     @relation("blocker")
   blocksReceived               Block[]                     @relation("blocked")
-  squads                       Squad[]
-  squadMembers                 SquadMember[]
-  squadRequests                SquadRequest[]              @relation("fromUser")
-  squadRequestsReceived        SquadRequest[]              @relation("toUser")
   notifications                Notification[]              @relation("toUser")
   notificationsSent            Notification[]              @relation("fromUser")
   traces                       Trace[]
   traceComments                TraceComment[]
   traceLikeStats               traceLikeStat[]
-  traceViewedStats             traceViewedStat[]
   tracePreferences             UserTracePreference[]
   privacySetting               UserPrivacySetting?
-  badgesAuthored               BadgeTemplate[]
-  badgeSources                 BadgeSource[]
-  badgeInstances               BadgeInstance[]
-  userBadgeCounts              UserBadgeCount[]
-  missions                     Mission[]
-  missionParticipants          MissionParticipant[]
-  recommendFeedbacks           RecommendationFeedback[]
-  blockedContents              UserBlockedContent[]
-  tags                         TagOnUser[]
   wallet                       Wallet?
   coinTransactions             CoinTransaction[]
   coinGiftsSent                CoinGift[]                  @relation("giftSender")
@@ -684,18 +585,6 @@ model Block {
   @@index([blockedID])
 }
 
-model Activity {
-  id          String     @id @default(uuid())
-  type        ActionType
-  userID      String
-  description String?
-  metadata    Json?
-  createdAt   DateTime   @default(now())
-  user        User       @relation(fields: [userID], references: [id], onDelete: Cascade)
-
-  @@index([userID])
-}
-
 model CallSession {
   id              String          @id @default(uuid())
   conversationID  String
@@ -741,95 +630,6 @@ model CallParticipant {
   @@unique([callID, userID])
   @@index([userID, status])
   @@index([callID, status])
-}
-
-// ─── Squad ────────────────────────────────────────────────────────────────────
-
-model Squad {
-  id          String          @id @default(uuid())
-  name        String
-  groupType   SquadType       @default(GROUP)
-  status      SquadStatus     @default(ACTIVE)
-  avatar      String?
-  cover       String?
-  description String?
-  theme       String?
-  visibility  SquadVisibility @default(PUBLIC)
-  addPolicy   AddPolicy       @default(OPEN)
-  creatorID   String
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
-
-  creator       User           @relation(fields: [creatorID], references: [id])
-  members       SquadMember[]
-  squadRequests SquadRequest[]
-  events        Event[]
-  tags          TagOnSquad[]
-
-  @@index([creatorID])
-  @@index([visibility, status])
-}
-
-model SquadMember {
-  id          String     @id @default(uuid())
-  userID      String?
-  role        MemberRole @default(member)
-  nickname    String?
-  avatar      String?
-  cover       String?
-  context     Json       @default("{}")
-  fromSquadID String
-  height      Int?
-  deleted     Boolean    @default(false)
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
-
-  fromSquad Squad   @relation(fields: [fromSquadID], references: [id], onDelete: Cascade)
-  user      User?   @relation(fields: [userID], references: [id])
-  events    Event[]
-
-  @@index([userID, fromSquadID, deleted])
-}
-
-model Event {
-  id            String      @id @default(uuid())
-  name          String
-  description   String?
-  avatar        String?
-  cover         String?
-  start         DateTime
-  end           DateTime
-  metadata      Json        @default("{}")
-  status        EventStatus @default(LIVE)
-  deleted       Boolean     @default(false)
-  squadID       String
-  squadMemberID String
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt
-
-  squad   Squad       @relation(fields: [squadID], references: [id], onDelete: Cascade)
-  creator SquadMember @relation(fields: [squadMemberID], references: [id])
-
-  @@index([squadID, squadMemberID])
-}
-
-model SquadRequest {
-  id         String            @id @default(uuid())
-  fromUserID String?
-  content    String?
-  status     SquadRequestState @default(PENDING)
-  toSquadID  String?
-  toUserID   String?
-  createdAt  DateTime          @default(now())
-  updatedAt  DateTime          @updatedAt
-
-  fromUser      User?          @relation("fromUser", fields: [fromUserID], references: [id])
-  toSquad       Squad?         @relation(fields: [toSquadID], references: [id])
-  toUser        User?          @relation("toUser", fields: [toUserID], references: [id])
-  notifications Notification[]
-
-  @@index([fromUserID])
-  @@index([toSquadID])
 }
 
 // ─── Conversation Group ───────────────────────────────────────────────────────
@@ -890,11 +690,8 @@ model Trace {
   from          User                  @relation(fields: [fromID], references: [id], onDelete: Cascade)
   comments      TraceComment[]
   likeStats     traceLikeStat[]
-  viewedStats   traceViewedStat[]
   preferences   UserTracePreference[]
   notifications Notification[]
-  badgeSources  BadgeSource[]
-  tags          TagOnTrace[]
 
   @@index([fromID])
 }
@@ -938,18 +735,6 @@ model traceLikeStat {
   @@unique([traceID, userID])
 }
 
-model traceViewedStat {
-  id        String   @id @default(uuid())
-  traceID   String
-  userID    String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  trace     Trace    @relation(fields: [traceID], references: [id], onDelete: Cascade)
-  user      User     @relation(fields: [userID], references: [id], onDelete: Cascade)
-
-  @@unique([userID, traceID])
-}
-
 model UserTracePreference {
   id        String                  @id @default(uuid())
   userID    String
@@ -985,55 +770,6 @@ model UserPrivacySetting {
   user                       User     @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([userID])
-}
-
-// ─── Tag ──────────────────────────────────────────────────────────────────────
-
-model Tag {
-  id        String   @id @default(uuid())
-  name      String   @unique
-  metadata  Json     @default("{}")
-  deleted   Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  traceTags TagOnTrace[]
-  userTags  TagOnUser[]
-  squadTags TagOnSquad[]
-
-  @@index([name, deleted])
-}
-
-model TagOnTrace {
-  id        String   @id @default(uuid())
-  tagID     String
-  traceID   String
-  createdAt DateTime @default(now())
-  tag       Tag      @relation(fields: [tagID], references: [id], onDelete: Cascade)
-  trace     Trace    @relation(fields: [traceID], references: [id], onDelete: Cascade)
-}
-
-model TagOnUser {
-  id        String   @id @default(uuid())
-  tagID     String
-  userID    String?
-  order     Int      @default(0)
-  createdAt DateTime @default(now())
-  tag       Tag      @relation(fields: [tagID], references: [id], onDelete: Cascade)
-  user      User?    @relation(fields: [userID], references: [id])
-
-  @@index([userID, order])
-}
-
-model TagOnSquad {
-  id      String @id @default(uuid())
-  tagID   String
-  squadID String
-  order   Int    @default(0)
-  tag     Tag    @relation(fields: [tagID], references: [id], onDelete: Cascade)
-  squad   Squad  @relation(fields: [squadID], references: [id], onDelete: Cascade)
-
-  @@index([squadID, order])
 }
 
 // ─── Coin / Wallet ────────────────────────────────────────────────────────────
@@ -1155,7 +891,6 @@ model Notification {
   type             NotificationType
   toUserID         String?
   fromUserID       String
-  squadRequestID   String?
   fromTraceID      String?
   fromReplyID      String?
   toReplyID        String?
@@ -1167,7 +902,6 @@ model Notification {
 
   toUser         User?             @relation("toUser", fields: [toUserID], references: [id])
   fromUser       User              @relation("fromUser", fields: [fromUserID], references: [id])
-  squadRequest   SquadRequest?     @relation(fields: [squadRequestID], references: [id])
   fromTrace      Trace?            @relation(fields: [fromTraceID], references: [id])
   fromReply      TraceComment?     @relation("fromReply", fields: [fromReplyID], references: [id])
   toReply        TraceComment?     @relation("toReply", fields: [toReplyID], references: [id])
@@ -1177,169 +911,6 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
-}
-
-// ─── Badge ────────────────────────────────────────────────────────────────────
-
-model BadgeTemplate {
-  id           String   @id @default(uuid())
-  name         String   @unique
-  icon         String   @unique
-  description  String?
-  metadata     Json?
-  maximumCount Int      @default(100)
-  authorID     String
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-
-  author          User             @relation(fields: [authorID], references: [id])
-  badgeSources    BadgeSource[]
-  badgeInstances  BadgeInstance[]
-  userBadgeCounts UserBadgeCount[]
-}
-
-model BadgeSource {
-  id        String   @id @default(uuid())
-  parentID  String
-  traceID   String?
-  userID    String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  parent         BadgeTemplate   @relation(fields: [parentID], references: [id])
-  trace          Trace?          @relation(fields: [traceID], references: [id])
-  user           User            @relation(fields: [userID], references: [id])
-  badgeInstances BadgeInstance[]
-}
-
-model BadgeInstance {
-  id        String   @id @default(uuid())
-  metadata  Json?
-  sourceID  String
-  badgeID   String
-  userID    String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  fromBadge  BadgeTemplate @relation(fields: [badgeID], references: [id])
-  fromSource BadgeSource   @relation(fields: [sourceID], references: [id])
-  user       User          @relation(fields: [userID], references: [id])
-
-  @@index([userID, sourceID])
-}
-
-model UserBadgeCount {
-  id        String   @id @default(uuid())
-  badgeID   String
-  userID    String
-  count     Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  badge BadgeTemplate @relation(fields: [badgeID], references: [id])
-  user  User          @relation(fields: [userID], references: [id])
-
-  @@index([badgeID, userID])
-}
-
-// ─── Mission ──────────────────────────────────────────────────────────────────
-
-model Mission {
-  id           String        @id @default(uuid())
-  title        String
-  description  String
-  type         MissionType
-  status       MissionStatus
-  creatorId    String
-  squadId      String?
-  startDate    DateTime
-  endDate      DateTime?
-  checkinCycle CheckinCycle
-  metadata     Json          @default("{}")
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-
-  creator      User                 @relation(fields: [creatorId], references: [id])
-  checkins     MissionCheckin[]
-  participants MissionParticipant[]
-
-  @@index([creatorId])
-  @@index([squadId])
-  @@index([status])
-}
-
-model MissionCheckin {
-  id        String        @id @default(uuid())
-  missionId String
-  userId    String
-  status    CheckinStatus
-  content   String?
-  metadata  Json          @default("{}")
-  createdAt DateTime      @default(now())
-
-  mission Mission @relation(fields: [missionId], references: [id], onDelete: Cascade)
-
-  @@index([missionId])
-  @@index([userId])
-}
-
-model MissionParticipant {
-  id        String          @id @default(uuid())
-  missionId String
-  userId    String
-  role      ParticipantRole
-  joinedAt  DateTime        @default(now())
-
-  mission Mission @relation(fields: [missionId], references: [id], onDelete: Cascade)
-  user    User    @relation(fields: [userId], references: [id])
-
-  @@unique([missionId, userId])
-  @@index([missionId])
-  @@index([userId])
-}
-
-// ─── Infrastructure ───────────────────────────────────────────────────────────
-
-model ImageCaption {
-  id       String @id @default(uuid())
-  imageKey String @unique
-  caption  String
-
-  @@index([imageKey])
-}
-
-model RecommendationFeedback {
-  id           String   @id @default(uuid())
-  userID       String
-  targetType   String
-  targetId     String
-  feedbackType String
-  reason       String?
-  position     Int?
-  sessionId    String?
-  processed    Boolean  @default(false)
-  createdAt    DateTime @default(now())
-
-  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
-
-  @@index([userID, createdAt])
-  @@index([targetType, targetId])
-  @@index([processed, createdAt])
-}
-
-model UserBlockedContent {
-  id        String    @id @default(uuid())
-  userID    String
-  traceID   String?
-  creatorID String?
-  reason    String?
-  expiresAt DateTime?
-  createdAt DateTime  @default(now())
-
-  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
-
-  @@unique([userID, traceID])
-  @@index([userID, creatorID])
 }
 
 // ─── Circle Plaza ────────────────────────────────────────────────────────────
