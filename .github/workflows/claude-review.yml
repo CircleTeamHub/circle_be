@@ -12,6 +12,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# Cancel an in-progress review when the PR is updated again — saves a runner and
+# Anthropic tokens on rapid pushes.
+concurrency:
+  group: claude-review-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     runs-on: ubuntu-latest

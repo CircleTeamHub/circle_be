@@ -9,7 +9,11 @@ on:
       - opened
       - edited
       - reopened
-      - synchronize
+
+# The title can't change on a push, so cancel/skip redundant re-runs.
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   pull-requests: read
