@@ -31,6 +31,7 @@ import {
   SelectCircleIconDto,
   UploadCircleIconDto,
   SetCircleCoverDto,
+  SetCircleAvatarDto,
 } from './dto/circle.dto';
 
 @ApiTags('Circle')
@@ -131,5 +132,19 @@ export class CircleController {
     @Req() req: any,
   ) {
     return this.circleService.setCircleCover(req.user.userId, id, dto.cover);
+  }
+
+  @Post(':id/avatar')
+  @ApiOperation({ summary: 'Set the circle avatar image' })
+  setAvatar(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetCircleAvatarDto,
+    @Req() req: any,
+  ) {
+    return this.circleService.setCircleAvatar(
+      req.user.userId,
+      id,
+      dto.avatarUrl,
+    );
   }
 }

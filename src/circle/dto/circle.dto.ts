@@ -156,6 +156,14 @@ export class SetCircleCoverDto {
   cover: string;
 }
 
+export class SetCircleAvatarDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  avatarUrl: string;
+}
+
 export {
   UploadCircleIconDto,
   SelectCircleIconDto,

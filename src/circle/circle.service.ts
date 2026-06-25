@@ -445,6 +445,19 @@ export class CircleService {
     });
   }
 
+  async setCircleAvatar(
+    userId: string,
+    circleId: string,
+    avatarUrl: string,
+  ): Promise<void> {
+    await this.assertOwner(userId, circleId);
+    this.assertAvatarUrlIsSafe(avatarUrl);
+    await this.prisma.circle.update({
+      where: { id: circleId },
+      data: { avatarUrl },
+    });
+  }
+
   private async assertJoinRestrictions(
     userId: string,
     circle: {
