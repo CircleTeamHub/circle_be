@@ -173,6 +173,58 @@ export class TraceService {
     });
   }
 
+  // ─── Detail ──────────────────────────────────────────────────────────────────
+
+  async getTraceById(userId: string, traceId: string): Promise<TraceDto> {
+    // Authoritative access gate: throws NotFound (missing/deleted) or
+    // Forbidden (privacy) using the exact same rules as the like/comment paths.
+    await this.requireVisibleTrace(traceId, userId);
+
+    // Re-fetch with the feed's relation shape so the single-moment payload is
+    // identical to the TraceDto the list already renders. Comments are NOT
+    // capped here (unlike the feed preview): the detail view shows the full
+    // thread, while likedFriends stays a bounded names preview.
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+      include: {
+        from: { select: { id: true, nickname: true, avatarUrl: true } },
+        likeStats: {
+          where: { deleted: false },
+          orderBy: { updatedAt: 'desc' },
+          take: TRACE_FEED_LIKE_PREVIEW_LIMIT,
+          include: { user: { select: { id: true, nickname: true } } },
+        },
+        comments: {
+          where: { deleted: false },
+          include: {
+            user: { select: { id: true, nickname: true } },
+            replyTo: {
+              include: { user: { select: { id: true, nickname: true } } },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+    });
+
+    // requireVisibleTrace already proved it exists; this only guards the narrow
+    // window where it was soft-deleted between the two reads.
+    if (!trace) {
+      throw new NotFoundException('Moment not found');
+    }
+
+    const friendIdSet = new Set(await this.getAcceptedFriendIds(userId));
+
+    // Authoritative own-like state — the likeStats preview above is truncated.
+    const myLike = await this.prisma.traceLikeStat.findFirst({
+      where: { traceID: traceId, userID: userId, deleted: false },
+      select: { traceID: true },
+    });
+    const likedTraceIds = new Set(myLike ? [traceId] : []);
+
+    return this.toTraceDto(trace, userId, friendIdSet, likedTraceIds);
+  }
+
   // ─── Create / Delete ───────────────────────────────────────────────────────
 
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
@@ -391,7 +443,9 @@ export class TraceService {
       user: { id: comment.user.id, nickname: comment.user.nickname },
       replyTo: comment.replyTo
         ? {
-            id: comment.replyTo.user.id,
+            // Parent COMMENT id (the client threads replies by this), not the
+            // replied-to user id. `nickname` is the replied-to user.
+            id: comment.replyTo.id,
             nickname: comment.replyTo.user.nickname,
           }
         : null,
@@ -518,9 +572,12 @@ export class TraceService {
           id: c.id,
           content: c.content,
           user: { id: c.user.id, nickname: c.user.nickname },
+          // `id` MUST be the parent COMMENT id — the client threads replies by
+          // looking it up in a comment-id map. Using c.replyTo.user.id here made
+          // every reply look like its own root → flat, unthreaded comment list.
           replyTo:
             c.replyTo && c.replyTo.user
-              ? { id: c.replyTo.user.id, nickname: c.replyTo.user.nickname }
+              ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
               : null,
           createdAt: c.createdAt.toISOString(),
         }),
