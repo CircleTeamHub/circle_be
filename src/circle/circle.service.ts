@@ -431,6 +431,20 @@ export class CircleService {
     });
   }
 
+  async setCircleCover(
+    userId: string,
+    circleId: string,
+    cover: string,
+  ): Promise<void> {
+    await this.assertOwner(userId, circleId);
+    // Covers are uploaded to this app's storage; reject arbitrary URLs.
+    this.assertAvatarUrlIsSafe(cover);
+    await this.prisma.circle.update({
+      where: { id: circleId },
+      data: { cover },
+    });
+  }
+
   private async assertJoinRestrictions(
     userId: string,
     circle: {
@@ -513,6 +527,7 @@ export class CircleService {
       ownerID: circle.ownerID,
       currentIconAssetID: circle.currentIconAssetID ?? null,
       currentIconUrl: circle.currentIconAsset?.imageUrl ?? null,
+      cover: circle.cover ?? null,
       cities: circle.cities,
       isPublic: circle.isPublic,
       categories: circle.categories,

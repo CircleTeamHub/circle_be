@@ -148,6 +148,14 @@ export class MyCirclesQueryDto {
   tab: 'joined' | 'created' | 'applied';
 }
 
+export class SetCircleCoverDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  cover: string;
+}
+
 export {
   UploadCircleIconDto,
   SelectCircleIconDto,
@@ -163,6 +171,7 @@ export class CircleDto {
   ownerID: string;
   currentIconAssetID: string | null;
   currentIconUrl: string | null;
+  cover: string | null;
   cities: string[];
   isPublic: boolean;
   categories: string[];

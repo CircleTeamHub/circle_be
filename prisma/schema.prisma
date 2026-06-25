@@ -1349,6 +1349,7 @@ model Circle {
   name                  String
   description           String   @default("")
   avatarUrl             String?
+  cover                 String?
   ownerID               String
   currentIconAssetID    String?
   cities                String[] @default([])

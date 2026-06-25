@@ -30,6 +30,7 @@ import {
   MyCirclesQueryDto,
   SelectCircleIconDto,
   UploadCircleIconDto,
+  SetCircleCoverDto,
 } from './dto/circle.dto';
 
 @ApiTags('Circle')
@@ -120,5 +121,15 @@ export class CircleController {
     @Req() req: any,
   ) {
     return this.circleService.selectCircleIcon(req.user.userId, id, dto);
+  }
+
+  @Post(':id/cover')
+  @ApiOperation({ summary: 'Set the circle cover image' })
+  setCover(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetCircleCoverDto,
+    @Req() req: any,
+  ) {
+    return this.circleService.setCircleCover(req.user.userId, id, dto.cover);
   }
 }
