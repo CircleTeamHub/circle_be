@@ -16,18 +16,6 @@ import {
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-const CIRCLE_CATEGORIES = [
-  'LIFE',
-  'FOOD',
-  'SPORTS',
-  'SOCIAL',
-  'GAMING',
-  'PHOTOGRAPHY',
-  'WORK',
-  'TRADE',
-  'CUSTOM',
-] as const;
-
 const MY_CIRCLE_TABS = ['joined', 'created', 'applied'] as const;
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
@@ -43,7 +31,10 @@ export class CreateCircleDto {
   @ApiProperty({ type: [String] })
   @IsArray()
   @IsString({ each: true })
-  @IsIn(CIRCLE_CATEGORIES, { each: true })
+  // Free-form categories: the 8 preset keys (lowercase, from the client i18n
+  // map) plus arbitrary user-entered custom labels. No fixed allowlist — just
+  // bound the count and per-item length so the payload stays sane.
+  @MaxLength(20, { each: true })
   @ArrayUnique()
   @ArrayMaxSize(5)
   categories: string[];
