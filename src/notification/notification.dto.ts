@@ -16,11 +16,6 @@ export type NotificationRealtimeDto = {
     firstImage: string | null;
   } | null;
   fromInvitation: { id: string; status: string } | null;
-  squadRequest: {
-    id: string;
-    status: string;
-    squad: { id: string; name: string } | null;
-  } | null;
 };
 
 export const NOTIFICATION_REALTIME_INCLUDE = {
@@ -30,13 +25,6 @@ export const NOTIFICATION_REALTIME_INCLUDE = {
   fromCircle: { select: { id: true, name: true } },
   fromCirclePost: { select: { id: true, content: true, images: true } },
   fromInvitation: { select: { id: true, status: true } },
-  squadRequest: {
-    select: {
-      id: true,
-      status: true,
-      toSquad: { select: { id: true, name: true } },
-    },
-  },
 } as const;
 
 export type NotificationRealtimeRow = Prisma.NotificationGetPayload<{
@@ -81,18 +69,6 @@ export function mapNotificationRealtimeDto(
       : null,
     fromInvitation: n.fromInvitation
       ? { id: n.fromInvitation.id, status: n.fromInvitation.status }
-      : null,
-    squadRequest: n.squadRequest
-      ? {
-          id: n.squadRequest.id,
-          status: n.squadRequest.status,
-          squad: n.squadRequest.toSquad
-            ? {
-                id: n.squadRequest.toSquad.id,
-                name: n.squadRequest.toSquad.name,
-              }
-            : null,
-        }
       : null,
   };
 }

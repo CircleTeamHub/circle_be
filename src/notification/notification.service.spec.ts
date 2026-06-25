@@ -89,59 +89,6 @@ describe('NotificationService', () => {
   });
 
   describe('notification center', () => {
-    it('creates squad request notifications with realtime payload context', async () => {
-      prisma.notification.create.mockResolvedValue({
-        id: 'n-squad-1',
-        type: NotificationType.SQUAD_REQUEST_RECEIVED,
-        content: 'join',
-        read: false,
-        createdAt: new Date('2026-06-05T00:00:00Z'),
-        toUserID: 'owner-1',
-        fromUser: { id: 'user-2', nickname: 'B', avatarUrl: null },
-        fromTrace: null,
-        fromReply: null,
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-        squadRequest: {
-          id: 'request-1',
-          status: 'PENDING',
-          toSquad: { id: 'squad-1', name: 'Running Club' },
-        },
-      });
-
-      const result = await service.createSquadRequestNotification({
-        type: NotificationType.SQUAD_REQUEST_RECEIVED,
-        toUserId: 'owner-1',
-        fromUserId: 'user-2',
-        squadRequestId: 'request-1',
-        content: 'join',
-      });
-
-      expect(prisma.notification.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: {
-            toUserID: 'owner-1',
-            fromUserID: 'user-2',
-            type: NotificationType.SQUAD_REQUEST_RECEIVED,
-            squadRequestID: 'request-1',
-            content: 'join',
-          },
-        }),
-      );
-      expect(result).toEqual(
-        expect.objectContaining({
-          id: 'n-squad-1',
-          type: NotificationType.SQUAD_REQUEST_RECEIVED,
-          squadRequest: {
-            id: 'request-1',
-            status: 'PENDING',
-            squad: { id: 'squad-1', name: 'Running Club' },
-          },
-        }),
-      );
-    });
-
     it('deduplicates repeated trace-like notifications inside the cooldown window', async () => {
       prisma.notification.findFirst.mockResolvedValue({
         id: 'existing-like',
@@ -210,7 +157,6 @@ describe('NotificationService', () => {
         fromCircle: null,
         fromCirclePost: null,
         fromInvitation: null,
-        squadRequest: null,
       });
     });
 

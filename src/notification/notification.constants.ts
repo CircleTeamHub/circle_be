@@ -5,9 +5,6 @@ import { NotificationType } from 'src/generated/prisma';
  * notice: trace comments/replies plus circle verification/invitation events.
  */
 export const DISCOVER_NOTIFICATION_TYPES = [
-  NotificationType.SQUAD_REQUEST_RECEIVED,
-  NotificationType.SQUAD_REQUEST_ACCEPTED,
-  NotificationType.SQUAD_REQUEST_REJECTED,
   NotificationType.FRIEND_REQUEST_RECEIVED,
   NotificationType.FRIEND_REQUEST_ACCEPTED,
   NotificationType.FRIEND_REQUEST_REJECTED,
