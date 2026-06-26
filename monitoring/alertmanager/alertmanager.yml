@@ -1,19 +1,15 @@
 route:
-  receiver: default
+  receiver: discord
   group_by: ["alertname"]
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
 
 receivers:
-  # Default no-op receiver. Alerts are visible in the Alertmanager UI (:9093).
-  #
-  # To push to 飞书 (Feishu/Lark): Alertmanager's webhook JSON differs from
-  # Feishu's card format, so point this at a small converter (the backend's
-  # ops-alert pattern, or a tool like prometheus-webhook-dingtalk) rather than
-  # the raw Feishu webhook. Then uncomment:
-  #
-  # webhook_configs:
-  #   - url: "http://host.docker.internal:<converter-port>/feishu"
-  #     send_resolved: true
-  - name: default
+  - name: discord
+    # Native Discord support (Alertmanager >= 0.25). The webhook URL is read from
+    # a gitignored file so it never lands in the repo — create it from
+    # discord.url.example and put your Discord channel webhook in it.
+    discord_configs:
+      - webhook_url_file: /etc/alertmanager/discord.url
+        send_resolved: true

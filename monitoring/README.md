@@ -15,6 +15,7 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Grafana | http://localhost:3001 | admin / admin |
 | Prometheus | http://localhost:9090 | — |
 | Alertmanager | http://localhost:9093 | — |
+| Uptime-Kuma | http://localhost:3002 | set on first visit |
 
 In Grafana the **Prometheus** datasource and the **circle_be — RED** dashboard
 are auto-provisioned (Dashboards → circle_be — RED).
@@ -49,10 +50,43 @@ Then check **Prometheus → Status → Targets** — `circle-be` should be **UP*
   and its scrape job; the rest is unaffected.
 - **OpenIM metrics:** a commented scrape job is in `prometheus/prometheus.yml`;
   enable it once you confirm OpenIM's metrics port for your version.
-- **Alerts → 飞书:** `alertmanager/alertmanager.yml` has a no-op receiver plus
-  instructions. Alertmanager's JSON differs from Feishu's card format, so route
-  through a small converter (the backend `ops-alert` pattern) rather than the raw
-  Feishu webhook.
+
+## Alerts → Discord
+
+Alertmanager has a native Discord receiver (no converter needed). The webhook
+URL is read from a **gitignored** `alertmanager/discord.url`.
+
+1. In Discord: **Server Settings → Integrations → Webhooks → New Webhook**, pick
+   a channel, **Copy Webhook URL**.
+2. Put it in the file (one line, no quotes):
+   ```bash
+   cp monitoring/alertmanager/discord.url.example monitoring/alertmanager/discord.url
+   # then paste your webhook URL into discord.url
+   ```
+3. Reload Alertmanager:
+   ```bash
+   docker compose -f monitoring/docker-compose.yml restart alertmanager
+   ```
+
+Test it fires by posting a throwaway alert to Alertmanager's API:
+```bash
+curl -XPOST http://localhost:9093/api/v2/alerts -H 'Content-Type: application/json' \
+  -d '[{"labels":{"alertname":"DiscordTest","severity":"critical"}}]'
+```
+
+## Uptime monitoring (Uptime-Kuma)
+
+Covers the gap Prometheus can't: **"is the service even reachable?"** Configured
+in its own UI (data persists in a volume).
+
+1. Open **http://localhost:3002**, create the admin account (first visit).
+2. **Add New Monitor** for each thing to watch, e.g.:
+   - Backend — `http://host.docker.internal:3000/metrics` (HTTP, accept 200)
+   - Grafana — `http://grafana:3000` · Prometheus — `http://prometheus:9090/-/healthy`
+   - OpenIM / your public API URL
+3. **Settings → Notifications → Setup Notification → Discord**, paste the same
+   webhook URL → assign it to the monitors. Uptime-Kuma pings Discord directly
+   (no Alertmanager involved).
 
 ## Production
 

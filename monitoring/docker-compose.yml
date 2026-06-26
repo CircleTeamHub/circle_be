@@ -60,7 +60,8 @@ services:
     container_name: circle-alertmanager
     restart: unless-stopped
     volumes:
-      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Mount the whole dir so alertmanager.yml can read the gitignored discord.url.
+      - ./alertmanager:/etc/alertmanager:ro
     ports:
       - "9093:9093"
 
@@ -81,6 +82,21 @@ services:
     depends_on:
       - prometheus
 
+  # Uptime monitoring — pings endpoints and alerts when something is DOWN
+  # (the gap Prometheus can't cover: "is the service even reachable?"). Monitors
+  # + Discord notifications are configured in its own web UI (data in a volume).
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: circle-uptime-kuma
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - uptime_kuma_data:/app/data
+    ports:
+      - "3002:3001" # Uptime-Kuma listens on 3001 in-container → host 3002
+
 volumes:
   prometheus_data:
   grafana_data:
+  uptime_kuma_data:
