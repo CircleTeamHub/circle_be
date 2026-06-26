@@ -77,12 +77,55 @@ export function buildNestFactoryOptions() {
   };
 }
 
+/** The slice of the Nest app the shutdown handler needs — keeps it unit-testable. */
+export interface ClosableApp {
+  close(): Promise<void>;
+}
+
+/** The slice of the error-aggregation provider the shutdown handler needs. */
+export interface FlushableAggregation {
+  flush(timeoutMs?: number): Promise<boolean>;
+}
+
+/**
+ * Builds an idempotent graceful-shutdown handler. On the first signal it closes
+ * the Nest app (draining in-flight requests, running module-destroy hooks) and
+ * then flushes buffered error aggregation (e.g. Sentry) so 5xx errors captured
+ * just before a SIGTERM/restart are not lost. The flush runs even if close
+ * throws, and the process exits afterwards regardless.
+ */
+export function createGracefulShutdownHandler(
+  app: ClosableApp,
+  errorAggregation: FlushableAggregation,
+  onExit: () => void = () => process.exit(0),
+  flushTimeoutMs = 2000,
+): () => Promise<void> {
+  let shuttingDown = false;
+  return async () => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    try {
+      await app.close();
+    } catch {
+      // Ignore close errors — still attempt to flush buffered errors below.
+    } finally {
+      try {
+        await errorAggregation.flush(flushTimeoutMs);
+      } finally {
+        onExit();
+      }
+    }
+  };
+}
+
 async function bootstrap() {
   const config = getServerConfig();
   const isProduction = process.env.NODE_ENV === 'production';
 
   const app = await NestFactory.create(AppModule, buildNestFactoryOptions());
-  setupApp(app);
+  const errorAggregation = setupApp(app);
 
   if (!isProduction) {
     const swaggerConfig = new DocumentBuilder()
@@ -103,6 +146,11 @@ async function bootstrap() {
 
   const port = resolveAppPort(config['APP_PORT'] ?? 3000);
   await app.listen(port);
+
+  // Drain and flush buffered error aggregation on orchestrator shutdown.
+  const shutdown = createGracefulShutdownHandler(app, errorAggregation);
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 if (require.main === module) {

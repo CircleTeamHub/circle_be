@@ -112,6 +112,29 @@ describe('ErrorLoggingInterceptor', () => {
     );
   });
 
+  it('still propagates the original error when aggregation.captureError throws', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const aggregation = createAggregationSpy();
+    (aggregation.captureError as jest.Mock).mockImplementation(() => {
+      throw new Error('sentry SDK blew up');
+    });
+    const interceptor = new ErrorLoggingInterceptor(logger as any, aggregation);
+    const error = new Error('database exploded');
+    const next = { handle: () => throwError(() => error) };
+
+    // The ORIGINAL error must reach the caller, not the telemetry error.
+    await expect(
+      runWithRequestContext(requestContext, () =>
+        lastValueFrom(interceptor.intercept({} as any, next)),
+      ),
+    ).rejects.toBe(error);
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      'HttpError',
+    );
+  });
+
   it('does not forward expected 4xx errors to error aggregation', async () => {
     const logger = { error: jest.fn(), warn: jest.fn() };
     const aggregation = createAggregationSpy();

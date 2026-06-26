@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { normalizeRoute } from './route-normalizer';
+import { normalizeRoute, limitRouteCardinality } from './route-normalizer';
 import type { Metrics } from './metrics.service';
 
 /** The scrape endpoint records nothing about itself (avoids self-referential noise). */
@@ -22,7 +22,7 @@ export function createHttpMetricsMiddleware(metrics: Metrics) {
       const durationSeconds = Number(process.hrtime.bigint() - startNs) / 1e9;
       metrics.recordHttpRequest({
         method: req.method,
-        route: normalizeRoute(req.path),
+        route: limitRouteCardinality(normalizeRoute(req.path)),
         statusCode: res.statusCode,
         durationSeconds,
       });

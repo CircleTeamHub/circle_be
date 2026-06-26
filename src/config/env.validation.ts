@@ -53,6 +53,9 @@ export function createEnvValidationSchema(
     SENTRY_DSN: Joi.string().uri().optional(),
     SENTRY_ENVIRONMENT: Joi.string().optional(),
     SENTRY_RELEASE: Joi.string().optional(),
+    // When set, /metrics requires `Authorization: Bearer <token>`. Leave unset
+    // only when the metrics port is reachable from a trusted network alone.
+    METRICS_AUTH_TOKEN: Joi.string().optional(),
     APP_PORT: Joi.number().integer().min(0).max(65535).default(3000),
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
