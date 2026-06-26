@@ -9,6 +9,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  IsUrl,
   Max,
   MaxLength,
   Min,
@@ -17,6 +18,10 @@ import {
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 const MY_CIRCLE_TABS = ['joined', 'created', 'applied'] as const;
+const URL_VALIDATION_OPTIONS = {
+  require_protocol: true,
+  require_tld: false,
+} as const;
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -152,6 +157,7 @@ export class SetCircleCoverDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   @MaxLength(500)
   cover: string;
 }
@@ -160,6 +166,7 @@ export class SetCircleAvatarDto {
   @ApiProperty()
   @IsString()
   @IsNotEmpty()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   @MaxLength(500)
   avatarUrl: string;
 }

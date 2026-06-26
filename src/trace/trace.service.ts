@@ -22,6 +22,7 @@ import {
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
+const TRACE_DETAIL_COMMENT_LIMIT = 100;
 
 @Injectable()
 export class TraceService {
@@ -181,9 +182,9 @@ export class TraceService {
     await this.requireVisibleTrace(traceId, userId);
 
     // Re-fetch with the feed's relation shape so the single-moment payload is
-    // identical to the TraceDto the list already renders. Comments are NOT
-    // capped here (unlike the feed preview): the detail view shows the full
-    // thread, while likedFriends stays a bounded names preview.
+    // identical to the TraceDto the list already renders. The detail endpoint
+    // uses a higher comment cap than the feed preview to avoid unbounded
+    // response/DB work on hot moments.
     const trace = await this.prisma.trace.findFirst({
       where: { id: traceId, deleted: false },
       include: {
@@ -203,6 +204,7 @@ export class TraceService {
             },
           },
           orderBy: { createdAt: 'desc' },
+          take: TRACE_DETAIL_COMMENT_LIMIT,
         },
       },
     });

@@ -60,10 +60,18 @@ type NoteContentBlock = {
   children?: NoteContentBlock[];
 };
 
-function toPrismaJson(value: NoteContentBlock[] | null | undefined) {
-  if (value === undefined) return undefined;
-  if (value === null) return Prisma.DbNull;
-  return value as Prisma.InputJsonValue;
+function toPrismaJson(
+  value: NoteContentBlock[] | null | undefined,
+): Prisma.InputJsonValue | typeof Prisma.DbNull | undefined {
+  let result: Prisma.InputJsonValue | typeof Prisma.DbNull | undefined;
+  if (value === undefined) {
+    result = undefined;
+  } else if (value === null) {
+    result = Prisma.DbNull;
+  } else {
+    result = value as Prisma.InputJsonValue;
+  }
+  return result;
 }
 
 // ── Typed row shapes returned by queries that use NOTE_INCLUDE ────────────────
@@ -219,7 +227,11 @@ export class NoteService {
       this.config.get<string>('NOTE_SHARE_WEB_BASE') ??
       this.config.get<string>('TEMP_CHAT_WEB_BASE') ??
       '';
-    return `${base.replace(/\/+$/, '')}/s/${token}`;
+    let trimmedBase = base;
+    while (trimmedBase.endsWith('/')) {
+      trimmedBase = trimmedBase.slice(0, -1);
+    }
+    return `${trimmedBase}/s/${token}`;
   }
 
   private assertMediaOwnership(ownerID: string, media: CreateNoteDto['media']) {
@@ -392,6 +404,8 @@ export class NoteService {
       id: membership.group.id,
       name: membership.group.name,
     }));
+    const fallbackCoverMedia = note.media?.[0] ?? null;
+    const coverMedia = note.coverMedia ?? fallbackCoverMedia;
 
     return {
       id: note.id,
@@ -403,19 +417,13 @@ export class NoteService {
       available: note.available,
       pinned: note.pinned,
       groups,
-      cover: note.coverMedia
+      cover: coverMedia
         ? {
-            id: note.coverMedia.id,
-            type: note.coverMedia.type,
-            url: note.coverMedia.url,
+            id: coverMedia.id,
+            type: coverMedia.type,
+            url: coverMedia.url,
           }
-        : note.media?.[0]
-          ? {
-              id: note.media[0].id,
-              type: note.media[0].type,
-              url: note.media[0].url,
-            }
-          : null,
+        : null,
       imageCount: note.imageCount,
       videoCount: note.videoCount,
       mediaCount: note.mediaCount,
@@ -473,7 +481,10 @@ export class NoteService {
         ...item,
       }));
 
-    const coverMediaID = media[0]?.id ?? null;
+    // Cover is the first image. Videos don't get thumbnails, so a video-only
+    // note simply has no cover rather than an unrenderable (mp4) one.
+    const coverMediaID =
+      media.find((item) => item.type === 'IMAGE')?.id ?? null;
     const counts = this.buildMediaStats(media);
 
     const created = await this.prisma.$transaction(async (tx) => {
@@ -688,7 +699,10 @@ export class NoteService {
         id: randomUUID(),
         ...item,
       }));
-    const coverMediaID = media[0]?.id ?? null;
+    // Cover is the first image. Videos don't get thumbnails, so a video-only
+    // note simply has no cover rather than an unrenderable (mp4) one.
+    const coverMediaID =
+      media.find((item) => item.type === 'IMAGE')?.id ?? null;
     const counts = this.buildMediaStats(media);
 
     const updated = await this.prisma.$transaction(async (tx) => {

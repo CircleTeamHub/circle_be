@@ -173,6 +173,32 @@ describe('TraceService', () => {
     expect(result.comments).toHaveLength(1);
   });
 
+  it('getTraceById caps loaded comments to protect the detail endpoint', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hello world',
+      images: [],
+      likeCount: 0,
+      replyCount: 250,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
+      likeStats: [],
+      comments: [],
+    });
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'author-1' },
+    ]);
+    prisma.traceLikeStat.findFirst.mockResolvedValue(null);
+
+    await service.getTraceById('viewer-1', 'trace-1');
+
+    const detailQuery = prisma.trace.findFirst.mock.calls[1][0];
+    expect(detailQuery.include.comments.take).toBe(100);
+  });
+
   it('getTraceById throws NotFound when the moment is missing or deleted', async () => {
     prisma.trace.findFirst.mockResolvedValue(null);
 

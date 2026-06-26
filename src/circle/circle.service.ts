@@ -65,12 +65,16 @@ export class CircleService {
     }
 
     this.assertAvatarUrlIsSafe(dto.avatarUrl);
+    const categories = this.normalizeStringList(
+      dto.categories ?? [],
+      'category',
+    );
 
     const circle = await this.prisma.$transaction(async (tx) => {
       const created = await tx.circle.create({
         data: {
           name: dto.name,
-          categories: dto.categories ?? [],
+          categories,
           description: dto.description,
           avatarUrl: dto.avatarUrl ?? null,
           ownerID: userId,
@@ -503,6 +507,17 @@ export class CircleService {
         'A fancy number is required to join this circle',
       );
     }
+  }
+
+  private normalizeStringList(values: string[], label: string): string[] {
+    const normalized = values.map((value) => value.trim());
+    if (normalized.some((value) => value.length === 0)) {
+      throw new BadRequestException(`${label} must not be blank`);
+    }
+    if (new Set(normalized).size !== normalized.length) {
+      throw new BadRequestException(`${label} must be unique`);
+    }
+    return normalized;
   }
 
   private isRetryableTransactionError(error: unknown): boolean {
