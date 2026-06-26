@@ -1,0 +1,86 @@
+# Local observability stack for circle_be.
+#
+# Scrapes the backend /metrics endpoint + host/container metrics, visualizes in
+# Grafana, and routes alerts via Alertmanager.
+#
+# Run:  docker compose -f monitoring/docker-compose.yml up -d
+# Stop: docker compose -f monitoring/docker-compose.yml down
+#
+# Images are :latest for an easy local start — pin explicit versions for prod.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: circle-prometheus
+    restart: unless-stopped
+    # Lets Prometheus reach the backend running on the HOST (npm run start:dev).
+    # Works on Docker Desktop; extra_hosts makes it work on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: circle-node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      # Plain :ro (no rslave) — Docker Desktop for Mac rejects slave propagation
+      # on "/". On a Linux server you may prefer "/:/host:ro,rslave".
+      - "/:/host:ro"
+    # No host port — Prometheus scrapes it over the compose network (node-exporter:9100).
+    # NOTE on macOS: this measures the Docker Desktop Linux VM, not macOS itself.
+    # On a real Linux server it measures the host. Good enough to test the pipeline.
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: circle-cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - "/:/rootfs:ro"
+      - "/var/run:/var/run:ro"
+      - "/sys:/sys:ro"
+      - "/var/lib/docker/:/var/lib/docker:ro"
+    # No host port — scraped internally as cadvisor:8080.
+    # NOTE: cAdvisor can be flaky on Docker Desktop for Mac. If it crash-loops,
+    # comment this service out + its scrape job — the rest of the stack is fine.
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: circle-alertmanager
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: circle-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000" # host 3001 → avoids clash with the backend on 3000
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
