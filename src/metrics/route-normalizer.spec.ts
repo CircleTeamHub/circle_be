@@ -23,6 +23,30 @@ describe('normalizeRoute', () => {
     );
   });
 
+  it('collapses temp-chat link tokens instead of exposing them as metric labels', () => {
+    expect(
+      normalizeRoute(
+        '/api/v1/temp-chat/by-token/eyJhbGciOiJIUzI1NiJ9.secret.signature/meta',
+      ),
+    ).toBe('/api/v1/temp-chat/by-token/:token/meta');
+    expect(
+      normalizeRoute(
+        '/api/v1/temp-chat/by-token/eyJhbGciOiJIUzI1NiJ9.secret.signature/join',
+      ),
+    ).toBe('/api/v1/temp-chat/by-token/:token/join');
+  });
+
+  it('collapses OpenIM string ids used in group and chat-history routes', () => {
+    expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
+      '/api/v1/group/:groupID/members/:userID',
+    );
+    expect(
+      normalizeRoute(
+        '/api/v1/chat-history/conversations/si_user-a_user-b/messages',
+      ),
+    ).toBe('/api/v1/chat-history/conversations/:conversationID/messages');
+  });
+
   it('leaves fully static routes unchanged', () => {
     expect(normalizeRoute('/api/v1/auth/login')).toBe('/api/v1/auth/login');
   });
