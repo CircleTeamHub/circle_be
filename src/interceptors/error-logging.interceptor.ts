@@ -10,12 +10,19 @@ import { Observable, catchError, throwError } from 'rxjs';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { getRequestContext } from '../logging/request-context';
 import { logSecurityEvent } from '../logging/security-event.logger';
+import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
+
+/** Status codes at or above this are unexpected server errors worth aggregating. */
+const SERVER_ERROR_THRESHOLD = 500;
 
 @Injectable()
 export class ErrorLoggingInterceptor implements NestInterceptor {
   private readonly loggingConfig = createLoggingConfig();
 
-  constructor(private readonly logger: LoggerService) {}
+  constructor(
+    private readonly logger: LoggerService,
+    private readonly errorAggregation?: ErrorAggregationProvider,
+  ) {}
 
   intercept(
     _context: ExecutionContext,
@@ -52,6 +59,19 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
             statusCode,
             reason: errorObject?.message ?? String(error),
+          });
+        }
+
+        // Forward only unexpected server errors to optional aggregation
+        // (Sentry). Expected 4xx client errors are never sent.
+        if (statusCode >= SERVER_ERROR_THRESHOLD) {
+          this.errorAggregation?.captureError(error, {
+            statusCode,
+            requestId: requestContext?.requestId,
+            traceId: requestContext?.traceId,
+            method: requestContext?.method,
+            path: requestContext?.path,
+            userId: requestContext?.userId,
           });
         }
 

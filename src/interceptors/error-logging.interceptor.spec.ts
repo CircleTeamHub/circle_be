@@ -2,6 +2,25 @@ import { HttpException, HttpStatus } from '@nestjs/common';
 import { lastValueFrom, throwError } from 'rxjs';
 import { ErrorLoggingInterceptor } from './error-logging.interceptor';
 import { runWithRequestContext } from '../logging/request-context';
+import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
+
+function createAggregationSpy(): ErrorAggregationProvider {
+  return {
+    name: 'sentry',
+    captureError: jest.fn(),
+    flush: jest.fn().mockResolvedValue(true),
+  };
+}
+
+const requestContext = {
+  requestId: 'req-1',
+  traceId: 'req-1',
+  method: 'POST',
+  path: '/api/v1/secure',
+  ip: '127.0.0.1',
+  userAgent: 'jest',
+  userId: 'user-1',
+};
 
 describe('ErrorLoggingInterceptor', () => {
   const originalEnv = process.env;
@@ -65,5 +84,62 @@ describe('ErrorLoggingInterceptor', () => {
       }),
       'SecurityEvent',
     );
+  });
+
+  it('forwards unexpected 5xx errors to error aggregation with request context', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const aggregation = createAggregationSpy();
+    const interceptor = new ErrorLoggingInterceptor(logger as any, aggregation);
+    const error = new Error('database exploded');
+    const next = { handle: () => throwError(() => error) };
+
+    await expect(
+      runWithRequestContext(requestContext, () =>
+        lastValueFrom(interceptor.intercept({} as any, next)),
+      ),
+    ).rejects.toBe(error);
+
+    expect(aggregation.captureError).toHaveBeenCalledTimes(1);
+    expect(aggregation.captureError).toHaveBeenCalledWith(
+      error,
+      expect.objectContaining({
+        statusCode: 500,
+        requestId: 'req-1',
+        method: 'POST',
+        path: '/api/v1/secure',
+        userId: 'user-1',
+      }),
+    );
+  });
+
+  it('does not forward expected 4xx errors to error aggregation', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const aggregation = createAggregationSpy();
+    const interceptor = new ErrorLoggingInterceptor(logger as any, aggregation);
+    const error = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
+    const next = { handle: () => throwError(() => error) };
+
+    await expect(
+      runWithRequestContext(requestContext, () =>
+        lastValueFrom(interceptor.intercept({} as any, next)),
+      ),
+    ).rejects.toBe(error);
+
+    expect(aggregation.captureError).not.toHaveBeenCalled();
+  });
+
+  it('works without an aggregation provider (optional dependency)', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const interceptor = new ErrorLoggingInterceptor(logger as any);
+    const error = new Error('boom');
+    const next = { handle: () => throwError(() => error) };
+
+    await expect(
+      runWithRequestContext(requestContext, () =>
+        lastValueFrom(interceptor.intercept({} as any, next)),
+      ),
+    ).rejects.toBe(error);
+
+    expect(logger.error).toHaveBeenCalled();
   });
 });

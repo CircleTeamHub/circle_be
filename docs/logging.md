@@ -6,7 +6,7 @@ This project uses NestJS logging through `nest-winston`. The current implementat
 - Keep unit tests quiet by default.
 - Avoid logging secrets or request/response bodies.
 
-Production-only work such as structured JSON logs, persistent audit logs, Sentry/Datadog/Loki/CloudWatch aggregation, and formal retention policies is intentionally deferred.
+Production-only work such as structured JSON logs, persistent audit logs, Datadog/Loki/CloudWatch aggregation, and formal retention policies is intentionally deferred. Optional **Sentry** error aggregation is available — see [Error Aggregation (Sentry)](#error-aggregation-sentry).
 
 ## Environment Defaults
 
@@ -95,3 +95,40 @@ Access logs record the route path without query values. Error logs record error 
 5. If duration is high, check for `http_slow`.
 6. If a write failed due to repeated calls, check for `rate_limit_hit`.
 7. If OpenIM or MinIO failed, check for `external_call_failed`.
+
+## Error Aggregation (Sentry)
+
+Unhandled server errors can optionally be forwarded to Sentry for aggregation.
+It is **disabled by default** and provider-neutral: the app talks to an
+`ErrorAggregationProvider` interface (`src/logging/error-aggregation.service.ts`),
+so Datadog/Loki/CloudWatch can be added later behind the same interface without
+changing call sites.
+
+### What is sent
+
+- Only **unhandled 5xx** errors (the same path that logs `http_error`). Expected
+  4xx validation/auth errors are never sent.
+- **Sanitized tags only**: `requestId`, `traceId`, `method`, `path`, `statusCode`,
+  plus `userId` when known. Never request bodies, headers, cookies, or tokens —
+  the same Safe Logging Policy above applies.
+
+### How to enable in production
+
+1. Create a Sentry project (self-hosted or sentry.io) and copy its DSN.
+2. Set the following in `.env.production`:
+
+   ```
+   LOG_AGGREGATION_PROVIDER=sentry
+   SENTRY_DSN=https://<public-key>@<host>/<project-id>
+   SENTRY_ENVIRONMENT=production   # optional, defaults to NODE_ENV
+   SENTRY_RELEASE=circle-be@1.0.0  # optional, for release health
+   ```
+
+3. Restart the backend. `Sentry.init()` runs once at boot, inside `setupApp`.
+
+If `LOG_AGGREGATION_PROVIDER` is unset or `none`, or `SENTRY_DSN` is missing, the
+provider is a no-op — `@sentry/node` is never loaded and nothing is sent.
+
+> Capture happens in `ErrorLoggingInterceptor`, which is only registered when
+> `LOG_ON` and `HTTP_LOG_ON` are enabled (the production default). With HTTP
+> logging off, errors are still logged by the global filter but not aggregated.
