@@ -143,6 +143,35 @@ describe('SentryErrorAggregationProvider', () => {
     );
   });
 
+  it('normalizes the path tag so link tokens and ids never reach Sentry', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+
+    provider.captureError(new Error('boom'), {
+      statusCode: 500,
+      path: '/api/v1/temp-chat/by-token/eyJhbGciOiJIUzI1NiJ9.secret.sig/join',
+    });
+
+    const [, captureContext] = client.captureException.mock.calls[0];
+    expect(captureContext.tags.path).toBe(
+      '/api/v1/temp-chat/by-token/:token/join',
+    );
+    expect(captureContext.tags.path).not.toContain('secret');
+  });
+
+  it('collapses id segments in the path tag (bounds Sentry tag cardinality)', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+
+    provider.captureError(new Error('boom'), {
+      statusCode: 500,
+      path: '/api/v1/circle/3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    });
+
+    const [, captureContext] = client.captureException.mock.calls[0];
+    expect(captureContext.tags.path).toBe('/api/v1/circle/:id');
+  });
+
   it('does not send expected 4xx client errors', () => {
     const client = createFakeClient();
     const provider = new SentryErrorAggregationProvider(client);

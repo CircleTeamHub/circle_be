@@ -7,6 +7,17 @@ export interface BusinessMetrics {
   recordEvent(event: string, result: BusinessEventResult): void;
 }
 
+/** Bucket for event names over the budget — bounds `event` label cardinality. */
+export const OTHER_EVENT = 'other';
+
+/**
+ * Max distinct event names ever emitted. Callers currently pass a fixed set of
+ * string literals, so this is generous headroom; it only ever engages if a
+ * future caller accidentally passes a high-cardinality (e.g. user-derived)
+ * value, which would otherwise blow up Prometheus series count.
+ */
+const MAX_EVENT_NAMES = 100;
+
 /**
  * App-domain business metrics, kept on a dedicated registry (independent of the
  * HTTP RED registry) and merged into the `/metrics` output. A single
@@ -23,10 +34,22 @@ export function createBusinessMetrics(): BusinessMetrics {
     registers: [registry],
   });
 
+  const seenEvents = new Set<string>();
+  const clampEventName = (event: string): string => {
+    if (seenEvents.has(event)) {
+      return event;
+    }
+    if (seenEvents.size >= MAX_EVENT_NAMES) {
+      return OTHER_EVENT;
+    }
+    seenEvents.add(event);
+    return event;
+  };
+
   return {
     registry,
     recordEvent(event, result) {
-      eventsTotal.inc({ event, result });
+      eventsTotal.inc({ event: clampEventName(event), result });
     },
   };
 }

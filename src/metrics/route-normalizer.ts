@@ -11,7 +11,10 @@
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MONGO_OBJECT_ID = /^[0-9a-f]{24}$/i;
 const NUMERIC = /^\d+$/;
-const STATIC_ROUTES = new Set([
+// Exported for the drift-guard test (route-normalizer.spec.ts) — keep these in
+// sync with the real router when adding controllers, or new routes silently
+// fall to the id-collapse fallback.
+export const STATIC_ROUTES = new Set([
   '/api/v1/auth/change-account-id',
   '/api/v1/auth/change-password',
   '/api/v1/auth/email/request-code',
@@ -79,7 +82,7 @@ const STATIC_ROUTES = new Set([
   '/api/v1/user',
   '/api/v1/user/search/account',
 ]);
-const DYNAMIC_ROUTE_TEMPLATES = [
+export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/auth/sessions/:sessionId',
   '/api/v1/calls/:callId/accept',
   '/api/v1/calls/:callId/cancel',
@@ -164,6 +167,13 @@ function matchesTemplate(pathSegments: string[], template: string): boolean {
   );
 }
 
+/** Count literal (non-`:param`) segments — higher means a more specific route. */
+function literalSegmentCount(template: string): number {
+  return template
+    .split('/')
+    .filter((segment) => segment !== '' && !segment.startsWith(':')).length;
+}
+
 export function normalizeRoute(path: string): string {
   if (!path) {
     return '/';
@@ -182,9 +192,24 @@ export function normalizeRoute(path: string): string {
     return pathname;
   }
 
+  // Pick the MOST specific matching template (most literal segments) so a
+  // concrete route like `/group/:id/members/invite` is not shadowed by a
+  // same-length wildcard template like `/group/:id/members/:userID`.
   const pathSegments = pathname.split('/');
-  const matchedTemplate = DYNAMIC_ROUTE_TEMPLATES.find((template) =>
-    matchesTemplate(pathSegments, template),
+  const matchedTemplate = DYNAMIC_ROUTE_TEMPLATES.reduce<string | undefined>(
+    (best, template) => {
+      if (!matchesTemplate(pathSegments, template)) {
+        return best;
+      }
+      if (
+        best === undefined ||
+        literalSegmentCount(template) > literalSegmentCount(best)
+      ) {
+        return template;
+      }
+      return best;
+    },
+    undefined,
   );
   if (matchedTemplate) {
     return matchedTemplate;
@@ -199,3 +224,50 @@ export function normalizeRoute(path: string): string {
     ? normalized.slice(0, -1)
     : normalized;
 }
+
+/** Bucket every route over the unknown-route budget falls into. */
+export const OTHER_ROUTE = '/__other__';
+
+/** All routes the app actually serves — these are always allowed as labels. */
+const KNOWN_ROUTES = new Set<string>([
+  ...STATIC_ROUTES,
+  ...DYNAMIC_ROUTE_TEMPLATES,
+]);
+
+/**
+ * Max number of *unknown* (unlisted) routes ever emitted as distinct labels.
+ * Bounds total `route` cardinality to |KNOWN_ROUTES| + this + 1.
+ */
+const MAX_UNKNOWN_ROUTES = 200;
+
+/**
+ * Cardinality guard for the `route` metric label.
+ *
+ * {@link normalizeRoute} collapses id-like segments, but a path made of
+ * arbitrary non-id segments (e.g. 404 scanning `/api/v1/<random>`) is returned
+ * verbatim — so unauthenticated request spam could otherwise mint an unbounded
+ * number of `route` label values and exhaust Prometheus memory. Known routes
+ * (static + templates) always pass; unknown routes are admitted up to a fixed
+ * budget, after which everything else collapses to {@link OTHER_ROUTE}.
+ *
+ * Returns a stateful limiter so production uses one shared budget while tests
+ * get an isolated instance.
+ */
+export function createRouteCardinalityLimiter(
+  maxUnknownRoutes: number = MAX_UNKNOWN_ROUTES,
+): (route: string) => string {
+  const seenUnknown = new Set<string>();
+  return (route: string): string => {
+    if (KNOWN_ROUTES.has(route) || seenUnknown.has(route)) {
+      return route;
+    }
+    if (seenUnknown.size >= maxUnknownRoutes) {
+      return OTHER_ROUTE;
+    }
+    seenUnknown.add(route);
+    return route;
+  };
+}
+
+/** App-wide shared limiter used by the HTTP RED middleware. */
+export const limitRouteCardinality = createRouteCardinalityLimiter();

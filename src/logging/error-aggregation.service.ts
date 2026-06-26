@@ -12,6 +12,8 @@
  * or tokens) accompany the captured exception.
  */
 
+import { normalizeRoute } from '../metrics/route-normalizer';
+
 export type ErrorAggregationProviderName = 'none' | 'sentry';
 
 export interface ErrorAggregationConfig {
@@ -134,7 +136,10 @@ function buildTags(context: ErrorAggregationContext): Record<string, string> {
   if (context.requestId) tags.requestId = context.requestId;
   if (context.traceId) tags.traceId = context.traceId;
   if (context.method) tags.method = context.method;
-  if (context.path) tags.path = context.path;
+  // Normalize before tagging: the raw path carries id/link-token segments
+  // (e.g. /temp-chat/by-token/<token>/join) — sending those to Sentry would
+  // leak secrets into an indexed, retained tag and blow up tag cardinality.
+  if (context.path) tags.path = normalizeRoute(context.path);
   return tags;
 }
 

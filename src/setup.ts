@@ -16,6 +16,7 @@ import { createRateLimitHandler } from './logging/rate-limit-logger';
 import {
   createErrorAggregationConfig,
   createErrorAggregationProvider,
+  type ErrorAggregationProvider,
 } from './logging/error-aggregation.service';
 import { Registry } from 'prom-client';
 import { createMetrics } from './metrics/metrics.service';
@@ -181,7 +182,7 @@ const logoutLimiter = rateLimit({
   legacyHeaders: false,
 } satisfies Partial<RateLimitOptions>);
 
-export const setupApp = (app: INestApplication) => {
+export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const isProduction = process.env.NODE_ENV === 'production';
   const config = getServerConfig();
   const loggingConfig = createLoggingConfig(
@@ -283,10 +284,25 @@ export const setupApp = (app: INestApplication) => {
   const metrics = createMetrics();
   app.use(createHttpMetricsMiddleware(metrics));
   // Expose HTTP RED metrics + business event counters together at /metrics.
+  // Gated by METRICS_AUTH_TOKEN when set; left open otherwise so internal-only
+  // deployments keep working without extra config.
+  const metricsAuthToken =
+    String(
+      config['METRICS_AUTH_TOKEN'] ?? process.env.METRICS_AUTH_TOKEN ?? '',
+    ).trim() || undefined;
+  if (isProduction && !metricsAuthToken) {
+    new Logger('Metrics').warn(
+      '/metrics is served without authentication (METRICS_AUTH_TOKEN unset). ' +
+        'Restrict it at the network layer or set METRICS_AUTH_TOKEN — the ' +
+        'exposition format reveals route inventory, business-event rates, and ' +
+        'process stats.',
+    );
+  }
   app.use(
     '/metrics',
     createMetricsHandler(
       Registry.merge([metrics.registry, businessMetrics.registry]),
+      { authToken: metricsAuthToken },
     ),
   );
 
@@ -415,4 +431,8 @@ export const setupApp = (app: INestApplication) => {
     }
     next();
   });
+
+  // Hand the error-aggregation provider back so bootstrap can flush it on
+  // shutdown (otherwise 5xx errors buffered just before SIGTERM are lost).
+  return errorAggregation;
 };

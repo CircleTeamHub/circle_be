@@ -63,16 +63,32 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
         }
 
         // Forward only unexpected server errors to optional aggregation
-        // (Sentry). Expected 4xx client errors are never sent.
+        // (Sentry). Expected 4xx client errors are never sent. Wrapped so a
+        // throwing telemetry SDK can never replace the original error in this
+        // catchError projection — the real error must always propagate.
         if (statusCode >= SERVER_ERROR_THRESHOLD) {
-          this.errorAggregation?.captureError(error, {
-            statusCode,
-            requestId: requestContext?.requestId,
-            traceId: requestContext?.traceId,
-            method: requestContext?.method,
-            path: requestContext?.path,
-            userId: requestContext?.userId,
-          });
+          try {
+            this.errorAggregation?.captureError(error, {
+              statusCode,
+              requestId: requestContext?.requestId,
+              traceId: requestContext?.traceId,
+              method: requestContext?.method,
+              path: requestContext?.path,
+              userId: requestContext?.userId,
+            });
+          } catch (aggregationError) {
+            this.logger.error(
+              {
+                event: 'error_aggregation_failed',
+                requestId: requestContext?.requestId,
+                message:
+                  aggregationError instanceof Error
+                    ? aggregationError.message
+                    : String(aggregationError),
+              },
+              'HttpError',
+            );
+          }
         }
 
         return throwError(() => error);
