@@ -1,4 +1,8 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { NotificationService } from 'src/notification/notification.service';
@@ -123,6 +127,100 @@ describe('TraceService', () => {
     );
   });
 
+  it('getTraceById returns a single visible moment in the feed DTO shape', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hello world',
+      images: [],
+      likeCount: 2,
+      replyCount: 1,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
+      likeStats: [
+        { userID: 'viewer-1', user: { id: 'viewer-1', nickname: 'Viewer' } },
+      ],
+      comments: [
+        {
+          id: 'comment-1',
+          content: 'nice',
+          userID: 'author-1',
+          createdAt: new Date('2026-06-08T01:00:00.000Z'),
+          user: { id: 'author-1', nickname: 'Author' },
+          replyTo: null,
+        },
+      ],
+    });
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'author-1' },
+    ]);
+    prisma.traceLikeStat.findFirst.mockResolvedValue({ traceID: 'trace-1' });
+
+    const result = await service.getTraceById('viewer-1', 'trace-1');
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        id: 'trace-1',
+        content: 'hello world',
+        likeCount: 2,
+        commentCount: 1,
+        isLikedByMe: true,
+        author: expect.objectContaining({ id: 'author-1' }),
+      }),
+    );
+    expect(result.comments).toHaveLength(1);
+  });
+
+  it('getTraceById caps loaded comments to protect the detail endpoint', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hello world',
+      images: [],
+      likeCount: 0,
+      replyCount: 250,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
+      likeStats: [],
+      comments: [],
+    });
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'author-1' },
+    ]);
+    prisma.traceLikeStat.findFirst.mockResolvedValue(null);
+
+    await service.getTraceById('viewer-1', 'trace-1');
+
+    const detailQuery = prisma.trace.findFirst.mock.calls[1][0];
+    expect(detailQuery.include.comments.take).toBe(100);
+  });
+
+  it('getTraceById throws NotFound when the moment is missing or deleted', async () => {
+    prisma.trace.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.getTraceById('viewer-1', 'trace-missing'),
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it('getTraceById throws Forbidden for a private moment the viewer does not own', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'PRIVATE',
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+
+    await expect(service.getTraceById('viewer-1', 'trace-1')).rejects.toThrow(
+      ForbiddenException,
+    );
+  });
+
   it('rejects replying to a comment from a different trace', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
@@ -143,6 +241,43 @@ describe('TraceService', () => {
         replyToId: 'comment-1',
       }),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  it('addComment returns the parent COMMENT id as replyTo.id (client threads by it)', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.traceComment.findFirst.mockResolvedValue({
+      id: 'parent-comment',
+      traceID: 'trace-1',
+      deleted: false,
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'reply-comment',
+      content: 'a reply',
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      // Prisma returns the parent comment relation; its `id` is the comment id,
+      // while `user` is the replied-to author.
+      replyTo: {
+        id: 'parent-comment',
+        user: { id: 'author-1', nickname: 'Bob' },
+      },
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    const result = await service.addComment('actor-1', 'trace-1', {
+      content: 'a reply',
+      replyToId: 'parent-comment',
+    });
+
+    // id is the parent comment id (not the author's user id 'author-1');
+    // nickname is the replied-to user.
+    expect(result.replyTo).toEqual({ id: 'parent-comment', nickname: 'Bob' });
   });
 
   it('broadcasts the created notification payload after adding a trace comment', async () => {
@@ -176,7 +311,6 @@ describe('TraceService', () => {
           fromCircle: null,
           fromCirclePost: null,
           fromInvitation: null,
-          squadRequest: null,
         },
       },
     ]);

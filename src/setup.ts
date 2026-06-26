@@ -113,6 +113,15 @@ const traceWriteLimiterOptions = {
   message: { message: 'Too many moment operations, please try again later.' },
 } satisfies Partial<RateLimitOptions>;
 
+/** Trace detail reads: 600 detail lookups / 15 min per IP. */
+const traceDetailReadLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many moment lookups, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
 /** Conversation-group writes: 60 mutating requests / 15 min per IP. */
 const conversationGroupWriteLimiterOptions = {
   windowMs: 15 * 60 * 1000,
@@ -237,6 +246,10 @@ export const setupApp = (app: INestApplication) => {
     'trace_write',
     traceWriteLimiterOptions,
   );
+  const traceDetailReadLimiter = createLimiter(
+    'trace_detail_read',
+    traceDetailReadLimiterOptions,
+  );
   const conversationGroupWriteLimiter = createLimiter(
     'conversation_group_write',
     conversationGroupWriteLimiterOptions,
@@ -329,6 +342,16 @@ export const setupApp = (app: INestApplication) => {
   app.use('/api/v1/trace', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
       return traceWriteLimiter(req, res, next);
+    }
+    next();
+  });
+  app.use('/api/v1/trace', (req: any, res: any, next: any) => {
+    const isTraceDetailPath =
+      /^\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        req.path,
+      );
+    if (req.method === 'GET' && isTraceDetailPath) {
+      return traceDetailReadLimiter(req, res, next);
     }
     next();
   });

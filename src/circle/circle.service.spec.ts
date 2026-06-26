@@ -1,8 +1,11 @@
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
+import { validateSync } from 'class-validator';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SetCircleAvatarDto, SetCircleCoverDto } from './dto/circle.dto';
 import { CircleService } from './circle.service';
 
 describe('CircleService', () => {
@@ -13,6 +16,7 @@ describe('CircleService', () => {
       findUnique: jest.fn(),
     },
     circle: {
+      create: jest.fn(),
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
@@ -81,7 +85,6 @@ describe('CircleService', () => {
   });
 
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
-    const { BadRequestException } = await import('@nestjs/common');
     const guarded = new CircleService(
       prisma as any,
       openimService as any,
@@ -100,6 +103,63 @@ describe('CircleService', () => {
       } as any),
     ).rejects.toThrow(BadRequestException);
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('rejects createCircle when a free-form category is blank after trimming', async () => {
+    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+
+    await expect(
+      service.createCircle('user-1', {
+        name: 'Food Circle',
+        categories: ['food', '   '],
+        description: 'a'.repeat(20),
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('lets the circle owner update the cover image', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+      deleted: false,
+    });
+    prisma.circle.update.mockResolvedValue({});
+
+    await service.setCircleCover(
+      'owner-1',
+      'circle-1',
+      'https://cdn.example.com/covers/circle-1.png',
+    );
+
+    expect(prisma.circle.update).toHaveBeenCalledWith({
+      where: { id: 'circle-1' },
+      data: { cover: 'https://cdn.example.com/covers/circle-1.png' },
+    });
+  });
+
+  it('rejects setCircleAvatar with an off-origin URL when MinIO is configured', async () => {
+    const guarded = new CircleService(
+      prisma as any,
+      openimService as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+      deleted: false,
+    });
+
+    await expect(
+      guarded.setCircleAvatar(
+        'owner-1',
+        'circle-1',
+        'https://evil.example.com/avatar.png',
+      ),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.circle.update).not.toHaveBeenCalled();
   });
 
   it('allows the circle owner to select the current circle icon', async () => {
@@ -124,5 +184,34 @@ describe('CircleService', () => {
       where: { id: 'circle-1' },
       data: { currentIconAssetID: 'asset-1' },
     });
+  });
+});
+
+describe('circle image DTO validation', () => {
+  function validate(dto: new () => object, payload: Record<string, unknown>) {
+    return validateSync(plainToInstance(dto, payload));
+  }
+
+  it('accepts local development asset URLs', () => {
+    expect(
+      validate(SetCircleCoverDto, {
+        cover: 'http://localhost:9000/covers/circle.png',
+      }),
+    ).toHaveLength(0);
+    expect(
+      validate(SetCircleAvatarDto, {
+        avatarUrl: 'http://localhost:9000/avatars/circle.png',
+      }),
+    ).toHaveLength(0);
+  });
+
+  it('rejects non-URL image fields before they reach the service', () => {
+    const coverErrors = validate(SetCircleCoverDto, { cover: '/covers/a.png' });
+    const avatarErrors = validate(SetCircleAvatarDto, {
+      avatarUrl: 'javascript:alert(1)',
+    });
+
+    expect(coverErrors[0]?.constraints).toHaveProperty('isUrl');
+    expect(avatarErrors[0]?.constraints).toHaveProperty('isUrl');
   });
 });

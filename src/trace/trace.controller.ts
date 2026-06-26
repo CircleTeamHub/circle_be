@@ -50,6 +50,18 @@ export class TraceController {
     return this.traceService.getNewCount(req.user.userId, query.since);
   }
 
+  // NOTE: must stay AFTER the static `feed` / `feed/new-count` GET routes so
+  // `:id` does not swallow them (NestJS/Express match in declaration order).
+  @Get(':id')
+  @ApiOperation({ summary: 'Get a single moment by id' })
+  @ApiOkResponse({ type: TraceDto })
+  findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<TraceDto> {
+    return this.traceService.getTraceById(req.user.userId, id);
+  }
+
   @Post()
   @ApiOperation({ summary: 'Post a moment' })
   @ApiOkResponse({ type: TraceDto })

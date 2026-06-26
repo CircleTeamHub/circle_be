@@ -116,7 +116,6 @@ export class NotificationService {
     fromUserID: string;
     type: NotificationType;
     content?: string;
-    squadRequestID?: string;
     fromTraceID?: string;
     fromCirclePostID?: string;
     dedupeWindowMs?: number;
@@ -137,9 +136,6 @@ export class NotificationService {
           fromUserID: notificationData.fromUserID,
           type: notificationData.type,
           deleted: false,
-          ...(notificationData.squadRequestID
-            ? { squadRequestID: notificationData.squadRequestID }
-            : {}),
           ...(notificationData.fromTraceID
             ? { fromTraceID: notificationData.fromTraceID }
             : {}),
@@ -179,25 +175,6 @@ export class NotificationService {
       fromUserID: params.fromUserId,
       type: params.type,
       content: params.content ?? '',
-    });
-  }
-
-  async createSquadRequestNotification(params: {
-    type:
-      | typeof NotificationType.SQUAD_REQUEST_RECEIVED
-      | typeof NotificationType.SQUAD_REQUEST_ACCEPTED
-      | typeof NotificationType.SQUAD_REQUEST_REJECTED;
-    toUserId: string;
-    fromUserId: string;
-    squadRequestId: string;
-    content?: string | null;
-  }): Promise<NotificationRealtimeDto | null> {
-    return this.createNotification({
-      toUserID: params.toUserId,
-      fromUserID: params.fromUserId,
-      type: params.type,
-      content: params.content ?? '',
-      squadRequestID: params.squadRequestId,
     });
   }
 

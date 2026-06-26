@@ -65,12 +65,16 @@ export class CircleService {
     }
 
     this.assertAvatarUrlIsSafe(dto.avatarUrl);
+    const categories = this.normalizeStringList(
+      dto.categories ?? [],
+      'category',
+    );
 
     const circle = await this.prisma.$transaction(async (tx) => {
       const created = await tx.circle.create({
         data: {
           name: dto.name,
-          categories: dto.categories ?? [],
+          categories,
           description: dto.description,
           avatarUrl: dto.avatarUrl ?? null,
           ownerID: userId,
@@ -431,6 +435,33 @@ export class CircleService {
     });
   }
 
+  async setCircleCover(
+    userId: string,
+    circleId: string,
+    cover: string,
+  ): Promise<void> {
+    await this.assertOwner(userId, circleId);
+    // Covers are uploaded to this app's storage; reject arbitrary URLs.
+    this.assertAvatarUrlIsSafe(cover);
+    await this.prisma.circle.update({
+      where: { id: circleId },
+      data: { cover },
+    });
+  }
+
+  async setCircleAvatar(
+    userId: string,
+    circleId: string,
+    avatarUrl: string,
+  ): Promise<void> {
+    await this.assertOwner(userId, circleId);
+    this.assertAvatarUrlIsSafe(avatarUrl);
+    await this.prisma.circle.update({
+      where: { id: circleId },
+      data: { avatarUrl },
+    });
+  }
+
   private async assertJoinRestrictions(
     userId: string,
     circle: {
@@ -478,6 +509,17 @@ export class CircleService {
     }
   }
 
+  private normalizeStringList(values: string[], label: string): string[] {
+    const normalized = values.map((value) => value.trim());
+    if (normalized.some((value) => value.length === 0)) {
+      throw new BadRequestException(`${label} must not be blank`);
+    }
+    if (new Set(normalized).size !== normalized.length) {
+      throw new BadRequestException(`${label} must be unique`);
+    }
+    return normalized;
+  }
+
   private isRetryableTransactionError(error: unknown): boolean {
     return (
       error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -513,6 +555,7 @@ export class CircleService {
       ownerID: circle.ownerID,
       currentIconAssetID: circle.currentIconAssetID ?? null,
       currentIconUrl: circle.currentIconAsset?.imageUrl ?? null,
+      cover: circle.cover ?? null,
       cities: circle.cities,
       isPublic: circle.isPublic,
       categories: circle.categories,

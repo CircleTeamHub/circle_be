@@ -2,7 +2,6 @@ import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
   ConflictException,
-  ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -204,6 +203,52 @@ describe('NoteService', () => {
         { id: 'group-2', name: '北京' },
       ],
     });
+  });
+
+  it('picks the first image as cover even when a video sorts first', async () => {
+    prisma.note.create.mockResolvedValueOnce({
+      id: 'note-c',
+      ownerID: 'user-1',
+      title: '封面测试',
+      coverMediaID: null,
+      imageCount: 1,
+      videoCount: 1,
+      mediaCount: 2,
+    });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-c',
+      ownerID: 'user-1',
+      title: '封面测试',
+      media: [],
+      groupMemberships: [],
+    });
+
+    await service.createNote('user-1', {
+      title: '封面测试',
+      media: [
+        {
+          type: 'VIDEO',
+          objectKey: 'notes/user-1/v.mp4',
+          url: 'https://cdn.example.com/v.mp4',
+          sortOrder: 0,
+        },
+        {
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/i.jpg',
+          url: 'https://cdn.example.com/i.jpg',
+          sortOrder: 1,
+        },
+      ],
+    });
+
+    const persisted = prisma.noteMedia.createMany.mock.calls[0][0].data;
+    const image = persisted.find((m: { type: string }) => m.type === 'IMAGE');
+    const video = persisted.find((m: { type: string }) => m.type === 'VIDEO');
+    const coverUpdate = prisma.note.update.mock.calls.at(-1)![0];
+
+    expect(coverUpdate.data.coverMediaID).toBe(image.id);
+    expect(coverUpdate.data.coverMediaID).not.toBe(video.id);
   });
 
   it('derives title, content, media, and contentJson from block documents', async () => {
@@ -1179,7 +1224,7 @@ describe('NoteService', () => {
     });
 
     const createArg = prisma.note.create.mock.calls[0][0];
-    expect(createArg.data.title.length).toBe(120);
-    expect(createArg.data.content.length).toBe(20_000);
+    expect(createArg.data.title).toHaveLength(120);
+    expect(createArg.data.content).toHaveLength(20_000);
   });
 });

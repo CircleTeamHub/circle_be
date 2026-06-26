@@ -161,7 +161,7 @@ export class OpenimService implements OnModuleInit {
     return res.token;
   }
 
-  // ─── Group (Squad sync) ──────────────────────────────────────────────────────
+  // ─── Group ───────────────────────────────────────────────────────────────────
 
   async createGroup(
     groupID: string,

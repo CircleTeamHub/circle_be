@@ -109,6 +109,18 @@ describe('setupApp', () => {
     );
   });
 
+  it('adds a dedicated rate limit for trace detail reads', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const traceLimiters = app.use.mock.calls.filter(
+      ([path]) => path === '/api/v1/trace',
+    );
+    expect(traceLimiters).toHaveLength(2);
+    expect(traceLimiters[0][1]).toEqual(expect.any(Function));
+    expect(traceLimiters[1][1]).toEqual(expect.any(Function));
+  });
+
   it('adds dedicated rate limits for group writes and group reports', () => {
     const app = buildAppMock();
     setupApp(app as any);

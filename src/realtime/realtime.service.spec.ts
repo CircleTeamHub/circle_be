@@ -73,7 +73,6 @@ describe('RealtimeService', () => {
       fromCircle: null,
       fromCirclePost: null,
       fromInvitation: null,
-      squadRequest: null,
     });
 
     expect(broadcast).toHaveBeenCalledWith('user-1', {
@@ -90,7 +89,6 @@ describe('RealtimeService', () => {
         fromCircle: null,
         fromCirclePost: null,
         fromInvitation: null,
-        squadRequest: null,
       },
     });
   });
