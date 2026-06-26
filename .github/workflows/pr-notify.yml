@@ -1,0 +1,64 @@
+name: PR Notify
+
+on:
+  pull_request:
+    types:
+      - opened
+      - closed
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    # Notify when a PR is opened, and when it is merged (closed + merged).
+    # Plain closes (closed without merge) are intentionally skipped.
+    if: ${{ github.event.action == 'opened' || github.event.pull_request.merged == true }}
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Send Discord Notification
+        # Secrets are unavailable for PRs from forks; skip instead of failing.
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        # Pass user-controlled fields via env (never interpolate into the
+        # script body) to avoid shell/code injection from PR titles or branches.
+        env:
+          PR_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+        run: |
+          node <<'NODE' > payload.json
+          const isMerged =
+            process.env.PR_ACTION === 'closed' && process.env.PR_MERGED === 'true';
+
+          const payload = {
+            username: 'GitHub Actions',
+            content: [
+              isMerged ? ':white_check_mark: **PR merged**' : ':new: **PR opened**',
+              `**Repository:** ${process.env.GITHUB_REPOSITORY}`,
+              `**#${process.env.PR_NUMBER}:** ${process.env.PR_TITLE}`,
+              isMerged
+                ? `**Merged by:** ${process.env.PR_MERGED_BY}`
+                : `**Author:** ${process.env.PR_AUTHOR}`,
+              `**Branch:** ${process.env.PR_BASE} ← ${process.env.PR_HEAD}`,
+              `**Link:** ${process.env.PR_URL}`,
+            ].join('\n'),
+          };
+
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+
+          curl --fail-with-body \
+            -H 'Content-Type: application/json' \
+            -d @payload.json \
+            "$DISCORD_WEBHOOK_URL"
