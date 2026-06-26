@@ -56,10 +56,10 @@ const emailCodeLimiterOptions = {
 
 /**
  * Login security-code verification: 10 attempts / 15 min per IP. The security
- * code is only 4-6 digits and verifyLoginSecurityCode has no server-side
- * lockout, so without this an attacker holding a stolen access token could
- * brute-force a 4-digit code at the global rate. See the persistent-lockout
- * follow-up in the review's remaining recommendations.
+ * code is only 4-6 digits, so this per-IP limit complements the per-account
+ * lockout in AuthService.verifyLoginSecurityCode (5 failures -> 15 min lock via
+ * securityCodeAttempts / securityCodeLockedUntil) — together they stop both
+ * single-IP and distributed / IP-rotating brute force.
  */
 const securityCodeVerifyLimiterOptions = {
   windowMs: 15 * 60 * 1000,
