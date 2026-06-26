@@ -1,5 +1,6 @@
 import { LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
+import { businessMetrics } from '../metrics/business-metrics';
 
 type BusinessEventResult = 'success' | 'failure';
 
@@ -43,6 +44,10 @@ export function logBusinessEvent(
   logger: LoggerService,
   payload: BusinessEventPayload,
 ): void {
+  // Count every business event regardless of log verbosity — metrics are an
+  // independent always-on concern (like the HTTP RED metrics).
+  businessMetrics.recordEvent(payload.businessEvent, payload.result);
+
   if (!payload.enabled) {
     return;
   }

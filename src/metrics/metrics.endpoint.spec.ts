@@ -19,7 +19,7 @@ describe('createMetricsHandler', () => {
     const setHeader = jest.fn();
     const end = jest.fn();
 
-    await createMetricsHandler(metrics)(
+    await createMetricsHandler(metrics.registry)(
       {} as never,
       {
         setHeader,
@@ -41,7 +41,7 @@ describe('createMetricsHandler', () => {
     const status = jest.fn().mockReturnThis();
     const end = jest.fn();
 
-    await createMetricsHandler(metrics)(
+    await createMetricsHandler(metrics.registry)(
       {} as never,
       {
         setHeader: jest.fn(),

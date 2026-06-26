@@ -8,7 +8,7 @@ function buildApp() {
   const metrics = createMetrics({ collectDefault: false });
   const app = express();
   app.use(createHttpMetricsMiddleware(metrics));
-  app.use('/metrics', createMetricsHandler(metrics));
+  app.use('/metrics', createMetricsHandler(metrics.registry));
   app.get('/api/v1/circle/:id', (_req, res) => {
     res.status(200).json({ ok: true });
   });

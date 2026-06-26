@@ -32,7 +32,13 @@ public; everything else stays internal.)
 |---|---|---|---|
 | `http_requests_total` | counter | `method`, `route`, `status_code` | Request count (Rate + Errors) |
 | `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Latency (Duration) |
+| `business_events_total` | counter | `event`, `result` | App-domain events (login, coin gift, …) by name + success/failure |
 | `process_*`, `nodejs_*` | gauges/counters | — | Default process metrics (CPU, memory, event loop, GC) |
+
+`business_events_total` increments automatically whenever a business event is
+logged (`src/logging/business-event.logger.ts`), independent of `BUSINESS_LOG_ON`
+— so Grafana can graph business activity without per-event metric code. The
+`event` label is the same bounded set as the `business_event` log field.
 
 **Routes are normalized** to keep cardinality bounded: dynamic segments (UUIDs,
 Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.
@@ -64,6 +70,13 @@ histogram_quantile(
   0.95,
   sum by (le, route) (rate(http_request_duration_seconds_bucket[5m]))
 )
+
+# Business — events/min by name (e.g. logins, coin gifts)
+sum by (event) (rate(business_events_total[1m])) * 60
+
+# Business — success ratio for a given event
+sum(rate(business_events_total{event="auth_login",result="success"}[5m]))
+  / sum(rate(business_events_total{event="auth_login"}[5m]))
 ```
 
 ## Verifying locally

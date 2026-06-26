@@ -17,9 +17,11 @@ import {
   createErrorAggregationConfig,
   createErrorAggregationProvider,
 } from './logging/error-aggregation.service';
+import { Registry } from 'prom-client';
 import { createMetrics } from './metrics/metrics.service';
 import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
 import { createMetricsHandler } from './metrics/metrics.endpoint';
+import { businessMetrics } from './metrics/business-metrics';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -280,7 +282,13 @@ export const setupApp = (app: INestApplication) => {
   // before the rate limiter below so scrapes are never throttled.
   const metrics = createMetrics();
   app.use(createHttpMetricsMiddleware(metrics));
-  app.use('/metrics', createMetricsHandler(metrics));
+  // Expose HTTP RED metrics + business event counters together at /metrics.
+  app.use(
+    '/metrics',
+    createMetricsHandler(
+      Registry.merge([metrics.registry, businessMetrics.registry]),
+    ),
+  );
 
   if (logger && loggingConfig.httpLogOn) {
     app.use(
