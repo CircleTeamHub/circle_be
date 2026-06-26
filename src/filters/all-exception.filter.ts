@@ -51,6 +51,39 @@ function statusCodeName(status: number): string {
   return HttpStatus[status] ?? 'UNKNOWN';
 }
 
+function initialErrorMessage(
+  isProduction: boolean,
+  exception: unknown,
+): string {
+  if (isProduction) {
+    return 'Internal server error';
+  }
+  if (exception instanceof Error) {
+    return exception.message;
+  }
+  return 'Internal server error';
+}
+
+function responseMessage(
+  body: Record<string, unknown>,
+  fallback: string,
+): string {
+  if (typeof body.message === 'string') {
+    return body.message;
+  }
+  if (Array.isArray(body.message)) {
+    return (body.message as unknown[]).join('; ');
+  }
+  return fallback;
+}
+
+function exceptionCause(exception: unknown, status: number): unknown {
+  if (status < 500) {
+    return undefined;
+  }
+  return exception instanceof Error ? exception.stack : exception;
+}
+
 @Catch()
 export class AllExceptionFilter implements ExceptionFilter {
   private readonly isProduction = process.env.NODE_ENV === 'production';
@@ -75,11 +108,7 @@ export class AllExceptionFilter implements ExceptionFilter {
 
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
     let code = 'INTERNAL_ERROR';
-    let message: string = this.isProduction
-      ? 'Internal server error'
-      : exception instanceof Error
-        ? exception.message
-        : 'Internal server error';
+    let message: string = initialErrorMessage(this.isProduction, exception);
 
     if (exception instanceof HttpException) {
       status = exception.getStatus();
@@ -89,12 +118,7 @@ export class AllExceptionFilter implements ExceptionFilter {
         message = body;
       } else if (body && typeof body === 'object') {
         const b = body as Record<string, unknown>;
-        message =
-          typeof b.message === 'string'
-            ? b.message
-            : Array.isArray(b.message)
-              ? (b.message as unknown[]).join('; ')
-              : message;
+        message = responseMessage(b, message);
         if (typeof b.code === 'string') code = b.code;
       }
     }
@@ -109,12 +133,7 @@ export class AllExceptionFilter implements ExceptionFilter {
       query: scrub(request.query),
       // Body intentionally omitted by default to avoid leaking PII / secrets;
       // turn on per-route via dedicated middleware if a debug capture is needed.
-      cause:
-        status >= 500
-          ? exception instanceof Error
-            ? exception.stack
-            : exception
-          : undefined,
+      cause: exceptionCause(exception, status),
     };
 
     if (status >= 500) {

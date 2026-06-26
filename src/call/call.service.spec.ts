@@ -60,13 +60,13 @@ describe('CallService', () => {
         }
       }),
     };
+    const configValues: Record<string, unknown> = {
+      CALL_MAX_PARTICIPANTS: 10,
+      CALL_RING_TIMEOUT_SECONDS: 45,
+      CALL_ENABLE_VIDEO: false,
+    };
     const config = {
-      get: jest.fn((key: string) => {
-        if (key === 'CALL_MAX_PARTICIPANTS') return 10;
-        if (key === 'CALL_RING_TIMEOUT_SECONDS') return 45;
-        if (key === 'CALL_ENABLE_VIDEO') return false;
-        return undefined;
-      }),
+      get: jest.fn((key: string): unknown => configValues[key]),
     } as unknown as ConfigService;
 
     service = new CallService(prisma, openim, livekit, realtime, config);

@@ -162,7 +162,9 @@ export class FriendService {
         // would race under concurrent requests for the same pair (e.g. a
         // double-tap). Serialize per user-pair with a transaction-scoped
         // advisory lock — released automatically on commit/rollback.
-        const pairKey = `friend:${[senderId, targetId].sort().join(':')}`;
+        const pairKey = `friend:${[senderId, targetId]
+          .sort((a, b) => a.localeCompare(b))
+          .join(':')}`;
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
         const existing = await tx.friend.findFirst({
@@ -254,7 +256,7 @@ export class FriendService {
     ) {
       throw new NotFoundException('Pending request not found');
     }
-    const nextRequest = await this.prisma.$transaction(async (tx: any) => {
+    await this.prisma.$transaction(async (tx: any) => {
       const updated = await tx.friend.update({
         where: { id: requestId },
         data: { state: FriendState.WITHDRAWN },

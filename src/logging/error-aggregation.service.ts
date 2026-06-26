@@ -164,6 +164,7 @@ function defaultSentryClientFactory(
 ): SentryClientLike | undefined {
   // Lazily loaded so the no-op path never pulls in the SDK. Only reached when
   // sentry is enabled and a dsn is configured.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Sentry = require('@sentry/node') as {
     init: (options: Record<string, unknown>) => void;
     captureException: SentryClientLike['captureException'];

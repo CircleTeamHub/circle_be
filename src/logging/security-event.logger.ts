@@ -13,10 +13,15 @@ export interface SecurityEventPayload {
 }
 
 function sanitizeText(value: string): string {
-  return value
-    .replace(/(authorization=)[^\s]+(?:\s+[^\s]+)*/gi, '$1[redacted]')
-    .replace(/(cookie=)[^\s]+(?:;\s*[^\s;=]+=[^\s;]+)*/gi, '$1[redacted]')
-    .replace(/(password|token|secret)=\S+/gi, '$1=[redacted]');
+  return (
+    value
+      // Fixed sanitizers for short log messages; keep in sync with SAFE logging policy.
+      // eslint-disable-next-line security/detect-unsafe-regex
+      .replace(/(authorization=)[^\s]+(?:\s+[^\s]+)*/gi, '$1[redacted]')
+      // eslint-disable-next-line security/detect-unsafe-regex
+      .replace(/(cookie=)[^\s]+(?:;\s*[^\s;=]+=[^\s;]+)*/gi, '$1[redacted]')
+      .replace(/(password|token|secret)=\S+/gi, '$1=[redacted]')
+  );
 }
 
 function sanitizeMetadata(

@@ -46,6 +46,11 @@ describe('ChatHistoryController', () => {
       ChatHistoryController.prototype.getMessages,
     );
 
-    expect(Object.keys(responses).sort()).toEqual(['200', '401', '404', '429']);
+    expect(Object.keys(responses).sort((a, b) => a.localeCompare(b))).toEqual([
+      '200',
+      '401',
+      '404',
+      '429',
+    ]);
   });
 });

@@ -611,7 +611,7 @@ export class CallService {
     userIDs: string[],
     prisma: Pick<PrismaService, '$queryRaw'>,
   ): Promise<void> {
-    for (const userID of [...userIDs].sort()) {
+    for (const userID of [...userIDs].sort((a, b) => a.localeCompare(b))) {
       await prisma.$queryRaw`
         SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${userID}`}, 0))
       `;

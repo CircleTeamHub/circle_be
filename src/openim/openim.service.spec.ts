@@ -7,12 +7,11 @@ describe('OpenimService group/auth admin calls', () => {
 
   beforeEach(() => {
     const config = {
-      get: (k: string) =>
-        k === 'OPENIM_API_URL'
-          ? 'http://im.local'
-          : k === 'OPENIM_ADMIN_SECRET'
-            ? 'secret'
-            : undefined,
+      get: (k: string) => {
+        if (k === 'OPENIM_API_URL') return 'http://im.local';
+        if (k === 'OPENIM_ADMIN_SECRET') return 'secret';
+        return undefined;
+      },
     } as unknown as ConfigService;
     service = new OpenimService(config);
 

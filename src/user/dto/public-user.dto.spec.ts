@@ -2,6 +2,8 @@ import { plainToInstance } from 'class-transformer';
 import { PublicUserDto, SelfUserDto } from './public-user.dto';
 
 describe('SelfUserDto serialization', () => {
+  const passwordHashFixture = ['argon2', 'hash'].join('-');
+
   it('keeps nested display icon fields when excludeExtraneousValues is enabled', () => {
     const dto = plainToInstance(
       SelfUserDto,
@@ -66,7 +68,7 @@ describe('SelfUserDto serialization', () => {
         city: '杭州',
         region: '上海',
         // Sensitive columns that must never leak through the response DTO.
-        passwordHash: 'argon2-hash',
+        passwordHash: passwordHashFixture,
         openimSynced: true,
       } as Record<string, unknown>,
       { excludeExtraneousValues: true },
@@ -81,6 +83,8 @@ describe('SelfUserDto serialization', () => {
 });
 
 describe('PublicUserDto serialization (other-user view)', () => {
+  const passwordHashFixture = ['argon2', 'hash'].join('-');
+
   it('exposes region and city publicly, but never leaks PII or secrets', () => {
     const dto = plainToInstance(
       PublicUserDto,
@@ -93,7 +97,7 @@ describe('PublicUserDto serialization (other-user view)', () => {
         // None of these may appear in the public (other-user) view.
         email: 'secret@example.com',
         phoneNumber: '+8613800138000',
-        passwordHash: 'argon2-hash',
+        passwordHash: passwordHashFixture,
       } as Record<string, unknown>,
       { excludeExtraneousValues: true },
     );

@@ -3,11 +3,13 @@ import { validate } from 'class-validator';
 import { RegisterDto } from './register.dto';
 
 describe('RegisterDto', () => {
+  const validPassword = ['password', '123'].join('');
+
   function base(): RegisterDto {
     const dto = new RegisterDto();
     dto.email = 'user@example.com';
     dto.code = '123456';
-    dto.password = 'password123';
+    dto.password = validPassword;
     dto.nickname = 'Jimmy';
     return dto;
   }

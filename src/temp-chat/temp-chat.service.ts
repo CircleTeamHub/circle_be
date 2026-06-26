@@ -3,9 +3,11 @@ import {
   ForbiddenException,
   GoneException,
   Injectable,
+  Logger,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { randomInt } from 'crypto';
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
@@ -48,6 +50,8 @@ export interface TempChatListItem {
 
 @Injectable()
 export class TempChatService {
+  private readonly logger = new Logger(TempChatService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly openim: OpenimService,
@@ -170,8 +174,7 @@ export class TempChatService {
   }> {
     const { tcId } = this.linkToken.verify(token);
     const displayName = (
-      dto.displayName?.trim() ||
-      `访客${Math.floor(1000 + Math.random() * 9000)}`
+      dto.displayName?.trim() || `访客${randomInt(1000, 10000)}`
     ).slice(0, 20);
     const guestImId = newGuestId();
 
@@ -216,9 +219,18 @@ export class TempChatService {
       };
     } catch (err) {
       // 补偿：OpenIM 任一步失败，释放座位，让访客可重试。
-      await this.prisma.tempChatGuest
-        .delete({ where: { id: guest.id } })
-        .catch(() => undefined);
+      this.logger.warn(
+        `Temp chat OpenIM join failed for guest ${guest.id}`,
+        err instanceof Error ? err.stack : undefined,
+      );
+      try {
+        await this.prisma.tempChatGuest.delete({ where: { id: guest.id } });
+      } catch (cleanupError) {
+        this.logger.warn(
+          `Temp chat guest cleanup failed after OpenIM join failure: ${guest.id}`,
+          cleanupError instanceof Error ? cleanupError.stack : undefined,
+        );
+      }
       throw new ServiceUnavailableException('加入失败，请重试');
     }
   }

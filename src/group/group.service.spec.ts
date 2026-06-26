@@ -8,7 +8,6 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { GroupController } from './group.controller';
 import { GroupService } from './group.service';
 

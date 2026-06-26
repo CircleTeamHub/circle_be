@@ -6,7 +6,6 @@ import {
 import {
   DisplayIconDto,
   DisplayIconTypeDto,
-  IconOptionDto,
   IconOptionsResponseDto,
   SystemIconKeyDto,
   UpdateDisplayIconItemDto,
