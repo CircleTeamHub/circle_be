@@ -36,23 +36,45 @@ jobs:
           PR_MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
           PR_BASE: ${{ github.event.pull_request.base.ref }}
           PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
         run: |
           node <<'NODE' > payload.json
           const isMerged =
             process.env.PR_ACTION === 'closed' && process.env.PR_MERGED === 'true';
 
+          const embed = {
+            author: {
+              name: isMerged ? '✅ Pull request merged' : '🆕 Pull request opened',
+            },
+            title: `#${process.env.PR_NUMBER} ${process.env.PR_TITLE}`.slice(0, 256),
+            url: process.env.PR_URL,
+            // GitHub colors: open = green (#1a7f37), merged = purple (#8250df).
+            color: isMerged ? 0x8250df : 0x1a7f37,
+            fields: [
+              {
+                name: 'Repository',
+                value: process.env.GITHUB_REPOSITORY,
+                inline: true,
+              },
+              {
+                name: isMerged ? 'Merged by' : 'Author',
+                value: isMerged ? process.env.PR_MERGED_BY : process.env.PR_AUTHOR,
+                inline: true,
+              },
+              {
+                name: 'Branch',
+                value: `\`${process.env.PR_BASE}\` ← \`${process.env.PR_HEAD}\``,
+                inline: false,
+              },
+            ],
+            timestamp: isMerged ? process.env.PR_MERGED_AT : process.env.PR_CREATED_AT,
+            footer: { text: 'GitHub Actions' },
+          };
+
           const payload = {
             username: 'GitHub Actions',
-            content: [
-              isMerged ? ':white_check_mark: **PR merged**' : ':new: **PR opened**',
-              `**Repository:** ${process.env.GITHUB_REPOSITORY}`,
-              `**#${process.env.PR_NUMBER}:** ${process.env.PR_TITLE}`,
-              isMerged
-                ? `**Merged by:** ${process.env.PR_MERGED_BY}`
-                : `**Author:** ${process.env.PR_AUTHOR}`,
-              `**Branch:** ${process.env.PR_BASE} ← ${process.env.PR_HEAD}`,
-              `**Link:** ${process.env.PR_URL}`,
-            ].join('\n'),
+            embeds: [embed],
           };
 
           process.stdout.write(JSON.stringify(payload));
