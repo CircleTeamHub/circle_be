@@ -13,6 +13,15 @@ import { getServerConfig } from './config/server.config';
 import { createLoggingConfig } from './logging/logging.config';
 import { createRequestLoggerMiddleware } from './logging/request-logger.middleware';
 import { createRateLimitHandler } from './logging/rate-limit-logger';
+import {
+  createErrorAggregationConfig,
+  createErrorAggregationProvider,
+} from './logging/error-aggregation.service';
+import { Registry } from 'prom-client';
+import { createMetrics } from './metrics/metrics.service';
+import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
+import { createMetricsHandler } from './metrics/metrics.endpoint';
+import { businessMetrics } from './metrics/business-metrics';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -267,6 +276,20 @@ export const setupApp = (app: INestApplication) => {
     groupReportLimiterOptions,
   );
 
+  // Prometheus metrics. The RED middleware times every request (added first so
+  // it spans the whole request); `/metrics` serves the raw exposition format,
+  // bypassing the `api/v1` prefix and the JSON response interceptor. Mounted
+  // before the rate limiter below so scrapes are never throttled.
+  const metrics = createMetrics();
+  app.use(createHttpMetricsMiddleware(metrics));
+  // Expose HTTP RED metrics + business event counters together at /metrics.
+  app.use(
+    '/metrics',
+    createMetricsHandler(
+      Registry.merge([metrics.registry, businessMetrics.registry]),
+    ),
+  );
+
   if (logger && loggingConfig.httpLogOn) {
     app.use(
       createRequestLoggerMiddleware(logger, {
@@ -281,8 +304,19 @@ export const setupApp = (app: INestApplication) => {
     new AllExceptionFilter(new Logger('Exception'), httpAdapterHost),
     new PrismaExceptionFilter(),
   );
+  // Optional error aggregation (Sentry). A no-op unless
+  // LOG_AGGREGATION_PROVIDER=sentry and SENTRY_DSN are configured; building it
+  // here also runs Sentry.init() once before requests are served.
+  const errorAggregation = createErrorAggregationProvider(
+    createErrorAggregationConfig(
+      config,
+      String(config['NODE_ENV'] || process.env.NODE_ENV || 'development'),
+    ),
+  );
   if (logger && loggingConfig.httpLogOn) {
-    app.useGlobalInterceptors(new ErrorLoggingInterceptor(logger));
+    app.useGlobalInterceptors(
+      new ErrorLoggingInterceptor(logger, errorAggregation),
+    );
   }
   app.useGlobalInterceptors(new ResponseInterceptor());
 

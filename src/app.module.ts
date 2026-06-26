@@ -36,7 +36,8 @@ import { OutboxModule } from './outbox/outbox.module';
 import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 
-const envFilePath = `.env.${process.env.NODE_ENV || `development`}`;
+const nodeEnv = process.env.NODE_ENV || 'development';
+const envFilePath = `.env.${nodeEnv}`;
 
 @Module({
   imports: [

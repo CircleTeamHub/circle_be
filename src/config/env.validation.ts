@@ -45,6 +45,14 @@ export function createEnvValidationSchema(
     BUSINESS_LOG_ON: Joi.boolean(),
     EXTERNAL_LOG_ON: Joi.boolean(),
     RATE_LIMIT_LOG_ON: Joi.boolean(),
+    // Error aggregation (optional). Disabled unless provider=sentry AND a dsn is
+    // set; a missing dsn degrades to a no-op rather than failing boot.
+    LOG_AGGREGATION_PROVIDER: Joi.string()
+      .valid('none', 'sentry')
+      .default('none'),
+    SENTRY_DSN: Joi.string().uri().optional(),
+    SENTRY_ENVIRONMENT: Joi.string().optional(),
+    SENTRY_RELEASE: Joi.string().optional(),
     APP_PORT: Joi.number().integer().min(0).max(65535).default(3000),
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),

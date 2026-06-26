@@ -25,12 +25,12 @@ function readBoolean(value: unknown, defaultValue: boolean): boolean {
 }
 
 function readPositiveInteger(value: unknown, defaultValue: number): number {
-  const numberValue =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string' && value.trim() !== ''
-        ? Number(value)
-        : NaN;
+  let numberValue = NaN;
+  if (typeof value === 'number') {
+    numberValue = value;
+  } else if (typeof value === 'string' && value.trim() !== '') {
+    numberValue = Number(value);
+  }
 
   return Number.isInteger(numberValue) && numberValue > 0
     ? numberValue

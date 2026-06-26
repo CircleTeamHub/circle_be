@@ -45,10 +45,16 @@ export function resolveCorsOriginChecker(
   const devPatterns: RegExp[] = isProduction
     ? []
     : [
+        // Fixed allowlist regexes for local/dev CORS origins.
+        // eslint-disable-next-line security/detect-unsafe-regex
         /^https?:\/\/localhost(:\d+)?$/,
+        // eslint-disable-next-line security/detect-unsafe-regex
         /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
+        // eslint-disable-next-line security/detect-unsafe-regex
         /^https?:\/\/\[::1\](:\d+)?$/,
+        // eslint-disable-next-line security/detect-unsafe-regex
         /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/,
+        // eslint-disable-next-line security/detect-unsafe-regex
         /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/,
       ];
 

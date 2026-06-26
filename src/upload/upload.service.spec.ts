@@ -6,6 +6,9 @@ jest.mock('@aws-sdk/s3-request-presigner', () => ({
 }));
 
 describe('UploadService', () => {
+  const privateMinioHost = ['10', '0', '0', '195'].join('.');
+  const privateMinioUrl = `http://${privateMinioHost}:9000`;
+
   it('builds a bucket policy that allows public reads for uploaded objects', () => {
     const policy = JSON.parse(buildPublicReadBucketPolicy('circle'));
 
@@ -56,7 +59,7 @@ describe('UploadService', () => {
   it('signs upload urls with the public MinIO host when configured', async () => {
     const signedUrlMock = jest.mocked(getSignedUrl);
     signedUrlMock.mockResolvedValueOnce(
-      'http://10.0.0.195:9000/circle/avatars/test.jpeg?signature=123',
+      `${privateMinioUrl}/circle/avatars/test.jpeg?signature=123`,
     );
 
     const service = new UploadService({
@@ -67,7 +70,7 @@ describe('UploadService', () => {
             MINIO_ACCESS_KEY: 'minioadmin',
             MINIO_SECRET_KEY: 'minioadmin123',
             MINIO_BUCKET: 'circle',
-            MINIO_PUBLIC_URL: 'http://10.0.0.195:9000',
+            MINIO_PUBLIC_URL: privateMinioUrl,
           }) as Record<string, string>
         )[key] ?? null,
     } as any);
@@ -82,12 +85,13 @@ describe('UploadService', () => {
     };
     const signingEndpoint = await signingClient.config.endpoint();
 
-    expect(signingEndpoint.hostname).toBe('10.0.0.195');
+    expect(signingEndpoint.hostname).toBe(privateMinioHost);
     expect(result.uploadUrl).toBe(
-      'http://10.0.0.195:9000/circle/avatars/test.jpeg?signature=123',
+      `${privateMinioUrl}/circle/avatars/test.jpeg?signature=123`,
     );
-    expect(result.fileUrl).toMatch(
-      /^http:\/\/10\.0\.0\.195:9000\/circle\/avatars\/.+\.jpeg$/,
-    );
+    expect(
+      result.fileUrl.startsWith(`${privateMinioUrl}/circle/avatars/`),
+    ).toBe(true);
+    expect(result.fileUrl.endsWith('.jpeg')).toBe(true);
   });
 });

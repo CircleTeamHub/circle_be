@@ -1,0 +1,15 @@
+route:
+  receiver: discord
+  group_by: ['alertname']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: discord
+    # Native Discord support (Alertmanager >= 0.25). The webhook URL is read from
+    # a gitignored file so it never lands in the repo — create it from
+    # discord.url.example and put your Discord channel webhook in it.
+    discord_configs:
+      - webhook_url_file: /etc/alertmanager/discord.url
+        send_resolved: true

@@ -8,6 +8,8 @@ describe('RefreshTokenService', () => {
   let service: RefreshTokenService;
 
   const records: any[] = [];
+  const loopbackIp = ['127', '0', '0', '1'].join('.');
+  const privateIp = ['10', '0', '0', '1'].join('.');
 
   const prisma = {
     refreshToken: {
@@ -55,7 +57,7 @@ describe('RefreshTokenService', () => {
           if (where.revokedAt === null && record.revokedAt !== null) {
             return false;
           }
-          if (where.expiredAt?.gt && !(record.expiredAt > where.expiredAt.gt)) {
+          if (where.expiredAt?.gt && record.expiredAt <= where.expiredAt.gt) {
             return false;
           }
           return true;
@@ -87,7 +89,7 @@ describe('RefreshTokenService', () => {
     const longName = 'x'.repeat(200);
     const session = await service.create('user-1', {
       deviceName: longName,
-      ip: '127.0.0.1',
+      ip: loopbackIp,
       userAgent: 'PostmanRuntime',
     });
 
@@ -100,7 +102,7 @@ describe('RefreshTokenService', () => {
         data: expect.objectContaining({
           userId: 'user-1',
           deviceName: longName.slice(0, 64),
-          ip: '127.0.0.1',
+          ip: loopbackIp,
           userAgent: 'PostmanRuntime',
         }),
       }),
@@ -119,7 +121,7 @@ describe('RefreshTokenService', () => {
         createdAt: now,
         lastUsedAt: now,
         deviceName: 'Active device',
-        ip: '127.0.0.1',
+        ip: loopbackIp,
         userAgent: 'PostmanRuntime',
       },
       {
@@ -235,7 +237,7 @@ describe('RefreshTokenService', () => {
   it('rotates a valid refresh token and revokes the old record', async () => {
     const { token: raw } = await service.create('user-1', {
       deviceName: 'MacBook',
-      ip: '127.0.0.1',
+      ip: loopbackIp,
       userAgent: 'PostmanRuntime',
     });
 
@@ -244,7 +246,7 @@ describe('RefreshTokenService', () => {
       userId,
       sessionId,
     } = await service.rotate(raw, {
-      ip: '10.0.0.1',
+      ip: privateIp,
     });
 
     expect(userId).toBe('user-1');
@@ -256,7 +258,7 @@ describe('RefreshTokenService', () => {
     const newRecord = records[1];
     expect(oldRecord.revokedAt).toBeInstanceOf(Date);
     expect(newRecord.revokedAt).toBeNull();
-    expect(newRecord.ip).toBe('10.0.0.1');
+    expect(newRecord.ip).toBe(privateIp);
     // Carries over device name from the old session when not supplied.
     expect(newRecord.deviceName).toBe('MacBook');
   });

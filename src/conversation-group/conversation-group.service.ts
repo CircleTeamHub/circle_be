@@ -26,7 +26,9 @@ export class ConversationGroupService {
       name: group.name,
       sortOrder: group.sortOrder,
       pinnedToTabs: group.pinnedToTabs,
-      conversationIDs: group.memberships.map((m) => m.conversationID).sort(), // stable order so clients can diff cheaply
+      conversationIDs: group.memberships
+        .map((m) => m.conversationID)
+        .sort((a, b) => a.localeCompare(b)), // stable order so clients can diff cheaply
       createdAt: group.createdAt.toISOString(),
       updatedAt: group.updatedAt.toISOString(),
     };
