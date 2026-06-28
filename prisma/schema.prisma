@@ -1126,5 +1126,7 @@ model UserLike {
 
   @@unique([fromUserID, toUserID, likedOn])
   @@index([toUserID])
-  @@index([fromUserID])
+  // Composite backs the per-day quota count (WHERE fromUserID = ? AND likedOn = ?);
+  // its fromUserID prefix also serves any fromUserID-only lookup.
+  @@index([fromUserID, likedOn])
 }

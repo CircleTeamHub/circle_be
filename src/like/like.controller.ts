@@ -13,6 +13,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import type { RequestWithUser } from 'src/auth/types';
@@ -20,7 +21,10 @@ import { LikeService } from './like.service';
 import { LikeStatusDto } from './dto/like-status.dto';
 
 @Controller('user')
-@UseGuards(JwtGuard)
+@UseGuards(JwtGuard, ThrottlerGuard)
+// Caps like/unlike churn (the daily quota only bounds NEW likes; unlike frees the
+// day-slot, so without this a user could flap like↔unlike unbounded).
+@Throttle({ default: { limit: 30, ttl: 60_000 } })
 @ApiTags('User')
 @ApiBearerAuth()
 export class LikeController {

@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
 import { likedOnToday } from './like.util';
@@ -6,6 +11,11 @@ import { LikeStatusDto } from './dto/like-status.dto';
 
 // 每人每天最多给几个不同的人点赞（防刷）。随时可改。
 const DAILY_LIKE_LIMIT = 5;
+// Serializable 事务在并发冲突时会抛 P2034，重试几次以吸收良性并发（多设备同时点赞）。
+const SERIALIZATION_RETRIES = 3;
+
+/** 当日配额已满的内部信号（事务内抛出以回滚），在 like() 边界转成 400。 */
+class DailyLikeLimitError extends Error {}
 
 @Injectable()
 export class LikeService {
@@ -21,6 +31,15 @@ export class LikeService {
   async like(fromUserId: string, toUserId: string): Promise<LikeStatusDto> {
     if (fromUserId === toUserId) {
       throw new BadRequestException('不能给自己点赞');
+    }
+
+    // 目标必须存在且为活跃用户：不能给已封禁/已注销的账号刷赞、刷徽章。
+    const target = await this.prisma.user.findUnique({
+      where: { id: toUserId },
+      select: { status: true },
+    });
+    if (!target || target.status !== UserStatus.ACTIVE) {
+      throw new NotFoundException('用户不存在或不可用');
     }
 
     const likedOn = likedOnToday();
@@ -39,48 +58,82 @@ export class LikeService {
       return this.getStatus(fromUserId, toUserId);
     }
 
-    // 每日配额：今天给不同的人点赞最多 DAILY_LIKE_LIMIT 个。
-    const todayCount = await this.prisma.userLike.count({
-      where: { fromUserID: fromUserId, likedOn },
-    });
-    if (todayCount >= DAILY_LIKE_LIMIT) {
-      throw new BadRequestException(
-        `今天点赞次数已达上限（每天最多给 ${DAILY_LIKE_LIMIT} 个人点赞）`,
-      );
-    }
-
     try {
-      await this.prisma.$transaction([
-        this.prisma.userLike.create({
-          data: { fromUserID: fromUserId, toUserID: toUserId, likedOn },
-        }),
-        this.prisma.user.update({
-          where: { id: toUserId },
-          data: { receivedLikeCount: { increment: 1 } },
-        }),
-      ]);
+      await this.createLikeAtomically(fromUserId, toUserId, likedOn);
       // 被赞数可能跨过阈值新获得合作达人徽章 → 失效其图标缓存。
       this.iconService.invalidateDisplayIconCacheFor(toUserId);
     } catch (e) {
-      // 唯一约束冲突（P2002）= 今天已经赞过，幂等：直接返回当前状态。
-      if ((e as { code?: string }).code !== 'P2002') throw e;
+      if (e instanceof DailyLikeLimitError) {
+        throw new BadRequestException(
+          `今天点赞次数已达上限（每天最多给 ${DAILY_LIKE_LIMIT} 个人点赞）`,
+        );
+      }
+      // 并发下同一目标二次创建 = 唯一约束冲突（P2002），幂等：忽略。
+      if ((e as { code?: string }).code !== 'P2002') {
+        throw e;
+      }
     }
 
     return this.getStatus(fromUserId, toUserId);
   }
 
-  /** 取消今天对 toUserId 的点赞（仅当天那一条）。 */
+  /**
+   * 在一个 Serializable 事务里「校验当日配额 → 建点赞 → 计数 +1」，三步原子。
+   * Serializable 让并发点赞被串行化，杜绝 count-then-create 的 TOCTOU 越限。
+   */
+  private async createLikeAtomically(
+    fromUserId: string,
+    toUserId: string,
+    likedOn: Date,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < SERIALIZATION_RETRIES; attempt += 1) {
+      try {
+        await this.prisma.$transaction(
+          async (tx) => {
+            const todayCount = await tx.userLike.count({
+              where: { fromUserID: fromUserId, likedOn },
+            });
+            if (todayCount >= DAILY_LIKE_LIMIT) {
+              throw new DailyLikeLimitError();
+            }
+            await tx.userLike.create({
+              data: { fromUserID: fromUserId, toUserID: toUserId, likedOn },
+            });
+            await tx.user.update({
+              where: { id: toUserId },
+              data: { receivedLikeCount: { increment: 1 } },
+            });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+        return;
+      } catch (e) {
+        // P2034 = 序列化冲突，良性并发，重试。
+        if ((e as { code?: string }).code === 'P2034') {
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw new BadRequestException('操作太频繁，请稍后重试');
+  }
+
+  /** 取消今天对 toUserId 的点赞（仅当天那一条）。删除与计数原子。 */
   async unlike(fromUserId: string, toUserId: string): Promise<LikeStatusDto> {
     const likedOn = likedOnToday();
-    const { count } = await this.prisma.userLike.deleteMany({
-      where: { fromUserID: fromUserId, toUserID: toUserId, likedOn },
+
+    const removed = await this.prisma.$transaction(async (tx) => {
+      const { count } = await tx.userLike.deleteMany({
+        where: { fromUserID: fromUserId, toUserID: toUserId, likedOn },
+      });
+      if (count > 0) {
+        // GREATEST(...,0) 给去归一化计数兜底，任何漂移都不会让它变负。
+        await tx.$executeRaw`UPDATE "User" SET "receivedLikeCount" = GREATEST("receivedLikeCount" - 1, 0) WHERE "id" = ${toUserId}`;
+      }
+      return count;
     });
 
-    if (count > 0) {
-      await this.prisma.user.update({
-        where: { id: toUserId },
-        data: { receivedLikeCount: { decrement: 1 } },
-      });
+    if (removed > 0) {
       this.iconService.invalidateDisplayIconCacheFor(toUserId);
     }
 
