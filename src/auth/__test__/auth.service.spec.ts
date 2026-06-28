@@ -210,6 +210,36 @@ describe('AuthService', () => {
     expect(result.accessToken).toBe('access-token');
   });
 
+  it('login still succeeds with empty imToken and logs an error when OpenIM token fetch fails', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'AAA111',
+      email: 'a@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockOpenimService.getUserToken.mockRejectedValueOnce(
+      new Error('OpenIM timeout'),
+    );
+    const errorSpy = jest
+      .spyOn((service as any).logger, 'error')
+      .mockImplementation(() => undefined);
+
+    const result = await service.login({
+      email: 'a@example.com',
+      password: 'password1',
+    } as any);
+
+    // 登录不被 IM 故障阻断：accessToken 正常、imToken 退化为空串
+    expect(result.accessToken).toBe('access-token');
+    expect(result.imToken).toBe('');
+    // 失败必须「喊出来」——error 级日志且带 userId 上下文
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(String(errorSpy.mock.calls[0][0])).toContain('uuid-1');
+  });
+
   it('login throws ForbiddenException for unknown email', async () => {
     await expect(
       service.login({
