@@ -25,6 +25,7 @@ import { CirclePlazaModule } from './circle-plaza/circle-plaza.module';
 import { CircleInvitationModule } from './circle-invitation/circle-invitation.module';
 import { TraceModule } from './trace/trace.module';
 import { IconModule } from './icon/icon.module';
+import { LikeModule } from './like/like.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { NotificationModule } from './notification/notification.module';
 import { ConversationGroupModule } from './conversation-group/conversation-group.module';
@@ -64,6 +65,7 @@ const envFilePath = `.env.${nodeEnv}`;
     NoteModule,
     CircleModule,
     IconModule,
+    LikeModule,
     CirclePlazaModule,
     CircleInvitationModule,
     TraceModule,

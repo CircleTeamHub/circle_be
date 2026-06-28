@@ -15,6 +15,11 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
+// 被赞总数达到该阈值即获得合作达人（PARTNER）徽章。随时可改。
+const PARTNER_LIKE_THRESHOLD = 3;
+// 仅供测试：这些 accountId 一律开通全部系统徽章（含合作达人 PARTNER），用于 UI 验证。
+// PARTNER 的正式发放条件确定后、或测试结束后请移除此后门。
+const TEST_ALL_BADGE_ACCOUNT_IDS = new Set<string>(['jimmy']);
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -189,7 +194,9 @@ export class IconService {
       where: { id: userId },
       select: {
         id: true,
+        accountId: true,
         vipLevel: true,
+        receivedLikeCount: true,
         createdAt: true,
         iconPreferencesInitialized: true,
       },
@@ -242,6 +249,46 @@ export class IconService {
         fallbackIconName: 'rocket-outline',
         imageUrl: null,
       });
+    }
+
+    // 合作达人：被赞总数达到阈值即获得。
+    if (user.receivedLikeCount >= PARTNER_LIKE_THRESHOLD) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.PARTNER,
+        title: '合作达人',
+        fallbackIconName: 'ribbon-outline',
+        imageUrl: null,
+      });
+    }
+
+    // 测试后门：指定账号一律补齐全部系统徽章（含合作达人），方便在 app 里验证展示。
+    if (TEST_ALL_BADGE_ACCOUNT_IDS.has(user.accountId)) {
+      const present = new Set(systemIcons.map((icon) => icon.systemKey));
+      const everySystemIcon: EligibleSystemIcon[] = [
+        {
+          systemKey: SystemIconKeyDto.VIP,
+          title: `VIP${user.vipLevel > 0 ? user.vipLevel : 1}`,
+          fallbackIconName: 'diamond',
+          imageUrl: null,
+        },
+        {
+          systemKey: SystemIconKeyDto.NEW_USER,
+          title: '新手',
+          fallbackIconName: 'rocket-outline',
+          imageUrl: null,
+        },
+        {
+          systemKey: SystemIconKeyDto.PARTNER,
+          title: '合作达人',
+          fallbackIconName: 'ribbon-outline',
+          imageUrl: null,
+        },
+      ];
+      for (const icon of everySystemIcon) {
+        if (!present.has(icon.systemKey)) {
+          systemIcons.push(icon);
+        }
+      }
     }
 
     const circleIcons: EligibleCircleIcon[] = circleMemberships

@@ -26,6 +26,7 @@ export enum DisplayIconTypeDto {
 export enum SystemIconKeyDto {
   VIP = 'VIP',
   NEW_USER = 'NEW_USER',
+  PARTNER = 'PARTNER',
 }
 
 export class DisplayIconDto {
