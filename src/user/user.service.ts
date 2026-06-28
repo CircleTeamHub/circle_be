@@ -265,6 +265,7 @@ export class UserService {
       }),
       this.iconService.getDisplayIconsForUser(id),
     ]);
+    await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
     return {
       ...user,
@@ -306,6 +307,7 @@ export class UserService {
     if (status !== UserStatus.ACTIVE) {
       await this.refreshTokens.revokeAll(id);
     }
+    await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
     return {
       ...user,
@@ -322,6 +324,7 @@ export class UserService {
       data: normalizeUpdateInput(input),
       select: PUBLIC_SELECT,
     });
+    await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
     return user;
   }

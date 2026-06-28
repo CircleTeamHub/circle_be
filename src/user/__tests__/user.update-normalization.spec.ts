@@ -6,6 +6,7 @@ describe('UserService.update normalization', () => {
   };
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(() => Promise.resolve()),
+    invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
 
   const prisma = {

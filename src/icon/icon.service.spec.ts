@@ -24,6 +24,7 @@ describe('IconService', () => {
 
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(),
+    invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
 
   beforeEach(async () => {

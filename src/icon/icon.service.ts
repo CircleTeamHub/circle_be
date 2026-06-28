@@ -163,6 +163,7 @@ export class IconService {
     });
 
     this.invalidateDisplayIconCache(userId);
+    await this.realtimeService.invalidateUserProfileSummaryCache(userId);
 
     const displayIcons = this.mapSelectionsToDisplayIcons(
       normalized.map((item) => ({

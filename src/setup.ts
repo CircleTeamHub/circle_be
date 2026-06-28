@@ -9,6 +9,7 @@ import helmet from 'helmet';
 import rateLimit, {
   type Options as RateLimitOptions,
 } from 'express-rate-limit';
+import { RedisService } from './redis/redis.service';
 import { getServerConfig } from './config/server.config';
 import { createLoggingConfig } from './logging/logging.config';
 import { createRequestLoggerMiddleware } from './logging/request-logger.middleware';
@@ -166,22 +167,6 @@ const groupReportLimiterOptions = {
  * /user/search/account endpoint to enumerate accountIds at the global 300/min
  * fallback rate.
  */
-const accountSearchLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { message: 'Too many account lookups, please try again later.' },
-} satisfies Partial<RateLimitOptions>);
-
-/** Logout — keep loose but bounded; matches refreshLimiter shape. */
-const logoutLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-} satisfies Partial<RateLimitOptions>);
-
 export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const isProduction = process.env.NODE_ENV === 'production';
   const config = getServerConfig();
@@ -195,12 +180,15 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     : undefined;
   logger && app.useLogger(logger);
   app.setGlobalPrefix('api/v1');
+  const redisService = getOptionalRedisService(app);
   const createLimiter = (
     limiterName: string,
     options: Partial<RateLimitOptions>,
-  ) =>
-    rateLimit({
+  ) => {
+    const store = redisService?.createRateLimitStore(limiterName);
+    return rateLimit({
       ...options,
+      ...(store ? { store, passOnStoreError: true } : {}),
       ...(logger
         ? {
             handler: createRateLimitHandler(logger, {
@@ -212,6 +200,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
           }
         : {}),
     } satisfies Partial<RateLimitOptions>);
+  };
   const authLimiter = createLimiter('auth_login', authLimiterOptions);
   const authRegisterLimiter = createLimiter(
     'auth_register',
@@ -276,6 +265,19 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     'group_report',
     groupReportLimiterOptions,
   );
+  const accountSearchLimiter = createLimiter('account_search', {
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: 'Too many account lookups, please try again later.' },
+  });
+  const logoutLimiter = createLimiter('auth_logout', {
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
 
   // Prometheus metrics. The RED middleware times every request (added first so
   // it spans the whole request); `/metrics` serves the raw exposition format,
@@ -436,3 +438,18 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // shutdown (otherwise 5xx errors buffered just before SIGTERM are lost).
   return errorAggregation;
 };
+
+function getOptionalRedisService(app: INestApplication): RedisService | null {
+  try {
+    const redisService = app.get(RedisService, { strict: false });
+    if (
+      redisService &&
+      typeof redisService.createRateLimitStore === 'function'
+    ) {
+      return redisService;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

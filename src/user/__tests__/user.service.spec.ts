@@ -29,6 +29,7 @@ describe('UserService', () => {
   };
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(),
+    invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
   const privacySettings = {
     canViewProfileField: jest.fn(),

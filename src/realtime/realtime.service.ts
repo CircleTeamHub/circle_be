@@ -1,6 +1,14 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleInit,
+  Optional,
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RedisService } from 'src/redis/redis.service';
 import {
   DISCOVER_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
@@ -52,6 +60,19 @@ type CallStatePayload = {
   changedAt: string;
 };
 
+type MembershipStatusPayload = {
+  vipLevel: number;
+  expiredAt: string | null;
+  changedAt: string;
+};
+
+type UserProfileSummaryPayload = {
+  vipLevel: number;
+  creditScore: number;
+  displayIconsVersion: number;
+  changedAt: string;
+};
+
 type RealtimeEvent =
   | { type: 'badge.snapshot'; payload: BadgeSnapshot }
   | { type: 'call.invite'; payload: CallInvitePayload }
@@ -71,11 +92,7 @@ type RealtimeEvent =
     }
   | {
       type: 'membership.status.changed';
-      payload: {
-        vipLevel: number;
-        expiredAt: string | null;
-        changedAt: string;
-      };
+      payload: MembershipStatusPayload;
     }
   | {
       type: 'wallet.balance.changed';
@@ -126,20 +143,35 @@ type RealtimeEvent =
     }
   | {
       type: 'user.profile.summary.changed';
-      payload: {
-        vipLevel: number;
-        creditScore: number;
-        displayIconsVersion: number;
-        changedAt: string;
-      };
+      payload: UserProfileSummaryPayload;
     };
 
 @Injectable()
-export class RealtimeService {
+export class RealtimeService implements OnModuleInit {
+  private static readonly REDIS_CHANNEL_PREFIX = 'circle:realtime:user:';
+  private static readonly REDIS_CHANNEL_PATTERN = `${RealtimeService.REDIS_CHANNEL_PREFIX}*`;
+  private static readonly HOT_CACHE_PREFIX = 'circle:hot:user:';
+  private static readonly BADGE_SNAPSHOT_TTL_SECONDS = 10;
+  private static readonly PROFILE_SUMMARY_TTL_SECONDS = 30;
+  private static readonly MEMBERSHIP_STATUS_TTL_SECONDS = 30;
+
   private readonly logger = new Logger(RealtimeService.name);
   private readonly clients = new Map<string, Set<WebSocket>>();
+  private readonly instanceId = randomUUID();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional()
+    @Inject(RedisService)
+    private readonly redisService?: RedisService,
+  ) {}
+
+  async onModuleInit() {
+    await this.redisService?.subscribePattern(
+      RealtimeService.REDIS_CHANNEL_PATTERN,
+      (channel, message) => this.handleRedisRealtimeMessage(channel, message),
+    );
+  }
 
   registerClient(userId: string, socket: WebSocket) {
     const group = this.clients.get(userId) ?? new Set<WebSocket>();
@@ -165,6 +197,12 @@ export class RealtimeService {
   }
 
   async buildSnapshot(userId: string): Promise<BadgeSnapshot> {
+    const cacheKey = this.badgeSnapshotCacheKey(userId);
+    const cached = await this.redisService?.getJson<BadgeSnapshot>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
       await Promise.all([
         this.prisma.friendActivity.count({
@@ -189,7 +227,7 @@ export class RealtimeService {
         }),
       ]);
 
-    return {
+    const snapshot = {
       messagesUnread: 0,
       contactsUnread,
       discoverUnread,
@@ -198,6 +236,12 @@ export class RealtimeService {
       systemUnread: profileUnread,
       syncedAt: new Date().toISOString(),
     };
+    await this.redisService?.setJson(
+      cacheKey,
+      snapshot,
+      RealtimeService.BADGE_SNAPSHOT_TTL_SECONDS,
+    );
+    return snapshot;
   }
 
   async emitSnapshot(userId: string) {
@@ -209,6 +253,7 @@ export class RealtimeService {
   }
 
   async broadcastFriendUnreadCount(userId: string) {
+    await this.invalidateBadgeSnapshotCache(userId);
     const count = await this.prisma.friendActivity.count({
       where: { viewerId: userId, readAt: null },
     });
@@ -234,6 +279,7 @@ export class RealtimeService {
 
   /** "互动消息" unread — trace comments/replies + circle verification/invitation. */
   async broadcastInteractionUnread(userId: string) {
+    await this.invalidateBadgeSnapshotCache(userId);
     const count = await this.prisma.notification.count({
       where: {
         toUserID: userId,
@@ -254,6 +300,7 @@ export class RealtimeService {
 
   /** "报名管理" unread — unseen signups on the author's own posts. */
   async broadcastSignupUnread(userId: string) {
+    await this.invalidateBadgeSnapshotCache(userId);
     const count = await this.countUnreadSignups(userId);
 
     this.broadcast(userId, {
@@ -266,6 +313,7 @@ export class RealtimeService {
   }
 
   async broadcastSystemNotificationUnread(userId: string) {
+    await this.invalidateBadgeSnapshotCache(userId);
     const count = await this.prisma.notification.count({
       where: {
         toUserID: userId,
@@ -285,22 +333,46 @@ export class RealtimeService {
   }
 
   async broadcastMembershipStatus(userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { vipLevel: true },
-    });
-    if (!user) {
+    const payload = await this.getMembershipStatusPayload(userId);
+    if (!payload) {
       return;
     }
 
     this.broadcast(userId, {
       type: 'membership.status.changed',
-      payload: {
-        vipLevel: user.vipLevel,
-        expiredAt: null,
-        changedAt: new Date().toISOString(),
-      },
+      payload,
     });
+  }
+
+  private async getMembershipStatusPayload(
+    userId: string,
+  ): Promise<MembershipStatusPayload | null> {
+    const cacheKey = this.membershipStatusCacheKey(userId);
+    const cached =
+      await this.redisService?.getJson<MembershipStatusPayload>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { vipLevel: true },
+    });
+    if (!user) {
+      return null;
+    }
+
+    const payload = {
+      vipLevel: user.vipLevel,
+      expiredAt: null,
+      changedAt: new Date().toISOString(),
+    };
+    await this.redisService?.setJson(
+      cacheKey,
+      payload,
+      RealtimeService.MEMBERSHIP_STATUS_TTL_SECONDS,
+    );
+    return payload;
   }
 
   /**
@@ -447,6 +519,27 @@ export class RealtimeService {
   }
 
   async broadcastUserProfileSummary(userId: string) {
+    const payload = await this.getUserProfileSummaryPayload(userId);
+    if (!payload) {
+      return;
+    }
+
+    this.broadcast(userId, {
+      type: 'user.profile.summary.changed',
+      payload,
+    });
+  }
+
+  private async getUserProfileSummaryPayload(
+    userId: string,
+  ): Promise<UserProfileSummaryPayload | null> {
+    const cacheKey = this.userProfileSummaryCacheKey(userId);
+    const cached =
+      await this.redisService?.getJson<UserProfileSummaryPayload>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     const [user, latestDisplayIcon] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
@@ -460,19 +553,37 @@ export class RealtimeService {
     ]);
 
     if (!user) {
-      return;
+      return null;
     }
 
-    this.broadcast(userId, {
-      type: 'user.profile.summary.changed',
-      payload: {
-        vipLevel: user.vipLevel,
-        creditScore: user.creditScore,
-        displayIconsVersion:
-          latestDisplayIcon?.updatedAt.getTime() ?? Date.now(),
-        changedAt: new Date().toISOString(),
-      },
-    });
+    const payload = {
+      vipLevel: user.vipLevel,
+      creditScore: user.creditScore,
+      displayIconsVersion: latestDisplayIcon?.updatedAt.getTime() ?? Date.now(),
+      changedAt: new Date().toISOString(),
+    };
+    await this.redisService?.setJson(
+      cacheKey,
+      payload,
+      RealtimeService.PROFILE_SUMMARY_TTL_SECONDS,
+    );
+    return payload;
+  }
+
+  async invalidateUserHotCache(userId: string): Promise<void> {
+    await Promise.all([
+      this.invalidateBadgeSnapshotCache(userId),
+      this.invalidateMembershipStatusCache(userId),
+      this.invalidateUserProfileSummaryCache(userId),
+    ]);
+  }
+
+  async invalidateMembershipStatusCache(userId: string): Promise<void> {
+    await this.redisService?.deleteKey(this.membershipStatusCacheKey(userId));
+  }
+
+  async invalidateUserProfileSummaryCache(userId: string): Promise<void> {
+    await this.redisService?.deleteKey(this.userProfileSummaryCacheKey(userId));
   }
 
   /**
@@ -497,6 +608,11 @@ export class RealtimeService {
   }
 
   broadcast(userId: string, event: RealtimeEvent) {
+    this.deliverLocal(userId, event);
+    void this.publishCrossInstance(userId, event);
+  }
+
+  private deliverLocal(userId: string, event: RealtimeEvent) {
     const group = this.clients.get(userId);
     if (!group || group.size === 0) {
       return;
@@ -515,5 +631,85 @@ export class RealtimeService {
         }
       }
     }
+  }
+
+  private async publishCrossInstance(userId: string, event: RealtimeEvent) {
+    const published = await this.redisService?.publish(
+      `${RealtimeService.REDIS_CHANNEL_PREFIX}${userId}`,
+      JSON.stringify({ origin: this.instanceId, event }),
+    );
+
+    if (published === false) {
+      this.logger.debug(
+        `Redis realtime backplane unavailable; delivered event locally for ${userId}.`,
+      );
+    }
+  }
+
+  private async invalidateBadgeSnapshotCache(userId: string): Promise<void> {
+    await this.redisService?.deleteKey(this.badgeSnapshotCacheKey(userId));
+  }
+
+  private badgeSnapshotCacheKey(userId: string): string {
+    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:badge-snapshot`;
+  }
+
+  private membershipStatusCacheKey(userId: string): string {
+    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:membership-status`;
+  }
+
+  private userProfileSummaryCacheKey(userId: string): string {
+    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:profile-summary`;
+  }
+
+  private handleRedisRealtimeMessage(channel: string, message: string) {
+    if (!channel.startsWith(RealtimeService.REDIS_CHANNEL_PREFIX)) {
+      return;
+    }
+
+    const userId = channel.slice(RealtimeService.REDIS_CHANNEL_PREFIX.length);
+    if (!userId) {
+      return;
+    }
+
+    const envelope = this.parseRedisEnvelope(message);
+    if (!envelope || envelope.origin === this.instanceId) {
+      return;
+    }
+
+    this.deliverLocal(userId, envelope.event);
+  }
+
+  private parseRedisEnvelope(
+    message: string,
+  ): { origin: string; event: RealtimeEvent } | null {
+    try {
+      const parsed: unknown = JSON.parse(message);
+      if (!parsed || typeof parsed !== 'object') {
+        return null;
+      }
+      const envelope = parsed as {
+        origin?: unknown;
+        event?: unknown;
+      };
+      if (typeof envelope.origin !== 'string') {
+        return null;
+      }
+      if (!this.isRealtimeEvent(envelope.event)) {
+        return null;
+      }
+      return { origin: envelope.origin, event: envelope.event };
+    } catch {
+      return null;
+    }
+  }
+
+  private isRealtimeEvent(event: unknown): event is RealtimeEvent {
+    return (
+      !!event &&
+      typeof event === 'object' &&
+      typeof (event as { type?: unknown }).type === 'string' &&
+      'payload' in event
+    );
   }
 }

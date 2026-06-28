@@ -101,6 +101,7 @@ export class MembershipService {
       // Notification failure should not affect the successful purchase
     }
 
+    await this.realtimeService.invalidateUserHotCache(userId);
     await this.realtimeService.safeBroadcastAll([
       () => this.realtimeService.broadcastMembershipStatus(userId),
       () =>

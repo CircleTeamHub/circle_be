@@ -35,6 +35,7 @@ import { GroupModule } from './group/group.module';
 import { OutboxModule } from './outbox/outbox.module';
 import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
+import { RedisModule } from './redis/redis.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -49,6 +50,7 @@ const envFilePath = `.env.${nodeEnv}`;
     }),
     ScheduleModule.forRoot(),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
+    RedisModule,
     PrismaModule,
     UserModule,
     LogsModule,

@@ -3,13 +3,16 @@ import {
   Controller,
   HttpException,
   HttpStatus,
+  Inject,
   Post,
   Req,
+  Optional,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import { RedisService } from 'src/redis/redis.service';
 import { PresignDto } from './dto/presign.dto';
 import { UploadService } from './upload.service';
 
@@ -29,10 +32,17 @@ export class UploadController {
   >();
   private static readonly PRESIGN_LIMIT = 20;
   private static readonly PRESIGN_WINDOW_MS = 60_000;
+  private static readonly PRESIGN_WINDOW_SECONDS =
+    UploadController.PRESIGN_WINDOW_MS / 1000;
   /** Timestamp of the last expired-entry sweep — bounds the Map's growth. */
   private lastSweepAt = 0;
 
-  constructor(private readonly uploadService: UploadService) {}
+  constructor(
+    private readonly uploadService: UploadService,
+    @Optional()
+    @Inject(RedisService)
+    private readonly redisService?: RedisService,
+  ) {}
 
   @Post('presign')
   @ApiOperation({
@@ -41,7 +51,7 @@ export class UploadController {
       '返回 uploadUrl（PUT 文件用，5 分钟有效）和 fileUrl（上传后的永久访问地址）',
   })
   async presign(@Body() dto: PresignDto, @Req() req: RequestWithUser) {
-    this.checkUserPresignLimit(req.user.userId);
+    await this.checkUserPresignLimit(req.user.userId);
     // Pass userId for user-scoped folders so keys are namespaced per user,
     // enabling server-side ownership verification at upload time.
     return this.uploadService.presign(
@@ -68,7 +78,27 @@ export class UploadController {
     }
   }
 
-  private checkUserPresignLimit(userId: string): void {
+  private async checkUserPresignLimit(userId: string): Promise<void> {
+    if (this.redisService?.isEnabled()) {
+      const count = await this.redisService.incrementWithTtl(
+        `rl:upload-presign:user:${userId}`,
+        UploadController.PRESIGN_WINDOW_SECONDS,
+      );
+      if (count === null) {
+        throw new HttpException(
+          'Upload rate limit is temporarily unavailable. Please try again later.',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
+      if (count > UploadController.PRESIGN_LIMIT) {
+        throw new HttpException(
+          'Too many upload requests. Please wait before requesting more upload URLs.',
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      return;
+    }
+
     const now = Date.now();
     this.sweepExpiredPresignCounts(now);
     const entry = this.userPresignCounts.get(userId);

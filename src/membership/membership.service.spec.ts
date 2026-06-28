@@ -37,6 +37,7 @@ describe('MembershipService', () => {
     broadcastSystemNotificationCreated: jest.fn(),
     broadcastSystemNotificationUnread: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
+    invalidateUserHotCache: jest.fn(() => Promise.resolve()),
     safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
       Promise.allSettled(fns.map((fn) => fn())),
     ),
