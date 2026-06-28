@@ -132,6 +132,16 @@ describe('MembershipService', () => {
     expect(realtimeService.broadcastMembershipStatus).toHaveBeenCalledWith(
       'user-1',
     );
+    expect(realtimeService.invalidateUserHotCache).toHaveBeenCalledWith(
+      'user-1',
+    );
+    // Hot cache must be invalidated BEFORE the status broadcast, so the
+    // broadcast (and the client refetch it triggers) reads fresh data.
+    expect(
+      realtimeService.invalidateUserHotCache.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      realtimeService.broadcastMembershipStatus.mock.invocationCallOrder[0],
+    );
     expect(realtimeService.broadcastWalletBalanceChanged).toHaveBeenCalledWith(
       'user-1',
       {

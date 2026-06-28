@@ -193,6 +193,16 @@ describe('UserService', () => {
         avatarUrl: 'https://example.com/x.png',
       });
       expect(prisma.user.update).toHaveBeenCalled();
+      expect(
+        realtimeService.invalidateUserProfileSummaryCache,
+      ).toHaveBeenCalledWith('user-1');
+      // Invalidate the profile-summary hot cache before broadcasting the change.
+      expect(
+        realtimeService.invalidateUserProfileSummaryCache.mock
+          .invocationCallOrder[0],
+      ).toBeLessThan(
+        realtimeService.broadcastUserProfileSummary.mock.invocationCallOrder[0],
+      );
     });
 
     it('normalizes a YYYY-MM-DD birthday into a UTC Date', async () => {
