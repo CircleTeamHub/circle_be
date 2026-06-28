@@ -163,4 +163,23 @@ describe('setupApp', () => {
       'auth_login',
     );
   });
+
+  it('still boots when resolving RedisService throws (falls back to no Redis)', () => {
+    const app = {
+      setGlobalPrefix: jest.fn(),
+      useGlobalFilters: jest.fn(),
+      useGlobalPipes: jest.fn(),
+      useGlobalInterceptors: jest.fn(),
+      use: jest.fn(),
+      get: jest.fn((provider: unknown) => {
+        if (provider === RedisService) {
+          throw new Error('Nest cannot resolve RedisService');
+        }
+        return { httpAdapter: { reply: jest.fn() } };
+      }),
+      useLogger: jest.fn(),
+    };
+
+    expect(() => setupApp(app as any)).not.toThrow();
+  });
 });

@@ -1,4 +1,4 @@
-import { HttpException, HttpStatus } from '@nestjs/common';
+import { HttpStatus } from '@nestjs/common';
 import { RedisService } from 'src/redis/redis.service';
 import { UploadController } from './upload.controller';
 
@@ -63,20 +63,24 @@ describe('UploadController', () => {
     expect(uploadService.presign).not.toHaveBeenCalled();
   });
 
-  it('fails closed when Redis is configured but unavailable', async () => {
+  it('falls back to in-memory limiting when Redis is configured but errors', async () => {
+    // incrementWithTtl resolves null when Redis is unreachable: the limiter must
+    // degrade to per-instance in-memory counting rather than fail the upload.
     redisService.incrementWithTtl.mockResolvedValue(null);
     const controller = new UploadController(
       uploadService as any,
       redisService as unknown as RedisService,
     );
 
-    const result = controller.presign(dto, req);
+    for (let index = 0; index < 20; index += 1) {
+      await controller.presign(dto, req);
+    }
+    expect(uploadService.presign).toHaveBeenCalledTimes(20);
 
-    await expect(result).rejects.toThrow(HttpException);
-    await expect(result).rejects.toMatchObject({
-      status: HttpStatus.SERVICE_UNAVAILABLE,
+    // The 21st is throttled with 429 (not a 503 fail-closed).
+    await expect(controller.presign(dto, req)).rejects.toMatchObject({
+      status: HttpStatus.TOO_MANY_REQUESTS,
     });
-    expect(uploadService.presign).not.toHaveBeenCalled();
   });
 
   it('keeps the local fallback limiter when Redis is not configured', async () => {

@@ -2,6 +2,7 @@ import {
   Inject,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
   Optional,
 } from '@nestjs/common';
@@ -147,17 +148,56 @@ type RealtimeEvent =
     };
 
 @Injectable()
-export class RealtimeService implements OnModuleInit {
+export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private static readonly REDIS_CHANNEL_PREFIX = 'circle:realtime:user:';
   private static readonly REDIS_CHANNEL_PATTERN = `${RealtimeService.REDIS_CHANNEL_PREFIX}*`;
   private static readonly HOT_CACHE_PREFIX = 'circle:hot:user:';
   private static readonly BADGE_SNAPSHOT_TTL_SECONDS = 10;
   private static readonly PROFILE_SUMMARY_TTL_SECONDS = 30;
   private static readonly MEMBERSHIP_STATUS_TTL_SECONDS = 30;
+  private static readonly SUBSCRIPTION_RETRY_BASE_MS = 1_000;
+  private static readonly SUBSCRIPTION_RETRY_MAX_MS = 30_000;
+  /** Allow-list of event types accepted off the Redis backplane. */
+  private static readonly REALTIME_EVENT_TYPES: ReadonlySet<string> = new Set([
+    'badge.snapshot',
+    'call.invite',
+    'call.participant.joined',
+    'call.participant.left',
+    'call.participant.rejected',
+    'call.participant.missed',
+    'call.canceled',
+    'call.ended',
+    'friend.activity.unread.changed',
+    'interaction.unread.changed',
+    'circle.signup.unread.changed',
+    'system.notification.unread.changed',
+    'membership.status.changed',
+    'wallet.balance.changed',
+    'wallet.recharge.completed',
+    'circle.post.interaction.created',
+    'circle.invitation.reviewed',
+    'notification.created',
+    'system.notification.created',
+    'user.profile.summary.changed',
+  ]);
 
   private readonly logger = new Logger(RealtimeService.name);
   private readonly clients = new Map<string, Set<WebSocket>>();
   private readonly instanceId = randomUUID();
+  /** De-dupes concurrent cache-miss recomputes for the same key within this instance. */
+  private readonly inFlightReads = new Map<string, Promise<unknown>>();
+  private subscriptionActive = false;
+  private subscriptionRetryTimer: NodeJS.Timeout | null = null;
+  private subscriptionRetryAttempt = 0;
+  private destroyed = false;
+  /**
+   * Count of cross-instance messages received for users NOT connected locally.
+   * Because every instance psubscribes `circle:realtime:user:*`, each instance
+   * sees every user's events and discards the ones it doesn't hold. A high ratio
+   * here signals the global-fanout pub/sub is becoming a scaling bottleneck and
+   * should be replaced by per-user / per-instance routing.
+   */
+  private crossInstanceIgnored = 0;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -167,10 +207,90 @@ export class RealtimeService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    await this.redisService?.subscribePattern(
+    await this.ensureBackplaneSubscription();
+  }
+
+  onModuleDestroy() {
+    this.destroyed = true;
+    if (this.subscriptionRetryTimer) {
+      clearTimeout(this.subscriptionRetryTimer);
+      this.subscriptionRetryTimer = null;
+    }
+  }
+
+  /** Observability hook: cross-instance messages discarded for non-local users. */
+  getCrossInstanceIgnoredCount(): number {
+    return this.crossInstanceIgnored;
+  }
+
+  /**
+   * Establishes the Redis pub/sub subscription, retrying with backoff if Redis
+   * is unreachable at boot. Without this, a Redis outage during startup would
+   * leave the instance permanently deaf to cross-instance events (it would still
+   * publish, but never receive) until the process restarts.
+   */
+  private async ensureBackplaneSubscription(): Promise<void> {
+    if (
+      this.destroyed ||
+      this.subscriptionActive ||
+      !this.redisService?.isEnabled()
+    ) {
+      return;
+    }
+
+    const subscribed = await this.redisService.subscribePattern(
       RealtimeService.REDIS_CHANNEL_PATTERN,
       (channel, message) => this.handleRedisRealtimeMessage(channel, message),
     );
+
+    if (subscribed) {
+      this.subscriptionActive = true;
+      this.subscriptionRetryAttempt = 0;
+      return;
+    }
+
+    this.scheduleSubscriptionRetry();
+  }
+
+  private scheduleSubscriptionRetry(): void {
+    if (this.destroyed || this.subscriptionRetryTimer) {
+      return;
+    }
+
+    const delay = Math.min(
+      RealtimeService.SUBSCRIPTION_RETRY_BASE_MS *
+        2 ** this.subscriptionRetryAttempt,
+      RealtimeService.SUBSCRIPTION_RETRY_MAX_MS,
+    );
+    this.subscriptionRetryAttempt += 1;
+    this.logger.warn(
+      `Realtime backplane subscription inactive; retrying in ${delay}ms.`,
+    );
+
+    this.subscriptionRetryTimer = setTimeout(() => {
+      this.subscriptionRetryTimer = null;
+      void this.ensureBackplaneSubscription();
+    }, delay);
+    // Don't keep the process alive solely for this retry timer.
+    this.subscriptionRetryTimer.unref?.();
+  }
+
+  /**
+   * Runs `compute` at most once per `key` while it is in flight, so a burst of
+   * concurrent cache misses for the same user issues a single DB read instead of
+   * a stampede. Purely in-process; cross-instance safety comes from the
+   * versioned cache writes (setJsonIfNewer).
+   */
+  private singleFlight<T>(key: string, compute: () => Promise<T>): Promise<T> {
+    const existing = this.inFlightReads.get(key) as Promise<T> | undefined;
+    if (existing) {
+      return existing;
+    }
+    const promise = compute().finally(() => {
+      this.inFlightReads.delete(key);
+    });
+    this.inFlightReads.set(key, promise);
+    return promise;
   }
 
   registerClient(userId: string, socket: WebSocket) {
@@ -203,45 +323,47 @@ export class RealtimeService implements OnModuleInit {
       return cached;
     }
 
-    const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
-      await Promise.all([
-        this.prisma.friendActivity.count({
-          where: { viewerId: userId, readAt: null },
-        }),
-        this.prisma.notification.count({
-          where: {
-            toUserID: userId,
-            deleted: false,
-            read: false,
-            type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-          },
-        }),
-        this.countUnreadSignups(userId),
-        this.prisma.notification.count({
-          where: {
-            toUserID: userId,
-            deleted: false,
-            read: false,
-            type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-          },
-        }),
-      ]);
+    return this.singleFlight(cacheKey, async () => {
+      const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
+        await Promise.all([
+          this.prisma.friendActivity.count({
+            where: { viewerId: userId, readAt: null },
+          }),
+          this.prisma.notification.count({
+            where: {
+              toUserID: userId,
+              deleted: false,
+              read: false,
+              type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+            },
+          }),
+          this.countUnreadSignups(userId),
+          this.prisma.notification.count({
+            where: {
+              toUserID: userId,
+              deleted: false,
+              read: false,
+              type: { in: [...PROFILE_NOTIFICATION_TYPES] },
+            },
+          }),
+        ]);
 
-    const snapshot = {
-      messagesUnread: 0,
-      contactsUnread,
-      discoverUnread,
-      signupUnread,
-      profileUnread,
-      systemUnread: profileUnread,
-      syncedAt: new Date().toISOString(),
-    };
-    await this.redisService?.setJson(
-      cacheKey,
-      snapshot,
-      RealtimeService.BADGE_SNAPSHOT_TTL_SECONDS,
-    );
-    return snapshot;
+      const snapshot: BadgeSnapshot = {
+        messagesUnread: 0,
+        contactsUnread,
+        discoverUnread,
+        signupUnread,
+        profileUnread,
+        systemUnread: profileUnread,
+        syncedAt: new Date().toISOString(),
+      };
+      await this.redisService?.setJson(
+        cacheKey,
+        snapshot,
+        RealtimeService.BADGE_SNAPSHOT_TTL_SECONDS,
+      );
+      return snapshot;
+    });
   }
 
   async emitSnapshot(userId: string) {
@@ -349,30 +471,37 @@ export class RealtimeService implements OnModuleInit {
   ): Promise<MembershipStatusPayload | null> {
     const cacheKey = this.membershipStatusCacheKey(userId);
     const cached =
-      await this.redisService?.getJson<MembershipStatusPayload>(cacheKey);
+      await this.redisService?.getJsonWithVersion<MembershipStatusPayload>(
+        cacheKey,
+      );
     if (cached) {
-      return cached;
+      return cached.payload;
     }
 
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { vipLevel: true },
+    return this.singleFlight(cacheKey, async () => {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { vipLevel: true, updatedAt: true },
+      });
+      if (!user) {
+        return null;
+      }
+
+      const payload: MembershipStatusPayload = {
+        vipLevel: user.vipLevel,
+        expiredAt: null,
+        changedAt: new Date().toISOString(),
+      };
+      // Version-guarded write: a slow reader holding a pre-update value can't
+      // clobber a fresher one (the mutation bumps user.updatedAt).
+      await this.redisService?.setJsonIfNewer(
+        cacheKey,
+        payload,
+        user.updatedAt.getTime(),
+        RealtimeService.MEMBERSHIP_STATUS_TTL_SECONDS,
+      );
+      return payload;
     });
-    if (!user) {
-      return null;
-    }
-
-    const payload = {
-      vipLevel: user.vipLevel,
-      expiredAt: null,
-      changedAt: new Date().toISOString(),
-    };
-    await this.redisService?.setJson(
-      cacheKey,
-      payload,
-      RealtimeService.MEMBERSHIP_STATUS_TTL_SECONDS,
-    );
-    return payload;
   }
 
   /**
@@ -535,39 +664,50 @@ export class RealtimeService implements OnModuleInit {
   ): Promise<UserProfileSummaryPayload | null> {
     const cacheKey = this.userProfileSummaryCacheKey(userId);
     const cached =
-      await this.redisService?.getJson<UserProfileSummaryPayload>(cacheKey);
+      await this.redisService?.getJsonWithVersion<UserProfileSummaryPayload>(
+        cacheKey,
+      );
     if (cached) {
-      return cached;
+      return cached.payload;
     }
 
-    const [user, latestDisplayIcon] = await Promise.all([
-      this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { vipLevel: true, creditScore: true },
-      }),
-      this.prisma.userDisplayIcon.findFirst({
-        where: { userID: userId },
-        orderBy: { updatedAt: 'desc' },
-        select: { updatedAt: true },
-      }),
-    ]);
+    return this.singleFlight(cacheKey, async () => {
+      const [user, latestDisplayIcon] = await Promise.all([
+        this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { vipLevel: true, creditScore: true, updatedAt: true },
+        }),
+        this.prisma.userDisplayIcon.findFirst({
+          where: { userID: userId },
+          orderBy: { updatedAt: 'desc' },
+          select: { updatedAt: true },
+        }),
+      ]);
 
-    if (!user) {
-      return null;
-    }
+      if (!user) {
+        return null;
+      }
 
-    const payload = {
-      vipLevel: user.vipLevel,
-      creditScore: user.creditScore,
-      displayIconsVersion: latestDisplayIcon?.updatedAt.getTime() ?? Date.now(),
-      changedAt: new Date().toISOString(),
-    };
-    await this.redisService?.setJson(
-      cacheKey,
-      payload,
-      RealtimeService.PROFILE_SUMMARY_TTL_SECONDS,
-    );
-    return payload;
+      const displayIconsUpdatedAt = latestDisplayIcon?.updatedAt.getTime() ?? 0;
+      const payload: UserProfileSummaryPayload = {
+        vipLevel: user.vipLevel,
+        creditScore: user.creditScore,
+        // Stable for icon-less users (0) so the cached payload doesn't churn on
+        // every recompute and trigger needless client refetches.
+        displayIconsVersion: displayIconsUpdatedAt,
+        changedAt: new Date().toISOString(),
+      };
+      // Version = newest of profile-row / display-icon change, so a stale reader
+      // can't overwrite a fresher write (see setJsonIfNewer).
+      const version = Math.max(user.updatedAt.getTime(), displayIconsUpdatedAt);
+      await this.redisService?.setJsonIfNewer(
+        cacheKey,
+        payload,
+        version,
+        RealtimeService.PROFILE_SUMMARY_TTL_SECONDS,
+      );
+      return payload;
+    });
   }
 
   async invalidateUserHotCache(userId: string): Promise<void> {
@@ -677,6 +817,13 @@ export class RealtimeService implements OnModuleInit {
       return;
     }
 
+    // Global-fanout psubscribe means we receive events for every user; skip
+    // (and count) the ones we don't hold locally so the overhead is measurable.
+    if (!this.clients.has(userId)) {
+      this.crossInstanceIgnored += 1;
+      return;
+    }
+
     this.deliverLocal(userId, envelope.event);
   }
 
@@ -705,11 +852,17 @@ export class RealtimeService implements OnModuleInit {
   }
 
   private isRealtimeEvent(event: unknown): event is RealtimeEvent {
+    if (!event || typeof event !== 'object') {
+      return false;
+    }
+    const candidate = event as { type?: unknown; payload?: unknown };
+    // Only known event types pass — a malformed or foreign message published to
+    // the channel must never be re-broadcast to clients verbatim.
     return (
-      !!event &&
-      typeof event === 'object' &&
-      typeof (event as { type?: unknown }).type === 'string' &&
-      'payload' in event
+      typeof candidate.type === 'string' &&
+      RealtimeService.REALTIME_EVENT_TYPES.has(candidate.type) &&
+      typeof candidate.payload === 'object' &&
+      candidate.payload !== null
     );
   }
 }

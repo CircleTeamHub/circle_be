@@ -188,7 +188,11 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     const store = redisService?.createRateLimitStore(limiterName);
     return rateLimit({
       ...options,
-      ...(store ? { store, passOnStoreError: true } : {}),
+      // The Redis store is wrapped in FallbackRateLimitStore, which degrades to
+      // per-instance in-memory limiting on a Redis outage rather than throwing.
+      // So we do NOT pass on store errors — limiting must never silently fail
+      // open (brute-force / account-enumeration protection lives here).
+      ...(store ? { store, passOnStoreError: false } : {}),
       ...(logger
         ? {
             handler: createRateLimitHandler(logger, {

@@ -84,21 +84,22 @@ export class UploadController {
         `rl:upload-presign:user:${userId}`,
         UploadController.PRESIGN_WINDOW_SECONDS,
       );
-      if (count === null) {
-        throw new HttpException(
-          'Upload rate limit is temporarily unavailable. Please try again later.',
-          HttpStatus.SERVICE_UNAVAILABLE,
-        );
+      if (count !== null) {
+        if (count > UploadController.PRESIGN_LIMIT) {
+          throw this.tooManyPresignRequests();
+        }
+        return;
       }
-      if (count > UploadController.PRESIGN_LIMIT) {
-        throw new HttpException(
-          'Too many upload requests. Please wait before requesting more upload URLs.',
-          HttpStatus.TOO_MANY_REQUESTS,
-        );
-      }
-      return;
+      // Redis is configured but errored (null): degrade to per-instance
+      // in-memory limiting instead of failing the upload (503). This keeps the
+      // limiter active and never fully fails open, consistent with how the
+      // express-rate-limit limiters fall back during a Redis outage.
     }
 
+    this.checkInMemoryPresignLimit(userId);
+  }
+
+  private checkInMemoryPresignLimit(userId: string): void {
     const now = Date.now();
     this.sweepExpiredPresignCounts(now);
     const entry = this.userPresignCounts.get(userId);
@@ -112,12 +113,16 @@ export class UploadController {
     }
 
     if (entry.count >= UploadController.PRESIGN_LIMIT) {
-      throw new HttpException(
-        'Too many upload requests. Please wait before requesting more upload URLs.',
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
+      throw this.tooManyPresignRequests();
     }
 
     entry.count += 1;
+  }
+
+  private tooManyPresignRequests(): HttpException {
+    return new HttpException(
+      'Too many upload requests. Please wait before requesting more upload URLs.',
+      HttpStatus.TOO_MANY_REQUESTS,
+    );
   }
 }
