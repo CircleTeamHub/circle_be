@@ -689,10 +689,7 @@ export class AuthService {
 
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
       this.refreshTokenService.create(userId, sessionContext),
-      this.openim.getUserToken(userId, platformID).catch((err) => {
-        this.logger.warn(`OpenIM getUserToken failed: ${err?.message}`);
-        return '';
-      }),
+      this.resolveImToken(userId, platformID),
     ]);
     const accessToken = await this.signAccessToken(
       userId,
@@ -701,6 +698,30 @@ export class AuthService {
       sessionId,
     );
     return { accessToken, refreshToken, imToken };
+  }
+
+  /**
+   * 取 OpenIM 用户 token。IM 不是登录的硬依赖：拿不到时退化为空串，让登录照常完成。
+   * 但失败必须「喊出来」——否则 OpenIM 宕机（如 Kafka 抽风导致 get_user_token 超时）时，
+   * 前端只会静默拿到空 imToken、连不上 IM、会话加载不出来，问题极难定位。
+   *
+   * 注意：OpenIM 被显式禁用（未配置 API/secret）时 getUserToken 直接返回空串、不抛错，
+   * 因此这里的 error 日志只会在「真实故障」时触发，不会对预期内的禁用态误报。
+   */
+  private async resolveImToken(
+    userId: string,
+    platformID?: 1 | 2 | 5,
+  ): Promise<string> {
+    try {
+      return await this.openim.getUserToken(userId, platformID);
+    } catch (err) {
+      this.logger.error(
+        `OpenIM getUserToken failed for userId=${userId} platformID=${platformID ?? 'default'}; ` +
+          'returning empty imToken — client IM login will be skipped',
+        err instanceof Error ? err.stack : String(err),
+      );
+      return '';
+    }
   }
 
   private signAccessToken(
