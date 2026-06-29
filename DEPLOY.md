@@ -28,16 +28,20 @@ docker version && docker compose version
 ## 2. 放行端口(两层都要开)
 
 **A. Oracle 控制台** → VCN → 对应子网的 Security List → Ingress Rules,加入(Source `0.0.0.0/0`,TCP):
-`3000`(API)、`9000`(MinIO)、`9001`(MinIO 控制台,建议只填你自己的 IP)。
+`3000`(API)、`9000`(MinIO S3)。
+> MinIO 控制台(9001)**不对公网开放** —— compose 已把它绑到 `127.0.0.1`,只走 SSH 隧道访问(见 §5)。
+> (别用 iptables INPUT 规则去“限制”它:Docker 发布端口走 DOCKER 链、先于 INPUT,挡不住;绑回环才可靠。)
 
 **B. 实例内 iptables**(Oracle 的 Ubuntu 镜像默认只放行 22):
 
 ```bash
 sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 3000 -j ACCEPT
 sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 9000 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 9001 -j ACCEPT
 sudo netfilter-persistent save   # 持久化,重启不丢
 ```
+
+> 正式生产(非测试):3000/9000 应放到一个 TLS 反代(Caddy/Nginx + 域名)后面,别用明文 HTTP 暴露;
+> 裸 IP 签不了证书,需要一个域名。本手册是测试环境,默认明文。
 
 ## 3. 上传代码
 
@@ -73,6 +77,13 @@ curl -i http://localhost:3000/api/v1/auth/me
 ```
 
 公网验证:浏览器/另一台机访问 `http://<公网IP>:3000/api/v1/auth/me`。
+
+MinIO 控制台(只绑服务器本机)从本地开 SSH 隧道访问:
+
+```bash
+ssh -i ~/.ssh/circle_oracle -L 9001:localhost:9001 ubuntu@<公网IP>
+# 保持连接,浏览器开 http://localhost:9001(账号/密码见 .env 的 MINIO_ROOT_*)
+```
 
 ---
 
