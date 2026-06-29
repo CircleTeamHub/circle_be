@@ -1,5 +1,6 @@
 export enum ConfigEnum {
   DATABASE_URL = 'DATABASE_URL',
+  REDIS_URL = 'REDIS_URL',
   SECRET = 'SECRET',
 }
 

@@ -40,4 +40,17 @@ describe('createEnvValidationSchema', () => {
     expect(value.CALL_MAX_PARTICIPANTS).toBe(10);
     expect(value.CALL_ENABLE_VIDEO).toBe(false);
   });
+
+  it('accepts optional REDIS_URL for shared realtime and rate limiting', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      REDIS_URL: 'redis://localhost:6379',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.REDIS_URL).toBe('redis://localhost:6379');
+  });
 });

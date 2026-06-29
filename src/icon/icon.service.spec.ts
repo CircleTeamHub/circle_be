@@ -24,6 +24,7 @@ describe('IconService', () => {
 
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(),
+    invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
 
   beforeEach(async () => {
@@ -162,6 +163,16 @@ describe('IconService', () => {
       } as any,
     ]);
 
+    expect(
+      realtimeService.invalidateUserProfileSummaryCache,
+    ).toHaveBeenCalledWith('user-1');
+    // Invalidate must run before the broadcast so a client refetch reads fresh.
+    expect(
+      realtimeService.invalidateUserProfileSummaryCache.mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(
+      realtimeService.broadcastUserProfileSummary.mock.invocationCallOrder[0],
+    );
     expect(realtimeService.broadcastUserProfileSummary).toHaveBeenCalledWith(
       'user-1',
     );

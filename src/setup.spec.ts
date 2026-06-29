@@ -2,16 +2,22 @@ import { AllExceptionFilter } from './filters/all-exception.filter';
 import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
 import { ErrorLoggingInterceptor } from './interceptors/error-logging.interceptor';
+import { RedisService } from './redis/redis.service';
 import { setupApp } from './setup';
 
-function buildAppMock() {
+function buildAppMock(
+  redisService?: Pick<RedisService, 'createRateLimitStore'>,
+) {
   return {
     setGlobalPrefix: jest.fn(),
     useGlobalFilters: jest.fn(),
     useGlobalPipes: jest.fn(),
     useGlobalInterceptors: jest.fn(),
     use: jest.fn(),
-    get: jest.fn().mockReturnValue({ httpAdapter: { reply: jest.fn() } }),
+    get: jest.fn((token: unknown) => {
+      if (token === RedisService && redisService) return redisService;
+      return { httpAdapter: { reply: jest.fn() } };
+    }),
     useLogger: jest.fn(),
   };
 }
@@ -131,5 +137,49 @@ describe('setupApp', () => {
     expect(groupLimiters).toHaveLength(2);
     expect(groupLimiters[0][1]).toEqual(expect.any(Function));
     expect(groupLimiters[1][1]).toEqual(expect.any(Function));
+  });
+
+  it('uses Redis-backed stores for express rate limits when Redis is configured', () => {
+    const createStore = (name: string) =>
+      ({
+        name,
+        init: jest.fn(),
+        increment: jest.fn(async () => ({
+          totalHits: 1,
+          resetTime: new Date(Date.now() + 60_000),
+        })),
+        decrement: jest.fn(),
+        resetKey: jest.fn(),
+      }) as any;
+    const redisService = {
+      createRateLimitStore: jest.fn(createStore),
+    };
+    const app = buildAppMock(redisService);
+
+    setupApp(app as any);
+
+    expect(redisService.createRateLimitStore).toHaveBeenCalledWith('global');
+    expect(redisService.createRateLimitStore).toHaveBeenCalledWith(
+      'auth_login',
+    );
+  });
+
+  it('still boots when resolving RedisService throws (falls back to no Redis)', () => {
+    const app = {
+      setGlobalPrefix: jest.fn(),
+      useGlobalFilters: jest.fn(),
+      useGlobalPipes: jest.fn(),
+      useGlobalInterceptors: jest.fn(),
+      use: jest.fn(),
+      get: jest.fn((provider: unknown) => {
+        if (provider === RedisService) {
+          throw new Error('Nest cannot resolve RedisService');
+        }
+        return { httpAdapter: { reply: jest.fn() } };
+      }),
+      useLogger: jest.fn(),
+    };
+
+    expect(() => setupApp(app as any)).not.toThrow();
   });
 });
