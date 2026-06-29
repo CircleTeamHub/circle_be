@@ -1,26 +1,115 @@
-# Use root/example as user/password credentials
-version: '3.1'
+# circle_be 测试环境部署编排 —— 核心后端栈(阶段4)。
+#
+#   postgres + minio(+ 建桶)+ 一次性 migrate + circle_be
+#
+# OpenIM(阶段5)用官方 openim-docker 单独编排;LiveKit(阶段6)用 LiveKit Cloud。
+# 完整步骤见 DEPLOY.md。
+#
+# compose 变量插值从同目录 .env 读(DB_PASSWORD / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)。
+# 应用配置从挂载的 .env.production 读(见 .env.production.example)。
+# 两者的 DB 密码、MinIO 密钥必须一致 —— DEPLOY.md 的 gen-env 步骤会自动保持一致。
+
+name: circle-be
 
 services:
-  db:
-    image: mysql
-    # NOTE: use of "mysql_native_password" is not recommended: https://dev.mysql.com/doc/refman/8.0/en/upgrading-from-previous-series.html#upgrade-caching-sha2-password
-    # (this is just an example, not intended to be a production configuration)
-    command: --default-authentication-plugin=mysql_native_password
-    restart: always
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: 8jdgi5anfkr2gm00rza1wvhjm2i9o4fl
-      MYSQL_DATABASE: nestjs-backend
-      MYSQL_USER: toimc
-      MYSQL_PASSWORD: mch2lvy2o9vdo32md7bbs6kd2e7ctdcy
+      POSTGRES_USER: circle
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: circle
     volumes:
-      - /home/mysql/db:/var/lib/mysql
-    ports:
-      - 12000:3306
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U circle -d circle']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # 仅供容器内访问,不对公网暴露端口
 
-  # navicat
-  adminer:
-    image: adminer
-    restart: always
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    command: server /data --console-address ":9001"
     ports:
-      - 12005:8080
+      - '9000:9000' # S3 API —— app 下载图片要用,需放行
+      # 控制台只绑回环:用 SSH 隧道访问(ssh -L 9001:localhost:9001 ...)。
+      # 不要发布到 0.0.0.0 —— Docker 发布端口走 DOCKER 链、先于 iptables INPUT,
+      # 主机防火墙 INPUT 规则挡不住,会把管理后台直接暴露公网。
+      - '127.0.0.1:9001:9001'
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # 一次性:确保 bucket 存在且可公开下载,然后退出
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set}
+    entrypoint: >
+      sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb -p local/circle &&
+      mc anonymous set download local/circle &&
+      echo 'minio bucket [circle] ready'
+      "
+    restart: 'no'
+
+  # 一次性:应用 Prisma 迁移建表,然后退出。
+  # 生产镜像 prune 掉了 prisma CLI,故用干净 node 镜像 + npx 拉 prisma(钉到
+  # 7.8.0,与 package-lock 的 prisma CLI 版本对齐,保证迁移可复现)。
+  migrate:
+    image: node:22-slim
+    working_dir: /app
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      # prisma CLI 从环境变量读 DATABASE_URL(schema.prisma datasource url=env(...))
+      DATABASE_URL: 'postgresql://circle:${DB_PASSWORD:?set}@postgres:5432/circle?schema=public'
+    volumes:
+      - ./prisma:/app/prisma:ro
+    command: sh -c "npx --yes prisma@7.8.0 migrate deploy"
+    restart: 'no'
+
+  circle_be:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+    environment:
+      NODE_ENV: production
+    volumes:
+      # getServerConfig 读这个文件;只读挂载
+      - ./.env.production:/app/.env.production:ro
+    ports:
+      - '3000:3000'
+    healthcheck:
+      # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://127.0.0.1:3000/api/v1/outbox/health',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  pg_data:
+  minio_data:
