@@ -19,6 +19,9 @@ describe('UserService', () => {
       count: jest.fn(),
       update: jest.fn(),
     },
+    userLike: {
+      findUnique: jest.fn(),
+    },
   };
   const refreshTokens = {
     revokeAll: jest.fn().mockResolvedValue(undefined),
@@ -56,6 +59,7 @@ describe('UserService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     privacySettings.canViewProfileField.mockResolvedValue(true);
+    prisma.userLike.findUnique.mockResolvedValue(null);
     service = await buildService();
   });
 
@@ -124,12 +128,19 @@ describe('UserService', () => {
   });
 
   describe('findOne', () => {
-    it('returns the user when found', async () => {
-      prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
-      await expect(service.findOne('user-1')).resolves.toEqual({
+    it('returns the user (with like status) when found', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        receivedLikeCount: 4,
+      });
+      // Self-view: likedByMeToday is always false and no like lookup is made.
+      await expect(service.findOne('user-1')).resolves.toMatchObject({
         id: 'user-1',
         displayIcons: [],
+        likeCount: 4,
+        likedByMeToday: false,
       });
+      expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
     });
 
     it('filters contact fields according to target privacy settings for other viewers', async () => {
@@ -143,12 +154,15 @@ describe('UserService', () => {
         async (_targetId: string, field: string) => field === 'wechat',
       );
 
-      await expect(service.findOne('target-1', 'viewer-1')).resolves.toEqual({
+      await expect(
+        service.findOne('target-1', 'viewer-1'),
+      ).resolves.toMatchObject({
         id: 'target-1',
         phoneNumber: null,
         wechat: 'wxid_target',
         qq: null,
         displayIcons: [],
+        likedByMeToday: false,
       });
     });
 

@@ -117,6 +117,7 @@ enum UserDisplayIconType {
 enum SystemIconKey {
   VIP
   NEW_USER
+  PARTNER
 }
 
 enum CircleCategory {
@@ -243,6 +244,8 @@ model User {
   lastOnline                 DateTime?
   /// Set once the one-time friend-activity backfill has run for this user.
   activitiesBackfilledAt     DateTime?
+  /// 收到的累计点赞总数（每人对其每天最多 +1），达阈值发放合作达人徽章。
+  receivedLikeCount          Int        @default(0)
   createdAt                  DateTime   @default(now())
   updatedAt                  DateTime   @updatedAt
 
@@ -256,6 +259,8 @@ model User {
   traces                       Trace[]
   traceComments                TraceComment[]
   traceLikeStats               traceLikeStat[]
+  likesGiven                   UserLike[]                  @relation("userLikesGiven")
+  likesReceived                UserLike[]                  @relation("userLikesReceived")
   tracePreferences             UserTracePreference[]
   privacySetting               UserPrivacySetting?
   wallet                       Wallet?
@@ -1105,4 +1110,23 @@ model EmailVerificationCode {
   createdAt  DateTime         @default(now())
 
   @@index([email, purpose])
+}
+
+/// 用户对用户的点赞：每人对同一目标「每天」最多一条（likedOn 为日期，唯一约束防当日重复）。
+/// 被赞总数累计在 User.receivedLikeCount，达阈值发放合作达人徽章。
+model UserLike {
+  id         String   @id @default(uuid())
+  fromUserID String
+  toUserID   String
+  likedOn    DateTime @db.Date
+  createdAt  DateTime @default(now())
+
+  fromUser User @relation("userLikesGiven", fields: [fromUserID], references: [id], onDelete: Cascade)
+  toUser   User @relation("userLikesReceived", fields: [toUserID], references: [id], onDelete: Cascade)
+
+  @@unique([fromUserID, toUserID, likedOn])
+  @@index([toUserID])
+  // Composite backs the per-day quota count (WHERE fromUserID = ? AND likedOn = ?);
+  // its fromUserID prefix also serves any fromUserID-only lookup.
+  @@index([fromUserID, likedOn])
 }

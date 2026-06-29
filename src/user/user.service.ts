@@ -14,6 +14,7 @@ import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
+import { likedOnToday } from '../like/like.util';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -202,9 +203,26 @@ export class UserService {
     ]);
     if (!user) throw new NotFoundException(`User ${id} not found`);
     const filteredUser = await this.applyProfilePrivacy(user, viewerId);
+    // 资料页携带「被赞总数 + 我今天赞过没」（看自己时 likedByMeToday 恒为 false）。
+    const likedByMeToday =
+      viewerId && viewerId !== id
+        ? Boolean(
+            await this.prisma.userLike.findUnique({
+              where: {
+                fromUserID_toUserID_likedOn: {
+                  fromUserID: viewerId,
+                  toUserID: id,
+                  likedOn: likedOnToday(),
+                },
+              },
+            }),
+          )
+        : false;
     return {
       ...filteredUser,
       displayIcons,
+      likeCount: user.receivedLikeCount,
+      likedByMeToday,
     };
   }
 

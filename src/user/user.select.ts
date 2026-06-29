@@ -27,6 +27,7 @@ export const USER_PROFILE_SELECT = {
   role: true,
   status: true,
   lastOnline: true,
+  receivedLikeCount: true,
   createdAt: true,
   updatedAt: true,
 } as const;

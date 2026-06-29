@@ -120,4 +120,15 @@ export class ProfileUserDto extends PublicUserDto {
   @ApiPropertyOptional({ example: '+8613800138000' })
   @Expose()
   phoneNumber: string | null;
+
+  @ApiProperty({ example: 12, description: '收到的累计点赞总数' })
+  @Expose()
+  likeCount: number;
+
+  @ApiProperty({
+    example: false,
+    description: '当前登录用户今天是否已为其点赞（看自己时恒为 false）',
+  })
+  @Expose()
+  likedByMeToday: boolean;
 }

@@ -256,4 +256,44 @@ describe('IconService', () => {
     // Cache was invalidated by updateDisplayIcons, so the next read hits DB.
     expect(prisma.user.findUnique).toHaveBeenCalled();
   });
+
+  it('awards the PARTNER (合作达人) badge once receivedLikeCount crosses the threshold', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 0,
+      receivedLikeCount: 5, // >= PARTNER_LIKE_THRESHOLD (3)
+      createdAt: new Date(0), // old account → no NEW_USER badge
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(result.systemIcons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ systemKey: 'PARTNER', title: '合作达人' }),
+      ]),
+    );
+  });
+
+  it('does NOT award PARTNER below the threshold', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 0,
+      receivedLikeCount: 2, // below threshold
+      createdAt: new Date(0),
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(result.systemIcons).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ systemKey: 'PARTNER' }),
+      ]),
+    );
+  });
 });

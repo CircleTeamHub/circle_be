@@ -15,6 +15,8 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
+// 被赞总数达到该阈值即获得合作达人（PARTNER）徽章。随时可改。
+const PARTNER_LIKE_THRESHOLD = 3;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -191,6 +193,7 @@ export class IconService {
       select: {
         id: true,
         vipLevel: true,
+        receivedLikeCount: true,
         createdAt: true,
         iconPreferencesInitialized: true,
       },
@@ -241,6 +244,16 @@ export class IconService {
         systemKey: SystemIconKeyDto.NEW_USER,
         title: '新手',
         fallbackIconName: 'rocket-outline',
+        imageUrl: null,
+      });
+    }
+
+    // 合作达人：被赞总数达到阈值即获得。
+    if (user.receivedLikeCount >= PARTNER_LIKE_THRESHOLD) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.PARTNER,
+        title: '合作达人',
+        fallbackIconName: 'ribbon-outline',
         imageUrl: null,
       });
     }
