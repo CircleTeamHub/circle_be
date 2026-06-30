@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { IconService } from 'src/icon/icon.service';
 import { CirclePlazaService } from './circle-plaza.service';
 
 describe('CirclePlazaService', () => {
@@ -16,6 +17,10 @@ describe('CirclePlazaService', () => {
   const prisma = {
     circleMember: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
+    },
+    block: {
+      findFirst: jest.fn(),
     },
     note: {
       findFirst: jest.fn(),
@@ -27,6 +32,7 @@ describe('CirclePlazaService', () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     circlePostSignup: {
       findUnique: jest.fn(),
@@ -40,9 +46,15 @@ describe('CirclePlazaService', () => {
     circle: {
       update: jest.fn(),
     },
+    collaborationRecognition: {
+      count: jest.fn(),
+      createMany: jest.fn(),
+    },
     user: {
       findUnique: jest.fn(),
     },
+    $queryRaw: jest.fn(),
+    $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -50,14 +62,20 @@ describe('CirclePlazaService', () => {
     broadcastSignupUnread: jest.fn(),
     broadcastInteractionUnread: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
   };
   const notificationService = {
     createCirclePostSignupNotification: jest.fn(),
+    createCirclePostAutoEndedNotification: jest.fn(),
+  };
+  const iconService = {
+    invalidateDisplayIconCacheFor: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     notificationService.createCirclePostSignupNotification.mockReset();
+    notificationService.createCirclePostAutoEndedNotification.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -66,6 +84,7 @@ describe('CirclePlazaService', () => {
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         { provide: RealtimeService, useValue: realtime },
         { provide: NotificationService, useValue: notificationService },
+        { provide: IconService, useValue: iconService },
       ],
     }).compile();
 
@@ -74,6 +93,9 @@ describe('CirclePlazaService', () => {
 
   describe('getFeed', () => {
     it('only returns posts from circles the viewer has actively joined', async () => {
+      jest
+        .useFakeTimers()
+        .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
@@ -82,25 +104,43 @@ describe('CirclePlazaService', () => {
         fancyNumber: false,
       });
 
-      const result = await service.getFeed('viewer-1', {});
+      try {
+        const result = await service.getFeed('viewer-1', {});
 
-      expect(result.items).toEqual([]);
-      const expectedMembershipScope = {
-        circle: {
-          deleted: false,
-          members: {
-            some: { userID: 'viewer-1', status: 'ACTIVE' },
+        expect(result.items).toEqual([]);
+        const expectedMembershipScope = {
+          circle: {
+            deleted: false,
+            members: {
+              some: { userID: 'viewer-1', status: 'ACTIVE' },
+            },
           },
-        },
-      };
-      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining(expectedMembershipScope),
-        }),
-      );
-      expect(prisma.circlePost.count).toHaveBeenCalledWith({
-        where: expect.objectContaining(expectedMembershipScope),
-      });
+        };
+        const expectedUnexpiredScope = [
+          { expiresAt: { gt: new Date('2026-06-29T12:00:00.000Z') } },
+          {
+            expiresAt: null,
+            createdAt: { gt: new Date('2026-06-28T12:00:00.000Z') },
+          },
+        ];
+        expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              status: 'ACTIVE',
+              OR: expectedUnexpiredScope,
+              ...expectedMembershipScope,
+            }),
+          }),
+        );
+        expect(prisma.circlePost.count).toHaveBeenCalledWith({
+          where: expect.objectContaining({
+            OR: expectedUnexpiredScope,
+            ...expectedMembershipScope,
+          }),
+        });
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('keeps selected circle and city filters inside the viewer membership scope', async () => {
@@ -207,6 +247,7 @@ describe('CirclePlazaService', () => {
       } as any,
       realtime as any,
       notificationService as any,
+      iconService as any,
     );
     prisma.circleMember.findUnique.mockResolvedValue({
       id: 'member-1',
@@ -223,6 +264,117 @@ describe('CirclePlazaService', () => {
       }),
     ).rejects.toThrow(BadRequestException);
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('persists a bounded post expiry duration when creating a plaza post', async () => {
+    jest
+      .useFakeTimers()
+      .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      status: 'ACTIVE',
+      role: 'MEMBER',
+      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+    });
+    prisma.circlePost.create.mockResolvedValue({
+      id: 'post-1',
+      content: 'hello plaza',
+      images: [],
+      tags: [],
+      city: null,
+      isHorn: false,
+      noteID: null,
+      vipRestriction: null,
+      creditRestriction: null,
+      fancyRestriction: false,
+      viewCount: 0,
+      signupCount: 0,
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+      author: {
+        id: 'user-1',
+        nickname: 'Host',
+        avatarUrl: null,
+        avatarFrame: null,
+        accountId: '1001',
+      },
+      circle: { id: 'circle-1', name: 'Board games' },
+      createdAt: new Date('2026-06-29T12:00:00Z'),
+      expiresAt: new Date('2026-07-02T12:00:00Z'),
+    });
+    prisma.circle.update.mockResolvedValue({});
+
+    const result = await service.createPost('user-1', {
+      circleId: 'circle-1',
+      content: 'hello plaza',
+      expiresInHours: 72,
+    });
+
+    expect(prisma.circlePost.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          expiresAt: new Date('2026-07-02T12:00:00.000Z'),
+        }),
+      }),
+    );
+    expect(result.expiresAt).toBe('2026-07-02T12:00:00.000Z');
+    jest.useRealTimers();
+  });
+
+  it('defaults to a 24h expiry when expiresInHours is omitted', async () => {
+    jest
+      .useFakeTimers()
+      .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      status: 'ACTIVE',
+      role: 'MEMBER',
+      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+    });
+    prisma.circlePost.create.mockResolvedValue({
+      id: 'post-1',
+      content: 'hi',
+      images: [],
+      tags: [],
+      city: null,
+      isHorn: false,
+      noteID: null,
+      vipRestriction: null,
+      creditRestriction: null,
+      fancyRestriction: false,
+      viewCount: 0,
+      signupCount: 0,
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+      author: {
+        id: 'user-1',
+        nickname: 'Host',
+        avatarUrl: null,
+        avatarFrame: null,
+        accountId: '1001',
+      },
+      circle: { id: 'circle-1', name: 'Board games' },
+      createdAt: new Date('2026-06-29T12:00:00Z'),
+      expiresAt: new Date('2026-06-30T12:00:00Z'),
+    });
+    prisma.circle.update.mockResolvedValue({});
+
+    await service.createPost('user-1', {
+      circleId: 'circle-1',
+      content: 'hi',
+    });
+
+    expect(prisma.circlePost.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          // 24h after the mocked "now"
+          expiresAt: new Date('2026-06-30T12:00:00.000Z'),
+        }),
+      }),
+    );
+    jest.useRealTimers();
   });
 
   describe('signupForPost', () => {
@@ -349,6 +501,50 @@ describe('CirclePlazaService', () => {
       expect(result.total).toBe(1);
     });
 
+    it('keeps ended posts that still need collaboration recognition in signup management', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.circlePostSignup.groupBy.mockResolvedValue([]);
+
+      await service.listMyPosts('author-1', 1);
+
+      const expectedWhere = {
+        authorID: 'author-1',
+        OR: [
+          { status: 'ACTIVE' },
+          { status: 'ENDED', collaborationRecognizedAt: null },
+        ],
+      };
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expectedWhere }),
+      );
+      expect(prisma.circlePost.count).toHaveBeenCalledWith({
+        where: expectedWhere,
+      });
+    });
+
+    it('falls back to createdAt+24h for a legacy post with a null expiresAt', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([
+        {
+          id: 'post-legacy',
+          circleID: 'circle-1',
+          content: 'legacy',
+          images: [],
+          signupCount: 0,
+          status: 'ACTIVE',
+          createdAt: new Date('2026-06-01T00:00:00Z'),
+          expiresAt: null,
+        },
+      ]);
+      prisma.circlePost.count.mockResolvedValue(1);
+      prisma.circlePostSignup.groupBy.mockResolvedValue([]);
+
+      const result = await service.listMyPosts('author-1', 1);
+
+      // null expiresAt → createdAt + 24h, surfaced as an ISO string (never null)
+      expect(result.items[0].expiresAt).toBe('2026-06-02T00:00:00.000Z');
+    });
+
     it('returns signers with OpenIM ids for my own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
       prisma.circlePostSignup.findMany.mockResolvedValue([
@@ -396,6 +592,290 @@ describe('CirclePlazaService', () => {
         data: { seenByAuthor: true, seenAt: expect.any(Date) },
       });
       expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
+    });
+
+    it('submits up to three collaboration recognitions for signed-up users', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+        circleID: 'circle-1',
+      });
+      prisma.circlePostSignup.count.mockResolvedValue(3);
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 1 });
+      prisma.collaborationRecognition.createMany.mockResolvedValue({
+        count: 2,
+      });
+
+      const result = await service.recognizePostCollaborators(
+        'author-1',
+        'post-1',
+        ['user-2', 'user-3', 'user-2'],
+      );
+
+      expect(result).toEqual({
+        count: 2,
+        recognizedUserIds: ['user-2', 'user-3'],
+      });
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'post-1',
+          authorID: 'author-1',
+          status: { in: ['ACTIVE', 'ENDED'] },
+        },
+        select: { id: true, authorID: true, circleID: true },
+      });
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+        where: {
+          circleID: 'circle-1',
+          status: 'ACTIVE',
+          userID: { in: ['user-2', 'user-3'] },
+        },
+        select: { userID: true },
+      });
+      expect(prisma.circlePostSignup.count).toHaveBeenCalledWith({
+        where: { postID: 'post-1' },
+      });
+      expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'post-1',
+          authorID: 'author-1',
+          collaborationRecognizedAt: null,
+        },
+        data: { collaborationRecognizedAt: expect.any(Date) },
+      });
+      expect(prisma.collaborationRecognition.createMany).toHaveBeenCalledWith({
+        data: [
+          {
+            recipientID: 'user-2',
+            recognizerID: 'author-1',
+            circlePostID: 'post-1',
+          },
+          {
+            recipientID: 'user-3',
+            recognizerID: 'author-1',
+            circlePostID: 'post-1',
+          },
+        ],
+      });
+      // each recipient's cached icon eligibility is refreshed so a newly earned
+      // TOP_COLLABORATOR badge shows up without waiting for the 30s cache TTL
+      expect(iconService.invalidateDisplayIconCacheFor).toHaveBeenCalledWith(
+        'user-2',
+      );
+      expect(iconService.invalidateDisplayIconCacheFor).toHaveBeenCalledWith(
+        'user-3',
+      );
+      expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
+        'user-2',
+      );
+      expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
+        'user-3',
+      );
+    });
+
+    it('rejects collaboration recognition when more than three users are selected', async () => {
+      await expect(
+        service.recognizePostCollaborators('author-1', 'post-1', [
+          'user-2',
+          'user-3',
+          'user-4',
+          'user-5',
+        ]),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.circlePost.findFirst).not.toHaveBeenCalled();
+      expect(prisma.collaborationRecognition.createMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects collaboration recognition for users who did not sign up', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+      });
+      prisma.circlePostSignup.count.mockResolvedValue(3);
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+      ]);
+
+      await expect(
+        service.recognizePostCollaborators('author-1', 'post-1', [
+          'user-2',
+          'user-9',
+        ]),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
+      expect(prisma.collaborationRecognition.createMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects duplicate collaboration recognition submission for the same post', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+        circleID: 'circle-1',
+      });
+      prisma.circlePostSignup.count.mockResolvedValue(3);
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.recognizePostCollaborators('author-1', 'post-1', [
+          'user-2',
+          'user-3',
+        ]),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.collaborationRecognition.createMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects recognition for a signed-up user who is no longer an active circle member', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+        circleID: 'circle-1',
+      });
+      prisma.circlePostSignup.count.mockResolvedValue(3);
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      // user-3 signed up but has since left the circle
+      prisma.circleMember.findMany.mockResolvedValue([{ userID: 'user-2' }]);
+      prisma.block.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.recognizePostCollaborators('author-1', 'post-1', [
+          'user-2',
+          'user-3',
+        ]),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
+      expect(prisma.collaborationRecognition.createMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects recognition for a user in a block relationship with the author', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+        circleID: 'circle-1',
+      });
+      prisma.circlePostSignup.count.mockResolvedValue(3);
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+        { userID: 'user-3' },
+      ]);
+      prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+
+      await expect(
+        service.recognizePostCollaborators('author-1', 'post-1', [
+          'user-2',
+          'user-3',
+        ]),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
+      expect(prisma.collaborationRecognition.createMany).not.toHaveBeenCalled();
+    });
+
+    it('bulk-ends an expired batch under an advisory lock and notifies each author', async () => {
+      const now = new Date('2026-06-29T12:00:00Z');
+      prisma.$executeRaw.mockResolvedValue(1);
+      prisma.circlePost.findMany.mockResolvedValue([
+        { id: 'post-1', authorID: 'author-1' },
+        { id: 'post-2', authorID: 'author-2' },
+      ]);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 2 });
+      notificationService.createCirclePostAutoEndedNotification.mockResolvedValue(
+        null,
+      );
+
+      const result = await service.sweepExpiredPosts(now);
+
+      expect(result).toEqual({ count: 2 });
+      // sweep is serialized by a transaction-scoped advisory lock
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.circlePost.findMany).toHaveBeenCalledWith({
+        where: {
+          status: 'ACTIVE',
+          OR: [
+            { expiresAt: { lte: now } },
+            {
+              expiresAt: null,
+              createdAt: { lte: new Date('2026-06-28T12:00:00.000Z') },
+            },
+          ],
+        },
+        select: { id: true, authorID: true },
+        orderBy: [
+          { expiresAt: { sort: 'asc', nulls: 'first' } },
+          { createdAt: 'asc' },
+        ],
+        take: 100,
+      });
+      // one bulk write for the whole batch, not one per post
+      expect(prisma.circlePost.updateMany).toHaveBeenCalledTimes(1);
+      expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['post-1', 'post-2'] }, status: 'ACTIVE' },
+        data: { status: 'ENDED', endedAt: now },
+      });
+      expect(
+        notificationService.createCirclePostAutoEndedNotification,
+      ).toHaveBeenCalledWith({ toUserId: 'author-1', postId: 'post-1' });
+      expect(
+        notificationService.createCirclePostAutoEndedNotification,
+      ).toHaveBeenCalledWith({ toUserId: 'author-2', postId: 'post-2' });
+    });
+
+    it('returns zero and skips the bulk write when nothing is expired', async () => {
+      const now = new Date('2026-06-29T12:00:00Z');
+      prisma.$executeRaw.mockResolvedValue(1);
+      prisma.circlePost.findMany.mockResolvedValue([]);
+
+      const result = await service.sweepExpiredPosts(now);
+
+      expect(result).toEqual({ count: 0 });
+      expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
+      expect(
+        notificationService.createCirclePostAutoEndedNotification,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('continues notifying the rest of the batch when one notification throws', async () => {
+      const now = new Date('2026-06-29T12:00:00Z');
+      prisma.$executeRaw.mockResolvedValue(1);
+      prisma.circlePost.findMany.mockResolvedValue([
+        { id: 'post-1', authorID: 'author-1' },
+        { id: 'post-2', authorID: 'author-2' },
+      ]);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 2 });
+      notificationService.createCirclePostAutoEndedNotification
+        .mockRejectedValueOnce(new Error('boom'))
+        .mockResolvedValueOnce(null);
+
+      const result = await service.sweepExpiredPosts(now);
+
+      // the rows were still ended; a failed notification does not roll them back
+      expect(result).toEqual({ count: 2 });
+      expect(
+        notificationService.createCirclePostAutoEndedNotification,
+      ).toHaveBeenCalledTimes(2);
     });
   });
 

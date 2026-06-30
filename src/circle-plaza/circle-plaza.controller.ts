@@ -27,10 +27,12 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CirclePlazaService } from './circle-plaza.service';
 import {
+  CollaborationRecognitionResultDto,
   CreatePlazaPostDto,
   MyCirclePostDto,
   PlazaFeedQueryDto,
   PlazaPostDto,
+  RecognizePostCollaboratorsDto,
   PostSignupItemDto,
 } from './dto/circle-plaza.dto';
 
@@ -197,5 +199,27 @@ export class CirclePlazaController {
     @Req() req: RequestWithUser,
   ): Promise<{ count: number }> {
     return this.plazaService.markPostSignupsSeen(req.user.userId, id);
+  }
+
+  @Post('me/posts/:id/collaboration-recognitions')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Recognize up to three signup collaborators for my post',
+  })
+  @ApiOkResponse({ type: CollaborationRecognitionResultDto })
+  @ApiTooManyRequestsResponse({
+    description: 'Too many collaboration-recognition writes',
+  })
+  recognizePostCollaborators(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: RecognizePostCollaboratorsDto,
+    @Req() req: RequestWithUser,
+  ): Promise<CollaborationRecognitionResultDto> {
+    return this.plazaService.recognizePostCollaborators(
+      req.user.userId,
+      id,
+      dto.recipientIds,
+    );
   }
 }
