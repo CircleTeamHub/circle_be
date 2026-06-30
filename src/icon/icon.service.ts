@@ -12,11 +12,24 @@ import {
 } from './dto/icon.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import type { PrivacySettingsDto } from 'src/privacy/privacy-settings.dto';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
+const CIRCLE_BUILDER_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// Circle Builder requires a circle with MORE THAN this many members
+// (i.e. >100); a circle with exactly 100 members does not qualify.
+const CIRCLE_BUILDER_MEMBER_THRESHOLD = 100;
+const TOP_COLLABORATOR_MIN_RECOGNITIONS = 100;
+const VERIFIED_PROFILE_MIN_BIO_LENGTH = 10;
 const MAX_DISPLAY_ICONS = 5;
 // 被赞总数达到该阈值即获得合作达人（PARTNER）徽章。随时可改。
 const PARTNER_LIKE_THRESHOLD = 3;
+// Upper bound on memberships scanned for icon eligibility. A user can join many
+// circles; without a cap a power user would load thousands of rows on every
+// icon-options / display-icon fetch. The newest memberships are the relevant
+// ones for circle icons, and Circle Builder only needs one qualifying circle.
+const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -30,6 +43,7 @@ type EligibleSystemIcon = {
   title: string;
   fallbackIconName: string;
   imageUrl: string | null;
+  recognitionCount?: number;
 };
 
 type EligibleCircleIcon = {
@@ -51,6 +65,7 @@ export class IconService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   private invalidateDisplayIconCache(userId: string): void {
@@ -93,6 +108,7 @@ export class IconService {
         fallbackIconName: icon.fallbackIconName,
         selected: selections.some((item) => item.systemKey === icon.systemKey),
         systemKey: icon.systemKey,
+        recognitionCount: icon.recognitionCount,
       })),
       circleIcons: eligibility.circleIcons.map((icon) => ({
         type: DisplayIconTypeDto.CIRCLE,
@@ -196,6 +212,17 @@ export class IconService {
         receivedLikeCount: true,
         createdAt: true,
         iconPreferencesInitialized: true,
+        avatarUrl: true,
+        nickname: true,
+        city: true,
+        email: true,
+        phoneNumber: true,
+        wechat: true,
+        qq: true,
+        persona: true,
+        helloWords: true,
+        whatsup: true,
+        status: true,
       },
     });
 
@@ -203,32 +230,50 @@ export class IconService {
       throw new NotFoundException('User not found');
     }
 
-    const circleMemberships = await this.prisma.circleMember.findMany({
-      where: {
-        userID: userId,
-        status: 'ACTIVE',
-        circle: {
-          deleted: false,
-          currentIconAssetID: { not: null },
+    const [circleMemberships, recognizerGroups, privacy] = await Promise.all([
+      this.prisma.circleMember.findMany({
+        where: {
+          userID: userId,
+          status: 'ACTIVE',
+          circle: {
+            deleted: false,
+          },
         },
-      },
-      select: {
-        circleID: true,
-        circle: {
-          select: {
-            id: true,
-            name: true,
-            currentIconAsset: {
-              select: {
-                id: true,
-                imageUrl: true,
+        select: {
+          circleID: true,
+          role: true,
+          circle: {
+            select: {
+              id: true,
+              name: true,
+              createdAt: true,
+              deleted: true,
+              memberCount: true,
+              currentIconAsset: {
+                select: {
+                  id: true,
+                  imageUrl: true,
+                },
               },
             },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+        orderBy: { createdAt: 'desc' },
+        take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
+      }),
+      // Count DISTINCT recognizers, not raw recognitions: a meaningful badge is
+      // "N different people recognized you", which can't be gamed by one author
+      // recognizing the same colluder across many of their own posts.
+      this.prisma.collaborationRecognition.groupBy({
+        by: ['recognizerID'],
+        where: {
+          recipientID: userId,
+          revokedAt: null,
+        },
+      }),
+      this.privacySettings.getSettings(userId),
+    ]);
+    const recognitionCount = recognizerGroups.length;
 
     const systemIcons: EligibleSystemIcon[] = [];
     if (user.vipLevel > 0) {
@@ -244,6 +289,31 @@ export class IconService {
         systemKey: SystemIconKeyDto.NEW_USER,
         title: '新手',
         fallbackIconName: 'rocket-outline',
+        imageUrl: null,
+      });
+    }
+    if (recognitionCount >= TOP_COLLABORATOR_MIN_RECOGNITIONS) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.TOP_COLLABORATOR,
+        title: 'Top Collaborator',
+        fallbackIconName: 'star-outline',
+        imageUrl: null,
+        recognitionCount,
+      });
+    }
+    if (this.isVerifiedProfileEligible(user, privacy)) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.VERIFIED_PROFILE,
+        title: 'Verified Profile',
+        fallbackIconName: 'shield-checkmark-outline',
+        imageUrl: null,
+      });
+    }
+    if (this.hasCircleBuilderCircle(circleMemberships)) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.CIRCLE_BUILDER,
+        title: 'Circle Builder',
+        fallbackIconName: 'construct-outline',
         imageUrl: null,
       });
     }
@@ -270,6 +340,72 @@ export class IconService {
     return { systemIcons, circleIcons };
   }
 
+  private isVerifiedProfileEligible(
+    user: {
+      avatarUrl: string | null;
+      nickname: string | null;
+      city: string | null;
+      email: string | null;
+      phoneNumber: string | null;
+      wechat: string | null;
+      qq: string | null;
+      persona: string | null;
+      helloWords: string | null;
+      whatsup: string | null;
+      status: string;
+    },
+    privacy: PrivacySettingsDto,
+  ): boolean {
+    if (user.status !== 'ACTIVE') return false;
+
+    const hasPublicContact =
+      (this.hasText(user.phoneNumber) && privacy.showPhone) ||
+      (this.hasText(user.wechat) && privacy.showWechat) ||
+      (this.hasText(user.qq) && privacy.showQQ);
+    const hasBio = [user.persona, user.helloWords, user.whatsup].some((value) =>
+      this.hasText(value, VERIFIED_PROFILE_MIN_BIO_LENGTH),
+    );
+
+    return (
+      this.hasText(user.avatarUrl) &&
+      this.hasText(user.nickname) &&
+      this.hasText(user.city) &&
+      this.hasText(user.email) &&
+      hasBio &&
+      hasPublicContact
+    );
+  }
+
+  private hasCircleBuilderCircle(
+    memberships: Array<{
+      role: string;
+      circle: {
+        createdAt: Date;
+        deleted: boolean;
+        memberCount: number;
+      };
+    }>,
+  ): boolean {
+    const now = Date.now();
+    return memberships.some((membership) => {
+      if (membership.role !== 'OWNER' && membership.role !== 'ADMIN') {
+        return false;
+      }
+      if (membership.circle.deleted) {
+        return false;
+      }
+      if (membership.circle.memberCount <= CIRCLE_BUILDER_MEMBER_THRESHOLD) {
+        return false;
+      }
+      return (
+        now - membership.circle.createdAt.getTime() >= CIRCLE_BUILDER_MIN_AGE_MS
+      );
+    });
+  }
+
+  private hasText(value: string | null | undefined, minLength = 1): boolean {
+    return typeof value === 'string' && value.trim().length >= minLength;
+  }
   private async pruneInvalidSelections(
     userId: string,
     eligibility: Eligibility,
@@ -424,6 +560,7 @@ export class IconService {
             imageUrl: icon.imageUrl,
             fallbackIconName: icon.fallbackIconName,
             systemKey: icon.systemKey,
+            recognitionCount: icon.recognitionCount,
             sortOrder: selection.sortOrder,
           };
         }

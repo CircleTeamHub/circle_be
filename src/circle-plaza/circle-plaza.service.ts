@@ -11,6 +11,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { IconService } from 'src/icon/icon.service';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -42,6 +43,12 @@ type SignupRestrictionFields = Pick<
   'signupVipRestriction' | 'signupCreditRestriction' | 'signupFancyRestriction'
 >;
 
+const MAX_COLLABORATION_RECOGNITIONS_PER_POST = 3;
+const MIN_SIGNUPS_FOR_COLLABORATION_RECOGNITION = 3;
+const CIRCLE_POST_AUTO_END_MS = 24 * 60 * 60 * 1000;
+const CIRCLE_POST_AUTO_END_BATCH_SIZE = 100;
+const DEFAULT_CIRCLE_POST_EXPIRY_HOURS = 24;
+
 @Injectable()
 export class CirclePlazaService {
   private readonly logger = new Logger(CirclePlazaService.name);
@@ -52,6 +59,7 @@ export class CirclePlazaService {
     private readonly config: ConfigService,
     private readonly realtime: RealtimeService,
     private readonly notificationService: NotificationService,
+    private readonly iconService: IconService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -130,6 +138,10 @@ export class CirclePlazaService {
       }
     }
 
+    const expiresInHours =
+      dto.expiresInHours ?? DEFAULT_CIRCLE_POST_EXPIRY_HOURS;
+    const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
+
     const post = await this.prisma.$transaction(async (tx) => {
       const created = await tx.circlePost.create({
         data: {
@@ -146,6 +158,7 @@ export class CirclePlazaService {
           signupCreditRestriction: dto.signupCreditRestriction ?? null,
           signupFancyRestriction: dto.signupFancyRestriction ?? false,
           authorID: userId,
+          expiresAt,
           circleID: dto.circleId,
         },
         include: {
@@ -180,7 +193,7 @@ export class CirclePlazaService {
     const skip = (page - 1) * limit;
 
     const where: Prisma.CirclePostWhereInput = {
-      status: 'ACTIVE',
+      ...this.activeUnexpiredPostWhere(),
       circle: {
         deleted: false,
         members: {
@@ -257,7 +270,11 @@ export class CirclePlazaService {
   async getPost(viewerId: string, postId: string): Promise<PlazaPostDto> {
     const [post, viewer] = await Promise.all([
       this.prisma.circlePost.findFirst({
-        where: { id: postId, status: 'ACTIVE', circle: { deleted: false } },
+        where: {
+          ...this.activeUnexpiredPostWhere(),
+          id: postId,
+          circle: { deleted: false },
+        },
         include: { author: true, circle: true },
       }),
       this.prisma.user.findUnique({
@@ -283,7 +300,7 @@ export class CirclePlazaService {
 
   async deletePost(userId: string, postId: string): Promise<void> {
     const post = await this.prisma.circlePost.findFirst({
-      where: { id: postId, status: 'ACTIVE' },
+      where: { ...this.activeUnexpiredPostWhere(), id: postId },
     });
     if (!post) throw new NotFoundException('Post not found');
     if (post.authorID !== userId) {
@@ -310,7 +327,11 @@ export class CirclePlazaService {
     // 报名资格门槛（signup*Restriction）独立于帖子查看/互动门槛
     // （vipRestriction 等）；后者由 checkCanInteract 管，此处只看 signup* 字段。
     const post = await this.prisma.circlePost.findFirst({
-      where: { id: postId, status: 'ACTIVE', circle: { deleted: false } },
+      where: {
+        ...this.activeUnexpiredPostWhere(),
+        id: postId,
+        circle: { deleted: false },
+      },
       select: {
         id: true,
         authorID: true,
@@ -501,7 +522,13 @@ export class CirclePlazaService {
   }> {
     const limit = 20;
     const skip = (Math.max(1, page) - 1) * limit;
-    const where = { authorID: authorId, status: 'ACTIVE' as const };
+    const where: Prisma.CirclePostWhereInput = {
+      authorID: authorId,
+      OR: [
+        { status: 'ACTIVE' },
+        { status: 'ENDED', collaborationRecognizedAt: null },
+      ],
+    };
     const [posts, total] = await Promise.all([
       this.prisma.circlePost.findMany({
         where,
@@ -516,6 +543,7 @@ export class CirclePlazaService {
           signupCount: true,
           status: true,
           createdAt: true,
+          expiresAt: true,
         },
       }),
       this.prisma.circlePost.count({ where }),
@@ -543,12 +571,84 @@ export class CirclePlazaService {
         unreadSignupCount: unreadByPost.get(p.id) ?? 0,
         status: p.status,
         createdAt: p.createdAt.toISOString(),
+        expiresAt: this.formatPostExpiresAt(p),
       })),
       total,
       page: Math.max(1, page),
       limit,
       hasMore: skip + posts.length < total,
     };
+  }
+
+  async sweepExpiredPosts(now = new Date()): Promise<{ count: number }> {
+    const cutoff = new Date(now.getTime() - CIRCLE_POST_AUTO_END_MS);
+    const expiredWhere: Prisma.CirclePostWhereInput = {
+      status: 'ACTIVE',
+      OR: [
+        { expiresAt: { lte: now } },
+        { expiresAt: null, createdAt: { lte: cutoff } },
+      ],
+    };
+
+    // Serialize the sweep with a transaction-scoped advisory lock so concurrent
+    // ticks / multiple instances never process the same batch (which would
+    // double-notify). The lock is released when the transaction commits.
+    const endedPosts = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('circle-post-expiry-sweep'))`;
+
+      const batch = await tx.circlePost.findMany({
+        where: expiredWhere,
+        select: { id: true, authorID: true },
+        orderBy: [
+          { expiresAt: { sort: 'asc', nulls: 'first' } },
+          { createdAt: 'asc' },
+        ],
+        take: CIRCLE_POST_AUTO_END_BATCH_SIZE,
+      });
+      if (batch.length === 0) {
+        return [];
+      }
+
+      // Bulk-end the whole batch in one write. The lock guarantees no other
+      // sweep touched these rows, so the count equals batch.length.
+      await tx.circlePost.updateMany({
+        where: { id: { in: batch.map((post) => post.id) }, status: 'ACTIVE' },
+        data: { status: 'ENDED', endedAt: now },
+      });
+
+      return batch;
+    });
+
+    if (endedPosts.length === 0) {
+      return { count: 0 };
+    }
+
+    for (const post of endedPosts) {
+      try {
+        const notification =
+          await this.notificationService.createCirclePostAutoEndedNotification({
+            toUserId: post.authorID,
+            postId: post.id,
+          });
+        if (notification) {
+          await this.realtime.broadcastInteractionUnread(post.authorID);
+          this.realtime.broadcastNotificationCreated(
+            post.authorID,
+            notification,
+          );
+        }
+      } catch (error) {
+        this.logger.error(
+          `circle post auto-end notification failed (post=${post.id}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    this.logger.log(`auto-ended ${endedPosts.length} expired circle posts`);
+
+    return { count: endedPosts.length };
   }
 
   /** Signers of one of the author's own posts, with identity for opening a chat. */
@@ -603,6 +703,148 @@ export class CirclePlazaService {
       }
     }
     return { count: result.count };
+  }
+
+  async recognizePostCollaborators(
+    authorId: string,
+    postId: string,
+    recipientIds: string[],
+  ): Promise<{ count: number; recognizedUserIds: string[] }> {
+    const uniqueRecipientIds = Array.from(
+      new Set(recipientIds.map((id) => id.trim()).filter(Boolean)),
+    );
+
+    if (uniqueRecipientIds.length === 0) {
+      throw new BadRequestException('Select at least one collaborator');
+    }
+    if (uniqueRecipientIds.length > MAX_COLLABORATION_RECOGNITIONS_PER_POST) {
+      throw new BadRequestException('Select at most three collaborators');
+    }
+    if (uniqueRecipientIds.includes(authorId)) {
+      throw new ForbiddenException('Cannot recognize yourself');
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const post = await tx.circlePost.findFirst({
+        where: {
+          id: postId,
+          authorID: authorId,
+          status: { in: ['ACTIVE', 'ENDED'] },
+        },
+        select: { id: true, authorID: true, circleID: true },
+      });
+      if (!post) throw new NotFoundException('Post not found');
+
+      const signupCount = await tx.circlePostSignup.count({
+        where: { postID: postId },
+      });
+      if (signupCount < MIN_SIGNUPS_FOR_COLLABORATION_RECOGNITION) {
+        throw new BadRequestException(
+          'At least three signups are required before recognizing collaborators',
+        );
+      }
+
+      // A recipient is eligible only if they signed up for the post AND are
+      // still an ACTIVE member of the post's circle. Someone who signed up and
+      // later left (or was removed from) the circle must not earn recognition.
+      const signedUsers = await tx.circlePostSignup.findMany({
+        where: {
+          postID: postId,
+          userID: { in: uniqueRecipientIds },
+        },
+        select: { userID: true },
+      });
+      const signedUserIds = new Set(signedUsers.map((signup) => signup.userID));
+      const allRecipientsSignedUp = uniqueRecipientIds.every((recipientId) =>
+        signedUserIds.has(recipientId),
+      );
+      if (!allRecipientsSignedUp) {
+        throw new BadRequestException(
+          'Only users who signed up for the post can be recognized',
+        );
+      }
+
+      const activeMembers = await tx.circleMember.findMany({
+        where: {
+          circleID: post.circleID,
+          status: 'ACTIVE',
+          userID: { in: uniqueRecipientIds },
+        },
+        select: { userID: true },
+      });
+      const activeMemberIds = new Set(
+        activeMembers.map((member) => member.userID),
+      );
+      const allRecipientsActiveMembers = uniqueRecipientIds.every(
+        (recipientId) => activeMemberIds.has(recipientId),
+      );
+      if (!allRecipientsActiveMembers) {
+        throw new BadRequestException(
+          'Only active members of the circle can be recognized',
+        );
+      }
+
+      // Never recognize someone in a block relationship with the author
+      // (either direction).
+      const block = await tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: authorId, blockedID: { in: uniqueRecipientIds } },
+            { blockerID: { in: uniqueRecipientIds }, blockedID: authorId },
+          ],
+        },
+        select: { id: true },
+      });
+      if (block) {
+        throw new ForbiddenException('Cannot recognize a blocked user');
+      }
+
+      const claimed = await tx.circlePost.updateMany({
+        where: {
+          id: postId,
+          authorID: authorId,
+          collaborationRecognizedAt: null,
+        },
+        data: { collaborationRecognizedAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        throw new BadRequestException(
+          'Collaboration recognition has already been submitted',
+        );
+      }
+
+      await tx.collaborationRecognition.createMany({
+        data: uniqueRecipientIds.map((recipientID) => ({
+          recipientID,
+          recognizerID: authorId,
+          circlePostID: postId,
+        })),
+      });
+
+      return {
+        count: uniqueRecipientIds.length,
+        recognizedUserIds: uniqueRecipientIds,
+      };
+    });
+
+    // After commit: a new recognition can change a recipient's TOP_COLLABORATOR
+    // eligibility, which IconService caches for 30s. Drop their cache and push a
+    // fresh profile summary so the badge appears immediately. Best-effort: a
+    // failure here must not fail the recognition that already succeeded.
+    for (const recipientId of result.recognizedUserIds) {
+      try {
+        this.iconService.invalidateDisplayIconCacheFor(recipientId);
+        await this.realtime.broadcastUserProfileSummary(recipientId);
+      } catch (error) {
+        this.logger.error(
+          `collaboration recognition profile refresh failed (user=${recipientId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    return result;
   }
 
   /** Total unseen signups across the author's active posts (报名管理 red dot). */
@@ -712,6 +954,33 @@ export class CirclePlazaService {
       },
       canInteract,
       createdAt: post.createdAt.toISOString(),
+      expiresAt: this.formatPostExpiresAt(post),
     };
+  }
+
+  private activeUnexpiredPostWhere(
+    now = new Date(),
+  ): Prisma.CirclePostWhereInput {
+    const legacyCutoff = new Date(now.getTime() - CIRCLE_POST_AUTO_END_MS);
+
+    return {
+      status: 'ACTIVE',
+      OR: [
+        { expiresAt: { gt: now } },
+        {
+          expiresAt: null,
+          createdAt: { gt: legacyCutoff },
+        },
+      ],
+    };
+  }
+
+  private formatPostExpiresAt(
+    post: Pick<CirclePost, 'createdAt' | 'expiresAt'>,
+  ): string {
+    return (
+      post.expiresAt ??
+      new Date(post.createdAt.getTime() + CIRCLE_POST_AUTO_END_MS)
+    ).toISOString();
   }
 }

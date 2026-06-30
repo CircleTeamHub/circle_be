@@ -220,6 +220,53 @@ describe('NotificationService', () => {
       ).not.toHaveBeenCalled();
     });
 
+    it('creates auto-ended circle post notifications for the author with post routing data', async () => {
+      prisma.notification.create.mockResolvedValue({
+        id: 'n-auto',
+        type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+        content: '',
+        read: false,
+        createdAt: new Date('2026-06-29T12:00:00Z'),
+        fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: {
+          id: 'post-1',
+          content: 'Board game night',
+          images: [],
+        },
+        fromInvitation: null,
+      });
+
+      const result = await service.createCirclePostAutoEndedNotification({
+        toUserId: 'author-1',
+        postId: 'post-1',
+      });
+
+      expect(prisma.notification.create).toHaveBeenCalledWith({
+        data: {
+          toUserID: 'author-1',
+          fromUserID: 'author-1',
+          type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+          fromCirclePostID: 'post-1',
+          content: '',
+        },
+        include: expect.any(Object),
+      });
+      expect(result).toEqual(
+        expect.objectContaining({
+          id: 'n-auto',
+          type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+          fromCirclePost: {
+            id: 'post-1',
+            excerpt: 'Board game night',
+            firstImage: null,
+          },
+        }),
+      );
+    });
+
     it('markAllNotificationsRead returns count', async () => {
       prisma.notification.updateMany.mockResolvedValue({ count: 4 });
       const result = await service.markAllNotificationsRead('user-1');

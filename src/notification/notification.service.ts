@@ -206,6 +206,28 @@ export class NotificationService {
     });
   }
 
+  async createCirclePostAutoEndedNotification(params: {
+    toUserId: string;
+    postId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    if (!params.toUserId || !params.postId) {
+      return null;
+    }
+
+    const notification = await this.prisma.notification.create({
+      data: {
+        toUserID: params.toUserId,
+        fromUserID: params.toUserId,
+        type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+        fromCirclePostID: params.postId,
+        content: '',
+      },
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+
+    return mapNotificationRealtimeDto(notification);
+  }
+
   async getNotifications(userId: string, page = 1) {
     const take = 20;
     const skip = (Math.max(1, page) - 1) * take;
