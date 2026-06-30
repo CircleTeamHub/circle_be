@@ -374,14 +374,30 @@ export class NoteService {
     return randomBytes(18).toString('base64url');
   }
 
+  private getExportSectionMedia(sections: NoteSections) {
+    const seen = new Set<string>();
+    return [...sections.media.items, ...sections.showcase.items].filter(
+      (item: any) => {
+        const key =
+          typeof item.objectKey === 'string'
+            ? `${item.objectKey}:${item.url ?? ''}`
+            : `url:${item.url ?? ''}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      },
+    );
+  }
+
   private createLongImageSvg(note: NoteRow) {
     const sections = this.buildSectionsFromRow(note);
+    const exportMedia = this.getExportSectionMedia(sections);
     const lines = [
       note.title,
       '',
       sections.text.content ?? '',
       '',
-      ...sections.media.items.map((item: any, index) => {
+      ...exportMedia.map((item: any, index) => {
         const type = item.type === 'VIDEO' ? '视频' : '图片';
         return `${type} ${index + 1}: ${item.url ?? ''}`;
       }),
@@ -421,7 +437,8 @@ export class NoteService {
 
   private async createPdf(note: NoteRow) {
     const sections = this.buildSectionsFromRow(note);
-    const mediaUrls = sections.media.items
+    const sectionMedia = this.getExportSectionMedia(sections);
+    const mediaUrls = sectionMedia
       .map((item: any) => (typeof item.url === 'string' ? item.url : null))
       .filter((url): url is string => Boolean(url));
     const doc = new PDFDocument({
@@ -467,7 +484,6 @@ export class NoteService {
     const noteMediaByKey = new Map(
       (note.media ?? []).map((item) => [`${item.objectKey}:${item.url}`, item]),
     );
-    const sectionMedia = sections.media.items;
     let embeddedImages = 0;
     for (const [index, rawItem] of sectionMedia.entries()) {
       const item = rawItem as any;
@@ -646,9 +662,12 @@ export class NoteService {
       seen.add(key);
       deduped.push(item);
     }
+    deduped.sort(
+      (left, right) => (left.sortOrder ?? 0) - (right.sortOrder ?? 0),
+    );
     return deduped.map((item, index) => ({
       ...item,
-      sortOrder: item.sortOrder ?? index,
+      sortOrder: index,
     }));
   }
 
@@ -770,19 +789,24 @@ export class NoteService {
     const fragments: string[] = [];
 
     for (const block of blocks) {
+      if (!this.isRecord(block)) continue;
       // Table blocks have a BNTableContent object, not an array — skip for text
       const inlines = Array.isArray(block.content) ? block.content : [];
 
       for (const node of inlines) {
+        if (!this.isRecord(node)) continue;
         if (node.type === 'text') {
           // BNStyledText: { type: 'text', text: string, styles: {...} }
-          const trimmed = node.text.trim();
+          const trimmed = typeof node.text === 'string' ? node.text.trim() : '';
           if (trimmed) fragments.push(trimmed);
         } else if (node.type === 'link') {
           // BNLink: { type: 'link', href: string, content: BNStyledText[] }
           // Extract the visible text from the link's inner StyledText nodes
-          for (const inner of node.content) {
-            const trimmed = inner.text.trim();
+          const linkContent = Array.isArray(node.content) ? node.content : [];
+          for (const inner of linkContent) {
+            if (!this.isRecord(inner)) continue;
+            const trimmed =
+              typeof inner.text === 'string' ? inner.text.trim() : '';
             if (trimmed) fragments.push(trimmed);
           }
         }
@@ -805,6 +829,7 @@ export class NoteService {
     const visit = (items: NoteContentBlock[], depth: number) => {
       if (depth > 10) return;
       for (const block of items) {
+        if (!this.isRecord(block)) continue;
         if (block.type === 'image' || block.type === 'video') {
           const props = block.props ?? {};
           const url = typeof props.url === 'string' ? props.url : '';
@@ -1350,6 +1375,7 @@ export class NoteService {
       throw new ServiceUnavailableException('File export is not configured');
     }
     const entries: Array<{ name: string; data: Buffer }> = [];
+    let downloadedBytes = 0;
     for (const [index, item] of selected.entries()) {
       const data = await this.uploadService.downloadObjectBuffer(
         item.objectKey,
@@ -1358,6 +1384,10 @@ export class NoteService {
       if (data.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
         throw new BadRequestException('Media file is too large to export');
       }
+      if (downloadedBytes + data.byteLength > MAX_EXPORT_TOTAL_MEDIA_BYTES) {
+        throw new BadRequestException('Selected media are too large to export');
+      }
+      downloadedBytes += data.byteLength;
       entries.push({
         name: `${input.format.toLowerCase()}-${index + 1}.${mediaExtension(item)}`,
         data,

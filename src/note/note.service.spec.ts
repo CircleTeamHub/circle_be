@@ -603,6 +603,75 @@ describe('NoteService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  it('normalizes section-derived media sort orders across media and showcase sections', async () => {
+    prisma.note.create.mockResolvedValueOnce({
+      id: 'note-sort',
+      ownerID: 'user-1',
+      title: 'sort',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 1,
+      mediaCount: 2,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-sort',
+      ownerID: 'user-1',
+      title: 'sort',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 1,
+      mediaCount: 2,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    await service.createNote('user-1', {
+      title: 'sort',
+      media: [],
+      sections: {
+        media: {
+          items: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/user-1/one.jpg',
+              url: 'https://cdn.example.com/one.jpg',
+              sortOrder: 0,
+            },
+          ],
+        },
+        showcase: {
+          items: [
+            {
+              type: 'VIDEO',
+              objectKey: 'notes/user-1/two.mp4',
+              url: 'https://cdn.example.com/two.mp4',
+              sortOrder: 0,
+            },
+          ],
+        },
+      },
+    } as any);
+
+    const data = prisma.noteMedia.createMany.mock.calls[0][0].data;
+    expect(data.map((item: any) => item.sortOrder)).toEqual([0, 1]);
+  });
+
   it('lists only the owner notes with summary fields', async () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
@@ -911,6 +980,91 @@ describe('NoteService', () => {
     });
   });
 
+  it('includes showcase-only media in PDF and long-image exports', async () => {
+    const noteRow = {
+      id: 'note-showcase-export',
+      ownerID: 'user-1',
+      title: '展示导出',
+      content: '正文',
+      contentJson: null,
+      sections: {
+        text: { content: '正文', contentJson: null },
+        media: { items: [] },
+        showcase: {
+          items: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/user-1/show.png',
+              url: 'https://cdn.example.com/show.png',
+              sortOrder: 0,
+            },
+          ],
+        },
+        location: null,
+      },
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [
+        {
+          id: 'img-show',
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/show.png',
+          url: 'https://cdn.example.com/show.png',
+          mimeType: 'image/png',
+          size: 10,
+          sortOrder: 0,
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    prisma.note.findFirst
+      .mockResolvedValueOnce(noteRow)
+      .mockResolvedValueOnce(noteRow);
+    uploadService.downloadObjectBuffer.mockResolvedValueOnce(
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    uploadService.uploadBuffer
+      .mockResolvedValueOnce({
+        url: 'https://cdn.example.com/pdf.pdf',
+        key: 'note-exports/user-1/note-showcase-export/pdf.pdf',
+        size: 2048,
+        expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+      })
+      .mockResolvedValueOnce({
+        url: 'https://cdn.example.com/image.svg',
+        key: 'note-exports/user-1/note-showcase-export/image.svg',
+        size: 1024,
+        expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+      });
+
+    await service.createNoteExport('user-1', 'note-showcase-export', {
+      format: 'PDF',
+      scope: 'ALL',
+    });
+    await service.createNoteExport('user-1', 'note-showcase-export', {
+      format: 'IMAGE',
+      scope: 'ALL',
+    });
+
+    const pdfBody = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
+    const svgBody = uploadService.uploadBuffer.mock.calls[1][0].body as Buffer;
+    expect(pdfBody.toString('latin1')).toContain(
+      'https://cdn.example.com/show.png',
+    );
+    expect(svgBody.toString()).toContain('https://cdn.example.com/show.png');
+  });
+
   it('rejects export requests whose selected media exceed safe limits', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-huge',
@@ -956,6 +1110,48 @@ describe('NoteService', () => {
       }),
     ).rejects.toThrow(BadRequestException);
     expect(uploadService.downloadObjectBuffer).not.toHaveBeenCalled();
+    expect(uploadService.uploadBuffer).not.toHaveBeenCalled();
+  });
+
+  it('rejects zip exports when actual downloaded bytes exceed the total cap', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-null-size',
+      ownerID: 'user-1',
+      title: '未知大小',
+      content: '正文',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 3,
+      videoCount: 0,
+      mediaCount: 3,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [1, 2, 3].map((index) => ({
+        id: `img-${index}`,
+        type: 'IMAGE',
+        objectKey: `notes/user-1/${index}.jpg`,
+        url: `https://cdn.example.com/${index}.jpg`,
+        mimeType: 'image/jpeg',
+        size: null,
+        sortOrder: index - 1,
+      })),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    uploadService.downloadObjectBuffer
+      .mockResolvedValueOnce(Buffer.alloc(8 * 1024 * 1024))
+      .mockResolvedValueOnce(Buffer.alloc(8 * 1024 * 1024))
+      .mockResolvedValueOnce(Buffer.alloc(1));
+
+    await expect(
+      service.createNoteExport('user-1', 'note-null-size', {
+        format: 'IMAGES',
+        scope: 'ALL',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(uploadService.downloadObjectBuffer).toHaveBeenCalledTimes(3);
     expect(uploadService.uploadBuffer).not.toHaveBeenCalled();
   });
 
@@ -1701,6 +1897,40 @@ describe('NoteService', () => {
             url: 'http://10.0.0.195:9000/circle/notes/user-1/legit.jpg',
             sortOrder: 0,
           },
+        ],
+      } as any),
+    ).resolves.toBeDefined();
+  });
+
+  it('ignores malformed contentJson nodes instead of throwing runtime errors', async () => {
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-malformed' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-malformed',
+      ownerID: 'user-1',
+      title: 'Malformed',
+      content: null,
+      contentJson: [{ type: 'paragraph', content: [{ type: 'link' }, null] }],
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      service.createNote('user-1', {
+        title: 'Malformed',
+        media: [],
+        contentJson: [
+          null,
+          { type: 'paragraph', content: [{ type: 'link' }, null] },
         ],
       } as any),
     ).resolves.toBeDefined();
