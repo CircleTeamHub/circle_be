@@ -27,6 +27,9 @@ export enum SystemIconKeyDto {
   VIP = 'VIP',
   NEW_USER = 'NEW_USER',
   PARTNER = 'PARTNER',
+  TOP_COLLABORATOR = 'TOP_COLLABORATOR',
+  VERIFIED_PROFILE = 'VERIFIED_PROFILE',
+  CIRCLE_BUILDER = 'CIRCLE_BUILDER',
 }
 
 export class DisplayIconDto {
@@ -62,6 +65,10 @@ export class DisplayIconDto {
   @Expose()
   systemKey?: SystemIconKeyDto;
 
+  @ApiPropertyOptional({ example: 100 })
+  @Expose()
+  recognitionCount?: number;
+
   @ApiProperty()
   @Expose()
   sortOrder: number;
@@ -91,6 +98,9 @@ export class IconOptionDto {
 
   @ApiPropertyOptional({ enum: SystemIconKeyDto })
   systemKey?: SystemIconKeyDto;
+
+  @ApiPropertyOptional({ example: 100 })
+  recognitionCount?: number;
 }
 
 export class IconOptionsResponseDto {

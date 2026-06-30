@@ -63,6 +63,7 @@ enum NoteMediaType {
 
 enum CirclePostStatus {
   ACTIVE
+  ENDED
   DELETED
 }
 
@@ -118,6 +119,9 @@ enum SystemIconKey {
   VIP
   NEW_USER
   PARTNER
+  TOP_COLLABORATOR
+  VERIFIED_PROFILE
+  CIRCLE_BUILDER
 }
 
 enum CircleCategory {
@@ -175,6 +179,7 @@ enum NotificationType {
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
   CIRCLE_POST_SIGNUP_CREATED
+  CIRCLE_POST_AUTO_ENDED
 }
 
 enum CallType {
@@ -249,50 +254,52 @@ model User {
   createdAt                  DateTime   @default(now())
   updatedAt                  DateTime   @updatedAt
 
-  refreshTokens                RefreshToken[]
-  friendsAsUser                Friend[]                    @relation("userFriends")
-  friendsAsFriend              Friend[]                    @relation("userFriendsTo")
-  blocksIssued                 Block[]                     @relation("blocker")
-  blocksReceived               Block[]                     @relation("blocked")
-  notifications                Notification[]              @relation("toUser")
-  notificationsSent            Notification[]              @relation("fromUser")
-  traces                       Trace[]
-  traceComments                TraceComment[]
-  traceLikeStats               traceLikeStat[]
-  likesGiven                   UserLike[]                  @relation("userLikesGiven")
-  likesReceived                UserLike[]                  @relation("userLikesReceived")
-  tracePreferences             UserTracePreference[]
-  privacySetting               UserPrivacySetting?
-  wallet                       Wallet?
-  coinTransactions             CoinTransaction[]
-  coinGiftsSent                CoinGift[]                  @relation("giftSender")
-  coinGiftsReceived            CoinGift[]                  @relation("giftRecipient")
-  collections                  UserCollection[]
-  circlePostSignups            CirclePostSignup[]
-  friendTags                   FriendTag[]
-  friendTagAssignments         FriendTagOnFriend[]         @relation("tagOwner")
-  pendingFriendTagAssignments  PendingFriendTagOnRequest[] @relation("pendingTagOwner")
-  friendActivities             FriendActivity[]            @relation("friendActivityViewer")
-  friendActivitiesAuthored     FriendActivity[]            @relation("friendActivityActor")
-  friendActivitiesCounterparty FriendActivity[]            @relation("friendActivityCounterparty")
-  friendReportsFiled           FriendReport[]              @relation("friendReportReporter")
-  friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
-  groupReportsFiled            GroupReport[]               @relation("groupReportReporter")
-  notes                        Note[]
-  noteShareLinks               NoteShareLink[]
-  noteGroups                   NoteGroup[]
-  circles                      Circle[]
-  circleMembers                CircleMember[]
-  circlePosts                  CirclePost[]
-  circleInvitationsAsApplicant CircleInvitation[]          @relation("invitationApplicant")
-  circleInvitationsAsInviter   CircleInvitation[]          @relation("invitationInviter")
-  circleVerifications          CircleInvitationVerifier[]  @relation("verifierUser")
-  circleVerificationsAdded     CircleInvitationVerifier[]  @relation("verifierAddedBy")
-  iconAssetsCreated            IconAsset[]                 @relation("iconAssetCreator")
-  displayIcons                 UserDisplayIcon[]
-  conversationGroups           ConversationGroup[]
-  callSessionsInitiated        CallSession[]               @relation("callInitiator")
-  callParticipants             CallParticipant[]
+  refreshTokens                     RefreshToken[]
+  friendsAsUser                     Friend[]                    @relation("userFriends")
+  friendsAsFriend                   Friend[]                    @relation("userFriendsTo")
+  blocksIssued                      Block[]                     @relation("blocker")
+  blocksReceived                    Block[]                     @relation("blocked")
+  notifications                     Notification[]              @relation("toUser")
+  notificationsSent                 Notification[]              @relation("fromUser")
+  traces                            Trace[]
+  traceComments                     TraceComment[]
+  traceLikeStats                    traceLikeStat[]
+  likesGiven                        UserLike[]                  @relation("userLikesGiven")
+  likesReceived                     UserLike[]                  @relation("userLikesReceived")
+  tracePreferences                  UserTracePreference[]
+  privacySetting                    UserPrivacySetting?
+  wallet                            Wallet?
+  coinTransactions                  CoinTransaction[]
+  coinGiftsSent                     CoinGift[]                  @relation("giftSender")
+  coinGiftsReceived                 CoinGift[]                  @relation("giftRecipient")
+  collections                       UserCollection[]
+  circlePostSignups                 CirclePostSignup[]
+  friendTags                        FriendTag[]
+  friendTagAssignments              FriendTagOnFriend[]         @relation("tagOwner")
+  pendingFriendTagAssignments       PendingFriendTagOnRequest[] @relation("pendingTagOwner")
+  friendActivities                  FriendActivity[]            @relation("friendActivityViewer")
+  friendActivitiesAuthored          FriendActivity[]            @relation("friendActivityActor")
+  friendActivitiesCounterparty      FriendActivity[]            @relation("friendActivityCounterparty")
+  friendReportsFiled                FriendReport[]              @relation("friendReportReporter")
+  friendReportsReceived             FriendReport[]              @relation("friendReportTarget")
+  groupReportsFiled                 GroupReport[]               @relation("groupReportReporter")
+  notes                             Note[]
+  noteShareLinks                    NoteShareLink[]
+  noteGroups                        NoteGroup[]
+  circles                           Circle[]
+  circleMembers                     CircleMember[]
+  collaborationRecognitionsReceived CollaborationRecognition[]  @relation("collaborationRecognitionRecipient")
+  collaborationRecognitionsGiven    CollaborationRecognition[]  @relation("collaborationRecognitionRecognizer")
+  circlePosts                       CirclePost[]
+  circleInvitationsAsApplicant      CircleInvitation[]          @relation("invitationApplicant")
+  circleInvitationsAsInviter        CircleInvitation[]          @relation("invitationInviter")
+  circleVerifications               CircleInvitationVerifier[]  @relation("verifierUser")
+  circleVerificationsAdded          CircleInvitationVerifier[]  @relation("verifierAddedBy")
+  iconAssetsCreated                 IconAsset[]                 @relation("iconAssetCreator")
+  displayIcons                      UserDisplayIcon[]
+  conversationGroups                ConversationGroup[]
+  callSessionsInitiated             CallSession[]               @relation("callInitiator")
+  callParticipants                  CallParticipant[]
 }
 
 model RefreshToken {
@@ -439,19 +446,19 @@ model Note {
 }
 
 model NoteShareLink {
-  id        String     @id @default(uuid())
+  id        String      @id @default(uuid())
   ownerID   String
-  token     String     @unique
+  token     String      @unique
   title     String
   status    NoteStatus?
   group     String?
   groupID   String?
   search    String?
-  noteIDs   String[]   @default([])
+  noteIDs   String[]    @default([])
   expiresAt DateTime?
   revokedAt DateTime?
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
 
   owner User @relation(fields: [ownerID], references: [id], onDelete: Cascade)
 
@@ -591,12 +598,12 @@ model Block {
 }
 
 model CallSession {
-  id              String          @id @default(uuid())
+  id              String         @id @default(uuid())
   conversationID  String
   sessionType     Int
   callType        CallType
-  status          CallStatus      @default(RINGING)
-  livekitRoomName String          @unique
+  status          CallStatus     @default(RINGING)
+  livekitRoomName String         @unique
   initiatorID     String
   startedAt       DateTime?
   endedAt         DateTime?
@@ -604,8 +611,8 @@ model CallSession {
   endedByID       String?
   endReason       CallEndReason?
   metadata        Json?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
 
   initiator    User              @relation("callInitiator", fields: [initiatorID], references: [id], onDelete: Cascade)
   participants CallParticipant[]
@@ -756,23 +763,23 @@ model UserTracePreference {
 }
 
 model UserPrivacySetting {
-  id                         String   @id @default(uuid())
-  userID                     String   @unique
-  messageSelfDestructDays    Int      @default(2)
-  momentsVisibility          String   @default("ALL")
-  allowStrangerMessages      Boolean  @default(true)
-  showPhone                  Boolean  @default(false)
-  showWechat                 Boolean  @default(true)
-  showQQ                     Boolean  @default(true)
-  addMeByAccount             Boolean  @default(true)
-  addMeByPhone               Boolean  @default(false)
-  addMeByQrCode              Boolean  @default(true)
-  addMeByGroup               Boolean  @default(true)
-  callPermission             String   @default("EVERYONE")
-  groupInvitePermission      String   @default("EVERYONE")
-  createdAt                  DateTime @default(now())
-  updatedAt                  DateTime @updatedAt
-  user                       User     @relation(fields: [userID], references: [id], onDelete: Cascade)
+  id                      String   @id @default(uuid())
+  userID                  String   @unique
+  messageSelfDestructDays Int      @default(2)
+  momentsVisibility       String   @default("ALL")
+  allowStrangerMessages   Boolean  @default(true)
+  showPhone               Boolean  @default(false)
+  showWechat              Boolean  @default(true)
+  showQQ                  Boolean  @default(true)
+  addMeByAccount          Boolean  @default(true)
+  addMeByPhone            Boolean  @default(false)
+  addMeByQrCode           Boolean  @default(true)
+  addMeByGroup            Boolean  @default(true)
+  callPermission          String   @default("EVERYONE")
+  groupInvitePermission   String   @default("EVERYONE")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  user                    User     @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([userID])
 }
@@ -975,35 +982,40 @@ model CircleMember {
 }
 
 model CirclePost {
-  id                      String           @id @default(uuid())
-  content                 String           @default("")
-  images                  String[]         @default([])
-  tags                    String[]         @default([])
-  city                    String?
-  isHorn                  Boolean          @default(false)
-  noteID                  String?
-  vipRestriction          Int?
-  creditRestriction       Int?
-  fancyRestriction        Boolean          @default(false)
-  viewCount               Int              @default(0)
-  signupCount             Int              @default(0)
-  signupVipRestriction    Int?
-  signupCreditRestriction Int?
-  signupFancyRestriction  Boolean          @default(false)
-  status                  CirclePostStatus @default(ACTIVE)
-  authorID                String
-  circleID                String
-  createdAt               DateTime         @default(now())
-  updatedAt               DateTime         @updatedAt
+  id                        String           @id @default(uuid())
+  content                   String           @default("")
+  images                    String[]         @default([])
+  tags                      String[]         @default([])
+  city                      String?
+  isHorn                    Boolean          @default(false)
+  noteID                    String?
+  vipRestriction            Int?
+  creditRestriction         Int?
+  fancyRestriction          Boolean          @default(false)
+  viewCount                 Int              @default(0)
+  signupCount               Int              @default(0)
+  signupVipRestriction      Int?
+  signupCreditRestriction   Int?
+  signupFancyRestriction    Boolean          @default(false)
+  status                    CirclePostStatus @default(ACTIVE)
+  endedAt                   DateTime?
+  collaborationRecognizedAt DateTime?
+  expiresAt                 DateTime?
+  authorID                  String
+  circleID                  String
+  createdAt                 DateTime         @default(now())
+  updatedAt                 DateTime         @updatedAt
 
-  author        User               @relation(fields: [authorID], references: [id], onDelete: Cascade)
-  circle        Circle             @relation(fields: [circleID], references: [id], onDelete: Cascade)
-  signups       CirclePostSignup[]
-  notifications Notification[]
+  author                    User                       @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  circle                    Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  signups                   CirclePostSignup[]
+  collaborationRecognitions CollaborationRecognition[]
+  notifications             Notification[]
 
   @@index([circleID, createdAt(sort: Desc)])
   @@index([authorID])
   @@index([city, createdAt(sort: Desc)])
+  @@index([status, expiresAt])
 }
 
 model CirclePostSignup {
@@ -1021,6 +1033,24 @@ model CirclePostSignup {
   @@index([postID])
   @@index([userID])
   @@index([postID, seenByAuthor])
+}
+
+model CollaborationRecognition {
+  id           String    @id @default(uuid())
+  recipientID  String
+  recognizerID String
+  circlePostID String?
+  revokedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  recipient  User        @relation("collaborationRecognitionRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
+  recognizer User        @relation("collaborationRecognitionRecognizer", fields: [recognizerID], references: [id], onDelete: Cascade)
+  circlePost CirclePost? @relation(fields: [circlePostID], references: [id], onDelete: SetNull)
+
+  @@unique([circlePostID, recipientID])
+  @@index([recipientID, revokedAt])
+  @@index([recognizerID, createdAt])
+  @@index([circlePostID])
 }
 
 model CircleInvitation {
