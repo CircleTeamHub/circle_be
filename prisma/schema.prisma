@@ -417,6 +417,7 @@ model Note {
   title        String
   content      String?
   contentJson  Json?
+  sections     Json?
   status       NoteStatus @default(ACTIVE)
   available    Boolean    @default(true)
   pinned       Boolean    @default(false)

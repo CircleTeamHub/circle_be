@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   S3Client,
   PutObjectCommand,
+  GetObjectCommand,
   CreateBucketCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
@@ -22,6 +23,20 @@ export interface PresignResult {
   uploadUrl: string;
   fileUrl: string;
   key: string;
+}
+
+export interface UploadBufferInput {
+  key: string;
+  body: Buffer;
+  contentType: string;
+  expiresInSeconds?: number;
+}
+
+export interface UploadBufferResult {
+  url: string;
+  key: string;
+  size: number;
+  expiresAt: Date | null;
 }
 
 export function buildPublicReadBucketPolicy(bucket: string) {
@@ -164,6 +179,72 @@ export class UploadService implements OnModuleInit {
     const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;
 
     return { uploadUrl, fileUrl, key };
+  }
+
+  async uploadBuffer(input: UploadBufferInput): Promise<UploadBufferResult> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: input.key,
+      Body: input.body,
+      ContentType: input.contentType,
+    });
+
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
+    try {
+      await this.client.send(command);
+    } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'minio',
+        operation: 'put_object',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'minio',
+        operation: 'put_object',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
+    }
+
+    const ttl = input.expiresInSeconds ?? null;
+    return {
+      url: `${this.publicUrl}/${this.bucket}/${input.key}`,
+      key: input.key,
+      size: input.body.byteLength,
+      expiresAt: ttl ? new Date(Date.now() + ttl * 1000) : null,
+    };
+  }
+
+  async downloadObjectBuffer(key: string): Promise<Buffer> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    });
+    const response = await this.client.send(command);
+    if (!response.Body) {
+      return Buffer.alloc(0);
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
   }
 
   private async ensureBucketExists() {

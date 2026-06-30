@@ -6,6 +6,7 @@ import {
   IsEnum,
   IsInt,
   IsNotEmpty,
+  IsNumber,
   IsOptional,
   IsString,
   IsUrl,
@@ -30,6 +31,9 @@ export type NoteWritableStatus = (typeof NOTE_WRITABLE_STATUS)[number];
 
 export const NOTE_MEDIA_TYPE = ['IMAGE', 'VIDEO'] as const;
 export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
+
+export const NOTE_EXPORT_FORMAT = ['IMAGE', 'PDF', 'IMAGES', 'VIDEOS'] as const;
+export type NoteExportFormat = (typeof NOTE_EXPORT_FORMAT)[number];
 
 @ValidatorConstraint({ name: 'uniqueMediaSortOrder', async: false })
 class UniqueMediaSortOrderConstraint implements ValidatorConstraintInterface {
@@ -104,6 +108,81 @@ export class CreateNoteMediaDto {
   sortOrder: number;
 }
 
+export class NoteTextSectionDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(20000)
+  content?: string;
+
+  @ApiPropertyOptional({ type: [Object] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  contentJson?: Record<string, unknown>[];
+}
+
+export class NoteMediaSectionDto {
+  @ApiPropertyOptional({ type: [CreateNoteMediaDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => CreateNoteMediaDto)
+  @Validate(UniqueMediaSortOrderConstraint)
+  items?: CreateNoteMediaDto[];
+}
+
+export class NoteLocationSectionDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  title?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  address?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  latitude?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  longitude?: number;
+}
+
+export class NoteSectionsDto {
+  @ApiPropertyOptional({ type: NoteTextSectionDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteTextSectionDto)
+  text?: NoteTextSectionDto;
+
+  @ApiPropertyOptional({ type: NoteMediaSectionDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteMediaSectionDto)
+  media?: NoteMediaSectionDto;
+
+  @ApiPropertyOptional({ type: NoteMediaSectionDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteMediaSectionDto)
+  showcase?: NoteMediaSectionDto;
+
+  @ApiPropertyOptional({ type: NoteLocationSectionDto, nullable: true })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteLocationSectionDto)
+  location?: NoteLocationSectionDto | null;
+}
+
 export class CreateNoteDto {
   @ApiProperty()
   @IsString()
@@ -147,6 +226,12 @@ export class CreateNoteDto {
   @Type(() => CreateNoteMediaDto)
   @Validate(UniqueMediaSortOrderConstraint)
   media: CreateNoteMediaDto[];
+
+  @ApiPropertyOptional({ type: NoteSectionsDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => NoteSectionsDto)
+  sections?: NoteSectionsDto;
 }
 
 export class UpdateNoteDto extends CreateNoteDto {}
@@ -305,6 +390,21 @@ export class NoteMediaDto {
   @ApiProperty() sortOrder: number;
 }
 
+export class NoteSectionsResponseDto {
+  @ApiProperty() text: {
+    content: string | null;
+    contentJson: unknown[] | null;
+  };
+  @ApiProperty() media: { items: unknown[] };
+  @ApiProperty() showcase: { items: unknown[] };
+  @ApiPropertyOptional({ nullable: true }) location: {
+    title?: string;
+    address?: string;
+    latitude?: number;
+    longitude?: number;
+  } | null;
+}
+
 export class NoteSummaryDto {
   @ApiProperty() id: string;
   @ApiProperty() ownerId: string;
@@ -323,6 +423,9 @@ export class NoteSummaryDto {
   @ApiProperty() imageCount: number;
   @ApiProperty() videoCount: number;
   @ApiProperty() mediaCount: number;
+  @ApiProperty() hasText: boolean;
+  @ApiProperty() showcaseCount: number;
+  @ApiProperty() hasLocation: boolean;
   @ApiProperty() createdAt: Date;
   @ApiProperty() updatedAt: Date;
 }
@@ -333,4 +436,27 @@ export class NoteDetailDto extends NoteSummaryDto {
     | Record<string, unknown>[]
     | null;
   @ApiProperty({ type: [NoteMediaDto] }) media: NoteMediaDto[];
+  @ApiProperty({ type: NoteSectionsResponseDto })
+  sections: NoteSectionsResponseDto;
+}
+
+export class CreateNoteExportDto {
+  @ApiProperty({ enum: NOTE_EXPORT_FORMAT })
+  @IsEnum(NOTE_EXPORT_FORMAT)
+  format: NoteExportFormat;
+
+  @ApiPropertyOptional({
+    description: '`ALL` for all media in the requested format, or a media id.',
+  })
+  @IsOptional()
+  @IsString()
+  scope?: 'ALL' | string;
+}
+
+export class NoteExportResultDto {
+  @ApiProperty() url: string;
+  @ApiProperty() filename: string;
+  @ApiProperty() mimeType: string;
+  @ApiPropertyOptional() size: number | null;
+  @ApiPropertyOptional() expiresAt: Date | null;
 }
