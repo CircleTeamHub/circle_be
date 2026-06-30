@@ -492,6 +492,7 @@ export class NoteService {
         try {
           const image = await this.uploadService.downloadObjectBuffer(
             item.objectKey,
+            MAX_EXPORT_SINGLE_MEDIA_BYTES,
           );
           if (image.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
             throw new BadRequestException('Image file is too large to embed');
@@ -569,12 +570,16 @@ export class NoteService {
       contentType: input.mimeType,
       expiresInSeconds: NOTE_EXPORT_TTL_SECONDS,
     });
+    const download = await this.uploadService.createPresignedGetUrl(
+      key,
+      NOTE_EXPORT_TTL_SECONDS,
+    );
     return {
-      url: uploaded.url,
+      url: download.url,
       filename: input.filename,
       mimeType: input.mimeType,
       size: uploaded.size,
-      expiresAt: uploaded.expiresAt,
+      expiresAt: download.expiresAt,
     };
   }
 
@@ -677,6 +682,43 @@ export class NoteService {
     };
   }
 
+  private resolveSectionMediaItems(
+    sectionName: 'media' | 'showcase',
+    requestedItems: CreateNoteDto['media'] | undefined,
+    fallbackItems: CreateNoteDto['media'],
+    validatedMedia: CreateNoteDto['media'],
+  ) {
+    const canonicalByComposite = new Map<string, Record<string, any>>();
+    const canonicalByObjectKey = new Map<string, Record<string, any>>();
+    const canonicalByUrl = new Map<string, Record<string, any>>();
+
+    for (const item of validatedMedia) {
+      const canonical = this.mapMediaItemForSection(
+        item as Record<string, any>,
+      );
+      canonicalByComposite.set(`${item.objectKey}:${item.url}`, canonical);
+      canonicalByObjectKey.set(item.objectKey, canonical);
+      canonicalByUrl.set(item.url, canonical);
+    }
+
+    const source =
+      requestedItems && requestedItems.length > 0
+        ? requestedItems
+        : fallbackItems;
+    return source.map((item) => {
+      const resolved =
+        canonicalByComposite.get(`${item.objectKey}:${item.url}`) ??
+        canonicalByObjectKey.get(item.objectKey) ??
+        canonicalByUrl.get(item.url);
+      if (!resolved) {
+        throw new BadRequestException(
+          `${sectionName} section media must reference note media`,
+        );
+      }
+      return resolved;
+    });
+  }
+
   private buildSectionsFromInput(
     input: CreateNoteDto | UpdateNoteDto,
     derived: {
@@ -686,14 +728,18 @@ export class NoteService {
     },
   ): NoteSections {
     const sectionInput = input.sections;
-    const mediaItems =
-      sectionInput?.media?.items && sectionInput.media.items.length > 0
-        ? sectionInput.media.items
-        : derived.media;
-    const showcaseItems =
-      sectionInput?.showcase?.items && sectionInput.showcase.items.length > 0
-        ? sectionInput.showcase.items
-        : derived.media.filter((item) => item.type === 'IMAGE');
+    const mediaItems = this.resolveSectionMediaItems(
+      'media',
+      sectionInput?.media?.items,
+      derived.media,
+      derived.media,
+    );
+    const showcaseItems = this.resolveSectionMediaItems(
+      'showcase',
+      sectionInput?.showcase?.items,
+      derived.media.filter((item) => item.type === 'IMAGE'),
+      derived.media,
+    );
 
     return {
       text: {
@@ -701,10 +747,10 @@ export class NoteService {
         contentJson: derived.contentJson,
       },
       media: {
-        items: mediaItems.map((item) => this.mapMediaItemForSection(item)),
+        items: mediaItems,
       },
       showcase: {
-        items: showcaseItems.map((item) => this.mapMediaItemForSection(item)),
+        items: showcaseItems,
       },
       location: this.normalizeLocation(sectionInput?.location),
     };
@@ -1283,13 +1329,20 @@ export class NoteService {
     if (scope !== 'ALL') {
       const item = selected[0];
       const ext = mediaExtension(item);
+      if (!this.uploadService) {
+        throw new ServiceUnavailableException('File export is not configured');
+      }
+      const download = await this.uploadService.createPresignedGetUrl(
+        item.objectKey,
+        NOTE_EXPORT_TTL_SECONDS,
+      );
       return {
-        url: item.url,
+        url: download.url,
         filename: `${basename}-${item.id}.${ext}`,
         mimeType:
           item.mimeType ?? (item.type === 'VIDEO' ? 'video/mp4' : 'image/jpeg'),
         size: item.size ?? null,
-        expiresAt: null,
+        expiresAt: download.expiresAt,
       };
     }
 
@@ -1300,6 +1353,7 @@ export class NoteService {
     for (const [index, item] of selected.entries()) {
       const data = await this.uploadService.downloadObjectBuffer(
         item.objectKey,
+        MAX_EXPORT_SINGLE_MEDIA_BYTES,
       );
       if (data.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
         throw new BadRequestException('Media file is too large to export');

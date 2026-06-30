@@ -53,10 +53,18 @@ describe('NoteService', () => {
   const uploadService = {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
+    createPresignedGetUrl: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    uploadService.createPresignedGetUrl.mockImplementation(
+      (key: string, expiresInSeconds: number) =>
+        Promise.resolve({
+          url: `https://signed.example.com/${key}?expires=${expiresInSeconds}`,
+          expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+        }),
+    );
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -564,6 +572,37 @@ describe('NoteService', () => {
     });
   });
 
+  it('rejects structured section media that is not part of the validated note media set', async () => {
+    await expect(
+      service.createNote('user-1', {
+        title: 'unsafe sections',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/legit.jpg',
+            url: 'https://cdn.example.com/legit.jpg',
+            sortOrder: 0,
+          },
+        ],
+        sections: {
+          text: { content: 'hello' },
+          media: {
+            items: [
+              {
+                type: 'IMAGE',
+                objectKey: 'notes/user-1/untracked.jpg',
+                url: 'https://cdn.example.com/untracked.jpg',
+                sortOrder: 0,
+              },
+            ],
+          },
+        },
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   it('lists only the owner notes with summary fields', async () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
@@ -785,12 +824,20 @@ describe('NoteService', () => {
     expect(uploaded.subarray(0, 2).toString()).toBe('PK');
     expect(uploadService.downloadObjectBuffer).toHaveBeenCalledWith(
       'notes/user-1/1.jpg',
+      8 * 1024 * 1024,
     );
     expect(uploadService.downloadObjectBuffer).toHaveBeenCalledWith(
       'notes/user-1/2.jpg',
+      8 * 1024 * 1024,
+    );
+    expect(uploadService.createPresignedGetUrl).toHaveBeenCalledWith(
+      expect.stringMatching(/^note-exports\/user-1\/note-export\/.+\.zip$/),
+      900,
     );
     expect(result).toMatchObject({
-      url: 'https://cdn.example.com/note-exports/user-1/note-export/images.zip',
+      url: expect.stringMatching(
+        /^https:\/\/signed\.example\.com\/note-exports\/user-1\/note-export\/.+\.zip\?expires=900$/,
+      ),
       filename: '导出测试-images.zip',
       mimeType: 'application/zip',
       size: 1234,
@@ -849,6 +896,7 @@ describe('NoteService', () => {
 
     expect(uploadService.downloadObjectBuffer).toHaveBeenCalledWith(
       'notes/user-1/1.png',
+      8 * 1024 * 1024,
     );
     const body = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     expect(body.subarray(0, 5).toString()).toBe('%PDF-');
@@ -856,7 +904,9 @@ describe('NoteService', () => {
     expect(result).toMatchObject({
       filename: 'PDF测试.pdf',
       mimeType: 'application/pdf',
-      url: 'https://cdn.example.com/note-exports/user-1/note-pdf/pdf.pdf',
+      url: expect.stringMatching(
+        /^https:\/\/signed\.example\.com\/note-exports\/user-1\/note-pdf\/.+\.pdf\?expires=900$/,
+      ),
       expiresAt,
     });
   });
@@ -1017,12 +1067,16 @@ describe('NoteService', () => {
     );
 
     expect(uploadService.uploadBuffer).not.toHaveBeenCalled();
+    expect(uploadService.createPresignedGetUrl).toHaveBeenCalledWith(
+      'notes/user-1/1.mp4',
+      900,
+    );
     expect(result).toMatchObject({
-      url: 'https://cdn.example.com/1.mp4',
+      url: 'https://signed.example.com/notes/user-1/1.mp4?expires=900',
       filename: '导出测试-video-1.mp4',
       mimeType: 'video/mp4',
       size: 20,
-      expiresAt: null,
+      expiresAt: new Date('2026-06-29T12:15:00.000Z'),
     });
   });
 
