@@ -12,11 +12,13 @@ import {
 } from './dto/icon.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { SystemIconKey, UserDisplayIconType } from 'src/generated/prisma';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
-// 被赞总数达到该阈值即获得合作达人（PARTNER）徽章。随时可改。
-const PARTNER_LIKE_THRESHOLD = 3;
+const TOP_COLLABORATOR_RECOGNITION_THRESHOLD = 100;
+const CIRCLE_BUILDER_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const CIRCLE_BUILDER_MIN_MEMBERS = 100;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -30,6 +32,7 @@ type EligibleSystemIcon = {
   title: string;
   fallbackIconName: string;
   imageUrl: string | null;
+  recognitionCount?: number;
 };
 
 type EligibleCircleIcon = {
@@ -43,6 +46,18 @@ type Eligibility = {
   systemIcons: EligibleSystemIcon[];
   circleIcons: EligibleCircleIcon[];
 };
+
+function toPrismaDisplayIconType(
+  displayType: DisplayIconTypeDto,
+): UserDisplayIconType {
+  return displayType as unknown as UserDisplayIconType;
+}
+
+function toPrismaSystemIconKey(
+  systemKey: SystemIconKeyDto | null | undefined,
+): SystemIconKey | null {
+  return (systemKey as unknown as SystemIconKey | undefined) ?? null;
+}
 
 @Injectable()
 export class IconService {
@@ -91,6 +106,7 @@ export class IconService {
         title: icon.title,
         imageUrl: icon.imageUrl,
         fallbackIconName: icon.fallbackIconName,
+        recognitionCount: icon.recognitionCount,
         selected: selections.some((item) => item.systemKey === icon.systemKey),
         systemKey: icon.systemKey,
       })),
@@ -150,8 +166,8 @@ export class IconService {
         await tx.userDisplayIcon.createMany({
           data: normalized.map((item) => ({
             userID: userId,
-            displayType: item.displayType,
-            systemKey: item.systemKey ?? null,
+            displayType: toPrismaDisplayIconType(item.displayType),
+            systemKey: toPrismaSystemIconKey(item.systemKey),
             circleID: item.circleId ?? null,
             sortOrder: item.sortOrder,
           })),
@@ -195,7 +211,18 @@ export class IconService {
         vipLevel: true,
         receivedLikeCount: true,
         createdAt: true,
+        status: true,
+        phoneNumber: true,
+        wechat: true,
+        qq: true,
         iconPreferencesInitialized: true,
+        privacySetting: {
+          select: {
+            showPhone: true,
+            showWechat: true,
+            showQQ: true,
+          },
+        },
       },
     });
 
@@ -203,32 +230,49 @@ export class IconService {
       throw new NotFoundException('User not found');
     }
 
-    const circleMemberships = await this.prisma.circleMember.findMany({
-      where: {
-        userID: userId,
-        status: 'ACTIVE',
-        circle: {
-          deleted: false,
-          currentIconAssetID: { not: null },
+    const [circleMemberships, builderMembership] = await Promise.all([
+      this.prisma.circleMember.findMany({
+        where: {
+          userID: userId,
+          status: 'ACTIVE',
+          circle: {
+            deleted: false,
+            currentIconAssetID: { not: null },
+          },
         },
-      },
-      select: {
-        circleID: true,
-        circle: {
-          select: {
-            id: true,
-            name: true,
-            currentIconAsset: {
-              select: {
-                id: true,
-                imageUrl: true,
+        select: {
+          circleID: true,
+          circle: {
+            select: {
+              id: true,
+              name: true,
+              currentIconAsset: {
+                select: {
+                  id: true,
+                  imageUrl: true,
+                },
               },
             },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.circleMember.findFirst({
+        where: {
+          userID: userId,
+          status: 'ACTIVE',
+          role: { in: ['OWNER', 'ADMIN'] },
+          circle: {
+            deleted: false,
+            createdAt: {
+              lte: new Date(Date.now() - CIRCLE_BUILDER_MIN_AGE_MS),
+            },
+            memberCount: { gt: CIRCLE_BUILDER_MIN_MEMBERS },
+          },
+        },
+        select: { id: true },
+      }),
+    ]);
 
     const systemIcons: EligibleSystemIcon[] = [];
     if (user.vipLevel > 0) {
@@ -248,12 +292,38 @@ export class IconService {
       });
     }
 
-    // 合作达人：被赞总数达到阈值即获得。
-    if (user.receivedLikeCount >= PARTNER_LIKE_THRESHOLD) {
+    if (user.receivedLikeCount >= TOP_COLLABORATOR_RECOGNITION_THRESHOLD) {
       systemIcons.push({
-        systemKey: SystemIconKeyDto.PARTNER,
+        systemKey: SystemIconKeyDto.TOP_COLLABORATOR,
         title: '合作达人',
         fallbackIconName: 'ribbon-outline',
+        imageUrl: null,
+        recognitionCount: user.receivedLikeCount,
+      });
+    }
+
+    const canShowPhone =
+      (user.privacySetting?.showPhone ?? false) && Boolean(user.phoneNumber);
+    const canShowWechat =
+      (user.privacySetting?.showWechat ?? true) && Boolean(user.wechat);
+    const canShowQQ = (user.privacySetting?.showQQ ?? true) && Boolean(user.qq);
+    if (
+      user.status === 'ACTIVE' &&
+      (canShowPhone || canShowWechat || canShowQQ)
+    ) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.VERIFIED_PROFILE,
+        title: '资料可信',
+        fallbackIconName: 'shield-checkmark-outline',
+        imageUrl: null,
+      });
+    }
+
+    if (builderMembership) {
+      systemIcons.push({
+        systemKey: SystemIconKeyDto.CIRCLE_BUILDER,
+        title: '圈子建设者',
+        fallbackIconName: 'construct-outline',
         imageUrl: null,
       });
     }
@@ -336,8 +406,8 @@ export class IconService {
         .map((icon, index) => ({
           id: `system:${icon.systemKey}`,
           userID: userId,
-          displayType: DisplayIconTypeDto.SYSTEM,
-          systemKey: icon.systemKey,
+          displayType: toPrismaDisplayIconType(DisplayIconTypeDto.SYSTEM),
+          systemKey: toPrismaSystemIconKey(icon.systemKey),
           circleID: null,
           sortOrder: index,
         }));
@@ -423,6 +493,7 @@ export class IconService {
             title: icon.title,
             imageUrl: icon.imageUrl,
             fallbackIconName: icon.fallbackIconName,
+            recognitionCount: icon.recognitionCount,
             systemKey: icon.systemKey,
             sortOrder: selection.sortOrder,
           };

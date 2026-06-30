@@ -13,6 +13,7 @@ describe('IconService', () => {
     },
     circleMember: {
       findMany: jest.fn(),
+      findFirst: jest.fn(),
     },
     userDisplayIcon: {
       findMany: jest.fn(),
@@ -29,6 +30,7 @@ describe('IconService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    prisma.circleMember.findFirst.mockResolvedValue(null);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -45,7 +47,9 @@ describe('IconService', () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
       vipLevel: 5,
+      receivedLikeCount: 0,
       createdAt: new Date(),
+      status: 'ACTIVE',
       iconPreferencesInitialized: false,
     });
     prisma.circleMember.findMany.mockResolvedValue([
@@ -91,13 +95,24 @@ describe('IconService', () => {
       .mockResolvedValueOnce({
         id: 'user-1',
         vipLevel: 5,
+        receivedLikeCount: 10_000,
         createdAt: new Date(),
+        status: 'ACTIVE',
+        phoneNumber: '13800138000',
+        wechat: 'wxid_user1',
+        qq: '932567218',
+        privacySetting: {
+          showPhone: true,
+          showWechat: true,
+          showQQ: true,
+        },
         iconPreferencesInitialized: false,
       })
       .mockResolvedValueOnce({
         iconPreferencesInitialized: false,
       });
     prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.circleMember.findFirst.mockResolvedValue({ id: 'builder-member-1' });
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
     const result = await service.getIconOptions('user-1');
@@ -118,6 +133,27 @@ describe('IconService', () => {
           circleID: null,
           sortOrder: 1,
         },
+        {
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'TOP_COLLABORATOR',
+          circleID: null,
+          sortOrder: 2,
+        },
+        {
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'VERIFIED_PROFILE',
+          circleID: null,
+          sortOrder: 3,
+        },
+        {
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'CIRCLE_BUILDER',
+          circleID: null,
+          sortOrder: 4,
+        },
       ],
     });
     expect(prisma.user.update).toHaveBeenCalledWith({
@@ -136,6 +172,22 @@ describe('IconService', () => {
           systemKey: 'NEW_USER',
           title: '新手',
         }),
+        expect.objectContaining({
+          type: 'SYSTEM',
+          systemKey: 'TOP_COLLABORATOR',
+          title: '合作达人',
+          recognitionCount: 10_000,
+        }),
+        expect.objectContaining({
+          type: 'SYSTEM',
+          systemKey: 'VERIFIED_PROFILE',
+          title: '资料可信',
+        }),
+        expect.objectContaining({
+          type: 'SYSTEM',
+          systemKey: 'CIRCLE_BUILDER',
+          title: '圈子建设者',
+        }),
       ]),
     );
   });
@@ -144,6 +196,7 @@ describe('IconService', () => {
     prisma.user.findUnique.mockResolvedValueOnce({
       id: 'user-1',
       vipLevel: 5,
+      receivedLikeCount: 0,
       createdAt: new Date(),
       iconPreferencesInitialized: true,
     });
@@ -182,6 +235,7 @@ describe('IconService', () => {
     prisma.user.findUnique.mockResolvedValueOnce({
       id: 'user-1',
       vipLevel: 5,
+      receivedLikeCount: 0,
       createdAt: new Date(),
       iconPreferencesInitialized: true,
     });
@@ -211,6 +265,7 @@ describe('IconService', () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
       vipLevel: 5,
+      receivedLikeCount: 0,
       createdAt: new Date(),
       iconPreferencesInitialized: true,
     });
@@ -232,6 +287,7 @@ describe('IconService', () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
       vipLevel: 5,
+      receivedLikeCount: 0,
       createdAt: new Date(),
       iconPreferencesInitialized: true,
     });
@@ -257,11 +313,11 @@ describe('IconService', () => {
     expect(prisma.user.findUnique).toHaveBeenCalled();
   });
 
-  it('awards the PARTNER (合作达人) badge once receivedLikeCount crosses the threshold', async () => {
+  it('awards the TOP_COLLABORATOR badge once recognition crosses the threshold', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
       vipLevel: 0,
-      receivedLikeCount: 5, // >= PARTNER_LIKE_THRESHOLD (3)
+      receivedLikeCount: 100,
       createdAt: new Date(0), // old account → no NEW_USER badge
       iconPreferencesInitialized: true,
     });
@@ -272,16 +328,20 @@ describe('IconService', () => {
 
     expect(result.systemIcons).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ systemKey: 'PARTNER', title: '合作达人' }),
+        expect.objectContaining({
+          systemKey: 'TOP_COLLABORATOR',
+          title: '合作达人',
+          recognitionCount: 100,
+        }),
       ]),
     );
   });
 
-  it('does NOT award PARTNER below the threshold', async () => {
+  it('does NOT award TOP_COLLABORATOR below the threshold', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-1',
       vipLevel: 0,
-      receivedLikeCount: 2, // below threshold
+      receivedLikeCount: 99,
       createdAt: new Date(0),
       iconPreferencesInitialized: true,
     });
@@ -292,7 +352,64 @@ describe('IconService', () => {
 
     expect(result.systemIcons).not.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ systemKey: 'PARTNER' }),
+        expect.objectContaining({ systemKey: 'TOP_COLLABORATOR' }),
+      ]),
+    );
+  });
+
+  it('awards VERIFIED_PROFILE when a public contact method is available', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 0,
+      receivedLikeCount: 0,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      wechat: 'wxid_user1',
+      qq: null,
+      phoneNumber: null,
+      privacySetting: {
+        showPhone: false,
+        showWechat: true,
+        showQQ: true,
+      },
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(result.systemIcons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          systemKey: 'VERIFIED_PROFILE',
+          title: '资料可信',
+        }),
+      ]),
+    );
+  });
+
+  it('awards CIRCLE_BUILDER for active owners or admins of mature circles', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 0,
+      receivedLikeCount: 0,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.circleMember.findFirst.mockResolvedValue({ id: 'builder-member-1' });
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(result.systemIcons).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          systemKey: 'CIRCLE_BUILDER',
+          title: '圈子建设者',
+        }),
       ]),
     );
   });
