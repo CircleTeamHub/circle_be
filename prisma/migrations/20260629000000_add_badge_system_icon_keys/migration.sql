@@ -30,14 +30,24 @@ ON "CollaborationRecognition"("circlePostID");
 CREATE UNIQUE INDEX IF NOT EXISTS "CollaborationRecognition_circlePostID_recipientID_key"
 ON "CollaborationRecognition"("circlePostID", "recipientID");
 
-ALTER TABLE "CollaborationRecognition"
-ADD CONSTRAINT "CollaborationRecognition_recipientID_fkey"
-FOREIGN KEY ("recipientID") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+-- AddForeignKey
+-- Postgres has no `ADD CONSTRAINT IF NOT EXISTS`, so guard each FK so the
+-- existing-DB baseline-reset runbook (db push → resolve 0_init → migrate
+-- deploy) re-applies cleanly when the constraints already exist.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'CollaborationRecognition_recipientID_fkey') THEN
+    ALTER TABLE "CollaborationRecognition" ADD CONSTRAINT "CollaborationRecognition_recipientID_fkey" FOREIGN KEY ("recipientID") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END $$;
 
-ALTER TABLE "CollaborationRecognition"
-ADD CONSTRAINT "CollaborationRecognition_recognizerID_fkey"
-FOREIGN KEY ("recognizerID") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'CollaborationRecognition_recognizerID_fkey') THEN
+    ALTER TABLE "CollaborationRecognition" ADD CONSTRAINT "CollaborationRecognition_recognizerID_fkey" FOREIGN KEY ("recognizerID") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END $$;
 
-ALTER TABLE "CollaborationRecognition"
-ADD CONSTRAINT "CollaborationRecognition_circlePostID_fkey"
-FOREIGN KEY ("circlePostID") REFERENCES "CirclePost"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'CollaborationRecognition_circlePostID_fkey') THEN
+    ALTER TABLE "CollaborationRecognition" ADD CONSTRAINT "CollaborationRecognition_circlePostID_fkey" FOREIGN KEY ("circlePostID") REFERENCES "CirclePost"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+  END IF;
+END $$;
