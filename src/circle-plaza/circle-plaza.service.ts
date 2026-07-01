@@ -11,6 +11,8 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { DisplayIconDto } from 'src/icon/dto/icon.dto';
+import { IconService } from 'src/icon/icon.service';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -52,6 +54,7 @@ export class CirclePlazaService {
     private readonly config: ConfigService,
     private readonly realtime: RealtimeService,
     private readonly notificationService: NotificationService,
+    private readonly iconService: IconService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -162,7 +165,17 @@ export class CirclePlazaService {
       return created;
     });
 
-    return this.toPlazaPostDto(post, true, false, true);
+    const displayIconsByAuthor = await this.getDisplayIconsByAuthorIds([
+      post.author.id,
+    ]);
+
+    return this.toPlazaPostDto(
+      post,
+      true,
+      false,
+      true,
+      displayIconsByAuthor.get(post.author.id) ?? [],
+    );
   }
 
   async getFeed(
@@ -221,12 +234,15 @@ export class CirclePlazaService {
     ]);
 
     const postIds = posts.map((p) => p.id);
-    const mySignups = postIds.length
-      ? await this.prisma.circlePostSignup.findMany({
-          where: { userID: viewerId, postID: { in: postIds } },
-          select: { postID: true },
-        })
-      : [];
+    const [mySignups, displayIconsByAuthor] = await Promise.all([
+      postIds.length
+        ? this.prisma.circlePostSignup.findMany({
+            where: { userID: viewerId, postID: { in: postIds } },
+            select: { postID: true },
+          })
+        : Promise.resolve([]),
+      this.getDisplayIconsByAuthorIds(posts.map((post) => post.author.id)),
+    ]);
     const signedSet = new Set(mySignups.map((s) => s.postID));
 
     const items = posts.map((post) =>
@@ -235,6 +251,7 @@ export class CirclePlazaService {
         this.checkCanInteract(post, viewer),
         signedSet.has(post.id),
         this.checkCanSignup(post, viewer),
+        displayIconsByAuthor.get(post.author.id) ?? [],
       ),
     );
 
@@ -268,16 +285,20 @@ export class CirclePlazaService {
 
     if (!post) throw new NotFoundException('Post not found');
 
-    const signed = await this.prisma.circlePostSignup.findUnique({
-      where: { postID_userID: { postID: postId, userID: viewerId } },
-      select: { id: true },
-    });
+    const [signed, displayIconsByAuthor] = await Promise.all([
+      this.prisma.circlePostSignup.findUnique({
+        where: { postID_userID: { postID: postId, userID: viewerId } },
+        select: { id: true },
+      }),
+      this.getDisplayIconsByAuthorIds([post.author.id]),
+    ]);
 
     return this.toPlazaPostDto(
       post,
       this.checkCanInteract(post, viewer),
       Boolean(signed),
       this.checkCanSignup(post, viewer),
+      displayIconsByAuthor.get(post.author.id) ?? [],
     );
   }
 
@@ -572,6 +593,9 @@ export class CirclePlazaService {
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
+    const displayIconsByUser = await this.getDisplayIconsByAuthorIds(
+      signups.map((signup) => signup.user.id),
+    );
     return {
       items: signups.map((s) => ({
         userId: s.user.id,
@@ -581,6 +605,7 @@ export class CirclePlazaService {
         accountId: s.user.accountId,
         signedAt: s.createdAt.toISOString(),
         seen: s.seenByAuthor,
+        displayIcons: displayIconsByUser.get(s.user.id) ?? [],
       })),
     };
   }
@@ -671,11 +696,36 @@ export class CirclePlazaService {
     return true;
   }
 
+  private async getDisplayIconsByAuthorIds(
+    authorIds: string[],
+  ): Promise<Map<string, DisplayIconDto[]>> {
+    const uniqueAuthorIds = [...new Set(authorIds.filter(Boolean))];
+    if (uniqueAuthorIds.length === 0) return new Map();
+
+    const entries = await Promise.all(
+      uniqueAuthorIds.map(async (authorId) => {
+        try {
+          const displayIcons =
+            await this.iconService.getDisplayIconsForUser(authorId);
+          return [authorId, displayIcons] as const;
+        } catch {
+          this.logger.warn(
+            `failed to resolve display icons for plaza author ${authorId}`,
+          );
+          return [authorId, [] as DisplayIconDto[]] as const;
+        }
+      }),
+    );
+
+    return new Map(entries);
+  }
+
   private toPlazaPostDto(
     post: PlazaPostWithRelations,
     canInteract: boolean,
     signedByMe: boolean,
     canSignup: boolean,
+    displayIcons: DisplayIconDto[],
   ): PlazaPostDto {
     return {
       id: post.id,
@@ -705,6 +755,7 @@ export class CirclePlazaService {
         avatarUrl: post.author.avatarUrl,
         avatarFrame: post.author.avatarFrame,
         accountId: post.author.accountId,
+        displayIcons,
       },
       circle: {
         id: post.circle.id,

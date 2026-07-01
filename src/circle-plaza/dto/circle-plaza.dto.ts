@@ -14,6 +14,7 @@ import {
   Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -154,6 +155,7 @@ export class PlazaPostAuthorDto {
   avatarUrl: string | null;
   avatarFrame: string | null;
   accountId: string;
+  displayIcons: DisplayIconDto[];
 }
 
 export class PlazaPostCircleDto {
@@ -208,4 +210,5 @@ export class PostSignupItemDto {
   accountId: string;
   signedAt: string;
   seen: boolean;
+  displayIcons: DisplayIconDto[];
 }
