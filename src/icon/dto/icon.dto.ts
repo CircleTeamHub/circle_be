@@ -66,6 +66,10 @@ export class DisplayIconDto {
 
   @ApiPropertyOptional()
   @Expose()
+  systemVariant?: string;
+
+  @ApiPropertyOptional()
+  @Expose()
   recognitionCount?: number;
 
   @ApiProperty()
@@ -99,6 +103,9 @@ export class IconOptionDto {
   systemKey?: SystemIconKeyDto;
 
   @ApiPropertyOptional()
+  systemVariant?: string;
+
+  @ApiPropertyOptional()
   recognitionCount?: number;
 }
 
@@ -129,6 +136,15 @@ export class UpdateDisplayIconItemDto {
   @ApiPropertyOptional()
   @ValidateIf(
     (value: UpdateDisplayIconItemDto) =>
+      value.displayType === DisplayIconTypeDto.SYSTEM,
+  )
+  @IsString()
+  @MaxLength(50)
+  systemVariant?: string;
+
+  @ApiPropertyOptional()
+  @ValidateIf(
+    (value: UpdateDisplayIconItemDto) =>
       value.displayType === DisplayIconTypeDto.CIRCLE,
   )
   @IsUUID()
@@ -148,7 +164,7 @@ export class UpdateDisplayIconsDto {
   @ArrayMaxSize(5)
   @ArrayUnique((item: UpdateDisplayIconItemDto) =>
     item.displayType === DisplayIconTypeDto.SYSTEM
-      ? `system:${item.systemKey}`
+      ? `system:${item.systemKey}:${item.systemVariant ?? ''}`
       : `circle:${item.circleId}`,
   )
   @ValidateNested({ each: true })

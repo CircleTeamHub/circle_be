@@ -78,7 +78,7 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
-    expect(result.systemIcons).toHaveLength(2);
+    expect(result.systemIcons).toHaveLength(6);
     expect(result.circleIcons).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -88,6 +88,182 @@ describe('IconService', () => {
       ]),
     );
     expect(prisma.userDisplayIcon.createMany).not.toHaveBeenCalled();
+  });
+
+  it('returns every VIP badge up to the current VIP level as selectable options', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 5,
+      receivedLikeCount: 0,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-3',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP3',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons
+        .filter((icon) => icon.systemKey === 'VIP')
+        .map((icon) => ({
+          title: icon.title,
+          systemVariant: icon.systemVariant,
+          selected: icon.selected,
+        })),
+    ).toEqual([
+      { title: 'VIP1', systemVariant: 'VIP1', selected: false },
+      { title: 'VIP2', systemVariant: 'VIP2', selected: false },
+      { title: 'VIP3', systemVariant: 'VIP3', selected: true },
+      { title: 'VIP4', systemVariant: 'VIP4', selected: false },
+      { title: 'VIP5', systemVariant: 'VIP5', selected: false },
+    ]);
+  });
+
+  it('maps migrated legacy VIP placeholder variants to the highest eligible VIP badge', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 5,
+      receivedLikeCount: 0,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-legacy',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
+    expect(result.displayIcons).toEqual([
+      expect.objectContaining({
+        systemKey: 'VIP',
+        systemVariant: 'VIP5',
+        title: 'VIP5',
+      }),
+    ]);
+    expect(
+      result.systemIcons
+        .filter((icon) => icon.systemKey === 'VIP')
+        .map((icon) => ({
+          variant: icon.systemVariant,
+          selected: icon.selected,
+        })),
+    ).toEqual([
+      { variant: 'VIP1', selected: false },
+      { variant: 'VIP2', selected: false },
+      { variant: 'VIP3', selected: false },
+      { variant: 'VIP4', selected: false },
+      { variant: 'VIP5', selected: true },
+    ]);
+  });
+
+  it('returns every earned top-collaborator tier as selectable options', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 0,
+      receivedLikeCount: 10_000,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons
+        .filter((icon) => icon.systemKey === 'TOP_COLLABORATOR')
+        .map((icon) => ({
+          title: icon.title,
+          systemVariant: icon.systemVariant,
+          recognitionCount: icon.recognitionCount,
+        })),
+    ).toEqual([
+      {
+        title: '合作达人1',
+        systemVariant: 'TOP_COLLABORATOR_1',
+        recognitionCount: 100,
+      },
+      {
+        title: '合作达人2',
+        systemVariant: 'TOP_COLLABORATOR_2',
+        recognitionCount: 1000,
+      },
+      {
+        title: '合作达人3',
+        systemVariant: 'TOP_COLLABORATOR_3',
+        recognitionCount: 10000,
+      },
+    ]);
+  });
+
+  it('returns previous and current variants for every leveled system badge', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-1',
+      vipLevel: 5,
+      receivedLikeCount: 10_000,
+      createdAt: new Date(0),
+      status: 'ACTIVE',
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    const leveledOptions = result.systemIcons
+      .filter((icon) => ['VIP', 'TOP_COLLABORATOR'].includes(icon.systemKey))
+      .map((icon) => ({
+        systemKey: icon.systemKey,
+        title: icon.title,
+        systemVariant: icon.systemVariant,
+      }));
+
+    expect(leveledOptions).toEqual([
+      { systemKey: 'VIP', title: 'VIP1', systemVariant: 'VIP1' },
+      { systemKey: 'VIP', title: 'VIP2', systemVariant: 'VIP2' },
+      { systemKey: 'VIP', title: 'VIP3', systemVariant: 'VIP3' },
+      { systemKey: 'VIP', title: 'VIP4', systemVariant: 'VIP4' },
+      { systemKey: 'VIP', title: 'VIP5', systemVariant: 'VIP5' },
+      {
+        systemKey: 'TOP_COLLABORATOR',
+        title: '合作达人1',
+        systemVariant: 'TOP_COLLABORATOR_1',
+      },
+      {
+        systemKey: 'TOP_COLLABORATOR',
+        title: '合作达人2',
+        systemVariant: 'TOP_COLLABORATOR_2',
+      },
+      {
+        systemKey: 'TOP_COLLABORATOR',
+        title: '合作达人3',
+        systemVariant: 'TOP_COLLABORATOR_3',
+      },
+    ]);
   });
 
   it('auto-initializes eligible system icons for legacy users without icon preferences', async () => {
@@ -123,6 +299,7 @@ describe('IconService', () => {
           userID: 'user-1',
           displayType: 'SYSTEM',
           systemKey: 'VIP',
+          systemVariant: 'VIP5',
           circleID: null,
           sortOrder: 0,
         },
@@ -130,6 +307,7 @@ describe('IconService', () => {
           userID: 'user-1',
           displayType: 'SYSTEM',
           systemKey: 'NEW_USER',
+          systemVariant: 'NEW_USER',
           circleID: null,
           sortOrder: 1,
         },
@@ -137,6 +315,7 @@ describe('IconService', () => {
           userID: 'user-1',
           displayType: 'SYSTEM',
           systemKey: 'TOP_COLLABORATOR',
+          systemVariant: 'TOP_COLLABORATOR_3',
           circleID: null,
           sortOrder: 2,
         },
@@ -144,6 +323,7 @@ describe('IconService', () => {
           userID: 'user-1',
           displayType: 'SYSTEM',
           systemKey: 'VERIFIED_PROFILE',
+          systemVariant: 'VERIFIED_PROFILE',
           circleID: null,
           sortOrder: 3,
         },
@@ -151,6 +331,7 @@ describe('IconService', () => {
           userID: 'user-1',
           displayType: 'SYSTEM',
           systemKey: 'CIRCLE_BUILDER',
+          systemVariant: 'CIRCLE_BUILDER',
           circleID: null,
           sortOrder: 4,
         },
@@ -165,6 +346,7 @@ describe('IconService', () => {
         expect.objectContaining({
           type: 'SYSTEM',
           systemKey: 'VIP',
+          systemVariant: 'VIP5',
           title: 'VIP5',
         }),
         expect.objectContaining({
@@ -175,7 +357,8 @@ describe('IconService', () => {
         expect.objectContaining({
           type: 'SYSTEM',
           systemKey: 'TOP_COLLABORATOR',
-          title: '合作达人',
+          systemVariant: 'TOP_COLLABORATOR_3',
+          title: '合作达人3',
           recognitionCount: 10_000,
         }),
         expect.objectContaining({
@@ -212,6 +395,7 @@ describe('IconService', () => {
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
+        systemVariant: 'VIP2',
         sortOrder: 0,
       } as any,
     ]);
@@ -251,14 +435,96 @@ describe('IconService', () => {
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
+        systemVariant: 'VIP1',
         sortOrder: 0,
+      } as any,
+      {
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP2',
+        sortOrder: 1,
       } as any,
     ]);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalled();
     expect(prisma.userDisplayIcon.createMany).toHaveBeenCalled();
+    expect(prisma.userDisplayIcon.createMany).toHaveBeenCalledWith({
+      data: expect.arrayContaining([
+        expect.objectContaining({
+          systemKey: 'VIP',
+          systemVariant: 'VIP1',
+        }),
+        expect.objectContaining({
+          systemKey: 'VIP',
+          systemVariant: 'VIP2',
+        }),
+      ]),
+    });
     expect(prisma.user.update).toHaveBeenCalled();
+  });
+
+  it('maps legacy VIP selections without a variant to the highest eligible VIP badge', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-1',
+      vipLevel: 5,
+      receivedLikeCount: 0,
+      createdAt: new Date(),
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 1 });
+    prisma.user.update.mockResolvedValue({
+      id: 'user-1',
+      iconPreferencesInitialized: true,
+    });
+
+    await service.updateDisplayIcons('user-1', [
+      {
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        sortOrder: 0,
+      } as any,
+    ]);
+
+    expect(prisma.userDisplayIcon.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          systemKey: 'VIP',
+          systemVariant: 'VIP5',
+        }),
+      ],
+    });
+  });
+
+  it('rejects duplicate selections after legacy VIP variants are normalized', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-1',
+      vipLevel: 5,
+      receivedLikeCount: 0,
+      createdAt: new Date(),
+      iconPreferencesInitialized: true,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await expect(
+      service.updateDisplayIcons('user-1', [
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          sortOrder: 0,
+        } as any,
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP5',
+          sortOrder: 1,
+        } as any,
+      ]),
+    ).rejects.toThrow('Duplicate icon selection');
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('caches getDisplayIconsForUser results within the TTL window', async () => {
@@ -302,6 +568,7 @@ describe('IconService', () => {
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
+        systemVariant: 'VIP5',
         sortOrder: 0,
       } as any,
     ]);
@@ -330,7 +597,7 @@ describe('IconService', () => {
       expect.arrayContaining([
         expect.objectContaining({
           systemKey: 'TOP_COLLABORATOR',
-          title: '合作达人',
+          title: '合作达人1',
           recognitionCount: 100,
         }),
       ]),

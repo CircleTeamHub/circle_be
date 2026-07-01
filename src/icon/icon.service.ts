@@ -16,11 +16,84 @@ import { SystemIconKey, UserDisplayIconType } from 'src/generated/prisma';
 
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
-const TOP_COLLABORATOR_RECOGNITION_THRESHOLD = 100;
 const CIRCLE_BUILDER_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const CIRCLE_BUILDER_MIN_MEMBERS = 100;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
+
+type EligibilityUser = {
+  vipLevel: number;
+  receivedLikeCount: number;
+};
+
+type LeveledSystemBadgeLevel = {
+  level: number;
+  variant: string;
+  title: string;
+  recognitionCount?: number;
+};
+
+type LeveledSystemBadgeDefinition = {
+  systemKey: SystemIconKeyDto;
+  fallbackIconName: string;
+  levels: LeveledSystemBadgeLevel[];
+  getEarnedLevel: (user: EligibilityUser) => number;
+};
+
+const VIP_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [1, 2, 3, 4, 5].map(
+  (level) => ({
+    level,
+    variant: `VIP${level}`,
+    title: `VIP${level}`,
+  }),
+);
+
+const TOP_COLLABORATOR_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [
+  {
+    level: 1,
+    variant: 'TOP_COLLABORATOR_1',
+    title: '合作达人1',
+    recognitionCount: 100,
+  },
+  {
+    level: 2,
+    variant: 'TOP_COLLABORATOR_2',
+    title: '合作达人2',
+    recognitionCount: 1000,
+  },
+  {
+    level: 3,
+    variant: 'TOP_COLLABORATOR_3',
+    title: '合作达人3',
+    recognitionCount: 10_000,
+  },
+];
+
+const LEVELED_SYSTEM_BADGE_DEFINITIONS: LeveledSystemBadgeDefinition[] = [
+  {
+    systemKey: SystemIconKeyDto.VIP,
+    fallbackIconName: 'diamond',
+    levels: VIP_BADGE_LEVELS,
+    getEarnedLevel: (user) => user.vipLevel,
+  },
+  {
+    systemKey: SystemIconKeyDto.TOP_COLLABORATOR,
+    fallbackIconName: 'ribbon-outline',
+    levels: TOP_COLLABORATOR_BADGE_LEVELS,
+    getEarnedLevel: (user) =>
+      TOP_COLLABORATOR_BADGE_LEVELS.reduce(
+        (earnedLevel, tier) =>
+          user.receivedLikeCount >= (tier.recognitionCount ?? Infinity)
+            ? tier.level
+            : earnedLevel,
+        0,
+      ),
+  },
+];
+
+const LEVELED_SYSTEM_BADGE_KEYS = new Set(
+  LEVELED_SYSTEM_BADGE_DEFINITIONS.map((definition) => definition.systemKey),
+);
 
 type CachedDisplayIcons = {
   data: DisplayIconDto[];
@@ -29,6 +102,7 @@ type CachedDisplayIcons = {
 
 type EligibleSystemIcon = {
   systemKey: SystemIconKeyDto;
+  systemVariant: string;
   title: string;
   fallbackIconName: string;
   imageUrl: string | null;
@@ -57,6 +131,50 @@ function toPrismaSystemIconKey(
   systemKey: SystemIconKeyDto | null | undefined,
 ): SystemIconKey | null {
   return (systemKey as unknown as SystemIconKey | undefined) ?? null;
+}
+
+function systemSelectionKey(
+  systemKey: SystemIconKeyDto | string | null | undefined,
+  systemVariant: string | null | undefined,
+): string {
+  return `${systemKey ?? ''}:${systemVariant ?? ''}`;
+}
+
+function lastItem<T>(items: T[]): T | undefined {
+  return items[items.length - 1];
+}
+
+function isLeveledSystemBadgeKey(
+  systemKey: string | null | undefined,
+): boolean {
+  return Boolean(
+    systemKey && LEVELED_SYSTEM_BADGE_KEYS.has(systemKey as SystemIconKeyDto),
+  );
+}
+
+function buildLeveledSystemIcons(user: EligibilityUser): EligibleSystemIcon[] {
+  const icons: EligibleSystemIcon[] = [];
+
+  for (const definition of LEVELED_SYSTEM_BADGE_DEFINITIONS) {
+    const earnedLevel = Math.max(0, definition.getEarnedLevel(user));
+
+    for (const tier of definition.levels) {
+      if (tier.level > earnedLevel) {
+        continue;
+      }
+
+      icons.push({
+        systemKey: definition.systemKey,
+        systemVariant: tier.variant,
+        title: tier.title,
+        fallbackIconName: definition.fallbackIconName,
+        imageUrl: null,
+        recognitionCount: tier.recognitionCount,
+      });
+    }
+  }
+
+  return icons;
 }
 
 @Injectable()
@@ -107,8 +225,14 @@ export class IconService {
         imageUrl: icon.imageUrl,
         fallbackIconName: icon.fallbackIconName,
         recognitionCount: icon.recognitionCount,
-        selected: selections.some((item) => item.systemKey === icon.systemKey),
+        selected: selections.some(
+          (item) =>
+            item.systemKey === icon.systemKey &&
+            this.resolveSelectionSystemVariant(item, eligibility) ===
+              icon.systemVariant,
+        ),
         systemKey: icon.systemKey,
+        systemVariant: icon.systemVariant,
       })),
       circleIcons: eligibility.circleIcons.map((icon) => ({
         type: DisplayIconTypeDto.CIRCLE,
@@ -152,6 +276,7 @@ export class IconService {
 
     const eligibility = await this.resolveEligibility(userId);
     this.assertItemsEligible(items, eligibility);
+    this.assertUniqueSelections(items);
 
     const normalized = [...items]
       .sort((a, b) => a.sortOrder - b.sortOrder)
@@ -168,6 +293,7 @@ export class IconService {
             userID: userId,
             displayType: toPrismaDisplayIconType(item.displayType),
             systemKey: toPrismaSystemIconKey(item.systemKey),
+            systemVariant: item.systemVariant ?? null,
             circleID: item.circleId ?? null,
             sortOrder: item.sortOrder,
           })),
@@ -192,6 +318,7 @@ export class IconService {
         userID: userId,
         displayType: item.displayType,
         systemKey: item.systemKey ?? null,
+        systemVariant: item.systemVariant ?? null,
         circleID: item.circleId ?? null,
         sortOrder: item.sortOrder,
       })),
@@ -274,31 +401,14 @@ export class IconService {
       }),
     ]);
 
-    const systemIcons: EligibleSystemIcon[] = [];
-    if (user.vipLevel > 0) {
-      systemIcons.push({
-        systemKey: SystemIconKeyDto.VIP,
-        title: `VIP${user.vipLevel}`,
-        fallbackIconName: 'diamond',
-        imageUrl: null,
-      });
-    }
+    const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons(user);
     if (Date.now() - user.createdAt.getTime() <= NEW_USER_MS) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.NEW_USER,
+        systemVariant: SystemIconKeyDto.NEW_USER,
         title: '新手',
         fallbackIconName: 'rocket-outline',
         imageUrl: null,
-      });
-    }
-
-    if (user.receivedLikeCount >= TOP_COLLABORATOR_RECOGNITION_THRESHOLD) {
-      systemIcons.push({
-        systemKey: SystemIconKeyDto.TOP_COLLABORATOR,
-        title: '合作达人',
-        fallbackIconName: 'ribbon-outline',
-        imageUrl: null,
-        recognitionCount: user.receivedLikeCount,
       });
     }
 
@@ -313,6 +423,7 @@ export class IconService {
     ) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.VERIFIED_PROFILE,
+        systemVariant: SystemIconKeyDto.VERIFIED_PROFILE,
         title: '资料可信',
         fallbackIconName: 'shield-checkmark-outline',
         imageUrl: null,
@@ -322,6 +433,7 @@ export class IconService {
     if (builderMembership) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.CIRCLE_BUILDER,
+        systemVariant: SystemIconKeyDto.CIRCLE_BUILDER,
         title: '圈子建设者',
         fallbackIconName: 'construct-outline',
         imageUrl: null,
@@ -340,6 +452,68 @@ export class IconService {
     return { systemIcons, circleIcons };
   }
 
+  private resolveSelectionSystemVariant(
+    selection: {
+      systemKey: string | null;
+      systemVariant?: string | null;
+    },
+    eligibility: Eligibility,
+  ): string | null {
+    const isLegacyPlaceholderVariant =
+      selection.systemVariant &&
+      selection.systemVariant === selection.systemKey &&
+      isLeveledSystemBadgeKey(selection.systemKey);
+
+    if (selection.systemVariant && !isLegacyPlaceholderVariant) {
+      return selection.systemVariant;
+    }
+
+    if (!selection.systemKey) {
+      return null;
+    }
+
+    if (isLeveledSystemBadgeKey(selection.systemKey)) {
+      const leveledIcons = eligibility.systemIcons.filter(
+        (icon) => icon.systemKey === selection.systemKey,
+      );
+      return lastItem(leveledIcons)?.systemVariant ?? selection.systemKey;
+    }
+
+    return selection.systemKey;
+  }
+
+  private defaultDisplaySystemIcons(
+    eligibility: Eligibility,
+  ): EligibleSystemIcon[] {
+    const byKey = (systemKey: SystemIconKeyDto) =>
+      eligibility.systemIcons.filter((icon) => icon.systemKey === systemKey);
+    const preferred = [
+      lastItem(byKey(SystemIconKeyDto.VIP)),
+      lastItem(byKey(SystemIconKeyDto.NEW_USER)),
+      lastItem(byKey(SystemIconKeyDto.TOP_COLLABORATOR)),
+      lastItem(byKey(SystemIconKeyDto.VERIFIED_PROFILE)),
+      lastItem(byKey(SystemIconKeyDto.CIRCLE_BUILDER)),
+    ].filter((icon): icon is EligibleSystemIcon => Boolean(icon));
+
+    if (preferred.length >= MAX_DISPLAY_ICONS) {
+      return preferred.slice(0, MAX_DISPLAY_ICONS);
+    }
+
+    const preferredVariants = new Set(
+      preferred.map((icon) =>
+        systemSelectionKey(icon.systemKey, icon.systemVariant),
+      ),
+    );
+    const fill = eligibility.systemIcons.filter(
+      (icon) =>
+        !preferredVariants.has(
+          systemSelectionKey(icon.systemKey, icon.systemVariant),
+        ),
+    );
+
+    return [...preferred, ...fill].slice(0, MAX_DISPLAY_ICONS);
+  }
+
   private async pruneInvalidSelections(
     userId: string,
     eligibility: Eligibility,
@@ -350,7 +524,9 @@ export class IconService {
     });
 
     const validSystemKeys = new Set(
-      eligibility.systemIcons.map((item) => item.systemKey),
+      eligibility.systemIcons.map((item) =>
+        systemSelectionKey(item.systemKey, item.systemVariant),
+      ),
     );
     const validCircleIds = new Set(
       eligibility.circleIcons.map((item) => item.circleId),
@@ -361,7 +537,12 @@ export class IconService {
         selection.displayType === DisplayIconTypeDto.SYSTEM &&
         selection.systemKey
       ) {
-        return !validSystemKeys.has(selection.systemKey as SystemIconKeyDto);
+        return !validSystemKeys.has(
+          systemSelectionKey(
+            selection.systemKey,
+            this.resolveSelectionSystemVariant(selection, eligibility),
+          ),
+        );
       }
       if (
         selection.displayType === DisplayIconTypeDto.CIRCLE &&
@@ -384,7 +565,14 @@ export class IconService {
     return selections
       .filter((selection) => !stale.some((item) => item.id === selection.id))
       .sort((a, b) => a.sortOrder - b.sortOrder)
-      .map((selection, index) => ({ ...selection, sortOrder: index }));
+      .map((selection, index) => ({
+        ...selection,
+        systemVariant: this.resolveSelectionSystemVariant(
+          selection,
+          eligibility,
+        ),
+        sortOrder: index,
+      }));
   }
 
   private async ensureSelections(userId: string, eligibility: Eligibility) {
@@ -401,16 +589,17 @@ export class IconService {
       !user.iconPreferencesInitialized &&
       eligibility.systemIcons.length > 0
     ) {
-      const defaults = eligibility.systemIcons
-        .slice(0, MAX_DISPLAY_ICONS)
-        .map((icon, index) => ({
-          id: `system:${icon.systemKey}`,
+      const defaults = this.defaultDisplaySystemIcons(eligibility).map(
+        (icon, index) => ({
+          id: `system:${icon.systemVariant}`,
           userID: userId,
           displayType: toPrismaDisplayIconType(DisplayIconTypeDto.SYSTEM),
           systemKey: toPrismaSystemIconKey(icon.systemKey),
+          systemVariant: icon.systemVariant,
           circleID: null,
           sortOrder: index,
-        }));
+        }),
+      );
 
       try {
         await this.prisma.userDisplayIcon.createMany({
@@ -441,7 +630,9 @@ export class IconService {
     eligibility: Eligibility,
   ): void {
     const systemKeys = new Set(
-      eligibility.systemIcons.map((item) => item.systemKey),
+      eligibility.systemIcons.map((item) =>
+        systemSelectionKey(item.systemKey, item.systemVariant),
+      ),
     );
     const circleIds = new Set(
       eligibility.circleIcons.map((item) => item.circleId),
@@ -449,9 +640,21 @@ export class IconService {
 
     for (const item of items) {
       if (item.displayType === DisplayIconTypeDto.SYSTEM) {
-        if (!item.systemKey || !systemKeys.has(item.systemKey)) {
+        const systemVariant =
+          item.systemVariant ??
+          this.resolveSelectionSystemVariant(
+            {
+              systemKey: item.systemKey ?? null,
+            },
+            eligibility,
+          );
+        if (
+          !item.systemKey ||
+          !systemKeys.has(systemSelectionKey(item.systemKey, systemVariant))
+        ) {
           throw new BadRequestException('Invalid system icon selection');
         }
+        item.systemVariant = systemVariant ?? undefined;
         continue;
       }
 
@@ -461,18 +664,38 @@ export class IconService {
     }
   }
 
+  private assertUniqueSelections(items: UpdateDisplayIconItemDto[]): void {
+    const seen = new Set<string>();
+
+    for (const item of items) {
+      const key =
+        item.displayType === DisplayIconTypeDto.SYSTEM
+          ? `system:${item.systemKey ?? ''}:${item.systemVariant ?? ''}`
+          : `circle:${item.circleId ?? ''}`;
+
+      if (seen.has(key)) {
+        throw new BadRequestException('Duplicate icon selection');
+      }
+      seen.add(key);
+    }
+  }
+
   private mapSelectionsToDisplayIcons(
     selections: Array<{
       id: string;
       displayType: string;
       systemKey: string | null;
+      systemVariant?: string | null;
       circleID: string | null;
       sortOrder: number;
     }>,
     eligibility: Eligibility,
   ): DisplayIconDto[] {
     const systemMap = new Map(
-      eligibility.systemIcons.map((item) => [item.systemKey, item]),
+      eligibility.systemIcons.map((item) => [
+        systemSelectionKey(item.systemKey, item.systemVariant),
+        item,
+      ]),
     );
     const circleMap = new Map(
       eligibility.circleIcons.map((item) => [item.circleId, item]),
@@ -484,17 +707,23 @@ export class IconService {
           selection.displayType === DisplayIconTypeDto.SYSTEM &&
           selection.systemKey
         ) {
-          const icon = systemMap.get(selection.systemKey as SystemIconKeyDto);
+          const icon = systemMap.get(
+            systemSelectionKey(
+              selection.systemKey,
+              this.resolveSelectionSystemVariant(selection, eligibility),
+            ),
+          );
           if (!icon) return null;
 
           return {
-            id: selection.id,
+            id: `system:${icon.systemVariant}`,
             type: DisplayIconTypeDto.SYSTEM,
             title: icon.title,
             imageUrl: icon.imageUrl,
             fallbackIconName: icon.fallbackIconName,
             recognitionCount: icon.recognitionCount,
             systemKey: icon.systemKey,
+            systemVariant: icon.systemVariant,
             sortOrder: selection.sortOrder,
           };
         }

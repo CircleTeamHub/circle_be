@@ -901,19 +901,20 @@ model IconAsset {
 }
 
 model UserDisplayIcon {
-  id          String              @id @default(uuid())
-  userID      String
-  displayType UserDisplayIconType
-  systemKey   SystemIconKey?
-  circleID    String?
-  sortOrder   Int
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  id            String              @id @default(uuid())
+  userID        String
+  displayType   UserDisplayIconType
+  systemKey     SystemIconKey?
+  systemVariant String?
+  circleID      String?
+  sortOrder     Int
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
 
   user   User    @relation(fields: [userID], references: [id], onDelete: Cascade)
   circle Circle? @relation(fields: [circleID], references: [id], onDelete: Cascade)
 
-  @@unique([userID, systemKey])
+  @@unique([userID, systemKey, systemVariant])
   @@unique([userID, circleID])
   @@index([userID, sortOrder])
 }

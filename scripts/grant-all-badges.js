@@ -19,9 +19,43 @@ const email = String(process.argv[2] ?? DEFAULT_EMAIL)
   .toLowerCase();
 
 const SYSTEM_BADGES = [
-  'VIP',
+  { systemKey: 'VIP', systemVariant: 'VIP1', label: 'VIP1' },
+  { systemKey: 'VIP', systemVariant: 'VIP2', label: 'VIP2' },
+  { systemKey: 'VIP', systemVariant: 'VIP3', label: 'VIP3' },
+  { systemKey: 'VIP', systemVariant: 'VIP4', label: 'VIP4' },
+  { systemKey: 'VIP', systemVariant: 'VIP5', label: 'VIP5' },
+  {
+    systemKey: 'TOP_COLLABORATOR',
+    systemVariant: 'TOP_COLLABORATOR_1',
+    label: '合作达人1',
+  },
+  {
+    systemKey: 'TOP_COLLABORATOR',
+    systemVariant: 'TOP_COLLABORATOR_2',
+    label: '合作达人2',
+  },
+  {
+    systemKey: 'TOP_COLLABORATOR',
+    systemVariant: 'TOP_COLLABORATOR_3',
+    label: '合作达人3',
+  },
+  { systemKey: 'NEW_USER', systemVariant: 'NEW_USER', label: '新手' },
+  {
+    systemKey: 'VERIFIED_PROFILE',
+    systemVariant: 'VERIFIED_PROFILE',
+    label: '资料可信',
+  },
+  {
+    systemKey: 'CIRCLE_BUILDER',
+    systemVariant: 'CIRCLE_BUILDER',
+    label: '圈子建设者',
+  },
+];
+
+const DEFAULT_DISPLAY_BADGES = [
+  'VIP5',
   'NEW_USER',
-  'TOP_COLLABORATOR',
+  'TOP_COLLABORATOR_3',
   'VERIFIED_PROFILE',
   'CIRCLE_BUILDER',
 ];
@@ -170,13 +204,23 @@ async function main() {
     });
 
     await tx.userDisplayIcon.createMany({
-      data: SYSTEM_BADGES.map((systemKey, sortOrder) => ({
-        userID: user.id,
-        displayType: 'SYSTEM',
-        systemKey,
-        circleID: null,
-        sortOrder,
-      })),
+      data: DEFAULT_DISPLAY_BADGES.map((systemVariant, sortOrder) => {
+        const badge = SYSTEM_BADGES.find(
+          (item) => item.systemVariant === systemVariant,
+        );
+        if (!badge) {
+          throw new Error(`Unknown default badge variant: ${systemVariant}`);
+        }
+
+        return {
+          userID: user.id,
+          displayType: 'SYSTEM',
+          systemKey: badge.systemKey,
+          systemVariant: badge.systemVariant,
+          circleID: null,
+          sortOrder,
+        };
+      }),
     });
   });
 
@@ -198,6 +242,7 @@ async function main() {
         select: {
           displayType: true,
           systemKey: true,
+          systemVariant: true,
           circleID: true,
           sortOrder: true,
         },
@@ -206,7 +251,10 @@ async function main() {
   });
 
   console.log('Granted all first-release system badges:', refreshed);
-  console.log('Available system badges:', SYSTEM_BADGES.join(', '));
+  console.log(
+    'Available system badges:',
+    SYSTEM_BADGES.map((item) => item.label).join(', '),
+  );
   console.log('Builder test circle:', circleId);
 }
 
