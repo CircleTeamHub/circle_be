@@ -19,7 +19,9 @@ function guardWithSecret(secret: string | undefined): OpenimCallbackGuard {
 describe('OpenimCallbackGuard', () => {
   it('allows any request when no secret is configured', () => {
     const guard = guardWithSecret(undefined);
-    expect(guard.canActivate(contextFor({ headers: {}, query: {} }))).toBe(true);
+    expect(guard.canActivate(contextFor({ headers: {}, query: {} }))).toBe(
+      true,
+    );
   });
 
   it('allows a request with a matching secret header', () => {
