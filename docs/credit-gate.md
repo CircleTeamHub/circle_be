@@ -30,7 +30,7 @@ assertLocalCanSendMessage  ──before-send webhook──►  /api/v1/openim-ca
 | **URL 拼接方式** | OpenIM Go 源 `http_client.go`：`fullURL = url + "/" + command`。所以 `IMENV_WEBHOOKS_URL` 只填**基址**（`.../api/v1/openim-callback`），命令由 OpenIM 追加。 |
 | **不能用 `?token=` 鉴权** | 命令追加在 url 之后，query 会被 `/command` 截断；OpenIM 也不发自定义 header。故 guard 密钥这条路不通，现阶段 `OPENIM_CALLBACK_SECRET` 留空 + 网络隔离。 |
 | **Linux 上 `host.docker.internal` 不解析** | 仅 Docker Desktop 有。compose 里已加 `extra_hosts: host.docker.internal:host-gateway`。 |
-| **fail-open 是有意的** | `failedContinue: true`：circle_be 挂了消息**照发**（可用性优先）。闸门是尽力而为，非硬拦。要硬拦改 `false`（但会全员发不出）。 |
+| **⚠️ 实为 fail-CLOSED（重要）** | `failedContinue` 在 OpenIM 3.8.x 源码里**只有字段、从未被读取**（`pkg/common/config/config.go` 是唯一出现处）。回调失败（circle_be 宕机/超时）时 `WithCondition` 原样上抛错误 → **消息发送失败**。即 circle_be 一挂/一慢就阻塞全体消息。上线前务必实测镜像实际行为（停 circle_be 发消息看是否被拦）。 |
 
 ## 缓存与失效（性能）
 
