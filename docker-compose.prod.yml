@@ -98,12 +98,6 @@ services:
       - ./.env.production:/app/.env.production:ro
     ports:
       - '3000:3000'
-    # default: 与 postgres/minio 通信(项目默认网)。
-    # shared-im: 与 OpenIM 栈共享,让 openim-server 用服务名 http://circle_be:3000
-    # 直连本服务的信誉回调,回调不经公网 3000。见 docs/credit-gate.md。
-    networks:
-      - default
-      - shared-im
     healthcheck:
       # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
       test:
@@ -119,9 +113,3 @@ services:
 volumes:
   pg_data:
   minio_data:
-
-networks:
-  # 与 OpenIM 栈共享的外部网络。部署前需先建一次:
-  #   docker network create shared-im
-  shared-im:
-    external: true
