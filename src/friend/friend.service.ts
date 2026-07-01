@@ -567,6 +567,50 @@ export class FriendService {
     );
   }
 
+  /**
+   * Withdraws the caller's own report(s) against a user and refunds the credit
+   * each one deducted. Ownership is enforced by scoping to `reporterID` — a user
+   * can only retract their own reports. Deleting the report row and reverting
+   * its credit deduction happen in one transaction so the two never diverge.
+   */
+  async withdrawReport(
+    reporterId: string,
+    friendUserId: string,
+  ): Promise<void> {
+    if (reporterId === friendUserId) {
+      throw new BadRequestException('Cannot withdraw a report on yourself');
+    }
+
+    const reports = await this.prisma.friendReport.findMany({
+      where: { reporterID: reporterId, targetID: friendUserId },
+      select: { id: true },
+    });
+    if (reports.length === 0) {
+      throw new NotFoundException('No report to withdraw');
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const report of reports) {
+        await tx.friendReport.delete({ where: { id: report.id } });
+        await this.creditService.revertBySourceInTransaction(
+          tx,
+          'FRIEND_REPORT',
+          report.id,
+          {
+            actorId: reporterId,
+            reason: 'FRIEND_REPORT_WITHDRAWN',
+          },
+        );
+      }
+    });
+
+    await this.creditService.broadcastCreditProfileChanged(friendUserId);
+
+    this.logger.warn(
+      `Friend report withdrawn: ${reporterId} → ${friendUserId} (${reports.length})`,
+    );
+  }
+
   // ─── Lists ────────────────────────────────────────────────────────────────────
 
   async listFriends(userId: string): Promise<FriendProfileDto[]> {

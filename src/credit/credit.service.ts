@@ -102,21 +102,37 @@ export class CreditService {
     sourceId: string,
     options: CreditRevertInput = {},
   ): Promise<CreditRevertResult> {
-    const result = await runSerializableTransaction(this.prisma, async (tx) => {
-      const original = await tx.creditEvent.findFirst({
-        where: { sourceType, sourceID: sourceId, revertedAt: null },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      });
-      if (!original) {
-        return { reverted: false as const };
-      }
-      return this.revertEventInTransaction(tx, original.id, options);
-    });
+    const result = await runSerializableTransaction(this.prisma, (tx) =>
+      this.revertBySourceInTransaction(tx, sourceType, sourceId, options),
+    );
     if (result.reverted && result.userId) {
       await this.broadcastCreditProfileChanged(result.userId);
     }
     return result;
+  }
+
+  /**
+   * In-transaction variant of {@link revertBySource} for callers that must undo
+   * a credit effect atomically with their own writes (e.g. deleting the
+   * FriendReport row and refunding its deduction together). The caller owns the
+   * transaction and is responsible for calling
+   * {@link broadcastCreditProfileChanged} after it commits.
+   */
+  async revertBySourceInTransaction(
+    client: CreditClient,
+    sourceType: string,
+    sourceId: string,
+    options: CreditRevertInput = {},
+  ): Promise<CreditRevertResult> {
+    const original = await client.creditEvent.findFirst({
+      where: { sourceType, sourceID: sourceId, revertedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (!original) {
+      return { reverted: false };
+    }
+    return this.revertEventInTransaction(client, original.id, options);
   }
 
   private async revertEventInTransaction(
