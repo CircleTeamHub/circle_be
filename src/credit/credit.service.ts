@@ -215,7 +215,6 @@ export class CreditService {
       },
       select: { id: true, scoreBefore: true, scoreAfter: true },
     });
-    this.creditPolicyService.invalidateUserPolicyCache(input.userId);
 
     return {
       eventId: event.id,
@@ -225,6 +224,11 @@ export class CreditService {
   }
 
   async broadcastCreditProfileChanged(userId: string) {
+    // 提交后钩子：所有改分路径（applyDelta / revert* / friend-report）在事务提交后
+    // 都会走到这里。信誉发言闸门缓存的失效放在这里、而非事务内——事务内失效存在竞态
+    // （回滚也会失效；并发 callback 可能读到未提交旧值再缓存，直到 TTL 才纠正）。
+    // 先做同步 Map 失效（必成功、即刻生效），再异步广播资料变更。
+    this.creditPolicyService.invalidateUserPolicyCache(userId);
     await this.realtimeService.safeBroadcastAll([
       () => this.realtimeService.invalidateUserProfileSummaryCache(userId),
       () => this.realtimeService.broadcastUserProfileSummary(userId),
