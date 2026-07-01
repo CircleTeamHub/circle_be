@@ -126,9 +126,21 @@ export class CreditService {
   ): Promise<CreditRevertResult> {
     const event = await client.creditEvent.findUnique({
       where: { id: eventId },
-      select: { id: true, userID: true, delta: true, revertedAt: true },
+      select: {
+        id: true,
+        userID: true,
+        delta: true,
+        revertedAt: true,
+        sourceType: true,
+      },
     });
-    if (!event || event.revertedAt) {
+    // Missing, already voided, or itself a reversal → nothing to undo. Reverting
+    // a reversal would silently re-apply the original delta, so refuse it.
+    if (
+      !event ||
+      event.revertedAt ||
+      event.sourceType === CREDIT_REVERT_SOURCE_TYPE
+    ) {
       return { reverted: false };
     }
 

@@ -214,6 +214,23 @@ describe('CreditService', () => {
       });
       expect(tx.creditEvent.create).not.toHaveBeenCalled();
     });
+
+    it('refuses to revert a reversal entry (no re-applying the original delta)', async () => {
+      tx.creditEvent.findUnique.mockResolvedValueOnce({
+        id: 'reversal-1',
+        userID: 'user-1',
+        delta: 5,
+        revertedAt: null,
+        sourceType: 'CREDIT_REVERT',
+      });
+
+      await expect(service.revertEvent('reversal-1')).resolves.toEqual({
+        reverted: false,
+      });
+
+      expect(tx.creditEvent.create).not.toHaveBeenCalled();
+      expect(tx.creditEvent.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('revertBySource', () => {
