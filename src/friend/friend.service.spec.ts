@@ -13,6 +13,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { CreditService } from 'src/credit/credit.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
@@ -87,6 +88,9 @@ describe('FriendService', () => {
     broadcastFriendUnreadCount: jest.fn(),
     broadcastInteractionUnread: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
+    invalidateUserProfileSummaryCache: jest.fn(),
+    safeBroadcastAll: jest.fn(),
   };
   const notificationService = {
     createFriendRequestNotification: jest.fn(),
@@ -99,6 +103,10 @@ describe('FriendService', () => {
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
+  };
+  const creditService = {
+    applyDeltaInTransaction: jest.fn(),
+    broadcastCreditProfileChanged: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -122,6 +130,12 @@ describe('FriendService', () => {
     }
     privacySettings.canReceiveStrangerMessage.mockReset();
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    creditService.applyDeltaInTransaction.mockResolvedValue({
+      eventId: 'credit-event-1',
+      scoreBefore: 100,
+      scoreAfter: 95,
+    });
+    creditService.broadcastCreditProfileChanged.mockResolvedValue(undefined);
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -137,6 +151,7 @@ describe('FriendService', () => {
         { provide: NotificationService, useValue: notificationService },
         { provide: OpenimService, useValue: openimService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: CreditService, useValue: creditService },
       ],
     }).compile();
 
@@ -675,6 +690,19 @@ describe('FriendService', () => {
         evidence: ['s3://bucket/report-1.png'],
       },
     });
+    expect(creditService.applyDeltaInTransaction).toHaveBeenCalledWith(prisma, {
+      userId: 'user-2',
+      delta: -5,
+      reason: 'FRIEND_REPORT',
+      sourceType: 'FRIEND_REPORT',
+      sourceId: 'report-1',
+      actorId: 'user-1',
+      idempotencyKey: 'friend-report:report-1',
+      metadata: { category: 'harassment' },
+    });
+    expect(creditService.broadcastCreditProfileChanged).toHaveBeenCalledWith(
+      'user-2',
+    );
   });
 
   it('rejects a duplicate report for the same reporter/target/category', async () => {
@@ -699,6 +727,8 @@ describe('FriendService', () => {
     ).rejects.toThrow(ConflictException);
 
     expect(prisma.friendReport.create).not.toHaveBeenCalled();
+    expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
+    expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
   });
 
   it('rejects reporting a non-friend target through the friend API', async () => {

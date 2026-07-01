@@ -283,6 +283,8 @@ model User {
   friendReportsFiled           FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
   groupReportsFiled            GroupReport[]               @relation("groupReportReporter")
+  creditEvents                 CreditEvent[]               @relation("creditEventUser")
+  creditEventsAuthored         CreditEvent[]               @relation("creditEventActor")
   notes                        Note[]
   noteShareLinks               NoteShareLink[]
   noteGroups                   NoteGroup[]
@@ -377,6 +379,30 @@ model GroupReport {
   @@index([reporterID, createdAt])
   @@index([groupID, createdAt])
   @@index([circleID, createdAt])
+}
+
+model CreditEvent {
+  id             String    @id @default(uuid())
+  userID         String
+  delta          Int
+  scoreBefore    Int
+  scoreAfter     Int
+  reason         String
+  sourceType     String
+  sourceID       String?
+  actorID        String?
+  idempotencyKey String?   @unique
+  metadata       Json      @default("{}")
+  revertedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  user  User  @relation("creditEventUser", fields: [userID], references: [id], onDelete: Cascade)
+  actor User? @relation("creditEventActor", fields: [actorID], references: [id], onDelete: SetNull)
+
+  @@index([userID, createdAt])
+  @@index([actorID, createdAt])
+  @@index([sourceType, sourceID])
 }
 
 model GroupSyncOutbox {
