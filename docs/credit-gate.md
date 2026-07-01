@@ -40,9 +40,17 @@ assertLocalCanSendMessage  ──before-send webhook──►  /api/v1/openim-ca
 
 ## 启用（部署）
 
-1. `openim-docker/.env` 设 `CIRCLE_CALLBACK_URL`（含 `/api/v1/openim-callback`），按部署改 host（同机宿主 `host.docker.internal:3000` / 同网络容器用服务名）。
-2. `docker compose up -d openim-server` 重启。
-3. 验证：用 `creditScore < 60` 账号发消息应被拦；`docker logs openim-server` 有回调 POST，circle_be 收到 `/api/v1/openim-callback/*`。
+两个 compose 栈（circle_be 的 `docker-compose.prod.yml`、`openim-docker`）跑在同一台机。回调走**共享内网** `shared-im`，不经公网 3000：
+
+1. 一次性建共享网络：`docker network create shared-im`
+2. 两个栈都已把服务接入 `shared-im`（circle_be 的 `circle_be`、openim 的 `openim-server`）。
+3. `openim-docker/.env` 的 `CIRCLE_CALLBACK_URL="http://circle_be:3000/api/v1/openim-callback"`（服务名直连）。
+4. `docker compose up -d`（两个栈都重启，让网络接入与 env 生效）。
+5. 验证：用 `creditScore < 60` 账号发消息应被拦；`docker logs openim-server` 有回调 POST，circle_be 收到 `/api/v1/openim-callback/*`。
+
+> 退路（暂不接内网）：`CIRCLE_CALLBACK_URL` 改回 `http://host.docker.internal:3000/api/v1/openim-callback`（openim-server 已配 `extra_hosts: host.docker.internal:host-gateway`，Linux 亦可）。缺点：经公网 3000，见下。
+
+**安全**：内网方案下回调不暴露公网。若用 host.docker.internal 退路，回调端点会经公网 3000 可达——该端点只读（返 allow/deny、不改状态、绕不过闸门），但会泄露"某人是否低分"、可被打 DB（15s 缓存兜底）。正式环境优先内网，或限制 `/api/v1/openim-callback` 来源。
 
 ## 阈值
 
