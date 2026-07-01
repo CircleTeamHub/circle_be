@@ -72,8 +72,6 @@ describe('FriendService', () => {
     friendReport: {
       create: jest.fn(),
       findFirst: jest.fn(),
-      findMany: jest.fn(),
-      delete: jest.fn(),
     },
     friendSyncOutbox: {
       createMany: jest.fn(),
@@ -108,7 +106,6 @@ describe('FriendService', () => {
   };
   const creditService = {
     applyDeltaInTransaction: jest.fn(),
-    revertBySourceInTransaction: jest.fn(),
     broadcastCreditProfileChanged: jest.fn(),
   };
 
@@ -137,13 +134,6 @@ describe('FriendService', () => {
       eventId: 'credit-event-1',
       scoreBefore: 100,
       scoreAfter: 95,
-    });
-    creditService.revertBySourceInTransaction.mockResolvedValue({
-      reverted: true,
-      userId: 'user-2',
-      reversalEventId: 'reversal-1',
-      scoreBefore: 95,
-      scoreAfter: 100,
     });
     creditService.broadcastCreditProfileChanged.mockResolvedValue(undefined);
 
@@ -779,70 +769,6 @@ describe('FriendService', () => {
       description: 'pretending to be support',
       evidence: ['proof-1'],
     });
-  });
-
-  it('withdraws the caller reports and refunds credit atomically', async () => {
-    prisma.friendReport.findMany.mockResolvedValue([
-      { id: 'report-1' },
-      { id: 'report-2' },
-    ]);
-    prisma.friendReport.delete.mockResolvedValue({ id: 'report-1' });
-
-    await service.withdrawReport('user-1', 'user-2');
-
-    // Only the caller's own reports are targeted.
-    expect(prisma.friendReport.findMany).toHaveBeenCalledWith({
-      where: { reporterID: 'user-1', targetID: 'user-2' },
-      select: { id: true },
-    });
-    // Each report is deleted and its deduction reverted inside the transaction.
-    expect(prisma.friendReport.delete).toHaveBeenCalledTimes(2);
-    expect(creditService.revertBySourceInTransaction).toHaveBeenCalledWith(
-      prisma,
-      'FRIEND_REPORT',
-      'report-1',
-      {
-        actorId: 'user-1',
-        reason: 'FRIEND_REPORT_WITHDRAWN',
-      },
-    );
-    expect(creditService.revertBySourceInTransaction).toHaveBeenCalledTimes(2);
-    expect(creditService.broadcastCreditProfileChanged).toHaveBeenCalledWith(
-      'user-2',
-    );
-  });
-
-  it('rejects withdrawing when the caller has no report on the target', async () => {
-    prisma.friendReport.findMany.mockResolvedValue([]);
-
-    await expect(service.withdrawReport('user-1', 'user-2')).rejects.toThrow(
-      NotFoundException,
-    );
-
-    expect(prisma.friendReport.delete).not.toHaveBeenCalled();
-    expect(creditService.revertBySourceInTransaction).not.toHaveBeenCalled();
-    expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
-  });
-
-  it('rejects withdrawing a report on yourself', async () => {
-    await expect(service.withdrawReport('user-1', 'user-1')).rejects.toThrow(
-      BadRequestException,
-    );
-
-    expect(prisma.friendReport.findMany).not.toHaveBeenCalled();
-  });
-
-  it('passes withdrawReport through the controller with the current user', async () => {
-    const serviceMock = {
-      withdrawReport: jest.fn().mockResolvedValue(undefined),
-    };
-    const controller = new FriendController(serviceMock as any);
-
-    await controller.withdrawReport('user-2', {
-      user: { userId: 'user-1' },
-    } as any);
-
-    expect(serviceMock.withdrawReport).toHaveBeenCalledWith('user-1', 'user-2');
   });
 
   it('supports the restful blacklist controller route', async () => {

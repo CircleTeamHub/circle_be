@@ -109,19 +109,6 @@ export class FriendController {
     return this.friendService.reportFriend(req.user.userId, friendUserId, dto);
   }
 
-  @Delete(':friendUserId/report')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({
-    summary: "Withdraw the caller's report(s) against a user and refund credit",
-  })
-  @ApiNoContentResponse()
-  withdrawReport(
-    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: RequestWithUser,
-  ): Promise<void> {
-    return this.friendService.withdrawReport(req.user.userId, friendUserId);
-  }
-
   // ─── Remark ───────────────────────────────────────────────────────────────────
 
   @Patch(':friendUserId/remark')
