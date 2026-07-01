@@ -62,6 +62,10 @@ export function createEnvValidationSchema(
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
     OPENIM_API_URL: Joi.string().uri().optional(),
     OPENIM_ADMIN_SECRET: Joi.string().optional(),
+    // When set, the OpenIM before-send callbacks require this shared secret
+    // (via the `x-openim-callback-secret` header or a `token` query param).
+    // Leave unset to keep the callbacks open (network-isolated deployments).
+    OPENIM_CALLBACK_SECRET: Joi.string().optional(),
     LIVEKIT_URL: Joi.string().uri().optional(),
     LIVEKIT_API_KEY: Joi.string().optional(),
     LIVEKIT_API_SECRET: Joi.string().optional(),
