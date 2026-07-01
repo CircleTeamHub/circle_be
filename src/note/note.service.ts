@@ -720,10 +720,7 @@ export class NoteService {
       canonicalByUrl.set(item.url, canonical);
     }
 
-    const source =
-      requestedItems && requestedItems.length > 0
-        ? requestedItems
-        : fallbackItems;
+    const source = Array.isArray(requestedItems) ? requestedItems : fallbackItems;
     return source.map((item) => {
       const resolved =
         canonicalByComposite.get(`${item.objectKey}:${item.url}`) ??
@@ -738,6 +735,10 @@ export class NoteService {
     });
   }
 
+  private hasSectionMediaItems(items: unknown) {
+    return Array.isArray(items);
+  }
+
   private buildSectionsFromInput(
     input: CreateNoteDto | UpdateNoteDto,
     derived: {
@@ -747,16 +748,24 @@ export class NoteService {
     },
   ): NoteSections {
     const sectionInput = input.sections;
+    const hasExplicitMedia = this.hasSectionMediaItems(
+      sectionInput?.media?.items,
+    );
+    const hasExplicitShowcase = this.hasSectionMediaItems(
+      sectionInput?.showcase?.items,
+    );
     const mediaItems = this.resolveSectionMediaItems(
       'media',
       sectionInput?.media?.items,
-      derived.media,
+      hasExplicitShowcase ? [] : derived.media,
       derived.media,
     );
     const showcaseItems = this.resolveSectionMediaItems(
       'showcase',
       sectionInput?.showcase?.items,
-      derived.media.filter((item) => item.type === 'IMAGE'),
+      hasExplicitMedia
+        ? []
+        : derived.media.filter((item) => item.type === 'IMAGE'),
       derived.media,
     );
 
@@ -934,18 +943,24 @@ export class NoteService {
     const storedLocation = this.isRecord(stored.location)
       ? stored.location
       : null;
+    const hasExplicitMedia = Array.isArray(storedMedia.items);
+    const hasExplicitShowcase = Array.isArray(storedShowcase.items);
     const mediaItems =
-      Array.isArray(storedMedia.items) && storedMedia.items.length > 0
+      hasExplicitMedia
         ? storedMedia.items
-        : (note.media ?? []).map((item) =>
-            this.mapMediaItemForSection(item as any),
-          );
+        : hasExplicitShowcase
+          ? []
+          : (note.media ?? []).map((item) =>
+              this.mapMediaItemForSection(item as any),
+            );
     const showcaseItems =
-      Array.isArray(storedShowcase.items) && storedShowcase.items.length > 0
+      hasExplicitShowcase
         ? storedShowcase.items
-        : (note.media ?? [])
-            .filter((item) => item.type === 'IMAGE')
-            .map((item) => this.mapMediaItemForSection(item as any));
+        : hasExplicitMedia
+          ? []
+          : (note.media ?? [])
+              .filter((item) => item.type === 'IMAGE')
+              .map((item) => this.mapMediaItemForSection(item as any));
     let contentJson: unknown[] | null = null;
     if (Array.isArray(storedText.contentJson)) {
       contentJson = storedText.contentJson;

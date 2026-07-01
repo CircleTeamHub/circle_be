@@ -672,6 +672,133 @@ describe('NoteService', () => {
     expect(data.map((item: any) => item.sortOrder)).toEqual([0, 1]);
   });
 
+  it('keeps showcase-only section media out of the body media section on create', async () => {
+    const showcaseImage = {
+      type: 'IMAGE',
+      objectKey: 'notes/user-1/showcase.jpg',
+      url: 'https://cdn.example.com/showcase.jpg',
+      sortOrder: 0,
+    };
+
+    prisma.note.create.mockResolvedValueOnce({
+      id: 'note-showcase-only',
+      ownerID: 'user-1',
+      title: 'showcase only',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 1 });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-showcase-only',
+      ownerID: 'user-1',
+      title: 'showcase only',
+      content: null,
+      contentJson: null,
+      sections: {
+        text: { content: null, contentJson: null },
+        media: { items: [] },
+        showcase: { items: [showcaseImage] },
+        location: null,
+      },
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [
+        {
+          id: 'media-1',
+          ...showcaseImage,
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    await service.createNote('user-1', {
+      title: 'showcase only',
+      media: [],
+      sections: {
+        showcase: {
+          items: [showcaseImage],
+        },
+      },
+    } as any);
+
+    expect(prisma.note.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          sections: expect.objectContaining({
+            media: { items: [] },
+            showcase: { items: [showcaseImage] },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('keeps an explicitly empty stored body media section empty on read', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-stored-sections',
+      ownerID: 'user-1',
+      title: 'stored sections',
+      content: null,
+      contentJson: null,
+      sections: {
+        text: { content: null, contentJson: null },
+        media: { items: [] },
+        showcase: {
+          items: [
+            {
+              id: 'media-1',
+              type: 'IMAGE',
+              objectKey: 'notes/user-1/showcase.jpg',
+              url: 'https://cdn.example.com/showcase.jpg',
+              sortOrder: 0,
+            },
+          ],
+        },
+        location: null,
+      },
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [
+        {
+          id: 'media-1',
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/showcase.jpg',
+          url: 'https://cdn.example.com/showcase.jpg',
+          sortOrder: 0,
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getNote('user-1', 'note-stored-sections');
+
+    expect(result.sections.media.items).toEqual([]);
+    expect(result.sections.showcase.items).toHaveLength(1);
+  });
+
   it('lists only the owner notes with summary fields', async () => {
     prisma.note.findMany.mockResolvedValueOnce([
       {
