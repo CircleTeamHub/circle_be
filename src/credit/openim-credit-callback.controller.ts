@@ -1,6 +1,7 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CreditPolicyService } from './credit-policy.service';
+import { OpenimCallbackGuard } from './openim-callback.guard';
 
 type OpenimBeforeSendPayload = {
   sendID?: unknown;
@@ -33,6 +34,7 @@ function openimCallbackDeny(message: string): OpenimCallbackResponse {
 }
 
 @ApiTags('OpenIM Callback')
+@UseGuards(OpenimCallbackGuard)
 @Controller('openim-callback')
 export class OpenimCreditCallbackController {
   constructor(private readonly creditPolicyService: CreditPolicyService) {}

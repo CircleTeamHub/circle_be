@@ -5,6 +5,7 @@ import { CreditService } from './credit.service';
 
 describe('CreditService', () => {
   const tx = {
+    $queryRaw: jest.fn(),
     user: {
       findUnique: jest.fn(),
       update: jest.fn(),
@@ -42,7 +43,7 @@ describe('CreditService', () => {
 
   it('applies a credit delta, clamps score, writes an event, and broadcasts profile summary', async () => {
     tx.creditEvent.findUnique.mockResolvedValue(null);
-    tx.user.findUnique.mockResolvedValue({ id: 'user-1', creditScore: 3 });
+    tx.$queryRaw.mockResolvedValue([{ creditScore: 3 }]);
     tx.user.update.mockResolvedValue({ id: 'user-1', creditScore: 0 });
     tx.creditEvent.create.mockResolvedValue({
       id: 'event-1',
@@ -66,6 +67,9 @@ describe('CreditService', () => {
       scoreAfter: 0,
     });
 
+    // The balance must be read under a row lock (SELECT ... FOR UPDATE) so
+    // concurrent deltas on the same user cannot lose an update.
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     expect(tx.user.update).toHaveBeenCalledWith({
       where: { id: 'user-1' },
       data: { creditScore: 0 },
@@ -120,6 +124,7 @@ describe('CreditService', () => {
       scoreAfter: 75,
     });
 
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
     expect(tx.user.update).not.toHaveBeenCalled();
     expect(tx.creditEvent.create).not.toHaveBeenCalled();
   });

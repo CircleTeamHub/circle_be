@@ -65,15 +65,21 @@ export class CreditService {
       }
     }
 
-    const user = await client.user.findUnique({
-      where: { id: input.userId },
-      select: { id: true, creditScore: true },
-    });
-    if (!user) {
+    // Lock the user row for the remainder of the transaction so concurrent
+    // credit deltas on the same user serialize. Without this, two Read
+    // Committed transactions (e.g. two friend reports against the same target)
+    // can both read the same scoreBefore and lose an update — corrupting both
+    // the balance and the ledger's scoreBefore/scoreAfter. Requires an
+    // enclosing transaction, which every caller provides.
+    const lockedRows = await client.$queryRaw<Array<{ creditScore: number }>>(
+      Prisma.sql`SELECT "creditScore" FROM "User" WHERE "id" = ${input.userId} FOR UPDATE`,
+    );
+    const locked = lockedRows[0];
+    if (!locked) {
       throw new NotFoundException('User not found');
     }
 
-    const scoreBefore = user.creditScore;
+    const scoreBefore = locked.creditScore;
     const scoreAfter = clampCreditScore(scoreBefore + input.delta);
     await client.user.update({
       where: { id: input.userId },
