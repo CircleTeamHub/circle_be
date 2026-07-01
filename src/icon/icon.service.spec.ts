@@ -9,6 +9,7 @@ describe('IconService', () => {
   const prisma = {
     user: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
       update: jest.fn(),
     },
     circleMember: {
@@ -654,6 +655,92 @@ describe('IconService', () => {
         }),
       ]),
     );
+  });
+
+  describe('getDisplayIconsForUsers (batch)', () => {
+    it('resolves many users with a single batched set of queries and no writes', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        {
+          id: 'user-1',
+          vipLevel: 2,
+          receivedLikeCount: 0,
+          createdAt: new Date(0),
+          status: 'ACTIVE',
+          iconPreferencesInitialized: true,
+        },
+        {
+          id: 'user-2',
+          vipLevel: 0,
+          receivedLikeCount: 0,
+          createdAt: new Date(0),
+          status: 'ACTIVE',
+          iconPreferencesInitialized: true,
+        },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      prisma.userDisplayIcon.findMany.mockResolvedValue([
+        {
+          id: 'display-1',
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP2',
+          circleID: null,
+          sortOrder: 0,
+        },
+      ]);
+
+      const result = await service.getDisplayIconsForUsers([
+        'user-1',
+        'user-2',
+        'user-1',
+      ]);
+
+      // One user fetch and one selections fetch for the whole batch — not per user.
+      expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.userDisplayIcon.findMany).toHaveBeenCalledTimes(1);
+      // Read-only: viewing others' badges must never persist prune/default writes.
+      expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.userDisplayIcon.createMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+
+      expect(result.get('user-1')).toEqual([
+        expect.objectContaining({ systemKey: 'VIP', systemVariant: 'VIP2' }),
+      ]);
+      // Initialized user with no selections shows nothing (no in-memory defaults).
+      expect(result.get('user-2')).toEqual([]);
+    });
+
+    it('returns an empty array for requested ids that do not exist', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+      const result = await service.getDisplayIconsForUsers(['ghost']);
+
+      expect(result.get('ghost')).toEqual([]);
+    });
+
+    it('serves cached entries without issuing new queries', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        vipLevel: 5,
+        receivedLikeCount: 0,
+        createdAt: new Date(),
+        iconPreferencesInitialized: true,
+      });
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+      // Warm the cache through the single-user path.
+      await service.getDisplayIconsForUser('user-1');
+      prisma.user.findMany.mockClear();
+
+      const result = await service.getDisplayIconsForUsers(['user-1']);
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(result.has('user-1')).toBe(true);
+    });
   });
 
   it('awards CIRCLE_BUILDER for active owners or admins of mature circles', async () => {

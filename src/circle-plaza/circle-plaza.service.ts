@@ -702,22 +702,20 @@ export class CirclePlazaService {
     const uniqueAuthorIds = [...new Set(authorIds.filter(Boolean))];
     if (uniqueAuthorIds.length === 0) return new Map();
 
-    const entries = await Promise.all(
-      uniqueAuthorIds.map(async (authorId) => {
-        try {
-          const displayIcons =
-            await this.iconService.getDisplayIconsForUser(authorId);
-          return [authorId, displayIcons] as const;
-        } catch {
-          this.logger.warn(
-            `failed to resolve display icons for plaza author ${authorId}`,
-          );
-          return [authorId, [] as DisplayIconDto[]] as const;
-        }
-      }),
-    );
-
-    return new Map(entries);
+    try {
+      // Single batched resolution avoids an N+1 (one query set for all authors
+      // instead of ~5 queries per author).
+      return await this.iconService.getDisplayIconsForUsers(uniqueAuthorIds);
+    } catch {
+      // Icons are non-critical chrome — never fail the feed over them. Callers
+      // fall back to an empty list per author on a missing entry.
+      this.logger.warn(
+        `failed to resolve display icons for plaza authors: ${uniqueAuthorIds.join(
+          ', ',
+        )}`,
+      );
+      return new Map();
+    }
   }
 
   private toPlazaPostDto(

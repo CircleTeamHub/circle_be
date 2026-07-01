@@ -56,14 +56,14 @@ describe('CirclePlazaService', () => {
     createCirclePostSignupNotification: jest.fn(),
   };
   const iconService = {
-    getDisplayIconsForUser: jest.fn(),
+    getDisplayIconsForUsers: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     notificationService.createCirclePostSignupNotification.mockReset();
-    iconService.getDisplayIconsForUser.mockReset();
-    iconService.getDisplayIconsForUser.mockResolvedValue([]);
+    iconService.getDisplayIconsForUsers.mockReset();
+    iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -235,11 +235,15 @@ describe('CirclePlazaService', () => {
         fancyNumber: false,
       });
       prisma.circlePostSignup.findMany.mockResolvedValue([]);
-      iconService.getDisplayIconsForUser.mockResolvedValue(displayIcons);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(
+        new Map([['author-1', displayIcons]]),
+      );
 
       const result = await service.getFeed('viewer-1', {});
 
-      expect(iconService.getDisplayIconsForUser).toHaveBeenCalledWith('author-1');
+      expect(iconService.getDisplayIconsForUsers).toHaveBeenCalledWith(
+        expect.arrayContaining(['author-1']),
+      );
       expect(result.items[0].author.displayIcons).toEqual(displayIcons);
     });
   });
@@ -439,12 +443,14 @@ describe('CirclePlazaService', () => {
           },
         },
       ]);
-      iconService.getDisplayIconsForUser.mockResolvedValue(displayIcons);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(
+        new Map([['0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547', displayIcons]]),
+      );
 
       const result = await service.getMyPostSignups('author-1', 'post-1');
 
-      expect(iconService.getDisplayIconsForUser).toHaveBeenCalledWith(
-        '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
+      expect(iconService.getDisplayIconsForUsers).toHaveBeenCalledWith(
+        expect.arrayContaining(['0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547']),
       );
       expect(result.items[0]).toEqual(
         expect.objectContaining({
