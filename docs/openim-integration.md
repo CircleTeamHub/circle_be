@@ -120,47 +120,11 @@ export class AuthTokensDto {
 # .env.development
 OPENIM_API_URL=http://localhost:10002      # OpenIM Server 地址
 OPENIM_ADMIN_SECRET=openIM123             # OpenIM 管理员密钥（见 docker-compose）
-OPENIM_CALLBACK_SECRET=                    # 可选：before-send 回调共享密钥（见 3.5）
 ```
 
----
-
-### 3.5 信誉发言闸门回调（OpenIM before-send callback）
-
-OpenIM 在投递消息前会回调 circle_be，由后端按发送者信誉分决定放行还是拦截。
-
-**端点**（`src/credit/openim-credit-callback.controller.ts`）：
-
-| 路径 | 触发时机 |
-|------|----------|
-| `POST /openim-callback/callbackBeforeSendSingleMsgCommand` | 单聊发送前 |
-| `POST /openim-callback/callbackBeforeSendGroupMsgCommand` | 群聊发送前 |
-
-**判定**：解析 `sendID` → 还原成 circle_be 用户 → 查信誉分。低于阈值(默认 60，见
-`CreditPolicyService`)返回拒绝(`errCode 5001`)，否则放行。缺失/无法解析的 `sendID`
-一律**放行**(fail-open，不因闸门故障阻断正常消息)。
-
-**鉴权**（`OpenimCallbackGuard`）：OpenIM 默认不对回调签名，端点又直连数据库。设置
-`OPENIM_CALLBACK_SECRET` 后，后端要求每次回调带匹配密钥，否则 401；**不设则为 no-op**
-(适用于回调路径已做网络隔离、仅 OpenIM 可达的部署)。密钥可走两个通道：
-
-- 请求头 `x-openim-callback-secret: <secret>`
-- 或查询参数 `?token=<secret>`
-
-**配置步骤**：
-
-1. 生成随机串：`openssl rand -hex 32`，写入对应环境的 `.env.${NODE_ENV}` 的
-   `OPENIM_CALLBACK_SECRET`，重启后端。
-2. 让 OpenIM 带上密钥（二选一）：
-   - **方式 A（推荐，最兼容）**：在仅 OpenIM 可达的网关(nginx)上给
-     `location /openim-callback/` 注入 `proxy_set_header x-openim-callback-secret "<secret>"`，
-     app 层校验作为纵深防御。
-   - **方式 B**：若你的 OpenIM 版本支持配置每条回调的**完整 URL**，在末尾加
-     `?token=<secret>`。注意「基址自动拼命令名」风格的版本会把 query 拼坏，此时用方式 A。
-3. 验证：不带密钥应 401，带正确密钥应 200。
-
-> ⚠️ 两侧密钥必须完全一致；轮换时先同步再重启，避免中间态把正常消息拦成 401
-> (守卫对鉴权失败 fail-closed)。
+> 信誉发言闸门(OpenIM before-send 回调)曾在此实现，因 fail-closed 风险与长期未启用
+> 已删除，详见 [credit-gate.md](./credit-gate.md)。信誉强制现只落在发帖互动/报名等
+> 走 circle_be 的动作上。
 
 ---
 

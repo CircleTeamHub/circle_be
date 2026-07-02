@@ -1,6 +1,5 @@
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { CreditPolicyService } from './credit-policy.service';
 import { CreditService } from './credit.service';
 
 describe('CreditService', () => {
@@ -27,9 +26,6 @@ describe('CreditService', () => {
       Promise.allSettled(fns.map((fn) => fn())),
     ),
   };
-  const creditPolicyService = {
-    invalidateUserPolicyCache: jest.fn(),
-  };
   let service: CreditService;
 
   beforeEach(() => {
@@ -37,7 +33,6 @@ describe('CreditService', () => {
     service = new CreditService(
       prisma as unknown as PrismaService,
       realtimeService as unknown as RealtimeService,
-      creditPolicyService as unknown as CreditPolicyService,
     );
   });
 
@@ -90,9 +85,6 @@ describe('CreditService', () => {
       },
       select: { id: true, scoreBefore: true, scoreAfter: true },
     });
-    expect(creditPolicyService.invalidateUserPolicyCache).toHaveBeenCalledWith(
-      'user-1',
-    );
     expect(
       realtimeService.invalidateUserProfileSummaryCache,
     ).toHaveBeenCalledWith('user-1');

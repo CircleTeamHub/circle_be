@@ -10,7 +10,7 @@
 - 即闸门是 **fail-CLOSED**：circle_be 一挂/一慢就阻塞**全体**消息，包括每次部署重启的窗口。
 - 用一个软性信誉功能把整个聊天的可用性绑死在 circle_be 上，不划算。故放弃聊天层强制。
 
-> 若将来确实需要聊天层强制：`src/credit/` 下的 before-send 回调（controller + guard + `checkOpenimSend` 缓存）已建好但**未启用**，可作为起点；但需先 patch OpenIM 让 `failedContinue` 真正生效（fail-open），否则勿在生产开启。
+> 若将来确实需要聊天层强制：before-send 回调实现（controller + guard + `checkOpenimSend` 缓存）曾建于 `src/credit/`，因长期未启用已删除（见 git 历史），可作为重建起点；但需先 patch OpenIM 让 `failedContinue` 真正生效（fail-open），否则勿在生产开启。
 
 ## 现在的两层
 
@@ -29,12 +29,9 @@
 
 FE `SEND_MESSAGE_MIN_SCORE = 60`（`credit-policy.ts`）仅用于客户端 UX 预检。发帖/报名的门槛是**按帖配置**的（`creditRestriction` / `signupCreditRestriction`），非全局常量。
 
-## 已建但未启用（dormant）
+## 已清理（删除的死代码）
 
-- `src/credit/openim-credit-callback.controller.ts`、`openim-callback.guard.ts`、`credit-policy.service.ts#checkOpenimSend`：OpenIM before-send 回调的服务端实现，含 15s 缓存 + 写时失效（`credit.service.ts` 改分后在提交后钩子 `broadcastCreditProfileChanged` 里失效）。**当前无人调用**（OpenIM webhook 未配）。保留以备将来 patch OpenIM（让 `failedContinue` 生效）后启用。
-
-## 已清理（Option A 后删除的死代码）
-
-以下是"每条发消息查服务端"的老方案，从未接通、已随 Option A 删除，避免误导：
-- FE `credit-policy.ts` 的 `assertCanSendMessage` / `checkCreditPolicy` + 15s 缓存/inflight（FE 现只剩 `assertLocalCanSendMessage` 本地拦截）。
+以下从未接通、已删除，避免误导：
+- BE OpenIM before-send 回调整套：`openim-credit-callback.controller.ts`、`openim-callback.guard.ts`、`credit-policy.service.ts`（含 `checkOpenimSend` 15s 缓存）、`OPENIM_CALLBACK_SECRET` 环境变量。OpenIM webhook 从未配置、回调无人调用；将来若要聊天层强制，需先让 OpenIM `failedContinue` 生效再重建（见上）。
 - BE `CreditController`（`POST /credit-policy/check`）+ `credit-policy.service.ts#check` + `dto/credit-policy.dto.ts`。
+- FE `credit-policy.ts` 的 `assertCanSendMessage` / `checkCreditPolicy` + 15s 缓存/inflight（FE 现只剩 `assertLocalCanSendMessage` 本地拦截）。

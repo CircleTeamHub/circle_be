@@ -3,7 +3,6 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
-import { CreditPolicyService } from './credit-policy.service';
 
 type CreditClient = Prisma.TransactionClient | PrismaService;
 
@@ -36,7 +35,6 @@ export class CreditService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
-    private readonly creditPolicyService: CreditPolicyService,
   ) {}
 
   async applyDelta(input: CreditDeltaInput): Promise<CreditDeltaResult> {
@@ -110,11 +108,9 @@ export class CreditService {
   }
 
   async broadcastCreditProfileChanged(userId: string) {
-    // 提交后钩子：所有改分路径（applyDelta / revert* / friend-report）在事务提交后
-    // 都会走到这里。信誉发言闸门缓存的失效放在这里、而非事务内——事务内失效存在竞态
-    // （回滚也会失效；并发 callback 可能读到未提交旧值再缓存，直到 TTL 才纠正）。
-    // 先做同步 Map 失效（必成功、即刻生效），再异步广播资料变更。
-    this.creditPolicyService.invalidateUserPolicyCache(userId);
+    // Post-commit hook: every score-change path (applyDelta / friend-report
+    // approval) calls this after its transaction commits. Invalidate the cached
+    // profile summary first (synchronous, immediate) then broadcast the change.
     await this.realtimeService.safeBroadcastAll([
       () => this.realtimeService.invalidateUserProfileSummaryCache(userId),
       () => this.realtimeService.broadcastUserProfileSummary(userId),
