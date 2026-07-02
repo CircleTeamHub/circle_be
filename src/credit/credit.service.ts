@@ -24,27 +24,8 @@ export type CreditDeltaResult = {
   scoreAfter: number;
 };
 
-export type CreditRevertInput = {
-  reason?: string;
-  actorId?: string | null;
-  metadata?: Record<string, unknown>;
-};
-
-export type CreditRevertResult = {
-  reverted: boolean;
-  userId?: string;
-  reversalEventId?: string;
-  scoreBefore?: number;
-  scoreAfter?: number;
-};
-
 const MIN_CREDIT_SCORE = 0;
 const MAX_CREDIT_SCORE = 100;
-
-// Reversal (compensating) entries carry their own source type so that
-// "find the original debit for this source" lookups never match a reversal,
-// and point sourceID at the event they undo.
-const CREDIT_REVERT_SOURCE_TYPE = 'CREDIT_REVERT';
 
 function clampCreditScore(score: number) {
   return Math.max(MIN_CREDIT_SCORE, Math.min(MAX_CREDIT_SCORE, score));
@@ -64,113 +45,6 @@ export class CreditService {
     );
     await this.broadcastCreditProfileChanged(input.userId);
     return result;
-  }
-
-  /**
-   * Reverses a single credit event by posting an equal-and-opposite
-   * compensating entry and stamping `revertedAt` on the original. The ledger
-   * stays append-only — history is never mutated beyond the void marker.
-   *
-   * Idempotent: an already-reverted (or missing) event yields
-   * `{ reverted: false }` and no new entry. Runs Serializable + retry so a
-   * concurrent double-revert of the same event resolves to a single reversal.
-   *
-   * Note: the compensating delta is the original's nominal delta. Because
-   * scores are clamped to [0, 100], a debit that was itself clamped may not be
-   * restored 1:1 — acceptable for a bounded reputation score.
-   */
-  async revertEvent(
-    eventId: string,
-    options: CreditRevertInput = {},
-  ): Promise<CreditRevertResult> {
-    const result = await runSerializableTransaction(this.prisma, (tx) =>
-      this.revertEventInTransaction(tx, eventId, options),
-    );
-    if (result.reverted && result.userId) {
-      await this.broadcastCreditProfileChanged(result.userId);
-    }
-    return result;
-  }
-
-  /**
-   * Reverses the most recent un-reverted debit/credit recorded for a given
-   * source (e.g. `('FRIEND_REPORT', reportId)` to refund a withdrawn report).
-   * Never matches a reversal entry, which carries its own source type.
-   */
-  async revertBySource(
-    sourceType: string,
-    sourceId: string,
-    options: CreditRevertInput = {},
-  ): Promise<CreditRevertResult> {
-    const result = await runSerializableTransaction(this.prisma, async (tx) => {
-      const original = await tx.creditEvent.findFirst({
-        where: { sourceType, sourceID: sourceId, revertedAt: null },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      });
-      if (!original) {
-        return { reverted: false as const };
-      }
-      return this.revertEventInTransaction(tx, original.id, options);
-    });
-    if (result.reverted && result.userId) {
-      await this.broadcastCreditProfileChanged(result.userId);
-    }
-    return result;
-  }
-
-  private async revertEventInTransaction(
-    client: CreditClient,
-    eventId: string,
-    options: CreditRevertInput,
-  ): Promise<CreditRevertResult> {
-    const event = await client.creditEvent.findUnique({
-      where: { id: eventId },
-      select: {
-        id: true,
-        userID: true,
-        delta: true,
-        revertedAt: true,
-        sourceType: true,
-      },
-    });
-    // Missing, already voided, or itself a reversal → nothing to undo. Reverting
-    // a reversal would silently re-apply the original delta, so refuse it.
-    if (
-      !event ||
-      event.revertedAt ||
-      event.sourceType === CREDIT_REVERT_SOURCE_TYPE
-    ) {
-      return { reverted: false };
-    }
-
-    const reversal = await this.applyDeltaInTransaction(client, {
-      userId: event.userID,
-      delta: -event.delta,
-      reason: options.reason ?? 'REVERT',
-      sourceType: CREDIT_REVERT_SOURCE_TYPE,
-      sourceId: event.id,
-      actorId: options.actorId ?? null,
-      idempotencyKey: `revert:${event.id}`,
-      metadata: {
-        revertOf: event.id,
-        revertReason: options.reason ?? null,
-        ...(options.metadata ?? {}),
-      },
-    });
-
-    await client.creditEvent.update({
-      where: { id: event.id },
-      data: { revertedAt: new Date() },
-    });
-
-    return {
-      reverted: true,
-      userId: event.userID,
-      reversalEventId: reversal.eventId,
-      scoreBefore: reversal.scoreBefore,
-      scoreAfter: reversal.scoreAfter,
-    };
   }
 
   async applyDeltaInTransaction(
