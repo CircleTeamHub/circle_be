@@ -40,7 +40,10 @@ const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
 
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
-    throw new BadRequestException(`${fieldName} 必须为4-6位数字`);
+    throw new BadRequestException({
+      message: `${fieldName} 必须为4-6位数字`,
+      errorCode: AuthErrorCode.SecurityCodeFormat,
+    });
   }
 }
 
@@ -308,7 +311,10 @@ export class AuthService {
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     // Banned/deleted users must not be able to keep refreshing tokens just
@@ -319,7 +325,10 @@ export class AuthService {
         `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
       );
       await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException('账号已被禁用');
+      throw new ForbiddenException({
+        message: '账号已被禁用',
+        errorCode: AuthErrorCode.AccountDisabled,
+      });
     }
 
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
@@ -386,7 +395,10 @@ export class AuthService {
       select: { singleDeviceLoginEnabled: true },
     });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
     return { enabled: user.singleDeviceLoginEnabled };
   }
@@ -401,7 +413,10 @@ export class AuthService {
       select: { id: true },
     });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     await this.prisma.user.update({
@@ -427,7 +442,10 @@ export class AuthService {
     ]);
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
@@ -452,12 +470,18 @@ export class AuthService {
   ): Promise<void> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     const valid = await argon2.verify(user.passwordHash, oldPassword);
     if (!valid) {
-      throw new UnauthorizedException('当前密码不正确');
+      throw new UnauthorizedException({
+        message: '当前密码不正确',
+        errorCode: AuthErrorCode.PasswordIncorrect,
+      });
     }
 
     const passwordHash = await argon2.hash(newPassword);
@@ -489,7 +513,10 @@ export class AuthService {
     // 处理，归一到小写后简单的精确查重 / DB 唯一约束即足以保证唯一性。
     const normalized = accountId.trim().toLowerCase();
     if (!ACCOUNT_ID_PATTERN.test(normalized)) {
-      throw new BadRequestException(ACCOUNT_ID_RULE_MESSAGE);
+      throw new BadRequestException({
+        message: ACCOUNT_ID_RULE_MESSAGE,
+        errorCode: AuthErrorCode.AccountIdInvalid,
+      });
     }
 
     const current = await this.prisma.user.findUnique({
@@ -497,10 +524,16 @@ export class AuthService {
       select: { accountId: true },
     });
     if (!current) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
     if (current.accountId === normalized) {
-      throw new BadRequestException('新账号不能和当前账号相同');
+      throw new BadRequestException({
+        message: '新账号不能和当前账号相同',
+        errorCode: AuthErrorCode.AccountIdUnchanged,
+      });
     }
 
     const taken = await this.prisma.user.findUnique({
@@ -554,7 +587,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     return { enabled: Boolean(user.loginSecurityCodeHash) };
@@ -573,7 +609,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (user.loginSecurityCodeHash) {
@@ -619,7 +658,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (!user.loginSecurityCodeHash) {
@@ -628,7 +670,10 @@ export class AuthService {
 
     const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
     if (!valid) {
-      throw new UnauthorizedException('安全码不正确');
+      throw new UnauthorizedException({
+        message: '安全码不正确',
+        errorCode: AuthErrorCode.SecurityCodeInvalid,
+      });
     }
 
     await this.prisma.user.update({
@@ -657,7 +702,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (!user.loginSecurityCodeHash) {

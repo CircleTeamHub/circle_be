@@ -46,9 +46,10 @@ export class CircleService {
     if (!this.minioPublicUrl || !avatarUrl) return;
     const prefix = this.minioPublicUrl.replace(/\/$/, '');
     if (avatarUrl !== prefix && !avatarUrl.startsWith(`${prefix}/`)) {
-      throw new BadRequestException(
-        "avatarUrl must be served from this application's storage",
-      );
+      throw new BadRequestException({
+        message: "avatarUrl must be served from this application's storage",
+        errorCode: CircleErrorCode.AvatarUrlInvalid,
+      });
     }
   }
 
@@ -62,7 +63,10 @@ export class CircleService {
       select: { vipLevel: true },
     });
     if (!user || user.vipLevel < 1) {
-      throw new ForbiddenException('Only VIP users can create circles');
+      throw new ForbiddenException({
+        message: 'Only VIP users can create circles',
+        errorCode: CircleErrorCode.VipRequired,
+      });
     }
 
     this.assertAvatarUrlIsSafe(dto.avatarUrl);
@@ -208,7 +212,11 @@ export class CircleService {
         },
       },
     });
-    if (!circle) throw new NotFoundException('Circle not found');
+    if (!circle)
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
 
     const membership = await this.prisma.circleMember.findUnique({
       where: { userID_circleID: { userID: userId, circleID: circleId } },
@@ -241,7 +249,11 @@ export class CircleService {
     const circle = await this.prisma.circle.findFirst({
       where: { id: circleId, deleted: false },
     });
-    if (!circle) throw new NotFoundException('Circle not found');
+    if (!circle)
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
 
     if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
       throw new BadRequestException({
@@ -336,9 +348,10 @@ export class CircleService {
           error instanceof Prisma.PrismaClientKnownRequestError &&
           error.code === 'P2002'
         ) {
-          throw new ConflictException(
-            'Already a member or a join request is already pending',
-          );
+          throw new ConflictException({
+            message: 'Already a member or a join request is already pending',
+            errorCode: CircleErrorCode.AlreadyMemberOrPending,
+          });
         }
         throw error;
       }
@@ -360,11 +373,16 @@ export class CircleService {
     const membership = await this.prisma.circleMember.findUnique({
       where: { userID_circleID: { userID: userId, circleID: circleId } },
     });
-    if (!membership) throw new NotFoundException('Not a member');
+    if (!membership)
+      throw new NotFoundException({
+        message: 'Not a member',
+        errorCode: CircleErrorCode.NotMember,
+      });
     if (membership.role === 'OWNER') {
-      throw new ForbiddenException(
-        'Owner cannot leave — transfer ownership first',
-      );
+      throw new ForbiddenException({
+        message: 'Owner cannot leave — transfer ownership first',
+        errorCode: CircleErrorCode.OwnerCannotLeave,
+      });
     }
 
     const circle = await this.prisma.circle.findUnique({
@@ -437,7 +455,10 @@ export class CircleService {
     });
 
     if (!asset) {
-      throw new NotFoundException('Circle icon asset not found');
+      throw new NotFoundException({
+        message: 'Circle icon asset not found',
+        errorCode: CircleErrorCode.IconAssetNotFound,
+      });
     }
 
     await this.prisma.circle.update({
@@ -494,39 +515,51 @@ export class CircleService {
       select: { vipLevel: true, creditScore: true, fancyNumber: true },
     });
     if (!user) {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: CircleErrorCode.UserNotFound,
+      });
     }
 
     if (
       circle.joinVipRestriction != null &&
       user.vipLevel < circle.joinVipRestriction
     ) {
-      throw new ForbiddenException(
-        `VIP ${circle.joinVipRestriction}+ is required to join this circle`,
-      );
+      throw new ForbiddenException({
+        message: `VIP ${circle.joinVipRestriction}+ is required to join this circle`,
+        errorCode: CircleErrorCode.JoinVipRequired,
+      });
     }
     if (
       circle.joinCreditRestriction != null &&
       user.creditScore < circle.joinCreditRestriction
     ) {
-      throw new ForbiddenException(
-        `Credit score ${circle.joinCreditRestriction}+ is required to join this circle`,
-      );
+      throw new ForbiddenException({
+        message: `Credit score ${circle.joinCreditRestriction}+ is required to join this circle`,
+        errorCode: CircleErrorCode.JoinCreditRequired,
+      });
     }
     if (circle.joinFancyRestriction && !user.fancyNumber) {
-      throw new ForbiddenException(
-        'A fancy number is required to join this circle',
-      );
+      throw new ForbiddenException({
+        message: 'A fancy number is required to join this circle',
+        errorCode: CircleErrorCode.JoinFancyNumberRequired,
+      });
     }
   }
 
   private normalizeStringList(values: string[], label: string): string[] {
     const normalized = values.map((value) => value.trim());
     if (normalized.some((value) => value.length === 0)) {
-      throw new BadRequestException(`${label} must not be blank`);
+      throw new BadRequestException({
+        message: `${label} must not be blank`,
+        errorCode: CircleErrorCode.ListItemBlank,
+      });
     }
     if (new Set(normalized).size !== normalized.length) {
-      throw new BadRequestException(`${label} must be unique`);
+      throw new BadRequestException({
+        message: `${label} must be unique`,
+        errorCode: CircleErrorCode.ListItemDuplicate,
+      });
     }
     return normalized;
   }
@@ -548,10 +581,16 @@ export class CircleService {
     });
 
     if (!circle) {
-      throw new NotFoundException('Circle not found');
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
     }
     if (circle.ownerID !== userId) {
-      throw new ForbiddenException('Only the owner can manage circle icons');
+      throw new ForbiddenException({
+        message: 'Only the owner can manage circle icons',
+        errorCode: CircleErrorCode.IconOwnerOnly,
+      });
     }
 
     return circle;

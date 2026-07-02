@@ -69,9 +69,10 @@ export class CoinService {
       });
     }
     if (amount > GIFT_MAX_SINGLE) {
-      throw new BadRequestException(
-        `Cannot send more than ${GIFT_MAX_SINGLE} coins at once`,
-      );
+      throw new BadRequestException({
+        message: `Cannot send more than ${GIFT_MAX_SINGLE} coins at once`,
+        errorCode: CoinErrorCode.AmountTooLarge,
+      });
     }
 
     const recipient = await this.prisma.user.findUnique({
@@ -79,7 +80,10 @@ export class CoinService {
       select: { id: true, status: true },
     });
     if (!recipient || recipient.status !== 'ACTIVE') {
-      throw new NotFoundException('Recipient not found');
+      throw new NotFoundException({
+        message: 'Recipient not found',
+        errorCode: CoinErrorCode.RecipientNotFound,
+      });
     }
 
     // Must be friends
@@ -126,9 +130,10 @@ export class CoinService {
         });
         const totalSentToday = Math.abs(sentToday._sum.amount ?? 0);
         if (totalSentToday + amount > GIFT_DAILY_LIMIT) {
-          throw new BadRequestException(
-            `Daily gift limit of ${GIFT_DAILY_LIMIT} coins reached`,
-          );
+          throw new BadRequestException({
+            message: `Daily gift limit of ${GIFT_DAILY_LIMIT} coins reached`,
+            errorCode: CoinErrorCode.DailyLimit,
+          });
         }
 
         // Prisma interactive transactions run on a single connection;
@@ -231,9 +236,10 @@ export class CoinService {
       });
     }
     if (amount > MAX_ADMIN_TOPUP) {
-      throw new BadRequestException(
-        `Amount exceeds the per-top-up cap of ${MAX_ADMIN_TOPUP}`,
-      );
+      throw new BadRequestException({
+        message: `Amount exceeds the per-top-up cap of ${MAX_ADMIN_TOPUP}`,
+        errorCode: CoinErrorCode.AmountTooLarge,
+      });
     }
 
     const target = await this.prisma.user.findUnique({
@@ -241,7 +247,10 @@ export class CoinService {
       select: { id: true, status: true },
     });
     if (!target || target.status !== 'ACTIVE') {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: CoinErrorCode.UserNotFound,
+      });
     }
 
     const wallet = await runSerializableTransaction(this.prisma, async (tx) => {

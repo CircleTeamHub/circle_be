@@ -140,7 +140,10 @@ export class GroupService {
     const normalizedGroupID = this.normalizeGroupID(groupID);
     const normalizedTargetUserID = targetUserID.trim();
     if (!normalizedTargetUserID) {
-      throw new NotFoundException('Group member not found');
+      throw new NotFoundException({
+        message: 'Group member not found',
+        errorCode: GroupErrorCode.MemberNotFound,
+      });
     }
 
     const circle = await this.findCircleByGroupID(normalizedGroupID);
@@ -149,7 +152,10 @@ export class GroupService {
     }
 
     if (normalizedTargetUserID === actorId) {
-      throw new ForbiddenException('Use the group leave endpoint for yourself');
+      throw new ForbiddenException({
+        message: 'Use the group leave endpoint for yourself',
+        errorCode: GroupErrorCode.UseLeaveEndpoint,
+      });
     }
 
     const actor = await this.getCircleMember(circle.id, actorId);
@@ -290,7 +296,10 @@ export class GroupService {
   ): Promise<void> {
     const normalizedGroupID = groupID.trim();
     if (!normalizedGroupID) {
-      throw new NotFoundException('Group not found');
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
     }
     const description = dto.description.trim();
     if (!description) {
@@ -343,9 +352,10 @@ export class GroupService {
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        throw new ServiceUnavailableException(
-          'Group membership cannot be verified right now',
-        );
+        throw new ServiceUnavailableException({
+          message: 'Group membership cannot be verified right now',
+          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+        });
       }
 
       if (!isMember) {
@@ -463,7 +473,10 @@ export class GroupService {
   private normalizeGroupID(groupID: string): string {
     const normalizedGroupID = groupID.trim();
     if (!normalizedGroupID) {
-      throw new NotFoundException('Group not found');
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
     }
     return normalizedGroupID;
   }

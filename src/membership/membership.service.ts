@@ -50,7 +50,10 @@ export class MembershipService {
         select: { id: true, vipLevel: true },
       });
       if (!currentUser) {
-        throw new NotFoundException('User not found');
+        throw new NotFoundException({
+          message: 'User not found',
+          errorCode: MembershipErrorCode.UserNotFound,
+        });
       }
       if (level <= currentUser.vipLevel) {
         throw new BadRequestException({

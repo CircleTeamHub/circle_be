@@ -52,7 +52,10 @@ export class EmailVerificationService {
       orderBy: { createdAt: 'desc' },
     });
     if (last && Date.now() - last.createdAt.getTime() < RESEND_COOLDOWN_MS) {
-      throw new BadRequestException('验证码发送过于频繁，请稍后再试');
+      throw new BadRequestException({
+        message: '验证码发送过于频繁，请稍后再试',
+        errorCode: AuthErrorCode.CodeRateLimited,
+      });
     }
 
     const userExists = await this.prisma.user.findUnique({
