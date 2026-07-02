@@ -14,4 +14,27 @@ export const AuthErrorCode = {
   SecurityCodeLocked: 'AUTH_SECURITY_CODE_LOCKED',
 } as const;
 
-export type AppErrorCode = (typeof AuthErrorCode)[keyof typeof AuthErrorCode];
+export const CoinErrorCode = {
+  SelfTransfer: 'COIN_SELF_TRANSFER',
+  NotFriend: 'COIN_NOT_FRIEND',
+  Insufficient: 'COIN_INSUFFICIENT',
+  AmountInvalid: 'COIN_AMOUNT_INVALID',
+} as const;
+
+export const MembershipErrorCode = {
+  InvalidLevel: 'MEMBERSHIP_INVALID_LEVEL',
+  LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
+  InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
+} as const;
+
+export const CircleErrorCode = {
+  MemberLimit: 'CIRCLE_MEMBER_LIMIT',
+  AlreadyMember: 'CIRCLE_ALREADY_MEMBER',
+  RequestPending: 'CIRCLE_REQUEST_PENDING',
+} as const;
+
+export type AppErrorCode =
+  | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
+  | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
+  | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
+  | (typeof CircleErrorCode)[keyof typeof CircleErrorCode];

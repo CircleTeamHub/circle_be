@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
@@ -37,7 +38,10 @@ export class MembershipService {
   ): Promise<UpgradeMembershipResponseDto> {
     const plan = VIP_PLANS.find((item) => item.level === level);
     if (!plan) {
-      throw new BadRequestException('Invalid VIP level');
+      throw new BadRequestException({
+        message: 'Invalid VIP level',
+        errorCode: MembershipErrorCode.InvalidLevel,
+      });
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
@@ -49,9 +53,10 @@ export class MembershipService {
         throw new NotFoundException('User not found');
       }
       if (level <= currentUser.vipLevel) {
-        throw new BadRequestException(
-          'Target VIP level must be higher than current level',
-        );
+        throw new BadRequestException({
+          message: 'Target VIP level must be higher than current level',
+          errorCode: MembershipErrorCode.LevelNotHigher,
+        });
       }
 
       await tx.wallet.upsert({
@@ -65,7 +70,10 @@ export class MembershipService {
         data: { balance: { decrement: plan.price } },
       });
       if (debitResult.count !== 1) {
-        throw new BadRequestException('Insufficient points');
+        throw new BadRequestException({
+          message: 'Insufficient points',
+          errorCode: MembershipErrorCode.InsufficientPoints,
+        });
       }
 
       const wallet = await tx.wallet.findUniqueOrThrow({

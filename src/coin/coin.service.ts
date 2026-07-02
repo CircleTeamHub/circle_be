@@ -6,6 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { FriendState } from 'src/generated/prisma';
+import { CoinErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -62,7 +63,10 @@ export class CoinService {
     message?: string,
   ): Promise<void> {
     if (senderId === recipientId) {
-      throw new BadRequestException('Cannot send coins to yourself');
+      throw new BadRequestException({
+        message: 'Cannot send coins to yourself',
+        errorCode: CoinErrorCode.SelfTransfer,
+      });
     }
     if (amount > GIFT_MAX_SINGLE) {
       throw new BadRequestException(
@@ -89,7 +93,10 @@ export class CoinService {
       },
     });
     if (!friendship) {
-      throw new ForbiddenException('You can only send coins to friends');
+      throw new ForbiddenException({
+        message: 'You can only send coins to friends',
+        errorCode: CoinErrorCode.NotFriend,
+      });
     }
 
     // Idempotency fast path: if this key was already used, the gift already
@@ -145,7 +152,10 @@ export class CoinService {
           data: { balance: { decrement: amount } },
         });
         if (debitResult.count !== 1) {
-          throw new BadRequestException('Insufficient coins');
+          throw new BadRequestException({
+            message: 'Insufficient coins',
+            errorCode: CoinErrorCode.Insufficient,
+          });
         }
 
         const updatedSender = await tx.wallet.findUniqueOrThrow({
@@ -214,7 +224,12 @@ export class CoinService {
     amount: number,
     note?: string,
   ): Promise<WalletDto> {
-    if (amount <= 0) throw new BadRequestException('Amount must be positive');
+    if (amount <= 0) {
+      throw new BadRequestException({
+        message: 'Amount must be positive',
+        errorCode: CoinErrorCode.AmountInvalid,
+      });
+    }
     if (amount > MAX_ADMIN_TOPUP) {
       throw new BadRequestException(
         `Amount exceeds the per-top-up cap of ${MAX_ADMIN_TOPUP}`,

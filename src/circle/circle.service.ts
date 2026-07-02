@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from 'src/generated/prisma';
+import { CircleErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import {
@@ -243,7 +244,10 @@ export class CircleService {
     if (!circle) throw new NotFoundException('Circle not found');
 
     if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
-      throw new BadRequestException('Circle has reached its member limit');
+      throw new BadRequestException({
+        message: 'Circle has reached its member limit',
+        errorCode: CircleErrorCode.MemberLimit,
+      });
     }
 
     await this.assertJoinRestrictions(userId, circle);
@@ -253,10 +257,16 @@ export class CircleService {
     });
     if (existing) {
       if (existing.status === 'ACTIVE') {
-        throw new ConflictException('Already a member');
+        throw new ConflictException({
+          message: 'Already a member',
+          errorCode: CircleErrorCode.AlreadyMember,
+        });
       }
       if (existing.status === 'PENDING') {
-        throw new ConflictException('Request already pending');
+        throw new ConflictException({
+          message: 'Request already pending',
+          errorCode: CircleErrorCode.RequestPending,
+        });
       }
     }
 
@@ -276,9 +286,10 @@ export class CircleService {
               currentCircle.maxMembers != null &&
               currentCircle.memberCount >= currentCircle.maxMembers
             ) {
-              throw new BadRequestException(
-                'Circle has reached its member limit',
-              );
+              throw new BadRequestException({
+                message: 'Circle has reached its member limit',
+                errorCode: CircleErrorCode.MemberLimit,
+              });
             }
 
             if (existing) {
