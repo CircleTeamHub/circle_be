@@ -71,4 +71,43 @@ describe('AllExceptionFilter', () => {
       403,
     );
   });
+
+  it('surfaces a stable errorCode from the exception body into the envelope', () => {
+    const { filter, reply } = createFilter();
+    const host = hostFor({
+      method: 'POST',
+      url: '/auth/login',
+      headers: {},
+      query: {},
+    });
+
+    filter.catch(
+      new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: 'AUTH_INVALID_CREDENTIALS',
+      }),
+      host,
+    );
+
+    expect(reply).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        code: 403,
+        message: '邮箱或密码错误',
+        data: null,
+        errorCode: 'AUTH_INVALID_CREDENTIALS',
+      },
+      403,
+    );
+  });
+
+  it('omits errorCode for plain exceptions', () => {
+    const { filter, reply } = createFilter();
+    const host = hostFor({ method: 'GET', url: '/x', headers: {}, query: {} });
+
+    filter.catch(new ForbiddenException('nope'), host);
+
+    const [, body] = reply.mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(body).not.toHaveProperty('errorCode');
+  });
 });

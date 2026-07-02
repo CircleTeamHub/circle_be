@@ -8,6 +8,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
+import { GroupErrorCode } from 'src/common/app-error-codes';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -139,7 +140,10 @@ export class GroupService {
     const normalizedGroupID = this.normalizeGroupID(groupID);
     const normalizedTargetUserID = targetUserID.trim();
     if (!normalizedTargetUserID) {
-      throw new NotFoundException('Group member not found');
+      throw new NotFoundException({
+        message: 'Group member not found',
+        errorCode: GroupErrorCode.MemberNotFound,
+      });
     }
 
     const circle = await this.findCircleByGroupID(normalizedGroupID);
@@ -148,7 +152,10 @@ export class GroupService {
     }
 
     if (normalizedTargetUserID === actorId) {
-      throw new ForbiddenException('Use the group leave endpoint for yourself');
+      throw new ForbiddenException({
+        message: 'Use the group leave endpoint for yourself',
+        errorCode: GroupErrorCode.UseLeaveEndpoint,
+      });
     }
 
     const actor = await this.getCircleMember(circle.id, actorId);
@@ -248,9 +255,10 @@ export class GroupService {
       circle &&
       (circle.ownerID === userId || membership?.role === CircleMemberRole.OWNER)
     ) {
-      throw new ForbiddenException(
-        'Owner cannot leave — transfer ownership first',
-      );
+      throw new ForbiddenException({
+        message: 'Owner cannot leave — transfer ownership first',
+        errorCode: GroupErrorCode.OwnerCannotLeave,
+      });
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -288,11 +296,17 @@ export class GroupService {
   ): Promise<void> {
     const normalizedGroupID = groupID.trim();
     if (!normalizedGroupID) {
-      throw new NotFoundException('Group not found');
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
     }
     const description = dto.description.trim();
     if (!description) {
-      throw new BadRequestException('Report description cannot be empty');
+      throw new BadRequestException({
+        message: 'Report description cannot be empty',
+        errorCode: GroupErrorCode.ReportDescEmpty,
+      });
     }
 
     const circle = await this.prisma.circle.findFirst({
@@ -318,9 +332,10 @@ export class GroupService {
       });
 
       if (membership?.status !== CircleMemberStatus.ACTIVE) {
-        throw new ForbiddenException(
-          'Only active group members can report this group',
-        );
+        throw new ForbiddenException({
+          message: 'Only active group members can report this group',
+          errorCode: GroupErrorCode.ReportNotActive,
+        });
       }
       circleID = circle.id;
     } else {
@@ -337,13 +352,17 @@ export class GroupService {
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        throw new ServiceUnavailableException(
-          'Group membership cannot be verified right now',
-        );
+        throw new ServiceUnavailableException({
+          message: 'Group membership cannot be verified right now',
+          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+        });
       }
 
       if (!isMember) {
-        throw new ForbiddenException('Only verified group members can report');
+        throw new ForbiddenException({
+          message: 'Only verified group members can report',
+          errorCode: GroupErrorCode.ReportNotVerified,
+        });
       }
     }
 
@@ -356,9 +375,11 @@ export class GroupService {
       select: { id: true },
     });
     if (duplicate) {
-      throw new ConflictException(
-        'You have already submitted a report for this category against this group',
-      );
+      throw new ConflictException({
+        message:
+          'You have already submitted a report for this category against this group',
+        errorCode: GroupErrorCode.ReportDuplicate,
+      });
     }
 
     try {
@@ -374,9 +395,11 @@ export class GroupService {
       });
     } catch (error) {
       if (this.prismaErrorCode(error) === 'P2002') {
-        throw new ConflictException(
-          'You have already submitted a report for this category against this group',
-        );
+        throw new ConflictException({
+          message:
+            'You have already submitted a report for this category against this group',
+          errorCode: GroupErrorCode.ReportDuplicate,
+        });
       }
       throw error;
     }
@@ -424,7 +447,10 @@ export class GroupService {
     target: CircleGroupMemberLookup | null,
   ): void {
     if (!actor || actor.status !== CircleMemberStatus.ACTIVE) {
-      throw new ForbiddenException('Only active group managers can do this');
+      throw new ForbiddenException({
+        message: 'Only active group managers can do this',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
     }
 
     if (actor.role === CircleMemberRole.OWNER) {
@@ -438,13 +464,19 @@ export class GroupService {
       return;
     }
 
-    throw new ForbiddenException('Only group managers can do this');
+    throw new ForbiddenException({
+      message: 'Only group managers can do this',
+      errorCode: GroupErrorCode.ManagerOnly,
+    });
   }
 
   private normalizeGroupID(groupID: string): string {
     const normalizedGroupID = groupID.trim();
     if (!normalizedGroupID) {
-      throw new NotFoundException('Group not found');
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
     }
     return normalizedGroupID;
   }
@@ -471,7 +503,10 @@ export class GroupService {
       ),
     );
     if (results.some((allowed) => !allowed)) {
-      throw new ForbiddenException('User does not allow group invites');
+      throw new ForbiddenException({
+        message: 'User does not allow group invites',
+        errorCode: GroupErrorCode.InviteNotAllowed,
+      });
     }
   }
 

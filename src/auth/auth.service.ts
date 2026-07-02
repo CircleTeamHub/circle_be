@@ -17,6 +17,7 @@ import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
 import { generateUniqueAccountId } from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 import {
   ACCOUNT_ID_PATTERN,
   ACCOUNT_ID_RULE_MESSAGE,
@@ -39,7 +40,10 @@ const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
 
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
-    throw new BadRequestException(`${fieldName} 必须为4-6位数字`);
+    throw new BadRequestException({
+      message: `${fieldName} 必须为4-6位数字`,
+      errorCode: AuthErrorCode.SecurityCodeFormat,
+    });
   }
 }
 
@@ -94,12 +98,18 @@ export class AuthService {
       dto.code,
     );
     if (!codeOk) {
-      throw new BadRequestException('验证码错误或已过期');
+      throw new BadRequestException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
-      throw new ConflictException('该邮箱已注册');
+      throw new ConflictException({
+        message: '该邮箱已注册',
+        errorCode: AuthErrorCode.EmailTaken,
+      });
     }
 
     const passwordHash = await argon2.hash(dto.password);
@@ -170,7 +180,10 @@ export class AuthService {
           reason: user ? 'inactive_account' : 'invalid_credentials',
         },
       });
-      throw new ForbiddenException('邮箱或密码错误');
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
@@ -182,7 +195,10 @@ export class AuthService {
         result: 'failure',
         metadata: { reason: 'invalid_credentials' },
       });
-      throw new ForbiddenException('邮箱或密码错误');
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
     }
 
     return this.finishLogin(user, sessionContext, dto.platform);
@@ -197,12 +213,18 @@ export class AuthService {
       dto.code,
     );
     if (!codeOk) {
-      throw new ForbiddenException('验证码错误或已过期');
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user || user.status !== 'ACTIVE') {
-      throw new ForbiddenException('验证码错误或已过期');
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     return this.finishLogin(user, sessionContext, dto.platform);
@@ -289,7 +311,10 @@ export class AuthService {
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     // Banned/deleted users must not be able to keep refreshing tokens just
@@ -300,7 +325,10 @@ export class AuthService {
         `Refresh blocked for non-active user ${user.id} (status=${user.status}); revoking sessions.`,
       );
       await this.refreshTokenService.revokeAll(user.id);
-      throw new ForbiddenException('账号已被禁用');
+      throw new ForbiddenException({
+        message: '账号已被禁用',
+        errorCode: AuthErrorCode.AccountDisabled,
+      });
     }
 
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
@@ -367,7 +395,10 @@ export class AuthService {
       select: { singleDeviceLoginEnabled: true },
     });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
     return { enabled: user.singleDeviceLoginEnabled };
   }
@@ -382,7 +413,10 @@ export class AuthService {
       select: { id: true },
     });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     await this.prisma.user.update({
@@ -408,7 +442,10 @@ export class AuthService {
     ]);
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     // Fire-and-forget lastOnline update so a DB hiccup never blocks the read
@@ -433,12 +470,18 @@ export class AuthService {
   ): Promise<void> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     const valid = await argon2.verify(user.passwordHash, oldPassword);
     if (!valid) {
-      throw new UnauthorizedException('当前密码不正确');
+      throw new UnauthorizedException({
+        message: '当前密码不正确',
+        errorCode: AuthErrorCode.PasswordIncorrect,
+      });
     }
 
     const passwordHash = await argon2.hash(newPassword);
@@ -470,7 +513,10 @@ export class AuthService {
     // 处理，归一到小写后简单的精确查重 / DB 唯一约束即足以保证唯一性。
     const normalized = accountId.trim().toLowerCase();
     if (!ACCOUNT_ID_PATTERN.test(normalized)) {
-      throw new BadRequestException(ACCOUNT_ID_RULE_MESSAGE);
+      throw new BadRequestException({
+        message: ACCOUNT_ID_RULE_MESSAGE,
+        errorCode: AuthErrorCode.AccountIdInvalid,
+      });
     }
 
     const current = await this.prisma.user.findUnique({
@@ -478,10 +524,16 @@ export class AuthService {
       select: { accountId: true },
     });
     if (!current) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
     if (current.accountId === normalized) {
-      throw new BadRequestException('新账号不能和当前账号相同');
+      throw new BadRequestException({
+        message: '新账号不能和当前账号相同',
+        errorCode: AuthErrorCode.AccountIdUnchanged,
+      });
     }
 
     const taken = await this.prisma.user.findUnique({
@@ -489,7 +541,10 @@ export class AuthService {
       select: { id: true },
     });
     if (taken) {
-      throw new ConflictException('该账号已被占用');
+      throw new ConflictException({
+        message: '该账号已被占用',
+        errorCode: AuthErrorCode.AccountIdTaken,
+      });
     }
 
     try {
@@ -503,7 +558,10 @@ export class AuthService {
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
-        throw new ConflictException('该账号已被占用');
+        throw new ConflictException({
+          message: '该账号已被占用',
+          errorCode: AuthErrorCode.AccountIdTaken,
+        });
       }
       throw err;
     }
@@ -529,7 +587,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     return { enabled: Boolean(user.loginSecurityCodeHash) };
@@ -548,12 +609,18 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (user.loginSecurityCodeHash) {
       if (!oldSecurityCode) {
-        throw new UnauthorizedException('当前安全码不正确');
+        throw new UnauthorizedException({
+          message: '当前安全码不正确',
+          errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
       }
       assertValidSecurityCode(oldSecurityCode, 'oldSecurityCode');
       const oldCodeValid = await argon2.verify(
@@ -561,7 +628,10 @@ export class AuthService {
         oldSecurityCode,
       );
       if (!oldCodeValid) {
-        throw new UnauthorizedException('当前安全码不正确');
+        throw new UnauthorizedException({
+          message: '当前安全码不正确',
+          errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
       }
     }
 
@@ -588,7 +658,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (!user.loginSecurityCodeHash) {
@@ -597,7 +670,10 @@ export class AuthService {
 
     const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
     if (!valid) {
-      throw new UnauthorizedException('安全码不正确');
+      throw new UnauthorizedException({
+        message: '安全码不正确',
+        errorCode: AuthErrorCode.SecurityCodeInvalid,
+      });
     }
 
     await this.prisma.user.update({
@@ -626,7 +702,10 @@ export class AuthService {
     });
 
     if (!user) {
-      throw new NotFoundException('用户不存在');
+      throw new NotFoundException({
+        message: '用户不存在',
+        errorCode: AuthErrorCode.UserNotFound,
+      });
     }
 
     if (!user.loginSecurityCodeHash) {
@@ -635,7 +714,10 @@ export class AuthService {
 
     const now = new Date();
     if (user.securityCodeLockedUntil && user.securityCodeLockedUntil > now) {
-      throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+      throw new ForbiddenException({
+        message: '安全码错误次数过多，请稍后再试',
+        errorCode: AuthErrorCode.SecurityCodeLocked,
+      });
     }
 
     const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
@@ -659,7 +741,10 @@ export class AuthService {
         this.logger.warn(
           `Security code locked for user ${userId} after ${MAX_SECURITY_CODE_ATTEMPTS} failed attempts.`,
         );
-        throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+        throw new ForbiddenException({
+          message: '安全码错误次数过多，请稍后再试',
+          errorCode: AuthErrorCode.SecurityCodeLocked,
+        });
       }
       return { ok: false };
     }
