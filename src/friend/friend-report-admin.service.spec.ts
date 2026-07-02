@@ -1,6 +1,7 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreditService } from 'src/credit/credit.service';
+import { NotificationService } from 'src/notification/notification.service';
 import { FriendReportAdminService } from './friend-report-admin.service';
 import { FriendReportAdminController } from './friend-report-admin.controller';
 
@@ -20,6 +21,9 @@ describe('FriendReportAdminService', () => {
     applyDeltaInTransaction: jest.fn(),
     broadcastCreditProfileChanged: jest.fn(),
   };
+  const notificationService = {
+    createSystemNotification: jest.fn(),
+  };
   let service: FriendReportAdminService;
 
   const mkUser = (id: string) => ({
@@ -34,9 +38,11 @@ describe('FriendReportAdminService', () => {
     prisma.$transaction.mockImplementation(
       async (cb: (client: typeof tx) => unknown) => cb(tx),
     );
+    notificationService.createSystemNotification.mockResolvedValue(null);
     service = new FriendReportAdminService(
       prisma as unknown as PrismaService,
       creditService as unknown as CreditService,
+      notificationService as unknown as NotificationService,
     );
   });
 
@@ -92,6 +98,7 @@ describe('FriendReportAdminService', () => {
       .mockResolvedValueOnce({
         id: 'report-1',
         status: 'PENDING',
+        reporterID: 'user-1',
         targetID: 'user-2',
         category: 'harassment',
       })
@@ -140,6 +147,17 @@ describe('FriendReportAdminService', () => {
     expect(creditService.broadcastCreditProfileChanged).toHaveBeenCalledWith(
       'user-2',
     );
+    // Reporter hears the outcome; target is told their score dropped.
+    expect(notificationService.createSystemNotification).toHaveBeenCalledWith(
+      'user-1',
+      'user-1',
+      expect.any(String),
+    );
+    expect(notificationService.createSystemNotification).toHaveBeenCalledWith(
+      'user-2',
+      'user-2',
+      expect.any(String),
+    );
     expect(result.status).toBe('APPROVED');
   });
 
@@ -148,6 +166,7 @@ describe('FriendReportAdminService', () => {
       .mockResolvedValueOnce({
         id: 'report-1',
         status: 'PENDING',
+        reporterID: 'user-1',
         targetID: 'user-2',
         category: 'spam',
       })
@@ -177,6 +196,15 @@ describe('FriendReportAdminService', () => {
     );
     expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
     expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
+    // Reporter is told the outcome; the (un-penalized) target is not notified.
+    expect(notificationService.createSystemNotification).toHaveBeenCalledTimes(
+      1,
+    );
+    expect(notificationService.createSystemNotification).toHaveBeenCalledWith(
+      'user-1',
+      'user-1',
+      expect.any(String),
+    );
     expect(result.status).toBe('REJECTED');
   });
 

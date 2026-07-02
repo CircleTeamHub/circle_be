@@ -7,6 +7,7 @@ import {
 import { FriendReportStatus, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreditService } from 'src/credit/credit.service';
+import { NotificationService } from 'src/notification/notification.service';
 import {
   FriendReportAdminItemDto,
   FriendReportListDto,
@@ -19,6 +20,12 @@ import {
 const FRIEND_REPORT_CREDIT_DEDUCTION = 5;
 
 const DEFAULT_PAGE_SIZE = 50;
+
+// Review-outcome notification copy (system notifications; identities not
+// revealed to the other party).
+const NOTIFY_REPORTER_APPROVED = '你举报的用户已被核实处理，感谢反馈。';
+const NOTIFY_REPORTER_REJECTED = '你提交的举报经核实未通过。';
+const NOTIFY_TARGET_PENALIZED = `你的信誉分因一次被核实的举报下降了 ${FRIEND_REPORT_CREDIT_DEDUCTION} 分。`;
 
 const REPORT_USER_SELECT = {
   id: true,
@@ -44,6 +51,7 @@ export class FriendReportAdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly creditService: CreditService,
+    private readonly notificationService: NotificationService,
   ) {}
 
   async listReports(
@@ -78,7 +86,13 @@ export class FriendReportAdminService {
   ): Promise<FriendReportAdminItemDto> {
     const report = await this.prisma.friendReport.findUnique({
       where: { id: reportId },
-      select: { id: true, status: true, targetID: true, category: true },
+      select: {
+        id: true,
+        status: true,
+        reporterID: true,
+        targetID: true,
+        category: true,
+      },
     });
     if (!report) {
       throw new NotFoundException('Report not found');
@@ -130,11 +144,49 @@ export class FriendReportAdminService {
       await this.creditService.broadcastCreditProfileChanged(report.targetID);
     }
 
+    await this.notifyReviewOutcome(report.reporterID, report.targetID, approve);
+
     this.logger.warn(
       `Friend report ${reportId} ${approve ? 'approved' : 'rejected'} by admin ${adminId}`,
     );
 
     return this.getReportDto(reportId);
+  }
+
+  // Post-commit, best-effort review-outcome notifications. A notification
+  // failure must never fail an already-committed review, so results are
+  // settled and errors only logged. The reporter always hears the outcome; the
+  // target is told only when approved (their score changed).
+  private async notifyReviewOutcome(
+    reporterId: string,
+    targetId: string,
+    approve: boolean,
+  ): Promise<void> {
+    const tasks = [
+      this.notificationService.createSystemNotification(
+        reporterId,
+        reporterId,
+        approve ? NOTIFY_REPORTER_APPROVED : NOTIFY_REPORTER_REJECTED,
+      ),
+    ];
+    if (approve) {
+      tasks.push(
+        this.notificationService.createSystemNotification(
+          targetId,
+          targetId,
+          NOTIFY_TARGET_PENALIZED,
+        ),
+      );
+    }
+
+    const results = await Promise.allSettled(tasks);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        this.logger.warn(
+          `failed to send report-review notification: ${String(result.reason)}`,
+        );
+      }
+    }
   }
 
   private async getReportDto(
