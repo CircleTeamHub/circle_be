@@ -10,6 +10,7 @@ import * as argon2 from 'argon2';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 import { MAILER, Mailer } from './mailer/mailer.interface';
 
 const CODE_TTL_MS = 10 * 60 * 1000; // 10 分钟
@@ -60,7 +61,10 @@ export class EmailVerificationService {
     });
 
     if (purpose === 'REGISTER' && userExists) {
-      throw new ConflictException('该邮箱已注册');
+      throw new ConflictException({
+        message: '该邮箱已注册',
+        errorCode: AuthErrorCode.EmailTaken,
+      });
     }
     if (purpose === 'LOGIN' && !userExists) {
       // 防账号枚举：未注册邮箱静默成功，不创建记录、不发信。

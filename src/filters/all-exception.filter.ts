@@ -109,6 +109,9 @@ export class AllExceptionFilter implements ExceptionFilter {
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
     let code = 'INTERNAL_ERROR';
     let message: string = initialErrorMessage(this.isProduction, exception);
+    // 稳定错误码(如 AUTH_INVALID_CREDENTIALS):由 `throw new X({ message, errorCode })`
+    // 携带,透传给前端做多语言映射。message 仍是人类可读兜底。
+    let errorCode: string | undefined;
 
     if (exception instanceof HttpException) {
       status = exception.getStatus();
@@ -120,6 +123,7 @@ export class AllExceptionFilter implements ExceptionFilter {
         const b = body as Record<string, unknown>;
         message = responseMessage(b, message);
         if (typeof b.code === 'string') code = b.code;
+        if (typeof b.errorCode === 'string') errorCode = b.errorCode;
       }
     }
 
@@ -146,6 +150,7 @@ export class AllExceptionFilter implements ExceptionFilter {
       code: status,
       message,
       data: null,
+      ...(errorCode ? { errorCode } : {}),
     };
 
     httpAdapter.reply(response, responseBody, status);

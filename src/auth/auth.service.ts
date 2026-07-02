@@ -17,6 +17,7 @@ import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
 import { generateUniqueAccountId } from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 import {
   ACCOUNT_ID_PATTERN,
   ACCOUNT_ID_RULE_MESSAGE,
@@ -94,12 +95,18 @@ export class AuthService {
       dto.code,
     );
     if (!codeOk) {
-      throw new BadRequestException('验证码错误或已过期');
+      throw new BadRequestException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
-      throw new ConflictException('该邮箱已注册');
+      throw new ConflictException({
+        message: '该邮箱已注册',
+        errorCode: AuthErrorCode.EmailTaken,
+      });
     }
 
     const passwordHash = await argon2.hash(dto.password);
@@ -170,7 +177,10 @@ export class AuthService {
           reason: user ? 'inactive_account' : 'invalid_credentials',
         },
       });
-      throw new ForbiddenException('邮箱或密码错误');
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
@@ -182,7 +192,10 @@ export class AuthService {
         result: 'failure',
         metadata: { reason: 'invalid_credentials' },
       });
-      throw new ForbiddenException('邮箱或密码错误');
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
     }
 
     return this.finishLogin(user, sessionContext, dto.platform);
@@ -197,12 +210,18 @@ export class AuthService {
       dto.code,
     );
     if (!codeOk) {
-      throw new ForbiddenException('验证码错误或已过期');
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user || user.status !== 'ACTIVE') {
-      throw new ForbiddenException('验证码错误或已过期');
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
     }
 
     return this.finishLogin(user, sessionContext, dto.platform);
@@ -489,7 +508,10 @@ export class AuthService {
       select: { id: true },
     });
     if (taken) {
-      throw new ConflictException('该账号已被占用');
+      throw new ConflictException({
+        message: '该账号已被占用',
+        errorCode: AuthErrorCode.AccountIdTaken,
+      });
     }
 
     try {
@@ -503,7 +525,10 @@ export class AuthService {
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
-        throw new ConflictException('该账号已被占用');
+        throw new ConflictException({
+          message: '该账号已被占用',
+          errorCode: AuthErrorCode.AccountIdTaken,
+        });
       }
       throw err;
     }
@@ -553,7 +578,10 @@ export class AuthService {
 
     if (user.loginSecurityCodeHash) {
       if (!oldSecurityCode) {
-        throw new UnauthorizedException('当前安全码不正确');
+        throw new UnauthorizedException({
+          message: '当前安全码不正确',
+          errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
       }
       assertValidSecurityCode(oldSecurityCode, 'oldSecurityCode');
       const oldCodeValid = await argon2.verify(
@@ -561,7 +589,10 @@ export class AuthService {
         oldSecurityCode,
       );
       if (!oldCodeValid) {
-        throw new UnauthorizedException('当前安全码不正确');
+        throw new UnauthorizedException({
+          message: '当前安全码不正确',
+          errorCode: AuthErrorCode.SecurityCodeInvalid,
+        });
       }
     }
 
@@ -635,7 +666,10 @@ export class AuthService {
 
     const now = new Date();
     if (user.securityCodeLockedUntil && user.securityCodeLockedUntil > now) {
-      throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+      throw new ForbiddenException({
+        message: '安全码错误次数过多，请稍后再试',
+        errorCode: AuthErrorCode.SecurityCodeLocked,
+      });
     }
 
     const valid = await argon2.verify(user.loginSecurityCodeHash, securityCode);
@@ -659,7 +693,10 @@ export class AuthService {
         this.logger.warn(
           `Security code locked for user ${userId} after ${MAX_SECURITY_CODE_ATTEMPTS} failed attempts.`,
         );
-        throw new ForbiddenException('安全码错误次数过多，请稍后再试');
+        throw new ForbiddenException({
+          message: '安全码错误次数过多，请稍后再试',
+          errorCode: AuthErrorCode.SecurityCodeLocked,
+        });
       }
       return { ok: false };
     }
