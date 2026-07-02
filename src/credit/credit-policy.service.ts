@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 export enum CreditPolicyAction {
@@ -11,10 +11,6 @@ export type CreditPolicyDecision = {
   currentScore: number;
   minScore: number;
   message: string | null;
-};
-
-export type CreditPolicyCheckInput = {
-  action: CreditPolicyAction;
 };
 
 const CREDIT_POLICY_MIN_SCORE: Record<CreditPolicyAction, number> = {
@@ -73,21 +69,6 @@ export class CreditPolicyService {
   >();
 
   constructor(private readonly prisma: PrismaService) {}
-
-  async check(
-    userId: string,
-    input: CreditPolicyCheckInput,
-  ): Promise<CreditPolicyDecision> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, creditScore: true },
-    });
-    if (!user) {
-      throw new NotFoundException('User not found');
-    }
-
-    return buildCreditPolicyDecision(input.action, user.creditScore);
-  }
 
   async checkOpenimSend(
     openimUserId: string,

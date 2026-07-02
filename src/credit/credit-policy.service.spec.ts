@@ -1,9 +1,5 @@
-import { NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
-import {
-  CreditPolicyAction,
-  CreditPolicyService,
-} from './credit-policy.service';
+import { CreditPolicyService } from './credit-policy.service';
 
 describe('CreditPolicyService', () => {
   const prisma = {
@@ -17,44 +13,6 @@ describe('CreditPolicyService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     service = new CreditPolicyService(prisma as unknown as PrismaService);
-  });
-
-  it('allows ordinary message sends at 60 credit score', async () => {
-    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', creditScore: 60 });
-
-    await expect(
-      service.check('user-1', { action: CreditPolicyAction.SEND_MESSAGE }),
-    ).resolves.toEqual({
-      allowed: true,
-      code: null,
-      currentScore: 60,
-      minScore: 60,
-      message: null,
-    });
-  });
-
-  it('blocks ordinary message sends below 60 credit score', async () => {
-    prisma.user.findUnique.mockResolvedValue({ id: 'user-1', creditScore: 59 });
-
-    await expect(
-      service.check('user-1', { action: CreditPolicyAction.SEND_MESSAGE }),
-    ).resolves.toEqual({
-      allowed: false,
-      code: 'LOW_CREDIT_SCORE',
-      currentScore: 59,
-      minScore: 60,
-      message: '信誉值低于 60，暂时无法发送消息',
-    });
-  });
-
-  it('throws not found when checking a missing user', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
-
-    await expect(
-      service.check('missing-user', {
-        action: CreditPolicyAction.SEND_MESSAGE,
-      }),
-    ).rejects.toThrow(NotFoundException);
   });
 
   it('checks OpenIM hyphenless user ids against the database UUID', async () => {
