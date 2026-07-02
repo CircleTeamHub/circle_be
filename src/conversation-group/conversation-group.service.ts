@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
+import { ConversationGroupErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   ConversationGroupDto,
@@ -67,7 +68,10 @@ export class ConversationGroupService {
         err.code === 'P2002'
       ) {
         // unique([ownerID, name]) 冲突
-        throw new ConflictException('同名分组已存在');
+        throw new ConflictException({
+          message: '同名分组已存在',
+          errorCode: ConversationGroupErrorCode.NameTaken,
+        });
       }
       throw err;
     }
@@ -98,7 +102,10 @@ export class ConversationGroupService {
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
-        throw new ConflictException('同名分组已存在');
+        throw new ConflictException({
+          message: '同名分组已存在',
+          errorCode: ConversationGroupErrorCode.NameTaken,
+        });
       }
       throw err;
     }

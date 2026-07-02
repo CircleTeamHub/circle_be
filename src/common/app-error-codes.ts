@@ -130,6 +130,53 @@ export const TraceErrorCode = {
   AccessForbidden: 'TRACE_ACCESS_FORBIDDEN',
 } as const;
 
+// 好友:加好友 / 申请处理 / 拉黑 / 举报 / 好友标签。好友数、标签数上限原文含数字,
+// 但信封不透传插值参数,前端用不带数字的固定文案。
+export const FriendErrorCode = {
+  SelfAdd: 'FRIEND_SELF_ADD',
+  UserNotFound: 'FRIEND_USER_NOT_FOUND',
+  BlockedCannotRequest: 'FRIEND_BLOCKED_CANNOT_REQUEST',
+  StrangerMsgNotAllowed: 'FRIEND_STRANGER_MSG_NOT_ALLOWED',
+  AlreadyFriends: 'FRIEND_ALREADY_FRIENDS',
+  RequestAlreadyPending: 'FRIEND_REQUEST_ALREADY_PENDING',
+  PendingRequestNotFound: 'FRIEND_PENDING_REQUEST_NOT_FOUND',
+  RequesterUnavailable: 'FRIEND_REQUESTER_UNAVAILABLE',
+  FriendshipNotFound: 'FRIEND_FRIENDSHIP_NOT_FOUND',
+  ReportSelf: 'FRIEND_REPORT_SELF',
+  ReportDuplicate: 'FRIEND_REPORT_DUPLICATE',
+  BlockSelf: 'FRIEND_BLOCK_SELF',
+  AlreadyBlocked: 'FRIEND_ALREADY_BLOCKED',
+  TagNotFound: 'FRIEND_TAG_NOT_FOUND',
+  TagLimitReached: 'FRIEND_TAG_LIMIT_REACHED',
+  LimitReached: 'FRIEND_LIMIT_REACHED',
+} as const;
+
+// 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。
+// 上限类原文含数字,前端用固定文案。
+export const NoteErrorCode = {
+  GroupExists: 'NOTE_GROUP_EXISTS',
+  GroupLimit: 'NOTE_GROUP_LIMIT',
+  ExportNoMedia: 'NOTE_EXPORT_NO_MEDIA',
+  ExportMediaTooLarge: 'NOTE_EXPORT_MEDIA_TOO_LARGE',
+  ExportTotalTooLarge: 'NOTE_EXPORT_TOTAL_TOO_LARGE',
+  ExportTooManyMedia: 'NOTE_EXPORT_TOO_MANY_MEDIA',
+} as const;
+
+// 实时通话:仅少数会在通话 UI 弹给用户的错误(已结束/已过期/占线/非群成员/人数超限)。
+// 其余信令竞态、LiveKit 基建错误走通用兜底。原 message 本就是 CALL_* 机器串,保留。
+export const CallErrorCode = {
+  Ended: 'CALL_ENDED',
+  Expired: 'CALL_EXPIRED',
+  Busy: 'CALL_BUSY',
+  NotGroupMember: 'CALL_NOT_GROUP_MEMBER',
+  ParticipantLimit: 'CALL_PARTICIPANT_LIMIT',
+} as const;
+
+// 会话分组(本地消息分组):同名分组已存在。
+export const ConversationGroupErrorCode = {
+  NameTaken: 'CONVGROUP_NAME_TAKEN',
+} as const;
+
 export type AppErrorCode =
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
@@ -139,7 +186,11 @@ export type AppErrorCode =
   | (typeof CircleInvitationErrorCode)[keyof typeof CircleInvitationErrorCode]
   | (typeof TempChatErrorCode)[keyof typeof TempChatErrorCode]
   | (typeof PlazaErrorCode)[keyof typeof PlazaErrorCode]
-  | (typeof TraceErrorCode)[keyof typeof TraceErrorCode];
+  | (typeof TraceErrorCode)[keyof typeof TraceErrorCode]
+  | (typeof FriendErrorCode)[keyof typeof FriendErrorCode]
+  | (typeof NoteErrorCode)[keyof typeof NoteErrorCode]
+  | (typeof CallErrorCode)[keyof typeof CallErrorCode]
+  | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
   AuthErrorCode,
@@ -151,6 +202,10 @@ export const APP_ERROR_CODE_GROUPS = [
   TempChatErrorCode,
   PlazaErrorCode,
   TraceErrorCode,
+  FriendErrorCode,
+  NoteErrorCode,
+  CallErrorCode,
+  ConversationGroupErrorCode,
 ] as const;
 
 export const APP_ERROR_CODES = APP_ERROR_CODE_GROUPS.flatMap((group) =>

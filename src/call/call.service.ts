@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
+import { CallErrorCode } from 'src/common/app-error-codes';
 import {
   CallEndReason,
   CallParticipantStatus,
@@ -218,7 +219,10 @@ export class CallService {
         call.status !== CallStatus.RINGING &&
         call.status !== CallStatus.ACTIVE
       ) {
-        throw new ConflictException('CALL_ENDED');
+        throw new ConflictException({
+          message: 'CALL_ENDED',
+          errorCode: CallErrorCode.Ended,
+        });
       }
       const token = await this.mintToken(call, participant.user);
       return {
@@ -236,11 +240,17 @@ export class CallService {
       call.status !== CallStatus.RINGING &&
       call.status !== CallStatus.ACTIVE
     ) {
-      throw new ConflictException('CALL_ENDED');
+      throw new ConflictException({
+        message: 'CALL_ENDED',
+        errorCode: CallErrorCode.Ended,
+      });
     }
     if (call.expiresAt && call.expiresAt.getTime() < Date.now()) {
       await this.expireRingingCallAsMissed(call, new Date());
-      throw new ConflictException('CALL_EXPIRED');
+      throw new ConflictException({
+        message: 'CALL_EXPIRED',
+        errorCode: CallErrorCode.Expired,
+      });
     }
 
     const joinedAt = new Date();
@@ -449,7 +459,10 @@ export class CallService {
       call.status !== CallStatus.RINGING &&
       call.status !== CallStatus.ACTIVE
     ) {
-      throw new ConflictException('CALL_ENDED');
+      throw new ConflictException({
+        message: 'CALL_ENDED',
+        errorCode: CallErrorCode.Ended,
+      });
     }
     if (
       call.status === CallStatus.RINGING &&
@@ -457,7 +470,10 @@ export class CallService {
       call.expiresAt.getTime() < Date.now()
     ) {
       await this.expireRingingCallAsMissed(call, new Date());
-      throw new ConflictException('CALL_EXPIRED');
+      throw new ConflictException({
+        message: 'CALL_EXPIRED',
+        errorCode: CallErrorCode.Expired,
+      });
     }
     if (participant.status !== CallParticipantStatus.JOINED) {
       throw new ConflictException('CALL_NOT_ACCEPTED');
@@ -556,7 +572,10 @@ export class CallService {
           .map((member) => member.userID),
       );
       if (!active.has(initiatorID)) {
-        throw new ForbiddenException('CALL_NOT_GROUP_MEMBER');
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
       }
       if (!participantIDs.every((userID) => active.has(userID))) {
         throw new BadRequestException('CALL_INVITEE_INVALID');
@@ -572,7 +591,10 @@ export class CallService {
         ),
       );
       if (!checks[0]) {
-        throw new ForbiddenException('CALL_NOT_GROUP_MEMBER');
+        throw new ForbiddenException({
+          message: 'CALL_NOT_GROUP_MEMBER',
+          errorCode: CallErrorCode.NotGroupMember,
+        });
       }
       if (checks.some((isMember) => !isMember)) {
         throw new BadRequestException('CALL_INVITEE_INVALID');
@@ -603,7 +625,10 @@ export class CallService {
       select: { id: true },
     });
     if (busy) {
-      throw new ConflictException('CALL_BUSY');
+      throw new ConflictException({
+        message: 'CALL_BUSY',
+        errorCode: CallErrorCode.Busy,
+      });
     }
   }
 
@@ -922,7 +947,10 @@ export class CallService {
 
   private assertParticipantLimit(totalParticipants: number): void {
     if (totalParticipants > this.maxParticipants()) {
-      throw new BadRequestException('CALL_PARTICIPANT_LIMIT');
+      throw new BadRequestException({
+        message: 'CALL_PARTICIPANT_LIMIT',
+        errorCode: CallErrorCode.ParticipantLimit,
+      });
     }
   }
 

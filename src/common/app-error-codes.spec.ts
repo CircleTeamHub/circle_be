@@ -1,11 +1,15 @@
 import {
   APP_ERROR_CODES,
   AuthErrorCode,
+  CallErrorCode,
   CircleErrorCode,
   CircleInvitationErrorCode,
   CoinErrorCode,
+  ConversationGroupErrorCode,
+  FriendErrorCode,
   GroupErrorCode,
   MembershipErrorCode,
+  NoteErrorCode,
   PlazaErrorCode,
   TempChatErrorCode,
   TraceErrorCode,
@@ -29,6 +33,10 @@ describe('app error code catalog', () => {
     TempChatErrorCode,
     PlazaErrorCode,
     TraceErrorCode,
+    FriendErrorCode,
+    NoteErrorCode,
+    CallErrorCode,
+    ConversationGroupErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>
