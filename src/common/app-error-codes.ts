@@ -101,6 +101,35 @@ export const TempChatErrorCode = {
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
 } as const;
 
+// 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
+// 圈子不存在复用 CircleErrorCode.NotFound。图片必须来自本站存储是内部安全护栏,不打码。
+export const PlazaErrorCode = {
+  NotActiveMember: 'PLAZA_NOT_ACTIVE_MEMBER',
+  AdminOnlyPost: 'PLAZA_ADMIN_ONLY_POST',
+  NoteInvalid: 'PLAZA_NOTE_INVALID',
+  PostNotFound: 'PLAZA_POST_NOT_FOUND',
+  DeleteAuthorOnly: 'PLAZA_DELETE_AUTHOR_ONLY',
+  SignupSelf: 'PLAZA_SIGNUP_SELF',
+  SignupIneligible: 'PLAZA_SIGNUP_INELIGIBLE',
+  RecognizeMinOne: 'PLAZA_RECOGNIZE_MIN_ONE',
+  RecognizeMaxThree: 'PLAZA_RECOGNIZE_MAX_THREE',
+  RecognizeSelf: 'PLAZA_RECOGNIZE_SELF',
+  RecognizeMinSignups: 'PLAZA_RECOGNIZE_MIN_SIGNUPS',
+  RecognizeNotSigned: 'PLAZA_RECOGNIZE_NOT_SIGNED',
+  RecognizeNotMember: 'PLAZA_RECOGNIZE_NOT_MEMBER',
+  RecognizeBlocked: 'PLAZA_RECOGNIZE_BLOCKED',
+  RecognizeAlready: 'PLAZA_RECOGNIZE_ALREADY',
+} as const;
+
+// 朋友圈动态(moments):动态/评论不存在、仅作者可删、无权访问(隐私/好友可见)。
+export const TraceErrorCode = {
+  MomentNotFound: 'TRACE_MOMENT_NOT_FOUND',
+  DeleteAuthorOnly: 'TRACE_DELETE_AUTHOR_ONLY',
+  ReplyTargetNotFound: 'TRACE_REPLY_TARGET_NOT_FOUND',
+  CommentNotFound: 'TRACE_COMMENT_NOT_FOUND',
+  AccessForbidden: 'TRACE_ACCESS_FORBIDDEN',
+} as const;
+
 export type AppErrorCode =
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
@@ -108,7 +137,9 @@ export type AppErrorCode =
   | (typeof CircleErrorCode)[keyof typeof CircleErrorCode]
   | (typeof GroupErrorCode)[keyof typeof GroupErrorCode]
   | (typeof CircleInvitationErrorCode)[keyof typeof CircleInvitationErrorCode]
-  | (typeof TempChatErrorCode)[keyof typeof TempChatErrorCode];
+  | (typeof TempChatErrorCode)[keyof typeof TempChatErrorCode]
+  | (typeof PlazaErrorCode)[keyof typeof PlazaErrorCode]
+  | (typeof TraceErrorCode)[keyof typeof TraceErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
   AuthErrorCode,
@@ -118,6 +149,8 @@ export const APP_ERROR_CODE_GROUPS = [
   GroupErrorCode,
   CircleInvitationErrorCode,
   TempChatErrorCode,
+  PlazaErrorCode,
+  TraceErrorCode,
 ] as const;
 
 export const APP_ERROR_CODES = APP_ERROR_CODE_GROUPS.flatMap((group) =>

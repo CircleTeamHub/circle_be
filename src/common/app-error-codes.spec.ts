@@ -6,7 +6,9 @@ import {
   CoinErrorCode,
   GroupErrorCode,
   MembershipErrorCode,
+  PlazaErrorCode,
   TempChatErrorCode,
+  TraceErrorCode,
 } from './app-error-codes';
 
 // These codes are a stable contract shared with the frontend i18n map
@@ -25,6 +27,8 @@ describe('app error code catalog', () => {
     GroupErrorCode,
     CircleInvitationErrorCode,
     TempChatErrorCode,
+    PlazaErrorCode,
+    TraceErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>
