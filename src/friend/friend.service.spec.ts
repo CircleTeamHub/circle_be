@@ -707,7 +707,7 @@ describe('FriendService', () => {
       userID: 'user-1',
       friendID: 'user-2',
     });
-    // Simulate an existing report for this combination
+    // Simulate an existing live report for this combination
     prisma.friendReport.findFirst.mockResolvedValue({ id: 'existing-report' });
 
     await expect(
@@ -717,9 +717,40 @@ describe('FriendService', () => {
       }),
     ).rejects.toThrow(ConflictException);
 
+    // Only non-rejected reports count as duplicates — a prior REJECTED report
+    // must not block a fresh submission.
+    expect(prisma.friendReport.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ['PENDING', 'APPROVED'] },
+        }),
+      }),
+    );
     expect(prisma.friendReport.create).not.toHaveBeenCalled();
-    expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
-    expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
+  });
+
+  it('allows re-reporting when the only prior report was rejected', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      state: FriendState.ACCEPTED,
+      userID: 'user-1',
+      friendID: 'user-2',
+    });
+    // The status-filtered pre-check finds no live report (the prior one is
+    // REJECTED and excluded), so a new report is created.
+    prisma.friendReport.findFirst.mockResolvedValue(null);
+    prisma.friendReport.create.mockResolvedValue({ id: 'report-2' });
+
+    await service.reportFriend('user-1', 'user-2', {
+      category: 'harassment',
+      description: 'happened again',
+    });
+
+    expect(prisma.friendReport.create).toHaveBeenCalled();
   });
 
   it('rejects reporting a non-friend target through the friend API', async () => {

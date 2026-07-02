@@ -368,7 +368,11 @@ model FriendReport {
   target     User  @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
   reviewedBy User? @relation("friendReportReviewer", fields: [reviewedByID], references: [id], onDelete: SetNull)
 
-  @@unique([reporterID, targetID, category])
+  // Uniqueness is enforced by a partial index (see migration
+  // add_friend_report_reportable_after_rejection): at most one non-REJECTED
+  // report per (reporter, target, category), so a rejected report frees the
+  // slot for a fresh one. Prisma can't express a partial @@unique, so it lives
+  // in raw SQL and is intentionally absent here.
   @@index([reporterID, createdAt])
   @@index([targetID, createdAt])
   @@index([status, createdAt])
