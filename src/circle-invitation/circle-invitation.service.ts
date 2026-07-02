@@ -7,6 +7,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
+import {
+  CircleErrorCode,
+  CircleInvitationErrorCode,
+} from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -67,9 +71,10 @@ export class CircleInvitationService {
       where: { userID_circleID: { userID: inviterId, circleID: circleId } },
     });
     if (!inviterMembership || inviterMembership.status !== 'ACTIVE') {
-      throw new ForbiddenException(
-        'You must be an active member to invite others',
-      );
+      throw new ForbiddenException({
+        message: 'You must be an active member to invite others',
+        errorCode: CircleInvitationErrorCode.InviterNotMember,
+      });
     }
 
     // 2. Verify applicant is NOT already a member
@@ -77,16 +82,27 @@ export class CircleInvitationService {
       where: { userID_circleID: { userID: applicantId, circleID: circleId } },
     });
     if (applicantMembership?.status === 'ACTIVE') {
-      throw new ConflictException('User is already a member of this circle');
+      throw new ConflictException({
+        message: 'User is already a member of this circle',
+        errorCode: CircleErrorCode.AlreadyMember,
+      });
     }
 
     // 4. Verify circle capacity
     const circle = await this.prisma.circle.findFirst({
       where: { id: circleId, deleted: false },
     });
-    if (!circle) throw new NotFoundException('Circle not found');
+    if (!circle) {
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
+    }
     if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
-      throw new BadRequestException('Circle has reached its member limit');
+      throw new BadRequestException({
+        message: 'Circle has reached its member limit',
+        errorCode: CircleErrorCode.MemberLimit,
+      });
     }
 
     // 5. Verify applicant meets join restrictions
@@ -94,26 +110,36 @@ export class CircleInvitationService {
       where: { id: applicantId },
       select: { vipLevel: true, creditScore: true, fancyNumber: true },
     });
-    if (!applicant) throw new NotFoundException('User not found');
+    if (!applicant) {
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: CircleErrorCode.UserNotFound,
+      });
+    }
 
     if (
       circle.joinVipRestriction != null &&
       applicant.vipLevel < circle.joinVipRestriction
     ) {
-      throw new ForbiddenException(
-        `Applicant needs VIP ${circle.joinVipRestriction}+ to join`,
-      );
+      throw new ForbiddenException({
+        message: `Applicant needs VIP ${circle.joinVipRestriction}+ to join`,
+        errorCode: CircleErrorCode.JoinVipRequired,
+      });
     }
     if (
       circle.joinCreditRestriction != null &&
       applicant.creditScore < circle.joinCreditRestriction
     ) {
-      throw new ForbiddenException(
-        `Applicant needs credit score ${circle.joinCreditRestriction}+ to join`,
-      );
+      throw new ForbiddenException({
+        message: `Applicant needs credit score ${circle.joinCreditRestriction}+ to join`,
+        errorCode: CircleErrorCode.JoinCreditRequired,
+      });
     }
     if (circle.joinFancyRestriction && !applicant.fancyNumber) {
-      throw new ForbiddenException('Applicant needs a fancy number to join');
+      throw new ForbiddenException({
+        message: 'Applicant needs a fancy number to join',
+        errorCode: CircleErrorCode.JoinFancyNumberRequired,
+      });
     }
 
     // Pass real friendship status: a FRIENDS_ONLY invite permission must let
@@ -126,7 +152,10 @@ export class CircleInvitationService {
         inviterIsFriend,
       );
     if (!canInviteApplicant) {
-      throw new ForbiddenException('User does not allow circle invites');
+      throw new ForbiddenException({
+        message: 'User does not allow circle invites',
+        errorCode: CircleInvitationErrorCode.NotAllowed,
+      });
     }
 
     // 6. Create invitation + auto-approve inviter as first verifier
@@ -145,9 +174,10 @@ export class CircleInvitationService {
         },
       });
       if (existingInvitation) {
-        throw new ConflictException(
-          'There is already a pending invitation for this user',
-        );
+        throw new ConflictException({
+          message: 'There is already a pending invitation for this user',
+          errorCode: CircleInvitationErrorCode.AlreadyPending,
+        });
       }
 
       const created = await tx.circleInvitation.create({
@@ -190,14 +220,25 @@ export class CircleInvitationService {
         where: { id: invitationId },
         include: { verifiers: true },
       });
-      if (!invitation) throw new NotFoundException('Invitation not found');
+      if (!invitation) {
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
+      }
 
       // Only the applicant can add verifiers
       if (invitation.applicantID !== callerId) {
-        throw new ForbiddenException('Only the applicant can add verifiers');
+        throw new ForbiddenException({
+          message: 'Only the applicant can add verifiers',
+          errorCode: CircleInvitationErrorCode.ApplicantOnly,
+        });
       }
       if (invitation.status !== 'PENDING') {
-        throw new BadRequestException('Invitation is no longer pending');
+        throw new BadRequestException({
+          message: 'Invitation is no longer pending',
+          errorCode: CircleInvitationErrorCode.NotPending,
+        });
       }
 
       // Verify the verifier is an active circle member
@@ -210,23 +251,30 @@ export class CircleInvitationService {
         },
       });
       if (!membership || membership.status !== 'ACTIVE') {
-        throw new BadRequestException(
-          '验证人必须是本圈子的活跃成员，请更换验证人再尝试',
-        );
+        throw new BadRequestException({
+          message: '验证人必须是本圈子的活跃成员，请更换验证人再尝试',
+          errorCode: CircleInvitationErrorCode.VerifierNotMember,
+        });
       }
 
       const existingVerifier = invitation.verifiers.find(
         (verifier) => verifier.verifierID === verifierId,
       );
       if (existingVerifier) {
-        throw new ConflictException('This user is already a verifier');
+        throw new ConflictException({
+          message: 'This user is already a verifier',
+          errorCode: CircleInvitationErrorCode.AlreadyVerifier,
+        });
       }
 
       const activeSlots = invitation.verifiers.filter(
         (verifier) => verifier.status !== 'REJECTED',
       ).length;
       if (activeSlots >= invitation.requiredCount) {
-        throw new BadRequestException('All verification slots are filled');
+        throw new BadRequestException({
+          message: 'All verification slots are filled',
+          errorCode: CircleInvitationErrorCode.SlotsFilled,
+        });
       }
 
       await tx.circleInvitationVerifier.create({
@@ -264,7 +312,10 @@ export class CircleInvitationService {
         },
       });
       if (!verifierRecord) {
-        throw new NotFoundException('No pending verification found for you');
+        throw new NotFoundException({
+          message: 'No pending verification found for you',
+          errorCode: CircleInvitationErrorCode.NoPendingVerification,
+        });
       }
 
       const invitation = await tx.circleInvitation.findUnique({
@@ -272,7 +323,10 @@ export class CircleInvitationService {
         include: { circle: true },
       });
       if (!invitation || invitation.status !== 'PENDING') {
-        throw new BadRequestException('Invitation is no longer pending');
+        throw new BadRequestException({
+          message: 'Invitation is no longer pending',
+          errorCode: CircleInvitationErrorCode.NotPending,
+        });
       }
 
       await tx.circleInvitationVerifier.update({
@@ -301,7 +355,10 @@ export class CircleInvitationService {
         data: { approvedCount: { increment: 1 } },
       });
       if (updatedRows.count === 0) {
-        throw new BadRequestException('Invitation is no longer pending');
+        throw new BadRequestException({
+          message: 'Invitation is no longer pending',
+          errorCode: CircleInvitationErrorCode.NotPending,
+        });
       }
 
       const updatedInvitation = await tx.circleInvitation.findUnique({
@@ -309,7 +366,10 @@ export class CircleInvitationService {
         include: { circle: true },
       });
       if (!updatedInvitation) {
-        throw new NotFoundException('Invitation not found');
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
       }
 
       if (updatedInvitation.approvedCount < updatedInvitation.requiredCount) {
@@ -379,7 +439,12 @@ export class CircleInvitationService {
       where: { id: invitationId },
       select: { circleID: true },
     });
-    if (!invitation) throw new NotFoundException('Invitation not found');
+    if (!invitation) {
+      throw new NotFoundException({
+        message: 'Invitation not found',
+        errorCode: CircleInvitationErrorCode.NotFound,
+      });
+    }
 
     // Verify caller is OWNER or ADMIN
     const membership = await this.prisma.circleMember.findUnique({
@@ -392,7 +457,10 @@ export class CircleInvitationService {
       membership.status !== 'ACTIVE' ||
       (membership.role !== 'OWNER' && membership.role !== 'ADMIN')
     ) {
-      throw new ForbiddenException('Only circle owner or admin can override');
+      throw new ForbiddenException({
+        message: 'Only circle owner or admin can override',
+        errorCode: CircleInvitationErrorCode.OwnerAdminOnly,
+      });
     }
 
     const result = await this.runInvitationTransaction(async (tx) => {
@@ -401,10 +469,16 @@ export class CircleInvitationService {
         include: { circle: true },
       });
       if (!pendingInvitation) {
-        throw new NotFoundException('Invitation not found');
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
       }
       if (pendingInvitation.status !== 'PENDING') {
-        throw new BadRequestException('Invitation is no longer pending');
+        throw new BadRequestException({
+          message: 'Invitation is no longer pending',
+          errorCode: CircleInvitationErrorCode.NotPending,
+        });
       }
 
       const finalized = await tx.circleInvitation.updateMany({
@@ -517,7 +591,10 @@ export class CircleInvitationService {
       membership.status !== 'ACTIVE' ||
       (membership.role !== 'OWNER' && membership.role !== 'ADMIN')
     ) {
-      throw new ForbiddenException('Only circle owner or admin can view');
+      throw new ForbiddenException({
+        message: 'Only circle owner or admin can view',
+        errorCode: CircleInvitationErrorCode.OwnerAdminOnly,
+      });
     }
 
     const invitations = await this.prisma.circleInvitation.findMany({
@@ -534,7 +611,12 @@ export class CircleInvitationService {
       where: { id: invitationId },
       include: INVITATION_INCLUDE,
     });
-    if (!inv) throw new NotFoundException('Invitation not found');
+    if (!inv) {
+      throw new NotFoundException({
+        message: 'Invitation not found',
+        errorCode: CircleInvitationErrorCode.NotFound,
+      });
+    }
     return inv;
   }
 
@@ -592,7 +674,10 @@ export class CircleInvitationService {
       select: { maxMembers: true, memberCount: true },
     });
     if (!circle) {
-      throw new NotFoundException('Circle not found');
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
     }
 
     const needsSeat = !existing || existing.status !== 'ACTIVE';
@@ -601,7 +686,10 @@ export class CircleInvitationService {
       circle.maxMembers != null &&
       circle.memberCount >= circle.maxMembers
     ) {
-      throw new BadRequestException('Circle has reached its member limit');
+      throw new BadRequestException({
+        message: 'Circle has reached its member limit',
+        errorCode: CircleErrorCode.MemberLimit,
+      });
     }
 
     if (existing) {
@@ -657,7 +745,10 @@ export class CircleInvitationService {
       return;
     }
 
-    throw new ForbiddenException('You are not allowed to view this invitation');
+    throw new ForbiddenException({
+      message: 'You are not allowed to view this invitation',
+      errorCode: CircleInvitationErrorCode.ViewForbidden,
+    });
   }
 
   private async syncApplicantToGroup(

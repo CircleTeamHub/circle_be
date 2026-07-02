@@ -9,6 +9,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
 import { TempChatStatus } from 'src/generated/prisma';
+import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { LinkTokenService } from './link-token.service';
@@ -106,7 +107,10 @@ export class TempChatService {
       room.status !== 'ACTIVE' ||
       room.expiresAt.getTime() <= Date.now()
     ) {
-      throw new GoneException('临时聊天已结束');
+      throw new GoneException({
+        message: '临时聊天已结束',
+        errorCode: TempChatErrorCode.Ended,
+      });
     }
     const memberCount = await this.prisma.tempChatGuest.count({
       where: { tempChatId: tcId },
@@ -189,13 +193,19 @@ export class TempChatService {
           room.status !== 'ACTIVE' ||
           room.expiresAt.getTime() <= Date.now()
         ) {
-          throw new GoneException('临时聊天已结束');
+          throw new GoneException({
+            message: '临时聊天已结束',
+            errorCode: TempChatErrorCode.Ended,
+          });
         }
         const count = await tx.tempChatGuest.count({
           where: { tempChatId: tcId },
         });
         if (count >= room.maxMembers) {
-          throw new ConflictException('人数已满');
+          throw new ConflictException({
+            message: '人数已满',
+            errorCode: TempChatErrorCode.Full,
+          });
         }
         const guest = await tx.tempChatGuest.create({
           data: { tempChatId: tcId, imUserId: guestImId, displayName },
@@ -240,7 +250,10 @@ export class TempChatService {
       where: { id },
     });
     if (room.hostUserId !== hostUserId) {
-      throw new ForbiddenException('只有创建者可以结束');
+      throw new ForbiddenException({
+        message: '只有创建者可以结束',
+        errorCode: TempChatErrorCode.CreatorOnly,
+      });
     }
     if (room.status !== 'ACTIVE') {
       return { status: room.status };

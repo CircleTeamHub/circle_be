@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { FriendErrorCode } from 'src/common/app-error-codes';
 import {
   FriendReportStatus,
   FriendState,
@@ -99,7 +100,10 @@ export class FriendService {
     tagIds?: string[],
   ): Promise<void> {
     if (senderId === targetId) {
-      throw new BadRequestException('You cannot add yourself as a friend');
+      throw new BadRequestException({
+        message: 'You cannot add yourself as a friend',
+        errorCode: FriendErrorCode.SelfAdd,
+      });
     }
 
     // Make sure the target user exists and is active
@@ -108,7 +112,10 @@ export class FriendService {
       select: { id: true, status: true, role: true },
     });
     if (!target || target.status !== 'ACTIVE') {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: FriendErrorCode.UserNotFound,
+      });
     }
 
     // Block check in both directions
@@ -121,15 +128,19 @@ export class FriendService {
       },
     });
     if (block) {
-      throw new ForbiddenException('Cannot send a friend request to this user');
+      throw new ForbiddenException({
+        message: 'Cannot send a friend request to this user',
+        errorCode: FriendErrorCode.BlockedCannotRequest,
+      });
     }
 
     const canReceiveStrangerMessage =
       await this.privacySettings.canReceiveStrangerMessage(targetId, false);
     if (!canReceiveStrangerMessage) {
-      throw new ForbiddenException(
-        'This user does not allow stranger messages',
-      );
+      throw new ForbiddenException({
+        message: 'This user does not allow stranger messages',
+        errorCode: FriendErrorCode.StrangerMsgNotAllowed,
+      });
     }
 
     // Enforce friend limit for the sender
@@ -146,7 +157,10 @@ export class FriendService {
       });
 
       if (ownedTags.length !== normalizedTagIds.length) {
-        throw new NotFoundException('Tag not found');
+        throw new NotFoundException({
+          message: 'Tag not found',
+          errorCode: FriendErrorCode.TagNotFound,
+        });
       }
     }
 
@@ -181,11 +195,16 @@ export class FriendService {
           },
         });
         if (existing) {
-          throw new ConflictException(
-            existing.state === FriendState.ACCEPTED
-              ? 'Already friends'
-              : 'Friend request already pending',
-          );
+          if (existing.state === FriendState.ACCEPTED) {
+            throw new ConflictException({
+              message: 'Already friends',
+              errorCode: FriendErrorCode.AlreadyFriends,
+            });
+          }
+          throw new ConflictException({
+            message: 'Friend request already pending',
+            errorCode: FriendErrorCode.RequestAlreadyPending,
+          });
         }
 
         const nextRequestRecord = await tx.friend.create({
@@ -258,7 +277,10 @@ export class FriendService {
       record.userID !== senderId ||
       record.state !== FriendState.PENDING
     ) {
-      throw new NotFoundException('Pending request not found');
+      throw new NotFoundException({
+        message: 'Pending request not found',
+        errorCode: FriendErrorCode.PendingRequestNotFound,
+      });
     }
     await this.prisma.$transaction(async (tx: any) => {
       const updated = await tx.friend.update({
@@ -310,7 +332,10 @@ export class FriendService {
       record.friendID !== recipientId ||
       record.state !== FriendState.PENDING
     ) {
-      throw new NotFoundException('Pending request not found');
+      throw new NotFoundException({
+        message: 'Pending request not found',
+        errorCode: FriendErrorCode.PendingRequestNotFound,
+      });
     }
 
     if (decision === FriendState.ACCEPTED) {
@@ -322,7 +347,10 @@ export class FriendService {
         select: { status: true },
       });
       if (!sender || sender.status !== 'ACTIVE') {
-        throw new NotFoundException('The requester is no longer available');
+        throw new NotFoundException({
+          message: 'The requester is no longer available',
+          errorCode: FriendErrorCode.RequesterUnavailable,
+        });
       }
 
       // Enforce friend limit for the recipient too
@@ -455,7 +483,10 @@ export class FriendService {
       },
     });
     if (!record) {
-      throw new NotFoundException('Friendship not found');
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
     }
     await this.prisma.$transaction(async (tx: any) => {
       await tx.friend.delete({ where: { id: record.id } });
@@ -483,7 +514,10 @@ export class FriendService {
     dto: ReportFriendDto,
   ): Promise<void> {
     if (reporterId === friendUserId) {
-      throw new BadRequestException('Cannot report yourself');
+      throw new BadRequestException({
+        message: 'Cannot report yourself',
+        errorCode: FriendErrorCode.ReportSelf,
+      });
     }
 
     const target = await this.prisma.user.findUnique({
@@ -491,7 +525,10 @@ export class FriendService {
       select: { id: true, status: true },
     });
     if (!target || target.status !== 'ACTIVE') {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: FriendErrorCode.UserNotFound,
+      });
     }
 
     const friendship = await this.prisma.friend.findFirst({
@@ -505,7 +542,10 @@ export class FriendService {
       select: { id: true },
     });
     if (!friendship) {
-      throw new NotFoundException('Friendship not found');
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
     }
 
     // Prevent duplicate live reports for the same reporter / target / category.
@@ -526,9 +566,11 @@ export class FriendService {
       select: { id: true },
     });
     if (duplicate) {
-      throw new ConflictException(
-        'You have already submitted a report for this category against this user',
-      );
+      throw new ConflictException({
+        message:
+          'You have already submitted a report for this category against this user',
+        errorCode: FriendErrorCode.ReportDuplicate,
+      });
     }
 
     // Reports no longer deduct credit on submission — they are queued as
@@ -547,9 +589,11 @@ export class FriendService {
       });
     } catch (error) {
       if (this.prismaErrorCode(error) === 'P2002') {
-        throw new ConflictException(
-          'You have already submitted a report for this category against this user',
-        );
+        throw new ConflictException({
+          message:
+            'You have already submitted a report for this category against this user',
+          errorCode: FriendErrorCode.ReportDuplicate,
+        });
       }
       throw error;
     }
@@ -604,7 +648,10 @@ export class FriendService {
     });
 
     if (!friendship) {
-      throw new NotFoundException('Friendship not found');
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
     }
 
     const [availableTags, assignedLinks] = await Promise.all([
@@ -716,7 +763,10 @@ export class FriendService {
     });
 
     if (!activity) {
-      throw new NotFoundException('Friend activity not found');
+      throw new NotFoundException({
+        message: 'Friend activity not found',
+        errorCode: FriendErrorCode.ActivityNotFound,
+      });
     }
 
     return this.toFriendActivityDto(activity);
@@ -734,7 +784,10 @@ export class FriendService {
       });
 
       if (!activity) {
-        throw new NotFoundException('Friend activity not found');
+        throw new NotFoundException({
+          message: 'Friend activity not found',
+          errorCode: FriendErrorCode.ActivityNotFound,
+        });
       }
     }
 
@@ -784,7 +837,10 @@ export class FriendService {
 
   async blockUser(blockerId: string, targetId: string): Promise<void> {
     if (blockerId === targetId) {
-      throw new BadRequestException('Cannot block yourself');
+      throw new BadRequestException({
+        message: 'Cannot block yourself',
+        errorCode: FriendErrorCode.BlockSelf,
+      });
     }
 
     const target = await this.prisma.user.findUnique({
@@ -792,7 +848,10 @@ export class FriendService {
       select: { id: true, status: true },
     });
     if (!target || target.status !== 'ACTIVE') {
-      throw new NotFoundException('User not found');
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: FriendErrorCode.UserNotFound,
+      });
     }
 
     const already = await this.prisma.block.findUnique({
@@ -800,7 +859,11 @@ export class FriendService {
         blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
       },
     });
-    if (already) throw new ConflictException('User already blocked');
+    if (already)
+      throw new ConflictException({
+        message: 'User already blocked',
+        errorCode: FriendErrorCode.AlreadyBlocked,
+      });
 
     // Remove friendship if exists (any state) in a transaction.
     // The pre-check above is a fast path; the catch handles the race where a
@@ -842,7 +905,10 @@ export class FriendService {
       });
     } catch (error) {
       if (this.isPrismaUniqueConstraintError(error)) {
-        throw new ConflictException('User already blocked');
+        throw new ConflictException({
+          message: 'User already blocked',
+          errorCode: FriendErrorCode.AlreadyBlocked,
+        });
       }
       throw error;
     }
@@ -881,7 +947,10 @@ export class FriendService {
     } catch (error) {
       // P2025 = record to delete does not exist.
       if (this.prismaErrorCode(error) === 'P2025') {
-        throw new NotFoundException('Block not found');
+        throw new NotFoundException({
+          message: 'Block not found',
+          errorCode: FriendErrorCode.BlockNotFound,
+        });
       }
       throw error;
     }
@@ -920,7 +989,11 @@ export class FriendService {
         state: FriendState.ACCEPTED,
       },
     });
-    if (!record) throw new NotFoundException('Friendship not found');
+    if (!record)
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
 
     const field = record.userID === userId ? 'remarkA' : 'remarkB';
     await this.prisma.friend.update({
@@ -940,7 +1013,11 @@ export class FriendService {
 
   async createTag(userId: string, name: string, color?: string) {
     const trimmed = name.trim();
-    if (!trimmed) throw new BadRequestException('Tag name cannot be empty');
+    if (!trimmed)
+      throw new BadRequestException({
+        message: 'Tag name cannot be empty',
+        errorCode: FriendErrorCode.TagNameEmpty,
+      });
 
     // Only enforce the cap when this would be a *new* tag — re-submitting an
     // existing name is an idempotent color update and must stay allowed.
@@ -953,9 +1030,10 @@ export class FriendService {
         where: { ownerID: userId },
       });
       if (tagCount >= MAX_FRIEND_TAGS_PER_USER) {
-        throw new BadRequestException(
-          `Friend tag limit reached (${MAX_FRIEND_TAGS_PER_USER}).`,
-        );
+        throw new BadRequestException({
+          message: `Friend tag limit reached (${MAX_FRIEND_TAGS_PER_USER}).`,
+          errorCode: FriendErrorCode.TagLimitReached,
+        });
       }
     }
 
@@ -971,7 +1049,10 @@ export class FriendService {
       where: { id: tagId },
     });
     if (!tag || tag.ownerID !== userId)
-      throw new NotFoundException('Tag not found');
+      throw new NotFoundException({
+        message: 'Tag not found',
+        errorCode: FriendErrorCode.TagNotFound,
+      });
     await this.prisma.friendTag.delete({ where: { id: tagId } });
   }
 
@@ -994,9 +1075,16 @@ export class FriendService {
       this.prisma.friendTag.findUnique({ where: { id: tagId } }),
     ]);
 
-    if (!friendship) throw new NotFoundException('Friendship not found');
+    if (!friendship)
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
     if (!tag || tag.ownerID !== userId)
-      throw new NotFoundException('Tag not found');
+      throw new NotFoundException({
+        message: 'Tag not found',
+        errorCode: FriendErrorCode.TagNotFound,
+      });
 
     await this.prisma.friendTagOnFriend.upsert({
       where: {
@@ -1030,11 +1118,18 @@ export class FriendService {
       this.prisma.friendTag.findUnique({ where: { id: tagId } }),
     ]);
 
-    if (!friendship) throw new NotFoundException('Friendship not found');
+    if (!friendship)
+      throw new NotFoundException({
+        message: 'Friendship not found',
+        errorCode: FriendErrorCode.FriendshipNotFound,
+      });
     // Validate tag ownership for parity with assignTag — a wrong/foreign
     // tagId is a 404 rather than a silent no-op.
     if (!tag || tag.ownerID !== userId)
-      throw new NotFoundException('Tag not found');
+      throw new NotFoundException({
+        message: 'Tag not found',
+        errorCode: FriendErrorCode.TagNotFound,
+      });
 
     await this.prisma.friendTagOnFriend.deleteMany({
       where: { ownerID: userId, tagID: tagId, friendID: friendship.id },
@@ -1050,7 +1145,10 @@ export class FriendService {
       where: { id: tagId },
     });
     if (!tag || tag.ownerID !== userId)
-      throw new NotFoundException('Tag not found');
+      throw new NotFoundException({
+        message: 'Tag not found',
+        errorCode: FriendErrorCode.TagNotFound,
+      });
 
     const links = await this.prisma.friendTagOnFriend.findMany({
       where: { ownerID: userId, tagID: tagId },
@@ -1156,11 +1254,16 @@ export class FriendService {
       select: { state: true },
     });
 
-    throw new ConflictException(
-      active?.state === FriendState.ACCEPTED
-        ? 'Already friends'
-        : 'Friend request already pending',
-    );
+    if (active?.state === FriendState.ACCEPTED) {
+      throw new ConflictException({
+        message: 'Already friends',
+        errorCode: FriendErrorCode.AlreadyFriends,
+      });
+    }
+    throw new ConflictException({
+      message: 'Friend request already pending',
+      errorCode: FriendErrorCode.RequestAlreadyPending,
+    });
   }
 
   private prismaErrorCode(error: unknown): string | undefined {
@@ -1471,9 +1574,10 @@ export class FriendService {
     });
 
     if (count >= limit) {
-      throw new ForbiddenException(
-        `Friend limit reached (${limit}). Upgrade to MEMBER for a higher limit.`,
-      );
+      throw new ForbiddenException({
+        message: `Friend limit reached (${limit}). Upgrade to MEMBER for a higher limit.`,
+        errorCode: FriendErrorCode.LimitReached,
+      });
     }
   }
 }

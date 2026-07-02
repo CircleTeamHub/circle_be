@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NotificationService } from 'src/notification/notification.service';
+import { TraceErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -212,7 +213,10 @@ export class TraceService {
     // requireVisibleTrace already proved it exists; this only guards the narrow
     // window where it was soft-deleted between the two reads.
     if (!trace) {
-      throw new NotFoundException('Moment not found');
+      throw new NotFoundException({
+        message: 'Moment not found',
+        errorCode: TraceErrorCode.MomentNotFound,
+      });
     }
 
     const friendIdSet = new Set(await this.getAcceptedFriendIds(userId));
@@ -268,9 +272,17 @@ export class TraceService {
     const trace = await this.prisma.trace.findFirst({
       where: { id: traceId, deleted: false },
     });
-    if (!trace) throw new NotFoundException('Moment not found');
+    if (!trace) {
+      throw new NotFoundException({
+        message: 'Moment not found',
+        errorCode: TraceErrorCode.MomentNotFound,
+      });
+    }
     if (trace.fromID !== userId) {
-      throw new ForbiddenException('Only the author can delete');
+      throw new ForbiddenException({
+        message: 'Only the author can delete',
+        errorCode: TraceErrorCode.DeleteAuthorOnly,
+      });
     }
     // Include fromID + deleted in the write to close the TOCTOU window.
     await this.prisma.trace.update({
@@ -366,12 +378,16 @@ export class TraceService {
         select: { id: true, traceID: true },
       });
       if (!replyTarget) {
-        throw new BadRequestException('Reply target not found');
+        throw new BadRequestException({
+          message: 'Reply target not found',
+          errorCode: TraceErrorCode.ReplyTargetNotFound,
+        });
       }
       if (replyTarget.traceID !== traceId) {
-        throw new BadRequestException(
-          'Reply target must belong to the same trace',
-        );
+        throw new BadRequestException({
+          message: 'Reply target must belong to the same trace',
+          errorCode: TraceErrorCode.ReplyTargetMismatch,
+        });
       }
     }
 
@@ -459,9 +475,17 @@ export class TraceService {
     const comment = await this.prisma.traceComment.findFirst({
       where: { id: commentId, deleted: false },
     });
-    if (!comment) throw new NotFoundException('Comment not found');
+    if (!comment) {
+      throw new NotFoundException({
+        message: 'Comment not found',
+        errorCode: TraceErrorCode.CommentNotFound,
+      });
+    }
     if (comment.userID !== userId) {
-      throw new ForbiddenException('Only the author can delete');
+      throw new ForbiddenException({
+        message: 'Only the author can delete',
+        errorCode: TraceErrorCode.DeleteAuthorOnly,
+      });
     }
 
     await this.prisma.$transaction([
@@ -512,7 +536,10 @@ export class TraceService {
       where: { id: traceId, deleted: false },
     });
     if (!trace) {
-      throw new NotFoundException('Moment not found');
+      throw new NotFoundException({
+        message: 'Moment not found',
+        errorCode: TraceErrorCode.MomentNotFound,
+      });
     }
     if (trace.fromID === viewerId) {
       return trace;
@@ -528,7 +555,10 @@ export class TraceService {
       isFriend,
     );
     if (!authorAllowsViewer) {
-      throw new ForbiddenException('You are not allowed to access this moment');
+      throw new ForbiddenException({
+        message: 'You are not allowed to access this moment',
+        errorCode: TraceErrorCode.AccessForbidden,
+      });
     }
     if (trace.visibility === 'PUBLIC') {
       return trace;
@@ -539,7 +569,10 @@ export class TraceService {
       }
     }
 
-    throw new ForbiddenException('You are not allowed to access this moment');
+    throw new ForbiddenException({
+      message: 'You are not allowed to access this moment',
+      errorCode: TraceErrorCode.AccessForbidden,
+    });
   }
 
   private toTraceDto(

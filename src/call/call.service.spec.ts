@@ -2,8 +2,10 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { CallErrorCode } from 'src/common/app-error-codes';
 import { CircleMemberStatus } from 'src/generated/prisma';
 import { CallService } from './call.service';
 
@@ -93,6 +95,29 @@ describe('CallService', () => {
       { id: 'user-3', nickname: 'Cara', avatarUrl: null, status: 'ACTIVE' },
     ]);
     prisma.callParticipant.findFirst.mockResolvedValue(null);
+  }
+
+  async function expectErrorCode(
+    promise: Promise<unknown>,
+    expectedCode: string,
+  ) {
+    try {
+      await promise;
+      throw new Error('Expected promise to reject');
+    } catch (error) {
+      if (
+        error instanceof BadRequestException ||
+        error instanceof ConflictException ||
+        error instanceof ForbiddenException ||
+        error instanceof NotFoundException
+      ) {
+        expect(error.getResponse()).toEqual(
+          expect.objectContaining({ errorCode: expectedCode }),
+        );
+        return;
+      }
+      throw error;
+    }
   }
 
   it('creates a group audio call for active mapped group members', async () => {
@@ -309,15 +334,49 @@ describe('CallService', () => {
   });
 
   it('rejects group calls without invitees', async () => {
-    await expect(
+    await expectErrorCode(
       service.createGroupCall('user-1', {
         conversationID: 'sg_group-1',
         callType: 'AUDIO',
         inviteeIDs: ['user-1', '  '],
       }),
-    ).rejects.toThrow(BadRequestException);
+      CallErrorCode.InviteesRequired,
+    );
 
     expect(livekit.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('rejects video calls with a stable error code when video is disabled', async () => {
+    await expectErrorCode(
+      service.createGroupCall('user-1', {
+        conversationID: 'sg_group-1',
+        callType: 'VIDEO',
+        inviteeIDs: ['user-2'],
+      }),
+      CallErrorCode.VideoDisabled,
+    );
+
+    expect(livekit.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid invitees with a stable error code', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'user-1',
+    });
+    prisma.circleMember.findMany.mockResolvedValue([
+      { userID: 'user-1', status: CircleMemberStatus.ACTIVE },
+    ]);
+
+    await expectErrorCode(
+      service.createGroupCall('user-1', {
+        conversationID: 'group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2'],
+      }),
+      CallErrorCode.InviteeInvalid,
+    );
   });
 
   it('rejects calls when the initiator is not an active mapped group member', async () => {
@@ -498,6 +557,31 @@ describe('CallService', () => {
     expect(result.livekit.token).toBe('livekit-token');
   });
 
+  it('rejects accept with a stable error code when the participant is not invited', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'LEFT',
+      call: {
+        id: 'call-1',
+        conversationID: 'sg_group-1',
+        sessionType: 3,
+        callType: 'AUDIO',
+        status: 'ACTIVE',
+        livekitRoomName: 'circle_call_1',
+        participants: [],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    await expectErrorCode(
+      service.acceptCall('user-2', 'call-1'),
+      CallErrorCode.NotInvited,
+    );
+
+    expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+  });
+
   it('ends the call when the last joined participant leaves', async () => {
     prisma.callParticipant.findUnique.mockResolvedValue({
       callID: 'call-1',
@@ -554,8 +638,9 @@ describe('CallService', () => {
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
 
-    await expect(service.createJoinToken('user-2', 'call-1')).rejects.toThrow(
-      ConflictException,
+    await expectErrorCode(
+      service.createJoinToken('user-2', 'call-1'),
+      CallErrorCode.NotAccepted,
     );
 
     expect(prisma.callParticipant.update).not.toHaveBeenCalled();
@@ -658,6 +743,27 @@ describe('CallService', () => {
 
     expect(prisma.callParticipant.update).not.toHaveBeenCalled();
     expect(result.status).toBe('REJECTED');
+  });
+
+  it('rejects reject-call with a stable error code when the participant is not invited', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'JOINED',
+      call: {
+        id: 'call-1',
+        status: 'ACTIVE',
+        participants: [],
+      },
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+
+    await expectErrorCode(
+      service.rejectCall('user-2', 'call-1'),
+      CallErrorCode.NotInvited,
+    );
+
+    expect(prisma.callParticipant.update).not.toHaveBeenCalled();
   });
 
   it('marks a ringing call missed when the last invitee rejects', async () => {
@@ -763,6 +869,52 @@ describe('CallService', () => {
     expect(prisma.callParticipant.updateMany).not.toHaveBeenCalled();
     expect(livekit.deleteRoom).not.toHaveBeenCalled();
     expect(result.status).toBe('CANCELED');
+  });
+
+  it('rejects cancel with a stable error code when the call does not exist', async () => {
+    prisma.callSession.findUnique.mockResolvedValue(null);
+
+    await expectErrorCode(
+      service.cancelCall('user-1', 'call-1'),
+      CallErrorCode.NotFound,
+    );
+  });
+
+  it('rejects cancel with a stable error code when the user is not the initiator', async () => {
+    prisma.callSession.findUnique.mockResolvedValue({
+      id: 'call-1',
+      initiatorID: 'user-1',
+      status: 'RINGING',
+      participants: [],
+    });
+
+    await expectErrorCode(
+      service.cancelCall('user-2', 'call-1'),
+      CallErrorCode.NotAllowed,
+    );
+  });
+
+  it('rejects cancel with a stable error code when the call is already active', async () => {
+    prisma.callSession.findUnique.mockResolvedValue({
+      id: 'call-1',
+      initiatorID: 'user-1',
+      status: 'ACTIVE',
+      participants: [],
+    });
+
+    await expectErrorCode(
+      service.cancelCall('user-1', 'call-1'),
+      CallErrorCode.AlreadyActive,
+    );
+  });
+
+  it('rejects participant lookup with a stable error code when the call is not found', async () => {
+    prisma.callParticipant.findUnique.mockResolvedValue(null);
+
+    await expectErrorCode(
+      service.createJoinToken('user-2', 'call-1'),
+      CallErrorCode.NotFound,
+    );
   });
 
   it('sweeps expired ringing calls in batches', async () => {

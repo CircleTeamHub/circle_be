@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
+import { ConversationGroupErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   ConversationGroupDto,
@@ -67,7 +68,10 @@ export class ConversationGroupService {
         err.code === 'P2002'
       ) {
         // unique([ownerID, name]) 冲突
-        throw new ConflictException('同名分组已存在');
+        throw new ConflictException({
+          message: '同名分组已存在',
+          errorCode: ConversationGroupErrorCode.NameTaken,
+        });
       }
       throw err;
     }
@@ -98,7 +102,10 @@ export class ConversationGroupService {
         err instanceof Prisma.PrismaClientKnownRequestError &&
         err.code === 'P2002'
       ) {
-        throw new ConflictException('同名分组已存在');
+        throw new ConflictException({
+          message: '同名分组已存在',
+          errorCode: ConversationGroupErrorCode.NameTaken,
+        });
       }
       throw err;
     }
@@ -157,11 +164,17 @@ export class ConversationGroupService {
       select: { ownerID: true },
     });
     if (!group) {
-      throw new NotFoundException('分组不存在');
+      throw new NotFoundException({
+        message: '分组不存在',
+        errorCode: ConversationGroupErrorCode.NotFound,
+      });
     }
     if (group.ownerID !== ownerID) {
       // 安全考虑：返 404 而不是 403，避免泄露"这个 id 存在但不属于你"
-      throw new NotFoundException('分组不存在');
+      throw new NotFoundException({
+        message: '分组不存在',
+        errorCode: ConversationGroupErrorCode.NotFound,
+      });
     }
   }
 }

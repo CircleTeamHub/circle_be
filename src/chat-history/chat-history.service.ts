@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { ChatHistoryErrorCode } from 'src/common/app-error-codes';
 import { OpenimService, type OpenimMessage } from 'src/openim/openim.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import {
@@ -101,7 +102,10 @@ export class ChatHistoryService {
         participantIDs.some((participantID) => !participantID) ||
         !participantIDs.includes(currentImUserID)
       ) {
-        throw new NotFoundException('会话不存在');
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatHistoryErrorCode.ConversationNotFound,
+        });
       }
       return;
     }
@@ -109,19 +113,28 @@ export class ChatHistoryService {
     if (conversationID.startsWith('sg_')) {
       const groupID = conversationID.slice(3);
       if (!groupID) {
-        throw new NotFoundException('会话不存在');
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatHistoryErrorCode.ConversationNotFound,
+        });
       }
       const isMember = await this.openim.isGroupMember(
         groupID,
         currentImUserID,
       );
       if (!isMember) {
-        throw new NotFoundException('会话不存在');
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatHistoryErrorCode.ConversationNotFound,
+        });
       }
       return;
     }
 
-    throw new NotFoundException('会话不存在');
+    throw new NotFoundException({
+      message: '会话不存在',
+      errorCode: ChatHistoryErrorCode.ConversationNotFound,
+    });
   }
 
   private toRestorableMessage(msg: OpenimMessage): RestorableMessageDto {

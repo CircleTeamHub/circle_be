@@ -13,6 +13,7 @@ import {
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import { TempChatService } from './temp-chat.service';
@@ -51,7 +52,10 @@ export class TempChatController {
         err?.name === 'JsonWebTokenError' ||
         err?.name === 'TokenExpiredError'
       ) {
-        throw new NotFoundException('链接无效');
+        throw new NotFoundException({
+          message: '链接无效',
+          errorCode: TempChatErrorCode.LinkInvalid,
+        });
       }
       throw err;
     }
@@ -68,7 +72,10 @@ export class TempChatController {
         err?.name === 'JsonWebTokenError' ||
         err?.name === 'TokenExpiredError'
       ) {
-        throw new NotFoundException('链接无效');
+        throw new NotFoundException({
+          message: '链接无效',
+          errorCode: TempChatErrorCode.LinkInvalid,
+        });
       }
       throw err;
     }

@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CirclePost, Prisma, User } from 'src/generated/prisma';
+import { CircleErrorCode, PlazaErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { OpenimService } from 'src/openim/openim.service';
@@ -107,19 +108,26 @@ export class CirclePlazaService {
     });
 
     if (!membership || membership.status !== 'ACTIVE') {
-      throw new ForbiddenException(
-        'You must be an active member of the circle to post',
-      );
+      throw new ForbiddenException({
+        message: 'You must be an active member of the circle to post',
+        errorCode: PlazaErrorCode.NotActiveMember,
+      });
     }
     if (membership.circle.deleted) {
-      throw new NotFoundException('Circle not found');
+      throw new NotFoundException({
+        message: 'Circle not found',
+        errorCode: CircleErrorCode.NotFound,
+      });
     }
 
     this.assertImagesAreSafe(dto.images);
 
     // Check if members are allowed to post (owners/admins always can)
     if (!membership.circle.memberCanPost && membership.role === 'MEMBER') {
-      throw new ForbiddenException('该圈子仅管理员可以发帖');
+      throw new ForbiddenException({
+        message: '该圈子仅管理员可以发帖',
+        errorCode: PlazaErrorCode.AdminOnlyPost,
+      });
     }
 
     if (dto.noteId) {
@@ -133,9 +141,11 @@ export class CirclePlazaService {
         select: { id: true },
       });
       if (!note) {
-        throw new BadRequestException(
-          'Note not found, unavailable, or not owned by the current user',
-        );
+        throw new BadRequestException({
+          message:
+            'Note not found, unavailable, or not owned by the current user',
+          errorCode: PlazaErrorCode.NoteInvalid,
+        });
       }
     }
 
@@ -298,7 +308,12 @@ export class CirclePlazaService {
       }),
     ]);
 
-    if (!post) throw new NotFoundException('Post not found');
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
 
     const [signed, displayIconsByAuthor] = await Promise.all([
       this.prisma.circlePostSignup.findUnique({
@@ -321,9 +336,17 @@ export class CirclePlazaService {
     const post = await this.prisma.circlePost.findFirst({
       where: { ...this.activeUnexpiredPostWhere(), id: postId },
     });
-    if (!post) throw new NotFoundException('Post not found');
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
     if (post.authorID !== userId) {
-      throw new ForbiddenException('Only the author can delete this post');
+      throw new ForbiddenException({
+        message: 'Only the author can delete this post',
+        errorCode: PlazaErrorCode.DeleteAuthorOnly,
+      });
     }
 
     await this.prisma.$transaction(async (tx) => {
@@ -360,11 +383,19 @@ export class CirclePlazaService {
         signupFancyRestriction: true,
       },
     });
-    if (!post) throw new NotFoundException('Post not found');
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
 
     // The author manages signups for their own post and never signs up for it.
     if (post.authorID === userId) {
-      throw new ForbiddenException('不能给自己发布的帖子报名');
+      throw new ForbiddenException({
+        message: '不能给自己发布的帖子报名',
+        errorCode: PlazaErrorCode.SignupSelf,
+      });
     }
 
     // Fast-path pre-check; the unique constraint inside the transaction is the
@@ -387,7 +418,10 @@ export class CirclePlazaService {
       select: { vipLevel: true, creditScore: true, fancyNumber: true },
     });
     if (!this.checkCanSignup(post, viewer)) {
-      throw new ForbiddenException('您的等级不满足该帖子的报名要求');
+      throw new ForbiddenException({
+        message: '您的等级不满足该帖子的报名要求',
+        errorCode: PlazaErrorCode.SignupIneligible,
+      });
     }
 
     let updated: { signupCount: number };
@@ -738,13 +772,22 @@ export class CirclePlazaService {
     );
 
     if (uniqueRecipientIds.length === 0) {
-      throw new BadRequestException('Select at least one collaborator');
+      throw new BadRequestException({
+        message: 'Select at least one collaborator',
+        errorCode: PlazaErrorCode.RecognizeMinOne,
+      });
     }
     if (uniqueRecipientIds.length > MAX_COLLABORATION_RECOGNITIONS_PER_POST) {
-      throw new BadRequestException('Select at most three collaborators');
+      throw new BadRequestException({
+        message: 'Select at most three collaborators',
+        errorCode: PlazaErrorCode.RecognizeMaxThree,
+      });
     }
     if (uniqueRecipientIds.includes(authorId)) {
-      throw new ForbiddenException('Cannot recognize yourself');
+      throw new ForbiddenException({
+        message: 'Cannot recognize yourself',
+        errorCode: PlazaErrorCode.RecognizeSelf,
+      });
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
@@ -756,15 +799,22 @@ export class CirclePlazaService {
         },
         select: { id: true, authorID: true, circleID: true },
       });
-      if (!post) throw new NotFoundException('Post not found');
+      if (!post) {
+        throw new NotFoundException({
+          message: 'Post not found',
+          errorCode: PlazaErrorCode.PostNotFound,
+        });
+      }
 
       const signupCount = await tx.circlePostSignup.count({
         where: { postID: postId },
       });
       if (signupCount < MIN_SIGNUPS_FOR_COLLABORATION_RECOGNITION) {
-        throw new BadRequestException(
-          'At least three signups are required before recognizing collaborators',
-        );
+        throw new BadRequestException({
+          message:
+            'At least three signups are required before recognizing collaborators',
+          errorCode: PlazaErrorCode.RecognizeMinSignups,
+        });
       }
 
       // A recipient is eligible only if they signed up for the post AND are
@@ -782,9 +832,10 @@ export class CirclePlazaService {
         signedUserIds.has(recipientId),
       );
       if (!allRecipientsSignedUp) {
-        throw new BadRequestException(
-          'Only users who signed up for the post can be recognized',
-        );
+        throw new BadRequestException({
+          message: 'Only users who signed up for the post can be recognized',
+          errorCode: PlazaErrorCode.RecognizeNotSigned,
+        });
       }
 
       const activeMembers = await tx.circleMember.findMany({
@@ -802,9 +853,10 @@ export class CirclePlazaService {
         (recipientId) => activeMemberIds.has(recipientId),
       );
       if (!allRecipientsActiveMembers) {
-        throw new BadRequestException(
-          'Only active members of the circle can be recognized',
-        );
+        throw new BadRequestException({
+          message: 'Only active members of the circle can be recognized',
+          errorCode: PlazaErrorCode.RecognizeNotMember,
+        });
       }
 
       // Never recognize someone in a block relationship with the author
@@ -819,7 +871,10 @@ export class CirclePlazaService {
         select: { id: true },
       });
       if (block) {
-        throw new ForbiddenException('Cannot recognize a blocked user');
+        throw new ForbiddenException({
+          message: 'Cannot recognize a blocked user',
+          errorCode: PlazaErrorCode.RecognizeBlocked,
+        });
       }
 
       const claimed = await tx.circlePost.updateMany({
@@ -831,9 +886,10 @@ export class CirclePlazaService {
         data: { collaborationRecognizedAt: new Date() },
       });
       if (claimed.count !== 1) {
-        throw new BadRequestException(
-          'Collaboration recognition has already been submitted',
-        );
+        throw new BadRequestException({
+          message: 'Collaboration recognition has already been submitted',
+          errorCode: PlazaErrorCode.RecognizeAlready,
+        });
       }
 
       await tx.collaborationRecognition.createMany({
@@ -899,7 +955,12 @@ export class CirclePlazaService {
       where: { id: postId, authorID: authorId },
       select: { id: true },
     });
-    if (!post) throw new NotFoundException('Post not found');
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
   }
 
   private checkCanInteract(
