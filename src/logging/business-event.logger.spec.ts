@@ -11,6 +11,8 @@ describe('logBusinessEvent', () => {
       result: 'success',
       metadata: {
         password: 'secret',
+        accessToken: 'access-token',
+        refreshToken: 'refresh-token',
         safe: 'value',
       },
     });
