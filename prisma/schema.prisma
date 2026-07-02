@@ -410,7 +410,6 @@ model CreditEvent {
   actorID        String?
   idempotencyKey String?   @unique
   metadata       Json      @default("{}")
-  revertedAt     DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
