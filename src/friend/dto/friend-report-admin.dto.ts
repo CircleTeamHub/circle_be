@@ -1,5 +1,15 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsEnum, IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  IsEnum,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 import { FriendReportStatus } from 'src/generated/prisma';
 
 export const FRIEND_REPORT_REVIEW_DECISIONS = ['APPROVE', 'REJECT'] as const;
@@ -15,6 +25,21 @@ export class ListFriendReportsQueryDto {
   @IsOptional()
   @IsEnum(FriendReportStatus)
   status?: FriendReportStatus;
+
+  @ApiPropertyOptional({ default: 1, minimum: 1 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page?: number;
+
+  @ApiPropertyOptional({ default: 50, minimum: 1, maximum: 100 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit?: number;
 }
 
 export class ReviewFriendReportDto {
@@ -79,4 +104,21 @@ export class FriendReportAdminItemDto {
 
   @ApiProperty({ type: FriendReportUserDto, nullable: true })
   reviewedBy: FriendReportUserDto | null;
+}
+
+export class FriendReportListDto {
+  @ApiProperty({ type: [FriendReportAdminItemDto] })
+  items: FriendReportAdminItemDto[];
+
+  @ApiProperty()
+  total: number;
+
+  @ApiProperty()
+  page: number;
+
+  @ApiProperty()
+  limit: number;
+
+  @ApiProperty()
+  hasMore: boolean;
 }

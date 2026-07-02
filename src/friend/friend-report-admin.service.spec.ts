@@ -12,6 +12,7 @@ describe('FriendReportAdminService', () => {
     friendReport: {
       findMany: jest.fn(),
       findUnique: jest.fn(),
+      count: jest.fn(),
     },
     $transaction: jest.fn(async (cb: (client: typeof tx) => unknown) => cb(tx)),
   };
@@ -39,7 +40,7 @@ describe('FriendReportAdminService', () => {
     );
   });
 
-  it('lists reports for the requested status as DTOs', async () => {
+  it('lists reports for the requested status as a paginated DTO envelope', async () => {
     prisma.friendReport.findMany.mockResolvedValue([
       {
         id: 'report-1',
@@ -55,21 +56,35 @@ describe('FriendReportAdminService', () => {
         reviewedBy: null,
       },
     ]);
+    prisma.friendReport.count.mockResolvedValue(75);
 
-    const result = await service.listReports('PENDING' as any);
+    const result = await service.listReports('PENDING' as any, 2, 50);
 
+    // page 2, limit 50 → skip 50; count 75 → hasMore (50 + 1 < 75).
     expect(prisma.friendReport.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { status: 'PENDING' } }),
-    );
-    expect(result).toEqual([
       expect.objectContaining({
-        id: 'report-1',
-        status: 'PENDING',
-        reporter: expect.objectContaining({ id: 'user-1' }),
-        target: expect.objectContaining({ id: 'user-2' }),
-        reviewedBy: null,
+        where: { status: 'PENDING' },
+        skip: 50,
+        take: 50,
       }),
-    ]);
+    );
+    expect(prisma.friendReport.count).toHaveBeenCalledWith({
+      where: { status: 'PENDING' },
+    });
+    expect(result).toEqual(
+      expect.objectContaining({
+        total: 75,
+        page: 2,
+        limit: 50,
+        hasMore: true,
+        items: [
+          expect.objectContaining({
+            id: 'report-1',
+            reporter: expect.objectContaining({ id: 'user-1' }),
+          }),
+        ],
+      }),
+    );
   });
 
   it('approves a pending report: marks it APPROVED, deducts credit, broadcasts', async () => {

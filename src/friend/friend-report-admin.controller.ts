@@ -21,6 +21,7 @@ import { AdminGuard } from 'src/guards/admin.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
   FriendReportAdminItemDto,
+  FriendReportListDto,
   ListFriendReportsQueryDto,
   ReviewFriendReportDto,
 } from './dto/friend-report-admin.dto';
@@ -35,13 +36,17 @@ export class FriendReportAdminController {
 
   @Get()
   @ApiOperation({
-    summary: 'List friend reports for review (defaults to PENDING)',
+    summary: 'List friend reports for review (defaults to PENDING), paginated',
   })
-  @ApiOkResponse({ type: [FriendReportAdminItemDto] })
+  @ApiOkResponse({ type: FriendReportListDto })
   list(
     @Query() query: ListFriendReportsQueryDto,
-  ): Promise<FriendReportAdminItemDto[]> {
-    return this.service.listReports(query.status ?? FriendReportStatus.PENDING);
+  ): Promise<FriendReportListDto> {
+    return this.service.listReports(
+      query.status ?? FriendReportStatus.PENDING,
+      query.page,
+      query.limit,
+    );
   }
 
   @Post(':reportId/review')

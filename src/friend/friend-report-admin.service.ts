@@ -9,6 +9,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { CreditService } from 'src/credit/credit.service';
 import {
   FriendReportAdminItemDto,
+  FriendReportListDto,
   FriendReportUserDto,
   ReviewFriendReportDto,
 } from './dto/friend-report-admin.dto';
@@ -17,9 +18,7 @@ import {
 // the historical FRIEND_REPORT deduction so approvals match the old behavior.
 const FRIEND_REPORT_CREDIT_DEDUCTION = 5;
 
-// Most recent reports returned per status page. Reviewing is low-volume, so a
-// simple capped list avoids pagination machinery for now.
-const REPORT_LIST_LIMIT = 200;
+const DEFAULT_PAGE_SIZE = 50;
 
 const REPORT_USER_SELECT = {
   id: true,
@@ -49,14 +48,27 @@ export class FriendReportAdminService {
 
   async listReports(
     status: FriendReportStatus = FriendReportStatus.PENDING,
-  ): Promise<FriendReportAdminItemDto[]> {
-    const reports = await this.prisma.friendReport.findMany({
-      where: { status },
-      orderBy: { createdAt: 'desc' },
-      take: REPORT_LIST_LIMIT,
-      include: reportInclude,
-    });
-    return reports.map((report) => this.toDto(report));
+    page = 1,
+    limit = DEFAULT_PAGE_SIZE,
+  ): Promise<FriendReportListDto> {
+    const skip = (page - 1) * limit;
+    const [reports, total] = await Promise.all([
+      this.prisma.friendReport.findMany({
+        where: { status },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        include: reportInclude,
+      }),
+      this.prisma.friendReport.count({ where: { status } }),
+    ]);
+    return {
+      items: reports.map((report) => this.toDto(report)),
+      total,
+      page,
+      limit,
+      hasMore: skip + reports.length < total,
+    };
   }
 
   async reviewReport(
