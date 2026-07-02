@@ -852,7 +852,13 @@ export class CirclePlazaService {
     const count = await this.prisma.circlePostSignup.count({
       where: {
         seenByAuthor: false,
-        post: { authorID: authorId, status: 'ACTIVE' },
+        post: {
+          authorID: authorId,
+          OR: [
+            { status: 'ACTIVE' },
+            { status: 'ENDED', collaborationRecognizedAt: null },
+          ],
+        },
       },
     });
     return { count };
