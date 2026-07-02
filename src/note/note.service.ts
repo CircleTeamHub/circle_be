@@ -720,7 +720,9 @@ export class NoteService {
       canonicalByUrl.set(item.url, canonical);
     }
 
-    const source = Array.isArray(requestedItems) ? requestedItems : fallbackItems;
+    const source = Array.isArray(requestedItems)
+      ? requestedItems
+      : fallbackItems;
     return source.map((item) => {
       const resolved =
         canonicalByComposite.get(`${item.objectKey}:${item.url}`) ??
@@ -945,22 +947,20 @@ export class NoteService {
       : null;
     const hasExplicitMedia = Array.isArray(storedMedia.items);
     const hasExplicitShowcase = Array.isArray(storedShowcase.items);
-    const mediaItems =
-      hasExplicitMedia
-        ? storedMedia.items
-        : hasExplicitShowcase
-          ? []
-          : (note.media ?? []).map((item) =>
-              this.mapMediaItemForSection(item as any),
-            );
-    const showcaseItems =
-      hasExplicitShowcase
-        ? storedShowcase.items
-        : hasExplicitMedia
-          ? []
-          : (note.media ?? [])
-              .filter((item) => item.type === 'IMAGE')
-              .map((item) => this.mapMediaItemForSection(item as any));
+    const mediaItems = hasExplicitMedia
+      ? storedMedia.items
+      : hasExplicitShowcase
+        ? []
+        : (note.media ?? []).map((item) =>
+            this.mapMediaItemForSection(item as any),
+          );
+    const showcaseItems = hasExplicitShowcase
+      ? storedShowcase.items
+      : hasExplicitMedia
+        ? []
+        : (note.media ?? [])
+            .filter((item) => item.type === 'IMAGE')
+            .map((item) => this.mapMediaItemForSection(item as any));
     let contentJson: unknown[] | null = null;
     if (Array.isArray(storedText.contentJson)) {
       contentJson = storedText.contentJson;
