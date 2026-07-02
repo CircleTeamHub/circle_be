@@ -870,12 +870,22 @@ export class CirclePlazaService {
     return result;
   }
 
-  /** Total unseen signups across the author's active posts (报名管理 red dot). */
+  /**
+   * Total unseen signups across the author's posts that still surface in the
+   * 报名管理 list — active posts, plus ended posts still pending collaboration
+   * recognition — so the red dot matches what the author can actually act on.
+   */
   async getMySignupsUnreadCount(authorId: string): Promise<{ count: number }> {
     const count = await this.prisma.circlePostSignup.count({
       where: {
         seenByAuthor: false,
-        post: { authorID: authorId, status: 'ACTIVE' },
+        post: {
+          authorID: authorId,
+          OR: [
+            { status: 'ACTIVE' },
+            { status: 'ENDED', collaborationRecognizedAt: null },
+          ],
+        },
       },
     });
     return { count };

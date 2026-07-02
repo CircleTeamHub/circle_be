@@ -676,6 +676,26 @@ describe('CirclePlazaService', () => {
       expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
     });
 
+    it('counts unread signups on ended posts that still need collaboration recognition', async () => {
+      prisma.circlePostSignup.count.mockResolvedValue(2);
+
+      const result = await service.getMySignupsUnreadCount('author-1');
+
+      expect(result).toEqual({ count: 2 });
+      expect(prisma.circlePostSignup.count).toHaveBeenCalledWith({
+        where: {
+          seenByAuthor: false,
+          post: {
+            authorID: 'author-1',
+            OR: [
+              { status: 'ACTIVE' },
+              { status: 'ENDED', collaborationRecognizedAt: null },
+            ],
+          },
+        },
+      });
+    });
+
     it('submits up to three collaboration recognitions for signed-up users', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         id: 'post-1',
