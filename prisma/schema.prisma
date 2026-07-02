@@ -282,6 +282,7 @@ model User {
   friendActivitiesCounterparty FriendActivity[]            @relation("friendActivityCounterparty")
   friendReportsFiled           FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived        FriendReport[]              @relation("friendReportTarget")
+  friendReportsReviewed        FriendReport[]              @relation("friendReportReviewer")
   groupReportsFiled            GroupReport[]               @relation("groupReportReporter")
   creditEvents                 CreditEvent[]               @relation("creditEventUser")
   creditEventsAuthored         CreditEvent[]               @relation("creditEventActor")
@@ -343,22 +344,34 @@ model Friend {
   @@index([friendID])
 }
 
-model FriendReport {
-  id          String   @id @default(uuid())
-  reporterID  String
-  targetID    String
-  category    String
-  description String
-  evidence    String[] @default([])
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+enum FriendReportStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
 
-  reporter User @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
-  target   User @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
+model FriendReport {
+  id           String             @id @default(uuid())
+  reporterID   String
+  targetID     String
+  category     String
+  description  String
+  evidence     String[]           @default([])
+  status       FriendReportStatus @default(PENDING)
+  reviewedByID String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  reporter   User  @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
+  target     User  @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
+  reviewedBy User? @relation("friendReportReviewer", fields: [reviewedByID], references: [id], onDelete: SetNull)
 
   @@unique([reporterID, targetID, category])
   @@index([reporterID, createdAt])
   @@index([targetID, createdAt])
+  @@index([status, createdAt])
 }
 
 model GroupReport {

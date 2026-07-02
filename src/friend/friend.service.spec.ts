@@ -690,19 +690,10 @@ describe('FriendService', () => {
         evidence: ['s3://bucket/report-1.png'],
       },
     });
-    expect(creditService.applyDeltaInTransaction).toHaveBeenCalledWith(prisma, {
-      userId: 'user-2',
-      delta: -5,
-      reason: 'FRIEND_REPORT',
-      sourceType: 'FRIEND_REPORT',
-      sourceId: 'report-1',
-      actorId: 'user-1',
-      idempotencyKey: 'friend-report:report-1',
-      metadata: { category: 'harassment' },
-    });
-    expect(creditService.broadcastCreditProfileChanged).toHaveBeenCalledWith(
-      'user-2',
-    );
+    // Submitting a report no longer deducts credit — that happens only on admin
+    // approval (see FriendReportAdminService).
+    expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
+    expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
   });
 
   it('rejects a duplicate report for the same reporter/target/category', async () => {

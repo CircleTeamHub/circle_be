@@ -13,7 +13,6 @@ import { NotificationService } from 'src/notification/notification.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { CreditService } from 'src/credit/credit.service';
 import {
   FriendProfileDto,
   FriendActivityDto,
@@ -30,8 +29,6 @@ const FRIEND_LIMIT_MEMBER = 5_000;
 
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
-
-const FRIEND_REPORT_CREDIT_DEDUCTION = 5;
 
 // Minimal user shape returned inside friend/request payloads
 const MINI_USER_SELECT = {
@@ -86,7 +83,6 @@ export class FriendService {
     private readonly realtimeService: RealtimeService,
     private readonly notificationService: NotificationService,
     private readonly privacySettings: PrivacySettingsService,
-    private readonly creditService: CreditService,
   ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
@@ -527,29 +523,19 @@ export class FriendService {
       );
     }
 
+    // Reports no longer deduct credit on submission — they are queued as
+    // PENDING and only affect the target's credit once an admin approves them
+    // (see FriendReportAdminService). This prevents brigading from silently
+    // tanking a user's score with no review.
     try {
-      await this.prisma.$transaction(async (tx) => {
-        const report = await tx.friendReport.create({
-          data: {
-            reporterID: reporterId,
-            targetID: friendUserId,
-            category: dto.category,
-            description: dto.description.trim(),
-            evidence: dto.evidence ?? [],
-          },
-        });
-        await this.creditService.applyDeltaInTransaction(tx, {
-          userId: friendUserId,
-          delta: -FRIEND_REPORT_CREDIT_DEDUCTION,
-          reason: 'FRIEND_REPORT',
-          sourceType: 'FRIEND_REPORT',
-          sourceId: report.id,
-          actorId: reporterId,
-          idempotencyKey: `friend-report:${report.id}`,
-          metadata: {
-            category: dto.category,
-          },
-        });
+      await this.prisma.friendReport.create({
+        data: {
+          reporterID: reporterId,
+          targetID: friendUserId,
+          category: dto.category,
+          description: dto.description.trim(),
+          evidence: dto.evidence ?? [],
+        },
       });
     } catch (error) {
       if (this.prismaErrorCode(error) === 'P2002') {
@@ -559,8 +545,6 @@ export class FriendService {
       }
       throw error;
     }
-
-    await this.creditService.broadcastCreditProfileChanged(friendUserId);
 
     this.logger.warn(
       `Friend report submitted: ${reporterId} → ${friendUserId} (${dto.category})`,
