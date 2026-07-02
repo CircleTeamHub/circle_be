@@ -384,9 +384,10 @@ export class TraceService {
         });
       }
       if (replyTarget.traceID !== traceId) {
-        throw new BadRequestException(
-          'Reply target must belong to the same trace',
-        );
+        throw new BadRequestException({
+          message: 'Reply target must belong to the same trace',
+          errorCode: TraceErrorCode.ReplyTargetMismatch,
+        });
       }
     }
 

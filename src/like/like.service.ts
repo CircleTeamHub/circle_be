@@ -3,6 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { LikeErrorCode } from 'src/common/app-error-codes';
 import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
@@ -30,7 +31,10 @@ export class LikeService {
    */
   async like(fromUserId: string, toUserId: string): Promise<LikeStatusDto> {
     if (fromUserId === toUserId) {
-      throw new BadRequestException('不能给自己点赞');
+      throw new BadRequestException({
+        message: '不能给自己点赞',
+        errorCode: LikeErrorCode.SelfLike,
+      });
     }
 
     // 目标必须存在且为活跃用户：不能给已封禁/已注销的账号刷赞、刷徽章。
@@ -39,7 +43,10 @@ export class LikeService {
       select: { status: true },
     });
     if (!target || target.status !== UserStatus.ACTIVE) {
-      throw new NotFoundException('用户不存在或不可用');
+      throw new NotFoundException({
+        message: '用户不存在或不可用',
+        errorCode: LikeErrorCode.TargetUnavailable,
+      });
     }
 
     const likedOn = likedOnToday();
@@ -64,9 +71,10 @@ export class LikeService {
       this.iconService.invalidateDisplayIconCacheFor(toUserId);
     } catch (e) {
       if (e instanceof DailyLikeLimitError) {
-        throw new BadRequestException(
-          `今天点赞次数已达上限（每天最多给 ${DAILY_LIKE_LIMIT} 个人点赞）`,
-        );
+        throw new BadRequestException({
+          message: `今天点赞次数已达上限（每天最多给 ${DAILY_LIKE_LIMIT} 个人点赞）`,
+          errorCode: LikeErrorCode.DailyLimit,
+        });
       }
       // 并发下同一目标二次创建 = 唯一约束冲突（P2002），幂等：忽略。
       if ((e as { code?: string }).code !== 'P2002') {
@@ -115,7 +123,10 @@ export class LikeService {
         throw e;
       }
     }
-    throw new BadRequestException('操作太频繁，请稍后重试');
+    throw new BadRequestException({
+      message: '操作太频繁，请稍后重试',
+      errorCode: LikeErrorCode.TooFrequent,
+    });
   }
 
   /** 取消今天对 toUserId 的点赞（仅当天那一条）。删除与计数原子。 */

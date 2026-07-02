@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { CollectionErrorCode } from 'src/common/app-error-codes';
 import { CollectionType, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreateCollectionDto, UserCollectionDto } from './dto/collection.dto';
@@ -33,7 +34,10 @@ export class CollectionService {
       where: { id, userID: userId },
     });
     if (result.count !== 1) {
-      throw new NotFoundException('Collection not found');
+      throw new NotFoundException({
+        message: 'Collection not found',
+        errorCode: CollectionErrorCode.NotFound,
+      });
     }
   }
 }

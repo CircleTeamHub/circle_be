@@ -3,6 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { IconErrorCode } from 'src/common/app-error-codes';
 import {
   DisplayIconDto,
   DisplayIconTypeDto,
@@ -362,7 +363,10 @@ export class IconService {
     items: UpdateDisplayIconItemDto[],
   ): Promise<DisplayIconDto[]> {
     if (items.length > MAX_DISPLAY_ICONS) {
-      throw new BadRequestException('A user can display at most 5 icons');
+      throw new BadRequestException({
+        message: 'A user can display at most 5 icons',
+        errorCode: IconErrorCode.DisplayLimit,
+      });
     }
 
     const eligibility = await this.resolveEligibility(userId);
@@ -801,14 +805,20 @@ export class IconService {
           !item.systemKey ||
           !systemKeys.has(systemSelectionKey(item.systemKey, systemVariant))
         ) {
-          throw new BadRequestException('Invalid system icon selection');
+          throw new BadRequestException({
+            message: 'Invalid system icon selection',
+            errorCode: IconErrorCode.InvalidSystemSelection,
+          });
         }
         item.systemVariant = systemVariant ?? undefined;
         continue;
       }
 
       if (!item.circleId || !circleIds.has(item.circleId)) {
-        throw new BadRequestException('Invalid circle icon selection');
+        throw new BadRequestException({
+          message: 'Invalid circle icon selection',
+          errorCode: IconErrorCode.InvalidCircleSelection,
+        });
       }
     }
   }
@@ -823,7 +833,10 @@ export class IconService {
           : `circle:${item.circleId ?? ''}`;
 
       if (seen.has(key)) {
-        throw new BadRequestException('Duplicate icon selection');
+        throw new BadRequestException({
+          message: 'Duplicate icon selection',
+          errorCode: IconErrorCode.DuplicateSelection,
+        });
       }
       seen.add(key);
     }

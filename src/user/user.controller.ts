@@ -12,6 +12,7 @@ import {
   UseGuards,
   Req,
 } from '@nestjs/common';
+import { UserErrorCode } from 'src/common/app-error-codes';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -96,7 +97,10 @@ export class UserController {
     @Req() req: RequestWithUser,
   ) {
     if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
-      throw new ForbiddenException('You can only update your own profile');
+      throw new ForbiddenException({
+        message: 'You can only update your own profile',
+        errorCode: UserErrorCode.UpdateOwnOnly,
+      });
     }
     return this.userService.update(id, dto);
   }
@@ -123,7 +127,10 @@ export class UserController {
     @Req() req: RequestWithUser,
   ) {
     if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
-      throw new ForbiddenException('You can only delete your own account');
+      throw new ForbiddenException({
+        message: 'You can only delete your own account',
+        errorCode: UserErrorCode.DeleteOwnOnly,
+      });
     }
     return this.userService.remove(id);
   }

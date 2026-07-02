@@ -11,8 +11,9 @@ This is incremental — pick a module, tag it, ship. Nothing here is urgent.
 ## 1. Where we are (2026-07-02)
 
 - **Mechanism is done** (see `src/common/app-error-codes.ts` + `all-exception.filter.ts`; frontend `services/api/errors.ts` + `server-error-codes.ts`). Don't redesign it — just add codes.
-- **281** user-facing throws total; **78 tagged** (= 53 distinct codes) across `auth / coin / membership / circle / group`.
-- **~203 untagged throws remain.** A cross-repo test already enforces `APP_ERROR_CODES == SERVER_ERROR_CODES == serverErrors keys (×5 locales)`, so every new code must land in all three or CI (locally) goes red.
+- **284** user-facing throws total; **245 tagged** (= **150 distinct codes** across **19 groups**: the earlier set plus `chat-history / collection / icon / like / privacy / user`). Rounds 5–10 have landed, plus the user-actionable tails of call / friend / note / trace / conversation-group / chat-history / privacy / user / like / icon / collection.
+- **39 untagged throws remain, and all are skip-by-design** per §2: transient `ServiceUnavailable` (LiveKit / upload / export "not configured" / account-id-gen / temp-chat retry / call membership), session mechanics (`refresh-token` reuse/expiry), webhook & dev guards (`RAW_BODY_REQUIRED`, `idempotency-key header`, `objectKey`/`section`/`reorder` validation, "Invalid timestamp"), internal by-id `User not found` (credit / icon / user / call `normalizeID`), storage-origin security guards (`circle-plaza`, `utils/storage-url` — deliberately un-coded), and the admin-only `friend-report-admin` console. A cross-repo test enforces `APP_ERROR_CODES == SERVER_ERROR_CODES == serverErrors keys (×5 locales)`, incl. an explicit `SERVER_ERROR_CODES == APP_ERROR_CODES` assertion.
+- **Display-wiring still owed for 3 modules.** `like`, `icon`, and `collection` screens do **not** yet funnel through `getApiErrorMessage`, so their codes are correct and forward-compatible but won't show localized copy until those screens are wired (route their `catch` through the shared helper). Everything else tagged is already displayed. Newer frontends degrade untagged `ApiError`s to the caller's generic fallback (no raw-message leak), so nothing regresses in the meantime.
 
 ### Untagged inventory, by module
 
@@ -51,7 +52,7 @@ This is incremental — pick a module, tag it, ship. Nothing here is urgent.
 - 🤔 **Maybe** — `NotFound` the user triggers directly by input. Prefer a small set of shared codes (e.g. `X_USER_NOT_FOUND` per domain) over one per entity.
 - ❌ **No** — internal/transient (`ServiceUnavailable`), developer guards (missing header, wrong endpoint), or anything masked as `Internal server error` in prod. The generic caller fallback already covers these.
 
-**Don't blanket-tag all 203.** Realistic target is ~90–120 codes total; the rest stay on the generic fallback.
+**Don't blanket-tag all remaining throws.** The rest stay on the generic fallback unless they are user-actionable or a screen bypasses the shared frontend helper.
 
 ---
 

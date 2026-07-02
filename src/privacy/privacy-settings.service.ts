@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
+import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   MOMENTS_VISIBILITY_OPTIONS,
@@ -196,25 +197,37 @@ export class PrivacySettingsService {
       input.messageSelfDestructDays !== undefined &&
       !SELF_DESTRUCT_DAY_OPTIONS.includes(input.messageSelfDestructDays)
     ) {
-      throw new BadRequestException('Unsupported self-destruct duration');
+      throw new BadRequestException({
+        message: 'Unsupported self-destruct duration',
+        errorCode: PrivacyErrorCode.SelfDestructInvalid,
+      });
     }
     if (
       input.momentsVisibility !== undefined &&
       !MOMENTS_VISIBILITY_OPTIONS.includes(input.momentsVisibility)
     ) {
-      throw new BadRequestException('Unsupported moments visibility');
+      throw new BadRequestException({
+        message: 'Unsupported moments visibility',
+        errorCode: PrivacyErrorCode.MomentsVisibilityInvalid,
+      });
     }
     if (
       input.callPermission !== undefined &&
       !PERMISSION_OPTIONS.includes(input.callPermission)
     ) {
-      throw new BadRequestException('Unsupported call permission');
+      throw new BadRequestException({
+        message: 'Unsupported call permission',
+        errorCode: PrivacyErrorCode.CallPermissionInvalid,
+      });
     }
     if (
       input.groupInvitePermission !== undefined &&
       !PERMISSION_OPTIONS.includes(input.groupInvitePermission)
     ) {
-      throw new BadRequestException('Unsupported invite permission');
+      throw new BadRequestException({
+        message: 'Unsupported invite permission',
+        errorCode: PrivacyErrorCode.InvitePermissionInvalid,
+      });
     }
   }
 

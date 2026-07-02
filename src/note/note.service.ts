@@ -332,7 +332,10 @@ export class NoteService {
     });
 
     if (groups.length !== groupIds.length) {
-      throw new NotFoundException('Note group not found');
+      throw new NotFoundException({
+        message: 'Note group not found',
+        errorCode: NoteErrorCode.GroupNotFound,
+      });
     }
 
     return groups;
@@ -348,7 +351,10 @@ export class NoteService {
     });
 
     if (!group) {
-      throw new NotFoundException('Note group not found');
+      throw new NotFoundException({
+        message: 'Note group not found',
+        errorCode: NoteErrorCode.GroupNotFound,
+      });
     }
 
     return group;
@@ -365,7 +371,10 @@ export class NoteService {
     });
 
     if (!note) {
-      throw new NotFoundException('Note not found');
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
     }
 
     return note;
@@ -512,7 +521,10 @@ export class NoteService {
             MAX_EXPORT_SINGLE_MEDIA_BYTES,
           );
           if (image.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
-            throw new BadRequestException('Image file is too large to embed');
+            throw new BadRequestException({
+              message: 'Image file is too large to embed',
+              errorCode: NoteErrorCode.ImageTooLarge,
+            });
           }
           doc.moveDown(0.5);
           doc.image(image, {
@@ -1264,7 +1276,10 @@ export class NoteService {
         select: { id: true },
       });
       if (notes.length !== noteIDs.length) {
-        throw new NotFoundException('Note not found');
+        throw new NotFoundException({
+          message: 'Note not found',
+          errorCode: NoteErrorCode.NotFound,
+        });
       }
     }
 
@@ -1320,7 +1335,10 @@ export class NoteService {
     });
 
     if (!note) {
-      throw new NotFoundException('Note not found');
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
     }
 
     return this.mapDetail(note, ownerID);
@@ -1341,7 +1359,10 @@ export class NoteService {
     });
 
     if (!note) {
-      throw new NotFoundException('Note not found');
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
     }
 
     const basename = sanitizeFilenamePart(note.title);
@@ -1468,7 +1489,10 @@ export class NoteService {
         select: { id: true, status: true },
       });
       if (!existing) {
-        throw new NotFoundException('Note not found');
+        throw new NotFoundException({
+          message: 'Note not found',
+          errorCode: NoteErrorCode.NotFound,
+        });
       }
 
       await tx.noteMedia.deleteMany({
@@ -1551,7 +1575,10 @@ export class NoteService {
         select: { id: true },
       });
       if (!existing) {
-        throw new NotFoundException('Note not found');
+        throw new NotFoundException({
+          message: 'Note not found',
+          errorCode: NoteErrorCode.NotFound,
+        });
       }
 
       await tx.noteGroupMembership.deleteMany({
@@ -1723,7 +1750,10 @@ export class NoteService {
     });
 
     if (!group) {
-      throw new NotFoundException('Note group not found');
+      throw new NotFoundException({
+        message: 'Note group not found',
+        errorCode: NoteErrorCode.GroupNotFound,
+      });
     }
 
     // Only check for name conflicts when the name is actually changing.
@@ -1784,7 +1814,10 @@ export class NoteService {
     });
 
     if (!group) {
-      throw new NotFoundException('Note group not found');
+      throw new NotFoundException({
+        message: 'Note group not found',
+        errorCode: NoteErrorCode.GroupNotFound,
+      });
     }
 
     await this.prisma.$transaction(async (tx) => {

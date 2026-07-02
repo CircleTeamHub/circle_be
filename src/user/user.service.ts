@@ -3,6 +3,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { UserErrorCode } from 'src/common/app-error-codes';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -78,7 +79,10 @@ function normalizeBirthdayInput(value: string | null | undefined) {
     // The DTO's @IsDateString validator should already reject this, but the
     // service is also called from places that bypass the pipe (e.g. internal
     // jobs); fail fast instead of letting an Invalid Date hit Prisma.
-    throw new BadRequestException(`Invalid birthday value: ${value}`);
+    throw new BadRequestException({
+      message: `Invalid birthday value: ${value}`,
+      errorCode: UserErrorCode.InvalidBirthday,
+    });
   }
 
   return parsed;

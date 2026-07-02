@@ -2,17 +2,23 @@ import {
   APP_ERROR_CODES,
   AuthErrorCode,
   CallErrorCode,
+  ChatHistoryErrorCode,
   CircleErrorCode,
   CircleInvitationErrorCode,
   CoinErrorCode,
+  CollectionErrorCode,
   ConversationGroupErrorCode,
   FriendErrorCode,
   GroupErrorCode,
+  IconErrorCode,
+  LikeErrorCode,
   MembershipErrorCode,
   NoteErrorCode,
   PlazaErrorCode,
+  PrivacyErrorCode,
   TempChatErrorCode,
   TraceErrorCode,
+  UserErrorCode,
 } from './app-error-codes';
 
 // These codes are a stable contract shared with the frontend i18n map
@@ -37,6 +43,12 @@ describe('app error code catalog', () => {
     NoteErrorCode,
     CallErrorCode,
     ConversationGroupErrorCode,
+    ChatHistoryErrorCode,
+    CollectionErrorCode,
+    IconErrorCode,
+    LikeErrorCode,
+    PrivacyErrorCode,
+    UserErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>

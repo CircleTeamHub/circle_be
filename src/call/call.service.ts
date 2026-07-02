@@ -97,7 +97,10 @@ export class CallService {
       (userID) => userID !== initiatorID,
     );
     if (inviteeIDs.length === 0) {
-      throw new BadRequestException('CALL_INVITEES_REQUIRED');
+      throw new BadRequestException({
+        message: 'CALL_INVITEES_REQUIRED',
+        errorCode: CallErrorCode.InviteesRequired,
+      });
     }
     this.assertCallTypeEnabled(dto.callType);
 
@@ -232,7 +235,10 @@ export class CallService {
       };
     }
     if (participant.status !== CallParticipantStatus.INVITED) {
-      throw new ConflictException('CALL_NOT_INVITED');
+      throw new ConflictException({
+        message: 'CALL_NOT_INVITED',
+        errorCode: CallErrorCode.NotInvited,
+      });
     }
 
     const call = participant.call as CallWithParticipants;
@@ -300,7 +306,10 @@ export class CallService {
       return participant;
     }
     if (participant.status !== CallParticipantStatus.INVITED) {
-      throw new ConflictException('CALL_NOT_INVITED');
+      throw new ConflictException({
+        message: 'CALL_NOT_INVITED',
+        errorCode: CallErrorCode.NotInvited,
+      });
     }
     const rejectedAt = new Date();
     const updatedParticipant = await this.prisma.callParticipant.update({
@@ -402,16 +411,25 @@ export class CallService {
       include: this.callInclude(),
     })) as CallWithParticipants | null;
     if (!call) {
-      throw new NotFoundException('CALL_NOT_FOUND');
+      throw new NotFoundException({
+        message: 'CALL_NOT_FOUND',
+        errorCode: CallErrorCode.NotFound,
+      });
     }
     if (call.initiatorID !== userID) {
-      throw new ForbiddenException('CALL_NOT_ALLOWED');
+      throw new ForbiddenException({
+        message: 'CALL_NOT_ALLOWED',
+        errorCode: CallErrorCode.NotAllowed,
+      });
     }
     if (call.status === CallStatus.CANCELED) {
       return this.toCallDto(call);
     }
     if (call.status !== CallStatus.RINGING) {
-      throw new ConflictException('CALL_ALREADY_ACTIVE');
+      throw new ConflictException({
+        message: 'CALL_ALREADY_ACTIVE',
+        errorCode: CallErrorCode.AlreadyActive,
+      });
     }
 
     const endedAt = new Date();
@@ -476,7 +494,10 @@ export class CallService {
       });
     }
     if (participant.status !== CallParticipantStatus.JOINED) {
-      throw new ConflictException('CALL_NOT_ACCEPTED');
+      throw new ConflictException({
+        message: 'CALL_NOT_ACCEPTED',
+        errorCode: CallErrorCode.NotAccepted,
+      });
     }
     await this.prisma.callParticipant.update({
       where: { callID_userID: { callID: callId, userID } },
@@ -535,7 +556,10 @@ export class CallService {
       },
     });
     if (!participant) {
-      throw new NotFoundException('CALL_NOT_FOUND');
+      throw new NotFoundException({
+        message: 'CALL_NOT_FOUND',
+        errorCode: CallErrorCode.NotFound,
+      });
     }
     return participant;
   }
@@ -578,7 +602,10 @@ export class CallService {
         });
       }
       if (!participantIDs.every((userID) => active.has(userID))) {
-        throw new BadRequestException('CALL_INVITEE_INVALID');
+        throw new BadRequestException({
+          message: 'CALL_INVITEE_INVALID',
+          errorCode: CallErrorCode.InviteeInvalid,
+        });
       }
       return;
     }
@@ -597,7 +624,10 @@ export class CallService {
         });
       }
       if (checks.some((isMember) => !isMember)) {
-        throw new BadRequestException('CALL_INVITEE_INVALID');
+        throw new BadRequestException({
+          message: 'CALL_INVITEE_INVALID',
+          errorCode: CallErrorCode.InviteeInvalid,
+        });
       }
     } catch (error) {
       if (
@@ -698,7 +728,10 @@ export class CallService {
       select: userLiteSelect,
     });
     if (users.length < userIDs.length) {
-      throw new BadRequestException('CALL_INVITEE_INVALID');
+      throw new BadRequestException({
+        message: 'CALL_INVITEE_INVALID',
+        errorCode: CallErrorCode.InviteeInvalid,
+      });
     }
     return new Map(users.map((user) => [user.id, user]));
   }
@@ -941,7 +974,10 @@ export class CallService {
 
   private assertCallTypeEnabled(callType: CallType): void {
     if (callType === CallType.VIDEO && !this.readBoolean('CALL_ENABLE_VIDEO')) {
-      throw new BadRequestException('CALL_VIDEO_DISABLED');
+      throw new BadRequestException({
+        message: 'CALL_VIDEO_DISABLED',
+        errorCode: CallErrorCode.VideoDisabled,
+      });
     }
   }
 

@@ -763,7 +763,10 @@ export class FriendService {
     });
 
     if (!activity) {
-      throw new NotFoundException('Friend activity not found');
+      throw new NotFoundException({
+        message: 'Friend activity not found',
+        errorCode: FriendErrorCode.ActivityNotFound,
+      });
     }
 
     return this.toFriendActivityDto(activity);
@@ -781,7 +784,10 @@ export class FriendService {
       });
 
       if (!activity) {
-        throw new NotFoundException('Friend activity not found');
+        throw new NotFoundException({
+          message: 'Friend activity not found',
+          errorCode: FriendErrorCode.ActivityNotFound,
+        });
       }
     }
 
@@ -941,7 +947,10 @@ export class FriendService {
     } catch (error) {
       // P2025 = record to delete does not exist.
       if (this.prismaErrorCode(error) === 'P2025') {
-        throw new NotFoundException('Block not found');
+        throw new NotFoundException({
+          message: 'Block not found',
+          errorCode: FriendErrorCode.BlockNotFound,
+        });
       }
       throw error;
     }
@@ -1004,7 +1013,11 @@ export class FriendService {
 
   async createTag(userId: string, name: string, color?: string) {
     const trimmed = name.trim();
-    if (!trimmed) throw new BadRequestException('Tag name cannot be empty');
+    if (!trimmed)
+      throw new BadRequestException({
+        message: 'Tag name cannot be empty',
+        errorCode: FriendErrorCode.TagNameEmpty,
+      });
 
     // Only enforce the cap when this would be a *new* tag — re-submitting an
     // existing name is an idempotent color update and must stay allowed.
