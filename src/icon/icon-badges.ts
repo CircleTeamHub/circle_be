@@ -2,7 +2,9 @@ import { SystemIconKeyDto } from './dto/icon.dto';
 
 export type EligibilityUser = {
   vipLevel: number;
-  receivedLikeCount: number;
+  // Distinct-recognizer count from CollaborationRecognition — the basis for the
+  // Top Collaborator badge tiers (not raw likes).
+  recognitionCount: number;
 };
 
 export type EligibleSystemIcon = {
@@ -71,7 +73,7 @@ const LEVELED_SYSTEM_BADGE_DEFINITIONS: LeveledSystemBadgeDefinition[] = [
     getEarnedLevel: (user) =>
       TOP_COLLABORATOR_BADGE_LEVELS.reduce(
         (earnedLevel, tier) =>
-          user.receivedLikeCount >= (tier.recognitionCount ?? Infinity)
+          user.recognitionCount >= (tier.recognitionCount ?? Infinity)
             ? tier.level
             : earnedLevel,
         0,

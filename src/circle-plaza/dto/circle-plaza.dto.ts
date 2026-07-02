@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
+  ArrayMinSize,
   ArrayUnique,
   IsArray,
   IsBoolean,
@@ -60,6 +61,17 @@ export class CreatePlazaPostDto {
   isHorn?: boolean;
 
   @ApiPropertyOptional({
+    description: 'Post lifetime in hours. Min 24h, max 168h.',
+    default: 24,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(24)
+  @Max(168)
+  @IsOptional()
+  expiresInHours?: number;
+
+  @ApiPropertyOptional({
     description: 'Min VIP level to interact, null = no restriction',
   })
   @Type(() => Number)
@@ -108,6 +120,21 @@ export class CreatePlazaPostDto {
   @IsBoolean()
   @IsOptional()
   signupFancyRestriction?: boolean;
+}
+
+export class RecognizePostCollaboratorsDto {
+  @ApiProperty({ type: [String], minItems: 1, maxItems: 3 })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(3)
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  recipientIds: string[];
+}
+
+export class CollaborationRecognitionResultDto {
+  count: number;
+  recognizedUserIds: string[];
 }
 
 export class PlazaFeedQueryDto {
@@ -189,6 +216,7 @@ export class PlazaPostDto {
   circle: PlazaPostCircleDto;
   canInteract: boolean;
   createdAt: string;
+  expiresAt: string;
 }
 
 export class MyCirclePostDto {
@@ -200,6 +228,7 @@ export class MyCirclePostDto {
   unreadSignupCount: number;
   status: string;
   createdAt: string;
+  expiresAt: string;
 }
 
 export class PostSignupItemDto {

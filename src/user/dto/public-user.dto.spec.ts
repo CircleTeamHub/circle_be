@@ -39,6 +39,7 @@ describe('SelfUserDto serialization', () => {
             imageUrl: null,
             fallbackIconName: 'diamond',
             systemKey: 'VIP',
+            recognitionCount: 100,
             sortOrder: 0,
           },
         ],
@@ -55,6 +56,7 @@ describe('SelfUserDto serialization', () => {
         title: 'VIP5',
         fallbackIconName: 'diamond',
         systemKey: 'VIP',
+        recognitionCount: 100,
         sortOrder: 0,
       }),
     ]);

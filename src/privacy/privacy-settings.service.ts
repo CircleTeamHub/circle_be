@@ -52,6 +52,33 @@ export class PrivacySettingsService {
     return { ...DEFAULT_PRIVACY_SETTINGS };
   }
 
+  /**
+   * Batch variant of {@link getSettings} for callers resolving many users at
+   * once (e.g. icon eligibility for a feed page). One query instead of N;
+   * users without a row fall back to defaults, matching getSettings.
+   */
+  async getSettingsForUsers(
+    userIds: string[],
+  ): Promise<Map<string, PrivacySettingsDto>> {
+    const result = new Map<string, PrivacySettingsDto>();
+    const uniqueIds = [...new Set(userIds.filter(Boolean))];
+    if (uniqueIds.length === 0) return result;
+
+    const rows = await this.prisma.userPrivacySetting.findMany({
+      where: { userID: { in: uniqueIds } },
+    });
+    const byUser = new Map(
+      rows.map((row) => [
+        (row as StoredPrivacySettings).userID as string,
+        this.toDto(row as StoredPrivacySettings),
+      ]),
+    );
+    for (const id of uniqueIds) {
+      result.set(id, byUser.get(id) ?? { ...DEFAULT_PRIVACY_SETTINGS });
+    }
+    return result;
+  }
+
   async updateSettings(
     userId: string,
     input: UpdatePrivacySettingsDto,

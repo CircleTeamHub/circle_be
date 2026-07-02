@@ -12,11 +12,9 @@ import {
 } from './dto/icon.dto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import {
-  Prisma,
-  SystemIconKey,
-  UserDisplayIconType,
-} from 'src/generated/prisma';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import type { PrivacySettingsDto } from 'src/privacy/privacy-settings.dto';
+import { SystemIconKey, UserDisplayIconType } from 'src/generated/prisma';
 import {
   buildLeveledSystemIcons,
   EligibleSystemIcon,
@@ -28,7 +26,14 @@ import {
 const NEW_USER_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_DISPLAY_ICONS = 5;
 const CIRCLE_BUILDER_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// Circle Builder requires MORE THAN this many members (i.e. >100).
 const CIRCLE_BUILDER_MIN_MEMBERS = 100;
+// Verified Profile requires a bio of at least this length in one of the fields.
+const VERIFIED_PROFILE_MIN_BIO_LENGTH = 10;
+// Cap on memberships scanned per user for eligibility — a power user could join
+// thousands of circles; the newest are the relevant ones for circle icons and
+// Circle Builder only needs one qualifying circle.
+const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -53,23 +58,28 @@ type Eligibility = {
 // batch paths so both compute identical results from the same shapes.
 type EligibilityUserRow = {
   vipLevel: number;
-  receivedLikeCount: number;
   createdAt: Date;
   status: string;
+  avatarUrl: string | null;
+  nickname: string | null;
+  city: string | null;
+  email: string | null;
   phoneNumber: string | null;
   wechat: string | null;
   qq: string | null;
-  privacySetting: {
-    showPhone: boolean;
-    showWechat: boolean;
-    showQQ: boolean;
-  } | null;
+  persona: string | null;
+  helloWords: string | null;
+  whatsup: string | null;
 };
 
 type EligibilityCircleMembership = {
+  role: string;
   circle: {
     id: string;
     name: string;
+    createdAt: Date;
+    deleted: boolean;
+    memberCount: number;
     currentIconAsset: { id: string; imageUrl: string | null } | null;
   };
 };
@@ -87,30 +97,34 @@ type StoredSelection = {
 const ELIGIBILITY_USER_SELECT = {
   id: true,
   vipLevel: true,
-  receivedLikeCount: true,
   createdAt: true,
   status: true,
+  avatarUrl: true,
+  nickname: true,
+  city: true,
+  email: true,
   phoneNumber: true,
   wechat: true,
   qq: true,
+  persona: true,
+  helloWords: true,
+  whatsup: true,
   iconPreferencesInitialized: true,
-  privacySetting: {
-    select: {
-      showPhone: true,
-      showWechat: true,
-      showQQ: true,
-    },
-  },
 } as const;
 
-// Prisma select for the circles that contribute a wearable circle icon.
+// Prisma select for active memberships — feeds both circle icons and the
+// Circle Builder check, so it carries role and the circle's size/age.
 const ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT = {
   userID: true,
   circleID: true,
+  role: true,
   circle: {
     select: {
       id: true,
       name: true,
+      createdAt: true,
+      deleted: true,
+      memberCount: true,
       currentIconAsset: {
         select: {
           id: true,
@@ -140,6 +154,7 @@ export class IconService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   private invalidateDisplayIconCache(userId: string): void {
@@ -239,32 +254,28 @@ export class IconService {
     }
     if (uncached.length === 0) return result;
 
-    const [users, memberships, builderRows, selections] = await Promise.all([
-      this.prisma.user.findMany({
-        where: { id: { in: uncached } },
-        select: ELIGIBILITY_USER_SELECT,
-      }),
-      this.prisma.circleMember.findMany({
-        where: {
-          userID: { in: uncached },
-          status: 'ACTIVE',
-          circle: {
-            deleted: false,
-            currentIconAssetID: { not: null },
+    const [users, memberships, recognitionCounts, privacyByUser, selections] =
+      await Promise.all([
+        this.prisma.user.findMany({
+          where: { id: { in: uncached } },
+          select: ELIGIBILITY_USER_SELECT,
+        }),
+        this.prisma.circleMember.findMany({
+          where: {
+            userID: { in: uncached },
+            status: 'ACTIVE',
+            circle: { deleted: false },
           },
-        },
-        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-        orderBy: { createdAt: 'desc' },
-      }),
-      this.prisma.circleMember.findMany({
-        where: this.builderMembershipWhere(uncached),
-        select: { userID: true },
-      }),
-      this.prisma.userDisplayIcon.findMany({
-        where: { userID: { in: uncached } },
-        orderBy: { sortOrder: 'asc' },
-      }),
-    ]);
+          select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
+          orderBy: { createdAt: 'desc' },
+        }),
+        this.recognitionCountsFor(uncached),
+        this.privacySettings.getSettingsForUsers(uncached),
+        this.prisma.userDisplayIcon.findMany({
+          where: { userID: { in: uncached } },
+          orderBy: { sortOrder: 'asc' },
+        }),
+      ]);
 
     const membershipsByUser = new Map<string, EligibilityCircleMembership[]>();
     for (const membership of memberships) {
@@ -272,7 +283,6 @@ export class IconService {
       list.push(membership);
       membershipsByUser.set(membership.userID, list);
     }
-    const builderUserIds = new Set(builderRows.map((row) => row.userID));
     const selectionsByUser = new Map<string, StoredSelection[]>();
     for (const selection of selections) {
       const list = selectionsByUser.get(selection.userID) ?? [];
@@ -284,7 +294,10 @@ export class IconService {
       const eligibility = this.buildEligibility(
         user,
         membershipsByUser.get(user.id) ?? [],
-        builderUserIds.has(user.id),
+        recognitionCounts.get(user.id) ?? 0,
+        // getSettingsForUsers returns an entry (defaults included) for every
+        // requested id, so this is always defined for a user in `uncached`.
+        privacyByUser.get(user.id) as PrivacySettingsDto,
       );
       const display = this.computeReadonlyDisplayIcons(
         user.id,
@@ -409,56 +422,57 @@ export class IconService {
   }
 
   private async resolveEligibility(userId: string): Promise<Eligibility> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: ELIGIBILITY_USER_SELECT,
-    });
+    const [user, circleMemberships, recognitionCounts, privacy] =
+      await Promise.all([
+        this.prisma.user.findUnique({
+          where: { id: userId },
+          select: ELIGIBILITY_USER_SELECT,
+        }),
+        this.prisma.circleMember.findMany({
+          where: {
+            userID: userId,
+            status: 'ACTIVE',
+            circle: { deleted: false },
+          },
+          select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
+          orderBy: { createdAt: 'desc' },
+          take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
+        }),
+        this.recognitionCountsFor([userId]),
+        this.privacySettings.getSettings(userId),
+      ]);
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    const [circleMemberships, builderMembership] = await Promise.all([
-      this.prisma.circleMember.findMany({
-        where: {
-          userID: userId,
-          status: 'ACTIVE',
-          circle: {
-            deleted: false,
-            currentIconAssetID: { not: null },
-          },
-        },
-        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-        orderBy: { createdAt: 'desc' },
-      }),
-      this.prisma.circleMember.findFirst({
-        where: this.builderMembershipWhere(userId),
-        select: { id: true },
-      }),
-    ]);
-
     return this.buildEligibility(
       user,
       circleMemberships,
-      Boolean(builderMembership),
+      recognitionCounts.get(userId) ?? 0,
+      privacy,
     );
   }
 
-  private builderMembershipWhere(
-    userId: string | string[],
-  ): Prisma.CircleMemberWhereInput {
-    return {
-      userID: Array.isArray(userId) ? { in: userId } : userId,
-      status: 'ACTIVE',
-      role: { in: ['OWNER', 'ADMIN'] },
-      circle: {
-        deleted: false,
-        createdAt: {
-          lte: new Date(Date.now() - CIRCLE_BUILDER_MIN_AGE_MS),
-        },
-        memberCount: { gt: CIRCLE_BUILDER_MIN_MEMBERS },
-      },
-    };
+  // Distinct-recognizer counts per recipient from CollaborationRecognition — a
+  // badge is "N different people recognized you", which one author recognizing
+  // the same colluder repeatedly can't inflate. Batched so the feed path stays
+  // N+1-free.
+  private async recognitionCountsFor(
+    userIds: string[],
+  ): Promise<Map<string, number>> {
+    const counts = new Map<string, number>();
+    const uniqueIds = [...new Set(userIds.filter(Boolean))];
+    if (uniqueIds.length === 0) return counts;
+
+    const groups = await this.prisma.collaborationRecognition.groupBy({
+      by: ['recipientID', 'recognizerID'],
+      where: { recipientID: { in: uniqueIds }, revokedAt: null },
+    });
+    for (const group of groups) {
+      counts.set(group.recipientID, (counts.get(group.recipientID) ?? 0) + 1);
+    }
+    return counts;
   }
 
   // Pure eligibility assembly from prefetched rows. Kept side-effect-free so the
@@ -466,9 +480,13 @@ export class IconService {
   private buildEligibility(
     user: EligibilityUserRow,
     circleMemberships: EligibilityCircleMembership[],
-    hasBuilderMembership: boolean,
+    recognitionCount: number,
+    privacy: PrivacySettingsDto,
   ): Eligibility {
-    const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons(user);
+    const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons({
+      vipLevel: user.vipLevel,
+      recognitionCount,
+    });
     if (Date.now() - user.createdAt.getTime() <= NEW_USER_MS) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.NEW_USER,
@@ -479,15 +497,7 @@ export class IconService {
       });
     }
 
-    const canShowPhone =
-      (user.privacySetting?.showPhone ?? false) && Boolean(user.phoneNumber);
-    const canShowWechat =
-      (user.privacySetting?.showWechat ?? true) && Boolean(user.wechat);
-    const canShowQQ = (user.privacySetting?.showQQ ?? true) && Boolean(user.qq);
-    if (
-      user.status === 'ACTIVE' &&
-      (canShowPhone || canShowWechat || canShowQQ)
-    ) {
+    if (this.isVerifiedProfileEligible(user, privacy)) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.VERIFIED_PROFILE,
         systemVariant: SystemIconKeyDto.VERIFIED_PROFILE,
@@ -497,7 +507,7 @@ export class IconService {
       });
     }
 
-    if (hasBuilderMembership) {
+    if (this.hasCircleBuilderCircle(circleMemberships)) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.CIRCLE_BUILDER,
         systemVariant: SystemIconKeyDto.CIRCLE_BUILDER,
@@ -517,6 +527,55 @@ export class IconService {
       }));
 
     return { systemIcons, circleIcons };
+  }
+
+  // Verified Profile: an ACTIVE user with a complete profile (avatar, nickname,
+  // city, email, a real bio) and at least one publicly-shown contact method.
+  private isVerifiedProfileEligible(
+    user: EligibilityUserRow,
+    privacy: PrivacySettingsDto,
+  ): boolean {
+    if (user.status !== 'ACTIVE') return false;
+
+    const hasPublicContact =
+      (this.hasText(user.phoneNumber) && privacy.showPhone) ||
+      (this.hasText(user.wechat) && privacy.showWechat) ||
+      (this.hasText(user.qq) && privacy.showQQ);
+    const hasBio = [user.persona, user.helloWords, user.whatsup].some((value) =>
+      this.hasText(value, VERIFIED_PROFILE_MIN_BIO_LENGTH),
+    );
+
+    return (
+      this.hasText(user.avatarUrl) &&
+      this.hasText(user.nickname) &&
+      this.hasText(user.city) &&
+      this.hasText(user.email) &&
+      hasBio &&
+      hasPublicContact
+    );
+  }
+
+  // Circle Builder: OWNER/ADMIN of a live circle with >100 members, aged ≥7d.
+  private hasCircleBuilderCircle(
+    memberships: EligibilityCircleMembership[],
+  ): boolean {
+    const now = Date.now();
+    return memberships.some((membership) => {
+      if (membership.role !== 'OWNER' && membership.role !== 'ADMIN') {
+        return false;
+      }
+      if (membership.circle.deleted) return false;
+      if (membership.circle.memberCount <= CIRCLE_BUILDER_MIN_MEMBERS) {
+        return false;
+      }
+      return (
+        now - membership.circle.createdAt.getTime() >= CIRCLE_BUILDER_MIN_AGE_MS
+      );
+    });
+  }
+
+  private hasText(value: string | null | undefined, minLength = 1): boolean {
+    return typeof value === 'string' && value.trim().length >= minLength;
   }
 
   private resolveSelectionSystemVariant(
