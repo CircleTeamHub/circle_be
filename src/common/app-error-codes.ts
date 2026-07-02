@@ -75,12 +75,40 @@ export const GroupErrorCode = {
   MembershipVerifyUnavailable: 'GROUP_MEMBERSHIP_VERIFY_UNAVAILABLE',
 } as const;
 
+// 圈子邀请 / 10 人担保流程。入圈限制(VIP / 信用分 / 靓号)与「已是成员 / 圈子已满 /
+// 用户不存在」复用上面的 CircleErrorCode,这里只列邀请流程独有的错误。
+export const CircleInvitationErrorCode = {
+  InviterNotMember: 'INVITATION_INVITER_NOT_MEMBER',
+  NotAllowed: 'INVITATION_NOT_ALLOWED',
+  AlreadyPending: 'INVITATION_ALREADY_PENDING',
+  NotFound: 'INVITATION_NOT_FOUND',
+  ApplicantOnly: 'INVITATION_APPLICANT_ONLY',
+  NotPending: 'INVITATION_NOT_PENDING',
+  VerifierNotMember: 'INVITATION_VERIFIER_NOT_MEMBER',
+  AlreadyVerifier: 'INVITATION_ALREADY_VERIFIER',
+  SlotsFilled: 'INVITATION_SLOTS_FILLED',
+  NoPendingVerification: 'INVITATION_NO_PENDING_VERIFICATION',
+  OwnerAdminOnly: 'INVITATION_OWNER_ADMIN_ONLY',
+  ViewForbidden: 'INVITATION_VIEW_FORBIDDEN',
+} as const;
+
+// 临时聊天(访客免注册)。链接失效 / 已结束 / 人数已满面向 H5 访客页,
+// 仅创建者可结束面向 App 内 TempChatsScreen。
+export const TempChatErrorCode = {
+  LinkInvalid: 'TEMP_CHAT_LINK_INVALID',
+  Ended: 'TEMP_CHAT_ENDED',
+  Full: 'TEMP_CHAT_FULL',
+  CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
+} as const;
+
 export type AppErrorCode =
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
   | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
   | (typeof CircleErrorCode)[keyof typeof CircleErrorCode]
-  | (typeof GroupErrorCode)[keyof typeof GroupErrorCode];
+  | (typeof GroupErrorCode)[keyof typeof GroupErrorCode]
+  | (typeof CircleInvitationErrorCode)[keyof typeof CircleInvitationErrorCode]
+  | (typeof TempChatErrorCode)[keyof typeof TempChatErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
   AuthErrorCode,
@@ -88,6 +116,8 @@ export const APP_ERROR_CODE_GROUPS = [
   MembershipErrorCode,
   CircleErrorCode,
   GroupErrorCode,
+  CircleInvitationErrorCode,
+  TempChatErrorCode,
 ] as const;
 
 export const APP_ERROR_CODES = APP_ERROR_CODE_GROUPS.flatMap((group) =>

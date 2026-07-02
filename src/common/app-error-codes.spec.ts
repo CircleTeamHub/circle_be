@@ -2,9 +2,11 @@ import {
   APP_ERROR_CODES,
   AuthErrorCode,
   CircleErrorCode,
+  CircleInvitationErrorCode,
   CoinErrorCode,
   GroupErrorCode,
   MembershipErrorCode,
+  TempChatErrorCode,
 } from './app-error-codes';
 
 // These codes are a stable contract shared with the frontend i18n map
@@ -21,6 +23,8 @@ describe('app error code catalog', () => {
     MembershipErrorCode,
     CircleErrorCode,
     GroupErrorCode,
+    CircleInvitationErrorCode,
+    TempChatErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>
