@@ -33,8 +33,19 @@ export const CircleErrorCode = {
   RequestPending: 'CIRCLE_REQUEST_PENDING',
 } as const;
 
+export const GroupErrorCode = {
+  ManagerOnly: 'GROUP_MANAGER_ONLY',
+  OwnerCannotLeave: 'GROUP_OWNER_CANNOT_LEAVE',
+  InviteNotAllowed: 'GROUP_INVITE_NOT_ALLOWED',
+  ReportNotVerified: 'GROUP_REPORT_NOT_VERIFIED',
+  ReportNotActive: 'GROUP_REPORT_NOT_ACTIVE',
+  ReportDuplicate: 'GROUP_REPORT_DUPLICATE',
+  ReportDescEmpty: 'GROUP_REPORT_DESC_EMPTY',
+} as const;
+
 export type AppErrorCode =
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
   | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
-  | (typeof CircleErrorCode)[keyof typeof CircleErrorCode];
+  | (typeof CircleErrorCode)[keyof typeof CircleErrorCode]
+  | (typeof GroupErrorCode)[keyof typeof GroupErrorCode];
