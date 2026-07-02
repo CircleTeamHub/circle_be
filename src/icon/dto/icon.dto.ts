@@ -65,6 +65,10 @@ export class DisplayIconDto {
   @Expose()
   systemKey?: SystemIconKeyDto;
 
+  @ApiPropertyOptional()
+  @Expose()
+  systemVariant?: string;
+
   @ApiPropertyOptional({ example: 100 })
   @Expose()
   recognitionCount?: number;
@@ -99,6 +103,9 @@ export class IconOptionDto {
   @ApiPropertyOptional({ enum: SystemIconKeyDto })
   systemKey?: SystemIconKeyDto;
 
+  @ApiPropertyOptional()
+  systemVariant?: string;
+
   @ApiPropertyOptional({ example: 100 })
   recognitionCount?: number;
 }
@@ -130,6 +137,15 @@ export class UpdateDisplayIconItemDto {
   @ApiPropertyOptional()
   @ValidateIf(
     (value: UpdateDisplayIconItemDto) =>
+      value.displayType === DisplayIconTypeDto.SYSTEM,
+  )
+  @IsString()
+  @MaxLength(50)
+  systemVariant?: string;
+
+  @ApiPropertyOptional()
+  @ValidateIf(
+    (value: UpdateDisplayIconItemDto) =>
       value.displayType === DisplayIconTypeDto.CIRCLE,
   )
   @IsUUID()
@@ -149,7 +165,7 @@ export class UpdateDisplayIconsDto {
   @ArrayMaxSize(5)
   @ArrayUnique((item: UpdateDisplayIconItemDto) =>
     item.displayType === DisplayIconTypeDto.SYSTEM
-      ? `system:${item.systemKey}`
+      ? `system:${item.systemKey}:${item.systemVariant ?? ''}`
       : `circle:${item.circleId}`,
   )
   @ValidateNested({ each: true })

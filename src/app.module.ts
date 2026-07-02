@@ -37,6 +37,7 @@ import { OutboxModule } from './outbox/outbox.module';
 import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 import { RedisModule } from './redis/redis.module';
+import { CreditModule } from './credit/credit.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -79,6 +80,7 @@ const envFilePath = `.env.${nodeEnv}`;
     GroupModule,
     OutboxModule,
     PrivacySettingsModule,
+    CreditModule,
     CallModule,
   ],
   controllers: [],

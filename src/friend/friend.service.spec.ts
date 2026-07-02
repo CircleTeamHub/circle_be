@@ -13,6 +13,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { CreditService } from 'src/credit/credit.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
@@ -87,6 +88,9 @@ describe('FriendService', () => {
     broadcastFriendUnreadCount: jest.fn(),
     broadcastInteractionUnread: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
+    invalidateUserProfileSummaryCache: jest.fn(),
+    safeBroadcastAll: jest.fn(),
   };
   const notificationService = {
     createFriendRequestNotification: jest.fn(),
@@ -99,6 +103,10 @@ describe('FriendService', () => {
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
+  };
+  const creditService = {
+    applyDeltaInTransaction: jest.fn(),
+    broadcastCreditProfileChanged: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -122,6 +130,12 @@ describe('FriendService', () => {
     }
     privacySettings.canReceiveStrangerMessage.mockReset();
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    creditService.applyDeltaInTransaction.mockResolvedValue({
+      eventId: 'credit-event-1',
+      scoreBefore: 100,
+      scoreAfter: 95,
+    });
+    creditService.broadcastCreditProfileChanged.mockResolvedValue(undefined);
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -137,6 +151,7 @@ describe('FriendService', () => {
         { provide: NotificationService, useValue: notificationService },
         { provide: OpenimService, useValue: openimService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: CreditService, useValue: creditService },
       ],
     }).compile();
 
@@ -675,6 +690,10 @@ describe('FriendService', () => {
         evidence: ['s3://bucket/report-1.png'],
       },
     });
+    // Submitting a report no longer deducts credit — that happens only on admin
+    // approval (see FriendReportAdminService).
+    expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
+    expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
   });
 
   it('rejects a duplicate report for the same reporter/target/category', async () => {
@@ -688,7 +707,7 @@ describe('FriendService', () => {
       userID: 'user-1',
       friendID: 'user-2',
     });
-    // Simulate an existing report for this combination
+    // Simulate an existing live report for this combination
     prisma.friendReport.findFirst.mockResolvedValue({ id: 'existing-report' });
 
     await expect(
@@ -698,7 +717,40 @@ describe('FriendService', () => {
       }),
     ).rejects.toThrow(ConflictException);
 
+    // Only non-rejected reports count as duplicates — a prior REJECTED report
+    // must not block a fresh submission.
+    expect(prisma.friendReport.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: { in: ['PENDING', 'APPROVED'] },
+        }),
+      }),
+    );
     expect(prisma.friendReport.create).not.toHaveBeenCalled();
+  });
+
+  it('allows re-reporting when the only prior report was rejected', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      state: FriendState.ACCEPTED,
+      userID: 'user-1',
+      friendID: 'user-2',
+    });
+    // The status-filtered pre-check finds no live report (the prior one is
+    // REJECTED and excluded), so a new report is created.
+    prisma.friendReport.findFirst.mockResolvedValue(null);
+    prisma.friendReport.create.mockResolvedValue({ id: 'report-2' });
+
+    await service.reportFriend('user-1', 'user-2', {
+      category: 'harassment',
+      description: 'happened again',
+    });
+
+    expect(prisma.friendReport.create).toHaveBeenCalled();
   });
 
   it('rejects reporting a non-friend target through the friend API', async () => {

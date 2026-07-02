@@ -6,7 +6,11 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { FriendState, NotificationType } from 'src/generated/prisma';
+import {
+  FriendReportStatus,
+  FriendState,
+  NotificationType,
+} from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -504,16 +508,20 @@ export class FriendService {
       throw new NotFoundException('Friendship not found');
     }
 
-    // Prevent duplicate reports for the same reporter / target / category.
-    // Fast path: an explicit pre-check gives a friendly message. The unique
-    // index `FriendReport_reporterID_targetID_category_key` is the authoritative
-    // backstop — the catch below turns the race-loser's P2002 into the same
-    // clean conflict instead of a leaked Prisma error.
+    // Prevent duplicate live reports for the same reporter / target / category.
+    // A previously REJECTED report doesn't block a fresh one (the reporter may
+    // have a genuine new incident) — only PENDING/APPROVED reports do. The
+    // partial unique index `FriendReport_active_report_key` (WHERE status <>
+    // 'REJECTED') is the authoritative backstop; the catch below turns the
+    // race-loser's P2002 into the same clean conflict.
     const duplicate = await this.prisma.friendReport.findFirst({
       where: {
         reporterID: reporterId,
         targetID: friendUserId,
         category: dto.category,
+        status: {
+          in: [FriendReportStatus.PENDING, FriendReportStatus.APPROVED],
+        },
       },
       select: { id: true },
     });
@@ -523,6 +531,10 @@ export class FriendService {
       );
     }
 
+    // Reports no longer deduct credit on submission — they are queued as
+    // PENDING and only affect the target's credit once an admin approves them
+    // (see FriendReportAdminService). This prevents brigading from silently
+    // tanking a user's score with no review.
     try {
       await this.prisma.friendReport.create({
         data: {

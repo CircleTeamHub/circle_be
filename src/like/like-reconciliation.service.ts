@@ -10,7 +10,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
  * deleted, the FK ON DELETE CASCADE removes their UserLike rows WITHOUT
  * decrementing the likee's counter. This daily job recomputes every counter
  * from the actual rows so a stale value can't keep a user falsely at the
- * 合作达人 (PARTNER) threshold.
+ * 合作达人 (TOP_COLLABORATOR) threshold.
  */
 @Injectable()
 export class LikeReconciliationService {

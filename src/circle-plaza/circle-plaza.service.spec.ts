@@ -70,12 +70,15 @@ describe('CirclePlazaService', () => {
   };
   const iconService = {
     invalidateDisplayIconCacheFor: jest.fn(),
+    getDisplayIconsForUsers: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     notificationService.createCirclePostSignupNotification.mockReset();
     notificationService.createCirclePostAutoEndedNotification.mockReset();
+    iconService.getDisplayIconsForUsers.mockReset();
+    iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -218,6 +221,66 @@ describe('CirclePlazaService', () => {
 
       const where = prisma.circlePost.findMany.mock.calls[0][0].where;
       expect(where.circleID.in).toHaveLength(50);
+    });
+
+    it('includes the post author display icons in feed DTOs', async () => {
+      const displayIcons = [
+        {
+          id: 'vip-5',
+          type: 'SYSTEM',
+          title: 'VIP5',
+          imageUrl: null,
+          fallbackIconName: null,
+          systemKey: 'VIP',
+          systemVariant: 'VIP5',
+          sortOrder: 0,
+        },
+      ];
+      prisma.circlePost.findMany.mockResolvedValue([
+        {
+          id: 'post-1',
+          content: 'hello',
+          images: [],
+          tags: [],
+          city: null,
+          isHorn: false,
+          noteID: null,
+          vipRestriction: null,
+          creditRestriction: null,
+          fancyRestriction: false,
+          viewCount: 0,
+          signupCount: 0,
+          signupVipRestriction: null,
+          signupCreditRestriction: null,
+          signupFancyRestriction: false,
+          createdAt: new Date('2026-06-29T00:00:00.000Z'),
+          author: {
+            id: 'author-1',
+            nickname: 'Author',
+            avatarUrl: null,
+            avatarFrame: null,
+            accountId: '1001',
+          },
+          circle: { id: 'circle-1', name: 'Circle' },
+        },
+      ]);
+      prisma.circlePost.count.mockResolvedValue(1);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(
+        new Map([['author-1', displayIcons]]),
+      );
+
+      const result = await service.getFeed('viewer-1', {});
+
+      expect(iconService.getDisplayIconsForUsers).toHaveBeenCalledWith(
+        expect.arrayContaining(['author-1']),
+      );
+      expect(result.items[0].author.displayIcons).toEqual(displayIcons);
     });
   });
 
@@ -547,6 +610,18 @@ describe('CirclePlazaService', () => {
 
     it('returns signers with OpenIM ids for my own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+      const displayIcons = [
+        {
+          id: 'vip-5',
+          type: 'SYSTEM',
+          title: 'VIP5',
+          imageUrl: null,
+          fallbackIconName: null,
+          systemKey: 'VIP',
+          systemVariant: 'VIP5',
+          sortOrder: 0,
+        },
+      ];
       prisma.circlePostSignup.findMany.mockResolvedValue([
         {
           createdAt: new Date('2026-06-06T00:00:00Z'),
@@ -559,15 +634,22 @@ describe('CirclePlazaService', () => {
           },
         },
       ]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(
+        new Map([['0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547', displayIcons]]),
+      );
 
       const result = await service.getMyPostSignups('author-1', 'post-1');
 
+      expect(iconService.getDisplayIconsForUsers).toHaveBeenCalledWith(
+        expect.arrayContaining(['0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547']),
+      );
       expect(result.items[0]).toEqual(
         expect.objectContaining({
           userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
           imUserId: '0a9ad3d6ef1d47bd9cbccda1cee57547',
           nickname: 'meiguici',
           seen: false,
+          displayIcons,
         }),
       );
     });

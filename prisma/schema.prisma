@@ -118,10 +118,12 @@ enum UserDisplayIconType {
 enum SystemIconKey {
   VIP
   NEW_USER
-  PARTNER
   TOP_COLLABORATOR
   VERIFIED_PROFILE
   CIRCLE_BUILDER
+  // Legacy value kept for databases that already applied the old PARTNER enum
+  // migration. The service no longer emits or accepts this key.
+  PARTNER
 }
 
 enum CircleCategory {
@@ -282,7 +284,10 @@ model User {
   friendActivitiesCounterparty      FriendActivity[]            @relation("friendActivityCounterparty")
   friendReportsFiled                FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived             FriendReport[]              @relation("friendReportTarget")
+  friendReportsReviewed             FriendReport[]              @relation("friendReportReviewer")
   groupReportsFiled                 GroupReport[]               @relation("groupReportReporter")
+  creditEvents                      CreditEvent[]               @relation("creditEventUser")
+  creditEventsAuthored              CreditEvent[]               @relation("creditEventActor")
   notes                             Note[]
   noteShareLinks                    NoteShareLink[]
   noteGroups                        NoteGroup[]
@@ -343,22 +348,38 @@ model Friend {
   @@index([friendID])
 }
 
+enum FriendReportStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model FriendReport {
-  id          String   @id @default(uuid())
-  reporterID  String
-  targetID    String
-  category    String
-  description String
-  evidence    String[] @default([])
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id           String             @id @default(uuid())
+  reporterID   String
+  targetID     String
+  category     String
+  description  String
+  evidence     String[]           @default([])
+  status       FriendReportStatus @default(PENDING)
+  reviewedByID String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
 
-  reporter User @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
-  target   User @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
+  reporter   User  @relation("friendReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
+  target     User  @relation("friendReportTarget", fields: [targetID], references: [id], onDelete: Cascade)
+  reviewedBy User? @relation("friendReportReviewer", fields: [reviewedByID], references: [id], onDelete: SetNull)
 
-  @@unique([reporterID, targetID, category])
+  // Uniqueness is enforced by a partial index (see migration
+  // add_friend_report_reportable_after_rejection): at most one non-REJECTED
+  // report per (reporter, target, category), so a rejected report frees the
+  // slot for a fresh one. Prisma can't express a partial @@unique, so it lives
+  // in raw SQL and is intentionally absent here.
   @@index([reporterID, createdAt])
   @@index([targetID, createdAt])
+  @@index([status, createdAt])
 }
 
 model GroupReport {
@@ -379,6 +400,29 @@ model GroupReport {
   @@index([reporterID, createdAt])
   @@index([groupID, createdAt])
   @@index([circleID, createdAt])
+}
+
+model CreditEvent {
+  id             String    @id @default(uuid())
+  userID         String
+  delta          Int
+  scoreBefore    Int
+  scoreAfter     Int
+  reason         String
+  sourceType     String
+  sourceID       String?
+  actorID        String?
+  idempotencyKey String?   @unique
+  metadata       Json      @default("{}")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  user  User  @relation("creditEventUser", fields: [userID], references: [id], onDelete: Cascade)
+  actor User? @relation("creditEventActor", fields: [actorID], references: [id], onDelete: SetNull)
+
+  @@index([userID, createdAt])
+  @@index([actorID, createdAt])
+  @@index([sourceType, sourceID])
 }
 
 model GroupSyncOutbox {
@@ -424,6 +468,7 @@ model Note {
   title        String
   content      String?
   contentJson  Json?
+  sections     Json?
   status       NoteStatus @default(ACTIVE)
   available    Boolean    @default(true)
   pinned       Boolean    @default(false)
@@ -876,19 +921,20 @@ model IconAsset {
 }
 
 model UserDisplayIcon {
-  id          String              @id @default(uuid())
-  userID      String
-  displayType UserDisplayIconType
-  systemKey   SystemIconKey?
-  circleID    String?
-  sortOrder   Int
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  id            String              @id @default(uuid())
+  userID        String
+  displayType   UserDisplayIconType
+  systemKey     SystemIconKey?
+  systemVariant String?
+  circleID      String?
+  sortOrder     Int
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
 
   user   User    @relation(fields: [userID], references: [id], onDelete: Cascade)
   circle Circle? @relation(fields: [circleID], references: [id], onDelete: Cascade)
 
-  @@unique([userID, systemKey])
+  @@unique([userID, systemKey, systemVariant])
   @@unique([userID, circleID])
   @@index([userID, sortOrder])
 }

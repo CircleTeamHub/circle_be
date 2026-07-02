@@ -3,21 +3,29 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  Optional,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes, randomUUID } from 'crypto';
+import { existsSync } from 'fs';
+import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { UploadService } from 'src/upload/upload.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { prismaErrorCode } from 'src/utils/prisma-tx';
 import {
+  CreateNoteExportDto,
   CreateNoteDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNotesQueryDto,
   NoteDetailDto,
+  NoteExportResultDto,
   NoteGroupDto,
   NoteMediaType,
+  NoteSectionsDto,
   NoteShareLinkDto,
   NoteStatus,
   NoteSummaryDto,
@@ -61,7 +69,7 @@ type NoteContentBlock = {
 };
 
 function toPrismaJson(
-  value: NoteContentBlock[] | null | undefined,
+  value: unknown | null | undefined,
 ): Prisma.InputJsonValue | typeof Prisma.DbNull | undefined {
   let result: Prisma.InputJsonValue | typeof Prisma.DbNull | undefined;
   if (value === undefined) {
@@ -96,6 +104,7 @@ type NoteRow = {
   title: string;
   content: string | null;
   contentJson: unknown;
+  sections: unknown;
   status: NoteStatus;
   available: boolean;
   pinned: boolean;
@@ -107,6 +116,27 @@ type NoteRow = {
   coverMedia: { id: string; type: NoteMediaType; url: string } | null;
   groupMemberships: Array<{ group: { id: string; name: string } }>;
   media: NoteMediaRow[];
+};
+
+type NoteLocationSection = {
+  title?: string;
+  address?: string;
+  latitude?: number;
+  longitude?: number;
+};
+
+type NoteSections = {
+  text: {
+    content: string | null;
+    contentJson: unknown[] | null;
+  };
+  media: {
+    items: Array<Record<string, unknown>>;
+  };
+  showcase: {
+    items: Array<Record<string, unknown>>;
+  };
+  location: NoteLocationSection | null;
 };
 
 type NoteGroupRow = {
@@ -152,6 +182,127 @@ const MAX_GROUPS_PER_USER = 50;
 // extracted from contentJson blocks otherwise bypasses DTO validation.
 const MAX_NOTE_TITLE_LENGTH = 120;
 const MAX_NOTE_CONTENT_LENGTH = 20_000;
+const NOTE_EXPORT_TTL_SECONDS = 15 * 60;
+const MAX_EXPORT_MEDIA_ITEMS = 50;
+const MAX_EXPORT_SINGLE_MEDIA_BYTES = 8 * 1024 * 1024;
+const MAX_EXPORT_TOTAL_MEDIA_BYTES = 16 * 1024 * 1024;
+const MAX_PDF_EMBEDDED_IMAGES = 4;
+const PDF_FONT_CANDIDATES = [
+  '/Library/Fonts/Arial Unicode.ttf',
+  '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf',
+  '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.otf',
+  '/usr/share/fonts/opentype/source-han-sans/SourceHanSansCN-Regular.otf',
+] as const;
+
+function sanitizeFilenamePart(value: string) {
+  const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '-');
+  return (normalized || 'note').slice(0, 80);
+}
+
+function mediaExtension(
+  item: Pick<NoteMediaRow, 'objectKey' | 'url' | 'mimeType'>,
+) {
+  const fromMime = item.mimeType?.split('/')[1]?.split(';')[0];
+  if (fromMime) return fromMime === 'jpeg' ? 'jpg' : fromMime;
+  const source = (item.objectKey || item.url).split('?')[0].split('#')[0];
+  const dotIndex = source.lastIndexOf('.');
+  if (dotIndex < 0 || dotIndex === source.length - 1) return 'bin';
+  return source.slice(dotIndex + 1).toLowerCase();
+}
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer: Buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function createZip(entries: Array<{ name: string; data: Buffer }>) {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime =
+    (now.getHours() << 11) |
+    (now.getMinutes() << 5) |
+    Math.floor(now.getSeconds() / 2);
+  const dosDate =
+    ((now.getFullYear() - 1980) << 9) |
+    ((now.getMonth() + 1) << 5) |
+    now.getDate();
+
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name);
+    const checksum = crc32(entry.data);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(entry.data.length, 18);
+    local.writeUInt32LE(entry.data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    locals.push(local, name, entry.data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(entry.data.length, 20);
+    central.writeUInt32LE(entry.data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, name);
+    offset += local.length + name.length + entry.data.length;
+  }
+
+  const centralSize = centrals.reduce((sum, item) => sum + item.length, 0);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+  return Buffer.concat([...locals, ...centrals, end]);
+}
+
+function escapeXml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
 
 @Injectable()
 export class NoteService {
@@ -160,6 +311,7 @@ export class NoteService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    @Optional() private readonly uploadService?: UploadService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -222,6 +374,231 @@ export class NoteService {
     return randomBytes(18).toString('base64url');
   }
 
+  private getExportSectionMedia(sections: NoteSections) {
+    const seen = new Set<string>();
+    return [...sections.media.items, ...sections.showcase.items].filter(
+      (item: any) => {
+        const key =
+          typeof item.objectKey === 'string'
+            ? `${item.objectKey}:${item.url ?? ''}`
+            : `url:${item.url ?? ''}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      },
+    );
+  }
+
+  private createLongImageSvg(note: NoteRow) {
+    const sections = this.buildSectionsFromRow(note);
+    const exportMedia = this.getExportSectionMedia(sections);
+    const lines = [
+      note.title,
+      '',
+      sections.text.content ?? '',
+      '',
+      ...exportMedia.map((item: any, index) => {
+        const type = item.type === 'VIDEO' ? '视频' : '图片';
+        return `${type} ${index + 1}: ${item.url ?? ''}`;
+      }),
+      ...(sections.location
+        ? [
+            '',
+            `位置: ${sections.location.title ?? ''}`,
+            sections.location.address ?? '',
+          ]
+        : []),
+    ].filter((line) => line != null);
+    const height = Math.max(320, 120 + lines.length * 34);
+    const text = lines
+      .map(
+        (line, index) =>
+          `<text x="40" y="${60 + index * 34}" font-size="${index === 0 ? 28 : 18}" fill="#111827">${escapeXml(String(line))}</text>`,
+      )
+      .join('');
+    return Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="${height}" viewBox="0 0 900 ${height}"><rect width="900" height="${height}" fill="#ffffff"/>${text}</svg>`,
+    );
+  }
+
+  private resolvePdfFontPath() {
+    const configured = this.config.get<string>('NOTE_EXPORT_PDF_FONT_PATH');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename
+    if (configured && existsSync(configured)) {
+      return configured;
+    }
+    return (
+      PDF_FONT_CANDIDATES.find((fontPath) => {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename
+        return existsSync(fontPath);
+      }) ?? null
+    );
+  }
+
+  private async createPdf(note: NoteRow) {
+    const sections = this.buildSectionsFromRow(note);
+    const sectionMedia = this.getExportSectionMedia(sections);
+    const mediaUrls = sectionMedia
+      .map((item: any) => (typeof item.url === 'string' ? item.url : null))
+      .filter((url): url is string => Boolean(url));
+    const doc = new PDFDocument({
+      size: 'A4',
+      margin: 48,
+      autoFirstPage: true,
+      info: {
+        Title: note.title,
+        Creator: 'Circle IM',
+        Producer: 'Circle IM',
+        Keywords: mediaUrls.join(' '),
+      },
+    });
+    const chunks: Buffer[] = [];
+    doc.on('data', (chunk: Buffer) => chunks.push(chunk));
+    const finished = new Promise<Buffer>((resolve, reject) => {
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+    });
+    const fontPath = this.resolvePdfFontPath();
+    if (fontPath) {
+      try {
+        doc.registerFont('noteFont', fontPath);
+        doc.font('noteFont');
+      } catch {
+        doc.font('Helvetica');
+      }
+    }
+
+    doc.fontSize(22).text(note.title || 'Untitled note', {
+      width: 500,
+      align: 'left',
+    });
+    doc.moveDown();
+    if (sections.text.content?.trim()) {
+      doc.fontSize(11).text(sections.text.content.trim(), {
+        width: 500,
+        lineGap: 4,
+      });
+      doc.moveDown();
+    }
+
+    const noteMediaByKey = new Map(
+      (note.media ?? []).map((item) => [`${item.objectKey}:${item.url}`, item]),
+    );
+    let embeddedImages = 0;
+    for (const [index, rawItem] of sectionMedia.entries()) {
+      const item = rawItem as any;
+      const type = item.type === 'VIDEO' ? 'Video' : 'Image';
+      doc.fontSize(12).text(`${type} ${index + 1}`, { continued: false });
+      doc
+        .fontSize(9)
+        .fillColor('#4b5563')
+        .text(String(item.url ?? ''));
+      doc.fillColor('#000000');
+      const mediaRow =
+        noteMediaByKey.get(`${item.objectKey}:${item.url}`) ??
+        (note.media ?? []).find((media) => media.objectKey === item.objectKey);
+
+      if (
+        item.type === 'IMAGE' &&
+        item.objectKey &&
+        this.uploadService &&
+        embeddedImages < MAX_PDF_EMBEDDED_IMAGES &&
+        (mediaRow?.size ?? 0) <= MAX_EXPORT_SINGLE_MEDIA_BYTES
+      ) {
+        try {
+          const image = await this.uploadService.downloadObjectBuffer(
+            item.objectKey,
+            MAX_EXPORT_SINGLE_MEDIA_BYTES,
+          );
+          if (image.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
+            throw new BadRequestException('Image file is too large to embed');
+          }
+          doc.moveDown(0.5);
+          doc.image(image, {
+            fit: [480, 260],
+            align: 'center',
+          });
+          embeddedImages += 1;
+          if (mediaRow?.width || mediaRow?.height) {
+            doc
+              .fontSize(8)
+              .fillColor('#6b7280')
+              .text(
+                [mediaRow.width, mediaRow.height].filter(Boolean).join(' x '),
+              );
+            doc.fillColor('#000000');
+          }
+        } catch {
+          doc
+            .fontSize(9)
+            .fillColor('#6b7280')
+            .text('Image could not be embedded; use the URL above.');
+          doc.fillColor('#000000');
+        }
+      } else if (item.type === 'IMAGE') {
+        doc
+          .fontSize(9)
+          .fillColor('#6b7280')
+          .text(
+            'Preview omitted to keep PDF export stable; use the URL above.',
+          );
+        doc.fillColor('#000000');
+      }
+      doc.moveDown();
+    }
+
+    if (sections.location) {
+      doc.fontSize(14).text('Location');
+      if (sections.location.title)
+        doc.fontSize(11).text(sections.location.title);
+      if (sections.location.address)
+        doc.fontSize(10).text(sections.location.address);
+      if (
+        typeof sections.location.latitude === 'number' &&
+        typeof sections.location.longitude === 'number'
+      ) {
+        doc
+          .fontSize(9)
+          .text(
+            `${sections.location.latitude}, ${sections.location.longitude}`,
+          );
+      }
+    }
+
+    doc.end();
+    return finished;
+  }
+
+  private async uploadExportArtifact(input: {
+    ownerID: string;
+    noteID: string;
+    filename: string;
+    mimeType: string;
+    body: Buffer;
+  }): Promise<NoteExportResultDto> {
+    if (!this.uploadService) {
+      throw new ServiceUnavailableException('File export is not configured');
+    }
+    const key = `note-exports/${input.ownerID}/${input.noteID}/${randomUUID()}-${input.filename}`;
+    const uploaded = await this.uploadService.uploadBuffer({
+      key,
+      body: input.body,
+      contentType: input.mimeType,
+      expiresInSeconds: NOTE_EXPORT_TTL_SECONDS,
+    });
+    const download = await this.uploadService.createPresignedGetUrl(
+      key,
+      NOTE_EXPORT_TTL_SECONDS,
+    );
+    return {
+      url: download.url,
+      filename: input.filename,
+      mimeType: input.mimeType,
+      size: uploaded.size,
+      expiresAt: download.expiresAt,
+    };
+  }
+
   private buildShareUrl(token: string): string {
     const base =
       this.config.get<string>('NOTE_SHARE_WEB_BASE') ??
@@ -276,6 +653,139 @@ export class NoteService {
     };
   }
 
+  private dedupeMedia(media: CreateNoteDto['media']) {
+    const seen = new Set<string>();
+    const deduped: CreateNoteDto['media'] = [];
+    for (const item of media) {
+      const key = `${item.objectKey}:${item.url}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(item);
+    }
+    deduped.sort(
+      (left, right) => (left.sortOrder ?? 0) - (right.sortOrder ?? 0),
+    );
+    return deduped.map((item, index) => ({
+      ...item,
+      sortOrder: index,
+    }));
+  }
+
+  private normalizeLocation(
+    location: NoteSectionsDto['location'] | null | undefined,
+  ): NoteLocationSection | null {
+    if (!location) return null;
+    const normalized: NoteLocationSection = {};
+    if (location.title?.trim()) normalized.title = location.title.trim();
+    if (location.address?.trim()) normalized.address = location.address.trim();
+    if (typeof location.latitude === 'number')
+      normalized.latitude = location.latitude;
+    if (typeof location.longitude === 'number')
+      normalized.longitude = location.longitude;
+    return Object.keys(normalized).length > 0 ? normalized : null;
+  }
+
+  private mapMediaItemForSection(item: Record<string, any>) {
+    return {
+      ...(item.id ? { id: item.id } : {}),
+      type: item.type,
+      objectKey: item.objectKey,
+      url: item.url,
+      ...(item.mimeType != null ? { mimeType: item.mimeType } : {}),
+      ...(item.size != null ? { size: item.size } : {}),
+      ...(item.width != null ? { width: item.width } : {}),
+      ...(item.height != null ? { height: item.height } : {}),
+      ...(item.durationMs != null ? { durationMs: item.durationMs } : {}),
+      ...(item.posterUrl != null ? { posterUrl: item.posterUrl } : {}),
+      sortOrder: item.sortOrder ?? 0,
+    };
+  }
+
+  private resolveSectionMediaItems(
+    sectionName: 'media' | 'showcase',
+    requestedItems: CreateNoteDto['media'] | undefined,
+    fallbackItems: CreateNoteDto['media'],
+    validatedMedia: CreateNoteDto['media'],
+  ) {
+    const canonicalByComposite = new Map<string, Record<string, any>>();
+    const canonicalByObjectKey = new Map<string, Record<string, any>>();
+    const canonicalByUrl = new Map<string, Record<string, any>>();
+
+    for (const item of validatedMedia) {
+      const canonical = this.mapMediaItemForSection(
+        item as Record<string, any>,
+      );
+      canonicalByComposite.set(`${item.objectKey}:${item.url}`, canonical);
+      canonicalByObjectKey.set(item.objectKey, canonical);
+      canonicalByUrl.set(item.url, canonical);
+    }
+
+    const source = Array.isArray(requestedItems)
+      ? requestedItems
+      : fallbackItems;
+    return source.map((item) => {
+      const resolved =
+        canonicalByComposite.get(`${item.objectKey}:${item.url}`) ??
+        canonicalByObjectKey.get(item.objectKey) ??
+        canonicalByUrl.get(item.url);
+      if (!resolved) {
+        throw new BadRequestException(
+          `${sectionName} section media must reference note media`,
+        );
+      }
+      return resolved;
+    });
+  }
+
+  private hasSectionMediaItems(items: unknown) {
+    return Array.isArray(items);
+  }
+
+  private buildSectionsFromInput(
+    input: CreateNoteDto | UpdateNoteDto,
+    derived: {
+      content: string | null;
+      contentJson: NoteContentBlock[] | null;
+      media: CreateNoteDto['media'];
+    },
+  ): NoteSections {
+    const sectionInput = input.sections;
+    const hasExplicitMedia = this.hasSectionMediaItems(
+      sectionInput?.media?.items,
+    );
+    const hasExplicitShowcase = this.hasSectionMediaItems(
+      sectionInput?.showcase?.items,
+    );
+    const mediaItems = this.resolveSectionMediaItems(
+      'media',
+      sectionInput?.media?.items,
+      hasExplicitShowcase ? [] : derived.media,
+      derived.media,
+    );
+    const showcaseItems = this.resolveSectionMediaItems(
+      'showcase',
+      sectionInput?.showcase?.items,
+      hasExplicitMedia
+        ? []
+        : derived.media.filter((item) => item.type === 'IMAGE'),
+      derived.media,
+    );
+
+    return {
+      text: {
+        content: derived.content,
+        contentJson: derived.contentJson,
+      },
+      media: {
+        items: mediaItems,
+      },
+      showcase: {
+        items: showcaseItems,
+      },
+      location: this.normalizeLocation(sectionInput?.location),
+    };
+  }
+
   private buildPreview(content: string | null | undefined) {
     if (!content) return null;
     return content.length > 120 ? `${content.slice(0, 120)}...` : content;
@@ -290,19 +800,24 @@ export class NoteService {
     const fragments: string[] = [];
 
     for (const block of blocks) {
+      if (!this.isRecord(block)) continue;
       // Table blocks have a BNTableContent object, not an array — skip for text
       const inlines = Array.isArray(block.content) ? block.content : [];
 
       for (const node of inlines) {
+        if (!this.isRecord(node)) continue;
         if (node.type === 'text') {
           // BNStyledText: { type: 'text', text: string, styles: {...} }
-          const trimmed = node.text.trim();
+          const trimmed = typeof node.text === 'string' ? node.text.trim() : '';
           if (trimmed) fragments.push(trimmed);
         } else if (node.type === 'link') {
           // BNLink: { type: 'link', href: string, content: BNStyledText[] }
           // Extract the visible text from the link's inner StyledText nodes
-          for (const inner of node.content) {
-            const trimmed = inner.text.trim();
+          const linkContent = Array.isArray(node.content) ? node.content : [];
+          for (const inner of linkContent) {
+            if (!this.isRecord(inner)) continue;
+            const trimmed =
+              typeof inner.text === 'string' ? inner.text.trim() : '';
             if (trimmed) fragments.push(trimmed);
           }
         }
@@ -325,6 +840,7 @@ export class NoteService {
     const visit = (items: NoteContentBlock[], depth: number) => {
       if (depth > 10) return;
       for (const block of items) {
+        if (!this.isRecord(block)) continue;
         if (block.type === 'image' || block.type === 'video') {
           const props = block.props ?? {};
           const url = typeof props.url === 'string' ? props.url : '';
@@ -368,35 +884,151 @@ export class NoteService {
   }
 
   private deriveNoteContent(input: CreateNoteDto | UpdateNoteDto) {
-    const blocks = Array.isArray(input.contentJson) ? input.contentJson : [];
+    const sectionText = input.sections?.text;
+    const textContentJson = sectionText?.contentJson ?? input.contentJson;
+    const blocks = Array.isArray(textContentJson) ? textContentJson : [];
     const extractedText =
       blocks.length > 0 ? this.extractBlockText(blocks) : [];
+    const sectionMedia = input.sections?.media?.items ?? [];
+    const sectionShowcase = input.sections?.showcase?.items ?? [];
+    const sectionMediaCombined = this.dedupeMedia([
+      ...sectionMedia,
+      ...sectionShowcase,
+    ]);
 
     // Prefer explicitly provided media — the client sends full metadata including
     // objectKey. Only fall back to block-derived media when input.media is empty
     // (for future server-side use or migration).
-    const derivedMedia =
-      input.media.length > 0 ? input.media : this.deriveMediaFromBlocks(blocks);
+    let derivedMedia = input.media ?? [];
+    if (derivedMedia.length === 0) {
+      derivedMedia =
+        sectionMediaCombined.length > 0
+          ? sectionMediaCombined
+          : this.deriveMediaFromBlocks(blocks);
+    }
 
     const derivedContent =
       blocks.length > 0
-        ? extractedText.join(' ').trim()
-        : (input.content ?? '').trim();
+        ? extractedText.join(' ').trim() ||
+          (sectionText?.content ?? input.content ?? '').trim()
+        : (sectionText?.content ?? input.content ?? '').trim();
     const derivedTitle =
       blocks.length > 0
         ? (extractedText[0] ?? input.title).trim()
         : input.title.trim();
-
-    return {
+    const normalized = {
       contentJson: blocks.length > 0 ? blocks : null,
-      // Truncate: text derived from contentJson bypasses the DTO @MaxLength
-      // caps, so enforce them here before the value reaches the DB column.
       title: derivedTitle.slice(0, MAX_NOTE_TITLE_LENGTH),
       content: derivedContent
         ? derivedContent.slice(0, MAX_NOTE_CONTENT_LENGTH)
         : null,
       media: derivedMedia,
     };
+
+    return {
+      ...normalized,
+      sections: this.buildSectionsFromInput(input, normalized),
+    };
+  }
+
+  private isRecord(value: unknown): value is Record<string, any> {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+  }
+
+  private buildSectionsFromRow(note: NoteRow): NoteSections {
+    const stored = this.isRecord(note.sections) ? note.sections : {};
+    const storedText = this.isRecord(stored.text) ? stored.text : {};
+    const storedMedia = this.isRecord(stored.media) ? stored.media : {};
+    const storedShowcase = this.isRecord(stored.showcase)
+      ? stored.showcase
+      : {};
+    const storedLocation = this.isRecord(stored.location)
+      ? stored.location
+      : null;
+    const hasExplicitMedia = Array.isArray(storedMedia.items);
+    const hasExplicitShowcase = Array.isArray(storedShowcase.items);
+    const mediaItems = hasExplicitMedia
+      ? storedMedia.items
+      : hasExplicitShowcase
+        ? []
+        : (note.media ?? []).map((item) =>
+            this.mapMediaItemForSection(item as any),
+          );
+    const showcaseItems = hasExplicitShowcase
+      ? storedShowcase.items
+      : hasExplicitMedia
+        ? []
+        : (note.media ?? [])
+            .filter((item) => item.type === 'IMAGE')
+            .map((item) => this.mapMediaItemForSection(item as any));
+    let contentJson: unknown[] | null = null;
+    if (Array.isArray(storedText.contentJson)) {
+      contentJson = storedText.contentJson;
+    } else if (Array.isArray(note.contentJson)) {
+      contentJson = note.contentJson;
+    }
+    const content =
+      typeof storedText.content === 'string'
+        ? storedText.content
+        : (note.content ?? null);
+
+    return {
+      text: {
+        content,
+        contentJson,
+      },
+      media: {
+        items: mediaItems,
+      },
+      showcase: {
+        items: showcaseItems,
+      },
+      location: storedLocation
+        ? {
+            ...(typeof storedLocation.title === 'string'
+              ? { title: storedLocation.title }
+              : {}),
+            ...(typeof storedLocation.address === 'string'
+              ? { address: storedLocation.address }
+              : {}),
+            ...(typeof storedLocation.latitude === 'number'
+              ? { latitude: storedLocation.latitude }
+              : {}),
+            ...(typeof storedLocation.longitude === 'number'
+              ? { longitude: storedLocation.longitude }
+              : {}),
+          }
+        : null,
+    };
+  }
+
+  private getSectionAvailability(sections: NoteSections) {
+    return {
+      hasText:
+        Boolean(sections.text.content?.trim()) ||
+        Boolean(sections.text.contentJson?.length),
+      showcaseCount: sections.showcase.items.length,
+      hasLocation: Boolean(sections.location),
+    };
+  }
+
+  private assertExportMediaWithinLimits(media: NoteMediaRow[]) {
+    if (media.length > MAX_EXPORT_MEDIA_ITEMS) {
+      throw new BadRequestException(
+        `Cannot export more than ${MAX_EXPORT_MEDIA_ITEMS} media files at once`,
+      );
+    }
+    let totalSize = 0;
+    for (const item of media) {
+      const size = item.size ?? 0;
+      if (size > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
+        throw new BadRequestException('Media file is too large to export');
+      }
+      totalSize += size;
+    }
+    if (totalSize > MAX_EXPORT_TOTAL_MEDIA_BYTES) {
+      throw new BadRequestException('Selected media are too large to export');
+    }
   }
 
   private mapSummary(note: NoteRow, viewerID: string): NoteSummaryDto {
@@ -406,6 +1038,8 @@ export class NoteService {
     }));
     const fallbackCoverMedia = note.media?.[0] ?? null;
     const coverMedia = note.coverMedia ?? fallbackCoverMedia;
+    const sections = this.buildSectionsFromRow(note);
+    const availability = this.getSectionAvailability(sections);
 
     return {
       id: note.id,
@@ -427,17 +1061,19 @@ export class NoteService {
       imageCount: note.imageCount,
       videoCount: note.videoCount,
       mediaCount: note.mediaCount,
+      ...availability,
       createdAt: note.createdAt,
       updatedAt: note.updatedAt,
     };
   }
 
   private mapDetail(note: NoteRow, viewerID: string): NoteDetailDto {
+    const sections = this.buildSectionsFromRow(note);
     return {
       ...this.mapSummary(note, viewerID),
       content: note.content ?? null,
       contentJson: Array.isArray(note.contentJson) ? note.contentJson : null,
-      media: note.media.map((item) => ({
+      media: (note.media ?? []).map((item) => ({
         id: item.id,
         type: item.type,
         objectKey: item.objectKey,
@@ -450,6 +1086,7 @@ export class NoteService {
         posterUrl: item.posterUrl ?? null,
         sortOrder: item.sortOrder,
       })),
+      sections,
     };
   }
 
@@ -494,6 +1131,7 @@ export class NoteService {
           title: derived.title,
           content: derived.content,
           contentJson: toPrismaJson(derived.contentJson),
+          sections: toPrismaJson(derived.sections),
           groupID: null,
           status: input.status ?? 'ACTIVE',
           available: true,
@@ -680,6 +1318,106 @@ export class NoteService {
     return this.mapDetail(note, ownerID);
   }
 
+  async createNoteExport(
+    viewerID: string,
+    noteId: string,
+    input: CreateNoteExportDto,
+  ): Promise<NoteExportResultDto> {
+    const note = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: viewerID }, { available: true }],
+      },
+      include: NOTE_INCLUDE,
+    });
+
+    if (!note) {
+      throw new NotFoundException('Note not found');
+    }
+
+    const basename = sanitizeFilenamePart(note.title);
+    if (input.format === 'IMAGE') {
+      return this.uploadExportArtifact({
+        ownerID: note.ownerID,
+        noteID: note.id,
+        filename: `${basename}.svg`,
+        mimeType: 'image/svg+xml',
+        body: this.createLongImageSvg(note),
+      });
+    }
+    if (input.format === 'PDF') {
+      return this.uploadExportArtifact({
+        ownerID: note.ownerID,
+        noteID: note.id,
+        filename: `${basename}.pdf`,
+        mimeType: 'application/pdf',
+        body: await this.createPdf(note),
+      });
+    }
+
+    const mediaType = input.format === 'IMAGES' ? 'IMAGE' : 'VIDEO';
+    const media = (note.media ?? []).filter((item) => item.type === mediaType);
+    const scope = input.scope ?? 'ALL';
+    const selected =
+      scope === 'ALL' ? media : media.filter((item) => item.id === scope);
+    if (selected.length === 0) {
+      throw new BadRequestException('No exportable media found');
+    }
+    this.assertExportMediaWithinLimits(selected);
+
+    if (scope !== 'ALL') {
+      const item = selected[0];
+      const ext = mediaExtension(item);
+      if (!this.uploadService) {
+        throw new ServiceUnavailableException('File export is not configured');
+      }
+      const download = await this.uploadService.createPresignedGetUrl(
+        item.objectKey,
+        NOTE_EXPORT_TTL_SECONDS,
+      );
+      return {
+        url: download.url,
+        filename: `${basename}-${item.id}.${ext}`,
+        mimeType:
+          item.mimeType ?? (item.type === 'VIDEO' ? 'video/mp4' : 'image/jpeg'),
+        size: item.size ?? null,
+        expiresAt: download.expiresAt,
+      };
+    }
+
+    if (!this.uploadService) {
+      throw new ServiceUnavailableException('File export is not configured');
+    }
+    const entries: Array<{ name: string; data: Buffer }> = [];
+    let downloadedBytes = 0;
+    for (const [index, item] of selected.entries()) {
+      const data = await this.uploadService.downloadObjectBuffer(
+        item.objectKey,
+        MAX_EXPORT_SINGLE_MEDIA_BYTES,
+      );
+      if (data.byteLength > MAX_EXPORT_SINGLE_MEDIA_BYTES) {
+        throw new BadRequestException('Media file is too large to export');
+      }
+      if (downloadedBytes + data.byteLength > MAX_EXPORT_TOTAL_MEDIA_BYTES) {
+        throw new BadRequestException('Selected media are too large to export');
+      }
+      downloadedBytes += data.byteLength;
+      entries.push({
+        name: `${input.format.toLowerCase()}-${index + 1}.${mediaExtension(item)}`,
+        data,
+      });
+    }
+    const filename = `${basename}-${input.format.toLowerCase()}.zip`;
+    return this.uploadExportArtifact({
+      ownerID: note.ownerID,
+      noteID: note.id,
+      filename,
+      mimeType: 'application/zip',
+      body: createZip(entries),
+    });
+  }
+
   async updateNote(
     ownerID: string,
     noteId: string,
@@ -758,6 +1496,7 @@ export class NoteService {
           title: derived.title,
           content: derived.content,
           contentJson: toPrismaJson(derived.contentJson),
+          sections: toPrismaJson(derived.sections),
           groupID: null,
           // Preserve the existing status when the caller omits it — omitting
           // status on a PATCH must not silently promote an UNLISTED note to ACTIVE.

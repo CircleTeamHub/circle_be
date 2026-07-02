@@ -25,10 +25,12 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
   CreateNoteDto,
+  CreateNoteExportDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNotesQueryDto,
   NoteDetailDto,
+  NoteExportResultDto,
   NoteGroupDto,
   NoteShareLinkDto,
   NoteSummaryDto,
@@ -161,6 +163,19 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.getNote(req.user.userId, id);
+  }
+
+  @Post(':id/exports')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Create a downloadable note export' })
+  @ApiOkResponse({ type: NoteExportResultDto })
+  createNoteExport(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CreateNoteExportDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteExportResultDto> {
+    return this.noteService.createNoteExport(req.user.userId, id, dto);
   }
 
   @Post('group')

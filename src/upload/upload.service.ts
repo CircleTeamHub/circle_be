@@ -2,12 +2,14 @@ import {
   Injectable,
   Logger,
   OnModuleInit,
+  PayloadTooLargeException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   S3Client,
   PutObjectCommand,
+  GetObjectCommand,
   CreateBucketCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
@@ -24,7 +26,34 @@ export interface PresignResult {
   key: string;
 }
 
+export interface UploadBufferInput {
+  key: string;
+  body: Buffer;
+  contentType: string;
+  expiresInSeconds?: number;
+}
+
+export interface UploadBufferResult {
+  url: string;
+  key: string;
+  size: number;
+  expiresAt: Date | null;
+}
+
+export interface PresignedDownloadResult {
+  url: string;
+  expiresAt: Date;
+}
+
 export function buildPublicReadBucketPolicy(bucket: string) {
+  const publicPrefixes = [
+    'avatars',
+    'covers',
+    'posts',
+    'notes',
+    'chat',
+    'uploads',
+  ];
   return JSON.stringify({
     Version: '2012-10-17',
     Statement: [
@@ -33,7 +62,9 @@ export function buildPublicReadBucketPolicy(bucket: string) {
         Effect: 'Allow',
         Principal: '*',
         Action: ['s3:GetObject'],
-        Resource: [`arn:aws:s3:::${bucket}/*`],
+        Resource: publicPrefixes.map(
+          (prefix) => `arn:aws:s3:::${bucket}/${prefix}/*`,
+        ),
       },
     ],
   });
@@ -164,6 +195,113 @@ export class UploadService implements OnModuleInit {
     const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;
 
     return { uploadUrl, fileUrl, key };
+  }
+
+  async uploadBuffer(input: UploadBufferInput): Promise<UploadBufferResult> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucket,
+      Key: input.key,
+      Body: input.body,
+      ContentType: input.contentType,
+    });
+
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
+    try {
+      await this.client.send(command);
+    } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'minio',
+        operation: 'put_object',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'minio',
+        operation: 'put_object',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
+    }
+
+    const ttl = input.expiresInSeconds ?? null;
+    return {
+      url: `${this.publicUrl}/${this.bucket}/${input.key}`,
+      key: input.key,
+      size: input.body.byteLength,
+      expiresAt: ttl ? new Date(Date.now() + ttl * 1000) : null,
+    };
+  }
+
+  async createPresignedGetUrl(
+    key: string,
+    expiresInSeconds = 300,
+  ): Promise<PresignedDownloadResult> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    });
+    const url = await getSignedUrl(this.publicClient, command, {
+      expiresIn: expiresInSeconds,
+    });
+    return {
+      url,
+      expiresAt: new Date(Date.now() + expiresInSeconds * 1000),
+    };
+  }
+
+  async downloadObjectBuffer(key: string, maxBytes?: number): Promise<Buffer> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    });
+    const response = await this.client.send(command);
+    if (
+      typeof maxBytes === 'number' &&
+      typeof response.ContentLength === 'number' &&
+      response.ContentLength > maxBytes
+    ) {
+      const body = response.Body as { destroy?: () => void } | undefined;
+      body?.destroy?.();
+      throw new PayloadTooLargeException(
+        'Object exceeds maximum download size',
+      );
+    }
+    if (!response.Body) {
+      return Buffer.alloc(0);
+    }
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      totalBytes += chunk.byteLength;
+      if (typeof maxBytes === 'number' && totalBytes > maxBytes) {
+        const body = response.Body as { destroy?: () => void } | undefined;
+        body?.destroy?.();
+        throw new PayloadTooLargeException(
+          'Object exceeds maximum download size',
+        );
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
   }
 
   private async ensureBucketExists() {

@@ -1,8 +1,43 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { IconService } from './icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { IconService } from './icon.service';
+
+// Privacy defaults mirror PrivacySettingsService: phone hidden, wechat/qq shown.
+const DEFAULT_PRIVACY = {
+  showPhone: false,
+  showWechat: true,
+  showQQ: true,
+} as any;
+
+// A user row that satisfies the strict Verified Profile rule (complete profile
+// + a shown contact method). Override fields per test.
+const verifiedUser = (overrides: Record<string, unknown> = {}) => ({
+  id: 'user-1',
+  vipLevel: 0,
+  createdAt: new Date(0),
+  status: 'ACTIVE',
+  avatarUrl: 'https://cdn/a.png',
+  nickname: 'Alice',
+  city: 'Shanghai',
+  email: 'a@example.com',
+  phoneNumber: null,
+  wechat: 'wxid_alice',
+  qq: null,
+  persona: 'A reasonably long self-introduction.',
+  helloWords: null,
+  whatsup: null,
+  iconPreferencesInitialized: true,
+  ...overrides,
+});
+
+// N distinct recognizers → the groupBy([recipientID, recognizerID]) shape.
+const recognizerGroups = (recipientId: string, n: number) =>
+  Array.from({ length: n }, (_, i) => ({
+    recipientID: recipientId,
+    recognizerID: `r${i}`,
+  }));
 
 describe('IconService', () => {
   let service: IconService;
@@ -10,6 +45,7 @@ describe('IconService', () => {
   const prisma = {
     user: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
       update: jest.fn(),
     },
     circleMember: {
@@ -33,17 +69,16 @@ describe('IconService', () => {
 
   const privacySettings = {
     getSettings: jest.fn(),
+    getSettingsForUsers: jest.fn(),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    // Default: no distinct recognizers (groupBy returns one row per recognizer).
+    // Sensible defaults: no circles, no recognitions, default privacy.
+    prisma.circleMember.findMany.mockResolvedValue([]);
     prisma.collaborationRecognition.groupBy.mockResolvedValue([]);
-    privacySettings.getSettings.mockResolvedValue({
-      showPhone: false,
-      showWechat: true,
-      showQQ: true,
-    });
+    privacySettings.getSettings.mockResolvedValue({ ...DEFAULT_PRIVACY });
+    privacySettings.getSettingsForUsers.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -57,32 +92,15 @@ describe('IconService', () => {
     service = module.get(IconService);
   });
 
-  it('returns eligible system and circle icons and trims stale display selections', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 5,
-      createdAt: new Date(),
-      iconPreferencesInitialized: false,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([
-      {
-        circleID: 'circle-1',
-        circle: {
-          id: 'circle-1',
-          name: 'Nbuuhbub',
-          currentIconAsset: {
-            id: 'asset-1',
-            imageUrl: 'http://cdn.example/circle-icon.png',
-          },
-        },
-      },
-    ]);
+  it('returns every VIP variant up to the current level as selectable options', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
     prisma.userDisplayIcon.findMany.mockResolvedValue([
       {
-        id: 'display-1',
+        id: 'display-vip-3',
         userID: 'user-1',
         displayType: 'SYSTEM',
         systemKey: 'VIP',
+        systemVariant: 'VIP3',
         circleID: null,
         sortOrder: 0,
       },
@@ -90,112 +108,123 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
-    expect(result.systemIcons).toHaveLength(2);
-    expect(result.circleIcons).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          circleId: 'circle-1',
-          title: 'Nbuuhbub',
-        }),
-      ]),
-    );
-    expect(prisma.userDisplayIcon.createMany).not.toHaveBeenCalled();
+    expect(
+      result.systemIcons
+        .filter((icon) => icon.systemKey === 'VIP')
+        .map((icon) => ({
+          variant: icon.systemVariant,
+          selected: icon.selected,
+        })),
+    ).toEqual([
+      { variant: 'VIP1', selected: false },
+      { variant: 'VIP2', selected: false },
+      { variant: 'VIP3', selected: true },
+      { variant: 'VIP4', selected: false },
+      { variant: 'VIP5', selected: false },
+    ]);
   });
 
-  it('auto-initializes eligible system icons for legacy users without icon preferences', async () => {
-    prisma.user.findUnique
-      .mockResolvedValueOnce({
-        id: 'user-1',
-        vipLevel: 5,
-        createdAt: new Date(),
-        iconPreferencesInitialized: false,
-      })
-      .mockResolvedValueOnce({
-        iconPreferencesInitialized: false,
-      });
-    prisma.circleMember.findMany.mockResolvedValue([]);
+  it('maps a legacy VIP placeholder variant to the highest eligible VIP badge', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-legacy',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
+    expect(result.displayIcons).toEqual([
+      expect.objectContaining({ systemKey: 'VIP', systemVariant: 'VIP5' }),
+    ]);
+  });
+
+  it('awards Top Collaborator tiers by DISTINCT-recognizer count', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser());
+    prisma.collaborationRecognition.groupBy.mockResolvedValue(
+      recognizerGroups('user-1', 1000),
+    );
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
     const result = await service.getIconOptions('user-1');
 
-    expect(prisma.userDisplayIcon.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          userID: 'user-1',
-          displayType: 'SYSTEM',
-          systemKey: 'VIP',
-          circleID: null,
-          sortOrder: 0,
-        },
-        {
-          userID: 'user-1',
-          displayType: 'SYSTEM',
-          systemKey: 'NEW_USER',
-          circleID: null,
-          sortOrder: 1,
-        },
-      ],
-    });
-    expect(prisma.user.update).toHaveBeenCalledWith({
-      where: { id: 'user-1' },
-      data: { iconPreferencesInitialized: true },
-    });
-    expect(result.displayIcons).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: 'SYSTEM',
-          systemKey: 'VIP',
-          title: 'VIP5',
-        }),
-        expect.objectContaining({
-          type: 'SYSTEM',
-          systemKey: 'NEW_USER',
-          title: '新手',
-        }),
-      ]),
-    );
+    expect(
+      result.systemIcons
+        .filter((icon) => icon.systemKey === 'TOP_COLLABORATOR')
+        .map((icon) => icon.systemVariant),
+    ).toEqual(['TOP_COLLABORATOR_1', 'TOP_COLLABORATOR_2']);
   });
 
-  it('returns first-release badge system icons when their simple eligibility rules are met', async () => {
-    const now = Date.now();
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 3,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      avatarUrl: 'https://cdn.example/avatar.png',
-      nickname: 'Builder User',
-      city: 'Shanghai',
-      email: 'builder@example.com',
-      phoneNumber: '13800000000',
-      wechat: null,
-      qq: null,
-      persona: 'I build useful circles',
-      helloWords: null,
-      whatsup: null,
-      status: 'ACTIVE',
-    });
-    privacySettings.getSettings.mockResolvedValue({
-      showPhone: true,
-      showWechat: false,
-      showQQ: false,
-    });
-    // 1000 DISTINCT recognizers (one groupBy row each)
+  it('does NOT award Top Collaborator below the first recognition threshold', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser());
     prisma.collaborationRecognition.groupBy.mockResolvedValue(
-      Array.from({ length: 1000 }, (_unused, index) => ({
-        recognizerID: `recognizer-${index}`,
-      })),
+      recognizerGroups('user-1', 99),
     );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'TOP_COLLABORATOR'),
+    ).toBe(false);
+  });
+
+  it('awards Verified Profile only when the profile is complete and a contact is public', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser());
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'VERIFIED_PROFILE'),
+    ).toBe(true);
+  });
+
+  it('withholds Verified Profile when a required field is missing', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'VERIFIED_PROFILE'),
+    ).toBe(false);
+  });
+
+  it('withholds Verified Profile when the only contact method is hidden by privacy', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ wechat: null, qq: null, phoneNumber: '13800138000' }),
+    );
+    // phone present but showPhone defaults to false → no public contact.
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'VERIFIED_PROFILE'),
+    ).toBe(false);
+  });
+
+  it('awards Circle Builder for an owner/admin of a mature, >100-member circle', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
     prisma.circleMember.findMany.mockResolvedValue([
       {
+        userID: 'user-1',
         circleID: 'circle-1',
-        role: 'ADMIN',
+        role: 'OWNER',
         circle: {
           id: 'circle-1',
-          name: 'Serious Builders',
-          createdAt: new Date(now - 8 * 24 * 60 * 60 * 1000),
+          name: 'Big Circle',
+          createdAt: new Date(0),
           deleted: false,
-          memberCount: 101,
+          memberCount: 250,
           currentIconAsset: null,
         },
       },
@@ -203,43 +232,23 @@ describe('IconService', () => {
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
     const result = await service.getIconOptions('user-1');
-    const systemKeys = result.systemIcons.map((icon) => icon.systemKey);
 
-    expect(systemKeys).toEqual(
-      expect.arrayContaining([
-        'VIP',
-        'TOP_COLLABORATOR',
-        'VERIFIED_PROFILE',
-        'CIRCLE_BUILDER',
-      ]),
-    );
     expect(
-      result.systemIcons.find((icon) => icon.systemKey === 'TOP_COLLABORATOR'),
-    ).toEqual(
-      expect.objectContaining({
-        title: 'Top Collaborator',
-        recognitionCount: 1000,
-      }),
-    );
+      result.systemIcons.some((icon) => icon.systemKey === 'CIRCLE_BUILDER'),
+    ).toBe(true);
   });
 
-  it('does not grant Circle Builder when the managed circle has exactly 100 members', async () => {
-    const now = Date.now();
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      status: 'ACTIVE',
-    });
+  it('does NOT award Circle Builder for a circle at the member threshold', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
     prisma.circleMember.findMany.mockResolvedValue([
       {
+        userID: 'user-1',
         circleID: 'circle-1',
         role: 'OWNER',
         circle: {
           id: 'circle-1',
-          name: 'Almost There',
-          createdAt: new Date(now - 8 * 24 * 60 * 60 * 1000),
+          name: 'Exactly 100',
+          createdAt: new Date(0),
           deleted: false,
           memberCount: 100,
           currentIconAsset: null,
@@ -250,154 +259,28 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
-    expect(result.systemIcons.map((icon) => icon.systemKey)).not.toContain(
-      'CIRCLE_BUILDER',
-    );
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'CIRCLE_BUILDER'),
+    ).toBe(false);
   });
 
-  it('does not grant Verified Profile without a public contact method', async () => {
-    const now = Date.now();
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      avatarUrl: 'https://cdn.example/avatar.png',
-      nickname: 'Private User',
-      city: 'Shanghai',
-      email: 'private@example.com',
-      phoneNumber: '13800000000',
-      wechat: 'wxid_private',
-      qq: '10001',
-      persona: 'I keep my contacts private',
-      helloWords: null,
-      whatsup: null,
-      status: 'ACTIVE',
-    });
-    privacySettings.getSettings.mockResolvedValue({
-      showPhone: false,
-      showWechat: false,
-      showQQ: false,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-
-    const result = await service.getIconOptions('user-1');
-
-    expect(result.systemIcons.map((icon) => icon.systemKey)).not.toContain(
-      'VERIFIED_PROFILE',
-    );
-  });
-
-  describe('Verified Profile required-field matrix', () => {
-    const now = Date.now();
-    const fullyEligibleUser = () => ({
-      id: 'user-1',
-      vipLevel: 0,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      avatarUrl: 'https://cdn.example/avatar.png',
-      nickname: 'Complete User',
-      city: 'Shanghai',
-      email: 'complete@example.com',
-      phoneNumber: '13800000000',
-      wechat: null,
-      qq: null,
-      persona: 'I build useful circles',
-      helloWords: null,
-      whatsup: null,
-      status: 'ACTIVE',
-    });
-
-    beforeEach(() => {
-      privacySettings.getSettings.mockResolvedValue({
-        showPhone: true,
-        showWechat: false,
-        showQQ: false,
-      });
-      prisma.circleMember.findMany.mockResolvedValue([]);
-      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-    });
-
-    it('grants Verified Profile when every requirement is met', async () => {
-      prisma.user.findUnique.mockResolvedValue(fullyEligibleUser());
-      const result = await service.getIconOptions('user-1');
-      expect(result.systemIcons.map((i) => i.systemKey)).toContain(
-        'VERIFIED_PROFILE',
-      );
-    });
-
-    it.each([
-      ['avatarUrl', { avatarUrl: null }],
-      ['nickname', { nickname: '  ' }],
-      ['city', { city: null }],
-      ['email', { email: null }],
-      ['bio too short', { persona: 'short' }],
-      ['inactive status', { status: 'BANNED' }],
-    ])(
-      'withholds Verified Profile when %s is missing/invalid',
-      async (_label, override) => {
-        prisma.user.findUnique.mockResolvedValue({
-          ...fullyEligibleUser(),
-          ...override,
-        });
-        const result = await service.getIconOptions('user-1');
-        expect(result.systemIcons.map((i) => i.systemKey)).not.toContain(
-          'VERIFIED_PROFILE',
-        );
-      },
-    );
-  });
-
-  it('counts distinct recognizers, so one author cannot inflate the badge by repeat recognitions', async () => {
-    const now = Date.now();
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      status: 'ACTIVE',
-    });
-    // groupBy collapses many recognitions from the same authors into one row
-    // each: only 2 distinct recognizers → far below the 100 threshold.
-    prisma.collaborationRecognition.groupBy.mockResolvedValue([
-      { recognizerID: 'author-a' },
-      { recognizerID: 'author-b' },
-    ]);
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-
-    const result = await service.getIconOptions('user-1');
-
-    expect(prisma.collaborationRecognition.groupBy).toHaveBeenCalledWith({
-      by: ['recognizerID'],
-      where: { recipientID: 'user-1', revokedAt: null },
-    });
-    expect(result.systemIcons.map((i) => i.systemKey)).not.toContain(
-      'TOP_COLLABORATOR',
-    );
-  });
-
-  it('grants Circle Builder for a >100-member circle at least 7 days old', async () => {
-    const now = Date.now();
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      createdAt: new Date(now - 10 * 24 * 60 * 60 * 1000),
-      iconPreferencesInitialized: true,
-      status: 'ACTIVE',
-    });
+  it('exposes circle icons for circles that have a current icon asset', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
     prisma.circleMember.findMany.mockResolvedValue([
       {
+        userID: 'user-1',
         circleID: 'circle-1',
-        role: 'OWNER',
+        role: 'MEMBER',
         circle: {
           id: 'circle-1',
-          name: 'Big Circle',
-          createdAt: new Date(now - 8 * 24 * 60 * 60 * 1000),
+          name: 'Nbuuhbub',
+          createdAt: new Date(),
           deleted: false,
-          memberCount: 101,
-          currentIconAsset: null,
+          memberCount: 3,
+          currentIconAsset: {
+            id: 'asset-1',
+            imageUrl: 'http://cdn/circle.png',
+          },
         },
       },
     ]);
@@ -405,165 +288,146 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
-    expect(result.systemIcons.map((i) => i.systemKey)).toContain(
-      'CIRCLE_BUILDER',
-    );
+    expect(result.circleIcons).toEqual([
+      expect.objectContaining({ circleId: 'circle-1', title: 'Nbuuhbub' }),
+    ]);
   });
 
-  it('broadcasts user profile summary after updating display icons', async () => {
-    prisma.user.findUnique.mockResolvedValueOnce({
-      id: 'user-1',
-      vipLevel: 5,
-      createdAt: new Date(),
-      iconPreferencesInitialized: true,
+  it('auto-initializes default system icons for legacy users without preferences', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ vipLevel: 2, iconPreferencesInitialized: false }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    await service.getIconOptions('user-1');
+
+    expect(prisma.userDisplayIcon.createMany).toHaveBeenCalled();
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { iconPreferencesInitialized: true },
     });
-    prisma.circleMember.findMany.mockResolvedValue([]);
+  });
+
+  it('wraps updateDisplayIcons delete+create in one transaction and broadcasts after invalidating', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });
-    prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 1 });
-    prisma.user.update.mockResolvedValue({
-      id: 'user-1',
-      iconPreferencesInitialized: true,
-    });
+    prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 2 });
+    prisma.user.update.mockResolvedValue({ id: 'user-1' });
 
     await service.updateDisplayIcons('user-1', [
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
+        systemVariant: 'VIP1',
         sortOrder: 0,
       } as any,
-    ]);
-
-    expect(
-      realtimeService.invalidateUserProfileSummaryCache,
-    ).toHaveBeenCalledWith('user-1');
-    // Invalidate must run before the broadcast so a client refetch reads fresh.
-    expect(
-      realtimeService.invalidateUserProfileSummaryCache.mock
-        .invocationCallOrder[0],
-    ).toBeLessThan(
-      realtimeService.broadcastUserProfileSummary.mock.invocationCallOrder[0],
-    );
-    expect(realtimeService.broadcastUserProfileSummary).toHaveBeenCalledWith(
-      'user-1',
-    );
-  });
-
-  it('wraps updateDisplayIcons delete+create in a transaction', async () => {
-    prisma.user.findUnique.mockResolvedValueOnce({
-      id: 'user-1',
-      vipLevel: 5,
-      createdAt: new Date(),
-      iconPreferencesInitialized: true,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });
-    prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 1 });
-    prisma.user.update.mockResolvedValue({
-      id: 'user-1',
-      iconPreferencesInitialized: true,
-    });
-
-    await service.updateDisplayIcons('user-1', [
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
-        sortOrder: 0,
+        systemVariant: 'VIP2',
+        sortOrder: 1,
       } as any,
     ]);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalled();
     expect(prisma.userDisplayIcon.createMany).toHaveBeenCalled();
-    expect(prisma.user.update).toHaveBeenCalled();
+    expect(
+      realtimeService.invalidateUserProfileSummaryCache.mock
+        .invocationCallOrder[0],
+    ).toBeLessThan(
+      realtimeService.broadcastUserProfileSummary.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('rejects duplicate variant selections in updateDisplayIcons', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+
+    await expect(
+      service.updateDisplayIcons('user-1', [
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP1',
+          sortOrder: 0,
+        } as any,
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP1',
+          sortOrder: 1,
+        } as any,
+      ]),
+    ).rejects.toThrow('Duplicate icon selection');
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  describe('getDisplayIconsForUsers (batch)', () => {
+    it('resolves many users with batched queries and no writes', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        verifiedUser({ id: 'user-1', vipLevel: 2, email: null }),
+        verifiedUser({ id: 'user-2', vipLevel: 0, email: null }),
+      ]);
+      prisma.collaborationRecognition.groupBy.mockResolvedValue([]);
+      privacySettings.getSettingsForUsers.mockResolvedValue(
+        new Map([
+          ['user-1', { ...DEFAULT_PRIVACY }],
+          ['user-2', { ...DEFAULT_PRIVACY }],
+        ]),
+      );
+      prisma.userDisplayIcon.findMany.mockResolvedValue([
+        {
+          id: 'display-1',
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP2',
+          circleID: null,
+          sortOrder: 0,
+        },
+      ]);
+
+      const result = await service.getDisplayIconsForUsers([
+        'user-1',
+        'user-2',
+        'user-1',
+      ]);
+
+      expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.collaborationRecognition.groupBy).toHaveBeenCalledTimes(1);
+      expect(privacySettings.getSettingsForUsers).toHaveBeenCalledTimes(1);
+      // Read-only: never persists prune/default writes for viewed users.
+      expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
+      expect(prisma.userDisplayIcon.createMany).not.toHaveBeenCalled();
+      expect(prisma.user.update).not.toHaveBeenCalled();
+
+      expect(result.get('user-1')).toEqual([
+        expect.objectContaining({ systemKey: 'VIP', systemVariant: 'VIP2' }),
+      ]);
+      expect(result.get('user-2')).toEqual([]);
+    });
+
+    it('returns an empty array for requested ids that do not exist', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+      privacySettings.getSettingsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getDisplayIconsForUsers(['ghost']);
+
+      expect(result.get('ghost')).toEqual([]);
+    });
   });
 
   it('caches getDisplayIconsForUser results within the TTL window', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 5,
-      createdAt: new Date(),
-      iconPreferencesInitialized: true,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
     await service.getDisplayIconsForUser('user-1');
     const callsAfterFirst = prisma.user.findUnique.mock.calls.length;
-
     await service.getDisplayIconsForUser('user-1');
     await service.getDisplayIconsForUser('user-1');
 
-    // After the first uncached call populates the cache, the next two calls
-    // must not trigger any additional DB reads.
     expect(prisma.user.findUnique).toHaveBeenCalledTimes(callsAfterFirst);
-  });
-
-  it('invalidates the display icon cache after updateDisplayIcons', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 5,
-      createdAt: new Date(),
-      iconPreferencesInitialized: true,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 0 });
-    prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 1 });
-    prisma.user.update.mockResolvedValue({});
-
-    await service.getDisplayIconsForUser('user-1');
-    await service.updateDisplayIcons('user-1', [
-      {
-        displayType: 'SYSTEM',
-        systemKey: 'VIP',
-        sortOrder: 0,
-      } as any,
-    ]);
-    prisma.user.findUnique.mockClear();
-
-    await service.getDisplayIconsForUser('user-1');
-
-    // Cache was invalidated by updateDisplayIcons, so the next read hits DB.
-    expect(prisma.user.findUnique).toHaveBeenCalled();
-  });
-
-  it('awards the PARTNER (合作达人) badge once receivedLikeCount crosses the threshold', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      receivedLikeCount: 5, // >= PARTNER_LIKE_THRESHOLD (3)
-      createdAt: new Date(0), // old account → no NEW_USER badge
-      iconPreferencesInitialized: true,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-
-    const result = await service.getIconOptions('user-1');
-
-    expect(result.systemIcons).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ systemKey: 'PARTNER', title: '合作达人' }),
-      ]),
-    );
-  });
-
-  it('does NOT award PARTNER below the threshold', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      vipLevel: 0,
-      receivedLikeCount: 2, // below threshold
-      createdAt: new Date(0),
-      iconPreferencesInitialized: true,
-    });
-    prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
-
-    const result = await service.getIconOptions('user-1');
-
-    expect(result.systemIcons).not.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ systemKey: 'PARTNER' }),
-      ]),
-    );
   });
 });

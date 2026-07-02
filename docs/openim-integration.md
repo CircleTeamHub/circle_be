@@ -122,6 +122,10 @@ OPENIM_API_URL=http://localhost:10002      # OpenIM Server 地址
 OPENIM_ADMIN_SECRET=openIM123             # OpenIM 管理员密钥（见 docker-compose）
 ```
 
+> 信誉发言闸门(OpenIM before-send 回调)曾在此实现，因 fail-closed 风险与长期未启用
+> 已删除，详见 [credit-gate.md](./credit-gate.md)。信誉强制现只落在发帖互动/报名等
+> 走 circle_be 的动作上。
+
 ---
 
 ## 四、完整交互流程

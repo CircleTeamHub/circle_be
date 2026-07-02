@@ -5,3 +5,11 @@
 # runtime — the production image runs `node dist/src/main.js` — so this code path
 # is not reachable. Will clear when the base image ships a patched npm.
 CVE-2026-33671
+
+# CVE-2026-48815 — @sigstore/* certificateOIDs verification bypass.
+# Same situation as above: present ONLY in the npm CLI bundled with the
+# node:22-slim base image (/usr/local/lib/node_modules/npm/node_modules/@sigstore),
+# not in our app deps (our lockfile has no sigstore). npm's package-provenance
+# verification is not invoked at runtime, so this code path is not reachable.
+# Will clear when the base image ships a patched npm.
+CVE-2026-48815
