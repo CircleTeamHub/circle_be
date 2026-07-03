@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { UserErrorCode } from 'src/common/app-error-codes';
@@ -16,6 +17,8 @@ import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
 import { likedOnToday } from '../like/like.util';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -129,6 +132,8 @@ function normalizeUpdateInput(input: UpdateUserInput) {
 
 @Injectable()
 export class UserService {
+  private readonly logger = new Logger(UserService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -162,12 +167,16 @@ export class UserService {
   }
 
   async findAll(query: GetUserDto) {
-    const { limit = 10, page = 1, accountId } = query;
+    const { limit = 10, page = 1, accountId, status } = query;
     const take = limit;
     const skip = (page - 1) * take;
-    const where = accountId
-      ? { accountId: { contains: accountId } }
-      : undefined;
+    const where =
+      accountId || status
+        ? {
+            ...(accountId ? { accountId: { contains: accountId } } : {}),
+            ...(status ? { status } : {}),
+          }
+        : undefined;
 
     const [data, total] = await Promise.all([
       this.prisma.user.findMany({ where, select: PUBLIC_SELECT, take, skip }),
@@ -314,8 +323,12 @@ export class UserService {
     };
   }
 
-  async updateStatus(id: string, status: UserStatus) {
-    await this.findOne(id);
+  async updateStatus(
+    id: string,
+    status: UserStatus,
+    options: { actorId?: string; reason?: string } = {},
+  ) {
+    const current = await this.findOne(id);
     const [user, displayIcons] = await Promise.all([
       this.prisma.user.update({
         where: { id },
@@ -331,6 +344,20 @@ export class UserService {
     }
     await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'admin_user_status_changed',
+      actorId: options.actorId,
+      targetId: id,
+      result: 'success',
+      entityType: 'user',
+      entityId: id,
+      metadata: {
+        oldStatus: current.status,
+        newStatus: status,
+        reason: options.reason,
+      },
+    });
     return {
       ...user,
       displayIcons,

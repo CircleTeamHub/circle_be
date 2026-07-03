@@ -114,8 +114,15 @@ export class UserController {
   updateUserStatus(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateUserStatusDto,
+    @Req() req: RequestWithUser,
   ) {
-    return this.userService.updateStatus(id, dto.status);
+    if (id === req.user.userId && dto.status !== 'ACTIVE') {
+      throw new ForbiddenException('Admins cannot disable their own account');
+    }
+    return this.userService.updateStatus(id, dto.status, {
+      actorId: req.user.userId,
+      reason: dto.reason,
+    });
   }
 
   @Delete('/:id')

@@ -1,10 +1,14 @@
 import type { Request } from 'express';
 
+export type TokenAudience = 'APP' | 'ADMIN';
+
 /** Body of a signed access token. */
 export interface JwtPayload {
   sub: string;
   accountId: string;
   role: string;
+  /** Token audience. ADMIN tokens are required by AdminGuard. */
+  aud?: TokenAudience;
   /** Refresh-token session id used for device management. */
   sid?: string;
   /** Issued-at, populated by @nestjs/jwt. */
@@ -18,6 +22,7 @@ export interface AuthenticatedUser {
   userId: string;
   accountId: string;
   role: string;
+  audience?: TokenAudience;
   sessionId?: string;
 }
 

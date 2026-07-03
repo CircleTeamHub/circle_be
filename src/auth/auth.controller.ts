@@ -99,6 +99,25 @@ export class AuthController {
     return this.authService.login(dto, getSessionContext(req));
   }
 
+  @Post('admin/login')
+  @ApiOperation({ summary: 'Admin web login with password' })
+  @ApiBody({ type: LoginDto })
+  @ApiHeader({
+    name: 'x-device-name',
+    required: false,
+    description: 'Optional device name to store with the admin refresh session',
+  })
+  @ApiCreatedResponse({
+    description: 'Admin login successful',
+    type: AuthTokensDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'Invalid credentials, inactive account, or non-admin user',
+  })
+  adminLogin(@Body() dto: LoginDto, @Req() req?: Request) {
+    return this.authService.adminLogin(dto, getSessionContext(req));
+  }
+
   @Post('email/request-code')
   @ApiOperation({ summary: 'Request an email verification code' })
   @ApiBody({ type: RequestEmailCodeDto })
@@ -137,6 +156,25 @@ export class AuthController {
   })
   refresh(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
     return this.authService.refresh(dto.refreshToken, getSessionContext(req));
+  }
+
+  @Post('admin/refresh')
+  @ApiOperation({ summary: 'Refresh an admin web access token' })
+  @ApiBody({ type: RefreshTokenDto })
+  @ApiHeader({
+    name: 'x-device-name',
+    required: false,
+    description: 'Optional device name to update for the rotated admin session',
+  })
+  @ApiCreatedResponse({
+    description: 'Admin token refreshed successfully',
+    type: AuthTokensDto,
+  })
+  adminRefresh(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
+    return this.authService.adminRefresh(
+      dto.refreshToken,
+      getSessionContext(req),
+    );
   }
 
   @Post('logout')

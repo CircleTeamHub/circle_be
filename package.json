@@ -27,6 +27,7 @@
       "prisma:migrate": "prisma migrate dev",
       "prisma:migrate:prod": "prisma migrate deploy",
       "prisma:studio": "prisma studio",
+      "seed:admin": "node scripts/seed-admin-user.js",
       "sentry:smoke": "cross-env NODE_ENV=development ts-node scripts/sentry-smoke.ts"
    },
    "dependencies": {

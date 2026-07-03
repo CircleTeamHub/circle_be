@@ -364,10 +364,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
 
   // Tighter limits on sensitive auth routes
   app.use('/api/v1/auth/login', authLimiter);
+  app.use('/api/v1/auth/admin/login', authLimiter);
   app.use('/api/v1/auth/register', authRegisterLimiter);
   app.use('/api/v1/auth/change-password', authChangePasswordLimiter);
   app.use('/api/v1/auth/change-account-id', authChangeAccountIdLimiter);
   app.use('/api/v1/auth/refresh', refreshLimiter);
+  app.use('/api/v1/auth/admin/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
   // Email code sends and security-code verification are the two new
   // unauthenticated-cost / brute-force surfaces from this branch.

@@ -22,7 +22,11 @@ import {
   ACCOUNT_ID_PATTERN,
   ACCOUNT_ID_RULE_MESSAGE,
 } from 'src/utils/account-id';
-import { RefreshTokenService, SessionContext } from './refresh-token.service';
+import {
+  RefreshTokenAudience,
+  RefreshTokenService,
+  SessionContext,
+} from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -204,6 +208,70 @@ export class AuthService {
     return this.finishLogin(user, sessionContext, dto.platform);
   }
 
+  async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
+    const email = normalizeEmail(dto.email);
+    const user = await this.prisma.user.findUnique({ where: { email } });
+
+    if (!user || user.status !== 'ACTIVE') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_login_failed',
+        actorId: user?.id,
+        result: 'failure',
+        metadata: {
+          reason: user ? 'inactive_account' : 'invalid_credentials',
+        },
+      });
+      throw new ForbiddenException('Invalid credentials or inactive account');
+    }
+
+    const valid = await argon2.verify(user.passwordHash, dto.password);
+    if (!valid || user.role !== 'ADMIN') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: {
+          reason: valid ? 'insufficient_role' : 'invalid_credentials',
+        },
+      });
+      throw new ForbiddenException('Invalid credentials or inactive account');
+    }
+
+    this.prisma.user
+      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${user.id}: ${err?.message}`,
+        ),
+      );
+
+    const tokens = await this.issueTokens(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionContext,
+      undefined,
+      {
+        audience: 'ADMIN',
+        issueImToken: false,
+        revokeExistingSessions: user.singleDeviceLoginEnabled,
+      },
+    );
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_admin_login_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+
+    return tokens;
+  }
+
   async loginWithCode(dto: LoginWithCodeDto, sessionContext?: SessionContext) {
     const email = normalizeEmail(dto.email);
 
@@ -307,7 +375,11 @@ export class AuthService {
       token: newRefreshToken,
       userId,
       sessionId,
-    } = await this.refreshTokenService.rotate(refreshToken, sessionContext);
+    } = await this.refreshTokenService.rotate(
+      refreshToken,
+      sessionContext,
+      'APP',
+    );
 
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
@@ -345,6 +417,49 @@ export class AuthService {
       user.accountId,
       user.role,
       sessionId,
+      'APP',
+    );
+    return { accessToken, refreshToken: newRefreshToken };
+  }
+
+  async adminRefresh(refreshToken: string, sessionContext?: SessionContext) {
+    const {
+      token: newRefreshToken,
+      userId,
+      sessionId,
+    } = await this.refreshTokenService.rotate(
+      refreshToken,
+      sessionContext,
+      'ADMIN',
+    );
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (user.status !== 'ACTIVE' || user.role !== 'ADMIN') {
+      this.logger.warn(
+        `Admin refresh blocked for user ${user.id} (status=${user.status}, role=${user.role}); revoking sessions.`,
+      );
+      await this.refreshTokenService.revokeAll(user.id);
+      throw new ForbiddenException('Admin account is not active');
+    }
+
+    this.prisma.user
+      .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
+      .catch((err) =>
+        this.logger.warn(
+          `lastOnline update failed for ${user.id}: ${err?.message}`,
+        ),
+      );
+
+    const accessToken = await this.signAccessToken(
+      user.id,
+      user.accountId,
+      user.role,
+      sessionId,
+      'ADMIN',
     );
     return { accessToken, refreshToken: newRefreshToken };
   }
@@ -766,23 +881,33 @@ export class AuthService {
     role: string,
     sessionContext?: SessionContext,
     platformID?: 1 | 2 | 5,
-    options?: { revokeExistingSessions?: boolean },
+    options?: {
+      revokeExistingSessions?: boolean;
+      audience?: RefreshTokenAudience;
+      issueImToken?: boolean;
+    },
   ) {
     if (options?.revokeExistingSessions) {
       await this.refreshTokenService.revokeAll(userId);
     }
 
+    const audience = options?.audience ?? 'APP';
+    const issueImToken = options?.issueImToken ?? true;
+
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
-      this.refreshTokenService.create(userId, sessionContext),
-      this.resolveImToken(userId, platformID),
+      this.refreshTokenService.create(userId, sessionContext, audience),
+      issueImToken ? this.resolveImToken(userId, platformID) : '',
     ]);
     const accessToken = await this.signAccessToken(
       userId,
       accountId,
       role,
       sessionId,
+      audience,
     );
-    return { accessToken, refreshToken, imToken };
+    return issueImToken
+      ? { accessToken, refreshToken, imToken }
+      : { accessToken, refreshToken };
   }
 
   /**
@@ -814,7 +939,14 @@ export class AuthService {
     accountId: string,
     role: string,
     sessionId?: string,
+    audience: RefreshTokenAudience = 'APP',
   ): Promise<string> {
-    return this.jwt.signAsync({ sub: userId, accountId, role, sid: sessionId });
+    return this.jwt.signAsync({
+      sub: userId,
+      accountId,
+      role,
+      sid: sessionId,
+      aud: audience,
+    });
   }
 }

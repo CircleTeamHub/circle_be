@@ -18,7 +18,16 @@ describe('AdminGuard', () => {
     expect(guard.canActivate(createContext())).toBe(false);
   });
 
-  it('allows access for admin users', () => {
-    expect(guard.canActivate(createContext({ role: Role.Admin }))).toBe(true);
+  it('denies admin users without an admin token audience', () => {
+    expect(guard.canActivate(createContext({ role: Role.Admin }))).toBe(false);
+    expect(
+      guard.canActivate(createContext({ role: Role.Admin, audience: 'APP' })),
+    ).toBe(false);
+  });
+
+  it('allows admin users with an admin token audience', () => {
+    expect(
+      guard.canActivate(createContext({ role: Role.Admin, audience: 'ADMIN' })),
+    ).toBe(true);
   });
 });

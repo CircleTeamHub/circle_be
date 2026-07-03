@@ -125,6 +125,41 @@ describe('UserService', () => {
         }),
       );
     });
+
+    it('filters by status when supplied', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+      prisma.user.count.mockResolvedValue(0);
+
+      await service.findAll({ status: UserStatus.BANNED });
+
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { status: UserStatus.BANNED },
+        }),
+      );
+      expect(prisma.user.count).toHaveBeenCalledWith({
+        where: { status: UserStatus.BANNED },
+      });
+    });
+
+    it('filters by accountId substring and status together', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+      prisma.user.count.mockResolvedValue(0);
+
+      await service.findAll({
+        accountId: 'foo',
+        status: UserStatus.ACTIVE,
+      });
+
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            accountId: { contains: 'foo' },
+            status: UserStatus.ACTIVE,
+          },
+        }),
+      );
+    });
   });
 
   describe('findOne', () => {

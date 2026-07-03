@@ -17,11 +17,13 @@ describe('AuthController', () => {
   const mockAuthService: Partial<AuthService> = {
     register: (_dto: RegisterDto) => Promise.resolve(mockTokenPayload as any),
     login: (_dto: LoginDto) => Promise.resolve(mockTokenPayload as any),
+    adminLogin: (_dto: LoginDto) => Promise.resolve(mockTokenPayload as any),
     loginWithCode: (_dto: any) => Promise.resolve(mockTokenPayload as any),
     requestEmailCode: jest.fn((_email: string, _purpose: string) =>
       Promise.resolve(),
     ),
     refresh: (_token: string) => Promise.resolve(mockTokenPayload as any),
+    adminRefresh: (_token: string) => Promise.resolve(mockTokenPayload as any),
     logout: (_token: string) => Promise.resolve(),
     sessions: jest.fn((_userId: string) =>
       Promise.resolve([
@@ -125,6 +127,15 @@ describe('AuthController', () => {
     expect(result).toEqual(mockTokenPayload);
   });
 
+  it('adminLogin returns admin-scoped tokens', async () => {
+    const result = await controller.adminLogin({
+      email: 'admin@example.com',
+      password: 'password1',
+    } as any);
+
+    expect(result).toEqual(mockTokenPayload);
+  });
+
   it('loginWithCode returns tokens', async () => {
     const result = await controller.loginWithCode({
       email: 'user@example.com',
@@ -147,6 +158,12 @@ describe('AuthController', () => {
   it('refresh returns tokens', async () => {
     const dto: RefreshTokenDto = { refreshToken: 'refresh-token' };
     const result = await controller.refresh(dto);
+    expect(result).toEqual(mockTokenPayload);
+  });
+
+  it('adminRefresh returns admin-scoped tokens', async () => {
+    const dto: RefreshTokenDto = { refreshToken: 'refresh-token' };
+    const result = await controller.adminRefresh(dto);
     expect(result).toEqual(mockTokenPayload);
   });
 
