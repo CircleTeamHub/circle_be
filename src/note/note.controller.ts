@@ -24,6 +24,8 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
+  CollectNoteDto,
+  CollectNoteResultDto,
   CreateNoteDto,
   CreateNoteExportDto,
   CreateNoteGroupDto,
@@ -68,6 +70,18 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.createNote(req.user.userId, dto);
+  }
+
+  @Post('collect')
+  @ApiOperation({
+    summary: 'Collect a note from chat into my notes (snapshot copy)',
+  })
+  @ApiOkResponse({ type: CollectNoteResultDto })
+  collectNote(
+    @Body() dto: CollectNoteDto,
+    @Req() req: RequestWithUser,
+  ): Promise<CollectNoteResultDto> {
+    return this.noteService.collectNote(req.user.userId, dto);
   }
 
   @Patch(':id')

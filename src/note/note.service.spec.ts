@@ -40,6 +40,7 @@ describe('NoteService', () => {
     noteMedia: {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
+      findMany: jest.fn(),
     },
     noteGroupMembership: {
       deleteMany: jest.fn(),
@@ -58,6 +59,8 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // updateNote 会先查笔记上已有媒体的 objectKey（收藏复制场景的豁免名单）。
+    prisma.noteMedia.findMany.mockResolvedValue([]);
     uploadService.createPresignedGetUrl.mockImplementation(
       (key: string, expiresInSeconds: number) =>
         Promise.resolve({
@@ -2097,5 +2100,271 @@ describe('NoteService', () => {
     const createArg = prisma.note.create.mock.calls[0][0];
     expect(createArg.data.title).toHaveLength(120);
     expect(createArg.data.content).toHaveLength(20_000);
+  });
+
+  // ── collectNote：聊天收藏笔记 → 复制入我的笔记 ─────────────────────────────
+
+  const collectSource = {
+    conversationType: 'group' as const,
+    conversationID: 'sg_123',
+    clientMsgID: 'msg-abc',
+    sender: {
+      id: 'user-2',
+      name: '小王',
+      faceURL: 'https://cdn.example.com/w.jpg',
+    },
+    group: {
+      id: 'g-1',
+      name: '产品讨论群',
+      faceURL: 'https://cdn.example.com/g.jpg',
+    },
+  };
+
+  const otherUsersNote = {
+    id: 'note-src',
+    ownerID: 'user-2',
+    title: '分享的笔记',
+    content: '正文',
+    contentJson: [{ type: 'paragraph' }],
+    sections: { text: { content: '正文', contentJson: null } },
+    status: 'ACTIVE',
+    available: true,
+    pinned: true,
+    imageCount: 1,
+    videoCount: 1,
+    mediaCount: 2,
+    createdAt: new Date('2026-06-01T00:00:00.000Z'),
+    updatedAt: new Date('2026-06-01T00:00:00.000Z'),
+    coverMedia: {
+      id: 'media-img',
+      type: 'IMAGE',
+      url: 'https://cdn.example.com/a.jpg',
+    },
+    groupMemberships: [],
+    media: [
+      {
+        id: 'media-vid',
+        type: 'VIDEO',
+        objectKey: 'notes/user-2/a.mp4',
+        url: 'https://cdn.example.com/a.mp4',
+        mimeType: 'video/mp4',
+        size: 100,
+        width: null,
+        height: null,
+        durationMs: 1000,
+        posterUrl: 'https://cdn.example.com/a-poster.jpg',
+        sortOrder: 0,
+      },
+      {
+        id: 'media-img',
+        type: 'IMAGE',
+        objectKey: 'notes/user-2/a.jpg',
+        url: 'https://cdn.example.com/a.jpg',
+        mimeType: 'image/jpeg',
+        size: 50,
+        width: 800,
+        height: 600,
+        durationMs: null,
+        posterUrl: null,
+        sortOrder: 1,
+      },
+    ],
+  };
+
+  it('collectNote snapshots another user note into my notes with source card', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote) // 源笔记可读
+      .mockResolvedValueOnce(null); // 尚未收藏过
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async (args: any) => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      pinned: false,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+      coverMediaID: args.data.coverMediaID,
+    }));
+
+    const result = await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    expect(result.alreadyCollected).toBe(false);
+    expect(result.note.canEdit).toBe(true);
+
+    const createArg = prisma.note.create.mock.calls[0][0];
+    expect(createArg.data).toMatchObject({
+      ownerID: 'user-1',
+      title: '分享的笔记',
+      collectedFromNoteID: 'note-src',
+      imageCount: 1,
+      videoCount: 1,
+      mediaCount: 2,
+      pinned: false,
+      status: 'ACTIVE',
+    });
+    expect(createArg.data.collectedFrom).toMatchObject({
+      kind: 'chat',
+      conversationType: 'group',
+      conversationID: 'sg_123',
+      clientMsgID: 'msg-abc',
+      sender: { id: 'user-2', name: '小王' },
+      group: { id: 'g-1', name: '产品讨论群' },
+      sourceNoteId: 'note-src',
+      sourceOwnerId: 'user-2',
+    });
+
+    // 媒体行复用同一存储对象（objectKey/url 原样），但换新 id 归属新笔记
+    const mediaArg = prisma.noteMedia.createMany.mock.calls[0][0];
+    expect(mediaArg.data).toHaveLength(2);
+    expect(mediaArg.data.map((m: any) => m.objectKey)).toEqual([
+      'notes/user-2/a.mp4',
+      'notes/user-2/a.jpg',
+    ]);
+    expect(mediaArg.data.every((m: any) => m.noteID === 'note-copy')).toBe(
+      true,
+    );
+    expect(mediaArg.data.every((m: any) => m.id !== 'media-img')).toBe(true);
+
+    // 封面对齐原笔记封面（IMAGE 那行的新 id）
+    const updateArg = prisma.note.update.mock.calls[0][0];
+    const copiedImage = mediaArg.data.find((m: any) => m.type === 'IMAGE');
+    expect(updateArg.data.coverMediaID).toBe(copiedImage.id);
+  });
+
+  it('collectNote returns own note untouched (already in my notes)', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-mine',
+      ownerID: 'user-1',
+    });
+
+    const result = await service.collectNote('user-1', {
+      noteId: 'note-mine',
+      source: collectSource,
+    });
+
+    expect(result.alreadyCollected).toBe(true);
+    expect(result.note.id).toBe('note-mine');
+    expect(prisma.note.create).not.toHaveBeenCalled();
+    expect(prisma.note.update).not.toHaveBeenCalled();
+  });
+
+  it('collectNote refreshes source snapshot when the note was collected before', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce({ id: 'note-copy' }); // 已有收藏副本
+    prisma.note.update.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      collectedFrom: { kind: 'chat', conversationID: 'sg_123' },
+      collectedFromNoteID: 'note-src',
+    });
+
+    const result = await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    expect(result.alreadyCollected).toBe(true);
+    expect(prisma.note.create).not.toHaveBeenCalled();
+    const updateArg = prisma.note.update.mock.calls[0][0];
+    expect(updateArg.where).toEqual({ id: 'note-copy' });
+    expect(updateArg.data.collectedFrom).toMatchObject({
+      conversationID: 'sg_123',
+      clientMsgID: 'msg-abc',
+    });
+  });
+
+  it('collectNote rejects notes that are deleted or not readable', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.collectNote('user-1', {
+        noteId: 'note-hidden',
+        source: collectSource,
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.note.create).not.toHaveBeenCalled();
+  });
+
+  it('collectNote surfaces collectedFrom in list/detail mapping', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      collectedFrom: {
+        kind: 'chat',
+        conversationType: 'group',
+        group: { id: 'g-1', name: '产品讨论群', faceURL: null },
+      },
+      collectedFromNoteID: 'note-src',
+    });
+
+    const detail = await service.getNote('user-1', 'note-copy');
+    expect(detail.collectedFrom).toMatchObject({
+      conversationType: 'group',
+      group: { name: '产品讨论群' },
+    });
+  });
+
+  // ── updateNote：收藏副本上的原作者媒体 key 豁免 ────────────────────────────
+
+  it('updateNote keeps grandfathered foreign media keys already on the note', async () => {
+    prisma.noteMedia.findMany.mockResolvedValueOnce([
+      { objectKey: 'notes/user-2/a.jpg' },
+    ]);
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-copy',
+      ownerID: 'user-1',
+      status: 'ACTIVE',
+    });
+    prisma.note.update.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+    });
+
+    await expect(
+      service.updateNote('user-1', 'note-copy', {
+        title: '编辑收藏的笔记',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-2/a.jpg', // 收藏时带来的原作者对象，允许保留
+            url: 'https://cdn.example.com/a.jpg',
+            sortOrder: 0,
+          },
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/new.jpg', // 新增媒体必须归属自己
+            url: 'https://cdn.example.com/new.jpg',
+            sortOrder: 1,
+          },
+        ],
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it('updateNote still rejects foreign media keys that are not on the note', async () => {
+    prisma.noteMedia.findMany.mockResolvedValueOnce([]);
+
+    await expect(
+      service.updateNote('user-1', 'note-1', {
+        title: '恶意引用',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-2/steal.jpg',
+            url: 'https://cdn.example.com/steal.jpg',
+            sortOrder: 0,
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });

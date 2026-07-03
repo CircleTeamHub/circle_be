@@ -476,6 +476,10 @@ model Note {
   mediaCount   Int        @default(0)
   imageCount   Int        @default(0)
   videoCount   Int        @default(0)
+  // 从聊天收藏他人笔记时的来源快照（会话类型、群/发送者名片、消息定位信息）。
+  // 自建笔记为 null；collectedFromNoteID 冗余成单列用于幂等去重查询。
+  collectedFrom       Json?
+  collectedFromNoteID String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
@@ -488,6 +492,7 @@ model Note {
   @@index([ownerID, status, updatedAt])
   @@index([ownerID, pinned, updatedAt])
   @@index([groupID])
+  @@index([ownerID, collectedFromNoteID])
 }
 
 model NoteShareLink {

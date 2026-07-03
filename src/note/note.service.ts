@@ -17,11 +17,14 @@ import { UploadService } from 'src/upload/upload.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { prismaErrorCode } from 'src/utils/prisma-tx';
 import {
+  CollectNoteDto,
+  CollectNoteResultDto,
   CreateNoteExportDto,
   CreateNoteDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNotesQueryDto,
+  NoteCollectSourceDto,
   NoteDetailDto,
   NoteExportResultDto,
   NoteGroupDto,
@@ -112,6 +115,8 @@ type NoteRow = {
   imageCount: number;
   videoCount: number;
   mediaCount: number;
+  collectedFrom?: unknown;
+  collectedFromNoteID?: string | null;
   createdAt: Date;
   updatedAt: Date;
   coverMedia: { id: string; type: NoteMediaType; url: string } | null;
@@ -624,12 +629,22 @@ export class NoteService {
     return `${trimmedBase}/s/${token}`;
   }
 
-  private assertMediaOwnership(ownerID: string, media: CreateNoteDto['media']) {
+  private assertMediaOwnership(
+    ownerID: string,
+    media: CreateNoteDto['media'],
+    // 收藏复制来的笔记会携带原作者的 objectKey；编辑时允许"保留笔记上已有的
+    // 媒体"，只有新增的 key 必须归属当前用户，防止客户端引用他人上传。
+    grandfatheredKeys?: ReadonlySet<string>,
+  ) {
     // Presign now generates keys as `notes/{userId}/{uuid}.ext`.
     // Verify both the folder prefix and the user segment so a client cannot
     // reference another user's uploaded media.
     const prefix = `notes/${ownerID}/`;
-    const invalid = media.find((item) => !item.objectKey.startsWith(prefix));
+    const invalid = media.find(
+      (item) =>
+        !item.objectKey.startsWith(prefix) &&
+        !grandfatheredKeys?.has(item.objectKey),
+    );
     if (invalid) {
       throw new BadRequestException(
         `objectKey must start with notes/${ownerID}/`,
@@ -1082,6 +1097,9 @@ export class NoteService {
       videoCount: note.videoCount,
       mediaCount: note.mediaCount,
       ...availability,
+      collectedFrom: this.isRecord(note.collectedFrom)
+        ? note.collectedFrom
+        : null,
       createdAt: note.createdAt,
       updatedAt: note.updatedAt,
     };
@@ -1344,6 +1362,151 @@ export class NoteService {
     return this.mapDetail(note, ownerID);
   }
 
+  private buildCollectedFrom(
+    source: NoteCollectSourceDto,
+    note: Pick<NoteRow, 'id' | 'ownerID'>,
+  ): Record<string, unknown> {
+    return {
+      kind: 'chat',
+      conversationType: source.conversationType,
+      conversationID: source.conversationID,
+      clientMsgID: source.clientMsgID,
+      sender: {
+        id: source.sender.id,
+        name: source.sender.name,
+        faceURL: source.sender.faceURL ?? null,
+      },
+      group: source.group
+        ? {
+            id: source.group.id,
+            name: source.group.name,
+            faceURL: source.group.faceURL ?? null,
+          }
+        : null,
+      sourceNoteId: note.id,
+      sourceOwnerId: note.ownerID,
+      collectedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * 聊天里收藏笔记 → 直接进"我的笔记"：把可读的他人笔记快照复制成一条自己的
+   * 笔记（媒体行复用同一份存储对象，不搬字节），并记录 collectedFrom 来源名片
+   * （群聊记群名片、私聊记发送者名片 + 消息 clientMsgID，供跳回聊天定位）。
+   *
+   * 幂等：自己的笔记不复制直接返回；同一原笔记重复收藏只刷新来源快照。
+   * （findFirst→create 之间理论上有并发窗口，单用户手动收藏场景可接受。）
+   */
+  async collectNote(
+    userID: string,
+    dto: CollectNoteDto,
+  ): Promise<CollectNoteResultDto> {
+    const source = await this.prisma.note.findFirst({
+      where: {
+        id: dto.noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: userID }, { available: true }],
+      },
+      include: NOTE_INCLUDE,
+    });
+
+    if (!source) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+
+    // 自己的笔记本来就在"我的笔记"里 —— 不复制、不打来源标（来源名片只对
+    // 收藏他人笔记有意义）。
+    if (source.ownerID === userID) {
+      return { note: this.mapDetail(source, userID), alreadyCollected: true };
+    }
+
+    const collectedFrom = this.buildCollectedFrom(dto.source, source);
+
+    const existing = await this.prisma.note.findFirst({
+      where: {
+        ownerID: userID,
+        collectedFromNoteID: dto.noteId,
+        status: { not: 'DELETED' },
+      },
+      select: { id: true },
+    });
+
+    if (existing) {
+      // 已收藏过：只把来源刷新成最近一次收藏的会话（可能换了个群/好友再收）。
+      const refreshed = await this.prisma.note.update({
+        where: { id: existing.id },
+        data: { collectedFrom: toPrismaJson(collectedFrom) },
+        include: NOTE_INCLUDE,
+      });
+      return {
+        note: this.mapDetail(refreshed, userID),
+        alreadyCollected: true,
+      };
+    }
+
+    const media = (source.media ?? []).map((item) => ({
+      id: randomUUID(),
+      sourceMediaID: item.id,
+      type: item.type,
+      objectKey: item.objectKey,
+      url: item.url,
+      mimeType: item.mimeType ?? null,
+      size: item.size ?? null,
+      width: item.width ?? null,
+      height: item.height ?? null,
+      durationMs: item.durationMs ?? null,
+      posterUrl: item.posterUrl ?? null,
+      sortOrder: item.sortOrder,
+    }));
+
+    // 封面对齐原笔记的封面行；原笔记无封面时回退第一张图（与 createNote 一致）。
+    const coverMediaID =
+      media.find((item) => item.sourceMediaID === source.coverMedia?.id)?.id ??
+      media.find((item) => item.type === 'IMAGE')?.id ??
+      null;
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      const note = await tx.note.create({
+        data: {
+          ownerID: userID,
+          title: source.title,
+          content: source.content,
+          contentJson: toPrismaJson(source.contentJson),
+          sections: toPrismaJson(source.sections),
+          groupID: null,
+          status: 'ACTIVE',
+          available: true,
+          pinned: false,
+          imageCount: source.imageCount,
+          videoCount: source.videoCount,
+          mediaCount: source.mediaCount,
+          collectedFrom: toPrismaJson(collectedFrom),
+          collectedFromNoteID: source.id,
+        },
+      });
+
+      if (media.length > 0) {
+        await tx.noteMedia.createMany({
+          data: media.map(({ sourceMediaID: _sourceMediaID, ...item }) => ({
+            ...item,
+            noteID: note.id,
+          })),
+        });
+      }
+
+      return tx.note.update({
+        where: { id: note.id },
+        data: { coverMediaID },
+        include: NOTE_INCLUDE,
+      });
+    });
+
+    return { note: this.mapDetail(created, userID), alreadyCollected: false };
+  }
+
   async createNoteExport(
     viewerID: string,
     noteId: string,
@@ -1465,7 +1628,17 @@ export class NoteService {
     await this.requireOwnedGroups(ownerID, uniqueGroupIds);
 
     const derived = this.deriveNoteContent(input);
-    this.assertMediaOwnership(ownerID, derived.media);
+    // 收藏复制的笔记媒体沿用原作者的 objectKey；这些 key 是服务端 collectNote
+    // 时合法落到本笔记上的，编辑时允许原样保留（新增媒体仍必须归属自己）。
+    const existingMedia = await this.prisma.noteMedia.findMany({
+      where: { noteID: noteId, note: { ownerID } },
+      select: { objectKey: true },
+    });
+    this.assertMediaOwnership(
+      ownerID,
+      derived.media,
+      new Set(existingMedia.map((item) => item.objectKey)),
+    );
     this.assertMediaUrlsAreSafe(derived.media);
 
     const media = derived.media
