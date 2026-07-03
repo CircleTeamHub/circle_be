@@ -9,7 +9,7 @@
       "postinstall": "prisma generate",
       "prebuild": "rimraf dist",
       "build": "cross-env NODE_ENV=production nest build",
-      "postbuild": "ln -sfn \"$(pwd)/src/generated\" dist/src/generated",
+      "postbuild": "node scripts/copy-generated-client.js",
       "prestart:dev": "mkdir -p dist/src && ln -sfn \"$(pwd)/src/generated\" dist/src/generated || true",
       "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
       "start": "ts-node src/main.ts",
