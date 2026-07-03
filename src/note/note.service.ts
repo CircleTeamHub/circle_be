@@ -1097,9 +1097,12 @@ export class NoteService {
       videoCount: note.videoCount,
       mediaCount: note.mediaCount,
       ...availability,
-      collectedFrom: this.isRecord(note.collectedFrom)
-        ? note.collectedFrom
-        : null,
+      // 来源名片是收藏者的私人定位标记：available=true 的笔记任何人都能打开，
+      // 但「从哪个群/谁那里收藏的」不能跟着泄漏 —— 只回给笔记主人本人。
+      collectedFrom:
+        note.ownerID === viewerID && this.isRecord(note.collectedFrom)
+          ? note.collectedFrom
+          : null,
       createdAt: note.createdAt,
       updatedAt: note.updatedAt,
     };

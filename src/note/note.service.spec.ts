@@ -2312,6 +2312,27 @@ describe('NoteService', () => {
     });
   });
 
+  it('hides collectedFrom from anyone who is not the note owner', async () => {
+    // 收藏副本被转发后 available=true，其他人能读内容，但来源名片是
+    // 收藏者的私人定位标记，不能跟着笔记一起泄漏给查看者。
+    prisma.note.findFirst.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      available: true,
+      collectedFrom: {
+        kind: 'chat',
+        conversationType: 'group',
+        group: { id: 'g-1', name: '产品讨论群', faceURL: null },
+      },
+      collectedFromNoteID: 'note-src',
+    });
+
+    const detail = await service.getNote('user-9', 'note-copy');
+    expect(detail.collectedFrom).toBeNull();
+    expect(detail.canEdit).toBe(false);
+  });
+
   // ── updateNote：收藏副本上的原作者媒体 key 豁免 ────────────────────────────
 
   it('updateNote keeps grandfathered foreign media keys already on the note', async () => {
