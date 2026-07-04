@@ -319,11 +319,15 @@ describe('AuthService', () => {
       },
     );
 
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith('uuid-1', {
-      deviceName: 'MacBook Pro',
-      ip: '127.0.0.1',
-      userAgent: 'PostmanRuntime',
-    }, 'APP');
+    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+      'uuid-1',
+      {
+        deviceName: 'MacBook Pro',
+        ip: '127.0.0.1',
+        userAgent: 'PostmanRuntime',
+      },
+      'APP',
+    );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({ sub: 'uuid-1', sid: 'session-1', aud: 'APP' }),
     );

@@ -18,7 +18,10 @@ export function encodeFeedCursor(createdAt: Date, id: string): string {
  * Decode a cursor or throw 400 with the caller's stable errorCode (each feed
  * keeps its own `*_INVALID_CURSOR` code for client-side i18n mapping).
  */
-export function decodeFeedCursor(cursor: string, errorCode: string): FeedCursor {
+export function decodeFeedCursor(
+  cursor: string,
+  errorCode: string,
+): FeedCursor {
   let decoded: string;
   try {
     decoded = Buffer.from(cursor, 'base64url').toString('utf8');
@@ -50,10 +53,7 @@ function invalidCursor(errorCode: string): BadRequestException {
  * a timestamp are never skipped or repeated across pages.
  */
 export function feedCursorWhere(cursor: FeedCursor): {
-  OR: [
-    { createdAt: { lt: Date } },
-    { createdAt: Date; id: { lt: string } },
-  ];
+  OR: [{ createdAt: { lt: Date } }, { createdAt: Date; id: { lt: string } }];
 } {
   return {
     OR: [

@@ -8,6 +8,6 @@
 -- column, so it still covers the old fromID-only lookups; the single-column index
 -- is therefore redundant and dropped.
 
-DROP INDEX "Trace_fromID_idx";
+DROP INDEX IF EXISTS "Trace_fromID_idx";
 
-CREATE INDEX "Trace_fromID_createdAt_idx" ON "Trace"("fromID", "createdAt" DESC);
+CREATE INDEX IF NOT EXISTS "Trace_fromID_createdAt_idx" ON "Trace"("fromID", "createdAt" DESC);

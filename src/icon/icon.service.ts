@@ -257,27 +257,26 @@ export class IconService {
     }
     if (uncached.length === 0) return result;
 
-    const [users, memberships, privacyByUser, selections] =
-      await Promise.all([
-        this.prisma.user.findMany({
-          where: { id: { in: uncached } },
-          select: ELIGIBILITY_USER_SELECT,
-        }),
-        this.prisma.circleMember.findMany({
-          where: {
-            userID: { in: uncached },
-            status: 'ACTIVE',
-            circle: { deleted: false },
-          },
-          select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-          orderBy: { createdAt: 'desc' },
-        }),
-        this.privacySettings.getSettingsForUsers(uncached),
-        this.prisma.userDisplayIcon.findMany({
-          where: { userID: { in: uncached } },
-          orderBy: { sortOrder: 'asc' },
-        }),
-      ]);
+    const [users, memberships, privacyByUser, selections] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { id: { in: uncached } },
+        select: ELIGIBILITY_USER_SELECT,
+      }),
+      this.prisma.circleMember.findMany({
+        where: {
+          userID: { in: uncached },
+          status: 'ACTIVE',
+          circle: { deleted: false },
+        },
+        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.privacySettings.getSettingsForUsers(uncached),
+      this.prisma.userDisplayIcon.findMany({
+        where: { userID: { in: uncached } },
+        orderBy: { sortOrder: 'asc' },
+      }),
+    ]);
 
     const membershipsByUser = new Map<string, EligibilityCircleMembership[]>();
     for (const membership of memberships) {
@@ -426,34 +425,29 @@ export class IconService {
   }
 
   private async resolveEligibility(userId: string): Promise<Eligibility> {
-    const [user, circleMemberships, privacy] =
-      await Promise.all([
-        this.prisma.user.findUnique({
-          where: { id: userId },
-          select: ELIGIBILITY_USER_SELECT,
-        }),
-        this.prisma.circleMember.findMany({
-          where: {
-            userID: userId,
-            status: 'ACTIVE',
-            circle: { deleted: false },
-          },
-          select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-          orderBy: { createdAt: 'desc' },
-          take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
-        }),
-        this.privacySettings.getSettings(userId),
-      ]);
+    const [user, circleMemberships, privacy] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: ELIGIBILITY_USER_SELECT,
+      }),
+      this.prisma.circleMember.findMany({
+        where: {
+          userID: userId,
+          status: 'ACTIVE',
+          circle: { deleted: false },
+        },
+        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
+        orderBy: { createdAt: 'desc' },
+        take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
+      }),
+      this.privacySettings.getSettings(userId),
+    ]);
 
     if (!user) {
       throw new NotFoundException('User not found');
     }
 
-    return this.buildEligibility(
-      user,
-      circleMemberships,
-      privacy,
-    );
+    return this.buildEligibility(user, circleMemberships, privacy);
   }
 
   // Pure eligibility assembly from prefetched rows. Kept side-effect-free so the

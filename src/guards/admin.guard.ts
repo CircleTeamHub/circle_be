@@ -5,6 +5,8 @@ import { Role } from 'src/enum/roles.enum';
 export class AdminGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest();
-    return request.user?.role === Role.Admin && request.user?.audience === 'ADMIN';
+    return (
+      request.user?.role === Role.Admin && request.user?.audience === 'ADMIN'
+    );
   }
 }

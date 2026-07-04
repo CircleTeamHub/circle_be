@@ -8,11 +8,11 @@
 
 DROP INDEX IF EXISTS "Note_ownerID_collectedFromNoteID_idx";
 
-CREATE UNIQUE INDEX "Note_ownerID_collectedFromNoteID_active_key"
+CREATE UNIQUE INDEX IF NOT EXISTS "Note_ownerID_collectedFromNoteID_active_key"
   ON "Note"("ownerID", "collectedFromNoteID")
   WHERE "collectedFromNoteID" IS NOT NULL AND "status" <> 'DELETED';
 
 DROP INDEX IF EXISTS "Trace_fromID_createdAt_idx";
 
-CREATE INDEX "Trace_fromID_createdAt_id_idx"
+CREATE INDEX IF NOT EXISTS "Trace_fromID_createdAt_id_idx"
   ON "Trace"("fromID", "createdAt" DESC, "id" DESC);
