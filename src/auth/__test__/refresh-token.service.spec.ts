@@ -48,6 +48,9 @@ describe('RefreshTokenService', () => {
         const matching = records.filter((record) => {
           if (where.userId && record.userId !== where.userId) return false;
           if (where.token && record.token !== where.token) return false;
+          if (where.audience && record.audience !== where.audience) {
+            return false;
+          }
           if (typeof where.id === 'string' && record.id !== where.id) {
             return false;
           }
@@ -107,6 +110,14 @@ describe('RefreshTokenService', () => {
         }),
       }),
     );
+  });
+
+  it('stores app audience by default and admin audience when requested', async () => {
+    await service.create('user-1');
+    await service.create('user-1', undefined, 'ADMIN');
+
+    expect(records[0].audience).toBe('APP');
+    expect(records[1].audience).toBe('ADMIN');
   });
 
   it('lists only active sessions for a user', async () => {
@@ -261,6 +272,25 @@ describe('RefreshTokenService', () => {
     expect(newRecord.ip).toBe(privateIp);
     // Carries over device name from the old session when not supplied.
     expect(newRecord.deviceName).toBe('MacBook');
+  });
+
+  it('carries the refresh token audience when rotating', async () => {
+    const { token: raw } = await service.create('user-1', undefined, 'ADMIN');
+
+    await service.rotate(raw, undefined, 'ADMIN');
+
+    expect(records[1].audience).toBe('ADMIN');
+  });
+
+  it('rejects rotating a refresh token for the wrong audience without revoking it', async () => {
+    const { token: raw } = await service.create('user-1', undefined, 'APP');
+
+    await expect(service.rotate(raw, undefined, 'ADMIN')).rejects.toThrow(
+      UnauthorizedException,
+    );
+
+    expect(records[0].revokedAt).toBeNull();
+    expect(records).toHaveLength(1);
   });
 
   it('detects refresh token reuse and revokes all sessions for the user', async () => {

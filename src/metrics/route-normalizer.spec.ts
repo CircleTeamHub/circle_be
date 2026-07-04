@@ -55,6 +55,14 @@ describe('normalizeRoute', () => {
 
   it('leaves fully static routes unchanged', () => {
     expect(normalizeRoute('/api/v1/auth/login')).toBe('/api/v1/auth/login');
+    expect(normalizeRoute('/api/v1/auth/admin/login')).toBe(
+      '/api/v1/auth/admin/login',
+    );
+    expect(normalizeRoute('/api/v1/auth/admin/refresh')).toBe(
+      '/api/v1/auth/admin/refresh',
+    );
+    expect(STATIC_ROUTES.has('/api/v1/auth/admin/login')).toBe(true);
+    expect(STATIC_ROUTES.has('/api/v1/auth/admin/refresh')).toBe(true);
   });
 
   it('strips the query string', () => {

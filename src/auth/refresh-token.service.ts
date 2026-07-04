@@ -14,6 +14,8 @@ export type SessionContext = {
   userAgent?: string | null;
 };
 
+export type RefreshTokenAudience = 'APP' | 'ADMIN';
+
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
@@ -54,6 +56,7 @@ export class RefreshTokenService {
   async create(
     userId: string,
     context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; sessionId: string }> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
@@ -69,6 +72,7 @@ export class RefreshTokenService {
         deviceName: safe.deviceName,
         ip: safe.ip,
         userAgent: safe.userAgent,
+        audience,
         lastUsedAt: new Date(),
       },
     });
@@ -79,6 +83,7 @@ export class RefreshTokenService {
   async rotate(
     oldToken: string,
     context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; userId: string; sessionId: string }> {
     const tokenHash = hashToken(oldToken);
     const now = new Date();
@@ -88,7 +93,12 @@ export class RefreshTokenService {
     // concurrent requests both pass a findUnique check before either writes
     // revokedAt, which would allow one token to spawn two live sessions.
     const revoked = await this.prisma.refreshToken.updateMany({
-      where: { token: tokenHash, revokedAt: null, expiredAt: { gt: now } },
+      where: {
+        token: tokenHash,
+        revokedAt: null,
+        expiredAt: { gt: now },
+        audience,
+      },
       data: { revokedAt: now },
     });
 
@@ -97,9 +107,14 @@ export class RefreshTokenService {
       // (potential session hijack) vs an unknown/expired token.
       const existing = await this.prisma.refreshToken.findUnique({
         where: { token: tokenHash },
-        select: { userId: true, revokedAt: true, expiredAt: true },
+        select: {
+          userId: true,
+          revokedAt: true,
+          expiredAt: true,
+          audience: true,
+        },
       });
-      if (existing?.revokedAt) {
+      if (existing?.revokedAt && existing.audience === audience) {
         // Reuse detected: the legitimate holder rotated this token, and now
         // someone is replaying the old one. Assume compromise and kill the
         // entire session chain for this user.
@@ -117,7 +132,13 @@ export class RefreshTokenService {
     // Fetch metadata needed to carry over device context to the new token.
     const record = await this.prisma.refreshToken.findUnique({
       where: { token: tokenHash },
-      select: { userId: true, deviceName: true, ip: true, userAgent: true },
+      select: {
+        userId: true,
+        deviceName: true,
+        ip: true,
+        userAgent: true,
+        audience: true,
+      },
     });
 
     if (!record) {
@@ -129,7 +150,7 @@ export class RefreshTokenService {
       deviceName: context?.deviceName ?? record.deviceName ?? null,
       ip: context?.ip ?? record.ip ?? null,
       userAgent: context?.userAgent ?? record.userAgent ?? null,
-    });
+    }, record.audience);
     return {
       token: newSession.token,
       userId: record.userId,

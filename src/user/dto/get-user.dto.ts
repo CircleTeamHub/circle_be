@@ -1,6 +1,7 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { UserStatus } from 'src/generated/prisma';
 
 export class GetUserDto {
   @ApiPropertyOptional({ example: 1, description: 'Current page number' })
@@ -28,4 +29,12 @@ export class GetUserDto {
   @IsOptional()
   @IsString()
   accountId?: string;
+
+  @ApiPropertyOptional({
+    enum: UserStatus,
+    description: 'Filter by account status',
+  })
+  @IsOptional()
+  @IsEnum(UserStatus)
+  status?: UserStatus;
 }

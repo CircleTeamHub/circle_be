@@ -15,6 +15,11 @@ enum UserStatus {
   DELETED
 }
 
+enum RefreshTokenAudience {
+  APP
+  ADMIN
+}
+
 enum EmailCodePurpose {
   REGISTER
   LOGIN
@@ -311,6 +316,7 @@ model RefreshToken {
   id         String    @id @default(uuid())
   userId     String
   token      String    @unique
+  audience   RefreshTokenAudience @default(APP)
   deviceName String?
   ip         String?
   userAgent  String?

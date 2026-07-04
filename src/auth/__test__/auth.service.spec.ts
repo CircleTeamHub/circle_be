@@ -323,9 +323,9 @@ describe('AuthService', () => {
       deviceName: 'MacBook Pro',
       ip: '127.0.0.1',
       userAgent: 'PostmanRuntime',
-    });
+    }, 'APP');
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
-      expect.objectContaining({ sub: 'uuid-1', sid: 'session-1' }),
+      expect.objectContaining({ sub: 'uuid-1', sid: 'session-1', aud: 'APP' }),
     );
   });
 
@@ -350,7 +350,60 @@ describe('AuthService', () => {
     expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
       'uuid-1',
       undefined,
+      'APP',
     );
+  });
+
+  it('adminLogin issues admin-audience tokens for active admin users', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      email: 'admin@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+
+    const result = await service.adminLogin({
+      email: 'admin@example.com',
+      password: 'password1',
+    } as any);
+
+    expect(result.accessToken).toBe('access-token');
+    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+      'uuid-1',
+      undefined,
+      'ADMIN',
+    );
+    expect(mockJwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sub: 'uuid-1',
+        role: 'ADMIN',
+        sid: 'session-1',
+        aud: 'ADMIN',
+      }),
+    );
+  });
+
+  it('adminLogin rejects valid non-admin credentials', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'user',
+      email: 'user@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+
+    await expect(
+      service.adminLogin({
+        email: 'user@example.com',
+        password: 'password1',
+      } as any),
+    ).rejects.toThrow(ForbiddenException);
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 
   it('returns the active sessions for a user', async () => {
@@ -432,8 +485,13 @@ describe('AuthService', () => {
 
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('new-refresh-token');
+    expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
+      'refresh-token',
+      undefined,
+      'APP',
+    );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
-      expect.objectContaining({ sub: 'uuid-1', sid: 'session-2' }),
+      expect.objectContaining({ sub: 'uuid-1', sid: 'session-2', aud: 'APP' }),
     );
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -444,6 +502,37 @@ describe('AuthService', () => {
       }),
     );
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
+  });
+
+  it('adminRefresh rotates only admin refresh sessions and returns an admin-audience token', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'ADMIN',
+      lastOnline: null,
+    });
+
+    const result = await service.adminRefresh('refresh-token');
+
+    expect(result).toEqual({
+      accessToken: 'access-token',
+      refreshToken: 'new-refresh-token',
+    });
+    expect(mockRefreshTokenService.rotate).toHaveBeenCalledWith(
+      'refresh-token',
+      undefined,
+      'ADMIN',
+    );
+    expect(mockJwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sub: 'uuid-1',
+        role: 'ADMIN',
+        sid: 'session-2',
+        aud: 'ADMIN',
+      }),
+    );
   });
 
   it('loads city, VIP level, and credit score in the self profile response', async () => {

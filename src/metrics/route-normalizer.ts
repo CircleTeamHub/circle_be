@@ -15,6 +15,8 @@ const NUMERIC = /^\d+$/;
 // sync with the real router when adding controllers, or new routes silently
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
+  '/api/v1/auth/admin/login',
+  '/api/v1/auth/admin/refresh',
   '/api/v1/auth/change-account-id',
   '/api/v1/auth/change-password',
   '/api/v1/auth/email/request-code',

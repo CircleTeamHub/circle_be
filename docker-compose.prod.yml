@@ -96,8 +96,8 @@ services:
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro
-    ports:
-      - '3000:3000'
+    expose:
+      - '3000'
     healthcheck:
       # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
       test:
@@ -110,6 +110,36 @@ services:
       retries: 5
       start_period: 40s
 
+  admin_web:
+    build:
+      context: ../circle_admin_web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      circle_be: { condition: service_healthy }
+    expose:
+      - '80'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      circle_be: { condition: service_healthy }
+      admin_web: { condition: service_started }
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
+      ADMIN_DOMAIN: ${ADMIN_DOMAIN:?set ADMIN_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   pg_data:
   minio_data:
+  caddy_data:
+  caddy_config:
