@@ -60,6 +60,13 @@ const DEFAULT_DISPLAY_BADGES = [
   'CIRCLE_BUILDER',
 ];
 
+const VERIFIED_PROFILE_FALLBACKS = {
+  avatarUrl:
+    'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=256&h=256&fit=crop',
+  city: '上海',
+  persona: 'Badge 全量测试账号，用于本地验证所有系统图标展示。',
+};
+
 function loadDatabaseUrl() {
   if (process.env.DATABASE_URL) return;
   const envPath = path.join(__dirname, '..', '.env.development');
@@ -83,6 +90,18 @@ function det(key) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }
 
+function presentOrFallback(value, fallback) {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value
+    : fallback;
+}
+
+function longTextOrFallback(value, fallback, minLength = 10) {
+  return typeof value === 'string' && value.trim().length >= minLength
+    ? value
+    : fallback;
+}
+
 loadDatabaseUrl();
 assertDevSeedAllowed(process.env);
 
@@ -93,7 +112,15 @@ const prisma = new PrismaClient({
 async function main() {
   const user = await prisma.user.findUnique({
     where: { email },
-    select: { id: true, accountId: true, email: true, nickname: true },
+    select: {
+      id: true,
+      accountId: true,
+      email: true,
+      nickname: true,
+      avatarUrl: true,
+      city: true,
+      persona: true,
+    },
   });
 
   if (!user) {
@@ -117,6 +144,15 @@ async function main() {
         fancyNumber: true,
         receivedLikeCount: 10_000,
         createdAt: now,
+        avatarUrl: presentOrFallback(
+          user.avatarUrl,
+          VERIFIED_PROFILE_FALLBACKS.avatarUrl,
+        ),
+        city: presentOrFallback(user.city, VERIFIED_PROFILE_FALLBACKS.city),
+        persona: longTextOrFallback(
+          user.persona,
+          VERIFIED_PROFILE_FALLBACKS.persona,
+        ),
         qq: '932567218',
         wechat: 'windnote_test_932567218',
         phoneNumber: '13800138000',
@@ -231,6 +267,9 @@ async function main() {
       accountId: true,
       email: true,
       nickname: true,
+      avatarUrl: true,
+      city: true,
+      persona: true,
       vipLevel: true,
       receivedLikeCount: true,
       createdAt: true,

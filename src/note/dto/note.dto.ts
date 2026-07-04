@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   IsArray,
   IsBoolean,
+  IsDefined,
   IsEnum,
   IsInt,
   IsNotEmpty,
@@ -16,6 +17,7 @@ import {
   MaxLength,
   Min,
   Validate,
+  ValidateIf,
   ValidateNested,
   ValidatorConstraint,
   ValidatorConstraintInterface,
@@ -258,6 +260,12 @@ export class SetNoteAvailableDto {
   available: boolean;
 }
 
+export class SetNoteStatusDto {
+  @ApiProperty({ enum: NOTE_WRITABLE_STATUS })
+  @IsEnum(NOTE_WRITABLE_STATUS)
+  status: NoteWritableStatus;
+}
+
 export class ListNotesQueryDto {
   @ApiPropertyOptional({ enum: NOTE_STATUS })
   @IsOptional()
@@ -426,6 +434,11 @@ export class NoteSummaryDto {
   @ApiProperty() hasText: boolean;
   @ApiProperty() showcaseCount: number;
   @ApiProperty() hasLocation: boolean;
+  @ApiPropertyOptional({
+    nullable: true,
+    description: '聊天收藏来源快照；自建笔记为 null',
+  })
+  collectedFrom: Record<string, unknown> | null;
   @ApiProperty() createdAt: Date;
   @ApiProperty() updatedAt: Date;
 }
@@ -438,6 +451,84 @@ export class NoteDetailDto extends NoteSummaryDto {
   @ApiProperty({ type: [NoteMediaDto] }) media: NoteMediaDto[];
   @ApiProperty({ type: NoteSectionsResponseDto })
   sections: NoteSectionsResponseDto;
+}
+
+// ── 收藏聊天中的笔记 → 复制入"我的笔记" ────────────────────────────────────────
+
+export const NOTE_COLLECT_CONVERSATION_TYPE = ['private', 'group'] as const;
+export type NoteCollectConversationType =
+  (typeof NOTE_COLLECT_CONVERSATION_TYPE)[number];
+
+/** 来源名片主体：群或用户（id 兼容 UUID 与 OpenIM 群号，不强校验 UUID） */
+export class NoteCollectPeerDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(64)
+  id: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  name: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUrl({ require_tld: false })
+  @MaxLength(500)
+  faceURL?: string;
+}
+
+export class NoteCollectSourceDto {
+  @ApiProperty({ enum: NOTE_COLLECT_CONVERSATION_TYPE })
+  @IsEnum(NOTE_COLLECT_CONVERSATION_TYPE)
+  conversationType: NoteCollectConversationType;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  conversationID: string;
+
+  /** 分享该笔记的那条消息的 clientMsgID，用于跳回聊天并定位 */
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  clientMsgID: string;
+
+  @ApiProperty({ type: NoteCollectPeerDto })
+  @IsDefined()
+  @ValidateNested()
+  @Type(() => NoteCollectPeerDto)
+  sender: NoteCollectPeerDto;
+
+  /** 群聊必填（展示群名片）；私聊省略 */
+  @ApiPropertyOptional({ type: NoteCollectPeerDto })
+  @ValidateIf((source) => source.conversationType === 'group')
+  @IsDefined({ message: 'group is required for group conversations' })
+  @ValidateNested()
+  @Type(() => NoteCollectPeerDto)
+  group?: NoteCollectPeerDto;
+}
+
+export class CollectNoteDto {
+  @ApiProperty()
+  @IsUUID()
+  noteId: string;
+
+  @ApiProperty({ type: NoteCollectSourceDto })
+  @IsDefined()
+  @ValidateNested()
+  @Type(() => NoteCollectSourceDto)
+  source: NoteCollectSourceDto;
+}
+
+export class CollectNoteResultDto {
+  @ApiProperty({ type: NoteDetailDto }) note: NoteDetailDto;
+  /** true = 笔记本来就是自己的，或此前已收藏过（幂等，不产生新副本） */
+  @ApiProperty() alreadyCollected: boolean;
 }
 
 export class CreateNoteExportDto {

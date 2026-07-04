@@ -54,10 +54,11 @@ export class CirclePlazaController {
     @Req() req: RequestWithUser,
   ): Promise<{
     items: PlazaPostDto[];
-    total: number;
+    total: number | null;
     page: number;
     limit: number;
     hasMore: boolean;
+    nextCursor: string | null;
   }> {
     return this.plazaService.getFeed(req.user.userId, query);
   }
@@ -184,7 +185,7 @@ export class CirclePlazaController {
   myPostSignups(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
-  ): Promise<{ items: PostSignupItemDto[] }> {
+  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
     return this.plazaService.getMyPostSignups(req.user.userId, id);
   }
 

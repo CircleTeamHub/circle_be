@@ -16,6 +16,7 @@ const DEFAULT_PRIVACY = {
 const verifiedUser = (overrides: Record<string, unknown> = {}) => ({
   id: 'user-1',
   vipLevel: 0,
+  receivedLikeCount: 0,
   createdAt: new Date(0),
   status: 'ACTIVE',
   avatarUrl: 'https://cdn/a.png',
@@ -32,13 +33,6 @@ const verifiedUser = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-// N distinct recognizers → the groupBy([recipientID, recognizerID]) shape.
-const recognizerGroups = (recipientId: string, n: number) =>
-  Array.from({ length: n }, (_, i) => ({
-    recipientID: recipientId,
-    recognizerID: `r${i}`,
-  }));
-
 describe('IconService', () => {
   let service: IconService;
 
@@ -50,9 +44,6 @@ describe('IconService', () => {
     },
     circleMember: {
       findMany: jest.fn(),
-    },
-    collaborationRecognition: {
-      groupBy: jest.fn(),
     },
     userDisplayIcon: {
       findMany: jest.fn(),
@@ -74,9 +65,8 @@ describe('IconService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    // Sensible defaults: no circles, no recognitions, default privacy.
+    // Sensible defaults: no circles, no likes, default privacy.
     prisma.circleMember.findMany.mockResolvedValue([]);
-    prisma.collaborationRecognition.groupBy.mockResolvedValue([]);
     privacySettings.getSettings.mockResolvedValue({ ...DEFAULT_PRIVACY });
     privacySettings.getSettingsForUsers.mockResolvedValue(new Map());
 
@@ -146,10 +136,9 @@ describe('IconService', () => {
     ]);
   });
 
-  it('awards Top Collaborator tiers by DISTINCT-recognizer count', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser());
-    prisma.collaborationRecognition.groupBy.mockResolvedValue(
-      recognizerGroups('user-1', 1000),
+  it('awards Top Collaborator tiers by received like count', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ receivedLikeCount: 1000 }),
     );
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
@@ -162,10 +151,9 @@ describe('IconService', () => {
     ).toEqual(['TOP_COLLABORATOR_1', 'TOP_COLLABORATOR_2']);
   });
 
-  it('does NOT award Top Collaborator below the first recognition threshold', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser());
-    prisma.collaborationRecognition.groupBy.mockResolvedValue(
-      recognizerGroups('user-1', 99),
+  it('does NOT award Top Collaborator below the first like threshold', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ receivedLikeCount: 99 }),
     );
     prisma.userDisplayIcon.findMany.mockResolvedValue([]);
 
@@ -369,7 +357,6 @@ describe('IconService', () => {
         verifiedUser({ id: 'user-1', vipLevel: 2, email: null }),
         verifiedUser({ id: 'user-2', vipLevel: 0, email: null }),
       ]);
-      prisma.collaborationRecognition.groupBy.mockResolvedValue([]);
       privacySettings.getSettingsForUsers.mockResolvedValue(
         new Map([
           ['user-1', { ...DEFAULT_PRIVACY }],
@@ -395,7 +382,6 @@ describe('IconService', () => {
       ]);
 
       expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
-      expect(prisma.collaborationRecognition.groupBy).toHaveBeenCalledTimes(1);
       expect(privacySettings.getSettingsForUsers).toHaveBeenCalledTimes(1);
       // Read-only: never persists prune/default writes for viewed users.
       expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();

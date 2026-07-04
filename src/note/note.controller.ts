@@ -24,6 +24,8 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
+  CollectNoteDto,
+  CollectNoteResultDto,
   CreateNoteDto,
   CreateNoteExportDto,
   CreateNoteGroupDto,
@@ -36,6 +38,7 @@ import {
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
+  SetNoteStatusDto,
   SetPinnedDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -68,6 +71,18 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteDetailDto> {
     return this.noteService.createNote(req.user.userId, dto);
+  }
+
+  @Post('collect')
+  @ApiOperation({
+    summary: 'Collect a note from chat into my notes (snapshot copy)',
+  })
+  @ApiOkResponse({ type: CollectNoteResultDto })
+  collectNote(
+    @Body() dto: CollectNoteDto,
+    @Req() req: RequestWithUser,
+  ): Promise<CollectNoteResultDto> {
+    return this.noteService.collectNote(req.user.userId, dto);
   }
 
   @Patch(':id')
@@ -118,6 +133,17 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setAvailable(req.user.userId, id, dto.available);
+  }
+
+  @Patch(':id/status')
+  @ApiOperation({ summary: 'Set note status' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', status: 'UNLISTED' } } })
+  setStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteStatusDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setStatus(req.user.userId, id, dto.status);
   }
 
   @Delete(':id')

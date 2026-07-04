@@ -14,6 +14,11 @@ import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
+  decodeFeedCursor,
+  encodeFeedCursor,
+  feedCursorWhere,
+} from 'src/utils/feed-cursor';
+import {
   CreateTraceCommentDto,
   CreateTraceDto,
   TraceCommentDto,
@@ -24,6 +29,22 @@ import {
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
 const TRACE_DETAIL_COMMENT_LIMIT = 100;
+
+/**
+ * Trace-feed keyset cursor — thin wrappers over the shared feed-cursor util so
+ * the 400 carries this feed's stable errorCode. Exported for the spec and for
+ * clients of the service that build cursors in tests.
+ */
+export function encodeTraceCursor(createdAt: Date, id: string): string {
+  return encodeFeedCursor(createdAt, id);
+}
+
+export function decodeTraceCursor(cursor: string): {
+  createdAt: Date;
+  id: string;
+} {
+  return decodeFeedCursor(cursor, TraceErrorCode.InvalidCursor);
+}
 
 @Injectable()
 export class TraceService {
@@ -47,14 +68,22 @@ export class TraceService {
     query: TraceFeedQueryDto,
   ): Promise<{
     items: TraceDto[];
-    total: number;
+    total: number | null;
     page: number;
     limit: number;
     hasMore: boolean;
+    nextCursor: string | null;
   }> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
+    // Keyset (cursor) pagination is the preferred path: cost is O(limit)
+    // regardless of depth and it runs no per-page count(). Offset (page) is
+    // kept for backward compatibility with clients not yet migrated. Both paths
+    // return `nextCursor`, so a client can follow the cursor even if it started
+    // on page numbers.
+    const cursor = query.cursor ? decodeTraceCursor(query.cursor) : null;
+    const useKeyset = cursor !== null;
+    const skip = useKeyset ? 0 : (page - 1) * limit;
 
     const friendIds = await this.getAcceptedFriendIds(userId);
     const friendIdSet = new Set(friendIds);
@@ -67,10 +96,17 @@ export class TraceService {
     // 单用户相册：authorId 收窄到某个作者。作者必须对 viewer 可见
     // （本人或已接受好友且未被隐私屏蔽），否则返回空——不泄露存在性。
     if (query.authorId && !visibleUserIds.includes(query.authorId)) {
-      return { items: [], total: 0, page, limit, hasMore: false };
+      return {
+        items: [],
+        total: useKeyset ? null : 0,
+        page,
+        limit,
+        hasMore: false,
+        nextCursor: null,
+      };
     }
 
-    const where = {
+    const whereBase = {
       deleted: false,
       fromID: query.authorId ? query.authorId : { in: visibleUserIds },
       // PRIVATE is excluded for everyone but the author. PUBLIC isn't creatable
@@ -83,8 +119,14 @@ export class TraceService {
         { visibility: 'PUBLIC' as const },
       ],
     };
+    // (createdAt, id) tuple keyset — see feedCursorWhere for the semantics.
+    const where = cursor
+      ? { AND: [whereBase, feedCursorWhere(cursor)] }
+      : whereBase;
 
-    const [traces, total] = await Promise.all([
+    // Keyset fetches one extra row to decide `hasMore` without a count();
+    // offset still returns an accurate `total` for the legacy page-number UI.
+    const [rows, total] = await Promise.all([
       this.prisma.trace.findMany({
         where,
         include: {
@@ -107,12 +149,18 @@ export class TraceService {
             take: TRACE_FEED_COMMENT_PREVIEW_LIMIT,
           },
         },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
       }),
-      this.prisma.trace.count({ where }),
+      useKeyset
+        ? Promise.resolve<number | null>(null)
+        : this.prisma.trace.count({ where }),
     ]);
+
+    const hasMore = useKeyset
+      ? rows.length > limit
+      : skip + rows.length < (total ?? 0);
+    const traces = useKeyset ? rows.slice(0, limit) : rows;
 
     // Resolve the viewer's own like state from an authoritative query rather
     // than the truncated `likeStats` preview — a like outside the top-20 would
@@ -131,21 +179,22 @@ export class TraceService {
       this.toTraceDto(trace, userId, friendIdSet, likedTraceIds),
     );
 
+    // The next page starts strictly after the last returned row. Only emit a
+    // cursor when there is more to fetch, so the client stops on `null`.
+    const last = traces[traces.length - 1];
+    const nextCursor =
+      hasMore && last ? encodeTraceCursor(last.createdAt, last.id) : null;
+
     // Feed query dimensions — helps diagnose "I can't see X's moments" reports
     // (scope size vs. result count) without logging any content.
     this.logger.debug(
       `trace feed: viewer=${userId} authorId=${query.authorId ?? '-'} ` +
+        `mode=${useKeyset ? 'keyset' : 'offset'} ` +
         `visibleAuthors=${visibleUserIds.length} page=${page} ` +
-        `returned=${traces.length} total=${total}`,
+        `returned=${traces.length} total=${total ?? '-'}`,
     );
 
-    return {
-      items,
-      total,
-      page,
-      limit,
-      hasMore: skip + traces.length < total,
-    };
+    return { items, total, page, limit, hasMore, nextCursor };
   }
 
   async getNewCount(userId: string, since: string): Promise<number> {

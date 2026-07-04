@@ -119,6 +119,7 @@ export const PlazaErrorCode = {
   RecognizeNotMember: 'PLAZA_RECOGNIZE_NOT_MEMBER',
   RecognizeBlocked: 'PLAZA_RECOGNIZE_BLOCKED',
   RecognizeAlready: 'PLAZA_RECOGNIZE_ALREADY',
+  InvalidCursor: 'PLAZA_INVALID_CURSOR',
 } as const;
 
 // 朋友圈动态(moments):动态/评论不存在、仅作者可删、无权访问(隐私/好友可见)。
@@ -129,6 +130,7 @@ export const TraceErrorCode = {
   CommentNotFound: 'TRACE_COMMENT_NOT_FOUND',
   AccessForbidden: 'TRACE_ACCESS_FORBIDDEN',
   ReplyTargetMismatch: 'TRACE_REPLY_TARGET_MISMATCH',
+  InvalidCursor: 'TRACE_INVALID_CURSOR',
 } as const;
 
 // 好友:加好友 / 申请处理 / 拉黑 / 举报 / 好友标签。好友数、标签数上限原文含数字,

@@ -14,6 +14,12 @@ import { OpenimService } from 'src/openim/openim.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { IconService } from 'src/icon/icon.service';
+import { likedOnToday } from 'src/like/like.util';
+import {
+  decodeFeedCursor,
+  encodeFeedCursor,
+  feedCursorWhere,
+} from 'src/utils/feed-cursor';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -46,7 +52,6 @@ type SignupRestrictionFields = Pick<
 >;
 
 const MAX_COLLABORATION_RECOGNITIONS_PER_POST = 3;
-const MIN_SIGNUPS_FOR_COLLABORATION_RECOGNITION = 3;
 const CIRCLE_POST_AUTO_END_MS = 24 * 60 * 60 * 1000;
 const CIRCLE_POST_AUTO_END_BATCH_SIZE = 100;
 const DEFAULT_CIRCLE_POST_EXPIRY_HOURS = 24;
@@ -204,16 +209,24 @@ export class CirclePlazaService {
     query: PlazaFeedQueryDto,
   ): Promise<{
     items: PlazaPostDto[];
-    total: number;
+    total: number | null;
     page: number;
     limit: number;
     hasMore: boolean;
+    nextCursor: string | null;
   }> {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
+    // Keyset (cursor) pagination mirrors the trace feed: O(limit) per page at
+    // any depth and no per-page count(). Offset (page) kept for clients not yet
+    // migrated; both paths return `nextCursor` so clients can switch mid-scroll.
+    const cursor = query.cursor
+      ? decodeFeedCursor(query.cursor, PlazaErrorCode.InvalidCursor)
+      : null;
+    const useKeyset = cursor !== null;
+    const skip = useKeyset ? 0 : (page - 1) * limit;
 
-    const where: Prisma.CirclePostWhereInput = {
+    const whereBase: Prisma.CirclePostWhereInput = {
       ...this.activeUnexpiredPostWhere(),
       circle: {
         deleted: false,
@@ -226,33 +239,49 @@ export class CirclePlazaService {
     const cities = this.parseCommaList(query.cities);
 
     if (query.circleId) {
-      where.circleID = query.circleId;
+      whereBase.circleID = query.circleId;
     } else if (circleIds.length > 0) {
-      where.circleID = { in: circleIds };
+      whereBase.circleID = { in: circleIds };
     }
     if (query.city) {
-      where.city = query.city;
+      whereBase.city = query.city;
     } else if (cities.length > 0) {
-      where.city = { in: cities };
+      whereBase.city = { in: cities };
     }
+    const where: Prisma.CirclePostWhereInput = cursor
+      ? { AND: [whereBase, feedCursorWhere(cursor)] }
+      : whereBase;
 
-    const [posts, total, viewer] = await Promise.all([
+    // Keyset fetches one extra row to decide `hasMore` without a count();
+    // offset still returns an accurate `total` for the legacy page-number UI.
+    const [rows, total, viewer] = await Promise.all([
       this.prisma.circlePost.findMany({
         where,
         include: {
           author: true,
           circle: true,
         },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
       }),
-      this.prisma.circlePost.count({ where }),
+      useKeyset
+        ? Promise.resolve<number | null>(null)
+        : this.prisma.circlePost.count({ where }),
       this.prisma.user.findUnique({
         where: { id: viewerId },
         select: { vipLevel: true, creditScore: true, fancyNumber: true },
       }),
     ]);
+
+    const hasMore = useKeyset
+      ? rows.length > limit
+      : skip + rows.length < (total ?? 0);
+    const posts = useKeyset ? rows.slice(0, limit) : rows;
+    const lastPost = posts[posts.length - 1];
+    const nextCursor =
+      hasMore && lastPost
+        ? encodeFeedCursor(lastPost.createdAt, lastPost.id)
+        : null;
 
     const postIds = posts.map((p) => p.id);
     const [mySignups, displayIconsByAuthor] = await Promise.all([
@@ -279,17 +308,12 @@ export class CirclePlazaService {
     this.logger.debug(
       `plaza feed: viewer=${viewerId} ` +
         `circleFilter=${query.circleId ?? circleIds.length} ` +
-        `cityFilter=${query.city ?? cities.length} page=${page} ` +
-        `returned=${posts.length} total=${total}`,
+        `cityFilter=${query.city ?? cities.length} ` +
+        `mode=${useKeyset ? 'keyset' : 'offset'} page=${page} ` +
+        `returned=${posts.length} total=${total ?? '-'}`,
     );
 
-    return {
-      items,
-      total,
-      page,
-      limit,
-      hasMore: skip + posts.length < total,
-    };
+    return { items, total, page, limit, hasMore, nextCursor };
   }
 
   async getPost(viewerId: string, postId: string): Promise<PlazaPostDto> {
@@ -704,12 +728,25 @@ export class CirclePlazaService {
     return { count: endedPosts.length };
   }
 
-  /** Signers of one of the author's own posts, with identity for opening a chat. */
+  /** Signers of one of the author's own posts, with recognition state. */
   async getMyPostSignups(
     authorId: string,
     postId: string,
-  ): Promise<{ items: PostSignupItemDto[] }> {
-    await this.requireOwnPost(authorId, postId);
+  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
+    const post = await this.prisma.circlePost.findFirst({
+      where: { id: postId, authorID: authorId },
+      select: {
+        id: true,
+        status: true,
+        collaborationRecognizedAt: true,
+      },
+    });
+    if (!post) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
+    }
     const signups = await this.prisma.circlePostSignup.findMany({
       where: { postID: postId },
       include: {
@@ -725,10 +762,25 @@ export class CirclePlazaService {
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
-    const displayIconsByUser = await this.getDisplayIconsByAuthorIds(
-      signups.map((signup) => signup.user.id),
+    const signerIds = signups.map((signup) => signup.user.id);
+    const recognizedRows =
+      signerIds.length > 0
+        ? await this.prisma.collaborationRecognition.findMany({
+            where: {
+              circlePostID: postId,
+              recipientID: { in: signerIds },
+              revokedAt: null,
+            },
+            select: { recipientID: true },
+          })
+        : [];
+    const recognizedUserIds = new Set(
+      recognizedRows.map((row) => row.recipientID),
     );
+    const displayIconsByUser = await this.getDisplayIconsByAuthorIds(signerIds);
     return {
+      recognitionOpen:
+        post.status === 'ENDED' && post.collaborationRecognizedAt === null,
       items: signups.map((s) => ({
         userId: s.user.id,
         imUserId: OpenimService.toImUserId(s.user.id),
@@ -738,6 +790,7 @@ export class CirclePlazaService {
         signedAt: s.createdAt.toISOString(),
         seen: s.seenByAuthor,
         displayIcons: displayIconsByUser.get(s.user.id) ?? [],
+        recognized: recognizedUserIds.has(s.user.id),
       })),
     };
   }
@@ -803,17 +856,6 @@ export class CirclePlazaService {
         throw new NotFoundException({
           message: 'Post not found',
           errorCode: PlazaErrorCode.PostNotFound,
-        });
-      }
-
-      const signupCount = await tx.circlePostSignup.count({
-        where: { postID: postId },
-      });
-      if (signupCount < MIN_SIGNUPS_FOR_COLLABORATION_RECOGNITION) {
-        throw new BadRequestException({
-          message:
-            'At least three signups are required before recognizing collaborators',
-          errorCode: PlazaErrorCode.RecognizeMinSignups,
         });
       }
 
@@ -900,6 +942,36 @@ export class CirclePlazaService {
         })),
       });
 
+      const likedOn = likedOnToday();
+      const existingLikes = await tx.userLike.findMany({
+        where: {
+          fromUserID: authorId,
+          toUserID: { in: uniqueRecipientIds },
+          likedOn,
+        },
+        select: { toUserID: true },
+      });
+      const alreadyLikedUserIds = new Set(
+        existingLikes.map((like) => like.toUserID),
+      );
+      const newLikeRecipientIds = uniqueRecipientIds.filter(
+        (recipientId) => !alreadyLikedUserIds.has(recipientId),
+      );
+      if (newLikeRecipientIds.length > 0) {
+        await tx.userLike.createMany({
+          data: newLikeRecipientIds.map((toUserID) => ({
+            fromUserID: authorId,
+            toUserID,
+            likedOn,
+          })),
+          skipDuplicates: true,
+        });
+        await tx.user.updateMany({
+          where: { id: { in: newLikeRecipientIds } },
+          data: { receivedLikeCount: { increment: 1 } },
+        });
+      }
+
       return {
         count: uniqueRecipientIds.length,
         recognizedUserIds: uniqueRecipientIds,
@@ -908,12 +980,21 @@ export class CirclePlazaService {
 
     // After commit: a new recognition can change a recipient's TOP_COLLABORATOR
     // eligibility, which IconService caches for 30s. Drop their cache and push a
-    // fresh profile summary so the badge appears immediately. Best-effort: a
-    // failure here must not fail the recognition that already succeeded.
+    // fresh profile summary so the badge appears immediately. Best-effort and
+    // non-blocking: a slow realtime channel must not hold the HTTP response open
+    // after the recognition has already been committed.
     for (const recipientId of result.recognizedUserIds) {
       try {
         this.iconService.invalidateDisplayIconCacheFor(recipientId);
-        await this.realtime.broadcastUserProfileSummary(recipientId);
+        void Promise.resolve(
+          this.realtime.broadcastUserProfileSummary(recipientId),
+        ).catch((error) => {
+          this.logger.error(
+            `collaboration recognition profile refresh failed (user=${recipientId}): ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
       } catch (error) {
         this.logger.error(
           `collaboration recognition profile refresh failed (user=${recipientId}): ${

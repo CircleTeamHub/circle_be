@@ -128,7 +128,9 @@ export class RecognizePostCollaboratorsDto {
   @ArrayMinSize(1)
   @ArrayMaxSize(3)
   @ArrayUnique()
-  @IsUUID('4', { each: true })
+  @IsString({ each: true })
+  @IsNotEmpty({ each: true })
+  @MaxLength(64, { each: true })
   recipientIds: string[];
 }
 
@@ -139,7 +141,8 @@ export class CollaborationRecognitionResultDto {
 
 export class PlazaFeedQueryDto {
   @ApiPropertyOptional()
-  @IsUUID()
+  @IsString()
+  @IsNotEmpty()
   @IsOptional()
   circleId?: string;
 
@@ -172,6 +175,16 @@ export class PlazaFeedQueryDto {
   @Max(100)
   @IsOptional()
   limit?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Keyset 游标（不透明字符串，来自上一页的 nextCursor）。传入时按游标翻页，' +
+      '忽略 page，且不再执行 count()——深翻页时开销恒定。',
+  })
+  @IsString()
+  @IsOptional()
+  @MaxLength(200)
+  cursor?: string;
 }
 
 // ── Response DTOs ────────────────────────────────────────────────────────────
@@ -240,4 +253,5 @@ export class PostSignupItemDto {
   signedAt: string;
   seen: boolean;
   displayIcons: DisplayIconDto[];
+  recognized: boolean;
 }

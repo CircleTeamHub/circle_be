@@ -146,11 +146,15 @@ export class RefreshTokenService {
       throw new UnauthorizedException('Invalid or expired refresh token');
     }
 
-    const newSession = await this.create(record.userId, {
-      deviceName: context?.deviceName ?? record.deviceName ?? null,
-      ip: context?.ip ?? record.ip ?? null,
-      userAgent: context?.userAgent ?? record.userAgent ?? null,
-    }, record.audience);
+    const newSession = await this.create(
+      record.userId,
+      {
+        deviceName: context?.deviceName ?? record.deviceName ?? null,
+        ip: context?.ip ?? record.ip ?? null,
+        userAgent: context?.userAgent ?? record.userAgent ?? null,
+      },
+      record.audience,
+    );
     return {
       token: newSession.token,
       userId: record.userId,
