@@ -1628,6 +1628,29 @@ describe('NoteService', () => {
     });
   });
 
+  it('updates note status for the owner only', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-1',
+      ownerID: 'user-1',
+    });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      status: 'UNLISTED',
+    });
+
+    const result = await service.setStatus('user-1', 'note-1', 'UNLISTED');
+
+    expect(prisma.note.update).toHaveBeenCalledWith({
+      where: { id: 'note-1', ownerID: 'user-1', status: { not: 'DELETED' } },
+      data: { status: 'UNLISTED' },
+      select: expect.any(Object),
+    });
+    expect(result).toMatchObject({
+      id: 'note-1',
+      status: 'UNLISTED',
+    });
+  });
+
   it('soft deletes a note', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',

@@ -32,6 +32,11 @@ export enum SystemIconKeyDto {
   CIRCLE_BUILDER = 'CIRCLE_BUILDER',
 }
 
+const URL_VALIDATION_OPTIONS = {
+  require_protocol: true,
+  require_tld: false,
+} as const;
+
 export class DisplayIconDto {
   @ApiProperty()
   @Expose()
@@ -175,7 +180,7 @@ export class UpdateDisplayIconsDto {
 
 export class UploadCircleIconDto {
   @ApiProperty()
-  @IsUrl({ protocols: ['https'], require_protocol: true })
+  @IsUrl(URL_VALIDATION_OPTIONS)
   imageUrl: string;
 
   @ApiPropertyOptional()

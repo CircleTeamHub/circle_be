@@ -33,6 +33,7 @@ import {
   NoteShareLinkDto,
   NoteStatus,
   NoteSummaryDto,
+  NoteWritableStatus,
   UpdateNoteDto,
   UpdateNoteGroupDto,
 } from './dto/note.dto';
@@ -1810,6 +1811,23 @@ export class NoteService {
       select: {
         id: true,
         available: true,
+      },
+    });
+  }
+
+  async setStatus(
+    ownerID: string,
+    noteId: string,
+    status: NoteWritableStatus,
+  ) {
+    await this.requireOwnedNote(ownerID, noteId);
+    // Include ownerID + status guard in the write to close the TOCTOU window.
+    return this.prisma.note.update({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      data: { status },
+      select: {
+        id: true,
+        status: true,
       },
     });
   }

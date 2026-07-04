@@ -425,14 +425,31 @@ export class CircleService {
   ) {
     await this.assertOwner(userId, circleId);
 
-    return this.prisma.iconAsset.create({
-      data: {
-        name: dto.name?.trim() || '圈子图标',
-        sourceType: 'CIRCLE',
-        imageUrl: dto.imageUrl,
-        circleID: circleId,
-        createdByID: userId,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const created = await tx.iconAsset.create({
+        data: {
+          name: dto.name?.trim() || '圈子图标',
+          sourceType: 'CIRCLE',
+          imageUrl: dto.imageUrl,
+          circleID: circleId,
+          createdByID: userId,
+        },
+      });
+
+      await tx.circle.update({
+        where: { id: circleId },
+        data: { currentIconAssetID: created.id },
+      });
+
+      await tx.iconAsset.deleteMany({
+        where: {
+          sourceType: 'CIRCLE',
+          circleID: circleId,
+          id: { not: created.id },
+        },
+      });
+
+      return created;
     });
   }
 

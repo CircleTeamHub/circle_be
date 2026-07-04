@@ -260,6 +260,12 @@ export class SetNoteAvailableDto {
   available: boolean;
 }
 
+export class SetNoteStatusDto {
+  @ApiProperty({ enum: NOTE_WRITABLE_STATUS })
+  @IsEnum(NOTE_WRITABLE_STATUS)
+  status: NoteWritableStatus;
+}
+
 export class ListNotesQueryDto {
   @ApiPropertyOptional({ enum: NOTE_STATUS })
   @IsOptional()

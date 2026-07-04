@@ -38,6 +38,7 @@ import {
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
+  SetNoteStatusDto,
   SetPinnedDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
@@ -132,6 +133,17 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setAvailable(req.user.userId, id, dto.available);
+  }
+
+  @Patch(':id/status')
+  @ApiOperation({ summary: 'Set note status' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', status: 'UNLISTED' } } })
+  setStatus(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteStatusDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setStatus(req.user.userId, id, dto.status);
   }
 
   @Delete(':id')

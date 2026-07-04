@@ -59,6 +59,7 @@ type Eligibility = {
 // batch paths so both compute identical results from the same shapes.
 type EligibilityUserRow = {
   vipLevel: number;
+  receivedLikeCount: number;
   createdAt: Date;
   status: string;
   avatarUrl: string | null;
@@ -98,6 +99,7 @@ type StoredSelection = {
 const ELIGIBILITY_USER_SELECT = {
   id: true,
   vipLevel: true,
+  receivedLikeCount: true,
   createdAt: true,
   status: true,
   avatarUrl: true,
@@ -255,7 +257,7 @@ export class IconService {
     }
     if (uncached.length === 0) return result;
 
-    const [users, memberships, recognitionCounts, privacyByUser, selections] =
+    const [users, memberships, privacyByUser, selections] =
       await Promise.all([
         this.prisma.user.findMany({
           where: { id: { in: uncached } },
@@ -270,7 +272,6 @@ export class IconService {
           select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
           orderBy: { createdAt: 'desc' },
         }),
-        this.recognitionCountsFor(uncached),
         this.privacySettings.getSettingsForUsers(uncached),
         this.prisma.userDisplayIcon.findMany({
           where: { userID: { in: uncached } },
@@ -295,7 +296,6 @@ export class IconService {
       const eligibility = this.buildEligibility(
         user,
         membershipsByUser.get(user.id) ?? [],
-        recognitionCounts.get(user.id) ?? 0,
         // getSettingsForUsers returns an entry (defaults included) for every
         // requested id, so this is always defined for a user in `uncached`.
         privacyByUser.get(user.id) as PrivacySettingsDto,
@@ -426,7 +426,7 @@ export class IconService {
   }
 
   private async resolveEligibility(userId: string): Promise<Eligibility> {
-    const [user, circleMemberships, recognitionCounts, privacy] =
+    const [user, circleMemberships, privacy] =
       await Promise.all([
         this.prisma.user.findUnique({
           where: { id: userId },
@@ -442,7 +442,6 @@ export class IconService {
           orderBy: { createdAt: 'desc' },
           take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
         }),
-        this.recognitionCountsFor([userId]),
         this.privacySettings.getSettings(userId),
       ]);
 
@@ -453,30 +452,8 @@ export class IconService {
     return this.buildEligibility(
       user,
       circleMemberships,
-      recognitionCounts.get(userId) ?? 0,
       privacy,
     );
-  }
-
-  // Distinct-recognizer counts per recipient from CollaborationRecognition — a
-  // badge is "N different people recognized you", which one author recognizing
-  // the same colluder repeatedly can't inflate. Batched so the feed path stays
-  // N+1-free.
-  private async recognitionCountsFor(
-    userIds: string[],
-  ): Promise<Map<string, number>> {
-    const counts = new Map<string, number>();
-    const uniqueIds = [...new Set(userIds.filter(Boolean))];
-    if (uniqueIds.length === 0) return counts;
-
-    const groups = await this.prisma.collaborationRecognition.groupBy({
-      by: ['recipientID', 'recognizerID'],
-      where: { recipientID: { in: uniqueIds }, revokedAt: null },
-    });
-    for (const group of groups) {
-      counts.set(group.recipientID, (counts.get(group.recipientID) ?? 0) + 1);
-    }
-    return counts;
   }
 
   // Pure eligibility assembly from prefetched rows. Kept side-effect-free so the
@@ -484,12 +461,11 @@ export class IconService {
   private buildEligibility(
     user: EligibilityUserRow,
     circleMemberships: EligibilityCircleMembership[],
-    recognitionCount: number,
     privacy: PrivacySettingsDto,
   ): Eligibility {
     const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons({
       vipLevel: user.vipLevel,
-      recognitionCount,
+      receivedLikeCount: user.receivedLikeCount,
     });
     if (Date.now() - user.createdAt.getTime() <= NEW_USER_MS) {
       systemIcons.push({
