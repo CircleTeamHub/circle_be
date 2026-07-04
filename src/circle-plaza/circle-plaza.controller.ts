@@ -54,10 +54,11 @@ export class CirclePlazaController {
     @Req() req: RequestWithUser,
   ): Promise<{
     items: PlazaPostDto[];
-    total: number;
+    total: number | null;
     page: number;
     limit: number;
     hasMore: boolean;
+    nextCursor: string | null;
   }> {
     return this.plazaService.getFeed(req.user.userId, query);
   }

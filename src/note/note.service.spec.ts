@@ -2258,6 +2258,79 @@ describe('NoteService', () => {
     expect(updateArg.data.coverMediaID).toBe(copiedImage.id);
   });
 
+  it('collectNote rewrites structured section media IDs to the copied media rows', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        ...otherUsersNote,
+        sections: {
+          text: { content: '正文', contentJson: null },
+          media: { items: [otherUsersNote.media[0]] },
+          showcase: { items: [otherUsersNote.media[1]] },
+          location: null,
+        },
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async (args: any) => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      sections: args.data.sections,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    }));
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const createArg = prisma.note.create.mock.calls[0][0];
+    const mediaArg = prisma.noteMedia.createMany.mock.calls[0][0];
+    const copiedVideo = mediaArg.data.find((m: any) => m.type === 'VIDEO');
+    const copiedImage = mediaArg.data.find((m: any) => m.type === 'IMAGE');
+
+    expect(createArg.data.sections.media.items[0].id).toBe(copiedVideo.id);
+    expect(createArg.data.sections.showcase.items[0].id).toBe(copiedImage.id);
+    expect(createArg.data.sections.media.items[0].id).not.toBe('media-vid');
+    expect(createArg.data.sections.showcase.items[0].id).not.toBe('media-img');
+  });
+
+  it('collectNote treats a concurrent duplicate collect as already collected', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote) // source note is readable
+      .mockResolvedValueOnce(null) // no copy at pre-check time
+      .mockResolvedValueOnce({ id: 'note-copy' }); // unique race loser re-read
+    prisma.note.create.mockRejectedValueOnce({ code: 'P2002' });
+    prisma.note.update.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      collectedFrom: { kind: 'chat', conversationID: 'sg_123' },
+      collectedFromNoteID: 'note-src',
+    });
+
+    const result = await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    expect(result.alreadyCollected).toBe(true);
+    expect(result.note.id).toBe('note-copy');
+    expect(prisma.note.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-copy',
+          ownerID: 'user-1',
+          status: { not: 'DELETED' },
+        },
+        include: expect.any(Object),
+      }),
+    );
+    expect(prisma.noteMedia.createMany).not.toHaveBeenCalled();
+  });
+
   it('collectNote returns own note untouched (already in my notes)', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       ...otherUsersNote,
@@ -2296,11 +2369,43 @@ describe('NoteService', () => {
     expect(result.alreadyCollected).toBe(true);
     expect(prisma.note.create).not.toHaveBeenCalled();
     const updateArg = prisma.note.update.mock.calls[0][0];
-    expect(updateArg.where).toEqual({ id: 'note-copy' });
+    expect(updateArg.where).toEqual({
+      id: 'note-copy',
+      ownerID: 'user-1',
+      status: { not: 'DELETED' },
+    });
     expect(updateArg.data.collectedFrom).toMatchObject({
       conversationID: 'sg_123',
       clientMsgID: 'msg-abc',
     });
+  });
+
+  it('collectNote refresh guards against copies deleted after lookup', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.note.update.mockResolvedValueOnce({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      collectedFrom: { kind: 'chat', conversationID: 'sg_123' },
+      collectedFromNoteID: 'note-src',
+    });
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    expect(prisma.note.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-copy',
+          ownerID: 'user-1',
+          status: { not: 'DELETED' },
+        },
+      }),
+    );
   });
 
   it('collectNote rejects notes that are deleted or not readable', async () => {

@@ -1393,13 +1393,75 @@ export class NoteService {
     };
   }
 
+  private rewriteCollectedSectionMediaIds(
+    sections: unknown,
+    media: Array<{ id: string; sourceMediaID: string }>,
+  ): unknown {
+    if (!this.isRecord(sections) || media.length === 0) return sections;
+
+    const copiedIdBySourceId = new Map(
+      media.map((item) => [item.sourceMediaID, item.id]),
+    );
+    const rewriteSection = (section: unknown) => {
+      if (!this.isRecord(section) || !Array.isArray(section.items)) {
+        return section;
+      }
+      return {
+        ...section,
+        items: section.items.map((item) => {
+          if (!this.isRecord(item) || typeof item.id !== 'string') {
+            return item;
+          }
+          const copiedId = copiedIdBySourceId.get(item.id);
+          return copiedId ? { ...item, id: copiedId } : item;
+        }),
+      };
+    };
+
+    return {
+      ...sections,
+      media: rewriteSection(sections.media),
+      showcase: rewriteSection(sections.showcase),
+    };
+  }
+
+  private async refreshCollectedNote(
+    userID: string,
+    sourceNoteID: string,
+    collectedFrom: Record<string, unknown>,
+  ): Promise<CollectNoteResultDto | null> {
+    const existing = await this.prisma.note.findFirst({
+      where: {
+        ownerID: userID,
+        collectedFromNoteID: sourceNoteID,
+        status: { not: 'DELETED' },
+      },
+      select: { id: true },
+    });
+    if (!existing) return null;
+
+    const refreshed = await this.prisma.note.update({
+      where: {
+        id: existing.id,
+        ownerID: userID,
+        status: { not: 'DELETED' },
+      },
+      data: { collectedFrom: toPrismaJson(collectedFrom) },
+      include: NOTE_INCLUDE,
+    });
+    return {
+      note: this.mapDetail(refreshed, userID),
+      alreadyCollected: true,
+    };
+  }
+
   /**
    * 聊天里收藏笔记 → 直接进"我的笔记"：把可读的他人笔记快照复制成一条自己的
    * 笔记（媒体行复用同一份存储对象，不搬字节），并记录 collectedFrom 来源名片
    * （群聊记群名片、私聊记发送者名片 + 消息 clientMsgID，供跳回聊天定位）。
    *
    * 幂等：自己的笔记不复制直接返回；同一原笔记重复收藏只刷新来源快照。
-   * （findFirst→create 之间理论上有并发窗口，单用户手动收藏场景可接受。）
+   * 并发重复收藏由数据库唯一索引兜底，冲突后重读已有副本。
    */
   async collectNote(
     userID: string,
@@ -1429,27 +1491,12 @@ export class NoteService {
 
     const collectedFrom = this.buildCollectedFrom(dto.source, source);
 
-    const existing = await this.prisma.note.findFirst({
-      where: {
-        ownerID: userID,
-        collectedFromNoteID: dto.noteId,
-        status: { not: 'DELETED' },
-      },
-      select: { id: true },
-    });
-
-    if (existing) {
-      // 已收藏过：只把来源刷新成最近一次收藏的会话（可能换了个群/好友再收）。
-      const refreshed = await this.prisma.note.update({
-        where: { id: existing.id },
-        data: { collectedFrom: toPrismaJson(collectedFrom) },
-        include: NOTE_INCLUDE,
-      });
-      return {
-        note: this.mapDetail(refreshed, userID),
-        alreadyCollected: true,
-      };
-    }
+    const refreshedExisting = await this.refreshCollectedNote(
+      userID,
+      dto.noteId,
+      collectedFrom,
+    );
+    if (refreshedExisting) return refreshedExisting;
 
     const media = (source.media ?? []).map((item) => ({
       id: randomUUID(),
@@ -1472,43 +1519,60 @@ export class NoteService {
       media.find((item) => item.type === 'IMAGE')?.id ??
       null;
 
-    const created = await this.prisma.$transaction(async (tx) => {
-      const note = await tx.note.create({
-        data: {
-          ownerID: userID,
-          title: source.title,
-          content: source.content,
-          contentJson: toPrismaJson(source.contentJson),
-          sections: toPrismaJson(source.sections),
-          groupID: null,
-          status: 'ACTIVE',
-          available: true,
-          pinned: false,
-          imageCount: source.imageCount,
-          videoCount: source.videoCount,
-          mediaCount: source.mediaCount,
-          collectedFrom: toPrismaJson(collectedFrom),
-          collectedFromNoteID: source.id,
-        },
-      });
+    const copiedSections = this.rewriteCollectedSectionMediaIds(
+      source.sections,
+      media,
+    );
 
-      if (media.length > 0) {
-        await tx.noteMedia.createMany({
-          data: media.map(({ sourceMediaID: _sourceMediaID, ...item }) => ({
-            ...item,
-            noteID: note.id,
-          })),
+    try {
+      const created = await this.prisma.$transaction(async (tx) => {
+        const note = await tx.note.create({
+          data: {
+            ownerID: userID,
+            title: source.title,
+            content: source.content,
+            contentJson: toPrismaJson(source.contentJson),
+            sections: toPrismaJson(copiedSections),
+            groupID: null,
+            status: 'ACTIVE',
+            available: true,
+            pinned: false,
+            imageCount: source.imageCount,
+            videoCount: source.videoCount,
+            mediaCount: source.mediaCount,
+            collectedFrom: toPrismaJson(collectedFrom),
+            collectedFromNoteID: source.id,
+          },
         });
-      }
 
-      return tx.note.update({
-        where: { id: note.id },
-        data: { coverMediaID },
-        include: NOTE_INCLUDE,
+        if (media.length > 0) {
+          await tx.noteMedia.createMany({
+            data: media.map(({ sourceMediaID: _sourceMediaID, ...item }) => ({
+              ...item,
+              noteID: note.id,
+            })),
+          });
+        }
+
+        return tx.note.update({
+          where: { id: note.id },
+          data: { coverMediaID },
+          include: NOTE_INCLUDE,
+        });
       });
-    });
 
-    return { note: this.mapDetail(created, userID), alreadyCollected: false };
+      return { note: this.mapDetail(created, userID), alreadyCollected: false };
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        const refreshed = await this.refreshCollectedNote(
+          userID,
+          dto.noteId,
+          collectedFrom,
+        );
+        if (refreshed) return refreshed;
+      }
+      throw error;
+    }
   }
 
   async createNoteExport(
@@ -1815,11 +1879,7 @@ export class NoteService {
     });
   }
 
-  async setStatus(
-    ownerID: string,
-    noteId: string,
-    status: NoteWritableStatus,
-  ) {
+  async setStatus(ownerID: string, noteId: string, status: NoteWritableStatus) {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status guard in the write to close the TOCTOU window.
     return this.prisma.note.update({
