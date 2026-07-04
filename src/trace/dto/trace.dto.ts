@@ -72,6 +72,16 @@ export class TraceFeedQueryDto {
   @IsUUID()
   @IsOptional()
   authorId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Keyset 游标（不透明字符串，来自上一页的 nextCursor）。传入时按游标翻页，' +
+      '忽略 page，且不再执行 count()——深翻页时开销恒定。',
+  })
+  @IsString()
+  @IsOptional()
+  @MaxLength(200)
+  cursor?: string;
 }
 
 export class NewCountQueryDto {

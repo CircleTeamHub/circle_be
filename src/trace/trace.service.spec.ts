@@ -9,7 +9,27 @@ import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { TraceService } from './trace.service';
+import {
+  TraceService,
+  encodeTraceCursor,
+  decodeTraceCursor,
+} from './trace.service';
+
+/** Minimal Trace row in the shape `getFeed`'s include produces. */
+function makeTraceRow(id: string, createdAt: Date) {
+  return {
+    id,
+    fromID: 'friend-1',
+    deleted: false,
+    visibility: 'FRIENDS_ONLY',
+    content: `content-${id}`,
+    images: [],
+    createdAt,
+    from: { id: 'friend-1', nickname: 'Friend', avatarUrl: null },
+    likeStats: [],
+    comments: [],
+  };
+}
 
 describe('TraceService', () => {
   let service: TraceService;
@@ -436,6 +456,75 @@ describe('TraceService', () => {
     expect(whereArg.fromID.in).toContain('viewer-1');
     expect(whereArg.fromID.in).toContain('friend-open');
     expect(whereArg.fromID.in).not.toContain('friend-private');
+  });
+
+  it('keyset mode (cursor): no skip, no count(), fetches limit+1 with the tuple predicate', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-1' },
+    ]);
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    // limit=2 → return 3 rows so the extra row signals a next page.
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('t3', new Date('2026-06-03T00:00:00.000Z')),
+      makeTraceRow('t2', new Date('2026-06-02T00:00:00.000Z')),
+      makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z')),
+    ]);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const cursor = encodeTraceCursor(
+      new Date('2026-06-04T00:00:00.000Z'),
+      't4',
+    );
+    const result = await service.getFeed('viewer-1', { limit: 2, cursor });
+
+    // No count() runs on the keyset path.
+    expect(prisma.trace.count).not.toHaveBeenCalled();
+    const args = prisma.trace.findMany.mock.calls[0][0];
+    expect(args.take).toBe(3); // limit + 1
+    expect(args.skip).toBeUndefined();
+    // Keyset predicate is ANDed onto the base visibility filter.
+    expect(Array.isArray(args.where.AND)).toBe(true);
+
+    // Only `limit` items returned; the dropped extra row drives hasMore/cursor.
+    expect(result.items).toHaveLength(2);
+    expect(result.total).toBeNull();
+    expect(result.hasMore).toBe(true);
+    expect(result.nextCursor).toBe(
+      encodeTraceCursor(new Date('2026-06-02T00:00:00.000Z'), 't2'),
+    );
+  });
+
+  it('keyset last page: fewer than limit+1 rows → hasMore false, nextCursor null', async () => {
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('t1', new Date('2026-06-01T00:00:00.000Z')),
+    ]);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const cursor = encodeTraceCursor(
+      new Date('2026-06-02T00:00:00.000Z'),
+      't2',
+    );
+    const result = await service.getFeed('viewer-1', { limit: 2, cursor });
+
+    expect(result.items).toHaveLength(1);
+    expect(result.hasMore).toBe(false);
+    expect(result.nextCursor).toBeNull();
+  });
+
+  it('rejects a malformed cursor before touching the DB', async () => {
+    await expect(
+      service.getFeed('viewer-1', { cursor: 'not a valid cursor' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  it('cursor encode/decode round-trips (createdAt + id)', () => {
+    const at = new Date('2026-06-08T12:34:56.000Z');
+    const decoded = decodeTraceCursor(encodeTraceCursor(at, 'abc-123'));
+    expect(decoded.id).toBe('abc-123');
+    expect(decoded.createdAt.toISOString()).toBe(at.toISOString());
   });
 
   it('toggleLike increments likeCount atomically and returns the DB value', async () => {

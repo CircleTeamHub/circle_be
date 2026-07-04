@@ -184,7 +184,7 @@ export class CirclePlazaController {
   myPostSignups(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
-  ): Promise<{ items: PostSignupItemDto[] }> {
+  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
     return this.plazaService.getMyPostSignups(req.user.userId, id);
   }
 

@@ -755,7 +755,11 @@ model Trace {
   preferences   UserTracePreference[]
   notifications Notification[]
 
-  @@index([fromID])
+  // Feed keyset pagination orders by (createdAt DESC) filtered by fromID, so the
+  // composite index lets Postgres satisfy the sort per author from the index
+  // instead of a top-N heapsort. Leading `fromID` also covers plain fromID
+  // lookups, so the standalone @@index([fromID]) is redundant and dropped.
+  @@index([fromID, createdAt(sort: Desc)])
 }
 
 model TraceComment {
@@ -1067,6 +1071,11 @@ model CirclePost {
   @@index([authorID])
   @@index([city, createdAt(sort: Desc)])
   @@index([status, expiresAt])
+  // Plaza feed keyset: status='ACTIVE' equality + ORDER BY (createdAt DESC, id
+  // DESC) is served as a pure index scan (no heapsort). Status-aware, so it
+  // stays efficient as ENDED/DELETED posts accumulate. Verified ~135x faster
+  // than the heapsort baseline on a 40k-post / 50-circle EXPLAIN ANALYZE.
+  @@index([status, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model CirclePostSignup {

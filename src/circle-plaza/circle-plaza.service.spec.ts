@@ -48,10 +48,16 @@ describe('CirclePlazaService', () => {
     },
     collaborationRecognition: {
       count: jest.fn(),
+      findMany: jest.fn(),
+      createMany: jest.fn(),
+    },
+    userLike: {
+      findMany: jest.fn(),
       createMany: jest.fn(),
     },
     user: {
       findUnique: jest.fn(),
+      updateMany: jest.fn(),
     },
     $queryRaw: jest.fn(),
     $executeRaw: jest.fn(),
@@ -79,6 +85,10 @@ describe('CirclePlazaService', () => {
     notificationService.createCirclePostAutoEndedNotification.mockReset();
     iconService.getDisplayIconsForUsers.mockReset();
     iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+    prisma.collaborationRecognition.findMany.mockResolvedValue([]);
+    prisma.userLike.findMany.mockResolvedValue([]);
+    prisma.userLike.createMany.mockResolvedValue({ count: 0 });
+    prisma.user.updateMany.mockResolvedValue({ count: 0 });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -281,6 +291,79 @@ describe('CirclePlazaService', () => {
         expect.arrayContaining(['author-1']),
       );
       expect(result.items[0].author.displayIcons).toEqual(displayIcons);
+    });
+
+    it('keyset mode (cursor): no skip, no count(), fetches limit+1 with the tuple predicate', async () => {
+      const b64url = (createdAt: Date, id: string) =>
+        Buffer.from(`${createdAt.toISOString()}|${id}`, 'utf8').toString(
+          'base64url',
+        );
+      const makeRow = (id: string, createdAt: Date) => ({
+        id,
+        content: `c-${id}`,
+        images: [],
+        tags: [],
+        city: null,
+        isHorn: false,
+        noteID: null,
+        vipRestriction: null,
+        creditRestriction: null,
+        fancyRestriction: false,
+        viewCount: 0,
+        signupCount: 0,
+        signupVipRestriction: null,
+        signupCreditRestriction: null,
+        signupFancyRestriction: false,
+        createdAt,
+        author: {
+          id: 'author-1',
+          nickname: 'A',
+          avatarUrl: null,
+          avatarFrame: null,
+          accountId: '1001',
+        },
+        circle: { id: 'circle-1', name: 'Circle' },
+      });
+      // limit=2 → return 3 rows so the extra row signals a next page.
+      prisma.circlePost.findMany.mockResolvedValue([
+        makeRow('p3', new Date('2026-06-03T00:00:00.000Z')),
+        makeRow('p2', new Date('2026-06-02T00:00:00.000Z')),
+        makeRow('p1', new Date('2026-06-01T00:00:00.000Z')),
+      ]);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getFeed('viewer-1', {
+        limit: 2,
+        cursor: b64url(new Date('2026-06-04T00:00:00.000Z'), 'p4'),
+      });
+
+      // No count() runs on the keyset path.
+      expect(prisma.circlePost.count).not.toHaveBeenCalled();
+      const args = prisma.circlePost.findMany.mock.calls[0][0];
+      expect(args.take).toBe(3); // limit + 1
+      expect(args.skip).toBeUndefined();
+      // Keyset predicate is ANDed onto the membership/visibility base filter.
+      expect(Array.isArray(args.where.AND)).toBe(true);
+
+      expect(result.items).toHaveLength(2);
+      expect(result.total).toBeNull();
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBe(
+        b64url(new Date('2026-06-02T00:00:00.000Z'), 'p2'),
+      );
+    });
+
+    it('rejects a malformed cursor before touching the DB', async () => {
+      await expect(
+        service.getFeed('viewer-1', { cursor: 'not a valid cursor' }),
+      ).rejects.toThrow(/cursor/i);
+      expect(prisma.circlePost.findMany).not.toHaveBeenCalled();
     });
   });
 
@@ -609,7 +692,11 @@ describe('CirclePlazaService', () => {
     });
 
     it('returns signers with OpenIM ids for my own post', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ACTIVE',
+        collaborationRecognizedAt: null,
+      });
       const displayIcons = [
         {
           id: 'vip-5',
@@ -650,6 +737,41 @@ describe('CirclePlazaService', () => {
           nickname: 'meiguici',
           seen: false,
           displayIcons,
+          recognized: false,
+        }),
+      );
+      expect(result.recognitionOpen).toBe(false);
+    });
+
+    it('opens recognition selection for ended unrecognized posts and marks already recognized signers', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ENDED',
+        collaborationRecognizedAt: null,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        {
+          createdAt: new Date('2026-06-06T00:00:00Z'),
+          seenByAuthor: true,
+          user: {
+            id: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
+            nickname: 'meiguici',
+            avatarUrl: null,
+            accountId: '123',
+          },
+        },
+      ]);
+      prisma.collaborationRecognition.findMany.mockResolvedValue([
+        { recipientID: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547' },
+      ]);
+
+      const result = await service.getMyPostSignups('author-1', 'post-1');
+
+      expect(result.recognitionOpen).toBe(true);
+      expect(result.items[0]).toEqual(
+        expect.objectContaining({
+          userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
+          recognized: true,
         }),
       );
     });
@@ -702,7 +824,6 @@ describe('CirclePlazaService', () => {
         authorID: 'author-1',
         circleID: 'circle-1',
       });
-      prisma.circlePostSignup.count.mockResolvedValue(3);
       prisma.circlePostSignup.findMany.mockResolvedValue([
         { userID: 'user-2' },
         { userID: 'user-3' },
@@ -716,6 +837,9 @@ describe('CirclePlazaService', () => {
       prisma.collaborationRecognition.createMany.mockResolvedValue({
         count: 2,
       });
+      prisma.userLike.findMany.mockResolvedValue([]);
+      prisma.userLike.createMany.mockResolvedValue({ count: 2 });
+      prisma.user.updateMany.mockResolvedValue({ count: 2 });
 
       const result = await service.recognizePostCollaborators(
         'author-1',
@@ -743,9 +867,7 @@ describe('CirclePlazaService', () => {
         },
         select: { userID: true },
       });
-      expect(prisma.circlePostSignup.count).toHaveBeenCalledWith({
-        where: { postID: 'post-1' },
-      });
+      expect(prisma.circlePostSignup.count).not.toHaveBeenCalled();
       expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
         where: {
           id: 'post-1',
@@ -768,6 +890,23 @@ describe('CirclePlazaService', () => {
           },
         ],
       });
+      expect(prisma.userLike.createMany).toHaveBeenCalledWith({
+        data: [
+          expect.objectContaining({
+            fromUserID: 'author-1',
+            toUserID: 'user-2',
+          }),
+          expect.objectContaining({
+            fromUserID: 'author-1',
+            toUserID: 'user-3',
+          }),
+        ],
+        skipDuplicates: true,
+      });
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['user-2', 'user-3'] } },
+        data: { receivedLikeCount: { increment: 1 } },
+      });
       // each recipient's cached icon eligibility is refreshed so a newly earned
       // TOP_COLLABORATOR badge shows up without waiting for the 30s cache TTL
       expect(iconService.invalidateDisplayIconCacheFor).toHaveBeenCalledWith(
@@ -781,6 +920,45 @@ describe('CirclePlazaService', () => {
       );
       expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
         'user-3',
+      );
+    });
+
+    it('does not block the recognition response on profile realtime refresh', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+        circleID: 'circle-1',
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        { userID: 'user-2' },
+      ]);
+      prisma.circleMember.findMany.mockResolvedValue([{ userID: 'user-2' }]);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 1 });
+      prisma.collaborationRecognition.createMany.mockResolvedValue({
+        count: 1,
+      });
+      prisma.userLike.findMany.mockResolvedValue([]);
+      prisma.userLike.createMany.mockResolvedValue({ count: 1 });
+      prisma.user.updateMany.mockResolvedValue({ count: 1 });
+      realtime.broadcastUserProfileSummary.mockImplementationOnce(
+        () => new Promise(() => undefined),
+      );
+
+      const result = await Promise.race([
+        service.recognizePostCollaborators('author-1', 'post-1', ['user-2']),
+        new Promise((resolve) => setTimeout(() => resolve('timed-out'), 25)),
+      ]);
+
+      expect(result).toEqual({
+        count: 1,
+        recognizedUserIds: ['user-2'],
+      });
+      expect(iconService.invalidateDisplayIconCacheFor).toHaveBeenCalledWith(
+        'user-2',
+      );
+      expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
+        'user-2',
       );
     });
 
