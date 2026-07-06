@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -9,16 +9,21 @@ import {
 import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
+  type RegisterPushTokenDto,
   type NotificationRealtimeDto,
 } from './notification.dto';
+import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 
 @Injectable()
 export class NotificationService {
+  private readonly logger = new Logger(NotificationService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    private readonly pushService: NotificationPushService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -41,6 +46,55 @@ export class NotificationService {
     if (this.isProfileNotification(type)) {
       await this.realtimeService.broadcastSystemNotificationUnread(userId);
     }
+  }
+
+  private async sendPushBestEffort(
+    userId: string,
+    notification: NotificationRealtimeDto,
+  ): Promise<void> {
+    try {
+      await this.pushService.sendNotification(userId, notification);
+    } catch (error) {
+      this.logger.warn(
+        `Push notification failed for ${notification.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  async registerPushToken(
+    userId: string,
+    dto: RegisterPushTokenDto,
+  ): Promise<void> {
+    await this.prisma.devicePushToken.upsert({
+      where: { token: dto.token },
+      create: {
+        token: dto.token,
+        userID: userId,
+        platform: dto.platform,
+        provider: dto.provider,
+        projectId: dto.projectId ?? null,
+        appVersion: dto.appVersion ?? null,
+      },
+      update: {
+        userID: userId,
+        platform: dto.platform,
+        provider: dto.provider,
+        projectId: dto.projectId ?? null,
+        appVersion: dto.appVersion ?? null,
+        disabledAt: null,
+      },
+    });
+  }
+
+  async deletePushToken(userId: string, token: string): Promise<void> {
+    await this.prisma.devicePushToken.deleteMany({
+      where: {
+        userID: userId,
+        token,
+      },
+    });
   }
 
   async getUnreadSummary(userId: string) {
@@ -108,7 +162,9 @@ export class NotificationService {
       },
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    await this.sendPushBestEffort(toUserId, dto);
+    return dto;
   }
 
   private async createNotification(data: {
@@ -118,6 +174,8 @@ export class NotificationService {
     content?: string;
     fromTraceID?: string;
     fromCirclePostID?: string;
+    fromCircleID?: string;
+    fromInvitationID?: string;
     dedupeWindowMs?: number;
   }): Promise<NotificationRealtimeDto | null> {
     if (
@@ -158,7 +216,9 @@ export class NotificationService {
       },
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    await this.sendPushBestEffort(notificationData.toUserID, dto);
+    return dto;
   }
 
   async createFriendRequestNotification(params: {
@@ -225,7 +285,31 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
 
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    await this.sendPushBestEffort(params.toUserId, dto);
+    return dto;
+  }
+
+  async createCircleInvitationNotification(data: {
+    toUserID: string;
+    fromUserID: string;
+    type:
+      | typeof NotificationType.CIRCLE_VERIFICATION_REQUESTED
+      | typeof NotificationType.CIRCLE_INVITATION_APPROVED
+      | typeof NotificationType.CIRCLE_INVITATION_REJECTED
+      | typeof NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED;
+    fromCircleID: string;
+    fromInvitationID: string;
+    content?: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: data.toUserID,
+      fromUserID: data.fromUserID,
+      type: data.type,
+      content: data.content ?? '',
+      fromCircleID: data.fromCircleID,
+      fromInvitationID: data.fromInvitationID,
+    });
   }
 
   async getNotifications(userId: string, page = 1) {
@@ -236,6 +320,23 @@ export class NotificationService {
         toUserID: userId,
         deleted: false,
         type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+    return rows.map(mapNotificationRealtimeDto);
+  }
+
+  async getProfileNotifications(userId: string, page = 1) {
+    const take = 20;
+    const skip = (Math.max(1, page) - 1) * take;
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...PROFILE_NOTIFICATION_TYPES] },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -353,7 +454,7 @@ export class NotificationService {
     // Atomic: either both notifications land or neither does — a partial
     // failure must not leave one orphaned notification behind.
     const created = await this.prisma.$transaction(notifications);
-    return created
+    const mapped = created
       .map((notification) => ({
         targetUserId: notification.toUserID,
         notification: mapNotificationRealtimeDto(notification),
@@ -366,5 +467,11 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
+    await Promise.all(
+      mapped.map((item) =>
+        this.sendPushBestEffort(item.targetUserId, item.notification),
+      ),
+    );
+    return mapped;
   }
 }

@@ -1,4 +1,54 @@
 import { Prisma, NotificationType } from 'src/generated/prisma';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
+
+export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
+export const PUSH_TOKEN_PROVIDERS = ['expo'] as const;
+
+export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
+export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
+
+export class RegisterPushTokenDto {
+  @ApiProperty({ maxLength: 512 })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(512)
+  token: string;
+
+  @ApiProperty({ enum: PUSH_TOKEN_PLATFORMS })
+  @IsIn(PUSH_TOKEN_PLATFORMS)
+  platform: PushTokenPlatform;
+
+  @ApiProperty({ enum: PUSH_TOKEN_PROVIDERS })
+  @IsIn(PUSH_TOKEN_PROVIDERS)
+  provider: PushTokenProvider;
+
+  @ApiPropertyOptional({ maxLength: 128 })
+  @IsString()
+  @IsOptional()
+  @MaxLength(128)
+  projectId?: string;
+
+  @ApiPropertyOptional({ maxLength: 128 })
+  @IsString()
+  @IsOptional()
+  @MaxLength(128)
+  appVersion?: string;
+}
+
+export class DeletePushTokenDto {
+  @ApiProperty({ maxLength: 512 })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(512)
+  token: string;
+}
 
 export type NotificationRealtimeDto = {
   id: string;

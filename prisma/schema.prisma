@@ -268,6 +268,7 @@ model User {
   blocksReceived                    Block[]                     @relation("blocked")
   notifications                     Notification[]              @relation("toUser")
   notificationsSent                 Notification[]              @relation("fromUser")
+  devicePushTokens                  DevicePushToken[]
   traces                            Trace[]
   traceComments                     TraceComment[]
   traceLikeStats                    traceLikeStat[]
@@ -985,6 +986,24 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+}
+
+model DevicePushToken {
+  id         String    @id @default(uuid())
+  token      String    @unique
+  provider   String
+  platform   String
+  projectId  String?
+  appVersion String?
+  disabledAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  userID String
+  user   User   @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID])
+  @@index([provider, platform])
 }
 
 // ─── Circle Plaza ────────────────────────────────────────────────────────────

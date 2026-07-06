@@ -1,4 +1,5 @@
 import {
+  Body,
   Controller,
   Delete,
   Get,
@@ -12,6 +13,10 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import {
+  DeletePushTokenDto,
+  RegisterPushTokenDto,
+} from './notification.dto';
 import { NotificationService } from './notification.service';
 
 @ApiTags('notification')
@@ -38,10 +43,31 @@ export class NotificationController {
     );
   }
 
+  @Get('profile/list')
+  @ApiOperation({ summary: 'Paginated profile-domain system notification list' })
+  profileList(@Query('page') page: string | undefined, @Req() req: any) {
+    return this.notificationService.getProfileNotifications(
+      req.user.userId,
+      page ? parseInt(page, 10) : 1,
+    );
+  }
+
   @Put('read-all')
   @ApiOperation({ summary: 'Mark all interactive notifications as read' })
   readAll(@Req() req: any) {
     return this.notificationService.markAllNotificationsRead(req.user.userId);
+  }
+
+  @Put('push-token')
+  @ApiOperation({ summary: 'Register or refresh the current device push token' })
+  registerPushToken(@Body() dto: RegisterPushTokenDto, @Req() req: any) {
+    return this.notificationService.registerPushToken(req.user.userId, dto);
+  }
+
+  @Delete('push-token')
+  @ApiOperation({ summary: 'Delete the current device push token' })
+  deletePushToken(@Body() dto: DeletePushTokenDto, @Req() req: any) {
+    return this.notificationService.deletePushToken(req.user.userId, dto.token);
   }
 
   @Put(':id/read')
