@@ -15,6 +15,7 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -31,6 +32,8 @@ import {
 // Members (paid) get 5 000, regular users get 1 000.
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
+const FRIEND_ACCEPTED_REPLY_MESSAGE =
+  '我通过了你的好友请求，现在开始聊天吧';
 
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
@@ -87,6 +90,7 @@ export class FriendService {
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly notificationService: NotificationService,
+    private readonly openimService: OpenimService,
     private readonly privacySettings: PrivacySettingsService,
   ) {}
 
@@ -344,7 +348,12 @@ export class FriendService {
       // otherwise produce a live friendship with an inactive account.
       const sender = await this.prisma.user.findUnique({
         where: { id: record.userID },
-        select: { status: true },
+        select: {
+          status: true,
+          nickname: true,
+          accountId: true,
+          avatarUrl: true,
+        },
       });
       if (!sender || sender.status !== 'ACTIVE') {
         throw new NotFoundException({
@@ -447,6 +456,13 @@ export class FriendService {
       return nextRequest;
     });
     await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
+    if (decision === FriendState.ACCEPTED) {
+      await this.emitAcceptedFriendChatMessages({
+        requesterUserID: nextRequest.userID,
+        accepterUserID: recipientId,
+        requestMessage: nextRequest.message ?? '',
+      });
+    }
     await this.createAndBroadcastFriendRequestNotification({
       type:
         decision === FriendState.ACCEPTED
@@ -1237,6 +1253,72 @@ export class FriendService {
         }`,
       );
     }
+  }
+
+  private async emitAcceptedFriendChatMessages(params: {
+    requesterUserID: string;
+    accepterUserID: string;
+    requestMessage: string;
+  }) {
+    try {
+      const [requester, accepter] = await Promise.all([
+        this.prisma.user.findUnique({
+          where: { id: params.requesterUserID },
+          select: { nickname: true, accountId: true, avatarUrl: true },
+        }),
+        this.prisma.user.findUnique({
+          where: { id: params.accepterUserID },
+          select: { nickname: true, accountId: true, avatarUrl: true },
+        }),
+      ]);
+      const requesterName = this.displayNameForAcceptedFriendMessage(
+        requester,
+        params.requesterUserID,
+      );
+      const accepterName = this.displayNameForAcceptedFriendMessage(
+        accepter,
+        params.accepterUserID,
+      );
+      const greeting =
+        params.requestMessage.trim() || `我是${requesterName}`;
+
+      await this.openimService.importFriends(params.requesterUserID, [
+        params.accepterUserID,
+      ]);
+      await this.openimService.importFriends(params.accepterUserID, [
+        params.requesterUserID,
+      ]);
+      await this.openimService.sendTextMessage({
+        sendID: params.requesterUserID,
+        recvID: params.accepterUserID,
+        content: greeting,
+        senderNickname: requesterName,
+        senderFaceURL: requester?.avatarUrl ?? '',
+      });
+      await this.openimService.sendTextMessage({
+        sendID: params.accepterUserID,
+        recvID: params.requesterUserID,
+        content: FRIEND_ACCEPTED_REPLY_MESSAGE,
+        senderNickname: accepterName,
+        senderFaceURL: accepter?.avatarUrl ?? '',
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Accepted friend chat messages failed: ${params.requesterUserID} <-> ${
+          params.accepterUserID
+        }: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private displayNameForAcceptedFriendMessage(
+    user:
+      | { nickname?: string | null; accountId?: string | null }
+      | null
+      | undefined,
+    fallbackUserID: string,
+  ) {
+    return user?.nickname?.trim() || user?.accountId?.trim() || fallbackUserID;
   }
 
   private async throwActiveFriendConflict(

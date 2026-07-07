@@ -100,6 +100,7 @@ describe('FriendService', () => {
     deleteFriend: jest.fn(),
     importFriends: jest.fn(),
     removeBlacklist: jest.fn(),
+    sendTextMessage: jest.fn(),
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
@@ -1035,18 +1036,36 @@ describe('FriendService', () => {
       ],
       skipDuplicates: true,
     });
-    expect(openimService.importFriends).not.toHaveBeenCalled();
   });
 
-  it('does not call OpenIM directly when accepting a friend request', async () => {
+  it('sends accepted friend greeting messages through OpenIM', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
       friendID: 'user-2',
       state: FriendState.PENDING,
-      message: 'hello',
+      message: '',
     });
-    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.user.findUnique.mockImplementation(async (args: any) => {
+      if (args?.where?.id === 'user-1') {
+        return {
+          status: 'ACTIVE',
+          role: 'USER',
+          nickname: '申请者',
+          accountId: 'sender001',
+          avatarUrl: 'sender.png',
+        };
+      }
+      if (args?.where?.id === 'user-2') {
+        return {
+          role: 'USER',
+          nickname: '通过者',
+          accountId: 'receiver001',
+          avatarUrl: 'receiver.png',
+        };
+      }
+      return null;
+    });
     prisma.friend.count.mockResolvedValue(0);
     prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
     prisma.friend.update.mockResolvedValue({
@@ -1054,13 +1073,32 @@ describe('FriendService', () => {
       userID: 'user-1',
       friendID: 'user-2',
       state: FriendState.ACCEPTED,
-      message: 'hello',
+      message: '',
     });
 
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).resolves.toBeUndefined();
-    expect(openimService.importFriends).not.toHaveBeenCalled();
+    expect(openimService.importFriends).toHaveBeenCalledWith('user-1', [
+      'user-2',
+    ]);
+    expect(openimService.importFriends).toHaveBeenCalledWith('user-2', [
+      'user-1',
+    ]);
+    expect(openimService.sendTextMessage).toHaveBeenCalledWith({
+      sendID: 'user-1',
+      recvID: 'user-2',
+      content: '我是申请者',
+      senderNickname: '申请者',
+      senderFaceURL: 'sender.png',
+    });
+    expect(openimService.sendTextMessage).toHaveBeenCalledWith({
+      sendID: 'user-2',
+      recvID: 'user-1',
+      content: '我通过了你的好友请求，现在开始聊天吧',
+      senderNickname: '通过者',
+      senderFaceURL: 'receiver.png',
+    });
   });
 
   it('queues removeFriend OpenIM sync in both directions', async () => {

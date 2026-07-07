@@ -325,6 +325,44 @@ export class OpenimService implements OnModuleInit {
     );
   }
 
+  async sendTextMessage(params: {
+    sendID: string;
+    recvID: string;
+    content: string;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const senderName = params.senderNickname?.trim() || 'Circle';
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        recvID: OpenimService.toImUserId(params.recvID),
+        content: { content: params.content },
+        contentType: 101,
+        sessionType: 1,
+        senderNickname: senderName,
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: false,
+        sendTime: Date.now(),
+        offlinePushInfo: {
+          title: senderName,
+          desc: params.content,
+          ex: '',
+          iOSPushSound: 'default',
+          iOSBadgeCount: true,
+        },
+        ex: '',
+      },
+      adminToken,
+    );
+  }
+
   async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
     if (!this.enabled) return;
 

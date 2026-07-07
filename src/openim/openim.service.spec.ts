@@ -114,6 +114,42 @@ describe('OpenimService group/auth admin calls', () => {
     });
   });
 
+  it('sendTextMessage posts /msg/send_msg as a single chat text message', async () => {
+    await service.sendTextMessage({
+      sendID: 'sender-1',
+      recvID: 'receiver-2',
+      content: '我是小李',
+      senderNickname: '小李',
+      senderFaceURL: 'https://cdn.example/avatar.png',
+    });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/send_msg'),
+    );
+
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      sendID: 'sender1',
+      recvID: 'receiver2',
+      content: { content: '我是小李' },
+      contentType: 101,
+      sessionType: 1,
+      senderNickname: '小李',
+      senderFaceURL: 'https://cdn.example/avatar.png',
+      senderPlatformID: 5,
+      isOnlineOnly: false,
+      notOfflinePush: false,
+      sendTime: expect.any(Number),
+      offlinePushInfo: {
+        title: '小李',
+        desc: '我是小李',
+        ex: '',
+        iOSPushSound: 'default',
+        iOSBadgeCount: true,
+      },
+      ex: '',
+    });
+  });
+
   it('deleteFriend posts /friend/delete_friend with normalized user ids', async () => {
     await service.deleteFriend('owner-1', 'friend-1');
     const call = fetchMock.mock.calls.find(([u]) =>
