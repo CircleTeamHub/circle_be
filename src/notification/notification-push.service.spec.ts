@@ -12,10 +12,35 @@ describe('NotificationPushService', () => {
 
   let service: NotificationPushService;
   const fetchMock = jest.fn();
+  const configValues: Record<string, string | undefined> = {};
+  const config = {
+    get: jest.fn((key: string) => configValues[key]),
+  };
+
+  const buildService = () =>
+    new NotificationPushService(
+      prisma as unknown as PrismaService,
+      config as any,
+    );
+
+  const baseNotification = () => ({
+    id: 'n1',
+    type: 'SYSTEM' as const,
+    content: 'hi',
+    read: false,
+    createdAt: '2026-07-05T00:00:00.000Z',
+    fromUser: null,
+    fromTrace: null,
+    fromReply: null,
+    fromCircle: null,
+    fromCirclePost: null,
+    fromInvitation: null,
+  });
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new NotificationPushService(prisma as unknown as PrismaService);
+    for (const key of Object.keys(configValues)) delete configValues[key];
+    service = buildService();
     global.fetch = fetchMock as any;
   });
 
@@ -109,6 +134,99 @@ describe('NotificationPushService', () => {
       where: { token: { in: ['ExponentPushToken[bad]'] } },
       data: { disabledAt: expect.any(Date) },
     });
+  });
+
+  it('omits the Authorization header when no Expo access token is configured', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', baseNotification());
+
+    const headers = fetchMock.mock.calls[0][1].headers;
+    expect(headers).not.toHaveProperty('Authorization');
+  });
+
+  it('attaches a Bearer token when EXPO_ACCESS_TOKEN is configured', async () => {
+    configValues.EXPO_ACCESS_TOKEN = 'secret-expo-token';
+    service = buildService();
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', baseNotification());
+
+    expect(fetchMock.mock.calls[0][1].headers).toEqual(
+      expect.objectContaining({ Authorization: 'Bearer secret-expo-token' }),
+    );
+  });
+
+  it('sends each Expo batch with a bounded request timeout', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', {
+      id: 'n1',
+      type: 'SYSTEM',
+      content: 'hi',
+      read: false,
+      createdAt: '2026-07-05T00:00:00.000Z',
+      fromUser: null,
+      fromTrace: null,
+      fromReply: null,
+      fromCircle: null,
+      fromCirclePost: null,
+      fromInvitation: null,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://exp.host/--/api/v2/push/send',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it('stays best-effort when the Expo endpoint fails or times out', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    // Simulate an AbortSignal.timeout firing / network failure.
+    fetchMock.mockRejectedValue(
+      Object.assign(new Error('The operation was aborted'), {
+        name: 'TimeoutError',
+      }),
+    );
+
+    await expect(
+      service.sendNotification('user-1', {
+        id: 'n1',
+        type: 'SYSTEM',
+        content: 'hi',
+        read: false,
+        createdAt: '2026-07-05T00:00:00.000Z',
+        fromUser: null,
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+      }),
+    ).resolves.toBeUndefined();
+
+    // A failed send must never try to disable tokens on incomplete data.
+    expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
   });
 
   it('deletes stale active and old disabled push tokens', async () => {

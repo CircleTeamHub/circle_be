@@ -32,8 +32,7 @@ import {
 // Members (paid) get 5 000, regular users get 1 000.
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
-const FRIEND_ACCEPTED_REPLY_MESSAGE =
-  '我通过了你的好友请求，现在开始聊天吧';
+const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在开始聊天吧';
 
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
@@ -456,13 +455,8 @@ export class FriendService {
       return nextRequest;
     });
     await this.broadcastFriendUnreadUpdates([recipientId, record.userID]);
-    if (decision === FriendState.ACCEPTED) {
-      await this.emitAcceptedFriendChatMessages({
-        requesterUserID: nextRequest.userID,
-        accepterUserID: recipientId,
-        requestMessage: nextRequest.message ?? '',
-      });
-    }
+    // Notify the requester first — it's the user-facing signal and only touches
+    // the DB + realtime channel, so it stays fast.
     await this.createAndBroadcastFriendRequestNotification({
       type:
         decision === FriendState.ACCEPTED
@@ -472,6 +466,19 @@ export class FriendService {
       fromUserId: recipientId,
       content: nextRequest.message ?? '',
     });
+    if (decision === FriendState.ACCEPTED) {
+      // Fire-and-forget: seeding the opening chat messages goes through up to
+      // four sequential OpenIM calls, so awaiting it would stall the accept
+      // response for up to ~20s if OpenIM is degraded. The friendship and the
+      // OpenIM friend import are already durable (transaction + friendSyncOutbox
+      // IMPORT_FRIEND rows); the greeting is a best-effort side effect. The
+      // method is fully self-contained (catches + logs), so this never rejects.
+      void this.emitAcceptedFriendChatMessages({
+        requesterUserID: nextRequest.userID,
+        accepterUserID: recipientId,
+        requestMessage: nextRequest.message ?? '',
+      });
+    }
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent:
@@ -1279,9 +1286,13 @@ export class FriendService {
         accepter,
         params.accepterUserID,
       );
-      const greeting =
-        params.requestMessage.trim() || `我是${requesterName}`;
+      const greeting = params.requestMessage.trim() || `我是${requesterName}`;
 
+      // Import both directions synchronously here (in addition to the durable
+      // friendSyncOutbox IMPORT_FRIEND rows written inside handleRequest's
+      // transaction) because the greeting messages below must land in an
+      // established friendship — the async outbox worker may not have run yet.
+      // OpenIM's import_friend is idempotent, so the double write is harmless.
       await this.openimService.importFriends(params.requesterUserID, [
         params.accepterUserID,
       ]);

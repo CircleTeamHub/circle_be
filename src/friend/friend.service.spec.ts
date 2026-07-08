@@ -1079,6 +1079,9 @@ describe('FriendService', () => {
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).resolves.toBeUndefined();
+    // The greeting is dispatched fire-and-forget (void) so the accept response
+    // isn't blocked on OpenIM — flush pending microtasks before asserting it ran.
+    await new Promise((resolve) => setImmediate(resolve));
     expect(openimService.importFriends).toHaveBeenCalledWith('user-1', [
       'user-2',
     ]);

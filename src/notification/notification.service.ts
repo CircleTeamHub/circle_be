@@ -48,6 +48,12 @@ export class NotificationService {
     }
   }
 
+  /**
+   * Fire-and-forget offline push. Dispatched with `void` (never awaited) from
+   * the notification-creation path so a slow Expo round-trip can't add latency
+   * to the user's request. Fully self-contained: every failure is caught and
+   * logged here, so the floating promise can never reject.
+   */
   private async sendPushBestEffort(
     userId: string,
     notification: NotificationRealtimeDto,
@@ -163,7 +169,7 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
     const dto = mapNotificationRealtimeDto(notification);
-    await this.sendPushBestEffort(toUserId, dto);
+    void this.sendPushBestEffort(toUserId, dto);
     return dto;
   }
 
@@ -217,7 +223,7 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
     const dto = mapNotificationRealtimeDto(notification);
-    await this.sendPushBestEffort(notificationData.toUserID, dto);
+    void this.sendPushBestEffort(notificationData.toUserID, dto);
     return dto;
   }
 
@@ -286,7 +292,7 @@ export class NotificationService {
     });
 
     const dto = mapNotificationRealtimeDto(notification);
-    await this.sendPushBestEffort(params.toUserId, dto);
+    void this.sendPushBestEffort(params.toUserId, dto);
     return dto;
   }
 
@@ -467,10 +473,9 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
-    await Promise.all(
-      mapped.map((item) =>
-        this.sendPushBestEffort(item.targetUserId, item.notification),
-      ),
+    mapped.forEach(
+      (item) =>
+        void this.sendPushBestEffort(item.targetUserId, item.notification),
     );
     return mapped;
   }

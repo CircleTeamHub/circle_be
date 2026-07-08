@@ -1,10 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { NotificationRealtimeDto } from './notification.dto';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_BATCH_SIZE = 100;
+// Hard cap on the Expo call. sendNotification is awaited inside the
+// notification-creation request path, and Node's global fetch (undici) applies
+// no response timeout by default — a slow/hung Expo endpoint would otherwise
+// stall the user's request (comment, friend accept, …) for minutes.
+const EXPO_PUSH_TIMEOUT_MS = 8_000;
 const ACTIVE_TOKEN_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 const DISABLED_TOKEN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -16,8 +22,17 @@ type ExpoPushTicket = {
 @Injectable()
 export class NotificationPushService {
   private readonly logger = new Logger(NotificationPushService.name);
+  // Optional. Required only when the Expo project has "Enhanced Security for
+  // Push Notifications" enabled — Expo then rejects unauthenticated sends.
+  private readonly expoAccessToken: string;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {
+    this.expoAccessToken =
+      this.config.get<string>('EXPO_ACCESS_TOKEN')?.trim() ?? '';
+  }
 
   async sendNotification(
     userId: string,
@@ -79,8 +94,12 @@ export class NotificationPushService {
         notificationId: notification.id,
         type: notification.type,
         ...(notification.type === 'SYSTEM' ? { route: 'system' } : {}),
-        ...(notification.fromTrace?.id ? { traceId: notification.fromTrace.id } : {}),
-        ...(notification.fromReply?.id ? { replyId: notification.fromReply.id } : {}),
+        ...(notification.fromTrace?.id
+          ? { traceId: notification.fromTrace.id }
+          : {}),
+        ...(notification.fromReply?.id
+          ? { replyId: notification.fromReply.id }
+          : {}),
         ...(notification.fromCirclePost?.id
           ? { postId: notification.fromCirclePost.id }
           : {}),
@@ -108,8 +127,14 @@ export class NotificationPushService {
     try {
       const response = await fetch(EXPO_PUSH_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.expoAccessToken
+            ? { Authorization: `Bearer ${this.expoAccessToken}` }
+            : {}),
+        },
         body: JSON.stringify(messages),
+        signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
       });
       if (!response.ok) {
         this.logger.warn(`Expo push send failed: ${response.status}`);
