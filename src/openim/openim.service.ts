@@ -119,6 +119,18 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * OpenIM's 1:1 conversation id: `si_` + the two IM userIDs sorted ascending
+   * and joined by `_`. Sorting makes it identical regardless of arg order.
+   */
+  static singleConversationID(userIdA: string, userIdB: string): string {
+    const [lo, hi] = [
+      OpenimService.toImUserId(userIdA),
+      OpenimService.toImUserId(userIdB),
+    ].sort();
+    return `si_${lo}_${hi}`;
+  }
+
+  /**
    * Register a user in OpenIM. Called during business registration.
    * Uses the circle_be User.id (UUID) as the OpenIM userID for 1:1 mapping.
    */
@@ -172,6 +184,28 @@ export class OpenimService implements OnModuleInit {
 
     const adminToken = await this.getAdminToken();
     await this.post('/user/update_user_info', { userInfo }, adminToken);
+  }
+
+  /**
+   * Clear a user's messages in the given conversations (their own view only).
+   * Used when deleting a friend so a later re-add starts from a clean history
+   * instead of stacking a second set of intro messages onto the old thread.
+   */
+  async clearConversationMessages(
+    userID: string,
+    conversationIDs: string[],
+  ): Promise<void> {
+    if (!this.enabled || conversationIDs.length === 0) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/clear_conversation_msg',
+      {
+        userID: OpenimService.toImUserId(userID),
+        conversationIDs,
+      },
+      adminToken,
+    );
   }
 
   /**

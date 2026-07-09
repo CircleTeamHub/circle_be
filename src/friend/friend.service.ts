@@ -606,6 +606,24 @@ export class FriendService {
         skipDuplicates: true,
       });
     });
+
+    // 删好友即清空删除者这侧的聊天记录：OpenIM 会话历史不随好友关系删除，不清的话
+    // 重加时接受流程注入的新开场白会叠在旧消息上（见截图反馈的重复）。只清删除者
+    // 自己的视图（对方历史保留，符合微信语义）。best-effort：清理失败不回滚删好友。
+    try {
+      const conversationID = OpenimService.singleConversationID(
+        userId,
+        friendId,
+      );
+      await this.openimService.clearConversationMessages(userId, [
+        conversationID,
+      ]);
+    } catch (err) {
+      this.logger.warn(
+        `OpenIM clearConversationMessages failed for ${userId} after removing ${friendId}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
   }
 
   async reportFriend(

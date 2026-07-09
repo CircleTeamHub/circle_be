@@ -86,6 +86,35 @@ describe('OpenimService group/auth admin calls', () => {
     expect(call).toBeUndefined();
   });
 
+  it('singleConversationID strips hyphens and sorts ascending (order-independent)', () => {
+    expect(OpenimService.singleConversationID('751b-7308', '0a9a-d3d6')).toBe(
+      'si_0a9ad3d6_751b7308',
+    );
+    expect(OpenimService.singleConversationID('0a9a-d3d6', '751b-7308')).toBe(
+      'si_0a9ad3d6_751b7308',
+    );
+  });
+
+  it('clearConversationMessages posts /msg/clear_conversation_msg with a hyphen-stripped userID', async () => {
+    await service.clearConversationMessages('a1-b2', ['si_a1b2_c3d4']);
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/clear_conversation_msg'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      userID: 'a1b2',
+      conversationIDs: ['si_a1b2_c3d4'],
+    });
+  });
+
+  it('clearConversationMessages is a no-op when no conversation ids are given', async () => {
+    await service.clearConversationMessages('a1', []);
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/clear_conversation_msg'),
+    );
+    expect(call).toBeUndefined();
+  });
+
   it('dismissGroup posts /group/dismiss_group with deleteMember=true', async () => {
     await service.dismissGroup('tmpABC');
     const call = fetchMock.mock.calls.find(([u]) =>

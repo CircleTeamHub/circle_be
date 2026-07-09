@@ -106,6 +106,7 @@ describe('FriendService', () => {
     importFriends: jest.fn(),
     removeBlacklist: jest.fn(),
     sendTextMessage: jest.fn(),
+    clearConversationMessages: jest.fn().mockResolvedValue(undefined),
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
@@ -907,6 +908,27 @@ describe('FriendService', () => {
         photos: ['friends/user-1/a.jpg'],
         permission: 'CHAT_ONLY',
       },
+    );
+  });
+
+  it('removeFriend clears the deleter’s OpenIM conversation so a re-add starts clean', async () => {
+    prisma.friend.findFirst.mockResolvedValue({
+      id: 'friendship-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+    });
+    prisma.friend.delete.mockResolvedValue({});
+    prisma.friendSyncOutbox.createMany.mockResolvedValue({});
+
+    await service.removeFriend('user-1', 'user-2');
+
+    expect(prisma.friend.delete).toHaveBeenCalledWith({
+      where: { id: 'friendship-1' },
+    });
+    expect(openimService.clearConversationMessages).toHaveBeenCalledWith(
+      'user-1',
+      [OpenimService.singleConversationID('user-1', 'user-2')],
     );
   });
 
