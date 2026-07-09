@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { FriendErrorCode } from 'src/common/app-error-codes';
 import {
+  FriendPermission,
   FriendReportStatus,
   FriendState,
   NotificationType,
@@ -36,6 +37,29 @@ const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在�
 
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
+
+/** Trim a free-text field, collapsing blank/whitespace-only input to null. */
+function normalizeOptionalText(value?: string | null): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+/** De-duplicate and drop empties from a photo-key list, preserving order. */
+function normalizePhotoKeys(values?: string[] | null): string[] {
+  if (!values || values.length === 0) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
 
 // Minimal user shape returned inside friend/request payloads
 const MINI_USER_SELECT = {
@@ -101,6 +125,11 @@ export class FriendService {
     message?: string,
     remark?: string,
     tagIds?: string[],
+    extras?: {
+      description?: string;
+      photos?: string[];
+      permission?: FriendPermission;
+    },
   ): Promise<void> {
     if (senderId === targetId) {
       throw new BadRequestException({
@@ -168,12 +197,23 @@ export class FriendService {
     }
 
     const pendingRemarkBySender = remark ?? null;
+    // Blank/whitespace description collapses to null; photos default to an empty
+    // array so the column is never null. Permission stays null when unset so the
+    // accept step leaves the DB default (FULL) untouched.
+    const pendingDescriptionBySender = normalizeOptionalText(
+      extras?.description,
+    );
+    const pendingPhotosBySender = normalizePhotoKeys(extras?.photos);
+    const pendingPermissionBySender = extras?.permission ?? null;
     const requestData = {
       userID: senderId,
       friendID: targetId,
       state: FriendState.PENDING,
       message: message ?? null,
       pendingRemarkBySender,
+      pendingDescriptionBySender,
+      pendingPhotosBySender,
+      pendingPermissionBySender,
     } as any;
 
     let request: { id: string };
@@ -368,13 +408,34 @@ export class FriendService {
     const nextRequest = await this.prisma.$transaction(async (tx: any) => {
       const data: any = { state: decision };
 
-      if (
-        decision === FriendState.ACCEPTED &&
-        record.pendingRemarkBySender !== null &&
-        record.pendingRemarkBySender !== undefined
-      ) {
-        // The sender is stored in userID, so the sender-owned active remark slot is remarkA.
-        data.remarkA = record.pendingRemarkBySender;
+      if (decision === FriendState.ACCEPTED) {
+        // The sender is stored in userID, so the sender-owned active slots are
+        // the *A columns. Promote each staged annotation the sender supplied;
+        // leave a slot untouched when nothing was staged so DB defaults stand.
+        if (
+          record.pendingRemarkBySender !== null &&
+          record.pendingRemarkBySender !== undefined
+        ) {
+          data.remarkA = record.pendingRemarkBySender;
+        }
+        if (
+          record.pendingDescriptionBySender !== null &&
+          record.pendingDescriptionBySender !== undefined
+        ) {
+          data.descriptionA = record.pendingDescriptionBySender;
+        }
+        if (
+          Array.isArray(record.pendingPhotosBySender) &&
+          record.pendingPhotosBySender.length > 0
+        ) {
+          data.photosA = record.pendingPhotosBySender;
+        }
+        if (
+          record.pendingPermissionBySender !== null &&
+          record.pendingPermissionBySender !== undefined
+        ) {
+          data.permissionA = record.pendingPermissionBySender;
+        }
       }
 
       const nextRequest = await tx.friend.update({
@@ -696,11 +757,20 @@ export class FriendService {
       }),
     ]);
 
+    // Each side reads its own annotation slot: the requester (userID) owns the
+    // *A columns, the recipient (friendID) owns the *B columns.
+    const viewerIsUser = friendship.userID === userId;
     return {
-      remark:
-        friendship.userID === userId ? friendship.remarkA : friendship.remarkB,
+      remark: viewerIsUser ? friendship.remarkA : friendship.remarkB,
       assignedTags: assignedLinks.map((link) => link.tag),
       availableTags,
+      description: viewerIsUser
+        ? friendship.descriptionA
+        : friendship.descriptionB,
+      photos: viewerIsUser ? friendship.photosA : friendship.photosB,
+      permission: viewerIsUser
+        ? friendship.permissionA
+        : friendship.permissionB,
     };
   }
 
@@ -1217,8 +1287,14 @@ export class FriendService {
 
     // skipDuplicates: the (requestId, viewerId, type) unique index makes this
     // idempotent if the same activity is ever written twice.
+    // viewer===actor 的动态是本人自己发起的动作(如「我已通过/拒绝申请」「我已发送申请」)，
+    // 对本人只是历史记录，创建即已读，避免给操作者自己弹未读红点/通知。
+    const now = new Date();
     await tx.friendActivity.createMany({
-      data: activities,
+      data: activities.map((activity) => ({
+        ...activity,
+        ...(activity.viewerId === activity.actorId ? { readAt: now } : {}),
+      })),
       skipDuplicates: true,
     });
   }
