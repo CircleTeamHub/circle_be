@@ -550,6 +550,7 @@ export class FriendService {
       // IMPORT_FRIEND rows); the greeting is a best-effort side effect. The
       // method is fully self-contained (catches + logs), so this never rejects.
       void this.emitAcceptedFriendChatMessages({
+        requestId: nextRequest.id,
         requesterUserID: nextRequest.userID,
         accepterUserID: recipientId,
         requestMessage: nextRequest.message ?? '',
@@ -1443,12 +1444,13 @@ export class FriendService {
   }
 
   private async emitAcceptedFriendChatMessages(params: {
+    requestId: string;
     requesterUserID: string;
     accepterUserID: string;
     requestMessage: string;
   }) {
     try {
-      const [requester, accepter] = await Promise.all([
+      const [requester, accepter, thread] = await Promise.all([
         this.prisma.user.findUnique({
           where: { id: params.requesterUserID },
           select: { nickname: true, accountId: true, avatarUrl: true },
@@ -1456,6 +1458,11 @@ export class FriendService {
         this.prisma.user.findUnique({
           where: { id: params.accepterUserID },
           select: { nickname: true, accountId: true, avatarUrl: true },
+        }),
+        this.prisma.friendRequestMessage.findMany({
+          where: { requestId: params.requestId },
+          orderBy: { createdAt: 'asc' },
+          select: { senderId: true, content: true },
         }),
       ]);
       const requesterName = this.displayNameForAcceptedFriendMessage(
@@ -1479,13 +1486,37 @@ export class FriendService {
       await this.openimService.importFriends(params.accepterUserID, [
         params.requesterUserID,
       ]);
-      await this.openimService.sendTextMessage({
-        sendID: params.requesterUserID,
-        recvID: params.accepterUserID,
-        content: greeting,
-        senderNickname: requesterName,
-        senderFaceURL: requester?.avatarUrl ?? '',
-      });
+
+      // Replay the pre-accept message thread as the conversation's first-screen
+      // history, each message attributed to its original sender. Known trade-off
+      // (spec §4): OpenIM stamps server time, so the whole thread lands as one
+      // batch at accept time rather than at each message's original timestamp.
+      const replayThread = thread ?? [];
+      if (replayThread.length > 0) {
+        for (const message of replayThread) {
+          const fromRequester = message.senderId === params.requesterUserID;
+          await this.openimService.sendTextMessage({
+            sendID: message.senderId,
+            recvID: fromRequester
+              ? params.accepterUserID
+              : params.requesterUserID,
+            content: message.content,
+            senderNickname: fromRequester ? requesterName : accepterName,
+            senderFaceURL:
+              (fromRequester ? requester : accepter)?.avatarUrl ?? '',
+          });
+        }
+      } else {
+        // No thread (e.g. request created before this feature) → fall back to
+        // the original single opening greeting from the requester.
+        await this.openimService.sendTextMessage({
+          sendID: params.requesterUserID,
+          recvID: params.accepterUserID,
+          content: greeting,
+          senderNickname: requesterName,
+          senderFaceURL: requester?.avatarUrl ?? '',
+        });
+      }
       await this.openimService.sendTextMessage({
         sendID: params.accepterUserID,
         recvID: params.requesterUserID,

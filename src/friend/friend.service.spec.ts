@@ -1347,6 +1347,79 @@ describe('FriendService', () => {
     });
   });
 
+  it('injects the message thread into the conversation on accept', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: '你好',
+    });
+    prisma.user.findUnique.mockImplementation(async (args: any) => {
+      if (args?.where?.id === 'user-1') {
+        return {
+          status: 'ACTIVE',
+          role: 'USER',
+          nickname: '申请者',
+          accountId: 'sender001',
+          avatarUrl: 'sender.png',
+        };
+      }
+      if (args?.where?.id === 'user-2') {
+        return {
+          role: 'USER',
+          nickname: '通过者',
+          accountId: 'receiver001',
+          avatarUrl: 'receiver.png',
+        };
+      }
+      return null;
+    });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.pendingFriendTagOnRequest.findMany.mockResolvedValue([]);
+    prisma.friend.update.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.ACCEPTED,
+      message: '你好',
+    });
+    prisma.friendRequestMessage.findMany.mockResolvedValue([
+      { senderId: 'user-1', content: '你好' },
+      { senderId: 'user-2', content: '你也好' },
+    ]);
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Requester's message attributed to the requester (user-1 → user-2)
+    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sendID: 'user-1',
+        recvID: 'user-2',
+        content: '你好',
+      }),
+    );
+    // Recipient's reply attributed to the recipient (user-2 → user-1)
+    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sendID: 'user-2',
+        recvID: 'user-1',
+        content: '你也好',
+      }),
+    );
+    // Still followed by the accept-reply closer.
+    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sendID: 'user-2',
+        recvID: 'user-1',
+        content: '我通过了你的好友请求，现在开始聊天吧',
+      }),
+    );
+  });
+
   it('sends accepted friend greeting messages through OpenIM', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
