@@ -184,6 +184,7 @@ enum NotificationType {
   FRIEND_REQUEST_RECEIVED
   FRIEND_REQUEST_ACCEPTED
   FRIEND_REQUEST_REJECTED
+  FRIEND_REQUEST_MESSAGE
   SYSTEM
   TRACE_LIKE
   TRACE_COMMENT
@@ -295,6 +296,7 @@ model User {
   friendActivities                  FriendActivity[]            @relation("friendActivityViewer")
   friendActivitiesAuthored          FriendActivity[]            @relation("friendActivityActor")
   friendActivitiesCounterparty      FriendActivity[]            @relation("friendActivityCounterparty")
+  friendRequestMessages             FriendRequestMessage[]      @relation("friendRequestMessageSender")
   friendReportsFiled                FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived             FriendReport[]              @relation("friendReportTarget")
   friendReportsReviewed             FriendReport[]              @relation("friendReportReviewer")
@@ -375,9 +377,25 @@ model Friend {
   tagLinks              FriendTagOnFriend[]
   pendingTagLinks       PendingFriendTagOnRequest[]
   activities            FriendActivity[]
+  messages              FriendRequestMessage[]
 
   @@index([userID])
   @@index([friendID])
+}
+
+// 好友申请阶段的多轮留言线程（双方 accept/reject 前的往来）。
+// 接受后按序注入两人 OpenIM 会话成为聊天首屏历史。
+model FriendRequestMessage {
+  id        String   @id @default(uuid())
+  requestId String
+  senderId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  request Friend @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  sender  User   @relation("friendRequestMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([requestId, createdAt])
 }
 
 enum FriendReportStatus {
