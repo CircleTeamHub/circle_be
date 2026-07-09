@@ -241,6 +241,29 @@ describe('TraceService', () => {
     );
   });
 
+  it('getTraceById throws Forbidden when the author marked the viewer chat-only', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hidden from chat-only friends',
+    });
+    // author-1 (userID) granted viewer-1 (friendID) only CHAT_ONLY via permissionA.
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        userID: 'author-1',
+        friendID: 'viewer-1',
+        permissionA: 'CHAT_ONLY',
+        permissionB: 'FULL',
+      },
+    ]);
+
+    await expect(service.getTraceById('viewer-1', 'trace-1')).rejects.toThrow(
+      ForbiddenException,
+    );
+  });
+
   it('rejects replying to a comment from a different trace', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
@@ -434,6 +457,32 @@ describe('TraceService', () => {
     expect(result.items).toEqual([]);
     expect(result.total).toBe(0);
     expect(result.hasMore).toBe(false);
+    expect(prisma.trace.findMany).not.toHaveBeenCalled();
+  });
+
+  it('hides a chat-only friend from the album feed even when asked by authorId', async () => {
+    // friend-1 (friendID) granted viewer-1 (userID) only CHAT_ONLY via permissionB,
+    // so viewer-1 must not see friend-1's moments.
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        userID: 'viewer-1',
+        friendID: 'friend-1',
+        permissionA: 'FULL',
+        permissionB: 'CHAT_ONLY',
+      },
+    ]);
+    privacySettings.canViewMoments.mockResolvedValue(true);
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    const result = await service.getFeed('viewer-1', {
+      page: 1,
+      limit: 20,
+      authorId: 'friend-1',
+    });
+
+    expect(result.items).toEqual([]);
     expect(prisma.trace.findMany).not.toHaveBeenCalled();
   });
 

@@ -571,13 +571,64 @@ export class TraceService {
     // O(friends) N+1 on every feed page).
     const settingsByAuthor =
       await this.privacySettings.getSettingsMany(authorIds);
-    return authorIds.filter((authorId) =>
-      this.privacySettings.momentsVisibleFor(
-        settingsByAuthor.get(authorId),
-        authorId === viewerId,
-        friendIdSet.has(authorId),
-      ),
+    // Authors who marked the viewer "chat-only" hide their moments from the
+    // viewer regardless of the author's global setting. The viewer's own posts
+    // are never gated this way.
+    const chatOnlyAuthorIds = await this.getChatOnlyAuthorIdsToward(
+      viewerId,
+      authorIds,
     );
+    return authorIds.filter(
+      (authorId) =>
+        !chatOnlyAuthorIds.has(authorId) &&
+        this.privacySettings.momentsVisibleFor(
+          settingsByAuthor.get(authorId),
+          authorId === viewerId,
+          friendIdSet.has(authorId),
+        ),
+    );
+  }
+
+  /**
+   * Of the given authors, which ones granted the viewer only CHAT_ONLY access
+   * (so their moments must be hidden from the viewer). The viewer is never
+   * included even if passed in `authorIds`.
+   */
+  private async getChatOnlyAuthorIdsToward(
+    viewerId: string,
+    authorIds: string[],
+  ): Promise<Set<string>> {
+    const others = authorIds.filter((id) => id !== viewerId);
+    if (others.length === 0) {
+      return new Set();
+    }
+    const records = await this.prisma.friend.findMany({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: { in: others }, friendID: viewerId },
+          { userID: viewerId, friendID: { in: others } },
+        ],
+      },
+      select: {
+        userID: true,
+        friendID: true,
+        permissionA: true,
+        permissionB: true,
+      },
+    });
+    const chatOnly = new Set<string>();
+    for (const record of records) {
+      // The author is whichever side isn't the viewer; read that side's grant.
+      if (record.userID === viewerId) {
+        if (record.permissionB === 'CHAT_ONLY') {
+          chatOnly.add(record.friendID);
+        }
+      } else if (record.permissionA === 'CHAT_ONLY') {
+        chatOnly.add(record.userID);
+      }
+    }
+    return chatOnly;
   }
 
   private async requireVisibleTrace(traceId: string, viewerId: string) {
@@ -592,6 +643,16 @@ export class TraceService {
     }
     if (trace.fromID === viewerId) {
       return trace;
+    }
+    // A chat-only friend can never open the author's moment, even by direct id.
+    const chatOnlyAuthors = await this.getChatOnlyAuthorIdsToward(viewerId, [
+      trace.fromID,
+    ]);
+    if (chatOnlyAuthors.has(trace.fromID)) {
+      throw new ForbiddenException({
+        message: 'You are not allowed to access this moment',
+        errorCode: TraceErrorCode.AccessForbidden,
+      });
     }
     const friendIds =
       trace.visibility === 'FRIENDS_ONLY' || trace.visibility === 'PUBLIC'

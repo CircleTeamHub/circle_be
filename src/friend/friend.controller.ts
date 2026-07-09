@@ -143,6 +143,11 @@ export class FriendController {
       dto.message,
       dto.remark,
       dto.tagIds,
+      {
+        description: dto.description,
+        photos: dto.photos,
+        permission: dto.permission,
+      },
     );
   }
 

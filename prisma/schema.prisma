@@ -45,6 +45,13 @@ enum FriendState {
   WITHDRAWN
 }
 
+/// How much of the owner's world a friend may see.
+/// FULL = chat + moments; CHAT_ONLY = chat but hidden from the owner's moments.
+enum FriendPermission {
+  FULL
+  CHAT_ONLY
+}
+
 enum FriendActivityType {
   REQUEST_RECEIVED
   REQUEST_SENT
@@ -343,6 +350,24 @@ model Friend {
   remarkA               String?
   /// friendID's private remark for userID
   remarkB               String?
+  /// Sender-owned private description staged on the request, promoted on accept
+  pendingDescriptionBySender String?
+  /// userID's private description note for friendID
+  descriptionA          String?
+  /// friendID's private description note for userID
+  descriptionB          String?
+  /// Sender-owned description photo keys staged on the request, promoted on accept
+  pendingPhotosBySender String[]                    @default([])
+  /// userID's private description photo keys for friendID
+  photosA               String[]                    @default([])
+  /// friendID's private description photo keys for userID
+  photosB               String[]                    @default([])
+  /// Permission the sender grants the target, staged on the request
+  pendingPermissionBySender FriendPermission?
+  /// userID's granted permission for friendID (gates friendID seeing userID's moments)
+  permissionA           FriendPermission            @default(FULL)
+  /// friendID's granted permission for userID (gates userID seeing friendID's moments)
+  permissionB           FriendPermission            @default(FULL)
   createdAt             DateTime                    @default(now())
   updatedAt             DateTime                    @updatedAt
   user                  User                        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)

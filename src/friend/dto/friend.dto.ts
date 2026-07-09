@@ -12,6 +12,10 @@ import {
   Matches,
   MaxLength,
 } from 'class-validator';
+import { FriendPermission } from 'src/generated/prisma';
+
+/** Upper bound on description photo notes attached to one friendship. */
+export const FRIEND_DESCRIPTION_PHOTO_LIMIT = 9;
 
 export class SendFriendRequestDto {
   @ApiProperty({ example: 'uuid-of-target-user' })
@@ -44,6 +48,45 @@ export class SendFriendRequestDto {
   @ArrayMaxSize(20)
   @IsUUID('4', { each: true })
   tagIds?: string[];
+
+  @ApiPropertyOptional({
+    example: 'Met at the 2026 design conference, leads the UI team.',
+    description: 'Sender-owned private description note, promoted on accept',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Sender-owned description photo urls/keys, promoted on accept (max 9)',
+    example: ['https://cdn.example.com/friends/abc.jpg'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(FRIEND_DESCRIPTION_PHOTO_LIMIT)
+  @ArrayUnique()
+  @IsString({ each: true })
+  @MaxLength(1000, { each: true })
+  // These render in the sender's own contact card; reject angle brackets so a
+  // stored value can never smuggle HTML/script markup into a client webview.
+  @Matches(/^[^<>]+$/, {
+    each: true,
+    message: 'photo entries contain invalid characters',
+  })
+  photos?: string[];
+
+  @ApiPropertyOptional({
+    enum: FriendPermission,
+    example: FriendPermission.CHAT_ONLY,
+    description:
+      'Moments access the sender grants the target once accepted (default FULL)',
+  })
+  @IsOptional()
+  @IsEnum(FriendPermission)
+  permission?: FriendPermission;
 }
 
 export class BlockUserDto {
@@ -120,6 +163,9 @@ export class FriendSettingsDto {
   @ApiPropertyOptional() remark: string | null;
   @ApiProperty({ type: [FriendTagDto] }) assignedTags: FriendTagDto[];
   @ApiProperty({ type: [FriendTagDto] }) availableTags: FriendTagDto[];
+  @ApiPropertyOptional() description: string | null;
+  @ApiProperty({ type: [String] }) photos: string[];
+  @ApiProperty({ enum: FriendPermission }) permission: FriendPermission;
 }
 
 export class FriendRequestDto {
