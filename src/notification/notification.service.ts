@@ -231,7 +231,8 @@ export class NotificationService {
     type:
       | typeof NotificationType.FRIEND_REQUEST_RECEIVED
       | typeof NotificationType.FRIEND_REQUEST_ACCEPTED
-      | typeof NotificationType.FRIEND_REQUEST_REJECTED;
+      | typeof NotificationType.FRIEND_REQUEST_REJECTED
+      | typeof NotificationType.FRIEND_REQUEST_MESSAGE;
     toUserId: string;
     fromUserId: string;
     content?: string | null;

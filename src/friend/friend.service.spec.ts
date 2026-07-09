@@ -278,6 +278,157 @@ describe('FriendService', () => {
     expect(prisma.friendRequestMessage.create).not.toHaveBeenCalled();
   });
 
+  describe('friend request messages', () => {
+    it('rejects reading messages by a non-party (404)', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+
+      await expect(
+        service.listRequestMessages('outsider', 'r1'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: 'FRIEND_PENDING_REQUEST_NOT_FOUND',
+        }),
+      });
+    });
+
+    it('returns the thread ordered by createdAt for a party', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+      prisma.friendRequestMessage.findMany.mockResolvedValue([
+        { id: 'm1', senderId: 'user-1', content: 'hi', createdAt: new Date() },
+      ]);
+
+      const rows = await service.listRequestMessages('user-2', 'r1');
+
+      expect(rows).toHaveLength(1);
+      expect(prisma.friendRequestMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { requestId: 'r1' },
+          orderBy: { createdAt: 'asc' },
+        }),
+      );
+    });
+
+    it('rejects sending on a non-PENDING request', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+      });
+
+      await expect(
+        service.appendRequestMessage('user-1', 'r1', 'hi'),
+      ).rejects.toBeDefined();
+      expect(prisma.friendRequestMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects empty content', async () => {
+      await expect(
+        service.appendRequestMessage('user-1', 'r1', '   '),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: 'FRIEND_REQUEST_MESSAGE_INVALID',
+        }),
+      });
+    });
+
+    it('enforces sender soft cap until recipient replies', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+      prisma.friendRequestMessage.count
+        .mockResolvedValueOnce(0) // recipient(user-2) messages = 0
+        .mockResolvedValueOnce(5); // sender(user-1) messages = 5
+
+      await expect(
+        service.appendRequestMessage('user-1', 'r1', 'spam'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: 'FRIEND_REQUEST_MESSAGE_LIMIT',
+        }),
+      });
+      expect(prisma.friendRequestMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('appends a message and notifies the counterparty', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+      prisma.friendRequestMessage.count.mockResolvedValue(0);
+      prisma.friendRequestMessage.create.mockResolvedValue({
+        id: 'm9',
+        senderId: 'user-1',
+        content: 'hello',
+        createdAt: new Date(),
+      });
+      notificationService.createFriendRequestNotification.mockResolvedValue(
+        null,
+      );
+
+      const created = await service.appendRequestMessage(
+        'user-1',
+        'r1',
+        '  hello  ',
+      );
+
+      expect(created.id).toBe('m9');
+      expect(prisma.friendRequestMessage.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { requestId: 'r1', senderId: 'user-1', content: 'hello' },
+        }),
+      );
+      expect(
+        notificationService.createFriendRequestNotification,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'FRIEND_REQUEST_MESSAGE',
+          toUserId: 'user-2',
+          fromUserId: 'user-1',
+        }),
+      );
+    });
+
+    it('allows the recipient to reply without the sender cap', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+      prisma.friendRequestMessage.create.mockResolvedValue({
+        id: 'm10',
+        senderId: 'user-2',
+        content: 'sure',
+        createdAt: new Date(),
+      });
+      notificationService.createFriendRequestNotification.mockResolvedValue(
+        null,
+      );
+
+      await service.appendRequestMessage('user-2', 'r1', 'sure');
+
+      // recipient side must not consult the soft-cap counters
+      expect(prisma.friendRequestMessage.count).not.toHaveBeenCalled();
+      expect(prisma.friendRequestMessage.create).toHaveBeenCalled();
+    });
+  });
+
   it('rejects friend requests when the target disallows stranger messages', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-2',

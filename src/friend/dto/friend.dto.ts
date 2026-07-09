@@ -95,6 +95,17 @@ export class SendFriendRequestDto {
   permission?: FriendPermission;
 }
 
+export class SendFriendRequestMessageDto {
+  @ApiProperty({
+    example: 'Hi, we met at the design conference last week.',
+    description: 'Plain-text message appended to the pending request thread',
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  content: string;
+}
+
 export class BlockUserDto {
   @ApiProperty({ example: 'uuid-of-user-to-block' })
   @IsUUID()

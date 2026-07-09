@@ -35,6 +35,10 @@ const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
 const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在开始聊天吧';
 
+// 好友申请留言:纯文本上限 + 发起方在对方回复前的连发软上限(防刷)。
+const FRIEND_REQUEST_MESSAGE_MAX_LENGTH = 500;
+const FRIEND_REQUEST_MESSAGE_SENDER_SOFT_CAP = 5;
+
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
 
@@ -1323,7 +1327,8 @@ export class FriendService {
     type:
       | typeof NotificationType.FRIEND_REQUEST_RECEIVED
       | typeof NotificationType.FRIEND_REQUEST_ACCEPTED
-      | typeof NotificationType.FRIEND_REQUEST_REJECTED;
+      | typeof NotificationType.FRIEND_REQUEST_REJECTED
+      | typeof NotificationType.FRIEND_REQUEST_MESSAGE;
     toUserId: string;
     fromUserId: string;
     content: string;
@@ -1347,6 +1352,94 @@ export class FriendService {
         }`,
       );
     }
+  }
+
+  async listRequestMessages(userId: string, requestId: string) {
+    const request = await this.prisma.friend.findUnique({
+      where: { id: requestId },
+    });
+    if (
+      !request ||
+      (request.userID !== userId && request.friendID !== userId)
+    ) {
+      throw new NotFoundException({
+        message: '好友申请不存在',
+        errorCode: FriendErrorCode.PendingRequestNotFound,
+      });
+    }
+    return this.prisma.friendRequestMessage.findMany({
+      where: { requestId },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, senderId: true, content: true, createdAt: true },
+    });
+  }
+
+  async appendRequestMessage(
+    userId: string,
+    requestId: string,
+    contentRaw: string,
+  ) {
+    const content = (contentRaw ?? '').trim();
+    if (!content || content.length > FRIEND_REQUEST_MESSAGE_MAX_LENGTH) {
+      throw new BadRequestException({
+        message: '留言内容不能为空且不能超过 500 字',
+        errorCode: FriendErrorCode.RequestMessageInvalid,
+      });
+    }
+
+    const request = await this.prisma.friend.findUnique({
+      where: { id: requestId },
+    });
+    if (
+      !request ||
+      (request.userID !== userId && request.friendID !== userId)
+    ) {
+      throw new NotFoundException({
+        message: '好友申请不存在',
+        errorCode: FriendErrorCode.PendingRequestNotFound,
+      });
+    }
+    if (request.state !== FriendState.PENDING) {
+      throw new ConflictException({
+        message: '该好友申请已处理,无法继续留言',
+        errorCode: FriendErrorCode.PendingRequestNotFound,
+      });
+    }
+
+    // 防刷软限制:发起方在对方回复前最多连发 5 条,对方一回复即解除。
+    const isSenderSide = request.userID === userId;
+    if (isSenderSide) {
+      const recipientCount = await this.prisma.friendRequestMessage.count({
+        where: { requestId, senderId: request.friendID },
+      });
+      if (recipientCount === 0) {
+        const senderCount = await this.prisma.friendRequestMessage.count({
+          where: { requestId, senderId: request.userID },
+        });
+        if (senderCount >= FRIEND_REQUEST_MESSAGE_SENDER_SOFT_CAP) {
+          throw new ConflictException({
+            message: '对方回复前最多发送 5 条留言',
+            errorCode: FriendErrorCode.RequestMessageLimit,
+          });
+        }
+      }
+    }
+
+    const created = await this.prisma.friendRequestMessage.create({
+      data: { requestId, senderId: userId, content },
+      select: { id: true, senderId: true, content: true, createdAt: true },
+    });
+
+    const toUserId =
+      request.userID === userId ? request.friendID : request.userID;
+    await this.createAndBroadcastFriendRequestNotification({
+      type: NotificationType.FRIEND_REQUEST_MESSAGE,
+      toUserId,
+      fromUserId: userId,
+      content,
+    });
+
+    return created;
   }
 
   private async emitAcceptedFriendChatMessages(params: {
