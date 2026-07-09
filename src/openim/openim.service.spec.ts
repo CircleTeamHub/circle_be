@@ -51,6 +51,41 @@ describe('OpenimService group/auth admin calls', () => {
     expect(body.memberUserIDs).toEqual(['g23']);
   });
 
+  it('updateUserInfo posts /user/update_user_info with a hyphen-stripped userID', async () => {
+    await service.updateUserInfo('a1b2-c3d4-e5', {
+      nickname: '小霸王',
+      avatarUrl: 'https://cdn/a.jpg',
+    });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      userInfo: {
+        userID: 'a1b2c3d4e5',
+        nickname: '小霸王',
+        faceURL: 'https://cdn/a.jpg',
+      },
+    });
+  });
+
+  it('updateUserInfo maps avatarUrl:null to an empty faceURL and omits unset fields', async () => {
+    await service.updateUserInfo('u-1', { avatarUrl: null });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    const body = JSON.parse(call![1].body);
+    expect(body.userInfo).toEqual({ userID: 'u1', faceURL: '' });
+  });
+
+  it('updateUserInfo is a no-op when neither nickname nor avatar is provided', async () => {
+    await service.updateUserInfo('u-1', {});
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    expect(call).toBeUndefined();
+  });
+
   it('dismissGroup posts /group/dismiss_group with deleteMember=true', async () => {
     await service.dismissGroup('tmpABC');
     const call = fetchMock.mock.calls.find(([u]) =>

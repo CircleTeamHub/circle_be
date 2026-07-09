@@ -146,6 +146,35 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * Update a user's OpenIM profile (nickname / avatar). OpenIM keeps its own copy
+   * of nickname+faceURL (set at registerUser) and surfaces it as the conversation
+   * showName/faceURL; without this, business-side profile edits never reach chats.
+   * Only the provided fields are sent. `avatarUrl: null` clears the face URL.
+   */
+  async updateUserInfo(
+    userID: string,
+    updates: { nickname?: string; avatarUrl?: string | null },
+  ): Promise<void> {
+    if (!this.enabled) return;
+    if (updates.nickname === undefined && updates.avatarUrl === undefined) {
+      return;
+    }
+
+    const userInfo: Record<string, unknown> = {
+      userID: OpenimService.toImUserId(userID),
+    };
+    if (updates.nickname !== undefined) {
+      userInfo.nickname = updates.nickname;
+    }
+    if (updates.avatarUrl !== undefined) {
+      userInfo.faceURL = updates.avatarUrl ?? '';
+    }
+
+    const adminToken = await this.getAdminToken();
+    await this.post('/user/update_user_info', { userInfo }, adminToken);
+  }
+
+  /**
    * Get an IM token for a user. Called during business login/register.
    * platformID: 1=iOS, 2=Android, 5=Web
    */
