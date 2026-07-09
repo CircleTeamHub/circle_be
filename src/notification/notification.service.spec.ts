@@ -222,6 +222,13 @@ describe('NotificationService', () => {
       });
     });
 
+    it('excludes friend-request events from the bell channel (they live in the 新的朋友 inbox)', () => {
+      const bellTypes = DISCOVER_NOTIFICATION_TYPES as readonly string[];
+      expect(bellTypes).not.toContain('FRIEND_REQUEST_RECEIVED');
+      expect(bellTypes).not.toContain('FRIEND_REQUEST_ACCEPTED');
+      expect(bellTypes).not.toContain('FRIEND_REQUEST_REJECTED');
+    });
+
     it('getProfileNotifications returns only profile-domain system rows', async () => {
       prisma.notification.findMany.mockResolvedValue([
         {
@@ -291,9 +298,7 @@ describe('NotificationService', () => {
           type: NotificationType.FRIEND_REQUEST_RECEIVED,
         }),
       );
-      expect(result).toEqual(
-        expect.objectContaining({ id: 'friend-n1' }),
-      );
+      expect(result).toEqual(expect.objectContaining({ id: 'friend-n1' }));
     });
 
     it('creates circle invitation notifications through the shared notification path', async () => {
