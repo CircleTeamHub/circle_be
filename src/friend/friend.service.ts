@@ -261,6 +261,17 @@ export class FriendService {
           normalizedTagIds,
         );
 
+        const seedContent = nextRequestRecord.message?.trim();
+        if (seedContent) {
+          await tx.friendRequestMessage.create({
+            data: {
+              requestId: nextRequestRecord.id,
+              senderId: senderId,
+              content: seedContent,
+            },
+          });
+        }
+
         await this.createFriendActivities(tx, [
           {
             requestId: nextRequestRecord.id,

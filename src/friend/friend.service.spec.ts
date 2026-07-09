@@ -76,6 +76,11 @@ describe('FriendService', () => {
     friendSyncOutbox: {
       createMany: jest.fn(),
     },
+    friendRequestMessage: {
+      create: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+      count: jest.fn().mockResolvedValue(0),
+    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
@@ -217,6 +222,60 @@ describe('FriendService', () => {
     expect(realtimeService.broadcastFriendUnreadCount).toHaveBeenCalledWith(
       'user-2',
     );
+  });
+
+  it('seeds the message thread with the first note when sending a request', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: '  hello there  ',
+    });
+
+    await service.sendRequest('user-1', 'user-2', '  hello there  ');
+
+    expect(prisma.friendRequestMessage.create).toHaveBeenCalledWith({
+      data: {
+        requestId: 'request-1',
+        senderId: 'user-1',
+        content: 'hello there',
+      },
+    });
+  });
+
+  it('does not seed a thread message when the request has no note', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: null,
+    });
+
+    await service.sendRequest('user-1', 'user-2', undefined);
+
+    expect(prisma.friendRequestMessage.create).not.toHaveBeenCalled();
   });
 
   it('rejects friend requests when the target disallows stranger messages', async () => {
@@ -591,6 +650,9 @@ describe('FriendService', () => {
       pendingFriendTagOnRequest: {
         deleteMany: jest.fn(),
         createMany: jest.fn(),
+      },
+      friendRequestMessage: {
+        create: jest.fn(),
       },
       friendActivity: {
         createMany: jest.fn().mockRejectedValue(new Error('activity failed')),
