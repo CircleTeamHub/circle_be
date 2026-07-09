@@ -12,10 +12,16 @@ import {
   Matches,
   MaxLength,
 } from 'class-validator';
-import { FriendPermission } from 'src/generated/prisma';
+// Type-only: the Prisma v7 client exports enums as types, so referencing
+// `FriendPermission.CHAT_ONLY` as a runtime value throws. Validation/Swagger use
+// the local const below instead (same approach as FRIEND_REPORT_CATEGORIES).
+import type { FriendPermission } from 'src/generated/prisma';
 
 /** Upper bound on description photo notes attached to one friendship. */
 export const FRIEND_DESCRIPTION_PHOTO_LIMIT = 9;
+
+/** Runtime values for the FriendPermission enum, for validators and Swagger. */
+export const FRIEND_PERMISSIONS = ['FULL', 'CHAT_ONLY'] as const;
 
 export class SendFriendRequestDto {
   @ApiProperty({ example: 'uuid-of-target-user' })
@@ -79,13 +85,13 @@ export class SendFriendRequestDto {
   photos?: string[];
 
   @ApiPropertyOptional({
-    enum: FriendPermission,
-    example: FriendPermission.CHAT_ONLY,
+    enum: FRIEND_PERMISSIONS,
+    example: 'CHAT_ONLY',
     description:
       'Moments access the sender grants the target once accepted (default FULL)',
   })
   @IsOptional()
-  @IsEnum(FriendPermission)
+  @IsEnum(FRIEND_PERMISSIONS)
   permission?: FriendPermission;
 }
 
@@ -165,7 +171,7 @@ export class FriendSettingsDto {
   @ApiProperty({ type: [FriendTagDto] }) availableTags: FriendTagDto[];
   @ApiPropertyOptional() description: string | null;
   @ApiProperty({ type: [String] }) photos: string[];
-  @ApiProperty({ enum: FriendPermission }) permission: FriendPermission;
+  @ApiProperty({ enum: FRIEND_PERMISSIONS }) permission: FriendPermission;
 }
 
 export class FriendRequestDto {
