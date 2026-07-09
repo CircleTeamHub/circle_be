@@ -42,6 +42,19 @@ const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
 const MAX_SECURITY_CODE_ATTEMPTS = 5;
 const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
 
+/**
+ * OpenIM 1004「record not found」——请求的用户还没在 OpenIM 落库。
+ * getUserToken 抢在异步注册前面时会命中，属于可重试的瞬时竞态。
+ */
+export function isOpenImRecordNotFoundError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  return (
+    message.includes('record not found') ||
+    message.includes('RecordNotFound') ||
+    message.includes('1004')
+  );
+}
+
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
     throw new BadRequestException({
@@ -922,16 +935,30 @@ export class AuthService {
     userId: string,
     platformID?: 1 | 2 | 5,
   ): Promise<string> {
-    try {
-      return await this.openim.getUserToken(userId, platformID);
-    } catch (err) {
-      this.logger.error(
-        `OpenIM getUserToken failed for userId=${userId} platformID=${platformID ?? 'default'}; ` +
-          'returning empty imToken — client IM login will be skipped',
-        err instanceof Error ? err.stack : String(err),
-      );
-      return '';
+    // OpenIM 用户注册是异步非阻塞的（见 registerUser 调用点），注册后紧接着的首个
+    // getUserToken 可能抢在用户落库之前，OpenIM 返回 1004 "record not found"。这是
+    // 可自愈的瞬时竞态 —— 短暂退避后重试即可，避免把「空 imToken」持久化到客户端
+    // （客户端只在登录时刷新 imToken，一旦存了空值会静默跳过 IM 登录、极难定位）。
+    // 真正的宕机/超时不重试：重试也白搭，且每次 getUserToken 有 5s 超时，重试会把
+    // 登录拖到十几秒。这类情况退化为空串并 error 喊出来。
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.openim.getUserToken(userId, platformID);
+      } catch (err) {
+        if (attempt < MAX_ATTEMPTS && isOpenImRecordNotFoundError(err)) {
+          await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+          continue;
+        }
+        this.logger.error(
+          `OpenIM getUserToken failed for userId=${userId} platformID=${platformID ?? 'default'} ` +
+            `after ${attempt} attempt(s); returning empty imToken — client IM login will be skipped`,
+          err instanceof Error ? err.stack : String(err),
+        );
+        return '';
+      }
     }
+    return '';
   }
 
   private signAccessToken(
