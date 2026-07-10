@@ -11,6 +11,7 @@ import { Prisma } from 'src/generated/prisma';
 import { CircleErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import {
   CircleDetailDto,
   CircleDto,
@@ -31,6 +32,7 @@ export class CircleService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
+    private readonly circleInvitationService: CircleInvitationService,
     private readonly config: ConfigService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
@@ -86,7 +88,6 @@ export class CircleService {
           cities: dto.cities ?? [],
           rules: dto.rules ?? '',
           tags: dto.tags ?? [],
-          isPublic: dto.isPublic ?? true,
           joinVipRestriction: dto.joinVipRestriction ?? null,
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
@@ -245,7 +246,7 @@ export class CircleService {
     };
   }
 
-  async joinCircle(userId: string, circleId: string): Promise<void> {
+  async joinCircle(userId: string, circleId: string) {
     const circle = await this.prisma.circle.findFirst({
       where: { id: circleId, deleted: false },
     });
@@ -264,33 +265,27 @@ export class CircleService {
 
     await this.assertJoinRestrictions(userId, circle);
 
-    const existing = await this.prisma.circleMember.findUnique({
-      where: { userID_circleID: { userID: userId, circleID: circleId } },
-    });
-    if (existing) {
-      if (existing.status === 'ACTIVE') {
-        throw new ConflictException({
-          message: 'Already a member',
-          errorCode: CircleErrorCode.AlreadyMember,
-        });
-      }
-      if (existing.status === 'PENDING') {
-        throw new ConflictException({
-          message: 'Request already pending',
-          errorCode: CircleErrorCode.RequestPending,
-        });
-      }
-    }
-
-    // 统一规则：无论从哪个入口（搜索/名片/浏览）申请加入，一律走担保验证——
-    // PENDING 成员 + 担保单（申请人自任 inviter，0/requiredCount 起步）同事务
-    // 落库，不存在「公开圈秒进」。转正（memberCount +1 / OpenIM 进群）发生在
-    // 担保满额或圈主代批的 finalize 里。isPublic 不再参与入圈判定。
+    // All joins are reviewed. The pair lock is shared with the member-invite
+    // path so a direct join and an invitation cannot create two applications.
+    let invitationId: string | null = null;
     for (let attempt = 1; attempt <= MAX_JOIN_TX_ATTEMPTS; attempt += 1) {
       try {
-        await this.prisma.$transaction(
+        invitationId = await this.prisma.$transaction(
           async (tx) => {
-            if (existing) {
+            const pairKey = `circle-invite:${circleId}:${userId}`;
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+            const existing = await tx.circleMember.findUnique({
+              where: { userID_circleID: { userID: userId, circleID: circleId } },
+            });
+            if (existing?.status === 'ACTIVE') {
+              throw new ConflictException({
+                message: 'Already a member',
+                errorCode: CircleErrorCode.AlreadyMember,
+              });
+            }
+
+            if (existing?.status === 'PENDING') {
               await tx.circleMember.update({
                 where: { id: existing.id },
                 data: { status: 'PENDING', role: 'MEMBER' },
@@ -316,14 +311,17 @@ export class CircleService {
               select: { id: true },
             });
             if (!existingInvitation) {
-              await tx.circleInvitation.create({
+              const created = await tx.circleInvitation.create({
                 data: {
                   circleID: circleId,
                   applicantID: userId,
                   inviterID: userId,
                 },
+                select: { id: true },
               });
+              return created.id;
             }
+            return existingInvitation.id;
           },
           {
             isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
@@ -340,8 +338,8 @@ export class CircleService {
           );
           continue;
         }
-        // A concurrent join wins the race between the pre-check and the
-        // create — surface a clean conflict instead of a leaked P2002.
+        // A concurrent operation should be retried under the pair lock. A
+        // remaining unique violation is surfaced as a structured conflict.
         if (
           error instanceof Prisma.PrismaClientKnownRequestError &&
           error.code === 'P2002'
@@ -354,6 +352,17 @@ export class CircleService {
         throw error;
       }
     }
+
+    if (!invitationId) {
+      throw new ConflictException({
+        message: 'Unable to create a join request',
+        errorCode: CircleErrorCode.RequestPending,
+      });
+    }
+    return this.circleInvitationService.getInvitationForViewer(
+      userId,
+      invitationId,
+    );
   }
 
   async leaveCircle(userId: string, circleId: string): Promise<void> {
@@ -379,6 +388,17 @@ export class CircleService {
 
     await this.prisma.$transaction(async (tx) => {
       const wasActive = membership.status === 'ACTIVE';
+
+      if (!wasActive) {
+        await tx.circleInvitation.updateMany({
+          where: {
+            circleID: circleId,
+            applicantID: userId,
+            status: 'PENDING',
+          },
+          data: { status: 'CANCELLED' },
+        });
+      }
 
       await tx.userDisplayIcon.deleteMany({
         where: { userID: userId, circleID: circleId },
@@ -611,7 +631,6 @@ export class CircleService {
       currentIconUrl: circle.currentIconAsset?.imageUrl ?? null,
       cover: circle.cover ?? null,
       cities: circle.cities,
-      isPublic: circle.isPublic,
       categories: circle.categories,
       rules: circle.rules,
       tags: circle.tags,

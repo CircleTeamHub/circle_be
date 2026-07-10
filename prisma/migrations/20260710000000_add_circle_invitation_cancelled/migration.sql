@@ -1,0 +1,1 @@
+ALTER TYPE "CircleInvitationStatus" ADD VALUE IF NOT EXISTS 'CANCELLED';

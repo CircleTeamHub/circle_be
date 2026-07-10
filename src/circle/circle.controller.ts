@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
+  ApiAcceptedResponse,
   ApiNoContentResponse,
   ApiOkResponse,
   ApiOperation,
@@ -33,6 +34,7 @@ import {
   SetCircleCoverDto,
   SetCircleAvatarDto,
 } from './dto/circle.dto';
+import { InvitationDto } from 'src/circle-invitation/dto/circle-invitation.dto';
 
 @ApiTags('Circle')
 @ApiBearerAuth()
@@ -52,7 +54,7 @@ export class CircleController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List public circles' })
+  @ApiOperation({ summary: 'List circles available to apply for' })
   list(@Query() query: ListCirclesQueryDto): Promise<{
     items: CircleDto[];
     total: number;
@@ -83,13 +85,13 @@ export class CircleController {
   }
 
   @Post(':id/join')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Join a circle' })
-  @ApiNoContentResponse()
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Submit a circle membership application' })
+  @ApiAcceptedResponse({ type: InvitationDto })
   join(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
-  ): Promise<void> {
+  ): Promise<InvitationDto> {
     return this.circleService.joinCircle(req.user.userId, id);
   }
 

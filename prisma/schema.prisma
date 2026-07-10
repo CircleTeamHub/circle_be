@@ -155,6 +155,7 @@ enum CircleInvitationStatus {
   APPROVED
   REJECTED
   ADMIN_APPROVED
+  CANCELLED
 }
 
 enum CircleInvitationVerifierStatus {

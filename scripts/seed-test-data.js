@@ -359,7 +359,6 @@ async function main() {
         description: c.description,
         cities: c.cities,
         categories: c.categories,
-        isPublic: true,
         deleted: false,
       },
       create: {
@@ -369,7 +368,6 @@ async function main() {
         cities: c.cities,
         categories: c.categories,
         ownerID,
-        isPublic: true,
       },
     });
     // Owner is an ACTIVE OWNER member.

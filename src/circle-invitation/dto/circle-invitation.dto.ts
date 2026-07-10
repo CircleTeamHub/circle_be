@@ -48,7 +48,12 @@ export class InvitationDto {
   inviter: InvitationUserDto;
   requiredCount: number;
   approvedCount: number;
-  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'ADMIN_APPROVED';
+  status:
+    | 'PENDING'
+    | 'APPROVED'
+    | 'REJECTED'
+    | 'ADMIN_APPROVED'
+    | 'CANCELLED';
   verifiers: InvitationVerifierDto[];
   createdAt: string;
 }

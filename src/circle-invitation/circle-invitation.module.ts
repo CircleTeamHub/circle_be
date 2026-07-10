@@ -10,5 +10,6 @@ import { CircleInvitationService } from './circle-invitation.service';
   imports: [OpenimModule, RealtimeModule, PrivacySettingsModule, NotificationModule],
   controllers: [CircleInvitationController],
   providers: [CircleInvitationService],
+  exports: [CircleInvitationService],
 })
 export class CircleInvitationModule {}
