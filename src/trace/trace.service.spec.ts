@@ -9,6 +9,7 @@ import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { TraceErrorCode } from 'src/common/app-error-codes';
 import {
   TraceService,
   encodeTraceCursor,
@@ -58,6 +59,9 @@ describe('TraceService', () => {
       findMany: jest.fn(),
     },
     userPrivacySetting: {
+      findMany: jest.fn(),
+    },
+    user: {
       findMany: jest.fn(),
     },
     $transaction: jest.fn(async (input: any) =>
@@ -361,6 +365,107 @@ describe('TraceService', () => {
       service.addComment('actor-1', 'trace-1', { content: '   ' }),
     ).rejects.toThrow(BadRequestException);
     expect(prisma.traceComment.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects missing or inactive mentioned users before creating a comment', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([]);
+
+    const error = await service
+      .addComment('actor-1', 'trace-1', {
+        content: 'hello',
+        mentionedUserIds: ['mention-user-1'],
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect((error as BadRequestException).getResponse()).toEqual(
+      expect.objectContaining({
+        errorCode: TraceErrorCode.MentionNotVisible,
+      }),
+    );
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: {
+        id: { in: ['mention-user-1'] },
+        status: 'ACTIVE',
+      },
+      select: { id: true },
+    });
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects mentioned users blocked by trace visibility before creating a comment', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.canViewMoments.mockResolvedValue(false);
+
+    const error = await service
+      .addComment('actor-1', 'trace-1', {
+        content: 'hello',
+        mentionedUserIds: ['mention-user-1'],
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect((error as BadRequestException).getResponse()).toEqual(
+      expect.objectContaining({
+        errorCode: TraceErrorCode.MentionNotVisible,
+      }),
+    );
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates valid mention recipients and forwards them to notifications', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'mention-user-1' },
+      { id: 'mention-user-2' },
+    ]);
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.canViewMoments.mockResolvedValue(true);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: [
+        'actor-1',
+        'mention-user-1',
+        'mention-user-1',
+        'mention-user-2',
+      ],
+    });
+
+    expect(
+      notificationService.createTraceCommentNotifications,
+    ).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mentionedUserIds: ['mention-user-1', 'mention-user-2'],
+      }),
+    );
   });
 
   it('broadcasts the created notification payload after adding a trace comment', async () => {

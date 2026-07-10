@@ -425,6 +425,7 @@ export class NotificationService {
     traceOwnerId: string;
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
+    mentionedUserIds?: string[];
     content: string;
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
@@ -475,8 +476,32 @@ export class NotificationService {
       );
     }
 
-    // Atomic: either both notifications land or neither does — a partial
-    // failure must not leave one orphaned notification behind.
+    for (const mentionedUserId of params.mentionedUserIds ?? []) {
+      if (
+        !mentionedUserId ||
+        mentionedUserId === params.actorId ||
+        notifiedUserIds.has(mentionedUserId)
+      ) {
+        continue;
+      }
+      notifiedUserIds.add(mentionedUserId);
+      notifications.push(
+        this.prisma.notification.create({
+          data: {
+            toUserID: mentionedUserId,
+            fromUserID: params.actorId,
+            type: NotificationType.TRACE_MENTION,
+            content: params.content,
+            fromTraceID: params.traceId,
+            fromReplyID: params.commentId,
+          },
+          include: NOTIFICATION_REALTIME_INCLUDE,
+        }),
+      );
+    }
+
+    // Atomic: either all notifications land or none does — a partial failure
+    // must not leave an orphaned notification behind.
     const created = await this.prisma.$transaction(notifications);
     const mapped = created
       .map((notification) => ({

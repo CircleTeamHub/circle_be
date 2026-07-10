@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
+  ArrayUnique,
   IsArray,
   IsEnum,
   IsISO8601,
@@ -59,6 +60,14 @@ export class CreateTraceCommentDto {
   @IsUUID()
   @IsOptional()
   replyToId?: string;
+
+  @ApiPropertyOptional({ type: [String], maxItems: 20, uniqueItems: true })
+  @IsArray()
+  @ArrayMaxSize(20)
+  @ArrayUnique()
+  @IsUUID(undefined, { each: true })
+  @IsOptional()
+  mentionedUserIds?: string[];
 }
 
 export class TraceFeedQueryDto {

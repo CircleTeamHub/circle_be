@@ -21,6 +21,9 @@ describe('NotificationService', () => {
       upsert: jest.fn(),
       deleteMany: jest.fn(),
     },
+    $transaction: jest.fn(async (operations: unknown[]) =>
+      Promise.all(operations),
+    ),
   };
 
   const realtimeService = {
@@ -40,6 +43,7 @@ describe('NotificationService', () => {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
+    prisma.$transaction.mockClear();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -227,6 +231,80 @@ describe('NotificationService', () => {
       expect(bellTypes).not.toContain('FRIEND_REQUEST_RECEIVED');
       expect(bellTypes).not.toContain('FRIEND_REQUEST_ACCEPTED');
       expect(bellTypes).not.toContain('FRIEND_REQUEST_REJECTED');
+    });
+
+    it('includes trace mentions in the discover notification channel', () => {
+      expect(DISCOVER_NOTIFICATION_TYPES as readonly string[]).toContain(
+        'TRACE_MENTION',
+      );
+    });
+
+    it('creates one precedence-ordered notification per comment target', async () => {
+      prisma.notification.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({
+          id: `notification-${data.toUserID}`,
+          ...data,
+          content: data.content ?? '',
+          read: false,
+          createdAt: new Date('2026-07-10T00:00:00Z'),
+          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+          fromTrace: { id: 'trace-1', content: 'trace', images: [] },
+          fromReply: { id: 'comment-1', content: 'hello' },
+          fromCircle: null,
+          fromCirclePost: null,
+          fromInvitation: null,
+        }),
+      );
+
+      const result = await service.createTraceCommentNotifications({
+        actorId: 'actor-1',
+        traceId: 'trace-1',
+        commentId: 'comment-1',
+        traceOwnerId: 'author-1',
+        replyToCommentId: 'parent-comment-1',
+        replyToUserId: 'reply-user-1',
+        mentionedUserIds: [
+          'actor-1',
+          'author-1',
+          'reply-user-1',
+          'mention-user-1',
+          'mention-user-2',
+        ],
+        content: 'hello',
+      });
+
+      expect(
+        prisma.notification.create.mock.calls.map(([arg]) => arg.data),
+      ).toEqual([
+        expect.objectContaining({
+          toUserID: 'author-1',
+          type: 'TRACE_COMMENT',
+        }),
+        expect.objectContaining({
+          toUserID: 'reply-user-1',
+          type: 'COMMENT_REPLY',
+          toReplyID: 'parent-comment-1',
+        }),
+        expect.objectContaining({
+          toUserID: 'mention-user-1',
+          type: 'TRACE_MENTION',
+          fromTraceID: 'trace-1',
+          fromReplyID: 'comment-1',
+        }),
+        expect.objectContaining({
+          toUserID: 'mention-user-2',
+          type: 'TRACE_MENTION',
+          fromTraceID: 'trace-1',
+          fromReplyID: 'comment-1',
+        }),
+      ]);
+      expect(result.map(({ targetUserId }) => targetUserId)).toEqual([
+        'author-1',
+        'reply-user-1',
+        'mention-user-1',
+        'mention-user-2',
+      ]);
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
     it('getProfileNotifications returns only profile-domain system rows', async () => {

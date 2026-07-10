@@ -451,6 +451,12 @@ export class TraceService {
       }
     }
 
+    const mentionedUserIds = await this.requireVisibleMentionRecipients(
+      traceId,
+      userId,
+      dto.mentionedUserIds ?? [],
+    );
+
     const comment = await this.prisma.$transaction(async (tx) => {
       const created = await tx.traceComment.create({
         data: {
@@ -486,6 +492,7 @@ export class TraceService {
           traceOwnerId: trace.fromID,
           replyToCommentId: comment.replyTo?.id ?? null,
           replyToUserId: comment.replyTo?.user.id ?? null,
+          mentionedUserIds,
           content: comment.content,
         });
 
@@ -563,6 +570,55 @@ export class TraceService {
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private async requireVisibleMentionRecipients(
+    traceId: string,
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<string[]> {
+    const distinctRecipientIds = [...new Set(recipientIds)].filter(
+      (recipientId) => recipientId !== actorId,
+    );
+    if (distinctRecipientIds.length === 0) {
+      return [];
+    }
+
+    const activeRecipients = await this.prisma.user.findMany({
+      where: {
+        id: { in: distinctRecipientIds },
+        status: 'ACTIVE',
+      },
+      select: { id: true },
+    });
+    const activeRecipientIds = new Set(
+      activeRecipients.map((recipient) => recipient.id),
+    );
+    if (
+      distinctRecipientIds.some(
+        (recipientId) => !activeRecipientIds.has(recipientId),
+      )
+    ) {
+      throw new BadRequestException({
+        message: 'Mentioned user cannot view this moment',
+        errorCode: TraceErrorCode.MentionNotVisible,
+      });
+    }
+
+    try {
+      await Promise.all(
+        distinctRecipientIds.map((recipientId) =>
+          this.requireVisibleTrace(traceId, recipientId),
+        ),
+      );
+    } catch {
+      throw new BadRequestException({
+        message: 'Mentioned user cannot view this moment',
+        errorCode: TraceErrorCode.MentionNotVisible,
+      });
+    }
+
+    return distinctRecipientIds;
+  }
 
   private async getAcceptedFriendIds(userId: string): Promise<string[]> {
     const records = await this.prisma.friend.findMany({

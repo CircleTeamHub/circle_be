@@ -14,6 +14,7 @@ export const DISCOVER_NOTIFICATION_TYPES = [
   NotificationType.TRACE_LIKE,
   NotificationType.TRACE_COMMENT,
   NotificationType.COMMENT_REPLY,
+  NotificationType.TRACE_MENTION,
   NotificationType.CIRCLE_VERIFICATION_REQUESTED,
   NotificationType.CIRCLE_INVITATION_APPROVED,
   NotificationType.CIRCLE_INVITATION_REJECTED,
