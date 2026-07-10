@@ -24,6 +24,14 @@ describe('FriendReportAdminService', () => {
   const notificationService = {
     createSystemNotification: jest.fn(),
   };
+  const realtimeService = {
+    safeBroadcastAll: jest.fn(async (fns: Array<() => unknown>) =>
+      Promise.allSettled(fns.map(async (fn) => fn())),
+    ),
+    broadcastSystemNotificationCreated: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+    broadcastSystemNotificationUnread: jest.fn(),
+  };
   let service: FriendReportAdminService;
 
   const mkUser = (id: string) => ({
@@ -43,6 +51,7 @@ describe('FriendReportAdminService', () => {
       prisma as unknown as PrismaService,
       creditService as unknown as CreditService,
       notificationService as unknown as NotificationService,
+      realtimeService as unknown as never,
     );
   });
 
@@ -159,6 +168,55 @@ describe('FriendReportAdminService', () => {
       expect.any(String),
     );
     expect(result.status).toBe('APPROVED');
+  });
+
+  it('broadcasts realtime system-notification events to every review recipient', async () => {
+    notificationService.createSystemNotification.mockResolvedValue({
+      id: 'n1',
+    } as never);
+    prisma.friendReport.findUnique
+      .mockResolvedValueOnce({
+        id: 'report-1',
+        status: 'PENDING',
+        reporterID: 'user-1',
+        targetID: 'user-2',
+        category: 'harassment',
+      })
+      .mockResolvedValueOnce({
+        id: 'report-1',
+        category: 'harassment',
+        description: 'abuse',
+        evidence: [],
+        status: 'APPROVED',
+        createdAt: new Date('2026-07-01T00:00:00Z'),
+        reviewedAt: new Date('2026-07-02T00:00:00Z'),
+        reviewNote: 'valid',
+        reporter: mkUser('user-1'),
+        target: mkUser('user-2'),
+        reviewedBy: mkUser('admin-1'),
+      });
+    tx.friendReport.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.reviewReport('admin-1', 'report-1', { decision: 'APPROVE' });
+
+    // 「我的」tab 红点即时刷新：举报人 + 被处罚者各广播一次。
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-2');
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'user-1',
+      { id: 'n1' },
+    );
+    expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'user-2',
+      { id: 'n1' },
+    );
+    expect(
+      realtimeService.broadcastSystemNotificationCreated,
+    ).toHaveBeenCalledTimes(2);
   });
 
   it('rejects a pending report without deducting credit', async () => {
