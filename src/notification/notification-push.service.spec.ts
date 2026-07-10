@@ -94,6 +94,7 @@ describe('NotificationPushService', () => {
         data: expect.objectContaining({
           notificationId: 'n1',
           type: 'TRACE_COMMENT',
+          toUserId: 'user-1',
           fromUserId: 'u2',
           fromUserNickname: 'Aki',
           traceId: 'trace-1',
@@ -101,6 +102,7 @@ describe('NotificationPushService', () => {
         }),
       }),
     );
+    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
   });
 
   it('includes canonical actor fields for profile-like pushes', async () => {
@@ -126,11 +128,35 @@ describe('NotificationPushService', () => {
         body: '赞了你的资料',
         data: expect.objectContaining({
           type: 'PROFILE_LIKE',
+          toUserId: 'user-1',
           fromUserId: 'actor-1',
           fromUserNickname: 'Aki',
         }),
       }),
     );
+    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
+  });
+
+  it('includes the canonical recipient for system pushes without inventing an actor', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('system-recipient-1', baseNotification());
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body[0].data).toEqual(
+      expect.objectContaining({
+        type: 'SYSTEM',
+        route: 'system',
+        toUserId: 'system-recipient-1',
+      }),
+    );
+    expect(body[0].data).not.toHaveProperty('fromUserId');
   });
 
   it('keeps the canonical actor nickname field when the stored nickname is empty', async () => {

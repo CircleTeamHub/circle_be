@@ -48,7 +48,7 @@ export class NotificationPushService {
     });
     if (tokens.length === 0) return;
 
-    const message = this.buildMessage(notification);
+    const message = this.buildMessage(userId, notification);
     for (let i = 0; i < tokens.length; i += EXPO_BATCH_SIZE) {
       const batch = tokens.slice(i, i + EXPO_BATCH_SIZE);
       await this.sendBatch(
@@ -79,7 +79,7 @@ export class NotificationPushService {
     });
   }
 
-  private buildMessage(notification: NotificationRealtimeDto) {
+  private buildMessage(userId: string, notification: NotificationRealtimeDto) {
     const actor = notification.fromUser?.nickname || 'CircleIM';
     const body =
       notification.type === 'TRACE_MENTION'
@@ -97,6 +97,7 @@ export class NotificationPushService {
       data: {
         notificationId: notification.id,
         type: notification.type,
+        toUserId: userId,
         ...(notification.fromUser
           ? {
               fromUserId: notification.fromUser.id,
