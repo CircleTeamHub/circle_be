@@ -394,6 +394,17 @@ export class NotificationService {
     return rows.map(mapNotificationRealtimeDto);
   }
 
+  async getNotificationOpenOwnership(
+    userId: string,
+    id: string,
+  ): Promise<{ owned: boolean }> {
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, toUserID: userId, deleted: false },
+      select: { id: true },
+    });
+    return { owned: notification !== null };
+  }
+
   async markNotificationRead(userId: string, id: string): Promise<void> {
     const notification = await this.prisma.notification.findFirst({
       where: { id, toUserID: userId, deleted: false },

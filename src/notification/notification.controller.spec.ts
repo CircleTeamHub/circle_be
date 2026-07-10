@@ -54,4 +54,23 @@ describe('NotificationController', () => {
       3,
     );
   });
+
+  it('checks notification ownership using the authenticated user and route id', async () => {
+    const notificationService = {
+      getNotificationOpenOwnership: jest
+        .fn()
+        .mockResolvedValue({ owned: true }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await expect(
+      controller.openOwnership('00000000-0000-4000-8000-000000000001', {
+        user: { userId: 'user-1' },
+      } as any),
+    ).resolves.toEqual({ owned: true });
+
+    expect(
+      notificationService.getNotificationOpenOwnership,
+    ).toHaveBeenCalledWith('user-1', '00000000-0000-4000-8000-000000000001');
+  });
 });

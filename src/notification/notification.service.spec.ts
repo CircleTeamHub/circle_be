@@ -106,6 +106,40 @@ describe('NotificationService', () => {
     ).not.toHaveBeenCalled();
   });
 
+  describe('notification open ownership', () => {
+    it('returns owned for a current-user notification even when already read', async () => {
+      prisma.notification.findFirst.mockResolvedValue({ id: 'notification-1' });
+
+      await expect(
+        service.getNotificationOpenOwnership('user-1', 'notification-1'),
+      ).resolves.toEqual({ owned: true });
+
+      expect(prisma.notification.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'notification-1',
+          toUserID: 'user-1',
+          deleted: false,
+        },
+        select: { id: true },
+      });
+      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'notification owned by another user',
+      'missing notification',
+      'deleted notification',
+    ])('returns the same not-owned envelope for a %s', async () => {
+      prisma.notification.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.getNotificationOpenOwnership('user-1', 'notification-1'),
+      ).resolves.toEqual({ owned: false });
+
+      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
   describe('push tokens', () => {
     it('upserts the current user device push token', async () => {
       prisma.devicePushToken.upsert.mockResolvedValue({
