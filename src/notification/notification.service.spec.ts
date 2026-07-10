@@ -137,8 +137,48 @@ describe('NotificationService', () => {
           projectId: 'project-1',
           appVersion: '1.0.0',
           disabledAt: null,
+          revocationSecretHash: null,
         },
       });
+    });
+
+    it('clears a stale revocation hash when the same owner registers without a secret', async () => {
+      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
+
+      await service.registerPushToken('user-1', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+      });
+
+      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            userID: 'user-1',
+            revocationSecretHash: null,
+          }),
+        }),
+      );
+    });
+
+    it('clears a stale revocation hash atomically when token ownership transfers without a secret', async () => {
+      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
+
+      await service.registerPushToken('different-user', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'android',
+        provider: 'expo',
+      });
+
+      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { token: 'ExponentPushToken[abc]' },
+          update: expect.objectContaining({
+            userID: 'different-user',
+            revocationSecretHash: null,
+          }),
+        }),
+      );
     });
 
     it('deletes only the current user device push token', async () => {

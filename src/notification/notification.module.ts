@@ -1,4 +1,5 @@
 import { Global, Module } from '@nestjs/common';
+import { RedisModule } from 'src/redis/redis.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationController } from './notification.controller';
 import { NotificationPublicController } from './notification-public.controller';
@@ -7,7 +8,7 @@ import { NotificationService } from './notification.service';
 
 @Global()
 @Module({
-  imports: [RealtimeModule],
+  imports: [RealtimeModule, RedisModule],
   controllers: [NotificationPublicController, NotificationController],
   providers: [NotificationService, NotificationPushService],
   exports: [NotificationService, NotificationPushService],

@@ -96,7 +96,10 @@ export class NotificationService {
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
         disabledAt: null,
-        ...(revocationSecretHash ? { revocationSecretHash } : {}),
+        // An omitted secret must revoke any prior capability in the same atomic
+        // upsert. Otherwise a stale secret could survive token ownership
+        // transfer and delete the new owner's registration.
+        revocationSecretHash: revocationSecretHash ?? null,
       },
     });
   }
