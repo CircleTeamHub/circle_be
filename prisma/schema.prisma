@@ -1081,6 +1081,7 @@ model Circle {
   currentIconAsset  IconAsset?         @relation("currentCircleIcon", fields: [currentIconAssetID], references: [id], onDelete: SetNull)
   iconAssets        IconAsset[]        @relation("circleIconAssets")
   posts             CirclePost[]
+  postLinks         CirclePostCircle[]
   members           CircleMember[]
   invitations       CircleInvitation[]
   notifications     Notification[]
@@ -1111,7 +1112,9 @@ model CirclePost {
   content                   String           @default("")
   images                    String[]         @default([])
   tags                      String[]         @default([])
+  // `city` 保留为「主城市」(= cities[0]) 兼容旧数据/旧客户端；`cities` 是多选来源。
   city                      String?
+  cities                    String[]         @default([])
   isHorn                    Boolean          @default(false)
   noteID                    String?
   vipRestriction            Int?
@@ -1132,7 +1135,10 @@ model CirclePost {
   updatedAt                 DateTime         @updatedAt
 
   author                    User                       @relation(fields: [authorID], references: [id], onDelete: Cascade)
+  // `circle`/`circleID` 保留为「主圈子」(= circleIds[0])，兼容旧查询/计数；
+  // `circleLinks` 是多选真源（含主圈子），feed 可见性/筛选走它。
   circle                    Circle                     @relation(fields: [circleID], references: [id], onDelete: Cascade)
+  circleLinks               CirclePostCircle[]
   signups                   CirclePostSignup[]
   collaborationRecognitions CollaborationRecognition[]
   notifications             Notification[]
@@ -1146,6 +1152,21 @@ model CirclePost {
   // stays efficient as ENDED/DELETED posts accumulate. Verified ~135x faster
   // than the heapsort baseline on a 40k-post / 50-circle EXPLAIN ANALYZE.
   @@index([status, createdAt(sort: Desc), id(sort: Desc)])
+}
+
+// 一条动态 ↔ 多个圈子的关联表（含主圈子）。一条动态可同时出现在多个圈子的广场。
+model CirclePostCircle {
+  id        String   @id @default(uuid())
+  postID    String
+  circleID  String
+  createdAt DateTime @default(now())
+
+  post   CirclePost @relation(fields: [postID], references: [id], onDelete: Cascade)
+  circle Circle     @relation(fields: [circleID], references: [id], onDelete: Cascade)
+
+  @@unique([postID, circleID])
+  // 按圈子拉取广场 feed 的主查询路径（circleID → 该圈子的所有动态）。
+  @@index([circleID, postID])
 }
 
 model CirclePostSignup {

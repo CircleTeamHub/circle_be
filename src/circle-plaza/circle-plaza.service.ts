@@ -29,8 +29,14 @@ import {
 } from './dto/circle-plaza.dto';
 
 // A plaza post joined with the relations every DTO mapping needs.
+// `circleLinks` carries the full set of circles the post is shared to (M2M);
+// `circle` remains the primary circle for backward compatibility.
 type PlazaPostWithRelations = Prisma.CirclePostGetPayload<{
-  include: { author: true; circle: true };
+  include: {
+    author: true;
+    circle: true;
+    circleLinks: { include: { circle: true } };
+  };
 }>;
 
 // The viewer fields that gate post interaction / signup eligibility.
@@ -83,6 +89,56 @@ export class CirclePlazaService {
       .slice(0, CirclePlazaService.MAX_FILTER_ITEMS);
   }
 
+  // 建帖城市多选归一化：优先用 cities，回落到旧的单个 city；去空白 + 去重 + 限量。
+  private normalizePostCities(
+    cities: string[] | undefined,
+    legacyCity: string | undefined,
+  ): string[] {
+    const source = cities?.length ? cities : legacyCity ? [legacyCity] : [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of source) {
+      const value = raw?.trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      out.push(value);
+      if (out.length >= CirclePlazaService.MAX_FILTER_ITEMS) break;
+    }
+    return out;
+  }
+
+  // 圈子成员可见范围：圈子未删除 且 viewer 是该圈 ACTIVE 成员。
+  // getFeed 与 getPost 共用，保证「列表能看到」与「详情能打开」的可见性一致。
+  private memberCircleScope(viewerId: string): Prisma.CircleWhereInput {
+    return {
+      deleted: false,
+      members: { some: { userID: viewerId, status: 'ACTIVE' } },
+    };
+  }
+
+  // 建帖圈子多选归一化：优先用 circleIds，回落到旧的单个 circleId；去空白 + 去重 + 限量。
+  // 保持顺序（circleIds[0] = 主圈子）。
+  private normalizeCircleIds(
+    circleIds: string[] | undefined,
+    legacyCircleId: string | undefined,
+  ): string[] {
+    const source = circleIds?.length
+      ? circleIds
+      : legacyCircleId
+        ? [legacyCircleId]
+        : [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const raw of source) {
+      const value = raw?.trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      out.push(value);
+      if (out.length >= CirclePlazaService.MAX_FILTER_ITEMS) break;
+    }
+    return out;
+  }
+
   /**
    * Rejects post images not served from this application's own storage.
    * A plaza post is shown to every feed viewer, so off-origin image URLs are
@@ -104,36 +160,47 @@ export class CirclePlazaService {
     userId: string,
     dto: CreatePlazaPostDto,
   ): Promise<PlazaPostDto> {
-    // Verify circle exists and user is a member
-    const membership = await this.prisma.circleMember.findUnique({
-      where: {
-        userID_circleID: { userID: userId, circleID: dto.circleId },
-      },
-      include: { circle: true },
-    });
-
-    if (!membership || membership.status !== 'ACTIVE') {
-      throw new ForbiddenException({
-        message: 'You must be an active member of the circle to post',
+    // 圈子多选：优先 dto.circleIds（去重），回落到旧的单个 dto.circleId。
+    // 主圈子 = circleIds[0]。至少要有一个圈子。
+    const circleIds = this.normalizeCircleIds(dto.circleIds, dto.circleId);
+    if (circleIds.length === 0) {
+      throw new BadRequestException({
+        message: 'At least one circle is required',
         errorCode: PlazaErrorCode.NotActiveMember,
       });
     }
-    if (membership.circle.deleted) {
-      throw new NotFoundException({
-        message: 'Circle not found',
-        errorCode: CircleErrorCode.NotFound,
-      });
+    const primaryCircleId = circleIds[0];
+
+    // 校验每一个目标圈子：用户都必须是 ACTIVE 成员、圈子未删除、且有发帖权限。
+    const memberships = await this.prisma.circleMember.findMany({
+      where: { userID: userId, circleID: { in: circleIds } },
+      include: { circle: true },
+    });
+    const membershipByCircle = new Map(memberships.map((m) => [m.circleID, m]));
+    for (const circleId of circleIds) {
+      const membership = membershipByCircle.get(circleId);
+      if (!membership || membership.status !== 'ACTIVE') {
+        throw new ForbiddenException({
+          message: 'You must be an active member of the circle to post',
+          errorCode: PlazaErrorCode.NotActiveMember,
+        });
+      }
+      if (membership.circle.deleted) {
+        throw new NotFoundException({
+          message: 'Circle not found',
+          errorCode: CircleErrorCode.NotFound,
+        });
+      }
+      // Members may be blocked from posting (owners/admins always can).
+      if (!membership.circle.memberCanPost && membership.role === 'MEMBER') {
+        throw new ForbiddenException({
+          message: '该圈子仅管理员可以发帖',
+          errorCode: PlazaErrorCode.AdminOnlyPost,
+        });
+      }
     }
 
     this.assertImagesAreSafe(dto.images);
-
-    // Check if members are allowed to post (owners/admins always can)
-    if (!membership.circle.memberCanPost && membership.role === 'MEMBER') {
-      throw new ForbiddenException({
-        message: '该圈子仅管理员可以发帖',
-        errorCode: PlazaErrorCode.AdminOnlyPost,
-      });
-    }
 
     if (dto.noteId) {
       const note = await this.prisma.note.findFirst({
@@ -158,13 +225,19 @@ export class CirclePlazaService {
       dto.expiresInHours ?? DEFAULT_CIRCLE_POST_EXPIRY_HOURS;
     const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
 
+    // 城市多选：优先用 dto.cities（去空白/去重），回落到旧的单个 dto.city。
+    // 主城市 city = cities[0]，兼容旧字段/旧客户端。
+    const cities = this.normalizePostCities(dto.cities, dto.city);
+    const primaryCity = cities[0] ?? null;
+
     const post = await this.prisma.$transaction(async (tx) => {
       const created = await tx.circlePost.create({
         data: {
           content: dto.content,
           images: dto.images ?? [],
           tags: dto.tags ?? [],
-          city: dto.city ?? null,
+          city: primaryCity,
+          cities,
           isHorn: dto.isHorn ?? false,
           noteID: dto.noteId ?? null,
           vipRestriction: dto.vipRestriction ?? null,
@@ -175,16 +248,24 @@ export class CirclePlazaService {
           signupFancyRestriction: dto.signupFancyRestriction ?? false,
           authorID: userId,
           expiresAt,
-          circleID: dto.circleId,
+          circleID: primaryCircleId,
+          // 关联表：主圈子 + 其余圈子都建一条 link。
+          circleLinks: {
+            create: circleIds.map((circleId) => ({
+              circle: { connect: { id: circleId } },
+            })),
+          },
         },
         include: {
           author: true,
           circle: true,
+          circleLinks: { include: { circle: true } },
         },
       });
 
-      await tx.circle.update({
-        where: { id: dto.circleId },
+      // 每个圈子的 postCount 都 +1。
+      await tx.circle.updateMany({
+        where: { id: { in: circleIds } },
         data: { postCount: { increment: 1 } },
       });
 
@@ -226,27 +307,31 @@ export class CirclePlazaService {
     const useKeyset = cursor !== null;
     const skip = useKeyset ? 0 : (page - 1) * limit;
 
-    const whereBase: Prisma.CirclePostWhereInput = {
-      ...this.activeUnexpiredPostWhere(),
-      circle: {
-        deleted: false,
-        members: {
-          some: { userID: viewerId, status: 'ACTIVE' },
-        },
-      },
-    };
     const circleIds = this.parseCommaList(query.circleIds);
     const cities = this.parseCommaList(query.cities);
 
+    // 可见性 + 圈子筛选合并进同一个 link 条件：一条动态只有当它 link 到
+    // 「viewer 是成员的那个圈子」时，才在该圈 feed 出现——杜绝跨圈泄露
+    //（帖子同时 link 到 A、B，viewer 仅是 A 成员时，按 B 筛选不会命中）。
+    const linkFilter: Prisma.CirclePostCircleWhereInput = {
+      circle: this.memberCircleScope(viewerId),
+    };
     if (query.circleId) {
-      whereBase.circleID = query.circleId;
+      linkFilter.circleID = query.circleId;
     } else if (circleIds.length > 0) {
-      whereBase.circleID = { in: circleIds };
+      linkFilter.circleID = { in: circleIds };
     }
+
+    const whereBase: Prisma.CirclePostWhereInput = {
+      ...this.activeUnexpiredPostWhere(),
+      circleLinks: { some: linkFilter },
+    };
+    // 城市筛选走 cities[] 数组谓词（旧数据已回填 cities，故仍能命中）：
+    // 单城市 = 数组包含该城市；多城市 = 数组与筛选集有交集。
     if (query.city) {
-      whereBase.city = query.city;
+      whereBase.cities = { has: query.city };
     } else if (cities.length > 0) {
-      whereBase.city = { in: cities };
+      whereBase.cities = { hasSome: cities };
     }
     const where: Prisma.CirclePostWhereInput = cursor
       ? { AND: [whereBase, feedCursorWhere(cursor)] }
@@ -260,6 +345,7 @@ export class CirclePlazaService {
         include: {
           author: true,
           circle: true,
+          circleLinks: { include: { circle: true } },
         },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
@@ -322,9 +408,15 @@ export class CirclePlazaService {
         where: {
           ...this.activeUnexpiredPostWhere(),
           id: postId,
-          circle: { deleted: false },
+          // 与 feed 同一套可见性：viewer 必须是该动态所属任一圈子的 ACTIVE 成员，
+          // 否则 findFirst 不命中 → 抛 404，避免凭 id 直读到非本圈私密动态。
+          circleLinks: { some: { circle: this.memberCircleScope(viewerId) } },
         },
-        include: { author: true, circle: true },
+        include: {
+          author: true,
+          circle: true,
+          circleLinks: { include: { circle: true } },
+        },
       }),
       this.prisma.user.findUnique({
         where: { id: viewerId },
@@ -373,14 +465,26 @@ export class CirclePlazaService {
       });
     }
 
+    // 该动态关联的所有圈子（含主圈子）都要 postCount -1。
+    const links = await this.prisma.circlePostCircle.findMany({
+      where: { postID: postId },
+      select: { circleID: true },
+    });
+    const linkedCircleIds = links.length
+      ? [...new Set(links.map((l) => l.circleID))]
+      : [post.circleID];
+
     await this.prisma.$transaction(async (tx) => {
-      await tx.circlePost.update({
-        where: { id: postId },
+      // 原子认领：只把 ACTIVE→DELETED 的那一次算作真删除，才递减 postCount。
+      // 并发/重试的第二次 count=0 → 跳过递减，避免每个圈子被多扣（甚至扣成负数）。
+      const claimed = await tx.circlePost.updateMany({
+        where: { id: postId, status: 'ACTIVE' },
         data: { status: 'DELETED' },
       });
+      if (claimed.count !== 1) return;
 
-      await tx.circle.update({
-        where: { id: post.circleID },
+      await tx.circle.updateMany({
+        where: { id: { in: linkedCircleIds } },
         data: { postCount: { decrement: 1 } },
       });
     });
@@ -850,7 +954,12 @@ export class CirclePlazaService {
           authorID: authorId,
           status: { in: ['ACTIVE', 'ENDED'] },
         },
-        select: { id: true, authorID: true, circleID: true },
+        select: {
+          id: true,
+          authorID: true,
+          circleID: true,
+          circleLinks: { select: { circleID: true } },
+        },
       });
       if (!post) {
         throw new NotFoundException({
@@ -858,6 +967,10 @@ export class CirclePlazaService {
           errorCode: PlazaErrorCode.PostNotFound,
         });
       }
+      // 认定资格：报名者仍是该动态「所属任一圈子」的 ACTIVE 成员即可（M2M）。
+      const postCircleIds = post.circleLinks?.length
+        ? [...new Set(post.circleLinks.map((l) => l.circleID))]
+        : [post.circleID];
 
       // A recipient is eligible only if they signed up for the post AND are
       // still an ACTIVE member of the post's circle. Someone who signed up and
@@ -882,7 +995,7 @@ export class CirclePlazaService {
 
       const activeMembers = await tx.circleMember.findMany({
         where: {
-          circleID: post.circleID,
+          circleID: { in: postCircleIds },
           status: 'ACTIVE',
           userID: { in: uniqueRecipientIds },
         },
@@ -1123,6 +1236,7 @@ export class CirclePlazaService {
       images: post.images,
       tags: post.tags,
       city: post.city,
+      cities: post.cities ?? (post.city ? [post.city] : []),
       isHorn: post.isHorn,
       noteId: post.noteID,
       restrictions: {
@@ -1151,6 +1265,13 @@ export class CirclePlazaService {
         id: post.circle.id,
         name: post.circle.name,
       },
+      // 多圈：优先用关联表；缺 circleLinks（旧 include/mock）时回落到主圈子。
+      circles: post.circleLinks?.length
+        ? post.circleLinks.map((link) => ({
+            id: link.circle.id,
+            name: link.circle.name,
+          }))
+        : [{ id: post.circle.id, name: post.circle.name }],
       canInteract,
       createdAt: post.createdAt.toISOString(),
       expiresAt: this.formatPostExpiresAt(post),
