@@ -167,6 +167,8 @@ export class FriendProfileDto {
   @ApiPropertyOptional() lastOnline: Date | null;
   /** When this friendship was accepted */
   @ApiProperty() friendsSince: Date;
+  /** The viewer's private remark (备注) for this friend, if set. */
+  @ApiPropertyOptional() remark: string | null;
 }
 
 export class FriendTagDto {

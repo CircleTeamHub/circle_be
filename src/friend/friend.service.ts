@@ -746,7 +746,9 @@ export class FriendService {
         const fid = r.userID === userId ? r.friendID : r.userID;
         const u = userMap.get(fid);
         if (!u) return null;
-        return { ...u, friendsSince: r.updatedAt } as FriendProfileDto;
+        // 当前用户视角的备注：作为 userID 一侧读 remarkA，作为 friendID 一侧读 remarkB。
+        const remark = r.userID === userId ? r.remarkA : r.remarkB;
+        return { ...u, friendsSince: r.updatedAt, remark } as FriendProfileDto;
       })
       .filter((x): x is FriendProfileDto => x !== null);
   }
@@ -1299,7 +1301,8 @@ export class FriendService {
         const fid = f.userID === userId ? f.friendID : f.userID;
         const u = userMap.get(fid);
         if (!u) return null;
-        return { ...u, friendsSince: f.updatedAt } as FriendProfileDto;
+        const remark = f.userID === userId ? f.remarkA : f.remarkB;
+        return { ...u, friendsSince: f.updatedAt, remark } as FriendProfileDto;
       })
       .filter((x): x is FriendProfileDto => x !== null);
   }
