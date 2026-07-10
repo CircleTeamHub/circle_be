@@ -26,7 +26,7 @@ describe('NotificationPublicController', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service.revokePushToken.mockResolvedValue(undefined);
+    service.revokePushToken.mockResolvedValue(false);
     redisService.isEnabled.mockReturnValue(true);
     redisService.incrementWithTtl.mockResolvedValue(1);
   });
@@ -55,7 +55,7 @@ describe('NotificationPublicController', () => {
     expect(guards).not.toContain(JwtGuard);
   });
 
-  it('uses Redis with a hashed per-token key before revoking', async () => {
+  it('uses Redis with a hashed per-token key after a no-op revocation', async () => {
     const tokenHash = createHash('sha256').update(dto.token).digest('hex');
 
     await expect(controller().revokePushToken(dto)).resolves.toBeUndefined();
@@ -68,15 +68,18 @@ describe('NotificationPublicController', () => {
       dto.token,
     );
     expect(service.revokePushToken).toHaveBeenCalledWith(dto);
+    expect(service.revokePushToken.mock.invocationCallOrder[0]).toBeLessThan(
+      redisService.incrementWithTtl.mock.invocationCallOrder[0],
+    );
   });
 
-  it('rejects Redis count 11 before calling the revocation service', async () => {
+  it('rejects Redis count 11 only after the revocation attempt is a no-op', async () => {
     redisService.incrementWithTtl.mockResolvedValue(11);
 
     await expect(controller().revokePushToken(dto)).rejects.toMatchObject({
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
-    expect(service.revokePushToken).not.toHaveBeenCalled();
+    expect(service.revokePushToken).toHaveBeenCalledWith(dto);
   });
 
   it('falls back in memory and rejects the controller-level 11th request when Redis errors', async () => {
@@ -89,7 +92,7 @@ describe('NotificationPublicController', () => {
     await expect(instance.revokePushToken(dto)).rejects.toMatchObject({
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
-    expect(service.revokePushToken).toHaveBeenCalledTimes(10);
+    expect(service.revokePushToken).toHaveBeenCalledTimes(11);
   });
 
   it('keeps different token buckets independent in the local fallback', async () => {
@@ -108,6 +111,62 @@ describe('NotificationPublicController', () => {
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
     expect(redisService.incrementWithTtl).not.toHaveBeenCalled();
+  });
+
+  it('never blocks a valid revocation after ten failed attempts, then rejects the next failure', async () => {
+    redisService.isEnabled.mockReturnValue(false);
+    service.revokePushToken
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const instance = controller();
+
+    for (let index = 0; index < 10; index += 1) {
+      await expect(
+        instance.revokePushToken({
+          ...dto,
+          revocationSecret: `wrong-secret-${String(index).padStart(20, '0')}`,
+        }),
+      ).resolves.toBeUndefined();
+    }
+
+    await expect(instance.revokePushToken(dto)).resolves.toBeUndefined();
+    await expect(
+      instance.revokePushToken({
+        ...dto,
+        revocationSecret: 'another-wrong-secret-that-is-long',
+      }),
+    ).rejects.toMatchObject({ status: HttpStatus.TOO_MANY_REQUESTS });
+    expect(service.revokePushToken).toHaveBeenCalledTimes(12);
+  });
+
+  it('keeps missing-token and wrong-secret no-op responses indistinguishable', async () => {
+    redisService.isEnabled.mockReturnValue(false);
+    const instance = controller();
+    const wrongSecret = {
+      ...dto,
+      revocationSecret: 'wrong-secret-that-is-long-enough',
+    };
+    const missingToken = {
+      ...dto,
+      token: 'ExponentPushToken[missing]',
+    };
+
+    await expect(
+      instance.revokePushToken(wrongSecret),
+    ).resolves.toBeUndefined();
+    await expect(
+      instance.revokePushToken(missingToken),
+    ).resolves.toBeUndefined();
   });
 
   it('is wired alongside the authenticated controller in NotificationModule', () => {

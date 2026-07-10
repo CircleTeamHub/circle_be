@@ -35,9 +35,11 @@ export class NotificationPublicController {
 
   @Delete('push-token/revoke')
   @ApiOperation({ summary: 'Revoke a device push token with its secret' })
-  async revokePushToken(@Body() dto: RevokePushTokenDto) {
-    await this.checkTokenRevokeLimit(dto.token);
-    return this.notificationService.revokePushToken(dto);
+  async revokePushToken(@Body() dto: RevokePushTokenDto): Promise<void> {
+    const revoked = await this.notificationService.revokePushToken(dto);
+    if (!revoked) {
+      await this.checkTokenRevokeLimit(dto.token);
+    }
   }
 
   private async checkTokenRevokeLimit(token: string): Promise<void> {

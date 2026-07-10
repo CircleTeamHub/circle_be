@@ -226,10 +226,12 @@ describe('NotificationService', () => {
         .digest('hex');
       prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 1 });
 
-      await service.revokePushToken({
-        token: 'ExponentPushToken[abc]',
-        revocationSecret,
-      });
+      await expect(
+        service.revokePushToken({
+          token: 'ExponentPushToken[abc]',
+          revocationSecret,
+        }),
+      ).resolves.toBe(true);
 
       expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
         where: {
@@ -247,7 +249,7 @@ describe('NotificationService', () => {
           token: 'ExponentPushToken[abc]',
           revocationSecret: 'wrong-secret-that-is-still-long-enough',
         }),
-      ).resolves.toBeUndefined();
+      ).resolves.toBe(false);
 
       expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
         where: {

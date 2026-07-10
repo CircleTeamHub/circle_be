@@ -113,13 +113,14 @@ export class NotificationService {
     });
   }
 
-  async revokePushToken(dto: RevokePushTokenDto): Promise<void> {
-    await this.prisma.devicePushToken.deleteMany({
+  async revokePushToken(dto: RevokePushTokenDto): Promise<boolean> {
+    const result = await this.prisma.devicePushToken.deleteMany({
       where: {
         token: dto.token,
         revocationSecretHash: this.hashRevocationSecret(dto.revocationSecret),
       },
     });
+    return result.count > 0;
   }
 
   private hashRevocationSecret(secret: string): string {
