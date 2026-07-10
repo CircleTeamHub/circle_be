@@ -131,6 +131,7 @@ export const TraceErrorCode = {
   AccessForbidden: 'TRACE_ACCESS_FORBIDDEN',
   ReplyTargetMismatch: 'TRACE_REPLY_TARGET_MISMATCH',
   InvalidCursor: 'TRACE_INVALID_CURSOR',
+  EmptyComment: 'TRACE_EMPTY_COMMENT',
 } as const;
 
 // 好友:加好友 / 申请处理 / 拉黑 / 举报 / 好友标签。好友数、标签数上限原文含数字,

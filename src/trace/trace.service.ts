@@ -419,6 +419,17 @@ export class TraceService {
     traceId: string,
     dto: CreateTraceCommentDto,
   ): Promise<TraceCommentDto> {
+    const content = dto.content?.trim() ?? '';
+    const images = dto.images ?? [];
+    // 允许纯图评论，但文字/图片不能同时为空。
+    if (!content && images.length === 0) {
+      throw new BadRequestException({
+        message: 'Comment needs text or an image',
+        errorCode: TraceErrorCode.EmptyComment,
+      });
+    }
+    assertUrlsFromStorage(images, this.minioPublicUrl, 'comment image');
+
     const trace = await this.requireVisibleTrace(traceId, userId);
 
     if (dto.replyToId) {
@@ -443,7 +454,8 @@ export class TraceService {
     const comment = await this.prisma.$transaction(async (tx) => {
       const created = await tx.traceComment.create({
         data: {
-          content: dto.content,
+          content,
+          images,
           traceID: traceId,
           userID: userId,
           replyToID: dto.replyToId ?? null,
@@ -507,6 +519,7 @@ export class TraceService {
     return {
       id: comment.id,
       content: comment.content,
+      images: comment.images,
       user: { id: comment.user.id, nickname: comment.user.nickname },
       replyTo: comment.replyTo
         ? {
@@ -716,6 +729,7 @@ export class TraceService {
         (c: any): TraceCommentDto => ({
           id: c.id,
           content: c.content,
+          images: c.images ?? [],
           user: { id: c.user.id, nickname: c.user.nickname },
           // `id` MUST be the parent COMMENT id — the client threads replies by
           // looking it up in a comment-id map. Using c.replyTo.user.id here made

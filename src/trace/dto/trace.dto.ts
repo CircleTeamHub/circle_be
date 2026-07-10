@@ -40,11 +40,20 @@ export class CreateTraceDto {
 }
 
 export class CreateTraceCommentDto {
-  @ApiProperty()
+  // 图片评论允许纯图无文字；「文字/图片至少有一样」在 service 层校验。
+  @ApiPropertyOptional()
   @IsString()
-  @IsNotEmpty()
+  @IsOptional()
   @MaxLength(1000)
-  content: string;
+  content?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsOptional()
+  @ArrayMaxSize(3)
+  @IsString({ each: true })
+  @MaxLength(500, { each: true })
+  images?: string[];
 
   @ApiPropertyOptional()
   @IsUUID()
@@ -101,6 +110,7 @@ export class TraceAuthorDto {
 export class TraceCommentDto {
   id: string;
   content: string;
+  images: string[];
   user: { id: string; nickname: string };
   replyTo: { id: string; nickname: string } | null;
   createdAt: string;

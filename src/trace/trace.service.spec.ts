@@ -323,6 +323,46 @@ describe('TraceService', () => {
     expect(result.replyTo).toEqual({ id: 'parent-comment', nickname: 'Bob' });
   });
 
+  it('addComment stores images and allows an image-only comment', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-img',
+      content: '',
+      images: ['https://cdn.example/img.jpg'],
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    const result = await service.addComment('actor-1', 'trace-1', {
+      images: ['https://cdn.example/img.jpg'],
+    });
+
+    expect(prisma.traceComment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          content: '',
+          images: ['https://cdn.example/img.jpg'],
+        }),
+      }),
+    );
+    expect(result.images).toEqual(['https://cdn.example/img.jpg']);
+  });
+
+  it('addComment rejects a comment with neither text nor images', async () => {
+    await expect(
+      service.addComment('actor-1', 'trace-1', { content: '   ' }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
+  });
+
   it('broadcasts the created notification payload after adding a trace comment', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
