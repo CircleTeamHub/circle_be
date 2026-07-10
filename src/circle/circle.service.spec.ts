@@ -39,6 +39,10 @@ describe('CircleService', () => {
     userDisplayIcon: {
       deleteMany: jest.fn(),
     },
+    circleInvitation: {
+      findFirst: jest.fn(),
+      create: jest.fn(),
+    },
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -87,6 +91,78 @@ describe('CircleService', () => {
 
     expect(prisma.circleMember.create).not.toHaveBeenCalled();
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
+  });
+
+  it('private-circle self-apply creates a PENDING member plus a vouch invitation', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      isPublic: false,
+      memberCount: 3,
+      maxMembers: null,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      groupID: null,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: null,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    prisma.circle.findUnique.mockResolvedValue({
+      maxMembers: null,
+      memberCount: 3,
+    });
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+
+    await service.joinCircle('user-1', 'circle-1');
+
+    expect(prisma.circleMember.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'PENDING' }),
+      }),
+    );
+    // 申请人自任 inviter 的担保单（0/10 起步），驱动「邀请好友为我验证」入口。
+    expect(prisma.circleInvitation.create).toHaveBeenCalledWith({
+      data: {
+        circleID: 'circle-1',
+        applicantID: 'user-1',
+        inviterID: 'user-1',
+      },
+    });
+    // PENDING 不占正式名额。
+    expect(prisma.circle.update).not.toHaveBeenCalled();
+  });
+
+  it('private-circle self-apply reuses an existing pending invitation', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      isPublic: false,
+      memberCount: 3,
+      maxMembers: null,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      groupID: null,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: null,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    prisma.circle.findUnique.mockResolvedValue({
+      maxMembers: null,
+      memberCount: 3,
+    });
+    prisma.circleInvitation.findFirst.mockResolvedValue({ id: 'inv-1' });
+
+    await service.joinCircle('user-1', 'circle-1');
+
+    expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
   });
 
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {

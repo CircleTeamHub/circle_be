@@ -325,6 +325,28 @@ export class CircleService {
                 where: { id: circleId },
                 data: { memberCount: { increment: 1 } },
               });
+            } else {
+              // 私密圈自主申请：随 PENDING 成员同事务创建担保单（申请人自任
+              // inviter，0/requiredCount 起步），让详情页「邀请好友为我验证」
+              // 与圈主审核页立即可用。已有进行中的担保单（例如成员先邀请过）
+              // 则复用，不重复建。
+              const existingInvitation = await tx.circleInvitation.findFirst({
+                where: {
+                  circleID: circleId,
+                  applicantID: userId,
+                  status: 'PENDING',
+                },
+                select: { id: true },
+              });
+              if (!existingInvitation) {
+                await tx.circleInvitation.create({
+                  data: {
+                    circleID: circleId,
+                    applicantID: userId,
+                    inviterID: userId,
+                  },
+                });
+              }
             }
           },
           {
