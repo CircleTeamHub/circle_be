@@ -79,9 +79,4 @@ describe('app error code catalog', () => {
   it('exports the canonical flat frontend contract in group order', () => {
     expect(APP_ERROR_CODES).toEqual(allEntries.map(({ value }) => value));
   });
-
-  it('publishes the stable trace-mention visibility error code', () => {
-    expect(TraceErrorCode.MentionNotVisible).toBe('TRACE_MENTION_NOT_VISIBLE');
-    expect(APP_ERROR_CODES).toContain('TRACE_MENTION_NOT_VISIBLE');
-  });
 });

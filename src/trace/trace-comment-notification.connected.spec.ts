@@ -164,7 +164,7 @@ describe('trace comment mention notification flow', () => {
     );
   });
 
-  it('blocks notification, push, and realtime after eligibility is revoked at the boundary', async () => {
+  it('skips a revoked mention while preserving the reply notification at the boundary', async () => {
     prisma.user.findMany
       .mockResolvedValueOnce([{ id: 'mention-user-1' }])
       .mockResolvedValueOnce([]);
@@ -172,23 +172,26 @@ describe('trace comment mention notification flow', () => {
     await expect(
       traceService.addComment('actor-1', 'trace-1', {
         content: 'hello',
+        replyToId: 'parent-comment-1',
         mentionedUserIds: ['mention-user-1'],
       }),
     ).resolves.toEqual(expect.objectContaining({ id: 'comment-1' }));
 
     expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
-    expect(prisma.notification.create).not.toHaveBeenCalled();
-    expect(
-      prisma.$transaction.mock.calls.some(([operations]) =>
-        Array.isArray(operations),
-      ),
-    ).toBe(false);
-    expect(push.sendNotification).not.toHaveBeenCalled();
-    expect(realtime.broadcastInteractionUnread).not.toHaveBeenCalled();
-    expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
-    expect(
-      realtime.broadcastCirclePostInteractionCreated,
-    ).not.toHaveBeenCalled();
+    expect(prisma.notification.create).toHaveBeenCalledTimes(1);
+    expect(prisma.notification.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          toUserID: 'reply-user-1',
+          type: 'COMMENT_REPLY',
+        }),
+      }),
+    );
+    expect(push.sendNotification).toHaveBeenCalledTimes(1);
+    expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
+      'reply-user-1',
+      expect.objectContaining({ type: 'COMMENT_REPLY' }),
+    );
   });
 
   it('blocks all notification side effects when the trace is deleted after preflight', async () => {
@@ -238,6 +241,14 @@ describe('trace comment mention notification flow', () => {
         visibility: 'PRIVATE',
       });
     prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00Z'),
+      user: { id: 'actor-1', nickname: 'Aki' },
+      replyTo: null,
+    });
 
     await traceService.addComment('actor-1', 'trace-1', {
       content: 'hello',

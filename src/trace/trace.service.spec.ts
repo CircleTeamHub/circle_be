@@ -367,7 +367,7 @@ describe('TraceService', () => {
     expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
-  it('rejects missing or inactive mentioned users before creating a comment', async () => {
+  it('creates the comment and aggregates missing or inactive mentions as ignored', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'actor-1',
@@ -375,20 +375,22 @@ describe('TraceService', () => {
       visibility: 'PUBLIC',
     });
     prisma.user.findMany.mockResolvedValue([]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
 
-    const error = await service
-      .addComment('actor-1', 'trace-1', {
-        content: 'hello',
-        mentionedUserIds: ['mention-user-1'],
-      })
-      .catch((caught) => caught);
+    const result = await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
 
-    expect(error).toBeInstanceOf(BadRequestException);
-    expect((error as BadRequestException).getResponse()).toEqual(
-      expect.objectContaining({
-        errorCode: TraceErrorCode.MentionNotVisible,
-      }),
-    );
+    expect(result.ignoredMentionCount).toBe(1);
     expect(prisma.user.findMany).toHaveBeenCalledWith({
       where: {
         id: { in: ['mention-user-1'] },
@@ -396,10 +398,13 @@ describe('TraceService', () => {
       },
       select: { id: true },
     });
-    expect(prisma.traceComment.create).not.toHaveBeenCalled();
+    expect(prisma.traceComment.create).toHaveBeenCalled();
+    expect(
+      notificationService.createTraceCommentNotifications,
+    ).toHaveBeenCalledWith(expect.objectContaining({ mentionedUserIds: [] }));
   });
 
-  it('rejects mentioned users blocked by trace visibility before creating a comment', async () => {
+  it('creates the comment while filtering mentions blocked by author privacy', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'actor-1',
@@ -412,34 +417,33 @@ describe('TraceService', () => {
       new Map([['actor-1', { momentsVisibility: 'PRIVATE' }]]),
     );
     privacySettings.momentsVisibleFor.mockImplementationOnce(() => false);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
 
-    const error = await service
-      .addComment('actor-1', 'trace-1', {
-        content: 'hello',
-        mentionedUserIds: ['mention-user-1'],
-      })
-      .catch((caught) => caught);
+    const result = await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
 
-    expect(error).toBeInstanceOf(BadRequestException);
-    expect((error as BadRequestException).getResponse()).toEqual(
-      expect.objectContaining({
-        errorCode: TraceErrorCode.MentionNotVisible,
-      }),
-    );
-    expect(prisma.traceComment.create).not.toHaveBeenCalled();
+    expect(result.ignoredMentionCount).toBe(1);
+    expect(prisma.traceComment.create).toHaveBeenCalled();
   });
 
-  it('deduplicates valid mention recipients and forwards them to notifications', async () => {
+  it('keeps eligible mentions, filters ineligible ones, and exposes only the aggregate count', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'actor-1',
       deleted: false,
       visibility: 'PUBLIC',
     });
-    prisma.user.findMany.mockResolvedValue([
-      { id: 'mention-user-1' },
-      { id: 'mention-user-2' },
-    ]);
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
     prisma.friend.findMany.mockResolvedValue([]);
     privacySettings.canViewMoments.mockResolvedValue(true);
     prisma.traceComment.create.mockResolvedValue({
@@ -452,23 +456,49 @@ describe('TraceService', () => {
     });
     prisma.trace.update.mockResolvedValue({});
 
-    await service.addComment('actor-1', 'trace-1', {
+    const result = await service.addComment('actor-1', 'trace-1', {
       content: 'hello',
-      mentionedUserIds: [
-        'actor-1',
-        'mention-user-1',
-        'mention-user-1',
-        'mention-user-2',
-      ],
+      mentionedUserIds: ['actor-1', 'mention-user-1', 'missing-user-1'],
     });
 
+    expect(result.ignoredMentionCount).toBe(1);
+    expect(result).not.toHaveProperty('ignoredMentionUserIds');
     expect(
       notificationService.createTraceCommentNotifications,
     ).toHaveBeenCalledWith(
       expect.objectContaining({
-        mentionedUserIds: ['mention-user-1', 'mention-user-2'],
+        mentionedUserIds: ['mention-user-1'],
       }),
     );
+  });
+
+  it('filters private, inactive, and missing recipients without aborting the comment', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PRIVATE',
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'private-user-1' }]);
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    const result = await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['private-user-1', 'inactive-user-1', 'missing-user-1'],
+    });
+
+    expect(result.ignoredMentionCount).toBe(3);
+    expect(
+      notificationService.createTraceCommentNotifications,
+    ).toHaveBeenCalledWith(expect.objectContaining({ mentionedUserIds: [] }));
   });
 
   it('authorizes the maximum mention set with bounded batch queries', async () => {
@@ -538,7 +568,7 @@ describe('TraceService', () => {
     expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
-  it('maps a missing trace during the boundary refresh to mention-not-visible', async () => {
+  it('returns trace-unavailable without recipient details when the boundary trace is missing', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'actor-1',
@@ -565,19 +595,17 @@ describe('TraceService', () => {
     const [notificationParams] = notificationService
       .createTraceCommentNotifications.mock.calls[0] as unknown as [
       {
-        recheckMentionEligibility: (recipientIds: string[]) => Promise<void>;
+        recheckMentionEligibility: (recipientIds: string[]) => Promise<{
+          traceAvailable: boolean;
+          eligibleUserIds: string[];
+        }>;
       },
     ];
     prisma.trace.findFirst.mockResolvedValue(null);
 
-    const error = await notificationParams
-      .recheckMentionEligibility(['mention-user-1'])
-      .catch((caught: unknown) => caught);
-
-    expect(error).toBeInstanceOf(BadRequestException);
-    expect((error as BadRequestException).getResponse()).toEqual(
-      expect.objectContaining({ errorCode: TraceErrorCode.MentionNotVisible }),
-    );
+    await expect(
+      notificationParams.recheckMentionEligibility(['mention-user-1']),
+    ).resolves.toEqual({ traceAvailable: false, eligibleUserIds: [] });
   });
 
   it('propagates trace refresh database failures from the boundary callback', async () => {
@@ -607,7 +635,10 @@ describe('TraceService', () => {
     const [notificationParams] = notificationService
       .createTraceCommentNotifications.mock.calls[0] as unknown as [
       {
-        recheckMentionEligibility: (recipientIds: string[]) => Promise<void>;
+        recheckMentionEligibility: (recipientIds: string[]) => Promise<{
+          traceAvailable: boolean;
+          eligibleUserIds: string[];
+        }>;
       },
     ];
     const databaseError = new Error('trace refresh database unavailable');

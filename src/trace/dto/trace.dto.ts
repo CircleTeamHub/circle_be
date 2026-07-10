@@ -122,6 +122,7 @@ export class TraceCommentDto {
   images: string[];
   user: { id: string; nickname: string };
   replyTo: { id: string; nickname: string } | null;
+  ignoredMentionCount = 0;
   createdAt: string;
 }
 

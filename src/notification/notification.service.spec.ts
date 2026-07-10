@@ -380,7 +380,15 @@ describe('NotificationService', () => {
     });
 
     it('creates one precedence-ordered notification per comment target', async () => {
-      const recheckMentionEligibility = jest.fn().mockResolvedValue(undefined);
+      const recheckMentionEligibility = jest.fn().mockResolvedValue({
+        traceAvailable: true,
+        eligibleUserIds: [
+          'author-1',
+          'reply-user-1',
+          'mention-user-1',
+          'mention-user-2',
+        ],
+      });
       prisma.notification.create.mockImplementation(({ data }: any) =>
         Promise.resolve({
           id: `notification-${data.toUserID}`,
@@ -458,6 +466,47 @@ describe('NotificationService', () => {
       ).toBeLessThan(prisma.notification.create.mock.invocationCallOrder[0]);
     });
 
+    it('preserves author and reply notifications when boundary filtering removes mentions', async () => {
+      prisma.notification.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({
+          id: `notification-${data.toUserID}`,
+          ...data,
+          content: data.content ?? '',
+          read: false,
+          createdAt: new Date('2026-07-10T00:00:00Z'),
+          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+          fromTrace: { id: 'trace-1', content: 'trace', images: [] },
+          fromReply: { id: 'comment-1', content: 'hello' },
+          fromCircle: null,
+          fromCirclePost: null,
+          fromInvitation: null,
+        }),
+      );
+
+      const result = await service.createTraceCommentNotifications({
+        actorId: 'actor-1',
+        traceId: 'trace-1',
+        commentId: 'comment-1',
+        traceOwnerId: 'author-1',
+        replyToCommentId: 'parent-comment-1',
+        replyToUserId: 'reply-user-1',
+        mentionedUserIds: ['mention-user-1'],
+        recheckMentionEligibility: jest.fn().mockResolvedValue({
+          traceAvailable: true,
+          eligibleUserIds: [],
+        }),
+        content: 'hello',
+      });
+
+      expect(
+        prisma.notification.create.mock.calls.map(([arg]) => arg.data.type),
+      ).toEqual(['TRACE_COMMENT', 'COMMENT_REPLY']);
+      expect(result.map(({ targetUserId }) => targetUserId)).toEqual([
+        'author-1',
+        'reply-user-1',
+      ]);
+    });
+
     it('creates no notification side effects when the boundary eligibility recheck fails', async () => {
       const recheckError = new Error('mention access revoked');
 
@@ -491,7 +540,10 @@ describe('NotificationService', () => {
           commentId: 'comment-1',
           traceOwnerId: 'actor-1',
           mentionedUserIds: ['mention-user-1'],
-          recheckMentionEligibility: jest.fn().mockResolvedValue(undefined),
+          recheckMentionEligibility: jest.fn().mockResolvedValue({
+            traceAvailable: true,
+            eligibleUserIds: ['mention-user-1'],
+          }),
           content: 'hello',
         }),
       ).rejects.toBe(transactionError);

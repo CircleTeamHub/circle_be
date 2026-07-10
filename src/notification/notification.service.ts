@@ -461,14 +461,17 @@ export class NotificationService {
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
     mentionedUserIds?: string[];
-    recheckMentionEligibility: (mentionedUserIds: string[]) => Promise<void>;
+    recheckMentionEligibility: (mentionedUserIds: string[]) => Promise<{
+      traceAvailable: boolean;
+      eligibleUserIds: string[];
+    }>;
     content: string;
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
   > {
     const notifications = [];
     const notifiedUserIds = new Set<string>();
-    const mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
+    let mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
       (mentionedUserId) =>
         mentionedUserId && mentionedUserId !== params.actorId,
     );
@@ -476,7 +479,15 @@ export class NotificationService {
     if (mentionedUserIds.length > 0) {
       // Authorization snapshot: refresh immediately before constructing the
       // Prisma operations that are committed in the single transaction below.
-      await params.recheckMentionEligibility(mentionedUserIds);
+      const refreshed =
+        await params.recheckMentionEligibility(mentionedUserIds);
+      if (!refreshed.traceAvailable) {
+        return [];
+      }
+      const requestedMentionIds = new Set(mentionedUserIds);
+      mentionedUserIds = [...new Set(refreshed.eligibleUserIds)].filter((id) =>
+        requestedMentionIds.has(id),
+      );
     }
 
     if (
@@ -544,6 +555,10 @@ export class NotificationService {
           include: NOTIFICATION_REALTIME_INCLUDE,
         }),
       );
+    }
+
+    if (notifications.length === 0) {
+      return [];
     }
 
     // Atomic: either all notifications land or none does — a partial failure

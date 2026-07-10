@@ -451,11 +451,12 @@ export class TraceService {
       }
     }
 
-    const mentionedUserIds = await this.requireVisibleMentionRecipients(
+    const mentionEligibility = await this.filterVisibleMentionRecipients(
       trace,
       userId,
       dto.mentionedUserIds ?? [],
     );
+    const mentionedUserIds = mentionEligibility.eligibleUserIds;
 
     const comment = await this.prisma.$transaction(async (tx) => {
       const created = await tx.traceComment.create({
@@ -494,7 +495,7 @@ export class TraceService {
           replyToUserId: comment.replyTo?.user.id ?? null,
           mentionedUserIds,
           recheckMentionEligibility: async (recipientIds) => {
-            await this.requireFreshVisibleMentionRecipients(
+            return this.filterFreshVisibleMentionRecipients(
               traceId,
               userId,
               recipientIds,
@@ -543,6 +544,7 @@ export class TraceService {
             nickname: comment.replyTo.user.nickname,
           }
         : null,
+      ignoredMentionCount: mentionEligibility.ignoredMentionCount,
       createdAt: comment.createdAt.toISOString(),
     };
   }
@@ -578,34 +580,36 @@ export class TraceService {
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
-  private async requireFreshVisibleMentionRecipients(
+  private async filterFreshVisibleMentionRecipients(
     traceId: string,
     actorId: string,
     recipientIds: string[],
-  ): Promise<string[]> {
+  ): Promise<{ traceAvailable: boolean; eligibleUserIds: string[] }> {
     const trace = await this.prisma.trace.findFirst({
       where: { id: traceId, deleted: false },
       select: { fromID: true, visibility: true },
     });
     if (!trace) {
-      throw new BadRequestException({
-        message: 'Mentioned user cannot view this moment',
-        errorCode: TraceErrorCode.MentionNotVisible,
-      });
+      return { traceAvailable: false, eligibleUserIds: [] };
     }
-    return this.requireVisibleMentionRecipients(trace, actorId, recipientIds);
+    const result = await this.filterVisibleMentionRecipients(
+      trace,
+      actorId,
+      recipientIds,
+    );
+    return { traceAvailable: true, eligibleUserIds: result.eligibleUserIds };
   }
 
-  private async requireVisibleMentionRecipients(
+  private async filterVisibleMentionRecipients(
     trace: { fromID: string; visibility: string },
     actorId: string,
     recipientIds: string[],
-  ): Promise<string[]> {
+  ): Promise<{ eligibleUserIds: string[]; ignoredMentionCount: number }> {
     const distinctRecipientIds = [...new Set(recipientIds)].filter(
       (recipientId) => recipientId !== actorId,
     );
     if (distinctRecipientIds.length === 0) {
-      return [];
+      return { eligibleUserIds: [], ignoredMentionCount: 0 };
     }
 
     const activeRecipients = await this.prisma.user.findMany({
@@ -618,28 +622,18 @@ export class TraceService {
     const activeRecipientIds = new Set(
       activeRecipients.map((recipient) => recipient.id),
     );
-    if (
-      distinctRecipientIds.some(
-        (recipientId) => !activeRecipientIds.has(recipientId),
-      )
-    ) {
-      throw new BadRequestException({
-        message: 'Mentioned user cannot view this moment',
-        errorCode: TraceErrorCode.MentionNotVisible,
-      });
-    }
-
     const nonOwnerRecipientIds = distinctRecipientIds.filter(
-      (recipientId) => recipientId !== trace.fromID,
+      (recipientId) =>
+        recipientId !== trace.fromID && activeRecipientIds.has(recipientId),
     );
-    if (nonOwnerRecipientIds.length === 0) {
-      return distinctRecipientIds;
-    }
-    if (trace.visibility === 'PRIVATE') {
-      throw new BadRequestException({
-        message: 'Mentioned user cannot view this moment',
-        errorCode: TraceErrorCode.MentionNotVisible,
-      });
+    const activeOwnerMentioned = activeRecipientIds.has(trace.fromID);
+    if (nonOwnerRecipientIds.length === 0 || trace.visibility === 'PRIVATE') {
+      const eligibleUserIds = activeOwnerMentioned ? [trace.fromID] : [];
+      return {
+        eligibleUserIds,
+        ignoredMentionCount:
+          distinctRecipientIds.length - eligibleUserIds.length,
+      };
     }
 
     const [friendships, settingsByAuthor] = await Promise.all([
@@ -676,7 +670,7 @@ export class TraceService {
     );
     const authorSettings = settingsByAuthor.get(trace.fromID);
 
-    const hasInvisibleRecipient = nonOwnerRecipientIds.some((recipientId) => {
+    const visibleNonOwnerIds = nonOwnerRecipientIds.filter((recipientId) => {
       const friendship = friendshipByRecipient.get(recipientId);
       const isFriend = Boolean(friendship);
       const authorPermission =
@@ -684,23 +678,25 @@ export class TraceService {
           ? friendship.permissionA
           : friendship?.permissionB;
       if (authorPermission === 'CHAT_ONLY') {
-        return true;
+        return false;
       }
       if (
         !this.privacySettings.momentsVisibleFor(authorSettings, false, isFriend)
       ) {
-        return true;
+        return false;
       }
-      return trace.visibility === 'FRIENDS_ONLY' && !isFriend;
+      return trace.visibility !== 'FRIENDS_ONLY' || isFriend;
     });
-    if (hasInvisibleRecipient) {
-      throw new BadRequestException({
-        message: 'Mentioned user cannot view this moment',
-        errorCode: TraceErrorCode.MentionNotVisible,
-      });
-    }
-
-    return distinctRecipientIds;
+    const visibleNonOwnerSet = new Set(visibleNonOwnerIds);
+    const eligibleUserIds = distinctRecipientIds.filter(
+      (recipientId) =>
+        (recipientId === trace.fromID && activeOwnerMentioned) ||
+        visibleNonOwnerSet.has(recipientId),
+    );
+    return {
+      eligibleUserIds,
+      ignoredMentionCount: distinctRecipientIds.length - eligibleUserIds.length,
+    };
   }
 
   private async getAcceptedFriendIds(userId: string): Promise<string[]> {
@@ -877,6 +873,7 @@ export class TraceService {
             c.replyTo && c.replyTo.user
               ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
               : null,
+          ignoredMentionCount: 0,
           createdAt: c.createdAt.toISOString(),
         }),
       );
