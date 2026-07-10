@@ -276,7 +276,9 @@ export class CircleService {
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
             const existing = await tx.circleMember.findUnique({
-              where: { userID_circleID: { userID: userId, circleID: circleId } },
+              where: {
+                userID_circleID: { userID: userId, circleID: circleId },
+              },
             });
             if (existing?.status === 'ACTIVE') {
               throw new ConflictException({

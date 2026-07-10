@@ -104,6 +104,7 @@ describe('OpenimService group/auth admin calls', () => {
     expect(JSON.parse(call![1].body)).toEqual({
       userID: 'a1b2',
       conversationIDs: ['si_a1b2_c3d4'],
+      deleteSyncOpt: { isSyncSelf: true, isSyncOther: false },
     });
   });
 

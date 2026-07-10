@@ -203,6 +203,10 @@ export class OpenimService implements OnModuleInit {
       {
         userID: OpenimService.toImUserId(userID),
         conversationIDs,
+        deleteSyncOpt: {
+          isSyncSelf: true,
+          isSyncOther: false,
+        },
       },
       adminToken,
     );
@@ -394,6 +398,8 @@ export class OpenimService implements OnModuleInit {
     content: string;
     senderNickname?: string | null;
     senderFaceURL?: string | null;
+    notOfflinePush?: boolean;
+    clientMsgID?: string;
   }): Promise<void> {
     if (!this.enabled) return;
 
@@ -411,7 +417,7 @@ export class OpenimService implements OnModuleInit {
         senderFaceURL: params.senderFaceURL ?? '',
         senderPlatformID: 5,
         isOnlineOnly: false,
-        notOfflinePush: false,
+        notOfflinePush: params.notOfflinePush ?? false,
         sendTime: Date.now(),
         offlinePushInfo: {
           title: senderName,
@@ -421,6 +427,7 @@ export class OpenimService implements OnModuleInit {
           iOSBadgeCount: true,
         },
         ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
       },
       adminToken,
     );

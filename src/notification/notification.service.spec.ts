@@ -21,6 +21,9 @@ describe('NotificationService', () => {
       upsert: jest.fn(),
       deleteMany: jest.fn(),
     },
+    notificationPushOutbox: {
+      upsert: jest.fn(),
+    },
   };
 
   const realtimeService = {
@@ -37,6 +40,9 @@ describe('NotificationService', () => {
       nested.mockReset();
     }
     for (const nested of Object.values(prisma.devicePushToken)) {
+      nested.mockReset();
+    }
+    for (const nested of Object.values(prisma.notificationPushOutbox)) {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
@@ -219,14 +225,15 @@ describe('NotificationService', () => {
         fromCircle: null,
         fromCirclePost: null,
         fromInvitation: null,
+        requestId: null,
       });
     });
 
     it('excludes friend-request events from the bell channel (they live in the 新的朋友 inbox)', () => {
       const bellTypes = DISCOVER_NOTIFICATION_TYPES as readonly string[];
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_RECEIVED');
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_ACCEPTED');
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_REJECTED');
+      expect(bellTypes).toContain('FRIEND_REQUEST_RECEIVED');
+      expect(bellTypes).toContain('FRIEND_REQUEST_ACCEPTED');
+      expect(bellTypes).toContain('FRIEND_REQUEST_REJECTED');
     });
 
     it('getProfileNotifications returns only profile-domain system rows', async () => {
@@ -269,7 +276,7 @@ describe('NotificationService', () => {
       );
     });
 
-    it('dispatches push after creating a friend request notification', async () => {
+    it('enqueues durable push delivery after creating a friend request notification', async () => {
       prisma.notification.create.mockResolvedValue({
         id: 'friend-n1',
         type: NotificationType.FRIEND_REQUEST_RECEIVED,
@@ -291,13 +298,11 @@ describe('NotificationService', () => {
         content: 'hello',
       });
 
-      expect(pushService.sendNotification).toHaveBeenCalledWith(
-        'to-1',
-        expect.objectContaining({
-          id: 'friend-n1',
-          type: NotificationType.FRIEND_REQUEST_RECEIVED,
-        }),
-      );
+      expect(prisma.notificationPushOutbox.upsert).toHaveBeenCalledWith({
+        where: { notificationID: 'friend-n1' },
+        create: { notificationID: 'friend-n1' },
+        update: expect.objectContaining({ status: 'PENDING' }),
+      });
       expect(result).toEqual(expect.objectContaining({ id: 'friend-n1' }));
     });
 
@@ -335,12 +340,7 @@ describe('NotificationService', () => {
         },
         include: expect.any(Object),
       });
-      expect(pushService.sendNotification).toHaveBeenCalledWith(
-        'to-1',
-        expect.objectContaining({
-          fromInvitation: { id: 'inv-1', status: 'PENDING' },
-        }),
-      );
+      expect(prisma.notificationPushOutbox.upsert).toHaveBeenCalled();
     });
 
     it('markNotificationRead broadcasts interaction unread for discover-domain rows', async () => {

@@ -13,10 +13,8 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import {
-  DeletePushTokenDto,
-  RegisterPushTokenDto,
-} from './notification.dto';
+import { DeletePushTokenDto, RegisterPushTokenDto } from './notification.dto';
+import { NotificationPageQueryDto } from './notification.dto';
 import { NotificationService } from './notification.service';
 
 @ApiTags('notification')
@@ -36,19 +34,21 @@ export class NotificationController {
 
   @Get('list')
   @ApiOperation({ summary: 'Paginated interactive notification list' })
-  list(@Query('page') page: string | undefined, @Req() req: any) {
+  list(@Query() query: NotificationPageQueryDto, @Req() req: any) {
     return this.notificationService.getNotifications(
       req.user.userId,
-      page ? parseInt(page, 10) : 1,
+      query.page,
     );
   }
 
   @Get('profile/list')
-  @ApiOperation({ summary: 'Paginated profile-domain system notification list' })
-  profileList(@Query('page') page: string | undefined, @Req() req: any) {
+  @ApiOperation({
+    summary: 'Paginated profile-domain system notification list',
+  })
+  profileList(@Query() query: NotificationPageQueryDto, @Req() req: any) {
     return this.notificationService.getProfileNotifications(
       req.user.userId,
-      page ? parseInt(page, 10) : 1,
+      query.page,
     );
   }
 
@@ -59,7 +59,9 @@ export class NotificationController {
   }
 
   @Put('push-token')
-  @ApiOperation({ summary: 'Register or refresh the current device push token' })
+  @ApiOperation({
+    summary: 'Register or refresh the current device push token',
+  })
   registerPushToken(@Body() dto: RegisterPushTokenDto, @Req() req: any) {
     return this.notificationService.registerPushToken(req.user.userId, dto);
   }

@@ -74,7 +74,9 @@ describe('NotificationPushService', () => {
         provider: 'expo',
         disabledAt: null,
       },
-      select: { token: true },
+      select: { token: true, projectId: true, updatedAt: true },
+      orderBy: { updatedAt: 'desc' },
+      take: 20,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       'https://exp.host/--/api/v2/push/send',
@@ -223,7 +225,7 @@ describe('NotificationPushService', () => {
         fromCirclePost: null,
         fromInvitation: null,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     // A failed send must never try to disable tokens on incomplete data.
     expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();

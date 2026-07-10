@@ -1,12 +1,26 @@
 import { Prisma, NotificationType } from 'src/generated/prisma';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 import {
   IsIn,
   IsNotEmpty,
   IsOptional,
   IsString,
   MaxLength,
+  IsInt,
+  Min,
+  Max,
 } from 'class-validator';
+
+export class NotificationPageQueryDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000)
+  @ApiPropertyOptional({ minimum: 1, maximum: 10_000, default: 1 })
+  @IsOptional()
+  page = 1;
+}
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
 export const PUSH_TOKEN_PROVIDERS = ['expo'] as const;
@@ -66,6 +80,7 @@ export type NotificationRealtimeDto = {
     firstImage: string | null;
   } | null;
   fromInvitation: { id: string; status: string } | null;
+  requestId?: string | null;
 };
 
 export const NOTIFICATION_REALTIME_INCLUDE = {
@@ -75,6 +90,7 @@ export const NOTIFICATION_REALTIME_INCLUDE = {
   fromCircle: { select: { id: true, name: true } },
   fromCirclePost: { select: { id: true, content: true, images: true } },
   fromInvitation: { select: { id: true, status: true } },
+  fromFriendRequest: { select: { id: true } },
 } as const;
 
 export type NotificationRealtimeRow = Prisma.NotificationGetPayload<{
@@ -120,5 +136,6 @@ export function mapNotificationRealtimeDto(
     fromInvitation: n.fromInvitation
       ? { id: n.fromInvitation.id, status: n.fromInvitation.status }
       : null,
+    requestId: n.fromFriendRequest?.id ?? null,
   };
 }

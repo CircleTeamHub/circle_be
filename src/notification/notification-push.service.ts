@@ -6,6 +6,8 @@ import type { NotificationRealtimeDto } from './notification.dto';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_BATCH_SIZE = 100;
+const MAX_ACTIVE_TOKENS_PER_USER = 20;
+const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. sendNotification is awaited inside the
 // notification-creation request path, and Node's global fetch (undici) applies
 // no response timeout by default — a slow/hung Expo endpoint would otherwise
@@ -37,30 +39,46 @@ export class NotificationPushService {
   async sendNotification(
     userId: string,
     notification: NotificationRealtimeDto,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const tokens = await this.prisma.devicePushToken.findMany({
       where: {
         userID: userId,
         provider: 'expo',
         disabledAt: null,
       },
-      select: { token: true },
+      select: { token: true, projectId: true, updatedAt: true },
+      orderBy: { updatedAt: 'desc' },
+      take: MAX_ACTIVE_TOKENS_PER_USER,
     });
-    if (tokens.length === 0) return;
+    if (tokens.length === 0) return true;
 
     const message = this.buildMessage(notification);
-    for (let i = 0; i < tokens.length; i += EXPO_BATCH_SIZE) {
-      const batch = tokens.slice(i, i + EXPO_BATCH_SIZE);
-      await this.sendBatch(
-        batch.map((row) => ({
-          to: row.token,
-          sound: 'default',
-          title: message.title,
-          body: message.body,
-          data: message.data,
-        })),
-      );
+    // Expo project IDs must not be mixed in a single request when enhanced
+    // security is enabled. Group first, then batch each project independently.
+    const byProject = new Map<string, typeof tokens>();
+    for (const token of tokens) {
+      const key = token.projectId ?? '';
+      const group = byProject.get(key) ?? [];
+      group.push(token);
+      byProject.set(key, group);
     }
+    let success = true;
+    for (const projectTokens of byProject.values()) {
+      for (let i = 0; i < projectTokens.length; i += EXPO_BATCH_SIZE) {
+        const batch = projectTokens.slice(i, i + EXPO_BATCH_SIZE);
+        success =
+          (await this.sendBatch(
+            batch.map((row) => ({
+              to: row.token,
+              sound: 'default',
+              title: message.title,
+              body: message.body,
+              data: message.data,
+            })),
+          )) && success;
+      }
+    }
+    return success;
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
@@ -106,6 +124,9 @@ export class NotificationPushService {
         ...(notification.fromInvitation?.id
           ? { invitationId: notification.fromInvitation.id }
           : {}),
+        ...(notification.requestId
+          ? { requestId: notification.requestId }
+          : {}),
       },
     };
   }
@@ -117,36 +138,48 @@ export class NotificationPushService {
     if (type === 'FRIEND_REQUEST_RECEIVED') return '请求添加你为好友';
     if (type === 'FRIEND_REQUEST_ACCEPTED') return '已通过你的好友申请';
     if (type === 'FRIEND_REQUEST_REJECTED') return '已拒绝你的好友申请';
+    if (type === 'PROFILE_LIKE') return '赞了你的资料';
     if (type === 'CIRCLE_VERIFICATION_REQUESTED') return '邀请你验证入圈申请';
     if (type === 'CIRCLE_POST_SIGNUP_CREATED') return '报名了你的帖子';
     if (type === 'CIRCLE_POST_AUTO_ENDED') return '你的帖子报名已结束';
     return '你有一条新通知';
   }
 
-  private async sendBatch(messages: Array<Record<string, unknown>>) {
-    try {
-      const response = await fetch(EXPO_PUSH_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(this.expoAccessToken
-            ? { Authorization: `Bearer ${this.expoAccessToken}` }
-            : {}),
-        },
-        body: JSON.stringify(messages),
-        signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        this.logger.warn(`Expo push send failed: ${response.status}`);
-        return;
+  private async sendBatch(
+    messages: Array<Record<string, unknown>>,
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= EXPO_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch(EXPO_PUSH_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(this.expoAccessToken
+              ? { Authorization: `Bearer ${this.expoAccessToken}` }
+              : {}),
+          },
+          body: JSON.stringify(messages),
+          signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = (await response.json()) as { data?: ExpoPushTicket[] };
+        await this.disableUnregisteredTokens(messages, payload.data ?? []);
+        return true;
+      } catch (error) {
+        if (attempt === EXPO_MAX_ATTEMPTS) {
+          this.logger.warn(
+            `Expo push send failed after ${attempt} attempts: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return false;
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, 250 * 2 ** (attempt - 1)),
+        );
       }
-      const payload = (await response.json()) as { data?: ExpoPushTicket[] };
-      await this.disableUnregisteredTokens(messages, payload.data ?? []);
-    } catch (error) {
-      this.logger.warn(
-        `Expo push send failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
     }
+    return false;
   }
 
   private async disableUnregisteredTokens(

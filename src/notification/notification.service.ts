@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -12,18 +12,15 @@ import {
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
 } from './notification.dto';
-import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+const MAX_PUSH_TOKENS_PER_USER = 20;
 
 @Injectable()
 export class NotificationService {
-  private readonly logger = new Logger(NotificationService.name);
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
-    private readonly pushService: NotificationPushService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -48,25 +45,14 @@ export class NotificationService {
     }
   }
 
-  /**
-   * Fire-and-forget offline push. Dispatched with `void` (never awaited) from
-   * the notification-creation path so a slow Expo round-trip can't add latency
-   * to the user's request. Fully self-contained: every failure is caught and
-   * logged here, so the floating promise can never reject.
-   */
-  private async sendPushBestEffort(
-    userId: string,
-    notification: NotificationRealtimeDto,
-  ): Promise<void> {
-    try {
-      await this.pushService.sendNotification(userId, notification);
-    } catch (error) {
-      this.logger.warn(
-        `Push notification failed for ${notification.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+  private async enqueuePush(notificationId: string): Promise<void> {
+    const outbox = this.prisma.notificationPushOutbox;
+    if (!outbox) return;
+    await outbox.upsert({
+      where: { notificationID: notificationId },
+      create: { notificationID: notificationId },
+      update: { status: 'PENDING', nextAttemptAt: new Date(), lockedAt: null },
+    });
   }
 
   async registerPushToken(
@@ -92,6 +78,19 @@ export class NotificationService {
         disabledAt: null,
       },
     });
+    const findTokens = this.prisma.devicePushToken.findMany;
+    if (!findTokens) return;
+    const excess = await findTokens({
+      where: { userID: userId, provider: dto.provider, disabledAt: null },
+      orderBy: { updatedAt: 'desc' },
+      skip: MAX_PUSH_TOKENS_PER_USER,
+      select: { id: true },
+    });
+    if (excess.length > 0) {
+      await this.prisma.devicePushToken.deleteMany({
+        where: { id: { in: excess.map((row) => row.id) } },
+      });
+    }
   }
 
   async deletePushToken(userId: string, token: string): Promise<void> {
@@ -169,7 +168,7 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(toUserId, dto);
+    await this.enqueuePush(dto.id);
     return dto;
   }
 
@@ -182,6 +181,7 @@ export class NotificationService {
     fromCirclePostID?: string;
     fromCircleID?: string;
     fromInvitationID?: string;
+    fromFriendRequestID?: string;
     dedupeWindowMs?: number;
   }): Promise<NotificationRealtimeDto | null> {
     if (
@@ -223,7 +223,7 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(notificationData.toUserID, dto);
+    await this.enqueuePush(dto.id);
     return dto;
   }
 
@@ -236,12 +236,14 @@ export class NotificationService {
     toUserId: string;
     fromUserId: string;
     content?: string | null;
+    requestId?: string;
   }): Promise<NotificationRealtimeDto | null> {
     return this.createNotification({
       toUserID: params.toUserId,
       fromUserID: params.fromUserId,
       type: params.type,
       content: params.content ?? '',
+      fromFriendRequestID: params.requestId,
     });
   }
 
@@ -310,7 +312,7 @@ export class NotificationService {
     });
 
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(params.toUserId, dto);
+    await this.enqueuePush(dto.id);
     return dto;
   }
 
@@ -491,9 +493,8 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
-    mapped.forEach(
-      (item) =>
-        void this.sendPushBestEffort(item.targetUserId, item.notification),
+    await Promise.all(
+      mapped.map((item) => this.enqueuePush(item.notification.id)),
     );
     return mapped;
   }

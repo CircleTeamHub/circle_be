@@ -26,6 +26,7 @@ describe('FriendService', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     block: {
       findUnique: jest.fn(),
@@ -42,6 +43,7 @@ describe('FriendService', () => {
       findMany: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
       count: jest.fn(),
     },
     friendTag: {
@@ -68,6 +70,7 @@ describe('FriendService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
+      upsert: jest.fn(),
     },
     friendReport: {
       create: jest.fn(),
@@ -75,6 +78,11 @@ describe('FriendService', () => {
     },
     friendSyncOutbox: {
       createMany: jest.fn(),
+    },
+    friendChatReplayOutbox: {
+      create: jest.fn(),
+      update: jest.fn(),
+      upsert: jest.fn(),
     },
     friendRequestMessage: {
       create: jest.fn(),
@@ -149,6 +157,7 @@ describe('FriendService', () => {
         ? operations(prisma as any)
         : Promise.all(operations),
     );
+    prisma.friend.updateMany.mockResolvedValue({ count: 1 });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -314,7 +323,7 @@ describe('FriendService', () => {
       expect(prisma.friendRequestMessage.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { requestId: 'r1' },
-          orderBy: { createdAt: 'asc' },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         }),
       );
     });
@@ -351,11 +360,31 @@ describe('FriendService', () => {
         state: FriendState.PENDING,
       });
       prisma.friendRequestMessage.count
+        .mockResolvedValueOnce(0) // total messages = 0
         .mockResolvedValueOnce(0) // recipient(user-2) messages = 0
         .mockResolvedValueOnce(5); // sender(user-1) messages = 5
 
       await expect(
         service.appendRequestMessage('user-1', 'r1', 'spam'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: 'FRIEND_REQUEST_MESSAGE_LIMIT',
+        }),
+      });
+      expect(prisma.friendRequestMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('enforces a hard total thread cap for both participants', async () => {
+      prisma.friend.findUnique.mockResolvedValue({
+        id: 'r1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.PENDING,
+      });
+      prisma.friendRequestMessage.count.mockResolvedValue(50);
+
+      await expect(
+        service.appendRequestMessage('user-2', 'r1', 'too late'),
       ).rejects.toMatchObject({
         response: expect.objectContaining({
           errorCode: 'FRIEND_REQUEST_MESSAGE_LIMIT',
@@ -401,8 +430,10 @@ describe('FriendService', () => {
           type: 'FRIEND_REQUEST_MESSAGE',
           toUserId: 'user-2',
           fromUserId: 'user-1',
+          requestId: 'r1',
         }),
       );
+      expect(prisma.friendActivity.upsert).toHaveBeenCalled();
     });
 
     it('allows the recipient to reply without the sender cap', async () => {
@@ -424,8 +455,8 @@ describe('FriendService', () => {
 
       await service.appendRequestMessage('user-2', 'r1', 'sure');
 
-      // recipient side must not consult the soft-cap counters
-      expect(prisma.friendRequestMessage.count).not.toHaveBeenCalled();
+      // recipient side consults only the hard total cap, not the sender soft cap
+      expect(prisma.friendRequestMessage.count).toHaveBeenCalledTimes(1);
       expect(prisma.friendRequestMessage.create).toHaveBeenCalled();
     });
   });
@@ -911,7 +942,7 @@ describe('FriendService', () => {
     );
   });
 
-  it('removeFriend clears the deleter’s OpenIM conversation so a re-add starts clean', async () => {
+  it('queues conversation clearing so a re-add starts clean', async () => {
     prisma.friend.findFirst.mockResolvedValue({
       id: 'friendship-1',
       userID: 'user-1',
@@ -926,9 +957,16 @@ describe('FriendService', () => {
     expect(prisma.friend.delete).toHaveBeenCalledWith({
       where: { id: 'friendship-1' },
     });
-    expect(openimService.clearConversationMessages).toHaveBeenCalledWith(
-      'user-1',
-      [OpenimService.singleConversationID('user-1', 'user-2')],
+    expect(prisma.friendSyncOutbox.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.arrayContaining([
+          {
+            operation: 'CLEAR_CONVERSATION',
+            userID: 'user-1',
+            targetUserID: 'user-2',
+          },
+        ]),
+      }),
     );
   });
 
@@ -1154,6 +1192,7 @@ describe('FriendService', () => {
     });
 
     const tx = {
+      $executeRaw: jest.fn(),
       friend: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'request-1',
@@ -1162,6 +1201,7 @@ describe('FriendService', () => {
           state: FriendState.PENDING,
           message: 'hello',
         }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         update: jest.fn().mockResolvedValue({
           id: 'request-1',
           userID: 'user-1',
@@ -1369,7 +1409,30 @@ describe('FriendService', () => {
     });
   });
 
-  it('injects the message thread into the conversation on accept', async () => {
+  it('rejects a losing concurrent decision without running side effects', async () => {
+    prisma.friend.findUnique.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'FRIEND_REQUEST_ALREADY_HANDLED',
+      }),
+    });
+    expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
+    expect(prisma.friendSyncOutbox.createMany).not.toHaveBeenCalled();
+  });
+
+  it('queues the message thread for durable replay on accept', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
@@ -1414,35 +1477,19 @@ describe('FriendService', () => {
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).resolves.toBeUndefined();
-    await new Promise((resolve) => setImmediate(resolve));
-
-    // Requester's message attributed to the requester (user-1 → user-2)
-    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
+    expect(prisma.friendChatReplayOutbox.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
-        sendID: 'user-1',
-        recvID: 'user-2',
-        content: '你好',
-      }),
-    );
-    // Recipient's reply attributed to the recipient (user-2 → user-1)
-    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sendID: 'user-2',
-        recvID: 'user-1',
-        content: '你也好',
-      }),
-    );
-    // Still followed by the accept-reply closer.
-    expect(openimService.sendTextMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sendID: 'user-2',
-        recvID: 'user-1',
-        content: '我通过了你的好友请求，现在开始聊天吧',
+        where: { requestId: 'request-1' },
+        create: expect.objectContaining({
+          requesterUserID: 'user-1',
+          accepterUserID: 'user-2',
+          status: 'PENDING',
+        }),
       }),
     );
   });
 
-  it('sends accepted friend greeting messages through OpenIM', async () => {
+  it('does not call OpenIM directly while accepting a request', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',
       userID: 'user-1',
@@ -1483,29 +1530,9 @@ describe('FriendService', () => {
     await expect(
       service.handleRequest('user-2', 'request-1', FriendState.ACCEPTED),
     ).resolves.toBeUndefined();
-    // The greeting is dispatched fire-and-forget (void) so the accept response
-    // isn't blocked on OpenIM — flush pending microtasks before asserting it ran.
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(openimService.importFriends).toHaveBeenCalledWith('user-1', [
-      'user-2',
-    ]);
-    expect(openimService.importFriends).toHaveBeenCalledWith('user-2', [
-      'user-1',
-    ]);
-    expect(openimService.sendTextMessage).toHaveBeenCalledWith({
-      sendID: 'user-1',
-      recvID: 'user-2',
-      content: '我是申请者',
-      senderNickname: '申请者',
-      senderFaceURL: 'sender.png',
-    });
-    expect(openimService.sendTextMessage).toHaveBeenCalledWith({
-      sendID: 'user-2',
-      recvID: 'user-1',
-      content: '我通过了你的好友请求，现在开始聊天吧',
-      senderNickname: '通过者',
-      senderFaceURL: 'receiver.png',
-    });
+    expect(openimService.importFriends).not.toHaveBeenCalled();
+    expect(openimService.sendTextMessage).not.toHaveBeenCalled();
+    expect(prisma.friendChatReplayOutbox.upsert).toHaveBeenCalled();
   });
 
   it('queues removeFriend OpenIM sync in both directions', async () => {
@@ -1530,6 +1557,11 @@ describe('FriendService', () => {
           operation: 'DELETE_FRIEND',
           userID: 'user-2',
           targetUserID: 'user-1',
+        },
+        {
+          operation: 'CLEAR_CONVERSATION',
+          userID: 'user-1',
+          targetUserID: 'user-2',
         },
       ],
       skipDuplicates: true,
@@ -1569,7 +1601,17 @@ describe('FriendService', () => {
     prisma.friend.count.mockResolvedValue(0);
 
     const tx = {
+      $executeRaw: jest.fn(),
       friend: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'request-1',
+          userID: 'user-1',
+          friendID: 'user-2',
+          state: FriendState.PENDING,
+          message: 'hello',
+          pendingRemarkBySender: 'met at school',
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         update: jest.fn().mockResolvedValue({
           id: 'request-1',
           userID: 'user-1',
@@ -1642,7 +1684,16 @@ describe('FriendService', () => {
     prisma.friend.count.mockResolvedValue(0);
 
     const tx = {
+      $executeRaw: jest.fn(),
       friend: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'request-1',
+          userID: 'user-1',
+          friendID: 'user-2',
+          state: FriendState.PENDING,
+          message: 'hello',
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         update: jest.fn().mockResolvedValue({
           id: 'request-1',
           userID: 'user-1',

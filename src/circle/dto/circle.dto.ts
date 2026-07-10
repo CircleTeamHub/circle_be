@@ -113,7 +113,6 @@ export class CreateCircleDto {
   @IsBoolean()
   @IsOptional()
   memberCanPost?: boolean;
-
 }
 
 export class ListCirclesQueryDto {
