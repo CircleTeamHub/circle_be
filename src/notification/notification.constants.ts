@@ -20,6 +20,7 @@ export const DISCOVER_NOTIFICATION_TYPES = [
   NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED,
   NotificationType.CIRCLE_POST_SIGNUP_CREATED,
   NotificationType.CIRCLE_POST_AUTO_ENDED,
+  NotificationType.PROFILE_LIKE,
 ] as const;
 
 export const PROFILE_NOTIFICATION_TYPES = [NotificationType.SYSTEM] as const;

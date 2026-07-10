@@ -259,6 +259,23 @@ export class NotificationService {
     });
   }
 
+  /**
+   * "XX 赞了你的资料" —— 用户资料点赞（receivedLikeCount）产生的互动通知。
+   * 归入互动类（DISCOVER），驱动铃铛列表 + 动态 tab 红点 + 横幅。点赞层已保证
+   * 每人每天最多赞一次同一目标，dedupe window 只是并发兜底。
+   */
+  async createProfileLikeNotification(params: {
+    actorId: string;
+    toUserId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.actorId,
+      type: NotificationType.PROFILE_LIKE,
+      dedupeWindowMs: NOTIFICATION_DEDUPE_WINDOW_MS,
+    });
+  }
+
   async createCirclePostSignupNotification(params: {
     toUserId: string;
     fromUserId: string;

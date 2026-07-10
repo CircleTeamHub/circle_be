@@ -14,8 +14,18 @@ describe('LikeService', () => {
     $executeRaw: jest.fn(),
   };
   const iconService = { invalidateDisplayIconCacheFor: jest.fn() };
+  const notificationService = { createProfileLikeNotification: jest.fn() };
+  const realtimeService = {
+    broadcastInteractionUnread: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+  };
 
-  const service = new LikeService(prisma as any, iconService as any);
+  const service = new LikeService(
+    prisma as any,
+    iconService as any,
+    notificationService as any,
+    realtimeService as any,
+  );
 
   // tx is prisma itself, so tx.* delegates to the same mocks.
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
@@ -26,6 +36,10 @@ describe('LikeService', () => {
     prisma.$executeRaw.mockResolvedValue(1);
     prisma.user.update.mockResolvedValue({});
     prisma.userLike.create.mockResolvedValue({});
+    // Default: a fresh like yields a notification dto, which drives the WS broadcasts.
+    notificationService.createProfileLikeNotification.mockResolvedValue({
+      id: 'notif-1',
+    });
   });
 
   describe('like', () => {
@@ -77,6 +91,66 @@ describe('LikeService', () => {
       expect(result).toEqual({ likeCount: 1, likedByMeToday: true });
     });
 
+    it('notifies the target (bell + discover badge + snackbar) on a fresh like', async () => {
+      prisma.user.findUnique
+        .mockResolvedValueOnce({ status: 'ACTIVE' })
+        .mockResolvedValueOnce({ receivedLikeCount: 1 });
+      prisma.userLike.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'like-1' });
+      prisma.userLike.count.mockResolvedValue(0);
+
+      await service.like('u1', 'u2');
+
+      expect(
+        notificationService.createProfileLikeNotification,
+      ).toHaveBeenCalledWith({ actorId: 'u1', toUserId: 'u2' });
+      expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
+        'u2',
+      );
+      expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
+        'u2',
+        { id: 'notif-1' },
+      );
+    });
+
+    it('skips the WS broadcasts when the notification was deduped (null)', async () => {
+      notificationService.createProfileLikeNotification.mockResolvedValueOnce(
+        null,
+      );
+      prisma.user.findUnique
+        .mockResolvedValueOnce({ status: 'ACTIVE' })
+        .mockResolvedValueOnce({ receivedLikeCount: 1 });
+      prisma.userLike.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'like-1' });
+      prisma.userLike.count.mockResolvedValue(0);
+
+      await service.like('u1', 'u2');
+
+      expect(realtimeService.broadcastInteractionUnread).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastNotificationCreated,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('never lets a notification failure break a successful like', async () => {
+      notificationService.createProfileLikeNotification.mockRejectedValueOnce(
+        new Error('notif down'),
+      );
+      prisma.user.findUnique
+        .mockResolvedValueOnce({ status: 'ACTIVE' })
+        .mockResolvedValueOnce({ receivedLikeCount: 1 });
+      prisma.userLike.findUnique
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'like-1' });
+      prisma.userLike.count.mockResolvedValue(0);
+
+      const result = await service.like('u1', 'u2');
+
+      expect(result).toEqual({ likeCount: 1, likedByMeToday: true });
+    });
+
     it('is idempotent when already liked today (no quota spent, no tx)', async () => {
       prisma.user.findUnique
         .mockResolvedValueOnce({ status: 'ACTIVE' })
@@ -89,6 +163,9 @@ describe('LikeService', () => {
 
       expect(prisma.$transaction).not.toHaveBeenCalled();
       expect(prisma.userLike.create).not.toHaveBeenCalled();
+      expect(
+        notificationService.createProfileLikeNotification,
+      ).not.toHaveBeenCalled();
       expect(result).toEqual({ likeCount: 7, likedByMeToday: true });
     });
 
@@ -117,6 +194,10 @@ describe('LikeService', () => {
 
       const result = await service.like('u1', 'u2');
 
+      // A concurrent duplicate isn't a fresh like → no notification side effect.
+      expect(
+        notificationService.createProfileLikeNotification,
+      ).not.toHaveBeenCalled();
       expect(result).toEqual({ likeCount: 1, likedByMeToday: true });
     });
   });
