@@ -46,7 +46,25 @@ describe('trace comment mention notification flow', () => {
   let traceService: TraceService;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    prisma.trace.findFirst.mockReset();
+    prisma.trace.update.mockReset();
+    prisma.traceComment.findFirst.mockReset();
+    prisma.traceComment.create.mockReset();
+    prisma.user.findMany.mockReset();
+    prisma.friend.findMany.mockReset();
+    prisma.userPrivacySetting.findMany.mockReset();
+    prisma.userPrivacySetting.findUnique.mockReset();
+    prisma.notification.create.mockReset();
+    prisma.$transaction
+      .mockReset()
+      .mockImplementation(async (input: any) =>
+        Array.isArray(input) ? Promise.all(input) : input(prisma),
+      );
+    realtime.broadcastInteractionUnread.mockReset();
+    realtime.broadcastSystemNotificationUnread.mockReset();
+    realtime.broadcastNotificationCreated.mockReset();
+    realtime.broadcastCirclePostInteractionCreated.mockReset();
+    push.sendNotification.mockReset();
     realtime.broadcastInteractionUnread.mockResolvedValue(undefined);
     push.sendNotification.mockResolvedValue(undefined);
 
@@ -159,6 +177,74 @@ describe('trace comment mention notification flow', () => {
     ).resolves.toEqual(expect.objectContaining({ id: 'comment-1' }));
 
     expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
+    expect(prisma.notification.create).not.toHaveBeenCalled();
+    expect(
+      prisma.$transaction.mock.calls.some(([operations]) =>
+        Array.isArray(operations),
+      ),
+    ).toBe(false);
+    expect(push.sendNotification).not.toHaveBeenCalled();
+    expect(realtime.broadcastInteractionUnread).not.toHaveBeenCalled();
+    expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
+    expect(
+      realtime.broadcastCirclePostInteractionCreated,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('blocks all notification side effects when the trace is deleted after preflight', async () => {
+    prisma.trace.findFirst
+      .mockResolvedValueOnce({
+        id: 'trace-1',
+        fromID: 'actor-1',
+        deleted: false,
+        visibility: 'PUBLIC',
+      })
+      .mockResolvedValueOnce(null);
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+
+    await traceService.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
+
+    expect(prisma.trace.findFirst).toHaveBeenNthCalledWith(2, {
+      where: { id: 'trace-1', deleted: false },
+      select: { fromID: true, visibility: true },
+    });
+    expect(prisma.notification.create).not.toHaveBeenCalled();
+    expect(
+      prisma.$transaction.mock.calls.some(([operations]) =>
+        Array.isArray(operations),
+      ),
+    ).toBe(false);
+    expect(push.sendNotification).not.toHaveBeenCalled();
+    expect(realtime.broadcastInteractionUnread).not.toHaveBeenCalled();
+    expect(realtime.broadcastNotificationCreated).not.toHaveBeenCalled();
+    expect(
+      realtime.broadcastCirclePostInteractionCreated,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('blocks all notification side effects when trace visibility changes after preflight', async () => {
+    prisma.trace.findFirst
+      .mockResolvedValueOnce({
+        id: 'trace-1',
+        fromID: 'actor-1',
+        deleted: false,
+        visibility: 'PUBLIC',
+      })
+      .mockResolvedValueOnce({
+        fromID: 'actor-1',
+        visibility: 'PRIVATE',
+      });
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+
+    await traceService.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
+
+    expect(prisma.trace.findFirst).toHaveBeenCalledTimes(2);
     expect(prisma.notification.create).not.toHaveBeenCalled();
     expect(
       prisma.$transaction.mock.calls.some(([operations]) =>

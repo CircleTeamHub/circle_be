@@ -538,6 +538,86 @@ describe('TraceService', () => {
     expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
+  it('maps a missing trace during the boundary refresh to mention-not-visible', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
+    const [notificationParams] = notificationService
+      .createTraceCommentNotifications.mock.calls[0] as unknown as [
+      {
+        recheckMentionEligibility: (recipientIds: string[]) => Promise<void>;
+      },
+    ];
+    prisma.trace.findFirst.mockResolvedValue(null);
+
+    const error = await notificationParams
+      .recheckMentionEligibility(['mention-user-1'])
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect((error as BadRequestException).getResponse()).toEqual(
+      expect.objectContaining({ errorCode: TraceErrorCode.MentionNotVisible }),
+    );
+  });
+
+  it('propagates trace refresh database failures from the boundary callback', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+    prisma.friend.findMany.mockResolvedValue([]);
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds: ['mention-user-1'],
+    });
+    const [notificationParams] = notificationService
+      .createTraceCommentNotifications.mock.calls[0] as unknown as [
+      {
+        recheckMentionEligibility: (recipientIds: string[]) => Promise<void>;
+      },
+    ];
+    const databaseError = new Error('trace refresh database unavailable');
+    prisma.trace.findFirst.mockRejectedValue(databaseError);
+
+    await expect(
+      notificationParams.recheckMentionEligibility(['mention-user-1']),
+    ).rejects.toBe(databaseError);
+  });
+
   it('broadcasts the created notification payload after adding a trace comment', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',

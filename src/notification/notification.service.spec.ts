@@ -338,6 +338,28 @@ describe('NotificationService', () => {
       expect(pushService.sendNotification).not.toHaveBeenCalled();
     });
 
+    it('sends no push when the notification transaction rejects', async () => {
+      const transactionError = new Error('notification transaction failed');
+      const notificationOperation = Promise.resolve({ id: 'uncommitted' });
+      prisma.notification.create.mockReturnValue(notificationOperation);
+      prisma.$transaction.mockRejectedValueOnce(transactionError);
+
+      await expect(
+        service.createTraceCommentNotifications({
+          actorId: 'actor-1',
+          traceId: 'trace-1',
+          commentId: 'comment-1',
+          traceOwnerId: 'actor-1',
+          mentionedUserIds: ['mention-user-1'],
+          recheckMentionEligibility: jest.fn().mockResolvedValue(undefined),
+          content: 'hello',
+        }),
+      ).rejects.toBe(transactionError);
+
+      expect(prisma.$transaction).toHaveBeenCalledWith([notificationOperation]);
+      expect(pushService.sendNotification).not.toHaveBeenCalled();
+    });
+
     it('getProfileNotifications returns only profile-domain system rows', async () => {
       prisma.notification.findMany.mockResolvedValue([
         {

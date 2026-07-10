@@ -494,8 +494,8 @@ export class TraceService {
           replyToUserId: comment.replyTo?.user.id ?? null,
           mentionedUserIds,
           recheckMentionEligibility: async (recipientIds) => {
-            await this.requireVisibleMentionRecipients(
-              trace,
+            await this.requireFreshVisibleMentionRecipients(
+              traceId,
               userId,
               recipientIds,
             );
@@ -577,6 +577,24 @@ export class TraceService {
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private async requireFreshVisibleMentionRecipients(
+    traceId: string,
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<string[]> {
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+      select: { fromID: true, visibility: true },
+    });
+    if (!trace) {
+      throw new BadRequestException({
+        message: 'Mentioned user cannot view this moment',
+        errorCode: TraceErrorCode.MentionNotVisible,
+      });
+    }
+    return this.requireVisibleMentionRecipients(trace, actorId, recipientIds);
+  }
 
   private async requireVisibleMentionRecipients(
     trace: { fromID: string; visibility: string },
