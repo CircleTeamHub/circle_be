@@ -5,6 +5,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationType } from 'src/generated/prisma';
 import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
 import { NotificationPushService } from './notification-push.service';
+import { createHash } from 'crypto';
 
 describe('NotificationService', () => {
   let service: NotificationService;
@@ -149,6 +150,69 @@ describe('NotificationService', () => {
         where: {
           userID: 'user-1',
           token: 'ExponentPushToken[abc]',
+        },
+      });
+    });
+
+    it('stores and rotates only the SHA-256 revocation-secret hash', async () => {
+      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
+      const revocationSecret = 'registration-secret-that-is-long-enough';
+      const revocationSecretHash = createHash('sha256')
+        .update(revocationSecret)
+        .digest('hex');
+
+      await service.registerPushToken('user-1', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+        revocationSecret,
+      });
+
+      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith({
+        where: { token: 'ExponentPushToken[abc]' },
+        create: expect.objectContaining({ revocationSecretHash }),
+        update: expect.objectContaining({ revocationSecretHash }),
+      });
+      const persisted = JSON.stringify(
+        prisma.devicePushToken.upsert.mock.calls[0][0],
+      );
+      expect(persisted).not.toContain(revocationSecret);
+    });
+
+    it('revokes idempotently only when token and secret hash match', async () => {
+      const revocationSecret = 'registered-secret-that-is-long-enough';
+      const revocationSecretHash = createHash('sha256')
+        .update(revocationSecret)
+        .digest('hex');
+      prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 1 });
+
+      await service.revokePushToken({
+        token: 'ExponentPushToken[abc]',
+        revocationSecret,
+      });
+
+      expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
+        where: {
+          token: 'ExponentPushToken[abc]',
+          revocationSecretHash,
+        },
+      });
+    });
+
+    it('uses the supplied hash predicate so a wrong secret is a no-op', async () => {
+      prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.revokePushToken({
+          token: 'ExponentPushToken[abc]',
+          revocationSecret: 'wrong-secret-that-is-still-long-enough',
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
+        where: {
+          token: 'ExponentPushToken[abc]',
+          revocationSecretHash: expect.stringMatching(/^[a-f0-9]{64}$/),
         },
       });
     });

@@ -1040,6 +1040,7 @@ model DevicePushToken {
   platform   String
   projectId  String?
   appVersion String?
+  revocationSecretHash String?
   disabledAt DateTime?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt

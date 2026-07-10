@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -11,6 +12,7 @@ import {
   NOTIFICATION_REALTIME_INCLUDE,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
+  type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
 
@@ -73,6 +75,9 @@ export class NotificationService {
     userId: string,
     dto: RegisterPushTokenDto,
   ): Promise<void> {
+    const revocationSecretHash = dto.revocationSecret
+      ? this.hashRevocationSecret(dto.revocationSecret)
+      : undefined;
     await this.prisma.devicePushToken.upsert({
       where: { token: dto.token },
       create: {
@@ -82,6 +87,7 @@ export class NotificationService {
         provider: dto.provider,
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
+        ...(revocationSecretHash ? { revocationSecretHash } : {}),
       },
       update: {
         userID: userId,
@@ -90,6 +96,7 @@ export class NotificationService {
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
         disabledAt: null,
+        ...(revocationSecretHash ? { revocationSecretHash } : {}),
       },
     });
   }
@@ -101,6 +108,19 @@ export class NotificationService {
         token,
       },
     });
+  }
+
+  async revokePushToken(dto: RevokePushTokenDto): Promise<void> {
+    await this.prisma.devicePushToken.deleteMany({
+      where: {
+        token: dto.token,
+        revocationSecretHash: this.hashRevocationSecret(dto.revocationSecret),
+      },
+    });
+  }
+
+  private hashRevocationSecret(secret: string): string {
+    return createHash('sha256').update(secret).digest('hex');
   }
 
   async getUnreadSummary(userId: string) {
