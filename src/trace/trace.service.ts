@@ -452,7 +452,7 @@ export class TraceService {
     }
 
     const mentionedUserIds = await this.requireVisibleMentionRecipients(
-      traceId,
+      trace,
       userId,
       dto.mentionedUserIds ?? [],
     );
@@ -493,6 +493,13 @@ export class TraceService {
           replyToCommentId: comment.replyTo?.id ?? null,
           replyToUserId: comment.replyTo?.user.id ?? null,
           mentionedUserIds,
+          recheckMentionEligibility: async (recipientIds) => {
+            await this.requireVisibleMentionRecipients(
+              trace,
+              userId,
+              recipientIds,
+            );
+          },
           content: comment.content,
         });
 
@@ -572,7 +579,7 @@ export class TraceService {
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private async requireVisibleMentionRecipients(
-    traceId: string,
+    trace: { fromID: string; visibility: string },
     actorId: string,
     recipientIds: string[],
   ): Promise<string[]> {
@@ -604,13 +611,71 @@ export class TraceService {
       });
     }
 
-    try {
-      await Promise.all(
-        distinctRecipientIds.map((recipientId) =>
-          this.requireVisibleTrace(traceId, recipientId),
-        ),
-      );
-    } catch {
+    const nonOwnerRecipientIds = distinctRecipientIds.filter(
+      (recipientId) => recipientId !== trace.fromID,
+    );
+    if (nonOwnerRecipientIds.length === 0) {
+      return distinctRecipientIds;
+    }
+    if (trace.visibility === 'PRIVATE') {
+      throw new BadRequestException({
+        message: 'Mentioned user cannot view this moment',
+        errorCode: TraceErrorCode.MentionNotVisible,
+      });
+    }
+
+    const [friendships, settingsByAuthor] = await Promise.all([
+      this.prisma.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            {
+              userID: trace.fromID,
+              friendID: { in: nonOwnerRecipientIds },
+            },
+            {
+              userID: { in: nonOwnerRecipientIds },
+              friendID: trace.fromID,
+            },
+          ],
+        },
+        select: {
+          userID: true,
+          friendID: true,
+          permissionA: true,
+          permissionB: true,
+        },
+      }),
+      this.privacySettings.getSettingsMany([trace.fromID]),
+    ]);
+    const friendshipByRecipient = new Map(
+      friendships.map((friendship) => [
+        friendship.userID === trace.fromID
+          ? friendship.friendID
+          : friendship.userID,
+        friendship,
+      ]),
+    );
+    const authorSettings = settingsByAuthor.get(trace.fromID);
+
+    const hasInvisibleRecipient = nonOwnerRecipientIds.some((recipientId) => {
+      const friendship = friendshipByRecipient.get(recipientId);
+      const isFriend = Boolean(friendship);
+      const authorPermission =
+        friendship?.userID === trace.fromID
+          ? friendship.permissionA
+          : friendship?.permissionB;
+      if (authorPermission === 'CHAT_ONLY') {
+        return true;
+      }
+      if (
+        !this.privacySettings.momentsVisibleFor(authorSettings, false, isFriend)
+      ) {
+        return true;
+      }
+      return trace.visibility === 'FRIENDS_ONLY' && !isFriend;
+    });
+    if (hasInvisibleRecipient) {
       throw new BadRequestException({
         message: 'Mentioned user cannot view this moment',
         errorCode: TraceErrorCode.MentionNotVisible,

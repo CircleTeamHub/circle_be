@@ -82,11 +82,15 @@ export class NotificationPushService {
   private buildMessage(notification: NotificationRealtimeDto) {
     const actor = notification.fromUser?.nickname || 'CircleIM';
     const body =
-      notification.content ||
-      notification.fromReply?.content ||
-      notification.fromCirclePost?.excerpt ||
-      notification.fromTrace?.excerpt ||
-      this.fallbackBody(notification.type);
+      notification.type === 'TRACE_MENTION'
+        ? notification.content ||
+          notification.fromReply?.content ||
+          this.fallbackBody(notification.type)
+        : notification.content ||
+          notification.fromReply?.content ||
+          notification.fromCirclePost?.excerpt ||
+          notification.fromTrace?.excerpt ||
+          this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
       body,

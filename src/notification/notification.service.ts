@@ -426,12 +426,23 @@ export class NotificationService {
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
     mentionedUserIds?: string[];
+    recheckMentionEligibility: (mentionedUserIds: string[]) => Promise<void>;
     content: string;
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
   > {
     const notifications = [];
     const notifiedUserIds = new Set<string>();
+    const mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
+      (mentionedUserId) =>
+        mentionedUserId && mentionedUserId !== params.actorId,
+    );
+
+    if (mentionedUserIds.length > 0) {
+      // Authorization snapshot: refresh immediately before constructing the
+      // Prisma operations that are committed in the single transaction below.
+      await params.recheckMentionEligibility(mentionedUserIds);
+    }
 
     if (
       params.traceOwnerId &&
@@ -476,7 +487,7 @@ export class NotificationService {
       );
     }
 
-    for (const mentionedUserId of params.mentionedUserIds ?? []) {
+    for (const mentionedUserId of mentionedUserIds) {
       if (
         !mentionedUserId ||
         mentionedUserId === params.actorId ||

@@ -408,7 +408,10 @@ describe('TraceService', () => {
     });
     prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
     prisma.friend.findMany.mockResolvedValue([]);
-    privacySettings.canViewMoments.mockResolvedValue(false);
+    privacySettings.getSettingsMany.mockResolvedValue(
+      new Map([['actor-1', { momentsVisibility: 'PRIVATE' }]]),
+    );
+    privacySettings.momentsVisibleFor.mockImplementationOnce(() => false);
 
     const error = await service
       .addComment('actor-1', 'trace-1', {
@@ -466,6 +469,73 @@ describe('TraceService', () => {
         mentionedUserIds: ['mention-user-1', 'mention-user-2'],
       }),
     );
+  });
+
+  it('authorizes the maximum mention set with bounded batch queries', async () => {
+    const mentionedUserIds = Array.from(
+      { length: 20 },
+      (_, index) => `mention-user-${index + 1}`,
+    );
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue(
+      mentionedUserIds.map((id) => ({ id })),
+    );
+    prisma.friend.findMany.mockResolvedValue(
+      mentionedUserIds.map((friendID) => ({
+        userID: 'actor-1',
+        friendID,
+        permissionA: 'FULL',
+        permissionB: 'FULL',
+      })),
+    );
+    privacySettings.getSettingsMany.mockResolvedValue(new Map());
+    prisma.traceComment.create.mockResolvedValue({
+      id: 'comment-1',
+      content: 'hello',
+      images: [],
+      createdAt: new Date('2026-07-10T00:00:00.000Z'),
+      user: { id: 'actor-1', nickname: 'Alice' },
+      replyTo: null,
+    });
+    prisma.trace.update.mockResolvedValue({});
+
+    await service.addComment('actor-1', 'trace-1', {
+      content: 'hello',
+      mentionedUserIds,
+    });
+
+    expect(prisma.trace.findFirst).toHaveBeenCalledTimes(1);
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+    expect(privacySettings.getSettingsMany).toHaveBeenCalledTimes(1);
+    expect(privacySettings.canViewMoments).not.toHaveBeenCalled();
+  });
+
+  it('propagates mention authorization database failures unchanged', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'actor-1',
+      deleted: false,
+      visibility: 'PUBLIC',
+    });
+    prisma.user.findMany.mockResolvedValue([{ id: 'mention-user-1' }]);
+    prisma.friend.findMany.mockRejectedValue(
+      new Error('friendship database unavailable'),
+    );
+
+    await expect(
+      service.addComment('actor-1', 'trace-1', {
+        content: 'hello',
+        mentionedUserIds: ['mention-user-1'],
+      }),
+    ).rejects.toThrow('friendship database unavailable');
+
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
   it('broadcasts the created notification payload after adding a trace comment', async () => {

@@ -240,6 +240,7 @@ describe('NotificationService', () => {
     });
 
     it('creates one precedence-ordered notification per comment target', async () => {
+      const recheckMentionEligibility = jest.fn().mockResolvedValue(undefined);
       prisma.notification.create.mockImplementation(({ data }: any) =>
         Promise.resolve({
           id: `notification-${data.toUserID}`,
@@ -270,6 +271,7 @@ describe('NotificationService', () => {
           'mention-user-1',
           'mention-user-2',
         ],
+        recheckMentionEligibility,
         content: 'hello',
       });
 
@@ -305,6 +307,35 @@ describe('NotificationService', () => {
         'mention-user-2',
       ]);
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(recheckMentionEligibility).toHaveBeenCalledWith([
+        'author-1',
+        'reply-user-1',
+        'mention-user-1',
+        'mention-user-2',
+      ]);
+      expect(
+        recheckMentionEligibility.mock.invocationCallOrder[0],
+      ).toBeLessThan(prisma.notification.create.mock.invocationCallOrder[0]);
+    });
+
+    it('creates no notification side effects when the boundary eligibility recheck fails', async () => {
+      const recheckError = new Error('mention access revoked');
+
+      await expect(
+        service.createTraceCommentNotifications({
+          actorId: 'actor-1',
+          traceId: 'trace-1',
+          commentId: 'comment-1',
+          traceOwnerId: 'actor-1',
+          mentionedUserIds: ['mention-user-1'],
+          recheckMentionEligibility: jest.fn().mockRejectedValue(recheckError),
+          content: 'hello',
+        }),
+      ).rejects.toBe(recheckError);
+
+      expect(prisma.notification.create).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(pushService.sendNotification).not.toHaveBeenCalled();
     });
 
     it('getProfileNotifications returns only profile-domain system rows', async () => {

@@ -1,4 +1,5 @@
 import { PrismaService } from 'src/prisma/prisma.service';
+import { NotificationType } from 'src/generated/prisma';
 import { NotificationPushService } from './notification-push.service';
 
 describe('NotificationPushService', () => {
@@ -167,10 +168,14 @@ describe('NotificationPushService', () => {
 
     await service.sendNotification('user-1', {
       ...baseNotification(),
-      type: 'TRACE_MENTION' as any,
+      type: NotificationType.TRACE_MENTION,
       content: '',
       fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-      fromTrace: { id: 'trace-1', excerpt: '', firstImage: null },
+      fromTrace: {
+        id: 'trace-1',
+        excerpt: 'original trace must not become the mention body',
+        firstImage: null,
+      },
       fromReply: { id: 'comment-1', content: '' },
     });
 
