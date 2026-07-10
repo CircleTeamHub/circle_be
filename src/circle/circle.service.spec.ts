@@ -93,17 +93,18 @@ describe('CircleService', () => {
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
   });
 
-  it('private-circle self-apply creates a PENDING member plus a vouch invitation', async () => {
+  it('every join goes through vouch verification — even public circles get PENDING + invitation', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
-      isPublic: false,
+      // 关键：即使 isPublic 也不再秒进——任何入口申请一律走担保验证。
+      isPublic: true,
       memberCount: 3,
       maxMembers: null,
       joinVipRestriction: null,
       joinCreditRestriction: null,
       joinFancyRestriction: false,
-      groupID: null,
+      groupID: 'group-1',
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
@@ -111,10 +112,6 @@ describe('CircleService', () => {
       fancyNumber: null,
     });
     prisma.circleMember.findUnique.mockResolvedValue(null);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 3,
-    });
     prisma.circleInvitation.findFirst.mockResolvedValue(null);
 
     await service.joinCircle('user-1', 'circle-1');
@@ -132,15 +129,16 @@ describe('CircleService', () => {
         inviterID: 'user-1',
       },
     });
-    // PENDING 不占正式名额。
+    // PENDING 不占正式名额、不进 OpenIM 群——转正统一发生在担保 finalize。
     expect(prisma.circle.update).not.toHaveBeenCalled();
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
-  it('private-circle self-apply reuses an existing pending invitation', async () => {
+  it('join reuses an existing pending invitation instead of duplicating it', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
-      isPublic: false,
+      isPublic: true,
       memberCount: 3,
       maxMembers: null,
       joinVipRestriction: null,
@@ -154,10 +152,6 @@ describe('CircleService', () => {
       fancyNumber: null,
     });
     prisma.circleMember.findUnique.mockResolvedValue(null);
-    prisma.circle.findUnique.mockResolvedValue({
-      maxMembers: null,
-      memberCount: 3,
-    });
     prisma.circleInvitation.findFirst.mockResolvedValue({ id: 'inv-1' });
 
     await service.joinCircle('user-1', 'circle-1');

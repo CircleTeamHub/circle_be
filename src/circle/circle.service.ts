@@ -282,32 +282,18 @@ export class CircleService {
       }
     }
 
-    const status = circle.isPublic ? 'ACTIVE' : 'PENDING';
-
+    // 统一规则：无论从哪个入口（搜索/名片/浏览）申请加入，一律走担保验证——
+    // PENDING 成员 + 担保单（申请人自任 inviter，0/requiredCount 起步）同事务
+    // 落库，不存在「公开圈秒进」。转正（memberCount +1 / OpenIM 进群）发生在
+    // 担保满额或圈主代批的 finalize 里。isPublic 不再参与入圈判定。
     for (let attempt = 1; attempt <= MAX_JOIN_TX_ATTEMPTS; attempt += 1) {
       try {
         await this.prisma.$transaction(
           async (tx) => {
-            const currentCircle = await tx.circle.findUnique({
-              where: { id: circleId },
-              select: { maxMembers: true, memberCount: true },
-            });
-            if (
-              status === 'ACTIVE' &&
-              currentCircle &&
-              currentCircle.maxMembers != null &&
-              currentCircle.memberCount >= currentCircle.maxMembers
-            ) {
-              throw new BadRequestException({
-                message: 'Circle has reached its member limit',
-                errorCode: CircleErrorCode.MemberLimit,
-              });
-            }
-
             if (existing) {
               await tx.circleMember.update({
                 where: { id: existing.id },
-                data: { status, role: 'MEMBER' },
+                data: { status: 'PENDING', role: 'MEMBER' },
               });
             } else {
               await tx.circleMember.create({
@@ -315,38 +301,28 @@ export class CircleService {
                   userID: userId,
                   circleID: circleId,
                   role: 'MEMBER',
-                  status,
+                  status: 'PENDING',
                 },
               });
             }
 
-            if (status === 'ACTIVE') {
-              await tx.circle.update({
-                where: { id: circleId },
-                data: { memberCount: { increment: 1 } },
-              });
-            } else {
-              // 私密圈自主申请：随 PENDING 成员同事务创建担保单（申请人自任
-              // inviter，0/requiredCount 起步），让详情页「邀请好友为我验证」
-              // 与圈主审核页立即可用。已有进行中的担保单（例如成员先邀请过）
-              // 则复用，不重复建。
-              const existingInvitation = await tx.circleInvitation.findFirst({
-                where: {
+            // 已有进行中的担保单（例如成员先邀请过）则复用，不重复建。
+            const existingInvitation = await tx.circleInvitation.findFirst({
+              where: {
+                circleID: circleId,
+                applicantID: userId,
+                status: 'PENDING',
+              },
+              select: { id: true },
+            });
+            if (!existingInvitation) {
+              await tx.circleInvitation.create({
+                data: {
                   circleID: circleId,
                   applicantID: userId,
-                  status: 'PENDING',
+                  inviterID: userId,
                 },
-                select: { id: true },
               });
-              if (!existingInvitation) {
-                await tx.circleInvitation.create({
-                  data: {
-                    circleID: circleId,
-                    applicantID: userId,
-                    inviterID: userId,
-                  },
-                });
-              }
             }
           },
           {
@@ -376,17 +352,6 @@ export class CircleService {
           });
         }
         throw error;
-      }
-    }
-
-    // Add to OpenIM group if auto-joined
-    if (status === 'ACTIVE' && circle.groupID) {
-      try {
-        await this.openimService.addGroupMembers(circle.groupID, [userId]);
-      } catch (error) {
-        this.logger.warn(
-          `Failed to add user ${userId} to OpenIM group ${circle.groupID}: ${error}`,
-        );
       }
     }
   }
