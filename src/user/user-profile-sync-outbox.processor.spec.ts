@@ -14,6 +14,7 @@ describe('UserProfileSyncOutboxProcessor', () => {
     const prisma = {
       userProfileSyncOutbox: {
         findMany: jest.fn().mockResolvedValue([job]),
+        findUnique: jest.fn(),
         updateMany: jest
           .fn()
           .mockResolvedValueOnce({ count: 1 })
@@ -94,13 +95,52 @@ describe('UserProfileSyncOutboxProcessor', () => {
     );
   });
 
-  it('releases its lease when a newer generation supersedes completion', async () => {
+  it('writes the superseding generation before releasing its lease', async () => {
     const { prisma, processor } = createHarness();
     prisma.userProfileSyncOutbox.updateMany
       .mockReset()
       .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 })
       .mockResolvedValueOnce({ count: 1 });
+    prisma.userProfileSyncOutbox.findUnique.mockImplementation(async () => ({
+      generation: 4,
+      status: 'PENDING',
+      leaseToken:
+        prisma.userProfileSyncOutbox.updateMany.mock.calls[0][0].data
+          .leaseToken,
+    }));
+
+    await processor.processPending();
+
+    expect(prisma.user.findUnique).toHaveBeenCalledTimes(2);
+    expect(prisma.userProfileSyncOutbox.updateMany).toHaveBeenLastCalledWith({
+      where: {
+        id: 'job-1',
+        generation: 4,
+        leaseToken: expect.any(String),
+        status: 'PROCESSING',
+      },
+      data: expect.objectContaining({
+        status: 'COMPLETED',
+        leaseToken: null,
+      }),
+    });
+  });
+
+  it('does not release a superseded lease until it has promoted the latest generation', async () => {
+    const { prisma, processor } = createHarness();
+    prisma.userProfileSyncOutbox.updateMany
+      .mockReset()
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+    prisma.userProfileSyncOutbox.findUnique.mockResolvedValueOnce({
+      generation: 4,
+      status: 'PENDING',
+      leaseToken: 'different-worker',
+    });
 
     await processor.processPending();
 
@@ -108,16 +148,11 @@ describe('UserProfileSyncOutboxProcessor', () => {
       ([input]) => input,
     );
     const leaseToken = writes[0].data.leaseToken;
-    expect(writes).toEqual(
+    expect(writes).not.toEqual(
       expect.arrayContaining([
-        {
+        expect.objectContaining({
           where: { id: 'job-1', leaseToken, status: 'PENDING' },
-          data: {
-            leaseToken: null,
-            lockedAt: null,
-            nextAttemptAt: expect.any(Date),
-          },
-        },
+        }),
       ]),
     );
   });

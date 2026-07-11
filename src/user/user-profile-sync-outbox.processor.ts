@@ -1,8 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
-import { OpenimService } from 'src/openim/openim.service';
+import {
+  OPENIM_REQUEST_TIMEOUT_MS,
+  OpenimService,
+} from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+
+// A lease is recoverable only well after OpenIM's request deadline. This keeps
+// crash recovery without allowing two live requests for one user to overlap.
+const PROFILE_SYNC_LEASE_TIMEOUT_MS = Math.max(
+  10 * 60 * 1000,
+  OPENIM_REQUEST_TIMEOUT_MS * 2,
+);
 
 @Injectable()
 export class UserProfileSyncOutboxProcessor {
@@ -16,7 +26,7 @@ export class UserProfileSyncOutboxProcessor {
   @Cron(CronExpression.EVERY_MINUTE)
   async processPending(): Promise<number> {
     const now = new Date();
-    const staleBefore = new Date(now.getTime() - 10 * 60 * 1000);
+    const staleBefore = new Date(now.getTime() - PROFILE_SYNC_LEASE_TIMEOUT_MS);
     const jobs = await this.prisma.userProfileSyncOutbox.findMany({
       where: {
         OR: [
@@ -62,6 +72,19 @@ export class UserProfileSyncOutboxProcessor {
         },
       });
       if (claimed.count === 0) continue;
+      if (await this.processClaimed(job, leaseToken)) {
+        completed += 1;
+      }
+    }
+    return completed;
+  }
+
+  private async processClaimed(
+    job: { id: string; userID: string; generation: number; attempts: number },
+    leaseToken: string,
+  ): Promise<boolean> {
+    let generation = job.generation;
+    while (true) {
       try {
         const user = await this.prisma.user.findUnique({
           where: { id: job.userID },
@@ -77,7 +100,7 @@ export class UserProfileSyncOutboxProcessor {
         const finished = await this.prisma.userProfileSyncOutbox.updateMany({
           where: {
             id: job.id,
-            generation: job.generation,
+            generation,
             leaseToken,
             status: 'PROCESSING',
           },
@@ -90,16 +113,21 @@ export class UserProfileSyncOutboxProcessor {
           },
         });
         if (finished.count > 0) {
-          completed += 1;
-        } else {
-          await this.releaseSupersededLease(job.id, leaseToken);
+          return true;
         }
+
+        const supersedingGeneration = await this.promoteSupersedingGeneration(
+          job.id,
+          leaseToken,
+        );
+        if (supersedingGeneration === null) return false;
+        generation = supersedingGeneration;
       } catch (error) {
         const attempts = job.attempts + 1;
         const failed = await this.prisma.userProfileSyncOutbox.updateMany({
           where: {
             id: job.id,
-            generation: job.generation,
+            generation,
             leaseToken,
             status: 'PROCESSING',
           },
@@ -115,25 +143,48 @@ export class UserProfileSyncOutboxProcessor {
           },
         });
         if (failed.count === 0) {
-          await this.releaseSupersededLease(job.id, leaseToken);
+          const supersedingGeneration = await this.promoteSupersedingGeneration(
+            job.id,
+            leaseToken,
+          );
+          if (supersedingGeneration !== null) {
+            generation = supersedingGeneration;
+            continue;
+          }
         }
         this.logger.warn(`Profile sync job ${job.id} failed: ${error}`);
+        return false;
       }
     }
-    return completed;
   }
 
-  private async releaseSupersededLease(
+  private async promoteSupersedingGeneration(
     jobId: string,
     leaseToken: string,
-  ): Promise<void> {
-    await this.prisma.userProfileSyncOutbox.updateMany({
-      where: { id: jobId, leaseToken, status: 'PENDING' },
-      data: {
-        leaseToken: null,
-        lockedAt: null,
-        nextAttemptAt: new Date(),
-      },
-    });
+  ): Promise<number | null> {
+    while (true) {
+      const superseding = await this.prisma.userProfileSyncOutbox.findUnique({
+        where: { id: jobId },
+        select: { generation: true, status: true, leaseToken: true },
+      });
+      if (
+        !superseding ||
+        superseding.leaseToken !== leaseToken ||
+        superseding.status !== 'PENDING'
+      ) {
+        return null;
+      }
+
+      const promoted = await this.prisma.userProfileSyncOutbox.updateMany({
+        where: {
+          id: jobId,
+          generation: superseding.generation,
+          leaseToken,
+          status: 'PENDING',
+        },
+        data: { status: 'PROCESSING', lockedAt: new Date() },
+      });
+      if (promoted.count > 0) return superseding.generation;
+    }
   }
 }
