@@ -21,15 +21,24 @@ set -euo pipefail
 echo "==> 1/4 Simulate an existing db-push-built database (live schema, no migration history)"
 npx prisma db push --accept-data-loss
 
-echo "==> 2/4 Apply the documented runbook: mark the squashed baseline as already-applied"
-# Records 0_init as applied WITHOUT running its SQL — so Prisma won't try to
-# recreate the tables that db push already created.
+echo "==> 2/4 Apply the documented runbook: mark the baseline and schema migrations as already-applied"
+# Records the baseline and all migrations whose schema is already represented
+# by `prisma db push` as applied WITHOUT running their SQL. The data migration
+# is intentionally excluded so it still runs in the next step.
 npx prisma migrate resolve --applied 0_init
 
-echo "==> 3/4 Deploy the remaining pending migrations onto the existing database"
-# Only the post-baseline migrations run here (remove_account_id_prefix data
-# transform + account_id_lower_unique index). This is the step that would have
-# blown up without the resolve above.
+DATA_MIGRATION="20260623000000_remove_account_id_prefix"
+while IFS= read -r migration_path; do
+  migration="$(basename "$migration_path")"
+  if [[ "$migration" == "0_init" || "$migration" == "$DATA_MIGRATION" ]]; then
+    continue
+  fi
+  npx prisma migrate resolve --applied "$migration"
+done < <(find prisma/migrations -mindepth 1 -maxdepth 1 -type d | sort)
+
+echo "==> 3/4 Deploy the remaining pending data migration onto the existing database"
+# Only the data migration runs here. All schema migrations are already covered
+# by the live schema created in step 1 and were marked applied above.
 npx prisma migrate deploy
 
 echo "==> 4/4 Assert no schema drift between the migrated DB and schema.prisma"

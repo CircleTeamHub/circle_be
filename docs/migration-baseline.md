@@ -43,7 +43,16 @@ recreate existing tables. **Run once per existing environment, in order:**
 # 1. Mark the squashed schema as already applied (does NOT run the SQL).
 npx prisma migrate resolve --applied 0_init
 
-# 2. Apply remaining pending migrations (only the data migration).
+# 2. Mark every schema migration already represented by the live database as applied.
+#    Keep data migrations pending so they still execute.
+for migration in $(find prisma/migrations -mindepth 1 -maxdepth 1 -type d | sort); do
+  migration=$(basename "$migration")
+  [ "$migration" = "0_init" ] && continue
+  [ "$migration" = "20260623000000_remove_account_id_prefix" ] && continue
+  npx prisma migrate resolve --applied "$migration"
+done
+
+# 3. Apply remaining pending data migrations.
 npx prisma migrate deploy
 ```
 Verified against a simulated existing DB: `resolve --applied 0_init` records the

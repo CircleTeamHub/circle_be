@@ -1098,6 +1098,7 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+  @@index([fromFriendRequestID])
 }
 
 model NotificationPushOutbox {
