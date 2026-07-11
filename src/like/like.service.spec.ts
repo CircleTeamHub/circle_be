@@ -227,7 +227,10 @@ describe('LikeService', () => {
 
       const result = await service.unlike('u1', 'u2');
 
-      expect(prisma.$executeRaw).not.toHaveBeenCalled();
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      expect(String(prisma.$executeRaw.mock.calls[0][0])).toContain(
+        'pg_advisory_xact_lock_shared',
+      );
       expect(iconService.invalidateDisplayIconCacheFor).not.toHaveBeenCalled();
       expect(result).toEqual({ likeCount: 3, likedByMeToday: false });
     });

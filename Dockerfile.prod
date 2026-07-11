@@ -3,13 +3,17 @@ FROM node:22-slim AS build-stage
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
 # npm ci also runs the postinstall `prisma generate` step.
 RUN npm ci
 
 COPY . .
-RUN npm run build && npm prune --omit=dev
+RUN npm run build
 
 # --- production stage -----------------------------------------------------
 FROM node:22-slim AS production-stage
@@ -25,6 +29,8 @@ COPY --from=build-stage --chown=app:app /app/node_modules ./node_modules
 COPY --from=build-stage --chown=app:app /app/dist ./dist
 COPY --from=build-stage --chown=app:app /app/prisma ./prisma
 COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
+
+RUN npm prune --omit=dev
 
 USER app
 

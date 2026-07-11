@@ -24,6 +24,8 @@ import { createMetrics } from './metrics/metrics.service';
 import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
 import { createMetricsHandler } from './metrics/metrics.endpoint';
 import { businessMetrics } from './metrics/business-metrics';
+import { redisMetrics } from './redis/redis.metrics';
+import { uploadMetrics } from './metrics/upload-metrics';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -180,6 +182,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     : undefined;
   logger && app.useLogger(logger);
   app.setGlobalPrefix('api/v1');
+  if (isProduction) {
+    const express = app.getHttpAdapter?.().getInstance?.();
+    express?.set?.('trust proxy', 1);
+  }
   const redisService = getOptionalRedisService(app);
   const createLimiter = (
     limiterName: string,
@@ -289,7 +295,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // before the rate limiter below so scrapes are never throttled.
   const metrics = createMetrics();
   app.use(createHttpMetricsMiddleware(metrics));
-  // Expose HTTP RED metrics + business event counters together at /metrics.
+  // Expose HTTP RED, business, and Redis resilience metrics together.
   // Gated by METRICS_AUTH_TOKEN when set; left open otherwise so internal-only
   // deployments keep working without extra config.
   const metricsAuthToken =
@@ -307,7 +313,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use(
     '/metrics',
     createMetricsHandler(
-      Registry.merge([metrics.registry, businessMetrics.registry]),
+      Registry.merge([
+        metrics.registry,
+        businessMetrics.registry,
+        redisMetrics.registry,
+        uploadMetrics.registry,
+      ]),
       { authToken: metricsAuthToken },
     ),
   );

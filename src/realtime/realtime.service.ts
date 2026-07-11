@@ -324,46 +324,63 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
 
     return this.singleFlight(cacheKey, async () => {
-      const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
-        await Promise.all([
-          this.prisma.friendActivity.count({
-            where: { viewerId: userId, readAt: null },
-          }),
-          this.prisma.notification.count({
-            where: {
-              toUserID: userId,
-              deleted: false,
-              read: false,
-              type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-            },
-          }),
-          this.countUnreadSignups(userId),
-          this.prisma.notification.count({
-            where: {
-              toUserID: userId,
-              deleted: false,
-              read: false,
-              type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-            },
-          }),
-        ]);
-
-      const snapshot: BadgeSnapshot = {
-        messagesUnread: 0,
-        contactsUnread,
-        discoverUnread,
-        signupUnread,
-        profileUnread,
-        systemUnread: profileUnread,
-        syncedAt: new Date().toISOString(),
-      };
-      await this.redisService?.setJson(
-        cacheKey,
-        snapshot,
-        RealtimeService.BADGE_SNAPSHOT_TTL_SECONDS,
-      );
-      return snapshot;
+      let snapshot: BadgeSnapshot | null = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const version = await this.redisService?.getVersion(
+          this.badgeSnapshotVersionKey(userId),
+        );
+        snapshot = await this.queryBadgeSnapshot(userId);
+        if (version === undefined || version === null) {
+          return snapshot;
+        }
+        const stored = await this.redisService?.setJsonIfVersionMatches(
+          cacheKey,
+          this.badgeSnapshotVersionKey(userId),
+          version,
+          snapshot,
+          RealtimeService.BADGE_SNAPSHOT_TTL_SECONDS,
+        );
+        if (stored) return snapshot;
+      }
+      return snapshot as BadgeSnapshot;
     });
+  }
+
+  private async queryBadgeSnapshot(userId: string): Promise<BadgeSnapshot> {
+    const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
+      await Promise.all([
+        this.prisma.friendActivity.count({
+          where: { viewerId: userId, readAt: null },
+        }),
+        this.prisma.notification.count({
+          where: {
+            toUserID: userId,
+            deleted: false,
+            read: false,
+            type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+          },
+        }),
+        this.countUnreadSignups(userId),
+        this.prisma.notification.count({
+          where: {
+            toUserID: userId,
+            deleted: false,
+            read: false,
+            type: { in: [...PROFILE_NOTIFICATION_TYPES] },
+          },
+        }),
+      ]);
+
+    const snapshot: BadgeSnapshot = {
+      messagesUnread: 0,
+      contactsUnread,
+      discoverUnread,
+      signupUnread,
+      profileUnread,
+      systemUnread: profileUnread,
+      syncedAt: new Date().toISOString(),
+    };
+    return snapshot;
   }
 
   async emitSnapshot(userId: string) {
@@ -787,11 +804,18 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async invalidateBadgeSnapshotCache(userId: string): Promise<void> {
-    await this.redisService?.deleteKey(this.badgeSnapshotCacheKey(userId));
+    await this.redisService?.invalidateVersionedKey(
+      this.badgeSnapshotCacheKey(userId),
+      this.badgeSnapshotVersionKey(userId),
+    );
   }
 
   private badgeSnapshotCacheKey(userId: string): string {
     return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:badge-snapshot`;
+  }
+
+  private badgeSnapshotVersionKey(userId: string): string {
+    return `${this.badgeSnapshotCacheKey(userId)}:version`;
   }
 
   private membershipStatusCacheKey(userId: string): string {

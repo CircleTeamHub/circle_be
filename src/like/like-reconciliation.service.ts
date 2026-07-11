@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { Prisma } from 'src/generated/prisma';
+
+const SERIALIZATION_RETRIES = 3;
 
 /**
  * Repairs drift in the denormalized User.receivedLikeCount.
@@ -18,11 +21,24 @@ export class LikeReconciliationService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  @Cron(CronExpression.EVERY_HOUR)
   async reconcileReceivedLikeCounts(): Promise<number> {
-    // Single set-based update: recompute the true count per user (LEFT JOIN so
-    // users with zero likes settle to 0) and write back only the drifted rows.
-    const updated = await this.prisma.$executeRaw`
+    for (let attempt = 0; attempt < SERIALIZATION_RETRIES; attempt += 1) {
+      try {
+        return await this.prisma.$transaction(
+          async (tx) => {
+            const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+        SELECT pg_try_advisory_xact_lock(hashtextextended('like-reconciliation-job', 0)) AS acquired
+      `;
+            if (!lock?.acquired) return 0;
+            const [consistencyLock] = await tx.$queryRaw<
+              Array<{ acquired: boolean }>
+            >`SELECT pg_try_advisory_xact_lock(hashtextextended('like-counter-reconciliation', 0)) AS acquired`;
+            if (!consistencyLock?.acquired) return 0;
+
+            // Single set-based update: recompute the true count per user (LEFT JOIN so
+            // users with zero likes settle to 0) and write back only the drifted rows.
+            const updated = await tx.$executeRaw`
       UPDATE "User" u
       SET "receivedLikeCount" = sub.cnt
       FROM (
@@ -32,13 +48,30 @@ export class LikeReconciliationService {
         GROUP BY u2.id
       ) sub
       WHERE u.id = sub.id AND u."receivedLikeCount" <> sub.cnt
-    `;
+      `;
 
-    if (updated > 0) {
-      this.logger.warn(
-        `Reconciled receivedLikeCount drift on ${updated} user(s).`,
-      );
+            if (updated > 0) {
+              this.logger.warn(
+                `Reconciled receivedLikeCount drift on ${updated} user(s).`,
+              );
+            }
+            return updated;
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+            timeout: 300_000,
+          },
+        );
+      } catch (error) {
+        if (
+          (error as { code?: string }).code === 'P2034' &&
+          attempt < SERIALIZATION_RETRIES - 1
+        ) {
+          continue;
+        }
+        throw error;
+      }
     }
-    return updated;
+    return 0;
   }
 }

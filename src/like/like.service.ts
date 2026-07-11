@@ -139,6 +139,7 @@ export class LikeService {
       try {
         await this.prisma.$transaction(
           async (tx) => {
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(hashtextextended('like-counter-reconciliation', 0))`;
             const todayCount = await tx.userLike.count({
               where: { fromUserID: fromUserId, likedOn },
             });
@@ -175,6 +176,7 @@ export class LikeService {
     const likedOn = likedOnToday();
 
     const removed = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(hashtextextended('like-counter-reconciliation', 0))`;
       const { count } = await tx.userLike.deleteMany({
         where: { fromUserID: fromUserId, toUserID: toUserId, likedOn },
       });

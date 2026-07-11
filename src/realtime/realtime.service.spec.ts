@@ -13,6 +13,9 @@ describe('RealtimeService', () => {
     setJson: jest.fn(),
     getJsonWithVersion: jest.fn(),
     setJsonIfNewer: jest.fn(),
+    getVersion: jest.fn(),
+    setJsonIfVersionMatches: jest.fn(),
+    invalidateVersionedKey: jest.fn(),
     deleteKey: jest.fn(),
   };
 
@@ -43,6 +46,9 @@ describe('RealtimeService', () => {
     redis.setJson.mockResolvedValue(true);
     redis.getJsonWithVersion.mockResolvedValue(null);
     redis.setJsonIfNewer.mockResolvedValue(true);
+    redis.getVersion.mockResolvedValue('');
+    redis.setJsonIfVersionMatches.mockResolvedValue(true);
+    redis.invalidateVersionedKey.mockResolvedValue(true);
     redis.deleteKey.mockResolvedValue(true);
 
     const module: TestingModule = await Test.createTestingModule({
@@ -79,14 +85,39 @@ describe('RealtimeService', () => {
       systemUnread: 1,
       syncedAt: expect.any(String),
     });
-    expect(redis.setJson).toHaveBeenCalledWith(
+    expect(redis.setJsonIfVersionMatches).toHaveBeenCalledWith(
       'circle:hot:user:user-1:badge-snapshot',
+      'circle:hot:user:user-1:badge-snapshot:version',
+      '',
       expect.objectContaining({
         contactsUnread: 3,
         discoverUnread: 2,
         signupUnread: 4,
         profileUnread: 1,
       }),
+      10,
+    );
+  });
+
+  it('retries badge snapshot reads when invalidation wins the cache-write race', async () => {
+    redis.getVersion
+      .mockResolvedValueOnce('token-4')
+      .mockResolvedValueOnce('token-5');
+    redis.setJsonIfVersionMatches
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    prisma.friendActivity.count.mockResolvedValue(1);
+    prisma.circlePostSignup.count.mockResolvedValue(2);
+    prisma.notification.count.mockResolvedValue(3);
+
+    await service.buildSnapshot('user-1');
+
+    expect(redis.setJsonIfVersionMatches).toHaveBeenCalledTimes(2);
+    expect(redis.setJsonIfVersionMatches).toHaveBeenLastCalledWith(
+      'circle:hot:user:user-1:badge-snapshot',
+      'circle:hot:user:user-1:badge-snapshot:version',
+      'token-5',
+      expect.any(Object),
       10,
     );
   });
@@ -241,8 +272,9 @@ describe('RealtimeService', () => {
       type: 'circle.signup.unread.changed',
       payload: { count: 2, changedAt: expect.any(String) },
     });
-    expect(redis.deleteKey).toHaveBeenCalledWith(
+    expect(redis.invalidateVersionedKey).toHaveBeenCalledWith(
       'circle:hot:user:user-1:badge-snapshot',
+      'circle:hot:user:user-1:badge-snapshot:version',
     );
   });
 

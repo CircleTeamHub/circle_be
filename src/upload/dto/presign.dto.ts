@@ -1,5 +1,13 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsString, Matches } from 'class-validator';
+import {
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Matches,
+  Max,
+  Min,
+} from 'class-validator';
 
 const ALLOWED_CONTENT_TYPES = [
   'image/jpeg',
@@ -36,6 +44,17 @@ export class PresignDto {
   })
   @IsIn(ALLOWED_CONTENT_TYPES)
   contentType: string;
+
+  @ApiProperty({
+    example: 1048576,
+    minimum: 1,
+    maximum: 104857600,
+    description: 'Exact upload size in bytes; included in the signed request',
+  })
+  @IsInt()
+  @Min(1)
+  @Max(100 * 1024 * 1024)
+  sizeBytes: number;
 
   @ApiPropertyOptional({
     example: 'avatars',

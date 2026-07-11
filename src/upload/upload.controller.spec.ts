@@ -1,6 +1,17 @@
 import { HttpStatus } from '@nestjs/common';
+import { uploadMetrics } from 'src/metrics/upload-metrics';
 import { RedisService } from 'src/redis/redis.service';
 import { UploadController } from './upload.controller';
+
+jest.mock('src/metrics/upload-metrics', () => ({
+  uploadMetrics: {
+    recordPresignLimited: jest.fn(),
+    observePresign: jest.fn(),
+  },
+}));
+
+const recordUploadPresignLimited =
+  uploadMetrics.recordPresignLimited as jest.Mock;
 
 describe('UploadController', () => {
   const uploadService = {
@@ -17,6 +28,7 @@ describe('UploadController', () => {
   const dto = {
     filename: 'avatar.png',
     contentType: 'image/png',
+    sizeBytes: 1024,
     folder: 'avatars',
   } as const;
 
@@ -45,6 +57,7 @@ describe('UploadController', () => {
     expect(uploadService.presign).toHaveBeenCalledWith(
       'avatar.png',
       'image/png',
+      1024,
       'avatars',
       'user-1',
     );
@@ -61,6 +74,7 @@ describe('UploadController', () => {
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
     expect(uploadService.presign).not.toHaveBeenCalled();
+    expect(recordUploadPresignLimited).toHaveBeenCalledWith('redis');
   });
 
   it('falls back to in-memory limiting when Redis is configured but errors', async () => {
@@ -81,6 +95,7 @@ describe('UploadController', () => {
     await expect(controller.presign(dto, req)).rejects.toMatchObject({
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
+    expect(recordUploadPresignLimited).toHaveBeenCalledWith('memory');
   });
 
   it('keeps the local fallback limiter when Redis is not configured', async () => {
@@ -99,5 +114,75 @@ describe('UploadController', () => {
     });
     expect(redisService.incrementWithTtl).not.toHaveBeenCalled();
     expect(uploadService.presign).toHaveBeenCalledTimes(20);
+  });
+
+  it('enforces the local fallback exactly under concurrent Redis failures', async () => {
+    redisService.incrementWithTtl.mockResolvedValue(null);
+    const controller = new UploadController(
+      uploadService as any,
+      redisService as unknown as RedisService,
+    );
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 25 }, () => controller.presign(dto, req)),
+    );
+
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(20);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(5);
+    expect(uploadService.presign).toHaveBeenCalledTimes(20);
+  });
+
+  it('does not retry Redis on every request during its fallback cooldown', async () => {
+    redisService.incrementWithTtl.mockResolvedValue(null);
+    const controller = new UploadController(
+      uploadService as any,
+      redisService as unknown as RedisService,
+    );
+
+    await controller.presign(dto, req);
+    await controller.presign(dto, req);
+
+    expect(redisService.incrementWithTtl).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the half-open probe when Redis unexpectedly rejects', async () => {
+    let now = 1_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    redisService.incrementWithTtl
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('unexpected'))
+      .mockResolvedValueOnce(1);
+    const controller = new UploadController(
+      uploadService as any,
+      redisService as unknown as RedisService,
+    );
+
+    await controller.presign(dto, req);
+    now += 2_000;
+    await expect(controller.presign(dto, req)).resolves.toBeDefined();
+    now += 2_000;
+    await expect(controller.presign(dto, req)).resolves.toBeDefined();
+
+    expect(redisService.incrementWithTtl).toHaveBeenCalledTimes(4);
+    nowSpy.mockRestore();
+  });
+
+  it('rejects when the shared daily issued-byte budget is exceeded', async () => {
+    redisService.incrementWithTtl
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(1024 * 1024 * 1024 + 1);
+    const controller = new UploadController(
+      uploadService as any,
+      redisService as unknown as RedisService,
+    );
+
+    await expect(controller.presign(dto, req)).rejects.toMatchObject({
+      status: HttpStatus.TOO_MANY_REQUESTS,
+    });
+    expect(uploadService.presign).not.toHaveBeenCalled();
   });
 });

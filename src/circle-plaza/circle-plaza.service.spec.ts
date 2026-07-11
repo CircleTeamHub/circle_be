@@ -45,6 +45,10 @@ describe('CirclePlazaService', () => {
     },
     circle: {
       update: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    circlePostCircle: {
+      findMany: jest.fn(),
     },
     collaborationRecognition: {
       count: jest.fn(),
@@ -89,6 +93,8 @@ describe('CirclePlazaService', () => {
     prisma.userLike.findMany.mockResolvedValue([]);
     prisma.userLike.createMany.mockResolvedValue({ count: 0 });
     prisma.user.updateMany.mockResolvedValue({ count: 0 });
+    prisma.circle.updateMany.mockResolvedValue({ count: 1 });
+    prisma.circlePostCircle.findMany.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -121,11 +127,16 @@ describe('CirclePlazaService', () => {
         const result = await service.getFeed('viewer-1', {});
 
         expect(result.items).toEqual([]);
+        // M2M：可见性走关联表——某条 link 指向 viewer 是 ACTIVE 成员的圈子。
         const expectedMembershipScope = {
-          circle: {
-            deleted: false,
-            members: {
-              some: { userID: 'viewer-1', status: 'ACTIVE' },
+          circleLinks: {
+            some: {
+              circle: {
+                deleted: false,
+                members: {
+                  some: { userID: 'viewer-1', status: 'ACTIVE' },
+                },
+              },
             },
           },
         };
@@ -173,14 +184,19 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            circleID: 'circle-1',
-            city: '上海',
-            circle: {
-              deleted: false,
-              members: {
-                some: { userID: 'viewer-1', status: 'ACTIVE' },
+            // 圈子筛选与成员范围合并进同一个 link 条件（杜绝跨圈泄露）。
+            circleLinks: {
+              some: {
+                circle: {
+                  deleted: false,
+                  members: {
+                    some: { userID: 'viewer-1', status: 'ACTIVE' },
+                  },
+                },
+                circleID: 'circle-1',
               },
             },
+            cities: { has: '上海' },
           }),
         }),
       );
@@ -203,14 +219,18 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePost.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            circleID: { in: ['circle-1', 'circle-2'] },
-            city: { in: ['上海', '杭州'] },
-            circle: {
-              deleted: false,
-              members: {
-                some: { userID: 'viewer-1', status: 'ACTIVE' },
+            circleLinks: {
+              some: {
+                circle: {
+                  deleted: false,
+                  members: {
+                    some: { userID: 'viewer-1', status: 'ACTIVE' },
+                  },
+                },
+                circleID: { in: ['circle-1', 'circle-2'] },
               },
             },
+            cities: { hasSome: ['上海', '杭州'] },
           }),
         }),
       );
@@ -230,7 +250,7 @@ describe('CirclePlazaService', () => {
       await service.getFeed('viewer-1', { circleIds: manyIds } as any);
 
       const where = prisma.circlePost.findMany.mock.calls[0][0].where;
-      expect(where.circleID.in).toHaveLength(50);
+      expect(where.circleLinks.some.circleID.in).toHaveLength(50);
     });
 
     it('includes the post author display icons in feed DTOs', async () => {
@@ -368,12 +388,15 @@ describe('CirclePlazaService', () => {
   });
 
   it('rejects creating a post with a note owned by another user', async () => {
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      status: 'ACTIVE',
-      role: 'MEMBER',
-      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-    });
+    prisma.circleMember.findMany.mockResolvedValue([
+      {
+        circleID: 'circle-1',
+        id: 'member-1',
+        status: 'ACTIVE',
+        role: 'MEMBER',
+        circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+      },
+    ]);
     prisma.note.findFirst.mockResolvedValue(null);
 
     await expect(
@@ -395,12 +418,15 @@ describe('CirclePlazaService', () => {
       notificationService as any,
       iconService as any,
     );
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      status: 'ACTIVE',
-      role: 'MEMBER',
-      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-    });
+    prisma.circleMember.findMany.mockResolvedValue([
+      {
+        circleID: 'circle-1',
+        id: 'member-1',
+        status: 'ACTIVE',
+        role: 'MEMBER',
+        circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+      },
+    ]);
 
     await expect(
       guarded.createPost('user-1', {
@@ -416,12 +442,15 @@ describe('CirclePlazaService', () => {
     jest
       .useFakeTimers()
       .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      status: 'ACTIVE',
-      role: 'MEMBER',
-      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-    });
+    prisma.circleMember.findMany.mockResolvedValue([
+      {
+        circleID: 'circle-1',
+        id: 'member-1',
+        status: 'ACTIVE',
+        role: 'MEMBER',
+        circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+      },
+    ]);
     prisma.circlePost.create.mockResolvedValue({
       id: 'post-1',
       content: 'hello plaza',
@@ -472,12 +501,15 @@ describe('CirclePlazaService', () => {
     jest
       .useFakeTimers()
       .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      status: 'ACTIVE',
-      role: 'MEMBER',
-      circle: { id: 'circle-1', deleted: false, memberCanPost: true },
-    });
+    prisma.circleMember.findMany.mockResolvedValue([
+      {
+        circleID: 'circle-1',
+        id: 'member-1',
+        status: 'ACTIVE',
+        role: 'MEMBER',
+        circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+      },
+    ]);
     prisma.circlePost.create.mockResolvedValue({
       id: 'post-1',
       content: 'hi',
@@ -823,6 +855,7 @@ describe('CirclePlazaService', () => {
         id: 'post-1',
         authorID: 'author-1',
         circleID: 'circle-1',
+        circleLinks: [{ circleID: 'circle-1' }],
       });
       prisma.circlePostSignup.findMany.mockResolvedValue([
         { userID: 'user-2' },
@@ -857,11 +890,16 @@ describe('CirclePlazaService', () => {
           authorID: 'author-1',
           status: { in: ['ACTIVE', 'ENDED'] },
         },
-        select: { id: true, authorID: true, circleID: true },
+        select: {
+          id: true,
+          authorID: true,
+          circleID: true,
+          circleLinks: { select: { circleID: true } },
+        },
       });
       expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
         where: {
-          circleID: 'circle-1',
+          circleID: { in: ['circle-1'] },
           status: 'ACTIVE',
           userID: { in: ['user-2', 'user-3'] },
         },
@@ -1294,6 +1332,90 @@ describe('CirclePlazaService', () => {
 
       expect(dto.signupCount).toBe(2);
       expect(dto.signedByMe).toBe(true);
+    });
+
+    it('getPost gates visibility on circle membership (no read-by-id leak)', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await expect(service.getPost('viewer-1', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      // 详情查询必须带 viewer 的成员范围 link 条件（与 feed 一致）。
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            circleLinks: {
+              some: {
+                circle: {
+                  deleted: false,
+                  members: {
+                    some: { userID: 'viewer-1', status: 'ACTIVE' },
+                  },
+                },
+              },
+            },
+          }),
+        }),
+      );
+    });
+  });
+
+  describe('deletePost', () => {
+    const ownPost = {
+      id: 'post-1',
+      authorID: 'author-1',
+      circleID: 'circle-1',
+      status: 'ACTIVE',
+    };
+
+    it('decrements postCount for every linked circle exactly once', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(ownPost);
+      prisma.circlePostCircle.findMany.mockResolvedValue([
+        { circleID: 'circle-1' },
+        { circleID: 'circle-2' },
+      ]);
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.deletePost('author-1', 'post-1');
+
+      expect(prisma.circlePost.updateMany).toHaveBeenCalledWith({
+        where: { id: 'post-1', status: 'ACTIVE' },
+        data: { status: 'DELETED' },
+      });
+      expect(prisma.circle.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['circle-1', 'circle-2'] } },
+        data: { postCount: { decrement: 1 } },
+      });
+    });
+
+    it('does not decrement postCount when the delete lost the race (already deleted)', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(ownPost);
+      prisma.circlePostCircle.findMany.mockResolvedValue([
+        { circleID: 'circle-1' },
+      ]);
+      // A concurrent delete already flipped the row → this claim matches 0 rows.
+      prisma.circlePost.updateMany.mockResolvedValue({ count: 0 });
+
+      await service.deletePost('author-1', 'post-1');
+
+      expect(prisma.circle.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects deleting a post the caller does not own', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        ...ownPost,
+        authorID: 'someone-else',
+      });
+
+      await expect(service.deletePost('author-1', 'post-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.circlePost.updateMany).not.toHaveBeenCalled();
     });
   });
 });

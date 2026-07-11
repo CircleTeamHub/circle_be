@@ -12,6 +12,7 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.production.example
 # General
 .DS_Store
 .AppleDouble

@@ -41,14 +41,37 @@ export class CreatePlazaPostDto {
   @IsOptional()
   tags?: string[];
 
-  @ApiProperty()
+  @ApiPropertyOptional({ description: 'Legacy single circle (= circleIds[0])' })
   @IsUUID()
-  circleId: string;
+  @IsOptional()
+  circleId?: string;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({
+    type: [String],
+    description: '圈子多选（去重，至少 1 个，最多 50）',
+  })
+  @IsArray()
+  @IsUUID('all', { each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(50)
+  @IsOptional()
+  circleIds?: string[];
+
+  @ApiPropertyOptional({ description: 'Legacy single city (= cities[0])' })
   @IsString()
   @IsOptional()
   city?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: '城市多选（去重，最多 50）',
+  })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(50)
+  @IsOptional()
+  cities?: string[];
 
   @ApiPropertyOptional()
   @IsUUID()
@@ -209,6 +232,7 @@ export class PlazaPostDto {
   images: string[];
   tags: string[];
   city: string | null;
+  cities: string[];
   isHorn: boolean;
   noteId: string | null;
   restrictions: {
@@ -227,6 +251,7 @@ export class PlazaPostDto {
   canSignup: boolean;
   author: PlazaPostAuthorDto;
   circle: PlazaPostCircleDto;
+  circles: PlazaPostCircleDto[];
   canInteract: boolean;
   createdAt: string;
   expiresAt: string;

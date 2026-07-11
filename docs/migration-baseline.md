@@ -5,7 +5,7 @@
 The migration chain never applied cleanly to a **fresh** database. The
 lexically-first migration `20260408170000_friend_activities` referenced the
 `FriendState` enum and the `Friend` table, both of which were only created by
-the *next* migration (`20260409000751_...`). Existing dev/prod databases only
+the _next_ migration (`20260409000751_...`). Existing dev/prod databases only
 worked because they were built incrementally (originally via `db push`), so the
 objects already existed.
 
@@ -20,44 +20,42 @@ This blocked: new dev machines, CI provisioning, and disaster recovery.
   current `schema.prisma` (`prisma migrate diff --from-empty --to-schema ...`).
   It reproduces the exact current schema (62 tables, 45 enums) in dependency
   order, and was verified drift-free against `schema.prisma`.
-- The brand-new **data** migration `20260623000000_remove_account_id_prefix`
-  (strip `ACC_` + lowercase) is kept after the baseline — it is a data
-  transform, not schema, so it must still run on existing databases.
+- Post-baseline schema and data migrations remain after `0_init` and must run
+  normally on existing databases after the one-time baseline reconciliation.
 
-Net active chain: `0_init` → `20260623000000_remove_account_id_prefix`.
+Net active chain: `0_init` followed by the chronological post-baseline
+migrations in `prisma/migrations/`.
 
 ## Rollout
 
 ### Fresh database / CI / new environment
-Nothing special — the normal command applies the baseline then the data
+
+Nothing special — the normal command applies the baseline then every later
 migration:
+
 ```bash
 npx prisma migrate deploy
 ```
+
 Verified: applies cleanly from empty, then `migrate diff` reports no drift.
 
 ### Existing database (dev / staging / prod) — ONE-TIME reconciliation
+
 The baseline must be marked as already-applied so Prisma does not try to
 recreate existing tables. **Run once per existing environment, in order:**
+
 ```bash
 # 1. Mark the squashed schema as already applied (does NOT run the SQL).
 npx prisma migrate resolve --applied 0_init
 
-# 2. Mark every schema migration already represented by the live database as applied.
-#    Keep data migrations pending so they still execute.
-for migration in $(find prisma/migrations -mindepth 1 -maxdepth 1 -type d | sort); do
-  migration=$(basename "$migration")
-  [ "$migration" = "0_init" ] && continue
-  [ "$migration" = "20260623000000_remove_account_id_prefix" ] && continue
-  npx prisma migrate resolve --applied "$migration"
-done
-
-# 3. Apply remaining pending data migrations.
+# 2. Apply every remaining post-baseline migration.
 npx prisma migrate deploy
 ```
-Verified against a simulated existing DB: `resolve --applied 0_init` records the
-baseline without re-running it, and `deploy` then applies only the
-`remove_account_id_prefix` data migration. Prisma tolerates the 38 archived
+
+Verified against a simulated existing baseline DB: the verification script
+executes `0_init` SQL without recording history, `resolve --applied 0_init`
+records the baseline without re-running it, and `deploy` applies every later
+migration exactly once. Prisma tolerates the 38 archived
 migrations still present in `_prisma_migrations` (they are reported as
 "not found locally" but do not block `deploy`).
 

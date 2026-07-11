@@ -15,6 +15,9 @@ const buildRow = (o: Partial<any> = {}) => ({
   maxMembers: 50,
   expiresAt: new Date(Date.now() + 3 * 24 * 3600 * 1000),
   endedAt: null,
+  cleanupLockedAt: null,
+  cleanupGroupDismissedAt: null,
+  cleanupCompletedAt: null,
   createdAt: new Date(),
   updatedAt: new Date(),
   ...o,
@@ -29,22 +32,27 @@ describe('TempChatService', () => {
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
       findMany: jest.fn(),
     },
     tempChatGuest: {
       create: jest.fn(),
+      findUnique: jest.fn(),
       count: jest.fn(),
       delete: jest.fn(),
       findMany: jest.fn(),
+      update: jest.fn(),
       updateMany: jest.fn(),
     },
     $transaction: jest.fn((cb: any) => cb(prisma)),
+    $executeRaw: jest.fn(),
   };
   const openim = {
     createGroup: jest.fn(),
     dismissGroup: jest.fn(),
     registerUser: jest.fn(),
     addGroupMembers: jest.fn(),
+    removeGroupMember: jest.fn(),
     getUserToken: jest.fn(),
     forceLogout: jest.fn(),
   };
@@ -68,6 +76,7 @@ describe('TempChatService', () => {
     openim.dismissGroup.mockResolvedValue(undefined);
     openim.registerUser.mockResolvedValue(undefined);
     openim.addGroupMembers.mockResolvedValue(undefined);
+    openim.removeGroupMember.mockResolvedValue(undefined);
     openim.forceLogout.mockResolvedValue(undefined);
     const mod = await Test.createTestingModule({
       providers: [
@@ -167,7 +176,11 @@ describe('TempChatService', () => {
       expect(prisma.tempChat.findMany).toHaveBeenCalledWith({
         where: { hostUserId: 'host-1' },
         orderBy: [{ createdAt: 'desc' }],
-        include: { _count: { select: { guests: true } } },
+        include: {
+          _count: {
+            select: { guests: { where: { provisioningFailedAt: null } } },
+          },
+        },
       });
       expect(rooms).toEqual([
         expect.objectContaining({
@@ -223,6 +236,12 @@ describe('TempChatService', () => {
         wsUrl: 'wss://im.example.com/ws',
         apiUrl: 'https://im.example.com',
       });
+      expect(prisma.$executeRaw).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.stringContaining('pg_advisory_xact_lock'),
+        ]),
+        'temp-chat:tc-1',
+      );
     });
 
     it('rejects when room is full', async () => {
@@ -249,6 +268,44 @@ describe('TempChatService', () => {
         where: { id: 'guest-1' },
       });
     });
+
+    it('retains the guest record when OpenIM compensation is incomplete', async () => {
+      prisma.tempChatGuest.create.mockResolvedValue({ id: 'guest-1' });
+      openim.addGroupMembers.mockRejectedValue(new Error('im down'));
+      openim.forceLogout.mockRejectedValue(new Error('logout down'));
+
+      await expect(service.join('signed-token', {})).rejects.toBeDefined();
+
+      expect(prisma.tempChatGuest.delete).not.toHaveBeenCalled();
+      expect(prisma.tempChatGuest.update).toHaveBeenCalledWith({
+        where: { id: 'guest-1' },
+        data: { provisioningFailedAt: expect.any(Date) },
+      });
+    });
+
+    it('revokes a provisioned guest when teardown wins before token return', async () => {
+      prisma.tempChat.findUnique
+        .mockResolvedValueOnce(buildRow())
+        .mockResolvedValueOnce(buildRow({ status: 'ENDED' }));
+      prisma.tempChatGuest.create.mockResolvedValue({
+        id: 'guest-1',
+        imUserId: 'gX',
+      });
+      openim.getUserToken.mockResolvedValue('im-token');
+
+      await expect(service.join('signed-token', {})).rejects.toBeInstanceOf(
+        GoneException,
+      );
+
+      expect(openim.removeGroupMember).toHaveBeenCalledWith(
+        'tmpABC',
+        expect.any(String),
+      );
+      expect(openim.forceLogout).toHaveBeenCalledWith(expect.any(String));
+      expect(prisma.tempChatGuest.delete).toHaveBeenCalledWith({
+        where: { id: 'guest-1' },
+      });
+    });
   });
 
   describe('end', () => {
@@ -261,12 +318,90 @@ describe('TempChatService', () => {
 
     it('host ends → dismiss group + status ENDED', async () => {
       prisma.tempChat.findUniqueOrThrow.mockResolvedValue(buildRow());
+      prisma.tempChat.findUnique.mockResolvedValue(buildRow());
       prisma.tempChatGuest.findMany.mockResolvedValue([{ imUserId: 'gA' }]);
       prisma.tempChat.update.mockResolvedValue(buildRow({ status: 'ENDED' }));
       const res = await service.end('host-1', 'tc-1');
       expect(openim.dismissGroup).toHaveBeenCalledWith('tmpABC');
       expect(openim.forceLogout).toHaveBeenCalledWith('gA');
       expect(res.status).toBe('ENDED');
+      expect(prisma.$executeRaw).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.stringContaining('pg_advisory_xact_lock'),
+        ]),
+        'temp-chat:tc-1',
+      );
+    });
+
+    it('performs OpenIM cleanup outside the database transaction', async () => {
+      let transactionActive = false;
+      prisma.$transaction.mockImplementationOnce(async (cb: any) => {
+        transactionActive = true;
+        const value = await cb(prisma);
+        transactionActive = false;
+        return value;
+      });
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(buildRow());
+      prisma.tempChat.findUnique.mockResolvedValue(buildRow());
+      prisma.tempChatGuest.findMany.mockResolvedValue([]);
+      openim.dismissGroup.mockImplementation(async () => {
+        expect(transactionActive).toBe(false);
+      });
+
+      await service.end('host-1', 'tc-1');
+    });
+
+    it('does not repeat external teardown after another instance ended the room', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(buildRow());
+      prisma.tempChat.findUnique.mockResolvedValue(
+        buildRow({
+          status: 'EXPIRED',
+          cleanupCompletedAt: new Date(),
+        }),
+      );
+
+      const result = await service.end('host-1', 'tc-1');
+
+      expect(openim.dismissGroup).not.toHaveBeenCalled();
+      expect(prisma.tempChatGuest.updateMany).not.toHaveBeenCalled();
+      expect(result.status).toBe('EXPIRED');
+    });
+
+    it('does not mark cleanup complete when OpenIM teardown fails', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(buildRow());
+      prisma.tempChat.findUnique.mockResolvedValue(buildRow());
+      prisma.tempChatGuest.findMany.mockResolvedValue([{ imUserId: 'gA' }]);
+      openim.dismissGroup.mockRejectedValue(new Error('im down'));
+
+      await expect(service.end('host-1', 'tc-1')).rejects.toThrow('im down');
+
+      expect(prisma.tempChat.updateMany).toHaveBeenCalledWith({
+        where: { id: 'tc-1', cleanupLockedAt: expect.any(Date) },
+        data: { cleanupLockedAt: null },
+      });
+      expect(prisma.tempChat.update).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            cleanupCompletedAt: expect.any(Date),
+          }),
+        }),
+      );
+    });
+
+    it('only clears the lease owned by the completing worker', async () => {
+      prisma.tempChat.findUniqueOrThrow.mockResolvedValue(buildRow());
+      prisma.tempChat.findUnique.mockResolvedValue(buildRow());
+      prisma.tempChatGuest.findMany.mockResolvedValue([]);
+
+      await service.end('host-1', 'tc-1');
+
+      expect(prisma.tempChat.updateMany).toHaveBeenCalledWith({
+        where: { id: 'tc-1', cleanupLockedAt: expect.any(Date) },
+        data: {
+          cleanupCompletedAt: expect.any(Date),
+          cleanupLockedAt: null,
+        },
+      });
     });
 
     it('ending an already-ended room is idempotent (no dismiss)', async () => {
