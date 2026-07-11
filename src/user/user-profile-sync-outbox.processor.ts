@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { randomUUID } from 'crypto';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
@@ -26,49 +27,69 @@ export class UserProfileSyncOutboxProcessor {
       },
       orderBy: { createdAt: 'asc' },
       take: 100,
-      include: {
-        user: { select: { id: true, nickname: true, avatarUrl: true } },
-      },
     });
     let completed = 0;
     for (const job of jobs) {
+      const leaseToken = randomUUID();
+      const claimNow = new Date();
       const claimed = await this.prisma.userProfileSyncOutbox.updateMany({
         where: {
           id: job.id,
-          OR: [
-            { status: 'PENDING' },
-            { status: 'FAILED', nextAttemptAt: { lte: now } },
-            { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
-          ],
+          generation: job.generation,
+          status: job.status,
+          ...(job.status === 'PROCESSING'
+            ? { lockedAt: job.lockedAt }
+            : {}),
         },
         data: {
           status: 'PROCESSING',
-          lockedAt: now,
+          leaseToken,
+          lockedAt: claimNow,
           attempts: { increment: 1 },
         },
       });
       if (claimed.count === 0) continue;
       try {
-        await this.openim.updateUserInfo(job.user.id, {
-          nickname: job.user.nickname,
-          avatarUrl: job.user.avatarUrl,
+        const user = await this.prisma.user.findUnique({
+          where: { id: job.userID },
+          select: { id: true, nickname: true, avatarUrl: true },
         });
-        await this.prisma.userProfileSyncOutbox.update({
-          where: { id: job.id },
+        if (!user) {
+          throw new Error(`Profile sync user ${job.userID} no longer exists`);
+        }
+        await this.openim.updateUserInfo(user.id, {
+          nickname: user.nickname,
+          avatarUrl: user.avatarUrl,
+        });
+        const finished = await this.prisma.userProfileSyncOutbox.updateMany({
+          where: {
+            id: job.id,
+            generation: job.generation,
+            leaseToken,
+            status: 'PROCESSING',
+          },
           data: {
             status: 'COMPLETED',
             processedAt: new Date(),
             lockedAt: null,
+            leaseToken: null,
+            lastError: null,
           },
         });
-        completed += 1;
+        if (finished.count > 0) completed += 1;
       } catch (error) {
         const attempts = job.attempts + 1;
-        await this.prisma.userProfileSyncOutbox.update({
-          where: { id: job.id },
+        await this.prisma.userProfileSyncOutbox.updateMany({
+          where: {
+            id: job.id,
+            generation: job.generation,
+            leaseToken,
+            status: 'PROCESSING',
+          },
           data: {
             status: 'FAILED',
             lockedAt: null,
+            leaseToken: null,
             lastError: error instanceof Error ? error.message : String(error),
             nextAttemptAt: new Date(
               Date.now() +

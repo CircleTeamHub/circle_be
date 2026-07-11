@@ -190,8 +190,12 @@ describe('UserService.update normalization', () => {
     );
     expect(prisma.userProfileSyncOutbox.upsert).toHaveBeenCalledWith({
       where: { userID: 'user-1' },
-      create: { userID: 'user-1' },
-      update: expect.objectContaining({ status: 'PENDING' }),
+      create: { userID: 'user-1', generation: 1 },
+      update: expect.objectContaining({
+        status: 'PENDING',
+        generation: { increment: 1 },
+        leaseToken: null,
+      }),
     });
   });
 
@@ -261,8 +265,12 @@ describe('UserService.update normalization', () => {
 
     expect(prisma.userProfileSyncOutbox.upsert).toHaveBeenCalledWith({
       where: { userID: 'user-1' },
-      create: { userID: 'user-1' },
-      update: expect.objectContaining({ status: 'PENDING' }),
+      create: { userID: 'user-1', generation: 1 },
+      update: expect.objectContaining({
+        status: 'PENDING',
+        generation: { increment: 1 },
+        leaseToken: null,
+      }),
     });
   });
 
