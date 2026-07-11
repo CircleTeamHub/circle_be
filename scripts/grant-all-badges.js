@@ -184,7 +184,6 @@ async function main() {
         ownerID: user.id,
         memberCount: 101,
         deleted: false,
-        isPublic: false,
         createdAt: matureCircleCreatedAt,
       },
       create: {
@@ -194,7 +193,6 @@ async function main() {
         ownerID: user.id,
         memberCount: 101,
         deleted: false,
-        isPublic: false,
         createdAt: matureCircleCreatedAt,
       },
     });

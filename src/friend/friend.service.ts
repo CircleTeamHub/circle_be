@@ -38,6 +38,7 @@ const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在�
 // 好友申请留言:纯文本上限 + 发起方在对方回复前的连发软上限(防刷)。
 const FRIEND_REQUEST_MESSAGE_MAX_LENGTH = 500;
 const FRIEND_REQUEST_MESSAGE_SENDER_SOFT_CAP = 5;
+const FRIEND_REQUEST_MESSAGE_TOTAL_CAP = 50;
 
 // Cap on how many organizational tags a single user can create.
 const MAX_FRIEND_TAGS_PER_USER = 50;
@@ -87,6 +88,7 @@ const FRIEND_PROFILE_SELECT = {
 const FRIEND_ACTIVITY_TYPE = {
   REQUEST_RECEIVED: 'REQUEST_RECEIVED',
   REQUEST_SENT: 'REQUEST_SENT',
+  REQUEST_MESSAGE_RECEIVED: 'REQUEST_MESSAGE_RECEIVED',
   REQUEST_ACCEPTED_BY_OTHER: 'REQUEST_ACCEPTED_BY_OTHER',
   REQUEST_REJECTED_BY_OTHER: 'REQUEST_REJECTED_BY_OTHER',
   REQUEST_ACCEPTED_BY_ME: 'REQUEST_ACCEPTED_BY_ME',
@@ -341,6 +343,30 @@ export class FriendService {
       });
     }
     await this.prisma.$transaction(async (tx: any) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`friend-request:${requestId}`}))`;
+      const locked = await tx.friend.findUnique({ where: { id: requestId } });
+      if (!locked || locked.userID !== senderId) {
+        throw new NotFoundException({
+          message: 'Pending request not found',
+          errorCode: FriendErrorCode.PendingRequestNotFound,
+        });
+      }
+      if (locked.state !== FriendState.PENDING) {
+        throw new ConflictException({
+          message: 'Friend request has already been handled',
+          errorCode: FriendErrorCode.RequestAlreadyHandled,
+        });
+      }
+      const updatedRows = await tx.friend.updateMany({
+        where: { id: requestId, userID: senderId, state: FriendState.PENDING },
+        data: { state: FriendState.WITHDRAWN },
+      });
+      if (updatedRows.count !== 1) {
+        throw new ConflictException({
+          message: 'Friend request has already been handled',
+          errorCode: FriendErrorCode.RequestAlreadyHandled,
+        });
+      }
       const updated = await tx.friend.update({
         where: { id: requestId },
         data: { state: FriendState.WITHDRAWN },
@@ -421,6 +447,25 @@ export class FriendService {
     }
 
     const nextRequest = await this.prisma.$transaction(async (tx: any) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`friend-request:${requestId}`}))`;
+      const recordForTransition = await tx.friend.findUnique({
+        where: { id: requestId },
+      });
+      if (
+        !recordForTransition ||
+        recordForTransition.friendID !== recipientId
+      ) {
+        throw new NotFoundException({
+          message: 'Pending request not found',
+          errorCode: FriendErrorCode.PendingRequestNotFound,
+        });
+      }
+      if (recordForTransition.state !== FriendState.PENDING) {
+        throw new ConflictException({
+          message: 'Friend request has already been handled',
+          errorCode: FriendErrorCode.RequestAlreadyHandled,
+        });
+      }
       const data: any = { state: decision };
 
       if (decision === FriendState.ACCEPTED) {
@@ -428,31 +473,45 @@ export class FriendService {
         // the *A columns. Promote each staged annotation the sender supplied;
         // leave a slot untouched when nothing was staged so DB defaults stand.
         if (
-          record.pendingRemarkBySender !== null &&
-          record.pendingRemarkBySender !== undefined
+          recordForTransition.pendingRemarkBySender !== null &&
+          recordForTransition.pendingRemarkBySender !== undefined
         ) {
-          data.remarkA = record.pendingRemarkBySender;
+          data.remarkA = recordForTransition.pendingRemarkBySender;
         }
         if (
-          record.pendingDescriptionBySender !== null &&
-          record.pendingDescriptionBySender !== undefined
+          recordForTransition.pendingDescriptionBySender !== null &&
+          recordForTransition.pendingDescriptionBySender !== undefined
         ) {
-          data.descriptionA = record.pendingDescriptionBySender;
+          data.descriptionA = recordForTransition.pendingDescriptionBySender;
         }
         if (
-          Array.isArray(record.pendingPhotosBySender) &&
-          record.pendingPhotosBySender.length > 0
+          Array.isArray(recordForTransition.pendingPhotosBySender) &&
+          recordForTransition.pendingPhotosBySender.length > 0
         ) {
-          data.photosA = record.pendingPhotosBySender;
+          data.photosA = recordForTransition.pendingPhotosBySender;
         }
         if (
-          record.pendingPermissionBySender !== null &&
-          record.pendingPermissionBySender !== undefined
+          recordForTransition.pendingPermissionBySender !== null &&
+          recordForTransition.pendingPermissionBySender !== undefined
         ) {
-          data.permissionA = record.pendingPermissionBySender;
+          data.permissionA = recordForTransition.pendingPermissionBySender;
         }
       }
 
+      const updatedRows = await tx.friend.updateMany({
+        where: {
+          id: requestId,
+          friendID: recipientId,
+          state: FriendState.PENDING,
+        },
+        data,
+      });
+      if (updatedRows.count !== 1) {
+        throw new ConflictException({
+          message: 'Friend request has already been handled',
+          errorCode: FriendErrorCode.RequestAlreadyHandled,
+        });
+      }
       const nextRequest = await tx.friend.update({
         where: { id: requestId },
         data,
@@ -526,6 +585,27 @@ export class FriendService {
           ],
           skipDuplicates: true,
         });
+        await tx.friendChatReplayOutbox.upsert({
+          where: { requestId: nextRequest.id },
+          create: {
+            requestId: nextRequest.id,
+            requesterUserID: nextRequest.userID,
+            accepterUserID: recipientId,
+            status: 'PENDING',
+          },
+          update: {
+            requesterUserID: nextRequest.userID,
+            accepterUserID: recipientId,
+            status: 'PENDING',
+            stage: 0,
+            messageIndex: 0,
+            attempts: 0,
+            lastError: null,
+            nextAttemptAt: new Date(),
+            lockedAt: null,
+            processedAt: null,
+          },
+        });
       }
 
       return nextRequest;
@@ -542,20 +622,8 @@ export class FriendService {
       fromUserId: recipientId,
       content: nextRequest.message ?? '',
     });
-    if (decision === FriendState.ACCEPTED) {
-      // Fire-and-forget: seeding the opening chat messages goes through up to
-      // four sequential OpenIM calls, so awaiting it would stall the accept
-      // response for up to ~20s if OpenIM is degraded. The friendship and the
-      // OpenIM friend import are already durable (transaction + friendSyncOutbox
-      // IMPORT_FRIEND rows); the greeting is a best-effort side effect. The
-      // method is fully self-contained (catches + logs), so this never rejects.
-      void this.emitAcceptedFriendChatMessages({
-        requestId: nextRequest.id,
-        requesterUserID: nextRequest.userID,
-        accepterUserID: recipientId,
-        requestMessage: nextRequest.message ?? '',
-      });
-    }
+    // Accepted-thread replay is handled by the durable outbox processor; accept
+    // itself never makes external OpenIM calls.
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent:
@@ -602,28 +670,15 @@ export class FriendService {
             userID: friendId,
             targetUserID: userId,
           },
+          {
+            operation: 'CLEAR_CONVERSATION',
+            userID: userId,
+            targetUserID: friendId,
+          },
         ],
         skipDuplicates: true,
       });
     });
-
-    // 删好友即清空删除者这侧的聊天记录：OpenIM 会话历史不随好友关系删除，不清的话
-    // 重加时接受流程注入的新开场白会叠在旧消息上（见截图反馈的重复）。只清删除者
-    // 自己的视图（对方历史保留，符合微信语义）。best-effort：清理失败不回滚删好友。
-    try {
-      const conversationID = OpenimService.singleConversationID(
-        userId,
-        friendId,
-      );
-      await this.openimService.clearConversationMessages(userId, [
-        conversationID,
-      ]);
-    } catch (err) {
-      this.logger.warn(
-        `OpenIM clearConversationMessages failed for ${userId} after removing ${friendId}: ` +
-          (err instanceof Error ? err.message : String(err)),
-      );
-    }
   }
 
   async reportFriend(
@@ -1354,6 +1409,7 @@ export class FriendService {
     toUserId: string;
     fromUserId: string;
     content: string;
+    requestId?: string;
   }): Promise<void> {
     try {
       const notification =
@@ -1391,7 +1447,7 @@ export class FriendService {
     }
     return this.prisma.friendRequestMessage.findMany({
       where: { requestId },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       select: { id: true, senderId: true, content: true, createdAt: true },
     });
   }
@@ -1409,159 +1465,97 @@ export class FriendService {
       });
     }
 
-    const request = await this.prisma.friend.findUnique({
-      where: { id: requestId },
-    });
-    if (
-      !request ||
-      (request.userID !== userId && request.friendID !== userId)
-    ) {
-      throw new NotFoundException({
-        message: '好友申请不存在',
-        errorCode: FriendErrorCode.PendingRequestNotFound,
-      });
-    }
-    if (request.state !== FriendState.PENDING) {
-      throw new ConflictException({
-        message: '该好友申请已处理,无法继续留言',
-        errorCode: FriendErrorCode.PendingRequestNotFound,
-      });
-    }
-
-    // 防刷软限制:发起方在对方回复前最多连发 5 条,对方一回复即解除。
-    const isSenderSide = request.userID === userId;
-    if (isSenderSide) {
-      const recipientCount = await this.prisma.friendRequestMessage.count({
-        where: { requestId, senderId: request.friendID },
-      });
-      if (recipientCount === 0) {
-        const senderCount = await this.prisma.friendRequestMessage.count({
-          where: { requestId, senderId: request.userID },
+    const result = await this.prisma.$transaction(async (tx: any) => {
+      const pairKey = `friend-request:${requestId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+      const request = await tx.friend.findUnique({ where: { id: requestId } });
+      if (
+        !request ||
+        (request.userID !== userId && request.friendID !== userId)
+      ) {
+        throw new NotFoundException({
+          message: '好友申请不存在',
+          errorCode: FriendErrorCode.PendingRequestNotFound,
         });
-        if (senderCount >= FRIEND_REQUEST_MESSAGE_SENDER_SOFT_CAP) {
-          throw new ConflictException({
-            message: '对方回复前最多发送 5 条留言',
-            errorCode: FriendErrorCode.RequestMessageLimit,
+      }
+      if (request.state !== FriendState.PENDING) {
+        throw new ConflictException({
+          message: '该好友申请已处理,无法继续留言',
+          errorCode: FriendErrorCode.RequestNotPending,
+        });
+      }
+
+      const totalCount = await tx.friendRequestMessage.count({
+        where: { requestId },
+      });
+      if (totalCount >= FRIEND_REQUEST_MESSAGE_TOTAL_CAP) {
+        throw new ConflictException({
+          message: '好友申请留言已达到 50 条上限',
+          errorCode: FriendErrorCode.RequestMessageLimit,
+        });
+      }
+
+      // 防刷软限制:发起方在对方回复前最多连发 5 条,对方一回复即解除。
+      const isSenderSide = request.userID === userId;
+      if (isSenderSide) {
+        const recipientCount = await tx.friendRequestMessage.count({
+          where: { requestId, senderId: request.friendID },
+        });
+        if (recipientCount === 0) {
+          const senderCount = await tx.friendRequestMessage.count({
+            where: { requestId, senderId: request.userID },
           });
+          if (senderCount >= FRIEND_REQUEST_MESSAGE_SENDER_SOFT_CAP) {
+            throw new ConflictException({
+              message: '对方回复前最多发送 5 条留言',
+              errorCode: FriendErrorCode.RequestMessageLimit,
+            });
+          }
         }
       }
-    }
 
-    const created = await this.prisma.friendRequestMessage.create({
-      data: { requestId, senderId: userId, content },
-      select: { id: true, senderId: true, content: true, createdAt: true },
+      const created = await tx.friendRequestMessage.create({
+        data: { requestId, senderId: userId, content },
+        select: { id: true, senderId: true, content: true, createdAt: true },
+      });
+      const toUserId =
+        request.userID === userId ? request.friendID : request.userID;
+      await tx.friendActivity.upsert({
+        where: {
+          requestId_viewerId_type: {
+            requestId,
+            viewerId: toUserId,
+            type: FRIEND_ACTIVITY_TYPE.REQUEST_MESSAGE_RECEIVED,
+          },
+        },
+        create: {
+          requestId,
+          viewerId: toUserId,
+          actorId: userId,
+          counterpartyId: userId,
+          type: FRIEND_ACTIVITY_TYPE.REQUEST_MESSAGE_RECEIVED,
+          messageSnapshot: content,
+        },
+        update: {
+          actorId: userId,
+          counterpartyId: userId,
+          messageSnapshot: content,
+          readAt: null,
+          createdAt: new Date(),
+        },
+      });
+      return { created, toUserId };
     });
 
-    const toUserId =
-      request.userID === userId ? request.friendID : request.userID;
     await this.createAndBroadcastFriendRequestNotification({
       type: NotificationType.FRIEND_REQUEST_MESSAGE,
-      toUserId,
+      toUserId: result.toUserId,
       fromUserId: userId,
       content,
+      requestId,
     });
 
-    return created;
-  }
-
-  private async emitAcceptedFriendChatMessages(params: {
-    requestId: string;
-    requesterUserID: string;
-    accepterUserID: string;
-    requestMessage: string;
-  }) {
-    try {
-      const [requester, accepter, thread] = await Promise.all([
-        this.prisma.user.findUnique({
-          where: { id: params.requesterUserID },
-          select: { nickname: true, accountId: true, avatarUrl: true },
-        }),
-        this.prisma.user.findUnique({
-          where: { id: params.accepterUserID },
-          select: { nickname: true, accountId: true, avatarUrl: true },
-        }),
-        this.prisma.friendRequestMessage.findMany({
-          where: { requestId: params.requestId },
-          orderBy: { createdAt: 'asc' },
-          select: { senderId: true, content: true },
-        }),
-      ]);
-      const requesterName = this.displayNameForAcceptedFriendMessage(
-        requester,
-        params.requesterUserID,
-      );
-      const accepterName = this.displayNameForAcceptedFriendMessage(
-        accepter,
-        params.accepterUserID,
-      );
-      const greeting = params.requestMessage.trim() || `我是${requesterName}`;
-
-      // Import both directions synchronously here (in addition to the durable
-      // friendSyncOutbox IMPORT_FRIEND rows written inside handleRequest's
-      // transaction) because the greeting messages below must land in an
-      // established friendship — the async outbox worker may not have run yet.
-      // OpenIM's import_friend is idempotent, so the double write is harmless.
-      await this.openimService.importFriends(params.requesterUserID, [
-        params.accepterUserID,
-      ]);
-      await this.openimService.importFriends(params.accepterUserID, [
-        params.requesterUserID,
-      ]);
-
-      // Replay the pre-accept message thread as the conversation's first-screen
-      // history, each message attributed to its original sender. Known trade-off
-      // (spec §4): OpenIM stamps server time, so the whole thread lands as one
-      // batch at accept time rather than at each message's original timestamp.
-      const replayThread = thread ?? [];
-      if (replayThread.length > 0) {
-        for (const message of replayThread) {
-          const fromRequester = message.senderId === params.requesterUserID;
-          await this.openimService.sendTextMessage({
-            sendID: message.senderId,
-            recvID: fromRequester
-              ? params.accepterUserID
-              : params.requesterUserID,
-            content: message.content,
-            senderNickname: fromRequester ? requesterName : accepterName,
-            senderFaceURL:
-              (fromRequester ? requester : accepter)?.avatarUrl ?? '',
-          });
-        }
-      } else {
-        // No thread (e.g. request created before this feature) → fall back to
-        // the original single opening greeting from the requester.
-        await this.openimService.sendTextMessage({
-          sendID: params.requesterUserID,
-          recvID: params.accepterUserID,
-          content: greeting,
-          senderNickname: requesterName,
-          senderFaceURL: requester?.avatarUrl ?? '',
-        });
-      }
-      await this.openimService.sendTextMessage({
-        sendID: params.accepterUserID,
-        recvID: params.requesterUserID,
-        content: FRIEND_ACCEPTED_REPLY_MESSAGE,
-        senderNickname: accepterName,
-        senderFaceURL: accepter?.avatarUrl ?? '',
-      });
-    } catch (error) {
-      this.logger.warn(
-        `Accepted friend chat messages failed: ${params.requesterUserID} <-> ${
-          params.accepterUserID
-        }: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  private displayNameForAcceptedFriendMessage(
-    user:
-      | { nickname?: string | null; accountId?: string | null }
-      | null
-      | undefined,
-    fallbackUserID: string,
-  ) {
-    return user?.nickname?.trim() || user?.accountId?.trim() || fallbackUserID;
+    return result.created;
   }
 
   private async throwActiveFriendConflict(

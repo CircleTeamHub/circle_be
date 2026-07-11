@@ -12,6 +12,7 @@ type FriendSyncJob = {
   operation:
     | 'IMPORT_FRIEND'
     | 'DELETE_FRIEND'
+    | 'CLEAR_CONVERSATION'
     | 'ADD_BLACKLIST'
     | 'REMOVE_BLACKLIST';
   status: 'PENDING' | 'PROCESSING' | 'FAILED';
@@ -102,6 +103,12 @@ export class FriendSyncOutboxProcessor {
     }
     if (job.operation === 'DELETE_FRIEND') {
       await this.openimService.deleteFriend(job.userID, job.targetUserID);
+      return;
+    }
+    if (job.operation === 'CLEAR_CONVERSATION') {
+      await this.openimService.clearConversationMessages(job.userID, [
+        OpenimService.singleConversationID(job.userID, job.targetUserID),
+      ]);
       return;
     }
     if (job.operation === 'ADD_BLACKLIST') {

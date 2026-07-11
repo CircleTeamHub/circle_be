@@ -5,6 +5,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import {
   SetCircleAvatarDto,
   SetCircleCoverDto,
@@ -42,7 +43,9 @@ describe('CircleService', () => {
     circleInvitation: {
       findFirst: jest.fn(),
       create: jest.fn(),
+      updateMany: jest.fn(),
     },
+    $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -50,6 +53,10 @@ describe('CircleService', () => {
     createGroup: jest.fn(),
     addGroupMembers: jest.fn(),
     removeGroupMember: jest.fn(),
+  };
+
+  const circleInvitationService = {
+    getInvitationForViewer: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -60,18 +67,23 @@ describe('CircleService', () => {
         CircleService,
         { provide: PrismaService, useValue: prisma },
         { provide: OpenimService, useValue: openimService },
+        { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
       ],
     }).compile();
 
     service = module.get(CircleService);
+    circleInvitationService.getInvitationForViewer.mockResolvedValue({
+      id: 'inv-1',
+      status: 'PENDING',
+    });
+    prisma.circleInvitation.create.mockResolvedValue({ id: 'inv-1' });
   });
 
   it('rejects joining when the user does not satisfy circle restrictions', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
-      isPublic: true,
       memberCount: 3,
       maxMembers: 10,
       joinVipRestriction: 3,
@@ -93,12 +105,10 @@ describe('CircleService', () => {
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
   });
 
-  it('every join goes through vouch verification — even public circles get PENDING + invitation', async () => {
+  it('returns a pending invitation for every join', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
-      // 关键：即使 isPublic 也不再秒进——任何入口申请一律走担保验证。
-      isPublic: true,
       memberCount: 3,
       maxMembers: null,
       joinVipRestriction: null,
@@ -114,7 +124,13 @@ describe('CircleService', () => {
     prisma.circleMember.findUnique.mockResolvedValue(null);
     prisma.circleInvitation.findFirst.mockResolvedValue(null);
 
-    await service.joinCircle('user-1', 'circle-1');
+    const result = await service.joinCircle('user-1', 'circle-1');
+
+    expect(result).toEqual(expect.objectContaining({ id: 'inv-1' }));
+    expect(circleInvitationService.getInvitationForViewer).toHaveBeenCalledWith(
+      'user-1',
+      'inv-1',
+    );
 
     expect(prisma.circleMember.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -128,6 +144,7 @@ describe('CircleService', () => {
         applicantID: 'user-1',
         inviterID: 'user-1',
       },
+      select: { id: true },
     });
     // PENDING 不占正式名额、不进 OpenIM 群——转正统一发生在担保 finalize。
     expect(prisma.circle.update).not.toHaveBeenCalled();
@@ -138,7 +155,6 @@ describe('CircleService', () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
-      isPublic: true,
       memberCount: 3,
       maxMembers: null,
       joinVipRestriction: null,
@@ -159,10 +175,71 @@ describe('CircleService', () => {
     expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
   });
 
+  it('repairs a legacy pending membership that has no invitation', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      memberCount: 3,
+      maxMembers: null,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      groupID: null,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: null,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      status: 'PENDING',
+      role: 'MEMBER',
+    });
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+    prisma.circleInvitation.create.mockResolvedValue({ id: 'inv-legacy' });
+
+    await service.joinCircle('user-1', 'circle-1');
+
+    expect(prisma.circleInvitation.create).toHaveBeenCalledWith({
+      data: {
+        circleID: 'circle-1',
+        applicantID: 'user-1',
+        inviterID: 'user-1',
+      },
+      select: { id: true },
+    });
+    expect(circleInvitationService.getInvitationForViewer).toHaveBeenCalledWith(
+      'user-1',
+      'inv-legacy',
+    );
+  });
+
+  it('cancels pending invitations when a pending member leaves', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: 'MEMBER',
+      status: 'PENDING',
+    });
+    prisma.circle.findUnique.mockResolvedValue({ groupID: null });
+
+    await service.leaveCircle('user-1', 'circle-1');
+
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: 'user-1',
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
+    });
+  });
+
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
       openimService as any,
+      circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
@@ -217,6 +294,7 @@ describe('CircleService', () => {
     const guarded = new CircleService(
       prisma as any,
       openimService as any,
+      circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,

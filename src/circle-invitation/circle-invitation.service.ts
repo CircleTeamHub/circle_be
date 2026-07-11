@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { Prisma } from 'src/generated/prisma';
 import {
   CircleErrorCode,
@@ -535,6 +536,80 @@ export class CircleInvitationService {
         },
       );
     }
+  }
+
+  /**
+   * Repairs invitations that crossed the approval threshold while the
+   * request transaction was interrupted. This intentionally uses the same
+   * admission transaction and side effects as a verifier approval, so a
+   * restart cannot leave a permanently pending invitation with a full set of
+   * approvals.
+   */
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async reconcileApprovedInvitations(): Promise<number> {
+    const candidates = await this.prisma.circleInvitation.findMany({
+      where: { status: 'PENDING' },
+      orderBy: { updatedAt: 'asc' },
+      take: 100,
+      include: { circle: true },
+    });
+    let finalizedCount = 0;
+    for (const candidate of candidates) {
+      if (candidate.approvedCount < candidate.requiredCount) continue;
+      const result = await this.runInvitationTransaction(async (tx) => {
+        const invitation = await tx.circleInvitation.findUnique({
+          where: { id: candidate.id },
+          include: { circle: true },
+        });
+        if (
+          !invitation ||
+          invitation.status !== 'PENDING' ||
+          invitation.approvedCount < invitation.requiredCount
+        ) {
+          return null;
+        }
+        const changed = await tx.circleInvitation.updateMany({
+          where: { id: invitation.id, status: 'PENDING' },
+          data: { status: 'APPROVED' },
+        });
+        if (changed.count === 0) return null;
+        const admitted = await this.admitApplicant(
+          tx,
+          invitation.circleID,
+          invitation.applicantID,
+        );
+        return {
+          admitted,
+          applicantId: invitation.applicantID,
+          groupID: invitation.circle.groupID,
+          notificationData: {
+            toUserID: invitation.applicantID,
+            fromUserID: invitation.inviterID,
+            type: 'CIRCLE_INVITATION_APPROVED' as const,
+            fromCircleID: invitation.circleID,
+            fromInvitationID: invitation.id,
+          },
+        };
+      });
+      if (!result) continue;
+      finalizedCount += 1;
+      await this.syncApplicantToGroup(
+        result.admitted ? result.groupID : null,
+        result.admitted ? result.applicantId : undefined,
+      );
+      await this.createAndBroadcastInvitationNotification(
+        result.notificationData,
+      );
+      this.realtimeService.broadcastCircleInvitationReviewed(
+        result.applicantId,
+        {
+          invitationId: candidate.id,
+          circleId: candidate.circleID,
+          status: 'APPROVED',
+        },
+      );
+    }
+    return finalizedCount;
   }
 
   async getInvitationForViewer(

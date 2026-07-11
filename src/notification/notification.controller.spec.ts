@@ -46,7 +46,9 @@ describe('NotificationController', () => {
     };
     const controller = new NotificationController(notificationService as any);
 
-    await controller.profileList('3', { user: { userId: 'user-1' } } as any);
+    await controller.profileList({ page: 3 }, {
+      user: { userId: 'user-1' },
+    } as any);
 
     expect(notificationService.getProfileNotifications).toHaveBeenCalledWith(
       'user-1',

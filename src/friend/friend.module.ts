@@ -8,6 +8,7 @@ import { FriendController } from './friend.controller';
 import { FriendReportAdminController } from './friend-report-admin.controller';
 import { FriendReportAdminService } from './friend-report-admin.service';
 import { FriendSyncOutboxProcessor } from './friend-sync-outbox.processor';
+import { FriendChatReplayOutboxProcessor } from './friend-chat-replay-outbox.processor';
 import { FriendService } from './friend.service';
 
 @Module({
@@ -23,6 +24,7 @@ import { FriendService } from './friend.service';
     FriendService,
     FriendReportAdminService,
     FriendSyncOutboxProcessor,
+    FriendChatReplayOutboxProcessor,
   ],
   exports: [FriendService],
 })

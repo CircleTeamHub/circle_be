@@ -113,15 +113,6 @@ export class CreateCircleDto {
   @IsBoolean()
   @IsOptional()
   memberCanPost?: boolean;
-
-  @ApiPropertyOptional({
-    default: true,
-    description:
-      'Public circles auto-admit on join; private circles require the invitation flow.',
-  })
-  @IsBoolean()
-  @IsOptional()
-  isPublic?: boolean;
 }
 
 export class ListCirclesQueryDto {
@@ -188,7 +179,6 @@ export class CircleDto {
   currentIconUrl: string | null;
   cover: string | null;
   cities: string[];
-  isPublic: boolean;
   categories: string[];
   rules: string;
   tags: string[];

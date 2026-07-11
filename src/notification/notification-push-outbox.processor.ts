@@ -1,0 +1,90 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  mapNotificationRealtimeDto,
+  NOTIFICATION_REALTIME_INCLUDE,
+} from './notification.dto';
+import { NotificationPushService } from './notification-push.service';
+
+const BATCH_SIZE = 100;
+const STALE_LOCK_MS = 10 * 60 * 1000;
+
+@Injectable()
+export class NotificationPushOutboxProcessor {
+  private readonly logger = new Logger(NotificationPushOutboxProcessor.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pushService: NotificationPushService,
+  ) {}
+
+  @Cron(CronExpression.EVERY_MINUTE)
+  async processPending(): Promise<number> {
+    const now = new Date();
+    const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);
+    const jobs = await this.prisma.notificationPushOutbox.findMany({
+      where: {
+        OR: [
+          { status: 'PENDING', nextAttemptAt: { lte: now } },
+          { status: 'FAILED', nextAttemptAt: { lte: now } },
+          { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
+        ],
+      },
+      orderBy: { createdAt: 'asc' },
+      take: BATCH_SIZE,
+      include: { notification: { include: NOTIFICATION_REALTIME_INCLUDE } },
+    });
+    let processed = 0;
+    for (const job of jobs) {
+      const claimed = await this.prisma.notificationPushOutbox.updateMany({
+        where: {
+          id: job.id,
+          OR: [
+            { status: 'PENDING' },
+            { status: 'FAILED', nextAttemptAt: { lte: now } },
+            { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
+          ],
+        },
+        data: {
+          status: 'PROCESSING',
+          lockedAt: now,
+          attempts: { increment: 1 },
+        },
+      });
+      if (claimed.count === 0) continue;
+      try {
+        const ok = await this.pushService.sendNotification(
+          job.notification.toUserID ?? '',
+          mapNotificationRealtimeDto(job.notification),
+        );
+        if (!ok) throw new Error('Expo push delivery failed');
+        await this.prisma.notificationPushOutbox.update({
+          where: { id: job.id },
+          data: {
+            status: 'COMPLETED',
+            processedAt: new Date(),
+            lockedAt: null,
+          },
+        });
+        processed += 1;
+      } catch (error) {
+        const attempts = job.attempts + 1;
+        await this.prisma.notificationPushOutbox.update({
+          where: { id: job.id },
+          data: {
+            status: 'FAILED',
+            lockedAt: null,
+            lastError: error instanceof Error ? error.message : String(error),
+            nextAttemptAt: new Date(
+              Date.now() +
+                Math.min(60 * 60 * 1000, 2 ** Math.min(attempts, 10) * 1000),
+            ),
+          },
+        });
+        this.logger.warn(`Push outbox job ${job.id} failed: ${error}`);
+      }
+    }
+    return processed;
+  }
+}

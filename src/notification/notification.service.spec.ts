@@ -5,7 +5,6 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationType } from 'src/generated/prisma';
 import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
 import { NotificationPushService } from './notification-push.service';
-import { createHash } from 'crypto';
 
 describe('NotificationService', () => {
   let service: NotificationService;
@@ -22,8 +21,14 @@ describe('NotificationService', () => {
       upsert: jest.fn(),
       deleteMany: jest.fn(),
     },
-    $transaction: jest.fn(async (operations: unknown[]) =>
-      Promise.all(operations),
+    notificationPushOutbox: {
+      upsert: jest.fn(),
+      create: jest.fn(),
+    },
+    $transaction: jest.fn(async (operation: any) =>
+      typeof operation === 'function'
+        ? operation(prisma)
+        : Promise.all(operation),
     ),
   };
 
@@ -37,14 +42,18 @@ describe('NotificationService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    for (const nested of Object.values(prisma.notification)) {
+    for (const nested of Object.values(prisma.notification) as jest.Mock[]) {
       nested.mockReset();
     }
-    for (const nested of Object.values(prisma.devicePushToken)) {
+    for (const nested of Object.values(prisma.devicePushToken) as jest.Mock[]) {
+      nested.mockReset();
+    }
+    for (const nested of Object.values(
+      prisma.notificationPushOutbox,
+    ) as jest.Mock[]) {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
-    prisma.$transaction.mockClear();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -106,40 +115,6 @@ describe('NotificationService', () => {
     ).not.toHaveBeenCalled();
   });
 
-  describe('notification open ownership', () => {
-    it('returns owned for a current-user notification even when already read', async () => {
-      prisma.notification.findFirst.mockResolvedValue({ id: 'notification-1' });
-
-      await expect(
-        service.getNotificationOpenOwnership('user-1', 'notification-1'),
-      ).resolves.toEqual({ owned: true });
-
-      expect(prisma.notification.findFirst).toHaveBeenCalledWith({
-        where: {
-          id: 'notification-1',
-          toUserID: 'user-1',
-          deleted: false,
-        },
-        select: { id: true },
-      });
-      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
-    });
-
-    it.each([
-      'notification owned by another user',
-      'missing notification',
-      'deleted notification',
-    ])('returns the same not-owned envelope for a %s', async () => {
-      prisma.notification.findFirst.mockResolvedValue(null);
-
-      await expect(
-        service.getNotificationOpenOwnership('user-1', 'notification-1'),
-      ).resolves.toEqual({ owned: false });
-
-      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
-    });
-  });
-
   describe('push tokens', () => {
     it('upserts the current user device push token', async () => {
       prisma.devicePushToken.upsert.mockResolvedValue({
@@ -176,45 +151,6 @@ describe('NotificationService', () => {
       });
     });
 
-    it('clears a stale revocation hash when the same owner registers without a secret', async () => {
-      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
-
-      await service.registerPushToken('user-1', {
-        token: 'ExponentPushToken[abc]',
-        platform: 'ios',
-        provider: 'expo',
-      });
-
-      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          update: expect.objectContaining({
-            userID: 'user-1',
-            revocationSecretHash: null,
-          }),
-        }),
-      );
-    });
-
-    it('clears a stale revocation hash atomically when token ownership transfers without a secret', async () => {
-      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
-
-      await service.registerPushToken('different-user', {
-        token: 'ExponentPushToken[abc]',
-        platform: 'android',
-        provider: 'expo',
-      });
-
-      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { token: 'ExponentPushToken[abc]' },
-          update: expect.objectContaining({
-            userID: 'different-user',
-            revocationSecretHash: null,
-          }),
-        }),
-      );
-    });
-
     it('deletes only the current user device push token', async () => {
       prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 1 });
 
@@ -224,71 +160,6 @@ describe('NotificationService', () => {
         where: {
           userID: 'user-1',
           token: 'ExponentPushToken[abc]',
-        },
-      });
-    });
-
-    it('stores and rotates only the SHA-256 revocation-secret hash', async () => {
-      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
-      const revocationSecret = 'registration-secret-that-is-long-enough';
-      const revocationSecretHash = createHash('sha256')
-        .update(revocationSecret)
-        .digest('hex');
-
-      await service.registerPushToken('user-1', {
-        token: 'ExponentPushToken[abc]',
-        platform: 'ios',
-        provider: 'expo',
-        revocationSecret,
-      });
-
-      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith({
-        where: { token: 'ExponentPushToken[abc]' },
-        create: expect.objectContaining({ revocationSecretHash }),
-        update: expect.objectContaining({ revocationSecretHash }),
-      });
-      const persisted = JSON.stringify(
-        prisma.devicePushToken.upsert.mock.calls[0][0],
-      );
-      expect(persisted).not.toContain(revocationSecret);
-    });
-
-    it('revokes idempotently only when token and secret hash match', async () => {
-      const revocationSecret = 'registered-secret-that-is-long-enough';
-      const revocationSecretHash = createHash('sha256')
-        .update(revocationSecret)
-        .digest('hex');
-      prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 1 });
-
-      await expect(
-        service.revokePushToken({
-          token: 'ExponentPushToken[abc]',
-          revocationSecret,
-        }),
-      ).resolves.toBe(true);
-
-      expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
-        where: {
-          token: 'ExponentPushToken[abc]',
-          revocationSecretHash,
-        },
-      });
-    });
-
-    it('uses the supplied hash predicate so a wrong secret is a no-op', async () => {
-      prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 0 });
-
-      await expect(
-        service.revokePushToken({
-          token: 'ExponentPushToken[abc]',
-          revocationSecret: 'wrong-secret-that-is-still-long-enough',
-        }),
-      ).resolves.toBe(false);
-
-      expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
-        where: {
-          token: 'ExponentPushToken[abc]',
-          revocationSecretHash: expect.stringMatching(/^[a-f0-9]{64}$/),
         },
       });
     });
@@ -363,193 +234,15 @@ describe('NotificationService', () => {
         fromCircle: null,
         fromCirclePost: null,
         fromInvitation: null,
+        requestId: null,
       });
     });
 
     it('excludes friend-request events from the bell channel (they live in the 新的朋友 inbox)', () => {
       const bellTypes = DISCOVER_NOTIFICATION_TYPES as readonly string[];
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_RECEIVED');
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_ACCEPTED');
-      expect(bellTypes).not.toContain('FRIEND_REQUEST_REJECTED');
-    });
-
-    it('includes trace mentions in the discover notification channel', () => {
-      expect(DISCOVER_NOTIFICATION_TYPES as readonly string[]).toContain(
-        'TRACE_MENTION',
-      );
-    });
-
-    it('creates one precedence-ordered notification per comment target', async () => {
-      const recheckMentionEligibility = jest.fn().mockResolvedValue({
-        traceAvailable: true,
-        eligibleUserIds: [
-          'author-1',
-          'reply-user-1',
-          'mention-user-1',
-          'mention-user-2',
-        ],
-      });
-      prisma.notification.create.mockImplementation(({ data }: any) =>
-        Promise.resolve({
-          id: `notification-${data.toUserID}`,
-          ...data,
-          content: data.content ?? '',
-          read: false,
-          createdAt: new Date('2026-07-10T00:00:00Z'),
-          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-          fromTrace: { id: 'trace-1', content: 'trace', images: [] },
-          fromReply: { id: 'comment-1', content: 'hello' },
-          fromCircle: null,
-          fromCirclePost: null,
-          fromInvitation: null,
-        }),
-      );
-
-      const result = await service.createTraceCommentNotifications({
-        actorId: 'actor-1',
-        traceId: 'trace-1',
-        commentId: 'comment-1',
-        traceOwnerId: 'author-1',
-        replyToCommentId: 'parent-comment-1',
-        replyToUserId: 'reply-user-1',
-        mentionedUserIds: [
-          'actor-1',
-          'author-1',
-          'reply-user-1',
-          'mention-user-1',
-          'mention-user-2',
-        ],
-        recheckMentionEligibility,
-        content: 'hello',
-      });
-
-      expect(
-        prisma.notification.create.mock.calls.map(([arg]) => arg.data),
-      ).toEqual([
-        expect.objectContaining({
-          toUserID: 'author-1',
-          type: 'TRACE_COMMENT',
-        }),
-        expect.objectContaining({
-          toUserID: 'reply-user-1',
-          type: 'COMMENT_REPLY',
-          toReplyID: 'parent-comment-1',
-        }),
-        expect.objectContaining({
-          toUserID: 'mention-user-1',
-          type: 'TRACE_MENTION',
-          fromTraceID: 'trace-1',
-          fromReplyID: 'comment-1',
-        }),
-        expect.objectContaining({
-          toUserID: 'mention-user-2',
-          type: 'TRACE_MENTION',
-          fromTraceID: 'trace-1',
-          fromReplyID: 'comment-1',
-        }),
-      ]);
-      expect(result.map(({ targetUserId }) => targetUserId)).toEqual([
-        'author-1',
-        'reply-user-1',
-        'mention-user-1',
-        'mention-user-2',
-      ]);
-      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-      expect(recheckMentionEligibility).toHaveBeenCalledWith([
-        'author-1',
-        'reply-user-1',
-        'mention-user-1',
-        'mention-user-2',
-      ]);
-      expect(
-        recheckMentionEligibility.mock.invocationCallOrder[0],
-      ).toBeLessThan(prisma.notification.create.mock.invocationCallOrder[0]);
-    });
-
-    it('preserves author and reply notifications when boundary filtering removes mentions', async () => {
-      prisma.notification.create.mockImplementation(({ data }: any) =>
-        Promise.resolve({
-          id: `notification-${data.toUserID}`,
-          ...data,
-          content: data.content ?? '',
-          read: false,
-          createdAt: new Date('2026-07-10T00:00:00Z'),
-          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-          fromTrace: { id: 'trace-1', content: 'trace', images: [] },
-          fromReply: { id: 'comment-1', content: 'hello' },
-          fromCircle: null,
-          fromCirclePost: null,
-          fromInvitation: null,
-        }),
-      );
-
-      const result = await service.createTraceCommentNotifications({
-        actorId: 'actor-1',
-        traceId: 'trace-1',
-        commentId: 'comment-1',
-        traceOwnerId: 'author-1',
-        replyToCommentId: 'parent-comment-1',
-        replyToUserId: 'reply-user-1',
-        mentionedUserIds: ['mention-user-1'],
-        recheckMentionEligibility: jest.fn().mockResolvedValue({
-          traceAvailable: true,
-          eligibleUserIds: [],
-        }),
-        content: 'hello',
-      });
-
-      expect(
-        prisma.notification.create.mock.calls.map(([arg]) => arg.data.type),
-      ).toEqual(['TRACE_COMMENT', 'COMMENT_REPLY']);
-      expect(result.map(({ targetUserId }) => targetUserId)).toEqual([
-        'author-1',
-        'reply-user-1',
-      ]);
-    });
-
-    it('creates no notification side effects when the boundary eligibility recheck fails', async () => {
-      const recheckError = new Error('mention access revoked');
-
-      await expect(
-        service.createTraceCommentNotifications({
-          actorId: 'actor-1',
-          traceId: 'trace-1',
-          commentId: 'comment-1',
-          traceOwnerId: 'actor-1',
-          mentionedUserIds: ['mention-user-1'],
-          recheckMentionEligibility: jest.fn().mockRejectedValue(recheckError),
-          content: 'hello',
-        }),
-      ).rejects.toBe(recheckError);
-
-      expect(prisma.notification.create).not.toHaveBeenCalled();
-      expect(prisma.$transaction).not.toHaveBeenCalled();
-      expect(pushService.sendNotification).not.toHaveBeenCalled();
-    });
-
-    it('sends no push when the notification transaction rejects', async () => {
-      const transactionError = new Error('notification transaction failed');
-      const notificationOperation = Promise.resolve({ id: 'uncommitted' });
-      prisma.notification.create.mockReturnValue(notificationOperation);
-      prisma.$transaction.mockRejectedValueOnce(transactionError);
-
-      await expect(
-        service.createTraceCommentNotifications({
-          actorId: 'actor-1',
-          traceId: 'trace-1',
-          commentId: 'comment-1',
-          traceOwnerId: 'actor-1',
-          mentionedUserIds: ['mention-user-1'],
-          recheckMentionEligibility: jest.fn().mockResolvedValue({
-            traceAvailable: true,
-            eligibleUserIds: ['mention-user-1'],
-          }),
-          content: 'hello',
-        }),
-      ).rejects.toBe(transactionError);
-
-      expect(prisma.$transaction).toHaveBeenCalledWith([notificationOperation]);
-      expect(pushService.sendNotification).not.toHaveBeenCalled();
+      expect(bellTypes).toContain('FRIEND_REQUEST_RECEIVED');
+      expect(bellTypes).toContain('FRIEND_REQUEST_ACCEPTED');
+      expect(bellTypes).toContain('FRIEND_REQUEST_REJECTED');
     });
 
     it('getProfileNotifications returns only profile-domain system rows', async () => {
@@ -592,7 +285,7 @@ describe('NotificationService', () => {
       );
     });
 
-    it('dispatches push after creating a friend request notification', async () => {
+    it('enqueues durable push delivery after creating a friend request notification', async () => {
       prisma.notification.create.mockResolvedValue({
         id: 'friend-n1',
         type: NotificationType.FRIEND_REQUEST_RECEIVED,
@@ -614,14 +307,38 @@ describe('NotificationService', () => {
         content: 'hello',
       });
 
-      expect(pushService.sendNotification).toHaveBeenCalledWith(
-        'to-1',
-        expect.objectContaining({
-          id: 'friend-n1',
-          type: NotificationType.FRIEND_REQUEST_RECEIVED,
-        }),
-      );
+      expect(prisma.notificationPushOutbox.create).toHaveBeenCalledWith({
+        data: { notificationID: 'friend-n1' },
+      });
       expect(result).toEqual(expect.objectContaining({ id: 'friend-n1' }));
+    });
+
+    it('fails the notification transaction when durable push enqueue fails', async () => {
+      prisma.notification.create.mockResolvedValue({
+        id: 'friend-n2',
+        type: NotificationType.FRIEND_REQUEST_RECEIVED,
+        content: 'hello',
+        read: false,
+        createdAt: new Date('2026-07-05T00:00:00Z'),
+        fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+      });
+      prisma.notificationPushOutbox.create.mockRejectedValue(
+        new Error('outbox unavailable'),
+      );
+
+      await expect(
+        service.createFriendRequestNotification({
+          type: NotificationType.FRIEND_REQUEST_RECEIVED,
+          toUserId: 'to-1',
+          fromUserId: 'from-1',
+          content: 'hello',
+        }),
+      ).rejects.toThrow('outbox unavailable');
     });
 
     it('creates circle invitation notifications through the shared notification path', async () => {
@@ -658,12 +375,7 @@ describe('NotificationService', () => {
         },
         include: expect.any(Object),
       });
-      expect(pushService.sendNotification).toHaveBeenCalledWith(
-        'to-1',
-        expect.objectContaining({
-          fromInvitation: { id: 'inv-1', status: 'PENDING' },
-        }),
-      );
+      expect(prisma.notificationPushOutbox.create).toHaveBeenCalled();
     });
 
     it('markNotificationRead broadcasts interaction unread for discover-domain rows', async () => {

@@ -5,12 +5,13 @@ import { UserService } from './user.service';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { OpenimModule } from 'src/openim/openim.module';
+import { UserProfileSyncOutboxProcessor } from './user-profile-sync-outbox.processor';
 
 @Global()
 @Module({
   imports: [ConfigModule, RealtimeModule, PrivacySettingsModule, OpenimModule],
   controllers: [UserController],
-  providers: [UserService],
+  providers: [UserService, UserProfileSyncOutboxProcessor],
   exports: [UserService],
 })
 export class UserModule {}

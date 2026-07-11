@@ -14,6 +14,10 @@ describe('UserService.update normalization', () => {
       findUnique: jest.fn(),
       update: jest.fn(),
     },
+    userProfileSyncOutbox: {
+      upsert: jest.fn(),
+    },
+    $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
   const refreshTokens = {
     revokeAll: jest.fn().mockResolvedValue(undefined),
@@ -23,10 +27,6 @@ describe('UserService.update normalization', () => {
   const privacySettings = {
     canViewProfileField: jest.fn().mockResolvedValue(true),
   };
-  const openim = {
-    updateUserInfo: jest.fn().mockResolvedValue(undefined),
-  };
-
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.user.findUnique.mockResolvedValue({
@@ -64,7 +64,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -88,7 +87,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -123,7 +121,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -150,7 +147,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -177,7 +173,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -193,6 +188,11 @@ describe('UserService.update normalization', () => {
         }),
       }),
     );
+    expect(prisma.userProfileSyncOutbox.upsert).toHaveBeenCalledWith({
+      where: { userID: 'user-1' },
+      create: { userID: 'user-1' },
+      update: expect.objectContaining({ status: 'PENDING' }),
+    });
   });
 
   it('converts blank/whitespace-only nullable fields to null', async () => {
@@ -204,7 +204,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -233,7 +232,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', { nickname: '   ' } as any);
@@ -245,7 +243,7 @@ describe('UserService.update normalization', () => {
     );
   });
 
-  it('pushes a nickname/avatar change to OpenIM', async () => {
+  it('queues a nickname/avatar change for durable OpenIM sync', async () => {
     const config = { get: jest.fn().mockReturnValue(null) };
     const service = new UserService(
       prisma as any,
@@ -254,7 +252,6 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
     );
 
     await service.update('user-1', {
@@ -262,13 +259,14 @@ describe('UserService.update normalization', () => {
       avatarUrl: 'https://cdn/a.jpg',
     } as any);
 
-    expect(openim.updateUserInfo).toHaveBeenCalledWith('user-1', {
-      nickname: '新昵称',
-      avatarUrl: 'https://cdn/a.jpg',
+    expect(prisma.userProfileSyncOutbox.upsert).toHaveBeenCalledWith({
+      where: { userID: 'user-1' },
+      create: { userID: 'user-1' },
+      update: expect.objectContaining({ status: 'PENDING' }),
     });
   });
 
-  it('does NOT touch OpenIM when neither nickname nor avatar changes', async () => {
+  it('fails the profile transaction when sync enqueue fails', async () => {
     const config = { get: jest.fn().mockReturnValue(null) };
     const service = new UserService(
       prisma as any,
@@ -277,11 +275,29 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
-      openim as any,
+    );
+    prisma.userProfileSyncOutbox.upsert.mockRejectedValue(
+      new Error('profile outbox unavailable'),
+    );
+
+    await expect(
+      service.update('user-1', { nickname: '新昵称' }),
+    ).rejects.toThrow('profile outbox unavailable');
+  });
+
+  it('does NOT enqueue a sync when neither nickname nor avatar changes', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+      privacySettings as any,
     );
 
     await service.update('user-1', { persona: 'just a bio' } as any);
 
-    expect(openim.updateUserInfo).not.toHaveBeenCalled();
+    expect(prisma.userProfileSyncOutbox.upsert).not.toHaveBeenCalled();
   });
 });

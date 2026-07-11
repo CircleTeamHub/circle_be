@@ -221,6 +221,7 @@ export class FriendActivityDto {
     enum: [
       'REQUEST_RECEIVED',
       'REQUEST_SENT',
+      'REQUEST_MESSAGE_RECEIVED',
       'REQUEST_ACCEPTED_BY_OTHER',
       'REQUEST_REJECTED_BY_OTHER',
       'REQUEST_ACCEPTED_BY_ME',

@@ -420,7 +420,14 @@ export class TraceService {
     dto: CreateTraceCommentDto,
   ): Promise<TraceCommentDto> {
     const content = dto.content?.trim() ?? '';
-    const images = dto.images ?? [];
+    const rawImages = dto.images ?? [];
+    if (rawImages.some((image) => !image?.trim())) {
+      throw new BadRequestException({
+        message: 'Comment images cannot be blank',
+        errorCode: TraceErrorCode.EmptyComment,
+      });
+    }
+    const images = rawImages.map((image) => image.trim());
     // 允许纯图评论，但文字/图片不能同时为空。
     if (!content && images.length === 0) {
       throw new BadRequestException({
@@ -501,7 +508,8 @@ export class TraceService {
               recipientIds,
             );
           },
-          content: comment.content,
+          content:
+            comment.content || (comment.images.length ? '评论了一张图片' : ''),
         });
 
       await Promise.all(
@@ -797,9 +805,9 @@ export class TraceService {
       trace.fromID,
     ]);
     if (chatOnlyAuthors.has(trace.fromID)) {
-      throw new ForbiddenException({
-        message: 'You are not allowed to access this moment',
-        errorCode: TraceErrorCode.AccessForbidden,
+      throw new NotFoundException({
+        message: 'Moment not found',
+        errorCode: TraceErrorCode.MomentNotFound,
       });
     }
     const friendIds =

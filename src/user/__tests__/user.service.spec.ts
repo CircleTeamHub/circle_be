@@ -23,6 +23,10 @@ describe('UserService', () => {
     userLike: {
       findUnique: jest.fn(),
     },
+    userProfileSyncOutbox: {
+      upsert: jest.fn(),
+    },
+    $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
   const refreshTokens = {
     revokeAll: jest.fn().mockResolvedValue(undefined),

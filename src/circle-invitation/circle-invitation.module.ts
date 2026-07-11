@@ -15,5 +15,6 @@ import { CircleInvitationService } from './circle-invitation.service';
   ],
   controllers: [CircleInvitationController],
   providers: [CircleInvitationService],
+  exports: [CircleInvitationService],
 })
 export class CircleInvitationModule {}

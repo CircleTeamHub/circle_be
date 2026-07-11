@@ -55,6 +55,7 @@ enum FriendPermission {
 enum FriendActivityType {
   REQUEST_RECEIVED
   REQUEST_SENT
+  REQUEST_MESSAGE_RECEIVED
   REQUEST_ACCEPTED_BY_OTHER
   REQUEST_REJECTED_BY_OTHER
   REQUEST_ACCEPTED_BY_ME
@@ -106,11 +107,33 @@ enum GroupSyncStatus {
 enum FriendSyncOperation {
   IMPORT_FRIEND
   DELETE_FRIEND
+  CLEAR_CONVERSATION
   ADD_BLACKLIST
   REMOVE_BLACKLIST
 }
 
 enum FriendSyncStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum FriendChatReplayStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum NotificationPushOutboxStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum UserProfileSyncStatus {
   PENDING
   PROCESSING
   COMPLETED
@@ -155,6 +178,7 @@ enum CircleInvitationStatus {
   APPROVED
   REJECTED
   ADMIN_APPROVED
+  CANCELLED
 }
 
 enum CircleInvitationVerifierStatus {
@@ -322,21 +346,39 @@ model User {
   conversationGroups                ConversationGroup[]
   callSessionsInitiated             CallSession[]               @relation("callInitiator")
   callParticipants                  CallParticipant[]
+  profileSyncOutbox                 UserProfileSyncOutbox?
+}
+
+model UserProfileSyncOutbox {
+  id            String                @id @default(uuid())
+  userID        String                @unique
+  status        UserProfileSyncStatus @default(PENDING)
+  attempts      Int                   @default(0)
+  lastError     String?
+  nextAttemptAt DateTime              @default(now())
+  lockedAt      DateTime?
+  processedAt   DateTime?
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
 }
 
 model RefreshToken {
-  id         String    @id @default(uuid())
+  id         String               @id @default(uuid())
   userId     String
-  token      String    @unique
+  token      String               @unique
   audience   RefreshTokenAudience @default(APP)
   deviceName String?
   ip         String?
   userAgent  String?
   expiredAt  DateTime
   revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
-  lastUsedAt DateTime  @default(now())
-  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime             @default(now())
+  lastUsedAt DateTime             @default(now())
+  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
@@ -344,42 +386,44 @@ model RefreshToken {
 // ─── Social ───────────────────────────────────────────────────────────────────
 
 model Friend {
-  id                    String                      @id @default(uuid())
-  userID                String
-  friendID              String
-  state                 FriendState                 @default(PENDING)
-  message               String?
-  pendingRemarkBySender String?
+  id                         String                      @id @default(uuid())
+  userID                     String
+  friendID                   String
+  state                      FriendState                 @default(PENDING)
+  message                    String?
+  pendingRemarkBySender      String?
   /// userID's private remark for friendID
-  remarkA               String?
+  remarkA                    String?
   /// friendID's private remark for userID
-  remarkB               String?
+  remarkB                    String?
   /// Sender-owned private description staged on the request, promoted on accept
   pendingDescriptionBySender String?
   /// userID's private description note for friendID
-  descriptionA          String?
+  descriptionA               String?
   /// friendID's private description note for userID
-  descriptionB          String?
+  descriptionB               String?
   /// Sender-owned description photo keys staged on the request, promoted on accept
-  pendingPhotosBySender String[]                    @default([])
+  pendingPhotosBySender      String[]                    @default([])
   /// userID's private description photo keys for friendID
-  photosA               String[]                    @default([])
+  photosA                    String[]                    @default([])
   /// friendID's private description photo keys for userID
-  photosB               String[]                    @default([])
+  photosB                    String[]                    @default([])
   /// Permission the sender grants the target, staged on the request
-  pendingPermissionBySender FriendPermission?
+  pendingPermissionBySender  FriendPermission?
   /// userID's granted permission for friendID (gates friendID seeing userID's moments)
-  permissionA           FriendPermission            @default(FULL)
+  permissionA                FriendPermission            @default(FULL)
   /// friendID's granted permission for userID (gates userID seeing friendID's moments)
-  permissionB           FriendPermission            @default(FULL)
-  createdAt             DateTime                    @default(now())
-  updatedAt             DateTime                    @updatedAt
-  user                  User                        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
-  friend                User                        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
-  tagLinks              FriendTagOnFriend[]
-  pendingTagLinks       PendingFriendTagOnRequest[]
-  activities            FriendActivity[]
-  messages              FriendRequestMessage[]
+  permissionB                FriendPermission            @default(FULL)
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+  user                       User                        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
+  friend                     User                        @relation("userFriendsTo", fields: [friendID], references: [id], onDelete: Cascade)
+  tagLinks                   FriendTagOnFriend[]
+  pendingTagLinks            PendingFriendTagOnRequest[]
+  activities                 FriendActivity[]
+  messages                   FriendRequestMessage[]
+  chatReplayJobs             FriendChatReplayOutbox[]
+  requestNotifications       Notification[]              @relation("friendRequestNotifications")
 
   @@index([userID])
   @@index([friendID])
@@ -398,6 +442,27 @@ model FriendRequestMessage {
   sender  User   @relation("friendRequestMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
 
   @@index([requestId, createdAt])
+}
+
+model FriendChatReplayOutbox {
+  id              String                 @id @default(uuid())
+  requestId       String                 @unique
+  requesterUserID String
+  accepterUserID  String
+  status          FriendChatReplayStatus @default(PENDING)
+  stage           Int                    @default(0)
+  messageIndex    Int                    @default(0)
+  attempts        Int                    @default(0)
+  lastError       String?
+  nextAttemptAt   DateTime               @default(now())
+  lockedAt        DateTime?
+  processedAt     DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  request Friend @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
 }
 
 enum FriendReportStatus {
@@ -1004,33 +1069,54 @@ model UserDisplayIcon {
 // ─── Notification ─────────────────────────────────────────────────────────────
 
 model Notification {
-  id               String           @id @default(uuid())
-  content          String           @default("")
-  deleted          Boolean          @default(false)
-  read             Boolean          @default(false)
-  type             NotificationType
-  toUserID         String?
-  fromUserID       String
-  fromTraceID      String?
-  fromReplyID      String?
-  toReplyID        String?
-  fromCircleID     String?
-  fromCirclePostID String?
-  fromInvitationID String?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
+  id                  String           @id @default(uuid())
+  content             String           @default("")
+  deleted             Boolean          @default(false)
+  read                Boolean          @default(false)
+  type                NotificationType
+  toUserID            String?
+  fromUserID          String
+  fromTraceID         String?
+  fromReplyID         String?
+  toReplyID           String?
+  fromCircleID        String?
+  fromCirclePostID    String?
+  fromInvitationID    String?
+  fromFriendRequestID String?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
 
-  toUser         User?             @relation("toUser", fields: [toUserID], references: [id])
-  fromUser       User              @relation("fromUser", fields: [fromUserID], references: [id])
-  fromTrace      Trace?            @relation(fields: [fromTraceID], references: [id])
-  fromReply      TraceComment?     @relation("fromReply", fields: [fromReplyID], references: [id])
-  toReply        TraceComment?     @relation("toReply", fields: [toReplyID], references: [id])
-  fromCircle     Circle?           @relation(fields: [fromCircleID], references: [id])
-  fromCirclePost CirclePost?       @relation(fields: [fromCirclePostID], references: [id])
-  fromInvitation CircleInvitation? @relation(fields: [fromInvitationID], references: [id])
+  toUser            User?                   @relation("toUser", fields: [toUserID], references: [id])
+  fromUser          User                    @relation("fromUser", fields: [fromUserID], references: [id])
+  fromTrace         Trace?                  @relation(fields: [fromTraceID], references: [id])
+  fromReply         TraceComment?           @relation("fromReply", fields: [fromReplyID], references: [id])
+  toReply           TraceComment?           @relation("toReply", fields: [toReplyID], references: [id])
+  fromCircle        Circle?                 @relation(fields: [fromCircleID], references: [id])
+  fromCirclePost    CirclePost?             @relation(fields: [fromCirclePostID], references: [id])
+  fromInvitation    CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
+  fromFriendRequest Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
+  pushOutbox        NotificationPushOutbox?
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+  @@index([fromFriendRequestID])
+}
+
+model NotificationPushOutbox {
+  id             String                       @id @default(uuid())
+  notificationID String                       @unique
+  status         NotificationPushOutboxStatus @default(PENDING)
+  attempts       Int                          @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime                     @default(now())
+  lockedAt       DateTime?
+  processedAt    DateTime?
+  createdAt      DateTime                     @default(now())
+  updatedAt      DateTime                     @updatedAt
+
+  notification Notification @relation(fields: [notificationID], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
 }
 
 model DevicePushToken {
@@ -1063,7 +1149,6 @@ model Circle {
   ownerID               String
   currentIconAssetID    String?
   cities                String[] @default([])
-  isPublic              Boolean  @default(true)
   categories            String[] @default([])
   rules                 String   @default("")
   tags                  String[] @default([])

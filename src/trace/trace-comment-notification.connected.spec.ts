@@ -29,6 +29,9 @@ describe('trace comment mention notification flow', () => {
     notification: {
       create: jest.fn(),
     },
+    notificationPushOutbox: {
+      create: jest.fn(),
+    },
     $transaction: jest.fn(async (input: any) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
@@ -55,6 +58,7 @@ describe('trace comment mention notification flow', () => {
     prisma.userPrivacySetting.findMany.mockReset();
     prisma.userPrivacySetting.findUnique.mockReset();
     prisma.notification.create.mockReset();
+    prisma.notificationPushOutbox.create.mockReset();
     prisma.$transaction
       .mockReset()
       .mockImplementation(async (input: any) =>
@@ -152,11 +156,8 @@ describe('trace comment mention notification flow', () => {
         fromReplyID: 'comment-1',
       }),
     ]);
-    const notificationTransaction = prisma.$transaction.mock.calls.find(
-      ([operations]) => Array.isArray(operations),
-    );
-    expect(notificationTransaction?.[0]).toHaveLength(2);
-    expect(push.sendNotification).toHaveBeenCalledTimes(2);
+    expect(prisma.notificationPushOutbox.create).toHaveBeenCalledTimes(2);
+    expect(push.sendNotification).not.toHaveBeenCalled();
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledTimes(2);
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
       'mention-user-1',
@@ -187,7 +188,8 @@ describe('trace comment mention notification flow', () => {
         }),
       }),
     );
-    expect(push.sendNotification).toHaveBeenCalledTimes(1);
+    expect(prisma.notificationPushOutbox.create).toHaveBeenCalledTimes(1);
+    expect(push.sendNotification).not.toHaveBeenCalled();
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
       'reply-user-1',
       expect.objectContaining({ type: 'COMMENT_REPLY' }),

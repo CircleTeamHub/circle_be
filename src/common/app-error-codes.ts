@@ -158,6 +158,8 @@ export const FriendErrorCode = {
   TagNameEmpty: 'FRIEND_TAG_NAME_EMPTY',
   RequestMessageInvalid: 'FRIEND_REQUEST_MESSAGE_INVALID',
   RequestMessageLimit: 'FRIEND_REQUEST_MESSAGE_LIMIT',
+  RequestNotPending: 'FRIEND_REQUEST_NOT_PENDING',
+  RequestAlreadyHandled: 'FRIEND_REQUEST_ALREADY_HANDLED',
 } as const;
 
 // 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。

@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -10,6 +10,7 @@ import {
 import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
+  type NotificationRealtimeRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
   type RevokePushTokenDto,
@@ -17,15 +18,16 @@ import {
 import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+const MAX_PUSH_TOKENS_PER_USER = 20;
 
 @Injectable()
 export class NotificationService {
-  private readonly logger = new Logger(NotificationService.name);
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
-    private readonly pushService: NotificationPushService,
+    // Kept optional for compatibility with direct service consumers; delivery
+    // itself is handled by the durable push outbox processor.
+    private readonly pushService?: NotificationPushService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -50,25 +52,16 @@ export class NotificationService {
     }
   }
 
-  /**
-   * Fire-and-forget offline push. Dispatched with `void` (never awaited) from
-   * the notification-creation path so a slow Expo round-trip can't add latency
-   * to the user's request. Fully self-contained: every failure is caught and
-   * logged here, so the floating promise can never reject.
-   */
-  private async sendPushBestEffort(
-    userId: string,
-    notification: NotificationRealtimeDto,
-  ): Promise<void> {
-    try {
-      await this.pushService.sendNotification(userId, notification);
-    } catch (error) {
-      this.logger.warn(
-        `Push notification failed for ${notification.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+  private async createNotificationWithPush<T extends NotificationRealtimeRow>(
+    operation: (tx: any) => Promise<T>,
+  ): Promise<T> {
+    return this.prisma.$transaction(async (tx) => {
+      const notification = await operation(tx);
+      await tx.notificationPushOutbox.create({
+        data: { notificationID: notification.id },
+      });
+      return notification;
+    });
   }
 
   async registerPushToken(
@@ -96,12 +89,22 @@ export class NotificationService {
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
         disabledAt: null,
-        // An omitted secret must revoke any prior capability in the same atomic
-        // upsert. Otherwise a stale secret could survive token ownership
-        // transfer and delete the new owner's registration.
         revocationSecretHash: revocationSecretHash ?? null,
       },
     });
+    const findTokens = this.prisma.devicePushToken.findMany;
+    if (!findTokens) return;
+    const excess = await findTokens({
+      where: { userID: userId, provider: dto.provider, disabledAt: null },
+      orderBy: { updatedAt: 'desc' },
+      skip: MAX_PUSH_TOKENS_PER_USER,
+      select: { id: true },
+    });
+    if (excess.length > 0) {
+      await this.prisma.devicePushToken.deleteMany({
+        where: { id: { in: excess.map((row) => row.id) } },
+      });
+    }
   }
 
   async deletePushToken(userId: string, token: string): Promise<void> {
@@ -183,17 +186,18 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.prisma.notification.create({
-      data: {
-        toUserID: toUserId,
-        fromUserID: fromUserId,
-        type: NotificationType.SYSTEM,
-        content,
-      },
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
+    const notification = await this.createNotificationWithPush((tx) =>
+      tx.notification.create({
+        data: {
+          toUserID: toUserId,
+          fromUserID: fromUserId,
+          type: NotificationType.SYSTEM,
+          content,
+        },
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      }),
+    );
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(toUserId, dto);
     return dto;
   }
 
@@ -206,6 +210,7 @@ export class NotificationService {
     fromCirclePostID?: string;
     fromCircleID?: string;
     fromInvitationID?: string;
+    fromFriendRequestID?: string;
     dedupeWindowMs?: number;
   }): Promise<NotificationRealtimeDto | null> {
     if (
@@ -217,37 +222,41 @@ export class NotificationService {
     }
 
     const { dedupeWindowMs, ...notificationData } = data;
-    if (dedupeWindowMs) {
-      const duplicate = await this.prisma.notification.findFirst({
-        where: {
-          toUserID: notificationData.toUserID,
-          fromUserID: notificationData.fromUserID,
-          type: notificationData.type,
-          deleted: false,
-          ...(notificationData.fromTraceID
-            ? { fromTraceID: notificationData.fromTraceID }
-            : {}),
-          ...(notificationData.fromCirclePostID
-            ? { fromCirclePostID: notificationData.fromCirclePostID }
-            : {}),
-          createdAt: { gte: new Date(Date.now() - dedupeWindowMs) },
-        },
-        select: { id: true },
-      });
-      if (duplicate) {
-        return null;
+    const notification = await this.prisma.$transaction(async (tx) => {
+      if (dedupeWindowMs) {
+        const duplicate = await tx.notification.findFirst({
+          where: {
+            toUserID: notificationData.toUserID,
+            fromUserID: notificationData.fromUserID,
+            type: notificationData.type,
+            deleted: false,
+            ...(notificationData.fromTraceID
+              ? { fromTraceID: notificationData.fromTraceID }
+              : {}),
+            ...(notificationData.fromCirclePostID
+              ? { fromCirclePostID: notificationData.fromCirclePostID }
+              : {}),
+            createdAt: { gte: new Date(Date.now() - dedupeWindowMs) },
+          },
+          select: { id: true },
+        });
+        if (duplicate) return null;
       }
-    }
 
-    const notification = await this.prisma.notification.create({
-      data: {
-        ...notificationData,
-        content: notificationData.content ?? '',
-      },
-      include: NOTIFICATION_REALTIME_INCLUDE,
+      const created = await tx.notification.create({
+        data: {
+          ...notificationData,
+          content: notificationData.content ?? '',
+        },
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      await tx.notificationPushOutbox.create({
+        data: { notificationID: created.id },
+      });
+      return created;
     });
+    if (!notification) return null;
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(notificationData.toUserID, dto);
     return dto;
   }
 
@@ -260,12 +269,14 @@ export class NotificationService {
     toUserId: string;
     fromUserId: string;
     content?: string | null;
+    requestId?: string;
   }): Promise<NotificationRealtimeDto | null> {
     return this.createNotification({
       toUserID: params.toUserId,
       fromUserID: params.fromUserId,
       type: params.type,
       content: params.content ?? '',
+      fromFriendRequestID: params.requestId,
     });
   }
 
@@ -322,19 +333,20 @@ export class NotificationService {
       return null;
     }
 
-    const notification = await this.prisma.notification.create({
-      data: {
-        toUserID: params.toUserId,
-        fromUserID: params.toUserId,
-        type: NotificationType.CIRCLE_POST_AUTO_ENDED,
-        fromCirclePostID: params.postId,
-        content: '',
-      },
-      include: NOTIFICATION_REALTIME_INCLUDE,
-    });
+    const notification = await this.createNotificationWithPush((tx) =>
+      tx.notification.create({
+        data: {
+          toUserID: params.toUserId,
+          fromUserID: params.toUserId,
+          type: NotificationType.CIRCLE_POST_AUTO_ENDED,
+          fromCirclePostID: params.postId,
+          content: '',
+        },
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      }),
+    );
 
     const dto = mapNotificationRealtimeDto(notification);
-    void this.sendPushBestEffort(params.toUserId, dto);
     return dto;
   }
 
@@ -461,7 +473,7 @@ export class NotificationService {
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
     mentionedUserIds?: string[];
-    recheckMentionEligibility: (mentionedUserIds: string[]) => Promise<{
+    recheckMentionEligibility?: (mentionedUserIds: string[]) => Promise<{
       traceAvailable: boolean;
       eligibleUserIds: string[];
     }>;
@@ -469,101 +481,93 @@ export class NotificationService {
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
   > {
-    const notifications = [];
     const notifiedUserIds = new Set<string>();
     let mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
       (mentionedUserId) =>
         mentionedUserId && mentionedUserId !== params.actorId,
     );
-
-    if (mentionedUserIds.length > 0) {
-      // Authorization snapshot: refresh immediately before constructing the
-      // Prisma operations that are committed in the single transaction below.
+    if (mentionedUserIds.length > 0 && params.recheckMentionEligibility) {
       const refreshed =
         await params.recheckMentionEligibility(mentionedUserIds);
-      if (!refreshed.traceAvailable) {
-        return [];
-      }
+      if (!refreshed.traceAvailable) return [];
       const requestedMentionIds = new Set(mentionedUserIds);
       mentionedUserIds = [...new Set(refreshed.eligibleUserIds)].filter((id) =>
         requestedMentionIds.has(id),
       );
+    } else if (mentionedUserIds.length > 0) {
+      // Mention recipients must be re-checked immediately before the write.
+      // Callers that cannot provide that authorization snapshot fail closed.
+      mentionedUserIds = [];
     }
-
-    if (
-      params.traceOwnerId &&
-      params.traceOwnerId !== params.actorId &&
-      !notifiedUserIds.has(params.traceOwnerId)
-    ) {
-      notifiedUserIds.add(params.traceOwnerId);
-      notifications.push(
-        this.prisma.notification.create({
-          data: {
-            toUserID: params.traceOwnerId,
-            fromUserID: params.actorId,
-            type: NotificationType.TRACE_COMMENT,
-            content: params.content,
-            fromTraceID: params.traceId,
-            fromReplyID: params.commentId,
-          },
-          include: NOTIFICATION_REALTIME_INCLUDE,
-        }),
-      );
-    }
-
-    if (
-      params.replyToUserId &&
-      params.replyToUserId !== params.actorId &&
-      !notifiedUserIds.has(params.replyToUserId)
-    ) {
-      notifiedUserIds.add(params.replyToUserId);
-      notifications.push(
-        this.prisma.notification.create({
-          data: {
-            toUserID: params.replyToUserId,
-            fromUserID: params.actorId,
-            type: NotificationType.COMMENT_REPLY,
-            content: params.content,
-            fromTraceID: params.traceId,
-            fromReplyID: params.commentId,
-            toReplyID: params.replyToCommentId ?? null,
-          },
-          include: NOTIFICATION_REALTIME_INCLUDE,
-        }),
-      );
-    }
-
-    for (const mentionedUserId of mentionedUserIds) {
+    const created = await this.prisma.$transaction(async (tx) => {
+      const notifications = [];
       if (
-        !mentionedUserId ||
-        mentionedUserId === params.actorId ||
-        notifiedUserIds.has(mentionedUserId)
+        params.traceOwnerId &&
+        params.traceOwnerId !== params.actorId &&
+        !notifiedUserIds.has(params.traceOwnerId)
       ) {
-        continue;
+        notifiedUserIds.add(params.traceOwnerId);
+        notifications.push(
+          await tx.notification.create({
+            data: {
+              toUserID: params.traceOwnerId,
+              fromUserID: params.actorId,
+              type: NotificationType.TRACE_COMMENT,
+              content: params.content,
+              fromTraceID: params.traceId,
+              fromReplyID: params.commentId,
+            },
+            include: NOTIFICATION_REALTIME_INCLUDE,
+          }),
+        );
       }
-      notifiedUserIds.add(mentionedUserId);
-      notifications.push(
-        this.prisma.notification.create({
-          data: {
-            toUserID: mentionedUserId,
-            fromUserID: params.actorId,
-            type: NotificationType.TRACE_MENTION,
-            content: params.content,
-            fromTraceID: params.traceId,
-            fromReplyID: params.commentId,
-          },
-          include: NOTIFICATION_REALTIME_INCLUDE,
-        }),
+      if (
+        params.replyToUserId &&
+        params.replyToUserId !== params.actorId &&
+        !notifiedUserIds.has(params.replyToUserId)
+      ) {
+        notifiedUserIds.add(params.replyToUserId);
+        notifications.push(
+          await tx.notification.create({
+            data: {
+              toUserID: params.replyToUserId,
+              fromUserID: params.actorId,
+              type: NotificationType.COMMENT_REPLY,
+              content: params.content,
+              fromTraceID: params.traceId,
+              fromReplyID: params.commentId,
+              toReplyID: params.replyToCommentId ?? null,
+            },
+            include: NOTIFICATION_REALTIME_INCLUDE,
+          }),
+        );
+      }
+      for (const mentionedUserId of mentionedUserIds) {
+        if (notifiedUserIds.has(mentionedUserId)) continue;
+        notifiedUserIds.add(mentionedUserId);
+        notifications.push(
+          await tx.notification.create({
+            data: {
+              toUserID: mentionedUserId,
+              fromUserID: params.actorId,
+              type: NotificationType.TRACE_MENTION,
+              content: params.content,
+              fromTraceID: params.traceId,
+              fromReplyID: params.commentId,
+            },
+            include: NOTIFICATION_REALTIME_INCLUDE,
+          }),
+        );
+      }
+      await Promise.all(
+        notifications.map((notification) =>
+          tx.notificationPushOutbox.create({
+            data: { notificationID: notification.id },
+          }),
+        ),
       );
-    }
-
-    if (notifications.length === 0) {
-      return [];
-    }
-
-    // Atomic: either all notifications land or none does — a partial failure
-    // must not leave an orphaned notification behind.
-    const created = await this.prisma.$transaction(notifications);
+      return notifications;
+    });
     const mapped = created
       .map((notification) => ({
         targetUserId: notification.toUserID,
@@ -577,10 +581,6 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
-    mapped.forEach(
-      (item) =>
-        void this.sendPushBestEffort(item.targetUserId, item.notification),
-    );
     return mapped;
   }
 }

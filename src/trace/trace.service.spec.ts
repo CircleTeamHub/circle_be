@@ -9,7 +9,6 @@ import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { TraceErrorCode } from 'src/common/app-error-codes';
 import {
   TraceService,
   encodeTraceCursor,
@@ -245,7 +244,7 @@ describe('TraceService', () => {
     );
   });
 
-  it('getTraceById throws Forbidden when the author marked the viewer chat-only', async () => {
+  it('hides chat-only moments as not found on direct detail access', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',
       fromID: 'author-1',
@@ -264,7 +263,7 @@ describe('TraceService', () => {
     ]);
 
     await expect(service.getTraceById('viewer-1', 'trace-1')).rejects.toThrow(
-      ForbiddenException,
+      NotFoundException,
     );
   });
 
@@ -358,6 +357,13 @@ describe('TraceService', () => {
       }),
     );
     expect(result.images).toEqual(['https://cdn.example/img.jpg']);
+  });
+
+  it('rejects blank image entries instead of storing an empty image comment', async () => {
+    await expect(
+      service.addComment('actor-1', 'trace-1', { images: [''] }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.traceComment.create).not.toHaveBeenCalled();
   });
 
   it('addComment rejects a comment with neither text nor images', async () => {
