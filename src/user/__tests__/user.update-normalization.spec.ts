@@ -17,6 +17,7 @@ describe('UserService.update normalization', () => {
     userProfileSyncOutbox: {
       upsert: jest.fn(),
     },
+    $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
   const refreshTokens = {
     revokeAll: jest.fn().mockResolvedValue(undefined),
@@ -263,6 +264,25 @@ describe('UserService.update normalization', () => {
       create: { userID: 'user-1' },
       update: expect.objectContaining({ status: 'PENDING' }),
     });
+  });
+
+  it('fails the profile transaction when sync enqueue fails', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+      privacySettings as any,
+    );
+    prisma.userProfileSyncOutbox.upsert.mockRejectedValue(
+      new Error('profile outbox unavailable'),
+    );
+
+    await expect(
+      service.update('user-1', { nickname: '新昵称' }),
+    ).rejects.toThrow('profile outbox unavailable');
   });
 
   it('does NOT enqueue a sync when neither nickname nor avatar changes', async () => {

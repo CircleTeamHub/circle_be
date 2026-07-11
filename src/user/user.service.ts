@@ -289,24 +289,14 @@ export class UserService {
     this.assertUrlsAreSafe(input);
     await this.findOne(id);
     const normalizedInput = normalizeUpdateInput(input);
-    const [user, displayIcons] = await Promise.all([
-      this.prisma.user.update({
+    const user = await this.prisma.$transaction(async (tx) => {
+      const updated = await tx.user.update({
         where: { id },
         data: normalizedInput,
         select: PUBLIC_SELECT,
-      }),
-      this.iconService.getDisplayIconsForUser(id),
-    ]);
-    await this.realtimeService.invalidateUserProfileSummaryCache(id);
-    await this.realtimeService.broadcastUserProfileSummary(id);
-
-    // OpenIM stores a profile copy used by conversation labels. Queue the
-    // synchronization durably; a transient OpenIM outage must not lose the
-    // update or make the profile request fail.
-    if (input.nickname !== undefined || input.avatarUrl !== undefined) {
-      const outbox = this.prisma.userProfileSyncOutbox;
-      if (outbox) {
-        await outbox.upsert({
+      });
+      if (input.nickname !== undefined || input.avatarUrl !== undefined) {
+        await tx.userProfileSyncOutbox.upsert({
           where: { userID: id },
           create: { userID: id },
           update: {
@@ -316,7 +306,11 @@ export class UserService {
           },
         });
       }
-    }
+      return updated;
+    });
+    const displayIcons = await this.iconService.getDisplayIconsForUser(id);
+    await this.realtimeService.invalidateUserProfileSummaryCache(id);
+    await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
       ...user,

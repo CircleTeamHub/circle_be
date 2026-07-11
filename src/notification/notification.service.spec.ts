@@ -23,7 +23,13 @@ describe('NotificationService', () => {
     },
     notificationPushOutbox: {
       upsert: jest.fn(),
+      create: jest.fn(),
     },
+    $transaction: jest.fn(async (operation: any) =>
+      typeof operation === 'function'
+        ? operation(prisma)
+        : Promise.all(operation),
+    ),
   };
 
   const realtimeService = {
@@ -36,13 +42,15 @@ describe('NotificationService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    for (const nested of Object.values(prisma.notification)) {
+    for (const nested of Object.values(prisma.notification) as jest.Mock[]) {
       nested.mockReset();
     }
-    for (const nested of Object.values(prisma.devicePushToken)) {
+    for (const nested of Object.values(prisma.devicePushToken) as jest.Mock[]) {
       nested.mockReset();
     }
-    for (const nested of Object.values(prisma.notificationPushOutbox)) {
+    for (const nested of Object.values(
+      prisma.notificationPushOutbox,
+    ) as jest.Mock[]) {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
@@ -298,12 +306,38 @@ describe('NotificationService', () => {
         content: 'hello',
       });
 
-      expect(prisma.notificationPushOutbox.upsert).toHaveBeenCalledWith({
-        where: { notificationID: 'friend-n1' },
-        create: { notificationID: 'friend-n1' },
-        update: expect.objectContaining({ status: 'PENDING' }),
+      expect(prisma.notificationPushOutbox.create).toHaveBeenCalledWith({
+        data: { notificationID: 'friend-n1' },
       });
       expect(result).toEqual(expect.objectContaining({ id: 'friend-n1' }));
+    });
+
+    it('fails the notification transaction when durable push enqueue fails', async () => {
+      prisma.notification.create.mockResolvedValue({
+        id: 'friend-n2',
+        type: NotificationType.FRIEND_REQUEST_RECEIVED,
+        content: 'hello',
+        read: false,
+        createdAt: new Date('2026-07-05T00:00:00Z'),
+        fromUser: { id: 'from-1', nickname: 'Aki', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: null,
+        fromInvitation: null,
+      });
+      prisma.notificationPushOutbox.create.mockRejectedValue(
+        new Error('outbox unavailable'),
+      );
+
+      await expect(
+        service.createFriendRequestNotification({
+          type: NotificationType.FRIEND_REQUEST_RECEIVED,
+          toUserId: 'to-1',
+          fromUserId: 'from-1',
+          content: 'hello',
+        }),
+      ).rejects.toThrow('outbox unavailable');
     });
 
     it('creates circle invitation notifications through the shared notification path', async () => {
@@ -340,7 +374,7 @@ describe('NotificationService', () => {
         },
         include: expect.any(Object),
       });
-      expect(prisma.notificationPushOutbox.upsert).toHaveBeenCalled();
+      expect(prisma.notificationPushOutbox.create).toHaveBeenCalled();
     });
 
     it('markNotificationRead broadcasts interaction unread for discover-domain rows', async () => {
