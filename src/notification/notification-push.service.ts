@@ -21,6 +21,16 @@ type ExpoPushTicket = {
   details?: { error?: string };
 };
 
+export type PushDeliveryResult = {
+  status: 'DELIVERED' | 'RETRYABLE_FAILURE' | 'TERMINAL_FAILURE';
+  error?: string;
+};
+
+const RETRYABLE_TICKET_ERRORS = new Set([
+  'MessageRateExceeded',
+  'ExpoServerError',
+]);
+
 @Injectable()
 export class NotificationPushService {
   private readonly logger = new Logger(NotificationPushService.name);
@@ -39,7 +49,7 @@ export class NotificationPushService {
   async sendNotification(
     userId: string,
     notification: NotificationRealtimeDto,
-  ): Promise<boolean> {
+  ): Promise<PushDeliveryResult> {
     const tokens = await this.prisma.devicePushToken.findMany({
       where: {
         userID: userId,
@@ -50,7 +60,7 @@ export class NotificationPushService {
       orderBy: { updatedAt: 'desc' },
       take: MAX_ACTIVE_TOKENS_PER_USER,
     });
-    if (tokens.length === 0) return true;
+    if (tokens.length === 0) return { status: 'DELIVERED' };
 
     const message = this.buildMessage(userId, notification);
     // Expo project IDs must not be mixed in a single request when enhanced
@@ -62,23 +72,30 @@ export class NotificationPushService {
       group.push(token);
       byProject.set(key, group);
     }
-    let success = true;
+    let aggregate: PushDeliveryResult = { status: 'DELIVERED' };
     for (const projectTokens of byProject.values()) {
       for (let i = 0; i < projectTokens.length; i += EXPO_BATCH_SIZE) {
         const batch = projectTokens.slice(i, i + EXPO_BATCH_SIZE);
-        success =
-          (await this.sendBatch(
-            batch.map((row) => ({
-              to: row.token,
-              sound: 'default',
-              title: message.title,
-              body: message.body,
-              data: message.data,
-            })),
-          )) && success;
+        const result = await this.sendBatch(
+          batch.map((row) => ({
+            to: row.token,
+            sound: 'default',
+            title: message.title,
+            body: message.body,
+            data: message.data,
+          })),
+        );
+        if (result.status === 'RETRYABLE_FAILURE') {
+          aggregate = result;
+        } else if (
+          result.status === 'TERMINAL_FAILURE' &&
+          aggregate.status === 'DELIVERED'
+        ) {
+          aggregate = result;
+        }
       }
     }
-    return success;
+    return aggregate;
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
@@ -173,7 +190,7 @@ export class NotificationPushService {
 
   private async sendBatch(
     messages: Array<Record<string, unknown>>,
-  ): Promise<boolean> {
+  ): Promise<PushDeliveryResult> {
     for (let attempt = 1; attempt <= EXPO_MAX_ATTEMPTS; attempt += 1) {
       try {
         const response = await fetch(EXPO_PUSH_URL, {
@@ -191,27 +208,36 @@ export class NotificationPushService {
           throw new Error(`HTTP ${response.status}`);
         }
         const payload = (await response.json()) as { data?: ExpoPushTicket[] };
-        await this.disableUnregisteredTokens(messages, payload.data ?? []);
-        return true;
+        return this.classifyTickets(messages, payload.data ?? []);
       } catch (error) {
         if (attempt === EXPO_MAX_ATTEMPTS) {
           this.logger.warn(
             `Expo push send failed after ${attempt} attempts: ${error instanceof Error ? error.message : String(error)}`,
           );
-          return false;
+          return {
+            status: 'RETRYABLE_FAILURE',
+            error: error instanceof Error ? error.message : String(error),
+          };
         }
         await new Promise((resolve) =>
           setTimeout(resolve, 250 * 2 ** (attempt - 1)),
         );
       }
     }
-    return false;
+    return { status: 'RETRYABLE_FAILURE', error: 'Expo delivery failed' };
   }
 
-  private async disableUnregisteredTokens(
+  private async classifyTickets(
     messages: Array<Record<string, unknown>>,
     tickets: ExpoPushTicket[],
-  ) {
+  ): Promise<PushDeliveryResult> {
+    if (tickets.length !== messages.length) {
+      return {
+        status: 'RETRYABLE_FAILURE',
+        error: 'MissingExpoPushTicket',
+      };
+    }
+
     const badTokens = tickets
       .map((ticket, index) =>
         ticket.status === 'error' &&
@@ -220,11 +246,26 @@ export class NotificationPushService {
           : null,
       )
       .filter((token): token is string => typeof token === 'string');
-    if (badTokens.length === 0) return;
+    if (badTokens.length > 0) {
+      await this.prisma.devicePushToken.updateMany({
+        where: { token: { in: badTokens } },
+        data: { disabledAt: new Date() },
+      });
+    }
 
-    await this.prisma.devicePushToken.updateMany({
-      where: { token: { in: badTokens } },
-      data: { disabledAt: new Date() },
-    });
+    const errors = tickets
+      .filter((ticket) => ticket.status === 'error')
+      .map((ticket) => ticket.details?.error || 'UnknownExpoTicketError');
+    if (errors.length === 0) return { status: 'DELIVERED' };
+
+    const retryable = errors.find(
+      (error) =>
+        RETRYABLE_TICKET_ERRORS.has(error) ||
+        error === 'UnknownExpoTicketError',
+    );
+    if (retryable) {
+      return { status: 'RETRYABLE_FAILURE', error: retryable };
+    }
+    return { status: 'TERMINAL_FAILURE', error: errors[0] };
   }
 }

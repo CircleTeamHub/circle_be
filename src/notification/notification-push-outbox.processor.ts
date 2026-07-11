@@ -62,11 +62,28 @@ export class NotificationPushOutboxProcessor {
       });
       if (claimed.count === 0) continue;
       try {
-        const ok = await this.pushService.sendNotification(
+        const delivery = await this.pushService.sendNotification(
           job.notification.toUserID ?? '',
           mapNotificationRealtimeDto(job.notification),
         );
-        if (!ok) throw new Error('Expo push delivery failed');
+        if (delivery.status === 'RETRYABLE_FAILURE') {
+          throw new Error(delivery.error || 'Expo push delivery failed');
+        }
+        if (delivery.status === 'TERMINAL_FAILURE') {
+          await this.prisma.notificationPushOutbox.updateMany({
+            where: { id: job.id, leaseToken, status: 'PROCESSING' },
+            data: {
+              status: 'TERMINAL',
+              processedAt: new Date(),
+              lockedAt: null,
+              leaseToken: null,
+              lastError: (
+                delivery.error || 'Terminal Expo ticket failure'
+              ).slice(0, 1000),
+            },
+          });
+          continue;
+        }
         const finished = await this.prisma.notificationPushOutbox.updateMany({
           where: { id: job.id, leaseToken, status: 'PROCESSING' },
           data: {

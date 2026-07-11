@@ -38,9 +38,9 @@ describe('NotificationPushOutboxProcessor leases', () => {
         .fn()
         .mockImplementationOnce(async () => {
           jest.setSystemTime(Date.parse('2026-07-11T00:11:00.000Z'));
-          return true;
+          return { status: 'DELIVERED' };
         })
-        .mockResolvedValueOnce(true),
+        .mockResolvedValueOnce({ status: 'DELIVERED' }),
     };
     const processor = new NotificationPushOutboxProcessor(
       prisma as any,
@@ -78,7 +78,7 @@ describe('NotificationPushOutboxProcessor leases', () => {
     const processor = new NotificationPushOutboxProcessor(
       prisma as any,
       {
-        sendNotification: jest.fn().mockResolvedValue(true),
+        sendNotification: jest.fn().mockResolvedValue({ status: 'DELIVERED' }),
       } as any,
     );
 
@@ -104,5 +104,47 @@ describe('NotificationPushOutboxProcessor leases', () => {
       ]),
     );
     expect(prisma.notificationPushOutbox.update).not.toHaveBeenCalled();
+  });
+
+  it('records non-retryable ticket failures as terminal', async () => {
+    const prisma = {
+      notificationPushOutbox: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([
+            { id: 'job-1', status: 'PENDING', attempts: 0, notification },
+          ]),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        update: jest.fn(),
+      },
+    };
+    const processor = new NotificationPushOutboxProcessor(
+      prisma as any,
+      {
+        sendNotification: jest.fn().mockResolvedValue({
+          status: 'TERMINAL_FAILURE',
+          error: 'MessageTooBig',
+        }),
+      } as any,
+    );
+
+    await processor.processPending();
+
+    const writes = prisma.notificationPushOutbox.updateMany.mock.calls.map(
+      ([input]) => input,
+    );
+    const leaseToken = writes[0].data.leaseToken;
+    expect(writes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          where: { id: 'job-1', leaseToken, status: 'PROCESSING' },
+          data: expect.objectContaining({
+            status: 'TERMINAL',
+            lastError: 'MessageTooBig',
+            leaseToken: null,
+          }),
+        }),
+      ]),
+    );
   });
 });

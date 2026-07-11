@@ -240,7 +240,7 @@ describe('NotificationPushService', () => {
       }),
     });
 
-    await service.sendNotification('user-1', {
+    const result = await service.sendNotification('user-1', {
       id: 'n1',
       type: 'SYSTEM',
       content: 'done',
@@ -257,6 +257,71 @@ describe('NotificationPushService', () => {
     expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
       where: { token: { in: ['ExponentPushToken[bad]'] } },
       data: { disabledAt: expect.any(Date) },
+    });
+    expect(result).toEqual({
+      status: 'TERMINAL_FAILURE',
+      error: 'DeviceNotRegistered',
+    });
+  });
+
+  it('returns a retryable failure for rate-limited Expo tickets', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{ status: 'error', details: { error: 'MessageRateExceeded' } }],
+      }),
+    });
+
+    await expect(
+      service.sendNotification('user-1', baseNotification()),
+    ).resolves.toEqual({
+      status: 'RETRYABLE_FAILURE',
+      error: 'MessageRateExceeded',
+    });
+  });
+
+  it('returns a terminal failure for invalid payload tickets', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{ status: 'error', details: { error: 'MessageTooBig' } }],
+      }),
+    });
+
+    await expect(
+      service.sendNotification('user-1', baseNotification()),
+    ).resolves.toEqual({
+      status: 'TERMINAL_FAILURE',
+      error: 'MessageTooBig',
+    });
+  });
+
+  it('does not hide a retryable error in a mixed ticket batch', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+      { token: 'ExponentPushToken[two]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { status: 'ok' },
+          { status: 'error', details: { error: 'MessageRateExceeded' } },
+        ],
+      }),
+    });
+
+    await expect(
+      service.sendNotification('user-1', baseNotification()),
+    ).resolves.toEqual({
+      status: 'RETRYABLE_FAILURE',
+      error: 'MessageRateExceeded',
     });
   });
 
@@ -347,7 +412,10 @@ describe('NotificationPushService', () => {
         fromCirclePost: null,
         fromInvitation: null,
       }),
-    ).resolves.toBe(false);
+    ).resolves.toEqual({
+      status: 'RETRYABLE_FAILURE',
+      error: 'The operation was aborted',
+    });
 
     // A failed send must never try to disable tokens on incomplete data.
     expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
