@@ -13,7 +13,11 @@ INSERT INTO "CircleInvitation" (
   "updatedAt"
 )
 SELECT
-  md5(random()::text || clock_timestamp()::text),
+  substr(md5(random()::text || clock_timestamp()::text), 1, 8) || '-' ||
+  substr(md5(random()::text || clock_timestamp()::text), 9, 4) || '-4' ||
+  substr(md5(random()::text || clock_timestamp()::text), 14, 3) || '-a' ||
+  substr(md5(random()::text || clock_timestamp()::text), 18, 3) || '-' ||
+  substr(md5(random()::text || clock_timestamp()::text), 21, 12),
   member."circleID",
   member."userID",
   member."userID",
@@ -91,7 +95,11 @@ BEGIN
         "id", "invitationID", "verifierID", "addedByID", "status",
         "respondedAt", "createdAt"
       ) VALUES (
-        md5(random()::text || clock_timestamp()::text),
+        substr(md5(random()::text || clock_timestamp()::text), 1, 8) || '-' ||
+        substr(md5(random()::text || clock_timestamp()::text), 9, 4) || '-4' ||
+        substr(md5(random()::text || clock_timestamp()::text), 14, 3) || '-a' ||
+        substr(md5(random()::text || clock_timestamp()::text), 18, 3) || '-' ||
+        substr(md5(random()::text || clock_timestamp()::text), 21, 12),
         canonical_id,
         verifier."verifierID",
         verifier."addedByID",
