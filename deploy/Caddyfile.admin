@@ -3,7 +3,18 @@
 }
 
 {$API_DOMAIN} {
-  reverse_proxy circle_be:3000
+  @metrics path /metrics /metrics/*
+  handle @metrics {
+    respond 404
+  }
+
+  handle /circle/* {
+    reverse_proxy minio:9000
+  }
+
+  handle {
+    reverse_proxy circle_be:3000
+  }
 }
 
 {$ADMIN_DOMAIN} {

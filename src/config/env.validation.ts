@@ -26,6 +26,32 @@ export function createEnvValidationSchema(
   const databaseUrlSchema = allowsStartWithoutDatabase(env)
     ? Joi.string().allow('').optional()
     : Joi.string().required();
+  const redisUrlSchema = Joi.string().uri({ scheme: ['redis', 'rediss'] });
+  const productionRedisUrlSchema = redisUrlSchema.custom((value, helpers) => {
+    const url = new URL(value);
+    const queryPasswords = url.searchParams.getAll('password');
+    if (queryPasswords.length > 1 || (url.password && queryPasswords.length)) {
+      return helpers.message({
+        custom: 'REDIS_URL must use exactly one password source',
+      });
+    }
+    const queryPassword = queryPasswords[0];
+    if (!url.password && !queryPassword) {
+      return helpers.message({
+        custom: 'REDIS_URL must include authentication credentials',
+      });
+    }
+    const root = helpers.state.ancestors[0] as Record<string, unknown>;
+    const allowInsecure =
+      root['REDIS_ALLOW_INSECURE'] === true ||
+      readBooleanEnvFlag(root['REDIS_ALLOW_INSECURE']);
+    if (url.protocol !== 'rediss:' && !allowInsecure) {
+      return helpers.message({
+        custom: 'external production REDIS_URL must use rediss TLS',
+      });
+    }
+    return value;
+  });
 
   const isProduction = env['NODE_ENV'] === 'production';
   const secretMin = isProduction ? 32 : 8;
@@ -56,7 +82,21 @@ export function createEnvValidationSchema(
     // When set, /metrics requires `Authorization: Bearer <token>`. Leave unset
     // only when the metrics port is reachable from a trusted network alone.
     METRICS_AUTH_TOKEN: Joi.string().optional(),
-    REDIS_URL: Joi.string().uri().optional(),
+    REDIS_REQUIRED: Joi.boolean().default(false),
+    REDIS_ALLOW_INSECURE: Joi.boolean().default(false),
+    REDIS_URL: Joi.when('REDIS_REQUIRED', {
+      is: true,
+      then: Joi.when('NODE_ENV', {
+        is: 'production',
+        then: productionRedisUrlSchema.required(),
+        otherwise: redisUrlSchema.required(),
+      }),
+      otherwise: Joi.when('NODE_ENV', {
+        is: 'production',
+        then: productionRedisUrlSchema.optional(),
+        otherwise: redisUrlSchema.optional(),
+      }),
+    }),
     APP_PORT: Joi.number().integer().min(0).max(65535).default(3000),
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),

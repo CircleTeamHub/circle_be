@@ -65,18 +65,32 @@ export class NotificationPushService {
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
   async deleteStaleTokens(): Promise<{ count: number }> {
-    return this.prisma.devicePushToken.deleteMany({
-      where: {
-        OR: [
-          { updatedAt: { lt: new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS) } },
-          {
-            disabledAt: {
-              lt: new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS),
-            },
+    return this.prisma.$transaction(
+      async (tx) => {
+        const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+        SELECT pg_try_advisory_xact_lock(hashtext('notification-token-cleanup')) AS acquired
+      `;
+        if (!lock?.acquired) return { count: 0 };
+
+        return tx.devicePushToken.deleteMany({
+          where: {
+            OR: [
+              {
+                updatedAt: {
+                  lt: new Date(Date.now() - ACTIVE_TOKEN_MAX_AGE_MS),
+                },
+              },
+              {
+                disabledAt: {
+                  lt: new Date(Date.now() - DISABLED_TOKEN_MAX_AGE_MS),
+                },
+              },
+            ],
           },
-        ],
+        });
       },
-    });
+      { timeout: 60_000 },
+    );
   }
 
   private buildMessage(userId: string, notification: NotificationRealtimeDto) {

@@ -15,8 +15,24 @@ export class TempChatCleanup {
 
   @Cron(CronExpression.EVERY_MINUTE)
   async sweep(): Promise<void> {
+    const staleLeaseBefore = new Date(Date.now() - 2 * 60 * 1000);
     const due = await this.prisma.tempChat.findMany({
-      where: { status: TempChatStatus.ACTIVE, expiresAt: { lte: new Date() } },
+      where: {
+        OR: [
+          {
+            status: TempChatStatus.ACTIVE,
+            expiresAt: { lte: new Date() },
+          },
+          {
+            status: { in: [TempChatStatus.ENDED, TempChatStatus.EXPIRED] },
+            cleanupCompletedAt: null,
+            OR: [
+              { cleanupLockedAt: null },
+              { cleanupLockedAt: { lt: staleLeaseBefore } },
+            ],
+          },
+        ],
+      },
       select: { id: true, groupId: true },
     });
     for (const room of due) {

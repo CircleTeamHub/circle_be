@@ -24,6 +24,7 @@ export interface PresignResult {
   uploadUrl: string;
   fileUrl: string;
   key: string;
+  requiredHeaders: Record<string, string>;
 }
 
 export interface UploadBufferInput {
@@ -52,6 +53,7 @@ export function buildPublicReadBucketPolicy(bucket: string) {
     'posts',
     'notes',
     'chat',
+    'friends',
     'uploads',
   ];
   return JSON.stringify({
@@ -79,6 +81,9 @@ export class UploadService implements OnModuleInit {
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly enabled: boolean;
+  private ready = false;
+  private bootstrapPromise: Promise<boolean> | null = null;
+  private nextBootstrapAttemptAt = 0;
 
   constructor(private config: ConfigService) {
     const endpoint = this.config.get<string>('MINIO_ENDPOINT') ?? '';
@@ -94,6 +99,7 @@ export class UploadService implements OnModuleInit {
       region: 'us-east-1', // MinIO 需要填但值随意
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle: true, // MinIO 必须开启
+      requestChecksumCalculation: 'WHEN_REQUIRED',
     });
 
     this.publicClient = new S3Client({
@@ -101,6 +107,7 @@ export class UploadService implements OnModuleInit {
       region: 'us-east-1',
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle: true,
+      requestChecksumCalculation: 'WHEN_REQUIRED',
     });
   }
 
@@ -115,8 +122,7 @@ export class UploadService implements OnModuleInit {
     // at boot, log and continue — `presign` surfaces a clean 503 to callers,
     // the rest of the app stays up.
     try {
-      await this.ensureBucketExists();
-      await this.ensureBucketIsPublicReadable();
+      this.ready = await this.bootstrap();
     } catch (error) {
       this.logger.error(
         `MinIO bucket bootstrap failed; upload features may be degraded: ${
@@ -138,12 +144,31 @@ export class UploadService implements OnModuleInit {
   async presign(
     filename: string,
     contentType: string,
+    sizeBytes: number,
     folder = 'uploads',
     userId?: string,
     expiresIn = contentType.startsWith('video/') ? 1800 : 300,
   ): Promise<PresignResult> {
     if (!this.enabled) {
       throw new ServiceUnavailableException('File upload is not configured');
+    }
+    if (!(await this.ensureReady())) {
+      throw new ServiceUnavailableException(
+        'File upload is temporarily unavailable',
+      );
+    }
+
+    const maxBytes = contentType.startsWith('video/')
+      ? 100 * 1024 * 1024
+      : 20 * 1024 * 1024;
+    if (
+      !Number.isSafeInteger(sizeBytes) ||
+      sizeBytes < 1 ||
+      sizeBytes > maxBytes
+    ) {
+      throw new PayloadTooLargeException(
+        `Upload exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
+      );
     }
 
     // `split('.').pop()` returns the whole string when there is no dot, so
@@ -161,6 +186,8 @@ export class UploadService implements OnModuleInit {
       Bucket: this.bucket,
       Key: key,
       ContentType: contentType,
+      ContentLength: sizeBytes,
+      IfNoneMatch: '*',
     });
 
     let uploadUrl: string;
@@ -169,6 +196,7 @@ export class UploadService implements OnModuleInit {
     try {
       uploadUrl = await getSignedUrl(this.publicClient, command, {
         expiresIn,
+        signableHeaders: new Set(['content-type']),
       });
     } catch (error) {
       result = 'failure';
@@ -194,7 +222,16 @@ export class UploadService implements OnModuleInit {
     // 把 uploadUrl 里的内网地址替换为公开访问地址
     const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;
 
-    return { uploadUrl, fileUrl, key };
+    return {
+      uploadUrl,
+      fileUrl,
+      key,
+      requiredHeaders: {
+        'Content-Type': contentType,
+        'Content-Length': String(sizeBytes),
+        'If-None-Match': '*',
+      },
+    };
   }
 
   async uploadBuffer(input: UploadBufferInput): Promise<UploadBufferResult> {
@@ -311,6 +348,32 @@ export class UploadService implements OnModuleInit {
       this.logger.log(`Bucket "${this.bucket}" not found, creating...`);
       await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
       this.logger.log(`Bucket "${this.bucket}" created.`);
+    }
+  }
+
+  private async ensureReady(): Promise<boolean> {
+    if (this.ready) return true;
+    if (Date.now() < this.nextBootstrapAttemptAt) return false;
+    if (!this.bootstrapPromise) {
+      this.bootstrapPromise = this.bootstrap().finally(() => {
+        this.bootstrapPromise = null;
+      });
+    }
+    this.ready = await this.bootstrapPromise;
+    if (!this.ready) this.nextBootstrapAttemptAt = Date.now() + 5_000;
+    return this.ready;
+  }
+
+  private async bootstrap(): Promise<boolean> {
+    try {
+      await this.ensureBucketExists();
+      await this.ensureBucketIsPublicReadable();
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `MinIO bootstrap attempt failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
     }
   }
 

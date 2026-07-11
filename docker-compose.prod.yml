@@ -1,13 +1,13 @@
 # circle_be 测试环境部署编排 —— 核心后端栈(阶段4)。
 #
-#   postgres + minio(+ 建桶)+ 一次性 migrate + circle_be
+#   postgres + redis + minio(+ 建桶)+ 一次性 migrate + circle_be
 #
 # OpenIM(阶段5)用官方 openim-docker 单独编排;LiveKit(阶段6)用 LiveKit Cloud。
 # 完整步骤见 DEPLOY.md。
 #
-# compose 变量插值从同目录 .env 读(DB_PASSWORD / MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)。
+# compose 变量插值从同目录 .env 读(DB_PASSWORD / REDIS_PASSWORD / MinIO 密钥)。
 # 应用配置从挂载的 .env.production 读(见 .env.production.example)。
-# 两者的 DB 密码、MinIO 密钥必须一致 —— DEPLOY.md 的 gen-env 步骤会自动保持一致。
+# 两者的 DB / Redis 密码、MinIO 密钥必须一致 —— gen-env 会自动保持一致。
 
 name: circle-be
 
@@ -28,6 +28,28 @@ services:
       retries: 12
     # 仅供容器内访问,不对公网暴露端口
 
+  redis:
+    image: redis:7-alpine
+    profiles: ['bundled-redis']
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -c
+      - test -n "$$REDIS_PASSWORD" || { echo 'REDIS_PASSWORD is required for bundled Redis' >&2; exit 1; }; exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD" --maxmemory 512mb --maxmemory-policy noeviction
+    mem_limit: 768m
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    # 仅供 compose 内网访问,不向宿主机发布 6379
+
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
@@ -36,7 +58,6 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     command: server /data --console-address ":9001"
     ports:
-      - '9000:9000' # S3 API —— app 下载图片要用,需放行
       # 控制台只绑回环:用 SSH 隧道访问(ssh -L 9001:localhost:9001 ...)。
       # 不要发布到 0.0.0.0 —— Docker 发布端口走 DOCKER 链、先于 iptables INPUT,
       # 主机防火墙 INPUT 规则挡不住,会把管理后台直接暴露公网。
@@ -49,7 +70,7 @@ services:
       timeout: 5s
       retries: 12
 
-  # 一次性:确保 bucket 存在且可公开下载,然后退出
+  # 一次性:确保 bucket 存在；最小公开读策略由应用启动时安装。
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
@@ -61,25 +82,24 @@ services:
       sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
       mc mb -p local/circle &&
-      mc anonymous set download local/circle &&
       echo 'minio bucket [circle] ready'
       "
     restart: 'no'
 
   # 一次性:应用 Prisma 迁移建表,然后退出。
-  # 生产镜像 prune 掉了 prisma CLI,故用干净 node 镜像 + npx 拉 prisma(钉到
-  # 7.8.0,与 package-lock 的 prisma CLI 版本对齐,保证迁移可复现)。
+  # 使用锁文件构建阶段中的 Prisma CLI，部署不依赖运行时从 npm 下载。
   migrate:
-    image: node:22-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+      target: build-stage
     working_dir: /app
     depends_on:
       postgres: { condition: service_healthy }
     environment:
       # prisma CLI 从环境变量读 DATABASE_URL(schema.prisma datasource url=env(...))
       DATABASE_URL: 'postgresql://circle:${DB_PASSWORD:?set}@postgres:5432/circle?schema=public'
-    volumes:
-      - ./prisma:/app/prisma:ro
-    command: sh -c "npx --yes prisma@7.8.0 migrate deploy"
+    command: npx prisma migrate deploy
     restart: 'no'
 
   circle_be:
@@ -89,6 +109,7 @@ services:
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
+      redis: { condition: service_healthy, required: false }
       migrate: { condition: service_completed_successfully }
       minio-init: { condition: service_completed_successfully }
     environment:
@@ -140,6 +161,7 @@ services:
 
 volumes:
   pg_data:
+  redis_data:
   minio_data:
   caddy_data:
   caddy_config:

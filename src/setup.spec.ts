@@ -4,6 +4,8 @@ import { ResponseInterceptor } from './interceptors/response.interceptor';
 import { ErrorLoggingInterceptor } from './interceptors/error-logging.interceptor';
 import { RedisService } from './redis/redis.service';
 import { setupApp } from './setup';
+import { redisMetrics } from './redis/redis.metrics';
+import { uploadMetrics } from './metrics/upload-metrics';
 
 function buildAppMock(
   redisService?: Pick<RedisService, 'createRateLimitStore'>,
@@ -164,6 +166,50 @@ describe('setupApp', () => {
     );
   });
 
+  it('exposes Redis resilience metrics on the metrics endpoint', async () => {
+    redisMetrics.recordCommandFailure('get', 'timeout');
+    redisMetrics.recordRateLimitFallback('setup_test');
+    uploadMetrics.recordPresignLimited('memory');
+    const app = buildAppMock();
+    setupApp(app as any);
+    const metricsCall = app.use.mock.calls.find(
+      ([path]) => path === '/metrics',
+    );
+    const handler = metricsCall?.[1] as
+      | ((req: unknown, res: unknown) => Promise<void>)
+      | undefined;
+    const response = {
+      setHeader: jest.fn(),
+      end: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+    };
+
+    expect(handler).toBeDefined();
+    await handler?.({ headers: {} }, response);
+
+    expect(response.end).toHaveBeenCalledWith(
+      expect.stringContaining('redis_command_failures_total'),
+    );
+    expect(response.end).toHaveBeenCalledWith(
+      expect.stringContaining('redis_rate_limit_degraded'),
+    );
+    expect(response.end).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /redis_command_failures_total\{operation="get",reason="timeout"\}\s+[1-9]/,
+      ),
+    );
+    expect(response.end).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /redis_rate_limit_fallback_total\{limiter="setup_test"\}\s+[1-9]/,
+      ),
+    );
+    expect(response.end).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /upload_presign_rate_limited_total\{store="memory"\}\s+[1-9]/,
+      ),
+    );
+  });
+
   it('still boots when resolving RedisService throws (falls back to no Redis)', () => {
     const app = {
       setGlobalPrefix: jest.fn(),
@@ -181,5 +227,21 @@ describe('setupApp', () => {
     };
 
     expect(() => setupApp(app as any)).not.toThrow();
+  });
+
+  it('trusts exactly one reverse-proxy hop in production', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    const express = { set: jest.fn() };
+    const app = {
+      ...buildAppMock(),
+      getHttpAdapter: jest.fn(() => ({ getInstance: () => express })),
+    };
+
+    setupApp(app as any);
+
+    expect(express.set).toHaveBeenCalledWith('trust proxy', 1);
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
   });
 });

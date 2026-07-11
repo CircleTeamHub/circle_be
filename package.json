@@ -23,6 +23,9 @@
       "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
       "test:e2e": "jest --config ./test/jest-e2e.json --maxWorkers=1",
       "test:e2e:watch": "jest --config ./test/jest-e2e.json --maxWorkers=1 --watch",
+      "test:redis": "bash scripts/test-redis-integration.sh",
+      "test:redis:compose": "bash scripts/test-redis-compose.sh",
+      "test:minio": "bash scripts/test-minio-integration.sh",
       "prisma:generate": "prisma generate",
       "prisma:migrate": "prisma migrate dev",
       "prisma:migrate:prod": "prisma migrate deploy",
@@ -156,6 +159,7 @@
       "@/": "src/"
    },
    "overrides": {
+      "@hono/node-server": "^1.19.13",
       "multer": "^2.2.0",
       "picomatch": "^4.0.4"
    }

@@ -51,6 +51,7 @@ export interface TempChatListItem {
 
 @Injectable()
 export class TempChatService {
+  private static readonly CLEANUP_LEASE_MS = 2 * 60 * 1000;
   private readonly logger = new Logger(TempChatService.name);
 
   constructor(
@@ -113,7 +114,7 @@ export class TempChatService {
       });
     }
     const memberCount = await this.prisma.tempChatGuest.count({
-      where: { tempChatId: tcId },
+      where: { tempChatId: tcId, provisioningFailedAt: null },
     });
     return {
       title: room.title,
@@ -129,7 +130,11 @@ export class TempChatService {
     const rows = await this.prisma.tempChat.findMany({
       where: { hostUserId },
       orderBy: [{ createdAt: 'desc' }],
-      include: { _count: { select: { guests: true } } },
+      include: {
+        _count: {
+          select: { guests: { where: { provisioningFailedAt: null } } },
+        },
+      },
     });
 
     const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
@@ -187,6 +192,7 @@ export class TempChatService {
     // —— 房间状态在事务内复核，销毁后不可能再占到座。
     const { guest, room } = await this.prisma.$transaction(
       async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${tcId}`}))`;
         const room = await tx.tempChat.findUnique({ where: { id: tcId } });
         if (
           !room ||
@@ -199,7 +205,7 @@ export class TempChatService {
           });
         }
         const count = await tx.tempChatGuest.count({
-          where: { tempChatId: tcId },
+          where: { tempChatId: tcId, provisioningFailedAt: null },
         });
         if (count >= room.maxMembers) {
           throw new ConflictException({
@@ -219,6 +225,26 @@ export class TempChatService {
       await this.openim.registerUser(guestImId, displayName);
       await this.openim.addGroupMembers(room.groupId, [guestImId]);
       const imToken = await this.openim.getUserToken(guestImId, 5);
+      const stillActive = await this.prisma.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${tcId}`}))`;
+          const current = await tx.tempChat.findUnique({
+            where: { id: tcId },
+            select: { status: true, expiresAt: true },
+          });
+          return Boolean(
+            current?.status === TempChatStatus.ACTIVE &&
+            current.expiresAt.getTime() > Date.now(),
+          );
+        },
+        { isolationLevel: 'Serializable' },
+      );
+      if (!stillActive) {
+        throw new GoneException({
+          message: '临时聊天已结束',
+          errorCode: TempChatErrorCode.Ended,
+        });
+      }
       return {
         imUserId: guestImId,
         imToken,
@@ -233,14 +259,8 @@ export class TempChatService {
         `Temp chat OpenIM join failed for guest ${guest.id}`,
         err instanceof Error ? err.stack : undefined,
       );
-      try {
-        await this.prisma.tempChatGuest.delete({ where: { id: guest.id } });
-      } catch (cleanupError) {
-        this.logger.warn(
-          `Temp chat guest cleanup failed after OpenIM join failure: ${guest.id}`,
-          cleanupError instanceof Error ? cleanupError.stack : undefined,
-        );
-      }
+      await this.compensateGuest(room.groupId, guestImId, guest.id);
+      if (err instanceof GoneException) throw err;
       throw new ServiceUnavailableException('加入失败，请重试');
     }
   }
@@ -258,30 +278,158 @@ export class TempChatService {
     if (room.status !== 'ACTIVE') {
       return { status: room.status };
     }
-    await this.teardown(room, TempChatStatus.ENDED);
-    return { status: TempChatStatus.ENDED };
+    const finalStatus = await this.teardown(room, TempChatStatus.ENDED);
+    return { status: finalStatus };
   }
 
   /** 解散群 + 强制访客下线 + 落库状态。幂等：仅对 ACTIVE 房调用。 */
   async teardown(
     room: { id: string; groupId: string },
     status: TempChatStatus,
-  ): Promise<void> {
-    await this.openim.dismissGroup(room.groupId).catch(() => undefined);
-    const guests = await this.prisma.tempChatGuest.findMany({
-      where: { tempChatId: room.id, cleanedUp: false },
-      select: { imUserId: true },
+  ): Promise<TempChatStatus> {
+    const claim = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${room.id}`}))`;
+      const current = await tx.tempChat.findUnique({ where: { id: room.id } });
+      if (!current) {
+        return { finalStatus: status, shouldCleanup: false, guests: [] };
+      }
+      const finalStatus =
+        current.status === TempChatStatus.ACTIVE ? status : current.status;
+      const staleBefore = new Date(
+        Date.now() - TempChatService.CLEANUP_LEASE_MS,
+      );
+      if (
+        current.cleanupCompletedAt ||
+        (current.cleanupLockedAt && current.cleanupLockedAt > staleBefore)
+      ) {
+        return { finalStatus, shouldCleanup: false, guests: [] };
+      }
+      const claimedAt = new Date();
+      await tx.tempChat.update({
+        where: { id: room.id },
+        data: {
+          status: finalStatus,
+          endedAt: current.endedAt ?? claimedAt,
+          cleanupLockedAt: claimedAt,
+        },
+      });
+      const guests = await tx.tempChatGuest.findMany({
+        where: { tempChatId: room.id, cleanedUp: false },
+        select: { imUserId: true },
+      });
+      return {
+        finalStatus,
+        shouldCleanup: true,
+        guests,
+        claimedAt,
+        groupDismissed: Boolean(current.cleanupGroupDismissedAt),
+      };
     });
-    for (const g of guests) {
-      await this.openim.forceLogout(g.imUserId).catch(() => undefined);
+
+    if (!claim.shouldCleanup) return claim.finalStatus;
+
+    let dismissFailure: unknown;
+    if (!claim.groupDismissed) {
+      let dismissed = false;
+      try {
+        await this.openim.dismissGroup(room.groupId);
+        dismissed = true;
+      } catch (error) {
+        if (this.isAlreadyAbsent(error)) dismissed = true;
+        else dismissFailure = error;
+      }
+      if (dismissed) {
+        await this.prisma.tempChat.updateMany({
+          where: { id: room.id, cleanupLockedAt: claim.claimedAt },
+          data: { cleanupGroupDismissedAt: new Date() },
+        });
+      }
     }
-    await this.prisma.tempChatGuest.updateMany({
-      where: { tempChatId: room.id },
-      data: { cleanedUp: true },
+    const guestFailures: unknown[] = [];
+    const cleanupConcurrency = 10;
+    for (
+      let offset = 0;
+      offset < claim.guests.length;
+      offset += cleanupConcurrency
+    ) {
+      const batch = claim.guests.slice(offset, offset + cleanupConcurrency);
+      const results = await Promise.allSettled(
+        batch.map((guest) => this.openim.forceLogout(guest.imUserId)),
+      );
+      const successfulGuests: string[] = [];
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          successfulGuests.push(batch[index].imUserId);
+        } else {
+          guestFailures.push(result.reason);
+        }
+      });
+      if (successfulGuests.length > 0) {
+        await this.prisma.tempChatGuest.updateMany({
+          where: {
+            tempChatId: room.id,
+            imUserId: { in: successfulGuests },
+          },
+          data: { cleanedUp: true },
+        });
+      }
+    }
+    const cleanupSucceeded = !dismissFailure && guestFailures.length === 0;
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.tempChat.updateMany({
+        where: { id: room.id, cleanupLockedAt: claim.claimedAt },
+        data: cleanupSucceeded
+          ? { cleanupCompletedAt: new Date(), cleanupLockedAt: null }
+          : { cleanupLockedAt: null },
+      });
     });
-    await this.prisma.tempChat.update({
-      where: { id: room.id },
-      data: { status, endedAt: new Date() },
-    });
+
+    if (!cleanupSucceeded) {
+      throw dismissFailure ?? guestFailures[0];
+    }
+    return claim.finalStatus;
+  }
+
+  private async compensateGuest(
+    groupId: string,
+    imUserId: string,
+    guestId: string,
+  ): Promise<void> {
+    const results = await Promise.allSettled([
+      this.openim.removeGroupMember(groupId, imUserId),
+      this.openim.forceLogout(imUserId),
+    ]);
+    const compensated = results.every(
+      (result) =>
+        result.status === 'fulfilled' || this.isAlreadyAbsent(result.reason),
+    );
+    if (!compensated) {
+      await this.prisma.tempChatGuest
+        .update({
+          where: { id: guestId },
+          data: { provisioningFailedAt: new Date() },
+        })
+        .catch(() => undefined);
+      this.logger.warn(
+        `OpenIM guest compensation incomplete; retaining guest ${guestId} for teardown retry`,
+      );
+      return;
+    }
+    try {
+      await this.prisma.tempChatGuest.delete({ where: { id: guestId } });
+    } catch (cleanupError) {
+      this.logger.warn(
+        `Temp chat guest cleanup failed after OpenIM join failure: ${guestId}`,
+        cleanupError instanceof Error ? cleanupError.stack : undefined,
+      );
+    }
+  }
+
+  private isAlreadyAbsent(error: unknown): boolean {
+    const value = error instanceof Error ? error.message : String(error);
+    return /RecordNotFoundError|not group member|already dismissed/i.test(
+      value,
+    );
   }
 }

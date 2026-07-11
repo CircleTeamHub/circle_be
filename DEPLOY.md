@@ -4,7 +4,7 @@
 
 | 阶段 | 内容 | 组件 |
 |------|------|------|
-| 4 | 核心后端 | circle_be + PostgreSQL + MinIO |
+| 4 | 核心后端 | circle_be + PostgreSQL + Redis + MinIO |
 | 5 | 实时聊天 | OpenIM 全套(Mongo/Redis/Kafka) |
 | 6 | 音视频 | LiveKit Cloud(免费层,不自托管) |
 
@@ -15,6 +15,7 @@
 ## 0. 前置
 
 - Oracle Always Free 实例:Ubuntu 22.04 / ARM64 / 2 OCPU / 12 GB
+- 已把 `API_DOMAIN`、`ADMIN_DOMAIN` 的 DNS A/AAAA 记录指向服务器公网 IP
 - 已能用 `ssh -i ~/.ssh/circle_oracle ubuntu@<公网IP>` 登录
 
 ## 1. 安装 Docker(服务器上,一次性)
@@ -28,20 +29,20 @@ docker version && docker compose version
 ## 2. 放行端口(两层都要开)
 
 **A. Oracle 控制台** → VCN → 对应子网的 Security List → Ingress Rules,加入(Source `0.0.0.0/0`,TCP):
-`3000`(API)、`9000`(MinIO S3)。
+`80`(HTTP/ACME)、`443`(HTTPS API/Admin/MinIO S3)。
 > MinIO 控制台(9001)**不对公网开放** —— compose 已把它绑到 `127.0.0.1`,只走 SSH 隧道访问(见 §5)。
 > (别用 iptables INPUT 规则去“限制”它:Docker 发布端口走 DOCKER 链、先于 INPUT,挡不住;绑回环才可靠。)
 
 **B. 实例内 iptables**(Oracle 的 Ubuntu 镜像默认只放行 22):
 
 ```bash
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 3000 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 9000 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
 sudo netfilter-persistent save   # 持久化,重启不丢
 ```
 
-> 正式生产(非测试):3000/9000 应放到一个 TLS 反代(Caddy/Nginx + 域名)后面,别用明文 HTTP 暴露;
-> 裸 IP 签不了证书,需要一个域名。本手册是测试环境,默认明文。
+> MinIO S3 不发布宿主机端口；对象下载与签名上传统一通过 API 域名的
+> `https://<API_DOMAIN>/circle/*` 路由，避免公网明文传输。
 
 ## 3. 上传代码
 
@@ -60,23 +61,33 @@ rsync -az --delete \
 
 ```bash
 cd ~/circle_be
-bash deploy/gen-env.sh <公网IP>        # 生成 .env 与 .env.production(随机密钥)
+bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱>
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-启动顺序由 `depends_on` 保证:`postgres`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
+启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
+
+已有部署可再次运行 `gen-env.sh`:脚本只补齐 Redis 配置,不会覆盖数据库、JWT、MinIO 等现有密钥。
+使用托管 Redis 时,把 `.env.production` 的 `REDIS_URL` 改成带认证的 `rediss://...`,
+设置 `REDIS_ALLOW_INSECURE=false`,并从 `.env` 的 `COMPOSE_PROFILES` 中移除
+`bundled-redis`;此时 Compose 不会启动内置 Redis。
+
+内置 `bundled-redis` 是单节点部署，适合开发、测试和可接受短时降级的单机环境；
+它启用 AOF，但主机或数据卷故障仍会造成中断。需要生产级高可用时，使用支持自动故障转移、
+跨可用区副本、备份和 TLS 的托管 Redis，并配置 `REDIS_REQUIRED=true`；应用侧的内存限流
+只是在 Redis 故障期间保持基础防护，不等价于跨实例一致性或 Redis 高可用。
 
 ## 5. 验证
 
 ```bash
 docker compose -f docker-compose.prod.yml ps          # circle_be 应为 healthy
 docker compose -f docker-compose.prod.yml logs -f circle_be
-# 本机自测(404 也行,说明服务在响应;关键是别 connection refused):
-curl -i http://localhost:3000/api/v1/auth/me
+# TLS/反代自测(401/404 也说明服务在响应):
+curl -i https://<API域名>/api/v1/auth/me
 ```
 
-公网验证:浏览器/另一台机访问 `http://<公网IP>:3000/api/v1/auth/me`。
+公网验证:浏览器/另一台机访问 `https://<API域名>/api/v1/auth/me`。
 
 MinIO 控制台(只绑服务器本机)从本地开 SSH 隧道访问:
 
@@ -96,7 +107,8 @@ ssh -i ~/.ssh/circle_oracle -L 9001:localhost:9001 ubuntu@<公网IP>
 - **migrate 容器报连不上库**:确认 `postgres` healthy;`.env` 的 `DB_PASSWORD` 与
   `.env.production` 的 `DATABASE_URL` 密码一致(gen-env.sh 已保证)。
 - **circle_be 启动即退出**:多半是 `.env.production` 缺必填项(SECRET/TEMP_CHAT_LINK_SECRET ≥32、
-  ALLOWED_ORIGINS)。看 `docker compose logs circle_be` 的 Joi 校验报错。
+  ALLOWED_ORIGINS/REDIS_URL),或 Redis 启动探测失败。先看
+  `docker compose logs redis circle_be`;gen-env.sh 会同步生成 Redis 密码和 URL。
 - **app 连不上**:确认两层端口都放行(Oracle Security List + iptables)。
 
 ---

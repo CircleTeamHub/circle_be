@@ -52,6 +52,15 @@ jobs:
       - name: Run Tests
         run: npm test
 
+      - name: Real Redis integration
+        run: npm run test:redis
+
+      - name: Production Redis Compose smoke
+        run: npm run test:redis:compose
+
+      - name: Real MinIO signed-upload integration
+        run: npm run test:minio
+
       - name: Coverage Report
         run: npm run test:cov
 
