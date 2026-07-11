@@ -131,6 +131,7 @@ enum NotificationPushOutboxStatus {
   PROCESSING
   COMPLETED
   FAILED
+  TERMINAL
 }
 
 enum UserProfileSyncStatus {
@@ -353,6 +354,8 @@ model UserProfileSyncOutbox {
   id            String                @id @default(uuid())
   userID        String                @unique
   status        UserProfileSyncStatus @default(PENDING)
+  generation    Int                   @default(0)
+  leaseToken    String?
   attempts      Int                   @default(0)
   lastError     String?
   nextAttemptAt DateTime              @default(now())
@@ -450,6 +453,7 @@ model FriendChatReplayOutbox {
   requesterUserID String
   accepterUserID  String
   status          FriendChatReplayStatus @default(PENDING)
+  leaseToken      String?
   stage           Int                    @default(0)
   messageIndex    Int                    @default(0)
   attempts        Int                    @default(0)
@@ -1106,6 +1110,7 @@ model NotificationPushOutbox {
   id             String                       @id @default(uuid())
   notificationID String                       @unique
   status         NotificationPushOutboxStatus @default(PENDING)
+  leaseToken     String?
   attempts       Int                          @default(0)
   lastError      String?
   nextAttemptAt  DateTime                     @default(now())
@@ -1149,6 +1154,7 @@ model Circle {
   ownerID               String
   currentIconAssetID    String?
   cities                String[] @default([])
+  isPublic              Boolean  @default(false)
   categories            String[] @default([])
   rules                 String   @default("")
   tags                  String[] @default([])
