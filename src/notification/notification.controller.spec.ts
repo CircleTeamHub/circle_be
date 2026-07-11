@@ -30,10 +30,9 @@ describe('NotificationController', () => {
     };
     const controller = new NotificationController(notificationService as any);
 
-    await controller.deletePushToken(
-      { token: 'ExponentPushToken[abc]' },
-      { user: { userId: 'user-1' } } as any,
-    );
+    await controller.deletePushToken({ token: 'ExponentPushToken[abc]' }, {
+      user: { userId: 'user-1' },
+    } as any);
 
     expect(notificationService.deletePushToken).toHaveBeenCalledWith(
       'user-1',

@@ -1,2 +1,2 @@
 ALTER TABLE "DevicePushToken"
-  ADD COLUMN "revocationSecretHash" TEXT;
+  ADD COLUMN IF NOT EXISTS "revocationSecretHash" TEXT;

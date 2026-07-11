@@ -1,4 +1,6 @@
-CREATE TABLE "DevicePushToken" (
+-- Idempotent for the existing-DB baseline-reset runbook
+-- (db push -> resolve 0_init -> migrate deploy).
+CREATE TABLE IF NOT EXISTS "DevicePushToken" (
   "id" TEXT NOT NULL,
   "token" TEXT NOT NULL,
   "provider" TEXT NOT NULL,
@@ -13,14 +15,18 @@ CREATE TABLE "DevicePushToken" (
   CONSTRAINT "DevicePushToken_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "DevicePushToken_token_key" ON "DevicePushToken"("token");
+CREATE UNIQUE INDEX IF NOT EXISTS "DevicePushToken_token_key" ON "DevicePushToken"("token");
 
-CREATE INDEX "DevicePushToken_userID_idx" ON "DevicePushToken"("userID");
+CREATE INDEX IF NOT EXISTS "DevicePushToken_userID_idx" ON "DevicePushToken"("userID");
 
-CREATE INDEX "DevicePushToken_provider_platform_idx"
+CREATE INDEX IF NOT EXISTS "DevicePushToken_provider_platform_idx"
   ON "DevicePushToken"("provider", "platform");
 
-ALTER TABLE "DevicePushToken"
-  ADD CONSTRAINT "DevicePushToken_userID_fkey"
-  FOREIGN KEY ("userID") REFERENCES "User"("id")
-  ON DELETE CASCADE ON UPDATE CASCADE;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'DevicePushToken_userID_fkey') THEN
+    ALTER TABLE "DevicePushToken"
+      ADD CONSTRAINT "DevicePushToken_userID_fkey"
+      FOREIGN KEY ("userID") REFERENCES "User"("id")
+      ON DELETE CASCADE ON UPDATE CASCADE;
+  END IF;
+END $$;
