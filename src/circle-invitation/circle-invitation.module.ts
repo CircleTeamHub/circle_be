@@ -7,7 +7,12 @@ import { CircleInvitationController } from './circle-invitation.controller';
 import { CircleInvitationService } from './circle-invitation.service';
 
 @Module({
-  imports: [OpenimModule, RealtimeModule, PrivacySettingsModule, NotificationModule],
+  imports: [
+    OpenimModule,
+    RealtimeModule,
+    PrivacySettingsModule,
+    NotificationModule,
+  ],
   controllers: [CircleInvitationController],
   providers: [CircleInvitationService],
 })

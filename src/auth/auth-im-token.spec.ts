@@ -13,10 +13,12 @@ describe('isOpenImRecordNotFoundError', () => {
   });
 
   it('does not match unrelated failures', () => {
-    expect(isOpenImRecordNotFoundError(new Error('The operation timed out'))).toBe(
+    expect(
+      isOpenImRecordNotFoundError(new Error('The operation timed out')),
+    ).toBe(false);
+    expect(isOpenImRecordNotFoundError(new Error('OpenIM HTTP 500'))).toBe(
       false,
     );
-    expect(isOpenImRecordNotFoundError(new Error('OpenIM HTTP 500'))).toBe(false);
     expect(isOpenImRecordNotFoundError(null)).toBe(false);
   });
 });
@@ -36,9 +38,14 @@ describe('AuthService.resolveImToken retry', () => {
   }
 
   const callResolve = (service: AuthService) =>
-    (service as unknown as {
-      resolveImToken: (userId: string, platformID?: number) => Promise<string>;
-    }).resolveImToken('user-1', 1);
+    (
+      service as unknown as {
+        resolveImToken: (
+          userId: string,
+          platformID?: number,
+        ) => Promise<string>;
+      }
+    ).resolveImToken('user-1', 1);
 
   beforeEach(() => {
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
