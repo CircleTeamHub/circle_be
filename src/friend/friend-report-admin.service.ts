@@ -8,6 +8,7 @@ import { FriendReportStatus, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CreditService } from 'src/credit/credit.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   FriendReportAdminItemDto,
   FriendReportListDto,
@@ -52,6 +53,7 @@ export class FriendReportAdminService {
     private readonly prisma: PrismaService,
     private readonly creditService: CreditService,
     private readonly notificationService: NotificationService,
+    private readonly realtimeService: RealtimeService,
   ) {}
 
   async listReports(
@@ -163,20 +165,13 @@ export class FriendReportAdminService {
     approve: boolean,
   ): Promise<void> {
     const tasks = [
-      this.notificationService.createSystemNotification(
-        reporterId,
+      this.notifySystemOutcome(
         reporterId,
         approve ? NOTIFY_REPORTER_APPROVED : NOTIFY_REPORTER_REJECTED,
       ),
     ];
     if (approve) {
-      tasks.push(
-        this.notificationService.createSystemNotification(
-          targetId,
-          targetId,
-          NOTIFY_TARGET_PENALIZED,
-        ),
-      );
+      tasks.push(this.notifySystemOutcome(targetId, NOTIFY_TARGET_PENALIZED));
     }
 
     const results = await Promise.allSettled(tasks);
@@ -187,6 +182,39 @@ export class FriendReportAdminService {
         );
       }
     }
+  }
+
+  /**
+   * 单个收件人的系统通知：建记录 + 实时广播（与 coin/membership 同一套路），
+   * 让「我的」tab 红点即时亮起，不用等快照兜底。广播失败不影响已提交的审核。
+   */
+  private async notifySystemOutcome(
+    userId: string,
+    content: string,
+  ): Promise<void> {
+    const notification =
+      await this.notificationService.createSystemNotification(
+        userId,
+        userId,
+        content,
+      );
+    await this.realtimeService.safeBroadcastAll([
+      () =>
+        this.realtimeService.broadcastSystemNotificationCreated(
+          userId,
+          content,
+        ),
+      ...(notification
+        ? [
+            () =>
+              this.realtimeService.broadcastNotificationCreated(
+                userId,
+                notification,
+              ),
+          ]
+        : []),
+      () => this.realtimeService.broadcastSystemNotificationUnread(userId),
+    ]);
   }
 
   private async getReportDto(

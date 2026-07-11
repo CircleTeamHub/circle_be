@@ -12,6 +12,16 @@ import {
   Matches,
   MaxLength,
 } from 'class-validator';
+// Type-only: the Prisma v7 client exports enums as types, so referencing
+// `FriendPermission.CHAT_ONLY` as a runtime value throws. Validation/Swagger use
+// the local const below instead (same approach as FRIEND_REPORT_CATEGORIES).
+import type { FriendPermission } from 'src/generated/prisma';
+
+/** Upper bound on description photo notes attached to one friendship. */
+export const FRIEND_DESCRIPTION_PHOTO_LIMIT = 9;
+
+/** Runtime values for the FriendPermission enum, for validators and Swagger. */
+export const FRIEND_PERMISSIONS = ['FULL', 'CHAT_ONLY'] as const;
 
 export class SendFriendRequestDto {
   @ApiProperty({ example: 'uuid-of-target-user' })
@@ -44,6 +54,56 @@ export class SendFriendRequestDto {
   @ArrayMaxSize(20)
   @IsUUID('4', { each: true })
   tagIds?: string[];
+
+  @ApiPropertyOptional({
+    example: 'Met at the 2026 design conference, leads the UI team.',
+    description: 'Sender-owned private description note, promoted on accept',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  description?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Sender-owned description photo urls/keys, promoted on accept (max 9)',
+    example: ['https://cdn.example.com/friends/abc.jpg'],
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(FRIEND_DESCRIPTION_PHOTO_LIMIT)
+  @ArrayUnique()
+  @IsString({ each: true })
+  @MaxLength(1000, { each: true })
+  // These render in the sender's own contact card; reject angle brackets so a
+  // stored value can never smuggle HTML/script markup into a client webview.
+  @Matches(/^[^<>]+$/, {
+    each: true,
+    message: 'photo entries contain invalid characters',
+  })
+  photos?: string[];
+
+  @ApiPropertyOptional({
+    enum: FRIEND_PERMISSIONS,
+    example: 'CHAT_ONLY',
+    description:
+      'Moments access the sender grants the target once accepted (default FULL)',
+  })
+  @IsOptional()
+  @IsEnum(FRIEND_PERMISSIONS)
+  permission?: FriendPermission;
+}
+
+export class SendFriendRequestMessageDto {
+  @ApiProperty({
+    example: 'Hi, we met at the design conference last week.',
+    description: 'Plain-text message appended to the pending request thread',
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  content: string;
 }
 
 export class BlockUserDto {
@@ -107,6 +167,8 @@ export class FriendProfileDto {
   @ApiPropertyOptional() lastOnline: Date | null;
   /** When this friendship was accepted */
   @ApiProperty() friendsSince: Date;
+  /** The viewer's private remark (备注) for this friend, if set. */
+  @ApiPropertyOptional() remark: string | null;
 }
 
 export class FriendTagDto {
@@ -120,6 +182,9 @@ export class FriendSettingsDto {
   @ApiPropertyOptional() remark: string | null;
   @ApiProperty({ type: [FriendTagDto] }) assignedTags: FriendTagDto[];
   @ApiProperty({ type: [FriendTagDto] }) availableTags: FriendTagDto[];
+  @ApiPropertyOptional() description: string | null;
+  @ApiProperty({ type: [String] }) photos: string[];
+  @ApiProperty({ enum: FRIEND_PERMISSIONS }) permission: FriendPermission;
 }
 
 export class FriendRequestDto {

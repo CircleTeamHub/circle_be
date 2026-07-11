@@ -131,6 +131,7 @@ export const TraceErrorCode = {
   AccessForbidden: 'TRACE_ACCESS_FORBIDDEN',
   ReplyTargetMismatch: 'TRACE_REPLY_TARGET_MISMATCH',
   InvalidCursor: 'TRACE_INVALID_CURSOR',
+  EmptyComment: 'TRACE_EMPTY_COMMENT',
 } as const;
 
 // 好友:加好友 / 申请处理 / 拉黑 / 举报 / 好友标签。好友数、标签数上限原文含数字,
@@ -155,6 +156,8 @@ export const FriendErrorCode = {
   ActivityNotFound: 'FRIEND_ACTIVITY_NOT_FOUND',
   BlockNotFound: 'FRIEND_BLOCK_NOT_FOUND',
   TagNameEmpty: 'FRIEND_TAG_NAME_EMPTY',
+  RequestMessageInvalid: 'FRIEND_REQUEST_MESSAGE_INVALID',
+  RequestMessageLimit: 'FRIEND_REQUEST_MESSAGE_LIMIT',
 } as const;
 
 // 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。

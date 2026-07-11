@@ -419,6 +419,17 @@ export class TraceService {
     traceId: string,
     dto: CreateTraceCommentDto,
   ): Promise<TraceCommentDto> {
+    const content = dto.content?.trim() ?? '';
+    const images = dto.images ?? [];
+    // 允许纯图评论，但文字/图片不能同时为空。
+    if (!content && images.length === 0) {
+      throw new BadRequestException({
+        message: 'Comment needs text or an image',
+        errorCode: TraceErrorCode.EmptyComment,
+      });
+    }
+    assertUrlsFromStorage(images, this.minioPublicUrl, 'comment image');
+
     const trace = await this.requireVisibleTrace(traceId, userId);
 
     if (dto.replyToId) {
@@ -440,10 +451,18 @@ export class TraceService {
       }
     }
 
+    const mentionEligibility = await this.filterVisibleMentionRecipients(
+      trace,
+      userId,
+      dto.mentionedUserIds ?? [],
+    );
+    const mentionedUserIds = mentionEligibility.eligibleUserIds;
+
     const comment = await this.prisma.$transaction(async (tx) => {
       const created = await tx.traceComment.create({
         data: {
-          content: dto.content,
+          content,
+          images,
           traceID: traceId,
           userID: userId,
           replyToID: dto.replyToId ?? null,
@@ -474,6 +493,14 @@ export class TraceService {
           traceOwnerId: trace.fromID,
           replyToCommentId: comment.replyTo?.id ?? null,
           replyToUserId: comment.replyTo?.user.id ?? null,
+          mentionedUserIds,
+          recheckMentionEligibility: async (recipientIds) => {
+            return this.filterFreshVisibleMentionRecipients(
+              traceId,
+              userId,
+              recipientIds,
+            );
+          },
           content: comment.content,
         });
 
@@ -507,6 +534,7 @@ export class TraceService {
     return {
       id: comment.id,
       content: comment.content,
+      images: comment.images,
       user: { id: comment.user.id, nickname: comment.user.nickname },
       replyTo: comment.replyTo
         ? {
@@ -516,6 +544,7 @@ export class TraceService {
             nickname: comment.replyTo.user.nickname,
           }
         : null,
+      ignoredMentionCount: mentionEligibility.ignoredMentionCount,
       createdAt: comment.createdAt.toISOString(),
     };
   }
@@ -551,6 +580,125 @@ export class TraceService {
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
+  private async filterFreshVisibleMentionRecipients(
+    traceId: string,
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<{ traceAvailable: boolean; eligibleUserIds: string[] }> {
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+      select: { fromID: true, visibility: true },
+    });
+    if (!trace) {
+      return { traceAvailable: false, eligibleUserIds: [] };
+    }
+    const result = await this.filterVisibleMentionRecipients(
+      trace,
+      actorId,
+      recipientIds,
+    );
+    return { traceAvailable: true, eligibleUserIds: result.eligibleUserIds };
+  }
+
+  private async filterVisibleMentionRecipients(
+    trace: { fromID: string; visibility: string },
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<{ eligibleUserIds: string[]; ignoredMentionCount: number }> {
+    const distinctRecipientIds = [...new Set(recipientIds)].filter(
+      (recipientId) => recipientId !== actorId,
+    );
+    if (distinctRecipientIds.length === 0) {
+      return { eligibleUserIds: [], ignoredMentionCount: 0 };
+    }
+
+    const activeRecipients = await this.prisma.user.findMany({
+      where: {
+        id: { in: distinctRecipientIds },
+        status: 'ACTIVE',
+      },
+      select: { id: true },
+    });
+    const activeRecipientIds = new Set(
+      activeRecipients.map((recipient) => recipient.id),
+    );
+    const nonOwnerRecipientIds = distinctRecipientIds.filter(
+      (recipientId) =>
+        recipientId !== trace.fromID && activeRecipientIds.has(recipientId),
+    );
+    const activeOwnerMentioned = activeRecipientIds.has(trace.fromID);
+    if (nonOwnerRecipientIds.length === 0 || trace.visibility === 'PRIVATE') {
+      const eligibleUserIds = activeOwnerMentioned ? [trace.fromID] : [];
+      return {
+        eligibleUserIds,
+        ignoredMentionCount:
+          distinctRecipientIds.length - eligibleUserIds.length,
+      };
+    }
+
+    const [friendships, settingsByAuthor] = await Promise.all([
+      this.prisma.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            {
+              userID: trace.fromID,
+              friendID: { in: nonOwnerRecipientIds },
+            },
+            {
+              userID: { in: nonOwnerRecipientIds },
+              friendID: trace.fromID,
+            },
+          ],
+        },
+        select: {
+          userID: true,
+          friendID: true,
+          permissionA: true,
+          permissionB: true,
+        },
+      }),
+      this.privacySettings.getSettingsMany([trace.fromID]),
+    ]);
+    const friendshipByRecipient = new Map(
+      friendships.map((friendship) => [
+        friendship.userID === trace.fromID
+          ? friendship.friendID
+          : friendship.userID,
+        friendship,
+      ]),
+    );
+    const authorSettings = settingsByAuthor.get(trace.fromID);
+
+    const visibleNonOwnerIds = nonOwnerRecipientIds.filter((recipientId) => {
+      const friendship = friendshipByRecipient.get(recipientId);
+      const isFriend = Boolean(friendship);
+      const authorPermission =
+        friendship?.userID === trace.fromID
+          ? friendship.permissionA
+          : friendship?.permissionB;
+      if (authorPermission === 'CHAT_ONLY') {
+        return false;
+      }
+      if (
+        !this.privacySettings.momentsVisibleFor(authorSettings, false, isFriend)
+      ) {
+        return false;
+      }
+      return trace.visibility !== 'FRIENDS_ONLY' || isFriend;
+    });
+    const visibleNonOwnerSet = new Set(visibleNonOwnerIds);
+    const eligibleUserIds = distinctRecipientIds.filter(
+      (recipientId) =>
+        (recipientId === trace.fromID && activeOwnerMentioned) ||
+        visibleNonOwnerSet.has(recipientId),
+    );
+    return {
+      eligibleUserIds,
+      ignoredMentionCount: distinctRecipientIds.length - eligibleUserIds.length,
+    };
+  }
+
   private async getAcceptedFriendIds(userId: string): Promise<string[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -571,13 +719,64 @@ export class TraceService {
     // O(friends) N+1 on every feed page).
     const settingsByAuthor =
       await this.privacySettings.getSettingsMany(authorIds);
-    return authorIds.filter((authorId) =>
-      this.privacySettings.momentsVisibleFor(
-        settingsByAuthor.get(authorId),
-        authorId === viewerId,
-        friendIdSet.has(authorId),
-      ),
+    // Authors who marked the viewer "chat-only" hide their moments from the
+    // viewer regardless of the author's global setting. The viewer's own posts
+    // are never gated this way.
+    const chatOnlyAuthorIds = await this.getChatOnlyAuthorIdsToward(
+      viewerId,
+      authorIds,
     );
+    return authorIds.filter(
+      (authorId) =>
+        !chatOnlyAuthorIds.has(authorId) &&
+        this.privacySettings.momentsVisibleFor(
+          settingsByAuthor.get(authorId),
+          authorId === viewerId,
+          friendIdSet.has(authorId),
+        ),
+    );
+  }
+
+  /**
+   * Of the given authors, which ones granted the viewer only CHAT_ONLY access
+   * (so their moments must be hidden from the viewer). The viewer is never
+   * included even if passed in `authorIds`.
+   */
+  private async getChatOnlyAuthorIdsToward(
+    viewerId: string,
+    authorIds: string[],
+  ): Promise<Set<string>> {
+    const others = authorIds.filter((id) => id !== viewerId);
+    if (others.length === 0) {
+      return new Set();
+    }
+    const records = await this.prisma.friend.findMany({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: { in: others }, friendID: viewerId },
+          { userID: viewerId, friendID: { in: others } },
+        ],
+      },
+      select: {
+        userID: true,
+        friendID: true,
+        permissionA: true,
+        permissionB: true,
+      },
+    });
+    const chatOnly = new Set<string>();
+    for (const record of records) {
+      // The author is whichever side isn't the viewer; read that side's grant.
+      if (record.userID === viewerId) {
+        if (record.permissionB === 'CHAT_ONLY') {
+          chatOnly.add(record.friendID);
+        }
+      } else if (record.permissionA === 'CHAT_ONLY') {
+        chatOnly.add(record.userID);
+      }
+    }
+    return chatOnly;
   }
 
   private async requireVisibleTrace(traceId: string, viewerId: string) {
@@ -592,6 +791,16 @@ export class TraceService {
     }
     if (trace.fromID === viewerId) {
       return trace;
+    }
+    // A chat-only friend can never open the author's moment, even by direct id.
+    const chatOnlyAuthors = await this.getChatOnlyAuthorIdsToward(viewerId, [
+      trace.fromID,
+    ]);
+    if (chatOnlyAuthors.has(trace.fromID)) {
+      throw new ForbiddenException({
+        message: 'You are not allowed to access this moment',
+        errorCode: TraceErrorCode.AccessForbidden,
+      });
     }
     const friendIds =
       trace.visibility === 'FRIENDS_ONLY' || trace.visibility === 'PUBLIC'
@@ -655,6 +864,7 @@ export class TraceService {
         (c: any): TraceCommentDto => ({
           id: c.id,
           content: c.content,
+          images: c.images ?? [],
           user: { id: c.user.id, nickname: c.user.nickname },
           // `id` MUST be the parent COMMENT id — the client threads replies by
           // looking it up in a comment-id map. Using c.replyTo.user.id here made
@@ -663,6 +873,7 @@ export class TraceService {
             c.replyTo && c.replyTo.user
               ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
               : null,
+          ignoredMentionCount: 0,
           createdAt: c.createdAt.toISOString(),
         }),
       );

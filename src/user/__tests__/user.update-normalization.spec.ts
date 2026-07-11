@@ -23,6 +23,9 @@ describe('UserService.update normalization', () => {
   const privacySettings = {
     canViewProfileField: jest.fn().mockResolvedValue(true),
   };
+  const openim = {
+    updateUserInfo: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -61,6 +64,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -84,6 +88,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -118,6 +123,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -144,6 +150,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -170,6 +177,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -196,6 +204,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -224,6 +233,7 @@ describe('UserService.update normalization', () => {
       iconService as any,
       realtimeService as any,
       privacySettings as any,
+      openim as any,
     );
 
     await service.update('user-1', { nickname: '   ' } as any);
@@ -233,5 +243,45 @@ describe('UserService.update normalization', () => {
         data: { nickname: '' },
       }),
     );
+  });
+
+  it('pushes a nickname/avatar change to OpenIM', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+      privacySettings as any,
+      openim as any,
+    );
+
+    await service.update('user-1', {
+      nickname: '新昵称',
+      avatarUrl: 'https://cdn/a.jpg',
+    } as any);
+
+    expect(openim.updateUserInfo).toHaveBeenCalledWith('user-1', {
+      nickname: '新昵称',
+      avatarUrl: 'https://cdn/a.jpg',
+    });
+  });
+
+  it('does NOT touch OpenIM when neither nickname nor avatar changes', async () => {
+    const config = { get: jest.fn().mockReturnValue(null) };
+    const service = new UserService(
+      prisma as any,
+      config as any,
+      refreshTokens as any,
+      iconService as any,
+      realtimeService as any,
+      privacySettings as any,
+      openim as any,
+    );
+
+    await service.update('user-1', { persona: 'just a bio' } as any);
+
+    expect(openim.updateUserInfo).not.toHaveBeenCalled();
   });
 });

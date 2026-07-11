@@ -45,6 +45,13 @@ enum FriendState {
   WITHDRAWN
 }
 
+/// How much of the owner's world a friend may see.
+/// FULL = chat + moments; CHAT_ONLY = chat but hidden from the owner's moments.
+enum FriendPermission {
+  FULL
+  CHAT_ONLY
+}
+
 enum FriendActivityType {
   REQUEST_RECEIVED
   REQUEST_SENT
@@ -177,16 +184,19 @@ enum NotificationType {
   FRIEND_REQUEST_RECEIVED
   FRIEND_REQUEST_ACCEPTED
   FRIEND_REQUEST_REJECTED
+  FRIEND_REQUEST_MESSAGE
   SYSTEM
   TRACE_LIKE
   TRACE_COMMENT
   COMMENT_REPLY
+  TRACE_MENTION
   CIRCLE_VERIFICATION_REQUESTED
   CIRCLE_INVITATION_APPROVED
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
   CIRCLE_POST_SIGNUP_CREATED
   CIRCLE_POST_AUTO_ENDED
+  PROFILE_LIKE
 }
 
 enum CallType {
@@ -268,6 +278,7 @@ model User {
   blocksReceived                    Block[]                     @relation("blocked")
   notifications                     Notification[]              @relation("toUser")
   notificationsSent                 Notification[]              @relation("fromUser")
+  devicePushTokens                  DevicePushToken[]
   traces                            Trace[]
   traceComments                     TraceComment[]
   traceLikeStats                    traceLikeStat[]
@@ -287,6 +298,7 @@ model User {
   friendActivities                  FriendActivity[]            @relation("friendActivityViewer")
   friendActivitiesAuthored          FriendActivity[]            @relation("friendActivityActor")
   friendActivitiesCounterparty      FriendActivity[]            @relation("friendActivityCounterparty")
+  friendRequestMessages             FriendRequestMessage[]      @relation("friendRequestMessageSender")
   friendReportsFiled                FriendReport[]              @relation("friendReportReporter")
   friendReportsReceived             FriendReport[]              @relation("friendReportTarget")
   friendReportsReviewed             FriendReport[]              @relation("friendReportReviewer")
@@ -342,6 +354,24 @@ model Friend {
   remarkA               String?
   /// friendID's private remark for userID
   remarkB               String?
+  /// Sender-owned private description staged on the request, promoted on accept
+  pendingDescriptionBySender String?
+  /// userID's private description note for friendID
+  descriptionA          String?
+  /// friendID's private description note for userID
+  descriptionB          String?
+  /// Sender-owned description photo keys staged on the request, promoted on accept
+  pendingPhotosBySender String[]                    @default([])
+  /// userID's private description photo keys for friendID
+  photosA               String[]                    @default([])
+  /// friendID's private description photo keys for userID
+  photosB               String[]                    @default([])
+  /// Permission the sender grants the target, staged on the request
+  pendingPermissionBySender FriendPermission?
+  /// userID's granted permission for friendID (gates friendID seeing userID's moments)
+  permissionA           FriendPermission            @default(FULL)
+  /// friendID's granted permission for userID (gates userID seeing friendID's moments)
+  permissionB           FriendPermission            @default(FULL)
   createdAt             DateTime                    @default(now())
   updatedAt             DateTime                    @updatedAt
   user                  User                        @relation("userFriends", fields: [userID], references: [id], onDelete: Cascade)
@@ -349,9 +379,25 @@ model Friend {
   tagLinks              FriendTagOnFriend[]
   pendingTagLinks       PendingFriendTagOnRequest[]
   activities            FriendActivity[]
+  messages              FriendRequestMessage[]
 
   @@index([userID])
   @@index([friendID])
+}
+
+// 好友申请阶段的多轮留言线程（双方 accept/reject 前的往来）。
+// 接受后按序注入两人 OpenIM 会话成为聊天首屏历史。
+model FriendRequestMessage {
+  id        String   @id @default(uuid())
+  requestId String
+  senderId  String
+  content   String
+  createdAt DateTime @default(now())
+
+  request Friend @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  sender  User   @relation("friendRequestMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([requestId, createdAt])
 }
 
 enum FriendReportStatus {
@@ -985,6 +1031,25 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+}
+
+model DevicePushToken {
+  id         String    @id @default(uuid())
+  token      String    @unique
+  provider   String
+  platform   String
+  projectId  String?
+  appVersion String?
+  revocationSecretHash String?
+  disabledAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  userID String
+  user   User   @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([userID])
+  @@index([provider, platform])
 }
 
 // ─── Circle Plaza ────────────────────────────────────────────────────────────

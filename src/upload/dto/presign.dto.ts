@@ -19,6 +19,7 @@ const ALLOWED_FOLDERS = [
   'posts',
   'notes',
   'chat',
+  'friends',
 ] as const;
 export type UploadFolder = (typeof ALLOWED_FOLDERS)[number];
 

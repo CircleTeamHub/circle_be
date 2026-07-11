@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -9,16 +10,22 @@ import {
 import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
+  type RegisterPushTokenDto,
   type NotificationRealtimeDto,
+  type RevokePushTokenDto,
 } from './notification.dto';
+import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 
 @Injectable()
 export class NotificationService {
+  private readonly logger = new Logger(NotificationService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    private readonly pushService: NotificationPushService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -41,6 +48,83 @@ export class NotificationService {
     if (this.isProfileNotification(type)) {
       await this.realtimeService.broadcastSystemNotificationUnread(userId);
     }
+  }
+
+  /**
+   * Fire-and-forget offline push. Dispatched with `void` (never awaited) from
+   * the notification-creation path so a slow Expo round-trip can't add latency
+   * to the user's request. Fully self-contained: every failure is caught and
+   * logged here, so the floating promise can never reject.
+   */
+  private async sendPushBestEffort(
+    userId: string,
+    notification: NotificationRealtimeDto,
+  ): Promise<void> {
+    try {
+      await this.pushService.sendNotification(userId, notification);
+    } catch (error) {
+      this.logger.warn(
+        `Push notification failed for ${notification.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  async registerPushToken(
+    userId: string,
+    dto: RegisterPushTokenDto,
+  ): Promise<void> {
+    const revocationSecretHash = dto.revocationSecret
+      ? this.hashRevocationSecret(dto.revocationSecret)
+      : undefined;
+    await this.prisma.devicePushToken.upsert({
+      where: { token: dto.token },
+      create: {
+        token: dto.token,
+        userID: userId,
+        platform: dto.platform,
+        provider: dto.provider,
+        projectId: dto.projectId ?? null,
+        appVersion: dto.appVersion ?? null,
+        ...(revocationSecretHash ? { revocationSecretHash } : {}),
+      },
+      update: {
+        userID: userId,
+        platform: dto.platform,
+        provider: dto.provider,
+        projectId: dto.projectId ?? null,
+        appVersion: dto.appVersion ?? null,
+        disabledAt: null,
+        // An omitted secret must revoke any prior capability in the same atomic
+        // upsert. Otherwise a stale secret could survive token ownership
+        // transfer and delete the new owner's registration.
+        revocationSecretHash: revocationSecretHash ?? null,
+      },
+    });
+  }
+
+  async deletePushToken(userId: string, token: string): Promise<void> {
+    await this.prisma.devicePushToken.deleteMany({
+      where: {
+        userID: userId,
+        token,
+      },
+    });
+  }
+
+  async revokePushToken(dto: RevokePushTokenDto): Promise<boolean> {
+    const result = await this.prisma.devicePushToken.deleteMany({
+      where: {
+        token: dto.token,
+        revocationSecretHash: this.hashRevocationSecret(dto.revocationSecret),
+      },
+    });
+    return result.count > 0;
+  }
+
+  private hashRevocationSecret(secret: string): string {
+    return createHash('sha256').update(secret).digest('hex');
   }
 
   async getUnreadSummary(userId: string) {
@@ -108,7 +192,9 @@ export class NotificationService {
       },
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    void this.sendPushBestEffort(toUserId, dto);
+    return dto;
   }
 
   private async createNotification(data: {
@@ -118,6 +204,8 @@ export class NotificationService {
     content?: string;
     fromTraceID?: string;
     fromCirclePostID?: string;
+    fromCircleID?: string;
+    fromInvitationID?: string;
     dedupeWindowMs?: number;
   }): Promise<NotificationRealtimeDto | null> {
     if (
@@ -158,14 +246,17 @@ export class NotificationService {
       },
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    void this.sendPushBestEffort(notificationData.toUserID, dto);
+    return dto;
   }
 
   async createFriendRequestNotification(params: {
     type:
       | typeof NotificationType.FRIEND_REQUEST_RECEIVED
       | typeof NotificationType.FRIEND_REQUEST_ACCEPTED
-      | typeof NotificationType.FRIEND_REQUEST_REJECTED;
+      | typeof NotificationType.FRIEND_REQUEST_REJECTED
+      | typeof NotificationType.FRIEND_REQUEST_MESSAGE;
     toUserId: string;
     fromUserId: string;
     content?: string | null;
@@ -188,6 +279,23 @@ export class NotificationService {
       fromUserID: params.actorId,
       type: NotificationType.TRACE_LIKE,
       fromTraceID: params.traceId,
+      dedupeWindowMs: NOTIFICATION_DEDUPE_WINDOW_MS,
+    });
+  }
+
+  /**
+   * "XX 赞了你的资料" —— 用户资料点赞（receivedLikeCount）产生的互动通知。
+   * 归入互动类（DISCOVER），驱动铃铛列表 + 动态 tab 红点 + 横幅。点赞层已保证
+   * 每人每天最多赞一次同一目标，dedupe window 只是并发兜底。
+   */
+  async createProfileLikeNotification(params: {
+    actorId: string;
+    toUserId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.actorId,
+      type: NotificationType.PROFILE_LIKE,
       dedupeWindowMs: NOTIFICATION_DEDUPE_WINDOW_MS,
     });
   }
@@ -225,7 +333,31 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
 
-    return mapNotificationRealtimeDto(notification);
+    const dto = mapNotificationRealtimeDto(notification);
+    void this.sendPushBestEffort(params.toUserId, dto);
+    return dto;
+  }
+
+  async createCircleInvitationNotification(data: {
+    toUserID: string;
+    fromUserID: string;
+    type:
+      | typeof NotificationType.CIRCLE_VERIFICATION_REQUESTED
+      | typeof NotificationType.CIRCLE_INVITATION_APPROVED
+      | typeof NotificationType.CIRCLE_INVITATION_REJECTED
+      | typeof NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED;
+    fromCircleID: string;
+    fromInvitationID: string;
+    content?: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: data.toUserID,
+      fromUserID: data.fromUserID,
+      type: data.type,
+      content: data.content ?? '',
+      fromCircleID: data.fromCircleID,
+      fromInvitationID: data.fromInvitationID,
+    });
   }
 
   async getNotifications(userId: string, page = 1) {
@@ -243,6 +375,34 @@ export class NotificationService {
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
     return rows.map(mapNotificationRealtimeDto);
+  }
+
+  async getProfileNotifications(userId: string, page = 1) {
+    const take = 20;
+    const skip = (Math.max(1, page) - 1) * take;
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        toUserID: userId,
+        deleted: false,
+        type: { in: [...PROFILE_NOTIFICATION_TYPES] },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take,
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+    return rows.map(mapNotificationRealtimeDto);
+  }
+
+  async getNotificationOpenOwnership(
+    userId: string,
+    id: string,
+  ): Promise<{ owned: boolean }> {
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, toUserID: userId, deleted: false },
+      select: { id: true },
+    });
+    return { owned: notification !== null };
   }
 
   async markNotificationRead(userId: string, id: string): Promise<void> {
@@ -300,12 +460,35 @@ export class NotificationService {
     traceOwnerId: string;
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
+    mentionedUserIds?: string[];
+    recheckMentionEligibility: (mentionedUserIds: string[]) => Promise<{
+      traceAvailable: boolean;
+      eligibleUserIds: string[];
+    }>;
     content: string;
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
   > {
     const notifications = [];
     const notifiedUserIds = new Set<string>();
+    let mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
+      (mentionedUserId) =>
+        mentionedUserId && mentionedUserId !== params.actorId,
+    );
+
+    if (mentionedUserIds.length > 0) {
+      // Authorization snapshot: refresh immediately before constructing the
+      // Prisma operations that are committed in the single transaction below.
+      const refreshed =
+        await params.recheckMentionEligibility(mentionedUserIds);
+      if (!refreshed.traceAvailable) {
+        return [];
+      }
+      const requestedMentionIds = new Set(mentionedUserIds);
+      mentionedUserIds = [...new Set(refreshed.eligibleUserIds)].filter((id) =>
+        requestedMentionIds.has(id),
+      );
+    }
 
     if (
       params.traceOwnerId &&
@@ -350,10 +533,38 @@ export class NotificationService {
       );
     }
 
-    // Atomic: either both notifications land or neither does — a partial
-    // failure must not leave one orphaned notification behind.
+    for (const mentionedUserId of mentionedUserIds) {
+      if (
+        !mentionedUserId ||
+        mentionedUserId === params.actorId ||
+        notifiedUserIds.has(mentionedUserId)
+      ) {
+        continue;
+      }
+      notifiedUserIds.add(mentionedUserId);
+      notifications.push(
+        this.prisma.notification.create({
+          data: {
+            toUserID: mentionedUserId,
+            fromUserID: params.actorId,
+            type: NotificationType.TRACE_MENTION,
+            content: params.content,
+            fromTraceID: params.traceId,
+            fromReplyID: params.commentId,
+          },
+          include: NOTIFICATION_REALTIME_INCLUDE,
+        }),
+      );
+    }
+
+    if (notifications.length === 0) {
+      return [];
+    }
+
+    // Atomic: either all notifications land or none does — a partial failure
+    // must not leave an orphaned notification behind.
     const created = await this.prisma.$transaction(notifications);
-    return created
+    const mapped = created
       .map((notification) => ({
         targetUserId: notification.toUserID,
         notification: mapNotificationRealtimeDto(notification),
@@ -366,5 +577,10 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
+    mapped.forEach(
+      (item) =>
+        void this.sendPushBestEffort(item.targetUserId, item.notification),
+    );
+    return mapped;
   }
 }

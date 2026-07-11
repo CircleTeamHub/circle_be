@@ -1,12 +1,15 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { LikeErrorCode } from 'src/common/app-error-codes';
 import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
+import { NotificationService } from 'src/notification/notification.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { likedOnToday } from './like.util';
 import { LikeStatusDto } from './dto/like-status.dto';
 
@@ -20,9 +23,13 @@ class DailyLikeLimitError extends Error {}
 
 @Injectable()
 export class LikeService {
+  private readonly logger = new Logger(LikeService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly iconService: IconService,
+    private readonly notificationService: NotificationService,
+    private readonly realtimeService: RealtimeService,
   ) {}
 
   /**
@@ -69,6 +76,8 @@ export class LikeService {
       await this.createLikeAtomically(fromUserId, toUserId, likedOn);
       // 被赞数可能跨过阈值新获得合作达人徽章 → 失效其图标缓存。
       this.iconService.invalidateDisplayIconCacheFor(toUserId);
+      // 只有「确实新建了点赞」这条路径才通知：幂等/配额超限/P2002 都到不了这里。
+      await this.notifyLiked(fromUserId, toUserId);
     } catch (e) {
       if (e instanceof DailyLikeLimitError) {
         throw new BadRequestException({
@@ -83,6 +92,38 @@ export class LikeService {
     }
 
     return this.getStatus(fromUserId, toUserId);
+  }
+
+  /**
+   * 点赞成功后的通知副作用（best-effort）：建互动通知 + 推实时事件，让被赞者的
+   * 铃铛列表、动态 tab 红点、横幅三处同时亮。失败只告警，绝不回滚已成功的点赞。
+   * 照搬 TRACE_LIKE 的三步：createXxxNotification → broadcastInteractionUnread
+   * → broadcastNotificationCreated。
+   */
+  private async notifyLiked(
+    fromUserId: string,
+    toUserId: string,
+  ): Promise<void> {
+    try {
+      const notification =
+        await this.notificationService.createProfileLikeNotification({
+          actorId: fromUserId,
+          toUserId,
+        });
+      if (notification) {
+        await this.realtimeService.broadcastInteractionUnread(toUserId);
+        this.realtimeService.broadcastNotificationCreated(
+          toUserId,
+          notification,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Profile like notification side effect failed: ${fromUserId} -> ${toUserId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**

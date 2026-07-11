@@ -15,6 +15,7 @@ import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { OpenimService } from 'src/openim/openim.service';
 import { USER_PROFILE_SELECT } from './user.select';
 import { likedOnToday } from '../like/like.util';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -146,6 +147,7 @@ export class UserService {
     // is a wiring bug that should crash at startup, not silently expose
     // phone/wechat/qq. PrivacySettingsModule is imported by UserModule.
     private privacySettings: PrivacySettingsService,
+    private openim: OpenimService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -298,6 +300,24 @@ export class UserService {
     ]);
     await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
+
+    // OpenIM 存了一份 nickname/faceURL 副本并作为会话 showName/faceURL 展示；
+    // 业务侧改了昵称/头像必须推给 OpenIM，否则聊天列表/会话里一直是旧信息。
+    // 非阻塞、best-effort：OpenIM 不是硬依赖，挂了也不能让资料更新失败。avatarFrame
+    // OpenIM 无对应概念、不同步。
+    if (input.nickname !== undefined || input.avatarUrl !== undefined) {
+      this.openim
+        .updateUserInfo(id, {
+          nickname: input.nickname,
+          avatarUrl: input.avatarUrl,
+        })
+        .catch((err) =>
+          this.logger.warn(
+            `OpenIM updateUserInfo failed for ${id}: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+    }
+
     return {
       ...user,
       displayIcons,

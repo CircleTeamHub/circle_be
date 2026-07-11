@@ -8,6 +8,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { OpenimService } from 'src/openim/openim.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -37,6 +38,9 @@ describe('UserService', () => {
   const privacySettings = {
     canViewProfileField: jest.fn(),
   };
+  const openim = {
+    updateUserInfo: jest.fn().mockResolvedValue(undefined),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -51,6 +55,7 @@ describe('UserService', () => {
         { provide: IconService, useValue: iconService },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: OpenimService, useValue: openim },
       ],
     }).compile();
     return module.get<UserService>(UserService);

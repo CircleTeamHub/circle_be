@@ -51,6 +51,70 @@ describe('OpenimService group/auth admin calls', () => {
     expect(body.memberUserIDs).toEqual(['g23']);
   });
 
+  it('updateUserInfo posts /user/update_user_info with a hyphen-stripped userID', async () => {
+    await service.updateUserInfo('a1b2-c3d4-e5', {
+      nickname: '小霸王',
+      avatarUrl: 'https://cdn/a.jpg',
+    });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      userInfo: {
+        userID: 'a1b2c3d4e5',
+        nickname: '小霸王',
+        faceURL: 'https://cdn/a.jpg',
+      },
+    });
+  });
+
+  it('updateUserInfo maps avatarUrl:null to an empty faceURL and omits unset fields', async () => {
+    await service.updateUserInfo('u-1', { avatarUrl: null });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    const body = JSON.parse(call![1].body);
+    expect(body.userInfo).toEqual({ userID: 'u1', faceURL: '' });
+  });
+
+  it('updateUserInfo is a no-op when neither nickname nor avatar is provided', async () => {
+    await service.updateUserInfo('u-1', {});
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/user/update_user_info'),
+    );
+    expect(call).toBeUndefined();
+  });
+
+  it('singleConversationID strips hyphens and sorts ascending (order-independent)', () => {
+    expect(OpenimService.singleConversationID('751b-7308', '0a9a-d3d6')).toBe(
+      'si_0a9ad3d6_751b7308',
+    );
+    expect(OpenimService.singleConversationID('0a9a-d3d6', '751b-7308')).toBe(
+      'si_0a9ad3d6_751b7308',
+    );
+  });
+
+  it('clearConversationMessages posts /msg/clear_conversation_msg with a hyphen-stripped userID', async () => {
+    await service.clearConversationMessages('a1-b2', ['si_a1b2_c3d4']);
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/clear_conversation_msg'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      userID: 'a1b2',
+      conversationIDs: ['si_a1b2_c3d4'],
+    });
+  });
+
+  it('clearConversationMessages is a no-op when no conversation ids are given', async () => {
+    await service.clearConversationMessages('a1', []);
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/clear_conversation_msg'),
+    );
+    expect(call).toBeUndefined();
+  });
+
   it('dismissGroup posts /group/dismiss_group with deleteMember=true', async () => {
     await service.dismissGroup('tmpABC');
     const call = fetchMock.mock.calls.find(([u]) =>
@@ -111,6 +175,42 @@ describe('OpenimService group/auth admin calls', () => {
     expect(JSON.parse(call![1].body)).toEqual({
       ownerUserID: 'owner1',
       friendUserIDs: ['friend1', 'friend2'],
+    });
+  });
+
+  it('sendTextMessage posts /msg/send_msg as a single chat text message', async () => {
+    await service.sendTextMessage({
+      sendID: 'sender-1',
+      recvID: 'receiver-2',
+      content: '我是小李',
+      senderNickname: '小李',
+      senderFaceURL: 'https://cdn.example/avatar.png',
+    });
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/msg/send_msg'),
+    );
+
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      sendID: 'sender1',
+      recvID: 'receiver2',
+      content: { content: '我是小李' },
+      contentType: 101,
+      sessionType: 1,
+      senderNickname: '小李',
+      senderFaceURL: 'https://cdn.example/avatar.png',
+      senderPlatformID: 5,
+      isOnlineOnly: false,
+      notOfflinePush: false,
+      sendTime: expect.any(Number),
+      offlinePushInfo: {
+        title: '小李',
+        desc: '我是小李',
+        ex: '',
+        iOSPushSound: 'default',
+        iOSBadgeCount: true,
+      },
+      ex: '',
     });
   });
 

@@ -4,6 +4,7 @@ import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { NotificationService } from 'src/notification/notification.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -57,10 +58,14 @@ describe('CircleInvitationService', () => {
   const privacySettings = {
     canBeInvitedToGroupOrCircle: jest.fn(),
   };
+  const notificationService = {
+    createCircleInvitationNotification: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+    notificationService.createCircleInvitationNotification.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -69,6 +74,7 @@ describe('CircleInvitationService', () => {
         { provide: OpenimService, useValue: openimService },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: NotificationService, useValue: notificationService },
       ],
     }).compile();
 
@@ -177,7 +183,7 @@ describe('CircleInvitationService', () => {
       verifiers: [],
     });
     prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
-    prisma.notification.create.mockResolvedValue({
+    notificationService.createCircleInvitationNotification.mockResolvedValue({
       id: 'notification-1',
       type: 'CIRCLE_VERIFICATION_REQUESTED',
       content: '',
@@ -192,17 +198,16 @@ describe('CircleInvitationService', () => {
 
     await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
 
-    expect(prisma.notification.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: {
-          toUserID: 'verifier-9',
-          fromUserID: 'applicant-1',
-          type: 'CIRCLE_VERIFICATION_REQUESTED',
-          fromCircleID: 'circle-1',
-          fromInvitationID: 'inv-1',
-        },
-      }),
-    );
+    expect(
+      notificationService.createCircleInvitationNotification,
+    ).toHaveBeenCalledWith({
+      toUserID: 'verifier-9',
+      fromUserID: 'applicant-1',
+      type: 'CIRCLE_VERIFICATION_REQUESTED',
+      fromCircleID: 'circle-1',
+      fromInvitationID: 'inv-1',
+    });
+    expect(prisma.notification.create).not.toHaveBeenCalled();
     expect(realtimeService.broadcastInteractionUnread).toHaveBeenCalledWith(
       'verifier-9',
     );
@@ -225,7 +230,7 @@ describe('CircleInvitationService', () => {
       verifiers: [],
     });
     prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
-    prisma.notification.create.mockRejectedValue(
+    notificationService.createCircleInvitationNotification.mockRejectedValue(
       new Error('notification unavailable'),
     );
 

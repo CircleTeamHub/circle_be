@@ -34,6 +34,7 @@ import {
   ReportFriendDto,
   FriendStatusDto,
   SendFriendRequestDto,
+  SendFriendRequestMessageDto,
   SetRemarkDto,
 } from './dto/friend.dto';
 import { FriendService } from './friend.service';
@@ -143,6 +144,11 @@ export class FriendController {
       dto.message,
       dto.remark,
       dto.tagIds,
+      {
+        description: dto.description,
+        photos: dto.photos,
+        permission: dto.permission,
+      },
     );
   }
 
@@ -199,6 +205,31 @@ export class FriendController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.cancelRequest(req.user.userId, requestId);
+  }
+
+  @Get('requests/:requestId/messages')
+  @ApiOperation({ summary: 'List the pending request message thread' })
+  @ApiOkResponse()
+  listRequestMessages(
+    @Param('requestId', ParseUUIDPipe) requestId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.friendService.listRequestMessages(req.user.userId, requestId);
+  }
+
+  @Post('requests/:requestId/messages')
+  @ApiOperation({ summary: 'Append a message to the pending request thread' })
+  @ApiOkResponse()
+  sendRequestMessage(
+    @Param('requestId', ParseUUIDPipe) requestId: string,
+    @Body() dto: SendFriendRequestMessageDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.friendService.appendRequestMessage(
+      req.user.userId,
+      requestId,
+      dto.content,
+    );
   }
 
   @Get('activities')

@@ -119,6 +119,18 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * OpenIM's 1:1 conversation id: `si_` + the two IM userIDs sorted ascending
+   * and joined by `_`. Sorting makes it identical regardless of arg order.
+   */
+  static singleConversationID(userIdA: string, userIdB: string): string {
+    const [lo, hi] = [
+      OpenimService.toImUserId(userIdA),
+      OpenimService.toImUserId(userIdB),
+    ].sort();
+    return `si_${lo}_${hi}`;
+  }
+
+  /**
    * Register a user in OpenIM. Called during business registration.
    * Uses the circle_be User.id (UUID) as the OpenIM userID for 1:1 mapping.
    */
@@ -140,6 +152,57 @@ export class OpenimService implements OnModuleInit {
             faceURL: avatarUrl ?? '',
           },
         ],
+      },
+      adminToken,
+    );
+  }
+
+  /**
+   * Update a user's OpenIM profile (nickname / avatar). OpenIM keeps its own copy
+   * of nickname+faceURL (set at registerUser) and surfaces it as the conversation
+   * showName/faceURL; without this, business-side profile edits never reach chats.
+   * Only the provided fields are sent. `avatarUrl: null` clears the face URL.
+   */
+  async updateUserInfo(
+    userID: string,
+    updates: { nickname?: string; avatarUrl?: string | null },
+  ): Promise<void> {
+    if (!this.enabled) return;
+    if (updates.nickname === undefined && updates.avatarUrl === undefined) {
+      return;
+    }
+
+    const userInfo: Record<string, unknown> = {
+      userID: OpenimService.toImUserId(userID),
+    };
+    if (updates.nickname !== undefined) {
+      userInfo.nickname = updates.nickname;
+    }
+    if (updates.avatarUrl !== undefined) {
+      userInfo.faceURL = updates.avatarUrl ?? '';
+    }
+
+    const adminToken = await this.getAdminToken();
+    await this.post('/user/update_user_info', { userInfo }, adminToken);
+  }
+
+  /**
+   * Clear a user's messages in the given conversations (their own view only).
+   * Used when deleting a friend so a later re-add starts from a clean history
+   * instead of stacking a second set of intro messages onto the old thread.
+   */
+  async clearConversationMessages(
+    userID: string,
+    conversationIDs: string[],
+  ): Promise<void> {
+    if (!this.enabled || conversationIDs.length === 0) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/clear_conversation_msg',
+      {
+        userID: OpenimService.toImUserId(userID),
+        conversationIDs,
       },
       adminToken,
     );
@@ -320,6 +383,44 @@ export class OpenimService implements OnModuleInit {
       {
         ownerUserID: OpenimService.toImUserId(ownerUserID),
         friendUserIDs: friendUserIDs.map(OpenimService.toImUserId),
+      },
+      adminToken,
+    );
+  }
+
+  async sendTextMessage(params: {
+    sendID: string;
+    recvID: string;
+    content: string;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const senderName = params.senderNickname?.trim() || 'Circle';
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        recvID: OpenimService.toImUserId(params.recvID),
+        content: { content: params.content },
+        contentType: 101,
+        sessionType: 1,
+        senderNickname: senderName,
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: false,
+        sendTime: Date.now(),
+        offlinePushInfo: {
+          title: senderName,
+          desc: params.content,
+          ex: '',
+          iOSPushSound: 'default',
+          iOSBadgeCount: true,
+        },
+        ex: '',
       },
       adminToken,
     );
