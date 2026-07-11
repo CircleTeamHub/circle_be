@@ -1659,4 +1659,47 @@ describe('CirclePlazaService', () => {
       expect(prisma.circlePostReport.upsert).not.toHaveBeenCalled();
     });
   });
+
+  describe('getPost visibility', () => {
+    it('throws NotCircleMember with circle details when the viewer is not a member but the post exists', async () => {
+      // 1st findFirst = 成员可见性(miss)；2nd findFirst = 去成员范围的存在性检查(命中)。
+      prisma.circlePost.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          circle: { id: 'circle-1', name: 'Board games' },
+        });
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: null,
+        creditScore: null,
+        fancyNumber: false,
+      });
+
+      expect.assertions(3);
+      try {
+        await service.getPost('outsider', 'post-1');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ForbiddenException);
+        const res = (err as ForbiddenException).getResponse() as {
+          errorCode?: string;
+          details?: unknown;
+        };
+        expect(res.errorCode).toBe('PLAZA_NOT_CIRCLE_MEMBER');
+        expect(res.details).toEqual({
+          circleId: 'circle-1',
+          circleName: 'Board games',
+        });
+      }
+    });
+
+    it('throws PostNotFound when the post does not exist at all', async () => {
+      prisma.circlePost.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null);
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.getPost('u1', 'missing')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
 });

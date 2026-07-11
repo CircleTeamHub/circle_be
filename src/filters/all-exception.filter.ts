@@ -112,6 +112,9 @@ export class AllExceptionFilter implements ExceptionFilter {
     // 稳定错误码(如 AUTH_INVALID_CREDENTIALS):由 `throw new X({ message, errorCode })`
     // 携带,透传给前端做多语言映射。message 仍是人类可读兜底。
     let errorCode: string | undefined;
+    // 结构化补充数据(如「非本圈成员」错误带上 circleId/circleName 供前端「申请加入」)。
+    // 由 `throw new X({ message, errorCode, details })` 携带，透传进 envelope 的 data。
+    let details: unknown;
 
     if (exception instanceof HttpException) {
       status = exception.getStatus();
@@ -124,6 +127,7 @@ export class AllExceptionFilter implements ExceptionFilter {
         message = responseMessage(b, message);
         if (typeof b.code === 'string') code = b.code;
         if (typeof b.errorCode === 'string') errorCode = b.errorCode;
+        if (b.details !== undefined && b.details !== null) details = b.details;
       }
     }
 
@@ -149,7 +153,7 @@ export class AllExceptionFilter implements ExceptionFilter {
     const responseBody = {
       code: status,
       message,
-      data: null,
+      data: details ?? null,
       ...(errorCode ? { errorCode } : {}),
     };
 

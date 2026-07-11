@@ -507,6 +507,22 @@ export class CirclePlazaService {
     ]);
 
     if (!post) {
+      // 区分「非本圈成员」与「帖子真的不存在/已删/已过期」：去掉成员可见性再查一次。
+      // 若帖子仍存在(仅因 viewer 非成员而被过滤)，回传主圈子信息，让前端提示「申请加入」。
+      const visible = await this.prisma.circlePost.findFirst({
+        where: { ...this.activeUnexpiredPostWhere(), id: postId },
+        select: { circle: { select: { id: true, name: true } } },
+      });
+      if (visible) {
+        throw new ForbiddenException({
+          message: 'You are not a member of this circle',
+          errorCode: PlazaErrorCode.NotCircleMember,
+          details: {
+            circleId: visible.circle.id,
+            circleName: visible.circle.name,
+          },
+        });
+      }
       throw new NotFoundException({
         message: 'Post not found',
         errorCode: PlazaErrorCode.PostNotFound,
