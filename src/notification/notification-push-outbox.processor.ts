@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   mapNotificationRealtimeDto,
@@ -37,18 +38,25 @@ export class NotificationPushOutboxProcessor {
     });
     let processed = 0;
     for (const job of jobs) {
+      const claimNow = new Date();
+      const claimStaleBefore = new Date(claimNow.getTime() - STALE_LOCK_MS);
+      const leaseToken = randomUUID();
       const claimed = await this.prisma.notificationPushOutbox.updateMany({
         where: {
           id: job.id,
           OR: [
             { status: 'PENDING' },
-            { status: 'FAILED', nextAttemptAt: { lte: now } },
-            { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
+            { status: 'FAILED', nextAttemptAt: { lte: claimNow } },
+            {
+              status: 'PROCESSING',
+              lockedAt: { lt: claimStaleBefore },
+            },
           ],
         },
         data: {
           status: 'PROCESSING',
-          lockedAt: now,
+          leaseToken,
+          lockedAt: claimNow,
           attempts: { increment: 1 },
         },
       });
@@ -59,22 +67,25 @@ export class NotificationPushOutboxProcessor {
           mapNotificationRealtimeDto(job.notification),
         );
         if (!ok) throw new Error('Expo push delivery failed');
-        await this.prisma.notificationPushOutbox.update({
-          where: { id: job.id },
+        const finished = await this.prisma.notificationPushOutbox.updateMany({
+          where: { id: job.id, leaseToken, status: 'PROCESSING' },
           data: {
             status: 'COMPLETED',
             processedAt: new Date(),
             lockedAt: null,
+            leaseToken: null,
+            lastError: null,
           },
         });
-        processed += 1;
+        if (finished.count > 0) processed += 1;
       } catch (error) {
         const attempts = job.attempts + 1;
-        await this.prisma.notificationPushOutbox.update({
-          where: { id: job.id },
+        await this.prisma.notificationPushOutbox.updateMany({
+          where: { id: job.id, leaseToken, status: 'PROCESSING' },
           data: {
             status: 'FAILED',
             lockedAt: null,
+            leaseToken: null,
             lastError: error instanceof Error ? error.message : String(error),
             nextAttemptAt: new Date(
               Date.now() +

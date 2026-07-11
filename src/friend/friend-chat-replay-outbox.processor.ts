@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { randomUUID } from 'crypto';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
@@ -17,6 +18,7 @@ type ReplayJob = {
   stage: number;
   messageIndex: number;
   attempts: number;
+  lockedAt?: Date | null;
 };
 
 @Injectable()
@@ -50,9 +52,14 @@ export class FriendChatReplayOutboxProcessor {
   }
 
   private async processJob(job: ReplayJob): Promise<void> {
+    const leaseToken = randomUUID();
     const claimed = await this.prisma.friendChatReplayOutbox.updateMany({
-      where: { id: job.id, status: job.status },
-      data: { status: 'PROCESSING', lockedAt: new Date() },
+      where: {
+        id: job.id,
+        status: job.status,
+        ...(job.status === 'PROCESSING' ? { lockedAt: job.lockedAt } : {}),
+      },
+      data: { status: 'PROCESSING', leaseToken, lockedAt: new Date() },
     });
     if (claimed.count === 0) return;
 
@@ -63,14 +70,20 @@ export class FriendChatReplayOutboxProcessor {
           job.accepterUserID,
         ]);
         stage = 1;
-        await this.persistProgress(job.id, { stage, lockedAt: new Date() });
+        await this.persistProgress(job.id, leaseToken, {
+          stage,
+          lockedAt: new Date(),
+        });
       }
       if (stage === 1) {
         await this.openimService.importFriends(job.accepterUserID, [
           job.requesterUserID,
         ]);
         stage = 2;
-        await this.persistProgress(job.id, { stage, lockedAt: new Date() });
+        await this.persistProgress(job.id, leaseToken, {
+          stage,
+          lockedAt: new Date(),
+        });
       }
 
       const [request, thread, requester, accepter] = await Promise.all([
@@ -116,7 +129,7 @@ export class FriendChatReplayOutboxProcessor {
               clientMsgID: `friend-request:${job.requestId}:${message.id}`,
             });
             job.messageIndex = index + 1;
-            await this.persistProgress(job.id, {
+            await this.persistProgress(job.id, leaseToken, {
               stage: 2,
               messageIndex: job.messageIndex,
               lockedAt: new Date(),
@@ -135,7 +148,10 @@ export class FriendChatReplayOutboxProcessor {
           });
         }
         stage = 3;
-        await this.persistProgress(job.id, { stage, lockedAt: new Date() });
+        await this.persistProgress(job.id, leaseToken, {
+          stage,
+          lockedAt: new Date(),
+        });
       }
 
       if (stage === 3) {
@@ -150,26 +166,28 @@ export class FriendChatReplayOutboxProcessor {
         });
       }
 
-      await this.prisma.friendChatReplayOutbox.update({
-        where: { id: job.id },
+      await this.prisma.friendChatReplayOutbox.updateMany({
+        where: { id: job.id, leaseToken, status: 'PROCESSING' },
         data: {
           status: 'COMPLETED',
           stage: 4,
           processedAt: new Date(),
           lockedAt: null,
+          leaseToken: null,
           lastError: null,
         },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await this.prisma.friendChatReplayOutbox.update({
-        where: { id: job.id },
+      await this.prisma.friendChatReplayOutbox.updateMany({
+        where: { id: job.id, leaseToken, status: 'PROCESSING' },
         data: {
           status: 'FAILED',
           attempts: { increment: 1 },
           lastError: message.slice(0, 1000),
           nextAttemptAt: this.nextRetryAt(job.attempts + 1),
           lockedAt: null,
+          leaseToken: null,
         },
       });
       this.logger.warn(`Friend chat replay failed for ${job.id}: ${message}`);
@@ -178,12 +196,16 @@ export class FriendChatReplayOutboxProcessor {
 
   private async persistProgress(
     jobId: string,
+    leaseToken: string,
     data: { stage: number; messageIndex?: number; lockedAt: Date },
   ): Promise<void> {
-    await this.prisma.friendChatReplayOutbox.update({
-      where: { id: jobId },
+    const updated = await this.prisma.friendChatReplayOutbox.updateMany({
+      where: { id: jobId, leaseToken, status: 'PROCESSING' },
       data,
     });
+    if (updated.count === 0) {
+      throw new Error(`Friend chat replay lease lost for ${jobId}`);
+    }
   }
 
   private nextRetryAt(attempts: number): Date {
