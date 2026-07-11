@@ -166,6 +166,18 @@ export class CircleInvitationService {
       const pairKey = circleApplicationLockKey(circleId, applicantId);
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
+      const lockedMembership = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: applicantId, circleID: circleId },
+        },
+      });
+      if (lockedMembership?.status === 'ACTIVE') {
+        throw new ConflictException({
+          message: 'User is already a member of this circle',
+          errorCode: CircleErrorCode.AlreadyMember,
+        });
+      }
+
       const existingInvitation = await tx.circleInvitation.findFirst({
         where: {
           circleID: circleId,

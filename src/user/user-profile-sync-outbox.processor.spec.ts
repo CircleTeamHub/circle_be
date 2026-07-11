@@ -76,4 +76,49 @@ describe('UserProfileSyncOutboxProcessor', () => {
     });
     expect(prisma.userProfileSyncOutbox.update).not.toHaveBeenCalled();
   });
+
+  it('does not select a superseding generation while an older lease is active', async () => {
+    const { prisma, processor } = createHarness();
+
+    await processor.processPending();
+
+    const selection = prisma.userProfileSyncOutbox.findMany.mock.calls[0][0];
+    expect(selection.where.OR).toEqual(
+      expect.arrayContaining([
+        {
+          status: 'PENDING',
+          leaseToken: null,
+          nextAttemptAt: { lte: expect.any(Date) },
+        },
+      ]),
+    );
+  });
+
+  it('releases its lease when a newer generation supersedes completion', async () => {
+    const { prisma, processor } = createHarness();
+    prisma.userProfileSyncOutbox.updateMany
+      .mockReset()
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 });
+
+    await processor.processPending();
+
+    const writes = prisma.userProfileSyncOutbox.updateMany.mock.calls.map(
+      ([input]) => input,
+    );
+    const leaseToken = writes[0].data.leaseToken;
+    expect(writes).toEqual(
+      expect.arrayContaining([
+        {
+          where: { id: 'job-1', leaseToken, status: 'PENDING' },
+          data: {
+            leaseToken: null,
+            lockedAt: null,
+            nextAttemptAt: expect.any(Date),
+          },
+        },
+      ]),
+    );
+  });
 });

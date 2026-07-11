@@ -20,8 +20,21 @@ export class UserProfileSyncOutboxProcessor {
     const jobs = await this.prisma.userProfileSyncOutbox.findMany({
       where: {
         OR: [
-          { status: 'PENDING', nextAttemptAt: { lte: now } },
-          { status: 'FAILED', nextAttemptAt: { lte: now } },
+          {
+            status: 'PENDING',
+            leaseToken: null,
+            nextAttemptAt: { lte: now },
+          },
+          {
+            status: 'FAILED',
+            leaseToken: null,
+            nextAttemptAt: { lte: now },
+          },
+          {
+            status: 'PENDING',
+            leaseToken: { not: null },
+            lockedAt: { lt: staleBefore },
+          },
           { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
         ],
       },
@@ -37,9 +50,9 @@ export class UserProfileSyncOutboxProcessor {
           id: job.id,
           generation: job.generation,
           status: job.status,
-          ...(job.status === 'PROCESSING'
-            ? { lockedAt: job.lockedAt }
-            : {}),
+          ...(job.leaseToken
+            ? { leaseToken: job.leaseToken, lockedAt: job.lockedAt }
+            : { leaseToken: null }),
         },
         data: {
           status: 'PROCESSING',
@@ -76,10 +89,14 @@ export class UserProfileSyncOutboxProcessor {
             lastError: null,
           },
         });
-        if (finished.count > 0) completed += 1;
+        if (finished.count > 0) {
+          completed += 1;
+        } else {
+          await this.releaseSupersededLease(job.id, leaseToken);
+        }
       } catch (error) {
         const attempts = job.attempts + 1;
-        await this.prisma.userProfileSyncOutbox.updateMany({
+        const failed = await this.prisma.userProfileSyncOutbox.updateMany({
           where: {
             id: job.id,
             generation: job.generation,
@@ -97,9 +114,26 @@ export class UserProfileSyncOutboxProcessor {
             ),
           },
         });
+        if (failed.count === 0) {
+          await this.releaseSupersededLease(job.id, leaseToken);
+        }
         this.logger.warn(`Profile sync job ${job.id} failed: ${error}`);
       }
     }
     return completed;
+  }
+
+  private async releaseSupersededLease(
+    jobId: string,
+    leaseToken: string,
+  ): Promise<void> {
+    await this.prisma.userProfileSyncOutbox.updateMany({
+      where: { id: jobId, leaseToken, status: 'PENDING' },
+      data: {
+        leaseToken: null,
+        lockedAt: null,
+        nextAttemptAt: new Date(),
+      },
+    });
   }
 }

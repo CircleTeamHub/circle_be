@@ -178,6 +178,63 @@ describe('CircleInvitationService', () => {
     );
   });
 
+  it('rejects an invite when the applicant becomes active before the pair lock', async () => {
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({ status: 'ACTIVE' })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ status: 'ACTIVE' });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      maxMembers: null,
+      memberCount: 1,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      creditScore: 100,
+      fancyNumber: false,
+    });
+    prisma.friend.findFirst.mockResolvedValue({ userID: 'inviter-1' });
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+    prisma.circleInvitation.create.mockResolvedValue({ id: 'inv-new' });
+    prisma.circleInvitationVerifier.create.mockResolvedValue({
+      id: 'verifier-new',
+    });
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-new',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      requiredCount: 10,
+      approvedCount: 1,
+      status: 'PENDING',
+      createdAt: new Date('2026-07-11T00:00:00.000Z'),
+      circle: { id: 'circle-1', name: 'Circle' },
+      applicant: {
+        id: 'applicant-1',
+        nickname: 'Applicant',
+        avatarUrl: null,
+        accountId: 'applicant',
+      },
+      inviter: {
+        id: 'inviter-1',
+        nickname: 'Inviter',
+        avatarUrl: null,
+        accountId: 'inviter',
+      },
+      verifiers: [],
+    });
+
+    await expect(
+      service.invite('inviter-1', 'applicant-1', 'circle-1'),
+    ).rejects.toThrow('already a member');
+
+    expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+  });
+
   it('queries only threshold-eligible invitations for reconciliation', async () => {
     prisma.$queryRaw.mockResolvedValue([]);
     prisma.circleInvitation.findMany.mockResolvedValue([]);

@@ -238,6 +238,15 @@ export class NotificationPushService {
       };
     }
 
+    if (
+      tickets.some((ticket) => !['ok', 'error'].includes(ticket.status ?? ''))
+    ) {
+      return {
+        status: 'RETRYABLE_FAILURE',
+        error: 'UnknownExpoTicketStatus',
+      };
+    }
+
     const badTokens = tickets
       .map((ticket, index) =>
         ticket.status === 'error' &&

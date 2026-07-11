@@ -325,6 +325,23 @@ describe('NotificationPushService', () => {
     });
   });
 
+  it('retries tickets whose status is missing or unknown', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ details: {} }] }),
+    });
+
+    await expect(
+      service.sendNotification('user-1', baseNotification()),
+    ).resolves.toEqual({
+      status: 'RETRYABLE_FAILURE',
+      error: 'UnknownExpoTicketStatus',
+    });
+  });
+
   it('omits the Authorization header when no Expo access token is configured', async () => {
     prisma.devicePushToken.findMany.mockResolvedValue([
       { token: 'ExponentPushToken[one]' },

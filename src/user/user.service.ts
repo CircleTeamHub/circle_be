@@ -302,11 +302,9 @@ export class UserService {
           update: {
             status: 'PENDING',
             generation: { increment: 1 },
-            leaseToken: null,
             attempts: 0,
             lastError: null,
             nextAttemptAt: new Date(),
-            lockedAt: null,
             processedAt: null,
           },
         });
