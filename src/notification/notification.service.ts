@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -12,7 +13,9 @@ import {
   type NotificationRealtimeRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
+  type RevokePushTokenDto,
 } from './notification.dto';
+import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 const MAX_PUSH_TOKENS_PER_USER = 20;
@@ -22,6 +25,9 @@ export class NotificationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
+    // Kept optional for compatibility with direct service consumers; delivery
+    // itself is handled by the durable push outbox processor.
+    private readonly pushService?: NotificationPushService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -62,6 +68,9 @@ export class NotificationService {
     userId: string,
     dto: RegisterPushTokenDto,
   ): Promise<void> {
+    const revocationSecretHash = dto.revocationSecret
+      ? this.hashRevocationSecret(dto.revocationSecret)
+      : undefined;
     await this.prisma.devicePushToken.upsert({
       where: { token: dto.token },
       create: {
@@ -71,6 +80,7 @@ export class NotificationService {
         provider: dto.provider,
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
+        ...(revocationSecretHash ? { revocationSecretHash } : {}),
       },
       update: {
         userID: userId,
@@ -79,6 +89,7 @@ export class NotificationService {
         projectId: dto.projectId ?? null,
         appVersion: dto.appVersion ?? null,
         disabledAt: null,
+        revocationSecretHash: revocationSecretHash ?? null,
       },
     });
     const findTokens = this.prisma.devicePushToken.findMany;
@@ -103,6 +114,20 @@ export class NotificationService {
         token,
       },
     });
+  }
+
+  async revokePushToken(dto: RevokePushTokenDto): Promise<boolean> {
+    const result = await this.prisma.devicePushToken.deleteMany({
+      where: {
+        token: dto.token,
+        revocationSecretHash: this.hashRevocationSecret(dto.revocationSecret),
+      },
+    });
+    return result.count > 0;
+  }
+
+  private hashRevocationSecret(secret: string): string {
+    return createHash('sha256').update(secret).digest('hex');
   }
 
   async getUnreadSummary(userId: string) {
@@ -381,6 +406,17 @@ export class NotificationService {
     return rows.map(mapNotificationRealtimeDto);
   }
 
+  async getNotificationOpenOwnership(
+    userId: string,
+    id: string,
+  ): Promise<{ owned: boolean }> {
+    const notification = await this.prisma.notification.findFirst({
+      where: { id, toUserID: userId, deleted: false },
+      select: { id: true },
+    });
+    return { owned: notification !== null };
+  }
+
   async markNotificationRead(userId: string, id: string): Promise<void> {
     const notification = await this.prisma.notification.findFirst({
       where: { id, toUserID: userId, deleted: false },
@@ -436,11 +472,33 @@ export class NotificationService {
     traceOwnerId: string;
     replyToCommentId?: string | null;
     replyToUserId?: string | null;
+    mentionedUserIds?: string[];
+    recheckMentionEligibility?: (mentionedUserIds: string[]) => Promise<{
+      traceAvailable: boolean;
+      eligibleUserIds: string[];
+    }>;
     content: string;
   }): Promise<
     Array<{ targetUserId: string; notification: NotificationRealtimeDto }>
   > {
     const notifiedUserIds = new Set<string>();
+    let mentionedUserIds = [...new Set(params.mentionedUserIds ?? [])].filter(
+      (mentionedUserId) =>
+        mentionedUserId && mentionedUserId !== params.actorId,
+    );
+    if (mentionedUserIds.length > 0 && params.recheckMentionEligibility) {
+      const refreshed =
+        await params.recheckMentionEligibility(mentionedUserIds);
+      if (!refreshed.traceAvailable) return [];
+      const requestedMentionIds = new Set(mentionedUserIds);
+      mentionedUserIds = [...new Set(refreshed.eligibleUserIds)].filter((id) =>
+        requestedMentionIds.has(id),
+      );
+    } else if (mentionedUserIds.length > 0) {
+      // Mention recipients must be re-checked immediately before the write.
+      // Callers that cannot provide that authorization snapshot fail closed.
+      mentionedUserIds = [];
+    }
     const created = await this.prisma.$transaction(async (tx) => {
       const notifications = [];
       if (
@@ -479,6 +537,23 @@ export class NotificationService {
               fromTraceID: params.traceId,
               fromReplyID: params.commentId,
               toReplyID: params.replyToCommentId ?? null,
+            },
+            include: NOTIFICATION_REALTIME_INCLUDE,
+          }),
+        );
+      }
+      for (const mentionedUserId of mentionedUserIds) {
+        if (notifiedUserIds.has(mentionedUserId)) continue;
+        notifiedUserIds.add(mentionedUserId);
+        notifications.push(
+          await tx.notification.create({
+            data: {
+              toUserID: mentionedUserId,
+              fromUserID: params.actorId,
+              type: NotificationType.TRACE_MENTION,
+              content: params.content,
+              fromTraceID: params.traceId,
+              fromReplyID: params.commentId,
             },
             include: NOTIFICATION_REALTIME_INCLUDE,
           }),

@@ -458,6 +458,13 @@ export class TraceService {
       }
     }
 
+    const mentionEligibility = await this.filterVisibleMentionRecipients(
+      trace,
+      userId,
+      dto.mentionedUserIds ?? [],
+    );
+    const mentionedUserIds = mentionEligibility.eligibleUserIds;
+
     const comment = await this.prisma.$transaction(async (tx) => {
       const created = await tx.traceComment.create({
         data: {
@@ -493,6 +500,14 @@ export class TraceService {
           traceOwnerId: trace.fromID,
           replyToCommentId: comment.replyTo?.id ?? null,
           replyToUserId: comment.replyTo?.user.id ?? null,
+          mentionedUserIds,
+          recheckMentionEligibility: async (recipientIds) => {
+            return this.filterFreshVisibleMentionRecipients(
+              traceId,
+              userId,
+              recipientIds,
+            );
+          },
           content:
             comment.content || (comment.images.length ? '评论了一张图片' : ''),
         });
@@ -537,6 +552,7 @@ export class TraceService {
             nickname: comment.replyTo.user.nickname,
           }
         : null,
+      ignoredMentionCount: mentionEligibility.ignoredMentionCount,
       createdAt: comment.createdAt.toISOString(),
     };
   }
@@ -571,6 +587,125 @@ export class TraceService {
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  private async filterFreshVisibleMentionRecipients(
+    traceId: string,
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<{ traceAvailable: boolean; eligibleUserIds: string[] }> {
+    const trace = await this.prisma.trace.findFirst({
+      where: { id: traceId, deleted: false },
+      select: { fromID: true, visibility: true },
+    });
+    if (!trace) {
+      return { traceAvailable: false, eligibleUserIds: [] };
+    }
+    const result = await this.filterVisibleMentionRecipients(
+      trace,
+      actorId,
+      recipientIds,
+    );
+    return { traceAvailable: true, eligibleUserIds: result.eligibleUserIds };
+  }
+
+  private async filterVisibleMentionRecipients(
+    trace: { fromID: string; visibility: string },
+    actorId: string,
+    recipientIds: string[],
+  ): Promise<{ eligibleUserIds: string[]; ignoredMentionCount: number }> {
+    const distinctRecipientIds = [...new Set(recipientIds)].filter(
+      (recipientId) => recipientId !== actorId,
+    );
+    if (distinctRecipientIds.length === 0) {
+      return { eligibleUserIds: [], ignoredMentionCount: 0 };
+    }
+
+    const activeRecipients = await this.prisma.user.findMany({
+      where: {
+        id: { in: distinctRecipientIds },
+        status: 'ACTIVE',
+      },
+      select: { id: true },
+    });
+    const activeRecipientIds = new Set(
+      activeRecipients.map((recipient) => recipient.id),
+    );
+    const nonOwnerRecipientIds = distinctRecipientIds.filter(
+      (recipientId) =>
+        recipientId !== trace.fromID && activeRecipientIds.has(recipientId),
+    );
+    const activeOwnerMentioned = activeRecipientIds.has(trace.fromID);
+    if (nonOwnerRecipientIds.length === 0 || trace.visibility === 'PRIVATE') {
+      const eligibleUserIds = activeOwnerMentioned ? [trace.fromID] : [];
+      return {
+        eligibleUserIds,
+        ignoredMentionCount:
+          distinctRecipientIds.length - eligibleUserIds.length,
+      };
+    }
+
+    const [friendships, settingsByAuthor] = await Promise.all([
+      this.prisma.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            {
+              userID: trace.fromID,
+              friendID: { in: nonOwnerRecipientIds },
+            },
+            {
+              userID: { in: nonOwnerRecipientIds },
+              friendID: trace.fromID,
+            },
+          ],
+        },
+        select: {
+          userID: true,
+          friendID: true,
+          permissionA: true,
+          permissionB: true,
+        },
+      }),
+      this.privacySettings.getSettingsMany([trace.fromID]),
+    ]);
+    const friendshipByRecipient = new Map(
+      friendships.map((friendship) => [
+        friendship.userID === trace.fromID
+          ? friendship.friendID
+          : friendship.userID,
+        friendship,
+      ]),
+    );
+    const authorSettings = settingsByAuthor.get(trace.fromID);
+
+    const visibleNonOwnerIds = nonOwnerRecipientIds.filter((recipientId) => {
+      const friendship = friendshipByRecipient.get(recipientId);
+      const isFriend = Boolean(friendship);
+      const authorPermission =
+        friendship?.userID === trace.fromID
+          ? friendship.permissionA
+          : friendship?.permissionB;
+      if (authorPermission === 'CHAT_ONLY') {
+        return false;
+      }
+      if (
+        !this.privacySettings.momentsVisibleFor(authorSettings, false, isFriend)
+      ) {
+        return false;
+      }
+      return trace.visibility !== 'FRIENDS_ONLY' || isFriend;
+    });
+    const visibleNonOwnerSet = new Set(visibleNonOwnerIds);
+    const eligibleUserIds = distinctRecipientIds.filter(
+      (recipientId) =>
+        (recipientId === trace.fromID && activeOwnerMentioned) ||
+        visibleNonOwnerSet.has(recipientId),
+    );
+    return {
+      eligibleUserIds,
+      ignoredMentionCount: distinctRecipientIds.length - eligibleUserIds.length,
+    };
+  }
 
   private async getAcceptedFriendIds(userId: string): Promise<string[]> {
     const records = await this.prisma.friend.findMany({
@@ -746,6 +881,7 @@ export class TraceService {
             c.replyTo && c.replyTo.user
               ? { id: c.replyTo.id, nickname: c.replyTo.user.nickname }
               : null,
+          ignoredMentionCount: 0,
           createdAt: c.createdAt.toISOString(),
         }),
       );

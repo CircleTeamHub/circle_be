@@ -146,6 +146,7 @@ describe('NotificationService', () => {
           projectId: 'project-1',
           appVersion: '1.0.0',
           disabledAt: null,
+          revocationSecretHash: null,
         },
       });
     });

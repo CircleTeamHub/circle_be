@@ -213,6 +213,7 @@ enum NotificationType {
   TRACE_LIKE
   TRACE_COMMENT
   COMMENT_REPLY
+  TRACE_MENTION
   CIRCLE_VERIFICATION_REQUESTED
   CIRCLE_INVITATION_APPROVED
   CIRCLE_INVITATION_REJECTED
@@ -1125,6 +1126,7 @@ model DevicePushToken {
   platform   String
   projectId  String?
   appVersion String?
+  revocationSecretHash String?
   disabledAt DateTime?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt

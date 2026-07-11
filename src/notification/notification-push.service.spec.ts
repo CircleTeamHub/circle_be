@@ -1,4 +1,5 @@
 import { PrismaService } from 'src/prisma/prisma.service';
+import { NotificationType } from 'src/generated/prisma';
 import { NotificationPushService } from './notification-push.service';
 
 describe('NotificationPushService', () => {
@@ -95,8 +96,127 @@ describe('NotificationPushService', () => {
         data: expect.objectContaining({
           notificationId: 'n1',
           type: 'TRACE_COMMENT',
+          toUserId: 'user-1',
+          fromUserId: 'u2',
+          fromUserNickname: 'Aki',
           traceId: 'trace-1',
           replyId: 'reply-1',
+        }),
+      }),
+    );
+    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
+  });
+
+  it('includes canonical actor fields for profile-like pushes', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', {
+      ...baseNotification(),
+      type: 'PROFILE_LIKE',
+      content: '',
+      fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body[0]).toEqual(
+      expect.objectContaining({
+        title: 'Aki',
+        body: '赞了你的资料',
+        data: expect.objectContaining({
+          type: 'PROFILE_LIKE',
+          toUserId: 'user-1',
+          fromUserId: 'actor-1',
+          fromUserNickname: 'Aki',
+        }),
+      }),
+    );
+    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
+  });
+
+  it('includes the canonical recipient for system pushes without inventing an actor', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('system-recipient-1', baseNotification());
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body[0].data).toEqual(
+      expect.objectContaining({
+        type: 'SYSTEM',
+        route: 'system',
+        toUserId: 'system-recipient-1',
+      }),
+    );
+    expect(body[0].data).not.toHaveProperty('fromUserId');
+  });
+
+  it('keeps the canonical actor nickname field when the stored nickname is empty', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', {
+      ...baseNotification(),
+      type: 'PROFILE_LIKE',
+      fromUser: { id: 'actor-1', nickname: '', avatarUrl: null },
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body[0].data).toEqual(
+      expect.objectContaining({
+        fromUserId: 'actor-1',
+        fromUserNickname: '',
+      }),
+    );
+  });
+
+  it('uses mention fallback text and preserves actor/comment routing fields', async () => {
+    prisma.devicePushToken.findMany.mockResolvedValue([
+      { token: 'ExponentPushToken[one]' },
+    ]);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ status: 'ok' }] }),
+    });
+
+    await service.sendNotification('user-1', {
+      ...baseNotification(),
+      type: NotificationType.TRACE_MENTION,
+      content: '',
+      fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+      fromTrace: {
+        id: 'trace-1',
+        excerpt: 'original trace must not become the mention body',
+        firstImage: null,
+      },
+      fromReply: { id: 'comment-1', content: '' },
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body[0]).toEqual(
+      expect.objectContaining({
+        body: '在动态评论中提到了你',
+        data: expect.objectContaining({
+          type: 'TRACE_MENTION',
+          fromUserId: 'actor-1',
+          fromUserNickname: 'Aki',
+          traceId: 'trace-1',
+          replyId: 'comment-1',
         }),
       }),
     );

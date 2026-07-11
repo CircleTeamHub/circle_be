@@ -72,6 +72,15 @@ export class NotificationController {
     return this.notificationService.deletePushToken(req.user.userId, dto.token);
   }
 
+  @Get(':id/open-ownership')
+  @ApiOperation({ summary: 'Check whether a push notification belongs to me' })
+  openOwnership(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
+    return this.notificationService.getNotificationOpenOwnership(
+      req.user.userId,
+      id,
+    );
+  }
+
   @Put(':id/read')
   @ApiOperation({ summary: 'Mark one notification as read' })
   read(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {

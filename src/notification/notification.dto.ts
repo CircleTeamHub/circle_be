@@ -7,6 +7,7 @@ import {
   IsOptional,
   IsString,
   MaxLength,
+  MinLength,
   IsInt,
   Min,
   Max,
@@ -54,6 +55,13 @@ export class RegisterPushTokenDto {
   @IsOptional()
   @MaxLength(128)
   appVersion?: string;
+
+  @ApiPropertyOptional({ minLength: 32, maxLength: 256 })
+  @IsString()
+  @MinLength(32)
+  @MaxLength(256)
+  @IsOptional()
+  revocationSecret?: string;
 }
 
 export class DeletePushTokenDto {
@@ -62,6 +70,21 @@ export class DeletePushTokenDto {
   @IsNotEmpty()
   @MaxLength(512)
   token: string;
+}
+
+export class RevokePushTokenDto {
+  @ApiProperty({ minLength: 1, maxLength: 512 })
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(1)
+  @MaxLength(512)
+  token: string;
+
+  @ApiProperty({ minLength: 32, maxLength: 256 })
+  @IsString()
+  @MinLength(32)
+  @MaxLength(256)
+  revocationSecret: string;
 }
 
 export type NotificationRealtimeDto = {

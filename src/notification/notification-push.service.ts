@@ -52,7 +52,7 @@ export class NotificationPushService {
     });
     if (tokens.length === 0) return true;
 
-    const message = this.buildMessage(notification);
+    const message = this.buildMessage(userId, notification);
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
     const byProject = new Map<string, typeof tokens>();
@@ -97,20 +97,31 @@ export class NotificationPushService {
     });
   }
 
-  private buildMessage(notification: NotificationRealtimeDto) {
+  private buildMessage(userId: string, notification: NotificationRealtimeDto) {
     const actor = notification.fromUser?.nickname || 'CircleIM';
     const body =
-      notification.content ||
-      notification.fromReply?.content ||
-      notification.fromCirclePost?.excerpt ||
-      notification.fromTrace?.excerpt ||
-      this.fallbackBody(notification.type);
+      notification.type === 'TRACE_MENTION'
+        ? notification.content ||
+          notification.fromReply?.content ||
+          this.fallbackBody(notification.type)
+        : notification.content ||
+          notification.fromReply?.content ||
+          notification.fromCirclePost?.excerpt ||
+          notification.fromTrace?.excerpt ||
+          this.fallbackBody(notification.type);
     return {
       title: notification.type === 'SYSTEM' ? '系统通知' : actor,
       body,
       data: {
         notificationId: notification.id,
         type: notification.type,
+        toUserId: userId,
+        ...(notification.fromUser
+          ? {
+              fromUserId: notification.fromUser.id,
+              fromUserNickname: notification.fromUser.nickname,
+            }
+          : {}),
         ...(notification.type === 'SYSTEM' ? { route: 'system' } : {}),
         ...(notification.fromTrace?.id
           ? { traceId: notification.fromTrace.id }
@@ -135,6 +146,7 @@ export class NotificationPushService {
     if (type === 'TRACE_LIKE') return '点赞了你的动态';
     if (type === 'TRACE_COMMENT') return '评论了你的动态';
     if (type === 'COMMENT_REPLY') return '回复了你的评论';
+    if (type === 'TRACE_MENTION') return '在动态评论中提到了你';
     if (type === 'FRIEND_REQUEST_RECEIVED') return '请求添加你为好友';
     if (type === 'FRIEND_REQUEST_ACCEPTED') return '已通过你的好友申请';
     if (type === 'FRIEND_REQUEST_REJECTED') return '已拒绝你的好友申请';
