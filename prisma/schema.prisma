@@ -218,8 +218,10 @@ enum NotificationType {
   CIRCLE_INVITATION_APPROVED
   CIRCLE_INVITATION_REJECTED
   CIRCLE_ADMIN_OVERRIDE_APPROVED
+  CIRCLE_POST_PUBLISHED
   CIRCLE_POST_SIGNUP_CREATED
   CIRCLE_POST_AUTO_ENDED
+  CIRCLE_POST_COLLABORATION_RECOGNIZED
   PROFILE_LIKE
 }
 
@@ -1272,6 +1274,20 @@ model CirclePostSignup {
   @@index([postID])
   @@index([userID])
   @@index([postID, seenByAuthor])
+}
+
+// 圈子帖子举报（内容举报日志）。独立表、不建外键关系：举报是审计日志，帖子删除后
+// 保留孤儿记录也无妨，从而无需改动庞大的 CirclePost / User 模型。同一用户对同一帖
+// 只记一条（@@unique），重复举报幂等更新原因。
+model CirclePostReport {
+  id         String   @id @default(uuid())
+  postID     String
+  reporterID String
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@unique([postID, reporterID])
+  @@index([postID])
 }
 
 model CollaborationRecognition {

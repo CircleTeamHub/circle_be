@@ -166,8 +166,11 @@ export class NotificationPushService {
     if (type === 'FRIEND_REQUEST_REJECTED') return '已拒绝你的好友申请';
     if (type === 'PROFILE_LIKE') return '赞了你的资料';
     if (type === 'CIRCLE_VERIFICATION_REQUESTED') return '邀请你验证入圈申请';
+    if (type === 'CIRCLE_POST_PUBLISHED') return '在圈子发布了新活动';
     if (type === 'CIRCLE_POST_SIGNUP_CREATED') return '报名了你的帖子';
     if (type === 'CIRCLE_POST_AUTO_ENDED') return '你的帖子报名已结束';
+    if (type === 'CIRCLE_POST_COLLABORATION_RECOGNIZED')
+      return '认可了你的活动协作';
     return '你有一条新通知';
   }
 

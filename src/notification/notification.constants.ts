@@ -1,5 +1,11 @@
 import { NotificationType } from 'src/generated/prisma';
 
+function compactNotificationTypes(
+  values: (NotificationType | undefined)[],
+): NotificationType[] {
+  return values.filter((value): value is NotificationType => Boolean(value));
+}
+
 /**
  * "互动消息" channel (the notification-bell list) — trace comments/replies plus
  * circle verification/invitation events.
@@ -8,7 +14,7 @@ import { NotificationType } from 'src/generated/prisma';
  * durable, consistent notification record. The dedicated "新的朋友" inbox
  * still remains the canonical request UI and unread activity source.
  */
-export const DISCOVER_NOTIFICATION_TYPES = [
+export const DISCOVER_NOTIFICATION_TYPES = compactNotificationTypes([
   NotificationType.FRIEND_REQUEST_RECEIVED,
   NotificationType.FRIEND_REQUEST_ACCEPTED,
   NotificationType.FRIEND_REQUEST_REJECTED,
@@ -20,9 +26,13 @@ export const DISCOVER_NOTIFICATION_TYPES = [
   NotificationType.CIRCLE_INVITATION_APPROVED,
   NotificationType.CIRCLE_INVITATION_REJECTED,
   NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED,
+  NotificationType.CIRCLE_POST_PUBLISHED,
   NotificationType.CIRCLE_POST_SIGNUP_CREATED,
   NotificationType.CIRCLE_POST_AUTO_ENDED,
+  NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
   NotificationType.PROFILE_LIKE,
-] as const;
+] as const);
 
-export const PROFILE_NOTIFICATION_TYPES = [NotificationType.SYSTEM] as const;
+export const PROFILE_NOTIFICATION_TYPES = compactNotificationTypes([
+  NotificationType.SYSTEM,
+] as const);

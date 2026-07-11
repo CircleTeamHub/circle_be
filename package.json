@@ -10,7 +10,7 @@
       "prebuild": "rimraf dist",
       "build": "cross-env NODE_ENV=production nest build",
       "postbuild": "node scripts/copy-generated-client.js",
-      "prestart:dev": "mkdir -p dist/src && ln -sfn \"$(pwd)/src/generated\" dist/src/generated || true",
+      "prestart:dev": "mkdir -p dist/src && rm -rf dist/src/generated && ln -s \"$(pwd)/src/generated\" dist/src/generated",
       "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
       "start": "ts-node src/main.ts",
       "start:dev": "cross-env NODE_ENV=development nest start --watch",

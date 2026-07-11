@@ -119,6 +119,7 @@ export const PlazaErrorCode = {
   RecognizeNotMember: 'PLAZA_RECOGNIZE_NOT_MEMBER',
   RecognizeBlocked: 'PLAZA_RECOGNIZE_BLOCKED',
   RecognizeAlready: 'PLAZA_RECOGNIZE_ALREADY',
+  ReportSelf: 'PLAZA_REPORT_SELF',
   InvalidCursor: 'PLAZA_INVALID_CURSOR',
 } as const;
 

@@ -350,6 +350,75 @@ export class NotificationService {
     return dto;
   }
 
+  /**
+   * "XX 认可了你的活动协作" —— 活动结束后作者提交合作认可时，通知每位被认可者。
+   * fromUser 为作者、fromCirclePost 为对应动态；点击直达作者主页。认可是一次性
+   * 事件（collaborationRecognizedAt 保证不可重复提交），故无需去重窗口。
+   */
+  async createCollaborationRecognitionNotification(params: {
+    toUserId: string;
+    fromUserId: string;
+    postId: string;
+  }): Promise<NotificationRealtimeDto | null> {
+    return this.createNotification({
+      toUserID: params.toUserId,
+      fromUserID: params.fromUserId,
+      type: NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
+      fromCirclePostID: params.postId,
+    });
+  }
+
+  /**
+   * "XX 在圈子发布了新活动" —— 圈子有新帖发布时，扇出通知给圈子成员，好让大家
+   * 及时报名。一次 createMany 批量落库 + 一次回查带 fromUser/fromCirclePost 的 DTO，
+   * 避免逐人往返；返回每位收件人的 DTO，交给调用方广播(snackbar/铃铛)+推送。
+   * recipientIds 由调用方保证已排除作者、被拉黑者、并去重。
+   */
+  async createCirclePostPublishedNotifications(params: {
+    postId: string;
+    fromUserId: string;
+    recipientIds: string[];
+  }): Promise<
+    Array<{ toUserId: string; notification: NotificationRealtimeDto }>
+  > {
+    const recipients = Array.from(
+      new Set(
+        params.recipientIds.filter((id) => id && id !== params.fromUserId),
+      ),
+    );
+    if (recipients.length === 0) {
+      return [];
+    }
+
+    await this.prisma.notification.createMany({
+      data: recipients.map((toUserID) => ({
+        toUserID,
+        fromUserID: params.fromUserId,
+        type: NotificationType.CIRCLE_POST_PUBLISHED,
+        fromCirclePostID: params.postId,
+        content: '',
+      })),
+    });
+
+    // 回查刚插入的这批行（同作者 + 同类型 + 同帖子 + 这批收件人唯一确定它们），
+    // 带上 realtime include 以构造 snackbar/推送所需的 DTO。
+    const rows = await this.prisma.notification.findMany({
+      where: {
+        toUserID: { in: recipients },
+        fromUserID: params.fromUserId,
+        type: NotificationType.CIRCLE_POST_PUBLISHED,
+        fromCirclePostID: params.postId,
+      },
+      include: NOTIFICATION_REALTIME_INCLUDE,
+    });
+
+    return rows.map((row) => {
+      const notification = mapNotificationRealtimeDto(row);
+      void this.sendPushBestEffort(row.toUserID, notification);
+      return { toUserId: row.toUserID, notification };
+    });
+  }
+
   async createCircleInvitationNotification(data: {
     toUserID: string;
     fromUserID: string;
