@@ -235,6 +235,29 @@ describe('CircleService', () => {
     });
   });
 
+  it('uses the locked membership state when approval races with leave', async () => {
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'member-1',
+        role: 'MEMBER',
+        status: 'PENDING',
+      })
+      .mockResolvedValueOnce({
+        id: 'member-1',
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+    prisma.circle.findUnique.mockResolvedValue({ groupID: null });
+
+    await service.leaveCircle('user-1', 'circle-1');
+
+    expect(prisma.circle.update).toHaveBeenCalledWith({
+      where: { id: 'circle-1' },
+      data: { memberCount: { decrement: 1 } },
+    });
+    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+  });
+
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,

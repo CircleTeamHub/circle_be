@@ -17,6 +17,7 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     circleInvitationVerifier: {
       findMany: jest.fn(),
@@ -28,12 +29,14 @@ describe('CircleInvitationService', () => {
       findUnique: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     notification: {
       create: jest.fn(),
     },
     circle: {
       findFirst: jest.fn(),
+      findUnique: jest.fn(),
       update: jest.fn(),
     },
     user: {
@@ -43,6 +46,7 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
     },
     $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -63,7 +67,8 @@ describe('CircleInvitationService', () => {
   };
 
   beforeEach(async () => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+    prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
     notificationService.createCircleInvitationNotification.mockReset();
 
@@ -170,6 +175,82 @@ describe('CircleInvitationService', () => {
     expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
       'applicant-1',
       true,
+    );
+  });
+
+  it('queries only threshold-eligible invitations for reconciliation', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    prisma.circleInvitation.findMany.mockResolvedValue([]);
+
+    await expect(service.reconcileApprovedInvitations()).resolves.toBe(0);
+
+    expect(prisma.$queryRaw).toHaveBeenCalled();
+    const query = prisma.$queryRaw.mock.calls[0][0].join(' ');
+    expect(query).toContain('"approvedCount" >= "requiredCount"');
+    expect(query).toContain('LIMIT 100');
+    expect(prisma.circleInvitation.findMany).not.toHaveBeenCalled();
+  });
+
+  it('continues reconciliation after one candidate cannot be admitted', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      { id: 'bad', circleID: 'circle-full', applicantID: 'user-bad' },
+      { id: 'good', circleID: 'circle-open', applicantID: 'user-good' },
+    ]);
+    prisma.circleInvitation.findMany.mockResolvedValue([]);
+    prisma.circleInvitation.findUnique
+      .mockResolvedValueOnce({
+        id: 'bad',
+        circleID: 'circle-full',
+        applicantID: 'user-bad',
+        inviterID: 'inviter-1',
+        status: 'PENDING',
+        approvedCount: 1,
+        requiredCount: 1,
+        circle: { groupID: null },
+      })
+      .mockResolvedValueOnce({
+        id: 'good',
+        circleID: 'circle-open',
+        applicantID: 'user-good',
+        inviterID: 'inviter-1',
+        status: 'PENDING',
+        approvedCount: 1,
+        requiredCount: 1,
+        circle: { groupID: null },
+      });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    prisma.circle.findUnique
+      .mockResolvedValueOnce({ maxMembers: 1, memberCount: 1 })
+      .mockResolvedValueOnce({ maxMembers: 2, memberCount: 0 });
+    prisma.circleMember.create.mockResolvedValue({ id: 'member-good' });
+    prisma.circle.update.mockResolvedValue({});
+    notificationService.createCircleInvitationNotification.mockResolvedValue(
+      null,
+    );
+
+    await expect(service.reconcileApprovedInvitations()).resolves.toBe(1);
+
+    expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
+      where: { id: 'good' },
+      include: { circle: true },
+    });
+  });
+
+  it('hides cancelled invitations from pending verifier work', async () => {
+    prisma.circleInvitation.findMany.mockResolvedValue([]);
+
+    await service.getMyPendingVerifications('verifier-1');
+
+    expect(prisma.circleInvitation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          status: 'PENDING',
+          verifiers: {
+            some: { verifierID: 'verifier-1', status: 'PENDING' },
+          },
+        },
+      }),
     );
   });
 
