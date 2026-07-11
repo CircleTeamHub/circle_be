@@ -14,6 +14,11 @@ describe('TempChatCleanup', () => {
       { id: 'b', groupId: 'tmpB' },
     ]);
     await job.sweep();
+    expect(prisma.tempChat.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ OR: expect.any(Array) }),
+      }),
+    );
     expect(service.teardown).toHaveBeenCalledTimes(2);
     expect(service.teardown).toHaveBeenCalledWith(
       { id: 'a', groupId: 'tmpA' },

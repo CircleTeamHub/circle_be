@@ -1257,6 +1257,9 @@ model TempChat {
   maxMembers Int            @default(50)
   expiresAt  DateTime
   endedAt    DateTime?
+  cleanupLockedAt    DateTime?
+  cleanupGroupDismissedAt DateTime?
+  cleanupCompletedAt DateTime?
   createdAt  DateTime       @default(now())
   updatedAt  DateTime       @updatedAt
 
@@ -1274,6 +1277,7 @@ model TempChatGuest {
   createdAt   DateTime @default(now())
   lastSeenAt  DateTime @default(now())
   cleanedUp   Boolean  @default(false)
+  provisioningFailedAt DateTime?
 
   tempChat TempChat @relation(fields: [tempChatId], references: [id], onDelete: Cascade)
 

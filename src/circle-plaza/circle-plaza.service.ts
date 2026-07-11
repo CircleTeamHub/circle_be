@@ -948,6 +948,7 @@ export class CirclePlazaService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(hashtextextended('like-counter-reconciliation', 0))`;
       const post = await tx.circlePost.findFirst({
         where: {
           id: postId,

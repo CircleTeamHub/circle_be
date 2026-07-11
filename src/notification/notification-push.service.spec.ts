@@ -8,6 +8,8 @@ describe('NotificationPushService', () => {
       updateMany: jest.fn(),
       deleteMany: jest.fn(),
     },
+    $queryRaw: jest.fn(),
+    $transaction: jest.fn((cb: any) => cb(prisma)),
   };
 
   let service: NotificationPushService;
@@ -230,6 +232,7 @@ describe('NotificationPushService', () => {
   });
 
   it('deletes stale active and old disabled push tokens', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
     prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 3 });
 
     await expect(service.deleteStaleTokens()).resolves.toEqual({ count: 3 });
@@ -242,5 +245,17 @@ describe('NotificationPushService', () => {
         ],
       },
     });
+    expect(prisma.$transaction).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({ timeout: 60_000 }),
+    );
+  });
+
+  it('skips stale-token cleanup when another instance owns the lock', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ acquired: false }]);
+
+    await expect(service.deleteStaleTokens()).resolves.toEqual({ count: 0 });
+
+    expect(prisma.devicePushToken.deleteMany).not.toHaveBeenCalled();
   });
 });

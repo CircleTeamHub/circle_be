@@ -26,6 +26,7 @@ describe('UploadService', () => {
             'arn:aws:s3:::circle/posts/*',
             'arn:aws:s3:::circle/notes/*',
             'arn:aws:s3:::circle/chat/*',
+            'arn:aws:s3:::circle/friends/*',
             'arn:aws:s3:::circle/uploads/*',
           ],
         },
@@ -48,6 +49,7 @@ describe('UploadService', () => {
           }) as Record<string, string>
         )[key] ?? null,
     } as any);
+    (service as any).ready = true;
 
     (service as any).client = { send };
 
@@ -82,10 +84,12 @@ describe('UploadService', () => {
           }) as Record<string, string>
         )[key] ?? null,
     } as any);
+    (service as any).ready = true;
 
     const result = await service.presign(
       'avatar.jpeg',
       'image/jpeg',
+      1024,
       'avatars',
     );
     const signingClient = signedUrlMock.mock.calls[0]?.[0] as {
@@ -101,6 +105,64 @@ describe('UploadService', () => {
       result.fileUrl.startsWith(`${privateMinioUrl}/circle/avatars/`),
     ).toBe(true);
     expect(result.fileUrl.endsWith('.jpeg')).toBe(true);
+    const command = signedUrlMock.mock.calls[0]?.[1] as {
+      input: { ContentLength?: number; IfNoneMatch?: string };
+    };
+    expect(command.input.ContentLength).toBe(1024);
+    expect(command.input.IfNoneMatch).toBe('*');
+    expect(signedUrlMock.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({
+        signableHeaders: new Set(['content-type']),
+      }),
+    );
+    expect(result.requiredHeaders).toEqual({
+      'Content-Type': 'image/jpeg',
+      'Content-Length': '1024',
+      'If-None-Match': '*',
+    });
+  });
+
+  it('rejects oversized images before signing', async () => {
+    const callsBefore = jest.mocked(getSignedUrl).mock.calls.length;
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'http://localhost:9000',
+          MINIO_ACCESS_KEY: 'minioadmin',
+          MINIO_SECRET_KEY: 'minioadmin123',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'https://api.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).ready = true;
+
+    await expect(
+      service.presign('huge.jpg', 'image/jpeg', 20 * 1024 * 1024 + 1, 'posts'),
+    ).rejects.toMatchObject({ status: 413 });
+    expect(jest.mocked(getSignedUrl)).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it('fails presign closed while bucket bootstrap is unavailable', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'http://localhost:9000',
+          MINIO_ACCESS_KEY: 'minioadmin',
+          MINIO_SECRET_KEY: 'minioadmin123',
+          MINIO_BUCKET: 'circle',
+        })[key] ?? null,
+    } as any);
+    const bootstrap = jest
+      .spyOn(service as any, 'bootstrap')
+      .mockResolvedValue(false);
+
+    await expect(
+      service.presign('asset.png', 'image/png', 10, 'posts'),
+    ).rejects.toMatchObject({ status: 503 });
+    await expect(
+      service.presign('asset.png', 'image/png', 10, 'posts'),
+    ).rejects.toMatchObject({ status: 503 });
+    expect(bootstrap).toHaveBeenCalledTimes(1);
   });
 
   it('rejects downloads whose content length exceeds the caller byte cap', async () => {
