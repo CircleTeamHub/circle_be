@@ -280,3 +280,14 @@ export class PostSignupItemDto {
   displayIcons: DisplayIconDto[];
   recognized: boolean;
 }
+
+export class ReportCirclePostDto {
+  @ApiPropertyOptional({
+    description: 'Optional free-text reason for the report',
+    maxLength: 500,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  reason?: string;
+}

@@ -101,6 +101,36 @@ describe('AllExceptionFilter', () => {
     );
   });
 
+  it('surfaces structured details from the exception body into data', () => {
+    const { filter, reply } = createFilter();
+    const host = hostFor({
+      method: 'GET',
+      url: '/circle-plaza/posts/p1',
+      headers: {},
+      query: {},
+    });
+
+    filter.catch(
+      new ForbiddenException({
+        message: 'You are not a member of this circle',
+        errorCode: 'PLAZA_NOT_CIRCLE_MEMBER',
+        details: { circleId: 'c1', circleName: 'Board games' },
+      }),
+      host,
+    );
+
+    expect(reply).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        code: 403,
+        message: 'You are not a member of this circle',
+        data: { circleId: 'c1', circleName: 'Board games' },
+        errorCode: 'PLAZA_NOT_CIRCLE_MEMBER',
+      },
+      403,
+    );
+  });
+
   it('omits errorCode for plain exceptions', () => {
     const { filter, reply } = createFilter();
     const host = hostFor({ method: 'GET', url: '/x', headers: {}, query: {} });

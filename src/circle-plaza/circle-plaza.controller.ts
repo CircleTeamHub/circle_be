@@ -33,6 +33,7 @@ import {
   PlazaFeedQueryDto,
   PlazaPostDto,
   RecognizePostCollaboratorsDto,
+  ReportCirclePostDto,
   PostSignupItemDto,
 } from './dto/circle-plaza.dto';
 
@@ -97,6 +98,18 @@ export class CirclePlazaController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.plazaService.deletePost(req.user.userId, id);
+  }
+
+  @Post('posts/:id/report')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Report a post' })
+  @ApiTooManyRequestsResponse({ description: 'Too many report attempts' })
+  reportPost(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ReportCirclePostDto,
+    @Req() req: RequestWithUser,
+  ): Promise<{ reported: boolean }> {
+    return this.plazaService.reportPost(req.user.userId, id, dto.reason);
   }
 
   @Post('posts/:id/signup')
