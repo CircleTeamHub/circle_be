@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import {
   cpSync,
   mkdirSync,
@@ -11,8 +11,32 @@ import {
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+function resolveBashExecutable(): string {
+  const configured = process.env.BASH_EXECUTABLE;
+  const candidates = [
+    ...(configured ? [configured] : []),
+    ...(process.platform === 'win32'
+      ? [
+          'C:\\Program Files\\Git\\bin\\bash.exe',
+          'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+        ]
+      : []),
+    'bash',
+  ];
+
+  for (const candidate of candidates) {
+    const probe = spawnSync(candidate, ['-c', 'true'], { stdio: 'ignore' });
+    if (probe.status === 0) return candidate;
+  }
+
+  throw new Error(
+    'A functional Bash is required for redis deployment tests; set BASH_EXECUTABLE to its path.',
+  );
+}
+
 describe('production Redis deployment configuration', () => {
   const repositoryRoot = join(__dirname, '..', '..');
+  const bashExecutable = resolveBashExecutable();
   const workspaces: string[] = [];
   const createWorkspace = (prefix: string) => {
     const workspace = mkdtempSync(join(tmpdir(), prefix));
@@ -41,7 +65,7 @@ describe('production Redis deployment configuration', () => {
       'admin.example.com',
       'ops@example.com',
     ];
-    execFileSync('bash', args, { cwd: workspace });
+    execFileSync(bashExecutable, args, { cwd: workspace });
     const firstComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const firstAppEnv = readFileSync(
       join(workspace, '.env.production'),
@@ -58,12 +82,14 @@ describe('production Redis deployment configuration', () => {
     expect(firstComposeEnv).toContain('API_DOMAIN=api.example.com');
     expect(firstComposeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(firstComposeEnv).toContain('ACME_EMAIL=ops@example.com');
-    expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
-    expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
-      0o600,
-    );
+    if (process.platform !== 'win32') {
+      expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
+      expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
+        0o600,
+      );
+    }
 
-    execFileSync('bash', args, { cwd: workspace });
+    execFileSync(bashExecutable, args, { cwd: workspace });
     const upgradedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const upgradedAppEnv = readFileSync(
       join(workspace, '.env.production'),
@@ -88,7 +114,7 @@ describe('production Redis deployment configuration', () => {
         )
         .replace(/^REDIS_ALLOW_INSECURE=.*\n?/m, ''),
     );
-    execFileSync('bash', args, { cwd: workspace });
+    execFileSync(bashExecutable, args, { cwd: workspace });
     expect(readFileSync(join(workspace, '.env'), 'utf8')).not.toContain(
       'COMPOSE_PROFILES=bundled-redis',
     );
@@ -103,7 +129,10 @@ describe('production Redis deployment configuration', () => {
       'utf8',
     );
 
-    const redisService = compose.match(/\n  redis:\n([\s\S]*?)\n  minio:/)?.[1];
+    const normalizedCompose = compose.split('\r\n').join('\n');
+    const redisService = normalizedCompose
+      .split('\n  redis:\n')[1]
+      ?.split('\n  minio:')[0];
     expect(redisService).toContain("profiles: ['bundled-redis']");
     expect(redisService).toContain('--appendonly yes');
     expect(redisService).toContain('--maxmemory 512mb');
@@ -155,7 +184,7 @@ describe('production Redis deployment configuration', () => {
     );
 
     execFileSync(
-      'bash',
+      bashExecutable,
       [
         'deploy/gen-env.sh',
         '203.0.113.10',
@@ -190,7 +219,7 @@ describe('production Redis deployment configuration', () => {
 
     expect(() =>
       execFileSync(
-        'bash',
+        bashExecutable,
         [
           'deploy/gen-env.sh',
           '203.0.113.10',
