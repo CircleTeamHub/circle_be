@@ -638,7 +638,7 @@ export class CirclePlazaService {
       where: {
         ...this.activeUnexpiredPostWhere(),
         id: postId,
-        circle: { deleted: false },
+        circleLinks: { some: { circle: { deleted: false } } },
       },
       select: {
         id: true,
@@ -647,6 +647,11 @@ export class CirclePlazaService {
         signupVipRestriction: true,
         signupCreditRestriction: true,
         signupFancyRestriction: true,
+        circleLinks: {
+          where: { circle: this.memberCircleScope(userId) },
+          select: { id: true },
+          take: 1,
+        },
       },
     });
     if (!post) {
@@ -676,6 +681,13 @@ export class CirclePlazaService {
         select: { signupCount: true },
       });
       return { signed: true, signupCount: current?.signupCount ?? 0 };
+    }
+
+    if (post.circleLinks.length === 0) {
+      throw new NotFoundException({
+        message: 'Post not found',
+        errorCode: PlazaErrorCode.PostNotFound,
+      });
     }
 
     // 报名资格校验（独立于帖子查看限制 vipRestriction，仅看 signup* 门槛）

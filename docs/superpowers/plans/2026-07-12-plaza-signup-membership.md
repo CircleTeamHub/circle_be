@@ -13,6 +13,7 @@
 ### Task 1: Add failing authorization tests
 
 **Files:**
+
 - Modify: `src/circle-plaza/circle-plaza.service.spec.ts:850-950`
 - Modify: `src/circle-plaza/circle-plaza.service.spec.ts:1533-1575`
 - Modify: `test/app.factory.ts:1-45`
@@ -86,7 +87,9 @@ export function assertSafeE2eDatabase(
   if (nodeEnv !== 'test' || !databaseUrl) {
     throw new Error('E2E cleanup requires NODE_ENV=test and DATABASE_URL');
   }
-  const databaseName = decodeURIComponent(new URL(databaseUrl).pathname.slice(1));
+  const databaseName = decodeURIComponent(
+    new URL(databaseUrl).pathname.slice(1),
+  );
   if (!/(^|[_-])test($|[_-])/i.test(databaseName)) {
     throw new Error(`Refusing to clean non-test database: ${databaseName}`);
   }
@@ -169,13 +172,28 @@ describe('CirclePlaza signup membership e2e', () => {
     postId = randomUUID();
     await prisma.user.createMany({
       data: [
-        { id: ownerId, accountId: `owner-${ownerId}`, passwordHash: 'x', nickname: 'Owner' },
-        { id: signerId, accountId: `signer-${signerId}`, passwordHash: 'x', nickname: 'Signer' },
+        {
+          id: ownerId,
+          accountId: `owner-${ownerId}`,
+          passwordHash: 'x',
+          nickname: 'Owner',
+        },
+        {
+          id: signerId,
+          accountId: `signer-${signerId}`,
+          passwordHash: 'x',
+          nickname: 'Signer',
+        },
       ],
     });
     await prisma.circle.createMany({
       data: [
-        { id: primaryCircleId, name: 'Primary', ownerID: ownerId, deleted: true },
+        {
+          id: primaryCircleId,
+          name: 'Primary',
+          ownerID: ownerId,
+          deleted: true,
+        },
         { id: secondaryCircleId, name: 'Secondary', ownerID: ownerId },
         { id: unrelatedCircleId, name: 'Unrelated', ownerID: ownerId },
       ],
@@ -198,18 +216,26 @@ describe('CirclePlaza signup membership e2e', () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  async function expectPostNotFound(operation: Promise<unknown>): Promise<void> {
+  async function expectPostNotFound(
+    operation: Promise<unknown>,
+  ): Promise<void> {
     await expect(operation).rejects.toMatchObject({
       response: { errorCode: PlazaErrorCode.PostNotFound },
     });
     await expect(
-      prisma.circlePostSignup.count({ where: { postID: postId, userID: signerId } }),
+      prisma.circlePostSignup.count({
+        where: { postID: postId, userID: signerId },
+      }),
     ).resolves.toBe(0);
   }
 
   it('allows an ACTIVE member of a secondary linked circle when primary is deleted', async () => {
     await prisma.circleMember.create({
-      data: { userID: signerId, circleID: secondaryCircleId, status: CircleMemberStatus.ACTIVE },
+      data: {
+        userID: signerId,
+        circleID: secondaryCircleId,
+        status: CircleMemberStatus.ACTIVE,
+      },
     });
     await expect(service.signupForPost(signerId, postId)).resolves.toEqual({
       signed: true,
@@ -230,8 +256,16 @@ describe('CirclePlaza signup membership e2e', () => {
   it('rejects membership only in a deleted or unlinked circle', async () => {
     await prisma.circleMember.createMany({
       data: [
-        { userID: signerId, circleID: primaryCircleId, status: CircleMemberStatus.ACTIVE },
-        { userID: signerId, circleID: unrelatedCircleId, status: CircleMemberStatus.ACTIVE },
+        {
+          userID: signerId,
+          circleID: primaryCircleId,
+          status: CircleMemberStatus.ACTIVE,
+        },
+        {
+          userID: signerId,
+          circleID: unrelatedCircleId,
+          status: CircleMemberStatus.ACTIVE,
+        },
       ],
     });
     await expectPostNotFound(service.signupForPost(signerId, postId));
@@ -239,11 +273,17 @@ describe('CirclePlaza signup membership e2e', () => {
 
   it('keeps an existing signup idempotent after membership loss', async () => {
     await prisma.circleMember.create({
-      data: { userID: signerId, circleID: secondaryCircleId, status: CircleMemberStatus.ACTIVE },
+      data: {
+        userID: signerId,
+        circleID: secondaryCircleId,
+        status: CircleMemberStatus.ACTIVE,
+      },
     });
     await service.signupForPost(signerId, postId);
     await prisma.circleMember.update({
-      where: { userID_circleID: { userID: signerId, circleID: secondaryCircleId } },
+      where: {
+        userID_circleID: { userID: signerId, circleID: secondaryCircleId },
+      },
       data: { status: CircleMemberStatus.PENDING },
     });
     await expect(service.signupForPost(signerId, postId)).resolves.toEqual({
@@ -251,9 +291,13 @@ describe('CirclePlaza signup membership e2e', () => {
       signupCount: 1,
     });
     await expect(
-      prisma.circlePostSignup.count({ where: { postID: postId, userID: signerId } }),
+      prisma.circlePostSignup.count({
+        where: { postID: postId, userID: signerId },
+      }),
     ).resolves.toBe(1);
-    await expect(prisma.circlePost.findUnique({ where: { id: postId } })).resolves.toMatchObject({
+    await expect(
+      prisma.circlePost.findUnique({ where: { id: postId } }),
+    ).resolves.toMatchObject({
       signupCount: 1,
     });
   });
@@ -288,9 +332,11 @@ docker run --name circle-signup-test-db \
   -p 55432:5432 -d postgres:16
 until docker exec circle-signup-test-db pg_isready -U postgres -d circle_signup_test; do sleep 1; done
 NODE_ENV=test \
+SECRET='ci-secret-ci-secret-ci-secret-0123456789' \
 DATABASE_URL='postgresql://postgres:postgres@localhost:55432/circle_signup_test?schema=public' \
   npx prisma migrate deploy
 NODE_ENV=test \
+SECRET='ci-secret-ci-secret-ci-secret-0123456789' \
 DATABASE_URL='postgresql://postgres:postgres@localhost:55432/circle_signup_test?schema=public' \
   npx jest --config ./test/jest-e2e.json --runInBand test/circle-plaza-signup.e2e-spec.ts
 ```
@@ -307,6 +353,7 @@ docker rm -f circle-signup-test-db
 ### Task 2: Implement the membership guard
 
 **Files:**
+
 - Modify: `src/circle-plaza/circle-plaza.service.ts:631-690`
 
 - [ ] **Step 1: Select an eligible linked circle with the existing post query**
@@ -360,6 +407,7 @@ Run:
 ```bash
 npm test -- --runInBand src/circle-plaza/circle-plaza.service.spec.ts
 NODE_ENV=test \
+SECRET='ci-secret-ci-secret-ci-secret-0123456789' \
 DATABASE_URL='postgresql://postgres:postgres@localhost:55432/circle_signup_test?schema=public' \
   npx jest --config ./test/jest-e2e.json --runInBand test/circle-plaza-signup.e2e-spec.ts
 ```
@@ -381,6 +429,7 @@ git commit -m "fix(plaza): require membership for new signups"
 ### Task 3: Run production verification
 
 **Files:**
+
 - Verify only
 
 - [ ] **Step 1: Run the complete unit suite without auto-fixing files**
@@ -424,6 +473,7 @@ if an earlier verification command fails.
 ### Task 4: Retire the obsolete detached worktree
 
 **Files:**
+
 - Remove worktree: `/Users/yiboding/.codex/worktrees/390b/circle_be`
 
 - [ ] **Step 1: Record and back up every detached change**
