@@ -118,3 +118,16 @@ Verification consists of Prisma generation, targeted plaza/notification/filter
 tests, production build, and the full Jest suite. Any unrelated baseline failure
 will be reported separately with its test name and evidence.
 
+## Cross-platform deployment-test harness
+
+The full-suite failure is caused by the test harness, not the Redis deployment
+configuration: Windows resolves `bash` to the WSL launcher even when no distro
+is installed, and the compose parser assumes LF-only line endings. The test
+suite will resolve a shell by executing a no-op and, on Windows, prefer the
+standard Git Bash locations before falling back to PATH. All script tests use
+that verified executable, so the negative-path assertion cannot pass merely
+because Bash failed to start. Static compose matching accepts both LF and CRLF.
+
+This change is test-only: `deploy/gen-env.sh` and production compose behavior
+remain unchanged.
+

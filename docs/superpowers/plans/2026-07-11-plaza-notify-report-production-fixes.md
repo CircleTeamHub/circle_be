@@ -309,3 +309,45 @@ Run: `git diff --check && git status --short && git diff origin/main...HEAD --st
 
 Expected: no whitespace errors and only scoped changes.
 
+### Task 7: Make Redis deployment verification cross-platform
+
+**Files:**
+- Modify: `src/config/redis-deploy.spec.ts`
+
+**Interfaces:**
+- Consumes: a functional Bash executable and repository text files.
+- Produces: script tests that execute under Git Bash on Windows and PATH Bash elsewhere, plus CRLF-safe compose assertions.
+
+- [ ] **Step 1: Preserve the failing baseline**
+
+Run: `npm test -- --runInBand src/config/redis-deploy.spec.ts`
+
+Expected: three failures: two WSL-launch failures and one LF-only compose match failure.
+
+- [ ] **Step 2: Add a functional Bash resolver**
+
+Use `spawnSync(candidate, ['-c', 'true'])` to validate candidates. On Windows,
+try `C:\\Program Files\\Git\\bin\\bash.exe` and
+`C:\\Program Files\\Git\\usr\\bin\\bash.exe` before `bash`; elsewhere use
+`bash`. Throw during suite setup if none works so script tests never become
+false positives.
+
+- [ ] **Step 3: Use the resolved executable for every script assertion**
+
+Replace every `execFileSync('bash', ...)` call with
+`execFileSync(bashExecutable, ...)`.
+
+- [ ] **Step 4: Make compose matching line-ending independent**
+
+Use `/\r?\n  redis:\r?\n([\s\S]*?)\r?\n  minio:/`.
+
+- [ ] **Step 5: Verify the focused and full suites**
+
+Run: `npm test -- --runInBand src/config/redis-deploy.spec.ts`
+
+Expected: 4/4 pass.
+
+Run: `npm test -- --runInBand`
+
+Expected: all non-integration Jest tests pass, with only explicitly skipped integration suites.
+
