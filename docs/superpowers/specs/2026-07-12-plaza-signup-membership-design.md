@@ -35,9 +35,9 @@ can run, but no post data is returned to the client. The lookup must accept a
 post whose primary circle is deleted when a non-deleted secondary linked circle
 still qualifies. No DTO, schema, or response shape changes are needed.
 
-When no qualifying post is found, retain the existing `PostNotFound` error. This
-does not disclose the existence of a post that the caller cannot participate
-in and keeps the endpoint's existing error contract.
+When an otherwise active post has no qualifying selected circle link, retain
+the existing `PostNotFound` error. This does not disclose post data that the
+caller cannot participate in and keeps the endpoint's existing error shape.
 
 Membership is required when creating a new signup. If a signup already exists,
 the endpoint preserves its current idempotent success response even when the
@@ -55,8 +55,9 @@ authorization used by the other plaza operations.
 
 Add focused service tests that assert all of the following:
 
-- The lookup uses `circleLinks.some.circle`, so membership in any linked circle
-  qualifies rather than only membership in the primary circle.
+- The lookup selects `circleLinks` through a nested circle filter, so membership
+  in any linked circle qualifies rather than only membership in the primary
+  circle.
 - The nested circle scope requires `deleted: false` and an `ACTIVE` membership
   for the requesting user, excluding pending/rejected memberships and deleted
   or unlinked circles through the query predicate.
