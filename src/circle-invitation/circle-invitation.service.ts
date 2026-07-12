@@ -21,6 +21,7 @@ import {
   InvitationDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
+import { circleApplicationLockKey } from './circle-application-lock';
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
 
@@ -162,8 +163,20 @@ export class CircleInvitationService {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
       // transaction-scoped advisory lock, then re-check inside the lock.
-      const pairKey = `circle-invite:${circleId}:${applicantId}`;
+      const pairKey = circleApplicationLockKey(circleId, applicantId);
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+      const lockedMembership = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: applicantId, circleID: circleId },
+        },
+      });
+      if (lockedMembership?.status === 'ACTIVE') {
+        throw new ConflictException({
+          message: 'User is already a member of this circle',
+          errorCode: CircleErrorCode.AlreadyMember,
+        });
+      }
 
       const existingInvitation = await tx.circleInvitation.findFirst({
         where: {
@@ -303,24 +316,41 @@ export class CircleInvitationService {
     approve: boolean,
   ): Promise<void> {
     const result = await this.runInvitationTransaction(async (tx) => {
-      const verifierRecord = await tx.circleInvitationVerifier.findFirst({
-        where: {
-          invitationID: invitationId,
-          verifierID: verifierId,
-          status: 'PENDING',
-        },
+      const application = await tx.circleInvitation.findUnique({
+        where: { id: invitationId },
+        select: { circleID: true, applicantID: true },
       });
+      if (!application) {
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
+      }
+      const pairKey = circleApplicationLockKey(
+        application.circleID,
+        application.applicantID,
+      );
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+      const [verifierRecord, invitation] = await Promise.all([
+        tx.circleInvitationVerifier.findFirst({
+          where: {
+            invitationID: invitationId,
+            verifierID: verifierId,
+            status: 'PENDING',
+          },
+        }),
+        tx.circleInvitation.findUnique({
+          where: { id: invitationId },
+          include: { circle: true },
+        }),
+      ]);
       if (!verifierRecord) {
         throw new NotFoundException({
           message: 'No pending verification found for you',
           errorCode: CircleInvitationErrorCode.NoPendingVerification,
         });
       }
-
-      const invitation = await tx.circleInvitation.findUnique({
-        where: { id: invitationId },
-        include: { circle: true },
-      });
       if (!invitation || invitation.status !== 'PENDING') {
         throw new BadRequestException({
           message: 'Invitation is no longer pending',
@@ -463,6 +493,22 @@ export class CircleInvitationService {
     }
 
     const result = await this.runInvitationTransaction(async (tx) => {
+      const application = await tx.circleInvitation.findUnique({
+        where: { id: invitationId },
+        select: { circleID: true, applicantID: true },
+      });
+      if (!application) {
+        throw new NotFoundException({
+          message: 'Invitation not found',
+          errorCode: CircleInvitationErrorCode.NotFound,
+        });
+      }
+      const pairKey = circleApplicationLockKey(
+        application.circleID,
+        application.applicantID,
+      );
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
       const pendingInvitation = await tx.circleInvitation.findUnique({
         where: { id: invitationId },
         include: { circle: true },
@@ -547,67 +593,85 @@ export class CircleInvitationService {
    */
   @Cron(CronExpression.EVERY_5_MINUTES)
   async reconcileApprovedInvitations(): Promise<number> {
-    const candidates = await this.prisma.circleInvitation.findMany({
-      where: { status: 'PENDING' },
-      orderBy: { updatedAt: 'asc' },
-      take: 100,
-      include: { circle: true },
-    });
+    const candidates = await this.prisma.$queryRaw<
+      Array<{ id: string; circleID: string; applicantID: string }>
+    >`
+      SELECT "id", "circleID", "applicantID"
+      FROM "CircleInvitation"
+      WHERE "status" = 'PENDING'
+        AND "approvedCount" >= "requiredCount"
+      ORDER BY "updatedAt" ASC, "id" ASC
+      LIMIT 100
+    `;
     let finalizedCount = 0;
     for (const candidate of candidates) {
-      if (candidate.approvedCount < candidate.requiredCount) continue;
-      const result = await this.runInvitationTransaction(async (tx) => {
-        const invitation = await tx.circleInvitation.findUnique({
-          where: { id: candidate.id },
-          include: { circle: true },
+      try {
+        const result = await this.runInvitationTransaction(async (tx) => {
+          const pairKey = circleApplicationLockKey(
+            candidate.circleID,
+            candidate.applicantID,
+          );
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+          const invitation = await tx.circleInvitation.findUnique({
+            where: { id: candidate.id },
+            include: { circle: true },
+          });
+          if (
+            !invitation ||
+            invitation.status !== 'PENDING' ||
+            invitation.approvedCount < invitation.requiredCount
+          ) {
+            return null;
+          }
+          const changed = await tx.circleInvitation.updateMany({
+            where: { id: invitation.id, status: 'PENDING' },
+            data: { status: 'APPROVED' },
+          });
+          if (changed.count === 0) return null;
+          const admitted = await this.admitApplicant(
+            tx,
+            invitation.circleID,
+            invitation.applicantID,
+          );
+          return {
+            admitted,
+            applicantId: invitation.applicantID,
+            circleId: invitation.circleID,
+            groupID: invitation.circle.groupID,
+            notificationData: {
+              toUserID: invitation.applicantID,
+              fromUserID: invitation.inviterID,
+              type: 'CIRCLE_INVITATION_APPROVED' as const,
+              fromCircleID: invitation.circleID,
+              fromInvitationID: invitation.id,
+            },
+          };
         });
-        if (
-          !invitation ||
-          invitation.status !== 'PENDING' ||
-          invitation.approvedCount < invitation.requiredCount
-        ) {
-          return null;
-        }
-        const changed = await tx.circleInvitation.updateMany({
-          where: { id: invitation.id, status: 'PENDING' },
-          data: { status: 'APPROVED' },
-        });
-        if (changed.count === 0) return null;
-        const admitted = await this.admitApplicant(
-          tx,
-          invitation.circleID,
-          invitation.applicantID,
+        if (!result) continue;
+        finalizedCount += 1;
+        await this.syncApplicantToGroup(
+          result.admitted ? result.groupID : null,
+          result.admitted ? result.applicantId : undefined,
         );
-        return {
-          admitted,
-          applicantId: invitation.applicantID,
-          groupID: invitation.circle.groupID,
-          notificationData: {
-            toUserID: invitation.applicantID,
-            fromUserID: invitation.inviterID,
-            type: 'CIRCLE_INVITATION_APPROVED' as const,
-            fromCircleID: invitation.circleID,
-            fromInvitationID: invitation.id,
+        await this.createAndBroadcastInvitationNotification(
+          result.notificationData,
+        );
+        this.realtimeService.broadcastCircleInvitationReviewed(
+          result.applicantId,
+          {
+            invitationId: candidate.id,
+            circleId: result.circleId,
+            status: 'APPROVED',
           },
-        };
-      });
-      if (!result) continue;
-      finalizedCount += 1;
-      await this.syncApplicantToGroup(
-        result.admitted ? result.groupID : null,
-        result.admitted ? result.applicantId : undefined,
-      );
-      await this.createAndBroadcastInvitationNotification(
-        result.notificationData,
-      );
-      this.realtimeService.broadcastCircleInvitationReviewed(
-        result.applicantId,
-        {
-          invitationId: candidate.id,
-          circleId: candidate.circleID,
-          status: 'APPROVED',
-        },
-      );
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Circle invitation reconciliation failed for ${candidate.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
     return finalizedCount;
   }
@@ -632,6 +696,7 @@ export class CircleInvitationService {
     // Single hydrated query — no N+1 over individual invitation loads.
     const invitations = await this.prisma.circleInvitation.findMany({
       where: {
+        status: 'PENDING',
         verifiers: { some: { verifierID: userId, status: 'PENDING' } },
       },
       orderBy: { createdAt: 'desc' },

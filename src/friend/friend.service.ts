@@ -314,6 +314,7 @@ export class FriendService {
       toUserId: targetId,
       fromUserId: senderId,
       content: message ?? '',
+      requestId: request.id,
     });
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -621,6 +622,7 @@ export class FriendService {
       toUserId: record.userID,
       fromUserId: recipientId,
       content: nextRequest.message ?? '',
+      requestId: nextRequest.id,
     });
     // Accepted-thread replay is handled by the durable outbox processor; accept
     // itself never makes external OpenIM calls.

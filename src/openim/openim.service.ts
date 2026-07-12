@@ -4,7 +4,7 @@ import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
-const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
+export const OPENIM_REQUEST_TIMEOUT_MS = 5_000;
 const OPENIM_ADMIN_TOKEN_FAILURE_COOLDOWN_MS = 30_000;
 const OPENIM_HTTP_ERROR_BODY_LIMIT = 300;
 

@@ -12,6 +12,7 @@ import { CircleErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
+import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import {
   CircleDetailDto,
   CircleDto,
@@ -272,7 +273,7 @@ export class CircleService {
       try {
         invitationId = await this.prisma.$transaction(
           async (tx) => {
-            const pairKey = `circle-invite:${circleId}:${userId}`;
+            const pairKey = circleApplicationLockKey(circleId, userId);
             await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
             const existing = await tx.circleMember.findUnique({
@@ -389,7 +390,26 @@ export class CircleService {
     });
 
     await this.prisma.$transaction(async (tx) => {
-      const wasActive = membership.status === 'ACTIVE';
+      const pairKey = circleApplicationLockKey(circleId, userId);
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+
+      const lockedMembership = await tx.circleMember.findUnique({
+        where: { userID_circleID: { userID: userId, circleID: circleId } },
+      });
+      if (!lockedMembership) {
+        throw new NotFoundException({
+          message: 'Not a member',
+          errorCode: CircleErrorCode.NotMember,
+        });
+      }
+      if (lockedMembership.role === 'OWNER') {
+        throw new ForbiddenException({
+          message: 'Owner cannot leave — transfer ownership first',
+          errorCode: CircleErrorCode.OwnerCannotLeave,
+        });
+      }
+
+      const wasActive = lockedMembership.status === 'ACTIVE';
 
       if (!wasActive) {
         await tx.circleInvitation.updateMany({
@@ -405,7 +425,7 @@ export class CircleService {
       await tx.userDisplayIcon.deleteMany({
         where: { userID: userId, circleID: circleId },
       });
-      await tx.circleMember.delete({ where: { id: membership.id } });
+      await tx.circleMember.delete({ where: { id: lockedMembership.id } });
 
       if (wasActive) {
         await tx.circle.update({

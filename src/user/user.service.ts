@@ -298,11 +298,14 @@ export class UserService {
       if (input.nickname !== undefined || input.avatarUrl !== undefined) {
         await tx.userProfileSyncOutbox.upsert({
           where: { userID: id },
-          create: { userID: id },
+          create: { userID: id, generation: 1 },
           update: {
             status: 'PENDING',
+            generation: { increment: 1 },
+            attempts: 0,
+            lastError: null,
             nextAttemptAt: new Date(),
-            lockedAt: null,
+            processedAt: null,
           },
         });
       }

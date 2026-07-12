@@ -514,6 +514,7 @@ describe('FriendService', () => {
       toUserId: 'user-2',
       fromUserId: 'user-1',
       content: 'hello',
+      requestId: 'request-1',
     });
     expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
       'user-2',
@@ -1293,6 +1294,7 @@ describe('FriendService', () => {
       toUserId: 'user-1',
       fromUserId: 'user-2',
       content: 'hello',
+      requestId: 'request-1',
     });
     expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
       'user-1',
@@ -1764,6 +1766,7 @@ describe('FriendService', () => {
       toUserId: 'user-1',
       fromUserId: 'user-2',
       content: 'hello',
+      requestId: 'request-1',
     });
     expect(realtimeService.broadcastNotificationCreated).toHaveBeenCalledWith(
       'user-1',
