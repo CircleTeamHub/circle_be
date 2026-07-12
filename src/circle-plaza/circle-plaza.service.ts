@@ -232,62 +232,76 @@ export class CirclePlazaService {
     // 主城市 city = cities[0]，兼容旧字段/旧客户端。
     const cities = this.normalizePostCities(dto.cities, dto.city);
     const primaryCity = cities[0] ?? null;
-
-    const post = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.circlePost.create({
-        data: {
-          content: dto.content,
-          images: dto.images ?? [],
-          tags: dto.tags ?? [],
-          city: primaryCity,
-          cities,
-          isHorn: dto.isHorn ?? false,
-          noteID: dto.noteId ?? null,
-          vipRestriction: dto.vipRestriction ?? null,
-          creditRestriction: dto.creditRestriction ?? null,
-          fancyRestriction: dto.fancyRestriction ?? false,
-          signupVipRestriction: dto.signupVipRestriction ?? null,
-          signupCreditRestriction: dto.signupCreditRestriction ?? null,
-          signupFancyRestriction: dto.signupFancyRestriction ?? false,
-          authorID: userId,
-          expiresAt,
-          circleID: primaryCircleId,
-          // 关联表：主圈子 + 其余圈子都建一条 link。
-          circleLinks: {
-            create: circleIds.map((circleId) => ({
-              circle: { connect: { id: circleId } },
-            })),
-          },
-        },
-        include: {
-          author: true,
-          circle: true,
-          circleLinks: { include: { circle: true } },
-        },
-      });
-
-      // 每个圈子的 postCount 都 +1。
-      await tx.circle.updateMany({
-        where: { id: { in: circleIds } },
-        data: { postCount: { increment: 1 } },
-      });
-
-      return created;
-    });
-
-    // 新帖发布：后台扇出「新活动」通知给圈子成员（snackbar + 铃铛 + 推送），方便大家
-    // 及时报名。fire-and-forget、best-effort——绝不阻塞发帖响应，扇出失败也不影响发帖。
-    void this.notifyCirclePostPublished({
-      id: post.id,
-      authorID: post.authorID,
+    const publishRecipientIds = await this.getCirclePostPublishRecipientIds(
+      userId,
       circleIds,
-    }).catch((error) => {
-      this.logger.error(
-        `circle post publish fan-out failed (post=${post.id}): ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
+    );
+
+    const { post, publishedNotifications } = await this.prisma.$transaction(
+      async (tx) => {
+        const created = await tx.circlePost.create({
+          data: {
+            content: dto.content,
+            images: dto.images ?? [],
+            tags: dto.tags ?? [],
+            city: primaryCity,
+            cities,
+            isHorn: dto.isHorn ?? false,
+            noteID: dto.noteId ?? null,
+            vipRestriction: dto.vipRestriction ?? null,
+            creditRestriction: dto.creditRestriction ?? null,
+            fancyRestriction: dto.fancyRestriction ?? false,
+            signupVipRestriction: dto.signupVipRestriction ?? null,
+            signupCreditRestriction: dto.signupCreditRestriction ?? null,
+            signupFancyRestriction: dto.signupFancyRestriction ?? false,
+            authorID: userId,
+            expiresAt,
+            circleID: primaryCircleId,
+            // 关联表：主圈子 + 其余圈子都建一条 link。
+            circleLinks: {
+              create: circleIds.map((circleId) => ({
+                circle: { connect: { id: circleId } },
+              })),
+            },
+          },
+          include: {
+            author: true,
+            circle: true,
+            circleLinks: { include: { circle: true } },
+          },
+        });
+
+        // 每个圈子的 postCount 都 +1。
+        await tx.circle.updateMany({
+          where: { id: { in: circleIds } },
+          data: { postCount: { increment: 1 } },
+        });
+
+        const notifications =
+          await this.notificationService.createCirclePostPublishedNotifications(
+            tx,
+            {
+              postId: created.id,
+              fromUserId: userId,
+              recipientIds: publishRecipientIds,
+            },
+          );
+
+        return { post: created, publishedNotifications: notifications };
+      },
+    );
+
+    for (const { toUserId, notification } of publishedNotifications) {
+      try {
+        this.realtime.broadcastNotificationCreated(toUserId, notification);
+      } catch (error) {
+        this.logger.error(
+          `circle post publish realtime broadcast failed (post=${post.id}, user=${toUserId}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
 
     const displayIconsByAuthor = await this.getDisplayIconsByAuthorIds([
       post.author.id,
@@ -303,68 +317,37 @@ export class CirclePlazaService {
   }
 
   /**
-   * 发帖后台扇出：给目标圈子的 ACTIVE 成员（排除作者本人、与作者存在任一方向拉黑
-   * 关系者，并跨多圈去重）发「新活动」通知——批量落库 + 逐人 realtime 广播（驱动
-   * snackbar/铃铛），推送在通知服务内 best-effort 发出。收件人超过上限时截断并记
-   * 日志（非静默）。整体 best-effort：任何失败都不影响已提交的发帖。
+   * Resolve a deterministic, capped set of ACTIVE recipients before the post
+   * transaction. Bidirectional blocks are excluded by the database query.
    */
-  private async notifyCirclePostPublished(post: {
-    id: string;
-    authorID: string;
-    circleIds: string[];
-  }): Promise<void> {
+  private async getCirclePostPublishRecipientIds(
+    authorId: string,
+    circleIds: string[],
+  ): Promise<string[]> {
     const members = await this.prisma.circleMember.findMany({
       where: {
-        circleID: { in: post.circleIds },
+        circleID: { in: circleIds },
         status: 'ACTIVE',
-        userID: { not: post.authorID },
+        userID: { not: authorId },
+        user: {
+          blocksIssued: { none: { blockedID: authorId } },
+          blocksReceived: { none: { blockerID: authorId } },
+        },
       },
       select: { userID: true },
       distinct: ['userID'],
+      orderBy: { userID: 'asc' },
       take: CIRCLE_POST_PUBLISH_FANOUT_CAP + 1,
     });
-    let recipientIds = members.map((m) => m.userID);
-    if (recipientIds.length === 0) {
-      return;
-    }
 
-    // 排除与作者存在（任一方向）拉黑关系的成员。
-    const blocks = await this.prisma.block.findMany({
-      where: {
-        OR: [
-          { blockerID: post.authorID, blockedID: { in: recipientIds } },
-          { blockerID: { in: recipientIds }, blockedID: post.authorID },
-        ],
-      },
-      select: { blockerID: true, blockedID: true },
-    });
-    if (blocks.length > 0) {
-      const blocked = new Set<string>();
-      for (const b of blocks) {
-        blocked.add(b.blockerID === post.authorID ? b.blockedID : b.blockerID);
-      }
-      recipientIds = recipientIds.filter((id) => !blocked.has(id));
-    }
-
-    if (recipientIds.length > CIRCLE_POST_PUBLISH_FANOUT_CAP) {
+    if (members.length > CIRCLE_POST_PUBLISH_FANOUT_CAP) {
       this.logger.warn(
-        `circle post publish fan-out capped at ${CIRCLE_POST_PUBLISH_FANOUT_CAP} recipients (post=${post.id}, eligible=${recipientIds.length})`,
+        `circle post publish fan-out capped at ${CIRCLE_POST_PUBLISH_FANOUT_CAP} recipients (author=${authorId}, eligible>${CIRCLE_POST_PUBLISH_FANOUT_CAP})`,
       );
-      recipientIds = recipientIds.slice(0, CIRCLE_POST_PUBLISH_FANOUT_CAP);
     }
-    if (recipientIds.length === 0) {
-      return;
-    }
-
-    const results =
-      await this.notificationService.createCirclePostPublishedNotifications({
-        postId: post.id,
-        fromUserId: post.authorID,
-        recipientIds,
-      });
-    for (const { toUserId, notification } of results) {
-      this.realtime.broadcastNotificationCreated(toUserId, notification);
-    }
+    return members
+      .slice(0, CIRCLE_POST_PUBLISH_FANOUT_CAP)
+      .map(({ userID }) => userID);
   }
 
   async getFeed(
@@ -510,16 +493,33 @@ export class CirclePlazaService {
       // 区分「非本圈成员」与「帖子真的不存在/已删/已过期」：去掉成员可见性再查一次。
       // 若帖子仍存在(仅因 viewer 非成员而被过滤)，回传主圈子信息，让前端提示「申请加入」。
       const visible = await this.prisma.circlePost.findFirst({
-        where: { ...this.activeUnexpiredPostWhere(), id: postId },
-        select: { circle: { select: { id: true, name: true } } },
+        where: {
+          ...this.activeUnexpiredPostWhere(),
+          id: postId,
+          circleLinks: { some: { circle: { deleted: false } } },
+        },
+        select: {
+          circle: { select: { id: true, name: true, deleted: true } },
+          circleLinks: {
+            where: { circle: { deleted: false } },
+            select: { circle: { select: { id: true, name: true } } },
+            take: 1,
+          },
+        },
       });
+      let joinCircle: { id: string; name: string } | null = null;
       if (visible) {
+        joinCircle = visible.circle.deleted
+          ? (visible.circleLinks[0]?.circle ?? null)
+          : visible.circle;
+      }
+      if (joinCircle) {
         throw new ForbiddenException({
           message: 'You are not a member of this circle',
           errorCode: PlazaErrorCode.NotCircleMember,
           details: {
-            circleId: visible.circle.id,
-            circleName: visible.circle.name,
+            circleId: joinCircle.id,
+            circleName: joinCircle.name,
           },
         });
       }
@@ -595,7 +595,13 @@ export class CirclePlazaService {
     reason?: string,
   ): Promise<{ reported: boolean }> {
     const post = await this.prisma.circlePost.findFirst({
-      where: { id: postId },
+      where: {
+        ...this.activeUnexpiredPostWhere(),
+        id: postId,
+        circleLinks: {
+          some: { circle: this.memberCircleScope(userId) },
+        },
+      },
       select: { id: true, authorID: true },
     });
     if (!post) {

@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { NotificationType } from 'src/generated/prisma';
+import { NotificationType, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
@@ -369,16 +369,18 @@ export class NotificationService {
   }
 
   /**
-   * "XX 在圈子发布了新活动" —— 圈子有新帖发布时，扇出通知给圈子成员，好让大家
-   * 及时报名。一次 createMany 批量落库 + 一次回查带 fromUser/fromCirclePost 的 DTO，
-   * 避免逐人往返；返回每位收件人的 DTO，交给调用方广播(snackbar/铃铛)+推送。
+   * "XX 在圈子发布了新活动" —— 在调用方事务内批量落库通知及 durable push
+   * outbox，再回查带 fromUser/fromCirclePost 的 DTO 供提交后 realtime 广播。
    * recipientIds 由调用方保证已排除作者、被拉黑者、并去重。
    */
-  async createCirclePostPublishedNotifications(params: {
-    postId: string;
-    fromUserId: string;
-    recipientIds: string[];
-  }): Promise<
+  async createCirclePostPublishedNotifications(
+    tx: Prisma.TransactionClient,
+    params: {
+      postId: string;
+      fromUserId: string;
+      recipientIds: string[];
+    },
+  ): Promise<
     Array<{ toUserId: string; notification: NotificationRealtimeDto }>
   > {
     const recipients = Array.from(
@@ -390,7 +392,7 @@ export class NotificationService {
       return [];
     }
 
-    await this.prisma.notification.createMany({
+    const created = await tx.notification.createManyAndReturn({
       data: recipients.map((toUserID) => ({
         toUserID,
         fromUserID: params.fromUserId,
@@ -398,25 +400,27 @@ export class NotificationService {
         fromCirclePostID: params.postId,
         content: '',
       })),
+      select: { id: true, toUserID: true },
     });
 
-    // 回查刚插入的这批行（同作者 + 同类型 + 同帖子 + 这批收件人唯一确定它们），
-    // 带上 realtime include 以构造 snackbar/推送所需的 DTO。
-    const rows = await this.prisma.notification.findMany({
-      where: {
-        toUserID: { in: recipients },
-        fromUserID: params.fromUserId,
-        type: NotificationType.CIRCLE_POST_PUBLISHED,
-        fromCirclePostID: params.postId,
-      },
+    await tx.notificationPushOutbox.createMany({
+      data: created.map(({ id }) => ({ notificationID: id })),
+    });
+
+    const rows = await tx.notification.findMany({
+      where: { id: { in: created.map(({ id }) => id) } },
       include: NOTIFICATION_REALTIME_INCLUDE,
     });
 
-    return rows.map((row) => {
-      const notification = mapNotificationRealtimeDto(row);
-      void this.sendPushBestEffort(row.toUserID, notification);
-      return { toUserId: row.toUserID, notification };
-    });
+    return rows
+      .filter(
+        (row): row is typeof row & { toUserID: string } =>
+          typeof row.toUserID === 'string',
+      )
+      .map((row) => ({
+        toUserId: row.toUserID,
+        notification: mapNotificationRealtimeDto(row),
+      }));
   }
 
   async createCircleInvitationNotification(data: {

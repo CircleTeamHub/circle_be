@@ -2,7 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationService } from './notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { NotificationType } from 'src/generated/prisma';
+import { NotificationType, Prisma } from 'src/generated/prisma';
 import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
 import { NotificationPushService } from './notification-push.service';
 
@@ -16,6 +16,7 @@ describe('NotificationService', () => {
       count: jest.fn(),
       updateMany: jest.fn(),
       create: jest.fn(),
+      createManyAndReturn: jest.fn(),
     },
     devicePushToken: {
       upsert: jest.fn(),
@@ -24,6 +25,7 @@ describe('NotificationService', () => {
     notificationPushOutbox: {
       upsert: jest.fn(),
       create: jest.fn(),
+      createMany: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) =>
       typeof operation === 'function'
@@ -483,6 +485,100 @@ describe('NotificationService', () => {
           },
         }),
       );
+    });
+
+    it('creates published-post notifications and push outbox rows in the supplied transaction', async () => {
+      const baseRow = {
+        type: NotificationType.CIRCLE_POST_PUBLISHED,
+        content: '',
+        read: false,
+        createdAt: new Date('2026-06-29T12:00:00Z'),
+        fromUser: { id: 'author-1', nickname: 'Host', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: null,
+        fromCirclePost: { id: 'post-1', content: 'hi', images: [] },
+        fromInvitation: null,
+        fromFriendRequest: null,
+      };
+      const tx = {
+        notification: {
+          createManyAndReturn: jest.fn().mockResolvedValue([
+            { id: 'n2', toUserID: 'member-2' },
+            { id: 'n3', toUserID: 'member-3' },
+          ]),
+          findMany: jest.fn().mockResolvedValue([
+            { ...baseRow, id: 'n2', toUserID: 'member-2' },
+            { ...baseRow, id: 'n3', toUserID: 'member-3' },
+          ]),
+        },
+        notificationPushOutbox: {
+          createMany: jest.fn().mockResolvedValue({ count: 2 }),
+        },
+      } as unknown as Prisma.TransactionClient;
+
+      const result = await service.createCirclePostPublishedNotifications(tx, {
+        postId: 'post-1',
+        fromUserId: 'author-1',
+        recipientIds: ['member-2', 'member-3', 'author-1', 'member-2'],
+      });
+
+      expect(tx.notification.createManyAndReturn).toHaveBeenCalledWith({
+        data: [
+          {
+            toUserID: 'member-2',
+            fromUserID: 'author-1',
+            type: NotificationType.CIRCLE_POST_PUBLISHED,
+            fromCirclePostID: 'post-1',
+            content: '',
+          },
+          {
+            toUserID: 'member-3',
+            fromUserID: 'author-1',
+            type: NotificationType.CIRCLE_POST_PUBLISHED,
+            fromCirclePostID: 'post-1',
+            content: '',
+          },
+        ],
+        select: { id: true, toUserID: true },
+      });
+      expect(tx.notificationPushOutbox.createMany).toHaveBeenCalledWith({
+        data: [{ notificationID: 'n2' }, { notificationID: 'n3' }],
+      });
+      expect(tx.notification.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['n2', 'n3'] } },
+        include: expect.any(Object),
+      });
+      expect(pushService.sendNotification).not.toHaveBeenCalled();
+      expect(result.map(({ toUserId }) => toUserId)).toEqual([
+        'member-2',
+        'member-3',
+      ]);
+    });
+
+    it('propagates push outbox creation failure to the caller transaction', async () => {
+      const outboxError = new Error('outbox unavailable');
+      const tx = {
+        notification: {
+          createManyAndReturn: jest
+            .fn()
+            .mockResolvedValue([{ id: 'n2', toUserID: 'member-2' }]),
+          findMany: jest.fn(),
+        },
+        notificationPushOutbox: {
+          createMany: jest.fn().mockRejectedValue(outboxError),
+        },
+      } as unknown as Prisma.TransactionClient;
+
+      await expect(
+        service.createCirclePostPublishedNotifications(tx, {
+          postId: 'post-1',
+          fromUserId: 'author-1',
+          recipientIds: ['member-2'],
+        }),
+      ).rejects.toBe(outboxError);
+      expect(tx.notification.findMany).not.toHaveBeenCalled();
+      expect(pushService.sendNotification).not.toHaveBeenCalled();
     });
 
     it('markAllNotificationsRead returns count', async () => {
