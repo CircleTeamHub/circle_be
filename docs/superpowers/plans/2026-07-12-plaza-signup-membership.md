@@ -359,7 +359,9 @@ Run:
 
 ```bash
 npm test -- --runInBand src/circle-plaza/circle-plaza.service.spec.ts
-npx jest --config ./test/jest-e2e.json --runInBand test/circle-plaza-signup.e2e-spec.ts
+NODE_ENV=test \
+DATABASE_URL='postgresql://postgres:postgres@localhost:55432/circle_signup_test?schema=public' \
+  npx jest --config ./test/jest-e2e.json --runInBand test/circle-plaza-signup.e2e-spec.ts
 ```
 
 Expected: both suites pass, including the real-relation authorization matrix.
@@ -410,6 +412,15 @@ git diff --stat main...HEAD
 Expected: no whitespace errors, a clean worktree, and only the scoped design,
 plan, service, test-infrastructure, and signup e2e changes.
 
+- [ ] **Step 4: Stop the disposable database**
+
+```bash
+docker rm -f circle-signup-test-db
+```
+
+Expected: the dedicated local test container is removed. Run this cleanup even
+if an earlier verification command fails.
+
 ### Task 4: Retire the obsolete detached worktree
 
 **Files:**
@@ -425,11 +436,12 @@ git -C /Users/yiboding/.codex/worktrees/390b/circle_be \
   diff --binary > /Users/yiboding/.codex/backups/circle_be-390b-2026-07-12.patch
 test -s /Users/yiboding/.codex/backups/circle_be-390b-2026-07-12.patch
 git -C /Users/yiboding/.codex/worktrees/390b/circle_be \
-  apply --check /Users/yiboding/.codex/backups/circle_be-390b-2026-07-12.patch
+  apply --check --reverse /Users/yiboding/.codex/backups/circle_be-390b-2026-07-12.patch
 ```
 
 Expected: exactly four modified tracked files, no untracked files, a non-empty
-patch, and a successful `git apply --check` against the detached base.
+patch, and a successful reverse-apply check proving the patch matches the dirty
+detached worktree exactly.
 
 - [ ] **Step 2: Reconfirm the remaining detached diffs are superseded**
 
