@@ -484,6 +484,7 @@ describe('CirclePlazaService', () => {
       signupVipRestriction: null,
       signupCreditRestriction: null,
       signupFancyRestriction: false,
+      circleLinks: [{ circle: { id: 'circle-1', name: 'Board games' } }],
       author: {
         id: 'user-1',
         nickname: 'Host',
@@ -866,6 +867,7 @@ describe('CirclePlazaService', () => {
       signupVipRestriction: null,
       signupCreditRestriction: null,
       signupFancyRestriction: false,
+      circleLinks: [{ id: 'link-1' }],
     };
     const eligibleViewer = {
       vipLevel: 9,
@@ -903,6 +905,54 @@ describe('CirclePlazaService', () => {
         'author-1',
         notification,
       );
+    });
+
+    it('loads the signer membership match from linked circles before signup', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
+
+      await service.signupForPost('user-2', 'post-1');
+
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 'post-1',
+            circleLinks: { some: { circle: { deleted: false } } },
+          }),
+          select: expect.objectContaining({
+            circleLinks: {
+              where: {
+                circle: {
+                  deleted: false,
+                  members: {
+                    some: { userID: 'user-2', status: 'ACTIVE' },
+                  },
+                },
+              },
+              select: { id: true },
+              take: 1,
+            },
+          }),
+        }),
+      );
+    });
+
+    it('rejects new signup when the signer has no ACTIVE linked-circle membership', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        ...activePost,
+        circleLinks: [],
+      });
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
     });
 
     it('is idempotent when already signed up', async () => {
@@ -1538,6 +1588,7 @@ describe('CirclePlazaService', () => {
       signupVipRestriction: 3,
       signupCreditRestriction: null,
       signupFancyRestriction: false,
+      circleLinks: [{ id: 'link-1' }],
     };
 
     it('rejects signup when viewer VIP below signup restriction', async () => {
