@@ -907,6 +907,49 @@ describe('CirclePlazaService', () => {
       );
     });
 
+    it('rechecks active linked-circle membership inside the serializable signup transaction', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+
+      const result = await service.signupForPost('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: true, signupCount: 3 });
+      expect(prisma.$transaction).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({ isolationLevel: 'Serializable' }),
+      );
+      expect(prisma.circlePost.findFirst).toHaveBeenNthCalledWith(2, {
+        where: {
+          status: 'ACTIVE',
+          OR: [
+            { expiresAt: { gt: expect.any(Date) } },
+            {
+              expiresAt: null,
+              createdAt: { gt: expect.any(Date) },
+            },
+          ],
+          id: 'post-1',
+          circleLinks: {
+            some: {
+              circle: {
+                deleted: false,
+                members: {
+                  some: { userID: 'user-2', status: 'ACTIVE' },
+                },
+              },
+            },
+          },
+        },
+        select: { id: true },
+      });
+      expect(prisma.circlePostSignup.create).toHaveBeenCalledWith({
+        data: { postID: 'post-1', userID: 'user-2' },
+      });
+    });
+
     it('rejects a new signup without an active linked-circle membership', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         ...activePost,
