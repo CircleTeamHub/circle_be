@@ -132,12 +132,16 @@ push tag v* ──► release.yml:
 ```
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
 → prisma migrate deploy(用发布镜像跑)
-→ 起另一色容器(circle_be / circle_be_green 交替,共享 DNS 别名 circle-be-app)
-→ 容器健康门禁(300s)→ 停旧色(保留容器)→ 走公网域名烟测
-→ 通过:删旧色,完成;失败:自动重启旧色回滚,CI 标红
+→ 起另一色容器(circle_be / circle_be_green 交替)
+→ 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色 → 走公网域名烟测
+→ 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
 ```
 
-Caddy 只 upstream 到别名 `circle-be-app:3000` 且带 30s 拨号重试(Caddyfile.admin),
+Caddy 通过 `CIRCLE_BE_UPSTREAM` 明确选择在役颜色，并把选择原子写入
+`.release/active-color`；中断重跑时会先恢复记录的颜色，不会猜测。每次切换先
+`caddy validate`，再 `caddy reload`，任一步失败都会保留或恢复旧实例。
+公网 API 烟测固定请求 `/api/v1/auth/me`，只接受 `401/403` 且 `Content-Type`
+为 JSON，SPA 的 `200 text/html` 不会被误判为成功。
 两色交接期间请求不会落到 502 —— 正常发版**零停机**。
 postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 `.env` / `.env.production` 被 rsync 排除并保护,不会被发版覆盖或删除。
@@ -157,7 +161,7 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 | Variable | `DEPLOY_HOST` | 服务器公网 IP 或域名 |
 | Variable | `DEPLOY_USER` | 可选,默认 `ubuntu` |
 | Variable | `DEPLOY_PATH` | 可选,默认 `circle_be`(相对远端 $HOME) |
-| Variable | `API_SMOKE_URL` | 可选,如 `https://<API域名>/api/v1/auth/me`;设了则 runner 侧再做一次外部视角烟测 |
+| Variable | `API_SMOKE_URL` | 可选，必须指向无需凭据时返回 `401/403` JSON 的已知 API 路由，如 `https://<API域名>/api/v1/auth/me`；设了则 runner 侧再做一次外部视角烟测 |
 
 镜像推/拉全用内置 `GITHUB_TOKEN`,无需额外 PAT;服务器只在部署那一刻用临时 token
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,
@@ -190,8 +194,8 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   (overlay `docker-compose.admin-release.yml`,只动 admin_web 一个服务,
   与 circle_be 发版共用互斥锁)。它需要的 secrets/vars 与上表相同 ——
   建议配成 **组织级** secrets,两个仓库共用。
-  **顺序要求**:先部署本仓库变更，让 Caddy 接管管理域名的 `/api/*` 并直连蓝绿
-  别名 `circle-be-app`，再发布只提供静态文件的 admin_web 镜像。
+  **顺序要求**:先部署本仓库变更，让 Caddy 接管管理域名的 `/api/*` 并根据
+  `CIRCLE_BE_UPSTREAM` 直连当前在役颜色，再发布只提供静态文件的 admin_web 镜像。
 - **App(风信,Expo/RN)**:workflow 在 `Circle_frontend` 仓库
   (`release-android.yml`,tag `v*` 触发):全量质量门禁 → 用正式 keystore 构建
   release APK(版本号取自 tag)→ 挂到 GitHub Release + Discord 通知。
