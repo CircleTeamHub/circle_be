@@ -1,0 +1,449 @@
+# Promote half of the build-once-promote release architecture.
+#
+# Pushing a `v*` tag (or dispatching this workflow with an existing tag)
+# releases that commit to the Oracle ARM server:
+#
+#   resolve   — pin the tag to a commit, require it to be on main with a green
+#               CI run (main is where the full test matrix runs), and check
+#               whether build-image.yml already pushed `sha-<commit>` to GHCR
+#   build     — fallback only: rebuild the image if the sha image is missing
+#   promote   — stamp the existing sha image with the immutable version tag
+#               (`buildx imagetools create` — a manifest copy, no rebuild), so
+#               the deployed artifact is byte-identical to what CI validated
+#   deploy    — rsync the tagged repo to the server and run
+#               deploy/release-deploy.sh: DB backup → migrate → start the
+#               standby color → health gate → switch → public smoke test,
+#               with automatic rollback if the new version fails
+#   publish   — GitHub Release with generated notes (tag pushes only)
+#   notify    — Discord, success or failure, always
+#
+# Rollback / redeploy: run this workflow manually (workflow_dispatch) with any
+# previously released tag. `downtime: true` switches the server script to
+# stop-first mode for migrations that are not backward-compatible.
+#
+# One-time setup (repo Settings) is documented in DEPLOY.md §6:
+#   secrets: DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS (optional), DISCORD_WEBHOOK_URL
+#   variables: DEPLOY_HOST, DEPLOY_USER (default ubuntu), DEPLOY_PATH (default circle_be)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to (re)deploy — rollback = dispatch an older tag"
+        required: true
+        type: string
+      downtime:
+        description: "Stop the old version before migrating (breaking migrations only)"
+        type: boolean
+        default: false
+      force:
+        description: "Skip the CI-green check (e.g. redeploying an old tag whose runs expired)"
+        type: boolean
+        default: false
+
+# Never cancel a release mid-deploy when another tag lands; queue it instead.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    name: "Resolve & verify release"
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # list CI runs for the tagged commit
+      packages: read # probe GHCR for the prebuilt sha image
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.verify.outputs.sha }}
+      sha_image: ${{ steps.image.outputs.sha_image }}
+      release_image: ${{ steps.image.outputs.release_image }}
+      exists: ${{ steps.image.outputs.exists }}
+    steps:
+      - name: Determine release tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then TAG="$INPUT_TAG"; else TAG="$REF_NAME"; fi
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "Refusing to release non-version tag: $TAG" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Notify release start
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then exit 0; fi
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          jq -n --arg content "🏁 Release $RELEASE_TAG started ($GITHUB_EVENT_NAME) — the server will be updated once verification passes. $RUN_URL" \
+            '{username: "GitHub Actions", content: $content}' |
+            curl --fail-with-body -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL" ||
+            echo "warning: release start notification failed; continuing release."
+
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0 # need origin/main for the ancestor check
+
+      # Releases deploy only commits that main's full CI matrix has validated.
+      # That check replaces re-running tests here — by design the release path
+      # never produces a "tested differently" artifact.
+      - name: Verify tag commit is on main
+        id: verify
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "Tag ${{ steps.tag.outputs.tag }} ($SHA) is not an ancestor of origin/main." >&2
+            echo "Releases must point at commits that went through main (PR + full CI)." >&2
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify CI succeeded for this commit
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.force) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // ""')"
+          if [ "$conclusion" != "success" ]; then
+            echo "CI for $SHA is '${conclusion:-not found}', not 'success'." >&2
+            echo "Fix CI (or, for old tags whose runs expired, dispatch with force: true)." >&2
+            exit 1
+          fi
+          echo "CI is green for $SHA"
+
+      - name: Check for prebuilt image
+        id: image
+        env:
+          SHA: ${{ steps.verify.outputs.sha }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sha_image="$repo:sha-$SHA"
+          release_image="$repo:$RELEASE_TAG"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$sha_image" >/dev/null 2>&1; then
+            exists=true
+            echo "Found prebuilt image: $sha_image (fast promote path)"
+          else
+            exists=false
+            echo "No prebuilt image for $SHA; the build job will rebuild it."
+          fi
+          {
+            echo "sha_image=$sha_image"
+            echo "release_image=$release_image"
+            echo "exists=$exists"
+          } >> "$GITHUB_OUTPUT"
+
+  # Fallback only: build-image.yml normally already pushed this exact image on
+  # the main push. Runs when that build failed, was cancelled, or was cleaned up.
+  build:
+    runs-on: ubuntu-latest
+    name: "Build image (fallback)"
+    needs: [resolve]
+    if: ${{ needs.resolve.outputs.exists != 'true' }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push sha image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prod
+          platforms: linux/arm64
+          push: true
+          tags: ${{ needs.resolve.outputs.sha_image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+          # Single tagged manifest per version (no attestation children) so
+          # cleanup-images.yml can prune versions safely.
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Stamp the sha image with the immutable version tag. A manifest copy inside
+  # GHCR — no layers move, takes seconds, and the digest (i.e. the artifact)
+  # provably equals what main built and tested.
+  promote:
+    runs-on: ubuntu-latest
+    name: "Promote image to version tag"
+    needs: [resolve, build]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag release image
+        env:
+          SHA_IMAGE: ${{ needs.resolve.outputs.sha_image }}
+          RELEASE_IMAGE: ${{ needs.resolve.outputs.release_image }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$RELEASE_IMAGE" "$SHA_IMAGE"
+          docker buildx imagetools inspect "$RELEASE_IMAGE"
+
+  deploy:
+    runs-on: ubuntu-latest
+    name: "Deploy to server"
+    needs: [resolve, promote]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read # the server pulls from GHCR with this job's ephemeral token
+    # Deploys run under the `production` environment so protection rules
+    # (required reviewers, wait timers) can be added in repo Settings without
+    # editing this file.
+    environment: production
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DEPLOY_SSH_KEY" ] || [ -z "$DEPLOY_HOST" ]; then
+            echo "Missing DEPLOY_SSH_KEY secret and/or DEPLOY_HOST variable." >&2
+            echo "Configure them in repo Settings (see DEPLOY.md §6) before releasing." >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$DEPLOY_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # Trust-on-first-use fallback. Pin the host key in the
+            # DEPLOY_KNOWN_HOSTS secret to close the MITM window.
+            echo "warning: DEPLOY_KNOWN_HOSTS not set; falling back to ssh-keyscan."
+            ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      # Same rsync contract as the manual flow (DEPLOY.md §3), with the
+      # server-generated secrets explicitly excluded so a release can never
+      # overwrite or delete .env / .env.production.
+      - name: Sync repo to server
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            --exclude=/.env \
+            --exclude=/.env.production \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude=dist \
+            --exclude=logs \
+            --exclude=coverage \
+            -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Roll out release on server
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          CIRCLE_BE_IMAGE: ${{ needs.resolve.outputs.release_image }}
+          RELEASE_DOWNTIME: ${{ inputs.downtime && '1' || '0' }}
+          # Ephemeral job token: lets the server pull from GHCR during this job
+          # only. The image stays in the local Docker cache afterwards, so
+          # restarts and cached rollbacks need no registry access.
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
+        run: |
+          set -euo pipefail
+          # Env travels over stdin (printf %q-escaped), never argv, so the
+          # registry token cannot show up in `ps` output on the server.
+          {
+            printf 'export RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
+              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$GHCR_USER" "$GHCR_TOKEN"
+            printf 'exec bash %q/deploy/release-deploy.sh\n' "$DEPLOY_PATH"
+          } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
+
+      # Outside-in verification from a network the server does not control:
+      # the runner probes the public API domain after the switch.
+      - name: External smoke check
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          API_SMOKE_URL: ${{ vars.API_SMOKE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$API_SMOKE_URL" ]; then
+            echo "vars.API_SMOKE_URL not set; skipping external smoke check."
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            code="$(curl -m 10 -s -o /dev/null -w '%{http_code}' "$API_SMOKE_URL" || echo 000)"
+            case "$code" in
+              2*|3*|401|403|404)
+                echo "external smoke ok (HTTP $code)"
+                exit 0
+                ;;
+            esac
+            sleep 5
+          done
+          echo "external smoke failed (last HTTP $code) — the server-side check passed," >&2
+          echo "so suspect DNS/firewall/CDN in front of $DEPLOY_HOST." >&2
+          exit 1
+
+  # Changelog comes from GitHub's generated notes (PRs/commits since the
+  # previous tag). Tag pushes only — a dispatch redeploy/rollback must not
+  # touch release history.
+  publish_release:
+    runs-on: ubuntu-latest
+    name: "Publish GitHub Release"
+    needs: [resolve, deploy]
+    if: ${{ github.event_name == 'push' }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: "Release ${{ needs.resolve.outputs.tag }}"
+          generate_release_notes: true
+
+  # Always report the outcome — a failed deploy must be as loud as a good one.
+  # This job only reports; the release result is the jobs above.
+  notify:
+    runs-on: ubuntu-latest
+    name: "Notify Discord"
+    needs: [resolve, build, promote, deploy, publish_release]
+    if: always()
+    timeout-minutes: 5
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      - name: Send Discord Notification
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag || github.ref_name }}
+          IMAGE: ${{ needs.resolve.outputs.release_image }}
+          PREBUILT: ${{ needs.resolve.outputs.exists }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          node <<'NODE' > payload.json
+          const needs = JSON.parse(process.env.NEEDS_JSON);
+          const jobLines = Object.entries(needs).map(
+            ([name, job]) => `${name}: ${job.result}`,
+          );
+          const failed = Object.values(needs).some((job) =>
+            ['failure', 'cancelled'].includes(job.result),
+          );
+          const mode =
+            process.env.PREBUILT === 'true'
+              ? 'promoted the image built on main'
+              : 'rebuilt at tag time';
+
+          const repo = process.env.GITHUB_REPOSITORY;
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const releaseUrl = `${process.env.GITHUB_SERVER_URL}/${repo}/releases/tag/${process.env.RELEASE_TAG}`;
+
+          const embed = {
+            author: {
+              name: failed ? '🚨 Release failed' : '🚀 Release deployed',
+            },
+            title: `${repo} ${process.env.RELEASE_TAG}`.slice(0, 256),
+            url: releaseUrl,
+            // GitHub colors: success = green (#1a7f37), failure = red (#cf222e).
+            color: failed ? 0xcf222e : 0x1a7f37,
+            fields: [
+              {
+                name: 'Image',
+                value: `${process.env.IMAGE || '(not resolved)'} — ${mode}`,
+              },
+              {
+                name: 'Trigger',
+                value: process.env.EVENT_NAME,
+                inline: true,
+              },
+              {
+                name: 'Jobs',
+                value: jobLines.join('\n'),
+              },
+              {
+                name: 'Run',
+                value: runUrl,
+              },
+            ],
+          };
+
+          process.stdout.write(
+            JSON.stringify({ username: 'GitHub Actions', embeds: [embed] }),
+          );
+          NODE
+
+          curl --fail-with-body \
+            -H 'Content-Type: application/json' \
+            -d @payload.json \
+            "$DISCORD_WEBHOOK_URL"

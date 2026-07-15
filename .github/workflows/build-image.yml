@@ -1,0 +1,100 @@
+# Build-once half of the build-once-promote release architecture.
+#
+# Every push to main cross-builds the production image for the Oracle ARM box
+# and pushes it to GHCR as `sha-<commit>` (immutable) plus a `main` convenience
+# tag. A release (release.yml) then *promotes* an existing sha image by
+# stamping it with the version tag — no rebuild — which guarantees the deployed
+# artifact is byte-identical to what main's CI validated, and keeps releases
+# down to minutes.
+#
+# If this build ever fails or its image is later evicted, release.yml falls
+# back to rebuilding at tag time, so a red run here delays nothing except the
+# fast path. Old sha- images are pruned by cleanup-images.yml; version tags are
+# kept forever.
+#
+# Cost knob: QEMU arm64 builds take ~8-25 min of (private-repo billed) runner
+# time per main push. If that bites, add `paths-ignore` for docs-only commits,
+# or switch `runs-on` to ubuntu-24.04-arm (free once the repo is public) and
+# drop the QEMU step.
+
+name: Build Image
+
+on:
+  push:
+    branches:
+      - main
+
+# A newer main build supersedes an in-flight one; release.yml's rebuild
+# fallback covers any sha this cancellation skips.
+concurrency:
+  group: build-image-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_push:
+    runs-on: ubuntu-latest
+    name: "Build & push linux/arm64 image"
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image repository
+        id: meta
+        # GHCR requires a lowercase repository path.
+        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prod
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+            ${{ steps.meta.outputs.repo }}:main
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Single tagged manifest per version (no attestation children) so
+          # cleanup-images.yml can prune versions safely.
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A silently rotting main image would surface only at the next release
+      # (as a slow rebuild); make it loud instead. Failure to notify must not
+      # fail the build itself.
+      - name: Notify Discord on failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then exit 0; fi
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          jq -n --arg content "⚠️ main image build failed for ${GITHUB_SHA:0:7} — next release will fall back to a slow rebuild. $RUN_URL" \
+            '{username: "GitHub Actions", content: $content}' |
+            curl --fail-with-body -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL" ||
+            echo "warning: Discord notification failed"
