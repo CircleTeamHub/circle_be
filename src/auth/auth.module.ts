@@ -8,6 +8,7 @@ import { ConfigEnum } from 'src/enum/config.enum';
 import { JwtStrategy } from './auth.strategy';
 import { CaslAbilityService } from './casl-ability.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { RefreshTokenCleanup } from './refresh-token.cleanup';
 import { EmailVerificationService } from './email-verification.service';
 import { MAILER } from './mailer/mailer.interface';
 import { ConsoleMailer } from './mailer/console.mailer';
@@ -36,6 +37,7 @@ import { OpenimModule } from 'src/openim/openim.module';
   providers: [
     AuthService,
     RefreshTokenService,
+    RefreshTokenCleanup,
     EmailVerificationService,
     { provide: MAILER, useClass: ConsoleMailer },
     JwtStrategy,
