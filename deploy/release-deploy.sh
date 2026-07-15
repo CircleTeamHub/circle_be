@@ -59,6 +59,30 @@ running() {
   compose ps -q --status running "$1" 2>/dev/null || true
 }
 
+RELEASE_STATE_DIR="${RELEASE_STATE_DIR:-.release}"
+
+recorded_live_color() {
+  cat "$RELEASE_STATE_DIR/active-color" 2>/dev/null || true
+}
+
+persist_active_color() {
+  local color="$1" temp
+  mkdir -p "$RELEASE_STATE_DIR"
+  temp="$RELEASE_STATE_DIR/active-color.tmp.$$"
+  printf '%s\n' "$color" > "$temp"
+  mv -f "$temp" "$RELEASE_STATE_DIR/active-color"
+}
+
+switch_proxy() {
+  local target="$1"
+  if [ -z "$(running caddy)" ]; then
+    echo "Caddy is not running; refusing to change the active app color." >&2
+    return 1
+  fi
+  compose exec -T -e "CIRCLE_BE_UPSTREAM=$target" caddy \
+    caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
   DOCKER_CONFIG="$(mktemp -d)"
@@ -82,10 +106,35 @@ fi
 # ── 识别在役颜色 ────────────────────────────────────────────────
 blue="$(running circle_be)"
 green="$(running circle_be_green)"
+proxy_aligned=0
 if [ -n "$blue" ] && [ -n "$green" ]; then
-  echo "warning: both colors running (interrupted release?); keeping circle_be, removing circle_be_green"
-  compose rm -sf circle_be_green
-  green=""
+  recorded_live="$(recorded_live_color)"
+  case "$recorded_live" in
+    circle_be)
+      live=circle_be standby=circle_be_green
+      ;;
+    circle_be_green)
+      live=circle_be_green standby=circle_be
+      ;;
+    *)
+      echo "Both app colors are running, but active-color state is missing or invalid." >&2
+      echo "Refusing to guess which container is live; repair $RELEASE_STATE_DIR/active-color." >&2
+      exit 1
+      ;;
+  esac
+  echo "warning: both colors running; preserving recorded live color $live"
+  if ! switch_proxy "$live"; then
+    echo "Failed to restore Caddy to $live; leaving both colors running." >&2
+    exit 1
+  fi
+  proxy_aligned=1
+  persist_active_color "$live"
+  compose rm -sf "$standby"
+  if [ "$standby" = "circle_be" ]; then
+    blue=""
+  else
+    green=""
+  fi
 fi
 if [ -n "$blue" ]; then
   live=circle_be standby=circle_be_green
@@ -99,6 +148,13 @@ if [ -z "$live" ] && [ -z "$(running postgres)" ]; then
   echo "Stack not initialized (no app color and postgres is down)." >&2
   echo "Run the DEPLOY.md §4 bootstrap first; releases only update a live stack." >&2
   exit 1
+fi
+if [ -n "$live" ]; then
+  if [ "$proxy_aligned" != "1" ] && ! switch_proxy "$live"; then
+    echo "Failed to align Caddy with live color $live; refusing to deploy." >&2
+    exit 1
+  fi
+  persist_active_color "$live"
 fi
 echo "==> Live color: ${live:-none}; deploying $RELEASE_TAG to: $standby"
 
@@ -123,6 +179,20 @@ wait_healthy() {
   done
 }
 
+ensure_live() {
+  if [ -z "$live" ]; then
+    return 1
+  fi
+  if [ -z "$(running "$live")" ] && ! compose start "$live"; then
+    echo "CRITICAL: previous version $live could not be restarted" >&2
+    return 1
+  fi
+  if ! wait_healthy "$live" 120; then
+    echo "CRITICAL: previous version $live did not return healthy" >&2
+    return 1
+  fi
+}
+
 # Before the new color is healthy, only downtime mode has stopped the live app.
 # Restore it on any migration/startup failure so an operational error does not
 # extend the maintenance window indefinitely.
@@ -132,14 +202,7 @@ restore_live() {
   fi
 
   echo "==> Restarting previous version $live (the schema may already be migrated)" >&2
-  if ! compose start "$live"; then
-    echo "CRITICAL: previous version $live could not be restarted" >&2
-    return 1
-  fi
-  if ! wait_healthy "$live" 120; then
-    echo "CRITICAL: previous version $live did not return healthy" >&2
-    return 1
-  fi
+  ensure_live || return 1
   echo "==> Previous version $live restored" >&2
 }
 
@@ -211,26 +274,61 @@ if ! wait_healthy "$standby" 300; then
   exit 1
 fi
 
-# ── 切换:停旧色(保留容器以便秒级回滚)→ 烟测 → 通过才删旧色 ────
-if [ -n "$live" ] && [ -n "$(running "$live")" ]; then
-  echo "==> $standby healthy; stopping $live"
-  compose stop "$live"
+# ── 切换代理 → 烟测 → 通过后才停/删旧色 ──────────────────────
+echo "==> $standby healthy; switching Caddy upstream"
+if ! switch_proxy "$standby"; then
+  echo "==> Caddy switch failed; leaving previous version $live live" >&2
+  if [ -n "$live" ]; then
+    if ! ensure_live; then
+      echo "warning: leaving both colors running for manual recovery" >&2
+      exit 1
+    fi
+    compose rm -sf "$standby" || true
+  else
+    echo "warning: no previous version exists; leaving standby running" >&2
+  fi
+  exit 1
+fi
+if ! persist_active_color "$standby"; then
+  echo "==> Could not persist active color; rolling Caddy back" >&2
+  if [ -n "$live" ]; then
+    if ! ensure_live || ! switch_proxy "$live"; then
+      echo "warning: Caddy rollback failed; leaving both colors running" >&2
+      exit 1
+    fi
+    compose rm -sf "$standby" || true
+  else
+    echo "warning: no previous version exists; leaving standby running" >&2
+  fi
+  exit 1
 fi
 
 if smoke; then
   if [ -n "$live" ]; then
+    if [ -n "$(running "$live")" ]; then
+      echo "==> Public smoke passed; stopping $live"
+      compose stop "$live"
+    fi
     compose rm -f "$live"
   fi
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
   compose logs --tail 100 "$standby" >&2 || true
-  compose rm -sf "$standby" || true
   if [ -n "$live" ]; then
-    compose start "$live"
-    wait_healthy "$live" 120 ||
-      echo "warning: previous version failed to come back healthy; manual intervention required" >&2
+    if ! ensure_live; then
+      echo "warning: previous version is unavailable; leaving standby in service" >&2
+      exit 1
+    fi
+    if ! switch_proxy "$live"; then
+      echo "warning: Caddy rollback failed; leaving both colors running for manual recovery" >&2
+      exit 1
+    fi
+    persist_active_color "$live"
+    compose rm -sf "$standby" || true
     echo "==> Rolled back: $live restored" >&2
+  else
+    echo "warning: no previous version exists; leaving the healthy standby running" >&2
   fi
   exit 1
 fi
