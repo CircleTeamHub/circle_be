@@ -100,6 +100,38 @@ describe('UserService', () => {
     expect(prisma.user.findFirst).not.toHaveBeenCalled();
   });
 
+  it('applies the target profile-privacy gate to account search results (F-01)', async () => {
+    prisma.user.findFirst.mockResolvedValue({
+      id: 'user-9',
+      accountId: 'jimmy',
+      nickname: 'Jimmy',
+      phoneNumber: '13800000000',
+      wechat: 'wx-secret',
+      qq: '10001',
+    });
+    // Target set wechat/qq to private; phone stays visible.
+    privacySettings.canViewProfileField.mockImplementation(
+      (_id: string, field: string) => Promise.resolve(field === 'phoneNumber'),
+    );
+
+    const result = await service.findByExactAccountId('jimmy', 'viewer-1');
+
+    // Private contact fields are nulled even on the friend-add lookup — matching
+    // GET /user/:id, so the search endpoint can't bypass the privacy toggle.
+    expect(result).toMatchObject({
+      id: 'user-9',
+      wechat: null,
+      qq: null,
+      phoneNumber: '13800000000',
+    });
+    expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+      'user-9',
+      'wechat',
+      false,
+      false,
+    );
+  });
+
   describe('findAll', () => {
     it('paginates with the supplied limit and skip', async () => {
       prisma.user.findMany.mockResolvedValue([{ id: 'user-1' }]);
