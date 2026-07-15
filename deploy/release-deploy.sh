@@ -2,7 +2,8 @@
 # 服务器端蓝绿发版。由 .github/workflows/release.yml 通过 SSH 驱动;
 # 也可以手动执行(回滚/重放,见 DEPLOY.md §6):
 #
-#   RELEASE_TAG=v0.1.0 CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be:v0.1.0 \
+#   RELEASE_TAG=v0.1.0 \
+#   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64-hex-digest> \
 #     bash deploy/release-deploy.sh
 #
 # 环境变量:
@@ -33,13 +34,15 @@ for name in RELEASE_TAG CIRCLE_BE_IMAGE; do
   fi
 done
 
-case "$RELEASE_TAG" in
-  v[0-9]*) ;;
-  *)
-    echo "Refusing to deploy non-version tag: $RELEASE_TAG" >&2
-    exit 1
-    ;;
-esac
+if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+  echo "Refusing to deploy invalid version tag: $RELEASE_TAG" >&2
+  exit 1
+fi
+
+if [[ ! "$CIRCLE_BE_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "CIRCLE_BE_IMAGE must be an immutable ghcr.io image digest" >&2
+  exit 1
+fi
 
 # 单飞锁:同一时刻只允许一个发版(CI 队列 + 手动操作重叠时的兜底)。
 exec 200>/tmp/circle-be-release.lock
@@ -120,19 +123,43 @@ wait_healthy() {
   done
 }
 
-# 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路;
-# 未带鉴权,2xx/3xx/401/403/404 都算活,5xx/超时判死。
+# Before the new color is healthy, only downtime mode has stopped the live app.
+# Restore it on any migration/startup failure so an operational error does not
+# extend the maintenance window indefinitely.
+restore_live() {
+  if [ "${RELEASE_DOWNTIME:-0}" != "1" ] || [ -z "$live" ]; then
+    return 0
+  fi
+
+  echo "==> Restarting previous version $live (the schema may already be migrated)" >&2
+  if ! compose start "$live"; then
+    echo "CRITICAL: previous version $live could not be restarted" >&2
+    return 1
+  fi
+  if ! wait_healthy "$live" 120; then
+    echo "CRITICAL: previous version $live did not return healthy" >&2
+    return 1
+  fi
+  echo "==> Previous version $live restored" >&2
+}
+
+# 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
+# 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
 smoke() {
   local api_domain attempt code
   api_domain="$(sed -n 's/^API_DOMAIN=//p' .env | tail -n 1)"
-  if [ -z "$api_domain" ] || [ -z "$(running caddy)" ]; then
-    echo "caddy not running or API_DOMAIN unset; skipping public smoke test"
-    return 0
+  if [ -z "$api_domain" ]; then
+    echo "API_DOMAIN is unset; public smoke verification is mandatory" >&2
+    return 1
+  fi
+  if [ -z "$(running caddy)" ]; then
+    echo "caddy is not running; public smoke verification cannot proceed" >&2
+    return 1
   fi
   for attempt in $(seq 1 12); do
     code="$(curl -m 5 -s -o /dev/null -w '%{http_code}' "https://$api_domain/api/v1/auth/me" || echo 000)"
     case "$code" in
-      2*|3*|401|403|404)
+      2*|3*|401|403)
         echo "public smoke ok (HTTP $code via https://$api_domain)"
         return 0
         ;;
@@ -162,19 +189,25 @@ fi
 # ── 用发布镜像跑迁移 ────────────────────────────────────────────
 # 默认(蓝绿)模式下旧版本仍在服务:迁移必须向后兼容(expand/contract)。
 echo "==> Running prisma migrate deploy from $CIRCLE_BE_IMAGE"
-compose run --rm migrate
+if ! compose run --rm migrate; then
+  echo "Migration failed; the database may require manual inspection" >&2
+  restore_live || true
+  exit 1
+fi
 
 # ── 起新色并等健康 ──────────────────────────────────────────────
 echo "==> Starting $standby"
-compose up -d --no-build --no-deps "$standby"
+if ! compose up -d --no-build --no-deps "$standby"; then
+  echo "Failed to create $standby" >&2
+  compose logs --tail 200 "$standby" >&2 || true
+  compose rm -sf "$standby" || true
+  restore_live || true
+  exit 1
+fi
 if ! wait_healthy "$standby" 300; then
   compose logs --tail 200 "$standby" >&2 || true
   compose rm -sf "$standby" || true
-  if [ "${RELEASE_DOWNTIME:-0}" = "1" ] && [ -n "$live" ]; then
-    echo "==> Restarting previous version $live (note: schema already migrated," >&2
-    echo "    a breaking migration may require restoring the backup above)" >&2
-    compose start "$live" || true
-  fi
+  restore_live || true
   exit 1
 fi
 

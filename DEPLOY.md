@@ -83,7 +83,7 @@ docker compose -f docker-compose.prod.yml up -d --build
 ```bash
 docker compose -f docker-compose.prod.yml ps          # circle_be 应为 healthy
 docker compose -f docker-compose.prod.yml logs -f circle_be
-# TLS/反代自测(401/404 也说明服务在响应):
+# TLS/反代自测(该已知路由应返回 2xx/3xx/401/403，404 表示路由故障):
 curl -i https://<API域名>/api/v1/auth/me
 ```
 
@@ -114,7 +114,7 @@ push main ──► build-image.yml:QEMU 交叉构建 linux/arm64
 
 push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
-  build    (仅当 sha- 镜像缺失时兜底重建)
+  缺失 sha- 镜像时立即失败，不在发版时重新构建
   promote  buildx imagetools create:把 sha- 镜像原样打上 v* 版本 tag(秒级)
   deploy   rsync 仓库 → SSH 执行 deploy/release-deploy.sh(见下)→ runner 外部烟测
   publish  自动生成 changelog 的 GitHub Release(仅 tag push)
@@ -152,7 +152,7 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 | 类型 | 名称 | 值 |
 |---|---|---|
 | Secret | `DEPLOY_SSH_KEY` | 部署私钥全文(建议单独生成一把只授权这台服务器的,不复用个人钥) |
-| Secret | `DEPLOY_KNOWN_HOSTS` | 建议设置:`ssh-keyscan -H <公网IP>` 的输出;不设则运行时 keyscan(TOFU) |
+| Secret | `DEPLOY_KNOWN_HOSTS` | **必填**；从可信网络预先核验并保存服务器 host key，workflow 不做 TOFU/keyscan |
 | Secret | `DISCORD_WEBHOOK_URL` | 已有,CI 复用同一个 |
 | Variable | `DEPLOY_HOST` | 服务器公网 IP 或域名 |
 | Variable | `DEPLOY_USER` | 可选,默认 `ubuntu` |
@@ -172,7 +172,8 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 
   ```bash
   cd ~/circle_be
-  RELEASE_TAG=v0.1.0 CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be:v0.1.0 \
+  RELEASE_TAG=v0.1.0 \
+  CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
     bash deploy/release-deploy.sh
   ```
 
@@ -183,13 +184,14 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 
 ### 关联发版:admin_web(管理端)与 App(安卓)
 
-- **admin_web**:workflow 在 `circle_admin_web` 仓库(tag `v*` 触发),CI 构建 dist →
-  装配 arm64 nginx 镜像推 GHCR → SSH 执行本仓库的 `deploy/admin-web-deploy.sh`
+- **admin_web**:主分支 workflow 测试并构建 `sha-<commit>` 的 arm64 镜像；tag
+  workflow 只提升已构建 manifest、解析 digest，再通过 SSH 执行本仓库的
+  `deploy/admin-web-deploy.sh`
   (overlay `docker-compose.admin-release.yml`,只动 admin_web 一个服务,
   与 circle_be 发版共用互斥锁)。它需要的 secrets/vars 与上表相同 ——
   建议配成 **组织级** secrets,两个仓库共用。
-  **顺序要求**:admin_web 新镜像的 nginx 反代目标是蓝绿别名 `circle-be-app`,
-  该别名在 circle_be 走过一次自动发版后才存在 —— 先发 circle_be,再发 admin_web。
+  **顺序要求**:先部署本仓库变更，让 Caddy 接管管理域名的 `/api/*` 并直连蓝绿
+  别名 `circle-be-app`，再发布只提供静态文件的 admin_web 镜像。
 - **App(风信,Expo/RN)**:workflow 在 `Circle_frontend` 仓库
   (`release-android.yml`,tag `v*` 触发):全量质量门禁 → 用正式 keystore 构建
   release APK(版本号取自 tag)→ 挂到 GitHub Release + Discord 通知。

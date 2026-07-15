@@ -7,10 +7,9 @@
 # artifact is byte-identical to what main's CI validated, and keeps releases
 # down to minutes.
 #
-# If this build ever fails or its image is later evicted, release.yml falls
-# back to rebuilding at tag time, so a red run here delays nothing except the
-# fast path. Old sha- images are pruned by cleanup-images.yml; version tags are
-# kept forever.
+# If this build fails, release.yml fails closed instead of rebuilding source at
+# tag time. Old sha- images are pruned by cleanup-images.yml; version tags are
+# kept forever and remain available for deterministic rollback.
 #
 # Cost knob: QEMU arm64 builds take ~8-25 min of (private-repo billed) runner
 # time per main push. If that bites, add `paths-ignore` for docs-only commits,
@@ -24,8 +23,8 @@ on:
     branches:
       - main
 
-# A newer main build supersedes an in-flight one; release.yml's rebuild
-# fallback covers any sha this cancellation skips.
+# A newer main build supersedes an in-flight one. Do not tag a cancelled commit
+# until its commit image has been rebuilt by rerunning this workflow.
 concurrency:
   group: build-image-main
   cancel-in-progress: true
@@ -43,7 +42,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Compute image repository
         id: meta
@@ -51,22 +50,22 @@ jobs:
         run: echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.prod
@@ -84,9 +83,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # A silently rotting main image would surface only at the next release
-      # (as a slow rebuild); make it loud instead. Failure to notify must not
-      # fail the build itself.
+      # A missing main image blocks release, so report build failure loudly.
       - name: Notify Discord on failure
         if: failure()
         env:
@@ -94,7 +91,7 @@ jobs:
         run: |
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then exit 0; fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          jq -n --arg content "⚠️ main image build failed for ${GITHUB_SHA:0:7} — next release will fall back to a slow rebuild. $RUN_URL" \
+          jq -n --arg content "⚠️ main image build failed for ${GITHUB_SHA:0:7} — releases of this commit are blocked. $RUN_URL" \
             '{username: "GitHub Actions", content: $content}' |
             curl --fail-with-body -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL" ||
             echo "warning: Discord notification failed"

@@ -22,5 +22,13 @@
 }
 
 {$ADMIN_DOMAIN} {
-  reverse_proxy admin_web:80
+  handle /api/* {
+    reverse_proxy circle-be-app:3000 {
+      lb_try_duration 30s
+    }
+  }
+
+  handle {
+    reverse_proxy admin_web:80
+  }
 }
