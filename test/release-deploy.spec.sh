@@ -12,7 +12,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME MIGRATE_FAIL SMOKE_CODE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
+  unset RELEASE_DOWNTIME MIGRATE_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -105,7 +105,26 @@ SED
   chmod +x "$CASE_DIR/bin/sed"
   cat > "$CASE_DIR/bin/curl" <<'CURL'
 #!/usr/bin/env bash
-printf '%s' "${SMOKE_CODE:-200}"
+set -euo pipefail
+headers=""
+body=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D)
+      headers="$2"
+      shift 2
+      ;;
+    -o)
+      body="$2"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+[ -z "$headers" ] || printf 'HTTP/2 %s\r\ncontent-type: %s\r\n\r\n' \
+  "${SMOKE_CODE:-401}" "${SMOKE_CONTENT_TYPE:-application/json}" > "$headers"
+[ -z "$body" ] || printf '%s' "${SMOKE_BODY:-{\"statusCode\":401}}" > "$body"
+printf '%s' "${SMOKE_CODE:-401}"
 CURL
   chmod +x "$CASE_DIR/bin/curl"
   cat > "$CASE_DIR/bin/mv" <<'MV'
@@ -126,7 +145,8 @@ run_release() {
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
-    SMOKE_CODE="${SMOKE_CODE:-200}" \
+    SMOKE_CODE="${SMOKE_CODE:-401}" \
+    SMOKE_CONTENT_TYPE="${SMOKE_CONTENT_TYPE:-application/json}" \
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
@@ -218,6 +238,18 @@ test_smoke_failure_restores_proxy_before_removing_standby() {
     assert_absent circle_be_green
 }
 
+test_spa_html_response_restores_proxy_before_removing_standby() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  SMOKE_CODE=200 SMOKE_CONTENT_TYPE=text/html
+  ! run_release || return 1
+  assert_reload_target circle_be_green && assert_reload_target circle_be &&
+    assert_active_color circle_be && assert_running circle_be &&
+    assert_absent circle_be_green
+}
+
 test_downtime_switch_failure_restores_previous_color_first() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -248,6 +280,7 @@ for test_name in \
   test_interrupted_rollout_preserves_recorded_live_color \
   test_proxy_switch_precedes_old_color_retirement \
   test_smoke_failure_restores_proxy_before_removing_standby \
+  test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \
   test_state_write_failure_rolls_proxy_back_before_cleanup; do
   if "$test_name"; then
