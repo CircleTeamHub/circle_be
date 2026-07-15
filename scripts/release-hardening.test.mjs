@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+const read = (path) =>
+  readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
 test('Caddy routes admin API requests directly to the blue-green backend', () => {
   const caddy = read('deploy/Caddyfile.admin');
@@ -11,7 +12,10 @@ test('Caddy routes admin API requests directly to the blue-green backend', () =>
   const siteHandler = adminBlock.indexOf('reverse_proxy admin_web:80');
 
   assert.notEqual(apiHandler, -1, 'ADMIN_DOMAIN must define an /api/* handler');
-  assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
+  assert.ok(
+    apiHandler < siteHandler,
+    'the API handler must precede the static-site proxy',
+  );
   assert.match(
     adminBlock,
     /handle \/api\/\*[\s\S]*reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle-be-blue:3000\}/,
@@ -42,7 +46,10 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
     /if ! name="\$\(docker inspect --format '\{\{\.Name\}\}' "\$cid"\)" \|\| \[ -z "\$name" \]; then/,
   );
   assert.match(deploy, /target="\$\(container_upstream "\$1"\)"/);
-  assert.ok(healthGate >= 0 && healthGate < cutover, 'standby health must precede cutover');
+  assert.ok(
+    healthGate >= 0 && healthGate < cutover,
+    'standby health must precede cutover',
+  );
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {
@@ -62,16 +69,28 @@ test('backend release never rebuilds tags and deploys immutable digests', () => 
   assert.doesNotMatch(release, /docker\/build-push-action/);
   assert.doesNotMatch(release, /^  build:/m);
   assert.match(release, /needs_promotion/);
-  assert.match(release, /if: \$\{\{ needs\.resolve\.outputs\.needs_promotion == 'true' \}\}/);
+  assert.match(
+    release,
+    /if: \$\{\{ needs\.resolve\.outputs\.needs_promotion == 'true' \}\}/,
+  );
   assert.match(release, /image_ref=\$repo@\$digest/);
-  assert.match(release, /CIRCLE_BE_IMAGE: \$\{\{ needs\.resolve\.outputs\.image_ref \}\}/);
+  assert.match(
+    release,
+    /CIRCLE_BE_IMAGE: \$\{\{ needs\.resolve\.outputs\.image_ref \}\}/,
+  );
 });
 
 test('backend release gate actions are pinned to full commit SHAs', () => {
   for (const filename of ['build-image.yml', 'ci.yml', 'release.yml']) {
     const workflow = read(`.github/workflows/${filename}`);
-    for (const line of workflow.split(/\r?\n/).filter((item) => /\buses:/.test(item))) {
-      assert.match(line, /uses:\s+[^\s@]+@[0-9a-f]{40}(?:\s+#.*)?$/i, `${filename}: ${line.trim()}`);
+    for (const line of workflow
+      .split(/\r?\n/)
+      .filter((item) => /\buses:/.test(item))) {
+      assert.match(
+        line,
+        /uses:\s+[^\s@]+@[0-9a-f]{40}(?:\s+#.*)?$/i,
+        `${filename}: ${line.trim()}`,
+      );
     }
   }
 });
@@ -97,7 +116,10 @@ test('releasable ARM64 image is scanned before either registry push', () => {
     build >= 0 && build < scan,
     'the ARM64 image must be built before scanning',
   );
-  assert.ok(scan < push, 'the blocking scan must finish before registry pushes');
+  assert.ok(
+    scan < push,
+    'the blocking scan must finish before registry pushes',
+  );
   assert.doesNotMatch(workflow.slice(0, scan), /push: true|docker push/);
   assert.match(workflow.slice(push), /docker push "\$SHA_IMAGE"/);
   assert.match(workflow.slice(push), /docker push "\$MAIN_IMAGE"/);
@@ -121,8 +143,14 @@ test('downtime deployment restores the live app after migration or startup failu
   const deploy = read('deploy/release-deploy.sh');
 
   assert.match(deploy, /restore_live\(\)/);
-  assert.match(deploy, /if ! compose run --rm migrate; then[\s\S]*restore_live/);
-  assert.match(deploy, /if ! compose up -d --no-build --no-deps "\$standby"; then[\s\S]*restore_live/);
+  assert.match(
+    deploy,
+    /if ! compose run --rm migrate; then[\s\S]*restore_live/,
+  );
+  assert.match(
+    deploy,
+    /if ! compose up -d --no-build --no-deps "\$standby"; then[\s\S]*restore_live/,
+  );
 });
 
 test('admin deploy validates digests, uses strict smoke checks, and rolls back', () => {
@@ -154,7 +182,10 @@ test('release selection and active-color state fail closed', () => {
   const deploy = read('deploy/release-deploy.sh');
   const compose = read('docker-compose.prod.yml');
 
-  assert.match(release, /head_sha=\$SHA&event=push&branch=main&status=completed/);
+  assert.match(
+    release,
+    /head_sha=\$SHA&event=push&branch=main&status=completed/,
+  );
   assert.match(release, /--exclude=\/\.release/);
   assert.match(deploy, /recorded_live_color\(\)/);
   assert.match(deploy, /Refusing to guess which container is live/);
