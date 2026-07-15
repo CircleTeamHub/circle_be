@@ -12,11 +12,10 @@ test('Caddy routes requests only to healthy blue-green backends', () => {
 
   assert.notEqual(apiHandler, -1, 'ADMIN_DOMAIN must define an /api/* handler');
   assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
-  assert.match(caddy, /reverse_proxy circle_be:3000 circle_be_green:3000/g);
-  assert.match(caddy, /lb_policy first/g);
-  assert.match(caddy, /health_uri \/api\/v1\/auth\/me/g);
-  assert.match(caddy, /health_status 401/g);
-  assert.doesNotMatch(caddy, /circle-be-app/);
+  assert.match(
+    adminBlock,
+    /handle \/api\/\*[\s\S]*reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle_be\}:3000/,
+  );
 });
 
 test('blue-green services do not share a Docker DNS alias', () => {
@@ -28,15 +27,23 @@ test('blue-green services do not share a Docker DNS alias', () => {
   assert.doesNotMatch(release, /aliases:/);
 });
 
-test('deploy validates and reloads Caddy before migrations and standby startup', () => {
+test('proxy switches validate the selected upstream before reloading Caddy', () => {
   const deploy = read('deploy/release-deploy.sh');
-  const reload = deploy.lastIndexOf('reload_caddy');
-  const migrate = deploy.indexOf('compose run --rm migrate');
-  const standby = deploy.indexOf('compose up -d --no-build --no-deps "$standby"');
+  const switchProxy = deploy.slice(
+    deploy.indexOf('switch_proxy()'),
+    deploy.indexOf('if [ -n "${GHCR_TOKEN:-}" ]'),
+  );
+  const validate = switchProxy.indexOf('caddy validate');
+  const reload = switchProxy.indexOf('caddy reload');
 
-  assert.match(deploy, /caddy validate --config \/etc\/caddy\/Caddyfile/);
-  assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);
-  assert.ok(reload !== -1 && reload < migrate && reload < standby);
+  assert.notEqual(validate, -1);
+  assert.notEqual(reload, -1);
+  assert.ok(validate < reload);
+  assert.match(switchProxy, /CIRCLE_BE_UPSTREAM=\$target/);
+  assert.match(
+    switchProxy,
+    /if ! compose exec[\s\S]*caddy validate[\s\S]*return 1/,
+  );
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {
@@ -106,7 +113,21 @@ test('admin deploy validates digests, uses strict smoke checks, and rolls back',
 test('backend CI blocks release contract regressions', () => {
   const ci = read('.github/workflows/ci.yml');
 
-  assert.match(ci, /run: node --test scripts\/release-hardening\.test\.mjs/);
+  assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
+  assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
+});
+
+test('release selection and active-color state fail closed', () => {
+  const release = read('.github/workflows/release.yml');
+  const deploy = read('deploy/release-deploy.sh');
+  const compose = read('docker-compose.prod.yml');
+
+  assert.match(release, /head_sha=\$SHA&event=push&branch=main&status=completed/);
+  assert.match(release, /--exclude=\/\.release/);
+  assert.match(deploy, /recorded_live_color\(\)/);
+  assert.match(deploy, /Refusing to guess which container is live/);
+  assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);
+  assert.match(compose, /exec caddy run --resume/);
 });
 
 test('backend workflow and server use the same strict version format', () => {

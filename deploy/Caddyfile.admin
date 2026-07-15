@@ -13,33 +13,13 @@
   }
 
   handle {
-    reverse_proxy circle_be:3000 circle_be_green:3000 {
-      lb_policy first
-      lb_try_duration 5s
-      health_uri /api/v1/auth/me
-      health_status 401
-      health_interval 5s
-      health_timeout 3s
-      fail_duration 30s
-      max_fails 1
-      unhealthy_status 5xx
-    }
+    reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
   }
 }
 
 {$ADMIN_DOMAIN} {
   handle /api/* {
-    reverse_proxy circle_be:3000 circle_be_green:3000 {
-      lb_policy first
-      lb_try_duration 5s
-      health_uri /api/v1/auth/me
-      health_status 401
-      health_interval 5s
-      health_timeout 3s
-      fail_duration 30s
-      max_fails 1
-      unhealthy_status 5xx
-    }
+    reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
   }
 
   handle {

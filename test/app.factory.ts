@@ -4,6 +4,22 @@ import { INestApplication } from '@nestjs/common';
 import { setupApp } from '../src/setup';
 import { PrismaService } from '../src/prisma/prisma.service';
 
+export function assertSafeE2eDatabase(
+  databaseUrl = process.env.DATABASE_URL,
+  nodeEnv = process.env.NODE_ENV,
+): void {
+  if (nodeEnv !== 'test' || !databaseUrl) {
+    throw new Error('E2E cleanup requires NODE_ENV=test and DATABASE_URL');
+  }
+
+  const databaseName = decodeURIComponent(
+    new URL(databaseUrl).pathname.slice(1),
+  );
+  if (!/(^|[_-])test($|[_-])/i.test(databaseName)) {
+    throw new Error(`Refusing to clean non-test database: ${databaseName}`);
+  }
+}
+
 export class AppFactory {
   private prisma: PrismaService;
 
@@ -28,6 +44,7 @@ export class AppFactory {
 
   // Clear all test data in dependency order
   async initDB() {
+    assertSafeE2eDatabase();
     await this.prisma.refreshToken.deleteMany();
     await this.prisma.user.deleteMany();
   }

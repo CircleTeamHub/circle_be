@@ -1,7 +1,24 @@
+# 发版 overlay —— 由 deploy/release-deploy.sh(release.yml workflow 驱动)使用;
+# 手动开通流程(DEPLOY.md §4,不带本文件)不受影响。
+#
+# 做两件事:
+# 1. 把 circle_be / migrate 钉到 CI 推到 GHCR 的不可变版本镜像(服务器零构建;
+#    发版调用永远带 --no-build,基础文件里保留的 build: 不会生效);
+# 2. 定义蓝绿部署的另一色 circle_be_green:extends 复用 circle_be 的全部配置。
+#    Caddy 在健康门禁通过后显式切换到对应服务名,两色不共享实时流量别名。
+#
+# 注意:发版顺序(migrate → 起新色 → 健康门禁 → 切代理 → 烟测 → 停旧色)由
+# release-deploy.sh 显式编排(compose 调用带 --no-deps),不依赖 compose 的
+# 依赖图;green 从 extends 继承到的 depends_on 只在手动 `up` 时才起作用。
 services:
   migrate:
+    # 与应用同一个运行时镜像:Dockerfile.prod 在生产阶段保留了 lockfile 钉版的
+    # Prisma CLI,正是为了让 migrate(命令沿用基础文件的 npx prisma migrate
+    # deploy)在部署时零 npm 下载。DATABASE_URL 沿用基础文件的定义。
     image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
     environment:
+      # 生产镜像以系统用户 app 运行,home 目录不存在;把 HOME 指到可写位置,
+      # 并关闭 Prisma CLI 的 telemetry 写盘,避免 migrate 因缓存写入失败报错。
       HOME: /tmp
       CHECKPOINT_DISABLE: "1"
 
