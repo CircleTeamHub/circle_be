@@ -1,22 +1,28 @@
 {
-  email {$ACME_EMAIL}
+	email {$ACME_EMAIL}
 }
 
 {$API_DOMAIN} {
-  @metrics path /metrics /metrics/*
-  handle @metrics {
-    respond 404
-  }
+	@metrics path /metrics /metrics/*
+	handle @metrics {
+		respond 404
+	}
 
-  handle /circle/* {
-    reverse_proxy minio:9000
-  }
+	handle /circle/* {
+		reverse_proxy minio:9000
+	}
 
-  handle {
-    reverse_proxy circle_be:3000
-  }
+	handle {
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+	}
 }
 
 {$ADMIN_DOMAIN} {
-  reverse_proxy admin_web:80
+	handle /api/* {
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+	}
+
+	handle {
+		reverse_proxy admin_web:80
+	}
 }
