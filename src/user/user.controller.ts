@@ -61,8 +61,11 @@ export class UserController {
     summary: 'Search a user by exact accountId for friend adding',
   })
   @ApiOkResponse({ description: 'Matched user or null', type: PublicUserDto })
-  searchUserByAccountId(@Query('accountId') accountId: string) {
-    return this.userService.findByExactAccountId(accountId);
+  searchUserByAccountId(
+    @Query('accountId') accountId: string,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.userService.findByExactAccountId(accountId, req.user.userId);
   }
 
   @Post()
