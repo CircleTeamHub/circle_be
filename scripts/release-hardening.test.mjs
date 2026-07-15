@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
-test('Caddy routes admin API requests directly to the blue-green backend', () => {
+test('Caddy routes requests only to healthy blue-green backends', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const adminBlock = caddy.slice(caddy.indexOf('{$ADMIN_DOMAIN}'));
   const apiHandler = adminBlock.indexOf('handle /api/*');
@@ -12,8 +12,31 @@ test('Caddy routes admin API requests directly to the blue-green backend', () =>
 
   assert.notEqual(apiHandler, -1, 'ADMIN_DOMAIN must define an /api/* handler');
   assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*reverse_proxy circle-be-app:3000/);
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*lb_try_duration 30s/);
+  assert.match(caddy, /reverse_proxy circle_be:3000 circle_be_green:3000/g);
+  assert.match(caddy, /lb_policy first/g);
+  assert.match(caddy, /health_uri \/api\/v1\/auth\/me/g);
+  assert.match(caddy, /health_status 401/g);
+  assert.doesNotMatch(caddy, /circle-be-app/);
+});
+
+test('blue-green services do not share a Docker DNS alias', () => {
+  const prod = read('docker-compose.prod.yml');
+  const release = read('docker-compose.release.yml');
+
+  assert.doesNotMatch(prod, /circle-be-app/);
+  assert.doesNotMatch(release, /circle-be-app/);
+  assert.doesNotMatch(release, /aliases:/);
+});
+
+test('deploy validates and reloads Caddy before migrations and standby startup', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const reload = deploy.lastIndexOf('reload_caddy');
+  const migrate = deploy.indexOf('compose run --rm migrate');
+  const standby = deploy.indexOf('compose up -d --no-build --no-deps "$standby"');
+
+  assert.match(deploy, /caddy validate --config \/etc\/caddy\/Caddyfile/);
+  assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);
+  assert.ok(reload !== -1 && reload < migrate && reload < standby);
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {

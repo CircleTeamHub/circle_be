@@ -59,6 +59,16 @@ running() {
   compose ps -q --status running "$1" 2>/dev/null || true
 }
 
+reload_caddy() {
+  if [ -z "$(running caddy)" ]; then
+    echo "caddy is not running; refusing to deploy without a verified proxy" >&2
+    return 1
+  fi
+  echo "==> Validating and reloading Caddy blue-green upstreams"
+  compose exec -T caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+  compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
   DOCKER_CONFIG="$(mktemp -d)"
@@ -101,6 +111,9 @@ if [ -z "$live" ] && [ -z "$(running postgres)" ]; then
   exit 1
 fi
 echo "==> Live color: ${live:-none}; deploying $RELEASE_TAG to: $standby"
+
+# Apply the bind-mounted proxy policy before migrations or standby startup.
+reload_caddy
 
 wait_healthy() {
   local svc="$1" timeout="$2" cid status deadline
