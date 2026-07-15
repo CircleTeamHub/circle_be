@@ -13,10 +13,16 @@
   }
 
   handle {
-    reverse_proxy circle_be:3000
+    reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
   }
 }
 
 {$ADMIN_DOMAIN} {
-  reverse_proxy admin_web:80
+  handle /api/* {
+    reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+  }
+
+  handle {
+    reverse_proxy admin_web:80
+  }
 }

@@ -119,6 +119,13 @@ services:
       - ./.env.production:/app/.env.production:ro
     expose:
       - '3000'
+    networks:
+      default:
+        aliases:
+          # Caddy 只认这个别名。蓝绿发版时新旧两色容器同时挂在别名下,
+          # Go 的拨号器会依次尝试解析到的所有 IP,切换全程不断流
+          #(见 docker-compose.release.yml 与 deploy/release-deploy.sh)。
+          - circle-be-app
     healthcheck:
       # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
       test:
@@ -137,16 +144,26 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
-      circle_be: { condition: service_healthy }
+      # required: false —— 蓝绿发版后 circle_be(蓝)可能整个被移除、由
+      # circle_be_green 在服务;日常 `up -d` 不应因此失败或把停用色拉起来。
+      circle_be: { condition: service_healthy, required: false }
     expose:
       - '80'
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - |
+        if [ -s /config/caddy/autosave.json ]; then
+          exec caddy run --resume
+        fi
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     depends_on:
-      circle_be: { condition: service_healthy }
-      admin_web: { condition: service_started }
+      # required: false 的理由同 admin_web —— 在役颜色可能是 circle_be_green。
+      circle_be: { condition: service_healthy, required: false }
+      admin_web: { condition: service_started, required: false }
     environment:
       API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?set ADMIN_DOMAIN in .env}

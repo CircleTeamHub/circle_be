@@ -28,9 +28,17 @@ COPY --from=build-stage --chown=app:app /app/package.json /app/package-lock.json
 COPY --from=build-stage --chown=app:app /app/node_modules ./node_modules
 COPY --from=build-stage --chown=app:app /app/dist ./dist
 COPY --from=build-stage --chown=app:app /app/prisma ./prisma
+COPY --from=build-stage --chown=app:app /app/prisma.config.ts ./
 COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
 
-RUN npm prune --omit=dev
+# Drop devDependencies, then restore just the lockfile-pinned Prisma CLI: the
+# release overlay (docker-compose.release.yml) runs `npx prisma migrate deploy`
+# from this exact image, and deploys must not download tooling from npm at
+# runtime. Installing at build time also fetches the schema engine through the
+# package's postinstall, so migrations on the server stay npm-offline.
+RUN npm prune --omit=dev \
+    && npm install --no-save --omit=dev \
+        "prisma@$(node -p "require('./package-lock.json').packages['node_modules/prisma'].version")"
 
 USER app
 
