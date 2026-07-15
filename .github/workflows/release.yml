@@ -305,20 +305,23 @@ jobs:
         env:
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           API_SMOKE_URL: ${{ vars.API_SMOKE_URL }}
+          API_SMOKE_EXPECTED_STATUS: ${{ vars.API_SMOKE_EXPECTED_STATUS }}
         run: |
           set -euo pipefail
           if [ -z "$API_SMOKE_URL" ]; then
             echo "vars.API_SMOKE_URL not set; skipping external smoke check."
             exit 0
           fi
+          if [[ ! "$API_SMOKE_EXPECTED_STATUS" =~ ^[1-5][0-9]{2}$ ]] || [ "$API_SMOKE_EXPECTED_STATUS" = "404" ]; then
+            echo "vars.API_SMOKE_EXPECTED_STATUS must be a non-404 three-digit HTTP status." >&2
+            exit 1
+          fi
           for _ in 1 2 3 4 5 6; do
             code="$(curl -m 10 -s -o /dev/null -w '%{http_code}' "$API_SMOKE_URL" || echo 000)"
-            case "$code" in
-              2*|3*|401|403)
-                echo "external smoke ok (HTTP $code)"
-                exit 0
-                ;;
-            esac
+            if [ "$code" = "$API_SMOKE_EXPECTED_STATUS" ]; then
+              echo "external smoke ok (HTTP $code)"
+              exit 0
+            fi
             sleep 5
           done
           echo "external smoke failed (last HTTP $code) — the server-side check passed," >&2

@@ -122,7 +122,7 @@ smoke_url() {
   for attempt in $(seq 1 12); do
     code="$(curl -m 5 -s -o /dev/null -w '%{http_code}' "$url" || echo 000)"
     case "$mode:$code" in
-      index:2*|index:3*|api:2*|api:401|api:403)
+      index:2*|index:3*|api:401)
         echo "smoke ok: $label (HTTP $code)"
         return 0
         ;;

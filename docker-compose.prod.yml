@@ -103,6 +103,7 @@ services:
     restart: 'no'
 
   circle_be:
+    container_name: circle-be-blue
     build:
       context: .
       dockerfile: Dockerfile.prod
@@ -119,13 +120,6 @@ services:
       - ./.env.production:/app/.env.production:ro
     expose:
       - '3000'
-    networks:
-      default:
-        aliases:
-          # Caddy 只认这个别名。蓝绿发版时新旧两色容器同时挂在别名下,
-          # Go 的拨号器会依次尝试解析到的所有 IP,切换全程不断流
-          #(见 docker-compose.release.yml 与 deploy/release-deploy.sh)。
-          - circle-be-app
     healthcheck:
       # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
       test:
@@ -161,11 +155,12 @@ services:
       API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?set ADMIN_DOMAIN in .env}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      BACKEND_UPSTREAMS: circle-be-blue:3000 circle-be-green:3000
     ports:
       - '80:80'
       - '443:443'
     volumes:
-      - ./deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro
+      - ./deploy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
 

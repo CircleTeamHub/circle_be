@@ -59,6 +59,43 @@ running() {
   compose ps -q --status running "$1" 2>/dev/null || true
 }
 
+service_upstream() {
+  case "$1" in
+    circle_be) echo "circle-be-blue:3000" ;;
+    circle_be_green) echo "circle-be-green:3000" ;;
+    *) echo "unknown backend service: $1" >&2; return 1 ;;
+  esac
+}
+
+container_upstream() {
+  local cid name
+  cid="$(running "$1")"
+  if [ -z "$cid" ]; then
+    echo "$1 has no running container" >&2
+    return 1
+  fi
+  name="$(docker inspect --format '{{.Name}}' "$cid")"
+  printf '%s:3000\n' "${name#/}"
+}
+
+reload_caddy_config() {
+  local upstreams="$1"
+  if [ -z "$(running caddy)" ]; then
+    echo "caddy is not running; refusing to change backend routing" >&2
+    return 1
+  fi
+  if [ -z "$upstreams" ]; then
+    echo "backend upstream list is empty" >&2
+    return 1
+  fi
+
+  compose cp deploy/Caddyfile.admin caddy:/tmp/Caddyfile.release
+  compose exec -T -e BACKEND_UPSTREAMS="$upstreams" caddy \
+    caddy validate --config /tmp/Caddyfile.release --adapter caddyfile
+  compose exec -T -e BACKEND_UPSTREAMS="$upstreams" caddy \
+    caddy reload --config /tmp/Caddyfile.release --adapter caddyfile
+}
+
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
   DOCKER_CONFIG="$(mktemp -d)"
@@ -83,9 +120,9 @@ fi
 blue="$(running circle_be)"
 green="$(running circle_be_green)"
 if [ -n "$blue" ] && [ -n "$green" ]; then
-  echo "warning: both colors running (interrupted release?); keeping circle_be, removing circle_be_green"
-  compose rm -sf circle_be_green
-  green=""
+  echo "Both backend colors are running after an interrupted release; refusing to guess which one is live." >&2
+  echo "Inspect Caddy routing and container health, then stop the confirmed standby before retrying." >&2
+  exit 1
 fi
 if [ -n "$blue" ]; then
   live=circle_be standby=circle_be_green
@@ -101,6 +138,20 @@ if [ -z "$live" ] && [ -z "$(running postgres)" ]; then
   exit 1
 fi
 echo "==> Live color: ${live:-none}; deploying $RELEASE_TAG to: $standby"
+
+# Route only to the exact live container before changing colors. This also
+# migrates safely from the legacy green service, which may still own the old
+# `circle_be` alias. Copy through /tmp because an already-running Caddy may
+# still use the legacy single-file bind mount from a previous release.
+if [ -n "$live" ]; then
+  initial_upstream="$(container_upstream "$live")"
+else
+  initial_upstream="$(service_upstream "$standby")"
+fi
+if ! reload_caddy_config "$initial_upstream"; then
+  echo "Failed to validate and reload the blue-green Caddy routing" >&2
+  exit 1
+fi
 
 wait_healthy() {
   local svc="$1" timeout="$2" cid status deadline
@@ -144,7 +195,7 @@ restore_live() {
 }
 
 # 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
-# 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
+# 已知存在且受 JWT 保护的路由;未带鉴权必须返回 401,其他状态均视为故障。
 smoke() {
   local api_domain attempt code
   api_domain="$(sed -n 's/^API_DOMAIN=//p' .env | tail -n 1)"
@@ -158,12 +209,10 @@ smoke() {
   fi
   for attempt in $(seq 1 12); do
     code="$(curl -m 5 -s -o /dev/null -w '%{http_code}' "https://$api_domain/api/v1/auth/me" || echo 000)"
-    case "$code" in
-      2*|3*|401|403)
-        echo "public smoke ok (HTTP $code via https://$api_domain)"
-        return 0
-        ;;
-    esac
+    if [ "$code" = "401" ]; then
+      echo "public smoke ok (HTTP $code via https://$api_domain)"
+      return 0
+    fi
     sleep 5
   done
   echo "public smoke failed after 12 attempts (last HTTP $code)" >&2
@@ -211,6 +260,20 @@ if ! wait_healthy "$standby" 300; then
   exit 1
 fi
 
+# The new color has a permanent, unambiguous container name. Put it first only
+# after its health gate; retain the exact old container as rollback fallback.
+standby_upstream="$(service_upstream "$standby")"
+cutover_upstreams="$standby_upstream"
+if [ -n "$live" ] && [ -n "$(running "$live")" ]; then
+  cutover_upstreams="$standby_upstream $(container_upstream "$live")"
+fi
+if ! reload_caddy_config "$cutover_upstreams"; then
+  echo "Failed to switch Caddy to the healthy standby" >&2
+  compose rm -sf "$standby" || true
+  restore_live || true
+  exit 1
+fi
+
 # ── 切换:停旧色(保留容器以便秒级回滚)→ 烟测 → 通过才删旧色 ────
 if [ -n "$live" ] && [ -n "$(running "$live")" ]; then
   echo "==> $standby healthy; stopping $live"
@@ -221,6 +284,8 @@ if smoke; then
   if [ -n "$live" ]; then
     compose rm -f "$live"
   fi
+  reload_caddy_config "$standby_upstream" ||
+    echo "warning: Caddy still has the removed color as an inactive fallback" >&2
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
@@ -228,8 +293,12 @@ else
   compose rm -sf "$standby" || true
   if [ -n "$live" ]; then
     compose start "$live"
-    wait_healthy "$live" 120 ||
+    if wait_healthy "$live" 120; then
+      reload_caddy_config "$(container_upstream "$live")" ||
+        echo "warning: Caddy rollback cleanup failed; the restored color remains a configured fallback" >&2
+    else
       echo "warning: previous version failed to come back healthy; manual intervention required" >&2
+    fi
     echo "==> Rolled back: $live restored" >&2
   fi
   exit 1

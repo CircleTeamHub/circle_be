@@ -12,8 +12,69 @@ test('Caddy routes admin API requests directly to the blue-green backend', () =>
 
   assert.notEqual(apiHandler, -1, 'ADMIN_DOMAIN must define an /api/* handler');
   assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*reverse_proxy circle-be-app:3000/);
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*lb_try_duration 30s/);
+  assert.match(adminBlock, /handle \/api\/\*[\s\S]*import backend_proxy/);
+});
+
+test('Caddy excludes an unready color from backend traffic', () => {
+  const caddy = read('deploy/Caddyfile.admin');
+  const productionCompose = read('docker-compose.prod.yml');
+  const releaseCompose = read('docker-compose.release.yml');
+
+  assert.doesNotMatch(productionCompose, /circle-be-app/);
+  assert.doesNotMatch(releaseCompose, /circle-be-app/);
+  assert.match(productionCompose, /container_name:\s*circle-be-blue/);
+  assert.match(releaseCompose, /circle_be_green:[\s\S]*container_name:\s*circle-be-green/);
+  assert.match(
+    caddy,
+    /reverse_proxy \{\$BACKEND_UPSTREAMS:circle-be-blue:3000 circle-be-green:3000\}/,
+  );
+  assert.match(caddy, /lb_policy first/);
+  assert.match(caddy, /health_uri \/api\/v1\/outbox\/health/);
+  assert.match(caddy, /health_status 401/);
+  assert.doesNotMatch(caddy, /circle-be-app/);
+});
+
+test('backend release loads the new Caddy routing before changing app colors', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const productionCompose = read('docker-compose.prod.yml');
+  const reload = deploy.indexOf('reload_caddy_config');
+  const migration = deploy.indexOf('==> Running prisma migrate deploy');
+
+  assert.match(productionCompose, /\.\/deploy:\/etc\/caddy:ro/);
+  assert.match(deploy, /compose cp deploy\/Caddyfile\.admin caddy:\/tmp\/Caddyfile\.release/);
+  assert.match(deploy, /container_upstream\(\)/);
+  assert.match(
+    deploy,
+    /-e BACKEND_UPSTREAMS="\$upstreams" caddy[\s\\]*caddy validate/,
+  );
+  assert.match(deploy, /caddy validate --config \/tmp\/Caddyfile\.release --adapter caddyfile/);
+  assert.match(deploy, /caddy reload --config \/tmp\/Caddyfile\.release --adapter caddyfile/);
+  assert.match(
+    deploy,
+    /initial_upstream="\$\(container_upstream "\$live"\)"[\s\S]*?if ! reload_caddy_config "\$initial_upstream"; then[\s\S]*?exit 1[\s\S]*?==> Running prisma migrate deploy/,
+  );
+  assert.match(
+    deploy,
+    /wait_healthy "\$standby" 300[\s\S]*?reload_caddy_config "\$cutover_upstreams"[\s\S]*?stopping \$live/,
+  );
+  assert.match(
+    deploy,
+    /Smoke test failed[\s\S]*?compose start "\$live"[\s\S]*?reload_caddy_config "\$\(container_upstream "\$live"\)"/,
+  );
+  assert.notEqual(reload, -1, 'release script must reload Caddy');
+  assert.ok(reload < migration, 'Caddy must reload before migrations or color changes');
+});
+
+test('backend release fails closed when both colors are already running', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const bothColors = deploy.slice(
+    deploy.indexOf('if [ -n "$blue" ] && [ -n "$green" ]; then'),
+    deploy.indexOf('if [ -n "$blue" ]; then'),
+  );
+
+  assert.match(bothColors, /interrupted release/);
+  assert.match(bothColors, /exit 1/);
+  assert.doesNotMatch(bothColors, /compose (?:rm|stop)/);
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {
@@ -52,10 +113,13 @@ test('backend deploy accepts only immutable digests and real API responses', () 
   const release = read('.github/workflows/release.yml');
 
   assert.match(deploy, /CIRCLE_BE_IMAGE.*sha256:\[0-9a-f\]\{64\}/);
-  assert.match(deploy, /2\*\|3\*\|401\|403/);
-  assert.doesNotMatch(deploy, /401\|403\|404/);
+  assert.match(deploy, /\[ "\$code" = "401" \]/);
+  assert.doesNotMatch(deploy, /2\*\|3\*\|401\|403/);
   assert.doesNotMatch(deploy, /skipping public smoke test/);
-  assert.doesNotMatch(release, /401\|403\|404/);
+  assert.match(release, /API_SMOKE_EXPECTED_STATUS/);
+  assert.match(release, /\[ "\$code" = "\$API_SMOKE_EXPECTED_STATUS" \]/);
+  assert.match(release, /\[ "\$API_SMOKE_EXPECTED_STATUS" = "404" \]/);
+  assert.doesNotMatch(release, /2\*\|3\*\|401\|403/);
 });
 
 test('downtime deployment restores the live app after migration or startup failure', () => {
@@ -74,8 +138,8 @@ test('admin deploy validates digests, uses strict smoke checks, and rolls back',
   assert.match(deploy, /rollback_admin\(\)/);
   assert.match(deploy, /ADMIN_WEB_IMAGE="\$previous_image"/);
   assert.match(deploy, /index:2\*\|index:3\*/);
-  assert.match(deploy, /api:2\*\|api:401\|api:403/);
-  assert.doesNotMatch(deploy, /api:404|index:401|index:403/);
+  assert.match(deploy, /api:401/);
+  assert.doesNotMatch(deploy, /api:2\*|api:3\*|api:403|api:404|index:401|index:403/);
   assert.match(deploy, /if ! wait_running/);
   assert.match(deploy, /rollback_admin/);
 });
