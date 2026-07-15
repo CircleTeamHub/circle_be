@@ -49,6 +49,33 @@ test('backend release gate actions are pinned to full commit SHAs', () => {
   }
 });
 
+test('releasable ARM64 image is scanned before either registry push', () => {
+  const workflow = read('.github/workflows/build-image.yml');
+  const build = workflow.indexOf('- name: Build and load ARM64 image');
+  const scan = workflow.indexOf('- name: Scan releasable ARM64 image');
+  const push = workflow.indexOf('- name: Push scanned image tags');
+
+  assert.match(workflow, /platforms: linux\/arm64/);
+  assert.match(workflow, /push: false/);
+  assert.match(workflow, /load: true/);
+  assert.match(
+    workflow,
+    /aquasecurity\/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8/,
+  );
+  assert.match(
+    workflow,
+    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}/,
+  );
+  assert.ok(
+    build >= 0 && build < scan,
+    'the ARM64 image must be built before scanning',
+  );
+  assert.ok(scan < push, 'the blocking scan must finish before registry pushes');
+  assert.doesNotMatch(workflow.slice(0, scan), /push: true|docker push/);
+  assert.match(workflow.slice(push), /docker push "\$SHA_IMAGE"/);
+  assert.match(workflow.slice(push), /docker push "\$MAIN_IMAGE"/);
+});
+
 test('backend deploy accepts only immutable digests and real API responses', () => {
   const deploy = read('deploy/release-deploy.sh');
   const release = read('.github/workflows/release.yml');

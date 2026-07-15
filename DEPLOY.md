@@ -110,7 +110,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ```
 push main ──► build-image.yml:QEMU 交叉构建 linux/arm64
-                └─► ghcr.io/circleteamhub/circle_be:sha-<commit>(+ :main)
+                └─► 阻断式 Trivy 扫描该 ARM64 镜像
+                    └─► 通过后才 push sha-<commit>(+ :main)
 
 push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
@@ -121,8 +122,8 @@ push tag v* ──► release.yml:
   notify   Discord 通知,成功失败都发(if: always())
 ```
 
-要点:**部署的镜像与 main 上通过全量 CI 的是同一个 digest**(发布不重新构建,
-所以 release 里也不重复跑测试——"在 main 上绿"就是发版门禁);
+要点:**部署的镜像就是 main 上完成阻断式 ARM64 扫描的 digest**(发布不重新构建;
+PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实际发布产物);
 构建发生在 merge 时,发版本身通常 2–3 分钟。
 
 ### 服务器上:蓝绿切换,失败自动回滚

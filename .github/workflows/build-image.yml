@@ -1,10 +1,10 @@
 # Build-once half of the build-once-promote release architecture.
 #
-# Every push to main cross-builds the production image for the Oracle ARM box
-# and pushes it to GHCR as `sha-<commit>` (immutable) plus a `main` convenience
-# tag. A release (release.yml) then *promotes* an existing sha image by
+# Every push to main cross-builds the production image for the Oracle ARM box,
+# scans that exact ARM64 image, and only then pushes `sha-<commit>` (immutable)
+# plus a `main` convenience tag. A release (release.yml) then *promotes* it by
 # stamping it with the version tag — no rebuild — which guarantees the deployed
-# artifact is byte-identical to what main's CI validated, and keeps releases
+# artifact is byte-identical to the ARM64 image scanned here and keeps releases
 # down to minutes.
 #
 # If this build fails, release.yml fails closed instead of rebuilding source at
@@ -35,7 +35,7 @@ permissions:
 jobs:
   build_push:
     runs-on: ubuntu-latest
-    name: "Build & push linux/arm64 image"
+    name: "Build, scan & push linux/arm64 image"
     timeout-minutes: 90
     permissions:
       contents: read
@@ -64,13 +64,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and load ARM64 image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.prod
           platforms: linux/arm64
-          push: true
+          push: false
+          load: true
           tags: |
             ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
             ${{ steps.meta.outputs.repo }}:main
@@ -82,6 +83,25 @@ jobs:
           provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan releasable ARM64 image
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1"
+
+      - name: Push scanned image tags
+        env:
+          SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+          MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main
+        run: |
+          set -euo pipefail
+          docker push "$SHA_IMAGE"
+          docker push "$MAIN_IMAGE"
 
       # A missing main image blocks release, so report build failure loudly.
       - name: Notify Discord on failure
