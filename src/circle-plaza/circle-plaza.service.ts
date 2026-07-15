@@ -20,6 +20,7 @@ import {
   encodeFeedCursor,
   feedCursorWhere,
 } from 'src/utils/feed-cursor';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   CreatePlazaPostDto,
   MyCirclePostDto,
@@ -704,7 +705,24 @@ export class CirclePlazaService {
 
     let updated: { signupCount: number };
     try {
-      updated = await this.prisma.$transaction(async (tx) => {
+      updated = await runSerializableTransaction(this.prisma, async (tx) => {
+        const stillAuthorized = await tx.circlePost.findFirst({
+          where: {
+            ...this.activeUnexpiredPostWhere(),
+            id: postId,
+            circleLinks: {
+              some: { circle: this.memberCircleScope(userId) },
+            },
+          },
+          select: { id: true },
+        });
+        if (!stillAuthorized) {
+          throw new NotFoundException({
+            message: 'Post not found',
+            errorCode: PlazaErrorCode.PostNotFound,
+          });
+        }
+
         await tx.circlePostSignup.create({
           data: { postID: postId, userID: userId },
         });
