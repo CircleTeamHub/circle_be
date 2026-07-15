@@ -21,9 +21,9 @@
 | F-08 upload size cap | P2 | ✅ Fixed (sizeBytes @Max + ContentLength binding) |
 | F-09 refresh-token pruning | P2 | ✅ Fixed — daily cleanup cron |
 | F-10 logs console.log | P3 | ✅ Fixed — PR #46 |
-| F-07 register enumeration | P2 | ◻︎ Open — accept-risk reasonable |
-| F-11 whatsup privacy gate | P3 | ◻︎ Open — product decision (default + client toggle) |
-| F-12 SERIALIZABLE tuning | P3 | ◻︎ Deferred — needs load data |
+| F-07 register enumeration | P2 | ⛔ Won't-fix — **accepted 2026-07-15** (rate-limited; the clear "already registered" UX is preferred) |
+| F-11 whatsup privacy gate | P3 | ❌ **Invalid (false positive)** — `whatsup` is a public status line ("Coding every day"), not a WhatsApp/contact handle; correctly ungated like `persona`/`helloWords` |
+| F-12 SERIALIZABLE tuning | P3 | ⛔ Won't-fix now — **monitor** (accepted 2026-07-15; correct + safe today, revisit only with APM contention data) |
 
 Method: repository-wide, partitioned review (architecture map → partitions →
 per-partition read) conducted directly in-session. Every confirmed finding cites
@@ -180,7 +180,7 @@ No **P0** findings.
 - Fix: return a generic "resource already exists" to clients; keep the field name in the server log only.
 
 **F-07 — Registration/email-code path is a user-enumeration oracle**
-- Severity **P2** · Privacy/Security · Partition P1 · Confidence High · Confirmed (accept-risk reasonable)
+- Severity **P2** · Privacy/Security · Partition P1 · Confidence High · **⛔ Won't-fix — accepted 2026-07-15** (rate-limited; clear "already registered" UX preferred)
 - Affected: `src/auth/email-verification.service.ts` (`REGISTER` + existing user → 409 "该邮箱已注册"); `src/auth/auth.service.ts`.
 - Impact: requesting a **register** code for an existing email returns a distinct 409, revealing it's registered. (The **login** path is correctly silent for unknown emails; password login uses a single generic error — good.) Gated behind resend cooldown + per-IP `emailCodeLimiter`.
 - Fix: if enumeration resistance is required, return a generic "if this email can be registered, we've sent a code" and handle the duplicate at verify time.
@@ -206,12 +206,13 @@ No **P0** findings.
 - Fix: remove the placeholder controller or use the structured logger.
 
 **F-11 — `whatsup` (WhatsApp) never privacy-gated**
-- Severity **P3** · Privacy consistency · Partition P2 · Confidence High · Confirmed (product decision)
+- Severity **P3** · Privacy consistency · Partition P2 · Confidence High · **❌ Invalid — false positive (2026-07-15)**
+- **Correction:** `whatsup` is a free-text public status line (DTO example "Coding every day", `@MaxLength(100)`, grouped with `persona`/`helloWords`), **not** a WhatsApp/contact handle. The original finding mislabeled it. Public status is meant to be visible like the other bio fields; only true contact info (phone/wechat/qq) is privacy-gated. No change needed.
 - Affected: `applyProfilePrivacy` gates only phone/wechat/qq; `whatsup` is `@Expose()`d on `PublicUserDto`.
 - Fix: include `whatsup` in the privacy-gated set if it's considered contact PII.
 
 **F-12 — `SERIALIZABLE` transactions on hot wallet/credit rows**
-- Severity **P3** · Performance · Partition P7 · Confidence Medium · Needs confirmation (load-dependent)
+- Severity **P3** · Performance · Partition P7 · Confidence Medium · **⛔ Won't-fix now — monitor (accepted 2026-07-15)**; correct + safe today, revisit only with APM contention data
 - Affected: `runSerializableTransaction` in `sendGift`/`adminTopUp` (`src/coin/coin.service.ts`) and `applyDelta` (`src/credit/credit.service.ts`).
 - Note: correct and safe, but `SERIALIZABLE` can produce serialization failures/retries under concurrent writes to a popular recipient/creditee. The atomic conditional `updateMany`/`FOR UPDATE` alone already prevents lost updates at a lower isolation level.
 - Fix: consider `READ COMMITTED` + existing atomic guards + explicit retry-on-40001 for throughput, if APM shows contention. Not urgent.
