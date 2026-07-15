@@ -8,6 +8,23 @@
 > findings here are **F-01…F-12**; a few cross-link (F-04 ↔ C-01, coin-gift
 > idempotency ↔ C-04).
 
+## Remediation status (updated 2026-07-15)
+
+| Finding | Sev | Status |
+|---|---|---|
+| F-01 search privacy | P1 | ✅ Fixed — PR #46 |
+| F-02 stateless access token | P1 | ✅ Fixed — Redis session revocation, fail-open |
+| F-03 public chat/notes media | P1 | ⛔ Won't-fix — **accepted 2026-07-15**: media kept public (UUID keys, "have-link-can-view" is acceptable per product) |
+| F-04 trust proxy | P1 | ✅ Fixed (landed before this pass) |
+| F-05 dev email bypass | P2 | ✅ Fixed — PR #46 (explicit opt-in) |
+| F-06 conflict field leak | P2 | ✅ Fixed — PR #46 |
+| F-08 upload size cap | P2 | ✅ Fixed (sizeBytes @Max + ContentLength binding) |
+| F-09 refresh-token pruning | P2 | ✅ Fixed — daily cleanup cron |
+| F-10 logs console.log | P3 | ✅ Fixed — PR #46 |
+| F-07 register enumeration | P2 | ◻︎ Open — accept-risk reasonable |
+| F-11 whatsup privacy gate | P3 | ◻︎ Open — product decision (default + client toggle) |
+| F-12 SERIALIZABLE tuning | P3 | ◻︎ Deferred — needs load data |
+
 Method: repository-wide, partitioned review (architecture map → partitions →
 per-partition read) conducted directly in-session. Every confirmed finding cites
 code evidence. No exploit payloads. Fewer high-quality findings preferred over
@@ -128,7 +145,7 @@ No **P0** findings.
 - Tests: set wechat/qq private → assert both `/user/:id` and `/user/search/account` return `null` for them.
 
 **F-02 — Access token not invalidated on logout / ban / role change**
-- Severity **P1** · Security (session) · Partition P1 · Confidence High · Confirmed
+- Severity **P1** · Security (session) · Partition P1 · Confidence High · **✅ Fixed 2026-07-15 — Redis session revocation (fail-open)**
 - Affected: `src/auth/auth.strategy.ts` (stateless `validate`); `src/auth/auth.service.ts` `logout` (revokes only the refresh token).
 - Description: `JwtStrategy.validate()` returns claims with **no DB lookup**, and the `sid` claim is never checked against revoked sessions. `logout()` revokes the refresh token only. A leaked/stolen access token — or a banned user's / demoted admin's token — stays valid until natural expiry (`JWT_EXPIRES_IN`=1h).
 - Impact: logout gives no immediate server-side invalidation; ban/role-downgrade has up to a 1h window. Partially mitigated: the **refresh** path re-checks `status !== ACTIVE` and revokes.
@@ -136,7 +153,7 @@ No **P0** findings.
 - (Severity is requirement-dependent; downgrade to P2 if a 1h ceiling is acceptable.)
 
 **F-03 — Public object store exposes chat/note media by URL**
-- Severity **P1** · Privacy · Partition P6 · Confidence High · Confirmed (product-intent = Needs confirmation)
+- Severity **P1** · Privacy · Partition P6 · Confidence High · **⛔ Won't-fix — accepted 2026-07-15 (media kept public; UUID keys, product-accepted)**
 - Affected: `buildPublicReadBucketPolicy` in `src/upload/upload.service.ts`; `docker-compose.prod.yml` (`minio` publishes `9000:9000`, `mc anonymous set download`).
 - Description: The bucket policy grants `s3:GetObject` to `Principal:'*'` for prefixes `avatars, covers, posts, notes, chat, uploads`, and MinIO :9000 is published to the internet. Every uploaded object — including **private chat images and note media** — is unauthenticated-readable by anyone with the URL, no expiry.
 - Impact: keys are `folder/userId/uuid.ext` (UUIDv4 — not enumerable), so not mass-harvestable, but any leaked URL (screenshots, referer, logs, forwarded links) grants permanent access to what users believe is private DM/notes content.
@@ -169,13 +186,13 @@ No **P0** findings.
 - Fix: if enumeration resistance is required, return a generic "if this email can be registered, we've sent a code" and handle the duplicate at verify time.
 
 **F-08 — No server-side size cap on presigned uploads**
-- Severity **P2** · Performance/Abuse · Partition P6 · Confidence High · Confirmed
+- Severity **P2** · Performance/Abuse · Partition P6 · Confidence High · **✅ Fixed (sizeBytes @Max 100MB + ContentLength binding)**
 - Affected: `src/upload/upload.service.ts` `presign` (builds a `PutObjectCommand` with no `ContentLengthRange`).
 - Impact: content-type is allowlisted (DTO — good) but there's no max object size. A client can upload arbitrarily large "video/mp4" objects into a public bucket → storage/bandwidth abuse, disk exhaustion. Presign is rate-limited per user (20/min), which bounds count but not per-object size.
 - Fix: enforce a max size via a presigned POST policy (`content-length-range`) or a MinIO per-bucket object-size limit; validate declared size in the DTO.
 
 **F-09 — Unbounded-growth tables without a pruning job**
-- Severity **P2** · Performance/Stability · Partition P8 · Confidence Medium · Needs confirmation (retention = product decision)
+- Severity **P2** · Performance/Stability · Partition P8 · Confidence Medium · **✅ Fixed 2026-07-15 — daily refresh-token pruning cron** (Notification/FriendActivity retention still a product decision)
 - Affected: `RefreshToken`, `Notification`, `FriendActivity` (schema); ledgers `CoinTransaction`/`CreditEvent` (intentionally retained).
 - Impact: `RefreshToken` rows are marked revoked/expired but never deleted; `Notification`/`FriendActivity` grow indefinitely. Cleanup crons exist for temp-chat/circle-plaza/calls but not these. Gradual (tables are well-indexed), not acute.
 - Fix: low-frequency cron to delete refresh tokens where `expiredAt < now()` (or `revokedAt` older than N days) and to archive/expire old notifications.
