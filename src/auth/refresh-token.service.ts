@@ -2,6 +2,7 @@ import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomBytes } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SessionRevocationService } from './session-revocation.service';
 
 const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
 const MAX_DEVICE_NAME_LENGTH = 64;
@@ -44,6 +45,7 @@ export class RefreshTokenService {
   constructor(
     private prisma: PrismaService,
     private config: ConfigService,
+    private readonly revocation: SessionRevocationService,
   ) {
     const raw = this.config.get<string | number>('REFRESH_EXPIRES_IN_DAYS');
     const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : raw;
@@ -164,10 +166,20 @@ export class RefreshTokenService {
 
   async revoke(token: string): Promise<void> {
     const tokenHash = hashToken(token);
+    // The row id is the session id carried in the access token's `sid` claim;
+    // fetch it so we can revoke the matching access token too (F-02), not just
+    // the refresh token.
+    const existing = await this.prisma.refreshToken.findUnique({
+      where: { token: tokenHash },
+      select: { id: true },
+    });
     await this.prisma.refreshToken.updateMany({
       where: { token: tokenHash, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    if (existing) {
+      await this.revocation.revokeSession(existing.id);
+    }
   }
 
   listActiveSessions(userId: string) {
@@ -197,6 +209,9 @@ export class RefreshTokenService {
       where: { userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    // Kill every access token this user already holds (logout-all / ban /
+    // password change / reuse detection), not just their refresh tokens (F-02).
+    await this.revocation.revokeUser(userId);
   }
 
   async revokeSession(userId: string, sessionId: string): Promise<void> {
@@ -204,6 +219,7 @@ export class RefreshTokenService {
       where: { id: sessionId, userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    await this.revocation.revokeSession(sessionId);
   }
 
   async revokeOtherSessions(
@@ -222,5 +238,10 @@ export class RefreshTokenService {
       },
       data: { revokedAt: new Date() },
     });
+    // Accepted residual (F-02): single-device-login revokes the OTHER devices'
+    // refresh tokens (they can't continue past the access-token TTL), but not
+    // their in-flight access tokens — revoking the user here would also kill the
+    // current session's still-valid token. The security-critical paths
+    // (logout / ban / password change) are immediate via revoke*/revokeUser.
   }
 }
