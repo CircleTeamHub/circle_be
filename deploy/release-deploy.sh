@@ -21,8 +21,8 @@
 #   caddy/admin_web 属开通期资产(DEPLOY.md §4),发版不 pull 不重建;
 # - 本机永不构建镜像(--no-build);
 # - 顺序:锁 → 拉镜像 → 备份数据库 → 迁移 → 起新色 → 容器健康门禁 →
-#   停旧色 → 公网烟测 → 删旧色;任何一步失败都让 CI 变红,
-#   烟测失败会自动把旧版本拉回来。
+#   校验/切换代理 → 公网烟测 → 停删旧色;任何一步失败都让 CI 变红,
+#   烟测失败会自动把代理切回旧版本并清理新色。
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -81,7 +81,7 @@ switch_proxy() {
   fi
   if ! compose exec -T -e "CIRCLE_BE_UPSTREAM=$target" caddy \
     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "Caddy configuration validation failed; refusing to reload." >&2
+    echo "Caddy validation failed for upstream $target." >&2
     return 1
   fi
   compose exec -T -e "CIRCLE_BE_UPSTREAM=$target" caddy \
@@ -214,7 +214,7 @@ restore_live() {
 # 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
 # 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
 smoke() {
-  local api_domain attempt code
+  local api_domain attempt code headers body
   api_domain="$(sed -n 's/^API_DOMAIN=//p' .env | tail -n 1)"
   if [ -z "$api_domain" ]; then
     echo "API_DOMAIN is unset; public smoke verification is mandatory" >&2
@@ -224,17 +224,30 @@ smoke() {
     echo "caddy is not running; public smoke verification cannot proceed" >&2
     return 1
   fi
+
+  headers="$(mktemp)"
+  body="$(mktemp)"
   for attempt in $(seq 1 12); do
-    code="$(curl -m 5 -s -o /dev/null -w '%{http_code}' "https://$api_domain/api/v1/auth/me" || echo 000)"
+    : >"$headers"
+    : >"$body"
+    if ! code="$(curl -m 5 -sS -H 'Accept: application/json' -D "$headers" -o "$body" \
+      -w '%{http_code}' "https://$api_domain/api/v1/auth/me")"; then
+      code=000
+    fi
     case "$code" in
-      2*|3*|401|403)
-        echo "public smoke ok (HTTP $code via https://$api_domain)"
-        return 0
+      401|403)
+        if grep -Eqi '^content-type:[[:space:]]*application/(problem\+)?json([;[:space:]]|$)' "$headers"; then
+          echo "public smoke ok (HTTP $code JSON via https://$api_domain)"
+          rm -f "$headers" "$body"
+          return 0
+        fi
         ;;
     esac
     sleep 5
   done
-  echo "public smoke failed after 12 attempts (last HTTP $code)" >&2
+  echo "public smoke failed after 12 attempts (last HTTP $code; expected 401/403 JSON)" >&2
+  head -c 500 "$body" >&2 || true
+  rm -f "$headers" "$body"
   return 1
 }
 
