@@ -20,6 +20,7 @@ export class PrivacySettingsDto {
   showPhone: boolean;
   showWechat: boolean;
   showQQ: boolean;
+  showWhatsup: boolean;
   addMeByAccount: boolean;
   addMeByPhone: boolean;
   addMeByQrCode: boolean;
@@ -59,6 +60,11 @@ export class UpdatePrivacySettingsDto {
   @IsOptional()
   @IsBoolean()
   showQQ?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  showWhatsup?: boolean;
 
   @ApiPropertyOptional()
   @IsOptional()
