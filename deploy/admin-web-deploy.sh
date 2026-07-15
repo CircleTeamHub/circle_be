@@ -118,18 +118,37 @@ rollback_admin() {
 }
 
 smoke_url() {
-  local url="$1" label="$2" mode="$3" attempt code
+  local url="$1" label="$2" mode="$3" attempt code headers body
+  headers="$(mktemp)"
+  body="$(mktemp)"
   for attempt in $(seq 1 12); do
-    code="$(curl -m 5 -s -o /dev/null -w '%{http_code}' "$url" || echo 000)"
+    : >"$headers"
+    : >"$body"
+    if ! code="$(curl -m 5 -sS -H 'Accept: application/json, text/html' -D "$headers" -o "$body" \
+      -w '%{http_code}' "$url")"; then
+      code=000
+    fi
     case "$mode:$code" in
-      index:2*|index:3*|api:401)
-        echo "smoke ok: $label (HTTP $code)"
-        return 0
+      index:2*)
+        if grep -Eqi '^content-type:[[:space:]]*text/html([;[:space:]]|$)' "$headers"; then
+          echo "smoke ok: $label (HTTP $code HTML)"
+          rm -f "$headers" "$body"
+          return 0
+        fi
+        ;;
+      api:401|api:403)
+        if grep -Eqi '^content-type:[[:space:]]*application/(problem\+)?json([;[:space:]]|$)' "$headers"; then
+          echo "smoke ok: $label (HTTP $code JSON)"
+          rm -f "$headers" "$body"
+          return 0
+        fi
         ;;
     esac
     sleep 5
   done
-  echo "smoke failed: $label after 12 attempts (last HTTP $code)" >&2
+  echo "smoke failed: $label after 12 attempts (last HTTP $code or wrong Content-Type)" >&2
+  head -c 500 "$body" >&2 || true
+  rm -f "$headers" "$body"
   return 1
 }
 

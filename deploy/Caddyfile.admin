@@ -2,17 +2,6 @@
 	email {$ACME_EMAIL}
 }
 
-(backend_proxy) {
-	reverse_proxy {$BACKEND_UPSTREAMS:circle-be-blue:3000 circle-be-green:3000} {
-		lb_policy first
-		health_uri /api/v1/outbox/health
-		health_interval 5s
-		health_timeout 3s
-		health_status 401
-		lb_try_duration 30s
-	}
-}
-
 {$API_DOMAIN} {
 	@metrics path /metrics /metrics/*
 	handle @metrics {
@@ -24,13 +13,13 @@
 	}
 
 	handle {
-		import backend_proxy
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
 	}
 }
 
 {$ADMIN_DOMAIN} {
 	handle /api/* {
-		import backend_proxy
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
 	}
 
 	handle {
