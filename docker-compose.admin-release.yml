@@ -1,0 +1,7 @@
+# admin_web 发版 overlay —— 由 deploy/admin-web-deploy.sh 使用(circle_admin_web
+# 仓库的 release.yml 通过 SSH 驱动),把管理端钉到 CI 推到 GHCR 的版本镜像。
+# 与 docker-compose.release.yml(circle_be 蓝绿)相互独立:两条发版线各自
+# 只叠加自己的 overlay,互不需要对方的环境变量。
+services:
+  admin_web:
+    image: ${ADMIN_WEB_IMAGE:?export ADMIN_WEB_IMAGE, e.g. via deploy/admin-web-deploy.sh}
