@@ -907,24 +907,28 @@ describe('CirclePlazaService', () => {
       );
     });
 
-    it('loads the signer membership match from linked circles before signup', async () => {
+    it('rechecks active linked-circle membership inside the serializable signup transaction', async () => {
       prisma.circlePost.findFirst.mockResolvedValue(activePost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue(eligibleViewer);
       prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 1 });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
 
-      await service.signupForPost('user-2', 'post-1');
+      const result = await service.signupForPost('user-2', 'post-1');
 
-      expect(prisma.circlePost.findFirst).toHaveBeenCalledWith(
+      expect(result).toEqual({ signed: true, signupCount: 3 });
+      expect(prisma.$transaction).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({ isolationLevel: 'Serializable' }),
+      );
+      expect(prisma.circlePost.findFirst).toHaveBeenCalledTimes(2);
+      expect(prisma.circlePost.findFirst).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({
           where: expect.objectContaining({
             id: 'post-1',
-            circleLinks: { some: { circle: { deleted: false } } },
-          }),
-          select: expect.objectContaining({
             circleLinks: {
-              where: {
+              some: {
                 circle: {
                   deleted: false,
                   members: {
@@ -932,10 +936,9 @@ describe('CirclePlazaService', () => {
                   },
                 },
               },
-              select: { id: true },
-              take: 1,
             },
           }),
+          select: { id: true },
         }),
       );
     });
