@@ -14,8 +14,35 @@ test('Caddy routes admin API requests directly to the blue-green backend', () =>
   assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
   assert.match(
     adminBlock,
-    /handle \/api\/\*[\s\S]*reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle_be\}:3000/,
+    /handle \/api\/\*[\s\S]*reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle-be-blue:3000\}/,
   );
+  assert.doesNotMatch(caddy, /\}:3000/);
+});
+
+test('Caddy switches only between unique blue-green container endpoints', () => {
+  const caddy = read('deploy/Caddyfile.admin');
+  const deploy = read('deploy/release-deploy.sh');
+  const productionCompose = read('docker-compose.prod.yml');
+  const releaseCompose = read('docker-compose.release.yml');
+  const healthGate = deploy.indexOf('if ! wait_healthy "$standby" 300; then');
+  const cutover = deploy.indexOf('if ! switch_proxy "$standby"; then');
+
+  assert.doesNotMatch(productionCompose, /circle-be-app/);
+  assert.doesNotMatch(releaseCompose, /circle-be-app/);
+  assert.doesNotMatch(releaseCompose, /^\s*- circle_be\s*$/m);
+  assert.match(productionCompose, /container_name:\s*circle-be-blue/);
+  assert.match(
+    releaseCompose,
+    /circle_be_green:[\s\S]*container_name:\s*circle-be-green/,
+  );
+  assert.match(caddy, /CIRCLE_BE_UPSTREAM:circle-be-blue/);
+  assert.match(deploy, /container_upstream\(\)/);
+  assert.match(
+    deploy,
+    /if ! name="\$\(docker inspect --format '\{\{\.Name\}\}' "\$cid"\)" \|\| \[ -z "\$name" \]; then/,
+  );
+  assert.match(deploy, /target="\$\(container_upstream "\$1"\)"/);
+  assert.ok(healthGate >= 0 && healthGate < cutover, 'standby health must precede cutover');
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {

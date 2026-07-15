@@ -134,7 +134,8 @@ PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
 → prisma migrate deploy(用发布镜像跑)
 → 起另一色容器(circle_be / circle_be_green 交替)
-→ 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色 → 走公网域名烟测
+→ 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
+  (`circle-be-blue` / `circle-be-green`)→ 走公网域名烟测
 → 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
 ```
 
@@ -196,7 +197,8 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   与 circle_be 发版共用互斥锁)。它需要的 secrets/vars 与上表相同 ——
   建议配成 **组织级** secrets,两个仓库共用。
   **顺序要求**:先部署本仓库变更，让 Caddy 接管管理域名的 `/api/*` 并根据
-  `CIRCLE_BE_UPSTREAM` 直连当前在役颜色，再发布只提供静态文件的 admin_web 镜像。
+  `CIRCLE_BE_UPSTREAM` 直连当前在役颜色的唯一容器端点，再发布只提供静态文件的
+  admin_web 镜像。
 - **App(风信,Expo/RN)**:workflow 在 `Circle_frontend` 仓库
   (`release-android.yml`,tag `v*` 触发):全量质量门禁 → 用正式 keystore 构建
   release APK(版本号取自 tag)→ 挂到 GitHub Release + Discord 通知。

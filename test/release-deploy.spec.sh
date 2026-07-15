@@ -80,6 +80,14 @@ if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then exit 0; fi
 if [ "${1:-}" = "inspect" ]; then
   container="$(last_arg "$@")"
   service="${container#cid-}"
+  if printf '%s\n' "$*" | grep -q '{{.Name}}'; then
+    case "$service" in
+      circle_be) printf '/circle-be-blue\n' ;;
+      circle_be_green) printf '/circle-be-green\n' ;;
+      *) exit 92 ;;
+    esac
+    exit 0
+  fi
   if [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
     printf 'healthy\n'
   else
@@ -221,8 +229,8 @@ test_proxy_switch_precedes_old_color_retirement() {
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
   run_release || return 1
   assert_active_color circle_be_green &&
-    assert_reload_target circle_be_green &&
-    assert_command_before 'CIRCLE_BE_UPSTREAM=circle_be_green' 'stop circle_be' &&
+    assert_reload_target circle-be-green:3000 &&
+    assert_command_before 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' 'stop circle_be' &&
     assert_running circle_be_green && assert_absent circle_be
 }
 
@@ -233,7 +241,7 @@ test_smoke_failure_restores_proxy_before_removing_standby() {
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
   SMOKE_CODE=500
   ! run_release || return 1
-  assert_reload_target circle_be_green && assert_reload_target circle_be &&
+  assert_reload_target circle-be-green:3000 && assert_reload_target circle-be-blue:3000 &&
     assert_active_color circle_be && assert_running circle_be &&
     assert_absent circle_be_green
 }
@@ -245,7 +253,7 @@ test_spa_html_response_restores_proxy_before_removing_standby() {
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
   SMOKE_CODE=200 SMOKE_CONTENT_TYPE=text/html
   ! run_release || return 1
-  assert_reload_target circle_be_green && assert_reload_target circle_be &&
+  assert_reload_target circle-be-green:3000 && assert_reload_target circle-be-blue:3000 &&
     assert_active_color circle_be && assert_running circle_be &&
     assert_absent circle_be_green
 }
@@ -255,7 +263,7 @@ test_downtime_switch_failure_restores_previous_color_first() {
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
   printf 'running\n' > "$TEST_STATE_DIR/caddy"
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
-  RELEASE_DOWNTIME=1 CADDY_RELOAD_FAIL_TARGET=circle_be_green
+  RELEASE_DOWNTIME=1 CADDY_RELOAD_FAIL_TARGET=circle-be-green:3000
   ! run_release || return 1
   assert_active_color circle_be && assert_running circle_be &&
     assert_absent circle_be_green &&
@@ -269,7 +277,7 @@ test_state_write_failure_rolls_proxy_back_before_cleanup() {
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
   PERSIST_FAIL_COLOR=circle_be_green
   ! run_release || return 1
-  assert_reload_target circle_be_green && assert_reload_target circle_be &&
+  assert_reload_target circle-be-green:3000 && assert_reload_target circle-be-blue:3000 &&
     assert_active_color circle_be && assert_running circle_be &&
     assert_absent circle_be_green
 }

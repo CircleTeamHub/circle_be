@@ -59,6 +59,20 @@ running() {
   compose ps -q --status running "$1" 2>/dev/null || true
 }
 
+container_upstream() {
+  local cid name
+  cid="$(running "$1")"
+  if [ -z "$cid" ]; then
+    echo "$1 has no running container" >&2
+    return 1
+  fi
+  if ! name="$(docker inspect --format '{{.Name}}' "$cid")" || [ -z "$name" ]; then
+    echo "Could not resolve the container endpoint for $1" >&2
+    return 1
+  fi
+  printf '%s:3000\n' "${name#/}"
+}
+
 RELEASE_STATE_DIR="${RELEASE_STATE_DIR:-.release}"
 
 recorded_live_color() {
@@ -74,7 +88,8 @@ persist_active_color() {
 }
 
 switch_proxy() {
-  local target="$1"
+  local target
+  target="$(container_upstream "$1")" || return 1
   if [ -z "$(running caddy)" ]; then
     echo "Caddy is not running; refusing to change the active app color." >&2
     return 1

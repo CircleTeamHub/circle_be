@@ -13,13 +13,13 @@
 	}
 
 	handle {
-		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000}
 	}
 }
 
 {$ADMIN_DOMAIN} {
 	handle /api/* {
-		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000}
 	}
 
 	handle {
