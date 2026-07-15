@@ -119,13 +119,6 @@ services:
       - ./.env.production:/app/.env.production:ro
     expose:
       - '3000'
-    networks:
-      default:
-        aliases:
-          # Caddy 只认这个别名。蓝绿发版时新旧两色容器同时挂在别名下,
-          # Go 的拨号器会依次尝试解析到的所有 IP,切换全程不断流
-          #(见 docker-compose.release.yml 与 deploy/release-deploy.sh)。
-          - circle-be-app
     healthcheck:
       # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
       test:

@@ -4,10 +4,10 @@
 # 做两件事:
 # 1. 把 circle_be / migrate 钉到 CI 推到 GHCR 的不可变版本镜像(服务器零构建;
 #    发版调用永远带 --no-build,基础文件里保留的 build: 不会生效);
-# 2. 定义蓝绿部署的另一色 circle_be_green:extends 复用 circle_be 的全部配置,
-#    两色共享网络别名 circle-be-app,Caddy 只认别名,不关心哪个颜色在服役。
+# 2. 定义蓝绿部署的另一色 circle_be_green:extends 复用 circle_be 的全部配置。
+#    Caddy 在健康门禁通过后显式切换到对应服务名,两色不共享实时流量别名。
 #
-# 注意:发版顺序(migrate → 起新色 → 健康门禁 → 烟测 → 停旧色)由
+# 注意:发版顺序(migrate → 起新色 → 健康门禁 → 切代理 → 烟测 → 停旧色)由
 # release-deploy.sh 显式编排(compose 调用带 --no-deps),不依赖 compose 的
 # 依赖图;green 从 extends 继承到的 depends_on 只在手动 `up` 时才起作用。
 services:
@@ -30,11 +30,3 @@ services:
       file: docker-compose.prod.yml
       service: circle_be
     image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
-    networks:
-      default:
-        aliases:
-          - circle-be-app
-          # 兼容别名:老版本 admin_web 的 nginx 反代目标是服务名 circle_be;
-          # 绿色在役、蓝色被删时靠这个别名保证旧主机名仍可解析,新旧 admin_web
-          # 都不断流。admin_web 全量换到 circle-be-app 后此别名仍无害。
-          - circle_be
