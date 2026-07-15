@@ -47,7 +47,9 @@ jobs:
         run: npm ci
 
       - name: Verify release contracts
-        run: node --test scripts/release-hardening.test.mjs
+        run: |
+          node --test scripts/release-hardening.test.mjs
+          bash test/release-deploy.spec.sh
 
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"

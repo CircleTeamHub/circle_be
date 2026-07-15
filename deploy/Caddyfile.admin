@@ -1,34 +1,28 @@
 {
-  email {$ACME_EMAIL}
+	email {$ACME_EMAIL}
 }
 
 {$API_DOMAIN} {
-  @metrics path /metrics /metrics/*
-  handle @metrics {
-    respond 404
-  }
+	@metrics path /metrics /metrics/*
+	handle @metrics {
+		respond 404
+	}
 
-  handle /circle/* {
-    reverse_proxy minio:9000
-  }
+	handle /circle/* {
+		reverse_proxy minio:9000
+	}
 
-  handle {
-    # circle-be-app 是蓝绿两色共享的网络别名(docker-compose.prod.yml)。
-    # 发版切换的短暂窗口里,拨号失败会在 30s 内自动重试,请求不落 502。
-    reverse_proxy circle-be-app:3000 {
-      lb_try_duration 30s
-    }
-  }
+	handle {
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+	}
 }
 
 {$ADMIN_DOMAIN} {
-  handle /api/* {
-    reverse_proxy circle-be-app:3000 {
-      lb_try_duration 30s
-    }
-  }
+	handle /api/* {
+		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle_be}:3000
+	}
 
-  handle {
-    reverse_proxy admin_web:80
-  }
+	handle {
+		reverse_proxy admin_web:80
+	}
 }

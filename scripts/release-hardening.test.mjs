@@ -12,8 +12,10 @@ test('Caddy routes admin API requests directly to the blue-green backend', () =>
 
   assert.notEqual(apiHandler, -1, 'ADMIN_DOMAIN must define an /api/* handler');
   assert.ok(apiHandler < siteHandler, 'the API handler must precede the static-site proxy');
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*reverse_proxy circle-be-app:3000/);
-  assert.match(adminBlock, /handle \/api\/\*[\s\S]*lb_try_duration 30s/);
+  assert.match(
+    adminBlock,
+    /handle \/api\/\*[\s\S]*reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle_be\}:3000/,
+  );
 });
 
 test('backend release SSH setup fails closed without pretrusted host keys', () => {
@@ -52,9 +54,12 @@ test('backend deploy accepts only immutable digests and real API responses', () 
   const release = read('.github/workflows/release.yml');
 
   assert.match(deploy, /CIRCLE_BE_IMAGE.*sha256:\[0-9a-f\]\{64\}/);
-  assert.match(deploy, /2\*\|3\*\|401\|403/);
+  assert.match(deploy, /401\|403/);
+  assert.match(deploy, /content-type:.*application\/\(problem\\\+\)\?json/i);
+  assert.doesNotMatch(deploy, /2\*\|3\*\|401\|403/);
   assert.doesNotMatch(deploy, /401\|403\|404/);
   assert.doesNotMatch(deploy, /skipping public smoke test/);
+  assert.match(release, /content-type:.*application\/\(problem\\\+\)\?json/i);
   assert.doesNotMatch(release, /401\|403\|404/);
 });
 
@@ -73,8 +78,11 @@ test('admin deploy validates digests, uses strict smoke checks, and rolls back',
   assert.match(deploy, /previous_image=.*\.Config\.Image/);
   assert.match(deploy, /rollback_admin\(\)/);
   assert.match(deploy, /ADMIN_WEB_IMAGE="\$previous_image"/);
-  assert.match(deploy, /index:2\*\|index:3\*/);
-  assert.match(deploy, /api:2\*\|api:401\|api:403/);
+  assert.match(deploy, /index:2\*/);
+  assert.match(deploy, /content-type:.*text\/html/i);
+  assert.match(deploy, /api:401\|api:403/);
+  assert.match(deploy, /content-type:.*application\/\(problem\\\+\)\?json/i);
+  assert.doesNotMatch(deploy, /api:2\*/);
   assert.doesNotMatch(deploy, /api:404|index:401|index:403/);
   assert.match(deploy, /if ! wait_running/);
   assert.match(deploy, /rollback_admin/);
@@ -83,7 +91,22 @@ test('admin deploy validates digests, uses strict smoke checks, and rolls back',
 test('backend CI blocks release contract regressions', () => {
   const ci = read('.github/workflows/ci.yml');
 
-  assert.match(ci, /run: node --test scripts\/release-hardening\.test\.mjs/);
+  assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
+  assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
+});
+
+test('release selection and active-color state fail closed', () => {
+  const release = read('.github/workflows/release.yml');
+  const deploy = read('deploy/release-deploy.sh');
+  const compose = read('docker-compose.prod.yml');
+
+  assert.match(release, /head_sha=\$SHA&event=push&branch=main&status=completed/);
+  assert.match(release, /--exclude=\/\.release/);
+  assert.match(deploy, /recorded_live_color\(\)/);
+  assert.match(deploy, /Refusing to guess which container is live/);
+  assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);
+  assert.match(deploy, /caddy validate --config \/etc\/caddy\/Caddyfile/);
+  assert.match(compose, /exec caddy run --resume/);
 });
 
 test('backend workflow and server use the same strict version format', () => {
