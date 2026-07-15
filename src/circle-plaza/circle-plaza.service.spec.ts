@@ -940,6 +940,82 @@ describe('CirclePlazaService', () => {
       );
     });
 
+    it('rechecks active linked-circle membership inside the serializable signup transaction', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(activePost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+      prisma.circlePostSignup.create.mockResolvedValue({ id: 's-1' });
+      prisma.circlePost.update.mockResolvedValue({ signupCount: 3 });
+
+      const result = await service.signupForPost('user-2', 'post-1');
+
+      expect(result).toEqual({ signed: true, signupCount: 3 });
+      expect(prisma.$transaction).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.objectContaining({ isolationLevel: 'Serializable' }),
+      );
+      expect(prisma.circlePost.findFirst).toHaveBeenNthCalledWith(2, {
+        where: {
+          status: 'ACTIVE',
+          OR: [
+            { expiresAt: { gt: expect.any(Date) } },
+            {
+              expiresAt: null,
+              createdAt: { gt: expect.any(Date) },
+            },
+          ],
+          id: 'post-1',
+          circleLinks: {
+            some: {
+              circle: {
+                deleted: false,
+                members: {
+                  some: { userID: 'user-2', status: 'ACTIVE' },
+                },
+              },
+            },
+          },
+        },
+        select: { id: true },
+      });
+    });
+
+    it('rejects signup when linked-circle membership is revoked before the transaction writes', async () => {
+      prisma.circlePost.findFirst
+        .mockResolvedValueOnce(activePost)
+        .mockResolvedValueOnce(null);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+      expect(prisma.circlePost.update).not.toHaveBeenCalled();
+    });
+
+    it('rechecks membership after a serializable conflict retry', async () => {
+      prisma.circlePost.findFirst
+        .mockResolvedValueOnce(activePost)
+        .mockResolvedValueOnce(null);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(eligibleViewer);
+      prisma.$transaction
+        .mockRejectedValueOnce(
+          Object.assign(new Error('serialization conflict'), { code: 'P2034' }),
+        )
+        .mockImplementationOnce(async (input: any) => input(prisma));
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        NotFoundException,
+      );
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+      expect(prisma.circlePost.update).not.toHaveBeenCalled();
+    });
+
     it('rejects new signup when the signer has no ACTIVE linked-circle membership', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         ...activePost,
