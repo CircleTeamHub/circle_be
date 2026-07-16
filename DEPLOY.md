@@ -110,7 +110,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ```
 push main ──► build-image.yml:QEMU 交叉构建 linux/arm64
-                └─► ghcr.io/circleteamhub/circle_be:sha-<commit>(+ :main)
+                └─► 阻断式 Trivy 扫描该 ARM64 镜像
+                    └─► 通过后才 push sha-<commit>(+ :main)
 
 push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
@@ -121,8 +122,8 @@ push tag v* ──► release.yml:
   notify   Discord 通知,成功失败都发(if: always())
 ```
 
-要点:**部署的镜像与 main 上通过全量 CI 的是同一个 digest**(发布不重新构建,
-所以 release 里也不重复跑测试——"在 main 上绿"就是发版门禁);
+要点:**部署的镜像就是 main 上完成阻断式 ARM64 扫描的 digest**(发布不重新构建;
+PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实际发布产物);
 构建发生在 merge 时,发版本身通常 2–3 分钟。
 
 ### 服务器上:蓝绿切换,失败自动回滚
@@ -133,7 +134,8 @@ push tag v* ──► release.yml:
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
 → prisma migrate deploy(用发布镜像跑)
 → 起另一色容器(circle_be / circle_be_green 交替)
-→ 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色 → 走公网域名烟测
+→ 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
+  (`circle-be-blue` / `circle-be-green`)→ 走公网域名烟测
 → 通过:停/删旧色,完成;失败:代理切回旧色并清理新色,CI 标红
 ```
 
@@ -195,7 +197,8 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   与 circle_be 发版共用互斥锁)。它需要的 secrets/vars 与上表相同 ——
   建议配成 **组织级** secrets,两个仓库共用。
   **顺序要求**:先部署本仓库变更，让 Caddy 接管管理域名的 `/api/*` 并根据
-  `CIRCLE_BE_UPSTREAM` 直连当前在役颜色，再发布只提供静态文件的 admin_web 镜像。
+  `CIRCLE_BE_UPSTREAM` 直连当前在役颜色的唯一容器端点，再发布只提供静态文件的
+  admin_web 镜像。
 - **App(风信,Expo/RN)**:workflow 在 `Circle_frontend` 仓库
   (`release-android.yml`,tag `v*` 触发):全量质量门禁 → 用正式 keystore 构建
   release APK(版本号取自 tag)→ 挂到 GitHub Release + Discord 通知。

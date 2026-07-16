@@ -103,6 +103,7 @@ services:
     restart: 'no'
 
   circle_be:
+    container_name: circle-be-blue
     build:
       context: .
       dockerfile: Dockerfile.prod
