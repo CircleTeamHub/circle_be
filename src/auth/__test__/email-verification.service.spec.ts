@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import { BadRequestException } from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { EmailVerificationService } from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -83,11 +83,14 @@ describe('EmailVerificationService', () => {
     expect(codes[0].codeHash).not.toMatch(/^\d{6}$/); // hashed, not plaintext
   });
 
-  it('requestCode(register) throws if email already registered', async () => {
+  it('requestCode(register) is silent for an already-registered email (F-07 anti-enumeration)', async () => {
     usersByEmail.add('a@b.com');
-    await expect(service.requestCode('a@b.com', 'REGISTER')).rejects.toThrow(
-      ConflictException,
-    );
+    // Must not reveal that the email is taken: no error, no code sent/stored.
+    // The duplicate is caught at registration commit by the email unique
+    // constraint (whose error is generic — see F-06).
+    await service.requestCode('a@b.com', 'REGISTER');
+    expect(mailer.sendVerificationCode).not.toHaveBeenCalled();
+    expect(codes).toHaveLength(0);
   });
 
   it('requestCode(login) is silent (no send) for unknown email', async () => {

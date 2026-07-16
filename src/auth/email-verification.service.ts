@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Inject,
   Injectable,
   Logger,
@@ -70,10 +69,10 @@ export class EmailVerificationService {
     });
 
     if (purpose === 'REGISTER' && userExists) {
-      throw new ConflictException({
-        message: '该邮箱已注册',
-        errorCode: AuthErrorCode.EmailTaken,
-      });
+      // 防账号枚举（F-07）：不再对已注册邮箱返回「已注册」的 409（那会泄漏邮箱是否已注册）。
+      // 静默成功、不发码；真正的重复在 verify 落库时由 email unique 约束兜底（错误已泛化，
+      // 见 F-06）。与下方 LOGIN 未注册的静默处理对称。
+      return;
     }
     if (purpose === 'LOGIN' && !userExists) {
       // 防账号枚举：未注册邮箱静默成功，不创建记录、不发信。

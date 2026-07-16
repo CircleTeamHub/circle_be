@@ -955,6 +955,7 @@ model UserPrivacySetting {
   showPhone               Boolean  @default(false)
   showWechat              Boolean  @default(true)
   showQQ                  Boolean  @default(true)
+  showWhatsup             Boolean  @default(true)
   addMeByAccount          Boolean  @default(true)
   addMeByPhone            Boolean  @default(false)
   addMeByQrCode           Boolean  @default(true)

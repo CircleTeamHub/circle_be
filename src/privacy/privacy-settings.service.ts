@@ -16,6 +16,7 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   showPhone: false,
   showWechat: true,
   showQQ: true,
+  showWhatsup: true,
   addMeByAccount: true,
   addMeByPhone: false,
   addMeByQrCode: true,
@@ -31,7 +32,7 @@ type StoredPrivacySettings = PrivacySettingsDto & {
   updatedAt?: Date;
 };
 
-type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq';
+type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
 
 @Injectable()
 export class PrivacySettingsService {
@@ -115,6 +116,7 @@ export class PrivacySettingsService {
     if (field === 'phoneNumber') return settings.showPhone;
     if (field === 'wechat') return settings.showWechat;
     if (field === 'qq') return settings.showQQ;
+    if (field === 'whatsup') return settings.showWhatsup;
     return isFriend;
   }
 
@@ -245,6 +247,7 @@ export class PrivacySettingsService {
       showPhone: settings.showPhone ?? DEFAULT_PRIVACY_SETTINGS.showPhone,
       showWechat: settings.showWechat ?? DEFAULT_PRIVACY_SETTINGS.showWechat,
       showQQ: settings.showQQ ?? DEFAULT_PRIVACY_SETTINGS.showQQ,
+      showWhatsup: settings.showWhatsup ?? DEFAULT_PRIVACY_SETTINGS.showWhatsup,
       addMeByAccount:
         settings.addMeByAccount ?? DEFAULT_PRIVACY_SETTINGS.addMeByAccount,
       addMeByPhone:

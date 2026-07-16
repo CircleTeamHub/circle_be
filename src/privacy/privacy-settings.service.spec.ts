@@ -27,6 +27,7 @@ describe('PrivacySettingsService', () => {
       showPhone: false,
       showWechat: true,
       showQQ: true,
+      showWhatsup: true,
       addMeByAccount: true,
       addMeByPhone: false,
       addMeByQrCode: true,
@@ -85,6 +86,7 @@ describe('PrivacySettingsService', () => {
       showPhone: false,
       showWechat: true,
       showQQ: false,
+      showWhatsup: false,
       groupInvitePermission: 'FRIENDS_ONLY',
       callPermission: 'FRIENDS_ONLY',
     });
@@ -98,6 +100,9 @@ describe('PrivacySettingsService', () => {
     await expect(
       service.canViewProfileField('target-1', 'wechat', false, false),
     ).resolves.toBe(true);
+    await expect(
+      service.canViewProfileField('target-1', 'whatsup', false, false),
+    ).resolves.toBe(false);
     await expect(
       service.canBeInvitedToGroupOrCircle('target-1', false),
     ).resolves.toBe(false);

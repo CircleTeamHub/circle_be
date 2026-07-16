@@ -63,6 +63,7 @@ type ProfilePrivacyUser = {
   phoneNumber?: string | null;
   wechat?: string | null;
   qq?: string | null;
+  whatsup?: string | null;
 };
 
 function normalizeBirthdayInput(value: string | null | undefined) {
@@ -258,27 +259,35 @@ export class UserService {
     // visibility is a global show/hide switch in the current model, not
     // friend-aware. If a "friends-only" profile tier is ever added, thread the
     // real friendship status through instead of this literal.
-    const [canViewPhone, canViewWechat, canViewQQ] = await Promise.all([
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'phoneNumber',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'wechat',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(user.id, 'qq', isSelf, false),
-    ]);
+    const [canViewPhone, canViewWechat, canViewQQ, canViewWhatsup] =
+      await Promise.all([
+        this.privacySettings.canViewProfileField(
+          user.id,
+          'phoneNumber',
+          isSelf,
+          false,
+        ),
+        this.privacySettings.canViewProfileField(
+          user.id,
+          'wechat',
+          isSelf,
+          false,
+        ),
+        this.privacySettings.canViewProfileField(user.id, 'qq', isSelf, false),
+        this.privacySettings.canViewProfileField(
+          user.id,
+          'whatsup',
+          isSelf,
+          false,
+        ),
+      ]);
 
     return {
       ...user,
       phoneNumber: canViewPhone ? user.phoneNumber : null,
       wechat: canViewWechat ? user.wechat : null,
       qq: canViewQQ ? user.qq : null,
+      whatsup: canViewWhatsup ? user.whatsup : null,
     };
   }
 
