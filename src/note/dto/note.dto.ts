@@ -453,6 +453,19 @@ export class NoteDetailDto extends NoteSummaryDto {
   sections: NoteSectionsResponseDto;
 }
 
+/**
+ * 访客侧解析 `/s/{token}` 的返回体。
+ *
+ * 只包含链接快照范围内、当前仍然可见的笔记摘要；`notes` 复用 NoteSummaryDto，
+ * 由 mapSummary 负责把 canEdit 置 false 并抹掉 collectedFrom（笔记主人私有）。
+ * 必须声明在 NoteSummaryDto 之后：装饰器在类定义时求值，提前引用会命中 TDZ。
+ */
+export class SharedNoteListDto {
+  @ApiProperty() title: string;
+  @ApiProperty({ type: [NoteSummaryDto] }) notes: NoteSummaryDto[];
+  @ApiPropertyOptional() expiresAt: Date | null;
+}
+
 // ── 收藏聊天中的笔记 → 复制入"我的笔记" ────────────────────────────────────────
 
 export const NOTE_COLLECT_CONVERSATION_TYPE = ['private', 'group'] as const;

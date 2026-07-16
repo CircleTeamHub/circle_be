@@ -177,6 +177,9 @@ export const NoteErrorCode = {
   NotFound: 'NOTE_NOT_FOUND',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',
+  // 访客侧解析分享链接失败。不存在 / 已吊销 / 已过期共用同一个码，
+  // 避免访客据此区分「链接从未存在」和「链接曾存在但被吊销」。
+  ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。

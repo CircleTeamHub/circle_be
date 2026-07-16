@@ -48,6 +48,7 @@ describe('NoteService', () => {
     },
     noteShareLink: {
       create: jest.fn(),
+      findUnique: jest.fn(),
     },
   };
 
@@ -2515,5 +2516,201 @@ describe('NoteService', () => {
         ],
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  // ── resolveShareLink（访客侧解析）──────────────────────────────────────────
+  // 规格来源：docs/note-share-links-todo.md 第 1 节（解析接口）与第 4 节
+  // （解析时重新校验笔记状态）。在此之前 NoteShareLink 只写不读，
+  // expiresAt / revokedAt 存了但从不校验。
+  describe('resolveShareLink', () => {
+    const shareLinkRow = {
+      id: 'share-1',
+      ownerID: 'user-1',
+      token: 'tok-abc',
+      title: '我的笔记',
+      status: null,
+      group: null,
+      groupID: null,
+      search: null,
+      noteIDs: [] as string[],
+      expiresAt: null as Date | null,
+      revokedAt: null as Date | null,
+      createdAt: new Date('2026-06-08T10:00:00.000Z'),
+      updatedAt: new Date('2026-06-08T10:00:00.000Z'),
+    };
+
+    const sharedNoteRow = {
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: '测试笔记',
+      content: '正文内容',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      // 收藏来源是笔记主人的私人定位标记，不能跟着分享链接泄漏给访客。
+      collectedFrom: { groupName: '私密来源群' },
+      createdAt: new Date('2026-04-09T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-09T10:00:00.000Z'),
+      groupMemberships: [],
+      coverMedia: null,
+    };
+
+    /** 捕获解析失败时抛出的异常，供「三种失败路径响应一致」断言比对。 */
+    const captureRejection = async (row: unknown): Promise<unknown> => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(row as never);
+      // 备好 findMany，这样「漏校验」的实现会成功返回而不是抛 TypeError —— 失败
+      // 信息才会明确指向缺失的过期/吊销校验本身。
+      prisma.note.findMany.mockResolvedValueOnce([]);
+      try {
+        await service.resolveShareLink('tok-abc');
+        throw new Error('expected resolveShareLink to reject');
+      } catch (error) {
+        return error;
+      }
+    };
+
+    it('resolves a valid token to the notes in the link snapshot', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        noteIDs: ['note-1'],
+      });
+      prisma.note.findMany.mockResolvedValueOnce([sharedNoteRow]);
+
+      const result = await service.resolveShareLink('tok-abc');
+
+      expect(prisma.noteShareLink.findUnique).toHaveBeenCalledWith({
+        where: { token: 'tok-abc' },
+      });
+      expect(result.title).toBe('我的笔记');
+      expect(result.notes).toHaveLength(1);
+      // 访客不是笔记主人：canEdit=false，collectedFrom 被抹掉。
+      expect(result.notes[0]).toMatchObject({
+        id: 'note-1',
+        ownerId: 'user-1',
+        canEdit: false,
+        collectedFrom: null,
+      });
+    });
+
+    it('rejects an expired token', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        expiresAt: new Date(Date.now() - 1000),
+      });
+      // 若实现漏掉过期校验，这一条会让它「成功」返回空列表，
+      // 断言随即报 "resolved instead of rejected"，直指缺失的校验。
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await expect(service.resolveShareLink('tok-abc')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      // 过期即拒绝，不得再去查笔记。
+      expect(prisma.note.findMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects a revoked token', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        revokedAt: new Date('2026-06-09T00:00:00.000Z'),
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await expect(service.resolveShareLink('tok-abc')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(prisma.note.findMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown token', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(null as never);
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await expect(service.resolveShareLink('tok-nope')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(prisma.note.findMany).not.toHaveBeenCalled();
+    });
+
+    it('returns an identical opaque error for unknown, revoked and expired tokens', async () => {
+      // 三条失败路径的响应必须逐字节一致，否则访客可以据此区分
+      // 「链接不存在」/「链接已被吊销」/「链接已过期」，从而探测链接是否存在。
+      const unknown = await captureRejection(null);
+      const revoked = await captureRejection({
+        ...shareLinkRow,
+        revokedAt: new Date('2026-06-09T00:00:00.000Z'),
+      });
+      const expired = await captureRejection({
+        ...shareLinkRow,
+        expiresAt: new Date(Date.now() - 1000),
+      });
+
+      for (const error of [unknown, revoked, expired]) {
+        expect(error).toBeInstanceOf(NotFoundException);
+      }
+      const body = (unknown as NotFoundException).getResponse();
+      expect((revoked as NotFoundException).getResponse()).toEqual(body);
+      expect((expired as NotFoundException).getResponse()).toEqual(body);
+    });
+
+    it('scopes resolution to the link owner and its stored snapshot filters', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        status: 'ACTIVE',
+        groupID: 'group-1',
+        search: '咖啡',
+        noteIDs: ['note-1', 'note-2'],
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      const where = prisma.note.findMany.mock.calls[0][0].where;
+      expect(where).toMatchObject({
+        ownerID: 'user-1',
+        id: { in: ['note-1', 'note-2'] },
+        status: 'ACTIVE',
+        groupMemberships: {
+          some: { groupID: 'group-1', group: { deletedAt: null } },
+        },
+      });
+      // docs 第 1 节：不能复用 getNote 的 `OR: [{ownerID}, {available:true}]`
+      // 放行逻辑 —— 那会让链接范围外的任意 available 笔记也被读出来。
+      expect(where.OR).not.toContainEqual({ available: true });
+      expect(where.OR).not.toContainEqual({ ownerID: 'user-1' });
+    });
+
+    it('re-checks note state at resolve time instead of trusting the snapshot', async () => {
+      // docs 第 4 节：链接创建后笔记可能被删除或取消 available，
+      // 解析时必须按当前状态过滤，不能信任 noteIDs 快照。
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        noteIDs: ['note-1'],
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      const where = prisma.note.findMany.mock.calls[0][0].where;
+      expect(where.available).toBe(true);
+      expect(where.status).toEqual({ not: 'DELETED' });
+    });
+
+    it('filters to ungrouped notes when the link snapshot stores group=ungrouped', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        group: 'ungrouped',
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      const where = prisma.note.findMany.mock.calls[0][0].where;
+      expect(where.groupMemberships).toEqual({
+        none: { group: { deletedAt: null } },
+      });
+    });
   });
 });
