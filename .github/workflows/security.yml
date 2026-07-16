@@ -8,9 +8,17 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.env.example'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.env.example'
   schedule:
     - cron: "0 6 * * 1" # weekly Monday 06:00 UTC full scan
 

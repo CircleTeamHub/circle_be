@@ -9,9 +9,18 @@ on:
   push:
     branches:
       - main
+    # Docs / example-env changes can't break the build — skip the whole matrix.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.env.example'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.env.example'
 
 # Cancel superseded runs on the same ref to save runner minutes.
 concurrency:
@@ -54,8 +63,12 @@ jobs:
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
 
-      - name: Run Tests
-        run: npm test
+      # Single test pass: `test:cov` runs the same Jest suite and enforces the
+      # coverage thresholds, so a separate `npm test` step just ran everything
+      # twice. Runs before the slower real-infra integration steps so unit
+      # failures short-circuit the job early.
+      - name: Run Tests (with coverage)
+        run: npm run test:cov
 
       - name: Real Redis integration
         run: npm run test:redis
@@ -65,9 +78,6 @@ jobs:
 
       - name: Real MinIO signed-upload integration
         run: npm run test:minio
-
-      - name: Coverage Report
-        run: npm run test:cov
 
       - name: Build Smoke
         run: npm run build
