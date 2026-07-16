@@ -9,6 +9,7 @@ global.beforeEach(async () => {
   appFactory = await AppFactory.init();
   await appFactory.initDB();
   app = appFactory.instance;
+  global.appFactory = appFactory;
 
   pactum.request.setBaseUrl(await app.getUrl());
   global.pactum = pactum;

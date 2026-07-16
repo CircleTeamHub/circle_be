@@ -15,6 +15,10 @@ export class AppFactory {
     return this.app;
   }
 
+  get database() {
+    return this.prisma;
+  }
+
   static async init() {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],

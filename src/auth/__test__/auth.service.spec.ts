@@ -6,6 +6,7 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
@@ -261,6 +262,26 @@ describe('AuthService', () => {
     expect(result.accessToken).toBe('access-token');
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
+  });
+
+  it('register returns service unavailable after exhausting uniqueness-race retries', async () => {
+    mockPrisma.user.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: ['inviteCode'] },
+      }),
+    );
+
+    await expect(
+      service.register({
+        email: 'exhausted@example.com',
+        code: '123456',
+        password: 'password1',
+        nickname: 'Exhausted',
+      } as any),
+    ).rejects.toThrow(ServiceUnavailableException);
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(10);
   });
 
   it('register throws BadRequest when code invalid', async () => {

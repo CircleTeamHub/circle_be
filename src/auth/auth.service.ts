@@ -16,7 +16,11 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
-import { generateUniqueRegistrationCode } from './account-id.unique';
+import {
+  generateUniqueRegistrationCode,
+  isRegistrationCodeUniqueCollision,
+  REGISTRATION_CODE_MAX_ATTEMPTS,
+} from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import {
@@ -903,7 +907,7 @@ export class AuthService {
   private async createRegisteredUser(
     data: Omit<Prisma.UserCreateInput, 'accountId' | 'inviteCode'>,
   ) {
-    const maxAttempts = 10;
+    const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const registrationCode = await generateUniqueRegistrationCode(
         this.prisma,
@@ -917,11 +921,9 @@ export class AuthService {
           },
         });
       } catch (error) {
-        if (
-          attempt < maxAttempts - 1 &&
-          this.isRegistrationCodeUniqueCollision(error)
-        ) {
-          continue;
+        if (isRegistrationCodeUniqueCollision(error)) {
+          if (attempt < maxAttempts - 1) continue;
+          break;
         }
         throw error;
       }
@@ -930,21 +932,6 @@ export class AuthService {
     throw new ServiceUnavailableException(
       'Failed to create a user with a unique registration code',
     );
-  }
-
-  private isRegistrationCodeUniqueCollision(error: unknown): boolean {
-    if (
-      !(error instanceof Prisma.PrismaClientKnownRequestError) ||
-      error.code !== 'P2002'
-    ) {
-      return false;
-    }
-    const target = error.meta?.target;
-    const fields = Array.isArray(target) ? target : [target];
-    return fields.some((field) => {
-      const value = String(field ?? '');
-      return value.includes('accountId') || value.includes('inviteCode');
-    });
   }
 
   private async issueTokens(

@@ -1,5 +1,6 @@
 import { ServiceUnavailableException } from '@nestjs/common';
 import { generateAccountId } from 'src/utils/account-id';
+import { Prisma } from 'src/generated/prisma';
 
 type AccountIdGenerator = () => string;
 
@@ -21,7 +22,32 @@ interface RegistrationCodeLookup extends AccountIdLookup {
   };
 }
 
-const MAX_ATTEMPTS = 10;
+export const REGISTRATION_CODE_MAX_ATTEMPTS = 10;
+const MAX_ATTEMPTS = REGISTRATION_CODE_MAX_ATTEMPTS;
+
+function uniqueCollisionTargets(error: unknown): string[] {
+  if (
+    !(error instanceof Prisma.PrismaClientKnownRequestError) ||
+    error.code !== 'P2002'
+  ) {
+    return [];
+  }
+  const target = error.meta?.target;
+  const fields = Array.isArray(target) ? target : [target];
+  return fields.map((field) => String(field ?? ''));
+}
+
+export function isRegistrationCodeUniqueCollision(error: unknown): boolean {
+  return uniqueCollisionTargets(error).some(
+    (target) => target.includes('accountId') || target.includes('inviteCode'),
+  );
+}
+
+export function isInviteCodeUniqueCollision(error: unknown): boolean {
+  return uniqueCollisionTargets(error).some((target) =>
+    target.includes('inviteCode'),
+  );
+}
 
 /**
  * 生成一个数据库内唯一的 accountId。复用纯随机生成器 generateAccountId()，
