@@ -16,6 +16,7 @@ import { circleApplicationLockKey } from 'src/circle-invitation/circle-applicati
 import {
   CircleDetailDto,
   CircleDto,
+  MyCircleDto,
   CreateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
@@ -172,7 +173,7 @@ export class CircleService {
   async myCircles(
     userId: string,
     query: MyCirclesQueryDto,
-  ): Promise<CircleDto[]> {
+  ): Promise<MyCircleDto[]> {
     const { tab } = query;
 
     if (tab === 'created') {
@@ -180,7 +181,8 @@ export class CircleService {
         where: { ownerID: userId, deleted: false },
         orderBy: { createdAt: 'desc' },
       });
-      return circles.map((c) => this.toCircleDto(c));
+      // 按定义 created === 自己是圈主。
+      return circles.map((c) => ({ ...this.toCircleDto(c), myRole: 'OWNER' }));
     }
 
     const statusFilter = tab === 'joined' ? 'ACTIVE' : 'PENDING';
@@ -196,7 +198,11 @@ export class CircleService {
       orderBy: { createdAt: 'desc' },
     });
 
-    return members.map((m) => this.toCircleDto(m.circle));
+    // 角色就在 membership 行上，一并返回，省掉客户端逐个拉详情。
+    return members.map((m) => ({
+      ...this.toCircleDto(m.circle),
+      myRole: m.role,
+    }));
   }
 
   async getCircleDetail(

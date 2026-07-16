@@ -26,6 +26,7 @@ import { CircleService } from './circle.service';
 import {
   CircleDetailDto,
   CircleDto,
+  MyCircleDto,
   CreateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
@@ -66,11 +67,11 @@ export class CircleController {
 
   @Get('my')
   @ApiOperation({ summary: 'My circles (joined / created / applied)' })
-  @ApiOkResponse({ type: [CircleDto] })
+  @ApiOkResponse({ type: [MyCircleDto] })
   myCircles(
     @Query() query: MyCirclesQueryDto,
     @Req() req: RequestWithUser,
-  ): Promise<CircleDto[]> {
+  ): Promise<MyCircleDto[]> {
     return this.circleService.myCircles(req.user.userId, query);
   }
 

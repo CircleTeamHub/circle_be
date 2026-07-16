@@ -23,6 +23,7 @@ describe('CircleService', () => {
     circle: {
       create: jest.fn(),
       findFirst: jest.fn(),
+      findMany: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
     },
@@ -33,6 +34,7 @@ describe('CircleService', () => {
     },
     circleMember: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
@@ -408,6 +410,54 @@ describe('CircleService', () => {
         id: { not: 'asset-new' },
       },
     });
+  });
+
+  // myCircles 必须自带 myRole —— 客户端「我管理的圈子」只需要这一个字段。不带的话
+  // 前端只能对每个已加入圈子再打一次 GET /circle/:id 把它捞回来（N+1，且在主 Tab 上）。
+  function circleRow(id: string) {
+    return {
+      id,
+      name: id,
+      description: '',
+      avatarUrl: null,
+      ownerID: 'owner-1',
+      cities: [],
+      categories: [],
+      rules: [],
+      tags: [],
+      joinVipRestriction: 0,
+      joinCreditRestriction: 0,
+      joinFancyRestriction: false,
+      maxMembers: 100,
+      memberCanPost: true,
+      groupID: null,
+      memberCount: 1,
+      postCount: 0,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+  }
+
+  it('myCircles(joined) reports each membership role so clients need no per-circle detail fetch', async () => {
+    prisma.circleMember.findMany.mockResolvedValue([
+      { role: 'ADMIN', circle: circleRow('circle-admin') },
+      { role: 'MEMBER', circle: circleRow('circle-member') },
+    ]);
+
+    const result = await service.myCircles('user-1', { tab: 'joined' } as any);
+
+    expect(result.map((c) => [c.id, c.myRole])).toEqual([
+      ['circle-admin', 'ADMIN'],
+      ['circle-member', 'MEMBER'],
+    ]);
+  });
+
+  it('myCircles(created) reports OWNER', async () => {
+    prisma.circle.findMany.mockResolvedValue([circleRow('circle-own')]);
+
+    const result = await service.myCircles('user-1', { tab: 'created' } as any);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].myRole).toBe('OWNER');
   });
 });
 
