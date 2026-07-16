@@ -2,15 +2,18 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Param,
   Post,
   Put,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
 import { Request } from 'express';
 import * as requestIp from 'request-ip';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -19,6 +22,7 @@ import {
   ApiHeader,
   ApiOkResponse,
   ApiOperation,
+  ApiServiceUnavailableResponse,
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
@@ -26,6 +30,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { AuthService } from './auth.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
+import { ImTokenDto, ImTokenQueryDto } from './dto/im-token.dto';
 import { LoginDto } from './dto/login.dto';
 import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { RequestEmailCodeDto } from './dto/request-email-code.dto';
@@ -42,6 +47,14 @@ import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
 import type { RequestWithUser } from './types';
+
+/**
+ * Rate limit for GET /auth/im-token. Sized for legitimate IM re-establishment
+ * (reconnect storms, token expiry) while capping how hard one caller can drive
+ * the outbound OpenIM /auth/get_user_token call behind it.
+ */
+export const IM_TOKEN_RATE_LIMIT = 10;
+export const IM_TOKEN_RATE_TTL_MS = 60_000;
 
 function getHeaderValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) {
@@ -355,5 +368,49 @@ export class AuthController {
   @ApiUnauthorizedResponse({ description: 'Missing or invalid bearer token' })
   me(@Req() req: RequestWithUser) {
     return this.authService.me(req.user.userId);
+  }
+
+  /**
+   * Re-issue an IM token without a full re-login (empty imToken at login,
+   * IM token expiry, transient IM failure recovery).
+   *
+   * Identity comes from the JWT alone — there is intentionally no userId
+   * parameter, so one user can never mint another's IM credential.
+   *
+   * ThrottlerGuard is opt-in per route in this app (ThrottlerModule is global
+   * but no APP_GUARD is registered — see app.module.ts), and this controller
+   * otherwise applies no rate limit. Each call is an outbound OpenIM
+   * /auth/get_user_token request, so an unthrottled route here would let any
+   * single logged-in client amplify into OpenIM. Hence the explicit guard.
+   *
+   * ADMIN-audience tokens are refused: adminLogin issues them with
+   * issueImToken:false because the admin console has no IM surface. Honouring
+   * them here would re-grant the capability admin login deliberately withheld.
+   */
+  @Get('im-token')
+  @UseGuards(JwtGuard, ThrottlerGuard)
+  @Throttle({
+    default: { limit: IM_TOKEN_RATE_LIMIT, ttl: IM_TOKEN_RATE_TTL_MS },
+  })
+  @ApiOperation({ summary: 'Get an OpenIM token for the current user' })
+  @ApiBearerAuth()
+  @ApiOkResponse({
+    description: 'OpenIM token for the caller',
+    type: ImTokenDto,
+  })
+  @ApiUnauthorizedResponse({ description: 'Missing or invalid bearer token' })
+  @ApiForbiddenResponse({
+    description: 'Admin-audience tokens cannot mint IM tokens',
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'OpenIM is unavailable or not configured',
+  })
+  imToken(@Req() req: RequestWithUser, @Query() query: ImTokenQueryDto) {
+    if (req.user.audience === 'ADMIN') {
+      throw new ForbiddenException(
+        'IM tokens are not issued to admin sessions',
+      );
+    }
+    return this.authService.getImToken(req.user.userId, query.platform);
   }
 }
