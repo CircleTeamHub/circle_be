@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
+import { SessionRevocationService } from '../session-revocation.service';
 
 describe('RefreshTokenService', () => {
   let service: RefreshTokenService;
@@ -72,6 +73,10 @@ describe('RefreshTokenService', () => {
   };
 
   const config = { get: jest.fn().mockReturnValue(undefined) };
+  const revocation = {
+    revokeUser: jest.fn().mockResolvedValue(undefined),
+    revokeSession: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeEach(async () => {
     records.length = 0;
@@ -82,6 +87,7 @@ describe('RefreshTokenService', () => {
         RefreshTokenService,
         { provide: PrismaService, useValue: prisma },
         { provide: ConfigService, useValue: config },
+        { provide: SessionRevocationService, useValue: revocation },
       ],
     }).compile();
 
@@ -167,6 +173,8 @@ describe('RefreshTokenService', () => {
     await service.revokeAll('user-1');
 
     expect(records[0].revokedAt).toBeInstanceOf(Date);
+    // F-02: also kills the user's outstanding access tokens.
+    expect(revocation.revokeUser).toHaveBeenCalledWith('user-1');
   });
 
   it('revokes a single active session for the owning user', async () => {
@@ -197,6 +205,8 @@ describe('RefreshTokenService', () => {
 
     expect(records[0].revokedAt).toBeInstanceOf(Date);
     expect(records[1].revokedAt).toBeNull();
+    // F-02: also kills the matching session's access token.
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
   });
 
   it('revokes all active sessions except the current session', async () => {

@@ -1,0 +1,73 @@
+# GHCR retention for the circle_be container package.
+#
+# build-image.yml pushes one `sha-<commit>` image per push to main; on a
+# private repo those bill against package storage forever unless pruned.
+#
+# Policy:
+# - any version carrying a `v*` tag is a release — kept forever. NOTE: promote
+#   stamps the version tag onto the SAME digest as its sha- tag, so a released
+#   version typically carries both tags and is protected by this rule;
+# - the `main` convenience tag is kept;
+# - other versions (sha-only or untagged) are deleted once they are BOTH
+#   outside the newest 20 AND older than 14 days.
+#
+# Builds push with provenance disabled, so every version is a single tagged
+# manifest — there are no untagged attestation/index children that a naive
+# prune could corrupt.
+
+name: Cleanup Images
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    name: "Prune old sha images"
+    timeout-minutes: 10
+    steps:
+      - name: Delete stale versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          pkg="${GITHUB_REPOSITORY##*/}"
+
+          # Owner may be an org or a user; probe org first.
+          base="orgs/$owner/packages/container/$pkg"
+          if ! gh api "$base" >/dev/null 2>&1; then
+            base="users/$owner/packages/container/$pkg"
+          fi
+          if ! gh api "$base" >/dev/null 2>&1; then
+            echo "package $pkg not found (never pushed yet?); nothing to do"
+            exit 0
+          fi
+
+          cutoff="$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+          gh api --paginate "$base/versions?per_page=100" \
+            --jq '.[] | {id, created_at, tags: .metadata.container.tags}' |
+            jq -s --arg cutoff "$cutoff" '
+              map(select(
+                (.tags | any(startswith("v")) | not) and
+                (.tags | index("main") | not)
+              ))
+              | sort_by(.created_at) | reverse
+              | .[20:]
+              | map(select(.created_at < $cutoff))
+            ' > stale.json
+
+          count="$(jq length stale.json)"
+          echo "stale versions to delete: $count"
+          jq -r '.[] | "\(.id)\t\(.created_at)\t\(.tags | join(","))"' stale.json
+
+          jq -r '.[].id' stale.json | while read -r id; do
+            gh api -X DELETE "$base/versions/$id"
+            echo "deleted version $id"
+          done

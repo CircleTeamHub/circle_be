@@ -31,14 +31,20 @@ export class EmailVerificationService {
   }
 
   /**
-   * 开发占位：真实邮件投递接通前，dev 环境允许一个固定码直接通过验证。
+   * 开发占位：真实邮件投递接通前，本地可用一个固定码直接通过验证。
    * 生产环境（NODE_ENV=production）永远返回 null —— 绝不放后门进线上。
-   * 可用环境变量 EMAIL_CODE_DEV_BYPASS 改码，或设为 "off" 关闭。
+   *
+   * 安全（F-05）：**必须显式 opt-in**。没有内置默认码 —— 只有当
+   * EMAIL_CODE_DEV_BYPASS 被显式设置为非空、非 "off" 值时才启用。这样任何
+   * 非生产但共享/联网的环境（staging/preprod），只要没配这个变量，就没有
+   * 任何后门码可用，攻击者无法用众所周知的 999999 登进去。
+   * 本地开发在 .env.development 里设置该变量即可照常使用。
    */
   private getDevBypassCode(): string | null {
     if (process.env.NODE_ENV === 'production') return null;
-    const value = process.env.EMAIL_CODE_DEV_BYPASS ?? '999999';
-    return value.toLowerCase() === 'off' ? null : value;
+    const value = process.env.EMAIL_CODE_DEV_BYPASS?.trim();
+    if (!value || value.toLowerCase() === 'off') return null;
+    return value;
   }
 
   async requestCode(

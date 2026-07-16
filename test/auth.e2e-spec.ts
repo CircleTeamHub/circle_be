@@ -1,10 +1,12 @@
 import * as pactum from 'pactum';
 import { AuthErrorCode } from 'src/common/app-error-codes';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { getE2eApp } from './e2e-context';
 
-// Registration is gated behind an email verification code. In non-production the
-// EmailVerificationService accepts a dev-bypass code (EMAIL_CODE_DEV_BYPASS,
-// default '999999'), so e2e can register deterministically without minting and
-// reading back a real code. See email-verification.service.ts:getDevBypassCode.
+// Registration is gated behind an email verification code. The CI E2E job
+// explicitly opts into EMAIL_CODE_DEV_BYPASS=999999 so the suite can register
+// deterministically without minting and reading back a real code. See
+// email-verification.service.ts:getDevBypassCode.
 const BYPASS_CODE = '999999';
 const EMAIL = 'e2e-user@example.com';
 const PASSWORD = 'password1';
@@ -65,7 +67,8 @@ describe('Auth e2e', () => {
       )
       .expectStatus(201);
 
-    const invitedUser = await global.appFactory.database.user.findUnique({
+    const prisma = getE2eApp().get(PrismaService);
+    const invitedUser = await prisma.user.findUnique({
       where: { email: 'invited-user@example.com' },
       select: { invitedByUserId: true },
     });
@@ -86,7 +89,7 @@ describe('Auth e2e', () => {
       });
 
     await expect(
-      global.appFactory.database.user.findUnique({ where: { email } }),
+      getE2eApp().get(PrismaService).user.findUnique({ where: { email } }),
     ).resolves.toBeNull();
   });
 

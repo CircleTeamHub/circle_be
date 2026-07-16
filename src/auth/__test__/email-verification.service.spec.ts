@@ -159,11 +159,32 @@ describe('EmailVerificationService', () => {
     ).resolves.toBe(false);
   });
 
-  it('verifyCode accepts the dev bypass code without a stored record', async () => {
-    // 没有 seed 任何验证码记录，999999 仍应直接通过（dev 占位）。
-    await expect(
-      service.verifyCode('nobody@b.com', 'LOGIN', '999999'),
-    ).resolves.toBe(true);
+  it('verifyCode accepts the dev bypass code when EMAIL_CODE_DEV_BYPASS is explicitly set', async () => {
+    const prev = process.env.EMAIL_CODE_DEV_BYPASS;
+    process.env.EMAIL_CODE_DEV_BYPASS = '999999';
+    try {
+      // 没有 seed 任何验证码记录，显式开启后该码应直接通过（dev 占位）。
+      await expect(
+        service.verifyCode('nobody@b.com', 'LOGIN', '999999'),
+      ).resolves.toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.EMAIL_CODE_DEV_BYPASS;
+      else process.env.EMAIL_CODE_DEV_BYPASS = prev;
+    }
+  });
+
+  it('verifyCode has NO bypass by default when EMAIL_CODE_DEV_BYPASS is unset (F-05)', async () => {
+    const prev = process.env.EMAIL_CODE_DEV_BYPASS;
+    delete process.env.EMAIL_CODE_DEV_BYPASS;
+    try {
+      // No built-in default code: a shared/staging env without the opt-in var
+      // must not accept the well-known 999999.
+      await expect(
+        service.verifyCode('nobody@b.com', 'LOGIN', '999999'),
+      ).resolves.toBe(false);
+    } finally {
+      if (prev !== undefined) process.env.EMAIL_CODE_DEV_BYPASS = prev;
+    }
   });
 
   it('verifyCode dev bypass can be disabled via EMAIL_CODE_DEV_BYPASS=off', async () => {

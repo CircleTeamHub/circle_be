@@ -55,10 +55,7 @@ export class LogsController {
   @Serialize(PublicLogsDto)
   // @UseInterceptors(new SerializeInterceptor(PublicLogsDto))
   postTest(@Body() dto: LogsDto) {
-    console.log(
-      '🚀 ~ file: logs.controller.ts ~ line 15 ~ LogsController ~ postTest ~ dto',
-      dto,
-    );
+    // No console.log here: it echoed request bodies to stdout in every env (F-10).
     return dto;
   }
 }
