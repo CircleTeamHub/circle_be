@@ -5,7 +5,7 @@ import test from 'node:test';
 const read = (path) =>
   readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
-test('Caddy routes admin API requests directly to the blue-green backend', () => {
+test('Caddy routes requests only to healthy blue-green backends', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const adminBlock = caddy.slice(caddy.indexOf('{$ADMIN_DOMAIN}'));
   const apiHandler = adminBlock.indexOf('handle /api/*');
@@ -49,6 +49,34 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
   assert.ok(
     healthGate >= 0 && healthGate < cutover,
     'standby health must precede cutover',
+  );
+});
+
+test('blue-green services do not share a Docker DNS alias', () => {
+  const prod = read('docker-compose.prod.yml');
+  const release = read('docker-compose.release.yml');
+
+  assert.doesNotMatch(prod, /circle-be-app/);
+  assert.doesNotMatch(release, /circle-be-app/);
+  assert.doesNotMatch(release, /aliases:/);
+});
+
+test('proxy switches validate the selected upstream before reloading Caddy', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const switchProxy = deploy.slice(
+    deploy.indexOf('switch_proxy()'),
+    deploy.indexOf('if [ -n "${GHCR_TOKEN:-}" ]'),
+  );
+  const validate = switchProxy.indexOf('caddy validate');
+  const reload = switchProxy.indexOf('caddy reload');
+
+  assert.notEqual(validate, -1);
+  assert.notEqual(reload, -1);
+  assert.ok(validate < reload);
+  assert.match(switchProxy, /CIRCLE_BE_UPSTREAM=\$target/);
+  assert.match(
+    switchProxy,
+    /if ! compose exec[\s\S]*caddy validate[\s\S]*return 1/,
   );
 });
 

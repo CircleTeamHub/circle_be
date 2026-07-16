@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+REAL_MV="$(command -v mv)"
 
 last_arg() {
   local value=""
@@ -142,13 +143,14 @@ if [ -n "${PERSIST_FAIL_COLOR:-}" ] &&
   [ "$(cat "${@: -2:1}" 2>/dev/null || true)" = "$PERSIST_FAIL_COLOR" ]; then
   exit 44
 fi
-exec /usr/bin/mv "$@"
+exec "$REAL_MV" "$@"
 MV
   chmod +x "$CASE_DIR/bin/mv"
 }
 
 run_release() {
   PATH="$CASE_DIR/bin:$PATH" \
+    REAL_MV="$REAL_MV" \
     RELEASE_TAG=v1.2.3 \
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \

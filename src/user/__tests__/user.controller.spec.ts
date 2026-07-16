@@ -34,12 +34,19 @@ describe('UserController', () => {
       nickname: 'Jimmy',
     });
 
-    await expect(controller.searchUserByAccountId('jimmy')).resolves.toEqual({
+    const req = { user: { userId: 'viewer-1' } } as never;
+    await expect(
+      controller.searchUserByAccountId('jimmy', req),
+    ).resolves.toEqual({
       id: 'user-2',
       accountId: 'jimmy',
       nickname: 'Jimmy',
     });
-    expect(userService.findByExactAccountId).toHaveBeenCalledWith('jimmy');
+    // viewerId is threaded through so the service can apply profile privacy (F-01).
+    expect(userService.findByExactAccountId).toHaveBeenCalledWith(
+      'jimmy',
+      'viewer-1',
+    );
   });
 
   it('allows a user to delete their own account', () => {

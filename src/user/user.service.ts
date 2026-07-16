@@ -186,7 +186,7 @@ export class UserService {
     return { data, total, page, limit: take };
   }
 
-  async findByExactAccountId(accountId: string | undefined) {
+  async findByExactAccountId(accountId: string | undefined, viewerId?: string) {
     if (!accountId) return null;
     const normalized = accountId.trim();
 
@@ -194,7 +194,7 @@ export class UserService {
       return null;
     }
 
-    return this.prisma.user.findFirst({
+    const user = await this.prisma.user.findFirst({
       where: {
         accountId: {
           equals: normalized,
@@ -204,6 +204,10 @@ export class UserService {
       },
       select: PUBLIC_SELECT,
     });
+
+    // Apply the same field-privacy gate as GET /user/:id. Without it the
+    // friend-add lookup leaks wechat/qq that the target set to private (F-01).
+    return user ? this.applyProfilePrivacy(user, viewerId) : null;
   }
 
   async findOne(id: string, viewerId?: string) {

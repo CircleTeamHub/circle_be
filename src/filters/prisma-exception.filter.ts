@@ -23,12 +23,18 @@ export class PrismaExceptionFilter implements ExceptionFilter {
     switch (exception.code) {
       case 'P2002': {
         status = HttpStatus.CONFLICT;
+        // Do NOT leak the conflicting column(s) to the client: naming the unique
+        // field (email / accountId / ...) turns any create/update into a
+        // user-enumeration oracle (F-06). Log it server-side for ops, return a
+        // generic message with no `conflict` payload.
         const target = (exception.meta as { target?: string[] } | undefined)
           ?.target;
-        message = target?.length
-          ? `Resource already exists: ${target.join(', ')}`
-          : 'Resource already exists';
-        extra = target ? { conflict: target } : undefined;
+        if (target?.length) {
+          this.logger.warn(
+            `Unique constraint conflict on [${target.join(', ')}] at ${request.method} ${request.url}`,
+          );
+        }
+        message = 'Resource already exists';
         break;
       }
       case 'P2025':
