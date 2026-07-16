@@ -15,7 +15,11 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import type { PrivacySettingsDto } from 'src/privacy/privacy-settings.dto';
-import { SystemIconKey, UserDisplayIconType } from 'src/generated/prisma';
+import {
+  Prisma,
+  SystemIconKey,
+  UserDisplayIconType,
+} from 'src/generated/prisma';
 import {
   buildLeveledSystemIcons,
   EligibleSystemIcon,
@@ -34,7 +38,7 @@ const VERIFIED_PROFILE_MIN_BIO_LENGTH = 10;
 // Cap on memberships scanned per user for eligibility — a power user could join
 // thousands of circles; the newest are the relevant ones for circle icons and
 // Circle Builder only needs one qualifying circle.
-const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
+export const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 
@@ -257,33 +261,20 @@ export class IconService {
     }
     if (uncached.length === 0) return result;
 
-    const [users, memberships, privacyByUser, selections] = await Promise.all([
-      this.prisma.user.findMany({
-        where: { id: { in: uncached } },
-        select: ELIGIBILITY_USER_SELECT,
-      }),
-      this.prisma.circleMember.findMany({
-        where: {
-          userID: { in: uncached },
-          status: 'ACTIVE',
-          circle: { deleted: false },
-        },
-        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-        orderBy: { createdAt: 'desc' },
-      }),
-      this.privacySettings.getSettingsForUsers(uncached),
-      this.prisma.userDisplayIcon.findMany({
-        where: { userID: { in: uncached } },
-        orderBy: { sortOrder: 'asc' },
-      }),
-    ]);
+    const [users, membershipsByUser, privacyByUser, selections] =
+      await Promise.all([
+        this.prisma.user.findMany({
+          where: { id: { in: uncached } },
+          select: ELIGIBILITY_USER_SELECT,
+        }),
+        this.fetchEligibilityMemberships(uncached),
+        this.privacySettings.getSettingsForUsers(uncached),
+        this.prisma.userDisplayIcon.findMany({
+          where: { userID: { in: uncached } },
+          orderBy: { sortOrder: 'asc' },
+        }),
+      ]);
 
-    const membershipsByUser = new Map<string, EligibilityCircleMembership[]>();
-    for (const membership of memberships) {
-      const list = membershipsByUser.get(membership.userID) ?? [];
-      list.push(membership);
-      membershipsByUser.set(membership.userID, list);
-    }
     const selectionsByUser = new Map<string, StoredSelection[]>();
     for (const selection of selections) {
       const list = selectionsByUser.get(selection.userID) ?? [];
@@ -425,21 +416,12 @@ export class IconService {
   }
 
   private async resolveEligibility(userId: string): Promise<Eligibility> {
-    const [user, circleMemberships, privacy] = await Promise.all([
+    const [user, membershipsByUser, privacy] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
         select: ELIGIBILITY_USER_SELECT,
       }),
-      this.prisma.circleMember.findMany({
-        where: {
-          userID: userId,
-          status: 'ACTIVE',
-          circle: { deleted: false },
-        },
-        select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
-        orderBy: { createdAt: 'desc' },
-        take: MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
-      }),
+      this.fetchEligibilityMemberships([userId]),
       this.privacySettings.getSettings(userId),
     ]);
 
@@ -447,7 +429,56 @@ export class IconService {
       throw new NotFoundException('User not found');
     }
 
-    return this.buildEligibility(user, circleMemberships, privacy);
+    return this.buildEligibility(
+      user,
+      membershipsByUser.get(userId) ?? [],
+      privacy,
+    );
+  }
+
+  /**
+   * Loads each user's newest active memberships, capped per user. Prisma's
+   * `take` can only bound a whole findMany, which would let one power user
+   * consume a batch's entire budget, so the cap is applied with a window
+   * function and the rows are then hydrated through the shared typed select.
+   * Both the single-user and batch paths go through here so the cap cannot
+   * drift between them.
+   */
+  private async fetchEligibilityMemberships(
+    userIds: string[],
+  ): Promise<Map<string, EligibilityCircleMembership[]>> {
+    const byUser = new Map<string, EligibilityCircleMembership[]>();
+    if (userIds.length === 0) return byUser;
+
+    const capped = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT ranked."id"
+      FROM (
+        SELECT member."id",
+               ROW_NUMBER() OVER (
+                 PARTITION BY member."userID"
+                 ORDER BY member."createdAt" DESC, member."id" DESC
+               ) AS rn
+        FROM "CircleMember" member
+        JOIN "Circle" circle ON circle."id" = member."circleID"
+        WHERE member."userID" = ANY(ARRAY[${Prisma.join(userIds)}]::text[])
+          AND member."status" = 'ACTIVE'
+          AND circle."deleted" = false
+      ) ranked
+      WHERE ranked.rn <= ${MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS}
+    `;
+    if (capped.length === 0) return byUser;
+
+    const memberships = await this.prisma.circleMember.findMany({
+      where: { id: { in: capped.map((row) => row.id) } },
+      select: ELIGIBILITY_CIRCLE_MEMBERSHIP_SELECT,
+      orderBy: { createdAt: 'desc' },
+    });
+    for (const membership of memberships) {
+      const list = byUser.get(membership.userID) ?? [];
+      list.push(membership);
+      byUser.set(membership.userID, list);
+    }
+    return byUser;
   }
 
   // Pure eligibility assembly from prefetched rows. Kept side-effect-free so the

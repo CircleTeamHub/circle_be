@@ -311,6 +311,85 @@ describe('CircleInvitationService', () => {
     );
   });
 
+  // Regression: leaveCircle / removeGroupMember delete the membership but keep
+  // the verifier row, so a departed member could still cast a binding vote.
+  it('rejects a respond() vote from a verifier who left the circle', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'PENDING',
+      circle: { id: 'circle-1', groupID: 'group-1' },
+    });
+    prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+      id: 'ver-1',
+      invitationID: 'inv-1',
+      verifierID: 'verifier-1',
+      status: 'PENDING',
+    });
+    // Membership row is gone: they left or were removed.
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+
+    await expect(service.respond('verifier-1', 'inv-1', true)).rejects.toThrow(
+      ForbiddenException,
+    );
+
+    expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
+    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects a respond() vote from a verifier whose membership is no longer active', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'PENDING',
+      circle: { id: 'circle-1', groupID: 'group-1' },
+    });
+    prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+      id: 'ver-1',
+      invitationID: 'inv-1',
+      verifierID: 'verifier-1',
+      status: 'PENDING',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'PENDING' });
+
+    await expect(service.respond('verifier-1', 'inv-1', true)).rejects.toThrow(
+      ForbiddenException,
+    );
+
+    expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts a respond() vote from a still-active verifier', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      approvedCount: 1,
+      requiredCount: 10,
+      circle: { id: 'circle-1', groupID: 'group-1' },
+    });
+    prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+      id: 'ver-1',
+      invitationID: 'inv-1',
+      verifierID: 'verifier-1',
+      status: 'PENDING',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.circleInvitationVerifier.update.mockResolvedValue({});
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.respond('verifier-1', 'inv-1', true);
+
+    expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith({
+      where: { id: 'ver-1' },
+      data: expect.objectContaining({ status: 'APPROVED' }),
+    });
+  });
+
   it('addVerifier sends a circle-verification interaction message', async () => {
     prisma.circleInvitation.findUnique.mockResolvedValue({
       id: 'inv-1',

@@ -24,6 +24,10 @@ import {
 import { circleApplicationLockKey } from './circle-application-lock';
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
+// Each invitation row hydrates a circle, two users and up to requiredCount
+// verifiers (10 by default) with a user join each, so the list endpoints cap
+// how many they return rather than scaling with the caller's history.
+const MAX_INVITATION_LIST_RESULTS = 50;
 
 type CircleInvitationNotificationData = {
   toUserID: string;
@@ -38,13 +42,28 @@ type CircleInvitationNotificationData = {
 };
 
 // Single include shape reused by loadInvitation and the list queries so the
-// list endpoints can hydrate in one round-trip instead of N+1.
+// list endpoints can hydrate in one round-trip instead of N+1. Narrowed to the
+// columns toInvitationDto and assertCanViewInvitation read — `true` here would
+// pull every column of the circle and of each of the ~12 joined users.
+const INVITATION_USER_SELECT = {
+  id: true,
+  nickname: true,
+  avatarUrl: true,
+  accountId: true,
+} as const;
+
 const INVITATION_INCLUDE = {
-  circle: true,
-  applicant: true,
-  inviter: true,
+  circle: { select: { name: true } },
+  applicant: { select: INVITATION_USER_SELECT },
+  inviter: { select: INVITATION_USER_SELECT },
   verifiers: {
-    include: { verifier: true },
+    select: {
+      id: true,
+      verifierID: true,
+      status: true,
+      respondedAt: true,
+      verifier: { select: INVITATION_USER_SELECT },
+    },
     orderBy: { createdAt: 'asc' },
   },
 } as const;
@@ -355,6 +374,24 @@ export class CircleInvitationService {
         throw new BadRequestException({
           message: 'Invitation is no longer pending',
           errorCode: CircleInvitationErrorCode.NotPending,
+        });
+      }
+
+      // Leaving or being removed from the circle deletes the membership but
+      // leaves the verifier row behind, so eligibility is re-checked at vote
+      // time rather than trusting the check made when the slot was assigned.
+      const verifierMembership = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: verifierId,
+            circleID: invitation.circleID,
+          },
+        },
+      });
+      if (!verifierMembership || verifierMembership.status !== 'ACTIVE') {
+        throw new ForbiddenException({
+          message: '验证人必须是本圈子的活跃成员',
+          errorCode: CircleInvitationErrorCode.VerifierNotMember,
         });
       }
 
@@ -701,6 +738,7 @@ export class CircleInvitationService {
       },
       orderBy: { createdAt: 'desc' },
       include: INVITATION_INCLUDE,
+      take: MAX_INVITATION_LIST_RESULTS,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
@@ -708,9 +746,12 @@ export class CircleInvitationService {
 
   async getMyApplications(userId: string): Promise<InvitationDto[]> {
     const invitations = await this.prisma.circleInvitation.findMany({
-      where: { applicantID: userId },
+      // Settled applications are history the caller cannot act on; only the
+      // in-flight ones drive the "verify me" entry point.
+      where: { applicantID: userId, status: 'PENDING' },
       orderBy: { createdAt: 'desc' },
       include: INVITATION_INCLUDE,
+      take: MAX_INVITATION_LIST_RESULTS,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
@@ -739,6 +780,7 @@ export class CircleInvitationService {
       where: { circleID: circleId, status: 'PENDING' },
       orderBy: { createdAt: 'desc' },
       include: INVITATION_INCLUDE,
+      take: MAX_INVITATION_LIST_RESULTS,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
