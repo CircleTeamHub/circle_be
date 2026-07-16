@@ -6,10 +6,12 @@ describe('SessionRevocationService', () => {
     getJson: jest.fn(),
     setJson: jest.fn(),
   };
-  const svc = new SessionRevocationService(redis as never);
+  const config = { get: jest.fn() };
+  const svc = new SessionRevocationService(redis as never, config as never);
 
   beforeEach(() => {
     jest.clearAllMocks();
+    config.get.mockReturnValue(undefined);
     redis.setJson.mockResolvedValue(true);
   });
 
@@ -52,17 +54,27 @@ describe('SessionRevocationService', () => {
       ).resolves.toBe(true);
     });
 
-    it('does NOT flag a token minted at/after the revoke-after stamp', async () => {
+    it('uses millisecond issuance time so a fresh same-second token survives', async () => {
       redis.getJson.mockImplementation((key: string) =>
-        Promise.resolve(key === 'authrev:u:u1' ? 200 : null),
+        Promise.resolve(key === 'authrev:u:u1' ? 1_700_000_000_500 : null),
       );
-      // A fresh re-login (iat >= revokedAfter) must survive.
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 200 }),
+        svc.isRevoked({
+          sub: 'u1',
+          sid: 's1',
+          iat: 1_700_000_000,
+          issuedAtMs: 1_700_000_000_600,
+        } as never),
       ).resolves.toBe(false);
+    });
+
+    it('flags a legacy token issued in the same second as user revocation', async () => {
+      redis.getJson.mockImplementation((key: string) =>
+        Promise.resolve(key === 'authrev:u:u1' ? 1_700_000_000_500 : null),
+      );
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 250 }),
-      ).resolves.toBe(false);
+        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 1_700_000_000 }),
+      ).resolves.toBe(true);
     });
 
     it('does NOT flag when no markers exist', async () => {
@@ -72,11 +84,12 @@ describe('SessionRevocationService', () => {
       ).resolves.toBe(false);
     });
 
-    it('revokeUser stores an epoch under the per-user key', async () => {
+    it('revokeUser stores a millisecond epoch under the per-user key', async () => {
+      jest.spyOn(Date, 'now').mockReturnValueOnce(1_700_000_000_500);
       await svc.revokeUser('u1');
       expect(redis.setJson).toHaveBeenCalledWith(
         'authrev:u:u1',
-        expect.any(Number),
+        1_700_000_000_500,
         expect.any(Number),
       );
     });
@@ -87,6 +100,22 @@ describe('SessionRevocationService', () => {
         'authrev:s:s1',
         1,
         expect.any(Number),
+      );
+    });
+
+    it('keeps revocation markers for the configured access-token lifetime', async () => {
+      config.get.mockReturnValue('2d');
+      const configuredSvc = new SessionRevocationService(
+        redis as never,
+        config as never,
+      );
+
+      await configuredSvc.revokeSession('s1');
+
+      expect(redis.setJson).toHaveBeenCalledWith(
+        'authrev:s:s1',
+        1,
+        2 * 24 * 60 * 60,
       );
     });
   });

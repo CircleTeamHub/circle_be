@@ -13,6 +13,8 @@ export interface JwtPayload {
   sid?: string;
   /** Issued-at, populated by @nestjs/jwt. */
   iat?: number;
+  /** Millisecond issuance time used for unambiguous revoke boundaries. */
+  issuedAtMs?: number;
   /** Expiration, populated by @nestjs/jwt. */
   exp?: number;
 }

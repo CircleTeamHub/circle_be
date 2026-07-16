@@ -449,7 +449,12 @@ describe('AuthService', () => {
       'APP',
     );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
-      expect.objectContaining({ sub: 'uuid-1', sid: 'session-1', aud: 'APP' }),
+      expect.objectContaining({
+        sub: 'uuid-1',
+        sid: 'session-1',
+        aud: 'APP',
+        issuedAtMs: expect.any(Number),
+      }),
     );
   });
 
