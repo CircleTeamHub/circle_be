@@ -263,6 +263,8 @@ enum CallEndReason {
 model User {
   id                         String     @id @default(uuid())
   accountId                  String     @unique
+  inviteCode                 String     @unique
+  invitedByUserId            String?
   passwordHash               String
   loginSecurityCodeHash      String?
   securityCodeAttempts       Int        @default(0)
@@ -299,6 +301,8 @@ model User {
   updatedAt                  DateTime   @updatedAt
 
   refreshTokens                     RefreshToken[]
+  invitedBy                         User?                         @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+  invitees                          User[]                        @relation("UserInvitations")
   friendsAsUser                     Friend[]                    @relation("userFriends")
   friendsAsFriend                   Friend[]                    @relation("userFriendsTo")
   blocksIssued                      Block[]                     @relation("blocker")
@@ -350,6 +354,8 @@ model User {
   callSessionsInitiated             CallSession[]               @relation("callInitiator")
   callParticipants                  CallParticipant[]
   profileSyncOutbox                 UserProfileSyncOutbox?
+
+  @@index([invitedByUserId])
 }
 
 model UserProfileSyncOutbox {

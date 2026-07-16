@@ -18,6 +18,7 @@ describe('UserService', () => {
       findMany: jest.fn(),
       findUnique: jest.fn(),
       count: jest.fn(),
+      create: jest.fn(),
       update: jest.fn(),
     },
     userLike: {
@@ -74,6 +75,26 @@ describe('UserService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('creates a stable normalized invite code with an explicit account ID', async () => {
+    prisma.user.create.mockResolvedValue({ id: 'user-1' });
+
+    await service.create({
+      accountId: 'Alice_01',
+      password: 'password1',
+      nickname: 'Alice',
+    });
+
+    expect(prisma.user.create).toHaveBeenCalledWith({
+      data: {
+        accountId: 'Alice_01',
+        inviteCode: 'alice_01',
+        passwordHash: expect.any(String),
+        nickname: 'Alice',
+      },
+      select: expect.any(Object),
+    });
   });
 
   it('finds an active user by exact accountId without exposing admin pagination', async () => {

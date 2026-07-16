@@ -12,6 +12,15 @@ interface AccountIdLookup {
   };
 }
 
+interface RegistrationCodeLookup extends AccountIdLookup {
+  user: AccountIdLookup['user'] & {
+    findUnique(args: {
+      where: { inviteCode: string };
+      select: { id: true };
+    }): Promise<{ id: string } | null>;
+  };
+}
+
 const MAX_ATTEMPTS = 10;
 
 /**
@@ -36,5 +45,30 @@ export async function generateUniqueAccountId(
   // Error，让全局过滤器返回干净的 5xx，且语义上是"暂时不可用、可重试"。
   throw new ServiceUnavailableException(
     'Failed to generate a unique account ID',
+  );
+}
+
+/** Generates a value that is free in both mutable account IDs and invite codes. */
+export async function generateUniqueRegistrationCode(
+  prisma: RegistrationCodeLookup,
+  generate: AccountIdGenerator = generateAccountId,
+): Promise<string> {
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const candidate = generate();
+    const [account, invite] = await Promise.all([
+      prisma.user.findUnique({
+        where: { accountId: candidate },
+        select: { id: true },
+      }),
+      prisma.user.findUnique({
+        where: { inviteCode: candidate },
+        select: { id: true },
+      }),
+    ]);
+    if (!account && !invite) return candidate;
+  }
+
+  throw new ServiceUnavailableException(
+    'Failed to generate a unique registration code',
   );
 }

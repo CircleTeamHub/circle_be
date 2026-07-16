@@ -70,6 +70,7 @@ describe('AuthController', () => {
       Promise.resolve({
         id: 'uuid-1',
         accountId: 'testuser',
+        inviteCode: 'testuser',
         nickname: 'Test User',
         avatarUrl: null,
         avatarFrame: null,

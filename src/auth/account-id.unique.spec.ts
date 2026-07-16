@@ -1,4 +1,7 @@
-import { generateUniqueAccountId } from './account-id.unique';
+import {
+  generateUniqueAccountId,
+  generateUniqueRegistrationCode,
+} from './account-id.unique';
 
 describe('generateUniqueAccountId', () => {
   it('returns the first candidate when it is free', async () => {
@@ -33,5 +36,43 @@ describe('generateUniqueAccountId', () => {
     await expect(
       generateUniqueAccountId(prisma as any, () => 'ALWAYS'),
     ).rejects.toThrow(/unique account ID/);
+  });
+});
+
+describe('generateUniqueRegistrationCode', () => {
+  it('retries when a candidate is already an invite code', async () => {
+    const prisma = {
+      user: {
+        findUnique: jest.fn(({ where }) =>
+          Promise.resolve(where.inviteCode === 'taken1' ? { id: 'x' } : null),
+        ),
+      },
+    };
+    const sequence = ['taken1', 'free22'];
+    let index = 0;
+
+    const code = await generateUniqueRegistrationCode(
+      prisma as any,
+      () => sequence[index++],
+    );
+
+    expect(code).toBe('free22');
+  });
+
+  it('checks both accountId and inviteCode before returning a candidate', async () => {
+    const prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue(null) },
+    };
+
+    await generateUniqueRegistrationCode(prisma as any, () => 'free22');
+
+    expect(prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { accountId: 'free22' },
+      select: { id: true },
+    });
+    expect(prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { inviteCode: 'free22' },
+      select: { id: true },
+    });
   });
 });

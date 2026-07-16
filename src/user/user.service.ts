@@ -278,6 +278,7 @@ export class UserService {
     return this.prisma.user.create({
       data: {
         accountId: input.accountId,
+        inviteCode: input.accountId.trim().toLowerCase(),
         passwordHash,
         nickname: input.nickname || input.accountId,
       },
