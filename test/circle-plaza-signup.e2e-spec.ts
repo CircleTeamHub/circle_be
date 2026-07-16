@@ -40,12 +40,14 @@ describe('CirclePlaza signup membership e2e', () => {
         {
           id: ownerId,
           accountId: `owner-${ownerId}`,
+          inviteCode: 'e2ownr',
           passwordHash: 'x',
           nickname: 'Owner',
         },
         {
           id: signerId,
           accountId: `signer-${signerId}`,
+          inviteCode: 'e2sign',
           passwordHash: 'x',
           nickname: 'Signer',
         },
