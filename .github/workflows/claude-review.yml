@@ -11,6 +11,11 @@ name: Claude Review
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    # Skip AI review (runner + Anthropic tokens) on docs-only PRs.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.env.example'
 
 # Cancel an in-progress review when the PR is updated again — saves a runner and
 # Anthropic tokens on rapid pushes.
