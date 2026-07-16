@@ -288,6 +288,12 @@ describe('CircleInvitationService', () => {
 
     await expect(service.reconcileApprovedInvitations()).resolves.toBe(1);
 
+    expect(prisma.$executeRaw.mock.calls.map((call) => call[1])).toEqual([
+      'circle-invite:circle-full:user-bad',
+      'circle-capacity:circle-full',
+      'circle-invite:circle-open:user-good',
+      'circle-capacity:circle-open',
+    ]);
     expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
       where: { id: 'good' },
       include: { circle: true },
@@ -384,6 +390,13 @@ describe('CircleInvitationService', () => {
 
     await service.respond('verifier-1', 'inv-1', true);
 
+    const pairLock = prisma.$executeRaw.mock.calls[0]?.[1] as
+      | { values?: string[] }
+      | undefined;
+    expect(pairLock?.values).toEqual([
+      'circle-invite:circle-1:applicant-1',
+      'circle-invite:circle-1:verifier-1',
+    ]);
     expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith({
       where: { id: 'ver-1' },
       data: expect.objectContaining({ status: 'APPROVED' }),

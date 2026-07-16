@@ -7,13 +7,12 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import {
-  CircleMemberRole,
-  CircleMemberStatus,
-  Prisma,
-} from 'src/generated/prisma';
+import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
-import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
+import {
+  lockCircleApplicationPairs,
+  lockCircleCapacity,
+} from 'src/circle-invitation/circle-application-lock';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -94,7 +93,7 @@ export class GroupService {
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
     await this.prisma.$transaction(async (tx) => {
-      await this.lockCircleApplicationPairs(tx, circle.id, invitableUserIDs);
+      await lockCircleApplicationPairs(tx, circle.id, invitableUserIDs);
 
       // Re-read under the locks: the pre-check snapshot can be stale (a
       // concurrent join may have activated a target, or filled the last seat).
@@ -118,6 +117,7 @@ export class GroupService {
         return;
       }
 
+      await lockCircleCapacity(tx, circle.id);
       const target = await tx.circle.findUnique({
         where: { id: circle.id },
         select: { maxMembers: true, memberCount: true },
@@ -196,29 +196,6 @@ export class GroupService {
     return { handled: true };
   }
 
-  /**
-   * Takes the (circle, user) advisory lock every other membership path takes,
-   * for a whole batch in one round-trip. Keys are sorted so two concurrent
-   * batches always acquire in the same order and cannot deadlock each other.
-   */
-  private async lockCircleApplicationPairs(
-    tx: Prisma.TransactionClient,
-    circleID: string,
-    userIDs: string[],
-  ): Promise<void> {
-    const pairKeys = userIDs
-      .map((userID) => circleApplicationLockKey(circleID, userID))
-      // Any stable total order prevents the deadlock; code-unit order is the
-      // right one here. localeCompare would vary with the runtime's locale,
-      // which is exactly the inconsistency this sort exists to rule out.
-      // eslint-disable-next-line sonarjs/no-alphabetical-sort
-      .sort();
-    await tx.$executeRaw`
-      SELECT pg_advisory_xact_lock(hashtext(pairs.pair_key))
-      FROM unnest(ARRAY[${Prisma.join(pairKeys)}]::text[]) AS pairs(pair_key)
-    `;
-  }
-
   async removeGroupMember(
     actorId: string,
     groupID: string,
@@ -253,41 +230,31 @@ export class GroupService {
     this.assertCanManageCircleGroup(actor, target);
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
-    if (!target) {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.conversationGroupMembership.deleteMany({
-          where: {
-            conversationID: {
-              in: this.groupConversationIDCandidates(normalizedGroupID),
-            },
-            group: { ownerID: normalizedTargetUserID },
-          },
-        });
-        await tx.groupSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'REMOVE_MEMBER',
-              groupID: openimGroupID,
-              userID: normalizedTargetUserID,
-            },
-          ],
-          skipDuplicates: true,
-        });
-      });
-      return { handled: true };
-    }
-
     await this.prisma.$transaction(async (tx) => {
-      await tx.userDisplayIcon.deleteMany({
-        where: { userID: normalizedTargetUserID, circleID: circle.id },
+      await lockCircleApplicationPairs(tx, circle.id, [normalizedTargetUserID]);
+      const lockedTarget = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: normalizedTargetUserID,
+            circleID: circle.id,
+          },
+        },
+        select: { id: true, role: true, status: true },
       });
-      await tx.circleMember.delete({ where: { id: target.id } });
+      this.assertCanManageCircleGroup(actor, lockedTarget);
 
-      if (target.status === CircleMemberStatus.ACTIVE) {
-        await tx.circle.update({
-          where: { id: circle.id },
-          data: { memberCount: { decrement: 1 } },
+      if (lockedTarget) {
+        await tx.userDisplayIcon.deleteMany({
+          where: { userID: normalizedTargetUserID, circleID: circle.id },
         });
+        await tx.circleMember.delete({ where: { id: lockedTarget.id } });
+
+        if (lockedTarget.status === CircleMemberStatus.ACTIVE) {
+          await tx.circle.update({
+            where: { id: circle.id },
+            data: { memberCount: { decrement: 1 } },
+          });
+        }
       }
 
       await tx.conversationGroupMembership.deleteMany({
@@ -349,6 +316,18 @@ export class GroupService {
     }
 
     await this.prisma.$transaction(async (tx) => {
+      if (circle) {
+        await lockCircleApplicationPairs(tx, circle.id, [userId]);
+      }
+      const lockedMembership = circle
+        ? await tx.circleMember.findUnique({
+            where: {
+              userID_circleID: { userID: userId, circleID: circle.id },
+            },
+            select: { id: true, role: true, status: true },
+          })
+        : null;
+
       await tx.conversationGroupMembership.deleteMany({
         where: {
           conversationID: { in: conversationIDs },
@@ -356,16 +335,16 @@ export class GroupService {
         },
       });
 
-      if (!circle || !membership) {
+      if (!circle || !lockedMembership) {
         return;
       }
 
       await tx.userDisplayIcon.deleteMany({
         where: { userID: userId, circleID: circle.id },
       });
-      await tx.circleMember.delete({ where: { id: membership.id } });
+      await tx.circleMember.delete({ where: { id: lockedMembership.id } });
 
-      if (membership.status === CircleMemberStatus.ACTIVE) {
+      if (lockedMembership.status === CircleMemberStatus.ACTIVE) {
         await tx.circle.update({
           where: { id: circle.id },
           data: { memberCount: { decrement: 1 } },

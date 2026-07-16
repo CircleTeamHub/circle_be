@@ -314,6 +314,7 @@ describe('GroupService reportGroup', () => {
 
     await service.leaveGroup('user-1', 'group-1');
 
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'user-1', circleID: 'circle-1' },
     });
@@ -406,8 +407,9 @@ describe('GroupService reportGroup', () => {
       },
       select: { userID: true, status: true },
     });
-    // The pair locks every other membership path takes, in one round-trip.
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    // Pair locks serialize each user and the capacity lock serializes the
+    // circle-wide memberCount check across disjoint invite batches.
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
     // Batched writes: no per-user create/update round-trip inside the tx.
     expect(prisma.circleMember.createMany).toHaveBeenCalledWith({
       data: [
@@ -555,6 +557,10 @@ describe('GroupService reportGroup', () => {
       }),
     ).resolves.toEqual({ handled: true });
 
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    expect(prisma.$executeRaw.mock.calls[1]?.[1]).toBe(
+      'circle-capacity:circle-1',
+    );
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { increment: 2 } },
@@ -645,6 +651,11 @@ describe('GroupService reportGroup', () => {
         id: 'target-member',
         role: CircleMemberRole.MEMBER,
         status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
       });
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({});
     prisma.circleMember.delete.mockResolvedValue({});
@@ -655,6 +666,7 @@ describe('GroupService reportGroup', () => {
       service.removeGroupMember('admin-1', 'group-1', 'target-user'),
     ).resolves.toEqual({ handled: true });
 
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'target-user', circleID: 'circle-1' },
     });

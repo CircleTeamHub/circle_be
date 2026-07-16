@@ -21,7 +21,11 @@ import {
   InvitationDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
-import { circleApplicationLockKey } from './circle-application-lock';
+import {
+  circleApplicationLockKey,
+  lockCircleApplicationPairs,
+  lockCircleCapacity,
+} from './circle-application-lock';
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
 // Each invitation row hydrates a circle, two users and up to requiredCount
@@ -345,11 +349,10 @@ export class CircleInvitationService {
           errorCode: CircleInvitationErrorCode.NotFound,
         });
       }
-      const pairKey = circleApplicationLockKey(
-        application.circleID,
+      await lockCircleApplicationPairs(tx, application.circleID, [
         application.applicantID,
-      );
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+        verifierId,
+      ]);
 
       const [verifierRecord, invitation] = await Promise.all([
         tx.circleInvitationVerifier.findFirst({
@@ -844,6 +847,7 @@ export class CircleInvitationService {
     circleId: string,
     applicantId: string,
   ): Promise<boolean> {
+    await lockCircleCapacity(tx, circleId);
     // Create or update membership
     const existing = await tx.circleMember.findUnique({
       where: { userID_circleID: { userID: applicantId, circleID: circleId } },
