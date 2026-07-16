@@ -91,7 +91,7 @@ describe('Circle capacity and invitation pagination e2e', () => {
   it('traverses more than 50 pending applications without gaps', async () => {
     const ownerId = randomUUID();
     const applicantId = randomUUID();
-    const circleId = randomUUID();
+    const circleIds = Array.from({ length: 55 }, () => randomUUID());
     await prisma.user.createMany({
       data: [ownerId, applicantId].map((id, index) => ({
         id,
@@ -101,15 +101,19 @@ describe('Circle capacity and invitation pagination e2e', () => {
         nickname: `Pagination ${index}`,
       })),
     });
-    await prisma.circle.create({
-      data: { id: circleId, name: 'Pagination', ownerID: ownerId },
+    await prisma.circle.createMany({
+      data: circleIds.map((id, index) => ({
+        id,
+        name: `Pagination ${index}`,
+        ownerID: ownerId,
+      })),
     });
     const invitationIds = Array.from({ length: 55 }, () => randomUUID());
     const createdAt = new Date('2026-07-16T12:00:00.000Z');
     await prisma.circleInvitation.createMany({
-      data: invitationIds.map((id) => ({
+      data: invitationIds.map((id, index) => ({
         id,
-        circleID: circleId,
+        circleID: circleIds[index],
         applicantID: applicantId,
         inviterID: ownerId,
         createdAt,
