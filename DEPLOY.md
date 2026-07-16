@@ -87,6 +87,21 @@ docker compose -f docker-compose.prod.yml logs -f circle_be
 curl -i https://<API域名>/api/v1/auth/me
 ```
 
+探针(不需要认证,不走 `api/v1` 前缀,也不受限流影响):
+
+- `GET /healthz` —— 存活:进程还在就返回 200,不查任何依赖。公网可访问,供外部
+  uptime 监控使用。
+- `GET /readyz` —— 就绪:真查数据库(`SELECT 1`),连不上返回 503;Redis 状态只
+  上报不拦截(Redis 可选,故障时降级为单实例限流/实时)。compose 的 healthcheck
+  探的就是它,因此 `circle_be` 显示 healthy 才代表真的能服务。Caddy 对公网 404
+  它,只能在容器内查:
+
+```bash
+docker compose -f docker-compose.prod.yml exec circle_be \
+  node -e "require('http').get('http://127.0.0.1:3000/readyz',r=>r.pipe(process.stdout))"
+# {"status":"ok","database":"up","redis":"up"}
+```
+
 公网验证:浏览器/另一台机访问 `https://<API域名>/api/v1/auth/me`。
 
 MinIO 控制台(只绑服务器本机)从本地开 SSH 隧道访问:
@@ -235,6 +250,9 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 - **circle_be 启动即退出**:多半是 `.env.production` 缺必填项(SECRET/TEMP_CHAT_LINK_SECRET ≥32、
   ALLOWED_ORIGINS/REDIS_URL),或 Redis 启动探测失败。先看
   `docker compose logs redis circle_be`;gen-env.sh 会同步生成 Redis 密码和 URL。
+- **circle_be 一直 unhealthy**:healthcheck 探 `/readyz`,只认 2xx —— 容器在跑但数据库
+  连不上就是 unhealthy(这是预期行为)。按 §5 在容器内 curl `/readyz` 看 `database`
+  字段,并查 `docker compose logs postgres circle_be`。
 - **app 连不上**:确认两层端口都放行(Oracle Security List + iptables)。
 
 ---

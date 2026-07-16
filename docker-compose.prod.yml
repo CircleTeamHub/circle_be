@@ -11,14 +11,25 @@
 
 name: circle-be
 
+# 容器日志默认无上限,写满磁盘会连带整台宿主机一起挂;每个服务都必须带轮转。
+# 10m × 3 ≈ 每服务最多 30MB。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: circle
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       POSTGRES_DB: circle
+    # shared_buffers 等默认值按小实例设定;留足余量给连接与 WAL。
+    mem_limit: 1g
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,6 +43,7 @@ services:
     image: redis:7-alpine
     profiles: ['bundled-redis']
     restart: unless-stopped
+    logging: *default-logging
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     command:
@@ -53,6 +65,8 @@ services:
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 1g
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
@@ -73,6 +87,7 @@ services:
   # 一次性:确保 bucket 存在；最小公开读策略由应用启动时安装。
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    logging: *default-logging
     depends_on:
       minio: { condition: service_healthy }
     environment:
@@ -94,6 +109,7 @@ services:
       dockerfile: Dockerfile.prod
       target: build-stage
     working_dir: /app
+    logging: *default-logging
     depends_on:
       postgres: { condition: service_healthy }
     environment:
@@ -108,6 +124,9 @@ services:
       context: .
       dockerfile: Dockerfile.prod
     restart: unless-stopped
+    logging: *default-logging
+    # Node 默认堆上限按宿主机内存推算,容器里会算得过大;留出堆外内存余量。
+    mem_limit: 1g
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy, required: false }
@@ -121,12 +140,15 @@ services:
     expose:
       - '3000'
     healthcheck:
-      # 用 node 自带能力探活(slim 镜像没有 curl/wget);401/200 都算存活,仅 5xx 判失败
+      # 用 node 自带能力探活(slim 镜像没有 curl/wget)。
+      # /readyz 真查数据库,且只认 2xx —— 之前探 /api/v1/outbox/health 并放行
+      # statusCode<500,那条路由挂着 JwtGuard,永远 401,于是「进程还在」就等于
+      # 「健康」:数据库断了照样绿灯,蓝绿发版的健康门禁也形同虚设。
       test:
         - CMD
         - node
         - -e
-        - "require('http').get('http://127.0.0.1:3000/api/v1/outbox/health',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+        - "require('http').get('http://127.0.0.1:3000/readyz',r=>process.exit(r.statusCode>=200&&r.statusCode<300?0:1)).on('error',()=>process.exit(1))"
       interval: 15s
       timeout: 5s
       retries: 5
@@ -137,6 +159,8 @@ services:
       context: ../circle_admin_web
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     depends_on:
       # required: false —— 蓝绿发版后 circle_be(蓝)可能整个被移除、由
       # circle_be_green 在服务;日常 `up -d` 不应因此失败或把停用色拉起来。
@@ -147,6 +171,8 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     entrypoint: ['/bin/sh', '/usr/local/bin/caddy-entrypoint.sh']
     depends_on:
       # required: false 的理由同 admin_web —— 在役颜色可能是 circle_be_green。

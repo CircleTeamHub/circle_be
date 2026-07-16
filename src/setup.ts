@@ -10,6 +10,11 @@ import rateLimit, {
   type Options as RateLimitOptions,
 } from 'express-rate-limit';
 import { RedisService } from './redis/redis.service';
+import { PrismaService } from './prisma/prisma.service';
+import {
+  createLivenessHandler,
+  createReadinessHandler,
+} from './health/health.endpoint';
 import { getServerConfig } from './config/server.config';
 import { createLoggingConfig } from './logging/logging.config';
 import { createRequestLoggerMiddleware } from './logging/request-logger.middleware';
@@ -187,6 +192,21 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     express?.set?.('trust proxy', 1);
   }
   const redisService = getOptionalRedisService(app);
+
+  // Orchestrator probes. Mounted first, and directly via `app.use()` like
+  // `/metrics` below, so they bypass the `api/v1` prefix, the JSON response
+  // interceptor, the auth guards, the request logger, and every rate limiter.
+  // A probe that can be throttled, or that answers 401 out of the guard stack,
+  // reports a dead app as healthy — which is what hides every other outage.
+  app.use('/healthz', createLivenessHandler());
+  app.use(
+    '/readyz',
+    createReadinessHandler({
+      database: app.get(PrismaService),
+      redis: redisService,
+    }),
+  );
+
   const createLimiter = (
     limiterName: string,
     options: Partial<RateLimitOptions>,

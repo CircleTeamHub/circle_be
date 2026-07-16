@@ -12,6 +12,15 @@
 		respond 404
 	}
 
+	# /readyz 报告数据库/Redis 是否可用,只服务于容器内探针与编排 —— compose 的
+	# healthcheck 直连 127.0.0.1:3000,不经过 Caddy,所以这里 404 不影响探活,
+	# 但能避免把依赖故障状态泄露给公网。/healthz 只回存活、不含依赖信息,保持
+	# 公开以便外部 uptime 监控使用。
+	@readyz path /readyz /readyz/*
+	handle @readyz {
+		respond 404
+	}
+
 	handle /circle/* {
 		reverse_proxy minio:9000
 	}

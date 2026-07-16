@@ -61,6 +61,14 @@ export function createEnvValidationSchema(
       .valid('development', 'production', 'test')
       .default('development'),
     DATABASE_URL: databaseUrlSchema,
+    // pg connection pool. Defaults match pg's own (max 10), except the acquire
+    // timeout — pg waits forever for a free slot by default, so a saturated
+    // pool hangs requests instead of surfacing an error.
+    DATABASE_POOL_MAX: Joi.number().integer().min(1).default(10),
+    DATABASE_POOL_ACQUIRE_TIMEOUT_MS: Joi.number()
+      .integer()
+      .min(1)
+      .default(10000),
     SECRET: Joi.string().min(secretMin).required(),
     JWT_EXPIRES_IN: Joi.string().default('1h'),
     REFRESH_EXPIRES_IN: Joi.string().default('30d'),
