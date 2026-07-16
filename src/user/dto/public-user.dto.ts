@@ -95,6 +95,10 @@ export class PublicUserDto {
  * Used for GET /auth/me and profile update responses seen by the owner.
  */
 export class SelfUserDto extends PublicUserDto {
+  @ApiProperty({ example: 'abc123' })
+  @Expose()
+  inviteCode: string;
+
   @ApiPropertyOptional({ example: 'user@example.com' })
   @Expose()
   email: string | null;

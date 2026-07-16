@@ -9,6 +9,7 @@ export const AuthErrorCode = {
   InvalidCredentials: 'AUTH_INVALID_CREDENTIALS',
   EmailTaken: 'AUTH_EMAIL_TAKEN',
   CodeInvalid: 'AUTH_CODE_INVALID',
+  InviteCodeInvalid: 'AUTH_INVITE_CODE_INVALID',
   AccountIdTaken: 'AUTH_ACCOUNT_ID_TAKEN',
   SecurityCodeInvalid: 'AUTH_SECURITY_CODE_INVALID',
   SecurityCodeLocked: 'AUTH_SECURITY_CODE_LOCKED',

@@ -10,6 +10,7 @@ describe('SelfUserDto serialization', () => {
       {
         id: 'user-1',
         accountId: 'jimmy',
+        inviteCode: 'invite1',
         nickname: 'meiguici',
         avatarUrl: null,
         avatarFrame: null,
@@ -60,6 +61,7 @@ describe('SelfUserDto serialization', () => {
         sortOrder: 0,
       }),
     ]);
+    expect(dto.inviteCode).toBe('invite1');
   });
 
   it('exposes region (inherited from PublicUserDto) and strips unknown/sensitive fields', () => {
@@ -71,6 +73,7 @@ describe('SelfUserDto serialization', () => {
         region: '上海',
         // Sensitive columns that must never leak through the response DTO.
         passwordHash: passwordHashFixture,
+        inviteCode: 'private1',
         openimSynced: true,
       } as Record<string, unknown>,
       { excludeExtraneousValues: true },
@@ -112,5 +115,6 @@ describe('PublicUserDto serialization (other-user view)', () => {
     expect(view.email).toBeUndefined();
     expect(view.phoneNumber).toBeUndefined();
     expect(view.passwordHash).toBeUndefined();
+    expect(view.inviteCode).toBeUndefined();
   });
 });

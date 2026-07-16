@@ -6,6 +6,7 @@ import {
   ConflictException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import * as argon2 from 'argon2';
@@ -28,16 +29,23 @@ describe('AuthService', () => {
         Promise.resolve(
           users.find(
             (u) =>
-              u.accountId === where.accountId ||
-              u.id === where.id ||
-              u.email === where.email,
+              (where.accountId !== undefined &&
+                u.accountId === where.accountId) ||
+              (where.inviteCode !== undefined &&
+                u.inviteCode === where.inviteCode) ||
+              (where.id !== undefined && u.id === where.id) ||
+              (where.email !== undefined && u.email === where.email),
           ) ?? null,
         ),
       ),
       create: jest.fn(async ({ data }) => {
+        const { invitedBy, ...fields } = data;
         const user = {
           id: `uuid-${Date.now()}`,
-          ...data,
+          ...fields,
+          ...(invitedBy?.connect?.id
+            ? { invitedByUserId: invitedBy.connect.id }
+            : {}),
           createdAt: new Date(),
           updatedAt: new Date(),
           status: 'ACTIVE',
@@ -92,16 +100,23 @@ describe('AuthService', () => {
       Promise.resolve(
         users.find(
           (u) =>
-            u.accountId === where.accountId ||
-            u.id === where.id ||
-            u.email === where.email,
+            (where.accountId !== undefined &&
+              u.accountId === where.accountId) ||
+            (where.inviteCode !== undefined &&
+              u.inviteCode === where.inviteCode) ||
+            (where.id !== undefined && u.id === where.id) ||
+            (where.email !== undefined && u.email === where.email),
         ) ?? null,
       ),
     );
     mockPrisma.user.create.mockImplementation(async ({ data }) => {
+      const { invitedBy, ...fields } = data;
       const user = {
         id: `uuid-${Date.now()}`,
-        ...data,
+        ...fields,
+        ...(invitedBy?.connect?.id
+          ? { invitedByUserId: invitedBy.connect.id }
+          : {}),
         createdAt: new Date(),
         updatedAt: new Date(),
         status: 'ACTIVE',
@@ -161,7 +176,112 @@ describe('AuthService', () => {
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('refresh-token');
     expect(users[0].accountId).toMatch(/^[a-z0-9]{6}$/);
+    expect(users[0].inviteCode).toBe(users[0].accountId);
     expect(users[0].email).toBe('new@example.com');
+  });
+
+  it('register records the active inviter for a normalized invite code', async () => {
+    users.push({
+      id: 'inviter-1',
+      accountId: 'renamed',
+      inviteCode: 'abc123',
+      email: 'inviter@example.com',
+      status: 'ACTIVE',
+    });
+
+    await service.register({
+      email: 'invitee@example.com',
+      code: '123456',
+      password: 'password1',
+      nickname: 'Invitee',
+      inviteCode: '  ABC123  ',
+    } as any);
+
+    const invitee = users.find((user) => user.email === 'invitee@example.com');
+    expect(invitee.invitedByUserId).toBe('inviter-1');
+  });
+
+  it('register rejects an unknown invite code with a stable error code', async () => {
+    await expect(
+      service.register({
+        email: 'invitee@example.com',
+        code: '123456',
+        password: 'password1',
+        nickname: 'Invitee',
+        inviteCode: 'missing',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'AUTH_INVITE_CODE_INVALID',
+      }),
+    });
+    expect(users).toHaveLength(0);
+  });
+
+  it('register rejects an invite code owned by an inactive user', async () => {
+    users.push({
+      id: 'inviter-1',
+      accountId: 'renamed',
+      inviteCode: 'abc123',
+      email: 'inviter@example.com',
+      status: 'BANNED',
+    });
+
+    await expect(
+      service.register({
+        email: 'invitee@example.com',
+        code: '123456',
+        password: 'password1',
+        nickname: 'Invitee',
+        inviteCode: 'abc123',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'AUTH_INVITE_CODE_INVALID',
+      }),
+    });
+    expect(users).toHaveLength(1);
+  });
+
+  it('register retries when account/invite-code creation loses a uniqueness race', async () => {
+    mockPrisma.user.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: ['inviteCode'] },
+      }),
+    );
+
+    const result = await service.register({
+      email: 'race@example.com',
+      code: '123456',
+      password: 'password1',
+      nickname: 'Race',
+    } as any);
+
+    expect(result.accessToken).toBe('access-token');
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
+    expect(users).toHaveLength(1);
+  });
+
+  it('register returns service unavailable after exhausting uniqueness-race retries', async () => {
+    mockPrisma.user.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: ['inviteCode'] },
+      }),
+    );
+
+    await expect(
+      service.register({
+        email: 'exhausted@example.com',
+        code: '123456',
+        password: 'password1',
+        nickname: 'Exhausted',
+      } as any),
+    ).rejects.toThrow(ServiceUnavailableException);
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(10);
   });
 
   it('register throws BadRequest when code invalid', async () => {

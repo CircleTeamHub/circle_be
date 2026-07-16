@@ -3,6 +3,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { UserErrorCode } from 'src/common/app-error-codes';
 import * as argon2 from 'argon2';
@@ -19,6 +20,11 @@ import { USER_PROFILE_SELECT } from './user.select';
 import { likedOnToday } from '../like/like.util';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import {
+  generateUniqueRegistrationCode,
+  isInviteCodeUniqueCollision,
+  REGISTRATION_CODE_MAX_ATTEMPTS,
+} from 'src/auth/account-id.unique';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -278,15 +284,34 @@ export class UserService {
 
   async create(input: CreateUserInput) {
     const passwordHash = await argon2.hash(input.password);
+    for (
+      let attempt = 0;
+      attempt < REGISTRATION_CODE_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      const inviteCode = await generateUniqueRegistrationCode(this.prisma);
+      try {
+        return await this.prisma.user.create({
+          data: {
+            accountId: input.accountId,
+            inviteCode,
+            passwordHash,
+            nickname: input.nickname || input.accountId,
+          },
+          select: PUBLIC_SELECT,
+        });
+      } catch (error) {
+        if (isInviteCodeUniqueCollision(error)) {
+          if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
+          break;
+        }
+        throw error;
+      }
+    }
 
-    return this.prisma.user.create({
-      data: {
-        accountId: input.accountId,
-        passwordHash,
-        nickname: input.nickname || input.accountId,
-      },
-      select: PUBLIC_SELECT,
-    });
+    throw new ServiceUnavailableException(
+      'Failed to create a user with a unique invite code',
+    );
   }
 
   async update(id: string, input: UpdateUserInput) {

@@ -35,6 +35,7 @@ export const USER_PROFILE_SELECT = {
 /** `/me` view — the profile fields plus the owner-only account economy fields. */
 export const USER_ME_SELECT = {
   ...USER_PROFILE_SELECT,
+  inviteCode: true,
   vipLevel: true,
   creditScore: true,
 } as const;

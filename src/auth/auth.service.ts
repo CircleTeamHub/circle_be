@@ -5,6 +5,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -15,7 +16,11 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
-import { generateUniqueAccountId } from './account-id.unique';
+import {
+  generateUniqueRegistrationCode,
+  isRegistrationCodeUniqueCollision,
+  REGISTRATION_CODE_MAX_ATTEMPTS,
+} from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import {
@@ -67,6 +72,7 @@ function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
 export type SafeUser = {
   id: string;
   accountId: string;
+  inviteCode: string;
   nickname: string;
   avatarUrl: string | null;
   avatarFrame: string | null;
@@ -129,16 +135,26 @@ export class AuthService {
       });
     }
 
-    const passwordHash = await argon2.hash(dto.password);
-    const accountId = await generateUniqueAccountId(this.prisma);
+    const normalizedInviteCode = dto.inviteCode?.trim().toLowerCase() || null;
+    const inviter = normalizedInviteCode
+      ? await this.prisma.user.findUnique({
+          where: { inviteCode: normalizedInviteCode },
+          select: { id: true, status: true },
+        })
+      : null;
+    if (normalizedInviteCode && (!inviter || inviter.status !== 'ACTIVE')) {
+      throw new BadRequestException({
+        message: '邀请码无效',
+        errorCode: AuthErrorCode.InviteCodeInvalid,
+      });
+    }
 
-    const user = await this.prisma.user.create({
-      data: {
-        accountId,
-        passwordHash,
-        nickname: dto.nickname,
-        email,
-      },
+    const passwordHash = await argon2.hash(dto.password);
+    const user = await this.createRegisteredUser({
+      passwordHash,
+      nickname: dto.nickname,
+      email,
+      ...(inviter ? { invitedBy: { connect: { id: inviter.id } } } : {}),
     });
 
     // Sync to OpenIM non-blocking. Mark openimSynced=true on success so
@@ -886,6 +902,36 @@ export class AuthService {
     }
 
     return { ok: true };
+  }
+
+  private async createRegisteredUser(
+    data: Omit<Prisma.UserCreateInput, 'accountId' | 'inviteCode'>,
+  ) {
+    const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const registrationCode = await generateUniqueRegistrationCode(
+        this.prisma,
+      );
+      try {
+        return await this.prisma.user.create({
+          data: {
+            ...data,
+            accountId: registrationCode,
+            inviteCode: registrationCode,
+          },
+        });
+      } catch (error) {
+        if (isRegistrationCodeUniqueCollision(error)) {
+          if (attempt < maxAttempts - 1) continue;
+          break;
+        }
+        throw error;
+      }
+    }
+
+    throw new ServiceUnavailableException(
+      'Failed to create a user with a unique registration code',
+    );
   }
 
   private async issueTokens(

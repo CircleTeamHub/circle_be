@@ -1,5 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { Prisma } from 'src/generated/prisma';
 import { ConfigService } from '@nestjs/config';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { UserStatus } from 'src/generated/prisma';
@@ -18,6 +23,7 @@ describe('UserService', () => {
       findMany: jest.fn(),
       findUnique: jest.fn(),
       count: jest.fn(),
+      create: jest.fn(),
       update: jest.fn(),
     },
     userLike: {
@@ -74,6 +80,66 @@ describe('UserService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('creates an independent canonical invite code with an explicit account ID', async () => {
+    prisma.user.create.mockResolvedValue({ id: 'user-1' });
+
+    await service.create({
+      accountId: 'Alice_01',
+      password: 'password1',
+      nickname: 'Alice',
+    });
+
+    expect(prisma.user.create).toHaveBeenCalledWith({
+      data: {
+        accountId: 'Alice_01',
+        inviteCode: expect.stringMatching(/^[a-z0-9]{6}$/),
+        passwordHash: expect.any(String),
+        nickname: 'Alice',
+      },
+      select: expect.any(Object),
+    });
+  });
+
+  it('returns service unavailable when admin-user invite-code collisions are exhausted', async () => {
+    prisma.user.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: ['inviteCode'] },
+      }),
+    );
+
+    await expect(
+      service.create({
+        accountId: 'Alice_02',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).rejects.toThrow(ServiceUnavailableException);
+    expect(prisma.user.create).toHaveBeenCalledTimes(10);
+  });
+
+  it('does not retry when the explicit account ID is already taken', async () => {
+    const accountIdCollision = new Prisma.PrismaClientKnownRequestError(
+      'Unique constraint failed',
+      {
+        code: 'P2002',
+        clientVersion: 'test',
+        meta: { target: ['accountId'] },
+      },
+    );
+    prisma.user.create.mockRejectedValue(accountIdCollision);
+
+    await expect(
+      service.create({
+        accountId: 'Alice_03',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).rejects.toBe(accountIdCollision);
+    expect(prisma.user.create).toHaveBeenCalledTimes(1);
   });
 
   it('finds an active user by exact accountId without exposing admin pagination', async () => {
