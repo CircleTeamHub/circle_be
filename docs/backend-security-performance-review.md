@@ -8,7 +8,7 @@
 > findings here are **F-01…F-12**; a few cross-link (F-04 ↔ C-01, coin-gift
 > idempotency ↔ C-04).
 
-## Remediation status (updated 2026-07-15)
+## Remediation status (updated 2026-07-16)
 
 | Finding | Sev | Status |
 |---|---|---|
@@ -21,8 +21,8 @@
 | F-08 upload size cap | P2 | ✅ Fixed (sizeBytes @Max + ContentLength binding) |
 | F-09 refresh-token pruning | P2 | ✅ Fixed — daily cleanup cron |
 | F-10 logs console.log | P3 | ✅ Fixed — PR #46 |
-| F-07 register enumeration | P2 | ⛔ Won't-fix — **accepted 2026-07-15** (rate-limited; the clear "already registered" UX is preferred) |
-| F-11 whatsup privacy gate | P3 | ❌ **Invalid (false positive)** — `whatsup` is a public status line ("Coding every day"), not a WhatsApp/contact handle; correctly ungated like `persona`/`helloWords` |
+| F-07 register enumeration | P2 | ✅ Fixed — PR #51: `requestCode(REGISTER)` is now silent for an already-registered email; the duplicate surfaces at registration commit via the `email` unique constraint, whose error is generic (F-06) |
+| F-11 whatsup privacy gate | P3 | ✅ Fixed — PR #51: `showWhatsup` toggle added (default `true`, preserving existing visibility) |
 | F-12 SERIALIZABLE tuning | P3 | ⛔ Won't-fix now — **monitor** (accepted 2026-07-15; correct + safe today, revisit only with APM contention data) |
 
 Method: repository-wide, partitioned review (architecture map → partitions →
@@ -180,7 +180,7 @@ No **P0** findings.
 - Fix: return a generic "resource already exists" to clients; keep the field name in the server log only.
 
 **F-07 — Registration/email-code path is a user-enumeration oracle**
-- Severity **P2** · Privacy/Security · Partition P1 · Confidence High · **⛔ Won't-fix — accepted 2026-07-15** (rate-limited; clear "already registered" UX preferred)
+- Severity **P2** · Privacy/Security · Partition P1 · Confidence High · **✅ Fixed — PR #51 (2026-07-16)**: `requestCode(REGISTER)` returns silently for an already-registered email, symmetric with the LOGIN-unknown path. Triaged as accept-risk on 2026-07-15, then fixed the next day — this row lagged the code.
 - Affected: `src/auth/email-verification.service.ts` (`REGISTER` + existing user → 409 "该邮箱已注册"); `src/auth/auth.service.ts`.
 - Impact: requesting a **register** code for an existing email returns a distinct 409, revealing it's registered. (The **login** path is correctly silent for unknown emails; password login uses a single generic error — good.) Gated behind resend cooldown + per-IP `emailCodeLimiter`.
 - Fix: if enumeration resistance is required, return a generic "if this email can be registered, we've sent a code" and handle the duplicate at verify time.
@@ -206,8 +206,8 @@ No **P0** findings.
 - Fix: remove the placeholder controller or use the structured logger.
 
 **F-11 — `whatsup` (WhatsApp) never privacy-gated**
-- Severity **P3** · Privacy consistency · Partition P2 · Confidence High · **❌ Invalid — false positive (2026-07-15)**
-- **Correction:** `whatsup` is a free-text public status line (DTO example "Coding every day", `@MaxLength(100)`, grouped with `persona`/`helloWords`), **not** a WhatsApp/contact handle. The original finding mislabeled it. Public status is meant to be visible like the other bio fields; only true contact info (phone/wechat/qq) is privacy-gated. No change needed.
+- Severity **P3** · Privacy consistency · Partition P2 · Confidence High · **✅ Fixed — PR #51 (2026-07-16)**
+- **Note:** `whatsup` is a free-text public status line (DTO example "Coding every day", `@MaxLength(100)`, grouped with `persona`/`helloWords`), **not** a WhatsApp/contact handle — so it was first triaged as a false positive. PR #51 gated it anyway via `showWhatsup` (default `true`), which keeps it publicly visible while giving users an opt-in switch consistent with `showWechat`/`showQQ`. The semantic point stands; the gate is a harmless superset.
 - Affected: `applyProfilePrivacy` gates only phone/wechat/qq; `whatsup` is `@Expose()`d on `PublicUserDto`.
 - Fix: include `whatsup` in the privacy-gated set if it's considered contact PII.
 
@@ -235,7 +235,7 @@ No **P0** findings.
 | File upload/download | P6 | Yes | P1 (F-03), P2 (F-08) | public bucket; no size cap; type/folder allowlisted | private prefixes + presigned GET + size cap | High |
 | Local file handling | P6 | No | — | UUID keys, filename regex-validated, no path traversal | — | High |
 | Third-party SDKs/deps | P10 | Unknown | — | modern versions; `multer`/`picomatch` overrides present | run `npm audit` (§9) | Low |
-| Permissions/privacy | P2,P5 | Minor | P3 (F-11) | privacy service consulted; `whatsup` ungated | gate whatsup if PII | High |
+| Permissions/privacy | P2,P5 | No | — | privacy service consulted; `whatsup` gated via `showWhatsup` (PR #51) | — | High |
 | Debug/test entry points | P1,P8 | Yes | P2 (F-05), P3 (F-10) | dev code bypass; logs scaffolding; Swagger prod-off | explicit opt-in flags | High |
 | Build/release config | P10 | Minor | P2 | non-root image, prune; `.env`/`logs` gitignored | confirm `NODE_ENV=production` everywhere | Med |
 
@@ -308,7 +308,7 @@ No **P0** findings.
 - **F-06** generic conflict messages; **F-09** pruning jobs for refresh tokens/notifications.
 
 **4. Monitor later**
-- **F-07** (accept/monitor enumeration), **F-11** (whatsup gating), **F-12** (isolation-level tuning under real load), **F-10** (remove logs scaffolding).
+- **F-12** (isolation-level tuning under real load) — revisit only with APM contention data.
 
 ---
 
