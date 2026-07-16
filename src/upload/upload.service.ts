@@ -46,13 +46,27 @@ export interface PresignedDownloadResult {
   expiresAt: Date;
 }
 
+/**
+ * Prefixes served anonymously (`Principal: '*'`) from the bucket.
+ *
+ * Only add a prefix here when the objects under it are genuinely public to the
+ * whole internet. An unguessable object key is NOT authorization: anyone who
+ * learns or guesses a key can fetch the object with no credentials.
+ *
+ * Deliberately absent:
+ * - `chat`   — attachments from private conversations (P0-5).
+ * - `notes`  — user note media; a note with `available: false` is private
+ *              (see NoteService.setAvailable).
+ *
+ * Both must be served through short-lived presigned GET URLs issued only after
+ * the caller's access has been checked. See UploadService.createPresignedGetUrl.
+ */
 export function buildPublicReadBucketPolicy(bucket: string) {
   const publicPrefixes = [
+    // Rendered to non-members in plaza/discovery and CDN-cacheable.
     'avatars',
     'covers',
     'posts',
-    'notes',
-    'chat',
     'friends',
     'uploads',
   ];

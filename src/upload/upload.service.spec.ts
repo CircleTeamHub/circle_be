@@ -24,8 +24,6 @@ describe('UploadService', () => {
             'arn:aws:s3:::circle/avatars/*',
             'arn:aws:s3:::circle/covers/*',
             'arn:aws:s3:::circle/posts/*',
-            'arn:aws:s3:::circle/notes/*',
-            'arn:aws:s3:::circle/chat/*',
             'arn:aws:s3:::circle/friends/*',
             'arn:aws:s3:::circle/uploads/*',
           ],
@@ -33,6 +31,42 @@ describe('UploadService', () => {
       ],
     });
     expect(JSON.stringify(policy)).not.toContain('note-exports');
+  });
+
+  // P0-5: `chat/*` holds attachments from private conversations and `notes/*`
+  // holds user notes (a note with `available: false` is private — see
+  // NoteService.setAvailable). Granting `Principal: '*'` on those prefixes makes
+  // the object key the only thing standing between an anonymous caller and the
+  // bytes. An unguessable key is not authorization.
+  describe('public-read bucket policy scope', () => {
+    const publicResources = (bucket: string): string[] => {
+      const policy = JSON.parse(buildPublicReadBucketPolicy(bucket));
+      return policy.Statement.filter(
+        (statement: { Effect: string; Principal: string }) =>
+          statement.Effect === 'Allow' && statement.Principal === '*',
+      ).flatMap((statement: { Resource: string[] }) => statement.Resource);
+    };
+
+    it('does not grant anonymous read to private-conversation attachments', () => {
+      expect(publicResources('circle')).not.toContain(
+        'arn:aws:s3:::circle/chat/*',
+      );
+    });
+
+    it('does not grant anonymous read to note media', () => {
+      expect(publicResources('circle')).not.toContain(
+        'arn:aws:s3:::circle/notes/*',
+      );
+    });
+
+    // Avatars are rendered to non-members in plaza/discovery and are
+    // CDN-cacheable; presigning them would be a perf and cache regression.
+    // This guards the deliberate carve-out against an over-eager future cleanup.
+    it('keeps avatars anonymously readable', () => {
+      expect(publicResources('circle')).toContain(
+        'arn:aws:s3:::circle/avatars/*',
+      );
+    });
   });
 
   it('applies a public-read bucket policy during module init', async () => {
