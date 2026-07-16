@@ -572,76 +572,78 @@ export class NotificationService {
       // Callers that cannot provide that authorization snapshot fail closed.
       mentionedUserIds = [];
     }
+    // Rows are assembled first so the whole fan-out is three statements rather
+    // than two per recipient. Order encodes precedence: a user who is both the
+    // trace owner and a mentionee gets only the highest-ranked notification.
+    const rows: Prisma.NotificationCreateManyInput[] = [];
+    if (
+      params.traceOwnerId &&
+      params.traceOwnerId !== params.actorId &&
+      !notifiedUserIds.has(params.traceOwnerId)
+    ) {
+      notifiedUserIds.add(params.traceOwnerId);
+      rows.push({
+        toUserID: params.traceOwnerId,
+        fromUserID: params.actorId,
+        type: NotificationType.TRACE_COMMENT,
+        content: params.content,
+        fromTraceID: params.traceId,
+        fromReplyID: params.commentId,
+      });
+    }
+    if (
+      params.replyToUserId &&
+      params.replyToUserId !== params.actorId &&
+      !notifiedUserIds.has(params.replyToUserId)
+    ) {
+      notifiedUserIds.add(params.replyToUserId);
+      rows.push({
+        toUserID: params.replyToUserId,
+        fromUserID: params.actorId,
+        type: NotificationType.COMMENT_REPLY,
+        content: params.content,
+        fromTraceID: params.traceId,
+        fromReplyID: params.commentId,
+        toReplyID: params.replyToCommentId ?? null,
+      });
+    }
+    for (const mentionedUserId of mentionedUserIds) {
+      if (notifiedUserIds.has(mentionedUserId)) continue;
+      notifiedUserIds.add(mentionedUserId);
+      rows.push({
+        toUserID: mentionedUserId,
+        fromUserID: params.actorId,
+        type: NotificationType.TRACE_MENTION,
+        content: params.content,
+        fromTraceID: params.traceId,
+        fromReplyID: params.commentId,
+      });
+    }
+    if (rows.length === 0) return [];
+
     const created = await this.prisma.$transaction(async (tx) => {
-      const notifications = [];
-      if (
-        params.traceOwnerId &&
-        params.traceOwnerId !== params.actorId &&
-        !notifiedUserIds.has(params.traceOwnerId)
-      ) {
-        notifiedUserIds.add(params.traceOwnerId);
-        notifications.push(
-          await tx.notification.create({
-            data: {
-              toUserID: params.traceOwnerId,
-              fromUserID: params.actorId,
-              type: NotificationType.TRACE_COMMENT,
-              content: params.content,
-              fromTraceID: params.traceId,
-              fromReplyID: params.commentId,
-            },
-            include: NOTIFICATION_REALTIME_INCLUDE,
-          }),
-        );
-      }
-      if (
-        params.replyToUserId &&
-        params.replyToUserId !== params.actorId &&
-        !notifiedUserIds.has(params.replyToUserId)
-      ) {
-        notifiedUserIds.add(params.replyToUserId);
-        notifications.push(
-          await tx.notification.create({
-            data: {
-              toUserID: params.replyToUserId,
-              fromUserID: params.actorId,
-              type: NotificationType.COMMENT_REPLY,
-              content: params.content,
-              fromTraceID: params.traceId,
-              fromReplyID: params.commentId,
-              toReplyID: params.replyToCommentId ?? null,
-            },
-            include: NOTIFICATION_REALTIME_INCLUDE,
-          }),
-        );
-      }
-      for (const mentionedUserId of mentionedUserIds) {
-        if (notifiedUserIds.has(mentionedUserId)) continue;
-        notifiedUserIds.add(mentionedUserId);
-        notifications.push(
-          await tx.notification.create({
-            data: {
-              toUserID: mentionedUserId,
-              fromUserID: params.actorId,
-              type: NotificationType.TRACE_MENTION,
-              content: params.content,
-              fromTraceID: params.traceId,
-              fromReplyID: params.commentId,
-            },
-            include: NOTIFICATION_REALTIME_INCLUDE,
-          }),
-        );
-      }
-      await Promise.all(
-        notifications.map((notification) =>
-          tx.notificationPushOutbox.create({
-            data: { notificationID: notification.id },
-          }),
-        ),
-      );
-      return notifications;
+      const inserted = await tx.notification.createManyAndReturn({
+        data: rows,
+        select: { id: true },
+      });
+
+      await tx.notificationPushOutbox.createMany({
+        data: inserted.map(({ id }) => ({ notificationID: id })),
+      });
+
+      const hydrated = await tx.notification.findMany({
+        where: { id: { in: inserted.map(({ id }) => id) } },
+        include: NOTIFICATION_REALTIME_INCLUDE,
+      });
+      // findMany does not promise the insert order back, so restore it to keep
+      // the precedence order above observable to callers.
+      const byId = new Map(hydrated.map((row) => [row.id, row]));
+      return inserted
+        .map(({ id }) => byId.get(id))
+        .filter((row): row is (typeof hydrated)[number] => row !== undefined);
     });
-    const mapped = created
+
+    return created
       .map((notification) => ({
         targetUserId: notification.toUserID,
         notification: mapNotificationRealtimeDto(notification),
@@ -654,6 +656,5 @@ export class NotificationService {
           notification: NotificationRealtimeDto;
         } => typeof item.targetUserId === 'string',
       );
-    return mapped;
   }
 }

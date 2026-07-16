@@ -40,6 +40,7 @@ describe('CirclePlazaService', () => {
       findUnique: jest.fn(),
       create: jest.fn(),
       delete: jest.fn(),
+      deleteMany: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
       count: jest.fn(),
@@ -1703,23 +1704,55 @@ describe('CirclePlazaService', () => {
 
   describe('cancelSignup', () => {
     it('removes signup and decrements count', async () => {
-      prisma.circlePostSignup.findUnique.mockResolvedValue({ id: 's-1' });
-      prisma.circlePostSignup.delete.mockResolvedValue({});
-      prisma.circlePost.update.mockResolvedValue({ signupCount: 2 });
+      prisma.circlePostSignup.deleteMany.mockResolvedValue({ count: 1 });
+      prisma.circlePost.update.mockResolvedValue({
+        signupCount: 2,
+        authorID: 'author-1',
+      });
 
       const result = await service.cancelSignup('user-2', 'post-1');
 
       expect(result).toEqual({ signed: false, signupCount: 2 });
+      expect(prisma.circlePost.update).toHaveBeenCalledWith({
+        where: { id: 'post-1' },
+        data: { signupCount: { decrement: 1 } },
+        select: { signupCount: true, authorID: true },
+      });
+      expect(realtime.broadcastSignupUnread).toHaveBeenCalledWith('author-1');
     });
 
     it('is a no-op when not signed up', async () => {
-      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.circlePostSignup.deleteMany.mockResolvedValue({ count: 0 });
       prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 4 });
 
       const result = await service.cancelSignup('user-2', 'post-1');
 
       expect(result).toEqual({ signed: false, signupCount: 4 });
-      expect(prisma.circlePostSignup.delete).not.toHaveBeenCalled();
+      expect(prisma.circlePost.update).not.toHaveBeenCalled();
+    });
+
+    // Regression: read-then-delete let both racers reach the delete, so the
+    // loser 500'd on P2025 and signupCount was decremented twice.
+    it('stays idempotent when a concurrent cancel wins the claim', async () => {
+      prisma.circlePostSignup.deleteMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
+      prisma.circlePost.update.mockResolvedValue({
+        signupCount: 2,
+        authorID: 'author-1',
+      });
+      prisma.circlePost.findUnique.mockResolvedValue({ signupCount: 2 });
+
+      const [winner, loser] = await Promise.all([
+        service.cancelSignup('user-2', 'post-1'),
+        service.cancelSignup('user-2', 'post-1'),
+      ]);
+
+      expect(winner).toEqual({ signed: false, signupCount: 2 });
+      expect(loser).toEqual({ signed: false, signupCount: 2 });
+      // Only the winning claim decrements; the loser must not double-count.
+      expect(prisma.circlePost.update).toHaveBeenCalledTimes(1);
+      expect(realtime.broadcastSignupUnread).toHaveBeenCalledTimes(1);
     });
   });
 
