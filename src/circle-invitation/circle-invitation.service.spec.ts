@@ -1,4 +1,4 @@
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -249,10 +249,13 @@ describe('CircleInvitationService', () => {
   });
 
   it('continues reconciliation after one candidate cannot be admitted', async () => {
-    prisma.$queryRaw.mockResolvedValue([
-      { id: 'bad', circleID: 'circle-full', applicantID: 'user-bad' },
-      { id: 'good', circleID: 'circle-open', applicantID: 'user-good' },
-    ]);
+    prisma.$queryRaw
+      .mockResolvedValueOnce([
+        { id: 'bad', circleID: 'circle-full', applicantID: 'user-bad' },
+        { id: 'good', circleID: 'circle-open', applicantID: 'user-good' },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'circle-open' }]);
     prisma.circleInvitation.findMany.mockResolvedValue([]);
     prisma.circleInvitation.findUnique
       .mockResolvedValueOnce({
@@ -277,9 +280,7 @@ describe('CircleInvitationService', () => {
       });
     prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
     prisma.circleMember.findUnique.mockResolvedValue(null);
-    prisma.circle.findUnique
-      .mockResolvedValueOnce({ maxMembers: 1, memberCount: 1 })
-      .mockResolvedValueOnce({ maxMembers: 2, memberCount: 0 });
+    prisma.circle.findUnique.mockResolvedValue({ id: 'circle-full' });
     prisma.circleMember.create.mockResolvedValue({ id: 'member-good' });
     prisma.circle.update.mockResolvedValue({});
     notificationService.createCircleInvitationNotification.mockResolvedValue(
@@ -309,6 +310,98 @@ describe('CircleInvitationService', () => {
         },
       }),
     );
+  });
+
+  it('paginates verifier work with a caller-scoped keyset cursor', async () => {
+    const cursor = '11111111-1111-4111-8111-111111111111';
+    const createdAt = new Date('2026-07-16T10:00:00.000Z');
+    prisma.circleInvitation.findFirst.mockResolvedValue({ createdAt });
+    prisma.circleInvitation.findMany.mockResolvedValue([]);
+
+    await service.getMyPendingVerifications('verifier-1', {
+      cursor,
+      limit: 20,
+    });
+
+    expect(prisma.circleInvitation.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: cursor,
+        verifiers: { some: { verifierID: 'verifier-1' } },
+      },
+      select: { createdAt: true },
+    });
+    expect(prisma.circleInvitation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          AND: [
+            {
+              status: 'PENDING',
+              verifiers: {
+                some: { verifierID: 'verifier-1', status: 'PENDING' },
+              },
+            },
+            {
+              OR: [
+                { createdAt: { lt: createdAt } },
+                { createdAt, id: { lt: cursor } },
+              ],
+            },
+          ],
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 20,
+      }),
+    );
+  });
+
+  it('rejects a pending-list cursor outside the caller scope', async () => {
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.getMyApplications('applicant-1', {
+        cursor: '22222222-2222-4222-8222-222222222222',
+        limit: 50,
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.circleInvitation.findMany).not.toHaveBeenCalled();
+  });
+
+  it('uses stable default pagination for a circle after checking admin access', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+    prisma.circleInvitation.findMany.mockResolvedValue([]);
+
+    await service.getPendingInvitationsForCircle('admin-1', 'circle-1');
+
+    expect(prisma.circleInvitation.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { circleID: 'circle-1', status: 'PENDING' },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: 50,
+      }),
+    );
+  });
+
+  it('rolls membership activation back when the atomic seat reservation fails', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    prisma.circleMember.create.mockResolvedValue({ id: 'member-new' });
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      maxMembers: null,
+      memberCount: 4,
+    });
+    prisma.$queryRaw.mockResolvedValue([]);
+
+    await expect(
+      (service as any).admitApplicant(prisma, 'circle-1', 'applicant-1'),
+    ).rejects.toThrow('Circle has reached its member limit');
+
+    expect(prisma.circleMember.create).toHaveBeenCalled();
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.circle.update).not.toHaveBeenCalled();
   });
 
   // Regression: leaveCircle / removeGroupMember delete the membership but keep

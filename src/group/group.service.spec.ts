@@ -15,6 +15,7 @@ describe('GroupService reportGroup', () => {
   let prisma: {
     $transaction: jest.Mock;
     $executeRaw: jest.Mock;
+    $queryRaw: jest.Mock;
     circle: { findFirst: jest.Mock; findUnique: jest.Mock; update: jest.Mock };
     circleMember: {
       create: jest.Mock;
@@ -50,6 +51,7 @@ describe('GroupService reportGroup', () => {
     prisma = {
       $transaction: jest.fn(async (callback) => callback(prisma)),
       $executeRaw: jest.fn(),
+      $queryRaw: jest.fn().mockResolvedValue([{ id: 'circle-1' }]),
       circle: {
         findFirst: jest.fn(),
         findUnique: jest.fn(),
@@ -433,10 +435,9 @@ describe('GroupService reportGroup', () => {
     });
     expect(prisma.circleMember.create).not.toHaveBeenCalled();
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
-    expect(prisma.circle.update).toHaveBeenCalledWith({
-      where: { id: 'circle-1' },
-      data: { memberCount: { increment: 2 } },
-    });
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([2, 'circle-1', 2]);
+    expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
         { operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'new-user' },
@@ -489,10 +490,8 @@ describe('GroupService reportGroup', () => {
     ).resolves.toEqual({ handled: true });
 
     expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
-    expect(prisma.circle.update).toHaveBeenCalledWith({
-      where: { id: 'circle-1' },
-      data: { memberCount: { increment: 1 } },
-    });
+    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([1, 'circle-1', 1]);
+    expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
         { operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'new-user' },
@@ -513,11 +512,15 @@ describe('GroupService reportGroup', () => {
       status: CircleMemberStatus.ACTIVE,
     });
     prisma.circleMember.findMany.mockResolvedValue([]);
-    // Two free seats, three invitees.
+    // The membership writes happen first inside the transaction; a failed
+    // atomic reservation then rolls them back.
     prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
       maxMembers: 10,
       memberCount: 8,
     });
+    prisma.circleMember.createMany.mockResolvedValue({ count: 3 });
+    prisma.$queryRaw.mockResolvedValue([]);
 
     await expect(
       service.inviteGroupMembers('admin-1', 'group-1', {
@@ -525,7 +528,8 @@ describe('GroupService reportGroup', () => {
       }),
     ).rejects.toThrow(BadRequestException);
 
-    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+    expect(prisma.circleMember.createMany).toHaveBeenCalled();
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
@@ -555,10 +559,8 @@ describe('GroupService reportGroup', () => {
       }),
     ).resolves.toEqual({ handled: true });
 
-    expect(prisma.circle.update).toHaveBeenCalledWith({
-      where: { id: 'circle-1' },
-      data: { memberCount: { increment: 2 } },
-    });
+    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([2, 'circle-1', 2]);
+    expect(prisma.circle.update).not.toHaveBeenCalled();
   });
 
   it('rejects circle group invites blocked by the target privacy setting', async () => {

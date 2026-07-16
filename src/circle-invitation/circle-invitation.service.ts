@@ -13,21 +13,21 @@ import {
   CircleInvitationErrorCode,
 } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { reserveCircleSeats } from 'src/circle/circle-capacity';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { feedCursorWhere } from 'src/utils/feed-cursor';
 import {
+  DEFAULT_INVITATION_LIST_LIMIT,
   InvitationDto,
+  InvitationListQueryDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
 import { circleApplicationLockKey } from './circle-application-lock';
 
 const MAX_INVITATION_TX_ATTEMPTS = 3;
-// Each invitation row hydrates a circle, two users and up to requiredCount
-// verifiers (10 by default) with a user join each, so the list endpoints cap
-// how many they return rather than scaling with the caller's history.
-const MAX_INVITATION_LIST_RESULTS = 50;
 
 type CircleInvitationNotificationData = {
   toUserID: string;
@@ -729,29 +729,46 @@ export class CircleInvitationService {
     return this.toInvitationDto(inv);
   }
 
-  async getMyPendingVerifications(userId: string): Promise<InvitationDto[]> {
+  async getMyPendingVerifications(
+    userId: string,
+    query: InvitationListQueryDto = new InvitationListQueryDto(),
+  ): Promise<InvitationDto[]> {
+    const whereBase: Prisma.CircleInvitationWhereInput = {
+      status: 'PENDING',
+      verifiers: { some: { verifierID: userId, status: 'PENDING' } },
+    };
+    const cursorWhere = await this.pendingInvitationCursorWhere(query.cursor, {
+      verifiers: { some: { verifierID: userId } },
+    });
     // Single hydrated query — no N+1 over individual invitation loads.
     const invitations = await this.prisma.circleInvitation.findMany({
-      where: {
-        status: 'PENDING',
-        verifiers: { some: { verifierID: userId, status: 'PENDING' } },
-      },
-      orderBy: { createdAt: 'desc' },
+      where: cursorWhere ? { AND: [whereBase, cursorWhere] } : whereBase,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       include: INVITATION_INCLUDE,
-      take: MAX_INVITATION_LIST_RESULTS,
+      take: query.limit ?? DEFAULT_INVITATION_LIST_LIMIT,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
   }
 
-  async getMyApplications(userId: string): Promise<InvitationDto[]> {
+  async getMyApplications(
+    userId: string,
+    query: InvitationListQueryDto = new InvitationListQueryDto(),
+  ): Promise<InvitationDto[]> {
+    const whereBase: Prisma.CircleInvitationWhereInput = {
+      applicantID: userId,
+      status: 'PENDING',
+    };
+    const cursorWhere = await this.pendingInvitationCursorWhere(query.cursor, {
+      applicantID: userId,
+    });
     const invitations = await this.prisma.circleInvitation.findMany({
       // Settled applications are history the caller cannot act on; only the
       // in-flight ones drive the "verify me" entry point.
-      where: { applicantID: userId, status: 'PENDING' },
-      orderBy: { createdAt: 'desc' },
+      where: cursorWhere ? { AND: [whereBase, cursorWhere] } : whereBase,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       include: INVITATION_INCLUDE,
-      take: MAX_INVITATION_LIST_RESULTS,
+      take: query.limit ?? DEFAULT_INVITATION_LIST_LIMIT,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
@@ -760,6 +777,7 @@ export class CircleInvitationService {
   async getPendingInvitationsForCircle(
     adminId: string,
     circleId: string,
+    query: InvitationListQueryDto = new InvitationListQueryDto(),
   ): Promise<InvitationDto[]> {
     // Verify admin role
     const membership = await this.prisma.circleMember.findUnique({
@@ -776,14 +794,43 @@ export class CircleInvitationService {
       });
     }
 
+    const whereBase: Prisma.CircleInvitationWhereInput = {
+      circleID: circleId,
+      status: 'PENDING',
+    };
+    const cursorWhere = await this.pendingInvitationCursorWhere(query.cursor, {
+      circleID: circleId,
+    });
     const invitations = await this.prisma.circleInvitation.findMany({
-      where: { circleID: circleId, status: 'PENDING' },
-      orderBy: { createdAt: 'desc' },
+      where: cursorWhere ? { AND: [whereBase, cursorWhere] } : whereBase,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       include: INVITATION_INCLUDE,
-      take: MAX_INVITATION_LIST_RESULTS,
+      take: query.limit ?? DEFAULT_INVITATION_LIST_LIMIT,
     });
 
     return invitations.map((inv) => this.toInvitationDto(inv));
+  }
+
+  private async pendingInvitationCursorWhere(
+    cursor: string | undefined,
+    scope: Prisma.CircleInvitationWhereInput,
+  ): Promise<Prisma.CircleInvitationWhereInput | undefined> {
+    if (!cursor) {
+      return undefined;
+    }
+
+    const anchor = await this.prisma.circleInvitation.findFirst({
+      where: { id: cursor, ...scope },
+      select: { createdAt: true },
+    });
+    if (!anchor) {
+      throw new BadRequestException({
+        message: 'Invalid invitation cursor',
+        errorCode: CircleInvitationErrorCode.InvalidCursor,
+      });
+    }
+
+    return feedCursorWhere({ createdAt: anchor.createdAt, id: cursor });
   }
 
   private async loadInvitation(invitationId: string) {
@@ -840,7 +887,7 @@ export class CircleInvitationService {
   }
 
   private async admitApplicant(
-    tx: any,
+    tx: Prisma.TransactionClient,
     circleId: string,
     applicantId: string,
   ): Promise<boolean> {
@@ -848,29 +895,6 @@ export class CircleInvitationService {
     const existing = await tx.circleMember.findUnique({
       where: { userID_circleID: { userID: applicantId, circleID: circleId } },
     });
-
-    const circle = await tx.circle.findUnique({
-      where: { id: circleId },
-      select: { maxMembers: true, memberCount: true },
-    });
-    if (!circle) {
-      throw new NotFoundException({
-        message: 'Circle not found',
-        errorCode: CircleErrorCode.NotFound,
-      });
-    }
-
-    const needsSeat = !existing || existing.status !== 'ACTIVE';
-    if (
-      needsSeat &&
-      circle.maxMembers != null &&
-      circle.memberCount >= circle.maxMembers
-    ) {
-      throw new BadRequestException({
-        message: 'Circle has reached its member limit',
-        errorCode: CircleErrorCode.MemberLimit,
-      });
-    }
 
     if (existing) {
       if (existing.status === 'ACTIVE') {
@@ -892,10 +916,23 @@ export class CircleInvitationService {
       });
     }
 
-    await tx.circle.update({
-      where: { id: circleId },
-      data: { memberCount: { increment: 1 } },
-    });
+    const reserved = await reserveCircleSeats(tx, circleId, 1);
+    if (!reserved) {
+      const circleStillExists = await tx.circle.findUnique({
+        where: { id: circleId },
+        select: { id: true },
+      });
+      if (!circleStillExists) {
+        throw new NotFoundException({
+          message: 'Circle not found',
+          errorCode: CircleErrorCode.NotFound,
+        });
+      }
+      throw new BadRequestException({
+        message: 'Circle has reached its member limit',
+        errorCode: CircleErrorCode.MemberLimit,
+      });
+    }
 
     return true;
   }

@@ -13,6 +13,7 @@ import {
   Prisma,
 } from 'src/generated/prisma';
 import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
+import { reserveCircleSeats } from 'src/circle/circle-capacity';
 import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -118,26 +119,6 @@ export class GroupService {
         return;
       }
 
-      const target = await tx.circle.findUnique({
-        where: { id: circle.id },
-        select: { maxMembers: true, memberCount: true },
-      });
-      if (!target) {
-        throw new NotFoundException({
-          message: 'Circle not found',
-          errorCode: GroupErrorCode.NotFound,
-        });
-      }
-      if (
-        target.maxMembers != null &&
-        target.memberCount + activatingUserIDs.length > target.maxMembers
-      ) {
-        throw new BadRequestException({
-          message: 'Circle has reached its member limit',
-          errorCode: CircleErrorCode.MemberLimit,
-        });
-      }
-
       const rejoiningUserIDs = activatingUserIDs.filter((userID) =>
         lockedByUserID.has(userID),
       );
@@ -177,10 +158,23 @@ export class GroupService {
       }
 
       if (seatsTaken > 0) {
-        await tx.circle.update({
-          where: { id: circle.id },
-          data: { memberCount: { increment: seatsTaken } },
-        });
+        const reserved = await reserveCircleSeats(tx, circle.id, seatsTaken);
+        if (!reserved) {
+          const circleStillExists = await tx.circle.findUnique({
+            where: { id: circle.id },
+            select: { id: true },
+          });
+          if (!circleStillExists) {
+            throw new NotFoundException({
+              message: 'Circle not found',
+              errorCode: GroupErrorCode.NotFound,
+            });
+          }
+          throw new BadRequestException({
+            message: 'Circle has reached its member limit',
+            errorCode: CircleErrorCode.MemberLimit,
+          });
+        }
       }
 
       await tx.groupSyncOutbox.createMany({
