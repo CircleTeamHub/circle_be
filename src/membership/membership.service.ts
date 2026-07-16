@@ -7,6 +7,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   MembershipPlanDto,
   UpgradeMembershipResponseDto,
@@ -44,7 +45,7 @@ export class MembershipService {
       });
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await runSerializableTransaction(this.prisma, async (tx) => {
       const currentUser = await tx.user.findUnique({
         where: { id: userId },
         select: { id: true, vipLevel: true },
@@ -82,9 +83,23 @@ export class MembershipService {
       const wallet = await tx.wallet.findUniqueOrThrow({
         where: { userID: userId },
       });
-      const user = await tx.user.update({
-        where: { id: userId },
+
+      // Compare-and-set on the level read above: the guard checked a snapshot,
+      // so a concurrent upgrade may have moved vipLevel since. Only the request
+      // that still matches wins — the loser rolls back its debit along with the
+      // transaction rather than paying for an upgrade it did not perform.
+      const levelChange = await tx.user.updateMany({
+        where: { id: userId, vipLevel: currentUser.vipLevel },
         data: { vipLevel: level },
+      });
+      if (levelChange.count !== 1) {
+        throw new BadRequestException({
+          message: 'Target VIP level must be higher than current level',
+          errorCode: MembershipErrorCode.LevelNotHigher,
+        });
+      }
+      const user = await tx.user.findUniqueOrThrow({
+        where: { id: userId },
         select: { id: true, vipLevel: true, creditScore: true },
       });
 
