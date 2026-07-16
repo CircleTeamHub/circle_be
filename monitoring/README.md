@@ -6,8 +6,17 @@ visualizes them in Grafana.
 
 ## Run
 
-If you want Alertmanager to send Discord notifications, create the gitignored
-webhook file before starting the stack:
+**Required** — set the Grafana admin password. There is no default; compose
+refuses to start until this exists, so the stack can never come up on
+`admin/admin`:
+
+```bash
+cp monitoring/.env.example monitoring/.env
+# put a real password in GRAFANA_ADMIN_PASSWORD (openssl rand -base64 24)
+```
+
+Optional — if you want Alertmanager to send Discord notifications, create the
+gitignored webhook file before starting the stack:
 
 ```bash
 cp monitoring/alertmanager/discord.url.example monitoring/alertmanager/discord.url
@@ -18,12 +27,16 @@ cp monitoring/alertmanager/discord.url.example monitoring/alertmanager/discord.u
 docker compose -f monitoring/docker-compose.yml up -d
 ```
 
-| UI           | URL                   | Login              |
-| ------------ | --------------------- | ------------------ |
-| Grafana      | http://localhost:3001 | admin / admin      |
-| Prometheus   | http://localhost:9090 | —                  |
-| Alertmanager | http://localhost:9093 | —                  |
-| Uptime-Kuma  | http://localhost:3002 | set on first visit |
+| UI           | URL                   | Login                        |
+| ------------ | --------------------- | ---------------------------- |
+| Grafana      | http://localhost:3001 | from `monitoring/.env`       |
+| Prometheus   | http://localhost:9090 | —                            |
+| Alertmanager | http://localhost:9093 | —                            |
+| Uptime-Kuma  | http://localhost:3002 | set on first visit           |
+
+> Changing `GRAFANA_ADMIN_PASSWORD` after the first start has no effect —
+> Grafana seeds the admin user into `grafana_data` on first boot only. Either
+> change it in the Grafana UI, or `down -v` to wipe the volume and re-seed.
 
 In Grafana the **Prometheus** datasource and the **circle_be — RED** dashboard
 are auto-provisioned (Dashboards → circle_be — RED).
@@ -61,6 +74,39 @@ Then check **Prometheus → Status → Targets** — `circle-be` should be **UP*
   and its scrape job; the rest is unaffected.
 - **OpenIM metrics:** a commented scrape job is in `prometheus/prometheus.yml`;
   enable it once you confirm OpenIM's metrics port for your version.
+
+## Relationship to OpenIM's own monitoring stack
+
+`DEPLOY.md` has the operator clone
+[openim-docker](https://github.com/openimsdk/openim-docker) separately, and that
+compose file **also ships prometheus / alertmanager / grafana / node-exporter**.
+Two things stop it colliding with this stack — both are upstream defaults, not
+local tweaks:
+
+- **It is opt-in.** All four services sit behind `profiles: [m]`, so a plain
+  `docker compose up -d` in openim-docker starts **no** monitoring at all. You
+  only get them with `--profile m`.
+- **Its ports are renumbered into the 1xxxx range** and it uses
+  `network_mode: host` (no published ports):
+
+  | Service       | OpenIM (`--profile m`) | This stack |
+  | ------------- | ---------------------- | ---------- |
+  | Prometheus    | 19090                  | 9090       |
+  | Alertmanager  | 19093                  | 9093       |
+  | Grafana       | 13000                  | 3001       |
+  | node-exporter | 19100                  | (internal) |
+
+So both can run on one box. If you do run both with `--profile m`, you get two
+node-exporters measuring the same host — harmless, just redundant.
+
+**We deliberately do not add a `circle-be` job to OpenIM's Prometheus.** Its
+config lives in the upstream checkout (`config/prometheus.yml`), so any edit is
+lost on the operator's next `git pull`; replacing it via an override would mean
+vendoring OpenIM's whole service-discovery config into this repo and keeping it
+in sync with their releases. Its Grafana also runs
+`GF_AUTH_ANONYMOUS_ENABLED=true` with `GF_AUTH_ANONYMOUS_ORG_ROLE=Admin` —
+anyone who reaches the port is an admin — which is a worse home for our
+dashboards than the password-protected Grafana here.
 
 ## Alerts → Discord
 
@@ -111,8 +157,27 @@ in its own UI (data persists in a volume).
 - Keep `/metrics`, Prometheus, Grafana, Alertmanager, and Uptime-Kuma on an
   internal network — do not expose them publicly (see the security note in
   `../docs/metrics.md`).
-- Replace Grafana's default `admin/admin` credentials with an environment
-  variable or secret-managed password.
+- Supply `GRAFANA_ADMIN_PASSWORD` from a secret manager rather than a
+  `monitoring/.env` file on the box.
+- **This stack targets the dev backend, not production.** The `circle-be` job
+  scrapes `host.docker.internal:3000`, which is `npm run start:dev` on your
+  machine. In production the backend only does `expose: 3000` on the
+  `circle-be` compose network (`docker-compose.prod.yml`) and is never
+  published to the host, so pointing this stack at prod means putting
+  Prometheus on that network and targeting `circle_be:3000` instead.
+- **If `METRICS_AUTH_TOKEN` is set, this scrape config will get 401s.**
+  `.env.production.example` ships it as `__REPLACE_RANDOM__`, so a correctly
+  configured production backend requires a bearer token that the `circle-be`
+  job does not send — the target will show DOWN. Add the token to the job
+  before scraping such a backend:
+  ```yaml
+  - job_name: circle-be
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics-token # mount it, keep it out of git
+  ```
+  Local dev leaves `METRICS_AUTH_TOKEN` unset, which is why the default job
+  works unauthenticated.
 - Use VPN, SSH tunneling, or an authenticated reverse proxy for remote access to
   monitoring UIs; do not publish the compose ports directly.
 - Provide `alertmanager/discord.url` through a secret manager or secure runtime

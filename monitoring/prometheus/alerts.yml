@@ -21,6 +21,18 @@ groups:
         annotations:
           summary: "Backend p95 latency > 1s for 5m"
 
+      # Event-loop lag is the signal unique to a single-threaded Node process:
+      # requests can still return 200 while the loop is blocked, so this fires
+      # before latency/5xx alerts do. Metric comes free from prom-client's
+      # collectDefaultMetrics (see src/metrics/metrics.service.ts).
+      - alert: BackendEventLoopLag
+        expr: nodejs_eventloop_lag_p99_seconds{job="circle-be"} > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend event-loop lag p99 > 250ms for 5m (process is blocking)"
+
       - alert: TargetDown
         expr: up == 0
         for: 2m

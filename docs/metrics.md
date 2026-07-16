@@ -15,13 +15,29 @@ aggregation via Sentry (see [logging.md](./logging.md)).
 
 ## ⚠️ Security: keep it internal
 
-`/metrics` is **unauthenticated** and exposes internal signals (route names,
-traffic volume, latencies, memory). **Do not expose it to the public internet.**
-In production, restrict it so only Prometheus can reach it:
+`/metrics` exposes internal signals (route names, traffic volume, latencies,
+memory). **Do not expose it to the public internet.**
 
-- Firewall the path / allowlist Prometheus's IP at the reverse proxy (Nginx), or
+It is **not** behind `JwtGuard`: it is mounted as raw Express middleware
+(`app.use('/metrics', …)` in `src/setup.ts`), so it never reaches Nest's
+controller guards — a scraper cannot hold a JWT anyway. Instead it has an
+**opt-in bearer token**:
+
+- Set **`METRICS_AUTH_TOKEN`** and the endpoint requires
+  `Authorization: Bearer <token>`, compared in constant time.
+- Leave it unset and the endpoint is **open** — the `Authorization` header is
+  ignored entirely. In production this logs a startup warning.
+- `.env.production.example` ships `METRICS_AUTH_TOKEN=__REPLACE_RANDOM__`, so
+  production is expected to run with the token set.
+
+The token is a second layer, not a substitute for network isolation. Also:
+
+- Firewall the path / allowlist Prometheus's IP at the reverse proxy (Caddy), or
 - Bind Prometheus and the backend on a private network and only publish the
   API + gateway ports.
+
+> If you set `METRICS_AUTH_TOKEN`, the scrape job must send it or the target
+> goes DOWN — see the production notes in [../monitoring/README.md](../monitoring/README.md).
 
 (This matches the deployment guide: only API, msg-gateway, and MinIO ports are
 public; everything else stays internal.)
