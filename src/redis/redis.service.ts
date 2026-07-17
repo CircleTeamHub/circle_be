@@ -86,6 +86,26 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Round-trips a PING. Reports Redis reachability for the readiness probe —
+   * never throws, and returns false rather than waiting on an outage (the
+   * client's connect/command timeouts and post-failure cooldown bound this).
+   */
+  async ping(): Promise<boolean> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('connect');
+      return false;
+    }
+
+    try {
+      return (await client.ping()) === 'PONG';
+    } catch (error) {
+      this.recordCommandFailure('connect', error);
+      return false;
+    }
+  }
+
   async publish(channel: string, message: string): Promise<boolean> {
     const client = await this.getCommandClient();
     if (!client) {

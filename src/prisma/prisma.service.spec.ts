@@ -28,7 +28,40 @@ jest.mock('src/config/server.config', () => ({
 }));
 
 import { Logger } from '@nestjs/common';
-import { PrismaService } from './prisma.service';
+import { PrismaService, resolveDatabasePoolConfig } from './prisma.service';
+
+describe('resolveDatabasePoolConfig', () => {
+  it('defaults to pg’s pool size, but bounds the acquire wait', () => {
+    // pg's own default for connectionTimeoutMillis is 0 = wait forever, which
+    // turns a saturated pool into hung requests instead of a visible error.
+    expect(resolveDatabasePoolConfig({})).toEqual({
+      max: 10,
+      connectionTimeoutMillis: 10_000,
+    });
+  });
+
+  it('reads both knobs from the environment', () => {
+    expect(
+      resolveDatabasePoolConfig({
+        DATABASE_POOL_MAX: '25',
+        DATABASE_POOL_ACQUIRE_TIMEOUT_MS: '3000',
+      }),
+    ).toEqual({ max: 25, connectionTimeoutMillis: 3000 });
+  });
+
+  it('falls back to defaults for unusable values rather than failing boot', () => {
+    expect(
+      resolveDatabasePoolConfig({
+        DATABASE_POOL_MAX: 'ten',
+        DATABASE_POOL_ACQUIRE_TIMEOUT_MS: '0',
+      }),
+    ).toEqual({ max: 10, connectionTimeoutMillis: 10_000 });
+    expect(resolveDatabasePoolConfig({ DATABASE_POOL_MAX: '-5' })).toEqual({
+      max: 10,
+      connectionTimeoutMillis: 10_000,
+    });
+  });
+});
 
 describe('PrismaService', () => {
   const originalEnv = process.env;
@@ -65,6 +98,35 @@ describe('PrismaService', () => {
 
     expect(() => new PrismaService()).not.toThrow();
     expect(prismaPgMock).not.toHaveBeenCalled();
+  });
+
+  it('passes the pool size and acquire timeout to the pg adapter', () => {
+    process.env.DATABASE_URL = 'postgresql://example';
+
+    expect(() => new PrismaService()).not.toThrow();
+
+    expect(prismaPgMock).toHaveBeenCalledWith({
+      connectionString: 'postgresql://example',
+      max: 10,
+      connectionTimeoutMillis: 10_000,
+    });
+  });
+
+  it('lets the environment override pool settings from the .env file', () => {
+    getServerConfigMock.mockReturnValue({
+      DATABASE_URL: 'postgresql://from-file',
+      DATABASE_POOL_MAX: '5',
+    });
+    process.env.DATABASE_POOL_MAX = '30';
+
+    expect(() => new PrismaService()).not.toThrow();
+
+    expect(prismaPgMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionString: 'postgresql://from-file',
+        max: 30,
+      }),
+    );
   });
 
   it('skips boot-time connection when PRISMA_SKIP_CONNECT_ON_BOOT is enabled', async () => {

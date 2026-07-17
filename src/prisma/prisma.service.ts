@@ -12,6 +12,48 @@ import {
 } from 'src/config/env.validation';
 import { getServerConfig } from 'src/config/server.config';
 
+/** pg's own default pool size — keeping it as the default makes tuning opt-in. */
+const DEFAULT_POOL_MAX = 10;
+/**
+ * Cap on how long a query waits for a free pool slot. pg defaults this to 0,
+ * meaning "queue forever": once the pool saturates, requests pile up silently
+ * and the process keeps looking alive while serving nothing. Failing fast turns
+ * that into a visible error instead.
+ */
+const DEFAULT_POOL_ACQUIRE_TIMEOUT_MS = 10_000;
+
+/** The pg pool knobs we expose — named to match pg's `PoolConfig` fields. */
+export interface DatabasePoolConfig {
+  max: number;
+  connectionTimeoutMillis: number;
+}
+
+function readPositiveInt(value: unknown, fallback: number): number {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : Number.parseInt(String(value ?? ''), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Resolves the pg pool settings from a merged env/config record. Unset or
+ * unparseable values fall back to the defaults rather than failing boot — Joi
+ * already rejects malformed values that arrive through ConfigModule, and this
+ * also runs against the raw `.env.<NODE_ENV>` file read by getServerConfig().
+ */
+export function resolveDatabasePoolConfig(
+  env: Record<string, unknown>,
+): DatabasePoolConfig {
+  return {
+    max: readPositiveInt(env['DATABASE_POOL_MAX'], DEFAULT_POOL_MAX),
+    connectionTimeoutMillis: readPositiveInt(
+      env['DATABASE_POOL_ACQUIRE_TIMEOUT_MS'],
+      DEFAULT_POOL_ACQUIRE_TIMEOUT_MS,
+    ),
+  };
+}
+
 @Injectable()
 export class PrismaService
   extends PrismaClient
@@ -36,10 +78,13 @@ export class PrismaService
       );
     }
 
+    // process.env wins over the .env file, same precedence as DATABASE_URL above.
+    const poolConfig = resolveDatabasePoolConfig({ ...config, ...process.env });
+
     super(
       connectionString
         ? {
-            adapter: new PrismaPg({ connectionString }),
+            adapter: new PrismaPg({ connectionString, ...poolConfig }),
           }
         : {},
     );

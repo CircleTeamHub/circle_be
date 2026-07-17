@@ -210,6 +210,25 @@ describe('setupApp', () => {
     );
   });
 
+  it('mounts /healthz and /readyz ahead of every rate limiter', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const mounts = app.use.mock.calls.map(([first]) => first);
+    expect(mounts).toContain('/healthz');
+    expect(mounts).toContain('/readyz');
+
+    // Express runs middleware in mount order, so the probes must precede the
+    // global limiter — a throttled probe reports a healthy app as dead. Rate
+    // limiters are identified by the `resetKey` express-rate-limit attaches.
+    const firstLimiterIndex = mounts.findIndex(
+      (first) => typeof first === 'function' && 'resetKey' in first,
+    );
+    expect(firstLimiterIndex).toBeGreaterThan(-1);
+    expect(mounts.indexOf('/healthz')).toBeLessThan(firstLimiterIndex);
+    expect(mounts.indexOf('/readyz')).toBeLessThan(firstLimiterIndex);
+  });
+
   it('still boots when resolving RedisService throws (falls back to no Redis)', () => {
     const app = {
       setGlobalPrefix: jest.fn(),

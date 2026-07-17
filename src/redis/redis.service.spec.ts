@@ -65,6 +65,29 @@ describe('RedisService', () => {
     client.disconnect();
   });
 
+  it('reports reachability via ping for the readiness probe', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = { ping: jest.fn().mockResolvedValue('PONG') };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+    await expect(service.ping()).resolves.toBe(true);
+  });
+
+  it('reports ping failures as unreachable instead of throwing at the probe', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    jest
+      .spyOn(service as any, 'getCommandClient')
+      .mockResolvedValue({ ping: jest.fn().mockRejectedValue(new Error('x')) });
+
+    await expect(service.ping()).resolves.toBe(false);
+
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(null);
+
+    await expect(service.ping()).resolves.toBe(false);
+  });
+
   it('warns but allows production startup when Redis is not configured by default', async () => {
     process.env.NODE_ENV = 'production';
     const service = new RedisService();
