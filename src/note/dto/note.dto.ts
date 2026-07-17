@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
@@ -300,6 +300,12 @@ export class ListNotesQueryDto {
 export class CreateNoteShareLinkDto {
   @ApiProperty()
   @IsString()
+  // 先 trim 再校验：@IsNotEmpty 只拒 '' / null / undefined，纯空白标题（'   '）
+  // 会被放行，进到服务里 trim 成空串。以前那里有个硬编码中文兜底顶上，
+  // 现在改成在边界直接拒（docs 第 5 节）。顺带让 @MaxLength 量的是 trim 后的长度。
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() : value,
+  )
   @IsNotEmpty()
   @MaxLength(120)
   title: string;
