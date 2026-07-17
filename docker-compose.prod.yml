@@ -147,13 +147,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
-    entrypoint: ['/bin/sh', '-ec']
-    command:
-      - |
-        if [ -s /config/caddy/autosave.json ]; then
-          exec caddy run --resume
-        fi
-        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    entrypoint: ['/bin/sh', '/usr/local/bin/caddy-entrypoint.sh']
     depends_on:
       # required: false 的理由同 admin_web —— 在役颜色可能是 circle_be_green。
       circle_be: { condition: service_healthy, required: false }
@@ -174,6 +168,7 @@ services:
       - '443:443'
     volumes:
       - ./deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro
+      - ./deploy/caddy-entrypoint.sh:/usr/local/bin/caddy-entrypoint.sh:ro
       - caddy_data:/data
       - caddy_config:/config
 

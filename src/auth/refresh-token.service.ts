@@ -215,11 +215,13 @@ export class RefreshTokenService {
   }
 
   async revokeSession(userId: string, sessionId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
+    const result = await this.prisma.refreshToken.updateMany({
       where: { id: sessionId, userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    await this.revocation.revokeSession(sessionId);
+    if (result.count === 1) {
+      await this.revocation.revokeSession(sessionId);
+    }
   }
 
   async revokeOtherSessions(

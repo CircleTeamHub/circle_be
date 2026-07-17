@@ -1,5 +1,15 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 const read = (path) =>
@@ -209,6 +219,7 @@ test('release selection and active-color state fail closed', () => {
   const release = read('.github/workflows/release.yml');
   const deploy = read('deploy/release-deploy.sh');
   const compose = read('docker-compose.prod.yml');
+  const caddyEntrypoint = read('deploy/caddy-entrypoint.sh');
 
   assert.match(
     release,
@@ -219,7 +230,70 @@ test('release selection and active-color state fail closed', () => {
   assert.match(deploy, /Refusing to guess which container is live/);
   assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);
   assert.match(deploy, /caddy validate --config \/etc\/caddy\/Caddyfile/);
-  assert.match(compose, /exec caddy run --resume/);
+  assert.match(
+    compose,
+    /caddy-entrypoint\.sh:\/usr\/local\/bin\/caddy-entrypoint\.sh:ro/,
+  );
+  assert.match(
+    compose,
+    /entrypoint: \['\/bin\/sh', '\/usr\/local\/bin\/caddy-entrypoint\.sh'\]/,
+  );
+  assert.doesNotMatch(compose, /caddy run --resume/);
+  assert.match(caddyEntrypoint, /circle-be-\(blue\|green\):3000/);
+  assert.match(caddyEntrypoint, /export CIRCLE_BE_UPSTREAM=/);
+  assert.match(
+    caddyEntrypoint,
+    /exec caddy run --config \/etc\/caddy\/Caddyfile --adapter caddyfile/,
+  );
+  assert.doesNotMatch(caddyEntrypoint, /caddy run --resume/);
+});
+
+test('Caddy restart preserves only the active upstream and loads the current Caddyfile', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'circle-caddy-'));
+  const autosave = join(directory, 'autosave.json');
+  const fakeCaddy = join(directory, 'caddy');
+  const entrypoint = fileURLToPath(
+    new URL('../deploy/caddy-entrypoint.sh', import.meta.url),
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeFileSync(
+    autosave,
+    JSON.stringify({ upstreams: ['circle-be-green:3000'] }),
+  );
+  writeFileSync(
+    fakeCaddy,
+    '#!/bin/sh\nprintf "%s|%s\\n" "$CIRCLE_BE_UPSTREAM" "$*"\n',
+  );
+  chmodSync(fakeCaddy, 0o755);
+
+  const result = spawnSync('/bin/sh', [entrypoint], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CADDY_AUTOSAVE_FILE: autosave,
+      PATH: `${directory}:${process.env.PATH}`,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    result.stdout.trim(),
+    'circle-be-green:3000|run --config /etc/caddy/Caddyfile --adapter caddyfile',
+  );
+
+  writeFileSync(autosave, JSON.stringify({ upstreams: ['unknown:3000'] }));
+  const invalid = spawnSync('/bin/sh', [entrypoint], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      CADDY_AUTOSAVE_FILE: autosave,
+      PATH: `${directory}:${process.env.PATH}`,
+    },
+  });
+
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /does not identify the active blue\/green backend/);
 });
 
 test('backend workflow and server use the same strict version format', () => {

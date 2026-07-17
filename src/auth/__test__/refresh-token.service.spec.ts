@@ -219,6 +219,8 @@ describe('RefreshTokenService', () => {
     expect(records[1].revokedAt).toBeNull();
     // F-02: also kills the matching session's access token.
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-2');
   });
 
   it('revokes all active sessions except the current session', async () => {
