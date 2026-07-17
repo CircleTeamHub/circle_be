@@ -4,6 +4,8 @@ describe('NoteController', () => {
   const noteService = {
     listNotes: jest.fn(),
     createNoteExport: jest.fn(),
+    revokeShareLink: jest.fn(),
+    listShareLinks: jest.fn(),
   };
   const req = {
     user: { userId: 'user-1' },
@@ -76,5 +78,46 @@ describe('NoteController', () => {
       { format: 'PDF', scope: 'ALL' },
     );
     expect(result).toEqual(exportResult);
+  });
+
+  // 吊销走 NoteController（类级 @UseGuards(JwtGuard)）而不是访客侧的
+  // NoteShareLinkPublicController：吊销必须知道「你是谁」才能校验 ownerID，
+  // 而公开 controller 刻意不挂 JwtGuard。
+  it('revokes a share link as the authenticated caller', async () => {
+    noteService.revokeShareLink.mockResolvedValueOnce(undefined);
+    const controller = new NoteController(noteService as any);
+
+    await controller.revokeShareLink(
+      '22222222-2222-2222-2222-222222222222',
+      req,
+    );
+
+    // 用户身份取自 JWT，绝不能来自请求体/查询参数 —— 否则可以吊销任何人的链接。
+    expect(noteService.revokeShareLink).toHaveBeenCalledWith(
+      'user-1',
+      '22222222-2222-2222-2222-222222222222',
+    );
+  });
+
+  it('lists share links for the authenticated caller only', async () => {
+    const links = [
+      {
+        id: 'share-1',
+        token: 'tok-1',
+        url: 'https://circle.im/s/tok-1',
+        expiresAt: null,
+        revokedAt: null,
+        createdAt: new Date('2026-06-08T10:00:00.000Z'),
+      },
+    ];
+    noteService.listShareLinks.mockResolvedValueOnce(links);
+    const controller = new NoteController(noteService as any);
+
+    const result = await controller.listShareLinks({ page: 2 } as any, req);
+
+    expect(noteService.listShareLinks).toHaveBeenCalledWith('user-1', {
+      page: 2,
+    });
+    expect(result).toEqual(links);
   });
 });

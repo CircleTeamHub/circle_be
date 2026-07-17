@@ -23,6 +23,7 @@ import {
   CreateNoteDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
+  ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
   NoteCollectSourceDto,
   NoteDetailDto,
@@ -214,6 +215,11 @@ const SHARE_LINK_MAX_NOTES = 200;
 // mapSummary 用它来判定「访客不是笔记主人」：ownerID 是 UUID，永远不会等于空串，
 // 因此 canEdit 恒为 false、collectedFrom 恒被抹掉。
 const SHARE_LINK_GUEST_VIEWER = '';
+
+// 列出分享链接的默认每页条数（对齐 listNotes）。链接行数没有上界（docs 第 3 节的
+// 每用户上限还没做），不设 take 会一次性把该用户全部历史链接拉进内存。
+// 每页上限 200 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
+const SHARE_LINK_LIST_DEFAULT_LIMIT = 50;
 const PDF_FONT_CANDIDATES = [
   '/Library/Fonts/Arial Unicode.ttf',
   '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf',
@@ -1349,14 +1355,7 @@ export class NoteService {
           },
         });
 
-        return {
-          id: row.id,
-          token: row.token,
-          url: this.buildShareUrl(row.token),
-          expiresAt: row.expiresAt,
-          revokedAt: row.revokedAt,
-          createdAt: row.createdAt,
-        };
+        return this.mapShareLink(row);
       } catch (error) {
         if (prismaErrorCode(error) === 'P2002' && attempt < 2) continue;
         throw error;
@@ -1453,6 +1452,87 @@ export class NoteService {
             ],
           }
         : {}),
+    };
+  }
+
+  /**
+   * 链接主人侧：把自己的分享链接标记为已吊销（docs 第 2 节）。
+   *
+   * resolveShareLink 早就会拒绝 `revokedAt != null` 的链接，但在此之前没有任何
+   * 代码写入 revokedAt —— enforcement 就位而 writer 缺失，链接一旦发出就作废不掉。
+   *
+   * 幂等：`revokedAt: null` 写在 where 里而不是先读后判，重复吊销匹配 0 行，
+   * 原始吊销时间不会被后一次调用覆写（并发的两次吊销也是同样的收敛结果）。
+   */
+  async revokeShareLink(ownerID: string, linkId: string): Promise<void> {
+    // ownerID 进 where = 越权吊销匹配 0 行。条件更新一步到位，不存在
+    // 「读到自己的链接 → 期间被改 → 写回」的 TOCTOU 窗口。
+    const { count } = await this.prisma.noteShareLink.updateMany({
+      where: { id: linkId, ownerID, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    if (count > 0) return;
+
+    // count === 0 有两种可能，必须区分：已经吊销过（幂等成功）vs 不存在 / 不是
+    // 你的（404）。兜底查询同样带 ownerID，所以「别人的链接」与「不存在」返回
+    // 完全一致的 404，不泄漏 id 是否存在。
+    const existing = await this.prisma.noteShareLink.findFirst({
+      where: { id: linkId, ownerID },
+      select: { id: true },
+    });
+    if (!existing) throw this.shareLinkInvalid();
+  }
+
+  /**
+   * 链接主人侧：列出自己创建的分享链接（配合吊销接口 —— 没有列表就拿不到 id）。
+   *
+   * 已吊销 / 已过期的链接也会返回：revokedAt 与 expiresAt 都在 DTO 上，由客户端
+   * 决定怎么展示；服务端先过滤掉会让这两个字段在响应里恒为 null。
+   *
+   * 分页（page/limit，默认值同 listNotes）不是锦上添花：吊销只能靠本接口拿 id，
+   * 只返回固定条数的话，链接数超过一屏之后较老但仍然有效的链接会被较新的
+   * （哪怕已吊销的）挤出去，从而看不到、也就吊销不了。
+   * 与 listNotes 一致返回裸数组、不带 total：客户端按「返回条数 < limit」判末页。
+   */
+  async listShareLinks(
+    ownerID: string,
+    query: ListNoteShareLinksQueryDto,
+  ): Promise<NoteShareLinkDto[]> {
+    const limit = query.limit ?? SHARE_LINK_LIST_DEFAULT_LIMIT;
+    const rows = await this.prisma.noteShareLink.findMany({
+      where: { ownerID },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: ((query.page ?? 1) - 1) * limit,
+      // 只取 mapShareLink 用得上的列：title / noteIDs / search 等快照字段不进
+      // DTO，没必要拉出来。给 mapShareLink 的入参加字段时这里会编译报错，
+      // 正好当作「别忘了同步」的提醒。
+      select: {
+        id: true,
+        token: true,
+        expiresAt: true,
+        revokedAt: true,
+        createdAt: true,
+      },
+    });
+    return rows.map((row) => this.mapShareLink(row));
+  }
+
+  /** NoteShareLink 行 → 对外 DTO。token 换成可直接打开的 /s/{token} 链接。 */
+  private mapShareLink(row: {
+    id: string;
+    token: string;
+    expiresAt: Date | null;
+    revokedAt: Date | null;
+    createdAt: Date;
+  }): NoteShareLinkDto {
+    return {
+      id: row.id,
+      token: row.token,
+      url: this.buildShareUrl(row.token),
+      expiresAt: row.expiresAt,
+      revokedAt: row.revokedAt,
+      createdAt: row.createdAt,
     };
   }
 
