@@ -4,6 +4,7 @@ import { validateSync } from 'class-validator';
 import {
   CreateNoteDto,
   CreateNoteShareLinkDto,
+  ListNoteShareLinksQueryDto,
   ReorderNoteGroupsDto,
 } from './note.dto';
 
@@ -161,5 +162,53 @@ describe('CreateNoteShareLinkDto', () => {
 
     expect(errors.some((error) => error.property === 'status')).toBe(true);
     expect(errors.some((error) => error.property === 'noteIds')).toBe(true);
+  });
+});
+
+describe('ListNoteShareLinksQueryDto', () => {
+  // 查询串永远是字符串，靠 setup.ts 里 ValidationPipe 的 enableImplicitConversion
+  // 按 DTO 上的类型转换 —— 这里用 enableImplicitConversion 复现同样的行为。
+  const parse = (query: Record<string, unknown>) =>
+    plainToInstance(ListNoteShareLinksQueryDto, query, {
+      enableImplicitConversion: true,
+    });
+
+  it('accepts a numeric page and limit from query string values', () => {
+    const dto = parse({ page: '2', limit: '20' });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.page).toBe(2);
+    expect(dto.limit).toBe(20);
+  });
+
+  it('accepts an empty query and leaves the defaults to the service', () => {
+    const dto = parse({});
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.page).toBeUndefined();
+    expect(dto.limit).toBeUndefined();
+  });
+
+  it('rejects a limit above the per-page cap', () => {
+    // 没有 @Max 的话，limit=100000 会让一个请求把整张表拉出来。
+    const errors = validateSync(parse({ limit: '100000' }));
+
+    expect(errors.some((error) => error.property === 'limit')).toBe(true);
+  });
+
+  it('rejects a zero or negative page', () => {
+    // page=0 会让 skip 算成负数，Prisma 会直接报错。
+    expect(
+      validateSync(parse({ page: '0' })).some((e) => e.property === 'page'),
+    ).toBe(true);
+    expect(
+      validateSync(parse({ page: '-1' })).some((e) => e.property === 'page'),
+    ).toBe(true);
+  });
+
+  it('rejects a non-integer limit', () => {
+    const errors = validateSync(parse({ limit: 'abc' }));
+
+    expect(errors.some((error) => error.property === 'limit')).toBe(true);
   });
 });

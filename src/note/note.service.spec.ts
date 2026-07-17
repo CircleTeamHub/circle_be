@@ -49,6 +49,9 @@ describe('NoteService', () => {
     noteShareLink: {
       create: jest.fn(),
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
+      updateMany: jest.fn(),
     },
   };
 
@@ -2711,6 +2714,185 @@ describe('NoteService', () => {
       expect(where.groupMemberships).toEqual({
         none: { group: { deletedAt: null } },
       });
+    });
+  });
+
+  // ── revokeShareLink / listShareLinks（链接主人侧管理）────────────────────────
+  // 规格来源：docs/note-share-links-todo.md 第 2 节（吊销接口）。
+  // resolveShareLink 已经会拒绝 revokedAt != null 的链接，但在此之前**没有任何
+  // 代码写入 revokedAt** —— enforcement 就位而 writer 缺失，吊销实际不可达。
+  describe('revokeShareLink', () => {
+    const revokedAt = new Date('2026-06-10T08:00:00.000Z');
+
+    it('stamps revokedAt on a link owned by the caller', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.revokeShareLink('user-1', 'share-1');
+
+      expect(prisma.noteShareLink.updateMany).toHaveBeenCalledWith({
+        // ownerID 在 where 里 = 越权吊销直接匹配 0 行，不需要先读后写。
+        where: { id: 'share-1', ownerID: 'user-1', revokedAt: null },
+        data: { revokedAt: expect.any(Date) },
+      });
+    });
+
+    it('keeps the original revokedAt when the link is already revoked', async () => {
+      // revokedAt: null 的 where 让重复吊销匹配 0 行 —— 原始吊销时间不会被覆写。
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce({
+        id: 'share-1',
+        revokedAt,
+      });
+
+      await expect(
+        service.revokeShareLink('user-1', 'share-1'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('rejects revoking a link owned by someone else', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      // 越权者的兜底查询同样带 ownerID，查不到 → 与「不存在」同一个 404，
+      // 不泄漏「这个 id 存在但不是你的」。
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.revokeShareLink('user-2', 'share-1'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(prisma.noteShareLink.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ ownerID: 'user-2' }),
+        }),
+      );
+    });
+
+    it('rejects revoking a link that does not exist', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.revokeShareLink('user-1', 'missing'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('does not re-read the row when the conditional update already revoked it', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.revokeShareLink('user-1', 'share-1');
+
+      // happy path 只有一次写查询：吊销是幂等条件更新，不需要先读后写。
+      expect(prisma.noteShareLink.findFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listShareLinks', () => {
+    it('returns the callers own links newest first with resolvable urls', async () => {
+      prisma.noteShareLink.findMany.mockResolvedValueOnce([
+        {
+          id: 'share-2',
+          ownerID: 'user-1',
+          token: 'tok-new',
+          title: '新链接',
+          status: null,
+          group: null,
+          groupID: null,
+          search: null,
+          noteIDs: [],
+          expiresAt: new Date('2026-07-01T00:00:00.000Z'),
+          revokedAt: null,
+          createdAt: new Date('2026-06-09T10:00:00.000Z'),
+          updatedAt: new Date('2026-06-09T10:00:00.000Z'),
+        },
+        {
+          id: 'share-1',
+          ownerID: 'user-1',
+          token: 'tok-old',
+          title: '旧链接',
+          status: null,
+          group: null,
+          groupID: null,
+          search: null,
+          noteIDs: [],
+          expiresAt: null,
+          revokedAt: new Date('2026-06-09T09:00:00.000Z'),
+          createdAt: new Date('2026-06-08T10:00:00.000Z'),
+          updatedAt: new Date('2026-06-09T09:00:00.000Z'),
+        },
+      ]);
+
+      const serviceWithBase = new NoteService(
+        prisma as any,
+        {
+          get: jest.fn((key: string) =>
+            key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
+          ),
+        } as any,
+      );
+
+      const result = await serviceWithBase.listShareLinks('user-1', {});
+
+      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { ownerID: 'user-1' },
+          orderBy: { createdAt: 'desc' },
+        }),
+      );
+      // 已吊销 / 已过期的链接也要返回：revokedAt、expiresAt 都在 DTO 上，
+      // 由客户端决定怎么展示；服务端过滤掉它们会让这两个字段恒为 null。
+      expect(result).toEqual([
+        {
+          id: 'share-2',
+          token: 'tok-new',
+          url: 'https://circle.im/s/tok-new',
+          expiresAt: new Date('2026-07-01T00:00:00.000Z'),
+          revokedAt: null,
+          createdAt: new Date('2026-06-09T10:00:00.000Z'),
+        },
+        {
+          id: 'share-1',
+          token: 'tok-old',
+          url: 'https://circle.im/s/tok-old',
+          expiresAt: null,
+          revokedAt: new Date('2026-06-09T09:00:00.000Z'),
+          createdAt: new Date('2026-06-08T10:00:00.000Z'),
+        },
+      ]);
+    });
+
+    it('defaults to the first page when no paging is requested', async () => {
+      prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
+
+      await service.listShareLinks('user-1', {});
+
+      // 与 listNotes 的默认值对齐（limit 50 / page 1）。链接行数没有上界，
+      // 不设 take 会把该用户全部历史链接一次性拉进内存。
+      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 50, skip: 0 }),
+      );
+    });
+
+    it('translates page and limit into skip and take', async () => {
+      prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
+
+      await service.listShareLinks('user-1', { page: 3, limit: 20 });
+
+      // 有了分页，超出首屏的旧链接也拿得到 id —— 否则它们在本接口上不可见，
+      // 也就无从吊销（吊销只能靠列表拿 id）。
+      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 20, skip: 40 }),
+      );
+    });
+
+    it('reaches links past the first page for revocation', async () => {
+      prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
+
+      await service.listShareLinks('user-1', { page: 2 });
+
+      // page 2 + 默认 limit：第 51 条起。这正是「老链接被新链接挤掉就吊销不了」
+      // 那个缺口的补法。
+      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 50, skip: 50 }),
+      );
     });
   });
 });

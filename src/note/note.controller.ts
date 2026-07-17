@@ -30,6 +30,7 @@ import {
   CreateNoteExportDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
+  ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
   NoteDetailDto,
   NoteExportResultDto,
@@ -170,6 +171,37 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteShareLinkDto> {
     return this.noteService.createShareLink(req.user.userId, dto);
+  }
+
+  // 必须声明在 @Get(':id') 之前：Nest 按声明顺序匹配，否则 /note/share-links 会
+  // 先命中 @Get(':id')，被那条路由的 ParseUUIDPipe 当成非法 UUID 打成 400。
+  @Get('share-links')
+  @ApiOperation({ summary: 'My note share links (newest first, paginated)' })
+  @ApiOkResponse({ type: [NoteShareLinkDto] })
+  listShareLinks(
+    @Query() query: ListNoteShareLinksQueryDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteShareLinkDto[]> {
+    return this.noteService.listShareLinks(req.user.userId, query);
+  }
+
+  /**
+   * 吊销自己的分享链接。挂在 NoteController（类级 JwtGuard）而不是访客侧的
+   * NoteShareLinkPublicController：吊销要校验 ownerID，必须先知道调用者是谁。
+   *
+   * 用 DELETE + 204 对齐同 controller 的 deleteNote / deleteGroup。语义上是软删除
+   * （行还在，只是盖上 revokedAt），与 deleteNote 的软删除（status=DELETED）一致。
+   * 重复吊销同样返回 204：吊销是幂等的。
+   */
+  @Delete('share-links/:id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Revoke one of my note share links' })
+  @ApiNoContentResponse()
+  revokeShareLink(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.noteService.revokeShareLink(req.user.userId, id);
   }
 
   @Get('group')

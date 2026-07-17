@@ -177,8 +177,11 @@ export const NoteErrorCode = {
   NotFound: 'NOTE_NOT_FOUND',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',
-  // 访客侧解析分享链接失败。不存在 / 已吊销 / 已过期共用同一个码，
-  // 避免访客据此区分「链接从未存在」和「链接曾存在但被吊销」。
+  // 分享链接不可用。两处共用：
+  // - 访客侧解析：不存在 / 已吊销 / 已过期共用同一个码，避免访客据此区分
+  //   「链接从未存在」和「链接曾存在但被吊销」。
+  // - 主人侧吊销：链接不存在 / 不属于当前用户，同样共用一个码，不泄漏 id 是否存在。
+  // 客户端应按「链接已失效」提示，不要复用笔记的「笔记不存在」文案。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
 } as const;
 
