@@ -1,14 +1,20 @@
 # Monitoring stack (Prometheus + Grafana + Alertmanager)
 
-Local observability stack that scrapes the backend `/metrics` (see
+Observability stack that scrapes the backend `/metrics` (see
 [../docs/metrics.md](../docs/metrics.md)), plus host/container metrics, and
 visualizes them in Grafana.
 
-## Run
+- **Local dev** — [Run](#run-local-dev), below. Scrapes `npm run start:dev` on
+  your machine.
+- **Production** — [Scraping production](#scraping-production). Needs the prod
+  overlay; the base file alone monitors nothing on a server.
 
-**Required** — set the Grafana admin password. There is no default; compose
-refuses to start until this exists, so the stack can never come up on
-`admin/admin`:
+## Run (local dev)
+
+**Required** — set the Grafana admin password. There is no default, so compose
+refuses to start until it is set and a **fresh** volume can never be seeded with
+`admin/admin`. On a volume that already exists this value is ignored — see
+[the first-boot caveat](#️-grafana_admin_password-only-applies-on-the-first-boot-of-the-volume):
 
 ```bash
 cp monitoring/.env.example monitoring/.env
@@ -34,31 +40,183 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Alertmanager | http://localhost:9093 | —                            |
 | Uptime-Kuma  | http://localhost:3002 | set on first visit           |
 
-> Changing `GRAFANA_ADMIN_PASSWORD` after the first start has no effect —
-> Grafana seeds the admin user into `grafana_data` on first boot only. Either
-> change it in the Grafana UI, or `down -v` to wipe the volume and re-seed.
-
 In Grafana the **Prometheus** datasource and the **circle_be — RED** dashboard
 are auto-provisioned (Dashboards → circle_be — RED).
+
+### ⚠️ `GRAFANA_ADMIN_PASSWORD` only applies on the FIRST boot of the volume
+
+Grafana seeds the admin user into the `grafana_data` volume once, on first boot.
+After that `GRAFANA_ADMIN_PASSWORD` is **silently ignored** — the container logs
+`Config overridden from Environment variable: GF_SECURITY_ADMIN_PASSWORD` on
+every start, which reads like it applied, but it did not.
+
+Verified against `grafana/grafana:13.1.0` on an existing volume:
+
+| Login attempt after changing the env var and recreating | Result |
+| --- | --- |
+| the **new** `GRAFANA_ADMIN_PASSWORD` | **401** — never applied |
+| the password the volume was **originally** seeded with | **200** — still live |
+
+So **if your `grafana_data` volume predates this password being set, changing it
+buys you nothing** — the old credential still works and the new one does not.
+Check when your volume was created:
+
+```bash
+docker volume inspect monitoring_grafana_data --format '{{.CreatedAt}}'
+```
+
+**To actually change it, reset in place** — no volume deletion, no data loss:
+
+```bash
+# note: `grafana cli`, NOT `grafana-cli` — the legacy binary no longer exists
+# in the Grafana image, and the old `grafana-cli ...` snippet fails there.
+docker compose -f monitoring/docker-compose.yml exec grafana \
+  grafana cli --homepath /usr/share/grafana admin reset-admin-password 'NEW_PASSWORD'
+```
+
+It takes effect immediately, with no restart. Then put the same value in
+`monitoring/.env` so the two agree (it still will not be what seeds the volume —
+it just keeps compose from refusing to start).
+
+> **Do not use `down -v` as the reset path.** It wipes every volume in the
+> stack, not just Grafana's: you also lose all your **Uptime-Kuma monitors and
+> notification setup** and your **Prometheus history**. Reset in place instead.
 
 Stop / wipe:
 
 ```bash
 docker compose -f monitoring/docker-compose.yml down       # keep data
-docker compose -f monitoring/docker-compose.yml down -v    # wipe volumes
+docker compose -f monitoring/docker-compose.yml down -v    # wipe volumes — this
+                                                           # also destroys your
+                                                           # Uptime-Kuma monitors
+                                                           # and Prometheus history
 ```
 
-## ⚠️ Restart the backend first
+## ⚠️ Restart the backend first (dev)
 
-The `circle-be` scrape target points at `host.docker.internal:3000`. If your
-backend is still running the old build it has no `/metrics`, so the target shows
-**DOWN**. Restart it on the new code:
+In dev the `circle-be` scrape target points at `host.docker.internal:3000`. If
+your backend is still running the old build it has no `/metrics`, so the target
+shows **DOWN**. Restart it on the new code:
 
 ```bash
 npm run start:dev
 ```
 
 Then check **Prometheus → Status → Targets** — `circle-be` should be **UP**.
+
+## Scraping production
+
+Everything above runs the stack against the **dev** backend on your machine. A
+plain `docker compose -f monitoring/docker-compose.yml up -d` on a production
+box monitors **nothing**: the `circle-be` job points at `host.docker.internal:3000`,
+but production only does `expose: 3000` on the compose network and never
+publishes the port. Prometheus dials a port that isn't there, the target is
+DOWN, and the dashboard is empty while looking installed.
+
+Add the **prod overlay** to fix that:
+
+```bash
+docker compose -f monitoring/docker-compose.yml \
+               -f monitoring/docker-compose.prod.yml up -d
+```
+
+The overlay joins Prometheus to the `circle-be` compose network, swaps in
+[`prometheus/prometheus.prod.yml`](prometheus/prometheus.prod.yml)
+(blue-green DNS discovery + bearer auth) and mounts the token file. The base
+file alone is unchanged, so local dev keeps working exactly as before.
+
+### Turning it on — step by step
+
+Run these on the server, from the repo root, **after** the app stack is up.
+
+1. **Confirm the app stack is running** — the overlay attaches to a network the
+   `circle-be` project owns, and will not create it:
+
+   ```bash
+   docker network inspect circle-be_default --format '{{.Name}}'
+   ```
+
+   Nothing? Bring the app stack up first (DEPLOY.md §4). If you run it under a
+   different compose project name, set `CIRCLE_BE_NETWORK` in `monitoring/.env`.
+
+2. **Publish the metrics token to Prometheus.** `deploy/gen-env.sh` always puts a
+   random `METRICS_AUTH_TOKEN` in `.env.production`, so a correctly bootstrapped
+   backend **always** requires a bearer token — scraping it without one is a
+   guaranteed `401`, not an edge case:
+
+   ```bash
+   bash monitoring/sync-metrics-token.sh
+   ```
+
+   This writes the gitignored `monitoring/prometheus/metrics_token`. Prometheus
+   runs as uid `65534`, so if the script tells you to, run the `chown` it prints —
+   a file it cannot read produces a `401`, i.e. the same symptom as a wrong token.
+
+3. **Set the Grafana password** (see the first-boot caveat above):
+
+   ```bash
+   cp monitoring/.env.example monitoring/.env   # then fill GRAFANA_ADMIN_PASSWORD
+   ```
+
+4. **Start it:**
+
+   ```bash
+   docker compose -f monitoring/docker-compose.yml \
+                  -f monitoring/docker-compose.prod.yml up -d
+   ```
+
+5. **Verify — do not skip this.** The whole failure mode here is monitoring that
+   looks installed and reports nothing:
+
+   ```bash
+   docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+     exec prometheus wget -qO- 'http://localhost:9090/api/v1/query?query=up{job="circle-be"}'
+   ```
+
+   You want `"value":[…,"1"]` with `"instance":"circle-be-blue"` (or `-green`).
+   `"0"` means it is reachable but rejecting you — check `lastError` on
+   **Status → Targets**; `401 Unauthorized` means step 2 is wrong or stale. An
+   empty `result` means no backend container exists at all.
+
+### After rotating `METRICS_AUTH_TOKEN`
+
+Re-run step 2 and reload, or every scrape 401s:
+
+```bash
+bash monitoring/sync-metrics-token.sh
+docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+  restart prometheus
+```
+
+### How the blue-green target works
+
+Deployment alternates the live container between `circle-be-blue` and
+`circle-be-green`, and `deploy/release-deploy.sh` **removes** the retired colour —
+so in steady state exactly one of the two names exists. A static target pinned to
+one colour is DOWN after every other release; two static targets leave one
+permanently red, which just teaches you to ignore red.
+
+So the job resolves **both container names via Docker's embedded DNS** and takes
+whatever exists:
+
+| Situation | Targets |
+| --- | --- |
+| Steady state | 1 — the live colour. The absent name is NXDOMAIN and contributes nothing (no error, no lookup failure). |
+| Mid-release | 2 — both colours, with distinct `instance` labels. You can watch the new colour before Caddy switches to it. |
+| After the switch | 1 — the removed colour's series goes stale within ~30s, well inside `TargetDown`'s `for: 2m`, so a release does not page you. |
+| No backend at all | 0 — **`up` stops existing rather than going to 0**, so `up == 0` cannot fire. The `CircleBeNoTarget` `absent()` rule in `alerts.yml` covers exactly this. Do not delete it. |
+
+`instance` is relabelled from the resolved name to a stable `circle-be-blue` /
+`circle-be-green` (otherwise it would be the container IP, which changes on every
+release), and a `color` label is added so you can tell them apart mid-release.
+
+> **Caveat:** this relies on Docker's embedded DNS being authoritative for
+> container names, which it is for any user-defined network. If your host's
+> resolver hijacks NXDOMAIN (some ISP resolvers do), the absent colour could
+> resolve to a bogus public IP and show as a DOWN target rather than no target.
+> That fails loudly, not silently — but if you see it, switch the job to
+> `docker_sd_config`, which needs no DNS but does need the Docker socket mounted
+> into Prometheus (a root-equivalent privilege — that is why DNS is the default).
 
 ## Notes / caveats
 
@@ -159,25 +317,13 @@ in its own UI (data persists in a volume).
   `../docs/metrics.md`).
 - Supply `GRAFANA_ADMIN_PASSWORD` from a secret manager rather than a
   `monitoring/.env` file on the box.
-- **This stack targets the dev backend, not production.** The `circle-be` job
-  scrapes `host.docker.internal:3000`, which is `npm run start:dev` on your
-  machine. In production the backend only does `expose: 3000` on the
-  `circle-be` compose network (`docker-compose.prod.yml`) and is never
-  published to the host, so pointing this stack at prod means putting
-  Prometheus on that network and targeting `circle_be:3000` instead.
-- **If `METRICS_AUTH_TOKEN` is set, this scrape config will get 401s.**
-  `.env.production.example` ships it as `__REPLACE_RANDOM__`, so a correctly
-  configured production backend requires a bearer token that the `circle-be`
-  job does not send — the target will show DOWN. Add the token to the job
-  before scraping such a backend:
-  ```yaml
-  - job_name: circle-be
-    authorization:
-      type: Bearer
-      credentials_file: /etc/prometheus/metrics-token # mount it, keep it out of git
-  ```
-  Local dev leaves `METRICS_AUTH_TOKEN` unset, which is why the default job
-  works unauthenticated.
+- **The base compose file targets the dev backend.** Scraping production needs
+  the prod overlay — see [Scraping production](#scraping-production). Bringing
+  this stack up on a server *without* the overlay monitors nothing.
+- **Never point the `circle-be` job at a public URL.** `deploy/Caddyfile.admin`
+  returns 404 for `/metrics` on purpose; the scrape path is the internal compose
+  network, and the bearer token is a second layer behind that, not a substitute
+  for it.
 - Use VPN, SSH tunneling, or an authenticated reverse proxy for remote access to
   monitoring UIs; do not publish the compose ports directly.
 - Provide `alertmanager/discord.url` through a secret manager or secure runtime

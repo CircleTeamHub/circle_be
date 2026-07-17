@@ -1,0 +1,42 @@
+# Production overlay for the monitoring stack.
+#
+#   docker compose -f monitoring/docker-compose.yml \
+#                  -f monitoring/docker-compose.prod.yml up -d
+#
+# Without it, the stack scrapes the DEV backend (host.docker.internal:3000) and
+# monitors nothing in production — see README.md "Scraping production".
+#
+# It changes Prometheus only, in three ways:
+#   1. joins it to the circle-be compose network, the only place the backend is
+#      reachable (docker-compose.prod.yml only does `expose: 3000`);
+#   2. swaps in prometheus.prod.yml (blue-green DNS discovery + bearer auth);
+#   3. mounts the METRICS_AUTH_TOKEN credentials file.
+#
+# Prerequisites:
+#   - the circle-be stack is up, so its network exists;
+#   - monitoring/prometheus/metrics_token exists — run monitoring/sync-metrics-token.sh.
+
+services:
+  prometheus:
+    networks:
+      # Named explicitly because adding a second network would otherwise drop
+      # the implicit default, and Prometheus must keep reaching alertmanager /
+      # node-exporter / cadvisor over the monitoring network.
+      - default
+      - circle-be
+    volumes:
+      # Overrides the dev config mounted at the same path by the base file.
+      - ./prometheus/prometheus.prod.yml:/etc/prometheus/prometheus.yml:ro
+      # Gitignored, 0600, owned by uid 65534 (the `nobody` user Prometheus runs
+      # as) — otherwise the container cannot read it and every scrape 401s.
+      - ./prometheus/metrics_token:/etc/prometheus/metrics_token:ro
+
+networks:
+  circle-be:
+    # Created by the circle-be stack (docker-compose.prod.yml sets
+    # `name: circle-be`, so compose names its default network circle-be_default).
+    # `external` means this overlay never creates or removes it — bring the app
+    # stack up first. Override CIRCLE_BE_NETWORK in monitoring/.env if you run
+    # the app stack under a different compose project name.
+    external: true
+    name: ${CIRCLE_BE_NETWORK:-circle-be_default}

@@ -36,8 +36,11 @@ The token is a second layer, not a substitute for network isolation. Also:
 - Bind Prometheus and the backend on a private network and only publish the
   API + gateway ports.
 
-> If you set `METRICS_AUTH_TOKEN`, the scrape job must send it or the target
-> goes DOWN — see the production notes in [../monitoring/README.md](../monitoring/README.md).
+> `deploy/gen-env.sh` always writes a random `METRICS_AUTH_TOKEN` into
+> `.env.production`, so **production always requires the token** — a scrape job
+> that omits it gets a 401 and the target goes DOWN with an empty dashboard.
+> `monitoring/docker-compose.prod.yml` wires it up; see
+> [Scraping production](../monitoring/README.md#scraping-production).
 
 (This matches the deployment guide: only API, msg-gateway, and MinIO ports are
 public; everything else stays internal.)
@@ -63,6 +66,9 @@ Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.
 
 ## Prometheus scrape config
 
+Minimal form, for an unauthenticated backend at a fixed address (this is what
+local dev uses — `monitoring/prometheus/prometheus.yml`):
+
 ```yaml
 scrape_configs:
   - job_name: circle-be
@@ -70,6 +76,12 @@ scrape_configs:
     static_configs:
       - targets: ["<backend-host>:3000"]
 ```
+
+**Production needs more than this** and the difference is not optional: the
+backend is only reachable on the compose network, requires the bearer token, and
+moves between the blue/green containers on every release. That config lives in
+`monitoring/prometheus/prometheus.prod.yml` — see
+[Scraping production](../monitoring/README.md#scraping-production).
 
 ## Example queries (RED method)
 

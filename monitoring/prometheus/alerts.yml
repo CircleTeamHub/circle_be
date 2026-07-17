@@ -41,6 +41,24 @@ groups:
         annotations:
           summary: "Scrape target {{ $labels.job }} is down"
 
+      # Companion to TargetDown, and NOT redundant with it. In production the
+      # circle-be job is DNS service discovery over the blue/green container
+      # names (prometheus.prod.yml): if no colour is running, discovery returns
+      # zero targets, so `up{job="circle-be"}` stops existing rather than going
+      # to 0 — and `up == 0` above can never fire. This catches exactly that
+      # hole: a backend that is not merely broken but entirely absent.
+      #
+      # Harmless in dev, where the job is a static target and `up` always exists.
+      # 5m tolerates a blue-green switch, which briefly runs both colours and
+      # then removes one; it never leaves zero.
+      - alert: CircleBeNoTarget
+        expr: absent(up{job="circle-be"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No circle-be scrape target exists (no backend container is running)"
+
   - name: host
     rules:
       - alert: HighMemory
