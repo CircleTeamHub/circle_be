@@ -31,6 +31,7 @@ import {
   NoteMediaType,
   NoteSectionsDto,
   NoteShareLinkDto,
+  NoteShareLinkRevokedDto,
   NoteStatus,
   NoteSummaryDto,
   NoteWritableStatus,
@@ -1364,6 +1365,73 @@ export class NoteService {
     }
 
     throw new ConflictException('Unable to create share link');
+  }
+
+  /**
+   * 主人侧：吊销一条分享链接（docs/note-share-links-todo.md 第 2 节）。
+   *
+   * revokedAt 字段一直存在，resolveShareLink 也已经在校验它（第 1 节），缺的只是
+   * 写入它的接口 —— 链接一旦发出去就无法主动作废。这里补上那个 writer，「作废」
+   * 至此才真正闭环：本方法写 revokedAt，解析接口据此拒绝该 token。
+   *
+   * 授权模型：`ownerID` 来自调用方的 JWT（controller 传入 `req.user.userId`），
+   * **绝不** 接受 body / query 里的用户 id。归属校验直接进 WHERE 而不是先读后判 ——
+   * 数据库层面就不可能写到别人的行，漏判的窗口不存在。少了这道校验，任何人都能
+   * 吊销任何人的分享链接（IDOR），即对他人分享的定向拒绝服务。
+   *
+   * 幂等：重复吊销返回 200 并保留 **首次** 吊销时间。吊销是安全动作，重试/误触
+   * 不该失败；而 revokedAt 是「链接何时被杀死」的审计事实，不能被第二次调用刷新。
+   * 条件写 `revokedAt: null` 让首次吊销成为一次原子 claim —— 并发的第二个请求
+   * 匹配 0 行，回落到读取路径，读回首次时间戳而不是覆盖它。
+   *
+   * 不存在的 id 与别人的 id 返回同一个 404（见 shareLinkNotFound）。
+   */
+  async revokeShareLink(
+    ownerID: string,
+    linkId: string,
+  ): Promise<NoteShareLinkRevokedDto> {
+    const now = new Date();
+
+    // ownerID 进 WHERE = IDOR 防线；revokedAt: null 保证只有首次吊销真正写入。
+    const claimed = await this.prisma.noteShareLink.updateMany({
+      where: { id: linkId, ownerID, revokedAt: null },
+      data: { revokedAt: now },
+    });
+
+    if (claimed.count > 0) {
+      return { id: linkId, revokedAt: now };
+    }
+
+    // count === 0 有三种可能：id 不存在 / 链接属于别人 / 已经吊销过。
+    // 回查同样带 ownerID —— 别人的链接在这里依旧读不到，因此走进 404 分支。
+    const existing = await this.prisma.noteShareLink.findFirst({
+      where: { id: linkId, ownerID },
+      select: { id: true, revokedAt: true },
+    });
+
+    // 读不到（不存在 / 不属于本人）→ 404。
+    // 读得到但 revokedAt 仍为空 → 与条件写的结果矛盾（无「取消吊销」路径，正常
+    // 不可达），此时也不能谎报成功，同样按 404 处理。
+    if (!existing?.revokedAt) throw this.shareLinkNotFound();
+
+    // 已吊销：幂等返回首次吊销时间，不刷新。
+    return { id: existing.id, revokedAt: existing.revokedAt };
+  }
+
+  /**
+   * 吊销失败的统一响应：id 不存在 与 id 属于别人 必须逐字节一致。
+   *
+   * 刻意用 404 而不是 403：403 等于确认「这条链接存在，只是不属于你」，
+   * 调用方可以拿它当枚举 id 的存在性探针。404 把两种情况折叠成同一个回答。
+   * 这也与本模块既有的归属校验一致（requireOwnedNote / requireOwnedGroup
+   * 同样把 ownerID 放进 WHERE 后回 404），以及与访客侧 shareLinkInvalid 的
+   * 「不可区分」原则一致。
+   */
+  private shareLinkNotFound(): NotFoundException {
+    return new NotFoundException({
+      message: 'Share link not found',
+      errorCode: NoteErrorCode.ShareLinkNotFound,
+    });
   }
 
   /**

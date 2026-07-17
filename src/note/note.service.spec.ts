@@ -49,6 +49,8 @@ describe('NoteService', () => {
     noteShareLink: {
       create: jest.fn(),
       findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      updateMany: jest.fn(),
     },
   };
 
@@ -2711,6 +2713,263 @@ describe('NoteService', () => {
       expect(where.groupMemberships).toEqual({
         none: { group: { deletedAt: null } },
       });
+    });
+  });
+
+  // ── revokeShareLink（链接吊销）────────────────────────────────────────────
+  // 规格来源：docs/note-share-links-todo.md 第 2 节。revokedAt 字段一直存在，
+  // 解析接口（第 1 节）也已经在校验它，但没有任何接口去写它 —— 链接发出去之后
+  // 无法主动作废。这里补上那个 writer。
+  describe('revokeShareLink', () => {
+    const linkId = '11111111-1111-4111-8111-111111111111';
+
+    it('revokes a link owned by the caller and stamps a real timestamp', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      const before = Date.now();
+      const result = await service.revokeShareLink('user-1', linkId);
+      const after = Date.now();
+
+      // revokedAt 必须是真实的当前时间戳，不能是 null / 占位值 —— 解析接口靠
+      // `revokedAt !== null` 短路，写错了链接就永远吊销不掉。
+      expect(result.id).toBe(linkId);
+      expect(result.revokedAt).toBeInstanceOf(Date);
+      expect(result.revokedAt.getTime()).toBeGreaterThanOrEqual(before);
+      expect(result.revokedAt.getTime()).toBeLessThanOrEqual(after);
+    });
+
+    // ★ 本接口的安全核心。ownerID 必须进 WHERE，否则任何人都能吊销别人的
+    // 分享链接（IDOR）—— 对他人分享的定向拒绝服务。
+    it('scopes the write by ownerID so a caller cannot revoke a foreign link', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.revokeShareLink('user-1', linkId);
+
+      const where = prisma.noteShareLink.updateMany.mock.calls[0][0].where;
+      expect(where.id).toBe(linkId);
+      expect(where.ownerID).toBe('user-1');
+    });
+
+    it('rejects revoking a link owned by someone else', async () => {
+      // 别人的链接：带 ownerID 的写匹配 0 行，带 ownerID 的回查也读不到。
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce(null as never);
+
+      await expect(
+        service.revokeShareLink('attacker', linkId),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      // 回查也必须按 ownerID 收窄，否则 404/200 的差异仍会泄漏链接是否存在。
+      const readWhere = prisma.noteShareLink.findFirst.mock.calls[0][0].where;
+      expect(readWhere.ownerID).toBe('attacker');
+    });
+
+    it('never lets a foreign revoke reach the database as an unscoped write', async () => {
+      // 用「没有 ownerID 条件就会命中」的 mock 反过来钉死实现：若实现把 ownerID
+      // 漏出 WHERE，updateMany 就会以 count=1 成功返回，本条随即失败。
+      prisma.noteShareLink.updateMany.mockImplementationOnce(
+        ({ where }: { where: Record<string, unknown> }) =>
+          Promise.resolve({ count: where.ownerID === 'owner-1' ? 1 : 0 }),
+      );
+      prisma.noteShareLink.findFirst.mockImplementationOnce(
+        ({ where }: { where: Record<string, unknown> }) =>
+          Promise.resolve(
+            where.ownerID === 'owner-1'
+              ? { id: linkId, revokedAt: null }
+              : null,
+          ),
+      );
+
+      await expect(
+        service.revokeShareLink('attacker', linkId),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('rejects an unknown link id', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce(null as never);
+
+      await expect(
+        service.revokeShareLink('user-1', linkId),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    // 未知 id 与他人的 id 必须返回逐字节一致的响应，否则调用方可以拿 404/403
+    // 的差异当「这条链接存在吗」的探针。
+    it('returns an identical opaque error for unknown and foreign link ids', async () => {
+      const capture = async (caller: string): Promise<unknown> => {
+        prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+        prisma.noteShareLink.findFirst.mockResolvedValueOnce(null as never);
+        try {
+          await service.revokeShareLink(caller, linkId);
+          throw new Error('expected revokeShareLink to reject');
+        } catch (error) {
+          return error;
+        }
+      };
+
+      const unknown = await capture('user-1');
+      const foreign = await capture('attacker');
+
+      for (const error of [unknown, foreign]) {
+        // 403 会确认「这条链接存在、只是不属于你」。统一 404。
+        expect(error).toBeInstanceOf(NotFoundException);
+        expect((error as NotFoundException).getStatus()).toBe(404);
+      }
+      expect((unknown as NotFoundException).getResponse()).toEqual(
+        (foreign as NotFoundException).getResponse(),
+      );
+    });
+
+    // 幂等语义：重复吊销返回 200 且保留**首次**吊销时间。revokedAt 是审计事实
+    // （链接何时被杀死），不能被重试或误触的第二次调用刷新。
+    it('is idempotent: re-revoking returns the original revokedAt, not a fresh one', async () => {
+      const firstRevokedAt = new Date('2026-06-09T00:00:00.000Z');
+      // 条件写 `revokedAt: null` 不再匹配 → count=0；回查读到已吊销的行。
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 0 });
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce({
+        id: linkId,
+        revokedAt: firstRevokedAt,
+      } as never);
+
+      const result = await service.revokeShareLink('user-1', linkId);
+
+      expect(result).toEqual({ id: linkId, revokedAt: firstRevokedAt });
+    });
+
+    it('guards the write with revokedAt: null so a concurrent re-revoke cannot bump the timestamp', async () => {
+      prisma.noteShareLink.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await service.revokeShareLink('user-1', linkId);
+
+      // 条件更新是原子的：两个并发请求只有一个能把 revokedAt 从 null 改掉，
+      // 首次吊销时间因此不会被第二个请求覆盖。
+      const where = prisma.noteShareLink.updateMany.mock.calls[0][0].where;
+      expect(where.revokedAt).toBeNull();
+    });
+  });
+
+  // ── 吊销 → 解析：端到端闭环 ───────────────────────────────────────────────
+  // 单独把 revokedAt 写进库不算功能完成 —— 只有当解析接口因此开始拒绝这条
+  // 链接，「作废」才真的成立。这条把 writer（第 2 节）和 reader（第 1 节）
+  // 接在同一份内存态上跑，证明闭环成立而不只是写了一列。
+  describe('revoke → resolve (end-to-end)', () => {
+    const linkId = '22222222-2222-4222-8222-222222222222';
+
+    /** 用一行可变的内存态同时驱动 revoke 的写和 resolve 的读。 */
+    const seedLink = () => {
+      // 必须 mockReset 而不能只靠外层的 jest.clearAllMocks()：clearAllMocks 只
+      // 清调用记录，**不会** 清空 mockResolvedValueOnce 的队列。上面
+      // resolveShareLink 的失败路径用例都排了一个 findMany once 值却因短路从未
+      // 消费（它们正是靠 not.toHaveBeenCalled() 断言的），残留的 once 值会抢在
+      // 本块的默认实现之前返回 []，把 e2e 断言污染成空列表。
+      prisma.note.findMany.mockReset();
+      prisma.noteShareLink.findUnique.mockReset();
+      prisma.noteShareLink.updateMany.mockReset();
+      prisma.noteShareLink.findFirst.mockReset();
+
+      const row = {
+        id: linkId,
+        ownerID: 'user-1',
+        token: 'tok-e2e',
+        title: '我的笔记',
+        status: null,
+        group: null,
+        groupID: null,
+        search: null,
+        noteIDs: ['note-1'],
+        expiresAt: null as Date | null,
+        revokedAt: null as Date | null,
+        createdAt: new Date('2026-06-08T10:00:00.000Z'),
+        updatedAt: new Date('2026-06-08T10:00:00.000Z'),
+      };
+
+      prisma.noteShareLink.findUnique.mockImplementation(
+        ({ where }: { where: { token: string } }) =>
+          Promise.resolve(where.token === row.token ? { ...row } : null),
+      );
+      // 忠实模拟 Prisma 的 where 语义：**未出现** 的字段代表「不约束」，而不是
+      // 「不匹配」。这一点是本块能抓到 IDOR 的关键 —— 若把缺失的 ownerID 当成
+      // 不匹配，漏了归属校验的实现反而会吊销失败，测试就会因为错误的原因变绿。
+      const matchesLink = (where: Record<string, unknown>): boolean =>
+        where.id === row.id &&
+        (where.ownerID === undefined || where.ownerID === row.ownerID) &&
+        (where.revokedAt === undefined ||
+          (where.revokedAt === null
+            ? row.revokedAt === null
+            : where.revokedAt === row.revokedAt));
+
+      prisma.noteShareLink.updateMany.mockImplementation(
+        ({
+          where,
+          data,
+        }: {
+          where: Record<string, unknown>;
+          data: { revokedAt: Date };
+        }) => {
+          if (!matchesLink(where)) return Promise.resolve({ count: 0 });
+          row.revokedAt = data.revokedAt;
+          return Promise.resolve({ count: 1 });
+        },
+      );
+      prisma.noteShareLink.findFirst.mockImplementation(
+        ({ where }: { where: Record<string, unknown> }) =>
+          Promise.resolve(
+            matchesLink(where)
+              ? { id: row.id, revokedAt: row.revokedAt }
+              : null,
+          ),
+      );
+      prisma.note.findMany.mockResolvedValue([
+        {
+          id: 'note-1',
+          ownerID: 'user-1',
+          title: '测试笔记',
+          content: '正文内容',
+          status: 'ACTIVE',
+          available: true,
+          pinned: false,
+          imageCount: 0,
+          videoCount: 0,
+          mediaCount: 0,
+          collectedFrom: null,
+          createdAt: new Date('2026-04-09T00:00:00.000Z'),
+          updatedAt: new Date('2026-04-09T10:00:00.000Z'),
+          groupMemberships: [],
+          coverMedia: null,
+        },
+      ]);
+
+      return row;
+    };
+
+    it('resolves before revoke, and stops resolving after revoke', async () => {
+      seedLink();
+
+      // 1. 吊销前：访客可以正常解析。
+      const before = await service.resolveShareLink('tok-e2e');
+      expect(before.notes).toHaveLength(1);
+
+      // 2. 主人吊销。
+      const revoked = await service.revokeShareLink('user-1', linkId);
+      expect(revoked.revokedAt).toBeInstanceOf(Date);
+
+      // 3. 吊销后：同一个 token 必须再也解析不出来 —— 这才是「链接作废」。
+      await expect(service.resolveShareLink('tok-e2e')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('leaves the link resolvable when a non-owner attempts the revoke', async () => {
+      seedLink();
+
+      // 越权吊销必须失败，且不能有任何副作用 —— 链接对访客照常可用。
+      await expect(
+        service.revokeShareLink('attacker', linkId),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      const stillWorks = await service.resolveShareLink('tok-e2e');
+      expect(stillWorks.notes).toHaveLength(1);
     });
   });
 });

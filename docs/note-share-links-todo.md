@@ -1,8 +1,9 @@
 # 笔记分享链接 — 待办事项
 
 > 关联 commit：`982daa8` Add note share links and readable note metadata
-> ~~现状：分享链接「只写不读」~~ → 第 1、4 条已完成（见下）。
-> 剩余：第 2 条（吊销接口）、第 3 条（数量上限）、第 5 条（兜底标题）。
+> ~~现状：分享链接「只写不读」~~ → 第 1、2、4 条已完成（见下）。
+> 「创建 → 解析 → 吊销」的读写闭环至此完整。
+> 剩余：第 3 条（数量上限）、第 5 条（兜底标题）。
 > 本文档记录 review 中发现的剩余工作。
 
 ---
@@ -21,8 +22,8 @@
 - [x] 解析时重新校验笔记状态（见第 4 条）
 
 > ~~⚠️ 注意：现在 `createShareLink` 已经会写入 `expiresAt`，但**只存不校验**。~~
-> ✅ `expiresAt` 现在在解析时真正生效。**但 `revokedAt` 仍无人写入**（第 2 条），
-> 即：解析侧已会拒绝被吊销的链接，只是还没有接口能把链接标记为已吊销。
+> ✅ `expiresAt` 现在在解析时真正生效。~~但 `revokedAt` 仍无人写入（第 2 条）~~
+> → `revokedAt` 的 writer 已随第 2 条落地，解析侧的吊销校验现在有真实数据可拒。
 
 补充说明（实现时的取舍）：
 
@@ -37,17 +38,40 @@
 
 ---
 
-## 2. 吊销接口 ← 目前「吊销」不可用的唯一缺口
+## 2. 吊销接口 ✅ 已完成
 
-数据库已有 `revokedAt` 字段，但没有接口去设置它，链接目前无法主动作废。
-客户端也没有吊销入口（`circle-im` 里 `revokedAt` 只出现在类型定义中）。
+~~数据库已有 `revokedAt` 字段，但没有接口去设置它，链接目前无法主动作废。~~
 
-- [ ] 新增 `DELETE /note/share-links/:id`（或 `POST .../revoke`），设置 `revokedAt = now`
-- [ ] 校验 `ownerID === 当前用户`，防止越权吊销别人的链接
+**已实现：** `DELETE /note/share-links/:id` —
+`NoteController`（类级 JwtGuard）+ `NoteService.revokeShareLink`。
+
+- [x] 新增 `DELETE /note/share-links/:id`（或 `POST .../revoke`），设置 `revokedAt = now`
+- [x] 校验 `ownerID === 当前用户`，防止越权吊销别人的链接
 - [x] 解析接口需配合校验 `revokedAt`（见第 1 条）— 已完成，解析侧已会拒绝
 
-> 即：**enforcement 已就位，缺的是 writer**。补上本条后「吊销」即可端到端生效，
-> 解析侧无需再改。
+> **「吊销」现已端到端生效**：本接口写 `revokedAt`，第 1 条的解析接口据此拒绝该
+> token。测试里有一条闭环用例（创建 → 解析成功 → 吊销 → 解析被拒）钉住这件事 ——
+> 只写一列不算功能完成，解析侧真的开始拒绝才算。
+
+补充说明（实现时的取舍）：
+
+- **归属校验进 WHERE**（`updateMany({ where: { id, ownerID, revokedAt: null } })`），
+  而不是先读后判：数据库层面就写不到别人的行，不存在漏判窗口。`ownerID` 只取自
+  JWT（`req.user.userId`），**绝不**接受 body / query 传入的用户 id。
+- **不存在的 id 与别人的 id 返回同一个 404**（`NOTE_SHARE_LINK_NOT_FOUND`），
+  不用 403：403 等于确认「链接存在，只是不属于你」，可被当作枚举 id 的存在性探针。
+  这也与本模块既有归属校验（`requireOwnedNote` / `requireOwnedGroup`）一致 ——
+  note 模块内没有任何 `ForbiddenException`。
+- **幂等**：重复吊销返回 200 并保留**首次**吊销时间。吊销是安全动作，重试/误触不该
+  失败；`revokedAt` 是「链接何时被杀死」的审计事实，不能被第二次调用刷新。条件写
+  `revokedAt: null` 让首次吊销成为原子 claim，并发的第二个请求匹配 0 行后回落到
+  读取路径，读回首次时间戳而非覆盖。
+- 响应体 `{ id, revokedAt }` 不回显 token / url（链接已作废，无需再传一次地址）。
+  目前没有主人侧的分享链接列表接口，这是主人观察到 `revokedAt` 的唯一途径。
+- 限流：`setup.ts` 的 `app.use('/api/v1/note', noteWriteLimiter)` 是 Express **前缀**
+  挂载且不筛方法，本路由已被覆盖（60 次/15 分钟/IP），未再叠加 `@Throttle`。
+- 路由不与 `NoteController` 既有的 `@Delete(':id')`（软删除笔记）冲突：那条只吃单段
+  路径，本条是两段。有一条真实 HTTP 用例钉住这点（最坏的失败模式是把笔记删了）。
 
 ---
 
@@ -91,6 +115,7 @@
 
 ## 实现顺序建议
 
-~~1 → 2 → 4 一起做~~ → 1 和 4 已完成（`feat: resolve note share links with expiry and revocation checks`）。
-2 未做：它是**写**路径（需要 owner 校验），与解析解耦，单独一个 PR 更好审。
+~~1 → 2 → 4 一起做~~ → 1、4 已完成（`feat: resolve note share links with expiry and revocation checks`），
+2 已完成（`feat: revoke note share links`，独立 PR —— 写路径与解析解耦，单独审更清楚）。
+读写闭环（创建 / 解析 / 吊销）至此完整。
 3、5 可后续单独处理。

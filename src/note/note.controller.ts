@@ -35,6 +35,7 @@ import {
   NoteExportResultDto,
   NoteGroupDto,
   NoteShareLinkDto,
+  NoteShareLinkRevokedDto,
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
@@ -170,6 +171,33 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteShareLinkDto> {
     return this.noteService.createShareLink(req.user.userId, dto);
+  }
+
+  /**
+   * 吊销分享链接（docs/note-share-links-todo.md 第 2 节）。
+   *
+   * revokedAt 字段和解析接口的 `revokedAt !== null` 校验都早就在了，缺的一直是
+   * 写入它的接口 —— 链接发出去之后无法主动作废。这条补上那个 writer。
+   *
+   * 吊销人取自 `req.user.userId`（JWT），**绝不** 从 body / query 读 —— 那会让
+   * 调用方自己声明身份，等同于允许任何人吊销任何人的链接（IDOR）。
+   * 归属校验在 service 里进 WHERE，不属于本人的 id 与不存在的 id 同为 404。
+   *
+   * 路由不与本 controller 的 `@Delete(':id')`（软删除笔记）冲突：那条只吃单段
+   * 路径（/note/xxx），这里是两段（/note/share-links/xxx）。
+   *
+   * 鉴权：类级 `@UseGuards(JwtGuard)` 已覆盖本路由。
+   * 限流：setup.ts 里 `app.use('/api/v1/note', noteWriteLimiter)` 是 Express
+   * 前缀挂载且不筛方法，本路由已被它覆盖（60 次/15 分钟/IP），无需再叠一层。
+   */
+  @Delete('share-links/:id')
+  @ApiOperation({ summary: 'Revoke a note share link' })
+  @ApiOkResponse({ type: NoteShareLinkRevokedDto })
+  revokeShareLink(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteShareLinkRevokedDto> {
+    return this.noteService.revokeShareLink(req.user.userId, id);
   }
 
   @Get('group')

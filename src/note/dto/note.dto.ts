@@ -353,6 +353,18 @@ export class NoteShareLinkDto {
   @ApiProperty() createdAt: Date;
 }
 
+/**
+ * 吊销结果。刻意不回显 token / url —— 这条链接已经作废，没有必要再把它的
+ * 地址传出去一次。
+ *
+ * `revokedAt` 恒为非空：吊销成功就一定有真实时间戳。重复吊销时返回的是
+ * **首次** 吊销时间（吊销时刻是审计事实，不能被重试刷新）。
+ */
+export class NoteShareLinkRevokedDto {
+  @ApiProperty() id: string;
+  @ApiProperty() revokedAt: Date;
+}
+
 export class CreateNoteGroupDto {
   @ApiProperty()
   @IsString()

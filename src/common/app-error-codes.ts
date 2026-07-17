@@ -180,6 +180,9 @@ export const NoteErrorCode = {
   // 访客侧解析分享链接失败。不存在 / 已吊销 / 已过期共用同一个码，
   // 避免访客据此区分「链接从未存在」和「链接曾存在但被吊销」。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
+  // 主人侧吊销分享链接失败。id 不存在 与 id 属于别人共用同一个码（且同为 404），
+  // 避免调用方拿 404/403 的差异当「这条链接存在吗」的探针。
+  ShareLinkNotFound: 'NOTE_SHARE_LINK_NOT_FOUND',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。
