@@ -56,7 +56,7 @@
 | `business_events_total{event,result}`           | 业务事件：登录 / 注册 / 好友操作…（按事件名 + 成功/失败） |
 | `process_*` / `nodejs_*`                        | 后端进程 CPU / 内存 / 事件循环 / GC                       |
 
-> 路由做了归一化（UUID/数字 → `:id`）防止基数爆炸。`/metrics` 无鉴权，生产环境**必须内网隔离/防火墙**。
+> 路由做了归一化（UUID/数字 → `:id`）防止基数爆炸。`/metrics` 默认无鉴权；设置 `METRICS_AUTH_TOKEN` 后要求 `Authorization: Bearer <token>`（`.env.production.example` 已内置该项）。鉴权只是第二层，生产环境**仍必须内网隔离/防火墙**。详见 [metrics.md](./metrics.md)。
 
 ### 4. node-exporter —— 机器压力
 

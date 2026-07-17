@@ -70,8 +70,11 @@ services:
     container_name: circle-grafana
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      # Deliberately no default: `:?` makes compose refuse to start rather than
+      # boot Grafana on a guessable password. Set it in monitoring/.env
+      # (copy monitoring/.env.example) — that file is gitignored.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in monitoring/.env — see monitoring/README.md}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
