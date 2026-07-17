@@ -193,8 +193,19 @@ export class CircleDto {
   createdAt: string;
 }
 
+export type CircleRole = 'OWNER' | 'ADMIN' | 'MEMBER';
+
+/**
+ * GET /circle/my 的返回项。比 CircleDto 多带一个 myRole —— 调用方（「我的圈子」面板）
+ * 要靠它区分「我管理的」圈子。角色本来就在 circleMember 行上，顺手返回即可；不返回的话
+ * 客户端只能对每个圈子再打一次 GET /circle/:id 把它捞回来（N+1）。
+ */
+export class MyCircleDto extends CircleDto {
+  myRole: CircleRole | null;
+}
+
 export class CircleDetailDto extends CircleDto {
-  myRole: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
+  myRole: CircleRole | null;
   myStatus: 'ACTIVE' | 'PENDING' | 'REJECTED' | null;
   availableIconAssets?: Array<{
     id: string;
