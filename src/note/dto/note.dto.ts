@@ -353,6 +353,27 @@ export class NoteShareLinkDto {
   @ApiProperty() createdAt: Date;
 }
 
+/**
+ * `GET /note/share-links` 的分页参数，默认值与上限对齐 ListNotesQueryDto。
+ *
+ * 分页是必需的而不是锦上添花：吊销只能靠本接口拿 `id`，不分页的话链接数超过一屏
+ * 之后，较老但仍然有效的链接就再也看不到、也就吊销不了。
+ */
+export class ListNoteShareLinksQueryDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  page?: number;
+
+  @ApiPropertyOptional({ default: 50 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
 export class CreateNoteGroupDto {
   @ApiProperty()
   @IsString()
