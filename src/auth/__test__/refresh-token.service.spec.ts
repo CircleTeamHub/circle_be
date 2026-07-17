@@ -69,6 +69,18 @@ describe('RefreshTokenService', () => {
         matching.forEach((record) => Object.assign(record, data));
         return { count: matching.length };
       }),
+      updateManyAndReturn: jest.fn(async ({ where, data }) => {
+        const matching = records.filter((record) => {
+          if (where.userId && record.userId !== where.userId) return false;
+          if (where.id?.not && record.id === where.id.not) return false;
+          if (where.revokedAt === null && record.revokedAt !== null) {
+            return false;
+          }
+          return true;
+        });
+        matching.forEach((record) => Object.assign(record, data));
+        return matching.map(({ id }) => ({ id }));
+      }),
     },
   };
 
@@ -207,6 +219,8 @@ describe('RefreshTokenService', () => {
     expect(records[1].revokedAt).toBeNull();
     // F-02: also kills the matching session's access token.
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-2');
   });
 
   it('revokes all active sessions except the current session', async () => {
@@ -236,6 +250,9 @@ describe('RefreshTokenService', () => {
 
     expect(records[0].revokedAt).toBeNull();
     expect(records[1].revokedAt).toBeInstanceOf(Date);
+    expect(prisma.refreshToken.updateManyAndReturn).toHaveBeenCalled();
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).toHaveBeenCalledWith('other');
   });
 
   it('does not revoke sessions when the current session id is missing', async () => {

@@ -1,7 +1,67 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { RedisService } from 'src/redis/redis.service';
 
-type RevocablePayload = { sub?: unknown; sid?: unknown; iat?: unknown };
+const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
+const DURATION_UNITS_IN_MS: Record<string, number> = {
+  ms: 1,
+  s: 1000,
+  m: 60 * 1000,
+  h: 60 * 60 * 1000,
+  d: 24 * 60 * 60 * 1000,
+  w: 7 * 24 * 60 * 60 * 1000,
+  y: 365.25 * 24 * 60 * 60 * 1000,
+};
+
+function accessTokenTtlSeconds(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return Math.ceil(raw);
+  }
+  if (typeof raw !== 'string') return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
+
+  const normalized = raw.trim().toLowerCase().split(' ').join('');
+  let unit = 'ms';
+  let amountText = normalized;
+  if (normalized.endsWith('ms')) {
+    amountText = normalized.slice(0, -2);
+  } else {
+    const candidateUnit = normalized.charAt(normalized.length - 1);
+    if (candidateUnit && candidateUnit in DURATION_UNITS_IN_MS) {
+      unit = candidateUnit;
+      amountText = normalized.slice(0, -1);
+    }
+  }
+  let dots = 0;
+  const validAmount =
+    amountText.length > 0 &&
+    [...amountText].every((character) => {
+      if (character === '.') {
+        dots += 1;
+        return dots === 1;
+      }
+      return character >= '0' && character <= '9';
+    });
+  const amount = validAmount ? Number(amountText) : Number.NaN;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
+  }
+
+  const milliseconds = amount * DURATION_UNITS_IN_MS[unit];
+  return Math.max(1, Math.ceil(milliseconds / 1000));
+}
+
+type RevocablePayload = {
+  sub?: unknown;
+  sid?: unknown;
+  iat?: unknown;
+  issuedAtMs?: unknown;
+};
+
+function getIssuedAtMs(payload: RevocablePayload): number | null {
+  if (typeof payload.issuedAtMs === 'number') return payload.issuedAtMs;
+  if (typeof payload.iat === 'number') return payload.iat * 1000;
+  return null;
+}
 
 /**
  * Server-side revocation for stateless access tokens (F-02).
@@ -22,14 +82,16 @@ type RevocablePayload = { sub?: unknown; sid?: unknown; iat?: unknown };
  */
 @Injectable()
 export class SessionRevocationService {
-  /**
-   * Markers must outlive any valid access token. 24h is a safe upper bound over
-   * any sane `JWT_EXPIRES_IN`, so a marker never expires while a token it should
-   * still be blocking is alive.
-   */
-  private static readonly MARKER_TTL_SECONDS = 24 * 60 * 60;
+  private readonly markerTtlSeconds: number;
 
-  constructor(private readonly redis: RedisService) {}
+  constructor(
+    private readonly redis: RedisService,
+    config: ConfigService,
+  ) {
+    this.markerTtlSeconds = accessTokenTtlSeconds(
+      config.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
+    );
+  }
 
   private userKey(userId: string): string {
     return `authrev:u:${userId}`;
@@ -42,11 +104,10 @@ export class SessionRevocationService {
   /** Revoke every access token issued to this user before now. No-op without Redis. */
   async revokeUser(userId: string): Promise<void> {
     if (!this.redis.isEnabled()) return;
-    const nowSeconds = Math.floor(Date.now() / 1000);
     await this.redis.setJson(
       this.userKey(userId),
-      nowSeconds,
-      SessionRevocationService.MARKER_TTL_SECONDS,
+      Date.now(),
+      this.markerTtlSeconds,
     );
   }
 
@@ -56,7 +117,7 @@ export class SessionRevocationService {
     await this.redis.setJson(
       this.sessionKey(sessionId),
       1,
-      SessionRevocationService.MARKER_TTL_SECONDS,
+      this.markerTtlSeconds,
     );
   }
 
@@ -75,12 +136,15 @@ export class SessionRevocationService {
     }
 
     const sub = typeof payload.sub === 'string' ? payload.sub : null;
-    const iat = typeof payload.iat === 'number' ? payload.iat : null;
-    if (sub && iat !== null) {
+    const issuedAtMs = getIssuedAtMs(payload);
+    if (sub && issuedAtMs !== null) {
       const revokedAfter = await this.redis.getJson<number>(this.userKey(sub));
-      // Strict `<`: a token minted at/after the revoke instant (i.e. a fresh
-      // re-login) survives; only tokens issued before it are killed.
-      if (typeof revokedAfter === 'number' && iat < revokedAfter) return true;
+      if (typeof revokedAfter === 'number') {
+        // Markers written before millisecond precision used epoch seconds.
+        const revokedAtMs =
+          revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
+        if (issuedAtMs <= revokedAtMs) return true;
+      }
     }
 
     return false;

@@ -1044,6 +1044,7 @@ export class AuthService {
       role,
       sid: sessionId,
       aud: audience,
+      issuedAtMs: Date.now(),
     });
   }
 }

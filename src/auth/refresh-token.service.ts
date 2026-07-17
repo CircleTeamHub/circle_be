@@ -215,11 +215,13 @@ export class RefreshTokenService {
   }
 
   async revokeSession(userId: string, sessionId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
+    const result = await this.prisma.refreshToken.updateMany({
       where: { id: sessionId, userId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    await this.revocation.revokeSession(sessionId);
+    if (result.count === 1) {
+      await this.revocation.revokeSession(sessionId);
+    }
   }
 
   async revokeOtherSessions(
@@ -230,18 +232,17 @@ export class RefreshTokenService {
       return;
     }
 
-    await this.prisma.refreshToken.updateMany({
+    const revokedSessions = await this.prisma.refreshToken.updateManyAndReturn({
       where: {
         userId,
         revokedAt: null,
         id: { not: currentSessionId },
       },
       data: { revokedAt: new Date() },
+      select: { id: true },
     });
-    // Accepted residual (F-02): single-device-login revokes the OTHER devices'
-    // refresh tokens (they can't continue past the access-token TTL), but not
-    // their in-flight access tokens — revoking the user here would also kill the
-    // current session's still-valid token. The security-critical paths
-    // (logout / ban / password change) are immediate via revoke*/revokeUser.
+    await Promise.all(
+      revokedSessions.map(({ id }) => this.revocation.revokeSession(id)),
+    );
   }
 }
