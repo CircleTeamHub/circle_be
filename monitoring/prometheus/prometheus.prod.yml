@@ -1,0 +1,93 @@
+# Prometheus config for scraping the PRODUCTION backend.
+#
+# Used only via the prod overlay, which mounts this file over
+# /etc/prometheus/prometheus.yml and joins Prometheus to the circle-be network:
+#
+#   docker compose -f monitoring/docker-compose.yml \
+#                  -f monitoring/docker-compose.prod.yml up -d
+#
+# Plain `-f monitoring/docker-compose.yml` keeps using prometheus.yml (dev:
+# backend on the host at host.docker.internal:3000, no auth). See README.md
+# "Scraping production".
+#
+# Only the circle-be job differs from prometheus.yml; the other jobs and the
+# alert rules are identical, so keep them in sync when editing either file.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: circle-be
+    metrics_path: /metrics
+    # ── Reaching the backend ──────────────────────────────────────────────
+    # Production never publishes port 3000 (docker-compose.prod.yml only does
+    # `expose: 3000`), so host.docker.internal cannot work — the prod overlay
+    # puts Prometheus on the circle-be compose network and we address the
+    # backend by container name, exactly like Caddy does.
+    #
+    # ── Why DNS discovery and not a static target ────────────────────────
+    # Deployment is blue-green (deploy/release-deploy.sh): the live container
+    # alternates between circle-be-blue and circle-be-green, and the retired
+    # colour is `compose rm`'d — so in steady state exactly ONE of the two
+    # names exists. A static target pinned to one colour is DOWN after every
+    # other release; listing both as static targets leaves one target
+    # permanently red, which trains operators to ignore red.
+    #
+    # Resolving both names through Docker's embedded DNS yields a target only
+    # for the colour(s) that actually exist: one in steady state, two briefly
+    # mid-release (which is what you want — the new colour's metrics are
+    # visible before Caddy switches traffic to it, and the old colour keeps
+    # reporting until it is removed). A name with no container returns NXDOMAIN
+    # and contributes no target, silently and with no lookup failure.
+    #
+    # Trade-off: when NO colour is running, discovery returns nothing and the
+    # `up` series disappears rather than going to 0 — so `up == 0` cannot catch
+    # a fully-down backend. That gap is covered by the CircleBeNoTarget
+    # (absent()) alert in alerts.yml. Do not remove it.
+    dns_sd_configs:
+      - names: ['circle-be-blue', 'circle-be-green']
+        type: A
+        port: 3000
+        refresh_interval: 15s
+    # ── Authentication ────────────────────────────────────────────────────
+    # deploy/gen-env.sh always writes a random METRICS_AUTH_TOKEN into
+    # .env.production, so a correctly bootstrapped production backend ALWAYS
+    # requires this header — scraping it without one is a guaranteed 401 and a
+    # silently empty dashboard. The file is written by monitoring/sync-metrics-token.sh
+    # and is gitignored; Prometheus trims trailing whitespace/newline from it.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
+    relabel_configs:
+      # Without this, `instance` is the container IP, which changes on every
+      # release and fragments every per-instance series. __meta_dns_name is the
+      # name we asked for, i.e. a stable circle-be-blue / circle-be-green.
+      - source_labels: [__meta_dns_name]
+        target_label: instance
+      # Lets you tell the colours apart mid-release (and keeps the two targets'
+      # series distinct, so they never collide on a duplicate instance label).
+      - source_labels: [__meta_dns_name]
+        regex: 'circle-be-(blue|green)'
+        target_label: color
+        replacement: '${1}'
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]

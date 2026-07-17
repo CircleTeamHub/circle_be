@@ -1,0 +1,3 @@
+# Real METRICS_AUTH_TOKEN for the production scrape job — never commit.
+# Generated from .env.production by monitoring/sync-metrics-token.sh.
+metrics_token
