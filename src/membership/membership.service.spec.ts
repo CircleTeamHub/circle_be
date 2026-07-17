@@ -11,7 +11,8 @@ describe('MembershipService', () => {
   const tx = {
     user: {
       findUnique: jest.fn(),
-      update: jest.fn(),
+      updateMany: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
     },
     wallet: {
       upsert: jest.fn(),
@@ -88,7 +89,8 @@ describe('MembershipService', () => {
       balance: 900,
       updatedAt: new Date('2026-04-22T12:01:00.000Z'),
     });
-    tx.user.update.mockResolvedValue({
+    tx.user.updateMany.mockResolvedValue({ count: 1 });
+    tx.user.findUniqueOrThrow.mockResolvedValue({
       id: 'user-1',
       vipLevel: 3,
       creditScore: 100,
@@ -110,11 +112,17 @@ describe('MembershipService', () => {
       where: { userID: 'user-1', balance: { gte: 2100 } },
       data: { balance: { decrement: 2100 } },
     });
-    expect(tx.user.update).toHaveBeenCalledWith({
-      where: { id: 'user-1' },
+    // The level is claimed with a conditional write, not a blind one, so a
+    // concurrent upgrade to the same level cannot also win.
+    expect(tx.user.updateMany).toHaveBeenCalledWith({
+      where: { id: 'user-1', vipLevel: { lt: 3 } },
       data: { vipLevel: 3 },
-      select: { id: true, vipLevel: true, creditScore: true },
     });
+    // The claim must precede the debit: a loser that has already moved money
+    // would leave the user charged for a level it never got.
+    expect(tx.user.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.wallet.updateMany.mock.invocationCallOrder[0],
+    );
     expect(tx.coinTransaction.create).toHaveBeenCalledWith({
       data: {
         userID: 'user-1',
@@ -169,5 +177,181 @@ describe('MembershipService', () => {
       BadRequestException,
     );
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+// Two concurrent upgrades to the same level must charge the user once, not
+// twice. The `level <= currentUser.vipLevel` guard only makes *sequential*
+// replay safe: it reads a snapshot, so two overlapping transactions can both
+// read the old level, both pass the guard, and both debit the wallet.
+//
+// Reproduced against a real Postgres 16 before this test was written: two
+// concurrent `upgrade(user, 1)` calls both succeeded and took 1560 points for
+// a single 780-point VIP1 upgrade.
+describe('MembershipService concurrent upgrade', () => {
+  const VIP1_PRICE = 780;
+
+  // Releases only once `parties` callers have arrived, which pins the
+  // interleaving that Postgres would otherwise produce non-deterministically.
+  function createBarrier(parties: number): () => Promise<void> {
+    let arrived = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    return async () => {
+      arrived += 1;
+      if (arrived >= parties) {
+        release();
+      }
+      await gate;
+    };
+  }
+
+  /**
+   * In-memory stand-in for Postgres under its default ReadCommitted isolation:
+   *
+   *  - `findUnique` returns the latest committed row (a snapshot; it does not
+   *    lock, so a concurrent writer can invalidate it).
+   *  - `updateMany` re-evaluates its `where` filter atomically against the
+   *    latest committed row version. That is why a conditional write is a valid
+   *    concurrency guard while a prior `findUnique` is not.
+   *
+   * Modelling only these two rules is enough to tell a correct implementation
+   * from a racy one, and it holds the service to the weakest isolation level it
+   * could run under rather than assuming a stronger one saves it.
+   */
+  function createFakeDb(initial: { vipLevel: number; balance: number }) {
+    const state = { ...initial };
+    const ledger: Array<Record<string, unknown>> = [];
+    const onRead = createBarrier(2);
+
+    const tx = {
+      user: {
+        findUnique: async ({ where }: any) => {
+          const snapshot = { id: where.id, vipLevel: state.vipLevel };
+          // Both callers read before either writes — the real overlap.
+          await onRead();
+          return snapshot;
+        },
+        findUniqueOrThrow: async ({ where }: any) => ({
+          id: where.id,
+          vipLevel: state.vipLevel,
+          creditScore: 100,
+        }),
+        updateMany: async ({ where, data }: any) => {
+          const floor = where.vipLevel?.lt;
+          if (floor !== undefined && state.vipLevel >= floor) {
+            return { count: 0 };
+          }
+          state.vipLevel = data.vipLevel;
+          return { count: 1 };
+        },
+      },
+      wallet: {
+        upsert: async () => ({ userID: 'user-1', balance: state.balance }),
+        updateMany: async ({ where, data }: any) => {
+          const minimum = where.balance?.gte;
+          if (minimum !== undefined && state.balance < minimum) {
+            return { count: 0 };
+          }
+          state.balance -= data.balance.decrement;
+          return { count: 1 };
+        },
+        findUniqueOrThrow: async () => ({
+          id: 'wallet-1',
+          userID: 'user-1',
+          balance: state.balance,
+        }),
+      },
+      coinTransaction: {
+        create: async ({ data }: any) => {
+          ledger.push(data);
+          return { id: `tx-${ledger.length}` };
+        },
+      },
+    };
+
+    return {
+      state,
+      ledger,
+      prisma: {
+        $transaction: async (
+          callback: (client: typeof tx) => Promise<unknown>,
+        ) => callback(tx),
+      },
+    };
+  }
+
+  const realtimeService = {
+    broadcastMembershipStatus: jest.fn(),
+    broadcastWalletBalanceChanged: jest.fn(),
+    broadcastSystemNotificationCreated: jest.fn(),
+    broadcastNotificationCreated: jest.fn(),
+    broadcastSystemNotificationUnread: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
+    invalidateUserHotCache: jest.fn(() => Promise.resolve()),
+    safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
+      Promise.allSettled(fns.map((fn) => fn())),
+    ),
+  };
+  const notificationService = { createSystemNotification: jest.fn() };
+
+  async function buildService(prisma: unknown): Promise<MembershipService> {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        MembershipService,
+        { provide: PrismaService, useValue: prisma },
+        { provide: RealtimeService, useValue: realtimeService },
+        { provide: NotificationService, useValue: notificationService },
+      ],
+    }).compile();
+
+    return module.get<MembershipService>(MembershipService);
+  }
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('charges once when two upgrades to the same level overlap', async () => {
+    // Balance deliberately covers TWO upgrades, so nothing but the service's
+    // own concurrency guard can stop the second debit.
+    const db = createFakeDb({ vipLevel: 0, balance: VIP1_PRICE * 2 });
+    const service = await buildService(db.prisma);
+
+    const results = await Promise.allSettled([
+      service.upgrade('user-1', 1),
+      service.upgrade('user-1', 1),
+    ]);
+
+    const succeeded = results.filter((r) => r.status === 'fulfilled');
+    const failed = results.filter((r) => r.status === 'rejected');
+
+    expect(succeeded).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    expect((failed[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+      BadRequestException,
+    );
+    // The money assertion: one level bought means one price paid.
+    expect(db.state.balance).toBe(VIP1_PRICE);
+    expect(db.state.vipLevel).toBe(1);
+  });
+
+  it('writes a single PURCHASE ledger row when two upgrades overlap', async () => {
+    const db = createFakeDb({ vipLevel: 0, balance: VIP1_PRICE * 2 });
+    const service = await buildService(db.prisma);
+
+    await Promise.allSettled([
+      service.upgrade('user-1', 1),
+      service.upgrade('user-1', 1),
+    ]);
+
+    // A second row here would mean the loser of the race still debited the
+    // wallet, leaving the user billed twice for one level.
+    expect(db.ledger).toHaveLength(1);
+    expect(db.ledger[0]).toMatchObject({
+      type: 'PURCHASE',
+      amount: -VIP1_PRICE,
+    });
   });
 });

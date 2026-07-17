@@ -7,6 +7,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   MembershipPlanDto,
   UpgradeMembershipResponseDto,
@@ -44,7 +45,7 @@ export class MembershipService {
       });
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
+    const result = await runSerializableTransaction(this.prisma, async (tx) => {
       const currentUser = await tx.user.findUnique({
         where: { id: userId },
         select: { id: true, vipLevel: true },
@@ -55,6 +56,10 @@ export class MembershipService {
           errorCode: MembershipErrorCode.UserNotFound,
         });
       }
+      // Fast-fail on an obviously redundant upgrade. This read is only a
+      // snapshot, so it cannot be the concurrency guard — the compare-and-swap
+      // below is. Keeping it preserves the precise 404-vs-400 distinction that
+      // the swap alone (count === 0 either way) could not express.
       if (level <= currentUser.vipLevel) {
         throw new BadRequestException({
           message: 'Target VIP level must be higher than current level',
@@ -67,6 +72,22 @@ export class MembershipService {
         update: {},
         create: { userID: userId },
       });
+
+      // Claim the level BEFORE moving any money. `updateMany` re-evaluates
+      // `vipLevel < level` against the latest committed row, so exactly one of
+      // N concurrent upgrades to the same level can match. The loser bails out
+      // here, having debited nothing; without this, two requests that both read
+      // the pre-upgrade level would both fall through and charge the wallet.
+      const claim = await tx.user.updateMany({
+        where: { id: userId, vipLevel: { lt: level } },
+        data: { vipLevel: level },
+      });
+      if (claim.count !== 1) {
+        throw new BadRequestException({
+          message: 'Target VIP level must be higher than current level',
+          errorCode: MembershipErrorCode.LevelNotHigher,
+        });
+      }
 
       const debitResult = await tx.wallet.updateMany({
         where: { userID: userId, balance: { gte: plan.price } },
@@ -82,9 +103,8 @@ export class MembershipService {
       const wallet = await tx.wallet.findUniqueOrThrow({
         where: { userID: userId },
       });
-      const user = await tx.user.update({
+      const user = await tx.user.findUniqueOrThrow({
         where: { id: userId },
-        data: { vipLevel: level },
         select: { id: true, vipLevel: true, creditScore: true },
       });
 
