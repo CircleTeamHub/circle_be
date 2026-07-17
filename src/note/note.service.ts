@@ -1331,7 +1331,11 @@ export class NoteService {
       }
     }
 
-    const title = dto.title.trim().slice(0, 120) || '我的笔记';
+    // 不再有 `|| '我的笔记'` 兜底：CreateNoteShareLinkDto 现在会 trim 并拒掉空白
+    // 标题，空串到不了这里（docs 第 5 节）。硬编码中文兜底既绕不开 i18n
+    // （它是内容不是报错，服务端也不知道调用方 locale），又会把「客户端传了个
+    // 空标题」这个 bug 悄悄盖掉。trim/slice 保留为纵深防御。
+    const title = dto.title.trim().slice(0, 120);
     const search = dto.search?.trim() || null;
     const expiresAt =
       dto.expiresInDays != null
