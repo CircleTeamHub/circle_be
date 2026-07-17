@@ -784,37 +784,43 @@ export class CirclePlazaService {
     userId: string,
     postId: string,
   ): Promise<{ signed: boolean; signupCount: number }> {
-    const existing = await this.prisma.circlePostSignup.findUnique({
-      where: { postID_userID: { postID: postId, userID: userId } },
-      select: { id: true },
-    });
-    if (!existing) {
-      const current = await this.prisma.circlePost.findUnique({
-        where: { id: postId },
-        select: { signupCount: true },
+    const result = await this.prisma.$transaction(async (tx) => {
+      // 原子认领：并发取消只有一次 deleteMany 命中，才递减 signupCount。
+      // 落败方 count=0 → 不递减、不广播，与 signupForPost 的 P2002 分支对称，
+      // 读后删则会让第二次 delete 抛 P2025(500) 并把计数多扣一次。
+      const claimed = await tx.circlePostSignup.deleteMany({
+        where: { postID: postId, userID: userId },
       });
-      return { signed: false, signupCount: current?.signupCount ?? 0 };
-    }
+      if (claimed.count !== 1) {
+        const current = await tx.circlePost.findUnique({
+          where: { id: postId },
+          select: { signupCount: true },
+        });
+        return { cancelled: false, signupCount: current?.signupCount ?? 0 };
+      }
 
-    const updated = await this.prisma.$transaction(async (tx) => {
-      await tx.circlePostSignup.delete({
-        where: { postID_userID: { postID: postId, userID: userId } },
-      });
-      return tx.circlePost.update({
+      const post = await tx.circlePost.update({
         where: { id: postId },
         data: { signupCount: { decrement: 1 } },
         select: { signupCount: true, authorID: true },
       });
+      return {
+        cancelled: true,
+        signupCount: post.signupCount,
+        authorID: post.authorID,
+      };
     });
 
     // Cancelling can drop an unseen signup, so refresh the author's badge.
-    try {
-      await this.realtime.broadcastSignupUnread(updated.authorID);
-    } catch {
-      // swallow: write is authoritative
+    if (result.cancelled) {
+      try {
+        await this.realtime.broadcastSignupUnread(result.authorID);
+      } catch {
+        // swallow: write is authoritative
+      }
     }
 
-    return { signed: false, signupCount: Math.max(0, updated.signupCount) };
+    return { signed: false, signupCount: Math.max(0, result.signupCount) };
   }
 
   async getPostSignups(

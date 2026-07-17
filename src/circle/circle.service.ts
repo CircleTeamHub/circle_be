@@ -25,6 +25,10 @@ import {
 } from './dto/circle.dto';
 
 const MAX_JOIN_TX_ATTEMPTS = 3;
+// The SYSTEM icon catalogue grows with every icon ever shipped and is read
+// whole by its endpoint, so cap it instead of letting table size decide the
+// response size.
+const MAX_AVAILABLE_ICON_ASSETS = 100;
 
 @Injectable()
 export class CircleService {
@@ -243,6 +247,7 @@ export class CircleService {
         imageUrl: true,
       },
       orderBy: [{ sourceType: 'asc' }, { createdAt: 'desc' }],
+      take: MAX_AVAILABLE_ICON_ASSETS,
     });
 
     return {
@@ -459,6 +464,9 @@ export class CircleService {
     dto: UploadCircleIconDto,
   ) {
     await this.assertOwner(userId, circleId);
+    // The icon is equippable as a badge and rendered to every plaza viewer, so
+    // it is at least as exposed as the avatar and gets the same origin guard.
+    this.assertAvatarUrlIsSafe(dto.imageUrl);
 
     return this.prisma.$transaction(async (tx) => {
       const created = await tx.iconAsset.create({

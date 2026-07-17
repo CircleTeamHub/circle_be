@@ -7,8 +7,14 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
-import { GroupErrorCode } from 'src/common/app-error-codes';
+import {
+  CircleMemberRole,
+  CircleMemberStatus,
+  Prisma,
+} from 'src/generated/prisma';
+import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
+import { reserveCircleSeats } from 'src/circle/circle-capacity';
+import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -62,6 +68,8 @@ export class GroupService {
       return { handled: true };
     }
 
+    // Pre-check only decides whether to run the privacy gate and open a
+    // transaction; the authoritative read happens under the pair locks below.
     const existingMemberships = await this.prisma.circleMember.findMany({
       where: {
         circleID: circle.id,
@@ -75,49 +83,99 @@ export class GroupService {
         membership.status,
       ]),
     );
-    const activatingUserIDs = targetUserIDs.filter(
+    const invitableUserIDs = targetUserIDs.filter(
       (userID) => existingByUserID.get(userID) !== CircleMemberStatus.ACTIVE,
     );
 
-    if (activatingUserIDs.length === 0) {
+    if (invitableUserIDs.length === 0) {
       return { handled: true };
     }
 
-    await this.assertInviteTargetsAllowInvites(actorId, activatingUserIDs);
+    await this.assertInviteTargetsAllowInvites(actorId, invitableUserIDs);
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
     await this.prisma.$transaction(async (tx) => {
-      for (const userID of activatingUserIDs) {
-        if (existingByUserID.has(userID)) {
-          await tx.circleMember.update({
-            where: {
-              userID_circleID: {
-                userID,
-                circleID: circle.id,
-              },
-            },
-            data: {
-              role: CircleMemberRole.MEMBER,
-              status: CircleMemberStatus.ACTIVE,
-            },
-          });
-          continue;
-        }
+      await this.lockCircleApplicationPairs(tx, circle.id, invitableUserIDs);
 
-        await tx.circleMember.create({
-          data: {
-            userID,
+      // Re-read under the locks: the pre-check snapshot can be stale (a
+      // concurrent join may have activated a target, or filled the last seat).
+      const lockedMemberships = await tx.circleMember.findMany({
+        where: {
+          circleID: circle.id,
+          userID: { in: invitableUserIDs },
+        },
+        select: { userID: true, status: true },
+      });
+      const lockedByUserID = new Map(
+        lockedMemberships.map((membership) => [
+          membership.userID,
+          membership.status,
+        ]),
+      );
+      const activatingUserIDs = invitableUserIDs.filter(
+        (userID) => lockedByUserID.get(userID) !== CircleMemberStatus.ACTIVE,
+      );
+      if (activatingUserIDs.length === 0) {
+        return;
+      }
+
+      const rejoiningUserIDs = activatingUserIDs.filter((userID) =>
+        lockedByUserID.has(userID),
+      );
+      const newUserIDs = activatingUserIDs.filter(
+        (userID) => !lockedByUserID.has(userID),
+      );
+
+      // memberCount is derived from what the writes actually changed, never
+      // from the pre-check snapshot, so a row that raced to ACTIVE cannot be
+      // counted twice.
+      let seatsTaken = 0;
+      if (rejoiningUserIDs.length > 0) {
+        const reactivated = await tx.circleMember.updateMany({
+          where: {
             circleID: circle.id,
+            userID: { in: rejoiningUserIDs },
+            status: { not: CircleMemberStatus.ACTIVE },
+          },
+          data: {
             role: CircleMemberRole.MEMBER,
             status: CircleMemberStatus.ACTIVE,
           },
         });
+        seatsTaken += reactivated.count;
+      }
+      if (newUserIDs.length > 0) {
+        const created = await tx.circleMember.createMany({
+          data: newUserIDs.map((userID) => ({
+            userID,
+            circleID: circle.id,
+            role: CircleMemberRole.MEMBER,
+            status: CircleMemberStatus.ACTIVE,
+          })),
+          skipDuplicates: true,
+        });
+        seatsTaken += created.count;
       }
 
-      await tx.circle.update({
-        where: { id: circle.id },
-        data: { memberCount: { increment: activatingUserIDs.length } },
-      });
+      if (seatsTaken > 0) {
+        const reserved = await reserveCircleSeats(tx, circle.id, seatsTaken);
+        if (!reserved) {
+          const circleStillExists = await tx.circle.findUnique({
+            where: { id: circle.id },
+            select: { id: true },
+          });
+          if (!circleStillExists) {
+            throw new NotFoundException({
+              message: 'Circle not found',
+              errorCode: GroupErrorCode.NotFound,
+            });
+          }
+          throw new BadRequestException({
+            message: 'Circle has reached its member limit',
+            errorCode: CircleErrorCode.MemberLimit,
+          });
+        }
+      }
 
       await tx.groupSyncOutbox.createMany({
         data: activatingUserIDs.map((userID) => ({
@@ -130,6 +188,29 @@ export class GroupService {
     });
 
     return { handled: true };
+  }
+
+  /**
+   * Takes the (circle, user) advisory lock every other membership path takes,
+   * for a whole batch in one round-trip. Keys are sorted so two concurrent
+   * batches always acquire in the same order and cannot deadlock each other.
+   */
+  private async lockCircleApplicationPairs(
+    tx: Prisma.TransactionClient,
+    circleID: string,
+    userIDs: string[],
+  ): Promise<void> {
+    const pairKeys = userIDs
+      .map((userID) => circleApplicationLockKey(circleID, userID))
+      // Any stable total order prevents the deadlock; code-unit order is the
+      // right one here. localeCompare would vary with the runtime's locale,
+      // which is exactly the inconsistency this sort exists to rule out.
+      // eslint-disable-next-line sonarjs/no-alphabetical-sort
+      .sort();
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(hashtext(pairs.pair_key))
+      FROM unnest(ARRAY[${Prisma.join(pairKeys)}]::text[]) AS pairs(pair_key)
+    `;
   }
 
   async removeGroupMember(

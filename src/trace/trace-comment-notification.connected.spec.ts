@@ -27,10 +27,11 @@ describe('trace comment mention notification flow', () => {
       findUnique: jest.fn(),
     },
     notification: {
-      create: jest.fn(),
+      createManyAndReturn: jest.fn(),
+      findMany: jest.fn(),
     },
     notificationPushOutbox: {
-      create: jest.fn(),
+      createMany: jest.fn(),
     },
     $transaction: jest.fn(async (input: any) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
@@ -57,8 +58,9 @@ describe('trace comment mention notification flow', () => {
     prisma.friend.findMany.mockReset();
     prisma.userPrivacySetting.findMany.mockReset();
     prisma.userPrivacySetting.findUnique.mockReset();
-    prisma.notification.create.mockReset();
-    prisma.notificationPushOutbox.create.mockReset();
+    prisma.notification.createManyAndReturn.mockReset();
+    prisma.notification.findMany.mockReset();
+    prisma.notificationPushOutbox.createMany.mockReset();
     prisma.$transaction
       .mockReset()
       .mockImplementation(async (input: any) =>
@@ -113,21 +115,35 @@ describe('trace comment mention notification flow', () => {
     prisma.trace.update.mockResolvedValue({});
     prisma.friend.findMany.mockResolvedValue([]);
     prisma.userPrivacySetting.findMany.mockResolvedValue([]);
-    prisma.notification.create.mockImplementation(({ data }: any) =>
-      Promise.resolve({
-        id: `notification-${data.toUserID}`,
-        ...data,
-        content: data.content ?? '',
-        read: false,
-        createdAt: new Date('2026-07-10T00:00:01Z'),
-        fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-        fromTrace: { id: 'trace-1', content: 'trace body', images: [] },
-        fromReply: { id: 'comment-1', content: 'hello' },
-        fromCircle: null,
-        fromCirclePost: null,
-        fromInvitation: null,
-      }),
+    // Notifications are written with one createManyAndReturn and hydrated by a
+    // follow-up findMany, so the mock keeps the inserted rows to serve back.
+    let insertedRows: any[] = [];
+    prisma.notification.createManyAndReturn.mockImplementation(
+      ({ data }: any) => {
+        insertedRows = data.map((row: any) => ({
+          id: `notification-${row.toUserID}`,
+          ...row,
+          content: row.content ?? '',
+          read: false,
+          createdAt: new Date('2026-07-10T00:00:01Z'),
+          fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
+          fromTrace: { id: 'trace-1', content: 'trace body', images: [] },
+          fromReply: { id: 'comment-1', content: 'hello' },
+          fromCircle: null,
+          fromCirclePost: null,
+          fromInvitation: null,
+        }));
+        return Promise.resolve(insertedRows.map(({ id }) => ({ id })));
+      },
     );
+    // Reversed on purpose: findMany gives no order guarantee, so the service
+    // must restore insertion order itself.
+    prisma.notification.findMany.mockImplementation(({ where }: any) => {
+      const ids = new Set(where.id.in);
+      return Promise.resolve(
+        insertedRows.filter((row) => ids.has(row.id)).reverse(),
+      );
+    });
   });
 
   it('delivers one eligible mention while reply overlap keeps higher precedence', async () => {
@@ -142,8 +158,11 @@ describe('trace comment mention notification flow', () => {
       mentionedUserIds: ['reply-user-1', 'mention-user-1'],
     });
 
+    // One batched insert carrying both rows in precedence order, not one
+    // round-trip per recipient.
+    expect(prisma.notification.createManyAndReturn).toHaveBeenCalledTimes(1);
     expect(
-      prisma.notification.create.mock.calls.map(([arg]) => arg.data),
+      prisma.notification.createManyAndReturn.mock.calls[0][0].data,
     ).toEqual([
       expect.objectContaining({
         toUserID: 'reply-user-1',
@@ -156,7 +175,13 @@ describe('trace comment mention notification flow', () => {
         fromReplyID: 'comment-1',
       }),
     ]);
-    expect(prisma.notificationPushOutbox.create).toHaveBeenCalledTimes(2);
+    expect(prisma.notificationPushOutbox.createMany).toHaveBeenCalledTimes(1);
+    expect(
+      prisma.notificationPushOutbox.createMany.mock.calls[0][0].data,
+    ).toEqual([
+      { notificationID: 'notification-reply-user-1' },
+      { notificationID: 'notification-mention-user-1' },
+    ]);
     expect(push.sendNotification).not.toHaveBeenCalled();
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledTimes(2);
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
@@ -179,16 +204,16 @@ describe('trace comment mention notification flow', () => {
     ).resolves.toEqual(expect.objectContaining({ id: 'comment-1' }));
 
     expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
-    expect(prisma.notification.create).toHaveBeenCalledTimes(1);
-    expect(prisma.notification.create).toHaveBeenCalledWith(
+    expect(prisma.notification.createManyAndReturn).toHaveBeenCalledTimes(1);
+    expect(
+      prisma.notification.createManyAndReturn.mock.calls[0][0].data,
+    ).toEqual([
       expect.objectContaining({
-        data: expect.objectContaining({
-          toUserID: 'reply-user-1',
-          type: 'COMMENT_REPLY',
-        }),
+        toUserID: 'reply-user-1',
+        type: 'COMMENT_REPLY',
       }),
-    );
-    expect(prisma.notificationPushOutbox.create).toHaveBeenCalledTimes(1);
+    ]);
+    expect(prisma.notificationPushOutbox.createMany).toHaveBeenCalledTimes(1);
     expect(push.sendNotification).not.toHaveBeenCalled();
     expect(realtime.broadcastNotificationCreated).toHaveBeenCalledWith(
       'reply-user-1',
@@ -216,7 +241,7 @@ describe('trace comment mention notification flow', () => {
       where: { id: 'trace-1', deleted: false },
       select: { fromID: true, visibility: true },
     });
-    expect(prisma.notification.create).not.toHaveBeenCalled();
+    expect(prisma.notification.createManyAndReturn).not.toHaveBeenCalled();
     expect(
       prisma.$transaction.mock.calls.some(([operations]) =>
         Array.isArray(operations),
@@ -258,7 +283,7 @@ describe('trace comment mention notification flow', () => {
     });
 
     expect(prisma.trace.findFirst).toHaveBeenCalledTimes(2);
-    expect(prisma.notification.create).not.toHaveBeenCalled();
+    expect(prisma.notification.createManyAndReturn).not.toHaveBeenCalled();
     expect(
       prisma.$transaction.mock.calls.some(([operations]) =>
         Array.isArray(operations),

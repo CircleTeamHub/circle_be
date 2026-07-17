@@ -340,6 +340,66 @@ describe('CircleService', () => {
     expect(prisma.circle.update).not.toHaveBeenCalled();
   });
 
+  // Regression: uploadCircleIcon was the one owner-write path without the
+  // origin guard, and the icon is rendered to every plaza viewer as a badge.
+  it('rejects uploadCircleIcon with an off-origin URL when MinIO is configured', async () => {
+    const guarded = new CircleService(
+      prisma as any,
+      openimService as any,
+      circleInvitationService as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+      deleted: false,
+    });
+    // Mocked so that, without the guard, the upload would succeed — the
+    // rejection below can only come from the origin check itself.
+    prisma.iconAsset.create.mockResolvedValue({
+      id: 'asset-evil',
+      imageUrl: 'https://evil.example.com/icon.png',
+    });
+
+    await expect(
+      guarded.uploadCircleIcon('owner-1', 'circle-1', {
+        imageUrl: 'https://evil.example.com/icon.png',
+        name: 'evil',
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.iconAsset.create).not.toHaveBeenCalled();
+  });
+
+  it('accepts uploadCircleIcon for a URL served from this app storage', async () => {
+    const guarded = new CircleService(
+      prisma as any,
+      openimService as any,
+      circleInvitationService as any,
+      {
+        get: jest.fn(() => 'http://10.0.0.195:9000'),
+      } as any,
+    );
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      ownerID: 'owner-1',
+      deleted: false,
+    });
+    prisma.iconAsset.create.mockResolvedValue({
+      id: 'asset-new',
+      imageUrl: 'http://10.0.0.195:9000/avatars/new.png',
+    });
+
+    await expect(
+      guarded.uploadCircleIcon('owner-1', 'circle-1', {
+        imageUrl: 'http://10.0.0.195:9000/avatars/new.png',
+        name: 'ok',
+      }),
+    ).resolves.toEqual(expect.objectContaining({ id: 'asset-new' }));
+  });
+
   it('allows the circle owner to select the current circle icon', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -458,6 +518,34 @@ describe('CircleService', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].myRole).toBe('OWNER');
+  });
+
+  it('returns every created circle instead of silently truncating the list', async () => {
+    prisma.circle.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', { tab: 'created' });
+
+    expect(prisma.circle.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1', deleted: false },
+      orderBy: { createdAt: 'desc' },
+    });
+  });
+
+  it('returns every joined circle instead of silently truncating the list', async () => {
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', { tab: 'joined' });
+
+    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        status: 'ACTIVE',
+        role: { not: 'OWNER' },
+        circle: { deleted: false },
+      },
+      include: { circle: true },
+      orderBy: { createdAt: 'desc' },
+    });
   });
 });
 

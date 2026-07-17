@@ -7,6 +7,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -23,6 +24,7 @@ import { CircleInvitationService } from './circle-invitation.service';
 import {
   AddVerifierDto,
   InvitationDto,
+  InvitationListQueryDto,
   InviteToCircleDto,
   RespondVerificationDto,
 } from './dto/circle-invitation.dto';
@@ -55,15 +57,22 @@ export class CircleInvitationController {
   @ApiOkResponse({ type: [InvitationDto] })
   myPendingVerifications(
     @Req() req: RequestWithUser,
+    @Query() query: InvitationListQueryDto,
   ): Promise<InvitationDto[]> {
-    return this.invitationService.getMyPendingVerifications(req.user.userId);
+    return this.invitationService.getMyPendingVerifications(
+      req.user.userId,
+      query,
+    );
   }
 
   @Get('my-applications')
   @ApiOperation({ summary: 'My applications (as applicant)' })
   @ApiOkResponse({ type: [InvitationDto] })
-  myApplications(@Req() req: RequestWithUser): Promise<InvitationDto[]> {
-    return this.invitationService.getMyApplications(req.user.userId);
+  myApplications(
+    @Req() req: RequestWithUser,
+    @Query() query: InvitationListQueryDto,
+  ): Promise<InvitationDto[]> {
+    return this.invitationService.getMyApplications(req.user.userId, query);
   }
 
   @Get('circle/:circleId/pending')
@@ -72,10 +81,12 @@ export class CircleInvitationController {
   circlePending(
     @Param('circleId', ParseUUIDPipe) circleId: string,
     @Req() req: RequestWithUser,
+    @Query() query: InvitationListQueryDto,
   ): Promise<InvitationDto[]> {
     return this.invitationService.getPendingInvitationsForCircle(
       req.user.userId,
       circleId,
+      query,
     );
   }
 

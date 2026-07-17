@@ -91,6 +91,7 @@ export const CircleInvitationErrorCode = {
   NoPendingVerification: 'INVITATION_NO_PENDING_VERIFICATION',
   OwnerAdminOnly: 'INVITATION_OWNER_ADMIN_ONLY',
   ViewForbidden: 'INVITATION_VIEW_FORBIDDEN',
+  InvalidCursor: 'INVITATION_INVALID_CURSOR',
 } as const;
 
 // 临时聊天(访客免注册)。链接失效 / 已结束 / 人数已满面向 H5 访客页,

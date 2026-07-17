@@ -1,5 +1,39 @@
-import { IsBoolean, IsNotEmpty, IsUUID } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+import {
+  IsBoolean,
+  IsInt,
+  IsNotEmpty,
+  IsOptional,
+  IsUUID,
+  Max,
+  Min,
+} from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+
+export const DEFAULT_INVITATION_LIST_LIMIT = 50;
+export const MAX_INVITATION_LIST_LIMIT = 100;
+
+export class InvitationListQueryDto {
+  @ApiPropertyOptional({
+    format: 'uuid',
+    description: 'Last invitation id returned by the previous page',
+  })
+  @IsOptional()
+  @IsUUID()
+  cursor?: string;
+
+  @ApiPropertyOptional({
+    default: DEFAULT_INVITATION_LIST_LIMIT,
+    minimum: 1,
+    maximum: MAX_INVITATION_LIST_LIMIT,
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_INVITATION_LIST_LIMIT)
+  limit: number = DEFAULT_INVITATION_LIST_LIMIT;
+}
 
 export class InviteToCircleDto {
   @ApiProperty()

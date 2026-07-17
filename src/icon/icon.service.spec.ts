@@ -2,7 +2,10 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { IconService } from './icon.service';
+import {
+  IconService,
+  MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
+} from './icon.service';
 
 // Privacy defaults mirror PrivacySettingsService: phone hidden, wechat/qq shown.
 const DEFAULT_PRIVACY = {
@@ -50,7 +53,21 @@ describe('IconService', () => {
       deleteMany: jest.fn(),
       createMany: jest.fn(),
     },
+    $queryRaw: jest.fn(),
     $transaction: jest.fn((fn: (tx: any) => Promise<any>) => fn(prisma)),
+  };
+
+  // Eligibility memberships load in two steps: $queryRaw picks the ids that
+  // survive the per-user cap, then circleMember.findMany hydrates them.
+  const mockMemberships = (
+    memberships: Array<Record<string, unknown> & { id?: string }>,
+  ) => {
+    const rows = memberships.map((membership, index) => ({
+      id: membership.id ?? `member-${index}`,
+      ...membership,
+    }));
+    prisma.$queryRaw.mockResolvedValue(rows.map(({ id }) => ({ id })));
+    prisma.circleMember.findMany.mockResolvedValue(rows);
   };
 
   const realtimeService = {
@@ -66,7 +83,7 @@ describe('IconService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     // Sensible defaults: no circles, no likes, default privacy.
-    prisma.circleMember.findMany.mockResolvedValue([]);
+    mockMemberships([]);
     privacySettings.getSettings.mockResolvedValue({ ...DEFAULT_PRIVACY });
     privacySettings.getSettingsForUsers.mockResolvedValue(new Map());
 
@@ -202,7 +219,7 @@ describe('IconService', () => {
 
   it('awards Circle Builder for an owner/admin of a mature, >100-member circle', async () => {
     prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
-    prisma.circleMember.findMany.mockResolvedValue([
+    mockMemberships([
       {
         userID: 'user-1',
         circleID: 'circle-1',
@@ -228,7 +245,7 @@ describe('IconService', () => {
 
   it('does NOT award Circle Builder for a circle at the member threshold', async () => {
     prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
-    prisma.circleMember.findMany.mockResolvedValue([
+    mockMemberships([
       {
         userID: 'user-1',
         circleID: 'circle-1',
@@ -254,7 +271,7 @@ describe('IconService', () => {
 
   it('exposes circle icons for circles that have a current icon asset', async () => {
     prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
-    prisma.circleMember.findMany.mockResolvedValue([
+    mockMemberships([
       {
         userID: 'user-1',
         circleID: 'circle-1',
@@ -402,6 +419,56 @@ describe('IconService', () => {
       const result = await service.getDisplayIconsForUsers(['ghost']);
 
       expect(result.get('ghost')).toEqual([]);
+    });
+
+    // Regression: the batch path used to read every membership of every author
+    // with no cap, so one power user could drag a whole feed page down.
+    it('caps memberships per user instead of per query', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        verifiedUser({ id: 'user-1', email: null }),
+      ]);
+      privacySettings.getSettingsForUsers.mockResolvedValue(
+        new Map([['user-1', { ...DEFAULT_PRIVACY }]]),
+      );
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+      mockMemberships([]);
+
+      await service.getDisplayIconsForUsers(['user-1', 'user-2']);
+
+      const [sql, , cap] = prisma.$queryRaw.mock.calls[0];
+      expect(sql.join('?')).toContain('PARTITION BY');
+      expect(cap).toBe(MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS);
+      // Hydration is keyed by the capped ids, never by an unbounded user scan.
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('applies the same cap on the single-user path', async () => {
+      prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+      mockMemberships([
+        {
+          id: 'member-a',
+          userID: 'user-1',
+          circleID: 'circle-1',
+          role: 'MEMBER',
+          circle: {
+            id: 'circle-1',
+            name: 'C',
+            createdAt: new Date(),
+            deleted: false,
+            memberCount: 3,
+            currentIconAsset: null,
+          },
+        },
+      ]);
+
+      await service.getDisplayIconsForUser('user-1');
+
+      const [, , cap] = prisma.$queryRaw.mock.calls[0];
+      expect(cap).toBe(MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS);
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: { in: ['member-a'] } } }),
+      );
     });
   });
 
