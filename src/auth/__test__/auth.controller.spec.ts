@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
 import { RegisterDto } from '../dto/register.dto';
@@ -99,6 +100,9 @@ describe('AuthController', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
+      // GET /auth/im-token opts into ThrottlerGuard, which needs the module
+      // options present even though this spec calls handlers directly.
+      imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [AuthController],
       providers: [{ provide: AuthService, useValue: mockAuthService }],
     }).compile();

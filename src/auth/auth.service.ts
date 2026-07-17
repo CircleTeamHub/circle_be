@@ -970,6 +970,30 @@ export class AuthService {
   }
 
   /**
+   * 单独签发 IM token，供客户端在「不重新登录」的前提下重建 IM 会话
+   * （登录时 imToken 为空、IM token 过期、连接瞬时失败后恢复等）。
+   *
+   * 身份只来自调用方的 JWT —— 见 AuthController.imToken，不接受任何 userId 入参。
+   *
+   * 与登录的差异只在失败语义：登录时 IM 只是附加能力，拿不到 token 也要放行；
+   * 而这个接口的全部意义就是返回 token，此时再退化成空串就成了「200 + 静默失败」，
+   * 客户端无法区分「IM 未配置」和「OpenIM 挂了」，只能把空值存下来再次陷入
+   * resolveImToken 注释里描述的死角。因此这里显式抛 503，让客户端能退避重试。
+   */
+  async getImToken(
+    userId: string,
+    platformID?: 1 | 2 | 5,
+  ): Promise<{ imToken: string }> {
+    const imToken = await this.resolveImToken(userId, platformID);
+    if (!imToken) {
+      throw new ServiceUnavailableException(
+        'IM token is temporarily unavailable',
+      );
+    }
+    return { imToken };
+  }
+
+  /**
    * 取 OpenIM 用户 token。IM 不是登录的硬依赖：拿不到时退化为空串，让登录照常完成。
    * 但失败必须「喊出来」——否则 OpenIM 宕机（如 Kafka 抽风导致 get_user_token 超时）时，
    * 前端只会静默拿到空 imToken、连不上 IM、会话加载不出来，问题极难定位。
