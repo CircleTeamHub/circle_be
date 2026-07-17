@@ -163,6 +163,54 @@ describe('CreateNoteShareLinkDto', () => {
     expect(errors.some((error) => error.property === 'status')).toBe(true);
     expect(errors.some((error) => error.property === 'noteIds')).toBe(true);
   });
+
+  // docs/note-share-links-todo.md 第 5 节。@IsNotEmpty 只拒 '' / null / undefined，
+  // 会放行纯空白标题，服务里再 trim 成空串、落到硬编码的中文兜底 '我的笔记'。
+  // 修法是在边界上拒掉，而不是把那个字符串翻译掉：它是内容不是报错，
+  // errorCode 那套 i18n 机制（docs/server-error-i18n-rollout.md）套不上，
+  // 服务端也不知道调用方的 locale。拒掉之后兜底就是不可达代码，直接删。
+  it('rejects a whitespace-only title', () => {
+    const errors = validateSync(
+      plainToInstance(CreateNoteShareLinkDto, { title: '   ' }),
+    );
+
+    expect(errors.some((error) => error.property === 'title')).toBe(true);
+  });
+
+  it('trims surrounding whitespace off a valid title', () => {
+    const dto = plainToInstance(CreateNoteShareLinkDto, {
+      title: '  我的旅行  ',
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.title).toBe('我的旅行');
+  });
+
+  it('still rejects an empty title', () => {
+    const errors = validateSync(
+      plainToInstance(CreateNoteShareLinkDto, { title: '' }),
+    );
+
+    expect(errors.some((error) => error.property === 'title')).toBe(true);
+  });
+
+  it('measures the title length after trimming', () => {
+    // 120 个字符 + 两端空白：trim 之后正好卡在 @MaxLength(120) 上，应当放行。
+    const dto = plainToInstance(CreateNoteShareLinkDto, {
+      title: `  ${'字'.repeat(120)}  `,
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.title).toHaveLength(120);
+  });
+
+  it('still rejects a title longer than the cap', () => {
+    const errors = validateSync(
+      plainToInstance(CreateNoteShareLinkDto, { title: '字'.repeat(121) }),
+    );
+
+    expect(errors.some((error) => error.property === 'title')).toBe(true);
+  });
 });
 
 describe('ListNoteShareLinksQueryDto', () => {

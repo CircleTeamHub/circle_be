@@ -1,8 +1,8 @@
 # 笔记分享链接 — 待办事项
 
 > 关联 commit：`982daa8` Add note share links and readable note metadata
-> ~~现状：分享链接「只写不读」~~ → 第 1、2、4 条已完成（见下）。
-> 剩余：第 3 条（数量上限）、第 5 条（兜底标题）。
+> ~~现状：分享链接「只写不读」~~ → 第 1、2、4、5 条已完成（见下）。
+> 剩余：**只剩第 3 条**（每用户链接数量上限）。
 > 本文档记录 review 中发现的剩余工作。
 
 ---
@@ -99,10 +99,30 @@
 
 ---
 
-## 5.（小）服务里硬编码的中文兜底标题
+## 5.（小）服务里硬编码的中文兜底标题 ✅ 已完成
 
-`note.service.ts` 的 `createShareLink` 里有 `dto.title.trim().slice(0, 120) || '我的笔记'`，
-空白标题（`@IsNotEmpty` 允许 `"   "`）会触发兜底。属于轻微 i18n 问题，优先级低，可暂不动。
+~~`note.service.ts` 的 `createShareLink` 里有 `dto.title.trim().slice(0, 120) || '我的笔记'`，
+空白标题（`@IsNotEmpty` 允许 `"   "`）会触发兜底。~~
+
+**已实现：** 兜底整个删掉了，改成在边界上拒绝空白标题 ——
+`CreateNoteShareLinkDto.title` 加 `@Transform` 先 trim 再校验。
+
+- [x] 纯空白标题（`'   '`）现在返回 **400**，不再静默变成「我的笔记」
+- [x] 合法标题两端空白被 trim，`@MaxLength(120)` 量的是 trim 后的长度
+- [x] `createShareLink` 里不再有硬编码中文
+
+> **这一条原本定性为「i18n 问题」，其实不是。** `'我的笔记'` 是**内容**不是报错，
+> `docs/server-error-i18n-rollout.md` 那套 `errorCode` → 前端查文案的机制套不上
+> （没有 error，服务端也不知道调用方 locale）。真正的根因是校验漏了：
+> `@IsNotEmpty` 只拒 `''` / `null` / `undefined`，放行纯空白。
+> 在边界拒掉之后兜底成了不可达代码，直接删 —— 比翻译一个本就不该存在的字符串更对。
+> 副作用是这个 bug 不再被悄悄盖住：客户端传空标题会拿到 400 而不是一个叫
+> 「我的笔记」的链接。空白标题走的是普通校验失败路径（同 `@MaxLength` 超长），
+> 与全站其它校验错误一致，无需新增 errorCode。
+
+> ⚠️ 同样的空白漏洞在别处也有（如 `CreateNoteDto.title`、`CreateNoteGroupDto.name`
+> 都是 `@IsNotEmpty` 裸用），只是那些地方没有硬编码兜底、影响不同。本次未一并改，
+> 属于独立的清理项。
 
 ---
 
@@ -119,4 +139,11 @@
 
 ~~1 → 2 → 4 一起做~~ → 1 和 4 已完成（`feat: resolve note share links with expiry and revocation checks`）。
 ~~2 未做~~ → 2 已完成（`feat: revoke and list note share links`，叠在上面那个 PR 之上）。
-3、5 可后续单独处理。
+~~3、5 可后续单独处理~~ → 5 已完成（`fix: reject blank note share link titles`，再叠一层）。
+
+**只剩第 3 条。** 但注意：第 3 条最实际的痛点（链接多了之后老链接看不到、
+从而吊销不了）已经被第 2 条的 `GET /note/share-links` 分页解掉了，
+剩下的是「行数长期无上界」这个存储/成本问题，不影响功能正确性。
+
+> 另：分享链接功能目前**四个接口全都没有客户端调用方**（`circle-im` 在
+> `9e8fca26` 已移除分享入口）。继续往下堆后端之前，值得先确认前端是否会恢复。
