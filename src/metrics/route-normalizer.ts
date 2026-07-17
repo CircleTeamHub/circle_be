@@ -137,6 +137,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/note/:id/groups',
   '/api/v1/note/:id/pin',
   '/api/v1/note/group/:id',
+  '/api/v1/note/share-links/:token',
   '/api/v1/notification/:id',
   '/api/v1/notification/:id/read',
   '/api/v1/roles/:id',

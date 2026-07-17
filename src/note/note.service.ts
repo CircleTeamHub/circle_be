@@ -34,6 +34,7 @@ import {
   NoteStatus,
   NoteSummaryDto,
   NoteWritableStatus,
+  SharedNoteListDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
 } from './dto/note.dto';
@@ -194,6 +195,25 @@ const MAX_EXPORT_MEDIA_ITEMS = 50;
 const MAX_EXPORT_SINGLE_MEDIA_BYTES = 8 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_MEDIA_BYTES = 16 * 1024 * 1024;
 const MAX_PDF_EMBEDDED_IMAGES = 4;
+
+/** NoteShareLink 上参与「快照筛选」的列，buildShareLinkNoteFilter 的入参。 */
+type NoteShareLinkFilter = {
+  ownerID: string;
+  status: NoteStatus | null;
+  group: string | null;
+  groupID: string | null;
+  search: string | null;
+  noteIDs: string[];
+};
+
+// 访客侧解析分享链接时返回的笔记数量上限。与 CreateNoteShareLinkDto.noteIds 的
+// @ArrayMaxSize(200) 对齐；「无 noteIDs 快照」的链接（纯筛选条件）本身没有上界，
+// 这里兜底避免一次解析拉出笔记主人的全部笔记。
+const SHARE_LINK_MAX_NOTES = 200;
+
+// mapSummary 用它来判定「访客不是笔记主人」：ownerID 是 UUID，永远不会等于空串，
+// 因此 canEdit 恒为 false、collectedFrom 恒被抹掉。
+const SHARE_LINK_GUEST_VIEWER = '';
 const PDF_FONT_CANDIDATES = [
   '/Library/Fonts/Arial Unicode.ttf',
   '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf',
@@ -1344,6 +1364,96 @@ export class NoteService {
     }
 
     throw new ConflictException('Unable to create share link');
+  }
+
+  /**
+   * 访客侧：把分享 token 解析成链接快照范围内的笔记列表。
+   *
+   * 规格见 docs/note-share-links-todo.md 第 1、4 节。这是分享功能缺失的「读」
+   * 半边 —— 在此之前 NoteShareLink 只写不读，expiresAt / revokedAt 存了但从不
+   * 校验，链接一旦发出就无法过期、也无法作废。
+   *
+   * 授权模型：链接本身即凭据（token 为 18 字节随机数，144 bit，不可枚举），
+   * 因此端点不挂 JwtGuard —— 二维码扫描者没有 Circle 会话。
+   */
+  async resolveShareLink(token: string): Promise<SharedNoteListDto> {
+    const link = await this.prisma.noteShareLink.findUnique({
+      where: { token },
+    });
+
+    // 不存在 / 已吊销 / 已过期 → 同一个 404，且都在查笔记之前短路。
+    if (
+      !link ||
+      link.revokedAt !== null ||
+      (link.expiresAt !== null && link.expiresAt.getTime() <= Date.now())
+    ) {
+      throw this.shareLinkInvalid();
+    }
+
+    const notes = await this.prisma.note.findMany({
+      where: this.buildShareLinkNoteFilter(link),
+      include: NOTE_INCLUDE,
+      orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
+      take: SHARE_LINK_MAX_NOTES,
+    });
+
+    return {
+      title: link.title,
+      notes: notes.map((note) =>
+        this.mapSummary(note, SHARE_LINK_GUEST_VIEWER),
+      ),
+      expiresAt: link.expiresAt,
+    };
+  }
+
+  /**
+   * 链接不存在 / 已吊销 / 已过期共用同一个 404 响应体。三者必须逐字节一致，
+   * 否则访客可以据此区分「链接从未存在」与「链接曾存在但已被吊销/过期」。
+   */
+  private shareLinkInvalid(): NotFoundException {
+    return new NotFoundException({
+      message: 'Share link not found',
+      errorCode: NoteErrorCode.ShareLinkInvalid,
+    });
+  }
+
+  /**
+   * 按链接存下来的快照条件（noteIDs / status / group / groupID / search）过滤。
+   *
+   * 刻意 **不** 复用 getNote 的 `OR: [{ownerID}, {available:true}]` 放行逻辑
+   * （docs 第 1 节）：那条 OR 会让链接范围之外的任意 available 笔记也被读出来。
+   * 这里 available / status 是**过滤条件**而非放行条件 —— 链接创建后被删除或被
+   * 取消 available 的笔记，解析时必须消失（docs 第 4 节）。
+   */
+  private buildShareLinkNoteFilter(link: NoteShareLinkFilter) {
+    const search = link.search?.trim();
+    return {
+      ownerID: link.ownerID,
+      // status 快照只可能是 ACTIVE / UNLISTED（NOTE_WRITABLE_STATUS），
+      // 两者都已排除 DELETED；未设置时显式排除。
+      status: link.status ?? { not: 'DELETED' as const },
+      available: true,
+      ...(link.noteIDs.length > 0 ? { id: { in: link.noteIDs } } : {}),
+      // group 与 groupID 在 createShareLink 里互斥，两个分支不会同时命中。
+      ...(link.groupID
+        ? {
+            groupMemberships: {
+              some: { groupID: link.groupID, group: { deletedAt: null } },
+            },
+          }
+        : {}),
+      ...(link.group === 'ungrouped'
+        ? { groupMemberships: { none: { group: { deletedAt: null } } } }
+        : {}),
+      ...(search
+        ? {
+            OR: [
+              { title: { contains: search, mode: 'insensitive' as const } },
+              { content: { contains: search, mode: 'insensitive' as const } },
+            ],
+          }
+        : {}),
+    };
   }
 
   async getNote(ownerID: string, noteId: string): Promise<NoteDetailDto> {
