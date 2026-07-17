@@ -101,7 +101,17 @@ export function createEnvValidationSchema(
     PRISMA_SKIP_CONNECT_ON_BOOT: Joi.boolean(),
     ALLOW_START_WITHOUT_DB: Joi.boolean(),
     OPENIM_API_URL: Joi.string().uri().optional(),
-    OPENIM_ADMIN_SECRET: Joi.string().optional(),
+    // Posted to OpenIM's /auth/get_admin_token, so whoever holds it can mint an
+    // admin token and act as any user — at least the blast radius of SECRET,
+    // hence the same production floor. Gated on OPENIM_API_URL because leaving
+    // the URL unset is the supported "IM disabled" state; setting the URL in
+    // production and omitting the secret fails loudly rather than silently
+    // dropping every IM feature (OpenimService treats an empty secret as off).
+    OPENIM_ADMIN_SECRET: Joi.when('OPENIM_API_URL', {
+      is: Joi.exist(),
+      then: Joi.string().min(secretMin).required(),
+      otherwise: Joi.string().optional(),
+    }),
     LIVEKIT_URL: Joi.string().uri().optional(),
     LIVEKIT_API_KEY: Joi.string().optional(),
     LIVEKIT_API_SECRET: Joi.string().optional(),

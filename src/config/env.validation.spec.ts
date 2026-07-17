@@ -230,4 +230,75 @@ describe('createEnvValidationSchema', () => {
 
     expect(error).toBeUndefined();
   });
+
+  describe('OPENIM_ADMIN_SECRET', () => {
+    // The admin secret is POSTed to /auth/get_admin_token; whoever holds it can
+    // mint an OpenIM admin token and act as any user. It is gated on
+    // OPENIM_API_URL because an unset URL is the supported "IM disabled" state.
+    const productionBase = {
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      SECRET: 'a-production-secret-that-is-over-32-characters',
+      ALLOWED_ORIGINS: 'https://app.example.com',
+      TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+    };
+
+    it('rejects the well-known OpenIM default secret in production', () => {
+      const env = {
+        ...productionBase,
+        OPENIM_API_URL: 'http://im.example.com:10002',
+        OPENIM_ADMIN_SECRET: 'openIM123',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain('OPENIM_ADMIN_SECRET');
+      expect(error?.message).toContain('at least 32');
+    });
+
+    it('requires OPENIM_ADMIN_SECRET in production once OPENIM_API_URL is set', () => {
+      const env = {
+        ...productionBase,
+        OPENIM_API_URL: 'http://im.example.com:10002',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain('"OPENIM_ADMIN_SECRET" is required');
+    });
+
+    it('allows production startup with OpenIM disabled (no API URL, no secret)', () => {
+      const env = { ...productionBase };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts a short secret outside production so local OpenIM still boots', () => {
+      const env = {
+        NODE_ENV: 'development',
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        SECRET: 'test-secret',
+        OPENIM_API_URL: 'http://127.0.0.1:10002',
+        OPENIM_ADMIN_SECRET: 'openIM123',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+    });
+
+    it('accepts a sufficiently long admin secret in production', () => {
+      const env = {
+        ...productionBase,
+        OPENIM_API_URL: 'http://im.example.com:10002',
+        OPENIM_ADMIN_SECRET: 'an-openim-admin-secret-over-32-characters',
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error).toBeUndefined();
+    });
+  });
 });
