@@ -66,6 +66,22 @@ describe('normalizeRoute', () => {
     );
   });
 
+  it('collapses note share-link tokens instead of exposing them as metric labels', () => {
+    // randomBytes(18).toString('base64url') — matches none of the id-collapse
+    // fallback regexes, so only the template keeps it out of the label.
+    expect(
+      normalizeRoute('/api/v1/note/share-links/EjXL-ytbFWx0_u4Qn4zymT5g'),
+    ).toBe('/api/v1/note/share-links/:token');
+    // Same template also covers the revoke route, which passes the share link's
+    // uuid in this position — `method` is a separate label, so one template is
+    // enough to tell the two apart on a dashboard.
+    expect(
+      normalizeRoute(
+        '/api/v1/note/share-links/3fa85f64-5717-4562-b3fc-2c963f66afa6',
+      ),
+    ).toBe('/api/v1/note/share-links/:token');
+  });
+
   it('collapses OpenIM string ids used in group and chat-history routes', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
       '/api/v1/group/:groupID/members/:userID',
