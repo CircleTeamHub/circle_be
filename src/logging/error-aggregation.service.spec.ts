@@ -1,4 +1,8 @@
 import {
+  OTHER_ROUTE,
+  limitRouteCardinality,
+} from '../metrics/route-normalizer';
+import {
   NoopErrorAggregationProvider,
   SentryErrorAggregationProvider,
   createErrorAggregationConfig,
@@ -170,6 +174,69 @@ describe('SentryErrorAggregationProvider', () => {
 
     const [, captureContext] = client.captureException.mock.calls[0];
     expect(captureContext.tags.path).toBe('/api/v1/circle/:id');
+  });
+
+  it('bounds distinct unknown path tags so drifted routes cannot explode tag cardinality', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+
+    // A route the normalizer has no template for is returned verbatim, so every
+    // distinct token becomes its own indexed, retained Sentry tag value. Route
+    // drift is real (PR #64) and case-permuted paths bypass template matching
+    // entirely, so the tag budget cannot rely on the template list being exact.
+    for (let index = 0; index < 500; index += 1) {
+      provider.captureError(new Error('boom'), {
+        statusCode: 500,
+        path: `/api/v1/drifted/token-${index}`,
+      });
+    }
+
+    const pathTags = new Set(
+      client.captureException.mock.calls.map((call) => call[1]?.tags?.path),
+    );
+
+    // 200 unknown-route budget + the /__other__ bucket everything else folds into.
+    expect(pathTags.size).toBeLessThanOrEqual(201);
+    expect(pathTags.has(OTHER_ROUTE)).toBe(true);
+  });
+
+  it('still reports known routes verbatim after the unknown-path budget is spent', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+
+    for (let index = 0; index < 500; index += 1) {
+      provider.captureError(new Error('boom'), {
+        statusCode: 500,
+        path: `/api/v1/drifted/token-${index}`,
+      });
+    }
+    provider.captureError(new Error('boom'), {
+      statusCode: 500,
+      path: '/api/v1/circle/3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    });
+
+    const { calls } = client.captureException.mock;
+    expect(calls[calls.length - 1]?.[1]?.tags?.path).toBe('/api/v1/circle/:id');
+  });
+
+  it('keeps a budget independent of the app-wide metrics limiter', () => {
+    // The HTTP middleware's limiter sees every request, including 404 scans, so
+    // its 200-slot unknown budget is the first thing an attacker exhausts.
+    // Sharing it would bucket the first genuine 5xx on a drifted route into
+    // /__other__ — losing the path exactly when Sentry needs it most.
+    for (let index = 0; index < 250; index += 1) {
+      limitRouteCardinality(`/api/v1/scan-${index}`);
+    }
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+
+    provider.captureError(new Error('boom'), {
+      statusCode: 500,
+      path: '/api/v1/drifted/first-real-5xx',
+    });
+
+    const [, captureContext] = client.captureException.mock.calls[0];
+    expect(captureContext?.tags?.path).toBe('/api/v1/drifted/first-real-5xx');
   });
 
   it('does not send expected 4xx client errors', () => {
