@@ -185,10 +185,18 @@ export function normalizeRoute(path: string): string {
   if (rawPathname === '' || rawPathname === '/') {
     return '/';
   }
-  const pathname =
+  // Express routing is case-insensitive by default, so `/API/V1/CiRcLe/<id>`
+  // reaches the same handler as `/api/v1/circle/<id>`. Paths arrive here as the
+  // raw client spelling (req.path / req.originalUrl), so canonicalize before
+  // matching — an exact-case match would miss every template and return the path
+  // verbatim, leaking link tokens and minting a label per case permutation.
+  // Safe because every literal segment in both allowlists is already lowercase
+  // (enforced by the consistency tests); `:params` match regardless of case.
+  const pathname = (
     rawPathname.length > 1 && rawPathname.endsWith('/')
       ? rawPathname.slice(0, -1)
-      : rawPathname;
+      : rawPathname
+  ).toLowerCase();
 
   if (STATIC_ROUTES.has(pathname)) {
     return pathname;

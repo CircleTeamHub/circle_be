@@ -12,7 +12,10 @@
  * or tokens) accompany the captured exception.
  */
 
-import { normalizeRoute } from '../metrics/route-normalizer';
+import {
+  createRouteCardinalityLimiter,
+  normalizeRoute,
+} from '../metrics/route-normalizer';
 
 export type ErrorAggregationProviderName = 'none' | 'sentry';
 
@@ -103,7 +106,21 @@ export class NoopErrorAggregationProvider implements ErrorAggregationProvider {
 export class SentryErrorAggregationProvider implements ErrorAggregationProvider {
   readonly name = 'sentry';
 
-  constructor(private readonly client: SentryClientLike) {}
+  /**
+   * Own limiter instance rather than the app-wide `limitRouteCardinality`: that
+   * one is fed by the HTTP middleware on every request, so 404 scanning spends
+   * its unknown-route budget long before any 5xx happens — sharing it would
+   * bucket the first genuine drifted-route error into `/__other__` and lose the
+   * path exactly when Sentry needs it. Sentry tags and Prometheus labels also
+   * price cardinality differently (indexed retention vs series memory), so the
+   * budgets are better kept independent.
+   */
+  constructor(
+    private readonly client: SentryClientLike,
+    private readonly limitPathCardinality: (
+      route: string,
+    ) => string = createRouteCardinalityLimiter(),
+  ) {}
 
   captureError(error: unknown, context: ErrorAggregationContext): void {
     if (context.statusCode < SERVER_ERROR_THRESHOLD) {
@@ -114,7 +131,7 @@ export class SentryErrorAggregationProvider implements ErrorAggregationProvider 
       tags: Record<string, string>;
       user?: { id: string };
     } = {
-      tags: buildTags(context),
+      tags: buildTags(context, this.limitPathCardinality),
     };
 
     if (context.userId) {
@@ -129,7 +146,10 @@ export class SentryErrorAggregationProvider implements ErrorAggregationProvider 
   }
 }
 
-function buildTags(context: ErrorAggregationContext): Record<string, string> {
+function buildTags(
+  context: ErrorAggregationContext,
+  limitPathCardinality: (route: string) => string,
+): Record<string, string> {
   const tags: Record<string, string> = {
     statusCode: String(context.statusCode),
   };
@@ -138,8 +158,12 @@ function buildTags(context: ErrorAggregationContext): Record<string, string> {
   if (context.method) tags.method = context.method;
   // Normalize before tagging: the raw path carries id/link-token segments
   // (e.g. /temp-chat/by-token/<token>/join) — sending those to Sentry would
-  // leak secrets into an indexed, retained tag and blow up tag cardinality.
-  if (context.path) tags.path = normalizeRoute(context.path);
+  // leak secrets into an indexed, retained tag. Normalizing alone is not enough:
+  // a path with no matching template is returned verbatim, so route drift or a
+  // 5xx storm on unlisted paths would still mint unbounded tag values. Cap them.
+  if (context.path) {
+    tags.path = limitPathCardinality(normalizeRoute(context.path));
+  }
   return tags;
 }
 

@@ -42,6 +42,30 @@ describe('normalizeRoute', () => {
     ).toBe('/api/v1/temp-chat/by-token/:token/join');
   });
 
+  it('matches case-insensitively so link tokens cannot escape redaction', () => {
+    // Express routing is case-insensitive by default, so this path reaches the
+    // real handler — but an exact-case template match misses it and falls back
+    // to returning the raw token verbatim.
+    expect(
+      normalizeRoute(
+        '/API/V1/temp-chat/by-token/eyJhbGciOiJIUzI1NiJ9.secret.signature/join',
+      ),
+    ).toBe('/api/v1/temp-chat/by-token/:token/join');
+  });
+
+  it('maps case-permuted spellings of one route to a single canonical label', () => {
+    const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+    expect(normalizeRoute(`/API/V1/CiRcLe/${uuid}`)).toBe('/api/v1/circle/:id');
+    expect(normalizeRoute(`/Api/V1/circle/${uuid}`)).toBe('/api/v1/circle/:id');
+    expect(normalizeRoute('/API/V1/AUTH/LOGIN')).toBe('/api/v1/auth/login');
+  });
+
+  it('canonicalizes case for unlisted paths so permutations share one label', () => {
+    expect(normalizeRoute('/api/v1/UnListed/Path')).toBe(
+      '/api/v1/unlisted/path',
+    );
+  });
+
   it('collapses OpenIM string ids used in group and chat-history routes', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
       '/api/v1/group/:groupID/members/:userID',
@@ -142,6 +166,23 @@ describe('route allowlist consistency', () => {
       expect(route.startsWith('/api/v1/')).toBe(true);
       expect(route).not.toContain('/:');
       expect(route.endsWith('/')).toBe(false);
+    }
+  });
+
+  // normalizeRoute lowercases the path before matching (Express routes are
+  // case-insensitive), so an allowlist entry with an uppercase literal segment
+  // could never match and would silently fall through to the id-collapse path.
+  it('has only lowercase literal segments', () => {
+    for (const route of staticRoutes) {
+      expect(route).toBe(route.toLowerCase());
+    }
+    for (const template of DYNAMIC_ROUTE_TEMPLATES) {
+      const literals = template
+        .split('/')
+        .filter((segment) => segment !== '' && !segment.startsWith(':'));
+      for (const literal of literals) {
+        expect(literal).toBe(literal.toLowerCase());
+      }
     }
   });
 
