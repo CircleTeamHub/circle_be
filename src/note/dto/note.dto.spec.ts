@@ -3,9 +3,11 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import {
   CreateNoteDto,
+  CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ReorderNoteGroupsDto,
+  UpdateNoteGroupDto,
 } from './note.dto';
 
 describe('CreateNoteDto', () => {
@@ -132,6 +134,66 @@ describe('ReorderNoteGroupsDto', () => {
     expect(
       validateSync(invalidDto).some((error) => error.property === 'groupIds'),
     ).toBe(true);
+  });
+});
+
+// 与 CreateNoteShareLinkDto.title 同一个洞（docs 第 5 节）：@IsNotEmpty 只拒
+// '' / null / undefined，放行纯空白。区别是这两处没有硬编码兜底顶着，
+// 而是直接把空串写进库 —— createGroup 里 `input.name.trim()` 会真的建出一个
+// 名字是空串的分组，createNote 的 derivedTitle 同理。
+describe('CreateNoteDto title blankness', () => {
+  it('rejects a whitespace-only title', () => {
+    const errors = validateSync(
+      plainToInstance(CreateNoteDto, { title: '   ', media: [] }),
+    );
+
+    expect(errors.some((error) => error.property === 'title')).toBe(true);
+  });
+
+  it('trims surrounding whitespace off a valid title', () => {
+    const dto = plainToInstance(CreateNoteDto, {
+      title: '  出去玩  ',
+      media: [],
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.title).toBe('出去玩');
+  });
+});
+
+describe('CreateNoteGroupDto', () => {
+  it('rejects a whitespace-only name', () => {
+    const errors = validateSync(
+      plainToInstance(CreateNoteGroupDto, { name: '   ' }),
+    );
+
+    expect(errors.some((error) => error.property === 'name')).toBe(true);
+  });
+
+  it('trims surrounding whitespace off a valid name', () => {
+    const dto = plainToInstance(CreateNoteGroupDto, { name: '  日记  ' });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.name).toBe('日记');
+  });
+
+  it('measures the name length after trimming', () => {
+    // 30 字 + 两端空白：trim 后正好卡在 @MaxLength(30) 上，应当放行。
+    const dto = plainToInstance(CreateNoteGroupDto, {
+      name: `  ${'字'.repeat(30)}  `,
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+  });
+});
+
+describe('UpdateNoteGroupDto', () => {
+  it('rejects a whitespace-only name', () => {
+    const errors = validateSync(
+      plainToInstance(UpdateNoteGroupDto, { name: '   ' }),
+    );
+
+    expect(errors.some((error) => error.property === 'name')).toBe(true);
   });
 });
 

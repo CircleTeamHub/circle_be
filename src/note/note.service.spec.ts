@@ -2207,6 +2207,43 @@ describe('NoteService', () => {
     expect(createArg.data.content).toHaveLength(20_000);
   });
 
+  it('falls back to the dto title when every content block is blank', async () => {
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await service.createNote('user-1', {
+      title: '我的标题',
+      contentJson: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text', text: '   ', styles: {} }],
+        },
+      ] as any,
+      media: [],
+    });
+
+    // extractBlockText 会丢掉纯空白片段，于是 extractedText[0] 是 undefined、
+    // derivedTitle 的 `??` 回退到 dto.title。这条不变式是 DTO 侧空白校验够用的
+    // 前提：若这里改成能产出空串，标题就能绕过 DTO 变空。
+    const createArg = prisma.note.create.mock.calls[0][0];
+    expect(createArg.data.title).toBe('我的标题');
+  });
+
   // ── collectNote：聊天收藏笔记 → 复制入我的笔记 ─────────────────────────────
 
   const collectSource = {

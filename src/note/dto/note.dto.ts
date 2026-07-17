@@ -1,4 +1,5 @@
-import { Transform, Type } from 'class-transformer';
+import { Type } from 'class-transformer';
+import { Trim } from 'src/decorators/trim.decorator';
 import {
   ArrayMaxSize,
   IsArray,
@@ -188,6 +189,8 @@ export class NoteSectionsDto {
 export class CreateNoteDto {
   @ApiProperty()
   @IsString()
+  // 空白标题会被 deriveNoteContent trim 成空串直接入库。@Trim 的说明见装饰器本身。
+  @Trim()
   @IsNotEmpty()
   @MaxLength(120)
   title: string;
@@ -300,12 +303,8 @@ export class ListNotesQueryDto {
 export class CreateNoteShareLinkDto {
   @ApiProperty()
   @IsString()
-  // 先 trim 再校验：@IsNotEmpty 只拒 '' / null / undefined，纯空白标题（'   '）
-  // 会被放行，进到服务里 trim 成空串。以前那里有个硬编码中文兜底顶上，
-  // 现在改成在边界直接拒（docs 第 5 节）。顺带让 @MaxLength 量的是 trim 后的长度。
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string' ? value.trim() : value,
-  )
+  // 以前空白标题会落到服务里一个硬编码中文兜底上，现在在边界直接拒（docs 第 5 节）。
+  @Trim()
   @IsNotEmpty()
   @MaxLength(120)
   title: string;
@@ -383,6 +382,8 @@ export class ListNoteShareLinksQueryDto {
 export class CreateNoteGroupDto {
   @ApiProperty()
   @IsString()
+  // 没有 @Trim 时 createGroup 的 `input.name.trim()` 会建出名字是空串的分组。
+  @Trim()
   @IsNotEmpty()
   @MaxLength(30)
   name: string;
@@ -391,6 +392,7 @@ export class CreateNoteGroupDto {
 export class UpdateNoteGroupDto {
   @ApiProperty()
   @IsString()
+  @Trim()
   @IsNotEmpty()
   @MaxLength(30)
   name: string;
