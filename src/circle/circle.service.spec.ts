@@ -519,6 +519,34 @@ describe('CircleService', () => {
     expect(result).toHaveLength(1);
     expect(result[0].myRole).toBe('OWNER');
   });
+
+  it('returns every created circle instead of silently truncating the list', async () => {
+    prisma.circle.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', { tab: 'created' });
+
+    expect(prisma.circle.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1', deleted: false },
+      orderBy: { createdAt: 'desc' },
+    });
+  });
+
+  it('returns every joined circle instead of silently truncating the list', async () => {
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', { tab: 'joined' });
+
+    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        status: 'ACTIVE',
+        role: { not: 'OWNER' },
+        circle: { deleted: false },
+      },
+      include: { circle: true },
+      orderBy: { createdAt: 'desc' },
+    });
+  });
 });
 
 describe('circle image DTO validation', () => {

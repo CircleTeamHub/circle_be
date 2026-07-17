@@ -25,11 +25,10 @@ import {
 } from './dto/circle.dto';
 
 const MAX_JOIN_TX_ATTEMPTS = 3;
-// The SYSTEM icon catalogue grows with every icon ever shipped, and a power
-// user's circle list is unbounded. Both are read whole by their endpoints, so
-// cap the rows instead of letting the table size decide the response size.
+// The SYSTEM icon catalogue grows with every icon ever shipped and is read
+// whole by its endpoint, so cap it instead of letting table size decide the
+// response size.
 const MAX_AVAILABLE_ICON_ASSETS = 100;
-const MAX_MY_CIRCLES = 200;
 
 @Injectable()
 export class CircleService {
@@ -185,7 +184,6 @@ export class CircleService {
       const circles = await this.prisma.circle.findMany({
         where: { ownerID: userId, deleted: false },
         orderBy: { createdAt: 'desc' },
-        take: MAX_MY_CIRCLES,
       });
       // 按定义 created === 自己是圈主。
       return circles.map((c) => ({ ...this.toCircleDto(c), myRole: 'OWNER' }));
@@ -202,7 +200,6 @@ export class CircleService {
       },
       include: { circle: true },
       orderBy: { createdAt: 'desc' },
-      take: MAX_MY_CIRCLES,
     });
 
     // 角色就在 membership 行上，一并返回，省掉客户端逐个拉详情。
