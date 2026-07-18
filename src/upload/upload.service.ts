@@ -51,7 +51,10 @@ export function buildPublicReadBucketPolicy(bucket: string) {
     'avatars',
     'covers',
     'posts',
-    'notes',
+    // 'notes' 已移除：私有笔记(available:false)的媒体不再匿名可读，改由 note.service
+    // 读取时发短时签名 URL(presign-on-read)。历史直链 url 仍在库里但不再被读取路径返回。
+    // 'chat' 保留：key 是不可枚举 UUID，且图 URL 固化在 OpenIM 消息体、无法迁移历史，
+    // 接受 key-secrecy 现状(单独决策，见 note-media 修复说明)。
     'chat',
     'friends',
     'uploads',
