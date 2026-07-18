@@ -51,7 +51,10 @@ export function buildPublicReadBucketPolicy(bucket: string) {
     'avatars',
     'covers',
     'posts',
-    'notes',
+    // 'notes' 已移除：私有笔记(available:false)的媒体不再匿名可读，改由 note.service
+    // 读取时发短时签名 URL(presign-on-read)。历史直链 url 仍在库里但不再被读取路径返回。
+    // 'chat' 保留：key 是不可枚举 UUID，且图 URL 固化在 OpenIM 消息体、无法迁移历史，
+    // 接受 key-secrecy 现状(单独决策，见 note-media 修复说明)。
     'chat',
     'friends',
     'uploads',
@@ -283,6 +286,7 @@ export class UploadService implements OnModuleInit {
   async createPresignedGetUrl(
     key: string,
     expiresInSeconds = 300,
+    signingDate?: Date,
   ): Promise<PresignedDownloadResult> {
     if (!this.enabled) {
       throw new ServiceUnavailableException('File upload is not configured');
@@ -292,13 +296,29 @@ export class UploadService implements OnModuleInit {
       Bucket: this.bucket,
       Key: key,
     });
+    // signingDate 传入时用它做 X-Amz-Date：调用方(note.service presignNoteMedia)把它舍入到
+    // 时间窗口，同窗口内同一 key 签出字节相同的 URL，客户端(expo-image)按-URL 缓存才能命中，
+    // 否则每次请求 URL 都变、列表刷新就重下所有笔记图。
     const url = await getSignedUrl(this.publicClient, command, {
       expiresIn: expiresInSeconds,
+      ...(signingDate ? { signingDate } : {}),
     });
     return {
       url,
       expiresAt: new Date(Date.now() + expiresInSeconds * 1000),
     };
+  }
+
+  /**
+   * 从本站直链反推 object key（fileUrl = `${publicUrl}/${bucket}/${key}` 的逆）。
+   * presign-on-read 用它处理只有 url、没有独立 objectKey 的字段（如 NoteMedia.posterUrl）。
+   * off-origin / 空 → null（不把外链误当本站 key）；读取路径回给的签名 url 里的 query 会被 strip。
+   */
+  objectKeyFromPublicUrl(url: string | null | undefined): string | null {
+    if (!url) return null;
+    const base = `${this.publicUrl.replace(/\/$/, '')}/${this.bucket}/`;
+    if (!url.startsWith(base)) return null;
+    return url.slice(base.length).split('?')[0];
   }
 
   async downloadObjectBuffer(key: string, maxBytes?: number): Promise<Buffer> {

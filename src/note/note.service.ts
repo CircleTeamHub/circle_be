@@ -192,6 +192,10 @@ const MAX_GROUPS_PER_USER = 50;
 const MAX_NOTE_TITLE_LENGTH = 120;
 const MAX_NOTE_CONTENT_LENGTH = 20_000;
 const NOTE_EXPORT_TTL_SECONDS = 15 * 60;
+// 读取时给笔记媒体现签短时 URL。signingDate 舍入到 WINDOW → 同窗口内同一对象签出字节相同的
+// URL，客户端(expo-image)按-URL 缓存才命中；TTL = 窗口 + buffer，保证窗口内始终有效。
+const NOTE_MEDIA_URL_WINDOW_MS = 60 * 60 * 1000; // 1h
+const NOTE_MEDIA_URL_TTL_SECONDS = 2 * 60 * 60; // 2h
 const MAX_EXPORT_MEDIA_ITEMS = 50;
 const MAX_EXPORT_SINGLE_MEDIA_BYTES = 8 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_MEDIA_BYTES = 16 * 1024 * 1024;
@@ -740,18 +744,34 @@ export class NoteService {
     return Object.keys(normalized).length > 0 ? normalized : null;
   }
 
-  private mapMediaItemForSection(item: Record<string, any>) {
+  private mapMediaItemForSection(
+    item: Record<string, any>,
+    presignedUrls?: Map<string, string>,
+  ) {
+    // 读路径传 presignedUrls → url/posterUrl 换成短时签名 URL。写路径（resolveSectionMediaItems）
+    // 不传 → 存持久 base url。两处都 stripQuery：写路径把客户端 edit 回传的签名 query 去掉只存
+    // base；读路径 presign 未命中时也回落到 base（不把过期签名当持久值）。
+    const stripQuery = (value: unknown) =>
+      typeof value === 'string' ? value.split('?')[0] : value;
+    const url =
+      presignedUrls && typeof item.url === 'string'
+        ? (presignedUrls.get(item.url) ?? stripQuery(item.url))
+        : stripQuery(item.url);
+    const posterUrl =
+      presignedUrls && typeof item.posterUrl === 'string'
+        ? (presignedUrls.get(item.posterUrl) ?? stripQuery(item.posterUrl))
+        : stripQuery(item.posterUrl);
     return {
       ...(item.id ? { id: item.id } : {}),
       type: item.type,
       objectKey: item.objectKey,
-      url: item.url,
+      url,
       ...(item.mimeType != null ? { mimeType: item.mimeType } : {}),
       ...(item.size != null ? { size: item.size } : {}),
       ...(item.width != null ? { width: item.width } : {}),
       ...(item.height != null ? { height: item.height } : {}),
       ...(item.durationMs != null ? { durationMs: item.durationMs } : {}),
-      ...(item.posterUrl != null ? { posterUrl: item.posterUrl } : {}),
+      ...(item.posterUrl != null ? { posterUrl } : {}),
       sortOrder: item.sortOrder ?? 0,
     };
   }
@@ -962,6 +982,18 @@ export class NoteService {
           : this.deriveMediaFromBlocks(blocks);
     }
 
+    // 客户端 edit 时会回传读到的签名 url；写入前 strip 掉 query，只存持久 base url
+    //（读取时才现签短时 URL）。base url 本无 query，strip 无副作用。
+    derivedMedia = derivedMedia.map((item) => ({
+      ...item,
+      url: typeof item.url === 'string' ? item.url.split('?')[0] : item.url,
+      ...(typeof (item as { posterUrl?: unknown }).posterUrl === 'string'
+        ? {
+            posterUrl: (item as { posterUrl: string }).posterUrl.split('?')[0],
+          }
+        : {}),
+    }));
+
     const derivedContent =
       blocks.length > 0
         ? extractedText.join(' ').trim() ||
@@ -990,7 +1022,10 @@ export class NoteService {
     return Boolean(value && typeof value === 'object' && !Array.isArray(value));
   }
 
-  private buildSectionsFromRow(note: NoteRow): NoteSections {
+  private buildSectionsFromRow(
+    note: NoteRow,
+    presignedUrls?: Map<string, string>,
+  ): NoteSections {
     const stored = this.isRecord(note.sections) ? note.sections : {};
     const storedText = this.isRecord(stored.text) ? stored.text : {};
     const storedMedia = this.isRecord(stored.media) ? stored.media : {};
@@ -1003,19 +1038,22 @@ export class NoteService {
     const hasExplicitMedia = Array.isArray(storedMedia.items);
     const hasExplicitShowcase = Array.isArray(storedShowcase.items);
     const mediaItems = hasExplicitMedia
-      ? storedMedia.items
+      ? // 坑：已存的 sections JSON items 是原样返回的，其冻结 url 也必须重签。
+        this.applyPresignedToItems(storedMedia.items, presignedUrls)
       : hasExplicitShowcase
         ? []
         : (note.media ?? []).map((item) =>
-            this.mapMediaItemForSection(item as any),
+            this.mapMediaItemForSection(item as any, presignedUrls),
           );
     const showcaseItems = hasExplicitShowcase
-      ? storedShowcase.items
+      ? this.applyPresignedToItems(storedShowcase.items, presignedUrls)
       : hasExplicitMedia
         ? []
         : (note.media ?? [])
             .filter((item) => item.type === 'IMAGE')
-            .map((item) => this.mapMediaItemForSection(item as any));
+            .map((item) =>
+              this.mapMediaItemForSection(item as any, presignedUrls),
+            );
     let contentJson: unknown[] | null = null;
     if (Array.isArray(storedText.contentJson)) {
       contentJson = storedText.contentJson;
@@ -1093,14 +1131,18 @@ export class NoteService {
     }
   }
 
-  private mapSummary(note: NoteRow, viewerID: string): NoteSummaryDto {
+  private mapSummary(
+    note: NoteRow,
+    viewerID: string,
+    presignedUrls?: Map<string, string>,
+  ): NoteSummaryDto {
     const groups = (note.groupMemberships ?? []).map((membership: any) => ({
       id: membership.group.id,
       name: membership.group.name,
     }));
     const fallbackCoverMedia = note.media?.[0] ?? null;
     const coverMedia = note.coverMedia ?? fallbackCoverMedia;
-    const sections = this.buildSectionsFromRow(note);
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     const availability = this.getSectionAvailability(sections);
 
     return {
@@ -1117,7 +1159,10 @@ export class NoteService {
         ? {
             id: coverMedia.id,
             type: coverMedia.type,
-            url: coverMedia.url,
+            url:
+              (presignedUrls && typeof coverMedia.url === 'string'
+                ? presignedUrls.get(coverMedia.url)
+                : undefined) ?? coverMedia.url,
           }
         : null,
       imageCount: note.imageCount,
@@ -1135,27 +1180,145 @@ export class NoteService {
     };
   }
 
-  private mapDetail(note: NoteRow, viewerID: string): NoteDetailDto {
-    const sections = this.buildSectionsFromRow(note);
+  private mapDetail(
+    note: NoteRow,
+    viewerID: string,
+    presignedUrls?: Map<string, string>,
+  ): NoteDetailDto {
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     return {
-      ...this.mapSummary(note, viewerID),
+      ...this.mapSummary(note, viewerID, presignedUrls),
       content: note.content ?? null,
       contentJson: Array.isArray(note.contentJson) ? note.contentJson : null,
       media: (note.media ?? []).map((item) => ({
         id: item.id,
         type: item.type,
         objectKey: item.objectKey,
-        url: item.url,
+        url:
+          (presignedUrls && typeof item.url === 'string'
+            ? presignedUrls.get(item.url)
+            : undefined) ?? item.url,
         mimeType: item.mimeType ?? null,
         size: item.size ?? null,
         width: item.width ?? null,
         height: item.height ?? null,
         durationMs: item.durationMs ?? null,
-        posterUrl: item.posterUrl ?? null,
+        posterUrl:
+          presignedUrls && typeof item.posterUrl === 'string'
+            ? (presignedUrls.get(item.posterUrl) ?? item.posterUrl)
+            : (item.posterUrl ?? null),
         sortOrder: item.sortOrder,
       })),
       sections,
     };
+  }
+
+  // ── presign-on-read（私有笔记媒体不再匿名公开，读取时现签短时 URL）─────────
+
+  // 从一个 note row 收集所有需现签的 (base url, object key)：media 行的 url/objectKey +
+  // poster(从 url 反推 key) + sections JSON verbatim items 里冻结的 url/objectKey。
+  private collectNoteMediaTargets(
+    note: NoteRow,
+  ): { url: string; objectKey: string }[] {
+    const out: { url: string; objectKey: string }[] = [];
+    const add = (url: unknown, key: unknown) => {
+      if (typeof url === 'string' && url && typeof key === 'string' && key) {
+        out.push({ url, objectKey: key });
+      }
+    };
+    for (const m of note.media ?? []) {
+      add(m.url, m.objectKey);
+      add(m.posterUrl, this.uploadService?.objectKeyFromPublicUrl(m.posterUrl));
+    }
+    const stored = this.isRecord(note.sections) ? note.sections : {};
+    for (const section of ['media', 'showcase'] as const) {
+      const s = this.isRecord(stored[section]) ? stored[section] : {};
+      if (Array.isArray(s.items)) {
+        for (const item of s.items) {
+          if (!this.isRecord(item)) continue;
+          add(item.url, item.objectKey);
+          add(
+            item.posterUrl,
+            this.uploadService?.objectKeyFromPublicUrl(item.posterUrl),
+          );
+        }
+      }
+    }
+    return out;
+  }
+
+  // 给一批 (base url, object key) 现签短时 URL → Map<base url, signed url>。signingDate 舍入
+  // 到窗口 → 同窗口签出字节相同 URL（缓存稳定）。uploadService 未注入/单个失败 → 略过，由
+  // map 函数 fallback 回 base url（MinIO 未配置时不崩）。
+  private async presignNoteMedia(
+    targets: { url: string; objectKey: string }[],
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!this.uploadService || !targets.length) return map;
+    // 同 base url 去重（同图可能出现在 media 行 + sections JSON 两处）。
+    const byUrl = new Map<string, string>();
+    for (const t of targets) byUrl.set(t.url, t.objectKey);
+    const signingDate = new Date(
+      Math.floor(Date.now() / NOTE_MEDIA_URL_WINDOW_MS) *
+        NOTE_MEDIA_URL_WINDOW_MS,
+    );
+    await Promise.all(
+      [...byUrl.entries()].map(async ([url, key]) => {
+        try {
+          const signed = await this.uploadService!.createPresignedGetUrl(
+            key,
+            NOTE_MEDIA_URL_TTL_SECONDS,
+            signingDate,
+          );
+          map.set(url, signed.url);
+        } catch {
+          /* MinIO 未配置 / 单个失败 → 略过，fallback base url */
+        }
+      }),
+    );
+    return map;
+  }
+
+  // 对已存的 sections JSON items（url 是写时冻结的 base url）就地换成签名 URL。
+  private applyPresignedToItems(
+    items: unknown,
+    presignedUrls?: Map<string, string>,
+  ): Array<Record<string, unknown>> {
+    if (!Array.isArray(items)) return [];
+    const rows = items as Array<Record<string, unknown>>;
+    if (!presignedUrls) return rows;
+    return rows.map((item) => {
+      if (!this.isRecord(item)) return item;
+      const next: Record<string, unknown> = { ...item };
+      if (typeof item.url === 'string') {
+        next.url = presignedUrls.get(item.url) ?? item.url;
+      }
+      if (typeof item.posterUrl === 'string') {
+        next.posterUrl = presignedUrls.get(item.posterUrl) ?? item.posterUrl;
+      }
+      return next;
+    });
+  }
+
+  // 读取入口用这三个 wrapper：先批量 presign，再同步 map（写路径不经过这里，存 base url）。
+  private async mapDetailResolved(
+    note: NoteRow,
+    viewerID: string,
+  ): Promise<NoteDetailDto> {
+    const presigned = await this.presignNoteMedia(
+      this.collectNoteMediaTargets(note),
+    );
+    return this.mapDetail(note, viewerID, presigned);
+  }
+
+  private async mapSummaryListResolved(
+    notes: NoteRow[],
+    viewerID: string,
+  ): Promise<NoteSummaryDto[]> {
+    const presigned = await this.presignNoteMedia(
+      notes.flatMap((note) => this.collectNoteMediaTargets(note)),
+    );
+    return notes.map((note) => this.mapSummary(note, viewerID, presigned));
   }
 
   private mapGroup(group: NoteGroupRow): NoteGroupDto {
@@ -1245,7 +1408,7 @@ export class NoteService {
       });
     });
 
-    return this.mapDetail(created, ownerID);
+    return this.mapDetailResolved(created, ownerID);
   }
 
   async listNotes(
@@ -1297,7 +1460,7 @@ export class NoteService {
       skip: ((query.page ?? 1) - 1) * (query.limit ?? 50),
     });
 
-    return notes.map((note) => this.mapSummary(note, ownerID));
+    return this.mapSummaryListResolved(notes, ownerID);
   }
 
   async createShareLink(
@@ -1402,9 +1565,7 @@ export class NoteService {
 
     return {
       title: link.title,
-      notes: notes.map((note) =>
-        this.mapSummary(note, SHARE_LINK_GUEST_VIEWER),
-      ),
+      notes: await this.mapSummaryListResolved(notes, SHARE_LINK_GUEST_VIEWER),
       expiresAt: link.expiresAt,
     };
   }
@@ -1557,7 +1718,7 @@ export class NoteService {
       });
     }
 
-    return this.mapDetail(note, ownerID);
+    return this.mapDetailResolved(note, ownerID);
   }
 
   private buildCollectedFrom(
@@ -1644,7 +1805,7 @@ export class NoteService {
       include: NOTE_INCLUDE,
     });
     return {
-      note: this.mapDetail(refreshed, userID),
+      note: await this.mapDetailResolved(refreshed, userID),
       alreadyCollected: true,
     };
   }
@@ -1680,7 +1841,10 @@ export class NoteService {
     // 自己的笔记本来就在"我的笔记"里 —— 不复制、不打来源标（来源名片只对
     // 收藏他人笔记有意义）。
     if (source.ownerID === userID) {
-      return { note: this.mapDetail(source, userID), alreadyCollected: true };
+      return {
+        note: await this.mapDetailResolved(source, userID),
+        alreadyCollected: true,
+      };
     }
 
     const collectedFrom = this.buildCollectedFrom(dto.source, source);
@@ -1755,7 +1919,10 @@ export class NoteService {
         });
       });
 
-      return { note: this.mapDetail(created, userID), alreadyCollected: false };
+      return {
+        note: await this.mapDetailResolved(created, userID),
+        alreadyCollected: false,
+      };
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
         const refreshed = await this.refreshCollectedNote(
@@ -1985,7 +2152,7 @@ export class NoteService {
       });
     });
 
-    return this.mapDetail(updated, ownerID);
+    return this.mapDetailResolved(updated, ownerID);
   }
 
   /**
