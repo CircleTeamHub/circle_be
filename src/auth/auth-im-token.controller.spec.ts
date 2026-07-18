@@ -9,6 +9,7 @@ import { AuthController, IM_TOKEN_RATE_LIMIT } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './auth.strategy';
 import { SessionRevocationService } from './session-revocation.service';
+import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
 
 const TEST_SECRET = 'im-token-spec-secret';
 const IM_TOKEN_ROUTE = '/auth/im-token';
@@ -47,6 +48,7 @@ describe('AuthController GET /auth/im-token', () => {
       controllers: [AuthController],
       providers: [
         { provide: AuthService, useValue: authService },
+        ImTokenThrottlerGuard,
         JwtStrategy,
         JwtService,
         {
@@ -224,5 +226,34 @@ describe('AuthController GET /auth/im-token', () => {
     expect(statuses.slice(IM_TOKEN_RATE_LIMIT)).toEqual([429, 429]);
     // The throttled calls must never have reached OpenIM.
     expect(authService.getImToken).toHaveBeenCalledTimes(IM_TOKEN_RATE_LIMIT);
+  });
+
+  it('gives authenticated users behind the same IP independent budgets', async () => {
+    const tokenA = signToken({
+      sub: 'user-a',
+      accountId: 'acct-a',
+      role: 'user',
+    });
+    const tokenB = signToken({
+      sub: 'user-b',
+      accountId: 'acct-b',
+      role: 'user',
+    });
+    const send = (token: string) =>
+      request(app.getHttpServer())
+        .get(IM_TOKEN_ROUTE)
+        .set('Authorization', `Bearer ${token}`);
+
+    for (let i = 0; i < IM_TOKEN_RATE_LIMIT; i += 1) {
+      await send(tokenA).expect(200);
+    }
+    for (let i = 0; i < IM_TOKEN_RATE_LIMIT; i += 1) {
+      await send(tokenB).expect(200);
+    }
+    await send(tokenA).expect(429);
+
+    expect(authService.getImToken).toHaveBeenCalledTimes(
+      IM_TOKEN_RATE_LIMIT * 2,
+    );
   });
 });
