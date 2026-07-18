@@ -185,6 +185,7 @@ export const NoteErrorCode = {
   // - 主人侧吊销：链接不存在 / 不属于当前用户，同样共用一个码，不泄漏 id 是否存在。
   // 客户端应按「链接已失效」提示，不要复用笔记的「笔记不存在」文案。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
+  ShareLinkInvalidCursor: 'NOTE_SHARE_LINK_INVALID_CURSOR',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。

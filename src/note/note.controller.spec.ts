@@ -113,10 +113,13 @@ describe('NoteController', () => {
     noteService.listShareLinks.mockResolvedValueOnce(links);
     const controller = new NoteController(noteService as any);
 
-    const result = await controller.listShareLinks({ page: 2 } as any, req);
+    const result = await controller.listShareLinks(
+      { cursor: '11111111-1111-4111-8111-111111111111' },
+      req,
+    );
 
     expect(noteService.listShareLinks).toHaveBeenCalledWith('user-1', {
-      page: 2,
+      cursor: '11111111-1111-4111-8111-111111111111',
     });
     expect(result).toEqual(links);
   });

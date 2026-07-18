@@ -72,14 +72,17 @@ describe('note share-link management routing', () => {
     expect(noteService.getNote).not.toHaveBeenCalled();
   });
 
-  it('passes share link paging params through from the query string', async () => {
-    const res = await fetch(`${baseUrl}/note/share-links?page=2&limit=20`);
+  it('passes share link cursor params through from the query string', async () => {
+    const cursor = '11111111-1111-4111-8111-111111111111';
+    const res = await fetch(
+      `${baseUrl}/note/share-links?cursor=${cursor}&limit=20`,
+    );
 
     expect(res.status).toBe(200);
     // 本测试的 app 没挂全局 ValidationPipe（enableImplicitConversion），所以这里
     // 拿到的是字符串；真实进程里 setup.ts 的 pipe 会按 DTO 上的类型转成 number。
     expect(noteService.listShareLinks).toHaveBeenCalledWith('user-1', {
-      page: '2',
+      cursor,
       limit: '20',
     });
   });

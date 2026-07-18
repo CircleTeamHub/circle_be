@@ -218,7 +218,7 @@ const SHARE_LINK_GUEST_VIEWER = '';
 
 // 列出分享链接的默认每页条数（对齐 listNotes）。链接行数没有上界（docs 第 3 节的
 // 每用户上限还没做），不设 take 会一次性把该用户全部历史链接拉进内存。
-// 每页上限 200 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
+// 每页上限 100 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
 const SHARE_LINK_LIST_DEFAULT_LIMIT = 50;
 const PDF_FONT_CANDIDATES = [
   '/Library/Fonts/Arial Unicode.ttf',
@@ -1493,9 +1493,8 @@ export class NoteService {
    * 已吊销 / 已过期的链接也会返回：revokedAt 与 expiresAt 都在 DTO 上，由客户端
    * 决定怎么展示；服务端先过滤掉会让这两个字段在响应里恒为 null。
    *
-   * 分页（page/limit，默认值同 listNotes）不是锦上添花：吊销只能靠本接口拿 id，
-   * 只返回固定条数的话，链接数超过一屏之后较老但仍然有效的链接会被较新的
-   * （哪怕已吊销的）挤出去，从而看不到、也就吊销不了。
+   * 分页使用最后一条链接 id 作为 cursor，并按 createdAt/id 稳定排序。吊销只能
+   * 靠本接口拿 id，所以每一页必须能稳定抵达较老的有效链接。
    * 与 listNotes 一致返回裸数组、不带 total：客户端按「返回条数 < limit」判末页。
    */
   async listShareLinks(
@@ -1503,11 +1502,31 @@ export class NoteService {
     query: ListNoteShareLinksQueryDto,
   ): Promise<NoteShareLinkDto[]> {
     const limit = query.limit ?? SHARE_LINK_LIST_DEFAULT_LIMIT;
+    const anchor = query.cursor
+      ? await this.prisma.noteShareLink.findFirst({
+          where: { id: query.cursor, ownerID },
+          select: { id: true, createdAt: true },
+        })
+      : null;
+    if (query.cursor && !anchor) {
+      throw new BadRequestException({
+        message: 'Invalid note share-link cursor',
+        errorCode: NoteErrorCode.ShareLinkInvalidCursor,
+      });
+    }
+
     const rows = await this.prisma.noteShareLink.findMany({
-      where: { ownerID },
-      orderBy: { createdAt: 'desc' },
+      where: anchor
+        ? {
+            ownerID,
+            OR: [
+              { createdAt: { lt: anchor.createdAt } },
+              { createdAt: anchor.createdAt, id: { lt: anchor.id } },
+            ],
+          }
+        : { ownerID },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit,
-      skip: ((query.page ?? 1) - 1) * limit,
       // 只取 mapShareLink 用得上的列：title / noteIDs / search 等快照字段不进
       // DTO，没必要拉出来。给 mapShareLink 的入参加字段时这里会编译报错，
       // 正好当作「别忘了同步」的提醒。
