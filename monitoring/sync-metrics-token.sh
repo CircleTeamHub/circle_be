@@ -19,8 +19,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ENV_FILE="${ENV_FILE:-.env.production}"
-TOKEN_FILE="monitoring/prometheus/metrics_token"
-PROM_UID=65534
+TOKEN_FILE="${TOKEN_FILE:-monitoring/prometheus/metrics_token}"
+PROM_UID="${PROM_UID:-65534}"
+PROM_GID="${PROM_GID:-$PROM_UID}"
+SUDO="${SUDO:-sudo}"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "❌ $ENV_FILE not found. Run deploy/gen-env.sh first (see DEPLOY.md §4)." >&2
@@ -59,25 +61,44 @@ if [ -d "$TOKEN_FILE" ]; then
   }
 fi
 
+token_dir="$(dirname "$TOKEN_FILE")"
+token_name="$(basename "$TOKEN_FILE")"
 umask 077
-printf '%s' "$token" > "$TOKEN_FILE"
-chmod 600 "$TOKEN_FILE"
+temp_file="$(mktemp "$token_dir/.${token_name}.tmp.XXXXXX")"
+staged_file="${temp_file}.staged"
 
-# Prometheus must be able to read it as uid 65534. chown needs root; if we are
-# not root, say exactly what to run rather than silently leaving a file that
-# only produces 401s later.
+cleanup() {
+  rm -f "$temp_file"
+  if [ -e "$staged_file" ]; then
+    if [ "$(id -u)" = "0" ]; then
+      rm -f "$staged_file"
+    elif command -v "$SUDO" >/dev/null 2>&1 && "$SUDO" -n true 2>/dev/null; then
+      "$SUDO" -n rm -f "$staged_file"
+    fi
+  fi
+}
+trap cleanup EXIT
+
+printf '%s' "$token" > "$temp_file"
+chmod 600 "$temp_file"
+
+# Never truncate TOKEN_FILE as the deployment user: after the first sync it is
+# deliberately 0600 and owned by Prometheus. Stage the new inode with the final
+# ownership, then replace the path atomically with privileged rename.
 if [ "$(id -u)" = "0" ]; then
-  chown "$PROM_UID:$PROM_UID" "$TOKEN_FILE"
-  echo "✅ wrote $TOKEN_FILE (0600, owned by $PROM_UID)"
-elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-  sudo chown "$PROM_UID:$PROM_UID" "$TOKEN_FILE"
-  echo "✅ wrote $TOKEN_FILE (0600, owned by $PROM_UID)"
+  install -m 600 -o "$PROM_UID" -g "$PROM_GID" "$temp_file" "$staged_file"
+  mv -f "$staged_file" "$TOKEN_FILE"
+elif command -v "$SUDO" >/dev/null 2>&1 && "$SUDO" -n true 2>/dev/null; then
+  "$SUDO" -n install -m 600 -o "$PROM_UID" -g "$PROM_GID" \
+    "$temp_file" "$staged_file"
+  "$SUDO" -n mv -f "$staged_file" "$TOKEN_FILE"
 else
-  echo "✅ wrote $TOKEN_FILE (0600, owned by $(id -un))"
-  echo "⚠️  Prometheus runs as uid $PROM_UID and cannot read a 0600 file owned by"
-  echo "    $(id -un). Unless your Docker maps users (Docker Desktop does), run:"
-  echo "      sudo chown $PROM_UID:$PROM_UID $TOKEN_FILE"
+  echo "❌ cannot install $TOKEN_FILE as uid/gid $PROM_UID:$PROM_GID." >&2
+  echo "   Configure passwordless sudo for install and mv, or run this script as root." >&2
+  exit 1
 fi
 
-echo "   Reload Prometheus to pick up a rotated token:"
-echo "     docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml restart prometheus"
+echo "✅ wrote $TOKEN_FILE (0600, owned by $PROM_UID:$PROM_GID)"
+
+echo "   Recreate Prometheus to bind the rotated token inode:"
+echo "     docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus"
