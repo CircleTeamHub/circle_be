@@ -36,6 +36,11 @@ describe('AuthController GET /auth/im-token', () => {
   const signToken = (payload: Record<string, unknown>) =>
     jwt.sign(payload, { secret: TEST_SECRET, expiresIn: '5m' });
 
+  const sendImTokenRequest = (token: string) =>
+    request(app.getHttpServer())
+      .get(IM_TOKEN_ROUTE)
+      .set('Authorization', `Bearer ${token}`);
+
   beforeEach(async () => {
     authService.getImToken.mockReset();
     authService.getImToken.mockResolvedValue({ imToken: 'im-token-xyz' });
@@ -210,14 +215,9 @@ describe('AuthController GET /auth/im-token', () => {
       accountId: 'acct-1',
       role: 'user',
     });
-    const send = () =>
-      request(app.getHttpServer())
-        .get(IM_TOKEN_ROUTE)
-        .set('Authorization', `Bearer ${token}`);
-
     const statuses: number[] = [];
     for (let i = 0; i < IM_TOKEN_RATE_LIMIT + 2; i += 1) {
-      statuses.push((await send()).status);
+      statuses.push((await sendImTokenRequest(token)).status);
     }
 
     expect(statuses.slice(0, IM_TOKEN_RATE_LIMIT)).toEqual(
@@ -239,18 +239,13 @@ describe('AuthController GET /auth/im-token', () => {
       accountId: 'acct-b',
       role: 'user',
     });
-    const send = (token: string) =>
-      request(app.getHttpServer())
-        .get(IM_TOKEN_ROUTE)
-        .set('Authorization', `Bearer ${token}`);
-
     for (let i = 0; i < IM_TOKEN_RATE_LIMIT; i += 1) {
-      await send(tokenA).expect(200);
+      await sendImTokenRequest(tokenA).expect(200);
     }
     for (let i = 0; i < IM_TOKEN_RATE_LIMIT; i += 1) {
-      await send(tokenB).expect(200);
+      await sendImTokenRequest(tokenB).expect(200);
     }
-    await send(tokenA).expect(429);
+    await sendImTokenRequest(tokenA).expect(429);
 
     expect(authService.getImToken).toHaveBeenCalledTimes(
       IM_TOKEN_RATE_LIMIT * 2,
