@@ -179,27 +179,79 @@ export class CircleService {
     query: MyCirclesQueryDto,
   ): Promise<MyCircleDto[]> {
     const { tab } = query;
+    const limit = query.limit ?? 50;
 
     if (tab === 'created') {
+      const baseWhere: Prisma.CircleWhereInput = {
+        ownerID: userId,
+        deleted: false,
+      };
+      const anchor = query.cursor
+        ? await this.prisma.circle.findFirst({
+            where: { ...baseWhere, id: query.cursor },
+            select: { id: true, createdAt: true },
+          })
+        : null;
+      if (query.cursor && !anchor) {
+        throw new BadRequestException({
+          message: 'Invalid circle cursor',
+          errorCode: CircleErrorCode.InvalidCursor,
+        });
+      }
+
       const circles = await this.prisma.circle.findMany({
-        where: { ownerID: userId, deleted: false },
-        orderBy: { createdAt: 'desc' },
+        where: anchor
+          ? {
+              ...baseWhere,
+              OR: [
+                { createdAt: { lt: anchor.createdAt } },
+                {
+                  createdAt: anchor.createdAt,
+                  id: { lt: anchor.id },
+                },
+              ],
+            }
+          : baseWhere,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
       });
       // 按定义 created === 自己是圈主。
       return circles.map((c) => ({ ...this.toCircleDto(c), myRole: 'OWNER' }));
     }
 
     const statusFilter = tab === 'joined' ? 'ACTIVE' : 'PENDING';
+    const baseWhere: Prisma.CircleMemberWhereInput = {
+      userID: userId,
+      status: statusFilter,
+      ...(tab === 'joined' ? { role: { not: 'OWNER' } } : {}),
+      circle: { deleted: false },
+    };
+    const anchor = query.cursor
+      ? await this.prisma.circleMember.findFirst({
+          where: { ...baseWhere, circleID: query.cursor },
+          select: { id: true, createdAt: true },
+        })
+      : null;
+    if (query.cursor && !anchor) {
+      throw new BadRequestException({
+        message: 'Invalid circle cursor',
+        errorCode: CircleErrorCode.InvalidCursor,
+      });
+    }
 
     const members = await this.prisma.circleMember.findMany({
-      where: {
-        userID: userId,
-        status: statusFilter,
-        ...(tab === 'joined' ? { role: { not: 'OWNER' } } : {}),
-        circle: { deleted: false },
-      },
+      where: anchor
+        ? {
+            ...baseWhere,
+            OR: [
+              { createdAt: { lt: anchor.createdAt } },
+              { createdAt: anchor.createdAt, id: { lt: anchor.id } },
+            ],
+          }
+        : baseWhere,
       include: { circle: true },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit,
     });
 
     // 角色就在 membership 行上，一并返回，省掉客户端逐个拉详情。

@@ -7,6 +7,7 @@ import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import {
+  MyCirclesQueryDto,
   SetCircleAvatarDto,
   SetCircleCoverDto,
   UploadCircleIconDto,
@@ -33,6 +34,7 @@ describe('CircleService', () => {
       deleteMany: jest.fn(),
     },
     circleMember: {
+      findFirst: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
       create: jest.fn(),
@@ -520,21 +522,22 @@ describe('CircleService', () => {
     expect(result[0].myRole).toBe('OWNER');
   });
 
-  it('returns every created circle instead of silently truncating the list', async () => {
+  it('bounds created circles and orders ties deterministically', async () => {
     prisma.circle.findMany.mockResolvedValue([]);
 
     await service.myCircles('user-1', { tab: 'created' });
 
     expect(prisma.circle.findMany).toHaveBeenCalledWith({
       where: { ownerID: 'user-1', deleted: false },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 50,
     });
   });
 
-  it('returns every joined circle instead of silently truncating the list', async () => {
+  it('uses the requested joined-circle limit and deterministic ordering', async () => {
     prisma.circleMember.findMany.mockResolvedValue([]);
 
-    await service.myCircles('user-1', { tab: 'joined' });
+    await service.myCircles('user-1', { tab: 'joined', limit: 20 });
 
     expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
       where: {
@@ -544,8 +547,131 @@ describe('CircleService', () => {
         circle: { deleted: false },
       },
       include: { circle: true },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 20,
     });
+  });
+
+  it('seeks created circles after an owner-scoped cursor', async () => {
+    const createdAt = new Date('2026-01-02T00:00:00.000Z');
+    prisma.circle.findFirst.mockResolvedValue({
+      id: '11111111-1111-4111-8111-111111111111',
+      createdAt,
+    });
+    prisma.circle.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', {
+      tab: 'created',
+      cursor: '11111111-1111-4111-8111-111111111111',
+      limit: 10,
+    });
+
+    expect(prisma.circle.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: '11111111-1111-4111-8111-111111111111',
+        ownerID: 'user-1',
+        deleted: false,
+      },
+      select: { id: true, createdAt: true },
+    });
+    expect(prisma.circle.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          ownerID: 'user-1',
+          deleted: false,
+          OR: [
+            { createdAt: { lt: createdAt } },
+            {
+              createdAt,
+              id: { lt: '11111111-1111-4111-8111-111111111111' },
+            },
+          ],
+        },
+        take: 10,
+      }),
+    );
+  });
+
+  it('seeks joined memberships using the returned circle id as cursor', async () => {
+    const createdAt = new Date('2026-01-02T00:00:00.000Z');
+    prisma.circleMember.findFirst.mockResolvedValue({
+      id: 'membership-anchor',
+      createdAt,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', {
+      tab: 'joined',
+      cursor: '22222222-2222-4222-8222-222222222222',
+    });
+
+    expect(prisma.circleMember.findFirst).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        circleID: '22222222-2222-4222-8222-222222222222',
+        status: 'ACTIVE',
+        role: { not: 'OWNER' },
+        circle: { deleted: false },
+      },
+      select: { id: true, createdAt: true },
+    });
+    expect(prisma.circleMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [
+            { createdAt: { lt: createdAt } },
+            { createdAt, id: { lt: 'membership-anchor' } },
+          ],
+        }),
+        take: 50,
+      }),
+    );
+  });
+
+  it('rejects a created-circle cursor outside the owner scope', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.myCircles('user-1', {
+        tab: 'created',
+        cursor: '33333333-3333-4333-8333-333333333333',
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_INVALID_CURSOR' },
+    });
+
+    expect(prisma.circle.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('MyCirclesQueryDto validation', () => {
+  const parse = (query: Record<string, unknown>) =>
+    plainToInstance(MyCirclesQueryDto, query, {
+      enableImplicitConversion: true,
+    });
+
+  it('accepts an optional UUID cursor and bounded numeric limit', () => {
+    const dto = parse({
+      tab: 'joined',
+      cursor: '11111111-1111-4111-8111-111111111111',
+      limit: '100',
+    });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.limit).toBe(100);
+  });
+
+  it('rejects malformed cursors and limits above 100', () => {
+    expect(
+      validateSync(parse({ tab: 'joined', cursor: 'not-a-uuid' })).some(
+        (error) => error.property === 'cursor',
+      ),
+    ).toBe(true);
+    expect(
+      validateSync(parse({ tab: 'joined', limit: '101' })).some(
+        (error) => error.property === 'limit',
+      ),
+    ).toBe(true);
   });
 });
 

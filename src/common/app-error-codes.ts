@@ -60,6 +60,7 @@ export const CircleErrorCode = {
   JoinFancyNumberRequired: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED',
   ListItemBlank: 'CIRCLE_LIST_ITEM_BLANK',
   ListItemDuplicate: 'CIRCLE_LIST_ITEM_DUPLICATE',
+  InvalidCursor: 'CIRCLE_INVALID_CURSOR',
 } as const;
 
 export const GroupErrorCode = {
