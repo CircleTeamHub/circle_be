@@ -26,7 +26,8 @@ prom_uid=65534
 prom_gid=65534
 using_fake_sudo=0
 
-if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
+if [ "$(id -u)" != "0" ] &&
+  { ! command -v sudo >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; }; then
   mkdir -p "$fake_bin"
   cat > "$fake_bin/sudo" <<'SH'
 #!/usr/bin/env bash
@@ -74,16 +75,18 @@ printf '%s\n' 'working-token' > "$token_file"
 chmod 600 "$token_file"
 printf '%s\n' 'METRICS_AUTH_TOKEN=must-not-replace' > "$env_file"
 
-if ENV_FILE="$env_file" \
-  TOKEN_FILE="$token_file" \
-  PROM_UID="$prom_uid" \
-  PROM_GID="$prom_gid" \
-  SUDO=false \
-  bash "$script"; then
-  echo 'expected sync to fail when privilege is unavailable' >&2
-  exit 1
-fi
+if [ "$(id -u)" != "0" ]; then
+  if ENV_FILE="$env_file" \
+    TOKEN_FILE="$token_file" \
+    PROM_UID="$prom_uid" \
+    PROM_GID="$prom_gid" \
+    SUDO=false \
+    bash "$script"; then
+    echo 'expected sync to fail when privilege is unavailable' >&2
+    exit 1
+  fi
 
-test "$(cat "$token_file")" = 'working-token'
+  test "$(cat "$token_file")" = 'working-token'
+fi
 
 echo 'sync-metrics-token regression tests passed'
