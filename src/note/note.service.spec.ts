@@ -59,6 +59,12 @@ describe('NoteService', () => {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
     createPresignedGetUrl: jest.fn(),
+    // 反推 object key（真 UploadService 的行为）：从本站直链 .../circle/<key>[?...] 取 <key>。
+    objectKeyFromPublicUrl: jest.fn((url: unknown) =>
+      typeof url === 'string'
+        ? (url.split('/circle/')[1]?.split('?')[0] ?? null)
+        : null,
+    ),
   };
 
   beforeEach(async () => {
@@ -569,7 +575,26 @@ describe('NoteService', () => {
         expect.objectContaining({ type: 'VIDEO', sortOrder: 1 }),
       ]),
     });
-    expect((result as any).sections).toEqual(sections);
+    // presign-on-read：写库存的是 base url（上面 prisma.note.create 已断言），返回给客户端的
+    // sections media/showcase url 换成按 objectKey 现签的短时签名 URL；posterUrl 不在本站
+    // /circle/ 前缀下、反推不出 key，保持原值。
+    const toSigned = (items: any[]) =>
+      (items ?? []).map((i: any) =>
+        i.objectKey
+          ? {
+              ...i,
+              url: `https://signed.example.com/${i.objectKey}?expires=7200`,
+            }
+          : i,
+      );
+    expect((result as any).sections).toEqual({
+      ...sections,
+      media: { ...sections.media, items: toSigned(sections.media.items) },
+      showcase: {
+        ...sections.showcase,
+        items: toSigned(sections.showcase.items),
+      },
+    });
     expect(result).toMatchObject({
       hasText: true,
       imageCount: 1,
@@ -577,6 +602,59 @@ describe('NoteService', () => {
       showcaseCount: 1,
       hasLocation: true,
     });
+  });
+
+  it('strips signed-url query before persisting note media (edit round-trip)', async () => {
+    // 客户端 edit 时回传的是读到的短时签名 url；写库必须只存 base url，读取时才现签。
+    const signed =
+      'https://cdn.example.com/notes/user-1/a.jpg?X-Amz-Signature=old&X-Amz-Date=1';
+    const base = 'https://cdn.example.com/notes/user-1/a.jpg';
+    const row = {
+      id: 'n1',
+      ownerID: 'user-1',
+      title: 't',
+      content: 'c',
+      contentJson: null,
+      sections: {},
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      createdAt: new Date('2026-04-09T00:00:00.000Z'),
+      updatedAt: new Date('2026-04-09T00:00:00.000Z'),
+    };
+    prisma.note.create.mockResolvedValueOnce(row);
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 1 });
+    prisma.note.update.mockResolvedValueOnce({
+      ...row,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [],
+    });
+
+    await service.createNote('user-1', {
+      title: 't',
+      content: 'c',
+      media: [
+        {
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/a.jpg',
+          url: signed,
+          sortOrder: 0,
+        },
+      ],
+    } as any);
+
+    // NoteMedia 行存 base url（签名 query 已被 strip）。
+    const rows = prisma.noteMedia.createMany.mock.calls[0][0].data;
+    expect(rows[0].url).toBe(base);
+    // sections JSON 里也不落签名。
+    const storedSections = JSON.stringify(
+      prisma.note.create.mock.calls[0][0].data.sections,
+    );
+    expect(storedSections).not.toContain('X-Amz-Signature');
   });
 
   it('rejects structured section media that is not part of the validated note media set', async () => {

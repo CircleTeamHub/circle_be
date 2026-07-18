@@ -1,9 +1,10 @@
 # 笔记媒体 Presign-on-Read（私有媒体 P0 修复规格）
 
-> 状态：**WIP**。Step 1（bucket policy）已在本分支实现并 TDD 通过；Step 2+（presign-on-read）待做。
-> **本分支不能单独合并**——只移除 bucket policy 会让所有笔记图立刻 404。必须整份做完再 ship。
+> 状态：**已实现**（Step 1-7 全部完成，本分支）。后端全量测试通过（1114 passed / 0 fail）、typecheck + lint 干净。
+> 客户端显示对 presign-on-read 透明，无需改（Step 8）。本文档保留作为设计记录 + reviewer 蓝图。
 >
-> 这份文档自包含，下个 session 可从 `origin/main` 冷启动执行整个规格（Step 1 的代码也在此，照抄即可）。
+> 实现要点与规格一致，唯一微调：`objectKeyFromPublicUrl` 放在 UploadService（规格建议）；presign map 的 key
+> 用 base url（而非 objectKey），让读路径 map 函数只需 `map.get(url) ?? url`、无需在读路径反推 key。
 
 ## 问题（P0）
 

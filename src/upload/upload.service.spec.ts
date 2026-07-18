@@ -224,4 +224,73 @@ describe('UploadService', () => {
     ).rejects.toThrow('Object exceeds maximum download size');
     expect(destroy).toHaveBeenCalled();
   });
+
+  it('createPresignedGetUrl forwards a fixed signingDate so windowed URLs stay byte-identical', async () => {
+    const signedUrlMock = jest.mocked(getSignedUrl);
+    signedUrlMock.mockClear();
+    signedUrlMock.mockResolvedValueOnce(
+      `${privateMinioUrl}/circle/notes/u/x.jpg?X-Amz-Signature=abc`,
+    );
+    const service = new UploadService({
+      get: (key: string) =>
+        (
+          ({
+            MINIO_ENDPOINT: 'http://localhost:9000',
+            MINIO_ACCESS_KEY: 'minioadmin',
+            MINIO_SECRET_KEY: 'minioadmin123',
+            MINIO_BUCKET: 'circle',
+            MINIO_PUBLIC_URL: privateMinioUrl,
+          }) as Record<string, string>
+        )[key] ?? null,
+    } as any);
+
+    const signingDate = new Date('2026-07-17T10:00:00.000Z');
+    const result = await service.createPresignedGetUrl(
+      'notes/u/x.jpg',
+      7200,
+      signingDate,
+    );
+
+    // 传入固定 signingDate → 同窗口内同一 key 的 X-Amz-Date/签名不变 → URL 字节相同，
+    // 客户端(expo-image)按-URL 缓存才能命中，否则每次刷新重下所有笔记图。
+    expect(signedUrlMock.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({ expiresIn: 7200, signingDate }),
+    );
+    expect(result.url).toBe(
+      `${privateMinioUrl}/circle/notes/u/x.jpg?X-Amz-Signature=abc`,
+    );
+  });
+
+  it('objectKeyFromPublicUrl reverses a fileUrl and strips any signature query', () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        (
+          ({
+            MINIO_ENDPOINT: 'http://localhost:9000',
+            MINIO_ACCESS_KEY: 'minioadmin',
+            MINIO_SECRET_KEY: 'minioadmin123',
+            MINIO_BUCKET: 'circle',
+            MINIO_PUBLIC_URL: privateMinioUrl,
+          }) as Record<string, string>
+        )[key] ?? null,
+    } as any);
+
+    expect(
+      service.objectKeyFromPublicUrl(`${privateMinioUrl}/circle/notes/u/x.jpg`),
+    ).toBe('notes/u/x.jpg');
+    // 读取路径给回的会是签名 url，反推 key 时必须 strip query。
+    expect(
+      service.objectKeyFromPublicUrl(
+        `${privateMinioUrl}/circle/notes/u/x.jpg?X-Amz-Signature=abc&X-Amz-Date=1`,
+      ),
+    ).toBe('notes/u/x.jpg');
+    // off-origin / 空 → null（不误把外链当成本站 key）。
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://evil.example.com/circle/notes/x.jpg',
+      ),
+    ).toBeNull();
+    expect(service.objectKeyFromPublicUrl(null)).toBeNull();
+    expect(service.objectKeyFromPublicUrl(undefined)).toBeNull();
+  });
 });
