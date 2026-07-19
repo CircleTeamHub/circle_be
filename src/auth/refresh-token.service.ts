@@ -169,17 +169,31 @@ export class RefreshTokenService {
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; sessionId: string }> {
-    const session = await this.prisma.$transaction(async (tx) => {
+    const replacement = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-      await tx.refreshToken.updateMany({
+      const revokedSessions = await tx.refreshToken.updateManyAndReturn({
         where: { userId, revokedAt: null },
         data: { revokedAt: new Date() },
+        select: { id: true },
       });
-      return this.createWithClient(tx, userId, context, audience);
+      const session = await this.createWithClient(
+        tx,
+        userId,
+        context,
+        audience,
+      );
+      return {
+        session,
+        revokedSessionIds: revokedSessions.map(({ id }) => id),
+      };
     });
-    await this.revocation.revokeUser(userId);
-    return session;
+    await Promise.all(
+      replacement.revokedSessionIds.map((sessionId) =>
+        this.revocation.revokeSession(sessionId),
+      ),
+    );
+    return replacement.session;
   }
 
   async rotate(

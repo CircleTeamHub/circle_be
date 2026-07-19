@@ -286,6 +286,51 @@ describe('RefreshTokenService', () => {
     expect(records[1].deviceName).toBe('replacement');
   });
 
+  it('cannot late-revoke the winning concurrent single-device session', async () => {
+    await service.create('user-1');
+    let releaseLateRevocation!: () => void;
+    const lateRevocation = new Promise<void>((resolve) => {
+      releaseLateRevocation = resolve;
+    });
+    let signalRevocationStarted!: () => void;
+    const revocationStarted = new Promise<void>((resolve) => {
+      signalRevocationStarted = resolve;
+    });
+    revocation.revokeUser.mockImplementationOnce(() => {
+      signalRevocationStarted();
+      return lateRevocation;
+    });
+    revocation.revokeSession.mockImplementationOnce(() => {
+      signalRevocationStarted();
+      return lateRevocation;
+    });
+
+    const first = service.replaceForSingleDevice(
+      'user-1',
+      { deviceName: 'first' },
+      'APP',
+    );
+    await revocationStarted;
+    const second = await service.replaceForSingleDevice(
+      'user-1',
+      { deviceName: 'second' },
+      'APP',
+    );
+    releaseLateRevocation();
+    await first;
+
+    expect(second.sessionId).toBe('session-3');
+    expect(records.filter((record) => record.revokedAt === null)).toEqual([
+      expect.objectContaining({
+        id: 'session-3',
+        deviceName: 'second',
+      }),
+    ]);
+    expect(revocation.revokeUser).not.toHaveBeenCalled();
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+  });
+
   it('does not revoke sessions when the current session id is missing', async () => {
     const now = new Date();
     records.push({
