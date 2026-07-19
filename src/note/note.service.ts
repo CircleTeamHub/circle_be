@@ -681,6 +681,45 @@ export class NoteService {
         `objectKey must start with notes/${ownerID}/`,
       );
     }
+
+    // posterUrl 没有独立的 objectKey 列，读取时要从 URL 反推 key 去签名
+    // （collectNoteMediaTargets）。若这里只校验同源而不校验属主，客户端就能在
+    // 自己的笔记上把 posterUrl 指向别人的对象，读取时换回一个有效签名 URL ——
+    // 绕开 presign-on-read 想建立的「私有媒体不可访问」。
+    const invalidPoster = media.find((item) =>
+      this.isForeignPosterKey(item.objectKey, item.posterUrl),
+    );
+    if (invalidPoster) {
+      throw new BadRequestException(
+        'posterUrl must reference the same owner as its objectKey',
+      );
+    }
+  }
+
+  /** `notes/{uid}/{file}` → `notes/{uid}/`；形状不符返回 null（不放行）。 */
+  private noteMediaOwnerPrefix(objectKey: unknown): string | null {
+    if (typeof objectKey !== 'string') return null;
+    const [root, uid] = objectKey.split('/');
+    return root === 'notes' && uid ? `notes/${uid}/` : null;
+  }
+
+  /**
+   * posterUrl 反推出的 key 是否落在该媒体自己 objectKey 的属主目录之外。
+   *
+   * 判据刻意是「与同一条媒体的 objectKey 同属主」而不是「等于笔记主人」：收藏
+   * 复制不搬运对象（collectNote 直接沿用原作者的 objectKey），按笔记主人一刀切
+   * 会把所有收藏笔记的封面弄挂。视频封面本就该躺在视频旁边。
+   *
+   * 反推不出 key（非本站 URL）时返回 false —— 那种情况由 assertMediaUrlsAreSafe
+   * 的同源检查负责，不归这里管。
+   */
+  private isForeignPosterKey(objectKey: unknown, posterUrl: unknown): boolean {
+    const posterKey = this.uploadService?.objectKeyFromPublicUrl(
+      typeof posterUrl === 'string' ? posterUrl : null,
+    );
+    if (!posterKey) return false;
+    const prefix = this.noteMediaOwnerPrefix(objectKey);
+    return !prefix || !posterKey.startsWith(prefix);
   }
 
   /**
@@ -1226,9 +1265,19 @@ export class NoteService {
         out.push({ url, objectKey: key });
       }
     };
+    /**
+     * poster 的 key 是从客户端可控的 URL 反推来的，签名前必须确认它没跨出该媒体
+     * objectKey 的属主目录。写入侧已经拦了（assertMediaOwnership），这里是纵深
+     * 防御，也用于挡住修复前就已落库的脏数据。
+     */
+    const addPoster = (posterUrl: unknown, objectKey: unknown) => {
+      if (typeof posterUrl !== 'string') return;
+      if (this.isForeignPosterKey(objectKey, posterUrl)) return;
+      add(posterUrl, this.uploadService?.objectKeyFromPublicUrl(posterUrl));
+    };
     for (const m of note.media ?? []) {
       add(m.url, m.objectKey);
-      add(m.posterUrl, this.uploadService?.objectKeyFromPublicUrl(m.posterUrl));
+      addPoster(m.posterUrl, m.objectKey);
     }
     const stored = this.isRecord(note.sections) ? note.sections : {};
     for (const section of ['media', 'showcase'] as const) {
@@ -1237,10 +1286,7 @@ export class NoteService {
         for (const item of s.items) {
           if (!this.isRecord(item)) continue;
           add(item.url, item.objectKey);
-          add(
-            item.posterUrl,
-            this.uploadService?.objectKeyFromPublicUrl(item.posterUrl),
-          );
+          addPoster(item.posterUrl, item.objectKey);
         }
       }
     }

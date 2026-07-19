@@ -2973,4 +2973,152 @@ describe('NoteService', () => {
       );
     });
   });
+
+  // ── posterUrl 的 object key 归属校验（IDOR）─────────────────────────────────
+  // presign-on-read（#74）从客户端可控的 posterUrl 反推 object key 去签名，
+  // 但写入侧 assertMediaOwnership 只校验 objectKey 的属主、posterUrl 只校验同源。
+  // 于是攻击者可以在自己的笔记里把 posterUrl 指向受害者的对象，读取时拿到一个
+  // 有效的签名 URL —— 正好绕开 #74 想堵的「私有媒体不可访问」。
+  describe('posterUrl object key ownership', () => {
+    const signedKeys = () =>
+      uploadService.createPresignedGetUrl.mock.calls.map(
+        (call: unknown[]) => call[0] as string,
+      );
+
+    const noteRow = (over: Record<string, unknown>) => ({
+      id: 'note-1',
+      ownerID: 'attacker',
+      title: 't',
+      content: 'c',
+      status: 'ACTIVE',
+      available: false,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...over,
+    });
+
+    it('does not presign a posterUrl whose object key belongs to another user', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [
+            {
+              id: 'm1',
+              type: 'IMAGE',
+              sortOrder: 0,
+              // 自己的 key —— 过得了 assertMediaOwnership
+              objectKey: 'notes/attacker/mine.jpg',
+              url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+              // 指向受害者的对象
+              posterUrl:
+                'https://minio.example.com/circle/notes/victim/secret.jpg',
+            },
+          ],
+        }),
+      );
+
+      await service.getNote('attacker', 'note-1');
+
+      expect(signedKeys()).toContain('notes/attacker/mine.jpg');
+      expect(signedKeys()).not.toContain('notes/victim/secret.jpg');
+    });
+
+    it('does not presign a foreign posterUrl frozen into the stored sections JSON', async () => {
+      // sections JSON 里的 verbatim item 走的是另一条收集路径，必须一并挡住。
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [],
+          sections: {
+            media: {
+              items: [
+                {
+                  id: 'm1',
+                  type: 'IMAGE',
+                  objectKey: 'notes/attacker/mine.jpg',
+                  url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+                  posterUrl:
+                    'https://minio.example.com/circle/notes/victim/secret.jpg',
+                },
+              ],
+            },
+          },
+        }),
+      );
+
+      await service.getNote('attacker', 'note-1');
+
+      expect(signedKeys()).not.toContain('notes/victim/secret.jpg');
+    });
+
+    it('still presigns a collected copy whose media belongs to the original author', async () => {
+      // 收藏不复制对象：collectNote 直接沿用原作者的 objectKey/posterUrl。
+      // 按「key 必须属于笔记主人」一刀切会把收藏笔记的图片全弄挂 —— 不能这么修。
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          ownerID: 'collector',
+          media: [
+            {
+              id: 'm1',
+              type: 'VIDEO',
+              sortOrder: 0,
+              objectKey: 'notes/author/clip.mp4',
+              url: 'https://minio.example.com/circle/notes/author/clip.mp4',
+              posterUrl:
+                'https://minio.example.com/circle/notes/author/clip-poster.jpg',
+            },
+          ],
+        }),
+      );
+
+      await service.getNote('collector', 'note-1');
+
+      expect(signedKeys()).toContain('notes/author/clip.mp4');
+      expect(signedKeys()).toContain('notes/author/clip-poster.jpg');
+    });
+
+    it('rejects creating a note whose posterUrl points at another user object', async () => {
+      // 备好写库 mock：这样「没拦住」时是走完流程后断言失败，而不是 mock 缺失
+      // 抛 TypeError —— 失败信息才明确指向缺失的校验本身。
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        ownerID: 'attacker',
+        title: 't',
+        content: 'c',
+        status: 'ACTIVE',
+        available: false,
+        pinned: false,
+        imageCount: 1,
+        videoCount: 0,
+        mediaCount: 1,
+        groupMemberships: [],
+        media: [],
+        coverMedia: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      await expect(
+        service.createNote('attacker', {
+          title: 't',
+          media: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/attacker/mine.jpg',
+              url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+              posterUrl:
+                'https://minio.example.com/circle/notes/victim/secret.jpg',
+              sortOrder: 0,
+            },
+          ],
+        } as never),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(prisma.note.create).not.toHaveBeenCalled();
+    });
+  });
 });
