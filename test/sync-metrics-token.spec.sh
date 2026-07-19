@@ -69,22 +69,67 @@ else
   test "$(stat -c '%g' "$token_file")" = "$expected_gid"
 fi
 
-printf '%s\n' 'working-token' > "$token_file"
-chmod 600 "$token_file"
-printf '%s\n' 'METRICS_AUTH_TOKEN=must-not-replace' > "$env_file"
+# stat is GNU on CI and BSD on a dev Mac; both spellings are needed because the
+# unprivileged path below is exactly the one a developer runs locally.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 
-if [ "$(id -u)" != "0" ]; then
+# Without privilege the two cases must diverge — collapsing them into one hard
+# failure is what made this script unrunnable during local development.
+
+# (1) Token already owned by somebody else: on a deployed host the first sync
+# ran as root, so it belongs to Prometheus. Replacing it as the deploy user
+# hands ownership over and Prometheus 401s with no symptom but dark metrics.
+# Constructing that precondition needs root, so skip where we cannot.
+# $using_fake_sudo means the stub on PATH only logs and execs — it grants no
+# privilege, so it cannot build this precondition and must not be consulted.
+foreign_file="$tmp_dir/foreign_token"
+if [ "$(id -u)" = "0" ]; then
+  install -m 600 -o 1 -g 1 /dev/null "$foreign_file" 2>/dev/null || :
+elif [ "$using_fake_sudo" != "1" ] && sudo -n true 2>/dev/null; then
+  sudo -n install -m 600 -o 1 -g 1 /dev/null "$foreign_file" 2>/dev/null || :
+fi
+
+if [ -e "$foreign_file" ] && [ ! -O "$foreign_file" ]; then
+  printf '%s\n' 'METRICS_AUTH_TOKEN=must-not-replace' > "$env_file"
   if ENV_FILE="$env_file" \
-    TOKEN_FILE="$token_file" \
+    TOKEN_FILE="$foreign_file" \
     PROM_UID="$prom_uid" \
     PROM_GID="$prom_gid" \
     SUDO=false \
     bash "$script"; then
-    echo 'expected sync to fail when privilege is unavailable' >&2
+    echo 'expected sync to refuse replacing a token owned by another user' >&2
     exit 1
   fi
-
-  test "$(cat "$token_file")" = 'working-token'
 fi
+
+# (2) Token absent or already ours: local development. Docker Desktop maps uids
+# so Prometheus can still read it; failing here only blocks bringing monitoring
+# up locally. Write it, warn loudly, exit 0.
+local_file="$tmp_dir/local_token"
+printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-token' > "$env_file"
+local_out="$(ENV_FILE="$env_file" \
+  TOKEN_FILE="$local_file" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  SUDO=false \
+  bash "$script")"
+
+test "$(cat "$local_file")" = 'local-dev-token'
+test "$(file_mode "$local_file")" = '600'
+printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+
+# Rotation still has to work on the following run — the file is ours now, which
+# must not be mistaken for the "owned by somebody else" case above.
+printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-rotated' > "$env_file"
+ENV_FILE="$env_file" \
+  TOKEN_FILE="$local_file" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  SUDO=false \
+  bash "$script" >/dev/null
+
+test "$(cat "$local_file")" = 'local-dev-rotated'
 
 echo 'sync-metrics-token regression tests passed'

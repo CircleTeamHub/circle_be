@@ -85,6 +85,8 @@ chmod 600 "$temp_file"
 # Never truncate TOKEN_FILE as the deployment user: after the first sync it is
 # deliberately 0600 and owned by Prometheus. Stage the new inode with the final
 # ownership, then replace the path atomically with privileged rename.
+owner_label="$PROM_UID:$PROM_GID"
+unprivileged=0
 if [ "$(id -u)" = "0" ]; then
   install -m 600 -o "$PROM_UID" -g "$PROM_GID" "$temp_file" "$staged_file"
   mv -f "$staged_file" "$TOKEN_FILE"
@@ -92,13 +94,32 @@ elif command -v "$SUDO" >/dev/null 2>&1 && "$SUDO" -n true 2>/dev/null; then
   "$SUDO" -n install -m 600 -o "$PROM_UID" -g "$PROM_GID" \
     "$temp_file" "$staged_file"
   "$SUDO" -n mv -f "$staged_file" "$TOKEN_FILE"
-else
-  echo "❌ cannot install $TOKEN_FILE as uid/gid $PROM_UID:$PROM_GID." >&2
+elif [ -e "$TOKEN_FILE" ] && [ ! -O "$TOKEN_FILE" ]; then
+  # On a deployed host the first sync ran as root, so the token belongs to
+  # Prometheus. Replacing it as the deploy user hands ownership to that user and
+  # Prometheus starts 401ing with no symptom other than metrics going dark.
+  # Refuse instead.
+  echo "❌ $TOKEN_FILE is owned by another user; refusing to replace it as $(id -un)." >&2
   echo "   Configure passwordless sudo for install and mv, or run this script as root." >&2
   exit 1
+else
+  # Local development, or the very first sync: still replace atomically, just
+  # owned by the current user. Docker Desktop maps uids, so Prometheus can read
+  # it there — failing hard would block bringing monitoring up locally for a
+  # problem that only exists on a real host.
+  install -m 600 "$temp_file" "$staged_file"
+  mv -f "$staged_file" "$TOKEN_FILE"
+  owner_label="$(id -un)"
+  unprivileged=1
 fi
 
-echo "✅ wrote $TOKEN_FILE (0600, owned by $PROM_UID:$PROM_GID)"
+echo "✅ wrote $TOKEN_FILE (0600, owned by $owner_label)"
+
+if [ "$unprivileged" = "1" ]; then
+  echo "⚠️  Prometheus runs as uid $PROM_UID and cannot read a 0600 file owned by"
+  echo "    $(id -un). Unless your Docker maps users (Docker Desktop does), run:"
+  echo "      sudo chown $PROM_UID:$PROM_GID $TOKEN_FILE"
+fi
 
 echo "   Recreate Prometheus to bind the rotated token inode:"
 echo "     docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus"
