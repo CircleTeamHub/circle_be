@@ -134,6 +134,8 @@ services:
       minio-init: { condition: service_completed_successfully }
     environment:
       NODE_ENV: production
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro
