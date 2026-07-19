@@ -71,6 +71,30 @@ describe('RealtimeService', () => {
     );
   });
 
+  it('subscribes to the session-revocation channel on module init', async () => {
+    await service.onModuleInit();
+
+    expect(redis.subscribePattern).toHaveBeenCalledWith(
+      'circle:realtime:revoke',
+      expect.any(Function),
+    );
+  });
+
+  it('retries only the half that failed to subscribe', async () => {
+    // Re-subscribing an already-live pattern would double-deliver every event.
+    redis.subscribePattern.mockImplementation((pattern: string) =>
+      Promise.resolve(pattern === 'circle:realtime:revoke'),
+    );
+    await service.onModuleInit();
+    expect(redis.subscribePattern).toHaveBeenCalledTimes(2);
+
+    redis.subscribePattern.mockResolvedValue(true);
+    await service['ensureBackplaneSubscription']();
+
+    const retried = redis.subscribePattern.mock.calls.slice(2);
+    expect(retried).toEqual([['circle:realtime:user:*', expect.any(Function)]]);
+  });
+
   it('builds a badge snapshot keeping interaction and signup counts separate', async () => {
     prisma.friendActivity.count.mockResolvedValue(3);
     prisma.circlePostSignup.count.mockResolvedValue(4);
@@ -408,10 +432,14 @@ describe('RealtimeService', () => {
     let handler:
       | ((channel: string, message: string) => void | Promise<void>)
       | undefined;
-    redis.subscribePattern.mockImplementation(async (_pattern, callback) => {
-      handler = callback;
-      return true;
-    });
+    redis.subscribePattern.mockImplementation(
+      async (pattern: string, callback) => {
+        // The service subscribes more than one channel; keep the realtime-event
+        // handler specifically rather than whichever registered last.
+        if (pattern === 'circle:realtime:user:*') handler = callback;
+        return true;
+      },
+    );
     await service.onModuleInit();
 
     const socket = {
@@ -451,10 +479,14 @@ describe('RealtimeService', () => {
     let handler:
       | ((channel: string, message: string) => void | Promise<void>)
       | undefined;
-    redis.subscribePattern.mockImplementation(async (_pattern, callback) => {
-      handler = callback;
-      return true;
-    });
+    redis.subscribePattern.mockImplementation(
+      async (pattern: string, callback) => {
+        // The service subscribes more than one channel; keep the realtime-event
+        // handler specifically rather than whichever registered last.
+        if (pattern === 'circle:realtime:user:*') handler = callback;
+        return true;
+      },
+    );
     await service.onModuleInit();
 
     // Capture THIS instance's origin id from the envelope it publishes.
@@ -483,10 +515,14 @@ describe('RealtimeService', () => {
     let handler:
       | ((channel: string, message: string) => void | Promise<void>)
       | undefined;
-    redis.subscribePattern.mockImplementation(async (_pattern, callback) => {
-      handler = callback;
-      return true;
-    });
+    redis.subscribePattern.mockImplementation(
+      async (pattern: string, callback) => {
+        // The service subscribes more than one channel; keep the realtime-event
+        // handler specifically rather than whichever registered last.
+        if (pattern === 'circle:realtime:user:*') handler = callback;
+        return true;
+      },
+    );
     await service.onModuleInit();
     expect(service.getCrossInstanceIgnoredCount()).toBe(0);
 
@@ -508,10 +544,14 @@ describe('RealtimeService', () => {
     let handler:
       | ((channel: string, message: string) => void | Promise<void>)
       | undefined;
-    redis.subscribePattern.mockImplementation(async (_pattern, callback) => {
-      handler = callback;
-      return true;
-    });
+    redis.subscribePattern.mockImplementation(
+      async (pattern: string, callback) => {
+        // The service subscribes more than one channel; keep the realtime-event
+        // handler specifically rather than whichever registered last.
+        if (pattern === 'circle:realtime:user:*') handler = callback;
+        return true;
+      },
+    );
     await service.onModuleInit();
     const socket = { readyState: 1, send: jest.fn() } as any;
     service.registerClient('user-1', socket);
@@ -530,15 +570,21 @@ describe('RealtimeService', () => {
   it('retries the backplane subscription when Redis is unavailable at boot', async () => {
     jest.useFakeTimers();
     try {
+      // Boot subscribes both channels; only the failing one is retried.
       redis.subscribePattern
         .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true)
         .mockResolvedValueOnce(true);
 
       await service.onModuleInit();
-      expect(redis.subscribePattern).toHaveBeenCalledTimes(1);
+      expect(redis.subscribePattern).toHaveBeenCalledTimes(2);
 
       await jest.advanceTimersByTimeAsync(1_000);
-      expect(redis.subscribePattern).toHaveBeenCalledTimes(2);
+      expect(redis.subscribePattern).toHaveBeenCalledTimes(3);
+      expect(redis.subscribePattern).toHaveBeenLastCalledWith(
+        'circle:realtime:user:*',
+        expect.any(Function),
+      );
     } finally {
       jest.useRealTimers();
     }

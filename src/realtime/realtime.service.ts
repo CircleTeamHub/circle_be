@@ -15,6 +15,31 @@ import {
   PROFILE_NOTIFICATION_TYPES,
 } from 'src/notification/notification.constants';
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
+import {
+  SESSION_REVOCATION_CHANNEL,
+  parseSessionRevocationBroadcast,
+  type SessionRevocationBroadcast,
+} from 'src/auth/session-revocation.broadcast';
+
+/**
+ * Close frame sent to a socket whose session was revoked. 1008 (policy
+ * violation) matches every other rejection in the gateway; the reason mirrors
+ * the HTTP side's `UnauthorizedException('Session revoked')` so a client can
+ * tell "you are no longer authorized, stop retrying" from a transient drop.
+ */
+export const REVOKED_CLOSE_CODE = 1008;
+export const REVOKED_CLOSE_REASON = 'Session revoked';
+
+/**
+ * Per-socket claims needed to decide whether a revocation applies, mirroring
+ * what `SessionRevocationService.isRevoked` reads off the JWT.
+ */
+export type RealtimeSocketIdentity = {
+  /** `sid` claim; null when the token predates session ids. */
+  sessionId: string | null;
+  /** `issuedAtMs` (or `iat` x1000); null when the token carries neither. */
+  issuedAtMs: number | null;
+};
 
 type BadgeSnapshot = {
   messagesUnread: number;
@@ -183,10 +208,21 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
 
   private readonly logger = new Logger(RealtimeService.name);
   private readonly clients = new Map<string, Set<WebSocket>>();
+  /** Claims per live socket, used to match incoming revocations. */
+  private readonly socketIdentities = new WeakMap<
+    WebSocket,
+    RealtimeSocketIdentity
+  >();
   private readonly instanceId = randomUUID();
   /** De-dupes concurrent cache-miss recomputes for the same key within this instance. */
   private readonly inFlightReads = new Map<string, Promise<unknown>>();
   private subscriptionActive = false;
+  /**
+   * Tracked separately so a partial failure retries only the missing half —
+   * re-subscribing an already-active pattern would double-deliver every event.
+   */
+  private eventSubscriptionActive = false;
+  private revocationSubscriptionActive = false;
   private subscriptionRetryTimer: NodeJS.Timeout | null = null;
   private subscriptionRetryAttempt = 0;
   private destroyed = false;
@@ -238,12 +274,28 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const subscribed = await this.redisService.subscribePattern(
-      RealtimeService.REDIS_CHANNEL_PATTERN,
-      (channel, message) => this.handleRedisRealtimeMessage(channel, message),
-    );
+    if (!this.eventSubscriptionActive) {
+      this.eventSubscriptionActive = await this.redisService.subscribePattern(
+        RealtimeService.REDIS_CHANNEL_PATTERN,
+        (channel, message) => this.handleRedisRealtimeMessage(channel, message),
+      );
+    }
 
-    if (subscribed) {
+    // Deliberately a second subscription rather than folding revocations into
+    // `circle:realtime:user:*`: everything on that channel is forwarded verbatim
+    // to clients (guarded by the REALTIME_EVENT_TYPES allow-list), whereas a
+    // revocation is a control-plane action that closes the socket instead. It
+    // reuses the same backplane machinery — publish, psubscribe, and the retry
+    // loop below — without widening what can reach a client.
+    if (!this.revocationSubscriptionActive) {
+      this.revocationSubscriptionActive =
+        await this.redisService.subscribePattern(
+          SESSION_REVOCATION_CHANNEL,
+          (_channel, message) => this.handleRevocationMessage(message),
+        );
+    }
+
+    if (this.eventSubscriptionActive && this.revocationSubscriptionActive) {
       this.subscriptionActive = true;
       this.subscriptionRetryAttempt = 0;
       return;
@@ -293,10 +345,17 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     return promise;
   }
 
-  registerClient(userId: string, socket: WebSocket) {
+  registerClient(
+    userId: string,
+    socket: WebSocket,
+    identity?: RealtimeSocketIdentity,
+  ) {
     const group = this.clients.get(userId) ?? new Set<WebSocket>();
     group.add(socket);
     this.clients.set(userId, group);
+    if (identity) {
+      this.socketIdentities.set(socket, identity);
+    }
   }
 
   getConnectionCount(userId: string): number {
@@ -849,6 +908,83 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.deliverLocal(userId, envelope.event);
+  }
+
+  private handleRevocationMessage(message: string) {
+    const broadcast = parseSessionRevocationBroadcast(message);
+    if (!broadcast) {
+      this.logger.warn('Discarded malformed session-revocation broadcast.');
+      return;
+    }
+    this.closeRevokedSockets(broadcast);
+  }
+
+  /**
+   * Closes the locally-held sockets this revocation kills, and returns how many.
+   *
+   * Unlike realtime events there is no `origin` check: the instance that
+   * processed the revocation must drop its own sockets too, and it learns about
+   * them through the same subscription (Redis delivers pub/sub back to the
+   * publishing process on its separate subscriber connection). One code path
+   * for local and remote means one behaviour to reason about.
+   */
+  closeRevokedSockets(broadcast: SessionRevocationBroadcast): number {
+    const revoked =
+      broadcast.kind === 'user'
+        ? this.socketsRevokedForUser(broadcast.userId, broadcast.revokedAtMs)
+        : this.socketsRevokedForSession(broadcast.sessionId);
+
+    for (const socket of revoked) {
+      try {
+        socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to close revoked socket: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+    }
+
+    if (revoked.length > 0) {
+      const target =
+        broadcast.kind === 'user'
+          ? `user ${broadcast.userId}`
+          : `session ${broadcast.sessionId}`;
+      this.logger.log(
+        `Closed ${revoked.length} realtime socket(s) for revoked ${target}.`,
+      );
+    }
+    return revoked.length;
+  }
+
+  private socketsRevokedForUser(
+    userId: string,
+    revokedAtMs: number,
+  ): WebSocket[] {
+    const group = this.clients.get(userId);
+    if (!group) return [];
+
+    return [...group].filter((socket) => {
+      const issuedAtMs = this.socketIdentities.get(socket)?.issuedAtMs ?? null;
+      // Mirrors `isRevoked`: the per-user stamp only kills tokens issued at or
+      // before it, so a device that logged back in after a "log out everywhere"
+      // keeps its socket. A token with no issuance claim is left alone for the
+      // same reason HTTP leaves it alone — it still dies at its own expiry.
+      return issuedAtMs !== null && issuedAtMs <= revokedAtMs;
+    });
+  }
+
+  private socketsRevokedForSession(sessionId: string): WebSocket[] {
+    // O(local sockets); revocations are rare next to connection churn, so a
+    // second sid-keyed index isn't worth the extra state to keep consistent.
+    const revoked: WebSocket[] = [];
+    for (const group of this.clients.values()) {
+      for (const socket of group) {
+        if (this.socketIdentities.get(socket)?.sessionId === sessionId) {
+          revoked.push(socket);
+        }
+      }
+    }
+    return revoked;
   }
 
   private parseRedisEnvelope(
