@@ -11,11 +11,9 @@ sudo_log="$tmp_dir/sudo.log"
 
 cleanup() {
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    sudo -n rm -f "$repo_root/monitoring/prometheus/metrics_token"
     sudo -n rm -rf "$tmp_dir"
   else
     rm -rf "$tmp_dir"
-    rm -f "$repo_root/monitoring/prometheus/metrics_token"
   fi
 }
 trap cleanup EXIT
