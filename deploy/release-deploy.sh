@@ -268,8 +268,17 @@ smoke() {
 
 # 异地备份的函数定义(只定义,不执行)。未配置目标存储桶时
 # ship_backup_offsite 直接返回,行为与引入它之前完全一致。
-# shellcheck source=deploy/offsite-backup.sh
-. deploy/offsite-backup.sh
+#
+# 必须带存在性判断:裸 source 在 set -e 下会让缺文件直接中止整个发版,而且是在
+# 下面的 pg_dump 安全网之前 —— 一个可选功能不该有能力搞挂根本没打算用它的发版
+# (只 rsync 了部分文件、热修时单独拷脚本等)。缺失时降级为 no-op 并告警。
+if [ -r deploy/offsite-backup.sh ]; then
+  # shellcheck source=deploy/offsite-backup.sh
+  . deploy/offsite-backup.sh
+else
+  echo "WARNING: deploy/offsite-backup.sh not found; off-host backup copy disabled" >&2
+  ship_backup_offsite() { :; }
+fi
 
 # ── 迁移前先做数据库备份(pg_dump,保留最近 7 份)────────────────
 if [ -n "$(running postgres)" ]; then
