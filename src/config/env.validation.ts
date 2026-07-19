@@ -1,6 +1,7 @@
 //这个文件负责环境变量的验证，使用 Joi 库来定义和校验 .env 中的配置。
 
 import * as Joi from 'joi';
+import { parseDurationMilliseconds } from 'src/utils/duration';
 
 type EnvLike = NodeJS.ProcessEnv | Record<string, unknown>;
 
@@ -31,6 +32,19 @@ const jwtTtlPattern = /^0*[1-9]\d*\s*(ms|s|m|h|d)$/i;
 // review 修复（round 2）：admin refresh TTL 强制带单位 —— 裸数字按旧语义是
 // 「天」，运维想写 12 小时漏了 h 会静默变 12 天，直接顶穿短会话窗口设计。
 const adminRefreshTtlPattern = /^0*[1-9]\d*\s*[dhm]$/i;
+
+function parseRefreshDurationMilliseconds(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0
+      ? value * 24 * 60 * 60 * 1000
+      : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return parseDurationMilliseconds(
+    /^\d+$/.test(normalized) ? `${normalized}d` : normalized,
+  );
+}
 
 export function createEnvValidationSchema(
   env: EnvLike = process.env,
@@ -209,5 +223,47 @@ export function createEnvValidationSchema(
       otherwise: Joi.string().min(8).optional(),
     }),
     NOTE_SHARE_WEB_BASE: Joi.string().uri().optional(),
-  }).unknown(true);
+  })
+    .unknown(true)
+    .custom((value, helpers) => {
+      const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);
+      const refreshTtl = parseRefreshDurationMilliseconds(
+        value.REFRESH_EXPIRES_IN ??
+          value.REFRESH_EXPIRES_IN_DAYS ??
+          '7d',
+      );
+      if (
+        accessTtl !== null &&
+        refreshTtl !== null &&
+        accessTtl > refreshTtl
+      ) {
+        return helpers.message({
+          custom: 'JWT_EXPIRES_IN must not exceed REFRESH_EXPIRES_IN',
+        });
+      }
+
+      const adminAccessTtl = parseDurationMilliseconds(
+        value.ADMIN_JWT_EXPIRES_IN,
+      );
+      const configuredAdminRefreshTtl = parseRefreshDurationMilliseconds(
+        value.ADMIN_REFRESH_EXPIRES_IN,
+      );
+      const effectiveAdminRefreshTtl =
+        refreshTtl === null
+          ? configuredAdminRefreshTtl
+          : configuredAdminRefreshTtl === null
+            ? refreshTtl
+            : Math.min(refreshTtl, configuredAdminRefreshTtl);
+      if (
+        adminAccessTtl !== null &&
+        effectiveAdminRefreshTtl !== null &&
+        adminAccessTtl > effectiveAdminRefreshTtl
+      ) {
+        return helpers.message({
+          custom:
+            'ADMIN_JWT_EXPIRES_IN must not exceed ADMIN_REFRESH_EXPIRES_IN',
+        });
+      }
+      return value;
+    });
 }

@@ -42,6 +42,37 @@ describe('createEnvValidationSchema', () => {
     expect(value.CALL_ENABLE_VIDEO).toBe(true);
   });
 
+  it('rejects access-token lifetime longer than refresh-session retention', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      JWT_EXPIRES_IN: '30d',
+      REFRESH_EXPIRES_IN: '7d',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain(
+      'JWT_EXPIRES_IN must not exceed REFRESH_EXPIRES_IN',
+    );
+  });
+
+  it('rejects admin access lifetime longer than its effective refresh lifetime', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      REFRESH_EXPIRES_IN: '8h',
+      ADMIN_REFRESH_EXPIRES_IN: '12h',
+      ADMIN_JWT_EXPIRES_IN: '9h',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain(
+      'ADMIN_JWT_EXPIRES_IN must not exceed ADMIN_REFRESH_EXPIRES_IN',
+    );
+  });
+
   it('accepts optional REDIS_URL for shared realtime and rate limiting', () => {
     const env = {
       ...baseEnv,

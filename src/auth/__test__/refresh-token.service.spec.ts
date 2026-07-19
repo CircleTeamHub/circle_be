@@ -287,6 +287,30 @@ describe('RefreshTokenService', () => {
     expect(records[1].deviceName).toBe('replacement');
   });
 
+  it('uses the validated REFRESH_EXPIRES_IN duration for session expiry', async () => {
+    const configured = new RefreshTokenService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'REFRESH_EXPIRES_IN' ? '36h' : undefined,
+        ),
+      } as any,
+      revocation as any,
+    );
+    const before = Date.now();
+
+    await configured.create('user-1');
+
+    const after = Date.now();
+    const thirtySixHours = 36 * 60 * 60 * 1000;
+    expect(records[0].expiredAt.getTime()).toBeGreaterThanOrEqual(
+      before + thirtySixHours,
+    );
+    expect(records[0].expiredAt.getTime()).toBeLessThanOrEqual(
+      after + thirtySixHours,
+    );
+  });
+
   it('cannot late-revoke the winning concurrent single-device session', async () => {
     await service.create('user-1');
     let releaseLateRevocation!: () => void;
