@@ -13,6 +13,8 @@ describe('RefreshTokenService', () => {
   const privateIp = ['10', '0', '0', '1'].join('.');
 
   const prisma = {
+    $executeRaw: jest.fn().mockResolvedValue(0),
+    $transaction: jest.fn(async (callback) => callback(prisma)),
     refreshToken: {
       create: jest.fn(async ({ data }) => {
         const record = {
@@ -28,6 +30,17 @@ describe('RefreshTokenService', () => {
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(
           records.find((record) => record.token === where.token) ?? null,
+        ),
+      ),
+      findFirst: jest.fn(({ where }) =>
+        Promise.resolve(
+          records.find(
+            (record) =>
+              record.id === where.id &&
+              record.userId === where.userId &&
+              record.revokedAt === null &&
+              record.expiredAt > where.expiredAt.gt,
+          ) ?? null,
         ),
       ),
       findMany: jest.fn(({ where }) =>
@@ -255,6 +268,24 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).toHaveBeenCalledWith('other');
   });
 
+  it('replaces single-device sessions under a per-user transaction lock', async () => {
+    await service.create('user-1');
+
+    const replacement = await (service as any).replaceForSingleDevice(
+      'user-1',
+      { deviceName: 'replacement' },
+      'APP',
+    );
+
+    expect(replacement.sessionId).toBe('session-2');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(records.filter((record) => record.revokedAt === null)).toHaveLength(
+      1,
+    );
+    expect(records[1].deviceName).toBe('replacement');
+  });
+
   it('does not revoke sessions when the current session id is missing', async () => {
     const now = new Date();
     records.push({
@@ -299,6 +330,8 @@ describe('RefreshTokenService', () => {
     expect(newRecord.ip).toBe(privateIp);
     // Carries over device name from the old session when not supplied.
     expect(newRecord.deviceName).toBe('MacBook');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
   });
 
   it('carries the refresh token audience when rotating', async () => {

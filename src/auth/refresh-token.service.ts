@@ -1,6 +1,7 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash, randomBytes } from 'crypto';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SessionRevocationService } from './session-revocation.service';
 
@@ -133,12 +134,21 @@ export class RefreshTokenService {
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; sessionId: string }> {
+    return this.createWithClient(this.prisma, userId, context, audience);
+  }
+
+  private async createWithClient(
+    client: PrismaService | Prisma.TransactionClient,
+    userId: string,
+    context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
+  ): Promise<{ token: string; sessionId: string }> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
     const expiredAt = new Date(Date.now() + this.ttlMsFor(audience));
 
     const safe = normalizeContext(context);
-    const session = await this.prisma.refreshToken.create({
+    const session = await client.refreshToken.create({
       data: {
         userId,
         token: tokenHash,
@@ -154,86 +164,126 @@ export class RefreshTokenService {
     return { token: rawToken, sessionId: session.id };
   }
 
+  async replaceForSingleDevice(
+    userId: string,
+    context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
+  ): Promise<{ token: string; sessionId: string }> {
+    const session = await this.prisma.$transaction(async (tx) => {
+      const lockKey = `auth-user:${userId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      await tx.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      return this.createWithClient(tx, userId, context, audience);
+    });
+    await this.revocation.revokeUser(userId);
+    return session;
+  }
+
   async rotate(
     oldToken: string,
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; userId: string; sessionId: string }> {
     const tokenHash = hashToken(oldToken);
-    const now = new Date();
+    const result = await this.prisma.$transaction(async (tx) => {
+      const initial = await tx.refreshToken.findUnique({
+        where: { token: tokenHash },
+        select: { userId: true, audience: true },
+      });
+      if (!initial || initial.audience !== audience) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
 
-    // Atomically revoke the token only if it hasn't been used yet.
-    // Using updateMany + count check prevents the TOCTOU race where two
-    // concurrent requests both pass a findUnique check before either writes
-    // revokedAt, which would allow one token to spawn two live sessions.
-    const revoked = await this.prisma.refreshToken.updateMany({
-      where: {
-        token: tokenHash,
-        revokedAt: null,
-        expiredAt: { gt: now },
-        audience,
-      },
-      data: { revokedAt: now },
-    });
+      const lockKey = `auth-user:${initial.userId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
 
-    if (revoked.count === 0) {
-      // Determine whether this is reuse of an already-revoked token
-      // (potential session hijack) vs an unknown/expired token.
-      const existing = await this.prisma.refreshToken.findUnique({
+      const record = await tx.refreshToken.findUnique({
         where: { token: tokenHash },
         select: {
           userId: true,
+          deviceName: true,
+          ip: true,
+          userAgent: true,
+          audience: true,
           revokedAt: true,
           expiredAt: true,
-          audience: true,
         },
       });
-      if (existing?.revokedAt && existing.audience === audience) {
-        // Reuse detected: the legitimate holder rotated this token, and now
-        // someone is replaying the old one. Assume compromise and kill the
-        // entire session chain for this user.
-        this.logger.warn(
-          `Refresh token reuse detected for user ${existing.userId}; revoking all sessions.`,
-        );
-        await this.revokeAll(existing.userId);
-        throw new UnauthorizedException(
-          'Refresh token reuse detected; all sessions revoked',
-        );
+      if (!record || record.audience !== audience) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
       }
-      throw new UnauthorizedException('Invalid or expired refresh token');
-    }
 
-    // Fetch metadata needed to carry over device context to the new token.
-    const record = await this.prisma.refreshToken.findUnique({
-      where: { token: tokenHash },
-      select: {
-        userId: true,
-        deviceName: true,
-        ip: true,
-        userAgent: true,
-        audience: true,
-      },
+      if (record.revokedAt) {
+        await tx.refreshToken.updateMany({
+          where: { userId: record.userId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        return { kind: 'reuse' as const, userId: record.userId };
+      }
+
+      const now = new Date();
+      if (record.expiredAt <= now) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
+      const revoked = await tx.refreshToken.updateMany({
+        where: {
+          token: tokenHash,
+          revokedAt: null,
+          expiredAt: { gt: now },
+          audience,
+        },
+        data: { revokedAt: now },
+      });
+      if (revoked.count !== 1) {
+        throw new UnauthorizedException('Invalid or expired refresh token');
+      }
+
+      const newSession = await this.createWithClient(
+        tx,
+        record.userId,
+        {
+          deviceName: context?.deviceName ?? record.deviceName ?? null,
+          ip: context?.ip ?? record.ip ?? null,
+          userAgent: context?.userAgent ?? record.userAgent ?? null,
+        },
+        record.audience,
+      );
+      return {
+        kind: 'rotated' as const,
+        token: newSession.token,
+        userId: record.userId,
+        sessionId: newSession.sessionId,
+      };
     });
 
-    if (!record) {
-      // Should be unreachable given the updateMany above succeeded.
-      throw new UnauthorizedException('Invalid or expired refresh token');
+    if (result.kind === 'reuse') {
+      this.logger.warn(
+        `Refresh token reuse detected for user ${result.userId}; revoking all sessions.`,
+      );
+      await this.revocation.revokeUser(result.userId);
+      throw new UnauthorizedException(
+        'Refresh token reuse detected; all sessions revoked',
+      );
     }
+    return result;
+  }
 
-    const newSession = await this.create(
-      record.userId,
-      {
-        deviceName: context?.deviceName ?? record.deviceName ?? null,
-        ip: context?.ip ?? record.ip ?? null,
-        userAgent: context?.userAgent ?? record.userAgent ?? null,
+  async assertSessionActive(userId: string, sessionId: string): Promise<void> {
+    const active = await this.prisma.refreshToken.findFirst({
+      where: {
+        id: sessionId,
+        userId,
+        revokedAt: null,
+        expiredAt: { gt: new Date() },
       },
-      record.audience,
-    );
-    return {
-      token: newSession.token,
-      userId: record.userId,
-      sessionId: newSession.sessionId,
-    };
+      select: { id: true },
+    });
+    if (!active) {
+      throw new UnauthorizedException('Session is no longer active');
+    }
   }
 
   /**

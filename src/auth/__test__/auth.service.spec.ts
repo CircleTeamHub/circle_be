@@ -74,6 +74,10 @@ describe('AuthService', () => {
     revokeSession: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
     revokeAll: jest.fn(() => Promise.resolve()),
+    replaceForSingleDevice: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
+    assertSessionActive: jest.fn(() => Promise.resolve()),
   };
 
   const mockJwt = {
@@ -477,12 +481,12 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.replaceForSingleDevice).toHaveBeenCalledWith(
       'uuid-1',
       undefined,
       'APP',
     );
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 
   it('adminLogin issues admin-audience tokens for active admin users', async () => {
@@ -627,6 +631,10 @@ describe('AuthService', () => {
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({ sub: 'uuid-1', sid: 'session-2', aud: 'APP' }),
     );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
+    );
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 'uuid-1' },
@@ -669,6 +677,10 @@ describe('AuthService', () => {
       // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
       // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
       expect.objectContaining({ expiresIn: 900 }),
+    );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
     );
   });
 

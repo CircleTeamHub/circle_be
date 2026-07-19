@@ -603,6 +603,7 @@ export class AuthService {
       sessionId,
       'APP',
     );
+    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -645,6 +646,7 @@ export class AuthService {
       sessionId,
       'ADMIN',
     );
+    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -1227,15 +1229,18 @@ export class AuthService {
       issueImToken?: boolean;
     },
   ) {
-    if (options?.revokeExistingSessions) {
-      await this.refreshTokenService.revokeAll(userId);
-    }
-
     const audience = options?.audience ?? 'APP';
     const issueImToken = options?.issueImToken ?? true;
+    const createSession = options?.revokeExistingSessions
+      ? this.refreshTokenService.replaceForSingleDevice(
+          userId,
+          sessionContext,
+          audience,
+        )
+      : this.refreshTokenService.create(userId, sessionContext, audience);
 
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
-      this.refreshTokenService.create(userId, sessionContext, audience),
+      createSession,
       issueImToken ? this.resolveImToken(userId, platformID) : '',
     ]);
     const accessToken = await this.signAccessToken(
@@ -1245,6 +1250,7 @@ export class AuthService {
       sessionId,
       audience,
     );
+    await this.refreshTokenService.assertSessionActive(userId, sessionId);
     return issueImToken
       ? { accessToken, refreshToken, imToken }
       : { accessToken, refreshToken };
