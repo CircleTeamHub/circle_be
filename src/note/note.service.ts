@@ -435,8 +435,20 @@ export class NoteService {
     );
   }
 
-  private createLongImageSvg(note: NoteRow) {
-    const sections = this.buildSectionsFromRow(note);
+  /**
+   * 长图导出是**纯文字** SVG：不嵌图片字节，`图片 N: <url>` 里的 URL 是对媒体的
+   * 唯一引用。桶策略把 notes/* 收归私有后，原始直链对收件人是 403，所以这里必须
+   * 和其它读取路径一样发短时签名 URL（presignedUrls）。
+   *
+   * 已知限制：签名 URL ~2h 过期，而导出件是用户长期留存的。链接终会失效 ——
+   * 但「导出后即刻可用」好过「一出生就是死链」。彻底解法是把媒体打包进导出件，
+   * 属于更大的改动，不在本次范围。
+   */
+  private createLongImageSvg(
+    note: NoteRow,
+    presignedUrls?: Map<string, string>,
+  ) {
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     const exportMedia = this.getExportSectionMedia(sections);
     const lines = [
       note.title,
@@ -481,12 +493,16 @@ export class NoteService {
     );
   }
 
-  private async createPdf(note: NoteRow) {
-    const sections = this.buildSectionsFromRow(note);
+  /** PDF 只嵌前 MAX_PDF_EMBEDDED_IMAGES 张图的字节，之后的媒体同样只剩 URL 可引用。 */
+  private async createPdf(note: NoteRow, presignedUrls?: Map<string, string>) {
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     const sectionMedia = this.getExportSectionMedia(sections);
     const mediaUrls = sectionMedia
       .map((item: any) => (typeof item.url === 'string' ? item.url : null))
-      .filter((url): url is string => Boolean(url));
+      .filter((url): url is string => Boolean(url))
+      // Keywords 是 PDF 元数据，不是给人点的链接。剥掉签名 query：短时凭据写进
+      // 长期留存文件的元数据既没用（会过期）又平白多一处泄漏面。
+      .map((url) => url.split('?')[0]);
     const doc = new PDFDocument({
       size: 'A4',
       margin: 48,
@@ -1958,23 +1974,27 @@ export class NoteService {
     }
 
     const basename = sanitizeFilenamePart(note.title);
-    if (input.format === 'IMAGE') {
-      return this.uploadExportArtifact({
-        ownerID: note.ownerID,
-        noteID: note.id,
-        filename: `${basename}.svg`,
-        mimeType: 'image/svg+xml',
-        body: this.createLongImageSvg(note),
-      });
-    }
-    if (input.format === 'PDF') {
-      return this.uploadExportArtifact({
-        ownerID: note.ownerID,
-        noteID: note.id,
-        filename: `${basename}.pdf`,
-        mimeType: 'application/pdf',
-        body: await this.createPdf(note),
-      });
+    if (input.format === 'IMAGE' || input.format === 'PDF') {
+      // 导出件里嵌的 URL 也要现签：notes/* 已不再匿名可读，原始直链对收件人是 403。
+      // 与其它读取路径同一条流水线（collect → presign → map）。
+      const presignedUrls = await this.presignNoteMedia(
+        this.collectNoteMediaTargets(note),
+      );
+      return input.format === 'IMAGE'
+        ? this.uploadExportArtifact({
+            ownerID: note.ownerID,
+            noteID: note.id,
+            filename: `${basename}.svg`,
+            mimeType: 'image/svg+xml',
+            body: this.createLongImageSvg(note, presignedUrls),
+          })
+        : this.uploadExportArtifact({
+            ownerID: note.ownerID,
+            noteID: note.id,
+            filename: `${basename}.pdf`,
+            mimeType: 'application/pdf',
+            body: await this.createPdf(note, presignedUrls),
+          });
     }
 
     const mediaType = input.format === 'IMAGES' ? 'IMAGE' : 'VIDEO';

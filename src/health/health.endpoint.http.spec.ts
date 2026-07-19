@@ -98,6 +98,7 @@ describe('health probes in the real HTTP pipeline', () => {
       status: 'ok',
       database: 'up',
       redis: 'disabled',
+      objectStore: 'disabled',
     });
     expect(queryRaw).toHaveBeenCalledTimes(1);
   });
@@ -114,6 +115,7 @@ describe('health probes in the real HTTP pipeline', () => {
       status: 'error',
       database: 'down',
       redis: 'disabled',
+      objectStore: 'disabled',
     });
   });
 
