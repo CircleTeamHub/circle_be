@@ -172,10 +172,13 @@ export class RefreshTokenService {
     const replacement = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-      const revokedSessions = await tx.refreshToken.updateManyAndReturn({
+      const revocableSessions = await tx.refreshToken.findMany({
+        where: { userId, expiredAt: { gt: new Date() } },
+        select: { id: true },
+      });
+      await tx.refreshToken.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: new Date() },
-        select: { id: true },
       });
       const session = await this.createWithClient(
         tx,
@@ -185,7 +188,7 @@ export class RefreshTokenService {
       );
       return {
         session,
-        revokedSessionIds: revokedSessions.map(({ id }) => id),
+        revokedSessionIds: revocableSessions.map(({ id }) => id),
       };
     });
     await Promise.all(

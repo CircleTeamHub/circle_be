@@ -48,7 +48,8 @@ describe('RefreshTokenService', () => {
           records.filter(
             (record) =>
               record.userId === where.userId &&
-              record.revokedAt === where.revokedAt &&
+              (where.revokedAt === undefined ||
+                record.revokedAt === where.revokedAt) &&
               record.expiredAt > where.expiredAt.gt,
           ),
         ),
@@ -329,6 +330,30 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeUser).not.toHaveBeenCalled();
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
     expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+  });
+
+  it('revokes access tokens for active and already-rotated unexpired sessions', async () => {
+    const { token: firstToken } = await service.create('user-1');
+    await service.rotate(firstToken);
+    jest.clearAllMocks();
+
+    const replacement = await service.replaceForSingleDevice(
+      'user-1',
+      { deviceName: 'single device' },
+      'APP',
+    );
+
+    expect(replacement.sessionId).toBe('session-3');
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1',
+        expiredAt: { gt: expect.any(Date) },
+      },
+      select: { id: true },
+    });
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-2');
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith('session-3');
   });
 
   it('does not revoke sessions when the current session id is missing', async () => {
