@@ -243,6 +243,19 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
 });
 
+test('every main push creates the exact-SHA CI run required by release', () => {
+  const ci = read('.github/workflows/ci.yml');
+  const push = ci.slice(ci.indexOf('  push:'), ci.indexOf('  pull_request:'));
+  const pullRequest = ci.slice(
+    ci.indexOf('  pull_request:'),
+    ci.indexOf('\n# Cancel superseded runs'),
+  );
+
+  assert.match(push, /branches:\s*\n\s*- main/);
+  assert.doesNotMatch(push, /paths-ignore:/);
+  assert.match(pullRequest, /paths-ignore:/);
+});
+
 test('release selection and active-color state fail closed', () => {
   const release = read('.github/workflows/release.yml');
   const deploy = read('deploy/release-deploy.sh');
