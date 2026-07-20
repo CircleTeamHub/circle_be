@@ -337,6 +337,91 @@ describe('RealtimeGateway session revocation', () => {
       expect(realtime.getConnectionCount('user-8')).toBe(0);
     });
 
+    it('rejects a revocation published while the initial marker check is in flight', async () => {
+      // Reproduce the ordering that loses a broadcast: the Redis GET has already
+      // observed "not revoked", but its promise has not resumed registration yet.
+      // The revoke SET + publish therefore arrives while no local socket is tracked.
+      const originalIsRevoked = revocation.isRevoked.bind(revocation);
+      let releaseCheck = () => {};
+      const checkStarted = new Promise<void>((resolve) => {
+        jest
+          .spyOn(revocation, 'isRevoked')
+          .mockImplementationOnce(async () => {
+            resolve();
+            await new Promise<void>((r) => (releaseCheck = r));
+            return false;
+          })
+          .mockImplementation(originalIsRevoked);
+      });
+
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', () => resolve());
+        socket.once('error', reject);
+      });
+      const closed = waitForClose(socket);
+      const firstMessage = waitForMessage(socket);
+      const outcome = Promise.race([
+        closed.then((payload) => ({ kind: 'closed', payload })),
+        firstMessage.then((message) => ({ kind: 'message', message })),
+      ]);
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          token: signToken({
+            sub: 'user-race',
+            sid: 'session-race',
+            issuedAtMs: Date.now() - 5_000,
+          }),
+        }),
+      );
+
+      await checkStarted;
+      await revocation.revokeUser('user-race');
+      expect(realtime.getConnectionCount('user-race')).toBe(0);
+      releaseCheck();
+
+      await expect(outcome).resolves.toEqual({
+        kind: 'closed',
+        payload: { code: 1008, reason: 'Session revoked' },
+      });
+    });
+
+    it('unregisters a token that expires during the revocation lookup', async () => {
+      jest.spyOn(revocation, 'isRevoked').mockImplementation(async () => {
+        await tick(80);
+        return false;
+      });
+
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', () => resolve());
+        socket.once('error', reject);
+      });
+      const closed = waitForClose(socket);
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          token: signToken({
+            sub: 'user-expiring',
+            sid: 'session-expiring',
+            // Valid when verifyToken runs, expired by the time the awaited
+            // revocation lookup returns and registration calculates its TTL.
+            exp: Date.now() / 1000 + 0.05,
+          }),
+        }),
+      );
+
+      await expect(closed).resolves.toEqual({
+        code: 1008,
+        reason: 'Token expired',
+      });
+      await tick();
+      expect(realtime.getConnectionCount('user-expiring')).toBe(0);
+    });
+
     it('keeps a session established after the revoke stamp (re-login race)', async () => {
       // Mirrors `isRevoked`: the per-user marker only kills tokens issued at or
       // before the revoke instant. A device that logged back in afterwards must

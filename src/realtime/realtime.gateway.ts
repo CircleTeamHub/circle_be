@@ -165,18 +165,9 @@ export class RealtimeGateway implements OnModuleDestroy {
     this.userBySocket.set(socket, userId);
     this.realtimeService.registerClient(userId, socket, identity);
 
-    if (expMs !== null) {
-      const ttl = expMs - Date.now();
-      if (ttl <= 0) {
-        socket.close(1008, 'Token expired');
-        return;
-      }
-      const timer = setTimeout(() => {
-        socket.close(1008, 'Token expired');
-      }, ttl);
-      this.expiryTimers.set(socket, timer);
-    }
-
+    // Attach teardown before any later branch can close or await. In particular,
+    // a token may expire while the revocation lookup is in flight; closing it
+    // before this listener exists would strand the socket in the client map.
     socket.on('close', () => {
       const timer = this.expiryTimers.get(socket);
       if (timer) {
@@ -192,6 +183,32 @@ export class RealtimeGateway implements OnModuleDestroy {
     socket.on('error', (error) => {
       this.logger.warn(`Realtime socket error for ${userId}: ${error.message}`);
     });
+
+    if (expMs !== null) {
+      const ttl = expMs - Date.now();
+      if (ttl <= 0) {
+        socket.close(1008, 'Token expired');
+        return;
+      }
+      const timer = setTimeout(() => {
+        socket.close(1008, 'Token expired');
+      }, ttl);
+      this.expiryTimers.set(socket, timer);
+    }
+
+    // Close the check/register gap. If a revocation was published after the
+    // first Redis GET observed "not revoked" but before this socket entered the
+    // local map, that broadcast could not find it. Once registered, check the
+    // marker again: earlier revocations are caught here, later ones find the
+    // registered socket through pub/sub.
+    if (await this.revocation.isRevoked(verified.payload)) {
+      socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+      return;
+    }
+
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
 
     try {
       await this.realtimeService.emitSnapshot(userId);
