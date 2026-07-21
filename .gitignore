@@ -13,6 +13,8 @@ dist/
 .env.*
 !.env.example
 !.env.production.example
+!.env.backup.example
+!.env.backup.mongo.example
 # General
 .DS_Store
 .AppleDouble

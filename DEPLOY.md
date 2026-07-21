@@ -503,3 +503,43 @@ git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
 注册 livekit.io → 建项目(免费层)→ 拿 `LIVEKIT_URL` / API Key / Secret,
 追加进 `.env.production`(含 `LIVEKIT_WEBHOOK_SECRET`、`CALL_ENABLE_VIDEO=true`),重启 circle_be。
 无需自托管,音视频不占服务器资源。
+
+---
+
+## 阶段 7:持续备份(**上线前必做**)
+
+`pg_data`、`minio_data` 和 OpenIM 的 Mongo(**全部聊天记录**)都是同一台机器上的
+docker volume。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会**同时**
+全部消失,且没有任何第二份副本。
+
+> **和上面「异地备份」的区别 —— 两者都要,不是二选一。**
+> 上面那节(`deploy/offsite-backup.sh`)只在**发版时**打一份 pg_dump 快照传到异地,
+> 保护的是「这次迁移把库改坏了」,而且**只覆盖 Postgres**。
+> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒)、对象每 15 分钟镜像、
+> 聊天记录每小时加密 dump,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
+> 所有聊天消息,只有本节覆盖得到。
+
+完整方案(覆盖范围、RPO/RTO、运维必须自行创建的桶和凭证、恢复演练、灾难恢复流程)
+见 **[docs/backups.md](docs/backups.md)**。
+
+```bash
+cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
+docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
+```
+
+> 聊天记录备份(OpenIM Mongo)的凭证在**单独的** `.env.backup.mongo`,只有 `backup_mongo`
+> 服务加载它 —— env_file 是整份注入容器的,Mongo 密码放进 `.env.backup` 会连 postgres
+> 容器一起给到,而它根本不需要。另外 `OPENIM_NETWORK` 要写进 `.env`(compose 顶层插值
+> 只认 `.env`/shell,不认 env_file),写在备份配置里不会生效。
+
+> 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
+> 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础
+> 定义重建,**WAL 归档会被静默关掉**。docs/backups.md 里有 `COMPOSE_FILE` 的固定方法,
+> 且 `check.sh` 每小时会检测这种情况。
+
+启用后务必跑一次恢复演练 —— 没演练过的备份不算备份:
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml \
+  run --rm backup run drill
+```
