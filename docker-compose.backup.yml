@@ -1,0 +1,138 @@
+# 备份 overlay —— 叠加在 docker-compose.prod.yml 之上,把三个有状态存储
+# (Postgres / MinIO 对象 / OpenIM Mongo)持续备份到异地 S3 兼容目标。
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
+#
+# 完整说明(包括运维必须自行创建的桶与凭证)见 docs/backups.md。
+#
+# WHY AN OVERLAY AND NOT THE BASE FILE
+# ------------------------------------
+# Turning on archive_mode makes Postgres REQUIRE that archive_command succeeds.
+# If it fails, WAL piles up in pg_wal until the disk fills — that is the correct
+# fail-loud behaviour for a backup system, but it would be a disastrous default
+# for an operator who has not configured a destination yet. Keeping archiving in
+# an opt-in overlay means the base stack behaves exactly as it does today until
+# someone deliberately layers this file on with a .env.backup in place.
+#
+# THE TRADE-OFF THIS CREATES: a bare `docker compose -f docker-compose.prod.yml
+# up -d` recreates postgres from the base definition and silently turns
+# archiving back OFF. deploy/backup/check.sh runs hourly specifically to catch
+# that. Set COMPOSE_FILE in .env (see docs/backups.md) so the overlay is never
+# accidentally dropped.
+
+name: circle-be
+
+services:
+  # 覆盖基础文件里的 postgres:16-alpine —— 换成带 pgbackrest 的镜像并开启 WAL 归档。
+  postgres:
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
+    # 显式命名,避免 build + 基础文件的 image: 同时存在时把官方 tag 覆盖掉。
+    image: circle-postgres-pgbackrest:16
+    # archive_timeout is the RPO knob: Postgres force-switches a WAL segment
+    # after this long even if it is not full, so worst-case data loss is
+    # roughly this + the time archive-push takes. 60s against a 15min target
+    # leaves ~14min of headroom for transient destination failures and retries.
+    # A forced switch archives a mostly-empty 16MB segment, but pgBackRest
+    # zstd-compresses it to a few KB, so the cost is bandwidth, not storage.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      # Plain, documented form. The S3 credentials and cipher passphrase reach
+      # this child process because docker/postgres/Dockerfile's entrypoint shim
+      # exports them before the postmaster starts — which is also what makes the
+      # generated restore_command work during recovery.
+      - archive_command=pgbackrest --stanza=circle archive-push %p
+      - -c
+      - archive_timeout=60
+    env_file:
+      # Credentials only. Never inline a secret in this file.
+      - .env.backup
+    volumes:
+      # Shared with the backup container so pgbackrest can reach the postmaster
+      # over the unix socket. pgBackRest's pg1-host means "remote pgbackrest via
+      # SSH/TLS", which is not what a same-host sidecar wants — the socket is.
+      - pg_socket:/var/run/postgresql
+      - ./deploy/backup/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+
+  # Postgres 全量/差异备份 + MinIO 对象镜像的调度器。
+  backup:
+    build:
+      context: .
+      dockerfile: docker/backup/Dockerfile
+    image: circle-backup:1
+    restart: unless-stopped
+    # uid 70 = postgres. PGDATA is 0700 postgres:postgres, so pgbackrest has to
+    # run as that user to read the data files it backs up.
+    user: '70:70'
+    depends_on:
+      postgres: { condition: service_healthy }
+    env_file:
+      - .env.backup
+    environment:
+      # pg-diff (差异,相对上次全量) rather than pg-incr (增量,相对上次任意备份):
+      # restoring a differential needs full + 1 backup, an incremental needs
+      # full + every incremental since. That is a direct RTO win — day-6 recovery
+      # fetches 2 backup sets instead of 7 — for a modest storage cost.
+      BACKUP_JOBS: pg-full,pg-diff,minio,check
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - pg_socket:/var/run/postgresql
+      - ./deploy/backup/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+      # Scratch space for the restore drill. A named volume, NOT tmpfs: the
+      # drill restores the WHOLE database here, and tmpfs is RAM-backed — on a
+      # database of any real size that is an OOM on the first drill. Needs free
+      # disk roughly equal to the database size.
+      - backup_scratch:/tmp
+    tmpfs:
+      # Secrets only (the Mongo URI conf), so they never touch disk. Small by
+      # construction — do NOT add /tmp here, see above.
+      - /run
+
+  # OpenIM 的 Mongo(全部聊天记录)——独立服务,profile 门控。
+  #
+  # OpenIM 是 DEPLOY.md 阶段5 才部署的独立 compose 栈(openim-docker),可能还不存在。
+  # 拆成单独服务 + profile,是为了让 Postgres/MinIO 备份能在 OpenIM 之前就先跑起来,
+  # 而不是因为 external network 不存在导致整个栈起不来。
+  #
+  # 启用: 在 .env 的 COMPOSE_PROFILES 里加 openim-backup。
+  #
+  # 我们不碰 openim-docker 里的任何东西 —— 只是从我们这侧接入它的网络,
+  # 用运维在 .env.backup 里提供的凭证只读地 mongodump。
+  backup_mongo:
+    profiles: ['openim-backup']
+    build:
+      context: .
+      dockerfile: docker/backup/Dockerfile
+    image: circle-backup:1
+    restart: unless-stopped
+    user: '70:70'
+    env_file:
+      - .env.backup
+    environment:
+      BACKUP_JOBS: mongo
+    networks:
+      - default
+      - openim
+    tmpfs:
+      - /run
+      - /tmp
+
+volumes:
+  # postgres 与 backup 共享 postmaster 的 unix socket,让 pgbackrest 能在
+  # 不开 TCP、不配 SSH/TLS 的前提下调用 pg_backup_start()/pg_backup_stop()。
+  pg_socket:
+  # 恢复演练用的临时空间(见 backup 服务的注释)。演练结束即清空。
+  backup_scratch:
+
+networks:
+  openim:
+    # openim-docker 自己创建的网络;我们只加入,不管理。
+    # 名字随 openim-docker 的 compose project 名而定,默认 openim-docker_openim。
+    external: true
+    name: ${OPENIM_NETWORK:-openim-docker_openim}
