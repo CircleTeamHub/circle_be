@@ -71,7 +71,14 @@ export function createEnvValidationSchema(
       .default(10000),
     SECRET: Joi.string().min(secretMin).required(),
     JWT_EXPIRES_IN: Joi.string().default('1h'),
-    REFRESH_EXPIRES_IN: Joi.string().default('30d'),
+    // #84：这个键从 schema 声明之日起就没被代码读过（代码读的是从未文档化的
+    // REFRESH_EXPIRES_IN_DAYS），所有环境实际拿 7 天。现已接线。默认从 '30d'
+    // 收敛为 '7d' —— 保住未显式配置环境的既有有效行为，不做静默寿命翻倍；
+    // 显式配置（如模板里的 30d）从此真正生效。
+    REFRESH_EXPIRES_IN: Joi.string().default('7d'),
+    // #91：管理台会话独立 TTL（上限被 REFRESH_EXPIRES_IN 钳制，绝不长于用户）。
+    ADMIN_REFRESH_EXPIRES_IN: Joi.string().default('12h'),
+    ADMIN_JWT_EXPIRES_IN: Joi.string().default('15m'),
     LOG_ON: Joi.boolean(),
     LOG_LEVEL: Joi.string(),
     HTTP_LOG_ON: Joi.boolean(),

@@ -33,6 +33,7 @@ import {
   SessionContext,
 } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { IconService } from 'src/icon/icon.service';
@@ -40,6 +41,13 @@ import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { USER_ME_SELECT } from 'src/user/user.select';
 
 const ME_SELECT = USER_ME_SELECT;
+
+// 管理台按账号锁定（#83）：与 securityCode 锁定同款参数量级。
+// 5 次错密码 → 锁 15 分钟；成功登录清零。只对 role=ADMIN 账号生效。
+const ADMIN_LOGIN_MAX_ATTEMPTS = 5;
+const ADMIN_LOGIN_LOCK_MINUTES = 15;
+// 管理台 access token 缩短（#91 目标 5-15 分钟）；可用 ADMIN_JWT_EXPIRES_IN 覆盖。
+const DEFAULT_ADMIN_JWT_EXPIRES_IN = '15m';
 const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
 // Persistent per-account lockout for security-code verification. Backs up the
 // per-IP rate limiter so a distributed / IP-rotating attacker still can't
@@ -110,6 +118,7 @@ export class AuthService {
     private openim: OpenimService,
     private iconService: IconService,
     private emailVerification: EmailVerificationService,
+    private configService: ConfigService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
@@ -240,6 +249,11 @@ export class AuthService {
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
     const email = normalizeEmail(dto.email);
     const user = await this.prisma.user.findUnique({ where: { email } });
+    // 管理台事件必须可追溯来源（#90）：ip/userAgent 一律进 metadata。
+    const adminAuditContext = {
+      ip: sessionContext?.ip ?? null,
+      userAgent: sessionContext?.userAgent ?? null,
+    };
 
     if (!user || user.status !== 'ACTIVE') {
       logBusinessEvent(this.logger, {
@@ -249,13 +263,61 @@ export class AuthService {
         result: 'failure',
         metadata: {
           reason: user ? 'inactive_account' : 'invalid_credentials',
+          ...adminAuditContext,
         },
+      });
+      throw new ForbiddenException('Invalid credentials or inactive account');
+    }
+
+    // 按账号锁定（#83）：admin 账号是唯一受保护对象 —— IP 限流挡不住分布式
+    // 撞库，这里在账号维度兜底。锁定检查先于 argon2.verify，锁死期间不做
+    // 密码比对（也顺带省掉被锁账号的 argon2 开销）。对外文案与其它失败一致，
+    // 不泄露「已锁定」状态。
+    const now = new Date();
+    if (
+      user.role === 'ADMIN' &&
+      user.adminLoginLockedUntil &&
+      user.adminLoginLockedUntil > now
+    ) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'account_locked', ...adminAuditContext },
       });
       throw new ForbiddenException('Invalid credentials or inactive account');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid || user.role !== 'ADMIN') {
+      // 只有真正的 ADMIN 账号累计失败计数：对非 admin 账号计数会让任何人
+      // 通过 adminLogin 刷别人的普通账号进锁定（DoS）。
+      if (!valid && user.role === 'ADMIN') {
+        const attempts = user.adminLoginAttempts + 1;
+        const shouldLock = attempts >= ADMIN_LOGIN_MAX_ATTEMPTS;
+        await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            adminLoginAttempts: shouldLock ? 0 : attempts,
+            adminLoginLockedUntil: shouldLock
+              ? new Date(now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000)
+              : user.adminLoginLockedUntil,
+          },
+        });
+        if (shouldLock) {
+          logBusinessEvent(this.logger, {
+            enabled: this.loggingConfig.businessLogOn,
+            businessEvent: 'auth_admin_login_locked',
+            actorId: user.id,
+            result: 'failure',
+            metadata: {
+              lockMinutes: ADMIN_LOGIN_LOCK_MINUTES,
+              ...adminAuditContext,
+            },
+          });
+        }
+      }
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
         businessEvent: 'auth_admin_login_failed',
@@ -263,9 +325,18 @@ export class AuthService {
         result: 'failure',
         metadata: {
           reason: valid ? 'insufficient_role' : 'invalid_credentials',
+          ...adminAuditContext,
         },
       });
       throw new ForbiddenException('Invalid credentials or inactive account');
+    }
+
+    // 成功登录清零计数（只在有残留时写库，避免每次登录白写一行）。
+    if (user.adminLoginAttempts !== 0 || user.adminLoginLockedUntil) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { adminLoginAttempts: 0, adminLoginLockedUntil: null },
+      });
     }
 
     this.prisma.user
@@ -296,6 +367,7 @@ export class AuthService {
       result: 'success',
       entityType: 'user',
       entityId: user.id,
+      metadata: adminAuditContext,
     });
 
     return tokens;
@@ -494,7 +566,19 @@ export class AuthService {
   }
 
   async logout(refreshToken: string): Promise<void> {
-    await this.refreshTokenService.revoke(refreshToken);
+    const revoked = await this.refreshTokenService.revoke(refreshToken);
+    // 管理台登出此前完全无痕（#90）：事后取证时连「会话何时结束」都答不上来。
+    // 普通用户登出量大且低敏，保持不记；ADMIN 会话必须留痕。
+    if (revoked?.audience === 'ADMIN') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_logout',
+        actorId: revoked.userId,
+        result: 'success',
+        entityType: 'user',
+        entityId: revoked.userId,
+      });
+    }
   }
 
   async sessions(userId: string, currentSessionId?: string) {
@@ -1038,13 +1122,24 @@ export class AuthService {
     sessionId?: string,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<string> {
-    return this.jwt.signAsync({
+    const payload = {
       sub: userId,
       accountId,
       role,
       sid: sessionId,
       aud: audience,
       issuedAtMs: Date.now(),
-    });
+    };
+    // ADMIN audience 用更短的 access TTL（#91）：全局 JWT_EXPIRES_IN 仍管普通
+    // 用户；管理台 access token 默认 15 分钟，可用 ADMIN_JWT_EXPIRES_IN 覆盖。
+    if (audience === 'ADMIN') {
+      const adminExpiresIn =
+        this.configService.get<string>('ADMIN_JWT_EXPIRES_IN') ??
+        DEFAULT_ADMIN_JWT_EXPIRES_IN;
+      return this.jwt.signAsync(payload, {
+        expiresIn: adminExpiresIn as unknown as number,
+      });
+    }
+    return this.jwt.signAsync(payload);
   }
 }
