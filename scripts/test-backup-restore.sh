@@ -131,8 +131,18 @@ services:
       - $tmp_env
 EOF
 
-step "1. starting throwaway postgres (WAL archiving on) + S3 stand-in"
-if ! up_out="$("${compose[@]}" up -d --build postgres 2>&1)"; then
+step "1. building both images, then starting throwaway postgres + S3 stand-in"
+# Build BOTH, explicitly. `up --build postgres` only rebuilds postgres; the
+# backup image is used later via `run --rm backup`, and `compose run` does NOT
+# build. Without this the test silently exercises whatever circle-backup:1
+# happens to be lying around from an earlier build, so every edit to
+# deploy/backup/*.sh appears to pass without once having been executed.
+if ! build_out="$("${compose[@]}" build postgres backup 2>&1)"; then
+  printf '%s\n' "$build_out" >&2
+  fail "image build failed"
+fi
+
+if ! up_out="$("${compose[@]}" up -d postgres 2>&1)"; then
   printf '%s\n' "$up_out" >&2
   "${compose[@]}" logs --tail 40 backup-s3 backup-s3-init postgres >&2 2>/dev/null || true
   fail "stack did not start"

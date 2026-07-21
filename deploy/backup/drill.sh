@@ -86,9 +86,22 @@ log "restoring latest backup into scratch dir $DRILL_DIR"
 export_pgbackrest_env
 # --archive-mode=off is what keeps this drill from pushing the scratch cluster's
 # WAL into the production repo and forking its timeline.
-pgbackrest --stanza=circle --pg1-path="$DRILL_DIR" --delta --archive-mode=off \
-           restore 2>&1 | sed 's/^/  /' \
-  || die "pgbackrest restore failed — THERE IS NO WORKING BACKUP"
+#
+# Output goes to a FILE, not through `| sed`. A pipe here deadlocks the whole
+# drill: the postmaster started further down inherits this shell's stdout, holds
+# the pipe's write end open for its entire life, and the sed therefore never
+# sees EOF — so the script waits for sed, sed waits for the postmaster, and the
+# postmaster waits to be stopped by the script. Observed as a drill that hangs
+# forever with a perfectly healthy restored cluster sitting right there.
+# Same footgun the pg_ctl comment below describes; it applies to every pipe that
+# is open when the postmaster starts, not just pg_ctl's own.
+RESTORE_LOG="$DRILL_ROOT/restore.log"
+if ! pgbackrest --stanza=circle --pg1-path="$DRILL_DIR" --delta --archive-mode=off \
+     restore >"$RESTORE_LOG" 2>&1; then
+  sed 's/^/  /' "$RESTORE_LOG" >&2 2>/dev/null || true
+  die "pgbackrest restore failed — THERE IS NO WORKING BACKUP"
+fi
+sed 's/^/  /' "$RESTORE_LOG"
 
 # ── 3. start scratch postmaster, replay WAL ───────────────────────────────────
 log "starting scratch postgres on port $DRILL_PORT (replays WAL from the repo)"
