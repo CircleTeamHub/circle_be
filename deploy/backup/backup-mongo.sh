@@ -29,14 +29,45 @@ chmod 600 "$CONF"
 printf 'uri: "%s"\n' "$BACKUP_MONGO_URI" > "$CONF"
 
 log "dumping OpenIM Mongo -> s3://${BACKUP_S3_BUCKET}/${KEY}"
-# pipefail (set in lib.sh) makes a mongodump or age failure fail the whole run
-# instead of silently shipping a truncated/empty archive.
-mongodump --config="$CONF" --archive --gzip --quiet \
-  | age -r "$BACKUP_AGE_RECIPIENT" \
-  | mc pipe --quiet "$DEST"
 
+# The upload is NOT allowed to fail silently, and a failed upload is NOT allowed
+# to leave an object behind.
+#
+# `mongodump | age | mc pipe` looks safe under pipefail, but it is not: if
+# mongodump dies (bad credentials, Mongo restarted, network gone), age still
+# sees a clean EOF and emits a STRUCTURALLY VALID age file wrapping zero bytes,
+# and mc pipe uploads it. pipefail then fails the script — but the object is
+# already in the bucket, and restore-mongo.sh without --key picks "the newest
+# object under mongo/". That is exactly the object it would pick, so the day you
+# need chat history you restore an empty database.
+#
+# So: run the pipeline under `if !` (which does not trip set -e), and on any
+# failure delete what was uploaded before failing the run.
+discard_partial() {
+  warn "removing partial/empty object so a later restore cannot select it: $DEST"
+  mc rm --force "$DEST" >/dev/null 2>&1 \
+    || warn "could NOT remove $DEST — delete it by hand before the next restore"
+}
+
+if ! mongodump --config="$CONF" --archive --gzip --quiet \
+     | age -r "$BACKUP_AGE_RECIPIENT" \
+     | mc pipe --quiet "$DEST"; then
+  discard_partial
+  die "mongodump/age/upload failed — no usable backup was produced"
+fi
+
+# Size is a second, independent gate: it catches the case where every process in
+# the pipeline exits 0 but the dump was empty anyway (e.g. the URI authenticated
+# against an empty database). age itself has ~200 bytes of header+MAC overhead,
+# so anything under the floor is an empty payload, not a small database.
 SIZE="$(mc stat --json "$DEST" 2>/dev/null | sed -n 's/.*"size":\([0-9]*\).*/\1/p' | head -1)"
-[ -n "$SIZE" ] && [ "$SIZE" -gt 0 ] || die "uploaded object is missing or empty: $DEST"
+case "$SIZE" in
+  ''|*[!0-9]*) discard_partial; die "cannot read the size of $DEST — treating as failed" ;;
+esac
+if [ "$SIZE" -lt "${BACKUP_MONGO_MIN_BYTES:-1024}" ]; then
+  discard_partial
+  die "uploaded object is only ${SIZE}B (< ${BACKUP_MONGO_MIN_BYTES:-1024}B) — the dump was empty"
+fi
 log "uploaded ${SIZE} bytes"
 
 # Best-effort pruning. Deliberately non-fatal: if the destination has an

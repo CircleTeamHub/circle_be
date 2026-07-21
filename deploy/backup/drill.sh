@@ -22,6 +22,25 @@ LOG_TAG=drill
 . "$(dirname "$0")/lib.sh"
 
 DRILL_ROOT="${DRILL_ROOT:-/tmp/drill}"
+
+# This script calls `rm -rf "$DRILL_ROOT"` twice, and it runs in a container that
+# mounts the LIVE pg_data volume read-write (pgbackrest has to read the data
+# files it backs up). A mistyped DRILL_ROOT is therefore a delete-production
+# button. Refuse anything that is not clearly scratch space.
+case "$DRILL_ROOT" in
+  /*) ;;
+  *) die "DRILL_ROOT must be an absolute path (got: '$DRILL_ROOT')" ;;
+esac
+case "$DRILL_ROOT" in
+  /|/var|/var/lib|/var/lib/postgresql|/var/lib/postgresql/data|/var/lib/postgresql/data/*|/etc|/etc/*|/opt|/opt/*)
+    die "DRILL_ROOT='$DRILL_ROOT' is at or inside a system/live-data path — refusing to rm -rf it" ;;
+esac
+# Belt and braces: a PG_VERSION file means this is somebody's real cluster,
+# whatever the path looks like.
+for probe in "$DRILL_ROOT" "$DRILL_ROOT/data"; do
+  [ -f "$probe/PG_VERSION" ] && die "DRILL_ROOT='$DRILL_ROOT' contains a real PGDATA ($probe/PG_VERSION) — refusing to destroy it"
+done
+
 DRILL_DIR="$DRILL_ROOT/data"
 DRILL_SOCK="$DRILL_ROOT/sock"
 DRILL_PORT=5433

@@ -321,6 +321,29 @@ docker compose ... run --rm backup run mongo     # dump chat history now
 docker compose ... run --rm backup run drill     # restore drill
 ```
 
+### What the hourly check does and does not cover
+
+`deploy/backup/check.sh` is the only thing that runs unattended, so it is worth
+knowing exactly what a passing check proves.
+
+| Checked hourly | How | Catches |
+|---|---|---|
+| Postgres WAL archiving | `pgbackrest check` forces a segment switch and confirms it landed | overlay dropped (`archive_mode` back to off), expired S3 credentials |
+| Postgres backup freshness | newest `stop` timestamp in `pgbackrest info`, fails over 48h | a stalled or crash-looping schedule |
+| Destination reachability | `mc ls` on the destination bucket | rotated/revoked `BACKUP_S3_*` |
+| **Chat-history freshness** | newest object under `mongo/`, fails over `BACKUP_CHECK_MONGO_MAX_AGE_H` (3h) | the mongo dump failing every run — see below |
+| **Source MinIO readability** | `mc ls` on the source bucket | rotated `BACKUP_MINIO_*`, which breaks every mirror run |
+
+**Not checked, by design:** object-mirror freshness. The mirror only creates
+objects when users upload, so "nothing new this hour" is indistinguishable from
+a broken mirror. The source-credential probe above is the closest proxy; the
+drill is what actually proves the objects are there.
+
+The chat-history check is deliberately conditional on `mongo/` being non-empty:
+`backup_mongo` is profile-gated and legitimately absent until OpenIM is deployed
+(DEPLOY.md stage 5), and a job that was never enabled must not raise an alarm.
+Once a single dump exists, the schedule is assumed live and staleness fails.
+
 ---
 
 ## The restore drill
@@ -458,6 +481,16 @@ collections instead of merging into them.
   model (objects are immutable and referenced by UUID) the failure mode is a
   broken media link, not corruption. A cross-store consistent snapshot would need
   coordinated quiescing and is not worth it here.
+- **A failed Mongo dump deletes its own object.** `mongodump | age | mc pipe` is
+  not safe on its own: if `mongodump` dies, `age` still sees a clean EOF and
+  emits a *structurally valid* archive wrapping zero bytes, which `mc pipe`
+  uploads. `pipefail` fails the run, but the object is already in the bucket —
+  and `restore-mongo.sh` without `--key` picks the **newest** object under
+  `mongo/`, which is exactly that one. So the upload runs under `if !`, and any
+  failure (or an object below `BACKUP_MONGO_MIN_BYTES`) is deleted again before
+  the script exits non-zero. If the delete itself fails — an object-lock window
+  can legitimately block it — the log says so explicitly and the object must be
+  removed by hand before the next restore.
 - **Single repo.** One destination bucket, one provider. If that provider loses
   the bucket, there is no third copy. A second `repo2-*` destination is a
   supported pgBackRest configuration if that risk ever matters.
