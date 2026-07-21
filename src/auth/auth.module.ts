@@ -48,7 +48,8 @@ import { OpenimModule } from 'src/openim/openim.module';
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when
   // BAN/DELETE happens) can revoke a user's sessions without going through
-  // AuthService.
-  exports: [CaslAbilityService, RefreshTokenService],
+  // AuthService. SessionRevocationService is exported so the realtime gateway
+  // can run the same revocation check on WebSocket auth that HTTP runs.
+  exports: [CaslAbilityService, RefreshTokenService, SessionRevocationService],
 })
 export class AuthModule {}

@@ -1,10 +1,48 @@
+import {
+  SESSION_REVOCATION_CHANNEL,
+  parseSessionRevocationBroadcast,
+} from './session-revocation.broadcast';
 import { SessionRevocationService } from './session-revocation.service';
+
+describe('parseSessionRevocationBroadcast', () => {
+  it('accepts well-formed user and session broadcasts', () => {
+    expect(
+      parseSessionRevocationBroadcast(
+        JSON.stringify({ kind: 'user', userId: 'u1', revokedAtMs: 42 }),
+      ),
+    ).toEqual({ kind: 'user', userId: 'u1', revokedAtMs: 42 });
+    expect(
+      parseSessionRevocationBroadcast(
+        JSON.stringify({ kind: 'session', sessionId: 's1' }),
+      ),
+    ).toEqual({ kind: 'session', sessionId: 's1' });
+  });
+
+  it.each([
+    ['not json', 'not json'],
+    ['null', 'null'],
+    ['unknown kind', JSON.stringify({ kind: 'everyone' })],
+    ['missing userId', JSON.stringify({ kind: 'user', revokedAtMs: 1 })],
+    [
+      'empty userId',
+      JSON.stringify({ kind: 'user', userId: '', revokedAtMs: 1 }),
+    ],
+    [
+      'non-numeric stamp',
+      JSON.stringify({ kind: 'user', userId: 'u1', revokedAtMs: 'x' }),
+    ],
+    ['missing sessionId', JSON.stringify({ kind: 'session' })],
+  ])('rejects %s rather than throwing', (_label, message) => {
+    expect(parseSessionRevocationBroadcast(message)).toBeNull();
+  });
+});
 
 describe('SessionRevocationService', () => {
   const redis = {
     isEnabled: jest.fn(),
     getJson: jest.fn(),
     setJson: jest.fn(),
+    publish: jest.fn(),
   };
   const config = { get: jest.fn() };
   const svc = new SessionRevocationService(redis as never, config as never);
@@ -13,6 +51,7 @@ describe('SessionRevocationService', () => {
     jest.clearAllMocks();
     config.get.mockReturnValue(undefined);
     redis.setJson.mockResolvedValue(true);
+    redis.publish.mockResolvedValue(true);
   });
 
   describe('fail-open when Redis is disabled', () => {
@@ -29,6 +68,12 @@ describe('SessionRevocationService', () => {
       await svc.revokeUser('u1');
       await svc.revokeSession('s1');
       expect(redis.setJson).not.toHaveBeenCalled();
+    });
+
+    it('announces nothing, so live sockets are left connected', async () => {
+      await svc.revokeUser('u1');
+      await svc.revokeSession('s1');
+      expect(redis.publish).not.toHaveBeenCalled();
     });
   });
 
@@ -101,6 +146,35 @@ describe('SessionRevocationService', () => {
         1,
         expect.any(Number),
       );
+    });
+
+    it('announces a user revocation on the realtime backplane', async () => {
+      jest.spyOn(Date, 'now').mockReturnValueOnce(1_700_000_000_500);
+      await svc.revokeUser('u1');
+      expect(redis.publish).toHaveBeenCalledWith(
+        SESSION_REVOCATION_CHANNEL,
+        JSON.stringify({
+          kind: 'user',
+          userId: 'u1',
+          revokedAtMs: 1_700_000_000_500,
+        }),
+      );
+    });
+
+    it('announces a session revocation on the realtime backplane', async () => {
+      await svc.revokeSession('s1');
+      expect(redis.publish).toHaveBeenCalledWith(
+        SESSION_REVOCATION_CHANNEL,
+        JSON.stringify({ kind: 'session', sessionId: 's1' }),
+      );
+    });
+
+    it('still revokes when the announce fails', async () => {
+      // The marker is what protects HTTP; a backplane hiccup must not turn a
+      // ban into an error, it just costs the socket-close half.
+      redis.publish.mockRejectedValue(new Error('redis gone'));
+      await expect(svc.revokeUser('u1')).resolves.toBeUndefined();
+      expect(redis.setJson).toHaveBeenCalled();
     });
 
     it('keeps revocation markers for the configured access-token lifetime', async () => {
