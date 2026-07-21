@@ -120,9 +120,10 @@
 > 「我的笔记」的链接。空白标题走的是普通校验失败路径（同 `@MaxLength` 超长），
 > 与全站其它校验错误一致，无需新增 errorCode。
 
-> ⚠️ 同样的空白漏洞在别处也有（如 `CreateNoteDto.title`、`CreateNoteGroupDto.name`
-> 都是 `@IsNotEmpty` 裸用），只是那些地方没有硬编码兜底、影响不同。本次未一并改，
-> 属于独立的清理项。
+> 同样的空白漏洞在别处也有（如 `CreateNoteDto.title`、`CreateNoteGroupDto.name`
+> 都是 `@IsNotEmpty` 裸用），只是那些地方没有硬编码兜底、影响不同 ——
+> 已在后续的 `fix: reject blank note titles and group names` 里一并收拾，
+> 并把这里的内联 `@Transform` 抽成了共享的 `@Trim()`（`src/decorators/trim.decorator.ts`）。
 
 ---
 
