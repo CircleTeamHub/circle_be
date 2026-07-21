@@ -45,7 +45,9 @@ if [ -z "$KEY" ]; then
   KEY="mongo/${KEY#mongo/}"
 fi
 
-CONF="$(mktemp -p /run circle-mongo-XXXXXX.conf)"
+# Template must END in XXXXXX — busybox mktemp (Alpine) rejects a suffix after
+# the placeholder. See the same note in backup-mongo.sh.
+CONF="$(mktemp -p /run circle-mongo-XXXXXX)"
 trap 'rm -f "$CONF"' EXIT
 chmod 600 "$CONF"
 printf 'uri: "%s"\n' "$URI" > "$CONF"

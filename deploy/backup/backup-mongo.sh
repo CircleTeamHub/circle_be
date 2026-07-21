@@ -23,7 +23,11 @@ DEST="backup/${BACKUP_S3_BUCKET}/${KEY}"
 # Keep the URI (which carries the Mongo password) off the process command line
 # and out of the host's `ps` output. /run is a tmpfs in the compose service, so
 # this never reaches disk.
-CONF="$(mktemp -p /run circle-mongo-XXXXXX.conf)"
+# Template must END in XXXXXX: this image is Alpine, so mktemp is busybox's, and
+# unlike GNU mktemp it rejects a suffix after the placeholder ("Invalid
+# argument"). With set -e that killed the job on its first line, meaning the
+# chat-history backup could never have run at all.
+CONF="$(mktemp -p /run circle-mongo-XXXXXX)"
 trap 'rm -f "$CONF"' EXIT
 chmod 600 "$CONF"
 printf 'uri: "%s"\n' "$BACKUP_MONGO_URI" > "$CONF"
@@ -58,15 +62,24 @@ fi
 
 # Size is a second, independent gate: it catches the case where every process in
 # the pipeline exits 0 but the dump was empty anyway (e.g. the URI authenticated
-# against an empty database). age itself has ~200 bytes of header+MAC overhead,
-# so anything under the floor is an empty payload, not a small database.
+# fine but names a database that does not exist).
+#
+# Measured against scripts/test-mongo-backup.sh, which is where these numbers
+# come from rather than guesswork:
+#   an age-wrapped EMPTY archive  =  200 bytes  (header + MAC, no payload)
+#   500 small documents           = 3810 bytes
+# The default sits between them but nearer the floor, because the failure mode
+# of setting it too HIGH is a loud false alarm on a young deployment with very
+# few messages, while setting it too LOW only loses this second line of defence
+# — the pipeline check above is the primary one.
+MIN_BYTES="${BACKUP_MONGO_MIN_BYTES:-512}"
 SIZE="$(mc stat --json "$DEST" 2>/dev/null | sed -n 's/.*"size":\([0-9]*\).*/\1/p' | head -1)"
 case "$SIZE" in
   ''|*[!0-9]*) discard_partial; die "cannot read the size of $DEST — treating as failed" ;;
 esac
-if [ "$SIZE" -lt "${BACKUP_MONGO_MIN_BYTES:-1024}" ]; then
+if [ "$SIZE" -lt "$MIN_BYTES" ]; then
   discard_partial
-  die "uploaded object is only ${SIZE}B (< ${BACKUP_MONGO_MIN_BYTES:-1024}B) — the dump was empty"
+  die "uploaded object is only ${SIZE}B (< ${MIN_BYTES}B) — the dump was empty. If your Mongo genuinely is this small, lower BACKUP_MONGO_MIN_BYTES."
 fi
 log "uploaded ${SIZE} bytes"
 

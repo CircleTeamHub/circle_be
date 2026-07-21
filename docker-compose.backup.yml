@@ -102,7 +102,13 @@ services:
     tmpfs:
       # Secrets only (the Mongo URI conf), so they never touch disk. Small by
       # construction — do NOT add /tmp here, see above.
-      - /run
+      #
+      # mode=1777 is required, not cosmetic: a docker tmpfs mounts 0755 root:root
+      # by default, and these containers run as uid 70, so mktemp in /run fails
+      # with EACCES and the job dies on its first line. The files written here are
+      # created 0600 by mktemp and chmod'd again by the scripts, so a sticky
+      # world-writable directory inside a single-purpose container costs nothing.
+      - /run:mode=1777
 
   # OpenIM 的 Mongo(全部聊天记录)——独立服务,profile 门控。
   #
@@ -144,8 +150,10 @@ services:
       - default
       - openim
     tmpfs:
-      - /run
-      - /tmp
+      # mode=1777 for the same reason as the backup service: default tmpfs is
+      # 0755 root:root and this container runs as uid 70, so mktemp would fail.
+      - /run:mode=1777
+      - /tmp:mode=1777
 
 volumes:
   # postgres 与 backup 共享 postmaster 的 unix socket,让 pgbackrest 能在

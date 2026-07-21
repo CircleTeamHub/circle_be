@@ -66,11 +66,14 @@ fi
 # raise a false alarm.
 MONGO_PREFIX="backup/${BACKUP_S3_BUCKET}/mongo/"
 if [ -n "$(mc ls --recursive "$MONGO_PREFIX" 2>/dev/null | head -1)" ]; then
-  max_h="${BACKUP_CHECK_MONGO_MAX_AGE_H:-3}"
-  if [ -n "$(mc find "$MONGO_PREFIX" --newer-than "${max_h}h" 2>/dev/null | head -1)" ]; then
-    log "OK  mongo: a chat-history dump landed within ${max_h}h"
+  # A duration string, not a bare hour count: `mc find` takes 7d10h31s form, and
+  # expressing the threshold the same way keeps it honest for sub-hour schedules
+  # (and lets the test suite drive it to 1s to prove the alarm actually fires).
+  max_age="${BACKUP_CHECK_MONGO_MAX_AGE:-3h}"
+  if [ -n "$(mc find "$MONGO_PREFIX" --newer-than "$max_age" 2>/dev/null | head -1)" ]; then
+    log "OK  mongo: a chat-history dump landed within ${max_age}"
   else
-    warn "FAIL mongo: NO chat-history dump in the last ${max_h}h."
+    warn "FAIL mongo: NO chat-history dump in the last ${max_age}."
     warn "     Chat history is not being backed up. Check the backup_mongo service:"
     warn "     docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml logs backup_mongo"
     rc=1

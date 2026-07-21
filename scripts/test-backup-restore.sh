@@ -129,6 +129,13 @@ services:
   backup:
     env_file: !override
       - $tmp_env
+
+  # Never started here (profile-gated), but compose validates env_file paths for
+  # EVERY service while parsing, so the operator's real .env.backup would become
+  # a hard requirement for running this test. Point it at the test env instead.
+  backup_mongo:
+    env_file: !override
+      - $tmp_env
 EOF
 
 step "1. building both images, then starting throwaway postgres + S3 stand-in"

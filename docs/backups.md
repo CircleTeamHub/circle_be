@@ -356,7 +356,7 @@ knowing exactly what a passing check proves.
 | Postgres WAL archiving | `pgbackrest check` forces a segment switch and confirms it landed | overlay dropped (`archive_mode` back to off), expired S3 credentials |
 | Postgres backup freshness | newest `stop` timestamp in `pgbackrest info`, fails over 48h | a stalled or crash-looping schedule |
 | Destination reachability | `mc ls` on the destination bucket | rotated/revoked `BACKUP_S3_*` |
-| **Chat-history freshness** | newest object under `mongo/`, fails over `BACKUP_CHECK_MONGO_MAX_AGE_H` (3h) | the mongo dump failing every run — see below |
+| **Chat-history freshness** | newest object under `mongo/`, fails over `BACKUP_CHECK_MONGO_MAX_AGE` (default `3h`) | the mongo dump failing every run — see below |
 | **Source MinIO readability** | `mc ls` on the source bucket | rotated `BACKUP_MINIO_*`, which breaks every mirror run |
 
 **Not checked, by design:** object-mirror freshness. The mirror only creates
@@ -417,6 +417,43 @@ have saved. Nothing outside its own `circle-backup-drill-$$` project is touched.
 ```bash
 scripts/test-backup-restore.sh
 ```
+
+Last verified result:
+
+```
+=== ROUND TRIP PASSED ===
+  rows restored          : 1750 / 1750  (exact match)
+  recovered via WAL only : 750 rows written after the last full backup
+```
+
+250 of those 750 were archived solely by `archive_timeout`, with no manual
+`pg_switch_wal()` — that is the measurement the RPO number rests on.
+
+### Chat-history proof (separate script)
+
+The Postgres round trip says nothing about Mongo, so the chat-history path has
+its own end-to-end test. It seeds a throwaway mongod, runs the real
+`backup-mongo.sh` through `run mongo`, then **decrypts with the age private key
+and restores into a second database** to compare document counts — proving the
+archive is genuinely restorable rather than merely present and plausibly sized.
+
+```bash
+scripts/test-mongo-backup.sh
+```
+
+It also pins down the two failure modes that are otherwise invisible:
+
+```
+round trip             : 500 / 500 documents, decrypted with the age private key
+failed dump            : left 0 objects behind
+stale-dump alarm       : fires
+never-enabled job      : stays quiet
+```
+
+Useful numbers it establishes, which is where `BACKUP_MONGO_MIN_BYTES` gets its
+default: an age-wrapped **empty** archive is **200 bytes**, and 500 small
+documents come to **3810 bytes**. If your own dumps ever approach the floor,
+lower it rather than letting a real backup be discarded as empty.
 
 ---
 
