@@ -447,6 +447,8 @@ export class OpenimService implements OnModuleInit {
       | { kind: 'single'; recvID: string }
       | { kind: 'group'; groupID: string };
     data: Record<string, unknown>;
+    /** 客户端按 customElem.extension 分发渲染（Circle_frontend im/mappers 惯例）。 */
+    extension: string;
     offlinePush?: { title: string; desc: string } | null;
   }): Promise<void> {
     if (!this.enabled) return;
@@ -463,7 +465,7 @@ export class OpenimService implements OnModuleInit {
         content: {
           data: JSON.stringify(params.data),
           description: '',
-          extension: '',
+          extension: params.extension,
         },
         contentType: 110,
         sessionType: single ? 1 : 3,

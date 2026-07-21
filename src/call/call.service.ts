@@ -1106,6 +1106,8 @@ export class CallService {
         senderNickname: initiator?.nickname,
         senderFaceURL: initiator?.avatarUrl ?? null,
         target,
+        // 与 Circle_frontend 的 customElem.extension 判别式约定对齐
+        extension: 'call-record-v1',
         data: {
           type: 'call_record',
           callId: call.id,
