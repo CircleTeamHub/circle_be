@@ -433,6 +433,56 @@ export class OpenimService implements OnModuleInit {
     );
   }
 
+  /**
+   * 服务端补发转账卡片（#100）：与客户端 im 发卡完全同构 ——
+   * contentType 110 + extension 'transfer-card-v1' + data {amount, message}，
+   * 接收端渲染路径无差别。仅单聊。
+   */
+  async sendTransferCardMessage(params: {
+    sendID: string;
+    recvID: string;
+    amount: number;
+    message: string | null;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        recvID: OpenimService.toImUserId(params.recvID),
+        content: {
+          data: JSON.stringify({
+            amount: params.amount,
+            message: params.message,
+          }),
+          description: `[转账] ${params.amount} 积分`,
+          extension: 'transfer-card-v1',
+        },
+        contentType: 110,
+        sessionType: 1,
+        senderNickname: params.senderNickname?.trim() || 'Circle',
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: false,
+        sendTime: Date.now(),
+        offlinePushInfo: {
+          title: params.senderNickname?.trim() || 'Circle',
+          desc: `[转账] ${params.amount} 积分`,
+          ex: '',
+          iOSPushSound: 'default',
+          iOSBadgeCount: true,
+        },
+        ex: '',
+      },
+      adminToken,
+    );
+  }
+
   async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
     if (!this.enabled) return;
 

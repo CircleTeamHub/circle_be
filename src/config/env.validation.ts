@@ -129,6 +129,9 @@ export function createEnvValidationSchema(
     CALL_MAX_PARTICIPANTS: Joi.number().integer().min(2).max(100).default(10),
     CALL_ALLOW_OFFLINE_INVITE: Joi.boolean().default(false),
     CALL_ENABLE_VIDEO: Joi.boolean().default(false),
+    // #95：通知 / 好友动态保留天数。0 = 关闭该表清理。
+    NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(0).default(90),
+    FRIEND_ACTIVITY_RETENTION_DAYS: Joi.number().integer().min(0).default(180),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),

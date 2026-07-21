@@ -607,6 +607,62 @@ export class AuthService {
     return { ...user, lastOnline: now, displayIcons };
   }
 
+  /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义在 email-verification 内。 */
+  async requestPasswordReset(email: string): Promise<void> {
+    await this.emailVerification.requestCode(
+      normalizeEmail(email),
+      'RESET_PASSWORD',
+    );
+  }
+
+  /**
+   * FE#92 忘记密码第二步：验证码换新密码。
+   * 用户不存在与验证码错误共用同一个错误码（防枚举 —— requestCode 已对不存在
+   * 邮箱静默成功，这里对称处理）。成功后撤销全部会话并留业务事件。
+   */
+  async resetPassword(
+    rawEmail: string,
+    code: string,
+    newPassword: string,
+  ): Promise<void> {
+    const email = normalizeEmail(rawEmail);
+    const codeOk = await this.emailVerification.verifyCode(
+      email,
+      'RESET_PASSWORD',
+      code,
+    );
+    if (!codeOk) {
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user || user.status !== 'ACTIVE') {
+      throw new ForbiddenException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
+    }
+
+    const passwordHash = await argon2.hash(newPassword);
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash },
+    });
+    // 重置密码 = 假定凭据可能已泄露：全端下线。
+    await this.refreshTokenService.revokeAll(user.id);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_password_reset_success',
+      actorId: user.id,
+      result: 'success',
+      entityType: 'user',
+      entityId: user.id,
+    });
+  }
+
   async changePassword(
     userId: string,
     oldPassword: string,

@@ -130,6 +130,7 @@ describe('MembershipService', () => {
         amount: -2100,
         balance: 900,
         note: '兑换 VIP3',
+        idempotencyKey: null,
       },
     });
     expect(notificationService.createSystemNotification).toHaveBeenCalledWith(

@@ -2319,6 +2319,40 @@ export class NoteService {
     });
   }
 
+  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
+  async listDeletedNotes(
+    ownerID: string,
+    page = 1,
+    limit = 50,
+  ): Promise<NoteSummaryDto[]> {
+    const take = Math.min(limit, 200);
+    const notes = await this.prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      take,
+      skip: (page - 1) * take,
+      include: NOTE_INCLUDE,
+    });
+    return this.mapSummaryListResolved(notes, ownerID);
+  }
+
+  /**
+   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
+   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动隐藏。
+   */
+  async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    const result = await this.prisma.note.updateMany({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      data: { status: 'ACTIVE' },
+    });
+    if (result.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status in the write to close the TOCTOU window, for

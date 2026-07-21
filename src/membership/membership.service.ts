@@ -29,6 +29,21 @@ export class MembershipService {
     private readonly notificationService: NotificationService,
   ) {}
 
+  /** #91：幂等重试的回放响应 —— 返回当前会员与钱包状态（与首次响应同形）。 */
+  private async currentStateResponse(
+    userId: string,
+    plan: (typeof VIP_PLANS)[number],
+  ): Promise<UpgradeMembershipResponseDto> {
+    const [user, wallet] = await Promise.all([
+      this.prisma.user.findUniqueOrThrow({
+        where: { id: userId },
+        select: { id: true, vipLevel: true, creditScore: true },
+      }),
+      this.prisma.wallet.findUniqueOrThrow({ where: { userID: userId } }),
+    ]);
+    return { user, wallet, plan };
+  }
+
   getPlans(): MembershipPlanDto[] {
     return VIP_PLANS;
   }
@@ -36,6 +51,7 @@ export class MembershipService {
   async upgrade(
     userId: string,
     level: number,
+    idempotencyKey?: string,
   ): Promise<UpgradeMembershipResponseDto> {
     const plan = VIP_PLANS.find((item) => item.level === level);
     if (!plan) {
@@ -43,6 +59,18 @@ export class MembershipService {
         message: 'Invalid VIP level',
         errorCode: MembershipErrorCode.InvalidLevel,
       });
+    }
+
+    // #91：与 coin 转账同款幂等。同 key 的重试直接回放当前状态，不再进扣费
+    // 事务（CAS 已挡住同级双扣，这里挡的是「响应丢失后的盲重试」语义漂移）。
+    if (idempotencyKey) {
+      const priorTx = await this.prisma.coinTransaction.findUnique({
+        where: { idempotencyKey },
+        select: { id: true },
+      });
+      if (priorTx) {
+        return this.currentStateResponse(userId, plan);
+      }
     }
 
     const result = await runSerializableTransaction(this.prisma, async (tx) => {
@@ -115,6 +143,7 @@ export class MembershipService {
           amount: -plan.price,
           balance: wallet.balance,
           note: `兑换 VIP${level}`,
+          idempotencyKey: idempotencyKey ?? null,
         },
       });
 

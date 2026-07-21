@@ -78,6 +78,10 @@ export class EmailVerificationService {
       // 防账号枚举：未注册邮箱静默成功，不创建记录、不发信。
       return;
     }
+    if (purpose === 'RESET_PASSWORD' && !userExists) {
+      // 同上（FE#92 忘记密码）：不存在的邮箱静默成功。
+      return;
+    }
 
     const code = this.generateCode();
     const codeHash = await argon2.hash(code);

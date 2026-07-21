@@ -6,11 +6,26 @@ import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
 } from './notification.dto';
-import { NotificationPushService } from './notification-push.service';
+import {
+  DELIVERY_MAX_ATTEMPTS,
+  NotificationPushService,
+  type ExpoPushPayload,
+} from './notification-push.service';
 
 const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
+/**
+ * Push outbox 处理器（#88 重构后）。
+ *
+ * 旧行为的两处硬伤：outbox 只有整通知一行，部分 token 失败 → 整通知重发 →
+ * 已收到的设备吃重复推送；且发送时重读活的 Notification 行。现在：
+ * - 每 (notification, token) 一条 NotificationPushDelivery 投递行，重试只补发
+ *   仍处 PENDING/FAILED 的 token；SENT/CONFIRMED/TERMINAL 永不重推。
+ * - payload 在第一次处理时组装并快照进 outbox.payload，之后的重试原样重发。
+ * - Expo ticket id 落在投递行上，异步回执由 NotificationPushService.pollReceipts
+ *   消费（死令牌 reap / 可重试错误把 outbox 拉回 PENDING）。
+ */
 @Injectable()
 export class NotificationPushOutboxProcessor {
   private readonly logger = new Logger(NotificationPushOutboxProcessor.name);
@@ -62,39 +77,112 @@ export class NotificationPushOutboxProcessor {
       });
       if (claimed.count === 0) continue;
       try {
-        const delivery = await this.pushService.sendNotification(
-          job.notification.toUserID ?? '',
-          mapNotificationRealtimeDto(job.notification),
-        );
-        if (delivery.status === 'RETRYABLE_FAILURE') {
-          throw new Error(delivery.error || 'Expo push delivery failed');
-        }
-        if (delivery.status === 'TERMINAL_FAILURE') {
+        const userId = job.notification.toUserID ?? '';
+
+        // payload 快照：第一次组装后固化，重试永远发「当初组装的那份」。
+        let payload = job.payload as ExpoPushPayload | null;
+        if (!payload || typeof payload.title !== 'string') {
+          payload = this.pushService.composeMessage(
+            userId,
+            mapNotificationRealtimeDto(job.notification),
+          );
           await this.prisma.notificationPushOutbox.updateMany({
-            where: { id: job.id, leaseToken, status: 'PROCESSING' },
-            data: {
-              status: 'TERMINAL',
-              processedAt: new Date(),
-              lockedAt: null,
-              leaseToken: null,
-              lastError: (
-                delivery.error || 'Terminal Expo ticket failure'
-              ).slice(0, 1000),
-            },
+            where: { id: job.id, leaseToken },
+            // Prisma Json 列入参要求 InputJsonValue；payload 本身就是纯 JSON。
+            data: { payload: JSON.parse(JSON.stringify(payload)) },
           });
+        }
+
+        // 为当前活跃 token 惰性建投递行（幂等：唯一键 + skipDuplicates）。
+        // 注册于「创建后、本次重试前」的新设备也能被补上。
+        const tokens = await this.pushService.listActiveTokens(userId);
+        if (tokens.length > 0) {
+          await this.prisma.notificationPushDelivery.createMany({
+            data: tokens.map((row) => ({
+              outboxID: job.id,
+              notificationID: job.notificationID,
+              token: row.token,
+            })),
+            skipDuplicates: true,
+          });
+        }
+
+        // 只发仍待投的行 —— 这是「部分失败不再殃及已送达设备」的关键。
+        const pendingDeliveries =
+          await this.prisma.notificationPushDelivery.findMany({
+            where: {
+              outboxID: job.id,
+              status: { in: ['PENDING', 'FAILED'] },
+              attempts: { lt: DELIVERY_MAX_ATTEMPTS },
+            },
+            select: { id: true, token: true },
+          });
+
+        if (pendingDeliveries.length === 0) {
+          await this.finishJob(job.id, leaseToken, 'COMPLETED');
+          processed += 1;
           continue;
         }
-        const finished = await this.prisma.notificationPushOutbox.updateMany({
-          where: { id: job.id, leaseToken, status: 'PROCESSING' },
-          data: {
-            status: 'COMPLETED',
-            processedAt: new Date(),
-            lockedAt: null,
-            leaseToken: null,
-            lastError: null,
-          },
-        });
-        if (finished.count > 0) processed += 1;
+
+        const projectByToken = new Map(
+          tokens.map((row) => [row.token, row.projectId]),
+        );
+        const outcomes = await this.pushService.sendToTokens(
+          pendingDeliveries.map((delivery) => ({
+            token: delivery.token,
+            projectId: projectByToken.get(delivery.token) ?? null,
+          })),
+          payload,
+        );
+
+        const deliveryByToken = new Map(
+          pendingDeliveries.map((delivery) => [delivery.token, delivery.id]),
+        );
+        const sentAt = new Date();
+        let retryable = 0;
+        for (const outcome of outcomes) {
+          const deliveryId = deliveryByToken.get(outcome.token);
+          if (!deliveryId) continue;
+          if (outcome.status === 'SENT') {
+            await this.prisma.notificationPushDelivery.update({
+              where: { id: deliveryId },
+              data: {
+                status: 'SENT',
+                ticketID: outcome.ticketId ?? null,
+                sentAt,
+                attempts: { increment: 1 },
+                lastError: null,
+              },
+            });
+          } else if (outcome.status === 'TERMINAL') {
+            await this.prisma.notificationPushDelivery.update({
+              where: { id: deliveryId },
+              data: {
+                status: 'TERMINAL',
+                attempts: { increment: 1 },
+                lastError: (outcome.error ?? 'terminal').slice(0, 1000),
+              },
+            });
+          } else {
+            retryable += 1;
+            await this.prisma.notificationPushDelivery.update({
+              where: { id: deliveryId },
+              data: {
+                status: 'FAILED',
+                attempts: { increment: 1 },
+                lastError: (outcome.error ?? 'retryable').slice(0, 1000),
+              },
+            });
+          }
+        }
+
+        if (retryable > 0) {
+          throw new RetryableDeliveryError(
+            `${retryable}/${outcomes.length} token deliveries retryable`,
+          );
+        }
+        await this.finishJob(job.id, leaseToken, 'COMPLETED');
+        processed += 1;
       } catch (error) {
         const attempts = job.attempts + 1;
         await this.prisma.notificationPushOutbox.updateMany({
@@ -103,16 +191,41 @@ export class NotificationPushOutboxProcessor {
             status: 'FAILED',
             lockedAt: null,
             leaseToken: null,
-            lastError: error instanceof Error ? error.message : String(error),
+            lastError: (error instanceof Error
+              ? error.message
+              : String(error)
+            ).slice(0, 1000),
             nextAttemptAt: new Date(
               Date.now() +
                 Math.min(60 * 60 * 1000, 2 ** Math.min(attempts, 10) * 1000),
             ),
           },
         });
-        this.logger.warn(`Push outbox job ${job.id} failed: ${error}`);
+        if (!(error instanceof RetryableDeliveryError)) {
+          this.logger.warn(`Push outbox job ${job.id} failed: ${error}`);
+        }
       }
     }
     return processed;
   }
+
+  private async finishJob(
+    jobId: string,
+    leaseToken: string,
+    status: 'COMPLETED' | 'TERMINAL',
+  ): Promise<void> {
+    await this.prisma.notificationPushOutbox.updateMany({
+      where: { id: jobId, leaseToken, status: 'PROCESSING' },
+      data: {
+        status,
+        processedAt: new Date(),
+        lockedAt: null,
+        leaseToken: null,
+        lastError: null,
+      },
+    });
+  }
 }
+
+/** 部分 token 可重试失败：走 outbox 退避重试，但不值得按异常告警。 */
+class RetryableDeliveryError extends Error {}

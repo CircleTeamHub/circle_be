@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
@@ -68,6 +69,22 @@ export class CoinController {
       dto.amount,
       idempotencyKey.trim(),
       dto.message,
+    );
+  }
+
+  @Post('gift/card-sent')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  markGiftCardSent(
+    @Headers('idempotency-key') idempotencyKey: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    if (!idempotencyKey || idempotencyKey.trim().length === 0) {
+      throw new BadRequestException('idempotency-key header is required');
+    }
+    // #100：IM 卡片已由客户端送达的回执，阻止服务端补偿 cron 重复发卡。
+    return this.coinService.markGiftCardSent(
+      req.user.userId,
+      idempotencyKey.trim(),
     );
   }
 }

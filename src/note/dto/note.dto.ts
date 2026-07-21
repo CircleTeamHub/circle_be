@@ -269,6 +269,23 @@ export class SetNoteStatusDto {
   status: NoteWritableStatus;
 }
 
+export class RecycleBinQueryDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page = 1;
+
+  @ApiPropertyOptional({ default: 50, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit = 50;
+}
+
 export class ListNotesQueryDto {
   @ApiPropertyOptional({ enum: NOTE_STATUS })
   @IsOptional()
