@@ -16,16 +16,19 @@ import {
   CallStatus,
   CallType,
   CircleMemberStatus,
+  FriendState,
   Prisma,
   UserStatus,
 } from 'src/generated/prisma';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { CreateGroupCallDto } from './dto/call.dto';
+import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 import { LiveKitCallService } from './livekit.service';
 
 const GROUP_SESSION_TYPE = 3;
+// OpenIM 单聊 sessionType。toCallDto 一直会把非 GROUP 映射成 'single'（此前是死分支）。
+const SINGLE_SESSION_TYPE = 1;
 
 type UserLite = {
   id: string;
@@ -109,6 +112,109 @@ export class CallService {
 
     await this.assertGroupMembers(conversationID, participantIDs, initiatorID);
     const users = await this.loadActiveUsers(participantIDs);
+    return this.startCall({
+      initiatorID,
+      conversationID,
+      sessionType: GROUP_SESSION_TYPE,
+      callType: dto.callType,
+      inviteeIDs,
+      users,
+      idempotencyKey,
+    });
+  }
+
+  /**
+   * 1:1 呼叫（#113）。与群呼共享同一条创建管线（busy 检测/幂等/振铃超时/
+   * LiveKit 房间），仅三处不同：成员校验是好友+非拉黑而不是群成员；
+   * sessionType 写 1；两人通话不受 CALL_MAX_PARTICIPANTS 约束。
+   * 非好友与被拉黑共用 CALL_NOT_FRIEND，不向发起方泄露拉黑事实。
+   */
+  async createDirectCall(
+    initiatorID: string,
+    dto: CreateDirectCallDto,
+    idempotencyKey?: string,
+  ) {
+    const calleeID = this.normalizeID(dto.calleeID, 'CALL_NOT_FRIEND');
+    if (calleeID === initiatorID) {
+      throw new BadRequestException({
+        message: 'CALL_INVITEE_INVALID',
+        errorCode: CallErrorCode.InviteeInvalid,
+      });
+    }
+    this.assertCallTypeEnabled(dto.callType);
+    await this.assertDirectCallee(initiatorID, calleeID);
+
+    const participantIDs = [initiatorID, calleeID];
+    const users = await this.loadActiveUsers(participantIDs);
+    // 会话 id 用 OpenIM 单聊规约（si_ + 双方 IM id 升序），与客户端会话一致，
+    // 通话留痕消息（#115）正好落进同一个会话。
+    const conversationID = OpenimService.singleConversationID(
+      initiatorID,
+      calleeID,
+    );
+    return this.startCall({
+      initiatorID,
+      conversationID,
+      sessionType: SINGLE_SESSION_TYPE,
+      callType: dto.callType,
+      inviteeIDs: [calleeID],
+      users,
+      idempotencyKey,
+    });
+  }
+
+  /**
+   * 重连对账（Circle_frontend#93）：断线恢复后客户端问「我现在在通话里吗」，
+   * 而不是靠可能漏掉的事件推断。只返回自己仍是 INVITED/JOINED 的
+   * RINGING/ACTIVE 会话。
+   */
+  async getCurrentCall(userID: string) {
+    const call = (await this.prisma.callSession.findFirst({
+      where: {
+        status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
+        participants: {
+          some: {
+            userID,
+            status: {
+              in: [CallParticipantStatus.INVITED, CallParticipantStatus.JOINED],
+            },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      include: this.callInclude(),
+    })) as CallWithParticipants | null;
+
+    if (!call) {
+      return { call: null, selfParticipant: null };
+    }
+    return {
+      call: this.toCallDto(call),
+      selfParticipant: this.toParticipantDto(
+        this.findParticipant(call, userID),
+      ),
+    };
+  }
+
+  private async startCall(params: {
+    initiatorID: string;
+    conversationID: string;
+    sessionType: number;
+    callType: CallType;
+    inviteeIDs: string[];
+    users: Map<string, UserLite>;
+    idempotencyKey?: string;
+  }) {
+    const {
+      initiatorID,
+      conversationID,
+      sessionType,
+      callType,
+      inviteeIDs,
+      users,
+      idempotencyKey,
+    } = params;
+    const participantIDs = [initiatorID, ...inviteeIDs];
     await this.expireStaleRingingCallsForUsers(participantIDs);
     const existing = await this.findIdempotentCreateCall(
       initiatorID,
@@ -147,8 +253,8 @@ export class CallService {
             data: {
               id: callId,
               conversationID,
-              sessionType: GROUP_SESSION_TYPE,
-              callType: dto.callType,
+              sessionType,
+              callType,
               status: CallStatus.RINGING,
               livekitRoomName,
               initiatorID,
@@ -187,8 +293,11 @@ export class CallService {
     const invitePayload = {
       callId: call.id,
       conversationID,
-      sessionType: 'group' as const,
-      callType: dto.callType,
+      sessionType:
+        sessionType === GROUP_SESSION_TYPE
+          ? ('group' as const)
+          : ('single' as const),
+      callType,
       initiator: users.get(initiatorID)!,
       invitees: inviteeIDs.map((id) => users.get(id)!),
       expiresAt: expiresAt.toISOString(),
@@ -403,6 +512,7 @@ export class CallService {
     this.logger.log(
       `call.ended callId=${callId} reason=${CallEndReason.ALL_LEFT}`,
     );
+    this.emitCallRecordMessage(ended, CallEndReason.ALL_LEFT, leftAt);
   }
 
   async cancelCall(userID: string, callId: string) {
@@ -467,6 +577,7 @@ export class CallService {
       }),
     );
     this.logger.log(`call.canceled callId=${callId} userID=${userID}`);
+    this.emitCallRecordMessage(canceled, CallEndReason.CANCELED, endedAt);
     return this.toCallDto(canceled);
   }
 
@@ -637,6 +748,44 @@ export class CallService {
         throw error;
       }
       throw new ServiceUnavailableException('Group membership unavailable');
+    }
+  }
+
+  /**
+   * 1:1 呼叫的成员校验（#113）：必须是已接受的好友，且双向都没有拉黑。
+   * 两种拒绝共用 CALL_NOT_FRIEND —— 把「对方拉黑了你」翻译成可感知的差异
+   * 等于把拉黑状态做成了探测接口。
+   */
+  private async assertDirectCallee(
+    initiatorID: string,
+    calleeID: string,
+  ): Promise<void> {
+    const [friendship, block] = await Promise.all([
+      this.prisma.friend.findFirst({
+        where: {
+          state: FriendState.ACCEPTED,
+          OR: [
+            { userID: initiatorID, friendID: calleeID },
+            { userID: calleeID, friendID: initiatorID },
+          ],
+        },
+        select: { id: true },
+      }),
+      this.prisma.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: calleeID, blockedID: initiatorID },
+            { blockerID: initiatorID, blockedID: calleeID },
+          ],
+        },
+        select: { id: true },
+      }),
+    ]);
+    if (!friendship || block) {
+      throw new ForbiddenException({
+        message: 'CALL_NOT_FRIEND',
+        errorCode: CallErrorCode.NotFriend,
+      });
     }
   }
 
@@ -827,6 +976,7 @@ export class CallService {
     this.logger.log(
       `call.missed callId=${call.id} reason=${CallEndReason.NO_ANSWER}`,
     );
+    this.emitCallRecordMessage(call, CallEndReason.NO_ANSWER, changedAt);
   }
 
   private async failRingingCallAsError(
@@ -861,6 +1011,7 @@ export class CallService {
     this.logger.log(
       `call.failed callId=${call.id} reason=${CallEndReason.ERROR}`,
     );
+    this.emitCallRecordMessage(call, CallEndReason.ERROR, changedAt);
   }
 
   private async endLiveKitFinishedCall(
@@ -905,6 +1056,83 @@ export class CallService {
     this.logger.log(
       `call.ended callId=${call.id} reason=livekit_room_finished`,
     );
+    this.emitCallRecordMessage(call, CallEndReason.NORMAL, changedAt);
+  }
+
+  /**
+   * 通话留痕消息（#115）：五个终局路径统一在此落一条 contentType 110 的
+   * 自定义消息进会话（data.type='call_record'），客户端渲染可点击的通话记录行。
+   * fire-and-forget：留痕失败绝不能反过来阻断通话收尾（teardown 的
+   * 广播/删房都在留痕之前完成）。只有未接（NO_ANSWER）带离线推送。
+   */
+  private emitCallRecordMessage(
+    call: CallWithParticipants,
+    endReason: CallEndReason,
+    endedAt: Date,
+  ): void {
+    void (async () => {
+      const initiator =
+        call.initiator ??
+        this.findParticipant(call, call.initiatorID ?? '')?.user;
+      if (!call.initiatorID || !call.conversationID) return;
+
+      const durationSeconds =
+        call.startedAt != null
+          ? Math.max(
+              0,
+              Math.floor((endedAt.getTime() - call.startedAt.getTime()) / 1000),
+            )
+          : null;
+
+      const isSingle = call.sessionType !== GROUP_SESSION_TYPE;
+      let target:
+        | { kind: 'single'; recvID: string }
+        | { kind: 'group'; groupID: string };
+      if (isSingle) {
+        const other = call.participants?.find(
+          (participant) => participant.userID !== call.initiatorID,
+        );
+        if (!other) return;
+        target = { kind: 'single', recvID: other.userID };
+      } else {
+        target = {
+          kind: 'group',
+          groupID: this.rawOpenimGroupID(call.conversationID),
+        };
+      }
+
+      await this.openimService.sendCallRecordMessage({
+        sendID: call.initiatorID,
+        senderNickname: initiator?.nickname,
+        senderFaceURL: initiator?.avatarUrl ?? null,
+        target,
+        data: {
+          type: 'call_record',
+          callId: call.id,
+          callType: call.callType ?? 'AUDIO',
+          sessionType: isSingle ? 'single' : 'group',
+          endReason,
+          durationSeconds,
+          initiatorID: call.initiatorID,
+        },
+        offlinePush:
+          endReason === CallEndReason.NO_ANSWER
+            ? {
+                title: initiator?.nickname ?? 'Circle',
+                desc:
+                  call.callType === 'VIDEO'
+                    ? '视频通话未接听'
+                    : '语音通话未接听',
+              }
+            : null,
+      });
+    })().catch((error) => {
+      this.logger.warn(
+        `call record message failed callId=${call.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
   }
 
   private buildTokenResponse(token: string) {
