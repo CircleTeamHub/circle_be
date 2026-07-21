@@ -14,7 +14,9 @@ import { PrismaService } from './prisma/prisma.service';
 import {
   createLivenessHandler,
   createReadinessHandler,
+  type HealthObjectStore,
 } from './health/health.endpoint';
+import { UploadService } from './upload/upload.service';
 import { getServerConfig } from './config/server.config';
 import { createLoggingConfig } from './logging/logging.config';
 import { createRequestLoggerMiddleware } from './logging/request-logger.middleware';
@@ -204,6 +206,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     createReadinessHandler({
       database: app.get(PrismaService),
       redis: redisService,
+      objectStore: getOptionalUploadService(app),
     }),
   );
 
@@ -475,6 +478,24 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // shutdown (otherwise 5xx errors buffered just before SIGTERM are lost).
   return errorAggregation;
 };
+
+/**
+ * UploadService 解析失败时探针报 `disabled` 而不是崩掉 —— 与 Redis 同样的容错方式。
+ * 它只用于报告桶策略状态，不参与任何请求路径。
+ */
+function getOptionalUploadService(
+  app: INestApplication,
+): HealthObjectStore | null {
+  try {
+    const uploadService = app.get(UploadService, { strict: false });
+    return uploadService &&
+      typeof uploadService.objectStoreStatus === 'function'
+      ? uploadService
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 function getOptionalRedisService(app: INestApplication): RedisService | null {
   try {

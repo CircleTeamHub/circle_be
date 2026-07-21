@@ -1181,7 +1181,13 @@ describe('NoteService', () => {
     );
     const body = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     expect(body.subarray(0, 5).toString()).toBe('%PDF-');
-    expect(body.toString('latin1')).toContain('https://cdn.example.com/1.png');
+    // 导出件里嵌的是现签 URL，不再是原始直链（notes/* 已不匿名可读，直链对收件人 403）。
+    expect(body.toString('latin1')).toContain(
+      'https://signed.example.com/notes/user-1/1.png',
+    );
+    expect(body.toString('latin1')).not.toContain(
+      'https://cdn.example.com/1.png',
+    );
     expect(result).toMatchObject({
       filename: 'PDF测试.pdf',
       mimeType: 'application/pdf',
@@ -1190,6 +1196,59 @@ describe('NoteService', () => {
       ),
       expiresAt,
     });
+  });
+
+  // 导出漏在 presign-on-read 改造之外：createLongImageSvg / createPdf 调
+  // buildSectionsFromRow 时不传 presigned map，嵌进导出文件的是原始 URL。
+  // 桶策略把 notes/* 收归私有后，这些链接对任何人都是 403 —— 而长图导出**只有**
+  // URL、PDF 第 5 张往后也只有 URL，等于导出件里全是死链。
+  it('presigns media urls embedded in the long-image (SVG) export', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-svg-presign',
+      ownerID: 'user-1',
+      title: '长图导出',
+      content: '正文',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      media: [
+        {
+          id: 'img-1',
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/1.png',
+          url: 'https://cdn.example.com/circle/notes/user-1/1.png',
+          mimeType: 'image/png',
+          size: 10,
+          sortOrder: 0,
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    uploadService.uploadBuffer.mockResolvedValueOnce({
+      url: 'https://cdn.example.com/note-exports/user-1/note-svg-presign/a.svg',
+      key: 'note-exports/user-1/note-svg-presign/a.svg',
+      size: 512,
+      expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+    });
+
+    await service.createNoteExport('user-1', 'note-svg-presign', {
+      format: 'IMAGE',
+      scope: 'ALL',
+    } as never);
+
+    const body = (
+      uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
+    ).toString();
+    expect(body).toContain('https://signed.example.com/notes/user-1/1.png');
+    // 原始直链不该再出现在导出件里 —— 它对收件人是 403。
+    expect(body).not.toContain(
+      'https://cdn.example.com/circle/notes/user-1/1.png',
+    );
   });
 
   it('includes showcase-only media in PDF and long-image exports', async () => {
@@ -1272,9 +1331,14 @@ describe('NoteService', () => {
     const pdfBody = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     const svgBody = uploadService.uploadBuffer.mock.calls[1][0].body as Buffer;
     expect(pdfBody.toString('latin1')).toContain(
+      'https://signed.example.com/notes/user-1/show.png',
+    );
+    expect(svgBody.toString()).toContain(
+      'https://signed.example.com/notes/user-1/show.png',
+    );
+    expect(svgBody.toString()).not.toContain(
       'https://cdn.example.com/show.png',
     );
-    expect(svgBody.toString()).toContain('https://cdn.example.com/show.png');
   });
 
   it('rejects export requests whose selected media exceed safe limits', async () => {
@@ -1414,8 +1478,10 @@ describe('NoteService', () => {
     expect(uploadService.downloadObjectBuffer).toHaveBeenCalledTimes(4);
     const body = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     const pdfText = body.toString('latin1');
-    expect(pdfText).toContain('https://cdn.example.com/1.png');
-    expect(pdfText).toContain('https://cdn.example.com/8.png');
+    // 超出 MAX_PDF_EMBEDDED_IMAGES 的图片没有嵌入字节，URL 是唯一引用 ——
+    // 正是这些最需要现签，否则导出件里它们全是死链。
+    expect(pdfText).toContain('https://signed.example.com/notes/user-1/1.png');
+    expect(pdfText).toContain('https://signed.example.com/notes/user-1/8.png');
   });
 
   it('uses NOTE_EXPORT_PDF_FONT_PATH when a custom PDF font is configured', () => {
