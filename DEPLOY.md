@@ -527,6 +527,11 @@ cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
 docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
 ```
 
+> 聊天记录备份(OpenIM Mongo)的凭证在**单独的** `.env.backup.mongo`,只有 `backup_mongo`
+> 服务加载它 —— env_file 是整份注入容器的,Mongo 密码放进 `.env.backup` 会连 postgres
+> 容器一起给到,而它根本不需要。另外 `OPENIM_NETWORK` 要写进 `.env`(compose 顶层插值
+> 只认 `.env`/shell,不认 env_file),写在备份配置里不会生效。
+
 > 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
 > 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础
 > 定义重建,**WAL 归档会被静默关掉**。docs/backups.md 里有 `COMPOSE_FILE` 的固定方法,

@@ -253,11 +253,25 @@ private key is needed only at restore time (`restore-mongo.sh --identity`).
 > encryption, because `mc mirror` copies bytes as-is — those are the same media
 > files the app already serves.
 
-### 5. `.env.backup`
+### 5. `.env.backup` and `.env.backup.mongo`
 
 ```bash
-cp .env.backup.example .env.backup && chmod 600 .env.backup
+cp .env.backup.example       .env.backup       && chmod 600 .env.backup
+cp .env.backup.mongo.example .env.backup.mongo && chmod 600 .env.backup.mongo   # only if backing up OpenIM
 ```
+
+**Two files, on purpose.** `docker compose` injects an `env_file` into a service
+wholesale, so every variable in it is readable from inside that container.
+`.env.backup` is loaded by all three services — including `postgres`, which is
+the container most exposed to application traffic. `BACKUP_MONGO_URI` is the
+password to *another system's* database holding every chat message, so it lives
+in `.env.backup.mongo`, which only `backup_mongo` loads. Compromising our
+Postgres should not hand over OpenIM's chat database with it.
+
+> Remaining trade-off, stated rather than hidden: `postgres` still receives the
+> MinIO source credentials from `.env.backup`. They are read-only and scoped to
+> a bucket whose contents postgres can already reference, so the marginal
+> exposure is small — unlike the Mongo URI, which reaches a different system.
 
 Fill in every value. There are no defaults for credentials, deliberately: a
 default credential is a published credential. (The `openim-docker` stack next
@@ -267,6 +281,17 @@ your chat-history backup is protected by a password published in a public repo.)
 
 **`BACKUP_PG_CIPHER_PASS` is not recoverable.** Lose it and every Postgres backup
 is permanently unreadable. Put it in a password manager before you continue.
+
+**`OPENIM_NETWORK` goes in `.env`, not in either file above.** It is a top-level
+compose interpolation (`networks.openim.name`), and compose resolves those from
+`.env` or the shell **only** — never from a service's `env_file`. Setting it in
+`.env.backup` silently does nothing and you fall back to the default
+`openim-docker_openim`:
+
+```bash
+docker network ls                                    # find the real name
+echo 'OPENIM_NETWORK=<name>' >> .env
+```
 
 ---
 

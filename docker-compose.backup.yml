@@ -81,6 +81,16 @@ services:
       # fetches 2 backup sets instead of 7 — for a modest storage cost.
       BACKUP_JOBS: pg-full,pg-diff,minio,check
     volumes:
+      # Read-WRITE, and it has to be. pgbackrest only READS these files to back
+      # them up, but this same container is also the disaster-recovery tool:
+      # `restore-postgres.sh --to /var/lib/postgresql/data` restores in place
+      # (that is the documented break-glass path, and what
+      # scripts/test-backup-restore.sh exercises). Mounting :ro would make the
+      # backups safer and the RESTORE impossible, which is the wrong trade for
+      # a system whose entire purpose is being usable at restore time.
+      # The corresponding risk — a stray rm -rf in this container reaching live
+      # PGDATA — is bounded in drill.sh, which refuses any DRILL_ROOT at or
+      # inside a live data path.
       - pg_data:/var/lib/postgresql/data
       - pg_socket:/var/run/postgresql
       - ./deploy/backup/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
@@ -114,6 +124,20 @@ services:
     user: '70:70'
     env_file:
       - .env.backup
+      # Mongo credentials live in a SECOND file that only this service loads.
+      # env_file is injected into a service wholesale, so putting BACKUP_MONGO_URI
+      # in .env.backup would also hand the OpenIM chat database's password to the
+      # postgres container, which needs none of it. postgres is the container most
+      # exposed to application traffic, and OpenIM is a separate system — that
+      # lateral move should stay closed.
+      #
+      # required: false because compose validates env_file paths for EVERY
+      # service, including profile-gated ones that will never start. Without it,
+      # an operator who is not backing up OpenIM yet (the normal state until
+      # DEPLOY.md stage 5) cannot even parse the stack. The job itself still
+      # fails loudly on a missing BACKUP_MONGO_URI — see require_env in lib.sh.
+      - path: .env.backup.mongo
+        required: false
     environment:
       BACKUP_JOBS: mongo
     networks:
@@ -134,5 +158,9 @@ networks:
   openim:
     # openim-docker 自己创建的网络;我们只加入,不管理。
     # 名字随 openim-docker 的 compose project 名而定,默认 openim-docker_openim。
+    #
+    # OPENIM_NETWORK 必须设在 `.env`(或 shell),不能设在 .env.backup ——
+    # 这是**顶层插值**,compose 只从 .env/shell 解析,service 的 env_file 是注入
+    # 容器用的,不参与文件插值。设错地方不会报错,只会静默回落到下面的默认值。
     external: true
     name: ${OPENIM_NETWORK:-openim-docker_openim}
