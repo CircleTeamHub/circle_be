@@ -455,6 +455,30 @@ default: an age-wrapped **empty** archive is **200 bytes**, and 500 small
 documents come to **3810 bytes**. If your own dumps ever approach the floor,
 lower it rather than letting a real backup be discarded as empty.
 
+### Object-mirror proof (third script)
+
+The object path has its own test too, because the two round trips above say
+nothing about user media. It seeds the app's real MinIO, runs `backup-minio.sh`
+through `run minio`, and compares **checksums** rather than object counts — a
+truncated copy still has the right name.
+
+```bash
+scripts/test-minio-backup.sh
+```
+
+```
+mirror                 : 3 / 3 objects, checksums identical to source
+deletes propagate      : NO — source went to 2, backup stayed at 3
+--dry-run              : wrote nothing
+restore                : 3 / 3 objects back into an emptied bucket, byte-identical
+```
+
+The middle line is the one worth having. "Deletes do not propagate" is what
+stands in for the object versioning R2 does not offer, and it is the whole
+reason the mirror runs without `--remove` and without `--overwrite`. Until this
+test existed it was an assertion in this document; now it is exercised by
+deleting from the source and re-running the scheduled job.
+
 ---
 
 ## Disaster recovery
