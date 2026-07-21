@@ -26,6 +26,31 @@ type CreateRoomInput = {
   metadata?: string;
 };
 
+// #109：LiveKit 出站调用超时。RoomServiceClient 不接受 AbortSignal（Twirp
+// 内部自持 fetch），用 Promise.race 兜底 —— 与 openim.service 的
+// AbortSignal.timeout 同一个动机：LiveKit 不可达且不 RST 时，发起通话的请求
+// 不该挂到平台默认超时。竞输的原请求会在后台自然结束，无资源泄漏风险
+//（HTTP 请求自身有 socket 生命周期）。
+const LIVEKIT_REQUEST_TIMEOUT_MS = 5_000;
+
+async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(`${label} timed out after ${LIVEKIT_REQUEST_TIMEOUT_MS}ms`),
+        ),
+      LIVEKIT_REQUEST_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 @Injectable()
 export class LiveKitCallService {
   private readonly logger = new Logger(LiveKitCallService.name);
@@ -63,11 +88,14 @@ export class LiveKitCallService {
     this.assertConfigured();
 
     try {
-      await this.roomService!.createRoom({
-        name: input.name,
-        maxParticipants: input.maxParticipants,
-        metadata: input.metadata,
-      });
+      await withTimeout(
+        this.roomService!.createRoom({
+          name: input.name,
+          maxParticipants: input.maxParticipants,
+          metadata: input.metadata,
+        }),
+        'LiveKit createRoom',
+      );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       const normalized = reason.toLowerCase();
@@ -85,7 +113,10 @@ export class LiveKitCallService {
     this.assertConfigured();
 
     try {
-      await this.roomService!.deleteRoom(roomName);
+      await withTimeout(
+        this.roomService!.deleteRoom(roomName),
+        'LiveKit deleteRoom',
+      );
     } catch (error) {
       this.logger.warn(
         `Failed to delete LiveKit room ${roomName}: ${

@@ -42,6 +42,7 @@ export class ConversationGroupService {
       // v1: 按 createdAt 排；sortOrder 字段为 v2 拖拽预留。
       // 仍然 prefer sortOrder asc 然后 createdAt asc 作 tiebreaker，未来切换无需迁移数据。
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      take: 200, // #108：防爆护栏，正常用户远够不到（会话分组是个位数量级）
     });
     return groups.map((g) => this.toDto(g));
   }

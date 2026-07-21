@@ -101,6 +101,7 @@ export const TempChatErrorCode = {
   Ended: 'TEMP_CHAT_ENDED',
   Full: 'TEMP_CHAT_FULL',
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
+  JoinFailed: 'TEMP_CHAT_JOIN_FAILED',
 } as const;
 
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
@@ -184,6 +185,8 @@ export const NoteErrorCode = {
   // - 主人侧吊销：链接不存在 / 不属于当前用户，同样共用一个码，不泄漏 id 是否存在。
   // 客户端应按「链接已失效」提示，不要复用笔记的「笔记不存在」文案。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
+  // #94：每用户活跃分享链接达到上限。
+  ShareLinkLimit: 'NOTE_SHARE_LINK_LIMIT',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。
@@ -202,6 +205,11 @@ export const CallErrorCode = {
   NotFound: 'CALL_NOT_FOUND',
   NotAllowed: 'CALL_NOT_ALLOWED',
   AlreadyActive: 'CALL_ALREADY_ACTIVE',
+} as const;
+
+// 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)
+export const UploadErrorCode = {
+  PayloadTooLarge: 'UPLOAD_PAYLOAD_TOO_LARGE',
 } as const;
 
 // 会话分组(本地消息分组):同名分组已存在 / 分组不存在。
@@ -266,6 +274,7 @@ export type AppErrorCode =
   | (typeof CallErrorCode)[keyof typeof CallErrorCode]
   | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode]
   | (typeof ChatHistoryErrorCode)[keyof typeof ChatHistoryErrorCode]
+  | (typeof UploadErrorCode)[keyof typeof UploadErrorCode]
   | (typeof CollectionErrorCode)[keyof typeof CollectionErrorCode]
   | (typeof IconErrorCode)[keyof typeof IconErrorCode]
   | (typeof LikeErrorCode)[keyof typeof LikeErrorCode]
@@ -285,6 +294,7 @@ export const APP_ERROR_CODE_GROUPS = [
   FriendErrorCode,
   NoteErrorCode,
   CallErrorCode,
+  UploadErrorCode,
   ConversationGroupErrorCode,
   ChatHistoryErrorCode,
   CollectionErrorCode,

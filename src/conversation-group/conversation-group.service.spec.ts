@@ -62,6 +62,7 @@ describe('ConversationGroupService', () => {
         where: { ownerID: OWNER_ID },
         include: { memberships: true },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+        take: 200,
       });
       expect(result).toEqual([
         {

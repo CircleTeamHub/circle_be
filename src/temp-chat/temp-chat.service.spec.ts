@@ -176,6 +176,7 @@ describe('TempChatService', () => {
       expect(prisma.tempChat.findMany).toHaveBeenCalledWith({
         where: { hostUserId: 'host-1' },
         orderBy: [{ createdAt: 'desc' }],
+        take: 200,
         include: {
           _count: {
             select: { guests: { where: { provisioningFailedAt: null } } },

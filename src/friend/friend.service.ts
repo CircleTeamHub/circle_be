@@ -780,6 +780,10 @@ export class FriendService {
 
   // ─── Lists ────────────────────────────────────────────────────────────────────
 
+  // #108：无界列表的防爆护栏。这些 take 是「异常防护上限」而不是分页 ——
+  // 正常用户远够不到；够到的说明该端点需要真分页（届时按 trace/plaza 的
+  // cursor 模式补）。FriendActivity 表不参与清理（见 refresh-token.cleanup
+  // 注释），listActivities 的 take 同时是这张只增表的读路径止血带。
   async listFriends(userId: string): Promise<FriendProfileDto[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -787,6 +791,7 @@ export class FriendService {
         state: FriendState.ACCEPTED,
       },
       orderBy: { updatedAt: 'desc' },
+      take: 2000,
     });
 
     const friendIds = records.map((r) =>
@@ -835,6 +840,7 @@ export class FriendService {
       this.prisma.friendTag.findMany({
         where: { ownerID: userId },
         orderBy: { name: 'asc' },
+        take: 500,
       }),
       this.prisma.friendTagOnFriend.findMany({
         where: {
@@ -871,6 +877,7 @@ export class FriendService {
     const records = await this.prisma.friend.findMany({
       where: { friendID: userId, state: FriendState.PENDING },
       orderBy: { createdAt: 'desc' },
+      take: 500,
     });
 
     const senderIds = records.map((r) => r.userID);
@@ -895,6 +902,7 @@ export class FriendService {
     const records = await this.prisma.friend.findMany({
       where: { userID: userId, state: FriendState.PENDING },
       orderBy: { createdAt: 'desc' },
+      take: 500,
     });
 
     const targetIds = records.map((r) => r.friendID);
@@ -922,6 +930,9 @@ export class FriendService {
       where: { viewerId: userId },
       orderBy: { createdAt: 'desc' },
       include: FRIEND_ACTIVITY_INCLUDE,
+      // 只增表 + 全量 include 的读路径（#108）：最近 200 条覆盖 UI 需要，
+      // 未读计数仍由 getUnreadActivityCount 的 count() 权威给出。
+      take: 200,
     });
 
     return activities.map((activity) => this.toFriendActivityDto(activity));
@@ -1149,6 +1160,7 @@ export class FriendService {
       include: {
         blocked: { select: MINI_USER_SELECT },
       },
+      take: 1000,
     });
     return blocks.map((b) => ({ ...b.blocked, blockedAt: b.createdAt }));
   }
@@ -1194,6 +1206,7 @@ export class FriendService {
     return this.prisma.friendTag.findMany({
       where: { ownerID: userId },
       orderBy: { name: 'asc' },
+      take: 500,
     });
   }
 

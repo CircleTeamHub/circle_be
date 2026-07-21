@@ -68,3 +68,24 @@ groups:
           severity: critical
         annotations:
           summary: "Host memory usage > 85% for 5m"
+
+      # #87：私有笔记媒体的桶策略未确认应用 —— notes/* 可能匿名可读。
+      # /readyz 有意不因此变红（策略失败在所有副本相同，fail-closed = 全站故障），
+      # 这条告警是唯一的叫醒机制。
+      - alert: ObjectStorePolicyUnconfirmed
+        expr: max(circle_object_store_policy_unconfirmed) == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Private-media bucket policy unconfirmed — notes/* may be anonymously readable"
+
+      # #102：会话撤销 fail-open 依赖 Redis。Redis 挂掉期间登出/封禁/盗号撤销
+      # 全部静默失效（HTTP 与 WS 同步失效），必须有人处理。
+      - alert: RedisDown
+        expr: max(circle_redis_up) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down — session revocation is silently fail-open while this fires"

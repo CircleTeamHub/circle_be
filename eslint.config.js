@@ -62,6 +62,18 @@ module.exports = [
       '@typescript-eslint/no-unsafe-function-type': 'off',
       '@typescript-eslint/no-unused-expressions': 'off',
       '@typescript-eslint/no-unused-vars': 'off',
+      // #112：永久封死 Prisma 的裸 SQL 注入面。当前用量为 0，此规则是回归
+      // 防线（error 级，不走 advisory 降级）——真需要 raw SQL 时用参数化的
+      // $queryRaw/$executeRaw 模板标签。
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "MemberExpression[property.name='$queryRawUnsafe'], MemberExpression[property.name='$executeRawUnsafe']",
+          message:
+            'Prisma $queryRawUnsafe/$executeRawUnsafe are banned — use the parameterized $queryRaw/$executeRaw template tags instead (#112).',
+        },
+      ],
     },
   },
   // Advisory security / bug-pattern layer (eslint-plugin-security + sonarjs).

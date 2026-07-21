@@ -130,6 +130,7 @@ export class TempChatService {
     const rows = await this.prisma.tempChat.findMany({
       where: { hostUserId },
       orderBy: [{ createdAt: 'desc' }],
+      take: 200, // #108：防爆护栏
       include: {
         _count: {
           select: { guests: { where: { provisioningFailedAt: null } } },
@@ -261,7 +262,10 @@ export class TempChatService {
       );
       await this.compensateGuest(room.groupId, guestImId, guest.id);
       if (err instanceof GoneException) throw err;
-      throw new ServiceUnavailableException('加入失败，请重试');
+      throw new ServiceUnavailableException({
+        message: '加入失败，请重试',
+        errorCode: TempChatErrorCode.JoinFailed,
+      });
     }
   }
 
