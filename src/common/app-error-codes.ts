@@ -218,6 +218,8 @@ export const ChatHistoryErrorCode = {
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
 export const CollectionErrorCode = {
   NotFound: 'COLLECTION_NOT_FOUND',
+  // #104 审查发现：无每用户上限，客户端循环可无界造行。
+  Limit: 'COLLECTION_LIMIT',
 } as const;
 
 // 展示图标 / 系统图标 / 圈子图标选择。(注:图标页暂未接入 getApiErrorMessage,待前端接线。)
