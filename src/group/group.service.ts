@@ -11,16 +11,13 @@ import {
   CircleMemberRole,
   CircleMemberStatus,
   Prisma,
-  ReportReviewStatus,
 } from 'src/generated/prisma';
-import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
-import { reserveCircleSeats } from 'src/circle/circle-capacity';
-import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
+import { GroupErrorCode } from 'src/common/app-error-codes';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
+import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import { InviteGroupMembersDto } from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
@@ -46,7 +43,6 @@ export class GroupService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly openimService: OpenimService,
-    private readonly privacySettings: PrivacySettingsService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
   ) {}
@@ -98,7 +94,7 @@ export class GroupService {
       );
       if (invitableUserIDs.length === 0) return;
 
-      await this.assertInviteTargetsAllowInvites(actorId, invitableUserIDs);
+      await this.assertInviteTargetsAllowInvites(tx, actorId, invitableUserIDs);
       const activatingUserIDs = await this.admissionPolicy.activateMembers(
         tx,
         circle.id,
@@ -109,14 +105,12 @@ export class GroupService {
         return;
       }
 
-      await tx.groupSyncOutbox.createMany({
-        data: activatingUserIDs.map((userID) => ({
-          operation: 'ADD_MEMBER',
-          groupID: openimGroupID,
-          userID,
-        })),
-        skipDuplicates: true,
-      });
+      await enqueueCircleMemberSync(
+        tx,
+        'ADD_MEMBER',
+        openimGroupID,
+        activatingUserIDs,
+      );
     });
 
     return { handled: true };
@@ -205,16 +199,9 @@ export class GroupService {
         },
       });
 
-      await tx.groupSyncOutbox.createMany({
-        data: [
-          {
-            operation: 'REMOVE_MEMBER',
-            groupID: openimGroupID,
-            userID: normalizedTargetUserID,
-          },
-        ],
-        skipDuplicates: true,
-      });
+      await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', openimGroupID, [
+        normalizedTargetUserID,
+      ]);
     });
 
     return { handled: true };
@@ -272,6 +259,14 @@ export class GroupService {
       });
 
       if (!circle || !membership) {
+        if (circle) {
+          await enqueueCircleMemberSync(
+            tx,
+            'REMOVE_MEMBER',
+            this.openimGroupID(circle, normalizedGroupID),
+            [userId],
+          );
+        }
         return;
       }
 
@@ -286,6 +281,12 @@ export class GroupService {
           data: { memberCount: { decrement: 1 } },
         });
       }
+      await enqueueCircleMemberSync(
+        tx,
+        'REMOVE_MEMBER',
+        this.openimGroupID(circle, normalizedGroupID),
+        [userId],
+      );
     });
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);
@@ -368,15 +369,11 @@ export class GroupService {
       }
     }
 
-    // review 修复：重复判定只看 PENDING —— 审结（APPROVED/REJECTED）后的
-    // 再次举报是合法的新违规线索，必须能重新进入审核队列。局部唯一索引
-    //（PENDING-only）兜住并发下的双 PENDING。
     const duplicate = await this.prisma.groupReport.findFirst({
       where: {
         reporterID: reporterId,
         groupID: reportGroupID,
         category: dto.category,
-        status: ReportReviewStatus.PENDING,
       },
       select: { id: true },
     });
@@ -482,39 +479,47 @@ export class GroupService {
   }
 
   private async assertInviteTargetsAllowInvites(
+    tx: Prisma.TransactionClient,
     inviterId: string,
     targetUserIDs: string[],
-  ) {
-    // Resolve the inviter's friends once, then check each target in parallel.
-    // Passing real friendship status keeps FRIENDS_ONLY invite permission
-    // meaningful (hardcoding false would make it behave like NONE), and the
-    // single friend query + Promise.all avoids the prior sequential N+1.
-    const friendSet = new Set(await this.getAcceptedFriendIds(inviterId));
-    const results = await Promise.all(
-      targetUserIDs.map((targetUserID) =>
-        this.privacySettings.canBeInvitedToGroupOrCircle(
-          targetUserID,
-          friendSet.has(targetUserID),
-        ),
+  ): Promise<void> {
+    const [friendships, privacyRows] = await Promise.all([
+      tx.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            { userID: inviterId, friendID: { in: targetUserIDs } },
+            { friendID: inviterId, userID: { in: targetUserIDs } },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      }),
+      tx.userPrivacySetting.findMany({
+        where: { userID: { in: targetUserIDs } },
+        select: { userID: true, groupInvitePermission: true },
+      }),
+    ]);
+    const friendSet = new Set(
+      friendships.map((record) =>
+        record.userID === inviterId ? record.friendID : record.userID,
       ),
     );
-    if (results.some((allowed) => !allowed)) {
+    const permissionByUserID = new Map(
+      privacyRows.map((row) => [row.userID, row.groupInvitePermission]),
+    );
+    const blocked = targetUserIDs.some((targetUserID) => {
+      const permission = permissionByUserID.get(targetUserID) ?? 'EVERYONE';
+      return (
+        permission === 'NONE' ||
+        (permission === 'FRIENDS_ONLY' && !friendSet.has(targetUserID))
+      );
+    });
+    if (blocked) {
       throw new ForbiddenException({
         message: 'User does not allow group invites',
         errorCode: GroupErrorCode.InviteNotAllowed,
       });
     }
-  }
-
-  private async getAcceptedFriendIds(userId: string): Promise<string[]> {
-    const records = await this.prisma.friend.findMany({
-      where: {
-        OR: [{ userID: userId }, { friendID: userId }],
-        state: 'ACCEPTED',
-      },
-      select: { userID: true, friendID: true },
-    });
-    return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
   }
 
   private rawOpenimGroupID(groupID: string): string {

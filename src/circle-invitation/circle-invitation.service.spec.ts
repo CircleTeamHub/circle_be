@@ -49,6 +49,7 @@ describe('CircleInvitationService', () => {
     },
     groupSyncOutbox: {
       createMany: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
     },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),

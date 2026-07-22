@@ -2,12 +2,17 @@ import { GroupSyncOutboxProcessor } from './group-sync-outbox.processor';
 
 describe('GroupSyncOutboxProcessor', () => {
   let prisma: {
+    $transaction: jest.Mock;
+    circle: { findFirst: jest.Mock; findUnique: jest.Mock };
+    circleMember: { findUnique: jest.Mock };
     groupSyncOutbox: {
       findMany: jest.Mock;
+      findUnique: jest.Mock;
       update: jest.Mock;
       updateMany: jest.Mock;
     };
   };
+  let memberLock: { lock: jest.Mock };
   let openim: {
     addGroupMembers: jest.Mock;
     removeGroupMember: jest.Mock;
@@ -16,8 +21,20 @@ describe('GroupSyncOutboxProcessor', () => {
 
   beforeEach(() => {
     prisma = {
+      $transaction: jest.fn(async (callback) => callback(prisma)),
+      circle: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'circle-1' }),
+        findUnique: jest.fn().mockResolvedValue({ groupID: 'group-1' }),
+      },
+      circleMember: {
+        findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }),
+      },
       groupSyncOutbox: {
         findMany: jest.fn(),
+        findUnique: jest.fn().mockImplementation(({ where }) => ({
+          id: where.id,
+          status: 'PROCESSING',
+        })),
         update: jest.fn(),
         updateMany: jest.fn(),
       },
@@ -26,7 +43,12 @@ describe('GroupSyncOutboxProcessor', () => {
       addGroupMembers: jest.fn().mockResolvedValue(undefined),
       removeGroupMember: jest.fn().mockResolvedValue(undefined),
     };
-    processor = new GroupSyncOutboxProcessor(prisma as any, openim as any);
+    memberLock = { lock: jest.fn() };
+    processor = new GroupSyncOutboxProcessor(
+      prisma as any,
+      openim as any,
+      memberLock as any,
+    );
   });
 
   it('processes pending add-member sync jobs and marks them completed', async () => {
@@ -45,6 +67,9 @@ describe('GroupSyncOutboxProcessor', () => {
     await processor.processPending();
 
     expect(openim.addGroupMembers).toHaveBeenCalledWith('group-1', ['user-1']);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.groupSyncOutbox.updateMany.mock.invocationCallOrder[0],
+    );
     expect(prisma.groupSyncOutbox.updateMany).toHaveBeenCalledWith({
       where: {
         id: 'job-1',
@@ -67,6 +92,7 @@ describe('GroupSyncOutboxProcessor', () => {
   });
 
   it('marks failed jobs retryable with backoff', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue(null);
     prisma.groupSyncOutbox.findMany.mockResolvedValue([
       {
         id: 'job-1',
@@ -125,6 +151,7 @@ describe('GroupSyncOutboxProcessor', () => {
   });
 
   it('marks missing remove-member OpenIM errors as completed', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue(null);
     prisma.groupSyncOutbox.findMany.mockResolvedValue([
       {
         id: 'job-1',
@@ -190,5 +217,118 @@ describe('GroupSyncOutboxProcessor', () => {
 
     expect(openim.addGroupMembers).toHaveBeenCalledTimes(1);
     expect(openim.addGroupMembers).toHaveBeenCalledWith('group-1', ['user-1']);
+  });
+
+  it('supersedes a stale ADD when the mapped circle membership is not active', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'job-stale-add',
+        operation: 'ADD_MEMBER',
+        status: 'FAILED',
+        groupID: 'openim-group-1',
+        userID: 'user-1',
+        attempts: 2,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+
+    await processor.processPending();
+
+    expect(prisma.circle.findFirst).toHaveBeenCalledWith({
+      where: {
+        OR: [{ id: 'openim-group-1' }, { groupID: 'openim-group-1' }],
+      },
+      select: { id: true },
+    });
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
+    expect(openim.addGroupMembers).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
+      where: { id: 'job-stale-add' },
+      data: {
+        status: 'COMPLETED',
+        processedAt: expect.any(Date),
+        lastError: 'Superseded stale ADD_MEMBER job',
+        lockedAt: null,
+      },
+    });
+  });
+
+  it('supersedes a stale REMOVE when the mapped membership is active', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'job-stale-remove',
+        operation: 'REMOVE_MEMBER',
+        status: 'PENDING',
+        groupID: 'group-1',
+        userID: 'user-1',
+        attempts: 0,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+
+    await processor.processPending();
+
+    expect(openim.removeGroupMember).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
+      where: { id: 'job-stale-remove' },
+      data: {
+        status: 'COMPLETED',
+        processedAt: expect.any(Date),
+        lastError: 'Superseded stale REMOVE_MEMBER job',
+        lockedAt: null,
+      },
+    });
+  });
+
+  it('does not claim a job that was superseded while waiting for its member lock', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'job-superseded',
+        operation: 'ADD_MEMBER',
+        status: 'PENDING',
+        groupID: 'group-1',
+        userID: 'user-1',
+        attempts: 0,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 0 });
+
+    await processor.processPending();
+
+    expect(openim.addGroupMembers).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.update).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('supersedes an ADD when the locked circle no longer maps to the job group', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'job-old-group',
+        operation: 'ADD_MEMBER',
+        status: 'PENDING',
+        groupID: 'old-group',
+        userID: 'user-1',
+        attempts: 0,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+    prisma.circle.findUnique.mockResolvedValue({ groupID: 'new-group' });
+
+    await processor.processPending();
+
+    expect(memberLock.lock).toHaveBeenCalled();
+    expect(openim.addGroupMembers).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
+      where: { id: 'job-old-group' },
+      data: {
+        status: 'COMPLETED',
+        processedAt: expect.any(Date),
+        lastError: 'Superseded stale ADD_MEMBER job',
+        lockedAt: null,
+      },
+    });
   });
 });

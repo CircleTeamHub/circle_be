@@ -21,6 +21,7 @@ import {
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
+import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
   CircleDetailDto,
   CircleDto,
@@ -410,6 +411,11 @@ export class CircleService {
           where: { id: circleId },
           select: { groupID: true },
         });
+        if (circle?.groupID) {
+          await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
+            userId,
+          ]);
+        }
         return circle?.groupID ?? null;
       },
     );

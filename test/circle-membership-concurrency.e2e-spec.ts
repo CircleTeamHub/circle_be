@@ -4,7 +4,9 @@ import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleService } from 'src/circle/circle.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { GroupService } from 'src/group/group.service';
+import { GroupSyncOutboxProcessor } from 'src/group/group-sync-outbox.processor';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
+import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import { getE2eApp } from './e2e-context';
@@ -36,6 +38,8 @@ describePostgres('Circle membership transition concurrency e2e', () => {
   let groupService: GroupService;
   let invitationService: CircleInvitationService;
   let memberLock: CircleMemberLockService;
+  let outboxProcessor: GroupSyncOutboxProcessor;
+  let openimService: OpenimService;
 
   const createUser = async (label: string) => {
     const id = randomUUID();
@@ -123,6 +127,8 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     groupService = app.get(GroupService);
     invitationService = app.get(CircleInvitationService);
     memberLock = app.get(CircleMemberLockService);
+    outboxProcessor = app.get(GroupSyncOutboxProcessor);
+    openimService = app.get(OpenimService);
   });
 
   it('keeps count consistent when pending activation races circle leave', async () => {
@@ -403,5 +409,111 @@ describePostgres('Circle membership transition concurrency e2e', () => {
         },
       }),
     ).resolves.toBe(1);
+  });
+
+  it('settles a failed ADD before REMOVE and never re-adds after processor restart', async () => {
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+    await prisma.groupSyncOutbox.updateMany({
+      where: {
+        groupID: circle.id,
+        userID: candidate.id,
+        operation: 'ADD_MEMBER',
+      },
+      data: { status: 'FAILED' },
+    });
+
+    await groupService.removeGroupMember(admin!.id, circle.id, candidate.id);
+
+    await expect(
+      prisma.groupSyncOutbox.findMany({
+        where: {
+          groupID: circle.id,
+          userID: candidate.id,
+          status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
+        },
+        select: { operation: true },
+      }),
+    ).resolves.toEqual([{ operation: 'REMOVE_MEMBER' }]);
+
+    const addSpy = jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockResolvedValue(undefined);
+    const removeSpy = jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockResolvedValue(undefined);
+    await outboxProcessor.processPending();
+    await outboxProcessor.processPending();
+
+    expect(addSpy).not.toHaveBeenCalledWith(circle.id, [candidate.id]);
+    expect(
+      removeSpy.mock.calls.filter(
+        ([groupID, userID]) => groupID === circle.id && userID === candidate.id,
+      ),
+    ).toHaveLength(1);
+    await expect(
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('supersedes REMOVE with a later reactivation and applies only ADD', async () => {
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.removeGroupMember(admin!.id, circle.id, candidate.id);
+    await groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+
+    await expect(
+      prisma.groupSyncOutbox.findMany({
+        where: {
+          groupID: circle.id,
+          userID: candidate.id,
+          status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
+        },
+        select: { operation: true },
+      }),
+    ).resolves.toEqual([{ operation: 'ADD_MEMBER' }]);
+
+    const addSpy = jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockResolvedValue(undefined);
+    const removeSpy = jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockResolvedValue(undefined);
+    await outboxProcessor.processPending();
+
+    expect(
+      addSpy.mock.calls.filter(
+        ([groupID, userIDs]) =>
+          groupID === circle.id && userIDs.includes(candidate.id),
+      ),
+    ).toHaveLength(1);
+    expect(removeSpy).not.toHaveBeenCalledWith(circle.id, candidate.id);
+    await expect(
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+        select: { status: true },
+      }),
+    ).resolves.toEqual({ status: CircleMemberStatus.ACTIVE });
   });
 });

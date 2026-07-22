@@ -15,6 +15,7 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
+import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -409,11 +410,14 @@ export class CircleInvitationService {
         [updatedInvitation.applicantID],
         { locksHeld: true },
       );
-      await this.enqueueGroupAdds(
-        tx,
-        updatedInvitation.circle.groupID,
-        admitted,
-      );
+      if (updatedInvitation.circle.groupID) {
+        await enqueueCircleMemberSync(
+          tx,
+          'ADD_MEMBER',
+          updatedInvitation.circle.groupID,
+          admitted,
+        );
+      }
 
       return {
         admission:
@@ -539,11 +543,14 @@ export class CircleInvitationService {
         [pendingInvitation.applicantID],
         { locksHeld: true },
       );
-      await this.enqueueGroupAdds(
-        tx,
-        pendingInvitation.circle.groupID,
-        admitted,
-      );
+      if (pendingInvitation.circle.groupID) {
+        await enqueueCircleMemberSync(
+          tx,
+          'ADD_MEMBER',
+          pendingInvitation.circle.groupID,
+          admitted,
+        );
+      }
 
       return {
         admission:
@@ -639,7 +646,14 @@ export class CircleInvitationService {
             [invitation.applicantID],
             { locksHeld: true },
           );
-          await this.enqueueGroupAdds(tx, invitation.circle.groupID, admitted);
+          if (invitation.circle.groupID) {
+            await enqueueCircleMemberSync(
+              tx,
+              'ADD_MEMBER',
+              invitation.circle.groupID,
+              admitted,
+            );
+          }
           return {
             admitted: admitted.length > 0,
             applicantId: invitation.applicantID,
@@ -901,22 +915,6 @@ export class CircleInvitationService {
         `Failed to add user ${applicantId} to OpenIM group ${groupID}: ${error}`,
       );
     }
-  }
-
-  private async enqueueGroupAdds(
-    tx: Prisma.TransactionClient,
-    groupID: string | null,
-    userIDs: readonly string[],
-  ): Promise<void> {
-    if (!groupID || userIDs.length === 0) return;
-    await tx.groupSyncOutbox.createMany({
-      data: userIDs.map((userID) => ({
-        operation: 'ADD_MEMBER',
-        groupID,
-        userID,
-      })),
-      skipDuplicates: true,
-    });
   }
 
   private async createAndBroadcastInvitationNotification(

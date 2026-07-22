@@ -51,6 +51,10 @@ describe('CircleService', () => {
       create: jest.fn(),
       updateMany: jest.fn(),
     },
+    groupSyncOutbox: {
+      createMany: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
@@ -340,6 +344,42 @@ describe('CircleService', () => {
         status: 'PENDING',
       },
       data: { status: 'CANCELLED' },
+    });
+  });
+
+  it('durably queues the latest REMOVE state when leaving an OpenIM-backed circle', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: 'MEMBER',
+      status: 'ACTIVE',
+    });
+    prisma.circle.findUnique.mockResolvedValue({ groupID: 'group-1' });
+
+    await service.leaveCircle('user-1', 'circle-1');
+
+    expect(prisma.groupSyncOutbox.updateMany).toHaveBeenCalledWith({
+      where: {
+        groupID: 'group-1',
+        userID: { in: ['user-1'] },
+        operation: { not: 'REMOVE_MEMBER' },
+        status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
+      },
+      data: {
+        status: 'COMPLETED',
+        processedAt: expect.any(Date),
+        lockedAt: null,
+        lastError: 'Superseded by desired REMOVE_MEMBER state',
+      },
+    });
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'REMOVE_MEMBER',
+          groupID: 'group-1',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
     });
   });
 
