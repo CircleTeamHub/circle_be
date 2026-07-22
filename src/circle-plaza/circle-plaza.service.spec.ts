@@ -9,6 +9,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { IconService } from 'src/icon/icon.service';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { PlazaErrorCode } from 'src/common/app-error-codes';
 import { CirclePlazaService } from './circle-plaza.service';
 
@@ -125,6 +126,7 @@ describe('CirclePlazaService', () => {
         { provide: RealtimeService, useValue: realtime },
         { provide: NotificationService, useValue: notificationService },
         { provide: IconService, useValue: iconService },
+        MembershipPolicyService,
       ],
     }).compile();
 
@@ -140,6 +142,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
         vipLevel: 0,
+        vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
       });
@@ -193,6 +196,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
         vipLevel: 0,
+        vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
       });
@@ -227,7 +231,8 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 0,
+        vipLevel: 1,
+        vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
       });
@@ -272,6 +277,184 @@ describe('CirclePlazaService', () => {
 
       const where = prisma.circlePost.findMany.mock.calls[0][0].where;
       expect(where.circleLinks.some.circleID.in).toHaveLength(50);
+    });
+
+    it.each([
+      ['regular', 0, 1],
+      ['silver', 1, 5],
+      ['gold', 2, 20],
+      ['diamond', 3, 50],
+      ['super', 4, 1000],
+    ] as const)(
+      'allows the %s city boundary and rejects one above it',
+      async (_tier, vipLevel, cityLimit) => {
+        prisma.circlePost.findMany.mockResolvedValue([]);
+        prisma.circlePost.count.mockResolvedValue(0);
+        prisma.user.findUnique.mockResolvedValue({
+          vipLevel,
+          vipExpiresAt: null,
+          creditScore: 100,
+          fancyNumber: false,
+        });
+        const atLimit = Array.from(
+          { length: cityLimit },
+          (_, index) => `city-${index}`,
+        );
+
+        await expect(
+          service.getFeed('viewer-1', { cities: atLimit } as any),
+        ).resolves.toMatchObject({ items: [] });
+        expect(
+          prisma.circlePost.findMany.mock.calls[0][0].where.cities.hasSome,
+        ).toEqual(atLimit);
+
+        await expect(
+          service.getFeed('viewer-1', {
+            cities: [...atLimit, 'one-too-many'],
+          } as any),
+        ).rejects.toMatchObject({
+          response: {
+            errorCode: 'CITY_FILTER_QUOTA_REACHED',
+            quota: 'city-filters',
+            limit: cityLimit,
+            current: cityLimit + 1,
+          },
+        });
+      },
+    );
+
+    it('normalizes city filters before applying the membership quota', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', {
+        cities: [' Shanghai ', '', 'Shanghai', '  ', 'Hangzhou'],
+      } as any);
+
+      expect(
+        prisma.circlePost.findMany.mock.calls[0][0].where.cities.hasSome,
+      ).toEqual(['Shanghai', 'Hangzhou']);
+    });
+
+    it('treats an expired paid viewer as regular for city filters', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await expect(
+        service.getFeed('viewer-1', {
+          cities: ['Shanghai', 'Hangzhou'],
+        } as any),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: 'CITY_FILTER_QUOTA_REACHED',
+          limit: 1,
+          current: 2,
+        },
+      });
+      expect(prisma.circlePost.findMany).not.toHaveBeenCalled();
+    });
+
+    it('builds the same selected-circle and city query for GET and body inputs', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', {
+        circleIds: 'circle-1,circle-2',
+        cities: ' Shanghai,Hangzhou,Shanghai, ',
+      });
+      const getWhere = prisma.circlePost.findMany.mock.calls[0][0].where;
+
+      await service.getFeed('viewer-1', {
+        circleIds: ['circle-1', 'circle-2'],
+        cities: [' Shanghai', 'Hangzhou', 'Shanghai', ' '],
+      } as any);
+      const bodyWhere = prisma.circlePost.findMany.mock.calls[1][0].where;
+
+      expect(bodyWhere).toEqual(getWhere);
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the legacy single city compatible with the same quota path', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 0,
+        vipExpiresAt: null,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', { city: 'Shanghai' });
+
+      expect(prisma.circlePost.findMany.mock.calls[0][0].where.cities).toEqual({
+        has: 'Shanghai',
+      });
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses effective membership for feed interaction and signup eligibility', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([
+        {
+          id: 'post-1',
+          content: 'restricted',
+          images: [],
+          tags: [],
+          city: null,
+          cities: [],
+          isHorn: false,
+          noteID: null,
+          vipRestriction: 1,
+          creditRestriction: null,
+          fancyRestriction: false,
+          viewCount: 0,
+          signupCount: 0,
+          signupVipRestriction: 1,
+          signupCreditRestriction: null,
+          signupFancyRestriction: false,
+          createdAt: new Date('2026-07-21T00:00:00.000Z'),
+          expiresAt: new Date('2026-07-23T00:00:00.000Z'),
+          author: {
+            id: 'author-1',
+            nickname: 'Author',
+            avatarUrl: null,
+            avatarFrame: null,
+            accountId: '1001',
+          },
+          circle: { id: 'circle-1', name: 'Circle' },
+          circleLinks: [],
+        },
+      ]);
+      prisma.circlePost.count.mockResolvedValue(1);
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      const result = await service.getFeed('viewer-1', {});
+
+      expect(result.items[0]).toMatchObject({
+        canInteract: false,
+        canSignup: false,
+      });
     });
 
     it('includes the post author display icons in feed DTOs', async () => {
@@ -438,6 +621,7 @@ describe('CirclePlazaService', () => {
       realtime as any,
       notificationService as any,
       iconService as any,
+      new MembershipPolicyService(prisma as any),
     );
     prisma.circleMember.findMany.mockResolvedValue([
       {
@@ -583,6 +767,75 @@ describe('CirclePlazaService', () => {
         }),
       }),
     );
+  });
+
+  it.each(['vipRestriction', 'signupVipRestriction'] as const)(
+    'rejects %s above the author effective membership',
+    async (restriction) => {
+      prisma.circleMember.findMany.mockImplementation((args: any) =>
+        Promise.resolve(
+          args?.select?.userID
+            ? []
+            : [
+                {
+                  circleID: 'circle-1',
+                  status: 'ACTIVE',
+                  role: 'MEMBER',
+                  circle: { deleted: false, memberCanPost: true },
+                },
+              ],
+        ),
+      );
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 2,
+        vipExpiresAt: null,
+      });
+
+      await expect(
+        service.createPost('user-1', {
+          circleId: 'circle-1',
+          content: 'hello plaza',
+          [restriction]: 3,
+        }),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: 'PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR',
+          limit: 2,
+        },
+      });
+      expect(prisma.circlePost.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('treats an expired post author as regular for restriction ceilings', async () => {
+    prisma.circleMember.findMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args?.select?.userID
+          ? []
+          : [
+              {
+                circleID: 'circle-1',
+                status: 'ACTIVE',
+                role: 'MEMBER',
+                circle: { deleted: false, memberCanPost: true },
+              },
+            ],
+      ),
+    );
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+    });
+
+    await expect(
+      service.createPost('user-1', {
+        circleId: 'circle-1',
+        content: 'hello plaza',
+        vipRestriction: 1,
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR', limit: 0 },
+    });
   });
 
   it('fans out a new-activity notification to active circle members after publishing', async () => {
@@ -1013,7 +1266,12 @@ describe('CirclePlazaService', () => {
             },
           },
         },
-        select: { id: true },
+        select: {
+          id: true,
+          signupVipRestriction: true,
+          signupCreditRestriction: true,
+          signupFancyRestriction: true,
+        },
       });
       expect(prisma.circlePostSignup.create).toHaveBeenCalledWith({
         data: { postID: 'post-1', userID: 'user-2' },
@@ -1745,9 +2003,49 @@ describe('CirclePlazaService', () => {
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue({
         vipLevel: 1,
+        vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
       });
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects signup when paid membership is expired', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.circlePostSignup.create).not.toHaveBeenCalled();
+    });
+
+    it('rechecks effective membership inside the signup transaction', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
+      prisma.circlePostSignup.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique
+        .mockResolvedValueOnce({
+          vipLevel: 3,
+          vipExpiresAt: new Date('2099-01-01T00:00:00.000Z'),
+          creditScore: 100,
+          fancyNumber: false,
+        })
+        .mockResolvedValueOnce({
+          vipLevel: 3,
+          vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+          creditScore: 100,
+          fancyNumber: false,
+        });
 
       await expect(service.signupForPost('user-2', 'post-1')).rejects.toThrow(
         ForbiddenException,

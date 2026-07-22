@@ -176,11 +176,13 @@ export class PlazaFeedQueryDto {
 
   @ApiPropertyOptional()
   @IsString()
+  @MaxLength(100)
   @IsOptional()
   city?: string;
 
-  @ApiPropertyOptional({ description: 'Comma-separated city names' })
+  @ApiPropertyOptional({ description: 'Comma-separated city names (legacy)' })
   @IsString()
+  @MaxLength(4096)
   @IsOptional()
   cities?: string;
 
@@ -207,6 +209,49 @@ export class PlazaFeedQueryDto {
   @IsString()
   @IsOptional()
   @MaxLength(200)
+  cursor?: string;
+}
+
+export class PlazaFeedSearchDto {
+  @ApiPropertyOptional()
+  @IsString()
+  @IsNotEmpty()
+  @IsOptional()
+  circleId?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayMaxSize(50)
+  @IsOptional()
+  circleIds?: string[];
+
+  @ApiProperty({ type: [String], maxItems: 1000 })
+  @IsArray()
+  @IsString({ each: true })
+  @MaxLength(100, { each: true })
+  @ArrayMaxSize(1000)
+  cities: string[];
+
+  @ApiPropertyOptional({ default: 1 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page?: number;
+
+  @ApiPropertyOptional({ default: 20 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit?: number;
+
+  @ApiPropertyOptional({ description: 'Keyset cursor from the previous page' })
+  @IsString()
+  @MaxLength(200)
+  @IsOptional()
   cursor?: string;
 }
 

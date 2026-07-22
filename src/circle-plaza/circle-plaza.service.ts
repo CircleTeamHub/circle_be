@@ -20,6 +20,8 @@ import { NotificationService } from 'src/notification/notification.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { IconService } from 'src/icon/icon.service';
 import { likedOnToday } from 'src/like/like.util';
+import { MembershipLevel } from 'src/membership/membership.catalog';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   decodeFeedCursor,
   encodeFeedCursor,
@@ -30,6 +32,7 @@ import {
   CreatePlazaPostDto,
   MyCirclePostDto,
   PlazaFeedQueryDto,
+  PlazaFeedSearchDto,
   PlazaPostDto,
   PostSignupItemDto,
 } from './dto/circle-plaza.dto';
@@ -46,10 +49,9 @@ type PlazaPostWithRelations = Prisma.CirclePostGetPayload<{
 }>;
 
 // The viewer fields that gate post interaction / signup eligibility.
-type ViewerEntitlements = Pick<
-  User,
-  'vipLevel' | 'creditScore' | 'fancyNumber'
->;
+type ViewerEntitlements = Pick<User, 'creditScore' | 'fancyNumber'> & {
+  membershipLevel: MembershipLevel;
+};
 
 // The post restriction fields each eligibility check reads. Picking them keeps
 // both the full-post and the narrowly-`select`ed callers type-safe — a typo'd
@@ -82,6 +84,7 @@ export class CirclePlazaService {
     private readonly realtime: RealtimeService,
     private readonly notificationService: NotificationService,
     private readonly iconService: IconService,
+    private readonly membershipPolicy: MembershipPolicyService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -89,13 +92,28 @@ export class CirclePlazaService {
   // 逗号分隔的过滤列表最多接受这么多项，防止恶意超长入参生成超大 IN 子句。
   private static readonly MAX_FILTER_ITEMS = 50;
 
-  private parseCommaList(value: string | undefined): string[] {
+  private parseCommaList(
+    value: string | string[] | undefined,
+    maxItems = CirclePlazaService.MAX_FILTER_ITEMS,
+  ): string[] {
     if (!value) return [];
-    return value
-      .split(',')
+    const items = Array.isArray(value) ? value : value.split(',');
+    return items
       .map((item) => item.trim())
       .filter(Boolean)
-      .slice(0, CirclePlazaService.MAX_FILTER_ITEMS);
+      .slice(0, maxItems);
+  }
+
+  private normalizeCities(values: readonly string[]): string[] {
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const raw of values) {
+      const city = raw.trim();
+      if (!city || seen.has(city)) continue;
+      seen.add(city);
+      normalized.push(city);
+    }
+    return normalized;
   }
 
   // 建帖城市多选归一化：优先用 cities，回落到旧的单个 city；去空白 + 去重 + 限量。
@@ -245,6 +263,33 @@ export class CirclePlazaService {
 
     const { post, publishedNotifications } = await this.prisma.$transaction(
       async (tx) => {
+        const author = await tx.user.findUnique({
+          where: { id: userId },
+          select: { vipLevel: true, vipExpiresAt: true },
+        });
+        if (!author) {
+          throw new NotFoundException({
+            message: 'User not found',
+            errorCode: PlazaErrorCode.NotActiveMember,
+          });
+        }
+        const authorLevel = this.membershipPolicy.resolve(
+          author,
+          new Date(),
+        ).level;
+        const requestedVipRestriction = Math.max(
+          dto.vipRestriction ?? 0,
+          dto.signupVipRestriction ?? 0,
+        );
+        if (requestedVipRestriction > authorLevel) {
+          throw new ForbiddenException({
+            message: 'Post VIP restriction exceeds author membership',
+            errorCode: PlazaErrorCode.VipRestrictionExceedsAuthor,
+            limit: authorLevel,
+            details: { limit: authorLevel },
+          });
+        }
+
         const created = await tx.circlePost.create({
           data: {
             content: dto.content,
@@ -362,7 +407,7 @@ export class CirclePlazaService {
 
   async getFeed(
     viewerId: string,
-    query: PlazaFeedQueryDto,
+    query: PlazaFeedQueryDto | PlazaFeedSearchDto,
   ): Promise<{
     items: PlazaPostDto[];
     total: number | null;
@@ -383,7 +428,48 @@ export class CirclePlazaService {
     const skip = useKeyset ? 0 : (page - 1) * limit;
 
     const circleIds = this.parseCommaList(query.circleIds);
-    const cities = this.parseCommaList(query.cities);
+    const legacyCities =
+      'city' in query && query.city ? this.normalizeCities([query.city]) : [];
+    const cities =
+      legacyCities.length > 0
+        ? legacyCities
+        : this.normalizeCities(this.parseCommaList(query.cities, 1001));
+
+    const viewer = await this.prisma.user.findUnique({
+      where: { id: viewerId },
+      select: {
+        vipLevel: true,
+        vipExpiresAt: true,
+        creditScore: true,
+        fancyNumber: true,
+      },
+    });
+    const policy = this.membershipPolicy.resolve(
+      viewer ?? { vipLevel: 0, vipExpiresAt: null },
+      new Date(),
+    );
+    const cityLimit = policy.tier.quotas.cityFilters.actual;
+    if (cities.length > cityLimit) {
+      throw new ForbiddenException({
+        message: 'City filter quota reached',
+        errorCode: PlazaErrorCode.CityFilterQuotaReached,
+        quota: 'city-filters',
+        limit: cityLimit,
+        current: cities.length,
+        details: {
+          quota: 'city-filters',
+          limit: cityLimit,
+          current: cities.length,
+        },
+      });
+    }
+    const viewerEntitlements: ViewerEntitlements | null = viewer
+      ? {
+          membershipLevel: policy.level,
+          creditScore: viewer.creditScore,
+          fancyNumber: viewer.fancyNumber,
+        }
+      : null;
 
     // 可见性 + 圈子筛选合并进同一个 link 条件：一条动态只有当它 link 到
     // 「viewer 是成员的那个圈子」时，才在该圈 feed 出现——杜绝跨圈泄露
@@ -403,8 +489,8 @@ export class CirclePlazaService {
     };
     // 城市筛选走 cities[] 数组谓词（旧数据已回填 cities，故仍能命中）：
     // 单城市 = 数组包含该城市；多城市 = 数组与筛选集有交集。
-    if (query.city) {
-      whereBase.cities = { has: query.city };
+    if (cities.length === 1 && 'city' in query && query.city) {
+      whereBase.cities = { has: cities[0] };
     } else if (cities.length > 0) {
       whereBase.cities = { hasSome: cities };
     }
@@ -414,7 +500,7 @@ export class CirclePlazaService {
 
     // Keyset fetches one extra row to decide `hasMore` without a count();
     // offset still returns an accurate `total` for the legacy page-number UI.
-    const [rows, total, viewer] = await Promise.all([
+    const [rows, total] = await Promise.all([
       this.prisma.circlePost.findMany({
         where,
         include: {
@@ -428,10 +514,6 @@ export class CirclePlazaService {
       useKeyset
         ? Promise.resolve<number | null>(null)
         : this.prisma.circlePost.count({ where }),
-      this.prisma.user.findUnique({
-        where: { id: viewerId },
-        select: { vipLevel: true, creditScore: true, fancyNumber: true },
-      }),
     ]);
 
     const hasMore = useKeyset
@@ -459,9 +541,9 @@ export class CirclePlazaService {
     const items = posts.map((post) =>
       this.toPlazaPostDto(
         post,
-        this.checkCanInteract(post, viewer),
+        this.checkCanInteract(post, viewerEntitlements),
         signedSet.has(post.id),
-        this.checkCanSignup(post, viewer),
+        this.checkCanSignup(post, viewerEntitlements),
         displayIconsByAuthor.get(post.author.id) ?? [],
       ),
     );
@@ -469,7 +551,7 @@ export class CirclePlazaService {
     this.logger.debug(
       `plaza feed: viewer=${viewerId} ` +
         `circleFilter=${query.circleId ?? circleIds.length} ` +
-        `cityFilter=${query.city ?? cities.length} ` +
+        `cityFilter=${('city' in query && query.city) || cities.length} ` +
         `mode=${useKeyset ? 'keyset' : 'offset'} page=${page} ` +
         `returned=${posts.length} total=${total ?? '-'}`,
     );
@@ -495,7 +577,12 @@ export class CirclePlazaService {
       }),
       this.prisma.user.findUnique({
         where: { id: viewerId },
-        select: { vipLevel: true, creditScore: true, fancyNumber: true },
+        select: {
+          vipLevel: true,
+          vipExpiresAt: true,
+          creditScore: true,
+          fancyNumber: true,
+        },
       }),
     ]);
 
@@ -547,11 +634,20 @@ export class CirclePlazaService {
       this.getDisplayIconsByAuthorIds([post.author.id]),
     ]);
 
+    const viewerEntitlements: ViewerEntitlements | null = viewer
+      ? {
+          membershipLevel: this.membershipPolicy.resolve(viewer, new Date())
+            .level,
+          creditScore: viewer.creditScore,
+          fancyNumber: viewer.fancyNumber,
+        }
+      : null;
+
     return this.toPlazaPostDto(
       post,
-      this.checkCanInteract(post, viewer),
+      this.checkCanInteract(post, viewerEntitlements),
       Boolean(signed),
-      this.checkCanSignup(post, viewer),
+      this.checkCanSignup(post, viewerEntitlements),
       displayIconsByAuthor.get(post.author.id) ?? [],
     );
   }
@@ -735,9 +831,22 @@ export class CirclePlazaService {
     // 报名资格校验（独立于帖子查看限制 vipRestriction，仅看 signup* 门槛）
     const viewer = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { vipLevel: true, creditScore: true, fancyNumber: true },
+      select: {
+        vipLevel: true,
+        vipExpiresAt: true,
+        creditScore: true,
+        fancyNumber: true,
+      },
     });
-    if (!this.checkCanSignup(post, viewer)) {
+    const viewerEntitlements: ViewerEntitlements | null = viewer
+      ? {
+          membershipLevel: this.membershipPolicy.resolve(viewer, new Date())
+            .level,
+          creditScore: viewer.creditScore,
+          fancyNumber: viewer.fancyNumber,
+        }
+      : null;
+    if (!this.checkCanSignup(post, viewerEntitlements)) {
       throw new ForbiddenException({
         message: '您的等级不满足该帖子的报名要求',
         errorCode: PlazaErrorCode.SignupIneligible,
@@ -755,12 +864,44 @@ export class CirclePlazaService {
               some: { circle: this.memberCircleScope(userId) },
             },
           },
-          select: { id: true },
+          select: {
+            id: true,
+            signupVipRestriction: true,
+            signupCreditRestriction: true,
+            signupFancyRestriction: true,
+          },
         });
         if (!stillAuthorized) {
           throw new NotFoundException({
             message: 'Post not found',
             errorCode: PlazaErrorCode.PostNotFound,
+          });
+        }
+
+        const authoritativeViewer = await tx.user.findUnique({
+          where: { id: userId },
+          select: {
+            vipLevel: true,
+            vipExpiresAt: true,
+            creditScore: true,
+            fancyNumber: true,
+          },
+        });
+        const authoritativeEntitlements: ViewerEntitlements | null =
+          authoritativeViewer
+            ? {
+                membershipLevel: this.membershipPolicy.resolve(
+                  authoritativeViewer,
+                  new Date(),
+                ).level,
+                creditScore: authoritativeViewer.creditScore,
+                fancyNumber: authoritativeViewer.fancyNumber,
+              }
+            : null;
+        if (!this.checkCanSignup(stillAuthorized, authoritativeEntitlements)) {
+          throw new ForbiddenException({
+            message: '您的等级不满足该帖子的报名要求',
+            errorCode: PlazaErrorCode.SignupIneligible,
           });
         }
 
@@ -1390,7 +1531,10 @@ export class CirclePlazaService {
   ): boolean {
     if (!viewer) return false;
 
-    if (post.vipRestriction != null && viewer.vipLevel < post.vipRestriction) {
+    if (
+      post.vipRestriction != null &&
+      viewer.membershipLevel < post.vipRestriction
+    ) {
       return false;
     }
     if (
@@ -1412,7 +1556,7 @@ export class CirclePlazaService {
     if (!viewer) return false;
     if (
       post.signupVipRestriction != null &&
-      viewer.vipLevel < post.signupVipRestriction
+      viewer.membershipLevel < post.signupVipRestriction
     ) {
       return false;
     }

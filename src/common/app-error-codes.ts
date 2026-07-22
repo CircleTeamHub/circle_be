@@ -132,6 +132,8 @@ export const PlazaErrorCode = {
   ReportSelf: 'PLAZA_REPORT_SELF',
   NotCircleMember: 'PLAZA_NOT_CIRCLE_MEMBER',
   InvalidCursor: 'PLAZA_INVALID_CURSOR',
+  CityFilterQuotaReached: 'CITY_FILTER_QUOTA_REACHED',
+  VipRestrictionExceedsAuthor: 'PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR',
 } as const;
 
 // 朋友圈动态(moments):动态/评论不存在、仅作者可删、无权访问(隐私/好友可见)。

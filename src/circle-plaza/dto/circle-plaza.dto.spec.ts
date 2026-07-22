@@ -3,6 +3,7 @@ import { validateSync } from 'class-validator';
 import {
   CreatePlazaPostDto,
   PlazaFeedQueryDto,
+  PlazaFeedSearchDto,
   RecognizePostCollaboratorsDto,
 } from './circle-plaza.dto';
 
@@ -44,6 +45,34 @@ describe('PlazaFeedQueryDto', () => {
     });
 
     expect(validateSync(dto)).toHaveLength(0);
+  });
+});
+
+describe('PlazaFeedSearchDto', () => {
+  it('accepts 1000 city filters without truncation', () => {
+    const cities = Array.from({ length: 1000 }, (_, index) => `city-${index}`);
+    const dto = plainToInstance(PlazaFeedSearchDto, { cities });
+
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.cities).toEqual(cities);
+  });
+
+  it('rejects 1001 city filters', () => {
+    const dto = plainToInstance(PlazaFeedSearchDto, {
+      cities: Array.from({ length: 1001 }, (_, index) => `city-${index}`),
+    });
+
+    const error = validateSync(dto).find((item) => item.property === 'cities');
+    expect(error).toHaveProperty('constraints.arrayMaxSize');
+  });
+
+  it('rejects an overlong city name', () => {
+    const dto = plainToInstance(PlazaFeedSearchDto, {
+      cities: ['x'.repeat(101)],
+    });
+
+    const error = validateSync(dto).find((item) => item.property === 'cities');
+    expect(error).toHaveProperty('constraints.maxLength');
   });
 });
 
