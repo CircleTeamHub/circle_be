@@ -15,13 +15,16 @@ export type AuditInput = {
   metadata?: Record<string, unknown>;
 };
 
+// AdminAuditLog 与治理侧（moderation）共用一张表，列名沿用先落地的
+// actorID / entityType / entityID；管理台对外讲的是 actor / target。两套名字
+// 只在这一层来回转换，调用方和 HTTP 契约看到的始终是 target 语义。
 const PUBLIC_AUDIT_SELECT = {
   id: true,
-  actorId: true,
+  actorID: true,
   actorAccountId: true,
   action: true,
-  targetType: true,
-  targetId: true,
+  entityType: true,
+  entityID: true,
   before: true,
   after: true,
   reason: true,
@@ -32,8 +35,24 @@ const PUBLIC_AUDIT_SELECT = {
   createdAt: true,
 } as const;
 
+type AuditRow = Prisma.AdminAuditLogGetPayload<{
+  select: typeof PUBLIC_AUDIT_SELECT;
+}>;
+
+function toAuditView(row: AuditRow) {
+  const { actorID, actorAccountId, entityType, entityID, ...rest } = row;
+  return {
+    ...rest,
+    actorId: actorID,
+    // 治理侧不记账号，回落到 actorID，管理台列表不会出现空的操作人。
+    actorAccountId: actorAccountId ?? actorID,
+    targetType: entityType,
+    targetId: entityID,
+  };
+}
+
 @Injectable()
-export class AdminAuditService {
+export class AdminUserAuditService {
   constructor(private readonly prisma: PrismaService) {}
 
   recordInTransaction(
@@ -44,11 +63,11 @@ export class AdminAuditService {
 
     return tx.adminAuditLog.create({
       data: {
-        actorId: input.actorId,
+        actorID: input.actorId,
         actorAccountId: input.actorAccountId,
         action: input.action,
-        targetType: input.targetType,
-        targetId: input.targetId,
+        entityType: input.targetType,
+        entityID: input.targetId,
         before: input.before as Prisma.InputJsonValue,
         after: input.after as Prisma.InputJsonValue,
         reason: input.reason,
@@ -60,14 +79,16 @@ export class AdminAuditService {
     });
   }
 
-  listForTarget(targetType: 'user', targetId: string, limit = 20) {
+  async listForTarget(targetType: 'user', targetId: string, limit = 20) {
     const boundedLimit = Math.min(100, Math.max(1, Math.trunc(limit)));
 
-    return this.prisma.adminAuditLog.findMany({
-      where: { targetType, targetId },
+    const rows = await this.prisma.adminAuditLog.findMany({
+      where: { entityType: targetType, entityID: targetId },
       orderBy: { createdAt: 'desc' },
       take: boundedLimit,
       select: PUBLIC_AUDIT_SELECT,
     });
+
+    return rows.map(toAuditView);
   }
 }

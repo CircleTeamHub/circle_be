@@ -13,10 +13,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { UserRole, UserStatus } from 'src/generated/prisma';
-import {
-  SENSITIVE_FIELDS,
-  SensitiveField,
-} from '../admin-user.constants';
+import { SENSITIVE_FIELDS, SensitiveField } from '../admin-user.constants';
 
 export class ListAdminUsersQueryDto {
   @ApiPropertyOptional({ maxLength: 100 })

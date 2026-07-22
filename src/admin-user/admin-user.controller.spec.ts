@@ -69,11 +69,7 @@ describe('AdminUserController', () => {
   it('delegates sensitive access with the minimal actor identity', () => {
     const dto = { field: 'email' as const, reason: 'support-123' };
 
-    controller.reveal(
-      '11111111-1111-4111-8111-111111111111',
-      dto,
-      request,
-    );
+    controller.reveal('11111111-1111-4111-8111-111111111111', dto, request);
 
     expect(service.revealSensitiveField).toHaveBeenCalledWith(
       { userId: 'admin-1', accountId: 'support-admin' },

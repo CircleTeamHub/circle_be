@@ -349,9 +349,9 @@ describe('AdminUserService', () => {
           metadata: { field: 'email' },
         },
       );
-      expect(JSON.stringify(audit.recordInTransaction.mock.calls)).not.toContain(
-        'private@example.com',
-      );
+      expect(
+        JSON.stringify(audit.recordInTransaction.mock.calls),
+      ).not.toContain('private@example.com');
       expect(result).toEqual({
         field: 'email',
         value: 'private@example.com',
@@ -408,30 +408,10 @@ describe('AdminUserService', () => {
     const actor = { userId: 'admin-1', accountId: 'support-admin' };
 
     it.each([
-      [
-        UserStatus.ACTIVE,
-        UserStatus.BANNED,
-        'USER_BANNED',
-        true,
-      ],
-      [
-        UserStatus.ACTIVE,
-        UserStatus.DELETED,
-        'USER_DELETED',
-        true,
-      ],
-      [
-        UserStatus.BANNED,
-        UserStatus.ACTIVE,
-        'USER_UNBANNED',
-        false,
-      ],
-      [
-        UserStatus.BANNED,
-        UserStatus.DELETED,
-        'USER_DELETED',
-        true,
-      ],
+      [UserStatus.ACTIVE, UserStatus.BANNED, 'USER_BANNED', true],
+      [UserStatus.ACTIVE, UserStatus.DELETED, 'USER_DELETED', true],
+      [UserStatus.BANNED, UserStatus.ACTIVE, 'USER_UNBANNED', false],
+      [UserStatus.BANNED, UserStatus.DELETED, 'USER_DELETED', true],
     ])(
       'changes %s to %s transactionally',
       async (currentStatus, targetStatus, action, revokesSessions) => {
@@ -476,9 +456,9 @@ describe('AdminUserService', () => {
           expect(tx.refreshToken.updateMany).not.toHaveBeenCalled();
           expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
         }
-        expect(
-          realtime.invalidateUserProfileSummaryCache,
-        ).toHaveBeenCalledWith('user-1');
+        expect(realtime.invalidateUserProfileSummaryCache).toHaveBeenCalledWith(
+          'user-1',
+        );
         expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
           'user-1',
         );
@@ -536,7 +516,7 @@ describe('AdminUserService', () => {
       },
     );
 
-    it.each([undefined, 'wrong-account']) (
+    it.each([undefined, 'wrong-account'])(
       'requires the exact account ID for deletion (%s)',
       async (confirmationAccountId) => {
         tx.user.findUnique.mockResolvedValue({
@@ -593,9 +573,7 @@ describe('AdminUserService', () => {
         }),
       ).rejects.toThrow('audit down');
       expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
-      expect(
-        realtime.invalidateUserProfileSummaryCache,
-      ).not.toHaveBeenCalled();
+      expect(realtime.invalidateUserProfileSummaryCache).not.toHaveBeenCalled();
     });
 
     it('keeps a committed status response successful when post-commit hooks fail', async () => {

@@ -12,7 +12,7 @@ import { AdminUserErrorCode } from 'src/common/app-error-codes';
 import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { AdminAuditService } from './admin-audit.service';
+import { AdminUserAuditService } from './admin-user-audit.service';
 import {
   AdminAuditAction,
   SENSITIVE_FIELDS,
@@ -68,7 +68,7 @@ export class AdminUserService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly audit: AdminAuditService,
+    private readonly audit: AdminUserAuditService,
     private readonly sessionRevocation: SessionRevocationService,
     private readonly realtime: RealtimeService,
   ) {}
@@ -207,7 +207,7 @@ export class AdminUserService {
       security: {
         securityCodeLocked: Boolean(
           user.securityCodeLockedUntil &&
-            user.securityCodeLockedUntil.getTime() > now.getTime(),
+          user.securityCodeLockedUntil.getTime() > now.getTime(),
         ),
         singleDeviceLoginEnabled: user.singleDeviceLoginEnabled,
         activeSessionCount,
@@ -311,8 +311,7 @@ export class AdminUserService {
 
       if (
         actor.userId === targetId &&
-        (dto.status === UserStatus.BANNED ||
-          dto.status === UserStatus.DELETED)
+        (dto.status === UserStatus.BANNED || dto.status === UserStatus.DELETED)
       ) {
         throw new BadRequestException({
           message: '不能封禁或删除当前管理员账号',

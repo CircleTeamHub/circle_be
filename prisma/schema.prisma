@@ -1209,20 +1209,29 @@ model NotificationPushDelivery {
 
 /// #90：管理台操作审计。业务日志有 actor/target 但缺 ip/UA 与结构化前后值；
 /// 事后取证需要「谁、从哪、把什么从 A 改成了 B」。只追加不更新。
+/// 管理台唯一的审计流水：治理侧（#90 下架/恢复）和用户中心（#121 封禁/解封/
+/// 敏感字段查看）都写这里。审计要的是「某管理员做过什么」的全量视图，拆成两张
+/// 表会让任何跨模块追溯都退化成 UNION。
 model AdminAuditLog {
-  id        String   @id @default(uuid())
-  actorID   String
-  action    String
-  entityType String?
-  entityID  String?
-  before    Json?
-  after     Json?
-  ip        String?
-  userAgent String?
-  createdAt DateTime @default(now())
+  id             String   @id @default(uuid())
+  actorID        String
+  /// 用户中心的列表要展示操作者账号；治理侧只记 actorID，故可空。
+  actorAccountId String?
+  action         String
+  entityType     String?
+  entityID       String?
+  before         Json?
+  after          Json?
+  reason         String?
+  metadata       Json?
+  requestId      String?
+  ip             String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
 
   @@index([actorID, createdAt])
   @@index([entityType, entityID, createdAt])
+  @@index([action, createdAt])
 }
 
 model DevicePushToken {
@@ -1532,23 +1541,3 @@ model UserLike {
   @@index([fromUserID, likedOn])
 }
 
-model AdminAuditLog {
-  id             String   @id @default(uuid())
-  actorId        String
-  actorAccountId String
-  action         String
-  targetType     String
-  targetId       String
-  before         Json?
-  after          Json?
-  reason         String?
-  metadata       Json?
-  requestId      String?
-  ip             String?
-  userAgent      String?
-  createdAt      DateTime @default(now())
-
-  @@index([targetType, targetId, createdAt])
-  @@index([actorId, createdAt])
-  @@index([action, createdAt])
-}
