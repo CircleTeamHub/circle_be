@@ -20,6 +20,10 @@ import {
   parseSessionRevocationBroadcast,
   type SessionRevocationBroadcast,
 } from 'src/auth/session-revocation.broadcast';
+import {
+  EffectiveMembershipAppearance,
+  resolveMembershipAppearance,
+} from 'src/membership/membership-appearance';
 
 /**
  * Close frame sent to a socket whose session was revoked. 1008 (policy
@@ -95,7 +99,9 @@ type CallStatePayload = {
 
 type MembershipStatusPayload = {
   vipLevel: number;
+  vipExpiresAt: string | null;
   expiredAt: string | null;
+  membership: EffectiveMembershipAppearance;
   changedAt: string;
 };
 
@@ -104,6 +110,10 @@ type UserProfileSummaryPayload = {
   creditScore: number;
   displayIconsVersion: number;
   changedAt: string;
+};
+
+type CachedUserProfileSummaryPayload = UserProfileSummaryPayload & {
+  membershipExpiresAt?: string | null;
 };
 
 type RealtimeEvent =
@@ -562,31 +572,54 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       await this.redisService?.getJsonWithVersion<MembershipStatusPayload>(
         cacheKey,
       );
-    if (cached) {
+    if (
+      cached &&
+      this.isCachedMembershipCurrent(
+        cached.payload.vipLevel,
+        cached.payload.vipExpiresAt,
+      )
+    ) {
       return cached.payload;
     }
 
     return this.singleFlight(cacheKey, async () => {
       const user = await this.prisma.user.findUnique({
         where: { id: userId },
-        select: { vipLevel: true, updatedAt: true },
+        select: { vipLevel: true, vipExpiresAt: true, updatedAt: true },
       });
       if (!user) {
         return null;
       }
 
+      const now = new Date();
+      const membership = resolveMembershipAppearance(user, now);
+      const vipExpiresAt = user.vipExpiresAt?.toISOString() ?? null;
+      const expiredAt =
+        user.vipLevel > 0 &&
+        user.vipLevel < 4 &&
+        user.vipExpiresAt !== null &&
+        user.vipExpiresAt.getTime() <= now.getTime()
+          ? vipExpiresAt
+          : null;
       const payload: MembershipStatusPayload = {
-        vipLevel: user.vipLevel,
-        expiredAt: null,
-        changedAt: new Date().toISOString(),
+        vipLevel: membership.effectiveLevel,
+        vipExpiresAt,
+        expiredAt,
+        membership,
+        changedAt: now.toISOString(),
       };
       // Version-guarded write: a slow reader holding a pre-update value can't
       // clobber a fresher one (the mutation bumps user.updatedAt).
       await this.redisService?.setJsonIfNewer(
         cacheKey,
         payload,
-        user.updatedAt.getTime(),
-        RealtimeService.MEMBERSHIP_STATUS_TTL_SECONDS,
+        this.membershipCacheVersion(user.updatedAt, user, now),
+        this.membershipCacheTtl(
+          user,
+          membership.effectiveLevel,
+          now,
+          RealtimeService.MEMBERSHIP_STATUS_TTL_SECONDS,
+        ),
       );
       return payload;
     });
@@ -767,18 +800,29 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ): Promise<UserProfileSummaryPayload | null> {
     const cacheKey = this.userProfileSummaryCacheKey(userId);
     const cached =
-      await this.redisService?.getJsonWithVersion<UserProfileSummaryPayload>(
+      await this.redisService?.getJsonWithVersion<CachedUserProfileSummaryPayload>(
         cacheKey,
       );
-    if (cached) {
-      return cached.payload;
+    if (
+      cached &&
+      this.isCachedMembershipCurrent(
+        cached.payload.vipLevel,
+        cached.payload.membershipExpiresAt,
+      )
+    ) {
+      return this.toPublicProfileSummary(cached.payload);
     }
 
     return this.singleFlight(cacheKey, async () => {
       const [user, latestDisplayIcon] = await Promise.all([
         this.prisma.user.findUnique({
           where: { id: userId },
-          select: { vipLevel: true, creditScore: true, updatedAt: true },
+          select: {
+            vipLevel: true,
+            vipExpiresAt: true,
+            creditScore: true,
+            updatedAt: true,
+          },
         }),
         this.prisma.userDisplayIcon.findFirst({
           where: { userID: userId },
@@ -792,22 +836,41 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
       }
 
       const displayIconsUpdatedAt = latestDisplayIcon?.updatedAt.getTime() ?? 0;
+      const now = new Date();
+      const membership = resolveMembershipAppearance(user, now);
       const payload: UserProfileSummaryPayload = {
-        vipLevel: user.vipLevel,
+        vipLevel: membership.effectiveLevel,
         creditScore: user.creditScore,
         // Stable for icon-less users (0) so the cached payload doesn't churn on
         // every recompute and trigger needless client refetches.
         displayIconsVersion: displayIconsUpdatedAt,
-        changedAt: new Date().toISOString(),
+        changedAt: now.toISOString(),
+      };
+      const cachedPayload: CachedUserProfileSummaryPayload = {
+        ...payload,
+        membershipExpiresAt:
+          membership.effectiveLevel > 0 && membership.effectiveLevel < 4
+            ? (user.vipExpiresAt?.toISOString() ?? null)
+            : null,
       };
       // Version = newest of profile-row / display-icon change, so a stale reader
       // can't overwrite a fresher write (see setJsonIfNewer).
-      const version = Math.max(user.updatedAt.getTime(), displayIconsUpdatedAt);
+      const version = this.membershipCacheVersion(
+        user.updatedAt,
+        user,
+        now,
+        displayIconsUpdatedAt,
+      );
       await this.redisService?.setJsonIfNewer(
         cacheKey,
-        payload,
+        cachedPayload,
         version,
-        RealtimeService.PROFILE_SUMMARY_TTL_SECONDS,
+        this.membershipCacheTtl(
+          user,
+          membership.effectiveLevel,
+          now,
+          RealtimeService.PROFILE_SUMMARY_TTL_SECONDS,
+        ),
       );
       return payload;
     });
@@ -905,11 +968,70 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private membershipStatusCacheKey(userId: string): string {
-    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:membership-status`;
+    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:membership-status:v2`;
   }
 
   private userProfileSummaryCacheKey(userId: string): string {
-    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:profile-summary`;
+    return `${RealtimeService.HOT_CACHE_PREFIX}${userId}:profile-summary:v2`;
+  }
+
+  private isCachedMembershipCurrent(
+    effectiveLevel: number,
+    vipExpiresAt: string | null | undefined,
+    now = new Date(),
+  ): boolean {
+    if (effectiveLevel <= 0 || effectiveLevel >= 4 || !vipExpiresAt) {
+      return true;
+    }
+    const expiry = Date.parse(vipExpiresAt);
+    return Number.isFinite(expiry) && expiry > now.getTime();
+  }
+
+  private membershipCacheTtl(
+    membership: { vipExpiresAt: Date | null },
+    effectiveLevel: number,
+    now: Date,
+    normalTtlSeconds: number,
+  ): number {
+    if (
+      effectiveLevel <= 0 ||
+      effectiveLevel >= 4 ||
+      membership.vipExpiresAt === null
+    ) {
+      return normalTtlSeconds;
+    }
+    const remainingMs = membership.vipExpiresAt.getTime() - now.getTime();
+    return Math.max(
+      1,
+      Math.min(normalTtlSeconds, Math.ceil(remainingMs / 1_000)),
+    );
+  }
+
+  private membershipCacheVersion(
+    updatedAt: Date,
+    membership: { vipLevel: number; vipExpiresAt: Date | null },
+    now: Date,
+    relatedVersion = 0,
+  ): number {
+    const expiredPhase =
+      membership.vipLevel > 0 &&
+      membership.vipLevel < 4 &&
+      membership.vipExpiresAt !== null &&
+      membership.vipExpiresAt.getTime() <= now.getTime()
+        ? 1
+        : 0;
+    return Math.max(updatedAt.getTime(), relatedVersion) * 2 + expiredPhase;
+  }
+
+  private toPublicProfileSummary(
+    cached: CachedUserProfileSummaryPayload,
+  ): UserProfileSummaryPayload {
+    return {
+      vipLevel: cached.vipLevel,
+      creditScore: cached.creditScore,
+      displayIconsVersion: cached.displayIconsVersion,
+      changedAt: cached.changedAt,
+    };
   }
 
   private handleRedisRealtimeMessage(channel: string, message: string) {

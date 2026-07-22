@@ -213,7 +213,16 @@ describe('UserService', () => {
       });
       expect(prisma.user.count).toHaveBeenCalledWith({ where: undefined });
       expect(result).toEqual({
-        data: [{ id: 'user-1' }],
+        data: [
+          {
+            id: 'user-1',
+            membership: {
+              effectiveLevel: 0,
+              key: 'regular',
+              appearance: { nameColor: 'default', badge: null },
+            },
+          },
+        ],
         total: 7,
         page: 2,
         limit: 5,
@@ -274,6 +283,8 @@ describe('UserService', () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         receivedLikeCount: 4,
+        vipLevel: 2,
+        vipExpiresAt: new Date(Date.now() - 1),
       });
       // Self-view: likedByMeToday is always false and no like lookup is made.
       await expect(service.findOne('user-1')).resolves.toMatchObject({
@@ -281,7 +292,15 @@ describe('UserService', () => {
         displayIcons: [],
         likeCount: 4,
         likedByMeToday: false,
+        membership: {
+          effectiveLevel: 0,
+          key: 'regular',
+          appearance: { nameColor: 'default', badge: null },
+        },
       });
+      const result = await service.findOne('user-1');
+      expect(result).not.toHaveProperty('vipLevel');
+      expect(result).not.toHaveProperty('vipExpiresAt');
       expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
     });
 

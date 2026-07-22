@@ -40,6 +40,10 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { IconService } from 'src/icon/icon.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { USER_ME_SELECT } from 'src/user/user.select';
+import {
+  EffectiveMembershipAppearance,
+  resolveMembershipAppearance,
+} from 'src/membership/membership-appearance';
 
 const ME_SELECT = USER_ME_SELECT;
 
@@ -98,6 +102,9 @@ export type SafeUser = {
   city: string | null;
   region: string | null;
   vipLevel: number;
+  storedVipLevel: number;
+  vipExpiresAt: Date | null;
+  membership: EffectiveMembershipAppearance;
   creditScore: number;
   role: string;
   status: string;
@@ -781,7 +788,17 @@ export class AuthService {
         ),
       );
 
-    return { ...user, lastOnline: now, displayIcons };
+    const membership = resolveMembershipAppearance(user, now);
+    const { vipLevel: storedVipLevel, ...safeUser } = user;
+
+    return {
+      ...safeUser,
+      storedVipLevel,
+      vipLevel: membership.effectiveLevel,
+      membership,
+      lastOnline: now,
+      displayIcons,
+    };
   }
 
   /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义在 email-verification 内。 */

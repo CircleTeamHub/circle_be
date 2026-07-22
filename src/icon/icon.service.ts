@@ -57,12 +57,14 @@ type EligibleCircleIcon = {
 type Eligibility = {
   systemIcons: EligibleSystemIcon[];
   circleIcons: EligibleCircleIcon[];
+  membershipExpiresAt: number | null;
 };
 
 // Prefetched inputs for building eligibility, shared by the single-user and
 // batch paths so both compute identical results from the same shapes.
 type EligibilityUserRow = {
   vipLevel: number;
+  vipExpiresAt: Date | null;
   receivedLikeCount: number;
   createdAt: Date;
   status: string;
@@ -103,6 +105,7 @@ type StoredSelection = {
 const ELIGIBILITY_USER_SELECT = {
   id: true,
   vipLevel: true,
+  vipExpiresAt: true,
   receivedLikeCount: true,
   createdAt: true,
   status: true,
@@ -178,7 +181,11 @@ export class IconService {
     return entry.data;
   }
 
-  private setCachedDisplayIcons(userId: string, data: DisplayIconDto[]): void {
+  private setCachedDisplayIcons(
+    userId: string,
+    data: DisplayIconDto[],
+    membershipExpiresAt: number | null,
+  ): void {
     if (this.displayIconCache.size >= DISPLAY_ICON_CACHE_MAX_ENTRIES) {
       // Simple eviction: drop the oldest insertion-order entry.
       const oldestKey = this.displayIconCache.keys().next().value;
@@ -186,9 +193,13 @@ export class IconService {
         this.displayIconCache.delete(oldestKey);
       }
     }
+    const normalExpiry = Date.now() + DISPLAY_ICON_CACHE_TTL_MS;
     this.displayIconCache.set(userId, {
       data,
-      expiresAt: Date.now() + DISPLAY_ICON_CACHE_TTL_MS,
+      expiresAt:
+        membershipExpiresAt === null
+          ? normalExpiry
+          : Math.min(normalExpiry, membershipExpiresAt),
     });
   }
 
@@ -232,7 +243,7 @@ export class IconService {
     const eligibility = await this.resolveEligibility(userId);
     const selections = await this.ensureSelections(userId, eligibility);
     const result = this.mapSelectionsToDisplayIcons(selections, eligibility);
-    this.setCachedDisplayIcons(userId, result);
+    this.setCachedDisplayIcons(userId, result, eligibility.membershipExpiresAt);
     return result;
   }
 
@@ -296,7 +307,11 @@ export class IconService {
         selectionsByUser.get(user.id) ?? [],
         user.iconPreferencesInitialized,
       );
-      this.setCachedDisplayIcons(user.id, display);
+      this.setCachedDisplayIcons(
+        user.id,
+        display,
+        eligibility.membershipExpiresAt,
+      );
       result.set(user.id, display);
     }
 
@@ -490,6 +505,7 @@ export class IconService {
   ): Eligibility {
     const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons({
       vipLevel: user.vipLevel,
+      vipExpiresAt: user.vipExpiresAt,
       receivedLikeCount: user.receivedLikeCount,
     });
     if (Date.now() - user.createdAt.getTime() <= NEW_USER_MS) {
@@ -531,7 +547,15 @@ export class IconService {
         fallbackIconName: 'people-circle-outline',
       }));
 
-    return { systemIcons, circleIcons };
+    const effectiveMembershipIcon = systemIcons.find(
+      (icon) => icon.systemKey === SystemIconKeyDto.VIP,
+    );
+    const membershipExpiresAt =
+      effectiveMembershipIcon && user.vipLevel < 4
+        ? (user.vipExpiresAt?.getTime() ?? null)
+        : null;
+
+    return { systemIcons, circleIcons, membershipExpiresAt };
   }
 
   // Verified Profile: an ACTIVE user with a complete profile (avatar, nickname,
@@ -590,12 +614,20 @@ export class IconService {
     },
     eligibility: Eligibility,
   ): string | null {
+    const isLegacySuperMembershipVariant =
+      selection.systemKey === SystemIconKeyDto.VIP &&
+      (selection.systemVariant === SystemIconKeyDto.VIP ||
+        selection.systemVariant === 'VIP5');
     const isLegacyPlaceholderVariant =
       selection.systemVariant &&
       selection.systemVariant === selection.systemKey &&
       isLeveledSystemBadgeKey(selection.systemKey);
 
-    if (selection.systemVariant && !isLegacyPlaceholderVariant) {
+    if (
+      selection.systemVariant &&
+      !isLegacyPlaceholderVariant &&
+      !isLegacySuperMembershipVariant
+    ) {
       return selection.systemVariant;
     }
 

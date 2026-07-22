@@ -9,7 +9,8 @@ describe('MallService', () => {
 
     expect(serialized).toContain('群扩容卡');
     expect(serialized).toContain('靓号');
-    expect(serialized).toContain('会员充值');
+    expect(serialized).toContain('会员服务');
+    expect(serialized).not.toContain('会员充值');
     expect(serialized).toContain('积分充值');
     expect(serialized).not.toContain('帮积分');
   });

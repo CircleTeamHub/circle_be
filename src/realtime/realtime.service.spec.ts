@@ -307,7 +307,15 @@ describe('RealtimeService', () => {
       version: 1,
       payload: {
         vipLevel: 3,
+        vipExpiresAt: null,
         expiredAt: null,
+        membership: {
+          effectiveLevel: 3,
+          key: 'diamond',
+          appearance: { nameColor: 'rainbow', badge: 'diamond' },
+          active: true,
+          lifetime: false,
+        },
         changedAt: '2026-06-26T00:00:00.000Z',
       },
     });
@@ -320,7 +328,15 @@ describe('RealtimeService', () => {
       type: 'membership.status.changed',
       payload: {
         vipLevel: 3,
+        vipExpiresAt: null,
         expiredAt: null,
+        membership: {
+          effectiveLevel: 3,
+          key: 'diamond',
+          appearance: { nameColor: 'rainbow', badge: 'diamond' },
+          active: true,
+          lifetime: false,
+        },
         changedAt: '2026-06-26T00:00:00.000Z',
       },
     });
@@ -594,6 +610,7 @@ describe('RealtimeService', () => {
     redis.getJsonWithVersion.mockResolvedValue(null);
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 2,
+      vipExpiresAt: null,
       updatedAt: new Date('2026-06-26T00:00:00.000Z'),
     });
     jest.spyOn(service, 'broadcast').mockImplementation();
@@ -601,10 +618,154 @@ describe('RealtimeService', () => {
     await service.broadcastMembershipStatus('user-1');
 
     expect(redis.setJsonIfNewer).toHaveBeenCalledWith(
-      'circle:hot:user:user-1:membership-status',
+      'circle:hot:user:user-1:membership-status:v2',
       expect.objectContaining({ vipLevel: 2 }),
-      new Date('2026-06-26T00:00:00.000Z').getTime(),
+      new Date('2026-06-26T00:00:00.000Z').getTime() * 2,
       30,
     );
+  });
+
+  it('emits regular membership at the exact expiry boundary', async () => {
+    const boundary = new Date('2026-07-22T12:00:00.000Z');
+    jest.useFakeTimers().setSystemTime(boundary.getTime());
+    try {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 3,
+        vipExpiresAt: boundary,
+        updatedAt: new Date('2026-07-01T00:00:00.000Z'),
+      });
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+      await service.broadcastMembershipStatus('user-1');
+
+      expect(broadcast).toHaveBeenCalledWith('user-1', {
+        type: 'membership.status.changed',
+        payload: expect.objectContaining({
+          vipLevel: 0,
+          vipExpiresAt: boundary.toISOString(),
+          expiredAt: boundary.toISOString(),
+          membership: expect.objectContaining({
+            key: 'regular',
+            active: false,
+          }),
+        }),
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('caps membership cache TTL at the time remaining until expiry', async () => {
+    const now = new Date('2026-07-22T11:59:55.000Z');
+    jest.useFakeTimers().setSystemTime(now.getTime());
+    try {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: new Date('2026-07-22T12:00:00.000Z'),
+        updatedAt: new Date('2026-07-01T00:00:00.000Z'),
+      });
+      jest.spyOn(service, 'broadcast').mockImplementation();
+
+      await service.broadcastMembershipStatus('user-1');
+
+      expect(redis.setJsonIfNewer).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Object),
+        expect.any(Number),
+        5,
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects an active cached payload at its exact expiry boundary', async () => {
+    const boundary = new Date('2026-07-22T12:00:00.000Z');
+    jest.useFakeTimers().setSystemTime(boundary.getTime());
+    try {
+      redis.getJsonWithVersion.mockResolvedValueOnce({
+        version: 1,
+        payload: {
+          vipLevel: 1,
+          vipExpiresAt: boundary.toISOString(),
+          expiredAt: null,
+          membership: {
+            effectiveLevel: 1,
+            key: 'silver',
+            appearance: { nameColor: 'silver', badge: 'silver' },
+            active: true,
+            lifetime: false,
+          },
+          changedAt: '2026-07-22T11:59:59.000Z',
+        },
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: boundary,
+        updatedAt: new Date('2026-07-01T00:00:00.000Z'),
+      });
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+      await service.broadcastMembershipStatus('user-1');
+
+      expect(prisma.user.findUnique).toHaveBeenCalled();
+      expect(broadcast).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({
+          payload: expect.objectContaining({ vipLevel: 0 }),
+        }),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('uses a newer cache version after expiry so a slow active reader cannot win', async () => {
+    const updatedAt = new Date('2026-07-01T00:00:00.000Z');
+    const boundary = new Date('2026-07-22T12:00:00.000Z');
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 2,
+      vipExpiresAt: boundary,
+      updatedAt,
+    });
+    jest.spyOn(service, 'broadcast').mockImplementation();
+
+    jest.useFakeTimers().setSystemTime(boundary.getTime() - 1);
+    await service.broadcastMembershipStatus('user-1');
+    const activeVersion = redis.setJsonIfNewer.mock.calls[0][2];
+
+    redis.getJsonWithVersion.mockResolvedValue(null);
+    jest.setSystemTime(boundary.getTime());
+    await service.broadcastMembershipStatus('user-1');
+    const expiredVersion = redis.setJsonIfNewer.mock.calls[1][2];
+    jest.useRealTimers();
+
+    expect(expiredVersion).toBeGreaterThan(activeVersion);
+  });
+
+  it('uses effective membership level in profile summaries', async () => {
+    const boundary = new Date('2026-07-22T12:00:00.000Z');
+    jest.useFakeTimers().setSystemTime(boundary.getTime());
+    try {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 2,
+        vipExpiresAt: boundary,
+        creditScore: 90,
+        updatedAt: new Date('2026-07-01T00:00:00.000Z'),
+      });
+      prisma.userDisplayIcon.findFirst.mockResolvedValue(null);
+      const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
+
+      await service.broadcastUserProfileSummary('user-1');
+
+      expect(broadcast).toHaveBeenCalledWith(
+        'user-1',
+        expect.objectContaining({
+          payload: expect.objectContaining({ vipLevel: 0 }),
+        }),
+      );
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

@@ -23,6 +23,7 @@ import {
   isInviteCodeUniqueCollision,
   REGISTRATION_CODE_MAX_ATTEMPTS,
 } from 'src/auth/account-id.unique';
+import { toPublicMembershipAppearance } from 'src/membership/membership-appearance';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -63,6 +64,19 @@ type ProfilePrivacyUser = {
   qq?: string | null;
   whatsup?: string | null;
 };
+
+type ProfileMembershipUser = {
+  vipLevel?: number;
+  vipExpiresAt?: Date | null;
+};
+
+function toPublicUser<T extends ProfileMembershipUser>(user: T) {
+  const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
+  return {
+    ...profile,
+    membership: toPublicMembershipAppearance({ vipLevel, vipExpiresAt }),
+  };
+}
 
 function normalizeBirthdayInput(value: string | null | undefined) {
   if (value === undefined) {
@@ -187,7 +201,7 @@ export class UserService {
       this.prisma.user.count({ where }),
     ]);
 
-    return { data, total, page, limit: take };
+    return { data: data.map(toPublicUser), total, page, limit: take };
   }
 
   async findByExactAccountId(accountId: string | undefined, viewerId?: string) {
@@ -211,7 +225,9 @@ export class UserService {
 
     // Apply the same field-privacy gate as GET /user/:id. Without it the
     // friend-add lookup leaks wechat/qq that the target set to private (F-01).
-    return user ? this.applyProfilePrivacy(user, viewerId) : null;
+    return user
+      ? toPublicUser(await this.applyProfilePrivacy(user, viewerId))
+      : null;
   }
 
   async findOne(id: string, viewerId?: string) {
@@ -240,7 +256,7 @@ export class UserService {
           )
         : false;
     return {
-      ...filteredUser,
+      ...toPublicUser(filteredUser),
       displayIcons,
       likeCount: user.receivedLikeCount,
       likedByMeToday,
@@ -297,7 +313,7 @@ export class UserService {
     ) {
       const inviteCode = await generateUniqueRegistrationCode(this.prisma);
       try {
-        return await this.prisma.user.create({
+        const user = await this.prisma.user.create({
           data: {
             accountId: input.accountId,
             inviteCode,
@@ -306,6 +322,7 @@ export class UserService {
           },
           select: PUBLIC_SELECT,
         });
+        return toPublicUser(user);
       } catch (error) {
         if (isInviteCodeUniqueCollision(error)) {
           if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
@@ -351,7 +368,7 @@ export class UserService {
     await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
-      ...user,
+      ...toPublicUser(user),
       displayIcons,
     };
   }
