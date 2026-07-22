@@ -60,14 +60,17 @@ CREATE TABLE "MembershipGrant" (
   "targetUserID" TEXT NOT NULL,
   "operatorUserID" TEXT NOT NULL,
   "previousLevel" INTEGER NOT NULL,
+  "previousEffectiveLevel" INTEGER NOT NULL,
   "newLevel" INTEGER NOT NULL,
   "previousExpiresAt" TIMESTAMP(3),
   "newExpiresAt" TIMESTAMP(3),
+  "benefitTypesSnapshot" "MembershipBenefitType"[] NOT NULL DEFAULT ARRAY[]::"MembershipBenefitType"[],
   "note" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
   CONSTRAINT "MembershipGrant_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "MembershipGrant_previousLevel_check" CHECK ("previousLevel" BETWEEN 0 AND 4),
+  CONSTRAINT "MembershipGrant_previousEffectiveLevel_check" CHECK ("previousEffectiveLevel" BETWEEN 0 AND 4),
   CONSTRAINT "MembershipGrant_newLevel_check" CHECK ("newLevel" BETWEEN 1 AND 4)
 );
 

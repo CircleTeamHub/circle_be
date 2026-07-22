@@ -81,6 +81,37 @@ describe('VIP restriction controller validation', () => {
     );
   });
 
+  it('accepts the super membership circle capacity boundary', async () => {
+    await request(app.getHttpServer())
+      .post('/circle')
+      .send({
+        name: 'Test Circle',
+        categories: ['test'],
+        description: 'a valid circle description',
+        maxMembers: 3000,
+      })
+      .expect(201);
+
+    expect(circleService.createCircle).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ maxMembers: 3000 }),
+    );
+  });
+
+  it('rejects maxMembers above the highest membership capacity', async () => {
+    await request(app.getHttpServer())
+      .post('/circle')
+      .send({
+        name: 'Test Circle',
+        categories: ['test'],
+        description: 'a valid circle description',
+        maxMembers: 3001,
+      })
+      .expect(400);
+
+    expect(circleService.createCircle).not.toHaveBeenCalled();
+  });
+
   it.each(['vipRestriction', 'signupVipRestriction'] as const)(
     'rejects plaza %s above 4 before the service',
     async (property) => {

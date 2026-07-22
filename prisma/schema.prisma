@@ -389,9 +389,11 @@ model MembershipGrant {
   targetUserID      String
   operatorUserID    String
   previousLevel     Int
+  previousEffectiveLevel Int
   newLevel          Int
   previousExpiresAt DateTime?
   newExpiresAt      DateTime?
+  benefitTypesSnapshot   MembershipBenefitType[] @default([])
   note              String?
   createdAt         DateTime  @default(now())
 

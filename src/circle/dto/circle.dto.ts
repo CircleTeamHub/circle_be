@@ -101,11 +101,13 @@ export class CreateCircleDto {
   @IsOptional()
   joinFancyRestriction?: boolean;
 
-  @ApiPropertyOptional({ description: 'Max members; omit for no limit.' })
+  @ApiPropertyOptional({
+    description: 'Max members; omit to use membership capacity.',
+  })
   @Type(() => Number)
   @IsInt()
   @Min(10)
-  @Max(5000)
+  @Max(3000)
   @IsOptional()
   maxMembers?: number;
 

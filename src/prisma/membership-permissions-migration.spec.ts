@@ -31,4 +31,14 @@ describe('membership permissions migration', () => {
       `CHECK ("${column}" IS NULL OR "${column}" BETWEEN 1 AND 4)`,
     );
   });
+
+  it('persists exact membership replay state on the grant audit', () => {
+    expect(sql).toContain('"previousEffectiveLevel" INTEGER NOT NULL');
+    expect(sql).toContain(
+      '"benefitTypesSnapshot" "MembershipBenefitType"[] NOT NULL DEFAULT ARRAY[]::"MembershipBenefitType"[]',
+    );
+    expect(sql).toContain(
+      'CONSTRAINT "MembershipGrant_previousEffectiveLevel_check" CHECK ("previousEffectiveLevel" BETWEEN 0 AND 4)',
+    );
+  });
 });

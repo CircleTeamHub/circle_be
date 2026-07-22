@@ -6,6 +6,7 @@ import { ConfigService } from '@nestjs/config';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   CreateCircleDto,
   SetCircleAvatarDto,
@@ -72,6 +73,7 @@ describe('CircleService', () => {
         { provide: OpenimService, useValue: openimService },
         { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        MembershipPolicyService,
       ],
     }).compile();
 
@@ -269,8 +271,12 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
-    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: null,
+    });
 
     await expect(
       guarded.createCircle('user-1', {
@@ -284,7 +290,10 @@ describe('CircleService', () => {
   });
 
   it('rejects createCircle when a free-form category is blank after trimming', async () => {
-    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: null,
+    });
 
     await expect(
       service.createCircle('user-1', {
@@ -296,8 +305,139 @@ describe('CircleService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  const membershipTiers = [
+    { level: 0, capacity: 100 },
+    { level: 1, capacity: 300 },
+    { level: 2, capacity: 500 },
+    { level: 3, capacity: 1000 },
+    { level: 4, capacity: 3000 },
+  ];
+
+  const validCircle = (maxMembers?: number): CreateCircleDto => ({
+    name: 'Capacity Circle',
+    categories: ['test'],
+    description: 'a valid circle description',
+    ...(maxMembers === undefined ? {} : { maxMembers }),
+  });
+
+  const circleRecord = (maxMembers: number) => ({
+    id: 'circle-1',
+    name: 'Capacity Circle',
+    description: 'a valid circle description',
+    avatarUrl: null,
+    ownerID: 'user-1',
+    cities: [],
+    categories: ['test'],
+    rules: '',
+    tags: [],
+    joinVipRestriction: null,
+    joinCreditRestriction: null,
+    joinFancyRestriction: false,
+    maxMembers,
+    memberCanPost: true,
+    groupID: null,
+    memberCount: 1,
+    postCount: 0,
+    createdAt: new Date('2026-07-21T12:00:00.000Z'),
+  });
+
+  it.each(membershipTiers)(
+    'defaults stored level $level circle capacity to $capacity',
+    async ({ level, capacity }) => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: level,
+        vipExpiresAt: null,
+      });
+      prisma.circle.create.mockResolvedValue(circleRecord(capacity));
+
+      await service.createCircle('user-1', validCircle());
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { vipLevel: true, vipExpiresAt: true },
+      });
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.user.findUnique.mock.invocationCallOrder[0],
+      );
+      expect(prisma.user.findUnique.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.create.mock.invocationCallOrder[0],
+      );
+      expect(prisma.circle.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ maxMembers: capacity }),
+      });
+    },
+  );
+
+  it.each(membershipTiers)(
+    'allows stored level $level at exact circle capacity $capacity',
+    async ({ level, capacity }) => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: level,
+        vipExpiresAt: null,
+      });
+      prisma.circle.create.mockResolvedValue(circleRecord(capacity));
+
+      await service.createCircle('user-1', validCircle(capacity));
+
+      expect(prisma.circle.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ maxMembers: capacity }),
+      });
+    },
+  );
+
+  it.each(membershipTiers)(
+    'rejects stored level $level above circle capacity $capacity',
+    async ({ level, capacity }) => {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: level,
+        vipExpiresAt: null,
+      });
+
+      await expect(
+        service.createCircle('user-1', validCircle(capacity + 1)),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED',
+        },
+      });
+      expect(prisma.circle.create).not.toHaveBeenCalled();
+      expect(prisma.circleMember.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it('falls back to regular capacity when a paid membership is expired', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+    });
+    prisma.circle.create.mockResolvedValue(circleRecord(100));
+
+    await service.createCircle('user-1', validCircle());
+
+    expect(prisma.circle.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ maxMembers: 100 }),
+    });
+  });
+
+  it('rejects expired paid membership above regular capacity', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+    });
+
+    await expect(
+      service.createCircle('user-1', validCircle(101)),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED' },
+    });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+  });
+
   it('stores legacy joinVipRestriction zero as no restriction', async () => {
-    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: null,
+    });
     prisma.circle.create.mockResolvedValue({
       id: 'circle-1',
       name: 'Food Circle',
@@ -359,6 +499,7 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -386,6 +527,7 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -417,6 +559,7 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',

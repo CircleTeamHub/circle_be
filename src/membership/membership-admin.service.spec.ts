@@ -98,9 +98,11 @@ describe('MembershipAdminService', () => {
       targetUserID: targetId,
       operatorUserID: operatorId,
       previousLevel: 0,
+      previousEffectiveLevel: 0,
       newLevel: 3,
       previousExpiresAt: null,
       newExpiresAt: new Date('2028-07-21T12:00:00.000Z'),
+      benefitTypesSnapshot: [MembershipBenefitType.STANDARD_FANCY_NUMBER],
       note: 'case approved',
       createdAt: now,
       benefitGrants: [{ type: MembershipBenefitType.STANDARD_FANCY_NUMBER }],
@@ -166,9 +168,11 @@ describe('MembershipAdminService', () => {
         targetUserID: targetId,
         operatorUserID: operatorId,
         previousLevel: 0,
+        previousEffectiveLevel: 0,
         newLevel: 1,
         previousExpiresAt: null,
         newExpiresAt: expiresAt,
+        benefitTypesSnapshot: [],
         note: 'case approved',
       },
     });
@@ -314,9 +318,6 @@ describe('MembershipAdminService', () => {
 
   it('replays an exactly matching idempotency key without writes or side effects', async () => {
     tx.membershipGrant.findUnique.mockResolvedValue(existingGrant());
-    tx.membershipBenefitGrant.findMany.mockResolvedValue([
-      { type: MembershipBenefitType.STANDARD_FANCY_NUMBER },
-    ]);
 
     const result = await service.grant(operatorId, targetId, {
       targetLevel: 3,
@@ -334,6 +335,7 @@ describe('MembershipAdminService', () => {
     expect(notification.createSystemNotification).not.toHaveBeenCalled();
     expect(realtime.invalidateUserHotCache).not.toHaveBeenCalled();
     expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
+    expect(tx.membershipBenefitGrant.findMany).not.toHaveBeenCalled();
   });
 
   it('replays a super grant with the exact original benefit snapshot', async () => {
@@ -369,13 +371,22 @@ describe('MembershipAdminService', () => {
     expect(first.issuedBenefitTypes).toEqual([
       MembershipBenefitType.PREMIUM_FANCY_NUMBER,
     ]);
+    expect(tx.membershipGrant.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        previousEffectiveLevel: 3,
+        benefitTypesSnapshot: [
+          MembershipBenefitType.STANDARD_FANCY_NUMBER,
+          MembershipBenefitType.PREMIUM_FANCY_NUMBER,
+        ],
+      }),
+    });
     expect(first.membership.benefitGrants).toEqual({
       standardFancyNumber: { available: false, issued: true },
       premiumFancyNumber: { available: false, issued: true },
     });
   });
 
-  it('replays an older grant without benefits issued by a later grant', async () => {
+  it('replays an older grant without a same-millisecond later benefit', async () => {
     let storedGrant: ReturnType<typeof existingGrant> | null = null;
     tx.membershipGrant.findUnique.mockImplementation(() =>
       Promise.resolve(storedGrant),
@@ -395,6 +406,7 @@ describe('MembershipAdminService', () => {
     });
     tx.membershipBenefitGrant.findMany.mockResolvedValue([
       { type: MembershipBenefitType.STANDARD_FANCY_NUMBER },
+      { type: MembershipBenefitType.PREMIUM_FANCY_NUMBER },
     ]);
     const replay = await service.grant(operatorId, targetId, {
       targetLevel: 3,
@@ -402,16 +414,54 @@ describe('MembershipAdminService', () => {
     });
 
     expect(replay).toEqual({ ...first, replayed: true });
-    expect(tx.membershipBenefitGrant.findMany).toHaveBeenCalledWith({
-      where: {
-        userID: targetId,
-        OR: [{ createdAt: { lte: now } }, { membershipGrantID: 'grant-1' }],
-      },
-      select: { type: true },
-    });
+    expect(tx.membershipBenefitGrant.findMany).not.toHaveBeenCalled();
     expect(replay.membership.benefitGrants.premiumFancyNumber.issued).toBe(
       false,
     );
+  });
+
+  it('replays the persisted previous effective level without expiry reinterpretation', async () => {
+    tx.membershipGrant.findUnique.mockResolvedValue(
+      existingGrant({
+        previousLevel: 2,
+        previousEffectiveLevel: 2,
+        previousExpiresAt: new Date('2027-07-21T11:59:59.999Z'),
+        benefitTypesSnapshot: [],
+        benefitGrants: [],
+      }),
+    );
+
+    const replay = await service.grant(operatorId, targetId, {
+      targetLevel: 3,
+      idempotencyKey,
+      note: 'case approved',
+    });
+
+    expect(replay.grant.previousEffectiveLevel).toBe(2);
+    expect(tx.membershipBenefitGrant.findMany).not.toHaveBeenCalled();
+  });
+
+  it('captures expiry semantics after waiting for the user lock', async () => {
+    const afterLock = new Date('2027-07-21T12:00:01.000Z');
+    policy.lockUsers.mockImplementationOnce(async () => {
+      jest.setSystemTime(afterLock.getTime());
+    });
+    tx.user.findUnique.mockResolvedValue(
+      user(2, new Date('2027-07-21T12:00:00.500Z')),
+    );
+
+    const result = await service.grant(operatorId, targetId, {
+      targetLevel: 1,
+      idempotencyKey,
+    });
+
+    expect(result.grant.previousEffectiveLevel).toBe(0);
+    expect(result.grant.newExpiresAt).toEqual(
+      new Date('2027-08-21T12:00:01.000Z'),
+    );
+    expect(tx.membershipGrant.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ previousEffectiveLevel: 0 }),
+    });
   });
 
   it('returns a stable 409 when an idempotency key payload differs', async () => {

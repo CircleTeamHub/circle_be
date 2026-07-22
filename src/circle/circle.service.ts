@@ -8,11 +8,15 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from 'src/generated/prisma';
-import { CircleErrorCode } from 'src/common/app-error-codes';
+import {
+  CircleErrorCode,
+  MembershipErrorCode,
+} from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   CircleDetailDto,
   CircleDto,
@@ -40,6 +44,7 @@ export class CircleService {
     private readonly openimService: OpenimService,
     private readonly circleInvitationService: CircleInvitationService,
     private readonly config: ConfigService,
+    private readonly membershipPolicy: MembershipPolicyService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -65,18 +70,6 @@ export class CircleService {
     userId: string,
     dto: CreateCircleDto,
   ): Promise<CircleDetailDto> {
-    // VIP gate: only VIP users can create circles
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { vipLevel: true },
-    });
-    if (!user || user.vipLevel < 1) {
-      throw new ForbiddenException({
-        message: 'Only VIP users can create circles',
-        errorCode: CircleErrorCode.VipRequired,
-      });
-    }
-
     this.assertAvatarUrlIsSafe(dto.avatarUrl);
     const categories = this.normalizeStringList(
       dto.categories ?? [],
@@ -84,6 +77,28 @@ export class CircleService {
     );
 
     const circle = await this.prisma.$transaction(async (tx) => {
+      await this.membershipPolicy.lockUsers(tx, [userId]);
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { vipLevel: true, vipExpiresAt: true },
+      });
+      if (!user) {
+        throw new NotFoundException({
+          message: 'User not found',
+          errorCode: CircleErrorCode.UserNotFound,
+        });
+      }
+
+      const policy = this.membershipPolicy.resolve(user, new Date());
+      const capacity = policy.tier.quotas.groupMembers.actual;
+      const maxMembers = dto.maxMembers ?? capacity;
+      if (maxMembers > capacity) {
+        throw new ForbiddenException({
+          message: 'Requested circle capacity exceeds membership entitlement',
+          errorCode: MembershipErrorCode.GroupMemberCapacityExceeded,
+        });
+      }
+
       const created = await tx.circle.create({
         data: {
           name: dto.name,
@@ -100,7 +115,7 @@ export class CircleService {
               : (dto.joinVipRestriction ?? null),
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
-          maxMembers: dto.maxMembers ?? null,
+          maxMembers,
           memberCanPost: dto.memberCanPost ?? true,
           memberCount: 1,
         },

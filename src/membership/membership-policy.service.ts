@@ -19,7 +19,6 @@ const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
 export enum MembershipQuota {
   GroupMembers = 'group-members',
   JoinedCircles = 'joined-circles',
-  CreatedCircles = 'created-circles',
   Notes = 'notes',
   CityFilters = 'city-filters',
 }

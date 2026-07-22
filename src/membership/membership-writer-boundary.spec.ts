@@ -50,4 +50,18 @@ describe('membership writer boundary', () => {
 
     expect(offenders).toEqual([]);
   });
+
+  it('keeps retired membership entitlements out of production source', () => {
+    const retiredEntitlement =
+      /created.?circles|premium.?circle|priority.?support/i;
+    const offenders = filesUnder(join(REPO_ROOT, 'src'))
+      .filter((file) => /\.ts$/.test(file) && !/\.spec\.ts$/.test(file))
+      .filter((file) => {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename
+        return retiredEntitlement.test(readFileSync(file, 'utf8'));
+      })
+      .map((file) => relative(REPO_ROOT, file));
+
+    expect(offenders).toEqual([]);
+  });
 });

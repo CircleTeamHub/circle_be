@@ -34,11 +34,6 @@ type ReplayableGrant = Prisma.MembershipGrantGetPayload<{
   include: typeof GRANT_REPLAY_INCLUDE;
 }>;
 
-type BenefitGrantReader = Pick<
-  Prisma.TransactionClient,
-  'membershipBenefitGrant'
->;
-
 type CanonicalGrantInput = {
   targetLevel: MembershipLevel;
   idempotencyKey: string;
@@ -80,8 +75,7 @@ export class MembershipAdminService {
           if (replay) {
             return {
               created: false,
-              response: await this.replayOrThrow(
-                tx,
+              response: this.replayOrThrow(
                 replay,
                 operatorUserId,
                 targetUserId,
@@ -125,6 +119,17 @@ export class MembershipAdminService {
                 this.expiryBase(target, previous.level, transactionNow),
                 targetTier.durationMonths,
               );
+          const benefitType = this.benefitForTarget(input.targetLevel);
+          const previouslyIssued = target.membershipBenefitGrants.map(
+            (benefit) => benefit.type,
+          );
+          const issuedBenefitTypes =
+            benefitType && !previouslyIssued.includes(benefitType)
+              ? [benefitType]
+              : [];
+          const benefitTypesSnapshot = [
+            ...new Set([...previouslyIssued, ...issuedBenefitTypes]),
+          ];
 
           const grant = await tx.membershipGrant.create({
             data: {
@@ -132,9 +137,11 @@ export class MembershipAdminService {
               targetUserID: targetUserId,
               operatorUserID: operatorUserId,
               previousLevel: target.vipLevel,
+              previousEffectiveLevel: previous.level,
               newLevel: input.targetLevel,
               previousExpiresAt: target.vipExpiresAt,
               newExpiresAt,
+              benefitTypesSnapshot,
               note: input.note,
             },
           });
@@ -147,12 +154,7 @@ export class MembershipAdminService {
             },
           });
 
-          const benefitType = this.benefitForTarget(input.targetLevel);
-          const previouslyIssued = target.membershipBenefitGrants.map(
-            (benefit) => benefit.type,
-          );
-          const issuedBenefitTypes: MembershipBenefitType[] = [];
-          if (benefitType && !previouslyIssued.includes(benefitType)) {
+          if (benefitType && issuedBenefitTypes.includes(benefitType)) {
             await tx.membershipBenefitGrant.create({
               data: {
                 userID: targetUserId,
@@ -160,7 +162,6 @@ export class MembershipAdminService {
                 type: benefitType,
               },
             });
-            issuedBenefitTypes.push(benefitType);
           }
 
           const replayableGrant: ReplayableGrant = {
@@ -169,10 +170,7 @@ export class MembershipAdminService {
           };
           return {
             created: true,
-            response: this.toResponse(replayableGrant, false, previous.level, [
-              ...previouslyIssued,
-              ...issuedBenefitTypes,
-            ]),
+            response: this.toResponse(replayableGrant, false),
           };
         },
       );
@@ -190,8 +188,7 @@ export class MembershipAdminService {
       }
       transactionResult = {
         created: false,
-        response: await this.replayOrThrow(
-          this.prisma,
+        response: this.replayOrThrow(
           replay,
           operatorUserId,
           targetUserId,
@@ -254,13 +251,12 @@ export class MembershipAdminService {
     return null;
   }
 
-  private async replayOrThrow(
-    client: BenefitGrantReader,
+  private replayOrThrow(
     grant: ReplayableGrant,
     operatorUserId: string,
     targetUserId: string,
     input: CanonicalGrantInput,
-  ): Promise<MembershipAdminGrantResponseDto> {
+  ): MembershipAdminGrantResponseDto {
     if (
       grant.operatorUserID !== operatorUserId ||
       grant.targetUserID !== targetUserId ||
@@ -273,34 +269,12 @@ export class MembershipAdminService {
       });
     }
 
-    const previousEffectiveLevel = this.membershipPolicy.resolve(
-      {
-        vipLevel: grant.previousLevel,
-        vipExpiresAt: grant.previousExpiresAt,
-      },
-      grant.createdAt,
-    ).level;
-    const benefitGrants = await client.membershipBenefitGrant.findMany({
-      where: {
-        userID: grant.targetUserID,
-        OR: [
-          { createdAt: { lte: grant.createdAt } },
-          { membershipGrantID: grant.id },
-        ],
-      },
-      select: { type: true },
-    });
-    const benefitTypes = [
-      ...new Set(benefitGrants.map((benefit) => benefit.type)),
-    ];
-    return this.toResponse(grant, true, previousEffectiveLevel, benefitTypes);
+    return this.toResponse(grant, true);
   }
 
   private toResponse(
     grant: ReplayableGrant,
     replayed: boolean,
-    previousEffectiveLevel: MembershipLevel,
-    allIssuedBenefitTypes: readonly MembershipBenefitType[],
   ): MembershipAdminGrantResponseDto {
     const newLevel = grant.newLevel as MembershipLevel;
     const tier = MEMBERSHIP_CATALOG[newLevel];
@@ -316,7 +290,7 @@ export class MembershipAdminService {
         targetUserId: grant.targetUserID,
         operatorUserId: grant.operatorUserID,
         previousLevel: grant.previousLevel,
-        previousEffectiveLevel,
+        previousEffectiveLevel: grant.previousEffectiveLevel as MembershipLevel,
         newLevel: grant.newLevel,
         previousExpiresAt: grant.previousExpiresAt,
         newExpiresAt: grant.newExpiresAt,
@@ -327,7 +301,7 @@ export class MembershipAdminService {
         { vipLevel: newLevel, vipExpiresAt: grant.newExpiresAt },
         tier,
         newLevel,
-        allIssuedBenefitTypes,
+        grant.benefitTypesSnapshot,
       ),
       issuedBenefitTypes,
     };

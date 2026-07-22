@@ -43,6 +43,7 @@ export const MembershipErrorCode = {
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
   // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
   IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
+  GroupMemberCapacityExceeded: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED',
 } as const;
 
 export const CircleErrorCode = {
