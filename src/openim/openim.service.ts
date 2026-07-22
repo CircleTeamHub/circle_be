@@ -450,6 +450,8 @@ export class OpenimService implements OnModuleInit {
     /** 客户端按 customElem.extension 分发渲染（Circle_frontend im/mappers 惯例）。 */
     extension: string;
     offlinePush?: { title: string; desc: string } | null;
+    /** 幂等键（round 2 review）：重试用固定 id，OpenIM 侧去重防双留痕。 */
+    clientMsgID?: string;
   }): Promise<void> {
     if (!this.enabled) return;
 
@@ -487,6 +489,7 @@ export class OpenimService implements OnModuleInit {
             }
           : {}),
         ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
       },
       adminToken,
     );

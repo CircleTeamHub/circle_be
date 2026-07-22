@@ -385,6 +385,12 @@ export class CallService {
         errorCode: CallErrorCode.Expired,
       });
     }
+    // round 2 review：1:1 接听前复检好友/拉黑 —— 邀请创建后任一方拉黑或
+    // 删好友，被叫不该还能把通话推进 ACTIVE 并拿到 LiveKit token。振铃会
+    // 自然超时收尾，无需在此显式取消。
+    if (call.sessionType === SINGLE_SESSION_TYPE && call.initiatorID) {
+      await this.assertDirectCallee(call.initiatorID, userID);
+    }
 
     const joinedAt = new Date();
     const updatedParticipant = await this.prisma.callParticipant.update({
@@ -516,14 +522,26 @@ export class CallService {
     }
 
     const call = (participant.call ?? {}) as CallWithParticipants;
-    const ended = (await this.prisma.callSession.update({
-      where: { id: callId },
+    // round 2 review：群通话的 all-left 终局同样必须 CAS —— LiveKit
+    // room_finished webhook 可能先赢下 NORMAL 转换并发过留痕，这里无条件
+    // update 会把已终局的行改写成 ALL_LEFT 再发第二条留痕。
+    const transition = await this.prisma.callSession.updateMany({
+      where: {
+        id: callId,
+        status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
+      },
       data: {
         status: CallStatus.ENDED,
         endReason: CallEndReason.ALL_LEFT,
         endedAt: leftAt,
         endedByID: userID,
       },
+    });
+    if (transition.count === 0) {
+      return;
+    }
+    const ended = (await this.prisma.callSession.findUnique({
+      where: { id: callId },
       include: this.callInclude(),
     })) as CallWithParticipants;
 
@@ -1219,8 +1237,17 @@ export class CallService {
           durationSeconds,
           initiatorID: call.initiatorID,
         },
+        // round 2 review：重试幂等 —— 固定 clientMsgID 让「超时但 OpenIM 已
+        // 收下」的重试在服务端合并，不再写出第二条留痕。终局转换是 CAS，
+        // 每通电话只有一条留痕在飞，按 callId 定键即可。
+        clientMsgID: `call_record_${call.id}`,
+        // round 2 review：未接推送只对单聊成立 —— 群消息挂 offlinePush 会
+        // 推给全群，而被邀请的可能只是群里两三个人；其余成员会收到一条
+        // 与自己无关的「未接来电」。群聊留痕入历史但不推送。
         offlinePush:
-          endReason === CallEndReason.NO_ANSWER && !options.suppressOfflinePush
+          isSingle &&
+          endReason === CallEndReason.NO_ANSWER &&
+          !options.suppressOfflinePush
             ? {
                 title: initiator?.nickname ?? 'Circle',
                 desc:

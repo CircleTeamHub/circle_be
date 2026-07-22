@@ -659,6 +659,13 @@ export class FriendService {
       });
     }
     await this.prisma.$transaction(async (tx: any) => {
+      // round 2 review：删好友与拉黑一样，须与 1:1 呼叫创建串行化
+      //（同款 call-user pair 锁，见 blockUser 内注释）。
+      for (const id of [userId, friendId].sort((a, b) => a.localeCompare(b))) {
+        await tx.$queryRaw`
+          SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${id}`}, 0))
+        `;
+      }
       await tx.friend.delete({ where: { id: record.id } });
       await tx.friendSyncOutbox.createMany({
         data: [
@@ -1057,6 +1064,18 @@ export class FriendService {
     // client still sees a clean 409 instead of a leaked Prisma constraint name.
     try {
       await this.prisma.$transaction(async (tx: any) => {
+        // round 2 review（与 1:1 呼叫的授权串行化）：拉黑写入拿与
+        // CallService.lockParticipantsForCall 完全相同的 per-user advisory
+        // 锁（key 'call-user:<id>'，升序）。否则拉黑事务与呼叫创建事务
+        // 互不相知：呼叫在锁内复检通过后、落库+广播前，拉黑仍能提交 ——
+        // 被拉黑的人照样收到邀请。共享同一把锁后两者严格互斥。
+        for (const id of [blockerId, targetId].sort((a, b) =>
+          a.localeCompare(b),
+        )) {
+          await tx.$queryRaw`
+            SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${id}`}, 0))
+          `;
+        }
         await tx.friend.deleteMany({
           where: {
             OR: [

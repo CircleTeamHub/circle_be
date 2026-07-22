@@ -515,6 +515,81 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     expect(prisma.callParticipant.count).not.toHaveBeenCalled();
   });
 
+  it('re-checks friend/block before ACCEPT of a 1:1 call (round 2)', async () => {
+    const call = {
+      id: 'call-1',
+      conversationID: 'si_user1_user2',
+      sessionType: 1,
+      callType: 'AUDIO',
+      status: CallStatus.RINGING,
+      initiatorID: 'user-1',
+      livekitRoomName: 'room-1',
+      expiresAt: new Date(now.getTime() + 30_000),
+      participants: [],
+    };
+    prisma.callParticipant.findUnique.mockResolvedValue({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: CallParticipantStatus.INVITED,
+      call,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    // 邀请创建后被叫拉黑了发起方
+    prisma.friend.findFirst.mockResolvedValue({ id: 'friend-1' });
+    prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+
+    await expectErrorCode(
+      service.acceptCall('user-2', 'call-1'),
+      CallErrorCode.NotFriend,
+    );
+    // 绝不能把通话推进 ACTIVE / 发 LiveKit token
+    expect(livekit.mintJoinToken).not.toHaveBeenCalled();
+  });
+
+  it('call records carry a stable clientMsgID and group misses do not offline-push (round 2)', async () => {
+    const groupCall = {
+      id: 'gcall-1',
+      conversationID: 'sg_group-1',
+      sessionType: 3,
+      callType: 'AUDIO',
+      status: CallStatus.RINGING,
+      initiatorID: 'user-1',
+      livekitRoomName: 'room-g',
+      startedAt: null,
+      expiresAt: new Date(now.getTime() - 1_000),
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      participants: [
+        {
+          userID: 'user-1',
+          status: CallParticipantStatus.JOINED,
+          user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        },
+        {
+          userID: 'user-2',
+          status: CallParticipantStatus.INVITED,
+          user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        },
+      ],
+    };
+    prisma.callSession.findMany.mockResolvedValue([groupCall]);
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.sweepExpiredRingingCalls();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: 'group', groupID: 'group-1' },
+        // 重试幂等键：固定 call_record_<id>
+        clientMsgID: 'call_record_gcall-1',
+        // 群聊未接绝不 offlinePush（会推给全群非被邀成员）
+        offlinePush: null,
+      }),
+    );
+  });
+
   it('retries a transient call-record send failure before giving up', async () => {
     const call = {
       id: 'call-1',
