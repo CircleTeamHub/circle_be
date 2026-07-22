@@ -129,6 +129,24 @@ export function createEnvValidationSchema(
     CALL_MAX_PARTICIPANTS: Joi.number().integer().min(2).max(100).default(10),
     CALL_ALLOW_OFFLINE_INVITE: Joi.boolean().default(false),
     CALL_ENABLE_VIDEO: Joi.boolean().default(false),
+    // 真实邮件投递（#82）。SMTP_HOST 未设 = 受支持的开发态（ConsoleMailer，
+    // 验证码打日志）；设了 host 就必须配齐凭据 —— production 半配置要在启动期
+    // 炸掉，而不是运行时静默不发信。465 → 隐式 TLS；587 → SMTP_SECURE=false
+    // 走 STARTTLS（SmtpMailer 强制 requireTLS，明文投递不可配）。
+    SMTP_HOST: Joi.string().hostname().optional(),
+    SMTP_PORT: Joi.number().integer().min(1).max(65535).default(465),
+    SMTP_SECURE: Joi.boolean().default(true),
+    SMTP_USER: Joi.when('SMTP_HOST', {
+      is: Joi.exist(),
+      then: Joi.string().required(),
+      otherwise: Joi.string().optional(),
+    }),
+    SMTP_PASS: Joi.when('SMTP_HOST', {
+      is: Joi.exist(),
+      then: Joi.string().required(),
+      otherwise: Joi.string().optional(),
+    }),
+    MAIL_FROM: Joi.string().optional(),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),

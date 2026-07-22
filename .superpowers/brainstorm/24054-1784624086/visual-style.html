@@ -1,0 +1,50 @@
+<style>
+  .style-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-top:24px}
+  .style-card{border:1px solid var(--border);border-radius:18px;overflow:hidden;background:var(--card);cursor:pointer;transition:.2s ease;box-shadow:0 10px 30px rgba(15,23,42,.08)}
+  .style-card:hover{transform:translateY(-3px);box-shadow:0 18px 40px rgba(15,23,42,.13)}
+  .style-card.selected{outline:3px solid var(--accent);outline-offset:2px}
+  .scene{height:260px;position:relative;overflow:hidden}
+  .scene:before,.scene:after{content:"";position:absolute;inset:auto}
+  .mountain{position:absolute;bottom:-35px;width:230px;height:230px;transform:rotate(45deg);border-radius:26px 80px 16px 80px;filter:blur(.2px)}
+  .mist{position:absolute;left:-10%;right:-10%;height:45px;border-radius:50%;filter:blur(13px)}
+  .moon{position:absolute;width:55px;height:55px;border-radius:50%;box-shadow:0 0 40px currentColor}
+  .a{background:linear-gradient(160deg,#b8efe2 0%,#89c8be 34%,#416b64 72%,#172f31 100%)}
+  .a .m1{left:-45px;background:#345f56}.a .m2{right:-35px;bottom:-60px;background:#234d49;transform:rotate(45deg) scale(1.15)}
+  .a .mist{bottom:62px;background:rgba(238,255,249,.7)}.a .moon{right:42px;top:35px;color:#e9ffdc;background:#f3ffe9}
+  .b{background:linear-gradient(165deg,#f5f3ec 0%,#cbc9c1 40%,#787d7b 76%,#2d3434 100%)}
+  .b .m1{left:-55px;background:#747d78}.b .m2{right:-10px;bottom:-70px;background:#3f4947;transform:rotate(45deg) scale(1.2)}
+  .b .mist{bottom:78px;background:rgba(255,255,255,.78)}.b .moon{left:38px;top:34px;color:#f7f2dd;background:#fffbe8}
+  .c{background:linear-gradient(160deg,#fff0ca 0%,#d79a63 38%,#8d3e2f 70%,#2d1724 100%)}
+  .c .m1{left:-30px;background:#853a32}.c .m2{right:-30px;bottom:-70px;background:#482438;transform:rotate(45deg) scale(1.2)}
+  .c .mist{bottom:62px;background:rgba(255,223,171,.55)}.c .moon{right:45px;top:32px;color:#ffd783;background:#ffe6a6}
+  .pavilion{position:absolute;bottom:72px;left:50%;width:92px;height:52px;transform:translateX(-50%);border-bottom:8px solid rgba(31,30,29,.72)}
+  .pavilion:before{content:"";position:absolute;left:10px;right:10px;top:0;height:28px;background:rgba(24,30,29,.78);clip-path:polygon(50% 0,100% 45%,82% 40%,75% 100%,25% 100%,18% 40%,0 45%)}
+  .pavilion:after{content:"";position:absolute;left:28px;right:28px;top:24px;height:30px;border-left:5px solid rgba(29,29,28,.75);border-right:5px solid rgba(29,29,28,.75)}
+  .copy{padding:18px 18px 20px}.copy h3{margin:0 0 7px}.copy p{margin:0;color:var(--muted);line-height:1.55}
+  .badge{display:inline-flex;margin-bottom:10px;padding:4px 9px;border-radius:999px;background:rgba(255,255,255,.72);font-size:12px;font-weight:700;color:#334155}
+  @media(max-width:850px){.style-grid{grid-template-columns:1fr}.scene{height:210px}}
+</style>
+
+<h2>仙侠山水主题：你更喜欢哪种气质？</h2>
+<p class="subtitle">三种方向都会给左侧导航和输入区留出干净安全区，避免背景影响文字可读性。</p>
+
+<div class="style-grid">
+  <div class="style-card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="scene a">
+      <div class="moon"></div><div class="mountain m1"></div><div class="mountain m2"></div><div class="mist"></div><div class="pavilion"></div>
+    </div>
+    <div class="copy"><span class="badge">推荐</span><h3>A · 青绿仙境</h3><p>碧青群峰、云海、远亭与柔光。仙气最浓，清爽耐看，适合长时间写代码。</p></div>
+  </div>
+  <div class="style-card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="scene b">
+      <div class="moon"></div><div class="mountain m1"></div><div class="mountain m2"></div><div class="mist"></div><div class="pavilion"></div>
+    </div>
+    <div class="copy"><span class="badge">克制</span><h3>B · 水墨云山</h3><p>宣纸灰白、墨色山峦、孤月和薄雾。东方感最纯，界面干净、不抢内容。</p></div>
+  </div>
+  <div class="style-card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="scene c">
+      <div class="moon"></div><div class="mountain m1"></div><div class="mountain m2"></div><div class="mist"></div><div class="pavilion"></div>
+    </div>
+    <div class="copy"><span class="badge">华丽</span><h3>C · 金霞宫阙</h3><p>夕照金红、悬空仙宫、流云与灯火。戏剧感最强，但视觉存在感也最高。</p></div>
+  </div>
+</div>
