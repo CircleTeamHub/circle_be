@@ -22,6 +22,10 @@ describe('MembershipService', () => {
     expect(service.getPlans()).toEqual([
       {
         level: 1,
+        name: 'Silver',
+        price: 298,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
         key: 'silver',
         durationMonths: 1,
         lifetime: false,
@@ -38,6 +42,10 @@ describe('MembershipService', () => {
       },
       {
         level: 2,
+        name: 'Gold',
+        price: 1288,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
         key: 'gold',
         durationMonths: 6,
         lifetime: false,
@@ -54,6 +62,10 @@ describe('MembershipService', () => {
       },
       {
         level: 3,
+        name: 'Diamond',
+        price: 1998,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
         key: 'diamond',
         durationMonths: 12,
         lifetime: false,
@@ -70,6 +82,10 @@ describe('MembershipService', () => {
       },
       {
         level: 4,
+        name: 'Super',
+        price: 3998,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
         key: 'super',
         durationMonths: null,
         lifetime: true,
@@ -90,6 +106,60 @@ describe('MembershipService', () => {
     ]);
 
     expect(MembershipService.prototype).not.toHaveProperty('upgrade');
+  });
+
+  it('satisfies the shipped v1 plan validator without restoring its five-tier fallback', () => {
+    const plans = service.getPlans() as unknown as Array<{
+      level: number;
+      name: string;
+      price: number;
+      priceCny: number;
+      perks: string;
+    }>;
+
+    expect(
+      plans.map(({ level, name, price, perks }) => ({
+        level,
+        name,
+        price,
+        perks,
+      })),
+    ).toEqual([
+      {
+        level: 1,
+        name: 'Silver',
+        price: 298,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
+      },
+      {
+        level: 2,
+        name: 'Gold',
+        price: 1288,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
+      },
+      {
+        level: 3,
+        name: 'Diamond',
+        price: 1998,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
+      },
+      {
+        level: 4,
+        name: 'Super',
+        price: 3998,
+        perks:
+          'See current membership benefits; contact customer service for activation or upgrade support.',
+      },
+    ]);
+    expect(plans).toHaveLength(4);
+    expect(
+      plans.every(({ name, perks }) => name.length > 0 && perks.length > 0),
+    ).toBe(true);
+    expect(plans.every(({ price, priceCny }) => price === priceCny)).toBe(true);
+    expect(plans.some(({ level }) => level === 5)).toBe(false);
   });
 
   it('returns an active timed membership and one-time benefit status', async () => {

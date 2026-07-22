@@ -45,6 +45,22 @@ export class MembershipBenefitsDto {
 
 export class MembershipPlanDto {
   @ApiProperty({ minimum: 1, maximum: 4 }) level: number;
+  @ApiProperty({
+    deprecated: true,
+    description: 'Legacy v1 display name; use key as the stable tier identity.',
+  })
+  name: string;
+  @ApiProperty({
+    deprecated: true,
+    description: 'Legacy v1 price alias; mirrors priceCny.',
+  })
+  price: number;
+  @ApiProperty({
+    deprecated: true,
+    description:
+      'Legacy v1 summary; use the authoritative benefits fields for entitlements.',
+  })
+  perks: string;
   @ApiProperty({ enum: ['silver', 'gold', 'diamond', 'super'] })
   key: Exclude<MembershipTierKey, 'regular'>;
   @ApiProperty({ nullable: true }) durationMonths: number | null;
