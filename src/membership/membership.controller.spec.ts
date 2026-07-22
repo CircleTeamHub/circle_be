@@ -7,13 +7,12 @@ import { MembershipService } from './membership.service';
 
 describe('MembershipController', () => {
   let app: INestApplication;
-  const plans = [1, 2, 3, 4].map((level) => ({
-    level,
-    name: `VIP${level}`,
-    price: level * 100,
-    perks: 'test',
-  }));
-  const service = { getPlans: jest.fn(() => plans) };
+  const plans = [1, 2, 3, 4].map((level) => ({ level }));
+  const membership = { storedLevel: 3, effectiveLevel: 3, key: 'diamond' };
+  const service = {
+    getPlans: jest.fn(() => plans),
+    getMe: jest.fn().mockResolvedValue(membership),
+  };
 
   beforeEach(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -47,6 +46,15 @@ describe('MembershipController', () => {
       .post('/membership/upgrade')
       .send({ level: 2 })
       .expect(404);
+  });
+
+  it('returns membership state for the authenticated user', async () => {
+    const controller = new MembershipController(service as never) as any;
+
+    await expect(
+      controller.getMe({ user: { userId: 'user-1' } } as never),
+    ).resolves.toBe(membership);
+    expect(service.getMe).toHaveBeenCalledWith('user-1');
   });
 
   it('does not retain an internal upgrade mutation method', () => {

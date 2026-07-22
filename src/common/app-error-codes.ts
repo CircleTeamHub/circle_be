@@ -38,6 +38,7 @@ export const CoinErrorCode = {
 export const MembershipErrorCode = {
   InvalidLevel: 'MEMBERSHIP_INVALID_LEVEL',
   LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
+  IdempotencyConflict: 'MEMBERSHIP_IDEMPOTENCY_CONFLICT',
   InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
   // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）

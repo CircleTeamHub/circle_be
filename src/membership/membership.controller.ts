@@ -1,4 +1,4 @@
-import { Controller, Get, UseGuards } from '@nestjs/common';
+import { Controller, Get, Req, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -6,7 +6,8 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import { MembershipPlanDto } from './dto/membership.dto';
+import type { RequestWithUser } from 'src/auth/types';
+import { MembershipPlanDto, MembershipStatusDto } from './dto/membership.dto';
 import { MembershipService } from './membership.service';
 
 @ApiTags('Membership')
@@ -21,5 +22,12 @@ export class MembershipController {
   @ApiOkResponse({ type: [MembershipPlanDto] })
   getPlans(): MembershipPlanDto[] {
     return this.membershipService.getPlans();
+  }
+
+  @Get('me')
+  @ApiOperation({ summary: 'Get effective membership for the current user' })
+  @ApiOkResponse({ type: MembershipStatusDto })
+  getMe(@Req() req: RequestWithUser): Promise<MembershipStatusDto> {
+    return this.membershipService.getMe(req.user.userId);
   }
 }

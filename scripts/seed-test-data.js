@@ -59,7 +59,6 @@ const USERS = [
   {
     accountId: 'alice01',
     nickname: '小爱',
-    vipLevel: 0,
     creditScore: 100,
     fancyNumber: false,
     gender: 'female',
@@ -68,7 +67,6 @@ const USERS = [
   {
     accountId: 'bob02',
     nickname: '大波',
-    vipLevel: 1,
     creditScore: 85,
     fancyNumber: true,
     gender: 'male',
@@ -77,7 +75,6 @@ const USERS = [
   {
     accountId: 'carol03',
     nickname: '小卡',
-    vipLevel: 2,
     creditScore: 70,
     fancyNumber: false,
     gender: 'female',
@@ -86,7 +83,6 @@ const USERS = [
   {
     accountId: 'dave04',
     nickname: '老戴',
-    vipLevel: 3,
     creditScore: 95,
     fancyNumber: true,
     gender: 'male',
@@ -95,7 +91,6 @@ const USERS = [
   {
     accountId: 'erin05',
     nickname: '伊琳',
-    vipLevel: 0,
     creditScore: 60,
     fancyNumber: false,
     gender: 'female',
@@ -104,7 +99,6 @@ const USERS = [
   {
     accountId: 'frank06',
     nickname: '法兰克',
-    vipLevel: 4,
     creditScore: 100,
     fancyNumber: true,
     gender: 'male',
@@ -113,7 +107,6 @@ const USERS = [
   {
     accountId: 'grace07',
     nickname: '阿雅',
-    vipLevel: 1,
     creditScore: 90,
     fancyNumber: false,
     gender: 'female',
@@ -122,7 +115,6 @@ const USERS = [
   {
     accountId: 'henry08',
     nickname: '亨利',
-    vipLevel: 2,
     creditScore: 80,
     fancyNumber: false,
     gender: 'male',
@@ -311,13 +303,13 @@ const FRIENDS = [
 async function main() {
   const passwordHash = await argon2.hash(PASSWORD);
 
-  // 1) Users (upsert by accountId).
+  // 1) Users (upsert by accountId). Membership stays at the schema default;
+  // paid test memberships must be created through the admin membership grant API.
   for (const u of USERS) {
     await prisma.user.upsert({
       where: { accountId: u.accountId },
       update: {
         nickname: u.nickname,
-        vipLevel: u.vipLevel,
         creditScore: u.creditScore,
         fancyNumber: u.fancyNumber,
         gender: u.gender,
@@ -329,7 +321,6 @@ async function main() {
         accountId: u.accountId,
         passwordHash,
         nickname: u.nickname,
-        vipLevel: u.vipLevel,
         creditScore: u.creditScore,
         fancyNumber: u.fancyNumber,
         gender: u.gender,
