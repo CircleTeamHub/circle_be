@@ -1,5 +1,6 @@
 import {
   APP_ERROR_CODES,
+  AdminUserErrorCode,
   AuthErrorCode,
   CallErrorCode,
   ChatHistoryErrorCode,
@@ -30,6 +31,7 @@ import {
 //      silently falling back to the raw (often Chinese) backend message.
 describe('app error code catalog', () => {
   const groups = {
+    AdminUserErrorCode,
     AuthErrorCode,
     CoinErrorCode,
     MembershipErrorCode,

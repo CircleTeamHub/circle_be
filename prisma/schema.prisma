@@ -1432,3 +1432,24 @@ model UserLike {
   // its fromUserID prefix also serves any fromUserID-only lookup.
   @@index([fromUserID, likedOn])
 }
+
+model AdminAuditLog {
+  id             String   @id @default(uuid())
+  actorId        String
+  actorAccountId String
+  action         String
+  targetType     String
+  targetId       String
+  before         Json?
+  after          Json?
+  reason         String?
+  metadata       Json?
+  requestId      String?
+  ip             String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  @@index([targetType, targetId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+}
