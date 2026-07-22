@@ -18,7 +18,9 @@
 - Ban and deletion revoke refresh rows transactionally and invoke existing access-token revocation after commit.
 - VIP is copy-only: `新的月度 VIP 系统设计中`; do not read or mutate legacy `vipLevel`.
 - Follow TDD: write each behavior test, run it and confirm the intended failure, then write minimal production code.
-- Backend branch: `feat/admin-user-management` based on local commit `114bc67`.
+- Backend branch: `feat/admin-user-management` based on the current
+  `docs/admin-user-management-design` branch so both approved design artifacts
+  travel with the implementation.
 - Admin branch: `feat/admin-user-management` based on `main`.
 
 ---
