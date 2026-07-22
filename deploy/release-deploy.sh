@@ -226,8 +226,8 @@ ensure_live() {
 }
 
 # Before the new color is healthy, only downtime mode has stopped the live app.
-# Restore it on any migration/startup failure so an operational error does not
-# extend the maintenance window indefinitely.
+# Reversible failures may restore it; irreversible failures call this only after
+# the database contract is positively proven unapplied.
 restore_live() {
   if [ "${RELEASE_DOWNTIME:-0}" != "1" ] || [ -z "$live" ]; then
     return 0
@@ -246,7 +246,7 @@ irreversible_boundary_crossed() {
 }
 
 enter_irreversible_maintenance() {
-  echo "CRITICAL: irreversible migration succeeded; refusing to restart the previous binary." >&2
+  echo "CRITICAL: irreversible contract is applied or could not be proven unapplied; refusing to restart the previous binary." >&2
   echo "Keeping the service in maintenance for a forward fix or database restore." >&2
   if [ -n "${standby:-}" ] && [ -n "$(running "$standby")" ]; then
     compose stop "$standby" || true
@@ -254,6 +254,78 @@ enter_irreversible_maintenance() {
   if [ -n "${live:-}" ] && [ -n "$(running "$live")" ]; then
     compose stop "$live" || true
   fi
+}
+
+probe_irreversible_contract_state() {
+  local constraint_count probe_script
+  probe_script=$(cat <<'NODE'
+const { Client } = require('pg');
+
+async function main() {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const result = await client.query(`
+      SELECT count(*)::int AS count
+      FROM pg_constraint AS constraint_record
+      JOIN pg_class AS table_record
+        ON table_record.oid = constraint_record.conrelid
+      JOIN pg_namespace AS schema_record
+        ON schema_record.oid = table_record.relnamespace
+      WHERE schema_record.nspname = current_schema()
+        AND constraint_record.contype = 'c'
+        AND constraint_record.convalidated
+        AND (
+          (table_record.relname = 'User'
+            AND constraint_record.conname = 'User_vipLevel_check')
+          OR
+          (table_record.relname = 'Circle'
+            AND constraint_record.conname = 'Circle_joinVipRestriction_check')
+        )
+    `);
+    process.stdout.write(String(result.rows[0].count));
+  } finally {
+    await client.end();
+  }
+}
+
+main().catch((error) => {
+  console.error(`membership contract probe failed: ${error.message}`);
+  process.exit(1);
+});
+NODE
+)
+
+  if ! constraint_count="$(compose run --rm --no-deps migrate node -e "$probe_script")"; then
+    printf 'ambiguous\n'
+    return 0
+  fi
+
+  case "$constraint_count" in
+    0) printf 'unapplied\n' ;;
+    2) printf 'applied\n' ;;
+    *) printf 'ambiguous\n' ;;
+  esac
+}
+
+handle_irreversible_migration_command_failure() {
+  local contract_state
+  contract_state="$(probe_irreversible_contract_state)"
+  case "$contract_state" in
+    unapplied)
+      echo "Irreversible contract is proven unapplied; restoring the previous binary." >&2
+      restore_live || true
+      ;;
+    applied)
+      irreversible_migration_applied=1
+      echo "Migration command failed after the irreversible contract was applied." >&2
+      enter_irreversible_maintenance
+      ;;
+    *)
+      echo "Migration command failed and contract state is ambiguous." >&2
+      enter_irreversible_maintenance
+      ;;
+  esac
 }
 
 handle_post_migration_failure() {
@@ -344,7 +416,11 @@ fi
 echo "==> Running prisma migrate deploy from $CIRCLE_BE_IMAGE"
 if ! compose run --rm migrate; then
   echo "Migration failed; the database may require manual inspection" >&2
-  restore_live || true
+  if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ]; then
+    handle_irreversible_migration_command_failure
+  else
+    restore_live || true
+  fi
   exit 1
 fi
 irreversible_migration_applied=1

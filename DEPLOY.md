@@ -174,9 +174,12 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `downtime: true` 和 `irreversible_migration: true`。服务器也会二次校验
 `RELEASE_IRREVERSIBLE_MIGRATION=1` 必须与 `RELEASE_DOWNTIME=1` 同时启用。
 
-迁移命令失败时 schema 尚未确认变更完成,脚本会恢复旧实例。迁移命令一旦成功,
-旧二进制不再是合法回滚目标;后续启动、健康、代理、状态写入或烟测失败都会保持
-维护状态,等待向前修复。只有先从本次迁移前备份完整恢复数据库,才能再启动旧镜像。
+不可逆迁移命令返回非零时,脚本会通过发布镜像连接目标数据库,直接检查
+`User_vipLevel_check` 和 `Circle_joinVipRestriction_check`。只有两个约束都不存在时,
+才能证明事务未应用并恢复旧实例;两个都存在、只存在一个、探测失败或返回异常结果
+都会保持维护状态。迁移命令成功后,旧二进制同样不再是合法回滚目标;后续启动、
+健康、代理、状态写入或烟测失败都会等待向前修复。只有先从本次迁移前备份完整恢复
+数据库,才能再启动旧镜像。
 本次会员迁移的完整值班步骤和验证 SQL 见
 `docs/operations/membership-rollout.md`。标记只能由**后续已成功部署**、且不再包含
 不可逆迁移的版本移除,不能在会员迁移 tag 上提前删除。

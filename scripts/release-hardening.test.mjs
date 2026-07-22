@@ -242,7 +242,7 @@ test('marked releases reject tag push and incomplete manual confirmations', (t) 
 test('server crosses an explicit no-rollback boundary after irreversible migration', () => {
   const deploy = read('deploy/release-deploy.sh');
   const migration = deploy.indexOf('if ! compose run --rm migrate; then');
-  const crossed = deploy.indexOf('irreversible_migration_applied=1');
+  const crossed = deploy.indexOf('irreversible_migration_applied=1', migration);
 
   assert.match(
     deploy,
@@ -254,6 +254,17 @@ test('server crosses an explicit no-rollback boundary after irreversible migrati
   );
   assert.ok(migration >= 0 && migration < crossed);
   assert.match(deploy, /enter_irreversible_maintenance\(\)/);
+  assert.match(deploy, /pg_constraint/);
+  assert.match(deploy, /User_vipLevel_check/);
+  assert.match(deploy, /Circle_joinVipRestriction_check/);
+  assert.match(
+    deploy,
+    /if ! compose run --rm migrate; then[\s\S]*handle_irreversible_migration_command_failure/,
+  );
+  assert.match(
+    deploy,
+    /unapplied\)[\s\S]*restore_live[\s\S]*applied\)[\s\S]*enter_irreversible_maintenance/,
+  );
   assert.match(
     deploy,
     /if irreversible_boundary_crossed; then[\s\S]*enter_irreversible_maintenance/,

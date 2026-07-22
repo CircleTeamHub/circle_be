@@ -60,8 +60,12 @@ level-5 account normalized to effective super membership.
 
 ## Failure Boundary
 
-- Before migration success: a migration failure may restart the old binary. Keep
-  the failed migration log and inspect the database before retrying.
+- If the migration command exits nonzero, the script probes the target database
+  for both membership check constraints. It restarts the old binary only when
+  neither constraint exists, which proves the transactional migration is
+  unapplied. Both constraints present means applied; one constraint, probe
+  failure, or malformed output is ambiguous. Applied and ambiguous states remain
+  in maintenance.
 - After migration success: startup, health, Caddy validation/reload, active-color
   state, or smoke failure must leave the service in maintenance. The script will
   not restart the old binary because it can write values rejected by the new

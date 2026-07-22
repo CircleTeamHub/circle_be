@@ -13,7 +13,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH MIGRATE_FAIL START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -69,7 +69,17 @@ if [ "${1:-}" = "compose" ]; then
       rm -f "$(service_file "$service")"
       ;;
     run)
-      [ "${MIGRATE_FAIL:-0}" != "1" ] || exit 42
+      if printf '%s\n' "$*" | grep -q 'User_vipLevel_check'; then
+        case "${CONTRACT_PROBE_STATE:-none}" in
+          none) printf '0\n' ;;
+          both) printf '2\n' ;;
+          partial) printf '1\n' ;;
+          error) exit 45 ;;
+          *) exit 46 ;;
+        esac
+      else
+        [ "${MIGRATE_FAIL:-0}" != "1" ] || exit 42
+      fi
       ;;
     exec)
       if [ -n "${CADDY_RELOAD_FAIL_TARGET:-}" ] &&
@@ -167,6 +177,7 @@ run_release() {
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
+    CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
     START_FAIL="${START_FAIL:-0}" \
     HEALTH_FAIL="${HEALTH_FAIL:-0}" \
     SMOKE_CODE="${SMOKE_CODE:-401}" \
@@ -215,6 +226,14 @@ assert_command_before() {
     cat "$TEST_COMMAND_LOG" >&2
     return 1
   fi
+}
+
+assert_contract_probe_ran() {
+  grep -q 'User_vipLevel_check' "$TEST_COMMAND_LOG" || {
+    echo "expected the target membership contract probe to run" >&2
+    cat "$TEST_COMMAND_LOG" >&2
+    return 1
+  }
 }
 
 test_migration_failure_restores_downtime_live_color() {
@@ -343,7 +362,28 @@ test_irreversible_migration_failure_restores_old_binary() {
   prepare_irreversible_case
   MIGRATE_FAIL=1
   ! run_release || return 1
-  assert_running circle_be
+  assert_contract_probe_ran && assert_running circle_be
+}
+
+test_irreversible_post_commit_cli_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=both
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_partial_contract_probe_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=partial
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_contract_probe_error_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=error
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
 }
 
 test_irreversible_startup_failure_stays_in_maintenance() {
@@ -393,6 +433,9 @@ for test_name in \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
   test_irreversible_migration_failure_restores_old_binary \
+  test_irreversible_post_commit_cli_failure_stays_in_maintenance \
+  test_irreversible_partial_contract_probe_stays_in_maintenance \
+  test_irreversible_contract_probe_error_stays_in_maintenance \
   test_irreversible_startup_failure_stays_in_maintenance \
   test_irreversible_health_failure_stays_in_maintenance \
   test_irreversible_proxy_failure_stays_in_maintenance \
