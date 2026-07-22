@@ -268,7 +268,19 @@ export const UserErrorCode = {
   InvalidBirthday: 'USER_INVALID_BIRTHDAY',
 } as const;
 
+export const AdminUserErrorCode = {
+  NotFound: 'ADMIN_USER_NOT_FOUND',
+  SelfStatusChange: 'ADMIN_USER_SELF_STATUS_CHANGE',
+  InvalidStatusTransition: 'ADMIN_USER_INVALID_STATUS_TRANSITION',
+  StatusConflict: 'ADMIN_USER_STATUS_CONFLICT',
+  ConfirmationMismatch: 'ADMIN_USER_CONFIRMATION_MISMATCH',
+  SensitiveFieldInvalid: 'ADMIN_USER_SENSITIVE_FIELD_INVALID',
+  SensitiveReasonRequired: 'ADMIN_USER_SENSITIVE_REASON_REQUIRED',
+  AuditUnavailable: 'ADMIN_AUDIT_UNAVAILABLE',
+} as const;
+
 export type AppErrorCode =
+  | (typeof AdminUserErrorCode)[keyof typeof AdminUserErrorCode]
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
   | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
@@ -291,6 +303,7 @@ export type AppErrorCode =
   | (typeof UserErrorCode)[keyof typeof UserErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
+  AdminUserErrorCode,
   AuthErrorCode,
   CoinErrorCode,
   MembershipErrorCode,

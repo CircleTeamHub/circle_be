@@ -13,6 +13,32 @@ describe('normalizeRoute', () => {
     ).toBe('/api/v1/circle/:id');
   });
 
+  it('normalizes every Admin user-management route template', () => {
+    const id = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
+    expect(normalizeRoute('/api/v1/admin/users')).toBe('/api/v1/admin/users');
+    expect(normalizeRoute(`/api/v1/admin/users/${id}`)).toBe(
+      '/api/v1/admin/users/:id',
+    );
+    expect(normalizeRoute(`/api/v1/admin/users/${id}/sensitive-access`)).toBe(
+      '/api/v1/admin/users/:id/sensitive-access',
+    );
+    expect(normalizeRoute(`/api/v1/admin/users/${id}/status`)).toBe(
+      '/api/v1/admin/users/:id/status',
+    );
+    expect(normalizeRoute(`/api/v1/admin/users/${id}/audit-logs`)).toBe(
+      '/api/v1/admin/users/:id/audit-logs',
+    );
+    expect(STATIC_ROUTES.has('/api/v1/admin/users')).toBe(true);
+    expect(DYNAMIC_ROUTE_TEMPLATES).toEqual(
+      expect.arrayContaining([
+        '/api/v1/admin/users/:id',
+        '/api/v1/admin/users/:id/sensitive-access',
+        '/api/v1/admin/users/:id/status',
+        '/api/v1/admin/users/:id/audit-logs',
+      ]),
+    );
+  });
+
   it('collapses Mongo ObjectId (24-hex) segments to :id', () => {
     expect(normalizeRoute('/api/v1/trace/507f1f77bcf86cd799439011')).toBe(
       '/api/v1/trace/:id',
