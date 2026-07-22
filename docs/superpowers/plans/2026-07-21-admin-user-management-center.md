@@ -37,7 +37,7 @@
 **Interfaces:**
 - Produces: Prisma delegate `adminAuditLog` and `AdminUserErrorCode` constants consumed by later backend tasks.
 
-- [ ] **Step 1: Create both feature branches**
+- [x] **Step 1: Create both feature branches**
 
 Run in `circle_be_remote`:
 
@@ -53,7 +53,7 @@ git switch -c feat/admin-user-management
 
 Expected: both commands report a new branch.
 
-- [ ] **Step 2: Write failing catalog and migration tests**
+- [x] **Step 2: Write failing catalog and migration tests**
 
 Add `AdminUserErrorCode` to the imports, `groups`, `AppErrorCode`, and `APP_ERROR_CODE_GROUPS` expectations in `app-error-codes.spec.ts`. Create `admin-audit-migration.spec.ts` with:
 
@@ -79,7 +79,7 @@ describe('AdminAuditLog migration', () => {
 });
 ```
 
-- [ ] **Step 3: Run the tests and verify RED**
+- [x] **Step 3: Run the tests and verify RED**
 
 Run:
 
@@ -89,7 +89,7 @@ npm test -- app-error-codes.spec.ts admin-audit-migration.spec.ts --runInBand
 
 Expected: FAIL because `AdminUserErrorCode` and the migration do not exist.
 
-- [ ] **Step 4: Add the error group, Prisma model, and SQL migration**
+- [x] **Step 4: Add the error group, Prisma model, and SQL migration**
 
 Add these stable codes:
 
@@ -108,11 +108,11 @@ export const AdminUserErrorCode = {
 
 Add the exact `AdminAuditLog` model from the approved design and create SQL for the 12 columns plus the three indexes. Use `TEXT` for strings, `JSONB` for `before`, `after`, and `metadata`, and `TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP` for `createdAt`.
 
-- [ ] **Step 5: Run the tests and verify GREEN**
+- [x] **Step 5: Run the tests and verify GREEN**
 
 Run the command from Step 3. Expected: PASS.
 
-- [ ] **Step 6: Generate Prisma client and commit**
+- [x] **Step 6: Generate Prisma client and commit**
 
 Run:
 
@@ -140,7 +140,7 @@ Expected: Prisma generation and commit succeed.
 **Interfaces:**
 - Produces: `SensitiveField`, `AdminAuditAction`, `maskSensitiveField`, validated request DTOs, and `AdminAuditService.recordInTransaction()` / `listForTarget()`.
 
-- [ ] **Step 1: Write failing masking tests**
+- [x] **Step 1: Write failing masking tests**
 
 ```ts
 describe('maskSensitiveField', () => {
@@ -158,7 +158,7 @@ describe('maskSensitiveField', () => {
 
 Run `npm test -- admin-user.masking.spec.ts --runInBand`. Expected: FAIL because the module does not exist.
 
-- [ ] **Step 2: Implement constants and masking**
+- [x] **Step 2: Implement constants and masking**
 
 ```ts
 export const SENSITIVE_FIELDS = [
@@ -176,7 +176,7 @@ export const AdminAuditAction = {
 
 Implement `maskSensitiveField(field, value)` exactly as the approved masking table. Re-run the masking test and expect PASS.
 
-- [ ] **Step 3: Write failing DTO validation tests**
+- [x] **Step 3: Write failing DTO validation tests**
 
 Use `validate()` from `class-validator` and `plainToInstance()` from `class-transformer` to prove:
 
@@ -187,7 +187,7 @@ Use `validate()` from `class-validator` and `plainToInstance()` from `class-tran
 
 Run `npm test -- admin-user.dto.spec.ts --runInBand`. Expected: FAIL because DTOs do not exist.
 
-- [ ] **Step 4: Implement DTOs**
+- [x] **Step 4: Implement DTOs**
 
 Create:
 
@@ -216,11 +216,11 @@ export class AdminUpdateUserStatusDto {
 
 Add Swagger decorators without changing validation. Re-run DTO tests and expect PASS.
 
-- [ ] **Step 5: Write failing audit service tests**
+- [x] **Step 5: Write failing audit service tests**
 
 Test that `recordInTransaction(tx, input)` calls `tx.adminAuditLog.create` with request context, never includes a supplied contact original, and that `listForTarget('user', id, limit)` orders by `createdAt: 'desc'` and caps limit at 100.
 
-- [ ] **Step 6: Implement the audit service**
+- [x] **Step 6: Implement the audit service**
 
 Expose:
 
@@ -240,7 +240,7 @@ type AuditInput = {
 
 `recordInTransaction` reads `getRequestContext()` for request ID, IP, and user-agent; truncates IP to 64 and user-agent to 256; and inserts only the explicit input. `listForTarget` selects the public audit columns, not arbitrary Prisma rows.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 ```bash
 npm test -- admin-user.masking.spec.ts admin-user.dto.spec.ts admin-audit.service.spec.ts --runInBand
@@ -262,7 +262,7 @@ Expected: all focused tests pass and commit succeeds.
 - Consumes: Task 2 DTOs, masking, and audit service.
 - Produces: `listUsers`, `getUserDetail`, `revealSensitiveField`, and `listAuditLogs` for the controller.
 
-- [ ] **Step 1: Write failing list tests**
+- [x] **Step 1: Write failing list tests**
 
 Cover trimmed keyword OR-search across `accountId`, `nickname`, `email`, and `phoneNumber`; status, role, date filters; pagination; masked email/phone; and absence of original contacts and secrets.
 
@@ -282,11 +282,11 @@ where: {
 
 Run `npm test -- admin-user.service.spec.ts --runInBand`. Expected: FAIL because the service does not exist.
 
-- [ ] **Step 2: Implement `listUsers`**
+- [x] **Step 2: Implement `listUsers`**
 
 Use one bounded `findMany` and one `count` in `Promise.all`. Select only list fields. Map `email` and `phoneNumber` to `maskedEmail` and `maskedPhoneNumber`, then omit originals.
 
-- [ ] **Step 3: Write failing detail aggregation tests**
+- [x] **Step 3: Write failing detail aggregation tests**
 
 Mock and assert account detail plus:
 
@@ -299,7 +299,7 @@ Mock and assert account detail plus:
 
 Assert the result has `maskedContacts`, `security`, and `summary`, contains no original contacts, and does not contain `vipLevel`.
 
-- [ ] **Step 4: Implement `getUserDetail`**
+- [x] **Step 4: Implement `getUserDetail`**
 
 Perform the profile lookup first and throw `NotFoundException` with `AdminUserErrorCode.NotFound` when absent. Run independent bounded aggregate reads with `Promise.all`. Return:
 
@@ -316,15 +316,15 @@ Perform the profile lookup first and throw `NotFoundException` with `AdminUserEr
 }
 ```
 
-- [ ] **Step 5: Write failing reveal tests**
+- [x] **Step 5: Write failing reveal tests**
 
 Prove one selected field is read, `AdminAuditAction.SensitiveFieldViewed` is recorded with metadata `{ field }`, no value is passed to the audit service, and audit failure becomes `ServiceUnavailableException` with `AdminUserErrorCode.AuditUnavailable` before any response is returned.
 
-- [ ] **Step 6: Implement reveal and audit listing**
+- [x] **Step 6: Implement reveal and audit listing**
 
 `revealSensitiveField(actor, targetId, dto)` selects `id` plus the requested field, records the audit event, and returns `field`, `value`, `revealedAt`, and `expiresAt = revealedAt + 60_000`. `listAuditLogs` delegates to `AdminAuditService.listForTarget('user', targetId, limit)` after confirming the target exists.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 ```bash
 npm test -- admin-user.service.spec.ts --runInBand
@@ -351,7 +351,7 @@ Expected: focused service tests pass.
 **Interfaces:**
 - Produces the approved `/admin/users` HTTP surface for the Admin frontend.
 
-- [ ] **Step 1: Write failing status tests**
+- [x] **Step 1: Write failing status tests**
 
 Test all four valid transitions, all other transition pairs, self-ban/delete,
 delete confirmation mismatch, conditional-update conflict, refresh-row
@@ -361,7 +361,7 @@ revocation/cache broadcast.
 
 Run `npm test -- admin-user.service.spec.ts --runInBand`. Expected: FAIL because status mutation is absent.
 
-- [ ] **Step 2: Implement `updateStatus`**
+- [x] **Step 2: Implement `updateStatus`**
 
 Inside `prisma.$transaction`:
 
@@ -399,14 +399,14 @@ After commit, call `SessionRevocationService.revokeUser` for ban/delete and call
 `broadcastUserProfileSummary`. Catch and log post-commit external failures so a
 committed status operation is not reported as rolled back.
 
-- [ ] **Step 3: Write failing controller and route-normalizer tests**
+- [x] **Step 3: Write failing controller and route-normalizer tests**
 
 Assert controller-level guards are `[JwtGuard, AdminGuard]`, UUID parsing is
 present, each method delegates actor `{ userId, accountId }`, and concrete
 paths containing a UUID normalize to `/api/v1/admin/users/:id`,
 `/sensitive-access`, `/status`, and `/audit-logs` templates.
 
-- [ ] **Step 4: Implement controller, module, and app wiring**
+- [x] **Step 4: Implement controller, module, and app wiring**
 
 Controller routes:
 
@@ -422,7 +422,7 @@ Register `AdminUserModule` in `AppModule`. Import `RealtimeModule` and `AuthModu
 in the feature module; provide the controller, `AdminUserService`, and
 `AdminAuditService`.
 
-- [ ] **Step 5: Run backend focused verification and commit**
+- [x] **Step 5: Run backend focused verification and commit**
 
 ```bash
 npm test -- admin-user app-error-codes.spec.ts route-normalizer.spec.ts admin-audit-migration.spec.ts --runInBand
@@ -446,7 +446,7 @@ Expected: focused tests and build pass.
 - Consumes the Task 4 HTTP API.
 - Produces `listUsers`, `getUserDetail`, `revealSensitiveField`, `updateUserStatus`, and `listUserAuditLogs`.
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Mock `apiClient` and assert exact paths and bodies:
 
@@ -463,7 +463,7 @@ expect(apiClient).toHaveBeenCalledWith('/admin/users/u1/status', {
 
 Run `npm test -- src/api/users.test.ts`. Expected: FAIL against legacy `/user` calls.
 
-- [ ] **Step 2: Add exact frontend types**
+- [x] **Step 2: Add exact frontend types**
 
 Add `AdminUserListItem`, `AdminUserDetail`, `MaskedContacts`, `UserSecuritySummary`,
 `UserBusinessSummary`, `SensitiveField`, `SensitiveAccessResponse`,
@@ -471,13 +471,13 @@ Add `AdminUserListItem`, `AdminUserDetail`, `MaskedContacts`, `UserSecuritySumma
 Keep the existing, permissive `AdminUser` summary type unchanged for report
 components; the stricter list/detail types are used only by the user center.
 
-- [ ] **Step 3: Implement API functions and query builder**
+- [x] **Step 3: Implement API functions and query builder**
 
 `userListQueryString` accepts `keyword`, `status`, `role`, `createdFrom`,
 `createdTo`, `page`, and `limit`, trims keyword, and omits empty filters. Change
 list calls to `/admin/users`. Add detail, reveal, status, and audit calls.
 
-- [ ] **Step 4: Run tests and commit**
+- [x] **Step 4: Run tests and commit**
 
 ```bash
 npm test -- src/api/users.test.ts
@@ -499,7 +499,7 @@ Expected: API tests pass.
 - Consumes `listUsers` and navigates to `/users/:userId`.
 - Produces the list route used by the detail page backlink.
 
-- [ ] **Step 1: Write failing helper and rendering tests**
+- [x] **Step 1: Write failing helper and rendering tests**
 
 Test query construction for keyword/status/role/date filters, pagination reset
 when a filter changes, masked columns, absence of ban/delete row buttons, and a
@@ -507,14 +507,14 @@ single `查看详情` action that navigates to `/users/u1`.
 
 Run `npm test -- src/pages/UsersPage.test.tsx`. Expected: FAIL against the legacy table.
 
-- [ ] **Step 2: Implement the new list page**
+- [x] **Step 2: Implement the new list page**
 
 Use `Input.Search`, status and role `Select`s, two date inputs or Ant Design
 `RangePicker`, and server-side pagination. Columns are avatar, account ID,
 nickname, masked email, masked phone, status, role, created time, last online,
 and `查看详情`. Keep query key `['admin-users', query]`.
 
-- [ ] **Step 3: Run tests and commit**
+- [x] **Step 3: Run tests and commit**
 
 ```bash
 npm test -- src/pages/UsersPage.test.tsx
@@ -542,38 +542,38 @@ Expected: list tests pass.
 - Consumes Task 5 APIs and `currentUser` from authenticated routes.
 - Produces `/users/:userId` with all approved sections.
 
-- [ ] **Step 1: Write failing sensitive-field tests**
+- [x] **Step 1: Write failing sensitive-field tests**
 
 Use fake timers to prove masked default, required reason, API reveal, original
 value visible only in memory, automatic remasking at 60 seconds, and cleanup on
 unmount. Run `npm test -- src/components/SensitiveFieldValue.test.tsx` and expect FAIL.
 
-- [ ] **Step 2: Implement `SensitiveFieldValue`**
+- [x] **Step 2: Implement `SensitiveFieldValue`**
 
 The component receives `userId`, `field`, `maskedValue`, and `label`. It opens a
 small modal with a required 3–500 character reason, calls
 `revealSensitiveField`, stores the returned value in `useState`, schedules one
 timeout from `expiresAt`, and clears that timeout plus value during cleanup.
 
-- [ ] **Step 3: Write failing status-action tests**
+- [x] **Step 3: Write failing status-action tests**
 
 Test the allowed transition matrix, self-action disabled state, reason required
 for every transition, exact account ID required for deletion, DELETED read-only,
 and payloads sent to `updateUserStatus`.
 
-- [ ] **Step 4: Implement `UserStatusActions`**
+- [x] **Step 4: Implement `UserStatusActions`**
 
 Render only actions allowed by current status. Use a modal form. Invalidate
 `['admin-users']`, `['admin-user', userId]`, and `['admin-user-audit', userId]`
 after success. Keep backend validation authoritative.
 
-- [ ] **Step 5: Write failing detail-page tests**
+- [x] **Step 5: Write failing detail-page tests**
 
 Mock detail and audit APIs. Assert account, contacts, security, business summary,
 last 20 audits, the exact VIP placeholder copy, no VIP mutation button, loading,
 404/error state, and backlink.
 
-- [ ] **Step 6: Implement `UserDetailPage` and route**
+- [x] **Step 6: Implement `UserDetailPage` and route**
 
 Use separate Ant Design cards for account, contacts, security, summary, VIP,
 dangerous actions, and audit history. Fetch:
@@ -586,7 +586,7 @@ useQuery({ queryKey: ['admin-user-audit', userId], queryFn: () => listUserAuditL
 Pass the authenticated Admin to `UserStatusActions`; add the route in `App.tsx`.
 Add responsive card/grid styles without changing unrelated pages.
 
-- [ ] **Step 7: Run frontend verification and commit**
+- [x] **Step 7: Run frontend verification and commit**
 
 ```bash
 npm test -- src/pages/UsersPage.test.tsx src/pages/UserDetailPage.test.tsx src/components/SensitiveFieldValue.test.tsx src/components/UserStatusActions.test.tsx src/api/users.test.ts
@@ -610,13 +610,13 @@ Expected: targeted tests, typecheck, and build pass.
 **Interfaces:**
 - Documents the final HTTP contract and operational rollout.
 
-- [ ] **Step 1: Update API and Admin documentation**
+- [x] **Step 1: Update API and Admin documentation**
 
 Document all five `/admin/users` endpoints, filters, status transitions, audit
 redaction, deployment order, and the VIP placeholder non-goal. Update the Admin
 README feature list and verification commands.
 
-- [ ] **Step 2: Run full backend verification**
+- [x] **Step 2: Run full backend verification**
 
 ```bash
 npm test -- --runInBand
@@ -627,7 +627,7 @@ Expected: zero Jest failures and build exit code 0. If full tests are blocked by
 missing external services, record the exact blocked suites and keep all unit
 and HTTP controller suites green.
 
-- [ ] **Step 3: Run full Admin verification**
+- [x] **Step 3: Run full Admin verification**
 
 ```bash
 npm test
@@ -637,7 +637,7 @@ npm run build
 
 Expected: zero Vitest failures, typecheck exit code 0, and Vite build exit code 0.
 
-- [ ] **Step 4: Inspect both diffs and privacy boundaries**
+- [x] **Step 4: Inspect both diffs and privacy boundaries**
 
 Run `git diff --check` and `git status --short` in both repositories. Search the
 Admin frontend for `vipLevel`, `passwordHash`, `loginSecurityCodeHash`, and
@@ -645,7 +645,7 @@ Admin frontend for `vipLevel`, `passwordHash`, `loginSecurityCodeHash`, and
 backend audit creation for contact field values; only field names may enter
 audit metadata.
 
-- [ ] **Step 5: Commit documentation**
+- [x] **Step 5: Commit documentation**
 
 Backend:
 
@@ -661,7 +661,7 @@ git add README.md
 git commit -m "docs: document user management center"
 ```
 
-- [ ] **Step 6: Final requirement review**
+- [x] **Step 6: Final requirement review**
 
 Re-read the approved design and verify every success criterion against a test,
 build result, or inspected response contract. Report exact commit SHAs and any

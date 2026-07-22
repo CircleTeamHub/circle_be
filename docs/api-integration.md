@@ -256,6 +256,92 @@ Content-Type: application/json
 
 ---
 
+## Admin 用户管理 `/api/v1/admin/users`
+
+> 所有接口都要求 `Authorization: Bearer <admin_access_token>`。Token 必须由
+> `/api/v1/auth/admin/login` 签发，用户角色为 `ADMIN`，audience 为 `ADMIN`。
+
+### 查询用户列表
+
+```http
+GET /api/v1/admin/users?keyword=jim&status=ACTIVE&role=USER&page=1&limit=20
+```
+
+支持参数：`keyword`（账号 ID、昵称、邮箱或手机号的部分匹配）、`status`、
+`role`、`createdFrom`、`createdTo`、`page` 和 `limit`（1..100）。响应只包含
+遮罩后的 `maskedEmail` 与 `maskedPhoneNumber`，不返回联系方式原文、密码字段或
+旧 `vipLevel`。
+
+### 获取用户 360 详情
+
+```http
+GET /api/v1/admin/users/:id
+```
+
+响应分为 `profile`、`maskedContacts`、`security` 和 `summary`。业务概览包含
+信用分、钱包余额、好友/笔记/动态/圈子/举报计数；不存在钱包时余额为 0。
+
+### 查看单个敏感字段
+
+```http
+POST /api/v1/admin/users/:id/sensitive-access
+Content-Type: application/json
+
+{
+  "field": "phoneNumber",
+  "reason": "CS-1024"
+}
+```
+
+`field` 只能是 `email`、`phoneNumber`、`wechat`、`qq` 或 `whatsup`。原因长度
+为 3..500。服务端先写 `USER_SENSITIVE_FIELD_VIEWED` 审计，再返回该字段原文；
+审计失败时返回 503，且不返回原文。响应中的 `expiresAt` 为前端 60 秒自动隐藏
+时间。敏感原文不得写入 URL、浏览器存储、日志、监控或审计 metadata。
+
+### 修改用户状态
+
+```http
+PATCH /api/v1/admin/users/:id/status
+Content-Type: application/json
+
+{
+  "status": "BANNED",
+  "reason": "abuse investigation"
+}
+```
+
+允许的状态迁移：
+
+| 当前状态 | 目标状态 |
+|---|---|
+| `ACTIVE` | `BANNED`、`DELETED` |
+| `BANNED` | `ACTIVE`、`DELETED` |
+| `DELETED` | 无（终态，不可恢复） |
+
+删除时还必须传精确的 `confirmationAccountId`。管理员不能封禁或删除自己。封禁和
+删除会在同一事务中更新状态、撤销 refresh token 并写入审计；提交后撤销 access
+token 并刷新实时资料缓存。重复、非法或并发冲突的操作返回 409。
+
+### 查询用户审计记录
+
+```http
+GET /api/v1/admin/users/:id/audit-logs?limit=20
+```
+
+最多返回 100 条，按 `createdAt` 倒序。审计记录包含管理员、动作、状态变更前后值、
+原因和请求上下文，但永远不包含联系人原文。
+
+### VIP 与发布顺序
+
+本期只在 Admin 详情页显示 `新的月度 VIP 系统设计中`，不读取或修改旧
+`vipLevel`，也不提供套餐、到期时间、支付核验、人工升级或兑换码能力。
+
+发布时先部署数据库迁移与后端接口，完成 Admin token 冒烟测试后再部署 Admin
+前端。生产验证应使用测试账号完成搜索、敏感字段查看、封禁和解封；软删除只对
+可丢弃账号执行。
+
+---
+
 ## 错误处理
 
 | HTTP 状态码 | 含义 |
