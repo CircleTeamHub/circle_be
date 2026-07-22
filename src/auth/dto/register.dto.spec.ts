@@ -92,4 +92,23 @@ describe('RegisterDto existing fields', () => {
     const errors = await validate(dto);
     expect(errors.some((error) => error.property === 'nickname')).toBe(true);
   });
+
+  it('rejects a whitespace-only nickname', async () => {
+    const dto = plainToInstance(RegisterDto, {
+      ...validPayload,
+      nickname: '   ',
+    });
+    const errors = await validate(dto);
+    expect(errors.some((error) => error.property === 'nickname')).toBe(true);
+  });
+
+  it('trims surrounding whitespace from a nickname', async () => {
+    const dto = plainToInstance(RegisterDto, {
+      ...validPayload,
+      nickname: '  Jimmy  ',
+    });
+    const errors = await validate(dto);
+    expect(errors).toHaveLength(0);
+    expect(dto.nickname).toBe('Jimmy');
+  });
 });

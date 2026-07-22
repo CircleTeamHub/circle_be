@@ -108,6 +108,10 @@ type UserProfileSummaryPayload = {
 
 type RealtimeEvent =
   | { type: 'badge.snapshot'; payload: BadgeSnapshot }
+  | {
+      type: 'moments.feed.updated';
+      payload: { authorId: string; changedAt: string };
+    }
   | { type: 'call.invite'; payload: CallInvitePayload }
   | { type: 'call.participant.joined'; payload: CallParticipantPayload }
   | { type: 'call.participant.left'; payload: CallParticipantPayload }
@@ -192,6 +196,7 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   /** Allow-list of event types accepted off the Redis backplane. */
   private static readonly REALTIME_EVENT_TYPES: ReadonlySet<string> = new Set([
     'badge.snapshot',
+    'moments.feed.updated',
     'call.invite',
     'call.participant.joined',
     'call.participant.left',
@@ -592,6 +597,21 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
    * balance — the client refetches via the wallet REST endpoint to avoid
    * leaking PII over the WebSocket transport.
    */
+  /**
+   * 朋友圈动态变更 poke（#89：客户端弃 30s 轮询改事件驱动）。
+   * 轻量「去拉一次」信号，不携带内容 —— 客户端收到后自行 refetch feed，
+   * 负载形状与权限过滤完全复用既有 GET /trace/feed。
+   */
+  broadcastMomentsFeedUpdated(userId: string, payload: { authorId: string }) {
+    this.broadcast(userId, {
+      type: 'moments.feed.updated',
+      payload: {
+        authorId: payload.authorId,
+        changedAt: new Date().toISOString(),
+      },
+    });
+  }
+
   broadcastWalletBalanceChanged(
     userId: string,
     payload?: { reason?: string; delta?: number | null },

@@ -166,7 +166,9 @@ export function createEnvValidationSchema(
     CALL_RING_TIMEOUT_SECONDS: Joi.number().integer().min(5).default(45),
     CALL_MAX_PARTICIPANTS: Joi.number().integer().min(2).max(100).default(10),
     CALL_ALLOW_OFFLINE_INVITE: Joi.boolean().default(false),
-    CALL_ENABLE_VIDEO: Joi.boolean().default(false),
+    // FE#119 拍板：测试期默认开视频（LiveKit 免费额度内）；流量成本可观时
+    // 用 env 显式关闭。
+    CALL_ENABLE_VIDEO: Joi.boolean().default(true),
     // 真实邮件投递（#82）。SMTP_HOST 未设 = 受支持的开发态（ConsoleMailer，
     // 验证码打日志）；设了 host 就必须配齐凭据 —— production 半配置要在启动期
     // 炸掉，而不是运行时静默不发信。465 → 隐式 TLS；587 → SMTP_SECURE=false

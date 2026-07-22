@@ -32,7 +32,25 @@ describe('UpdateUserDto', () => {
   it('rejects overlong nickname', () => {
     const errors = build({ nickname: 'x'.repeat(51) });
     const target = errors.find((e) => e.property === 'nickname');
-    expect(target?.constraints).toHaveProperty('maxLength');
+    expect(target?.constraints).toHaveProperty('isLength');
+  });
+
+  it('rejects a blank nickname', () => {
+    const errors = build({ nickname: '' });
+    const target = errors.find((e) => e.property === 'nickname');
+    expect(target?.constraints).toHaveProperty('isLength');
+  });
+
+  it('rejects a whitespace-only nickname', () => {
+    const errors = build({ nickname: '   ' });
+    const target = errors.find((e) => e.property === 'nickname');
+    expect(target?.constraints).toHaveProperty('isLength');
+  });
+
+  it('trims surrounding whitespace from a nickname', () => {
+    const dto = plainToInstance(UpdateUserDto, { nickname: '  Jim  ' });
+    expect(validateSync(dto)).toHaveLength(0);
+    expect(dto.nickname).toBe('Jim');
   });
 
   it('rejects malformed email', () => {

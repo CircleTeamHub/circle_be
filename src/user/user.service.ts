@@ -98,8 +98,8 @@ function normalizeBirthdayInput(value: string | null | undefined) {
 
 // Optional text fields where a blank (empty / whitespace-only) value means
 // "clear it" — persisted as null instead of an empty string. Excludes required
-// fields (nickname) and format-validated fields (email, avatar URLs) that can
-// never legitimately arrive blank.
+// fields (nickname) and format-validated fields (email, avatar URLs), which the
+// DTO layer rejects when blank so they never reach here empty.
 const BLANKABLE_TEXT_FIELDS: ReadonlySet<keyof UpdateUserInput> = new Set([
   'phoneNumber',
   'wechat',
