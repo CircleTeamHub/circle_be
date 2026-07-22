@@ -9,13 +9,19 @@ import { AuthErrorCode } from 'src/common/app-error-codes';
  */
 describe('requestPasswordReset anti-enumeration (PR #120 review)', () => {
   function buildService(requestCode: jest.Mock) {
-    return new AuthService(
-      {} as never, // prisma —— 本路径不触达
-      {} as never, // refreshTokenService
-      {} as never, // jwt
-      {} as never, // openim
-      {} as never, // iconService
-      { requestCode } as never,
+    // 构造参数按位注入到 emailVerification 即可；用变长构造签名让本 spec 对
+    // 「#117 给 AuthService 追加 configService 参数」的分支合并保持中立。
+    const LooseAuthService = AuthService as unknown as new (
+      ...args: unknown[]
+    ) => AuthService;
+    return new LooseAuthService(
+      {}, // prisma —— 本路径不触达
+      {}, // refreshTokenService
+      {}, // jwt
+      {}, // openim
+      {}, // iconService
+      { requestCode },
+      {}, // configService（#117 合并后存在；此前多传无害）
     );
   }
 
