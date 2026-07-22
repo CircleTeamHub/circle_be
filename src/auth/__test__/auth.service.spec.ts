@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AuthService } from '../auth.service';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import {
   BadRequestException,
   ConflictException,
@@ -156,6 +157,7 @@ describe('AuthService', () => {
           provide: EmailVerificationService,
           useValue: mockEmailVerification,
         },
+        { provide: ConfigService, useValue: { get: () => undefined } },
       ],
     }).compile();
 
@@ -512,6 +514,9 @@ describe('AuthService', () => {
         sid: 'session-1',
         aud: 'ADMIN',
       }),
+      // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
+      // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
+      expect.objectContaining({ expiresIn: 900 }),
     );
   });
 
@@ -661,6 +666,9 @@ describe('AuthService', () => {
         sid: 'session-2',
         aud: 'ADMIN',
       }),
+      // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
+      // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
+      expect.objectContaining({ expiresIn: 900 }),
     );
   });
 

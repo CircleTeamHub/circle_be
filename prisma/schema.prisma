@@ -269,6 +269,9 @@ model User {
   loginSecurityCodeHash      String?
   securityCodeAttempts       Int        @default(0)
   securityCodeLockedUntil    DateTime?
+  // Admin console brute-force lockout (#83) — mirrors the security-code pair.
+  adminLoginAttempts         Int        @default(0)
+  adminLoginLockedUntil      DateTime?
   singleDeviceLoginEnabled   Boolean    @default(false)
   nickname                   String
   avatarUrl                  String?
