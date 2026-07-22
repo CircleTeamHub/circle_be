@@ -124,6 +124,22 @@ describe('TempChatService', () => {
       expect(ms).toBeGreaterThan(4319 * 60 * 1000);
       expect(ms).toBeLessThan(4321 * 60 * 1000);
     });
+
+    it('rechecks the host quota under the same lock that persists the room', async () => {
+      prisma.tempChat.count
+        .mockResolvedValueOnce(199)
+        .mockResolvedValueOnce(200);
+      prisma.tempChat.create.mockResolvedValue(buildRow());
+
+      await expect(service.create('host-1', {})).rejects.toMatchObject({
+        status: 400,
+      });
+
+      expect(prisma.tempChat.create).not.toHaveBeenCalled();
+      expect(openim.dismissGroup).toHaveBeenCalledWith(
+        expect.stringMatching(/^tmp/),
+      );
+    });
   });
 
   describe('getByToken', () => {
