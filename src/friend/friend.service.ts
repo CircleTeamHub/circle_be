@@ -32,6 +32,7 @@ import {
 
 // Members (paid) get 5 000, regular users get 1 000.
 const FRIEND_REQUEST_PAGE_SIZE = 500;
+const BLOCKED_PAGE_SIZE = 1000;
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
 const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在开始聊天吧';
@@ -1187,14 +1188,17 @@ export class FriendService {
     }
   }
 
-  async listBlocked(userId: string) {
+  async listBlocked(userId: string, page = 1) {
+    // round 3 review：1000 条护栏外的旧拉黑此前不可达（解除拉黑要列表里的
+    // id）。与好友申请同款 page 参数，第 1 页行为不变。
     const blocks = await this.prisma.block.findMany({
       where: { blockerID: userId },
       orderBy: { createdAt: 'desc' },
+      skip: (Math.max(1, page) - 1) * BLOCKED_PAGE_SIZE,
       include: {
         blocked: { select: MINI_USER_SELECT },
       },
-      take: 1000,
+      take: BLOCKED_PAGE_SIZE,
     });
     return blocks.map((b) => ({ ...b.blocked, blockedAt: b.createdAt }));
   }

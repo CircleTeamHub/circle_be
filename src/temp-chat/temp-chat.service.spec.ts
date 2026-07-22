@@ -29,6 +29,7 @@ describe('TempChatService', () => {
   const prisma = {
     tempChat: {
       create: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
@@ -45,6 +46,7 @@ describe('TempChatService', () => {
       updateMany: jest.fn(),
     },
     $transaction: jest.fn((cb: any) => cb(prisma)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     $executeRaw: jest.fn(),
   };
   const openim = {

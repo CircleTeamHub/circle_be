@@ -40,10 +40,15 @@ import {
 } from './dto/friend.dto';
 import { FriendService } from './friend.service';
 
-/** 查询参数页码：非法/缺省回落默认值，恒 ≥1。 */
+/**
+ * 查询参数页码：非法/缺省回落默认值，恒 ≥1 且封顶（round 3 review：
+ * 无上界的 page 会被拼成天文数字 offset，一次手滑就是全表偏移扫描）。
+ */
+const MAX_PAGE = 10_000;
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(raw ?? '', 10);
-  return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback;
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, MAX_PAGE);
 }
 
 @ApiTags('Friend')
@@ -400,7 +405,10 @@ export class FriendController {
 
   @Get('blocked')
   @ApiOperation({ summary: 'My blocked users list' })
-  listBlocked(@Req() req: RequestWithUser) {
-    return this.friendService.listBlocked(req.user.userId);
+  listBlocked(@Req() req: RequestWithUser, @Query('page') page?: string) {
+    return this.friendService.listBlocked(
+      req.user.userId,
+      parsePositiveInt(page, 1),
+    );
   }
 }

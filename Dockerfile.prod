@@ -38,7 +38,12 @@ COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
 # package's postinstall, so migrations on the server stay npm-offline.
 RUN npm prune --omit=dev \
     && npm install --no-save --omit=dev \
-        "prisma@$(node -p "require('./package-lock.json').packages['node_modules/prisma'].version")"
+        "prisma@$(node -p "require('./package-lock.json').packages['node_modules/prisma'].version")" \
+    # 基础镜像自带的 npm CLI 捆绑着带 CVE 的 tar/brace-expansion（Trivy 扫
+    # /usr/local/lib/node_modules/npm）。镜像里 npm/npx 必须保留（release
+    # overlay 用本镜像跑 `npx prisma migrate deploy`），所以就地升级 npm 到
+    # 当前 latest 让捆绑依赖吃到修复版。
+    && npm install -g npm@latest --no-audit --no-fund
 
 USER app
 

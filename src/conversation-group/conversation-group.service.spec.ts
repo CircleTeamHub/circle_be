@@ -22,6 +22,7 @@ describe('ConversationGroupService', () => {
       createMany: jest.fn(),
     },
     $transaction: jest.fn((cb: any) => cb(prisma as any)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
   };
 
   const OWNER_ID = 'owner-1';

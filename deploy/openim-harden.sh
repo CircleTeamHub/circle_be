@@ -68,8 +68,17 @@ ROTATED_KEYS=""
 # ── 1. 密钥轮换（只动仍处于上游公开默认值的项）─────────────────────────────
 # 上游 openim-docker 的公开默认值。任何能连到主机的人都查得到这些值。
 rotate_if_default "OPENIM_SECRET"      "openIM123"
-rotate_if_default "MONGO_PASSWORD"     "openIM123"
-rotate_if_default "MONGO_OPENIM_PASSWORD" "openIM123"
+# round 3 review（P1）：MONGO_* 不能只改 .env —— 对已有数据卷，上游 compose
+# 只在用户不存在时才按 env 建号，库里的旧密码原样保留；只改 .env 会让
+# openim-server/chat 直接认证失败、IM 全断。Mongo 轮换必须两步走（先在库内
+# 用旧凭据改密，再改 .env），脚本不代劳，只打印手工流程：
+if grep -qE '^MONGO_PASSWORD=openIM123$|^MONGO_OPENIM_PASSWORD=openIM123$' "$ENV_FILE"; then
+  echo "⚠ MONGO_PASSWORD / MONGO_OPENIM_PASSWORD 仍是默认值。不自动轮换（已有"
+  echo "  数据卷时只改 .env 会把 IM 打断）。手工两步："
+  echo "  1) docker exec -it <mongo容器> mongosh -u <user> -p openIM123 \\"
+  echo '       --eval "db.getSiblingDB(\"admin\").changeUserPassword(\"<user>\", \"<新密码>\")"'
+  echo "  2) 把新密码写进 $ENV_FILE 后再 force-recreate"
+fi
 rotate_if_default "REDIS_PASSWORD"     "openIM123"
 rotate_if_default "MINIO_SECRET_ACCESS_KEY" "openIM123"
 
@@ -104,10 +113,33 @@ patch_port 37017 27017 || true
 patch_port 16379 6379  || true
 patch_port 10005 9000  || true
 
+# round 3 review（P1）：上游 compose 大量端口是「纯变量公开端口」形式
+#（如 ${MINIO_PORT}:9000、${MINIO_CONSOLE_PORT}:9090、${ADMIN_API_PORT}:10009），
+# 上面的字面量 patch 全都匹配不到 —— 操作员会以为只剩 10001/10002 对外，
+# 而 MinIO/admin 其实还绑在 0.0.0.0。通杀：凡 ${VAR}:内部端口 的映射，
+# 内部端口不在放行清单（10001/10002 = msggateway/api，测试期必须直连）
+# 一律钉回环。
+pin_variable_ports() {
+  local allow_internal=" 10001 10002 "
+  local matches
+  matches=$(grep -E '^[[:space:]]*-[[:space:]]*["'"'"']?\$\{[A-Z0-9_]+\}:[0-9]+["'"'"']?[[:space:]]*$' "$COMPOSE_FILE" | grep -v '127\.0\.0\.1' || true)
+  [ -z "$matches" ] && return 0
+  while IFS= read -r line; do
+    local var internal
+    var=$(printf '%s' "$line" | sed -E 's/.*\$\{([A-Z0-9_]+)\}:([0-9]+).*/\1/')
+    internal=$(printf '%s' "$line" | sed -E 's/.*\$\{([A-Z0-9_]+)\}:([0-9]+).*/\2/')
+    case "$allow_internal" in *" $internal "*) continue ;; esac
+    sed -i.sedbak -E "s|^([[:space:]]*-[[:space:]]*)[\"']?\\\$\{${var}\}:${internal}[\"']?[[:space:]]*$|\1\"127.0.0.1:\${${var}}:${internal}\"|" "$COMPOSE_FILE" \
+      && rm -f "$COMPOSE_FILE.sedbak"
+    echo "已钉到回环（变量公开端口）: \${${var}}:${internal}"
+  done <<< "$matches"
+}
+pin_variable_ports
+
 # ── 3. 汇总当前仍对 0.0.0.0 暴露的端口，供人工核对 ──────────────────────────
 echo
 echo "== compose 中剩余的端口映射（10001/10002 测试期保持对外是预期内）=="
-grep -nE "^[[:space:]]*-[[:space:]]*[\"']?(\\\$\{HOST_BIND_IP\}:)?[0-9]+:[0-9]+" "$COMPOSE_FILE" || true
+grep -nE '^[[:space:]]*-[[:space:]]*["'"'"']?(\$\{[A-Z0-9_]+\}:)?[0-9]+:[0-9]+|^[[:space:]]*-[[:space:]]*["'"'"']?\$\{[A-Z0-9_]+\}:[0-9]+' "$COMPOSE_FILE" | grep -v '127\.0\.0\.1' || true
 
 echo
 if echo "$ROTATED_KEYS" | grep -q OPENIM_SECRET; then

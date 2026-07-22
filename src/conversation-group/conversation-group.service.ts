@@ -55,26 +55,30 @@ export class ConversationGroupService {
     dto: CreateConversationGroupDto,
   ): Promise<ConversationGroupDto> {
     const name = dto.name.trim();
-    // round 2 review：创建上限与 list 的 take:200 护栏对齐 —— 否则第 201 个
-    // 分组建得出来却永远列不出来（无法改名/删除/编辑成员）。会话分组正常是
-    // 个位数量级，200 只会被失控客户端打到。
-    const existing = await this.prisma.conversationGroup.count({
-      where: { ownerID },
-    });
-    if (existing >= MAX_GROUPS_PER_USER) {
-      throw new BadRequestException(
-        `会话分组数量已达上限（${MAX_GROUPS_PER_USER}）`,
-      );
-    }
     try {
-      const created = await this.prisma.conversationGroup.create({
-        data: {
-          ownerID,
-          name,
-          sortOrder: dto.sortOrder ?? 0,
-          pinnedToTabs: dto.pinnedToTabs ?? true,
-        },
-        include: { memberships: true },
+      // round 2/3 review：创建上限与 list 的 take:200 护栏对齐，且 count+create
+      // 进 per-owner advisory 锁事务 —— 199 时并发双请求不再双双越过护栏
+      // 造出列不出来的第 201 个分组。
+      const quotaLockKey = `conv-group:${ownerID}`;
+      const created = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+        const existing = await tx.conversationGroup.count({
+          where: { ownerID },
+        });
+        if (existing >= MAX_GROUPS_PER_USER) {
+          throw new BadRequestException(
+            `会话分组数量已达上限（${MAX_GROUPS_PER_USER}）`,
+          );
+        }
+        return tx.conversationGroup.create({
+          data: {
+            ownerID,
+            name,
+            sortOrder: dto.sortOrder ?? 0,
+            pinnedToTabs: dto.pinnedToTabs ?? true,
+          },
+          include: { memberships: true },
+        });
       });
       return this.toDto(created);
     } catch (err) {

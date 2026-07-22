@@ -27,12 +27,21 @@ bash deploy/openim-harden.sh ~/openim-docker
 #    把脚本输出的 OPENIM_ADMIN_SECRET 新值写进 .env.production
 
 # 3) 宿主机级日志轮转兜底（#107 —— 覆盖两个栈与未来任何容器）
-sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+# round 3 review：不要整文件覆盖 —— 宿主机已有 daemon.json（registry mirror /
+# live-restore 等）会被抹掉。先备份再合并两个键：
+sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak.$(date +%s) 2>/dev/null || true
+if [ -s /etc/docker/daemon.json ]; then
+  sudo jq '. + {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' \
+    /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null \
+    && sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+else
+  sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
 {
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" }
 }
 JSON
+fi
 sudo systemctl reload docker || sudo systemctl restart docker
 # 注意：daemon.json 只对「新创建」的容器生效，下一步的 force-recreate 正好覆盖。
 
@@ -60,8 +69,9 @@ ss -tlnp | grep -E '12379|12380'      # 预期只见 127.0.0.1
 
 # 7) #110 —— 确认 OpenIM metrics 端口后启用抓取
 grep -rn "prometheusPort\|ports:" ~/openim-docker/config 2>/dev/null | grep -i prom | head
-# 把确认的端口填进 monitoring/prometheus/prometheus.yml 的 openim job
-# （仓库里已留好模板注释），然后:
+# round 3 review：生产 compose 挂载的是 prometheus.prod.yml（覆盖容器内
+# /etc/prometheus/prometheus.yml）——生产环境改 prod 文件，dev 才改
+# prometheus.yml；两个文件里都留了同款 openim job 模板注释。填好后:
 docker exec circle-prometheus kill -HUP 1   # 或 curl -X POST localhost:9090/-/reload
 ```
 
