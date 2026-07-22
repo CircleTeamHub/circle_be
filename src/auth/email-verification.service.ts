@@ -74,6 +74,13 @@ export class EmailVerificationService {
     rawEmail: string,
     purpose: EmailCodePurpose,
   ): Promise<void> {
+    // round 3 review（P1）：投递通道不可用时在**任何分支之前**统一失败。
+    // 若放在防枚举早退之后，503 只会打在「会真正发信」的地址上 ——
+    // register 对已注册邮箱静默 201、login 对未注册邮箱静默 201，
+    // fail-closed 反而变成账号存在性 oracle。
+    if (this.mailer.isAvailable && !this.mailer.isAvailable()) {
+      throw new ServiceUnavailableException('邮件服务暂不可用，请稍后再试');
+    }
     const email = normalizeEmail(rawEmail);
 
     const last = await this.prisma.emailVerificationCode.findFirst({
@@ -143,16 +150,29 @@ export class EmailVerificationService {
     try {
       await this.mailer.sendVerificationCode(email, code, purpose);
       // 送达成功才作废旧码：同 email+purpose 只留刚送达的这一条未消费行。
+      // round 3 review ×2：
+      // - 只删 createdAt 更早的行 —— 本清理若被拖过冷却窗口，`id != created`
+      //   会连后来重发的新码一起删掉；
+      // - 失败不再静默吞：老行残留会在新码消费后重新可用（verifyCode 已
+      //   加最新行判定兜底），但仍要在日志里可见。
       await this.prisma.emailVerificationCode
         .deleteMany({
           where: {
             email,
             purpose,
             consumedAt: null,
-            id: { not: created.id },
+            createdAt: { lt: created.createdAt },
           },
         })
-        .catch(() => undefined);
+        .catch((cleanupError) => {
+          this.logger.warn(
+            `stale code cleanup failed (${purpose}): ${
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError)
+            }`,
+          );
+        });
     } catch (error) {
       // review 修复（投递失败回滚）：不回滚的话这条没送达的行会占住 60s
       // 冷却 —— 用户立刻重试只会得到 CodeRateLimited，且不会再发一封。
@@ -160,7 +180,17 @@ export class EmailVerificationService {
       // 且此刻旧码原封未动，仍可验证。
       await this.prisma.emailVerificationCode
         .deleteMany({ where: { id: created.id } })
-        .catch(() => undefined);
+        .catch((rollbackError) => {
+          // round 3 review：回滚失败必须可见 —— 未送达的行残留会占住 60s
+          // 冷却并遮蔽更早已送达的码（verifyCode 只认最新行），需人工删除。
+          this.logger.error(
+            `undelivered code rollback failed (${purpose}) rowId=${created.id}: ${
+              rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError)
+            }`,
+          );
+        });
       if (error instanceof ServiceUnavailableException) throw error;
       // review 修复（round 2）：SMTP 报错常回带 RCPT 收件人全文，整棵 stack
       // 打日志等于把邮箱写进生产日志。只留脱敏元信息：错误类名、SMTP
@@ -199,6 +229,18 @@ export class EmailVerificationService {
     });
 
     if (!record || record.attempts >= MAX_ATTEMPTS) {
+      return false;
+    }
+
+    // round 3 review：候选行还必须是该 (email, purpose) 的**整体最新**行
+    // （含已消费行）。否则「新码已被消费、旧码因清理失败仍在」的窗口里，
+    // 旧码会重新变得可用 —— 一封邮箱里躺着的旧邮件成了第二把钥匙。
+    const newest = await this.prisma.emailVerificationCode.findFirst({
+      where: { email, purpose },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+    if (newest && newest.id !== record.id) {
       return false;
     }
 

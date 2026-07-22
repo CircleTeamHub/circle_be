@@ -18,6 +18,10 @@ import { Mailer } from './mailer.interface';
 export class UnconfiguredMailer implements Mailer {
   private readonly logger = new Logger('UnconfiguredMailer');
 
+  isAvailable(): boolean {
+    return false;
+  }
+
   sendVerificationCode(
     email: string,
     _code: string,

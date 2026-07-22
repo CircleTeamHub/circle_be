@@ -34,11 +34,14 @@ describe('EmailVerificationService', () => {
       deleteMany: jest.fn(({ where }) => {
         codes = codes.filter((c) => {
           if (where.id !== undefined) return c.id !== where.id;
-          return !(
+          const matches =
             c.email === where.email &&
             c.purpose === where.purpose &&
-            c.consumedAt === null
-          );
+            c.consumedAt === null &&
+            // round 3：送达后的清理只删更旧的行
+            (where.createdAt?.lt === undefined ||
+              c.createdAt < where.createdAt.lt);
+          return !matches;
         });
         return Promise.resolve({ count: 0 });
       }),
@@ -169,6 +172,57 @@ describe('EmailVerificationService', () => {
     expect(logged).not.toContain('a@b.com');
     expect(logged).toContain('responseCode=454');
     errorSpy.mockRestore();
+  });
+
+  it('fails identically for known and unknown emails when the mailer is unavailable (round 3 P1)', async () => {
+    usersByEmail.add('known@b.com');
+    (mailer as any).isAvailable = jest.fn(() => false);
+    try {
+      // 已注册与未注册必须拿到同一个 503 —— 差异即账号枚举 oracle
+      await expect(
+        service.requestCode('known@b.com', 'LOGIN'),
+      ).rejects.toThrow(ServiceUnavailableException);
+      await expect(
+        service.requestCode('ghost@b.com', 'LOGIN'),
+      ).rejects.toThrow(ServiceUnavailableException);
+      // 且都发生在任何 DB 写入之前
+      expect(codes).toHaveLength(0);
+    } finally {
+      delete (mailer as any).isAvailable;
+    }
+  });
+
+  it('rejects an older unconsumed code once a newer row exists (round 3)', async () => {
+    const oldHash = await argon2.hash('111111');
+    const newHash = await argon2.hash('222222');
+    const past = new Date(Date.now() - 30_000);
+    codes.push(
+      {
+        id: 'old',
+        email: 'a@b.com',
+        purpose: 'LOGIN',
+        codeHash: oldHash,
+        attempts: 0,
+        consumedAt: null,
+        createdAt: past,
+        expiresAt: new Date(Date.now() + 9 * 60_000),
+      },
+      {
+        id: 'new',
+        email: 'a@b.com',
+        purpose: 'LOGIN',
+        codeHash: newHash,
+        attempts: 0,
+        consumedAt: new Date(), // 新码已被消费
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 10 * 60_000),
+      },
+    );
+
+    // 清理失败残留的旧码不能在新码消费后复活成第二把钥匙
+    await expect(
+      service.verifyCode('a@b.com', 'LOGIN', '111111'),
+    ).resolves.toBe(false);
   });
 
   it('re-checks the cooldown inside the serialized transaction (concurrent double-send guard)', async () => {
