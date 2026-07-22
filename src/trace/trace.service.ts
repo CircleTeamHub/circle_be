@@ -46,7 +46,10 @@ export function decodeTraceCursor(cursor: string): {
   return decodeFeedCursor(cursor, TraceErrorCode.InvalidCursor);
 }
 
-const MOMENTS_POKE_FANOUT_CAP = 500;
+const MOMENTS_POKE_FANOUT_PAGE = 500;
+// 绝对上限（20 页）：防御性护栏，防止病态数据把发布路径拖进长循环。
+// 命中即告警 —— 超过 1 万可见好友的号需要产品层面重新设计，而不是静默截断。
+const MOMENTS_POKE_MAX_PAGES = 20;
 
 @Injectable()
 export class TraceService {
@@ -337,53 +340,77 @@ export class TraceService {
     try {
       const recipients = new Set<string>([authorId]);
       if (visibility !== 'PRIVATE') {
-        // PR #122 review（P2）：扇出必须套用与 GET /trace/feed 相同的隐私门。
-        // 少了它们，被作者屏蔽朋友圈的好友仍会收到带 authorId+时间戳的 poke ——
-        // 隐藏帖/删帖的存在性与时序就此泄露（poke 虽无内容，元数据也是数据）。
-        const authorSettings = (
-          await this.privacySettings.getSettingsMany([authorId])
-        ).get(authorId);
-        // poke 候选全是已接受好友（isFriend 恒真）；作者把朋友圈对好友整体
-        // 关闭时直接零扇出，只 poke 作者自己的多端。
-        const visibleToFriends = this.privacySettings.momentsVisibleFor(
-          authorSettings,
-          false,
-          true,
-        );
-        if (visibleToFriends) {
-          const friendships = await this.prisma.friend.findMany({
-            where: {
-              state: 'ACCEPTED',
-              OR: [{ userID: authorId }, { friendID: authorId }],
-            },
-            select: {
-              userID: true,
-              friendID: true,
-              permissionA: true,
-              permissionB: true,
-            },
-            take: MOMENTS_POKE_FANOUT_CAP,
-          });
-          if (friendships.length === MOMENTS_POKE_FANOUT_CAP) {
-            this.logger.warn(
-              `moments feed poke fan-out capped at ${MOMENTS_POKE_FANOUT_CAP} for ${authorId}`,
-            );
-          }
-          for (const friendship of friendships) {
-            // 与 feed 一致：作者侧权限为 CHAT_ONLY 的好友看不到其朋友圈，不 poke。
-            const authorPermission =
-              friendship.userID === authorId
-                ? friendship.permissionA
-                : friendship.permissionB;
-            if (authorPermission === 'CHAT_ONLY') {
-              continue;
+        // PR #122 review（P2 两条）：
+        // 1. 扇出套用与 GET /trace/feed 相同的隐私门（momentsVisibleFor +
+        //    作者侧 CHAT_ONLY）—— poke 虽无内容，收没收到本身也是元数据。
+        // 2. 扇出读取（设置/好友表）失败不得连坐作者：内层 try 只包扇出，
+        //    作者本人多端的 poke 永远送达。
+        try {
+          const authorSettings = (
+            await this.privacySettings.getSettingsMany([authorId])
+          ).get(authorId);
+          // poke 候选全是已接受好友（isFriend 恒真）；作者把朋友圈对好友
+          // 整体关闭时直接零扇出，只 poke 作者自己的多端。
+          const visibleToFriends = this.privacySettings.momentsVisibleFor(
+            authorSettings,
+            false,
+            true,
+          );
+          if (visibleToFriends) {
+            // 分页全量扇出（review：硬截断会让 500 名之后的好友永远收不到
+            // poke，而客户端已不再轮询）。按主键游标翻页，护栏见常量注释。
+            let cursor: string | undefined;
+            for (let page = 0; page < MOMENTS_POKE_MAX_PAGES; page += 1) {
+              const friendships = await this.prisma.friend.findMany({
+                where: {
+                  state: 'ACCEPTED',
+                  OR: [{ userID: authorId }, { friendID: authorId }],
+                },
+                select: {
+                  id: true,
+                  userID: true,
+                  friendID: true,
+                  permissionA: true,
+                  permissionB: true,
+                },
+                orderBy: { id: 'asc' },
+                take: MOMENTS_POKE_FANOUT_PAGE,
+                ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+              });
+              for (const friendship of friendships) {
+                // 与 feed 一致：作者侧权限 CHAT_ONLY 的好友看不到其朋友圈。
+                const authorPermission =
+                  friendship.userID === authorId
+                    ? friendship.permissionA
+                    : friendship.permissionB;
+                if (authorPermission === 'CHAT_ONLY') {
+                  continue;
+                }
+                recipients.add(
+                  friendship.userID === authorId
+                    ? friendship.friendID
+                    : friendship.userID,
+                );
+              }
+              if (friendships.length < MOMENTS_POKE_FANOUT_PAGE) {
+                break;
+              }
+              cursor = friendships[friendships.length - 1].id;
+              if (page === MOMENTS_POKE_MAX_PAGES - 1) {
+                this.logger.warn(
+                  `moments feed poke fan-out hit the ${
+                    MOMENTS_POKE_MAX_PAGES * MOMENTS_POKE_FANOUT_PAGE
+                  }-row ceiling for ${authorId}; remaining friends not poked`,
+                );
+              }
             }
-            recipients.add(
-              friendship.userID === authorId
-                ? friendship.friendID
-                : friendship.userID,
-            );
           }
+        } catch (error) {
+          this.logger.warn(
+            `moments feed poke fan-out failed for ${authorId}; poking author only: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
       await this.realtimeService.safeBroadcastAll(

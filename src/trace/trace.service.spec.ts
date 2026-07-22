@@ -1011,12 +1011,14 @@ describe('TraceService', () => {
       });
       prisma.friend.findMany.mockResolvedValue([
         {
+          id: 'f-1',
           userID: 'user-1',
           friendID: 'friend-1',
           permissionA: 'ALL',
           permissionB: 'ALL',
         },
         {
+          id: 'f-2',
           userID: 'friend-2',
           friendID: 'user-1',
           permissionA: 'ALL',
@@ -1047,6 +1049,7 @@ describe('TraceService', () => {
       prisma.friend.findMany.mockResolvedValue([
         // 作者侧 permissionA=CHAT_ONLY：friend-1 看不到作者朋友圈，不得 poke
         {
+          id: 'f-1',
           userID: 'user-1',
           friendID: 'friend-1',
           permissionA: 'CHAT_ONLY',
@@ -1054,6 +1057,7 @@ describe('TraceService', () => {
         },
         // 反向行：作者是 friendID，作者侧权限在 permissionB
         {
+          id: 'f-2',
           userID: 'friend-2',
           friendID: 'user-1',
           permissionA: 'ALL',
@@ -1092,6 +1096,69 @@ describe('TraceService', () => {
       ).mock.calls.map((call) => call[0]);
       expect(poked).toEqual(['user-1']);
       expect(prisma.friend.findMany).not.toHaveBeenCalled();
+    });
+
+    it('pages through fan-out past 500 rows instead of truncating (review)', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-5',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      const fullPage = Array.from({ length: 500 }, (_, index) => ({
+        id: `f-${index}`,
+        userID: 'user-1',
+        friendID: `friend-${index}`,
+        permissionA: 'ALL',
+        permissionB: 'ALL',
+      }));
+      prisma.friend.findMany
+        .mockResolvedValueOnce(fullPage)
+        .mockResolvedValueOnce([
+          {
+            id: 'f-500',
+            userID: 'user-1',
+            friendID: 'friend-500',
+            permissionA: 'ALL',
+            permissionB: 'ALL',
+          },
+        ]);
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(prisma.friend.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.friend.findMany.mock.calls[1][0]).toMatchObject({
+        cursor: { id: 'f-499' },
+        skip: 1,
+      });
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      // 501 个好友 + 作者
+      expect(new Set(poked).size).toBe(502);
+    });
+
+    it('still pokes the author when fan-out reads fail (review)', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-6',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      prisma.friend.findMany.mockRejectedValue(new Error('db down'));
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      expect(poked).toEqual(['user-1']);
     });
 
     it('pokes only the author for PRIVATE moments', async () => {
