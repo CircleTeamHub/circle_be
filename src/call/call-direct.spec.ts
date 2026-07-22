@@ -24,6 +24,8 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       $queryRaw: jest.fn().mockResolvedValue([]),
       friend: { findFirst: jest.fn() },
       block: { findFirst: jest.fn() },
+      // 群留痕的 conversationID→OpenIM 群 id 解析（round 3）；null = 非 Circle 行
+      circle: { findFirst: jest.fn().mockResolvedValue(null) },
       user: { findMany: jest.fn() },
       callSession: {
         create: jest.fn(),
@@ -586,6 +588,51 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
         clientMsgID: 'call_record_gcall-1',
         // 群聊未接绝不 offlinePush（会推给全群非被邀成员）
         offlinePush: null,
+      }),
+    );
+  });
+
+  it('resolves a Circle.id conversation to the real OpenIM group for records (round 3)', async () => {
+    const circleCall = {
+      id: 'gcall-2',
+      conversationID: 'circle-uuid-1',
+      sessionType: 3,
+      callType: 'AUDIO',
+      status: CallStatus.RINGING,
+      initiatorID: 'user-1',
+      livekitRoomName: 'room-c',
+      startedAt: null,
+      expiresAt: new Date(now.getTime() - 1_000),
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      participants: [
+        {
+          userID: 'user-1',
+          status: CallParticipantStatus.JOINED,
+          user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        },
+        {
+          userID: 'user-2',
+          status: CallParticipantStatus.INVITED,
+          user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        },
+      ],
+    };
+    prisma.callSession.findMany.mockResolvedValue([circleCall]);
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+    // conversationID 是 Circle.id：留痕必须发到 circle.groupID 对应的 openim 群
+    prisma.circle.findFirst.mockResolvedValue({
+      groupID: 'sg_real-openim-group',
+    });
+
+    await service.sweepExpiredRingingCalls();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        target: { kind: 'group', groupID: 'real-openim-group' },
       }),
     );
   });

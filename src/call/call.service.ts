@@ -261,10 +261,23 @@ export class CallService {
     });
 
     let call: CallWithParticipants;
+    let replayed = false;
     try {
       call = (await this.prisma.$transaction(
         async (tx) => {
           await this.lockParticipantsForCall(participantIDs, tx);
+          // round 3 review：锁内复查幂等 —— 同键并发双请求都可能在锁外
+          // 预检时查无此单；输家拿到锁后必须先看对手是否已建成同键通话，
+          // 否则会撞进 assertNotBusy 拿到 CALL_BUSY，而不是回放已建的单。
+          const replay = await this.findIdempotentCreateCall(
+            initiatorID,
+            idempotencyKey,
+            tx as unknown as Pick<PrismaService, 'callSession'>,
+          );
+          if (replay) {
+            replayed = true;
+            return replay;
+          }
           await this.assertNotBusy(participantIDs, tx);
           if (revalidate) await revalidate(tx);
           return tx.callSession.create({
@@ -298,6 +311,20 @@ export class CallService {
     } catch (error) {
       await this.livekit.deleteRoom(livekitRoomName);
       throw error;
+    }
+
+    if (replayed) {
+      // 回放路径：本请求预建的 LiveKit 房间成了孤儿，补偿删除；
+      // 不再广播邀请（首建请求已广播过）。
+      await this.livekit.deleteRoom(livekitRoomName);
+      const token = await this.mintToken(call, users.get(initiatorID)!);
+      return {
+        call: this.toCallDto(call),
+        selfParticipant: this.toParticipantDto(
+          this.findParticipant(call, initiatorID),
+        ),
+        livekit: this.buildTokenResponse(token),
+      };
     }
 
     let token: string;
@@ -385,32 +412,73 @@ export class CallService {
         errorCode: CallErrorCode.Expired,
       });
     }
-    // round 2 review：1:1 接听前复检好友/拉黑 —— 邀请创建后任一方拉黑或
-    // 删好友，被叫不该还能把通话推进 ACTIVE 并拿到 LiveKit token。振铃会
-    // 自然超时收尾，无需在此显式取消。
-    if (call.sessionType === SINGLE_SESSION_TYPE && call.initiatorID) {
-      await this.assertDirectCallee(call.initiatorID, userID);
-    }
-
     const joinedAt = new Date();
-    const updatedParticipant = await this.prisma.callParticipant.update({
-      where: { callID_userID: { callID: callId, userID } },
-      data: {
-        status: CallParticipantStatus.JOINED,
-        joinedAt,
-        lastTokenAt: joinedAt,
-      },
-      include: { user: { select: userLiteSelect } },
+    // round 3 review ×2：接听的复检与状态转换放进**同一把 pair 锁事务**并
+    // 全程 CAS——
+    // - 复检在锁外时，拉黑/删好友（已共享 call-user 锁）仍可在复检通过后、
+    //   状态落库前提交，被叫照样拿到 token；
+    // - 无条件 update 会把 cancel/超时清扫刚写下的终局行改回 ACTIVE、给已
+    //   删除的房间发 token。任一 CAS 落空即整体回滚并按 CALL_ENDED 拒绝。
+    const isSingleCall =
+      call.sessionType === SINGLE_SESSION_TYPE && !!call.initiatorID;
+    await this.prisma.$transaction(async (tx) => {
+      if (isSingleCall) {
+        await this.lockParticipantsForCall([call.initiatorID!, userID], tx);
+        await this.assertDirectCallee(call.initiatorID!, userID, tx);
+      }
+      const claim = await tx.callParticipant.updateMany({
+        where: {
+          callID: callId,
+          userID,
+          status: CallParticipantStatus.INVITED,
+        },
+        data: {
+          status: CallParticipantStatus.JOINED,
+          joinedAt,
+          lastTokenAt: joinedAt,
+        },
+      });
+      if (claim.count === 0) {
+        // 双击竞态里输家看到的可能已是 JOINED（幂等成功）；其余（MISSED
+        // 等终局参与态）按通话已结束拒绝。
+        const nowRow = await tx.callParticipant.findUnique({
+          where: { callID_userID: { callID: callId, userID } },
+          select: { status: true },
+        });
+        if (nowRow?.status !== CallParticipantStatus.JOINED) {
+          throw new ConflictException({
+            message: 'CALL_ENDED',
+            errorCode: CallErrorCode.Ended,
+          });
+        }
+      }
+      const transition = await tx.callSession.updateMany({
+        where: { id: callId, status: CallStatus.RINGING },
+        data: { status: CallStatus.ACTIVE, startedAt: joinedAt },
+      });
+      if (transition.count === 0) {
+        const nowCall = await tx.callSession.findUnique({
+          where: { id: callId },
+          select: { status: true },
+        });
+        if (nowCall?.status !== CallStatus.ACTIVE) {
+          // cancel / 清扫抢先终局：回滚参与者转换，不给 token
+          throw new ConflictException({
+            message: 'CALL_ENDED',
+            errorCode: CallErrorCode.Ended,
+          });
+        }
+      }
     });
 
-    const updatedCall =
-      call.status === CallStatus.RINGING
-        ? await this.prisma.callSession.update({
-            where: { id: callId },
-            data: { status: CallStatus.ACTIVE, startedAt: joinedAt },
-            include: this.callInclude(),
-          })
-        : call;
+    const updatedParticipant = (await this.prisma.callParticipant.findUnique({
+      where: { callID_userID: { callID: callId, userID } },
+      include: { user: { select: userLiteSelect } },
+    }))!;
+    const updatedCall = (await this.prisma.callSession.findUnique({
+      where: { id: callId },
+      include: this.callInclude(),
+    })) as CallWithParticipants;
 
     const token = await this.mintToken(call, updatedParticipant.user);
     const payload = {
@@ -1004,12 +1072,13 @@ export class CallService {
   private async findIdempotentCreateCall(
     initiatorID: string,
     idempotencyKey?: string,
+    db: Pick<PrismaService, 'callSession'> = this.prisma,
   ): Promise<CallWithParticipants | null> {
     const key = idempotencyKey?.trim();
     if (!key) {
       return null;
     }
-    return (await this.prisma.callSession.findFirst({
+    return (await db.callSession.findFirst({
       where: {
         initiatorID,
         status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
@@ -1215,9 +1284,12 @@ export class CallService {
         if (!other) return;
         target = { kind: 'single', recvID: other.userID };
       } else {
+        // round 3 review：/calls/group 接受 Circle.id 作为 conversationID ——
+        // 直接拿它当 OpenIM groupID 发留痕必失败。是 Circle 行则解析出真实
+        // openim 群 id；否则按原样（sg_ 前缀剥离）。
         target = {
           kind: 'group',
-          groupID: this.rawOpenimGroupID(call.conversationID),
+          groupID: await this.resolveOpenimGroupID(call.conversationID),
         };
       }
 
@@ -1403,6 +1475,19 @@ export class CallService {
 
   private uniqueIDs(ids: string[]): string[] {
     return Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
+  }
+
+  /** conversationID → 真实 OpenIM 群 id（Circle.id 时查表解析）。 */
+  private async resolveOpenimGroupID(conversationID: string): Promise<string> {
+    const raw = this.rawOpenimGroupID(conversationID);
+    const circle = await this.prisma.circle.findFirst({
+      where: { OR: [{ id: conversationID }, { id: raw }] },
+      select: { groupID: true },
+    });
+    if (circle?.groupID) {
+      return this.rawOpenimGroupID(circle.groupID);
+    }
+    return raw;
   }
 
   private rawOpenimGroupID(groupID: string): string {
