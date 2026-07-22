@@ -75,6 +75,11 @@ describe('TraceService', () => {
     broadcastInteractionUnread: jest.fn(() => Promise.resolve()),
     broadcastCirclePostInteractionCreated: jest.fn(),
     broadcastNotificationCreated: jest.fn(),
+    // #89：feed poke
+    broadcastMomentsFeedUpdated: jest.fn(),
+    safeBroadcastAll: jest.fn(async (fns: Array<() => unknown>) => {
+      for (const fn of fns) await fn();
+    }),
   };
   const privacySettings = {
     canViewMoments: jest.fn(),
@@ -993,5 +998,54 @@ describe('TraceService', () => {
       notificationService.createTraceLikeNotification,
     ).not.toHaveBeenCalled();
     expect(realtimeService.broadcastNotificationCreated).not.toHaveBeenCalled();
+  });
+  describe('moments feed poke (#89)', () => {
+    it('pokes the author and accepted friends on create (FRIENDS_ONLY)', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-1',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      prisma.friend.findMany.mockResolvedValue([
+        { userID: 'user-1', friendID: 'friend-1' },
+        { userID: 'friend-2', friendID: 'user-1' },
+      ]);
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      expect(new Set(poked)).toEqual(
+        new Set(['user-1', 'friend-1', 'friend-2']),
+      );
+    });
+
+    it('pokes only the author for PRIVATE moments', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-2',
+        content: 'secret',
+        images: [],
+        visibility: 'PRIVATE',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+
+      await service.createTrace('user-1', {
+        content: 'secret',
+        visibility: 'PRIVATE',
+      } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      expect(poked).toEqual(['user-1']);
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
+    });
   });
 });

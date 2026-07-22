@@ -46,6 +46,8 @@ export function decodeTraceCursor(cursor: string): {
   return decodeFeedCursor(cursor, TraceErrorCode.InvalidCursor);
 }
 
+const MOMENTS_POKE_FANOUT_CAP = 500;
+
 @Injectable()
 export class TraceService {
   private readonly logger = new Logger(TraceService.name);
@@ -298,6 +300,10 @@ export class TraceService {
       },
     });
 
+    // #89：发布即向可见范围广播 feed poke，客户端由 30s 轮询改为事件驱动。
+    // fire-and-forget —— 广播失败绝不能反过来让发布报错。
+    void this.broadcastFeedPoke(userId, trace.visibility);
+
     return {
       id: trace.id,
       content: trace.content,
@@ -315,6 +321,57 @@ export class TraceService {
       comments: [],
       createdAt: trace.createdAt.toISOString(),
     };
+  }
+
+  /**
+   * 朋友圈 feed 变更 poke（#89）：作者本人各端恒收；FRIENDS_ONLY 时扇出到
+   * 已接受的好友。扇出封顶 + 命中记日志（镜像圈子发帖通知的护栏哲学）；
+   * PRIVATE 只 poke 自己。收到 poke 的客户端自行 refetch，可见性过滤仍由
+   * GET /trace/feed 权威裁决 —— poke 本身不泄露内容。
+   */
+  private async broadcastFeedPoke(
+    authorId: string,
+    visibility: string,
+  ): Promise<void> {
+    try {
+      const recipients = new Set<string>([authorId]);
+      if (visibility !== 'PRIVATE') {
+        const friendships = await this.prisma.friend.findMany({
+          where: {
+            state: 'ACCEPTED',
+            OR: [{ userID: authorId }, { friendID: authorId }],
+          },
+          select: { userID: true, friendID: true },
+          take: MOMENTS_POKE_FANOUT_CAP,
+        });
+        if (friendships.length === MOMENTS_POKE_FANOUT_CAP) {
+          this.logger.warn(
+            `moments feed poke fan-out capped at ${MOMENTS_POKE_FANOUT_CAP} for ${authorId}`,
+          );
+        }
+        for (const friendship of friendships) {
+          recipients.add(
+            friendship.userID === authorId
+              ? friendship.friendID
+              : friendship.userID,
+          );
+        }
+      }
+      await this.realtimeService.safeBroadcastAll(
+        [...recipients].map(
+          (recipientId) => () =>
+            this.realtimeService.broadcastMomentsFeedUpdated(recipientId, {
+              authorId,
+            }),
+        ),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `moments feed poke failed for ${authorId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async deleteTrace(userId: string, traceId: string): Promise<void> {
@@ -338,6 +395,8 @@ export class TraceService {
       where: { id: traceId, fromID: userId, deleted: false },
       data: { deleted: true },
     });
+    // #89：删除同样触发 feed poke（好友端把这条从列表里拉掉）。
+    void this.broadcastFeedPoke(userId, trace.visibility);
   }
 
   // ─── Like ──────────────────────────────────────────────────────────────────

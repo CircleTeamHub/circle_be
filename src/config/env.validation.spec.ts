@@ -38,7 +38,8 @@ describe('createEnvValidationSchema', () => {
     expect(value.LIVEKIT_TOKEN_TTL_SECONDS).toBe(3600);
     expect(value.CALL_RING_TIMEOUT_SECONDS).toBe(45);
     expect(value.CALL_MAX_PARTICIPANTS).toBe(10);
-    expect(value.CALL_ENABLE_VIDEO).toBe(false);
+    // FE#119 拍板：测试期默认开视频
+    expect(value.CALL_ENABLE_VIDEO).toBe(true);
   });
 
   it('accepts optional REDIS_URL for shared realtime and rate limiting', () => {
