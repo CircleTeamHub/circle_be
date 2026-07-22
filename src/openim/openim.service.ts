@@ -500,7 +500,6 @@ export class OpenimService implements OnModuleInit {
     );
   }
 
-
   /**
    * 服务端补发转账卡片（#100）：与客户端 im 发卡完全同构 ——
    * contentType 110 + extension 'transfer-card-v1' + data {amount, message}，
@@ -553,7 +552,6 @@ export class OpenimService implements OnModuleInit {
       adminToken,
     );
   }
-
 
   async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
     if (!this.enabled) return;
