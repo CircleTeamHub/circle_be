@@ -3,9 +3,10 @@ import { MembershipController } from './membership.controller';
 import { MembershipService } from './membership.service';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { NotificationModule } from 'src/notification/notification.module';
+import { MembershipPolicyModule } from './membership-policy.module';
 
 @Module({
-  imports: [RealtimeModule, NotificationModule],
+  imports: [MembershipPolicyModule, RealtimeModule, NotificationModule],
   controllers: [MembershipController],
   providers: [MembershipService],
   exports: [MembershipService],

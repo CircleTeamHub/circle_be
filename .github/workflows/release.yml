@@ -39,6 +39,10 @@ on:
         description: "Stop the old version before migrating (breaking migrations only)"
         type: boolean
         default: false
+      irreversible_migration:
+        description: "Confirm this release crosses the old-binary rollback boundary"
+        type: boolean
+        default: false
       force:
         description: "Skip the CI-green check (e.g. redeploying an old tag whose runs expired)"
         type: boolean
@@ -85,6 +89,35 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0 # need origin/main for the ancestor check
+
+      - name: Validate irreversible migration confirmations
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DOWNTIME: ${{ inputs.downtime || false }}
+          IRREVERSIBLE: ${{ inputs.irreversible_migration || false }}
+        run: |
+          set -euo pipefail
+          marker=deploy/REQUIRES_IRREVERSIBLE_MIGRATION
+          if [ -e "$marker" ]; then
+            if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+              echo "$marker blocks tag-push deployment; use manual workflow_dispatch with both confirmations." >&2
+              exit 1
+            fi
+            if [ "$DOWNTIME" != "true" ] || [ "$IRREVERSIBLE" != "true" ]; then
+              echo "$marker requires downtime=true and irreversible_migration=true." >&2
+              exit 1
+            fi
+          fi
+          if [ "$IRREVERSIBLE" = "true" ] && [ "$DOWNTIME" != "true" ]; then
+            echo "irreversible_migration=true requires downtime=true." >&2
+            exit 1
+          fi
+
       - name: Notify release start
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -96,12 +129,6 @@ jobs:
             '{username: "GitHub Actions", content: $content}' |
             curl --fail-with-body -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL" ||
             echo "warning: release start notification failed; continuing release."
-
-      - name: Checkout tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          fetch-depth: 0 # need origin/main for the ancestor check
 
       # Releases deploy only commits that main's full CI matrix has validated.
       # That check replaces re-running tests here — by design the release path
@@ -282,6 +309,7 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           CIRCLE_BE_IMAGE: ${{ needs.resolve.outputs.image_ref }}
           RELEASE_DOWNTIME: ${{ inputs.downtime && '1' || '0' }}
+          RELEASE_IRREVERSIBLE_MIGRATION: ${{ inputs.irreversible_migration && '1' || '0' }}
           # Ephemeral job token: lets the server pull from GHCR during this job
           # only. The image stays in the local Docker cache afterwards, so
           # restarts and cached rollbacks need no registry access.
@@ -295,8 +323,8 @@ jobs:
           # Env travels over stdin (printf %q-escaped), never argv, so the
           # registry token cannot show up in `ps` output on the server.
           {
-            printf 'export RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
-              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$GHCR_USER" "$GHCR_TOKEN"
+            printf 'export RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q RELEASE_IRREVERSIBLE_MIGRATION=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
+              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$RELEASE_IRREVERSIBLE_MIGRATION" "$GHCR_USER" "$GHCR_TOKEN"
             printf 'exec bash %q/deploy/release-deploy.sh\n' "$DEPLOY_PATH"
           } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
 

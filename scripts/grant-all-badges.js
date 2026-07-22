@@ -23,7 +23,6 @@ const SYSTEM_BADGES = [
   { systemKey: 'VIP', systemVariant: 'VIP2', label: 'VIP2' },
   { systemKey: 'VIP', systemVariant: 'VIP3', label: 'VIP3' },
   { systemKey: 'VIP', systemVariant: 'VIP4', label: 'VIP4' },
-  { systemKey: 'VIP', systemVariant: 'VIP5', label: 'VIP5' },
   {
     systemKey: 'TOP_COLLABORATOR',
     systemVariant: 'TOP_COLLABORATOR_1',
@@ -53,7 +52,7 @@ const SYSTEM_BADGES = [
 ];
 
 const DEFAULT_DISPLAY_BADGES = [
-  'VIP5',
+  'VIP4',
   'NEW_USER',
   'TOP_COLLABORATOR_3',
   'VERIFIED_PROFILE',
@@ -139,7 +138,6 @@ async function main() {
       where: { id: user.id },
       data: {
         status: 'ACTIVE',
-        vipLevel: 5,
         creditScore: 100,
         fancyNumber: true,
         receivedLikeCount: 10_000,

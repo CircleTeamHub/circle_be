@@ -14,6 +14,8 @@
 #   RELEASE_DOWNTIME=1 可选,停机模式:先停旧版本再跑迁移。仅用于
 #                      不向后兼容的迁移;默认蓝绿模式要求迁移向后兼容
 #                      (旧代码 + 新 schema 需共存到切换完成)。
+#   RELEASE_IRREVERSIBLE_MIGRATION=1 可选,确认本次迁移越过旧二进制
+#                      回滚下限。必须同时启用 RELEASE_DOWNTIME=1。
 #
 # 发版契约:
 # - 只接受 v* 版本 tag;
@@ -41,6 +43,16 @@ fi
 
 if [[ ! "$CIRCLE_BE_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "CIRCLE_BE_IMAGE must be an immutable ghcr.io image digest" >&2
+  exit 1
+fi
+
+RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-deploy/REQUIRES_IRREVERSIBLE_MIGRATION}"
+if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] && [ "${RELEASE_DOWNTIME:-0}" != "1" ]; then
+  echo "RELEASE_IRREVERSIBLE_MIGRATION=1 requires RELEASE_DOWNTIME=1" >&2
+  exit 1
+fi
+if [ -e "$RELEASE_MARKER_PATH" ] && [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" != "1" ]; then
+  echo "$RELEASE_MARKER_PATH requires RELEASE_IRREVERSIBLE_MIGRATION=1" >&2
   exit 1
 fi
 
@@ -226,6 +238,32 @@ restore_live() {
   echo "==> Previous version $live restored" >&2
 }
 
+irreversible_migration_applied=0
+
+irreversible_boundary_crossed() {
+  [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
+    [ "$irreversible_migration_applied" = "1" ]
+}
+
+enter_irreversible_maintenance() {
+  echo "CRITICAL: irreversible migration succeeded; refusing to restart the previous binary." >&2
+  echo "Keeping the service in maintenance for a forward fix or database restore." >&2
+  if [ -n "${standby:-}" ] && [ -n "$(running "$standby")" ]; then
+    compose stop "$standby" || true
+  fi
+  if [ -n "${live:-}" ] && [ -n "$(running "$live")" ]; then
+    compose stop "$live" || true
+  fi
+}
+
+handle_post_migration_failure() {
+  if irreversible_boundary_crossed; then
+    enter_irreversible_maintenance
+  else
+    restore_live || true
+  fi
+}
+
 # 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
 # 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
 smoke() {
@@ -309,6 +347,7 @@ if ! compose run --rm migrate; then
   restore_live || true
   exit 1
 fi
+irreversible_migration_applied=1
 
 # ── 起新色并等健康 ──────────────────────────────────────────────
 echo "==> Starting $standby"
@@ -316,13 +355,17 @@ if ! compose up -d --no-build --no-deps "$standby"; then
   echo "Failed to create $standby" >&2
   compose logs --tail 200 "$standby" >&2 || true
   compose rm -sf "$standby" || true
-  restore_live || true
+  handle_post_migration_failure
   exit 1
 fi
 if ! wait_healthy "$standby" 300; then
   compose logs --tail 200 "$standby" >&2 || true
-  compose rm -sf "$standby" || true
-  restore_live || true
+  if irreversible_boundary_crossed; then
+    enter_irreversible_maintenance
+  else
+    compose rm -sf "$standby" || true
+    restore_live || true
+  fi
   exit 1
 fi
 
@@ -330,6 +373,10 @@ fi
 echo "==> $standby healthy; switching Caddy upstream"
 if ! switch_proxy "$standby"; then
   echo "==> Caddy switch failed; leaving previous version $live live" >&2
+  if irreversible_boundary_crossed; then
+    enter_irreversible_maintenance
+    exit 1
+  fi
   if [ -n "$live" ]; then
     if ! ensure_live; then
       echo "warning: leaving both colors running for manual recovery" >&2
@@ -343,6 +390,10 @@ if ! switch_proxy "$standby"; then
 fi
 if ! persist_active_color "$standby"; then
   echo "==> Could not persist active color; rolling Caddy back" >&2
+  if irreversible_boundary_crossed; then
+    enter_irreversible_maintenance
+    exit 1
+  fi
   if [ -n "$live" ]; then
     if ! ensure_live || ! switch_proxy "$live"; then
       echo "warning: Caddy rollback failed; leaving both colors running" >&2
@@ -367,6 +418,10 @@ if smoke; then
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
   compose logs --tail 100 "$standby" >&2 || true
+  if irreversible_boundary_crossed; then
+    enter_irreversible_maintenance
+    exit 1
+  fi
   if [ -n "$live" ]; then
     if ! ensure_live; then
       echo "warning: previous version is unavailable; leaving standby in service" >&2

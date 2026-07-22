@@ -104,7 +104,7 @@ const USERS = [
   {
     accountId: 'frank06',
     nickname: '法兰克',
-    vipLevel: 5,
+    vipLevel: 4,
     creditScore: 100,
     fancyNumber: true,
     gender: 'male',

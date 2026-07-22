@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -177,7 +178,7 @@ test('backend deploy accepts only immutable digests and real API responses', () 
   assert.doesNotMatch(release, /401\|403\|404/);
 });
 
-test('downtime deployment restores the live app after migration or startup failure', () => {
+test('downtime deployment restores the live app after migration or reversible startup failure', () => {
   const deploy = read('deploy/release-deploy.sh');
 
   assert.match(deploy, /restore_live\(\)/);
@@ -188,6 +189,74 @@ test('downtime deployment restores the live app after migration or startup failu
   assert.match(
     deploy,
     /if ! compose up -d --no-build --no-deps "\$standby"; then[\s\S]*restore_live/,
+  );
+});
+
+test('marked releases reject tag push and incomplete manual confirmations', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const gate = release.slice(
+    release.indexOf('- name: Validate irreversible migration confirmations'),
+    release.indexOf('- name: Notify release start'),
+  );
+  const runMarker = '        run: |\n';
+  const script = gate
+    .slice(gate.indexOf(runMarker) + runMarker.length)
+    .split(/\r?\n/)
+    .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
+    .join('\n');
+  const directory = mkdtempSync(join(tmpdir(), 'circle-release-gate-'));
+  mkdirSync(join(directory, 'deploy'));
+  writeFileSync(
+    join(directory, 'deploy', 'REQUIRES_IRREVERSIBLE_MIGRATION'),
+    'test marker\n',
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const runGate = (EVENT_NAME, DOWNTIME, IRREVERSIBLE) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: { ...process.env, EVENT_NAME, DOWNTIME, IRREVERSIBLE },
+    });
+
+  assert.match(gate, /deploy\/REQUIRES_IRREVERSIBLE_MIGRATION/);
+  assert.notEqual(runGate('push', 'false', 'false').status, 0);
+  for (const confirmations of [
+    ['false', 'false'],
+    ['true', 'false'],
+    ['false', 'true'],
+  ]) {
+    assert.notEqual(
+      runGate('workflow_dispatch', ...confirmations).status,
+      0,
+      `manual dispatch unexpectedly accepted ${confirmations.join('/')}`,
+    );
+  }
+  assert.equal(runGate('workflow_dispatch', 'true', 'true').status, 0);
+  assert.match(
+    release,
+    /RELEASE_IRREVERSIBLE_MIGRATION: \$\{\{ inputs\.irreversible_migration && '1' \|\| '0' \}\}/,
+  );
+});
+
+test('server crosses an explicit no-rollback boundary after irreversible migration', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const migration = deploy.indexOf('if ! compose run --rm migrate; then');
+  const crossed = deploy.indexOf('irreversible_migration_applied=1');
+
+  assert.match(
+    deploy,
+    /RELEASE_IRREVERSIBLE_MIGRATION.*requires RELEASE_DOWNTIME=1/,
+  );
+  assert.match(
+    deploy,
+    /REQUIRES_IRREVERSIBLE_MIGRATION.*RELEASE_IRREVERSIBLE_MIGRATION=1/s,
+  );
+  assert.ok(migration >= 0 && migration < crossed);
+  assert.match(deploy, /enter_irreversible_maintenance\(\)/);
+  assert.match(
+    deploy,
+    /if irreversible_boundary_crossed; then[\s\S]*enter_irreversible_maintenance/,
   );
 });
 

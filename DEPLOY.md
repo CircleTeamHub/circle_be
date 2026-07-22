@@ -169,6 +169,18 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 勾选 `downtime: true`(先停旧版本再迁移,接受短暂停机;此模式下若失败,
 回滚可能还需恢复迁移前备份)。
 
+**不可逆迁移**:仓库存在 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION` 时,tag push 会
+fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同时勾选
+`downtime: true` 和 `irreversible_migration: true`。服务器也会二次校验
+`RELEASE_IRREVERSIBLE_MIGRATION=1` 必须与 `RELEASE_DOWNTIME=1` 同时启用。
+
+迁移命令失败时 schema 尚未确认变更完成,脚本会恢复旧实例。迁移命令一旦成功,
+旧二进制不再是合法回滚目标;后续启动、健康、代理、状态写入或烟测失败都会保持
+维护状态,等待向前修复。只有先从本次迁移前备份完整恢复数据库,才能再启动旧镜像。
+本次会员迁移的完整值班步骤和验证 SQL 见
+`docs/operations/membership-rollout.md`。标记只能由**后续已成功部署**、且不再包含
+不可逆迁移的版本移除,不能在会员迁移 tag 上提前删除。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |
@@ -198,6 +210,11 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
     bash deploy/release-deploy.sh
   ```
+
+  携带不可逆迁移标记的版本还必须增加
+  `RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=1`;缺一项脚本都会在备份和
+  迁移前拒绝运行。越过迁移成功边界后,不要直接改用旧 tag 重跑;先向前修复,或先
+  恢复迁移前数据库备份。
 
   镜像还在本地缓存时无需登录;缓存已清且仓库私有,先用带 `read:packages` 的
   PAT `docker login ghcr.io` 再跑。
