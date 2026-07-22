@@ -13,6 +13,29 @@ import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import { MAILER, Mailer } from './mailer/mailer.interface';
 
+/** SMTP 错误 → 可入日志的脱敏描述：类名 + code/responseCode + 打码正文。 */
+function describeMailerError(error: unknown): string {
+  const shaped = error as {
+    name?: unknown;
+    code?: unknown;
+    responseCode?: unknown;
+    message?: unknown;
+  } | null;
+  const parts = [
+    typeof shaped?.name === 'string' ? shaped.name : 'Error',
+    typeof shaped?.code === 'string' || typeof shaped?.code === 'number'
+      ? `code=${shaped.code}`
+      : null,
+    typeof shaped?.responseCode === 'number'
+      ? `responseCode=${shaped.responseCode}`
+      : null,
+    typeof shaped?.message === 'string'
+      ? shaped.message.replace(/[^\s@<>()]+@[^\s@<>()]+/g, '<redacted-email>')
+      : null,
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
 const CODE_TTL_MS = 10 * 60 * 1000; // 10 分钟
 const RESEND_COOLDOWN_MS = 60 * 1000; // 60 秒
 const MAX_ATTEMPTS = 5;
@@ -103,10 +126,10 @@ export class EmailVerificationService {
           errorCode: AuthErrorCode.CodeRateLimited,
         });
       }
-      // 同 email+purpose 仅保留最新一条未消费记录。
-      await tx.emailVerificationCode.deleteMany({
-        where: { email, purpose, consumedAt: null },
-      });
+      // review 修复（round 2）：旧未消费行的作废推迟到**新码送达之后** ——
+      // 冷却期外的重发若在删旧后才失败，用户手里已送达的旧码会被连坐作废，
+      // 落进「一个可用码都没有」的状态。verifyCode 取最新未消费行，新旧
+      // 短暂并存时也永远只认新码，语义不变。
       return tx.emailVerificationCode.create({
         data: {
           email,
@@ -119,17 +142,31 @@ export class EmailVerificationService {
 
     try {
       await this.mailer.sendVerificationCode(email, code, purpose);
+      // 送达成功才作废旧码：同 email+purpose 只留刚送达的这一条未消费行。
+      await this.prisma.emailVerificationCode
+        .deleteMany({
+          where: {
+            email,
+            purpose,
+            consumedAt: null,
+            id: { not: created.id },
+          },
+        })
+        .catch(() => undefined);
     } catch (error) {
       // review 修复（投递失败回滚）：不回滚的话这条没送达的行会占住 60s
       // 冷却 —— 用户立刻重试只会得到 CodeRateLimited，且不会再发一封。
-      // 删行让重试立即可用（滥用防护由 setup 层 emailCodeLimiter 兜底）。
+      // 删行让重试立即可用（滥用防护由 setup 层 emailCodeLimiter 兜底），
+      // 且此刻旧码原封未动，仍可验证。
       await this.prisma.emailVerificationCode
         .deleteMany({ where: { id: created.id } })
         .catch(() => undefined);
       if (error instanceof ServiceUnavailableException) throw error;
+      // review 修复（round 2）：SMTP 报错常回带 RCPT 收件人全文，整棵 stack
+      // 打日志等于把邮箱写进生产日志。只留脱敏元信息：错误类名、SMTP
+      // code/responseCode、正文里的邮箱全部打码。
       this.logger.error(
-        `verification mail delivery failed (${purpose})`,
-        error instanceof Error ? error.stack : String(error),
+        `verification mail delivery failed (${purpose}): ${describeMailerError(error)}`,
       );
       throw new ServiceUnavailableException('验证码发送失败，请稍后再试');
     }

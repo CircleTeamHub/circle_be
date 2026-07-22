@@ -131,6 +131,46 @@ describe('EmailVerificationService', () => {
     expect(mailer.sendVerificationCode).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps the previously delivered code usable when a resend fails (round 2)', async () => {
+    usersByEmail.add('a@b.com');
+    // 第一封成功送达
+    await service.requestCode('a@b.com', 'LOGIN');
+    expect(codes).toHaveLength(1);
+    const oldRow = codes[0];
+    // 冷却期外的重发：SMTP 失败
+    oldRow.createdAt = new Date(Date.now() - 61_000);
+    mailer.sendVerificationCode.mockRejectedValueOnce(new Error('454 relay'));
+
+    await expect(service.requestCode('a@b.com', 'LOGIN')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+
+    // 旧行必须原封仍在（新行已回滚）——用户手里那封信还能用
+    expect(codes).toHaveLength(1);
+    expect(codes[0].id).toBe(oldRow.id);
+  });
+
+  it('redacts recipient addresses out of SMTP failure logs (round 2)', async () => {
+    usersByEmail.add('a@b.com');
+    const smtpError = Object.assign(
+      new Error('454 4.7.1 <a@b.com>: Relay access denied'),
+      { responseCode: 454, name: 'SMTPError' },
+    );
+    mailer.sendVerificationCode.mockRejectedValueOnce(smtpError);
+    const errorSpy = jest
+      .spyOn((service as any).logger, 'error')
+      .mockImplementation(() => undefined);
+
+    await expect(service.requestCode('a@b.com', 'LOGIN')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+
+    const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).not.toContain('a@b.com');
+    expect(logged).toContain('responseCode=454');
+    errorSpy.mockRestore();
+  });
+
   it('re-checks the cooldown inside the serialized transaction (concurrent double-send guard)', async () => {
     usersByEmail.add('a@b.com');
     // 模拟并发对手：外层冷却快查时还没有行，进锁复检时对手的行已经出现。
