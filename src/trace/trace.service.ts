@@ -47,6 +47,11 @@ export function decodeTraceCursor(cursor: string): {
 }
 
 const MOMENTS_POKE_FANOUT_PAGE = 500;
+// per-author 抑制窗口：窗口内的连发合并成「领先沿立即发 + 尾随补一发」。
+// 高好友数账号连发时，扇出成本从每次变更一趟降到每窗口至多两趟。
+const MOMENTS_POKE_COALESCE_MS = 2_000;
+// 抑制表防泄漏阈值：超过即清理已过窗口的闲置项（in-memory、per-instance）。
+const MOMENTS_POKE_COALESCE_MAX_ENTRIES = 10_000;
 // 绝对上限（20 页）：防御性护栏，防止病态数据把发布路径拖进长循环。
 // 命中即告警 —— 超过 1 万可见好友的号需要产品层面重新设计，而不是静默截断。
 const MOMENTS_POKE_MAX_PAGES = 20;
@@ -305,7 +310,7 @@ export class TraceService {
 
     // #89：发布即向可见范围广播 feed poke，客户端由 30s 轮询改为事件驱动。
     // fire-and-forget —— 广播失败绝不能反过来让发布报错。
-    void this.broadcastFeedPoke(userId, trace.visibility);
+    this.queueFeedPoke(userId, trace.visibility !== 'PRIVATE');
 
     return {
       id: trace.id,
@@ -330,16 +335,74 @@ export class TraceService {
    * 朋友圈 feed 变更 poke（#89）：作者本人各端恒收；非 PRIVATE 时扇出到
    * 已接受好友中**通过 feed 同款隐私门**（momentsVisibility + 作者侧
    * CHAT_ONLY）的那些。扇出封顶 + 命中记日志（镜像圈子发帖通知的护栏哲学）；
-   * PRIVATE 只 poke 自己。收到 poke 的客户端自行 refetch，内容级过滤仍由
+   * includeFriends=false（PRIVATE）只 poke 自己。客户端收到后自行 refetch，内容级过滤仍由
    * GET /trace/feed 权威裁决 —— poke 无内容，但收没收到本身也不能泄密。
    */
+  // review（P2 削峰）：per-author 领先沿 + 尾随合并。窗口内多次变更只触发
+  // 头尾两次扇出；尾随一发聚合窗口内的最宽可见性（有任一非 PRIVATE 就扇出
+  // 好友）。in-memory、per-instance —— 目的是削峰，不追求跨实例精确一次。
+  private readonly pokeCoalesce = new Map<
+    string,
+    {
+      lastRunAt: number;
+      timer: ReturnType<typeof setTimeout> | null;
+      pendingIncludeFriends: boolean;
+    }
+  >();
+
+  private queueFeedPoke(authorId: string, includeFriends: boolean): void {
+    const now = Date.now();
+    let entry = this.pokeCoalesce.get(authorId);
+    if (!entry) {
+      if (this.pokeCoalesce.size >= MOMENTS_POKE_COALESCE_MAX_ENTRIES) {
+        for (const [key, value] of this.pokeCoalesce) {
+          if (
+            !value.timer &&
+            now - value.lastRunAt > MOMENTS_POKE_COALESCE_MS
+          ) {
+            this.pokeCoalesce.delete(key);
+          }
+        }
+      }
+      entry = { lastRunAt: 0, timer: null, pendingIncludeFriends: false };
+      this.pokeCoalesce.set(authorId, entry);
+    }
+
+    if (entry.timer) {
+      // 已有尾随发排队：只聚合可见性。
+      entry.pendingIncludeFriends ||= includeFriends;
+      return;
+    }
+
+    if (now - entry.lastRunAt >= MOMENTS_POKE_COALESCE_MS) {
+      entry.lastRunAt = now;
+      void this.broadcastFeedPoke(authorId, includeFriends);
+      return;
+    }
+
+    entry.pendingIncludeFriends = includeFriends;
+    const timer = setTimeout(
+      () => {
+        entry.timer = null;
+        entry.lastRunAt = Date.now();
+        const aggregated = entry.pendingIncludeFriends;
+        entry.pendingIncludeFriends = false;
+        void this.broadcastFeedPoke(authorId, aggregated);
+      },
+      MOMENTS_POKE_COALESCE_MS - (now - entry.lastRunAt),
+    );
+    // 不拖住进程退出（也避免测试挂 open handle）。
+    timer.unref?.();
+    entry.timer = timer;
+  }
+
   private async broadcastFeedPoke(
     authorId: string,
-    visibility: string,
+    includeFriends: boolean,
   ): Promise<void> {
     try {
       const recipients = new Set<string>([authorId]);
-      if (visibility !== 'PRIVATE') {
+      if (includeFriends) {
         // PR #122 review（P2 两条）：
         // 1. 扇出套用与 GET /trace/feed 相同的隐私门（momentsVisibleFor +
         //    作者侧 CHAT_ONLY）—— poke 虽无内容，收没收到本身也是元数据。
@@ -452,7 +515,7 @@ export class TraceService {
       data: { deleted: true },
     });
     // #89：删除同样触发 feed poke（好友端把这条从列表里拉掉）。
-    void this.broadcastFeedPoke(userId, trace.visibility);
+    this.queueFeedPoke(userId, trace.visibility !== 'PRIVATE');
   }
 
   // ─── Like ──────────────────────────────────────────────────────────────────

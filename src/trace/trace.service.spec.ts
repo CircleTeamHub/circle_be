@@ -1161,6 +1161,33 @@ describe('TraceService', () => {
       expect(poked).toEqual(['user-1']);
     });
 
+    it('coalesces rapid pokes per author — leading edge fans out, burst queues a trailing one (review)', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-7',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      prisma.friend.findMany.mockResolvedValue([
+        {
+          id: 'f-1',
+          userID: 'user-1',
+          friendID: 'friend-1',
+          permissionA: 'ALL',
+          permissionB: 'ALL',
+        },
+      ]);
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await service.createTrace('user-1', { content: 'hi again' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // 领先沿只有一次真实扇出（好友表只被查一遍）；第二次进了尾随队列
+      expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+    });
+
     it('pokes only the author for PRIVATE moments', async () => {
       prisma.trace.create.mockResolvedValue({
         id: 'trace-2',
