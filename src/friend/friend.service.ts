@@ -31,6 +31,8 @@ import {
 } from './dto/friend.dto';
 
 // Members (paid) get 5 000, regular users get 1 000.
+const FRIEND_REQUEST_PAGE_SIZE = 500;
+const BLOCKED_PAGE_SIZE = 1000;
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
 const FRIEND_ACCEPTED_REPLY_MESSAGE = '我通过了你的好友请求，现在开始聊天吧';
@@ -780,6 +782,10 @@ export class FriendService {
 
   // ─── Lists ────────────────────────────────────────────────────────────────────
 
+  // #108：无界列表的防爆护栏。这些 take 是「异常防护上限」而不是分页 ——
+  // 正常用户远够不到；够到的说明该端点需要真分页（届时按 trace/plaza 的
+  // cursor 模式补）。FriendActivity 表不参与清理（见 refresh-token.cleanup
+  // 注释），listActivities 的 take 同时是这张只增表的读路径止血带。
   async listFriends(userId: string): Promise<FriendProfileDto[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -787,6 +793,8 @@ export class FriendService {
         state: FriendState.ACCEPTED,
       },
       orderBy: { updatedAt: 'desc' },
+      // 护栏对齐实际业务上限（FRIEND_LIMIT_MEMBER）：低于它会静默吞掉合法好友。
+      take: FRIEND_LIMIT_MEMBER,
     });
 
     const friendIds = records.map((r) =>
@@ -835,6 +843,7 @@ export class FriendService {
       this.prisma.friendTag.findMany({
         where: { ownerID: userId },
         orderBy: { name: 'asc' },
+        take: 500,
       }),
       this.prisma.friendTagOnFriend.findMany({
         where: {
@@ -867,10 +876,18 @@ export class FriendService {
     };
   }
 
-  async listIncomingRequests(userId: string): Promise<FriendRequestDto[]> {
+  async listIncomingRequests(
+    userId: string,
+    page = 1,
+  ): Promise<FriendRequestDto[]> {
+    // round 2 review：500 条护栏之外的旧请求此前完全不可达（接受/拒绝都需要
+    // 列表里的 requestId）。加 page 参数（默认第 1 页，行为不变）让公开账号
+    // 被刷爆时也能翻到并处理更早的请求。
     const records = await this.prisma.friend.findMany({
       where: { friendID: userId, state: FriendState.PENDING },
       orderBy: { createdAt: 'desc' },
+      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
+      take: FRIEND_REQUEST_PAGE_SIZE,
     });
 
     const senderIds = records.map((r) => r.userID);
@@ -891,10 +908,15 @@ export class FriendService {
       }));
   }
 
-  async listOutgoingRequests(userId: string): Promise<FriendRequestDto[]> {
+  async listOutgoingRequests(
+    userId: string,
+    page = 1,
+  ): Promise<FriendRequestDto[]> {
     const records = await this.prisma.friend.findMany({
       where: { userID: userId, state: FriendState.PENDING },
       orderBy: { createdAt: 'desc' },
+      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
+      take: FRIEND_REQUEST_PAGE_SIZE,
     });
 
     const targetIds = records.map((r) => r.friendID);
@@ -922,9 +944,33 @@ export class FriendService {
       where: { viewerId: userId },
       orderBy: { createdAt: 'desc' },
       include: FRIEND_ACTIVITY_INCLUDE,
+      // 只增表 + 全量 include 的读路径（#108）：最近 200 条覆盖 UI 需要，
+      // 未读计数仍由 getUnreadActivityCount 的 count() 权威给出。
+      take: 200,
     });
 
     return activities.map((activity) => this.toFriendActivityDto(activity));
+  }
+
+  /**
+   * 一键全部已读（review 修复）：listActivities 有 200 条护栏后，更老的未读
+   * 无法逐条到达 —— 未读数会永远不归零。批量置读是唯一不需要分页的出口。
+   */
+  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
+    // review 修复（round 2）：先补历史 —— 老账号的活动行由 list/unread-count
+    // 惰性回填；用户第一步就点全部已读的话，不回填等于 0 行被置读，下一次
+    // unread-count 又把旧请求回填成未读，计数永远清不掉。
+    await this.backfillLegacyActivitiesForViewer(userId);
+    const result = await this.prisma.friendActivity.updateMany({
+      where: { viewerId: userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+    // review 修复（round 2）：与 markActivityRead 一致地广播未读数变化，
+    // 同账号其它在线设备的角标即时归零。
+    if (result.count > 0) {
+      await this.broadcastFriendUnreadUpdates([userId]);
+    }
+    return { count: result.count };
   }
 
   async getUnreadActivityCount(
@@ -1142,13 +1188,17 @@ export class FriendService {
     }
   }
 
-  async listBlocked(userId: string) {
+  async listBlocked(userId: string, page = 1) {
+    // round 3 review：1000 条护栏外的旧拉黑此前不可达（解除拉黑要列表里的
+    // id）。与好友申请同款 page 参数，第 1 页行为不变。
     const blocks = await this.prisma.block.findMany({
       where: { blockerID: userId },
       orderBy: { createdAt: 'desc' },
+      skip: (Math.max(1, page) - 1) * BLOCKED_PAGE_SIZE,
       include: {
         blocked: { select: MINI_USER_SELECT },
       },
+      take: BLOCKED_PAGE_SIZE,
     });
     return blocks.map((b) => ({ ...b.blocked, blockedAt: b.createdAt }));
   }
@@ -1194,6 +1244,7 @@ export class FriendService {
     return this.prisma.friendTag.findMany({
       where: { ownerID: userId },
       orderBy: { name: 'asc' },
+      take: 500,
     });
   }
 

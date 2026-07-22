@@ -8,9 +8,8 @@ import { ScheduleModule } from '@nestjs/schedule';
 // not via a global APP_GUARD — rate limiting stays scoped to temp-chat.
 import { ThrottlerModule } from '@nestjs/throttler';
 
-import { LogsModule } from './logs/logs.module';
-import { RolesModule } from './roles/roles.module';
 import { AuthModule } from './auth/auth.module';
+import { WinstonLoggingModule } from './logging/winston-logging.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
@@ -55,9 +54,8 @@ const envFilePath = `.env.${nodeEnv}`;
     RedisModule,
     PrismaModule,
     UserModule,
-    LogsModule,
-    RolesModule,
     AuthModule,
+    WinstonLoggingModule,
     OpenimModule,
     UploadModule,
     FriendModule,
