@@ -45,6 +45,26 @@ export class NotificationRetentionCleanup {
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
   async sweep(now: Date = new Date()): Promise<void> {
+    // round 2 review：多副本部署里每个实例都会在 4AM 触发 —— 与
+    // deleteStaleTokens 同款 try-lock 选主，输家直接收工，避免删除负载
+    //（WAL/行锁）在清理窗口翻倍。锁的粒度是整轮 sweep。
+    const [lock] = await this.prisma.$queryRaw<Array<{ acquired: boolean }>>`
+      SELECT pg_try_advisory_lock(hashtext('notification-retention-sweep')) AS acquired
+    `;
+    if (!lock?.acquired) {
+      return;
+    }
+    try {
+      await this.runSweep(now);
+    } finally {
+      await this.prisma
+        .$queryRaw`SELECT pg_advisory_unlock(hashtext('notification-retention-sweep'))`.catch(
+        () => undefined,
+      );
+    }
+  }
+
+  private async runSweep(now: Date): Promise<void> {
     if (this.notificationDays > 0) {
       try {
         const cutoff = new Date(

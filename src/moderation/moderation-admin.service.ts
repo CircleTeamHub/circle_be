@@ -168,6 +168,9 @@ export class ModerationAdminService {
     // 维护 —— 否则每个关联圈子的 postCount 永久虚高，恢复也无从补偿。
     // CAS（非 DELETED → DELETED）保证并发/重试只扣一次。
     const linkedCircleIds = await this.linkedCircleIds(postId, post.circleID);
+    // round 2 review：takedown 审计行是 restore 资格判定的**依据**，不能走
+    // best-effort —— 并入状态事务：审计写不进去就整体回滚，绝不出现
+    // 「帖子已下架但没有下架凭据」的状态。
     await this.prisma.$transaction(async (tx) => {
       const claimed = await tx.circlePost.updateMany({
         where: { id: postId, status: { not: CirclePostStatus.DELETED } },
@@ -178,18 +181,17 @@ export class ModerationAdminService {
         where: { id: { in: linkedCircleIds } },
         data: { postCount: { decrement: 1 } },
       });
+      await this.audit.recordStrict(tx, {
+        actorID,
+        action: 'post_takedown',
+        entityType: 'CirclePost',
+        entityID: postId,
+        before: { status: post.status },
+        after: { status: CirclePostStatus.DELETED, note: note ?? null },
+        ...context,
+      });
     });
-    const updated = { id: postId, status: CirclePostStatus.DELETED };
-    await this.audit.record({
-      actorID,
-      action: 'post_takedown',
-      entityType: 'CirclePost',
-      entityID: postId,
-      before: { status: post.status },
-      after: { status: CirclePostStatus.DELETED, note: note ?? null },
-      ...context,
-    });
-    return updated;
+    return { id: postId, status: CirclePostStatus.DELETED };
   }
 
   /** 帖子关联的全部圈子 id（含主圈子）——postCount 增减的作用域。 */
@@ -264,6 +266,8 @@ export class ModerationAdminService {
     // 让一个陈年帖子重新出现在「进行中」流里。ENDED 可见但不可再报名。
     // 计数对称回补下架时的递减。
     const linkedCircleIds = await this.linkedCircleIds(postId, post.circleID);
+    // round 2 review：restore 审计同样并入事务（丢了它，作者后续自删的帖子
+    // 会因残留的旧 takedown 记录再次可被恢复）。
     await this.prisma.$transaction(async (tx) => {
       const claimed = await tx.circlePost.updateMany({
         where: { id: postId, status: CirclePostStatus.DELETED },
@@ -274,17 +278,16 @@ export class ModerationAdminService {
         where: { id: { in: linkedCircleIds } },
         data: { postCount: { increment: 1 } },
       });
+      await this.audit.recordStrict(tx, {
+        actorID,
+        action: 'post_restore',
+        entityType: 'CirclePost',
+        entityID: postId,
+        before: { status: post.status },
+        after: { status: CirclePostStatus.ENDED },
+        ...context,
+      });
     });
-    const updated = { id: postId, status: CirclePostStatus.ENDED };
-    await this.audit.record({
-      actorID,
-      action: 'post_restore',
-      entityType: 'CirclePost',
-      entityID: postId,
-      before: { status: post.status },
-      after: { status: CirclePostStatus.ENDED },
-      ...context,
-    });
-    return updated;
+    return { id: postId, status: CirclePostStatus.ENDED };
   }
 }

@@ -421,6 +421,54 @@ describe('MembershipService idempotency scoping (PR #120 review)', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  it('replays success when the same key loses the race to a committed twin (round 2)', async () => {
+    // 预检时无成交行（对手还没提交）→ 事务 CAS 输掉（LevelNotHigher）
+    // → 复查发现同键成交已存在且参数吻合 → 回放成功而非报错
+    const prisma = {
+      coinTransaction: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValueOnce(null) // 预检
+          .mockResolvedValue({
+            userID: 'user-1',
+            type: 'PURCHASE',
+            amount: -780,
+            note: '兑换 VIP1',
+          }), // 输后复查
+      },
+      user: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'user-1', vipLevel: 1 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          vipLevel: 1,
+          creditScore: 100,
+        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+      wallet: {
+        upsert: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          id: 'wallet-1',
+          userID: 'user-1',
+          balance: 20,
+        }),
+      },
+      $transaction: jest.fn(async (fn: any) => fn(prisma)),
+    };
+    const service = new MembershipService(
+      prisma as never,
+      realtime as never,
+      notification as never,
+    );
+
+    const result = await service.upgrade('user-1', 1, 'racing-key');
+
+    expect(result.user.vipLevel).toBe(1);
+    // 复查发生在 CAS 失败之后（findUnique 被调了两次）
+    expect(prisma.coinTransaction.findUnique).toHaveBeenCalledTimes(2);
+  });
+
   it('replays current state for a true same-purchase retry', async () => {
     const { service, prisma } = buildService({
       id: 'tx-1',

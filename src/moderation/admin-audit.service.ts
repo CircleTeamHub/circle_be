@@ -22,6 +22,34 @@ export class AdminAuditService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  /**
+   * 事务内严格审计写入（round 2 review）：takedown/restore 的恢复资格判定
+   * 依赖这两类审计行的存在性 —— best-effort 吞错会让判定地基悬空（下架审计
+   * 丢了→合法恢复被拒；恢复审计丢了→作者自删又能被复活）。作为承载业务
+   * 语义的行，必须与状态变更同事务、失败即整体回滚。
+   */
+  async recordStrict(
+    tx: Pick<PrismaService, 'adminAuditLog'>,
+    entry: AdminAuditEntry,
+  ): Promise<void> {
+    await tx.adminAuditLog.create({
+      data: {
+        actorID: entry.actorID,
+        action: entry.action,
+        entityType: entry.entityType ?? null,
+        entityID: entry.entityID ?? null,
+        before: entry.before
+          ? (JSON.parse(JSON.stringify(entry.before)) as object)
+          : undefined,
+        after: entry.after
+          ? (JSON.parse(JSON.stringify(entry.after)) as object)
+          : undefined,
+        ip: entry.ip ?? null,
+        userAgent: entry.userAgent ?? null,
+      },
+    });
+  }
+
   async record(entry: AdminAuditEntry): Promise<void> {
     try {
       await this.prisma.adminAuditLog.create({

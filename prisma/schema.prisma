@@ -1063,6 +1063,9 @@ model CoinGift {
 
   @@index([senderID])
   @@index([recipientID])
+  // round 2：待补卡片的局部索引（WHERE cardDeliveredAt IS NULL）在迁移
+  // 20260721180000 里用原生 SQL 建 —— Prisma schema 无法表达 partial index。
+
 }
 
 model UserCollection {
@@ -1197,6 +1200,8 @@ model NotificationPushDelivery {
 
   @@unique([notificationID, token])
   @@index([status, sentAt])
+  // round 2：sweep 按 outboxID+status+attempts 查询/计数（外键不自动建索引）
+  @@index([outboxID, status, attempts])
 }
 
 /// #90：管理台操作审计。业务日志有 actor/target 但缺 ip/UA 与结构化前后值；

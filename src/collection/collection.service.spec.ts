@@ -7,6 +7,8 @@ describe('CollectionService', () => {
   let service: CollectionService;
 
   const prisma = {
+    $transaction: jest.fn(async (fn: any) => fn(prisma)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     userCollection: {
       findMany: jest.fn(),
       create: jest.fn(),

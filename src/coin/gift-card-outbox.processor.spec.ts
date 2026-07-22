@@ -24,6 +24,7 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
       },
     };
     const openim = {
+      isEnabled: jest.fn().mockReturnValue(true),
       sendTransferCardMessage: jest.fn().mockResolvedValue(undefined),
     };
     const processor = new GiftCardOutboxProcessor(
@@ -57,6 +58,19 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
       where: { id: 'gift-1' },
       data: { cardDeliveredAt: expect.any(Date) },
     });
+  });
+
+  it('does nothing (and marks nothing delivered) while OpenIM is unconfigured (round 2)', async () => {
+    const { prisma, openim, processor } = buildHarness();
+    openim.isEnabled.mockReturnValue(false);
+
+    const delivered = await processor.compensate(now);
+
+    expect(delivered).toBe(0);
+    // 关键：未发出的卡绝不能被标成已送达（那会永久压掉补偿）
+    expect(prisma.coinGift.update).not.toHaveBeenCalled();
+    expect(prisma.coinGift.updateMany).not.toHaveBeenCalled();
+    expect(openim.sendTransferCardMessage).not.toHaveBeenCalled();
   });
 
   it('skips the send entirely when another replica (or the client receipt) wins the claim', async () => {

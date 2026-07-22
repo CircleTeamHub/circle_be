@@ -94,7 +94,44 @@ export class MembershipService {
       }
     }
 
-    const result = await runSerializableTransaction(this.prisma, async (tx) => {
+    let result: Awaited<ReturnType<typeof this.runUpgradeTransaction>>;
+    try {
+      result = await this.runUpgradeTransaction(
+        userId,
+        level,
+        plan,
+        idempotencyKey,
+      );
+    } catch (error) {
+      // round 2 review：同键并发 —— 预检时首个请求还没提交，本请求进入事务
+      // 后在 CAS 抢占处输掉（LevelNotHigher）。此时若同键的成交记录已经落库，
+      // 语义上这是「重试」而不是「重复购买」，必须回放成功态而不是报错。
+      if (
+        idempotencyKey &&
+        error instanceof BadRequestException &&
+        this.errorCodeOf(error) === MembershipErrorCode.LevelNotHigher
+      ) {
+        const replay = await this.tryReplayIdempotentUpgrade(
+          userId,
+          level,
+          plan,
+          idempotencyKey,
+        );
+        if (replay) return replay;
+      }
+      throw error;
+    }
+    return this.finishUpgradeSideEffects(userId, level, plan, result);
+  }
+
+  /** 扣费+升级的可序列化事务体（从 upgrade 抽出，便于同键并发的回放复查）。 */
+  private runUpgradeTransaction(
+    userId: string,
+    level: number,
+    plan: MembershipPlanDto,
+    idempotencyKey?: string,
+  ) {
+    return runSerializableTransaction(this.prisma, async (tx) => {
       const currentUser = await tx.user.findUnique({
         where: { id: userId },
         select: { id: true, vipLevel: true },
@@ -170,7 +207,47 @@ export class MembershipService {
 
       return { user, wallet, plan };
     });
+  }
 
+  /** 幂等错误码提取（response 为对象时）。 */
+  private errorCodeOf(error: BadRequestException): string | undefined {
+    const response = error.getResponse();
+    return typeof response === 'object' && response !== null
+      ? (response as { errorCode?: string }).errorCode
+      : undefined;
+  }
+
+  /**
+   * 同键并发输家的回放复查（round 2 review）：CAS 输了之后同键成交记录已
+   * 存在且归属/参数吻合 → 按重试回放当前状态；不吻合/不存在 → null 由调用方
+   * 原样抛错。
+   */
+  private async tryReplayIdempotentUpgrade(
+    userId: string,
+    level: number,
+    plan: MembershipPlanDto,
+    idempotencyKey: string,
+  ): Promise<UpgradeMembershipResponseDto | null> {
+    const priorTx = await this.prisma.coinTransaction.findUnique({
+      where: { idempotencyKey },
+      select: { userID: true, type: true, amount: true, note: true },
+    });
+    const matches =
+      priorTx &&
+      priorTx.userID === userId &&
+      priorTx.type === 'PURCHASE' &&
+      priorTx.amount === -plan.price &&
+      priorTx.note === `兑换 VIP${level}`;
+    return matches ? this.currentStateResponse(userId, plan) : null;
+  }
+
+  /** 成交后的通知与广播（从 upgrade 抽出）。 */
+  private async finishUpgradeSideEffects(
+    userId: string,
+    level: number,
+    plan: MembershipPlanDto,
+    result: UpgradeMembershipResponseDto,
+  ): Promise<UpgradeMembershipResponseDto> {
     let notification = null;
     try {
       notification = await this.notificationService.createSystemNotification(

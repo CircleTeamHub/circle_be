@@ -29,7 +29,11 @@ describe('ModerationAdminService (PR #120 review fixes)', () => {
       },
       $transaction: jest.fn(async (callback: any) => callback(prisma)),
     };
-    const audit = { record: jest.fn().mockResolvedValue(undefined) };
+    const audit = {
+      record: jest.fn().mockResolvedValue(undefined),
+      // round 2：takedown/restore 的审计并入状态事务（recordStrict）
+      recordStrict: jest.fn().mockResolvedValue(undefined),
+    };
     const service = new ModerationAdminService(prisma as never, audit as never);
     return { prisma, audit, service };
   }

@@ -18,7 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
@@ -73,6 +73,9 @@ export class CoinController {
   }
 
   @Post('gift/card-sent')
+  // round 2 review：@Throttle 只是元数据，没有 ThrottlerGuard 就不生效
+  //（本应用有意不注册全局 ThrottlerGuard）。回执是会写库的端点，必须真限流。
+  @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   markGiftCardSent(
     @Headers('idempotency-key') idempotencyKey: string,

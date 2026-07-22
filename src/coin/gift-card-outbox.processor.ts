@@ -27,6 +27,12 @@ export class GiftCardOutboxProcessor {
 
   @Cron(CronExpression.EVERY_MINUTE)
   async compensate(now: Date = new Date()): Promise<number> {
+    // round 2 review：OpenIM 未配置时 sendTransferCardMessage 直接静默返回 ——
+    // 继续跑会把根本没发出去的卡标成已送达、永久压掉补偿。整个 cron 停摆，
+    // 待 OpenIM 配好后这些行仍在待补名单里。
+    if (!this.openim.isEnabled()) {
+      return 0;
+    }
     const gifts = await this.prisma.coinGift.findMany({
       where: {
         cardDeliveredAt: null,

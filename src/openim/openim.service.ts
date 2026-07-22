@@ -48,6 +48,11 @@ export class OpenimService implements OnModuleInit {
   private readonly adminSecret: string;
   private readonly enabled: boolean;
 
+  /** OpenIM 出站是否已配置可用（round 2 review：补偿 cron 用它做前置门禁）。 */
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   constructor(private config: ConfigService) {
     this.apiUrl = this.config.get<string>('OPENIM_API_URL') ?? '';
     this.adminSecret = this.config.get<string>('OPENIM_ADMIN_SECRET') ?? '';
