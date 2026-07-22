@@ -1,6 +1,7 @@
 import { GroupSyncOutboxProcessor } from './group-sync-outbox.processor';
 
 describe('GroupSyncOutboxProcessor', () => {
+  let transactionDepth: number;
   let prisma: {
     $transaction: jest.Mock;
     circle: { findFirst: jest.Mock; findUnique: jest.Mock };
@@ -8,6 +9,7 @@ describe('GroupSyncOutboxProcessor', () => {
     groupSyncOutbox: {
       findMany: jest.Mock;
       findUnique: jest.Mock;
+      createMany: jest.Mock;
       update: jest.Mock;
       updateMany: jest.Mock;
     };
@@ -20,8 +22,16 @@ describe('GroupSyncOutboxProcessor', () => {
   let processor: GroupSyncOutboxProcessor;
 
   beforeEach(() => {
+    transactionDepth = 0;
     prisma = {
-      $transaction: jest.fn(async (callback) => callback(prisma)),
+      $transaction: jest.fn(async (callback) => {
+        transactionDepth += 1;
+        try {
+          return await callback(prisma);
+        } finally {
+          transactionDepth -= 1;
+        }
+      }),
       circle: {
         findFirst: jest.fn().mockResolvedValue({ id: 'circle-1' }),
         findUnique: jest.fn().mockResolvedValue({ groupID: 'group-1' }),
@@ -31,6 +41,7 @@ describe('GroupSyncOutboxProcessor', () => {
       },
       groupSyncOutbox: {
         findMany: jest.fn(),
+        createMany: jest.fn(),
         findUnique: jest.fn().mockImplementation(({ where }) => ({
           id: where.id,
           status: 'PROCESSING',
@@ -63,16 +74,21 @@ describe('GroupSyncOutboxProcessor', () => {
       },
     ]);
     prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+    openim.addGroupMembers.mockImplementation(async () => {
+      expect(transactionDepth).toBe(0);
+    });
 
     await processor.processPending();
 
     expect(openim.addGroupMembers).toHaveBeenCalledWith('group-1', ['user-1']);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
     expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
       prisma.groupSyncOutbox.updateMany.mock.invocationCallOrder[0],
     );
     expect(prisma.groupSyncOutbox.updateMany).toHaveBeenCalledWith({
       where: {
         id: 'job-1',
+        operation: 'ADD_MEMBER',
         status: 'PENDING',
       },
       data: {
@@ -88,6 +104,90 @@ describe('GroupSyncOutboxProcessor', () => {
         lastError: null,
         lockedAt: null,
       },
+    });
+  });
+
+  it('requeues REMOVE when a blocked stale ADD lands after a leave', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'add-generation',
+        operation: 'ADD_MEMBER',
+        status: 'PENDING',
+        groupID: 'group-1',
+        userID: 'user-1',
+        attempts: 0,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+    openim.addGroupMembers.mockImplementation(async () => {
+      expect(transactionDepth).toBe(0);
+      prisma.groupSyncOutbox.findUnique.mockResolvedValue({
+        status: 'COMPLETED',
+        operation: 'ADD_MEMBER',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+    });
+
+    await processor.processPending();
+
+    expect(prisma.groupSyncOutbox.updateMany).toHaveBeenLastCalledWith({
+      where: {
+        groupID: 'group-1',
+        userID: { in: ['user-1'] },
+        status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
+      },
+      data: {
+        status: 'COMPLETED',
+        processedAt: expect.any(Date),
+        lockedAt: null,
+        lastError: 'Superseded by desired REMOVE_MEMBER state',
+      },
+    });
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'REMOVE_MEMBER',
+          groupID: 'group-1',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
+    });
+  });
+
+  it('requeues ADD when a blocked stale REMOVE lands after reactivation', async () => {
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([
+      {
+        id: 'remove-generation',
+        operation: 'REMOVE_MEMBER',
+        status: 'PENDING',
+        groupID: 'group-1',
+        userID: 'user-1',
+        attempts: 0,
+      },
+    ]);
+    prisma.groupSyncOutbox.updateMany.mockResolvedValue({ count: 1 });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+    openim.removeGroupMember.mockImplementation(async () => {
+      expect(transactionDepth).toBe(0);
+      prisma.groupSyncOutbox.findUnique.mockResolvedValue({
+        status: 'COMPLETED',
+        operation: 'REMOVE_MEMBER',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    });
+
+    await processor.processPending();
+
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'ADD_MEMBER',
+          groupID: 'group-1',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
     });
   });
 
@@ -245,14 +345,15 @@ describe('GroupSyncOutboxProcessor', () => {
       'user-1',
     ]);
     expect(openim.addGroupMembers).not.toHaveBeenCalled();
-    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
-      where: { id: 'job-stale-add' },
-      data: {
-        status: 'COMPLETED',
-        processedAt: expect.any(Date),
-        lastError: 'Superseded stale ADD_MEMBER job',
-        lockedAt: null,
-      },
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'REMOVE_MEMBER',
+          groupID: 'openim-group-1',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
     });
   });
 
@@ -272,14 +373,15 @@ describe('GroupSyncOutboxProcessor', () => {
     await processor.processPending();
 
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
-    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
-      where: { id: 'job-stale-remove' },
-      data: {
-        status: 'COMPLETED',
-        processedAt: expect.any(Date),
-        lastError: 'Superseded stale REMOVE_MEMBER job',
-        lockedAt: null,
-      },
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'ADD_MEMBER',
+          groupID: 'group-1',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
     });
   });
 
@@ -321,14 +423,15 @@ describe('GroupSyncOutboxProcessor', () => {
 
     expect(memberLock.lock).toHaveBeenCalled();
     expect(openim.addGroupMembers).not.toHaveBeenCalled();
-    expect(prisma.groupSyncOutbox.update).toHaveBeenCalledWith({
-      where: { id: 'job-old-group' },
-      data: {
-        status: 'COMPLETED',
-        processedAt: expect.any(Date),
-        lastError: 'Superseded stale ADD_MEMBER job',
-        lockedAt: null,
-      },
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'REMOVE_MEMBER',
+          groupID: 'old-group',
+          userID: 'user-1',
+        },
+      ],
+      skipDuplicates: true,
     });
   });
 });

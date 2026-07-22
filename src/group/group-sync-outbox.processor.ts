@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
-import { Prisma } from 'src/generated/prisma';
+import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
+import { GroupSyncOperation, Prisma } from 'src/generated/prisma';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
@@ -12,12 +13,18 @@ const GROUP_SYNC_MAX_BACKOFF_MS = 30 * 60 * 1000;
 
 type GroupSyncJob = {
   id: string;
-  operation: 'ADD_MEMBER' | 'REMOVE_MEMBER';
+  operation: GroupSyncOperation;
   status: 'PENDING' | 'PROCESSING' | 'FAILED';
   groupID: string;
   userID: string;
   attempts: number;
 };
+
+type CircleLookup = { id: string } | null;
+
+type ExternalResult =
+  | { outcome: 'SUCCEEDED'; idempotentMessage?: string }
+  | { outcome: 'FAILED'; message: string };
 
 @Injectable()
 export class GroupSyncOutboxProcessor {
@@ -51,21 +58,22 @@ export class GroupSyncOutboxProcessor {
   }
 
   private async processJob(job: GroupSyncJob): Promise<void> {
-    const circle = await this.prisma.circle.findFirst({
-      where: {
-        OR: [{ id: job.groupID }, { groupID: job.groupID }],
-      },
-      select: { id: true },
-    });
+    const claimed = await this.claimCurrentGeneration(job);
+    if (!claimed) return;
 
-    await runSerializableTransaction(this.prisma, async (tx) => {
-      if (circle) {
-        await this.memberLock.lock(tx, circle.id, [job.userID]);
-      }
+    // No transaction or advisory lock is held across this network boundary.
+    const result = await this.applyExternalEffect(job);
+    await this.finalizeOrReconcile(job, result);
+  }
 
+  private async claimCurrentGeneration(job: GroupSyncJob): Promise<boolean> {
+    const circle = await this.findCircle(job.groupID);
+    return runSerializableTransaction(this.prisma, async (tx) => {
+      await this.lockIfMapped(tx, circle, job);
       const claimed = await tx.groupSyncOutbox.updateMany({
         where: {
           id: job.id,
+          operation: job.operation,
           status: job.status,
         },
         data: {
@@ -73,82 +81,55 @@ export class GroupSyncOutboxProcessor {
           lockedAt: new Date(),
         },
       });
-      if (claimed.count === 0) return;
+      if (claimed.count === 0) return false;
 
-      const currentJob = await tx.groupSyncOutbox.findUnique({
+      const desiredOperation = await this.readDesiredOperation(tx, circle, job);
+      if (desiredOperation !== job.operation) {
+        await enqueueCircleMemberSync(tx, desiredOperation, job.groupID, [
+          job.userID,
+        ]);
+        return false;
+      }
+      return true;
+    });
+  }
+
+  private async finalizeOrReconcile(
+    job: GroupSyncJob,
+    result: ExternalResult,
+  ): Promise<void> {
+    const circle = await this.findCircle(job.groupID);
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.lockIfMapped(tx, circle, job);
+      const currentGeneration = await tx.groupSyncOutbox.findUnique({
         where: { id: job.id },
         select: { status: true },
       });
-      if (currentJob?.status !== 'PROCESSING') return;
+      const desiredOperation = await this.readDesiredOperation(tx, circle, job);
+      const isCurrentGeneration = currentGeneration?.status === 'PROCESSING';
 
-      const currentCircle = circle
-        ? await tx.circle.findUnique({
-            where: { id: circle.id },
-            select: { groupID: true },
-          })
-        : null;
-      const mappingMatches =
-        currentCircle !== null &&
-        (currentCircle.groupID ?? circle?.id) === job.groupID;
-      const membership = circle
-        ? await tx.circleMember.findUnique({
-            where: {
-              userID_circleID: {
-                userID: job.userID,
-                circleID: circle.id,
-              },
-            },
-            select: { status: true },
-          })
-        : null;
-      const isActive = mappingMatches && membership?.status === 'ACTIVE';
-      if (
-        (job.operation === 'ADD_MEMBER' && !isActive) ||
-        (job.operation === 'REMOVE_MEMBER' && isActive)
-      ) {
+      if (!isCurrentGeneration || desiredOperation !== job.operation) {
+        await enqueueCircleMemberSync(tx, desiredOperation, job.groupID, [
+          job.userID,
+        ]);
+        return;
+      }
+
+      if (result.outcome === 'SUCCEEDED') {
         await tx.groupSyncOutbox.update({
           where: { id: job.id },
           data: {
             status: 'COMPLETED',
             processedAt: new Date(),
-            lastError: `Superseded stale ${job.operation} job`,
+            lastError: null,
             lockedAt: null,
           },
         });
-        return;
-      }
-
-      await this.applyJob(tx, job);
-    });
-  }
-
-  private async applyJob(
-    tx: Prisma.TransactionClient,
-    job: GroupSyncJob,
-  ): Promise<void> {
-    try {
-      if (job.operation === 'ADD_MEMBER') {
-        await this.openimService.addGroupMembers(job.groupID, [job.userID]);
-      } else {
-        await this.openimService.removeGroupMember(job.groupID, job.userID);
-      }
-
-      await tx.groupSyncOutbox.update({
-        where: { id: job.id },
-        data: {
-          status: 'COMPLETED',
-          processedAt: new Date(),
-          lastError: null,
-          lockedAt: null,
-        },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (this.isIdempotentOpenimResult(job.operation, message)) {
-        await this.markCompleted(tx, job.id);
-        this.logger.warn(
-          `OpenIM group sync outbox ${job.id} treated as completed: ${message}`,
-        );
+        if (result.idempotentMessage) {
+          this.logger.warn(
+            `OpenIM group sync outbox ${job.id} treated as completed: ${result.idempotentMessage}`,
+          );
+        }
         return;
       }
 
@@ -157,29 +138,80 @@ export class GroupSyncOutboxProcessor {
         data: {
           status: 'FAILED',
           attempts: { increment: 1 },
-          lastError: message.slice(0, 1000),
+          lastError: result.message.slice(0, 1000),
           nextAttemptAt: this.nextRetryAt(job.attempts + 1),
           lockedAt: null,
         },
       });
       this.logger.warn(
-        `OpenIM group sync failed for outbox ${job.id}: ${message}`,
+        `OpenIM group sync failed for outbox ${job.id}: ${result.message}`,
       );
+    });
+  }
+
+  private async applyExternalEffect(
+    job: GroupSyncJob,
+  ): Promise<ExternalResult> {
+    try {
+      if (job.operation === 'ADD_MEMBER') {
+        await this.openimService.addGroupMembers(job.groupID, [job.userID]);
+      } else {
+        await this.openimService.removeGroupMember(job.groupID, job.userID);
+      }
+      return { outcome: 'SUCCEEDED' };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.isIdempotentOpenimResult(job.operation, message)) {
+        return { outcome: 'SUCCEEDED', idempotentMessage: message };
+      }
+      return { outcome: 'FAILED', message };
     }
   }
 
-  private async markCompleted(
+  private async readDesiredOperation(
     tx: Prisma.TransactionClient,
-    jobID: string,
-  ): Promise<void> {
-    await tx.groupSyncOutbox.update({
-      where: { id: jobID },
-      data: {
-        status: 'COMPLETED',
-        processedAt: new Date(),
-        lastError: null,
-        lockedAt: null,
+    circle: CircleLookup,
+    job: GroupSyncJob,
+  ): Promise<GroupSyncOperation> {
+    if (!circle) return 'REMOVE_MEMBER';
+
+    const currentCircle = await tx.circle.findUnique({
+      where: { id: circle.id },
+      select: { groupID: true },
+    });
+    const membership = await tx.circleMember.findUnique({
+      where: {
+        userID_circleID: {
+          userID: job.userID,
+          circleID: circle.id,
+        },
       },
+      select: { status: true },
+    });
+    const mappingMatches =
+      currentCircle !== null &&
+      (currentCircle.groupID ?? circle.id) === job.groupID;
+    return mappingMatches && membership?.status === 'ACTIVE'
+      ? 'ADD_MEMBER'
+      : 'REMOVE_MEMBER';
+  }
+
+  private async lockIfMapped(
+    tx: Prisma.TransactionClient,
+    circle: CircleLookup,
+    job: GroupSyncJob,
+  ): Promise<void> {
+    if (circle) {
+      await this.memberLock.lock(tx, circle.id, [job.userID]);
+    }
+  }
+
+  private findCircle(groupID: string): Promise<CircleLookup> {
+    return this.prisma.circle.findFirst({
+      where: {
+        OR: [{ id: groupID }, { groupID }],
+      },
+      select: { id: true },
     });
   }
 
@@ -192,7 +224,7 @@ export class GroupSyncOutboxProcessor {
   }
 
   private isIdempotentOpenimResult(
-    operation: GroupSyncJob['operation'],
+    operation: GroupSyncOperation,
     message: string,
   ): boolean {
     const normalized = message.toLowerCase();

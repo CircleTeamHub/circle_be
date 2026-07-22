@@ -18,7 +18,6 @@ export async function enqueueCircleMemberSync(
     where: {
       groupID,
       userID: { in: userIDs },
-      operation: { not: operation },
       status: { in: [...OPEN_GROUP_SYNC_STATUSES] },
     },
     data: {

@@ -10,7 +10,7 @@ describe('enqueueCircleMemberSync', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
-  it('supersedes opposite open jobs before queueing the latest desired state', async () => {
+  it('supersedes every open generation before queueing a fresh desired state', async () => {
     await enqueueCircleMemberSync(tx as any, 'REMOVE_MEMBER', 'group-1', [
       'user-b',
       'user-a',
@@ -21,7 +21,6 @@ describe('enqueueCircleMemberSync', () => {
       where: {
         groupID: 'group-1',
         userID: { in: ['user-a', 'user-b'] },
-        operation: { not: 'REMOVE_MEMBER' },
         status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
       },
       data: {
@@ -39,6 +38,22 @@ describe('enqueueCircleMemberSync', () => {
         { operation: 'REMOVE_MEMBER', groupID: 'group-1', userID: 'user-a' },
         { operation: 'REMOVE_MEMBER', groupID: 'group-1', userID: 'user-b' },
       ],
+      skipDuplicates: true,
+    });
+  });
+
+  it('creates a fresh generation even when the open operation already matches', async () => {
+    await enqueueCircleMemberSync(tx as any, 'ADD_MEMBER', 'group-1', [
+      'user-1',
+    ]);
+
+    expect(tx.groupSyncOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.not.objectContaining({ operation: expect.anything() }),
+      }),
+    );
+    expect(tx.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [{ operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'user-1' }],
       skipDuplicates: true,
     });
   });

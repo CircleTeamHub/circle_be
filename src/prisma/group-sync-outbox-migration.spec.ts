@@ -9,6 +9,17 @@ const migrationPath = join(
 describe('group sync desired-state migration', () => {
   const sql = readFileSync(migrationPath, 'utf8');
 
+  it('rolls back dedupe, probes, and index replacement on validation failure', () => {
+    expect(sql.trimStart().startsWith('BEGIN;')).toBe(true);
+    expect(sql.trimEnd().endsWith('COMMIT;')).toBe(true);
+    expect(sql.indexOf('BEGIN;')).toBeLessThan(
+      sql.indexOf('WITH ranked_open_jobs'),
+    );
+    expect(sql.lastIndexOf('COMMIT;')).toBeGreaterThan(
+      sql.lastIndexOf('DROP INDEX'),
+    );
+  });
+
   it('deduplicates open jobs by group and user, keeping the latest intent', () => {
     expect(sql).toContain('PARTITION BY "groupID", "userID"');
     expect(sql).toContain('ORDER BY "createdAt" DESC, "id" DESC');

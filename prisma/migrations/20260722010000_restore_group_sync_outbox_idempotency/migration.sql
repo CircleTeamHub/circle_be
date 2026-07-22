@@ -1,3 +1,5 @@
+BEGIN;
+
 -- Keep only the newest open desired state for each OpenIM group member.
 WITH ranked_open_jobs AS (
   SELECT
@@ -163,3 +165,5 @@ $$;
 
 DROP INDEX "__GroupSyncOutbox_desired_probe_20260722010000";
 DROP INDEX "__GroupSyncOutbox_legacy_probe_20260722010000";
+
+COMMIT;

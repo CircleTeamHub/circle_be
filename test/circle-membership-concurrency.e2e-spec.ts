@@ -516,4 +516,152 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       }),
     ).resolves.toEqual({ status: CircleMemberStatus.ACTIVE });
   });
+
+  it('reconciles REMOVE after a blocked stale ADD resolves last', async () => {
+    await prisma.groupSyncOutbox.deleteMany({});
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+
+    let releaseAdd!: () => void;
+    const addMayFinish = new Promise<void>((resolve) => {
+      releaseAdd = resolve;
+    });
+    let markAddStarted!: () => void;
+    const addStarted = new Promise<void>((resolve) => {
+      markAddStarted = resolve;
+    });
+    let openimHasMember = false;
+    jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockImplementation(async (groupID, userIDs) => {
+        if (groupID === circle.id && userIDs.includes(candidate.id)) {
+          markAddStarted();
+          await addMayFinish;
+          openimHasMember = true;
+        }
+      });
+    const removeSpy = jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockImplementation(async (groupID, userID) => {
+        if (groupID === circle.id && userID === candidate.id) {
+          openimHasMember = false;
+        }
+      });
+
+    const staleAdd = outboxProcessor.processPending();
+    await addStarted;
+    const removing = groupService.removeGroupMember(
+      admin!.id,
+      circle.id,
+      candidate.id,
+    );
+    const removedWithoutNetwork = await Promise.race([
+      removing.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    if (!removedWithoutNetwork) releaseAdd();
+    expect(removedWithoutNetwork).toBe(true);
+
+    await outboxProcessor.processPending();
+    releaseAdd();
+    await staleAdd;
+    expect(openimHasMember).toBe(true);
+
+    await outboxProcessor.processPending();
+
+    expect(openimHasMember).toBe(false);
+    expect(
+      removeSpy.mock.calls.filter(
+        ([groupID, userID]) => groupID === circle.id && userID === candidate.id,
+      ),
+    ).toHaveLength(2);
+    await expect(
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('reconciles ADD after a blocked stale REMOVE resolves last', async () => {
+    await prisma.groupSyncOutbox.deleteMany({});
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.removeGroupMember(admin!.id, circle.id, candidate.id);
+
+    let releaseRemove!: () => void;
+    const removeMayFinish = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    let markRemoveStarted!: () => void;
+    const removeStarted = new Promise<void>((resolve) => {
+      markRemoveStarted = resolve;
+    });
+    let openimHasMember = true;
+    jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockImplementation(async (groupID, userID) => {
+        if (groupID === circle.id && userID === candidate.id) {
+          markRemoveStarted();
+          await removeMayFinish;
+          openimHasMember = false;
+        }
+      });
+    const addSpy = jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockImplementation(async (groupID, userIDs) => {
+        if (groupID === circle.id && userIDs.includes(candidate.id)) {
+          openimHasMember = true;
+        }
+      });
+
+    const staleRemove = outboxProcessor.processPending();
+    await removeStarted;
+    const reactivating = groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+    const reactivatedWithoutNetwork = await Promise.race([
+      reactivating.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    if (!reactivatedWithoutNetwork) releaseRemove();
+    expect(reactivatedWithoutNetwork).toBe(true);
+
+    await outboxProcessor.processPending();
+    releaseRemove();
+    await staleRemove;
+    expect(openimHasMember).toBe(false);
+
+    await outboxProcessor.processPending();
+
+    expect(openimHasMember).toBe(true);
+    expect(
+      addSpy.mock.calls.filter(
+        ([groupID, userIDs]) =>
+          groupID === circle.id && userIDs.includes(candidate.id),
+      ),
+    ).toHaveLength(2);
+    await expect(
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+        select: { status: true },
+      }),
+    ).resolves.toEqual({ status: CircleMemberStatus.ACTIVE });
+  });
 });

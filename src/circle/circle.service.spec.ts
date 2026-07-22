@@ -361,7 +361,6 @@ describe('CircleService', () => {
       where: {
         groupID: 'group-1',
         userID: { in: ['user-1'] },
-        operation: { not: 'REMOVE_MEMBER' },
         status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
       },
       data: {
