@@ -29,6 +29,9 @@ import { LiveKitCallService } from './livekit.service';
 const GROUP_SESSION_TYPE = 3;
 // OpenIM 单聊 sessionType。toCallDto 一直会把非 GROUP 映射成 'single'（此前是死分支）。
 const SINGLE_SESSION_TYPE = 1;
+// 通话留痕消息发送的有界重试（review：瞬断不该永久丢历史）
+const CALL_RECORD_SEND_ATTEMPTS = 3;
+const CALL_RECORD_RETRY_DELAY_MS = 1_000;
 
 type UserLite = {
   id: string;
@@ -145,6 +148,10 @@ export class CallService {
     await this.assertDirectCallee(initiatorID, calleeID);
 
     const participantIDs = [initiatorID, calleeID];
+    // review 修复：锁内复检 —— 预检通过后、callSession.create 之前，被叫可能
+    // 已拉黑/删除发起方；不复检会给已拉黑用户推送邀请。见 startCall.revalidate。
+    const revalidate = (tx: Prisma.TransactionClient) =>
+      this.assertDirectCallee(initiatorID, calleeID, tx);
     const users = await this.loadActiveUsers(participantIDs);
     // 会话 id 用 OpenIM 单聊规约（si_ + 双方 IM id 升序），与客户端会话一致，
     // 通话留痕消息（#115）正好落进同一个会话。
@@ -160,6 +167,7 @@ export class CallService {
       inviteeIDs: [calleeID],
       users,
       idempotencyKey,
+      revalidate,
     });
   }
 
@@ -171,7 +179,13 @@ export class CallService {
   async getCurrentCall(userID: string) {
     const call = (await this.prisma.callSession.findFirst({
       where: {
-        status: { in: [CallStatus.RINGING, CallStatus.ACTIVE] },
+        // review 修复：RINGING 必须未过振铃窗口 —— 每分钟一次的清扫器还没
+        // 扫到时，重连客户端不该被告知仍在一个实际已超时的通话里。
+        OR: [
+          { status: CallStatus.ACTIVE },
+          { status: CallStatus.RINGING, expiresAt: null },
+          { status: CallStatus.RINGING, expiresAt: { gt: new Date() } },
+        ],
         participants: {
           some: {
             userID,
@@ -204,6 +218,8 @@ export class CallService {
     inviteeIDs: string[];
     users: Map<string, UserLite>;
     idempotencyKey?: string;
+    /** 参与者锁内、create 之前的最终授权复检（如 1:1 的好友/拉黑）。 */
+    revalidate?: (tx: Prisma.TransactionClient) => Promise<void>;
   }) {
     const {
       initiatorID,
@@ -213,6 +229,7 @@ export class CallService {
       inviteeIDs,
       users,
       idempotencyKey,
+      revalidate,
     } = params;
     const participantIDs = [initiatorID, ...inviteeIDs];
     await this.expireStaleRingingCallsForUsers(participantIDs);
@@ -249,6 +266,7 @@ export class CallService {
         async (tx) => {
           await this.lockParticipantsForCall(participantIDs, tx);
           await this.assertNotBusy(participantIDs, tx);
+          if (revalidate) await revalidate(tx);
           return tx.callSession.create({
             data: {
               id: callId,
@@ -465,6 +483,18 @@ export class CallService {
       include: { user: { select: userLiteSelect } },
     });
 
+    const callRow = participant.call as CallWithParticipants;
+    // review 修复：1:1 已接通的通话里任一方挂断即整场结束 —— 群语义
+    // （joinedCount===0 才终局）会让另一方一直挂在 ACTIVE 会话里、LiveKit
+    // 房间不删、终局事件与留痕迟迟不发。
+    // 显式等于 SINGLE 才走 1:1 分支：include 没带 sessionType 的旧路径 /
+    // 群会话都落回群语义（joinedCount===0 终局），行为不回归。
+    const isSingle = callRow.sessionType === SINGLE_SESSION_TYPE;
+    if (isSingle && callRow.status === CallStatus.ACTIVE) {
+      await this.endSingleCallOnFirstLeave(callRow, userID, leftAt);
+      return;
+    }
+
     const joinedCount = await this.prisma.callParticipant.count({
       where: {
         callID: callId,
@@ -515,6 +545,50 @@ export class CallService {
     this.emitCallRecordMessage(ended, CallEndReason.ALL_LEFT, leftAt);
   }
 
+  /**
+   * 1:1 首离终局（review 修复）：CAS 抢转换权 —— 双方几乎同时挂断时只有
+   * 一个请求完成 ENDED 转换并发留痕，避免重复历史行；输家静默返回。
+   */
+  private async endSingleCallOnFirstLeave(
+    call: CallWithParticipants,
+    leaverID: string,
+    leftAt: Date,
+  ): Promise<void> {
+    const transition = await this.prisma.callSession.updateMany({
+      where: { id: call.id, status: CallStatus.ACTIVE },
+      data: {
+        status: CallStatus.ENDED,
+        endReason: CallEndReason.ALL_LEFT,
+        endedAt: leftAt,
+        endedByID: leaverID,
+      },
+    });
+    if (transition.count === 0) {
+      return;
+    }
+    await this.prisma.callParticipant.updateMany({
+      where: { callID: call.id, status: CallParticipantStatus.JOINED },
+      data: { status: CallParticipantStatus.LEFT, leftAt },
+    });
+
+    if (call.livekitRoomName) {
+      await this.livekit.deleteRoom(call.livekitRoomName);
+    }
+    await this.broadcastToCallParticipants(call, (targetID) =>
+      this.realtime.broadcastCallEnded(targetID, {
+        callId: call.id,
+        status: CallStatus.ENDED,
+        endReason: CallEndReason.ALL_LEFT,
+        endedAt: leftAt.toISOString(),
+        changedAt: leftAt.toISOString(),
+      }),
+    );
+    this.logger.log(
+      `call.ended callId=${call.id} reason=${CallEndReason.ALL_LEFT} (single first-leave)`,
+    );
+    this.emitCallRecordMessage(call, CallEndReason.ALL_LEFT, leftAt);
+  }
+
   async cancelCall(userID: string, callId: string) {
     const call = (await this.prisma.callSession.findUnique({
       where: { id: callId },
@@ -543,6 +617,31 @@ export class CallService {
     }
 
     const endedAt = new Date();
+    // review 修复：状态转换必须是条件写（CAS）——两个并发 cancel 都能读到
+    // RINGING，无条件 update 会让两边都走到留痕发送，写出重复的持久历史行。
+    // updateMany 只让一个请求赢；输家按幂等语义返回已取消的会话。
+    const transition = await this.prisma.callSession.updateMany({
+      where: { id: callId, status: CallStatus.RINGING },
+      data: {
+        status: CallStatus.CANCELED,
+        endReason: CallEndReason.CANCELED,
+        endedAt,
+        endedByID: userID,
+      },
+    });
+    if (transition.count === 0) {
+      const latest = (await this.prisma.callSession.findUnique({
+        where: { id: callId },
+        include: this.callInclude(),
+      })) as CallWithParticipants | null;
+      if (latest?.status === CallStatus.CANCELED) {
+        return this.toCallDto(latest);
+      }
+      throw new ConflictException({
+        message: 'CALL_ALREADY_ACTIVE',
+        errorCode: CallErrorCode.AlreadyActive,
+      });
+    }
     await this.prisma.callParticipant.updateMany({
       where: {
         callID: callId,
@@ -553,14 +652,8 @@ export class CallService {
         missedAt: endedAt,
       },
     });
-    const canceled = (await this.prisma.callSession.update({
+    const canceled = (await this.prisma.callSession.findUnique({
       where: { id: callId },
-      data: {
-        status: CallStatus.CANCELED,
-        endReason: CallEndReason.CANCELED,
-        endedAt,
-        endedByID: userID,
-      },
       include: this.callInclude(),
     })) as CallWithParticipants;
 
@@ -759,9 +852,10 @@ export class CallService {
   private async assertDirectCallee(
     initiatorID: string,
     calleeID: string,
+    db: Pick<PrismaService, 'friend' | 'block'> = this.prisma,
   ): Promise<void> {
     const [friendship, block] = await Promise.all([
-      this.prisma.friend.findFirst({
+      db.friend.findFirst({
         where: {
           state: FriendState.ACCEPTED,
           OR: [
@@ -771,7 +865,7 @@ export class CallService {
         },
         select: { id: true },
       }),
-      this.prisma.block.findFirst({
+      db.block.findFirst({
         where: {
           OR: [
             { blockerID: calleeID, blockedID: initiatorID },
@@ -866,7 +960,11 @@ export class CallService {
       return;
     }
 
-    await this.expireRingingCallAsMissed(call, changedAt);
+    // review 修复：这里只会由「最后一个被叫方主动拒接」触达 —— 给刚拒接的
+    // 人再推「未接来电」既错误也扰人。终局仍记 NO_ANSWER，但压掉离线推送。
+    await this.expireRingingCallAsMissed(call, changedAt, {
+      suppressOfflinePush: true,
+    });
   }
 
   private async loadActiveUsers(
@@ -936,6 +1034,7 @@ export class CallService {
   private async expireRingingCallAsMissed(
     call: CallWithParticipants,
     changedAt: Date,
+    options: { suppressOfflinePush?: boolean } = {},
   ): Promise<void> {
     const result = await this.prisma.callSession.updateMany({
       where: { id: call.id, status: CallStatus.RINGING },
@@ -976,7 +1075,9 @@ export class CallService {
     this.logger.log(
       `call.missed callId=${call.id} reason=${CallEndReason.NO_ANSWER}`,
     );
-    this.emitCallRecordMessage(call, CallEndReason.NO_ANSWER, changedAt);
+    this.emitCallRecordMessage(call, CallEndReason.NO_ANSWER, changedAt, {
+      suppressOfflinePush: options.suppressOfflinePush,
+    });
   }
 
   private async failRingingCallAsError(
@@ -1069,6 +1170,7 @@ export class CallService {
     call: CallWithParticipants,
     endReason: CallEndReason,
     endedAt: Date,
+    options: { suppressOfflinePush?: boolean } = {},
   ): void {
     void (async () => {
       const initiator =
@@ -1101,7 +1203,7 @@ export class CallService {
         };
       }
 
-      await this.openimService.sendCallRecordMessage({
+      const message = {
         sendID: call.initiatorID,
         senderNickname: initiator?.nickname,
         senderFaceURL: initiator?.avatarUrl ?? null,
@@ -1118,7 +1220,7 @@ export class CallService {
           initiatorID: call.initiatorID,
         },
         offlinePush:
-          endReason === CallEndReason.NO_ANSWER
+          endReason === CallEndReason.NO_ANSWER && !options.suppressOfflinePush
             ? {
                 title: initiator?.nickname ?? 'Circle',
                 desc:
@@ -1127,10 +1229,29 @@ export class CallService {
                     : '语音通话未接听',
               }
             : null,
-      });
+      };
+      // review 修复：一次瞬断（admin token 轮换 / 连接抖动）就永久丢一条
+      // 通话历史太脆 —— 带退避重试 3 次。仍是 fire-and-forget（teardown 的
+      // 广播/删房在此之前已完成），不打断通话收尾。
+      for (let attempt = 1; attempt <= CALL_RECORD_SEND_ATTEMPTS; attempt++) {
+        try {
+          await this.openimService.sendCallRecordMessage(message);
+          return;
+        } catch (error) {
+          if (attempt === CALL_RECORD_SEND_ATTEMPTS) throw error;
+          this.logger.warn(
+            `call record send attempt ${attempt} failed callId=${call.id}, retrying`,
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, CALL_RECORD_RETRY_DELAY_MS * attempt),
+          );
+        }
+      }
     })().catch((error) => {
-      this.logger.warn(
-        `call record message failed callId=${call.id}: ${
+      // error 级：重试打光仍失败，这条通话在会话里没有留痕，需人工按
+      // callId/endReason 补录（数据在 CallSession 表里都在）。
+      this.logger.error(
+        `call record message failed permanently callId=${call.id} reason=${endReason}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
