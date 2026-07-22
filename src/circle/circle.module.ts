@@ -6,6 +6,7 @@ import { MembershipPolicyModule } from 'src/membership/membership-policy.module'
 import { CircleController } from './circle.controller';
 import { CircleService } from './circle.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CircleMemberLockService } from './circle-member-lock';
 
 @Module({
   imports: [
@@ -15,7 +16,7 @@ import { CircleAdmissionPolicy } from './circle-admission-policy';
     MembershipPolicyModule,
   ],
   controllers: [CircleController],
-  providers: [CircleService, CircleAdmissionPolicy],
+  providers: [CircleService, CircleAdmissionPolicy, CircleMemberLockService],
   exports: [CircleService],
 })
 export class CircleModule {}

@@ -5,6 +5,7 @@ import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { NotificationModule } from 'src/notification/notification.module';
 import { MembershipPolicyModule } from 'src/membership/membership-policy.module';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleInvitationController } from './circle-invitation.controller';
 import { CircleInvitationService } from './circle-invitation.service';
 
@@ -17,7 +18,11 @@ import { CircleInvitationService } from './circle-invitation.service';
     MembershipPolicyModule,
   ],
   controllers: [CircleInvitationController],
-  providers: [CircleInvitationService, CircleAdmissionPolicy],
+  providers: [
+    CircleInvitationService,
+    CircleAdmissionPolicy,
+    CircleMemberLockService,
+  ],
   exports: [CircleInvitationService],
 })
 export class CircleInvitationModule {}

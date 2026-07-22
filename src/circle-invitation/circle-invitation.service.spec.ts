@@ -6,6 +6,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -68,9 +69,9 @@ describe('CircleInvitationService', () => {
   };
   const admissionPolicy = {
     assertCanApply: jest.fn(),
-    lockCandidateUsers: jest.fn(),
     activateMembers: jest.fn(),
   };
+  const memberLock = { lock: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -78,7 +79,6 @@ describe('CircleInvitationService', () => {
     privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
     notificationService.createCircleInvitationNotification.mockReset();
     admissionPolicy.assertCanApply.mockResolvedValue(undefined);
-    admissionPolicy.lockCandidateUsers.mockResolvedValue(undefined);
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
 
     const module: TestingModule = await Test.createTestingModule({
@@ -90,6 +90,7 @@ describe('CircleInvitationService', () => {
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: NotificationService, useValue: notificationService },
         { provide: CircleAdmissionPolicy, useValue: admissionPolicy },
+        { provide: CircleMemberLockService, useValue: memberLock },
       ],
     }).compile();
 
@@ -498,17 +499,14 @@ describe('CircleInvitationService', () => {
 
     await service.respond('verifier-1', 'inv-1', true);
 
-    expect(admissionPolicy.lockCandidateUsers).toHaveBeenCalledWith(prisma, [
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
       'applicant-1',
     ]);
-    expect(
-      admissionPolicy.lockCandidateUsers.mock.invocationCallOrder[0],
-    ).toBeLessThan(prisma.$executeRaw.mock.invocationCallOrder[0]);
     expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
       prisma,
       'circle-1',
       ['applicant-1'],
-      { userLocksHeld: true },
+      { locksHeld: true },
     );
   });
 
@@ -529,14 +527,14 @@ describe('CircleInvitationService', () => {
 
     await service.adminApprove('admin-1', 'inv-1');
 
-    expect(admissionPolicy.lockCandidateUsers).toHaveBeenCalledWith(prisma, [
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
       'applicant-1',
     ]);
     expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
       prisma,
       'circle-1',
       ['applicant-1'],
-      { userLocksHeld: true },
+      { locksHeld: true },
     );
   });
 
@@ -562,7 +560,7 @@ describe('CircleInvitationService', () => {
       prisma,
       'circle-1',
       ['applicant-1'],
-      { userLocksHeld: true },
+      { locksHeld: true },
     );
   });
 

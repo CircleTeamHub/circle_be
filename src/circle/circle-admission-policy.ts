@@ -15,11 +15,11 @@ import {
 } from 'src/common/app-error-codes';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipLevel } from 'src/membership/membership.catalog';
-import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import { reserveCircleSeats } from './circle-capacity';
+import { CircleMemberLockService } from './circle-member-lock';
 
 type AdmissionOptions = {
-  userLocksHeld?: boolean;
+  locksHeld?: boolean;
 };
 
 const CIRCLE_ADMISSION_SELECT = {
@@ -34,14 +34,10 @@ const CIRCLE_ADMISSION_SELECT = {
 
 @Injectable()
 export class CircleAdmissionPolicy {
-  constructor(private readonly membershipPolicy: MembershipPolicyService) {}
-
-  async lockCandidateUsers(
-    tx: Prisma.TransactionClient,
-    userIDs: readonly string[],
-  ): Promise<void> {
-    await this.membershipPolicy.lockUsers(tx, userIDs);
-  }
+  constructor(
+    private readonly membershipPolicy: MembershipPolicyService,
+    private readonly memberLock: CircleMemberLockService,
+  ) {}
 
   async activateMembers(
     tx: Prisma.TransactionClient,
@@ -54,10 +50,9 @@ export class CircleAdmissionPolicy {
 
     // Global user locks always precede pair and circle locks. This serializes a
     // user's admissions across different circles without creating lock cycles.
-    if (!options.userLocksHeld) {
-      await this.lockCandidateUsers(tx, userIDs);
+    if (!options.locksHeld) {
+      await this.memberLock.lock(tx, circleID, userIDs);
     }
-    await this.lockCirclePairs(tx, circleID, userIDs);
 
     const memberships = await tx.circleMember.findMany({
       where: { circleID, userID: { in: userIDs } },
@@ -225,22 +220,6 @@ export class CircleAdmissionPolicy {
       });
     }
     return requested;
-  }
-
-  private async lockCirclePairs(
-    tx: Prisma.TransactionClient,
-    circleID: string,
-    userIDs: readonly string[],
-  ): Promise<void> {
-    const keys = userIDs.map((userID) =>
-      circleApplicationLockKey(circleID, userID),
-    );
-    await tx.$executeRaw(
-      Prisma.sql`
-        SELECT pg_advisory_xact_lock(hashtextextended(keys.lock_key, 0))
-        FROM unnest(ARRAY[${Prisma.join(keys)}]::text[]) AS keys(lock_key)
-      `,
-    );
   }
 
   private assertRestrictions(

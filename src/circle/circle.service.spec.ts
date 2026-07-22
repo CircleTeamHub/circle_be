@@ -8,6 +8,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CircleMemberLockService } from './circle-member-lock';
 import {
   CreateCircleDto,
   SetCircleAvatarDto,
@@ -63,6 +64,13 @@ describe('CircleService', () => {
   const circleInvitationService = {
     getInvitationForViewer: jest.fn(),
   };
+  const memberLock = { lock: jest.fn() };
+  const directMembershipPolicy = new MembershipPolicyService(prisma as any);
+  const directMemberLock = new CircleMemberLockService(directMembershipPolicy);
+  const directAdmissionPolicy = new CircleAdmissionPolicy(
+    directMembershipPolicy,
+    directMemberLock,
+  );
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -76,6 +84,7 @@ describe('CircleService', () => {
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         MembershipPolicyService,
         CircleAdmissionPolicy,
+        { provide: CircleMemberLockService, useValue: memberLock },
       ],
     }).compile();
 
@@ -271,21 +280,22 @@ describe('CircleService', () => {
   });
 
   it('uses the locked membership state when approval races with leave', async () => {
-    prisma.circleMember.findUnique
-      .mockResolvedValueOnce({
-        id: 'member-1',
-        role: 'MEMBER',
-        status: 'PENDING',
-      })
-      .mockResolvedValueOnce({
-        id: 'member-1',
-        role: 'MEMBER',
-        status: 'ACTIVE',
-      });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: 'MEMBER',
+      status: 'ACTIVE',
+    });
     prisma.circle.findUnique.mockResolvedValue({ groupID: null });
 
     await service.leaveCircle('user-1', 'circle-1');
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
@@ -301,8 +311,9 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
-      new MembershipPolicyService(prisma as any),
-      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
+      directMembershipPolicy,
+      directAdmissionPolicy,
+      directMemberLock,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -568,8 +579,9 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
-      new MembershipPolicyService(prisma as any),
-      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
+      directMembershipPolicy,
+      directAdmissionPolicy,
+      directMemberLock,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -597,8 +609,9 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
-      new MembershipPolicyService(prisma as any),
-      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
+      directMembershipPolicy,
+      directAdmissionPolicy,
+      directMemberLock,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -630,8 +643,9 @@ describe('CircleService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
-      new MembershipPolicyService(prisma as any),
-      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
+      directMembershipPolicy,
+      directAdmissionPolicy,
+      directMemberLock,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',

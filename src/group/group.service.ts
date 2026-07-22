@@ -17,6 +17,7 @@ import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { reserveCircleSeats } from 'src/circle/circle-capacity';
 import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -47,6 +48,7 @@ export class GroupService {
     private readonly openimService: OpenimService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
+    private readonly memberLock: CircleMemberLockService,
   ) {}
 
   async inviteGroupMembers(
@@ -147,49 +149,40 @@ export class GroupService {
       });
     }
 
-    const actor = await this.getCircleMember(circle.id, actorId);
-    const target = await this.getCircleMember(
-      circle.id,
-      normalizedTargetUserID,
-    );
-    this.assertCanManageCircleGroup(actor, target);
-
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
-    if (!target) {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.conversationGroupMembership.deleteMany({
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circle.id, [normalizedTargetUserID]);
+      const [actor, target] = await Promise.all([
+        tx.circleMember.findUnique({
           where: {
-            conversationID: {
-              in: this.groupConversationIDCandidates(normalizedGroupID),
-            },
-            group: { ownerID: normalizedTargetUserID },
+            userID_circleID: { userID: actorId, circleID: circle.id },
           },
-        });
-        await tx.groupSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'REMOVE_MEMBER',
-              groupID: openimGroupID,
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
               userID: normalizedTargetUserID,
+              circleID: circle.id,
             },
-          ],
-          skipDuplicates: true,
-        });
-      });
-      return { handled: true };
-    }
+          },
+          select: { id: true, role: true, status: true },
+        }),
+      ]);
+      this.assertCanManageCircleGroup(actor, target);
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.userDisplayIcon.deleteMany({
-        where: { userID: normalizedTargetUserID, circleID: circle.id },
-      });
-      await tx.circleMember.delete({ where: { id: target.id } });
-
-      if (target.status === CircleMemberStatus.ACTIVE) {
-        await tx.circle.update({
-          where: { id: circle.id },
-          data: { memberCount: { decrement: 1 } },
+      if (target) {
+        await tx.userDisplayIcon.deleteMany({
+          where: { userID: normalizedTargetUserID, circleID: circle.id },
         });
+        await tx.circleMember.delete({ where: { id: target.id } });
+
+        if (target.status === CircleMemberStatus.ACTIVE) {
+          await tx.circle.update({
+            where: { id: circle.id },
+            data: { memberCount: { decrement: 1 } },
+          });
+        }
       }
 
       await tx.conversationGroupMembership.deleteMany({
@@ -233,24 +226,25 @@ export class GroupService {
       select: { id: true, groupID: true, ownerID: true },
     });
 
-    const membership = circle
-      ? await this.prisma.circleMember.findUnique({
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      let membership: CircleGroupMemberLookup | null = null;
+      if (circle) {
+        await this.memberLock.lock(tx, circle.id, [userId]);
+        membership = await tx.circleMember.findUnique({
           where: { userID_circleID: { userID: userId, circleID: circle.id } },
           select: { id: true, role: true, status: true },
-        })
-      : null;
+        });
+        if (
+          circle.ownerID === userId ||
+          membership?.role === CircleMemberRole.OWNER
+        ) {
+          throw new ForbiddenException({
+            message: 'Owner cannot leave — transfer ownership first',
+            errorCode: GroupErrorCode.OwnerCannotLeave,
+          });
+        }
+      }
 
-    if (
-      circle &&
-      (circle.ownerID === userId || membership?.role === CircleMemberRole.OWNER)
-    ) {
-      throw new ForbiddenException({
-        message: 'Owner cannot leave — transfer ownership first',
-        errorCode: GroupErrorCode.OwnerCannotLeave,
-      });
-    }
-
-    await this.prisma.$transaction(async (tx) => {
       await tx.conversationGroupMembership.deleteMany({
         where: {
           conversationID: { in: conversationIDs },

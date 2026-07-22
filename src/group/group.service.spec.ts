@@ -48,6 +48,7 @@ describe('GroupService reportGroup', () => {
   let admissionPolicy: {
     activateMembers: jest.Mock;
   };
+  let memberLock: { lock: jest.Mock };
   let service: GroupService;
 
   beforeEach(() => {
@@ -91,11 +92,13 @@ describe('GroupService reportGroup', () => {
     admissionPolicy = {
       activateMembers: jest.fn(async (_tx, _circleID, userIDs) => userIDs),
     };
+    memberLock = { lock: jest.fn() };
     service = new GroupService(
       prisma as any,
       openim as any,
       privacySettings as any,
       admissionPolicy as any,
+      memberLock as any,
     );
   });
 
@@ -323,6 +326,13 @@ describe('GroupService reportGroup', () => {
 
     await service.leaveGroup('user-1', 'group-1');
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'user-1', circleID: 'circle-1' },
     });
@@ -357,7 +367,11 @@ describe('GroupService reportGroup', () => {
       ForbiddenException,
     );
 
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
+    expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
   it('passes group leave through the controller with the current user', async () => {
@@ -688,6 +702,13 @@ describe('GroupService reportGroup', () => {
       service.removeGroupMember('admin-1', 'group-1', 'target-user'),
     ).resolves.toEqual({ handled: true });
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'target-user',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(2);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'target-user', circleID: 'circle-1' },
     });
@@ -740,7 +761,11 @@ describe('GroupService reportGroup', () => {
     ).rejects.toThrow(ForbiddenException);
 
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'target-user',
+    ]);
+    expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
   it('still removes an OpenIM member when local circle membership is already missing', async () => {

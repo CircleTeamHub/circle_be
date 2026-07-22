@@ -14,13 +14,13 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
-import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   prismaErrorCode,
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CircleMemberLockService } from './circle-member-lock';
 import {
   CircleDetailDto,
   CircleDto,
@@ -49,6 +49,7 @@ export class CircleService {
     private readonly config: ConfigService,
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
+    private readonly memberLock: CircleMemberLockService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -127,6 +128,7 @@ export class CircleService {
         },
       });
 
+      await this.memberLock.lock(tx, created.id, [userId]);
       await tx.circleMember.create({
         data: {
           userID: userId,
@@ -290,8 +292,7 @@ export class CircleService {
       invitationId = await runSerializableTransaction(
         this.prisma,
         async (tx) => {
-          const pairKey = circleApplicationLockKey(circleId, userId);
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+          await this.memberLock.lock(tx, circleId, [userId]);
 
           const existing = await tx.circleMember.findUnique({
             where: {
@@ -362,79 +363,66 @@ export class CircleService {
   }
 
   async leaveCircle(userId: string, circleId: string): Promise<void> {
-    const membership = await this.prisma.circleMember.findUnique({
-      where: { userID_circleID: { userID: userId, circleID: circleId } },
-    });
-    if (!membership)
-      throw new NotFoundException({
-        message: 'Not a member',
-        errorCode: CircleErrorCode.NotMember,
-      });
-    if (membership.role === 'OWNER') {
-      throw new ForbiddenException({
-        message: 'Owner cannot leave — transfer ownership first',
-        errorCode: CircleErrorCode.OwnerCannotLeave,
-      });
-    }
-
-    const circle = await this.prisma.circle.findUnique({
-      where: { id: circleId },
-      select: { groupID: true },
-    });
-
-    await this.prisma.$transaction(async (tx) => {
-      const pairKey = circleApplicationLockKey(circleId, userId);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
-
-      const lockedMembership = await tx.circleMember.findUnique({
-        where: { userID_circleID: { userID: userId, circleID: circleId } },
-      });
-      if (!lockedMembership) {
-        throw new NotFoundException({
-          message: 'Not a member',
-          errorCode: CircleErrorCode.NotMember,
+    const groupID = await runSerializableTransaction(
+      this.prisma,
+      async (tx) => {
+        await this.memberLock.lock(tx, circleId, [userId]);
+        const lockedMembership = await tx.circleMember.findUnique({
+          where: { userID_circleID: { userID: userId, circleID: circleId } },
         });
-      }
-      if (lockedMembership.role === 'OWNER') {
-        throw new ForbiddenException({
-          message: 'Owner cannot leave — transfer ownership first',
-          errorCode: CircleErrorCode.OwnerCannotLeave,
+        if (!lockedMembership) {
+          throw new NotFoundException({
+            message: 'Not a member',
+            errorCode: CircleErrorCode.NotMember,
+          });
+        }
+        if (lockedMembership.role === 'OWNER') {
+          throw new ForbiddenException({
+            message: 'Owner cannot leave — transfer ownership first',
+            errorCode: CircleErrorCode.OwnerCannotLeave,
+          });
+        }
+
+        const wasActive = lockedMembership.status === 'ACTIVE';
+
+        if (!wasActive) {
+          await tx.circleInvitation.updateMany({
+            where: {
+              circleID: circleId,
+              applicantID: userId,
+              status: 'PENDING',
+            },
+            data: { status: 'CANCELLED' },
+          });
+        }
+
+        await tx.userDisplayIcon.deleteMany({
+          where: { userID: userId, circleID: circleId },
         });
-      }
+        await tx.circleMember.delete({ where: { id: lockedMembership.id } });
 
-      const wasActive = lockedMembership.status === 'ACTIVE';
+        if (wasActive) {
+          await tx.circle.update({
+            where: { id: circleId },
+            data: { memberCount: { decrement: 1 } },
+          });
+        }
 
-      if (!wasActive) {
-        await tx.circleInvitation.updateMany({
-          where: {
-            circleID: circleId,
-            applicantID: userId,
-            status: 'PENDING',
-          },
-          data: { status: 'CANCELLED' },
-        });
-      }
-
-      await tx.userDisplayIcon.deleteMany({
-        where: { userID: userId, circleID: circleId },
-      });
-      await tx.circleMember.delete({ where: { id: lockedMembership.id } });
-
-      if (wasActive) {
-        await tx.circle.update({
+        const circle = await tx.circle.findUnique({
           where: { id: circleId },
-          data: { memberCount: { decrement: 1 } },
+          select: { groupID: true },
         });
-      }
-    });
+        return circle?.groupID ?? null;
+      },
+    );
 
     // Remove from OpenIM group
-    if (circle?.groupID) {
+    if (groupID) {
       try {
-        await this.openimService.removeGroupMember(circle.groupID, userId);
+        await this.openimService.removeGroupMember(groupID, userId);
       } catch (error) {
         this.logger.warn(
-          `Failed to remove user ${userId} from OpenIM group ${circle.groupID}: ${error}`,
+          `Failed to remove user ${userId} from OpenIM group ${groupID}: ${error}`,
         );
       }
     }

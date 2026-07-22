@@ -2,6 +2,7 @@ import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CircleMemberLockService } from './circle-member-lock';
 
 describe('CircleAdmissionPolicy', () => {
   const activeMemberships: Array<{
@@ -24,7 +25,8 @@ describe('CircleAdmissionPolicy', () => {
   const membershipPolicy = new MembershipPolicyService(
     prisma as unknown as PrismaService,
   );
-  const policy = new CircleAdmissionPolicy(membershipPolicy);
+  const memberLock = new CircleMemberLockService(membershipPolicy);
+  const policy = new CircleAdmissionPolicy(membershipPolicy, memberLock);
 
   const circle = (overrides: Record<string, unknown> = {}) => ({
     id: 'circle-1',
@@ -254,8 +256,8 @@ describe('CircleAdmissionPolicy', () => {
       'membership-user:candidate-z',
     ]);
     expect(pairLock.values).toEqual([
-      'circle-invite:circle-1:candidate-a',
-      'circle-invite:circle-1:candidate-z',
+      'circle-member:circle-1:candidate-a',
+      'circle-member:circle-1:candidate-z',
     ]);
     expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
       prisma.circleMember.count.mock.invocationCallOrder[0],

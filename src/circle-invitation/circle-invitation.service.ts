@@ -14,6 +14,7 @@ import {
 } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -26,7 +27,6 @@ import {
   InvitationListQueryDto,
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
-import { circleApplicationLockKey } from './circle-application-lock';
 
 type CircleInvitationNotificationData = {
   toUserID: string;
@@ -78,6 +78,7 @@ export class CircleInvitationService {
     private readonly privacySettings: PrivacySettingsService,
     private readonly notificationService: NotificationService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
+    private readonly memberLock: CircleMemberLockService,
   ) {}
 
   async invite(
@@ -134,8 +135,7 @@ export class CircleInvitationService {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
       // transaction-scoped advisory lock, then re-check inside the lock.
-      const pairKey = circleApplicationLockKey(circleId, applicantId);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+      await this.memberLock.lock(tx, circleId, [applicantId]);
 
       const lockedMembership = await tx.circleMember.findUnique({
         where: {
@@ -298,14 +298,9 @@ export class CircleInvitationService {
           errorCode: CircleInvitationErrorCode.NotFound,
         });
       }
-      const pairKey = circleApplicationLockKey(
-        application.circleID,
-        application.applicantID,
-      );
-      await this.admissionPolicy.lockCandidateUsers(tx, [
+      await this.memberLock.lock(tx, application.circleID, [
         application.applicantID,
       ]);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
       const [verifierRecord, invitation] = await Promise.all([
         tx.circleInvitationVerifier.findFirst({
@@ -410,7 +405,7 @@ export class CircleInvitationService {
         tx,
         updatedInvitation.circleID,
         [updatedInvitation.applicantID],
-        { userLocksHeld: true },
+        { locksHeld: true },
       );
 
       return {
@@ -498,14 +493,9 @@ export class CircleInvitationService {
           errorCode: CircleInvitationErrorCode.NotFound,
         });
       }
-      const pairKey = circleApplicationLockKey(
-        application.circleID,
-        application.applicantID,
-      );
-      await this.admissionPolicy.lockCandidateUsers(tx, [
+      await this.memberLock.lock(tx, application.circleID, [
         application.applicantID,
       ]);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
       const pendingInvitation = await tx.circleInvitation.findUnique({
         where: { id: invitationId },
@@ -536,7 +526,7 @@ export class CircleInvitationService {
         tx,
         pendingInvitation.circleID,
         [pendingInvitation.applicantID],
-        { userLocksHeld: true },
+        { locksHeld: true },
       );
 
       return {
@@ -607,14 +597,9 @@ export class CircleInvitationService {
     for (const candidate of candidates) {
       try {
         const result = await this.runInvitationTransaction(async (tx) => {
-          const pairKey = circleApplicationLockKey(
-            candidate.circleID,
-            candidate.applicantID,
-          );
-          await this.admissionPolicy.lockCandidateUsers(tx, [
+          await this.memberLock.lock(tx, candidate.circleID, [
             candidate.applicantID,
           ]);
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
           const invitation = await tx.circleInvitation.findUnique({
             where: { id: candidate.id },
@@ -636,7 +621,7 @@ export class CircleInvitationService {
             tx,
             invitation.circleID,
             [invitation.applicantID],
-            { userLocksHeld: true },
+            { locksHeld: true },
           );
           return {
             admitted: admitted.length > 0,
