@@ -251,11 +251,13 @@ export class RefreshTokenService {
       where: { token: tokenHash },
       select: { id: true, userId: true, audience: true },
     });
-    await this.prisma.refreshToken.updateMany({
+    const revoked = await this.prisma.refreshToken.updateMany({
       where: { token: tokenHash, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    if (existing) {
+    // review 修复：token 已被撤销过（updateMany 0 行）时不再返回归属 ——
+    // 否则超时重试 / 持旧 token 者每次「登出」都会多记一条成功审计。
+    if (existing && revoked.count > 0) {
       await this.revocation.revokeSession(existing.id);
       return {
         userId: existing.userId,

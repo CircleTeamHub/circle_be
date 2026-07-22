@@ -22,13 +22,28 @@ type UserRow = {
 
 function buildService(user: UserRow | null) {
   const updates: { where: unknown; data: Record<string, unknown> }[] = [];
+  const updateManyCalls: { where: any; data: Record<string, unknown> }[] = [];
+  // 模拟 DB 侧真实语义：increment 相对写 + updateMany 条件匹配。这正是原子
+  // 方案的关键 —— 服务不再信任读到的快照，而是让 DB 决定是否到达锁定阈值。
+  const counter = { attempts: user?.adminLoginAttempts ?? 0 };
   const prisma = {
     user: {
       findUnique: jest.fn().mockResolvedValue(user),
-      update: jest.fn(
-        (args: { where: unknown; data: Record<string, unknown> }) => {
-          updates.push(args);
-          return Promise.resolve({});
+      update: jest.fn((args: { where: unknown; data: Record<string, any> }) => {
+        updates.push(args);
+        const inc = args.data?.adminLoginAttempts?.increment;
+        if (typeof inc === 'number') counter.attempts += inc;
+        return Promise.resolve({});
+      }),
+      updateMany: jest.fn(
+        (args: { where: any; data: Record<string, unknown> }) => {
+          updateManyCalls.push(args);
+          const gte = args.where?.adminLoginAttempts?.gte;
+          if (typeof gte === 'number' && counter.attempts >= gte) {
+            counter.attempts = 0;
+            return Promise.resolve({ count: 1 });
+          }
+          return Promise.resolve({ count: 0 });
         },
       ),
     },
@@ -51,7 +66,7 @@ function buildService(user: UserRow | null) {
     { verifyCode: jest.fn() } as never,
     config as never,
   );
-  return { service, prisma, updates, jwt };
+  return { service, prisma, updates, updateManyCalls, counter, jwt };
 }
 
 function adminUser(overrides: Partial<UserRow> = {}): UserRow {
@@ -74,22 +89,27 @@ describe('admin login lockout (#83)', () => {
     argon2.verify.mockReset();
   });
 
-  it('increments the failed counter on a wrong password', async () => {
+  it('counts failures with a DB-side atomic increment (not read-modify-write)', async () => {
     argon2.verify.mockResolvedValue(false);
-    const { service, updates } = buildService(adminUser());
+    const { service, updates, updateManyCalls, counter } =
+      buildService(adminUser());
 
     await expect(
       service.adminLogin({ email: 'admin@example.com', password: 'nope' }),
     ).rejects.toThrow(ForbiddenException);
 
+    // 相对写：{ increment: 1 }，绝不回写读到的快照值
     expect(updates).toHaveLength(1);
-    expect(updates[0].data).toMatchObject({ adminLoginAttempts: 1 });
-    expect(updates[0].data.adminLoginLockedUntil).toBeNull();
+    expect(updates[0].data).toEqual({ adminLoginAttempts: { increment: 1 } });
+    expect(counter.attempts).toBe(1);
+    // 锁定转换是条件 updateMany（阈值未到 → 0 行，不上锁）
+    expect(updateManyCalls).toHaveLength(1);
+    expect(updateManyCalls[0].where.adminLoginAttempts).toEqual({ gte: 5 });
   });
 
   it('locks the account on the 5th consecutive failure', async () => {
     argon2.verify.mockResolvedValue(false);
-    const { service, updates } = buildService(
+    const { service, updateManyCalls, counter } = buildService(
       adminUser({ adminLoginAttempts: 4 }),
     );
 
@@ -97,11 +117,39 @@ describe('admin login lockout (#83)', () => {
       service.adminLogin({ email: 'admin@example.com', password: 'nope' }),
     ).rejects.toThrow(ForbiddenException);
 
-    expect(updates).toHaveLength(1);
-    expect(updates[0].data.adminLoginAttempts).toBe(0);
-    expect(updates[0].data.adminLoginLockedUntil).toBeInstanceOf(Date);
-    const lockedUntil = updates[0].data.adminLoginLockedUntil as Date;
-    expect(lockedUntil.getTime()).toBeGreaterThan(Date.now());
+    expect(counter.attempts).toBe(0); // 锁定时清零
+    const lockWrite = updateManyCalls[0];
+    expect(lockWrite.data.adminLoginAttempts).toBe(0);
+    expect(lockWrite.data.adminLoginLockedUntil).toBeInstanceOf(Date);
+    expect(
+      (lockWrite.data.adminLoginLockedUntil as Date).getTime(),
+    ).toBeGreaterThan(Date.now());
+  });
+
+  it('locks after 5 CONCURRENT wrong guesses that all read the same stale row', async () => {
+    argon2.verify.mockResolvedValue(false);
+    // findUnique 恒返回 attempts=0 的旧快照 —— 分布式撞库场景。旧读-改-写
+    // 实现下 5 发并发只能把计数推到 1；原子 increment 下 DB 计数真实到 5。
+    const { service, counter, updateManyCalls } = buildService(adminUser());
+
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        service
+          .adminLogin({ email: 'admin@example.com', password: 'nope' })
+          .catch(() => undefined),
+      ),
+    );
+
+    // 第 5 次 increment 后条件转换命中：锁上且计数清零
+    const lockHits = updateManyCalls.filter(
+      (c) => c.where.adminLoginAttempts?.gte === 5,
+    );
+    expect(lockHits).toHaveLength(5);
+    expect(counter.attempts).toBe(0);
+    const lockedWrites = lockHits.filter(
+      (c) => c.data.adminLoginLockedUntil instanceof Date,
+    );
+    expect(lockedWrites.length).toBeGreaterThan(0);
   });
 
   it('rejects while locked WITHOUT running the password check', async () => {
@@ -164,7 +212,35 @@ describe('admin login lockout (#83)', () => {
 
     expect(jwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({ aud: 'ADMIN' }),
-      expect.objectContaining({ expiresIn: '15m' }),
+      // 秒数：min(ADMIN_JWT_EXPIRES_IN 默认 15m, JWT_EXPIRES_IN 默认 1h)
+      expect.objectContaining({ expiresIn: 15 * 60 }),
+    );
+  });
+
+  it('clamps admin access TTL to JWT_EXPIRES_IN so revocation markers outlive tokens', async () => {
+    argon2.verify.mockResolvedValue(true);
+    const { service, jwt } = buildService(adminUser());
+    // ADMIN_JWT_EXPIRES_IN 配得比全局长：吊销标记按全局 TTL 定长，admin token
+    // 更长会在标记过期后「复活」——必须钳到全局值。
+    const ttlEnv: Record<string, string> = {
+      ADMIN_JWT_EXPIRES_IN: '2h',
+      JWT_EXPIRES_IN: '1h',
+    };
+    const configGet = (
+      service as unknown as {
+        configService: { get: jest.Mock };
+      }
+    ).configService.get;
+    configGet.mockImplementation((key: string) => ttlEnv[key]);
+
+    await service.adminLogin({
+      email: 'admin@example.com',
+      password: 'right',
+    });
+
+    expect(jwt.signAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ aud: 'ADMIN' }),
+      expect.objectContaining({ expiresIn: 60 * 60 }),
     );
   });
 });

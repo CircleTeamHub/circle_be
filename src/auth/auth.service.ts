@@ -33,6 +33,7 @@ import {
   SessionContext,
 } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { accessTokenTtlSeconds } from './session-revocation.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -294,18 +295,27 @@ export class AuthService {
       // 只有真正的 ADMIN 账号累计失败计数：对非 admin 账号计数会让任何人
       // 通过 adminLogin 刷别人的普通账号进锁定（DoS）。
       if (!valid && user.role === 'ADMIN') {
-        const attempts = user.adminLoginAttempts + 1;
-        const shouldLock = attempts >= ADMIN_LOGIN_MAX_ATTEMPTS;
+        // review 修复（原子计数）：此前读-改-写，N 个并发错误密码都基于同一
+        // 旧值回写，5 发分布式撞库可能只把计数推到 1、永远锁不上。改为 DB 侧
+        // increment（天然原子），再用条件 updateMany（gte 上限才匹配）完成
+        // 「清零+上锁」转换 —— 并发下也只有一个请求能完成转换并发锁定事件。
         await this.prisma.user.update({
           where: { id: user.id },
+          data: { adminLoginAttempts: { increment: 1 } },
+        });
+        const locked = await this.prisma.user.updateMany({
+          where: {
+            id: user.id,
+            adminLoginAttempts: { gte: ADMIN_LOGIN_MAX_ATTEMPTS },
+          },
           data: {
-            adminLoginAttempts: shouldLock ? 0 : attempts,
-            adminLoginLockedUntil: shouldLock
-              ? new Date(now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000)
-              : user.adminLoginLockedUntil,
+            adminLoginAttempts: 0,
+            adminLoginLockedUntil: new Date(
+              now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000,
+            ),
           },
         });
-        if (shouldLock) {
+        if (locked.count > 0) {
           logBusinessEvent(this.logger, {
             enabled: this.loggingConfig.businessLogOn,
             businessEvent: 'auth_admin_login_locked',
@@ -1136,8 +1146,22 @@ export class AuthService {
       const adminExpiresIn =
         this.configService.get<string>('ADMIN_JWT_EXPIRES_IN') ??
         DEFAULT_ADMIN_JWT_EXPIRES_IN;
+      // review 修复（钳到吊销窗口）：SessionRevocationService 的吊销标记
+      // TTL 按全局 JWT_EXPIRES_IN 定长 —— admin access TTL 若配得更长，
+      // 标记先过期、被吊销的 admin token 会「复活」。上限=全局 TTL。
+      const adminSeconds = accessTokenTtlSeconds(adminExpiresIn);
+      const globalSeconds = accessTokenTtlSeconds(
+        this.configService.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
+      );
+      if (adminSeconds > globalSeconds) {
+        this.logger.warn(
+          `ADMIN_JWT_EXPIRES_IN (${adminExpiresIn}) exceeds JWT_EXPIRES_IN — ` +
+            'clamping admin access TTL to the global value so revocation ' +
+            'markers always outlive the token',
+        );
+      }
       return this.jwt.signAsync(payload, {
-        expiresIn: adminExpiresIn as unknown as number,
+        expiresIn: Math.min(adminSeconds, globalSeconds),
       });
     }
     return this.jwt.signAsync(payload);

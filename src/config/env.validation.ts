@@ -20,6 +20,11 @@ export function shouldSkipPrismaConnectOnBoot(
   return readBooleanEnvFlag(env['PRISMA_SKIP_CONNECT_ON_BOOT']);
 }
 
+// TTL 旋钮的可解析格式（与 refresh-token.service parseRefreshTtlMs / jwt 的
+// ms 子集对齐）。放宽大小写与首尾空白由 trim 处理，这里只钉结构。
+const refreshTtlPattern = /^\d+\s*[dhm]?$/i;
+const jwtTtlPattern = /^\d+\s*(ms|s|m|h|d)?$/i;
+
 export function createEnvValidationSchema(
   env: EnvLike = process.env,
 ): Joi.ObjectSchema {
@@ -72,13 +77,30 @@ export function createEnvValidationSchema(
     SECRET: Joi.string().min(secretMin).required(),
     JWT_EXPIRES_IN: Joi.string().default('1h'),
     // #84：这个键从 schema 声明之日起就没被代码读过（代码读的是从未文档化的
-    // REFRESH_EXPIRES_IN_DAYS），所有环境实际拿 7 天。现已接线。默认从 '30d'
-    // 收敛为 '7d' —— 保住未显式配置环境的既有有效行为，不做静默寿命翻倍；
-    // 显式配置（如模板里的 30d）从此真正生效。
-    REFRESH_EXPIRES_IN: Joi.string().default('7d'),
+    // REFRESH_EXPIRES_IN_DAYS），所有环境实际拿 7 天。现已接线。
+    // review 修复 ×2：
+    // - 不在 Joi 层给默认：ConfigModule 会先落默认再进服务，只配了旧
+    //   REFRESH_EXPIRES_IN_DAYS 的环境会被 '7d' 顶掉、兼容回落成死代码。
+    //   默认由 RefreshTokenService 在两个键都缺席时兜（同为 7d，行为不变）。
+    // - pattern 钉死可解析格式：这是安全敏感的会话寿命旋钮，'8hours' 这类
+    //   写错的值静默回落默认可能比运维显式配置的更长，必须 fail boot。
+    REFRESH_EXPIRES_IN: Joi.string().pattern(refreshTtlPattern, {
+      name: 'duration like 30d / 12h / 45m',
+    }),
+    // 旧名（纯天数）仅作兼容回落，同样 fail-boot 校验。
+    REFRESH_EXPIRES_IN_DAYS: Joi.alternatives(
+      Joi.number().positive(),
+      Joi.string().pattern(refreshTtlPattern, {
+        name: 'duration like 14 / 14d',
+      }),
+    ),
     // #91：管理台会话独立 TTL（上限被 REFRESH_EXPIRES_IN 钳制，绝不长于用户）。
-    ADMIN_REFRESH_EXPIRES_IN: Joi.string().default('12h'),
-    ADMIN_JWT_EXPIRES_IN: Joi.string().default('15m'),
+    ADMIN_REFRESH_EXPIRES_IN: Joi.string()
+      .pattern(refreshTtlPattern, { name: 'duration like 12h / 45m' })
+      .default('12h'),
+    ADMIN_JWT_EXPIRES_IN: Joi.string()
+      .pattern(jwtTtlPattern, { name: 'duration like 15m / 900s' })
+      .default('15m'),
     LOG_ON: Joi.boolean(),
     LOG_LEVEL: Joi.string(),
     HTTP_LOG_ON: Joi.boolean(),

@@ -515,7 +515,8 @@ describe('AuthService', () => {
         aud: 'ADMIN',
       }),
       // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
-      expect.objectContaining({ expiresIn: '15m' }),
+      // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
+      expect.objectContaining({ expiresIn: 900 }),
     );
   });
 
@@ -666,7 +667,8 @@ describe('AuthService', () => {
         aud: 'ADMIN',
       }),
       // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
-      expect.objectContaining({ expiresIn: '15m' }),
+      // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
+      expect.objectContaining({ expiresIn: 900 }),
     );
   });
 

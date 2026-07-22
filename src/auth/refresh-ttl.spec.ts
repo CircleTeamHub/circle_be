@@ -91,4 +91,39 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
     expect(expiredAt - before).toBeGreaterThan(30 * DAY - 5_000);
     expect(expiredAt - before).toBeLessThan(30 * DAY + 5_000);
   });
+
+  it('revoke() only attributes the session when a row was actually revoked (double-logout)', async () => {
+    const config = { get: () => undefined } as unknown as ConfigService;
+    const revocation = { revokeSession: jest.fn(), revokeUser: jest.fn() };
+    let alreadyRevoked = false;
+    const prisma = {
+      refreshToken: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'session-1',
+          userId: 'admin-1',
+          audience: 'ADMIN',
+        }),
+        updateMany: jest.fn(() =>
+          // 第一次撤销 1 行；重放（超时重试/旧 token）撤销 0 行
+          Promise.resolve({
+            count: alreadyRevoked ? 0 : ((alreadyRevoked = true), 1),
+          }),
+        ),
+      },
+    };
+    const service = new RefreshTokenService(
+      prisma as never,
+      config,
+      revocation as never,
+    );
+
+    // 首次登出：真撤销，返回归属供审计
+    await expect(service.revoke('token-x')).resolves.toEqual({
+      userId: 'admin-1',
+      audience: 'ADMIN',
+    });
+    // 重放：行早已撤销 —— 不返回归属，调用方不得再记一条成功审计
+    await expect(service.revoke('token-x')).resolves.toBeNull();
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+  });
 });
