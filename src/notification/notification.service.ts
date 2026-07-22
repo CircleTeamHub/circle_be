@@ -18,6 +18,9 @@ import {
 import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+// #98 显式决定：保持 20 而不是原计划的 10。多设备（手机+平板+重装残留）在
+// 20 内都装得下，超限按 lastSeen 逐出最旧的；收紧到 10 只会更快逐出仍然
+// 活跃的次要设备，没有对应的安全收益（token 本身不可伪造投递身份）。
 const MAX_PUSH_TOKENS_PER_USER = 20;
 
 @Injectable()

@@ -48,6 +48,11 @@ export class OpenimService implements OnModuleInit {
   private readonly adminSecret: string;
   private readonly enabled: boolean;
 
+  /** OpenIM 出站是否已配置可用（round 2 review：补偿 cron 用它做前置门禁）。 */
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   constructor(private config: ConfigService) {
     this.apiUrl = this.config.get<string>('OPENIM_API_URL') ?? '';
     this.adminSecret = this.config.get<string>('OPENIM_ADMIN_SECRET') ?? '';
@@ -422,6 +427,121 @@ export class OpenimService implements OnModuleInit {
         offlinePushInfo: {
           title: senderName,
           desc: params.content,
+          ex: '',
+          iOSPushSound: 'default',
+          iOSBadgeCount: true,
+        },
+        ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
+      },
+      adminToken,
+    );
+  }
+
+  /**
+   * 通话留痕自定义消息（#115）。contentType 110（CustomElem），data 为 JSON 串，
+   * 客户端按 data.type 分发渲染（与 friend-card / transfer-card 同一套约定）。
+   * 单聊发给 recvID，群聊发给 groupID。默认不做离线推送（通话结束不该像新
+   * 消息一样响铃）；未接来电（offlinePush 显式给出时）例外。
+   */
+  async sendCallRecordMessage(params: {
+    sendID: string;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+    target:
+      | { kind: 'single'; recvID: string }
+      | { kind: 'group'; groupID: string };
+    data: Record<string, unknown>;
+    /** 客户端按 customElem.extension 分发渲染（Circle_frontend im/mappers 惯例）。 */
+    extension: string;
+    offlinePush?: { title: string; desc: string } | null;
+    /** 幂等键（round 2 review）：重试用固定 id，OpenIM 侧去重防双留痕。 */
+    clientMsgID?: string;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    const single = params.target.kind === 'single';
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        ...(params.target.kind === 'single'
+          ? { recvID: OpenimService.toImUserId(params.target.recvID) }
+          : { groupID: params.target.groupID }),
+        content: {
+          data: JSON.stringify(params.data),
+          description: '',
+          extension: params.extension,
+        },
+        contentType: 110,
+        sessionType: single ? 1 : 3,
+        senderNickname: params.senderNickname?.trim() || 'Circle',
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: !params.offlinePush,
+        sendTime: Date.now(),
+        ...(params.offlinePush
+          ? {
+              offlinePushInfo: {
+                title: params.offlinePush.title,
+                desc: params.offlinePush.desc,
+                ex: '',
+                iOSPushSound: 'default',
+                iOSBadgeCount: true,
+              },
+            }
+          : {}),
+        ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
+      },
+      adminToken,
+    );
+  }
+
+  /**
+   * 服务端补发转账卡片（#100）：与客户端 im 发卡完全同构 ——
+   * contentType 110 + extension 'transfer-card-v1' + data {amount, message}，
+   * 接收端渲染路径无差别。仅单聊。
+   */
+  async sendTransferCardMessage(params: {
+    sendID: string;
+    recvID: string;
+    amount: number;
+    message: string | null;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+    /** 幂等键（review 修复）：补偿 cron 用 gift 派生的固定 id，OpenIM 侧去重。 */
+    clientMsgID?: string;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        recvID: OpenimService.toImUserId(params.recvID),
+        content: {
+          data: JSON.stringify({
+            amount: params.amount,
+            message: params.message,
+          }),
+          description: `[转账] ${params.amount} 积分`,
+          extension: 'transfer-card-v1',
+        },
+        contentType: 110,
+        sessionType: 1,
+        senderNickname: params.senderNickname?.trim() || 'Circle',
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: false,
+        sendTime: Date.now(),
+        offlinePushInfo: {
+          title: params.senderNickname?.trim() || 'Circle',
+          desc: `[转账] ${params.amount} 积分`,
           ex: '',
           iOSPushSound: 'default',
           iOSBadgeCount: true,

@@ -6,6 +6,7 @@ import { NotificationPublicController } from './notification-public.controller';
 import { NotificationPushService } from './notification-push.service';
 import { NotificationService } from './notification.service';
 import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
+import { NotificationRetentionCleanup } from './notification-retention.cleanup';
 
 @Global()
 @Module({
@@ -15,6 +16,7 @@ import { NotificationPushOutboxProcessor } from './notification-push-outbox.proc
     NotificationService,
     NotificationPushService,
     NotificationPushOutboxProcessor,
+    NotificationRetentionCleanup,
   ],
   exports: [NotificationService, NotificationPushService],
 })

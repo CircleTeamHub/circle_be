@@ -30,6 +30,7 @@ import { Registry } from 'prom-client';
 import { createMetrics } from './metrics/metrics.service';
 import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
 import { createMetricsHandler } from './metrics/metrics.endpoint';
+import { createInfraStatusMetrics } from './metrics/infra-status.metrics';
 import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
@@ -333,6 +334,16 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         'process stats.',
     );
   }
+  // 基建状态 gauge（#87/#102）：桶策略未确认、Redis 存活。抓取时求值。
+  const uploadServiceForMetrics = getOptionalUploadService(app);
+  const infraStatusMetrics = createInfraStatusMetrics({
+    objectStoreStatus: uploadServiceForMetrics
+      ? () => uploadServiceForMetrics.objectStoreStatus()
+      : null,
+    // 未启用 Redis（无 REDIS_URL 的单机部署）时不挂 ping：否则 gauge 恒 0，
+    // RedisDown 告警对着一个本来就不存在的依赖长鸣。
+    redisPing: redisService?.isEnabled() ? () => redisService.ping() : null,
+  });
   app.use(
     '/metrics',
     createMetricsHandler(
@@ -341,6 +352,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         businessMetrics.registry,
         redisMetrics.registry,
         uploadMetrics.registry,
+        infraStatusMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),
@@ -408,10 +420,21 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // Email code sends and security-code verification are the two new
   // unauthenticated-cost / brute-force surfaces from this branch.
   app.use('/api/v1/auth/email/request-code', emailCodeLimiter);
+  // review 修复：忘记密码的验证码发送与 request-code 同为未认证发信面，
+  // 必须共享同一个 Redis 限流池 —— 否则攻击者换个端点就绕开 10/15min 上限。
+  app.use('/api/v1/auth/password/reset-request', emailCodeLimiter);
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
-  app.use('/api/v1/coin/gift', coinGiftLimiter);
+  // review 修复：只有「真发礼物」吃 20/15min 配额。前缀挂载会把
+  // /coin/gift/card-sent 回执也算进去 —— 发 10 单+逐单回执就顶满配额，
+  // 且回执被 429 会让 cardDeliveredAt 悬空、补偿 cron 之后重复发卡。
+  app.use('/api/v1/coin/gift', (req: any, res: any, next: any) => {
+    if (req.path === '/' || req.path === '') {
+      return coinGiftLimiter(req, res, next);
+    }
+    next();
+  });
   app.use('/api/v1/note', noteWriteLimiter);
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {

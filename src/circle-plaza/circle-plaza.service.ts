@@ -6,7 +6,12 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { CirclePost, Prisma, User } from 'src/generated/prisma';
+import {
+  CirclePost,
+  Prisma,
+  ReportReviewStatus,
+  User,
+} from 'src/generated/prisma';
 import { CircleErrorCode, PlazaErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -619,13 +624,45 @@ export class CirclePlazaService {
     }
 
     const trimmed = reason?.trim();
-    await this.prisma.circlePostReport.upsert({
+    // review 修复：幂等只对 PENDING 行生效（补充理由）；审结行是管理员已经
+    // 看过的证据，绝不改写 —— 审结后的新举报建全新 PENDING 行重新进队列。
+    // 并发双报由 PENDING 局部唯一索引兜住，P2002 输家改走更新路径。
+    const pending = await this.prisma.circlePostReport.findFirst({
       where: {
-        postID_reporterID: { postID: postId, reporterID: userId },
+        postID: postId,
+        reporterID: userId,
+        status: ReportReviewStatus.PENDING,
       },
-      create: { postID: postId, reporterID: userId, reason: trimmed || null },
-      update: { reason: trimmed || null },
+      select: { id: true },
     });
+    if (pending) {
+      await this.prisma.circlePostReport.update({
+        where: { id: pending.id },
+        data: { reason: trimmed || null },
+      });
+      return { reported: true };
+    }
+    try {
+      await this.prisma.circlePostReport.create({
+        data: { postID: postId, reporterID: userId, reason: trimmed || null },
+      });
+    } catch (error) {
+      if (this.prismaErrorCode(error) !== 'P2002') throw error;
+      const raced = await this.prisma.circlePostReport.findFirst({
+        where: {
+          postID: postId,
+          reporterID: userId,
+          status: ReportReviewStatus.PENDING,
+        },
+        select: { id: true },
+      });
+      if (raced) {
+        await this.prisma.circlePostReport.update({
+          where: { id: raced.id },
+          data: { reason: trimmed || null },
+        });
+      }
+    }
     return { reported: true };
   }
 

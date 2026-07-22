@@ -6,6 +6,7 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  Matches,
   MaxLength,
   MinLength,
   IsInt,
@@ -30,10 +31,19 @@ export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
 
 export class RegisterPushTokenDto {
-  @ApiProperty({ maxLength: 512 })
+  // #98：provider 目前只有 expo，Expo push token 有公开的稳定形状 ——
+  // ExponentPushToken[...]（旧版 ExpoPushToken[...] 同被接受）。在边界拒绝
+  // 杂讯，而不是等到投递时被 Expo 以 DeviceNotRegistered 打回。
+  @ApiProperty({
+    maxLength: 512,
+    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]',
+  })
   @IsString()
   @IsNotEmpty()
   @MaxLength(512)
+  @Matches(/^Expo(nent)?PushToken\[[^\s\]]+\]$/, {
+    message: 'token must be an Expo push token (ExponentPushToken[...])',
+  })
   token: string;
 
   @ApiProperty({ enum: PUSH_TOKEN_PLATFORMS })

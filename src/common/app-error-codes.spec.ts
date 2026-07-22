@@ -19,6 +19,7 @@ import {
   PrivacyErrorCode,
   TempChatErrorCode,
   TraceErrorCode,
+  UploadErrorCode,
   UserErrorCode,
 } from './app-error-codes';
 
@@ -44,6 +45,7 @@ describe('app error code catalog', () => {
     FriendErrorCode,
     NoteErrorCode,
     CallErrorCode,
+    UploadErrorCode,
     ConversationGroupErrorCode,
     ChatHistoryErrorCode,
     CollectionErrorCode,

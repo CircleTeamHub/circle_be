@@ -488,17 +488,11 @@ describe('CallService', () => {
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
     });
-    prisma.callParticipant.update.mockResolvedValue({
-      userID: 'user-2',
-      status: 'JOINED',
-      invitedAt: now,
-      joinedAt: now,
-      leftAt: null,
-      rejectedAt: null,
-      missedAt: null,
-      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
-    });
-    prisma.callSession.update.mockResolvedValue({
+    // round 3：接听改为锁内 CAS 事务（INVITED→JOINED / RINGING→ACTIVE
+    // 都是条件写），随后 findUnique 取终态
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callSession.findUnique.mockResolvedValue({
       id: 'call-1',
       conversationID: 'sg_group-1',
       sessionType: 3,
@@ -515,9 +509,16 @@ describe('CallService', () => {
 
     const result = await service.acceptCall('user-2', 'call-1');
 
-    expect(prisma.callParticipant.update).toHaveBeenCalledWith(
+    expect(prisma.callParticipant.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
+        where: expect.objectContaining({ status: 'INVITED' }),
         data: expect.objectContaining({ status: 'JOINED', joinedAt: now }),
+      }),
+    );
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'call-1', status: 'RINGING' },
+        data: expect.objectContaining({ status: 'ACTIVE' }),
       }),
     );
     expect(livekit.mintJoinToken).toHaveBeenCalledWith(
@@ -596,7 +597,9 @@ describe('CallService', () => {
     });
     prisma.callParticipant.update.mockResolvedValue({});
     prisma.callParticipant.count.mockResolvedValue(0);
-    prisma.callSession.update.mockResolvedValue({
+    // round 2：终局转换是 CAS（updateMany），赢家再 findUnique 取终态
+    prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callSession.findUnique.mockResolvedValue({
       id: 'call-1',
       status: 'ENDED',
       endReason: 'ALL_LEFT',
@@ -606,9 +609,12 @@ describe('CallService', () => {
 
     await service.leaveCall('user-2', 'call-1');
 
-    expect(prisma.callSession.update).toHaveBeenCalledWith(
+    expect(prisma.callSession.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'call-1' },
+        where: {
+          id: 'call-1',
+          status: { in: ['RINGING', 'ACTIVE'] },
+        },
         data: expect.objectContaining({
           status: 'ENDED',
           endReason: 'ALL_LEFT',

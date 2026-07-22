@@ -7,10 +7,14 @@ describe('CollectionService', () => {
   let service: CollectionService;
 
   const prisma = {
+    $transaction: jest.fn(async (fn: any) => fn(prisma)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     userCollection: {
       findMany: jest.fn(),
       create: jest.fn(),
       deleteMany: jest.fn(),
+      // #104 审查加的每用户上限检查
+      count: jest.fn().mockResolvedValue(0),
     },
   };
 
@@ -96,5 +100,21 @@ describe('CollectionService', () => {
     expect(prisma.userCollection.deleteMany).toHaveBeenCalledWith({
       where: { id: 'collection-1', userID: 'user-1' },
     });
+  });
+
+  it('rejects creating past the per-user cap with COLLECTION_LIMIT (#104)', async () => {
+    prisma.userCollection.count.mockResolvedValueOnce(500);
+
+    await expect(
+      service.create('user-1', {
+        type: 'NOTE' as never,
+        title: 't',
+        summary: 's',
+        sourceID: 'x',
+      } as never),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ errorCode: 'COLLECTION_LIMIT' }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
   });
 });

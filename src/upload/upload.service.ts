@@ -1,3 +1,4 @@
+import { UploadErrorCode } from 'src/common/app-error-codes';
 import {
   Injectable,
   Logger,
@@ -172,9 +173,10 @@ export class UploadService implements OnModuleInit {
       sizeBytes < 1 ||
       sizeBytes > maxBytes
     ) {
-      throw new PayloadTooLargeException(
-        `Upload exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
-      );
+      throw new PayloadTooLargeException({
+        message: `Upload exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
+        errorCode: UploadErrorCode.PayloadTooLarge,
+      });
     }
 
     // `split('.').pop()` returns the whole string when there is no dot, so

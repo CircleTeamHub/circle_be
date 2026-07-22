@@ -7,11 +7,22 @@
 # Stop: docker compose -f monitoring/docker-compose.yml down
 #
 # Images are :latest for an easy local start — pin explicit versions for prod.
+
+# #107：容器日志默认无上限，写满磁盘会连带 pg_data 所在宿主机一起挂。
+# 与 docker-compose.prod.yml 同款轮转 + 内存上限。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
 services:
   prometheus:
     image: prom/prometheus:latest
     container_name: circle-prometheus
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     # Lets Prometheus reach the backend running on the HOST (npm run start:dev).
     # Works on Docker Desktop; extra_hosts makes it work on Linux too.
     extra_hosts:
@@ -31,6 +42,8 @@ services:
     image: prom/node-exporter:latest
     container_name: circle-node-exporter
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
     command:
       - '--path.rootfs=/host'
     volumes:
@@ -45,6 +58,8 @@ services:
     image: gcr.io/cadvisor/cadvisor:latest
     container_name: circle-cadvisor
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     privileged: true
     volumes:
       - '/:/rootfs:ro'
@@ -59,6 +74,8 @@ services:
     image: prom/alertmanager:latest
     container_name: circle-alertmanager
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
     volumes:
       # Mount the whole dir so alertmanager.yml can read the gitignored discord.url.
       - ./alertmanager:/etc/alertmanager:ro
@@ -69,6 +86,8 @@ services:
     image: grafana/grafana:latest
     container_name: circle-grafana
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 512m
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       # Deliberately no default: `:?` makes compose refuse to start rather than
@@ -92,6 +111,8 @@ services:
     image: louislam/uptime-kuma:1
     container_name: circle-uptime-kuma
     restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 256m
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     volumes:

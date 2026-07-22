@@ -20,6 +20,8 @@ describe('NoteService', () => {
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
     $executeRaw: jest.fn().mockResolvedValue(0),
+    // createShareLink 配额检查用 advisory 锁（pg_advisory_xact_lock）
+    $queryRaw: jest.fn().mockResolvedValue([]),
     note: {
       create: jest.fn(),
       findMany: jest.fn(),
@@ -52,6 +54,8 @@ describe('NoteService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
+      // #94 每用户活跃链接上限检查；默认远低于上限
+      count: jest.fn().mockResolvedValue(0),
     },
   };
 
@@ -1990,6 +1994,23 @@ describe('NoteService', () => {
       revokedAt: null,
       createdAt: new Date('2026-06-08T10:00:00.000Z'),
     });
+  });
+
+  it('rejects creating a share link past the per-user active cap (#94)', async () => {
+    prisma.noteShareLink.count.mockResolvedValueOnce(200);
+
+    await expect(
+      service.createShareLink('user-1', { title: '我的笔记' }),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'NOTE_SHARE_LINK_LIMIT',
+      }),
+    });
+
+    expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
+    // count 与 create 必须同事务且持 per-owner advisory 锁（并发下守住上限）
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(prisma.$queryRaw).toHaveBeenCalled();
   });
 
   it('rejects a note share link when any requested note is missing or owned by someone else', async () => {

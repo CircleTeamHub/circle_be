@@ -26,6 +26,13 @@ import {
  * violation) matches every other rejection in the gateway; the reason mirrors
  * the HTTP side's `UnauthorizedException('Session revoked')` so a client can
  * tell "you are no longer authorized, stop retrying" from a transient drop.
+ *
+ * ⚠️ 跨仓字符串契约（#102）：REVOKED_CLOSE_REASON 必须与
+ *   Circle_frontend/src/realtime/client.ts 的 REVOKED_CLOSE_REASON
+ * 逐字节一致 —— 网关对六种拒绝都发 1008，reason 是客户端判「终态、停止重连」
+ * 的唯一依据。任何一侧改词、两边测试都不会互相报警，撤销登出会静默退化成
+ * 重连环直到 JWT 过期。改动必须两仓同步 + 双方 pin 测试同步更新
+ * （本仓 src/realtime/revoked-close-contract.spec.ts）。
  */
 export const REVOKED_CLOSE_CODE = 1008;
 export const REVOKED_CLOSE_REASON = 'Session revoked';
