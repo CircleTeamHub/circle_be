@@ -174,12 +174,18 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `downtime: true` 和 `irreversible_migration: true`。服务器也会二次校验
 `RELEASE_IRREVERSIBLE_MIGRATION=1` 必须与 `RELEASE_DOWNTIME=1` 同时启用。
 
-不可逆迁移命令返回非零时,脚本会通过发布镜像连接目标数据库,直接检查
-`User_vipLevel_check` 和 `Circle_joinVipRestriction_check`。只有两个约束都不存在时,
-才能证明事务未应用并恢复旧实例;两个都存在、只存在一个、探测失败或返回异常结果
+不可逆迁移命令返回非零时,脚本会通过发布镜像连接目标数据库,直接检查 User、Circle
+和 CirclePost 的四个会员等级约束。只有四个约束都不存在时,才能证明事务未应用并恢复
+旧实例;四个都存在、只存在一部分、探测失败或返回异常结果
 都会保持维护状态。迁移命令成功后,旧二进制同样不再是合法回滚目标;后续启动、
 健康、代理、状态写入或烟测失败都会等待向前修复。只有先从本次迁移前备份完整恢复
 数据库,才能再启动旧镜像。
+
+兼容级别来自 tag 内的 `deploy/SCHEMA_COMPATIBILITY`。不可逆迁移开始前,服务器会把
+最低级别原子写入 rsync 排除的 `.release/minimum-schema-compatibility`;workflow 在
+rsync 前读取它,所以不含兼容标记的旧 tag 会在替换服务器脚本前被拒绝。该文件不是
+普通回滚开关:只有完整恢复迁移前数据库、验证上述四个约束均不存在后,值班人员才可
+显式删除它,再运行旧 tag。
 本次会员迁移的完整值班步骤和验证 SQL 见
 `docs/operations/membership-rollout.md`。标记只能由**后续已成功部署**、且不再包含
 不可逆迁移的版本移除,不能在会员迁移 tag 上提前删除。
@@ -217,7 +223,8 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
   携带不可逆迁移标记的版本还必须增加
   `RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=1`;缺一项脚本都会在备份和
   迁移前拒绝运行。越过迁移成功边界后,不要直接改用旧 tag 重跑;先向前修复,或先
-  恢复迁移前数据库备份。
+  恢复迁移前数据库备份并验证四个约束均不存在,然后显式删除
+  `.release/minimum-schema-compatibility`。
 
   镜像还在本地缓存时无需登录;缓存已清且仓库私有,先用带 `read:packages` 的
   PAT `docker login ghcr.io` 再跑。

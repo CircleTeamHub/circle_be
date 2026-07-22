@@ -84,7 +84,7 @@ export class CreateCircleDto {
   @Type(() => Number)
   @IsInt()
   @Min(0)
-  @Max(10)
+  @Max(4)
   @IsOptional()
   joinVipRestriction?: number;
 

@@ -94,7 +94,10 @@ export class CircleService {
           cities: dto.cities ?? [],
           rules: dto.rules ?? '',
           tags: dto.tags ?? [],
-          joinVipRestriction: dto.joinVipRestriction ?? null,
+          joinVipRestriction:
+            dto.joinVipRestriction === 0
+              ? null
+              : (dto.joinVipRestriction ?? null),
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
           maxMembers: dto.maxMembers ?? null,

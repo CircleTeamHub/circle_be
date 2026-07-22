@@ -254,10 +254,14 @@ export class CirclePlazaService {
             cities,
             isHorn: dto.isHorn ?? false,
             noteID: dto.noteId ?? null,
-            vipRestriction: dto.vipRestriction ?? null,
+            vipRestriction:
+              dto.vipRestriction === 0 ? null : (dto.vipRestriction ?? null),
             creditRestriction: dto.creditRestriction ?? null,
             fancyRestriction: dto.fancyRestriction ?? false,
-            signupVipRestriction: dto.signupVipRestriction ?? null,
+            signupVipRestriction:
+              dto.signupVipRestriction === 0
+                ? null
+                : (dto.signupVipRestriction ?? null),
             signupCreditRestriction: dto.signupCreditRestriction ?? null,
             signupFancyRestriction: dto.signupFancyRestriction ?? false,
             authorID: userId,

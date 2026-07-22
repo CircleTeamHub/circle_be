@@ -16,6 +16,25 @@ import test from 'node:test';
 const read = (path) =>
   readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
 
+function workflowRunScript(workflow, stepName, nextStepName) {
+  const endMarker = nextStepName.startsWith('\n')
+    ? nextStepName
+    : `- name: ${nextStepName}`;
+  const block = workflow.slice(
+    workflow.indexOf(`- name: ${stepName}`),
+    workflow.indexOf(endMarker),
+  );
+  const runMarker = '        run: |\n';
+  return {
+    block,
+    script: block
+      .slice(block.indexOf(runMarker) + runMarker.length)
+      .split(/\r?\n/)
+      .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
+      .join('\n'),
+  };
+}
+
 test('Caddy routes requests only to healthy blue-green backends', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const adminBlock = caddy.slice(caddy.indexOf('{$ADMIN_DOMAIN}'));
@@ -194,16 +213,11 @@ test('downtime deployment restores the live app after migration or reversible st
 
 test('marked releases reject tag push and incomplete manual confirmations', (t) => {
   const release = read('.github/workflows/release.yml');
-  const gate = release.slice(
-    release.indexOf('- name: Validate irreversible migration confirmations'),
-    release.indexOf('- name: Notify release start'),
+  const { block: gate, script } = workflowRunScript(
+    release,
+    'Validate irreversible migration confirmations',
+    'Notify release start',
   );
-  const runMarker = '        run: |\n';
-  const script = gate
-    .slice(gate.indexOf(runMarker) + runMarker.length)
-    .split(/\r?\n/)
-    .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
-    .join('\n');
   const directory = mkdtempSync(join(tmpdir(), 'circle-release-gate-'));
   mkdirSync(join(directory, 'deploy'));
   writeFileSync(
@@ -239,6 +253,103 @@ test('marked releases reject tag push and incomplete manual confirmations', (t) 
   );
 });
 
+test('manual dispatch promotes the commit image when the version image is absent', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-release-image-'));
+  const bin = join(directory, 'bin');
+  const output = join(directory, 'output');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+case "$ref" in
+  *:sha-*) printf '{"digest":"sha256:%064d"}\\n' 0 ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const result = spawnSync('/bin/bash', ['-c', script], {
+    cwd: directory,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      EVENT_NAME: 'workflow_dispatch',
+      SHA: 'a'.repeat(40),
+      RELEASE_TAG: 'v1.2.3',
+      GHCR_TOKEN: 'token',
+      GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+      GITHUB_ACTOR: 'release-test',
+      GITHUB_OUTPUT: output,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const outputs = readFileSync(output, 'utf8');
+  assert.match(outputs, /digest=sha256:0{64}/);
+  assert.match(outputs, /needs_promotion=true/);
+  assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+});
+
+test('workflow rejects a pre-marker target before rsync after a boundary is recorded', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { block, script } = workflowRunScript(
+    release,
+    'Verify server schema compatibility',
+    'Sync repo to server',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-release-boundary-'));
+  const bin = join(directory, 'bin');
+  const remote = join(directory, 'remote');
+  mkdirSync(bin);
+  mkdirSync(join(remote, '.release'), { recursive: true });
+  writeFileSync(join(remote, '.release', 'minimum-schema-compatibility'), '1\n');
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(bin, 'ssh'),
+    '#!/bin/sh\nexec /bin/bash -s\n',
+  );
+  chmodSync(join(bin, 'ssh'), 0o755);
+
+  const result = spawnSync('/bin/bash', ['-c', script], {
+    cwd: directory,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      TARGET_SCHEMA_COMPATIBILITY: '0',
+      DEPLOY_USER: 'release-test',
+      DEPLOY_HOST: 'example.test',
+      DEPLOY_PATH: remote,
+      HOME: directory,
+    },
+  });
+
+  assert.match(block, /minimum-schema-compatibility/);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /schema compatibility 0 is below server minimum 1/);
+  assert.ok(
+    release.indexOf('- name: Verify server schema compatibility') <
+      release.indexOf('- name: Sync repo to server'),
+  );
+});
+
 test('server crosses an explicit no-rollback boundary after irreversible migration', () => {
   const deploy = read('deploy/release-deploy.sh');
   const migration = deploy.indexOf('if ! compose run --rm migrate; then');
@@ -257,6 +368,8 @@ test('server crosses an explicit no-rollback boundary after irreversible migrati
   assert.match(deploy, /pg_constraint/);
   assert.match(deploy, /User_vipLevel_check/);
   assert.match(deploy, /Circle_joinVipRestriction_check/);
+  assert.match(deploy, /CirclePost_vipRestriction_check/);
+  assert.match(deploy, /CirclePost_signupVipRestriction_check/);
   assert.match(
     deploy,
     /if ! compose run --rm migrate; then[\s\S]*handle_irreversible_migration_command_failure/,
@@ -269,6 +382,8 @@ test('server crosses an explicit no-rollback boundary after irreversible migrati
     deploy,
     /if irreversible_boundary_crossed; then[\s\S]*enter_irreversible_maintenance/,
   );
+  assert.match(deploy, /minimum-schema-compatibility/);
+  assert.match(deploy, /schema compatibility.*below server minimum/);
 });
 
 test('admin deploy validates digests, uses strict smoke checks, and rolls back', () => {

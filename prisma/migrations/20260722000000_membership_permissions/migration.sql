@@ -22,6 +22,24 @@ END
 WHERE "joinVipRestriction" IS NOT NULL
   AND ("joinVipRestriction" <= 0 OR "joinVipRestriction" > 4);
 
+UPDATE "CirclePost"
+SET "vipRestriction" = CASE
+  WHEN "vipRestriction" <= 0 THEN NULL
+  WHEN "vipRestriction" > 4 THEN 4
+  ELSE "vipRestriction"
+END
+WHERE "vipRestriction" IS NOT NULL
+  AND ("vipRestriction" <= 0 OR "vipRestriction" > 4);
+
+UPDATE "CirclePost"
+SET "signupVipRestriction" = CASE
+  WHEN "signupVipRestriction" <= 0 THEN NULL
+  WHEN "signupVipRestriction" > 4 THEN 4
+  ELSE "signupVipRestriction"
+END
+WHERE "signupVipRestriction" IS NOT NULL
+  AND ("signupVipRestriction" <= 0 OR "signupVipRestriction" > 4);
+
 ALTER TABLE "User"
   ADD CONSTRAINT "User_vipLevel_check"
   CHECK ("vipLevel" BETWEEN 0 AND 4);
@@ -29,6 +47,12 @@ ALTER TABLE "User"
 ALTER TABLE "Circle"
   ADD CONSTRAINT "Circle_joinVipRestriction_check"
   CHECK ("joinVipRestriction" IS NULL OR "joinVipRestriction" BETWEEN 1 AND 4);
+
+ALTER TABLE "CirclePost"
+  ADD CONSTRAINT "CirclePost_vipRestriction_check"
+  CHECK ("vipRestriction" IS NULL OR "vipRestriction" BETWEEN 1 AND 4),
+  ADD CONSTRAINT "CirclePost_signupVipRestriction_check"
+  CHECK ("signupVipRestriction" IS NULL OR "signupVipRestriction" BETWEEN 1 AND 4);
 
 CREATE TABLE "MembershipGrant" (
   "id" TEXT NOT NULL,

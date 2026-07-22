@@ -518,6 +518,73 @@ describe('CirclePlazaService', () => {
     jest.useRealTimers();
   });
 
+  it('stores legacy zero VIP restrictions as no restriction', async () => {
+    prisma.circleMember.findMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args?.select?.userID
+          ? []
+          : [
+              {
+                circleID: 'circle-1',
+                id: 'member-1',
+                status: 'ACTIVE',
+                role: 'MEMBER',
+                circle: {
+                  id: 'circle-1',
+                  deleted: false,
+                  memberCanPost: true,
+                },
+              },
+            ],
+      ),
+    );
+    prisma.circlePost.create.mockResolvedValue({
+      id: 'post-1',
+      content: 'hello plaza',
+      images: [],
+      tags: [],
+      city: null,
+      cities: [],
+      isHorn: false,
+      noteID: null,
+      vipRestriction: null,
+      creditRestriction: null,
+      fancyRestriction: false,
+      viewCount: 0,
+      signupCount: 0,
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+      author: {
+        id: 'user-1',
+        nickname: 'Host',
+        avatarUrl: null,
+        avatarFrame: null,
+        accountId: '1001',
+      },
+      circle: { id: 'circle-1', name: 'Board games' },
+      circleLinks: [],
+      createdAt: new Date('2026-07-21T12:00:00.000Z'),
+      expiresAt: new Date('2026-07-22T12:00:00.000Z'),
+    });
+
+    await service.createPost('user-1', {
+      circleId: 'circle-1',
+      content: 'hello plaza',
+      vipRestriction: 0,
+      signupVipRestriction: 0,
+    });
+
+    expect(prisma.circlePost.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          vipRestriction: null,
+          signupVipRestriction: null,
+        }),
+      }),
+    );
+  });
+
   it('fans out a new-activity notification to active circle members after publishing', async () => {
     // 发帖成员校验用 include，扇出取成员用 select.userID —— 按参数分流，不依赖调用顺序。
     prisma.circleMember.findMany.mockImplementation((args: any) => {

@@ -45,6 +45,13 @@ FROM "Circle"
 WHERE "joinVipRestriction" IS NOT NULL
   AND "joinVipRestriction" NOT BETWEEN 1 AND 4;
 
+SELECT COUNT(*) AS invalid_post_restrictions
+FROM "CirclePost"
+WHERE ("vipRestriction" IS NOT NULL
+       AND "vipRestriction" NOT BETWEEN 1 AND 4)
+   OR ("signupVipRestriction" IS NOT NULL
+       AND "signupVipRestriction" NOT BETWEEN 1 AND 4);
+
 SELECT column_name
 FROM information_schema.columns
 WHERE table_name = 'User' AND column_name = 'vipExpiresAt';
@@ -53,7 +60,7 @@ SELECT to_regclass('public."MembershipGrant"') AS membership_grant,
        to_regclass('public."MembershipBenefitGrant"') AS benefit_grant;
 ```
 
-Both invalid counts must be zero, `vipExpiresAt` must be returned, and both table
+All invalid counts must be zero, `vipExpiresAt` must be returned, and both table
 names must be non-null. Also verify `/readyz`, the authenticated membership read,
 one regular account, one active paid account, one expired account, and a legacy
 level-5 account normalized to effective super membership.
@@ -61,9 +68,9 @@ level-5 account normalized to effective super membership.
 ## Failure Boundary
 
 - If the migration command exits nonzero, the script probes the target database
-  for both membership check constraints. It restarts the old binary only when
-  neither constraint exists, which proves the transactional migration is
-  unapplied. Both constraints present means applied; one constraint, probe
+  for all four membership check constraints. It restarts the old binary only when
+  none exists, which proves the transactional migration is unapplied. All four
+  constraints present means applied; a partial set, probe
   failure, or malformed output is ambiguous. Applied and ambiguous states remain
   in maintenance.
 - After migration success: startup, health, Caddy validation/reload, active-color
@@ -75,6 +82,28 @@ For a post-migration failure, prefer a forward fix built on the membership
 contract. To run an old binary, first stop all application writers, restore the
 recorded pre-migration dump, verify the restored schema, and only then deploy the
 old image. Restoring only the binary is prohibited.
+
+The server persists the compatibility floor at
+`~/circle_be/.release/minimum-schema-compatibility`, outside the rsynced tree.
+After a full database restore, verify the four membership constraints are absent:
+
+```sql
+SELECT count(*)
+FROM pg_constraint
+WHERE conname IN (
+  'User_vipLevel_check',
+  'Circle_joinVipRestriction_check',
+  'CirclePost_vipRestriction_check',
+  'CirclePost_signupVipRestriction_check'
+);
+```
+
+Only when that query returns `0`, explicitly clear the boundary before deploying
+a pre-marker tag:
+
+```bash
+rm -f ~/circle_be/.release/minimum-schema-compatibility
+```
 
 ## Marker Removal
 

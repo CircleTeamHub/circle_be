@@ -7,6 +7,7 @@ import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import {
+  CreateCircleDto,
   SetCircleAvatarDto,
   SetCircleCoverDto,
   UploadCircleIconDto,
@@ -295,6 +296,41 @@ describe('CircleService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  it('stores legacy joinVipRestriction zero as no restriction', async () => {
+    prisma.user.findUnique.mockResolvedValue({ vipLevel: 3 });
+    prisma.circle.create.mockResolvedValue({
+      id: 'circle-1',
+      name: 'Food Circle',
+      description: 'a'.repeat(20),
+      avatarUrl: null,
+      ownerID: 'user-1',
+      cities: [],
+      categories: ['food'],
+      rules: '',
+      tags: [],
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      maxMembers: null,
+      memberCanPost: true,
+      groupID: null,
+      memberCount: 1,
+      postCount: 0,
+      createdAt: new Date('2026-07-21T12:00:00.000Z'),
+    });
+
+    await service.createCircle('user-1', {
+      name: 'Food Circle',
+      categories: ['food'],
+      description: 'a'.repeat(20),
+      joinVipRestriction: 0,
+    });
+
+    expect(prisma.circle.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ joinVipRestriction: null }),
+    });
+  });
+
   it('lets the circle owner update the cover image', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -549,7 +585,7 @@ describe('CircleService', () => {
   });
 });
 
-describe('circle image DTO validation', () => {
+describe('circle DTO validation', () => {
   function validate(dto: new () => object, payload: Record<string, unknown>) {
     return validateSync(plainToInstance(dto, payload));
   }
@@ -580,5 +616,32 @@ describe('circle image DTO validation', () => {
 
     expect(coverErrors[0]?.constraints).toHaveProperty('isUrl');
     expect(avatarErrors[0]?.constraints).toHaveProperty('isUrl');
+  });
+
+  it.each([0, 1, 2, 3, 4])(
+    'accepts compatible join VIP restriction %i',
+    (joinVipRestriction) => {
+      expect(
+        validate(CreateCircleDto, {
+          name: 'Test Circle',
+          categories: ['test'],
+          description: 'a valid circle description',
+          joinVipRestriction,
+        }),
+      ).toHaveLength(0);
+    },
+  );
+
+  it('rejects join VIP restrictions above level 4', () => {
+    const errors = validate(CreateCircleDto, {
+      name: 'Test Circle',
+      categories: ['test'],
+      description: 'a valid circle description',
+      joinVipRestriction: 5,
+    });
+
+    expect(
+      errors.find((error) => error.property === 'joinVipRestriction'),
+    ).toHaveProperty('constraints.max');
   });
 });

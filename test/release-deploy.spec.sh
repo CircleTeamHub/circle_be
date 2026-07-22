@@ -13,7 +13,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -72,7 +72,7 @@ if [ "${1:-}" = "compose" ]; then
       if printf '%s\n' "$*" | grep -q 'User_vipLevel_check'; then
         case "${CONTRACT_PROBE_STATE:-none}" in
           none) printf '0\n' ;;
-          both) printf '2\n' ;;
+          both) printf '4\n' ;;
           partial) printf '1\n' ;;
           error) exit 45 ;;
           *) exit 46 ;;
@@ -175,6 +175,8 @@ run_release() {
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
+    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-1}" \
+    SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
     CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
@@ -358,6 +360,30 @@ test_marker_requires_irreversible_confirmation() {
   grep -q 'requires RELEASE_IRREVERSIBLE_MIGRATION=1' "$CASE_DIR/release.log"
 }
 
+test_pre_marker_release_is_rejected_after_boundary_is_recorded() {
+  new_case
+  printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
+  RELEASE_SCHEMA_COMPATIBILITY=0
+  SCHEMA_COMPATIBILITY_PATH="$CASE_DIR/no-schema-compatibility"
+  ! run_release || return 1
+  grep -q 'schema compatibility 0 is below server minimum 1' "$CASE_DIR/release.log" &&
+    [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
+test_release_cannot_understate_checked_out_schema_compatibility() {
+  new_case
+  RELEASE_SCHEMA_COMPATIBILITY=0
+  ! run_release || return 1
+  grep -q 'does not match checked-out schema compatibility 1' "$CASE_DIR/release.log" &&
+    [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
+test_irreversible_release_records_minimum_schema_compatibility() {
+  prepare_irreversible_case
+  run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "1" ]
+}
+
 test_irreversible_migration_failure_restores_old_binary() {
   prepare_irreversible_case
   MIGRATE_FAIL=1
@@ -432,6 +458,9 @@ for test_name in \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
+  test_pre_marker_release_is_rejected_after_boundary_is_recorded \
+  test_release_cannot_understate_checked_out_schema_compatibility \
+  test_irreversible_release_records_minimum_schema_compatibility \
   test_irreversible_migration_failure_restores_old_binary \
   test_irreversible_post_commit_cli_failure_stays_in_maintenance \
   test_irreversible_partial_contract_probe_stays_in_maintenance \

@@ -16,6 +16,8 @@
 #                      (旧代码 + 新 schema 需共存到切换完成)。
 #   RELEASE_IRREVERSIBLE_MIGRATION=1 可选,确认本次迁移越过旧二进制
 #                      回滚下限。必须同时启用 RELEASE_DOWNTIME=1。
+#   RELEASE_SCHEMA_COMPATIBILITY 可选,发布镜像支持的 schema 兼容级别；CI
+#                      显式传入，手工执行时从 deploy/SCHEMA_COMPATIBILITY 读取。
 #
 # 发版契约:
 # - 只接受 v* 版本 tag;
@@ -43,6 +45,41 @@ fi
 
 if [[ ! "$CIRCLE_BE_IMAGE" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
   echo "CIRCLE_BE_IMAGE must be an immutable ghcr.io image digest" >&2
+  exit 1
+fi
+
+RELEASE_STATE_DIR="${RELEASE_STATE_DIR:-.release}"
+SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-deploy/SCHEMA_COMPATIBILITY}"
+MINIMUM_SCHEMA_COMPATIBILITY_PATH="$RELEASE_STATE_DIR/minimum-schema-compatibility"
+checked_out_schema_compatibility=0
+if [ -e "$SCHEMA_COMPATIBILITY_PATH" ]; then
+  checked_out_schema_compatibility="$(cat "$SCHEMA_COMPATIBILITY_PATH")"
+  if [[ ! "$checked_out_schema_compatibility" =~ ^[0-9]+$ ]]; then
+    echo "Invalid checked-out schema compatibility: $SCHEMA_COMPATIBILITY_PATH" >&2
+    exit 1
+  fi
+fi
+if [ -z "${RELEASE_SCHEMA_COMPATIBILITY:-}" ]; then
+  RELEASE_SCHEMA_COMPATIBILITY="$checked_out_schema_compatibility"
+fi
+if [[ ! "$RELEASE_SCHEMA_COMPATIBILITY" =~ ^[0-9]+$ ]]; then
+  echo "Invalid release schema compatibility: $RELEASE_SCHEMA_COMPATIBILITY" >&2
+  exit 1
+fi
+if (( RELEASE_SCHEMA_COMPATIBILITY != checked_out_schema_compatibility )); then
+  echo "Release schema compatibility $RELEASE_SCHEMA_COMPATIBILITY does not match checked-out schema compatibility $checked_out_schema_compatibility." >&2
+  exit 1
+fi
+minimum_schema_compatibility=0
+if [ -e "$MINIMUM_SCHEMA_COMPATIBILITY_PATH" ]; then
+  minimum_schema_compatibility="$(cat "$MINIMUM_SCHEMA_COMPATIBILITY_PATH")"
+  if [[ ! "$minimum_schema_compatibility" =~ ^[0-9]+$ ]]; then
+    echo "Invalid server schema boundary: $MINIMUM_SCHEMA_COMPATIBILITY_PATH" >&2
+    exit 1
+  fi
+fi
+if (( RELEASE_SCHEMA_COMPATIBILITY < minimum_schema_compatibility )); then
+  echo "Release schema compatibility $RELEASE_SCHEMA_COMPATIBILITY is below server minimum $minimum_schema_compatibility; restore and verify the database before explicitly clearing $MINIMUM_SCHEMA_COMPATIBILITY_PATH." >&2
   exit 1
 fi
 
@@ -85,8 +122,6 @@ container_upstream() {
   printf '%s:3000\n' "${name#/}"
 }
 
-RELEASE_STATE_DIR="${RELEASE_STATE_DIR:-.release}"
-
 recorded_live_color() {
   cat "$RELEASE_STATE_DIR/active-color" 2>/dev/null || true
 }
@@ -97,6 +132,21 @@ persist_active_color() {
   temp="$RELEASE_STATE_DIR/active-color.tmp.$$"
   printf '%s\n' "$color" > "$temp"
   mv -f "$temp" "$RELEASE_STATE_DIR/active-color"
+}
+
+persist_minimum_schema_compatibility() {
+  local target="$1" current temp
+  current=0
+  if [ -e "$MINIMUM_SCHEMA_COMPATIBILITY_PATH" ]; then
+    current="$(cat "$MINIMUM_SCHEMA_COMPATIBILITY_PATH")"
+  fi
+  if (( target <= current )); then
+    return 0
+  fi
+  mkdir -p "$RELEASE_STATE_DIR"
+  temp="$MINIMUM_SCHEMA_COMPATIBILITY_PATH.tmp.$$"
+  printf '%s\n' "$target" > "$temp"
+  mv -f "$temp" "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"
 }
 
 switch_proxy() {
@@ -281,6 +331,12 @@ async function main() {
           OR
           (table_record.relname = 'Circle'
             AND constraint_record.conname = 'Circle_joinVipRestriction_check')
+          OR
+          (table_record.relname = 'CirclePost'
+            AND constraint_record.conname = 'CirclePost_vipRestriction_check')
+          OR
+          (table_record.relname = 'CirclePost'
+            AND constraint_record.conname = 'CirclePost_signupVipRestriction_check')
         )
     `);
     process.stdout.write(String(result.rows[0].count));
@@ -303,7 +359,7 @@ NODE
 
   case "$constraint_count" in
     0) printf 'unapplied\n' ;;
-    2) printf 'applied\n' ;;
+    4) printf 'applied\n' ;;
     *) printf 'ambiguous\n' ;;
   esac
 }
@@ -409,6 +465,17 @@ fi
 if [ "${RELEASE_DOWNTIME:-0}" = "1" ] && [ -n "$live" ]; then
   echo "==> Downtime mode: stopping $live before migration"
   compose stop "$live"
+fi
+
+# Persist the boundary before the irreversible command. If the process is
+# interrupted after the database changes, a later pre-marker release still
+# fails closed even though its checked-out tree lacks this script.
+if [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ]; then
+  if ! persist_minimum_schema_compatibility "$RELEASE_SCHEMA_COMPATIBILITY"; then
+    echo "Could not persist the irreversible schema compatibility boundary." >&2
+    restore_live || true
+    exit 1
+  fi
 fi
 
 # ── 用发布镜像跑迁移 ────────────────────────────────────────────

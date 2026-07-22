@@ -63,15 +63,20 @@ describe('MembershipService', () => {
     service = module.get<MembershipService>(MembershipService);
   });
 
-  it('returns VIP1 to VIP5 plans priced in points', () => {
+  it('returns only VIP1 to VIP4 plans priced in points', () => {
     const plans = service.getPlans();
 
-    expect(plans).toHaveLength(5);
-    expect(plans.map((plan) => plan.level)).toEqual([1, 2, 3, 4, 5]);
-    expect(plans.map((plan) => plan.price)).toEqual([
-      780, 1280, 2100, 4600, 9100,
-    ]);
+    expect(plans).toHaveLength(4);
+    expect(plans.map((plan) => plan.level)).toEqual([1, 2, 3, 4]);
+    expect(plans.map((plan) => plan.price)).toEqual([780, 1280, 2100, 4600]);
     expect(JSON.stringify(plans)).not.toContain('帮积分');
+  });
+
+  it('rejects VIP5 before opening a transaction', async () => {
+    await expect(service.upgrade('user-1', 5)).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('deducts points and upgrades the user VIP level atomically', async () => {
