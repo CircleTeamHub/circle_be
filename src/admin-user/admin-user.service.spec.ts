@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { UserRole, UserStatus } from 'src/generated/prisma';
 import { AdminUserErrorCode } from 'src/common/app-error-codes';
 import { AdminUserService } from './admin-user.service';
@@ -511,10 +512,70 @@ describe('AdminUserService', () => {
             confirmationAccountId: 'support-admin',
           }),
         ).rejects.toMatchObject({
+          // 自保护是权限拒绝，错误目录把它定为 403，不是参数错误的 400。
+          status: 403,
           response: { errorCode: AdminUserErrorCode.SelfStatusChange },
         });
       },
     );
+
+    it('emits the admin_user_status_changed business event after commit', async () => {
+      // 测试环境下 logOn 默认关，businessLogOn 是它的与项，两个都要打开。
+      const previous = {
+        log: process.env.LOG_ON,
+        business: process.env.BUSINESS_LOG_ON,
+      };
+      process.env.LOG_ON = 'true';
+      process.env.BUSINESS_LOG_ON = 'true';
+      try {
+        const logged = new AdminUserService(
+          prisma as never,
+          audit as never,
+          sessionRevocation as never,
+          realtime as never,
+        );
+        const logSpy = jest
+          .spyOn(Logger.prototype, 'log')
+          .mockImplementation(() => undefined);
+        tx.user.findUnique.mockResolvedValue({
+          id: 'user-1',
+          accountId: 'jim-1001',
+          status: UserStatus.ACTIVE,
+        });
+        tx.user.updateMany.mockResolvedValue({ count: 1 });
+        tx.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+        audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+        await logged.updateStatus(actor, 'user-1', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        });
+
+        expect(logSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            businessEvent: 'admin_user_status_changed',
+            actorId: 'admin-1',
+            targetId: 'user-1',
+            result: 'success',
+            metadata: expect.objectContaining({
+              oldStatus: UserStatus.ACTIVE,
+              newStatus: UserStatus.BANNED,
+              reason: 'policy violation',
+            }),
+          }),
+          'BusinessEvent',
+        );
+        logSpy.mockRestore();
+      } finally {
+        for (const [key, value] of [
+          ['LOG_ON', previous.log],
+          ['BUSINESS_LOG_ON', previous.business],
+        ] as const) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
 
     it.each([undefined, 'wrong-account'])(
       'requires the exact account ID for deletion (%s)',

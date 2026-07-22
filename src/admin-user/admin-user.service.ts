@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -10,6 +11,8 @@ import type { AuthenticatedUser } from 'src/auth/types';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { AdminUserErrorCode } from 'src/common/app-error-codes';
 import { Prisma, UserStatus } from 'src/generated/prisma';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { createLoggingConfig } from 'src/logging/logging.config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { AdminUserAuditService } from './admin-user-audit.service';
@@ -65,6 +68,7 @@ const ADMIN_USER_DETAIL_SELECT = {
 @Injectable()
 export class AdminUserService {
   private readonly logger = new Logger(AdminUserService.name);
+  private readonly loggingConfig = createLoggingConfig();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -313,7 +317,8 @@ export class AdminUserService {
         actor.userId === targetId &&
         (dto.status === UserStatus.BANNED || dto.status === UserStatus.DELETED)
       ) {
-        throw new BadRequestException({
+        // 这是权限自保护，不是参数问题；错误目录也把它定为 403。
+        throw new ForbiddenException({
           message: '不能封禁或删除当前管理员账号',
           errorCode: AdminUserErrorCode.SelfStatusChange,
         });
@@ -382,6 +387,7 @@ export class AdminUserService {
         id: current.id,
         accountId: current.accountId,
         status: dto.status,
+        previousStatus: current.status,
       };
     });
 
@@ -397,7 +403,28 @@ export class AdminUserService {
       this.realtime.broadcastUserProfileSummary(targetId),
     );
 
-    return result;
+    // 审计表之外还要留一条业务事件：封禁/解封/删除本来就统计在
+    // business_events_total 与结构化日志里，管理台迁到这个接口后不能断流。
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'admin_user_status_changed',
+      actorId: actor.userId,
+      targetId,
+      result: 'success',
+      entityType: 'user',
+      entityId: targetId,
+      metadata: {
+        oldStatus: result.previousStatus,
+        newStatus: dto.status,
+        reason,
+      },
+    });
+
+    return {
+      id: result.id,
+      accountId: result.accountId,
+      status: result.status,
+    };
   }
 
   private async runPostCommitHook(

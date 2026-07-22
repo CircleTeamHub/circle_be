@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsDateString,
   IsEnum,
@@ -14,6 +14,13 @@ import {
 } from 'class-validator';
 import { UserRole, UserStatus } from 'src/generated/prisma';
 import { SENSITIVE_FIELDS, SensitiveField } from '../admin-user.constants';
+
+// 审计原因必须是真内容：不 trim 的话 '   ' 能过 MinLength(3)，管理员就能在
+// 只留一串空格的情况下查看/封禁，审计留痕等于没留。
+const TrimmedReason = () =>
+  Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() : value,
+  );
 
 export class ListAdminUsersQueryDto {
   @ApiPropertyOptional({ maxLength: 100 })
@@ -64,6 +71,7 @@ export class RevealSensitiveFieldDto {
   field: SensitiveField;
 
   @ApiProperty({ minLength: 3, maxLength: 500 })
+  @TrimmedReason()
   @IsString()
   @MinLength(3)
   @MaxLength(500)
@@ -76,6 +84,7 @@ export class AdminUpdateUserStatusDto {
   status: UserStatus;
 
   @ApiProperty({ minLength: 3, maxLength: 500 })
+  @TrimmedReason()
   @IsString()
   @MinLength(3)
   @MaxLength(500)

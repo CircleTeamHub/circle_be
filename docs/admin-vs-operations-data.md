@@ -50,7 +50,8 @@ Admin data is for moderators, support, and business operators. It should answer:
 - `GET /api/v1/admin/friend-reports`
 - `POST /api/v1/admin/friend-reports/:reportId/review`
 - `GET /api/v1/user`
-- `PATCH /api/v1/user/:id/status`
+- `PATCH /api/v1/admin/users/:id/status`（唯一的状态变更入口，带审计留痕；
+  原先无审计的 `PATCH /api/v1/user/:id/status` 已随 #121 移除）
 - `GET /api/v1/auth/me`
 - `GET /api/v1/outbox/health`
 

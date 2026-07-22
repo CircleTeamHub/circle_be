@@ -47,8 +47,37 @@ describe('Admin user DTOs', () => {
   it.each([
     [{ field: 'passwordHash', reason: 'support-123' }],
     [{ field: 'email', reason: 'no' }],
+    // 空白理由必须在 DTO 层就挡掉：查看明文一定要留下真正的审计理由。
+    [{ field: 'email', reason: '   ' }],
+    [{ field: 'email', reason: '\t\n  ' }],
   ])('rejects invalid sensitive reveal %j', async (input) => {
     await expectInvalid(RevealSensitiveFieldDto, input);
+  });
+
+  it.each(['   ', ' \t ', '\n\n'])(
+    'rejects a whitespace-only status reason %j',
+    async (reason) => {
+      await expectInvalid(AdminUpdateUserStatusDto, {
+        status: UserStatus.BANNED,
+        reason,
+      });
+    },
+  );
+
+  it('trims the reasons it keeps', async () => {
+    const reveal = plainToInstance(RevealSensitiveFieldDto, {
+      field: 'email',
+      reason: '  support-123  ',
+    });
+    const status = plainToInstance(AdminUpdateUserStatusDto, {
+      status: UserStatus.BANNED,
+      reason: '  abuse reports  ',
+    });
+
+    await expect(validate(reveal)).resolves.toEqual([]);
+    await expect(validate(status)).resolves.toEqual([]);
+    expect(reveal.reason).toBe('support-123');
+    expect(status.reason).toBe('abuse reports');
   });
 
   it('accepts a valid sensitive reveal', async () => {

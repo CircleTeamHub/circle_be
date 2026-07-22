@@ -18,8 +18,6 @@ import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
 import { likedOnToday } from '../like/like.util';
-import { createLoggingConfig } from 'src/logging/logging.config';
-import { logBusinessEvent } from 'src/logging/business-event.logger';
 import {
   generateUniqueRegistrationCode,
   isInviteCodeUniqueCollision,
@@ -140,7 +138,6 @@ function normalizeUpdateInput(input: UpdateUserInput) {
 @Injectable()
 export class UserService {
   private readonly logger = new Logger(UserService.name);
-  private readonly loggingConfig = createLoggingConfig();
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -378,46 +375,8 @@ export class UserService {
     };
   }
 
-  async updateStatus(
-    id: string,
-    status: UserStatus,
-    options: { actorId?: string; reason?: string } = {},
-  ) {
-    const current = await this.findOne(id);
-    const [user, displayIcons] = await Promise.all([
-      this.prisma.user.update({
-        where: { id },
-        data: { status },
-        select: PUBLIC_SELECT,
-      }),
-      this.iconService.getDisplayIconsForUser(id),
-    ]);
-    // BAN / DELETE must invalidate sessions immediately. ACTIVE → ACTIVE is a
-    // no-op revoke call; cheaper than introducing a branch.
-    if (status !== UserStatus.ACTIVE) {
-      await this.refreshTokens.revokeAll(id);
-    }
-    await this.realtimeService.invalidateUserProfileSummaryCache(id);
-    await this.realtimeService.broadcastUserProfileSummary(id);
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'admin_user_status_changed',
-      actorId: options.actorId,
-      targetId: id,
-      result: 'success',
-      entityType: 'user',
-      entityId: id,
-      metadata: {
-        oldStatus: current.status,
-        newStatus: status,
-        reason: options.reason,
-      },
-    });
-    return {
-      ...user,
-      displayIcons,
-    };
-  }
+  // updateStatus 已移除：管理端状态变更统一走 AdminUserService（#121），那里带
+  // 事务、状态机校验、删除确认和 AdminAuditLog 留痕，这里的无审计版本是后门。
 
   async updateBasicProfile(id: string, input: UpdateUserInput) {
     // Same storage-origin guard as `update` — an off-origin avatarUrl/cover

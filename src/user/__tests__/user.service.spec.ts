@@ -379,7 +379,7 @@ describe('UserService', () => {
     });
   });
 
-  describe('remove + updateStatus', () => {
+  describe('remove', () => {
     beforeEach(() => {
       prisma.user.findUnique.mockResolvedValue({ id: 'user-1' });
       prisma.user.update.mockResolvedValue({ id: 'user-1' });
@@ -394,16 +394,6 @@ describe('UserService', () => {
         }),
       );
       expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
-    });
-
-    it('updateStatus to BANNED revokes sessions', async () => {
-      await service.updateStatus('user-1', UserStatus.BANNED);
-      expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
-    });
-
-    it('updateStatus back to ACTIVE does not revoke sessions', async () => {
-      await service.updateStatus('user-1', UserStatus.ACTIVE);
-      expect(refreshTokens.revokeAll).not.toHaveBeenCalled();
     });
   });
 });
