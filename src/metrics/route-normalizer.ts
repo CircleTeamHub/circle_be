@@ -64,7 +64,6 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/logs',
   '/api/v1/mall/sections',
   '/api/v1/membership/plans',
-  '/api/v1/membership/upgrade',
   '/api/v1/note',
   '/api/v1/note/group',
   '/api/v1/note/group/order',

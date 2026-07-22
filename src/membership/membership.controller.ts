@@ -1,12 +1,4 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Headers,
-  Post,
-  Req,
-  UseGuards,
-} from '@nestjs/common';
+import { Controller, Get, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -14,11 +6,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import {
-  MembershipPlanDto,
-  UpgradeMembershipDto,
-  UpgradeMembershipResponseDto,
-} from './dto/membership.dto';
+import { MembershipPlanDto } from './dto/membership.dto';
 import { MembershipService } from './membership.service';
 
 @ApiTags('Membership')
@@ -33,21 +21,5 @@ export class MembershipController {
   @ApiOkResponse({ type: [MembershipPlanDto] })
   getPlans(): MembershipPlanDto[] {
     return this.membershipService.getPlans();
-  }
-
-  @Post('upgrade')
-  @ApiOperation({ summary: 'Upgrade current user VIP level with points' })
-  @ApiOkResponse({ type: UpgradeMembershipResponseDto })
-  upgrade(
-    @Body() dto: UpgradeMembershipDto,
-    @Req() req: any,
-    // #91：可选（旧客户端兼容）。同 key 重试回放当前状态，不重复扣费。
-    @Headers('idempotency-key') idempotencyKey?: string,
-  ): Promise<UpgradeMembershipResponseDto> {
-    return this.membershipService.upgrade(
-      req.user.userId,
-      dto.level,
-      idempotencyKey?.trim() || undefined,
-    );
   }
 }

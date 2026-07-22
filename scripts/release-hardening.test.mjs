@@ -306,48 +306,35 @@ esac
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
 });
 
-test('workflow rejects a pre-marker target before rsync after a boundary is recorded', (t) => {
+test('workflow stages target content and delegates activation to the persistent launcher', () => {
   const release = read('.github/workflows/release.yml');
-  const { block, script } = workflowRunScript(
+  assert.match(
     release,
-    'Verify server schema compatibility',
-    'Sync repo to server',
+    /ref: \$\{\{ github\.workflow_sha \}\}[\s\S]*path: \.release-workflow/,
   );
-  const directory = mkdtempSync(join(tmpdir(), 'circle-release-boundary-'));
-  const bin = join(directory, 'bin');
-  const remote = join(directory, 'remote');
-  mkdirSync(bin);
-  mkdirSync(join(remote, '.release'), { recursive: true });
-  writeFileSync(join(remote, '.release', 'minimum-schema-compatibility'), '1\n');
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-
-  writeFileSync(
-    join(bin, 'ssh'),
-    '#!/bin/sh\nexec /bin/bash -s\n',
+  assert.match(
+    release,
+    /stage_path="\$DEPLOY_PATH\/\.release\/incoming\/\$STAGED_RELEASE_NAME"/,
   );
-  chmodSync(join(bin, 'ssh'), 0o755);
+  assert.match(release, /\.release\/release-launcher\.sh/);
+  assert.doesNotMatch(release, /exec bash %q\/deploy\/release-deploy\.sh/);
+});
 
-  const result = spawnSync('/bin/bash', ['-c', script], {
-    cwd: directory,
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH}`,
-      TARGET_SCHEMA_COMPATIBILITY: '0',
-      DEPLOY_USER: 'release-test',
-      DEPLOY_HOST: 'example.test',
-      DEPLOY_PATH: remote,
-      HOME: directory,
-    },
-  });
-
-  assert.match(block, /minimum-schema-compatibility/);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /schema compatibility 0 is below server minimum 1/);
-  assert.ok(
-    release.indexOf('- name: Verify server schema compatibility') <
-      release.indexOf('- name: Sync repo to server'),
+test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
+  const launcher = read('deploy/release-launcher.sh');
+  const lock = launcher.indexOf('flock -x 201');
+  const floor = launcher.indexOf(
+    'cat "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"',
+    lock,
   );
+  const activation = launcher.indexOf('rsync ', floor);
+  const target = launcher.indexOf('bash deploy/release-deploy.sh', activation);
+
+  assert.match(launcher, /exec 201>"\$RELEASE_STATE_DIR\/deploy\.lock"/);
+  assert.ok(lock >= 0 && lock < floor);
+  assert.ok(floor < activation);
+  assert.ok(activation < target);
+  assert.doesNotMatch(launcher.slice(lock, target), /flock -u/);
 });
 
 test('server crosses an explicit no-rollback boundary after irreversible migration', () => {
@@ -408,6 +395,7 @@ test('backend CI blocks release contract regressions', () => {
 
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
+  assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
 });
 
 test('release selection and active-color state fail closed', () => {

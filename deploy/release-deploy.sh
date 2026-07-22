@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# 服务器端蓝绿发版。由 .github/workflows/release.yml 通过 SSH 驱动;
-# 也可以手动执行(回滚/重放,见 DEPLOY.md §6):
-#
-#   RELEASE_TAG=v0.1.0 \
-#   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64-hex-digest> \
-#     bash deploy/release-deploy.sh
+# 服务器端蓝绿发版目标脚本。只能由 rsync 树外的持久 launcher 在持锁状态下调用;
+# workflow 和手工回滚入口见 DEPLOY.md §6。
 #
 # 环境变量:
 #   RELEASE_TAG        必填,v 开头的版本 tag
@@ -16,8 +12,8 @@
 #                      (旧代码 + 新 schema 需共存到切换完成)。
 #   RELEASE_IRREVERSIBLE_MIGRATION=1 可选,确认本次迁移越过旧二进制
 #                      回滚下限。必须同时启用 RELEASE_DOWNTIME=1。
-#   RELEASE_SCHEMA_COMPATIBILITY 可选,发布镜像支持的 schema 兼容级别；CI
-#                      显式传入，手工执行时从 deploy/SCHEMA_COMPATIBILITY 读取。
+#   RELEASE_SCHEMA_COMPATIBILITY 必填(由 launcher 传入),发布镜像支持的 schema
+#                      兼容级别。
 #
 # 发版契约:
 # - 只接受 v* 版本 tag;
@@ -30,6 +26,11 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+if [ "${RELEASE_LAUNCHER_ACTIVE:-0}" != "1" ]; then
+  echo "release-deploy.sh must be executed by the persistent release launcher" >&2
+  exit 1
+fi
 
 for name in RELEASE_TAG CIRCLE_BE_IMAGE; do
   if [ -z "${!name:-}" ]; then

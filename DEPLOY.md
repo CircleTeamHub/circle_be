@@ -132,7 +132,7 @@ push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
   缺失 sha- 镜像时立即失败，不在发版时重新构建
   promote  buildx imagetools create:把 sha- 镜像原样打上 v* 版本 tag(秒级)
-  deploy   rsync 仓库 → SSH 执行 deploy/release-deploy.sh(见下)→ runner 外部烟测
+  deploy   暂存仓库 → 持久 launcher 锁定检查/激活/执行(见下)→ runner 外部烟测
   publish  自动生成 changelog 的 GitHub Release(仅 tag push)
   notify   Discord 通知,成功失败都发(if: always())
 ```
@@ -143,7 +143,8 @@ PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实
 
 ### 服务器上:蓝绿切换,失败自动回滚
 
-`deploy/release-deploy.sh` 的顺序:
+`.release/release-launcher.sh` 先取得 rsync 树外的持久锁,重新读取 schema 兼容下限,
+再把已暂存的发布树原子激活并调用 `deploy/release-deploy.sh`。目标脚本的顺序:
 
 ```
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
@@ -182,8 +183,9 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 数据库,才能再启动旧镜像。
 
 兼容级别来自 tag 内的 `deploy/SCHEMA_COMPATIBILITY`。不可逆迁移开始前,服务器会把
-最低级别原子写入 rsync 排除的 `.release/minimum-schema-compatibility`;workflow 在
-rsync 前读取它,所以不含兼容标记的旧 tag 会在替换服务器脚本前被拒绝。该文件不是
+最低级别原子写入 rsync 排除的 `.release/minimum-schema-compatibility`;持久 launcher
+在同一把锁内重新读取它、激活目标树并等待目标脚本退出,所以并发的旧 tag 会在替换
+服务器脚本和启动容器前被拒绝。该文件不是
 普通回滚开关:只有完整恢复迁移前数据库、验证上述四个约束均不存在后,值班人员才可
 显式删除它,再运行旧 tag。
 本次会员迁移的完整值班步骤和验证 SQL 见
@@ -211,13 +213,21 @@ rsync 前读取它,所以不含兼容标记的旧 tag 会在替换服务器脚�
 - **一键回滚**:Actions → Release → Run workflow,填旧 tag(如 `v0.1.0`)。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
-- **服务器上手动**(GitHub 不可用时):
+- **服务器上手动**(GitHub 不可用时):将目标 tag 检出到 live tree 之外,按 workflow
+  的排除规则暂存到 `~/circle_be/.release/incoming/<唯一名称>/`,然后通过持久 launcher
+  激活。不要直接执行目标树内的 `deploy/release-deploy.sh`。
 
   ```bash
   cd ~/circle_be
+  stage=manual-v0.1.0-$(date +%s)
+  mkdir -p ".release/incoming/$stage"
+  rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
+    --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
+    /path/to/external-v0.1.0-checkout/ ".release/incoming/$stage/"
+  TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
   RELEASE_TAG=v0.1.0 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
-    bash deploy/release-deploy.sh
+    bash .release/release-launcher.sh "$stage"
   ```
 
   携带不可逆迁移标记的版本还必须增加

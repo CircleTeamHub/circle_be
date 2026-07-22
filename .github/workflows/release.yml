@@ -8,8 +8,8 @@
 #   promote   — on tag push only, stamp the prebuilt sha image with the version tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
-#   deploy    — rsync the tagged repo to the server and run
-#               deploy/release-deploy.sh: DB backup → migrate → start the
+#   deploy    — stage the tagged repo, then use the persistent locked launcher
+#               to activate it and run release-deploy.sh: DB backup → migrate → start the
 #               standby color → health gate → switch → public smoke test,
 #               with automatic rollback if the new version fails
 #   publish   — GitHub Release with generated notes (tag pushes only)
@@ -287,6 +287,16 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.tag }}
 
+      # A rollback target may predate the launcher. Fetch the launcher from the
+      # commit that defined this workflow, never from target tag contents.
+      - name: Checkout trusted release launcher
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-workflow
+          sparse-checkout: deploy/release-launcher.sh
+          sparse-checkout-cone-mode: false
+
       - name: Configure SSH
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -306,66 +316,62 @@ jobs:
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      # This check runs from the current workflow before checkout content can
-      # replace server scripts. A pre-boundary tag therefore cannot erase its
-      # own rollback protection through rsync.
-      - name: Verify server schema compatibility
+      - name: Install persistent release launcher
         env:
-          TARGET_SCHEMA_COMPATIBILITY: ${{ needs.resolve.outputs.schema_compatibility }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
         run: |
           set -euo pipefail
+          launcher_tmp="$DEPLOY_PATH/.release/release-launcher.sh.$GITHUB_RUN_ID.tmp"
+          ssh_target="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh_args=(-i "$HOME/.ssh/deploy_key" -o StrictHostKeyChecking=yes)
+          ssh "${ssh_args[@]}" "$ssh_target" "mkdir -p $(printf '%q' "$DEPLOY_PATH/.release")"
+          rsync -az -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            .release-workflow/deploy/release-launcher.sh "$ssh_target:$launcher_tmp"
           {
-            printf 'target_schema_compatibility=%q deploy_path=%q\n' \
-              "$TARGET_SCHEMA_COMPATIBILITY" "$DEPLOY_PATH"
+            printf 'deploy_path=%q launcher_tmp=%q\n' "$DEPLOY_PATH" "$launcher_tmp"
             cat <<'REMOTE'
           set -euo pipefail
-          minimum_file="$deploy_path/.release/minimum-schema-compatibility"
-          minimum=0
-          if [ -e "$minimum_file" ]; then
-            minimum="$(cat "$minimum_file")"
-            if [[ ! "$minimum" =~ ^[0-9]+$ ]]; then
-              echo "Invalid server schema boundary: $minimum_file" >&2
-              exit 1
-            fi
-          fi
-          if [[ ! "$target_schema_compatibility" =~ ^[0-9]+$ ]]; then
-            echo "Invalid target schema compatibility: $target_schema_compatibility" >&2
-            exit 1
-          fi
-          if (( target_schema_compatibility < minimum )); then
-            echo "Target schema compatibility $target_schema_compatibility is below server minimum $minimum; restore and verify the database before explicitly clearing $minimum_file." >&2
-            exit 1
-          fi
+          exec 201>"$deploy_path/.release/deploy.lock"
+          flock -x 201
+          install -m 0755 "$launcher_tmp" "$deploy_path/.release/release-launcher.sh"
+          rm -f "$launcher_tmp"
           REMOTE
-          } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
+          } | ssh "${ssh_args[@]}" "$ssh_target" bash -s
 
-      # Same rsync contract as the manual flow (DEPLOY.md §3), with the
-      # server-generated secrets explicitly excluded so a release can never
-      # overwrite or delete .env / .env.production.
-      - name: Sync repo to server
+      # Upload is inert. The launcher performs the only rsync into the live tree
+      # after acquiring the persistent lock and re-reading the compatibility floor.
+      - name: Stage release on server
+        id: stage
         env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
         run: |
           set -euo pipefail
+          STAGED_RELEASE_NAME="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_SHA"
+          stage_path="$DEPLOY_PATH/.release/incoming/$STAGED_RELEASE_NAME"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p $(printf '%q' "$stage_path")"
           rsync -az --delete \
             --exclude=/.env \
             --exclude=/.env.production \
             --exclude=/.release \
+            --exclude=/.release-workflow \
             --exclude=.git \
             --exclude=node_modules \
             --exclude=dist \
             --exclude=logs \
             --exclude=coverage \
             -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
-            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$stage_path/"
+          echo "name=$STAGED_RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Roll out release on server
+      - name: Activate staged release on server
         env:
+          STAGED_RELEASE_NAME: ${{ steps.stage.outputs.name }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           CIRCLE_BE_IMAGE: ${{ needs.resolve.outputs.image_ref }}
           RELEASE_DOWNTIME: ${{ inputs.downtime && '1' || '0' }}
@@ -384,9 +390,10 @@ jobs:
           # Env travels over stdin (printf %q-escaped), never argv, so the
           # registry token cannot show up in `ps` output on the server.
           {
-            printf 'export RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q RELEASE_IRREVERSIBLE_MIGRATION=%q RELEASE_SCHEMA_COMPATIBILITY=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
-              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$RELEASE_IRREVERSIBLE_MIGRATION" "$RELEASE_SCHEMA_COMPATIBILITY" "$GHCR_USER" "$GHCR_TOKEN"
-            printf 'exec bash %q/deploy/release-deploy.sh\n' "$DEPLOY_PATH"
+            printf 'export TARGET_SCHEMA_COMPATIBILITY=%q RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q RELEASE_IRREVERSIBLE_MIGRATION=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
+              "$RELEASE_SCHEMA_COMPATIBILITY" \
+              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$RELEASE_IRREVERSIBLE_MIGRATION" "$GHCR_USER" "$GHCR_TOKEN"
+            printf 'exec bash %q/.release/release-launcher.sh %q\n' "$DEPLOY_PATH" "$STAGED_RELEASE_NAME"
           } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
 
       # Outside-in verification from a network the server does not control:

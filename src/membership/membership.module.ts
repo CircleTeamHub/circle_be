@@ -1,12 +1,10 @@
 import { Module } from '@nestjs/common';
 import { MembershipController } from './membership.controller';
 import { MembershipService } from './membership.service';
-import { RealtimeModule } from 'src/realtime/realtime.module';
-import { NotificationModule } from 'src/notification/notification.module';
 import { MembershipPolicyModule } from './membership-policy.module';
 
 @Module({
-  imports: [MembershipPolicyModule, RealtimeModule, NotificationModule],
+  imports: [MembershipPolicyModule],
   controllers: [MembershipController],
   providers: [MembershipService],
   exports: [MembershipService],

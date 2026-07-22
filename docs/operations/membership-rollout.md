@@ -85,6 +85,8 @@ old image. Restoring only the binary is prohibited.
 
 The server persists the compatibility floor at
 `~/circle_be/.release/minimum-schema-compatibility`, outside the rsynced tree.
+The persistent launcher re-reads this floor after taking its deployment lock and
+holds that lock through staged-tree activation and target script completion.
 After a full database restore, verify the four membership constraints are absent:
 
 ```sql
