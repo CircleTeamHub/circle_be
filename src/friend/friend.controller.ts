@@ -258,6 +258,13 @@ export class FriendController {
     return this.friendService.getActivity(req.user.userId, activityId);
   }
 
+  // 固定路径先于 :activityId 参数路由声明。
+  @Post('activities/read-all')
+  @ApiOperation({ summary: 'Mark ALL friend activities as read' })
+  markAllActivitiesRead(@Req() req: RequestWithUser) {
+    return this.friendService.markAllActivitiesRead(req.user.userId);
+  }
+
   @Post('activities/:activityId/read')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Mark a single friend activity as read' })

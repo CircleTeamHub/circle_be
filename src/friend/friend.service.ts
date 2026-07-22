@@ -791,7 +791,8 @@ export class FriendService {
         state: FriendState.ACCEPTED,
       },
       orderBy: { updatedAt: 'desc' },
-      take: 2000,
+      // 护栏对齐实际业务上限（FRIEND_LIMIT_MEMBER）：低于它会静默吞掉合法好友。
+      take: FRIEND_LIMIT_MEMBER,
     });
 
     const friendIds = records.map((r) =>
@@ -936,6 +937,18 @@ export class FriendService {
     });
 
     return activities.map((activity) => this.toFriendActivityDto(activity));
+  }
+
+  /**
+   * 一键全部已读（review 修复）：listActivities 有 200 条护栏后，更老的未读
+   * 无法逐条到达 —— 未读数会永远不归零。批量置读是唯一不需要分页的出口。
+   */
+  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
+    const result = await this.prisma.friendActivity.updateMany({
+      where: { viewerId: userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+    return { count: result.count };
   }
 
   async getUnreadActivityCount(

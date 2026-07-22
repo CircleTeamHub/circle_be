@@ -340,7 +340,9 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     objectStoreStatus: uploadServiceForMetrics
       ? () => uploadServiceForMetrics.objectStoreStatus()
       : null,
-    redisPing: redisService ? () => redisService.ping() : null,
+    // 未启用 Redis（无 REDIS_URL 的单机部署）时不挂 ping：否则 gauge 恒 0，
+    // RedisDown 告警对着一个本来就不存在的依赖长鸣。
+    redisPing: redisService?.isEnabled() ? () => redisService.ping() : null,
   });
   app.use(
     '/metrics',

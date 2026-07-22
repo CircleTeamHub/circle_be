@@ -74,13 +74,23 @@ rotate_if_default "REDIS_PASSWORD"     "openIM123"
 rotate_if_default "MINIO_SECRET_ACCESS_KEY" "openIM123"
 
 # ── 2. etcd 裸映射钉回环（#106 第三条：它不吃 HOST_BIND_IP 前缀）──────────────
-# 匹配 "12379:2379" / '12380:2380' 两种引号与缩进变体，未命中则提示人工检查。
+# 匹配三种写法（review 修复：补上 ${HOST_BIND_IP}: 前缀形 —— openim-docker
+# 部分版本这么写，而 .env 默认 HOST_BIND_IP=0.0.0.0，照样是公网暴露，此前
+# 会漏进「未找到」分支只打警告）：
+#   - "12379:2379"                     裸映射
+#   - "${HOST_BIND_IP}:12379:2379"    变量前缀映射
+#   - "127.0.0.1:12379:2379"          已钉好
 patch_port() {
   local pub="$1" internal="$2"
-  if grep -qE "^\s*-\s*[\"']?${pub}:${internal}[\"']?\s*$" "$COMPOSE_FILE"; then
-    sed -i.sedbak -E "s|^(\s*-\s*)[\"']?${pub}:${internal}[\"']?\s*$|\1\"127.0.0.1:${pub}:${internal}\"|" "$COMPOSE_FILE" \
+  local var_prefix="\\\$\\{HOST_BIND_IP\\}:"
+  if grep -qE "^[[:space:]]*-[[:space:]]*[\"']?${pub}:${internal}[\"']?[[:space:]]*$" "$COMPOSE_FILE"; then
+    sed -i.sedbak -E "s|^([[:space:]]*-[[:space:]]*)[\"']?${pub}:${internal}[\"']?[[:space:]]*$|\1\"127.0.0.1:${pub}:${internal}\"|" "$COMPOSE_FILE" \
       && rm -f "$COMPOSE_FILE.sedbak"
     echo "已钉到回环: ${pub}:${internal}"
+  elif grep -qE "^[[:space:]]*-[[:space:]]*[\"']?${var_prefix}${pub}:${internal}[\"']?[[:space:]]*$" "$COMPOSE_FILE"; then
+    sed -i.sedbak -E "s|^([[:space:]]*-[[:space:]]*)[\"']?${var_prefix}${pub}:${internal}[\"']?[[:space:]]*$|\1\"127.0.0.1:${pub}:${internal}\"|" "$COMPOSE_FILE" \
+      && rm -f "$COMPOSE_FILE.sedbak"
+    echo "已钉到回环（原为 \${HOST_BIND_IP}: 前缀）: ${pub}:${internal}"
   elif grep -qE "127\.0\.0\.1:${pub}:${internal}" "$COMPOSE_FILE"; then
     echo "已是回环: ${pub}:${internal}"
   else
@@ -97,7 +107,7 @@ patch_port 10005 9000  || true
 # ── 3. 汇总当前仍对 0.0.0.0 暴露的端口，供人工核对 ──────────────────────────
 echo
 echo "== compose 中剩余的端口映射（10001/10002 测试期保持对外是预期内）=="
-grep -nE "^\s*-\s*[\"']?(\\\$\{HOST_BIND_IP\}:)?[0-9]+:[0-9]+" "$COMPOSE_FILE" || true
+grep -nE "^[[:space:]]*-[[:space:]]*[\"']?(\\\$\{HOST_BIND_IP\}:)?[0-9]+:[0-9]+" "$COMPOSE_FILE" || true
 
 echo
 if echo "$ROTATED_KEYS" | grep -q OPENIM_SECRET; then

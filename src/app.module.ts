@@ -9,6 +9,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule } from '@nestjs/throttler';
 
 import { AuthModule } from './auth/auth.module';
+import { WinstonLoggingModule } from './logging/winston-logging.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
@@ -54,6 +55,7 @@ const envFilePath = `.env.${nodeEnv}`;
     PrismaModule,
     UserModule,
     AuthModule,
+    WinstonLoggingModule,
     OpenimModule,
     UploadModule,
     FriendModule,

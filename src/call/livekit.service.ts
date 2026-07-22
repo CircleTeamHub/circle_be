@@ -33,14 +33,17 @@ type CreateRoomInput = {
 //（HTTP 请求自身有 socket 生命周期）。
 const LIVEKIT_REQUEST_TIMEOUT_MS = 5_000;
 
+class LiveKitTimeoutError extends Error {
+  constructor(label: string) {
+    super(`${label} timed out after ${LIVEKIT_REQUEST_TIMEOUT_MS}ms`);
+  }
+}
+
 async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(
-      () =>
-        reject(
-          new Error(`${label} timed out after ${LIVEKIT_REQUEST_TIMEOUT_MS}ms`),
-        ),
+      () => reject(new LiveKitTimeoutError(label)),
       LIVEKIT_REQUEST_TIMEOUT_MS,
     );
   });
@@ -48,6 +51,8 @@ async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
     return await Promise.race([work, timeout]);
   } finally {
     clearTimeout(timer);
+    // 竞输后不让底层 rejection 变成 unhandledRejection。
+    void work.catch(() => undefined);
   }
 }
 
@@ -104,6 +109,12 @@ export class LiveKitCallService {
         normalized.includes('already_exists')
       ) {
         return;
+      }
+      // review 修复：超时 ≠ 失败 —— 竞输的 createRoom 可能仍在 LiveKit 侧
+      // 成功，留下一间无人认领的孤儿房。挂一个后台补偿删除（best-effort，
+      // 空转 delete 不存在的房间无害）；真错误路径没有房间可删，不补偿。
+      if (error instanceof LiveKitTimeoutError) {
+        void this.deleteRoom(input.name).catch(() => undefined);
       }
       throw new ServiceUnavailableException('LiveKit room creation failed');
     }

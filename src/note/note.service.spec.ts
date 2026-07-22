@@ -20,6 +20,8 @@ describe('NoteService', () => {
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
     $executeRaw: jest.fn().mockResolvedValue(0),
+    // createShareLink 配额检查用 advisory 锁（pg_advisory_xact_lock）
+    $queryRaw: jest.fn().mockResolvedValue([]),
     note: {
       create: jest.fn(),
       findMany: jest.fn(),
@@ -2006,6 +2008,9 @@ describe('NoteService', () => {
     });
 
     expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
+    // count 与 create 必须同事务且持 per-owner advisory 锁（并发下守住上限）
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(prisma.$queryRaw).toHaveBeenCalled();
   });
 
   it('rejects a note share link when any requested note is missing or owned by someone else', async () => {

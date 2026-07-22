@@ -38,8 +38,11 @@ sudo systemctl reload docker || sudo systemctl restart docker
 
 # 4) 重启窗口
 cd ~/openim-docker && docker compose up -d --force-recreate
-cd ~/circle_be && docker compose -f docker-compose.prod.yml up -d app_blue app_green 2>/dev/null \
-  || docker restart <当前活跃的 circle_be 容器>
+# circle_be 侧：compose 服务名是 circle_be（蓝）/ circle_be_green（绿），
+# 只重启当前在役颜色即可（看 Caddy 上游或 docker ps 确认）：
+cd ~/circle_be && docker compose -f docker-compose.prod.yml up -d --force-recreate circle_be
+# 在役为绿时改用: docker compose -f docker-compose.prod.yml up -d --force-recreate circle_be_green
+# 或者干脆走常规发版脚本（自带健康检查与切流）: bash deploy/release-deploy.sh
 
 # 5) OpenIM 栈内存上限（#107；docker update 对运行中容器即时生效，重启后仍保留）
 docker ps --format '{{.Names}}' | grep -Ei 'openim|mongo|kafka|zookeeper|etcd' \
