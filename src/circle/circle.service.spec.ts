@@ -235,6 +235,39 @@ describe('CircleService', () => {
     );
   });
 
+  it('moves a rejected membership back to pending when the user reapplies', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      memberCount: 3,
+      maxMembers: null,
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      groupID: null,
+    });
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      vipExpiresAt: null,
+      creditScore: 100,
+      fancyNumber: null,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-rejected',
+      status: 'REJECTED',
+      role: 'MEMBER',
+    });
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+
+    await service.joinCircle('user-1', 'circle-1');
+
+    expect(prisma.circleMember.update).toHaveBeenCalledWith({
+      where: { id: 'member-rejected' },
+      data: { status: 'PENDING', role: 'MEMBER' },
+    });
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
+  });
+
   it('reports an existing ACTIVE membership before changed capacity or restrictions', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -300,7 +333,14 @@ describe('CircleService', () => {
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
     });
-    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: 'user-1',
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
+    });
   });
 
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {

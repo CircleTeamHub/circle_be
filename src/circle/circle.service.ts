@@ -308,7 +308,7 @@ export class CircleService {
 
           await this.admissionPolicy.assertCanApply(tx, circleId, userId);
 
-          if (existing?.status === 'PENDING') {
+          if (existing) {
             await tx.circleMember.update({
               where: { id: existing.id },
               data: { status: 'PENDING', role: 'MEMBER' },
@@ -385,16 +385,14 @@ export class CircleService {
 
         const wasActive = lockedMembership.status === 'ACTIVE';
 
-        if (!wasActive) {
-          await tx.circleInvitation.updateMany({
-            where: {
-              circleID: circleId,
-              applicantID: userId,
-              status: 'PENDING',
-            },
-            data: { status: 'CANCELLED' },
-          });
-        }
+        await tx.circleInvitation.updateMany({
+          where: {
+            circleID: circleId,
+            applicantID: userId,
+            status: 'PENDING',
+          },
+          data: { status: 'CANCELLED' },
+        });
 
         await tx.userDisplayIcon.deleteMany({
           where: { userID: userId, circleID: circleId },

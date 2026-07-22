@@ -171,4 +171,24 @@ describe('GroupSyncOutboxProcessor', () => {
     expect(openim.addGroupMembers).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.update).not.toHaveBeenCalled();
   });
+
+  it('applies one OpenIM add when two processors select the same job', async () => {
+    const job = {
+      id: 'job-1',
+      operation: 'ADD_MEMBER',
+      status: 'PENDING',
+      groupID: 'group-1',
+      userID: 'user-1',
+      attempts: 0,
+    };
+    prisma.groupSyncOutbox.findMany.mockResolvedValue([job]);
+    prisma.groupSyncOutbox.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    await Promise.all([processor.processPending(), processor.processPending()]);
+
+    expect(openim.addGroupMembers).toHaveBeenCalledTimes(1);
+    expect(openim.addGroupMembers).toHaveBeenCalledWith('group-1', ['user-1']);
+  });
 });

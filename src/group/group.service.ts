@@ -63,48 +63,47 @@ export class GroupService {
       return { handled: false };
     }
 
-    const actor = await this.getCircleMember(circle.id, actorId);
-    this.assertCanManageCircleGroup(actor, null);
-
     const targetUserIDs = this.uniqueIDs(dto.userIDs).filter(
       (userID) => userID !== actorId,
     );
 
-    if (targetUserIDs.length === 0) {
-      return { handled: true };
-    }
-
-    // Pre-check only decides whether to run the privacy gate and open a
-    // transaction; the authoritative read happens under the pair locks below.
-    const existingMemberships = await this.prisma.circleMember.findMany({
-      where: {
-        circleID: circle.id,
-        userID: { in: targetUserIDs },
-      },
-      select: { userID: true, status: true },
-    });
-    const existingByUserID = new Map(
-      existingMemberships.map((membership) => [
-        membership.userID,
-        membership.status,
-      ]),
-    );
-    const invitableUserIDs = targetUserIDs.filter(
-      (userID) => existingByUserID.get(userID) !== CircleMemberStatus.ACTIVE,
-    );
-
-    if (invitableUserIDs.length === 0) {
-      return { handled: true };
-    }
-
-    await this.assertInviteTargetsAllowInvites(actorId, invitableUserIDs);
-
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circle.id, [actorId, ...targetUserIDs]);
+      const [actor, existingMemberships] = await Promise.all([
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: actorId, circleID: circle.id },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findMany({
+          where: {
+            circleID: circle.id,
+            userID: { in: targetUserIDs },
+          },
+          select: { userID: true, status: true },
+        }),
+      ]);
+      this.assertCanManageCircleGroup(actor, null);
+
+      const existingByUserID = new Map(
+        existingMemberships.map((membership) => [
+          membership.userID,
+          membership.status,
+        ]),
+      );
+      const invitableUserIDs = targetUserIDs.filter(
+        (userID) => existingByUserID.get(userID) !== CircleMemberStatus.ACTIVE,
+      );
+      if (invitableUserIDs.length === 0) return;
+
+      await this.assertInviteTargetsAllowInvites(actorId, invitableUserIDs);
       const activatingUserIDs = await this.admissionPolicy.activateMembers(
         tx,
         circle.id,
         invitableUserIDs,
+        { locksHeld: true },
       );
       if (activatingUserIDs.length === 0) {
         return;
@@ -151,7 +150,10 @@ export class GroupService {
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
-      await this.memberLock.lock(tx, circle.id, [normalizedTargetUserID]);
+      await this.memberLock.lock(tx, circle.id, [
+        actorId,
+        normalizedTargetUserID,
+      ]);
       const [actor, target] = await Promise.all([
         tx.circleMember.findUnique({
           where: {
@@ -170,6 +172,15 @@ export class GroupService {
         }),
       ]);
       this.assertCanManageCircleGroup(actor, target);
+
+      await tx.circleInvitation.updateMany({
+        where: {
+          circleID: circle.id,
+          applicantID: normalizedTargetUserID,
+          status: 'PENDING',
+        },
+        data: { status: 'CANCELLED' },
+      });
 
       if (target) {
         await tx.userDisplayIcon.deleteMany({
@@ -243,6 +254,14 @@ export class GroupService {
             errorCode: GroupErrorCode.OwnerCannotLeave,
           });
         }
+        await tx.circleInvitation.updateMany({
+          where: {
+            circleID: circle.id,
+            applicantID: userId,
+            status: 'PENDING',
+          },
+          data: { status: 'CANCELLED' },
+        });
       }
 
       await tx.conversationGroupMembership.deleteMany({
@@ -416,16 +435,6 @@ export class GroupService {
         ],
       },
       select: { id: true, groupID: true, ownerID: true },
-    });
-  }
-
-  private async getCircleMember(
-    circleID: string,
-    userID: string,
-  ): Promise<CircleGroupMemberLookup | null> {
-    return this.prisma.circleMember.findUnique({
-      where: { userID_circleID: { userID, circleID } },
-      select: { id: true, role: true, status: true },
     });
   }
 

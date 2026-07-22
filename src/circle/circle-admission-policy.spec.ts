@@ -16,10 +16,12 @@ describe('CircleAdmissionPolicy', () => {
     circle: { findFirst: jest.fn(), findUnique: jest.fn() },
     circleMember: {
       count: jest.fn(),
+      groupBy: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
       createMany: jest.fn(),
     },
+    circleInvitation: { updateMany: jest.fn() },
     user: { findMany: jest.fn(), findUnique: jest.fn() },
   };
   const membershipPolicy = new MembershipPolicyService(
@@ -55,6 +57,7 @@ describe('CircleAdmissionPolicy', () => {
     prisma.circle.findFirst.mockResolvedValue(circle());
     prisma.circleMember.findMany.mockResolvedValue(activeMemberships);
     prisma.circleMember.count.mockResolvedValue(0);
+    prisma.circleMember.groupBy.mockResolvedValue([]);
     prisma.circleMember.updateMany.mockResolvedValue({ count: 0 });
     prisma.circleMember.createMany.mockResolvedValue({ count: 1 });
     prisma.user.findMany.mockResolvedValue([user()]);
@@ -73,18 +76,22 @@ describe('CircleAdmissionPolicy', () => {
       prisma.user.findMany.mockResolvedValue([
         user({ vipLevel, vipExpiresAt }),
       ]);
-      prisma.circleMember.count.mockResolvedValue(limit - 1);
+      prisma.circleMember.groupBy.mockResolvedValue([
+        { userID: 'candidate-1', _count: { _all: limit - 1 } },
+      ]);
 
       await expect(
         policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
       ).resolves.toEqual(['candidate-1']);
 
-      expect(prisma.circleMember.count).toHaveBeenCalledWith({
+      expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
+        by: ['userID'],
         where: {
-          userID: 'candidate-1',
+          userID: { in: ['candidate-1'] },
           status: 'ACTIVE',
           role: { not: 'OWNER' },
         },
+        _count: { _all: true },
       });
     },
   );
@@ -101,7 +108,9 @@ describe('CircleAdmissionPolicy', () => {
       prisma.user.findMany.mockResolvedValue([
         user({ vipLevel, vipExpiresAt }),
       ]);
-      prisma.circleMember.count.mockResolvedValue(limit);
+      prisma.circleMember.groupBy.mockResolvedValue([
+        { userID: 'candidate-1', _count: { _all: limit } },
+      ]);
 
       await expect(
         policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
@@ -125,7 +134,9 @@ describe('CircleAdmissionPolicy', () => {
         vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
       }),
     ]);
-    prisma.circleMember.count.mockResolvedValue(100);
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 100 } },
+    ]);
 
     await expect(
       policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
@@ -146,6 +157,14 @@ describe('CircleAdmissionPolicy', () => {
     expect(prisma.user.findMany).not.toHaveBeenCalled();
     expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
     expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: { in: ['candidate-1'] },
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
+    });
   });
 
   it('uses effective membership for the final VIP restriction check', async () => {
@@ -214,9 +233,10 @@ describe('CircleAdmissionPolicy', () => {
       user({ id: 'candidate-1' }),
       user({ id: 'candidate-2' }),
     ]);
-    prisma.circleMember.count
-      .mockResolvedValueOnce(99)
-      .mockResolvedValueOnce(100);
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 99 } },
+      { userID: 'candidate-2', _count: { _all: 100 } },
+    ]);
 
     await expect(
       policy.activateMembers(prisma as any, 'circle-1', [
@@ -260,11 +280,30 @@ describe('CircleAdmissionPolicy', () => {
       'circle-member:circle-1:candidate-z',
     ]);
     expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
-      prisma.circleMember.count.mock.invocationCallOrder[0],
+      prisma.circleMember.groupBy.mock.invocationCallOrder[0],
     );
-    expect(prisma.circleMember.count.mock.invocationCallOrder[1]).toBeLessThan(
-      prisma.$queryRaw.mock.invocationCallOrder[0],
+    expect(
+      prisma.circleMember.groupBy.mock.invocationCallOrder[0],
+    ).toBeLessThan(prisma.$queryRaw.mock.invocationCallOrder[0]);
+  });
+
+  it('counts joined circles for a 100-user batch with one grouped query', async () => {
+    const candidates = Array.from({ length: 100 }, (_, index) =>
+      user({ id: `candidate-${String(index).padStart(3, '0')}` }),
     );
+    prisma.user.findMany.mockResolvedValue(candidates);
+
+    await expect(
+      policy.activateMembers(
+        prisma as any,
+        'circle-1',
+        candidates.map((candidate) => candidate.id),
+      ),
+    ).resolves.toHaveLength(100);
+
+    expect(prisma.circleMember.groupBy).toHaveBeenCalledTimes(1);
+    expect(prisma.circleMember.count).not.toHaveBeenCalled();
+    expect(prisma.circleMember.createMany).toHaveBeenCalledTimes(1);
   });
 
   it('distinguishes circle capacity from joined quota failures', async () => {

@@ -68,7 +68,10 @@ export class CircleAdmissionPolicy {
 
     // Existing ACTIVE rows stay idempotent after a downgrade or restriction
     // change. Quotas only gate new activations; they never remove memberships.
-    if (activatingUserIDs.length === 0) return [];
+    if (activatingUserIDs.length === 0) {
+      await this.cancelPendingInvitations(tx, circleID, userIDs);
+      return [];
+    }
 
     const circle = await tx.circle.findUnique({
       where: { id: circleID },
@@ -91,25 +94,26 @@ export class CircleAdmissionPolicy {
     );
     const now = new Date();
 
-    const counts = await Promise.all(
-      activatingUserIDs.map((userID) =>
-        tx.circleMember.count({
-          where: {
-            userID,
-            status: CircleMemberStatus.ACTIVE,
-            role: { not: CircleMemberRole.OWNER },
-          },
-        }),
-      ),
+    const joinedCounts = await tx.circleMember.groupBy({
+      by: ['userID'],
+      where: {
+        userID: { in: activatingUserIDs },
+        status: CircleMemberStatus.ACTIVE,
+        role: { not: CircleMemberRole.OWNER },
+      },
+      _count: { _all: true },
+    });
+    const joinedCountByUserID = new Map(
+      joinedCounts.map((row) => [row.userID, row._count._all]),
     );
 
-    for (const [index, userID] of activatingUserIDs.entries()) {
+    for (const userID of activatingUserIDs) {
       const candidate = userByID.get(userID);
       if (!candidate) this.throwCandidateNotFound();
 
       const effective = this.membershipPolicy.resolve(candidate, now);
       const limit = effective.tier.quotas.joinedCircles.actual;
-      if (counts[index] >= limit) {
+      if ((joinedCountByUserID.get(userID) ?? 0) >= limit) {
         throw new ForbiddenException({
           message: 'Joined circle membership quota reached',
           errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
@@ -170,7 +174,24 @@ export class CircleAdmissionPolicy {
       });
     }
 
+    await this.cancelPendingInvitations(tx, circleID, userIDs);
+
     return activatingUserIDs;
+  }
+
+  private async cancelPendingInvitations(
+    tx: Prisma.TransactionClient,
+    circleID: string,
+    userIDs: readonly string[],
+  ): Promise<void> {
+    await tx.circleInvitation.updateMany({
+      where: {
+        circleID,
+        applicantID: { in: [...userIDs] },
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
+    });
   }
 
   async assertCanApply(
