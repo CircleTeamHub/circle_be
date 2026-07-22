@@ -179,12 +179,12 @@ describe('EmailVerificationService', () => {
     (mailer as any).isAvailable = jest.fn(() => false);
     try {
       // 已注册与未注册必须拿到同一个 503 —— 差异即账号枚举 oracle
-      await expect(
-        service.requestCode('known@b.com', 'LOGIN'),
-      ).rejects.toThrow(ServiceUnavailableException);
-      await expect(
-        service.requestCode('ghost@b.com', 'LOGIN'),
-      ).rejects.toThrow(ServiceUnavailableException);
+      await expect(service.requestCode('known@b.com', 'LOGIN')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
+      await expect(service.requestCode('ghost@b.com', 'LOGIN')).rejects.toThrow(
+        ServiceUnavailableException,
+      );
       // 且都发生在任何 DB 写入之前
       expect(codes).toHaveLength(0);
     } finally {
