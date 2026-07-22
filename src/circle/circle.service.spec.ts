@@ -7,6 +7,7 @@ import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { CircleAdmissionPolicy } from './circle-admission-policy';
 import {
   CreateCircleDto,
   SetCircleAvatarDto,
@@ -74,6 +75,7 @@ describe('CircleService', () => {
         { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         MembershipPolicyService,
+        CircleAdmissionPolicy,
       ],
     }).compile();
 
@@ -98,6 +100,7 @@ describe('CircleService', () => {
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 2,
+      vipExpiresAt: null,
       creditScore: 90,
       fancyNumber: true,
     });
@@ -123,6 +126,7 @@ describe('CircleService', () => {
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
+      vipExpiresAt: null,
       creditScore: 100,
       fancyNumber: null,
     });
@@ -169,6 +173,7 @@ describe('CircleService', () => {
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
+      vipExpiresAt: null,
       creditScore: 100,
       fancyNumber: null,
     });
@@ -193,6 +198,7 @@ describe('CircleService', () => {
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
+      vipExpiresAt: null,
       creditScore: 100,
       fancyNumber: null,
     });
@@ -218,6 +224,30 @@ describe('CircleService', () => {
       'user-1',
       'inv-legacy',
     );
+  });
+
+  it('reports an existing ACTIVE membership before changed capacity or restrictions', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      memberCount: 10,
+      maxMembers: 10,
+      joinVipRestriction: 4,
+      joinCreditRestriction: 100,
+      joinFancyRestriction: true,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      status: 'ACTIVE',
+      role: 'MEMBER',
+    });
+
+    await expect(
+      service.joinCircle('user-1', 'circle-1'),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_ALREADY_MEMBER' },
+    });
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
   });
 
   it('cancels pending invitations when a pending member leaves', async () => {
@@ -272,6 +302,7 @@ describe('CircleService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -471,6 +502,44 @@ describe('CircleService', () => {
     });
   });
 
+  it('rejects a join VIP restriction above the creator effective membership', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 2,
+      vipExpiresAt: null,
+    });
+
+    await expect(
+      service.createCircle('user-1', {
+        ...validCircle(),
+        joinVipRestriction: 3,
+      }),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR',
+        limit: 2,
+      },
+    });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
+  });
+
+  it('uses the creator effective regular level after paid membership expiry', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+    });
+
+    await expect(
+      service.createCircle('user-1', {
+        ...validCircle(),
+        joinVipRestriction: 1,
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR' },
+    });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+  });
+
   it('lets the circle owner update the cover image', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -500,6 +569,7 @@ describe('CircleService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -528,6 +598,7 @@ describe('CircleService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -560,6 +631,7 @@ describe('CircleService', () => {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
       new MembershipPolicyService(prisma as any),
+      new CircleAdmissionPolicy(new MembershipPolicyService(prisma as any)),
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -774,6 +846,17 @@ describe('circle DTO validation', () => {
       ).toHaveLength(0);
     },
   );
+
+  it('accepts null as no join VIP restriction', () => {
+    expect(
+      validate(CreateCircleDto, {
+        name: 'Test Circle',
+        categories: ['test'],
+        description: 'a valid circle description',
+        joinVipRestriction: null,
+      }),
+    ).toHaveLength(0);
+  });
 
   it('rejects join VIP restrictions above level 4', () => {
     const errors = validate(CreateCircleDto, {

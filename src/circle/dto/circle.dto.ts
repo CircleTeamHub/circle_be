@@ -80,13 +80,13 @@ export class CreateCircleDto {
   @IsOptional()
   tags?: string[];
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ nullable: true })
   @Type(() => Number)
   @IsInt()
   @Min(0)
   @Max(4)
   @IsOptional()
-  joinVipRestriction?: number;
+  joinVipRestriction?: number | null;
 
   @ApiPropertyOptional()
   @Type(() => Number)

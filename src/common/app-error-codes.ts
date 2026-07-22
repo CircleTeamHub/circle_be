@@ -44,6 +44,7 @@ export const MembershipErrorCode = {
   // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
   IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
   GroupMemberCapacityExceeded: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED',
+  JoinedCircleQuotaReached: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
 } as const;
 
 export const CircleErrorCode = {
@@ -62,6 +63,8 @@ export const CircleErrorCode = {
   JoinVipRequired: 'CIRCLE_JOIN_VIP_REQUIRED',
   JoinCreditRequired: 'CIRCLE_JOIN_CREDIT_REQUIRED',
   JoinFancyNumberRequired: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED',
+  JoinVipRestrictionExceedsCreator:
+    'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR',
   ListItemBlank: 'CIRCLE_LIST_ITEM_BLANK',
   ListItemDuplicate: 'CIRCLE_LIST_ITEM_DUPLICATE',
 } as const;

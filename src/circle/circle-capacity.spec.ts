@@ -13,6 +13,7 @@ describe('reserveCircleSeats', () => {
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     const [sql, ...values] = tx.$queryRaw.mock.calls[0];
     expect(sql.join(' ')).toContain('UPDATE "Circle"');
+    expect(sql.join(' ')).toContain('"deleted" = false');
     expect(sql.join(' ')).toContain('"memberCount" +   <= "maxMembers"');
     expect(sql.join(' ')).toContain('RETURNING "id"');
     expect(values).toEqual([2, 'circle-1', 2]);

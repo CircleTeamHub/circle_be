@@ -13,12 +13,13 @@ import {
   CircleInvitationErrorCode,
 } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { reserveCircleSeats } from 'src/circle/circle-capacity';
+import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { feedCursorWhere } from 'src/utils/feed-cursor';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   DEFAULT_INVITATION_LIST_LIMIT,
   InvitationDto,
@@ -26,8 +27,6 @@ import {
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
 import { circleApplicationLockKey } from './circle-application-lock';
-
-const MAX_INVITATION_TX_ATTEMPTS = 3;
 
 type CircleInvitationNotificationData = {
   toUserID: string;
@@ -78,6 +77,7 @@ export class CircleInvitationService {
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly notificationService: NotificationService,
+    private readonly admissionPolicy: CircleAdmissionPolicy,
   ) {}
 
   async invite(
@@ -107,59 +107,11 @@ export class CircleInvitationService {
       });
     }
 
-    // 4. Verify circle capacity
-    const circle = await this.prisma.circle.findFirst({
-      where: { id: circleId, deleted: false },
-    });
-    if (!circle) {
-      throw new NotFoundException({
-        message: 'Circle not found',
-        errorCode: CircleErrorCode.NotFound,
-      });
-    }
-    if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
-      throw new BadRequestException({
-        message: 'Circle has reached its member limit',
-        errorCode: CircleErrorCode.MemberLimit,
-      });
-    }
-
-    // 5. Verify applicant meets join restrictions
-    const applicant = await this.prisma.user.findUnique({
-      where: { id: applicantId },
-      select: { vipLevel: true, creditScore: true, fancyNumber: true },
-    });
-    if (!applicant) {
-      throw new NotFoundException({
-        message: 'User not found',
-        errorCode: CircleErrorCode.UserNotFound,
-      });
-    }
-
-    if (
-      circle.joinVipRestriction != null &&
-      applicant.vipLevel < circle.joinVipRestriction
-    ) {
-      throw new ForbiddenException({
-        message: `Applicant needs VIP ${circle.joinVipRestriction}+ to join`,
-        errorCode: CircleErrorCode.JoinVipRequired,
-      });
-    }
-    if (
-      circle.joinCreditRestriction != null &&
-      applicant.creditScore < circle.joinCreditRestriction
-    ) {
-      throw new ForbiddenException({
-        message: `Applicant needs credit score ${circle.joinCreditRestriction}+ to join`,
-        errorCode: CircleErrorCode.JoinCreditRequired,
-      });
-    }
-    if (circle.joinFancyRestriction && !applicant.fancyNumber) {
-      throw new ForbiddenException({
-        message: 'Applicant needs a fancy number to join',
-        errorCode: CircleErrorCode.JoinFancyNumberRequired,
-      });
-    }
+    await this.admissionPolicy.assertCanApply(
+      this.prisma as unknown as Prisma.TransactionClient,
+      circleId,
+      applicantId,
+    );
 
     // Pass real friendship status: a FRIENDS_ONLY invite permission must let
     // friends through. Hardcoding false here would collapse FRIENDS_ONLY into
@@ -196,6 +148,7 @@ export class CircleInvitationService {
           errorCode: CircleErrorCode.AlreadyMember,
         });
       }
+      await this.admissionPolicy.assertCanApply(tx, circleId, applicantId);
 
       const existingInvitation = await tx.circleInvitation.findFirst({
         where: {
@@ -349,6 +302,9 @@ export class CircleInvitationService {
         application.circleID,
         application.applicantID,
       );
+      await this.admissionPolicy.lockCandidateUsers(tx, [
+        application.applicantID,
+      ]);
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
       const [verifierRecord, invitation] = await Promise.all([
@@ -450,19 +406,21 @@ export class CircleInvitationService {
         return { admission: null, notificationData: null };
       }
 
-      const admitted = await this.admitApplicant(
+      const admitted = await this.admissionPolicy.activateMembers(
         tx,
         updatedInvitation.circleID,
-        updatedInvitation.applicantID,
+        [updatedInvitation.applicantID],
+        { userLocksHeld: true },
       );
 
       return {
-        admission: admitted
-          ? {
-              applicantId: updatedInvitation.applicantID,
-              groupID: updatedInvitation.circle.groupID,
-            }
-          : null,
+        admission:
+          admitted.length > 0
+            ? {
+                applicantId: updatedInvitation.applicantID,
+                groupID: updatedInvitation.circle.groupID,
+              }
+            : null,
         notificationData: {
           toUserID: updatedInvitation.applicantID,
           fromUserID: verifierId,
@@ -544,6 +502,9 @@ export class CircleInvitationService {
         application.circleID,
         application.applicantID,
       );
+      await this.admissionPolicy.lockCandidateUsers(tx, [
+        application.applicantID,
+      ]);
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
       const pendingInvitation = await tx.circleInvitation.findUnique({
@@ -571,19 +532,21 @@ export class CircleInvitationService {
         return { admission: null, notificationData: null };
       }
 
-      const admitted = await this.admitApplicant(
+      const admitted = await this.admissionPolicy.activateMembers(
         tx,
         pendingInvitation.circleID,
-        pendingInvitation.applicantID,
+        [pendingInvitation.applicantID],
+        { userLocksHeld: true },
       );
 
       return {
-        admission: admitted
-          ? {
-              applicantId: pendingInvitation.applicantID,
-              groupID: pendingInvitation.circle.groupID,
-            }
-          : null,
+        admission:
+          admitted.length > 0
+            ? {
+                applicantId: pendingInvitation.applicantID,
+                groupID: pendingInvitation.circle.groupID,
+              }
+            : null,
         notificationData: {
           toUserID: pendingInvitation.applicantID,
           fromUserID: adminId,
@@ -648,6 +611,9 @@ export class CircleInvitationService {
             candidate.circleID,
             candidate.applicantID,
           );
+          await this.admissionPolicy.lockCandidateUsers(tx, [
+            candidate.applicantID,
+          ]);
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
 
           const invitation = await tx.circleInvitation.findUnique({
@@ -666,13 +632,14 @@ export class CircleInvitationService {
             data: { status: 'APPROVED' },
           });
           if (changed.count === 0) return null;
-          const admitted = await this.admitApplicant(
+          const admitted = await this.admissionPolicy.activateMembers(
             tx,
             invitation.circleID,
-            invitation.applicantID,
+            [invitation.applicantID],
+            { userLocksHeld: true },
           );
           return {
-            admitted,
+            admitted: admitted.length > 0,
             applicantId: invitation.applicantID,
             circleId: invitation.circleID,
             groupID: invitation.circle.groupID,
@@ -886,57 +853,6 @@ export class CircleInvitationService {
     };
   }
 
-  private async admitApplicant(
-    tx: Prisma.TransactionClient,
-    circleId: string,
-    applicantId: string,
-  ): Promise<boolean> {
-    // Create or update membership
-    const existing = await tx.circleMember.findUnique({
-      where: { userID_circleID: { userID: applicantId, circleID: circleId } },
-    });
-
-    if (existing) {
-      if (existing.status === 'ACTIVE') {
-        return false;
-      }
-
-      await tx.circleMember.update({
-        where: { id: existing.id },
-        data: { status: 'ACTIVE', role: 'MEMBER' },
-      });
-    } else {
-      await tx.circleMember.create({
-        data: {
-          userID: applicantId,
-          circleID: circleId,
-          role: 'MEMBER',
-          status: 'ACTIVE',
-        },
-      });
-    }
-
-    const reserved = await reserveCircleSeats(tx, circleId, 1);
-    if (!reserved) {
-      const circleStillExists = await tx.circle.findUnique({
-        where: { id: circleId },
-        select: { id: true },
-      });
-      if (!circleStillExists) {
-        throw new NotFoundException({
-          message: 'Circle not found',
-          errorCode: CircleErrorCode.NotFound,
-        });
-      }
-      throw new BadRequestException({
-        message: 'Circle has reached its member limit',
-        errorCode: CircleErrorCode.MemberLimit,
-      });
-    }
-
-    return true;
-  }
-
   private async assertCanViewInvitation(
     viewerId: string,
     invitation: Awaited<ReturnType<CircleInvitationService['loadInvitation']>>,
@@ -1007,35 +923,9 @@ export class CircleInvitationService {
   }
 
   private async runInvitationTransaction<T>(
-    operation: (tx: any) => Promise<T>,
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
   ): Promise<T> {
-    for (let attempt = 1; attempt <= MAX_INVITATION_TX_ATTEMPTS; attempt += 1) {
-      try {
-        return await this.prisma.$transaction(operation, {
-          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-        });
-      } catch (error) {
-        if (
-          this.isRetryableTransactionError(error) &&
-          attempt < MAX_INVITATION_TX_ATTEMPTS
-        ) {
-          this.logger.warn(
-            `Retrying invitation transaction after serialization conflict (attempt ${attempt})`,
-          );
-          continue;
-        }
-        throw error;
-      }
-    }
-
-    throw new Error('Unreachable invitation transaction state');
-  }
-
-  private isRetryableTransactionError(error: unknown): boolean {
-    return (
-      error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === 'P2034'
-    );
+    return runSerializableTransaction(this.prisma, operation);
   }
 
   private async areFriends(a: string, b: string): Promise<boolean> {

@@ -22,6 +22,7 @@ export async function reserveCircleSeats(
     SET "memberCount" = "memberCount" + ${seatCount},
         "updatedAt" = CURRENT_TIMESTAMP
     WHERE "id" = ${circleId}
+      AND "deleted" = false
       AND (
         "maxMembers" IS NULL
         OR "memberCount" + ${seatCount} <= "maxMembers"
