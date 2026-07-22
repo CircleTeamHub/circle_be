@@ -3,6 +3,7 @@ import {
   Inject,
   Injectable,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
@@ -82,20 +83,56 @@ export class EmailVerificationService {
     const code = this.generateCode();
     const codeHash = await argon2.hash(code);
 
-    // 同 email+purpose 仅保留最新一条未消费记录。
-    await this.prisma.emailVerificationCode.deleteMany({
-      where: { email, purpose, consumedAt: null },
-    });
-    await this.prisma.emailVerificationCode.create({
-      data: {
-        email,
-        codeHash,
-        purpose,
-        expiresAt: new Date(Date.now() + CODE_TTL_MS),
-      },
+    // review 修复（并发串行化）：删旧 + 建新放进 per-email+purpose advisory
+    // 锁事务，并在锁内复检冷却。否则两个并发请求都能越过上面的冷却快查，
+    // 各自 deleteMany+create+发信 —— 用户先收到的那封码已被后写的一条作废。
+    // 锁内复检让后到者拿到 CodeRateLimited，只有一封信发出。
+    const lockKey = `email-code:${purpose}:${email}`;
+    const created = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      const latest = await tx.emailVerificationCode.findFirst({
+        where: { email, purpose },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (
+        latest &&
+        Date.now() - latest.createdAt.getTime() < RESEND_COOLDOWN_MS
+      ) {
+        throw new BadRequestException({
+          message: '验证码发送过于频繁，请稍后再试',
+          errorCode: AuthErrorCode.CodeRateLimited,
+        });
+      }
+      // 同 email+purpose 仅保留最新一条未消费记录。
+      await tx.emailVerificationCode.deleteMany({
+        where: { email, purpose, consumedAt: null },
+      });
+      return tx.emailVerificationCode.create({
+        data: {
+          email,
+          codeHash,
+          purpose,
+          expiresAt: new Date(Date.now() + CODE_TTL_MS),
+        },
+      });
     });
 
-    await this.mailer.sendVerificationCode(email, code, purpose);
+    try {
+      await this.mailer.sendVerificationCode(email, code, purpose);
+    } catch (error) {
+      // review 修复（投递失败回滚）：不回滚的话这条没送达的行会占住 60s
+      // 冷却 —— 用户立刻重试只会得到 CodeRateLimited，且不会再发一封。
+      // 删行让重试立即可用（滥用防护由 setup 层 emailCodeLimiter 兜底）。
+      await this.prisma.emailVerificationCode
+        .deleteMany({ where: { id: created.id } })
+        .catch(() => undefined);
+      if (error instanceof ServiceUnavailableException) throw error;
+      this.logger.error(
+        `verification mail delivery failed (${purpose})`,
+        error instanceof Error ? error.stack : String(error),
+      );
+      throw new ServiceUnavailableException('验证码发送失败，请稍后再试');
+    }
   }
 
   async verifyCode(

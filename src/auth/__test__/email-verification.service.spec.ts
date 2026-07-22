@@ -1,5 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import * as argon2 from 'argon2';
 import { EmailVerificationService } from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -11,7 +14,10 @@ describe('EmailVerificationService', () => {
   let usersByEmail: Set<string>;
   const mailer = { sendVerificationCode: jest.fn(() => Promise.resolve()) };
 
-  const mockPrisma = {
+  const mockPrisma: any = {
+    // requestCode 的删旧+建新走 advisory 锁事务；mock 直接把自身当 tx 用。
+    $transaction: jest.fn(async (fn: any) => fn(mockPrisma)),
+    $queryRaw: jest.fn(async () => []),
     emailVerificationCode: {
       findFirst: jest.fn(({ where }) => {
         const list = codes
@@ -26,14 +32,14 @@ describe('EmailVerificationService', () => {
         return Promise.resolve(list[0] ?? null);
       }),
       deleteMany: jest.fn(({ where }) => {
-        codes = codes.filter(
-          (c) =>
-            !(
-              c.email === where.email &&
-              c.purpose === where.purpose &&
-              c.consumedAt === null
-            ),
-        );
+        codes = codes.filter((c) => {
+          if (where.id !== undefined) return c.id !== where.id;
+          return !(
+            c.email === where.email &&
+            c.purpose === where.purpose &&
+            c.consumedAt === null
+          );
+        });
         return Promise.resolve({ count: 0 });
       }),
       create: jest.fn(({ data }) => {
@@ -105,6 +111,40 @@ describe('EmailVerificationService', () => {
     await expect(service.requestCode('a@b.com', 'LOGIN')).rejects.toThrow(
       BadRequestException,
     );
+  });
+
+  it('rolls the code row back when mail delivery fails, so retry is not cooldown-locked', async () => {
+    usersByEmail.add('a@b.com');
+    mailer.sendVerificationCode.mockRejectedValueOnce(
+      new Error('454 relay refused'),
+    );
+
+    await expect(service.requestCode('a@b.com', 'LOGIN')).rejects.toThrow(
+      ServiceUnavailableException,
+    );
+    // 没送达的行必须删掉：否则它占住 60s 冷却，用户重试只会拿到 CodeRateLimited
+    expect(codes).toHaveLength(0);
+
+    // 立刻重试可以直接成功（不撞冷却）
+    await service.requestCode('a@b.com', 'LOGIN');
+    expect(codes).toHaveLength(1);
+    expect(mailer.sendVerificationCode).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-checks the cooldown inside the serialized transaction (concurrent double-send guard)', async () => {
+    usersByEmail.add('a@b.com');
+    // 模拟并发对手：外层冷却快查时还没有行，进锁复检时对手的行已经出现。
+    mockPrisma.emailVerificationCode.findFirst
+      .mockResolvedValueOnce(null) // 外层快查
+      .mockResolvedValueOnce({ createdAt: new Date() }); // 锁内复检
+
+    await expect(service.requestCode('a@b.com', 'LOGIN')).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(mockPrisma.emailVerificationCode.create).not.toHaveBeenCalled();
+    expect(mailer.sendVerificationCode).not.toHaveBeenCalled();
+    // 锁确实被拿了
+    expect(mockPrisma.$queryRaw).toHaveBeenCalled();
   });
 
   it('verifyCode succeeds once then is consumed', async () => {

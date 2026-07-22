@@ -11,7 +11,7 @@ jest.mock('nodemailer', () => ({
   },
 }));
 
-// eslint-disable-next-line import/first -- mock must be registered before import
+// mock must be registered before this import (jest hoists jest.mock above it)
 import { SmtpMailer } from './smtp.mailer';
 
 function configWith(values: Record<string, string | undefined>): ConfigService {
@@ -42,6 +42,10 @@ describe('SmtpMailer', () => {
       secure: true,
       requireTLS: false,
       auth: { user: 'bot@example.com', pass: 'auth-code' },
+      // 未认证端点内联发信：连接/握手/收发都必须钉秒级超时
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 10_000,
     });
   });
 

@@ -4,6 +4,9 @@ import { createTransport, type Transporter } from 'nodemailer';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { Mailer } from './mailer.interface';
 
+// 连接/握手/收发同一上限：10s 内没走完某一阶段就放弃，交给上游报可控错误。
+const SMTP_TIMEOUT_MS = 10_000;
+
 /**
  * 真实 SMTP Mailer（#82）。
  *
@@ -24,7 +27,8 @@ export class SmtpMailer implements Mailer {
   constructor(configService: ConfigService) {
     const host = configService.get<string>('SMTP_HOST');
     const port = Number(configService.get('SMTP_PORT') ?? 465);
-    const secure = String(configService.get('SMTP_SECURE') ?? 'true') !== 'false';
+    const secure =
+      String(configService.get('SMTP_SECURE') ?? 'true') !== 'false';
     const user = configService.get<string>('SMTP_USER');
     const pass = configService.get<string>('SMTP_PASS');
     this.from = configService.get<string>('MAIL_FROM') ?? user ?? '';
@@ -36,6 +40,12 @@ export class SmtpMailer implements Mailer {
       // secure=false 时（587/STARTTLS）仍强制 TLS 升级，拒绝明文降级。
       requireTLS: !secure,
       auth: user && pass ? { user, pass } : undefined,
+      // review 修复：request-code 是未认证端点且 sendMail 内联在请求里 ——
+      // SMTP 服务器接了连接却停在 greeting/DATA 时，缺省超时会让请求挂到
+      // 平台级超时并在降级期堆积。三段都钉在秒级。
+      connectionTimeout: SMTP_TIMEOUT_MS,
+      greetingTimeout: SMTP_TIMEOUT_MS,
+      socketTimeout: SMTP_TIMEOUT_MS,
     });
   }
 
