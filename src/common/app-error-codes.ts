@@ -205,6 +205,9 @@ export const CallErrorCode = {
   NotFound: 'CALL_NOT_FOUND',
   NotAllowed: 'CALL_NOT_ALLOWED',
   AlreadyActive: 'CALL_ALREADY_ACTIVE',
+  // 1:1 呼叫（#113）：非好友或任一方向已拉黑。共用一个码，不向发起方泄露
+  // 「被拉黑」这一事实。
+  NotFriend: 'CALL_NOT_FRIEND',
 } as const;
 
 // 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)
