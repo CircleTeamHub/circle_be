@@ -303,6 +303,11 @@ export class RefreshTokenService {
     });
   }
 
+  /** 仅写 access token 吊销标记（DB 撤销已由调用方事务完成时用）。 */
+  async revokeAllAccessMarkers(userId: string): Promise<void> {
+    await this.revocation.revokeUser(userId);
+  }
+
   async revokeAll(userId: string): Promise<void> {
     await this.prisma.refreshToken.updateMany({
       where: { userId, revokedAt: null },

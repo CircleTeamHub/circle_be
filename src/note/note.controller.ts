@@ -32,6 +32,7 @@ import {
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  RecycleBinQueryDto,
   NoteDetailDto,
   NoteExportResultDto,
   NoteGroupDto,
@@ -145,6 +146,23 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setStatus(req.user.userId, id, dto.status);
+  }
+
+  // 必须先于 @Get(':id') / @Patch(':id') 声明（同 share-links 的顺序注释）。
+  @Get('recycle-bin')
+  @ApiOperation({ summary: 'List soft-deleted notes (FE#92 recycle bin)' })
+  listDeleted(@Query() query: RecycleBinQueryDto, @Req() req: RequestWithUser) {
+    return this.noteService.listDeletedNotes(
+      req.user.userId,
+      query.page,
+      query.limit,
+    );
+  }
+
+  @Post(':id/restore')
+  @ApiOperation({ summary: 'Restore a soft-deleted note to ACTIVE' })
+  restore(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
+    return this.noteService.restoreNote(req.user.userId, id);
   }
 
   @Delete(':id')

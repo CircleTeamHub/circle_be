@@ -40,6 +40,8 @@ export const MembershipErrorCode = {
   LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
   InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
+  // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
+  IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
 } as const;
 
 export const CircleErrorCode = {
@@ -177,6 +179,8 @@ export const NoteErrorCode = {
   ExportTotalTooLarge: 'NOTE_EXPORT_TOTAL_TOO_LARGE',
   ExportTooManyMedia: 'NOTE_EXPORT_TOO_MANY_MEDIA',
   NotFound: 'NOTE_NOT_FOUND',
+  // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）
+  AlreadyCollected: 'NOTE_RESTORE_DUPLICATE',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',
   // 分享链接不可用。两处共用：
@@ -229,6 +233,8 @@ export const ChatHistoryErrorCode = {
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
 export const CollectionErrorCode = {
   NotFound: 'COLLECTION_NOT_FOUND',
+  // #104 审查发现：无每用户上限，客户端循环可无界造行。
+  Limit: 'COLLECTION_LIMIT',
 } as const;
 
 // 展示图标 / 系统图标 / 圈子图标选择。(注:图标页暂未接入 getApiErrorMessage,待前端接线。)

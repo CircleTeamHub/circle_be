@@ -2342,6 +2342,70 @@ export class NoteService {
     });
   }
 
+  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
+  async listDeletedNotes(
+    ownerID: string,
+    page = 1,
+    limit = 50,
+  ): Promise<NoteSummaryDto[]> {
+    const take = Math.min(limit, 200);
+    const notes = await this.prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      take,
+      skip: (page - 1) * take,
+      include: NOTE_INCLUDE,
+    });
+    return this.mapSummaryListResolved(notes, ownerID);
+  }
+
+  /**
+   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
+   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动隐藏。
+   */
+  async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
+    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
+    // 先查同源活跃副本，命中给可控 409。
+    const target = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      select: { id: true, collectedFromNoteID: true },
+    });
+    if (!target) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    if (target.collectedFromNoteID) {
+      const activeDuplicate = await this.prisma.note.findFirst({
+        where: {
+          ownerID,
+          collectedFromNoteID: target.collectedFromNoteID,
+          status: { not: 'DELETED' },
+          id: { not: noteId },
+        },
+        select: { id: true },
+      });
+      if (activeDuplicate) {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+    }
+    const result = await this.prisma.note.updateMany({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      data: { status: 'ACTIVE' },
+    });
+    if (result.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status in the write to close the TOCTOU window, for

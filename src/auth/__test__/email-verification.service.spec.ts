@@ -63,6 +63,17 @@ describe('EmailVerificationService', () => {
         if (data.consumedAt) row.consumedAt = data.consumedAt;
         return Promise.resolve(row);
       }),
+      // round 3：消费改 CAS（updateMany where consumedAt null）
+      updateMany: jest.fn(({ where, data }) => {
+        const row = codes.find(
+          (c) =>
+            c.id === where.id &&
+            (where.consumedAt === undefined || c.consumedAt === null),
+        );
+        if (!row) return Promise.resolve({ count: 0 });
+        if (data.consumedAt) row.consumedAt = data.consumedAt;
+        return Promise.resolve({ count: 1 });
+      }),
     },
     user: {
       findUnique: jest.fn(({ where }) =>

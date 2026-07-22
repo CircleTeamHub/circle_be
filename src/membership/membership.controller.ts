@@ -1,4 +1,12 @@
-import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -33,7 +41,13 @@ export class MembershipController {
   upgrade(
     @Body() dto: UpgradeMembershipDto,
     @Req() req: any,
+    // #91：可选（旧客户端兼容）。同 key 重试回放当前状态，不重复扣费。
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<UpgradeMembershipResponseDto> {
-    return this.membershipService.upgrade(req.user.userId, dto.level);
+    return this.membershipService.upgrade(
+      req.user.userId,
+      dto.level,
+      idempotencyKey?.trim() || undefined,
+    );
   }
 }

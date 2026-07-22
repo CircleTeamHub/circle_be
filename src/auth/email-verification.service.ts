@@ -109,6 +109,10 @@ export class EmailVerificationService {
       // 防账号枚举：未注册邮箱静默成功，不创建记录、不发信。
       return;
     }
+    if (purpose === 'RESET_PASSWORD' && !userExists) {
+      // 同上（FE#92 忘记密码）：不存在的邮箱静默成功。
+      return;
+    }
 
     const code = this.generateCode();
     const codeHash = await argon2.hash(code);
@@ -253,10 +257,13 @@ export class EmailVerificationService {
       return false;
     }
 
-    await this.prisma.emailVerificationCode.update({
-      where: { id: record.id },
+    // round 3 review：消费必须 CAS —— 并发两次同码重置都能过读+argon2，
+    // 无条件 update 让一次性码在竞态下可复用（最终密码 last-writer-wins）。
+    // 条件写 0 行 = 已被并发对手消费，按无效处理。
+    const consumed = await this.prisma.emailVerificationCode.updateMany({
+      where: { id: record.id, consumedAt: null },
       data: { consumedAt: new Date() },
     });
-    return true;
+    return consumed.count === 1;
   }
 }

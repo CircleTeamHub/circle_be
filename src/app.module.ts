@@ -10,6 +10,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 
 import { AuthModule } from './auth/auth.module';
 import { WinstonLoggingModule } from './logging/winston-logging.module';
+import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
@@ -56,6 +57,7 @@ const envFilePath = `.env.${nodeEnv}`;
     UserModule,
     AuthModule,
     WinstonLoggingModule,
+    ModerationModule,
     OpenimModule,
     UploadModule,
     FriendModule,

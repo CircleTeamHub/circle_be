@@ -48,6 +48,11 @@ export class OpenimService implements OnModuleInit {
   private readonly adminSecret: string;
   private readonly enabled: boolean;
 
+  /** OpenIM 出站是否已配置可用（round 2 review：补偿 cron 用它做前置门禁）。 */
+  isEnabled(): boolean {
+    return this.enabled;
+  }
+
   constructor(private config: ConfigService) {
     this.apiUrl = this.config.get<string>('OPENIM_API_URL') ?? '';
     this.adminSecret = this.config.get<string>('OPENIM_ADMIN_SECRET') ?? '';
@@ -494,6 +499,61 @@ export class OpenimService implements OnModuleInit {
       adminToken,
     );
   }
+
+
+  /**
+   * 服务端补发转账卡片（#100）：与客户端 im 发卡完全同构 ——
+   * contentType 110 + extension 'transfer-card-v1' + data {amount, message}，
+   * 接收端渲染路径无差别。仅单聊。
+   */
+  async sendTransferCardMessage(params: {
+    sendID: string;
+    recvID: string;
+    amount: number;
+    message: string | null;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+    /** 幂等键（review 修复）：补偿 cron 用 gift 派生的固定 id，OpenIM 侧去重。 */
+    clientMsgID?: string;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        recvID: OpenimService.toImUserId(params.recvID),
+        content: {
+          data: JSON.stringify({
+            amount: params.amount,
+            message: params.message,
+          }),
+          description: `[转账] ${params.amount} 积分`,
+          extension: 'transfer-card-v1',
+        },
+        contentType: 110,
+        sessionType: 1,
+        senderNickname: params.senderNickname?.trim() || 'Circle',
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: false,
+        sendTime: Date.now(),
+        offlinePushInfo: {
+          title: params.senderNickname?.trim() || 'Circle',
+          desc: `[转账] ${params.amount} 积分`,
+          ex: '',
+          iOSPushSound: 'default',
+          iOSBadgeCount: true,
+        },
+        ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
+      },
+      adminToken,
+    );
+  }
+
 
   async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
     if (!this.enabled) return;

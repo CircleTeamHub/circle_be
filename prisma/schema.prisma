@@ -23,6 +23,7 @@ enum RefreshTokenAudience {
 enum EmailCodePurpose {
   REGISTER
   LOGIN
+  RESET_PASSWORD
 }
 
 enum UserRole {
@@ -130,6 +131,18 @@ enum NotificationPushOutboxStatus {
   PENDING
   PROCESSING
   COMPLETED
+  FAILED
+  TERMINAL
+}
+
+/// Per-(notification, device-token) delivery state (#88).
+/// SENT = Expo accepted (ticket held); CONFIRMED = receipt ok or aged out;
+/// FAILED = retryable, the outbox sweep will resend to this token only;
+/// TERMINAL = token dead (DeviceNotRegistered etc.), never retried.
+enum NotificationPushDeliveryStatus {
+  PENDING
+  SENT
+  CONFIRMED
   FAILED
   TERMINAL
 }
@@ -486,6 +499,14 @@ enum FriendReportStatus {
   REJECTED
 }
 
+/// #92：群/圈子帖子报告的三态审核（与 FriendReportStatus 同值集，独立命名
+/// 避免「好友报告」语义扩散）。
+enum ReportReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model FriendReport {
   id           String             @id @default(uuid())
   reporterID   String
@@ -515,22 +536,30 @@ model FriendReport {
 }
 
 model GroupReport {
-  id          String   @id @default(uuid())
-  reporterID  String
-  groupID     String
-  circleID    String?
-  category    String
-  description String
-  evidence    String[] @default([])
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id           String             @id @default(uuid())
+  reporterID   String
+  groupID      String
+  circleID     String?
+  category     String
+  description  String
+  evidence     String[]           @default([])
+  status       ReportReviewStatus @default(PENDING)
+  reviewedByID String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
 
   reporter User    @relation("groupReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
   circle   Circle? @relation("groupReports", fields: [circleID], references: [id], onDelete: SetNull)
 
-  @@unique([reporterID, groupID, category])
+  // review 修复：唯一约束收窄到 PENDING（局部唯一索引，见
+  // 20260721160000_report_reopen_partial_unique）。硬唯一会让「审结后再次
+  // 举报」永远建不出新 PENDING 行 —— 复发的违规无法再进审核队列。
+  @@index([reporterID, groupID, category])
   @@index([reporterID, createdAt])
   @@index([groupID, createdAt])
+  @@index([status, createdAt])
   @@index([circleID, createdAt])
 }
 
@@ -718,6 +747,8 @@ model FriendActivity {
   counterparty    User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
 
   @@unique([requestId, viewerId, type])
+  // review 修复：保留期清理按裸 createdAt 截断分批删除
+  @@index([createdAt])
   @@index([requestId])
   @@index([viewerId, createdAt])
   @@index([viewerId, readAt])
@@ -1007,6 +1038,8 @@ model CoinTransaction {
   balance   Int // balance after this tx
   note      String?
   relatedID String? // e.g. CoinGift.id for gift txs
+  /// #91：会员兑换等入口的 Idempotency-Key（可空唯一）。
+  idempotencyKey String?  @unique
   createdAt DateTime   @default(now())
   user      User       @relation(fields: [userID], references: [id], onDelete: Cascade)
 
@@ -1022,12 +1055,20 @@ model CoinGift {
   /// Client-supplied Idempotency-Key — a retry of the same gift reuses it
   /// and is rejected by the unique constraint instead of double-charging.
   idempotencyKey String?  @unique
+  /// #100：转账卡片补偿。客户端 IM 发卡成功后回执置位；超时未置位由
+  /// 服务端补发（gift-card outbox cron），钱与卡从「两个不相关操作」
+  /// 变成「最终必达」。
+  cardDeliveredAt DateTime?
+  cardAttempts    Int       @default(0)
   createdAt      DateTime @default(now())
   sender         User     @relation("giftSender", fields: [senderID], references: [id], onDelete: Cascade)
   recipient      User     @relation("giftRecipient", fields: [recipientID], references: [id], onDelete: Cascade)
 
   @@index([senderID])
   @@index([recipientID])
+  // round 2：待补卡片的局部索引（WHERE cardDeliveredAt IS NULL）在迁移
+  // 20260721180000 里用原生 SQL 建 —— Prisma schema 无法表达 partial index。
+
 }
 
 model UserCollection {
@@ -1115,6 +1156,8 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+  // review 修复：保留期清理按裸 createdAt 截断分批删除
+  @@index([createdAt])
   @@index([fromFriendRequestID])
 }
 
@@ -1128,12 +1171,58 @@ model NotificationPushOutbox {
   nextAttemptAt  DateTime                     @default(now())
   lockedAt       DateTime?
   processedAt    DateTime?
+  /// Immutable snapshot of the composed push payload (#88) — retries resend
+  /// exactly what was originally composed instead of re-reading live rows.
+  payload        Json?
   createdAt      DateTime                     @default(now())
   updatedAt      DateTime                     @updatedAt
 
-  notification Notification @relation(fields: [notificationID], references: [id], onDelete: Cascade)
+  notification Notification               @relation(fields: [notificationID], references: [id], onDelete: Cascade)
+  deliveries   NotificationPushDelivery[]
 
   @@index([status, nextAttemptAt])
+}
+
+model NotificationPushDelivery {
+  id             String                         @id @default(uuid())
+  outboxID       String
+  notificationID String
+  /// Raw Expo token snapshot — reaping via receipts works even after the
+  /// DevicePushToken row rotates or is pruned.
+  token          String
+  ticketID       String?
+  status         NotificationPushDeliveryStatus @default(PENDING)
+  lastError      String?
+  attempts       Int                            @default(0)
+  sentAt         DateTime?
+  receiptCheckedAt DateTime?
+  createdAt      DateTime                       @default(now())
+  updatedAt      DateTime                       @updatedAt
+
+  outbox NotificationPushOutbox @relation(fields: [outboxID], references: [id], onDelete: Cascade)
+
+  @@unique([notificationID, token])
+  @@index([status, sentAt])
+  // round 2：sweep 按 outboxID+status+attempts 查询/计数（外键不自动建索引）
+  @@index([outboxID, status, attempts])
+}
+
+/// #90：管理台操作审计。业务日志有 actor/target 但缺 ip/UA 与结构化前后值；
+/// 事后取证需要「谁、从哪、把什么从 A 改成了 B」。只追加不更新。
+model AdminAuditLog {
+  id        String   @id @default(uuid())
+  actorID   String
+  action    String
+  entityType String?
+  entityID  String?
+  before    Json?
+  after     Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([actorID, createdAt])
+  @@index([entityType, entityID, createdAt])
 }
 
 model DevicePushToken {
@@ -1296,14 +1385,21 @@ model CirclePostSignup {
 // 保留孤儿记录也无妨，从而无需改动庞大的 CirclePost / User 模型。同一用户对同一帖
 // 只记一条（@@unique），重复举报幂等更新原因。
 model CirclePostReport {
-  id         String   @id @default(uuid())
-  postID     String
-  reporterID String
-  reason     String?
-  createdAt  DateTime @default(now())
+  id           String             @id @default(uuid())
+  postID       String
+  reporterID   String
+  reason       String?
+  status       ReportReviewStatus @default(PENDING)
+  reviewedByID String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @default(now()) @updatedAt
 
-  @@unique([postID, reporterID])
+  // review 修复：同 GroupReport —— PENDING 局部唯一，审结后可重新举报。
+  @@index([postID, reporterID])
   @@index([postID])
+  @@index([status, createdAt])
 }
 
 model CollaborationRecognition {

@@ -118,6 +118,34 @@ describe('setupApp', () => {
     );
   });
 
+  it('mounts reset-request behind the shared email-code limiter (PR #120 review)', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    // 未认证发信面必须共享同一个限流池，换端点不能绕开 10/15min 上限
+    expect(app.use).toHaveBeenCalledWith(
+      '/api/v1/auth/password/reset-request',
+      expect.any(Function),
+    );
+  });
+
+  it('exempts /coin/gift/card-sent receipts from the gift-send quota (PR #120 review)', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const [, giftGate] = app.use.mock.calls.find(
+      ([path]) => path === '/api/v1/coin/gift',
+    ) as [string, (req: any, res: any, next: any) => void];
+
+    // 挂载点是包装器：真发礼物（path '/'）走限流器，card-sent 回执直接放行
+    const next = jest.fn();
+    giftGate({ path: '/card-sent' } as any, {} as any, next);
+    expect(next).toHaveBeenCalledTimes(1);
+
+    // path '/'（POST /coin/gift 本体）不会直接 next —— 进的是限流器分支。
+    // 限流器内部行为在别处测；这里只验证「回执不吃配额」的分流。
+  });
+
   it('adds a dedicated rate limit for trace detail reads', () => {
     const app = buildAppMock();
     setupApp(app as any);

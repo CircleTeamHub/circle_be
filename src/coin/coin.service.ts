@@ -221,6 +221,25 @@ export class CoinService {
     );
   }
 
+/**
+   * 客户端 IM 发卡成功回执（#100）：置位 cardDeliveredAt，补偿 cron 不再
+   * 补发。按 idempotencyKey 定位（客户端本就持有它；sendGift 响应无 id）。
+   * 幂等；仅发送方本人可回执。找不到礼物静默成功 —— 回执迟到于清理属可容忍。
+   */
+  async markGiftCardSent(
+    senderId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    await this.prisma.coinGift.updateMany({
+      where: {
+        idempotencyKey,
+        senderID: senderId,
+        cardDeliveredAt: null,
+      },
+      data: { cardDeliveredAt: new Date() },
+    });
+  }
+
   private async notifyRecharge(userId: string, amount: number): Promise<void> {
     let notification = null;
     try {

@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
@@ -68,6 +69,25 @@ export class CoinController {
       dto.amount,
       idempotencyKey.trim(),
       dto.message,
+    );
+  }
+
+  @Post('gift/card-sent')
+  // round 2 review：@Throttle 只是元数据，没有 ThrottlerGuard 就不生效
+  //（本应用有意不注册全局 ThrottlerGuard）。回执是会写库的端点，必须真限流。
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  markGiftCardSent(
+    @Headers('idempotency-key') idempotencyKey: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    if (!idempotencyKey || idempotencyKey.trim().length === 0) {
+      throw new BadRequestException('idempotency-key header is required');
+    }
+    // #100：IM 卡片已由客户端送达的回执，阻止服务端补偿 cron 重复发卡。
+    return this.coinService.markGiftCardSent(
+      req.user.userId,
+      idempotencyKey.trim(),
     );
   }
 }

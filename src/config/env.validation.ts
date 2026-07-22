@@ -185,6 +185,9 @@ export function createEnvValidationSchema(
       otherwise: Joi.string().optional(),
     }),
     MAIL_FROM: Joi.string().optional(),
+    // #95：通知 / 好友动态保留天数。0 = 关闭该表清理。
+    NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(0).default(90),
+    FRIEND_ACTIVITY_RETENTION_DAYS: Joi.number().integer().min(0).default(180),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),
