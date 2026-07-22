@@ -431,8 +431,8 @@ describe('CircleService', () => {
 
   const membershipTiers = [
     { level: 0, capacity: 100 },
-    { level: 1, capacity: 300 },
-    { level: 2, capacity: 500 },
+    { level: 1, capacity: 200 },
+    { level: 2, capacity: 400 },
     { level: 3, capacity: 1000 },
     { level: 4, capacity: 3000 },
   ];

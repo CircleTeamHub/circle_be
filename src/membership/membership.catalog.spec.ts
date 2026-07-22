@@ -11,8 +11,8 @@ describe('membership catalog', () => {
       key: 'regular',
       durationMonths: null,
       priceCny: null,
-      actual: [100, 100, 50, 1],
-      display: ['100', '100', '50', '1'],
+      actual: [100, 100, 50, 0],
+      display: ['100', '100', '50', '0'],
       appearance: ['default', null, null],
     },
     {
@@ -20,8 +20,8 @@ describe('membership catalog', () => {
       key: 'silver',
       durationMonths: 1,
       priceCny: 298,
-      actual: [300, 200, 100, 5],
-      display: ['300', '200', '100', '5'],
+      actual: [200, 200, 100, 2],
+      display: ['200', '200', '100', '2'],
       appearance: ['silver', 'silver', null],
     },
     {
@@ -29,8 +29,8 @@ describe('membership catalog', () => {
       key: 'gold',
       durationMonths: 6,
       priceCny: 1288,
-      actual: [500, 500, 500, 20],
-      display: ['500', '500', '500', '20'],
+      actual: [400, 300, 500, 10],
+      display: ['400', '300', '500', '10'],
       appearance: ['gold', 'gold', null],
     },
     {
@@ -39,7 +39,7 @@ describe('membership catalog', () => {
       durationMonths: 12,
       priceCny: 1998,
       actual: [1000, 1000, 1000, 50],
-      display: ['1000', '999+', '999+', '50'],
+      display: ['1000', '1000', '1000', '50'],
       appearance: ['rainbow', 'diamond', 'standard'],
     },
     {
@@ -47,8 +47,8 @@ describe('membership catalog', () => {
       key: 'super',
       durationMonths: null,
       priceCny: 3998,
-      actual: [3000, 5000, 10000, 1000],
-      display: ['3000', 'unlimited', 'unlimited', 'unlimited'],
+      actual: [3000, 2000, 3000, 1000],
+      display: ['3000', '2000', '3000', 'unlimited'],
       appearance: ['exclusive-shimmer', 'super-lifetime', 'premium'],
     },
   ])(

@@ -141,7 +141,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 0,
+        vipLevel: 1,
         vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
@@ -195,7 +195,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 0,
+        vipLevel: 1,
         vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,
@@ -280,9 +280,9 @@ describe('CirclePlazaService', () => {
     });
 
     it.each([
-      ['regular', 0, 1],
-      ['silver', 1, 5],
-      ['gold', 2, 20],
+      ['regular', 0, 0],
+      ['silver', 1, 2],
+      ['gold', 2, 10],
       ['diamond', 3, 50],
       ['super', 4, 1000],
     ] as const)(
@@ -304,9 +304,12 @@ describe('CirclePlazaService', () => {
         await expect(
           service.getFeed('viewer-1', { cities: atLimit } as any),
         ).resolves.toMatchObject({ items: [] });
-        expect(
-          prisma.circlePost.findMany.mock.calls[0][0].where.cities.hasSome,
-        ).toEqual(atLimit);
+        const atLimitWhere = prisma.circlePost.findMany.mock.calls[0][0].where;
+        if (cityLimit === 0) {
+          expect(atLimitWhere.cities).toBeUndefined();
+        } else {
+          expect(atLimitWhere.cities.hasSome).toEqual(atLimit);
+        }
 
         await expect(
           service.getFeed('viewer-1', {
@@ -352,13 +355,13 @@ describe('CirclePlazaService', () => {
 
       await expect(
         service.getFeed('viewer-1', {
-          cities: ['Shanghai', 'Hangzhou'],
+          cities: ['Shanghai'],
         } as any),
       ).rejects.toMatchObject({
         response: {
           errorCode: 'CITY_FILTER_QUOTA_REACHED',
-          limit: 1,
-          current: 2,
+          limit: 0,
+          current: 1,
         },
       });
       expect(prisma.circlePost.findMany).not.toHaveBeenCalled();
@@ -394,7 +397,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 0,
+        vipLevel: 1,
         vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: false,

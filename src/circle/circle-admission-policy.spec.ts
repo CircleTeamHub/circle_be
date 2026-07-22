@@ -67,9 +67,9 @@ describe('CircleAdmissionPolicy', () => {
   it.each([
     [0, null, 100],
     [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 500],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
     [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
-    [4, null, 5000],
+    [4, null, 2000],
   ])(
     'allows effective level %i at limit - 1 and exposes its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
@@ -99,9 +99,9 @@ describe('CircleAdmissionPolicy', () => {
   it.each([
     [0, null, 100],
     [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 500],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
     [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
-    [4, null, 5000],
+    [4, null, 2000],
   ])(
     'denies effective level %i at its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
