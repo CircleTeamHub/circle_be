@@ -21,7 +21,6 @@ const GIFT_MAX_SINGLE = 10_000;
 // Max coins a user can send per day (prevent drain attacks)
 const GIFT_DAILY_LIMIT = 50_000;
 // Upper bound on a single admin top-up — guards against fat-finger / Int overflow.
-const MAX_ADMIN_TOPUP = 1_000_000;
 
 @Injectable()
 export class CoinService {
@@ -222,63 +221,7 @@ export class CoinService {
     );
   }
 
-  // ─── Admin: top-up ────────────────────────────────────────────────────────────
-
-  async adminTopUp(
-    targetUserId: string,
-    amount: number,
-    note?: string,
-  ): Promise<WalletDto> {
-    if (amount <= 0) {
-      throw new BadRequestException({
-        message: 'Amount must be positive',
-        errorCode: CoinErrorCode.AmountInvalid,
-      });
-    }
-    if (amount > MAX_ADMIN_TOPUP) {
-      throw new BadRequestException({
-        message: `Amount exceeds the per-top-up cap of ${MAX_ADMIN_TOPUP}`,
-        errorCode: CoinErrorCode.AmountTooLarge,
-      });
-    }
-
-    const target = await this.prisma.user.findUnique({
-      where: { id: targetUserId },
-      select: { id: true, status: true },
-    });
-    if (!target || target.status !== 'ACTIVE') {
-      throw new NotFoundException({
-        message: 'User not found',
-        errorCode: CoinErrorCode.UserNotFound,
-      });
-    }
-
-    const wallet = await runSerializableTransaction(this.prisma, async (tx) => {
-      const wallet = await tx.wallet.upsert({
-        where: { userID: targetUserId },
-        update: { balance: { increment: amount } },
-        create: { userID: targetUserId, balance: amount },
-      });
-
-      await tx.coinTransaction.create({
-        data: {
-          userID: targetUserId,
-          type: 'RECHARGE',
-          amount,
-          balance: wallet.balance,
-          note: note ?? null,
-        },
-      });
-
-      return wallet;
-    });
-
-    await this.notifyRecharge(targetUserId, amount);
-
-    return wallet;
-  }
-
-  /**
+/**
    * 客户端 IM 发卡成功回执（#100）：置位 cardDeliveredAt，补偿 cron 不再
    * 补发。按 idempotencyKey 定位（客户端本就持有它；sendGift 响应无 id）。
    * 幂等；仅发送方本人可回执。找不到礼物静默成功 —— 回执迟到于清理属可容忍。

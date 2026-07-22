@@ -250,47 +250,6 @@ describe('CoinService', () => {
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
   });
 
-  it('adminTopUp rejects a non-positive amount', async () => {
-    await expect(service.adminTopUp('user-1', 0)).rejects.toThrow(
-      BadRequestException,
-    );
-  });
-
-  it('adminTopUp rejects an amount above the cap', async () => {
-    await expect(service.adminTopUp('user-1', 1_000_001)).rejects.toThrow(
-      /cap/i,
-    );
-  });
-
-  it('adminTopUp rejects a missing target user', async () => {
-    prisma.user.findUnique.mockResolvedValue(null);
-
-    await expect(service.adminTopUp('ghost', 500)).rejects.toThrow(
-      NotFoundException,
-    );
-    expect(prisma.$transaction).not.toHaveBeenCalled();
-  });
-
-  it('adminTopUp credits the wallet and records a RECHARGE tx', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      id: 'user-1',
-      status: 'ACTIVE',
-    });
-    tx.wallet.upsert.mockResolvedValue({
-      id: 'wallet-1',
-      userID: 'user-1',
-      balance: 500,
-    });
-    tx.coinTransaction.create.mockResolvedValue({ id: 'tx-1' });
-
-    const wallet = await service.adminTopUp('user-1', 500, 'launch bonus');
-
-    expect(wallet.balance).toBe(500);
-    expect(tx.coinTransaction.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ type: 'RECHARGE', amount: 500 }),
-    });
-  });
-
   it('getWallet upserts so concurrent first access cannot collide', async () => {
     prisma.wallet.upsert.mockResolvedValue({
       id: 'wallet-1',

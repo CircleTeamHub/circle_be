@@ -33,6 +33,8 @@ import {
   SessionContext,
 } from './refresh-token.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { accessTokenTtlSeconds } from './session-revocation.service';
+import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { IconService } from 'src/icon/icon.service';
@@ -40,6 +42,13 @@ import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { USER_ME_SELECT } from 'src/user/user.select';
 
 const ME_SELECT = USER_ME_SELECT;
+
+// 管理台按账号锁定（#83）：与 securityCode 锁定同款参数量级。
+// 5 次错密码 → 锁 15 分钟；成功登录清零。只对 role=ADMIN 账号生效。
+const ADMIN_LOGIN_MAX_ATTEMPTS = 5;
+const ADMIN_LOGIN_LOCK_MINUTES = 15;
+// 管理台 access token 缩短（#91 目标 5-15 分钟）；可用 ADMIN_JWT_EXPIRES_IN 覆盖。
+const DEFAULT_ADMIN_JWT_EXPIRES_IN = '15m';
 const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
 // Persistent per-account lockout for security-code verification. Backs up the
 // per-IP rate limiter so a distributed / IP-rotating attacker still can't
@@ -110,6 +119,7 @@ export class AuthService {
     private openim: OpenimService,
     private iconService: IconService,
     private emailVerification: EmailVerificationService,
+    private configService: ConfigService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
@@ -219,8 +229,40 @@ export class AuthService {
       });
     }
 
+    // round 3 review（P1）：ADMIN 账号整体拒绝走普通登录 —— 即使密码正确，
+    // 这里发出的是 APP audience 的长 TTL 会话 + IM token，而 /roles 等管理
+    // 端点（JwtGuard+RoleGuard）会接受它，等于绕开短 TTL/审计的管理会话
+    // 模型。管理台请走 /auth/admin/login。对外文案与普通失败一致（不泄露
+    // 该邮箱是管理员）。锁定检查仍在其前（锁死期间不做密码比对）。
+    const now = new Date();
+    if (this.isAdminLockedNow(user, now)) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'account_locked' },
+      });
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
+
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid) {
+      if (user.role === 'ADMIN') {
+        const lockedNow = await this.registerAdminLoginFailure(user.id, now);
+        if (lockedNow) {
+          logBusinessEvent(this.logger, {
+            enabled: this.loggingConfig.businessLogOn,
+            businessEvent: 'auth_admin_login_locked',
+            actorId: user.id,
+            result: 'failure',
+            metadata: { lockMinutes: ADMIN_LOGIN_LOCK_MINUTES, via: 'login' },
+          });
+        }
+      }
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
         businessEvent: 'auth_login_failed',
@@ -234,12 +276,86 @@ export class AuthService {
       });
     }
 
+    if (user.role === 'ADMIN') {
+      await this.resetAdminLockCounters(user);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'admin_must_use_admin_login' },
+      });
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
     return this.finishLogin(user, sessionContext, dto.platform);
+  }
+
+  /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
+  private isAdminLockedNow(
+    user: { role: string; adminLoginLockedUntil: Date | null },
+    now: Date,
+  ): boolean {
+    return (
+      user.role === 'ADMIN' &&
+      !!user.adminLoginLockedUntil &&
+      user.adminLoginLockedUntil > now
+    );
+  }
+
+  /**
+   * ADMIN 错误密码计数（DB 原子 increment）+ 到阈值的条件上锁转换。
+   * 返回是否由本次失败触发锁定。/auth/login 与 /auth/admin/login 共用 ——
+   * review 修复（round 2 P1）：普通登录路径也接受 ADMIN 账号，不共用计数的
+   * 话攻击者换条路就能无限撞库，锁定形同虚设。
+   */
+  private async registerAdminLoginFailure(
+    userId: string,
+    now: Date,
+  ): Promise<boolean> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { adminLoginAttempts: { increment: 1 } },
+    });
+    const locked = await this.prisma.user.updateMany({
+      where: {
+        id: userId,
+        adminLoginAttempts: { gte: ADMIN_LOGIN_MAX_ATTEMPTS },
+      },
+      data: {
+        adminLoginAttempts: 0,
+        adminLoginLockedUntil: new Date(
+          now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000,
+        ),
+      },
+    });
+    return locked.count > 0;
+  }
+
+  /** 成功登录清零计数（只在有残留时写库，避免每次登录白写一行）。 */
+  private async resetAdminLockCounters(user: {
+    id: string;
+    adminLoginAttempts: number;
+    adminLoginLockedUntil: Date | null;
+  }): Promise<void> {
+    if (user.adminLoginAttempts !== 0 || user.adminLoginLockedUntil) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { adminLoginAttempts: 0, adminLoginLockedUntil: null },
+      });
+    }
   }
 
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
     const email = normalizeEmail(dto.email);
     const user = await this.prisma.user.findUnique({ where: { email } });
+    // 管理台事件必须可追溯来源（#90）：ip/userAgent 一律进 metadata。
+    const adminAuditContext = {
+      ip: sessionContext?.ip ?? null,
+      userAgent: sessionContext?.userAgent ?? null,
+    };
 
     if (!user || user.status !== 'ACTIVE') {
       logBusinessEvent(this.logger, {
@@ -249,13 +365,48 @@ export class AuthService {
         result: 'failure',
         metadata: {
           reason: user ? 'inactive_account' : 'invalid_credentials',
+          ...adminAuditContext,
         },
+      });
+      throw new ForbiddenException('Invalid credentials or inactive account');
+    }
+
+    // 按账号锁定（#83）：admin 账号是唯一受保护对象 —— IP 限流挡不住分布式
+    // 撞库，这里在账号维度兜底。锁定检查先于 argon2.verify，锁死期间不做
+    // 密码比对（也顺带省掉被锁账号的 argon2 开销）。对外文案与其它失败一致，
+    // 不泄露「已锁定」状态。
+    const now = new Date();
+    if (this.isAdminLockedNow(user, now)) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'account_locked', ...adminAuditContext },
       });
       throw new ForbiddenException('Invalid credentials or inactive account');
     }
 
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid || user.role !== 'ADMIN') {
+      // 只有真正的 ADMIN 账号累计失败计数：对非 admin 账号计数会让任何人
+      // 通过 adminLogin 刷别人的普通账号进锁定（DoS）。
+      if (!valid && user.role === 'ADMIN') {
+        // 原子计数 + 条件上锁（round 1 修复），与 /auth/login 共用同一辅助。
+        const lockedNow = await this.registerAdminLoginFailure(user.id, now);
+        if (lockedNow) {
+          logBusinessEvent(this.logger, {
+            enabled: this.loggingConfig.businessLogOn,
+            businessEvent: 'auth_admin_login_locked',
+            actorId: user.id,
+            result: 'failure',
+            metadata: {
+              lockMinutes: ADMIN_LOGIN_LOCK_MINUTES,
+              ...adminAuditContext,
+            },
+          });
+        }
+      }
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
         businessEvent: 'auth_admin_login_failed',
@@ -263,10 +414,13 @@ export class AuthService {
         result: 'failure',
         metadata: {
           reason: valid ? 'insufficient_role' : 'invalid_credentials',
+          ...adminAuditContext,
         },
       });
       throw new ForbiddenException('Invalid credentials or inactive account');
     }
+
+    await this.resetAdminLockCounters(user);
 
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
@@ -296,6 +450,7 @@ export class AuthService {
       result: 'success',
       entityType: 'user',
       entityId: user.id,
+      metadata: adminAuditContext,
     });
 
     return tokens;
@@ -493,8 +648,30 @@ export class AuthService {
     return { accessToken, refreshToken: newRefreshToken };
   }
 
-  async logout(refreshToken: string): Promise<void> {
-    await this.refreshTokenService.revoke(refreshToken);
+  async logout(
+    refreshToken: string,
+    sessionContext?: SessionContext,
+  ): Promise<void> {
+    const revoked = await this.refreshTokenService.revoke(refreshToken);
+    // 管理台登出此前完全无痕（#90）：事后取证时连「会话何时结束」都答不上来。
+    // 普通用户登出量大且低敏，保持不记；ADMIN 会话必须留痕。
+    // review 修复（round 2）：带上 ip/userAgent/sessionId —— 没有来源信息，
+    // 正常登出与「被盗 refresh token 在别处被撤销」在审计里无从区分。
+    if (revoked?.audience === 'ADMIN') {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_admin_logout',
+        actorId: revoked.userId,
+        result: 'success',
+        entityType: 'user',
+        entityId: revoked.userId,
+        metadata: {
+          sessionId: revoked.sessionId,
+          ip: sessionContext?.ip ?? null,
+          userAgent: sessionContext?.userAgent ?? null,
+        },
+      });
+    }
   }
 
   async sessions(userId: string, currentSessionId?: string) {
@@ -1142,13 +1319,38 @@ export class AuthService {
     sessionId?: string,
     audience: RefreshTokenAudience = 'APP',
   ): Promise<string> {
-    return this.jwt.signAsync({
+    const payload = {
       sub: userId,
       accountId,
       role,
       sid: sessionId,
       aud: audience,
       issuedAtMs: Date.now(),
-    });
+    };
+    // ADMIN audience 用更短的 access TTL（#91）：全局 JWT_EXPIRES_IN 仍管普通
+    // 用户；管理台 access token 默认 15 分钟，可用 ADMIN_JWT_EXPIRES_IN 覆盖。
+    if (audience === 'ADMIN') {
+      const adminExpiresIn =
+        this.configService.get<string>('ADMIN_JWT_EXPIRES_IN') ??
+        DEFAULT_ADMIN_JWT_EXPIRES_IN;
+      // review 修复（钳到吊销窗口）：SessionRevocationService 的吊销标记
+      // TTL 按全局 JWT_EXPIRES_IN 定长 —— admin access TTL 若配得更长，
+      // 标记先过期、被吊销的 admin token 会「复活」。上限=全局 TTL。
+      const adminSeconds = accessTokenTtlSeconds(adminExpiresIn);
+      const globalSeconds = accessTokenTtlSeconds(
+        this.configService.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
+      );
+      if (adminSeconds > globalSeconds) {
+        this.logger.warn(
+          `ADMIN_JWT_EXPIRES_IN (${adminExpiresIn}) exceeds JWT_EXPIRES_IN — ` +
+            'clamping admin access TTL to the global value so revocation ' +
+            'markers always outlive the token',
+        );
+      }
+      return this.jwt.signAsync(payload, {
+        expiresIn: Math.min(adminSeconds, globalSeconds),
+      });
+    }
+    return this.jwt.signAsync(payload);
   }
 }

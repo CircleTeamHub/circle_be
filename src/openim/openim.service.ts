@@ -439,6 +439,69 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * 通话留痕自定义消息（#115）。contentType 110（CustomElem），data 为 JSON 串，
+   * 客户端按 data.type 分发渲染（与 friend-card / transfer-card 同一套约定）。
+   * 单聊发给 recvID，群聊发给 groupID。默认不做离线推送（通话结束不该像新
+   * 消息一样响铃）；未接来电（offlinePush 显式给出时）例外。
+   */
+  async sendCallRecordMessage(params: {
+    sendID: string;
+    senderNickname?: string | null;
+    senderFaceURL?: string | null;
+    target:
+      | { kind: 'single'; recvID: string }
+      | { kind: 'group'; groupID: string };
+    data: Record<string, unknown>;
+    /** 客户端按 customElem.extension 分发渲染（Circle_frontend im/mappers 惯例）。 */
+    extension: string;
+    offlinePush?: { title: string; desc: string } | null;
+    /** 幂等键（round 2 review）：重试用固定 id，OpenIM 侧去重防双留痕。 */
+    clientMsgID?: string;
+  }): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    const single = params.target.kind === 'single';
+    await this.post(
+      '/msg/send_msg',
+      {
+        sendID: OpenimService.toImUserId(params.sendID),
+        ...(params.target.kind === 'single'
+          ? { recvID: OpenimService.toImUserId(params.target.recvID) }
+          : { groupID: params.target.groupID }),
+        content: {
+          data: JSON.stringify(params.data),
+          description: '',
+          extension: params.extension,
+        },
+        contentType: 110,
+        sessionType: single ? 1 : 3,
+        senderNickname: params.senderNickname?.trim() || 'Circle',
+        senderFaceURL: params.senderFaceURL ?? '',
+        senderPlatformID: 5,
+        isOnlineOnly: false,
+        notOfflinePush: !params.offlinePush,
+        sendTime: Date.now(),
+        ...(params.offlinePush
+          ? {
+              offlinePushInfo: {
+                title: params.offlinePush.title,
+                desc: params.offlinePush.desc,
+                ex: '',
+                iOSPushSound: 'default',
+                iOSBadgeCount: true,
+              },
+            }
+          : {}),
+        ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
+      },
+      adminToken,
+    );
+  }
+
+
+  /**
    * 服务端补发转账卡片（#100）：与客户端 im 发卡完全同构 ——
    * contentType 110 + extension 'transfer-card-v1' + data {amount, message}，
    * 接收端渲染路径无差别。仅单聊。
@@ -490,6 +553,7 @@ export class OpenimService implements OnModuleInit {
       adminToken,
     );
   }
+
 
   async deleteFriend(ownerUserID: string, friendUserID: string): Promise<void> {
     if (!this.enabled) return;

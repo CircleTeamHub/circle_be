@@ -8,7 +8,8 @@ import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 
 function buildAppMock(
-  redisService?: Pick<RedisService, 'createRateLimitStore'>,
+  redisService?: Pick<RedisService, 'createRateLimitStore'> &
+    Partial<Pick<RedisService, 'isEnabled' | 'ping'>>,
 ) {
   return {
     setGlobalPrefix: jest.fn(),
@@ -183,6 +184,8 @@ describe('setupApp', () => {
       }) as any;
     const redisService = {
       createRateLimitStore: jest.fn(createStore),
+      isEnabled: jest.fn(() => true),
+      ping: jest.fn(async () => true),
     };
     const app = buildAppMock(redisService);
 

@@ -95,6 +95,8 @@ describe('FriendService', () => {
         ? operations(prisma as any)
         : Promise.all(operations),
     ),
+    // 拉黑/删好友与 1:1 呼叫共享的 pair advisory 锁（round 2）
+    $queryRaw: jest.fn().mockResolvedValue([]),
   };
 
   const realtimeService = {

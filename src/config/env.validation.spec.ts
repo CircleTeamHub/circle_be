@@ -231,6 +231,64 @@ describe('createEnvValidationSchema', () => {
     expect(error).toBeUndefined();
   });
 
+  describe('session TTL knobs (PR #117 review)', () => {
+    const base = {
+      NODE_ENV: 'development',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      SECRET: 'x'.repeat(64),
+    };
+
+    it('does NOT default REFRESH_EXPIRES_IN — legacy-only envs keep their fallback alive', () => {
+      const env = { ...base, REFRESH_EXPIRES_IN_DAYS: '14' };
+      const { error, value } = createEnvValidationSchema(env).validate(env, {
+        allowUnknown: true,
+      });
+      expect(error).toBeUndefined();
+      // Joi 层若默认 '7d'，RefreshTokenService 永远读到非空值，
+      // REFRESH_EXPIRES_IN_DAYS 的兼容回落就成了死代码（会把 14d 环境降成 7d）
+      expect(value.REFRESH_EXPIRES_IN).toBeUndefined();
+    });
+
+    it('rejects malformed TTLs at boot instead of silently defaulting', () => {
+      for (const bad of [
+        { REFRESH_EXPIRES_IN: '8hours' },
+        { REFRESH_EXPIRES_IN: 'soon' },
+        { ADMIN_REFRESH_EXPIRES_IN: '3600x' },
+        { ADMIN_JWT_EXPIRES_IN: 'fifteen-minutes' },
+        { REFRESH_EXPIRES_IN_DAYS: '-3' },
+        // round 2：零时长（下游按无效回落默认 = 静默放大）
+        { REFRESH_EXPIRES_IN: '0d' },
+        { ADMIN_REFRESH_EXPIRES_IN: '0h' },
+        { ADMIN_JWT_EXPIRES_IN: '0s' },
+        { REFRESH_EXPIRES_IN_DAYS: '0' },
+        // round 2：admin refresh 裸数字（旧语义=天，漏个 h 变 12 天）
+        { ADMIN_REFRESH_EXPIRES_IN: '12' },
+        // round 3：admin access 裸数字（'900' 按毫秒解析 = 1 秒 token）
+        { ADMIN_JWT_EXPIRES_IN: '900' },
+      ]) {
+        const env = { ...base, ...bad };
+        const { error } = createEnvValidationSchema(env).validate(env, {
+          allowUnknown: true,
+        });
+        expect(error?.message).toBeDefined();
+      }
+    });
+
+    it('accepts the documented duration formats', () => {
+      const env = {
+        ...base,
+        REFRESH_EXPIRES_IN: '30d',
+        ADMIN_REFRESH_EXPIRES_IN: '12h',
+        ADMIN_JWT_EXPIRES_IN: '900s',
+        REFRESH_EXPIRES_IN_DAYS: '14',
+      };
+      const { error } = createEnvValidationSchema(env).validate(env, {
+        allowUnknown: true,
+      });
+      expect(error).toBeUndefined();
+    });
+  });
+
   describe('OPENIM_ADMIN_SECRET', () => {
     // The admin secret is POSTed to /auth/get_admin_token; whoever holds it can
     // mint an OpenIM admin token and act as any user. It is gated on

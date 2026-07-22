@@ -30,6 +30,7 @@ import { Registry } from 'prom-client';
 import { createMetrics } from './metrics/metrics.service';
 import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
 import { createMetricsHandler } from './metrics/metrics.endpoint';
+import { createInfraStatusMetrics } from './metrics/infra-status.metrics';
 import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
@@ -333,6 +334,16 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         'process stats.',
     );
   }
+  // 基建状态 gauge（#87/#102）：桶策略未确认、Redis 存活。抓取时求值。
+  const uploadServiceForMetrics = getOptionalUploadService(app);
+  const infraStatusMetrics = createInfraStatusMetrics({
+    objectStoreStatus: uploadServiceForMetrics
+      ? () => uploadServiceForMetrics.objectStoreStatus()
+      : null,
+    // 未启用 Redis（无 REDIS_URL 的单机部署）时不挂 ping：否则 gauge 恒 0，
+    // RedisDown 告警对着一个本来就不存在的依赖长鸣。
+    redisPing: redisService?.isEnabled() ? () => redisService.ping() : null,
+  });
   app.use(
     '/metrics',
     createMetricsHandler(
@@ -341,6 +352,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         businessMetrics.registry,
         redisMetrics.registry,
         uploadMetrics.registry,
+        infraStatusMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),
