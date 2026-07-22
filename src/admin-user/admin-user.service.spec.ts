@@ -4,6 +4,7 @@ import { AdminUserService } from './admin-user.service';
 
 describe('AdminUserService', () => {
   const prisma = {
+    $transaction: jest.fn(),
     user: {
       findMany: jest.fn(),
       count: jest.fn(),
@@ -23,10 +24,31 @@ describe('AdminUserService', () => {
     recordInTransaction: jest.fn(),
     listForTarget: jest.fn(),
   };
-  const service = new AdminUserService(prisma as never, audit as never);
+  const tx = {
+    user: {
+      findUnique: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    refreshToken: { updateMany: jest.fn() },
+  };
+  const sessionRevocation = { revokeUser: jest.fn() };
+  const realtime = {
+    invalidateUserProfileSummaryCache: jest.fn(),
+    broadcastUserProfileSummary: jest.fn(),
+  };
+  const service = new AdminUserService(
+    prisma as never,
+    audit as never,
+    sessionRevocation as never,
+    realtime as never,
+  );
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+    prisma.$transaction.mockImplementation((callback) => callback(tx));
+    sessionRevocation.revokeUser.mockResolvedValue(undefined);
+    realtime.invalidateUserProfileSummaryCache.mockResolvedValue(undefined);
+    realtime.broadcastUserProfileSummary.mockResolvedValue(undefined);
   });
 
   describe('listUsers', () => {
@@ -379,6 +401,241 @@ describe('AdminUserService', () => {
         response: { errorCode: AdminUserErrorCode.NotFound },
       });
       expect(audit.listForTarget).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateStatus', () => {
+    const actor = { userId: 'admin-1', accountId: 'support-admin' };
+
+    it.each([
+      [
+        UserStatus.ACTIVE,
+        UserStatus.BANNED,
+        'USER_BANNED',
+        true,
+      ],
+      [
+        UserStatus.ACTIVE,
+        UserStatus.DELETED,
+        'USER_DELETED',
+        true,
+      ],
+      [
+        UserStatus.BANNED,
+        UserStatus.ACTIVE,
+        'USER_UNBANNED',
+        false,
+      ],
+      [
+        UserStatus.BANNED,
+        UserStatus.DELETED,
+        'USER_DELETED',
+        true,
+      ],
+    ])(
+      'changes %s to %s transactionally',
+      async (currentStatus, targetStatus, action, revokesSessions) => {
+        tx.user.findUnique.mockResolvedValue({
+          id: 'user-1',
+          accountId: 'jim-1001',
+          status: currentStatus,
+        });
+        tx.user.updateMany.mockResolvedValue({ count: 1 });
+        tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+        audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+        const result = await service.updateStatus(actor, 'user-1', {
+          status: targetStatus,
+          reason: '  policy violation  ',
+          ...(targetStatus === UserStatus.DELETED
+            ? { confirmationAccountId: 'jim-1001' }
+            : {}),
+        });
+
+        expect(tx.user.updateMany).toHaveBeenCalledWith({
+          where: { id: 'user-1', status: currentStatus },
+          data: { status: targetStatus },
+        });
+        expect(audit.recordInTransaction).toHaveBeenCalledWith(tx, {
+          actorId: 'admin-1',
+          actorAccountId: 'support-admin',
+          action,
+          targetType: 'user',
+          targetId: 'user-1',
+          before: { status: currentStatus },
+          after: { status: targetStatus },
+          reason: 'policy violation',
+        });
+        if (revokesSessions) {
+          expect(tx.refreshToken.updateMany).toHaveBeenCalledWith({
+            where: { userId: 'user-1', revokedAt: null },
+            data: { revokedAt: expect.any(Date) },
+          });
+          expect(sessionRevocation.revokeUser).toHaveBeenCalledWith('user-1');
+        } else {
+          expect(tx.refreshToken.updateMany).not.toHaveBeenCalled();
+          expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
+        }
+        expect(
+          realtime.invalidateUserProfileSummaryCache,
+        ).toHaveBeenCalledWith('user-1');
+        expect(realtime.broadcastUserProfileSummary).toHaveBeenCalledWith(
+          'user-1',
+        );
+        expect(result).toEqual({
+          id: 'user-1',
+          accountId: 'jim-1001',
+          status: targetStatus,
+        });
+      },
+    );
+
+    it.each([
+      [UserStatus.ACTIVE, UserStatus.ACTIVE],
+      [UserStatus.BANNED, UserStatus.BANNED],
+      [UserStatus.DELETED, UserStatus.ACTIVE],
+      [UserStatus.DELETED, UserStatus.BANNED],
+      [UserStatus.DELETED, UserStatus.DELETED],
+    ])('rejects the invalid transition %s to %s', async (current, target) => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: current,
+      });
+
+      await expect(
+        service.updateStatus(actor, 'user-1', {
+          status: target,
+          reason: 'policy violation',
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: AdminUserErrorCode.InvalidStatusTransition },
+      });
+      expect(tx.user.updateMany).not.toHaveBeenCalled();
+      expect(audit.recordInTransaction).not.toHaveBeenCalled();
+    });
+
+    it.each([UserStatus.BANNED, UserStatus.DELETED])(
+      'rejects self-directed %s',
+      async (status) => {
+        tx.user.findUnique.mockResolvedValue({
+          id: 'admin-1',
+          accountId: 'support-admin',
+          status: UserStatus.ACTIVE,
+        });
+
+        await expect(
+          service.updateStatus(actor, 'admin-1', {
+            status,
+            reason: 'policy violation',
+            confirmationAccountId: 'support-admin',
+          }),
+        ).rejects.toMatchObject({
+          response: { errorCode: AdminUserErrorCode.SelfStatusChange },
+        });
+      },
+    );
+
+    it.each([undefined, 'wrong-account']) (
+      'requires the exact account ID for deletion (%s)',
+      async (confirmationAccountId) => {
+        tx.user.findUnique.mockResolvedValue({
+          id: 'user-1',
+          accountId: 'jim-1001',
+          status: UserStatus.ACTIVE,
+        });
+
+        await expect(
+          service.updateStatus(actor, 'user-1', {
+            status: UserStatus.DELETED,
+            reason: 'policy violation',
+            confirmationAccountId,
+          }),
+        ).rejects.toMatchObject({
+          response: { errorCode: AdminUserErrorCode.ConfirmationMismatch },
+        });
+      },
+    );
+
+    it('rejects a concurrent conditional-update conflict', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.updateStatus(actor, 'user-1', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: AdminUserErrorCode.StatusConflict },
+      });
+      expect(audit.recordInTransaction).not.toHaveBeenCalled();
+    });
+
+    it('rolls back the operation surface when transactional audit fails', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      audit.recordInTransaction.mockRejectedValue(new Error('audit down'));
+
+      await expect(
+        service.updateStatus(actor, 'user-1', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        }),
+      ).rejects.toThrow('audit down');
+      expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
+      expect(
+        realtime.invalidateUserProfileSummaryCache,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('keeps a committed status response successful when post-commit hooks fail', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+      sessionRevocation.revokeUser.mockRejectedValue(new Error('redis down'));
+      realtime.invalidateUserProfileSummaryCache.mockRejectedValue(
+        new Error('cache down'),
+      );
+
+      await expect(
+        service.updateStatus(actor, 'user-1', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        }),
+      ).resolves.toEqual({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.BANNED,
+      });
+    });
+
+    it('returns not found before attempting a status write', async () => {
+      tx.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.updateStatus(actor, 'missing', {
+          status: UserStatus.BANNED,
+          reason: 'policy violation',
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: AdminUserErrorCode.NotFound },
+      });
+      expect(tx.user.updateMany).not.toHaveBeenCalled();
     });
   });
 });

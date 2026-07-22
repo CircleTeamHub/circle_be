@@ -1,13 +1,17 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import type { AuthenticatedUser } from 'src/auth/types';
+import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { AdminUserErrorCode } from 'src/common/app-error-codes';
-import { Prisma } from 'src/generated/prisma';
+import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { RealtimeService } from 'src/realtime/realtime.service';
 import { AdminAuditService } from './admin-audit.service';
 import {
   AdminAuditAction,
@@ -17,6 +21,7 @@ import {
 import { maskSensitiveField } from './admin-user.masking';
 import {
   ListAdminUsersQueryDto,
+  AdminUpdateUserStatusDto,
   RevealSensitiveFieldDto,
 } from './dto/admin-user.dto';
 
@@ -59,9 +64,13 @@ const ADMIN_USER_DETAIL_SELECT = {
 
 @Injectable()
 export class AdminUserService {
+  private readonly logger = new Logger(AdminUserService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly audit: AdminAuditService,
+    private readonly sessionRevocation: SessionRevocationService,
+    private readonly realtime: RealtimeService,
   ) {}
 
   async listUsers(query: ListAdminUsersQueryDto) {
@@ -279,6 +288,132 @@ export class AdminUserService {
     }
 
     return this.audit.listForTarget('user', targetId, limit);
+  }
+
+  async updateStatus(
+    actor: Pick<AuthenticatedUser, 'userId' | 'accountId'>,
+    targetId: string,
+    dto: AdminUpdateUserStatusDto,
+  ) {
+    const reason = dto.reason?.trim();
+    if (!reason || reason.length < 3 || reason.length > 500) {
+      throw new BadRequestException('操作原因必须为 3 到 500 个字符');
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const current = await tx.user.findUnique({
+        where: { id: targetId },
+        select: { id: true, accountId: true, status: true },
+      });
+      if (!current) {
+        throw this.userNotFound();
+      }
+
+      if (
+        actor.userId === targetId &&
+        (dto.status === UserStatus.BANNED ||
+          dto.status === UserStatus.DELETED)
+      ) {
+        throw new BadRequestException({
+          message: '不能封禁或删除当前管理员账号',
+          errorCode: AdminUserErrorCode.SelfStatusChange,
+        });
+      }
+
+      const allowed =
+        (current.status === UserStatus.ACTIVE &&
+          (dto.status === UserStatus.BANNED ||
+            dto.status === UserStatus.DELETED)) ||
+        (current.status === UserStatus.BANNED &&
+          (dto.status === UserStatus.ACTIVE ||
+            dto.status === UserStatus.DELETED));
+      if (!allowed) {
+        throw new ConflictException({
+          message: '不允许执行该账号状态变更',
+          errorCode: AdminUserErrorCode.InvalidStatusTransition,
+        });
+      }
+
+      if (
+        dto.status === UserStatus.DELETED &&
+        dto.confirmationAccountId !== current.accountId
+      ) {
+        throw new BadRequestException({
+          message: '删除确认账号 ID 不匹配',
+          errorCode: AdminUserErrorCode.ConfirmationMismatch,
+        });
+      }
+
+      const changed = await tx.user.updateMany({
+        where: { id: targetId, status: current.status },
+        data: { status: dto.status },
+      });
+      if (changed.count !== 1) {
+        throw new ConflictException({
+          message: '账号状态已被其他操作修改，请刷新后重试',
+          errorCode: AdminUserErrorCode.StatusConflict,
+        });
+      }
+
+      if (dto.status !== UserStatus.ACTIVE) {
+        await tx.refreshToken.updateMany({
+          where: { userId: targetId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
+
+      const action =
+        dto.status === UserStatus.BANNED
+          ? AdminAuditAction.UserBanned
+          : dto.status === UserStatus.DELETED
+            ? AdminAuditAction.UserDeleted
+            : AdminAuditAction.UserUnbanned;
+      await this.audit.recordInTransaction(tx, {
+        actorId: actor.userId,
+        actorAccountId: actor.accountId,
+        action,
+        targetType: 'user',
+        targetId,
+        before: { status: current.status },
+        after: { status: dto.status },
+        reason,
+      });
+
+      return {
+        id: current.id,
+        accountId: current.accountId,
+        status: dto.status,
+      };
+    });
+
+    if (dto.status !== UserStatus.ACTIVE) {
+      await this.runPostCommitHook('revoke user sessions', () =>
+        this.sessionRevocation.revokeUser(targetId),
+      );
+    }
+    await this.runPostCommitHook('invalidate profile summary cache', () =>
+      this.realtime.invalidateUserProfileSummaryCache(targetId),
+    );
+    await this.runPostCommitHook('broadcast profile summary', () =>
+      this.realtime.broadcastUserProfileSummary(targetId),
+    );
+
+    return result;
+  }
+
+  private async runPostCommitHook(
+    name: string,
+    hook: () => Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await hook();
+    } catch (error) {
+      this.logger.warn(
+        `Admin user status committed but failed to ${name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   private userNotFound() {
