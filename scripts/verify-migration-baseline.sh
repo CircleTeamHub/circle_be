@@ -21,7 +21,7 @@ set -euo pipefail
 echo "==> 1/7 Simulate the existing baseline schema without migration history"
 npx prisma db execute --file prisma/migrations/0_init/migration.sql
 
-echo "==> 2/7 Seed a malformed legacy index and opposite open jobs"
+echo "==> 2/7 Seed malformed legacy index and chronological desired-state cases"
 npx prisma db execute --stdin <<'SQL'
 INSERT INTO "GroupSyncOutbox"
   ("id", "operation", "status", "groupID", "userID", "lockedAt", "createdAt", "updatedAt")
@@ -33,7 +33,31 @@ VALUES
     CURRENT_TIMESTAMP - INTERVAL '2 minutes'
   ),
   (
-    'migration-remove', 'REMOVE_MEMBER', 'PENDING', 'migration-group', 'migration-user',
+    'migration-remove', 'REMOVE_MEMBER', 'COMPLETED', 'migration-group', 'migration-user',
+    NULL,
+    CURRENT_TIMESTAMP - INTERVAL '1 minute',
+    CURRENT_TIMESTAMP - INTERVAL '1 minute'
+  ),
+  (
+    'inverse-remove', 'REMOVE_MEMBER', 'PROCESSING', 'inverse-group', 'inverse-user',
+    CURRENT_TIMESTAMP - INTERVAL '10 minutes',
+    CURRENT_TIMESTAMP - INTERVAL '2 minutes',
+    CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+  ),
+  (
+    'inverse-add', 'ADD_MEMBER', 'COMPLETED', 'inverse-group', 'inverse-user',
+    NULL,
+    CURRENT_TIMESTAMP - INTERVAL '1 minute',
+    CURRENT_TIMESTAMP - INTERVAL '1 minute'
+  ),
+  (
+    'tie-a-processing', 'ADD_MEMBER', 'PROCESSING', 'tie-group', 'tie-user',
+    CURRENT_TIMESTAMP - INTERVAL '10 minutes',
+    CURRENT_TIMESTAMP - INTERVAL '1 minute',
+    CURRENT_TIMESTAMP - INTERVAL '1 minute'
+  ),
+  (
+    'tie-z-desired', 'REMOVE_MEMBER', 'COMPLETED', 'tie-group', 'tie-user',
     NULL,
     CURRENT_TIMESTAMP - INTERVAL '1 minute',
     CURRENT_TIMESTAMP - INTERVAL '1 minute'
@@ -67,7 +91,11 @@ BEGIN
   INTO unchanged_rows
   FROM "GroupSyncOutbox"
   WHERE ("id" = 'migration-add' AND "status" = 'PROCESSING')
-     OR ("id" = 'migration-remove' AND "status" = 'PENDING');
+     OR ("id" = 'migration-remove' AND "status" = 'COMPLETED')
+     OR ("id" = 'inverse-remove' AND "status" = 'PROCESSING')
+     OR ("id" = 'inverse-add' AND "status" = 'COMPLETED')
+     OR ("id" = 'tie-a-processing' AND "status" = 'PROCESSING')
+     OR ("id" = 'tie-z-desired' AND "status" = 'COMPLETED');
 
   SELECT COUNT(*)
   INTO probe_count
@@ -87,7 +115,7 @@ BEGIN
     AND table_name = 'GroupSyncOutbox'
     AND column_name IN ('generation', 'processingGeneration', 'processingOperation');
 
-  IF unchanged_rows <> 2
+  IF unchanged_rows <> 6
      OR probe_count <> 0
      OR state_column_count <> 0
      OR malformed_definition NOT LIKE '%("groupID", "userID")%'
@@ -155,7 +183,36 @@ BEGIN
       AND "processingOperation" = 'ADD_MEMBER'
       AND "status" = 'PENDING'
   ) THEN
-    RAISE EXCEPTION 'Migration did not preserve desired and processing state';
+    RAISE EXCEPTION 'Migration did not preserve newer REMOVE over older processing ADD';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM "GroupSyncOutbox"
+    WHERE "groupID" = 'inverse-group'
+      AND "userID" = 'inverse-user'
+      AND "operation" = 'ADD_MEMBER'
+      AND "generation" = 2
+      AND "processingGeneration" = 1
+      AND "processingOperation" = 'REMOVE_MEMBER'
+      AND "status" = 'PENDING'
+  ) THEN
+    RAISE EXCEPTION 'Migration did not preserve newer ADD over older processing REMOVE';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM "GroupSyncOutbox"
+    WHERE "id" = 'tie-z-desired'
+      AND "groupID" = 'tie-group'
+      AND "userID" = 'tie-user'
+      AND "operation" = 'REMOVE_MEMBER'
+      AND "generation" = 2
+      AND "processingGeneration" = 1
+      AND "processingOperation" = 'ADD_MEMBER'
+      AND "status" = 'PENDING'
+  ) THEN
+    RAISE EXCEPTION 'Migration did not use descending id for equal timestamps';
   END IF;
 END
 $$;

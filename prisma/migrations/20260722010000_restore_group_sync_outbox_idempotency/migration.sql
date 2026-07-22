@@ -6,19 +6,15 @@ ALTER TABLE "GroupSyncOutbox"
   ADD COLUMN "processingOperation" "GroupSyncOperation";
 
 -- Collapse historical jobs into one durable desired-state row per group member.
--- An open retry wins over terminal history. If an older PROCESSING row exists,
--- retain it separately so lease recovery replays that uncertain external effect
--- before advancing to the latest desired operation.
+-- Desired intent is always the chronologically newest row, regardless of status.
+-- Independently retain the newest PROCESSING attempt so lease recovery replays
+-- that uncertain external effect before advancing to the latest desired operation.
 WITH ranked_desired AS (
   SELECT
     job.*,
     ROW_NUMBER() OVER (
       PARTITION BY job."groupID", job."userID"
       ORDER BY
-        CASE
-          WHEN job."status" IN ('PENDING', 'PROCESSING', 'FAILED') THEN 0
-          ELSE 1
-        END,
         job."createdAt" DESC,
         job."id" DESC
     ) AS desired_rank
@@ -77,10 +73,6 @@ WITH ranked AS (
     ROW_NUMBER() OVER (
       PARTITION BY "groupID", "userID"
       ORDER BY
-        CASE
-          WHEN "status" IN ('PENDING', 'PROCESSING', 'FAILED') THEN 0
-          ELSE 1
-        END,
         "createdAt" DESC,
         "id" DESC
     ) AS desired_rank

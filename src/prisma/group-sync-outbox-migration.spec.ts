@@ -20,10 +20,24 @@ describe('group sync desired-state migration', () => {
     );
   });
 
-  it('deduplicates open jobs by group and user, keeping the latest intent', () => {
+  it('chooses desired intent strictly by createdAt and id across all statuses', () => {
+    const desiredRanking =
+      /WITH ranked_desired AS \(([\s\S]*?)\),\ndesired AS/.exec(sql)?.[1];
+    const deletionRanking =
+      /WITH ranked AS \(([\s\S]*?)\)\nDELETE FROM "GroupSyncOutbox"/.exec(
+        sql,
+      )?.[1];
+
+    expect(desiredRanking).toMatch(
+      /ORDER BY\s+job\."createdAt" DESC,\s+job\."id" DESC/,
+    );
+    expect(deletionRanking).toMatch(/ORDER BY\s+"createdAt" DESC,\s+"id" DESC/);
+    expect(desiredRanking).not.toContain('"status" IN');
+    expect(deletionRanking).not.toContain('"status" IN');
     expect(sql).toContain('PARTITION BY "groupID", "userID"');
-    expect(sql).toContain('job."createdAt" DESC');
-    expect(sql).toContain('retain it separately so lease recovery replays');
+    expect(sql).toContain(
+      'Independently retain the newest PROCESSING attempt so lease recovery replays',
+    );
   });
 
   it('accepts only the exact desired or archived legacy index definition', () => {
