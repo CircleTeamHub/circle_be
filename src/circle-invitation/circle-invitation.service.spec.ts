@@ -584,6 +584,7 @@ describe('CircleInvitationService', () => {
       ],
       skipDuplicates: true,
     });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
   it('uses the admission policy for admin-approved activation', async () => {
@@ -626,6 +627,7 @@ describe('CircleInvitationService', () => {
       ],
       skipDuplicates: true,
     });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
   it('uses the admission policy when reconciling a threshold-approved invitation', async () => {
@@ -662,6 +664,7 @@ describe('CircleInvitationService', () => {
       ],
       skipDuplicates: true,
     });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
   it('does not reactivate an applicant from a cancelled invitation', async () => {

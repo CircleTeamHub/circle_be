@@ -2,7 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
-import { GroupSyncOperation, Prisma } from 'src/generated/prisma';
+import {
+  GroupSyncOperation,
+  GroupSyncStatus,
+  Prisma,
+} from 'src/generated/prisma';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
@@ -11,13 +15,27 @@ const GROUP_SYNC_BATCH_SIZE = 20;
 const GROUP_SYNC_STALE_LOCK_MS = 5 * 60 * 1000;
 const GROUP_SYNC_MAX_BACKOFF_MS = 30 * 60 * 1000;
 
-type GroupSyncJob = {
+type GroupSyncRow = {
   id: string;
   operation: GroupSyncOperation;
-  status: 'PENDING' | 'PROCESSING' | 'FAILED';
+  generation: number;
+  processingGeneration: number | null;
+  processingOperation: GroupSyncOperation | null;
+  status: GroupSyncStatus;
   groupID: string;
   userID: string;
   attempts: number;
+  lockedAt: Date | null;
+};
+
+type ClaimedAttempt = {
+  rowID: string;
+  groupID: string;
+  userID: string;
+  generation: number;
+  operation: GroupSyncOperation;
+  attempts: number;
+  leaseLockedAt: Date;
 };
 
 type CircleLookup = { id: string } | null;
@@ -40,128 +58,224 @@ export class GroupSyncOutboxProcessor {
   async processPending(): Promise<void> {
     const now = new Date();
     const staleLockBefore = new Date(Date.now() - GROUP_SYNC_STALE_LOCK_MS);
-    const jobs = await this.prisma.groupSyncOutbox.findMany({
+    const rows = await this.prisma.groupSyncOutbox.findMany({
       where: {
         OR: [
-          { status: 'PENDING', nextAttemptAt: { lte: now } },
-          { status: 'FAILED', nextAttemptAt: { lte: now } },
-          { status: 'PROCESSING', lockedAt: { lt: staleLockBefore } },
+          {
+            processingGeneration: null,
+            status: 'PENDING',
+            nextAttemptAt: { lte: now },
+          },
+          {
+            processingGeneration: null,
+            status: 'FAILED',
+            nextAttemptAt: { lte: now },
+          },
+          {
+            processingGeneration: { not: null },
+            processingOperation: { not: null },
+            lockedAt: { lt: staleLockBefore },
+          },
         ],
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: { updatedAt: 'asc' },
       take: GROUP_SYNC_BATCH_SIZE,
     });
 
-    for (const job of jobs as GroupSyncJob[]) {
-      await this.processJob(job);
+    for (const row of rows as GroupSyncRow[]) {
+      await this.processRow(row);
     }
   }
 
-  private async processJob(job: GroupSyncJob): Promise<void> {
-    const claimed = await this.claimCurrentGeneration(job);
-    if (!claimed) return;
+  private async processRow(row: GroupSyncRow): Promise<void> {
+    const attempt = await this.claim(row);
+    if (!attempt) return;
 
-    // No transaction or advisory lock is held across this network boundary.
-    const result = await this.applyExternalEffect(job);
-    await this.finalizeOrReconcile(job, result);
+    // Token acquisition and OpenIM calls happen after the claim transaction
+    // commits, so no advisory lock or database connection is held here.
+    const result = await this.applyExternalEffect(attempt);
+    await this.finalize(attempt, result);
   }
 
-  private async claimCurrentGeneration(job: GroupSyncJob): Promise<boolean> {
-    const circle = await this.findCircle(job.groupID);
+  private async claim(row: GroupSyncRow): Promise<ClaimedAttempt | null> {
+    const circle = await this.findCircle(row.groupID);
     return runSerializableTransaction(this.prisma, async (tx) => {
-      await this.lockIfMapped(tx, circle, job);
+      await this.lockIfMapped(tx, circle, row.userID);
+      const leaseLockedAt = new Date();
+
+      if (
+        row.processingGeneration !== null &&
+        row.processingOperation !== null &&
+        row.lockedAt !== null
+      ) {
+        const reclaimed = await tx.groupSyncOutbox.updateMany({
+          where: {
+            id: row.id,
+            generation: row.generation,
+            operation: row.operation,
+            status: row.status,
+            processingGeneration: row.processingGeneration,
+            processingOperation: row.processingOperation,
+            lockedAt: row.lockedAt,
+          },
+          data: { lockedAt: leaseLockedAt },
+        });
+        if (reclaimed.count === 0) return null;
+        return {
+          rowID: row.id,
+          groupID: row.groupID,
+          userID: row.userID,
+          generation: row.processingGeneration,
+          operation: row.processingOperation,
+          attempts: row.attempts,
+          leaseLockedAt,
+        };
+      }
+
+      if (
+        row.processingGeneration !== null ||
+        row.processingOperation !== null ||
+        row.lockedAt !== null
+      ) {
+        return null;
+      }
+
+      const desiredOperation = await this.readDesiredOperation(tx, circle, row);
+      if (desiredOperation !== row.operation) {
+        await enqueueCircleMemberSync(tx, desiredOperation, row.groupID, [
+          row.userID,
+        ]);
+        return null;
+      }
+
       const claimed = await tx.groupSyncOutbox.updateMany({
         where: {
-          id: job.id,
-          operation: job.operation,
-          status: job.status,
+          id: row.id,
+          generation: row.generation,
+          operation: row.operation,
+          status: row.status,
+          processingGeneration: null,
+          processingOperation: null,
+          lockedAt: null,
         },
         data: {
+          processingGeneration: row.generation,
+          processingOperation: row.operation,
+          lockedAt: leaseLockedAt,
           status: 'PROCESSING',
-          lockedAt: new Date(),
         },
       });
-      if (claimed.count === 0) return false;
-
-      const desiredOperation = await this.readDesiredOperation(tx, circle, job);
-      if (desiredOperation !== job.operation) {
-        await enqueueCircleMemberSync(tx, desiredOperation, job.groupID, [
-          job.userID,
-        ]);
-        return false;
-      }
-      return true;
+      if (claimed.count === 0) return null;
+      return {
+        rowID: row.id,
+        groupID: row.groupID,
+        userID: row.userID,
+        generation: row.generation,
+        operation: row.operation,
+        attempts: row.attempts,
+        leaseLockedAt,
+      };
     });
   }
 
-  private async finalizeOrReconcile(
-    job: GroupSyncJob,
+  private async finalize(
+    attempt: ClaimedAttempt,
     result: ExternalResult,
   ): Promise<void> {
-    const circle = await this.findCircle(job.groupID);
+    const circle = await this.findCircle(attempt.groupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
-      await this.lockIfMapped(tx, circle, job);
-      const currentGeneration = await tx.groupSyncOutbox.findUnique({
-        where: { id: job.id },
-        select: { status: true },
+      await this.lockIfMapped(tx, circle, attempt.userID);
+      const current = await tx.groupSyncOutbox.findUnique({
+        where: { id: attempt.rowID },
+        select: {
+          generation: true,
+          operation: true,
+          processingGeneration: true,
+          processingOperation: true,
+          lockedAt: true,
+        },
       });
-      const desiredOperation = await this.readDesiredOperation(tx, circle, job);
-      const isCurrentGeneration = currentGeneration?.status === 'PROCESSING';
+      if (!current) return;
 
-      if (!isCurrentGeneration || desiredOperation !== job.operation) {
-        await enqueueCircleMemberSync(tx, desiredOperation, job.groupID, [
-          job.userID,
-        ]);
-        return;
-      }
+      const desiredChanged =
+        current.generation !== attempt.generation ||
+        current.operation !== attempt.operation;
+      const where = {
+        id: attempt.rowID,
+        generation: current.generation,
+        operation: current.operation,
+        processingGeneration: attempt.generation,
+        processingOperation: attempt.operation,
+        lockedAt: attempt.leaseLockedAt,
+      } as const;
 
       if (result.outcome === 'SUCCEEDED') {
-        await tx.groupSyncOutbox.update({
-          where: { id: job.id },
+        const finalized = await tx.groupSyncOutbox.updateMany({
+          where,
           data: {
-            status: 'COMPLETED',
-            processedAt: new Date(),
-            lastError: null,
+            processingGeneration: null,
+            processingOperation: null,
             lockedAt: null,
+            status: desiredChanged ? 'PENDING' : 'COMPLETED',
+            nextAttemptAt: desiredChanged ? new Date() : undefined,
+            processedAt: desiredChanged ? null : new Date(),
+            lastError: null,
           },
         });
-        if (result.idempotentMessage) {
+        if (finalized.count > 0 && result.idempotentMessage) {
           this.logger.warn(
-            `OpenIM group sync outbox ${job.id} treated as completed: ${result.idempotentMessage}`,
+            `OpenIM group sync outbox ${attempt.rowID} treated as completed: ${result.idempotentMessage}`,
           );
         }
         return;
       }
 
-      await tx.groupSyncOutbox.update({
-        where: { id: job.id },
-        data: {
-          status: 'FAILED',
-          attempts: { increment: 1 },
-          lastError: result.message.slice(0, 1000),
-          nextAttemptAt: this.nextRetryAt(job.attempts + 1),
-          lockedAt: null,
-        },
+      const finalized = await tx.groupSyncOutbox.updateMany({
+        where,
+        data: desiredChanged
+          ? {
+              processingGeneration: null,
+              processingOperation: null,
+              lockedAt: null,
+              status: 'PENDING',
+              nextAttemptAt: new Date(),
+            }
+          : {
+              processingGeneration: null,
+              processingOperation: null,
+              lockedAt: null,
+              status: 'FAILED',
+              attempts: { increment: 1 },
+              lastError: result.message.slice(0, 1000),
+              nextAttemptAt: this.nextRetryAt(attempt.attempts + 1),
+            },
       });
-      this.logger.warn(
-        `OpenIM group sync failed for outbox ${job.id}: ${result.message}`,
-      );
+      if (finalized.count > 0 && !desiredChanged) {
+        this.logger.warn(
+          `OpenIM group sync failed for outbox ${attempt.rowID}: ${result.message}`,
+        );
+      }
     });
   }
 
   private async applyExternalEffect(
-    job: GroupSyncJob,
+    attempt: ClaimedAttempt,
   ): Promise<ExternalResult> {
     try {
-      if (job.operation === 'ADD_MEMBER') {
-        await this.openimService.addGroupMembers(job.groupID, [job.userID]);
+      if (attempt.operation === 'ADD_MEMBER') {
+        await this.openimService.addGroupMembers(attempt.groupID, [
+          attempt.userID,
+        ]);
       } else {
-        await this.openimService.removeGroupMember(job.groupID, job.userID);
+        await this.openimService.removeGroupMember(
+          attempt.groupID,
+          attempt.userID,
+        );
       }
       return { outcome: 'SUCCEEDED' };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (this.isIdempotentOpenimResult(job.operation, message)) {
+      if (this.isIdempotentOpenimResult(attempt.operation, message)) {
         return { outcome: 'SUCCEEDED', idempotentMessage: message };
       }
       return { outcome: 'FAILED', message };
@@ -171,7 +285,7 @@ export class GroupSyncOutboxProcessor {
   private async readDesiredOperation(
     tx: Prisma.TransactionClient,
     circle: CircleLookup,
-    job: GroupSyncJob,
+    row: Pick<GroupSyncRow, 'groupID' | 'userID'>,
   ): Promise<GroupSyncOperation> {
     if (!circle) return 'REMOVE_MEMBER';
 
@@ -182,7 +296,7 @@ export class GroupSyncOutboxProcessor {
     const membership = await tx.circleMember.findUnique({
       where: {
         userID_circleID: {
-          userID: job.userID,
+          userID: row.userID,
           circleID: circle.id,
         },
       },
@@ -190,7 +304,7 @@ export class GroupSyncOutboxProcessor {
     });
     const mappingMatches =
       currentCircle !== null &&
-      (currentCircle.groupID ?? circle.id) === job.groupID;
+      (currentCircle.groupID ?? circle.id) === row.groupID;
     return mappingMatches && membership?.status === 'ACTIVE'
       ? 'ADD_MEMBER'
       : 'REMOVE_MEMBER';
@@ -199,10 +313,10 @@ export class GroupSyncOutboxProcessor {
   private async lockIfMapped(
     tx: Prisma.TransactionClient,
     circle: CircleLookup,
-    job: GroupSyncJob,
+    userID: string,
   ): Promise<void> {
     if (circle) {
-      await this.memberLock.lock(tx, circle.id, [job.userID]);
+      await this.memberLock.lock(tx, circle.id, [userID]);
     }
   }
 

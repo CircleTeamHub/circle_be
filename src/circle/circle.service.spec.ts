@@ -361,13 +361,15 @@ describe('CircleService', () => {
       where: {
         groupID: 'group-1',
         userID: { in: ['user-1'] },
-        status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
       },
       data: {
-        status: 'COMPLETED',
-        processedAt: expect.any(Date),
-        lockedAt: null,
-        lastError: 'Superseded by desired REMOVE_MEMBER state',
+        operation: 'REMOVE_MEMBER',
+        generation: { increment: 1 },
+        status: 'PENDING',
+        attempts: 0,
+        lastError: null,
+        nextAttemptAt: expect.any(Date),
+        processedAt: null,
       },
     });
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
@@ -380,6 +382,7 @@ describe('CircleService', () => {
       ],
       skipDuplicates: true,
     });
+    expect(openimService.removeGroupMember).not.toHaveBeenCalled();
   });
 
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {

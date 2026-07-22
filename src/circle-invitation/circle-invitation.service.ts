@@ -16,7 +16,6 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
-import { OpenimService } from 'src/openim/openim.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -74,7 +73,6 @@ export class CircleInvitationService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openimService: OpenimService,
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly notificationService: NotificationService,
@@ -437,11 +435,6 @@ export class CircleInvitationService {
       };
     });
 
-    await this.syncApplicantToGroup(
-      result.admission?.groupID ?? null,
-      result.admission?.applicantId,
-    );
-
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
       select: { applicantID: true, circleID: true },
@@ -570,11 +563,6 @@ export class CircleInvitationService {
       };
     });
 
-    await this.syncApplicantToGroup(
-      result.admission?.groupID ?? null,
-      result.admission?.applicantId,
-    );
-
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
       select: { applicantID: true },
@@ -670,10 +658,6 @@ export class CircleInvitationService {
         });
         if (!result) continue;
         finalizedCount += 1;
-        await this.syncApplicantToGroup(
-          result.admitted ? result.groupID : null,
-          result.admitted ? result.applicantId : undefined,
-        );
         await this.createAndBroadcastInvitationNotification(
           result.notificationData,
         );
@@ -898,23 +882,6 @@ export class CircleInvitationService {
       message: 'You are not allowed to view this invitation',
       errorCode: CircleInvitationErrorCode.ViewForbidden,
     });
-  }
-
-  private async syncApplicantToGroup(
-    groupID: string | null | undefined,
-    applicantId: string | undefined,
-  ): Promise<void> {
-    if (!groupID || !applicantId) {
-      return;
-    }
-
-    try {
-      await this.openimService.addGroupMembers(groupID, [applicantId]);
-    } catch (error) {
-      this.logger.warn(
-        `Failed to add user ${applicantId} to OpenIM group ${groupID}: ${error}`,
-      );
-    }
   }
 
   private async createAndBroadcastInvitationNotification(

@@ -582,7 +582,7 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       removeSpy.mock.calls.filter(
         ([groupID, userID]) => groupID === circle.id && userID === candidate.id,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     await expect(
       prisma.circleMember.findUnique({
         where: {
@@ -654,7 +654,171 @@ describePostgres('Circle membership transition concurrency e2e', () => {
         ([groupID, userIDs]) =>
           groupID === circle.id && userIDs.includes(candidate.id),
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
+    await expect(
+      prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: candidate.id, circleID: circle.id },
+        },
+        select: { status: true },
+      }),
+    ).resolves.toEqual({ status: CircleMemberStatus.ACTIVE });
+  });
+
+  it('replays crashed ADD success before advancing to desired REMOVE', async () => {
+    await prisma.groupSyncOutbox.deleteMany({});
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+
+    let openimHasMember = false;
+    const addSpy = jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockImplementation(async () => {
+        openimHasMember = true;
+      });
+    const removeSpy = jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockImplementation(async () => {
+        openimHasMember = false;
+      });
+    const originalTransaction = prisma.$transaction.bind(prisma);
+    let transactionCalls = 0;
+    const transactionSpy = jest
+      .spyOn(prisma as any, '$transaction')
+      .mockImplementation((...args: any[]) => {
+        transactionCalls += 1;
+        if (transactionCalls === 2) {
+          return Promise.reject(new Error('simulated process death'));
+        }
+        return originalTransaction(...(args as [any, any]));
+      });
+
+    await expect(outboxProcessor.processPending()).rejects.toThrow(
+      'simulated process death',
+    );
+    transactionSpy.mockRestore();
+    expect(openimHasMember).toBe(true);
+
+    await groupService.removeGroupMember(admin!.id, circle.id, candidate.id);
+    const state = await prisma.groupSyncOutbox.findUniqueOrThrow({
+      where: {
+        groupID_userID: { groupID: circle.id, userID: candidate.id },
+      },
+    });
+    expect(state).toMatchObject({
+      operation: 'REMOVE_MEMBER',
+      generation: 2,
+      processingGeneration: 1,
+      processingOperation: 'ADD_MEMBER',
+      status: 'PENDING',
+    });
+    await prisma.groupSyncOutbox.update({
+      where: { id: state.id },
+      data: { lockedAt: new Date(Date.now() - 10 * 60 * 1000) },
+    });
+
+    await outboxProcessor.processPending();
+    expect(addSpy).toHaveBeenCalledTimes(2);
+    expect(openimHasMember).toBe(true);
+    await outboxProcessor.processPending();
+
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(openimHasMember).toBe(false);
+    await expect(
+      prisma.groupSyncOutbox.findUniqueOrThrow({
+        where: {
+          groupID_userID: { groupID: circle.id, userID: candidate.id },
+        },
+        select: {
+          operation: true,
+          generation: true,
+          processingGeneration: true,
+          status: true,
+        },
+      }),
+    ).resolves.toEqual({
+      operation: 'REMOVE_MEMBER',
+      generation: 2,
+      processingGeneration: null,
+      status: 'COMPLETED',
+    });
+  });
+
+  it('replays crashed REMOVE success before advancing to desired ADD', async () => {
+    await prisma.groupSyncOutbox.deleteMany({});
+    const { admin, candidate, circle } = await createCircleWithPendingMember({
+      admin: true,
+    });
+    await prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    await groupService.removeGroupMember(admin!.id, circle.id, candidate.id);
+
+    let openimHasMember = true;
+    const removeSpy = jest
+      .spyOn(openimService, 'removeGroupMember')
+      .mockImplementation(async () => {
+        openimHasMember = false;
+      });
+    const addSpy = jest
+      .spyOn(openimService, 'addGroupMembers')
+      .mockImplementation(async () => {
+        openimHasMember = true;
+      });
+    const originalTransaction = prisma.$transaction.bind(prisma);
+    let transactionCalls = 0;
+    const transactionSpy = jest
+      .spyOn(prisma as any, '$transaction')
+      .mockImplementation((...args: any[]) => {
+        transactionCalls += 1;
+        if (transactionCalls === 2) {
+          return Promise.reject(new Error('simulated process death'));
+        }
+        return originalTransaction(...(args as [any, any]));
+      });
+
+    await expect(outboxProcessor.processPending()).rejects.toThrow(
+      'simulated process death',
+    );
+    transactionSpy.mockRestore();
+    expect(openimHasMember).toBe(false);
+
+    await groupService.inviteGroupMembers(admin!.id, circle.id, {
+      userIDs: [candidate.id],
+    });
+    const state = await prisma.groupSyncOutbox.findUniqueOrThrow({
+      where: {
+        groupID_userID: { groupID: circle.id, userID: candidate.id },
+      },
+    });
+    expect(state).toMatchObject({
+      operation: 'ADD_MEMBER',
+      generation: 2,
+      processingGeneration: 1,
+      processingOperation: 'REMOVE_MEMBER',
+      status: 'PENDING',
+    });
+    await prisma.groupSyncOutbox.update({
+      where: { id: state.id },
+      data: { lockedAt: new Date(Date.now() - 10 * 60 * 1000) },
+    });
+
+    await outboxProcessor.processPending();
+    expect(removeSpy).toHaveBeenCalledTimes(2);
+    expect(openimHasMember).toBe(false);
+    await outboxProcessor.processPending();
+
+    expect(addSpy).toHaveBeenCalledTimes(1);
+    expect(openimHasMember).toBe(true);
     await expect(
       prisma.circleMember.findUnique({
         where: {

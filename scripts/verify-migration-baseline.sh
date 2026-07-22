@@ -24,10 +24,20 @@ npx prisma db execute --file prisma/migrations/0_init/migration.sql
 echo "==> 2/7 Seed a malformed legacy index and opposite open jobs"
 npx prisma db execute --stdin <<'SQL'
 INSERT INTO "GroupSyncOutbox"
-  ("id", "operation", "status", "groupID", "userID", "updatedAt")
+  ("id", "operation", "status", "groupID", "userID", "lockedAt", "createdAt", "updatedAt")
 VALUES
-  ('migration-add', 'ADD_MEMBER', 'PENDING', 'migration-group', 'migration-user', CURRENT_TIMESTAMP),
-  ('migration-remove', 'REMOVE_MEMBER', 'FAILED', 'migration-group', 'migration-user', CURRENT_TIMESTAMP);
+  (
+    'migration-add', 'ADD_MEMBER', 'PROCESSING', 'migration-group', 'migration-user',
+    CURRENT_TIMESTAMP - INTERVAL '10 minutes',
+    CURRENT_TIMESTAMP - INTERVAL '2 minutes',
+    CURRENT_TIMESTAMP - INTERVAL '2 minutes'
+  ),
+  (
+    'migration-remove', 'REMOVE_MEMBER', 'PENDING', 'migration-group', 'migration-user',
+    NULL,
+    CURRENT_TIMESTAMP - INTERVAL '1 minute',
+    CURRENT_TIMESTAMP - INTERVAL '1 minute'
+  );
 
 CREATE UNIQUE INDEX "GroupSyncOutbox_open_active_key"
 ON "GroupSyncOutbox"("groupID", "userID")
@@ -50,13 +60,14 @@ DO $$
 DECLARE
   unchanged_rows integer;
   probe_count integer;
+  state_column_count integer;
   malformed_definition text;
 BEGIN
   SELECT COUNT(*)
   INTO unchanged_rows
   FROM "GroupSyncOutbox"
-  WHERE ("id" = 'migration-add' AND "status" = 'PENDING')
-     OR ("id" = 'migration-remove' AND "status" = 'FAILED');
+  WHERE ("id" = 'migration-add' AND "status" = 'PROCESSING')
+     OR ("id" = 'migration-remove' AND "status" = 'PENDING');
 
   SELECT COUNT(*)
   INTO probe_count
@@ -69,14 +80,22 @@ BEGIN
   SELECT pg_catalog.pg_get_indexdef('"GroupSyncOutbox_open_active_key"'::regclass)
   INTO malformed_definition;
 
+  SELECT COUNT(*)
+  INTO state_column_count
+  FROM information_schema.columns
+  WHERE table_schema = current_schema()
+    AND table_name = 'GroupSyncOutbox'
+    AND column_name IN ('generation', 'processingGeneration', 'processingOperation');
+
   IF unchanged_rows <> 2
      OR probe_count <> 0
+     OR state_column_count <> 0
      OR malformed_definition NOT LIKE '%("groupID", "userID")%'
      OR malformed_definition NOT LIKE '%PENDING%'
      OR malformed_definition LIKE '%PROCESSING%' THEN
     RAISE EXCEPTION
-      'Malformed-index rollback failed: rows=%, probes=%, index=%',
-      unchanged_rows, probe_count, malformed_definition;
+      'Malformed-index rollback failed: rows=%, probes=%, columns=%, index=%',
+      unchanged_rows, probe_count, state_column_count, malformed_definition;
   END IF;
 END
 $$;
@@ -116,24 +135,27 @@ BEGIN
   )
   INTO key_columns
   FROM pg_catalog.pg_index AS index_meta
-  WHERE index_meta.indexrelid = '"GroupSyncOutbox_open_active_key"'::regclass
+  WHERE index_meta.indexrelid = '"GroupSyncOutbox_desired_state_key"'::regclass
     AND index_meta.indisunique
     AND index_meta.indisvalid
-    AND pg_catalog.pg_get_expr(index_meta.indpred, index_meta.indrelid)
-      LIKE '%PENDING%PROCESSING%FAILED%';
+    AND index_meta.indpred IS NULL;
 
   IF key_columns IS DISTINCT FROM ARRAY['groupID', 'userID']::text[] THEN
     RAISE EXCEPTION 'Unexpected desired-state index columns: %', key_columns;
   END IF;
 
-  IF (
-    SELECT COUNT(*)
+  IF NOT EXISTS (
+    SELECT 1
     FROM "GroupSyncOutbox"
     WHERE "groupID" = 'migration-group'
       AND "userID" = 'migration-user'
-      AND "status" IN ('PENDING', 'PROCESSING', 'FAILED')
-  ) <> 1 THEN
-    RAISE EXCEPTION 'Migration did not deduplicate legacy desired states';
+      AND "operation" = 'REMOVE_MEMBER'
+      AND "generation" = 2
+      AND "processingGeneration" = 1
+      AND "processingOperation" = 'ADD_MEMBER'
+      AND "status" = 'PENDING'
+  ) THEN
+    RAISE EXCEPTION 'Migration did not preserve desired and processing state';
   END IF;
 END
 $$;

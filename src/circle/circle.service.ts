@@ -364,72 +364,57 @@ export class CircleService {
   }
 
   async leaveCircle(userId: string, circleId: string): Promise<void> {
-    const groupID = await runSerializableTransaction(
-      this.prisma,
-      async (tx) => {
-        await this.memberLock.lock(tx, circleId, [userId]);
-        const lockedMembership = await tx.circleMember.findUnique({
-          where: { userID_circleID: { userID: userId, circleID: circleId } },
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circleId, [userId]);
+      const lockedMembership = await tx.circleMember.findUnique({
+        where: { userID_circleID: { userID: userId, circleID: circleId } },
+      });
+      if (!lockedMembership) {
+        throw new NotFoundException({
+          message: 'Not a member',
+          errorCode: CircleErrorCode.NotMember,
         });
-        if (!lockedMembership) {
-          throw new NotFoundException({
-            message: 'Not a member',
-            errorCode: CircleErrorCode.NotMember,
-          });
-        }
-        if (lockedMembership.role === 'OWNER') {
-          throw new ForbiddenException({
-            message: 'Owner cannot leave — transfer ownership first',
-            errorCode: CircleErrorCode.OwnerCannotLeave,
-          });
-        }
-
-        const wasActive = lockedMembership.status === 'ACTIVE';
-
-        await tx.circleInvitation.updateMany({
-          where: {
-            circleID: circleId,
-            applicantID: userId,
-            status: 'PENDING',
-          },
-          data: { status: 'CANCELLED' },
-        });
-
-        await tx.userDisplayIcon.deleteMany({
-          where: { userID: userId, circleID: circleId },
-        });
-        await tx.circleMember.delete({ where: { id: lockedMembership.id } });
-
-        if (wasActive) {
-          await tx.circle.update({
-            where: { id: circleId },
-            data: { memberCount: { decrement: 1 } },
-          });
-        }
-
-        const circle = await tx.circle.findUnique({
-          where: { id: circleId },
-          select: { groupID: true },
-        });
-        if (circle?.groupID) {
-          await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
-            userId,
-          ]);
-        }
-        return circle?.groupID ?? null;
-      },
-    );
-
-    // Remove from OpenIM group
-    if (groupID) {
-      try {
-        await this.openimService.removeGroupMember(groupID, userId);
-      } catch (error) {
-        this.logger.warn(
-          `Failed to remove user ${userId} from OpenIM group ${groupID}: ${error}`,
-        );
       }
-    }
+      if (lockedMembership.role === 'OWNER') {
+        throw new ForbiddenException({
+          message: 'Owner cannot leave — transfer ownership first',
+          errorCode: CircleErrorCode.OwnerCannotLeave,
+        });
+      }
+
+      const wasActive = lockedMembership.status === 'ACTIVE';
+
+      await tx.circleInvitation.updateMany({
+        where: {
+          circleID: circleId,
+          applicantID: userId,
+          status: 'PENDING',
+        },
+        data: { status: 'CANCELLED' },
+      });
+
+      await tx.userDisplayIcon.deleteMany({
+        where: { userID: userId, circleID: circleId },
+      });
+      await tx.circleMember.delete({ where: { id: lockedMembership.id } });
+
+      if (wasActive) {
+        await tx.circle.update({
+          where: { id: circleId },
+          data: { memberCount: { decrement: 1 } },
+        });
+      }
+
+      const circle = await tx.circle.findUnique({
+        where: { id: circleId },
+        select: { groupID: true },
+      });
+      if (circle?.groupID) {
+        await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
+          userId,
+        ]);
+      }
+    });
   }
 
   async uploadCircleIcon(

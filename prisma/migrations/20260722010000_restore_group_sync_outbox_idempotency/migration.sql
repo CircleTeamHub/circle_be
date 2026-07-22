@@ -1,30 +1,99 @@
 BEGIN;
 
--- Keep only the newest open desired state for each OpenIM group member.
-WITH ranked_open_jobs AS (
+ALTER TABLE "GroupSyncOutbox"
+  ADD COLUMN "generation" INTEGER NOT NULL DEFAULT 1,
+  ADD COLUMN "processingGeneration" INTEGER,
+  ADD COLUMN "processingOperation" "GroupSyncOperation";
+
+-- Collapse historical jobs into one durable desired-state row per group member.
+-- An open retry wins over terminal history. If an older PROCESSING row exists,
+-- retain it separately so lease recovery replays that uncertain external effect
+-- before advancing to the latest desired operation.
+WITH ranked_desired AS (
+  SELECT
+    job.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY job."groupID", job."userID"
+      ORDER BY
+        CASE
+          WHEN job."status" IN ('PENDING', 'PROCESSING', 'FAILED') THEN 0
+          ELSE 1
+        END,
+        job."createdAt" DESC,
+        job."id" DESC
+    ) AS desired_rank
+  FROM "GroupSyncOutbox" AS job
+),
+desired AS (
+  SELECT * FROM ranked_desired WHERE desired_rank = 1
+),
+processing AS (
+  SELECT DISTINCT ON (job."groupID", job."userID")
+    job."id",
+    job."groupID",
+    job."userID",
+    job."operation",
+    job."lockedAt",
+    job."updatedAt"
+  FROM "GroupSyncOutbox" AS job
+  WHERE job."status" = 'PROCESSING'
+  ORDER BY job."groupID", job."userID", job."createdAt" DESC, job."id" DESC
+)
+UPDATE "GroupSyncOutbox" AS retained
+SET
+  "generation" = CASE
+    WHEN processing."id" IS NOT NULL AND processing."id" <> desired."id" THEN 2
+    ELSE 1
+  END,
+  "processingGeneration" = CASE
+    WHEN processing."id" IS NOT NULL THEN 1
+    ELSE NULL
+  END,
+  "processingOperation" = processing."operation",
+  "lockedAt" = CASE
+    WHEN processing."id" IS NOT NULL
+      THEN COALESCE(processing."lockedAt", processing."updatedAt", CURRENT_TIMESTAMP)
+    ELSE NULL
+  END,
+  "status" = CASE
+    WHEN processing."id" = desired."id" THEN 'PROCESSING'::"GroupSyncStatus"
+    WHEN processing."id" IS NOT NULL THEN 'PENDING'::"GroupSyncStatus"
+    ELSE desired."status"
+  END,
+  "processedAt" = CASE
+    WHEN processing."id" IS NOT NULL AND processing."id" <> desired."id" THEN NULL
+    ELSE desired."processedAt"
+  END,
+  "updatedAt" = CURRENT_TIMESTAMP
+FROM desired
+LEFT JOIN processing
+  ON processing."groupID" = desired."groupID"
+ AND processing."userID" = desired."userID"
+WHERE retained."id" = desired."id";
+
+WITH ranked AS (
   SELECT
     "id",
     ROW_NUMBER() OVER (
       PARTITION BY "groupID", "userID"
-      ORDER BY "createdAt" DESC, "id" DESC
+      ORDER BY
+        CASE
+          WHEN "status" IN ('PENDING', 'PROCESSING', 'FAILED') THEN 0
+          ELSE 1
+        END,
+        "createdAt" DESC,
+        "id" DESC
     ) AS desired_rank
   FROM "GroupSyncOutbox"
-  WHERE "status" IN ('PENDING', 'PROCESSING', 'FAILED')
 )
-UPDATE "GroupSyncOutbox" AS job
-SET
-  "status" = 'COMPLETED',
-  "processedAt" = COALESCE(job."processedAt", CURRENT_TIMESTAMP),
-  "lockedAt" = NULL,
-  "lastError" = 'Superseded by newer desired group membership state',
-  "updatedAt" = CURRENT_TIMESTAMP
-FROM ranked_open_jobs AS ranked
-WHERE job."id" = ranked."id"
+DELETE FROM "GroupSyncOutbox" AS discarded
+USING ranked
+WHERE discarded."id" = ranked."id"
   AND ranked.desired_rank > 1;
 
--- Probe indexes give PostgreSQL, rather than string normalization, ownership
--- of the exact access method, operator classes, collations, ordering and
--- predicate representation used for compatibility checks below.
+-- Validate the exact archived and prior desired-state partial indexes before
+-- replacing either with the one-row unique key. Probe indexes let PostgreSQL
+-- define the canonical access method, operator classes and predicate form.
 CREATE UNIQUE INDEX "__GroupSyncOutbox_desired_probe_20260722010000"
 ON "GroupSyncOutbox"("groupID", "userID")
 WHERE "status" IN ('PENDING', 'PROCESSING', 'FAILED');
@@ -145,25 +214,41 @@ BEGIN
     exact_legacy := exact_legacy
       AND key_columns = ARRAY['operation', 'groupID', 'userID']::text[];
 
-    IF exact_legacy THEN
+    IF exact_desired OR exact_legacy THEN
       DROP INDEX "GroupSyncOutbox_open_active_key";
-      existing_oid := NULL;
-    ELSIF NOT exact_desired THEN
+    ELSE
       existing_definition := pg_catalog.pg_get_indexdef(existing_oid);
       RAISE EXCEPTION 'Unexpected definition for index GroupSyncOutbox_open_active_key: %',
         existing_definition;
     END IF;
   END IF;
 
-  IF existing_oid IS NULL THEN
-    CREATE UNIQUE INDEX "GroupSyncOutbox_open_active_key"
-    ON "GroupSyncOutbox"("groupID", "userID")
-    WHERE "status" IN ('PENDING', 'PROCESSING', 'FAILED');
+  IF to_regclass('"GroupSyncOutbox_desired_state_key"') IS NOT NULL THEN
+    RAISE EXCEPTION 'Unexpected pre-existing index GroupSyncOutbox_desired_state_key';
   END IF;
 END
 $$;
 
 DROP INDEX "__GroupSyncOutbox_desired_probe_20260722010000";
 DROP INDEX "__GroupSyncOutbox_legacy_probe_20260722010000";
+
+CREATE UNIQUE INDEX "GroupSyncOutbox_desired_state_key"
+ON "GroupSyncOutbox"("groupID", "userID");
+
+ALTER TABLE "GroupSyncOutbox"
+ADD CONSTRAINT "GroupSyncOutbox_processing_state_check"
+CHECK (
+  (
+    "processingGeneration" IS NULL
+    AND "processingOperation" IS NULL
+    AND "lockedAt" IS NULL
+  )
+  OR
+  (
+    "processingGeneration" IS NOT NULL
+    AND "processingOperation" IS NOT NULL
+    AND "lockedAt" IS NOT NULL
+  )
+);
 
 COMMIT;

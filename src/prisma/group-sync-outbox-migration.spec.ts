@@ -13,7 +13,7 @@ describe('group sync desired-state migration', () => {
     expect(sql.trimStart().startsWith('BEGIN;')).toBe(true);
     expect(sql.trimEnd().endsWith('COMMIT;')).toBe(true);
     expect(sql.indexOf('BEGIN;')).toBeLessThan(
-      sql.indexOf('WITH ranked_open_jobs'),
+      sql.indexOf('WITH ranked_desired'),
     );
     expect(sql.lastIndexOf('COMMIT;')).toBeGreaterThan(
       sql.lastIndexOf('DROP INDEX'),
@@ -22,8 +22,8 @@ describe('group sync desired-state migration', () => {
 
   it('deduplicates open jobs by group and user, keeping the latest intent', () => {
     expect(sql).toContain('PARTITION BY "groupID", "userID"');
-    expect(sql).toContain('ORDER BY "createdAt" DESC, "id" DESC');
-    expect(sql).toContain('Superseded by newer desired group membership state');
+    expect(sql).toContain('job."createdAt" DESC');
+    expect(sql).toContain('retain it separately so lease recovery replays');
   });
 
   it('accepts only the exact desired or archived legacy index definition', () => {
@@ -37,10 +37,13 @@ describe('group sync desired-state migration', () => {
 
   it('creates one open desired-state job per group and user', () => {
     expect(sql).toMatch(
-      /CREATE UNIQUE INDEX "GroupSyncOutbox_open_active_key"\s+ON "GroupSyncOutbox"\("groupID", "userID"\)/,
+      /CREATE UNIQUE INDEX "GroupSyncOutbox_desired_state_key"\s+ON "GroupSyncOutbox"\("groupID", "userID"\)/,
     );
-    expect(sql).not.toMatch(
-      /CREATE UNIQUE INDEX "GroupSyncOutbox_open_active_key"\s+ON "GroupSyncOutbox"\("operation",/,
+    expect(sql).toContain('ADD COLUMN "generation" INTEGER NOT NULL DEFAULT 1');
+    expect(sql).toContain('ADD COLUMN "processingGeneration" INTEGER');
+    expect(sql).toContain(
+      'ADD COLUMN "processingOperation" "GroupSyncOperation"',
     );
+    expect(sql).toContain('GroupSyncOutbox_processing_state_check');
   });
 });

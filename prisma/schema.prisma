@@ -632,19 +632,23 @@ model CreditEvent {
 }
 
 model GroupSyncOutbox {
-  id            String             @id @default(uuid())
-  operation     GroupSyncOperation
-  status        GroupSyncStatus    @default(PENDING)
-  groupID       String
-  userID        String
-  attempts      Int                @default(0)
-  lastError     String?
-  nextAttemptAt DateTime           @default(now())
-  lockedAt      DateTime?
-  processedAt   DateTime?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+  id                   String              @id @default(uuid())
+  operation            GroupSyncOperation
+  generation           Int                 @default(1)
+  processingGeneration Int?
+  processingOperation  GroupSyncOperation?
+  status               GroupSyncStatus     @default(PENDING)
+  groupID              String
+  userID               String
+  attempts             Int                 @default(0)
+  lastError            String?
+  nextAttemptAt        DateTime            @default(now())
+  lockedAt             DateTime?
+  processedAt          DateTime?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
 
+  @@unique([groupID, userID], map: "GroupSyncOutbox_desired_state_key")
   @@index([status, nextAttemptAt])
   @@index([groupID, userID, status])
 }

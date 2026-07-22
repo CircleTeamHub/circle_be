@@ -21,13 +21,15 @@ describe('enqueueCircleMemberSync', () => {
       where: {
         groupID: 'group-1',
         userID: { in: ['user-a', 'user-b'] },
-        status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
       },
       data: {
-        status: 'COMPLETED',
-        processedAt: expect.any(Date),
-        lockedAt: null,
-        lastError: 'Superseded by desired REMOVE_MEMBER state',
+        operation: 'REMOVE_MEMBER',
+        generation: { increment: 1 },
+        status: 'PENDING',
+        attempts: 0,
+        lastError: null,
+        nextAttemptAt: expect.any(Date),
+        processedAt: null,
       },
     });
     expect(
@@ -56,6 +58,13 @@ describe('enqueueCircleMemberSync', () => {
       data: [{ operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'user-1' }],
       skipDuplicates: true,
     });
+    expect(tx.groupSyncOutbox.updateMany.mock.calls[0][0].data).not.toEqual(
+      expect.objectContaining({
+        processingGeneration: expect.anything(),
+        processingOperation: expect.anything(),
+        lockedAt: expect.anything(),
+      }),
+    );
   });
 
   it('does not query the outbox for an empty desired-state batch', async () => {

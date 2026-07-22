@@ -1,7 +1,5 @@
 import { GroupSyncOperation, Prisma } from 'src/generated/prisma';
 
-const OPEN_GROUP_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'FAILED'] as const;
-
 export async function enqueueCircleMemberSync(
   tx: Prisma.TransactionClient,
   operation: GroupSyncOperation,
@@ -18,13 +16,15 @@ export async function enqueueCircleMemberSync(
     where: {
       groupID,
       userID: { in: userIDs },
-      status: { in: [...OPEN_GROUP_SYNC_STATUSES] },
     },
     data: {
-      status: 'COMPLETED',
-      processedAt: new Date(),
-      lockedAt: null,
-      lastError: `Superseded by desired ${operation} state`,
+      operation,
+      generation: { increment: 1 },
+      status: 'PENDING',
+      attempts: 0,
+      lastError: null,
+      nextAttemptAt: new Date(),
+      processedAt: null,
     },
   });
   await tx.groupSyncOutbox.createMany({
