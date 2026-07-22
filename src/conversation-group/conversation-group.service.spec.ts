@@ -9,6 +9,7 @@ describe('ConversationGroupService', () => {
 
   const prisma = {
     conversationGroup: {
+      count: jest.fn().mockResolvedValue(0),
       findMany: jest.fn(),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),

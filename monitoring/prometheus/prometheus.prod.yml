@@ -91,3 +91,14 @@ scrape_configs:
   - job_name: cadvisor
     static_configs:
       - targets: ["cadvisor:8080"]
+
+  # OpenIM exposes its own Prometheus metrics when enabled in its config (#110).
+  # round 2 review：生产 compose 挂载的是本文件（prometheus.yml 会被覆盖），
+  # runbook 第 7 步在生产照做时必须改这里。端口确认方式同 dev 模板：
+  #   grep -rn "prometheusPort" ~/openim-docker/config
+  # - job_name: openim
+  #   static_configs:
+  #     # msggateway（连接数/在线数——容量规划最需要的那组）
+  #     - targets: ["host.docker.internal:20112"]
+  #     # openim-api（消息吞吐）
+  #     - targets: ["host.docker.internal:20113"]

@@ -92,15 +92,13 @@ export class LiveKitCallService {
   async createRoom(input: CreateRoomInput): Promise<void> {
     this.assertConfigured();
 
+    const work = this.roomService!.createRoom({
+      name: input.name,
+      maxParticipants: input.maxParticipants,
+      metadata: input.metadata,
+    });
     try {
-      await withTimeout(
-        this.roomService!.createRoom({
-          name: input.name,
-          maxParticipants: input.maxParticipants,
-          metadata: input.metadata,
-        }),
-        'LiveKit createRoom',
-      );
+      await withTimeout(work, 'LiveKit createRoom');
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       const normalized = reason.toLowerCase();
@@ -111,10 +109,13 @@ export class LiveKitCallService {
         return;
       }
       // review 修复：超时 ≠ 失败 —— 竞输的 createRoom 可能仍在 LiveKit 侧
-      // 成功，留下一间无人认领的孤儿房。挂一个后台补偿删除（best-effort，
-      // 空转 delete 不存在的房间无害）；真错误路径没有房间可删，不补偿。
+      // 成功，留下一间无人认领的孤儿房。round 2：补偿删除**链在原请求落定
+      // 之后** —— 立刻删会赶在慢 create 落地之前空转，随后 create 成功照样
+      // 留孤儿。原请求成功才有房可删；原请求失败无需补偿。
       if (error instanceof LiveKitTimeoutError) {
-        void this.deleteRoom(input.name).catch(() => undefined);
+        void work
+          .then(() => this.deleteRoom(input.name))
+          .catch(() => undefined);
       }
       throw new ServiceUnavailableException('LiveKit room creation failed');
     }

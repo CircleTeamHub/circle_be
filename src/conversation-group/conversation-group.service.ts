@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -16,6 +17,8 @@ import {
 type ConversationGroupWithMemberships = Prisma.ConversationGroupGetPayload<{
   include: { memberships: true };
 }>;
+
+const MAX_GROUPS_PER_USER = 200;
 
 @Injectable()
 export class ConversationGroupService {
@@ -42,7 +45,7 @@ export class ConversationGroupService {
       // v1: 按 createdAt 排；sortOrder 字段为 v2 拖拽预留。
       // 仍然 prefer sortOrder asc 然后 createdAt asc 作 tiebreaker，未来切换无需迁移数据。
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-      take: 200, // #108：防爆护栏，正常用户远够不到（会话分组是个位数量级）
+      take: MAX_GROUPS_PER_USER, // #108：防爆护栏，与创建上限一致（见 create）
     });
     return groups.map((g) => this.toDto(g));
   }
@@ -52,6 +55,17 @@ export class ConversationGroupService {
     dto: CreateConversationGroupDto,
   ): Promise<ConversationGroupDto> {
     const name = dto.name.trim();
+    // round 2 review：创建上限与 list 的 take:200 护栏对齐 —— 否则第 201 个
+    // 分组建得出来却永远列不出来（无法改名/删除/编辑成员）。会话分组正常是
+    // 个位数量级，200 只会被失控客户端打到。
+    const existing = await this.prisma.conversationGroup.count({
+      where: { ownerID },
+    });
+    if (existing >= MAX_GROUPS_PER_USER) {
+      throw new BadRequestException(
+        `会话分组数量已达上限（${MAX_GROUPS_PER_USER}）`,
+      );
+    }
     try {
       const created = await this.prisma.conversationGroup.create({
         data: {

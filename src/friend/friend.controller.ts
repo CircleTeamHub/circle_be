@@ -9,6 +9,7 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -38,6 +39,12 @@ import {
   SetRemarkDto,
 } from './dto/friend.dto';
 import { FriendService } from './friend.service';
+
+/** 查询参数页码：非法/缺省回落默认值，恒 ≥1。 */
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : fallback;
+}
 
 @ApiTags('Friend')
 @ApiBearerAuth()
@@ -153,17 +160,29 @@ export class FriendController {
   }
 
   @Get('requests/incoming')
-  @ApiOperation({ summary: 'Incoming friend requests' })
+  @ApiOperation({ summary: 'Incoming friend requests (500/page)' })
   @ApiOkResponse({ type: [FriendRequestDto] })
-  listIncoming(@Req() req: RequestWithUser): Promise<FriendRequestDto[]> {
-    return this.friendService.listIncomingRequests(req.user.userId);
+  listIncoming(
+    @Req() req: RequestWithUser,
+    @Query('page') page?: string,
+  ): Promise<FriendRequestDto[]> {
+    return this.friendService.listIncomingRequests(
+      req.user.userId,
+      parsePositiveInt(page, 1),
+    );
   }
 
   @Get('requests/outgoing')
-  @ApiOperation({ summary: 'Outgoing friend requests' })
+  @ApiOperation({ summary: 'Outgoing friend requests (500/page)' })
   @ApiOkResponse({ type: [FriendRequestDto] })
-  listOutgoing(@Req() req: RequestWithUser): Promise<FriendRequestDto[]> {
-    return this.friendService.listOutgoingRequests(req.user.userId);
+  listOutgoing(
+    @Req() req: RequestWithUser,
+    @Query('page') page?: string,
+  ): Promise<FriendRequestDto[]> {
+    return this.friendService.listOutgoingRequests(
+      req.user.userId,
+      parsePositiveInt(page, 1),
+    );
   }
 
   @Post('requests/:requestId/accept')

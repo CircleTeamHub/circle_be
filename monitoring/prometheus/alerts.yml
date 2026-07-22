@@ -83,7 +83,9 @@ groups:
       # #102：会话撤销 fail-open 依赖 Redis。Redis 挂掉期间登出/封禁/盗号撤销
       # 全部静默失效（HTTP 与 WS 同步失效），必须有人处理。
       - alert: RedisDown
-        expr: max(circle_redis_up) == 0
+        # round 2 review：min 而不是 max —— 蓝绿切换/单色坏配置时，只要有
+        # 一个仍在服务的实例丢了 Redis（撤销 fail-open），就必须响。
+        expr: min(circle_redis_up) == 0
         for: 2m
         labels:
           severity: critical
