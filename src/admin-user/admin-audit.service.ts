@@ -36,7 +36,10 @@ const PUBLIC_AUDIT_SELECT = {
 export class AdminAuditService {
   constructor(private readonly prisma: PrismaService) {}
 
-  recordInTransaction(tx: Prisma.TransactionClient, input: AuditInput) {
+  recordInTransaction(
+    tx: Pick<Prisma.TransactionClient, 'adminAuditLog'>,
+    input: AuditInput,
+  ) {
     const context = getRequestContext();
 
     return tx.adminAuditLog.create({
