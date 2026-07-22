@@ -139,17 +139,25 @@ export class NotificationPushOutboxProcessor {
           // review 修复：还有 FAILED 但重试次数打光的行时，这个 job 不是
           // 「完成」而是「死信」——标 TERMINAL 让积压对运维可见（Expo 长停
           // 期间静默 COMPLETED 等于把丢推送藏起来）。
-          const exhausted = await this.prisma.notificationPushDelivery.count({
-            where: {
-              outboxID: job.id,
-              status: 'FAILED',
-              attempts: { gte: DELIVERY_MAX_ATTEMPTS },
-            },
-          });
+          // round 3：但只要还有 SENT 行在等回执就不能 TERMINAL —— 回执轮询
+          // 只会把 COMPLETED 的 outbox 拉回 PENDING，TERMINAL 会把这些行的
+          // 可重试回执失败永久冻住。等回执全部落定后的下一轮 sweep 再定性。
+          const [exhausted, awaitingReceipt] = await Promise.all([
+            this.prisma.notificationPushDelivery.count({
+              where: {
+                outboxID: job.id,
+                status: 'FAILED',
+                attempts: { gte: DELIVERY_MAX_ATTEMPTS },
+              },
+            }),
+            this.prisma.notificationPushDelivery.count({
+              where: { outboxID: job.id, status: 'SENT' },
+            }),
+          ]);
           await this.finishJob(
             job.id,
             leaseToken,
-            exhausted > 0 ? 'TERMINAL' : 'COMPLETED',
+            exhausted > 0 && awaitingReceipt === 0 ? 'TERMINAL' : 'COMPLETED',
           );
           processed += 1;
           continue;

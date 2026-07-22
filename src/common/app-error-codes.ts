@@ -178,6 +178,8 @@ export const NoteErrorCode = {
   ExportTotalTooLarge: 'NOTE_EXPORT_TOTAL_TOO_LARGE',
   ExportTooManyMedia: 'NOTE_EXPORT_TOO_MANY_MEDIA',
   NotFound: 'NOTE_NOT_FOUND',
+  // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）
+  AlreadyCollected: 'NOTE_RESTORE_DUPLICATE',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',
   // 分享链接不可用。两处共用：

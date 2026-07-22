@@ -17,7 +17,9 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       updateMany: jest.fn(),
     },
     $queryRaw: jest.fn(),
-    $transaction: jest.fn((cb: any) => cb(prisma)),
+    $transaction: jest.fn((input: any) =>
+      Array.isArray(input) ? Promise.all(input) : input(prisma),
+    ),
   };
 
   let service: NotificationPushService;
@@ -217,8 +219,9 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         where: { id: 'd3' },
         data: expect.objectContaining({ status: 'FAILED' }),
       });
+      // round 3：requeue 与行状态同事务，形状从批量 in 改为逐条 id
       expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['o3'] }, status: 'COMPLETED' },
+        where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
     });
@@ -251,7 +254,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
       // outbox 被拉回 PENDING，凭据修好后自动补发
       expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['o1'] }, status: 'COMPLETED' },
+        where: { id: 'o1', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
     });

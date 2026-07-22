@@ -267,8 +267,10 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       pendingDeliveries: [], // 全部行 attempts >= 上限，被待投查询滤光
       outcomes: [],
     });
-    // 存在打光的 FAILED 行 → 死信而非完成
-    prisma.notificationPushDelivery.count.mockResolvedValue(2);
+    // 存在打光的 FAILED 行且无 SENT 待回执 → 死信而非完成
+    prisma.notificationPushDelivery.count.mockImplementation(({ where }: any) =>
+      Promise.resolve(where.status === 'SENT' ? 0 : 2),
+    );
 
     await processor.processPending();
 
@@ -280,6 +282,39 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       .map(([input]: any[]) => input)
       .find((input: any) => input.data.status === 'COMPLETED');
     expect(completed).toBeUndefined();
+  });
+
+  it('keeps the outbox reopenable while receipts are still outstanding (round 3)', async () => {
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'FAILED',
+          attempts: 3,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [],
+      outcomes: [],
+    });
+    // 打光 1 行，但还有 1 行 SENT 在等回执 → 必须 COMPLETED（可被回执轮询
+    // 拉回 PENDING），TERMINAL 会把可重试回执失败永久冻住
+    prisma.notificationPushDelivery.count.mockImplementation(({ where }: any) =>
+      Promise.resolve(where.status === 'SENT' ? 1 : 1),
+    );
+
+    await processor.processPending();
+
+    const terminal = prisma.notificationPushOutbox.updateMany.mock.calls
+      .map(([input]: any[]) => input)
+      .find((input: any) => input.data.status === 'TERMINAL');
+    expect(terminal).toBeUndefined();
+    const completed = prisma.notificationPushOutbox.updateMany.mock.calls
+      .map(([input]: any[]) => input)
+      .find((input: any) => input.data.status === 'COMPLETED');
+    expect(completed).toBeDefined();
   });
 
   it('uses the actual claim time for each job in a long batch (lease regression)', async () => {

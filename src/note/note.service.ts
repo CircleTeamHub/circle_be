@@ -2341,6 +2341,36 @@ export class NoteService {
    * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动隐藏。
    */
   async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
+    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
+    // 先查同源活跃副本，命中给可控 409。
+    const target = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      select: { id: true, collectedFromNoteID: true },
+    });
+    if (!target) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    if (target.collectedFromNoteID) {
+      const activeDuplicate = await this.prisma.note.findFirst({
+        where: {
+          ownerID,
+          collectedFromNoteID: target.collectedFromNoteID,
+          status: { not: 'DELETED' },
+          id: { not: noteId },
+        },
+        select: { id: true },
+      });
+      if (activeDuplicate) {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+    }
     const result = await this.prisma.note.updateMany({
       where: { id: noteId, ownerID, status: 'DELETED' },
       data: { status: 'ACTIVE' },

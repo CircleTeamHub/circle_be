@@ -45,26 +45,29 @@ export class NotificationRetentionCleanup {
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
   async sweep(now: Date = new Date()): Promise<void> {
-    // round 2 review：多副本部署里每个实例都会在 4AM 触发 —— 与
-    // deleteStaleTokens 同款 try-lock 选主，输家直接收工，避免删除负载
-    //（WAL/行锁）在清理窗口翻倍。锁的粒度是整轮 sweep。
-    const [lock] = await this.prisma.$queryRaw<Array<{ acquired: boolean }>>`
-      SELECT pg_try_advisory_lock(hashtext('notification-retention-sweep')) AS acquired
-    `;
-    if (!lock?.acquired) {
-      return;
-    }
-    try {
-      await this.runSweep(now);
-    } finally {
-      await this.prisma
-        .$queryRaw`SELECT pg_advisory_unlock(hashtext('notification-retention-sweep'))`.catch(
-        () => undefined,
-      );
-    }
+    // round 2/3 review：多副本选主。round 3 改 xact 锁 —— session 级
+    // pg_try_advisory_lock 的 unlock 在连接池下可能落到另一条连接上，
+    // 赢家的锁被一直持有，之后每天的清理在所有副本上静默跳过。xact 锁随
+    // 事务自动释放且天然同连接；整轮 sweep 在一个交互式事务里跑（批量
+    // 删除语句本身仍分批），4AM 低峰的分钟级事务可接受。
+    await this.prisma.$transaction(
+      async (tx) => {
+        const [lock] = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+          SELECT pg_try_advisory_xact_lock(hashtext('notification-retention-sweep')) AS acquired
+        `;
+        if (!lock?.acquired) {
+          return;
+        }
+        await this.runSweep(now, tx);
+      },
+      { timeout: 15 * 60_000 },
+    );
   }
 
-  private async runSweep(now: Date): Promise<void> {
+  private async runSweep(
+    now: Date,
+    db: Pick<PrismaService, '$executeRaw'> = this.prisma,
+  ): Promise<void> {
     if (this.notificationDays > 0) {
       try {
         const cutoff = new Date(
@@ -72,7 +75,7 @@ export class NotificationRetentionCleanup {
         );
         const removed = await this.batchedDelete(
           (take) =>
-            this.prisma.$executeRaw`
+            db.$executeRaw`
             DELETE FROM "Notification" WHERE "id" IN (
               SELECT "id" FROM "Notification"
               WHERE "createdAt" < ${cutoff}
@@ -99,7 +102,7 @@ export class NotificationRetentionCleanup {
         );
         const removed = await this.batchedDelete(
           (take) =>
-            this.prisma.$executeRaw`
+            db.$executeRaw`
             DELETE FROM "FriendActivity" WHERE "id" IN (
               SELECT "id" FROM "FriendActivity"
               WHERE "createdAt" < ${cutoff}

@@ -287,7 +287,6 @@ export class NotificationPushService {
 
     let processed = expired.length;
     const deadTokens: string[] = [];
-    const retryOutboxIDs = new Set<string>();
     for (const delivery of pending) {
       const receipt = delivery.ticketID
         ? receipts[delivery.ticketID]
@@ -319,11 +318,23 @@ export class NotificationPushService {
         });
         continue;
       }
-      await this.prisma.notificationPushDelivery.update({
-        where: { id: delivery.id },
-        data: { status: 'FAILED', receiptCheckedAt: now, lastError: errorCode },
-      });
-      retryOutboxIDs.add(delivery.outboxID);
+      // round 3 review：FAILED 标记与 outbox 重开必须同事务 —— 行改成
+      // FAILED 后 outbox 若没能拉回 PENDING（写失败），这条可重试失败就
+      // 永远没有下一次 sweep。
+      await this.prisma.$transaction([
+        this.prisma.notificationPushDelivery.update({
+          where: { id: delivery.id },
+          data: {
+            status: 'FAILED',
+            receiptCheckedAt: now,
+            lastError: errorCode,
+          },
+        }),
+        this.prisma.notificationPushOutbox.updateMany({
+          where: { id: delivery.outboxID, status: 'COMPLETED' },
+          data: { status: 'PENDING', nextAttemptAt: now },
+        }),
+      ]);
     }
 
     if (deadTokens.length > 0) {
@@ -332,13 +343,7 @@ export class NotificationPushService {
         data: { disabledAt: new Date() },
       });
     }
-    if (retryOutboxIDs.size > 0) {
-      // 只把对应 outbox 拉回 PENDING；sweep 只会补发仍处 FAILED 的投递行。
-      await this.prisma.notificationPushOutbox.updateMany({
-        where: { id: { in: [...retryOutboxIDs] }, status: 'COMPLETED' },
-        data: { status: 'PENDING', nextAttemptAt: now },
-      });
-    }
+    // requeue 已在上方与行状态同事务完成。
     return { processed, done: deliveries.length < RECEIPT_BATCH_SIZE };
   }
 

@@ -620,6 +620,15 @@ export class AuthService {
       // 差异本身就是账号存在性探针。把冷却也折叠成静默成功：60s 内的合法
       // 重复请求本来就不该再发一封；真实滥用由 IP 级 emailCodeLimiter 兜底。
       if (this.isCodeRateLimited(error)) return;
+      // round 3 review：邮件服务故障（503）同理 —— 未注册邮箱在发信前就
+      // 静默成功，已注册邮箱才会撞到 5xx，故障期间的差异同样是探针。
+      // 静默成功 + error 日志（运维可见；用户重试由前端「未收到？重发」引导）。
+      if (error instanceof ServiceUnavailableException) {
+        this.logger.error(
+          'password reset code delivery failed (mailer unavailable); returning generic success to stay non-enumerable',
+        );
+        return;
+      }
       throw error;
     }
   }
@@ -667,12 +676,31 @@ export class AuthService {
     }
 
     const passwordHash = await argon2.hash(newPassword);
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: { passwordHash },
-    });
-    // 重置密码 = 假定凭据可能已泄露：全端下线。
-    await this.refreshTokenService.revokeAll(user.id);
+    // round 3 review：改密与 refresh 撤销必须同事务 —— 分两步时撤销失败会
+    // 留下「新密码已生效 + 旧会话全活着」的半态，客户端却拿到失败响应。
+    await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash },
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+    // access token 吊销标记（Redis）单独尽力：失败时 refresh 已死、access
+    // 最多再活一个 TTL；显式 error 让运维可见，不把已提交的改密翻成假失败。
+    try {
+      await this.refreshTokenService.revokeAllAccessMarkers(user.id);
+    } catch (markerError) {
+      this.logger.error(
+        `password reset: access-token revocation marker failed for ${user.id}: ${
+          markerError instanceof Error
+            ? markerError.message
+            : String(markerError)
+        }`,
+      );
+    }
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
       businessEvent: 'auth_password_reset_success',
