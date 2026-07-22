@@ -17,6 +17,9 @@ const DISABLED_TOKEN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const RECEIPT_MIN_AGE_MS = 15 * 60 * 1000;
 const RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const RECEIPT_BATCH_SIZE = 300;
+// review 修复：单轮最多抽多少批 —— 300×20=6000 行/轮，远超预期峰值；
+// 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
+const RECEIPT_MAX_BATCHES_PER_RUN = 20;
 
 type ExpoPushTicket = {
   status?: string;
@@ -46,12 +49,14 @@ export type ExpoPushPayload = {
 const RETRYABLE_TICKET_ERRORS = new Set([
   'MessageRateExceeded',
   'ExpoServerError',
-]);
-// 令牌本身已死，重试无意义且应停用 token。
-const TERMINAL_TOKEN_ERRORS = new Set([
-  'DeviceNotRegistered',
+  // review 修复：InvalidCredentials 是「项目 APNs/FCM 凭据配置坏了」这类
+  // 运维故障 —— 修好凭据后推送应自动恢复。此前按死令牌处理会把所有受影响
+  // 设备永久 disabledAt，凭据修复后用户依旧收不到推送。
   'InvalidCredentials',
 ]);
+// 令牌本身已死，重试无意义且应停用 token。只有 token 级错误配进来；
+// 项目级/消息级错误（InvalidCredentials/MessageTooBig）绝不 reap token。
+const TERMINAL_TOKEN_ERRORS = new Set(['DeviceNotRegistered']);
 const DELIVERY_MAX_ATTEMPTS = 5;
 
 @Injectable()
@@ -192,13 +197,32 @@ export class NotificationPushService {
    * - 可重试错误 → FAILED + 对应 outbox 置回 PENDING（sweep 只补发该 token）；
    * - 超过 24h 取不到回执 → CONFIRMED（Expo 侧已过期，无从考证，按送达计）。
    */
-  @Cron(CronExpression.EVERY_30_MINUTES)
+  // review 修复：30 分钟 × 300 行的吞吐上限是 600 行/小时，超过即积压，
+  // 24h 后被「过期视同送达」吞掉 —— DeviceNotRegistered 与可重试错误全被
+  // 静默错过。加密频率到 5 分钟，且单轮循环抽批直到抽干（对 Expo 尚未生成
+  // 回执的行记入跳过清单，避免同轮空转重查）。
+  @Cron(CronExpression.EVERY_5_MINUTES)
   async pollReceipts(now: Date = new Date()): Promise<number> {
+    let total = 0;
+    const skipIDs: string[] = [];
+    for (let batch = 0; batch < RECEIPT_MAX_BATCHES_PER_RUN; batch += 1) {
+      const result = await this.pollReceiptBatch(now, skipIDs);
+      total += result.processed;
+      if (result.done) break;
+    }
+    return total;
+  }
+
+  private async pollReceiptBatch(
+    now: Date,
+    skipIDs: string[],
+  ): Promise<{ processed: number; done: boolean }> {
     const deliveries = await this.prisma.notificationPushDelivery.findMany({
       where: {
         status: 'SENT',
         ticketID: { not: null },
         sentAt: { lte: new Date(now.getTime() - RECEIPT_MIN_AGE_MS) },
+        ...(skipIDs.length > 0 ? { id: { notIn: skipIDs } } : {}),
       },
       orderBy: { sentAt: 'asc' },
       take: RECEIPT_BATCH_SIZE,
@@ -210,7 +234,7 @@ export class NotificationPushService {
         sentAt: true,
       },
     });
-    if (deliveries.length === 0) return 0;
+    if (deliveries.length === 0) return { processed: 0, done: true };
 
     const expired = deliveries.filter(
       (d) =>
@@ -227,7 +251,12 @@ export class NotificationPushService {
       });
     }
     const pending = deliveries.filter((d) => !expired.includes(d));
-    if (pending.length === 0) return expired.length;
+    if (pending.length === 0) {
+      return {
+        processed: expired.length,
+        done: deliveries.length < RECEIPT_BATCH_SIZE,
+      };
+    }
 
     let receipts: Record<string, ExpoPushReceipt>;
     try {
@@ -248,11 +277,12 @@ export class NotificationPushService {
       };
       receipts = json.data ?? {};
     } catch (error) {
-      // 拉不到回执不改状态，下一轮 cron 再试。
+      // 拉不到回执不改状态，下一轮 cron 再试；本轮直接收工（Expo 出问题时
+      // 继续抽批只会连环失败）。
       this.logger.warn(
         `Expo receipt poll failed: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return expired.length;
+      return { processed: expired.length, done: true };
     }
 
     let processed = expired.length;
@@ -262,7 +292,12 @@ export class NotificationPushService {
       const receipt = delivery.ticketID
         ? receipts[delivery.ticketID]
         : undefined;
-      if (!receipt) continue; // Expo 还没生成回执，下轮再查
+      if (!receipt) {
+        // Expo 还没生成回执：状态不动，但记入本轮跳过清单，
+        // 否则排空循环会反复捞到同一批「最老的无回执行」空转。
+        skipIDs.push(delivery.id);
+        continue;
+      }
       processed += 1;
       if (receipt.status === 'ok') {
         await this.prisma.notificationPushDelivery.update({
@@ -304,7 +339,7 @@ export class NotificationPushService {
         data: { status: 'PENDING', nextAttemptAt: now },
       });
     }
-    return processed;
+    return { processed, done: deliveries.length < RECEIPT_BATCH_SIZE };
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)

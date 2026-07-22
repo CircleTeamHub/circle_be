@@ -122,6 +122,27 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
     });
 
+    it('treats InvalidCredentials as retryable and never disables the token (P1)', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ status: 'error', details: { error: 'InvalidCredentials' } }],
+        }),
+      });
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'tok-a', projectId: null }],
+        payload,
+      );
+
+      // 项目凭据坏了是运维故障：修好后重试应当恢复，token 不能被 reap
+      expect(outcomes).toEqual([
+        { token: 'tok-a', status: 'RETRYABLE', error: 'InvalidCredentials' },
+      ]);
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
     it('marks the whole batch retryable when the HTTP call keeps failing', async () => {
       fetchMock.mockRejectedValue(new Error('ECONNRESET'));
 
@@ -200,6 +221,79 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         where: { id: { in: ['o3'] }, status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
       });
+    });
+
+    it('keeps InvalidCredentials receipts retryable without reaping the token (P1)', async () => {
+      prisma.notificationPushDelivery.findMany
+        .mockResolvedValueOnce([
+          { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        ])
+        .mockResolvedValue([]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'error', details: { error: 'InvalidCredentials' } },
+          },
+        }),
+      });
+
+      await service.pollReceipts(now);
+
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd1' },
+        data: {
+          status: 'FAILED',
+          receiptCheckedAt: now,
+          lastError: 'InvalidCredentials',
+        },
+      });
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+      // outbox 被拉回 PENDING，凭据修好后自动补发
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['o1'] }, status: 'COMPLETED' },
+        data: { status: 'PENDING', nextAttemptAt: now },
+      });
+    });
+
+    it('drains multiple batches in one run instead of capping at 300 per 30min', async () => {
+      const fullBatch = Array.from({ length: 300 }, (_, index) => ({
+        id: `d${index}`,
+        ticketID: `t${index}`,
+        token: `tok-${index}`,
+        outboxID: `o${index}`,
+        sentAt,
+      }));
+      const tail = [
+        {
+          id: 'd-tail',
+          ticketID: 't-tail',
+          token: 'tok-t',
+          outboxID: 'ot',
+          sentAt,
+        },
+      ];
+      prisma.notificationPushDelivery.findMany
+        .mockResolvedValueOnce(fullBatch)
+        .mockResolvedValueOnce(tail)
+        .mockResolvedValue([]);
+      const okFor = (rows: Array<{ ticketID: string }>) =>
+        Object.fromEntries(rows.map((row) => [row.ticketID, { status: 'ok' }]));
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: okFor(fullBatch) }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: okFor(tail) }),
+        });
+
+      const processed = await service.pollReceipts(now);
+
+      // 满批 → 继续抽下一批；尾批不足 300 → 收工
+      expect(processed).toBe(301);
+      expect(prisma.notificationPushDelivery.findMany).toHaveBeenCalledTimes(2);
     });
 
     it('assumes delivery for receipts older than the 24h Expo retention', async () => {

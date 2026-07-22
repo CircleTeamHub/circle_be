@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -63,12 +64,32 @@ export class MembershipService {
 
     // #91：与 coin 转账同款幂等。同 key 的重试直接回放当前状态，不再进扣费
     // 事务（CAS 已挡住同级双扣，这里挡的是「响应丢失后的盲重试」语义漂移）。
+    // review 修复：命中行必须核对归属与原始购买参数 —— 只查 key 存在的话，
+    // 别人用过的 key / 自己上次买 VIP1 的 key 会让这次 VIP2 请求不扣费不升级
+    // 却返回成功形状。参数不符按冲突拒绝，不给「假成功」。
     if (idempotencyKey) {
       const priorTx = await this.prisma.coinTransaction.findUnique({
         where: { idempotencyKey },
-        select: { id: true },
+        select: {
+          id: true,
+          userID: true,
+          type: true,
+          amount: true,
+          note: true,
+        },
       });
       if (priorTx) {
+        const matchesThisPurchase =
+          priorTx.userID === userId &&
+          priorTx.type === 'PURCHASE' &&
+          priorTx.amount === -plan.price &&
+          priorTx.note === `兑换 VIP${level}`;
+        if (!matchesThisPurchase) {
+          throw new ConflictException({
+            message: 'Idempotency-Key was already used for a different request',
+            errorCode: MembershipErrorCode.IdempotencyKeyReused,
+          });
+        }
         return this.currentStateResponse(userId, plan);
       }
     }

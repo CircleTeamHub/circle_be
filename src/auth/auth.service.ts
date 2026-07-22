@@ -609,9 +609,29 @@ export class AuthService {
 
   /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义在 email-verification 内。 */
   async requestPasswordReset(email: string): Promise<void> {
-    await this.emailVerification.requestCode(
-      normalizeEmail(email),
-      'RESET_PASSWORD',
+    try {
+      await this.emailVerification.requestCode(
+        normalizeEmail(email),
+        'RESET_PASSWORD',
+      );
+    } catch (error) {
+      // review 修复（防枚举）：冷却检查先于「未注册邮箱静默成功」——60s 内
+      // 重复请求时，已注册邮箱会拿到 CodeRateLimited、未注册邮箱恒静默成功，
+      // 差异本身就是账号存在性探针。把冷却也折叠成静默成功：60s 内的合法
+      // 重复请求本来就不该再发一封；真实滥用由 IP 级 emailCodeLimiter 兜底。
+      if (this.isCodeRateLimited(error)) return;
+      throw error;
+    }
+  }
+
+  private isCodeRateLimited(error: unknown): boolean {
+    if (!(error instanceof BadRequestException)) return false;
+    const response = error.getResponse();
+    return (
+      typeof response === 'object' &&
+      response !== null &&
+      (response as { errorCode?: string }).errorCode ===
+        AuthErrorCode.CodeRateLimited
     );
   }
 

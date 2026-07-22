@@ -40,6 +40,8 @@ export const MembershipErrorCode = {
   LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
   InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
+  // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
+  IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
 } as const;
 
 export const CircleErrorCode = {

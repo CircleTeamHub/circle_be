@@ -550,7 +550,10 @@ model GroupReport {
   reporter User    @relation("groupReportReporter", fields: [reporterID], references: [id], onDelete: Cascade)
   circle   Circle? @relation("groupReports", fields: [circleID], references: [id], onDelete: SetNull)
 
-  @@unique([reporterID, groupID, category])
+  // review 修复：唯一约束收窄到 PENDING（局部唯一索引，见
+  // 20260721160000_report_reopen_partial_unique）。硬唯一会让「审结后再次
+  // 举报」永远建不出新 PENDING 行 —— 复发的违规无法再进审核队列。
+  @@index([reporterID, groupID, category])
   @@index([reporterID, createdAt])
   @@index([groupID, createdAt])
   @@index([status, createdAt])
@@ -741,6 +744,8 @@ model FriendActivity {
   counterparty    User               @relation("friendActivityCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
 
   @@unique([requestId, viewerId, type])
+  // review 修复：保留期清理按裸 createdAt 截断分批删除
+  @@index([createdAt])
   @@index([requestId])
   @@index([viewerId, createdAt])
   @@index([viewerId, readAt])
@@ -1145,6 +1150,8 @@ model Notification {
 
   @@index([fromUserID, toUserID])
   @@index([toUserID])
+  // review 修复：保留期清理按裸 createdAt 截断分批删除
+  @@index([createdAt])
   @@index([fromFriendRequestID])
 }
 
@@ -1381,7 +1388,8 @@ model CirclePostReport {
   createdAt    DateTime           @default(now())
   updatedAt    DateTime           @default(now()) @updatedAt
 
-  @@unique([postID, reporterID])
+  // review 修复：同 GroupReport —— PENDING 局部唯一，审结后可重新举报。
+  @@index([postID, reporterID])
   @@index([postID])
   @@index([status, createdAt])
 }

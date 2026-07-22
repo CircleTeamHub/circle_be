@@ -36,6 +36,9 @@ function buildHarness({
       createMany: jest.fn().mockResolvedValue({ count: tokens.length }),
       findMany: jest.fn().mockResolvedValue(pendingDeliveries),
       update: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      // 打光判定（review 修复）：默认无耗尽行 → COMPLETED
+      count: jest.fn().mockResolvedValue(0),
     },
   };
   const push = {
@@ -218,6 +221,65 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       .map(([input]) => input)
       .find((input) => input.data.status === 'COMPLETED');
     expect(complete).toBeDefined();
+  });
+
+  it('marks deliveries TERMINAL instead of retrying tokens the user has since revoked (P1)', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'FAILED',
+          attempts: 1,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      // 首轮失败时快照的投递行指向 tok-old；重试前用户已登出/换绑，
+      // 现在的活跃 token 只有 tok-new
+      pendingDeliveries: [{ id: 'd-old', token: 'tok-old' }],
+      tokens: [{ token: 'tok-new', projectId: null }],
+      outcomes: [],
+    });
+
+    await processor.processPending();
+
+    expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['d-old'] } },
+      data: { status: 'TERMINAL', lastError: 'token-revoked' },
+    });
+    // 绝不把旧 token 发出去（可能已归属别的账号）
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+  });
+
+  it('finishes as TERMINAL (not COMPLETED) when all deliveries exhausted their attempts', async () => {
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'FAILED',
+          attempts: 3,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [], // 全部行 attempts >= 上限，被待投查询滤光
+      outcomes: [],
+    });
+    // 存在打光的 FAILED 行 → 死信而非完成
+    prisma.notificationPushDelivery.count.mockResolvedValue(2);
+
+    await processor.processPending();
+
+    const terminal = prisma.notificationPushOutbox.updateMany.mock.calls
+      .map(([input]: any[]) => input)
+      .find((input: any) => input.data.status === 'TERMINAL');
+    expect(terminal).toBeDefined();
+    const completed = prisma.notificationPushOutbox.updateMany.mock.calls
+      .map(([input]: any[]) => input)
+      .find((input: any) => input.data.status === 'COMPLETED');
+    expect(completed).toBeUndefined();
   });
 
   it('uses the actual claim time for each job in a long batch (lease regression)', async () => {

@@ -445,6 +445,8 @@ export class OpenimService implements OnModuleInit {
     message: string | null;
     senderNickname?: string | null;
     senderFaceURL?: string | null;
+    /** 幂等键（review 修复）：补偿 cron 用 gift 派生的固定 id，OpenIM 侧去重。 */
+    clientMsgID?: string;
   }): Promise<void> {
     if (!this.enabled) return;
 
@@ -478,6 +480,7 @@ export class OpenimService implements OnModuleInit {
           iOSBadgeCount: true,
         },
         ex: '',
+        ...(params.clientMsgID ? { clientMsgID: params.clientMsgID } : {}),
       },
       adminToken,
     );

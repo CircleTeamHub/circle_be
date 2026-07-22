@@ -108,7 +108,7 @@ export class NotificationPushOutboxProcessor {
         }
 
         // 只发仍待投的行 —— 这是「部分失败不再殃及已送达设备」的关键。
-        const pendingDeliveries =
+        const retriableDeliveries =
           await this.prisma.notificationPushDelivery.findMany({
             where: {
               outboxID: job.id,
@@ -118,8 +118,39 @@ export class NotificationPushOutboxProcessor {
             select: { id: true, token: true },
           });
 
+        // review 修复（P1）：投递行存的是裸 token 快照 —— 用户登出删除 /
+        // token 被 upsert 到别的账号后，重试会把通知推给已登出设备或别人。
+        // 每次补发前都对照收件人「当前活跃」token 集，出圈的行直接终态。
+        const activeTokenSet = new Set(tokens.map((row) => row.token));
+        const revoked = retriableDeliveries.filter(
+          (delivery) => !activeTokenSet.has(delivery.token),
+        );
+        if (revoked.length > 0) {
+          await this.prisma.notificationPushDelivery.updateMany({
+            where: { id: { in: revoked.map((delivery) => delivery.id) } },
+            data: { status: 'TERMINAL', lastError: 'token-revoked' },
+          });
+        }
+        const pendingDeliveries = retriableDeliveries.filter((delivery) =>
+          activeTokenSet.has(delivery.token),
+        );
+
         if (pendingDeliveries.length === 0) {
-          await this.finishJob(job.id, leaseToken, 'COMPLETED');
+          // review 修复：还有 FAILED 但重试次数打光的行时，这个 job 不是
+          // 「完成」而是「死信」——标 TERMINAL 让积压对运维可见（Expo 长停
+          // 期间静默 COMPLETED 等于把丢推送藏起来）。
+          const exhausted = await this.prisma.notificationPushDelivery.count({
+            where: {
+              outboxID: job.id,
+              status: 'FAILED',
+              attempts: { gte: DELIVERY_MAX_ATTEMPTS },
+            },
+          });
+          await this.finishJob(
+            job.id,
+            leaseToken,
+            exhausted > 0 ? 'TERMINAL' : 'COMPLETED',
+          );
           processed += 1;
           continue;
         }
