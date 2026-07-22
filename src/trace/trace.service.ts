@@ -324,10 +324,11 @@ export class TraceService {
   }
 
   /**
-   * 朋友圈 feed 变更 poke（#89）：作者本人各端恒收；FRIENDS_ONLY 时扇出到
-   * 已接受的好友。扇出封顶 + 命中记日志（镜像圈子发帖通知的护栏哲学）；
-   * PRIVATE 只 poke 自己。收到 poke 的客户端自行 refetch，可见性过滤仍由
-   * GET /trace/feed 权威裁决 —— poke 本身不泄露内容。
+   * 朋友圈 feed 变更 poke（#89）：作者本人各端恒收；非 PRIVATE 时扇出到
+   * 已接受好友中**通过 feed 同款隐私门**（momentsVisibility + 作者侧
+   * CHAT_ONLY）的那些。扇出封顶 + 命中记日志（镜像圈子发帖通知的护栏哲学）；
+   * PRIVATE 只 poke 自己。收到 poke 的客户端自行 refetch，内容级过滤仍由
+   * GET /trace/feed 权威裁决 —— poke 无内容，但收没收到本身也不能泄密。
    */
   private async broadcastFeedPoke(
     authorId: string,
@@ -336,25 +337,53 @@ export class TraceService {
     try {
       const recipients = new Set<string>([authorId]);
       if (visibility !== 'PRIVATE') {
-        const friendships = await this.prisma.friend.findMany({
-          where: {
-            state: 'ACCEPTED',
-            OR: [{ userID: authorId }, { friendID: authorId }],
-          },
-          select: { userID: true, friendID: true },
-          take: MOMENTS_POKE_FANOUT_CAP,
-        });
-        if (friendships.length === MOMENTS_POKE_FANOUT_CAP) {
-          this.logger.warn(
-            `moments feed poke fan-out capped at ${MOMENTS_POKE_FANOUT_CAP} for ${authorId}`,
-          );
-        }
-        for (const friendship of friendships) {
-          recipients.add(
-            friendship.userID === authorId
-              ? friendship.friendID
-              : friendship.userID,
-          );
+        // PR #122 review（P2）：扇出必须套用与 GET /trace/feed 相同的隐私门。
+        // 少了它们，被作者屏蔽朋友圈的好友仍会收到带 authorId+时间戳的 poke ——
+        // 隐藏帖/删帖的存在性与时序就此泄露（poke 虽无内容，元数据也是数据）。
+        const authorSettings = (
+          await this.privacySettings.getSettingsMany([authorId])
+        ).get(authorId);
+        // poke 候选全是已接受好友（isFriend 恒真）；作者把朋友圈对好友整体
+        // 关闭时直接零扇出，只 poke 作者自己的多端。
+        const visibleToFriends = this.privacySettings.momentsVisibleFor(
+          authorSettings,
+          false,
+          true,
+        );
+        if (visibleToFriends) {
+          const friendships = await this.prisma.friend.findMany({
+            where: {
+              state: 'ACCEPTED',
+              OR: [{ userID: authorId }, { friendID: authorId }],
+            },
+            select: {
+              userID: true,
+              friendID: true,
+              permissionA: true,
+              permissionB: true,
+            },
+            take: MOMENTS_POKE_FANOUT_CAP,
+          });
+          if (friendships.length === MOMENTS_POKE_FANOUT_CAP) {
+            this.logger.warn(
+              `moments feed poke fan-out capped at ${MOMENTS_POKE_FANOUT_CAP} for ${authorId}`,
+            );
+          }
+          for (const friendship of friendships) {
+            // 与 feed 一致：作者侧权限为 CHAT_ONLY 的好友看不到其朋友圈，不 poke。
+            const authorPermission =
+              friendship.userID === authorId
+                ? friendship.permissionA
+                : friendship.permissionB;
+            if (authorPermission === 'CHAT_ONLY') {
+              continue;
+            }
+            recipients.add(
+              friendship.userID === authorId
+                ? friendship.friendID
+                : friendship.userID,
+            );
+          }
         }
       }
       await this.realtimeService.safeBroadcastAll(

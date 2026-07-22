@@ -1010,8 +1010,18 @@ describe('TraceService', () => {
         from: { id: 'user-1', nickname: 'A', avatarUrl: null },
       });
       prisma.friend.findMany.mockResolvedValue([
-        { userID: 'user-1', friendID: 'friend-1' },
-        { userID: 'friend-2', friendID: 'user-1' },
+        {
+          userID: 'user-1',
+          friendID: 'friend-1',
+          permissionA: 'ALL',
+          permissionB: 'ALL',
+        },
+        {
+          userID: 'friend-2',
+          friendID: 'user-1',
+          permissionA: 'ALL',
+          permissionB: 'ALL',
+        },
       ]);
 
       await service.createTrace('user-1', { content: 'hi' } as never);
@@ -1023,6 +1033,65 @@ describe('TraceService', () => {
       expect(new Set(poked)).toEqual(
         new Set(['user-1', 'friend-1', 'friend-2']),
       );
+    });
+
+    it('skips friends gated by CHAT_ONLY or hidden moments settings (PR #122 P2)', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-3',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      prisma.friend.findMany.mockResolvedValue([
+        // 作者侧 permissionA=CHAT_ONLY：friend-1 看不到作者朋友圈，不得 poke
+        {
+          userID: 'user-1',
+          friendID: 'friend-1',
+          permissionA: 'CHAT_ONLY',
+          permissionB: 'ALL',
+        },
+        // 反向行：作者是 friendID，作者侧权限在 permissionB
+        {
+          userID: 'friend-2',
+          friendID: 'user-1',
+          permissionA: 'ALL',
+          permissionB: 'ALL',
+        },
+      ]);
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      expect(new Set(poked)).toEqual(new Set(['user-1', 'friend-2']));
+    });
+
+    it('pokes only the author when moments are hidden from friends entirely', async () => {
+      prisma.trace.create.mockResolvedValue({
+        id: 'trace-4',
+        content: 'hi',
+        images: [],
+        visibility: 'FRIENDS_ONLY',
+        createdAt: new Date(),
+        from: { id: 'user-1', nickname: 'A', avatarUrl: null },
+      });
+      privacySettings.getSettingsMany.mockResolvedValue(
+        new Map([['user-1', { momentsVisibility: 'NOBODY' }]]),
+      );
+      privacySettings.momentsVisibleFor.mockReturnValueOnce(false);
+
+      await service.createTrace('user-1', { content: 'hi' } as never);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const poked = (
+        realtimeService.broadcastMomentsFeedUpdated as jest.Mock
+      ).mock.calls.map((call) => call[0]);
+      expect(poked).toEqual(['user-1']);
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
     });
 
     it('pokes only the author for PRIVATE moments', async () => {
