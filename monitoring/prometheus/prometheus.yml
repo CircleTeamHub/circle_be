@@ -30,8 +30,13 @@ scrape_configs:
     static_configs:
       - targets: ["cadvisor:8080"]
 
-  # OpenIM exposes its own Prometheus metrics when enabled in its config.
-  # Uncomment + set the correct port once verified for your OpenIM version.
+  # OpenIM exposes its own Prometheus metrics when enabled in its config (#110).
+  # 端口因版本而异 —— 先在服务器上确认（deploy/openim-hardening-runbook.md 第 7 步：
+  #   grep -rn "prometheusPort" ~/openim-docker/config），把下面的占位端口换成真实值
+  # 再 reload prometheus。目标不可达时 Prometheus 只标记 target down，不影响其它 job。
   # - job_name: openim
   #   static_configs:
-  #     - targets: ["host.docker.internal:<openim-metrics-port>"]
+  #     # msggateway（连接数/在线数——容量规划最需要的那组）
+  #     - targets: ["host.docker.internal:20112"]
+  #     # openim-api（消息吞吐）
+  #     - targets: ["host.docker.internal:20113"]

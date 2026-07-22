@@ -224,6 +224,8 @@ const SHARE_LINK_GUEST_VIEWER = '';
 // 每用户上限还没做），不设 take 会一次性把该用户全部历史链接拉进内存。
 // 每页上限 200 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
 const SHARE_LINK_LIST_DEFAULT_LIMIT = 50;
+// #94：每用户活跃分享链接上限（未撤销且未过期的计数）。
+const MAX_ACTIVE_SHARE_LINKS_PER_USER = 200;
 const PDF_FONT_CANDIDATES = [
   '/Library/Fonts/Arial Unicode.ttf',
   '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf',
@@ -1534,6 +1536,7 @@ export class NoteService {
         'group and groupId cannot be used together',
       );
     }
+
     if (dto.groupId) {
       await this.requireOwnedGroup(ownerID, dto.groupId);
     }
@@ -1570,18 +1573,38 @@ export class NoteService {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const token = this.createShareToken();
       try {
-        const row = await this.prisma.noteShareLink.create({
-          data: {
-            ownerID,
-            token,
-            title,
-            status: dto.status ?? null,
-            group: dto.group ?? null,
-            groupID: dto.groupId ?? null,
-            search,
-            noteIDs,
-            expiresAt,
-          },
+        // #94 配额（review 修复为原子）：count 与 create 同事务，并用 per-owner
+        // advisory 锁串行化 —— 否则 199 条时并发双请求都读到 199、双双越过
+        // 200 护栏。锁按 owner 分片，不同用户互不阻塞；xact 锁随事务自动释放。
+        const quotaLockKey = `note-share-link:${ownerID}`;
+        const row = await this.prisma.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+          const activeLinks = await tx.noteShareLink.count({
+            where: {
+              ownerID,
+              revokedAt: null,
+              OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+            },
+          });
+          if (activeLinks >= MAX_ACTIVE_SHARE_LINKS_PER_USER) {
+            throw new BadRequestException({
+              message: `分享链接数量已达上限（${MAX_ACTIVE_SHARE_LINKS_PER_USER}），请先撤销不再使用的链接`,
+              errorCode: NoteErrorCode.ShareLinkLimit,
+            });
+          }
+          return tx.noteShareLink.create({
+            data: {
+              ownerID,
+              token,
+              title,
+              status: dto.status ?? null,
+              group: dto.group ?? null,
+              groupID: dto.groupId ?? null,
+              search,
+              noteIDs,
+              expiresAt,
+            },
+          });
         });
 
         return this.mapShareLink(row);
@@ -2351,6 +2374,7 @@ export class NoteService {
           },
         },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+        take: 500, // #108：防爆护栏（分组数已有业务上限，这里兜异常数据）
       })) ?? [];
 
     return groups.map((group) => this.mapGroup(group));

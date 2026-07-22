@@ -17,7 +17,7 @@ const DURATION_UNITS_IN_MS: Record<string, number> = {
   y: 365.25 * 24 * 60 * 60 * 1000,
 };
 
-function accessTokenTtlSeconds(raw: unknown): number {
+export function accessTokenTtlSeconds(raw: unknown): number {
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
     return Math.ceil(raw);
   }
