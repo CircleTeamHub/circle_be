@@ -10,6 +10,7 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     },
     notificationPushDelivery: {
       findMany: jest.fn(),
+      count: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
@@ -223,6 +224,29 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
         where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
+      });
+    });
+
+    it('marks a completed outbox terminal after its last receipt settles with an exhausted failure', async () => {
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+      ]);
+      prisma.notificationPushDelivery.count
+        .mockResolvedValueOnce(0)
+        .mockResolvedValueOnce(1);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { t1: { status: 'ok' } } }),
+      });
+
+      await service.pollReceipts(now);
+
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: 'o1', status: 'COMPLETED' },
+        data: {
+          status: 'TERMINAL',
+          lastError: 'delivery-attempts-exhausted',
+        },
       });
     });
 

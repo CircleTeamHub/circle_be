@@ -250,8 +250,10 @@ export class NotificationPushService {
         },
       });
     }
+    const settledOutboxIDs = new Set(expired.map((d) => d.outboxID));
     const pending = deliveries.filter((d) => !expired.includes(d));
     if (pending.length === 0) {
+      await this.reconcileCompletedOutboxes(settledOutboxIDs);
       return {
         processed: expired.length,
         done: deliveries.length < RECEIPT_BATCH_SIZE,
@@ -282,6 +284,7 @@ export class NotificationPushService {
       this.logger.warn(
         `Expo receipt poll failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      await this.reconcileCompletedOutboxes(settledOutboxIDs);
       return { processed: expired.length, done: true };
     }
 
@@ -297,6 +300,7 @@ export class NotificationPushService {
         skipIDs.push(delivery.id);
         continue;
       }
+      settledOutboxIDs.add(delivery.outboxID);
       processed += 1;
       if (receipt.status === 'ok') {
         await this.prisma.notificationPushDelivery.update({
@@ -343,8 +347,39 @@ export class NotificationPushService {
         data: { disabledAt: new Date() },
       });
     }
+    await this.reconcileCompletedOutboxes(settledOutboxIDs);
     // requeue 已在上方与行状态同事务完成。
     return { processed, done: deliveries.length < RECEIPT_BATCH_SIZE };
+  }
+
+  private async reconcileCompletedOutboxes(
+    outboxIDs: ReadonlySet<string>,
+  ): Promise<void> {
+    for (const outboxID of outboxIDs) {
+      await this.prisma.$transaction(async (tx) => {
+        const [awaitingReceipt, exhausted] = await Promise.all([
+          tx.notificationPushDelivery.count({
+            where: { outboxID, status: 'SENT' },
+          }),
+          tx.notificationPushDelivery.count({
+            where: {
+              outboxID,
+              status: 'FAILED',
+              attempts: { gte: DELIVERY_MAX_ATTEMPTS },
+            },
+          }),
+        ]);
+        if (awaitingReceipt === 0 && exhausted > 0) {
+          await tx.notificationPushOutbox.updateMany({
+            where: { id: outboxID, status: 'COMPLETED' },
+            data: {
+              status: 'TERMINAL',
+              lastError: 'delivery-attempts-exhausted',
+            },
+          });
+        }
+      });
+    }
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
