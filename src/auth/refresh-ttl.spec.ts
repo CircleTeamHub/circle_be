@@ -123,9 +123,12 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
       audience: 'ADMIN',
       sessionId: 'session-1',
     });
-    // 重放：行早已撤销 —— 不返回归属，调用方不得再记一条成功审计
+    // 重放：行早已撤销 —— 不返回归属，调用方不得再记一条成功审计。
+    // round 3 起吊销标记只要行存在就写（幂等），所以标记会再写一次，
+    // 变化的只是归属/审计不再返回。
     await expect(service.revoke('token-x')).resolves.toBeNull();
-    expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+    expect(revocation.revokeSession).toHaveBeenCalledTimes(2);
+    expect(revocation.revokeSession).toHaveBeenNthCalledWith(2, 'session-1');
   });
 
   it('revoke() ignores expired-but-never-revoked tokens (no phantom logout audit)', async () => {
@@ -149,7 +152,9 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
     );
 
     await expect(service.revoke('expired-token')).resolves.toBeNull();
-    expect(revocation.revokeSession).not.toHaveBeenCalled();
+    // round 3：行存在（即使过期）就写吊销标记 —— refresh TTL 可短于
+    // access TTL，登出必须让还活着的 access token 立即失效
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-old');
     // 撤销条件必须显式排除过期行
     expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({

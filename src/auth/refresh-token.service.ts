@@ -264,9 +264,14 @@ export class RefreshTokenService {
       },
       data: { revokedAt: new Date() },
     });
+    // round 3 review：refresh TTL 可配得比 access TTL 短 —— 行过期不代表
+    // 对应 access token 已死。只要行存在就写会话吊销标记（幂等且便宜），
+    // 让登出语义对 access token 始终成立；归属/审计仍只在真撤销时返回。
+    if (existing) {
+      await this.revocation.revokeSession(existing.id);
+    }
     // token 已被撤销过 / 已过期（updateMany 0 行）时不返回归属。
     if (existing && revoked.count > 0) {
-      await this.revocation.revokeSession(existing.id);
       return {
         userId: existing.userId,
         audience: existing.audience as RefreshTokenAudience,

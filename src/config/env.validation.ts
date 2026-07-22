@@ -25,7 +25,9 @@ export function shouldSkipPrismaConnectOnBoot(
 // review 修复（round 2）：必须为正 —— '0h' 这类值下游解析按无效回落默认，
 // 运维显式配 0 却拿到 12h/1h 是静默放大，必须 fail boot。
 const refreshTtlPattern = /^0*[1-9]\d*\s*[dhm]?$/i;
-const jwtTtlPattern = /^0*[1-9]\d*\s*(ms|s|m|h|d)?$/i;
+// round 3 review：admin access TTL 的单位必须显式 —— '900' 会被
+// accessTokenTtlSeconds 按毫秒解析成 1 秒 token。
+const jwtTtlPattern = /^0*[1-9]\d*\s*(ms|s|m|h|d)$/i;
 // review 修复（round 2）：admin refresh TTL 强制带单位 —— 裸数字按旧语义是
 // 「天」，运维想写 12 小时漏了 h 会静默变 12 天，直接顶穿短会话窗口设计。
 const adminRefreshTtlPattern = /^0*[1-9]\d*\s*[dhm]$/i;

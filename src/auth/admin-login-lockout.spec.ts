@@ -170,6 +170,26 @@ describe('admin login lockout (#83)', () => {
     expect(lockedWrites.length).toBeGreaterThan(0);
   });
 
+  it('rejects an ADMIN with VALID credentials on /auth/login (round 3 P1)', async () => {
+    argon2.verify.mockResolvedValue(true);
+    const { service, updates } = buildService(
+      adminUser({ adminLoginAttempts: 2 }),
+    );
+
+    // 密码对了也不放行：普通登录发的是 APP audience 长会话 + IM token，
+    // 会被 /roles 等管理端点接受，绕开短 TTL 管理会话模型
+    await expect(
+      service.login({ email: 'admin@example.com', password: 'right' }),
+    ).rejects.toThrow(ForbiddenException);
+    // 有效凭据仍清零锁定计数（证明不是撞库）
+    const resetWrite = updates.find(
+      (u) =>
+        u.data.adminLoginAttempts === 0 &&
+        u.data.adminLoginLockedUntil === null,
+    );
+    expect(resetWrite).toBeDefined();
+  });
+
   it('rejects a locked admin on /auth/login without running argon2 (round 2 P1)', async () => {
     const { service } = buildService(
       adminUser({

@@ -263,6 +263,8 @@ describe('createEnvValidationSchema', () => {
         { REFRESH_EXPIRES_IN_DAYS: '0' },
         // round 2：admin refresh 裸数字（旧语义=天，漏个 h 变 12 天）
         { ADMIN_REFRESH_EXPIRES_IN: '12' },
+        // round 3：admin access 裸数字（'900' 按毫秒解析 = 1 秒 token）
+        { ADMIN_JWT_EXPIRES_IN: '900' },
       ]) {
         const env = { ...base, ...bad };
         const { error } = createEnvValidationSchema(env).validate(env, {

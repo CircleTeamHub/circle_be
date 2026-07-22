@@ -229,8 +229,11 @@ export class AuthService {
       });
     }
 
-    // review 修复（round 2 P1）：ADMIN 账号的锁定在普通登录路径同样生效。
-    // 对外文案与普通失败一致（不泄露锁定状态）。
+    // round 3 review（P1）：ADMIN 账号整体拒绝走普通登录 —— 即使密码正确，
+    // 这里发出的是 APP audience 的长 TTL 会话 + IM token，而 /roles 等管理
+    // 端点（JwtGuard+RoleGuard）会接受它，等于绕开短 TTL/审计的管理会话
+    // 模型。管理台请走 /auth/admin/login。对外文案与普通失败一致（不泄露
+    // 该邮箱是管理员）。锁定检查仍在其前（锁死期间不做密码比对）。
     const now = new Date();
     if (this.isAdminLockedNow(user, now)) {
       logBusinessEvent(this.logger, {
@@ -275,6 +278,17 @@ export class AuthService {
 
     if (user.role === 'ADMIN') {
       await this.resetAdminLockCounters(user);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'admin_must_use_admin_login' },
+      });
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
     }
     return this.finishLogin(user, sessionContext, dto.platform);
   }
