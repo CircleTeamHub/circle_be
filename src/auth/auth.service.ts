@@ -229,8 +229,37 @@ export class AuthService {
       });
     }
 
+    // review 修复（round 2 P1）：ADMIN 账号的锁定在普通登录路径同样生效。
+    // 对外文案与普通失败一致（不泄露锁定状态）。
+    const now = new Date();
+    if (this.isAdminLockedNow(user, now)) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_login_failed',
+        actorId: user.id,
+        result: 'failure',
+        metadata: { reason: 'account_locked' },
+      });
+      throw new ForbiddenException({
+        message: '邮箱或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
+
     const valid = await argon2.verify(user.passwordHash, dto.password);
     if (!valid) {
+      if (user.role === 'ADMIN') {
+        const lockedNow = await this.registerAdminLoginFailure(user.id, now);
+        if (lockedNow) {
+          logBusinessEvent(this.logger, {
+            enabled: this.loggingConfig.businessLogOn,
+            businessEvent: 'auth_admin_login_locked',
+            actorId: user.id,
+            result: 'failure',
+            metadata: { lockMinutes: ADMIN_LOGIN_LOCK_MINUTES, via: 'login' },
+          });
+        }
+      }
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
         businessEvent: 'auth_login_failed',
@@ -244,7 +273,65 @@ export class AuthService {
       });
     }
 
+    if (user.role === 'ADMIN') {
+      await this.resetAdminLockCounters(user);
+    }
     return this.finishLogin(user, sessionContext, dto.platform);
+  }
+
+  /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
+  private isAdminLockedNow(
+    user: { role: string; adminLoginLockedUntil: Date | null },
+    now: Date,
+  ): boolean {
+    return (
+      user.role === 'ADMIN' &&
+      !!user.adminLoginLockedUntil &&
+      user.adminLoginLockedUntil > now
+    );
+  }
+
+  /**
+   * ADMIN 错误密码计数（DB 原子 increment）+ 到阈值的条件上锁转换。
+   * 返回是否由本次失败触发锁定。/auth/login 与 /auth/admin/login 共用 ——
+   * review 修复（round 2 P1）：普通登录路径也接受 ADMIN 账号，不共用计数的
+   * 话攻击者换条路就能无限撞库，锁定形同虚设。
+   */
+  private async registerAdminLoginFailure(
+    userId: string,
+    now: Date,
+  ): Promise<boolean> {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { adminLoginAttempts: { increment: 1 } },
+    });
+    const locked = await this.prisma.user.updateMany({
+      where: {
+        id: userId,
+        adminLoginAttempts: { gte: ADMIN_LOGIN_MAX_ATTEMPTS },
+      },
+      data: {
+        adminLoginAttempts: 0,
+        adminLoginLockedUntil: new Date(
+          now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000,
+        ),
+      },
+    });
+    return locked.count > 0;
+  }
+
+  /** 成功登录清零计数（只在有残留时写库，避免每次登录白写一行）。 */
+  private async resetAdminLockCounters(user: {
+    id: string;
+    adminLoginAttempts: number;
+    adminLoginLockedUntil: Date | null;
+  }): Promise<void> {
+    if (user.adminLoginAttempts !== 0 || user.adminLoginLockedUntil) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { adminLoginAttempts: 0, adminLoginLockedUntil: null },
+      });
+    }
   }
 
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
@@ -275,11 +362,7 @@ export class AuthService {
     // 密码比对（也顺带省掉被锁账号的 argon2 开销）。对外文案与其它失败一致，
     // 不泄露「已锁定」状态。
     const now = new Date();
-    if (
-      user.role === 'ADMIN' &&
-      user.adminLoginLockedUntil &&
-      user.adminLoginLockedUntil > now
-    ) {
+    if (this.isAdminLockedNow(user, now)) {
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
         businessEvent: 'auth_admin_login_failed',
@@ -295,27 +378,9 @@ export class AuthService {
       // 只有真正的 ADMIN 账号累计失败计数：对非 admin 账号计数会让任何人
       // 通过 adminLogin 刷别人的普通账号进锁定（DoS）。
       if (!valid && user.role === 'ADMIN') {
-        // review 修复（原子计数）：此前读-改-写，N 个并发错误密码都基于同一
-        // 旧值回写，5 发分布式撞库可能只把计数推到 1、永远锁不上。改为 DB 侧
-        // increment（天然原子），再用条件 updateMany（gte 上限才匹配）完成
-        // 「清零+上锁」转换 —— 并发下也只有一个请求能完成转换并发锁定事件。
-        await this.prisma.user.update({
-          where: { id: user.id },
-          data: { adminLoginAttempts: { increment: 1 } },
-        });
-        const locked = await this.prisma.user.updateMany({
-          where: {
-            id: user.id,
-            adminLoginAttempts: { gte: ADMIN_LOGIN_MAX_ATTEMPTS },
-          },
-          data: {
-            adminLoginAttempts: 0,
-            adminLoginLockedUntil: new Date(
-              now.getTime() + ADMIN_LOGIN_LOCK_MINUTES * 60_000,
-            ),
-          },
-        });
-        if (locked.count > 0) {
+        // 原子计数 + 条件上锁（round 1 修复），与 /auth/login 共用同一辅助。
+        const lockedNow = await this.registerAdminLoginFailure(user.id, now);
+        if (lockedNow) {
           logBusinessEvent(this.logger, {
             enabled: this.loggingConfig.businessLogOn,
             businessEvent: 'auth_admin_login_locked',
@@ -341,13 +406,7 @@ export class AuthService {
       throw new ForbiddenException('Invalid credentials or inactive account');
     }
 
-    // 成功登录清零计数（只在有残留时写库，避免每次登录白写一行）。
-    if (user.adminLoginAttempts !== 0 || user.adminLoginLockedUntil) {
-      await this.prisma.user.update({
-        where: { id: user.id },
-        data: { adminLoginAttempts: 0, adminLoginLockedUntil: null },
-      });
-    }
+    await this.resetAdminLockCounters(user);
 
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })
@@ -575,10 +634,15 @@ export class AuthService {
     return { accessToken, refreshToken: newRefreshToken };
   }
 
-  async logout(refreshToken: string): Promise<void> {
+  async logout(
+    refreshToken: string,
+    sessionContext?: SessionContext,
+  ): Promise<void> {
     const revoked = await this.refreshTokenService.revoke(refreshToken);
     // 管理台登出此前完全无痕（#90）：事后取证时连「会话何时结束」都答不上来。
     // 普通用户登出量大且低敏，保持不记；ADMIN 会话必须留痕。
+    // review 修复（round 2）：带上 ip/userAgent/sessionId —— 没有来源信息，
+    // 正常登出与「被盗 refresh token 在别处被撤销」在审计里无从区分。
     if (revoked?.audience === 'ADMIN') {
       logBusinessEvent(this.logger, {
         enabled: this.loggingConfig.businessLogOn,
@@ -587,6 +651,11 @@ export class AuthService {
         result: 'success',
         entityType: 'user',
         entityId: revoked.userId,
+        metadata: {
+          sessionId: revoked.sessionId,
+          ip: sessionContext?.ip ?? null,
+          userAgent: sessionContext?.userAgent ?? null,
+        },
       });
     }
   }

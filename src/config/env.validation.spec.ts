@@ -256,6 +256,13 @@ describe('createEnvValidationSchema', () => {
         { ADMIN_REFRESH_EXPIRES_IN: '3600x' },
         { ADMIN_JWT_EXPIRES_IN: 'fifteen-minutes' },
         { REFRESH_EXPIRES_IN_DAYS: '-3' },
+        // round 2：零时长（下游按无效回落默认 = 静默放大）
+        { REFRESH_EXPIRES_IN: '0d' },
+        { ADMIN_REFRESH_EXPIRES_IN: '0h' },
+        { ADMIN_JWT_EXPIRES_IN: '0s' },
+        { REFRESH_EXPIRES_IN_DAYS: '0' },
+        // round 2：admin refresh 裸数字（旧语义=天，漏个 h 变 12 天）
+        { ADMIN_REFRESH_EXPIRES_IN: '12' },
       ]) {
         const env = { ...base, ...bad };
         const { error } = createEnvValidationSchema(env).validate(env, {

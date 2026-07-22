@@ -240,9 +240,11 @@ export class RefreshTokenService {
    * 撤销单枚 refresh token。返回被撤销会话的归属（无匹配时 null），
    * 供调用方补审计日志（#90 —— admin 登出此前完全无痕）。
    */
-  async revoke(
-    token: string,
-  ): Promise<{ userId: string; audience: RefreshTokenAudience } | null> {
+  async revoke(token: string): Promise<{
+    userId: string;
+    audience: RefreshTokenAudience;
+    sessionId: string;
+  } | null> {
     const tokenHash = hashToken(token);
     // The row id is the session id carried in the access token's `sid` claim;
     // fetch it so we can revoke the matching access token too (F-02), not just
@@ -252,16 +254,23 @@ export class RefreshTokenService {
       select: { id: true, userId: true, audience: true },
     });
     const revoked = await this.prisma.refreshToken.updateMany({
-      where: { token: tokenHash, revokedAt: null },
+      // review 修复（round 2）：过期未撤销的行同样不算「真撤销」——旧 ADMIN
+      // refresh token 过期后被拿来「登出」，不该再记一条成功审计（会话早已
+      // 自然死亡，什么都没被结束）。
+      where: {
+        token: tokenHash,
+        revokedAt: null,
+        expiredAt: { gt: new Date() },
+      },
       data: { revokedAt: new Date() },
     });
-    // review 修复：token 已被撤销过（updateMany 0 行）时不再返回归属 ——
-    // 否则超时重试 / 持旧 token 者每次「登出」都会多记一条成功审计。
+    // token 已被撤销过 / 已过期（updateMany 0 行）时不返回归属。
     if (existing && revoked.count > 0) {
       await this.revocation.revokeSession(existing.id);
       return {
         userId: existing.userId,
         audience: existing.audience as RefreshTokenAudience,
+        sessionId: existing.id,
       };
     }
     return null;

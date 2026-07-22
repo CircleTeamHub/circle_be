@@ -117,13 +117,46 @@ describe('RefreshTokenService TTL wiring (#84 #91)', () => {
       revocation as never,
     );
 
-    // 首次登出：真撤销，返回归属供审计
+    // 首次登出：真撤销，返回归属+会话 id 供审计
     await expect(service.revoke('token-x')).resolves.toEqual({
       userId: 'admin-1',
       audience: 'ADMIN',
+      sessionId: 'session-1',
     });
     // 重放：行早已撤销 —— 不返回归属，调用方不得再记一条成功审计
     await expect(service.revoke('token-x')).resolves.toBeNull();
     expect(revocation.revokeSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('revoke() ignores expired-but-never-revoked tokens (no phantom logout audit)', async () => {
+    const config = { get: () => undefined } as unknown as ConfigService;
+    const revocation = { revokeSession: jest.fn(), revokeUser: jest.fn() };
+    const prisma = {
+      refreshToken: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'session-old',
+          userId: 'admin-1',
+          audience: 'ADMIN',
+        }),
+        // where 带 expiredAt > now：过期行匹配 0 条
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    };
+    const service = new RefreshTokenService(
+      prisma as never,
+      config,
+      revocation as never,
+    );
+
+    await expect(service.revoke('expired-token')).resolves.toBeNull();
+    expect(revocation.revokeSession).not.toHaveBeenCalled();
+    // 撤销条件必须显式排除过期行
+    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          expiredAt: { gt: expect.any(Date) },
+        }),
+      }),
+    );
   });
 });

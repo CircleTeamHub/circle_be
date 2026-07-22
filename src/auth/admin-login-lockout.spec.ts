@@ -152,6 +152,50 @@ describe('admin login lockout (#83)', () => {
     expect(lockedWrites.length).toBeGreaterThan(0);
   });
 
+  it('locks the admin after 5 wrong passwords on the REGULAR /auth/login route (round 2 P1)', async () => {
+    argon2.verify.mockResolvedValue(false);
+    const { service, counter, updateManyCalls } = buildService(adminUser());
+
+    for (let i = 0; i < 5; i += 1) {
+      await service
+        .login({ email: 'admin@example.com', password: 'nope' })
+        .catch(() => undefined);
+    }
+
+    // 与 adminLogin 共用同一原子计数：第 5 次触发条件上锁
+    expect(counter.attempts).toBe(0); // 上锁时清零
+    const lockedWrites = updateManyCalls.filter(
+      (c) => c.data.adminLoginLockedUntil instanceof Date,
+    );
+    expect(lockedWrites.length).toBeGreaterThan(0);
+  });
+
+  it('rejects a locked admin on /auth/login without running argon2 (round 2 P1)', async () => {
+    const { service } = buildService(
+      adminUser({
+        adminLoginLockedUntil: new Date(Date.now() + 10 * 60_000),
+      }),
+    );
+
+    await expect(
+      service.login({ email: 'admin@example.com', password: 'right' }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(argon2.verify).not.toHaveBeenCalled();
+  });
+
+  it('does NOT touch lockout counters for regular USER logins (round 2)', async () => {
+    argon2.verify.mockResolvedValue(false);
+    const { service, updates } = buildService(adminUser({ role: 'USER' }));
+
+    await expect(
+      service.login({ email: 'admin@example.com', password: 'nope' }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(updates.filter((u) => 'adminLoginAttempts' in u.data)).toHaveLength(
+      0,
+    );
+  });
+
   it('rejects while locked WITHOUT running the password check', async () => {
     const { service } = buildService(
       adminUser({

@@ -22,8 +22,13 @@ export function shouldSkipPrismaConnectOnBoot(
 
 // TTL 旋钮的可解析格式（与 refresh-token.service parseRefreshTtlMs / jwt 的
 // ms 子集对齐）。放宽大小写与首尾空白由 trim 处理，这里只钉结构。
-const refreshTtlPattern = /^\d+\s*[dhm]?$/i;
-const jwtTtlPattern = /^\d+\s*(ms|s|m|h|d)?$/i;
+// review 修复（round 2）：必须为正 —— '0h' 这类值下游解析按无效回落默认，
+// 运维显式配 0 却拿到 12h/1h 是静默放大，必须 fail boot。
+const refreshTtlPattern = /^0*[1-9]\d*\s*[dhm]?$/i;
+const jwtTtlPattern = /^0*[1-9]\d*\s*(ms|s|m|h|d)?$/i;
+// review 修复（round 2）：admin refresh TTL 强制带单位 —— 裸数字按旧语义是
+// 「天」，运维想写 12 小时漏了 h 会静默变 12 天，直接顶穿短会话窗口设计。
+const adminRefreshTtlPattern = /^0*[1-9]\d*\s*[dhm]$/i;
 
 export function createEnvValidationSchema(
   env: EnvLike = process.env,
@@ -90,13 +95,15 @@ export function createEnvValidationSchema(
     // 旧名（纯天数）仅作兼容回落，同样 fail-boot 校验。
     REFRESH_EXPIRES_IN_DAYS: Joi.alternatives(
       Joi.number().positive(),
-      Joi.string().pattern(refreshTtlPattern, {
-        name: 'duration like 14 / 14d',
+      Joi.string().pattern(/^0*[1-9]\d*\s*d?$/i, {
+        name: 'positive day count like 14 / 14d',
       }),
     ),
     // #91：管理台会话独立 TTL（上限被 REFRESH_EXPIRES_IN 钳制，绝不长于用户）。
     ADMIN_REFRESH_EXPIRES_IN: Joi.string()
-      .pattern(refreshTtlPattern, { name: 'duration like 12h / 45m' })
+      .pattern(adminRefreshTtlPattern, {
+        name: 'duration with an explicit unit, like 12h / 45m',
+      })
       .default('12h'),
     ADMIN_JWT_EXPIRES_IN: Joi.string()
       .pattern(jwtTtlPattern, { name: 'duration like 15m / 900s' })
