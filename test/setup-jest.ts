@@ -1,12 +1,12 @@
-import { AppFactory } from './app.factory';
 import { INestApplication } from '@nestjs/common';
 import * as pactum from 'pactum';
 import { clearE2eApp, setE2eApp } from './e2e-context';
 
-let appFactory: AppFactory;
+let appFactory: import('./app.factory').AppFactory;
 let app: INestApplication;
 
 global.beforeEach(async () => {
+  const { AppFactory } = await import('./app.factory');
   appFactory = await AppFactory.init();
   await appFactory.initDB();
   app = appFactory.instance;

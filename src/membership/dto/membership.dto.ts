@@ -28,8 +28,6 @@ export class MembershipQuotasDto {
   @ApiProperty({ type: MembershipQuotaValueDto })
   joinedCircles: MembershipQuotaValueDto;
   @ApiProperty({ type: MembershipQuotaValueDto })
-  createdCircles: MembershipQuotaValueDto;
-  @ApiProperty({ type: MembershipQuotaValueDto })
   notes: MembershipQuotaValueDto;
   @ApiProperty({ type: MembershipQuotaValueDto })
   cityFilters: MembershipQuotaValueDto;
@@ -41,7 +39,6 @@ export class MembershipAppearanceDto {
 }
 
 export class MembershipBenefitsDto {
-  @ApiProperty() premiumCircle: boolean;
   @ApiProperty({ enum: ['standard', 'premium'], nullable: true })
   fancyNumberVoucher: 'standard' | 'premium' | null;
 }

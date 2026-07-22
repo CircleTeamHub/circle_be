@@ -5,11 +5,7 @@ export type MembershipTierKey =
   | 'gold'
   | 'diamond'
   | 'super';
-export type MembershipQuotaDisplay =
-  | `${number}`
-  | 'cannot-create'
-  | '999+'
-  | 'unlimited';
+export type MembershipQuotaDisplay = `${number}` | '999+' | 'unlimited';
 export type MembershipNameColor =
   | 'default'
   | 'silver'
@@ -34,7 +30,6 @@ export interface MembershipTier {
   quotas: {
     groupMembers: MembershipQuotaValue;
     joinedCircles: MembershipQuotaValue;
-    createdCircles: MembershipQuotaValue;
     notes: MembershipQuotaValue;
     cityFilters: MembershipQuotaValue;
   };
@@ -43,7 +38,6 @@ export interface MembershipTier {
     badge: MembershipBadge | null;
   };
   benefits: {
-    premiumCircle: boolean;
     fancyNumberVoucher: FancyNumberVoucher | null;
   };
 }
@@ -57,14 +51,13 @@ export const MEMBERSHIP_CATALOG = [
     priceCny: null,
     recommended: false,
     quotas: {
-      groupMembers: { actual: 0, display: 'cannot-create' },
+      groupMembers: { actual: 100, display: '100' },
       joinedCircles: { actual: 100, display: '100' },
-      createdCircles: { actual: 0, display: '0' },
       notes: { actual: 50, display: '50' },
       cityFilters: { actual: 1, display: '1' },
     },
     appearance: { nameColor: 'default', badge: null },
-    benefits: { premiumCircle: false, fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null },
   },
   {
     level: 1,
@@ -76,12 +69,11 @@ export const MEMBERSHIP_CATALOG = [
     quotas: {
       groupMembers: { actual: 300, display: '300' },
       joinedCircles: { actual: 200, display: '200' },
-      createdCircles: { actual: 20, display: '20' },
       notes: { actual: 100, display: '100' },
       cityFilters: { actual: 5, display: '5' },
     },
     appearance: { nameColor: 'silver', badge: 'silver' },
-    benefits: { premiumCircle: true, fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null },
   },
   {
     level: 2,
@@ -93,12 +85,11 @@ export const MEMBERSHIP_CATALOG = [
     quotas: {
       groupMembers: { actual: 500, display: '500' },
       joinedCircles: { actual: 500, display: '500' },
-      createdCircles: { actual: 100, display: '100' },
       notes: { actual: 500, display: '500' },
       cityFilters: { actual: 20, display: '20' },
     },
     appearance: { nameColor: 'gold', badge: 'gold' },
-    benefits: { premiumCircle: true, fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null },
   },
   {
     level: 3,
@@ -110,12 +101,11 @@ export const MEMBERSHIP_CATALOG = [
     quotas: {
       groupMembers: { actual: 1000, display: '1000' },
       joinedCircles: { actual: 1000, display: '999+' },
-      createdCircles: { actual: 300, display: '300' },
       notes: { actual: 1000, display: '999+' },
       cityFilters: { actual: 50, display: '50' },
     },
     appearance: { nameColor: 'rainbow', badge: 'diamond' },
-    benefits: { premiumCircle: true, fancyNumberVoucher: 'standard' },
+    benefits: { fancyNumberVoucher: 'standard' },
   },
   {
     level: 4,
@@ -127,12 +117,11 @@ export const MEMBERSHIP_CATALOG = [
     quotas: {
       groupMembers: { actual: 3000, display: '3000' },
       joinedCircles: { actual: 5000, display: 'unlimited' },
-      createdCircles: { actual: 3000, display: 'unlimited' },
       notes: { actual: 10000, display: 'unlimited' },
       cityFilters: { actual: 1000, display: 'unlimited' },
     },
     appearance: { nameColor: 'exclusive-shimmer', badge: 'super-lifetime' },
-    benefits: { premiumCircle: true, fancyNumberVoucher: 'premium' },
+    benefits: { fancyNumberVoucher: 'premium' },
   },
 ] as const satisfies readonly MembershipTier[];
 

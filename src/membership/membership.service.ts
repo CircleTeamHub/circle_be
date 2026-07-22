@@ -18,7 +18,6 @@ function mapQuotas(tier: MembershipTier): MembershipQuotasDto {
   return {
     groupMembers: { ...tier.quotas.groupMembers },
     joinedCircles: { ...tier.quotas.joinedCircles },
-    createdCircles: { ...tier.quotas.createdCircles },
     notes: { ...tier.quotas.notes },
     cityFilters: { ...tier.quotas.cityFilters },
   };

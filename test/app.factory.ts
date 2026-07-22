@@ -45,6 +45,10 @@ export class AppFactory {
   // Clear all test data in dependency order
   async initDB() {
     assertSafeE2eDatabase();
+    await this.prisma.notificationPushOutbox.deleteMany();
+    await this.prisma.notification.deleteMany();
+    await this.prisma.membershipBenefitGrant.deleteMany();
+    await this.prisma.membershipGrant.deleteMany();
     await this.prisma.refreshToken.deleteMany();
     await this.prisma.user.deleteMany();
   }

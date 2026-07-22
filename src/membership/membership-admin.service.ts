@@ -34,6 +34,11 @@ type ReplayableGrant = Prisma.MembershipGrantGetPayload<{
   include: typeof GRANT_REPLAY_INCLUDE;
 }>;
 
+type BenefitGrantReader = Pick<
+  Prisma.TransactionClient,
+  'membershipBenefitGrant'
+>;
+
 type CanonicalGrantInput = {
   targetLevel: MembershipLevel;
   idempotencyKey: string;
@@ -75,7 +80,8 @@ export class MembershipAdminService {
           if (replay) {
             return {
               created: false,
-              response: this.replayOrThrow(
+              response: await this.replayOrThrow(
+                tx,
                 replay,
                 operatorUserId,
                 targetUserId,
@@ -105,12 +111,7 @@ export class MembershipAdminService {
             target,
             transactionNow,
           );
-          const belowExpiredStoredLevel =
-            previous.level === 0 &&
-            target.vipLevel >= 1 &&
-            target.vipLevel <= 3 &&
-            input.targetLevel < target.vipLevel;
-          if (input.targetLevel <= previous.level || belowExpiredStoredLevel) {
+          if (input.targetLevel <= previous.level) {
             throw new ConflictException({
               message: 'Target membership level must be higher',
               errorCode: MembershipErrorCode.LevelNotHigher,
@@ -189,7 +190,8 @@ export class MembershipAdminService {
       }
       transactionResult = {
         created: false,
-        response: this.replayOrThrow(
+        response: await this.replayOrThrow(
+          this.prisma,
           replay,
           operatorUserId,
           targetUserId,
@@ -252,12 +254,13 @@ export class MembershipAdminService {
     return null;
   }
 
-  private replayOrThrow(
+  private async replayOrThrow(
+    client: BenefitGrantReader,
     grant: ReplayableGrant,
     operatorUserId: string,
     targetUserId: string,
     input: CanonicalGrantInput,
-  ): MembershipAdminGrantResponseDto {
+  ): Promise<MembershipAdminGrantResponseDto> {
     if (
       grant.operatorUserID !== operatorUserId ||
       grant.targetUserID !== targetUserId ||
@@ -277,12 +280,20 @@ export class MembershipAdminService {
       },
       grant.createdAt,
     ).level;
-    return this.toResponse(
-      grant,
-      true,
-      previousEffectiveLevel,
-      grant.benefitGrants.map((benefit) => benefit.type),
-    );
+    const benefitGrants = await client.membershipBenefitGrant.findMany({
+      where: {
+        userID: grant.targetUserID,
+        OR: [
+          { createdAt: { lte: grant.createdAt } },
+          { membershipGrantID: grant.id },
+        ],
+      },
+      select: { type: true },
+    });
+    const benefitTypes = [
+      ...new Set(benefitGrants.map((benefit) => benefit.type)),
+    ];
+    return this.toResponse(grant, true, previousEffectiveLevel, benefitTypes);
   }
 
   private toResponse(

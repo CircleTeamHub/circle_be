@@ -30,12 +30,11 @@ describe('MembershipService', () => {
         quotas: {
           groupMembers: { actual: 300, display: '300' },
           joinedCircles: { actual: 200, display: '200' },
-          createdCircles: { actual: 20, display: '20' },
           notes: { actual: 100, display: '100' },
           cityFilters: { actual: 5, display: '5' },
         },
         appearance: { nameColor: 'silver', badge: 'silver' },
-        benefits: { premiumCircle: true, fancyNumberVoucher: null },
+        benefits: { fancyNumberVoucher: null },
       },
       {
         level: 2,
@@ -47,12 +46,11 @@ describe('MembershipService', () => {
         quotas: {
           groupMembers: { actual: 500, display: '500' },
           joinedCircles: { actual: 500, display: '500' },
-          createdCircles: { actual: 100, display: '100' },
           notes: { actual: 500, display: '500' },
           cityFilters: { actual: 20, display: '20' },
         },
         appearance: { nameColor: 'gold', badge: 'gold' },
-        benefits: { premiumCircle: true, fancyNumberVoucher: null },
+        benefits: { fancyNumberVoucher: null },
       },
       {
         level: 3,
@@ -64,12 +62,11 @@ describe('MembershipService', () => {
         quotas: {
           groupMembers: { actual: 1000, display: '1000' },
           joinedCircles: { actual: 1000, display: '999+' },
-          createdCircles: { actual: 300, display: '300' },
           notes: { actual: 1000, display: '999+' },
           cityFilters: { actual: 50, display: '50' },
         },
         appearance: { nameColor: 'rainbow', badge: 'diamond' },
-        benefits: { premiumCircle: true, fancyNumberVoucher: 'standard' },
+        benefits: { fancyNumberVoucher: 'standard' },
       },
       {
         level: 4,
@@ -81,7 +78,6 @@ describe('MembershipService', () => {
         quotas: {
           groupMembers: { actual: 3000, display: '3000' },
           joinedCircles: { actual: 5000, display: 'unlimited' },
-          createdCircles: { actual: 3000, display: 'unlimited' },
           notes: { actual: 10000, display: 'unlimited' },
           cityFilters: { actual: 1000, display: 'unlimited' },
         },
@@ -89,7 +85,7 @@ describe('MembershipService', () => {
           nameColor: 'exclusive-shimmer',
           badge: 'super-lifetime',
         },
-        benefits: { premiumCircle: true, fancyNumberVoucher: 'premium' },
+        benefits: { fancyNumberVoucher: 'premium' },
       },
     ]);
 
@@ -120,7 +116,7 @@ describe('MembershipService', () => {
       active: true,
       quotas: { joinedCircles: { actual: 1000, display: '999+' } },
       appearance: { nameColor: 'rainbow', badge: 'diamond' },
-      benefits: { premiumCircle: true, fancyNumberVoucher: 'standard' },
+      benefits: { fancyNumberVoucher: 'standard' },
       benefitGrants: {
         standardFancyNumber: { available: false, issued: true },
         premiumFancyNumber: { available: false, issued: false },
@@ -149,7 +145,7 @@ describe('MembershipService', () => {
       lifetime: false,
       active: false,
       quotas: {
-        groupMembers: { actual: 0, display: 'cannot-create' },
+        groupMembers: { actual: 100, display: '100' },
       },
     });
     expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
