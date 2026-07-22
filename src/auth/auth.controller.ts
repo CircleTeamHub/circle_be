@@ -194,8 +194,8 @@ export class AuthController {
   @ApiOperation({ summary: 'Logout and revoke a refresh token' })
   @ApiBody({ type: RefreshTokenDto })
   @ApiOkResponse({ description: 'Logout successful' })
-  logout(@Body() dto: RefreshTokenDto) {
-    return this.authService.logout(dto.refreshToken);
+  logout(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
+    return this.authService.logout(dto.refreshToken, getSessionContext(req));
   }
 
   @Get('sessions')
