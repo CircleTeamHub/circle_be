@@ -1,21 +1,26 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { NoteErrorCode } from 'src/common/app-error-codes';
+import { MembershipErrorCode, NoteErrorCode } from 'src/common/app-error-codes';
 import { randomBytes, randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { UploadService } from 'src/upload/upload.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
-import { prismaErrorCode } from 'src/utils/prisma-tx';
+import {
+  prismaErrorCode,
+  runSerializableTransaction,
+} from 'src/utils/prisma-tx';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
@@ -350,9 +355,47 @@ export class NoteService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly membershipPolicy: MembershipPolicyService,
     @Optional() private readonly uploadService?: UploadService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  /**
+   * Active storage is one owned, non-deleted Note row. Group memberships do
+   * not add slots, and DELETED rows release capacity because the API has no
+   * restore path (all writable-note lookups exclude DELETED).
+   */
+  private async assertNoteStorageAvailable(
+    tx: Prisma.TransactionClient,
+    ownerID: string,
+  ): Promise<void> {
+    const membership = await tx.user.findUnique({
+      where: { id: ownerID },
+      select: { vipLevel: true, vipExpiresAt: true },
+    });
+    if (!membership) {
+      throw new NotFoundException({
+        message: 'User not found',
+        errorCode: MembershipErrorCode.UserNotFound,
+      });
+    }
+
+    const current = await tx.note.count({
+      where: { ownerID, status: { not: 'DELETED' } },
+    });
+    const limit =
+      this.membershipPolicy.resolve(membership).tier.quotas.notes.actual;
+    if (current >= limit) {
+      throw new ForbiddenException({
+        message: 'Note storage quota reached',
+        errorCode: NoteErrorCode.StorageQuotaReached,
+        quota: 'notes',
+        limit,
+        current,
+        details: { quota: 'notes', limit, current },
+      });
+    }
   }
 
   private async requireOwnedGroups(ownerID: string, groupIds: string[]) {
@@ -1419,58 +1462,64 @@ export class NoteService {
       media.find((item) => item.type === 'IMAGE')?.id ?? null;
     const counts = this.buildMediaStats(media);
 
-    const created = await this.prisma.$transaction(async (tx) => {
-      const note = await tx.note.create({
-        data: {
-          ownerID,
-          title: derived.title,
-          content: derived.content,
-          contentJson: toPrismaJson(derived.contentJson),
-          sections: toPrismaJson(derived.sections),
-          groupID: null,
-          status: input.status ?? 'ACTIVE',
-          available: true,
-          pinned: input.pinned ?? false,
-          ...counts,
-        },
-      });
+    const created = await runSerializableTransaction(
+      this.prisma,
+      async (tx) => {
+        await this.membershipPolicy.lockUsers(tx, [ownerID]);
+        await this.assertNoteStorageAvailable(tx, ownerID);
 
-      if (media.length > 0) {
-        await tx.noteMedia.createMany({
-          data: media.map((item) => ({
-            id: item.id,
-            noteID: note.id,
-            type: item.type,
-            objectKey: item.objectKey,
-            url: item.url,
-            mimeType: item.mimeType ?? null,
-            size: item.size ?? null,
-            width: item.width ?? null,
-            height: item.height ?? null,
-            durationMs: item.durationMs ?? null,
-            posterUrl: item.posterUrl ?? null,
-            sortOrder: item.sortOrder,
-          })),
+        const note = await tx.note.create({
+          data: {
+            ownerID,
+            title: derived.title,
+            content: derived.content,
+            contentJson: toPrismaJson(derived.contentJson),
+            sections: toPrismaJson(derived.sections),
+            groupID: null,
+            status: input.status ?? 'ACTIVE',
+            available: true,
+            pinned: input.pinned ?? false,
+            ...counts,
+          },
         });
-      }
 
-      if (uniqueGroupIds.length > 0) {
-        await tx.noteGroupMembership.createMany({
-          data: uniqueGroupIds.map((groupID) => ({
-            noteID: note.id,
-            groupID,
-          })),
+        if (media.length > 0) {
+          await tx.noteMedia.createMany({
+            data: media.map((item) => ({
+              id: item.id,
+              noteID: note.id,
+              type: item.type,
+              objectKey: item.objectKey,
+              url: item.url,
+              mimeType: item.mimeType ?? null,
+              size: item.size ?? null,
+              width: item.width ?? null,
+              height: item.height ?? null,
+              durationMs: item.durationMs ?? null,
+              posterUrl: item.posterUrl ?? null,
+              sortOrder: item.sortOrder,
+            })),
+          });
+        }
+
+        if (uniqueGroupIds.length > 0) {
+          await tx.noteGroupMembership.createMany({
+            data: uniqueGroupIds.map((groupID) => ({
+              noteID: note.id,
+              groupID,
+            })),
+          });
+        }
+
+        return tx.note.update({
+          where: { id: note.id },
+          data: {
+            coverMediaID,
+          },
+          include: NOTE_INCLUDE,
         });
-      }
-
-      return tx.note.update({
-        where: { id: note.id },
-        data: {
-          coverMediaID,
-        },
-        include: NOTE_INCLUDE,
-      });
-    });
+      },
+    );
 
     return this.mapDetailResolved(created, ownerID);
   }
@@ -1866,11 +1915,12 @@ export class NoteService {
   }
 
   private async refreshCollectedNote(
+    tx: Prisma.TransactionClient,
     userID: string,
     sourceNoteID: string,
     collectedFrom: Record<string, unknown>,
-  ): Promise<CollectNoteResultDto | null> {
-    const existing = await this.prisma.note.findFirst({
+  ): Promise<NoteRow | null> {
+    const existing = await tx.note.findFirst({
       where: {
         ownerID: userID,
         collectedFromNoteID: sourceNoteID,
@@ -1880,7 +1930,7 @@ export class NoteService {
     });
     if (!existing) return null;
 
-    const refreshed = await this.prisma.note.update({
+    return tx.note.update({
       where: {
         id: existing.id,
         ownerID: userID,
@@ -1889,10 +1939,6 @@ export class NoteService {
       data: { collectedFrom: toPrismaJson(collectedFrom) },
       include: NOTE_INCLUDE,
     });
-    return {
-      note: await this.mapDetailResolved(refreshed, userID),
-      alreadyCollected: true,
-    };
   }
 
   /**
@@ -1934,13 +1980,6 @@ export class NoteService {
 
     const collectedFrom = this.buildCollectedFrom(dto.source, source);
 
-    const refreshedExisting = await this.refreshCollectedNote(
-      userID,
-      dto.noteId,
-      collectedFrom,
-    );
-    if (refreshedExisting) return refreshedExisting;
-
     const media = (source.media ?? []).map((item) => ({
       id: randomUUID(),
       sourceMediaID: item.id,
@@ -1968,54 +2007,84 @@ export class NoteService {
     );
 
     try {
-      const created = await this.prisma.$transaction(async (tx) => {
-        const note = await tx.note.create({
-          data: {
-            ownerID: userID,
-            title: source.title,
-            content: source.content,
-            contentJson: toPrismaJson(source.contentJson),
-            sections: toPrismaJson(copiedSections),
-            groupID: null,
-            status: 'ACTIVE',
-            available: true,
-            pinned: false,
-            imageCount: source.imageCount,
-            videoCount: source.videoCount,
-            mediaCount: source.mediaCount,
-            collectedFrom: toPrismaJson(collectedFrom),
-            collectedFromNoteID: source.id,
-          },
-        });
+      const result = await runSerializableTransaction(
+        this.prisma,
+        async (tx) => {
+          await this.membershipPolicy.lockUsers(tx, [userID]);
 
-        if (media.length > 0) {
-          await tx.noteMedia.createMany({
-            data: media.map(({ sourceMediaID: _sourceMediaID, ...item }) => ({
-              ...item,
-              noteID: note.id,
-            })),
+          const refreshed = await this.refreshCollectedNote(
+            tx,
+            userID,
+            dto.noteId,
+            collectedFrom,
+          );
+          if (refreshed) {
+            return { note: refreshed, alreadyCollected: true };
+          }
+
+          await this.assertNoteStorageAvailable(tx, userID);
+
+          const note = await tx.note.create({
+            data: {
+              ownerID: userID,
+              title: source.title,
+              content: source.content,
+              contentJson: toPrismaJson(source.contentJson),
+              sections: toPrismaJson(copiedSections),
+              groupID: null,
+              status: 'ACTIVE',
+              available: true,
+              pinned: false,
+              imageCount: source.imageCount,
+              videoCount: source.videoCount,
+              mediaCount: source.mediaCount,
+              collectedFrom: toPrismaJson(collectedFrom),
+              collectedFromNoteID: source.id,
+            },
           });
-        }
 
-        return tx.note.update({
-          where: { id: note.id },
-          data: { coverMediaID },
-          include: NOTE_INCLUDE,
-        });
-      });
+          if (media.length > 0) {
+            await tx.noteMedia.createMany({
+              data: media.map(({ sourceMediaID: _sourceMediaID, ...item }) => ({
+                ...item,
+                noteID: note.id,
+              })),
+            });
+          }
+
+          const created = await tx.note.update({
+            where: { id: note.id },
+            data: { coverMediaID },
+            include: NOTE_INCLUDE,
+          });
+          return { note: created, alreadyCollected: false };
+        },
+      );
 
       return {
-        note: await this.mapDetailResolved(created, userID),
-        alreadyCollected: false,
+        note: await this.mapDetailResolved(result.note, userID),
+        alreadyCollected: result.alreadyCollected,
       };
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {
-        const refreshed = await this.refreshCollectedNote(
-          userID,
-          dto.noteId,
-          collectedFrom,
+        const refreshed = await runSerializableTransaction(
+          this.prisma,
+          async (tx) => {
+            await this.membershipPolicy.lockUsers(tx, [userID]);
+            return this.refreshCollectedNote(
+              tx,
+              userID,
+              dto.noteId,
+              collectedFrom,
+            );
+          },
         );
-        if (refreshed) return refreshed;
+        if (refreshed) {
+          return {
+            note: await this.mapDetailResolved(refreshed, userID),
+            alreadyCollected: true,
+          };
+        }
       }
       throw error;
     }

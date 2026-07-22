@@ -177,6 +177,7 @@ export const FriendErrorCode = {
 // 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。
 // 上限类原文含数字,前端用固定文案。
 export const NoteErrorCode = {
+  StorageQuotaReached: 'NOTE_STORAGE_QUOTA_REACHED',
   GroupExists: 'NOTE_GROUP_EXISTS',
   GroupLimit: 'NOTE_GROUP_LIMIT',
   ExportNoMedia: 'NOTE_EXPORT_NO_MEDIA',
