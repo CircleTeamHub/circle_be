@@ -16,6 +16,7 @@ import { ConsoleMailer } from './mailer/console.mailer';
 import { UnconfiguredMailer } from './mailer/unconfigured.mailer';
 import { SmtpMailer } from './mailer/smtp.mailer';
 import { OpenimModule } from 'src/openim/openim.module';
+import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
 
 @Global()
 @Module({
@@ -69,6 +70,7 @@ import { OpenimModule } from 'src/openim/openim.module';
     },
     JwtStrategy,
     CaslAbilityService,
+    ImTokenThrottlerGuard,
   ],
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when

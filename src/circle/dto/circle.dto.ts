@@ -10,6 +10,7 @@ import {
   IsOptional,
   IsString,
   IsUrl,
+  IsUUID,
   Max,
   MaxLength,
   Min,
@@ -142,6 +143,19 @@ export class MyCirclesQueryDto {
   @IsString()
   @IsIn(MY_CIRCLE_TABS)
   tab: 'joined' | 'created' | 'applied';
+
+  @ApiPropertyOptional({ description: 'Last circle id from the previous page' })
+  @IsOptional()
+  @IsUUID()
+  cursor?: string;
+
+  @ApiPropertyOptional({ default: 50, maximum: 100 })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit?: number;
 }
 
 export class SetCircleCoverDto {

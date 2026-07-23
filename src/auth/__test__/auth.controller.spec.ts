@@ -6,6 +6,7 @@ import { RegisterDto } from '../dto/register.dto';
 import { LoginDto } from '../dto/login.dto';
 import { RefreshTokenDto } from '../dto/refresh-token.dto';
 import { SetLoginSecurityCodeDto } from '../dto/login-security-code.dto';
+import { ImTokenThrottlerGuard } from '../im-token-throttler.guard';
 
 describe('AuthController', () => {
   let controller: AuthController;
@@ -104,7 +105,10 @@ describe('AuthController', () => {
       // options present even though this spec calls handlers directly.
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: mockAuthService }],
+      providers: [
+        { provide: AuthService, useValue: mockAuthService },
+        ImTokenThrottlerGuard,
+      ],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);

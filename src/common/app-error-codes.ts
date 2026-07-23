@@ -62,6 +62,7 @@ export const CircleErrorCode = {
   JoinFancyNumberRequired: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED',
   ListItemBlank: 'CIRCLE_LIST_ITEM_BLANK',
   ListItemDuplicate: 'CIRCLE_LIST_ITEM_DUPLICATE',
+  InvalidCursor: 'CIRCLE_INVALID_CURSOR',
 } as const;
 
 export const GroupErrorCode = {
@@ -189,6 +190,7 @@ export const NoteErrorCode = {
   // - 主人侧吊销：链接不存在 / 不属于当前用户，同样共用一个码，不泄漏 id 是否存在。
   // 客户端应按「链接已失效」提示，不要复用笔记的「笔记不存在」文案。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
+  ShareLinkInvalidCursor: 'NOTE_SHARE_LINK_INVALID_CURSOR',
   // #94：每用户活跃分享链接达到上限。
   ShareLinkLimit: 'NOTE_SHARE_LINK_LIMIT',
 } as const;

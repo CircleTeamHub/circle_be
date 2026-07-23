@@ -148,9 +148,10 @@ Run these on the server, from the repo root, **after** the app stack is up.
    bash monitoring/sync-metrics-token.sh
    ```
 
-   This writes the gitignored `monitoring/prometheus/metrics_token`. Prometheus
-   runs as uid `65534`, so if the script tells you to, run the `chown` it prints —
-   a file it cannot read produces a `401`, i.e. the same symptom as a wrong token.
+   This atomically replaces the gitignored
+   `monitoring/prometheus/metrics_token` as uid `65534` with mode `0600`.
+   Passwordless sudo for `install` and `mv` (or running the script as root) is
+   required so repeated rotations never try to overwrite a Prometheus-owned file.
 
 3. **Set the Grafana password** (see the first-boot caveat above):
 
@@ -185,7 +186,7 @@ Re-run step 2 and reload, or every scrape 401s:
 ```bash
 bash monitoring/sync-metrics-token.sh
 docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
-  restart prometheus
+  up -d --force-recreate prometheus
 ```
 
 ### How the blue-green target works

@@ -382,17 +382,18 @@ export class NoteShareLinkDto {
  * 之后，较老但仍然有效的链接就再也看不到、也就吊销不了。
  */
 export class ListNoteShareLinksQueryDto {
-  @ApiPropertyOptional({ default: 1 })
+  @ApiPropertyOptional({
+    description: 'Last share-link id from the previous page',
+  })
   @IsOptional()
-  @IsInt()
-  @Min(1)
-  page?: number;
+  @IsUUID()
+  cursor?: string;
 
-  @ApiPropertyOptional({ default: 50 })
+  @ApiPropertyOptional({ default: 50, maximum: 100 })
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(200)
+  @Max(100)
   limit?: number;
 }
 

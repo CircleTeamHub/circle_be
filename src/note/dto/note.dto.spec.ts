@@ -283,11 +283,14 @@ describe('ListNoteShareLinksQueryDto', () => {
       enableImplicitConversion: true,
     });
 
-  it('accepts a numeric page and limit from query string values', () => {
-    const dto = parse({ page: '2', limit: '20' });
+  it('accepts a UUID cursor and numeric limit from query string values', () => {
+    const dto = parse({
+      cursor: '11111111-1111-4111-8111-111111111111',
+      limit: '20',
+    });
 
     expect(validateSync(dto)).toHaveLength(0);
-    expect(dto.page).toBe(2);
+    expect(dto.cursor).toBe('11111111-1111-4111-8111-111111111111');
     expect(dto.limit).toBe(20);
   });
 
@@ -295,25 +298,20 @@ describe('ListNoteShareLinksQueryDto', () => {
     const dto = parse({});
 
     expect(validateSync(dto)).toHaveLength(0);
-    expect(dto.page).toBeUndefined();
+    expect(dto.cursor).toBeUndefined();
     expect(dto.limit).toBeUndefined();
   });
 
   it('rejects a limit above the per-page cap', () => {
-    // 没有 @Max 的话，limit=100000 会让一个请求把整张表拉出来。
-    const errors = validateSync(parse({ limit: '100000' }));
+    const errors = validateSync(parse({ limit: '101' }));
 
     expect(errors.some((error) => error.property === 'limit')).toBe(true);
   });
 
-  it('rejects a zero or negative page', () => {
-    // page=0 会让 skip 算成负数，Prisma 会直接报错。
-    expect(
-      validateSync(parse({ page: '0' })).some((e) => e.property === 'page'),
-    ).toBe(true);
-    expect(
-      validateSync(parse({ page: '-1' })).some((e) => e.property === 'page'),
-    ).toBe(true);
+  it('rejects a malformed cursor', () => {
+    const errors = validateSync(parse({ cursor: 'not-a-uuid' }));
+
+    expect(errors.some((error) => error.property === 'cursor')).toBe(true);
   });
 
   it('rejects a non-integer limit', () => {
