@@ -79,7 +79,9 @@ export class TempChatService {
     // round 3 review：/mine 有 200 条护栏 —— 不设创建上限的话，第 201 间
     // 活跃房间建得出来却列不出来（拿不到 id 去结束它），只能等 TTL。上限
     // 与护栏对齐；count+create 用 per-host advisory 锁串行化防并发越界。
-    // 锁内只做 count（便宜）；OpenIM 建群仍在锁外（外呼不进锁）。
+    // 先做一次便宜的锁内预检，避免已满时白建 OpenIM 群。真正落库前必须在
+    // 同一把锁里再次 count 并 create；否则两个 199→200 的并发请求会一起
+    // 通过预检、释放锁，最后落成 201 个活跃房间。
     const quotaLockKey = `temp-chat:${hostUserId}`;
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
@@ -97,8 +99,19 @@ export class TempChatService {
     // 先建群；落库失败要回滚群，避免 OpenIM 留孤儿群。
     await this.openim.createGroup(groupId, title, hostUserId, [hostUserId]);
     try {
-      const row = await this.prisma.tempChat.create({
-        data: { groupId, hostUserId, title, maxMembers, expiresAt },
+      const row = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+        const active = await tx.tempChat.count({
+          where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
+        });
+        if (active >= MAX_ACTIVE_ROOMS_PER_HOST) {
+          throw new BadRequestException(
+            `活跃临时聊天数量已达上限（${MAX_ACTIVE_ROOMS_PER_HOST}），请先结束不再使用的房间`,
+          );
+        }
+        return tx.tempChat.create({
+          data: { groupId, hostUserId, title, maxMembers, expiresAt },
+        });
       });
       const seconds = Math.max(
         1,

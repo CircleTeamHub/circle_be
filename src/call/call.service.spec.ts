@@ -692,7 +692,7 @@ describe('CallService', () => {
   });
 
   it('broadcasts when an invited participant rejects', async () => {
-    prisma.callParticipant.findUnique.mockResolvedValue({
+    const invited = {
       callID: 'call-1',
       userID: 'user-2',
       status: 'INVITED',
@@ -702,8 +702,8 @@ describe('CallService', () => {
         participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
-    });
-    prisma.callParticipant.update.mockResolvedValue({
+    };
+    const rejected = {
       userID: 'user-2',
       status: 'REJECTED',
       invitedAt: now,
@@ -712,7 +712,11 @@ describe('CallService', () => {
       rejectedAt: now,
       missedAt: null,
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
-    });
+    };
+    prisma.callParticipant.findUnique
+      .mockResolvedValueOnce(invited)
+      .mockResolvedValue(rejected);
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.count.mockResolvedValue(1);
 
     await service.rejectCall('user-2', 'call-1');
@@ -773,7 +777,7 @@ describe('CallService', () => {
   });
 
   it('marks a ringing call missed when the last invitee rejects', async () => {
-    prisma.callParticipant.findUnique.mockResolvedValue({
+    const invited = {
       callID: 'call-1',
       userID: 'user-2',
       status: 'INVITED',
@@ -784,8 +788,8 @@ describe('CallService', () => {
         participants: [{ userID: 'user-1' }, { userID: 'user-2' }],
       },
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
-    });
-    prisma.callParticipant.update.mockResolvedValue({
+    };
+    const rejected = {
       userID: 'user-2',
       status: 'REJECTED',
       invitedAt: now,
@@ -794,7 +798,11 @@ describe('CallService', () => {
       rejectedAt: now,
       missedAt: null,
       user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
-    });
+    };
+    prisma.callParticipant.findUnique
+      .mockResolvedValueOnce(invited)
+      .mockResolvedValue(rejected);
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.count.mockResolvedValue(0);
     prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.callSession.findUnique.mockResolvedValue({

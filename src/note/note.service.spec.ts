@@ -3273,4 +3273,24 @@ describe('NoteService', () => {
       expect(prisma.note.create).not.toHaveBeenCalled();
     });
   });
+
+  it('maps a concurrent restore unique collision to NOTE_RESTORE_DUPLICATE', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        id: 'deleted-copy',
+        collectedFromNoteID: 'source-note',
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.updateMany.mockRejectedValueOnce(
+      Object.assign(new Error('unique constraint'), { code: 'P2002' }),
+    );
+
+    await expect(
+      service.restoreNote('user-1', 'deleted-copy'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'NOTE_RESTORE_DUPLICATE',
+      }),
+    });
+  });
 });

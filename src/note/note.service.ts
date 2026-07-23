@@ -2413,10 +2413,21 @@ export class NoteService {
         });
       }
     }
-    const result = await this.prisma.note.updateMany({
-      where: { id: noteId, ownerID, status: 'DELETED' },
-      data: { status: 'ACTIVE' },
-    });
+    let result: { count: number };
+    try {
+      result = await this.prisma.note.updateMany({
+        where: { id: noteId, ownerID, status: 'DELETED' },
+        data: { status: 'ACTIVE' },
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+      throw error;
+    }
     if (result.count === 0) {
       throw new NotFoundException({
         message: 'Note not found',

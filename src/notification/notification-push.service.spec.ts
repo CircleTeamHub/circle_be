@@ -10,6 +10,8 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     },
     notificationPushDelivery: {
       findMany: jest.fn(),
+      count: jest.fn(),
+      groupBy: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
     },
@@ -37,6 +39,9 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       config as any,
     );
     global.fetch = fetchMock as any;
+    // reconcileCompletedOutboxes 默认无 outbox 需终结（两次分组聚合都空）。
+    // 具体用例用 mockResolvedValueOnce 覆盖。
+    prisma.notificationPushDelivery.groupBy.mockResolvedValue([]);
   });
 
   const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
@@ -223,6 +228,76 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
         where: { id: 'o3', status: 'COMPLETED' },
         data: { status: 'PENDING', nextAttemptAt: now },
+      });
+    });
+
+    it('marks a completed outbox terminal after its last receipt settles with an exhausted failure', async () => {
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+      ]);
+      // 分组聚合：无 SENT 待回执、有耗尽的 FAILED → 该 outbox 可终结。
+      prisma.notificationPushDelivery.groupBy
+        .mockResolvedValueOnce([]) // still-awaiting (SENT)
+        .mockResolvedValueOnce([{ outboxID: 'o1' }]); // exhausted FAILED
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: { t1: { status: 'ok' } } }),
+      });
+
+      await service.pollReceipts(now);
+
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['o1'] }, status: 'COMPLETED' },
+        data: {
+          status: 'TERMINAL',
+          lastError: 'delivery-attempts-exhausted',
+        },
+      });
+    });
+
+    it('reconciles a full batch of distinct outboxes with two grouped queries and one batched update (review P2)', async () => {
+      // 回执分散在三个不同 outbox 上 —— 旧实现会为每个 outbox 开一个事务 +
+      // 两次 count。断言现在只做两次分组聚合 + 一条批量 updateMany。
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        { id: 'd2', ticketID: 't2', token: 'tok-b', outboxID: 'o2', sentAt },
+        { id: 'd3', ticketID: 't3', token: 'tok-c', outboxID: 'o3', sentAt },
+      ]);
+      prisma.notificationPushDelivery.groupBy
+        // still-awaiting (SENT)：o2 还有未回执的 SENT
+        .mockResolvedValueOnce([{ outboxID: 'o2' }])
+        // exhausted FAILED：o1/o2/o3 都有耗尽失败
+        .mockResolvedValueOnce([
+          { outboxID: 'o1' },
+          { outboxID: 'o2' },
+          { outboxID: 'o3' },
+        ]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'ok' },
+            t2: { status: 'ok' },
+            t3: { status: 'ok' },
+          },
+        }),
+      });
+
+      await service.pollReceipts(now);
+
+      // 恰好两次分组聚合，不随 outbox 数量线性增长
+      expect(prisma.notificationPushDelivery.groupBy).toHaveBeenCalledTimes(2);
+      // 一条 updateMany 批量终结 o1/o3；o2 仍有 SENT 被排除
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledTimes(1);
+      const call = prisma.notificationPushOutbox.updateMany.mock.calls[0][0];
+      expect(call.where.status).toBe('COMPLETED');
+      expect([...call.where.id.in].sort((a, b) => a.localeCompare(b))).toEqual([
+        'o1',
+        'o3',
+      ]);
+      expect(call.data).toEqual({
+        status: 'TERMINAL',
+        lastError: 'delivery-attempts-exhausted',
       });
     });
 

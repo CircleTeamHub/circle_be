@@ -513,14 +513,40 @@ export class CallService {
       });
     }
     const rejectedAt = new Date();
-    const updatedParticipant = await this.prisma.callParticipant.update({
-      where: { callID_userID: { callID: callId, userID } },
+    const claim = await this.prisma.callParticipant.updateMany({
+      where: {
+        callID: callId,
+        userID,
+        status: CallParticipantStatus.INVITED,
+      },
       data: {
         status: CallParticipantStatus.REJECTED,
         rejectedAt,
       },
+    });
+    if (claim.count === 0) {
+      const current = await this.prisma.callParticipant.findUnique({
+        where: { callID_userID: { callID: callId, userID } },
+        include: { user: { select: userLiteSelect } },
+      });
+      if (current?.status === CallParticipantStatus.REJECTED) {
+        return current;
+      }
+      throw new ConflictException({
+        message: 'CALL_NOT_INVITED',
+        errorCode: CallErrorCode.NotInvited,
+      });
+    }
+    const updatedParticipant = await this.prisma.callParticipant.findUnique({
+      where: { callID_userID: { callID: callId, userID } },
       include: { user: { select: userLiteSelect } },
     });
+    if (!updatedParticipant) {
+      throw new ConflictException({
+        message: 'CALL_NOT_INVITED',
+        errorCode: CallErrorCode.NotInvited,
+      });
+    }
     await this.broadcastToCallParticipants(
       participant.call as CallWithParticipants,
       (targetID) =>
