@@ -20,8 +20,7 @@ SET "familyId" = "id"
 WHERE "familyId" IS NULL;
 
 ALTER TABLE "RefreshToken"
-ALTER COLUMN "familyId" SET NOT NULL,
-ALTER COLUMN "familyId" SET DEFAULT gen_random_uuid()::text;
+ALTER COLUMN "familyId" SET NOT NULL;
 
 CREATE INDEX "RefreshToken_userId_familyId_idx"
 ON "RefreshToken"("userId", "familyId");

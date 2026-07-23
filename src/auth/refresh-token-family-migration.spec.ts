@@ -18,9 +18,7 @@ describe('refresh-token family migration', () => {
     );
     expect(sql).toMatch(/SET "familyId" = "id"\s+WHERE "familyId" IS NULL/i);
     expect(sql).toContain('ALTER COLUMN "familyId" SET NOT NULL');
-    expect(sql).toContain(
-      'ALTER COLUMN "familyId" SET DEFAULT gen_random_uuid()::text',
-    );
+    expect(sql).not.toContain('ALTER COLUMN "familyId" SET DEFAULT');
     expect(sql).not.toMatch(/SET\s+"revocationReason"\s*=/i);
     expect(sql).toContain('RefreshToken_userId_familyId_idx');
     expect(sql).toContain('RefreshToken_userId_audience_createdAt_idx');
