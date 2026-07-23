@@ -53,13 +53,21 @@ run_sync() {
     bash "$script"
 }
 
+read_token_file() {
+  if [ "$(id -u)" = "0" ] || [ "$using_fake_sudo" = "1" ]; then
+    cat "$1"
+  else
+    sudo -n cat "$1"
+  fi
+}
+
 printf '%s\n' 'METRICS_AUTH_TOKEN=first-token' > "$env_file"
 run_sync
 
 printf '%s\n' 'METRICS_AUTH_TOKEN=second-token' > "$env_file"
 run_sync
 
-test "$(cat "$token_file")" = 'second-token'
+test "$(read_token_file "$token_file")" = 'second-token'
 if [ "$using_fake_sudo" = "1" ]; then
   grep -F "install -m 600 -o $expected_uid -g $expected_gid" "$sudo_log" >/dev/null
   grep -F 'mv -f' "$sudo_log" >/dev/null
@@ -76,6 +84,7 @@ fi
 least_bin="$tmp_dir/least-privilege-bin"
 least_sudo_log="$tmp_dir/least-privilege-sudo.log"
 least_token_file="$tmp_dir/least-privilege-token"
+real_sudo="$(command -v sudo || :)"
 mkdir -p "$least_bin"
 cat > "$least_bin/id" <<'SH'
 #!/usr/bin/env bash
@@ -92,7 +101,12 @@ if [ "${1:-}" = '-n' ]; then
 fi
 printf '%s\n' "$*" >> "$LEAST_SUDO_LOG"
 case "${1:-}" in
-  install | mv) exec "$@" ;;
+  install | mv)
+    if [ -n "${REAL_SUDO:-}" ] && [ "$(/usr/bin/id -u)" != "0" ]; then
+      exec "$REAL_SUDO" -n "$@"
+    fi
+    exec "$@"
+    ;;
   *) exit 1 ;;
 esac
 SH
@@ -101,6 +115,7 @@ chmod +x "$least_bin/id" "$least_bin/sudo"
 printf '%s\n' 'METRICS_AUTH_TOKEN=least-privilege-token' > "$env_file"
 PATH="$least_bin:$PATH" \
   LEAST_SUDO_LOG="$least_sudo_log" \
+  REAL_SUDO="$real_sudo" \
   ENV_FILE="$env_file" \
   TOKEN_FILE="$least_token_file" \
   PROM_UID="$prom_uid" \
@@ -108,7 +123,7 @@ PATH="$least_bin:$PATH" \
   SUDO="$least_bin/sudo" \
   bash "$script" >/dev/null
 
-test "$(cat "$least_token_file")" = 'least-privilege-token'
+test "$(read_token_file "$least_token_file")" = 'least-privilege-token'
 grep -F 'install -m 600' "$least_sudo_log" >/dev/null
 grep -F 'mv -f' "$least_sudo_log" >/dev/null
 if grep -F 'true' "$least_sudo_log" >/dev/null; then
