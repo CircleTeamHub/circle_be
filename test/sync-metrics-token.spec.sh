@@ -69,6 +69,53 @@ else
   test "$(stat -c '%g' "$token_file")" = "$expected_gid"
 fi
 
+# A production sudoers policy may authorize only the two commands the sync
+# needs. Simulate that policy even when this suite itself runs as root: the fake
+# id keeps the script on its non-root path, while fake sudo rejects `true` and
+# permits only install/mv.
+least_bin="$tmp_dir/least-privilege-bin"
+least_sudo_log="$tmp_dir/least-privilege-sudo.log"
+least_token_file="$tmp_dir/least-privilege-token"
+mkdir -p "$least_bin"
+cat > "$least_bin/id" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -u) printf '%s\n' 1000 ;;
+  -un) printf '%s\n' deploy ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+SH
+cat > "$least_bin/sudo" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = '-n' ]; then
+  shift
+fi
+printf '%s\n' "$*" >> "$LEAST_SUDO_LOG"
+case "${1:-}" in
+  install | mv) exec "$@" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$least_bin/id" "$least_bin/sudo"
+
+printf '%s\n' 'METRICS_AUTH_TOKEN=least-privilege-token' > "$env_file"
+PATH="$least_bin:$PATH" \
+  LEAST_SUDO_LOG="$least_sudo_log" \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$least_token_file" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  SUDO="$least_bin/sudo" \
+  bash "$script" >/dev/null
+
+test "$(cat "$least_token_file")" = 'least-privilege-token'
+grep -F 'install -m 600' "$least_sudo_log" >/dev/null
+grep -F 'mv -f' "$least_sudo_log" >/dev/null
+if grep -F 'true' "$least_sudo_log" >/dev/null; then
+  echo 'sync must not require sudo permission for true' >&2
+  exit 1
+fi
+
 # stat is GNU on CI and BSD on a dev Mac; both spellings are needed because the
 # unprivileged path below is exactly the one a developer runs locally.
 file_mode() {
@@ -91,7 +138,7 @@ elif [ "$using_fake_sudo" != "1" ] && sudo -n true 2>/dev/null; then
   sudo -n install -m 600 -o 1 -g 1 /dev/null "$foreign_file" 2>/dev/null || :
 fi
 
-if [ -e "$foreign_file" ] && [ ! -O "$foreign_file" ]; then
+if [ "$(id -u)" != "0" ] && [ -e "$foreign_file" ] && [ ! -O "$foreign_file" ]; then
   printf '%s\n' 'METRICS_AUTH_TOKEN=must-not-replace' > "$env_file"
   if ENV_FILE="$env_file" \
     TOKEN_FILE="$foreign_file" \
@@ -117,7 +164,10 @@ local_out="$(ENV_FILE="$env_file" \
   bash "$script")"
 
 test "$(cat "$local_file")" = 'local-dev-token'
-test "$(file_mode "$local_file")" = '600'
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) ;;
+  *) test "$(file_mode "$local_file")" = '600' ;;
+esac
 printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
 
 # Rotation still has to work on the following run — the file is ours now, which

@@ -72,8 +72,11 @@ cleanup() {
   if [ -e "$staged_file" ]; then
     if [ "$(id -u)" = "0" ]; then
       rm -f "$staged_file"
-    elif command -v "$SUDO" >/dev/null 2>&1 && "$SUDO" -n true 2>/dev/null; then
-      "$SUDO" -n rm -f "$staged_file"
+    elif command -v "$SUDO" >/dev/null 2>&1; then
+      # Reuse the documented mv permission to hand the staged inode back to the
+      # caller for cleanup; do not require an unrelated sudo true/rm grant.
+      "$SUDO" -n mv -f "$staged_file" "$temp_file" 2>/dev/null || :
+      rm -f "$temp_file"
     fi
   fi
 }
@@ -90,9 +93,9 @@ unprivileged=0
 if [ "$(id -u)" = "0" ]; then
   install -m 600 -o "$PROM_UID" -g "$PROM_GID" "$temp_file" "$staged_file"
   mv -f "$staged_file" "$TOKEN_FILE"
-elif command -v "$SUDO" >/dev/null 2>&1 && "$SUDO" -n true 2>/dev/null; then
+elif command -v "$SUDO" >/dev/null 2>&1 &&
   "$SUDO" -n install -m 600 -o "$PROM_UID" -g "$PROM_GID" \
-    "$temp_file" "$staged_file"
+    "$temp_file" "$staged_file"; then
   "$SUDO" -n mv -f "$staged_file" "$TOKEN_FILE"
 elif [ -e "$TOKEN_FILE" ] && [ ! -O "$TOKEN_FILE" ]; then
   # On a deployed host the first sync ran as root, so the token belongs to
