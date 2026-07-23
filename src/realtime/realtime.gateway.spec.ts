@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'http';
+import { EventEmitter } from 'events';
 import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -57,6 +58,11 @@ function createRedisBus(enabled = true) {
     }),
     getJson: jest.fn(async (key: string) =>
       enabled ? (store.get(key) ?? null) : null,
+    ),
+    getJsonMany: jest.fn(async (keys: string[]) =>
+      enabled
+        ? keys.map((key) => store.get(key) ?? null)
+        : keys.map(() => null),
     ),
     getJsonWithVersion: jest.fn().mockResolvedValue(null),
     setJsonIfNewer: jest.fn().mockResolvedValue(true),
@@ -420,6 +426,95 @@ describe('RealtimeGateway session revocation', () => {
       });
       await tick();
       expect(realtime.getConnectionCount('user-expiring')).toBe(0);
+    });
+
+    it('does not deliver private events while the final revocation check is pending', async () => {
+      let releaseFinalCheck = (_revoked: boolean) => {};
+      let callCount = 0;
+      const finalCheckStarted = new Promise<void>((resolve) => {
+        jest.spyOn(revocation, 'isRevoked').mockImplementation(async () => {
+          callCount += 1;
+          if (callCount === 1) return false;
+          resolve();
+          return new Promise<boolean>((release) => {
+            releaseFinalCheck = release;
+          });
+        });
+      });
+
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', () => resolve());
+        socket.once('error', reject);
+      });
+      const received: unknown[] = [];
+      socket.on('message', (data) => {
+        received.push(JSON.parse(data.toString('utf8')));
+      });
+      const closed = waitForClose(socket);
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          token: signToken({
+            sub: 'user-pending',
+            sid: 'session-pending',
+            issuedAtMs: Date.now() - 5_000,
+          }),
+        }),
+      );
+
+      await finalCheckStarted;
+      expect(realtime.getConnectionCount('user-pending')).toBe(1);
+      realtime.broadcastWalletBalanceChanged('user-pending');
+      await tick();
+      expect(received).toEqual([]);
+
+      releaseFinalCheck(true);
+      await expect(closed).resolves.toEqual({
+        code: 1008,
+        reason: 'Session revoked',
+      });
+    });
+
+    it('keeps the authentication deadline active until admission completes', async () => {
+      jest.useFakeTimers();
+      try {
+        jest
+          .spyOn(revocation, 'isRevoked')
+          .mockImplementation(() => new Promise<boolean>(() => {}));
+        const socket = new EventEmitter() as EventEmitter & {
+          close: jest.Mock;
+          readyState: number;
+          ping: jest.Mock;
+        };
+        socket.close = jest.fn();
+        socket.readyState = WebSocket.OPEN;
+        socket.ping = jest.fn();
+
+        const pendingAdmission = (gateway as any).handleConnection(socket);
+        expect(pendingAdmission).toBeInstanceOf(Promise);
+        socket.emit(
+          'message',
+          Buffer.from(
+            JSON.stringify({
+              type: 'auth',
+              token: signToken({
+                sub: 'user-stalled',
+                sid: 'session-stalled',
+                issuedAtMs: Date.now(),
+              }),
+            }),
+          ),
+        );
+        await Promise.resolve();
+
+        jest.advanceTimersByTime(10_000);
+
+        expect(socket.close).toHaveBeenCalledWith(1008, 'Auth timeout');
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('keeps a session established after the revoke stamp (re-login race)', async () => {

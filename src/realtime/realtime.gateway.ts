@@ -107,8 +107,6 @@ export class RealtimeGateway implements OnModuleDestroy {
     }, AUTH_TIMEOUT_MS);
 
     socket.once('message', (data: RawData) => {
-      clearTimeout(authTimeout);
-
       const auth = this.parseAuthMessage(data);
       if (!auth) {
         socket.close(1008, 'Invalid auth message');
@@ -121,7 +119,7 @@ export class RealtimeGateway implements OnModuleDestroy {
         return;
       }
 
-      void this.acceptAuthenticatedSocket(socket, verified);
+      void this.acceptAuthenticatedSocket(socket, verified, authTimeout);
     });
 
     socket.on('error', (error) => {
@@ -136,8 +134,26 @@ export class RealtimeGateway implements OnModuleDestroy {
   private async acceptAuthenticatedSocket(
     socket: WebSocket,
     verified: VerifiedToken,
+    authTimeout: ReturnType<typeof setTimeout>,
   ) {
     const { userId, expMs, identity } = verified;
+
+    this.userBySocket.set(socket, userId);
+    // Install teardown before any await or registration. A client can disappear
+    // during either marker lookup; cleanup must cover both pending and active
+    // state so no connection slot is stranded.
+    socket.on('close', () => {
+      clearTimeout(authTimeout);
+      const timer = this.expiryTimers.get(socket);
+      if (timer) {
+        clearTimeout(timer);
+        this.expiryTimers.delete(socket);
+      }
+      const currentUserId = this.userBySocket.get(socket);
+      if (currentUserId) {
+        this.realtimeService.unregisterClient(currentUserId, socket);
+      }
+    });
 
     // Same check the HTTP strategy runs (F-02), so a banned or logged-out token
     // cannot open a new stream. Fail-open exactly like HTTP: with Redis off this
@@ -162,23 +178,7 @@ export class RealtimeGateway implements OnModuleDestroy {
       return;
     }
 
-    this.userBySocket.set(socket, userId);
-    this.realtimeService.registerClient(userId, socket, identity);
-
-    // Attach teardown before any later branch can close or await. In particular,
-    // a token may expire while the revocation lookup is in flight; closing it
-    // before this listener exists would strand the socket in the client map.
-    socket.on('close', () => {
-      const timer = this.expiryTimers.get(socket);
-      if (timer) {
-        clearTimeout(timer);
-        this.expiryTimers.delete(socket);
-      }
-      const currentUserId = this.userBySocket.get(socket);
-      if (currentUserId) {
-        this.realtimeService.unregisterClient(currentUserId, socket);
-      }
-    });
+    this.realtimeService.registerPendingClient(userId, socket, identity);
 
     socket.on('error', (error) => {
       this.logger.warn(`Realtime socket error for ${userId}: ${error.message}`);
@@ -196,7 +196,11 @@ export class RealtimeGateway implements OnModuleDestroy {
       this.expiryTimers.set(socket, timer);
     }
 
-    // Close the check/register gap. If a revocation was published after the
+    // Close the check/register gap. Pending registration lets revocation
+    // broadcasts find and close the socket while keeping it out of business
+    // event delivery until this final marker check succeeds.
+    //
+    // If a revocation was published after the
     // first Redis GET observed "not revoked" but before this socket entered the
     // local map, that broadcast could not find it. Once registered, check the
     // marker again: earlier revocations are caught here, later ones find the
@@ -209,6 +213,11 @@ export class RealtimeGateway implements OnModuleDestroy {
     if (socket.readyState !== WebSocket.OPEN) {
       return;
     }
+
+    if (!this.realtimeService.promotePendingClient(userId, socket)) {
+      return;
+    }
+    clearTimeout(authTimeout);
 
     try {
       await this.realtimeService.emitSnapshot(userId);
