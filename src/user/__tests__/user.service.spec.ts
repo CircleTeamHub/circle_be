@@ -82,6 +82,31 @@ describe('UserService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('getVipLevels', () => {
+    it('maps existing user ids to their vipLevel and dedupes the query', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'a', vipLevel: 3 },
+        { id: 'b', vipLevel: 0 },
+      ]);
+
+      const result = await service.getVipLevels(['a', 'b', 'a', 'missing']);
+
+      // Missing ids are simply absent (client defaults them to 0); query is deduped.
+      expect(result).toEqual({ a: 3, b: 0 });
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['a', 'b', 'missing'] } },
+        select: { id: true, vipLevel: true },
+      });
+    });
+
+    it('short-circuits on empty input without hitting the database', async () => {
+      const result = await service.getVipLevels([]);
+
+      expect(result).toEqual({});
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+    });
+  });
+
   it('creates an independent canonical invite code with an explicit account ID', async () => {
     prisma.user.create.mockResolvedValue({ id: 'user-1' });
 

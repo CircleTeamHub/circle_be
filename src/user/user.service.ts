@@ -155,6 +155,22 @@ export class UserService {
   }
 
   /**
+   * 批量取 userId → vipLevel（前端渲染会员名字特效用）。vipLevel 是公开展示属性，
+   * 任意登录用户可查；不存在的 id 不会出现在结果里，前端按缺省 0 处理。
+   */
+  async getVipLevels(ids: string[]): Promise<Record<string, number>> {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0) {
+      return {};
+    }
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: uniqueIds } },
+      select: { id: true, vipLevel: true },
+    });
+    return Object.fromEntries(users.map((user) => [user.id, user.vipLevel]));
+  }
+
+  /**
    * Rejects URL fields that don't originate from our own storage.
    * Prevents SSRF-capable URLs (cloud metadata, localhost, javascript:, data:)
    * being stored and later rendered by clients.

@@ -25,6 +25,7 @@ import { UserService } from './user.service';
 import { GetUserDto } from './dto/get-user.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { VipLevelsDto } from './dto/vip-levels.dto';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -79,6 +80,15 @@ export class UserController {
       password: dto.password,
       nickname: dto.nickname,
     });
+  }
+
+  @Post('vip-levels')
+  @ApiOperation({
+    summary: 'Batch lookup vipLevel by user ids (for name-effect rendering)',
+  })
+  @ApiOkResponse({ description: 'Map of userId to vipLevel' })
+  getVipLevels(@Body() dto: VipLevelsDto): Promise<Record<string, number>> {
+    return this.userService.getVipLevels(dto.ids);
   }
 
   @Get('/:id')
