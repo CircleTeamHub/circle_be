@@ -188,6 +188,7 @@ describe('RedisService', () => {
     await expect(service.setJsonIfNewer('k', { a: 1 }, 5, 10)).resolves.toBe(
       false,
     );
+    await expect(service.setNumericMax('k', 5, 10)).resolves.toBe(false);
     await expect(service.getJsonWithVersion('k')).resolves.toBeNull();
     await expect(service.getVersion('k:version')).resolves.toBeNull();
     await expect(
@@ -221,6 +222,25 @@ describe('RedisService', () => {
       expect.stringContaining('"__ver":5'),
       '5',
       '10',
+    );
+  });
+
+  it('atomically preserves the greatest numeric revocation marker', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = { eval: jest.fn().mockResolvedValue(1) };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+    await expect(
+      service.setNumericMax('authrev:u:user-1', 200, 3600),
+    ).resolves.toBe(true);
+
+    expect(client.eval).toHaveBeenCalledWith(
+      expect.stringContaining('current >= incoming'),
+      1,
+      'authrev:u:user-1',
+      '200',
+      '3600',
     );
   });
 

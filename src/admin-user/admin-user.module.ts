@@ -4,10 +4,15 @@ import { RealtimeModule } from 'src/realtime/realtime.module';
 import { AdminUserAuditService } from './admin-user-audit.service';
 import { AdminUserController } from './admin-user.controller';
 import { AdminUserService } from './admin-user.service';
+import { SessionRevocationOutboxProcessor } from './session-revocation-outbox.processor';
 
 @Module({
   imports: [AuthModule, RealtimeModule],
   controllers: [AdminUserController],
-  providers: [AdminUserService, AdminUserAuditService],
+  providers: [
+    AdminUserService,
+    AdminUserAuditService,
+    SessionRevocationOutboxProcessor,
+  ],
 })
 export class AdminUserModule {}

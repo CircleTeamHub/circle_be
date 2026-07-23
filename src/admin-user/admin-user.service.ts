@@ -359,10 +359,26 @@ export class AdminUserService {
         });
       }
 
-      if (dto.status !== UserStatus.ACTIVE) {
+      const revokedAt =
+        dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
+      if (revokedAt) {
+        const expiresAt = this.sessionRevocation.revocationExpiresAt(
+          revokedAt.getTime(),
+        );
         await tx.refreshToken.updateMany({
           where: { userId: targetId, revokedAt: null },
-          data: { revokedAt: new Date() },
+          data: { revokedAt },
+        });
+        await tx.sessionRevocationOutbox.upsert({
+          where: { userID: targetId },
+          create: { userID: targetId, revokedAt, expiresAt },
+          update: {
+            revokedAt,
+            expiresAt,
+            attempts: 0,
+            lastError: null,
+            nextAttemptAt: revokedAt,
+          },
         });
       }
 
@@ -388,14 +404,13 @@ export class AdminUserService {
         accountId: current.accountId,
         status: dto.status,
         previousStatus: current.status,
+        revokedAt,
       };
     });
 
-    if (dto.status !== UserStatus.ACTIVE) {
-      await this.runPostCommitHook('revoke user sessions', () =>
-        this.sessionRevocation.revokeUser(targetId),
-      );
-    }
+    const sessionRevocationPending = result.revokedAt
+      ? !(await this.completeSessionRevocation(targetId, result.revokedAt))
+      : false;
     await this.runPostCommitHook('invalidate profile summary cache', () =>
       this.realtime.invalidateUserProfileSummaryCache(targetId),
     );
@@ -417,6 +432,7 @@ export class AdminUserService {
         oldStatus: result.previousStatus,
         newStatus: dto.status,
         reason,
+        sessionRevocationPending,
       },
     });
 
@@ -424,7 +440,40 @@ export class AdminUserService {
       id: result.id,
       accountId: result.accountId,
       status: result.status,
+      sessionRevocationPending,
     };
+  }
+
+  private async completeSessionRevocation(
+    userId: string,
+    revokedAt: Date,
+  ): Promise<boolean> {
+    try {
+      const completed = await this.sessionRevocation.revokeUserAt(
+        userId,
+        revokedAt.getTime(),
+      );
+      if (!completed) {
+        this.logger.warn('Admin user session revocation remains pending');
+        return false;
+      }
+    } catch (error) {
+      this.logger.warn(
+        `Admin user status committed but failed to revoke user sessions: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
+
+    await this.runPostCommitHook(
+      'remove completed session revocation outbox',
+      () =>
+        this.prisma.sessionRevocationOutbox.deleteMany({
+          where: { userID: userId, revokedAt },
+        }),
+    );
+    return true;
   }
 
   private async runPostCommitHook(
