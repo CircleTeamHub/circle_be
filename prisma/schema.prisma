@@ -20,6 +20,16 @@ enum RefreshTokenAudience {
   ADMIN
 }
 
+enum RefreshTokenRevocationReason {
+  ROTATED
+  SINGLE_DEVICE_REPLACED
+  LOGOUT
+  LOGOUT_ALL
+  SESSION_REVOKED
+  OTHER_SESSIONS_REVOKED
+  TOKEN_FAMILY_REUSE
+}
+
 enum EmailCodePurpose {
   REGISTER
   LOGIN
@@ -394,20 +404,24 @@ model UserProfileSyncOutbox {
 }
 
 model RefreshToken {
-  id         String               @id @default(uuid())
-  userId     String
-  token      String               @unique
-  audience   RefreshTokenAudience @default(APP)
-  deviceName String?
-  ip         String?
-  userAgent  String?
-  expiredAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime             @default(now())
-  lastUsedAt DateTime             @default(now())
-  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id               String                        @id @default(uuid())
+  userId           String
+  token            String                        @unique
+  familyId         String                        @default(uuid())
+  audience         RefreshTokenAudience          @default(APP)
+  deviceName       String?
+  ip               String?
+  userAgent        String?
+  expiredAt        DateTime
+  revokedAt        DateTime?
+  revocationReason RefreshTokenRevocationReason?
+  createdAt        DateTime                      @default(now())
+  lastUsedAt       DateTime                      @default(now())
+  user             User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([userId, familyId])
+  @@index([userId, audience, createdAt])
 }
 
 // ─── Social ───────────────────────────────────────────────────────────────────
@@ -1540,4 +1554,3 @@ model UserLike {
   // its fromUserID prefix also serves any fromUserID-only lookup.
   @@index([fromUserID, likedOn])
 }
-

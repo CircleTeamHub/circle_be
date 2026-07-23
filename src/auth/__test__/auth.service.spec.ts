@@ -62,6 +62,9 @@ describe('AuthService', () => {
     create: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    createAppSession: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
     rotate: jest.fn(() =>
       Promise.resolve({
         token: 'new-refresh-token',
@@ -77,6 +80,7 @@ describe('AuthService', () => {
     replaceForSingleDevice: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    setSingleDeviceLogin: jest.fn(() => Promise.resolve()),
     assertSessionActive: jest.fn(() => Promise.resolve()),
   };
 
@@ -445,14 +449,13 @@ describe('AuthService', () => {
       },
     );
 
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
       'uuid-1',
       {
         deviceName: 'MacBook Pro',
         ip: '127.0.0.1',
         userAgent: 'PostmanRuntime',
       },
-      'APP',
     );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -481,10 +484,9 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(mockRefreshTokenService.replaceForSingleDevice).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
       'uuid-1',
       undefined,
-      'APP',
     );
     expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
@@ -598,12 +600,9 @@ describe('AuthService', () => {
 
     await service.setSingleDeviceLogin('uuid-1', true, 'session-1');
 
-    expect(mockPrisma.user.update).toHaveBeenCalledWith({
-      where: { id: 'uuid-1' },
-      data: { singleDeviceLoginEnabled: true },
-    });
-    expect(mockRefreshTokenService.revokeOtherSessions).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.setSingleDeviceLogin).toHaveBeenCalledWith(
       'uuid-1',
+      true,
       'session-1',
     );
   });

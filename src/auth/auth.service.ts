@@ -439,7 +439,6 @@ export class AuthService {
       {
         audience: 'ADMIN',
         issueImToken: false,
-        revokeExistingSessions: user.singleDeviceLoginEnabled,
       },
     );
 
@@ -539,7 +538,6 @@ export class AuthService {
       user.role,
       sessionContext,
       platform,
-      { revokeExistingSessions: user.singleDeviceLoginEnabled },
     );
 
     logBusinessEvent(this.logger, {
@@ -742,17 +740,11 @@ export class AuthService {
       });
     }
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { singleDeviceLoginEnabled: enabled },
-    });
-
-    if (enabled) {
-      await this.refreshTokenService.revokeOtherSessions(
-        userId,
-        currentSessionId,
-      );
-    }
+    await this.refreshTokenService.setSingleDeviceLogin(
+      userId,
+      enabled,
+      currentSessionId,
+    );
   }
 
   async me(userId: string): Promise<SafeUser> {
@@ -1224,20 +1216,16 @@ export class AuthService {
     sessionContext?: SessionContext,
     platformID?: 1 | 2 | 5,
     options?: {
-      revokeExistingSessions?: boolean;
       audience?: RefreshTokenAudience;
       issueImToken?: boolean;
     },
   ) {
     const audience = options?.audience ?? 'APP';
     const issueImToken = options?.issueImToken ?? true;
-    const createSession = options?.revokeExistingSessions
-      ? this.refreshTokenService.replaceForSingleDevice(
-          userId,
-          sessionContext,
-          audience,
-        )
-      : this.refreshTokenService.create(userId, sessionContext, audience);
+    const createSession =
+      audience === 'APP'
+        ? this.refreshTokenService.createAppSession(userId, sessionContext)
+        : this.refreshTokenService.create(userId, sessionContext, audience);
 
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
       createSession,

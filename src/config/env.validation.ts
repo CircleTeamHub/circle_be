@@ -228,15 +228,9 @@ export function createEnvValidationSchema(
     .custom((value, helpers) => {
       const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);
       const refreshTtl = parseRefreshDurationMilliseconds(
-        value.REFRESH_EXPIRES_IN ??
-          value.REFRESH_EXPIRES_IN_DAYS ??
-          '7d',
+        value.REFRESH_EXPIRES_IN ?? value.REFRESH_EXPIRES_IN_DAYS ?? '7d',
       );
-      if (
-        accessTtl !== null &&
-        refreshTtl !== null &&
-        accessTtl > refreshTtl
-      ) {
+      if (accessTtl !== null && refreshTtl !== null && accessTtl > refreshTtl) {
         return helpers.message({
           custom: 'JWT_EXPIRES_IN must not exceed REFRESH_EXPIRES_IN',
         });

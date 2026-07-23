@@ -1,9 +1,12 @@
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, randomBytes } from 'crypto';
-import { Prisma } from 'src/generated/prisma';
+import { createHash, randomBytes, randomUUID } from 'crypto';
+import { Prisma, RefreshTokenRevocationReason } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { SessionRevocationService } from './session-revocation.service';
+import {
+  accessTokenTtlSeconds,
+  SessionRevocationService,
+} from './session-revocation.service';
 
 const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
 // 管理台会话故意比用户短一个量级（#91 目标区间 8-24h）：一枚被偷的 admin
@@ -12,6 +15,7 @@ const DEFAULT_ADMIN_REFRESH_TTL = '12h';
 const MAX_DEVICE_NAME_LENGTH = 64;
 const MAX_USER_AGENT_LENGTH = 256;
 const MAX_IP_LENGTH = 64;
+const REVOCATION_BATCH_SIZE = 25;
 
 const MS_PER_MINUTE = 60_000;
 const MS_PER_HOUR = 3_600_000;
@@ -81,6 +85,7 @@ export class RefreshTokenService {
   private readonly logger = new Logger(RefreshTokenService.name);
   private readonly ttlMs: number;
   private readonly adminTtlMs: number;
+  private readonly accessTtlMs: number;
 
   constructor(
     private prisma: PrismaService,
@@ -122,6 +127,10 @@ export class RefreshTokenService {
       adminConfigured ?? parseRefreshTtlMs(DEFAULT_ADMIN_REFRESH_TTL)!,
       this.ttlMs,
     );
+    this.accessTtlMs =
+      accessTokenTtlSeconds(
+        this.config.get<string | number>('JWT_EXPIRES_IN') ?? '1h',
+      ) * 1000;
   }
 
   /** 各 audience 的会话 TTL（毫秒）。导出仅为测试可见性。 */
@@ -142,6 +151,7 @@ export class RefreshTokenService {
     userId: string,
     context?: SessionContext,
     audience: RefreshTokenAudience = 'APP',
+    familyId: string = randomUUID(),
   ): Promise<{ token: string; sessionId: string }> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
@@ -152,6 +162,7 @@ export class RefreshTokenService {
       data: {
         userId,
         token: tokenHash,
+        familyId,
         expiredAt,
         deviceName: safe.deviceName,
         ip: safe.ip,
@@ -164,6 +175,71 @@ export class RefreshTokenService {
     return { token: rawToken, sessionId: session.id };
   }
 
+  private async revokeAccessSessions(sessionIds: string[]): Promise<void> {
+    for (
+      let offset = 0;
+      offset < sessionIds.length;
+      offset += REVOCATION_BATCH_SIZE
+    ) {
+      const batch = sessionIds.slice(offset, offset + REVOCATION_BATCH_SIZE);
+      await Promise.all(
+        batch.map((sessionId) => this.revocation.revokeSession(sessionId)),
+      );
+    }
+  }
+
+  private async replaceForSingleDeviceWithClient(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
+  ) {
+    const now = new Date();
+    const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
+    const revocableSessions = await tx.refreshToken.findMany({
+      where: { userId, audience, createdAt: { gt: accessCutoff } },
+      select: { id: true },
+    });
+    await tx.refreshToken.updateMany({
+      where: { userId, audience, revokedAt: null },
+      data: {
+        revokedAt: now,
+        revocationReason: RefreshTokenRevocationReason.SINGLE_DEVICE_REPLACED,
+      },
+    });
+    const session = await this.createWithClient(tx, userId, context, audience);
+    return {
+      session,
+      revokedSessionIds: revocableSessions.map(({ id }) => id),
+    };
+  }
+
+  async createAppSession(
+    userId: string,
+    context?: SessionContext,
+  ): Promise<{ token: string; sessionId: string }> {
+    const result = await this.prisma.$transaction(async (tx) => {
+      const lockKey = `auth-user:${userId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { singleDeviceLoginEnabled: true },
+      });
+      if (!user) {
+        throw new UnauthorizedException('Invalid or inactive account');
+      }
+      if (user.singleDeviceLoginEnabled) {
+        return this.replaceForSingleDeviceWithClient(tx, userId, context);
+      }
+      return {
+        session: await this.createWithClient(tx, userId, context, 'APP'),
+        revokedSessionIds: [],
+      };
+    });
+    await this.revokeAccessSessions(result.revokedSessionIds);
+    return result.session;
+  }
+
   async replaceForSingleDevice(
     userId: string,
     context?: SessionContext,
@@ -172,31 +248,57 @@ export class RefreshTokenService {
     const replacement = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
-      const revocableSessions = await tx.refreshToken.findMany({
-        where: { userId, expiredAt: { gt: new Date() } },
-        select: { id: true },
-      });
-      await tx.refreshToken.updateMany({
-        where: { userId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-      const session = await this.createWithClient(
+      return this.replaceForSingleDeviceWithClient(
         tx,
         userId,
         context,
         audience,
       );
-      return {
-        session,
-        revokedSessionIds: revocableSessions.map(({ id }) => id),
-      };
     });
-    await Promise.all(
-      replacement.revokedSessionIds.map((sessionId) =>
-        this.revocation.revokeSession(sessionId),
-      ),
-    );
+    await this.revokeAccessSessions(replacement.revokedSessionIds);
     return replacement.session;
+  }
+
+  async setSingleDeviceLogin(
+    userId: string,
+    enabled: boolean,
+    currentSessionId?: string,
+  ): Promise<void> {
+    const revokedSessionIds = await this.prisma.$transaction(async (tx) => {
+      const lockKey = `auth-user:${userId}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      await tx.user.update({
+        where: { id: userId },
+        data: { singleDeviceLoginEnabled: enabled },
+      });
+      if (!enabled) return [];
+
+      const now = new Date();
+      const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
+      const revocableSessions = await tx.refreshToken.findMany({
+        where: {
+          userId,
+          audience: 'APP',
+          createdAt: { gt: accessCutoff },
+          ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
+        },
+        select: { id: true },
+      });
+      await tx.refreshToken.updateMany({
+        where: {
+          userId,
+          audience: 'APP',
+          revokedAt: null,
+          ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
+        },
+        data: {
+          revokedAt: now,
+          revocationReason: RefreshTokenRevocationReason.OTHER_SESSIONS_REVOKED,
+        },
+      });
+      return revocableSessions.map(({ id }) => id);
+    });
+    await this.revokeAccessSessions(revokedSessionIds);
   }
 
   async rotate(
@@ -225,7 +327,9 @@ export class RefreshTokenService {
           ip: true,
           userAgent: true,
           audience: true,
+          familyId: true,
           revokedAt: true,
+          revocationReason: true,
           expiredAt: true,
         },
       });
@@ -233,18 +337,42 @@ export class RefreshTokenService {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
 
-      if (record.revokedAt) {
-        await tx.refreshToken.updateMany({
-          where: { userId: record.userId, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
-        return { kind: 'reuse' as const, userId: record.userId };
-      }
-
       const now = new Date();
       if (record.expiredAt <= now) {
         throw new UnauthorizedException('Invalid or expired refresh token');
       }
+
+      if (record.revokedAt) {
+        if (record.revocationReason !== RefreshTokenRevocationReason.ROTATED) {
+          throw new UnauthorizedException('Invalid or expired refresh token');
+        }
+        const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
+        const familySessions = await tx.refreshToken.findMany({
+          where: {
+            userId: record.userId,
+            familyId: record.familyId,
+            createdAt: { gt: accessCutoff },
+          },
+          select: { id: true },
+        });
+        await tx.refreshToken.updateMany({
+          where: {
+            userId: record.userId,
+            familyId: record.familyId,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt: now,
+            revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
+          },
+        });
+        return {
+          kind: 'reuse' as const,
+          userId: record.userId,
+          sessionIds: familySessions.map(({ id }) => id),
+        };
+      }
+
       const revoked = await tx.refreshToken.updateMany({
         where: {
           token: tokenHash,
@@ -252,7 +380,10 @@ export class RefreshTokenService {
           expiredAt: { gt: now },
           audience,
         },
-        data: { revokedAt: now },
+        data: {
+          revokedAt: now,
+          revocationReason: RefreshTokenRevocationReason.ROTATED,
+        },
       });
       if (revoked.count !== 1) {
         throw new UnauthorizedException('Invalid or expired refresh token');
@@ -267,6 +398,7 @@ export class RefreshTokenService {
           userAgent: context?.userAgent ?? record.userAgent ?? null,
         },
         record.audience,
+        record.familyId,
       );
       return {
         kind: 'rotated' as const,
@@ -278,11 +410,11 @@ export class RefreshTokenService {
 
     if (result.kind === 'reuse') {
       this.logger.warn(
-        `Refresh token reuse detected for user ${result.userId}; revoking all sessions.`,
+        `Refresh token reuse detected for user ${result.userId}; revoking the affected token family.`,
       );
-      await this.revocation.revokeUser(result.userId);
+      await this.revokeAccessSessions(result.sessionIds);
       throw new UnauthorizedException(
-        'Refresh token reuse detected; all sessions revoked',
+        'Refresh token reuse detected; token family revoked',
       );
     }
     return result;
@@ -329,7 +461,10 @@ export class RefreshTokenService {
         revokedAt: null,
         expiredAt: { gt: new Date() },
       },
-      data: { revokedAt: new Date() },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.LOGOUT,
+      },
     });
     // round 3 review：refresh TTL 可配得比 access TTL 短 —— 行过期不代表
     // 对应 access token 已死。只要行存在就写会话吊销标记（幂等且便宜），
@@ -378,7 +513,10 @@ export class RefreshTokenService {
   async revokeAll(userId: string): Promise<void> {
     await this.prisma.refreshToken.updateMany({
       where: { userId, revokedAt: null },
-      data: { revokedAt: new Date() },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+      },
     });
     // Kill every access token this user already holds (logout-all / ban /
     // password change / reuse detection), not just their refresh tokens (F-02).
@@ -388,7 +526,10 @@ export class RefreshTokenService {
   async revokeSession(userId: string, sessionId: string): Promise<void> {
     const result = await this.prisma.refreshToken.updateMany({
       where: { id: sessionId, userId, revokedAt: null },
-      data: { revokedAt: new Date() },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
+      },
     });
     if (result.count === 1) {
       await this.revocation.revokeSession(sessionId);
@@ -409,11 +550,12 @@ export class RefreshTokenService {
         revokedAt: null,
         id: { not: currentSessionId },
       },
-      data: { revokedAt: new Date() },
+      data: {
+        revokedAt: new Date(),
+        revocationReason: RefreshTokenRevocationReason.OTHER_SESSIONS_REVOKED,
+      },
       select: { id: true },
     });
-    await Promise.all(
-      revokedSessions.map(({ id }) => this.revocation.revokeSession(id)),
-    );
+    await this.revokeAccessSessions(revokedSessions.map(({ id }) => id));
   }
 }
