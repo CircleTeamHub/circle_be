@@ -522,7 +522,7 @@ describe('CircleService', () => {
     expect(result[0].myRole).toBe('OWNER');
   });
 
-  it('bounds created circles and orders ties deterministically', async () => {
+  it('keeps the legacy complete-list contract when pagination is omitted', async () => {
     prisma.circle.findMany.mockResolvedValue([]);
 
     await service.myCircles('user-1', { tab: 'created' });
@@ -530,7 +530,6 @@ describe('CircleService', () => {
     expect(prisma.circle.findMany).toHaveBeenCalledWith({
       where: { ownerID: 'user-1', deleted: false },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: 50,
     });
   });
 
@@ -552,6 +551,23 @@ describe('CircleService', () => {
     });
   });
 
+  it('returns every joined circle when legacy clients omit pagination', async () => {
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await service.myCircles('user-1', { tab: 'joined' });
+
+    expect(prisma.circleMember.findMany).toHaveBeenCalledWith({
+      where: {
+        userID: 'user-1',
+        status: 'ACTIVE',
+        role: { not: 'OWNER' },
+        circle: { deleted: false },
+      },
+      include: { circle: true },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    });
+  });
+
   it('seeks created circles after an owner-scoped cursor', async () => {
     const createdAt = new Date('2026-01-02T00:00:00.000Z');
     prisma.circle.findFirst.mockResolvedValue({
@@ -563,7 +579,6 @@ describe('CircleService', () => {
     await service.myCircles('user-1', {
       tab: 'created',
       cursor: '11111111-1111-4111-8111-111111111111',
-      limit: 10,
     });
 
     expect(prisma.circle.findFirst).toHaveBeenCalledWith({
@@ -587,7 +602,7 @@ describe('CircleService', () => {
             },
           ],
         },
-        take: 10,
+        take: 50,
       }),
     );
   });

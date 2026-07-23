@@ -149,7 +149,10 @@ export class MyCirclesQueryDto {
   @IsUUID()
   cursor?: string;
 
-  @ApiPropertyOptional({ default: 50, maximum: 100 })
+  @ApiPropertyOptional({
+    maximum: 100,
+    description: 'Page size; defaults to 50 when cursor is provided',
+  })
   @Type(() => Number)
   @IsOptional()
   @IsInt()
