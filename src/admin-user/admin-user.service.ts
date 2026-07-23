@@ -359,29 +359,6 @@ export class AdminUserService {
         });
       }
 
-      const revokedAt =
-        dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
-      if (revokedAt) {
-        const expiresAt = this.sessionRevocation.revocationExpiresAt(
-          revokedAt.getTime(),
-        );
-        await tx.refreshToken.updateMany({
-          where: { userId: targetId, revokedAt: null },
-          data: { revokedAt },
-        });
-        await tx.sessionRevocationOutbox.upsert({
-          where: { userID: targetId },
-          create: { userID: targetId, revokedAt, expiresAt },
-          update: {
-            revokedAt,
-            expiresAt,
-            attempts: 0,
-            lastError: null,
-            nextAttemptAt: revokedAt,
-          },
-        });
-      }
-
       const action =
         dto.status === UserStatus.BANNED
           ? AdminAuditAction.UserBanned
@@ -398,6 +375,12 @@ export class AdminUserService {
         after: { status: dto.status },
         reason,
       });
+
+      const revokedAt =
+        dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
+      if (revokedAt) {
+        await this.persistSessionRevocation(tx, targetId, revokedAt);
+      }
 
       return {
         id: current.id,
@@ -474,6 +457,31 @@ export class AdminUserService {
         }),
     );
     return true;
+  }
+
+  private async persistSessionRevocation(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    revokedAt: Date,
+  ): Promise<void> {
+    const expiresAt = this.sessionRevocation.revocationExpiresAt(
+      revokedAt.getTime(),
+    );
+    await tx.refreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt },
+    });
+    await tx.sessionRevocationOutbox.upsert({
+      where: { userID: userId },
+      create: { userID: userId, revokedAt, expiresAt },
+      update: {
+        revokedAt,
+        expiresAt,
+        attempts: 0,
+        lastError: null,
+        nextAttemptAt: revokedAt,
+      },
+    });
   }
 
   private async runPostCommitHook(

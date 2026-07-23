@@ -119,6 +119,12 @@ export class UserController {
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
   ) {
+    if (req.user?.role === Role.Admin) {
+      throw new ForbiddenException({
+        message: 'Admins must use the audited admin status endpoint',
+        errorCode: UserErrorCode.DeleteOwnOnly,
+      });
+    }
     if (id !== req.user?.userId) {
       throw new ForbiddenException({
         message: 'You can only delete your own account',

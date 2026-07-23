@@ -5,6 +5,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 
 const SESSION_REVOCATION_BATCH_SIZE = 100;
 const SESSION_REVOCATION_MAX_BACKOFF_MS = 60 * 60 * 1000;
+const SESSION_REVOCATION_CLAIM_LEASE_MS = 55 * 1000;
 const REVOCATION_UNAVAILABLE =
   'Redis revocation or socket broadcast unavailable';
 
@@ -38,6 +39,22 @@ export class SessionRevocationOutboxProcessor {
         continue;
       }
 
+      const claimedUntil = new Date(
+        now.getTime() + SESSION_REVOCATION_CLAIM_LEASE_MS,
+      );
+      const claimed = await this.prisma.sessionRevocationOutbox.updateMany({
+        where: {
+          userID: job.userID,
+          revokedAt: job.revokedAt,
+          nextAttemptAt: job.nextAttemptAt,
+          attempts: job.attempts,
+        },
+        data: { nextAttemptAt: claimedUntil },
+      });
+      if (claimed.count !== 1) {
+        continue;
+      }
+
       try {
         const revoked = await this.sessionRevocation.revokeUserAt(
           job.userID,
@@ -52,14 +69,24 @@ export class SessionRevocationOutboxProcessor {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         await this.prisma.sessionRevocationOutbox.updateMany({
-          where: { userID: job.userID, revokedAt: job.revokedAt },
+          where: {
+            userID: job.userID,
+            revokedAt: job.revokedAt,
+            nextAttemptAt: claimedUntil,
+          },
           data: {
             attempts: { increment: 1 },
             lastError: message.slice(0, 1000),
             nextAttemptAt: this.nextRetryAt(job.attempts + 1),
           },
         });
-        this.logger.warn(`Session revocation retry failed: ${message}`);
+        this.logger.warn({
+          message: 'Session revocation retry failed',
+          error: message,
+          userID: job.userID,
+          revokedAt: job.revokedAt.toISOString(),
+          attempts: job.attempts + 1,
+        });
       }
     }
 

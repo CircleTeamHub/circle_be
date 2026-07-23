@@ -522,7 +522,7 @@ describe('CircleService', () => {
     expect(result[0].myRole).toBe('OWNER');
   });
 
-  it('keeps the legacy complete-list contract when pagination is omitted', async () => {
+  it('caps created circles when pagination is omitted', async () => {
     prisma.circle.findMany.mockResolvedValue([]);
 
     await service.myCircles('user-1', { tab: 'created' });
@@ -530,6 +530,7 @@ describe('CircleService', () => {
     expect(prisma.circle.findMany).toHaveBeenCalledWith({
       where: { ownerID: 'user-1', deleted: false },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 100,
     });
   });
 
@@ -551,7 +552,7 @@ describe('CircleService', () => {
     });
   });
 
-  it('returns every joined circle when legacy clients omit pagination', async () => {
+  it('caps joined circles when legacy clients omit pagination', async () => {
     prisma.circleMember.findMany.mockResolvedValue([]);
 
     await service.myCircles('user-1', { tab: 'joined' });
@@ -565,6 +566,7 @@ describe('CircleService', () => {
       },
       include: { circle: true },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 100,
     });
   });
 

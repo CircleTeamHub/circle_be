@@ -417,7 +417,8 @@ describe('AdminUserService', () => {
   describe('updateStatus', () => {
     const actor = { userId: 'admin-1', accountId: 'support-admin' };
 
-    it('persists access revocation before committing a ban', async () => {
+    it('persists access revocation in the status transaction when banning', async () => {
+      prisma.$transaction.mockImplementation(async (callback) => callback(tx));
       tx.user.findUnique.mockResolvedValue({
         id: 'user-1',
         accountId: 'jim-1001',
@@ -450,6 +451,7 @@ describe('AdminUserService', () => {
           nextAttemptAt: refreshRevokedAt,
         },
       });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
     it('completes and removes the durable revocation immediately when Redis is healthy', async () => {
@@ -552,6 +554,42 @@ describe('AdminUserService', () => {
         });
       },
     );
+
+    it('persists session revocation in the status transaction before commit', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+      const callOrder: string[] = [];
+      tx.sessionRevocationOutbox.upsert.mockImplementation(async () => {
+        callOrder.push('outbox');
+        return {};
+      });
+      audit.recordInTransaction.mockImplementation(async () => {
+        callOrder.push('audit');
+        return { id: 'audit-1' };
+      });
+      prisma.$transaction.mockImplementation(async (callback) => {
+        const value = await callback(tx);
+        callOrder.push('commit');
+        return value;
+      });
+      sessionRevocation.revokeUserAt.mockImplementation(async () => {
+        callOrder.push('redis');
+        return true;
+      });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      expect(callOrder).toEqual(['audit', 'outbox', 'commit', 'redis']);
+    });
 
     it.each([
       [UserStatus.ACTIVE, UserStatus.ACTIVE],

@@ -151,7 +151,8 @@ export class MyCirclesQueryDto {
 
   @ApiPropertyOptional({
     maximum: 100,
-    description: 'Page size; defaults to 50 when cursor is provided',
+    description:
+      'Page size; defaults to 50 when cursor is provided and 100 otherwise',
   })
   @Type(() => Number)
   @IsOptional()

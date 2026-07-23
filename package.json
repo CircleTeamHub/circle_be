@@ -162,6 +162,7 @@
   },
   "overrides": {
     "@hono/node-server": "^1.19.13",
+    "find-my-way": "^9.7.0",
     "multer": "^2.2.0",
     "picomatch": "^4.0.4"
   }

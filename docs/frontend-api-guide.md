@@ -344,7 +344,9 @@ DELETE /user/:id
 Authorization: Bearer <accessToken>
 ```
 
-> 软删除，status 变为 `DELETED`，只能删除自己（或 admin）
+> 软删除，status 变为 `DELETED`，只能删除自己。
+> 管理员删除用户必须走审计状态接口：
+> `PATCH /admin/users/:id/status`，请求体传 `status: "DELETED"`、`reason` 和 `confirmationAccountId`。
 
 **Response 200：** User 对象（status 为 DELETED）
 

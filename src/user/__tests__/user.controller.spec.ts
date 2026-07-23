@@ -71,6 +71,19 @@ describe('UserController', () => {
     expect(userService.remove).not.toHaveBeenCalled();
   });
 
+  it('blocks admin self-deletes from the self-service route', () => {
+    expect(() =>
+      controller.removeUser('user-1', {
+        user: {
+          userId: 'user-1',
+          accountId: 'admin',
+          role: Role.Admin,
+        },
+      } as any),
+    ).toThrow(ForbiddenException);
+    expect(userService.remove).not.toHaveBeenCalled();
+  });
+
   it('denies deleting another user without admin access', () => {
     expect(() =>
       controller.removeUser('user-2', {
