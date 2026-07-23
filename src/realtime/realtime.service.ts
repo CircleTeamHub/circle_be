@@ -219,7 +219,14 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ]);
 
   private readonly logger = new Logger(RealtimeService.name);
+  /** Fully admitted sockets eligible to receive business events. */
   private readonly clients = new Map<string, Set<WebSocket>>();
+  /**
+   * Authenticated sockets awaiting the final revocation fence. They consume a
+   * connection slot and can be closed by revocation broadcasts, but must not
+   * receive user data until promoted.
+   */
+  private readonly pendingClients = new Map<string, Set<WebSocket>>();
   /** Claims per live socket, used to match incoming revocations. */
   private readonly socketIdentities = new WeakMap<
     WebSocket,
@@ -370,20 +377,45 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  registerPendingClient(
+    userId: string,
+    socket: WebSocket,
+    identity: RealtimeSocketIdentity,
+  ) {
+    const group = this.pendingClients.get(userId) ?? new Set<WebSocket>();
+    group.add(socket);
+    this.pendingClients.set(userId, group);
+    this.socketIdentities.set(socket, identity);
+  }
+
+  promotePendingClient(userId: string, socket: WebSocket): boolean {
+    const pending = this.pendingClients.get(userId);
+    if (!pending?.delete(socket)) return false;
+    if (pending.size === 0) {
+      this.pendingClients.delete(userId);
+    }
+
+    const active = this.clients.get(userId) ?? new Set<WebSocket>();
+    active.add(socket);
+    this.clients.set(userId, active);
+    return true;
+  }
+
   getConnectionCount(userId: string): number {
-    return this.clients.get(userId)?.size ?? 0;
+    return (
+      (this.clients.get(userId)?.size ?? 0) +
+      (this.pendingClients.get(userId)?.size ?? 0)
+    );
   }
 
   unregisterClient(userId: string, socket: WebSocket) {
-    const group = this.clients.get(userId);
-    if (!group) {
-      return;
-    }
-
-    group.delete(socket);
-
-    if (group.size === 0) {
-      this.clients.delete(userId);
+    for (const groups of [this.clients, this.pendingClients]) {
+      const group = groups.get(userId);
+      if (!group) continue;
+      group.delete(socket);
+      if (group.size === 0) {
+        groups.delete(userId);
+      }
     }
   }
 
@@ -987,8 +1019,11 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     userId: string,
     revokedAtMs: number,
   ): WebSocket[] {
-    const group = this.clients.get(userId);
-    if (!group) return [];
+    const group = new Set([
+      ...(this.clients.get(userId) ?? []),
+      ...(this.pendingClients.get(userId) ?? []),
+    ]);
+    if (group.size === 0) return [];
 
     return [...group].filter((socket) => {
       const issuedAtMs = this.socketIdentities.get(socket)?.issuedAtMs ?? null;
@@ -1003,15 +1038,17 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   private socketsRevokedForSession(sessionId: string): WebSocket[] {
     // O(local sockets); revocations are rare next to connection churn, so a
     // second sid-keyed index isn't worth the extra state to keep consistent.
-    const revoked: WebSocket[] = [];
-    for (const group of this.clients.values()) {
-      for (const socket of group) {
-        if (this.socketIdentities.get(socket)?.sessionId === sessionId) {
-          revoked.push(socket);
+    const revoked = new Set<WebSocket>();
+    for (const groups of [this.clients, this.pendingClients]) {
+      for (const group of groups.values()) {
+        for (const socket of group) {
+          if (this.socketIdentities.get(socket)?.sessionId === sessionId) {
+            revoked.add(socket);
+          }
         }
       }
     }
-    return revoked;
+    return [...revoked];
   }
 
   private parseRedisEnvelope(

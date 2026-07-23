@@ -33,6 +33,10 @@ describe('RedisService', () => {
       false,
     );
     await expect(service.getJson('circle:test')).resolves.toBeNull();
+    await expect(service.getJsonMany(['a', 'b'])).resolves.toEqual([
+      null,
+      null,
+    ]);
     await expect(
       service.setJson('circle:test', { ok: true }, 10),
     ).resolves.toBe(false);
@@ -72,6 +76,22 @@ describe('RedisService', () => {
     jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
 
     await expect(service.ping()).resolves.toBe(true);
+  });
+
+  it('reads multiple JSON values in one Redis MGET', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = {
+      mget: jest
+        .fn()
+        .mockResolvedValue(['1', null, JSON.stringify({ revoked: true })]),
+    };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+    await expect(
+      service.getJsonMany(['one', 'missing', 'obj']),
+    ).resolves.toEqual([1, null, { revoked: true }]);
+    expect(client.mget).toHaveBeenCalledWith('one', 'missing', 'obj');
   });
 
   it('reports ping failures as unreachable instead of throwing at the probe', async () => {
@@ -182,6 +202,10 @@ describe('RedisService', () => {
     jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(null);
 
     await expect(service.getJson('k')).resolves.toBeNull();
+    await expect(service.getJsonMany(['a', 'b'])).resolves.toEqual([
+      null,
+      null,
+    ]);
     await expect(service.setJson('k', { a: 1 }, 10)).resolves.toBe(false);
     await expect(service.deleteKey('k')).resolves.toBe(false);
     await expect(service.incrementWithTtl('k', 10)).resolves.toBeNull();

@@ -163,21 +163,25 @@ export class SessionRevocationService {
     if (!this.redis.isEnabled()) return false;
 
     const sid = typeof payload.sid === 'string' ? payload.sid : null;
-    if (sid) {
-      const marked = await this.redis.getJson<number>(this.sessionKey(sid));
-      if (marked) return true;
-    }
-
     const sub = typeof payload.sub === 'string' ? payload.sub : null;
     const issuedAtMs = getIssuedAtMs(payload);
+
+    const keys: string[] = [];
+    if (sid) keys.push(this.sessionKey(sid));
+    if (sub && issuedAtMs !== null) keys.push(this.userKey(sub));
+    if (keys.length === 0) return false;
+
+    const markers = await this.redis.getJsonMany<number>(keys);
+    let markerIndex = 0;
+    if (sid && markers[markerIndex++]) return true;
+
     if (sub && issuedAtMs !== null) {
-      const revokedAfter = await this.redis.getJson<number>(this.userKey(sub));
-      if (typeof revokedAfter === 'number') {
-        // Markers written before millisecond precision used epoch seconds.
-        const revokedAtMs =
-          revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
-        if (issuedAtMs <= revokedAtMs) return true;
-      }
+      const revokedAfter = markers[markerIndex];
+      if (typeof revokedAfter !== 'number') return false;
+      // Markers written before millisecond precision used epoch seconds.
+      const revokedAtMs =
+        revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
+      if (issuedAtMs <= revokedAtMs) return true;
     }
 
     return false;

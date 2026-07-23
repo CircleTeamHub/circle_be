@@ -1,7 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
-import { RealtimeService } from './realtime.service';
+import {
+  REVOKED_CLOSE_CODE,
+  REVOKED_CLOSE_REASON,
+  RealtimeService,
+} from './realtime.service';
 
 describe('RealtimeService', () => {
   let service: RealtimeService;
@@ -355,6 +359,33 @@ describe('RealtimeService', () => {
 
   it('returns 0 for getConnectionCount when no clients registered', () => {
     expect(service.getConnectionCount('unknown-user')).toBe(0);
+  });
+
+  it('counts pending clients for limits but excludes them from delivery', () => {
+    const socket = {
+      readyState: 1,
+      send: jest.fn(),
+      close: jest.fn(),
+    } as any;
+    service.registerPendingClient('user-pending', socket, {
+      sessionId: 'session-pending',
+      issuedAtMs: 100,
+    });
+
+    expect(service.getConnectionCount('user-pending')).toBe(1);
+    service.broadcastWalletBalanceChanged('user-pending');
+    expect(socket.send).not.toHaveBeenCalled();
+
+    expect(
+      service.closeRevokedSockets({
+        kind: 'session',
+        sessionId: 'session-pending',
+      }),
+    ).toBe(1);
+    expect(socket.close).toHaveBeenCalledWith(
+      REVOKED_CLOSE_CODE,
+      REVOKED_CLOSE_REASON,
+    );
   });
 
   it('safeBroadcastAll does not throw even when callbacks fail', async () => {
