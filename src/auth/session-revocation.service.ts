@@ -1,6 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from 'src/redis/redis.service';
+import {
+  SESSION_REVOCATION_CHANNEL,
+  type SessionRevocationBroadcast,
+} from './session-revocation.broadcast';
 
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DURATION_UNITS_IN_MS: Record<string, number> = {
@@ -13,7 +17,7 @@ const DURATION_UNITS_IN_MS: Record<string, number> = {
   y: 365.25 * 24 * 60 * 60 * 1000,
 };
 
-function accessTokenTtlSeconds(raw: unknown): number {
+export function accessTokenTtlSeconds(raw: unknown): number {
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
     return Math.ceil(raw);
   }
@@ -82,6 +86,7 @@ function getIssuedAtMs(payload: RevocablePayload): number | null {
  */
 @Injectable()
 export class SessionRevocationService {
+  private readonly logger = new Logger(SessionRevocationService.name);
   private readonly markerTtlSeconds: number;
 
   constructor(
@@ -104,11 +109,13 @@ export class SessionRevocationService {
   /** Revoke every access token issued to this user before now. No-op without Redis. */
   async revokeUser(userId: string): Promise<void> {
     if (!this.redis.isEnabled()) return;
+    const revokedAtMs = Date.now();
     await this.redis.setJson(
       this.userKey(userId),
-      Date.now(),
+      revokedAtMs,
       this.markerTtlSeconds,
     );
+    await this.announce({ kind: 'user', userId, revokedAtMs });
   }
 
   /** Revoke a single session's access token (single logout / kill one session). */
@@ -119,6 +126,32 @@ export class SessionRevocationService {
       1,
       this.markerTtlSeconds,
     );
+    await this.announce({ kind: 'session', sessionId });
+  }
+
+  /**
+   * Tells every instance to drop the WebSockets this revocation just killed.
+   * The marker above only gates the *next* request; a live socket has no such
+   * checkpoint, so without this a banned user keeps receiving pushes until the
+   * JWT expires.
+   *
+   * Best-effort by design: a publish failure still leaves the marker written,
+   * so HTTP stays protected and the socket dies at token expiry — the same
+   * degradation as running without Redis. Never let it fail the revocation.
+   */
+  private async announce(event: SessionRevocationBroadcast): Promise<void> {
+    try {
+      await this.redis.publish(
+        SESSION_REVOCATION_CHANNEL,
+        JSON.stringify(event),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to announce session revocation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**

@@ -8,9 +8,9 @@ import { ScheduleModule } from '@nestjs/schedule';
 // not via a global APP_GUARD — rate limiting stays scoped to temp-chat.
 import { ThrottlerModule } from '@nestjs/throttler';
 
-import { LogsModule } from './logs/logs.module';
-import { RolesModule } from './roles/roles.module';
 import { AuthModule } from './auth/auth.module';
+import { WinstonLoggingModule } from './logging/winston-logging.module';
+import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
@@ -38,6 +38,7 @@ import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 import { RedisModule } from './redis/redis.module';
 import { CreditModule } from './credit/credit.module';
+import { AdminUserModule } from './admin-user/admin-user.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -55,9 +56,9 @@ const envFilePath = `.env.${nodeEnv}`;
     RedisModule,
     PrismaModule,
     UserModule,
-    LogsModule,
-    RolesModule,
     AuthModule,
+    WinstonLoggingModule,
+    ModerationModule,
     OpenimModule,
     UploadModule,
     FriendModule,
@@ -82,6 +83,7 @@ const envFilePath = `.env.${nodeEnv}`;
     PrivacySettingsModule,
     CreditModule,
     CallModule,
+    AdminUserModule,
   ],
   controllers: [],
   providers: [Logger],

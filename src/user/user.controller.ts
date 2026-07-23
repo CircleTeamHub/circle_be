@@ -25,7 +25,6 @@ import { UserService } from './user.service';
 import { GetUserDto } from './dto/get-user.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { UpdateUserStatusDto } from './dto/update-user-status.dto';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -108,25 +107,9 @@ export class UserController {
     return this.userService.update(id, dto);
   }
 
-  @Patch('/:id/status')
-  @UseGuards(AdminGuard)
-  @Serialize(PublicUserDto)
-  @ApiOperation({ summary: 'Update user status (admin only)' })
-  @ApiBody({ type: UpdateUserStatusDto })
-  @ApiOkResponse({ description: 'Updated user', type: PublicUserDto })
-  updateUserStatus(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: UpdateUserStatusDto,
-    @Req() req: RequestWithUser,
-  ) {
-    if (id === req.user.userId && dto.status !== 'ACTIVE') {
-      throw new ForbiddenException('Admins cannot disable their own account');
-    }
-    return this.userService.updateStatus(id, dto.status, {
-      actorId: req.user.userId,
-      reason: dto.reason,
-    });
-  }
+  // 账号状态变更只保留 PATCH /admin/users/:id/status 一条路径（#121）：这里原来
+  // 那条 admin 路由不写审计、原因可省、删除也不需要确认账号 ID，留着就是一个
+  // 绕过审计与状态机的后门。
 
   @Delete('/:id')
   @Serialize(PublicUserDto)

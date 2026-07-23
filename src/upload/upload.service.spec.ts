@@ -70,6 +70,54 @@ describe('UploadService', () => {
     });
   });
 
+  // 桶策略是白名单且 notes/ 已被移出 —— 「应用策略」正是让私有笔记媒体变私有的
+  // 那个动作。它在启动时是 best-effort：失败只打日志、应用照常起来，旧策略继续
+  // 生效、桶仍匿名可读，而读取路径照发预签名 URL。这个「以为修好了其实没修」的
+  // 状态必须能被 readiness 探针观测到。
+  describe('objectStoreStatus', () => {
+    const buildService = (send: jest.Mock) => {
+      const service = new UploadService({
+        get: (key: string) =>
+          (
+            ({
+              MINIO_ENDPOINT: 'http://localhost:9000',
+              MINIO_ACCESS_KEY: 'minioadmin',
+              MINIO_SECRET_KEY: 'minioadmin123',
+              MINIO_BUCKET: 'circle',
+              MINIO_PUBLIC_URL: 'http://localhost:9000',
+            }) as Record<string, string>
+          )[key] ?? null,
+      } as any);
+      (service as any).client = { send };
+      return service;
+    };
+
+    it('reports ok once the bucket policy is applied', async () => {
+      const service = buildService(jest.fn().mockResolvedValue({}));
+
+      await service.onModuleInit();
+
+      expect(service.objectStoreStatus()).toBe('ok');
+    });
+
+    it('reports policy-unconfirmed when applying the policy failed', async () => {
+      // MinIO 启动时不可达 / 缺 s3:PutBucketPolicy 权限。
+      const service = buildService(
+        jest.fn().mockRejectedValue(new Error('nope')),
+      );
+
+      await service.onModuleInit();
+
+      expect(service.objectStoreStatus()).toBe('policy-unconfirmed');
+    });
+
+    it('reports disabled when MinIO is not configured at all', () => {
+      const service = new UploadService({ get: () => null } as any);
+
+      expect(service.objectStoreStatus()).toBe('disabled');
+    });
+  });
+
   it('signs upload urls with the public MinIO host when configured', async () => {
     const signedUrlMock = jest.mocked(getSignedUrl);
     signedUrlMock.mockResolvedValueOnce(

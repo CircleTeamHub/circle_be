@@ -2,7 +2,13 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import type { Server } from 'http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { RealtimeService } from './realtime.service';
+import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import {
+  REVOKED_CLOSE_CODE,
+  REVOKED_CLOSE_REASON,
+  RealtimeService,
+  type RealtimeSocketIdentity,
+} from './realtime.service';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
@@ -17,6 +23,17 @@ type JwtPayload = {
   sub?: unknown;
   accountId?: unknown;
   exp?: unknown;
+  sid?: unknown;
+  iat?: unknown;
+  issuedAtMs?: unknown;
+};
+
+type VerifiedToken = {
+  userId: string;
+  expMs: number | null;
+  identity: RealtimeSocketIdentity;
+  /** Retained so the connect-time revocation check sees the same claims HTTP does. */
+  payload: JwtPayload;
 };
 
 @Injectable()
@@ -34,6 +51,7 @@ export class RealtimeGateway implements OnModuleDestroy {
   constructor(
     private readonly jwtService: JwtService,
     private readonly realtimeService: RealtimeService,
+    private readonly revocation: SessionRevocationService,
   ) {}
 
   attach(httpServer: Server) {
@@ -103,11 +121,7 @@ export class RealtimeGateway implements OnModuleDestroy {
         return;
       }
 
-      void this.acceptAuthenticatedSocket(
-        socket,
-        verified.userId,
-        verified.expMs,
-      );
+      void this.acceptAuthenticatedSocket(socket, verified);
     });
 
     socket.on('error', (error) => {
@@ -121,9 +135,27 @@ export class RealtimeGateway implements OnModuleDestroy {
 
   private async acceptAuthenticatedSocket(
     socket: WebSocket,
-    userId: string,
-    expMs: number | null,
+    verified: VerifiedToken,
   ) {
+    const { userId, expMs, identity } = verified;
+
+    // Same check the HTTP strategy runs (F-02), so a banned or logged-out token
+    // cannot open a new stream. Fail-open exactly like HTTP: with Redis off this
+    // resolves false rather than locking every user out of realtime.
+    if (await this.revocation.isRevoked(verified.payload)) {
+      socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+      return;
+    }
+
+    // The revocation lookup above is the first `await` between authenticating
+    // and registering, so the client may have vanished meanwhile. Registering a
+    // dead socket would strand it in the client map — its `close` already fired,
+    // and the unregister listener is only attached below — burning one of the
+    // user's connection slots permanently.
+    if (socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
     const currentCount = this.realtimeService.getConnectionCount(userId);
     if (currentCount >= MAX_CONNECTIONS_PER_USER) {
       socket.close(1008, 'Too many connections');
@@ -131,7 +163,7 @@ export class RealtimeGateway implements OnModuleDestroy {
     }
 
     this.userBySocket.set(socket, userId);
-    this.realtimeService.registerClient(userId, socket);
+    this.realtimeService.registerClient(userId, socket, identity);
 
     if (expMs !== null) {
       const ttl = expMs - Date.now();
@@ -189,9 +221,7 @@ export class RealtimeGateway implements OnModuleDestroy {
     }
   }
 
-  private verifyToken(
-    token: string,
-  ): { userId: string; expMs: number | null } | null {
+  private verifyToken(token: string): VerifiedToken | null {
     try {
       const payload = this.jwtService.verify<JwtPayload>(token);
       // Only an access token is accepted: it always carries both `sub` and
@@ -200,9 +230,24 @@ export class RealtimeGateway implements OnModuleDestroy {
       if (typeof payload?.sub !== 'string') return null;
       if (typeof payload?.accountId !== 'string') return null;
       const expMs = typeof payload.exp === 'number' ? payload.exp * 1000 : null;
-      return { userId: payload.sub, expMs };
+      return {
+        userId: payload.sub,
+        expMs,
+        identity: {
+          sessionId: typeof payload.sid === 'string' ? payload.sid : null,
+          issuedAtMs: issuedAtMs(payload),
+        },
+        payload,
+      };
     } catch {
       return null;
     }
   }
+}
+
+/** Millisecond issuance time, preferring the explicit claim over `iat`. */
+function issuedAtMs(payload: JwtPayload): number | null {
+  if (typeof payload.issuedAtMs === 'number') return payload.issuedAtMs;
+  if (typeof payload.iat === 'number') return payload.iat * 1000;
+  return null;
 }

@@ -147,6 +147,7 @@ PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实
 
 ```
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
+             → 加密后上传一份到主机之外(可选,见「异地备份」;未配置则跳过)
 → prisma migrate deploy(用发布镜像跑)
 → 起另一色容器(circle_be / circle_be_green 交替)
 → 容器健康门禁(300s)→ validate 并原子 reload Caddy 到新色的唯一容器端点
@@ -202,6 +203,237 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   PAT `docker login ghcr.io` 再跑。
 - **数据库**:迁移前备份在 `~/circle_be_backups/`,恢复:
   `gunzip -c <备份文件> | docker compose -f docker-compose.prod.yml exec -T postgres psql -U circle -d circle`。
+  这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——
+  改从异地副本恢复,见下面「异地备份」。
+
+### 异地备份(可选;加密后上传到对象存储)
+
+`~/circle_be_backups/` 和 `pg_data` 卷在**同一台 VPS** 上:磁盘损坏、实例丢失、
+主机被入侵会把数据和备份一起带走。开启本功能后,每次发版的 pg_dump 会额外加密
+上传一份到主机之外。本地备份的顺序、命名、7 份保留策略都**不受影响** —— 它仍然
+是迁移安全网。
+
+**不开启 = 行为完全不变**:没有 `~/.circle_be_backup.env` 时脚本不做任何事、
+不打印、不报错。现有部署不需要改动。
+
+#### 加密:age 公钥模式(不是 gpg --symmetric)
+
+理由只有一条,但是决定性的:**服务器上只放公钥**。对称加密要求加密方持有解密
+口令,主机被入侵时攻击者能连备份一起解密 —— 异地副本的意义当场归零。公钥模式
+下这台机器只能"写进去",永远解不开自己送出去的东西。
+
+脚本会拒绝 `AGE-SECRET-KEY-` 开头的值,挡住"把私钥误配到服务器上"这个最危险的
+操作失误。
+
+#### ⚠️ 密钥丢失 = 所有异地备份永久报废
+
+这是本方案最大的单点。**私钥丢了,桶里那些文件就是一堆无法恢复的随机字节** ——
+比没有备份更糟,因为它让人误以为有备份。所以:
+
+1. 生成**两把**密钥,一把日常、一把 break-glass:
+
+   ```bash
+   age-keygen -o circle-backup-primary.key      # 输出里的 age1... 就是公钥
+   age-keygen -o circle-backup-breakglass.key
+   ```
+
+2. `BACKUP_OFFSITE_AGE_RECIPIENTS` 填**两个公钥**(空格分隔)。age 会给每个
+   收件人各封装一次密钥,**任一把私钥都能独立解密**,不需要凑齐。
+3. 私钥去处(**绝不留在服务器上,绝不进 git,绝不进聊天软件**):
+   - primary:密码管理器(1Password / Bitwarden 的 secure note);
+   - break-glass:离线介质或纸质打印件,和 primary **不同物理位置**。
+4. 分发完把服务器/工作机上的私钥文件抹掉:`shred -u circle-backup-*.key`。
+5. 每次轮换密钥后,**必须**按下面「恢复演练」实跑一遍再认为它有效。
+
+#### 目标桶:必须用独立的只写凭证
+
+**不要复用应用自己的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`。** 整件事的前提
+是:这台机器被入侵时,攻击者**删不掉**备份 —— 这正是勒索软件的标准路径。要求:
+
+- 桶**开启版本控制**(object versioning);
+- 上传凭证只有 `s3:PutObject`,**没有** Delete / Get / List;
+- 恢复用的读凭证**另外一把**,只在恢复时从密码管理器取出,**不放服务器**。
+
+服务器上这把只写凭证的策略(AWS S3 / MinIO,把 `__BUCKET__` 换成桶名):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupWriteOnly",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": ["arn:aws:s3:::__BUCKET__/*"]
+    }
+  ]
+}
+```
+
+恢复用的读凭证策略(**只存密码管理器**):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BackupRestoreRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": ["arn:aws:s3:::__BUCKET__/*"]
+    },
+    {
+      "Sid": "BackupRestoreList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
+      "Resource": ["arn:aws:s3:::__BUCKET__"]
+    }
+  ]
+}
+```
+
+上面这套只写策略实测可用:`aws s3 cp` 上传单个对象只需要 `s3:PutObject`,
+同一把凭证做 delete / get / list 会被拒(见本仓库 PR 里的往返验证输出)。
+
+各家的差异,**别踩坑**:
+
+- **AWS S3** —— 策略直接可用。再开 Versioning;要更强可加 Object Lock
+  (compliance 模式),那样连 root 都删不掉未过期的版本。
+- **Backblaze B2** —— application key 可以只勾 `writeFiles` 而不给
+  `deleteFiles` / `readFiles`,是真正的只写,且支持 Object Lock。
+- **Cloudflare R2** —— API token 权限档位偏粗:最窄的能 PutObject 的档位是
+  "Object Read & Write",**同时带读和删**。R2 因此拿不到严格的只写语义,
+  "入侵者删不掉备份"这条性质在 R2 上**不成立**。只图便宜/出网方便可以用 R2,
+  但要这条性质就选 S3 或 B2。
+
+#### 开通步骤
+
+服务器上:
+
+```bash
+sudo apt-get install -y age awscli          # Ubuntu 22.04 两个都在源里
+cp deploy/backup.env.example ~/.circle_be_backup.env
+chmod 600 ~/.circle_be_backup.env
+# 编辑它,把 __XXX__ 占位换成:桶名、endpoint、只写凭证、age 公钥
+```
+
+apt 装的是 aws-cli v1(22.04 上是 1.22.34),已实测可用;官方安装器的 v2 也可以。
+配了非 AWS endpoint 时脚本会自动设 `AWS_REQUEST_CHECKSUM_CALCULATION=when_required`
+—— v2.23+ 默认发的 CRC trailer 会被 R2 和旧版 MinIO 拒绝,v1 忽略该变量,两边都不用管。
+
+配置文件**必须放在 `$HOME`,不能放进仓库目录** —— 发版的 `rsync --delete`
+会删掉仓库里的陌生文件,`$HOME` 不在同步范围内。脚本只做 `KEY=VALUE` 解析,
+不 source,配置文件里的内容不会被当成代码执行。
+
+下一次发版的日志里应该出现:
+
+```
+==> Shipping encrypted backup to s3://<bucket>/circle_be/circle-<ts>-pre-<tag>.sql.gz.age
+==> Off-host backup uploaded: s3://<bucket>/circle_be/circle-<ts>-pre-<tag>.sql.gz.age
+```
+
+#### 上传失败:发版继续,但会大声报错
+
+设计取舍:**上传失败不阻断发版**。走到这一步本地 pg_dump 已经成功,这次发版真正
+需要的安全网(迁移改坏数据能回滚)已经就位。异地副本防的是"整台 VPS 没了",
+那件事和这次发版不相关 —— 拦下发版不会让它更安全,只会把一次紧急修复推迟到
+云存储恢复之后。
+
+代价是可能静默烂掉,所以失败时会同时做三件事:
+
+- stderr 打一整块 `OFF-HOST BACKUP UPLOAD FAILED` 横幅;
+- stdout 写一行 GitHub Actions annotation,在 run 摘要页显示红色告警
+  (**不会**让 job 变红,job 状态只看退出码);
+- 写状态文件 `~/circle_be_backups/.offsite-status`。
+
+例行检查(建议进值班清单):
+
+```bash
+cat ~/circle_be_backups/.offsite-status
+# ok 2026-07-18T09:12:44Z s3://circle-backups/circle_be/circle-...sql.gz.age
+# 或 failed <时间> <原因>
+```
+
+配置错误(没填公钥、没装 age、凭证缺失)同样只告警不中断,并且**绝不会**退化成
+上传明文 —— 没有可用公钥时脚本直接拒绝上传。
+
+#### 恢复演练 / 真正的恢复
+
+**没恢复过的备份只是一个假设。** 至少每季度、以及每次轮换密钥后跑一遍。
+在**工作机**上做(服务器上既没有读凭证也没有私钥,本来就做不了):
+
+```bash
+export AWS_ACCESS_KEY_ID=<恢复用只读凭证>
+export AWS_SECRET_ACCESS_KEY=<...>
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required   # R2 / MinIO 必需
+
+S3="aws --endpoint-url https://<account>.r2.cloudflarestorage.com --region auto"
+# 用 AWS S3 时去掉 --endpoint-url,--region 换成桶所在 region
+
+# 1. 列出可用备份
+$S3 s3 ls s3://<bucket>/circle_be/
+
+# 2. 下载
+$S3 s3 cp s3://<bucket>/circle_be/circle-<ts>-pre-<tag>.sql.gz.age ./
+
+# 3. 解密(私钥从密码管理器取出,用完删掉)
+age -d -i circle-backup-primary.key \
+    -o circle-<ts>.sql.gz circle-<ts>-pre-<tag>.sql.gz.age
+
+# 4. 演练:灌进一次性的本地库,不要碰生产
+docker run -d --name pg-drill \
+  -e POSTGRES_USER=circle -e POSTGRES_PASSWORD=drill -e POSTGRES_DB=circle postgres:16
+sleep 5
+gunzip -c circle-<ts>.sql.gz | docker exec -i pg-drill psql -U circle -d circle
+docker exec -i pg-drill psql -U circle -d circle -c '\dt'          # 表都在?
+docker exec -i pg-drill psql -U circle -d circle -c 'SELECT count(*) FROM users;'
+docker rm -f pg-drill
+```
+
+真要恢复生产库时,把第 4 步换成本节上面「回滚 / 重放」里的那条命令:
+
+```bash
+gunzip -c circle-<ts>.sql.gz | \
+  docker compose -f docker-compose.prod.yml exec -T postgres psql -U circle -d circle
+```
+
+> 只写凭证**读不了**桶,所以脚本无法在上传后回读校验。"上传成功"只代表
+> PutObject 返回 200。真正的验证只能靠上面这个演练 —— 请当成必做项。
+
+#### 主机被入侵后的恢复:不要直接取最新版本
+
+只写凭证删不掉对象,但**能覆盖**它。所以入侵者虽然毁不掉历史,却可以把
+**最新版本**换成垃圾。开了版本控制的意义正在于此 —— 恢复时要按版本取:
+
+```bash
+# 列出该对象的所有版本(IsLatest=False 的才是被覆盖前的)
+$S3 s3api list-object-versions --bucket <bucket> \
+    --prefix circle_be/circle-<ts>-pre-<tag>.sql.gz.age \
+    --query 'Versions[].{Ver:VersionId,Latest:IsLatest,Size:Size,When:LastModified}' --output table
+
+# 按 VersionId 取回某个具体版本
+$S3 s3api get-object --bucket <bucket> \
+    --key circle_be/circle-<ts>-pre-<tag>.sql.gz.age \
+    --version-id <VersionId> ./recovered.sql.gz.age
+```
+
+判断依据:被覆盖的垃圾版本通常尺寸明显异常(几十字节),且 `age -d` 会直接
+解密失败。取最近一个能正常解密、尺寸合理的版本。
+
+> 因此**桶的生命周期规则不能删除 noncurrent 版本**,至少保留到你的恢复窗口
+> (建议 ≥30 天)。否则入侵者只要覆盖足够多次,历史版本就会被规则自动清掉。
+
+#### 这套方案**不**覆盖什么
+
+别把它当成完整的灾难恢复。明确**不在**范围内:
+
+| 没覆盖 | 后果 |
+|---|---|
+| **RPO = 一次发版** | 备份只在发版时产生。两次发版之间(可能几天到几周)写入的数据,VPS 挂掉就没了。要更小的 RPO 得另做定时备份或 WAL 归档(pgBackRest / WAL-G)。 |
+| **MinIO 对象** | 头像、图片、附件全在 `minio_data` 卷里,**完全没有异地副本**。只恢复数据库的话,这些引用会变成坏链。 |
+| **OpenIM 聊天记录** | 阶段 5 的 Mongo / Redis / Kafka 数据不在备份范围。 |
+| **Redis** | 内置 Redis 只做缓存/限流,故意不备份。 |
+| **自动恢复验证** | 没有任何自动化在验证备份可用。上面的演练要人去跑。 |
 
 ### 关联发版:admin_web(管理端)与 App(安卓)
 
@@ -271,3 +503,43 @@ git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
 注册 livekit.io → 建项目(免费层)→ 拿 `LIVEKIT_URL` / API Key / Secret,
 追加进 `.env.production`(含 `LIVEKIT_WEBHOOK_SECRET`、`CALL_ENABLE_VIDEO=true`),重启 circle_be。
 无需自托管,音视频不占服务器资源。
+
+---
+
+## 阶段 7:持续备份(**上线前必做**)
+
+`pg_data`、`minio_data` 和 OpenIM 的 Mongo(**全部聊天记录**)都是同一台机器上的
+docker volume。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会**同时**
+全部消失,且没有任何第二份副本。
+
+> **和上面「异地备份」的区别 —— 两者都要,不是二选一。**
+> 上面那节(`deploy/offsite-backup.sh`)只在**发版时**打一份 pg_dump 快照传到异地,
+> 保护的是「这次迁移把库改坏了」,而且**只覆盖 Postgres**。
+> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒)、对象每 15 分钟镜像、
+> 聊天记录每小时加密 dump,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
+> 所有聊天消息,只有本节覆盖得到。
+
+完整方案(覆盖范围、RPO/RTO、运维必须自行创建的桶和凭证、恢复演练、灾难恢复流程)
+见 **[docs/backups.md](docs/backups.md)**。
+
+```bash
+cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
+docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
+```
+
+> 聊天记录备份(OpenIM Mongo)的凭证在**单独的** `.env.backup.mongo`,只有 `backup_mongo`
+> 服务加载它 —— env_file 是整份注入容器的,Mongo 密码放进 `.env.backup` 会连 postgres
+> 容器一起给到,而它根本不需要。另外 `OPENIM_NETWORK` 要写进 `.env`(compose 顶层插值
+> 只认 `.env`/shell,不认 env_file),写在备份配置里不会生效。
+
+> 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
+> 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础
+> 定义重建,**WAL 归档会被静默关掉**。docs/backups.md 里有 `COMPOSE_FILE` 的固定方法,
+> 且 `check.sh` 每小时会检测这种情况。
+
+启用后务必跑一次恢复演练 —— 没演练过的备份不算备份:
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml \
+  run --rm backup run drill
+```

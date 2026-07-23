@@ -9,6 +9,7 @@ describe('ConversationGroupService', () => {
 
   const prisma = {
     conversationGroup: {
+      count: jest.fn().mockResolvedValue(0),
       findMany: jest.fn(),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
@@ -21,6 +22,7 @@ describe('ConversationGroupService', () => {
       createMany: jest.fn(),
     },
     $transaction: jest.fn((cb: any) => cb(prisma as any)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
   };
 
   const OWNER_ID = 'owner-1';
@@ -62,6 +64,7 @@ describe('ConversationGroupService', () => {
         where: { ownerID: OWNER_ID },
         include: { memberships: true },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+        take: 200,
       });
       expect(result).toEqual([
         {

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   GoneException,
@@ -49,6 +50,8 @@ export interface TempChatListItem {
   shareUrl: string | null;
 }
 
+const MAX_ACTIVE_ROOMS_PER_HOST = 200;
+
 @Injectable()
 export class TempChatService {
   private static readonly CLEANUP_LEASE_MS = 2 * 60 * 1000;
@@ -72,6 +75,23 @@ export class TempChatService {
     const maxMembers =
       dto.maxMembers ?? this.config.get<number>('TEMP_CHAT_MAX_MEMBERS', 50);
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+
+    // round 3 review：/mine 有 200 条护栏 —— 不设创建上限的话，第 201 间
+    // 活跃房间建得出来却列不出来（拿不到 id 去结束它），只能等 TTL。上限
+    // 与护栏对齐；count+create 用 per-host advisory 锁串行化防并发越界。
+    // 锁内只做 count（便宜）；OpenIM 建群仍在锁外（外呼不进锁）。
+    const quotaLockKey = `temp-chat:${hostUserId}`;
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+      const active = await tx.tempChat.count({
+        where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
+      });
+      if (active >= MAX_ACTIVE_ROOMS_PER_HOST) {
+        throw new BadRequestException(
+          `活跃临时聊天数量已达上限（${MAX_ACTIVE_ROOMS_PER_HOST}），请先结束不再使用的房间`,
+        );
+      }
+    });
 
     const groupId = newGroupId();
     // 先建群；落库失败要回滚群，避免 OpenIM 留孤儿群。
@@ -130,6 +150,7 @@ export class TempChatService {
     const rows = await this.prisma.tempChat.findMany({
       where: { hostUserId },
       orderBy: [{ createdAt: 'desc' }],
+      take: 200, // #108：防爆护栏
       include: {
         _count: {
           select: { guests: { where: { provisioningFailedAt: null } } },
@@ -261,7 +282,10 @@ export class TempChatService {
       );
       await this.compensateGuest(room.groupId, guestImId, guest.id);
       if (err instanceof GoneException) throw err;
-      throw new ServiceUnavailableException('加入失败，请重试');
+      throw new ServiceUnavailableException({
+        message: '加入失败，请重试',
+        errorCode: TempChatErrorCode.JoinFailed,
+      });
     }
   }
 

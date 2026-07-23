@@ -266,6 +266,20 @@ smoke() {
   return 1
 }
 
+# 异地备份的函数定义(只定义,不执行)。未配置目标存储桶时
+# ship_backup_offsite 直接返回,行为与引入它之前完全一致。
+#
+# 必须带存在性判断:裸 source 在 set -e 下会让缺文件直接中止整个发版,而且是在
+# 下面的 pg_dump 安全网之前 —— 一个可选功能不该有能力搞挂根本没打算用它的发版
+# (只 rsync 了部分文件、热修时单独拷脚本等)。缺失时降级为 no-op 并告警。
+if [ -r deploy/offsite-backup.sh ]; then
+  # shellcheck source=deploy/offsite-backup.sh
+  . deploy/offsite-backup.sh
+else
+  echo "WARNING: deploy/offsite-backup.sh not found; off-host backup copy disabled" >&2
+  ship_backup_offsite() { :; }
+fi
+
 # ── 迁移前先做数据库备份(pg_dump,保留最近 7 份)────────────────
 if [ -n "$(running postgres)" ]; then
   backup_dir="$HOME/circle_be_backups"
@@ -274,6 +288,11 @@ if [ -n "$(running postgres)" ]; then
   echo "==> Backing up database to $backup_file"
   compose exec -T postgres pg_dump -U circle -d circle | gzip > "$backup_file"
   ls -1t "$backup_dir"/circle-*.sql.gz 2>/dev/null | tail -n +8 | xargs -r rm -f
+
+  # 再送一份加密副本到主机之外。本地备份(上面几行)是迁移安全网,不受影响;
+  # 这一步防的是整台 VPS 丢失。失败只告警不中断发版 —— 理由见
+  # deploy/offsite-backup.sh 里 ship_backup_offsite 的注释。
+  ship_backup_offsite "$backup_file" || true
 fi
 
 # ── 停机模式:先停旧色再迁移(仅不向后兼容迁移使用)──────────────

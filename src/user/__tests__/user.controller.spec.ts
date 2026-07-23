@@ -91,47 +91,6 @@ describe('UserController', () => {
     });
   });
 
-  it('passes admin status changes with actor and reason to the service', () => {
-    expect(
-      controller.updateUserStatus(
-        'user-2',
-        { status: 'BANNED' as any, reason: 'abuse reports' },
-        {
-          user: {
-            userId: 'admin-1',
-            accountId: 'admin',
-            role: Role.Admin,
-          },
-        } as any,
-      ),
-    ).toEqual({ id: 'user-2', status: 'BANNED' });
-    expect(userService.updateStatus).toHaveBeenCalledWith('user-2', 'BANNED', {
-      actorId: 'admin-1',
-      reason: 'abuse reports',
-    });
-  });
-
-  it('denies admins banning their own account', () => {
-    expect(() =>
-      controller.updateUserStatus('admin-1', { status: 'BANNED' as any }, {
-        user: {
-          userId: 'admin-1',
-          accountId: 'admin',
-          role: Role.Admin,
-        },
-      } as any),
-    ).toThrow(ForbiddenException);
-  });
-
-  it('denies admins deleting their own account', () => {
-    expect(() =>
-      controller.updateUserStatus('admin-1', { status: 'DELETED' as any }, {
-        user: {
-          userId: 'admin-1',
-          accountId: 'admin',
-          role: Role.Admin,
-        },
-      } as any),
-    ).toThrow(ForbiddenException);
-  });
+  // 账号状态变更的用例都在 admin-user 那边：这个控制器不再暴露 status 路由，
+  // 唯一入口是审计化的 PATCH /admin/users/:id/status。
 });

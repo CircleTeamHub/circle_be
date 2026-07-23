@@ -1,3 +1,4 @@
+import { UploadErrorCode } from 'src/common/app-error-codes';
 import {
   Injectable,
   Logger,
@@ -85,6 +86,9 @@ export class UploadService implements OnModuleInit {
   private readonly publicUrl: string;
   private readonly enabled: boolean;
   private ready = false;
+  // 与 `ready` 分开跟踪：ready 涵盖「桶存在 + 策略已应用」，而只有策略这一项关乎
+  // 「私有笔记媒体是否真的私有」。见 objectStoreStatus()。
+  private mediaPolicyApplied = false;
   private bootstrapPromise: Promise<boolean> | null = null;
   private nextBootstrapAttemptAt = 0;
 
@@ -169,9 +173,10 @@ export class UploadService implements OnModuleInit {
       sizeBytes < 1 ||
       sizeBytes > maxBytes
     ) {
-      throw new PayloadTooLargeException(
-        `Upload exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
-      );
+      throw new PayloadTooLargeException({
+        message: `Upload exceeds the ${maxBytes / (1024 * 1024)} MiB limit`,
+        errorCode: UploadErrorCode.PayloadTooLarge,
+      });
     }
 
     // `split('.').pop()` returns the whole string when there is no dot, so
@@ -390,8 +395,12 @@ export class UploadService implements OnModuleInit {
       await this.ensureBucketIsPublicReadable();
       return true;
     } catch (error) {
-      this.logger.warn(
-        `MinIO bootstrap attempt failed: ${error instanceof Error ? error.message : String(error)}`,
+      // error（不是 warn）并且点名后果：这条失败意味着桶策略没换上，notes/* 可能
+      // 仍然匿名可读，而应用照常发预签名 URL —— 表面上一切正常。readiness 探针
+      // 的 objectStore 字段会同步报 policy-unconfirmed。
+      this.logger.error(
+        `MinIO bootstrap attempt failed: ${error instanceof Error ? error.message : String(error)}. ` +
+          'The private-media bucket policy may not be in force — notes/* could still be anonymously readable.',
       );
       return false;
     }
@@ -404,5 +413,22 @@ export class UploadService implements OnModuleInit {
         Policy: buildPublicReadBucketPolicy(this.bucket),
       }),
     );
+    this.mediaPolicyApplied = true;
+  }
+
+  /**
+   * 桶策略是否确认应用成功 —— 供 readiness 探针观测。
+   *
+   * 为什么这个状态必须外露：buildPublicReadBucketPolicy 是**白名单**，`notes` 已被
+   * 移出，所以「应用这条策略」正是让私有笔记媒体变私有的那个动作。它在启动时是
+   * best-effort（失败只打日志、应用照常起来），一旦失败，**旧策略继续生效、桶仍然
+   * 匿名可读**，而读取路径照发预签名 URL —— 从外部看毫无异样，P0 实际没修上。
+   *
+   * 刻意不用它去 gate 预签名：签名是本地 SigV4 计算，不需要 MinIO 在线；拿它挡读
+   * 只会把「MinIO 短暂不可达」放大成「所有笔记媒体读取全挂」。
+   */
+  objectStoreStatus(): 'ok' | 'policy-unconfirmed' | 'disabled' {
+    if (!this.enabled) return 'disabled';
+    return this.mediaPolicyApplied ? 'ok' : 'policy-unconfirmed';
   }
 }

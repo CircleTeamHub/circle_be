@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   Headers,
   Param,
   Post,
@@ -12,7 +13,11 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallService } from './call.service';
-import { CreateGroupCallDto, LeaveCallDto } from './dto/call.dto';
+import {
+  CreateDirectCallDto,
+  CreateGroupCallDto,
+  LeaveCallDto,
+} from './dto/call.dto';
 
 @ApiTags('Calls')
 @ApiBearerAuth()
@@ -33,6 +38,27 @@ export class CallController {
       dto,
       idempotencyKey,
     );
+  }
+
+  @Post('direct')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  createDirectCall(
+    @Body() dto: CreateDirectCallDto,
+    @Req() req: RequestWithUser,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.callService.createDirectCall(
+      req.user.userId,
+      dto,
+      idempotencyKey,
+    );
+  }
+
+  // 固定路径必须先于 :callId 参数路由声明，否则 'current' 会被吃进参数。
+  @Get('current')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  getCurrentCall(@Req() req: RequestWithUser) {
+    return this.callService.getCurrentCall(req.user.userId);
   }
 
   @Post(':callId/accept')

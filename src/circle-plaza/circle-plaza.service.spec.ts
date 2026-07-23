@@ -54,7 +54,9 @@ describe('CirclePlazaService', () => {
       findMany: jest.fn(),
     },
     circlePostReport: {
-      upsert: jest.fn(),
+      findFirst: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockResolvedValue({}),
+      update: jest.fn().mockResolvedValue({}),
     },
     collaborationRecognition: {
       count: jest.fn(),
@@ -1921,7 +1923,7 @@ describe('CirclePlazaService', () => {
         id: 'post-1',
         authorID: 'author-1',
       });
-      prisma.circlePostReport.upsert.mockResolvedValue({});
+      prisma.circlePostReport.findFirst.mockResolvedValue(null);
 
       const result = await service.reportPost(
         'reporter-2',
@@ -1948,17 +1950,59 @@ describe('CirclePlazaService', () => {
         }),
         select: { id: true, authorID: true },
       });
-      expect(prisma.circlePostReport.upsert).toHaveBeenCalledWith({
+      // 无 PENDING 行 → 新建（审结历史不阻挡、也绝不被改写）
+      expect(prisma.circlePostReport.findFirst).toHaveBeenCalledWith({
         where: {
-          postID_reporterID: { postID: 'post-1', reporterID: 'reporter-2' },
+          postID: 'post-1',
+          reporterID: 'reporter-2',
+          status: 'PENDING',
         },
-        create: {
+        select: { id: true },
+      });
+      expect(prisma.circlePostReport.create).toHaveBeenCalledWith({
+        data: {
           postID: 'post-1',
           reporterID: 'reporter-2',
           reason: 'spam',
         },
-        update: { reason: 'spam' },
       });
+    });
+
+    it('updates the reason on an existing PENDING report instead of duplicating', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+      });
+      prisma.circlePostReport.findFirst.mockResolvedValue({ id: 'report-1' });
+
+      const result = await service.reportPost('reporter-2', 'post-1', 'worse');
+
+      expect(result).toEqual({ reported: true });
+      expect(prisma.circlePostReport.update).toHaveBeenCalledWith({
+        where: { id: 'report-1' },
+        data: { reason: 'worse' },
+      });
+      expect(prisma.circlePostReport.create).not.toHaveBeenCalled();
+    });
+
+    it('creates a fresh PENDING report after the previous one was reviewed', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        authorID: 'author-1',
+      });
+      // 上一条已 REJECTED → PENDING 查询不命中 → 新行入队
+      prisma.circlePostReport.findFirst.mockResolvedValue(null);
+
+      await service.reportPost('reporter-2', 'post-1', 'again');
+
+      expect(prisma.circlePostReport.create).toHaveBeenCalledWith({
+        data: {
+          postID: 'post-1',
+          reporterID: 'reporter-2',
+          reason: 'again',
+        },
+      });
+      expect(prisma.circlePostReport.update).not.toHaveBeenCalled();
     });
 
     it('stores null when no reason is given', async () => {
@@ -1966,13 +2010,13 @@ describe('CirclePlazaService', () => {
         id: 'post-1',
         authorID: 'author-1',
       });
-      prisma.circlePostReport.upsert.mockResolvedValue({});
+      prisma.circlePostReport.findFirst.mockResolvedValue(null);
 
       await service.reportPost('reporter-2', 'post-1');
 
-      expect(prisma.circlePostReport.upsert).toHaveBeenCalledWith(
+      expect(prisma.circlePostReport.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          create: {
+          data: {
             postID: 'post-1',
             reporterID: 'reporter-2',
             reason: null,
@@ -1989,7 +2033,7 @@ describe('CirclePlazaService', () => {
       await expect(service.reportPost('author-1', 'post-1')).rejects.toThrow(
         ForbiddenException,
       );
-      expect(prisma.circlePostReport.upsert).not.toHaveBeenCalled();
+      expect(prisma.circlePostReport.create).not.toHaveBeenCalled();
     });
 
     it('hides missing, inactive, and non-member posts from reporting', async () => {
@@ -1997,7 +2041,7 @@ describe('CirclePlazaService', () => {
       await expect(
         service.reportPost('reporter-2', 'private-post'),
       ).rejects.toThrow(NotFoundException);
-      expect(prisma.circlePostReport.upsert).not.toHaveBeenCalled();
+      expect(prisma.circlePostReport.create).not.toHaveBeenCalled();
     });
   });
 

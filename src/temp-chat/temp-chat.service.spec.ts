@@ -29,6 +29,7 @@ describe('TempChatService', () => {
   const prisma = {
     tempChat: {
       create: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
@@ -45,6 +46,7 @@ describe('TempChatService', () => {
       updateMany: jest.fn(),
     },
     $transaction: jest.fn((cb: any) => cb(prisma)),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     $executeRaw: jest.fn(),
   };
   const openim = {
@@ -176,6 +178,7 @@ describe('TempChatService', () => {
       expect(prisma.tempChat.findMany).toHaveBeenCalledWith({
         where: { hostUserId: 'host-1' },
         orderBy: [{ createdAt: 'desc' }],
+        take: 200,
         include: {
           _count: {
             select: { guests: { where: { provisioningFailedAt: null } } },

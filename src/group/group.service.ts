@@ -11,6 +11,7 @@ import {
   CircleMemberRole,
   CircleMemberStatus,
   Prisma,
+  ReportReviewStatus,
 } from 'src/generated/prisma';
 import { CircleErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { reserveCircleSeats } from 'src/circle/circle-capacity';
@@ -447,11 +448,15 @@ export class GroupService {
       }
     }
 
+    // review 修复：重复判定只看 PENDING —— 审结（APPROVED/REJECTED）后的
+    // 再次举报是合法的新违规线索，必须能重新进入审核队列。局部唯一索引
+    //（PENDING-only）兜住并发下的双 PENDING。
     const duplicate = await this.prisma.groupReport.findFirst({
       where: {
         reporterID: reporterId,
         groupID: reportGroupID,
         category: dto.category,
+        status: ReportReviewStatus.PENDING,
       },
       select: { id: true },
     });

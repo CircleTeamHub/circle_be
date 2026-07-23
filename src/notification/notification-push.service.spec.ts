@@ -1,16 +1,25 @@
 import { PrismaService } from 'src/prisma/prisma.service';
-import { NotificationType } from 'src/generated/prisma';
 import { NotificationPushService } from './notification-push.service';
 
-describe('NotificationPushService', () => {
+describe('NotificationPushService (#88 per-token delivery)', () => {
   const prisma = {
     devicePushToken: {
       findMany: jest.fn(),
       updateMany: jest.fn(),
       deleteMany: jest.fn(),
     },
+    notificationPushDelivery: {
+      findMany: jest.fn(),
+      update: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    notificationPushOutbox: {
+      updateMany: jest.fn(),
+    },
     $queryRaw: jest.fn(),
-    $transaction: jest.fn((cb: any) => cb(prisma)),
+    $transaction: jest.fn((input: any) =>
+      Array.isArray(input) ? Promise.all(input) : input(prisma),
+    ),
   };
 
   let service: NotificationPushService;
@@ -20,449 +29,328 @@ describe('NotificationPushService', () => {
     get: jest.fn((key: string) => configValues[key]),
   };
 
-  const buildService = () =>
-    new NotificationPushService(
-      prisma as unknown as PrismaService,
-      config as any,
-    );
-
-  const baseNotification = () => ({
-    id: 'n1',
-    type: 'SYSTEM' as const,
-    content: 'hi',
-    read: false,
-    createdAt: '2026-07-05T00:00:00.000Z',
-    fromUser: null,
-    fromTrace: null,
-    fromReply: null,
-    fromCircle: null,
-    fromCirclePost: null,
-    fromInvitation: null,
-  });
-
   beforeEach(() => {
     jest.clearAllMocks();
     for (const key of Object.keys(configValues)) delete configValues[key];
-    service = buildService();
+    service = new NotificationPushService(
+      prisma as unknown as PrismaService,
+      config as any,
+    );
     global.fetch = fetchMock as any;
   });
 
-  it('sends expo push messages with routable notification data', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-      { token: 'ExponentPushToken[two]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }, { status: 'ok' }] }),
-    });
+  const payload = { title: 'T', body: 'B', data: { notificationId: 'n1' } };
 
-    await service.sendNotification('user-1', {
-      id: 'n1',
-      type: 'TRACE_COMMENT',
-      content: 'hello',
-      read: false,
-      createdAt: '2026-07-05T00:00:00.000Z',
-      fromUser: { id: 'u2', nickname: 'Aki', avatarUrl: null },
-      fromTrace: { id: 'trace-1', excerpt: 'body', firstImage: null },
-      fromReply: { id: 'reply-1', content: 'hello' },
-      fromCircle: null,
-      fromCirclePost: null,
-      fromInvitation: null,
-    });
-
-    expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
-      where: {
-        userID: 'user-1',
-        provider: 'expo',
-        disabledAt: null,
-      },
-      select: { token: true, projectId: true, updatedAt: true },
-      orderBy: { updatedAt: 'desc' },
-      take: 20,
-    });
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://exp.host/--/api/v2/push/send',
-      expect.objectContaining({
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: expect.any(String),
-      }),
-    );
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body[0]).toEqual(
-      expect.objectContaining({
-        to: 'ExponentPushToken[one]',
-        title: 'Aki',
-        body: 'hello',
-        data: expect.objectContaining({
-          notificationId: 'n1',
-          type: 'TRACE_COMMENT',
-          toUserId: 'user-1',
-          fromUserId: 'u2',
-          fromUserNickname: 'Aki',
-          traceId: 'trace-1',
-          replyId: 'reply-1',
-        }),
-      }),
-    );
-    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
-  });
-
-  it('includes canonical actor fields for profile-like pushes', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', {
-      ...baseNotification(),
-      type: 'PROFILE_LIKE',
-      content: '',
-      fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-    });
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body[0]).toEqual(
-      expect.objectContaining({
-        title: 'Aki',
-        body: '赞了你的资料',
-        data: expect.objectContaining({
-          type: 'PROFILE_LIKE',
-          toUserId: 'user-1',
-          fromUserId: 'actor-1',
-          fromUserNickname: 'Aki',
-        }),
-      }),
-    );
-    expect(body[0].data.toUserId).not.toBe(body[0].data.fromUserId);
-  });
-
-  it('includes the canonical recipient for system pushes without inventing an actor', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('system-recipient-1', baseNotification());
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body[0].data).toEqual(
-      expect.objectContaining({
-        type: 'SYSTEM',
-        route: 'system',
-        toUserId: 'system-recipient-1',
-      }),
-    );
-    expect(body[0].data).not.toHaveProperty('fromUserId');
-  });
-
-  it('keeps the canonical actor nickname field when the stored nickname is empty', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', {
-      ...baseNotification(),
-      type: 'PROFILE_LIKE',
-      fromUser: { id: 'actor-1', nickname: '', avatarUrl: null },
-    });
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body[0].data).toEqual(
-      expect.objectContaining({
-        fromUserId: 'actor-1',
-        fromUserNickname: '',
-      }),
-    );
-  });
-
-  it('uses mention fallback text and preserves actor/comment routing fields', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', {
-      ...baseNotification(),
-      type: NotificationType.TRACE_MENTION,
-      content: '',
-      fromUser: { id: 'actor-1', nickname: 'Aki', avatarUrl: null },
-      fromTrace: {
-        id: 'trace-1',
-        excerpt: 'original trace must not become the mention body',
-        firstImage: null,
-      },
-      fromReply: { id: 'comment-1', content: '' },
-    });
-
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body[0]).toEqual(
-      expect.objectContaining({
-        body: '在动态评论中提到了你',
-        data: expect.objectContaining({
-          type: 'TRACE_MENTION',
-          fromUserId: 'actor-1',
-          fromUserNickname: 'Aki',
-          traceId: 'trace-1',
-          replyId: 'comment-1',
-        }),
-      }),
-    );
-  });
-
-  it('disables expo tokens reported as not registered', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[bad]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [
-          {
-            status: 'error',
-            details: { error: 'DeviceNotRegistered' },
-          },
-        ],
-      }),
-    });
-
-    const result = await service.sendNotification('user-1', {
-      id: 'n1',
-      type: 'SYSTEM',
-      content: 'done',
-      read: false,
-      createdAt: '2026-07-05T00:00:00.000Z',
-      fromUser: null,
-      fromTrace: null,
-      fromReply: null,
-      fromCircle: null,
-      fromCirclePost: null,
-      fromInvitation: null,
-    });
-
-    expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
-      where: { token: { in: ['ExponentPushToken[bad]'] } },
-      data: { disabledAt: expect.any(Date) },
-    });
-    expect(result).toEqual({
-      status: 'TERMINAL_FAILURE',
-      error: 'DeviceNotRegistered',
-    });
-  });
-
-  it('returns a retryable failure for rate-limited Expo tickets', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [{ status: 'error', details: { error: 'MessageRateExceeded' } }],
-      }),
-    });
-
-    await expect(
-      service.sendNotification('user-1', baseNotification()),
-    ).resolves.toEqual({
-      status: 'RETRYABLE_FAILURE',
-      error: 'MessageRateExceeded',
-    });
-  });
-
-  it('returns a terminal failure for invalid payload tickets', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [{ status: 'error', details: { error: 'MessageTooBig' } }],
-      }),
-    });
-
-    await expect(
-      service.sendNotification('user-1', baseNotification()),
-    ).resolves.toEqual({
-      status: 'TERMINAL_FAILURE',
-      error: 'MessageTooBig',
-    });
-  });
-
-  it('does not hide a retryable error in a mixed ticket batch', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-      { token: 'ExponentPushToken[two]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        data: [
-          { status: 'ok' },
-          { status: 'error', details: { error: 'MessageRateExceeded' } },
-        ],
-      }),
-    });
-
-    await expect(
-      service.sendNotification('user-1', baseNotification()),
-    ).resolves.toEqual({
-      status: 'RETRYABLE_FAILURE',
-      error: 'MessageRateExceeded',
-    });
-  });
-
-  it('retries tickets whose status is missing or unknown', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ details: {} }] }),
-    });
-
-    await expect(
-      service.sendNotification('user-1', baseNotification()),
-    ).resolves.toEqual({
-      status: 'RETRYABLE_FAILURE',
-      error: 'UnknownExpoTicketStatus',
-    });
-  });
-
-  it('omits the Authorization header when no Expo access token is configured', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', baseNotification());
-
-    const headers = fetchMock.mock.calls[0][1].headers;
-    expect(headers).not.toHaveProperty('Authorization');
-  });
-
-  it('attaches a Bearer token when EXPO_ACCESS_TOKEN is configured', async () => {
-    configValues.EXPO_ACCESS_TOKEN = 'secret-expo-token';
-    service = buildService();
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', baseNotification());
-
-    expect(fetchMock.mock.calls[0][1].headers).toEqual(
-      expect.objectContaining({ Authorization: 'Bearer secret-expo-token' }),
-    );
-  });
-
-  it('sends each Expo batch with a bounded request timeout', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ data: [{ status: 'ok' }] }),
-    });
-
-    await service.sendNotification('user-1', {
-      id: 'n1',
-      type: 'SYSTEM',
-      content: 'hi',
-      read: false,
-      createdAt: '2026-07-05T00:00:00.000Z',
-      fromUser: null,
-      fromTrace: null,
-      fromReply: null,
-      fromCircle: null,
-      fromCirclePost: null,
-      fromInvitation: null,
-    });
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      'https://exp.host/--/api/v2/push/send',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-  });
-
-  it('stays best-effort when the Expo endpoint fails or times out', async () => {
-    prisma.devicePushToken.findMany.mockResolvedValue([
-      { token: 'ExponentPushToken[one]' },
-    ]);
-    // Simulate an AbortSignal.timeout firing / network failure.
-    fetchMock.mockRejectedValue(
-      Object.assign(new Error('The operation was aborted'), {
-        name: 'TimeoutError',
-      }),
-    );
-
-    await expect(
-      service.sendNotification('user-1', {
+  describe('composeMessage', () => {
+    it('builds a routable payload with actor title and data ids', () => {
+      const message = service.composeMessage('user-1', {
         id: 'n1',
-        type: 'SYSTEM',
-        content: 'hi',
+        type: 'TRACE_COMMENT',
+        content: 'hello',
         read: false,
         createdAt: '2026-07-05T00:00:00.000Z',
-        fromUser: null,
-        fromTrace: null,
-        fromReply: null,
+        fromUser: { id: 'u2', nickname: 'Aki', avatarUrl: null },
+        fromTrace: { id: 'trace-1', excerpt: 'body', firstImage: null },
+        fromReply: { id: 'reply-1', content: 'hello' },
         fromCircle: null,
         fromCirclePost: null,
         fromInvitation: null,
-      }),
-    ).resolves.toEqual({
-      status: 'RETRYABLE_FAILURE',
-      error: 'The operation was aborted',
-    });
+      } as any);
 
-    // A failed send must never try to disable tokens on incomplete data.
-    expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+      expect(message.title).toBe('Aki');
+      expect(message.body).toBe('hello');
+      expect(message.data).toMatchObject({
+        notificationId: 'n1',
+        type: 'TRACE_COMMENT',
+        toUserId: 'user-1',
+        traceId: 'trace-1',
+        replyId: 'reply-1',
+      });
+    });
   });
 
-  it('deletes stale active and old disabled push tokens', async () => {
-    prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
-    prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 3 });
+  describe('sendToTokens', () => {
+    it('maps tickets per token and keeps SENT ticket ids', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [
+            { status: 'ok', id: 'ticket-1' },
+            { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            { status: 'error', details: { error: 'MessageRateExceeded' } },
+          ],
+        }),
+      });
 
-    await expect(service.deleteStaleTokens()).resolves.toEqual({ count: 3 });
-
-    expect(prisma.devicePushToken.deleteMany).toHaveBeenCalledWith({
-      where: {
-        OR: [
-          { updatedAt: { lt: expect.any(Date) } },
-          { disabledAt: { lt: expect.any(Date) } },
+      const outcomes = await service.sendToTokens(
+        [
+          { token: 'tok-a', projectId: null },
+          { token: 'tok-b', projectId: null },
+          { token: 'tok-c', projectId: null },
         ],
-      },
+        payload,
+      );
+
+      expect(outcomes).toEqual([
+        { token: 'tok-a', status: 'SENT', ticketId: 'ticket-1' },
+        { token: 'tok-b', status: 'TERMINAL', error: 'DeviceNotRegistered' },
+        { token: 'tok-c', status: 'RETRYABLE', error: 'MessageRateExceeded' },
+      ]);
+      // 只有死令牌被停用
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['tok-b'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
     });
-    expect(prisma.$transaction).toHaveBeenCalledWith(
-      expect.any(Function),
-      expect.objectContaining({ timeout: 60_000 }),
-    );
+
+    it('does NOT disable tokens on message-level terminal errors (MessageTooBig)', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ status: 'error', details: { error: 'MessageTooBig' } }],
+        }),
+      });
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'tok-a', projectId: null }],
+        payload,
+      );
+
+      expect(outcomes[0]).toEqual({
+        token: 'tok-a',
+        status: 'TERMINAL',
+        error: 'MessageTooBig',
+      });
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('treats InvalidCredentials as retryable and never disables the token (P1)', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: [{ status: 'error', details: { error: 'InvalidCredentials' } }],
+        }),
+      });
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'tok-a', projectId: null }],
+        payload,
+      );
+
+      // 项目凭据坏了是运维故障：修好后重试应当恢复，token 不能被 reap
+      expect(outcomes).toEqual([
+        { token: 'tok-a', status: 'RETRYABLE', error: 'InvalidCredentials' },
+      ]);
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('marks the whole batch retryable when the HTTP call keeps failing', async () => {
+      fetchMock.mockRejectedValue(new Error('ECONNRESET'));
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'tok-a', projectId: null }],
+        payload,
+      );
+
+      expect(outcomes[0].status).toBe('RETRYABLE');
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('groups tokens by Expo project id into separate requests', async () => {
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ data: [{ status: 'ok', id: 't' }] }),
+      });
+
+      await service.sendToTokens(
+        [
+          { token: 'tok-a', projectId: 'proj-1' },
+          { token: 'tok-b', projectId: 'proj-2' },
+        ],
+        payload,
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
-  it('skips stale-token cleanup when another instance owns the lock', async () => {
-    prisma.$queryRaw.mockResolvedValue([{ acquired: false }]);
+  describe('pollReceipts', () => {
+    const now = new Date('2026-07-21T12:00:00.000Z');
+    const sentAt = new Date(now.getTime() - 30 * 60 * 1000);
 
-    await expect(service.deleteStaleTokens()).resolves.toEqual({ count: 0 });
+    it('confirms ok receipts, reaps dead tokens, requeues retryable outboxes', async () => {
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        { id: 'd2', ticketID: 't2', token: 'tok-b', outboxID: 'o2', sentAt },
+        { id: 'd3', ticketID: 't3', token: 'tok-c', outboxID: 'o3', sentAt },
+      ]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'ok' },
+            t2: { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            t3: { status: 'error', details: { error: 'ExpoServerError' } },
+          },
+        }),
+      });
 
-    expect(prisma.devicePushToken.deleteMany).not.toHaveBeenCalled();
+      const processed = await service.pollReceipts(now);
+
+      expect(processed).toBe(3);
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd1' },
+        data: expect.objectContaining({ status: 'CONFIRMED' }),
+      });
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd2' },
+        data: expect.objectContaining({
+          status: 'TERMINAL',
+          lastError: 'DeviceNotRegistered',
+        }),
+      });
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['tok-b'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
+      // 可重试错误：投递行 FAILED + outbox 拉回 PENDING 由 sweep 补发
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd3' },
+        data: expect.objectContaining({ status: 'FAILED' }),
+      });
+      // round 3：requeue 与行状态同事务，形状从批量 in 改为逐条 id
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: 'o3', status: 'COMPLETED' },
+        data: { status: 'PENDING', nextAttemptAt: now },
+      });
+    });
+
+    it('keeps InvalidCredentials receipts retryable without reaping the token (P1)', async () => {
+      prisma.notificationPushDelivery.findMany
+        .mockResolvedValueOnce([
+          { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+        ])
+        .mockResolvedValue([]);
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          data: {
+            t1: { status: 'error', details: { error: 'InvalidCredentials' } },
+          },
+        }),
+      });
+
+      await service.pollReceipts(now);
+
+      expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+        where: { id: 'd1' },
+        data: {
+          status: 'FAILED',
+          receiptCheckedAt: now,
+          lastError: 'InvalidCredentials',
+        },
+      });
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+      // outbox 被拉回 PENDING，凭据修好后自动补发
+      expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith({
+        where: { id: 'o1', status: 'COMPLETED' },
+        data: { status: 'PENDING', nextAttemptAt: now },
+      });
+    });
+
+    it('drains multiple batches in one run instead of capping at 300 per 30min', async () => {
+      const fullBatch = Array.from({ length: 300 }, (_, index) => ({
+        id: `d${index}`,
+        ticketID: `t${index}`,
+        token: `tok-${index}`,
+        outboxID: `o${index}`,
+        sentAt,
+      }));
+      const tail = [
+        {
+          id: 'd-tail',
+          ticketID: 't-tail',
+          token: 'tok-t',
+          outboxID: 'ot',
+          sentAt,
+        },
+      ];
+      prisma.notificationPushDelivery.findMany
+        .mockResolvedValueOnce(fullBatch)
+        .mockResolvedValueOnce(tail)
+        .mockResolvedValue([]);
+      const okFor = (rows: Array<{ ticketID: string }>) =>
+        Object.fromEntries(rows.map((row) => [row.ticketID, { status: 'ok' }]));
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: okFor(fullBatch) }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: okFor(tail) }),
+        });
+
+      const processed = await service.pollReceipts(now);
+
+      // 满批 → 继续抽下一批；尾批不足 300 → 收工
+      expect(processed).toBe(301);
+      expect(prisma.notificationPushDelivery.findMany).toHaveBeenCalledTimes(2);
+    });
+
+    it('assumes delivery for receipts older than the 24h Expo retention', async () => {
+      const ancient = new Date(now.getTime() - 25 * 60 * 60 * 1000);
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        {
+          id: 'd-old',
+          ticketID: 't-old',
+          token: 'tok-old',
+          outboxID: 'o-old',
+          sentAt: ancient,
+        },
+      ]);
+
+      const processed = await service.pollReceipts(now);
+
+      expect(processed).toBe(1);
+      expect(prisma.notificationPushDelivery.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['d-old'] } },
+        data: expect.objectContaining({ status: 'CONFIRMED' }),
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('leaves state untouched when the receipt endpoint is unreachable', async () => {
+      prisma.notificationPushDelivery.findMany.mockResolvedValue([
+        { id: 'd1', ticketID: 't1', token: 'tok-a', outboxID: 'o1', sentAt },
+      ]);
+      fetchMock.mockRejectedValue(new Error('down'));
+
+      const processed = await service.pollReceipts(now);
+
+      expect(processed).toBe(0);
+      expect(prisma.notificationPushDelivery.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deleteStaleTokens', () => {
+    it('prunes aged tokens under an advisory lock', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
+      prisma.devicePushToken.deleteMany.mockResolvedValue({ count: 2 });
+
+      const result = await service.deleteStaleTokens();
+
+      expect(result.count).toBe(2);
+    });
+
+    it('is a no-op when another instance holds the lock', async () => {
+      prisma.$queryRaw.mockResolvedValue([{ acquired: false }]);
+
+      const result = await service.deleteStaleTokens();
+
+      expect(result.count).toBe(0);
+      expect(prisma.devicePushToken.deleteMany).not.toHaveBeenCalled();
+    });
   });
 });

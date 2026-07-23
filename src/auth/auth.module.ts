@@ -1,4 +1,4 @@
-import { Global, Module } from '@nestjs/common';
+import { Global, Logger, Module } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { PassportModule } from '@nestjs/passport';
@@ -13,6 +13,8 @@ import { SessionRevocationService } from './session-revocation.service';
 import { EmailVerificationService } from './email-verification.service';
 import { MAILER } from './mailer/mailer.interface';
 import { ConsoleMailer } from './mailer/console.mailer';
+import { UnconfiguredMailer } from './mailer/unconfigured.mailer';
+import { SmtpMailer } from './mailer/smtp.mailer';
 import { OpenimModule } from 'src/openim/openim.module';
 import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
 
@@ -42,7 +44,30 @@ import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
     RefreshTokenCleanup,
     SessionRevocationService,
     EmailVerificationService,
-    { provide: MAILER, useClass: ConsoleMailer },
+    {
+      // 真实投递 vs 开发态自动切换（#82）：SMTP_HOST 存在即用 SmtpMailer
+      // （凭据齐备由 env.validation 兜底）。生产缺 SMTP 时 fail closed
+      // （review 修复）：绑 UnconfiguredMailer —— 请求期 503、绝不把验证码
+      // 打进日志（ConsoleMailer 会，等于把 OTP 广播给整条日志管道）。启动期
+      // 再补一条 error 日志让部署者第一时间看到。仅开发/测试回落 Console。
+      provide: MAILER,
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => {
+        if (configService.get<string>('SMTP_HOST')) {
+          return new SmtpMailer(configService);
+        }
+        if (configService.get<string>('NODE_ENV') === 'production') {
+          new Logger('AuthModule').error(
+            'SMTP_HOST is not configured in production — email verification ' +
+              'endpoints will answer 503 and NO user can register or log ' +
+              'in by code. Set SMTP_HOST/SMTP_USER/SMTP_PASS ' +
+              '(and optionally SMTP_PORT/SMTP_SECURE/MAIL_FROM).',
+          );
+          return new UnconfiguredMailer();
+        }
+        return new ConsoleMailer();
+      },
+    },
     JwtStrategy,
     CaslAbilityService,
     ImTokenThrottlerGuard,
@@ -50,7 +75,8 @@ import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when
   // BAN/DELETE happens) can revoke a user's sessions without going through
-  // AuthService.
-  exports: [CaslAbilityService, RefreshTokenService],
+  // AuthService. SessionRevocationService is exported so the realtime gateway
+  // can run the same revocation check on WebSocket auth that HTTP runs.
+  exports: [CaslAbilityService, RefreshTokenService, SessionRevocationService],
 })
 export class AuthModule {}

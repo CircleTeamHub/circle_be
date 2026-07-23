@@ -13,7 +13,7 @@ import {
 } from '@nestjs/common';
 import { Request } from 'express';
 import * as requestIp from 'request-ip';
-import { Throttle } from '@nestjs/throttler';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -34,6 +34,10 @@ import { ImTokenDto, ImTokenQueryDto } from './dto/im-token.dto';
 import { LoginDto } from './dto/login.dto';
 import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { RequestEmailCodeDto } from './dto/request-email-code.dto';
+import {
+  RequestPasswordResetDto,
+  ResetPasswordDto,
+} from './dto/password-reset.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -195,8 +199,8 @@ export class AuthController {
   @ApiOperation({ summary: 'Logout and revoke a refresh token' })
   @ApiBody({ type: RefreshTokenDto })
   @ApiOkResponse({ description: 'Logout successful' })
-  logout(@Body() dto: RefreshTokenDto) {
-    return this.authService.logout(dto.refreshToken);
+  logout(@Body() dto: RefreshTokenDto, @Req() req?: Request) {
+    return this.authService.logout(dto.refreshToken, getSessionContext(req));
   }
 
   @Get('sessions')
@@ -272,6 +276,30 @@ export class AuthController {
       dto.enabled,
       req.user.sessionId,
     );
+  }
+
+  @Post('password/reset-request')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Request a password-reset code (FE#92; silent for unknown emails)',
+  })
+  @ApiBody({ type: RequestPasswordResetDto })
+  @ApiCreatedResponse({ description: 'Code sent (or silently ignored)' })
+  requestPasswordReset(@Body() dto: RequestPasswordResetDto) {
+    return this.authService.requestPasswordReset(dto.email);
+  }
+
+  @Post('password/reset')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Reset password with an emailed code (revokes all sessions)',
+  })
+  @ApiBody({ type: ResetPasswordDto })
+  @ApiOkResponse({ description: 'Password reset' })
+  resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto.email, dto.code, dto.newPassword);
   }
 
   @Post('change-password')

@@ -20,6 +20,8 @@ describe('NoteService', () => {
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
     $executeRaw: jest.fn().mockResolvedValue(0),
+    // createShareLink 配额检查用 advisory 锁（pg_advisory_xact_lock）
+    $queryRaw: jest.fn().mockResolvedValue([]),
     note: {
       create: jest.fn(),
       findMany: jest.fn(),
@@ -52,6 +54,8 @@ describe('NoteService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
+      // #94 每用户活跃链接上限检查；默认远低于上限
+      count: jest.fn().mockResolvedValue(0),
     },
   };
 
@@ -1181,7 +1185,13 @@ describe('NoteService', () => {
     );
     const body = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     expect(body.subarray(0, 5).toString()).toBe('%PDF-');
-    expect(body.toString('latin1')).toContain('https://cdn.example.com/1.png');
+    // 导出件里嵌的是现签 URL，不再是原始直链（notes/* 已不匿名可读，直链对收件人 403）。
+    expect(body.toString('latin1')).toContain(
+      'https://signed.example.com/notes/user-1/1.png',
+    );
+    expect(body.toString('latin1')).not.toContain(
+      'https://cdn.example.com/1.png',
+    );
     expect(result).toMatchObject({
       filename: 'PDF测试.pdf',
       mimeType: 'application/pdf',
@@ -1190,6 +1200,59 @@ describe('NoteService', () => {
       ),
       expiresAt,
     });
+  });
+
+  // 导出漏在 presign-on-read 改造之外：createLongImageSvg / createPdf 调
+  // buildSectionsFromRow 时不传 presigned map，嵌进导出文件的是原始 URL。
+  // 桶策略把 notes/* 收归私有后，这些链接对任何人都是 403 —— 而长图导出**只有**
+  // URL、PDF 第 5 张往后也只有 URL，等于导出件里全是死链。
+  it('presigns media urls embedded in the long-image (SVG) export', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-svg-presign',
+      ownerID: 'user-1',
+      title: '长图导出',
+      content: '正文',
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      media: [
+        {
+          id: 'img-1',
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/1.png',
+          url: 'https://cdn.example.com/circle/notes/user-1/1.png',
+          mimeType: 'image/png',
+          size: 10,
+          sortOrder: 0,
+        },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    uploadService.uploadBuffer.mockResolvedValueOnce({
+      url: 'https://cdn.example.com/note-exports/user-1/note-svg-presign/a.svg',
+      key: 'note-exports/user-1/note-svg-presign/a.svg',
+      size: 512,
+      expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+    });
+
+    await service.createNoteExport('user-1', 'note-svg-presign', {
+      format: 'IMAGE',
+      scope: 'ALL',
+    } as never);
+
+    const body = (
+      uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
+    ).toString();
+    expect(body).toContain('https://signed.example.com/notes/user-1/1.png');
+    // 原始直链不该再出现在导出件里 —— 它对收件人是 403。
+    expect(body).not.toContain(
+      'https://cdn.example.com/circle/notes/user-1/1.png',
+    );
   });
 
   it('includes showcase-only media in PDF and long-image exports', async () => {
@@ -1272,9 +1335,14 @@ describe('NoteService', () => {
     const pdfBody = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     const svgBody = uploadService.uploadBuffer.mock.calls[1][0].body as Buffer;
     expect(pdfBody.toString('latin1')).toContain(
+      'https://signed.example.com/notes/user-1/show.png',
+    );
+    expect(svgBody.toString()).toContain(
+      'https://signed.example.com/notes/user-1/show.png',
+    );
+    expect(svgBody.toString()).not.toContain(
       'https://cdn.example.com/show.png',
     );
-    expect(svgBody.toString()).toContain('https://cdn.example.com/show.png');
   });
 
   it('rejects export requests whose selected media exceed safe limits', async () => {
@@ -1414,8 +1482,10 @@ describe('NoteService', () => {
     expect(uploadService.downloadObjectBuffer).toHaveBeenCalledTimes(4);
     const body = uploadService.uploadBuffer.mock.calls[0][0].body as Buffer;
     const pdfText = body.toString('latin1');
-    expect(pdfText).toContain('https://cdn.example.com/1.png');
-    expect(pdfText).toContain('https://cdn.example.com/8.png');
+    // 超出 MAX_PDF_EMBEDDED_IMAGES 的图片没有嵌入字节，URL 是唯一引用 ——
+    // 正是这些最需要现签，否则导出件里它们全是死链。
+    expect(pdfText).toContain('https://signed.example.com/notes/user-1/1.png');
+    expect(pdfText).toContain('https://signed.example.com/notes/user-1/8.png');
   });
 
   it('uses NOTE_EXPORT_PDF_FONT_PATH when a custom PDF font is configured', () => {
@@ -1926,6 +1996,23 @@ describe('NoteService', () => {
     });
   });
 
+  it('rejects creating a share link past the per-user active cap (#94)', async () => {
+    prisma.noteShareLink.count.mockResolvedValueOnce(200);
+
+    await expect(
+      service.createShareLink('user-1', { title: '我的笔记' }),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'NOTE_SHARE_LINK_LIMIT',
+      }),
+    });
+
+    expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
+    // count 与 create 必须同事务且持 per-owner advisory 锁（并发下守住上限）
+    expect(prisma.$transaction).toHaveBeenCalled();
+    expect(prisma.$queryRaw).toHaveBeenCalled();
+  });
+
   it('rejects a note share link when any requested note is missing or owned by someone else', async () => {
     prisma.note.findMany.mockResolvedValueOnce([{ id: 'note-1' }]);
 
@@ -2205,6 +2292,43 @@ describe('NoteService', () => {
     const createArg = prisma.note.create.mock.calls[0][0];
     expect(createArg.data.title).toHaveLength(120);
     expect(createArg.data.content).toHaveLength(20_000);
+  });
+
+  it('falls back to the dto title when every content block is blank', async () => {
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await service.createNote('user-1', {
+      title: '我的标题',
+      contentJson: [
+        {
+          type: 'paragraph',
+          content: [{ type: 'text', text: '   ', styles: {} }],
+        },
+      ] as any,
+      media: [],
+    });
+
+    // extractBlockText 会丢掉纯空白片段，于是 extractedText[0] 是 undefined、
+    // derivedTitle 的 `??` 回退到 dto.title。这条不变式是 DTO 侧空白校验够用的
+    // 前提：若这里改成能产出空串，标题就能绕过 DTO 变空。
+    const createArg = prisma.note.create.mock.calls[0][0];
+    expect(createArg.data.title).toBe('我的标题');
   });
 
   // ── collectNote：聊天收藏笔记 → 复制入我的笔记 ─────────────────────────────
@@ -2999,6 +3123,154 @@ describe('NoteService', () => {
       });
 
       expect(prisma.noteShareLink.findMany).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── posterUrl 的 object key 归属校验（IDOR）─────────────────────────────────
+  // presign-on-read（#74）从客户端可控的 posterUrl 反推 object key 去签名，
+  // 但写入侧 assertMediaOwnership 只校验 objectKey 的属主、posterUrl 只校验同源。
+  // 于是攻击者可以在自己的笔记里把 posterUrl 指向受害者的对象，读取时拿到一个
+  // 有效的签名 URL —— 正好绕开 #74 想堵的「私有媒体不可访问」。
+  describe('posterUrl object key ownership', () => {
+    const signedKeys = () =>
+      uploadService.createPresignedGetUrl.mock.calls.map(
+        (call: unknown[]) => call[0] as string,
+      );
+
+    const noteRow = (over: Record<string, unknown>) => ({
+      id: 'note-1',
+      ownerID: 'attacker',
+      title: 't',
+      content: 'c',
+      status: 'ACTIVE',
+      available: false,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...over,
+    });
+
+    it('does not presign a posterUrl whose object key belongs to another user', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [
+            {
+              id: 'm1',
+              type: 'IMAGE',
+              sortOrder: 0,
+              // 自己的 key —— 过得了 assertMediaOwnership
+              objectKey: 'notes/attacker/mine.jpg',
+              url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+              // 指向受害者的对象
+              posterUrl:
+                'https://minio.example.com/circle/notes/victim/secret.jpg',
+            },
+          ],
+        }),
+      );
+
+      await service.getNote('attacker', 'note-1');
+
+      expect(signedKeys()).toContain('notes/attacker/mine.jpg');
+      expect(signedKeys()).not.toContain('notes/victim/secret.jpg');
+    });
+
+    it('does not presign a foreign posterUrl frozen into the stored sections JSON', async () => {
+      // sections JSON 里的 verbatim item 走的是另一条收集路径，必须一并挡住。
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [],
+          sections: {
+            media: {
+              items: [
+                {
+                  id: 'm1',
+                  type: 'IMAGE',
+                  objectKey: 'notes/attacker/mine.jpg',
+                  url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+                  posterUrl:
+                    'https://minio.example.com/circle/notes/victim/secret.jpg',
+                },
+              ],
+            },
+          },
+        }),
+      );
+
+      await service.getNote('attacker', 'note-1');
+
+      expect(signedKeys()).not.toContain('notes/victim/secret.jpg');
+    });
+
+    it('still presigns a collected copy whose media belongs to the original author', async () => {
+      // 收藏不复制对象：collectNote 直接沿用原作者的 objectKey/posterUrl。
+      // 按「key 必须属于笔记主人」一刀切会把收藏笔记的图片全弄挂 —— 不能这么修。
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          ownerID: 'collector',
+          media: [
+            {
+              id: 'm1',
+              type: 'VIDEO',
+              sortOrder: 0,
+              objectKey: 'notes/author/clip.mp4',
+              url: 'https://minio.example.com/circle/notes/author/clip.mp4',
+              posterUrl:
+                'https://minio.example.com/circle/notes/author/clip-poster.jpg',
+            },
+          ],
+        }),
+      );
+
+      await service.getNote('collector', 'note-1');
+
+      expect(signedKeys()).toContain('notes/author/clip.mp4');
+      expect(signedKeys()).toContain('notes/author/clip-poster.jpg');
+    });
+
+    it('rejects creating a note whose posterUrl points at another user object', async () => {
+      // 备好写库 mock：这样「没拦住」时是走完流程后断言失败，而不是 mock 缺失
+      // 抛 TypeError —— 失败信息才明确指向缺失的校验本身。
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        ownerID: 'attacker',
+        title: 't',
+        content: 'c',
+        status: 'ACTIVE',
+        available: false,
+        pinned: false,
+        imageCount: 1,
+        videoCount: 0,
+        mediaCount: 1,
+        groupMemberships: [],
+        media: [],
+        coverMedia: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      await expect(
+        service.createNote('attacker', {
+          title: 't',
+          media: [
+            {
+              type: 'IMAGE',
+              objectKey: 'notes/attacker/mine.jpg',
+              url: 'https://minio.example.com/circle/notes/attacker/mine.jpg',
+              posterUrl:
+                'https://minio.example.com/circle/notes/victim/secret.jpg',
+              sortOrder: 0,
+            },
+          ],
+        } as never),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      expect(prisma.note.create).not.toHaveBeenCalled();
     });
   });
 });

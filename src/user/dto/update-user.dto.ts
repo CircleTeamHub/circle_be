@@ -1,4 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import {
   IsDateString,
   IsEmail,
@@ -6,6 +7,7 @@ import {
   IsOptional,
   IsString,
   IsUrl,
+  Length,
   MaxLength,
 } from 'class-validator';
 import { Gender } from 'src/generated/prisma';
@@ -19,7 +21,10 @@ export class UpdateUserDto {
   @ApiPropertyOptional({ example: 'My Nickname' })
   @IsOptional()
   @IsString()
-  @MaxLength(50)
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() : value,
+  )
+  @Length(1, 50)
   nickname?: string;
 
   @ApiPropertyOptional({ example: 'https://example.com/avatar.png' })

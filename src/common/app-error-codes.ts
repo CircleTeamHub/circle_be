@@ -40,6 +40,8 @@ export const MembershipErrorCode = {
   LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
   InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
+  // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
+  IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
 } as const;
 
 export const CircleErrorCode = {
@@ -102,6 +104,7 @@ export const TempChatErrorCode = {
   Ended: 'TEMP_CHAT_ENDED',
   Full: 'TEMP_CHAT_FULL',
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
+  JoinFailed: 'TEMP_CHAT_JOIN_FAILED',
 } as const;
 
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
@@ -177,6 +180,8 @@ export const NoteErrorCode = {
   ExportTotalTooLarge: 'NOTE_EXPORT_TOTAL_TOO_LARGE',
   ExportTooManyMedia: 'NOTE_EXPORT_TOO_MANY_MEDIA',
   NotFound: 'NOTE_NOT_FOUND',
+  // round 3：回收站恢复撞上同源活跃收藏副本（唯一索引会拒绝）
+  AlreadyCollected: 'NOTE_RESTORE_DUPLICATE',
   GroupNotFound: 'NOTE_GROUP_NOT_FOUND',
   ImageTooLarge: 'NOTE_IMAGE_TOO_LARGE',
   // 分享链接不可用。两处共用：
@@ -186,6 +191,8 @@ export const NoteErrorCode = {
   // 客户端应按「链接已失效」提示，不要复用笔记的「笔记不存在」文案。
   ShareLinkInvalid: 'NOTE_SHARE_LINK_INVALID',
   ShareLinkInvalidCursor: 'NOTE_SHARE_LINK_INVALID_CURSOR',
+  // #94：每用户活跃分享链接达到上限。
+  ShareLinkLimit: 'NOTE_SHARE_LINK_LIMIT',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。
@@ -204,6 +211,14 @@ export const CallErrorCode = {
   NotFound: 'CALL_NOT_FOUND',
   NotAllowed: 'CALL_NOT_ALLOWED',
   AlreadyActive: 'CALL_ALREADY_ACTIVE',
+  // 1:1 呼叫（#113）：非好友或任一方向已拉黑。共用一个码，不向发起方泄露
+  // 「被拉黑」这一事实。
+  NotFriend: 'CALL_NOT_FRIEND',
+} as const;
+
+// 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)
+export const UploadErrorCode = {
+  PayloadTooLarge: 'UPLOAD_PAYLOAD_TOO_LARGE',
 } as const;
 
 // 会话分组(本地消息分组):同名分组已存在 / 分组不存在。
@@ -220,6 +235,8 @@ export const ChatHistoryErrorCode = {
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
 export const CollectionErrorCode = {
   NotFound: 'COLLECTION_NOT_FOUND',
+  // #104 审查发现：无每用户上限，客户端循环可无界造行。
+  Limit: 'COLLECTION_LIMIT',
 } as const;
 
 // 展示图标 / 系统图标 / 圈子图标选择。(注:图标页暂未接入 getApiErrorMessage,待前端接线。)
@@ -253,7 +270,19 @@ export const UserErrorCode = {
   InvalidBirthday: 'USER_INVALID_BIRTHDAY',
 } as const;
 
+export const AdminUserErrorCode = {
+  NotFound: 'ADMIN_USER_NOT_FOUND',
+  SelfStatusChange: 'ADMIN_USER_SELF_STATUS_CHANGE',
+  InvalidStatusTransition: 'ADMIN_USER_INVALID_STATUS_TRANSITION',
+  StatusConflict: 'ADMIN_USER_STATUS_CONFLICT',
+  ConfirmationMismatch: 'ADMIN_USER_CONFIRMATION_MISMATCH',
+  SensitiveFieldInvalid: 'ADMIN_USER_SENSITIVE_FIELD_INVALID',
+  SensitiveReasonRequired: 'ADMIN_USER_SENSITIVE_REASON_REQUIRED',
+  AuditUnavailable: 'ADMIN_AUDIT_UNAVAILABLE',
+} as const;
+
 export type AppErrorCode =
+  | (typeof AdminUserErrorCode)[keyof typeof AdminUserErrorCode]
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
   | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
@@ -268,6 +297,7 @@ export type AppErrorCode =
   | (typeof CallErrorCode)[keyof typeof CallErrorCode]
   | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode]
   | (typeof ChatHistoryErrorCode)[keyof typeof ChatHistoryErrorCode]
+  | (typeof UploadErrorCode)[keyof typeof UploadErrorCode]
   | (typeof CollectionErrorCode)[keyof typeof CollectionErrorCode]
   | (typeof IconErrorCode)[keyof typeof IconErrorCode]
   | (typeof LikeErrorCode)[keyof typeof LikeErrorCode]
@@ -275,6 +305,7 @@ export type AppErrorCode =
   | (typeof UserErrorCode)[keyof typeof UserErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
+  AdminUserErrorCode,
   AuthErrorCode,
   CoinErrorCode,
   MembershipErrorCode,
@@ -287,6 +318,7 @@ export const APP_ERROR_CODE_GROUPS = [
   FriendErrorCode,
   NoteErrorCode,
   CallErrorCode,
+  UploadErrorCode,
   ConversationGroupErrorCode,
   ChatHistoryErrorCode,
   CollectionErrorCode,

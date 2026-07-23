@@ -31,6 +31,9 @@ export class RegisterDto {
 
   @ApiProperty({ example: 'Jimmy' })
   @IsString()
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() : value,
+  )
   @Length(1, 50)
   nickname: string;
 

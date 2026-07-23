@@ -224,6 +224,8 @@ const SHARE_LINK_GUEST_VIEWER = '';
 // 每用户上限还没做），不设 take 会一次性把该用户全部历史链接拉进内存。
 // 每页上限 100 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
 const SHARE_LINK_LIST_DEFAULT_LIMIT = 50;
+// #94：每用户活跃分享链接上限（未撤销且未过期的计数）。
+const MAX_ACTIVE_SHARE_LINKS_PER_USER = 200;
 const PDF_FONT_CANDIDATES = [
   '/Library/Fonts/Arial Unicode.ttf',
   '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf',
@@ -435,8 +437,20 @@ export class NoteService {
     );
   }
 
-  private createLongImageSvg(note: NoteRow) {
-    const sections = this.buildSectionsFromRow(note);
+  /**
+   * 长图导出是**纯文字** SVG：不嵌图片字节，`图片 N: <url>` 里的 URL 是对媒体的
+   * 唯一引用。桶策略把 notes/* 收归私有后，原始直链对收件人是 403，所以这里必须
+   * 和其它读取路径一样发短时签名 URL（presignedUrls）。
+   *
+   * 已知限制：签名 URL ~2h 过期，而导出件是用户长期留存的。链接终会失效 ——
+   * 但「导出后即刻可用」好过「一出生就是死链」。彻底解法是把媒体打包进导出件，
+   * 属于更大的改动，不在本次范围。
+   */
+  private createLongImageSvg(
+    note: NoteRow,
+    presignedUrls?: Map<string, string>,
+  ) {
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     const exportMedia = this.getExportSectionMedia(sections);
     const lines = [
       note.title,
@@ -481,12 +495,16 @@ export class NoteService {
     );
   }
 
-  private async createPdf(note: NoteRow) {
-    const sections = this.buildSectionsFromRow(note);
+  /** PDF 只嵌前 MAX_PDF_EMBEDDED_IMAGES 张图的字节，之后的媒体同样只剩 URL 可引用。 */
+  private async createPdf(note: NoteRow, presignedUrls?: Map<string, string>) {
+    const sections = this.buildSectionsFromRow(note, presignedUrls);
     const sectionMedia = this.getExportSectionMedia(sections);
     const mediaUrls = sectionMedia
       .map((item: any) => (typeof item.url === 'string' ? item.url : null))
-      .filter((url): url is string => Boolean(url));
+      .filter((url): url is string => Boolean(url))
+      // Keywords 是 PDF 元数据，不是给人点的链接。剥掉签名 query：短时凭据写进
+      // 长期留存文件的元数据既没用（会过期）又平白多一处泄漏面。
+      .map((url) => url.split('?')[0]);
     const doc = new PDFDocument({
       size: 'A4',
       margin: 48,
@@ -681,6 +699,45 @@ export class NoteService {
         `objectKey must start with notes/${ownerID}/`,
       );
     }
+
+    // posterUrl 没有独立的 objectKey 列，读取时要从 URL 反推 key 去签名
+    // （collectNoteMediaTargets）。若这里只校验同源而不校验属主，客户端就能在
+    // 自己的笔记上把 posterUrl 指向别人的对象，读取时换回一个有效签名 URL ——
+    // 绕开 presign-on-read 想建立的「私有媒体不可访问」。
+    const invalidPoster = media.find((item) =>
+      this.isForeignPosterKey(item.objectKey, item.posterUrl),
+    );
+    if (invalidPoster) {
+      throw new BadRequestException(
+        'posterUrl must reference the same owner as its objectKey',
+      );
+    }
+  }
+
+  /** `notes/{uid}/{file}` → `notes/{uid}/`；形状不符返回 null（不放行）。 */
+  private noteMediaOwnerPrefix(objectKey: unknown): string | null {
+    if (typeof objectKey !== 'string') return null;
+    const [root, uid] = objectKey.split('/');
+    return root === 'notes' && uid ? `notes/${uid}/` : null;
+  }
+
+  /**
+   * posterUrl 反推出的 key 是否落在该媒体自己 objectKey 的属主目录之外。
+   *
+   * 判据刻意是「与同一条媒体的 objectKey 同属主」而不是「等于笔记主人」：收藏
+   * 复制不搬运对象（collectNote 直接沿用原作者的 objectKey），按笔记主人一刀切
+   * 会把所有收藏笔记的封面弄挂。视频封面本就该躺在视频旁边。
+   *
+   * 反推不出 key（非本站 URL）时返回 false —— 那种情况由 assertMediaUrlsAreSafe
+   * 的同源检查负责，不归这里管。
+   */
+  private isForeignPosterKey(objectKey: unknown, posterUrl: unknown): boolean {
+    const posterKey = this.uploadService?.objectKeyFromPublicUrl(
+      typeof posterUrl === 'string' ? posterUrl : null,
+    );
+    if (!posterKey) return false;
+    const prefix = this.noteMediaOwnerPrefix(objectKey);
+    return !prefix || !posterKey.startsWith(prefix);
   }
 
   /**
@@ -1226,9 +1283,19 @@ export class NoteService {
         out.push({ url, objectKey: key });
       }
     };
+    /**
+     * poster 的 key 是从客户端可控的 URL 反推来的，签名前必须确认它没跨出该媒体
+     * objectKey 的属主目录。写入侧已经拦了（assertMediaOwnership），这里是纵深
+     * 防御，也用于挡住修复前就已落库的脏数据。
+     */
+    const addPoster = (posterUrl: unknown, objectKey: unknown) => {
+      if (typeof posterUrl !== 'string') return;
+      if (this.isForeignPosterKey(objectKey, posterUrl)) return;
+      add(posterUrl, this.uploadService?.objectKeyFromPublicUrl(posterUrl));
+    };
     for (const m of note.media ?? []) {
       add(m.url, m.objectKey);
-      add(m.posterUrl, this.uploadService?.objectKeyFromPublicUrl(m.posterUrl));
+      addPoster(m.posterUrl, m.objectKey);
     }
     const stored = this.isRecord(note.sections) ? note.sections : {};
     for (const section of ['media', 'showcase'] as const) {
@@ -1237,10 +1304,7 @@ export class NoteService {
         for (const item of s.items) {
           if (!this.isRecord(item)) continue;
           add(item.url, item.objectKey);
-          add(
-            item.posterUrl,
-            this.uploadService?.objectKeyFromPublicUrl(item.posterUrl),
-          );
+          addPoster(item.posterUrl, item.objectKey);
         }
       }
     }
@@ -1472,6 +1536,7 @@ export class NoteService {
         'group and groupId cannot be used together',
       );
     }
+
     if (dto.groupId) {
       await this.requireOwnedGroup(ownerID, dto.groupId);
     }
@@ -1508,18 +1573,38 @@ export class NoteService {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const token = this.createShareToken();
       try {
-        const row = await this.prisma.noteShareLink.create({
-          data: {
-            ownerID,
-            token,
-            title,
-            status: dto.status ?? null,
-            group: dto.group ?? null,
-            groupID: dto.groupId ?? null,
-            search,
-            noteIDs,
-            expiresAt,
-          },
+        // #94 配额（review 修复为原子）：count 与 create 同事务，并用 per-owner
+        // advisory 锁串行化 —— 否则 199 条时并发双请求都读到 199、双双越过
+        // 200 护栏。锁按 owner 分片，不同用户互不阻塞；xact 锁随事务自动释放。
+        const quotaLockKey = `note-share-link:${ownerID}`;
+        const row = await this.prisma.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+          const activeLinks = await tx.noteShareLink.count({
+            where: {
+              ownerID,
+              revokedAt: null,
+              OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+            },
+          });
+          if (activeLinks >= MAX_ACTIVE_SHARE_LINKS_PER_USER) {
+            throw new BadRequestException({
+              message: `分享链接数量已达上限（${MAX_ACTIVE_SHARE_LINKS_PER_USER}），请先撤销不再使用的链接`,
+              errorCode: NoteErrorCode.ShareLinkLimit,
+            });
+          }
+          return tx.noteShareLink.create({
+            data: {
+              ownerID,
+              token,
+              title,
+              status: dto.status ?? null,
+              group: dto.group ?? null,
+              groupID: dto.groupId ?? null,
+              search,
+              noteIDs,
+              expiresAt,
+            },
+          });
         });
 
         return this.mapShareLink(row);
@@ -1977,23 +2062,27 @@ export class NoteService {
     }
 
     const basename = sanitizeFilenamePart(note.title);
-    if (input.format === 'IMAGE') {
-      return this.uploadExportArtifact({
-        ownerID: note.ownerID,
-        noteID: note.id,
-        filename: `${basename}.svg`,
-        mimeType: 'image/svg+xml',
-        body: this.createLongImageSvg(note),
-      });
-    }
-    if (input.format === 'PDF') {
-      return this.uploadExportArtifact({
-        ownerID: note.ownerID,
-        noteID: note.id,
-        filename: `${basename}.pdf`,
-        mimeType: 'application/pdf',
-        body: await this.createPdf(note),
-      });
+    if (input.format === 'IMAGE' || input.format === 'PDF') {
+      // 导出件里嵌的 URL 也要现签：notes/* 已不再匿名可读，原始直链对收件人是 403。
+      // 与其它读取路径同一条流水线（collect → presign → map）。
+      const presignedUrls = await this.presignNoteMedia(
+        this.collectNoteMediaTargets(note),
+      );
+      return input.format === 'IMAGE'
+        ? this.uploadExportArtifact({
+            ownerID: note.ownerID,
+            noteID: note.id,
+            filename: `${basename}.svg`,
+            mimeType: 'image/svg+xml',
+            body: this.createLongImageSvg(note, presignedUrls),
+          })
+        : this.uploadExportArtifact({
+            ownerID: note.ownerID,
+            noteID: note.id,
+            filename: `${basename}.pdf`,
+            mimeType: 'application/pdf',
+            body: await this.createPdf(note, presignedUrls),
+          });
     }
 
     const mediaType = input.format === 'IMAGES' ? 'IMAGE' : 'VIDEO';
@@ -2272,6 +2361,70 @@ export class NoteService {
     });
   }
 
+  /** FE#92 回收站：已软删笔记列表（新删在前）。 */
+  async listDeletedNotes(
+    ownerID: string,
+    page = 1,
+    limit = 50,
+  ): Promise<NoteSummaryDto[]> {
+    const take = Math.min(limit, 200);
+    const notes = await this.prisma.note.findMany({
+      where: { ownerID, status: 'DELETED' },
+      orderBy: { updatedAt: 'desc' },
+      take,
+      skip: (page - 1) * take,
+      include: NOTE_INCLUDE,
+    });
+    return this.mapSummaryListResolved(notes, ownerID);
+  }
+
+  /**
+   * FE#92 回收站：恢复软删笔记 → ACTIVE。deleteNote 未记录删除前状态
+   * （UNLISTED/ACTIVE 无从区分），统一回 ACTIVE —— 用户在列表里可再手动隐藏。
+   */
+  async restoreNote(ownerID: string, noteId: string): Promise<void> {
+    // round 3 review：收藏复制的笔记受「同源活跃副本唯一」局部索引约束 ——
+    // 删除旧副本→再次收藏→恢复旧副本会撞唯一索引，裂成一个裸 DB 冲突。
+    // 先查同源活跃副本，命中给可控 409。
+    const target = await this.prisma.note.findFirst({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      select: { id: true, collectedFromNoteID: true },
+    });
+    if (!target) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+    if (target.collectedFromNoteID) {
+      const activeDuplicate = await this.prisma.note.findFirst({
+        where: {
+          ownerID,
+          collectedFromNoteID: target.collectedFromNoteID,
+          status: { not: 'DELETED' },
+          id: { not: noteId },
+        },
+        select: { id: true },
+      });
+      if (activeDuplicate) {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+    }
+    const result = await this.prisma.note.updateMany({
+      where: { id: noteId, ownerID, status: 'DELETED' },
+      data: { status: 'ACTIVE' },
+    });
+    if (result.count === 0) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+  }
+
   async deleteNote(ownerID: string, noteId: string): Promise<void> {
     await this.requireOwnedNote(ownerID, noteId);
     // Include ownerID + status in the write to close the TOCTOU window, for
@@ -2304,6 +2457,7 @@ export class NoteService {
           },
         },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+        take: 500, // #108：防爆护栏（分组数已有业务上限，这里兜异常数据）
       })) ?? [];
 
     return groups.map((group) => this.mapGroup(group));

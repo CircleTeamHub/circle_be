@@ -5,9 +5,47 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SessionRevocationService } from './session-revocation.service';
 
 const DEFAULT_REFRESH_TOKEN_TTL_DAYS = 7;
+// 管理台会话故意比用户短一个量级（#91 目标区间 8-24h）：一枚被偷的 admin
+// refresh token 的价值远高于普通用户，续命窗口必须收紧。
+const DEFAULT_ADMIN_REFRESH_TTL = '12h';
 const MAX_DEVICE_NAME_LENGTH = 64;
 const MAX_USER_AGENT_LENGTH = 256;
 const MAX_IP_LENGTH = 64;
+
+const MS_PER_MINUTE = 60_000;
+const MS_PER_HOUR = 3_600_000;
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * 解析 refresh TTL 配置（#84）。接受 '30d' / '12h' / '45m' / 纯数字（=天，
+ * 兼容旧 REFRESH_EXPIRES_IN_DAYS 语义）。无法解析返回 null，由调用方回落默认
+ * 并告警 —— 静默把错误配置当默认值吞掉正是这个 issue 的病根。
+ */
+export function parseRefreshTtlMs(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? value * MS_PER_DAY : null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') {
+    return null;
+  }
+  const match = /^(\d+)\s*([dhm]?)$/i.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+  const amount = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+  switch (match[2].toLowerCase()) {
+    case 'h':
+      return amount * MS_PER_HOUR;
+    case 'm':
+      return amount * MS_PER_MINUTE;
+    // 裸数字与 'd' 同义：与旧 REFRESH_EXPIRES_IN_DAYS 的「天数」语义兼容。
+    default:
+      return amount * MS_PER_DAY;
+  }
+}
 
 export type SessionContext = {
   deviceName?: string | null;
@@ -40,19 +78,54 @@ function normalizeContext(context?: SessionContext): SessionContext {
 @Injectable()
 export class RefreshTokenService {
   private readonly logger = new Logger(RefreshTokenService.name);
-  private readonly ttlDays: number;
+  private readonly ttlMs: number;
+  private readonly adminTtlMs: number;
 
   constructor(
     private prisma: PrismaService,
     private config: ConfigService,
     private readonly revocation: SessionRevocationService,
   ) {
-    const raw = this.config.get<string | number>('REFRESH_EXPIRES_IN_DAYS');
-    const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : raw;
-    this.ttlDays =
-      typeof parsed === 'number' && Number.isFinite(parsed) && parsed > 0
-        ? parsed
-        : DEFAULT_REFRESH_TOKEN_TTL_DAYS;
+    // #84：读 schema/模板一直文档化的 REFRESH_EXPIRES_IN（此前代码读的是从未
+    // 见诸任何模板的 REFRESH_EXPIRES_IN_DAYS，导致所有环境静默拿 7 天默认）。
+    // 旧名保留为兼容回落（带弃用告警），两者都无效才落进 7 天默认。
+    const documented = parseRefreshTtlMs(
+      this.config.get<string | number>('REFRESH_EXPIRES_IN'),
+    );
+    const legacyRaw = this.config.get<string | number>(
+      'REFRESH_EXPIRES_IN_DAYS',
+    );
+    const legacy = parseRefreshTtlMs(legacyRaw);
+    if (documented === null && legacy !== null) {
+      this.logger.warn(
+        'REFRESH_EXPIRES_IN_DAYS is deprecated — set REFRESH_EXPIRES_IN (e.g. "30d") instead',
+      );
+    }
+    if (
+      documented === null &&
+      legacy === null &&
+      this.config.get('REFRESH_EXPIRES_IN') !== undefined
+    ) {
+      this.logger.warn(
+        `REFRESH_EXPIRES_IN="${String(this.config.get('REFRESH_EXPIRES_IN'))}" is not parseable; falling back to ${DEFAULT_REFRESH_TOKEN_TTL_DAYS}d`,
+      );
+    }
+    this.ttlMs =
+      documented ?? legacy ?? DEFAULT_REFRESH_TOKEN_TTL_DAYS * MS_PER_DAY;
+
+    // #91：ADMIN audience 独立 TTL，绝不长于普通用户的。
+    const adminConfigured = parseRefreshTtlMs(
+      this.config.get<string | number>('ADMIN_REFRESH_EXPIRES_IN'),
+    );
+    this.adminTtlMs = Math.min(
+      adminConfigured ?? parseRefreshTtlMs(DEFAULT_ADMIN_REFRESH_TTL)!,
+      this.ttlMs,
+    );
+  }
+
+  /** 各 audience 的会话 TTL（毫秒）。导出仅为测试可见性。 */
+  ttlMsFor(audience: RefreshTokenAudience): number {
+    return audience === 'ADMIN' ? this.adminTtlMs : this.ttlMs;
   }
 
   async create(
@@ -62,8 +135,7 @@ export class RefreshTokenService {
   ): Promise<{ token: string; sessionId: string }> {
     const rawToken = randomBytes(64).toString('hex');
     const tokenHash = hashToken(rawToken);
-    const expiredAt = new Date();
-    expiredAt.setDate(expiredAt.getDate() + this.ttlDays);
+    const expiredAt = new Date(Date.now() + this.ttlMsFor(audience));
 
     const safe = normalizeContext(context);
     const session = await this.prisma.refreshToken.create({
@@ -164,22 +236,49 @@ export class RefreshTokenService {
     };
   }
 
-  async revoke(token: string): Promise<void> {
+  /**
+   * 撤销单枚 refresh token。返回被撤销会话的归属（无匹配时 null），
+   * 供调用方补审计日志（#90 —— admin 登出此前完全无痕）。
+   */
+  async revoke(token: string): Promise<{
+    userId: string;
+    audience: RefreshTokenAudience;
+    sessionId: string;
+  } | null> {
     const tokenHash = hashToken(token);
     // The row id is the session id carried in the access token's `sid` claim;
     // fetch it so we can revoke the matching access token too (F-02), not just
     // the refresh token.
     const existing = await this.prisma.refreshToken.findUnique({
       where: { token: tokenHash },
-      select: { id: true },
+      select: { id: true, userId: true, audience: true },
     });
-    await this.prisma.refreshToken.updateMany({
-      where: { token: tokenHash, revokedAt: null },
+    const revoked = await this.prisma.refreshToken.updateMany({
+      // review 修复（round 2）：过期未撤销的行同样不算「真撤销」——旧 ADMIN
+      // refresh token 过期后被拿来「登出」，不该再记一条成功审计（会话早已
+      // 自然死亡，什么都没被结束）。
+      where: {
+        token: tokenHash,
+        revokedAt: null,
+        expiredAt: { gt: new Date() },
+      },
       data: { revokedAt: new Date() },
     });
+    // round 3 review：refresh TTL 可配得比 access TTL 短 —— 行过期不代表
+    // 对应 access token 已死。只要行存在就写会话吊销标记（幂等且便宜），
+    // 让登出语义对 access token 始终成立；归属/审计仍只在真撤销时返回。
     if (existing) {
       await this.revocation.revokeSession(existing.id);
     }
+    // token 已被撤销过 / 已过期（updateMany 0 行）时不返回归属。
+    if (existing && revoked.count > 0) {
+      return {
+        userId: existing.userId,
+        audience: existing.audience as RefreshTokenAudience,
+        sessionId: existing.id,
+      };
+    }
+    return null;
   }
 
   listActiveSessions(userId: string) {
@@ -202,6 +301,11 @@ export class RefreshTokenService {
         lastUsedAt: 'desc',
       },
     });
+  }
+
+  /** 仅写 access token 吊销标记（DB 撤销已由调用方事务完成时用）。 */
+  async revokeAllAccessMarkers(userId: string): Promise<void> {
+    await this.revocation.revokeUser(userId);
   }
 
   async revokeAll(userId: string): Promise<void> {

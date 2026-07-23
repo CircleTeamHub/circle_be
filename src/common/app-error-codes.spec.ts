@@ -1,5 +1,6 @@
 import {
   APP_ERROR_CODES,
+  AdminUserErrorCode,
   AuthErrorCode,
   CallErrorCode,
   ChatHistoryErrorCode,
@@ -18,6 +19,7 @@ import {
   PrivacyErrorCode,
   TempChatErrorCode,
   TraceErrorCode,
+  UploadErrorCode,
   UserErrorCode,
 } from './app-error-codes';
 
@@ -30,6 +32,7 @@ import {
 //      silently falling back to the raw (often Chinese) backend message.
 describe('app error code catalog', () => {
   const groups = {
+    AdminUserErrorCode,
     AuthErrorCode,
     CoinErrorCode,
     MembershipErrorCode,
@@ -42,6 +45,7 @@ describe('app error code catalog', () => {
     FriendErrorCode,
     NoteErrorCode,
     CallErrorCode,
+    UploadErrorCode,
     ConversationGroupErrorCode,
     ChatHistoryErrorCode,
     CollectionErrorCode,

@@ -59,3 +59,33 @@ describe('push token DTOs', () => {
     ).toEqual(['revocationSecret', 'token']);
   });
 });
+
+describe('push token shape validation (#98)', () => {
+  const registration = (token: string) =>
+    plainToInstance(RegisterPushTokenDto, {
+      token,
+      platform: 'ios' as const,
+      provider: 'expo' as const,
+    });
+
+  it('accepts both Expo push token spellings', () => {
+    expect(
+      validateSync(registration('ExponentPushToken[abc-DEF_123]')),
+    ).toHaveLength(0);
+    expect(validateSync(registration('ExpoPushToken[abc]'))).toHaveLength(0);
+  });
+
+  it('rejects junk that is not an Expo push token', () => {
+    for (const junk of [
+      'not-a-token',
+      'ExponentPushToken[]',
+      'ExponentPushToken[with space]',
+      'fcm:abcdef',
+      'ExponentPushToken[abc', // 未闭合
+    ]) {
+      expect(validateSync(registration(junk)).map((e) => e.property)).toContain(
+        'token',
+      );
+    }
+  });
+});
