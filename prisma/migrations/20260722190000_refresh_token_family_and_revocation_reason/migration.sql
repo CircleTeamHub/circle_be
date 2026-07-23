@@ -8,8 +8,10 @@ CREATE TYPE "RefreshTokenRevocationReason" AS ENUM (
   'TOKEN_FAMILY_REUSE'
 );
 
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 ALTER TABLE "RefreshToken"
-ADD COLUMN "familyId" TEXT,
+ADD COLUMN "familyId" TEXT DEFAULT (gen_random_uuid()::text),
 ADD COLUMN "revocationReason" "RefreshTokenRevocationReason";
 
 -- Existing rows cannot be linked into their historical rotation chains
@@ -17,7 +19,7 @@ ADD COLUMN "revocationReason" "RefreshTokenRevocationReason";
 -- old revoked token to terminate a newer, unrelated session.
 UPDATE "RefreshToken"
 SET "familyId" = "id"
-WHERE "familyId" IS NULL;
+WHERE "revocationReason" IS NULL;
 
 ALTER TABLE "RefreshToken"
 ALTER COLUMN "familyId" SET NOT NULL;

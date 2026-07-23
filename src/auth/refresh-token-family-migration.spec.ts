@@ -12,13 +12,15 @@ describe('refresh-token family migration', () => {
     const sql = readFileSync(migrationPath, 'utf8');
 
     expect(sql).toContain('CREATE TYPE "RefreshTokenRevocationReason"');
-    expect(sql).toContain('ADD COLUMN "familyId" TEXT');
+    expect(sql).toMatch(
+      /ADD COLUMN "familyId" TEXT DEFAULT \(\s*gen_random_uuid\(\)\s*::text\s*\)/i,
+    );
     expect(sql).toContain(
       'ADD COLUMN "revocationReason" "RefreshTokenRevocationReason"',
     );
-    expect(sql).toMatch(/SET "familyId" = "id"\s+WHERE "familyId" IS NULL/i);
+    expect(sql).toMatch(/SET "familyId" = "id"/i);
+    expect(sql).not.toMatch(/ALTER COLUMN "familyId" SET DEFAULT/i);
     expect(sql).toContain('ALTER COLUMN "familyId" SET NOT NULL');
-    expect(sql).not.toContain('ALTER COLUMN "familyId" SET DEFAULT');
     expect(sql).not.toMatch(/SET\s+"revocationReason"\s*=/i);
     expect(sql).toContain('RefreshToken_userId_familyId_idx');
     expect(sql).toContain('RefreshToken_userId_audience_createdAt_idx');

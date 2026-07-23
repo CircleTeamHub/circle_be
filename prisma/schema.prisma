@@ -407,7 +407,7 @@ model RefreshToken {
   id               String                        @id @default(uuid())
   userId           String
   token            String                        @unique
-  familyId         String                        @default(uuid())
+  familyId         String                        @default(dbgenerated("(gen_random_uuid())::text"))
   audience         RefreshTokenAudience          @default(APP)
   deviceName       String?
   ip               String?

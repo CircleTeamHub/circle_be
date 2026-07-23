@@ -404,7 +404,7 @@ describe('RefreshTokenService', () => {
       where: {
         userId: 'user-1',
         audience: 'APP',
-        createdAt: { gt: expect.any(Date) },
+        expiredAt: { gt: expect.any(Date) },
       },
       select: { id: true },
     });
@@ -447,9 +447,22 @@ describe('RefreshTokenService', () => {
     expect(
       records.find((record) => record.id === admin.sessionId)?.revokedAt,
     ).toBeNull();
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
     expect(revocation.revokeSession).toHaveBeenCalledWith(rotated.sessionId);
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(admin.sessionId);
     expect(revocation.revokeUser).not.toHaveBeenCalled();
+  });
+
+  it('revokes live access sessions for reused families even when refresh rows predate the current access TTL', async () => {
+    const { token: oldToken } = await service.create('user-1');
+    const rotated = await service.rotate(oldToken);
+    records.find((record) => record.id === rotated.sessionId)!.createdAt =
+      new Date(Date.now() - 60 * 60 * 1000);
+    jest.clearAllMocks();
+
+    await expect(service.rotate(oldToken)).rejects.toThrow(/reuse detected/i);
+
+    expect(revocation.revokeSession).toHaveBeenCalledWith(rotated.sessionId);
   });
 
   it('rejects an expired rotated token without revoking its family again', async () => {
@@ -482,7 +495,7 @@ describe('RefreshTokenService', () => {
     expect(revocation.revokeSession).not.toHaveBeenCalledWith(admin.sessionId);
   });
 
-  it('only marks replacement sessions whose access token can still be live', async () => {
+  it('marks every unexpired replaced session when access TTL may have been shortened', async () => {
     const configured = new RefreshTokenService(
       prisma as any,
       {
@@ -494,6 +507,7 @@ describe('RefreshTokenService', () => {
     );
     const recent = new Date(Date.now() - 30 * 60 * 1000);
     const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const expired = new Date(Date.now() - 24 * 60 * 60 * 1000);
     records.push(
       {
         id: 'recent-rotated',
@@ -519,6 +533,18 @@ describe('RefreshTokenService', () => {
         createdAt: stale,
         lastUsedAt: stale,
       },
+      {
+        id: 'expired-rotated',
+        userId: 'user-1',
+        token: 'expired-token',
+        audience: 'APP',
+        familyId: 'expired-family',
+        revocationReason: 'ROTATED',
+        revokedAt: expired,
+        expiredAt: new Date(Date.now() - 60 * 1000),
+        createdAt: expired,
+        lastUsedAt: expired,
+      },
     );
 
     await configured.replaceForSingleDevice('user-1');
@@ -527,12 +553,15 @@ describe('RefreshTokenService', () => {
       where: {
         userId: 'user-1',
         audience: 'APP',
-        createdAt: { gt: expect.any(Date) },
+        expiredAt: { gt: expect.any(Date) },
       },
       select: { id: true },
     });
     expect(revocation.revokeSession).toHaveBeenCalledWith('recent-rotated');
-    expect(revocation.revokeSession).not.toHaveBeenCalledWith('stale-rotated');
+    expect(revocation.revokeSession).toHaveBeenCalledWith('stale-rotated');
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
+      'expired-rotated',
+    );
   });
 
   it('applies access revocation markers with bounded concurrency', async () => {
@@ -638,6 +667,30 @@ describe('RefreshTokenService', () => {
       select: { singleDeviceLoginEnabled: true },
     });
     expect(userSettings.get('user-1')).toBe(false);
+  });
+
+  it('revokes other ADMIN sessions when enabling single-device login', async () => {
+    const admin = await service.create('user-1', undefined, 'ADMIN');
+    const current = await service.create('user-1', undefined, 'APP');
+    const otherApp = await service.create('user-1', undefined, 'APP');
+    jest.clearAllMocks();
+
+    await service.setSingleDeviceLogin('user-1', true, current.sessionId);
+
+    expect(
+      records.find((record) => record.id === current.sessionId)?.revokedAt,
+    ).toBeNull();
+    expect(
+      records.find((record) => record.id === admin.sessionId)?.revokedAt,
+    ).toBeInstanceOf(Date);
+    expect(
+      records.find((record) => record.id === otherApp.sessionId)?.revokedAt,
+    ).toBeInstanceOf(Date);
+    expect(revocation.revokeSession).toHaveBeenCalledWith(admin.sessionId);
+    expect(revocation.revokeSession).toHaveBeenCalledWith(otherApp.sessionId);
+    expect(revocation.revokeSession).not.toHaveBeenCalledWith(
+      current.sessionId,
+    );
   });
 
   it('does not revoke sessions when the current session id is missing', async () => {

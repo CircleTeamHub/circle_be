@@ -526,6 +526,31 @@ describe('AuthService', () => {
     );
   });
 
+  it('adminLogin replaces prior admin sessions when single-device login is enabled', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      email: 'admin@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'ADMIN',
+      singleDeviceLoginEnabled: true,
+    });
+
+    await service.adminLogin({
+      email: 'admin@example.com',
+      password: 'password1',
+    } as any);
+
+    expect(mockRefreshTokenService.replaceForSingleDevice).toHaveBeenCalledWith(
+      'uuid-1',
+      undefined,
+      'ADMIN',
+    );
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
+  });
+
   it('adminLogin rejects valid non-admin credentials', async () => {
     const passwordHash = await argon2.hash('password1');
     users.push({

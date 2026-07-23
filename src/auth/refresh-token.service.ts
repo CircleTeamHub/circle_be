@@ -195,9 +195,8 @@ export class RefreshTokenService {
     audience: RefreshTokenAudience = 'APP',
   ) {
     const now = new Date();
-    const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
     const revocableSessions = await tx.refreshToken.findMany({
-      where: { userId, audience, createdAt: { gt: accessCutoff } },
+      where: { userId, audience, expiredAt: { gt: now } },
       select: { id: true },
     });
     await tx.refreshToken.updateMany({
@@ -274,12 +273,10 @@ export class RefreshTokenService {
       if (!enabled) return [];
 
       const now = new Date();
-      const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
       const revocableSessions = await tx.refreshToken.findMany({
         where: {
           userId,
-          audience: 'APP',
-          createdAt: { gt: accessCutoff },
+          expiredAt: { gt: now },
           ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
         },
         select: { id: true },
@@ -287,7 +284,6 @@ export class RefreshTokenService {
       await tx.refreshToken.updateMany({
         where: {
           userId,
-          audience: 'APP',
           revokedAt: null,
           ...(currentSessionId ? { id: { not: currentSessionId } } : {}),
         },
@@ -346,12 +342,11 @@ export class RefreshTokenService {
         if (record.revocationReason !== RefreshTokenRevocationReason.ROTATED) {
           throw new UnauthorizedException('Invalid or expired refresh token');
         }
-        const accessCutoff = new Date(now.getTime() - this.accessTtlMs);
         const familySessions = await tx.refreshToken.findMany({
           where: {
             userId: record.userId,
             familyId: record.familyId,
-            createdAt: { gt: accessCutoff },
+            expiredAt: { gt: now },
           },
           select: { id: true },
         });
