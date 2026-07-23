@@ -355,31 +355,50 @@ export class NotificationPushService {
   private async reconcileCompletedOutboxes(
     outboxIDs: ReadonlySet<string>,
   ): Promise<void> {
-    for (const outboxID of outboxIDs) {
-      await this.prisma.$transaction(async (tx) => {
-        const [awaitingReceipt, exhausted] = await Promise.all([
-          tx.notificationPushDelivery.count({
-            where: { outboxID, status: 'SENT' },
-          }),
-          tx.notificationPushDelivery.count({
-            where: {
-              outboxID,
-              status: 'FAILED',
-              attempts: { gte: DELIVERY_MAX_ATTEMPTS },
-            },
-          }),
-        ]);
-        if (awaitingReceipt === 0 && exhausted > 0) {
-          await tx.notificationPushOutbox.updateMany({
-            where: { id: outboxID, status: 'COMPLETED' },
-            data: {
-              status: 'TERMINAL',
-              lastError: 'delivery-attempts-exhausted',
-            },
-          });
-        }
-      });
-    }
+    if (outboxIDs.size === 0) return;
+    const ids = [...outboxIDs];
+
+    // review P2：原实现「每个已结算 outbox 一个事务 + 两次 count」。一次
+    // pollReceipts 最多 300 行、cron 每轮最多 20 批，若回执分散在很多不同
+    // outbox 上，可累积到数千个事务、上万次 count，让高峰期收据轮询变成
+    // DB-bound。改为对整批 outboxID 各做一次分组聚合，再用一条 updateMany
+    // 批量终结 —— 与逐个判定语义完全一致（无 SENT 待回执 且 有耗尽的 FAILED）。
+    const [stillAwaiting, exhaustedGroups] = await Promise.all([
+      // 仍有 SENT（等回执）的 outbox：还不能终结
+      this.prisma.notificationPushDelivery.groupBy({
+        by: ['outboxID'],
+        where: { outboxID: { in: ids }, status: 'SENT' },
+      }),
+      // 存在「尝试已耗尽的 FAILED」的 outbox
+      this.prisma.notificationPushDelivery.groupBy({
+        by: ['outboxID'],
+        where: {
+          outboxID: { in: ids },
+          status: 'FAILED',
+          attempts: { gte: DELIVERY_MAX_ATTEMPTS },
+        },
+      }),
+    ]);
+
+    const stillAwaitingIDs = new Set(
+      stillAwaiting.map((group) => group.outboxID),
+    );
+    const terminalIDs = exhaustedGroups
+      .map((group) => group.outboxID)
+      .filter((outboxID) => !stillAwaitingIDs.has(outboxID));
+
+    if (terminalIDs.length === 0) return;
+
+    // status: 'COMPLETED' 守卫不变 —— 本轮已被 requeue 拉回 PENDING 的 outbox
+    // 自动排除；COMPLETED 的 outbox 不会再新增 delivery，故 SENT 计数只减不增，
+    // 批量终结安全。
+    await this.prisma.notificationPushOutbox.updateMany({
+      where: { id: { in: terminalIDs }, status: 'COMPLETED' },
+      data: {
+        status: 'TERMINAL',
+        lastError: 'delivery-attempts-exhausted',
+      },
+    });
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_4AM)
