@@ -5,6 +5,7 @@ import {
   MembershipPolicyService,
   MembershipQuota,
 } from './membership-policy.service';
+import { MembershipProgramService } from './membership-program.service';
 
 describe('MembershipPolicyService', () => {
   const prisma = {
@@ -41,6 +42,48 @@ describe('MembershipPolicyService', () => {
     await expect(service.getUserPolicy('missing')).rejects.toBeInstanceOf(
       NotFoundException,
     );
+  });
+
+  it('uses gold as the entitlement floor while the program is disabled', async () => {
+    const program = {
+      getStatus: jest.fn().mockResolvedValue({ enabled: false }),
+    };
+    const rolloutService = new MembershipPolicyService(
+      prisma as unknown as PrismaService,
+      program as unknown as MembershipProgramService,
+    );
+
+    const regular = await rolloutService.resolveEntitlement({
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+    const superMember = await rolloutService.resolveEntitlement({
+      vipLevel: 4,
+      vipExpiresAt: null,
+    });
+
+    expect(regular.level).toBe(2);
+    expect(regular.tier.key).toBe('gold');
+    expect(superMember.level).toBe(4);
+    expect(superMember.tier.key).toBe('super');
+  });
+
+  it('uses the real effective tier after the program is enabled', async () => {
+    const program = {
+      getStatus: jest.fn().mockResolvedValue({ enabled: true }),
+    };
+    const rolloutService = new MembershipPolicyService(
+      prisma as unknown as PrismaService,
+      program as unknown as MembershipProgramService,
+    );
+
+    const policy = await rolloutService.resolveEntitlement({
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+
+    expect(policy.level).toBe(0);
+    expect(policy.tier.key).toBe('regular');
   });
 
   it('takes deduplicated global user locks in code-unit order', async () => {

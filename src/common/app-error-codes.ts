@@ -114,6 +114,7 @@ export const TempChatErrorCode = {
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
 // 圈子不存在复用 CircleErrorCode.NotFound。图片必须来自本站存储是内部安全护栏,不打码。
 export const PlazaErrorCode = {
+  MembershipRequired: 'PLAZA_MEMBERSHIP_REQUIRED',
   NotActiveMember: 'PLAZA_NOT_ACTIVE_MEMBER',
   AdminOnlyPost: 'PLAZA_ADMIN_ONLY_POST',
   NoteInvalid: 'PLAZA_NOTE_INVALID',

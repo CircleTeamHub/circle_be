@@ -95,7 +95,11 @@ export class CircleService {
         });
       }
 
-      const policy = this.membershipPolicy.resolve(user, new Date());
+      const policy = await this.membershipPolicy.resolveEntitlement(
+        user,
+        tx,
+        new Date(),
+      );
       const capacity = policy.tier.quotas.groupMembers.actual;
       const maxMembers = dto.maxMembers ?? capacity;
       if (maxMembers > capacity) {

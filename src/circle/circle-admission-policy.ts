@@ -111,7 +111,11 @@ export class CircleAdmissionPolicy {
       const candidate = userByID.get(userID);
       if (!candidate) this.throwCandidateNotFound();
 
-      const effective = this.membershipPolicy.resolve(candidate, now);
+      const effective = await this.membershipPolicy.resolveEntitlement(
+        candidate,
+        tx,
+        now,
+      );
       const limit = effective.tier.quotas.joinedCircles.actual;
       if ((joinedCountByUserID.get(userID) ?? 0) >= limit) {
         throw new ForbiddenException({
@@ -223,7 +227,11 @@ export class CircleAdmissionPolicy {
       },
     });
     if (!candidate) this.throwCandidateNotFound();
-    const effective = this.membershipPolicy.resolve(candidate, new Date());
+    const effective = await this.membershipPolicy.resolveEntitlement(
+      candidate,
+      tx,
+      new Date(),
+    );
     this.assertRestrictions(circle, candidate, effective.level);
   }
 

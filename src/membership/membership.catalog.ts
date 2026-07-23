@@ -134,7 +134,8 @@ export function resolveEffectiveMembershipLevel(
   membership: StoredMembership,
   now = new Date(),
 ): MembershipLevel {
-  const { vipLevel, vipExpiresAt } = membership;
+  const { vipLevel } = membership;
+  const vipExpiresAt = membership.vipExpiresAt ?? null;
   if (
     !Number.isFinite(vipLevel) ||
     !Number.isInteger(vipLevel) ||

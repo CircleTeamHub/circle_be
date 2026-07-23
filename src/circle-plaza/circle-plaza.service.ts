@@ -273,9 +273,8 @@ export class CirclePlazaService {
             errorCode: PlazaErrorCode.NotActiveMember,
           });
         }
-        const authorLevel = this.membershipPolicy.resolve(
-          author,
-          new Date(),
+        const authorLevel = (
+          await this.membershipPolicy.resolveEntitlement(author, tx, new Date())
         ).level;
         const requestedVipRestriction = Math.max(
           dto.vipRestriction ?? 0,
@@ -444,10 +443,17 @@ export class CirclePlazaService {
         fancyNumber: true,
       },
     });
-    const policy = this.membershipPolicy.resolve(
+    const policy = await this.membershipPolicy.resolveEntitlement(
       viewer ?? { vipLevel: 0, vipExpiresAt: null },
+      this.prisma,
       new Date(),
     );
+    if (policy.level === 0) {
+      throw new ForbiddenException({
+        message: 'Membership required to view circle posts',
+        errorCode: PlazaErrorCode.MembershipRequired,
+      });
+    }
     const cityLimit = policy.tier.quotas.cityFilters.actual;
     if (cities.length > cityLimit) {
       throw new ForbiddenException({
@@ -560,31 +566,41 @@ export class CirclePlazaService {
   }
 
   async getPost(viewerId: string, postId: string): Promise<PlazaPostDto> {
-    const [post, viewer] = await Promise.all([
-      this.prisma.circlePost.findFirst({
-        where: {
-          ...this.activeUnexpiredPostWhere(),
-          id: postId,
-          // 与 feed 同一套可见性：viewer 必须是该动态所属任一圈子的 ACTIVE 成员，
-          // 否则 findFirst 不命中 → 抛 404，避免凭 id 直读到非本圈私密动态。
-          circleLinks: { some: { circle: this.memberCircleScope(viewerId) } },
-        },
-        include: {
-          author: true,
-          circle: true,
-          circleLinks: { include: { circle: true } },
-        },
-      }),
-      this.prisma.user.findUnique({
-        where: { id: viewerId },
-        select: {
-          vipLevel: true,
-          vipExpiresAt: true,
-          creditScore: true,
-          fancyNumber: true,
-        },
-      }),
-    ]);
+    const viewer = await this.prisma.user.findUnique({
+      where: { id: viewerId },
+      select: {
+        vipLevel: true,
+        vipExpiresAt: true,
+        creditScore: true,
+        fancyNumber: true,
+      },
+    });
+    const viewerPolicy = await this.membershipPolicy.resolveEntitlement(
+      viewer ?? { vipLevel: 0, vipExpiresAt: null },
+      this.prisma,
+      new Date(),
+    );
+    if (viewerPolicy.level === 0) {
+      throw new ForbiddenException({
+        message: 'Membership required to view circle posts',
+        errorCode: PlazaErrorCode.MembershipRequired,
+      });
+    }
+
+    const post = await this.prisma.circlePost.findFirst({
+      where: {
+        ...this.activeUnexpiredPostWhere(),
+        id: postId,
+        // 与 feed 同一套可见性：viewer 必须是该动态所属任一圈子的 ACTIVE 成员，
+        // 否则 findFirst 不命中 → 抛 404，避免凭 id 直读到非本圈私密动态。
+        circleLinks: { some: { circle: this.memberCircleScope(viewerId) } },
+      },
+      include: {
+        author: true,
+        circle: true,
+        circleLinks: { include: { circle: true } },
+      },
+    });
 
     if (!post) {
       // 区分「非本圈成员」与「帖子真的不存在/已删/已过期」：去掉成员可见性再查一次。
@@ -636,8 +652,7 @@ export class CirclePlazaService {
 
     const viewerEntitlements: ViewerEntitlements | null = viewer
       ? {
-          membershipLevel: this.membershipPolicy.resolve(viewer, new Date())
-            .level,
+          membershipLevel: viewerPolicy.level,
           creditScore: viewer.creditScore,
           fancyNumber: viewer.fancyNumber,
         }
@@ -840,8 +855,13 @@ export class CirclePlazaService {
     });
     const viewerEntitlements: ViewerEntitlements | null = viewer
       ? {
-          membershipLevel: this.membershipPolicy.resolve(viewer, new Date())
-            .level,
+          membershipLevel: (
+            await this.membershipPolicy.resolveEntitlement(
+              viewer,
+              this.prisma,
+              new Date(),
+            )
+          ).level,
           creditScore: viewer.creditScore,
           fancyNumber: viewer.fancyNumber,
         }
@@ -890,9 +910,12 @@ export class CirclePlazaService {
         const authoritativeEntitlements: ViewerEntitlements | null =
           authoritativeViewer
             ? {
-                membershipLevel: this.membershipPolicy.resolve(
-                  authoritativeViewer,
-                  new Date(),
+                membershipLevel: (
+                  await this.membershipPolicy.resolveEntitlement(
+                    authoritativeViewer,
+                    tx,
+                    new Date(),
+                  )
                 ).level,
                 creditScore: authoritativeViewer.creditScore,
                 fancyNumber: authoritativeViewer.fancyNumber,

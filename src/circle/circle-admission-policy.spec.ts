@@ -1,10 +1,15 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
 
 describe('CircleAdmissionPolicy', () => {
+  let programEnabled = true;
+  const membershipProgram = {
+    getStatus: jest.fn(() => Promise.resolve({ enabled: programEnabled })),
+  };
   const activeMemberships: Array<{
     id: string;
     userID: string;
@@ -26,6 +31,7 @@ describe('CircleAdmissionPolicy', () => {
   };
   const membershipPolicy = new MembershipPolicyService(
     prisma as unknown as PrismaService,
+    membershipProgram as unknown as MembershipProgramService,
   );
   const memberLock = new CircleMemberLockService(membershipPolicy);
   const policy = new CircleAdmissionPolicy(membershipPolicy, memberLock);
@@ -52,6 +58,7 @@ describe('CircleAdmissionPolicy', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    programEnabled = true;
     prisma.$queryRaw.mockResolvedValue([{ id: 'circle-1' }]);
     prisma.circle.findUnique.mockResolvedValue(circle());
     prisma.circle.findFirst.mockResolvedValue(circle());
@@ -62,6 +69,17 @@ describe('CircleAdmissionPolicy', () => {
     prisma.circleMember.createMany.mockResolvedValue({ count: 1 });
     prisma.user.findMany.mockResolvedValue([user()]);
     prisma.user.findUnique.mockResolvedValue(user());
+  });
+
+  it('gives a regular applicant the gold joined-circle quota while disabled', async () => {
+    programEnabled = false;
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 299 } },
+    ]);
+
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).resolves.toEqual(['candidate-1']);
   });
 
   it.each([

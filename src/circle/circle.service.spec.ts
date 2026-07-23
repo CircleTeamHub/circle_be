@@ -7,6 +7,7 @@ import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
 import {
@@ -19,6 +20,10 @@ import { CircleService } from './circle.service';
 
 describe('CircleService', () => {
   let service: CircleService;
+  let programEnabled = true;
+  const membershipProgram = {
+    getStatus: jest.fn(() => Promise.resolve({ enabled: programEnabled })),
+  };
 
   const prisma = {
     user: {
@@ -78,6 +83,7 @@ describe('CircleService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    programEnabled = true;
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -87,6 +93,7 @@ describe('CircleService', () => {
         { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         MembershipPolicyService,
+        { provide: MembershipProgramService, useValue: membershipProgram },
         CircleAdmissionPolicy,
         { provide: CircleMemberLockService, useValue: memberLock },
       ],
@@ -491,6 +498,21 @@ describe('CircleService', () => {
       });
     },
   );
+
+  it('gives a regular creator the gold capacity while rollout is disabled', async () => {
+    programEnabled = false;
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+    prisma.circle.create.mockResolvedValue(circleRecord(400));
+
+    await service.createCircle('user-1', validCircle());
+
+    expect(prisma.circle.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ maxMembers: 400 }),
+    });
+  });
 
   it.each(membershipTiers)(
     'allows stored level $level at exact circle capacity $capacity',

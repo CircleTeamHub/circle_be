@@ -11,15 +11,21 @@ import { join } from 'path';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { NoteService } from './note.service';
 
 describe('NoteService', () => {
   let service: NoteService;
+  let programEnabled = true;
+  const membershipProgram = {
+    getStatus: jest.fn(() => Promise.resolve({ enabled: programEnabled })),
+  };
 
   const prisma = {
     $transaction: jest.fn(async (input) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
+    $queryRaw: jest.fn().mockResolvedValue([]),
     $executeRaw: jest.fn().mockResolvedValue(0),
     user: {
       findUnique: jest.fn(),
@@ -52,6 +58,7 @@ describe('NoteService', () => {
       createMany: jest.fn(),
     },
     noteShareLink: {
+      count: jest.fn(),
       create: jest.fn(),
       findUnique: jest.fn(),
       findFirst: jest.fn(),
@@ -74,11 +81,13 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    programEnabled = true;
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
       vipExpiresAt: null,
     });
     prisma.note.count.mockResolvedValue(0);
+    prisma.noteShareLink.count.mockResolvedValue(0);
     // updateNote 会先查笔记上已有媒体的 objectKey（收藏复制场景的豁免名单）。
     prisma.noteMedia.findMany.mockResolvedValue([]);
     uploadService.createPresignedGetUrl.mockImplementation(
@@ -93,6 +102,7 @@ describe('NoteService', () => {
       providers: [
         NoteService,
         MembershipPolicyService,
+        { provide: MembershipProgramService, useValue: membershipProgram },
         { provide: PrismaService, useValue: prisma },
         { provide: UploadService, useValue: uploadService },
         // No MINIO_PUBLIC_URL configured → media-url origin check is skipped.
@@ -180,6 +190,17 @@ describe('NoteService', () => {
       expect(prisma.note.count.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.note.create.mock.invocationCallOrder[0],
       );
+    });
+
+    it('gives a regular user the gold note quota while rollout is disabled', async () => {
+      programEnabled = false;
+      prisma.note.count.mockResolvedValueOnce(499);
+      prisma.note.create.mockResolvedValueOnce({ id: createdNote.id });
+      prisma.note.update.mockResolvedValueOnce(createdNote);
+
+      await expect(
+        service.createNote('user-1', createInput),
+      ).resolves.toMatchObject({ id: createdNote.id });
     });
 
     it('excludes soft-deleted notes from usage so deletion releases capacity', async () => {

@@ -101,6 +101,22 @@ export class MembershipStatusDto {
   benefitGrants: MembershipBenefitGrantsDto;
 }
 
+export class MembershipProgramStatusDto {
+  @ApiProperty() enabled: boolean;
+  @ApiProperty({ nullable: true }) enabledAt: Date | null;
+  @ApiProperty({ enum: [0, 2] }) entitlementFloorLevel: 0 | 2;
+}
+
+export class MembershipProgramAdminStatusDto extends MembershipProgramStatusDto {
+  @ApiProperty({ nullable: true }) enabledByUserId: string | null;
+}
+
+export class EnableMembershipProgramResponseDto {
+  @ApiProperty() replayed: boolean;
+  @ApiProperty({ type: MembershipProgramAdminStatusDto })
+  status: MembershipProgramAdminStatusDto;
+}
+
 export class CreateMembershipGrantDto {
   @ApiProperty({ minimum: 1, maximum: 4 })
   @IsInt()

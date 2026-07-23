@@ -6,10 +6,15 @@ import { NotificationModule } from 'src/notification/notification.module';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { MembershipAdminController } from './membership-admin.controller';
 import { MembershipAdminService } from './membership-admin.service';
+import { MembershipProgramAdminController } from './membership-program-admin.controller';
 
 @Module({
   imports: [MembershipPolicyModule, NotificationModule, RealtimeModule],
-  controllers: [MembershipController, MembershipAdminController],
+  controllers: [
+    MembershipController,
+    MembershipAdminController,
+    MembershipProgramAdminController,
+  ],
   providers: [MembershipService, MembershipAdminService],
   exports: [MembershipService],
 })

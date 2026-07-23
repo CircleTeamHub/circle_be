@@ -2,6 +2,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -13,6 +14,11 @@ import {
   resolveEffectiveMembershipLevel,
   StoredMembership,
 } from './membership.catalog';
+import {
+  MARKETING_ENTITLEMENT_FLOOR_LEVEL,
+  MembershipProgramDatabase,
+  MembershipProgramService,
+} from './membership-program.service';
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
 
@@ -31,7 +37,11 @@ export interface EffectiveMembershipPolicy {
 
 @Injectable()
 export class MembershipPolicyService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional()
+    private readonly membershipProgram?: MembershipProgramService,
+  ) {}
 
   resolve(
     membership: StoredMembership,
@@ -41,7 +51,29 @@ export class MembershipPolicyService {
     return {
       level,
       tier: MEMBERSHIP_CATALOG[level],
-      vipExpiresAt: membership.vipExpiresAt,
+      vipExpiresAt: membership.vipExpiresAt ?? null,
+    };
+  }
+
+  async resolveEntitlement(
+    membership: StoredMembership,
+    db: MembershipProgramDatabase = this.prisma,
+    now = new Date(),
+  ): Promise<EffectiveMembershipPolicy> {
+    const actual = this.resolve(membership, now);
+    if (!this.membershipProgram) {
+      return actual;
+    }
+
+    const program = await this.membershipProgram.getStatus(db);
+    const level = program.enabled
+      ? actual.level
+      : Math.max(actual.level, MARKETING_ENTITLEMENT_FLOOR_LEVEL);
+    const entitlementLevel = level as MembershipLevel;
+    return {
+      level: entitlementLevel,
+      tier: MEMBERSHIP_CATALOG[entitlementLevel],
+      vipExpiresAt: actual.vipExpiresAt,
     };
   }
 
@@ -59,7 +91,7 @@ export class MembershipPolicyService {
         errorCode: MembershipErrorCode.UserNotFound,
       });
     }
-    return this.resolve(membership, now);
+    return this.resolveEntitlement(membership, this.prisma, now);
   }
 
   async lockUsers(
