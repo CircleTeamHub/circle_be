@@ -175,14 +175,10 @@ const SINGLE_CHATS = [
   },
 ];
 
-// circleRef -> deterministic id (must match seed-test-data.js det())
-const crypto = require('crypto');
+// circleRef -> deterministic circle id (must match seed-test-data.js circleDet())
+const { deterministicUuid } = require('./deterministic-id.cjs');
 const det = (key) => {
-  const h = crypto
-    .createHash('sha1')
-    .update('circle-seed:' + key)
-    .digest('hex');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+  return deterministicUuid('circle-seed:', key);
 };
 const CIRCLES = {
   existing: '62043328-4ff9-4e53-b668-a70d6994ecd3',

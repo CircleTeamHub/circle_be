@@ -34,10 +34,11 @@ describe('set-vip parseArgs (#99)', () => {
   });
 
   it('rejects out-of-range and non-integer levels', () => {
-    expect(() => parseArgs(['--id', 'u1', '6'])).toThrow(/between 0 and 5/);
-    expect(() => parseArgs(['--id', 'u1', '-1'])).toThrow(/between 0 and 5/);
-    expect(() => parseArgs(['--id', 'u1', '2.5'])).toThrow(/between 0 and 5/);
-    expect(() => parseArgs(['--id', 'u1', 'gold'])).toThrow(/between 0 and 5/);
+    expect(() => parseArgs(['--id', 'u1', '5'])).toThrow(/between 0 and 4/);
+    expect(() => parseArgs(['--id', 'u1', '6'])).toThrow(/between 0 and 4/);
+    expect(() => parseArgs(['--id', 'u1', '-1'])).toThrow(/between 0 and 4/);
+    expect(() => parseArgs(['--id', 'u1', '2.5'])).toThrow(/between 0 and 4/);
+    expect(() => parseArgs(['--id', 'u1', 'gold'])).toThrow(/between 0 and 4/);
   });
 
   it('rejects trailing extra arguments', () => {

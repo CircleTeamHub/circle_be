@@ -13,11 +13,14 @@
  *
  * Run:  node scripts/seed-test-data.js
  */
-const crypto = require('crypto');
 const argon2 = require('argon2');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const { PrismaClient } = require('../src/generated/prisma');
 const { assertDevSeedAllowed } = require('./seed-guard');
+const {
+  deterministicUuid,
+  legacyDeterministicId,
+} = require('./deterministic-id.cjs');
 
 // Load DATABASE_URL from .env.development if not already in the environment.
 if (!process.env.DATABASE_URL) {
@@ -44,13 +47,46 @@ const prisma = new PrismaClient({
 
 const PASSWORD = 'Test1234';
 
-/** Stable uuid-shaped id from a key, so upserts are idempotent across runs. */
+/** Stable id from a key, so upserts are idempotent across runs. */
 function det(key) {
-  const h = crypto
-    .createHash('sha1')
-    .update('circle-seed:' + key)
-    .digest('hex');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+  return legacyDeterministicId('circle-seed:', key);
+}
+
+function circleDet(key) {
+  return deterministicUuid('circle-seed:', key);
+}
+
+function legacyDet(key) {
+  return legacyDeterministicId('circle-seed:', key);
+}
+
+async function repairLegacyCircleId(legacyId, id) {
+  if (legacyId === id) return;
+  const legacy = await prisma.circle.findUnique({
+    where: { id: legacyId },
+    select: { id: true, groupID: true },
+  });
+  if (!legacy) return;
+
+  const current = await prisma.circle.findUnique({
+    where: { id },
+    select: { id: true },
+  });
+  if (current) {
+    await prisma.circle.update({
+      where: { id: legacyId },
+      data: { deleted: true, groupID: null },
+    });
+    return;
+  }
+
+  await prisma.circle.update({
+    where: { id: legacyId },
+    data: {
+      id,
+      groupID: legacy.groupID === legacyId ? id : legacy.groupID,
+    },
+  });
 }
 
 const EXISTING_CIRCLE_ID = '62043328-4ff9-4e53-b668-a70d6994ecd3'; // "Nbuuhbub", owner jimmy
@@ -104,7 +140,7 @@ const USERS = [
   {
     accountId: 'frank06',
     nickname: '法兰克',
-    vipLevel: 5,
+    vipLevel: 4,
     creditScore: 100,
     fancyNumber: true,
     gender: 'male',
@@ -317,6 +353,7 @@ async function main() {
       where: { accountId: u.accountId },
       update: {
         nickname: u.nickname,
+        inviteCode: u.accountId.toLowerCase(),
         vipLevel: u.vipLevel,
         creditScore: u.creditScore,
         fancyNumber: u.fancyNumber,
@@ -327,6 +364,7 @@ async function main() {
       create: {
         id: det('user:' + u.accountId),
         accountId: u.accountId,
+        inviteCode: u.accountId.toLowerCase(),
         passwordHash,
         nickname: u.nickname,
         vipLevel: u.vipLevel,
@@ -349,7 +387,8 @@ async function main() {
   // 2) Circles (upsert by deterministic id) + owner membership.
   const circleId = { existing: EXISTING_CIRCLE_ID };
   for (const c of CIRCLES) {
-    const id = det('circle:' + c.key);
+    const id = circleDet('circle:' + c.key);
+    await repairLegacyCircleId(legacyDet('circle:' + c.key), id);
     circleId[c.key] = id;
     const ownerID = uid[c.ownerAccount];
     await prisma.circle.upsert({
@@ -416,6 +455,7 @@ async function main() {
       update: {
         content: p.content,
         city: p.city,
+        circleID: circleId[p.circle],
         signupVipRestriction: p.r.signupVip ?? null,
         signupCreditRestriction: p.r.signupCredit ?? null,
         signupFancyRestriction: p.r.signupFancy ?? false,
