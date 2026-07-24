@@ -90,6 +90,7 @@ describe('AuthController', () => {
         region: null,
         vipLevel: 0,
         creditScore: 0,
+        receivedLikeCount: 0,
         role: 'USER',
         status: 'ACTIVE',
         lastOnline: null,

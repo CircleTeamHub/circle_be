@@ -30,13 +30,13 @@ describe('SelfUserDto serialization', () => {
         updatedAt: new Date('2026-04-24T02:52:34.270Z'),
         email: null,
         phoneNumber: null,
-        vipLevel: 5,
+        vipLevel: 4,
         creditScore: 100,
         displayIcons: [
           {
             id: 'icon-1',
             type: 'SYSTEM',
-            title: 'VIP5',
+            title: 'VIP4',
             imageUrl: null,
             fallbackIconName: 'diamond',
             systemKey: 'VIP',
@@ -54,7 +54,7 @@ describe('SelfUserDto serialization', () => {
       expect.objectContaining({
         id: 'icon-1',
         type: 'SYSTEM',
-        title: 'VIP5',
+        title: 'VIP4',
         fallbackIconName: 'diamond',
         systemKey: 'VIP',
         recognitionCount: 100,
@@ -84,6 +84,22 @@ describe('SelfUserDto serialization', () => {
     expect(dto.city).toBe('杭州');
     expect(leaked.passwordHash).toBeUndefined();
     expect(leaked.openimSynced).toBeUndefined();
+  });
+
+  it('exposes receivedLikeCount so /auth/me can hydrate the self profile like count', () => {
+    const dto = plainToInstance(
+      SelfUserDto,
+      {
+        id: 'user-1',
+        accountId: 'jimmy',
+        receivedLikeCount: 1,
+      },
+      { excludeExtraneousValues: true },
+    );
+
+    expect(
+      (dto as unknown as { receivedLikeCount?: number }).receivedLikeCount,
+    ).toBe(1);
   });
 });
 

@@ -114,6 +114,10 @@ export class SelfUserDto extends PublicUserDto {
   @ApiProperty({ example: 100 })
   @Expose()
   creditScore: number;
+
+  @ApiProperty({ example: 12, description: '收到的累计点赞总数' })
+  @Expose()
+  receivedLikeCount: number;
 }
 
 /**
