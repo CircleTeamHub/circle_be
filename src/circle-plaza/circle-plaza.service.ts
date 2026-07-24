@@ -1482,6 +1482,7 @@ export class CirclePlazaService {
         avatarUrl: post.author.avatarUrl,
         avatarFrame: post.author.avatarFrame,
         accountId: post.author.accountId,
+        vipLevel: post.author.vipLevel ?? null,
         displayIcons,
       },
       circle: {

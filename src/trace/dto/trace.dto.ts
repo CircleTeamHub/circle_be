@@ -114,6 +114,7 @@ export class TraceAuthorDto {
   id: string;
   nickname: string;
   avatarUrl: string | null;
+  vipLevel: number | null;
 }
 
 export class TraceCommentDto {

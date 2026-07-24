@@ -218,6 +218,7 @@ export class PlazaPostAuthorDto {
   avatarUrl: string | null;
   avatarFrame: string | null;
   accountId: string;
+  vipLevel: number | null;
   displayIcons: DisplayIconDto[];
 }
 
