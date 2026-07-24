@@ -9,11 +9,6 @@ on:
   push:
     branches:
       - main
-    # Docs / example-env changes can't break the build — skip the whole matrix.
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - '.env.example'
   pull_request:
     branches:
       - main

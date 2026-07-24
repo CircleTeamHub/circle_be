@@ -334,6 +334,36 @@ describe('GroupService reportGroup', () => {
     });
   });
 
+  it('locks and re-reads an active membership before leave accounting', async () => {
+    let insideTransaction = false;
+    prisma.$transaction.mockImplementationOnce(async (callback) => {
+      insideTransaction = true;
+      return callback(prisma);
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(() =>
+      Promise.resolve({
+        id: 'member-1',
+        role: CircleMemberRole.MEMBER,
+        status: insideTransaction
+          ? CircleMemberStatus.ACTIVE
+          : CircleMemberStatus.PENDING,
+      }),
+    );
+
+    await service.leaveGroup('user-1', 'group-1');
+
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.circle.update).toHaveBeenCalledWith({
+      where: { id: 'circle-1' },
+      data: { memberCount: { decrement: 1 } },
+    });
+  });
+
   it('does not allow a circle owner to leave via group cleanup', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -350,7 +380,8 @@ describe('GroupService reportGroup', () => {
       ForbiddenException,
     );
 
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
   it('passes group leave through the controller with the current user', async () => {
@@ -686,6 +717,44 @@ describe('GroupService reportGroup', () => {
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
   });
 
+  it('locks and re-reads actor and a concurrently reactivated target before removal', async () => {
+    let insideTransaction = false;
+    prisma.$transaction.mockImplementationOnce(async (callback) => {
+      insideTransaction = true;
+      return callback(prisma);
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) => {
+      const userID = where.userID_circleID.userID;
+      if (userID === 'admin-1') {
+        return Promise.resolve({
+          id: 'actor-member',
+          role: CircleMemberRole.ADMIN,
+          status: CircleMemberStatus.ACTIVE,
+        });
+      }
+      return Promise.resolve({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: insideTransaction
+          ? CircleMemberStatus.ACTIVE
+          : CircleMemberStatus.PENDING,
+      });
+    });
+
+    await service.removeGroupMember('admin-1', 'group-1', 'target-user');
+
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.circle.update).toHaveBeenCalledWith({
+      where: { id: 'circle-1' },
+      data: { memberCount: { decrement: 1 } },
+    });
+  });
+
   it('does not allow a circle admin to remove another manager', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -709,7 +778,8 @@ describe('GroupService reportGroup', () => {
     ).rejects.toThrow(ForbiddenException);
 
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
   it('still removes an OpenIM member when local circle membership is already missing', async () => {

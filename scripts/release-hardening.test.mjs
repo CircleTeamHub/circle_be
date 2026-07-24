@@ -33,6 +33,34 @@ test('Caddy routes requests only to healthy blue-green backends', () => {
   assert.doesNotMatch(caddy, /\}:3000/);
 });
 
+test('production routes backend and public OpenIM paths to the host gateway', () => {
+  const compose = read('docker-compose.prod.yml').replaceAll('\r\n', '\n');
+  const backend = compose
+    .split('\n  circle_be:\n')[1]
+    ?.split('\n  admin_web:')[0];
+  const exampleEnv = read('.env.production.example');
+  const caddy = read('deploy/Caddyfile.admin');
+
+  assert.match(
+    backend,
+    /extra_hosts:\s*\n\s+- ['"]host\.docker\.internal:host-gateway['"]/,
+  );
+  assert.match(
+    exampleEnv,
+    /OPENIM_API_URL=http:\/\/host\.docker\.internal:10002/,
+  );
+  assert.match(caddy, /@openimWs path \/openim-ws \/openim-ws\/\*/);
+  assert.match(caddy, /@openimApi path \/openim-api \/openim-api\/\*/);
+  assert.match(
+    caddy,
+    /handle @openimWs \{[\s\S]*uri strip_prefix \/openim-ws[\s\S]*reverse_proxy \{\$OPENIM_WS_UPSTREAM/,
+  );
+  assert.match(
+    caddy,
+    /handle @openimApi \{[\s\S]*uri strip_prefix \/openim-api[\s\S]*reverse_proxy \{\$OPENIM_API_UPSTREAM/,
+  );
+});
+
 test('Caddy switches only between unique blue-green container endpoints', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const deploy = read('deploy/release-deploy.sh');
@@ -213,6 +241,19 @@ test('backend CI blocks release contract regressions', () => {
 
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
+});
+
+test('every main push creates the exact-SHA CI run required by release', () => {
+  const ci = read('.github/workflows/ci.yml');
+  const push = ci.slice(ci.indexOf('  push:'), ci.indexOf('  pull_request:'));
+  const pullRequest = ci.slice(
+    ci.indexOf('  pull_request:'),
+    ci.indexOf('\n# Cancel superseded runs'),
+  );
+
+  assert.match(push, /branches:\s*\n\s*- main/);
+  assert.doesNotMatch(push, /paths-ignore:/);
+  assert.match(pullRequest, /paths-ignore:/);
 });
 
 test('release selection and active-color state fail closed', () => {

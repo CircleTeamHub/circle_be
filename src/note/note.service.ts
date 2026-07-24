@@ -1312,13 +1312,18 @@ export class NoteService {
   }
 
   // 给一批 (base url, object key) 现签短时 URL → Map<base url, signed url>。signingDate 舍入
-  // 到窗口 → 同窗口签出字节相同 URL（缓存稳定）。uploadService 未注入/单个失败 → 略过，由
-  // map 函数 fallback 回 base url（MinIO 未配置时不崩）。
+  // 到窗口 → 同窗口签出字节相同 URL（缓存稳定）。签名失败必须 fail closed，避免把私有
+  // 对象的未签名持久 URL 返回给客户端。
   private async presignNoteMedia(
     targets: { url: string; objectKey: string }[],
   ): Promise<Map<string, string>> {
     const map = new Map<string, string>();
-    if (!this.uploadService || !targets.length) return map;
+    if (!targets.length) return map;
+    if (!this.uploadService) {
+      throw new ServiceUnavailableException(
+        'Private note media is temporarily unavailable',
+      );
+    }
     // 同 base url 去重（同图可能出现在 media 行 + sections JSON 两处）。
     const byUrl = new Map<string, string>();
     for (const t of targets) byUrl.set(t.url, t.objectKey);
@@ -1326,20 +1331,22 @@ export class NoteService {
       Math.floor(Date.now() / NOTE_MEDIA_URL_WINDOW_MS) *
         NOTE_MEDIA_URL_WINDOW_MS,
     );
-    await Promise.all(
-      [...byUrl.entries()].map(async ([url, key]) => {
-        try {
+    try {
+      await Promise.all(
+        [...byUrl.entries()].map(async ([url, key]) => {
           const signed = await this.uploadService!.createPresignedGetUrl(
             key,
             NOTE_MEDIA_URL_TTL_SECONDS,
             signingDate,
           );
           map.set(url, signed.url);
-        } catch {
-          /* MinIO 未配置 / 单个失败 → 略过，fallback base url */
-        }
-      }),
-    );
+        }),
+      );
+    } catch {
+      throw new ServiceUnavailableException(
+        'Private note media is temporarily unavailable',
+      );
+    }
     return map;
   }
 

@@ -50,6 +50,10 @@ function buildService(user: UserRow | null) {
   };
   const refreshTokenService = {
     create: jest.fn().mockResolvedValue({ token: 'r', sessionId: 's1' }),
+    createSessionForCurrentSingleDeviceSetting: jest
+      .fn()
+      .mockResolvedValue({ token: 'r', sessionId: 's1' }),
+    assertSessionActive: jest.fn().mockResolvedValue(undefined),
     revokeAll: jest.fn(),
     revoke: jest.fn(),
   };

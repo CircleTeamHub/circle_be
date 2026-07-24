@@ -5,52 +5,17 @@ import {
   SESSION_REVOCATION_CHANNEL,
   type SessionRevocationBroadcast,
 } from './session-revocation.broadcast';
+import { parseDurationMilliseconds } from 'src/utils/duration';
 
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
-const DURATION_UNITS_IN_MS: Record<string, number> = {
-  ms: 1,
-  s: 1000,
-  m: 60 * 1000,
-  h: 60 * 60 * 1000,
-  d: 24 * 60 * 60 * 1000,
-  w: 7 * 24 * 60 * 60 * 1000,
-  y: 365.25 * 24 * 60 * 60 * 1000,
-};
 
 export function accessTokenTtlSeconds(raw: unknown): number {
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
     return Math.ceil(raw);
   }
   if (typeof raw !== 'string') return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
-
-  const normalized = raw.trim().toLowerCase().split(' ').join('');
-  let unit = 'ms';
-  let amountText = normalized;
-  if (normalized.endsWith('ms')) {
-    amountText = normalized.slice(0, -2);
-  } else {
-    const candidateUnit = normalized.charAt(normalized.length - 1);
-    if (candidateUnit && candidateUnit in DURATION_UNITS_IN_MS) {
-      unit = candidateUnit;
-      amountText = normalized.slice(0, -1);
-    }
-  }
-  let dots = 0;
-  const validAmount =
-    amountText.length > 0 &&
-    [...amountText].every((character) => {
-      if (character === '.') {
-        dots += 1;
-        return dots === 1;
-      }
-      return character >= '0' && character <= '9';
-    });
-  const amount = validAmount ? Number(amountText) : Number.NaN;
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
-  }
-
-  const milliseconds = amount * DURATION_UNITS_IN_MS[unit];
+  const milliseconds = parseDurationMilliseconds(raw);
+  if (milliseconds === null) return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
   return Math.max(1, Math.ceil(milliseconds / 1000));
 }
 

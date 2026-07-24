@@ -62,6 +62,12 @@ describe('AuthService', () => {
     create: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    createAppSession: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
+    createSessionForCurrentSingleDeviceSetting: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
     rotate: jest.fn(() =>
       Promise.resolve({
         token: 'new-refresh-token',
@@ -74,6 +80,11 @@ describe('AuthService', () => {
     revokeSession: jest.fn(() => Promise.resolve()),
     revokeOtherSessions: jest.fn(() => Promise.resolve()),
     revokeAll: jest.fn(() => Promise.resolve()),
+    replaceForSingleDevice: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
+    setSingleDeviceLogin: jest.fn(() => Promise.resolve()),
+    assertSessionActive: jest.fn(() => Promise.resolve()),
   };
 
   const mockJwt = {
@@ -441,14 +452,13 @@ describe('AuthService', () => {
       },
     );
 
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
       'uuid-1',
       {
         deviceName: 'MacBook Pro',
         ip: '127.0.0.1',
         userAgent: 'PostmanRuntime',
       },
-      'APP',
     );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -477,12 +487,11 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.createAppSession).toHaveBeenCalledWith(
       'uuid-1',
       undefined,
-      'APP',
     );
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 
   it('adminLogin issues admin-audience tokens for active admin users', async () => {
@@ -502,7 +511,11 @@ describe('AuthService', () => {
     } as any);
 
     expect(result.accessToken).toBe('access-token');
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalledWith(
       'uuid-1',
       undefined,
       'ADMIN',
@@ -518,6 +531,32 @@ describe('AuthService', () => {
       // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
       expect.objectContaining({ expiresIn: 900 }),
     );
+  });
+
+  it('adminLogin replaces prior admin sessions when single-device login is enabled', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      email: 'admin@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'ADMIN',
+      singleDeviceLoginEnabled: true,
+    });
+
+    await service.adminLogin({
+      email: 'admin@example.com',
+      password: 'password1',
+    } as any);
+
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
+    expect(
+      mockRefreshTokenService.replaceForSingleDevice,
+    ).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 
   it('adminLogin rejects valid non-admin credentials', async () => {
@@ -594,12 +633,9 @@ describe('AuthService', () => {
 
     await service.setSingleDeviceLogin('uuid-1', true, 'session-1');
 
-    expect(mockPrisma.user.update).toHaveBeenCalledWith({
-      where: { id: 'uuid-1' },
-      data: { singleDeviceLoginEnabled: true },
-    });
-    expect(mockRefreshTokenService.revokeOtherSessions).toHaveBeenCalledWith(
+    expect(mockRefreshTokenService.setSingleDeviceLogin).toHaveBeenCalledWith(
       'uuid-1',
+      true,
       'session-1',
     );
   });
@@ -626,6 +662,10 @@ describe('AuthService', () => {
     );
     expect(mockJwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({ sub: 'uuid-1', sid: 'session-2', aud: 'APP' }),
+    );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
     );
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -669,6 +709,10 @@ describe('AuthService', () => {
       // #91：ADMIN audience 使用独立的更短 access TTL（默认 15m）
       // 秒数：min(admin 15m, 全局 1h) —— TTL 钳制后签名参数为秒
       expect.objectContaining({ expiresIn: 900 }),
+    );
+    expect(mockRefreshTokenService.assertSessionActive).toHaveBeenCalledWith(
+      'uuid-1',
+      'session-2',
     );
   });
 
