@@ -370,6 +370,7 @@ model User {
   callSessionsInitiated             CallSession[]               @relation("callInitiator")
   callParticipants                  CallParticipant[]
   profileSyncOutbox                 UserProfileSyncOutbox?
+  sessionRevocationOutbox           SessionRevocationOutbox?
 
   @@index([invitedByUserId])
 }
@@ -391,6 +392,22 @@ model UserProfileSyncOutbox {
   user User @relation(fields: [userID], references: [id], onDelete: Cascade)
 
   @@index([status, nextAttemptAt])
+}
+
+model SessionRevocationOutbox {
+  userID        String   @id
+  revokedAt     DateTime
+  expiresAt     DateTime
+  attempts      Int      @default(0)
+  lastError     String?
+  nextAttemptAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([nextAttemptAt])
+  @@index([expiresAt])
 }
 
 model RefreshToken {
@@ -1540,4 +1557,3 @@ model UserLike {
   // its fromUserID prefix also serves any fromUserID-only lookup.
   @@index([fromUserID, likedOn])
 }
-

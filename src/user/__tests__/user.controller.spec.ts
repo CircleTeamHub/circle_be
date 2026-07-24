@@ -58,8 +58,8 @@ describe('UserController', () => {
     expect(userService.remove).toHaveBeenCalledWith('user-1');
   });
 
-  it('allows an admin to delete another user', () => {
-    expect(
+  it('requires admins to use the audited admin-user status endpoint', () => {
+    expect(() =>
       controller.removeUser('user-2', {
         user: {
           userId: 'user-1',
@@ -67,8 +67,21 @@ describe('UserController', () => {
           role: Role.Admin,
         },
       } as any),
-    ).toEqual({ id: 'user-2' });
-    expect(userService.remove).toHaveBeenCalledWith('user-2');
+    ).toThrow(ForbiddenException);
+    expect(userService.remove).not.toHaveBeenCalled();
+  });
+
+  it('blocks admin self-deletes from the self-service route', () => {
+    expect(() =>
+      controller.removeUser('user-1', {
+        user: {
+          userId: 'user-1',
+          accountId: 'admin',
+          role: Role.Admin,
+        },
+      } as any),
+    ).toThrow(ForbiddenException);
+    expect(userService.remove).not.toHaveBeenCalled();
   });
 
   it('denies deleting another user without admin access', () => {

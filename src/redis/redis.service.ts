@@ -171,6 +171,49 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Atomically stores the greatest numeric value seen for a key.
+   * A smaller late write succeeds without replacing the stronger marker.
+   */
+  async setNumericMax(
+    key: string,
+    value: number,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return false;
+    }
+
+    try {
+      const result = await client.eval(
+        [
+          "local raw = redis.call('GET', KEYS[1])",
+          'local current = raw and tonumber(raw) or nil',
+          'local incoming = tonumber(ARGV[1])',
+          'if current and current >= incoming then',
+          "  redis.call('EXPIRE', KEYS[1], ARGV[2])",
+          '  return 1',
+          'end',
+          "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])",
+          'return 1',
+        ].join('\n'),
+        1,
+        key,
+        String(value),
+        String(ttlSeconds),
+      );
+      return Number(result) === 1;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      this.logger.warn(
+        `Redis numeric max set failed for ${key}: ${this.formatError(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
    * Versioned, race-safe cache write. Stores `{ __ver, payload }` and only
    * overwrites when the incoming `version` is >= the stored version (or the key
    * is absent), atomically via a Lua CAS. This makes read-through repopulation

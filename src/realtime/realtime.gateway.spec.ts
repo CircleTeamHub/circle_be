@@ -55,6 +55,14 @@ function createRedisBus(enabled = true) {
       store.set(key, value);
       return true;
     }),
+    setNumericMax: jest.fn(async (key: string, value: number) => {
+      if (!enabled) return false;
+      const current = store.get(key);
+      if (typeof current !== 'number' || value > current) {
+        store.set(key, value);
+      }
+      return true;
+    }),
     getJson: jest.fn(async (key: string) =>
       enabled ? (store.get(key) ?? null) : null,
     ),
