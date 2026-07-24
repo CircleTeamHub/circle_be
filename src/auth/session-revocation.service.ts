@@ -106,16 +106,29 @@ export class SessionRevocationService {
     return `authrev:s:${sessionId}`;
   }
 
+  revocationExpiresAt(revokedAtMs: number): Date {
+    return new Date(revokedAtMs + this.markerTtlSeconds * 1000);
+  }
+
   /** Revoke every access token issued to this user before now. No-op without Redis. */
   async revokeUser(userId: string): Promise<void> {
-    if (!this.redis.isEnabled()) return;
-    const revokedAtMs = Date.now();
-    await this.redis.setJson(
+    await this.revokeUserAt(userId, Date.now());
+  }
+
+  /**
+   * Persist a revocation marker at the original security-event timestamp.
+   * Returns false when Redis is disabled or the socket-close broadcast needs
+   * retry; marker write errors reject so durable callers can retry them too.
+   */
+  async revokeUserAt(userId: string, revokedAtMs: number): Promise<boolean> {
+    if (!this.redis.isEnabled()) return false;
+    const markerStored = await this.redis.setNumericMax(
       this.userKey(userId),
       revokedAtMs,
       this.markerTtlSeconds,
     );
-    await this.announce({ kind: 'user', userId, revokedAtMs });
+    if (!markerStored) return false;
+    return this.announce({ kind: 'user', userId, revokedAtMs });
   }
 
   /** Revoke a single session's access token (single logout / kill one session). */
@@ -139,9 +152,9 @@ export class SessionRevocationService {
    * so HTTP stays protected and the socket dies at token expiry — the same
    * degradation as running without Redis. Never let it fail the revocation.
    */
-  private async announce(event: SessionRevocationBroadcast): Promise<void> {
+  private async announce(event: SessionRevocationBroadcast): Promise<boolean> {
     try {
-      await this.redis.publish(
+      return await this.redis.publish(
         SESSION_REVOCATION_CHANNEL,
         JSON.stringify(event),
       );
@@ -151,6 +164,7 @@ export class SessionRevocationService {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
   }
 

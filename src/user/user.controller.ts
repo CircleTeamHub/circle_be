@@ -113,13 +113,19 @@ export class UserController {
 
   @Delete('/:id')
   @Serialize(PublicUserDto)
-  @ApiOperation({ summary: 'Delete a user (self or admin)' })
+  @ApiOperation({ summary: 'Delete the current user account' })
   @ApiOkResponse({ description: 'Deleted user', type: PublicUserDto })
   removeUser(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
   ) {
-    if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
+    if (req.user?.role === Role.Admin) {
+      throw new ForbiddenException({
+        message: 'Admins must use the audited admin status endpoint',
+        errorCode: UserErrorCode.DeleteOwnOnly,
+      });
+    }
+    if (id !== req.user?.userId) {
       throw new ForbiddenException({
         message: 'You can only delete your own account',
         errorCode: UserErrorCode.DeleteOwnOnly,

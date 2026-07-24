@@ -20,6 +20,7 @@ describe('AdminUserService', () => {
     circleMember: { count: jest.fn() },
     friendReport: { count: jest.fn() },
     wallet: { findUnique: jest.fn() },
+    sessionRevocationOutbox: { deleteMany: jest.fn() },
   };
   const audit = {
     recordInTransaction: jest.fn(),
@@ -31,8 +32,12 @@ describe('AdminUserService', () => {
       updateMany: jest.fn(),
     },
     refreshToken: { updateMany: jest.fn() },
+    sessionRevocationOutbox: { upsert: jest.fn() },
   };
-  const sessionRevocation = { revokeUser: jest.fn() };
+  const sessionRevocation = {
+    revokeUserAt: jest.fn(),
+    revocationExpiresAt: jest.fn(),
+  };
   const realtime = {
     invalidateUserProfileSummaryCache: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
@@ -47,7 +52,11 @@ describe('AdminUserService', () => {
   beforeEach(() => {
     jest.resetAllMocks();
     prisma.$transaction.mockImplementation((callback) => callback(tx));
-    sessionRevocation.revokeUser.mockResolvedValue(undefined);
+    sessionRevocation.revokeUserAt.mockResolvedValue(true);
+    sessionRevocation.revocationExpiresAt.mockImplementation(
+      (revokedAtMs: number) => new Date(revokedAtMs + 60 * 60 * 1000),
+    );
+    prisma.sessionRevocationOutbox.deleteMany.mockResolvedValue({ count: 1 });
     realtime.invalidateUserProfileSummaryCache.mockResolvedValue(undefined);
     realtime.broadcastUserProfileSummary.mockResolvedValue(undefined);
   });
@@ -408,6 +417,75 @@ describe('AdminUserService', () => {
   describe('updateStatus', () => {
     const actor = { userId: 'admin-1', accountId: 'support-admin' };
 
+    it('persists access revocation in the status transaction when banning', async () => {
+      prisma.$transaction.mockImplementation(async (callback) => callback(tx));
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      const refreshRevokedAt =
+        tx.refreshToken.updateMany.mock.calls[0][0].data.revokedAt;
+      const expiresAt = new Date(refreshRevokedAt.getTime() + 60 * 60 * 1000);
+      expect(tx.sessionRevocationOutbox.upsert).toHaveBeenCalledWith({
+        where: { userID: 'user-1' },
+        create: {
+          userID: 'user-1',
+          revokedAt: refreshRevokedAt,
+          expiresAt,
+        },
+        update: {
+          revokedAt: refreshRevokedAt,
+          expiresAt,
+          attempts: 0,
+          lastError: null,
+          nextAttemptAt: refreshRevokedAt,
+        },
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('completes and removes the durable revocation immediately when Redis is healthy', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+      const result = await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      const revokedAt =
+        tx.sessionRevocationOutbox.upsert.mock.calls[0][0].create.revokedAt;
+      expect(sessionRevocation.revokeUserAt).toHaveBeenCalledWith(
+        'user-1',
+        revokedAt.getTime(),
+      );
+      expect(prisma.sessionRevocationOutbox.deleteMany).toHaveBeenCalledWith({
+        where: { userID: 'user-1', revokedAt },
+      });
+      expect(result).toEqual({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.BANNED,
+        sessionRevocationPending: false,
+      });
+    });
+
     it.each([
       [UserStatus.ACTIVE, UserStatus.BANNED, 'USER_BANNED', true],
       [UserStatus.ACTIVE, UserStatus.DELETED, 'USER_DELETED', true],
@@ -452,10 +530,15 @@ describe('AdminUserService', () => {
             where: { userId: 'user-1', revokedAt: null },
             data: { revokedAt: expect.any(Date) },
           });
-          expect(sessionRevocation.revokeUser).toHaveBeenCalledWith('user-1');
+          const revokedAt =
+            tx.refreshToken.updateMany.mock.calls[0][0].data.revokedAt;
+          expect(sessionRevocation.revokeUserAt).toHaveBeenCalledWith(
+            'user-1',
+            revokedAt.getTime(),
+          );
         } else {
           expect(tx.refreshToken.updateMany).not.toHaveBeenCalled();
-          expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
+          expect(sessionRevocation.revokeUserAt).not.toHaveBeenCalled();
         }
         expect(realtime.invalidateUserProfileSummaryCache).toHaveBeenCalledWith(
           'user-1',
@@ -467,9 +550,46 @@ describe('AdminUserService', () => {
           id: 'user-1',
           accountId: 'jim-1001',
           status: targetStatus,
+          sessionRevocationPending: false,
         });
       },
     );
+
+    it('persists session revocation in the status transaction before commit', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+      const callOrder: string[] = [];
+      tx.sessionRevocationOutbox.upsert.mockImplementation(async () => {
+        callOrder.push('outbox');
+        return {};
+      });
+      audit.recordInTransaction.mockImplementation(async () => {
+        callOrder.push('audit');
+        return { id: 'audit-1' };
+      });
+      prisma.$transaction.mockImplementation(async (callback) => {
+        const value = await callback(tx);
+        callOrder.push('commit');
+        return value;
+      });
+      sessionRevocation.revokeUserAt.mockImplementation(async () => {
+        callOrder.push('redis');
+        return true;
+      });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      expect(callOrder).toEqual(['audit', 'outbox', 'commit', 'redis']);
+    });
 
     it.each([
       [UserStatus.ACTIVE, UserStatus.ACTIVE],
@@ -633,11 +753,11 @@ describe('AdminUserService', () => {
           reason: 'policy violation',
         }),
       ).rejects.toThrow('audit down');
-      expect(sessionRevocation.revokeUser).not.toHaveBeenCalled();
+      expect(sessionRevocation.revokeUserAt).not.toHaveBeenCalled();
       expect(realtime.invalidateUserProfileSummaryCache).not.toHaveBeenCalled();
     });
 
-    it('keeps a committed status response successful when post-commit hooks fail', async () => {
+    it('reports pending revocation when Redis returns unavailable after commit', async () => {
       tx.user.findUnique.mockResolvedValue({
         id: 'user-1',
         accountId: 'jim-1001',
@@ -646,7 +766,7 @@ describe('AdminUserService', () => {
       tx.user.updateMany.mockResolvedValue({ count: 1 });
       tx.refreshToken.updateMany.mockResolvedValue({ count: 1 });
       audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
-      sessionRevocation.revokeUser.mockRejectedValue(new Error('redis down'));
+      sessionRevocation.revokeUserAt.mockResolvedValue(false);
       realtime.invalidateUserProfileSummaryCache.mockRejectedValue(
         new Error('cache down'),
       );
@@ -660,7 +780,9 @@ describe('AdminUserService', () => {
         id: 'user-1',
         accountId: 'jim-1001',
         status: UserStatus.BANNED,
+        sessionRevocationPending: true,
       });
+      expect(prisma.sessionRevocationOutbox.deleteMany).not.toHaveBeenCalled();
     });
 
     it('returns not found before attempting a status write', async () => {

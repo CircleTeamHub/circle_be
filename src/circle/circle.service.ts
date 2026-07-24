@@ -29,6 +29,7 @@ const MAX_JOIN_TX_ATTEMPTS = 3;
 // whole by its endpoint, so cap it instead of letting table size decide the
 // response size.
 const MAX_AVAILABLE_ICON_ASSETS = 100;
+const MY_CIRCLES_DEFAULT_LIMIT = 100;
 
 @Injectable()
 export class CircleService {
@@ -179,7 +180,7 @@ export class CircleService {
     query: MyCirclesQueryDto,
   ): Promise<MyCircleDto[]> {
     const { tab } = query;
-    const limit = query.limit ?? 50;
+    const limit = query.limit ?? (query.cursor ? 50 : MY_CIRCLES_DEFAULT_LIMIT);
 
     if (tab === 'created') {
       const baseWhere: Prisma.CircleWhereInput = {
