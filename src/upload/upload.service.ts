@@ -85,6 +85,7 @@ export class UploadService implements OnModuleInit {
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly enabled: boolean;
+  private readonly production: boolean;
   private ready = false;
   // 与 `ready` 分开跟踪：ready 涵盖「桶存在 + 策略已应用」，而只有策略这一项关乎
   // 「私有笔记媒体是否真的私有」。见 objectStoreStatus()。
@@ -98,6 +99,9 @@ export class UploadService implements OnModuleInit {
     const secretKey = this.config.get<string>('MINIO_SECRET_KEY') ?? '';
     this.bucket = this.config.get<string>('MINIO_BUCKET') ?? 'circle';
     this.publicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? endpoint;
+    this.production =
+      (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
+      'production';
 
     this.enabled = Boolean(endpoint && accessKey && secretKey);
 
@@ -120,6 +124,11 @@ export class UploadService implements OnModuleInit {
 
   async onModuleInit() {
     if (!this.enabled) {
+      if (this.production) {
+        throw new ServiceUnavailableException(
+          'Private media storage is not configured',
+        );
+      }
       this.logger.warn(
         'MinIO is not configured (MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY missing). Upload features will be skipped.',
       );
@@ -130,7 +139,13 @@ export class UploadService implements OnModuleInit {
     // the rest of the app stays up.
     try {
       this.ready = await this.bootstrap();
+      if (!this.ready && this.production) {
+        throw new ServiceUnavailableException(
+          'Private media storage policy could not be applied',
+        );
+      }
     } catch (error) {
+      if (this.production) throw error;
       this.logger.error(
         `MinIO bucket bootstrap failed; upload features may be degraded: ${
           error instanceof Error ? error.message : String(error)

@@ -118,6 +118,37 @@ describe('UploadService', () => {
     });
   });
 
+  it('rejects production startup when the bucket policy cannot be applied', async () => {
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('policy denied'));
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'http://localhost:9000',
+          MINIO_ACCESS_KEY: 'minioadmin',
+          MINIO_SECRET_KEY: 'minioadmin123',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'http://localhost:9000',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('rejects production startup when MinIO is not configured', async () => {
+    const service = new UploadService({
+      get: (key: string) => (key === 'NODE_ENV' ? 'production' : null),
+    } as any);
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+  });
+
   it('signs upload urls with the public MinIO host when configured', async () => {
     const signedUrlMock = jest.mocked(getSignedUrl);
     signedUrlMock.mockResolvedValueOnce(

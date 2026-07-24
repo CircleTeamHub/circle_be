@@ -933,6 +933,44 @@ describe('NoteService', () => {
     });
   });
 
+  it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {
+    prisma.note.findMany.mockResolvedValueOnce([
+      {
+        id: 'note-private',
+        ownerID: 'user-1',
+        title: 'private',
+        content: null,
+        sections: null,
+        status: 'ACTIVE',
+        available: false,
+        pinned: false,
+        imageCount: 1,
+        videoCount: 0,
+        mediaCount: 1,
+        groupMemberships: [],
+        coverMedia: null,
+        media: [
+          {
+            id: 'media-private',
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/private.jpg',
+            url: 'https://api.example.com/circle/notes/user-1/private.jpg',
+            sortOrder: 0,
+          },
+        ],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+    uploadService.createPresignedGetUrl.mockRejectedValueOnce(
+      new Error('signing unavailable'),
+    );
+
+    await expect(service.listNotes('user-1', {})).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
   it('returns a note detail with owner edit metadata', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',

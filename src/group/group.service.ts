@@ -240,49 +240,41 @@ export class GroupService {
       });
     }
 
-    const actor = await this.getCircleMember(circle.id, actorId);
-    const target = await this.getCircleMember(
-      circle.id,
-      normalizedTargetUserID,
-    );
-    this.assertCanManageCircleGroup(actor, target);
-
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
-    if (!target) {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.conversationGroupMembership.deleteMany({
-          where: {
-            conversationID: {
-              in: this.groupConversationIDCandidates(normalizedGroupID),
-            },
-            group: { ownerID: normalizedTargetUserID },
-          },
-        });
-        await tx.groupSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'REMOVE_MEMBER',
-              groupID: openimGroupID,
-              userID: normalizedTargetUserID,
-            },
-          ],
-          skipDuplicates: true,
-        });
-      });
-      return { handled: true };
-    }
-
     await this.prisma.$transaction(async (tx) => {
-      await tx.userDisplayIcon.deleteMany({
-        where: { userID: normalizedTargetUserID, circleID: circle.id },
-      });
-      await tx.circleMember.delete({ where: { id: target.id } });
+      await this.lockCircleApplicationPairs(tx, circle.id, [
+        actorId,
+        normalizedTargetUserID,
+      ]);
+      const [actor, target] = await Promise.all([
+        tx.circleMember.findUnique({
+          where: { userID_circleID: { userID: actorId, circleID: circle.id } },
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: normalizedTargetUserID,
+              circleID: circle.id,
+            },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+      ]);
+      this.assertCanManageCircleGroup(actor, target);
 
-      if (target.status === CircleMemberStatus.ACTIVE) {
-        await tx.circle.update({
-          where: { id: circle.id },
-          data: { memberCount: { decrement: 1 } },
+      if (target) {
+        await tx.userDisplayIcon.deleteMany({
+          where: { userID: normalizedTargetUserID, circleID: circle.id },
         });
+        await tx.circleMember.delete({ where: { id: target.id } });
+
+        if (target.status === CircleMemberStatus.ACTIVE) {
+          await tx.circle.update({
+            where: { id: circle.id },
+            data: { memberCount: { decrement: 1 } },
+          });
+        }
       }
 
       await tx.conversationGroupMembership.deleteMany({
@@ -326,24 +318,25 @@ export class GroupService {
       select: { id: true, groupID: true, ownerID: true },
     });
 
-    const membership = circle
-      ? await this.prisma.circleMember.findUnique({
+    await this.prisma.$transaction(async (tx) => {
+      let membership: CircleGroupMemberLookup | null = null;
+      if (circle) {
+        await this.lockCircleApplicationPairs(tx, circle.id, [userId]);
+        membership = await tx.circleMember.findUnique({
           where: { userID_circleID: { userID: userId, circleID: circle.id } },
           select: { id: true, role: true, status: true },
-        })
-      : null;
+        });
+        if (
+          circle.ownerID === userId ||
+          membership?.role === CircleMemberRole.OWNER
+        ) {
+          throw new ForbiddenException({
+            message: 'Owner cannot leave — transfer ownership first',
+            errorCode: GroupErrorCode.OwnerCannotLeave,
+          });
+        }
+      }
 
-    if (
-      circle &&
-      (circle.ownerID === userId || membership?.role === CircleMemberRole.OWNER)
-    ) {
-      throw new ForbiddenException({
-        message: 'Owner cannot leave — transfer ownership first',
-        errorCode: GroupErrorCode.OwnerCannotLeave,
-      });
-    }
-
-    await this.prisma.$transaction(async (tx) => {
       await tx.conversationGroupMembership.deleteMany({
         where: {
           conversationID: { in: conversationIDs },

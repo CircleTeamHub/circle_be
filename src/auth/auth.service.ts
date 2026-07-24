@@ -439,7 +439,6 @@ export class AuthService {
       {
         audience: 'ADMIN',
         issueImToken: false,
-        revokeExistingSessions: user.singleDeviceLoginEnabled,
       },
     );
 
@@ -539,7 +538,6 @@ export class AuthService {
       user.role,
       sessionContext,
       platform,
-      { revokeExistingSessions: user.singleDeviceLoginEnabled },
     );
 
     logBusinessEvent(this.logger, {
@@ -603,6 +601,7 @@ export class AuthService {
       sessionId,
       'APP',
     );
+    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -645,6 +644,7 @@ export class AuthService {
       sessionId,
       'ADMIN',
     );
+    await this.refreshTokenService.assertSessionActive(user.id, sessionId);
     return { accessToken, refreshToken: newRefreshToken };
   }
 
@@ -740,17 +740,11 @@ export class AuthService {
       });
     }
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { singleDeviceLoginEnabled: enabled },
-    });
-
-    if (enabled) {
-      await this.refreshTokenService.revokeOtherSessions(
-        userId,
-        currentSessionId,
-      );
-    }
+    await this.refreshTokenService.setSingleDeviceLogin(
+      userId,
+      enabled,
+      currentSessionId,
+    );
   }
 
   async me(userId: string): Promise<SafeUser> {
@@ -1222,20 +1216,29 @@ export class AuthService {
     sessionContext?: SessionContext,
     platformID?: 1 | 2 | 5,
     options?: {
-      revokeExistingSessions?: boolean;
       audience?: RefreshTokenAudience;
       issueImToken?: boolean;
     },
   ) {
-    if (options?.revokeExistingSessions) {
-      await this.refreshTokenService.revokeAll(userId);
-    }
-
     const audience = options?.audience ?? 'APP';
     const issueImToken = options?.issueImToken ?? true;
+    let createSession: Promise<{ token: string; sessionId: string }>;
+    if (audience === 'APP') {
+      createSession = this.refreshTokenService.createAppSession(
+        userId,
+        sessionContext,
+      );
+    } else {
+      createSession =
+        this.refreshTokenService.createSessionForCurrentSingleDeviceSetting(
+          userId,
+          sessionContext,
+          audience,
+        );
+    }
 
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
-      this.refreshTokenService.create(userId, sessionContext, audience),
+      createSession,
       issueImToken ? this.resolveImToken(userId, platformID) : '',
     ]);
     const accessToken = await this.signAccessToken(
@@ -1245,6 +1248,7 @@ export class AuthService {
       sessionId,
       audience,
     );
+    await this.refreshTokenService.assertSessionActive(userId, sessionId);
     return issueImToken
       ? { accessToken, refreshToken, imToken }
       : { accessToken, refreshToken };
