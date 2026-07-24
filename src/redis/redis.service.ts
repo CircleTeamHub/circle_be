@@ -147,6 +147,35 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async getJsonMany<T>(keys: string[]): Promise<Array<T | null>> {
+    if (keys.length === 0) return [];
+
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return keys.map(() => null);
+    }
+
+    try {
+      const values = await client.mget(...keys);
+      return values.map((value, index) => {
+        if (!value) return null;
+        try {
+          return JSON.parse(value) as T;
+        } catch (error) {
+          this.logger.warn(
+            `Redis JSON get failed for ${keys[index]}: ${this.formatError(error)}`,
+          );
+          return null;
+        }
+      });
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      this.logger.warn(`Redis JSON MGET failed: ${this.formatError(error)}`);
+      return keys.map(() => null);
+    }
+  }
+
   async setJson<T>(
     key: string,
     value: T,
