@@ -25,4 +25,12 @@ describe('refresh-token family migration', () => {
     expect(sql).toContain('RefreshToken_userId_familyId_idx');
     expect(sql).toContain('RefreshToken_userId_audience_createdAt_idx');
   });
+
+  it('wraps the migration in an explicit transaction so deploy retries do not see partial enum or column state', () => {
+    expect(existsSync(migrationPath)).toBe(true);
+    const sql = readFileSync(migrationPath, 'utf8');
+
+    expect(sql).toMatch(/^\s*BEGIN;\s+CREATE\s+EXTENSION/i);
+    expect(sql).toMatch(/CREATE\s+INDEX[\s\S]+;\s*COMMIT;\s*$/i);
+  });
 });

@@ -65,6 +65,9 @@ describe('AuthService', () => {
     createAppSession: jest.fn(() =>
       Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
     ),
+    createSessionForCurrentSingleDeviceSetting: jest.fn(() =>
+      Promise.resolve({ token: 'refresh-token', sessionId: 'session-1' }),
+    ),
     rotate: jest.fn(() =>
       Promise.resolve({
         token: 'new-refresh-token',
@@ -508,7 +511,11 @@ describe('AuthService', () => {
     } as any);
 
     expect(result.accessToken).toBe('access-token');
-    expect(mockRefreshTokenService.create).toHaveBeenCalledWith(
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
+    expect(mockRefreshTokenService.create).not.toHaveBeenCalledWith(
       'uuid-1',
       undefined,
       'ADMIN',
@@ -543,11 +550,12 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
 
-    expect(mockRefreshTokenService.replaceForSingleDevice).toHaveBeenCalledWith(
-      'uuid-1',
-      undefined,
-      'ADMIN',
-    );
+    expect(
+      mockRefreshTokenService.createSessionForCurrentSingleDeviceSetting,
+    ).toHaveBeenCalledWith('uuid-1', undefined, 'ADMIN');
+    expect(
+      mockRefreshTokenService.replaceForSingleDevice,
+    ).not.toHaveBeenCalled();
     expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 

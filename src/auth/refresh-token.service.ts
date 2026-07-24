@@ -213,9 +213,10 @@ export class RefreshTokenService {
     };
   }
 
-  async createAppSession(
+  async createSessionForCurrentSingleDeviceSetting(
     userId: string,
     context?: SessionContext,
+    audience: RefreshTokenAudience = 'APP',
   ): Promise<{ token: string; sessionId: string }> {
     const result = await this.prisma.$transaction(async (tx) => {
       const lockKey = `auth-user:${userId}`;
@@ -228,15 +229,31 @@ export class RefreshTokenService {
         throw new UnauthorizedException('Invalid or inactive account');
       }
       if (user.singleDeviceLoginEnabled) {
-        return this.replaceForSingleDeviceWithClient(tx, userId, context);
+        return this.replaceForSingleDeviceWithClient(
+          tx,
+          userId,
+          context,
+          audience,
+        );
       }
       return {
-        session: await this.createWithClient(tx, userId, context, 'APP'),
+        session: await this.createWithClient(tx, userId, context, audience),
         revokedSessionIds: [],
       };
     });
     await this.revokeAccessSessions(result.revokedSessionIds);
     return result.session;
+  }
+
+  async createAppSession(
+    userId: string,
+    context?: SessionContext,
+  ): Promise<{ token: string; sessionId: string }> {
+    return this.createSessionForCurrentSingleDeviceSetting(
+      userId,
+      context,
+      'APP',
+    );
   }
 
   async replaceForSingleDevice(
@@ -339,7 +356,10 @@ export class RefreshTokenService {
       }
 
       if (record.revokedAt) {
-        if (record.revocationReason !== RefreshTokenRevocationReason.ROTATED) {
+        if (
+          record.revocationReason !== RefreshTokenRevocationReason.ROTATED &&
+          record.revocationReason !== null
+        ) {
           throw new UnauthorizedException('Invalid or expired refresh token');
         }
         const familySessions = await tx.refreshToken.findMany({

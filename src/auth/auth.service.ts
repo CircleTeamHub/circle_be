@@ -439,7 +439,6 @@ export class AuthService {
       {
         audience: 'ADMIN',
         issueImToken: false,
-        singleDeviceLoginEnabled: user.singleDeviceLoginEnabled,
       },
     );
 
@@ -1219,7 +1218,6 @@ export class AuthService {
     options?: {
       audience?: RefreshTokenAudience;
       issueImToken?: boolean;
-      singleDeviceLoginEnabled?: boolean;
     },
   ) {
     const audience = options?.audience ?? 'APP';
@@ -1230,18 +1228,13 @@ export class AuthService {
         userId,
         sessionContext,
       );
-    } else if (options?.singleDeviceLoginEnabled) {
-      createSession = this.refreshTokenService.replaceForSingleDevice(
-        userId,
-        sessionContext,
-        audience,
-      );
     } else {
-      createSession = this.refreshTokenService.create(
-        userId,
-        sessionContext,
-        audience,
-      );
+      createSession =
+        this.refreshTokenService.createSessionForCurrentSingleDeviceSetting(
+          userId,
+          sessionContext,
+          audience,
+        );
     }
 
     const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([

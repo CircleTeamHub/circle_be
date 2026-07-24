@@ -777,6 +777,45 @@ describe('RefreshTokenService', () => {
     expect(newSessionAfterFirstRotate.revokedAt).toBeInstanceOf(Date);
   });
 
+  it('marks legacy revoked refresh-token replays with null revocation reason', async () => {
+    const { token: raw } = await service.create('user-1');
+    await service.rotate(raw);
+    records[0].revocationReason = null;
+    jest.clearAllMocks();
+
+    await expect(service.rotate(raw)).rejects.toThrow(/reuse detected/i);
+
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+  });
+
+  it('creates ADMIN sessions under the single-device lock and rechecks the setting', async () => {
+    await service.create('user-1', { deviceName: 'old admin' }, 'ADMIN');
+    prisma.$executeRaw.mockImplementationOnce(async () => {
+      userSettings.set('user-1', true);
+      return 0;
+    });
+
+    const session = await (
+      service as any
+    ).createSessionForCurrentSingleDeviceSetting(
+      'user-1',
+      { deviceName: 'new admin' },
+      'ADMIN',
+    );
+
+    expect(session.sessionId).toBe('session-2');
+    expect(records[0].revokedAt).toBeInstanceOf(Date);
+    expect(records[1].audience).toBe('ADMIN');
+    expect(records[1].deviceName).toBe('new admin');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      select: { singleDeviceLoginEnabled: true },
+    });
+    expect(revocation.revokeSession).toHaveBeenCalledWith('session-1');
+  });
+
   it('rejects rotating an unknown refresh token', async () => {
     await expect(service.rotate('missing-token')).rejects.toThrow(
       UnauthorizedException,

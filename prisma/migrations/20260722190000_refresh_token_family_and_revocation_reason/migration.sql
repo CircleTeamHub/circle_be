@@ -1,3 +1,7 @@
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
 CREATE TYPE "RefreshTokenRevocationReason" AS ENUM (
   'ROTATED',
   'SINGLE_DEVICE_REPLACED',
@@ -7,8 +11,6 @@ CREATE TYPE "RefreshTokenRevocationReason" AS ENUM (
   'OTHER_SESSIONS_REVOKED',
   'TOKEN_FAMILY_REUSE'
 );
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 ALTER TABLE "RefreshToken"
 ADD COLUMN "familyId" TEXT DEFAULT (gen_random_uuid()::text),
@@ -29,3 +31,5 @@ ON "RefreshToken"("userId", "familyId");
 
 CREATE INDEX "RefreshToken_userId_audience_createdAt_idx"
 ON "RefreshToken"("userId", "audience", "createdAt");
+
+COMMIT;
