@@ -22,5 +22,10 @@ describe('VIP level check migration', () => {
     expect(sql).toMatch(/ADD CONSTRAINT "User_vipLevel_check"/i);
     expect(sql).toMatch(/"vipLevel"\s*<=\s*4/i);
     expect(sql).not.toMatch(/"vipLevel"\s*<=\s*5/i);
+
+    // 圈子/帖子的历史 VIP 门槛也一并夹到 4，否则原本配 VIP5 门槛的内容收口后无人可达。
+    expect(sql).toMatch(/UPDATE "Circle"[\s\S]*?"joinVipRestriction"\s*=\s*4/i);
+    expect(sql).toMatch(/UPDATE "CirclePost"[\s\S]*?"vipRestriction"\s*=\s*4/i);
+    expect(sql).toMatch(/"signupVipRestriction"\s*=\s*4/i);
   });
 });

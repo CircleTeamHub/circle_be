@@ -100,7 +100,7 @@ export class CreatePlazaPostDto {
   @Type(() => Number)
   @IsInt()
   @Min(0)
-  @Max(10)
+  @Max(4)
   @IsOptional()
   vipRestriction?: number;
 
@@ -125,7 +125,7 @@ export class CreatePlazaPostDto {
   @Type(() => Number)
   @IsInt()
   @Min(0)
-  @Max(10)
+  @Max(4)
   @IsOptional()
   signupVipRestriction?: number;
 
