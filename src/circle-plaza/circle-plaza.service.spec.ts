@@ -277,13 +277,13 @@ describe('CirclePlazaService', () => {
     it('includes the post author display icons in feed DTOs', async () => {
       const displayIcons = [
         {
-          id: 'vip-5',
+          id: 'vip-4',
           type: 'SYSTEM',
-          title: 'VIP5',
+          title: 'VIP4',
           imageUrl: null,
           fallbackIconName: null,
           systemKey: 'VIP',
-          systemVariant: 'VIP5',
+          systemVariant: 'VIP4',
           sortOrder: 0,
         },
       ];
@@ -1165,13 +1165,13 @@ describe('CirclePlazaService', () => {
       });
       const displayIcons = [
         {
-          id: 'vip-5',
+          id: 'vip-4',
           type: 'SYSTEM',
-          title: 'VIP5',
+          title: 'VIP4',
           imageUrl: null,
           fallbackIconName: null,
           systemKey: 'VIP',
-          systemVariant: 'VIP5',
+          systemVariant: 'VIP4',
           sortOrder: 0,
         },
       ];
@@ -1692,7 +1692,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 5,
+        vipLevel: 4,
         creditScore: 100,
         fancyNumber: false,
       });

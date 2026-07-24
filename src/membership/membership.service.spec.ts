@@ -63,14 +63,13 @@ describe('MembershipService', () => {
     service = module.get<MembershipService>(MembershipService);
   });
 
-  it('returns VIP1 to VIP5 plans priced in points', () => {
+  it('returns VIP1 to VIP4 plans priced in points', () => {
     const plans = service.getPlans();
 
-    expect(plans).toHaveLength(5);
-    expect(plans.map((plan) => plan.level)).toEqual([1, 2, 3, 4, 5]);
-    expect(plans.map((plan) => plan.price)).toEqual([
-      780, 1280, 2100, 4600, 9100,
-    ]);
+    expect(plans).toHaveLength(4);
+    expect(plans.map((plan) => plan.level)).toEqual([1, 2, 3, 4]);
+    expect(plans.map((plan) => plan.price)).toEqual([780, 1280, 2100, 4600]);
+    expect(plans.map((plan) => plan.name)).not.toContain('VIP5');
     expect(JSON.stringify(plans)).not.toContain('帮积分');
   });
 
@@ -172,11 +171,19 @@ describe('MembershipService', () => {
   });
 
   it('rejects upgrading to the current or lower VIP level', async () => {
-    tx.user.findUnique.mockResolvedValue({ id: 'user-1', vipLevel: 5 });
+    tx.user.findUnique.mockResolvedValue({ id: 'user-1', vipLevel: 4 });
 
+    await expect(service.upgrade('user-1', 4)).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects unsupported VIP5 upgrades', async () => {
     await expect(service.upgrade('user-1', 5)).rejects.toThrow(
       BadRequestException,
     );
+    expect(tx.user.findUnique).not.toHaveBeenCalled();
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
   });
 });

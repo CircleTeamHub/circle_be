@@ -30,7 +30,7 @@ type LeveledSystemBadgeDefinition = {
   getEarnedLevel: (user: EligibilityUser) => number;
 };
 
-const VIP_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [1, 2, 3, 4, 5].map(
+const VIP_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [1, 2, 3, 4].map(
   (level) => ({
     level,
     variant: `VIP${level}`,

@@ -19,7 +19,6 @@ const VIP_PLANS: MembershipPlanDto[] = [
   { level: 2, name: 'VIP2', price: 1280, perks: '更多群容量与基础折扣' },
   { level: 3, name: 'VIP3', price: 2100, perks: '高级身份标识与积分加成' },
   { level: 4, name: 'VIP4', price: 4600, perks: '专属靓号折扣与优先体验' },
-  { level: 5, name: 'VIP5', price: 9100, perks: '至尊会员权益与最高折扣' },
 ];
 
 @Injectable()
