@@ -86,7 +86,16 @@ export class UserController {
   @ApiOperation({
     summary: 'Batch lookup vipLevel by user ids (for name-effect rendering)',
   })
-  @ApiOkResponse({ description: 'Map of userId to vipLevel' })
+  @ApiOkResponse({
+    description: 'Map of userId to vipLevel',
+    // Promise<Record<string, number>> 的泛型在运行时被擦除，反射只看到 Promise，
+    // 不显式给 schema 的话生成的 OpenAPI 该响应没有对象/值类型，客户端无法建模。
+    schema: {
+      type: 'object',
+      additionalProperties: { type: 'integer' },
+      example: { 'user-a-id': 3, 'user-b-id': 4 },
+    },
+  })
   getVipLevels(@Body() dto: VipLevelsDto): Promise<Record<string, number>> {
     return this.userService.getVipLevels(dto.ids);
   }
