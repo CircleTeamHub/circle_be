@@ -11,8 +11,11 @@ import {
   ForbiddenException,
   UseGuards,
   Req,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { Throttle } from '@nestjs/throttler';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { UserErrorCode } from 'src/common/app-error-codes';
 import {
   ApiBearerAuth,
@@ -84,9 +87,12 @@ export class UserController {
   }
 
   @Post('vip-levels')
-  // 无全局 ThrottlerGuard,给这个前端可高频调用(IM 补水/重连)的批量端点单独限流,
-  // 防止重连风暴或单个持 token 的客户端把每次最多 200 个 id 的 DB 查询打爆。
-  @UseGuards(ThrottlerGuard)
+  // POST 但语义是只读查询:显式 200(默认 201 会与 @ApiOkResponse 的 200 契约冲突)。
+  @HttpCode(HttpStatus.OK)
+  // 无全局 ThrottlerGuard,给这个前端可高频调用(IM 补水/重连)的批量端点单独限流。
+  // 用 UserThrottlerGuard 按已认证用户计数(而非 IP)——否则同一 NAT/代理后的用户共享额度,
+  // 一小波重连会让无辜用户吃 429;防止重连风暴或单客户端把每次最多 200 个 id 的查询打爆。
+  @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({
     summary: 'Batch lookup vipLevel by user ids (for name-effect rendering)',

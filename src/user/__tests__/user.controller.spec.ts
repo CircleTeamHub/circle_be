@@ -1,7 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ForbiddenException } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
-import { ThrottlerGuard } from '@nestjs/throttler';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { Role } from 'src/enum/roles.enum';
 import { UserController } from '../user.controller';
 import { UserService } from '../user.service';
@@ -23,7 +23,7 @@ describe('UserController', () => {
     })
       // vip-levels 端点上的 ThrottlerGuard 依赖 ThrottlerModule 的 provider（本单测未引入）；
       // 放行即可，限流本身由下方的元数据用例断言。
-      .overrideGuard(ThrottlerGuard)
+      .overrideGuard(UserThrottlerGuard)
       .useValue({ canActivate: () => true })
       .compile();
 
@@ -111,7 +111,7 @@ describe('POST /user/vip-levels rate limiting', () => {
         GUARDS_METADATA,
         UserController.prototype.getVipLevels,
       ) ?? [];
-    expect(guards).toContain(ThrottlerGuard);
+    expect(guards).toContain(UserThrottlerGuard);
     expect(
       Reflect.getMetadata(
         'THROTTLER:LIMITdefault',

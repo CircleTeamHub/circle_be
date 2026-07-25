@@ -35,3 +35,18 @@ WHERE "vipRestriction" > 4;
 UPDATE "CirclePost"
 SET "signupVipRestriction" = 4
 WHERE "signupVipRestriction" > 4;
+
+-- 加 0..4 的 CHECK 约束（列可空，NULL=不限）。夹取只处理一次历史数据，约束才能挡住
+-- 蓝绿部署窗口里旧色（DTO 上限还是 10）新写入的 VIP5+ 门槛——否则会持久化一个收口后
+-- 无人可满足的不可达门槛。DB 层直接拒绝，比留下坏数据好。
+ALTER TABLE "Circle"
+  ADD CONSTRAINT "Circle_joinVipRestriction_check"
+  CHECK ("joinVipRestriction" IS NULL OR ("joinVipRestriction" >= 0 AND "joinVipRestriction" <= 4));
+
+ALTER TABLE "CirclePost"
+  ADD CONSTRAINT "CirclePost_vipRestriction_check"
+  CHECK ("vipRestriction" IS NULL OR ("vipRestriction" >= 0 AND "vipRestriction" <= 4));
+
+ALTER TABLE "CirclePost"
+  ADD CONSTRAINT "CirclePost_signupVipRestriction_check"
+  CHECK ("signupVipRestriction" IS NULL OR ("signupVipRestriction" >= 0 AND "signupVipRestriction" <= 4));

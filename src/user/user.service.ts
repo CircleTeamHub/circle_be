@@ -166,23 +166,30 @@ export class UserService {
     }
     // 客户端可能传标准 UUID(REST 场景)或无连字符的 OpenIM sendID(聊天场景)。两者都归一到
     // UUID 去查 User.id,但响应仍以**调用方传入的原始 id** 为键——前端好按它当初传的原样查回。
-    const normalizedToOriginal = new Map<string, string>();
+    // 同一批里可能同时传了一个用户的 UUID 和无连字符形态(两种 UI 各用一种),它们归一到同一
+    // 个 id;必须记录每个归一化 id 的**所有**别名并逐个产出,否则用另一形态的一侧会把已知
+    // 用户默认成 VIP0。
+    const aliasesByNormalized = new Map<string, string[]>();
     for (const id of uniqueIds) {
       const normalized = OpenimService.fromImUserId(id);
-      if (!normalizedToOriginal.has(normalized)) {
-        normalizedToOriginal.set(normalized, id);
+      const list = aliasesByNormalized.get(normalized);
+      if (list) {
+        list.push(id);
+      } else {
+        aliasesByNormalized.set(normalized, [id]);
       }
     }
     const users = await this.prisma.user.findMany({
-      where: { id: { in: [...normalizedToOriginal.keys()] } },
+      where: { id: { in: [...aliasesByNormalized.keys()] } },
       select: { id: true, vipLevel: true },
     });
-    return Object.fromEntries(
-      users.map((user) => [
-        normalizedToOriginal.get(user.id) ?? user.id,
-        user.vipLevel,
-      ]),
-    );
+    const out: Record<string, number> = {};
+    for (const user of users) {
+      for (const alias of aliasesByNormalized.get(user.id) ?? [user.id]) {
+        out[alias] = user.vipLevel;
+      }
+    }
+    return out;
   }
 
   /**

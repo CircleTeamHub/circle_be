@@ -121,6 +121,21 @@ describe('UserService', () => {
       });
       expect(result).toEqual({ [imId]: 4 });
     });
+
+    it('returns every requested alias when both UUID and OpenIM forms of one user are sent', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555';
+      prisma.user.findMany.mockResolvedValue([{ id: uuid, vipLevel: 4 }]);
+
+      const result = await service.getVipLevels([uuid, imId]);
+
+      // 归一后只查一次(同一 UUID),但两种别名都要回——否则用另一形态的一侧会默认 VIP0。
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: [uuid] } },
+        select: { id: true, vipLevel: true },
+      });
+      expect(result).toEqual({ [uuid]: 4, [imId]: 4 });
+    });
   });
 
   it('creates an independent canonical invite code with an explicit account ID', async () => {

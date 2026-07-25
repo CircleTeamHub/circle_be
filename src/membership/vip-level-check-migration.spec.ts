@@ -27,5 +27,13 @@ describe('VIP level check migration', () => {
     expect(sql).toMatch(/UPDATE "Circle"[\s\S]*?"joinVipRestriction"\s*=\s*4/i);
     expect(sql).toMatch(/UPDATE "CirclePost"[\s\S]*?"vipRestriction"\s*=\s*4/i);
     expect(sql).toMatch(/"signupVipRestriction"\s*=\s*4/i);
+
+    // 并加 0..4 的 CHECK 约束，挡住蓝绿窗口里旧色（DTO 上限仍是 10）新写入的不可达 VIP5+ 门槛。
+    expect(sql).toMatch(/ADD CONSTRAINT "Circle_joinVipRestriction_check"/i);
+    expect(sql).toMatch(/ADD CONSTRAINT "CirclePost_vipRestriction_check"/i);
+    expect(sql).toMatch(
+      /ADD CONSTRAINT "CirclePost_signupVipRestriction_check"/i,
+    );
+    expect(sql).toMatch(/"joinVipRestriction" IS NULL OR/i);
   });
 });
