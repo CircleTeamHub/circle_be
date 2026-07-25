@@ -1,5 +1,36 @@
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { UserController } from './user/user.controller';
+
+describe('trace & plaza author DTOs document vipLevel for OpenAPI', () => {
+  const read = (p: string) => readFileSync(join(process.cwd(), p), 'utf8');
+
+  it('decorates the author property and its vipLevel field so generated clients can model it', () => {
+    // 无 nest swagger 编译插件时,响应 DTO 必须显式 @ApiProperty 才能出现在 OpenAPI 里。
+    const trace = read('src/trace/dto/trace.dto.ts');
+    expect(trace).toMatch(
+      /@ApiProperty\(\{ type: TraceAuthorDto \}\)\s*\n\s*author: TraceAuthorDto;/,
+    );
+    const traceAuthor = trace.slice(
+      trace.indexOf('export class TraceAuthorDto'),
+    );
+    expect(traceAuthor).toMatch(
+      /@ApiProperty\(\{[\s\S]*?\}\)\s*\n\s*vipLevel: number \| null;/,
+    );
+
+    const plaza = read('src/circle-plaza/dto/circle-plaza.dto.ts');
+    expect(plaza).toMatch(
+      /@ApiProperty\(\{ type: PlazaPostAuthorDto \}\)\s*\n\s*author: PlazaPostAuthorDto;/,
+    );
+    const plazaAuthor = plaza.slice(
+      plaza.indexOf('export class PlazaPostAuthorDto'),
+    );
+    expect(plazaAuthor).toMatch(
+      /@ApiProperty\(\{[\s\S]*?\}\)\s*\n\s*vipLevel: number \| null;/,
+    );
+  });
+});
 
 describe('POST /user/vip-levels OpenAPI response schema', () => {
   it('declares an object map of userId -> integer vipLevel', () => {

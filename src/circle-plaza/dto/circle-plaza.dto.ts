@@ -213,12 +213,29 @@ export class PlazaFeedQueryDto {
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
 export class PlazaPostAuthorDto {
+  @ApiProperty()
   id: string;
+
+  @ApiProperty()
   nickname: string;
+
+  @ApiProperty({ type: String, nullable: true })
   avatarUrl: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
   avatarFrame: string | null;
+
+  @ApiProperty()
   accountId: string;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: '会员等级（名字特效渲染用）；null / 0 = 非会员',
+  })
   vipLevel: number | null;
+
+  @ApiProperty({ type: [DisplayIconDto] })
   displayIcons: DisplayIconDto[];
 }
 
@@ -250,6 +267,8 @@ export class PlazaPostDto {
     fancyNumber: boolean;
   };
   canSignup: boolean;
+
+  @ApiProperty({ type: PlazaPostAuthorDto })
   author: PlazaPostAuthorDto;
   circle: PlazaPostCircleDto;
   circles: PlazaPostCircleDto[];

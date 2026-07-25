@@ -111,9 +111,20 @@ export class NewCountQueryDto {
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
 export class TraceAuthorDto {
+  @ApiProperty()
   id: string;
+
+  @ApiProperty()
   nickname: string;
+
+  @ApiProperty({ type: String, nullable: true })
   avatarUrl: string | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: '会员等级（名字特效渲染用）；null / 0 = 非会员',
+  })
   vipLevel: number | null;
 }
 
@@ -132,6 +143,8 @@ export class TraceDto {
   content: string;
   images: string[];
   visibility: string;
+
+  @ApiProperty({ type: TraceAuthorDto })
   author: TraceAuthorDto;
   likeCount: number;
   commentCount: number;
