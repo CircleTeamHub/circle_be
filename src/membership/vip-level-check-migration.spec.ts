@@ -35,5 +35,20 @@ describe('VIP level check migration', () => {
       /ADD CONSTRAINT "CirclePost_signupVipRestriction_check"/i,
     );
     expect(sql).toMatch(/"joinVipRestriction" IS NULL OR/i);
+
+    // 每个 CHECK 约束在 ADD 前都要 DROP IF EXISTS，迁移才能重跑（部署脚本重试 / 手工
+    // 补跑不会因 42710 duplicate_object 炸掉）。与 User_vipLevel_check 的处理保持一致。
+    for (const name of [
+      'Circle_joinVipRestriction_check',
+      'CirclePost_vipRestriction_check',
+      'CirclePost_signupVipRestriction_check',
+    ]) {
+      const dropIdx = sql.search(
+        new RegExp(`DROP CONSTRAINT IF EXISTS "${name}"`, 'i'),
+      );
+      const addIdx = sql.search(new RegExp(`ADD CONSTRAINT "${name}"`, 'i'));
+      expect(dropIdx).toBeGreaterThanOrEqual(0);
+      expect(addIdx).toBeGreaterThan(dropIdx);
+    }
   });
 });

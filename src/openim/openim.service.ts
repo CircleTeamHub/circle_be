@@ -130,10 +130,14 @@ export class OpenimService implements OnModuleInit {
    */
   static fromImUserId(imUserId: string): string {
     if (/^[0-9a-f]{32}$/i.test(imUserId)) {
-      return `${imUserId.slice(0, 8)}-${imUserId.slice(8, 12)}-${imUserId.slice(
+      // 正则大小写不敏感,但 Postgres/Prisma 的 UUID 恒为小写。若按原样重建,大写 hex
+      // 会拼出大写 UUID、与 `User.id` 比对全落空。先归一到小写再切段,任何合法 32-hex
+      // 都还原成规范的小写 UUID。
+      const hex = imUserId.toLowerCase();
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
         12,
         16,
-      )}-${imUserId.slice(16, 20)}-${imUserId.slice(20)}`;
+      )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     }
     return imUserId;
   }

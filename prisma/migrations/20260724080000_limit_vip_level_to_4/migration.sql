@@ -40,13 +40,19 @@ WHERE "signupVipRestriction" > 4;
 -- 蓝绿部署窗口里旧色（DTO 上限还是 10）新写入的 VIP5+ 门槛——否则会持久化一个收口后
 -- 无人可满足的不可达门槛。DB 层直接拒绝，比留下坏数据好。
 ALTER TABLE "Circle"
+  DROP CONSTRAINT IF EXISTS "Circle_joinVipRestriction_check";
+ALTER TABLE "Circle"
   ADD CONSTRAINT "Circle_joinVipRestriction_check"
   CHECK ("joinVipRestriction" IS NULL OR ("joinVipRestriction" >= 0 AND "joinVipRestriction" <= 4));
 
 ALTER TABLE "CirclePost"
+  DROP CONSTRAINT IF EXISTS "CirclePost_vipRestriction_check";
+ALTER TABLE "CirclePost"
   ADD CONSTRAINT "CirclePost_vipRestriction_check"
   CHECK ("vipRestriction" IS NULL OR ("vipRestriction" >= 0 AND "vipRestriction" <= 4));
 
+ALTER TABLE "CirclePost"
+  DROP CONSTRAINT IF EXISTS "CirclePost_signupVipRestriction_check";
 ALTER TABLE "CirclePost"
   ADD CONSTRAINT "CirclePost_signupVipRestriction_check"
   CHECK ("signupVipRestriction" IS NULL OR ("signupVipRestriction" >= 0 AND "signupVipRestriction" <= 4));
