@@ -12,6 +12,7 @@ import {
   UseGuards,
   Req,
 } from '@nestjs/common';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { UserErrorCode } from 'src/common/app-error-codes';
 import {
   ApiBearerAuth,
@@ -83,6 +84,10 @@ export class UserController {
   }
 
   @Post('vip-levels')
+  // 无全局 ThrottlerGuard,给这个前端可高频调用(IM 补水/重连)的批量端点单独限流,
+  // 防止重连风暴或单个持 token 的客户端把每次最多 200 个 id 的 DB 查询打爆。
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({
     summary: 'Batch lookup vipLevel by user ids (for name-effect rendering)',
   })

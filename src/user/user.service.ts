@@ -17,6 +17,7 @@ import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
+import { OpenimService } from 'src/openim/openim.service';
 import { likedOnToday } from '../like/like.util';
 import {
   generateUniqueRegistrationCode,
@@ -163,11 +164,25 @@ export class UserService {
     if (uniqueIds.length === 0) {
       return {};
     }
+    // 客户端可能传标准 UUID(REST 场景)或无连字符的 OpenIM sendID(聊天场景)。两者都归一到
+    // UUID 去查 User.id,但响应仍以**调用方传入的原始 id** 为键——前端好按它当初传的原样查回。
+    const normalizedToOriginal = new Map<string, string>();
+    for (const id of uniqueIds) {
+      const normalized = OpenimService.fromImUserId(id);
+      if (!normalizedToOriginal.has(normalized)) {
+        normalizedToOriginal.set(normalized, id);
+      }
+    }
     const users = await this.prisma.user.findMany({
-      where: { id: { in: uniqueIds } },
+      where: { id: { in: [...normalizedToOriginal.keys()] } },
       select: { id: true, vipLevel: true },
     });
-    return Object.fromEntries(users.map((user) => [user.id, user.vipLevel]));
+    return Object.fromEntries(
+      users.map((user) => [
+        normalizedToOriginal.get(user.id) ?? user.id,
+        user.vipLevel,
+      ]),
+    );
   }
 
   /**

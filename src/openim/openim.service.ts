@@ -124,6 +124,21 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * `toImUserId` 的逆操作：把无连字符的 32 位 OpenIM userID 还原成标准 UUID（`User.id`）。
+   * 客户端在聊天场景拿到的是 OpenIM 的 sendID（无连字符），拿它直接和 PostgreSQL 的连字符
+   * UUID 比对会全部落空。非 32 位纯 hex（已是 UUID / 其它形态）则原样返回。
+   */
+  static fromImUserId(imUserId: string): string {
+    if (/^[0-9a-f]{32}$/i.test(imUserId)) {
+      return `${imUserId.slice(0, 8)}-${imUserId.slice(8, 12)}-${imUserId.slice(
+        12,
+        16,
+      )}-${imUserId.slice(16, 20)}-${imUserId.slice(20)}`;
+    }
+    return imUserId;
+  }
+
+  /**
    * OpenIM's 1:1 conversation id: `si_` + the two IM userIDs sorted ascending
    * and joined by `_`. Sorting makes it identical regardless of arg order.
    */

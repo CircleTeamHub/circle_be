@@ -105,6 +105,22 @@ describe('UserService', () => {
       expect(result).toEqual({});
       expect(prisma.user.findMany).not.toHaveBeenCalled();
     });
+
+    it('resolves hyphenless OpenIM sendIDs to UUID users and keys by the caller id', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555'; // = toImUserId(uuid)
+      prisma.user.findMany.mockResolvedValue([{ id: uuid, vipLevel: 4 }]);
+
+      const result = await service.getVipLevels([imId]);
+
+      // 查询用还原后的 UUID(否则聊天场景的无连字符 id 全部落空、VIP 默认 0);
+      // 响应键用调用方传入的原始 id,前端按当初传的原样查回。
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: [uuid] } },
+        select: { id: true, vipLevel: true },
+      });
+      expect(result).toEqual({ [imId]: 4 });
+    });
   });
 
   it('creates an independent canonical invite code with an explicit account ID', async () => {
