@@ -352,3 +352,30 @@ describe('OpenimService group/auth admin calls', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('OpenimService userID <-> imUserID mapping', () => {
+  it('strips hyphens going to OpenIM and restores them coming back', () => {
+    const uuid = '2f1a4b6c-8d9e-4a1b-8c2d-3e4f5a6b7c8d';
+    const imId = OpenimService.toImUserId(uuid);
+
+    expect(imId).toBe('2f1a4b6c8d9e4a1b8c2d3e4f5a6b7c8d');
+    expect(imId).not.toContain('-');
+    expect(OpenimService.fromImUserId(imId)).toBe(uuid);
+  });
+
+  it('normalizes uppercase im ids to the lowercase UUID Postgres stores', () => {
+    // 正则大小写不敏感,但 Prisma/Postgres 的 User.id 恒为小写。大写 im id 若按原样重建
+    // 会拼出大写 UUID、与 DB 比对全落空。fromImUserId 必须归一到小写。
+    const upper = '2F1A4B6C8D9E4A1B8C2D3E4F5A6B7C8D';
+
+    expect(OpenimService.fromImUserId(upper)).toBe(
+      '2f1a4b6c-8d9e-4a1b-8c2d-3e4f5a6b7c8d',
+    );
+  });
+
+  it('returns non-32-hex ids unchanged (already a UUID or other shape)', () => {
+    const alreadyUuid = '2f1a4b6c-8d9e-4a1b-8c2d-3e4f5a6b7c8d';
+    expect(OpenimService.fromImUserId(alreadyUuid)).toBe(alreadyUuid);
+    expect(OpenimService.fromImUserId('admin')).toBe('admin');
+  });
+});

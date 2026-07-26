@@ -99,6 +99,7 @@ export type SafeUser = {
   region: string | null;
   vipLevel: number;
   creditScore: number;
+  receivedLikeCount: number;
   role: string;
   status: string;
   lastOnline: Date | null;

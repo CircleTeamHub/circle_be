@@ -82,6 +82,62 @@ describe('UserService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('getVipLevels', () => {
+    it('maps existing user ids to their vipLevel and dedupes the query', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'a', vipLevel: 3 },
+        { id: 'b', vipLevel: 0 },
+      ]);
+
+      const result = await service.getVipLevels(['a', 'b', 'a', 'missing']);
+
+      // Missing ids are simply absent (client defaults them to 0); query is deduped.
+      expect(result).toEqual({ a: 3, b: 0 });
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['a', 'b', 'missing'] } },
+        select: { id: true, vipLevel: true },
+      });
+    });
+
+    it('short-circuits on empty input without hitting the database', async () => {
+      const result = await service.getVipLevels([]);
+
+      expect(result).toEqual({});
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+    });
+
+    it('resolves hyphenless OpenIM sendIDs to UUID users and keys by the caller id', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555'; // = toImUserId(uuid)
+      prisma.user.findMany.mockResolvedValue([{ id: uuid, vipLevel: 4 }]);
+
+      const result = await service.getVipLevels([imId]);
+
+      // 查询用还原后的 UUID(否则聊天场景的无连字符 id 全部落空、VIP 默认 0);
+      // 响应键用调用方传入的原始 id,前端按当初传的原样查回。
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: [uuid] } },
+        select: { id: true, vipLevel: true },
+      });
+      expect(result).toEqual({ [imId]: 4 });
+    });
+
+    it('returns every requested alias when both UUID and OpenIM forms of one user are sent', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555';
+      prisma.user.findMany.mockResolvedValue([{ id: uuid, vipLevel: 4 }]);
+
+      const result = await service.getVipLevels([uuid, imId]);
+
+      // 归一后只查一次(同一 UUID),但两种别名都要回——否则用另一形态的一侧会默认 VIP0。
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: [uuid] } },
+        select: { id: true, vipLevel: true },
+      });
+      expect(result).toEqual({ [uuid]: 4, [imId]: 4 });
+    });
+  });
+
   it('creates an independent canonical invite code with an explicit account ID', async () => {
     prisma.user.create.mockResolvedValue({ id: 'user-1' });
 

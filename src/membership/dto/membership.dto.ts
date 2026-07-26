@@ -10,10 +10,10 @@ export class MembershipPlanDto {
 }
 
 export class UpgradeMembershipDto {
-  @ApiProperty({ example: 3, minimum: 1, maximum: 5 })
+  @ApiProperty({ example: 3, minimum: 1, maximum: 4 })
   @IsInt()
   @Min(1)
-  @Max(5)
+  @Max(4)
   level: number;
 }
 
