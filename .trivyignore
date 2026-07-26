@@ -13,3 +13,13 @@ CVE-2026-33671
 # verification is not invoked at runtime, so this code path is not reachable.
 # Will clear when the base image ships a patched npm.
 CVE-2026-48815
+
+# CVE-2026-14257 — brace-expansion 5.0.7 ReDoS.
+# Present ONLY in the npm CLI bundled with the node:22-slim base image
+# (/usr/local/lib/node_modules/npm/node_modules/brace-expansion). Our own app deps
+# are patched — the lockfile pins the 5.0.x copies to 5.0.8 and every copy is a
+# devDependency pruned out of the production image (`npm prune --omit=dev`). npm is
+# not invoked at runtime — the image runs `node dist/src/main.js` — and the offline
+# `npx prisma migrate deploy` path passes no attacker-controlled brace patterns, so
+# the ReDoS is not reachable. Will clear when the base image ships a patched npm.
+CVE-2026-14257
