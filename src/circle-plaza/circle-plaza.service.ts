@@ -20,7 +20,10 @@ import { NotificationService } from 'src/notification/notification.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { IconService } from 'src/icon/icon.service';
 import { likedOnToday } from 'src/like/like.util';
-import { MembershipLevel } from 'src/membership/membership.catalog';
+import {
+  MembershipLevel,
+  resolveEffectiveMembershipLevel,
+} from 'src/membership/membership.catalog';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   decodeFeedCursor,
@@ -1653,6 +1656,10 @@ export class CirclePlazaService {
         avatarUrl: post.author.avatarUrl,
         avatarFrame: post.author.avatarFrame,
         accountId: post.author.accountId,
+        vipLevel: resolveEffectiveMembershipLevel({
+          vipLevel: post.author.vipLevel ?? 0,
+          vipExpiresAt: post.author.vipExpiresAt ?? null,
+        }),
         displayIcons,
       },
       circle: {

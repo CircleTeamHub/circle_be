@@ -216,6 +216,7 @@ describe('UserService', () => {
         data: [
           {
             id: 'user-1',
+            vipLevel: 0,
             membership: {
               effectiveLevel: 0,
               key: 'regular',
@@ -292,6 +293,7 @@ describe('UserService', () => {
         displayIcons: [],
         likeCount: 4,
         likedByMeToday: false,
+        vipLevel: 0,
         membership: {
           effectiveLevel: 0,
           key: 'regular',
@@ -299,7 +301,6 @@ describe('UserService', () => {
         },
       });
       const result = await service.findOne('user-1');
-      expect(result).not.toHaveProperty('vipLevel');
       expect(result).not.toHaveProperty('vipExpiresAt');
       expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
     });

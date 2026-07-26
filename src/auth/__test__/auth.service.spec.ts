@@ -1174,7 +1174,7 @@ describe('AuthService', () => {
       {
         id: 'vip-icon',
         type: 'SYSTEM',
-        title: 'VIP5',
+        title: 'VIP4',
         imageUrl: null,
         fallbackIconName: 'diamond',
         sortOrder: 0,
@@ -1198,7 +1198,7 @@ describe('AuthService', () => {
       birthday: null,
       gender: 'male',
       city: '杭州',
-      vipLevel: 5,
+      vipLevel: 4,
       creditScore: 100,
       role: 'USER',
       status: 'ACTIVE',
@@ -1214,7 +1214,7 @@ describe('AuthService', () => {
     );
     expect(me.displayIcons).toEqual([
       expect.objectContaining({
-        title: 'VIP5',
+        title: 'VIP4',
       }),
     ]);
   });

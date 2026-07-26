@@ -72,9 +72,11 @@ type ProfileMembershipUser = {
 
 function toPublicUser<T extends ProfileMembershipUser>(user: T) {
   const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
+  const membership = toPublicMembershipAppearance({ vipLevel, vipExpiresAt });
   return {
     ...profile,
-    membership: toPublicMembershipAppearance({ vipLevel, vipExpiresAt }),
+    vipLevel: membership.effectiveLevel,
+    membership,
   };
 }
 

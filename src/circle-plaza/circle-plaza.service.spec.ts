@@ -496,11 +496,11 @@ describe('CirclePlazaService', () => {
         {
           id: 'vip-5',
           type: 'SYSTEM',
-          title: 'VIP5',
+          title: 'VIP4',
           imageUrl: null,
           fallbackIconName: null,
           systemKey: 'VIP',
-          systemVariant: 'VIP5',
+          systemVariant: 'VIP4',
           sortOrder: 0,
         },
       ];
@@ -528,6 +528,8 @@ describe('CirclePlazaService', () => {
             avatarUrl: null,
             avatarFrame: null,
             accountId: '1001',
+            vipLevel: 3,
+            vipExpiresAt: new Date('2030-01-01T00:00:00.000Z'),
           },
           circle: { id: 'circle-1', name: 'Circle' },
         },
@@ -549,6 +551,7 @@ describe('CirclePlazaService', () => {
         expect.arrayContaining(['author-1']),
       );
       expect(result.items[0].author.displayIcons).toEqual(displayIcons);
+      expect(result.items[0].author.vipLevel).toBe(3);
     });
 
     it('keyset mode (cursor): no skip, no count(), fetches limit+1 with the tuple predicate', async () => {
@@ -1526,11 +1529,11 @@ describe('CirclePlazaService', () => {
         {
           id: 'vip-5',
           type: 'SYSTEM',
-          title: 'VIP5',
+          title: 'VIP4',
           imageUrl: null,
           fallbackIconName: null,
           systemKey: 'VIP',
-          systemVariant: 'VIP5',
+          systemVariant: 'VIP4',
           sortOrder: 0,
         },
       ];
@@ -2091,7 +2094,7 @@ describe('CirclePlazaService', () => {
       prisma.circlePost.findFirst.mockResolvedValue(restrictedPost);
       prisma.circlePostSignup.findUnique.mockResolvedValue(null);
       prisma.user.findUnique.mockResolvedValue({
-        vipLevel: 5,
+        vipLevel: 4,
         creditScore: 100,
         fancyNumber: false,
       });

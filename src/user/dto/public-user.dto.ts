@@ -129,6 +129,15 @@ export class PublicUserDto {
   @Type(() => DisplayIconDto)
   displayIcons: DisplayIconDto[];
 
+  @ApiProperty({
+    example: 3,
+    minimum: 0,
+    maximum: 4,
+    description: 'Effective public membership level for display.',
+  })
+  @Expose()
+  vipLevel: number;
+
   @ApiProperty({ type: PublicMembershipAppearanceDto })
   @Expose()
   @Type(() => PublicMembershipAppearanceDto)
@@ -151,10 +160,6 @@ export class SelfUserDto extends PublicUserDto {
   @ApiPropertyOptional({ example: '+8613800138000' })
   @Expose()
   phoneNumber: string | null;
-
-  @ApiProperty({ example: 3 })
-  @Expose()
-  vipLevel: number;
 
   @ApiProperty({ example: 3 })
   @Expose()

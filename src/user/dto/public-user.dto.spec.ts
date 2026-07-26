@@ -30,7 +30,7 @@ describe('SelfUserDto serialization', () => {
         updatedAt: new Date('2026-04-24T02:52:34.270Z'),
         email: null,
         phoneNumber: null,
-        vipLevel: 5,
+        vipLevel: 4,
         storedVipLevel: 5,
         vipExpiresAt: null,
         membership: {
@@ -48,7 +48,7 @@ describe('SelfUserDto serialization', () => {
           {
             id: 'icon-1',
             type: 'SYSTEM',
-            title: 'VIP5',
+            title: 'VIP4',
             imageUrl: null,
             fallbackIconName: 'diamond',
             systemKey: 'VIP',
@@ -66,7 +66,7 @@ describe('SelfUserDto serialization', () => {
       expect.objectContaining({
         id: 'icon-1',
         type: 'SYSTEM',
-        title: 'VIP5',
+        title: 'VIP4',
         fallbackIconName: 'diamond',
         systemKey: 'VIP',
         recognitionCount: 100,
@@ -75,6 +75,7 @@ describe('SelfUserDto serialization', () => {
     ]);
     expect(dto.inviteCode).toBe('invite1');
     expect(dto.storedVipLevel).toBe(5);
+    expect(dto.vipLevel).toBe(4);
     expect(dto.membership).toEqual({
       effectiveLevel: 4,
       key: 'super',
@@ -148,12 +149,13 @@ describe('PublicUserDto serialization (other-user view)', () => {
     // region/city are intentionally public — same visibility as city (product decision).
     expect(view.region).toBe('上海');
     expect(view.city).toBe('杭州');
-    // PublicUserDto is the "no PII" view; PII and secrets must stay out.
+    // PublicUserDto is the "no PII" view; membership display level is public,
+    // but expiry/storage details stay private.
     expect(view.email).toBeUndefined();
     expect(view.phoneNumber).toBeUndefined();
     expect(view.passwordHash).toBeUndefined();
     expect(view.inviteCode).toBeUndefined();
-    expect(view.vipLevel).toBeUndefined();
+    expect(view.vipLevel).toBe(3);
     expect(view.vipExpiresAt).toBeUndefined();
     expect(dto.membership).toEqual({
       effectiveLevel: 3,
