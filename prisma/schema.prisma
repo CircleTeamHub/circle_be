@@ -421,7 +421,7 @@ model MembershipProgramState {
   enabledAt       DateTime?
   enabledByUserId String?
   createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  updatedAt       DateTime  @default(now()) @updatedAt
 }
 
 model MembershipBenefitGrant {
