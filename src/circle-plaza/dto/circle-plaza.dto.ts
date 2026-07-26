@@ -360,3 +360,33 @@ export class ReportCirclePostDto {
   @MaxLength(500)
   reason?: string;
 }
+
+// GET /circle-plaza/feed 与 POST /circle-plaza/feed/search 的分页信封响应。之前 feed/search
+// 的 @ApiOkResponse 谎报成裸 PlazaPostDto[]，生成的移动端客户端会按错误的顶层结构反序列化。
+export class PlazaFeedResponseDto {
+  @ApiProperty({ type: PlazaPostDto, isArray: true })
+  items: PlazaPostDto[];
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: '总数；游标翻页时为 null',
+  })
+  total: number | null;
+
+  @ApiProperty()
+  page: number;
+
+  @ApiProperty()
+  limit: number;
+
+  @ApiProperty()
+  hasMore: boolean;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: '下一页 keyset 游标；无更多时为 null',
+  })
+  nextCursor: string | null;
+}

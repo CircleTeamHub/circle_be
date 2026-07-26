@@ -317,8 +317,18 @@ export class MembershipAdminService {
         content,
       ),
     ]);
-    if (cacheResult.status === 'rejected') {
-      this.logger.warn('Membership cache invalidation failed after commit');
+    // deleteKey 软失败（Redis 不可用时返回 false 而不抛）同样算失效失败：allSettled 会把它
+    // 当 fulfilled，若不复检返回值，下面的 broadcastMembershipStatus / ProfileSummary 会把
+    // pre-grant 的陈旧缓存推给客户端。强制再失效一次收窄陈旧窗口。
+    const cacheInvalidated =
+      cacheResult.status === 'fulfilled' && cacheResult.value === true;
+    if (!cacheInvalidated) {
+      this.logger.warn(
+        'Membership cache invalidation failed after commit; retrying before broadcast',
+      );
+      await this.realtimeService
+        .invalidateUserHotCache(targetUserId)
+        .catch(() => undefined);
     }
     if (notificationResult.status === 'rejected') {
       this.logger.warn('Membership notification failed after commit');

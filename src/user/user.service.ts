@@ -24,7 +24,10 @@ import {
   isInviteCodeUniqueCollision,
   REGISTRATION_CODE_MAX_ATTEMPTS,
 } from 'src/auth/account-id.unique';
-import { toPublicMembershipAppearance } from 'src/membership/membership-appearance';
+import {
+  resolveMembershipAppearance,
+  toPublicMembershipAppearance,
+} from 'src/membership/membership-appearance';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -76,6 +79,28 @@ function toPublicUser<T extends ProfileMembershipUser>(user: T) {
   const membership = toPublicMembershipAppearance({ vipLevel, vipExpiresAt });
   return {
     ...profile,
+    vipLevel: membership.effectiveLevel,
+    membership,
+  };
+}
+
+// 自视图映射：保留 storedVipLevel / vipExpiresAt 与含 active·lifetime 的完整 appearance，
+// 供序列化成 SelfUserDto 的路径（如 PATCH /user/:id）用。toPublicUser 是「无 PII」的他人
+// 视图、会剥掉这些自有字段；PATCH 若用它，SelfUserDto 的新契约字段就会全部缺失（与
+// /auth/me 不一致）。
+function toSelfUser<T extends ProfileMembershipUser>(
+  user: T,
+  now = new Date(),
+) {
+  const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
+  const membership = resolveMembershipAppearance(
+    { vipLevel, vipExpiresAt },
+    now,
+  );
+  return {
+    ...profile,
+    storedVipLevel: vipLevel,
+    vipExpiresAt,
     vipLevel: membership.effectiveLevel,
     membership,
   };
@@ -408,7 +433,7 @@ export class UserService {
     await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
-      ...toPublicUser(user),
+      ...toSelfUser(user),
       displayIcons,
     };
   }

@@ -908,20 +908,30 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  async invalidateUserHotCache(userId: string): Promise<void> {
-    await Promise.all([
+  /**
+   * 返回「基于 deleteKey 的两处热缓存是否都失效成功」。deleteKey 在 Redis 不可用 / 失败时
+   * 只返回 false 而不抛，若不把它上报，会员发放后的广播会读到 pre-grant 的陈旧缓存档位。
+   * 徽章走 versioned key（best-effort），不计入返回值。没接 Redis = 没有可陈旧的缓存 = true。
+   */
+  async invalidateUserHotCache(userId: string): Promise<boolean> {
+    const [, membershipOk, profileOk] = await Promise.all([
       this.invalidateBadgeSnapshotCache(userId),
       this.invalidateMembershipStatusCache(userId),
       this.invalidateUserProfileSummaryCache(userId),
     ]);
+    return membershipOk && profileOk;
   }
 
-  async invalidateMembershipStatusCache(userId: string): Promise<void> {
-    await this.redisService?.deleteKey(this.membershipStatusCacheKey(userId));
+  async invalidateMembershipStatusCache(userId: string): Promise<boolean> {
+    return this.redisService
+      ? this.redisService.deleteKey(this.membershipStatusCacheKey(userId))
+      : true;
   }
 
-  async invalidateUserProfileSummaryCache(userId: string): Promise<void> {
-    await this.redisService?.deleteKey(this.userProfileSummaryCacheKey(userId));
+  async invalidateUserProfileSummaryCache(userId: string): Promise<boolean> {
+    return this.redisService
+      ? this.redisService.deleteKey(this.userProfileSummaryCacheKey(userId))
+      : true;
   }
 
   /**

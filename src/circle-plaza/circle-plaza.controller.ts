@@ -31,6 +31,7 @@ import {
   CreatePlazaPostDto,
   MyCirclePostDto,
   PlazaFeedQueryDto,
+  PlazaFeedResponseDto,
   PlazaFeedSearchDto,
   PlazaPostDto,
   RecognizePostCollaboratorsDto,
@@ -50,6 +51,7 @@ export class CirclePlazaController {
   @ApiOperation({
     summary: 'Plaza feed (paginated, filterable by circle/city)',
   })
+  @ApiOkResponse({ type: PlazaFeedResponseDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza feed reads' })
   feed(
     @Query() query: PlazaFeedQueryDto,
@@ -69,7 +71,7 @@ export class CirclePlazaController {
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: 'Plaza feed search with body-based city filters' })
-  @ApiOkResponse({ type: PlazaPostDto, isArray: true })
+  @ApiOkResponse({ type: PlazaFeedResponseDto })
   @ApiTooManyRequestsResponse({ description: 'Too many plaza feed reads' })
   feedSearch(
     @Body() body: PlazaFeedSearchDto,

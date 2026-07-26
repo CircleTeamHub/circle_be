@@ -18,6 +18,7 @@ import {
   MARKETING_ENTITLEMENT_FLOOR_LEVEL,
   MembershipProgramDatabase,
   MembershipProgramService,
+  MembershipProgramStatus,
 } from './membership-program.service';
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
@@ -60,12 +61,31 @@ export class MembershipPolicyService {
     db: MembershipProgramDatabase = this.prisma,
     now = new Date(),
   ): Promise<EffectiveMembershipPolicy> {
+    const program = await this.loadProgramStatus(db);
+    return this.resolveEntitlementWith(membership, program, now);
+  }
+
+  /**
+   * 载一次 staged-rollout 状态。批量准入（一次可含 100 个目标）用它在循环外读一次，避免每个
+   * 候选人各查一次 MembershipProgramState —— 那些串行往返发生在持有全部 advisory 锁的
+   * Serializable 事务里，会显著拉长延迟与锁竞争。
+   */
+  async loadProgramStatus(
+    db: MembershipProgramDatabase = this.prisma,
+  ): Promise<MembershipProgramStatus | null> {
+    return this.membershipProgram ? this.membershipProgram.getStatus(db) : null;
+  }
+
+  /** 用预载的 rollout 状态解析有效权益（无 DB 往返），供批量准入循环用。 */
+  resolveEntitlementWith(
+    membership: StoredMembership,
+    program: MembershipProgramStatus | null,
+    now = new Date(),
+  ): EffectiveMembershipPolicy {
     const actual = this.resolve(membership, now);
-    if (!this.membershipProgram) {
+    if (!program) {
       return actual;
     }
-
-    const program = await this.membershipProgram.getStatus(db);
     const level = program.enabled
       ? actual.level
       : Math.max(actual.level, MARKETING_ENTITLEMENT_FLOOR_LEVEL);

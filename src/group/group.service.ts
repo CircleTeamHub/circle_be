@@ -11,6 +11,7 @@ import {
   CircleMemberRole,
   CircleMemberStatus,
   Prisma,
+  ReportReviewStatus,
 } from 'src/generated/prisma';
 import { GroupErrorCode } from 'src/common/app-error-codes';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
@@ -369,11 +370,15 @@ export class GroupService {
       }
     }
 
+    // 只挡「同一举报仍在 PENDING」的重复；APPROVED/REJECTED 审结后允许再次举报新事件
+    // （与 GroupReport_pending_unique 局部唯一索引一致）。不限定 status 会把已审结的旧行
+    // 也当重复、永久 409。
     const duplicate = await this.prisma.groupReport.findFirst({
       where: {
         reporterID: reporterId,
         groupID: reportGroupID,
         category: dto.category,
+        status: ReportReviewStatus.PENDING,
       },
       select: { id: true },
     });

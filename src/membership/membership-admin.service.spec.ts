@@ -56,7 +56,9 @@ describe('MembershipAdminService', () => {
     createSystemNotification: jest.fn().mockResolvedValue(null),
   };
   const realtime = {
-    invalidateUserHotCache: jest.fn().mockResolvedValue(undefined),
+    // invalidateUserHotCache 现返回 boolean（true = 失效成功）；发放后路径靠它复检，false 会
+    // 触发一次强制重试。默认成功。
+    invalidateUserHotCache: jest.fn().mockResolvedValue(true),
     broadcastMembershipStatus: jest.fn().mockResolvedValue(undefined),
     broadcastUserProfileSummary: jest.fn().mockResolvedValue(undefined),
     broadcastSystemNotificationCreated: jest.fn(),
@@ -129,7 +131,7 @@ describe('MembershipAdminService', () => {
     prisma.membershipGrant.findUnique.mockResolvedValue(null);
     prisma.membershipBenefitGrant.findMany.mockResolvedValue([]);
     notification.createSystemNotification.mockResolvedValue(null);
-    realtime.invalidateUserHotCache.mockResolvedValue(undefined);
+    realtime.invalidateUserHotCache.mockResolvedValue(true);
     realtime.safeBroadcastAll.mockImplementation((fns) =>
       Promise.allSettled(fns.map((fn) => fn())),
     );
@@ -605,5 +607,24 @@ describe('MembershipAdminService', () => {
     ).resolves.toMatchObject({ replayed: false, grant: { id: 'grant-1' } });
     expect(tx.user.update).toHaveBeenCalledTimes(1);
     expect(tx.membershipGrant.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries hot-cache invalidation before broadcasting when the first invalidation soft-fails', async () => {
+    tx.user.findUnique.mockResolvedValue(user(0, null));
+    // deleteKey 软失败时 invalidateUserHotCache 返回 false（不抛）。发放后路径应复检返回值并再
+    // 失效一次，收窄陈旧窗口——否则 broadcastMembershipStatus/ProfileSummary 会把 pre-grant 的
+    // 陈旧缓存推给客户端。
+    realtime.invalidateUserHotCache
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    await expect(
+      service.grant(operatorId, targetId, {
+        targetLevel: 1,
+        idempotencyKey,
+      }),
+    ).resolves.toMatchObject({ replayed: false });
+
+    expect(realtime.invalidateUserHotCache).toHaveBeenCalledTimes(2);
   });
 });

@@ -25,6 +25,7 @@ type AdmissionOptions = {
 const CIRCLE_ADMISSION_SELECT = {
   id: true,
   deleted: true,
+  ownerID: true,
   maxMembers: true,
   memberCount: true,
   joinVipRestriction: true,
@@ -107,13 +108,17 @@ export class CircleAdmissionPolicy {
       joinedCounts.map((row) => [row.userID, row._count._all]),
     );
 
+    // staged-rollout 状态在循环外读一次；每个候选人再各查一次会在持有全部 advisory 锁的
+    // Serializable 事务里串行往返（最多 100 次），徒增延迟与锁竞争。
+    const program = await this.membershipPolicy.loadProgramStatus(tx);
+
     for (const userID of activatingUserIDs) {
       const candidate = userByID.get(userID);
       if (!candidate) this.throwCandidateNotFound();
 
-      const effective = await this.membershipPolicy.resolveEntitlement(
+      const effective = this.membershipPolicy.resolveEntitlementWith(
         candidate,
-        tx,
+        program,
         now,
       );
       const limit = effective.tier.quotas.joinedCircles.actual;
@@ -129,10 +134,24 @@ export class CircleAdmissionPolicy {
       this.assertRestrictions(circle, candidate, effective.level);
     }
 
+    // 圈主软降级：座位数还要受圈主「当前有效会员」的单群人数配额限（不只受 maxMembers）。否则
+    // 钻石圈主建 1000 人群后过期降级仍能继续加到 1000，legacy null maxMembers 更是无限，违背软
+    // 降级（保留存量、按低配额挡新增）。owner 理论必然存在，缺失时按普通用户兜底、不放宽。
+    const owner = await tx.user.findUnique({
+      where: { id: circle.ownerID },
+      select: { vipLevel: true, vipExpiresAt: true },
+    });
+    const ownerCapacity = this.membershipPolicy.resolveEntitlementWith(
+      owner ?? { vipLevel: 0, vipExpiresAt: null },
+      program,
+      now,
+    ).tier.quotas.groupMembers.actual;
+
     const reserved = await reserveCircleSeats(
       tx,
       circleID,
       activatingUserIDs.length,
+      ownerCapacity,
     );
     if (!reserved) {
       const currentCircle = await tx.circle.findUnique({

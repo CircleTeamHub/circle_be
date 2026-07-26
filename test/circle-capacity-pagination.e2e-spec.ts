@@ -65,7 +65,10 @@ describe('Circle capacity and invitation pagination e2e', () => {
           release();
         }
         await bothMembershipWritesReady;
-        if (!(await reserveCircleSeats(tx, circleId, 1))) {
+        // 该用例只验 maxMembers 容量：给足够大的 ownerCapacity 使其不参与限制。
+        if (
+          !(await reserveCircleSeats(tx, circleId, 1, Number.MAX_SAFE_INTEGER))
+        ) {
           throw new Error('member limit');
         }
       });
