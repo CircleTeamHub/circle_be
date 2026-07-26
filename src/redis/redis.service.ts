@@ -147,6 +147,35 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async getJsonMany<T>(keys: string[]): Promise<Array<T | null>> {
+    if (keys.length === 0) return [];
+
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return keys.map(() => null);
+    }
+
+    try {
+      const values = await client.mget(...keys);
+      return values.map((value, index) => {
+        if (!value) return null;
+        try {
+          return JSON.parse(value) as T;
+        } catch (error) {
+          this.logger.warn(
+            `Redis JSON get failed for ${keys[index]}: ${this.formatError(error)}`,
+          );
+          return null;
+        }
+      });
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      this.logger.warn(`Redis JSON MGET failed: ${this.formatError(error)}`);
+      return keys.map(() => null);
+    }
+  }
+
   async setJson<T>(
     key: string,
     value: T,
@@ -165,6 +194,49 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       this.recordCommandFailure('set', error);
       this.logger.warn(
         `Redis JSON set failed for ${key}: ${this.formatError(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Atomically stores the greatest numeric value seen for a key.
+   * A smaller late write succeeds without replacing the stronger marker.
+   */
+  async setNumericMax(
+    key: string,
+    value: number,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return false;
+    }
+
+    try {
+      const result = await client.eval(
+        [
+          "local raw = redis.call('GET', KEYS[1])",
+          'local current = raw and tonumber(raw) or nil',
+          'local incoming = tonumber(ARGV[1])',
+          'if current and current >= incoming then',
+          "  redis.call('EXPIRE', KEYS[1], ARGV[2])",
+          '  return 1',
+          'end',
+          "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])",
+          'return 1',
+        ].join('\n'),
+        1,
+        key,
+        String(value),
+        String(ttlSeconds),
+      );
+      return Number(result) === 1;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      this.logger.warn(
+        `Redis numeric max set failed for ${key}: ${this.formatError(error)}`,
       );
       return false;
     }

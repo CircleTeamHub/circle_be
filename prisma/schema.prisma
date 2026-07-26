@@ -20,6 +20,16 @@ enum RefreshTokenAudience {
   ADMIN
 }
 
+enum RefreshTokenRevocationReason {
+  ROTATED
+  SINGLE_DEVICE_REPLACED
+  LOGOUT
+  LOGOUT_ALL
+  SESSION_REVOKED
+  OTHER_SESSIONS_REVOKED
+  TOKEN_FAMILY_REUSE
+}
+
 enum EmailCodePurpose {
   REGISTER
   LOGIN
@@ -379,6 +389,7 @@ model User {
   membershipGrantsReceived          MembershipGrant[]           @relation("membershipGrantTarget")
   membershipGrantsIssued            MembershipGrant[]           @relation("membershipGrantOperator")
   membershipBenefitGrants           MembershipBenefitGrant[]
+  sessionRevocationOutbox           SessionRevocationOutbox?
 
   @@index([invitedByUserId])
 }
@@ -446,21 +457,41 @@ model UserProfileSyncOutbox {
   @@index([status, nextAttemptAt])
 }
 
+model SessionRevocationOutbox {
+  userID        String   @id
+  revokedAt     DateTime
+  expiresAt     DateTime
+  attempts      Int      @default(0)
+  lastError     String?
+  nextAttemptAt DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  @@index([nextAttemptAt])
+  @@index([expiresAt])
+}
+
 model RefreshToken {
-  id         String               @id @default(uuid())
-  userId     String
-  token      String               @unique
-  audience   RefreshTokenAudience @default(APP)
-  deviceName String?
-  ip         String?
-  userAgent  String?
-  expiredAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime             @default(now())
-  lastUsedAt DateTime             @default(now())
-  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id               String                        @id @default(uuid())
+  userId           String
+  token            String                        @unique
+  familyId         String                        @default(dbgenerated("(gen_random_uuid())::text"))
+  audience         RefreshTokenAudience          @default(APP)
+  deviceName       String?
+  ip               String?
+  userAgent        String?
+  expiredAt        DateTime
+  revokedAt        DateTime?
+  revocationReason RefreshTokenRevocationReason?
+  createdAt        DateTime                      @default(now())
+  lastUsedAt       DateTime                      @default(now())
+  user             User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([userId, familyId])
+  @@index([userId, audience, createdAt])
 }
 
 // ─── Social ───────────────────────────────────────────────────────────────────
@@ -1597,4 +1628,3 @@ model UserLike {
   // its fromUserID prefix also serves any fromUserID-only lookup.
   @@index([fromUserID, likedOn])
 }
-

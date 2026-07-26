@@ -140,7 +140,14 @@ export class TraceService {
       this.prisma.trace.findMany({
         where,
         include: {
-          from: { select: { id: true, nickname: true, avatarUrl: true } },
+          from: {
+            select: {
+              id: true,
+              nickname: true,
+              avatarUrl: true,
+              vipLevel: true,
+            },
+          },
           likeStats: {
             where: { deleted: false },
             orderBy: { updatedAt: 'desc' },
@@ -248,7 +255,9 @@ export class TraceService {
     const trace = await this.prisma.trace.findFirst({
       where: { id: traceId, deleted: false },
       include: {
-        from: { select: { id: true, nickname: true, avatarUrl: true } },
+        from: {
+          select: { id: true, nickname: true, avatarUrl: true, vipLevel: true },
+        },
         likeStats: {
           where: { deleted: false },
           orderBy: { updatedAt: 'desc' },
@@ -304,7 +313,9 @@ export class TraceService {
         fromID: userId,
       },
       include: {
-        from: { select: { id: true, nickname: true, avatarUrl: true } },
+        from: {
+          select: { id: true, nickname: true, avatarUrl: true, vipLevel: true },
+        },
       },
     });
 
@@ -321,6 +332,7 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
+        vipLevel: trace.from.vipLevel ?? null,
       },
       likeCount: 0,
       commentCount: 0,
@@ -1076,6 +1088,7 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
+        vipLevel: trace.from.vipLevel ?? null,
       },
       likeCount: trace.likeCount,
       commentCount: trace.replyCount,

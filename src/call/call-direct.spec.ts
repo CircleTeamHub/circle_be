@@ -400,6 +400,49 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     );
   });
 
+  it('rejectCall cannot overwrite a participant concurrently accepted as JOINED', async () => {
+    const call = {
+      id: 'call-1',
+      conversationID: 'si_user1_user2',
+      sessionType: 1,
+      callType: 'AUDIO',
+      status: CallStatus.RINGING,
+      initiatorID: 'user-1',
+      participants: [],
+    };
+    prisma.callParticipant.findUnique
+      .mockResolvedValueOnce({
+        callID: 'call-1',
+        userID: 'user-2',
+        status: CallParticipantStatus.INVITED,
+        call,
+      })
+      .mockResolvedValueOnce({
+        callID: 'call-1',
+        userID: 'user-2',
+        status: CallParticipantStatus.JOINED,
+        call,
+      });
+    prisma.callParticipant.updateMany.mockResolvedValueOnce({ count: 0 });
+    prisma.callParticipant.update.mockResolvedValueOnce({
+      callID: 'call-1',
+      userID: 'user-2',
+      status: CallParticipantStatus.REJECTED,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    });
+    prisma.callParticipant.count.mockResolvedValueOnce(1);
+    realtime.broadcastCallParticipantRejected = jest.fn();
+
+    await expect(service.rejectCall('user-2', 'call-1')).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: CallErrorCode.NotInvited,
+      }),
+    });
+
+    expect(prisma.callParticipant.update).not.toHaveBeenCalled();
+    expect(realtime.broadcastCallParticipantRejected).not.toHaveBeenCalled();
+  });
+
   it('only the winning cancel emits the call record (concurrent cancels)', async () => {
     const call = {
       id: 'call-1',

@@ -33,6 +33,10 @@ describe('RedisService', () => {
       false,
     );
     await expect(service.getJson('circle:test')).resolves.toBeNull();
+    await expect(service.getJsonMany(['a', 'b'])).resolves.toEqual([
+      null,
+      null,
+    ]);
     await expect(
       service.setJson('circle:test', { ok: true }, 10),
     ).resolves.toBe(false);
@@ -72,6 +76,22 @@ describe('RedisService', () => {
     jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
 
     await expect(service.ping()).resolves.toBe(true);
+  });
+
+  it('reads multiple JSON values in one Redis MGET', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = {
+      mget: jest
+        .fn()
+        .mockResolvedValue(['1', null, JSON.stringify({ revoked: true })]),
+    };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+    await expect(
+      service.getJsonMany(['one', 'missing', 'obj']),
+    ).resolves.toEqual([1, null, { revoked: true }]);
+    expect(client.mget).toHaveBeenCalledWith('one', 'missing', 'obj');
   });
 
   it('reports ping failures as unreachable instead of throwing at the probe', async () => {
@@ -182,12 +202,17 @@ describe('RedisService', () => {
     jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(null);
 
     await expect(service.getJson('k')).resolves.toBeNull();
+    await expect(service.getJsonMany(['a', 'b'])).resolves.toEqual([
+      null,
+      null,
+    ]);
     await expect(service.setJson('k', { a: 1 }, 10)).resolves.toBe(false);
     await expect(service.deleteKey('k')).resolves.toBe(false);
     await expect(service.incrementWithTtl('k', 10)).resolves.toBeNull();
     await expect(service.setJsonIfNewer('k', { a: 1 }, 5, 10)).resolves.toBe(
       false,
     );
+    await expect(service.setNumericMax('k', 5, 10)).resolves.toBe(false);
     await expect(service.getJsonWithVersion('k')).resolves.toBeNull();
     await expect(service.getVersion('k:version')).resolves.toBeNull();
     await expect(
@@ -221,6 +246,25 @@ describe('RedisService', () => {
       expect.stringContaining('"__ver":5'),
       '5',
       '10',
+    );
+  });
+
+  it('atomically preserves the greatest numeric revocation marker', async () => {
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    const client = { eval: jest.fn().mockResolvedValue(1) };
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+    await expect(
+      service.setNumericMax('authrev:u:user-1', 200, 3600),
+    ).resolves.toBe(true);
+
+    expect(client.eval).toHaveBeenCalledWith(
+      expect.stringContaining('current >= incoming'),
+      1,
+      'authrev:u:user-1',
+      '200',
+      '3600',
     );
   });
 

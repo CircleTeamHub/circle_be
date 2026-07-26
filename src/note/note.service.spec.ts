@@ -1054,6 +1054,44 @@ describe('NoteService', () => {
     });
   });
 
+  it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {
+    prisma.note.findMany.mockResolvedValueOnce([
+      {
+        id: 'note-private',
+        ownerID: 'user-1',
+        title: 'private',
+        content: null,
+        sections: null,
+        status: 'ACTIVE',
+        available: false,
+        pinned: false,
+        imageCount: 1,
+        videoCount: 0,
+        mediaCount: 1,
+        groupMemberships: [],
+        coverMedia: null,
+        media: [
+          {
+            id: 'media-private',
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/private.jpg',
+            url: 'https://api.example.com/circle/notes/user-1/private.jpg',
+            sortOrder: 0,
+          },
+        ],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]);
+    uploadService.createPresignedGetUrl.mockRejectedValueOnce(
+      new Error('signing unavailable'),
+    );
+
+    await expect(service.listNotes('user-1', {})).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
   it('returns a note detail with owner edit metadata', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
@@ -3190,7 +3228,7 @@ describe('NoteService', () => {
       expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { ownerID: 'user-1' },
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       );
       // 已吊销 / 已过期的链接也要返回：revokedAt、expiresAt 都在 DTO 上，
@@ -3215,40 +3253,68 @@ describe('NoteService', () => {
       ]);
     });
 
-    it('defaults to the first page when no paging is requested', async () => {
+    it('defaults to a bounded first cursor page', async () => {
       prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
 
       await service.listShareLinks('user-1', {});
 
-      // 与 listNotes 的默认值对齐（limit 50 / page 1）。链接行数没有上界，
-      // 不设 take 会把该用户全部历史链接一次性拉进内存。
-      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ take: 50, skip: 0 }),
-      );
+      const query = prisma.noteShareLink.findMany.mock.calls[0][0];
+      expect(query).toEqual(expect.objectContaining({ take: 50 }));
+      expect(query).not.toHaveProperty('skip');
     });
 
-    it('translates page and limit into skip and take', async () => {
+    it('seeks after an owner-scoped cursor with stable tie ordering', async () => {
+      const createdAt = new Date('2026-06-09T10:00:00.000Z');
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce({
+        id: '11111111-1111-4111-8111-111111111111',
+        createdAt,
+      });
       prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
 
-      await service.listShareLinks('user-1', { page: 3, limit: 20 });
+      await service.listShareLinks('user-1', {
+        cursor: '11111111-1111-4111-8111-111111111111',
+        limit: 20,
+      });
 
-      // 有了分页，超出首屏的旧链接也拿得到 id —— 否则它们在本接口上不可见，
-      // 也就无从吊销（吊销只能靠列表拿 id）。
-      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ take: 20, skip: 40 }),
+      expect(prisma.noteShareLink.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: '11111111-1111-4111-8111-111111111111',
+          ownerID: 'user-1',
+        },
+        select: { id: true, createdAt: true },
+      });
+      const query = prisma.noteShareLink.findMany.mock.calls[0][0];
+      expect(query).toEqual(
+        expect.objectContaining({
+          where: {
+            ownerID: 'user-1',
+            OR: [
+              { createdAt: { lt: createdAt } },
+              {
+                createdAt,
+                id: { lt: '11111111-1111-4111-8111-111111111111' },
+              },
+            ],
+          },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: 20,
+        }),
       );
+      expect(query).not.toHaveProperty('skip');
     });
 
-    it('reaches links past the first page for revocation', async () => {
-      prisma.noteShareLink.findMany.mockResolvedValueOnce([]);
+    it('rejects a cursor that is missing or owned by another user', async () => {
+      prisma.noteShareLink.findFirst.mockResolvedValueOnce(null);
 
-      await service.listShareLinks('user-1', { page: 2 });
+      await expect(
+        service.listShareLinks('user-1', {
+          cursor: '22222222-2222-4222-8222-222222222222',
+        }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'NOTE_SHARE_LINK_INVALID_CURSOR' },
+      });
 
-      // page 2 + 默认 limit：第 51 条起。这正是「老链接被新链接挤掉就吊销不了」
-      // 那个缺口的补法。
-      expect(prisma.noteShareLink.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ take: 50, skip: 50 }),
-      );
+      expect(prisma.noteShareLink.findMany).not.toHaveBeenCalled();
     });
   });
 
@@ -3397,6 +3463,26 @@ describe('NoteService', () => {
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(prisma.note.create).not.toHaveBeenCalled();
+    });
+  });
+
+  it('maps a concurrent restore unique collision to NOTE_RESTORE_DUPLICATE', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce({
+        id: 'deleted-copy',
+        collectedFromNoteID: 'source-note',
+      })
+      .mockResolvedValueOnce(null);
+    prisma.note.updateMany.mockRejectedValueOnce(
+      Object.assign(new Error('unique constraint'), { code: 'P2002' }),
+    );
+
+    await expect(
+      service.restoreNote('user-1', 'deleted-copy'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'NOTE_RESTORE_DUPLICATE',
+      }),
     });
   });
 });

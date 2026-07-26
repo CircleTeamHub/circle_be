@@ -124,6 +124,25 @@ export class OpenimService implements OnModuleInit {
   }
 
   /**
+   * `toImUserId` 的逆操作：把无连字符的 32 位 OpenIM userID 还原成标准 UUID（`User.id`）。
+   * 客户端在聊天场景拿到的是 OpenIM 的 sendID（无连字符），拿它直接和 PostgreSQL 的连字符
+   * UUID 比对会全部落空。非 32 位纯 hex（已是 UUID / 其它形态）则原样返回。
+   */
+  static fromImUserId(imUserId: string): string {
+    if (/^[0-9a-f]{32}$/i.test(imUserId)) {
+      // 正则大小写不敏感,但 Postgres/Prisma 的 UUID 恒为小写。若按原样重建,大写 hex
+      // 会拼出大写 UUID、与 `User.id` 比对全落空。先归一到小写再切段,任何合法 32-hex
+      // 都还原成规范的小写 UUID。
+      const hex = imUserId.toLowerCase();
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(
+        12,
+        16,
+      )}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+    return imUserId;
+  }
+
+  /**
    * OpenIM's 1:1 conversation id: `si_` + the two IM userIDs sorted ascending
    * and joined by `_`. Sorting makes it identical regardless of arg order.
    */

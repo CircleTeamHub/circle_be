@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ForbiddenException } from '@nestjs/common';
+import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { Role } from 'src/enum/roles.enum';
 import { UserController } from '../user.controller';
 import { UserService } from '../user.service';
@@ -18,7 +20,12 @@ describe('UserController', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [UserController],
       providers: [{ provide: UserService, useValue: userService }],
-    }).compile();
+    })
+      // vip-levels 端点上的 ThrottlerGuard 依赖 ThrottlerModule 的 provider（本单测未引入）；
+      // 放行即可，限流本身由下方的元数据用例断言。
+      .overrideGuard(UserThrottlerGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
 
     controller = module.get<UserController>(UserController);
   });
@@ -58,8 +65,8 @@ describe('UserController', () => {
     expect(userService.remove).toHaveBeenCalledWith('user-1');
   });
 
-  it('allows an admin to delete another user', () => {
-    expect(
+  it('requires admins to use the audited admin-user status endpoint', () => {
+    expect(() =>
       controller.removeUser('user-2', {
         user: {
           userId: 'user-1',
@@ -67,8 +74,21 @@ describe('UserController', () => {
           role: Role.Admin,
         },
       } as any),
-    ).toEqual({ id: 'user-2' });
-    expect(userService.remove).toHaveBeenCalledWith('user-2');
+    ).toThrow(ForbiddenException);
+    expect(userService.remove).not.toHaveBeenCalled();
+  });
+
+  it('blocks admin self-deletes from the self-service route', () => {
+    expect(() =>
+      controller.removeUser('user-1', {
+        user: {
+          userId: 'user-1',
+          accountId: 'admin',
+          role: Role.Admin,
+        },
+      } as any),
+    ).toThrow(ForbiddenException);
+    expect(userService.remove).not.toHaveBeenCalled();
   });
 
   it('denies deleting another user without admin access', () => {
@@ -93,4 +113,29 @@ describe('UserController', () => {
 
   // 账号状态变更的用例都在 admin-user 那边：这个控制器不再暴露 status 路由，
   // 唯一入口是审计化的 PATCH /admin/users/:id/status。
+});
+
+describe('POST /user/vip-levels rate limiting', () => {
+  it('guards the frontend-facing batch endpoint with ThrottlerGuard and a 30/min budget', () => {
+    // 无全局 ThrottlerGuard：该端点会被前端 IM 补水/重连高频调用,必须单独限流,
+    // 防止重连风暴或单个持 token 的客户端把每次最多 200 id 的 DB 查询打爆。
+    const guards =
+      Reflect.getMetadata(
+        GUARDS_METADATA,
+        UserController.prototype.getVipLevels,
+      ) ?? [];
+    expect(guards).toContain(UserThrottlerGuard);
+    expect(
+      Reflect.getMetadata(
+        'THROTTLER:LIMITdefault',
+        UserController.prototype.getVipLevels,
+      ),
+    ).toBe(30);
+    expect(
+      Reflect.getMetadata(
+        'THROTTLER:TTLdefault',
+        UserController.prototype.getVipLevels,
+      ),
+    ).toBe(60_000);
+  });
 });

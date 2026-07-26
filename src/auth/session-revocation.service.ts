@@ -5,52 +5,17 @@ import {
   SESSION_REVOCATION_CHANNEL,
   type SessionRevocationBroadcast,
 } from './session-revocation.broadcast';
+import { parseDurationMilliseconds } from 'src/utils/duration';
 
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
-const DURATION_UNITS_IN_MS: Record<string, number> = {
-  ms: 1,
-  s: 1000,
-  m: 60 * 1000,
-  h: 60 * 60 * 1000,
-  d: 24 * 60 * 60 * 1000,
-  w: 7 * 24 * 60 * 60 * 1000,
-  y: 365.25 * 24 * 60 * 60 * 1000,
-};
 
 export function accessTokenTtlSeconds(raw: unknown): number {
   if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
     return Math.ceil(raw);
   }
   if (typeof raw !== 'string') return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
-
-  const normalized = raw.trim().toLowerCase().split(' ').join('');
-  let unit = 'ms';
-  let amountText = normalized;
-  if (normalized.endsWith('ms')) {
-    amountText = normalized.slice(0, -2);
-  } else {
-    const candidateUnit = normalized.charAt(normalized.length - 1);
-    if (candidateUnit && candidateUnit in DURATION_UNITS_IN_MS) {
-      unit = candidateUnit;
-      amountText = normalized.slice(0, -1);
-    }
-  }
-  let dots = 0;
-  const validAmount =
-    amountText.length > 0 &&
-    [...amountText].every((character) => {
-      if (character === '.') {
-        dots += 1;
-        return dots === 1;
-      }
-      return character >= '0' && character <= '9';
-    });
-  const amount = validAmount ? Number(amountText) : Number.NaN;
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
-  }
-
-  const milliseconds = amount * DURATION_UNITS_IN_MS[unit];
+  const milliseconds = parseDurationMilliseconds(raw);
+  if (milliseconds === null) return DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
   return Math.max(1, Math.ceil(milliseconds / 1000));
 }
 
@@ -106,16 +71,29 @@ export class SessionRevocationService {
     return `authrev:s:${sessionId}`;
   }
 
+  revocationExpiresAt(revokedAtMs: number): Date {
+    return new Date(revokedAtMs + this.markerTtlSeconds * 1000);
+  }
+
   /** Revoke every access token issued to this user before now. No-op without Redis. */
   async revokeUser(userId: string): Promise<void> {
-    if (!this.redis.isEnabled()) return;
-    const revokedAtMs = Date.now();
-    await this.redis.setJson(
+    await this.revokeUserAt(userId, Date.now());
+  }
+
+  /**
+   * Persist a revocation marker at the original security-event timestamp.
+   * Returns false when Redis is disabled or the socket-close broadcast needs
+   * retry; marker write errors reject so durable callers can retry them too.
+   */
+  async revokeUserAt(userId: string, revokedAtMs: number): Promise<boolean> {
+    if (!this.redis.isEnabled()) return false;
+    const markerStored = await this.redis.setNumericMax(
       this.userKey(userId),
       revokedAtMs,
       this.markerTtlSeconds,
     );
-    await this.announce({ kind: 'user', userId, revokedAtMs });
+    if (!markerStored) return false;
+    return this.announce({ kind: 'user', userId, revokedAtMs });
   }
 
   /** Revoke a single session's access token (single logout / kill one session). */
@@ -139,9 +117,9 @@ export class SessionRevocationService {
    * so HTTP stays protected and the socket dies at token expiry — the same
    * degradation as running without Redis. Never let it fail the revocation.
    */
-  private async announce(event: SessionRevocationBroadcast): Promise<void> {
+  private async announce(event: SessionRevocationBroadcast): Promise<boolean> {
     try {
-      await this.redis.publish(
+      return await this.redis.publish(
         SESSION_REVOCATION_CHANNEL,
         JSON.stringify(event),
       );
@@ -151,6 +129,7 @@ export class SessionRevocationService {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
   }
 
@@ -163,21 +142,25 @@ export class SessionRevocationService {
     if (!this.redis.isEnabled()) return false;
 
     const sid = typeof payload.sid === 'string' ? payload.sid : null;
-    if (sid) {
-      const marked = await this.redis.getJson<number>(this.sessionKey(sid));
-      if (marked) return true;
-    }
-
     const sub = typeof payload.sub === 'string' ? payload.sub : null;
     const issuedAtMs = getIssuedAtMs(payload);
+
+    const keys: string[] = [];
+    if (sid) keys.push(this.sessionKey(sid));
+    if (sub && issuedAtMs !== null) keys.push(this.userKey(sub));
+    if (keys.length === 0) return false;
+
+    const markers = await this.redis.getJsonMany<number>(keys);
+    let markerIndex = 0;
+    if (sid && markers[markerIndex++]) return true;
+
     if (sub && issuedAtMs !== null) {
-      const revokedAfter = await this.redis.getJson<number>(this.userKey(sub));
-      if (typeof revokedAfter === 'number') {
-        // Markers written before millisecond precision used epoch seconds.
-        const revokedAtMs =
-          revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
-        if (issuedAtMs <= revokedAtMs) return true;
-      }
+      const revokedAfter = markers[markerIndex];
+      if (typeof revokedAfter !== 'number') return false;
+      // Markers written before millisecond precision used epoch seconds.
+      const revokedAtMs =
+        revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
+      if (issuedAtMs <= revokedAtMs) return true;
     }
 
     return false;

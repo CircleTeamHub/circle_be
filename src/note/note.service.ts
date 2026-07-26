@@ -227,7 +227,7 @@ const SHARE_LINK_GUEST_VIEWER = '';
 
 // 列出分享链接的默认每页条数（对齐 listNotes）。链接行数没有上界（docs 第 3 节的
 // 每用户上限还没做），不设 take 会一次性把该用户全部历史链接拉进内存。
-// 每页上限 200 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
+// 每页上限 100 由 ListNoteShareLinksQueryDto 的 @Max 兜住。
 const SHARE_LINK_LIST_DEFAULT_LIMIT = 50;
 // #94：每用户活跃分享链接上限（未撤销且未过期的计数）。
 const MAX_ACTIVE_SHARE_LINKS_PER_USER = 200;
@@ -1356,13 +1356,18 @@ export class NoteService {
   }
 
   // 给一批 (base url, object key) 现签短时 URL → Map<base url, signed url>。signingDate 舍入
-  // 到窗口 → 同窗口签出字节相同 URL（缓存稳定）。uploadService 未注入/单个失败 → 略过，由
-  // map 函数 fallback 回 base url（MinIO 未配置时不崩）。
+  // 到窗口 → 同窗口签出字节相同 URL（缓存稳定）。签名失败必须 fail closed，避免把私有
+  // 对象的未签名持久 URL 返回给客户端。
   private async presignNoteMedia(
     targets: { url: string; objectKey: string }[],
   ): Promise<Map<string, string>> {
     const map = new Map<string, string>();
-    if (!this.uploadService || !targets.length) return map;
+    if (!targets.length) return map;
+    if (!this.uploadService) {
+      throw new ServiceUnavailableException(
+        'Private note media is temporarily unavailable',
+      );
+    }
     // 同 base url 去重（同图可能出现在 media 行 + sections JSON 两处）。
     const byUrl = new Map<string, string>();
     for (const t of targets) byUrl.set(t.url, t.objectKey);
@@ -1370,20 +1375,22 @@ export class NoteService {
       Math.floor(Date.now() / NOTE_MEDIA_URL_WINDOW_MS) *
         NOTE_MEDIA_URL_WINDOW_MS,
     );
-    await Promise.all(
-      [...byUrl.entries()].map(async ([url, key]) => {
-        try {
+    try {
+      await Promise.all(
+        [...byUrl.entries()].map(async ([url, key]) => {
           const signed = await this.uploadService!.createPresignedGetUrl(
             key,
             NOTE_MEDIA_URL_TTL_SECONDS,
             signingDate,
           );
           map.set(url, signed.url);
-        } catch {
-          /* MinIO 未配置 / 单个失败 → 略过，fallback base url */
-        }
-      }),
-    );
+        }),
+      );
+    } catch {
+      throw new ServiceUnavailableException(
+        'Private note media is temporarily unavailable',
+      );
+    }
     return map;
   }
 
@@ -1789,9 +1796,8 @@ export class NoteService {
    * 已吊销 / 已过期的链接也会返回：revokedAt 与 expiresAt 都在 DTO 上，由客户端
    * 决定怎么展示；服务端先过滤掉会让这两个字段在响应里恒为 null。
    *
-   * 分页（page/limit，默认值同 listNotes）不是锦上添花：吊销只能靠本接口拿 id，
-   * 只返回固定条数的话，链接数超过一屏之后较老但仍然有效的链接会被较新的
-   * （哪怕已吊销的）挤出去，从而看不到、也就吊销不了。
+   * 分页使用最后一条链接 id 作为 cursor，并按 createdAt/id 稳定排序。吊销只能
+   * 靠本接口拿 id，所以每一页必须能稳定抵达较老的有效链接。
    * 与 listNotes 一致返回裸数组、不带 total：客户端按「返回条数 < limit」判末页。
    */
   async listShareLinks(
@@ -1799,11 +1805,31 @@ export class NoteService {
     query: ListNoteShareLinksQueryDto,
   ): Promise<NoteShareLinkDto[]> {
     const limit = query.limit ?? SHARE_LINK_LIST_DEFAULT_LIMIT;
+    const anchor = query.cursor
+      ? await this.prisma.noteShareLink.findFirst({
+          where: { id: query.cursor, ownerID },
+          select: { id: true, createdAt: true },
+        })
+      : null;
+    if (query.cursor && !anchor) {
+      throw new BadRequestException({
+        message: 'Invalid note share-link cursor',
+        errorCode: NoteErrorCode.ShareLinkInvalidCursor,
+      });
+    }
+
     const rows = await this.prisma.noteShareLink.findMany({
-      where: { ownerID },
-      orderBy: { createdAt: 'desc' },
+      where: anchor
+        ? {
+            ownerID,
+            OR: [
+              { createdAt: { lt: anchor.createdAt } },
+              { createdAt: anchor.createdAt, id: { lt: anchor.id } },
+            ],
+          }
+        : { ownerID },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit,
-      skip: ((query.page ?? 1) - 1) * limit,
       // 只取 mapShareLink 用得上的列：title / noteIDs / search 等快照字段不进
       // DTO，没必要拉出来。给 mapShareLink 的入参加字段时这里会编译报错，
       // 正好当作「别忘了同步」的提醒。
@@ -2464,10 +2490,21 @@ export class NoteService {
         });
       }
     }
-    const result = await this.prisma.note.updateMany({
-      where: { id: noteId, ownerID, status: 'DELETED' },
-      data: { status: 'ACTIVE' },
-    });
+    let result: { count: number };
+    try {
+      result = await this.prisma.note.updateMany({
+        where: { id: noteId, ownerID, status: 'DELETED' },
+        data: { status: 'ACTIVE' },
+      });
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException({
+          message: '该笔记的另一份收藏副本已存在，无需恢复',
+          errorCode: NoteErrorCode.AlreadyCollected,
+        });
+      }
+      throw error;
+    }
     if (result.count === 0) {
       throw new NotFoundException({
         message: 'Note not found',

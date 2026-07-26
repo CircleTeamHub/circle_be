@@ -136,6 +136,15 @@ export class CreateMembershipGrantDto {
   note?: string;
 }
 
+// 保留 main 的升级 DTO（其 spec 仍在测；与分支的 CreateMembershipGrantDto 并存）。
+export class UpgradeMembershipDto {
+  @ApiProperty({ example: 3, minimum: 1, maximum: 4 })
+  @IsInt()
+  @Min(1)
+  @Max(4)
+  level: number;
+}
+
 export class MembershipGrantAuditDto {
   @ApiProperty() id: string;
   @ApiProperty({ format: 'uuid' }) idempotencyKey: string;

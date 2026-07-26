@@ -127,7 +127,7 @@ describe('IconService', () => {
   });
 
   it('maps a legacy VIP placeholder variant to the highest eligible VIP badge', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 4 }));
     prisma.userDisplayIcon.findMany.mockResolvedValue([
       {
         id: 'display-vip-legacy',
@@ -403,7 +403,7 @@ describe('IconService', () => {
   });
 
   it('wraps updateDisplayIcons delete+create in one transaction and broadcasts after invalidating', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 4 }));
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });
     prisma.userDisplayIcon.createMany.mockResolvedValue({ count: 2 });
     prisma.user.update.mockResolvedValue({ id: 'user-1' });
@@ -429,7 +429,7 @@ describe('IconService', () => {
   });
 
   it('rejects duplicate variant selections in updateDisplayIcons', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 4 }));
 
     await expect(
       service.updateDisplayIcons('user-1', [

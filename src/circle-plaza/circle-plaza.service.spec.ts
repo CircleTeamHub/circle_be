@@ -494,7 +494,7 @@ describe('CirclePlazaService', () => {
     it('includes the post author display icons in feed DTOs', async () => {
       const displayIcons = [
         {
-          id: 'vip-5',
+          id: 'vip-4',
           type: 'SYSTEM',
           title: 'VIP4',
           imageUrl: null,
@@ -1527,7 +1527,7 @@ describe('CirclePlazaService', () => {
       });
       const displayIcons = [
         {
-          id: 'vip-5',
+          id: 'vip-4',
           type: 'SYSTEM',
           title: 'VIP4',
           imageUrl: null,

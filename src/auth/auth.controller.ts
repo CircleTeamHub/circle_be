@@ -51,6 +51,7 @@ import { SelfUserDto } from 'src/user/dto/public-user.dto';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import { SessionContext } from './refresh-token.service';
 import type { RequestWithUser } from './types';
+import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
 
 /**
  * Rate limit for GET /auth/im-token. Sized for legitimate IM re-establishment
@@ -416,7 +417,7 @@ export class AuthController {
    * them here would re-grant the capability admin login deliberately withheld.
    */
   @Get('im-token')
-  @UseGuards(JwtGuard, ThrottlerGuard)
+  @UseGuards(JwtGuard, ImTokenThrottlerGuard)
   @Throttle({
     default: { limit: IM_TOKEN_RATE_LIMIT, ttl: IM_TOKEN_RATE_TTL_MS },
   })

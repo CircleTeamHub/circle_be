@@ -6,12 +6,15 @@
  *   node scripts/grant-all-badges.js
  *   node scripts/grant-all-badges.js user@example.com
  */
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const { PrismaClient } = require('../src/generated/prisma');
 const { assertDevSeedAllowed } = require('./seed-guard');
+const {
+  deterministicUuid,
+  legacyDeterministicId,
+} = require('./deterministic-id.cjs');
 
 const DEFAULT_EMAIL = '932567218@qq.com';
 const email = String(process.argv[2] ?? DEFAULT_EMAIL)
@@ -82,11 +85,11 @@ function loadDatabaseUrl() {
 }
 
 function det(key) {
-  const h = crypto
-    .createHash('sha1')
-    .update(`circle-badge-seed:${key}`)
-    .digest('hex');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+  return legacyDeterministicId('circle-badge-seed:', key);
+}
+
+function legacyDet(key) {
+  return legacyDeterministicId('circle-badge-seed:', key);
 }
 
 function presentOrFallback(value, fallback) {
@@ -130,14 +133,49 @@ async function main() {
   const matureCircleCreatedAt = new Date(
     now.getTime() - 8 * 24 * 60 * 60 * 1000,
   );
-  const circleId = det(`builder-circle:${user.id}`);
+  const circleId = deterministicUuid(
+    'circle-badge-seed:',
+    `builder-circle:${user.id}`,
+  );
+  const legacyCircleId = legacyDet(`builder-circle:${user.id}`);
   const iconAssetId = det(`builder-circle-icon:${user.id}`);
 
   await prisma.$transaction(async (tx) => {
+    if (legacyCircleId !== circleId) {
+      const legacyCircle = await tx.circle.findUnique({
+        where: { id: legacyCircleId },
+        select: { id: true, groupID: true },
+      });
+      if (legacyCircle) {
+        const currentCircle = await tx.circle.findUnique({
+          where: { id: circleId },
+          select: { id: true },
+        });
+        if (currentCircle) {
+          await tx.circle.update({
+            where: { id: legacyCircleId },
+            data: { deleted: true, groupID: null },
+          });
+        } else {
+          await tx.circle.update({
+            where: { id: legacyCircleId },
+            data: {
+              id: circleId,
+              groupID:
+                legacyCircle.groupID === legacyCircleId
+                  ? circleId
+                  : legacyCircle.groupID,
+            },
+          });
+        }
+      }
+    }
+
     await tx.user.update({
       where: { id: user.id },
       data: {
         status: 'ACTIVE',
+        vipLevel: 4,
         creditScore: 100,
         fancyNumber: true,
         receivedLikeCount: 10_000,

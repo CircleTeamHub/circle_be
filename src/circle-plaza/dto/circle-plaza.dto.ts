@@ -96,6 +96,8 @@ export class CreatePlazaPostDto {
 
   @ApiPropertyOptional({
     description: 'Min VIP level to interact, null = no restriction',
+    minimum: 0,
+    maximum: 4,
   })
   @Type(() => Number)
   @IsInt()
@@ -121,6 +123,8 @@ export class CreatePlazaPostDto {
 
   @ApiPropertyOptional({
     description: 'Min VIP level to sign up, null = no restriction',
+    minimum: 0,
+    maximum: 4,
   })
   @Type(() => Number)
   @IsInt()
@@ -258,12 +262,29 @@ export class PlazaFeedSearchDto {
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
 export class PlazaPostAuthorDto {
+  @ApiProperty()
   id: string;
+
+  @ApiProperty()
   nickname: string;
+
+  @ApiProperty({ type: String, nullable: true })
   avatarUrl: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
   avatarFrame: string | null;
+
+  @ApiProperty()
   accountId: string;
-  vipLevel: number;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: '有效会员等级（名字特效渲染用，按到期算）；0 = 非会员',
+  })
+  vipLevel: number | null;
+
+  @ApiProperty({ type: [DisplayIconDto] })
   displayIcons: DisplayIconDto[];
 }
 
@@ -295,6 +316,8 @@ export class PlazaPostDto {
     fancyNumber: boolean;
   };
   canSignup: boolean;
+
+  @ApiProperty({ type: PlazaPostAuthorDto })
   author: PlazaPostAuthorDto;
   circle: PlazaPostCircleDto;
   circles: PlazaPostCircleDto[];

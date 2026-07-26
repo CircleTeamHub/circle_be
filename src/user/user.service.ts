@@ -17,6 +17,7 @@ import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
+import { OpenimService } from 'src/openim/openim.service';
 import { likedOnToday } from '../like/like.util';
 import {
   generateUniqueRegistrationCode,
@@ -168,6 +169,43 @@ export class UserService {
     private privacySettings: PrivacySettingsService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+  }
+
+  /**
+   * 批量取 userId → vipLevel（前端渲染会员名字特效用）。vipLevel 是公开展示属性，
+   * 任意登录用户可查；不存在的 id 不会出现在结果里，前端按缺省 0 处理。
+   */
+  async getVipLevels(ids: string[]): Promise<Record<string, number>> {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0) {
+      return {};
+    }
+    // 客户端可能传标准 UUID(REST 场景)或无连字符的 OpenIM sendID(聊天场景)。两者都归一到
+    // UUID 去查 User.id,但响应仍以**调用方传入的原始 id** 为键——前端好按它当初传的原样查回。
+    // 同一批里可能同时传了一个用户的 UUID 和无连字符形态(两种 UI 各用一种),它们归一到同一
+    // 个 id;必须记录每个归一化 id 的**所有**别名并逐个产出,否则用另一形态的一侧会把已知
+    // 用户默认成 VIP0。
+    const aliasesByNormalized = new Map<string, string[]>();
+    for (const id of uniqueIds) {
+      const normalized = OpenimService.fromImUserId(id);
+      const list = aliasesByNormalized.get(normalized);
+      if (list) {
+        list.push(id);
+      } else {
+        aliasesByNormalized.set(normalized, [id]);
+      }
+    }
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: [...aliasesByNormalized.keys()] } },
+      select: { id: true, vipLevel: true },
+    });
+    const out: Record<string, number> = {};
+    for (const user of users) {
+      for (const alias of aliasesByNormalized.get(user.id) ?? [user.id]) {
+        out[alias] = user.vipLevel;
+      }
+    }
+    return out;
   }
 
   /**

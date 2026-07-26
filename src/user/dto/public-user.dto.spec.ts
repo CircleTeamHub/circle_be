@@ -116,6 +116,22 @@ describe('SelfUserDto serialization', () => {
     expect(leaked.passwordHash).toBeUndefined();
     expect(leaked.openimSynced).toBeUndefined();
   });
+
+  it('exposes receivedLikeCount so /auth/me can hydrate the self profile like count', () => {
+    const dto = plainToInstance(
+      SelfUserDto,
+      {
+        id: 'user-1',
+        accountId: 'jimmy',
+        receivedLikeCount: 1,
+      },
+      { excludeExtraneousValues: true },
+    );
+
+    expect(
+      (dto as unknown as { receivedLikeCount?: number }).receivedLikeCount,
+    ).toBe(1);
+  });
 });
 
 describe('PublicUserDto serialization (other-user view)', () => {

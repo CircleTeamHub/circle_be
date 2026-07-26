@@ -9,11 +9,6 @@ on:
   push:
     branches:
       - main
-    # Docs / example-env changes can't break the build — skip the whole matrix.
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - '.env.example'
   pull_request:
     branches:
       - main
@@ -60,6 +55,7 @@ jobs:
           node --test scripts/release-hardening.test.mjs
           bash test/release-deploy.spec.sh
           bash test/release-launcher.spec.sh
+          bash test/sync-metrics-token.spec.sh
 
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
