@@ -96,6 +96,8 @@ export class CreatePlazaPostDto {
 
   @ApiPropertyOptional({
     description: 'Min VIP level to interact, null = no restriction',
+    minimum: 0,
+    maximum: 4,
   })
   @Type(() => Number)
   @IsInt()
@@ -121,6 +123,8 @@ export class CreatePlazaPostDto {
 
   @ApiPropertyOptional({
     description: 'Min VIP level to sign up, null = no restriction',
+    minimum: 0,
+    maximum: 4,
   })
   @Type(() => Number)
   @IsInt()

@@ -1,3 +1,4 @@
+import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import {
@@ -5,6 +6,7 @@ import {
   PlazaFeedQueryDto,
   RecognizePostCollaboratorsDto,
 } from './circle-plaza.dto';
+import { CreateCircleDto } from '../../circle/dto/circle.dto';
 
 describe('PlazaFeedQueryDto', () => {
   it('accepts existing circle ids that are not RFC UUID variants', () => {
@@ -47,5 +49,29 @@ describe('CreatePlazaPostDto VIP restrictions cap at the top tier (4)', () => {
     expect(hasError({ signupVipRestriction: 4 }, 'signupVipRestriction')).toBe(
       false,
     );
+  });
+});
+
+describe('VIP restriction fields advertise the 0..4 cap in OpenAPI metadata', () => {
+  // @Max(4) 只做运行时校验;若不同时写进 @ApiPropertyOptional 的 minimum/maximum,
+  // 生成的 Swagger 契约里就看不到四档上限,客户端无从适配、会继续发 5+ 请求吃 400。
+  // @nestjs/swagger 把 @ApiProperty 选项存在 'swagger/apiModelProperties' 元数据键下。
+  const apiMeta = (proto: object, prop: string): Record<string, unknown> =>
+    (Reflect.getMetadata('swagger/apiModelProperties', proto, prop) as
+      | Record<string, unknown>
+      | undefined) ?? {};
+
+  it('CreatePlazaPostDto vip/signup restrictions expose minimum 0 and maximum 4', () => {
+    for (const prop of ['vipRestriction', 'signupVipRestriction']) {
+      const meta = apiMeta(CreatePlazaPostDto.prototype, prop);
+      expect(meta.minimum).toBe(0);
+      expect(meta.maximum).toBe(4);
+    }
+  });
+
+  it('CreateCircleDto joinVipRestriction exposes minimum 0 and maximum 4', () => {
+    const meta = apiMeta(CreateCircleDto.prototype, 'joinVipRestriction');
+    expect(meta.minimum).toBe(0);
+    expect(meta.maximum).toBe(4);
   });
 });
