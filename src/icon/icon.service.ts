@@ -4,6 +4,7 @@ import {
   NotFoundException,
   Optional,
   OnModuleInit,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { IconErrorCode } from 'src/common/app-error-codes';
 import { RedisService } from 'src/redis/redis.service';
@@ -49,6 +50,8 @@ const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
 // instance must evict every instance's cache — otherwise other nodes keep
 // serving the old-tier badge for up to the TTL. Message payload = userId.
 const DISPLAY_ICON_INVALIDATION_CHANNEL = 'circle:icon:display-invalidate';
+const DISPLAY_ICON_SUBSCRIPTION_RETRY_BASE_MS = 1_000;
+const DISPLAY_ICON_SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 
 type CachedDisplayIcons = {
   data: DisplayIconDto[];
@@ -166,8 +169,12 @@ function toPrismaSystemIconKey(
 }
 
 @Injectable()
-export class IconService implements OnModuleInit {
+export class IconService implements OnModuleInit, OnModuleDestroy {
   private readonly displayIconCache = new Map<string, CachedDisplayIcons>();
+  private displayIconSubscriptionActive = false;
+  private displayIconSubscriptionRetryAttempt = 0;
+  private displayIconSubscriptionRetryTimer: NodeJS.Timeout | null = null;
+  private destroyed = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -176,17 +183,67 @@ export class IconService implements OnModuleInit {
     @Optional() private readonly redisService?: RedisService,
   ) {}
 
-  // Subscribe to the cross-instance eviction channel so a grant (or any other
-  // vipLevel change) committed on another instance drops this instance's stale
-  // displayIconCache entry too. Best-effort: without Redis the cache stays
-  // per-instance and simply falls back to its 30s TTL, exactly as before.
   async onModuleInit(): Promise<void> {
-    await this.redisService?.subscribePattern(
-      DISPLAY_ICON_INVALIDATION_CHANNEL,
-      (_channel, message) => {
-        if (message) this.displayIconCache.delete(message);
-      },
+    await this.ensureDisplayIconSubscription();
+  }
+
+  onModuleDestroy(): void {
+    this.destroyed = true;
+    if (this.displayIconSubscriptionRetryTimer) {
+      clearTimeout(this.displayIconSubscriptionRetryTimer);
+      this.displayIconSubscriptionRetryTimer = null;
+    }
+  }
+
+  // Subscribe to the cross-instance eviction channel, retrying with backoff if
+  // Redis is unreachable at boot. A one-shot subscribe would leave this instance
+  // permanently deaf to grant invalidations after a startup Redis outage (it
+  // still publishes, but never receives) — serving stale membership badges for
+  // the cache TTL on every request until restart. Without Redis at all the cache
+  // stays per-instance and falls back to its 30s TTL, exactly as before.
+  private async ensureDisplayIconSubscription(): Promise<void> {
+    if (
+      this.destroyed ||
+      this.displayIconSubscriptionActive ||
+      !this.redisService?.isEnabled()
+    ) {
+      return;
+    }
+
+    this.displayIconSubscriptionActive =
+      await this.redisService.subscribePattern(
+        DISPLAY_ICON_INVALIDATION_CHANNEL,
+        (_channel, message) => {
+          if (message) this.displayIconCache.delete(message);
+        },
+      );
+
+    if (this.displayIconSubscriptionActive) {
+      this.displayIconSubscriptionRetryAttempt = 0;
+      return;
+    }
+
+    this.scheduleDisplayIconSubscriptionRetry();
+  }
+
+  private scheduleDisplayIconSubscriptionRetry(): void {
+    if (this.destroyed || this.displayIconSubscriptionRetryTimer) {
+      return;
+    }
+
+    const delay = Math.min(
+      DISPLAY_ICON_SUBSCRIPTION_RETRY_BASE_MS *
+        2 ** this.displayIconSubscriptionRetryAttempt,
+      DISPLAY_ICON_SUBSCRIPTION_RETRY_MAX_MS,
     );
+    this.displayIconSubscriptionRetryAttempt += 1;
+
+    this.displayIconSubscriptionRetryTimer = setTimeout(() => {
+      this.displayIconSubscriptionRetryTimer = null;
+      void this.ensureDisplayIconSubscription();
+    }, delay);
+    // Don't keep the process alive solely for this retry timer.
+    this.displayIconSubscriptionRetryTimer.unref?.();
   }
 
   private invalidateDisplayIconCache(userId: string): void {
@@ -639,35 +696,24 @@ export class IconService implements OnModuleInit {
     },
     eligibility: Eligibility,
   ): string | null {
-    const isLegacySuperMembershipVariant =
-      selection.systemKey === SystemIconKeyDto.VIP &&
-      (selection.systemVariant === SystemIconKeyDto.VIP ||
-        selection.systemVariant === 'VIP5');
-    const isLegacyPlaceholderVariant =
-      selection.systemVariant &&
-      selection.systemVariant === selection.systemKey &&
-      isLeveledSystemBadgeKey(selection.systemKey);
-
-    if (
-      selection.systemVariant &&
-      !isLegacyPlaceholderVariant &&
-      !isLegacySuperMembershipVariant
-    ) {
-      return selection.systemVariant;
-    }
-
-    if (!selection.systemKey) {
-      return null;
-    }
-
-    if (isLeveledSystemBadgeKey(selection.systemKey)) {
+    // Leveled system badges (the VIP tiers) ALWAYS resolve to the user's current
+    // effective variant, regardless of which variant was persisted. A saved VIP1
+    // selection must render as VIP2 after an upgrade (and cleanly drop out once
+    // no tier is eligible) instead of being treated as a stale VIP1 row and
+    // deleted — which would blank the membership badge on /auth/me, profiles and
+    // feeds. This also subsumes the legacy 'VIP'/'VIP5' placeholder variants.
+    if (selection.systemKey && isLeveledSystemBadgeKey(selection.systemKey)) {
       const leveledIcons = eligibility.systemIcons.filter(
         (icon) => icon.systemKey === selection.systemKey,
       );
       return lastItem(leveledIcons)?.systemVariant ?? selection.systemKey;
     }
 
-    return selection.systemKey;
+    // Non-leveled badges keep their explicit variant, else fall back to the key.
+    if (selection.systemVariant) {
+      return selection.systemVariant;
+    }
+    return selection.systemKey ?? null;
   }
 
   private defaultDisplaySystemIcons(

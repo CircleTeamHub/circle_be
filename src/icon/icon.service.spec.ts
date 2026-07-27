@@ -83,6 +83,7 @@ describe('IconService', () => {
   };
 
   const redisService = {
+    isEnabled: jest.fn(() => true),
     publish: jest.fn(() => Promise.resolve(true)),
     subscribePattern: jest.fn(() => Promise.resolve(true)),
   };
@@ -123,6 +124,9 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
+    // The persisted VIP3 selection carries forward to the user's current
+    // effective tier (VIP4) rather than being dropped as stale — a VIP display
+    // choice must follow tier changes, not vanish.
     expect(
       result.systemIcons
         .filter((icon) => icon.systemKey === 'VIP')
@@ -130,7 +134,7 @@ describe('IconService', () => {
           variant: icon.systemVariant,
           selected: icon.selected,
         })),
-    ).toEqual([{ variant: 'VIP4', selected: false }]);
+    ).toEqual([{ variant: 'VIP4', selected: true }]);
   });
 
   it('maps a legacy VIP placeholder variant to the highest eligible VIP badge', async () => {
@@ -594,5 +598,75 @@ describe('IconService', () => {
     expect(prisma.user.findUnique.mock.calls.length).toBeGreaterThan(
       callsAfterWarm,
     );
+  });
+
+  it('carries a persisted VIP1 selection forward to VIP2 after an upgrade', async () => {
+    // Prefs already initialized, so defaults won't re-add anything; the saved
+    // VIP1 row must follow the upgrade to VIP2 instead of being dropped stale.
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ vipLevel: 2, iconPreferencesInitialized: true }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-1',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP1',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const options = await service.getIconOptions('user-1');
+    expect(
+      options.systemIcons
+        .filter((icon) => icon.systemKey === 'VIP')
+        .map((icon) => ({
+          variant: icon.systemVariant,
+          selected: icon.selected,
+        })),
+    ).toEqual([{ variant: 'VIP2', selected: true }]);
+
+    // And the displayed badge (feeds / profile / auth-me path) shows VIP2.
+    const displayed = await service.getDisplayIconsForUser('user-1');
+    const vip = displayed.filter((icon) => icon.systemKey === 'VIP');
+    expect(vip).toHaveLength(1);
+    expect(vip[0].systemVariant).toBe('VIP2');
+  });
+
+  it('retries the display-icon subscription with backoff until Redis accepts it', async () => {
+    jest.useFakeTimers();
+    try {
+      const flakyRedis = {
+        isEnabled: jest.fn(() => true),
+        publish: jest.fn(() => Promise.resolve(true)),
+        subscribePattern: jest
+          .fn()
+          .mockResolvedValueOnce(false) // Redis unavailable at boot
+          .mockResolvedValueOnce(true), // recovered on the retry
+      };
+      const svc = new IconService(
+        prisma as never,
+        realtimeService as never,
+        privacySettings as never,
+        flakyRedis as never,
+      );
+
+      await svc.onModuleInit();
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(1);
+
+      // Backoff fires and re-subscribes once Redis is back.
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(2);
+
+      // Once active it stops retrying — no unbounded re-subscribe loop.
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(2);
+
+      svc.onModuleDestroy();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

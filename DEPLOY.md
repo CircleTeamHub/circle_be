@@ -270,6 +270,23 @@ launcher」,拒绝「live-tree rsync」和「直接执行 `release-deploy.sh`」
 **在此之前的运维硬约束**:① 绝不重跑「抬高 floor 之前」的历史 Release workflow;② 回滚一律
 走上面〈回滚 / 重放〉的持久 launcher 手动流程,绝不直接执行目标树内的 `release-deploy.sh`。
 
+### ⚠️ 加固待办:不可逆重放的空跑不应封死可兼容活色(需 staging 验证)
+
+**现象**:重发一个**已成功上线**的不可逆 tag 且用 downtime 模式时,`release-deploy.sh` 先停活色 →
+`prisma migrate deploy` 空跑成功 → 无条件置 `irreversible_migration_applied=1`。若此时新色(备色)
+启动/健康检查失败,`irreversible_boundary_crossed` 为真 → 进 `enter_irreversible_maintenance`,
+**拒绝恢复活色**——可活色是**同一个 tag、schema 本就兼容**,本可安全恢复,却把一次可恢复的重放
+失败变成了持续维护态。
+
+**目标修法**:为每个成功上线的颜色持久化其 schema 兼容级别(如 `.release/<color>-schema`),备色失败
+时若**活色已支持当前 schema**(其兼容级别 ≥ 本次 `RELEASE_SCHEMA_COMPATIBILITY`)则允许恢复活色,
+而非一律进维护。
+
+**为何暂不改**:这段是不可逆迁移的**回滚安全闸**——判断错(把不兼容的旧二进制恢复到已契约化的
+schema 上)不是可用性抖动,而是数据损坏级事故。改动本地无法对真实蓝绿 + 迁移状态机验证,必须在
+**staging 真跑**(含备色失败注入)后再合。**在此之前的运维约束**:重发已上线的不可逆 tag 前,确认
+备色能起;若备色失败进了维护态,手工确认活色 tag 与 DB schema 一致后再恢复,不要盲目清状态文件。
+
 ### 异地备份(可选;加密后上传到对象存储)
 
 `~/circle_be_backups/` 和 `pg_data` 卷在**同一台 VPS** 上:磁盘损坏、实例丢失、
