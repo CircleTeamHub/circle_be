@@ -399,6 +399,12 @@ describe('CirclePlazaService', () => {
     });
 
     it('builds the same selected-circle and city query for GET and body inputs', async () => {
+      // The where clause embeds new Date() (expiresAt.gt / createdAt.gt); freeze
+      // time so both calls produce identical timestamps — otherwise a 1ms tick
+      // between the two getFeed calls makes the toEqual flake (seen on CI).
+      jest
+        .useFakeTimers()
+        .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
       prisma.circlePost.findMany.mockResolvedValue([]);
       prisma.circlePost.count.mockResolvedValue(0);
       prisma.user.findUnique.mockResolvedValue({
@@ -422,6 +428,7 @@ describe('CirclePlazaService', () => {
 
       expect(bodyWhere).toEqual(getWhere);
       expect(prisma.user.findUnique).toHaveBeenCalledTimes(2);
+      jest.useRealTimers();
     });
 
     it('keeps the legacy single city compatible with the same quota path', async () => {
