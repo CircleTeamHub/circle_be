@@ -675,6 +675,25 @@ export class CircleInvitationService {
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        // Transient conflicts are already retried inside the transaction, so
+        // reaching here means a deterministic block (full circle / unmet
+        // restriction / missing side-effect). Left untouched, such rows keep
+        // the oldest `updatedAt` and re-fill the `ORDER BY updatedAt ASC LIMIT
+        // 100` window every run, starving admissible invitations. Touch the row
+        // so it rotates to the back of the queue; a still-blocked candidate
+        // simply retries on a later cycle instead of monopolizing the batch.
+        try {
+          await this.prisma.circleInvitation.updateMany({
+            where: { id: candidate.id, status: 'PENDING' },
+            data: { status: 'PENDING' },
+          });
+        } catch (bumpError) {
+          this.logger.warn(
+            `Failed to defer reconciliation row ${candidate.id}: ${
+              bumpError instanceof Error ? bumpError.message : String(bumpError)
+            }`,
+          );
+        }
       }
     }
     return finalizedCount;

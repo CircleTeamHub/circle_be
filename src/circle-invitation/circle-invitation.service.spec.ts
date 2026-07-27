@@ -373,6 +373,12 @@ describe('CircleInvitationService', () => {
       where: { id: 'good' },
       include: { circle: true },
     });
+    // The permanently-blocked 'bad' row is deferred (touched) so it rotates to
+    // the back of the updatedAt-ordered batch instead of re-filling it forever.
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: { id: 'bad', status: 'PENDING' },
+      data: { status: 'PENDING' },
+    });
   });
 
   it('hides cancelled invitations from pending verifier work', async () => {
