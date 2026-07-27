@@ -44,29 +44,48 @@ const level = program.enabled
 
 | 拦截路径 | 抛出位置 | 错误码 |
 |----------|----------|--------|
-| 建圈 / 入圈配额 | `circle.service.ts`、`circle-admission-policy.ts` | `MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED` |
-| 圈子成员容量 | `circle-admission-policy.ts` | `CIRCLE_MEMBER_LIMIT` |
-| 广场城市筛选 | `circle-plaza.service.ts` | `CITY_FILTER_QUOTA_REACHED` |
-| 笔记存储 | `note.service.ts`(`assertNoteStorageAvailable`) | `NOTE_STORAGE_QUOTA_REACHED` |
+| 建圈 / 入圈配额 | `circle.service.ts:126`、`circle-admission-policy.ts:131` | `MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED` |
+| 建圈时申报的容量 | `circle.service.ts:141` | `MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED` |
+| 圈子成员容量 | `circle-admission-policy.ts:179,248` | `CIRCLE_MEMBER_LIMIT` |
+| 广场城市筛选 | `circle-plaza.service.ts:486` | `CITY_FILTER_QUOTA_REACHED` |
+| 笔记存储 | `note.service.ts:400`(`assertNoteStorageAvailable`) | `NOTE_STORAGE_QUOTA_REACHED` |
+
+其中「建圈时申报的容量」容易被漏掉:`CircleService.create` 校验的是**请求里申报的
+`maxMembers`**(`maxMembers > quotas.groupMembers.actual` 即拒),不是已有成员数。因此在
+program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请求会以这个码失败 ——
+看板或客户端若只盯上表其余几个码,这类失败不会被发现。
 
 上线前应为每种拒绝形态补路由级契约测试;或反过来把实现收敛到统一错误码,但那是行为变更,
 需与客户端一并改。
 
 ### 上线后的风险
 
-若生产中已存在超过上述数值的**旧合法**用户(例如加入了 350 个圈子),那么在
-**部署完成之后、会员计划正式启用之前**,他们的新增操作会被直接拒绝 —— 而这些数据在旧规则下
-完全合法。
+若生产中已存在**达到或超过**上述数值的**旧合法**用户(例如加入了 350 个圈子,或恰好
+300 个 —— 拦截是「达到即拒」),那么在**部署完成之后、会员计划正式启用之前**,他们的新增操作
+会被直接拒绝 —— 而这些数据在旧规则下完全合法。
 
 ### 上线前必做
 
 1. **先查生产分布**(启用前的前置数据),但**只有三项能查库**:统计 `groupMembers /
-   joinedCircles / notes` 各自超过 gold 阈值的用户数 —— 它们都对应可计数的持久化行。
+   joinedCircles / notes` 达到或超过 gold 阈值的用户数 —— 它们都对应可计数的持久化行。
+
+   > **判定必须用 `>=`,不能用 `>`。** 拦截谓词都是「达到即拒」:
+   > `activeMemberships >= joinedLimit`(`circle.service.ts:126`)、
+   > `current >= limit`(`note.service.ts:400`)、准入侧同理(`circle-admission-policy.ts:131`)。
+   > 用 `>` 统计会把「恰好 300 个圈子」「恰好 500 条笔记」「恰好 400 人的圈子」算作 0,
+   > 从而放行灰度 —— 而这些用户的**下一次操作就会立即报错**。
+   > 另注:`groupMembers` 是**按每个自有圈子**计量,不是用户级总数;夹具需同时覆盖
+   > `limit - 1` 与 `limit` 两档。
+
 2. **`cityFilters` 查不到分布,必须换一种审计方式**:它没有 per-user 存储,
    `CirclePlazaService.getFeed` 是拿**本次请求**的 `cities` 参数直接与配额比长度。
-   因此数据库审计会显示为 0,而一个携带 11–1000 个城市(`PlazaFeedSearchDto` 仍接受)的
-   既有客户端请求,会在程序未启用期间开始返回 403。改用接口/客户端用量或埋点审计,
-   或在启用前豁免这一项请求级配额;并补一条「program disabled + 请求含 10 个以上城市」的用例。
+   因此数据库审计会显示为 0。改用接口/客户端用量或埋点审计,或在启用前豁免这一项请求级配额。
+
+   > **但告警范围要按实际档位收窄。** program 未启用时 floor 是
+   > `Math.max(actual.level, 2)` —— 是**下限**,不是把所有人压成 gold:钻石仍是 50 个城市、
+   > 超级仍是 1000。所以「请求含 11 个以上城市即 403」只对**实际档位 ≤ gold** 的用户成立;
+   > 一条笼统的「>10 城市」埋点规则会把钻石/超级的**合法流量**误判为异常。
+   > 用例应覆盖:program disabled 下,11 个城市对普通用户被拒、对钻石/超级放行。
 3. 若不为 0,**把「营销展示 floor」与「启用前强制配额」解耦**:floor 只用于
    *展示档位与功能可见性*,配额强制在 program 未启用时不设上限(或按旧规则放行),
    待正式启用后再切到 catalog 数值。
@@ -85,12 +104,21 @@ const level = program.enabled
 上线前要点:该修法落在服务器 `~/.ssh/authorized_keys`,**不在本仓库**;启用 ForceCommand
 需同时改造 `release.yml` 的 `bash -s` 传参方式,且必须在 staging 真跑验证。
 
-> **别指望靠轮换部署 key 挡住它。** `release.yml` 里是
-> `DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}` —— 表达式在**运行时**从仓库当前的 secret
-> 求值。重跑一个 launcher 引入之前的历史 workflow,它并不持有旧私钥快照,而是照样拿到
-> **轮换后的新 key**,于是仍能做 live-tree rsync 并直接执行旧的无守卫 `release-deploy.sh`。
-> 轮换只能作废 GitHub 之外的密钥副本(如本机、其他系统留存的拷贝);唯一真正的阻断层是
-> 服务器端受限的 ForceCommand key。落地后须在 staging 验证:重跑一个历史 workflow 会被拒绝。
+> **注意区分「换值」和「换名」——只有后者能挡住历史 workflow。**
+>
+> `release.yml` 里是 `DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}`,表达式在**运行时**从
+> 仓库当前的 secret 求值。
+>
+> - **原地轮换 secret 的值(同名)——无效。** 重跑 launcher 之前的历史 workflow,它并不持有
+>   旧私钥快照,而是照样拿到**轮换后的新 key**,于是仍能做 live-tree rsync 并直接执行旧的
+>   无守卫 `release-deploy.sh`。同名轮换只能作废 GitHub 之外的密钥副本(本机、其他系统的拷贝)。
+> - **改用新 secret 名 + 新服务器 key,并删除旧的 `DEPLOY_SSH_KEY` 与其 authorized key
+>   ——有效,可作为上线前的一次性切断。** 历史 workflow 仍引用已不存在的旧 secret,取到空值,
+>   其 `Configure SSH` 步骤在 `release.yml:307-311` 的空值校验处直接 `exit 1`,早于任何部署动作。
+> - **ForceCommand 才是长期解。** 改名只切断「引用旧名的历史 workflow」这一批;新管线沿用新
+>   名之后,同样的绕过路径会随时间重新累积。服务器端 `command=` 限制不依赖任何 secret 名。
+>
+> 无论走哪条,都须在 staging 验证:重跑一个历史 workflow 被拒绝,且更新后的发版流程仍能成功。
 
 ---
 
