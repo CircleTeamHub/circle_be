@@ -38,9 +38,19 @@ const level = program.enabled
 | `notes` | 500 |
 | `cityFilters` | 10 |
 
-返回的这个 level 会流向所有强制拦截路径(`circle-admission-policy.ts`、`circle.service.ts`、
-`circle-plaza.service.ts`、`note.service.ts`),最终由 `assertQuotaAvailable` 抛
-`MEMBERSHIP_QUOTA_REACHED`。
+返回的这个 level 会流向所有强制拦截路径,由各自的端点抛**不同**的错误码。注意
+`assertQuotaAvailable`(会抛 `MEMBERSHIP_QUOTA_REACHED`)**在生产代码中没有任何调用方**,
+只被单测引用 —— 按它做灰度校验、看板或客户端断言会漏掉全部真实拒绝:
+
+| 拦截路径 | 抛出位置 | 错误码 |
+|----------|----------|--------|
+| 建圈 / 入圈配额 | `circle.service.ts`、`circle-admission-policy.ts` | `MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED` |
+| 圈子成员容量 | `circle-admission-policy.ts` | `CIRCLE_MEMBER_LIMIT` |
+| 广场城市筛选 | `circle-plaza.service.ts` | `CITY_FILTER_QUOTA_REACHED` |
+| 笔记存储 | `note.service.ts`(`assertNoteStorageAvailable`) | `NOTE_STORAGE_QUOTA_REACHED` |
+
+上线前应为每种拒绝形态补路由级契约测试;或反过来把实现收敛到统一错误码,但那是行为变更,
+需与客户端一并改。
 
 ### 上线后的风险
 
@@ -50,12 +60,17 @@ const level = program.enabled
 
 ### 上线前必做
 
-1. **先查生产分布**(启用前的前置数据):统计 `groupMembers / joinedCircles / notes / cityFilters`
-   四项各自超过 gold 阈值的用户数。若为 0,可直接按现状启用。
-2. 若不为 0,**把「营销展示 floor」与「启用前强制配额」解耦**:floor 只用于
+1. **先查生产分布**(启用前的前置数据),但**只有三项能查库**:统计 `groupMembers /
+   joinedCircles / notes` 各自超过 gold 阈值的用户数 —— 它们都对应可计数的持久化行。
+2. **`cityFilters` 查不到分布,必须换一种审计方式**:它没有 per-user 存储,
+   `CirclePlazaService.getFeed` 是拿**本次请求**的 `cities` 参数直接与配额比长度。
+   因此数据库审计会显示为 0,而一个携带 11–1000 个城市(`PlazaFeedSearchDto` 仍接受)的
+   既有客户端请求,会在程序未启用期间开始返回 403。改用接口/客户端用量或埋点审计,
+   或在启用前豁免这一项请求级配额;并补一条「program disabled + 请求含 10 个以上城市」的用例。
+3. 若不为 0,**把「营销展示 floor」与「启用前强制配额」解耦**:floor 只用于
    *展示档位与功能可见性*,配额强制在 program 未启用时不设上限(或按旧规则放行),
    待正式启用后再切到 catalog 数值。
-3. 解耦后补单测:覆盖「program disabled + 存量超额用户 → 不被拦截」与
+4. 解耦后补单测:覆盖「program disabled + 存量超额用户 → 不被拦截」与
    「program enabled → 正常按 catalog 拦截」两个方向。
 
 ---
@@ -69,7 +84,13 @@ const level = program.enabled
 
 上线前要点:该修法落在服务器 `~/.ssh/authorized_keys`,**不在本仓库**;启用 ForceCommand
 需同时改造 `release.yml` 的 `bash -s` 传参方式,且必须在 staging 真跑验证。
-首次上线前应完成**部署 key 轮换**,使引入 launcher 之前的历史 workflow 所持凭据失效。
+
+> **别指望靠轮换部署 key 挡住它。** `release.yml` 里是
+> `DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}` —— 表达式在**运行时**从仓库当前的 secret
+> 求值。重跑一个 launcher 引入之前的历史 workflow,它并不持有旧私钥快照,而是照样拿到
+> **轮换后的新 key**,于是仍能做 live-tree rsync 并直接执行旧的无守卫 `release-deploy.sh`。
+> 轮换只能作废 GitHub 之外的密钥副本(如本机、其他系统留存的拷贝);唯一真正的阻断层是
+> 服务器端受限的 ForceCommand key。落地后须在 staging 验证:重跑一个历史 workflow 会被拒绝。
 
 ---
 
@@ -85,8 +106,15 @@ const level = program.enabled
 
 ---
 
-## 已闭合
+## 待合入(修复已就绪,尚未进入 main)
 
 - **icon 资格分页截断已选圈子 / Circle Builder 资格**(原 P2):与生产数据无关的代码正确性缺陷,
-  本地开发即可复现,已修复并合入 —— 见 PR
-  [CircleTeamHub/circle_be#129](https://github.com/CircleTeamHub/circle_be/pull/129)。
+  本地开发即可复现 —— 用户若加入 200 个以上圈子,其已选圈子或符合 Circle Builder 资格的
+  成员关系可能排在窗口之外,已保存的有效图标随后会被当作 stale 删除。
+
+  修复见 PR [CircleTeamHub/circle_be#129](https://github.com/CircleTeamHub/circle_be/pull/129)。
+  **在该 PR 合入 main 之前,本条仍然成立**:当前 main 的 `IconService.fetchEligibilityMemberships`
+  依旧只按 `createdAt DESC` 取每人最新 200 条。合入后再把本条移到「已闭合」。
+
+  另:#129 目前只有单测覆盖(SQL 排序断言),**尚缺**把符合资格的成员关系放到第 201 位之后的
+  真实 PostgreSQL 集成回归测试 —— 上线前补上。
