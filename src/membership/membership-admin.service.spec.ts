@@ -70,6 +70,9 @@ describe('MembershipAdminService', () => {
         Promise.allSettled(fns.map((fn) => fn())),
       ),
   };
+  const iconService = {
+    invalidateDisplayIconCacheFor: jest.fn(),
+  };
   let service: MembershipAdminService;
 
   function user(
@@ -141,6 +144,7 @@ describe('MembershipAdminService', () => {
       policy as never,
       notification as never,
       realtime as never,
+      iconService as never,
     );
   });
 
@@ -585,6 +589,22 @@ describe('MembershipAdminService', () => {
     expect(
       realtime.invalidateUserHotCache.mock.invocationCallOrder[0],
     ).toBeLessThan(realtime.safeBroadcastAll.mock.invocationCallOrder[0]);
+  });
+
+  it('evicts the target display-icon cache on grant (warmed VIP1 badge → VIP2)', async () => {
+    // Display-icon eligibility is derived from vipLevel, so a committed grant
+    // must evict the (cross-instance) displayIconCache or /auth/me, profile
+    // reads, and feeds keep serving the old VIP1 badge until the TTL expires.
+    tx.user.findUnique.mockResolvedValue(user(1, null));
+
+    await service.grant(operatorId, targetId, {
+      targetLevel: 2,
+      idempotencyKey,
+    });
+
+    expect(iconService.invalidateDisplayIconCacheFor).toHaveBeenCalledWith(
+      targetId,
+    );
   });
 
   it('returns the committed grant when every post-commit side effect fails', async () => {

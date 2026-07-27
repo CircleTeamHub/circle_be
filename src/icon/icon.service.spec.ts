@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { RedisService } from 'src/redis/redis.service';
 import {
   IconService,
   MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
@@ -81,6 +82,11 @@ describe('IconService', () => {
     getSettingsForUsers: jest.fn(),
   };
 
+  const redisService = {
+    publish: jest.fn(() => Promise.resolve(true)),
+    subscribePattern: jest.fn(() => Promise.resolve(true)),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
     // Sensible defaults: no circles, no likes, default privacy.
@@ -94,6 +100,7 @@ describe('IconService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: RedisService, useValue: redisService },
       ],
     }).compile();
 
@@ -565,5 +572,27 @@ describe('IconService', () => {
     await service.getDisplayIconsForUser('user-1');
 
     expect(prisma.user.findUnique).toHaveBeenCalledTimes(callsAfterFirst);
+  });
+
+  it('evicts locally and fans out cross-instance on invalidateDisplayIconCacheFor', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    // Warm the cache (e.g. a VIP1 badge), then invalidate as a grant would.
+    await service.getDisplayIconsForUser('user-1');
+    const callsAfterWarm = prisma.user.findUnique.mock.calls.length;
+
+    service.invalidateDisplayIconCacheFor('user-1');
+
+    // Fans the eviction out so every other instance drops its stale copy too.
+    expect(redisService.publish).toHaveBeenCalledWith(
+      'circle:icon:display-invalidate',
+      'user-1',
+    );
+    // Local entry is gone: the next read recomputes rather than serving stale.
+    await service.getDisplayIconsForUser('user-1');
+    expect(prisma.user.findUnique.mock.calls.length).toBeGreaterThan(
+      callsAfterWarm,
+    );
   });
 });

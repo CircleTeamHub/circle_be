@@ -2,8 +2,11 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Optional,
+  OnModuleInit,
 } from '@nestjs/common';
 import { IconErrorCode } from 'src/common/app-error-codes';
+import { RedisService } from 'src/redis/redis.service';
 import {
   DisplayIconDto,
   DisplayIconTypeDto,
@@ -41,6 +44,11 @@ const VERIFIED_PROFILE_MIN_BIO_LENGTH = 10;
 export const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
+// Cross-instance eviction channel for the per-instance in-memory displayIconCache.
+// Eligibility is derived from vipLevel, so a committed membership grant on one
+// instance must evict every instance's cache — otherwise other nodes keep
+// serving the old-tier badge for up to the TTL. Message payload = userId.
+const DISPLAY_ICON_INVALIDATION_CHANNEL = 'circle:icon:display-invalidate';
 
 type CachedDisplayIcons = {
   data: DisplayIconDto[];
@@ -158,14 +166,28 @@ function toPrismaSystemIconKey(
 }
 
 @Injectable()
-export class IconService {
+export class IconService implements OnModuleInit {
   private readonly displayIconCache = new Map<string, CachedDisplayIcons>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
+    @Optional() private readonly redisService?: RedisService,
   ) {}
+
+  // Subscribe to the cross-instance eviction channel so a grant (or any other
+  // vipLevel change) committed on another instance drops this instance's stale
+  // displayIconCache entry too. Best-effort: without Redis the cache stays
+  // per-instance and simply falls back to its 30s TTL, exactly as before.
+  async onModuleInit(): Promise<void> {
+    await this.redisService?.subscribePattern(
+      DISPLAY_ICON_INVALIDATION_CHANNEL,
+      (_channel, message) => {
+        if (message) this.displayIconCache.delete(message);
+      },
+    );
+  }
 
   private invalidateDisplayIconCache(userId: string): void {
     this.displayIconCache.delete(userId);
@@ -360,7 +382,10 @@ export class IconService {
    * observe directly (e.g. circle icon swaps that affect circle eligibility).
    */
   invalidateDisplayIconCacheFor(userId: string): void {
+    // Evict locally immediately, then fan the eviction out to every other
+    // instance over Redis (fire-and-forget, mirroring the realtime backplane).
     this.invalidateDisplayIconCache(userId);
+    void this.redisService?.publish(DISPLAY_ICON_INVALIDATION_CHANNEL, userId);
   }
 
   async updateDisplayIcons(

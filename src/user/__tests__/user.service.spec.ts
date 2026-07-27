@@ -492,5 +492,21 @@ describe('UserService', () => {
       );
       expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
     });
+
+    it('maps an expired paid membership to the public view in the deletion body', async () => {
+      prisma.user.update.mockResolvedValue({
+        id: 'user-1',
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.remove('user-1');
+
+      // Expired level 3 → effective 0 and the membership object is present, so
+      // the deletion body matches every other public-user response instead of
+      // leaking the stored paid tier.
+      expect(result.vipLevel).toBe(0);
+      expect(result.membership.effectiveLevel).toBe(0);
+    });
   });
 });

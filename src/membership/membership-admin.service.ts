@@ -10,6 +10,7 @@ import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { IconService } from 'src/icon/icon.service';
 import {
   prismaErrorCode,
   runSerializableTransaction,
@@ -49,6 +50,7 @@ export class MembershipAdminService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly notificationService: NotificationService,
     private readonly realtimeService: RealtimeService,
+    private readonly iconService: IconService,
   ) {}
 
   async grant(
@@ -309,6 +311,11 @@ export class MembershipAdminService {
 
   private async runPostCommitSideEffects(targetUserId: string): Promise<void> {
     const content = '会员权益已更新';
+    // A grant changes vipLevel, which drives display-icon eligibility. Evict the
+    // in-memory displayIconCache across ALL instances (Redis fan-out), or
+    // /auth/me, profile reads, and feeds served by other nodes keep returning
+    // the old-tier badge until the 30s TTL expires.
+    this.iconService.invalidateDisplayIconCacheFor(targetUserId);
     const [cacheResult, notificationResult] = await Promise.allSettled([
       this.realtimeService.invalidateUserHotCache(targetUserId),
       this.notificationService.createSystemNotification(

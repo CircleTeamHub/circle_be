@@ -457,8 +457,11 @@ export class UserService {
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
+    // Map through toPublicUser like every other public-user response: resolve
+    // the effective (expiry-aware) vipLevel and attach the membership object,
+    // so an expired paid tier can't leak its stored level in the deletion body.
     return {
-      ...user,
+      ...toPublicUser(user),
       displayIcons,
     };
   }
