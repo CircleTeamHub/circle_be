@@ -28,6 +28,7 @@ import {
   resolveMembershipAppearance,
   toPublicMembershipAppearance,
 } from 'src/membership/membership-appearance';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -222,12 +223,17 @@ export class UserService {
     }
     const users = await this.prisma.user.findMany({
       where: { id: { in: [...aliasesByNormalized.keys()] } },
-      select: { id: true, vipLevel: true },
+      select: { id: true, vipLevel: true, vipExpiresAt: true },
     });
+    // Resolve expiry so an expired level 1–3 stops driving paid name effects on
+    // the chat surfaces that consume this map; this mirrors every other public
+    // profile path instead of leaking the stored (unexpired) level.
+    const now = new Date();
     const out: Record<string, number> = {};
     for (const user of users) {
+      const effectiveLevel = resolveEffectiveMembershipLevel(user, now);
       for (const alias of aliasesByNormalized.get(user.id) ?? [user.id]) {
-        out[alias] = user.vipLevel;
+        out[alias] = effectiveLevel;
       }
     }
     return out;

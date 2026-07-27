@@ -19,6 +19,7 @@ import {
   MembershipProgramDatabase,
   MembershipProgramService,
   MembershipProgramStatus,
+  ProgramReadOptions,
 } from './membership-program.service';
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
@@ -60,8 +61,9 @@ export class MembershipPolicyService {
     membership: StoredMembership,
     db: MembershipProgramDatabase = this.prisma,
     now = new Date(),
+    options: ProgramReadOptions = {},
   ): Promise<EffectiveMembershipPolicy> {
-    const program = await this.loadProgramStatus(db);
+    const program = await this.loadProgramStatus(db, options);
     return this.resolveEntitlementWith(membership, program, now);
   }
 
@@ -72,8 +74,11 @@ export class MembershipPolicyService {
    */
   async loadProgramStatus(
     db: MembershipProgramDatabase = this.prisma,
+    options: ProgramReadOptions = {},
   ): Promise<MembershipProgramStatus | null> {
-    return this.membershipProgram ? this.membershipProgram.getStatus(db) : null;
+    return this.membershipProgram
+      ? this.membershipProgram.getStatus(db, options)
+      : null;
   }
 
   /** 用预载的 rollout 状态解析有效权益（无 DB 往返），供批量准入循环用。 */

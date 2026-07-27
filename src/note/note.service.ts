@@ -384,9 +384,19 @@ export class NoteService {
     const current = await tx.note.count({
       where: { ownerID, status: { not: 'DELETED' } },
     });
-    const limit = (
-      await this.membershipPolicy.resolveEntitlement(membership, tx)
-    ).tier.quotas.notes.actual;
+    const limit =
+      // lockForWrite: serialize the rollout-floor read against program
+      // enablement so this note-quota decision cannot commit under a stale floor.
+      (
+        await this.membershipPolicy.resolveEntitlement(
+          membership,
+          tx,
+          new Date(),
+          {
+            lockForWrite: true,
+          },
+        )
+      ).tier.quotas.notes.actual;
     if (current >= limit) {
       throw new ForbiddenException({
         message: 'Note storage quota reached',

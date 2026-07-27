@@ -324,13 +324,30 @@ describe('CircleAdmissionPolicy', () => {
     expect(prisma.circleMember.createMany).toHaveBeenCalledTimes(1);
   });
 
-  it('distinguishes circle capacity from joined quota failures', async () => {
+  it('reports the owner capacity, not the larger stored maxMembers, when a downgraded owner rejects admission', async () => {
+    // reserveCircleSeats fails → capacity rejection. The owner is regular
+    // (level 0, groupMembers cap 100) while the circle stores maxMembers 3000,
+    // so the bound that actually rejected is 100 — surfacing the stale 3000
+    // would mislead clients about why the write failed (#5).
     prisma.$queryRaw.mockResolvedValue([]);
 
     await expect(
       policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
     ).rejects.toMatchObject({
-      response: { errorCode: 'CIRCLE_MEMBER_LIMIT', limit: 3000 },
+      response: { errorCode: 'CIRCLE_MEMBER_LIMIT', limit: 100 },
+    });
+  });
+
+  it('reports the owner capacity, not null, when a legacy null-cap circle rejects admission', async () => {
+    // Legacy circle with maxMembers = null must never surface `limit: null`;
+    // the owner's groupMembers cap (regular = 100) is the effective bound.
+    prisma.circle.findUnique.mockResolvedValue(circle({ maxMembers: null }));
+    prisma.$queryRaw.mockResolvedValue([]);
+
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_MEMBER_LIMIT', limit: 100 },
     });
   });
 

@@ -80,10 +80,18 @@ describePostgres('Note storage quota concurrency e2e', () => {
     ).resolves.toBe(50);
   };
 
-  beforeEach(() => {
+  beforeEach(async () => {
     const app = getE2eApp();
     prisma = app.get(PrismaService);
     jwt = app.get(JwtService);
+    // Enforce the regular-tier note quota (50): while the rollout is disabled
+    // the marketing floor (gold, 500 notes) applies and 49 notes never hit the
+    // cap, so no parallel create would be rejected.
+    await prisma.membershipProgramState.upsert({
+      where: { id: 1 },
+      update: { enabledAt: new Date() },
+      create: { id: 1, enabledAt: new Date() },
+    });
   });
 
   it('allows exactly one of two parallel creates at limit minus one', async () => {

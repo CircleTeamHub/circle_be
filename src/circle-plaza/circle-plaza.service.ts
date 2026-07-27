@@ -277,9 +277,30 @@ export class CirclePlazaService {
             errorCode: PlazaErrorCode.NotActiveMember,
           });
         }
-        const authorLevel = (
-          await this.membershipPolicy.resolveEntitlement(author, tx, new Date())
-        ).level;
+        const authorLevel =
+          // lockForWrite: serialize the rollout-floor read against program
+          // enablement so this author-level gate uses a consistent floor.
+          (
+            await this.membershipPolicy.resolveEntitlement(
+              author,
+              tx,
+              new Date(),
+              {
+                lockForWrite: true,
+              },
+            )
+          ).level;
+        // Regular (level 0) authors are forbidden from the Plaza read paths
+        // (feed + detail both reject level 0), so a level-0 write would create a
+        // post its author can never see. Reject before any write or publish
+        // notification — a zero VIP restriction must not slip past the check
+        // below (0 > 0 is false).
+        if (authorLevel === 0) {
+          throw new ForbiddenException({
+            message: 'Membership required to publish circle posts',
+            errorCode: PlazaErrorCode.MembershipRequired,
+          });
+        }
         const requestedVipRestriction = Math.max(
           dto.vipRestriction ?? 0,
           dto.signupVipRestriction ?? 0,
@@ -919,6 +940,7 @@ export class CirclePlazaService {
                     authoritativeViewer,
                     tx,
                     new Date(),
+                    { lockForWrite: true },
                   )
                 ).level,
                 creditScore: authoritativeViewer.creditScore,

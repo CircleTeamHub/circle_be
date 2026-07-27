@@ -5,6 +5,8 @@ import { CircleService } from 'src/circle/circle.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { GroupService } from 'src/group/group.service';
 import { GroupSyncOutboxProcessor } from 'src/group/group-sync-outbox.processor';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -40,6 +42,8 @@ describePostgres('Circle membership transition concurrency e2e', () => {
   let memberLock: CircleMemberLockService;
   let outboxProcessor: GroupSyncOutboxProcessor;
   let openimService: OpenimService;
+  let membershipPolicy: MembershipPolicyService;
+  let programService: MembershipProgramService;
 
   const createUser = async (label: string) => {
     const id = randomUUID();
@@ -106,6 +110,15 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       admissionPolicy.activateMembers(tx, circleID, [userID]),
     );
 
+  // Turns on the staged rollout so effective entitlements drop to the stored
+  // level (no marketing floor) — required for regular-tier quotas to bite.
+  const enableMembershipProgram = () =>
+    prisma.membershipProgramState.upsert({
+      where: { id: 1 },
+      update: { enabledAt: new Date() },
+      create: { id: 1, enabledAt: new Date() },
+    });
+
   const expectCounterConsistent = async (circleID: string) => {
     const [circle, activeCount] = await Promise.all([
       prisma.circle.findUniqueOrThrow({
@@ -129,6 +142,8 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     memberLock = app.get(CircleMemberLockService);
     outboxProcessor = app.get(GroupSyncOutboxProcessor);
     openimService = app.get(OpenimService);
+    membershipPolicy = app.get(MembershipPolicyService);
+    programService = app.get(MembershipProgramService);
   });
 
   it('keeps count consistent when pending activation races circle leave', async () => {
@@ -204,6 +219,10 @@ describePostgres('Circle membership transition concurrency e2e', () => {
         })),
       ],
     });
+    // Enable the rollout so the regular joined-circles limit (100) is enforced;
+    // while disabled the marketing floor (gold, 300) applies and 99 memberships
+    // would be nowhere near the boundary, so no admission would be rejected.
+    await enableMembershipProgram();
 
     const results = await Promise.allSettled(
       targetCircleIDs.map((circleID) => activate(circleID, candidate.id)),
@@ -827,5 +846,45 @@ describePostgres('Circle membership transition concurrency e2e', () => {
         select: { status: true },
       }),
     ).resolves.toEqual({ status: CircleMemberStatus.ACTIVE });
+  });
+
+  it('serializes rollout enablement against an in-flight entitlement-write read', async () => {
+    const operator = await createUser('rollout-operator');
+
+    let releaseHold: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      releaseHold = resolve;
+    });
+    let signalAcquired: () => void = () => undefined;
+    const lockAcquired = new Promise<void>((resolve) => {
+      signalAcquired = resolve;
+    });
+
+    // A quota-writing transaction takes the SHARED program lock (as every
+    // entitlement write now does via lockForWrite) and holds it open.
+    const holdTx = runSerializableTransaction(prisma, async (tx) => {
+      await membershipPolicy.loadProgramStatus(tx, { lockForWrite: true });
+      signalAcquired();
+      await held;
+    });
+
+    await lockAcquired;
+
+    // enable() takes the EXCLUSIVE lock on the same key, so it must not commit
+    // while the shared lock is held — proving the read+write serialize with it.
+    let enableDone = false;
+    const enablePromise = programService.enable(operator.id).then((result) => {
+      enableDone = true;
+      return result;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(enableDone).toBe(false);
+
+    releaseHold();
+    await holdTx;
+    const result = await enablePromise;
+    expect(enableDone).toBe(true);
+    expect(result.status.enabled).toBe(true);
   });
 });

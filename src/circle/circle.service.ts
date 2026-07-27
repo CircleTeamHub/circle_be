@@ -101,6 +101,9 @@ export class CircleService {
         user,
         tx,
         new Date(),
+        // Serialize the rollout-floor read against program enablement so this
+        // quota decision cannot commit under an obsolete entitlement floor.
+        { lockForWrite: true },
       );
 
       // 非会员（有效档 0：普通 / 已过期）不能建圈。resolveEntitlement 已应用 staged-rollout

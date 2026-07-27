@@ -112,7 +112,11 @@ export class CircleAdmissionPolicy {
 
     // staged-rollout 状态在循环外读一次；每个候选人再各查一次会在持有全部 advisory 锁的
     // Serializable 事务里串行往返（最多 100 次），徒增延迟与锁竞争。
-    const program = await this.membershipPolicy.loadProgramStatus(tx);
+    // lockForWrite: serialize the rollout-floor read against program enablement
+    // so quota decisions below cannot commit under an obsolete entitlement floor.
+    const program = await this.membershipPolicy.loadProgramStatus(tx, {
+      lockForWrite: true,
+    });
 
     for (const userID of activatingUserIDs) {
       const candidate = userByID.get(userID);
@@ -161,11 +165,20 @@ export class CircleAdmissionPolicy {
         select: { deleted: true, maxMembers: true },
       });
       if (!currentCircle || currentCircle.deleted) this.throwCircleNotFound();
+      // Report the bound that actually rejected: seats are capped by BOTH the
+      // stored maxMembers and the owner's current groupMembers quota. A
+      // downgraded owner (ownerCapacity < maxMembers) or a legacy null-cap
+      // circle rejects at ownerCapacity, so surface the effective minimum
+      // instead of the stored value — never a misleading larger or null limit.
+      const effectiveLimit = Math.min(
+        currentCircle.maxMembers ?? ownerCapacity,
+        ownerCapacity,
+      );
       throw new BadRequestException({
         message: 'Circle has reached its member limit',
         errorCode: CircleErrorCode.MemberLimit,
-        limit: currentCircle.maxMembers,
-        details: { limit: currentCircle.maxMembers },
+        limit: effectiveLimit,
+        details: { limit: effectiveLimit },
       });
     }
 
@@ -252,6 +265,7 @@ export class CircleAdmissionPolicy {
       candidate,
       tx,
       new Date(),
+      { lockForWrite: true },
     );
     this.assertRestrictions(circle, candidate, effective.level);
   }

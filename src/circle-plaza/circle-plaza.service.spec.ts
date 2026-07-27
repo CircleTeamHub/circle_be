@@ -900,7 +900,7 @@ describe('CirclePlazaService', () => {
     },
   );
 
-  it('treats an expired post author as regular for restriction ceilings', async () => {
+  it('rejects an expired post author as a non-member before any write', async () => {
     prisma.circleMember.findMany.mockImplementation((args: any) =>
       Promise.resolve(
         args?.select?.userID
@@ -915,6 +915,9 @@ describe('CirclePlazaService', () => {
             ],
       ),
     );
+    // Level 3 but expired → effective level 0. The Plaza read paths forbid
+    // level 0, so publishing must be rejected up front (even with the VIP
+    // restriction omitted) rather than creating a post the author cannot see.
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
       vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
@@ -924,14 +927,58 @@ describe('CirclePlazaService', () => {
       service.createPost('user-1', {
         circleId: 'circle-1',
         content: 'hello plaza',
-        vipRestriction: 1,
       }),
     ).rejects.toMatchObject({
-      response: { errorCode: 'PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR', limit: 0 },
+      response: { errorCode: 'PLAZA_MEMBERSHIP_REQUIRED' },
     });
+    expect(prisma.circlePost.create).not.toHaveBeenCalled();
+    expect(
+      notificationService.createCirclePostPublishedNotifications,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('rejects a regular (never-VIP) post author before any write', async () => {
+    prisma.circleMember.findMany.mockImplementation((args: any) =>
+      Promise.resolve(
+        args?.select?.userID
+          ? []
+          : [
+              {
+                circleID: 'circle-1',
+                status: 'ACTIVE',
+                role: 'MEMBER',
+                circle: { deleted: false, memberCanPost: true },
+              },
+            ],
+      ),
+    );
+    // Regular level-0 author with the VIP restriction omitted: 0 > 0 is false,
+    // so the restriction check would pass — the up-front level gate must reject.
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+
+    await expect(
+      service.createPost('user-1', {
+        circleId: 'circle-1',
+        content: 'hello plaza',
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'PLAZA_MEMBERSHIP_REQUIRED' },
+    });
+    expect(prisma.circlePost.create).not.toHaveBeenCalled();
+    expect(
+      notificationService.createCirclePostPublishedNotifications,
+    ).not.toHaveBeenCalled();
   });
 
   it('fans out a new-activity notification to active circle members after publishing', async () => {
+    // Active member author (level 1); the publish path is gated on level > 0.
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
     // 发帖成员校验用 include，扇出取成员用 select.userID —— 按参数分流，不依赖调用顺序。
     prisma.circleMember.findMany.mockImplementation((args: any) => {
       if (args?.select?.userID) {
@@ -999,6 +1046,10 @@ describe('CirclePlazaService', () => {
   });
 
   it('rolls back post creation when publication outbox creation fails', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
     prisma.circleMember.findMany.mockImplementation((args: any) => {
       if (args?.select?.userID) {
         return Promise.resolve([{ userID: 'member-2' }]);
@@ -1035,6 +1086,10 @@ describe('CirclePlazaService', () => {
   });
 
   it('does not fail a committed post when realtime publication broadcast fails', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
     prisma.circleMember.findMany.mockImplementation((args: any) => {
       if (args?.select?.userID) {
         return Promise.resolve([{ userID: 'member-2' }]);
@@ -1095,6 +1150,10 @@ describe('CirclePlazaService', () => {
   });
 
   it('excludes the author and blocked users in the capped recipient query', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
     prisma.circleMember.findMany.mockImplementation((args: any) => {
       if (args?.select?.userID) {
         return Promise.resolve([{ userID: 'member-2' }]);
@@ -1220,6 +1279,10 @@ describe('CirclePlazaService', () => {
     jest
       .useFakeTimers()
       .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
     prisma.circleMember.findMany.mockResolvedValue([
       {
         circleID: 'circle-1',

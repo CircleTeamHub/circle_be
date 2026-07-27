@@ -4,6 +4,25 @@ import { PrismaService } from 'src/prisma/prisma.service';
 
 export const MARKETING_ENTITLEMENT_FLOOR_LEVEL = 2 as const;
 
+// Advisory-lock key shared by enablement (exclusive) and entitlement-writing
+// transactions (shared). Both must hash the SAME string or they never contend.
+const MEMBERSHIP_PROGRAM_LOCK_KEY = 'membership-program-enable';
+
+/** Options for reading rollout status inside an entitlement-writing transaction. */
+export type ProgramReadOptions = {
+  /**
+   * Take a SHARED advisory lock on the program key before reading, held until
+   * the caller's transaction commits. This serializes the read+write against
+   * {@link MembershipProgramService.enable} (which locks the same key
+   * EXCLUSIVELY): enable waits for in-flight writes to commit, and a write that
+   * begins while enable holds the lock blocks until enable commits and then
+   * reads the fresh floor — closing the window where a quota write commits
+   * under an obsolete entitlement. Outside a transaction the xact lock is a
+   * no-op (autocommit), which is correct for pure reads.
+   */
+  lockForWrite?: boolean;
+};
+
 type ProgramStateRow = {
   enabledAt: Date | null;
   enabledByUserId: string | null;
@@ -27,7 +46,15 @@ export class MembershipProgramService {
 
   async getStatus(
     db: MembershipProgramDatabase = this.prisma,
+    options: ProgramReadOptions = {},
   ): Promise<MembershipProgramStatus> {
+    if (options.lockForWrite) {
+      await db.$executeRaw(Prisma.sql`
+        SELECT pg_advisory_xact_lock_shared(
+          hashtextextended(${MEMBERSHIP_PROGRAM_LOCK_KEY}, 0)
+        )
+      `);
+    }
     const rows = await db.$queryRaw<ProgramStateRow[]>(Prisma.sql`
       SELECT "enabledAt", "enabledByUserId"
       FROM "MembershipProgramState"
@@ -44,7 +71,7 @@ export class MembershipProgramService {
     return this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw(Prisma.sql`
         SELECT pg_advisory_xact_lock(
-          hashtextextended('membership-program-enable', 0)
+          hashtextextended(${MEMBERSHIP_PROGRAM_LOCK_KEY}, 0)
         )
       `);
 

@@ -201,6 +201,56 @@ describe('TraceService', () => {
     expect(result.comments).toHaveLength(1);
   });
 
+  it('getTraceById resolves the author membership across an expiry boundary', async () => {
+    const baseTrace = {
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hello world',
+      images: [],
+      likeCount: 0,
+      replyCount: 0,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      likeStats: [],
+      comments: [],
+    };
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'author-1' },
+    ]);
+    prisma.traceLikeStat.findFirst.mockResolvedValue(null);
+
+    // Expired level 3 → 0: no leaked paid name effect on the moment surface.
+    prisma.trace.findFirst.mockResolvedValue({
+      ...baseTrace,
+      from: {
+        id: 'author-1',
+        nickname: 'Author',
+        avatarUrl: null,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      },
+    });
+    expect(
+      (await service.getTraceById('viewer-1', 'trace-1')).author.vipLevel,
+    ).toBe(0);
+
+    // Unexpired level 2 is preserved.
+    prisma.trace.findFirst.mockResolvedValue({
+      ...baseTrace,
+      from: {
+        id: 'author-1',
+        nickname: 'Author',
+        avatarUrl: null,
+        vipLevel: 2,
+        vipExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+      },
+    });
+    expect(
+      (await service.getTraceById('viewer-1', 'trace-1')).author.vipLevel,
+    ).toBe(2);
+  });
+
   it('getTraceById caps loaded comments to protect the detail endpoint', async () => {
     prisma.trace.findFirst.mockResolvedValue({
       id: 'trace-1',

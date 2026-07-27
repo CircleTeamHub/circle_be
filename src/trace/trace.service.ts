@@ -18,6 +18,7 @@ import {
   encodeFeedCursor,
   feedCursorWhere,
 } from 'src/utils/feed-cursor';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 import {
   CreateTraceCommentDto,
   CreateTraceDto,
@@ -146,6 +147,7 @@ export class TraceService {
               nickname: true,
               avatarUrl: true,
               vipLevel: true,
+              vipExpiresAt: true,
             },
           },
           likeStats: {
@@ -256,7 +258,13 @@ export class TraceService {
       where: { id: traceId, deleted: false },
       include: {
         from: {
-          select: { id: true, nickname: true, avatarUrl: true, vipLevel: true },
+          select: {
+            id: true,
+            nickname: true,
+            avatarUrl: true,
+            vipLevel: true,
+            vipExpiresAt: true,
+          },
         },
         likeStats: {
           where: { deleted: false },
@@ -314,7 +322,13 @@ export class TraceService {
       },
       include: {
         from: {
-          select: { id: true, nickname: true, avatarUrl: true, vipLevel: true },
+          select: {
+            id: true,
+            nickname: true,
+            avatarUrl: true,
+            vipLevel: true,
+            vipExpiresAt: true,
+          },
         },
       },
     });
@@ -332,7 +346,7 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
-        vipLevel: trace.from.vipLevel ?? null,
+        vipLevel: resolveEffectiveMembershipLevel(trace.from),
       },
       likeCount: 0,
       commentCount: 0,
@@ -1088,7 +1102,7 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
-        vipLevel: trace.from.vipLevel ?? null,
+        vipLevel: resolveEffectiveMembershipLevel(trace.from),
       },
       likeCount: trace.likeCount,
       commentCount: trace.replyCount,

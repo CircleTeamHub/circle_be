@@ -95,7 +95,7 @@ describe('UserService', () => {
       expect(result).toEqual({ a: 3, b: 0 });
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: ['a', 'b', 'missing'] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
     });
 
@@ -117,7 +117,7 @@ describe('UserService', () => {
       // 响应键用调用方传入的原始 id,前端按当初传的原样查回。
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: [uuid] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
       expect(result).toEqual({ [imId]: 4 });
     });
@@ -132,9 +132,30 @@ describe('UserService', () => {
       // 归一后只查一次(同一 UUID),但两种别名都要回——否则用另一形态的一侧会默认 VIP0。
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: [uuid] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
       expect(result).toEqual({ [uuid]: 4, [imId]: 4 });
+    });
+
+    it('resolves expiry so an expired paid level maps to 0', async () => {
+      // Fixed past/future dates cross the expiry boundary against real `now`.
+      const past = new Date('2020-01-01T00:00:00.000Z');
+      const future = new Date('2999-01-01T00:00:00.000Z');
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'expired', vipLevel: 3, vipExpiresAt: past },
+        { id: 'active', vipLevel: 2, vipExpiresAt: future },
+        { id: 'lifetime', vipLevel: 4, vipExpiresAt: null },
+      ]);
+
+      const result = await service.getVipLevels([
+        'expired',
+        'active',
+        'lifetime',
+      ]);
+
+      // Expired paid level collapses to 0 (no leaked paid name effect); an
+      // unexpired level is preserved; super (4) is lifetime regardless.
+      expect(result).toEqual({ expired: 0, active: 2, lifetime: 4 });
     });
   });
 
