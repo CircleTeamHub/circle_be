@@ -245,6 +245,9 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 
 ### ⚠️ 加固待办:锁死历史 workflow 绕过 floor(需服务器端配置)
 
+> 本项目尚未上线,此项当前不触发;上线前须逐条复评 —— 见
+> [docs/pre-launch-checklist.md](docs/pre-launch-checklist.md)。
+
 **残留风险(未闭合)**:`.release/release-launcher.sh` 的持久锁 + `minimum-schema-compatibility`
 下限,以及 `release-deploy.sh` 顶部的 `RELEASE_LAUNCHER_ACTIVE` 守卫,都只保护**当前**发版
 管线。若有人重跑一个**在 launcher 引入之前**的旧 Release workflow,它会把自己的检出用 rsync
@@ -271,6 +274,9 @@ launcher」,拒绝「live-tree rsync」和「直接执行 `release-deploy.sh`」
 走上面〈回滚 / 重放〉的持久 launcher 手动流程,绝不直接执行目标树内的 `release-deploy.sh`。
 
 ### ⚠️ 加固待办:不可逆重放的空跑不应封死可兼容活色(需 staging 验证)
+
+> 本项目尚未上线,此项当前不触发;上线前须逐条复评 —— 见
+> [docs/pre-launch-checklist.md](docs/pre-launch-checklist.md)。
 
 **现象**:重发一个**已成功上线**的不可逆 tag 且用 downtime 模式时,`release-deploy.sh` 先停活色 →
 `prisma migrate deploy` 空跑成功 → 无条件置 `irreversible_migration_applied=1`。若此时新色(备色)
