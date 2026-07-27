@@ -15,7 +15,9 @@ global.beforeEach(async () => {
   pactum.request.setBaseUrl(await app.getUrl());
   global.pactum = pactum;
   global.spec = pactum.spec();
-});
+  // Booting the full AppModule per test can exceed Jest's 5s hook default on a
+  // loaded CI runner; give the setup hook headroom so app init never flakes.
+}, 30000);
 
 global.afterEach(async () => {
   try {

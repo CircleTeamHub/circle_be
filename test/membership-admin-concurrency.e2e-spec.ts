@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
@@ -85,6 +86,9 @@ describePostgres('Membership admin grant concurrency e2e', () => {
     const app = getE2eApp();
     prisma = app.get(PrismaService);
     const jwt = app.get(JwtService);
+    // Sign with the auth SECRET explicitly — app.get(JwtService) may resolve a
+    // different JwtModule instance keyed on a secret CI does not set.
+    const jwtSecret = app.get(ConfigService).get<string>('SECRET') ?? '';
     const operator = await createUser('ADMIN');
     operatorId = operator.id;
     adminToken = jwt.sign(
@@ -94,7 +98,7 @@ describePostgres('Membership admin grant concurrency e2e', () => {
         role: 'ADMIN',
         aud: 'ADMIN',
       },
-      { expiresIn: '5m' },
+      { secret: jwtSecret, expiresIn: '5m' },
     );
   });
 

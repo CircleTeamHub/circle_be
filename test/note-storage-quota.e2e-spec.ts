@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { NoteErrorCode } from 'src/common/app-error-codes';
@@ -28,6 +29,11 @@ const describePostgres = canRunPostgresE2e() ? describe : describe.skip;
 describePostgres('Note storage quota concurrency e2e', () => {
   let prisma: PrismaService;
   let jwt: JwtService;
+  // Sign with the auth SECRET explicitly: app.get(JwtService) can resolve a
+  // different JwtModule instance (e.g. temp-chat's, keyed on a secret CI never
+  // sets), so relying on the module default yields "secretOrPrivateKey must
+  // have a value" and forges tokens the auth strategy would reject anyway.
+  let jwtSecret: string;
 
   const createUser = async (label: string) => {
     const id = randomUUID();
@@ -51,7 +57,7 @@ describePostgres('Note storage quota concurrency e2e', () => {
         role: 'USER',
         aud: 'APP',
       },
-      { expiresIn: '5m' },
+      { secret: jwtSecret, expiresIn: '5m' },
     );
 
   const createRequest = (token: string, title: string) =>
@@ -84,6 +90,7 @@ describePostgres('Note storage quota concurrency e2e', () => {
     const app = getE2eApp();
     prisma = app.get(PrismaService);
     jwt = app.get(JwtService);
+    jwtSecret = app.get(ConfigService).get<string>('SECRET') ?? '';
     // Enforce the regular-tier note quota (50): while the rollout is disabled
     // the marketing floor (gold, 500 notes) applies and 49 notes never hit the
     // cap, so no parallel create would be rejected.
