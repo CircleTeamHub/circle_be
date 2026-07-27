@@ -569,7 +569,7 @@ describe('IconService', () => {
 
       const [sql] = prisma.$queryRaw.mock.calls[0];
       const query = sql.join('?');
-      expect(query).toContain('member."role" IN (\'OWNER\', \'ADMIN\')');
+      expect(query).toContain("member.\"role\" IN ('OWNER', 'ADMIN')");
       expect(query).toContain('circle."memberCount" >');
     });
 
