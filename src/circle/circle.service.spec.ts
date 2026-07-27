@@ -46,6 +46,7 @@ describe('CircleService', () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       findMany: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
       create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
@@ -438,8 +439,9 @@ describe('CircleService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  // level 0（普通 / 已过期）在 enforcement 开启时不能建圈（见下方 rejects 用例），故容量参数化
+  // 只覆盖可建圈的付费档 1-4。
   const membershipTiers = [
-    { level: 0, capacity: 100 },
     { level: 1, capacity: 200 },
     { level: 2, capacity: 400 },
     { level: 3, capacity: 1000 },
@@ -553,32 +555,63 @@ describe('CircleService', () => {
     },
   );
 
-  it('falls back to regular capacity when a paid membership is expired', async () => {
+  it('rejects a regular (level 0) creator while the rollout is enabled', async () => {
     prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 3,
-      vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      vipLevel: 0,
+      vipExpiresAt: null,
     });
-    prisma.circle.create.mockResolvedValue(circleRecord(100));
 
-    await service.createCircle('user-1', validCircle());
-
-    expect(prisma.circle.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({ maxMembers: 100 }),
+    await expect(
+      service.createCircle('user-1', validCircle()),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_VIP_REQUIRED' },
     });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
   });
 
-  it('rejects expired paid membership above regular capacity', async () => {
+  it('rejects an expired paid membership (effective level 0) from creating a circle', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
       vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
     });
 
     await expect(
-      service.createCircle('user-1', validCircle(101)),
+      service.createCircle('user-1', validCircle()),
     ).rejects.toMatchObject({
-      response: { errorCode: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED' },
+      response: { errorCode: 'CIRCLE_VIP_REQUIRED' },
     });
     expect(prisma.circle.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects circle creation when the creator is at their joined-circle quota', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    // 白银 joinedCircles = 200；已达上限（含拥有的圈子一起计数）→ 建圈应被拒，否则可无限建。
+    prisma.circleMember.count.mockResolvedValue(200);
+
+    await expect(
+      service.createCircle('user-1', validCircle()),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED' },
+    });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
+  });
+
+  it('allows circle creation when the creator is one below their joined-circle quota', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    prisma.circleMember.count.mockResolvedValue(199);
+    prisma.circle.create.mockResolvedValue(circleRecord(200));
+
+    await service.createCircle('user-1', validCircle());
+
+    expect(prisma.circle.create).toHaveBeenCalled();
   });
 
   it('stores legacy joinVipRestriction zero as no restriction', async () => {
@@ -640,19 +673,20 @@ describe('CircleService', () => {
     expect(prisma.circleMember.create).not.toHaveBeenCalled();
   });
 
-  it('uses the creator effective regular level after paid membership expiry', async () => {
+  it('rejects an expired creator before evaluating join VIP restriction (gate fires first)', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
       vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
     });
 
+    // 过期 → 有效档 0 → 会员门禁(CIRCLE_VIP_REQUIRED)先于 joinVipRestriction 校验触发。
     await expect(
       service.createCircle('user-1', {
         ...validCircle(),
         joinVipRestriction: 1,
       }),
     ).rejects.toMatchObject({
-      response: { errorCode: 'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR' },
+      response: { errorCode: 'CIRCLE_VIP_REQUIRED' },
     });
     expect(prisma.circle.create).not.toHaveBeenCalled();
   });

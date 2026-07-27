@@ -392,6 +392,17 @@ test_irreversible_migration_failure_restores_old_binary() {
   assert_contract_probe_ran && assert_running circle_be
 }
 
+test_irreversible_migration_failure_restores_schema_floor_when_unapplied() {
+  prepare_irreversible_case
+  # 发布前无 floor(=0)。发布把它抬高到 RELEASE_SCHEMA_COMPATIBILITY 后，迁移失败且合约证明
+  # 「未应用」→ 既重启旧版本，也要把 floor 原子恢复到发布前（此处 = 删除该文件）。否则被抬高
+  # 的 floor 会一直卡着，后续任何旧版本的 redeploy/rollback 都被 launcher 永久拒绝。
+  MIGRATE_FAIL=1
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_running circle_be || return 1
+  [ ! -e "$RELEASE_STATE_DIR/minimum-schema-compatibility" ]
+}
+
 test_irreversible_post_commit_cli_failure_stays_in_maintenance() {
   prepare_irreversible_case
   MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=both
@@ -463,6 +474,7 @@ for test_name in \
   test_release_cannot_understate_checked_out_schema_compatibility \
   test_irreversible_release_records_minimum_schema_compatibility \
   test_irreversible_migration_failure_restores_old_binary \
+  test_irreversible_migration_failure_restores_schema_floor_when_unapplied \
   test_irreversible_post_commit_cli_failure_stays_in_maintenance \
   test_irreversible_partial_contract_probe_stays_in_maintenance \
   test_irreversible_contract_probe_error_stays_in_maintenance \

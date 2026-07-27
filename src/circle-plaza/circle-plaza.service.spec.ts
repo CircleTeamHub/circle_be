@@ -552,6 +552,62 @@ describe('CirclePlazaService', () => {
       );
       expect(result.items[0].author.displayIcons).toEqual(displayIcons);
       expect(result.items[0].author.vipLevel).toBe(3);
+      // 作者的稳定会员外观也随 feed 下发,客户端无需复刻档位规则即可渲染钻石身份。
+      expect(result.items[0].author.membership).toMatchObject({
+        effectiveLevel: 3,
+        key: 'diamond',
+      });
+    });
+
+    it('maps an expired author to the regular membership appearance in the feed', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([
+        {
+          id: 'post-1',
+          content: 'hello',
+          type: 'ACTIVITY',
+          circleID: 'circle-1',
+          city: null,
+          cities: [],
+          isHorn: false,
+          noteID: null,
+          vipRestriction: null,
+          creditRestriction: null,
+          fancyRestriction: false,
+          viewCount: 0,
+          signupCount: 0,
+          signupVipRestriction: null,
+          signupCreditRestriction: null,
+          signupFancyRestriction: false,
+          createdAt: new Date('2026-06-29T00:00:00.000Z'),
+          author: {
+            id: 'author-1',
+            nickname: 'Author',
+            avatarUrl: null,
+            avatarFrame: null,
+            accountId: '1001',
+            // 存储档位是钻石(3),但已过期 → 有效档位降为 0(普通),外观应随之为 regular。
+            vipLevel: 3,
+            vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+          },
+          circle: { id: 'circle-1', name: 'Circle' },
+        },
+      ]);
+      prisma.circlePost.count.mockResolvedValue(1);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        creditScore: 100,
+        fancyNumber: false,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getFeed('viewer-1', {});
+
+      expect(result.items[0].author.vipLevel).toBe(0);
+      expect(result.items[0].author.membership).toMatchObject({
+        effectiveLevel: 0,
+        key: 'regular',
+      });
     });
 
     it('keyset mode (cursor): no skip, no count(), fetches limit+1 with the tuple predicate', async () => {

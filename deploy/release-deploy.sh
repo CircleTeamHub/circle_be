@@ -72,7 +72,9 @@ if (( RELEASE_SCHEMA_COMPATIBILITY != checked_out_schema_compatibility )); then
   exit 1
 fi
 minimum_schema_compatibility=0
+minimum_schema_compatibility_existed=0
 if [ -e "$MINIMUM_SCHEMA_COMPATIBILITY_PATH" ]; then
+  minimum_schema_compatibility_existed=1
   minimum_schema_compatibility="$(cat "$MINIMUM_SCHEMA_COMPATIBILITY_PATH")"
   if [[ ! "$minimum_schema_compatibility" =~ ^[0-9]+$ ]]; then
     echo "Invalid server schema boundary: $MINIMUM_SCHEMA_COMPATIBILITY_PATH" >&2
@@ -148,6 +150,21 @@ persist_minimum_schema_compatibility() {
   temp="$MINIMUM_SCHEMA_COMPATIBILITY_PATH.tmp.$$"
   printf '%s\n' "$target" > "$temp"
   mv -f "$temp" "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"
+}
+
+# 迁移被证明未应用（DB 仍是发布前的旧 schema）时，把发布前抬高的 floor 原子恢复到发布前的
+# 值。否则被抬高的 floor 会一直卡着：后续任何旧版本的 redeploy/rollback 都会被 launcher 以
+# 「低于 server 最低兼容」永久拒绝，直到运维手工改状态文件。发布前不存在则删掉该文件还原。
+restore_minimum_schema_compatibility_floor() {
+  local temp
+  if [ "$minimum_schema_compatibility_existed" = "1" ]; then
+    mkdir -p "$RELEASE_STATE_DIR"
+    temp="$MINIMUM_SCHEMA_COMPATIBILITY_PATH.tmp.$$"
+    printf '%s\n' "$minimum_schema_compatibility" > "$temp"
+    mv -f "$temp" "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"
+  else
+    rm -f "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"
+  fi
 }
 
 switch_proxy() {
@@ -370,7 +387,8 @@ handle_irreversible_migration_command_failure() {
   contract_state="$(probe_irreversible_contract_state)"
   case "$contract_state" in
     unapplied)
-      echo "Irreversible contract is proven unapplied; restoring the previous binary." >&2
+      echo "Irreversible contract is proven unapplied; restoring the previous binary and the pre-release schema floor." >&2
+      restore_minimum_schema_compatibility_floor || true
       restore_live || true
       ;;
     applied)

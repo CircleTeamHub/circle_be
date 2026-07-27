@@ -102,12 +102,12 @@ describe('CircleAdmissionPolicy', () => {
         policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
       ).resolves.toEqual(['candidate-1']);
 
+      // joinedCircles 计全部 ACTIVE 成员（拥有 + 加入），不再排除 OWNER —— 与建圈路径一致。
       expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
         by: ['userID'],
         where: {
           userID: { in: ['candidate-1'] },
           status: 'ACTIVE',
-          role: { not: 'OWNER' },
         },
         _count: { _all: true },
       });

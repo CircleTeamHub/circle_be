@@ -24,6 +24,7 @@ import {
   MembershipLevel,
   resolveEffectiveMembershipLevel,
 } from 'src/membership/membership.catalog';
+import { toPublicMembershipAppearance } from 'src/membership/membership-appearance';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
   decodeFeedCursor,
@@ -1657,6 +1658,12 @@ export class CirclePlazaService {
         avatarFrame: post.author.avatarFrame,
         accountId: post.author.accountId,
         vipLevel: resolveEffectiveMembershipLevel({
+          vipLevel: post.author.vipLevel ?? 0,
+          vipExpiresAt: post.author.vipExpiresAt ?? null,
+        }),
+        // 除了有效档位，还下发稳定的会员外观（tier key / 名字色 / 徽章），客户端据此渲染银/金/
+        // 钻/流光身份，无需在端上复刻后端档位规则（按到期算，与 vipLevel 同一有效计算）。
+        membership: toPublicMembershipAppearance({
           vipLevel: post.author.vipLevel ?? 0,
           vipExpiresAt: post.author.vipExpiresAt ?? null,
         }),

@@ -102,6 +102,34 @@ export class CircleService {
         tx,
         new Date(),
       );
+
+      // 非会员（有效档 0：普通 / 已过期）不能建圈。resolveEntitlement 已应用 staged-rollout
+      // floor —— rollout 关闭期 level ≥ 2、此处不触发；仅 enforcement 开启且用户确为普通/过期
+      // 时拒绝，兑现「普通用户不可建群」的会员契约（旧实现即拒非 VIP，本次收口时漏补回）。
+      if (policy.level === 0) {
+        throw new ForbiddenException({
+          message: 'Membership is required to create a circle',
+          errorCode: CircleErrorCode.VipRequired,
+        });
+      }
+
+      // 建圈本身占用「已加入圈子」配额（写一条 ACTIVE OWNER 成员行）。在上面的 per-user 锁下统计
+      // 现有全部 ACTIVE 成员数，达到有效档位上限即拒绝，否则用户可无限建圈绕过配额（admission
+      // 路径已校验，create 路径此前漏了）。
+      const activeMemberships = await tx.circleMember.count({
+        where: { userID: userId, status: 'ACTIVE' },
+      });
+      const joinedLimit = policy.tier.quotas.joinedCircles.actual;
+      if (activeMemberships >= joinedLimit) {
+        throw new ForbiddenException({
+          message: 'Joined circle membership quota reached',
+          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
+          quota: 'joined-circles',
+          limit: joinedLimit,
+          details: { quota: 'joined-circles', limit: joinedLimit },
+        });
+      }
+
       const capacity = policy.tier.quotas.groupMembers.actual;
       const maxMembers = dto.maxMembers ?? capacity;
       if (maxMembers > capacity) {

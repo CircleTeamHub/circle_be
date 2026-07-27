@@ -16,6 +16,7 @@ import {
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
+import { PublicMembershipAppearanceDto } from 'src/user/dto/public-user.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -283,6 +284,10 @@ export class PlazaPostAuthorDto {
     description: '有效会员等级（名字特效渲染用，按到期算）；0 = 非会员',
   })
   vipLevel: number | null;
+
+  @ApiProperty({ type: PublicMembershipAppearanceDto })
+  @Type(() => PublicMembershipAppearanceDto)
+  membership: PublicMembershipAppearanceDto;
 
   @ApiProperty({ type: [DisplayIconDto] })
   displayIcons: DisplayIconDto[];

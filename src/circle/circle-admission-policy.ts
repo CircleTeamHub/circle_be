@@ -95,12 +95,14 @@ export class CircleAdmissionPolicy {
     );
     const now = new Date();
 
+    // joinedCircles 配额 = 用户当前全部 ACTIVE 圈子成员数（拥有 + 加入）。不排除 OWNER：否则
+    // 与建圈路径(circle.service 建圈按全部 ACTIVE 计数)语义不一致,且没有独立的「已创建群」配额时
+    // 拥有的圈子将不计入任何上限、可无限建。两条写路径统一按「全部成员」计。
     const joinedCounts = await tx.circleMember.groupBy({
       by: ['userID'],
       where: {
         userID: { in: activatingUserIDs },
         status: CircleMemberStatus.ACTIVE,
-        role: { not: CircleMemberRole.OWNER },
       },
       _count: { _all: true },
     });
