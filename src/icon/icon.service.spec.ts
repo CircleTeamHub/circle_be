@@ -529,11 +529,48 @@ describe('IconService', () => {
 
       await service.getDisplayIconsForUsers(['user-1', 'user-2']);
 
-      const [sql, , cap] = prisma.$queryRaw.mock.calls[0];
+      const [sql, ...params] = prisma.$queryRaw.mock.calls[0];
+      const cap = params.at(-1);
       expect(sql.join('?')).toContain('PARTITION BY');
       expect(cap).toBe(MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS);
       // Hydration is keyed by the capped ids, never by an unbounded user scan.
       expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('prioritizes persisted circle selections before applying the membership cap', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        verifiedUser({ id: 'user-1', email: null }),
+      ]);
+      privacySettings.getSettingsForUsers.mockResolvedValue(
+        new Map([['user-1', { ...DEFAULT_PRIVACY }]]),
+      );
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+      mockMemberships([]);
+
+      await service.getDisplayIconsForUsers(['user-1']);
+
+      const [sql] = prisma.$queryRaw.mock.calls[0];
+      const query = sql.join('?');
+      expect(query).toContain('LEFT JOIN "UserDisplayIcon" selection');
+      expect(query).toContain('(selection."id" IS NOT NULL) DESC');
+    });
+
+    it('prioritizes a qualifying circle-builder membership before applying the cap', async () => {
+      prisma.user.findMany.mockResolvedValue([
+        verifiedUser({ id: 'user-1', email: null }),
+      ]);
+      privacySettings.getSettingsForUsers.mockResolvedValue(
+        new Map([['user-1', { ...DEFAULT_PRIVACY }]]),
+      );
+      prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+      mockMemberships([]);
+
+      await service.getDisplayIconsForUsers(['user-1']);
+
+      const [sql] = prisma.$queryRaw.mock.calls[0];
+      const query = sql.join('?');
+      expect(query).toContain('member."role" IN (\'OWNER\', \'ADMIN\')');
+      expect(query).toContain('circle."memberCount" >');
     });
 
     it('applies the same cap on the single-user path', async () => {
@@ -558,7 +595,8 @@ describe('IconService', () => {
 
       await service.getDisplayIconsForUser('user-1');
 
-      const [, , cap] = prisma.$queryRaw.mock.calls[0];
+      const [, ...params] = prisma.$queryRaw.mock.calls[0];
+      const cap = params.at(-1);
       expect(cap).toBe(MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS);
       expect(prisma.circleMember.findMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: { in: ['member-a'] } } }),
