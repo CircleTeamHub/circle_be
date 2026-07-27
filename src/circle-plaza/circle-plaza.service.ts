@@ -891,6 +891,7 @@ export class CirclePlazaService {
           fancyNumber: viewer.fancyNumber,
         }
       : null;
+    this.assertSignupMembership(viewerEntitlements);
     if (!this.checkCanSignup(post, viewerEntitlements)) {
       throw new ForbiddenException({
         message: '您的等级不满足该帖子的报名要求',
@@ -947,6 +948,7 @@ export class CirclePlazaService {
                 fancyNumber: authoritativeViewer.fancyNumber,
               }
             : null;
+        this.assertSignupMembership(authoritativeEntitlements);
         if (!this.checkCanSignup(stillAuthorized, authoritativeEntitlements)) {
           throw new ForbiddenException({
             message: '您的等级不满足该帖子的报名要求',
@@ -1596,6 +1598,20 @@ export class CirclePlazaService {
       return false;
     }
     return true;
+  }
+
+  // Level 0 (regular/expired) is forbidden from the Plaza read paths (feed +
+  // detail both reject it with MembershipRequired), so it must not be able to
+  // sign up either — otherwise it writes a signup, bumps the counter, and
+  // notifies the author for content it can never view. A null (missing) viewer
+  // falls through to checkCanSignup's own rejection.
+  private assertSignupMembership(viewer: ViewerEntitlements | null): void {
+    if (viewer && viewer.membershipLevel === 0) {
+      throw new ForbiddenException({
+        message: 'Membership required to sign up for circle posts',
+        errorCode: PlazaErrorCode.MembershipRequired,
+      });
+    }
   }
 
   private checkCanSignup(

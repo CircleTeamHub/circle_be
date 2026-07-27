@@ -2502,9 +2502,17 @@ export class NoteService {
     }
     let result: { count: number };
     try {
-      result = await this.prisma.note.updateMany({
-        where: { id: noteId, ownerID, status: 'DELETED' },
-        data: { status: 'ACTIVE' },
+      result = await runSerializableTransaction(this.prisma, async (tx) => {
+        await this.membershipPolicy.lockUsers(tx, [ownerID]);
+        // Restoring a soft-deleted note re-consumes a storage slot, so it must
+        // pass the same quota gate as create/collect under the user lock —
+        // otherwise delete → create replacements → restore old ones grows past
+        // the cap, and concurrent restores could cross the boundary together.
+        await this.assertNoteStorageAvailable(tx, ownerID);
+        return tx.note.updateMany({
+          where: { id: noteId, ownerID, status: 'DELETED' },
+          data: { status: 'ACTIVE' },
+        });
       });
     } catch (error) {
       if (prismaErrorCode(error) === 'P2002') {

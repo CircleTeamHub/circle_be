@@ -119,6 +119,44 @@ describe('CirclePlaza signup membership e2e', () => {
     });
   });
 
+  it('rejects a level-0 signer before any signup, counter change, or notification', async () => {
+    // Rollout enabled → a regular signer resolves to effective level 0 (no gold
+    // marketing floor). Feed and detail forbid level 0, so signup must too, or
+    // the caller writes a signup for content it can never view.
+    await prisma.membershipProgramState.upsert({
+      where: { id: 1 },
+      update: { enabledAt: new Date() },
+      create: { id: 1, enabledAt: new Date() },
+    });
+    await prisma.circleMember.create({
+      data: {
+        userID: signerId,
+        circleID: secondaryCircleId,
+        status: CircleMemberStatus.ACTIVE,
+      },
+    });
+    const notifySpy = getE2eApp().get(NotificationService)
+      .createCirclePostSignupNotification as jest.Mock;
+
+    await expect(service.signupForPost(signerId, postId)).rejects.toMatchObject(
+      {
+        response: { errorCode: PlazaErrorCode.MembershipRequired },
+      },
+    );
+    await expect(
+      prisma.circlePostSignup.count({
+        where: { postID: postId, userID: signerId },
+      }),
+    ).resolves.toBe(0);
+    await expect(
+      prisma.circlePost.findUnique({
+        where: { id: postId },
+        select: { signupCount: true },
+      }),
+    ).resolves.toMatchObject({ signupCount: 0 });
+    expect(notifySpy).not.toHaveBeenCalled();
+  });
+
   it.each([CircleMemberStatus.PENDING, CircleMemberStatus.REJECTED] as const)(
     'rejects %s membership',
     async (status) => {
