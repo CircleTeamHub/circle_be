@@ -534,12 +534,14 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Loads each user's newest active memberships, capped per user. Prisma's
+   * Loads each user's relevant active memberships, capped per user. Prisma's
    * `take` can only bound a whole findMany, which would let one power user
    * consume a batch's entire budget, so the cap is applied with a window
    * function and the rows are then hydrated through the shared typed select.
-   * Both the single-user and batch paths go through here so the cap cannot
-   * drift between them.
+   * Persisted circle selections and qualifying Circle Builder memberships sort
+   * ahead of newer ordinary memberships, so pagination cannot make a
+   * valid saved icon look stale or hide that system badge. Both the single-user
+   * and batch paths go through here so the cap cannot drift between them.
    */
   private async fetchEligibilityMemberships(
     userIds: string[],
@@ -553,10 +555,24 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
         SELECT member."id",
                ROW_NUMBER() OVER (
                  PARTITION BY member."userID"
-                 ORDER BY member."createdAt" DESC, member."id" DESC
+                 ORDER BY
+                   (selection."id" IS NOT NULL) DESC,
+                   (
+                     member."role" IN ('OWNER', 'ADMIN')
+                     AND circle."memberCount" > ${CIRCLE_BUILDER_MIN_MEMBERS}
+                     AND circle."createdAt" <= CURRENT_TIMESTAMP - make_interval(
+                       secs => ${Math.floor(CIRCLE_BUILDER_MIN_AGE_MS / 1000)}
+                     )
+                   ) DESC,
+                   member."createdAt" DESC,
+                   member."id" DESC
                ) AS rn
         FROM "CircleMember" member
         JOIN "Circle" circle ON circle."id" = member."circleID"
+        LEFT JOIN "UserDisplayIcon" selection
+          ON selection."userID" = member."userID"
+         AND selection."circleID" = member."circleID"
+         AND selection."displayType" = 'CIRCLE'
         WHERE member."userID" = ANY(ARRAY[${Prisma.join(userIds)}]::text[])
           AND member."status" = 'ACTIVE'
           AND circle."deleted" = false
