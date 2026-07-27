@@ -25,9 +25,9 @@ describe('reserveCircleSeats', () => {
       $queryRaw: jest.fn().mockResolvedValue([{ id: 'circle-1' }]),
     };
 
-    await expect(reserveCircleSeats(tx as any, 'circle-1', 1, 50)).resolves.toBe(
-      true,
-    );
+    await expect(
+      reserveCircleSeats(tx as any, 'circle-1', 1, 50),
+    ).resolves.toBe(true);
     // ownerCapacity 作为独立上限并入 WHERE（末位插值），legacy null maxMembers 也被它封顶。
     const values = tx.$queryRaw.mock.calls[0].slice(1);
     expect(values[values.length - 1]).toBe(50);

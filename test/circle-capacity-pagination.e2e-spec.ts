@@ -65,10 +65,9 @@ describe('Circle capacity and invitation pagination e2e', () => {
           release();
         }
         await bothMembershipWritesReady;
-        // 该用例只验 maxMembers 容量：给足够大的 ownerCapacity 使其不参与限制。
-        if (
-          !(await reserveCircleSeats(tx, circleId, 1, Number.MAX_SAFE_INTEGER))
-        ) {
+        // 该用例只验 maxMembers 容量：ownerCapacity 给一个远超任何圈子规模、且落在 int4 范围内
+        // 的值使其不参与限制（Number.MAX_SAFE_INTEGER 会溢出 memberCount 的 integer 列）。
+        if (!(await reserveCircleSeats(tx, circleId, 1, 1_000_000))) {
           throw new Error('member limit');
         }
       });
