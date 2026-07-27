@@ -112,7 +112,10 @@ export class CreditService {
     // approval) calls this after its transaction commits. Invalidate the cached
     // profile summary first (synchronous, immediate) then broadcast the change.
     await this.realtimeService.safeBroadcastAll([
-      () => this.realtimeService.invalidateUserProfileSummaryCache(userId),
+      // 失效方法现返回 boolean（供会员发放路径复检）；credit 这里不关心结果，包一层丢弃成 void。
+      async () => {
+        await this.realtimeService.invalidateUserProfileSummaryCache(userId);
+      },
       () => this.realtimeService.broadcastUserProfileSummary(userId),
     ]);
   }

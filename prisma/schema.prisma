@@ -281,6 +281,11 @@ enum CallEndReason {
   ERROR
 }
 
+enum MembershipBenefitType {
+  STANDARD_FANCY_NUMBER
+  PREMIUM_FANCY_NUMBER
+}
+
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
@@ -314,6 +319,7 @@ model User {
   role                       UserRole   @default(USER)
   status                     UserStatus @default(ACTIVE)
   vipLevel                   Int        @default(0)
+  vipExpiresAt               DateTime?
   creditScore                Int        @default(100)
   fancyNumber                Boolean    @default(false)
   iconPreferencesInitialized Boolean    @default(false)
@@ -380,9 +386,56 @@ model User {
   callSessionsInitiated             CallSession[]               @relation("callInitiator")
   callParticipants                  CallParticipant[]
   profileSyncOutbox                 UserProfileSyncOutbox?
+  membershipGrantsReceived          MembershipGrant[]           @relation("membershipGrantTarget")
+  membershipGrantsIssued            MembershipGrant[]           @relation("membershipGrantOperator")
+  membershipBenefitGrants           MembershipBenefitGrant[]
   sessionRevocationOutbox           SessionRevocationOutbox?
 
   @@index([invitedByUserId])
+}
+
+model MembershipGrant {
+  id                String    @id @default(uuid())
+  idempotencyKey    String    @unique
+  targetUserID      String
+  operatorUserID    String
+  previousLevel     Int
+  previousEffectiveLevel Int
+  newLevel          Int
+  previousExpiresAt DateTime?
+  newExpiresAt      DateTime?
+  benefitTypesSnapshot   MembershipBenefitType[] @default([])
+  note              String?
+  createdAt         DateTime  @default(now())
+
+  targetUser    User                     @relation("membershipGrantTarget", fields: [targetUserID], references: [id], onDelete: Restrict)
+  operatorUser  User                     @relation("membershipGrantOperator", fields: [operatorUserID], references: [id], onDelete: Restrict)
+  benefitGrants MembershipBenefitGrant[]
+
+  @@index([targetUserID, createdAt])
+  @@index([operatorUserID, createdAt])
+}
+
+model MembershipProgramState {
+  id              Int       @id
+  enabledAt       DateTime?
+  enabledByUserId String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @default(now()) @updatedAt
+}
+
+model MembershipBenefitGrant {
+  id                String                @id @default(uuid())
+  userID            String
+  membershipGrantID String
+  type              MembershipBenefitType
+  createdAt         DateTime              @default(now())
+
+  user            User            @relation(fields: [userID], references: [id], onDelete: Restrict)
+  membershipGrant MembershipGrant @relation(fields: [membershipGrantID], references: [id], onDelete: Restrict)
+
+  @@unique([userID, type])
+  @@index([membershipGrantID])
 }
 
 model UserProfileSyncOutbox {
@@ -618,19 +671,23 @@ model CreditEvent {
 }
 
 model GroupSyncOutbox {
-  id            String             @id @default(uuid())
-  operation     GroupSyncOperation
-  status        GroupSyncStatus    @default(PENDING)
-  groupID       String
-  userID        String
-  attempts      Int                @default(0)
-  lastError     String?
-  nextAttemptAt DateTime           @default(now())
-  lockedAt      DateTime?
-  processedAt   DateTime?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+  id                   String              @id @default(uuid())
+  operation            GroupSyncOperation
+  generation           Int                 @default(1)
+  processingGeneration Int?
+  processingOperation  GroupSyncOperation?
+  status               GroupSyncStatus     @default(PENDING)
+  groupID              String
+  userID               String
+  attempts             Int                 @default(0)
+  lastError            String?
+  nextAttemptAt        DateTime            @default(now())
+  lockedAt             DateTime?
+  processedAt          DateTime?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
 
+  @@unique([groupID, userID], map: "GroupSyncOutbox_desired_state_key")
   @@index([status, nextAttemptAt])
   @@index([groupID, userID, status])
 }

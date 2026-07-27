@@ -38,10 +38,13 @@ export const CoinErrorCode = {
 export const MembershipErrorCode = {
   InvalidLevel: 'MEMBERSHIP_INVALID_LEVEL',
   LevelNotHigher: 'MEMBERSHIP_LEVEL_NOT_HIGHER',
+  IdempotencyConflict: 'MEMBERSHIP_IDEMPOTENCY_CONFLICT',
   InsufficientPoints: 'MEMBERSHIP_INSUFFICIENT_POINTS',
   UserNotFound: 'MEMBERSHIP_USER_NOT_FOUND',
   // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
   IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
+  GroupMemberCapacityExceeded: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED',
+  JoinedCircleQuotaReached: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
 } as const;
 
 export const CircleErrorCode = {
@@ -60,6 +63,8 @@ export const CircleErrorCode = {
   JoinVipRequired: 'CIRCLE_JOIN_VIP_REQUIRED',
   JoinCreditRequired: 'CIRCLE_JOIN_CREDIT_REQUIRED',
   JoinFancyNumberRequired: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED',
+  JoinVipRestrictionExceedsCreator:
+    'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR',
   ListItemBlank: 'CIRCLE_LIST_ITEM_BLANK',
   ListItemDuplicate: 'CIRCLE_LIST_ITEM_DUPLICATE',
   InvalidCursor: 'CIRCLE_INVALID_CURSOR',
@@ -110,6 +115,7 @@ export const TempChatErrorCode = {
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
 // 圈子不存在复用 CircleErrorCode.NotFound。图片必须来自本站存储是内部安全护栏,不打码。
 export const PlazaErrorCode = {
+  MembershipRequired: 'PLAZA_MEMBERSHIP_REQUIRED',
   NotActiveMember: 'PLAZA_NOT_ACTIVE_MEMBER',
   AdminOnlyPost: 'PLAZA_ADMIN_ONLY_POST',
   NoteInvalid: 'PLAZA_NOTE_INVALID',
@@ -128,6 +134,8 @@ export const PlazaErrorCode = {
   ReportSelf: 'PLAZA_REPORT_SELF',
   NotCircleMember: 'PLAZA_NOT_CIRCLE_MEMBER',
   InvalidCursor: 'PLAZA_INVALID_CURSOR',
+  CityFilterQuotaReached: 'CITY_FILTER_QUOTA_REACHED',
+  VipRestrictionExceedsAuthor: 'PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR',
 } as const;
 
 // 朋友圈动态(moments):动态/评论不存在、仅作者可删、无权访问(隐私/好友可见)。
@@ -173,6 +181,7 @@ export const FriendErrorCode = {
 // 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。
 // 上限类原文含数字,前端用固定文案。
 export const NoteErrorCode = {
+  StorageQuotaReached: 'NOTE_STORAGE_QUOTA_REACHED',
   GroupExists: 'NOTE_GROUP_EXISTS',
   GroupLimit: 'NOTE_GROUP_LIMIT',
   ExportNoMedia: 'NOTE_EXPORT_NO_MEDIA',

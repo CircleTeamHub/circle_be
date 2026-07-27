@@ -13,7 +13,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME MIGRATE_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -43,7 +43,10 @@ if [ "${1:-}" = "compose" ]; then
   case "$subcommand" in
     ps)
       service="$(last_arg "$@")"
-      if [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
+      if [ "${HEALTH_FAIL:-0}" = "1" ] && [ "$service" != "circle_be" ] &&
+        ! printf '%s\n' "$*" | grep -q -- '--status running'; then
+        :
+      elif [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
         printf 'cid-%s\n' "$service"
       fi
       ;;
@@ -52,8 +55,13 @@ if [ "${1:-}" = "compose" ]; then
       service="$(last_arg "$@")"
       printf 'stopped\n' > "$(service_file "$service")"
       ;;
-    start|up)
+    start)
       service="$(last_arg "$@")"
+      printf 'running\n' > "$(service_file "$service")"
+      ;;
+    up)
+      service="$(last_arg "$@")"
+      [ "${START_FAIL:-0}" != "1" ] || exit 41
       printf 'running\n' > "$(service_file "$service")"
       ;;
     rm)
@@ -61,7 +69,17 @@ if [ "${1:-}" = "compose" ]; then
       rm -f "$(service_file "$service")"
       ;;
     run)
-      [ "${MIGRATE_FAIL:-0}" != "1" ] || exit 42
+      if printf '%s\n' "$*" | grep -q 'User_vipLevel_check'; then
+        case "${CONTRACT_PROBE_STATE:-none}" in
+          none) printf '0\n' ;;
+          both) printf '4\n' ;;
+          partial) printf '1\n' ;;
+          error) exit 45 ;;
+          *) exit 46 ;;
+        esac
+      else
+        [ "${MIGRATE_FAIL:-0}" != "1" ] || exit 42
+      fi
       ;;
     exec)
       if [ -n "${CADDY_RELOAD_FAIL_TARGET:-}" ] &&
@@ -89,7 +107,9 @@ if [ "${1:-}" = "inspect" ]; then
     esac
     exit 0
   fi
-  if [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
+  if [ "${HEALTH_FAIL:-0}" = "1" ] && [ "$service" != "circle_be" ]; then
+    printf 'starting\n'
+  elif [ "$(cat "$(service_file "$service")" 2>/dev/null || true)" = "running" ]; then
     printf 'healthy\n'
   else
     printf 'unknown\n'
@@ -152,9 +172,17 @@ run_release() {
   PATH="$CASE_DIR/bin:$PATH" \
     REAL_MV="$REAL_MV" \
     RELEASE_TAG=v1.2.3 \
+    RELEASE_LAUNCHER_ACTIVE=1 \
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \
+    RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
+    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-1}" \
+    SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
+    RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
+    CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
+    START_FAIL="${START_FAIL:-0}" \
+    HEALTH_FAIL="${HEALTH_FAIL:-0}" \
     SMOKE_CODE="${SMOKE_CODE:-401}" \
     SMOKE_CONTENT_TYPE="${SMOKE_CONTENT_TYPE:-application/json}" \
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
@@ -201,6 +229,14 @@ assert_command_before() {
     cat "$TEST_COMMAND_LOG" >&2
     return 1
   fi
+}
+
+assert_contract_probe_ran() {
+  grep -q 'User_vipLevel_check' "$TEST_COMMAND_LOG" || {
+    echo "expected the target membership contract probe to run" >&2
+    cat "$TEST_COMMAND_LOG" >&2
+    return 1
+  }
 }
 
 test_migration_failure_restores_downtime_live_color() {
@@ -284,6 +320,145 @@ test_state_write_failure_rolls_proxy_back_before_cleanup() {
     assert_absent circle_be_green
 }
 
+assert_not_restarted() {
+  ! grep -q 'start circle_be' "$TEST_COMMAND_LOG" || {
+    echo "expected previous circle_be binary not to restart" >&2
+    cat "$TEST_COMMAND_LOG" >&2
+    return 1
+  }
+}
+
+assert_maintenance() {
+  [ "$(cat "$TEST_STATE_DIR/circle_be" 2>/dev/null || true)" != "running" ] &&
+    [ "$(cat "$TEST_STATE_DIR/circle_be_green" 2>/dev/null || true)" != "running" ] || {
+      echo "expected both app colors to remain stopped for maintenance" >&2
+      cat "$TEST_COMMAND_LOG" >&2
+      return 1
+    }
+}
+
+prepare_irreversible_case() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  RELEASE_DOWNTIME=1
+  RELEASE_IRREVERSIBLE_MIGRATION=1
+}
+
+test_irreversible_confirmation_requires_downtime() {
+  new_case
+  RELEASE_DOWNTIME=0 RELEASE_IRREVERSIBLE_MIGRATION=1
+  ! run_release || return 1
+  grep -q 'requires RELEASE_DOWNTIME=1' "$CASE_DIR/release.log"
+}
+
+test_marker_requires_irreversible_confirmation() {
+  new_case
+  RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=0
+  RELEASE_MARKER_PATH="$ROOT_DIR/deploy/REQUIRES_IRREVERSIBLE_MIGRATION"
+  ! run_release || return 1
+  grep -q 'requires RELEASE_IRREVERSIBLE_MIGRATION=1' "$CASE_DIR/release.log"
+}
+
+test_pre_marker_release_is_rejected_after_boundary_is_recorded() {
+  new_case
+  printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
+  RELEASE_SCHEMA_COMPATIBILITY=0
+  SCHEMA_COMPATIBILITY_PATH="$CASE_DIR/no-schema-compatibility"
+  ! run_release || return 1
+  grep -q 'schema compatibility 0 is below server minimum 1' "$CASE_DIR/release.log" &&
+    [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
+test_release_cannot_understate_checked_out_schema_compatibility() {
+  new_case
+  RELEASE_SCHEMA_COMPATIBILITY=0
+  ! run_release || return 1
+  grep -q 'does not match checked-out schema compatibility 1' "$CASE_DIR/release.log" &&
+    [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
+test_irreversible_release_records_minimum_schema_compatibility() {
+  prepare_irreversible_case
+  run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "1" ]
+}
+
+test_irreversible_migration_failure_restores_old_binary() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_running circle_be
+}
+
+test_irreversible_migration_failure_restores_schema_floor_when_unapplied() {
+  prepare_irreversible_case
+  # 发布前无 floor(=0)。发布把它抬高到 RELEASE_SCHEMA_COMPATIBILITY 后，迁移失败且合约证明
+  # 「未应用」→ 既重启旧版本，也要把 floor 原子恢复到发布前（此处 = 删除该文件）。否则被抬高
+  # 的 floor 会一直卡着，后续任何旧版本的 redeploy/rollback 都被 launcher 永久拒绝。
+  MIGRATE_FAIL=1
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_running circle_be || return 1
+  [ ! -e "$RELEASE_STATE_DIR/minimum-schema-compatibility" ]
+}
+
+test_irreversible_post_commit_cli_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=both
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_partial_contract_probe_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=partial
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_contract_probe_error_stays_in_maintenance() {
+  prepare_irreversible_case
+  MIGRATE_FAIL=1 CONTRACT_PROBE_STATE=error
+  ! run_release || return 1
+  assert_contract_probe_ran && assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_startup_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  START_FAIL=1
+  ! run_release || return 1
+  assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_health_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  HEALTH_FAIL=1
+  ! run_release || return 1
+  assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_proxy_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  CADDY_RELOAD_FAIL_TARGET=circle-be-green:3000
+  ! run_release || return 1
+  assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_state_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  PERSIST_FAIL_COLOR=circle_be_green
+  ! run_release || return 1
+  assert_maintenance && assert_not_restarted
+}
+
+test_irreversible_smoke_failure_stays_in_maintenance() {
+  prepare_irreversible_case
+  SMOKE_CODE=500
+  ! run_release || return 1
+  assert_maintenance && assert_not_restarted
+}
+
 failures=0
 for test_name in \
   test_migration_failure_restores_downtime_live_color \
@@ -292,7 +467,22 @@ for test_name in \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \
-  test_state_write_failure_rolls_proxy_back_before_cleanup; do
+  test_state_write_failure_rolls_proxy_back_before_cleanup \
+  test_irreversible_confirmation_requires_downtime \
+  test_marker_requires_irreversible_confirmation \
+  test_pre_marker_release_is_rejected_after_boundary_is_recorded \
+  test_release_cannot_understate_checked_out_schema_compatibility \
+  test_irreversible_release_records_minimum_schema_compatibility \
+  test_irreversible_migration_failure_restores_old_binary \
+  test_irreversible_migration_failure_restores_schema_floor_when_unapplied \
+  test_irreversible_post_commit_cli_failure_stays_in_maintenance \
+  test_irreversible_partial_contract_probe_stays_in_maintenance \
+  test_irreversible_contract_probe_error_stays_in_maintenance \
+  test_irreversible_startup_failure_stays_in_maintenance \
+  test_irreversible_health_failure_stays_in_maintenance \
+  test_irreversible_proxy_failure_stays_in_maintenance \
+  test_irreversible_state_failure_stays_in_maintenance \
+  test_irreversible_smoke_failure_stays_in_maintenance; do
   if "$test_name"; then
     echo "PASS $test_name"
   else

@@ -2,6 +2,46 @@ import { Expose, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 
+export class MembershipNameAppearanceDto {
+  @ApiProperty({
+    enum: ['default', 'silver', 'gold', 'rainbow', 'exclusive-shimmer'],
+  })
+  @Expose()
+  nameColor: string;
+
+  @ApiPropertyOptional({
+    enum: ['silver', 'gold', 'diamond', 'super-lifetime'],
+    nullable: true,
+  })
+  @Expose()
+  badge: string | null;
+}
+
+export class PublicMembershipAppearanceDto {
+  @ApiProperty({ example: 3, minimum: 0, maximum: 4 })
+  @Expose()
+  effectiveLevel: number;
+
+  @ApiProperty({ enum: ['regular', 'silver', 'gold', 'diamond', 'super'] })
+  @Expose()
+  key: string;
+
+  @ApiProperty({ type: MembershipNameAppearanceDto })
+  @Expose()
+  @Type(() => MembershipNameAppearanceDto)
+  appearance: MembershipNameAppearanceDto;
+}
+
+export class SelfMembershipAppearanceDto extends PublicMembershipAppearanceDto {
+  @ApiProperty()
+  @Expose()
+  active: boolean;
+
+  @ApiProperty()
+  @Expose()
+  lifetime: boolean;
+}
+
 /** Safe public profile — no PII. Used for GET /user/:id viewed by other users. */
 export class PublicUserDto {
   @ApiProperty({ example: '7f6dcb5e-0d94-463c-b6b3-165b1aa77845' })
@@ -88,6 +128,20 @@ export class PublicUserDto {
   @Expose()
   @Type(() => DisplayIconDto)
   displayIcons: DisplayIconDto[];
+
+  @ApiProperty({
+    example: 3,
+    minimum: 0,
+    maximum: 4,
+    description: 'Effective public membership level for display.',
+  })
+  @Expose()
+  vipLevel: number;
+
+  @ApiProperty({ type: PublicMembershipAppearanceDto })
+  @Expose()
+  @Type(() => PublicMembershipAppearanceDto)
+  membership: PublicMembershipAppearanceDto;
 }
 
 /**
@@ -109,7 +163,16 @@ export class SelfUserDto extends PublicUserDto {
 
   @ApiProperty({ example: 3 })
   @Expose()
-  vipLevel: number;
+  storedVipLevel: number;
+
+  @ApiPropertyOptional({ example: '2026-08-22T00:00:00.000Z', nullable: true })
+  @Expose()
+  vipExpiresAt: Date | null;
+
+  @ApiProperty({ type: SelfMembershipAppearanceDto })
+  @Expose()
+  @Type(() => SelfMembershipAppearanceDto)
+  declare membership: SelfMembershipAppearanceDto;
 
   @ApiProperty({ example: 100 })
   @Expose()

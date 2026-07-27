@@ -716,7 +716,8 @@ describe('AuthService', () => {
     );
   });
 
-  it('loads city, VIP level, and credit score in the self profile response', async () => {
+  it('returns stored and effective membership state in the self profile response', async () => {
+    const vipExpiresAt = new Date(Date.now() - 1);
     users.push({
       id: 'uuid-1',
       accountId: 'testuser',
@@ -735,6 +736,7 @@ describe('AuthService', () => {
       gender: 'male',
       city: '杭州',
       vipLevel: 3,
+      vipExpiresAt,
       creditScore: 128,
       role: 'USER',
       status: 'ACTIVE',
@@ -751,6 +753,7 @@ describe('AuthService', () => {
       select: expect.objectContaining({
         city: true,
         vipLevel: true,
+        vipExpiresAt: true,
         creditScore: true,
         birthday: true,
         gender: true,
@@ -765,7 +768,15 @@ describe('AuthService', () => {
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
-      vipLevel: 3,
+      storedVipLevel: 3,
+      vipLevel: 0,
+      vipExpiresAt,
+      membership: {
+        key: 'regular',
+        appearance: { nameColor: 'default', badge: null },
+        active: false,
+        lifetime: false,
+      },
       creditScore: 128,
     });
     expect(me.lastOnline).toBeInstanceOf(Date);

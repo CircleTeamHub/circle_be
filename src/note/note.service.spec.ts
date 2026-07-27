@@ -10,19 +10,28 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { NoteService } from './note.service';
 
 describe('NoteService', () => {
   let service: NoteService;
+  let programEnabled = true;
+  const membershipProgram = {
+    getStatus: jest.fn(() => Promise.resolve({ enabled: programEnabled })),
+  };
 
   const prisma = {
     $transaction: jest.fn(async (input) =>
       Array.isArray(input) ? Promise.all(input) : input(prisma),
     ),
-    $executeRaw: jest.fn().mockResolvedValue(0),
-    // createShareLink 配额检查用 advisory 锁（pg_advisory_xact_lock）
     $queryRaw: jest.fn().mockResolvedValue([]),
+    $executeRaw: jest.fn().mockResolvedValue(0),
+    user: {
+      findUnique: jest.fn(),
+    },
     note: {
+      count: jest.fn(),
       create: jest.fn(),
       findMany: jest.fn(),
       findFirst: jest.fn(),
@@ -49,13 +58,12 @@ describe('NoteService', () => {
       createMany: jest.fn(),
     },
     noteShareLink: {
+      count: jest.fn(),
       create: jest.fn(),
       findUnique: jest.fn(),
       findFirst: jest.fn(),
       findMany: jest.fn(),
       updateMany: jest.fn(),
-      // #94 每用户活跃链接上限检查；默认远低于上限
-      count: jest.fn().mockResolvedValue(0),
     },
   };
 
@@ -73,6 +81,13 @@ describe('NoteService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    programEnabled = true;
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+    prisma.note.count.mockResolvedValue(0);
+    prisma.noteShareLink.count.mockResolvedValue(0);
     // updateNote 会先查笔记上已有媒体的 objectKey（收藏复制场景的豁免名单）。
     prisma.noteMedia.findMany.mockResolvedValue([]);
     uploadService.createPresignedGetUrl.mockImplementation(
@@ -86,6 +101,8 @@ describe('NoteService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         NoteService,
+        MembershipPolicyService,
+        { provide: MembershipProgramService, useValue: membershipProgram },
         { provide: PrismaService, useValue: prisma },
         { provide: UploadService, useValue: uploadService },
         // No MINIO_PUBLIC_URL configured → media-url origin check is skipped.
@@ -94,6 +111,110 @@ describe('NoteService', () => {
     }).compile();
 
     service = module.get<NoteService>(NoteService);
+  });
+
+  describe('membership note storage quota', () => {
+    const createdNote = {
+      id: 'quota-note',
+      ownerID: 'user-1',
+      title: 'Quota note',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      groupID: null,
+      coverMediaID: null,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      collectedFrom: null,
+      collectedFromNoteID: null,
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      updatedAt: new Date('2026-07-22T00:00:00.000Z'),
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+    };
+
+    const createInput = { title: 'Quota note', media: [] };
+
+    it.each([
+      ['regular', 0, null, 50],
+      ['silver', 1, new Date('2099-01-01T00:00:00.000Z'), 100],
+      ['gold', 2, new Date('2099-01-01T00:00:00.000Z'), 500],
+      ['diamond', 3, new Date('2099-01-01T00:00:00.000Z'), 1000],
+      ['super', 4, null, 3000],
+      ['expired paid', 3, new Date('2000-01-01T00:00:00.000Z'), 50],
+    ])(
+      'blocks %s users at the effective %i-note limit',
+      async (_label, vipLevel, vipExpiresAt, limit) => {
+        prisma.user.findUnique.mockResolvedValueOnce({
+          vipLevel,
+          vipExpiresAt,
+        });
+        prisma.note.count.mockResolvedValueOnce(limit);
+
+        await expect(
+          service.createNote('user-1', createInput),
+        ).rejects.toMatchObject({
+          response: {
+            errorCode: 'NOTE_STORAGE_QUOTA_REACHED',
+            quota: 'notes',
+            limit,
+            current: limit,
+            details: { quota: 'notes', limit, current: limit },
+          },
+        });
+        expect(prisma.note.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('allows limit minus one and locks before counting and writing in one Serializable transaction', async () => {
+      prisma.note.count.mockResolvedValueOnce(49);
+      prisma.note.create.mockResolvedValueOnce({ id: createdNote.id });
+      prisma.note.update.mockResolvedValueOnce(createdNote);
+
+      await service.createNote('user-1', createInput);
+
+      expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: 'Serializable',
+      });
+      expect(prisma.note.count).toHaveBeenCalledWith({
+        where: { ownerID: 'user-1', status: { not: 'DELETED' } },
+      });
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.note.count.mock.invocationCallOrder[0],
+      );
+      expect(prisma.note.count.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.note.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('gives a regular user the gold note quota while rollout is disabled', async () => {
+      programEnabled = false;
+      prisma.note.count.mockResolvedValueOnce(499);
+      prisma.note.create.mockResolvedValueOnce({ id: createdNote.id });
+      prisma.note.update.mockResolvedValueOnce(createdNote);
+
+      await expect(
+        service.createNote('user-1', createInput),
+      ).resolves.toMatchObject({ id: createdNote.id });
+    });
+
+    it('excludes soft-deleted notes from usage so deletion releases capacity', async () => {
+      prisma.note.count.mockResolvedValueOnce(49);
+      prisma.note.create.mockResolvedValueOnce({ id: createdNote.id });
+      prisma.note.update.mockResolvedValueOnce(createdNote);
+
+      await service.createNote('user-1', createInput);
+
+      expect(prisma.note.count).toHaveBeenCalledWith({
+        where: { ownerID: 'user-1', status: { not: 'DELETED' } },
+      });
+      expect(prisma.note.create).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('creates a note with ordered mixed media and multiple groups', async () => {
@@ -1538,6 +1659,7 @@ describe('NoteService', () => {
           key === 'NOTE_EXPORT_PDF_FONT_PATH' ? fontPath : null,
         ),
       } as any,
+      new MembershipPolicyService(prisma as any),
       uploadService as any,
     );
 
@@ -1597,6 +1719,7 @@ describe('NoteService', () => {
   });
 
   it('updates a note by replacing media and recalculating counts', async () => {
+    prisma.note.count.mockResolvedValue(51);
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
       ownerID: 'user-1',
@@ -1675,6 +1798,7 @@ describe('NoteService', () => {
       imageCount: 1,
       videoCount: 1,
     });
+    expect(prisma.note.count).not.toHaveBeenCalled();
   });
 
   it('replaces note group memberships in one round-trip', async () => {
@@ -1842,6 +1966,7 @@ describe('NoteService', () => {
   });
 
   it('soft deletes a note', async () => {
+    prisma.note.count.mockResolvedValue(51);
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
       ownerID: 'user-1',
@@ -1858,6 +1983,18 @@ describe('NoteService', () => {
       data: { status: 'DELETED' },
       select: expect.any(Object),
     });
+    expect(prisma.note.count).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a soft-deleted note through the writable status path', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.setStatus('user-1', 'deleted-note', 'ACTIVE'),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(prisma.note.update).not.toHaveBeenCalled();
+    expect(prisma.note.count).not.toHaveBeenCalled();
   });
 
   it('creates and lists note groups for the owner', async () => {
@@ -1995,6 +2132,7 @@ describe('NoteService', () => {
           key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
         ),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
 
     const result = await serviceWithBase.createShareLink('user-1', {
@@ -2032,23 +2170,6 @@ describe('NoteService', () => {
       revokedAt: null,
       createdAt: new Date('2026-06-08T10:00:00.000Z'),
     });
-  });
-
-  it('rejects creating a share link past the per-user active cap (#94)', async () => {
-    prisma.noteShareLink.count.mockResolvedValueOnce(200);
-
-    await expect(
-      service.createShareLink('user-1', { title: '我的笔记' }),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({
-        errorCode: 'NOTE_SHARE_LINK_LIMIT',
-      }),
-    });
-
-    expect(prisma.noteShareLink.create).not.toHaveBeenCalled();
-    // count 与 create 必须同事务且持 per-owner advisory 锁（并发下守住上限）
-    expect(prisma.$transaction).toHaveBeenCalled();
-    expect(prisma.$queryRaw).toHaveBeenCalled();
   });
 
   it('rejects a note share link when any requested note is missing or owned by someone else', async () => {
@@ -2204,6 +2325,7 @@ describe('NoteService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
 
     await expect(
@@ -2228,6 +2350,7 @@ describe('NoteService', () => {
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
       } as any,
+      new MembershipPolicyService(prisma as any),
     );
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
@@ -2502,6 +2625,33 @@ describe('NoteService', () => {
     expect(updateArg.data.coverMediaID).toBe(copiedImage.id);
   });
 
+  it('blocks a new collected-note copy at the storage limit', async () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce(null);
+    prisma.note.count.mockResolvedValueOnce(50);
+
+    await expect(
+      service.collectNote('user-1', {
+        noteId: 'note-src',
+        source: collectSource,
+      }),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'NOTE_STORAGE_QUOTA_REACHED',
+        quota: 'notes',
+        limit: 50,
+        current: 50,
+        details: { quota: 'notes', limit: 50, current: 50 },
+      },
+    });
+
+    expect(prisma.note.create).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.note.count.mock.invocationCallOrder[0],
+    );
+  });
+
   it('collectNote rewrites structured section media IDs to the copied media rows', async () => {
     prisma.note.findFirst
       .mockResolvedValueOnce({
@@ -2547,6 +2697,7 @@ describe('NoteService', () => {
       .mockResolvedValueOnce(null) // no copy at pre-check time
       .mockResolvedValueOnce({ id: 'note-copy' }); // unique race loser re-read
     prisma.note.create.mockRejectedValueOnce({ code: 'P2002' });
+    prisma.note.count.mockResolvedValueOnce(49);
     prisma.note.update.mockResolvedValueOnce({
       ...otherUsersNote,
       id: 'note-copy',
@@ -2593,7 +2744,8 @@ describe('NoteService', () => {
     expect(prisma.note.update).not.toHaveBeenCalled();
   });
 
-  it('collectNote refreshes source snapshot when the note was collected before', async () => {
+  it('collectNote remains idempotent at the storage limit when already collected', async () => {
+    prisma.note.count.mockResolvedValue(50);
     prisma.note.findFirst
       .mockResolvedValueOnce(otherUsersNote)
       .mockResolvedValueOnce({ id: 'note-copy' }); // 已有收藏副本
@@ -2622,6 +2774,7 @@ describe('NoteService', () => {
       conversationID: 'sg_123',
       clientMsgID: 'msg-abc',
     });
+    expect(prisma.note.count).not.toHaveBeenCalled();
   });
 
   it('collectNote refresh guards against copies deleted after lookup', async () => {
@@ -3067,6 +3220,7 @@ describe('NoteService', () => {
             key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
           ),
         } as any,
+        new MembershipPolicyService(prisma as any),
       );
 
       const result = await serviceWithBase.listShareLinks('user-1', {});

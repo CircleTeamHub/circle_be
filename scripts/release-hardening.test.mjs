@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -14,6 +15,25 @@ import test from 'node:test';
 
 const read = (path) =>
   readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+
+function workflowRunScript(workflow, stepName, nextStepName) {
+  const endMarker = nextStepName.startsWith('\n')
+    ? nextStepName
+    : `- name: ${nextStepName}`;
+  const block = workflow.slice(
+    workflow.indexOf(`- name: ${stepName}`),
+    workflow.indexOf(endMarker),
+  );
+  const runMarker = '        run: |\n';
+  return {
+    block,
+    script: block
+      .slice(block.indexOf(runMarker) + runMarker.length)
+      .split(/\r?\n/)
+      .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
+      .join('\n'),
+  };
+}
 
 test('Caddy routes requests only to healthy blue-green backends', () => {
   const caddy = read('deploy/Caddyfile.admin');
@@ -205,7 +225,7 @@ test('backend deploy accepts only immutable digests and real API responses', () 
   assert.doesNotMatch(release, /401\|403\|404/);
 });
 
-test('downtime deployment restores the live app after migration or startup failure', () => {
+test('downtime deployment restores the live app after migration or reversible startup failure', () => {
   const deploy = read('deploy/release-deploy.sh');
 
   assert.match(deploy, /restore_live\(\)/);
@@ -217,6 +237,168 @@ test('downtime deployment restores the live app after migration or startup failu
     deploy,
     /if ! compose up -d --no-build --no-deps "\$standby"; then[\s\S]*restore_live/,
   );
+});
+
+test('marked releases reject tag push and incomplete manual confirmations', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { block: gate, script } = workflowRunScript(
+    release,
+    'Validate irreversible migration confirmations',
+    'Notify release start',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-release-gate-'));
+  mkdirSync(join(directory, 'deploy'));
+  writeFileSync(
+    join(directory, 'deploy', 'REQUIRES_IRREVERSIBLE_MIGRATION'),
+    'test marker\n',
+  );
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  const runGate = (EVENT_NAME, DOWNTIME, IRREVERSIBLE) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: { ...process.env, EVENT_NAME, DOWNTIME, IRREVERSIBLE },
+    });
+
+  assert.match(gate, /deploy\/REQUIRES_IRREVERSIBLE_MIGRATION/);
+  assert.notEqual(runGate('push', 'false', 'false').status, 0);
+  for (const confirmations of [
+    ['false', 'false'],
+    ['true', 'false'],
+    ['false', 'true'],
+  ]) {
+    assert.notEqual(
+      runGate('workflow_dispatch', ...confirmations).status,
+      0,
+      `manual dispatch unexpectedly accepted ${confirmations.join('/')}`,
+    );
+  }
+  assert.equal(runGate('workflow_dispatch', 'true', 'true').status, 0);
+  assert.match(
+    release,
+    /RELEASE_IRREVERSIBLE_MIGRATION: \$\{\{ inputs\.irreversible_migration && '1' \|\| '0' \}\}/,
+  );
+});
+
+test('manual dispatch promotes the commit image when the version image is absent', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-release-image-'));
+  const bin = join(directory, 'bin');
+  const output = join(directory, 'output');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+case "$ref" in
+  *:sha-*) printf '{"digest":"sha256:%064d"}\\n' 0 ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const result = spawnSync('/bin/bash', ['-c', script], {
+    cwd: directory,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      EVENT_NAME: 'workflow_dispatch',
+      SHA: 'a'.repeat(40),
+      RELEASE_TAG: 'v1.2.3',
+      GHCR_TOKEN: 'token',
+      GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+      GITHUB_ACTOR: 'release-test',
+      GITHUB_OUTPUT: output,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const outputs = readFileSync(output, 'utf8');
+  assert.match(outputs, /digest=sha256:0{64}/);
+  assert.match(outputs, /needs_promotion=true/);
+  assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+});
+
+test('workflow stages target content and delegates activation to the persistent launcher', () => {
+  const release = read('.github/workflows/release.yml');
+  assert.match(
+    release,
+    /ref: \$\{\{ github\.workflow_sha \}\}[\s\S]*path: \.release-workflow/,
+  );
+  assert.match(
+    release,
+    /stage_path="\$DEPLOY_PATH\/\.release\/incoming\/\$STAGED_RELEASE_NAME"/,
+  );
+  assert.match(release, /\.release\/release-launcher\.sh/);
+  assert.doesNotMatch(release, /exec bash %q\/deploy\/release-deploy\.sh/);
+});
+
+test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
+  const launcher = read('deploy/release-launcher.sh');
+  const lock = launcher.indexOf('flock -x 201');
+  const floor = launcher.indexOf(
+    'cat "$MINIMUM_SCHEMA_COMPATIBILITY_PATH"',
+    lock,
+  );
+  const activation = launcher.indexOf('rsync ', floor);
+  const target = launcher.indexOf('bash deploy/release-deploy.sh', activation);
+
+  assert.match(launcher, /exec 201>"\$RELEASE_STATE_DIR\/deploy\.lock"/);
+  assert.ok(lock >= 0 && lock < floor);
+  assert.ok(floor < activation);
+  assert.ok(activation < target);
+  assert.doesNotMatch(launcher.slice(lock, target), /flock -u/);
+});
+
+test('server crosses an explicit no-rollback boundary after irreversible migration', () => {
+  const deploy = read('deploy/release-deploy.sh');
+  const migration = deploy.indexOf('if ! compose run --rm migrate; then');
+  const crossed = deploy.indexOf('irreversible_migration_applied=1', migration);
+
+  assert.match(
+    deploy,
+    /RELEASE_IRREVERSIBLE_MIGRATION.*requires RELEASE_DOWNTIME=1/,
+  );
+  assert.match(
+    deploy,
+    /REQUIRES_IRREVERSIBLE_MIGRATION.*RELEASE_IRREVERSIBLE_MIGRATION=1/s,
+  );
+  assert.ok(migration >= 0 && migration < crossed);
+  assert.match(deploy, /enter_irreversible_maintenance\(\)/);
+  assert.match(deploy, /pg_constraint/);
+  assert.match(deploy, /User_vipLevel_check/);
+  assert.match(deploy, /Circle_joinVipRestriction_check/);
+  assert.match(deploy, /CirclePost_vipRestriction_check/);
+  assert.match(deploy, /CirclePost_signupVipRestriction_check/);
+  assert.match(
+    deploy,
+    /if ! compose run --rm migrate; then[\s\S]*handle_irreversible_migration_command_failure/,
+  );
+  assert.match(
+    deploy,
+    /unapplied\)[\s\S]*restore_live[\s\S]*applied\)[\s\S]*enter_irreversible_maintenance/,
+  );
+  assert.match(
+    deploy,
+    /if irreversible_boundary_crossed; then[\s\S]*enter_irreversible_maintenance/,
+  );
+  assert.match(deploy, /minimum-schema-compatibility/);
+  assert.match(deploy, /schema compatibility.*below server minimum/);
 });
 
 test('admin deploy validates digests, uses strict smoke checks, and rolls back', () => {
@@ -241,6 +423,7 @@ test('backend CI blocks release contract regressions', () => {
 
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
+  assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
 });
 
 test('every main push creates the exact-SHA CI run required by release', () => {

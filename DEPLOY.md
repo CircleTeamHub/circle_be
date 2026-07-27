@@ -132,7 +132,7 @@ push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
   缺失 sha- 镜像时立即失败，不在发版时重新构建
   promote  buildx imagetools create:把 sha- 镜像原样打上 v* 版本 tag(秒级)
-  deploy   rsync 仓库 → SSH 执行 deploy/release-deploy.sh(见下)→ runner 外部烟测
+  deploy   暂存仓库 → 持久 launcher 锁定检查/激活/执行(见下)→ runner 外部烟测
   publish  自动生成 changelog 的 GitHub Release(仅 tag push)
   notify   Discord 通知,成功失败都发(if: always())
 ```
@@ -143,7 +143,8 @@ PR/main CI 的独立镜像扫描提供更早反馈，ARM64 workflow 再扫描实
 
 ### 服务器上:蓝绿切换,失败自动回滚
 
-`deploy/release-deploy.sh` 的顺序:
+`.release/release-launcher.sh` 先取得 rsync 树外的持久锁,重新读取 schema 兼容下限,
+再把已暂存的发布树原子激活并调用 `deploy/release-deploy.sh`。目标脚本的顺序:
 
 ```
 flock 单飞锁 → 拉镜像 → pg_dump 备份(保留 7 份,~/circle_be_backups/)
@@ -169,6 +170,28 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 勾选 `downtime: true`(先停旧版本再迁移,接受短暂停机;此模式下若失败,
 回滚可能还需恢复迁移前备份)。
 
+**不可逆迁移**:仓库存在 `deploy/REQUIRES_IRREVERSIBLE_MIGRATION` 时,tag push 会
+fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同时勾选
+`downtime: true` 和 `irreversible_migration: true`。服务器也会二次校验
+`RELEASE_IRREVERSIBLE_MIGRATION=1` 必须与 `RELEASE_DOWNTIME=1` 同时启用。
+
+不可逆迁移命令返回非零时,脚本会通过发布镜像连接目标数据库,直接检查 User、Circle
+和 CirclePost 的四个会员等级约束。只有四个约束都不存在时,才能证明事务未应用并恢复
+旧实例;四个都存在、只存在一部分、探测失败或返回异常结果
+都会保持维护状态。迁移命令成功后,旧二进制同样不再是合法回滚目标;后续启动、
+健康、代理、状态写入或烟测失败都会等待向前修复。只有先从本次迁移前备份完整恢复
+数据库,才能再启动旧镜像。
+
+兼容级别来自 tag 内的 `deploy/SCHEMA_COMPATIBILITY`。不可逆迁移开始前,服务器会把
+最低级别原子写入 rsync 排除的 `.release/minimum-schema-compatibility`;持久 launcher
+在同一把锁内重新读取它、激活目标树并等待目标脚本退出,所以并发的旧 tag 会在替换
+服务器脚本和启动容器前被拒绝。该文件不是
+普通回滚开关:只有完整恢复迁移前数据库、验证上述四个约束均不存在后,值班人员才可
+显式删除它,再运行旧 tag。
+本次会员迁移的完整值班步骤和验证 SQL 见
+`docs/operations/membership-rollout.md`。标记只能由**后续已成功部署**、且不再包含
+不可逆迁移的版本移除,不能在会员迁移 tag 上提前删除。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |
@@ -190,14 +213,28 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
 - **一键回滚**:Actions → Release → Run workflow,填旧 tag(如 `v0.1.0`)。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
-- **服务器上手动**(GitHub 不可用时):
+- **服务器上手动**(GitHub 不可用时):将目标 tag 检出到 live tree 之外,按 workflow
+  的排除规则暂存到 `~/circle_be/.release/incoming/<唯一名称>/`,然后通过持久 launcher
+  激活。不要直接执行目标树内的 `deploy/release-deploy.sh`。
 
   ```bash
   cd ~/circle_be
+  stage=manual-v0.1.0-$(date +%s)
+  mkdir -p ".release/incoming/$stage"
+  rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
+    --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
+    /path/to/external-v0.1.0-checkout/ ".release/incoming/$stage/"
+  TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
   RELEASE_TAG=v0.1.0 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
-    bash deploy/release-deploy.sh
+    bash .release/release-launcher.sh "$stage"
   ```
+
+  携带不可逆迁移标记的版本还必须增加
+  `RELEASE_DOWNTIME=1 RELEASE_IRREVERSIBLE_MIGRATION=1`;缺一项脚本都会在备份和
+  迁移前拒绝运行。越过迁移成功边界后,不要直接改用旧 tag 重跑;先向前修复,或先
+  恢复迁移前数据库备份并验证四个约束均不存在,然后显式删除
+  `.release/minimum-schema-compatibility`。
 
   镜像还在本地缓存时无需登录;缓存已清且仓库私有,先用带 `read:packages` 的
   PAT `docker login ghcr.io` 再跑。
@@ -205,6 +242,50 @@ postgres/redis/minio/caddy/admin_web 属于开通期资产,发版**不碰**;
   `gunzip -c <备份文件> | docker compose -f docker-compose.prod.yml exec -T postgres psql -U circle -d circle`。
   这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——
   改从异地副本恢复,见下面「异地备份」。
+
+### ⚠️ 加固待办:锁死历史 workflow 绕过 floor(需服务器端配置)
+
+**残留风险(未闭合)**:`.release/release-launcher.sh` 的持久锁 + `minimum-schema-compatibility`
+下限,以及 `release-deploy.sh` 顶部的 `RELEASE_LAUNCHER_ACTIVE` 守卫,都只保护**当前**发版
+管线。若有人重跑一个**在 launcher 引入之前**的旧 Release workflow,它会把自己的检出用 rsync
+直接盖到 `DEPLOY_PATH` 并执行**那份旧的、无守卫的** `release-deploy.sh` —— 既不经过持久
+launcher、也不读 `minimum-schema-compatibility`,于是可能在已抬高 floor 之后仍启动旧二进制、
+打到已被不可逆迁移契约化的 schema 上。
+
+**为什么仓库内改不掉**:旧 workflow 发给服务器的命令(`rsync … DEPLOY_PATH/` + `bash
+deploy/release-deploy.sh`)由**旧的检出**决定,新代码无法改变历史 workflow 会发什么。唯一
+能拦截它的层是**服务器的 `~/.ssh/authorized_keys`**,不在本仓库里。
+
+**目标修法(SSH ForceCommand)**:给部署 key 挂 `command="…"`,把该 key 的所有 SSH 会话
+强制经过 `.release/` 下的持久入口 —— 只放行「rsync 进 `.release/incoming/`」「安装 / 调用
+launcher」,拒绝「live-tree rsync」和「直接执行 `release-deploy.sh`」。因为 `command=` 写在
+服务器 authorized_keys 里,任何被 rsync 覆盖的仓库代码都替换不了它,历史 workflow 也就绕
+不过去。
+
+**为何尚未落地**:`.github/workflows/release.yml` 现用 `bash -s`(经 stdin 传 GHCR token,
+刻意不进 `argv` 以免出现在 `ps`)。ForceCommand 无法内省 stdin 脚本,所以启用它必须同时把
+发版流改成**显式命令**且保持 token 不进 argv —— 属较大、需在 **staging 真跑一次**验证的独立
+运维改动,不在应用代码 PR 范围内。
+
+**在此之前的运维硬约束**:① 绝不重跑「抬高 floor 之前」的历史 Release workflow;② 回滚一律
+走上面〈回滚 / 重放〉的持久 launcher 手动流程,绝不直接执行目标树内的 `release-deploy.sh`。
+
+### ⚠️ 加固待办:不可逆重放的空跑不应封死可兼容活色(需 staging 验证)
+
+**现象**:重发一个**已成功上线**的不可逆 tag 且用 downtime 模式时,`release-deploy.sh` 先停活色 →
+`prisma migrate deploy` 空跑成功 → 无条件置 `irreversible_migration_applied=1`。若此时新色(备色)
+启动/健康检查失败,`irreversible_boundary_crossed` 为真 → 进 `enter_irreversible_maintenance`,
+**拒绝恢复活色**——可活色是**同一个 tag、schema 本就兼容**,本可安全恢复,却把一次可恢复的重放
+失败变成了持续维护态。
+
+**目标修法**:为每个成功上线的颜色持久化其 schema 兼容级别(如 `.release/<color>-schema`),备色失败
+时若**活色已支持当前 schema**(其兼容级别 ≥ 本次 `RELEASE_SCHEMA_COMPATIBILITY`)则允许恢复活色,
+而非一律进维护。
+
+**为何暂不改**:这段是不可逆迁移的**回滚安全闸**——判断错(把不兼容的旧二进制恢复到已契约化的
+schema 上)不是可用性抖动,而是数据损坏级事故。改动本地无法对真实蓝绿 + 迁移状态机验证,必须在
+**staging 真跑**(含备色失败注入)后再合。**在此之前的运维约束**:重发已上线的不可逆 tag 前,确认
+备色能起;若备色失败进了维护态,手工确认活色 tag 与 DB schema 一致后再恢复,不要盲目清状态文件。
 
 ### 异地备份(可选;加密后上传到对象存储)
 

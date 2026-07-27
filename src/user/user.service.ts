@@ -24,6 +24,11 @@ import {
   isInviteCodeUniqueCollision,
   REGISTRATION_CODE_MAX_ATTEMPTS,
 } from 'src/auth/account-id.unique';
+import {
+  resolveMembershipAppearance,
+  toPublicMembershipAppearance,
+} from 'src/membership/membership-appearance';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -64,6 +69,43 @@ type ProfilePrivacyUser = {
   qq?: string | null;
   whatsup?: string | null;
 };
+
+type ProfileMembershipUser = {
+  vipLevel?: number;
+  vipExpiresAt?: Date | null;
+};
+
+function toPublicUser<T extends ProfileMembershipUser>(user: T) {
+  const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
+  const membership = toPublicMembershipAppearance({ vipLevel, vipExpiresAt });
+  return {
+    ...profile,
+    vipLevel: membership.effectiveLevel,
+    membership,
+  };
+}
+
+// 自视图映射：保留 storedVipLevel / vipExpiresAt 与含 active·lifetime 的完整 appearance，
+// 供序列化成 SelfUserDto 的路径（如 PATCH /user/:id）用。toPublicUser 是「无 PII」的他人
+// 视图、会剥掉这些自有字段；PATCH 若用它，SelfUserDto 的新契约字段就会全部缺失（与
+// /auth/me 不一致）。
+function toSelfUser<T extends ProfileMembershipUser>(
+  user: T,
+  now = new Date(),
+) {
+  const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
+  const membership = resolveMembershipAppearance(
+    { vipLevel, vipExpiresAt },
+    now,
+  );
+  return {
+    ...profile,
+    storedVipLevel: vipLevel,
+    vipExpiresAt,
+    vipLevel: membership.effectiveLevel,
+    membership,
+  };
+}
 
 function normalizeBirthdayInput(value: string | null | undefined) {
   if (value === undefined) {
@@ -181,12 +223,17 @@ export class UserService {
     }
     const users = await this.prisma.user.findMany({
       where: { id: { in: [...aliasesByNormalized.keys()] } },
-      select: { id: true, vipLevel: true },
+      select: { id: true, vipLevel: true, vipExpiresAt: true },
     });
+    // Resolve expiry so an expired level 1–3 stops driving paid name effects on
+    // the chat surfaces that consume this map; this mirrors every other public
+    // profile path instead of leaking the stored (unexpired) level.
+    const now = new Date();
     const out: Record<string, number> = {};
     for (const user of users) {
+      const effectiveLevel = resolveEffectiveMembershipLevel(user, now);
       for (const alias of aliasesByNormalized.get(user.id) ?? [user.id]) {
-        out[alias] = user.vipLevel;
+        out[alias] = effectiveLevel;
       }
     }
     return out;
@@ -225,7 +272,7 @@ export class UserService {
       this.prisma.user.count({ where }),
     ]);
 
-    return { data, total, page, limit: take };
+    return { data: data.map(toPublicUser), total, page, limit: take };
   }
 
   async findByExactAccountId(accountId: string | undefined, viewerId?: string) {
@@ -249,7 +296,9 @@ export class UserService {
 
     // Apply the same field-privacy gate as GET /user/:id. Without it the
     // friend-add lookup leaks wechat/qq that the target set to private (F-01).
-    return user ? this.applyProfilePrivacy(user, viewerId) : null;
+    return user
+      ? toPublicUser(await this.applyProfilePrivacy(user, viewerId))
+      : null;
   }
 
   async findOne(id: string, viewerId?: string) {
@@ -278,7 +327,7 @@ export class UserService {
           )
         : false;
     return {
-      ...filteredUser,
+      ...toPublicUser(filteredUser),
       displayIcons,
       likeCount: user.receivedLikeCount,
       likedByMeToday,
@@ -335,7 +384,7 @@ export class UserService {
     ) {
       const inviteCode = await generateUniqueRegistrationCode(this.prisma);
       try {
-        return await this.prisma.user.create({
+        const user = await this.prisma.user.create({
           data: {
             accountId: input.accountId,
             inviteCode,
@@ -344,6 +393,7 @@ export class UserService {
           },
           select: PUBLIC_SELECT,
         });
+        return toPublicUser(user);
       } catch (error) {
         if (isInviteCodeUniqueCollision(error)) {
           if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
@@ -389,7 +439,7 @@ export class UserService {
     await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
-      ...user,
+      ...toSelfUser(user),
       displayIcons,
     };
   }
@@ -407,8 +457,11 @@ export class UserService {
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
+    // Map through toPublicUser like every other public-user response: resolve
+    // the effective (expiry-aware) vipLevel and attach the membership object,
+    // so an expired paid tier can't leak its stored level in the deletion body.
     return {
-      ...user,
+      ...toPublicUser(user),
       displayIcons,
     };
   }

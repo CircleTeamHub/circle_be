@@ -15,6 +15,7 @@ const NUMERIC = /^\d+$/;
 // sync with the real router when adding controllers, or new routes silently
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
+  '/api/v1/admin/memberships/program/enable',
   '/api/v1/admin/users',
   '/api/v1/auth/admin/login',
   '/api/v1/auth/admin/refresh',
@@ -41,6 +42,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/circle-invitation/my-applications',
   '/api/v1/circle-invitation/pending',
   '/api/v1/circle-plaza/feed',
+  '/api/v1/circle-plaza/feed/search',
   '/api/v1/circle-plaza/me/posts',
   '/api/v1/circle-plaza/me/signups/unread-count',
   '/api/v1/circle-plaza/posts',
@@ -63,8 +65,9 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/icon/options',
   '/api/v1/logs',
   '/api/v1/mall/sections',
+  '/api/v1/membership/me',
   '/api/v1/membership/plans',
-  '/api/v1/membership/upgrade',
+  '/api/v1/membership/program',
   '/api/v1/note',
   '/api/v1/note/group',
   '/api/v1/note/group/order',
@@ -86,6 +89,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/user/search/account',
 ]);
 export const DYNAMIC_ROUTE_TEMPLATES = [
+  '/api/v1/admin/memberships/users/:id/grants',
   '/api/v1/admin/users/:id',
   '/api/v1/admin/users/:id/audit-logs',
   '/api/v1/admin/users/:id/sensitive-access',

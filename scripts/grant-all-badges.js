@@ -139,6 +139,8 @@ async function main() {
   );
   const legacyCircleId = legacyDet(`builder-circle:${user.id}`);
   const iconAssetId = det(`builder-circle-icon:${user.id}`);
+  const membershipGrantId = det(`membership-grant:${user.id}`);
+  const membershipGrantIdempotencyKey = `grant-all-badges:${user.id}:4`;
 
   await prisma.$transaction(async (tx) => {
     if (legacyCircleId !== circleId) {
@@ -176,6 +178,9 @@ async function main() {
       data: {
         status: 'ACTIVE',
         vipLevel: 4,
+        // Super is lifetime; the audited grant flow sets a null expiry, so match
+        // it here instead of leaving a stale expiry from a prior lower tier.
+        vipExpiresAt: null,
         creditScore: 100,
         fancyNumber: true,
         receivedLikeCount: 10_000,
@@ -193,6 +198,43 @@ async function main() {
         wechat: 'windnote_test_932567218',
         phoneNumber: '13800138000',
         iconPreferencesInitialized: true,
+      },
+    });
+
+    // Route the super membership through the audited grant shape instead of a
+    // bare vipLevel write. A VIP4 member produced by the admin grant API always
+    // carries a MembershipGrant (audit row) plus the PREMIUM_FANCY_NUMBER
+    // benefit grant; synthesizing the same rows here (operator = self, mirroring
+    // the legacy-benefit backfill migration) keeps badge/membership tests on
+    // state the admin API can actually produce. Idempotent via the unique
+    // idempotencyKey and (userID, type) so reruns never double-grant.
+    await tx.membershipGrant.upsert({
+      where: { idempotencyKey: membershipGrantIdempotencyKey },
+      update: {},
+      create: {
+        id: membershipGrantId,
+        idempotencyKey: membershipGrantIdempotencyKey,
+        targetUserID: user.id,
+        operatorUserID: user.id,
+        previousLevel: 0,
+        previousEffectiveLevel: 0,
+        newLevel: 4,
+        previousExpiresAt: null,
+        newExpiresAt: null,
+        benefitTypesSnapshot: ['PREMIUM_FANCY_NUMBER'],
+        note: 'grant-all-badges dev seed: super membership via audited grant shape',
+      },
+    });
+    await tx.membershipBenefitGrant.upsert({
+      where: {
+        userID_type: { userID: user.id, type: 'PREMIUM_FANCY_NUMBER' },
+      },
+      update: {},
+      create: {
+        id: det(`membership-benefit:${user.id}:PREMIUM_FANCY_NUMBER`),
+        userID: user.id,
+        membershipGrantID: membershipGrantId,
+        type: 'PREMIUM_FANCY_NUMBER',
       },
     });
 
@@ -293,6 +335,34 @@ async function main() {
       }),
     });
   });
+
+  // Assert the audited membership rows exist. The seed must reproduce the exact
+  // shape the admin grant API creates (grant + benefit), or badge/membership
+  // tests would silently run on an impossible bare-vipLevel state.
+  const membershipAudit = await prisma.membershipGrant.findUnique({
+    where: { idempotencyKey: membershipGrantIdempotencyKey },
+    select: {
+      newLevel: true,
+      benefitGrants: { select: { type: true } },
+    },
+  });
+  const seededUser = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: { vipLevel: true, vipExpiresAt: true },
+  });
+  if (
+    !membershipAudit ||
+    membershipAudit.newLevel !== 4 ||
+    !membershipAudit.benefitGrants.some(
+      (benefit) => benefit.type === 'PREMIUM_FANCY_NUMBER',
+    ) ||
+    seededUser?.vipLevel !== 4 ||
+    seededUser?.vipExpiresAt !== null
+  ) {
+    throw new Error(
+      'Audited membership grant/benefit rows were not created for the seeded super member; refusing to report success.',
+    );
+  }
 
   const refreshed = await prisma.user.findUnique({
     where: { id: user.id },

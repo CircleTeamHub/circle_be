@@ -42,7 +42,7 @@ const MALL_SECTIONS: MallSectionDto[] = [
     products: [
       {
         id: 'membership-upgrade',
-        name: '会员充值',
+        name: '会员服务',
         icon: 'diamond-outline',
         color: '#F59E0B',
         action: 'membership',

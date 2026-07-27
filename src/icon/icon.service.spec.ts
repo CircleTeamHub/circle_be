@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { RedisService } from 'src/redis/redis.service';
 import {
   IconService,
   MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
@@ -19,6 +20,7 @@ const DEFAULT_PRIVACY = {
 const verifiedUser = (overrides: Record<string, unknown> = {}) => ({
   id: 'user-1',
   vipLevel: 0,
+  vipExpiresAt: null,
   receivedLikeCount: 0,
   createdAt: new Date(0),
   status: 'ACTIVE',
@@ -80,6 +82,12 @@ describe('IconService', () => {
     getSettingsForUsers: jest.fn(),
   };
 
+  const redisService = {
+    isEnabled: jest.fn(() => true),
+    publish: jest.fn(() => Promise.resolve(true)),
+    subscribePattern: jest.fn(() => Promise.resolve(true)),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
     // Sensible defaults: no circles, no likes, default privacy.
@@ -93,14 +101,15 @@ describe('IconService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: RedisService, useValue: redisService },
       ],
     }).compile();
 
     service = module.get(IconService);
   });
 
-  it('returns every VIP variant up to the current level as selectable options', async () => {
-    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 4 }));
+  it('returns only the effective super badge for a legacy level 5 user', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
     prisma.userDisplayIcon.findMany.mockResolvedValue([
       {
         id: 'display-vip-3',
@@ -115,6 +124,9 @@ describe('IconService', () => {
 
     const result = await service.getIconOptions('user-1');
 
+    // The persisted VIP3 selection carries forward to the user's current
+    // effective tier (VIP4) rather than being dropped as stale — a VIP display
+    // choice must follow tier changes, not vanish.
     expect(
       result.systemIcons
         .filter((icon) => icon.systemKey === 'VIP')
@@ -122,13 +134,7 @@ describe('IconService', () => {
           variant: icon.systemVariant,
           selected: icon.selected,
         })),
-    ).toEqual([
-      { variant: 'VIP1', selected: false },
-      { variant: 'VIP2', selected: false },
-      { variant: 'VIP3', selected: true },
-      { variant: 'VIP4', selected: false },
-    ]);
-    expect(JSON.stringify(result.systemIcons)).not.toContain('VIP5');
+    ).toEqual([{ variant: 'VIP4', selected: true }]);
   });
 
   it('maps a legacy VIP placeholder variant to the highest eligible VIP badge', async () => {
@@ -149,8 +155,102 @@ describe('IconService', () => {
 
     expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
     expect(result.displayIcons).toEqual([
+      expect.objectContaining({
+        systemKey: 'VIP',
+        systemVariant: 'VIP4',
+        title: '超级会员',
+      }),
+    ]);
+  });
+
+  it('migrates a persisted VIP5 selection to the current super badge', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 5 }));
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-5',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP5',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(prisma.userDisplayIcon.deleteMany).not.toHaveBeenCalled();
+    expect(result.displayIcons).toEqual([
       expect.objectContaining({ systemKey: 'VIP', systemVariant: 'VIP4' }),
     ]);
+  });
+
+  it('does not emit a persisted membership badge after expiry', async () => {
+    jest
+      .useFakeTimers()
+      .setSystemTime(new Date('2026-07-22T12:00:00.000Z').getTime());
+    try {
+      prisma.user.findUnique.mockResolvedValue(
+        verifiedUser({
+          vipLevel: 3,
+          vipExpiresAt: new Date('2026-07-22T12:00:00.000Z'),
+        }),
+      );
+      prisma.userDisplayIcon.findMany.mockResolvedValue([
+        {
+          id: 'display-vip-3',
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP3',
+          circleID: null,
+          sortOrder: 0,
+        },
+      ]);
+
+      await expect(service.getDisplayIconsForUser('user-1')).resolves.toEqual(
+        [],
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not reuse a cached membership badge across its expiry boundary', async () => {
+    jest
+      .useFakeTimers()
+      .setSystemTime(new Date('2026-07-22T11:59:59.999Z').getTime());
+    try {
+      const expiringUser = verifiedUser({
+        vipLevel: 1,
+        vipExpiresAt: new Date('2026-07-22T12:00:00.000Z'),
+      });
+      prisma.user.findUnique.mockResolvedValue(expiringUser);
+      prisma.userDisplayIcon.findMany.mockResolvedValue([
+        {
+          id: 'display-vip-1',
+          userID: 'user-1',
+          displayType: 'SYSTEM',
+          systemKey: 'VIP',
+          systemVariant: 'VIP1',
+          circleID: null,
+          sortOrder: 0,
+        },
+      ]);
+
+      await expect(service.getDisplayIconsForUser('user-1')).resolves.toEqual([
+        expect.objectContaining({ systemVariant: 'VIP1' }),
+      ]);
+
+      jest.setSystemTime(new Date('2026-07-22T12:00:00.000Z').getTime());
+
+      await expect(service.getDisplayIconsForUser('user-1')).resolves.toEqual(
+        [],
+      );
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(4);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('awards Top Collaborator tiers by received like count', async () => {
@@ -323,14 +423,8 @@ describe('IconService', () => {
       {
         displayType: 'SYSTEM',
         systemKey: 'VIP',
-        systemVariant: 'VIP1',
+        systemVariant: 'VIP4',
         sortOrder: 0,
-      } as any,
-      {
-        displayType: 'SYSTEM',
-        systemKey: 'VIP',
-        systemVariant: 'VIP2',
-        sortOrder: 1,
       } as any,
     ]);
 
@@ -353,13 +447,13 @@ describe('IconService', () => {
         {
           displayType: 'SYSTEM',
           systemKey: 'VIP',
-          systemVariant: 'VIP1',
+          systemVariant: 'VIP4',
           sortOrder: 0,
         } as any,
         {
           displayType: 'SYSTEM',
           systemKey: 'VIP',
-          systemVariant: 'VIP1',
+          systemVariant: 'VIP4',
           sortOrder: 1,
         } as any,
       ]),
@@ -482,5 +576,97 @@ describe('IconService', () => {
     await service.getDisplayIconsForUser('user-1');
 
     expect(prisma.user.findUnique).toHaveBeenCalledTimes(callsAfterFirst);
+  });
+
+  it('evicts locally and fans out cross-instance on invalidateDisplayIconCacheFor', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser({ email: null }));
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    // Warm the cache (e.g. a VIP1 badge), then invalidate as a grant would.
+    await service.getDisplayIconsForUser('user-1');
+    const callsAfterWarm = prisma.user.findUnique.mock.calls.length;
+
+    service.invalidateDisplayIconCacheFor('user-1');
+
+    // Fans the eviction out so every other instance drops its stale copy too.
+    expect(redisService.publish).toHaveBeenCalledWith(
+      'circle:icon:display-invalidate',
+      'user-1',
+    );
+    // Local entry is gone: the next read recomputes rather than serving stale.
+    await service.getDisplayIconsForUser('user-1');
+    expect(prisma.user.findUnique.mock.calls.length).toBeGreaterThan(
+      callsAfterWarm,
+    );
+  });
+
+  it('carries a persisted VIP1 selection forward to VIP2 after an upgrade', async () => {
+    // Prefs already initialized, so defaults won't re-add anything; the saved
+    // VIP1 row must follow the upgrade to VIP2 instead of being dropped stale.
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ vipLevel: 2, iconPreferencesInitialized: true }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-1',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP1',
+        circleID: null,
+        sortOrder: 0,
+      },
+    ]);
+
+    const options = await service.getIconOptions('user-1');
+    expect(
+      options.systemIcons
+        .filter((icon) => icon.systemKey === 'VIP')
+        .map((icon) => ({
+          variant: icon.systemVariant,
+          selected: icon.selected,
+        })),
+    ).toEqual([{ variant: 'VIP2', selected: true }]);
+
+    // And the displayed badge (feeds / profile / auth-me path) shows VIP2.
+    const displayed = await service.getDisplayIconsForUser('user-1');
+    const vip = displayed.filter((icon) => icon.systemKey === 'VIP');
+    expect(vip).toHaveLength(1);
+    expect(vip[0].systemVariant).toBe('VIP2');
+  });
+
+  it('retries the display-icon subscription with backoff until Redis accepts it', async () => {
+    jest.useFakeTimers();
+    try {
+      const flakyRedis = {
+        isEnabled: jest.fn(() => true),
+        publish: jest.fn(() => Promise.resolve(true)),
+        subscribePattern: jest
+          .fn()
+          .mockResolvedValueOnce(false) // Redis unavailable at boot
+          .mockResolvedValueOnce(true), // recovered on the retry
+      };
+      const svc = new IconService(
+        prisma as never,
+        realtimeService as never,
+        privacySettings as never,
+        flakyRedis as never,
+      );
+
+      await svc.onModuleInit();
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(1);
+
+      // Backoff fires and re-subscribes once Redis is back.
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(2);
+
+      // Once active it stops retrying — no unbounded re-subscribe loop.
+      await jest.advanceTimersByTimeAsync(10_000);
+      expect(flakyRedis.subscribePattern).toHaveBeenCalledTimes(2);
+
+      svc.onModuleDestroy();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

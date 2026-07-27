@@ -1,7 +1,9 @@
 import { SystemIconKeyDto } from './dto/icon.dto';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 
 export type EligibilityUser = {
   vipLevel: number;
+  vipExpiresAt: Date | null;
   // Denormalized total likes/recognitions received by the user. This is the
   // persisted source of truth for Top Collaborator badge tiers.
   receivedLikeCount: number;
@@ -28,15 +30,15 @@ type LeveledSystemBadgeDefinition = {
   fallbackIconName: string;
   levels: LeveledSystemBadgeLevel[];
   getEarnedLevel: (user: EligibilityUser) => number;
+  currentLevelOnly?: boolean;
 };
 
-const VIP_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [1, 2, 3, 4].map(
-  (level) => ({
-    level,
-    variant: `VIP${level}`,
-    title: `VIP${level}`,
-  }),
-);
+const VIP_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [
+  { level: 1, variant: 'VIP1', title: '白银会员' },
+  { level: 2, variant: 'VIP2', title: '黄金会员' },
+  { level: 3, variant: 'VIP3', title: '钻石会员' },
+  { level: 4, variant: 'VIP4', title: '超级会员' },
+];
 
 const TOP_COLLABORATOR_BADGE_LEVELS: LeveledSystemBadgeLevel[] = [
   {
@@ -64,7 +66,8 @@ const LEVELED_SYSTEM_BADGE_DEFINITIONS: LeveledSystemBadgeDefinition[] = [
     systemKey: SystemIconKeyDto.VIP,
     fallbackIconName: 'diamond',
     levels: VIP_BADGE_LEVELS,
-    getEarnedLevel: (user) => user.vipLevel,
+    getEarnedLevel: () => 0,
+    currentLevelOnly: true,
   },
   {
     systemKey: SystemIconKeyDto.TOP_COLLABORATOR,
@@ -106,14 +109,24 @@ export function isLeveledSystemBadgeKey(
 
 export function buildLeveledSystemIcons(
   user: EligibilityUser,
+  now = new Date(),
 ): EligibleSystemIcon[] {
   const icons: EligibleSystemIcon[] = [];
 
   for (const definition of LEVELED_SYSTEM_BADGE_DEFINITIONS) {
-    const earnedLevel = Math.max(0, definition.getEarnedLevel(user));
+    const earnedLevel = Math.max(
+      0,
+      definition.systemKey === SystemIconKeyDto.VIP
+        ? resolveEffectiveMembershipLevel(user, now)
+        : definition.getEarnedLevel(user),
+    );
 
     for (const tier of definition.levels) {
-      if (tier.level > earnedLevel) {
+      if (
+        definition.currentLevelOnly
+          ? tier.level !== earnedLevel
+          : tier.level > earnedLevel
+      ) {
         continue;
       }
 

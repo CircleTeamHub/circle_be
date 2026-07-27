@@ -54,6 +54,7 @@ jobs:
         run: |
           node --test scripts/release-hardening.test.mjs
           bash test/release-deploy.spec.sh
+          bash test/release-launcher.spec.sh
           bash test/sync-metrics-token.spec.sh
 
       - name: Lint

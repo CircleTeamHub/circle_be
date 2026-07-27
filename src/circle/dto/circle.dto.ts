@@ -81,13 +81,13 @@ export class CreateCircleDto {
   @IsOptional()
   tags?: string[];
 
-  @ApiPropertyOptional({ minimum: 0, maximum: 4 })
+  @ApiPropertyOptional({ nullable: true, minimum: 0, maximum: 4 })
   @Type(() => Number)
   @IsInt()
   @Min(0)
   @Max(4)
   @IsOptional()
-  joinVipRestriction?: number;
+  joinVipRestriction?: number | null;
 
   @ApiPropertyOptional()
   @Type(() => Number)
@@ -102,11 +102,13 @@ export class CreateCircleDto {
   @IsOptional()
   joinFancyRestriction?: boolean;
 
-  @ApiPropertyOptional({ description: 'Max members; omit for no limit.' })
+  @ApiPropertyOptional({
+    description: 'Max members; omit to use membership capacity.',
+  })
   @Type(() => Number)
   @IsInt()
   @Min(10)
-  @Max(5000)
+  @Max(3000)
   @IsOptional()
   maxMembers?: number;
 

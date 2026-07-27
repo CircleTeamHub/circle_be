@@ -28,6 +28,8 @@ export const USER_PROFILE_SELECT = {
   status: true,
   lastOnline: true,
   receivedLikeCount: true,
+  vipLevel: true,
+  vipExpiresAt: true,
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -36,6 +38,5 @@ export const USER_PROFILE_SELECT = {
 export const USER_ME_SELECT = {
   ...USER_PROFILE_SELECT,
   inviteCode: true,
-  vipLevel: true,
   creditScore: true,
 } as const;

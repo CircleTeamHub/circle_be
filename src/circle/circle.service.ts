@@ -7,12 +7,22 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import {
+  CircleErrorCode,
+  MembershipErrorCode,
+} from 'src/common/app-error-codes';
 import { Prisma } from 'src/generated/prisma';
-import { CircleErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
-import { circleApplicationLockKey } from 'src/circle-invitation/circle-application-lock';
+import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import {
+  prismaErrorCode,
+  runSerializableTransaction,
+} from 'src/utils/prisma-tx';
+import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CircleMemberLockService } from './circle-member-lock';
+import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
   CircleDetailDto,
   CircleDto,
@@ -24,7 +34,6 @@ import {
   UploadCircleIconDto,
 } from './dto/circle.dto';
 
-const MAX_JOIN_TX_ATTEMPTS = 3;
 // The SYSTEM icon catalogue grows with every icon ever shipped and is read
 // whole by its endpoint, so cap it instead of letting table size decide the
 // response size.
@@ -41,6 +50,9 @@ export class CircleService {
     private readonly openimService: OpenimService,
     private readonly circleInvitationService: CircleInvitationService,
     private readonly config: ConfigService,
+    private readonly membershipPolicy: MembershipPolicyService,
+    private readonly admissionPolicy: CircleAdmissionPolicy,
+    private readonly memberLock: CircleMemberLockService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -66,18 +78,6 @@ export class CircleService {
     userId: string,
     dto: CreateCircleDto,
   ): Promise<CircleDetailDto> {
-    // VIP gate: only VIP users can create circles
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { vipLevel: true },
-    });
-    if (!user || user.vipLevel < 1) {
-      throw new ForbiddenException({
-        message: 'Only VIP users can create circles',
-        errorCode: CircleErrorCode.VipRequired,
-      });
-    }
-
     this.assertAvatarUrlIsSafe(dto.avatarUrl);
     const categories = this.normalizeStringList(
       dto.categories ?? [],
@@ -85,6 +85,68 @@ export class CircleService {
     );
 
     const circle = await this.prisma.$transaction(async (tx) => {
+      await this.membershipPolicy.lockUsers(tx, [userId]);
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { vipLevel: true, vipExpiresAt: true },
+      });
+      if (!user) {
+        throw new NotFoundException({
+          message: 'User not found',
+          errorCode: CircleErrorCode.UserNotFound,
+        });
+      }
+
+      const policy = await this.membershipPolicy.resolveEntitlement(
+        user,
+        tx,
+        new Date(),
+        // Serialize the rollout-floor read against program enablement so this
+        // quota decision cannot commit under an obsolete entitlement floor.
+        { lockForWrite: true },
+      );
+
+      // 非会员（有效档 0：普通 / 已过期）不能建圈。resolveEntitlement 已应用 staged-rollout
+      // floor —— rollout 关闭期 level ≥ 2、此处不触发；仅 enforcement 开启且用户确为普通/过期
+      // 时拒绝，兑现「普通用户不可建群」的会员契约（旧实现即拒非 VIP，本次收口时漏补回）。
+      if (policy.level === 0) {
+        throw new ForbiddenException({
+          message: 'Membership is required to create a circle',
+          errorCode: CircleErrorCode.VipRequired,
+        });
+      }
+
+      // 建圈本身占用「已加入圈子」配额（写一条 ACTIVE OWNER 成员行）。在上面的 per-user 锁下统计
+      // 现有全部 ACTIVE 成员数，达到有效档位上限即拒绝，否则用户可无限建圈绕过配额（admission
+      // 路径已校验，create 路径此前漏了）。
+      const activeMemberships = await tx.circleMember.count({
+        where: { userID: userId, status: 'ACTIVE' },
+      });
+      const joinedLimit = policy.tier.quotas.joinedCircles.actual;
+      if (activeMemberships >= joinedLimit) {
+        throw new ForbiddenException({
+          message: 'Joined circle membership quota reached',
+          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
+          quota: 'joined-circles',
+          limit: joinedLimit,
+          details: { quota: 'joined-circles', limit: joinedLimit },
+        });
+      }
+
+      const capacity = policy.tier.quotas.groupMembers.actual;
+      const maxMembers = dto.maxMembers ?? capacity;
+      if (maxMembers > capacity) {
+        throw new ForbiddenException({
+          message: 'Requested circle capacity exceeds membership entitlement',
+          errorCode: MembershipErrorCode.GroupMemberCapacityExceeded,
+        });
+      }
+      const joinVipRestriction =
+        this.admissionPolicy.normalizeCreatorVipRestriction(
+          dto.joinVipRestriction,
+          policy.level,
+        );
+
       const created = await tx.circle.create({
         data: {
           name: dto.name,
@@ -95,15 +157,16 @@ export class CircleService {
           cities: dto.cities ?? [],
           rules: dto.rules ?? '',
           tags: dto.tags ?? [],
-          joinVipRestriction: dto.joinVipRestriction ?? null,
+          joinVipRestriction,
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
-          maxMembers: dto.maxMembers ?? null,
+          maxMembers,
           memberCanPost: dto.memberCanPost ?? true,
           memberCount: 1,
         },
       });
 
+      await this.memberLock.lock(tx, created.id, [userId]);
       await tx.circleMember.create({
         data: {
           userID: userId,
@@ -312,119 +375,76 @@ export class CircleService {
   }
 
   async joinCircle(userId: string, circleId: string) {
-    const circle = await this.prisma.circle.findFirst({
-      where: { id: circleId, deleted: false },
-    });
-    if (!circle)
-      throw new NotFoundException({
-        message: 'Circle not found',
-        errorCode: CircleErrorCode.NotFound,
-      });
-
-    if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
-      throw new BadRequestException({
-        message: 'Circle has reached its member limit',
-        errorCode: CircleErrorCode.MemberLimit,
-      });
-    }
-
-    await this.assertJoinRestrictions(userId, circle);
-
     // All joins are reviewed. The pair lock is shared with the member-invite
     // path so a direct join and an invitation cannot create two applications.
-    let invitationId: string | null = null;
-    for (let attempt = 1; attempt <= MAX_JOIN_TX_ATTEMPTS; attempt += 1) {
-      try {
-        invitationId = await this.prisma.$transaction(
-          async (tx) => {
-            const pairKey = circleApplicationLockKey(circleId, userId);
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
+    let invitationId: string;
+    try {
+      invitationId = await runSerializableTransaction(
+        this.prisma,
+        async (tx) => {
+          await this.memberLock.lock(tx, circleId, [userId]);
 
-            const existing = await tx.circleMember.findUnique({
-              where: {
-                userID_circleID: { userID: userId, circleID: circleId },
+          const existing = await tx.circleMember.findUnique({
+            where: {
+              userID_circleID: { userID: userId, circleID: circleId },
+            },
+          });
+          if (existing?.status === 'ACTIVE') {
+            throw new ConflictException({
+              message: 'Already a member',
+              errorCode: CircleErrorCode.AlreadyMember,
+            });
+          }
+
+          await this.admissionPolicy.assertCanApply(tx, circleId, userId);
+
+          if (existing) {
+            await tx.circleMember.update({
+              where: { id: existing.id },
+              data: { status: 'PENDING', role: 'MEMBER' },
+            });
+          } else {
+            await tx.circleMember.create({
+              data: {
+                userID: userId,
+                circleID: circleId,
+                role: 'MEMBER',
+                status: 'PENDING',
               },
             });
-            if (existing?.status === 'ACTIVE') {
-              throw new ConflictException({
-                message: 'Already a member',
-                errorCode: CircleErrorCode.AlreadyMember,
-              });
-            }
+          }
 
-            if (existing?.status === 'PENDING') {
-              await tx.circleMember.update({
-                where: { id: existing.id },
-                data: { status: 'PENDING', role: 'MEMBER' },
-              });
-            } else {
-              await tx.circleMember.create({
-                data: {
-                  userID: userId,
-                  circleID: circleId,
-                  role: 'MEMBER',
-                  status: 'PENDING',
-                },
-              });
-            }
-
-            // 已有进行中的担保单（例如成员先邀请过）则复用，不重复建。
-            const existingInvitation = await tx.circleInvitation.findFirst({
-              where: {
+          // 已有进行中的担保单（例如成员先邀请过）则复用，不重复建。
+          const existingInvitation = await tx.circleInvitation.findFirst({
+            where: {
+              circleID: circleId,
+              applicantID: userId,
+              status: 'PENDING',
+            },
+            select: { id: true },
+          });
+          if (!existingInvitation) {
+            const created = await tx.circleInvitation.create({
+              data: {
                 circleID: circleId,
                 applicantID: userId,
-                status: 'PENDING',
+                inviterID: userId,
               },
               select: { id: true },
             });
-            if (!existingInvitation) {
-              const created = await tx.circleInvitation.create({
-                data: {
-                  circleID: circleId,
-                  applicantID: userId,
-                  inviterID: userId,
-                },
-                select: { id: true },
-              });
-              return created.id;
-            }
-            return existingInvitation.id;
-          },
-          {
-            isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-          },
-        );
-        break;
-      } catch (error) {
-        if (
-          this.isRetryableTransactionError(error) &&
-          attempt < MAX_JOIN_TX_ATTEMPTS
-        ) {
-          this.logger.warn(
-            `Retrying circle join after serialization conflict (attempt ${attempt})`,
-          );
-          continue;
-        }
-        // A concurrent operation should be retried under the pair lock. A
-        // remaining unique violation is surfaced as a structured conflict.
-        if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === 'P2002'
-        ) {
-          throw new ConflictException({
-            message: 'Already a member or a join request is already pending',
-            errorCode: CircleErrorCode.AlreadyMemberOrPending,
-          });
-        }
-        throw error;
+            return created.id;
+          }
+          return existingInvitation.id;
+        },
+      );
+    } catch (error) {
+      if (prismaErrorCode(error) === 'P2002') {
+        throw new ConflictException({
+          message: 'Already a member or a join request is already pending',
+          errorCode: CircleErrorCode.AlreadyMemberOrPending,
+        });
       }
-    }
-
-    if (!invitationId) {
-      throw new ConflictException({
-        message: 'Unable to create a join request',
-        errorCode: CircleErrorCode.RequestPending,
-      });
+      throw error;
     }
     return this.circleInvitationService.getInvitationForViewer(
       userId,
@@ -433,30 +453,8 @@ export class CircleService {
   }
 
   async leaveCircle(userId: string, circleId: string): Promise<void> {
-    const membership = await this.prisma.circleMember.findUnique({
-      where: { userID_circleID: { userID: userId, circleID: circleId } },
-    });
-    if (!membership)
-      throw new NotFoundException({
-        message: 'Not a member',
-        errorCode: CircleErrorCode.NotMember,
-      });
-    if (membership.role === 'OWNER') {
-      throw new ForbiddenException({
-        message: 'Owner cannot leave — transfer ownership first',
-        errorCode: CircleErrorCode.OwnerCannotLeave,
-      });
-    }
-
-    const circle = await this.prisma.circle.findUnique({
-      where: { id: circleId },
-      select: { groupID: true },
-    });
-
-    await this.prisma.$transaction(async (tx) => {
-      const pairKey = circleApplicationLockKey(circleId, userId);
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${pairKey}))`;
-
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circleId, [userId]);
       const lockedMembership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },
       });
@@ -475,16 +473,14 @@ export class CircleService {
 
       const wasActive = lockedMembership.status === 'ACTIVE';
 
-      if (!wasActive) {
-        await tx.circleInvitation.updateMany({
-          where: {
-            circleID: circleId,
-            applicantID: userId,
-            status: 'PENDING',
-          },
-          data: { status: 'CANCELLED' },
-        });
-      }
+      await tx.circleInvitation.updateMany({
+        where: {
+          circleID: circleId,
+          applicantID: userId,
+          status: 'PENDING',
+        },
+        data: { status: 'CANCELLED' },
+      });
 
       await tx.userDisplayIcon.deleteMany({
         where: { userID: userId, circleID: circleId },
@@ -497,18 +493,17 @@ export class CircleService {
           data: { memberCount: { decrement: 1 } },
         });
       }
-    });
 
-    // Remove from OpenIM group
-    if (circle?.groupID) {
-      try {
-        await this.openimService.removeGroupMember(circle.groupID, userId);
-      } catch (error) {
-        this.logger.warn(
-          `Failed to remove user ${userId} from OpenIM group ${circle.groupID}: ${error}`,
-        );
+      const circle = await tx.circle.findUnique({
+        where: { id: circleId },
+        select: { groupID: true },
+      });
+      if (circle?.groupID) {
+        await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
+          userId,
+        ]);
       }
-    }
+    });
   }
 
   async uploadCircleIcon(
@@ -607,59 +602,6 @@ export class CircleService {
     });
   }
 
-  private async assertJoinRestrictions(
-    userId: string,
-    circle: {
-      joinVipRestriction: number | null;
-      joinCreditRestriction: number | null;
-      joinFancyRestriction: boolean;
-    },
-  ): Promise<void> {
-    if (
-      circle.joinVipRestriction == null &&
-      circle.joinCreditRestriction == null &&
-      !circle.joinFancyRestriction
-    ) {
-      return;
-    }
-
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { vipLevel: true, creditScore: true, fancyNumber: true },
-    });
-    if (!user) {
-      throw new NotFoundException({
-        message: 'User not found',
-        errorCode: CircleErrorCode.UserNotFound,
-      });
-    }
-
-    if (
-      circle.joinVipRestriction != null &&
-      user.vipLevel < circle.joinVipRestriction
-    ) {
-      throw new ForbiddenException({
-        message: `VIP ${circle.joinVipRestriction}+ is required to join this circle`,
-        errorCode: CircleErrorCode.JoinVipRequired,
-      });
-    }
-    if (
-      circle.joinCreditRestriction != null &&
-      user.creditScore < circle.joinCreditRestriction
-    ) {
-      throw new ForbiddenException({
-        message: `Credit score ${circle.joinCreditRestriction}+ is required to join this circle`,
-        errorCode: CircleErrorCode.JoinCreditRequired,
-      });
-    }
-    if (circle.joinFancyRestriction && !user.fancyNumber) {
-      throw new ForbiddenException({
-        message: 'A fancy number is required to join this circle',
-        errorCode: CircleErrorCode.JoinFancyNumberRequired,
-      });
-    }
-  }
-
   private normalizeStringList(values: string[], label: string): string[] {
     const normalized = values.map((value) => value.trim());
     if (normalized.some((value) => value.length === 0)) {
@@ -675,13 +617,6 @@ export class CircleService {
       });
     }
     return normalized;
-  }
-
-  private isRetryableTransactionError(error: unknown): boolean {
-    return (
-      error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === 'P2034'
-    );
   }
 
   private async assertOwner(userId: string, circleId: string) {

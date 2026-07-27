@@ -29,12 +29,15 @@ describe('GroupService reportGroup', () => {
     conversationGroupMembership: { deleteMany: jest.Mock };
     groupSyncOutbox: {
       createMany: jest.Mock;
+      updateMany: jest.Mock;
     };
+    circleInvitation: { updateMany: jest.Mock };
     groupReport: {
       findFirst: jest.Mock;
       create: jest.Mock;
     };
     friend: { findMany: jest.Mock };
+    userPrivacySetting: { findMany: jest.Mock };
     userDisplayIcon: { deleteMany: jest.Mock };
   };
   let openim: {
@@ -42,9 +45,10 @@ describe('GroupService reportGroup', () => {
     isGroupMember: jest.Mock;
     removeGroupMember: jest.Mock;
   };
-  let privacySettings: {
-    canBeInvitedToGroupOrCircle: jest.Mock;
+  let admissionPolicy: {
+    activateMembers: jest.Mock;
   };
+  let memberLock: { lock: jest.Mock };
   let service: GroupService;
 
   beforeEach(() => {
@@ -69,12 +73,15 @@ describe('GroupService reportGroup', () => {
       conversationGroupMembership: { deleteMany: jest.fn() },
       groupSyncOutbox: {
         createMany: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
+      circleInvitation: { updateMany: jest.fn() },
       groupReport: {
         findFirst: jest.fn(),
         create: jest.fn(),
       },
       friend: { findMany: jest.fn().mockResolvedValue([]) },
+      userPrivacySetting: { findMany: jest.fn().mockResolvedValue([]) },
       userDisplayIcon: { deleteMany: jest.fn() },
     };
     openim = {
@@ -82,13 +89,15 @@ describe('GroupService reportGroup', () => {
       isGroupMember: jest.fn().mockResolvedValue(false),
       removeGroupMember: jest.fn().mockResolvedValue(undefined),
     };
-    privacySettings = {
-      canBeInvitedToGroupOrCircle: jest.fn().mockResolvedValue(true),
+    admissionPolicy = {
+      activateMembers: jest.fn(async (_tx, _circleID, userIDs) => userIDs),
     };
+    memberLock = { lock: jest.fn() };
     service = new GroupService(
       prisma as any,
       openim as any,
-      privacySettings as any,
+      admissionPolicy as any,
+      memberLock as any,
     );
   });
 
@@ -316,6 +325,13 @@ describe('GroupService reportGroup', () => {
 
     await service.leaveGroup('user-1', 'group-1');
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'user-1', circleID: 'circle-1' },
     });
@@ -325,6 +341,14 @@ describe('GroupService reportGroup', () => {
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
+    });
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: 'user-1',
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
     });
     expect(prisma.conversationGroupMembership.deleteMany).toHaveBeenCalledWith({
       where: {
@@ -357,7 +381,9 @@ describe('GroupService reportGroup', () => {
 
     await service.leaveGroup('user-1', 'group-1');
 
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
@@ -381,6 +407,9 @@ describe('GroupService reportGroup', () => {
     );
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'user-1',
+    ]);
     expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
@@ -439,54 +468,47 @@ describe('GroupService reportGroup', () => {
       },
       select: { userID: true, status: true },
     });
-    // The pair locks every other membership path takes, in one round-trip.
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
-    // Batched writes: no per-user create/update round-trip inside the tx.
-    expect(prisma.circleMember.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          userID: 'new-user',
-          circleID: 'circle-1',
-          role: CircleMemberRole.MEMBER,
-          status: CircleMemberStatus.ACTIVE,
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(prisma.circleMember.updateMany).toHaveBeenCalledWith({
-      where: {
-        circleID: 'circle-1',
-        userID: { in: ['existing-pending'] },
-        status: { not: CircleMemberStatus.ACTIVE },
-      },
-      data: {
-        role: CircleMemberRole.MEMBER,
-        status: CircleMemberStatus.ACTIVE,
-      },
-    });
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'new-user',
+      'existing-pending',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    // Membership writes and locks are owned by the admission policy.
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
     expect(prisma.circleMember.create).not.toHaveBeenCalled();
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
-    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([2, 'circle-1', 2]);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
-        { operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'new-user' },
         {
           operation: 'ADD_MEMBER',
           groupID: 'group-1',
           userID: 'existing-pending',
         },
+        { operation: 'ADD_MEMBER', groupID: 'group-1', userID: 'new-user' },
       ],
       skipDuplicates: true,
     });
     expect(openim.addGroupMembers).not.toHaveBeenCalled();
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['new-user', 'existing-pending'],
+      { locksHeld: true },
+    );
   });
 
   // Regression: memberCount used to be incremented by the size of the
   // pre-transaction snapshot, so a target that joined concurrently was counted
   // a second time and the circle drifted permanently.
   it('derives the memberCount increment from the rows the writes changed', async () => {
+    admissionPolicy.activateMembers.mockResolvedValueOnce(['new-user']);
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
@@ -497,16 +519,11 @@ describe('GroupService reportGroup', () => {
       role: CircleMemberRole.ADMIN,
       status: CircleMemberStatus.ACTIVE,
     });
-    // Pre-check sees both as invitable...
-    prisma.circleMember.findMany
-      .mockResolvedValueOnce([
-        { userID: 'racer', status: CircleMemberStatus.PENDING },
-      ])
-      // ...but under the lock `racer` has already been activated by a
-      // concurrent join, leaving only one real seat to take.
-      .mockResolvedValueOnce([
-        { userID: 'racer', status: CircleMemberStatus.ACTIVE },
-      ]);
+    // The complete request is locked before this authoritative read. The
+    // racer is now ACTIVE, so it stays idempotent while new-user is admitted.
+    prisma.circleMember.findMany.mockResolvedValue([
+      { userID: 'racer', status: CircleMemberStatus.ACTIVE },
+    ]);
     prisma.circle.findUnique.mockResolvedValue({
       maxMembers: null,
       memberCount: 5,
@@ -521,7 +538,7 @@ describe('GroupService reportGroup', () => {
     ).resolves.toEqual({ handled: true });
 
     expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
-    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([1, 'circle-1', 1]);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
@@ -529,9 +546,46 @@ describe('GroupService reportGroup', () => {
       ],
       skipDuplicates: true,
     });
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'new-user',
+      'racer',
+    ]);
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['new-user'],
+      { locksHeld: true },
+    );
+  });
+
+  it('does not admit a batch after the locked inviter has left', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['target-a', 'target-b'],
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'target-a',
+      'target-b',
+    ]);
+    expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
 
   it('rejects a group invite that would exceed the circle member limit', async () => {
+    admissionPolicy.activateMembers.mockRejectedValueOnce(
+      new BadRequestException('Circle has reached its member limit'),
+    );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
@@ -543,8 +597,6 @@ describe('GroupService reportGroup', () => {
       status: CircleMemberStatus.ACTIVE,
     });
     prisma.circleMember.findMany.mockResolvedValue([]);
-    // The membership writes happen first inside the transaction; a failed
-    // atomic reservation then rolls them back.
     prisma.circle.findUnique.mockResolvedValue({
       id: 'circle-1',
       maxMembers: 10,
@@ -559,8 +611,8 @@ describe('GroupService reportGroup', () => {
       }),
     ).rejects.toThrow(BadRequestException);
 
-    expect(prisma.circleMember.createMany).toHaveBeenCalled();
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
@@ -590,8 +642,49 @@ describe('GroupService reportGroup', () => {
       }),
     ).resolves.toEqual({ handled: true });
 
-    expect(prisma.$queryRaw.mock.calls[0].slice(1)).toEqual([2, 'circle-1', 2]);
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['a', 'b'],
+      { locksHeld: true },
+    );
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
+  });
+
+  it('leaves the whole direct-invite batch unwritten when one user is over joined quota', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    admissionPolicy.activateMembers.mockRejectedValueOnce(
+      new ForbiddenException({
+        errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
+      }),
+    );
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['allowed-user', 'over-quota-user', 'allowed-user'],
+      }),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['allowed-user', 'over-quota-user'],
+      { locksHeld: true },
+    );
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
 
   it('rejects circle group invites blocked by the target privacy setting', async () => {
@@ -606,7 +699,9 @@ describe('GroupService reportGroup', () => {
       status: CircleMemberStatus.ACTIVE,
     });
     prisma.circleMember.findMany.mockResolvedValue([]);
-    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+    prisma.userPrivacySetting.findMany.mockResolvedValue([
+      { userID: 'new-user', groupInvitePermission: 'NONE' },
+    ]);
 
     await expect(
       service.inviteGroupMembers('admin-1', 'group-1', {
@@ -614,11 +709,11 @@ describe('GroupService reportGroup', () => {
       }),
     ).rejects.toThrow(ForbiddenException);
 
-    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
 
-  it('passes real friendship status to the group invite privacy check (FRIENDS_ONLY)', async () => {
+  it('allows FRIENDS_ONLY invites when the locked bulk friendship read finds the inviter', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
@@ -634,18 +729,70 @@ describe('GroupService reportGroup', () => {
     prisma.friend.findMany.mockResolvedValue([
       { userID: 'admin-1', friendID: 'new-user' },
     ]);
-    // Block before the transaction so we only assert the privacy-check args.
-    privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+    prisma.userPrivacySetting.findMany.mockResolvedValue([
+      { userID: 'new-user', groupInvitePermission: 'FRIENDS_ONLY' },
+    ]);
 
     await expect(
       service.inviteGroupMembers('admin-1', 'group-1', {
         userIDs: ['new-user'],
       }),
-    ).rejects.toThrow(ForbiddenException);
+    ).resolves.toEqual({ handled: true });
 
-    expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledWith(
-      'new-user',
-      true,
+    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.friend.findMany.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('uses two bounded transaction reads for a 100-target privacy check', async () => {
+    const targetUserIDs = Array.from(
+      { length: 100 },
+      (_, index) => `target-${index}`,
+    );
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: targetUserIDs,
+      }),
+    ).resolves.toEqual({ handled: true });
+
+    expect(prisma.friend.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.friend.findMany).toHaveBeenCalledWith({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: 'admin-1', friendID: { in: targetUserIDs } },
+          { friendID: 'admin-1', userID: { in: targetUserIDs } },
+        ],
+      },
+      select: { userID: true, friendID: true },
+    });
+    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.userPrivacySetting.findMany).toHaveBeenCalledWith({
+      where: { userID: { in: targetUserIDs } },
+      select: { userID: true, groupInvitePermission: true },
+    });
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.userPrivacySetting.findMany.mock.invocationCallOrder[0],
+    );
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      targetUserIDs,
+      { locksHeld: true },
     );
   });
 
@@ -688,6 +835,14 @@ describe('GroupService reportGroup', () => {
       service.removeGroupMember('admin-1', 'group-1', 'target-user'),
     ).resolves.toEqual({ handled: true });
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'target-user',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(2);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'target-user', circleID: 'circle-1' },
     });
@@ -697,6 +852,14 @@ describe('GroupService reportGroup', () => {
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
+    });
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: 'target-user',
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
     });
     expect(prisma.conversationGroupMembership.deleteMany).toHaveBeenCalledWith({
       where: {
@@ -748,7 +911,10 @@ describe('GroupService reportGroup', () => {
 
     await service.removeGroupMember('admin-1', 'group-1', 'target-user');
 
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'target-user',
+    ]);
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
@@ -779,6 +945,10 @@ describe('GroupService reportGroup', () => {
 
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'target-user',
+    ]);
     expect(prisma.circleMember.delete).not.toHaveBeenCalled();
   });
 
@@ -816,6 +986,14 @@ describe('GroupService reportGroup', () => {
         },
       ],
       skipDuplicates: true,
+    });
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: {
+        circleID: 'circle-1',
+        applicantID: 'target-user',
+        status: 'PENDING',
+      },
+      data: { status: 'CANCELLED' },
     });
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
   });

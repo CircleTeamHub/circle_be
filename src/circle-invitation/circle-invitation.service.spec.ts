@@ -5,6 +5,8 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
+import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -45,6 +47,10 @@ describe('CircleInvitationService', () => {
     friend: {
       findFirst: jest.fn(),
     },
+    groupSyncOutbox: {
+      createMany: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
@@ -65,12 +71,19 @@ describe('CircleInvitationService', () => {
   const notificationService = {
     createCircleInvitationNotification: jest.fn(),
   };
+  const admissionPolicy = {
+    assertCanApply: jest.fn(),
+    activateMembers: jest.fn(),
+  };
+  const memberLock = { lock: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
     notificationService.createCircleInvitationNotification.mockReset();
+    admissionPolicy.assertCanApply.mockResolvedValue(undefined);
+    admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -80,6 +93,8 @@ describe('CircleInvitationService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: NotificationService, useValue: notificationService },
+        { provide: CircleAdmissionPolicy, useValue: admissionPolicy },
+        { provide: CircleMemberLockService, useValue: memberLock },
       ],
     }).compile();
 
@@ -179,10 +194,7 @@ describe('CircleInvitationService', () => {
   });
 
   it('rejects an invite when the applicant becomes active before the pair lock', async () => {
-    prisma.circleMember.findUnique
-      .mockResolvedValueOnce({ status: 'ACTIVE' })
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({ status: 'ACTIVE' });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       deleted: false,
@@ -232,6 +244,71 @@ describe('CircleInvitationService', () => {
       service.invite('inviter-1', 'applicant-1', 'circle-1'),
     ).rejects.toThrow('already a member');
 
+    expect(admissionPolicy.assertCanApply).not.toHaveBeenCalled();
+    expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+  });
+
+  it('locks inviter and applicant before authorizing invitation creation', async () => {
+    prisma.circleMember.findUnique.mockImplementation(({ where }: any) =>
+      where.userID_circleID.userID === 'inviter-1'
+        ? { status: 'ACTIVE', role: 'MEMBER' }
+        : null,
+    );
+    prisma.circleInvitation.findFirst.mockResolvedValue(null);
+    prisma.circleInvitation.create.mockResolvedValue({ id: 'inv-new' });
+    prisma.circleInvitationVerifier.create.mockResolvedValue({ id: 'ver-new' });
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-new',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      requiredCount: 10,
+      approvedCount: 1,
+      status: 'PENDING',
+      createdAt: new Date('2026-07-22T00:00:00.000Z'),
+      circle: { id: 'circle-1', name: 'Circle' },
+      applicant: {
+        id: 'applicant-1',
+        nickname: 'Applicant',
+        avatarUrl: null,
+        accountId: 'applicant',
+      },
+      inviter: {
+        id: 'inviter-1',
+        nickname: 'Inviter',
+        avatarUrl: null,
+        accountId: 'inviter',
+      },
+      verifiers: [],
+    });
+
+    await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'inviter-1',
+      'applicant-1',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prisma.circleInvitation.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects invitation creation when the locked inviter is no longer active', async () => {
+    prisma.circleMember.findUnique.mockImplementation(({ where }: any) =>
+      where.userID_circleID.userID === 'inviter-1'
+        ? { status: 'PENDING', role: 'MEMBER' }
+        : null,
+    );
+
+    await expect(
+      service.invite('inviter-1', 'applicant-1', 'circle-1'),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'inviter-1',
+      'applicant-1',
+    ]);
     expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
   });
 
@@ -249,6 +326,9 @@ describe('CircleInvitationService', () => {
   });
 
   it('continues reconciliation after one candidate cannot be admitted', async () => {
+    admissionPolicy.activateMembers
+      .mockRejectedValueOnce(new BadRequestException('circle full'))
+      .mockResolvedValueOnce(['user-good']);
     prisma.$queryRaw
       .mockResolvedValueOnce([
         { id: 'bad', circleID: 'circle-full', applicantID: 'user-bad' },
@@ -292,6 +372,12 @@ describe('CircleInvitationService', () => {
     expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
       where: { id: 'good' },
       include: { circle: true },
+    });
+    // The permanently-blocked 'bad' row is deferred (touched) so it rotates to
+    // the back of the updatedAt-ordered batch instead of re-filling it forever.
+    expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+      where: { id: 'bad', status: 'PENDING' },
+      data: { status: 'PENDING' },
     });
   });
 
@@ -385,25 +471,6 @@ describe('CircleInvitationService', () => {
     );
   });
 
-  it('rolls membership activation back when the atomic seat reservation fails', async () => {
-    prisma.circleMember.findUnique.mockResolvedValue(null);
-    prisma.circleMember.create.mockResolvedValue({ id: 'member-new' });
-    prisma.circle.findUnique.mockResolvedValue({
-      id: 'circle-1',
-      maxMembers: null,
-      memberCount: 4,
-    });
-    prisma.$queryRaw.mockResolvedValue([]);
-
-    await expect(
-      (service as any).admitApplicant(prisma, 'circle-1', 'applicant-1'),
-    ).rejects.toThrow('Circle has reached its member limit');
-
-    expect(prisma.circleMember.create).toHaveBeenCalled();
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
-    expect(prisma.circle.update).not.toHaveBeenCalled();
-  });
-
   // Regression: leaveCircle / removeGroupMember delete the membership but keep
   // the verifier row, so a departed member could still cast a binding vote.
   it('rejects a respond() vote from a verifier who left the circle', async () => {
@@ -483,6 +550,175 @@ describe('CircleInvitationService', () => {
     });
   });
 
+  it('locks the applicant globally before final verifier-approved activation', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      approvedCount: 10,
+      requiredCount: 10,
+      circle: { id: 'circle-1', groupID: 'group-1' },
+    });
+    prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+      id: 'ver-1',
+      status: 'PENDING',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.respond('verifier-1', 'inv-1', true);
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'verifier-1',
+      'applicant-1',
+    ]);
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['applicant-1'],
+      { locksHeld: true },
+    );
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'ADD_MEMBER',
+          groupID: 'group-1',
+          userID: 'applicant-1',
+        },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+  });
+
+  it('uses the admission policy for admin-approved activation', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.adminApprove('admin-1', 'inv-1');
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'applicant-1',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['applicant-1'],
+      { locksHeld: true },
+    );
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'ADD_MEMBER',
+          groupID: 'group-1',
+          userID: 'applicant-1',
+        },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+  });
+
+  it('uses the admission policy when reconciling a threshold-approved invitation', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      { id: 'inv-1', circleID: 'circle-1', applicantID: 'applicant-1' },
+    ]);
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      approvedCount: 10,
+      requiredCount: 10,
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(service.reconcileApprovedInvitations()).resolves.toBe(1);
+
+    expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      ['applicant-1'],
+      { locksHeld: true },
+    );
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          operation: 'ADD_MEMBER',
+          groupID: 'group-1',
+          userID: 'applicant-1',
+        },
+      ],
+      skipDuplicates: true,
+    });
+    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+  });
+
+  it('does not reactivate an applicant from a cancelled invitation', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'CANCELLED',
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+
+    await expect(service.adminApprove('admin-1', 'inv-1')).rejects.toThrow(
+      BadRequestException,
+    );
+
+    expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects admin approval when the locked admin was demoted', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      status: 'PENDING',
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'MEMBER',
+    });
+
+    await expect(service.adminApprove('admin-1', 'inv-1')).rejects.toThrow(
+      ForbiddenException,
+    );
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+      'applicant-1',
+    ]);
+    expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+  });
+
   it('addVerifier sends a circle-verification interaction message', async () => {
     prisma.circleInvitation.findUnique.mockResolvedValue({
       id: 'inv-1',
@@ -508,6 +744,13 @@ describe('CircleInvitationService', () => {
 
     await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
 
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'applicant-1',
+      'verifier-9',
+    ]);
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+    );
     expect(
       notificationService.createCircleInvitationNotification,
     ).toHaveBeenCalledWith({

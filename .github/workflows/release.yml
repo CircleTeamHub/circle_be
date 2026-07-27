@@ -8,8 +8,8 @@
 #   promote   — on tag push only, stamp the prebuilt sha image with the version tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
-#   deploy    — rsync the tagged repo to the server and run
-#               deploy/release-deploy.sh: DB backup → migrate → start the
+#   deploy    — stage the tagged repo, then use the persistent locked launcher
+#               to activate it and run release-deploy.sh: DB backup → migrate → start the
 #               standby color → health gate → switch → public smoke test,
 #               with automatic rollback if the new version fails
 #   publish   — GitHub Release with generated notes (tag pushes only)
@@ -37,6 +37,10 @@ on:
         type: string
       downtime:
         description: "Stop the old version before migrating (breaking migrations only)"
+        type: boolean
+        default: false
+      irreversible_migration:
+        description: "Confirm this release crosses the old-binary rollback boundary"
         type: boolean
         default: false
       force:
@@ -69,6 +73,7 @@ jobs:
       digest: ${{ steps.image.outputs.digest }}
       image_ref: ${{ steps.image.outputs.image_ref }}
       needs_promotion: ${{ steps.image.outputs.needs_promotion }}
+      schema_compatibility: ${{ steps.compatibility.outputs.level }}
     steps:
       - name: Determine release tag
         id: tag
@@ -85,6 +90,50 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0 # need origin/main for the ancestor check
+
+      - name: Resolve schema compatibility
+        id: compatibility
+        run: |
+          set -euo pipefail
+          compatibility_file=deploy/SCHEMA_COMPATIBILITY
+          level=0
+          if [ -e "$compatibility_file" ]; then
+            level="$(cat "$compatibility_file")"
+            if [[ ! "$level" =~ ^[0-9]+$ ]]; then
+              echo "$compatibility_file must contain one non-negative integer." >&2
+              exit 1
+            fi
+          fi
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+
+      - name: Validate irreversible migration confirmations
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DOWNTIME: ${{ inputs.downtime || false }}
+          IRREVERSIBLE: ${{ inputs.irreversible_migration || false }}
+        run: |
+          set -euo pipefail
+          marker=deploy/REQUIRES_IRREVERSIBLE_MIGRATION
+          if [ -e "$marker" ]; then
+            if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+              echo "$marker blocks tag-push deployment; use manual workflow_dispatch with both confirmations." >&2
+              exit 1
+            fi
+            if [ "$DOWNTIME" != "true" ] || [ "$IRREVERSIBLE" != "true" ]; then
+              echo "$marker requires downtime=true and irreversible_migration=true." >&2
+              exit 1
+            fi
+          fi
+          if [ "$IRREVERSIBLE" = "true" ] && [ "$DOWNTIME" != "true" ]; then
+            echo "irreversible_migration=true requires downtime=true." >&2
+            exit 1
+          fi
+
       - name: Notify release start
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -96,12 +145,6 @@ jobs:
             '{username: "GitHub Actions", content: $content}' |
             curl --fail-with-body -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK_URL" ||
             echo "warning: release start notification failed; continuing release."
-
-      - name: Checkout tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ steps.tag.outputs.tag }}
-          fetch-depth: 0 # need origin/main for the ancestor check
 
       # Releases deploy only commits that main's full CI matrix has validated.
       # That check replaces re-running tests here — by design the release path
@@ -154,11 +197,19 @@ jobs:
           }
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            if ! digest="$(digest_of "$release_image")"; then
-              echo "Existing release image not found: $release_image" >&2
-              exit 1
+            if digest="$(digest_of "$release_image" 2>/dev/null)"; then
+              if sha_digest="$(digest_of "$sha_image" 2>/dev/null)" && [ "$sha_digest" != "$digest" ]; then
+                echo "Refusing mismatched release image: $release_image ($digest != $sha_digest)." >&2
+                exit 1
+              fi
+              needs_promotion=false
+            else
+              if ! digest="$(digest_of "$sha_image")"; then
+                echo "Neither release image $release_image nor prebuilt commit image $sha_image exists." >&2
+                exit 1
+              fi
+              needs_promotion=true
             fi
-            needs_promotion=false
           else
             if ! digest="$(digest_of "$sha_image")"; then
               echo "Prebuilt main image not found: $sha_image" >&2
@@ -236,6 +287,16 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.tag }}
 
+      # A rollback target may predate the launcher. Fetch the launcher from the
+      # commit that defined this workflow, never from target tag contents.
+      - name: Checkout trusted release launcher
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-workflow
+          sparse-checkout: deploy/release-launcher.sh
+          sparse-checkout-cone-mode: false
+
       - name: Configure SSH
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -255,33 +316,67 @@ jobs:
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      # Same rsync contract as the manual flow (DEPLOY.md §3), with the
-      # server-generated secrets explicitly excluded so a release can never
-      # overwrite or delete .env / .env.production.
-      - name: Sync repo to server
+      - name: Install persistent release launcher
         env:
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
         run: |
           set -euo pipefail
+          launcher_tmp="$DEPLOY_PATH/.release/release-launcher.sh.$GITHUB_RUN_ID.tmp"
+          ssh_target="$DEPLOY_USER@$DEPLOY_HOST"
+          ssh_args=(-i "$HOME/.ssh/deploy_key" -o StrictHostKeyChecking=yes)
+          ssh "${ssh_args[@]}" "$ssh_target" "mkdir -p $(printf '%q' "$DEPLOY_PATH/.release")"
+          rsync -az -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            .release-workflow/deploy/release-launcher.sh "$ssh_target:$launcher_tmp"
+          {
+            printf 'deploy_path=%q launcher_tmp=%q\n' "$DEPLOY_PATH" "$launcher_tmp"
+            cat <<'REMOTE'
+          set -euo pipefail
+          exec 201>"$deploy_path/.release/deploy.lock"
+          flock -x 201
+          install -m 0755 "$launcher_tmp" "$deploy_path/.release/release-launcher.sh"
+          rm -f "$launcher_tmp"
+          REMOTE
+          } | ssh "${ssh_args[@]}" "$ssh_target" bash -s
+
+      # Upload is inert. The launcher performs the only rsync into the live tree
+      # after acquiring the persistent lock and re-reading the compatibility floor.
+      - name: Stage release on server
+        id: stage
+        env:
+          RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
+        run: |
+          set -euo pipefail
+          STAGED_RELEASE_NAME="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_SHA"
+          stage_path="$DEPLOY_PATH/.release/incoming/$STAGED_RELEASE_NAME"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p $(printf '%q' "$stage_path")"
           rsync -az --delete \
             --exclude=/.env \
             --exclude=/.env.production \
             --exclude=/.release \
+            --exclude=/.release-workflow \
             --exclude=.git \
             --exclude=node_modules \
             --exclude=dist \
             --exclude=logs \
             --exclude=coverage \
             -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
-            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$stage_path/"
+          echo "name=$STAGED_RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Roll out release on server
+      - name: Activate staged release on server
         env:
+          STAGED_RELEASE_NAME: ${{ steps.stage.outputs.name }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           CIRCLE_BE_IMAGE: ${{ needs.resolve.outputs.image_ref }}
           RELEASE_DOWNTIME: ${{ inputs.downtime && '1' || '0' }}
+          RELEASE_IRREVERSIBLE_MIGRATION: ${{ inputs.irreversible_migration && '1' || '0' }}
+          RELEASE_SCHEMA_COMPATIBILITY: ${{ needs.resolve.outputs.schema_compatibility }}
           # Ephemeral job token: lets the server pull from GHCR during this job
           # only. The image stays in the local Docker cache afterwards, so
           # restarts and cached rollbacks need no registry access.
@@ -295,9 +390,10 @@ jobs:
           # Env travels over stdin (printf %q-escaped), never argv, so the
           # registry token cannot show up in `ps` output on the server.
           {
-            printf 'export RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
-              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$GHCR_USER" "$GHCR_TOKEN"
-            printf 'exec bash %q/deploy/release-deploy.sh\n' "$DEPLOY_PATH"
+            printf 'export TARGET_SCHEMA_COMPATIBILITY=%q RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q RELEASE_IRREVERSIBLE_MIGRATION=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
+              "$RELEASE_SCHEMA_COMPATIBILITY" \
+              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$RELEASE_IRREVERSIBLE_MIGRATION" "$GHCR_USER" "$GHCR_TOKEN"
+            printf 'exec bash %q/.release/release-launcher.sh %q\n' "$DEPLOY_PATH" "$STAGED_RELEASE_NAME"
           } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
 
       # Outside-in verification from a network the server does not control:

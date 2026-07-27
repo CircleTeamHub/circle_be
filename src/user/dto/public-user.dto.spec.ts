@@ -31,6 +31,18 @@ describe('SelfUserDto serialization', () => {
         email: null,
         phoneNumber: null,
         vipLevel: 4,
+        storedVipLevel: 5,
+        vipExpiresAt: null,
+        membership: {
+          effectiveLevel: 4,
+          key: 'super',
+          appearance: {
+            nameColor: 'exclusive-shimmer',
+            badge: 'super-lifetime',
+          },
+          active: true,
+          lifetime: true,
+        },
         creditScore: 100,
         displayIcons: [
           {
@@ -62,6 +74,18 @@ describe('SelfUserDto serialization', () => {
       }),
     ]);
     expect(dto.inviteCode).toBe('invite1');
+    expect(dto.storedVipLevel).toBe(5);
+    expect(dto.vipLevel).toBe(4);
+    expect(dto.membership).toEqual({
+      effectiveLevel: 4,
+      key: 'super',
+      appearance: {
+        nameColor: 'exclusive-shimmer',
+        badge: 'super-lifetime',
+      },
+      active: true,
+      lifetime: true,
+    });
   });
 
   it('exposes region (inherited from PublicUserDto) and strips unknown/sensitive fields', () => {
@@ -73,6 +97,13 @@ describe('SelfUserDto serialization', () => {
         region: '上海',
         // Sensitive columns that must never leak through the response DTO.
         passwordHash: passwordHashFixture,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2026-05-01T00:00:00.000Z'),
+        membership: {
+          effectiveLevel: 3,
+          key: 'diamond',
+          appearance: { nameColor: 'rainbow', badge: 'diamond' },
+        },
         inviteCode: 'private1',
         openimSynced: true,
       } as Record<string, unknown>,
@@ -119,6 +150,13 @@ describe('PublicUserDto serialization (other-user view)', () => {
         email: 'secret@example.com',
         phoneNumber: '+8613800138000',
         passwordHash: passwordHashFixture,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2026-05-01T00:00:00.000Z'),
+        membership: {
+          effectiveLevel: 3,
+          key: 'diamond',
+          appearance: { nameColor: 'rainbow', badge: 'diamond' },
+        },
       } as Record<string, unknown>,
       { excludeExtraneousValues: true },
     );
@@ -127,10 +165,18 @@ describe('PublicUserDto serialization (other-user view)', () => {
     // region/city are intentionally public — same visibility as city (product decision).
     expect(view.region).toBe('上海');
     expect(view.city).toBe('杭州');
-    // PublicUserDto is the "no PII" view; PII and secrets must stay out.
+    // PublicUserDto is the "no PII" view; membership display level is public,
+    // but expiry/storage details stay private.
     expect(view.email).toBeUndefined();
     expect(view.phoneNumber).toBeUndefined();
     expect(view.passwordHash).toBeUndefined();
     expect(view.inviteCode).toBeUndefined();
+    expect(view.vipLevel).toBe(3);
+    expect(view.vipExpiresAt).toBeUndefined();
+    expect(dto.membership).toEqual({
+      effectiveLevel: 3,
+      key: 'diamond',
+      appearance: { nameColor: 'rainbow', badge: 'diamond' },
+    });
   });
 });

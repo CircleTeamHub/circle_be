@@ -1,5 +1,5 @@
 -- System badges can have multiple selectable variants under the same key,
--- e.g. VIP1..VIP5 are all SystemIconKey.VIP.
+-- e.g. VIP1..VIP4 are all SystemIconKey.VIP.
 ALTER TABLE "UserDisplayIcon" ADD COLUMN IF NOT EXISTS "systemVariant" TEXT;
 
 UPDATE "UserDisplayIcon"

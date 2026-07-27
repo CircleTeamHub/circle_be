@@ -16,6 +16,7 @@ import {
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
+import { PublicMembershipAppearanceDto } from 'src/user/dto/public-user.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -180,11 +181,13 @@ export class PlazaFeedQueryDto {
 
   @ApiPropertyOptional()
   @IsString()
+  @MaxLength(100)
   @IsOptional()
   city?: string;
 
-  @ApiPropertyOptional({ description: 'Comma-separated city names' })
+  @ApiPropertyOptional({ description: 'Comma-separated city names (legacy)' })
   @IsString()
+  @MaxLength(4096)
   @IsOptional()
   cities?: string;
 
@@ -214,6 +217,49 @@ export class PlazaFeedQueryDto {
   cursor?: string;
 }
 
+export class PlazaFeedSearchDto {
+  @ApiPropertyOptional()
+  @IsString()
+  @IsNotEmpty()
+  @IsOptional()
+  circleId?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayMaxSize(50)
+  @IsOptional()
+  circleIds?: string[];
+
+  @ApiProperty({ type: [String], maxItems: 1000 })
+  @IsArray()
+  @IsString({ each: true })
+  @MaxLength(100, { each: true })
+  @ArrayMaxSize(1000)
+  cities: string[];
+
+  @ApiPropertyOptional({ default: 1 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page?: number;
+
+  @ApiPropertyOptional({ default: 20 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit?: number;
+
+  @ApiPropertyOptional({ description: 'Keyset cursor from the previous page' })
+  @IsString()
+  @MaxLength(200)
+  @IsOptional()
+  cursor?: string;
+}
+
 // ── Response DTOs ────────────────────────────────────────────────────────────
 
 export class PlazaPostAuthorDto {
@@ -235,9 +281,13 @@ export class PlazaPostAuthorDto {
   @ApiProperty({
     type: Number,
     nullable: true,
-    description: '会员等级（名字特效渲染用）；null / 0 = 非会员',
+    description: '有效会员等级（名字特效渲染用，按到期算）；0 = 非会员',
   })
   vipLevel: number | null;
+
+  @ApiProperty({ type: PublicMembershipAppearanceDto })
+  @Type(() => PublicMembershipAppearanceDto)
+  membership: PublicMembershipAppearanceDto;
 
   @ApiProperty({ type: [DisplayIconDto] })
   displayIcons: DisplayIconDto[];
@@ -314,4 +364,34 @@ export class ReportCirclePostDto {
   @IsString()
   @MaxLength(500)
   reason?: string;
+}
+
+// GET /circle-plaza/feed 与 POST /circle-plaza/feed/search 的分页信封响应。之前 feed/search
+// 的 @ApiOkResponse 谎报成裸 PlazaPostDto[]，生成的移动端客户端会按错误的顶层结构反序列化。
+export class PlazaFeedResponseDto {
+  @ApiProperty({ type: PlazaPostDto, isArray: true })
+  items: PlazaPostDto[];
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: '总数；游标翻页时为 null',
+  })
+  total: number | null;
+
+  @ApiProperty()
+  page: number;
+
+  @ApiProperty()
+  limit: number;
+
+  @ApiProperty()
+  hasMore: boolean;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: '下一页 keyset 游标；无更多时为 null',
+  })
+  nextCursor: string | null;
 }

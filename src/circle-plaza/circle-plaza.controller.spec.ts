@@ -1,4 +1,9 @@
-import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { RequestMethod } from '@nestjs/common';
+import {
+  GUARDS_METADATA,
+  METHOD_METADATA,
+  PATH_METADATA,
+} from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CirclePlazaController } from './circle-plaza.controller';
@@ -38,5 +43,23 @@ describe('CirclePlazaController', () => {
     } as any);
 
     expect(service.getPostSignups).toHaveBeenCalledWith('author-1', 'post-1');
+  });
+
+  it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {
+    const service = { getFeed: jest.fn().mockResolvedValue({ items: [] }) };
+    const controller = new CirclePlazaController(service as any);
+    const body = { cities: [' Shanghai ', 'Shanghai'], limit: 25 };
+
+    await controller.feedSearch(body, {
+      user: { userId: 'viewer-1' },
+    } as any);
+
+    const handler = CirclePlazaController.prototype.feedSearch;
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe('feed/search');
+    expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBe(
+      RequestMethod.POST,
+    );
+    expect(service.getFeed).toHaveBeenCalledWith('viewer-1', body);
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', handler)).toBe(60);
   });
 });

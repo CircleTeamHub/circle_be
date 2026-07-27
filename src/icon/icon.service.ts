@@ -2,8 +2,12 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  Optional,
+  OnModuleInit,
+  OnModuleDestroy,
 } from '@nestjs/common';
 import { IconErrorCode } from 'src/common/app-error-codes';
+import { RedisService } from 'src/redis/redis.service';
 import {
   DisplayIconDto,
   DisplayIconTypeDto,
@@ -41,6 +45,13 @@ const VERIFIED_PROFILE_MIN_BIO_LENGTH = 10;
 export const MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS = 200;
 const DISPLAY_ICON_CACHE_TTL_MS = 30_000;
 const DISPLAY_ICON_CACHE_MAX_ENTRIES = 5_000;
+// Cross-instance eviction channel for the per-instance in-memory displayIconCache.
+// Eligibility is derived from vipLevel, so a committed membership grant on one
+// instance must evict every instance's cache — otherwise other nodes keep
+// serving the old-tier badge for up to the TTL. Message payload = userId.
+const DISPLAY_ICON_INVALIDATION_CHANNEL = 'circle:icon:display-invalidate';
+const DISPLAY_ICON_SUBSCRIPTION_RETRY_BASE_MS = 1_000;
+const DISPLAY_ICON_SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 
 type CachedDisplayIcons = {
   data: DisplayIconDto[];
@@ -57,12 +68,14 @@ type EligibleCircleIcon = {
 type Eligibility = {
   systemIcons: EligibleSystemIcon[];
   circleIcons: EligibleCircleIcon[];
+  membershipExpiresAt: number | null;
 };
 
 // Prefetched inputs for building eligibility, shared by the single-user and
 // batch paths so both compute identical results from the same shapes.
 type EligibilityUserRow = {
   vipLevel: number;
+  vipExpiresAt: Date | null;
   receivedLikeCount: number;
   createdAt: Date;
   status: string;
@@ -103,6 +116,7 @@ type StoredSelection = {
 const ELIGIBILITY_USER_SELECT = {
   id: true,
   vipLevel: true,
+  vipExpiresAt: true,
   receivedLikeCount: true,
   createdAt: true,
   status: true,
@@ -155,14 +169,82 @@ function toPrismaSystemIconKey(
 }
 
 @Injectable()
-export class IconService {
+export class IconService implements OnModuleInit, OnModuleDestroy {
   private readonly displayIconCache = new Map<string, CachedDisplayIcons>();
+  private displayIconSubscriptionActive = false;
+  private displayIconSubscriptionRetryAttempt = 0;
+  private displayIconSubscriptionRetryTimer: NodeJS.Timeout | null = null;
+  private destroyed = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
+    @Optional() private readonly redisService?: RedisService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    await this.ensureDisplayIconSubscription();
+  }
+
+  onModuleDestroy(): void {
+    this.destroyed = true;
+    if (this.displayIconSubscriptionRetryTimer) {
+      clearTimeout(this.displayIconSubscriptionRetryTimer);
+      this.displayIconSubscriptionRetryTimer = null;
+    }
+  }
+
+  // Subscribe to the cross-instance eviction channel, retrying with backoff if
+  // Redis is unreachable at boot. A one-shot subscribe would leave this instance
+  // permanently deaf to grant invalidations after a startup Redis outage (it
+  // still publishes, but never receives) — serving stale membership badges for
+  // the cache TTL on every request until restart. Without Redis at all the cache
+  // stays per-instance and falls back to its 30s TTL, exactly as before.
+  private async ensureDisplayIconSubscription(): Promise<void> {
+    if (
+      this.destroyed ||
+      this.displayIconSubscriptionActive ||
+      !this.redisService?.isEnabled()
+    ) {
+      return;
+    }
+
+    this.displayIconSubscriptionActive =
+      await this.redisService.subscribePattern(
+        DISPLAY_ICON_INVALIDATION_CHANNEL,
+        (_channel, message) => {
+          if (message) this.displayIconCache.delete(message);
+        },
+      );
+
+    if (this.displayIconSubscriptionActive) {
+      this.displayIconSubscriptionRetryAttempt = 0;
+      return;
+    }
+
+    this.scheduleDisplayIconSubscriptionRetry();
+  }
+
+  private scheduleDisplayIconSubscriptionRetry(): void {
+    if (this.destroyed || this.displayIconSubscriptionRetryTimer) {
+      return;
+    }
+
+    const delay = Math.min(
+      DISPLAY_ICON_SUBSCRIPTION_RETRY_BASE_MS *
+        2 ** this.displayIconSubscriptionRetryAttempt,
+      DISPLAY_ICON_SUBSCRIPTION_RETRY_MAX_MS,
+    );
+    this.displayIconSubscriptionRetryAttempt += 1;
+
+    this.displayIconSubscriptionRetryTimer = setTimeout(() => {
+      this.displayIconSubscriptionRetryTimer = null;
+      void this.ensureDisplayIconSubscription();
+    }, delay);
+    // Don't keep the process alive solely for this retry timer.
+    this.displayIconSubscriptionRetryTimer.unref?.();
+  }
 
   private invalidateDisplayIconCache(userId: string): void {
     this.displayIconCache.delete(userId);
@@ -178,7 +260,11 @@ export class IconService {
     return entry.data;
   }
 
-  private setCachedDisplayIcons(userId: string, data: DisplayIconDto[]): void {
+  private setCachedDisplayIcons(
+    userId: string,
+    data: DisplayIconDto[],
+    membershipExpiresAt: number | null,
+  ): void {
     if (this.displayIconCache.size >= DISPLAY_ICON_CACHE_MAX_ENTRIES) {
       // Simple eviction: drop the oldest insertion-order entry.
       const oldestKey = this.displayIconCache.keys().next().value;
@@ -186,9 +272,13 @@ export class IconService {
         this.displayIconCache.delete(oldestKey);
       }
     }
+    const normalExpiry = Date.now() + DISPLAY_ICON_CACHE_TTL_MS;
     this.displayIconCache.set(userId, {
       data,
-      expiresAt: Date.now() + DISPLAY_ICON_CACHE_TTL_MS,
+      expiresAt:
+        membershipExpiresAt === null
+          ? normalExpiry
+          : Math.min(normalExpiry, membershipExpiresAt),
     });
   }
 
@@ -232,7 +322,7 @@ export class IconService {
     const eligibility = await this.resolveEligibility(userId);
     const selections = await this.ensureSelections(userId, eligibility);
     const result = this.mapSelectionsToDisplayIcons(selections, eligibility);
-    this.setCachedDisplayIcons(userId, result);
+    this.setCachedDisplayIcons(userId, result, eligibility.membershipExpiresAt);
     return result;
   }
 
@@ -296,7 +386,11 @@ export class IconService {
         selectionsByUser.get(user.id) ?? [],
         user.iconPreferencesInitialized,
       );
-      this.setCachedDisplayIcons(user.id, display);
+      this.setCachedDisplayIcons(
+        user.id,
+        display,
+        eligibility.membershipExpiresAt,
+      );
       result.set(user.id, display);
     }
 
@@ -345,7 +439,10 @@ export class IconService {
    * observe directly (e.g. circle icon swaps that affect circle eligibility).
    */
   invalidateDisplayIconCacheFor(userId: string): void {
+    // Evict locally immediately, then fan the eviction out to every other
+    // instance over Redis (fire-and-forget, mirroring the realtime backplane).
     this.invalidateDisplayIconCache(userId);
+    void this.redisService?.publish(DISPLAY_ICON_INVALIDATION_CHANNEL, userId);
   }
 
   async updateDisplayIcons(
@@ -490,6 +587,7 @@ export class IconService {
   ): Eligibility {
     const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons({
       vipLevel: user.vipLevel,
+      vipExpiresAt: user.vipExpiresAt,
       receivedLikeCount: user.receivedLikeCount,
     });
     if (Date.now() - user.createdAt.getTime() <= NEW_USER_MS) {
@@ -531,7 +629,15 @@ export class IconService {
         fallbackIconName: 'people-circle-outline',
       }));
 
-    return { systemIcons, circleIcons };
+    const effectiveMembershipIcon = systemIcons.find(
+      (icon) => icon.systemKey === SystemIconKeyDto.VIP,
+    );
+    const membershipExpiresAt =
+      effectiveMembershipIcon && user.vipLevel < 4
+        ? (user.vipExpiresAt?.getTime() ?? null)
+        : null;
+
+    return { systemIcons, circleIcons, membershipExpiresAt };
   }
 
   // Verified Profile: an ACTIVE user with a complete profile (avatar, nickname,
@@ -590,27 +696,24 @@ export class IconService {
     },
     eligibility: Eligibility,
   ): string | null {
-    const isLegacyPlaceholderVariant =
-      selection.systemVariant &&
-      selection.systemVariant === selection.systemKey &&
-      isLeveledSystemBadgeKey(selection.systemKey);
-
-    if (selection.systemVariant && !isLegacyPlaceholderVariant) {
-      return selection.systemVariant;
-    }
-
-    if (!selection.systemKey) {
-      return null;
-    }
-
-    if (isLeveledSystemBadgeKey(selection.systemKey)) {
+    // Leveled system badges (the VIP tiers) ALWAYS resolve to the user's current
+    // effective variant, regardless of which variant was persisted. A saved VIP1
+    // selection must render as VIP2 after an upgrade (and cleanly drop out once
+    // no tier is eligible) instead of being treated as a stale VIP1 row and
+    // deleted — which would blank the membership badge on /auth/me, profiles and
+    // feeds. This also subsumes the legacy 'VIP'/'VIP5' placeholder variants.
+    if (selection.systemKey && isLeveledSystemBadgeKey(selection.systemKey)) {
       const leveledIcons = eligibility.systemIcons.filter(
         (icon) => icon.systemKey === selection.systemKey,
       );
       return lastItem(leveledIcons)?.systemVariant ?? selection.systemKey;
     }
 
-    return selection.systemKey;
+    // Non-leveled badges keep their explicit variant, else fall back to the key.
+    if (selection.systemVariant) {
+      return selection.systemVariant;
+    }
+    return selection.systemKey ?? null;
   }
 
   private defaultDisplaySystemIcons(

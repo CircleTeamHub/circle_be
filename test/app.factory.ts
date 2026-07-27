@@ -45,8 +45,16 @@ export class AppFactory {
   // Clear all test data in dependency order
   async initDB() {
     assertSafeE2eDatabase();
+    await this.prisma.notificationPushOutbox.deleteMany();
+    await this.prisma.notification.deleteMany();
+    await this.prisma.membershipBenefitGrant.deleteMany();
+    await this.prisma.membershipGrant.deleteMany();
     await this.prisma.refreshToken.deleteMany();
     await this.prisma.user.deleteMany();
+    // Reset the staged-rollout singleton so each test starts DISABLED. Quota
+    // tests that need the enforced (non-floored) limits enable it explicitly;
+    // without this reset an enablement would leak into later tests.
+    await this.prisma.membershipProgramState.deleteMany();
   }
 
   async cleanup() {

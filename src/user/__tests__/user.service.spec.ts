@@ -95,7 +95,7 @@ describe('UserService', () => {
       expect(result).toEqual({ a: 3, b: 0 });
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: ['a', 'b', 'missing'] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
     });
 
@@ -117,7 +117,7 @@ describe('UserService', () => {
       // 响应键用调用方传入的原始 id,前端按当初传的原样查回。
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: [uuid] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
       expect(result).toEqual({ [imId]: 4 });
     });
@@ -132,9 +132,30 @@ describe('UserService', () => {
       // 归一后只查一次(同一 UUID),但两种别名都要回——否则用另一形态的一侧会默认 VIP0。
       expect(prisma.user.findMany).toHaveBeenCalledWith({
         where: { id: { in: [uuid] } },
-        select: { id: true, vipLevel: true },
+        select: { id: true, vipLevel: true, vipExpiresAt: true },
       });
       expect(result).toEqual({ [uuid]: 4, [imId]: 4 });
+    });
+
+    it('resolves expiry so an expired paid level maps to 0', async () => {
+      // Fixed past/future dates cross the expiry boundary against real `now`.
+      const past = new Date('2020-01-01T00:00:00.000Z');
+      const future = new Date('2999-01-01T00:00:00.000Z');
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'expired', vipLevel: 3, vipExpiresAt: past },
+        { id: 'active', vipLevel: 2, vipExpiresAt: future },
+        { id: 'lifetime', vipLevel: 4, vipExpiresAt: null },
+      ]);
+
+      const result = await service.getVipLevels([
+        'expired',
+        'active',
+        'lifetime',
+      ]);
+
+      // Expired paid level collapses to 0 (no leaked paid name effect); an
+      // unexpired level is preserved; super (4) is lifetime regardless.
+      expect(result).toEqual({ expired: 0, active: 2, lifetime: 4 });
     });
   });
 
@@ -269,7 +290,17 @@ describe('UserService', () => {
       });
       expect(prisma.user.count).toHaveBeenCalledWith({ where: undefined });
       expect(result).toEqual({
-        data: [{ id: 'user-1' }],
+        data: [
+          {
+            id: 'user-1',
+            vipLevel: 0,
+            membership: {
+              effectiveLevel: 0,
+              key: 'regular',
+              appearance: { nameColor: 'default', badge: null },
+            },
+          },
+        ],
         total: 7,
         page: 2,
         limit: 5,
@@ -330,6 +361,8 @@ describe('UserService', () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         receivedLikeCount: 4,
+        vipLevel: 2,
+        vipExpiresAt: new Date(Date.now() - 1),
       });
       // Self-view: likedByMeToday is always false and no like lookup is made.
       await expect(service.findOne('user-1')).resolves.toMatchObject({
@@ -337,7 +370,15 @@ describe('UserService', () => {
         displayIcons: [],
         likeCount: 4,
         likedByMeToday: false,
+        vipLevel: 0,
+        membership: {
+          effectiveLevel: 0,
+          key: 'regular',
+          appearance: { nameColor: 'default', badge: null },
+        },
       });
+      const result = await service.findOne('user-1');
+      expect(result).not.toHaveProperty('vipExpiresAt');
       expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
     });
 
@@ -450,6 +491,22 @@ describe('UserService', () => {
         }),
       );
       expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
+    });
+
+    it('maps an expired paid membership to the public view in the deletion body', async () => {
+      prisma.user.update.mockResolvedValue({
+        id: 'user-1',
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.remove('user-1');
+
+      // Expired level 3 → effective 0 and the membership object is present, so
+      // the deletion body matches every other public-user response instead of
+      // leaking the stored paid tier.
+      expect(result.vipLevel).toBe(0);
+      expect(result.membership.effectiveLevel).toBe(0);
     });
   });
 });
