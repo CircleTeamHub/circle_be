@@ -243,6 +243,33 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
   这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——
   改从异地副本恢复,见下面「异地备份」。
 
+### ⚠️ 加固待办:锁死历史 workflow 绕过 floor(需服务器端配置)
+
+**残留风险(未闭合)**:`.release/release-launcher.sh` 的持久锁 + `minimum-schema-compatibility`
+下限,以及 `release-deploy.sh` 顶部的 `RELEASE_LAUNCHER_ACTIVE` 守卫,都只保护**当前**发版
+管线。若有人重跑一个**在 launcher 引入之前**的旧 Release workflow,它会把自己的检出用 rsync
+直接盖到 `DEPLOY_PATH` 并执行**那份旧的、无守卫的** `release-deploy.sh` —— 既不经过持久
+launcher、也不读 `minimum-schema-compatibility`,于是可能在已抬高 floor 之后仍启动旧二进制、
+打到已被不可逆迁移契约化的 schema 上。
+
+**为什么仓库内改不掉**:旧 workflow 发给服务器的命令(`rsync … DEPLOY_PATH/` + `bash
+deploy/release-deploy.sh`)由**旧的检出**决定,新代码无法改变历史 workflow 会发什么。唯一
+能拦截它的层是**服务器的 `~/.ssh/authorized_keys`**,不在本仓库里。
+
+**目标修法(SSH ForceCommand)**:给部署 key 挂 `command="…"`,把该 key 的所有 SSH 会话
+强制经过 `.release/` 下的持久入口 —— 只放行「rsync 进 `.release/incoming/`」「安装 / 调用
+launcher」,拒绝「live-tree rsync」和「直接执行 `release-deploy.sh`」。因为 `command=` 写在
+服务器 authorized_keys 里,任何被 rsync 覆盖的仓库代码都替换不了它,历史 workflow 也就绕
+不过去。
+
+**为何尚未落地**:`.github/workflows/release.yml` 现用 `bash -s`(经 stdin 传 GHCR token,
+刻意不进 `argv` 以免出现在 `ps`)。ForceCommand 无法内省 stdin 脚本,所以启用它必须同时把
+发版流改成**显式命令**且保持 token 不进 argv —— 属较大、需在 **staging 真跑一次**验证的独立
+运维改动,不在应用代码 PR 范围内。
+
+**在此之前的运维硬约束**:① 绝不重跑「抬高 floor 之前」的历史 Release workflow;② 回滚一律
+走上面〈回滚 / 重放〉的持久 launcher 手动流程,绝不直接执行目标树内的 `release-deploy.sh`。
+
 ### 异地备份(可选;加密后上传到对象存储)
 
 `~/circle_be_backups/` 和 `pg_data` 卷在**同一台 VPS** 上:磁盘损坏、实例丢失、
