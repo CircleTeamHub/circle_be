@@ -163,7 +163,7 @@
 - `months Int?`
 - `unitPrice Int`
 - `totalPrice Int`
-- `walletBalanceAfter Int`
+- `walletBalanceAfter Int?`
 - `previousExpiresAt DateTime?`
 - `newExpiresAt DateTime?`
 - `createdAt DateTime`
@@ -183,7 +183,7 @@
 
 因此不同用户可以安全复用相同的客户端请求头。购买指纹绑定用户、操作、号码和标准化月份；超级会员永久购买会先把客户端传入或省略的 `months` 统一归一为 `null`。续费指纹额外绑定当前 `leaseID`，避免同一用户在未来的新租约上误用旧键时重放历史续费。同一作用域键且指纹相同返回原结果，指纹不同返回冲突。内部 `SUPER_CONVERSION` 和 `LEGACY_GRANT` 使用上述确定性键防止重复订单，不依赖客户端请求头。
 
-`walletBalanceAfter` 保存订单提交时观察到的余额。幂等重放返回原订单及该历史余额快照，不用当前钱包余额改写旧响应；客户端需要最新余额时使用钱包查询接口或实时事件。
+`walletBalanceAfter` 保存用户发起的购买/续费订单提交时观察到的余额。幂等重放返回原订单及该历史余额快照，不用当前钱包余额改写旧响应；客户端需要最新余额时使用钱包查询接口或实时事件。`LEGACY_GRANT` 和后台 `SUPER_CONVERSION` 等内部零价订单允许该字段为空，迁移或会员升级不能为了余额快照而创建无业务需要的钱包。
 
 普通购买/续费产生一条 `CoinTransaction(type=PURCHASE, amount=-totalPrice, relatedID=order.id)`。零价永久选号、超级会员转永久和历史迁移不产生虚假的积分流水。
 
@@ -417,14 +417,14 @@
 
 1. 进入维护模式，阻断所有创建用户、修改 `accountId` 和生成/修改 `inviteCode` 的入口。
 2. 直接基于现有 `User.accountId` 和 `inviteCode` 做标准化跨列、跨用户冲突预检；发现冲突时在任何注册表写入前终止，并输出可定位记录，不能静默覆盖。
-3. 创建枚举、注册表、库存、租约和订单表及索引。
+3. 创建枚举、注册表、库存、租约和订单表及索引，并先以可空/宽松约束形式添加用户靓号快照字段。
 4. 在预检通过后回填所有现有 `accountId` 和 `inviteCode`。
 5. 为现有 `fancyNumber=true` 用户：
    - 将当前 `accountId` 建为库存记录；
    - 创建永久租约和 `LEGACY_GRANT` 零价订单；
    - 设置永久快照；
    - 不要求可恢复原账号，因为永久租约不会到期。
-6. 增加用户快照字段和必要外键/检查约束。
+6. 校验注册表、历史租约和用户快照回填结果，再为用户快照补默认值/非空约束，并增加必要外键和检查约束。
 7. 部署所有账号创建、邀请码生成、改号、购买和到期路径统一使用注册表的代码。
 8. 运行一致性校验，确认每个 `User.accountId`、`inviteCode` 与注册表归属一致。
 9. 恢复流量。
