@@ -141,15 +141,15 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 
 ---
 
-## 待合入(修复已就绪,尚未进入 main)
+## 已闭合(仍需补强回归测试)
 
 - **icon 资格分页截断已选圈子 / Circle Builder 资格**(原 P2):与生产数据无关的代码正确性缺陷,
   本地开发即可复现 —— 用户若加入 200 个以上圈子,其已选圈子或符合 Circle Builder 资格的
-  成员关系可能排在窗口之外,已保存的有效图标随后会被当作 stale 删除。
+  成员关系过去可能排在窗口之外,已保存的有效图标随后会被当作 stale 删除。
 
-  修复见 PR [CircleTeamHub/circle_be#129](https://github.com/CircleTeamHub/circle_be/pull/129)。
-  **在该 PR 合入 main 之前,本条仍然成立**:当前 main 的 `IconService.fetchEligibilityMemberships`
-  依旧只按 `createdAt DESC` 取每人最新 200 条。合入后再把本条移到「已闭合」。
+  PR [CircleTeamHub/circle_be#129](https://github.com/CircleTeamHub/circle_be/pull/129)
+  已合入 `main`:当前 `IconService.fetchEligibilityMemberships` 会在应用每用户 200 条上限前,
+  优先保留已持久化的圈子图标选择和符合 Circle Builder 条件的成员关系。
 
-  另:#129 目前只有单测覆盖(SQL 排序断言),**尚缺**把符合资格的成员关系放到第 201 位之后的
+  剩余测试缺口:#129 目前只有单测覆盖(SQL 排序断言),**尚缺**把符合资格的成员关系放到第 201 位之后的
   真实 PostgreSQL 集成回归测试 —— 上线前补上。
