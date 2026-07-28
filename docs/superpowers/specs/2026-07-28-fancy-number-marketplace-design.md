@@ -163,6 +163,7 @@
 - `months Int?`
 - `unitPrice Int`
 - `totalPrice Int`
+- `walletBalanceAfter Int`
 - `previousExpiresAt DateTime?`
 - `newExpiresAt DateTime?`
 - `createdAt DateTime`
@@ -180,7 +181,9 @@
 - 超级会员转永久：`super-conversion:{leaseID}`；
 - 历史迁移：`legacy-grant:{userID}:{fancyNumberID}`。
 
-因此不同用户可以安全复用相同的客户端请求头。`requestFingerprint` 对客户端操作绑定用户、操作、号码和月份；同一作用域键且指纹相同返回原结果，指纹不同返回冲突。内部 `SUPER_CONVERSION` 和 `LEGACY_GRANT` 使用上述确定性键防止重复订单，不依赖客户端请求头。
+因此不同用户可以安全复用相同的客户端请求头。购买指纹绑定用户、操作、号码和标准化月份；超级会员永久购买会先把客户端传入或省略的 `months` 统一归一为 `null`。续费指纹额外绑定当前 `leaseID`，避免同一用户在未来的新租约上误用旧键时重放历史续费。同一作用域键且指纹相同返回原结果，指纹不同返回冲突。内部 `SUPER_CONVERSION` 和 `LEGACY_GRANT` 使用上述确定性键防止重复订单，不依赖客户端请求头。
+
+`walletBalanceAfter` 保存订单提交时观察到的余额。幂等重放返回原订单及该历史余额快照，不用当前钱包余额改写旧响应；客户端需要最新余额时使用钱包查询接口或实时事件。
 
 普通购买/续费产生一条 `CoinTransaction(type=PURCHASE, amount=-totalPrice, relatedID=order.id)`。零价永久选号、超级会员转永久和历史迁移不产生虚假的积分流水。
 
@@ -413,9 +416,9 @@
 首次引入账号注册表需要维护窗口：迁移开始前停止注册、管理员创建用户和修改账号写入，完成迁移与新代码部署后再恢复流量。当前数据库为测试环境，可以在该窗口内直接迁移；未来生产上线也必须使用同一维护窗口，不能在旧代码仍可写入时边回填边切换。
 
 1. 进入维护模式，阻断所有创建用户、修改 `accountId` 和生成/修改 `inviteCode` 的入口。
-2. 创建枚举、注册表、库存、租约和订单表及索引。
-3. 回填所有现有 `accountId` 和 `inviteCode`。
-4. 对跨列、跨用户冲突做迁移前检查；发现冲突时迁移失败并输出可定位记录，不能静默覆盖。
+2. 直接基于现有 `User.accountId` 和 `inviteCode` 做标准化跨列、跨用户冲突预检；发现冲突时在任何注册表写入前终止，并输出可定位记录，不能静默覆盖。
+3. 创建枚举、注册表、库存、租约和订单表及索引。
+4. 在预检通过后回填所有现有 `accountId` 和 `inviteCode`。
 5. 为现有 `fancyNumber=true` 用户：
    - 将当前 `accountId` 建为库存记录；
    - 创建永久租约和 `LEGACY_GRANT` 零价订单；
