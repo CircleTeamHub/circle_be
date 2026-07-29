@@ -180,7 +180,7 @@ export class AuthService {
       passwordHash,
       nickname: dto.nickname,
       email,
-      ...(inviter ? { invitedBy: { connect: { id: inviter.id } } } : {}),
+      ...(inviter ? { invitedByUserId: inviter.id } : {}),
     });
 
     // Sync to OpenIM non-blocking. Mark openimSynced=true on success so
@@ -1233,7 +1233,7 @@ export class AuthService {
   }
 
   private async createRegisteredUser(
-    data: Omit<Prisma.UserCreateInput, 'accountId' | 'inviteCode'>,
+    data: Omit<Prisma.UserUncheckedCreateInput, 'accountId' | 'inviteCode'>,
   ) {
     const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {

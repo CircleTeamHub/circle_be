@@ -40,6 +40,41 @@ describe('fancy number persistence contract', () => {
     expect(sql).toContain('pg_advisory_xact_lock');
     expect(sql).toContain('ORDER BY identifier');
     expect(sql).toContain('AccountIdentifier_lock_value_trigger');
+    const prepareStart = sql.indexOf(
+      'CREATE OR REPLACE FUNCTION "User_account_identifier_prepare"',
+    );
+    const cleanupStart = sql.indexOf(
+      'CREATE OR REPLACE FUNCTION "User_account_identifier_cleanup"',
+    );
+    expect(cleanupStart).toBeGreaterThan(prepareStart);
+    expect(sql.slice(prepareStart, cleanupStart)).not.toContain(
+      'DELETE FROM "AccountIdentifier"',
+    );
+    expect(sql.slice(cleanupStart)).toContain(
+      'DELETE FROM "AccountIdentifier"',
+    );
+    expect(sql).toMatch(
+      /CREATE TRIGGER "User_account_identifier_cleanup_trigger"[\s\S]*AFTER UPDATE OF "accountId", "inviteCode"/,
+    );
+    const forwardSql = readFileSync(
+      join(
+        root,
+        'prisma/migrations/20260729160000_account_identifier_cleanup_trigger/migration.sql',
+      ),
+      'utf8',
+    );
+    const forwardPrepareStart = forwardSql.indexOf(
+      'CREATE OR REPLACE FUNCTION "User_account_identifier_prepare"',
+    );
+    const forwardCleanupStart = forwardSql.indexOf(
+      'CREATE OR REPLACE FUNCTION "User_account_identifier_cleanup"',
+    );
+    expect(
+      forwardSql.slice(forwardPrepareStart, forwardCleanupStart),
+    ).not.toContain('DELETE FROM "AccountIdentifier"');
+    expect(forwardSql.slice(forwardCleanupStart)).toContain(
+      'AFTER UPDATE OF "accountId", "inviteCode"',
+    );
   });
 
   it('adds an auditable order type for permanent-number switching', () => {

@@ -53,6 +53,7 @@ describe('NotificationAdminController', () => {
   it('publishes trimmed system announcement content from the authenticated admin', async () => {
     await request(app.getHttpServer())
       .post('/admin/system-announcements')
+      .set('Idempotency-Key', 'announcement-request-1')
       .send({ content: '  New app version is available.  ' })
       .expect(201, response);
 
@@ -61,11 +62,21 @@ describe('NotificationAdminController', () => {
       {
         content: 'New app version is available.',
       },
+      'announcement-request-1',
       expect.objectContaining({
         ip: expect.any(String),
         userAgent: null,
       }),
     );
+  });
+
+  it('requires an idempotency key for system announcements', async () => {
+    await request(app.getHttpServer())
+      .post('/admin/system-announcements')
+      .send({ content: 'New app version is available.' })
+      .expect(400);
+
+    expect(service.publishSystemAnnouncement).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -77,6 +88,7 @@ describe('NotificationAdminController', () => {
   ])('rejects an invalid announcement DTO: %j', async (body) => {
     await request(app.getHttpServer())
       .post('/admin/system-announcements')
+      .set('Idempotency-Key', 'announcement-request-invalid')
       .send(body)
       .expect(400);
     expect(service.publishSystemAnnouncement).not.toHaveBeenCalled();

@@ -23,7 +23,7 @@ CREATE TABLE "AvatarFrameAsset" (
   "isActive" BOOLEAN NOT NULL DEFAULT true,
   "sortOrder" INTEGER NOT NULL DEFAULT 0,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
 
   CONSTRAINT "AvatarFrameAsset_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "AvatarFrameAsset_minimumVipLevel_check"
@@ -42,7 +42,7 @@ CREATE TABLE "UserAvatarFrameGrant" (
   "revokedByUserID" TEXT,
   "revokeReason" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
 
   CONSTRAINT "UserAvatarFrameGrant_pkey" PRIMARY KEY ("id")
 );
@@ -92,7 +92,8 @@ INSERT INTO "AvatarFrameAsset" (
   "name",
   "description",
   "minimumVipLevel",
-  "sortOrder"
+  "sortOrder",
+  "updatedAt"
 )
 VALUES
   (
@@ -101,7 +102,8 @@ VALUES
     'Diamond Avatar Frame',
     'Unlocked by an active Diamond or Super membership.',
     3,
-    30
+    30,
+    CURRENT_TIMESTAMP
   ),
   (
     '00000000-0000-4000-8000-000000000004',
@@ -109,7 +111,8 @@ VALUES
     'Super Avatar Frame',
     'Unlocked by a Super membership.',
     4,
-    40
+    40,
+    CURRENT_TIMESTAMP
   );
 
 -- Install the foreign key without a table scan while holding the brief ALTER

@@ -1,4 +1,4 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException } from '@nestjs/common';
 import { AdminCommunityService } from './admin-community.service';
 
 describe('AdminCommunityService', () => {
@@ -15,7 +15,7 @@ describe('AdminCommunityService', () => {
       create: jest.fn(),
       findMany: jest.fn(),
     },
-    adminAuditLog: { create: jest.fn() },
+    adminAuditLog: { findFirst: jest.fn(), create: jest.fn() },
   };
   const prisma = {
     $transaction: jest.fn(async (callback: (client: typeof tx) => unknown) =>
@@ -33,6 +33,7 @@ describe('AdminCommunityService', () => {
     tx.$executeRaw.mockResolvedValue(1);
     tx.circle.findFirst.mockResolvedValue(null);
     tx.adminGroupOperation.findFirst.mockResolvedValue(null);
+    tx.adminAuditLog.findFirst.mockResolvedValue(null);
   });
 
   it('disables a circle immediately and queues a durable group mute', async () => {
@@ -88,6 +89,9 @@ describe('AdminCommunityService', () => {
       groupID: 'group-1',
       deleted: true,
       adminState: 'DISABLED',
+      adminDisabledAt: new Date('2026-07-29T00:00:00.000Z'),
+      adminDisabledBy: 'admin-1',
+      adminDisableReason: '违规内容',
     });
     tx.circle.update.mockResolvedValue({
       id: 'circle-1',
@@ -135,6 +139,31 @@ describe('AdminCommunityService', () => {
     expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
   });
 
+  it('does not restore a legacy deleted circle without admin-disable provenance', async () => {
+    tx.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: '作者已删除圈子',
+      groupID: 'group-1',
+      deleted: true,
+      adminState: 'ACTIVE',
+      adminDisabledAt: null,
+      adminDisabledBy: null,
+      adminDisableReason: null,
+    });
+
+    await expect(
+      service.restoreCircle({
+        actorId: 'admin-1',
+        circleId: 'circle-1',
+        reason: '尝试恢复',
+        confirmation: '作者已删除圈子',
+        idempotencyKey: 'request-legacy',
+      }),
+    ).rejects.toThrow('圈子不是由管理员停用，无法恢复');
+    expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
+    expect(tx.circle.update).not.toHaveBeenCalled();
+  });
+
   it('rejects a circle action when the confirmation does not match', async () => {
     tx.circle.findUnique.mockResolvedValue({
       id: 'circle-1',
@@ -155,7 +184,7 @@ describe('AdminCommunityService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
-  it('rejects circle muting when no OpenIM group is linked', async () => {
+  it('disables an unlinked circle locally without queuing OpenIM work', async () => {
     tx.circle.findUnique.mockResolvedValue({
       id: 'circle-1',
       name: '摄影爱好者',
@@ -163,16 +192,83 @@ describe('AdminCommunityService', () => {
       deleted: false,
       adminState: 'ACTIVE',
     });
+    tx.circle.update.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影爱好者',
+      groupID: null,
+      deleted: true,
+      adminState: 'DISABLED',
+    });
 
-    await expect(
-      service.disableCircle({
-        actorId: 'admin-1',
-        circleId: 'circle-1',
-        reason: '违规内容',
-        confirmation: '摄影爱好者',
-        idempotencyKey: 'request-1',
+    const result = await service.disableCircle({
+      actorId: 'admin-1',
+      circleId: 'circle-1',
+      reason: '违规内容',
+      confirmation: '摄影爱好者',
+      idempotencyKey: 'request-1',
+    });
+
+    expect(tx.circle.update).toHaveBeenCalledWith({
+      where: { id: 'circle-1' },
+      data: expect.objectContaining({
+        deleted: true,
+        adminState: 'DISABLED',
+        adminDisabledBy: 'admin-1',
+        adminDisableReason: '违规内容',
       }),
-    ).rejects.toBeInstanceOf(NotFoundException);
+    });
+    expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
+    expect(tx.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        actorID: 'admin-1',
+        action: 'ADMIN_CIRCLE_STATE_CHANGED',
+        entityType: 'Circle',
+        entityID: 'circle-1',
+        reason: '违规内容',
+        requestId: 'request-1',
+      }),
+    });
+    expect(result).toEqual({
+      circle: expect.objectContaining({
+        id: 'circle-1',
+        adminState: 'DISABLED',
+      }),
+      operation: null,
+    });
+  });
+
+  it('replays an unlinked circle action without applying it twice', async () => {
+    tx.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: '摄影爱好者',
+      groupID: null,
+      deleted: true,
+      adminState: 'DISABLED',
+    });
+    tx.adminAuditLog.findFirst.mockResolvedValue({
+      actorID: 'admin-1',
+      action: 'ADMIN_CIRCLE_STATE_CHANGED',
+      entityType: 'Circle',
+      entityID: 'circle-1',
+      reason: '违规内容',
+      requestId: 'request-1',
+      metadata: { type: 'MUTE' },
+    });
+
+    const result = await service.disableCircle({
+      actorId: 'admin-1',
+      circleId: 'circle-1',
+      reason: '违规内容',
+      confirmation: '摄影爱好者',
+      idempotencyKey: 'request-1',
+    });
+
+    expect(tx.circle.update).not.toHaveBeenCalled();
+    expect(tx.adminAuditLog.create).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      circle: expect.objectContaining({ id: 'circle-1' }),
+      operation: null,
+    });
   });
 
   it('queues a confirmed standalone group dismissal', async () => {

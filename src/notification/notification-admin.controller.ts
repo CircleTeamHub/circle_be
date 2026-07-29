@@ -1,5 +1,18 @@
-import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Headers,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiHeader,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
 import type { RequestWithUser } from 'src/auth/types';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
@@ -16,6 +29,16 @@ function auditContext(req: RequestWithUser) {
   };
 }
 
+function requireIdempotencyKey(value: string | undefined): string {
+  const normalized = value?.trim();
+  if (!normalized || normalized.length > 128) {
+    throw new BadRequestException(
+      'Idempotency-Key header is required and must be at most 128 characters',
+    );
+  }
+  return normalized;
+}
+
 @ApiTags('Admin System Announcements')
 @ApiBearerAuth()
 @UseGuards(JwtGuard, AdminGuard)
@@ -25,13 +48,20 @@ export class NotificationAdminController {
 
   @Post()
   @ApiOperation({ summary: 'Publish a system announcement to active users' })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    required: true,
+    description: 'Stable key reused when retrying the same announcement',
+  })
   publish(
     @Req() req: RequestWithUser,
     @Body() dto: PublishSystemAnnouncementDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
   ): Promise<PublishSystemAnnouncementResponseDto> {
     return this.notificationService.publishSystemAnnouncement(
       req.user.userId,
       dto,
+      requireIdempotencyKey(idempotencyKey),
       auditContext(req),
     );
   }

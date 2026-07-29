@@ -93,7 +93,15 @@ export class DashboardCommerceMetrics {
         },
       }),
       this.prisma.membershipGrant.count({ where: { createdAt: range } }),
-      this.prisma.fancyNumberLease.count({ where: { endedAt: null } }),
+      this.prisma.fancyNumberLease.count({
+        where: {
+          endedAt: null,
+          OR: [
+            { permanentAt: { not: null } },
+            { expiresAt: { gt: period.endAt } },
+          ],
+        },
+      }),
       this.prisma.fancyNumberOrder.aggregate({
         where: { createdAt: range },
         _count: { _all: true },

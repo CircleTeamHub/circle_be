@@ -336,52 +336,52 @@ enum AdminGroupOperationStatus {
 // ─── Core Models ──────────────────────────────────────────────────────────────
 
 model User {
-  id                         String     @id @default(uuid())
-  accountId                  String     @unique
-  inviteCode                 String     @unique
-  invitedByUserId            String?
-  passwordHash               String
-  loginSecurityCodeHash      String?
-  securityCodeAttempts       Int        @default(0)
-  securityCodeLockedUntil    DateTime?
+  id                           String     @id @default(uuid())
+  accountId                    String     @unique
+  inviteCode                   String     @unique
+  invitedByUserId              String?
+  passwordHash                 String
+  loginSecurityCodeHash        String?
+  securityCodeAttempts         Int        @default(0)
+  securityCodeLockedUntil      DateTime?
   // Admin console brute-force lockout (#83) — mirrors the security-code pair.
-  adminLoginAttempts         Int        @default(0)
-  adminLoginLockedUntil      DateTime?
-  singleDeviceLoginEnabled   Boolean    @default(false)
-  nickname                   String
-  avatarUrl                  String?
-  avatarFrame                String?
-  selectedAvatarFrameID      String?
+  adminLoginAttempts           Int        @default(0)
+  adminLoginLockedUntil        DateTime?
+  singleDeviceLoginEnabled     Boolean    @default(false)
+  nickname                     String
+  avatarUrl                    String?
+  avatarFrame                  String?
+  selectedAvatarFrameID        String?
   selectedAvatarFrameExpiresAt DateTime?
-  cover                      String?
-  email                      String?    @unique
-  phoneNumber                String?
-  wechat                     String?
-  qq                         String?
-  whatsup                    String?
-  persona                    String?
-  helloWords                 String?
-  birthday                   DateTime?
-  city                       String?
-  region                     String?
-  gender                     Gender     @default(unset)
-  role                       UserRole   @default(USER)
-  status                     UserStatus @default(ACTIVE)
-  vipLevel                   Int        @default(0)
-  vipExpiresAt               DateTime?
-  creditScore                Int        @default(100)
-  fancyNumber                Boolean    @default(false)
-  fancyNumberExpiresAt       DateTime?
-  fancyNumberPermanent       Boolean    @default(false)
-  iconPreferencesInitialized Boolean    @default(false)
-  openimSynced               Boolean    @default(false)
-  lastOnline                 DateTime?
+  cover                        String?
+  email                        String?    @unique
+  phoneNumber                  String?
+  wechat                       String?
+  qq                           String?
+  whatsup                      String?
+  persona                      String?
+  helloWords                   String?
+  birthday                     DateTime?
+  city                         String?
+  region                       String?
+  gender                       Gender     @default(unset)
+  role                         UserRole   @default(USER)
+  status                       UserStatus @default(ACTIVE)
+  vipLevel                     Int        @default(0)
+  vipExpiresAt                 DateTime?
+  creditScore                  Int        @default(100)
+  fancyNumber                  Boolean    @default(false)
+  fancyNumberExpiresAt         DateTime?
+  fancyNumberPermanent         Boolean    @default(false)
+  iconPreferencesInitialized   Boolean    @default(false)
+  openimSynced                 Boolean    @default(false)
+  lastOnline                   DateTime?
   /// Set once the one-time friend-activity backfill has run for this user.
-  activitiesBackfilledAt     DateTime?
+  activitiesBackfilledAt       DateTime?
   /// 收到的累计点赞总数（每人对其每天最多 +1），达阈值发放合作达人徽章。
-  receivedLikeCount          Int        @default(0)
-  createdAt                  DateTime   @default(now())
-  updatedAt                  DateTime   @updatedAt
+  receivedLikeCount            Int        @default(0)
+  createdAt                    DateTime   @default(now())
+  updatedAt                    DateTime   @updatedAt
 
   refreshTokens                     RefreshToken[]
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
@@ -440,11 +440,12 @@ model User {
   membershipGrantsReceived          MembershipGrant[]           @relation("membershipGrantTarget")
   membershipGrantsIssued            MembershipGrant[]           @relation("membershipGrantOperator")
   membershipBenefitGrants           MembershipBenefitGrant[]
-  selectedAvatarFrame               AvatarFrameAsset?            @relation("selectedAvatarFrame", fields: [selectedAvatarFrameID], references: [id], onDelete: SetNull)
-  avatarFrameGrants                 UserAvatarFrameGrant[]       @relation("avatarFrameGrantUser")
-  avatarFrameGrantsIssued           UserAvatarFrameGrant[]       @relation("avatarFrameGrantOperator")
-  avatarFrameGrantRevocations       UserAvatarFrameGrant[]       @relation("avatarFrameGrantRevoker")
+  selectedAvatarFrame               AvatarFrameAsset?           @relation("selectedAvatarFrame", fields: [selectedAvatarFrameID], references: [id], onDelete: SetNull)
+  avatarFrameGrants                 UserAvatarFrameGrant[]      @relation("avatarFrameGrantUser")
+  avatarFrameGrantsIssued           UserAvatarFrameGrant[]      @relation("avatarFrameGrantOperator")
+  avatarFrameGrantRevocations       UserAvatarFrameGrant[]      @relation("avatarFrameGrantRevoker")
   sessionRevocationOutbox           SessionRevocationOutbox?
+  accountIdRegistry                 AccountIdentifier           @relation("userAccountIdRegistry", fields: [accountId], references: [value], onDelete: Restrict, onUpdate: Cascade, map: "User_accountId_registry_fkey")
   currentAccountIdentifier          AccountIdentifier?          @relation("currentAccountIdentifier")
   reservedAccountIdentifier         AccountIdentifier?          @relation("reservedAccountIdentifier")
   inviteAccountIdentifier           AccountIdentifier?          @relation("inviteAccountIdentifier")
@@ -492,10 +493,10 @@ model UserAvatarFrameGrant {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  user          User              @relation("avatarFrameGrantUser", fields: [userID], references: [id], onDelete: Restrict)
-  frame         AvatarFrameAsset  @relation(fields: [frameID], references: [id], onDelete: Restrict)
-  operatorUser  User              @relation("avatarFrameGrantOperator", fields: [operatorUserID], references: [id], onDelete: Restrict)
-  revokedByUser User?             @relation("avatarFrameGrantRevoker", fields: [revokedByUserID], references: [id], onDelete: Restrict)
+  user          User             @relation("avatarFrameGrantUser", fields: [userID], references: [id], onDelete: Restrict)
+  frame         AvatarFrameAsset @relation(fields: [frameID], references: [id], onDelete: Restrict)
+  operatorUser  User             @relation("avatarFrameGrantOperator", fields: [operatorUserID], references: [id], onDelete: Restrict)
+  revokedByUser User?            @relation("avatarFrameGrantRevoker", fields: [revokedByUserID], references: [id], onDelete: Restrict)
 
   @@index([userID, revokedAt, expiresAt], map: "UserAvatarFrameGrant_user_active_idx")
   @@index([userID, createdAt, id], map: "UserAvatarFrameGrant_user_createdAt_id_idx")
@@ -560,6 +561,7 @@ model AccountIdentifier {
   currentUser User?        @relation("currentAccountIdentifier", fields: [currentUserID], references: [id], onDelete: Restrict)
   reservedFor User?        @relation("reservedAccountIdentifier", fields: [reservedForUserID], references: [id], onDelete: Restrict)
   inviteOwner User?        @relation("inviteAccountIdentifier", fields: [inviteOwnerUserID], references: [id], onDelete: Restrict)
+  accountUser User?        @relation("userAccountIdRegistry")
   fancyNumber FancyNumber?
 }
 
@@ -1408,39 +1410,55 @@ model UserDisplayIcon {
 // ─── Notification ─────────────────────────────────────────────────────────────
 
 model Notification {
-  id                  String           @id @default(uuid())
-  content             String           @default("")
-  deleted             Boolean          @default(false)
-  read                Boolean          @default(false)
-  type                NotificationType
-  toUserID            String?
-  fromUserID          String
-  fromTraceID         String?
-  fromReplyID         String?
-  toReplyID           String?
-  fromCircleID        String?
-  fromCirclePostID    String?
-  fromInvitationID    String?
-  fromFriendRequestID String?
-  createdAt           DateTime         @default(now())
-  updatedAt           DateTime         @updatedAt
+  id                   String           @id @default(uuid())
+  content              String           @default("")
+  deleted              Boolean          @default(false)
+  read                 Boolean          @default(false)
+  type                 NotificationType
+  toUserID             String?
+  fromUserID           String
+  fromTraceID          String?
+  fromReplyID          String?
+  toReplyID            String?
+  fromCircleID         String?
+  fromCirclePostID     String?
+  fromInvitationID     String?
+  fromFriendRequestID  String?
+  systemAnnouncementID String?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
 
-  toUser            User?                   @relation("toUser", fields: [toUserID], references: [id])
-  fromUser          User                    @relation("fromUser", fields: [fromUserID], references: [id])
-  fromTrace         Trace?                  @relation(fields: [fromTraceID], references: [id])
-  fromReply         TraceComment?           @relation("fromReply", fields: [fromReplyID], references: [id])
-  toReply           TraceComment?           @relation("toReply", fields: [toReplyID], references: [id])
-  fromCircle        Circle?                 @relation(fields: [fromCircleID], references: [id])
-  fromCirclePost    CirclePost?             @relation(fields: [fromCirclePostID], references: [id])
-  fromInvitation    CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
-  fromFriendRequest Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
-  pushOutbox        NotificationPushOutbox?
+  toUser             User?                   @relation("toUser", fields: [toUserID], references: [id])
+  fromUser           User                    @relation("fromUser", fields: [fromUserID], references: [id])
+  fromTrace          Trace?                  @relation(fields: [fromTraceID], references: [id])
+  fromReply          TraceComment?           @relation("fromReply", fields: [fromReplyID], references: [id])
+  toReply            TraceComment?           @relation("toReply", fields: [toReplyID], references: [id])
+  fromCircle         Circle?                 @relation(fields: [fromCircleID], references: [id])
+  fromCirclePost     CirclePost?             @relation(fields: [fromCirclePostID], references: [id])
+  fromInvitation     CircleInvitation?       @relation(fields: [fromInvitationID], references: [id])
+  fromFriendRequest  Friend?                 @relation("friendRequestNotifications", fields: [fromFriendRequestID], references: [id])
+  systemAnnouncement SystemAnnouncement?     @relation(fields: [systemAnnouncementID], references: [id], onDelete: Restrict)
+  pushOutbox         NotificationPushOutbox?
 
+  @@unique([systemAnnouncementID, toUserID], map: "Notification_announcement_recipient_key")
   @@index([fromUserID, toUserID])
   @@index([toUserID])
   // review 修复：保留期清理按裸 createdAt 截断分批删除
   @@index([createdAt])
   @@index([fromFriendRequestID])
+}
+
+model SystemAnnouncement {
+  id                 String   @id @default(uuid())
+  idempotencyKey     String   @unique
+  requestFingerprint String
+  operatorID         String
+  content            String
+  createdAt          DateTime @default(now())
+
+  notifications Notification[]
+
+  @@index([createdAt])
 }
 
 model NotificationPushOutbox {
@@ -1538,34 +1556,34 @@ model DevicePushToken {
 // ─── Circle Plaza ────────────────────────────────────────────────────────────
 
 model Circle {
-  id                    String   @id @default(uuid())
+  id                    String           @id @default(uuid())
   name                  String
-  description           String   @default("")
+  description           String           @default("")
   avatarUrl             String?
   cover                 String?
   ownerID               String
   currentIconAssetID    String?
-  cities                String[] @default([])
-  isPublic              Boolean  @default(false)
-  categories            String[] @default([])
-  rules                 String   @default("")
-  tags                  String[] @default([])
+  cities                String[]         @default([])
+  isPublic              Boolean          @default(false)
+  categories            String[]         @default([])
+  rules                 String           @default("")
+  tags                  String[]         @default([])
   joinVipRestriction    Int?
   joinCreditRestriction Int?
-  joinFancyRestriction  Boolean  @default(false)
+  joinFancyRestriction  Boolean          @default(false)
   maxMembers            Int?
-  expansionSeats        Int      @default(0)
-  memberCanPost         Boolean  @default(true)
-  groupID               String?  @unique
-  memberCount           Int      @default(0)
-  postCount             Int      @default(0)
-  deleted               Boolean  @default(false)
+  expansionSeats        Int              @default(0)
+  memberCanPost         Boolean          @default(true)
+  groupID               String?          @unique
+  memberCount           Int              @default(0)
+  postCount             Int              @default(0)
+  deleted               Boolean          @default(false)
   adminState            CircleAdminState @default(ACTIVE)
   adminDisabledAt       DateTime?
   adminDisabledBy       String?
   adminDisableReason    String?
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
 
   owner             User                  @relation(fields: [ownerID], references: [id], onDelete: Cascade)
   currentIconAsset  IconAsset?            @relation("currentCircleIcon", fields: [currentIconAssetID], references: [id], onDelete: SetNull)

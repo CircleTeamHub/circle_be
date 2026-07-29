@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
+  ConflictException,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -32,6 +33,9 @@ describe('UserService', () => {
     },
     userProfileSyncOutbox: {
       upsert: jest.fn(),
+    },
+    accountIdentifier: {
+      findUnique: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
@@ -80,6 +84,7 @@ describe('UserService', () => {
     jest.clearAllMocks();
     privacySettings.canViewProfileField.mockResolvedValue(true);
     prisma.userLike.findUnique.mockResolvedValue(null);
+    prisma.accountIdentifier.findUnique.mockResolvedValue(null);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
@@ -312,6 +317,34 @@ describe('UserService', () => {
       }),
     ).rejects.toBe(accountIdCollision);
     expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an account ID claimed by fancy-number inventory before creating an admin user', async () => {
+    prisma.accountIdentifier.findUnique.mockResolvedValue({
+      currentUserID: null,
+      reservedForUserID: null,
+      inviteOwnerUserID: null,
+      fancyNumber: { id: 'fancy-1' },
+    });
+
+    await expect(
+      service.create({
+        accountId: 'ABC123',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.accountIdentifier.findUnique).toHaveBeenCalledWith({
+      where: { value: 'abc123' },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+        fancyNumber: { select: { id: true } },
+      },
+    });
+    expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
   it('finds an active user by exact accountId without exposing admin pagination', async () => {

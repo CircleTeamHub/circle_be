@@ -252,6 +252,9 @@ export class AdminCommunityService {
             groupID: true,
             deleted: true,
             adminState: true,
+            adminDisabledAt: true,
+            adminDisabledBy: true,
+            adminDisableReason: true,
           },
         });
         if (!circle) throw new NotFoundException('圈子不存在');
@@ -262,7 +265,7 @@ export class AdminCommunityService {
           throw new ConflictException('确认圈子名称不匹配');
         }
         if (!circle.groupID) {
-          throw new NotFoundException('圈子尚未关联 OpenIM 群聊');
+          return this.applyLocalCircleOperation(tx, circle, input, type);
         }
         await this.lockGroup(tx, circle.groupID);
         const duplicate = await tx.adminGroupOperation.findUnique({
@@ -288,6 +291,9 @@ export class AdminCommunityService {
         }
         if (type === 'UNMUTE' && !circle.deleted) {
           throw new ConflictException('圈子当前未停用');
+        }
+        if (type === 'UNMUTE' && !this.hasAdminDisableProvenance(circle)) {
+          throw new ConflictException('圈子不是由管理员停用，无法恢复');
         }
         const updatedCircle = await tx.circle.update({
           where: { id: circle.id },
@@ -318,6 +324,121 @@ export class AdminCommunityService {
     } catch (error) {
       this.rethrowOperationConflict(error);
     }
+  }
+
+  private async applyLocalCircleOperation(
+    tx: Prisma.TransactionClient,
+    circle: {
+      id: string;
+      name: string;
+      groupID: string | null;
+      deleted: boolean;
+      adminState: CircleAdminState;
+      adminDisabledAt: Date | null;
+      adminDisabledBy: string | null;
+      adminDisableReason: string | null;
+    },
+    input: CircleAction,
+    type: 'MUTE' | 'UNMUTE',
+  ) {
+    await this.lockGroup(tx, `circle:${circle.id}`);
+    await this.lockGroup(tx, `idempotency:${input.idempotencyKey}`);
+    const duplicate = await tx.adminAuditLog.findFirst({
+      where: {
+        requestId: input.idempotencyKey,
+        action: 'ADMIN_CIRCLE_STATE_CHANGED',
+      },
+      select: {
+        actorID: true,
+        entityID: true,
+        reason: true,
+        metadata: true,
+      },
+    });
+    if (duplicate) {
+      const metadata =
+        duplicate.metadata &&
+        typeof duplicate.metadata === 'object' &&
+        !Array.isArray(duplicate.metadata)
+          ? (duplicate.metadata as Record<string, unknown>)
+          : null;
+      if (
+        duplicate.actorID !== input.actorId ||
+        duplicate.entityID !== circle.id ||
+        duplicate.reason !== input.reason ||
+        metadata?.type !== type
+      ) {
+        throw new ConflictException('Idempotency-Key 已用于其他管理操作');
+      }
+      return { circle, operation: null };
+    }
+
+    if (type === 'MUTE' && circle.adminState === 'DISABLED') {
+      throw new ConflictException('圈子已经停用');
+    }
+    if (type === 'UNMUTE' && !circle.deleted) {
+      throw new ConflictException('圈子当前未停用');
+    }
+    if (type === 'UNMUTE' && !this.hasAdminDisableProvenance(circle)) {
+      throw new ConflictException('圈子不是由管理员停用，无法恢复');
+    }
+
+    const updatedCircle = await tx.circle.update({
+      where: { id: circle.id },
+      data:
+        type === 'MUTE'
+          ? {
+              deleted: true,
+              adminState: 'DISABLED',
+              adminDisabledAt: new Date(),
+              adminDisabledBy: input.actorId,
+              adminDisableReason: input.reason,
+            }
+          : {
+              deleted: false,
+              adminState: 'ACTIVE',
+              adminDisabledAt: null,
+              adminDisabledBy: null,
+              adminDisableReason: null,
+            },
+    });
+    await tx.adminAuditLog.create({
+      data: {
+        actorID: input.actorId,
+        action: 'ADMIN_CIRCLE_STATE_CHANGED',
+        entityType: 'Circle',
+        entityID: circle.id,
+        before: {
+          deleted: circle.deleted,
+          adminState: circle.adminState,
+        },
+        after: {
+          deleted: type === 'MUTE',
+          adminState: type === 'MUTE' ? 'DISABLED' : 'ACTIVE',
+        },
+        reason: input.reason,
+        metadata: { type, synchronization: 'LOCAL_ONLY' },
+        requestId: input.idempotencyKey,
+      },
+    });
+    return { circle: updatedCircle, operation: null };
+  }
+
+  private hasAdminDisableProvenance(circle: {
+    adminState: CircleAdminState;
+    adminDisabledAt: Date | null;
+    adminDisabledBy: string | null;
+    adminDisableReason: string | null;
+  }) {
+    return (
+      (circle.adminState === 'DISABLED' ||
+        circle.adminState === 'SYNC_FAILED') &&
+      circle.adminDisabledAt instanceof Date &&
+      typeof circle.adminDisabledBy === 'string' &&
+      circle.adminDisabledBy.length > 0 &&
+      typeof circle.adminDisableReason === 'string' &&
+      circle.adminDisableReason.length > 0
+    );
   }
 
   private latestOperations(groupIds: string[]) {

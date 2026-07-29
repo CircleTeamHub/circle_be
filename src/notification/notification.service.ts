@@ -1,4 +1,9 @@
-import { Injectable, Optional } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  Optional,
+} from '@nestjs/common';
 import { createHash } from 'crypto';
 import { NotificationType, Prisma, UserStatus } from 'src/generated/prisma';
 import { AdminAuditService } from 'src/moderation/admin-audit.service';
@@ -42,6 +47,8 @@ function chunkArray<T>(items: readonly T[], size: number): T[][] {
 
 @Injectable()
 export class NotificationService {
+  private readonly logger = new Logger(NotificationService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
@@ -227,17 +234,33 @@ export class NotificationService {
   async publishSystemAnnouncement(
     operatorId: string,
     dto: PublishSystemAnnouncementDto,
+    idempotencyKey: string,
     auditContext?: SystemAnnouncementAuditContext,
   ): Promise<{ createdCount: number }> {
+    const requestFingerprint = `${operatorId}:${dto.content}`;
+    const announcement = await this.prisma.systemAnnouncement.upsert({
+      where: { idempotencyKey },
+      create: {
+        idempotencyKey,
+        requestFingerprint,
+        operatorID: operatorId,
+        content: dto.content,
+      },
+      update: {},
+      select: { id: true, requestFingerprint: true },
+    });
+    if (announcement.requestFingerprint !== requestFingerprint) {
+      throw new ConflictException(
+        'Idempotency-Key has already been used for another announcement',
+      );
+    }
+
     const recipients = await this.prisma.user.findMany({
       where: { status: UserStatus.ACTIVE },
       select: { id: true },
       orderBy: { id: 'asc' },
     });
     const recipientIds = [...new Set(recipients.map((user) => user.id))];
-    if (recipientIds.length === 0) {
-      return { createdCount: 0 };
-    }
 
     const created: Array<{ id: string; toUserID: string | null }> = [];
     for (const batch of chunkArray(
@@ -251,7 +274,9 @@ export class NotificationService {
             fromUserID: operatorId,
             type: NotificationType.SYSTEM,
             content: dto.content,
+            systemAnnouncementID: announcement.id,
           })),
+          skipDuplicates: true,
           select: { id: true, toUserID: true },
         });
 
@@ -273,26 +298,40 @@ export class NotificationService {
       createdUserIds,
       SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
     )) {
-      await Promise.all(
+      await Promise.allSettled(
         batch.map((userId) =>
           this.realtimeService.broadcastSystemNotificationUnread(userId),
         ),
       );
     }
 
-    await this.auditService?.record({
-      actorID: operatorId,
-      action: 'system_announcement_publish',
-      entityType: 'SystemAnnouncement',
-      after: {
-        content: dto.content,
-        createdCount: created.length,
-      },
-      ip: auditContext?.ip ?? null,
-      userAgent: auditContext?.userAgent ?? null,
+    const createdCount = await this.prisma.notification.count({
+      where: { systemAnnouncementID: announcement.id },
     });
+    if (created.length > 0) {
+      try {
+        await this.auditService?.record({
+          actorID: operatorId,
+          action: 'system_announcement_publish',
+          entityType: 'SystemAnnouncement',
+          entityID: announcement.id,
+          after: {
+            content: dto.content,
+            createdCount,
+          },
+          ip: auditContext?.ip ?? null,
+          userAgent: auditContext?.userAgent ?? null,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `Secondary audit logging failed for persisted system announcement ${announcement.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
 
-    return { createdCount: created.length };
+    return { createdCount };
   }
 
   private async createNotification(data: {

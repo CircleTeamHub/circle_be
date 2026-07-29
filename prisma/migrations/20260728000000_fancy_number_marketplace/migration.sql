@@ -62,7 +62,7 @@ CREATE TABLE "AccountIdentifier" (
   "reservedForUserID" TEXT,
   "inviteOwnerUserID" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
 
   CONSTRAINT "AccountIdentifier_pkey" PRIMARY KEY ("value"),
   CONSTRAINT "AccountIdentifier_value_lower_check"
@@ -100,7 +100,7 @@ CREATE TABLE "FancyNumber" (
   "createdByUserID" TEXT,
   "disabledAt" TIMESTAMP(3),
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
 
   CONSTRAINT "FancyNumber_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "FancyNumber_value_lower_check" CHECK ("value" = lower("value"))
@@ -121,7 +121,7 @@ CREATE TABLE "FancyNumberLease" (
   "endedAt" TIMESTAMP(3),
   "endReason" "FancyNumberLeaseEndReason",
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
 
   CONSTRAINT "FancyNumberLease_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "FancyNumberLease_duration_check" CHECK (
@@ -451,14 +451,6 @@ BEGIN
       END IF;
     END IF;
 
-    DELETE FROM "AccountIdentifier" ai
-    WHERE ai."value" = OLD."accountId"
-      AND ai."currentUserID" IS NULL
-      AND ai."reservedForUserID" IS NULL
-      AND ai."inviteOwnerUserID" IS NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM "FancyNumber" fn WHERE fn."value" = ai."value"
-      );
   END IF;
 
   IF NEW."inviteCode" IS DISTINCT FROM OLD."inviteCode" THEN
@@ -540,6 +532,39 @@ BEGIN
 END
 $$;
 
+CREATE OR REPLACE FUNCTION "User_account_identifier_cleanup"()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF OLD."accountId" IS DISTINCT FROM NEW."accountId" THEN
+    DELETE FROM "AccountIdentifier" ai
+    WHERE ai."value" = OLD."accountId"
+      AND ai."currentUserID" IS NULL
+      AND ai."reservedForUserID" IS NULL
+      AND ai."inviteOwnerUserID" IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM "FancyNumber" fn WHERE fn."value" = ai."value"
+      );
+  END IF;
+
+  IF OLD."inviteCode" IS DISTINCT FROM NEW."inviteCode"
+    AND OLD."inviteCode" <> OLD."accountId"
+  THEN
+    DELETE FROM "AccountIdentifier" ai
+    WHERE ai."value" = OLD."inviteCode"
+      AND ai."currentUserID" IS NULL
+      AND ai."reservedForUserID" IS NULL
+      AND ai."inviteOwnerUserID" IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM "FancyNumber" fn WHERE fn."value" = ai."value"
+      );
+  END IF;
+
+  RETURN NEW;
+END
+$$;
+
 CREATE TRIGGER "User_account_identifier_prepare_trigger"
 BEFORE INSERT OR UPDATE OF "accountId", "inviteCode" ON "User"
 FOR EACH ROW EXECUTE FUNCTION "User_account_identifier_prepare"();
@@ -547,5 +572,9 @@ FOR EACH ROW EXECUTE FUNCTION "User_account_identifier_prepare"();
 CREATE TRIGGER "User_account_identifier_assign_trigger"
 AFTER INSERT ON "User"
 FOR EACH ROW EXECUTE FUNCTION "User_account_identifier_assign"();
+
+CREATE TRIGGER "User_account_identifier_cleanup_trigger"
+AFTER UPDATE OF "accountId", "inviteCode" ON "User"
+FOR EACH ROW EXECUTE FUNCTION "User_account_identifier_cleanup"();
 
 COMMIT;

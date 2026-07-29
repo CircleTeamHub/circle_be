@@ -107,6 +107,15 @@ describe('dashboard metric providers', () => {
       pointSpend: 1100,
       pointRecharge: 1500,
     });
+    expect(prisma.fancyNumberLease.count).toHaveBeenCalledWith({
+      where: {
+        endedAt: null,
+        OR: [
+          { permanentAt: { not: null } },
+          { expiresAt: { gt: period.endAt } },
+        ],
+      },
+    });
   });
 
   it('combines all pending moderation queues', async () => {

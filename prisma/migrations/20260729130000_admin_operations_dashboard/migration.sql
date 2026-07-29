@@ -56,15 +56,4 @@ ON "AdminGroupOperation" ("groupID", "createdAt");
 CREATE INDEX "AdminGroupOperation_circleID_createdAt_idx"
 ON "AdminGroupOperation" ("circleID", "createdAt");
 
-CREATE INDEX "User_createdAt_idx" ON "User" ("createdAt");
-CREATE INDEX "User_lastOnline_idx" ON "User" ("lastOnline");
-CREATE INDEX "User_status_createdAt_idx" ON "User" ("status", "createdAt");
-CREATE INDEX "MembershipGrant_createdAt_idx" ON "MembershipGrant" ("createdAt");
-CREATE INDEX "FancyNumberOrder_createdAt_idx" ON "FancyNumberOrder" ("createdAt");
-CREATE INDEX "CoinTransaction_type_createdAt_idx" ON "CoinTransaction" ("type", "createdAt");
-CREATE INDEX "Circle_adminState_createdAt_idx" ON "Circle" ("adminState", "createdAt");
-CREATE INDEX "Circle_deleted_createdAt_idx" ON "Circle" ("deleted", "createdAt");
-CREATE INDEX "GroupExpansionOrder_createdAt_idx" ON "GroupExpansionOrder" ("createdAt");
-CREATE INDEX "CircleMember_status_createdAt_idx" ON "CircleMember" ("status", "createdAt");
-
 COMMIT;

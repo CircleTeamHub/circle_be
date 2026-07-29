@@ -1,11 +1,12 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { UserErrorCode } from 'src/common/app-error-codes';
+import { AuthErrorCode, UserErrorCode } from 'src/common/app-error-codes';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -443,6 +444,26 @@ export class UserService {
   }
 
   async create(input: CreateUserInput) {
+    const normalizedAccountId = input.accountId.trim().toLowerCase();
+    const identifierClaim = await this.prisma.accountIdentifier.findUnique({
+      where: { value: normalizedAccountId },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+        fancyNumber: { select: { id: true } },
+      },
+    });
+    if (
+      identifierClaim &&
+      (identifierClaim.currentUserID !== null ||
+        identifierClaim.reservedForUserID !== null ||
+        identifierClaim.inviteOwnerUserID !== null ||
+        identifierClaim.fancyNumber !== null)
+    ) {
+      throw this.accountIdTaken();
+    }
+
     const passwordHash = await argon2.hash(input.password);
     for (
       let attempt = 0;
@@ -468,6 +489,13 @@ export class UserService {
           appearances.get(user.id)?.avatarFrame ?? null,
         );
       } catch (error) {
+        if (this.isAccountIdentifierCollision(error, normalizedAccountId)) {
+          throw this.accountIdTaken();
+        }
+        if (this.isAccountIdentifierCollision(error, inviteCode)) {
+          if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
+          break;
+        }
         if (isInviteCodeUniqueCollision(error)) {
           if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
           break;
@@ -479,6 +507,25 @@ export class UserService {
     throw new ServiceUnavailableException(
       'Failed to create a user with a unique invite code',
     );
+  }
+
+  private accountIdTaken() {
+    return new ConflictException({
+      message: '该账号已被占用',
+      errorCode: AuthErrorCode.AccountIdTaken,
+    });
+  }
+
+  private isAccountIdentifierCollision(error: unknown, value: string): boolean {
+    const message =
+      error instanceof Error
+        ? error.message
+        : typeof error === 'object' && error !== null && 'message' in error
+          ? String(error.message)
+          : String(error);
+    return message
+      .toLowerCase()
+      .includes(`account identifier collision: ${value.toLowerCase()}`);
   }
 
   async update(id: string, input: UpdateUserInput) {
