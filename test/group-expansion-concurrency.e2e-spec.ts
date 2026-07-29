@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
+import { getGroupExpansionProduct } from 'src/group-expansion/group-expansion.catalog';
 import { GroupExpansionService } from 'src/group-expansion/group-expansion.service';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -74,6 +75,7 @@ describePostgres('Group expansion purchase concurrency e2e', () => {
 
   it('allows only one concurrent flagship purchase at the hard limit', async () => {
     const { ownerID, circleID } = await createOwnerWithCircle();
+    const product = getGroupExpansionProduct('flagship')!;
 
     const results = await Promise.allSettled([
       service.purchase(ownerID, circleID, 'flagship', randomUUID()),
@@ -97,7 +99,7 @@ describePostgres('Group expansion purchase concurrency e2e', () => {
         where: { userID: ownerID },
         select: { balance: true },
       }),
-    ).resolves.toEqual({ balance: 12_000 });
+    ).resolves.toEqual({ balance: 20_000 - product.price });
     await expect(
       prisma.groupExpansionOrder.count({ where: { circleID } }),
     ).resolves.toBe(1);
@@ -106,6 +108,7 @@ describePostgres('Group expansion purchase concurrency e2e', () => {
   it('converges two concurrent retries with the same idempotency key', async () => {
     const { ownerID, circleID } = await createOwnerWithCircle();
     const idempotencyKey = randomUUID();
+    const product = getGroupExpansionProduct('light')!;
 
     const purchases = await Promise.all([
       service.purchase(ownerID, circleID, 'light', idempotencyKey),
@@ -118,7 +121,7 @@ describePostgres('Group expansion purchase concurrency e2e', () => {
         where: { userID: ownerID },
         select: { balance: true },
       }),
-    ).resolves.toEqual({ balance: 19_400 });
+    ).resolves.toEqual({ balance: 20_000 - product.price });
     await expect(
       prisma.groupExpansionOrder.count({ where: { circleID } }),
     ).resolves.toBe(1);
