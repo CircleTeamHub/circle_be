@@ -48,13 +48,13 @@ test/
 
 ## 环境变量
 
-可以参考 [.env.example](/Users/yiboding/projects/circle_be/.env.example)。
+可以参考 [.env.example](.env.example)。
 
-开发环境常用的是：
+开发环境常用的是（均不入库，需本地自行创建）：
 
-- [.env](/Users/yiboding/projects/circle_be/.env)
-- [.env.development](/Users/yiboding/projects/circle_be/.env.development)
-- [.env.test](/Users/yiboding/projects/circle_be/.env.test)
+- `.env`
+- `.env.development`
+- `.env.test`
 
 关键变量：
 
@@ -70,7 +70,7 @@ test/
 - `EXTERNAL_LOG_ON`
 - `RATE_LIMIT_LOG_ON`
 
-日志策略、字段和排查方式见 [docs/logging.md](/Users/yiboding/projects/circle_be/docs/logging.md)。
+日志策略、字段和排查方式见 [docs/logging.md](docs/logging.md)。
 
 ## 本地启动
 
@@ -118,7 +118,7 @@ NODE_ENV=development pnpm run prisma:studio
 
 ## Docker 数据库说明
 
-[docker-compose.yml](/Users/yiboding/projects/circle_be/docker-compose.yml) 会启动一个 PostgreSQL 16 容器。
+[docker-compose.yml](docker-compose.yml) 会启动一个 PostgreSQL 16 容器。
 
 默认连接参数：
 
@@ -127,7 +127,7 @@ NODE_ENV=development pnpm run prisma:studio
 - User：`postgres`
 - Password：`postgres`
 
-初始化脚本 [01-create-databases.sql](/Users/yiboding/projects/circle_be/docker/postgres/init/01-create-databases.sql) 会创建：
+初始化脚本 [01-create-databases.sql](docker/postgres/init/01-create-databases.sql) 会创建：
 
 - `nestjs_dev`
 - `nestjs_test`
@@ -175,7 +175,7 @@ pnpm run prisma:studio
 ## 说明
 
 - Prisma Client 通过 `postinstall` 自动生成
-- 如果你修改了 [schema.prisma](/Users/yiboding/projects/circle_be/prisma/schema.prisma)，请重新执行：
+- 如果你修改了 [schema.prisma](prisma/schema.prisma)，请重新执行：
 
 ```bash
 pnpm exec prisma generate

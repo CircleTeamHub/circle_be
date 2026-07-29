@@ -20,8 +20,10 @@ dist/
 .AppleDouble
 .LSOverride
 
-# Icon must end with two \r
-Icon
+# macOS 自定义图标文件,真名是 "Icon" 后跟两个 \r。裸写 Icon 会在大小写不敏感的
+# 文件系统(Windows/macOS)上误伤 src/icon/ 整个目录 —— git 大小写敏感不受影响,
+# 但 prettier 默认拿 .gitignore 当忽略清单,会静默跳过该目录、只在 Linux CI 才报错。
+Icon[\r]
 
 # Thumbnails
 ._*
