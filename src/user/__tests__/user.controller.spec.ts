@@ -11,6 +11,7 @@ describe('UserController', () => {
   const userService = {
     findAll: jest.fn(),
     findByExactAccountId: jest.fn(),
+    getAppearances: jest.fn(),
     updateStatus: jest.fn((id: string, status: string) => ({ id, status })),
     remove: jest.fn((id: string) => ({ id })),
   };
@@ -111,6 +112,19 @@ describe('UserController', () => {
     });
   });
 
+  it('delegates appearance batches and preserves 200 response semantics', async () => {
+    userService.getAppearances.mockResolvedValue({
+      alias: { vipLevel: 0, avatarFrame: null },
+    });
+
+    await expect(
+      controller.getAppearances({ ids: ['alias'] }),
+    ).resolves.toEqual({
+      alias: { vipLevel: 0, avatarFrame: null },
+    });
+    expect(userService.getAppearances).toHaveBeenCalledWith(['alias']);
+  });
+
   // 账号状态变更的用例都在 admin-user 那边：这个控制器不再暴露 status 路由，
   // 唯一入口是审计化的 PATCH /admin/users/:id/status。
 });
@@ -135,6 +149,29 @@ describe('POST /user/vip-levels rate limiting', () => {
       Reflect.getMetadata(
         'THROTTLER:TTLdefault',
         UserController.prototype.getVipLevels,
+      ),
+    ).toBe(60_000);
+  });
+});
+
+describe('POST /user/appearances rate limiting', () => {
+  it('uses the same user-scoped 30/min budget as vip-levels', () => {
+    const guards =
+      Reflect.getMetadata(
+        GUARDS_METADATA,
+        UserController.prototype.getAppearances,
+      ) ?? [];
+    expect(guards).toContain(UserThrottlerGuard);
+    expect(
+      Reflect.getMetadata(
+        'THROTTLER:LIMITdefault',
+        UserController.prototype.getAppearances,
+      ),
+    ).toBe(30);
+    expect(
+      Reflect.getMetadata(
+        'THROTTLER:TTLdefault',
+        UserController.prototype.getAppearances,
       ),
     ).toBe(60_000);
   });

@@ -69,6 +69,8 @@ function buildService(user: UserRow | null) {
     { listForUser: jest.fn() } as never,
     { verifyCode: jest.fn() } as never,
     config as never,
+    { ensureAccountIdChangeAllowed: jest.fn() } as never,
+    null as never,
   );
   return { service, prisma, updates, updateManyCalls, counter, jwt };
 }

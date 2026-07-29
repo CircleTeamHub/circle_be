@@ -1,6 +1,6 @@
 import { Prisma, NotificationType } from 'src/generated/prisma';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsIn,
   IsNotEmpty,
@@ -22,6 +22,19 @@ export class NotificationPageQueryDto {
   @ApiPropertyOptional({ minimum: 1, maximum: 10_000, default: 1 })
   @IsOptional()
   page = 1;
+}
+
+export class PublishSystemAnnouncementDto {
+  @ApiProperty({ minLength: 1, maxLength: 5000 })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(5000)
+  content: string;
+}
+
+export class PublishSystemAnnouncementResponseDto {
+  @ApiProperty() createdCount: number;
 }
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;

@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
-import { MembershipBenefitType, NotificationType } from 'src/generated/prisma';
+import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { getE2eApp } from './e2e-context';
 
@@ -61,12 +61,9 @@ describePostgres('Membership admin grant concurrency e2e', () => {
     ).resolves.toBe(1);
     await expect(
       prisma.membershipBenefitGrant.count({
-        where: {
-          userID: { in: targetUserIds },
-          type: MembershipBenefitType.STANDARD_FANCY_NUMBER,
-        },
+        where: { userID: { in: targetUserIds } },
       }),
-    ).resolves.toBe(1);
+    ).resolves.toBe(0);
     await expect(
       prisma.user.count({
         where: { id: { in: targetUserIds }, vipLevel: 3 },

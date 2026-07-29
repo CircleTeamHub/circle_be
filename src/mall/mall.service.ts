@@ -37,33 +37,6 @@ const MALL_SECTIONS: MallSectionDto[] = [
     ],
   },
   {
-    id: 'membership',
-    title: '会员专区',
-    products: [
-      {
-        id: 'membership-upgrade',
-        name: '会员服务',
-        icon: 'diamond-outline',
-        color: '#F59E0B',
-        action: 'membership',
-      },
-      {
-        id: 'experience-exchange',
-        name: '兑换经验',
-        icon: 'trending-up-outline',
-        color: '#F59E0B',
-        action: 'experience',
-      },
-      {
-        id: 'points-recharge',
-        name: '积分充值',
-        icon: 'wallet-outline',
-        color: '#F59E0B',
-        action: 'wallet',
-      },
-    ],
-  },
-  {
     id: 'fancy-number',
     title: '靓号专区',
     products: [
@@ -80,26 +53,6 @@ const MALL_SECTIONS: MallSectionDto[] = [
         icon: 'bookmark-outline',
         color: '#E11D48',
         action: 'fancy-number-renew',
-      },
-    ],
-  },
-  {
-    id: 'points',
-    title: '积分专区',
-    products: [
-      {
-        id: 'redeem-code',
-        name: '查询&兑换卡密',
-        icon: 'server-outline',
-        color: '#2563EB',
-        action: 'redeem-code',
-      },
-      {
-        id: 'buy-code',
-        name: '购买卡密',
-        icon: 'bag-handle-outline',
-        color: '#2563EB',
-        action: 'buy-code',
       },
     ],
   },

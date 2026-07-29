@@ -157,6 +157,13 @@ describe('PublicUserDto serialization (other-user view)', () => {
           key: 'diamond',
           appearance: { nameColor: 'rainbow', badge: 'diamond' },
         },
+        avatarFrameAppearance: {
+          id: 'frame-1',
+          key: 'membership-diamond',
+          name: 'Diamond frame',
+          imageUrl: 'https://cdn.example/frame.png',
+          internalOnly: 'strip-me',
+        },
       } as Record<string, unknown>,
       { excludeExtraneousValues: true },
     );
@@ -177,6 +184,12 @@ describe('PublicUserDto serialization (other-user view)', () => {
       effectiveLevel: 3,
       key: 'diamond',
       appearance: { nameColor: 'rainbow', badge: 'diamond' },
+    });
+    expect(dto.avatarFrameAppearance).toEqual({
+      id: 'frame-1',
+      key: 'membership-diamond',
+      name: 'Diamond frame',
+      imageUrl: 'https://cdn.example/frame.png',
     });
   });
 });

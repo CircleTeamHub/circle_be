@@ -75,4 +75,23 @@ describe('generateUniqueRegistrationCode', () => {
       select: { id: true },
     });
   });
+
+  it('retries when a candidate is reserved in fancy-number inventory', async () => {
+    const prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue(null) },
+      accountIdentifier: {
+        findUnique: jest.fn(({ where }) =>
+          Promise.resolve(
+            where.value === '888888' ? { value: '888888' } : null,
+          ),
+        ),
+      },
+    };
+    const sequence = ['888888', 'free22'];
+    let index = 0;
+
+    await expect(
+      generateUniqueRegistrationCode(prisma as any, () => sequence[index++]),
+    ).resolves.toBe('free22');
+  });
 });

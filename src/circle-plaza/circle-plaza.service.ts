@@ -26,6 +26,7 @@ import {
 } from 'src/membership/membership.catalog';
 import { toPublicMembershipAppearance } from 'src/membership/membership-appearance';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
+import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-status';
 import {
   decodeFeedCursor,
   encodeFeedCursor,
@@ -40,6 +41,10 @@ import {
   PlazaPostDto,
   PostSignupItemDto,
 } from './dto/circle-plaza.dto';
+import {
+  AvatarFramePublicAppearance,
+  AvatarFrameService,
+} from 'src/avatar-frame/avatar-frame.service';
 
 // A plaza post joined with the relations every DTO mapping needs.
 // `circleLinks` carries the full set of circles the post is shared to (M2M);
@@ -53,7 +58,8 @@ type PlazaPostWithRelations = Prisma.CirclePostGetPayload<{
 }>;
 
 // The viewer fields that gate post interaction / signup eligibility.
-type ViewerEntitlements = Pick<User, 'creditScore' | 'fancyNumber'> & {
+type ViewerEntitlements = Pick<User, 'creditScore'> & {
+  fancyNumber: boolean;
   membershipLevel: MembershipLevel;
 };
 
@@ -89,6 +95,7 @@ export class CirclePlazaService {
     private readonly notificationService: NotificationService,
     private readonly iconService: IconService,
     private readonly membershipPolicy: MembershipPolicyService,
+    private readonly avatarFrames: AvatarFrameService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -385,6 +392,9 @@ export class CirclePlazaService {
     const displayIconsByAuthor = await this.getDisplayIconsByAuthorIds([
       post.author.id,
     ]);
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      post.author.id,
+    ]);
 
     return this.toPlazaPostDto(
       post,
@@ -392,6 +402,7 @@ export class CirclePlazaService {
       false,
       true,
       displayIconsByAuthor.get(post.author.id) ?? [],
+      appearances.get(post.author.id)?.avatarFrame ?? null,
     );
   }
 
@@ -466,12 +477,15 @@ export class CirclePlazaService {
         vipExpiresAt: true,
         creditScore: true,
         fancyNumber: true,
+        fancyNumberExpiresAt: true,
+        fancyNumberPermanent: true,
       },
     });
+    const entitlementNow = new Date();
     const policy = await this.membershipPolicy.resolveEntitlement(
       viewer ?? { vipLevel: 0, vipExpiresAt: null },
       this.prisma,
-      new Date(),
+      entitlementNow,
     );
     if (policy.level === 0) {
       throw new ForbiddenException({
@@ -498,7 +512,7 @@ export class CirclePlazaService {
       ? {
           membershipLevel: policy.level,
           creditScore: viewer.creditScore,
-          fancyNumber: viewer.fancyNumber,
+          fancyNumber: resolveEffectiveFancyNumber(viewer, entitlementNow),
         }
       : null;
 
@@ -558,7 +572,7 @@ export class CirclePlazaService {
         : null;
 
     const postIds = posts.map((p) => p.id);
-    const [mySignups, displayIconsByAuthor] = await Promise.all([
+    const [mySignups, displayIconsByAuthor, appearances] = await Promise.all([
       postIds.length
         ? this.prisma.circlePostSignup.findMany({
             where: { userID: viewerId, postID: { in: postIds } },
@@ -566,6 +580,9 @@ export class CirclePlazaService {
           })
         : Promise.resolve([]),
       this.getDisplayIconsByAuthorIds(posts.map((post) => post.author.id)),
+      this.avatarFrames.resolvePublicAppearances(
+        posts.map((post) => post.author.id),
+      ),
     ]);
     const signedSet = new Set(mySignups.map((s) => s.postID));
 
@@ -576,6 +593,7 @@ export class CirclePlazaService {
         signedSet.has(post.id),
         this.checkCanSignup(post, viewerEntitlements),
         displayIconsByAuthor.get(post.author.id) ?? [],
+        appearances.get(post.author.id)?.avatarFrame ?? null,
       ),
     );
 
@@ -598,12 +616,15 @@ export class CirclePlazaService {
         vipExpiresAt: true,
         creditScore: true,
         fancyNumber: true,
+        fancyNumberExpiresAt: true,
+        fancyNumberPermanent: true,
       },
     });
+    const entitlementNow = new Date();
     const viewerPolicy = await this.membershipPolicy.resolveEntitlement(
       viewer ?? { vipLevel: 0, vipExpiresAt: null },
       this.prisma,
-      new Date(),
+      entitlementNow,
     );
     if (viewerPolicy.level === 0) {
       throw new ForbiddenException({
@@ -667,19 +688,20 @@ export class CirclePlazaService {
       });
     }
 
-    const [signed, displayIconsByAuthor] = await Promise.all([
+    const [signed, displayIconsByAuthor, appearances] = await Promise.all([
       this.prisma.circlePostSignup.findUnique({
         where: { postID_userID: { postID: postId, userID: viewerId } },
         select: { id: true },
       }),
       this.getDisplayIconsByAuthorIds([post.author.id]),
+      this.avatarFrames.resolvePublicAppearances([post.author.id]),
     ]);
 
     const viewerEntitlements: ViewerEntitlements | null = viewer
       ? {
           membershipLevel: viewerPolicy.level,
           creditScore: viewer.creditScore,
-          fancyNumber: viewer.fancyNumber,
+          fancyNumber: resolveEffectiveFancyNumber(viewer, entitlementNow),
         }
       : null;
 
@@ -689,6 +711,7 @@ export class CirclePlazaService {
       Boolean(signed),
       this.checkCanSignup(post, viewerEntitlements),
       displayIconsByAuthor.get(post.author.id) ?? [],
+      appearances.get(post.author.id)?.avatarFrame ?? null,
     );
   }
 
@@ -876,19 +899,22 @@ export class CirclePlazaService {
         vipExpiresAt: true,
         creditScore: true,
         fancyNumber: true,
+        fancyNumberExpiresAt: true,
+        fancyNumberPermanent: true,
       },
     });
+    const entitlementNow = new Date();
     const viewerEntitlements: ViewerEntitlements | null = viewer
       ? {
           membershipLevel: (
             await this.membershipPolicy.resolveEntitlement(
               viewer,
               this.prisma,
-              new Date(),
+              entitlementNow,
             )
           ).level,
           creditScore: viewer.creditScore,
-          fancyNumber: viewer.fancyNumber,
+          fancyNumber: resolveEffectiveFancyNumber(viewer, entitlementNow),
         }
       : null;
     this.assertSignupMembership(viewerEntitlements);
@@ -931,8 +957,11 @@ export class CirclePlazaService {
             vipExpiresAt: true,
             creditScore: true,
             fancyNumber: true,
+            fancyNumberExpiresAt: true,
+            fancyNumberPermanent: true,
           },
         });
+        const authoritativeNow = new Date();
         const authoritativeEntitlements: ViewerEntitlements | null =
           authoritativeViewer
             ? {
@@ -940,12 +969,15 @@ export class CirclePlazaService {
                   await this.membershipPolicy.resolveEntitlement(
                     authoritativeViewer,
                     tx,
-                    new Date(),
+                    authoritativeNow,
                     { lockForWrite: true },
                   )
                 ).level,
                 creditScore: authoritativeViewer.creditScore,
-                fancyNumber: authoritativeViewer.fancyNumber,
+                fancyNumber: resolveEffectiveFancyNumber(
+                  authoritativeViewer,
+                  authoritativeNow,
+                ),
               }
             : null;
         this.assertSignupMembership(authoritativeEntitlements);
@@ -1665,6 +1697,7 @@ export class CirclePlazaService {
     signedByMe: boolean,
     canSignup: boolean,
     displayIcons: DisplayIconDto[],
+    avatarFrameAppearance: AvatarFramePublicAppearance | null,
   ): PlazaPostDto {
     return {
       id: post.id,
@@ -1694,6 +1727,7 @@ export class CirclePlazaService {
         nickname: post.author.nickname,
         avatarUrl: post.author.avatarUrl,
         avatarFrame: post.author.avatarFrame,
+        avatarFrameAppearance,
         accountId: post.author.accountId,
         vipLevel: resolveEffectiveMembershipLevel({
           vipLevel: post.author.vipLevel ?? 0,

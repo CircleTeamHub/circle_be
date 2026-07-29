@@ -17,6 +17,8 @@ import { OpenimService } from 'src/openim/openim.service';
 import { IconService } from 'src/icon/icon.service';
 import { EmailVerificationService } from '../email-verification.service';
 import { Prisma } from 'src/generated/prisma';
+import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -25,6 +27,9 @@ describe('AuthService', () => {
   const users: any[] = [];
 
   const mockPrisma = {
+    accountIdentifier: {
+      findUnique: jest.fn(() => Promise.resolve(null)),
+    },
     user: {
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(
@@ -104,10 +109,21 @@ describe('AuthService', () => {
     requestCode: jest.fn(() => Promise.resolve()),
     verifyCode: jest.fn(() => Promise.resolve(true)),
   };
+  const mockFancyNumberService = {
+    ensureAccountIdChangeAllowed: jest.fn(() => Promise.resolve()),
+  };
+  const mockAvatarFrameService = {
+    resolvePublicAppearances: jest.fn(() => Promise.resolve(new Map())),
+  };
 
   beforeEach(async () => {
     users.length = 0;
     jest.clearAllMocks();
+    mockPrisma.accountIdentifier.findUnique.mockResolvedValue(null);
+    mockFancyNumberService.ensureAccountIdChangeAllowed.mockResolvedValue();
+    mockAvatarFrameService.resolvePublicAppearances.mockResolvedValue(
+      new Map(),
+    );
     mockPrisma.user.findUnique.mockImplementation(({ where }) =>
       Promise.resolve(
         users.find(
@@ -169,6 +185,8 @@ describe('AuthService', () => {
           useValue: mockEmailVerification,
         },
         { provide: ConfigService, useValue: { get: () => undefined } },
+        { provide: FancyNumberService, useValue: mockFancyNumberService },
+        { provide: AvatarFrameService, useValue: mockAvatarFrameService },
       ],
     }).compile();
 
@@ -783,6 +801,49 @@ describe('AuthService', () => {
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
   });
 
+  it('includes the effective avatar-frame appearance in /auth/me', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'testuser',
+      nickname: 'Test User',
+      avatarUrl: null,
+      avatarFrame: 'legacy-frame',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    mockAvatarFrameService.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'uuid-1',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
+
+    await expect(service.me('uuid-1')).resolves.toMatchObject({
+      avatarFrame: 'legacy-frame',
+      avatarFrameAppearance: {
+        id: 'frame-1',
+        key: 'admin-gift',
+        name: 'Gift frame',
+        imageUrl: null,
+      },
+    });
+    expect(
+      mockAvatarFrameService.resolvePublicAppearances,
+    ).toHaveBeenCalledWith(['uuid-1']);
+  });
+
   it('login returns the same error for unknown vs inactive accounts', async () => {
     const passwordHash = await argon2.hash('password1');
     users.push({
@@ -893,6 +954,24 @@ describe('AuthService', () => {
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
   });
 
+  it('changeAccountId rejects changes while the current fancy number is active', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: '888888',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockFancyNumberService.ensureAccountIdChangeAllowed.mockRejectedValueOnce(
+      new ConflictException('Active fancy number'),
+    );
+
+    await expect(
+      service.changeAccountId('uuid-1', 'alice_2024'),
+    ).rejects.toThrow(ConflictException);
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
   it('changeAccountId rejects an id already taken by another user', async () => {
     users.push({
       id: 'uuid-1',
@@ -910,6 +989,28 @@ describe('AuthService', () => {
     });
 
     await expect(service.changeAccountId('uuid-1', 'bobby')).rejects.toThrow(
+      ConflictException,
+    );
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('changeAccountId rejects a number reserved in fancy-number inventory', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.accountIdentifier.findUnique.mockResolvedValueOnce({
+      value: '888888',
+      currentUserID: null,
+      reservedForUserID: null,
+      inviteOwnerUserID: null,
+      fancyNumber: { id: 'fancy-1' },
+    });
+
+    await expect(service.changeAccountId('uuid-1', '888888')).rejects.toThrow(
       ConflictException,
     );
     expect(mockPrisma.user.update).not.toHaveBeenCalled();

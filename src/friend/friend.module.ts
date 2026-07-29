@@ -10,6 +10,7 @@ import { FriendReportAdminService } from './friend-report-admin.service';
 import { FriendSyncOutboxProcessor } from './friend-sync-outbox.processor';
 import { FriendChatReplayOutboxProcessor } from './friend-chat-replay-outbox.processor';
 import { FriendService } from './friend.service';
+import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { FriendService } from './friend.service';
     OpenimModule,
     PrivacySettingsModule,
     CreditModule,
+    AvatarFrameModule,
   ],
   controllers: [FriendController, FriendReportAdminController],
   providers: [

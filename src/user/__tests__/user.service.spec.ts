@@ -14,6 +14,7 @@ import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -51,6 +52,9 @@ describe('UserService', () => {
   const openim = {
     updateUserInfo: jest.fn().mockResolvedValue(undefined),
   };
+  const avatarFrames = {
+    resolvePublicAppearances: jest.fn(),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -66,6 +70,7 @@ describe('UserService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: OpenimService, useValue: openim },
+        { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();
     return module.get<UserService>(UserService);
@@ -75,6 +80,7 @@ describe('UserService', () => {
     jest.clearAllMocks();
     privacySettings.canViewProfileField.mockResolvedValue(true);
     prisma.userLike.findUnique.mockResolvedValue(null);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
 
@@ -157,6 +163,95 @@ describe('UserService', () => {
       // unexpired level is preserved; super (4) is lifetime regardless.
       expect(result).toEqual({ expired: 0, active: 2, lifetime: 4 });
     });
+  });
+
+  describe('getAppearances', () => {
+    it('normalizes aliases once and returns every caller alias', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555';
+      const missingUuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const appearance = {
+        vipLevel: 3,
+        avatarFrame: {
+          id: 'frame-1',
+          key: 'membership-diamond',
+          name: 'Diamond frame',
+          imageUrl: 'https://cdn.example/frame.png',
+        },
+      };
+      avatarFrames.resolvePublicAppearances.mockResolvedValue(
+        new Map([[uuid, appearance]]),
+      );
+
+      await expect(
+        service.getAppearances([uuid, imId, uuid, missingUuid]),
+      ).resolves.toEqual({
+        [uuid]: appearance,
+        [imId]: appearance,
+      });
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+        uuid,
+        missingUuid,
+      ]);
+    });
+
+    it('short-circuits an empty appearance request', async () => {
+      await expect(service.getAppearances([])).resolves.toEqual({});
+      expect(avatarFrames.resolvePublicAppearances).not.toHaveBeenCalled();
+    });
+
+    it('omits malformed ids without sending them to the UUID query', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      avatarFrames.resolvePublicAppearances.mockResolvedValue(
+        new Map([[uuid, { vipLevel: 0, avatarFrame: null }]]),
+      );
+
+      await expect(
+        service.getAppearances(['not-a-user-id', uuid]),
+      ).resolves.toEqual({
+        [uuid]: { vipLevel: 0, avatarFrame: null },
+      });
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+        uuid,
+      ]);
+    });
+  });
+
+  it('adds the effective frame appearance to a public profile', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-1',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      receivedLikeCount: 0,
+    });
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'user-1',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
+
+    await expect(service.findOne('user-1')).resolves.toMatchObject({
+      avatarFrameAppearance: {
+        id: 'frame-1',
+        key: 'admin-gift',
+        name: 'Gift frame',
+        imageUrl: null,
+      },
+    });
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+      'user-1',
+    ]);
   });
 
   it('creates an independent canonical invite code with an explicit account ID', async () => {
@@ -293,6 +388,7 @@ describe('UserService', () => {
         data: [
           {
             id: 'user-1',
+            avatarFrameAppearance: null,
             vipLevel: 0,
             membership: {
               effectiveLevel: 0,

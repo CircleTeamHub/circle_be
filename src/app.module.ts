@@ -39,6 +39,11 @@ import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 import { RedisModule } from './redis/redis.module';
 import { CreditModule } from './credit/credit.module';
 import { AdminUserModule } from './admin-user/admin-user.module';
+import { FancyNumberModule } from './fancy-number/fancy-number.module';
+import { GroupExpansionModule } from './group-expansion/group-expansion.module';
+import { DashboardModule } from './admin-dashboard/dashboard.module';
+import { AvatarFrameModule } from './avatar-frame/avatar-frame.module';
+import { AdminCommunityModule } from './admin-community/admin-community.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -84,6 +89,11 @@ const envFilePath = `.env.${nodeEnv}`;
     CreditModule,
     CallModule,
     AdminUserModule,
+    FancyNumberModule,
+    GroupExpansionModule,
+    DashboardModule,
+    AvatarFrameModule,
+    AdminCommunityModule,
   ],
   controllers: [],
   providers: [Logger],

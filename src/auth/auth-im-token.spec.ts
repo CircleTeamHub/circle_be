@@ -35,6 +35,8 @@ describe('AuthService.resolveImToken retry', () => {
       null as any,
       null as any,
       { get: () => undefined } as any,
+      null as any,
+      null as any,
     );
   }
 

@@ -34,6 +34,8 @@ const prisma = new PrismaClient({
 });
 
 const accountId = process.env.ADMIN_SEED_ACCOUNT_ID || 'admin';
+const inviteCode =
+  process.env.ADMIN_SEED_INVITE_CODE || accountId.toLowerCase();
 const email = process.env.ADMIN_SEED_EMAIL || 'admin@local.dev';
 const password = process.env.ADMIN_SEED_PASSWORD || 'Admin1234!';
 
@@ -42,6 +44,7 @@ async function main() {
   const user = await prisma.user.upsert({
     where: { accountId },
     update: {
+      inviteCode,
       passwordHash,
       nickname: 'Local Admin',
       email,
@@ -50,6 +53,7 @@ async function main() {
     },
     create: {
       accountId,
+      inviteCode,
       email,
       passwordHash,
       nickname: 'Local Admin',
@@ -62,6 +66,7 @@ async function main() {
   console.log('Admin seed ready:', {
     id: user.id,
     accountId,
+    inviteCode,
     email,
     password,
     role: user.role,

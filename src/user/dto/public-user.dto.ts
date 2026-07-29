@@ -42,6 +42,24 @@ export class SelfMembershipAppearanceDto extends PublicMembershipAppearanceDto {
   lifetime: boolean;
 }
 
+export class AvatarFrameAppearanceDto {
+  @ApiProperty()
+  @Expose()
+  id: string;
+
+  @ApiProperty()
+  @Expose()
+  key: string;
+
+  @ApiProperty()
+  @Expose()
+  name: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  @Expose()
+  imageUrl: string | null;
+}
+
 /** Safe public profile — no PII. Used for GET /user/:id viewed by other users. */
 export class PublicUserDto {
   @ApiProperty({ example: '7f6dcb5e-0d94-463c-b6b3-165b1aa77845' })
@@ -63,6 +81,11 @@ export class PublicUserDto {
   @ApiPropertyOptional({ example: 'https://example.com/frame.png' })
   @Expose()
   avatarFrame: string | null;
+
+  @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
+  @Expose()
+  @Type(() => AvatarFrameAppearanceDto)
+  avatarFrameAppearance: AvatarFrameAppearanceDto | null;
 
   @ApiPropertyOptional({ example: 'https://example.com/cover.png' })
   @Expose()

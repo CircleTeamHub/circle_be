@@ -39,6 +39,7 @@ export interface MembershipTier {
   };
   benefits: {
     fancyNumberVoucher: FancyNumberVoucher | null;
+    permanentFancyNumber: boolean;
   };
 }
 
@@ -57,7 +58,7 @@ export const MEMBERSHIP_CATALOG = [
       cityFilters: { actual: 0, display: '0' },
     },
     appearance: { nameColor: 'default', badge: null },
-    benefits: { fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null, permanentFancyNumber: false },
   },
   {
     level: 1,
@@ -73,7 +74,7 @@ export const MEMBERSHIP_CATALOG = [
       cityFilters: { actual: 2, display: '2' },
     },
     appearance: { nameColor: 'silver', badge: 'silver' },
-    benefits: { fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null, permanentFancyNumber: false },
   },
   {
     level: 2,
@@ -89,7 +90,7 @@ export const MEMBERSHIP_CATALOG = [
       cityFilters: { actual: 10, display: '10' },
     },
     appearance: { nameColor: 'gold', badge: 'gold' },
-    benefits: { fancyNumberVoucher: null },
+    benefits: { fancyNumberVoucher: null, permanentFancyNumber: false },
   },
   {
     level: 3,
@@ -105,7 +106,7 @@ export const MEMBERSHIP_CATALOG = [
       cityFilters: { actual: 50, display: '50' },
     },
     appearance: { nameColor: 'rainbow', badge: 'diamond' },
-    benefits: { fancyNumberVoucher: 'standard' },
+    benefits: { fancyNumberVoucher: null, permanentFancyNumber: false },
   },
   {
     level: 4,
@@ -116,12 +117,12 @@ export const MEMBERSHIP_CATALOG = [
     recommended: false,
     quotas: {
       groupMembers: { actual: 3000, display: '3000' },
-      joinedCircles: { actual: 2000, display: '2000' },
+      joinedCircles: { actual: 2000, display: 'unlimited' },
       notes: { actual: 3000, display: '3000' },
       cityFilters: { actual: 1000, display: 'unlimited' },
     },
     appearance: { nameColor: 'exclusive-shimmer', badge: 'super-lifetime' },
-    benefits: { fancyNumberVoucher: 'premium' },
+    benefits: { fancyNumberVoucher: null, permanentFancyNumber: true },
   },
 ] as const satisfies readonly MembershipTier[];
 

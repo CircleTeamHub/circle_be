@@ -16,7 +16,10 @@ import {
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
-import { PublicMembershipAppearanceDto } from 'src/user/dto/public-user.dto';
+import {
+  AvatarFrameAppearanceDto,
+  PublicMembershipAppearanceDto,
+} from 'src/user/dto/public-user.dto';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -274,6 +277,10 @@ export class PlazaPostAuthorDto {
 
   @ApiProperty({ type: String, nullable: true })
   avatarFrame: string | null;
+
+  @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
+  @Type(() => AvatarFrameAppearanceDto)
+  avatarFrameAppearance: AvatarFrameAppearanceDto | null;
 
   @ApiProperty()
   accountId: string;

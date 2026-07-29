@@ -76,6 +76,7 @@ describe('AuthController', () => {
         nickname: 'Test User',
         avatarUrl: null,
         avatarFrame: null,
+        avatarFrameAppearance: null,
         cover: null,
         email: null,
         phoneNumber: null,

@@ -47,8 +47,46 @@ export const MembershipErrorCode = {
   JoinedCircleQuotaReached: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
 } as const;
 
+export const AvatarFrameErrorCode = {
+  UserNotFound: 'AVATAR_FRAME_USER_NOT_FOUND',
+  OperatorNotFound: 'AVATAR_FRAME_OPERATOR_NOT_FOUND',
+  AssetNotFound: 'AVATAR_FRAME_ASSET_NOT_FOUND',
+  AssetInactive: 'AVATAR_FRAME_ASSET_INACTIVE',
+  NotOwned: 'AVATAR_FRAME_NOT_OWNED',
+  InvalidExpiry: 'AVATAR_FRAME_INVALID_EXPIRY',
+  InvalidReason: 'AVATAR_FRAME_INVALID_REASON',
+  InvalidCursor: 'AVATAR_FRAME_INVALID_CURSOR',
+  IdempotencyConflict: 'AVATAR_FRAME_IDEMPOTENCY_CONFLICT',
+  GrantNotFound: 'AVATAR_FRAME_GRANT_NOT_FOUND',
+  AlreadyRevoked: 'AVATAR_FRAME_ALREADY_REVOKED',
+} as const;
+
+export const FancyNumberErrorCode = {
+  AccountIdLocked: 'FANCY_NUMBER_ACCOUNT_ID_LOCKED',
+  InvalidMonths: 'FANCY_NUMBER_INVALID_MONTHS',
+  InvalidIdempotencyKey: 'FANCY_NUMBER_INVALID_IDEMPOTENCY_KEY',
+  IdempotencyConflict: 'FANCY_NUMBER_IDEMPOTENCY_CONFLICT',
+  NotAvailable: 'FANCY_NUMBER_NOT_AVAILABLE',
+  AlreadyOwned: 'FANCY_NUMBER_ALREADY_OWNED',
+  LeaseNotFound: 'FANCY_NUMBER_LEASE_NOT_FOUND',
+  LeaseExpired: 'FANCY_NUMBER_LEASE_EXPIRED',
+  PermanentCannotRenew: 'FANCY_NUMBER_PERMANENT_CANNOT_RENEW',
+  SwitchRequiresPermanent: 'FANCY_NUMBER_SWITCH_REQUIRES_PERMANENT',
+  InvalidValue: 'FANCY_NUMBER_INVALID_VALUE',
+  ReservedValue: 'FANCY_NUMBER_RESERVED_VALUE',
+  InsufficientPoints: 'FANCY_NUMBER_INSUFFICIENT_POINTS',
+  InventoryConflict: 'FANCY_NUMBER_INVENTORY_CONFLICT',
+  RecommendationLimit: 'FANCY_NUMBER_RECOMMENDATION_LIMIT',
+  RecommendationConflict: 'FANCY_NUMBER_RECOMMENDATION_CONFLICT',
+  RecommendationNotFound: 'FANCY_NUMBER_RECOMMENDATION_NOT_FOUND',
+  RecommendationAccountOccupied: 'FANCY_NUMBER_RECOMMENDATION_ACCOUNT_OCCUPIED',
+  RecommendationInvalidOrder: 'FANCY_NUMBER_RECOMMENDATION_INVALID_ORDER',
+} as const;
+
 export const CircleErrorCode = {
   MemberLimit: 'CIRCLE_MEMBER_LIMIT',
+  // 已发布给客户端的兼容代码；当前新流程使用会员配额错误码。
+  JoinLimitReached: 'CIRCLE_JOIN_LIMIT_REACHED',
   AlreadyMember: 'CIRCLE_ALREADY_MEMBER',
   RequestPending: 'CIRCLE_REQUEST_PENDING',
   VipRequired: 'CIRCLE_VIP_REQUIRED',
@@ -68,6 +106,15 @@ export const CircleErrorCode = {
   ListItemBlank: 'CIRCLE_LIST_ITEM_BLANK',
   ListItemDuplicate: 'CIRCLE_LIST_ITEM_DUPLICATE',
   InvalidCursor: 'CIRCLE_INVALID_CURSOR',
+} as const;
+
+export const GroupExpansionErrorCode = {
+  ProductNotFound: 'GROUP_EXPANSION_PRODUCT_NOT_FOUND',
+  CircleNotFound: 'GROUP_EXPANSION_CIRCLE_NOT_FOUND',
+  CapacityExceeded: 'GROUP_EXPANSION_CAPACITY_EXCEEDED',
+  InsufficientPoints: 'GROUP_EXPANSION_INSUFFICIENT_POINTS',
+  InvalidIdempotencyKey: 'GROUP_EXPANSION_INVALID_IDEMPOTENCY_KEY',
+  IdempotencyConflict: 'GROUP_EXPANSION_IDEMPOTENCY_CONFLICT',
 } as const;
 
 export const GroupErrorCode = {
@@ -295,7 +342,10 @@ export type AppErrorCode =
   | (typeof AuthErrorCode)[keyof typeof AuthErrorCode]
   | (typeof CoinErrorCode)[keyof typeof CoinErrorCode]
   | (typeof MembershipErrorCode)[keyof typeof MembershipErrorCode]
+  | (typeof AvatarFrameErrorCode)[keyof typeof AvatarFrameErrorCode]
+  | (typeof FancyNumberErrorCode)[keyof typeof FancyNumberErrorCode]
   | (typeof CircleErrorCode)[keyof typeof CircleErrorCode]
+  | (typeof GroupExpansionErrorCode)[keyof typeof GroupExpansionErrorCode]
   | (typeof GroupErrorCode)[keyof typeof GroupErrorCode]
   | (typeof CircleInvitationErrorCode)[keyof typeof CircleInvitationErrorCode]
   | (typeof TempChatErrorCode)[keyof typeof TempChatErrorCode]
@@ -318,7 +368,10 @@ export const APP_ERROR_CODE_GROUPS = [
   AuthErrorCode,
   CoinErrorCode,
   MembershipErrorCode,
+  AvatarFrameErrorCode,
+  FancyNumberErrorCode,
   CircleErrorCode,
+  GroupExpansionErrorCode,
   GroupErrorCode,
   CircleInvitationErrorCode,
   TempChatErrorCode,

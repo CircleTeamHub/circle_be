@@ -39,7 +39,9 @@ describe('CircleAdmissionPolicy', () => {
   const circle = (overrides: Record<string, unknown> = {}) => ({
     id: 'circle-1',
     deleted: false,
+    ownerID: 'owner-1',
     maxMembers: 3000,
+    expansionSeats: 0,
     memberCount: 1,
     joinVipRestriction: null,
     joinCreditRestriction: null,
@@ -246,6 +248,25 @@ describe('CircleAdmissionPolicy', () => {
     },
   );
 
+  it('does not satisfy a fancy-number restriction with an expired paid lease snapshot', async () => {
+    prisma.circle.findUnique.mockResolvedValue(
+      circle({ joinFancyRestriction: true }),
+    );
+    prisma.user.findMany.mockResolvedValue([
+      user({
+        fancyNumber: true,
+        fancyNumberPermanent: false,
+        fancyNumberExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      }),
+    ]);
+
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED' },
+    });
+  });
+
   it('deduplicates batch IDs and leaves every row untouched when one candidate fails', async () => {
     prisma.user.findMany.mockResolvedValue([
       user({ id: 'candidate-1' }),
@@ -349,6 +370,17 @@ describe('CircleAdmissionPolicy', () => {
     ).rejects.toMatchObject({
       response: { errorCode: 'CIRCLE_MEMBER_LIMIT', limit: 100 },
     });
+  });
+
+  it('adds the permanent group expansion seats to the owner membership capacity', async () => {
+    prisma.circle.findUnique.mockResolvedValue(
+      circle({ maxMembers: 700, expansionSeats: 600 }),
+    );
+
+    await policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']);
+
+    const reserveValues = prisma.$queryRaw.mock.calls[0].slice(1);
+    expect(reserveValues[reserveValues.length - 1]).toBe(700);
   });
 
   it.each([[null], [{ ...circle(), deleted: true }]])(

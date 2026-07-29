@@ -13,6 +13,7 @@ import { MembershipPolicyService } from 'src/membership/membership-policy.servic
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { PlazaErrorCode } from 'src/common/app-error-codes';
 import { CirclePlazaService } from './circle-plaza.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('CirclePlazaService', () => {
   let service: CirclePlazaService;
@@ -98,6 +99,9 @@ describe('CirclePlazaService', () => {
     invalidateDisplayIconCacheFor: jest.fn(),
     getDisplayIconsForUsers: jest.fn(),
   };
+  const avatarFrames = {
+    resolvePublicAppearances: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -117,6 +121,8 @@ describe('CirclePlazaService', () => {
     prisma.block.findMany.mockResolvedValue([]);
     iconService.getDisplayIconsForUsers.mockReset();
     iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+    avatarFrames.resolvePublicAppearances.mockReset();
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     prisma.collaborationRecognition.findMany.mockResolvedValue([]);
     prisma.userLike.findMany.mockResolvedValue([]);
     prisma.userLike.createMany.mockResolvedValue({ count: 0 });
@@ -134,6 +140,7 @@ describe('CirclePlazaService', () => {
         { provide: IconService, useValue: iconService },
         MembershipPolicyService,
         { provide: MembershipProgramService, useValue: membershipProgram },
+        { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();
 
@@ -551,6 +558,22 @@ describe('CirclePlazaService', () => {
       iconService.getDisplayIconsForUsers.mockResolvedValue(
         new Map([['author-1', displayIcons]]),
       );
+      avatarFrames.resolvePublicAppearances.mockResolvedValue(
+        new Map([
+          [
+            'author-1',
+            {
+              vipLevel: 3,
+              avatarFrame: {
+                id: 'frame-1',
+                key: 'membership-diamond',
+                name: 'Diamond frame',
+                imageUrl: null,
+              },
+            },
+          ],
+        ]),
+      );
 
       const result = await service.getFeed('viewer-1', {});
 
@@ -559,6 +582,16 @@ describe('CirclePlazaService', () => {
       );
       expect(result.items[0].author.displayIcons).toEqual(displayIcons);
       expect(result.items[0].author.vipLevel).toBe(3);
+      expect(result.items[0].author.avatarFrameAppearance).toEqual({
+        id: 'frame-1',
+        key: 'membership-diamond',
+        name: 'Diamond frame',
+        imageUrl: null,
+      });
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+        'author-1',
+      ]);
       // 作者的稳定会员外观也随 feed 下发,客户端无需复刻档位规则即可渲染钻石身份。
       expect(result.items[0].author.membership).toMatchObject({
         effectiveLevel: 3,
@@ -722,6 +755,7 @@ describe('CirclePlazaService', () => {
       notificationService as any,
       iconService as any,
       new MembershipPolicyService(prisma as any),
+      avatarFrames as any,
     );
     prisma.circleMember.findMany.mockResolvedValue([
       {

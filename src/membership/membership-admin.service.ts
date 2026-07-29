@@ -5,7 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { MembershipBenefitType, Prisma } from 'src/generated/prisma';
+import { Prisma } from 'src/generated/prisma';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -26,6 +26,8 @@ import {
   addUtcCalendarMonths,
 } from './membership.catalog';
 import { mapMembershipStatus } from './membership.service';
+import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 const GRANT_REPLAY_INCLUDE = {
   benefitGrants: { select: { type: true } },
@@ -51,6 +53,8 @@ export class MembershipAdminService {
     private readonly notificationService: NotificationService,
     private readonly realtimeService: RealtimeService,
     private readonly iconService: IconService,
+    private readonly fancyNumberService: FancyNumberService,
+    private readonly avatarFrameService: AvatarFrameService,
   ) {}
 
   async grant(
@@ -86,12 +90,27 @@ export class MembershipAdminService {
             };
           }
 
+          const transactionNow = new Date();
           const target = await tx.user.findUnique({
             where: { id: targetUserId },
             select: {
               id: true,
               vipLevel: true,
               vipExpiresAt: true,
+              selectedAvatarFrameID: true,
+              selectedAvatarFrameExpiresAt: true,
+              selectedAvatarFrame: {
+                select: {
+                  id: true,
+                  key: true,
+                  name: true,
+                  description: true,
+                  imageUrl: true,
+                  minimumVipLevel: true,
+                  isActive: true,
+                  sortOrder: true,
+                },
+              },
               membershipBenefitGrants: { select: { type: true } },
             },
           });
@@ -101,8 +120,26 @@ export class MembershipAdminService {
               errorCode: MembershipErrorCode.UserNotFound,
             });
           }
+          const selectedFrameGrants = target.selectedAvatarFrameID
+            ? await tx.userAvatarFrameGrant.findMany({
+                where: {
+                  userID: targetUserId,
+                  frameID: target.selectedAvatarFrameID,
+                  revokedAt: null,
+                  OR: [
+                    { expiresAt: null },
+                    { expiresAt: { gt: transactionNow } },
+                  ],
+                },
+                select: {
+                  id: true,
+                  frameID: true,
+                  expiresAt: true,
+                  revokedAt: true,
+                },
+              })
+            : [];
 
-          const transactionNow = new Date();
           const previous = this.membershipPolicy.resolve(
             target,
             transactionNow,
@@ -121,17 +158,10 @@ export class MembershipAdminService {
                 this.expiryBase(target, previous.level, transactionNow),
                 targetTier.durationMonths,
               );
-          const benefitType = this.benefitForTarget(input.targetLevel);
           const previouslyIssued = target.membershipBenefitGrants.map(
             (benefit) => benefit.type,
           );
-          const issuedBenefitTypes =
-            benefitType && !previouslyIssued.includes(benefitType)
-              ? [benefitType]
-              : [];
-          const benefitTypesSnapshot = [
-            ...new Set([...previouslyIssued, ...issuedBenefitTypes]),
-          ];
+          const benefitTypesSnapshot = [...new Set(previouslyIssued)];
 
           const grant = await tx.membershipGrant.create({
             data: {
@@ -155,20 +185,27 @@ export class MembershipAdminService {
               vipExpiresAt: newExpiresAt,
             },
           });
+          await this.avatarFrameService.extendSelectionContinuityForMembershipChange(
+            tx,
+            { ...target, avatarFrameGrants: selectedFrameGrants },
+            {
+              vipLevel: input.targetLevel,
+              vipExpiresAt: newExpiresAt,
+            },
+            transactionNow,
+          );
 
-          if (benefitType && issuedBenefitTypes.includes(benefitType)) {
-            await tx.membershipBenefitGrant.create({
-              data: {
-                userID: targetUserId,
-                membershipGrantID: grant.id,
-                type: benefitType,
-              },
-            });
+          if (input.targetLevel === 4) {
+            await this.fancyNumberService.convertActiveLeaseToPermanent(
+              tx,
+              targetUserId,
+              transactionNow,
+            );
           }
 
           const replayableGrant: ReplayableGrant = {
             ...grant,
-            benefitGrants: issuedBenefitTypes.map((type) => ({ type })),
+            benefitGrants: [],
           };
           return {
             created: true,
@@ -239,18 +276,6 @@ export class MembershipAdminService {
       return target.vipExpiresAt;
     }
     return now;
-  }
-
-  private benefitForTarget(
-    targetLevel: MembershipLevel,
-  ): MembershipBenefitType | null {
-    if (targetLevel === 3) {
-      return MembershipBenefitType.STANDARD_FANCY_NUMBER;
-    }
-    if (targetLevel === 4) {
-      return MembershipBenefitType.PREMIUM_FANCY_NUMBER;
-    }
-    return null;
   }
 
   private replayOrThrow(

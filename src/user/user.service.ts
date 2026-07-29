@@ -29,6 +29,11 @@ import {
   toPublicMembershipAppearance,
 } from 'src/membership/membership-appearance';
 import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
+import {
+  AvatarFramePublicAppearance,
+  AvatarFrameService,
+  PublicUserAppearance,
+} from 'src/avatar-frame/avatar-frame.service';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -61,6 +66,8 @@ export interface UpdateUserInput {
 }
 
 const PUBLIC_SELECT = USER_PROFILE_SELECT;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type ProfilePrivacyUser = {
   id: string;
@@ -75,13 +82,17 @@ type ProfileMembershipUser = {
   vipExpiresAt?: Date | null;
 };
 
-function toPublicUser<T extends ProfileMembershipUser>(user: T) {
+function toPublicUser<T extends ProfileMembershipUser>(
+  user: T,
+  avatarFrameAppearance: AvatarFramePublicAppearance | null = null,
+) {
   const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
   const membership = toPublicMembershipAppearance({ vipLevel, vipExpiresAt });
   return {
     ...profile,
     vipLevel: membership.effectiveLevel,
     membership,
+    avatarFrameAppearance,
   };
 }
 
@@ -91,6 +102,7 @@ function toPublicUser<T extends ProfileMembershipUser>(user: T) {
 // /auth/me 不一致）。
 function toSelfUser<T extends ProfileMembershipUser>(
   user: T,
+  avatarFrameAppearance: AvatarFramePublicAppearance | null = null,
   now = new Date(),
 ) {
   const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
@@ -104,6 +116,7 @@ function toSelfUser<T extends ProfileMembershipUser>(
     vipExpiresAt,
     vipLevel: membership.effectiveLevel,
     membership,
+    avatarFrameAppearance,
   };
 }
 
@@ -193,6 +206,7 @@ export class UserService {
     // is a wiring bug that should crash at startup, not silently expose
     // phone/wechat/qq. PrivacySettingsModule is imported by UserModule.
     private privacySettings: PrivacySettingsService,
+    private avatarFrames: AvatarFrameService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -239,6 +253,40 @@ export class UserService {
     return out;
   }
 
+  async getAppearances(
+    ids: string[],
+  ): Promise<Record<string, PublicUserAppearance>> {
+    const uniqueIds = [...new Set(ids)];
+    if (uniqueIds.length === 0) {
+      return {};
+    }
+
+    const aliasesByNormalized = new Map<string, string[]>();
+    for (const id of uniqueIds) {
+      const normalized = OpenimService.fromImUserId(id).toLowerCase();
+      if (!UUID_PATTERN.test(normalized)) {
+        continue;
+      }
+      const aliases = aliasesByNormalized.get(normalized);
+      if (aliases) {
+        aliases.push(id);
+      } else {
+        aliasesByNormalized.set(normalized, [id]);
+      }
+    }
+
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      ...aliasesByNormalized.keys(),
+    ]);
+    const result: Record<string, PublicUserAppearance> = {};
+    for (const [normalizedId, appearance] of appearances) {
+      for (const alias of aliasesByNormalized.get(normalizedId) ?? []) {
+        result[alias] = appearance;
+      }
+    }
+    return result;
+  }
+
   /**
    * Rejects URL fields that don't originate from our own storage.
    * Prevents SSRF-capable URLs (cloud metadata, localhost, javascript:, data:)
@@ -272,7 +320,17 @@ export class UserService {
       this.prisma.user.count({ where }),
     ]);
 
-    return { data: data.map(toPublicUser), total, page, limit: take };
+    const appearances = await this.avatarFrames.resolvePublicAppearances(
+      data.map((user) => user.id),
+    );
+    return {
+      data: data.map((user) =>
+        toPublicUser(user, appearances.get(user.id)?.avatarFrame ?? null),
+      ),
+      total,
+      page,
+      limit: take,
+    };
   }
 
   async findByExactAccountId(accountId: string | undefined, viewerId?: string) {
@@ -296,18 +354,27 @@ export class UserService {
 
     // Apply the same field-privacy gate as GET /user/:id. Without it the
     // friend-add lookup leaks wechat/qq that the target set to private (F-01).
-    return user
-      ? toPublicUser(await this.applyProfilePrivacy(user, viewerId))
-      : null;
+    if (!user) {
+      return null;
+    }
+    const [filteredUser, appearances] = await Promise.all([
+      this.applyProfilePrivacy(user, viewerId),
+      this.avatarFrames.resolvePublicAppearances([user.id]),
+    ]);
+    return toPublicUser(
+      filteredUser,
+      appearances.get(user.id)?.avatarFrame ?? null,
+    );
   }
 
   async findOne(id: string, viewerId?: string) {
-    const [user, displayIcons] = await Promise.all([
+    const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id },
         select: PUBLIC_SELECT,
       }),
       this.iconService.getDisplayIconsForUser(id),
+      this.avatarFrames.resolvePublicAppearances([id]),
     ]);
     if (!user) throw new NotFoundException(`User ${id} not found`);
     const filteredUser = await this.applyProfilePrivacy(user, viewerId);
@@ -327,7 +394,7 @@ export class UserService {
           )
         : false;
     return {
-      ...toPublicUser(filteredUser),
+      ...toPublicUser(filteredUser, appearances.get(id)?.avatarFrame ?? null),
       displayIcons,
       likeCount: user.receivedLikeCount,
       likedByMeToday,
@@ -393,7 +460,13 @@ export class UserService {
           },
           select: PUBLIC_SELECT,
         });
-        return toPublicUser(user);
+        const appearances = await this.avatarFrames.resolvePublicAppearances([
+          user.id,
+        ]);
+        return toPublicUser(
+          user,
+          appearances.get(user.id)?.avatarFrame ?? null,
+        );
       } catch (error) {
         if (isInviteCodeUniqueCollision(error)) {
           if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
@@ -434,25 +507,29 @@ export class UserService {
       }
       return updated;
     });
-    const displayIcons = await this.iconService.getDisplayIconsForUser(id);
+    const [displayIcons, appearances] = await Promise.all([
+      this.iconService.getDisplayIconsForUser(id),
+      this.avatarFrames.resolvePublicAppearances([id]),
+    ]);
     await this.realtimeService.invalidateUserProfileSummaryCache(id);
     await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
-      ...toSelfUser(user),
+      ...toSelfUser(user, appearances.get(id)?.avatarFrame ?? null),
       displayIcons,
     };
   }
 
   async remove(id: string) {
     await this.findOne(id);
-    const [user, displayIcons] = await Promise.all([
+    const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.update({
         where: { id },
         data: { status: UserStatus.DELETED },
         select: PUBLIC_SELECT,
       }),
       this.iconService.getDisplayIconsForUser(id),
+      this.avatarFrames.resolvePublicAppearances([id]),
     ]);
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
@@ -461,7 +538,7 @@ export class UserService {
     // the effective (expiry-aware) vipLevel and attach the membership object,
     // so an expired paid tier can't leak its stored level in the deletion body.
     return {
-      ...toPublicUser(user),
+      ...toPublicUser(user, appearances.get(id)?.avatarFrame ?? null),
       displayIcons,
     };
   }

@@ -40,7 +40,7 @@ describe('membership catalog', () => {
       priceCny: 1998,
       actual: [1000, 1000, 1000, 50],
       display: ['1000', '1000', '1000', '50'],
-      appearance: ['rainbow', 'diamond', 'standard'],
+      appearance: ['rainbow', 'diamond', null],
     },
     {
       level: 4,
@@ -48,8 +48,8 @@ describe('membership catalog', () => {
       durationMonths: null,
       priceCny: 3998,
       actual: [3000, 2000, 3000, 1000],
-      display: ['3000', '2000', '3000', 'unlimited'],
-      appearance: ['exclusive-shimmer', 'super-lifetime', 'premium'],
+      display: ['3000', 'unlimited', '3000', 'unlimited'],
+      appearance: ['exclusive-shimmer', 'super-lifetime', null],
     },
   ])(
     'defines the complete $key actual and display entitlement contract',
@@ -92,6 +92,27 @@ describe('membership catalog', () => {
     expect(serialized).not.toMatch(
       /voice.?to.?text|avatar.?frame|animated.?avatar|createdCircles|premiumCircle|prioritySupport/i,
     );
+  });
+
+  it('removes graded fancy-number vouchers and gives only super a permanent fancy number', () => {
+    const benefits = MEMBERSHIP_CATALOG.map(
+      (tier) =>
+        tier.benefits as {
+          fancyNumberVoucher: string | null;
+          permanentFancyNumber?: boolean;
+        },
+    );
+
+    expect(benefits.map((benefit) => benefit.fancyNumberVoucher)).toEqual([
+      null,
+      null,
+      null,
+      null,
+      null,
+    ]);
+    expect(
+      benefits.map((benefit) => benefit.permanentFancyNumber ?? false),
+    ).toEqual([false, false, false, false, true]);
   });
 });
 

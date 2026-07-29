@@ -34,6 +34,24 @@ export interface OpenimMessage {
   ex: string;
 }
 
+export interface OpenimAdminGroup {
+  groupInfo: {
+    groupID: string;
+    groupName: string;
+    faceURL?: string;
+    status: number;
+    memberCount?: number;
+    createTime?: number;
+  };
+  groupOwnerUserID?: string;
+  groupOwnerUserName?: string;
+}
+
+export interface OpenimAdminGroupList {
+  total: number;
+  groups: OpenimAdminGroup[];
+}
+
 @Injectable()
 export class OpenimService implements OnModuleInit {
   private readonly logger = new Logger(OpenimService.name);
@@ -150,7 +168,7 @@ export class OpenimService implements OnModuleInit {
     const [lo, hi] = [
       OpenimService.toImUserId(userIdA),
       OpenimService.toImUserId(userIdB),
-    ].sort();
+    ].sort((left, right) => left.localeCompare(right));
     return `si_${lo}_${hi}`;
   }
 
@@ -631,6 +649,52 @@ export class OpenimService implements OnModuleInit {
       { groupID, deleteMember: true },
       adminToken,
     );
+  }
+
+  async listGroups(params: {
+    page: number;
+    limit: number;
+    keyword?: string;
+  }): Promise<OpenimAdminGroupList> {
+    if (!this.enabled) {
+      throw new Error('OpenIM is not configured');
+    }
+    const adminToken = await this.getAdminToken();
+    const keyword = params.keyword?.trim();
+    if (keyword) {
+      const exact = await this.post<OpenimAdminGroupList>(
+        '/group/get_groups',
+        {
+          groupID: keyword,
+          pagination: { pageNumber: 1, showNumber: 1 },
+        },
+        adminToken,
+      );
+      if (exact.total > 0) return exact;
+    }
+    return this.post<OpenimAdminGroupList>(
+      '/group/get_groups',
+      {
+        ...(keyword ? { groupName: keyword } : {}),
+        pagination: {
+          pageNumber: params.page,
+          showNumber: params.limit,
+        },
+      },
+      adminToken,
+    );
+  }
+
+  async muteGroup(groupID: string): Promise<void> {
+    if (!this.enabled) return;
+    const adminToken = await this.getAdminToken();
+    await this.post('/group/mute_group', { groupID }, adminToken);
+  }
+
+  async unmuteGroup(groupID: string): Promise<void> {
+    if (!this.enabled) return;
+    const adminToken = await this.getAdminToken();
+    await this.post('/group/cancel_mute_group', { groupID }, adminToken);
   }
 
   /**

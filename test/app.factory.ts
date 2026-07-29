@@ -45,12 +45,13 @@ export class AppFactory {
   // Clear all test data in dependency order
   async initDB() {
     assertSafeE2eDatabase();
-    await this.prisma.notificationPushOutbox.deleteMany();
-    await this.prisma.notification.deleteMany();
-    await this.prisma.membershipBenefitGrant.deleteMany();
-    await this.prisma.membershipGrant.deleteMany();
-    await this.prisma.refreshToken.deleteMany();
-    await this.prisma.user.deleteMany();
+    // User.accountId and AccountIdentifier.currentUserID deliberately form a
+    // claim cycle, so row-by-row deletes cannot remove either side first.
+    // This helper is guarded to an explicit test database above; CASCADE gives
+    // every e2e case a clean user-owned graph without weakening production FKs.
+    await this.prisma.$executeRaw`
+      TRUNCATE TABLE "User", "AccountIdentifier" CASCADE
+    `;
     // Reset the staged-rollout singleton so each test starts DISABLED. Quota
     // tests that need the enforced (non-floored) limits enable it explicitly;
     // without this reset an enablement would leak into later tests.

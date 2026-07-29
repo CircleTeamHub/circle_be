@@ -8,6 +8,7 @@ export type AdminAuditEntry = {
   entityID?: string;
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
+  reason?: string | null;
   ip?: string | null;
   userAgent?: string | null;
 };
@@ -44,6 +45,7 @@ export class AdminAuditService {
         after: entry.after
           ? (JSON.parse(JSON.stringify(entry.after)) as object)
           : undefined,
+        reason: entry.reason ?? null,
         ip: entry.ip ?? null,
         userAgent: entry.userAgent ?? null,
       },
@@ -65,6 +67,7 @@ export class AdminAuditService {
           after: entry.after
             ? (JSON.parse(JSON.stringify(entry.after)) as object)
             : undefined,
+          reason: entry.reason ?? null,
           ip: entry.ip ?? null,
           userAgent: entry.userAgent ?? null,
         },

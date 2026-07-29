@@ -128,6 +128,64 @@ describe('OpenimService group/auth admin calls', () => {
     });
   });
 
+  it('lists OpenIM groups with server-side pagination and search', async () => {
+    fetchMock.mockImplementation(
+      async (url: string, options?: RequestInit) => ({
+        json: async () => {
+          if (url.endsWith('/auth/get_admin_token')) {
+            return { errCode: 0, data: { token: 'admin-token' } };
+          }
+          const body = JSON.parse(String(options?.body ?? '{}'));
+          if (body.groupID) {
+            return { errCode: 0, data: { total: 0, groups: [] } };
+          }
+          return {
+            errCode: 0,
+            data: {
+              total: 1,
+              groups: [
+                {
+                  groupInfo: {
+                    groupID: 'group-1',
+                    groupName: 'Weekend Hike',
+                    status: 0,
+                    memberCount: 20,
+                  },
+                  groupOwnerUserID: 'owner-1',
+                  groupOwnerUserName: 'Alice',
+                },
+              ],
+            },
+          };
+        },
+      }),
+    );
+
+    await expect(
+      service.listGroups({ page: 2, limit: 25, keyword: 'Weekend' }),
+    ).resolves.toMatchObject({ total: 1 });
+    const calls = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith('/group/get_groups'),
+    );
+    expect(JSON.parse(calls[0]![1].body)).toEqual({
+      groupID: 'Weekend',
+      pagination: { pageNumber: 1, showNumber: 1 },
+    });
+    expect(JSON.parse(calls[1]![1].body)).toEqual({
+      groupName: 'Weekend',
+      pagination: { pageNumber: 2, showNumber: 25 },
+    });
+  });
+
+  it.each([
+    ['muteGroup', '/group/mute_group'],
+    ['unmuteGroup', '/group/cancel_mute_group'],
+  ] as const)('%s posts the group id to OpenIM', async (method, path) => {
+    await service[method]('group-1');
+    const call = fetchMock.mock.calls.find(([u]) => String(u).endsWith(path));
+    expect(JSON.parse(call![1].body)).toEqual({ groupID: 'group-1' });
+  });
+
   it('isGroupMember posts /group/get_group_members_info with the normalized user id', async () => {
     fetchMock.mockImplementation(async (url: string) => ({
       json: async () =>

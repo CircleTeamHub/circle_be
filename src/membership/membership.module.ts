@@ -8,6 +8,8 @@ import { IconModule } from 'src/icon/icon.module';
 import { MembershipAdminController } from './membership-admin.controller';
 import { MembershipAdminService } from './membership-admin.service';
 import { MembershipProgramAdminController } from './membership-program-admin.controller';
+import { FancyNumberModule } from 'src/fancy-number/fancy-number.module';
+import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 
 @Module({
   imports: [
@@ -15,6 +17,8 @@ import { MembershipProgramAdminController } from './membership-program-admin.con
     NotificationModule,
     RealtimeModule,
     IconModule,
+    FancyNumberModule,
+    AvatarFrameModule,
   ],
   controllers: [
     MembershipController,

@@ -44,6 +44,11 @@ import {
   EffectiveMembershipAppearance,
   resolveMembershipAppearance,
 } from 'src/membership/membership-appearance';
+import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
+import {
+  AvatarFramePublicAppearance,
+  AvatarFrameService,
+} from 'src/avatar-frame/avatar-frame.service';
 
 const ME_SELECT = USER_ME_SELECT;
 
@@ -89,6 +94,7 @@ export type SafeUser = {
   nickname: string;
   avatarUrl: string | null;
   avatarFrame: string | null;
+  avatarFrameAppearance: AvatarFramePublicAppearance | null;
   cover: string | null;
   email: string | null;
   phoneNumber: string | null;
@@ -128,6 +134,8 @@ export class AuthService {
     private iconService: IconService,
     private emailVerification: EmailVerificationService,
     private configService: ConfigService,
+    private fancyNumberService: FancyNumberService,
+    private avatarFrames: AvatarFrameService,
   ) {}
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
@@ -756,12 +764,13 @@ export class AuthService {
   }
 
   async me(userId: string): Promise<SafeUser> {
-    const [user, displayIcons] = await Promise.all([
+    const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
         select: ME_SELECT,
       }),
       this.iconService.getDisplayIconsForUser(userId),
+      this.avatarFrames.resolvePublicAppearances([userId]),
     ]);
 
     if (!user) {
@@ -791,6 +800,7 @@ export class AuthService {
       storedVipLevel,
       vipLevel: membership.effectiveLevel,
       membership,
+      avatarFrameAppearance: appearances.get(userId)?.avatarFrame ?? null,
       lastOnline: now,
       displayIcons,
     };
@@ -956,6 +966,8 @@ export class AuthService {
       });
     }
 
+    await this.fancyNumberService.ensureAccountIdChangeAllowed(userId);
+
     const current = await this.prisma.user.findUnique({
       where: { id: userId },
       select: { accountId: true },
@@ -978,6 +990,29 @@ export class AuthService {
       select: { id: true },
     });
     if (taken) {
+      throw new ConflictException({
+        message: '该账号已被占用',
+        errorCode: AuthErrorCode.AccountIdTaken,
+      });
+    }
+    const identifierClaim = await this.prisma.accountIdentifier.findUnique({
+      where: { value: normalized },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+        fancyNumber: { select: { id: true } },
+      },
+    });
+    if (
+      identifierClaim &&
+      ((identifierClaim.currentUserID !== null &&
+        identifierClaim.currentUserID !== userId) ||
+        identifierClaim.reservedForUserID !== null ||
+        (identifierClaim.inviteOwnerUserID !== null &&
+          identifierClaim.inviteOwnerUserID !== userId) ||
+        identifierClaim.fancyNumber !== null)
+    ) {
       throw new ConflictException({
         message: '该账号已被占用',
         errorCode: AuthErrorCode.AccountIdTaken,

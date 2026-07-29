@@ -5,11 +5,15 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationType, Prisma } from 'src/generated/prisma';
 import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
 import { NotificationPushService } from './notification-push.service';
+import { AdminAuditService } from 'src/moderation/admin-audit.service';
 
 describe('NotificationService', () => {
   let service: NotificationService;
 
   const prisma = {
+    user: {
+      findMany: jest.fn(),
+    },
     notification: {
       findFirst: jest.fn(),
       findMany: jest.fn(),
@@ -41,10 +45,16 @@ describe('NotificationService', () => {
   const pushService = {
     sendNotification: jest.fn(),
   };
+  const auditService = {
+    record: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     for (const nested of Object.values(prisma.notification) as jest.Mock[]) {
+      nested.mockReset();
+    }
+    for (const nested of Object.values(prisma.user) as jest.Mock[]) {
       nested.mockReset();
     }
     for (const nested of Object.values(prisma.devicePushToken) as jest.Mock[]) {
@@ -56,6 +66,7 @@ describe('NotificationService', () => {
       nested.mockReset();
     }
     pushService.sendNotification.mockReset();
+    auditService.record.mockReset();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -63,6 +74,7 @@ describe('NotificationService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: NotificationPushService, useValue: pushService },
+        { provide: AdminAuditService, useValue: auditService },
       ],
     }).compile();
 
@@ -115,6 +127,76 @@ describe('NotificationService', () => {
     expect(
       realtimeService.broadcastSystemNotificationUnread,
     ).not.toHaveBeenCalled();
+  });
+
+  it('publishes an admin system announcement to active users with push outbox rows and unread broadcasts', async () => {
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'user-1' },
+      { id: 'user-2' },
+    ]);
+    prisma.notification.createManyAndReturn.mockResolvedValue([
+      { id: 'notification-1', toUserID: 'user-1' },
+      { id: 'notification-2', toUserID: 'user-2' },
+    ]);
+
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-1',
+        {
+          content: 'Maintenance starts at 22:00.',
+        },
+        {
+          ip: '127.0.0.1',
+          userAgent: 'jest',
+        },
+      ),
+    ).resolves.toEqual({ createdCount: 2 });
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { status: 'ACTIVE' },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+    });
+    expect(prisma.notification.createManyAndReturn).toHaveBeenCalledWith({
+      data: [
+        {
+          toUserID: 'user-1',
+          fromUserID: 'admin-1',
+          type: NotificationType.SYSTEM,
+          content: 'Maintenance starts at 22:00.',
+        },
+        {
+          toUserID: 'user-2',
+          fromUserID: 'admin-1',
+          type: NotificationType.SYSTEM,
+          content: 'Maintenance starts at 22:00.',
+        },
+      ],
+      select: { id: true, toUserID: true },
+    });
+    expect(prisma.notificationPushOutbox.createMany).toHaveBeenCalledWith({
+      data: [
+        { notificationID: 'notification-1' },
+        { notificationID: 'notification-2' },
+      ],
+    });
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-1');
+    expect(
+      realtimeService.broadcastSystemNotificationUnread,
+    ).toHaveBeenCalledWith('user-2');
+    expect(auditService.record).toHaveBeenCalledWith({
+      actorID: 'admin-1',
+      action: 'system_announcement_publish',
+      entityType: 'SystemAnnouncement',
+      after: {
+        content: 'Maintenance starts at 22:00.',
+        createdCount: 2,
+      },
+      ip: '127.0.0.1',
+      userAgent: 'jest',
+    });
   });
 
   describe('push tokens', () => {

@@ -76,6 +76,89 @@ export function buildPublicReadBucketPolicy(bucket: string) {
   });
 }
 
+function stringField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function numberField(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function errorRecord(error: unknown): Record<string, unknown> | null {
+  return error && typeof error === 'object'
+    ? (error as Record<string, unknown>)
+    : null;
+}
+
+function redactLogValue(value: string) {
+  return value.replace(
+    /(token|secret|password|authorization)=\S+/gi,
+    '$1=[redacted]',
+  );
+}
+
+function errorMessage(error: unknown, record: Record<string, unknown> | null) {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+  return record ? stringField(record, 'message') : null;
+}
+
+function errorName(error: unknown, record: Record<string, unknown> | null) {
+  if (error instanceof Error && error.name.trim()) {
+    return error.name.trim();
+  }
+  return record ? stringField(record, 'name') : null;
+}
+
+function errorCode(record: Record<string, unknown> | null) {
+  if (!record) return null;
+  return stringField(record, 'Code') ?? stringField(record, 'code');
+}
+
+function formatMinioBootstrapError(error: unknown) {
+  if (typeof error === 'string' && error.trim()) {
+    return redactLogValue(error.trim());
+  }
+
+  const record = errorRecord(error);
+  const metadata = errorRecord(record?.['$metadata']);
+  const message = errorMessage(error, record);
+  const name = errorName(error, record);
+  const code = errorCode(record);
+  const status = metadata ? numberField(metadata, 'httpStatusCode') : null;
+  const requestId = metadata ? stringField(metadata, 'requestId') : null;
+  const attempts = metadata ? numberField(metadata, 'attempts') : null;
+
+  const parts = [
+    name ? `name=${redactLogValue(name)}` : null,
+    code ? `code=${redactLogValue(code)}` : null,
+    message ? `message=${redactLogValue(message)}` : null,
+    status ? `status=${status}` : null,
+    requestId ? `requestId=${redactLogValue(requestId)}` : null,
+    attempts ? `attempts=${attempts}` : null,
+  ].filter(Boolean);
+
+  return parts.length ? parts.join(' ') : 'UnknownError';
+}
+
+function isMissingBucketError(error: unknown) {
+  const record = errorRecord(error);
+  const metadata = errorRecord(record?.['$metadata']);
+  const status = metadata ? numberField(metadata, 'httpStatusCode') : null;
+  const name = errorName(error, record);
+  const code = errorCode(record);
+
+  return (
+    status === 404 ||
+    name === 'NotFound' ||
+    name === 'NoSuchBucket' ||
+    code === 'NoSuchBucket'
+  );
+}
+
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
@@ -384,7 +467,10 @@ export class UploadService implements OnModuleInit {
   private async ensureBucketExists() {
     try {
       await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
-    } catch {
+    } catch (error) {
+      if (!isMissingBucketError(error)) {
+        throw error;
+      }
       this.logger.log(`Bucket "${this.bucket}" not found, creating...`);
       await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
       this.logger.log(`Bucket "${this.bucket}" created.`);
@@ -405,8 +491,11 @@ export class UploadService implements OnModuleInit {
   }
 
   private async bootstrap(): Promise<boolean> {
+    let step: 'ensure_bucket_exists' | 'put_bucket_policy' =
+      'ensure_bucket_exists';
     try {
       await this.ensureBucketExists();
+      step = 'put_bucket_policy';
       await this.ensureBucketIsPublicReadable();
       return true;
     } catch (error) {
@@ -414,8 +503,9 @@ export class UploadService implements OnModuleInit {
       // 仍然匿名可读，而应用照常发预签名 URL —— 表面上一切正常。readiness 探针
       // 的 objectStore 字段会同步报 policy-unconfirmed。
       this.logger.error(
-        `MinIO bootstrap attempt failed: ${error instanceof Error ? error.message : String(error)}. ` +
+        `MinIO bootstrap attempt failed during ${step}: ${formatMinioBootstrapError(error)}. ` +
           'The private-media bucket policy may not be in force — notes/* could still be anonymously readable.',
+        error instanceof Error ? error.stack : undefined,
       );
       return false;
     }

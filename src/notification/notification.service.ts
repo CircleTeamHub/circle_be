@@ -1,6 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { NotificationType, Prisma } from 'src/generated/prisma';
+import { NotificationType, Prisma, UserStatus } from 'src/generated/prisma';
+import { AdminAuditService } from 'src/moderation/admin-audit.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
@@ -13,15 +14,31 @@ import {
   type NotificationRealtimeRow,
   type RegisterPushTokenDto,
   type NotificationRealtimeDto,
+  type PublishSystemAnnouncementDto,
   type RevokePushTokenDto,
 } from './notification.dto';
 import { NotificationPushService } from './notification-push.service';
 
 const NOTIFICATION_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+const SYSTEM_ANNOUNCEMENT_BATCH_SIZE = 500;
+const SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE = 50;
 // #98 显式决定：保持 20 而不是原计划的 10。多设备（手机+平板+重装残留）在
 // 20 内都装得下，超限按 lastSeen 逐出最旧的；收紧到 10 只会更快逐出仍然
 // 活跃的次要设备，没有对应的安全收益（token 本身不可伪造投递身份）。
 const MAX_PUSH_TOKENS_PER_USER = 20;
+
+type SystemAnnouncementAuditContext = {
+  ip?: string | null;
+  userAgent?: string | null;
+};
+
+function chunkArray<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
 
 @Injectable()
 export class NotificationService {
@@ -30,7 +47,10 @@ export class NotificationService {
     private readonly realtimeService: RealtimeService,
     // Kept optional for compatibility with direct service consumers; delivery
     // itself is handled by the durable push outbox processor.
+    @Optional()
     private readonly pushService?: NotificationPushService,
+    @Optional()
+    private readonly auditService?: AdminAuditService,
   ) {}
 
   private isDiscoverNotification(type: NotificationType): boolean {
@@ -202,6 +222,77 @@ export class NotificationService {
     );
     const dto = mapNotificationRealtimeDto(notification);
     return dto;
+  }
+
+  async publishSystemAnnouncement(
+    operatorId: string,
+    dto: PublishSystemAnnouncementDto,
+    auditContext?: SystemAnnouncementAuditContext,
+  ): Promise<{ createdCount: number }> {
+    const recipients = await this.prisma.user.findMany({
+      where: { status: UserStatus.ACTIVE },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+    });
+    const recipientIds = [...new Set(recipients.map((user) => user.id))];
+    if (recipientIds.length === 0) {
+      return { createdCount: 0 };
+    }
+
+    const created: Array<{ id: string; toUserID: string | null }> = [];
+    for (const batch of chunkArray(
+      recipientIds,
+      SYSTEM_ANNOUNCEMENT_BATCH_SIZE,
+    )) {
+      const inserted = await this.prisma.$transaction(async (tx) => {
+        const rows = await tx.notification.createManyAndReturn({
+          data: batch.map((toUserID) => ({
+            toUserID,
+            fromUserID: operatorId,
+            type: NotificationType.SYSTEM,
+            content: dto.content,
+          })),
+          select: { id: true, toUserID: true },
+        });
+
+        if (rows.length > 0) {
+          await tx.notificationPushOutbox.createMany({
+            data: rows.map(({ id }) => ({ notificationID: id })),
+          });
+        }
+
+        return rows;
+      });
+      created.push(...inserted);
+    }
+
+    const createdUserIds = created
+      .map(({ toUserID }) => toUserID)
+      .filter((userId): userId is string => typeof userId === 'string');
+    for (const batch of chunkArray(
+      createdUserIds,
+      SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
+    )) {
+      await Promise.all(
+        batch.map((userId) =>
+          this.realtimeService.broadcastSystemNotificationUnread(userId),
+        ),
+      );
+    }
+
+    await this.auditService?.record({
+      actorID: operatorId,
+      action: 'system_announcement_publish',
+      entityType: 'SystemAnnouncement',
+      after: {
+        content: dto.content,
+        createdCount: created.length,
+      },
+      ip: auditContext?.ip ?? null,
+      userAgent: auditContext?.userAgent ?? null,
+    });
+
+    return { createdCount: created.length };
   }
 
   private async createNotification(data: {
