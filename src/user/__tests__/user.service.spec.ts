@@ -279,6 +279,26 @@ describe('UserService', () => {
     });
   });
 
+  it('returns the committed user when the optional avatar-frame lookup fails', async () => {
+    prisma.user.create.mockResolvedValue({ id: 'user-1' });
+    avatarFrames.resolvePublicAppearances.mockRejectedValue(
+      new Error('database timeout'),
+    );
+
+    await expect(
+      service.create({
+        accountId: 'Alice_04',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).resolves.toMatchObject({
+      id: 'user-1',
+      avatarFrameAppearance: null,
+    });
+
+    expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+
   it('returns service unavailable when admin-user invite-code collisions are exhausted', async () => {
     prisma.user.create.mockRejectedValue(
       new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {

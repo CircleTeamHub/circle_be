@@ -15,7 +15,6 @@ describe('AdminGroupOperationProcessor', () => {
       updateMany: jest.fn(),
       findFirst: jest.fn(),
       findUnique: jest.fn(),
-      update: jest.fn(),
     },
     circle: { update: jest.fn() },
     adminAuditLog: { create: jest.fn() },
@@ -48,10 +47,6 @@ describe('AdminGroupOperationProcessor', () => {
       attempts: 0,
     });
     prisma.adminGroupOperation.findUnique.mockResolvedValue(operation);
-    prisma.adminGroupOperation.update.mockResolvedValue({
-      ...operation,
-      status: 'SUCCEEDED',
-    });
   });
 
   it('mutes the OpenIM group and completes circle disabling', async () => {
@@ -62,8 +57,12 @@ describe('AdminGroupOperationProcessor', () => {
       where: { id: 'circle-1' },
       data: { adminState: 'DISABLED' },
     });
-    expect(prisma.adminGroupOperation.update).toHaveBeenCalledWith({
-      where: { id: 'operation-1' },
+    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'operation-1',
+        status: 'PROCESSING',
+        claimedAt: new Date('2026-07-29T12:00:00.000Z'),
+      },
       data: expect.objectContaining({
         status: 'SUCCEEDED',
         lastError: null,
@@ -97,8 +96,12 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(prisma.adminGroupOperation.update).toHaveBeenCalledWith({
-      where: { id: 'operation-1' },
+    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: 'operation-1',
+        status: 'PROCESSING',
+        claimedAt: new Date('2026-07-29T12:00:00.000Z'),
+      },
       data: expect.objectContaining({
         status: 'PENDING',
         lastError: 'OpenIM timeout',
@@ -114,8 +117,8 @@ describe('AdminGroupOperationProcessor', () => {
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
     expect(openim.muteGroup).not.toHaveBeenCalled();
-    expect(prisma.adminGroupOperation.update).toHaveBeenCalledWith({
-      where: { id: 'operation-1' },
+    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: 'operation-1' }),
       data: expect.objectContaining({ status: 'PENDING' }),
     });
   });
@@ -130,8 +133,8 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(prisma.adminGroupOperation.update).toHaveBeenCalledWith({
-      where: { id: 'operation-1' },
+    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: 'operation-1' }),
       data: expect.objectContaining({ status: 'FAILED' }),
     });
     expect(prisma.circle.update).toHaveBeenCalledWith({
@@ -152,8 +155,8 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(prisma.adminGroupOperation.update).toHaveBeenCalledWith({
-      where: { id: 'operation-1' },
+    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({ id: 'operation-1' }),
       data: expect.objectContaining({ status: 'SUCCEEDED' }),
     });
   });
@@ -171,5 +174,17 @@ describe('AdminGroupOperationProcessor', () => {
       where: { id: 'circle-1' },
       data: { deleted: true, adminState: 'DISMISSED' },
     });
+  });
+
+  it('does not let a stale worker overwrite an operation reclaimed by another worker', async () => {
+    prisma.adminGroupOperation.updateMany
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValueOnce({ count: 0 });
+
+    await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
+
+    expect(openim.muteGroup).toHaveBeenCalledWith('group-1');
+    expect(prisma.circle.update).not.toHaveBeenCalled();
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
   });
 });

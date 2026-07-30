@@ -368,31 +368,24 @@ export class FancyNumberService {
       if (!user || user.status !== 'ACTIVE') {
         throw new NotFoundException('User not found');
       }
-      const permanent = resolveEffectiveMembershipLevel(user, now) === 4;
-      if (
-        !permanent &&
-        (!Number.isInteger(months) || (months ?? 0) < 1 || (months ?? 0) > 12)
-      ) {
-        throw new BadRequestException({
-          message: '购买月数必须是 1 到 12 的整数',
-          errorCode: FancyNumberErrorCode.InvalidMonths,
+      const buildRequestFingerprint = (fingerprintMonths: number | null) =>
+        JSON.stringify({
+          operation: target.kind === 'custom' ? 'custom-purchase' : 'purchase',
+          userId,
+          ...(target.kind === 'custom'
+            ? { value: target.value }
+            : { fancyNumberId: target.id }),
+          months: fingerprintMonths,
         });
-      }
-      const normalizedMonths = permanent ? null : (months as number);
-      const requestFingerprint = JSON.stringify({
-        operation: target.kind === 'custom' ? 'custom-purchase' : 'purchase',
-        userId,
-        ...(target.kind === 'custom'
-          ? { value: target.value }
-          : { fancyNumberId: target.id }),
-        months: normalizedMonths,
-      });
 
       const existingOrder = await tx.fancyNumberOrder.findUnique({
         where: { idempotencyKey: scopedIdempotencyKey },
       });
       if (existingOrder) {
-        if (existingOrder.requestFingerprint !== requestFingerprint) {
+        const replayFingerprint = buildRequestFingerprint(
+          existingOrder.newExpiresAt === null ? null : (months ?? null),
+        );
+        if (existingOrder.requestFingerprint !== replayFingerprint) {
           throw new ConflictException({
             message: '幂等键已用于其他请求',
             errorCode: FancyNumberErrorCode.IdempotencyConflict,
@@ -420,6 +413,18 @@ export class FancyNumberService {
           },
         };
       }
+      const permanent = resolveEffectiveMembershipLevel(user, now) === 4;
+      if (
+        !permanent &&
+        (!Number.isInteger(months) || (months ?? 0) < 1 || (months ?? 0) > 12)
+      ) {
+        throw new BadRequestException({
+          message: '购买月数必须是 1 到 12 的整数',
+          errorCode: FancyNumberErrorCode.InvalidMonths,
+        });
+      }
+      const normalizedMonths = permanent ? null : (months as number);
+      const requestFingerprint = buildRequestFingerprint(normalizedMonths);
       if (
         expectedUnitPrice !== undefined &&
         expectedUnitPrice !== FANCY_NUMBER_UNIT_PRICE
@@ -486,6 +491,7 @@ export class FancyNumberService {
           value: fancyNumber.value,
           currentUserID: null,
           reservedForUserID: null,
+          inviteOwnerUserID: null,
         },
         data: { currentUserID: userId },
       });
@@ -792,6 +798,7 @@ export class FancyNumberService {
             value: targetNumber.value,
             currentUserID: null,
             reservedForUserID: null,
+            inviteOwnerUserID: null,
           },
           data: { currentUserID: userId },
         });
@@ -802,16 +809,13 @@ export class FancyNumberService {
           });
         }
 
-        const releasedNumber = await tx.fancyNumber.updateMany({
-          where: { id: lease.fancyNumber.id, status: 'PERMANENT' },
-          data: { status: 'AVAILABLE', disabledAt: null },
-        });
-        if (releasedNumber.count !== 1) {
-          throw new ConflictException({
-            message: '原靓号状态发生变化，请重试',
-            errorCode: FancyNumberErrorCode.InventoryConflict,
-          });
-        }
+        await this.releaseFancyNumberInventory(
+          tx,
+          lease.fancyNumber.id,
+          lease.fancyNumber.value,
+          'PERMANENT',
+          now,
+        );
 
         await tx.fancyNumberLease.update({
           where: { id: lease.id },
@@ -1136,10 +1140,13 @@ export class FancyNumberService {
           fancyNumberPermanent: false,
         },
       });
-      await tx.fancyNumber.update({
-        where: { id: lease.fancyNumberID },
-        data: { status: 'AVAILABLE', disabledAt: null },
-      });
+      await this.releaseFancyNumberInventory(
+        tx,
+        lease.fancyNumberID,
+        lease.fancyNumber.value,
+        'LEASED',
+        now,
+      );
       return { expired: true, userId: lease.userID };
     });
 
@@ -1648,10 +1655,17 @@ export class FancyNumberService {
     userId: string,
   ): Promise<{ id: string; value: string; status: string } | null> {
     if (target.kind === 'inventory') {
-      return tx.fancyNumber.findUnique({
+      const inventoryNumber = await tx.fancyNumber.findUnique({
         where: { id: target.id },
         select: { id: true, value: true, status: true },
       });
+      if (
+        !inventoryNumber ||
+        (await this.hasAccountIdentifierClaim(tx, inventoryNumber.value))
+      ) {
+        return null;
+      }
+      return inventoryNumber;
     }
 
     const existingFancyNumber = await tx.fancyNumber.findUnique({
@@ -1659,6 +1673,9 @@ export class FancyNumberService {
       select: { id: true, value: true, status: true },
     });
     if (existingFancyNumber) {
+      if (await this.hasAccountIdentifierClaim(tx, existingFancyNumber.value)) {
+        return null;
+      }
       return existingFancyNumber;
     }
 
@@ -1713,6 +1730,64 @@ export class FancyNumberService {
       });
     }
     return `client:${userId}:${normalized}`;
+  }
+
+  private async hasAccountIdentifierClaim(
+    tx: Prisma.TransactionClient,
+    value: string,
+  ): Promise<boolean> {
+    const identifier = await tx.accountIdentifier.findUnique({
+      where: { value },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+      },
+    });
+    return (
+      !identifier ||
+      identifier.currentUserID !== null ||
+      identifier.reservedForUserID !== null ||
+      identifier.inviteOwnerUserID !== null
+    );
+  }
+
+  private async releaseFancyNumberInventory(
+    tx: Prisma.TransactionClient,
+    fancyNumberId: string,
+    value: string,
+    expectedStatus: 'LEASED' | 'PERMANENT',
+    now: Date,
+  ): Promise<void> {
+    const identifier = await tx.accountIdentifier.findUnique({
+      where: { value },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+      },
+    });
+    if (!identifier || identifier.currentUserID !== null) {
+      throw new ConflictException({
+        message: '原靓号账号标识状态发生变化，请重试',
+        errorCode: FancyNumberErrorCode.InventoryConflict,
+      });
+    }
+    const hasDurableClaim =
+      identifier.reservedForUserID !== null ||
+      identifier.inviteOwnerUserID !== null;
+    const released = await tx.fancyNumber.updateMany({
+      where: { id: fancyNumberId, status: expectedStatus },
+      data: hasDurableClaim
+        ? { status: 'DISABLED', disabledAt: now }
+        : { status: 'AVAILABLE', disabledAt: null },
+    });
+    if (released.count !== 1) {
+      throw new ConflictException({
+        message: '原靓号状态发生变化，请重试',
+        errorCode: FancyNumberErrorCode.InventoryConflict,
+      });
+    }
   }
 
   private async expireOverdueLeaseForUser(
@@ -1800,10 +1875,13 @@ export class FancyNumberService {
         fancyNumberPermanent: false,
       },
     });
-    await tx.fancyNumber.update({
-      where: { id: lease.fancyNumberID },
-      data: { status: 'AVAILABLE', disabledAt: null },
-    });
+    await this.releaseFancyNumberInventory(
+      tx,
+      lease.fancyNumberID,
+      lease.fancyNumber.value,
+      'LEASED',
+      now,
+    );
   }
 
   private inactiveFancyNumber() {

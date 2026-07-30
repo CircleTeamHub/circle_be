@@ -192,10 +192,10 @@ describe('AvatarFrameService', () => {
       expect(prisma.user.findMany).not.toHaveBeenCalled();
     });
 
-    it('chunks more than 200 unique ids and merges every result in input order', async () => {
+    it('resolves 5,000 unique ids with one bounded set-based user query', async () => {
       const ids = Array.from(
-        { length: 205 },
-        (_, index) => `user-${String(index).padStart(3, '0')}`,
+        { length: 5_000 },
+        (_, index) => `user-${String(index).padStart(4, '0')}`,
       );
       prisma.user.findMany.mockImplementation(
         ({ where }: { where: { id: { in: string[] } } }) =>
@@ -213,13 +213,14 @@ describe('AvatarFrameService', () => {
         now,
       );
 
-      expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
-      for (const [query] of prisma.user.findMany.mock.calls) {
-        expect(query.where.id.in.length).toBeLessThanOrEqual(200);
-      }
+      expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.user.findMany.mock.calls[0][0].where.id.in).toHaveLength(
+        5_000,
+      );
+      expect(prisma.userAvatarFrameGrant.findMany).not.toHaveBeenCalled();
       expect([...result.keys()]).toEqual(ids);
-      expect(result.size).toBe(205);
-      expect(result.get(ids[204])).toEqual({
+      expect(result.size).toBe(5_000);
+      expect(result.get(ids[4_999])).toEqual({
         vipLevel: 0,
         avatarFrame: null,
       });

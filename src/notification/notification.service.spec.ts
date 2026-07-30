@@ -34,6 +34,7 @@ describe('NotificationService', () => {
     systemAnnouncement: {
       upsert: jest.fn(),
       updateMany: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) =>
       typeof operation === 'function'
@@ -318,6 +319,29 @@ describe('NotificationService', () => {
         where: { idempotencyKey: 'announcement-request-1' },
       }),
     );
+  });
+
+  it('does not recreate a completed announcement after notification retention cleanup', async () => {
+    prisma.systemAnnouncement.upsert.mockResolvedValue({
+      id: 'announcement-1',
+      requestFingerprint: 'admin-1:Maintenance',
+      createdAt: new Date('2026-04-01T12:00:00.000Z'),
+      auditRecordedAt: new Date('2026-04-01T12:01:00.000Z'),
+      fanoutCompletedAt: new Date('2026-04-01T12:00:30.000Z'),
+      recipientCount: 275,
+    });
+
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-1',
+        { content: 'Maintenance' },
+        'announcement-request-1',
+      ),
+    ).resolves.toEqual({ createdCount: 275 });
+
+    expect(prisma.user.findMany).not.toHaveBeenCalled();
+    expect(prisma.notification.createManyAndReturn).not.toHaveBeenCalled();
+    expect(prisma.notification.count).not.toHaveBeenCalled();
   });
 
   it('does not report a committed announcement as failed when secondary audit logging is unavailable', async () => {

@@ -48,8 +48,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS "AvatarFrameAsset_key_key"
   ON "AvatarFrameAsset"("key");
 CREATE INDEX IF NOT EXISTS "AvatarFrameAsset_isActive_sortOrder_id_idx"
   ON "AvatarFrameAsset"("isActive", "sortOrder", "id");
-CREATE INDEX IF NOT EXISTS "User_selectedAvatarFrameID_idx"
-  ON "User"("selectedAvatarFrameID");
 CREATE UNIQUE INDEX IF NOT EXISTS "UserAvatarFrameGrant_idempotencyKey_key"
   ON "UserAvatarFrameGrant"("idempotencyKey");
 CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_user_active_idx"

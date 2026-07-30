@@ -1456,6 +1456,8 @@ model SystemAnnouncement {
   content            String
   createdAt          DateTime @default(now())
   auditRecordedAt    DateTime?
+  fanoutCompletedAt  DateTime?
+  recipientCount     Int?
 
   notifications Notification[]
 

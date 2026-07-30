@@ -280,6 +280,8 @@ export class NotificationService {
         requestFingerprint: true,
         createdAt: true,
         auditRecordedAt: true,
+        fanoutCompletedAt: true,
+        recipientCount: true,
       },
     });
     if (announcement.requestFingerprint !== requestFingerprint) {
@@ -288,62 +290,78 @@ export class NotificationService {
       );
     }
 
-    let cursor: string | undefined;
-    while (true) {
-      const recipients = await this.prisma.user.findMany({
-        where: {
-          status: UserStatus.ACTIVE,
-          createdAt: { lte: announcement.createdAt },
-          ...(cursor ? { id: { gt: cursor } } : {}),
-        },
-        select: { id: true },
-        orderBy: { id: 'asc' },
-        take: SYSTEM_ANNOUNCEMENT_BATCH_SIZE,
-      });
-      if (recipients.length === 0) break;
-      const recipientIds = recipients.map(({ id }) => id);
-      const inserted = await this.prisma.$transaction(async (tx) => {
-        const rows = await tx.notification.createManyAndReturn({
-          data: recipientIds.map((toUserID) => ({
-            toUserID,
-            fromUserID: operatorId,
-            type: NotificationType.SYSTEM,
-            content: dto.content,
-            systemAnnouncementID: announcement.id,
-          })),
-          skipDuplicates: true,
-          select: { id: true, toUserID: true },
+    let createdCount = announcement.recipientCount ?? 0;
+    if (!announcement.fanoutCompletedAt) {
+      let cursor: string | undefined;
+      while (true) {
+        const recipients = await this.prisma.user.findMany({
+          where: {
+            status: UserStatus.ACTIVE,
+            createdAt: { lte: announcement.createdAt },
+            ...(cursor ? { id: { gt: cursor } } : {}),
+          },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: SYSTEM_ANNOUNCEMENT_BATCH_SIZE,
         });
-
-        if (rows.length > 0) {
-          await tx.notificationPushOutbox.createMany({
-            data: rows.map(({ id }) => ({ notificationID: id })),
+        if (recipients.length === 0) break;
+        const recipientIds = recipients.map(({ id }) => id);
+        const inserted = await this.prisma.$transaction(async (tx) => {
+          const rows = await tx.notification.createManyAndReturn({
+            data: recipientIds.map((toUserID) => ({
+              toUserID,
+              fromUserID: operatorId,
+              type: NotificationType.SYSTEM,
+              content: dto.content,
+              systemAnnouncementID: announcement.id,
+            })),
+            skipDuplicates: true,
+            select: { id: true, toUserID: true },
           });
+
+          if (rows.length > 0) {
+            await tx.notificationPushOutbox.createMany({
+              data: rows.map(({ id }) => ({ notificationID: id })),
+            });
+          }
+
+          return rows;
+        });
+        const createdUserIds = inserted
+          .map(({ toUserID }) => toUserID)
+          .filter((userId): userId is string => typeof userId === 'string');
+        for (const batch of chunkArray(
+          createdUserIds,
+          SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
+        )) {
+          await Promise.allSettled(
+            batch.map((userId) =>
+              this.realtimeService.broadcastSystemNotificationUnread(userId),
+            ),
+          );
         }
 
-        return rows;
-      });
-      const createdUserIds = inserted
-        .map(({ toUserID }) => toUserID)
-        .filter((userId): userId is string => typeof userId === 'string');
-      for (const batch of chunkArray(
-        createdUserIds,
-        SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
-      )) {
-        await Promise.allSettled(
-          batch.map((userId) =>
-            this.realtimeService.broadcastSystemNotificationUnread(userId),
-          ),
-        );
+        cursor = recipientIds[recipientIds.length - 1];
+        if (recipients.length < SYSTEM_ANNOUNCEMENT_BATCH_SIZE) break;
       }
 
-      cursor = recipientIds[recipientIds.length - 1];
-      if (recipients.length < SYSTEM_ANNOUNCEMENT_BATCH_SIZE) break;
+      createdCount = await this.prisma.notification.count({
+        where: { systemAnnouncementID: announcement.id },
+      });
+      const completedAt = new Date();
+      const completed = await this.prisma.systemAnnouncement.updateMany({
+        where: { id: announcement.id, fanoutCompletedAt: null },
+        data: { fanoutCompletedAt: completedAt, recipientCount: createdCount },
+      });
+      if (completed.count === 0) {
+        const persisted =
+          await this.prisma.systemAnnouncement.findUniqueOrThrow({
+            where: { id: announcement.id },
+            select: { recipientCount: true },
+          });
+        createdCount = persisted.recipientCount ?? 0;
+      }
     }
-
-    const createdCount = await this.prisma.notification.count({
-      where: { systemAnnouncementID: announcement.id },
-    });
     if (this.auditService) {
       try {
         await this.prisma.$transaction(async (tx) => {

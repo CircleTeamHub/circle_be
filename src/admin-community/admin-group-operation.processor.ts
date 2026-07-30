@@ -81,8 +81,12 @@ export class AdminGroupOperationProcessor {
 
   private complete(operation: AdminGroupOperation, now: Date) {
     return runSerializableTransaction(this.prisma, async (tx) => {
-      await tx.adminGroupOperation.update({
-        where: { id: operation.id },
+      const completed = await tx.adminGroupOperation.updateMany({
+        where: {
+          id: operation.id,
+          status: 'PROCESSING',
+          claimedAt: now,
+        },
         data: {
           status: 'SUCCEEDED',
           completedAt: now,
@@ -90,6 +94,7 @@ export class AdminGroupOperationProcessor {
           lastError: null,
         },
       });
+      if (completed.count !== 1) return;
       if (operation.circleID) {
         await tx.circle.update({
           where: { id: operation.circleID },
@@ -121,8 +126,12 @@ export class AdminGroupOperationProcessor {
       `Admin group operation ${operation.id} failed on attempt ${operation.attempts}: ${message}`,
     );
     return runSerializableTransaction(this.prisma, async (tx) => {
-      await tx.adminGroupOperation.update({
-        where: { id: operation.id },
+      const failed = await tx.adminGroupOperation.updateMany({
+        where: {
+          id: operation.id,
+          status: 'PROCESSING',
+          claimedAt: now,
+        },
         data: finalAttempt
           ? {
               status: 'FAILED',
@@ -137,6 +146,7 @@ export class AdminGroupOperationProcessor {
               lastError: message,
             },
       });
+      if (failed.count !== 1) return;
       if (finalAttempt && operation.circleID) {
         await tx.circle.update({
           where: { id: operation.circleID },

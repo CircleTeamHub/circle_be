@@ -80,8 +80,6 @@ type FrameAssetState = {
   grants?: FrameGrantState[];
 };
 
-const PUBLIC_APPEARANCE_BATCH_SIZE = 200;
-
 export type AvatarFrameSelectionState = MembershipState & {
   id: string;
   selectedAvatarFrameID: string | null;
@@ -152,93 +150,83 @@ export class AvatarFrameService {
       return new Map();
     }
 
-    const appearanceById = new Map<string, PublicUserAppearance>();
-    for (
-      let offset = 0;
-      offset < uniqueUserIds.length;
-      offset += PUBLIC_APPEARANCE_BATCH_SIZE
-    ) {
-      const userIdsChunk = uniqueUserIds.slice(
-        offset,
-        offset + PUBLIC_APPEARANCE_BATCH_SIZE,
-      );
-      const users = await this.prisma.user.findMany({
-        where: { id: { in: userIdsChunk } },
-        select: {
-          id: true,
-          vipLevel: true,
-          vipExpiresAt: true,
-          selectedAvatarFrameID: true,
-          selectedAvatarFrameExpiresAt: true,
-          selectedAvatarFrame: {
-            select: {
-              id: true,
-              key: true,
-              name: true,
-              description: true,
-              imageUrl: true,
-              minimumVipLevel: true,
-              isActive: true,
-              sortOrder: true,
-            },
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: uniqueUserIds } },
+      select: {
+        id: true,
+        vipLevel: true,
+        vipExpiresAt: true,
+        selectedAvatarFrameID: true,
+        selectedAvatarFrameExpiresAt: true,
+        selectedAvatarFrame: {
+          select: {
+            id: true,
+            key: true,
+            name: true,
+            description: true,
+            imageUrl: true,
+            minimumVipLevel: true,
+            isActive: true,
+            sortOrder: true,
           },
         },
-      });
+      },
+    });
 
-      const selectedPairs = users.flatMap((user) =>
-        user.selectedAvatarFrameID
-          ? [
-              {
-                userID: user.id,
-                frameID: user.selectedAvatarFrameID,
-              },
-            ]
-          : [],
-      );
-      const grants =
-        selectedPairs.length === 0
-          ? []
-          : await this.prisma.userAvatarFrameGrant.findMany({
-              where: {
-                revokedAt: null,
-                AND: [
-                  { OR: selectedPairs },
-                  { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
-                ],
-              },
-              select: {
-                id: true,
-                userID: true,
-                frameID: true,
-                expiresAt: true,
-                revokedAt: true,
-              },
-            });
-      const selectedFrameByUser = new Map(
-        users.map((user) => [user.id, user.selectedAvatarFrameID]),
-      );
-      const grantsByUser = new Map<string, FrameGrantState[]>();
-      for (const grant of grants) {
-        if (selectedFrameByUser.get(grant.userID) !== grant.frameID) {
-          continue;
-        }
-        const userGrants = grantsByUser.get(grant.userID);
-        if (userGrants) {
-          userGrants.push(grant);
-        } else {
-          grantsByUser.set(grant.userID, [grant]);
-        }
+    const selectedPairs = users.flatMap((user) =>
+      user.selectedAvatarFrameID
+        ? [
+            {
+              userID: user.id,
+              frameID: user.selectedAvatarFrameID,
+            },
+          ]
+        : [],
+    );
+    const grants =
+      selectedPairs.length === 0
+        ? []
+        : await this.prisma.userAvatarFrameGrant.findMany({
+            where: {
+              revokedAt: null,
+              AND: [
+                { OR: selectedPairs },
+                { OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+              ],
+            },
+            select: {
+              id: true,
+              userID: true,
+              frameID: true,
+              expiresAt: true,
+              revokedAt: true,
+            },
+          });
+    const selectedFrameByUser = new Map(
+      users.map((user) => [user.id, user.selectedAvatarFrameID]),
+    );
+    const grantsByUser = new Map<string, FrameGrantState[]>();
+    for (const grant of grants) {
+      if (selectedFrameByUser.get(grant.userID) !== grant.frameID) {
+        continue;
       }
-      for (const user of users) {
-        const state: AvatarFrameSelectionState = {
-          ...user,
-          avatarFrameGrants: grantsByUser.get(user.id) ?? [],
-        };
-        appearanceById.set(user.id, {
-          vipLevel: resolveEffectiveMembershipLevel(user, now),
-          avatarFrame: this.toPublicAppearance(state, now),
-        });
+      const userGrants = grantsByUser.get(grant.userID);
+      if (userGrants) {
+        userGrants.push(grant);
+      } else {
+        grantsByUser.set(grant.userID, [grant]);
       }
+    }
+    const appearanceById = new Map<string, PublicUserAppearance>();
+    for (const user of users) {
+      const state: AvatarFrameSelectionState = {
+        ...user,
+        avatarFrameGrants: grantsByUser.get(user.id) ?? [],
+      };
+      appearanceById.set(user.id, {
+        vipLevel: resolveEffectiveMembershipLevel(user, now),
+        avatarFrame: this.toPublicAppearance(state, now),
+      });
     }
 
     return new Map(

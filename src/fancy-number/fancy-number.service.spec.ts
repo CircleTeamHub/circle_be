@@ -73,6 +73,11 @@ describe('FancyNumberService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    tx.accountIdentifier.findUnique.mockResolvedValue({
+      currentUserID: null,
+      reservedForUserID: null,
+      inviteOwnerUserID: null,
+    });
     const module = await Test.createTestingModule({
       providers: [
         FancyNumberService,
@@ -256,6 +261,48 @@ describe('FancyNumberService', () => {
     expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
   });
 
+  it('replays a paid purchase after the member upgrades to Super', async () => {
+    const expiresAt = new Date('2026-02-28T09:15:30.123Z');
+    tx.user.findUnique.mockResolvedValue({
+      id: 'user-upgraded',
+      status: 'ACTIVE',
+      accountId: '888888',
+      vipLevel: 4,
+      vipExpiresAt: null,
+    });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue({
+      id: 'order-paid-before-upgrade',
+      requestFingerprint: JSON.stringify({
+        operation: 'purchase',
+        userId: 'user-upgraded',
+        fancyNumberId: 'fancy-paid',
+        months: 1,
+      }),
+      fancyNumberID: 'fancy-paid',
+      newExpiresAt: expiresAt,
+      months: 1,
+      unitPrice: 100,
+      totalPrice: 100,
+      walletBalanceAfter: 300,
+    });
+    tx.fancyNumber.findUniqueOrThrow.mockResolvedValue({ value: '888888' });
+
+    await expect(
+      service.purchase(
+        'user-upgraded',
+        'fancy-paid',
+        1,
+        'request-before-upgrade',
+        now,
+      ),
+    ).resolves.toMatchObject({
+      orderId: 'order-paid-before-upgrade',
+      permanent: false,
+      months: 1,
+      totalPrice: 100,
+    });
+  });
+
   it('lets a super member choose one permanent fancy number without spending points', async () => {
     tx.fancyNumberOrder.findUnique.mockResolvedValue(null);
     tx.user.findUnique.mockResolvedValue({
@@ -410,7 +457,7 @@ describe('FancyNumberService', () => {
     });
   });
 
-  it('switches a permanent fancy number for 100 points and releases the previous number', async () => {
+  it('switches a permanent fancy number and disables the released invite-owned number', async () => {
     tx.fancyNumberLease.findFirst.mockResolvedValue({
       id: 'lease-permanent',
       userID: 'user-permanent',
@@ -428,6 +475,17 @@ describe('FancyNumberService', () => {
       value: '999999',
       status: 'AVAILABLE',
     });
+    tx.accountIdentifier.findUnique
+      .mockResolvedValueOnce({
+        currentUserID: null,
+        reservedForUserID: null,
+        inviteOwnerUserID: null,
+      })
+      .mockResolvedValueOnce({
+        currentUserID: null,
+        reservedForUserID: null,
+        inviteOwnerUserID: 'invite-owner',
+      });
     tx.fancyNumber.updateMany.mockResolvedValue({ count: 1 });
     tx.accountIdentifier.updateMany
       .mockResolvedValueOnce({ count: 1 })
@@ -468,6 +526,7 @@ describe('FancyNumberService', () => {
         value: '999999',
         currentUserID: null,
         reservedForUserID: null,
+        inviteOwnerUserID: null,
       },
       data: { currentUserID: 'user-permanent' },
     });
@@ -477,7 +536,7 @@ describe('FancyNumberService', () => {
     });
     expect(tx.fancyNumber.updateMany).toHaveBeenCalledWith({
       where: { id: 'fancy-old', status: 'PERMANENT' },
-      data: { status: 'AVAILABLE', disabledAt: null },
+      data: { status: 'DISABLED', disabledAt: now },
     });
     expect(tx.fancyNumberLease.update).toHaveBeenCalledWith({
       where: { id: 'lease-permanent' },
@@ -784,8 +843,8 @@ describe('FancyNumberService', () => {
         fancyNumberPermanent: false,
       },
     });
-    expect(tx.fancyNumber.update).toHaveBeenCalledWith({
-      where: { id: 'fancy-4' },
+    expect(tx.fancyNumber.updateMany).toHaveBeenCalledWith({
+      where: { id: 'fancy-4', status: 'LEASED' },
       data: { status: 'AVAILABLE', disabledAt: null },
     });
     expect(tx.fancyNumberLease.updateMany).toHaveBeenCalledWith({
@@ -1323,8 +1382,8 @@ describe('FancyNumberService', () => {
         fancyNumberPermanent: false,
       },
     });
-    expect(tx.fancyNumber.update).toHaveBeenCalledWith({
-      where: { id: 'fancy-expired-upgrade' },
+    expect(tx.fancyNumber.updateMany).toHaveBeenCalledWith({
+      where: { id: 'fancy-expired-upgrade', status: 'LEASED' },
       data: { status: 'AVAILABLE', disabledAt: null },
     });
     expect(tx.fancyNumberOrder.upsert).not.toHaveBeenCalled();

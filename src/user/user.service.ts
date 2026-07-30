@@ -481,9 +481,14 @@ export class UserService {
           },
           select: PUBLIC_SELECT,
         });
-        const appearances = await this.avatarFrames.resolvePublicAppearances([
-          user.id,
-        ]);
+        let appearances = new Map<string, PublicUserAppearance>();
+        try {
+          appearances = await this.avatarFrames.resolvePublicAppearances([
+            user.id,
+          ]);
+        } catch {
+          this.logger.warn('Avatar-frame appearance lookup failed after user creation');
+        }
         return toPublicUser(
           user,
           appearances.get(user.id)?.avatarFrame ?? null,
