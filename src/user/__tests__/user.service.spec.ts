@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
+  ConflictException,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -14,6 +15,7 @@ import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { OpenimService } from 'src/openim/openim.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('UserService', () => {
   let service: UserService;
@@ -31,6 +33,9 @@ describe('UserService', () => {
     },
     userProfileSyncOutbox: {
       upsert: jest.fn(),
+    },
+    accountIdentifier: {
+      findUnique: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
@@ -51,6 +56,9 @@ describe('UserService', () => {
   const openim = {
     updateUserInfo: jest.fn().mockResolvedValue(undefined),
   };
+  const avatarFrames = {
+    resolvePublicAppearances: jest.fn(),
+  };
 
   async function buildService(
     overrides: { configGet?: (key: string) => string | null } = {},
@@ -66,6 +74,7 @@ describe('UserService', () => {
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: OpenimService, useValue: openim },
+        { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();
     return module.get<UserService>(UserService);
@@ -75,6 +84,8 @@ describe('UserService', () => {
     jest.clearAllMocks();
     privacySettings.canViewProfileField.mockResolvedValue(true);
     prisma.userLike.findUnique.mockResolvedValue(null);
+    prisma.accountIdentifier.findUnique.mockResolvedValue(null);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
 
@@ -159,6 +170,95 @@ describe('UserService', () => {
     });
   });
 
+  describe('getAppearances', () => {
+    it('normalizes aliases once and returns every caller alias', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      const imId = '11111111222233334444555555555555';
+      const missingUuid = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const appearance = {
+        vipLevel: 3,
+        avatarFrame: {
+          id: 'frame-1',
+          key: 'membership-diamond',
+          name: 'Diamond frame',
+          imageUrl: 'https://cdn.example/frame.png',
+        },
+      };
+      avatarFrames.resolvePublicAppearances.mockResolvedValue(
+        new Map([[uuid, appearance]]),
+      );
+
+      await expect(
+        service.getAppearances([uuid, imId, uuid, missingUuid]),
+      ).resolves.toEqual({
+        [uuid]: appearance,
+        [imId]: appearance,
+      });
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+        uuid,
+        missingUuid,
+      ]);
+    });
+
+    it('short-circuits an empty appearance request', async () => {
+      await expect(service.getAppearances([])).resolves.toEqual({});
+      expect(avatarFrames.resolvePublicAppearances).not.toHaveBeenCalled();
+    });
+
+    it('omits malformed ids without sending them to the UUID query', async () => {
+      const uuid = '11111111-2222-3333-4444-555555555555';
+      avatarFrames.resolvePublicAppearances.mockResolvedValue(
+        new Map([[uuid, { vipLevel: 0, avatarFrame: null }]]),
+      );
+
+      await expect(
+        service.getAppearances(['not-a-user-id', uuid]),
+      ).resolves.toEqual({
+        [uuid]: { vipLevel: 0, avatarFrame: null },
+      });
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+        uuid,
+      ]);
+    });
+  });
+
+  it('adds the effective frame appearance to a public profile', async () => {
+    prisma.user.findUnique.mockResolvedValueOnce({
+      id: 'user-1',
+      vipLevel: 0,
+      vipExpiresAt: null,
+      receivedLikeCount: 0,
+    });
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'user-1',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
+
+    await expect(service.findOne('user-1')).resolves.toMatchObject({
+      avatarFrameAppearance: {
+        id: 'frame-1',
+        key: 'admin-gift',
+        name: 'Gift frame',
+        imageUrl: null,
+      },
+    });
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+      'user-1',
+    ]);
+  });
+
   it('creates an independent canonical invite code with an explicit account ID', async () => {
     prisma.user.create.mockResolvedValue({ id: 'user-1' });
 
@@ -177,6 +277,26 @@ describe('UserService', () => {
       },
       select: expect.any(Object),
     });
+  });
+
+  it('returns the committed user when the optional avatar-frame lookup fails', async () => {
+    prisma.user.create.mockResolvedValue({ id: 'user-1' });
+    avatarFrames.resolvePublicAppearances.mockRejectedValue(
+      new Error('database timeout'),
+    );
+
+    await expect(
+      service.create({
+        accountId: 'Alice_04',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).resolves.toMatchObject({
+      id: 'user-1',
+      avatarFrameAppearance: null,
+    });
+
+    expect(prisma.user.create).toHaveBeenCalledTimes(1);
   });
 
   it('returns service unavailable when admin-user invite-code collisions are exhausted', async () => {
@@ -217,6 +337,34 @@ describe('UserService', () => {
       }),
     ).rejects.toBe(accountIdCollision);
     expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an account ID claimed by fancy-number inventory before creating an admin user', async () => {
+    prisma.accountIdentifier.findUnique.mockResolvedValue({
+      currentUserID: null,
+      reservedForUserID: null,
+      inviteOwnerUserID: null,
+      fancyNumber: { id: 'fancy-1' },
+    });
+
+    await expect(
+      service.create({
+        accountId: 'ABC123',
+        password: 'password1',
+        nickname: 'Alice',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+
+    expect(prisma.accountIdentifier.findUnique).toHaveBeenCalledWith({
+      where: { value: 'abc123' },
+      select: {
+        currentUserID: true,
+        reservedForUserID: true,
+        inviteOwnerUserID: true,
+        fancyNumber: { select: { id: true } },
+      },
+    });
+    expect(prisma.user.create).not.toHaveBeenCalled();
   });
 
   it('finds an active user by exact accountId without exposing admin pagination', async () => {
@@ -293,6 +441,7 @@ describe('UserService', () => {
         data: [
           {
             id: 'user-1',
+            avatarFrameAppearance: null,
             vipLevel: 0,
             membership: {
               effectiveLevel: 0,
@@ -489,6 +638,17 @@ describe('UserService', () => {
           where: { id: 'user-1' },
           data: { status: UserStatus.DELETED },
         }),
+      );
+      expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
+    });
+
+    it('still revokes sessions when optional deletion appearance lookup fails', async () => {
+      avatarFrames.resolvePublicAppearances
+        .mockResolvedValueOnce(new Map())
+        .mockRejectedValueOnce(new Error('appearance unavailable'));
+
+      await expect(service.remove('user-1')).resolves.toEqual(
+        expect.objectContaining({ id: 'user-1' }),
       );
       expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
     });

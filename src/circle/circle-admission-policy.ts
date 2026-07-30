@@ -17,6 +17,7 @@ import { MembershipPolicyService } from 'src/membership/membership-policy.servic
 import { MembershipLevel } from 'src/membership/membership.catalog';
 import { reserveCircleSeats } from './circle-capacity';
 import { CircleMemberLockService } from './circle-member-lock';
+import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-status';
 
 type AdmissionOptions = {
   locksHeld?: boolean;
@@ -27,6 +28,7 @@ const CIRCLE_ADMISSION_SELECT = {
   deleted: true,
   ownerID: true,
   maxMembers: true,
+  expansionSeats: true,
   memberCount: true,
   joinVipRestriction: true,
   joinCreditRestriction: true,
@@ -88,6 +90,8 @@ export class CircleAdmissionPolicy {
         vipExpiresAt: true,
         creditScore: true,
         fancyNumber: true,
+        fancyNumberExpiresAt: true,
+        fancyNumberPermanent: true,
       },
     });
     const userByID = new Map(
@@ -137,7 +141,14 @@ export class CircleAdmissionPolicy {
           details: { quota: 'joined-circles', limit },
         });
       }
-      this.assertRestrictions(circle, candidate, effective.level);
+      this.assertRestrictions(
+        circle,
+        {
+          ...candidate,
+          fancyNumber: resolveEffectiveFancyNumber(candidate, now),
+        },
+        effective.level,
+      );
     }
 
     // 圈主软降级：座位数还要受圈主「当前有效会员」的单群人数配额限（不只受 maxMembers）。否则
@@ -147,11 +158,16 @@ export class CircleAdmissionPolicy {
       where: { id: circle.ownerID },
       select: { vipLevel: true, vipExpiresAt: true },
     });
-    const ownerCapacity = this.membershipPolicy.resolveEntitlementWith(
-      owner ?? { vipLevel: 0, vipExpiresAt: null },
-      program,
-      now,
-    ).tier.quotas.groupMembers.actual;
+    const ownerMembershipCapacity =
+      this.membershipPolicy.resolveEntitlementWith(
+        owner ?? { vipLevel: 0, vipExpiresAt: null },
+        program,
+        now,
+      ).tier.quotas.groupMembers.actual;
+    const ownerCapacity = Math.min(
+      3000,
+      ownerMembershipCapacity + circle.expansionSeats,
+    );
 
     const reserved = await reserveCircleSeats(
       tx,
@@ -258,16 +274,26 @@ export class CircleAdmissionPolicy {
         vipExpiresAt: true,
         creditScore: true,
         fancyNumber: true,
+        fancyNumberExpiresAt: true,
+        fancyNumberPermanent: true,
       },
     });
     if (!candidate) this.throwCandidateNotFound();
+    const now = new Date();
     const effective = await this.membershipPolicy.resolveEntitlement(
       candidate,
       tx,
-      new Date(),
+      now,
       { lockForWrite: true },
     );
-    this.assertRestrictions(circle, candidate, effective.level);
+    this.assertRestrictions(
+      circle,
+      {
+        ...candidate,
+        fancyNumber: resolveEffectiveFancyNumber(candidate, now),
+      },
+      effective.level,
+    );
   }
 
   normalizeCreatorVipRestriction(

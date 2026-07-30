@@ -29,6 +29,7 @@ import {
   FriendStatusDto,
   ReportFriendDto,
 } from './dto/friend.dto';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 // Members (paid) get 5 000, regular users get 1 000.
 const FRIEND_REQUEST_PAGE_SIZE = 500;
@@ -101,6 +102,12 @@ const FRIEND_ACTIVITY_TYPE = {
 type FriendActivityType =
   (typeof FRIEND_ACTIVITY_TYPE)[keyof typeof FRIEND_ACTIVITY_TYPE];
 
+type FriendListRecord = {
+  userID: string;
+  friendID: string;
+  updatedAt: Date;
+};
+
 const FRIEND_ACTIVITY_INCLUDE = {
   counterparty: { select: MINI_USER_SELECT },
   request: {
@@ -111,6 +118,35 @@ const FRIEND_ACTIVITY_INCLUDE = {
     },
   },
 } as const;
+
+function getCounterpartyId(
+  record: Pick<FriendListRecord, 'userID' | 'friendID'>,
+  userId: string,
+) {
+  return record.userID === userId ? record.friendID : record.userID;
+}
+
+function latestFriendRecordsByCounterparty<T extends FriendListRecord>(
+  records: T[],
+  userId: string,
+): T[] {
+  const byCounterparty = new Map<string, T>();
+
+  for (const record of records) {
+    const counterpartyId = getCounterpartyId(record, userId);
+    const previous = byCounterparty.get(counterpartyId);
+    if (
+      !previous ||
+      record.updatedAt.getTime() > previous.updatedAt.getTime()
+    ) {
+      byCounterparty.set(counterpartyId, record);
+    }
+  }
+
+  return Array.from(byCounterparty.values()).sort(
+    (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+  );
+}
 
 @Injectable()
 export class FriendService {
@@ -123,6 +159,7 @@ export class FriendService {
     private readonly notificationService: NotificationService,
     private readonly openimService: OpenimService,
     private readonly privacySettings: PrivacySettingsService,
+    private readonly avatarFrames: AvatarFrameService,
   ) {}
 
   // ─── Send request ────────────────────────────────────────────────────────────
@@ -804,23 +841,29 @@ export class FriendService {
       take: FRIEND_LIMIT_MEMBER,
     });
 
-    const friendIds = records.map((r) =>
-      r.userID === userId ? r.friendID : r.userID,
-    );
+    const uniqueRecords = latestFriendRecordsByCounterparty(records, userId);
+    const friendIds = uniqueRecords.map((r) => getCounterpartyId(r, userId));
     const users = await this.prisma.user.findMany({
       where: { id: { in: friendIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    return records
+    return uniqueRecords
       .map((r) => {
-        const fid = r.userID === userId ? r.friendID : r.userID;
+        const fid = getCounterpartyId(r, userId);
         const u = userMap.get(fid);
         if (!u) return null;
         // 当前用户视角的备注：作为 userID 一侧读 remarkA，作为 friendID 一侧读 remarkB。
         const remark = r.userID === userId ? r.remarkA : r.remarkB;
-        return { ...u, friendsSince: r.updatedAt, remark } as FriendProfileDto;
+        return {
+          ...u,
+          avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
+          friendsSince: r.updatedAt,
+          remark,
+        } as FriendProfileDto;
       })
       .filter((x): x is FriendProfileDto => x !== null);
   }
@@ -1411,25 +1454,34 @@ export class FriendService {
       include: { friendship: true },
     });
 
-    const friendUserIds = links.map((l) => {
-      const f = l.friendship;
-      return f.userID === userId ? f.friendID : f.userID;
-    });
+    const uniqueLinks = latestFriendRecordsByCounterparty(
+      links.map((link) => link.friendship),
+      userId,
+    );
+    const friendUserIds = uniqueLinks.map((friendship) =>
+      getCounterpartyId(friendship, userId),
+    );
 
     const users = await this.prisma.user.findMany({
       where: { id: { in: friendUserIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendUserIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    return links
-      .map((l) => {
-        const f = l.friendship;
-        const fid = f.userID === userId ? f.friendID : f.userID;
+    return uniqueLinks
+      .map((f) => {
+        const fid = getCounterpartyId(f, userId);
         const u = userMap.get(fid);
         if (!u) return null;
         const remark = f.userID === userId ? f.remarkA : f.remarkB;
-        return { ...u, friendsSince: f.updatedAt, remark } as FriendProfileDto;
+        return {
+          ...u,
+          avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
+          friendsSince: f.updatedAt,
+          remark,
+        } as FriendProfileDto;
       })
       .filter((x): x is FriendProfileDto => x !== null);
   }

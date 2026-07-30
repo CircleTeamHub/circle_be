@@ -91,6 +91,13 @@ describe('UploadService', () => {
       (service as any).client = { send };
       return service;
     };
+    const muteLogger = (service: UploadService) => {
+      (service as any).logger = {
+        error: jest.fn(),
+        log: jest.fn(),
+        warn: jest.fn(),
+      };
+    };
 
     it('reports ok once the bucket policy is applied', async () => {
       const service = buildService(jest.fn().mockResolvedValue({}));
@@ -103,11 +110,96 @@ describe('UploadService', () => {
     it('reports policy-unconfirmed when applying the policy failed', async () => {
       // MinIO 启动时不可达 / 缺 s3:PutBucketPolicy 权限。
       const service = buildService(
-        jest.fn().mockRejectedValue(new Error('nope')),
+        jest
+          .fn()
+          .mockResolvedValueOnce({})
+          .mockRejectedValueOnce(new Error('nope')),
       );
+      muteLogger(service);
 
       await service.onModuleInit();
 
+      expect(service.objectStoreStatus()).toBe('policy-unconfirmed');
+    });
+
+    it('creates the bucket when HeadBucket reports that it is missing', async () => {
+      const missingBucket = Object.assign(new Error(''), {
+        name: 'NotFound',
+        $metadata: { httpStatusCode: 404 },
+      });
+      const send = jest
+        .fn()
+        .mockRejectedValueOnce(missingBucket)
+        .mockResolvedValueOnce({})
+        .mockResolvedValueOnce({});
+      const service = buildService(send);
+      muteLogger(service);
+
+      await service.onModuleInit();
+
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
+      expect(send.mock.calls[1][0].constructor.name).toBe(
+        'CreateBucketCommand',
+      );
+      expect(send.mock.calls[2][0].constructor.name).toBe(
+        'PutBucketPolicyCommand',
+      );
+      expect(service.objectStoreStatus()).toBe('ok');
+    });
+
+    it('logs AWS error metadata when the SDK error message is blank', async () => {
+      const policyError = Object.assign(new Error(''), {
+        name: 'AccessDenied',
+        Code: 'AccessDenied',
+        $metadata: {
+          httpStatusCode: 403,
+          requestId: 'req-123',
+          attempts: 1,
+          totalRetryDelay: 0,
+        },
+      });
+      const service = buildService(
+        jest.fn().mockResolvedValueOnce({}).mockRejectedValueOnce(policyError),
+      );
+      const logger = {
+        error: jest.fn(),
+        log: jest.fn(),
+        warn: jest.fn(),
+      };
+      (service as any).logger = logger;
+
+      await service.onModuleInit();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'MinIO bootstrap attempt failed during put_bucket_policy: name=AccessDenied code=AccessDenied status=403 requestId=req-123 attempts=1',
+        ),
+        expect.any(String),
+      );
+    });
+
+    it('does not try to create the bucket when HeadBucket fails for a non-missing bucket error', async () => {
+      const headError = Object.assign(new Error(''), {
+        name: 'AccessDenied',
+        Code: 'AccessDenied',
+        $metadata: { httpStatusCode: 403, requestId: 'head-req' },
+      });
+      const send = jest.fn().mockRejectedValueOnce(headError);
+      const service = buildService(send);
+      const logger = {
+        error: jest.fn(),
+        log: jest.fn(),
+        warn: jest.fn(),
+      };
+      (service as any).logger = logger;
+
+      await service.onModuleInit();
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(logger.log).not.toHaveBeenCalledWith(
+        expect.stringContaining('not found'),
+      );
       expect(service.objectStoreStatus()).toBe('policy-unconfirmed');
     });
 
@@ -135,6 +227,11 @@ describe('UploadService', () => {
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
+    (service as any).logger = {
+      error: jest.fn(),
+      log: jest.fn(),
+      warn: jest.fn(),
+    };
 
     await expect(service.onModuleInit()).rejects.toMatchObject({
       status: 503,

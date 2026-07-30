@@ -754,8 +754,14 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
         systemSelectionKey(icon.systemKey, icon.systemVariant),
       ),
     );
+    const preferredLeveledKeys = new Set(
+      preferred
+        .filter((icon) => isLeveledSystemBadgeKey(icon.systemKey))
+        .map((icon) => icon.systemKey),
+    );
     const fill = eligibility.systemIcons.filter(
       (icon) =>
+        !preferredLeveledKeys.has(icon.systemKey) &&
         !preferredVariants.has(
           systemSelectionKey(icon.systemKey, icon.systemVariant),
         ),
@@ -835,17 +841,29 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
     valid: StoredSelection[],
     eligibility: Eligibility,
   ) {
+    const seen = new Set<string>();
     return valid
       .slice()
       .sort((a, b) => a.sortOrder - b.sortOrder)
-      .map((selection, index) => ({
-        ...selection,
-        systemVariant: this.resolveSelectionSystemVariant(
+      .flatMap((selection) => {
+        const systemVariant = this.resolveSelectionSystemVariant(
           selection,
           eligibility,
-        ),
-        sortOrder: index,
-      }));
+        );
+        const key =
+          selection.displayType === DisplayIconTypeDto.SYSTEM
+            ? `system:${selection.systemKey ?? ''}:${systemVariant ?? ''}`
+            : `circle:${selection.circleID ?? ''}`;
+        if (seen.has(key)) return [];
+        seen.add(key);
+        return [
+          {
+            ...selection,
+            systemVariant,
+            sortOrder: seen.size - 1,
+          },
+        ];
+      });
   }
 
   private async ensureSelections(userId: string, eligibility: Eligibility) {
@@ -947,10 +965,16 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
     const seen = new Set<string>();
 
     for (const item of items) {
-      const key =
-        item.displayType === DisplayIconTypeDto.SYSTEM
-          ? `system:${item.systemKey ?? ''}:${item.systemVariant ?? ''}`
-          : `circle:${item.circleId ?? ''}`;
+      let key: string;
+      if (item.displayType === DisplayIconTypeDto.SYSTEM) {
+        if (isLeveledSystemBadgeKey(item.systemKey)) {
+          key = `system:${item.systemKey ?? ''}`;
+        } else {
+          key = `system:${item.systemKey ?? ''}:${item.systemVariant ?? ''}`;
+        }
+      } else {
+        key = `circle:${item.circleId ?? ''}`;
+      }
 
       if (seen.has(key)) {
         throw new BadRequestException({

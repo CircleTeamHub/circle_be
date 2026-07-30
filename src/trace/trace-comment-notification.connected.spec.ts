@@ -88,6 +88,7 @@ describe('trace comment mention notification flow', () => {
       notificationService,
       realtime as unknown as RealtimeService,
       privacySettings,
+      {} as any,
     );
 
     prisma.trace.findFirst.mockResolvedValue({

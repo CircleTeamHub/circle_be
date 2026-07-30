@@ -20,6 +20,8 @@ describe('AuthService.getImToken', () => {
       null as any,
       null as any,
       { get: () => undefined } as any,
+      null as any,
+      null as any,
     );
   }
 

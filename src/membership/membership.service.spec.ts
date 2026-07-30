@@ -38,7 +38,10 @@ describe('MembershipService', () => {
           cityFilters: { actual: 2, display: '2' },
         },
         appearance: { nameColor: 'silver', badge: 'silver' },
-        benefits: { fancyNumberVoucher: null },
+        benefits: {
+          fancyNumberVoucher: null,
+          permanentFancyNumber: false,
+        },
       },
       {
         level: 2,
@@ -58,7 +61,10 @@ describe('MembershipService', () => {
           cityFilters: { actual: 10, display: '10' },
         },
         appearance: { nameColor: 'gold', badge: 'gold' },
-        benefits: { fancyNumberVoucher: null },
+        benefits: {
+          fancyNumberVoucher: null,
+          permanentFancyNumber: false,
+        },
       },
       {
         level: 3,
@@ -78,7 +84,10 @@ describe('MembershipService', () => {
           cityFilters: { actual: 50, display: '50' },
         },
         appearance: { nameColor: 'rainbow', badge: 'diamond' },
-        benefits: { fancyNumberVoucher: 'standard' },
+        benefits: {
+          fancyNumberVoucher: null,
+          permanentFancyNumber: false,
+        },
       },
       {
         level: 4,
@@ -93,7 +102,7 @@ describe('MembershipService', () => {
         recommended: false,
         quotas: {
           groupMembers: { actual: 3000, display: '3000' },
-          joinedCircles: { actual: 2000, display: '2000' },
+          joinedCircles: { actual: 2000, display: 'unlimited' },
           notes: { actual: 3000, display: '3000' },
           cityFilters: { actual: 1000, display: 'unlimited' },
         },
@@ -101,7 +110,10 @@ describe('MembershipService', () => {
           nameColor: 'exclusive-shimmer',
           badge: 'super-lifetime',
         },
-        benefits: { fancyNumberVoucher: 'premium' },
+        benefits: {
+          fancyNumberVoucher: null,
+          permanentFancyNumber: true,
+        },
       },
     ]);
 
@@ -186,7 +198,10 @@ describe('MembershipService', () => {
       active: true,
       quotas: { joinedCircles: { actual: 1000, display: '1000' } },
       appearance: { nameColor: 'rainbow', badge: 'diamond' },
-      benefits: { fancyNumberVoucher: 'standard' },
+      benefits: {
+        fancyNumberVoucher: null,
+        permanentFancyNumber: false,
+      },
       benefitGrants: {
         standardFancyNumber: { available: false, issued: true },
         premiumFancyNumber: { available: false, issued: false },

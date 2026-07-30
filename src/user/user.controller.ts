@@ -30,6 +30,8 @@ import { GetUserDto } from './dto/get-user.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { VipLevelsDto } from './dto/vip-levels.dto';
+import { AppearancesDto } from './dto/appearances.dto';
+import type { PublicUserAppearance } from 'src/avatar-frame/avatar-frame.service';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
@@ -109,6 +111,43 @@ export class UserController {
   })
   getVipLevels(@Body() dto: VipLevelsDto): Promise<Record<string, number>> {
     return this.userService.getVipLevels(dto.ids);
+  }
+
+  @Post('appearances')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Batch lookup effective VIP and avatar-frame appearance',
+  })
+  @ApiOkResponse({
+    description: 'Map keyed by each matched caller-provided alias',
+    schema: {
+      type: 'object',
+      additionalProperties: {
+        type: 'object',
+        required: ['vipLevel', 'avatarFrame'],
+        properties: {
+          vipLevel: { type: 'integer', minimum: 0, maximum: 4 },
+          avatarFrame: {
+            type: 'object',
+            nullable: true,
+            required: ['id', 'key', 'name', 'imageUrl'],
+            properties: {
+              id: { type: 'string' },
+              key: { type: 'string' },
+              name: { type: 'string' },
+              imageUrl: { type: 'string', nullable: true },
+            },
+          },
+        },
+      },
+    },
+  })
+  getAppearances(
+    @Body() dto: AppearancesDto,
+  ): Promise<Record<string, PublicUserAppearance>> {
+    return this.userService.getAppearances(dto.ids);
   }
 
   @Get('/:id')

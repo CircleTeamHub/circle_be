@@ -17,6 +17,8 @@ import { UnconfiguredMailer } from './mailer/unconfigured.mailer';
 import { SmtpMailer } from './mailer/smtp.mailer';
 import { OpenimModule } from 'src/openim/openim.module';
 import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
+import { FancyNumberModule } from 'src/fancy-number/fancy-number.module';
+import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 
 @Global()
 @Module({
@@ -37,6 +39,8 @@ import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
       inject: [ConfigService],
     }),
     OpenimModule,
+    FancyNumberModule,
+    AvatarFrameModule,
   ],
   providers: [
     AuthService,

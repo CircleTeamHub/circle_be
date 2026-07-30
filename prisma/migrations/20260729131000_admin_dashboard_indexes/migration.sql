@@ -1,0 +1,10 @@
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_createdAt_idx" ON "User" ("createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_lastOnline_idx" ON "User" ("lastOnline");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_status_createdAt_idx" ON "User" ("status", "createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "MembershipGrant_createdAt_idx" ON "MembershipGrant" ("createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "FancyNumberOrder_createdAt_idx" ON "FancyNumberOrder" ("createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "CoinTransaction_type_createdAt_idx" ON "CoinTransaction" ("type", "createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Circle_adminState_createdAt_idx" ON "Circle" ("adminState", "createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Circle_deleted_createdAt_idx" ON "Circle" ("deleted", "createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "GroupExpansionOrder_createdAt_idx" ON "GroupExpansionOrder" ("createdAt");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "CircleMember_status_createdAt_idx" ON "CircleMember" ("status", "createdAt");

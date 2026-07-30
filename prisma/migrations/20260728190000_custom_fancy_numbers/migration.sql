@@ -1,0 +1,1 @@
+ALTER TYPE "FancyNumberSource" ADD VALUE 'CUSTOM';

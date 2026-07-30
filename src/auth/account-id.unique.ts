@@ -20,6 +20,12 @@ interface RegistrationCodeLookup extends AccountIdLookup {
       select: { id: true };
     }): Promise<{ id: string } | null>;
   };
+  accountIdentifier?: {
+    findUnique(args: {
+      where: { value: string };
+      select: { value: true };
+    }): Promise<{ value: string } | null>;
+  };
 }
 
 export const REGISTRATION_CODE_MAX_ATTEMPTS = 10;
@@ -81,7 +87,7 @@ export async function generateUniqueRegistrationCode(
 ): Promise<string> {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const candidate = generate();
-    const [account, invite] = await Promise.all([
+    const [account, invite, identifier] = await Promise.all([
       prisma.user.findUnique({
         where: { accountId: candidate },
         select: { id: true },
@@ -90,8 +96,14 @@ export async function generateUniqueRegistrationCode(
         where: { inviteCode: candidate },
         select: { id: true },
       }),
+      prisma.accountIdentifier
+        ? prisma.accountIdentifier.findUnique({
+            where: { value: candidate },
+            select: { value: true },
+          })
+        : Promise.resolve(null),
     ]);
-    if (!account && !invite) return candidate;
+    if (!account && !invite && !identifier) return candidate;
   }
 
   throw new ServiceUnavailableException(

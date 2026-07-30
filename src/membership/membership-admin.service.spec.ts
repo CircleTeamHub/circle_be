@@ -6,6 +6,7 @@ import {
 import { MembershipBenefitType } from 'src/generated/prisma';
 import { MembershipErrorCode } from 'src/common/app-error-codes';
 import { MembershipAdminService } from './membership-admin.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('MembershipAdminService', () => {
   const now = new Date('2027-07-21T12:00:00.000Z');
@@ -22,6 +23,9 @@ describe('MembershipAdminService', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       create: jest.fn(),
+    },
+    userAvatarFrameGrant: {
+      findMany: jest.fn(),
     },
     user: {
       findUnique: jest.fn(),
@@ -73,7 +77,11 @@ describe('MembershipAdminService', () => {
   const iconService = {
     invalidateDisplayIconCacheFor: jest.fn(),
   };
+  const fancyNumberService = {
+    convertActiveLeaseToPermanent: jest.fn().mockResolvedValue(false),
+  };
   let service: MembershipAdminService;
+  let avatarFrameService: AvatarFrameService;
 
   function user(
     vipLevel: number,
@@ -128,6 +136,7 @@ describe('MembershipAdminService', () => {
     tx.membershipBenefitGrant.create.mockImplementation(({ data }) =>
       Promise.resolve({ id: 'benefit-1', createdAt: now, ...data }),
     );
+    tx.userAvatarFrameGrant.findMany.mockResolvedValue([]);
     tx.user.update.mockImplementation(({ data }) =>
       Promise.resolve({ id: targetId, ...data }),
     );
@@ -138,13 +147,20 @@ describe('MembershipAdminService', () => {
     realtime.safeBroadcastAll.mockImplementation((fns) =>
       Promise.allSettled(fns.map((fn) => fn())),
     );
+    fancyNumberService.convertActiveLeaseToPermanent.mockResolvedValue(false);
 
+    avatarFrameService = new AvatarFrameService(
+      prisma as never,
+      realtime as never,
+    );
     service = new MembershipAdminService(
       prisma as never,
       policy as never,
       notification as never,
       realtime as never,
       iconService as never,
+      fancyNumberService as never,
+      avatarFrameService,
     );
   });
 
@@ -209,6 +225,121 @@ describe('MembershipAdminService', () => {
     );
   });
 
+  it('extends an effective selected frame deadline in the membership transaction', async () => {
+    const oldExpiry = new Date('2027-08-31T10:15:00.000Z');
+    tx.user.findUnique.mockResolvedValue({
+      ...user(3, oldExpiry),
+      selectedAvatarFrameID: 'frame-diamond',
+      selectedAvatarFrameExpiresAt: oldExpiry,
+      selectedAvatarFrame: {
+        id: 'frame-diamond',
+        key: 'membership-diamond',
+        name: 'Diamond frame',
+        description: 'Diamond membership frame',
+        imageUrl: null,
+        minimumVipLevel: 3,
+        isActive: true,
+        sortOrder: 10,
+      },
+      avatarFrameGrants: [],
+    });
+
+    await service.grant(operatorId, targetId, {
+      targetLevel: 4,
+      idempotencyKey,
+    });
+
+    expect(tx.user.findUnique).toHaveBeenCalledWith({
+      where: { id: targetId },
+      select: expect.objectContaining({
+        selectedAvatarFrameID: true,
+        selectedAvatarFrameExpiresAt: true,
+        selectedAvatarFrame: expect.any(Object),
+      }),
+    });
+    expect(tx.user.update).toHaveBeenNthCalledWith(1, {
+      where: { id: targetId },
+      data: { vipLevel: 4, vipExpiresAt: null },
+    });
+    expect(tx.user.update).toHaveBeenNthCalledWith(2, {
+      where: { id: targetId },
+      data: { selectedAvatarFrameExpiresAt: null },
+    });
+  });
+
+  it('loads only active grants for the selected frame after locking the user', async () => {
+    const oldExpiry = new Date('2027-08-31T10:15:00.000Z');
+    tx.user.findUnique.mockResolvedValue({
+      ...user(3, oldExpiry),
+      selectedAvatarFrameID: 'frame-diamond',
+      selectedAvatarFrameExpiresAt: oldExpiry,
+      selectedAvatarFrame: {
+        id: 'frame-diamond',
+        key: 'membership-diamond',
+        name: 'Diamond frame',
+        description: 'Diamond membership frame',
+        imageUrl: null,
+        minimumVipLevel: 3,
+        isActive: true,
+        sortOrder: 10,
+      },
+    });
+
+    await service.grant(operatorId, targetId, {
+      targetLevel: 4,
+      idempotencyKey,
+    });
+
+    expect(tx.userAvatarFrameGrant.findMany).toHaveBeenCalledWith({
+      where: {
+        userID: targetId,
+        frameID: 'frame-diamond',
+        revokedAt: null,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      select: {
+        id: true,
+        frameID: true,
+        expiresAt: true,
+        revokedAt: true,
+      },
+    });
+    expect(policy.lockUsers.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.userAvatarFrameGrant.findMany.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not revive an expired selected frame during a membership upgrade', async () => {
+    const membershipExpiry = new Date('2027-08-31T10:15:00.000Z');
+    tx.user.findUnique.mockResolvedValue({
+      ...user(3, membershipExpiry),
+      selectedAvatarFrameID: 'frame-diamond',
+      selectedAvatarFrameExpiresAt: new Date('2027-07-21T11:59:59.999Z'),
+      selectedAvatarFrame: {
+        id: 'frame-diamond',
+        key: 'membership-diamond',
+        name: 'Diamond frame',
+        description: 'Diamond membership frame',
+        imageUrl: null,
+        minimumVipLevel: 3,
+        isActive: true,
+        sortOrder: 10,
+      },
+      avatarFrameGrants: [],
+    });
+
+    await service.grant(operatorId, targetId, {
+      targetLevel: 4,
+      idempotencyKey,
+    });
+
+    expect(tx.user.update).toHaveBeenCalledTimes(1);
+    expect(tx.user.update).toHaveBeenCalledWith({
+      where: { id: targetId },
+      data: { vipLevel: 4, vipExpiresAt: null },
+    });
+  });
+
   it('uses UTC month-end leap arithmetic for a new timed activation', async () => {
     jest.setSystemTime(new Date('2028-01-31T23:30:00.000Z').getTime());
     tx.user.findUnique.mockResolvedValue(user(0, null));
@@ -242,6 +373,9 @@ describe('MembershipAdminService', () => {
       lifetime: true,
       vipExpiresAt: null,
     });
+    expect(
+      fancyNumberService.convertActiveLeaseToPermanent,
+    ).toHaveBeenCalledWith(tx, targetId, now);
   });
 
   it('rejects a service-level invalid target with a stable 400 code', async () => {
@@ -344,7 +478,7 @@ describe('MembershipAdminService', () => {
     expect(tx.membershipBenefitGrant.findMany).not.toHaveBeenCalled();
   });
 
-  it('replays a super grant with the exact original benefit snapshot', async () => {
+  it('replays a super grant without issuing a legacy fancy-number voucher', async () => {
     let storedGrant: ReturnType<typeof existingGrant> | null = null;
     tx.membershipGrant.findUnique.mockImplementation(() =>
       Promise.resolve(storedGrant),
@@ -355,7 +489,7 @@ describe('MembershipAdminService', () => {
     tx.membershipGrant.create.mockImplementation(({ data }) => {
       storedGrant = existingGrant({
         ...data,
-        benefitGrants: [{ type: MembershipBenefitType.PREMIUM_FANCY_NUMBER }],
+        benefitGrants: [],
       });
       return Promise.resolve(storedGrant);
     });
@@ -374,21 +508,16 @@ describe('MembershipAdminService', () => {
     });
 
     expect(replay).toEqual({ ...first, replayed: true });
-    expect(first.issuedBenefitTypes).toEqual([
-      MembershipBenefitType.PREMIUM_FANCY_NUMBER,
-    ]);
+    expect(first.issuedBenefitTypes).toEqual([]);
     expect(tx.membershipGrant.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         previousEffectiveLevel: 3,
-        benefitTypesSnapshot: [
-          MembershipBenefitType.STANDARD_FANCY_NUMBER,
-          MembershipBenefitType.PREMIUM_FANCY_NUMBER,
-        ],
+        benefitTypesSnapshot: [MembershipBenefitType.STANDARD_FANCY_NUMBER],
       }),
     });
     expect(first.membership.benefitGrants).toEqual({
       standardFancyNumber: { available: false, issued: true },
-      premiumFancyNumber: { available: false, issued: true },
+      premiumFancyNumber: { available: false, issued: false },
     });
   });
 
@@ -401,7 +530,7 @@ describe('MembershipAdminService', () => {
     tx.membershipGrant.create.mockImplementation(({ data }) => {
       storedGrant = existingGrant({
         ...data,
-        benefitGrants: [{ type: MembershipBenefitType.STANDARD_FANCY_NUMBER }],
+        benefitGrants: [],
       });
       return Promise.resolve(storedGrant);
     });
@@ -530,18 +659,15 @@ describe('MembershipAdminService', () => {
     ).toEqual([false, true]);
     expect(tx.membershipGrant.create).toHaveBeenCalledTimes(1);
     expect(tx.user.update).toHaveBeenCalledTimes(1);
-    expect(tx.membershipBenefitGrant.create).toHaveBeenCalledTimes(1);
+    expect(tx.membershipBenefitGrant.create).not.toHaveBeenCalled();
     expect(notification.createSystemNotification).toHaveBeenCalledTimes(1);
     expect(realtime.invalidateUserHotCache).toHaveBeenCalledTimes(1);
     expect(realtime.safeBroadcastAll).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    [3, MembershipBenefitType.STANDARD_FANCY_NUMBER],
-    [4, MembershipBenefitType.PREMIUM_FANCY_NUMBER],
-  ])(
-    'issues the one-time benefit for level %i only once',
-    async (targetLevel, type) => {
+  it.each([3, 4])(
+    'does not issue a legacy fancy-number voucher for level %i',
+    async (targetLevel) => {
       tx.user.findUnique.mockResolvedValue(user(targetLevel - 1, null));
 
       const result = await service.grant(operatorId, targetId, {
@@ -549,15 +675,8 @@ describe('MembershipAdminService', () => {
         idempotencyKey,
       });
 
-      expect(tx.membershipBenefitGrant.create).toHaveBeenCalledWith({
-        data: { userID: targetId, membershipGrantID: 'grant-1', type },
-      });
-      expect(result.issuedBenefitTypes).toEqual([type]);
-      if (targetLevel === 4) {
-        expect(result.issuedBenefitTypes).not.toContain(
-          MembershipBenefitType.STANDARD_FANCY_NUMBER,
-        );
-      }
+      expect(tx.membershipBenefitGrant.create).not.toHaveBeenCalled();
+      expect(result.issuedBenefitTypes).toEqual([]);
     },
   );
 

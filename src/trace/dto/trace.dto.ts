@@ -15,6 +15,7 @@ import {
   Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
 
 const TRACE_VISIBILITY = ['FRIENDS_ONLY', 'PRIVATE'] as const;
 
@@ -119,6 +120,10 @@ export class TraceAuthorDto {
 
   @ApiProperty({ type: String, nullable: true })
   avatarUrl: string | null;
+
+  @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
+  @Type(() => AvatarFrameAppearanceDto)
+  avatarFrameAppearance: AvatarFrameAppearanceDto | null;
 
   @ApiProperty({
     type: Number,

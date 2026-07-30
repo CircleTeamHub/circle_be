@@ -1,7 +1,9 @@
 import { Global, Module } from '@nestjs/common';
+import { ModerationModule } from 'src/moderation/moderation.module';
 import { RedisModule } from 'src/redis/redis.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationController } from './notification.controller';
+import { NotificationAdminController } from './notification-admin.controller';
 import { NotificationPublicController } from './notification-public.controller';
 import { NotificationPushService } from './notification-push.service';
 import { NotificationService } from './notification.service';
@@ -10,8 +12,12 @@ import { NotificationRetentionCleanup } from './notification-retention.cleanup';
 
 @Global()
 @Module({
-  imports: [RealtimeModule, RedisModule],
-  controllers: [NotificationPublicController, NotificationController],
+  imports: [RealtimeModule, RedisModule, ModerationModule],
+  controllers: [
+    NotificationPublicController,
+    NotificationController,
+    NotificationAdminController,
+  ],
   providers: [
     NotificationService,
     NotificationPushService,

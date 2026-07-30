@@ -26,6 +26,10 @@ import {
   TraceDto,
   TraceFeedQueryDto,
 } from './dto/trace.dto';
+import {
+  AvatarFramePublicAppearance,
+  AvatarFrameService,
+} from 'src/avatar-frame/avatar-frame.service';
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
@@ -68,6 +72,7 @@ export class TraceService {
     private readonly notificationService: NotificationService,
     private readonly realtimeService: RealtimeService,
     private readonly privacySettings: PrivacySettingsService,
+    private readonly avatarFrames: AvatarFrameService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -193,9 +198,18 @@ export class TraceService {
       select: { traceID: true },
     });
     const likedTraceIds = new Set(myLikes.map((like) => like.traceID));
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      ...new Set(traces.map((trace) => trace.from.id)),
+    ]);
 
     const items = traces.map((trace) =>
-      this.toTraceDto(trace, userId, friendIdSet, likedTraceIds),
+      this.toTraceDto(
+        trace,
+        userId,
+        friendIdSet,
+        likedTraceIds,
+        appearances.get(trace.from.id)?.avatarFrame ?? null,
+      ),
     );
 
     // The next page starts strictly after the last returned row. Only emit a
@@ -303,14 +317,29 @@ export class TraceService {
       select: { traceID: true },
     });
     const likedTraceIds = new Set(myLike ? [traceId] : []);
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      trace.from.id,
+    ]);
 
-    return this.toTraceDto(trace, userId, friendIdSet, likedTraceIds);
+    return this.toTraceDto(
+      trace,
+      userId,
+      friendIdSet,
+      likedTraceIds,
+      appearances.get(trace.from.id)?.avatarFrame ?? null,
+    );
   }
 
   // ─── Create / Delete ───────────────────────────────────────────────────────
 
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
     assertUrlsFromStorage(dto.images ?? [], this.minioPublicUrl, 'trace image');
+
+    // Resolve this fallible projection before the non-idempotent write. If the
+    // lookup fails, the client can safely retry without creating a duplicate.
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      userId,
+    ]);
 
     const trace = await this.prisma.trace.create({
       data: {
@@ -346,6 +375,8 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
+        avatarFrameAppearance:
+          appearances.get(trace.from.id)?.avatarFrame ?? null,
         vipLevel: resolveEffectiveMembershipLevel(trace.from),
       },
       likeCount: 0,
@@ -1050,6 +1081,7 @@ export class TraceService {
     viewerId: string,
     friendIdSet: Set<string>,
     likedTraceIds: Set<string>,
+    avatarFrameAppearance: AvatarFramePublicAppearance | null,
   ): TraceDto {
     // Filter likes and comments to only show mutual friends (WeChat Moments logic)
     const mutualLikes = trace.likeStats
@@ -1102,6 +1134,7 @@ export class TraceService {
         id: trace.from.id,
         nickname: trace.from.nickname,
         avatarUrl: trace.from.avatarUrl,
+        avatarFrameAppearance,
         vipLevel: resolveEffectiveMembershipLevel(trace.from),
       },
       likeCount: trace.likeCount,

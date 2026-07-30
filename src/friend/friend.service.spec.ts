@@ -17,6 +17,7 @@ import { CreditService } from 'src/credit/credit.service';
 import { SendFriendRequestDto } from './dto/friend.dto';
 import { FriendController } from './friend.controller';
 import { FriendService } from './friend.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('FriendService', () => {
   let service: FriendService;
@@ -125,6 +126,9 @@ describe('FriendService', () => {
     applyDeltaInTransaction: jest.fn(),
     broadcastCreditProfileChanged: jest.fn(),
   };
+  const avatarFrames = {
+    resolvePublicAppearances: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -153,6 +157,8 @@ describe('FriendService', () => {
       scoreAfter: 95,
     });
     creditService.broadcastCreditProfileChanged.mockResolvedValue(undefined);
+    avatarFrames.resolvePublicAppearances.mockReset();
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
 
     prisma.$transaction.mockImplementation((operations: any) =>
       typeof operations === 'function'
@@ -170,6 +176,7 @@ describe('FriendService', () => {
         { provide: OpenimService, useValue: openimService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: CreditService, useValue: creditService },
+        { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();
 
@@ -185,6 +192,84 @@ describe('FriendService', () => {
     );
 
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates accepted friendship rows by friend user in the friend list', async () => {
+    const newer = new Date('2026-07-24T07:59:51.066Z');
+    const older = new Date('2026-06-26T08:06:52.906Z');
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        id: 'friendship-new',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        updatedAt: newer,
+        remarkA: 'new remark',
+        remarkB: null,
+      },
+      {
+        id: 'friendship-old',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        updatedAt: older,
+        remarkA: 'old remark',
+        remarkB: null,
+      },
+    ]);
+    prisma.user.findMany.mockResolvedValue([
+      {
+        id: 'user-2',
+        accountId: 'bob02',
+        nickname: 'Bob',
+        avatarUrl: null,
+        avatarFrame: null,
+        gender: 'unset',
+        lastOnline: null,
+      },
+    ]);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'user-2',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
+
+    const friends = await service.listFriends('user-1');
+
+    expect(friends).toEqual([
+      expect.objectContaining({
+        id: 'user-2',
+        accountId: 'bob02',
+        friendsSince: newer,
+        remark: 'new remark',
+        avatarFrameAppearance: {
+          id: 'frame-1',
+          key: 'admin-gift',
+          name: 'Gift frame',
+          imageUrl: null,
+        },
+      }),
+    ]);
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+      'user-2',
+    ]);
+    expect(prisma.user.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
+      }),
+    );
   });
 
   it('creates mirrored friend activities when sending a request', async () => {

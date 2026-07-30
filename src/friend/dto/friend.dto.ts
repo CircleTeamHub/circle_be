@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
 import {
   ArrayUnique,
   ArrayMaxSize,
@@ -163,6 +164,8 @@ export class FriendProfileDto {
   @ApiProperty() nickname: string;
   @ApiPropertyOptional() avatarUrl: string | null;
   @ApiPropertyOptional() avatarFrame: string | null;
+  @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
+  avatarFrameAppearance: AvatarFrameAppearanceDto | null;
   @ApiProperty() gender: string;
   @ApiPropertyOptional() lastOnline: Date | null;
   /** When this friendship was accepted */

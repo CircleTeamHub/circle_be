@@ -41,6 +41,11 @@ export class MembershipAppearanceDto {
 export class MembershipBenefitsDto {
   @ApiProperty({ enum: ['standard', 'premium'], nullable: true })
   fancyNumberVoucher: 'standard' | 'premium' | null;
+
+  @ApiProperty({
+    description: 'Whether this tier includes one permanent fancy number.',
+  })
+  permanentFancyNumber: boolean;
 }
 
 export class MembershipPlanDto {

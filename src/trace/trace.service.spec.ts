@@ -14,6 +14,7 @@ import {
   encodeTraceCursor,
   decodeTraceCursor,
 } from './trace.service';
+import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 /** Minimal Trace row in the shape `getFeed`'s include produces. */
 function makeTraceRow(id: string, createdAt: Date) {
@@ -99,6 +100,9 @@ describe('TraceService', () => {
       },
     ),
   };
+  const avatarFrames = {
+    resolvePublicAppearances: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -109,6 +113,8 @@ describe('TraceService', () => {
     prisma.userPrivacySetting.findMany.mockResolvedValue([]);
     notificationService.createTraceCommentNotifications.mockResolvedValue([]);
     notificationService.createTraceLikeNotification.mockReset();
+    avatarFrames.resolvePublicAppearances.mockReset();
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -118,6 +124,7 @@ describe('TraceService', () => {
         { provide: NotificationService, useValue: notificationService },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
+        { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();
 
@@ -185,6 +192,22 @@ describe('TraceService', () => {
       { userID: 'viewer-1', friendID: 'author-1' },
     ]);
     prisma.traceLikeStat.findFirst.mockResolvedValue({ traceID: 'trace-1' });
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'author-1',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
 
     const result = await service.getTraceById('viewer-1', 'trace-1');
 
@@ -198,6 +221,15 @@ describe('TraceService', () => {
         author: expect.objectContaining({ id: 'author-1' }),
       }),
     );
+    expect(result.author.avatarFrameAppearance).toEqual({
+      id: 'frame-1',
+      key: 'admin-gift',
+      name: 'Gift frame',
+      imageUrl: null,
+    });
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+      'author-1',
+    ]);
     expect(result.comments).toHaveLength(1);
   });
 
@@ -807,6 +839,47 @@ describe('TraceService', () => {
     );
   });
 
+  it('resolves feed author appearances in one deduped batch', async () => {
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'friend-1' },
+    ]);
+    prisma.trace.findMany.mockResolvedValue([
+      makeTraceRow('trace-1', new Date('2026-06-08T00:00:00.000Z')),
+      makeTraceRow('trace-2', new Date('2026-06-07T00:00:00.000Z')),
+    ]);
+    prisma.trace.count.mockResolvedValue(2);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(
+      new Map([
+        [
+          'friend-1',
+          {
+            vipLevel: 0,
+            avatarFrame: {
+              id: 'frame-1',
+              key: 'admin-gift',
+              name: 'Gift frame',
+              imageUrl: null,
+            },
+          },
+        ],
+      ]),
+    );
+
+    const result = await service.getFeed('viewer-1', {});
+
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
+    expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledWith([
+      'friend-1',
+    ]);
+    expect(result.items[0].author.avatarFrameAppearance).toEqual({
+      id: 'frame-1',
+      key: 'admin-gift',
+      name: 'Gift frame',
+      imageUrl: null,
+    });
+  });
+
   it('narrows the feed to a single author when authorId is a visible friend', async () => {
     prisma.friend.findMany.mockResolvedValue([
       { userID: 'viewer-1', friendID: 'friend-1' },
@@ -1050,6 +1123,21 @@ describe('TraceService', () => {
     expect(realtimeService.broadcastNotificationCreated).not.toHaveBeenCalled();
   });
   describe('moments feed poke (#89)', () => {
+    it('does not commit a moment when its appearance projection cannot be resolved', async () => {
+      avatarFrames.resolvePublicAppearances.mockRejectedValue(
+        new Error('database unavailable'),
+      );
+
+      await expect(
+        service.createTrace('user-1', { content: 'hi' } as never),
+      ).rejects.toThrow('database unavailable');
+
+      expect(prisma.trace.create).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastMomentsFeedUpdated,
+      ).not.toHaveBeenCalled();
+    });
+
     it('pokes the author and accepted friends on create (FRIENDS_ONLY)', async () => {
       prisma.trace.create.mockResolvedValue({
         id: 'trace-1',
