@@ -1,6 +1,7 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { Test } from '@nestjs/testing';
+import { ThrottlerModule } from '@nestjs/throttler';
 import request from 'supertest';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
@@ -17,6 +18,7 @@ describe('NotificationAdminController', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     const moduleRef = await Test.createTestingModule({
+      imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [NotificationAdminController],
       providers: [{ provide: NotificationService, useValue: service }],
     })
@@ -77,6 +79,26 @@ describe('NotificationAdminController', () => {
       .expect(400);
 
     expect(service.publishSystemAnnouncement).not.toHaveBeenCalled();
+  });
+
+  it('rate-limits excess publish attempts before invoking the service', async () => {
+    await request(app.getHttpServer())
+      .post('/admin/system-announcements')
+      .set('Idempotency-Key', 'rate-limit-1')
+      .send({ content: 'First' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post('/admin/system-announcements')
+      .set('Idempotency-Key', 'rate-limit-2')
+      .send({ content: 'Second' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post('/admin/system-announcements')
+      .set('Idempotency-Key', 'rate-limit-3')
+      .send({ content: 'Third' })
+      .expect(429);
+
+    expect(service.publishSystemAnnouncement).toHaveBeenCalledTimes(2);
   });
 
   it.each([

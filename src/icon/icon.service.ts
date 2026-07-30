@@ -754,8 +754,14 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
         systemSelectionKey(icon.systemKey, icon.systemVariant),
       ),
     );
+    const preferredLeveledKeys = new Set(
+      preferred
+        .filter((icon) => isLeveledSystemBadgeKey(icon.systemKey))
+        .map((icon) => icon.systemKey),
+    );
     const fill = eligibility.systemIcons.filter(
       (icon) =>
+        !preferredLeveledKeys.has(icon.systemKey) &&
         !preferredVariants.has(
           systemSelectionKey(icon.systemKey, icon.systemVariant),
         ),

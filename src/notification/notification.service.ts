@@ -1,5 +1,7 @@
 import {
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
   Optional,
@@ -48,6 +50,7 @@ function chunkArray<T>(items: readonly T[], size: number): T[][] {
 @Injectable()
 export class NotificationService {
   private readonly logger = new Logger(NotificationService.name);
+  private announcementFanoutInFlight = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -237,6 +240,31 @@ export class NotificationService {
     idempotencyKey: string,
     auditContext?: SystemAnnouncementAuditContext,
   ): Promise<{ createdCount: number }> {
+    if (this.announcementFanoutInFlight) {
+      throw new HttpException(
+        'A system announcement publish is already in progress',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    this.announcementFanoutInFlight = true;
+    try {
+      return await this.publishSystemAnnouncementOnce(
+        operatorId,
+        dto,
+        idempotencyKey,
+        auditContext,
+      );
+    } finally {
+      this.announcementFanoutInFlight = false;
+    }
+  }
+
+  private async publishSystemAnnouncementOnce(
+    operatorId: string,
+    dto: PublishSystemAnnouncementDto,
+    idempotencyKey: string,
+    auditContext?: SystemAnnouncementAuditContext,
+  ): Promise<{ createdCount: number }> {
     const requestFingerprint = `${operatorId}:${dto.content}`;
     const announcement = await this.prisma.systemAnnouncement.upsert({
       where: { idempotencyKey },
@@ -247,7 +275,12 @@ export class NotificationService {
         content: dto.content,
       },
       update: {},
-      select: { id: true, requestFingerprint: true },
+      select: {
+        id: true,
+        requestFingerprint: true,
+        createdAt: true,
+        auditRecordedAt: true,
+      },
     });
     if (announcement.requestFingerprint !== requestFingerprint) {
       throw new ConflictException(
@@ -256,11 +289,11 @@ export class NotificationService {
     }
 
     let cursor: string | undefined;
-    let createdThisRun = 0;
     while (true) {
       const recipients = await this.prisma.user.findMany({
         where: {
           status: UserStatus.ACTIVE,
+          createdAt: { lte: announcement.createdAt },
           ...(cursor ? { id: { gt: cursor } } : {}),
         },
         select: { id: true },
@@ -290,7 +323,6 @@ export class NotificationService {
 
         return rows;
       });
-      createdThisRun += inserted.length;
       const createdUserIds = inserted
         .map(({ toUserID }) => toUserID)
         .filter((userId): userId is string => typeof userId === 'string');
@@ -312,19 +344,26 @@ export class NotificationService {
     const createdCount = await this.prisma.notification.count({
       where: { systemAnnouncementID: announcement.id },
     });
-    if (createdThisRun > 0) {
+    if (this.auditService) {
       try {
-        await this.auditService?.record({
-          actorID: operatorId,
-          action: 'system_announcement_publish',
-          entityType: 'SystemAnnouncement',
-          entityID: announcement.id,
-          after: {
-            content: dto.content,
-            createdCount,
-          },
-          ip: auditContext?.ip ?? null,
-          userAgent: auditContext?.userAgent ?? null,
+        await this.prisma.$transaction(async (tx) => {
+          const claimed = await tx.systemAnnouncement.updateMany({
+            where: { id: announcement.id, auditRecordedAt: null },
+            data: { auditRecordedAt: new Date() },
+          });
+          if (claimed.count === 0) return;
+          await this.auditService!.recordStrict(tx, {
+            actorID: operatorId,
+            action: 'system_announcement_publish',
+            entityType: 'SystemAnnouncement',
+            entityID: announcement.id,
+            after: {
+              content: dto.content,
+              createdCount,
+            },
+            ip: auditContext?.ip ?? null,
+            userAgent: auditContext?.userAgent ?? null,
+          });
         });
       } catch (error) {
         this.logger.warn(

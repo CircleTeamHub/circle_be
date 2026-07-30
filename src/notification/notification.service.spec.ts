@@ -33,6 +33,7 @@ describe('NotificationService', () => {
     },
     systemAnnouncement: {
       upsert: jest.fn(),
+      updateMany: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) =>
       typeof operation === 'function'
@@ -50,6 +51,7 @@ describe('NotificationService', () => {
   };
   const auditService = {
     record: jest.fn(),
+    recordStrict: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -75,6 +77,8 @@ describe('NotificationService', () => {
     }
     pushService.sendNotification.mockReset();
     auditService.record.mockReset();
+    auditService.recordStrict.mockReset();
+    prisma.systemAnnouncement.updateMany.mockResolvedValue({ count: 1 });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -141,6 +145,8 @@ describe('NotificationService', () => {
     prisma.systemAnnouncement.upsert.mockResolvedValue({
       id: 'announcement-1',
       requestFingerprint: 'admin-1:Maintenance starts at 22:00.',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
     });
     prisma.user.findMany.mockResolvedValue([
       { id: 'user-1' },
@@ -167,7 +173,10 @@ describe('NotificationService', () => {
     ).resolves.toEqual({ createdCount: 2 });
 
     expect(prisma.user.findMany).toHaveBeenCalledWith({
-      where: { status: 'ACTIVE' },
+      where: {
+        status: 'ACTIVE',
+        createdAt: { lte: new Date('2026-07-29T12:00:00.000Z') },
+      },
       select: { id: true },
       orderBy: { id: 'asc' },
       take: 500,
@@ -204,7 +213,7 @@ describe('NotificationService', () => {
     expect(
       realtimeService.broadcastSystemNotificationUnread,
     ).toHaveBeenCalledWith('user-2');
-    expect(auditService.record).toHaveBeenCalledWith({
+    expect(auditService.recordStrict).toHaveBeenCalledWith(prisma, {
       actorID: 'admin-1',
       action: 'system_announcement_publish',
       entityType: 'SystemAnnouncement',
@@ -225,6 +234,8 @@ describe('NotificationService', () => {
     prisma.systemAnnouncement.upsert.mockResolvedValue({
       id: 'announcement-1',
       requestFingerprint: 'admin-1:Maintenance',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
     });
     prisma.user.findMany
       .mockResolvedValueOnce(recipients.slice(0, 500))
@@ -284,6 +295,7 @@ describe('NotificationService', () => {
     expect(prisma.user.findMany).toHaveBeenNthCalledWith(2, {
       where: {
         status: 'ACTIVE',
+        createdAt: { lte: new Date('2026-07-29T12:00:00.000Z') },
         id: { gt: 'user-500' },
       },
       select: { id: true },
@@ -293,6 +305,7 @@ describe('NotificationService', () => {
     expect(prisma.user.findMany).toHaveBeenNthCalledWith(4, {
       where: {
         status: 'ACTIVE',
+        createdAt: { lte: new Date('2026-07-29T12:00:00.000Z') },
         id: { gt: 'user-500' },
       },
       select: { id: true },
@@ -311,13 +324,15 @@ describe('NotificationService', () => {
     prisma.systemAnnouncement.upsert.mockResolvedValue({
       id: 'announcement-1',
       requestFingerprint: 'admin-1:Maintenance',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
     });
     prisma.user.findMany.mockResolvedValue([{ id: 'user-1' }]);
     prisma.notification.createManyAndReturn.mockResolvedValue([
       { id: 'notification-1', toUserID: 'user-1' },
     ]);
     prisma.notification.count.mockResolvedValue(1);
-    auditService.record.mockRejectedValue(new Error('audit unavailable'));
+    auditService.recordStrict.mockRejectedValue(new Error('audit unavailable'));
 
     await expect(
       (service.publishSystemAnnouncement as any)(
@@ -328,10 +343,108 @@ describe('NotificationService', () => {
     ).resolves.toEqual({ createdCount: 1 });
   });
 
+  it('retries a failed durable announcement audit even when no recipients are new', async () => {
+    prisma.systemAnnouncement.upsert.mockResolvedValue({
+      id: 'announcement-1',
+      requestFingerprint: 'admin-1:Maintenance',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
+    });
+    prisma.user.findMany
+      .mockResolvedValueOnce([{ id: 'user-1' }])
+      .mockResolvedValueOnce([]);
+    prisma.notification.createManyAndReturn.mockResolvedValueOnce([
+      { id: 'notification-1', toUserID: 'user-1' },
+    ]);
+    prisma.notification.count.mockResolvedValue(1);
+    auditService.recordStrict
+      .mockRejectedValueOnce(new Error('audit unavailable'))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-1',
+        { content: 'Maintenance' },
+        'announcement-request-1',
+      ),
+    ).resolves.toEqual({ createdCount: 1 });
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-1',
+        { content: 'Maintenance' },
+        'announcement-request-1',
+      ),
+    ).resolves.toEqual({ createdCount: 1 });
+
+    expect(auditService.recordStrict).toHaveBeenCalledTimes(2);
+  });
+
+  it('freezes announcement recipients at the first publish timestamp', async () => {
+    const createdAt = new Date('2026-07-29T12:00:00.000Z');
+    prisma.systemAnnouncement.upsert.mockResolvedValue({
+      id: 'announcement-1',
+      requestFingerprint: 'admin-1:Maintenance',
+      createdAt,
+      auditRecordedAt: null,
+    });
+    prisma.user.findMany.mockResolvedValue([]);
+    prisma.notification.count.mockResolvedValue(0);
+
+    await service.publishSystemAnnouncement(
+      'admin-1',
+      { content: 'Maintenance' },
+      'announcement-request-1',
+    );
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          status: 'ACTIVE',
+          createdAt: { lte: createdAt },
+        },
+      }),
+    );
+  });
+
+  it('allows only one announcement fan-out at a time', async () => {
+    let releaseUpsert!: () => void;
+    const pendingUpsert = new Promise<void>((resolve) => {
+      releaseUpsert = resolve;
+    });
+    prisma.systemAnnouncement.upsert.mockImplementationOnce(async () => {
+      await pendingUpsert;
+      return {
+        id: 'announcement-1',
+        requestFingerprint: 'admin-1:First',
+        createdAt: new Date('2026-07-29T12:00:00.000Z'),
+        auditRecordedAt: null,
+      };
+    });
+    prisma.user.findMany.mockResolvedValue([]);
+    prisma.notification.count.mockResolvedValue(0);
+
+    const first = service.publishSystemAnnouncement(
+      'admin-1',
+      { content: 'First' },
+      'announcement-request-1',
+    );
+    await expect(
+      service.publishSystemAnnouncement(
+        'admin-2',
+        { content: 'Second' },
+        'announcement-request-2',
+      ),
+    ).rejects.toMatchObject({ status: 429 });
+    releaseUpsert();
+    await expect(first).resolves.toEqual({ createdCount: 0 });
+  });
+
   it('rejects reusing an announcement idempotency key with different content', async () => {
     prisma.systemAnnouncement.upsert.mockResolvedValue({
       id: 'announcement-1',
       requestFingerprint: 'admin-1:Original content',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
     });
 
     await expect(

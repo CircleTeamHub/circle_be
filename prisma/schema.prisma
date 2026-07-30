@@ -1455,6 +1455,7 @@ model SystemAnnouncement {
   operatorID         String
   content            String
   createdAt          DateTime @default(now())
+  auditRecordedAt    DateTime?
 
   notifications Notification[]
 

@@ -413,6 +413,29 @@ describe('IconService', () => {
     });
   });
 
+  it('auto-initializes only the highest Top Collaborator tier', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({
+        receivedLikeCount: 10_000,
+        iconPreferencesInitialized: false,
+      }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    await service.getIconOptions('user-1');
+
+    const created = prisma.userDisplayIcon.createMany.mock.calls[0][0].data;
+    expect(
+      created.filter(
+        (item: { systemKey: string }) => item.systemKey === 'TOP_COLLABORATOR',
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        systemVariant: 'TOP_COLLABORATOR_3',
+      }),
+    ]);
+  });
+
   it('wraps updateDisplayIcons delete+create in one transaction and broadcasts after invalidating', async () => {
     prisma.user.findUnique.mockResolvedValue(verifiedUser({ vipLevel: 4 }));
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({ count: 1 });

@@ -88,8 +88,16 @@ export class DashboardCommerceMetrics {
     ] = await Promise.all([
       this.prisma.user.count({
         where: {
-          vipLevel: { gt: 0 },
-          OR: [{ vipExpiresAt: null }, { vipExpiresAt: { gt: period.endAt } }],
+          OR: [
+            { vipLevel: { gte: 4 } },
+            {
+              vipLevel: { gt: 0, lt: 4 },
+              OR: [
+                { vipExpiresAt: null },
+                { vipExpiresAt: { gt: period.endAt } },
+              ],
+            },
+          ],
         },
       }),
       this.prisma.membershipGrant.count({ where: { createdAt: range } }),

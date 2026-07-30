@@ -116,6 +116,20 @@ describe('dashboard metric providers', () => {
         ],
       },
     });
+    expect(prisma.user.count).toHaveBeenCalledWith({
+      where: {
+        OR: [
+          { vipLevel: { gte: 4 } },
+          {
+            vipLevel: { gt: 0, lt: 4 },
+            OR: [
+              { vipExpiresAt: null },
+              { vipExpiresAt: { gt: period.endAt } },
+            ],
+          },
+        ],
+      },
+    });
   });
 
   it('combines all pending moderation queues', async () => {

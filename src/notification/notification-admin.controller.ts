@@ -13,9 +13,11 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
   PublishSystemAnnouncementDto,
   PublishSystemAnnouncementResponseDto,
@@ -47,6 +49,8 @@ export class NotificationAdminController {
   constructor(private readonly notificationService: NotificationService) {}
 
   @Post()
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 2, ttl: 60_000 } })
   @ApiOperation({ summary: 'Publish a system announcement to active users' })
   @ApiHeader({
     name: 'Idempotency-Key',
