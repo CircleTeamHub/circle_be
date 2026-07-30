@@ -164,6 +164,31 @@ describe('AdminCommunityService', () => {
     expect(tx.circle.update).not.toHaveBeenCalled();
   });
 
+  it('does not manufacture admin-disable provenance for an already deleted circle', async () => {
+    tx.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      name: '作者已删除圈子',
+      groupID: 'group-1',
+      deleted: true,
+      adminState: 'ACTIVE',
+      adminDisabledAt: null,
+      adminDisabledBy: null,
+      adminDisableReason: null,
+    });
+
+    await expect(
+      service.disableCircle({
+        actorId: 'admin-1',
+        circleId: 'circle-1',
+        reason: '尝试停用',
+        confirmation: '作者已删除圈子',
+        idempotencyKey: 'request-deleted',
+      }),
+    ).rejects.toThrow('圈子已经删除，无法停用');
+    expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
+    expect(tx.circle.update).not.toHaveBeenCalled();
+  });
+
   it('rejects a circle action when the confirmation does not match', async () => {
     tx.circle.findUnique.mockResolvedValue({
       id: 'circle-1',

@@ -763,7 +763,7 @@ describe('FancyNumberService', () => {
         expiresAt: previousExpiresAt,
         permanentAt: null,
         endedAt: null,
-        fancyNumber: { id: 'fancy-renew-replay', value: '999999' },
+        fancyNumber: { id: 'fancy-switched', value: '666666' },
       });
     tx.fancyNumberOrder.findUnique.mockResolvedValue({
       id: 'order-renew-replay',
@@ -778,16 +778,37 @@ describe('FancyNumberService', () => {
       unitPrice: 100,
       totalPrice: 100,
       walletBalanceAfter: 300,
+      fancyNumber: { value: '999999' },
     });
 
     await expect(
       service.renew('user-renew-replay', 1, 'renew-replay', now),
     ).resolves.toMatchObject({
       orderId: 'order-renew-replay',
+      accountId: '999999',
       expiresAt: newExpiresAt,
       walletBalanceAfter: 300,
     });
     expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
+  });
+
+  it('does not enable a disabled fancy number with a durable identifier claim', async () => {
+    tx.fancyNumber.findUnique.mockResolvedValue({
+      id: 'fancy-invite-owned',
+      value: '888888',
+      status: 'DISABLED',
+    });
+    tx.accountIdentifier.findUnique.mockResolvedValue({
+      currentUserID: null,
+      reservedForUserID: null,
+      inviteOwnerUserID: 'invite-owner',
+    });
+
+    await expect(
+      service.adminSetAvailability('admin-1', 'fancy-invite-owned', true),
+    ).rejects.toThrow('Fancy number has an identifier claim');
+    expect(tx.fancyNumber.update).not.toHaveBeenCalled();
+    expect(tx.adminAuditLog.create).not.toHaveBeenCalled();
   });
 
   it('restores an overdue lease before rejecting renewal', async () => {

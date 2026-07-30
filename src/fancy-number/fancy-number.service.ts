@@ -937,6 +937,9 @@ export class FancyNumberService {
       });
       const existingOrder = await tx.fancyNumberOrder.findUnique({
         where: { idempotencyKey: scopedIdempotencyKey },
+        include: {
+          fancyNumber: { select: { value: true } },
+        },
       });
       if (existingOrder) {
         if (existingOrder.requestFingerprint !== requestFingerprint) {
@@ -949,7 +952,7 @@ export class FancyNumberService {
           replayed: true,
           result: {
             orderId: existingOrder.id,
-            accountId: lease.fancyNumber.value,
+            accountId: existingOrder.fancyNumber.value,
             expiresAt: existingOrder.newExpiresAt,
             permanent: false,
             months: existingOrder.months,
@@ -1578,6 +1581,12 @@ export class FancyNumberService {
         throw new ConflictException(
           'Leased or permanent fancy numbers cannot be disabled',
         );
+      }
+      if (
+        enabled &&
+        (await this.hasAccountIdentifierClaim(tx, current.value))
+      ) {
+        throw new ConflictException('Fancy number has an identifier claim');
       }
       const status = enabled ? 'AVAILABLE' : 'DISABLED';
       const disabledAt = enabled ? null : new Date();

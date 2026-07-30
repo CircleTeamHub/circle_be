@@ -283,6 +283,9 @@ export class AdminCommunityService {
         }
         await this.assertNoActiveOperation(tx, circle.groupID);
 
+        if (type === 'MUTE' && circle.deleted) {
+          throw new ConflictException('圈子已经删除，无法停用');
+        }
         if (type === 'MUTE' && circle.adminState === 'DISABLED') {
           throw new ConflictException('圈子已经停用');
         }
@@ -373,6 +376,9 @@ export class AdminCommunityService {
       return { circle, operation: null };
     }
 
+    if (type === 'MUTE' && circle.deleted) {
+      throw new ConflictException('圈子已经删除，无法停用');
+    }
     if (type === 'MUTE' && circle.adminState === 'DISABLED') {
       throw new ConflictException('圈子已经停用');
     }
