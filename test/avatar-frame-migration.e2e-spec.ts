@@ -26,13 +26,6 @@ function allowlistedTestDatabaseUrl(): string | null {
   return databaseUrl;
 }
 
-function migrationStatements(sql: string): string[] {
-  return sql
-    .split(/;\s*(?:\r?\n|$)/)
-    .map((statement) => statement.trim())
-    .filter(Boolean);
-}
-
 const databaseUrl = allowlistedTestDatabaseUrl();
 const describePostgres = databaseUrl ? describe : describe.skip;
 const migrationPath = join(
@@ -73,18 +66,20 @@ describePostgres('avatar frame migration PostgreSQL integration', () => {
       [activeDiamondExpiry, new Date('2020-01-01T00:00:00.000Z')],
     );
 
-    for (const statement of migrationStatements(
-      readFileSync(migrationPath, 'utf8'),
-    )) {
-      await client.query(statement);
-    }
+    await client.query(readFileSync(migrationPath, 'utf8'));
   });
 
   afterAll(async () => {
     if (!client) return;
-    await client.query('SET search_path TO public');
-    await client.query(`DROP SCHEMA "${schemaName}" CASCADE`);
-    await client.end();
+    try {
+      // A migration failure can leave an explicit transaction aborted. Reset
+      // it before dropping the isolated schema so cleanup still succeeds.
+      await client.query('ROLLBACK');
+      await client.query('SET search_path TO public');
+      await client.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+    } finally {
+      await client.end();
+    }
   });
 
   it('applies the backfill, validated foreign key, and query-path indexes', async () => {
