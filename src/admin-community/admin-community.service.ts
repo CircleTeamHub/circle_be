@@ -174,18 +174,15 @@ export class AdminCommunityService {
     try {
       return await runSerializableTransaction(this.prisma, async (tx) => {
         await this.lockGroup(tx, groupID);
-        const linkedCircle =
-          input.type === 'DISMISS'
-            ? await tx.circle.findFirst({
-                where: { groupID },
-                select: {
-                  id: true,
-                  name: true,
-                  deleted: true,
-                  adminState: true,
-                },
-              })
-            : null;
+        const linkedCircle = await tx.circle.findFirst({
+          where: { groupID },
+          select: {
+            id: true,
+            name: true,
+            deleted: true,
+            adminState: true,
+          },
+        });
         const duplicate = await tx.adminGroupOperation.findUnique({
           where: { idempotencyKey: input.idempotencyKey },
         });
@@ -198,6 +195,11 @@ export class AdminCommunityService {
             reason: input.reason,
           });
           return duplicate;
+        }
+        if (linkedCircle && input.type !== 'DISMISS') {
+          throw new ConflictException(
+            '该群聊已关联圈子，请使用圈子停用或恢复接口',
+          );
         }
         await this.assertNoActiveOperation(tx, groupID);
         if (linkedCircle) {

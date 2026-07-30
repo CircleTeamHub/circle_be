@@ -642,6 +642,17 @@ describe('UserService', () => {
       expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
     });
 
+    it('still revokes sessions when optional deletion appearance lookup fails', async () => {
+      avatarFrames.resolvePublicAppearances
+        .mockResolvedValueOnce(new Map())
+        .mockRejectedValueOnce(new Error('appearance unavailable'));
+
+      await expect(service.remove('user-1')).resolves.toEqual(
+        expect.objectContaining({ id: 'user-1' }),
+      );
+      expect(refreshTokens.revokeAll).toHaveBeenCalledWith('user-1');
+    });
+
     it('maps an expired paid membership to the public view in the deletion body', async () => {
       prisma.user.update.mockResolvedValue({
         id: 'user-1',

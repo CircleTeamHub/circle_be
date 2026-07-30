@@ -909,6 +909,44 @@ export class FancyNumberService {
       userId,
       idempotencyKey,
     );
+    const existingOrder = await this.prisma.fancyNumberOrder.findUnique({
+      where: { idempotencyKey: scopedIdempotencyKey },
+      include: {
+        fancyNumber: { select: { value: true } },
+      },
+    });
+    if (existingOrder) {
+      let fingerprint: unknown;
+      try {
+        fingerprint = JSON.parse(existingOrder.requestFingerprint);
+      } catch {
+        fingerprint = null;
+      }
+      if (
+        !fingerprint ||
+        typeof fingerprint !== 'object' ||
+        Array.isArray(fingerprint) ||
+        (fingerprint as Record<string, unknown>).operation !== 'renewal' ||
+        (fingerprint as Record<string, unknown>).userId !== userId ||
+        (fingerprint as Record<string, unknown>).months !== months ||
+        typeof (fingerprint as Record<string, unknown>).leaseId !== 'string'
+      ) {
+        throw new ConflictException({
+          message: '幂等键已用于其他请求',
+          errorCode: FancyNumberErrorCode.IdempotencyConflict,
+        });
+      }
+      return {
+        orderId: existingOrder.id,
+        accountId: existingOrder.fancyNumber.value,
+        expiresAt: existingOrder.newExpiresAt,
+        permanent: false,
+        months: existingOrder.months,
+        unitPrice: existingOrder.unitPrice,
+        totalPrice: existingOrder.totalPrice,
+        walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
+      };
+    }
     if (await this.expireOverdueLeaseForUser(userId, now)) {
       throw new ConflictException({
         message: '靓号已到期并恢复原账号',
@@ -1166,29 +1204,36 @@ export class FancyNumberService {
   }
 
   async expireDue(now = new Date()): Promise<number> {
-    const due = await this.prisma.fancyNumberLease.findMany({
-      where: {
-        endedAt: null,
-        permanentAt: null,
-        expiresAt: { lte: now },
-      },
-      select: { id: true },
-      orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
-      take: 100,
-    });
     let expired = 0;
-    for (const lease of due) {
-      try {
-        if (await this.expireLease(lease.id, now)) {
-          expired += 1;
+    let cursor: string | undefined;
+    while (true) {
+      const due = await this.prisma.fancyNumberLease.findMany({
+        where: {
+          endedAt: null,
+          permanentAt: null,
+          expiresAt: { lte: now },
+        },
+        select: { id: true },
+        orderBy: [{ expiresAt: 'asc' }, { id: 'asc' }],
+        take: 100,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      for (const lease of due) {
+        try {
+          if (await this.expireLease(lease.id, now)) {
+            expired += 1;
+          }
+        } catch (error) {
+          this.logger.error(
+            `Failed to expire fancy-number lease ${lease.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
-      } catch (error) {
-        this.logger.error(
-          `Failed to expire fancy-number lease ${lease.id}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
       }
+      if (due.length < 100) break;
+      cursor = due[due.length - 1]?.id;
+      if (!cursor) break;
     }
     return expired;
   }

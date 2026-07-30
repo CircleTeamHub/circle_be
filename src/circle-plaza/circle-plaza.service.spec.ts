@@ -1190,6 +1190,68 @@ describe('CirclePlazaService', () => {
     ).resolves.toEqual(expect.objectContaining({ id: 'post-1' }));
   });
 
+  it('does not fail a committed post when optional appearance projection fails', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    prisma.circleMember.findMany.mockImplementation((args: any) => {
+      if (args?.select?.userID) return Promise.resolve([]);
+      return Promise.resolve([
+        {
+          circleID: 'circle-1',
+          id: 'member-1',
+          status: 'ACTIVE',
+          role: 'MEMBER',
+          circle: { id: 'circle-1', deleted: false, memberCanPost: true },
+        },
+      ]);
+    });
+    prisma.circlePost.create.mockResolvedValue({
+      id: 'post-appearance-fallback',
+      authorID: 'user-1',
+      content: 'hi',
+      images: [],
+      tags: [],
+      city: null,
+      cities: [],
+      isHorn: false,
+      noteID: null,
+      vipRestriction: null,
+      creditRestriction: null,
+      fancyRestriction: false,
+      viewCount: 0,
+      signupCount: 0,
+      signupVipRestriction: null,
+      signupCreditRestriction: null,
+      signupFancyRestriction: false,
+      author: {
+        id: 'user-1',
+        nickname: 'Host',
+        avatarUrl: null,
+        avatarFrame: null,
+        accountId: '1001',
+      },
+      circle: { id: 'circle-1', name: 'Board games' },
+      circleLinks: [],
+      createdAt: new Date('2026-06-29T12:00:00Z'),
+      expiresAt: new Date('2026-06-30T12:00:00Z'),
+    });
+    avatarFrames.resolvePublicAppearances.mockRejectedValue(
+      new Error('appearance unavailable'),
+    );
+
+    await expect(
+      service.createPost('user-1', {
+        circleId: 'circle-1',
+        content: 'hi',
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({ id: 'post-appearance-fallback' }),
+    );
+    expect(prisma.circlePost.create).toHaveBeenCalledTimes(1);
+  });
+
   it('excludes the author and blocked users in the capped recipient query', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 1,

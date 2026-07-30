@@ -36,6 +36,7 @@ describe('NotificationService', () => {
       updateMany: jest.fn(),
       findUniqueOrThrow: jest.fn(),
     },
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (operation: any) =>
       typeof operation === 'function'
         ? operation(prisma)
@@ -79,6 +80,8 @@ describe('NotificationService', () => {
     pushService.sendNotification.mockReset();
     auditService.record.mockReset();
     auditService.recordStrict.mockReset();
+    prisma.$queryRaw.mockReset();
+    prisma.$queryRaw.mockResolvedValue([{ acquired: true }]);
     prisma.systemAnnouncement.updateMany.mockResolvedValue({ count: 1 });
 
     const module: TestingModule = await Test.createTestingModule({
@@ -461,6 +464,25 @@ describe('NotificationService', () => {
     ).rejects.toMatchObject({ status: 429 });
     releaseUpsert();
     await expect(first).resolves.toEqual({ createdCount: 0 });
+  });
+
+  it('rejects an announcement when another replica holds the database lock', async () => {
+    const otherReplica = new NotificationService(
+      prisma as never,
+      realtimeService as never,
+      pushService as never,
+      auditService as never,
+    );
+    prisma.$queryRaw.mockResolvedValueOnce([{ acquired: false }]);
+
+    await expect(
+      otherReplica.publishSystemAnnouncement(
+        'admin-2',
+        { content: 'Second' },
+        'announcement-request-2',
+      ),
+    ).rejects.toMatchObject({ status: 429 });
+    expect(prisma.systemAnnouncement.upsert).not.toHaveBeenCalled();
   });
 
   it('rejects reusing an announcement idempotency key with different content', async () => {

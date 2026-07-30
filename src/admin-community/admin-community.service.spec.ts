@@ -33,6 +33,7 @@ describe('AdminCommunityService', () => {
     tx.$executeRaw.mockResolvedValue(1);
     tx.circle.findFirst.mockResolvedValue(null);
     tx.adminGroupOperation.findFirst.mockResolvedValue(null);
+    tx.adminGroupOperation.findUnique.mockResolvedValue(null);
     tx.adminAuditLog.findFirst.mockResolvedValue(null);
   });
 
@@ -368,6 +369,31 @@ describe('AdminCommunityService', () => {
       }),
     });
   });
+
+  it.each(['MUTE', 'UNMUTE'] as const)(
+    'rejects raw %s operations for a linked circle',
+    async (type) => {
+      tx.circle.findFirst.mockResolvedValue({
+        id: 'circle-9',
+        name: '已关联圈子',
+        groupID: 'group-9',
+        deleted: type === 'UNMUTE',
+        adminState: type === 'UNMUTE' ? 'DISABLED' : 'ACTIVE',
+      });
+
+      await expect(
+        service.requestGroupOperation({
+          actorId: 'admin-1',
+          groupId: 'group-9',
+          type,
+          reason: '管理操作',
+          confirmation: 'group-9',
+          idempotencyKey: `request-${type.toLowerCase()}`,
+        }),
+      ).rejects.toThrow('请使用圈子停用或恢复接口');
+      expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
+    },
+  );
 
   it('returns the original operation when the same request is retried', async () => {
     tx.adminGroupOperation.findUnique.mockResolvedValue({

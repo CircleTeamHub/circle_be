@@ -392,9 +392,20 @@ export class CirclePlazaService {
     const displayIconsByAuthor = await this.getDisplayIconsByAuthorIds([
       post.author.id,
     ]);
-    const appearances = await this.avatarFrames.resolvePublicAppearances([
-      post.author.id,
-    ]);
+    let avatarFrameAppearance: AvatarFramePublicAppearance | null = null;
+    try {
+      const appearances = await this.avatarFrames.resolvePublicAppearances([
+        post.author.id,
+      ]);
+      avatarFrameAppearance =
+        appearances.get(post.author.id)?.avatarFrame ?? null;
+    } catch (error) {
+      this.logger.warn(
+        `Avatar-frame appearance lookup failed after post publication (post=${post.id}): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
 
     return this.toPlazaPostDto(
       post,
@@ -402,7 +413,7 @@ export class CirclePlazaService {
       false,
       true,
       displayIconsByAuthor.get(post.author.id) ?? [],
-      appearances.get(post.author.id)?.avatarFrame ?? null,
+      avatarFrameAppearance,
     );
   }
 

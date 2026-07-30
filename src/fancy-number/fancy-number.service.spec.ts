@@ -13,6 +13,7 @@ describe('FancyNumberService', () => {
     },
     fancyNumberLease: {
       findFirst: jest.fn(),
+      findMany: jest.fn(),
       findUnique: jest.fn(),
       create: jest.fn(),
       updateMany: jest.fn(),
@@ -58,6 +59,7 @@ describe('FancyNumberService', () => {
     user: tx.user,
     fancyNumber: tx.fancyNumber,
     fancyNumberLease: tx.fancyNumberLease,
+    fancyNumberOrder: tx.fancyNumberOrder,
     accountIdentifier: tx.accountIdentifier,
     $transaction: jest.fn(
       async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx),
@@ -73,6 +75,10 @@ describe('FancyNumberService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    tx.fancyNumberOrder.findUnique.mockReset();
+    tx.fancyNumberOrder.findUnique.mockResolvedValue(null);
+    tx.fancyNumberLease.findFirst.mockReset();
+    tx.fancyNumberLease.findMany.mockReset();
     tx.accountIdentifier.findUnique.mockResolvedValue({
       currentUserID: null,
       reservedForUserID: null,
@@ -792,6 +798,42 @@ describe('FancyNumberService', () => {
     expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
   });
 
+  it('replays a successful renewal before trying to expire its now-overdue lease', async () => {
+    const newExpiresAt = new Date('2026-02-28T09:15:30.123Z');
+    tx.fancyNumberOrder.findUnique.mockResolvedValue({
+      id: 'order-expired-replay',
+      requestFingerprint: JSON.stringify({
+        operation: 'renewal',
+        userId: 'user-expired-replay',
+        leaseId: 'lease-expired-replay',
+        months: 1,
+      }),
+      newExpiresAt,
+      months: 1,
+      unitPrice: 100,
+      totalPrice: 100,
+      walletBalanceAfter: 300,
+      fancyNumber: { value: '999999' },
+    });
+    const expireSpy = jest
+      .spyOn(service as any, 'expireOverdueLeaseForUser')
+      .mockResolvedValue(true);
+
+    await expect(
+      service.renew(
+        'user-expired-replay',
+        1,
+        'expired-replay',
+        new Date('2026-03-01T00:00:00.000Z'),
+      ),
+    ).resolves.toMatchObject({
+      orderId: 'order-expired-replay',
+      accountId: '999999',
+      expiresAt: newExpiresAt,
+    });
+    expect(expireSpy).not.toHaveBeenCalled();
+  });
+
   it('does not enable a disabled fancy number with a durable identifier claim', async () => {
     tx.fancyNumber.findUnique.mockResolvedValue({
       id: 'fancy-invite-owned',
@@ -831,6 +873,25 @@ describe('FancyNumberService', () => {
     });
     expect(expireSpy).toHaveBeenCalledWith('lease-expired', now);
     expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('continues the expiry sweep after a full batch of failing leases', async () => {
+    const failing = Array.from({ length: 100 }, (_, index) => ({
+      id: `failed-${String(index).padStart(3, '0')}`,
+    }));
+    tx.fancyNumberLease.findMany
+      .mockResolvedValueOnce(failing)
+      .mockResolvedValueOnce([{ id: 'valid-after-failures' }])
+      .mockResolvedValueOnce([]);
+    const expireSpy = jest
+      .spyOn(service, 'expireLease')
+      .mockImplementation(async (leaseId) => {
+        if (leaseId === 'valid-after-failures') return true;
+        throw new Error('invalid identifier state');
+      });
+
+    await expect(service.expireDue(now)).resolves.toBe(1);
+    expect(expireSpy).toHaveBeenCalledWith('valid-after-failures', now);
   });
 
   it('restores the reserved account and releases an expired fancy number', async () => {

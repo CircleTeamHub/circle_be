@@ -576,23 +576,33 @@ export class UserService {
 
   async remove(id: string) {
     await this.findOne(id);
-    const [user, displayIcons, appearances] = await Promise.all([
-      this.prisma.user.update({
-        where: { id },
-        data: { status: UserStatus.DELETED },
-        select: PUBLIC_SELECT,
-      }),
-      this.iconService.getDisplayIconsForUser(id),
-      this.avatarFrames.resolvePublicAppearances([id]),
-    ]);
+    const user = await this.prisma.user.update({
+      where: { id },
+      data: { status: UserStatus.DELETED },
+      select: PUBLIC_SELECT,
+    });
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
+    const displayIcons = await this.iconService.getDisplayIconsForUser(id);
+    let avatarFrameAppearance: AvatarFramePublicAppearance | null = null;
+    try {
+      const appearances = await this.avatarFrames.resolvePublicAppearances([
+        id,
+      ]);
+      avatarFrameAppearance = appearances.get(id)?.avatarFrame ?? null;
+    } catch (error) {
+      this.logger.warn(
+        `Avatar-frame appearance lookup failed after user deletion (user=${id}): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     // Map through toPublicUser like every other public-user response: resolve
     // the effective (expiry-aware) vipLevel and attach the membership object,
     // so an expired paid tier can't leak its stored level in the deletion body.
     return {
-      ...toPublicUser(user, appearances.get(id)?.avatarFrame ?? null),
+      ...toPublicUser(user, avatarFrameAppearance),
       displayIcons,
     };
   }

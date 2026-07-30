@@ -248,11 +248,27 @@ export class NotificationService {
     }
     this.announcementFanoutInFlight = true;
     try {
-      return await this.publishSystemAnnouncementOnce(
-        operatorId,
-        dto,
-        idempotencyKey,
-        auditContext,
+      return await this.prisma.$transaction(
+        async (tx) => {
+          const rows = await tx.$queryRaw<Array<{ acquired: boolean }>>`
+            SELECT pg_try_advisory_xact_lock(
+              hashtext('circle-system-announcement-fanout')
+            ) AS acquired
+          `;
+          if (!rows[0]?.acquired) {
+            throw new HttpException(
+              'A system announcement publish is already in progress',
+              HttpStatus.TOO_MANY_REQUESTS,
+            );
+          }
+          return this.publishSystemAnnouncementOnce(
+            operatorId,
+            dto,
+            idempotencyKey,
+            auditContext,
+          );
+        },
+        { maxWait: 5_000, timeout: 600_000 },
       );
     } finally {
       this.announcementFanoutInFlight = false;
