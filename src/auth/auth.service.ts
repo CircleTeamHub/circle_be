@@ -22,7 +22,10 @@ import {
   REGISTRATION_CODE_MAX_ATTEMPTS,
 } from './account-id.unique';
 import { normalizeEmail } from 'src/utils/email';
-import { AuthErrorCode } from 'src/common/app-error-codes';
+import {
+  AuthErrorCode,
+  FancyNumberErrorCode,
+} from 'src/common/app-error-codes';
 import {
   ACCOUNT_ID_PATTERN,
   ACCOUNT_ID_RULE_MESSAGE,
@@ -49,6 +52,8 @@ import {
   AvatarFramePublicAppearance,
   AvatarFrameService,
 } from 'src/avatar-frame/avatar-frame.service';
+import { lockFancyNumberUser } from 'src/fancy-number/fancy-number-user-lock';
+import { runSerializableTransaction } from 'src/utils/prisma-tx';
 
 const ME_SELECT = USER_ME_SELECT;
 
@@ -968,61 +973,75 @@ export class AuthService {
 
     await this.fancyNumberService.ensureAccountIdChangeAllowed(userId);
 
-    const current = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { accountId: true },
-    });
-    if (!current) {
-      throw new NotFoundException({
-        message: '用户不存在',
-        errorCode: AuthErrorCode.UserNotFound,
-      });
-    }
-    if (current.accountId === normalized) {
-      throw new BadRequestException({
-        message: '新账号不能和当前账号相同',
-        errorCode: AuthErrorCode.AccountIdUnchanged,
-      });
-    }
-
-    const taken = await this.prisma.user.findUnique({
-      where: { accountId: normalized },
-      select: { id: true },
-    });
-    if (taken) {
-      throw new ConflictException({
-        message: '该账号已被占用',
-        errorCode: AuthErrorCode.AccountIdTaken,
-      });
-    }
-    const identifierClaim = await this.prisma.accountIdentifier.findUnique({
-      where: { value: normalized },
-      select: {
-        currentUserID: true,
-        reservedForUserID: true,
-        inviteOwnerUserID: true,
-        fancyNumber: { select: { id: true } },
-      },
-    });
-    if (
-      identifierClaim &&
-      ((identifierClaim.currentUserID !== null &&
-        identifierClaim.currentUserID !== userId) ||
-        identifierClaim.reservedForUserID !== null ||
-        (identifierClaim.inviteOwnerUserID !== null &&
-          identifierClaim.inviteOwnerUserID !== userId) ||
-        identifierClaim.fancyNumber !== null)
-    ) {
-      throw new ConflictException({
-        message: '该账号已被占用',
-        errorCode: AuthErrorCode.AccountIdTaken,
-      });
-    }
-
     try {
-      await this.prisma.user.update({
-        where: { id: userId },
-        data: { accountId: normalized },
+      await runSerializableTransaction(this.prisma, async (tx) => {
+        await lockFancyNumberUser(tx, userId);
+        const activeLease = await tx.fancyNumberLease.findFirst({
+          where: { userID: userId, endedAt: null },
+          select: { id: true },
+        });
+        if (activeLease) {
+          throw new ConflictException({
+            message: '使用靓号期间不能修改账号 ID',
+            errorCode: FancyNumberErrorCode.AccountIdLocked,
+          });
+        }
+
+        const current = await tx.user.findUnique({
+          where: { id: userId },
+          select: { accountId: true },
+        });
+        if (!current) {
+          throw new NotFoundException({
+            message: '用户不存在',
+            errorCode: AuthErrorCode.UserNotFound,
+          });
+        }
+        if (current.accountId === normalized) {
+          throw new BadRequestException({
+            message: '新账号不能和当前账号相同',
+            errorCode: AuthErrorCode.AccountIdUnchanged,
+          });
+        }
+
+        const taken = await tx.user.findUnique({
+          where: { accountId: normalized },
+          select: { id: true },
+        });
+        if (taken) {
+          throw new ConflictException({
+            message: '该账号已被占用',
+            errorCode: AuthErrorCode.AccountIdTaken,
+          });
+        }
+        const identifierClaim = await tx.accountIdentifier.findUnique({
+          where: { value: normalized },
+          select: {
+            currentUserID: true,
+            reservedForUserID: true,
+            inviteOwnerUserID: true,
+            fancyNumber: { select: { id: true } },
+          },
+        });
+        if (
+          identifierClaim &&
+          ((identifierClaim.currentUserID !== null &&
+            identifierClaim.currentUserID !== userId) ||
+            identifierClaim.reservedForUserID !== null ||
+            (identifierClaim.inviteOwnerUserID !== null &&
+              identifierClaim.inviteOwnerUserID !== userId) ||
+            identifierClaim.fancyNumber !== null)
+        ) {
+          throw new ConflictException({
+            message: '该账号已被占用',
+            errorCode: AuthErrorCode.AccountIdTaken,
+          });
+        }
+
+        await tx.user.update({
+          where: { id: userId },
+          data: { accountId: normalized },
+        });
       });
     } catch (err) {
       // 查重与写入之间被并发抢占：唯一约束兜底，转成友好的 409。

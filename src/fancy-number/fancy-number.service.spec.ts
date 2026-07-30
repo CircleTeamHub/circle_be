@@ -184,6 +184,47 @@ describe('FancyNumberService', () => {
         idempotencyKey: 'fancy-number:client:user-1:request-1',
       },
     });
+    expect(tx.$executeRaw).toHaveBeenCalled();
+    expect(tx.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      tx.user.findUnique.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not rebroadcast purchase mutations when replaying an idempotent order', async () => {
+    const expiresAt = new Date('2026-03-31T09:15:30.123Z');
+    tx.fancyNumberLease.findFirst.mockResolvedValueOnce(null);
+    tx.user.findUnique.mockResolvedValue({
+      id: 'user-replay',
+      status: 'ACTIVE',
+      accountId: '888888',
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue({
+      id: 'order-replay',
+      idempotencyKey: 'client:user-replay:request-replay',
+      requestFingerprint: JSON.stringify({
+        operation: 'purchase',
+        userId: 'user-replay',
+        fancyNumberId: 'fancy-replay',
+        months: 1,
+      }),
+      fancyNumberID: 'fancy-replay',
+      newExpiresAt: expiresAt,
+      months: 1,
+      unitPrice: 100,
+      totalPrice: 100,
+      walletBalanceAfter: 400,
+    });
+    tx.fancyNumber.findUniqueOrThrow.mockResolvedValue({ value: '888888' });
+
+    await expect(
+      service.purchase('user-replay', 'fancy-replay', 1, 'request-replay', now),
+    ).resolves.toMatchObject({
+      orderId: 'order-replay',
+      walletBalanceAfter: 400,
+    });
+    expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
   });
 
   it('lets a super member choose one permanent fancy number without spending points', async () => {
@@ -532,6 +573,44 @@ describe('FancyNumberService', () => {
         idempotencyKey: 'fancy-number:client:user-3:renew-request',
       },
     });
+  });
+
+  it('does not rebroadcast a wallet debit when replaying an idempotent renewal', async () => {
+    const previousExpiresAt = new Date('2026-03-31T09:15:30.123Z');
+    const newExpiresAt = new Date('2026-04-30T09:15:30.123Z');
+    tx.fancyNumberLease.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'lease-renew-replay',
+        userID: 'user-renew-replay',
+        expiresAt: previousExpiresAt,
+        permanentAt: null,
+        endedAt: null,
+        fancyNumber: { id: 'fancy-renew-replay', value: '999999' },
+      });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue({
+      id: 'order-renew-replay',
+      requestFingerprint: JSON.stringify({
+        operation: 'renewal',
+        userId: 'user-renew-replay',
+        leaseId: 'lease-renew-replay',
+        months: 1,
+      }),
+      newExpiresAt,
+      months: 1,
+      unitPrice: 100,
+      totalPrice: 100,
+      walletBalanceAfter: 300,
+    });
+
+    await expect(
+      service.renew('user-renew-replay', 1, 'renew-replay', now),
+    ).resolves.toMatchObject({
+      orderId: 'order-renew-replay',
+      expiresAt: newExpiresAt,
+      walletBalanceAfter: 300,
+    });
+    expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
   });
 
   it('restores an overdue lease before rejecting renewal', async () => {

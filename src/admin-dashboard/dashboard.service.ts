@@ -47,7 +47,14 @@ export class DashboardService {
     now = new Date(),
   ): Promise<DashboardResponse> {
     const cacheKey = `admin:dashboard:${range}`;
-    const cached = await this.redis.getJson<DashboardResponse>(cacheKey);
+    let cached: DashboardResponse | null = null;
+    try {
+      cached = await this.redis.getJson<DashboardResponse>(cacheKey);
+    } catch (error) {
+      this.logger.warn(
+        `Dashboard cache read failed: ${this.errorMessage(error)}`,
+      );
+    }
     if (cached) return cached;
 
     const period = resolveDashboardPeriod(range, now);
@@ -88,7 +95,13 @@ export class DashboardService {
       },
     };
     if (results.every((result) => result.status === 'fulfilled')) {
-      await this.redis.setJson(cacheKey, response, 45);
+      try {
+        await this.redis.setJson(cacheKey, response, 45);
+      } catch (error) {
+        this.logger.warn(
+          `Dashboard cache write failed: ${this.errorMessage(error)}`,
+        );
+      }
     }
     return response;
   }

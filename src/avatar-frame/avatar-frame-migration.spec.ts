@@ -6,6 +6,10 @@ const migrationPath = join(
   root,
   'prisma/migrations/20260729120000_avatar_frame_wardrobe/migration.sql',
 );
+const selectedIndexMigrationPath = join(
+  root,
+  'prisma/migrations/20260729120500_avatar_frame_selected_index/migration.sql',
+);
 
 function prismaModel(schema: string, name: string): string {
   const start = schema.indexOf(`model ${name} {`);
@@ -18,6 +22,9 @@ describe('avatar frame wardrobe persistence contract', () => {
   const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
   const sql = existsSync(migrationPath)
     ? readFileSync(migrationPath, 'utf8')
+    : '';
+  const selectedIndexSql = existsSync(selectedIndexMigrationPath)
+    ? readFileSync(selectedIndexMigrationPath, 'utf8')
     : '';
 
   it('models the catalog, audited grants, and explicit user selection', () => {
@@ -55,13 +62,13 @@ describe('avatar frame wardrobe persistence contract', () => {
 
   it('creates the catalog and grant tables with relational and idempotency safeguards', () => {
     expect(existsSync(migrationPath)).toBe(true);
-    expect(sql).toContain('CREATE TABLE "AvatarFrameAsset"');
-    expect(sql).toContain('CREATE TABLE "UserAvatarFrameGrant"');
-    expect(sql).toContain(
-      'CREATE INDEX CONCURRENTLY "User_selectedAvatarFrameID_idx"',
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS "AvatarFrameAsset"');
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS "UserAvatarFrameGrant"');
+    expect(selectedIndexSql).toContain(
+      'CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_selectedAvatarFrameID_idx"',
     );
     expect(sql).toContain(
-      'CREATE UNIQUE INDEX "UserAvatarFrameGrant_idempotencyKey_key"',
+      'CREATE UNIQUE INDEX IF NOT EXISTS "UserAvatarFrameGrant_idempotencyKey_key"',
     );
     expect(sql).toContain('User_selectedAvatarFrameID_fkey');
     expect(sql).toContain('UserAvatarFrameGrant_userID_fkey');
@@ -74,16 +81,44 @@ describe('avatar frame wardrobe persistence contract', () => {
     expect(sql).not.toMatch(/\bDROP\s+(TABLE|COLUMN)\b/i);
   });
 
+  it('makes every committed migration stage safe to resume after interruption', () => {
+    expect(sql).toMatch(
+      /ADD COLUMN IF NOT EXISTS "selectedAvatarFrameID" TEXT/,
+    );
+    expect(sql).toMatch(
+      /ADD COLUMN IF NOT EXISTS "selectedAvatarFrameExpiresAt" TIMESTAMP\(3\)/,
+    );
+    expect(selectedIndexSql).toMatch(
+      /CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_selectedAvatarFrameID_idx"/,
+    );
+    expect(
+      selectedIndexSql
+        .split(';')
+        .filter((statement) => statement.trim().length > 0),
+    ).toHaveLength(1);
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS "AvatarFrameAsset"/);
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS "UserAvatarFrameGrant"/);
+    expect(sql).toMatch(/ON CONFLICT \("key"\) DO NOTHING/);
+    for (const constraint of [
+      'UserAvatarFrameGrant_userID_fkey',
+      'UserAvatarFrameGrant_frameID_fkey',
+      'UserAvatarFrameGrant_operatorUserID_fkey',
+      'UserAvatarFrameGrant_revokedByUserID_fkey',
+      'User_selectedAvatarFrameID_fkey',
+    ]) {
+      expect(sql).toContain(`WHERE conname = '${constraint}'`);
+    }
+  });
+
   it('releases the User DDL lock before backfill and validates its FK separately', () => {
     expect(sql).toMatch(/SET\s+lock_timeout\s*=\s*'[^']+'/i);
 
     const userAlter = sql.indexOf('ALTER TABLE "User"');
     const firstCommit = sql.indexOf('COMMIT;');
-    const concurrentIndex = sql.indexOf(
-      'CREATE INDEX CONCURRENTLY "User_selectedAvatarFrameID_idx"',
-    );
     const nextTransaction = sql.indexOf('BEGIN;', firstCommit);
-    const assetTable = sql.indexOf('CREATE TABLE "AvatarFrameAsset"');
+    const assetTable = sql.indexOf(
+      'CREATE TABLE IF NOT EXISTS "AvatarFrameAsset"',
+    );
     const backfill = sql.indexOf('UPDATE "User" AS u');
     const foreignKey = sql.indexOf(
       'ADD CONSTRAINT "User_selectedAvatarFrameID_fkey"',
@@ -94,8 +129,6 @@ describe('avatar frame wardrobe persistence contract', () => {
     );
 
     expect(firstCommit).toBeGreaterThan(userAlter);
-    expect(concurrentIndex).toBeGreaterThan(firstCommit);
-    expect(concurrentIndex).toBeLessThan(nextTransaction);
     expect(assetTable).toBeGreaterThan(nextTransaction);
     expect(backfill).toBeGreaterThan(firstCommit);
     expect(foreignKey).toBeGreaterThan(firstCommit);

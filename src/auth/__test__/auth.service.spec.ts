@@ -61,6 +61,11 @@ describe('AuthService', () => {
       }),
       update: jest.fn(),
     },
+    fancyNumberLease: {
+      findFirst: jest.fn(() => Promise.resolve(null)),
+    },
+    $executeRaw: jest.fn(() => Promise.resolve(1)),
+    $transaction: jest.fn(async (operation: any) => operation(mockPrisma)),
   };
 
   const mockRefreshTokenService = {
@@ -120,6 +125,7 @@ describe('AuthService', () => {
     users.length = 0;
     jest.clearAllMocks();
     mockPrisma.accountIdentifier.findUnique.mockResolvedValue(null);
+    mockPrisma.fancyNumberLease.findFirst.mockResolvedValue(null);
     mockFancyNumberService.ensureAccountIdChangeAllowed.mockResolvedValue();
     mockAvatarFrameService.resolvePublicAppearances.mockResolvedValue(
       new Map(),
@@ -972,6 +978,29 @@ describe('AuthService', () => {
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
   });
 
+  it('changeAccountId rejects a fancy-number purchase that wins the user lock after the pre-check', async () => {
+    users.push({
+      id: 'uuid-1',
+      accountId: 'alice',
+      email: 'alice@test.dev',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    mockPrisma.fancyNumberLease.findFirst.mockResolvedValueOnce({
+      id: 'lease-created-concurrently',
+    });
+
+    await expect(
+      service.changeAccountId('uuid-1', 'alice_2024'),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'FANCY_NUMBER_ACCOUNT_ID_LOCKED',
+      }),
+    });
+    expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
   it('changeAccountId rejects an id already taken by another user', async () => {
     users.push({
       id: 'uuid-1',
@@ -1035,6 +1064,18 @@ describe('AuthService', () => {
       }),
     );
     expect(result.accountId).toBe('alice_2024');
+    expect(mockPrisma.$transaction).toHaveBeenCalled();
+    expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+    expect(mockPrisma.fancyNumberLease.findFirst).toHaveBeenCalledWith({
+      where: { userID: 'uuid-1', endedAt: null },
+      select: { id: true },
+    });
+    expect(mockPrisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      mockPrisma.fancyNumberLease.findFirst.mock.invocationCallOrder[0],
+    );
+    expect(
+      mockPrisma.fancyNumberLease.findFirst.mock.invocationCallOrder[0],
+    ).toBeLessThan(mockPrisma.user.update.mock.invocationCallOrder[0]);
     // 改 accountId 不应撤销登录态（与改密码不同）
     expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
   });

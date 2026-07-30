@@ -462,6 +462,31 @@ describe('IconService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  it('rejects multiple tiers of the same leveled badge type', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ receivedLikeCount: 1_000 }),
+    );
+
+    await expect(
+      service.updateDisplayIcons('user-1', [
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'TOP_COLLABORATOR',
+          systemVariant: 'TOP_COLLABORATOR_1',
+          sortOrder: 0,
+        } as any,
+        {
+          displayType: 'SYSTEM',
+          systemKey: 'TOP_COLLABORATOR',
+          systemVariant: 'TOP_COLLABORATOR_2',
+          sortOrder: 1,
+        } as any,
+      ]),
+    ).rejects.toThrow('Duplicate icon selection');
+
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   describe('getDisplayIconsForUsers (batch)', () => {
     it('resolves many users with batched queries and no writes', async () => {
       prisma.user.findMany.mockResolvedValue([
@@ -671,6 +696,52 @@ describe('IconService', () => {
     const vip = displayed.filter((icon) => icon.systemKey === 'VIP');
     expect(vip).toHaveLength(1);
     expect(vip[0].systemVariant).toBe('VIP2');
+  });
+
+  it('collapses historical VIP tier selections into one current membership badge', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ vipLevel: 3, iconPreferencesInitialized: true }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([
+      {
+        id: 'display-vip-3',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP3',
+        circleID: null,
+        sortOrder: 0,
+      },
+      {
+        id: 'display-vip-1',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP1',
+        circleID: null,
+        sortOrder: 2,
+      },
+      {
+        id: 'display-vip-2',
+        userID: 'user-1',
+        displayType: 'SYSTEM',
+        systemKey: 'VIP',
+        systemVariant: 'VIP2',
+        circleID: null,
+        sortOrder: 3,
+      },
+    ]);
+
+    const displayed = await service.getDisplayIconsForUser('user-1');
+
+    expect(displayed).toEqual([
+      expect.objectContaining({
+        id: 'system:VIP3',
+        systemKey: 'VIP',
+        systemVariant: 'VIP3',
+        sortOrder: 0,
+      }),
+    ]);
   });
 
   it('retries the display-icon subscription with backoff until Redis accepts it', async () => {

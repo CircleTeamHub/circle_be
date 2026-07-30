@@ -3,17 +3,14 @@ SET lock_timeout = '5s';
 BEGIN;
 
 ALTER TABLE "User"
-  ADD COLUMN "selectedAvatarFrameID" TEXT,
-  ADD COLUMN "selectedAvatarFrameExpiresAt" TIMESTAMP(3);
+  ADD COLUMN IF NOT EXISTS "selectedAvatarFrameID" TEXT,
+  ADD COLUMN IF NOT EXISTS "selectedAvatarFrameExpiresAt" TIMESTAMP(3);
 
 COMMIT;
 
-CREATE INDEX CONCURRENTLY "User_selectedAvatarFrameID_idx"
-  ON "User"("selectedAvatarFrameID");
-
 BEGIN;
 
-CREATE TABLE "AvatarFrameAsset" (
+CREATE TABLE IF NOT EXISTS "AvatarFrameAsset" (
   "id" TEXT NOT NULL,
   "key" TEXT NOT NULL,
   "name" TEXT NOT NULL,
@@ -30,7 +27,7 @@ CREATE TABLE "AvatarFrameAsset" (
     CHECK ("minimumVipLevel" IS NULL OR "minimumVipLevel" BETWEEN 1 AND 4)
 );
 
-CREATE TABLE "UserAvatarFrameGrant" (
+CREATE TABLE IF NOT EXISTS "UserAvatarFrameGrant" (
   "id" TEXT NOT NULL,
   "userID" TEXT NOT NULL,
   "frameID" TEXT NOT NULL,
@@ -47,42 +44,66 @@ CREATE TABLE "UserAvatarFrameGrant" (
   CONSTRAINT "UserAvatarFrameGrant_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "AvatarFrameAsset_key_key"
+CREATE UNIQUE INDEX IF NOT EXISTS "AvatarFrameAsset_key_key"
   ON "AvatarFrameAsset"("key");
-CREATE INDEX "AvatarFrameAsset_isActive_sortOrder_id_idx"
+CREATE INDEX IF NOT EXISTS "AvatarFrameAsset_isActive_sortOrder_id_idx"
   ON "AvatarFrameAsset"("isActive", "sortOrder", "id");
-CREATE UNIQUE INDEX "UserAvatarFrameGrant_idempotencyKey_key"
+CREATE UNIQUE INDEX IF NOT EXISTS "UserAvatarFrameGrant_idempotencyKey_key"
   ON "UserAvatarFrameGrant"("idempotencyKey");
-CREATE INDEX "UserAvatarFrameGrant_user_active_idx"
+CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_user_active_idx"
   ON "UserAvatarFrameGrant"("userID", "revokedAt", "expiresAt");
-CREATE INDEX "UserAvatarFrameGrant_user_createdAt_id_idx"
+CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_user_createdAt_id_idx"
   ON "UserAvatarFrameGrant"("userID", "createdAt", "id");
-CREATE INDEX "UserAvatarFrameGrant_frame_active_idx"
+CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_frame_active_idx"
   ON "UserAvatarFrameGrant"("frameID", "revokedAt", "expiresAt");
-CREATE INDEX "UserAvatarFrameGrant_operatorUserID_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_operatorUserID_createdAt_idx"
   ON "UserAvatarFrameGrant"("operatorUserID", "createdAt");
-CREATE INDEX "UserAvatarFrameGrant_revokedByUserID_revokedAt_idx"
+CREATE INDEX IF NOT EXISTS "UserAvatarFrameGrant_revokedByUserID_revokedAt_idx"
   ON "UserAvatarFrameGrant"("revokedByUserID", "revokedAt");
 
-ALTER TABLE "UserAvatarFrameGrant"
-  ADD CONSTRAINT "UserAvatarFrameGrant_userID_fkey"
-  FOREIGN KEY ("userID") REFERENCES "User"("id")
-  ON DELETE RESTRICT ON UPDATE CASCADE;
-
-ALTER TABLE "UserAvatarFrameGrant"
-  ADD CONSTRAINT "UserAvatarFrameGrant_frameID_fkey"
-  FOREIGN KEY ("frameID") REFERENCES "AvatarFrameAsset"("id")
-  ON DELETE RESTRICT ON UPDATE CASCADE;
-
-ALTER TABLE "UserAvatarFrameGrant"
-  ADD CONSTRAINT "UserAvatarFrameGrant_operatorUserID_fkey"
-  FOREIGN KEY ("operatorUserID") REFERENCES "User"("id")
-  ON DELETE RESTRICT ON UPDATE CASCADE;
-
-ALTER TABLE "UserAvatarFrameGrant"
-  ADD CONSTRAINT "UserAvatarFrameGrant_revokedByUserID_fkey"
-  FOREIGN KEY ("revokedByUserID") REFERENCES "User"("id")
-  ON DELETE RESTRICT ON UPDATE CASCADE;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'UserAvatarFrameGrant_userID_fkey'
+      AND conrelid = '"UserAvatarFrameGrant"'::regclass
+  ) THEN
+    ALTER TABLE "UserAvatarFrameGrant"
+      ADD CONSTRAINT "UserAvatarFrameGrant_userID_fkey"
+      FOREIGN KEY ("userID") REFERENCES "User"("id")
+      ON DELETE RESTRICT ON UPDATE CASCADE;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'UserAvatarFrameGrant_frameID_fkey'
+      AND conrelid = '"UserAvatarFrameGrant"'::regclass
+  ) THEN
+    ALTER TABLE "UserAvatarFrameGrant"
+      ADD CONSTRAINT "UserAvatarFrameGrant_frameID_fkey"
+      FOREIGN KEY ("frameID") REFERENCES "AvatarFrameAsset"("id")
+      ON DELETE RESTRICT ON UPDATE CASCADE;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'UserAvatarFrameGrant_operatorUserID_fkey'
+      AND conrelid = '"UserAvatarFrameGrant"'::regclass
+  ) THEN
+    ALTER TABLE "UserAvatarFrameGrant"
+      ADD CONSTRAINT "UserAvatarFrameGrant_operatorUserID_fkey"
+      FOREIGN KEY ("operatorUserID") REFERENCES "User"("id")
+      ON DELETE RESTRICT ON UPDATE CASCADE;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'UserAvatarFrameGrant_revokedByUserID_fkey'
+      AND conrelid = '"UserAvatarFrameGrant"'::regclass
+  ) THEN
+    ALTER TABLE "UserAvatarFrameGrant"
+      ADD CONSTRAINT "UserAvatarFrameGrant_revokedByUserID_fkey"
+      FOREIGN KEY ("revokedByUserID") REFERENCES "User"("id")
+      ON DELETE RESTRICT ON UPDATE CASCADE;
+  END IF;
+END $$;
 
 COMMIT;
 
@@ -113,18 +134,28 @@ VALUES
     4,
     40,
     CURRENT_TIMESTAMP
-  );
+  )
+ON CONFLICT ("key") DO NOTHING;
 
 -- Install the foreign key without a table scan while holding the brief ALTER
 -- lock. New writes are enforced immediately; historical rows are validated
 -- after the bounded backfill completes.
 BEGIN;
 
-ALTER TABLE "User"
-  ADD CONSTRAINT "User_selectedAvatarFrameID_fkey"
-  FOREIGN KEY ("selectedAvatarFrameID") REFERENCES "AvatarFrameAsset"("id")
-  ON DELETE SET NULL ON UPDATE CASCADE
-  NOT VALID;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'User_selectedAvatarFrameID_fkey'
+      AND conrelid = '"User"'::regclass
+  ) THEN
+    ALTER TABLE "User"
+      ADD CONSTRAINT "User_selectedAvatarFrameID_fkey"
+      FOREIGN KEY ("selectedAvatarFrameID") REFERENCES "AvatarFrameAsset"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE
+      NOT VALID;
+  END IF;
+END $$;
 
 COMMIT;
 

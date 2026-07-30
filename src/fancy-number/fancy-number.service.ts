@@ -23,6 +23,7 @@ import {
   normalizeCustomFancyNumber,
   validateCustomFancyNumber,
 } from './fancy-number.rules';
+import { lockFancyNumberUser } from './fancy-number-user-lock';
 
 const FANCY_NUMBER_UNIT_PRICE = 100;
 const FANCY_NUMBER_RECOMMENDATION_LIMIT = 100;
@@ -355,7 +356,8 @@ export class FancyNumberService {
     });
     await this.expireOverdueLeaseForUser(userId, now);
 
-    const result = await runSerializableTransaction(this.prisma, async (tx) => {
+    const replay = await runSerializableTransaction(this.prisma, async (tx) => {
+      await lockFancyNumberUser(tx, userId);
       const user = await tx.user.findUnique({
         where: { id: userId },
         select: {
@@ -392,22 +394,25 @@ export class FancyNumberService {
           });
         }
         return {
-          orderId: existingOrder.id,
-          accountId: this.displayTargetValue(
-            (
-              await tx.fancyNumber.findUniqueOrThrow({
-                where: { id: existingOrder.fancyNumberID },
-                select: { value: true },
-              })
-            ).value,
-            target,
-          ),
-          expiresAt: existingOrder.newExpiresAt,
-          permanent: existingOrder.newExpiresAt === null,
-          months: existingOrder.months,
-          unitPrice: existingOrder.unitPrice,
-          totalPrice: existingOrder.totalPrice,
-          walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
+          replayed: true,
+          result: {
+            orderId: existingOrder.id,
+            accountId: this.displayTargetValue(
+              (
+                await tx.fancyNumber.findUniqueOrThrow({
+                  where: { id: existingOrder.fancyNumberID },
+                  select: { value: true },
+                })
+              ).value,
+              target,
+            ),
+            expiresAt: existingOrder.newExpiresAt,
+            permanent: existingOrder.newExpiresAt === null,
+            months: existingOrder.months,
+            unitPrice: existingOrder.unitPrice,
+            totalPrice: existingOrder.totalPrice,
+            walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
+          },
         };
       }
 
@@ -557,33 +562,38 @@ export class FancyNumberService {
       }
 
       return {
-        orderId: order.id,
-        accountId: this.displayTargetValue(fancyNumber.value, target),
-        expiresAt: lease.expiresAt,
-        permanent,
-        months: normalizedMonths,
-        unitPrice: FANCY_NUMBER_UNIT_PRICE,
-        totalPrice,
-        walletBalanceAfter,
+        replayed: false,
+        result: {
+          orderId: order.id,
+          accountId: this.displayTargetValue(fancyNumber.value, target),
+          expiresAt: lease.expiresAt,
+          permanent,
+          months: normalizedMonths,
+          unitPrice: FANCY_NUMBER_UNIT_PRICE,
+          totalPrice,
+          walletBalanceAfter,
+        },
       };
     });
 
-    await this.realtime.safeBroadcastAll([
-      ...(result.totalPrice > 0
-        ? [
-            () =>
-              this.realtime.broadcastWalletBalanceChanged(userId, {
-                reason: 'PURCHASE',
-                delta: -result.totalPrice,
-              }),
-          ]
-        : []),
-      async () => {
-        await this.realtime.invalidateUserProfileSummaryCache(userId);
-      },
-      () => this.realtime.broadcastUserProfileSummary(userId),
-    ]);
-    return result;
+    if (!replay.replayed) {
+      await this.realtime.safeBroadcastAll([
+        ...(replay.result.totalPrice > 0
+          ? [
+              () =>
+                this.realtime.broadcastWalletBalanceChanged(userId, {
+                  reason: 'PURCHASE',
+                  delta: -replay.result.totalPrice,
+                }),
+            ]
+          : []),
+        async () => {
+          await this.realtime.invalidateUserProfileSummaryCache(userId);
+        },
+        () => this.realtime.broadcastUserProfileSummary(userId),
+      ]);
+    }
+    return replay.result;
   }
 
   async switchPermanent(
@@ -873,7 +883,7 @@ export class FancyNumberService {
       });
     }
 
-    const result = await runSerializableTransaction(this.prisma, async (tx) => {
+    const replay = await runSerializableTransaction(this.prisma, async (tx) => {
       const lease = await tx.fancyNumberLease.findFirst({
         where: { userID: userId, endedAt: null },
         include: {
@@ -903,14 +913,17 @@ export class FancyNumberService {
           });
         }
         return {
-          orderId: existingOrder.id,
-          accountId: lease.fancyNumber.value,
-          expiresAt: existingOrder.newExpiresAt,
-          permanent: false,
-          months: existingOrder.months,
-          unitPrice: existingOrder.unitPrice,
-          totalPrice: existingOrder.totalPrice,
-          walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
+          replayed: true,
+          result: {
+            orderId: existingOrder.id,
+            accountId: lease.fancyNumber.value,
+            expiresAt: existingOrder.newExpiresAt,
+            permanent: false,
+            months: existingOrder.months,
+            unitPrice: existingOrder.unitPrice,
+            totalPrice: existingOrder.totalPrice,
+            walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
+          },
         };
       }
       if (lease.permanentAt !== null || lease.expiresAt === null) {
@@ -986,25 +999,30 @@ export class FancyNumberService {
       });
 
       return {
-        orderId: order.id,
-        accountId: lease.fancyNumber.value,
-        expiresAt: updatedLease.expiresAt,
-        permanent: false,
-        months,
-        unitPrice: FANCY_NUMBER_UNIT_PRICE,
-        totalPrice,
-        walletBalanceAfter: wallet.balance,
+        replayed: false,
+        result: {
+          orderId: order.id,
+          accountId: lease.fancyNumber.value,
+          expiresAt: updatedLease.expiresAt,
+          permanent: false,
+          months,
+          unitPrice: FANCY_NUMBER_UNIT_PRICE,
+          totalPrice,
+          walletBalanceAfter: wallet.balance,
+        },
       };
     });
 
-    await this.realtime.safeBroadcastAll([
-      () =>
-        this.realtime.broadcastWalletBalanceChanged(userId, {
-          reason: 'PURCHASE',
-          delta: -result.totalPrice,
-        }),
-    ]);
-    return result;
+    if (!replay.replayed) {
+      await this.realtime.safeBroadcastAll([
+        () =>
+          this.realtime.broadcastWalletBalanceChanged(userId, {
+            reason: 'PURCHASE',
+            delta: -replay.result.totalPrice,
+          }),
+      ]);
+    }
+    return replay.result;
   }
 
   async expireLease(leaseId: string, now = new Date()): Promise<boolean> {

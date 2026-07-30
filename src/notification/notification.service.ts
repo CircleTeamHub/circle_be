@@ -255,21 +255,23 @@ export class NotificationService {
       );
     }
 
-    const recipients = await this.prisma.user.findMany({
-      where: { status: UserStatus.ACTIVE },
-      select: { id: true },
-      orderBy: { id: 'asc' },
-    });
-    const recipientIds = [...new Set(recipients.map((user) => user.id))];
-
-    const created: Array<{ id: string; toUserID: string | null }> = [];
-    for (const batch of chunkArray(
-      recipientIds,
-      SYSTEM_ANNOUNCEMENT_BATCH_SIZE,
-    )) {
+    let cursor: string | undefined;
+    let createdThisRun = 0;
+    while (true) {
+      const recipients = await this.prisma.user.findMany({
+        where: {
+          status: UserStatus.ACTIVE,
+          ...(cursor ? { id: { gt: cursor } } : {}),
+        },
+        select: { id: true },
+        orderBy: { id: 'asc' },
+        take: SYSTEM_ANNOUNCEMENT_BATCH_SIZE,
+      });
+      if (recipients.length === 0) break;
+      const recipientIds = recipients.map(({ id }) => id);
       const inserted = await this.prisma.$transaction(async (tx) => {
         const rows = await tx.notification.createManyAndReturn({
-          data: batch.map((toUserID) => ({
+          data: recipientIds.map((toUserID) => ({
             toUserID,
             fromUserID: operatorId,
             type: NotificationType.SYSTEM,
@@ -288,27 +290,29 @@ export class NotificationService {
 
         return rows;
       });
-      created.push(...inserted);
-    }
+      createdThisRun += inserted.length;
+      const createdUserIds = inserted
+        .map(({ toUserID }) => toUserID)
+        .filter((userId): userId is string => typeof userId === 'string');
+      for (const batch of chunkArray(
+        createdUserIds,
+        SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
+      )) {
+        await Promise.allSettled(
+          batch.map((userId) =>
+            this.realtimeService.broadcastSystemNotificationUnread(userId),
+          ),
+        );
+      }
 
-    const createdUserIds = created
-      .map(({ toUserID }) => toUserID)
-      .filter((userId): userId is string => typeof userId === 'string');
-    for (const batch of chunkArray(
-      createdUserIds,
-      SYSTEM_ANNOUNCEMENT_BROADCAST_BATCH_SIZE,
-    )) {
-      await Promise.allSettled(
-        batch.map((userId) =>
-          this.realtimeService.broadcastSystemNotificationUnread(userId),
-        ),
-      );
+      cursor = recipientIds[recipientIds.length - 1];
+      if (recipients.length < SYSTEM_ANNOUNCEMENT_BATCH_SIZE) break;
     }
 
     const createdCount = await this.prisma.notification.count({
       where: { systemAnnouncementID: announcement.id },
     });
-    if (created.length > 0) {
+    if (createdThisRun > 0) {
       try {
         await this.auditService?.record({
           actorID: operatorId,

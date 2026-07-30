@@ -170,6 +170,7 @@ describe('NotificationService', () => {
       where: { status: 'ACTIVE' },
       select: { id: true },
       orderBy: { id: 'asc' },
+      take: 500,
     });
     expect(prisma.notification.createManyAndReturn).toHaveBeenCalledWith({
       data: [
@@ -225,7 +226,11 @@ describe('NotificationService', () => {
       id: 'announcement-1',
       requestFingerprint: 'admin-1:Maintenance',
     });
-    prisma.user.findMany.mockResolvedValue(recipients);
+    prisma.user.findMany
+      .mockResolvedValueOnce(recipients.slice(0, 500))
+      .mockResolvedValueOnce(recipients.slice(500))
+      .mockResolvedValueOnce(recipients.slice(0, 500))
+      .mockResolvedValueOnce(recipients.slice(500));
     prisma.notification.createManyAndReturn
       .mockResolvedValueOnce(
         recipients.slice(0, 500).map(({ id }, index) => ({
@@ -275,6 +280,24 @@ describe('NotificationService', () => {
           systemAnnouncementID: 'announcement-1',
         }),
       ]),
+    });
+    expect(prisma.user.findMany).toHaveBeenNthCalledWith(2, {
+      where: {
+        status: 'ACTIVE',
+        id: { gt: 'user-500' },
+      },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: 500,
+    });
+    expect(prisma.user.findMany).toHaveBeenNthCalledWith(4, {
+      where: {
+        status: 'ACTIVE',
+        id: { gt: 'user-500' },
+      },
+      select: { id: true },
+      orderBy: { id: 'asc' },
+      take: 500,
     });
     expect(prisma.systemAnnouncement.upsert).toHaveBeenNthCalledWith(
       2,

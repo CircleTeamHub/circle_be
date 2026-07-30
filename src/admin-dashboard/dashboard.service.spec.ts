@@ -81,4 +81,41 @@ describe('DashboardService', () => {
       45,
     );
   });
+
+  it('falls back to live metrics when the Redis cache read fails', async () => {
+    redis.getJson.mockRejectedValue(new Error('redis unavailable'));
+    users.getMetrics.mockResolvedValue({ totalUsers: 10 });
+    community.getMetrics.mockResolvedValue({ totalCircles: 3 });
+    commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
+    moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
+    system.getMetrics.mockResolvedValue({ failed: 0 });
+    redis.setJson.mockResolvedValue(true);
+
+    await expect(
+      service.getDashboard(DashboardRange.Today, now),
+    ).resolves.toMatchObject({
+      sections: {
+        users: { status: 'ok', data: { totalUsers: 10 } },
+      },
+    });
+    expect(users.getMetrics).toHaveBeenCalled();
+  });
+
+  it('returns complete live metrics when the Redis cache write fails', async () => {
+    redis.getJson.mockResolvedValue(null);
+    users.getMetrics.mockResolvedValue({ totalUsers: 10 });
+    community.getMetrics.mockResolvedValue({ totalCircles: 3 });
+    commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
+    moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
+    system.getMetrics.mockResolvedValue({ failed: 0 });
+    redis.setJson.mockRejectedValue(new Error('redis unavailable'));
+
+    await expect(
+      service.getDashboard(DashboardRange.Today, now),
+    ).resolves.toMatchObject({
+      sections: {
+        users: { status: 'ok', data: { totalUsers: 10 } },
+      },
+    });
+  });
 });
