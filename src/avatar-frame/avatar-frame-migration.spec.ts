@@ -67,6 +67,7 @@ describe('avatar frame wardrobe persistence contract', () => {
     expect(selectedIndexSql).toContain(
       'CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_selectedAvatarFrameID_idx"',
     );
+    expect(sql).not.toContain('"User_selectedAvatarFrameID_idx"');
     expect(sql).toContain(
       'CREATE UNIQUE INDEX IF NOT EXISTS "UserAvatarFrameGrant_idempotencyKey_key"',
     );

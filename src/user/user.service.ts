@@ -487,7 +487,9 @@ export class UserService {
             user.id,
           ]);
         } catch {
-          this.logger.warn('Avatar-frame appearance lookup failed after user creation');
+          this.logger.warn(
+            'Avatar-frame appearance lookup failed after user creation',
+          );
         }
         return toPublicUser(
           user,
