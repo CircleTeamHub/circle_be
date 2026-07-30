@@ -42,6 +42,17 @@ export class PurchaseFancyNumberDto {
   @Min(1)
   @Max(12)
   months?: number;
+
+  @ApiPropertyOptional({
+    minimum: 0,
+    description:
+      'Unit price displayed to the user. When supplied, stale quotes are rejected before debit.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  expectedUnitPrice?: number;
 }
 
 export class RenewFancyNumberDto {
@@ -51,6 +62,17 @@ export class RenewFancyNumberDto {
   @Min(1)
   @Max(12)
   months: number;
+
+  @ApiPropertyOptional({
+    minimum: 0,
+    description:
+      'Unit price displayed to the user. When supplied, stale quotes are rejected before debit.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  expectedUnitPrice?: number;
 }
 
 export class CheckCustomFancyNumberQueryDto {
@@ -81,7 +103,31 @@ export class PurchaseCustomFancyNumberDto extends PurchaseFancyNumberDto {
   value: string;
 }
 
-export class SwitchCustomFancyNumberDto extends CheckCustomFancyNumberQueryDto {}
+export class SwitchFancyNumberDto {
+  @ApiPropertyOptional({
+    minimum: 0,
+    description:
+      'Unit price displayed to the user. When supplied, stale quotes are rejected before debit.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  expectedUnitPrice?: number;
+}
+
+export class SwitchCustomFancyNumberDto extends CheckCustomFancyNumberQueryDto {
+  @ApiPropertyOptional({
+    minimum: 0,
+    description:
+      'Unit price displayed to the user. When supplied, stale quotes are rejected before debit.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  expectedUnitPrice?: number;
+}
 
 export class BatchCreateFancyNumbersDto {
   @ApiProperty({ type: [String], minItems: 1, maxItems: 100 })

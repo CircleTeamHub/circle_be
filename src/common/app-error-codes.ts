@@ -75,6 +75,7 @@ export const FancyNumberErrorCode = {
   InvalidValue: 'FANCY_NUMBER_INVALID_VALUE',
   ReservedValue: 'FANCY_NUMBER_RESERVED_VALUE',
   InsufficientPoints: 'FANCY_NUMBER_INSUFFICIENT_POINTS',
+  QuoteChanged: 'FANCY_NUMBER_QUOTE_CHANGED',
   InventoryConflict: 'FANCY_NUMBER_INVENTORY_CONFLICT',
   RecommendationLimit: 'FANCY_NUMBER_RECOMMENDATION_LIMIT',
   RecommendationConflict: 'FANCY_NUMBER_RECOMMENDATION_CONFLICT',

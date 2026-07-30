@@ -23,13 +23,20 @@ describe('FancyNumberController', () => {
   it('passes the authenticated user and idempotency key to purchase', async () => {
     service.purchase.mockResolvedValue({ orderId: 'order-1' });
 
-    await controller.purchase('fancy-1', { months: 2 }, ' request-1 ', request);
+    await controller.purchase(
+      'fancy-1',
+      { months: 2, expectedUnitPrice: 100 },
+      ' request-1 ',
+      request,
+    );
 
     expect(service.purchase).toHaveBeenCalledWith(
       'user-1',
       'fancy-1',
       2,
       'request-1',
+      undefined,
+      100,
     );
   });
 
@@ -39,7 +46,7 @@ describe('FancyNumberController', () => {
 
     await controller.checkCustomAvailability({ value: 'AB12C3' }, request);
     await controller.purchaseCustom(
-      { value: 'AB12C3', months: 2 },
+      { value: 'AB12C3', months: 2, expectedUnitPrice: 100 },
       ' custom-request ',
       request,
     );
@@ -53,6 +60,8 @@ describe('FancyNumberController', () => {
       'AB12C3',
       2,
       'custom-request',
+      undefined,
+      100,
     );
   });
 
@@ -66,12 +75,19 @@ describe('FancyNumberController', () => {
   it('passes the authenticated user and idempotency key to permanent-number switching', async () => {
     service.switchPermanent.mockResolvedValue({ orderId: 'order-switch' });
 
-    await controller.switchPermanent('fancy-new', ' switch-request ', request);
+    await controller.switchPermanent(
+      'fancy-new',
+      { expectedUnitPrice: 100 },
+      ' switch-request ',
+      request,
+    );
 
     expect(service.switchPermanent).toHaveBeenCalledWith(
       'user-1',
       'fancy-new',
       'switch-request',
+      undefined,
+      100,
     );
   });
 
@@ -81,7 +97,7 @@ describe('FancyNumberController', () => {
     });
 
     await controller.switchPermanentCustom(
-      { value: 'AB12C3' },
+      { value: 'AB12C3', expectedUnitPrice: 100 },
       ' custom-switch-request ',
       request,
     );
@@ -90,6 +106,8 @@ describe('FancyNumberController', () => {
       'user-1',
       'AB12C3',
       'custom-switch-request',
+      undefined,
+      100,
     );
   });
 });

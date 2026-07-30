@@ -33,6 +33,7 @@ import {
   PurchaseCustomFancyNumberDto,
   RenewFancyNumberDto,
   SwitchCustomFancyNumberDto,
+  SwitchFancyNumberDto,
 } from './dto/fancy-number.dto';
 import { FancyNumberService } from './fancy-number.service';
 
@@ -85,6 +86,8 @@ export class FancyNumberController {
       dto.value,
       dto.months,
       this.requireIdempotencyKey(idempotencyKey),
+      undefined,
+      dto.expectedUnitPrice,
     );
   }
 
@@ -103,6 +106,8 @@ export class FancyNumberController {
       req.user.userId,
       dto.value,
       this.requireIdempotencyKey(idempotencyKey),
+      undefined,
+      dto.expectedUnitPrice,
     );
   }
 
@@ -123,6 +128,8 @@ export class FancyNumberController {
       id,
       dto.months,
       this.requireIdempotencyKey(idempotencyKey),
+      undefined,
+      dto.expectedUnitPrice,
     );
   }
 
@@ -134,6 +141,7 @@ export class FancyNumberController {
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
   switchPermanent(
     @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SwitchFancyNumberDto,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Req() req: RequestWithUser,
   ) {
@@ -141,6 +149,8 @@ export class FancyNumberController {
       req.user.userId,
       id,
       this.requireIdempotencyKey(idempotencyKey),
+      undefined,
+      dto.expectedUnitPrice,
     );
   }
 
@@ -159,6 +169,8 @@ export class FancyNumberController {
       req.user.userId,
       dto.months,
       this.requireIdempotencyKey(idempotencyKey),
+      undefined,
+      dto.expectedUnitPrice,
     );
   }
 

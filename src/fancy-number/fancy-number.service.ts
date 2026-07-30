@@ -308,6 +308,7 @@ export class FancyNumberService {
     months: number | undefined,
     idempotencyKey: string,
     now = new Date(),
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     return this.purchaseTarget(
       userId,
@@ -315,6 +316,7 @@ export class FancyNumberService {
       months,
       idempotencyKey,
       now,
+      expectedUnitPrice,
     );
   }
 
@@ -324,6 +326,7 @@ export class FancyNumberService {
     months: number | undefined,
     idempotencyKey: string,
     now = new Date(),
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     const normalized = this.requireCustomFancyNumber(value);
     return this.purchaseTarget(
@@ -332,6 +335,7 @@ export class FancyNumberService {
       months,
       idempotencyKey,
       now,
+      expectedUnitPrice,
     );
   }
 
@@ -341,6 +345,7 @@ export class FancyNumberService {
     months: number | undefined,
     idempotencyKey: string,
     now: Date,
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     const scopedIdempotencyKey = this.clientIdempotencyKey(
       userId,
@@ -414,6 +419,15 @@ export class FancyNumberService {
             walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
           },
         };
+      }
+      if (
+        expectedUnitPrice !== undefined &&
+        expectedUnitPrice !== FANCY_NUMBER_UNIT_PRICE
+      ) {
+        throw new ConflictException({
+          message: '靓号价格已更新，请刷新后重试',
+          errorCode: FancyNumberErrorCode.QuoteChanged,
+        });
       }
 
       const activeLease = await tx.fancyNumberLease.findFirst({
@@ -601,12 +615,14 @@ export class FancyNumberService {
     fancyNumberId: string,
     idempotencyKey: string,
     now = new Date(),
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     return this.switchPermanentTarget(
       userId,
       { kind: 'inventory', id: fancyNumberId },
       idempotencyKey,
       now,
+      expectedUnitPrice,
     );
   }
 
@@ -615,6 +631,7 @@ export class FancyNumberService {
     value: string,
     idempotencyKey: string,
     now = new Date(),
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     const normalized = this.requireCustomFancyNumber(value);
     return this.switchPermanentTarget(
@@ -622,6 +639,7 @@ export class FancyNumberService {
       { kind: 'custom', value: normalized.storedValue },
       idempotencyKey,
       now,
+      expectedUnitPrice,
     );
   }
 
@@ -630,6 +648,7 @@ export class FancyNumberService {
     target: FancyNumberTarget,
     idempotencyKey: string,
     now: Date,
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     const scopedIdempotencyKey = this.clientIdempotencyKey(
       userId,
@@ -688,6 +707,15 @@ export class FancyNumberService {
               walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
             },
           };
+        }
+        if (
+          expectedUnitPrice !== undefined &&
+          expectedUnitPrice !== FANCY_NUMBER_UNIT_PRICE
+        ) {
+          throw new ConflictException({
+            message: '靓号价格已更新，请刷新后重试',
+            errorCode: FancyNumberErrorCode.QuoteChanged,
+          });
         }
 
         if (
@@ -865,6 +893,7 @@ export class FancyNumberService {
     months: number,
     idempotencyKey: string,
     now = new Date(),
+    expectedUnitPrice?: number,
   ): Promise<FancyNumberPurchaseResult> {
     if (!Number.isInteger(months) || months < 1 || months > 12) {
       throw new BadRequestException({
@@ -925,6 +954,15 @@ export class FancyNumberService {
             walletBalanceAfter: existingOrder.walletBalanceAfter ?? 0,
           },
         };
+      }
+      if (
+        expectedUnitPrice !== undefined &&
+        expectedUnitPrice !== FANCY_NUMBER_UNIT_PRICE
+      ) {
+        throw new ConflictException({
+          message: '靓号价格已更新，请刷新后重试',
+          errorCode: FancyNumberErrorCode.QuoteChanged,
+        });
       }
       if (lease.permanentAt !== null || lease.expiresAt === null) {
         throw new ConflictException({

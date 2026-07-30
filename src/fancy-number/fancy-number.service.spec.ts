@@ -190,6 +190,35 @@ describe('FancyNumberService', () => {
     );
   });
 
+  it('rejects a stale purchase quote before claiming inventory or debiting points', async () => {
+    tx.fancyNumberLease.findFirst.mockResolvedValue(null);
+    tx.user.findUnique.mockResolvedValue({
+      id: 'user-stale-purchase',
+      status: 'ACTIVE',
+      accountId: 'normal01',
+      vipLevel: 0,
+      vipExpiresAt: null,
+    });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.purchase(
+        'user-stale-purchase',
+        'fancy-1',
+        2,
+        'stale-purchase',
+        now,
+        99,
+      ),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'FANCY_NUMBER_QUOTE_CHANGED',
+      }),
+    });
+    expect(tx.fancyNumber.updateMany).not.toHaveBeenCalled();
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+  });
+
   it('does not rebroadcast purchase mutations when replaying an idempotent order', async () => {
     const expiresAt = new Date('2026-03-31T09:15:30.123Z');
     tx.fancyNumberLease.findFirst.mockResolvedValueOnce(null);
@@ -441,6 +470,37 @@ describe('FancyNumberService', () => {
     });
   });
 
+  it('rejects a stale permanent-switch quote before debiting points', async () => {
+    tx.fancyNumberLease.findFirst.mockResolvedValue({
+      id: 'lease-stale-switch',
+      userID: 'user-stale-switch',
+      fancyNumberID: 'fancy-old',
+      restoreAccountId: 'normal01',
+      expiresAt: null,
+      permanentAt: new Date('2026-01-01T00:00:00.000Z'),
+      endedAt: null,
+      user: { accountId: '888888', status: 'ACTIVE' },
+      fancyNumber: { id: 'fancy-old', value: '888888' },
+    });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.switchPermanent(
+        'user-stale-switch',
+        'fancy-new',
+        'stale-switch',
+        now,
+        99,
+      ),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'FANCY_NUMBER_QUOTE_CHANGED',
+      }),
+    });
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+    expect(tx.fancyNumber.updateMany).not.toHaveBeenCalled();
+  });
+
   it('replays a permanent-number switch idempotently without a second debit', async () => {
     tx.fancyNumberLease.findFirst.mockResolvedValue({
       id: 'lease-permanent',
@@ -573,6 +633,29 @@ describe('FancyNumberService', () => {
         idempotencyKey: 'fancy-number:client:user-3:renew-request',
       },
     });
+  });
+
+  it('rejects a stale renewal quote before debiting points', async () => {
+    tx.fancyNumberLease.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        id: 'lease-stale-renewal',
+        userID: 'user-stale-renewal',
+        expiresAt: new Date('2026-03-31T09:15:30.123Z'),
+        permanentAt: null,
+        endedAt: null,
+        fancyNumber: { id: 'fancy-stale-renewal', value: '999999' },
+      });
+    tx.fancyNumberOrder.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.renew('user-stale-renewal', 2, 'stale-renewal', now, 101),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'FANCY_NUMBER_QUOTE_CHANGED',
+      }),
+    });
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
   });
 
   it('does not rebroadcast a wallet debit when replaying an idempotent renewal', async () => {

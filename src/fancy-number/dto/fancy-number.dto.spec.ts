@@ -8,11 +8,16 @@ import {
   PurchaseFancyNumberDto,
   ReorderFancyNumberRecommendationsDto,
   RenewFancyNumberDto,
+  SwitchCustomFancyNumberDto,
+  SwitchFancyNumberDto,
 } from './fancy-number.dto';
 
 describe('fancy number DTOs', () => {
   it.each([1, 12])('accepts purchase month boundary %i', async (months) => {
-    const dto = plainToInstance(PurchaseFancyNumberDto, { months });
+    const dto = plainToInstance(PurchaseFancyNumberDto, {
+      months,
+      expectedUnitPrice: 100,
+    });
     await expect(validate(dto)).resolves.toHaveLength(0);
   });
 
@@ -25,6 +30,31 @@ describe('fancy number DTOs', () => {
     const dto = plainToInstance(RenewFancyNumberDto, { months });
     expect(await validate(dto)).not.toHaveLength(0);
   });
+
+  it.each([-1, 1.5])(
+    'rejects invalid expected unit price %p',
+    async (price) => {
+      const purchase = plainToInstance(PurchaseFancyNumberDto, {
+        months: 1,
+        expectedUnitPrice: price,
+      });
+      const renewal = plainToInstance(RenewFancyNumberDto, {
+        months: 1,
+        expectedUnitPrice: price,
+      });
+      const switchInventory = plainToInstance(SwitchFancyNumberDto, {
+        expectedUnitPrice: price,
+      });
+      const switchCustom = plainToInstance(SwitchCustomFancyNumberDto, {
+        value: 'AB12C3',
+        expectedUnitPrice: price,
+      });
+      expect(await validate(purchase)).not.toHaveLength(0);
+      expect(await validate(renewal)).not.toHaveLength(0);
+      expect(await validate(switchInventory)).not.toHaveLength(0);
+      expect(await validate(switchCustom)).not.toHaveLength(0);
+    },
+  );
 
   it('normalizes and validates a bounded admin inventory batch', async () => {
     const dto = plainToInstance(BatchCreateFancyNumbersDto, {
