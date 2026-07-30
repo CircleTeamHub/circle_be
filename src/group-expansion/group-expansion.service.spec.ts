@@ -92,6 +92,7 @@ describe('GroupExpansionService', () => {
       'circle-1',
       'advanced',
       'request-1',
+      { price: 180, seats: 200 },
       now,
     );
 
@@ -134,11 +135,39 @@ describe('GroupExpansionService', () => {
     );
   });
 
+  it('rejects a stale displayed quote before debiting the wallet', async () => {
+    await expect(
+      service.purchase(
+        'user-1',
+        'circle-1',
+        'advanced',
+        'stale-quote',
+        { price: 100, seats: 200 },
+        now,
+      ),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'GROUP_EXPANSION_QUOTE_CHANGED',
+      }),
+    });
+
+    expect(tx.wallet.upsert).not.toHaveBeenCalled();
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+    expect(tx.circle.update).not.toHaveBeenCalled();
+  });
+
   it('rolls back when the wallet has insufficient points', async () => {
     tx.wallet.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(
-      service.purchase('user-1', 'circle-1', 'advanced', 'request-2', now),
+      service.purchase(
+        'user-1',
+        'circle-1',
+        'advanced',
+        'request-2',
+        undefined,
+        now,
+      ),
     ).rejects.toBeInstanceOf(BadRequestException);
 
     expect(tx.circle.update).not.toHaveBeenCalled();
@@ -149,7 +178,14 @@ describe('GroupExpansionService', () => {
     tx.circle.findFirst.mockResolvedValue(null);
 
     await expect(
-      service.purchase('user-2', 'circle-1', 'light', 'request-3', now),
+      service.purchase(
+        'user-2',
+        'circle-1',
+        'light',
+        'request-3',
+        undefined,
+        now,
+      ),
     ).rejects.toBeInstanceOf(NotFoundException);
 
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
@@ -167,7 +203,14 @@ describe('GroupExpansionService', () => {
     });
 
     await expect(
-      service.purchase('user-1', 'circle-1', 'light', 'request-4', now),
+      service.purchase(
+        'user-1',
+        'circle-1',
+        'light',
+        'request-4',
+        undefined,
+        now,
+      ),
     ).rejects.toBeInstanceOf(ConflictException);
 
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();
@@ -192,6 +235,7 @@ describe('GroupExpansionService', () => {
       'circle-1',
       'light',
       'request-5',
+      undefined,
       now,
     );
 
@@ -201,6 +245,42 @@ describe('GroupExpansionService', () => {
     expect(realtime.safeBroadcastAll).not.toHaveBeenCalled();
   });
 
+  it('replays a committed quoted order even after the catalog quote changes', async () => {
+    const requestFingerprint = JSON.stringify({
+      circleId: 'circle-1',
+      productId: 'light',
+      expectedPrice: 90,
+      expectedSeats: 100,
+    });
+    tx.groupExpansionOrder.findUnique.mockResolvedValue({
+      id: 'order-quoted',
+      requestFingerprint,
+      circleID: 'circle-1',
+      productID: 'light',
+      productName: '轻量扩群卡',
+      seats: 100,
+      price: 90,
+      previousMaxMembers: 200,
+      newMaxMembers: 300,
+      walletBalanceAfter: 910,
+    });
+
+    await expect(
+      service.purchase(
+        'user-1',
+        'circle-1',
+        'light',
+        'quoted-retry',
+        { price: 90, seats: 100 },
+        now,
+      ),
+    ).resolves.toMatchObject({
+      orderId: 'order-quoted',
+      price: 90,
+    });
+    expect(tx.wallet.updateMany).not.toHaveBeenCalled();
+  });
+
   it('rejects reuse of an idempotency key for a different request', async () => {
     tx.groupExpansionOrder.findUnique.mockResolvedValue({
       id: 'order-existing',
@@ -208,7 +288,14 @@ describe('GroupExpansionService', () => {
     });
 
     await expect(
-      service.purchase('user-1', 'circle-1', 'advanced', 'request-5', now),
+      service.purchase(
+        'user-1',
+        'circle-1',
+        'advanced',
+        'request-5',
+        undefined,
+        now,
+      ),
     ).rejects.toBeInstanceOf(ConflictException);
 
     expect(tx.wallet.updateMany).not.toHaveBeenCalled();

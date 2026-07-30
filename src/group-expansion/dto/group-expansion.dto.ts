@@ -1,6 +1,15 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsUUID, Max, Min } from 'class-validator';
+import {
+  IsDefined,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsUUID,
+  Max,
+  Min,
+  ValidateIf,
+} from 'class-validator';
 import {
   GROUP_EXPANSION_PRODUCTS,
   GroupExpansionProductId,
@@ -18,6 +27,27 @@ export class PurchaseGroupExpansionDto {
   @ApiProperty({ enum: GROUP_EXPANSION_PRODUCT_IDS })
   @IsIn(GROUP_EXPANSION_PRODUCT_IDS)
   productId: GroupExpansionProductId;
+
+  @ApiProperty({ required: false, minimum: 1 })
+  @ValidateIf(
+    (dto: PurchaseGroupExpansionDto) =>
+      dto.expectedPrice !== undefined || dto.expectedSeats !== undefined,
+  )
+  @IsDefined()
+  @IsInt()
+  @Min(1)
+  expectedPrice?: number;
+
+  @ApiProperty({ required: false, minimum: 1, maximum: 3000 })
+  @ValidateIf(
+    (dto: PurchaseGroupExpansionDto) =>
+      dto.expectedPrice !== undefined || dto.expectedSeats !== undefined,
+  )
+  @IsDefined()
+  @IsInt()
+  @Min(1)
+  @Max(3000)
+  expectedSeats?: number;
 }
 
 export class GroupExpansionCircleQueryDto {

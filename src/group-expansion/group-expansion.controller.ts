@@ -82,6 +82,12 @@ export class GroupExpansionController {
       dto.circleId,
       dto.productId,
       this.requireIdempotencyKey(idempotencyKey),
+      dto.expectedPrice === undefined
+        ? undefined
+        : {
+            price: dto.expectedPrice,
+            seats: dto.expectedSeats as number,
+          },
     );
   }
 

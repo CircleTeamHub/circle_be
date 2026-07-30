@@ -23,6 +23,8 @@ describe('GroupExpansionController', () => {
       {
         circleId: '54a43f3e-4df0-4d58-bcec-952214502ee4',
         productId: 'light',
+        expectedPrice: 100,
+        expectedSeats: 100,
       },
       ' request-1 ',
       request,
@@ -33,6 +35,7 @@ describe('GroupExpansionController', () => {
       '54a43f3e-4df0-4d58-bcec-952214502ee4',
       'light',
       'request-1',
+      { price: 100, seats: 100 },
     );
   });
 

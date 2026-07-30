@@ -115,6 +115,7 @@ export const GroupExpansionErrorCode = {
   InsufficientPoints: 'GROUP_EXPANSION_INSUFFICIENT_POINTS',
   InvalidIdempotencyKey: 'GROUP_EXPANSION_INVALID_IDEMPOTENCY_KEY',
   IdempotencyConflict: 'GROUP_EXPANSION_IDEMPOTENCY_CONFLICT',
+  QuoteChanged: 'GROUP_EXPANSION_QUOTE_CHANGED',
 } as const;
 
 export const GroupErrorCode = {

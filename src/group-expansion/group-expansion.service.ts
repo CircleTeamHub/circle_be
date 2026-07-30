@@ -198,6 +198,7 @@ export class GroupExpansionService {
     circleId: string,
     productId: GroupExpansionProductId,
     idempotencyKey: string,
+    expectedQuote?: { price: number; seats: number },
     now = new Date(),
   ): Promise<GroupExpansionPurchaseResult> {
     const product = getGroupExpansionProduct(productId);
@@ -209,7 +210,14 @@ export class GroupExpansionService {
     }
 
     const scopedIdempotencyKey = `client:${userId}:${idempotencyKey}`;
-    const requestFingerprint = `${circleId}:${product.id}`;
+    const requestFingerprint = expectedQuote
+      ? JSON.stringify({
+          circleId,
+          productId: product.id,
+          expectedPrice: expectedQuote.price,
+          expectedSeats: expectedQuote.seats,
+        })
+      : `${circleId}:${product.id}`;
 
     let transactionResult: {
       purchase: GroupExpansionPurchaseResult;
@@ -227,6 +235,21 @@ export class GroupExpansionService {
               purchase: this.restorePrior(prior, requestFingerprint),
               created: false,
             };
+          }
+
+          if (
+            expectedQuote &&
+            (expectedQuote.price !== product.price ||
+              expectedQuote.seats !== product.seats)
+          ) {
+            throw new ConflictException({
+              message: '扩容商品价格或名额已更新，请刷新后重试',
+              errorCode: GroupExpansionErrorCode.QuoteChanged,
+              details: {
+                currentPrice: product.price,
+                currentSeats: product.seats,
+              },
+            });
           }
 
           const circle = await tx.circle.findFirst({
