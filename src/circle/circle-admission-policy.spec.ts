@@ -73,23 +73,28 @@ describe('CircleAdmissionPolicy', () => {
     prisma.user.findUnique.mockResolvedValue(user());
   });
 
-  it('gives a regular applicant the gold joined-circle quota while disabled', async () => {
+  it('keeps the joined-circle hard limit at 100 while membership rollout is disabled', async () => {
     programEnabled = false;
     prisma.circleMember.groupBy.mockResolvedValue([
-      { userID: 'candidate-1', _count: { _all: 299 } },
+      { userID: 'candidate-1', _count: { _all: 100 } },
     ]);
 
     await expect(
       policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
-    ).resolves.toEqual(['candidate-1']);
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+      },
+    });
   });
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
-    [4, null, 2000],
+    [1, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [3, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [4, null, 100],
   ])(
     'allows effective level %i at limit - 1 and exposes its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
@@ -104,11 +109,12 @@ describe('CircleAdmissionPolicy', () => {
         policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
       ).resolves.toEqual(['candidate-1']);
 
-      // joinedCircles 计全部 ACTIVE 成员（拥有 + 加入），不再排除 OWNER —— 与建圈路径一致。
+      // Only ACTIVE non-owner memberships consume the joined-circle limit.
       expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
         by: ['userID'],
         where: {
           userID: { in: ['candidate-1'] },
+          role: { not: 'OWNER' },
           status: 'ACTIVE',
         },
         _count: { _all: true },
@@ -118,10 +124,10 @@ describe('CircleAdmissionPolicy', () => {
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
-    [4, null, 2000],
+    [1, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [3, new Date('2026-08-21T00:00:00.000Z'), 100],
+    [4, null, 100],
   ])(
     'denies effective level %i at its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
@@ -136,7 +142,7 @@ describe('CircleAdmissionPolicy', () => {
         policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
       ).rejects.toMatchObject({
         response: {
-          errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
+          errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
           quota: 'joined-circles',
           limit,
           details: { quota: 'joined-circles', limit },
@@ -187,6 +193,43 @@ describe('CircleAdmissionPolicy', () => {
     });
   });
 
+  it('does not count circles owned by the user toward the joined-circle limit', async () => {
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 99 } },
+    ]);
+
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).resolves.toEqual(['candidate-1']);
+
+    expect(prisma.circleMember.groupBy).toHaveBeenCalledWith({
+      by: ['userID'],
+      where: {
+        userID: { in: ['candidate-1'] },
+        role: { not: 'OWNER' },
+        status: 'ACTIVE',
+      },
+      _count: { _all: true },
+    });
+  });
+
+  it('blocks a historical over-limit user from another activation', async () => {
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 101 } },
+    ]);
+
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+      },
+    });
+    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+  });
+
   it('uses effective membership for the final VIP restriction check', async () => {
     prisma.circle.findUnique.mockResolvedValue(
       circle({ joinVipRestriction: 3 }),
@@ -221,7 +264,51 @@ describe('CircleAdmissionPolicy', () => {
     ).rejects.toMatchObject({
       response: { errorCode: 'CIRCLE_JOIN_VIP_REQUIRED' },
     });
-    expect(prisma.circleMember.count).not.toHaveBeenCalled();
+    expect(prisma.circleMember.count).toHaveBeenCalledWith({
+      where: {
+        userID: 'candidate-1',
+        role: { not: 'OWNER' },
+        status: 'ACTIVE',
+      },
+    });
+  });
+
+  it('rejects a new application immediately when the user is already at the hard limit', async () => {
+    prisma.circleMember.count.mockResolvedValue(100);
+
+    await expect(
+      policy.assertCanApply(prisma as any, 'circle-1', 'candidate-1'),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+      },
+    });
+    expect(prisma.circleMember.count).toHaveBeenCalledWith({
+      where: {
+        userID: 'candidate-1',
+        role: { not: 'OWNER' },
+        status: 'ACTIVE',
+      },
+    });
+  });
+
+  it('prioritizes the user join limit when both the user and circle are full', async () => {
+    prisma.circle.findFirst.mockResolvedValue(
+      circle({ maxMembers: 10, memberCount: 10 }),
+    );
+    prisma.circleMember.count.mockResolvedValue(100);
+
+    await expect(
+      policy.assertCanApply(prisma as any, 'circle-1', 'candidate-1'),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+      },
+    });
+    expect(prisma.circleMember.count).toHaveBeenCalled();
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
   });
 
   it.each([

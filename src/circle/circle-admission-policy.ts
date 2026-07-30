@@ -9,10 +9,7 @@ import {
   CircleMemberStatus,
   Prisma,
 } from 'src/generated/prisma';
-import {
-  CircleErrorCode,
-  MembershipErrorCode,
-} from 'src/common/app-error-codes';
+import { CircleErrorCode } from 'src/common/app-error-codes';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipLevel } from 'src/membership/membership.catalog';
 import { reserveCircleSeats } from './circle-capacity';
@@ -22,6 +19,8 @@ import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-statu
 type AdmissionOptions = {
   locksHeld?: boolean;
 };
+
+const CIRCLE_JOIN_LIMIT = 100;
 
 const CIRCLE_ADMISSION_SELECT = {
   id: true,
@@ -99,13 +98,13 @@ export class CircleAdmissionPolicy {
     );
     const now = new Date();
 
-    // joinedCircles 配额 = 用户当前全部 ACTIVE 圈子成员数（拥有 + 加入）。不排除 OWNER：否则
-    // 与建圈路径(circle.service 建圈按全部 ACTIVE 计数)语义不一致,且没有独立的「已创建群」配额时
-    // 拥有的圈子将不计入任何上限、可无限建。两条写路径统一按「全部成员」计。
+    // The join limit applies only to ACTIVE non-owner memberships. Owned
+    // circles are governed by creation policy and never consume this limit.
     const joinedCounts = await tx.circleMember.groupBy({
       by: ['userID'],
       where: {
         userID: { in: activatingUserIDs },
+        role: { not: CircleMemberRole.OWNER },
         status: CircleMemberStatus.ACTIVE,
       },
       _count: { _all: true },
@@ -131,14 +130,16 @@ export class CircleAdmissionPolicy {
         program,
         now,
       );
-      const limit = effective.tier.quotas.joinedCircles.actual;
-      if ((joinedCountByUserID.get(userID) ?? 0) >= limit) {
+      if ((joinedCountByUserID.get(userID) ?? 0) >= CIRCLE_JOIN_LIMIT) {
         throw new ForbiddenException({
           message: 'Joined circle membership quota reached',
-          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
+          errorCode: CircleErrorCode.JoinLimitReached,
           quota: 'joined-circles',
-          limit,
-          details: { quota: 'joined-circles', limit },
+          limit: CIRCLE_JOIN_LIMIT,
+          details: {
+            quota: 'joined-circles',
+            limit: CIRCLE_JOIN_LIMIT,
+          },
         });
       }
       this.assertRestrictions(
@@ -258,6 +259,27 @@ export class CircleAdmissionPolicy {
       select: CIRCLE_ADMISSION_SELECT,
     });
     if (!circle) this.throwCircleNotFound();
+
+    const joinedCount = await tx.circleMember.count({
+      where: {
+        userID,
+        role: { not: CircleMemberRole.OWNER },
+        status: CircleMemberStatus.ACTIVE,
+      },
+    });
+    if (joinedCount >= CIRCLE_JOIN_LIMIT) {
+      throw new ForbiddenException({
+        message: 'Joined circle membership quota reached',
+        errorCode: CircleErrorCode.JoinLimitReached,
+        quota: 'joined-circles',
+        limit: CIRCLE_JOIN_LIMIT,
+        details: {
+          quota: 'joined-circles',
+          limit: CIRCLE_JOIN_LIMIT,
+        },
+      });
+    }
+
     if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
       throw new BadRequestException({
         message: 'Circle has reached its member limit',

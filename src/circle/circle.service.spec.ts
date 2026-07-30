@@ -584,34 +584,19 @@ describe('CircleService', () => {
     expect(prisma.circle.create).not.toHaveBeenCalled();
   });
 
-  it('rejects circle creation when the creator is at their joined-circle quota', async () => {
+  it('does not count owned circles toward the joined-circle hard limit', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 1,
       vipExpiresAt: null,
     });
-    // 白银 joinedCircles = 200；已达上限（含拥有的圈子一起计数）→ 建圈应被拒，否则可无限建。
+    // Even a legacy count above 100 cannot block an OWNER membership.
     prisma.circleMember.count.mockResolvedValue(200);
-
-    await expect(
-      service.createCircle('user-1', validCircle()),
-    ).rejects.toMatchObject({
-      response: { errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED' },
-    });
-    expect(prisma.circle.create).not.toHaveBeenCalled();
-    expect(prisma.circleMember.create).not.toHaveBeenCalled();
-  });
-
-  it('allows circle creation when the creator is one below their joined-circle quota', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-    });
-    prisma.circleMember.count.mockResolvedValue(199);
     prisma.circle.create.mockResolvedValue(circleRecord(200));
 
     await service.createCircle('user-1', validCircle());
 
     expect(prisma.circle.create).toHaveBeenCalled();
+    expect(prisma.circleMember.count).not.toHaveBeenCalled();
   });
 
   it('stores legacy joinVipRestriction zero as no restriction', async () => {

@@ -666,7 +666,7 @@ describe('GroupService reportGroup', () => {
     prisma.circleMember.findMany.mockResolvedValue([]);
     admissionPolicy.activateMembers.mockRejectedValueOnce(
       new ForbiddenException({
-        errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
       }),
     );
 

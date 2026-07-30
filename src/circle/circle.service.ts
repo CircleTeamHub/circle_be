@@ -116,23 +116,6 @@ export class CircleService {
         });
       }
 
-      // 建圈本身占用「已加入圈子」配额（写一条 ACTIVE OWNER 成员行）。在上面的 per-user 锁下统计
-      // 现有全部 ACTIVE 成员数，达到有效档位上限即拒绝，否则用户可无限建圈绕过配额（admission
-      // 路径已校验，create 路径此前漏了）。
-      const activeMemberships = await tx.circleMember.count({
-        where: { userID: userId, status: 'ACTIVE' },
-      });
-      const joinedLimit = policy.tier.quotas.joinedCircles.actual;
-      if (activeMemberships >= joinedLimit) {
-        throw new ForbiddenException({
-          message: 'Joined circle membership quota reached',
-          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
-          quota: 'joined-circles',
-          limit: joinedLimit,
-          details: { quota: 'joined-circles', limit: joinedLimit },
-        });
-      }
-
       const capacity = policy.tier.quotas.groupMembers.actual;
       const maxMembers = dto.maxMembers ?? capacity;
       if (maxMembers > capacity) {

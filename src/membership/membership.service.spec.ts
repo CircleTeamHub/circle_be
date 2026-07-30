@@ -33,7 +33,7 @@ describe('MembershipService', () => {
         recommended: false,
         quotas: {
           groupMembers: { actual: 200, display: '200' },
-          joinedCircles: { actual: 200, display: '200' },
+          joinedCircles: { actual: 100, display: '100' },
           notes: { actual: 100, display: '100' },
           cityFilters: { actual: 2, display: '2' },
         },
@@ -56,7 +56,7 @@ describe('MembershipService', () => {
         recommended: false,
         quotas: {
           groupMembers: { actual: 400, display: '400' },
-          joinedCircles: { actual: 300, display: '300' },
+          joinedCircles: { actual: 100, display: '100' },
           notes: { actual: 500, display: '500' },
           cityFilters: { actual: 10, display: '10' },
         },
@@ -79,7 +79,7 @@ describe('MembershipService', () => {
         recommended: true,
         quotas: {
           groupMembers: { actual: 1000, display: '1000' },
-          joinedCircles: { actual: 1000, display: '1000' },
+          joinedCircles: { actual: 100, display: '100' },
           notes: { actual: 1000, display: '1000' },
           cityFilters: { actual: 50, display: '50' },
         },
@@ -102,7 +102,7 @@ describe('MembershipService', () => {
         recommended: false,
         quotas: {
           groupMembers: { actual: 3000, display: '3000' },
-          joinedCircles: { actual: 2000, display: 'unlimited' },
+          joinedCircles: { actual: 100, display: '100' },
           notes: { actual: 3000, display: '3000' },
           cityFilters: { actual: 1000, display: 'unlimited' },
         },
@@ -196,7 +196,7 @@ describe('MembershipService', () => {
       vipExpiresAt: expiresAt,
       lifetime: false,
       active: true,
-      quotas: { joinedCircles: { actual: 1000, display: '1000' } },
+      quotas: { joinedCircles: { actual: 100, display: '100' } },
       appearance: { nameColor: 'rainbow', badge: 'diamond' },
       benefits: {
         fancyNumberVoucher: null,
