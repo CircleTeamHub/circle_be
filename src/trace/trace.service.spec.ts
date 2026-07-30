@@ -1123,6 +1123,21 @@ describe('TraceService', () => {
     expect(realtimeService.broadcastNotificationCreated).not.toHaveBeenCalled();
   });
   describe('moments feed poke (#89)', () => {
+    it('does not commit a moment when its appearance projection cannot be resolved', async () => {
+      avatarFrames.resolvePublicAppearances.mockRejectedValue(
+        new Error('database unavailable'),
+      );
+
+      await expect(
+        service.createTrace('user-1', { content: 'hi' } as never),
+      ).rejects.toThrow('database unavailable');
+
+      expect(prisma.trace.create).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastMomentsFeedUpdated,
+      ).not.toHaveBeenCalled();
+    });
+
     it('pokes the author and accepted friends on create (FRIENDS_ONLY)', async () => {
       prisma.trace.create.mockResolvedValue({
         id: 'trace-1',

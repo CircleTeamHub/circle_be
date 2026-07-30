@@ -1,4 +1,5 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, HttpStatus } from '@nestjs/common';
+import { HTTP_CODE_METADATA } from '@nestjs/common/constants';
 import { FancyNumberController } from './fancy-number.controller';
 import { FancyNumberService } from './fancy-number.service';
 
@@ -19,6 +20,21 @@ describe('FancyNumberController', () => {
   const request = { user: { userId: 'user-1' } } as never;
 
   beforeEach(() => jest.clearAllMocks());
+
+  it.each([
+    'purchaseCustom',
+    'switchPermanentCustom',
+    'purchase',
+    'switchPermanent',
+    'renew',
+  ] as const)('returns HTTP 200 from %s', (methodName) => {
+    expect(
+      Reflect.getMetadata(
+        HTTP_CODE_METADATA,
+        FancyNumberController.prototype[methodName],
+      ),
+    ).toBe(HttpStatus.OK);
+  });
 
   it('passes the authenticated user and idempotency key to purchase', async () => {
     service.purchase.mockResolvedValue({ orderId: 'order-1' });

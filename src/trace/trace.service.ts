@@ -335,6 +335,12 @@ export class TraceService {
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
     assertUrlsFromStorage(dto.images ?? [], this.minioPublicUrl, 'trace image');
 
+    // Resolve this fallible projection before the non-idempotent write. If the
+    // lookup fails, the client can safely retry without creating a duplicate.
+    const appearances = await this.avatarFrames.resolvePublicAppearances([
+      userId,
+    ]);
+
     const trace = await this.prisma.trace.create({
       data: {
         content: dto.content,
@@ -359,10 +365,6 @@ export class TraceService {
     // #89：发布即向可见范围广播 feed poke，客户端由 30s 轮询改为事件驱动。
     // fire-and-forget —— 广播失败绝不能反过来让发布报错。
     this.queueFeedPoke(userId, trace.visibility !== 'PRIVATE');
-
-    const appearances = await this.avatarFrames.resolvePublicAppearances([
-      trace.from.id,
-    ]);
 
     return {
       id: trace.id,

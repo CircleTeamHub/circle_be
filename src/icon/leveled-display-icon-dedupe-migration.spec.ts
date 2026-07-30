@@ -20,6 +20,9 @@ describe('leveled display icon dedupe migration', () => {
     expect(sql).toMatch(/DELETE FROM\s+"UserDisplayIcon"/i);
     expect(sql).toMatch(/ranked\."rowNumber"\s*>\s*1/i);
     expect(sql).toMatch(
+      /BEGIN;[\s\S]*?LOCK TABLE\s+"UserDisplayIcon"\s+IN SHARE ROW EXCLUSIVE MODE;[\s\S]*?DELETE FROM\s+"UserDisplayIcon"[\s\S]*?CREATE UNIQUE INDEX[\s\S]*?COMMIT;/i,
+    );
+    expect(sql).toMatch(
       /CREATE UNIQUE INDEX[\s\S]*?\("userID",\s*"systemKey"\)[\s\S]*?WHERE[\s\S]*?"systemKey"\s+IN\s*\(\s*'VIP',\s*'TOP_COLLABORATOR'\s*\)/i,
     );
   });

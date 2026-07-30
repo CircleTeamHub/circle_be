@@ -285,7 +285,7 @@ describe('FancyNumberService', () => {
     const result = await service.purchase(
       'super-1',
       'fancy-2',
-      undefined,
+      1,
       'request-2',
       now,
     );
@@ -315,6 +315,41 @@ describe('FancyNumberService', () => {
         fancyNumberPermanent: true,
       },
     });
+    expect(tx.fancyNumberOrder.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          requestFingerprint: JSON.stringify({
+            operation: 'purchase',
+            userId: 'super-1',
+            fancyNumberId: 'fancy-2',
+            months: null,
+          }),
+        }),
+      }),
+    );
+
+    tx.fancyNumberOrder.findUnique.mockResolvedValue({
+      id: 'order-2',
+      idempotencyKey: 'fancy-number:client:super-1:request-2',
+      requestFingerprint: JSON.stringify({
+        operation: 'purchase',
+        userId: 'super-1',
+        fancyNumberId: 'fancy-2',
+        months: null,
+      }),
+      fancyNumberID: 'fancy-2',
+      newExpiresAt: null,
+      months: null,
+      unitPrice: 100,
+      totalPrice: 0,
+      walletBalanceAfter: 40,
+    });
+    tx.fancyNumber.findUniqueOrThrow.mockResolvedValue({ value: '666666' });
+
+    await expect(
+      service.purchase('super-1', 'fancy-2', undefined, 'request-2', now),
+    ).resolves.toEqual(result);
+    expect(tx.fancyNumberOrder.create).toHaveBeenCalledTimes(1);
   });
 
   it('creates and buys a custom fancy number only inside the purchase transaction', async () => {

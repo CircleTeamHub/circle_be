@@ -351,14 +351,6 @@ export class FancyNumberService {
       userId,
       idempotencyKey,
     );
-    const requestFingerprint = JSON.stringify({
-      operation: target.kind === 'custom' ? 'custom-purchase' : 'purchase',
-      userId,
-      ...(target.kind === 'custom'
-        ? { value: target.value }
-        : { fancyNumberId: target.id }),
-      months: months ?? null,
-    });
     await this.expireOverdueLeaseForUser(userId, now);
 
     const replay = await runSerializableTransaction(this.prisma, async (tx) => {
@@ -387,6 +379,14 @@ export class FancyNumberService {
         });
       }
       const normalizedMonths = permanent ? null : (months as number);
+      const requestFingerprint = JSON.stringify({
+        operation: target.kind === 'custom' ? 'custom-purchase' : 'purchase',
+        userId,
+        ...(target.kind === 'custom'
+          ? { value: target.value }
+          : { fancyNumberId: target.id }),
+        months: normalizedMonths,
+      });
 
       const existingOrder = await tx.fancyNumberOrder.findUnique({
         where: { idempotencyKey: scopedIdempotencyKey },

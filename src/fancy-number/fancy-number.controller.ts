@@ -4,6 +4,8 @@ import {
   Controller,
   Get,
   Headers,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseUUIDPipe,
   Post,
@@ -76,6 +78,7 @@ export class FancyNumberController {
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiOperation({ summary: 'Purchase a custom six-character fancy number' })
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
+  @HttpCode(HttpStatus.OK)
   purchaseCustom(
     @Body() dto: PurchaseCustomFancyNumberDto,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -97,6 +100,7 @@ export class FancyNumberController {
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiOperation({ summary: 'Switch to a custom permanent fancy number' })
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
+  @HttpCode(HttpStatus.OK)
   switchPermanentCustom(
     @Body() dto: SwitchCustomFancyNumberDto,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -117,6 +121,7 @@ export class FancyNumberController {
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiOperation({ summary: 'Purchase a fancy number' })
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
+  @HttpCode(HttpStatus.OK)
   purchase(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: PurchaseFancyNumberDto,
@@ -139,6 +144,7 @@ export class FancyNumberController {
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiOperation({ summary: 'Switch my permanent fancy number for 100 points' })
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
+  @HttpCode(HttpStatus.OK)
   switchPermanent(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SwitchFancyNumberDto,
@@ -160,6 +166,7 @@ export class FancyNumberController {
   @ApiHeader({ name: 'Idempotency-Key', required: true })
   @ApiOperation({ summary: 'Renew my active fancy number' })
   @ApiOkResponse({ type: FancyNumberPurchaseResultDto })
+  @HttpCode(HttpStatus.OK)
   renew(
     @Body() dto: RenewFancyNumberDto,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
