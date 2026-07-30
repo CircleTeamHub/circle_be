@@ -32,6 +32,10 @@ const migrationPath = join(
   __dirname,
   '../prisma/migrations/20260729120000_avatar_frame_wardrobe/migration.sql',
 );
+const selectedIndexMigrationPath = join(
+  __dirname,
+  '../prisma/migrations/20260729120500_avatar_frame_selected_index/migration.sql',
+);
 
 describePostgres('avatar frame migration PostgreSQL integration', () => {
   const schemaName = `avatar_frame_migration_test_${randomUUID().replace(
@@ -67,6 +71,14 @@ describePostgres('avatar frame migration PostgreSQL integration', () => {
     );
 
     await client.query(readFileSync(migrationPath, 'utf8'));
+    const selectedIndexSql = readFileSync(
+      selectedIndexMigrationPath,
+      'utf8',
+    ).replace(
+      'ON "User"("selectedAvatarFrameID")',
+      `ON "${schemaName}"."User"("selectedAvatarFrameID")`,
+    );
+    await client.query(selectedIndexSql);
   });
 
   afterAll(async () => {
