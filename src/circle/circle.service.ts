@@ -21,6 +21,7 @@ import {
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CIRCLE_CREATE_LIMIT } from './circle-limits';
 import { CircleMemberLockService } from './circle-member-lock';
 import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
@@ -113,6 +114,21 @@ export class CircleService {
         throw new ForbiddenException({
           message: 'Membership is required to create a circle',
           errorCode: CircleErrorCode.VipRequired,
+        });
+      }
+
+      // 建圈写的是 OWNER 成员行，不占「已加入圈子」额度，所以必须有独立上限：
+      // 否则任何有效会员都能无限建圈，而每个圈子还会连带创建一个 OpenIM 群。
+      // 在上面的 per-user 锁下统计，并发建圈不会越过上限。
+      const ownedCircles = await tx.circle.count({
+        where: { ownerID: userId, deleted: false },
+      });
+      if (ownedCircles >= CIRCLE_CREATE_LIMIT) {
+        throw new ForbiddenException({
+          message: 'Created circle limit reached',
+          errorCode: CircleErrorCode.CreateLimitReached,
+          limit: CIRCLE_CREATE_LIMIT,
+          details: { limit: CIRCLE_CREATE_LIMIT },
         });
       }
 

@@ -44,11 +44,18 @@ const level = program.enabled
 
 | 拦截路径 | 抛出位置 | 错误码 |
 |----------|----------|--------|
-| 建圈 / 入圈配额 | `circle.service.ts:126`、`circle-admission-policy.ts:131` | `MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED` |
+| 建圈上限 | `circle.service.ts`(`CIRCLE_CREATE_LIMIT`) | `CIRCLE_CREATE_LIMIT_REACHED` |
+| 入圈上限 · 本人申请 | `circle-admission-policy.ts`(`throwJoinLimitReached('self')`) | `CIRCLE_JOIN_LIMIT_REACHED` |
+| 入圈上限 · 邀请 / 审批他人 | `circle-admission-policy.ts`(`throwJoinLimitReached('third-party')`) | `CIRCLE_TARGET_JOIN_LIMIT_REACHED` |
 | 建圈时申报的容量 | `circle.service.ts:141` | `MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED` |
 | 圈子成员容量 | `circle-admission-policy.ts:179,248` | `CIRCLE_MEMBER_LIMIT` |
 | 广场城市筛选 | `circle-plaza.service.ts:486` | `CITY_FILTER_QUOTA_REACHED` |
 | 笔记存储 | `note.service.ts:400`(`assertNoteStorageAvailable`) | `NOTE_STORAGE_QUOTA_REACHED` |
+
+上表前三行的两条圈子数量上限**与会员档位无关** —— 所有档位同为「最多建 20 个、最多加入
+100 个」,定义在 `circle/circle-limits.ts`,不读 `MEMBERSHIP_CATALOG`。目录里的
+`joinedCircles` 只供会员中心展示,`circle-limits.spec.ts` 断言两者数值一致,避免宣传口径与
+执行口径漂移。
 
 其中「建圈时申报的容量」容易被漏掉:`CircleService.create` 校验的是**请求里申报的
 `maxMembers`**(`maxMembers > quotas.groupMembers.actual` 即拒),不是已有成员数。因此在

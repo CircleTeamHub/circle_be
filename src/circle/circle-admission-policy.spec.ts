@@ -293,6 +293,59 @@ describe('CircleAdmissionPolicy', () => {
     });
   });
 
+  // 用 toHaveProperty(key, value)（深相等）而不是 toMatchObject（递归部分匹配）：
+  // 这条契约的全部意义就是「不多带任何字段」，放过多余字段等于没测。
+  const TARGET_LIMIT_RESPONSE = {
+    message: 'Target user has reached the joined circle limit',
+    errorCode: 'CIRCLE_TARGET_JOIN_LIMIT_REACHED',
+  };
+
+  it('hides the invitee join limit from the inviter', async () => {
+    prisma.circleMember.count.mockResolvedValue(100);
+
+    // 邀请路径下这个错误回给邀请人，不能泄露被邀请人的额度状态。
+    // 也不是 INVITATION_NOT_ALLOWED：那个码既有语义是「对方隐私设置不接受
+    // 邀请」，拿来表达配额会让邀请人读到一句与事实不符的提示。
+    await expect(
+      policy.assertCanApply(prisma as any, 'circle-1', 'candidate-1', {
+        actor: 'third-party',
+      }),
+    ).rejects.toHaveProperty('response', TARGET_LIMIT_RESPONSE);
+  });
+
+  it('hides the applicant join limit from an approver', async () => {
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 100 } },
+    ]);
+
+    // 审批路径：受限的是申请人，错误却回给圈主 / 担保成员。
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1'], {
+        actor: 'third-party',
+      }),
+    ).rejects.toHaveProperty('response', TARGET_LIMIT_RESPONSE);
+
+    expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
+    expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
+  });
+
+  it('keeps the detailed join limit error when the applicant acts for themselves', async () => {
+    prisma.circleMember.groupBy.mockResolvedValue([
+      { userID: 'candidate-1', _count: { _all: 100 } },
+    ]);
+
+    // 默认视角不变：本人自助路径仍然拿到可执行的数值。
+    await expect(
+      policy.activateMembers(prisma as any, 'circle-1', ['candidate-1']),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+        details: { quota: 'joined-circles', limit: 100 },
+      },
+    });
+  });
+
   it('prioritizes the user join limit when both the user and circle are full', async () => {
     prisma.circle.findFirst.mockResolvedValue(
       circle({ maxMembers: 10, memberCount: 10 }),

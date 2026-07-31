@@ -96,11 +96,13 @@ export class GroupService {
       if (invitableUserIDs.length === 0) return;
 
       await this.assertInviteTargetsAllowInvites(tx, actorId, invitableUserIDs);
+      // invitableUserIDs 是被 actorId 拉进群的其他人：加入上限被触发时错误回给
+      // actorId，不能带上别人的额度细节。
       const activatingUserIDs = await this.admissionPolicy.activateMembers(
         tx,
         circle.id,
         invitableUserIDs,
-        { locksHeld: true },
+        { locksHeld: true, actor: 'third-party' },
       );
       if (activatingUserIDs.length === 0) {
         return;
