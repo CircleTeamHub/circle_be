@@ -177,7 +177,14 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       createUser('quota-owner'),
       createUser('quota-candidate'),
     ]);
-    const joinedCircleIDs = Array.from({ length: 99 }, () => randomUUID());
+    await prisma.user.update({
+      where: { id: candidate.id },
+      data: {
+        vipLevel: 2,
+        vipExpiresAt: new Date('2099-01-01T00:00:00.000Z'),
+      },
+    });
+    const joinedCircleIDs = Array.from({ length: 299 }, () => randomUUID());
     const targetCircleIDs = [randomUUID(), randomUUID()];
     await prisma.circle.createMany({
       data: [...joinedCircleIDs, ...targetCircleIDs].map((id, index) => ({
@@ -226,7 +233,7 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     expect(rejected?.reason).toMatchObject({
       response: {
         errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
-        limit: 100,
+        limit: 300,
       },
     });
     await expect(
@@ -237,7 +244,7 @@ describePostgres('Circle membership transition concurrency e2e', () => {
           status: CircleMemberStatus.ACTIVE,
         },
       }),
-    ).resolves.toBe(100);
+    ).resolves.toBe(300);
     await Promise.all(targetCircleIDs.map(expectCounterConsistent));
   });
 
