@@ -44,7 +44,6 @@ export const MembershipErrorCode = {
   // review 修复：幂等键归属/参数不符（跨用户复用、跨等级复用）
   IdempotencyKeyReused: 'MEMBERSHIP_IDEMPOTENCY_KEY_REUSED',
   GroupMemberCapacityExceeded: 'MEMBERSHIP_GROUP_MEMBER_CAPACITY_EXCEEDED',
-  JoinedCircleQuotaReached: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
 } as const;
 
 export const AvatarFrameErrorCode = {
@@ -86,8 +85,15 @@ export const FancyNumberErrorCode = {
 
 export const CircleErrorCode = {
   MemberLimit: 'CIRCLE_MEMBER_LIMIT',
-  // 已发布给客户端的兼容代码；当前新流程使用会员配额错误码。
+  // 用户已加满 CIRCLE_JOIN_LIMIT 个 ACTIVE 非 OWNER 圈子。与会员档位无关，
+  // 所有档位同一上限，因此不再复用会员配额错误码。
   JoinLimitReached: 'CIRCLE_JOIN_LIMIT_REACHED',
+  // 同一条上限，但受限的是别人（邀请人邀请他人、圈主审批他人申请）：错误回给
+  // 操作者，所以不带 limit / quota / details，客户端文案也另写一句。
+  TargetJoinLimitReached: 'CIRCLE_TARGET_JOIN_LIMIT_REACHED',
+  // 用户已建满 CIRCLE_CREATE_LIMIT 个圈子。建圈不占加入额度，故需独立上限，
+  // 否则建圈路径无界（每个圈子还会连带创建一个 OpenIM 群）。
+  CreateLimitReached: 'CIRCLE_CREATE_LIMIT_REACHED',
   AlreadyMember: 'CIRCLE_ALREADY_MEMBER',
   RequestPending: 'CIRCLE_REQUEST_PENDING',
   VipRequired: 'CIRCLE_VIP_REQUIRED',

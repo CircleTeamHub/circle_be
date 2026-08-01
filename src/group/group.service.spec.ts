@@ -500,7 +500,7 @@ describe('GroupService reportGroup', () => {
       prisma,
       'circle-1',
       ['new-user', 'existing-pending'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
   });
 
@@ -555,7 +555,7 @@ describe('GroupService reportGroup', () => {
       prisma,
       'circle-1',
       ['new-user'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
   });
 
@@ -646,7 +646,7 @@ describe('GroupService reportGroup', () => {
       prisma,
       'circle-1',
       ['a', 'b'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
     expect(prisma.$queryRaw).not.toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
@@ -666,7 +666,8 @@ describe('GroupService reportGroup', () => {
     prisma.circleMember.findMany.mockResolvedValue([]);
     admissionPolicy.activateMembers.mockRejectedValueOnce(
       new ForbiddenException({
-        errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED',
+        // 这条路径以第三方视角调用，真实策略回的是不带额度细节的 target 码。
+        errorCode: 'CIRCLE_TARGET_JOIN_LIMIT_REACHED',
       }),
     );
 
@@ -680,7 +681,7 @@ describe('GroupService reportGroup', () => {
       prisma,
       'circle-1',
       ['allowed-user', 'over-quota-user'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
     expect(prisma.circleMember.createMany).not.toHaveBeenCalled();
     expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
@@ -792,7 +793,7 @@ describe('GroupService reportGroup', () => {
       prisma,
       'circle-1',
       targetUserIDs,
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
   });
 

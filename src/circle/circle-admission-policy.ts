@@ -9,17 +9,26 @@ import {
   CircleMemberStatus,
   Prisma,
 } from 'src/generated/prisma';
-import {
-  CircleErrorCode,
-  MembershipErrorCode,
-} from 'src/common/app-error-codes';
+import { CircleErrorCode } from 'src/common/app-error-codes';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipLevel } from 'src/membership/membership.catalog';
 import { reserveCircleSeats } from './circle-capacity';
+import { CIRCLE_JOIN_LIMIT } from './circle-limits';
 import { CircleMemberLockService } from './circle-member-lock';
 import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-status';
 
-type AdmissionOptions = {
+type JoinLimitAudience = {
+  /**
+   * 加入上限被触发时，这个错误最终会被谁读到 —— 决定回哪个错误码：
+   * - `self`：被限制的用户本人（自助申请加入），可以直接告知自己的上限数值；
+   * - `third-party`：邀请人或审批人。受限的是别人，所以既不能带 limit /
+   *   quota / details（他人的额度状态不外泄），客户端也需要一句写给操作者
+   *   而不是写给申请人的文案。
+   */
+  actor?: 'self' | 'third-party';
+};
+
+type AdmissionOptions = JoinLimitAudience & {
   locksHeld?: boolean;
 };
 
@@ -99,13 +108,13 @@ export class CircleAdmissionPolicy {
     );
     const now = new Date();
 
-    // joinedCircles 配额 = 用户当前全部 ACTIVE 圈子成员数（拥有 + 加入）。不排除 OWNER：否则
-    // 与建圈路径(circle.service 建圈按全部 ACTIVE 计数)语义不一致,且没有独立的「已创建群」配额时
-    // 拥有的圈子将不计入任何上限、可无限建。两条写路径统一按「全部成员」计。
+    // The join limit applies only to ACTIVE non-owner memberships. Owned
+    // circles are governed by creation policy and never consume this limit.
     const joinedCounts = await tx.circleMember.groupBy({
       by: ['userID'],
       where: {
         userID: { in: activatingUserIDs },
+        role: { not: CircleMemberRole.OWNER },
         status: CircleMemberStatus.ACTIVE,
       },
       _count: { _all: true },
@@ -131,15 +140,10 @@ export class CircleAdmissionPolicy {
         program,
         now,
       );
-      const limit = effective.tier.quotas.joinedCircles.actual;
-      if ((joinedCountByUserID.get(userID) ?? 0) >= limit) {
-        throw new ForbiddenException({
-          message: 'Joined circle membership quota reached',
-          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
-          quota: 'joined-circles',
-          limit,
-          details: { quota: 'joined-circles', limit },
-        });
+      if ((joinedCountByUserID.get(userID) ?? 0) >= CIRCLE_JOIN_LIMIT) {
+        // 所有调用点（审批通过、管理员放行、圈内邀请入群）里被激活的都是别人，
+        // 错误回给操作者，所以默认之外的 actor 必须由调用方显式声明。
+        this.throwJoinLimitReached(options.actor ?? 'self');
       }
       this.assertRestrictions(
         circle,
@@ -252,12 +256,25 @@ export class CircleAdmissionPolicy {
     tx: Prisma.TransactionClient,
     circleID: string,
     userID: string,
+    { actor = 'self' }: JoinLimitAudience = {},
   ): Promise<void> {
     const circle = await tx.circle.findFirst({
       where: { id: circleID, deleted: false },
       select: CIRCLE_ADMISSION_SELECT,
     });
     if (!circle) this.throwCircleNotFound();
+
+    const joinedCount = await tx.circleMember.count({
+      where: {
+        userID,
+        role: { not: CircleMemberRole.OWNER },
+        status: CircleMemberStatus.ACTIVE,
+      },
+    });
+    if (joinedCount >= CIRCLE_JOIN_LIMIT) {
+      this.throwJoinLimitReached(actor);
+    }
+
     if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
       throw new BadRequestException({
         message: 'Circle has reached its member limit',
@@ -351,6 +368,33 @@ export class CircleAdmissionPolicy {
     // Code-unit ordering matches the global lock service on every host.
     // eslint-disable-next-line sonarjs/no-alphabetical-sort
     return [...new Set(userIDs)].sort();
+  }
+
+  /**
+   * 加入上限的唯一抛出点。两条写路径（申请、激活）共用，保证同一条规则不会
+   * 因为调用方不同而给出两套字段。
+   */
+  private throwJoinLimitReached(actor: 'self' | 'third-party'): never {
+    // 邀请 / 审批路径下受限的是别人：不能带 limit / quota / details，也不能复用
+    // INVITATION_NOT_ALLOWED —— 那个码的既有语义是「对方隐私设置不接受邀请」
+    // (circle-invitation.service.ts)，客户端文案是「对方不接受圈子邀请」，
+    // 拿它表达配额会让操作者读到一句与事实不符、也无从处理的提示。
+    if (actor === 'third-party') {
+      throw new ForbiddenException({
+        message: 'Target user has reached the joined circle limit',
+        errorCode: CircleErrorCode.TargetJoinLimitReached,
+      });
+    }
+    throw new ForbiddenException({
+      message: 'Joined circle membership quota reached',
+      errorCode: CircleErrorCode.JoinLimitReached,
+      quota: 'joined-circles',
+      limit: CIRCLE_JOIN_LIMIT,
+      details: {
+        quota: 'joined-circles',
+        limit: CIRCLE_JOIN_LIMIT,
+      },
+    });
   }
 
   private throwCircleNotFound(): never {

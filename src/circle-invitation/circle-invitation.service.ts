@@ -132,7 +132,11 @@ export class CircleInvitationService {
           errorCode: CircleErrorCode.AlreadyMember,
         });
       }
-      await this.admissionPolicy.assertCanApply(tx, circleId, applicantId);
+      // applicantId 是被邀请人，任何拒绝原因都会回给 inviter —— 用第三方视角
+      // 调用，避免把对方的加入额度状态泄露给邀请人。
+      await this.admissionPolicy.assertCanApply(tx, circleId, applicantId, {
+        actor: 'third-party',
+      });
 
       const existingInvitation = await tx.circleInvitation.findFirst({
         where: {
@@ -402,11 +406,12 @@ export class CircleInvitationService {
         return { admission: null, notificationData: null };
       }
 
+      // 审批人（担保成员）读到的错误说的是申请人的额度，不是自己的。
       const admitted = await this.admissionPolicy.activateMembers(
         tx,
         updatedInvitation.circleID,
         [updatedInvitation.applicantID],
-        { locksHeld: true },
+        { locksHeld: true, actor: 'third-party' },
       );
       if (updatedInvitation.circle.groupID) {
         await enqueueCircleMemberSync(
@@ -530,11 +535,12 @@ export class CircleInvitationService {
         return { admission: null, notificationData: null };
       }
 
+      // 同上：圈主 / 管理员强制通过，错误回给操作者而不是申请人。
       const admitted = await this.admissionPolicy.activateMembers(
         tx,
         pendingInvitation.circleID,
         [pendingInvitation.applicantID],
-        { locksHeld: true },
+        { locksHeld: true, actor: 'third-party' },
       );
       if (pendingInvitation.circle.groupID) {
         await enqueueCircleMemberSync(
@@ -628,6 +634,8 @@ export class CircleInvitationService {
             data: { status: 'APPROVED' },
           });
           if (changed.count === 0) return null;
+          // 后台补偿任务：异常只进日志、没有接收方，保留默认的详细错误码，
+          // 这样 catch 里记下的是「哪条上限挡住了」而不是一句中性话。
           const admitted = await this.admissionPolicy.activateMembers(
             tx,
             invitation.circleID,

@@ -578,7 +578,7 @@ describe('CircleInvitationService', () => {
       prisma,
       'circle-1',
       ['applicant-1'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [
@@ -621,7 +621,7 @@ describe('CircleInvitationService', () => {
       prisma,
       'circle-1',
       ['applicant-1'],
-      { locksHeld: true },
+      { locksHeld: true, actor: 'third-party' },
     );
     expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
       data: [

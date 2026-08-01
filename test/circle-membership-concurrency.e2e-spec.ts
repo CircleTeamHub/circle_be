@@ -110,15 +110,6 @@ describePostgres('Circle membership transition concurrency e2e', () => {
       admissionPolicy.activateMembers(tx, circleID, [userID]),
     );
 
-  // Turns on the staged rollout so effective entitlements drop to the stored
-  // level (no marketing floor) — required for regular-tier quotas to bite.
-  const enableMembershipProgram = () =>
-    prisma.membershipProgramState.upsert({
-      where: { id: 1 },
-      update: { enabledAt: new Date() },
-      create: { id: 1, enabledAt: new Date() },
-    });
-
   const expectCounterConsistent = async (circleID: string) => {
     const [circle, activeCount] = await Promise.all([
       prisma.circle.findUniqueOrThrow({
@@ -219,11 +210,6 @@ describePostgres('Circle membership transition concurrency e2e', () => {
         })),
       ],
     });
-    // Enable the rollout so the regular joined-circles limit (100) is enforced;
-    // while disabled the marketing floor (gold, 300) applies and 99 memberships
-    // would be nowhere near the boundary, so no admission would be rejected.
-    await enableMembershipProgram();
-
     const results = await Promise.allSettled(
       targetCircleIDs.map((circleID) => activate(circleID, candidate.id)),
     );
@@ -234,6 +220,15 @@ describePostgres('Circle membership transition concurrency e2e', () => {
     expect(results.filter(({ status }) => status === 'rejected')).toHaveLength(
       1,
     );
+    const rejected = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    expect(rejected?.reason).toMatchObject({
+      response: {
+        errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
+        limit: 100,
+      },
+    });
     await expect(
       prisma.circleMember.count({
         where: {

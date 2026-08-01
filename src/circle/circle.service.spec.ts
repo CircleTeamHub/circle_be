@@ -32,6 +32,7 @@ describe('CircleService', () => {
     },
     circle: {
       create: jest.fn(),
+      count: jest.fn().mockResolvedValue(0),
       findFirst: jest.fn(),
       findMany: jest.fn(),
       findUnique: jest.fn(),
@@ -103,6 +104,10 @@ describe('CircleService', () => {
     }).compile();
 
     service = module.get(CircleService);
+    // clearAllMocks 不清实现，逐用例设置的计数会泄漏到后续用例；建圈上限
+    // 与加入上限都靠 count，默认必须显式归零。
+    prisma.circle.count.mockResolvedValue(0);
+    prisma.circleMember.count.mockResolvedValue(0);
     circleInvitationService.getInvitationForViewer.mockResolvedValue({
       id: 'inv-1',
       status: 'PENDING',
@@ -584,34 +589,77 @@ describe('CircleService', () => {
     expect(prisma.circle.create).not.toHaveBeenCalled();
   });
 
-  it('rejects circle creation when the creator is at their joined-circle quota', async () => {
+  it('does not count owned circles toward the joined-circle hard limit', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 1,
       vipExpiresAt: null,
     });
-    // 白银 joinedCircles = 200；已达上限（含拥有的圈子一起计数）→ 建圈应被拒，否则可无限建。
+    // 历史遗留的加入数即便远超 100，也不该挡住建圈：两条上限互不干扰。
     prisma.circleMember.count.mockResolvedValue(200);
-
-    await expect(
-      service.createCircle('user-1', validCircle()),
-    ).rejects.toMatchObject({
-      response: { errorCode: 'MEMBERSHIP_JOINED_CIRCLE_QUOTA_REACHED' },
-    });
-    expect(prisma.circle.create).not.toHaveBeenCalled();
-    expect(prisma.circleMember.create).not.toHaveBeenCalled();
-  });
-
-  it('allows circle creation when the creator is one below their joined-circle quota', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-    });
-    prisma.circleMember.count.mockResolvedValue(199);
     prisma.circle.create.mockResolvedValue(circleRecord(200));
 
     await service.createCircle('user-1', validCircle());
 
     expect(prisma.circle.create).toHaveBeenCalled();
+    expect(prisma.circleMember.create).toHaveBeenCalledWith({
+      data: {
+        userID: 'user-1',
+        circleID: 'circle-1',
+        role: 'OWNER',
+        status: 'ACTIVE',
+      },
+    });
+    // 建圈只统计自己拥有的圈子，不读加入额度。
+    expect(prisma.circle.count).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1', deleted: false },
+    });
+  });
+
+  it('rejects circle creation at the created-circle hard limit', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 4,
+      vipExpiresAt: null,
+    });
+    prisma.circle.count.mockResolvedValue(20);
+
+    await expect(
+      service.createCircle('user-1', validCircle()),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'CIRCLE_CREATE_LIMIT_REACHED', limit: 20 },
+    });
+    expect(prisma.circle.create).not.toHaveBeenCalled();
+    expect(prisma.circleMember.create).not.toHaveBeenCalled();
+  });
+
+  it('allows circle creation one below the created-circle hard limit', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 1,
+      vipExpiresAt: null,
+    });
+    prisma.circle.count.mockResolvedValue(19);
+    prisma.circle.create.mockResolvedValue(circleRecord(200));
+
+    await service.createCircle('user-1', validCircle());
+
+    expect(prisma.circle.create).toHaveBeenCalled();
+  });
+
+  it('applies the same created-circle limit to every membership tier', async () => {
+    prisma.circle.count.mockResolvedValue(20);
+
+    for (const vipLevel of [1, 2, 3, 4]) {
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel,
+        vipExpiresAt: null,
+      });
+
+      await expect(
+        service.createCircle('user-1', validCircle()),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CIRCLE_CREATE_LIMIT_REACHED', limit: 20 },
+      });
+    }
+    expect(prisma.circle.create).not.toHaveBeenCalled();
   });
 
   it('stores legacy joinVipRestriction zero as no restriction', async () => {

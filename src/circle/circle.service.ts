@@ -21,6 +21,7 @@ import {
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
+import { CIRCLE_CREATE_LIMIT } from './circle-limits';
 import { CircleMemberLockService } from './circle-member-lock';
 import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
@@ -116,20 +117,18 @@ export class CircleService {
         });
       }
 
-      // 建圈本身占用「已加入圈子」配额（写一条 ACTIVE OWNER 成员行）。在上面的 per-user 锁下统计
-      // 现有全部 ACTIVE 成员数，达到有效档位上限即拒绝，否则用户可无限建圈绕过配额（admission
-      // 路径已校验，create 路径此前漏了）。
-      const activeMemberships = await tx.circleMember.count({
-        where: { userID: userId, status: 'ACTIVE' },
+      // 建圈写的是 OWNER 成员行，不占「已加入圈子」额度，所以必须有独立上限：
+      // 否则任何有效会员都能无限建圈，而每个圈子还会连带创建一个 OpenIM 群。
+      // 在上面的 per-user 锁下统计，并发建圈不会越过上限。
+      const ownedCircles = await tx.circle.count({
+        where: { ownerID: userId, deleted: false },
       });
-      const joinedLimit = policy.tier.quotas.joinedCircles.actual;
-      if (activeMemberships >= joinedLimit) {
+      if (ownedCircles >= CIRCLE_CREATE_LIMIT) {
         throw new ForbiddenException({
-          message: 'Joined circle membership quota reached',
-          errorCode: MembershipErrorCode.JoinedCircleQuotaReached,
-          quota: 'joined-circles',
-          limit: joinedLimit,
-          details: { quota: 'joined-circles', limit: joinedLimit },
+          message: 'Created circle limit reached',
+          errorCode: CircleErrorCode.CreateLimitReached,
+          limit: CIRCLE_CREATE_LIMIT,
+          details: { limit: CIRCLE_CREATE_LIMIT },
         });
       }
 
