@@ -5,10 +5,30 @@ import {
   ArrayUnique,
   IsArray,
   IsBoolean,
+  IsEnum,
   IsString,
   MaxLength,
   MinLength,
 } from 'class-validator';
+
+export enum GroupMemberRoleInput {
+  ADMIN = 'ADMIN',
+  MEMBER = 'MEMBER',
+}
+
+export class UpdateGroupMemberRoleDto {
+  @ApiProperty({ enum: GroupMemberRoleInput })
+  @IsEnum(GroupMemberRoleInput)
+  role: GroupMemberRoleInput;
+}
+
+export class GroupMemberRoleResultDto {
+  @ApiProperty({ example: true })
+  handled: true;
+
+  @ApiProperty({ enum: GroupMemberRoleInput })
+  role: GroupMemberRoleInput;
+}
 
 export class InviteGroupMembersDto {
   @ApiProperty({

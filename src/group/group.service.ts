@@ -20,11 +20,15 @@ import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
-import { InviteGroupMembersDto } from './dto/group-member.dto';
+import {
+  GroupMemberRoleInput,
+  GroupMemberRoleResultDto,
+  InviteGroupMembersDto,
+  UpdateGroupMemberRoleDto,
+} from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
 
 type GroupMemberSyncResult = { handled: boolean };
-
 type CircleGroupLookup = {
   id: string;
   groupID: string | null;
@@ -47,6 +51,119 @@ export class GroupService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
   ) {}
+
+  async updateGroupMemberRole(
+    actorId: string,
+    groupID: string,
+    targetUserID: string,
+    dto: UpdateGroupMemberRoleDto,
+  ): Promise<GroupMemberRoleResultDto> {
+    const normalizedGroupID = this.normalizeGroupID(groupID);
+    const normalizedTargetUserID = OpenimService.fromImUserId(
+      targetUserID.trim(),
+    );
+    if (!normalizedTargetUserID || normalizedTargetUserID === actorId) {
+      throw new ForbiddenException({
+        message: 'The group owner cannot change their own role',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
+
+    const circle = await this.findCircleByGroupID(normalizedGroupID);
+    const roleLevel = dto.role === GroupMemberRoleInput.ADMIN ? 60 : 20;
+
+    if (!circle) {
+      const openimGroupID = this.rawOpenimGroupID(normalizedGroupID);
+      const [actorRole, targetRole] = await Promise.all([
+        this.openimService.getGroupMemberRole(openimGroupID, actorId),
+        this.openimService.getGroupMemberRole(
+          openimGroupID,
+          normalizedTargetUserID,
+        ),
+      ]);
+      if (actorRole !== 100) {
+        throw new ForbiddenException({
+          message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+      if (targetRole !== 20 && targetRole !== 60) {
+        throw new NotFoundException({
+          message: 'Group member not found',
+          errorCode: GroupErrorCode.MemberNotFound,
+        });
+      }
+      await this.openimService.setGroupMemberRole(
+        openimGroupID,
+        normalizedTargetUserID,
+        roleLevel,
+      );
+      return { handled: true, role: dto.role };
+    }
+
+    const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circle.id, [
+        actorId,
+        normalizedTargetUserID,
+      ]);
+      const [actor, target] = await Promise.all([
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: actorId, circleID: circle.id },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: normalizedTargetUserID,
+              circleID: circle.id,
+            },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+      ]);
+
+      if (
+        !actor ||
+        actor.status !== CircleMemberStatus.ACTIVE ||
+        actor.role !== CircleMemberRole.OWNER
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+      if (
+        !target ||
+        target.status !== CircleMemberStatus.ACTIVE ||
+        target.role === CircleMemberRole.OWNER
+      ) {
+        throw new NotFoundException({
+          message: 'Group member not found',
+          errorCode: GroupErrorCode.MemberNotFound,
+        });
+      }
+
+      await this.openimService.setGroupMemberRole(
+        openimGroupID,
+        normalizedTargetUserID,
+        roleLevel,
+      );
+      await tx.circleMember.update({
+        where: { id: target.id },
+        data: {
+          role:
+            dto.role === GroupMemberRoleInput.ADMIN
+              ? CircleMemberRole.ADMIN
+              : CircleMemberRole.MEMBER,
+        },
+      });
+    });
+
+    return { handled: true, role: dto.role };
+  }
 
   async inviteGroupMembers(
     actorId: string,

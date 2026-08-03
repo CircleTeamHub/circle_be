@@ -297,7 +297,32 @@ export class OpenimService implements OnModuleInit {
           groupID,
           groupName,
           groupType: 2, // 2 = work group
+          lookMemberInfo: 1,
+          applyMemberFriend: 1,
         },
+      },
+      adminToken,
+    );
+  }
+
+  async setGroupMemberRole(
+    groupID: string,
+    userID: string,
+    roleLevel: 20 | 60,
+  ): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/group/set_group_member_info',
+      {
+        members: [
+          {
+            groupID,
+            userID: OpenimService.toImUserId(userID),
+            roleLevel,
+          },
+        ],
       },
       adminToken,
     );
@@ -348,6 +373,30 @@ export class OpenimService implements OnModuleInit {
     );
 
     return (res.members ?? []).some((member) => member.userID === imUserID);
+  }
+
+  async getGroupMemberRole(
+    groupID: string,
+    userID: string,
+  ): Promise<20 | 60 | 100 | null> {
+    if (!this.enabled) return null;
+
+    const imUserID = OpenimService.toImUserId(userID);
+    const adminToken = await this.getAdminToken();
+    const res = await this.post<{
+      members?: Array<{ userID: string; roleLevel: number }>;
+    }>(
+      '/group/get_group_members_info',
+      { groupID, userIDs: [imUserID] },
+      adminToken,
+    );
+    const roleLevel = (res.members ?? []).find(
+      (member) => member.userID === imUserID,
+    )?.roleLevel;
+
+    return roleLevel === 20 || roleLevel === 60 || roleLevel === 100
+      ? roleLevel
+      : null;
   }
 
   // ─── Message history (chat-history restore) ──────────────────────────────────
