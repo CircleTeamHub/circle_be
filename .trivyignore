@@ -34,3 +34,12 @@ CVE-2026-14257
 # runtime — the image runs `node dist/src/main.js` — so the vulnerable code path is
 # not reachable. Will clear when the base image ships a patched npm.
 CVE-2026-69152
+
+# CVE-2026-69192 — ip-address IPv4 leading-zero octet misclassification (SSRF).
+# Same base-image situation: the flagged 10.2.0 copy ships ONLY inside the npm CLI
+# bundled with node:22-slim (/usr/local/lib/node_modules/npm/node_modules/ip-address,
+# via npm's socks-proxy-agent). Our own app dependency is patched — the `ip-address`
+# override pins it to ^10.3.1 (lockfile resolves 10.4.0). npm is not invoked at
+# runtime — the image runs `node dist/src/main.js` — so the vulnerable code path is
+# not reachable. Will clear when the base image ships a patched npm.
+CVE-2026-69192
