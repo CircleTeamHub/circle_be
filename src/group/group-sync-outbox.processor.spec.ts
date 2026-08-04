@@ -23,6 +23,7 @@ type Row = {
 describe('GroupSyncOutboxProcessor desired-state machine', () => {
   let row: Row | null;
   let membershipActive: boolean;
+  let membershipRole: 'OWNER' | 'ADMIN' | 'MEMBER';
   let transactionDepth: number;
   let transactionCount: number;
   let crashBeforeTransaction: number | null;
@@ -30,6 +31,7 @@ describe('GroupSyncOutboxProcessor desired-state machine', () => {
   let openim: {
     addGroupMembers: jest.Mock;
     removeGroupMember: jest.Mock;
+    setGroupMemberRole: jest.Mock;
   };
   let memberLock: { lock: jest.Mock };
   let processor: GroupSyncOutboxProcessor;
@@ -88,6 +90,7 @@ describe('GroupSyncOutboxProcessor desired-state machine', () => {
   beforeEach(() => {
     row = pendingRow();
     membershipActive = true;
+    membershipRole = 'MEMBER';
     transactionDepth = 0;
     transactionCount = 0;
     crashBeforeTransaction = null;
@@ -143,7 +146,7 @@ describe('GroupSyncOutboxProcessor desired-state machine', () => {
       },
       circleMember: {
         findUnique: jest.fn(async () =>
-          membershipActive ? { status: 'ACTIVE' } : null,
+          membershipActive ? { status: 'ACTIVE', role: membershipRole } : null,
         ),
       },
       groupSyncOutbox,
@@ -151,6 +154,7 @@ describe('GroupSyncOutboxProcessor desired-state machine', () => {
     openim = {
       addGroupMembers: jest.fn().mockResolvedValue(undefined),
       removeGroupMember: jest.fn().mockResolvedValue(undefined),
+      setGroupMemberRole: jest.fn().mockResolvedValue(undefined),
     };
     memberLock = { lock: jest.fn() };
     processor = new GroupSyncOutboxProcessor(
@@ -349,6 +353,59 @@ describe('GroupSyncOutboxProcessor desired-state machine', () => {
       processingGeneration: null,
       processingOperation: null,
       lockedAt: null,
+    });
+  });
+
+  // review P1：角色变更先落库，由 outbox 把 DB 真值推到 OpenIM ——
+  // ADD_MEMBER 的外部效果必须同时收敛角色，DB 写失败/外呼失败都能最终一致。
+  it('pushes the DB role to OpenIM as part of ADD_MEMBER convergence', async () => {
+    membershipRole = 'ADMIN';
+
+    await processor.processPending();
+
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'group-1',
+      'user-1',
+      60,
+    );
+    expect(row).toMatchObject({ status: 'COMPLETED' });
+  });
+
+  it('still converges the role when the member already exists in OpenIM', async () => {
+    membershipRole = 'ADMIN';
+    openim.addGroupMembers.mockRejectedValue(
+      new Error('group member repeated add'),
+    );
+
+    await processor.processPending();
+
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'group-1',
+      'user-1',
+      60,
+    );
+    expect(row).toMatchObject({ status: 'COMPLETED' });
+  });
+
+  it('never rewrites the owner role level from the sync path', async () => {
+    membershipRole = 'OWNER';
+
+    await processor.processPending();
+
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+    expect(row).toMatchObject({ status: 'COMPLETED' });
+  });
+
+  it('retries when the role push fails after a successful add', async () => {
+    membershipRole = 'ADMIN';
+    openim.setGroupMemberRole.mockRejectedValue(new Error('openim down'));
+
+    await processor.processPending();
+
+    expect(row).toMatchObject({
+      status: 'FAILED',
+      attempts: 1,
+      lastError: 'openim down',
     });
   });
 });

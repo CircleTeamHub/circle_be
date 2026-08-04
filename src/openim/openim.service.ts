@@ -42,6 +42,9 @@ export interface OpenimAdminGroup {
     status: number;
     memberCount?: number;
     createTime?: number;
+    /** 0/缺省 = 允许普通成员看目录；1 = 仅管理员（AllowType.NotAllowed）。 */
+    lookMemberInfo?: number;
+    applyMemberFriend?: number;
   };
   groupOwnerUserID?: string;
   groupOwnerUserName?: string;
@@ -297,6 +300,28 @@ export class OpenimService implements OnModuleInit {
           groupID,
           groupName,
           groupType: 2, // 2 = work group
+          lookMemberInfo: 1,
+          applyMemberFriend: 1,
+        },
+      },
+      adminToken,
+    );
+  }
+
+  /**
+   * 把已有群的成员目录收紧为「仅群主/管理员可见」（lookMemberInfo=1）并禁止
+   * 通过群目录加好友（applyMemberFriend=1）。管理员令牌绕过 OpenIM 的
+   * 群主/管理员校验，可用于服务端 backfill 存量群。
+   */
+  async enforceGroupMemberPrivacy(groupID: string): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/group/set_group_info',
+      {
+        groupInfoForSet: {
+          groupID,
           lookMemberInfo: 1,
           applyMemberFriend: 1,
         },

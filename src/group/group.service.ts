@@ -73,35 +73,18 @@ export class GroupService {
     const roleLevel = dto.role === GroupMemberRoleInput.ADMIN ? 60 : 20;
 
     if (!circle) {
-      const openimGroupID = this.rawOpenimGroupID(normalizedGroupID);
-      const [actorRole, targetRole] = await Promise.all([
-        this.openimService.getGroupMemberRole(openimGroupID, actorId),
-        this.openimService.getGroupMemberRole(
-          openimGroupID,
-          normalizedTargetUserID,
-        ),
-      ]);
-      if (actorRole !== 100) {
-        throw new ForbiddenException({
-          message: 'Only the group owner can change administrator roles',
-          errorCode: GroupErrorCode.ManagerOnly,
-        });
-      }
-      if (targetRole !== 20 && targetRole !== 60) {
-        throw new NotFoundException({
-          message: 'Group member not found',
-          errorCode: GroupErrorCode.MemberNotFound,
-        });
-      }
-      await this.openimService.setGroupMemberRole(
-        openimGroupID,
+      return this.updateRawGroupMemberRole(
+        actorId,
+        this.rawOpenimGroupID(normalizedGroupID),
         normalizedTargetUserID,
+        dto,
         roleLevel,
       );
-      return { handled: true, role: dto.role };
     }
 
     const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
+    // review P1：先落库（角色 + outbox + 审计原子提交），OpenIM 放到提交后。
+    // 旧顺序在事务内先调 OpenIM，提交失败会回滚本地状态而外部已提权。
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.memberLock.lock(tx, circle.id, [
         actorId,
@@ -146,21 +129,139 @@ export class GroupService {
         });
       }
 
+      const nextRole =
+        dto.role === GroupMemberRoleInput.ADMIN
+          ? CircleMemberRole.ADMIN
+          : CircleMemberRole.MEMBER;
+      await tx.circleMember.update({
+        where: { id: target.id },
+        data: { role: nextRole },
+      });
+      // review P2：特权变更留结构化审计（脱敏：只有 ID 与角色），与角色写同事务。
+      await tx.adminAuditLog.create({
+        data: {
+          actorID: actorId,
+          action: 'GROUP_MEMBER_ROLE_UPDATED',
+          entityType: 'CircleMember',
+          entityID: target.id,
+          metadata: {
+            circleID: circle.id,
+            groupID: openimGroupID,
+            targetUserID: normalizedTargetUserID,
+            previousRole: target.role,
+            newRole: nextRole,
+          },
+        },
+      });
+      // ADD_MEMBER 的 outbox 语义 = 「成员在群里且角色与 DB 一致」；提交后由
+      // processor 兜底收敛 OpenIM，本地权限真值不依赖外呼成功。
+      await enqueueCircleMemberSync(tx, 'ADD_MEMBER', openimGroupID, [
+        normalizedTargetUserID,
+      ]);
+    });
+
+    // 提交成功后立即推一把 OpenIM（快路径）；失败不回滚也不报错——outbox
+    // 会以 DB 真值重试直到收敛。
+    try {
       await this.openimService.setGroupMemberRole(
         openimGroupID,
         normalizedTargetUserID,
         roleLevel,
       );
-      await tx.circleMember.update({
-        where: { id: target.id },
+    } catch (error) {
+      this.logger.warn(
+        `OpenIM role push deferred to outbox for group ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    return { handled: true, role: dto.role };
+  }
+
+  private async updateRawGroupMemberRole(
+    actorId: string,
+    openimGroupID: string,
+    targetUserID: string,
+    dto: UpdateGroupMemberRoleDto,
+    roleLevel: 20 | 60,
+  ): Promise<GroupMemberRoleResultDto> {
+    // review P2：裸 OpenIM 群没有本地状态，OpenIM 故障要映射成稳定的 503
+    // （与 reportGroup 的裸群成员校验先例一致），而不是裸抛 500。
+    let actorRole: 20 | 60 | 100 | null;
+    let targetRole: 20 | 60 | 100 | null;
+    try {
+      [actorRole, targetRole] = await Promise.all([
+        this.openimService.getGroupMemberRole(openimGroupID, actorId),
+        this.openimService.getGroupMemberRole(openimGroupID, targetUserID),
+      ]);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to verify raw OpenIM group roles for group ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw new ServiceUnavailableException({
+        message: 'Group membership cannot be verified right now',
+        errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+      });
+    }
+    if (actorRole !== 100) {
+      throw new ForbiddenException({
+        message: 'Only the group owner can change administrator roles',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
+    if (targetRole !== 20 && targetRole !== 60) {
+      throw new NotFoundException({
+        message: 'Group member not found',
+        errorCode: GroupErrorCode.MemberNotFound,
+      });
+    }
+
+    try {
+      await this.openimService.setGroupMemberRole(
+        openimGroupID,
+        targetUserID,
+        roleLevel,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to update raw OpenIM group role for group ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw new ServiceUnavailableException({
+        message: 'Group role cannot be updated right now',
+        errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+      });
+    }
+
+    // review P2：裸群同样留审计。写在外呼成功后；审计落库失败不回滚已生效的
+    // 角色（避免误导客户端重试非幂等操作），但要响亮报错留痕。
+    try {
+      await this.prisma.adminAuditLog.create({
         data: {
-          role:
-            dto.role === GroupMemberRoleInput.ADMIN
-              ? CircleMemberRole.ADMIN
-              : CircleMemberRole.MEMBER,
+          actorID: actorId,
+          action: 'GROUP_MEMBER_ROLE_UPDATED',
+          entityType: 'OpenimGroup',
+          entityID: openimGroupID,
+          metadata: {
+            groupID: openimGroupID,
+            targetUserID,
+            previousRoleLevel: targetRole,
+            newRoleLevel: roleLevel,
+            newRole: dto.role,
+          },
         },
       });
-    });
+    } catch (error) {
+      this.logger.error(
+        `Audit write failed for raw group role change ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
 
     return { handled: true, role: dto.role };
   }

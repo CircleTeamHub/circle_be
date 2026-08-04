@@ -43,6 +43,24 @@ describe('OpenimService group/auth admin calls', () => {
     });
   });
 
+  it('enforces member privacy on an existing group via set_group_info', async () => {
+    expect(typeof (service as any).enforceGroupMemberPrivacy).toBe('function');
+
+    await (service as any).enforceGroupMemberPrivacy('legacy-group');
+
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/group/set_group_info'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      groupInfoForSet: {
+        groupID: 'legacy-group',
+        lookMemberInfo: 1,
+        applyMemberFriend: 1,
+      },
+    });
+  });
+
   it('sets a group member role through the OpenIM admin API', async () => {
     expect(typeof (service as any).setGroupMemberRole).toBe('function');
 

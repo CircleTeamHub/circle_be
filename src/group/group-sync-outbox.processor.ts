@@ -263,15 +263,29 @@ export class GroupSyncOutboxProcessor {
   ): Promise<ExternalResult> {
     try {
       if (attempt.operation === 'ADD_MEMBER') {
-        await this.openimService.addGroupMembers(attempt.groupID, [
-          attempt.userID,
-        ]);
-      } else {
-        await this.openimService.removeGroupMember(
-          attempt.groupID,
-          attempt.userID,
-        );
+        // ADD_MEMBER 语义 = 「成员在群里且角色与 DB 一致」。加群的幂等错误
+        // 要就地吞掉，否则会短路后面的角色收敛（review P1：角色变更先落库，
+        // 由这里兜底把 DB 真值推到 OpenIM）。
+        let idempotentMessage: string | undefined;
+        try {
+          await this.openimService.addGroupMembers(attempt.groupID, [
+            attempt.userID,
+          ]);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          if (!this.isIdempotentOpenimResult('ADD_MEMBER', message)) {
+            throw error;
+          }
+          idempotentMessage = message;
+        }
+        await this.syncDesiredMemberRole(attempt.groupID, attempt.userID);
+        return { outcome: 'SUCCEEDED', idempotentMessage };
       }
+      await this.openimService.removeGroupMember(
+        attempt.groupID,
+        attempt.userID,
+      );
       return { outcome: 'SUCCEEDED' };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -280,6 +294,28 @@ export class GroupSyncOutboxProcessor {
       }
       return { outcome: 'FAILED', message };
     }
+  }
+
+  /**
+   * 把成员当前的 DB 角色推到 OpenIM（MEMBER→20 / ADMIN→60）。圈主的 100 由
+   * 建群/转让流程负责，这里跳过；成员已不在册则交由 REMOVE 路径处理。
+   */
+  private async syncDesiredMemberRole(
+    groupID: string,
+    userID: string,
+  ): Promise<void> {
+    const circle = await this.findCircle(groupID);
+    if (!circle) return;
+    const membership = await this.prisma.circleMember.findUnique({
+      where: { userID_circleID: { userID, circleID: circle.id } },
+      select: { role: true, status: true },
+    });
+    if (membership?.status !== 'ACTIVE' || membership.role === 'OWNER') return;
+    await this.openimService.setGroupMemberRole(
+      groupID,
+      userID,
+      membership.role === 'ADMIN' ? 60 : 20,
+    );
   }
 
   private async readDesiredOperation(
