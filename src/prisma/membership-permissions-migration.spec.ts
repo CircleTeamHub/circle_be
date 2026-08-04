@@ -7,7 +7,9 @@ const MIGRATION_SQL_PATH = join(
 );
 
 describe('membership permissions migration', () => {
-  const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8');
+  // Normalize CRLF: Windows checkouts (core.autocrlf=true) rewrite the working
+  // tree, and these assertions match statement boundaries with literal "\n".
+  const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8').replace(/\r\n/g, '\n');
 
   it.each(['vipRestriction', 'signupVipRestriction'])(
     'normalizes legacy CirclePost.%s values into nullable levels 1 through 4',

@@ -13,7 +13,10 @@ describe('system announcement persistence contract', () => {
   );
 
   it('persists an idempotency identity and one notification per recipient', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
     expect(schema).toMatch(
       /model SystemAnnouncement[\s\S]*idempotencyKey\s+String\s+@unique/,
     );
@@ -24,7 +27,7 @@ describe('system announcement persistence contract', () => {
       '@@unique([systemAnnouncementID, toUserID], map: "Notification_announcement_recipient_key")',
     );
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
     expect(sql).toContain(
       'CREATE UNIQUE INDEX "Notification_announcement_recipient_key"',
     );
@@ -32,7 +35,10 @@ describe('system announcement persistence contract', () => {
       /model SystemAnnouncement[\s\S]*fanoutCompletedAt\s+DateTime\?[\s\S]*recipientCount\s+Int\?/,
     );
     expect(existsSync(completionMigrationPath)).toBe(true);
-    const completionSql = readFileSync(completionMigrationPath, 'utf8');
+    const completionSql = readFileSync(completionMigrationPath, 'utf8').replace(
+      /\r\n/g,
+      '\n',
+    );
     expect(completionSql).toContain(
       'ADD COLUMN "fanoutCompletedAt" TIMESTAMP(3)',
     );

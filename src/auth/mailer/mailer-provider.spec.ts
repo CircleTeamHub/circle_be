@@ -13,10 +13,9 @@ const BASE_ENV = {
 
 describe('mailer provider wiring (#82)', () => {
   it('auth.module selects SmtpMailer on SMTP_HOST and error-logs the production console fallback', () => {
-    const source = fs.readFileSync(
-      path.join(process.cwd(), 'src/auth/auth.module.ts'),
-      'utf8',
-    );
+    const source = fs
+      .readFileSync(path.join(process.cwd(), 'src/auth/auth.module.ts'), 'utf8')
+      .replace(/\r\n/g, '\n');
     // factory 按 SMTP_HOST 切换真实实现
     expect(source).toMatch(/SMTP_HOST/);
     expect(source).toMatch(/new SmtpMailer\(configService\)/);

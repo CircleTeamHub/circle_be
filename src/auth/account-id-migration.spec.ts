@@ -95,7 +95,7 @@ describe('remove_account_id_prefix migration', () => {
   });
 
   describe('migration.sql artifact keeps its safety guards', () => {
-    const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8');
+    const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8').replace(/\r\n/g, '\n');
 
     it('aborts on collision instead of corrupting data', () => {
       expect(sql).toContain('RAISE EXCEPTION');

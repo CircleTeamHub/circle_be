@@ -19,12 +19,15 @@ function prismaModel(schema: string, name: string): string {
 }
 
 describe('avatar frame wardrobe persistence contract', () => {
-  const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+  const schema = readFileSync(
+    join(root, 'prisma/schema.prisma'),
+    'utf8',
+  ).replace(/\r\n/g, '\n');
   const sql = existsSync(migrationPath)
-    ? readFileSync(migrationPath, 'utf8')
+    ? readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n')
     : '';
   const selectedIndexSql = existsSync(selectedIndexMigrationPath)
-    ? readFileSync(selectedIndexMigrationPath, 'utf8')
+    ? readFileSync(selectedIndexMigrationPath, 'utf8').replace(/\r\n/g, '\n')
     : '';
 
   it('models the catalog, audited grants, and explicit user selection', () => {

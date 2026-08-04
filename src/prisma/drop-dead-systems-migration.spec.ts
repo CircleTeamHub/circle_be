@@ -7,7 +7,7 @@ const MIGRATION_SQL_PATH = join(
 );
 
 describe('drop dead systems migration', () => {
-  const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8');
+  const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8').replace(/\r\n/g, '\n');
 
   it('aborts before dropping dead tables when any table still contains data', () => {
     expect(sql).toContain('dead system table "%" is not empty');

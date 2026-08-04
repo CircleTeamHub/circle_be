@@ -5,7 +5,10 @@ const root = join(__dirname, '..', '..');
 
 describe('fancy number persistence contract', () => {
   it('defines account claims, inventory, leases, orders and user expiry snapshots', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
 
     expect(schema).toContain('model AccountIdentifier');
     expect(schema).toContain('model FancyNumber');
@@ -24,7 +27,7 @@ describe('fancy number persistence contract', () => {
         'prisma/migrations/20260728000000_fancy_number_marketplace/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(sql.indexOf('account identifier collision')).toBeLessThan(
       sql.indexOf('INSERT INTO "AccountIdentifier"'),
@@ -62,7 +65,7 @@ describe('fancy number persistence contract', () => {
         'prisma/migrations/20260729160000_account_identifier_cleanup_trigger/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
     const forwardPrepareStart = forwardSql.indexOf(
       'CREATE OR REPLACE FUNCTION "User_account_identifier_prepare"',
     );
@@ -78,14 +81,17 @@ describe('fancy number persistence contract', () => {
   });
 
   it('adds an auditable order type for permanent-number switching', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
     const sql = readFileSync(
       join(
         root,
         'prisma/migrations/20260728180000_fancy_number_switch/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(schema).toMatch(/enum FancyNumberOrderType[\s\S]*\bSWITCH\b/);
     expect(sql).toContain(
@@ -94,14 +100,17 @@ describe('fancy number persistence contract', () => {
   });
 
   it('adds a source value for user-created custom fancy numbers', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
     const sql = readFileSync(
       join(
         root,
         'prisma/migrations/20260728190000_custom_fancy_numbers/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(schema).toMatch(/enum FancyNumberSource[\s\S]*\bCUSTOM\b/);
     expect(sql).toContain(
@@ -110,14 +119,17 @@ describe('fancy number persistence contract', () => {
   });
 
   it('adds a non-destructive curated recommendation flag with a bounded backfill', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
     const sql = readFileSync(
       join(
         root,
         'prisma/migrations/20260729010000_fancy_number_recommendations/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(schema).toMatch(/isRecommended\s+Boolean\s+@default\(false\)/);
     expect(schema).toContain(
