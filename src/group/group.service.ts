@@ -161,13 +161,28 @@ export class GroupService {
     });
 
     // 提交成功后立即推一把 OpenIM（快路径）；失败不回滚也不报错——outbox
-    // 会以 DB 真值重试直到收敛。
+    // 会以 DB 真值重试直到收敛。review R2：推送前重读已提交的角色而非请求参数
+    // ——并发升/降级时本请求可能不是最后提交者，推参数会把旧角色写回 OpenIM。
     try {
-      await this.openimService.setGroupMemberRole(
-        openimGroupID,
-        normalizedTargetUserID,
-        roleLevel,
-      );
+      const committed = await this.prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: normalizedTargetUserID,
+            circleID: circle.id,
+          },
+        },
+        select: { role: true, status: true },
+      });
+      if (
+        committed?.status === CircleMemberStatus.ACTIVE &&
+        committed.role !== CircleMemberRole.OWNER
+      ) {
+        await this.openimService.setGroupMemberRole(
+          openimGroupID,
+          normalizedTargetUserID,
+          committed.role === CircleMemberRole.ADMIN ? 60 : 20,
+        );
+      }
     } catch (error) {
       this.logger.warn(
         `OpenIM role push deferred to outbox for group ${openimGroupID}: ${
@@ -188,24 +203,33 @@ export class GroupService {
   ): Promise<GroupMemberRoleResultDto> {
     // review P2：裸 OpenIM 群没有本地状态，OpenIM 故障要映射成稳定的 503
     // （与 reportGroup 的裸群成员校验先例一致），而不是裸抛 500。
-    let actorRole: 20 | 60 | 100 | null;
-    let targetRole: 20 | 60 | 100 | null;
-    try {
-      [actorRole, targetRole] = await Promise.all([
-        this.openimService.getGroupMemberRole(openimGroupID, actorId),
-        this.openimService.getGroupMemberRole(openimGroupID, targetUserID),
-      ]);
-    } catch (error) {
-      this.logger.warn(
-        `Failed to verify raw OpenIM group roles for group ${openimGroupID}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      throw new ServiceUnavailableException({
-        message: 'Group membership cannot be verified right now',
-        errorCode: GroupErrorCode.MembershipVerifyUnavailable,
-      });
-    }
+    // review R2：群/成员不存在类错误不是故障——归一成 null 走下面的 403/404
+    // 拒绝路径，只有真正的依赖故障才 503。
+    const lookupRole = async (
+      userID: string,
+    ): Promise<20 | 60 | 100 | null> => {
+      try {
+        return await this.openimService.getGroupMemberRole(
+          openimGroupID,
+          userID,
+        );
+      } catch (error) {
+        if (this.isOpenimNotFoundError(error)) return null;
+        this.logger.warn(
+          `Failed to verify raw OpenIM group roles for group ${openimGroupID}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        throw new ServiceUnavailableException({
+          message: 'Group membership cannot be verified right now',
+          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+        });
+      }
+    };
+    const [actorRole, targetRole] = await Promise.all([
+      lookupRole(actorId),
+      lookupRole(targetUserID),
+    ]);
     if (actorRole !== 100) {
       throw new ForbiddenException({
         message: 'Only the group owner can change administrator roles',
@@ -237,33 +261,44 @@ export class GroupService {
       });
     }
 
-    // review P2：裸群同样留审计。写在外呼成功后；审计落库失败不回滚已生效的
-    // 角色（避免误导客户端重试非幂等操作），但要响亮报错留痕。
-    try {
-      await this.prisma.adminAuditLog.create({
-        data: {
-          actorID: actorId,
-          action: 'GROUP_MEMBER_ROLE_UPDATED',
-          entityType: 'OpenimGroup',
-          entityID: openimGroupID,
-          metadata: {
-            groupID: openimGroupID,
-            targetUserID,
-            previousRoleLevel: targetRole,
-            newRoleLevel: roleLevel,
-            newRole: dto.role,
-          },
+    // review P2/R2：裸群同样留审计，且审计不可静默丢——写失败就让整个请求
+    // 失败（角色 set 幂等，客户端重试会重放同一角色并重试审计，最终两者都齐），
+    // 绝不返回一个没有审计痕迹的成功。
+    await this.prisma.adminAuditLog.create({
+      data: {
+        actorID: actorId,
+        action: 'GROUP_MEMBER_ROLE_UPDATED',
+        entityType: 'OpenimGroup',
+        entityID: openimGroupID,
+        metadata: {
+          groupID: openimGroupID,
+          targetUserID,
+          previousRoleLevel: targetRole,
+          newRoleLevel: roleLevel,
+          newRole: dto.role,
         },
-      });
-    } catch (error) {
-      this.logger.error(
-        `Audit write failed for raw group role change ${openimGroupID}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+      },
+    });
 
     return { handled: true, role: dto.role };
+  }
+
+  /**
+   * OpenIM 「查无此群/此成员」类错误。这是业务上的拒绝信号（403/404），
+   * 不是依赖故障，调用方不应把它映射成可重试的 503。
+   */
+  private isOpenimNotFoundError(error: unknown): boolean {
+    const message = (
+      error instanceof Error ? error.message : String(error)
+    ).toLowerCase();
+    return (
+      message.includes('recordnotfound') ||
+      message.includes('record not found') ||
+      message.includes('not found') ||
+      message.includes('not exist') ||
+      message.includes('not in group') ||
+      message.includes('not group member')
+    );
   }
 
   async inviteGroupMembers(

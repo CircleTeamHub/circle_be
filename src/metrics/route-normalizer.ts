@@ -139,6 +139,7 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/friend/tags/:tagId/friends',
   '/api/v1/group/:groupID/leave',
   '/api/v1/group/:groupID/members/:userID',
+  '/api/v1/group/:groupID/members/:userID/role',
   '/api/v1/group/:groupID/members/invite',
   '/api/v1/group/:groupID/report',
   '/api/v1/note/:id',

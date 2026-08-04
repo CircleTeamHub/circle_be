@@ -28,6 +28,8 @@ describe('GroupPrivacyBackfillProcessor', () => {
     listGroups: jest.Mock;
     enforceGroupMemberPrivacy: jest.Mock;
   };
+  let lockAcquired: boolean;
+  let prisma: { $transaction: jest.Mock };
   let processor: GroupPrivacyBackfillProcessor;
 
   beforeEach(() => {
@@ -36,7 +38,15 @@ describe('GroupPrivacyBackfillProcessor', () => {
       listGroups: jest.fn(),
       enforceGroupMemberPrivacy: jest.fn().mockResolvedValue(undefined),
     };
-    processor = new GroupPrivacyBackfillProcessor(openim as any);
+    lockAcquired = true;
+    prisma = {
+      $transaction: jest.fn(async (callback: (tx: any) => Promise<void>) =>
+        callback({
+          $queryRaw: jest.fn(async () => [{ acquired: lockAcquired }]),
+        }),
+      ),
+    };
+    processor = new GroupPrivacyBackfillProcessor(openim as any, prisma as any);
   });
 
   it('restricts a legacy group without requiring a manager to open the app', async () => {
@@ -122,6 +132,20 @@ describe('GroupPrivacyBackfillProcessor', () => {
     await processor.reconcile();
 
     expect(openim.listGroups).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('skips the round when another replica holds the advisory lock', async () => {
+    lockAcquired = false;
+    openim.listGroups.mockResolvedValue({
+      total: 1,
+      groups: [group('legacy-1')],
+    });
+
+    await processor.reconcile();
+
+    expect(openim.listGroups).not.toHaveBeenCalled();
+    expect(openim.enforceGroupMemberPrivacy).not.toHaveBeenCalled();
   });
 
   it('does not overlap concurrent reconcile runs', async () => {
