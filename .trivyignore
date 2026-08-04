@@ -23,3 +23,14 @@ CVE-2026-48815
 # `npx prisma migrate deploy` path passes no attacker-controlled brace patterns, so
 # the ReDoS is not reachable. Will clear when the base image ships a patched npm.
 CVE-2026-14257
+
+# CVE-2026-69152 — brace-expansion DoS via unbounded intermediate arrays.
+# Same base-image situation as CVE-2026-14257 above: the flagged 5.0.7 copy ships
+# ONLY inside the npm CLI bundled with node:22-slim
+# (/usr/local/lib/node_modules/npm/node_modules/brace-expansion). Our own app deps
+# are clear — the lockfile now pins every 5.0.x copy to 5.0.9 (fixed) via the
+# `brace-expansion@5` override, and the remaining 1.x/2.x copies are devDependencies
+# pruned out of the production image (`npm prune --omit=dev`). npm is not invoked at
+# runtime — the image runs `node dist/src/main.js` — so the vulnerable code path is
+# not reachable. Will clear when the base image ships a patched npm.
+CVE-2026-69152
