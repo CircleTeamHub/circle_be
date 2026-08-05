@@ -37,16 +37,24 @@ describe('resolveDatabasePoolConfig', () => {
     expect(resolveDatabasePoolConfig({})).toEqual({
       max: 10,
       connectionTimeoutMillis: 10_000,
+      // Postgres 默认 statement_timeout 是 0 = 不限：一条失控的查询能占着池里的
+      // 一个连接直到跑完，几条就能让整个实例的其它请求全部卡在取连接超时上。
+      statement_timeout: 15_000,
     });
   });
 
-  it('reads both knobs from the environment', () => {
+  it('reads every knob from the environment', () => {
     expect(
       resolveDatabasePoolConfig({
         DATABASE_POOL_MAX: '25',
         DATABASE_POOL_ACQUIRE_TIMEOUT_MS: '3000',
+        DATABASE_STATEMENT_TIMEOUT_MS: '5000',
       }),
-    ).toEqual({ max: 25, connectionTimeoutMillis: 3000 });
+    ).toEqual({
+      max: 25,
+      connectionTimeoutMillis: 3000,
+      statement_timeout: 5000,
+    });
   });
 
   it('falls back to defaults for unusable values rather than failing boot', () => {
@@ -55,10 +63,15 @@ describe('resolveDatabasePoolConfig', () => {
         DATABASE_POOL_MAX: 'ten',
         DATABASE_POOL_ACQUIRE_TIMEOUT_MS: '0',
       }),
-    ).toEqual({ max: 10, connectionTimeoutMillis: 10_000 });
+    ).toEqual({
+      max: 10,
+      connectionTimeoutMillis: 10_000,
+      statement_timeout: 15_000,
+    });
     expect(resolveDatabasePoolConfig({ DATABASE_POOL_MAX: '-5' })).toEqual({
       max: 10,
       connectionTimeoutMillis: 10_000,
+      statement_timeout: 15_000,
     });
   });
 });
@@ -109,6 +122,7 @@ describe('PrismaService', () => {
       connectionString: 'postgresql://example',
       max: 10,
       connectionTimeoutMillis: 10_000,
+      statement_timeout: 15_000,
     });
   });
 
