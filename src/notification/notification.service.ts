@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  ForbiddenException,
   HttpException,
   HttpStatus,
   Injectable,
@@ -104,6 +105,30 @@ export class NotificationService {
     const revocationSecretHash = dto.revocationSecret
       ? this.hashRevocationSecret(dto.revocationSecret)
       : undefined;
+
+    // 换绑保护：upsert 的键是 token 本身。没有这道校验的话，任何拿到别人设备令牌的人
+    // 都能把它改挂到自己账号下 —— 受害者从此收不到自己的推送，反而会在锁屏上收到
+    // 攻击者的通知；而且这次 update 还会把原有的 revocationSecretHash 直接置空，
+    // 把设备侧的撤销能力一并抹掉。
+    // 规则：令牌已属于别人时，必须出示与登记时一致的 revocationSecret 才允许换绑
+    // （同一台设备换账号登录是正常场景，客户端本来就持有这个 secret）。
+    const existing = await this.prisma.devicePushToken.findUnique({
+      where: { token: dto.token },
+      select: { userID: true, revocationSecretHash: true },
+    });
+    if (existing && existing.userID !== userId) {
+      const proven =
+        !!existing.revocationSecretHash &&
+        !!revocationSecretHash &&
+        existing.revocationSecretHash === revocationSecretHash;
+      if (!proven) {
+        this.logger.warn(
+          `Rejected push-token rebind: token is owned by another account (requester=${userId})`,
+        );
+        throw new ForbiddenException('Push token belongs to another account');
+      }
+    }
+
     await this.prisma.devicePushToken.upsert({
       where: { token: dto.token },
       create: {

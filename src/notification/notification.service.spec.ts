@@ -1,4 +1,6 @@
+import { ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationService } from './notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -23,6 +25,7 @@ describe('NotificationService', () => {
       createManyAndReturn: jest.fn(),
     },
     devicePushToken: {
+      findUnique: jest.fn(),
       upsert: jest.fn(),
       deleteMany: jest.fn(),
     },
@@ -539,6 +542,44 @@ describe('NotificationService', () => {
           revocationSecretHash: null,
         },
       });
+    });
+
+    it('refuses to rebind a token owned by another account', async () => {
+      // 拿到别人的设备令牌就能改挂到自己名下 = 受害者收不到自己的推送，反而在锁屏上
+      // 收到攻击者的通知；顺带还把设备侧的撤销密钥抹掉。
+      prisma.devicePushToken.findUnique.mockResolvedValue({
+        userID: 'victim',
+        revocationSecretHash: 'hash-of-victim-secret',
+      });
+
+      await expect(
+        service.registerPushToken('attacker', {
+          token: 'ExponentPushToken[abc]',
+          platform: 'ios',
+          provider: 'expo',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.devicePushToken.upsert).not.toHaveBeenCalled();
+    });
+
+    it('allows rebinding when the caller proves the revocation secret', async () => {
+      // 同一台设备换账号登录是正常场景：客户端手里本来就有这个 secret。
+      const secret = 'device-secret';
+      const hash = createHash('sha256').update(secret).digest('hex');
+      prisma.devicePushToken.findUnique.mockResolvedValue({
+        userID: 'previous-owner',
+        revocationSecretHash: hash,
+      });
+      prisma.devicePushToken.upsert.mockResolvedValue({ id: 'token-row-1' });
+
+      await service.registerPushToken('new-owner', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+        revocationSecret: secret,
+      });
+
+      expect(prisma.devicePushToken.upsert).toHaveBeenCalled();
     });
 
     it('deletes only the current user device push token', async () => {

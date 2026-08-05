@@ -159,6 +159,13 @@ export class UserController {
   }
 
   @Patch('/:id')
+  // 这是全站最重的写：一次调用会失效并重算 profile summary 缓存、向订阅者广播、
+  // 并往 OpenIM 同步 outbox 里写行。之前它一道路由级限流都没有，只剩 300 次/分钟/IP
+  // 的全局兜底 —— 一个脚本循环改昵称就能把广播和同步队列打满。
+  // 按账号而不是 IP 计数（UserThrottlerGuard），免得运营商 NAT 后的用户互相牵连。
+  // 30 次/分钟对真人编辑资料绰绰有余，与本文件其它写接口保持一致。
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Serialize(SelfUserDto)
   @ApiOperation({ summary: 'Update a user (self or admin)' })
   @ApiOkResponse({ description: 'Updated user', type: SelfUserDto })
