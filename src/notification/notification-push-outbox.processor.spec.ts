@@ -1,4 +1,79 @@
-import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
+import {
+  NotificationPushOutboxProcessor,
+  selectFairBatch,
+} from './notification-push-outbox.processor';
+
+describe('selectFairBatch', () => {
+  const job = (fromUserID: string, seq: number) => ({
+    id: `${fromUserID}-${seq}`,
+    notification: { fromUserID },
+  });
+
+  it('stops one sender from starving everyone else out of a tick', () => {
+    // 攻击者一次发圈帖扇出 500 条，而出队是 100 条/分钟。按 createdAt 升序取的话，
+    // 这 100 个名额会被攻击者全部占满，后面排队的好友请求 / 评论回复一条也发不出去 ——
+    // 脚本跑十分钟就能买到约两小时的全站推送黑屏。
+    const flood = Array.from({ length: 500 }, (_, i) => job('attacker', i));
+    const legit = [job('alice', 0), job('bob', 0), job('carol', 0)];
+    const picked = selectFairBatch([...flood, ...legit]);
+
+    const senders = picked.map((p) => p.notification?.fromUserID);
+    expect(senders.filter((s) => s === 'attacker').length).toBeLessThanOrEqual(
+      10,
+    );
+    // 正常用户必须在同一个 tick 里就发出去，而不是排在 500 条洪水后面。
+    for (const victim of ['alice', 'bob', 'carol']) {
+      expect(senders).toContain(victim);
+    }
+  });
+
+  it('leaves a normal backlog untouched and preserves arrival order', () => {
+    // 没有洪水时不该改变任何行为：候选不超过一批就原样返回。
+    const jobs = [job('alice', 0), job('bob', 0), job('alice', 1)];
+    expect(selectFairBatch(jobs)).toEqual(jobs);
+  });
+
+  it('still fills the whole batch, and spreads it across senders', () => {
+    // 名额不能因为限流而空着 —— 否则公平调度反倒把整体吞吐打下去了。
+    // 发送者足够多时轮转在第一轮就取满，于是攻击者只拿到 1 条（比上限 10 更公平）。
+    const flood = Array.from({ length: 300 }, (_, i) => job('attacker', i));
+    const others = Array.from({ length: 200 }, (_, i) => job(`user-${i}`, 0));
+    const picked = selectFairBatch([...flood, ...others]);
+
+    expect(picked).toHaveLength(100);
+    expect(
+      picked.filter((p) => p.notification?.fromUserID === 'attacker').length,
+    ).toBeLessThanOrEqual(10);
+    // 一个 tick 里应该覆盖到尽可能多的发送者，而不是被少数几个占满。
+    expect(new Set(picked.map((p) => p.notification?.fromUserID)).size).toBe(
+      100,
+    );
+  });
+
+  it('gives a sender its full quota when there are few senders', () => {
+    // 只有两个发送者时，攻击者拿满 10 条上限，其余名额归另一个人 —— 上限生效，
+    // 但不会因为「候选里发送者少」就让批次发不满。
+    const flood = Array.from({ length: 300 }, (_, i) => job('attacker', i));
+    const alice = Array.from({ length: 300 }, (_, i) => job('alice', i));
+    const picked = selectFairBatch([...flood, ...alice]);
+
+    expect(
+      picked.filter((p) => p.notification?.fromUserID === 'attacker'),
+    ).toHaveLength(10);
+    expect(
+      picked.filter((p) => p.notification?.fromUserID === 'alice'),
+    ).toHaveLength(10);
+  });
+
+  it('does not bucket unrelated senderless rows together', () => {
+    // fromUserID 取不到时若归成同一个桶，它们会互相饿死；每条应自成一组。
+    const orphans = Array.from({ length: 200 }, () => ({
+      id: 'x',
+      notification: null,
+    }));
+    expect(selectFairBatch(orphans)).toHaveLength(100);
+  });
+});
 
 const notification = {
   id: 'notification-1',

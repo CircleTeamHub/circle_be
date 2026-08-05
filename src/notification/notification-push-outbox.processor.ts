@@ -16,6 +16,68 @@ const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
 /**
+ * 一次 tick 里，同一个发送者最多占多少个投递名额。
+ *
+ * 为什么需要这个：出队是 BATCH_SIZE 条/分钟，而一次发圈帖扇出上限 500 人
+ * （CIRCLE_POST_PUBLISH_FANOUT_CAP），发帖接口限流是 40 次/15 分钟/IP —— 单个账号
+ * 就能以约 1300 条/分钟往队列里灌，比出队快 13 倍。队列按 createdAt 升序取，于是
+ * 正常推送（好友请求、评论回复、系统通知）全部排在洪水后面：脚本跑十分钟就能买到
+ * 约两小时的全站推送黑屏。
+ *
+ * 公平调度只改「先发谁」，不提高发送速率 —— 对推送服务商的压力一点没变，因此不存在
+ * 被上游限流或封禁的风险。攻击者仍会占满自己的配额，但吃不掉别人的。
+ */
+const MAX_PER_SENDER_PER_TICK = 10;
+/** 要挑出公平的一批，得看比 BATCH_SIZE 更大的窗口 —— 否则窗口本身就已被洪水占满。 */
+const CANDIDATE_WINDOW = BATCH_SIZE * 10;
+
+type FairJob = { notification?: { fromUserID?: string | null } | null };
+
+/**
+ * 按发送者轮转取批：先按 createdAt 顺序分组，再一轮一轮地每个发送者取一条，
+ * 直到取满 batchSize 或候选耗尽。组内保持原有先后（老的先发）。
+ *
+ * 导出是为了能脱离数据库直接测这套调度逻辑。
+ */
+export function selectFairBatch<T extends FairJob>(
+  candidates: readonly T[],
+  batchSize = BATCH_SIZE,
+  maxPerSender = MAX_PER_SENDER_PER_TICK,
+): T[] {
+  if (candidates.length <= batchSize) return [...candidates];
+
+  // Map 保留插入顺序 = 各发送者首次出现的先后，所以轮转本身也偏向最早排队的人。
+  const bySender = new Map<string, T[]>();
+  for (const job of candidates) {
+    // 取不到发送者时每条自成一组 —— 归进同一个桶会让它们互相饿死。
+    const key = job.notification?.fromUserID ?? `__unknown__:${bySender.size}`;
+    const bucket = bySender.get(key);
+    if (bucket) bucket.push(job);
+    else bySender.set(key, [job]);
+  }
+
+  const picked: T[] = [];
+  const queues = [...bySender.values()];
+  for (
+    let round = 0;
+    round < maxPerSender && picked.length < batchSize;
+    round += 1
+  ) {
+    let tookAny = false;
+    for (const queue of queues) {
+      if (picked.length >= batchSize) break;
+      const job = queue[round];
+      if (job) {
+        picked.push(job);
+        tookAny = true;
+      }
+    }
+    if (!tookAny) break;
+  }
+  return picked;
+}
+
+/**
  * Push outbox 处理器（#88 重构后）。
  *
  * 旧行为的两处硬伤：outbox 只有整通知一行，部分 token 失败 → 整通知重发 →
@@ -39,7 +101,7 @@ export class NotificationPushOutboxProcessor {
   async processPending(): Promise<number> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);
-    const jobs = await this.prisma.notificationPushOutbox.findMany({
+    const candidates = await this.prisma.notificationPushOutbox.findMany({
       where: {
         OR: [
           { status: 'PENDING', nextAttemptAt: { lte: now } },
@@ -48,9 +110,10 @@ export class NotificationPushOutboxProcessor {
         ],
       },
       orderBy: { createdAt: 'asc' },
-      take: BATCH_SIZE,
+      take: CANDIDATE_WINDOW,
       include: { notification: { include: NOTIFICATION_REALTIME_INCLUDE } },
     });
+    const jobs = selectFairBatch(candidates);
     let processed = 0;
     for (const job of jobs) {
       const claimNow = new Date();
