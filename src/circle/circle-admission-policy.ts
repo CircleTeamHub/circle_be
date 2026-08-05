@@ -13,7 +13,6 @@ import { CircleErrorCode } from 'src/common/app-error-codes';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipLevel } from 'src/membership/membership.catalog';
 import { reserveCircleSeats } from './circle-capacity';
-import { CIRCLE_JOIN_LIMIT } from './circle-limits';
 import { CircleMemberLockService } from './circle-member-lock';
 import { resolveEffectiveFancyNumber } from 'src/fancy-number/fancy-number-status';
 
@@ -140,10 +139,11 @@ export class CircleAdmissionPolicy {
         program,
         now,
       );
-      if ((joinedCountByUserID.get(userID) ?? 0) >= CIRCLE_JOIN_LIMIT) {
+      const joinLimit = effective.tier.quotas.joinedCircles.actual;
+      if ((joinedCountByUserID.get(userID) ?? 0) >= joinLimit) {
         // 所有调用点（审批通过、管理员放行、圈内邀请入群）里被激活的都是别人，
         // 错误回给操作者，所以默认之外的 actor 必须由调用方显式声明。
-        this.throwJoinLimitReached(options.actor ?? 'self');
+        this.throwJoinLimitReached(options.actor ?? 'self', joinLimit);
       }
       this.assertRestrictions(
         circle,
@@ -271,19 +271,6 @@ export class CircleAdmissionPolicy {
         status: CircleMemberStatus.ACTIVE,
       },
     });
-    if (joinedCount >= CIRCLE_JOIN_LIMIT) {
-      this.throwJoinLimitReached(actor);
-    }
-
-    if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
-      throw new BadRequestException({
-        message: 'Circle has reached its member limit',
-        errorCode: CircleErrorCode.MemberLimit,
-        limit: circle.maxMembers,
-        details: { limit: circle.maxMembers },
-      });
-    }
-
     const candidate = await tx.user.findUnique({
       where: { id: userID },
       select: {
@@ -303,6 +290,20 @@ export class CircleAdmissionPolicy {
       now,
       { lockForWrite: true },
     );
+    const joinLimit = effective.tier.quotas.joinedCircles.actual;
+    if (joinedCount >= joinLimit) {
+      this.throwJoinLimitReached(actor, joinLimit);
+    }
+
+    if (circle.maxMembers != null && circle.memberCount >= circle.maxMembers) {
+      throw new BadRequestException({
+        message: 'Circle has reached its member limit',
+        errorCode: CircleErrorCode.MemberLimit,
+        limit: circle.maxMembers,
+        details: { limit: circle.maxMembers },
+      });
+    }
+
     this.assertRestrictions(
       circle,
       {
@@ -374,7 +375,10 @@ export class CircleAdmissionPolicy {
    * 加入上限的唯一抛出点。两条写路径（申请、激活）共用，保证同一条规则不会
    * 因为调用方不同而给出两套字段。
    */
-  private throwJoinLimitReached(actor: 'self' | 'third-party'): never {
+  private throwJoinLimitReached(
+    actor: 'self' | 'third-party',
+    limit: number,
+  ): never {
     // 邀请 / 审批路径下受限的是别人：不能带 limit / quota / details，也不能复用
     // INVITATION_NOT_ALLOWED —— 那个码的既有语义是「对方隐私设置不接受邀请」
     // (circle-invitation.service.ts)，客户端文案是「对方不接受圈子邀请」，
@@ -389,10 +393,10 @@ export class CircleAdmissionPolicy {
       message: 'Joined circle membership quota reached',
       errorCode: CircleErrorCode.JoinLimitReached,
       quota: 'joined-circles',
-      limit: CIRCLE_JOIN_LIMIT,
+      limit,
       details: {
         quota: 'joined-circles',
-        limit: CIRCLE_JOIN_LIMIT,
+        limit,
       },
     });
   }

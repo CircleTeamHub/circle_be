@@ -85,8 +85,8 @@ export const FancyNumberErrorCode = {
 
 export const CircleErrorCode = {
   MemberLimit: 'CIRCLE_MEMBER_LIMIT',
-  // 用户已加满 CIRCLE_JOIN_LIMIT 个 ACTIVE 非 OWNER 圈子。与会员档位无关，
-  // 所有档位同一上限，因此不再复用会员配额错误码。
+  // 用户已达到当前会员档位的 ACTIVE 非 OWNER 圈子额度。
+  // 当前统一使用圈子域错误码，具体数值由会员目录提供。
   JoinLimitReached: 'CIRCLE_JOIN_LIMIT_REACHED',
   // 同一条上限，但受限的是别人（邀请人邀请他人、圈主审批他人申请）：错误回给
   // 操作者，所以不带 limit / quota / details，客户端文案也另写一句。

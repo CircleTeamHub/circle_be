@@ -73,10 +73,10 @@ describe('CircleAdmissionPolicy', () => {
     prisma.user.findUnique.mockResolvedValue(user());
   });
 
-  it('keeps the joined-circle hard limit at 100 while membership rollout is disabled', async () => {
+  it('uses the gold joined-circle limit while membership rollout is disabled', async () => {
     programEnabled = false;
     prisma.circleMember.groupBy.mockResolvedValue([
-      { userID: 'candidate-1', _count: { _all: 100 } },
+      { userID: 'candidate-1', _count: { _all: 300 } },
     ]);
 
     await expect(
@@ -84,17 +84,17 @@ describe('CircleAdmissionPolicy', () => {
     ).rejects.toMatchObject({
       response: {
         errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
-        limit: 100,
+        limit: 300,
       },
     });
   });
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [4, null, 100],
+    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
+    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
+    [4, null, 2000],
   ])(
     'allows effective level %i at limit - 1 and exposes its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
@@ -124,10 +124,10 @@ describe('CircleAdmissionPolicy', () => {
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 100],
-    [4, null, 100],
+    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
+    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
+    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
+    [4, null, 2000],
   ])(
     'denies effective level %i at its joined-circle limit',
     async (vipLevel, vipExpiresAt, limit) => {
@@ -273,15 +273,18 @@ describe('CircleAdmissionPolicy', () => {
     });
   });
 
-  it('rejects a new application immediately when the user is already at the hard limit', async () => {
-    prisma.circleMember.count.mockResolvedValue(100);
+  it('rejects a new application at the effective membership limit', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      user({ vipLevel: 2, vipExpiresAt: new Date('2026-08-21T00:00:00.000Z') }),
+    );
+    prisma.circleMember.count.mockResolvedValue(300);
 
     await expect(
       policy.assertCanApply(prisma as any, 'circle-1', 'candidate-1'),
     ).rejects.toMatchObject({
       response: {
         errorCode: 'CIRCLE_JOIN_LIMIT_REACHED',
-        limit: 100,
+        limit: 300,
       },
     });
     expect(prisma.circleMember.count).toHaveBeenCalledWith({
@@ -361,7 +364,7 @@ describe('CircleAdmissionPolicy', () => {
       },
     });
     expect(prisma.circleMember.count).toHaveBeenCalled();
-    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.user.findUnique).toHaveBeenCalled();
   });
 
   it.each([

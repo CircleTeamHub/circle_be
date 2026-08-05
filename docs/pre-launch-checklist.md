@@ -52,10 +52,9 @@ const level = program.enabled
 | 广场城市筛选 | `circle-plaza.service.ts:486` | `CITY_FILTER_QUOTA_REACHED` |
 | 笔记存储 | `note.service.ts:400`(`assertNoteStorageAvailable`) | `NOTE_STORAGE_QUOTA_REACHED` |
 
-上表前三行的两条圈子数量上限**与会员档位无关** —— 所有档位同为「最多建 20 个、最多加入
-100 个」,定义在 `circle/circle-limits.ts`,不读 `MEMBERSHIP_CATALOG`。目录里的
-`joinedCircles` 只供会员中心展示,`circle-limits.spec.ts` 断言两者数值一致,避免宣传口径与
-执行口径漂移。
+建圈上限与会员档位无关，所有档位最多建 20 个，定义在 `circle/circle-limits.ts`。入圈上限
+读取 `MEMBERSHIP_CATALOG[*].quotas.joinedCircles`：普通用户 100，Silver 200，Gold 300，
+Diamond 1000，Super 2000；只统计 ACTIVE 且非 OWNER 的成员关系。
 
 其中「建圈时申报的容量」容易被漏掉:`CircleService.create` 校验的是**请求里申报的
 `maxMembers`**(`maxMembers > quotas.groupMembers.actual` 即拒),不是已有成员数。因此在
