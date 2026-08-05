@@ -14,6 +14,7 @@ import {
   CreateBucketCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
+  ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
@@ -337,6 +338,48 @@ export class UploadService implements OnModuleInit {
         'Content-Length': String(sizeBytes),
         'If-None-Match': '*',
       },
+    };
+  }
+
+  /**
+   * 分页列出某个前缀下的对象。目前只服务于存量盘点（StorageAuditService）。
+   *
+   * 刻意不提供删除方法：本仓库至今没有任何一处删除 MinIO 对象，先把「哪些对象没人
+   * 引用」查清楚、人工核对过，再谈删。判错一个对象就是删掉用户的头像或笔记配图。
+   */
+  async listObjects(
+    prefix: string,
+    continuationToken?: string,
+  ): Promise<{
+    objects: { key: string; size: number; lastModified: Date | null }[];
+    nextContinuationToken?: string;
+  }> {
+    if (!this.enabled) {
+      return { objects: [] };
+    }
+
+    const response = await this.client.send(
+      new ListObjectsV2Command({
+        Bucket: this.bucket,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+        MaxKeys: 1000,
+      }),
+    );
+
+    return {
+      objects: (response.Contents ?? [])
+        .filter((item): item is typeof item & { Key: string } =>
+          Boolean(item.Key),
+        )
+        .map((item) => ({
+          key: item.Key,
+          size: item.Size ?? 0,
+          lastModified: item.LastModified ?? null,
+        })),
+      nextContinuationToken: response.IsTruncated
+        ? response.NextContinuationToken
+        : undefined,
     };
   }
 
