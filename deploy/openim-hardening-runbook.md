@@ -53,9 +53,18 @@ cd ~/circle_be && docker compose -f docker-compose.prod.yml up -d --force-recrea
 # 在役为绿时改用: docker compose -f docker-compose.prod.yml up -d --force-recreate circle_be_green
 # 或者干脆走常规发版脚本（自带健康检查与切流）: bash deploy/release-deploy.sh
 
-# 5) OpenIM 栈内存上限（#107；docker update 对运行中容器即时生效，重启后仍保留）
-docker ps --format '{{.Names}}' | grep -Ei 'openim|mongo|kafka|zookeeper|etcd' \
-  | xargs -I{} docker update --memory 1g --memory-swap 1g {}
+# 5) OpenIM 栈内存上限
+# 已改为由第 1 步的脚本写 ~/openim-docker/docker-compose.override.yml（compose 会自动
+# 加载这个文件名）。上一步的 force-recreate 就已经带上了上限，这里只需核对：
+docker inspect --format '{{.Name}} mem={{.HostConfig.Memory}}' \
+  $(docker ps -q) | grep -Ei 'openim|mongo|kafka|zookeeper|etcd'
+# 预期每个都是 1073741824（1g）而不是 0。额度不合适就改：
+#   OPENIM_MEM_LIMIT=2g bash deploy/openim-harden.sh ~/openim-docker
+#   cd ~/openim-docker && docker compose up -d
+#
+# 为什么不再用 `docker update --memory`：那只作用于**当前这批容器**，之后任何一次
+# force-recreate（升级上游、回滚、重跑本 runbook）都会建出没有上限的新容器，且不报
+# 任何错 —— 直到一次消息洪泛把 mongo/kafka 吃爆内存、连业务栈一起拖垮（同机部署）。
 
 # 6) 验证
 # 6a. 旧默认密钥必须已失效（预期返回错误）：
@@ -67,12 +76,53 @@ ss -tlnp | grep -E '12379|12380'      # 预期只见 127.0.0.1
 # 6c. 客户端冒烟：app 收发一条消息（token 自愈会自动完成重登）
 # 6d. circle_be 侧：日志无 OpenIM auth 错误，/readyz 正常
 
-# 7) #110 —— 确认 OpenIM metrics 端口后启用抓取
+# 7) #110 —— 打通 OpenIM metrics 抓取
+# openim job 现在默认是**启用**的（不再是注释）：聊天消息不经过 circle_be，这是唯一
+# 能看见消息吞吐与连接数的地方，关掉它等于恶意刷屏在监控上完全不可见。
+#
+# ⚠️ 光确认端口号不够：上游 openim-docker 默认**不发布** metrics 端口到宿主机，
+# 容器内监听 ≠ Prometheus（在另一套 compose 里，经 host.docker.internal）能抓到。
+# 两步都要做：
+# 7a. 确认容器内真实端口（版本不同会变）：
 grep -rn "prometheusPort\|ports:" ~/openim-docker/config 2>/dev/null | grep -i prom | head
+# 7b. 在 ~/openim-docker/docker-compose.yaml 给对应服务加端口映射（用 ${HOST_BIND_IP}
+#     前缀，收口后会随之只对内网可见）：
+#       ports:
+#         - "${HOST_BIND_IP}:20112:20112"   # msggateway
+#         - "${HOST_BIND_IP}:20113:20113"   # openim-api
+#     加固脚本已把这两个端口放进放行清单，重跑不会把它们钉掉；端口号不同时用
+#     OPENIM_METRICS_PORTS="20112 20113" 覆盖，否则下次重跑会把它们收走、监控再次变瞎。
 # round 3 review：生产 compose 挂载的是 prometheus.prod.yml（覆盖容器内
-# /etc/prometheus/prometheus.yml）——生产环境改 prod 文件，dev 才改
-# prometheus.yml；两个文件里都留了同款 openim job 模板注释。填好后:
+# /etc/prometheus/prometheus.yml）——生产环境改 prod 文件，dev 才改 prometheus.yml。
+# 端口对不上时不会污染别的 job，只会让 OpenIMMetricsUnreachable（warning）响；
+# 它被有意排除在 critical 的 TargetDown 之外，理由见 monitoring/prometheus/alerts.yml。
+# 填好后:
 docker exec circle-prometheus kill -HUP 1   # 或 curl -X POST localhost:9090/-/reload
+# 验证抓到了:
+curl -s localhost:9090/api/v1/targets | grep -o '"job":"openim"[^}]*"health":"[a-z]*"' | head
+
+# 8) 收口（域名 + Caddy 就绪后才做，做完客户端不能再直连网关）
+# 前置 8a：客户端已发版到 wss://<域名>/openim-ws + https://<域名>/openim-api
+# 前置 8b：Caddy 必须先换成带 rate_limit 模块的自建镜像。不换的话 Caddyfile 里的
+#          rate_limit 是未知指令 —— 发版时 caddy validate 直接失败、拒绝切流，
+#          而且 caddy 一旦重启就 crash-loop（公网入口整个消失）。
+#          release-deploy.sh 已加前置检查会拦住，但这一步要主动做：
+cd ~/circle_be
+docker compose -f docker-compose.prod.yml build caddy
+docker compose -f docker-compose.prod.yml up -d --force-recreate caddy
+docker compose -f docker-compose.prod.yml exec -T caddy caddy list-modules | grep rate_limit
+
+# 8c：收口。⚠️ 绑定地址是 docker bridge 网关（如 172.17.0.1），**不是 127.0.0.1**：
+# Caddy 在容器里经 host.docker.internal 回连宿主机，绑回环 = Caddy 也连不上 =
+# 刚迁过来的客户端 100% 中断，而 ss 看着一切正常。脚本会自动探测 bridge IP。
+bash deploy/openim-harden.sh ~/openim-docker --collapse-public-ports
+cd ~/openim-docker && docker compose up -d --force-recreate
+
+# 8d：验证。ss 只能证明「公网关上了」，证明不了「Caddy 还连得上」——两件事必须都查。
+ss -tlnp | grep -E '10001|10002'   # 预期是 bridge IP，不是 0.0.0.0
+curl -sS https://<API_DOMAIN>/openim-api/ -o /dev/null -w '%{http_code}\n'
+# 期望 OpenIM 自己的应答（4xx / JSON 错误都算通过）。502 = 上游不可达，
+# 立刻回滚（把 .env 的 HOST_BIND_IP 改回去 + force-recreate）再排查。
 ```
 
 ## 回滚
@@ -88,7 +138,8 @@ docker compose up -d --force-recreate
 ## 遗留（有意不在本次覆盖）
 
 - `HOST_BIND_IP` 仍为 0.0.0.0：10001/10002 测试期必须直连（无域名/无 TLS）。
-  域名 + Caddy 反代就绪后，把 `.env` 的 `HOST_BIND_IP` 切成 `127.0.0.1` 并
-  force-recreate，即完成最后一步收口（届时客户端走 wss://域名/openim-ws）。
+  收口已脚本化，见上面第 8 步（`--collapse-public-ports`）—— 但**必须等客户端发版
+  改走域名之后再执行**，否则 force-recreate 当场断掉所有直连客户端。
+  收口前 Caddyfile 里的 rate_limit 全部被绕过，等于不存在。
 - Tencent 安全组若已挡 12379/12380/37017/16379，上面第 6b 步会提前显得"已经
   安全"—— 仍建议完成回环绑定（纵深防御，安全组误改不再等于门户洞开）。

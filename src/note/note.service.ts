@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MembershipErrorCode, NoteErrorCode } from 'src/common/app-error-codes';
-import { randomBytes, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
@@ -700,7 +700,21 @@ export class NoteService {
     if (!this.uploadService) {
       throw new ServiceUnavailableException('File export is not configured');
     }
-    const key = `note-exports/${input.ownerID}/${input.noteID}/${randomUUID()}-${input.filename}`;
+    // key 用内容哈希而不是 randomUUID：同一篇笔记、同一种格式、同样的内容重复导出
+    // 时复用同一个对象，而不是每次落一个新的永久对象。
+    //
+    // 之前是每调用一次就新建一个 key，而后端没有任何删除对象的代码路径，于是一个
+    // 循环调用导出的脚本能持续往磁盘里堆几十上百 GiB —— 和 Postgres 同机，写满时
+    // 倒下的是数据库。now 生命周期规则（docker-compose minio-init）把上限压到一天，
+    // 这里再把「同样的内容反复占新空间」这条也堵掉：内容不变则 key 不变，PUT 覆盖
+    // 同一个对象。内容变了哈希才变，所以不会返回过期的导出。
+    const contentHash = createHash('sha256')
+      .update(input.mimeType)
+      .update(input.filename)
+      .update(input.body)
+      .digest('hex')
+      .slice(0, 32);
+    const key = `note-exports/${input.ownerID}/${input.noteID}/${contentHash}-${input.filename}`;
     const uploaded = await this.uploadService.uploadBuffer({
       key,
       body: input.body,
