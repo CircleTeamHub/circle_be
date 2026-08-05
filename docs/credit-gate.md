@@ -12,6 +12,18 @@
 
 > 若将来确实需要聊天层强制：before-send 回调实现（controller + guard + `checkOpenimSend` 缓存）曾建于 `src/credit/`，因长期未启用已删除（见 git 历史），可作为重建起点；但需先 patch OpenIM 让 `failedContinue` 真正生效（fail-open），否则勿在生产开启。
 
+**2026-08 复核：阻塞点仍然成立。** 重新读了 openim-server `main` 分支的
+`pkg/common/webhook/http_client.go` —— `SyncPost` / `AsyncPost` 把 `post()` 的错误原样
+返回（网络错 → `ErrNetwork`、解析错 → `ErrData`、`output.Parse()` 的错也照抛），
+全文件没有任何读取 `failedContinue`、据此吞错继续的分支。结论不变：**不要重建
+before-send 回调**，除非先 patch OpenIM。
+
+消息长度这类**不需要业务上下文**的限制，已改由网关本地强制：`websocketMaxMsgLen`
+（见 `deploy/openim-harden.sh` 的 2d 段与 runbook 第 7b 步）。它在网关内判定、不依赖
+任何外部服务，没有 fail-closed 风险。需要服务端强制时应优先找这类本地配置，
+而不是回调 —— 回调只适合真正需要业务上下文的判断（如信誉分），而那正是本文档
+判定「不值得用聊天可用性去换」的东西。
+
 ## 现在的两层
 
 ### 1. 客户端 UX 预检（circle-im，非强制）

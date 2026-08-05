@@ -315,6 +315,44 @@ write_resource_override() {
 }
 write_resource_override
 
+# ── 2d. 网关消息大小上限 ────────────────────────────────────────────────────
+# 消息文本长度在服务端**唯一**能安全强制的地方。
+#
+# 为什么不是 before-send webhook：OpenIM 的 webhook 客户端直接上抛回调错误，
+# `failedContinue` 只是个从未被读取的配置字段（2026-08 复核 openim-server main 的
+# pkg/common/webhook/http_client.go，仍然如此）。于是回调是 fail-CLOSED —— circle_be
+# 一挂或一慢就阻塞**全体**消息，连每次部署重启的窗口都算。这套曾建过又被删，
+# 原因与证据见 docs/credit-gate.md，别再重建，除非先 patch OpenIM。
+#
+# websocketMaxMsgLen 没有这个问题：它在网关本地判定，不依赖任何外部服务，超限的
+# 包直接被拒。客户端映射层也有 8000 字的渲染截断，但那只保护自家用户、拦不住
+# 「发出去」这一侧；这条才是拦住发送的那道。
+OPENIM_MAX_MSG_LEN="${OPENIM_MAX_MSG_LEN:-16384}"
+harden_ws_msg_len() {
+  local cfg
+  # `|| true` 不能省：脚本开了 set -euo pipefail，glob 不匹配时这条管道非零退出，
+  # 会让整个加固脚本从这里静默中止 —— 而此前的改动已经落盘，只做了一半。
+  cfg="$(ls "$OPENIM_DIR"/config/openim-msggateway.y*ml 2>/dev/null | head -1 || true)"
+  if [ -z "$cfg" ]; then
+    echo "⚠ 找不到 openim-msggateway 配置 —— 跳过消息大小上限，请人工确认"
+    echo "  （在 longConnSvr 段设 websocketMaxMsgLen: ${OPENIM_MAX_MSG_LEN}）"
+    return 0
+  fi
+  backup "$cfg"
+  local current
+  current="$(grep -E '^\s*websocketMaxMsgLen:' "$cfg" | head -1 | sed -E 's/.*:\s*//')"
+  if [ "$current" = "$OPENIM_MAX_MSG_LEN" ]; then
+    echo "已是目标值: websocketMaxMsgLen=${OPENIM_MAX_MSG_LEN}"
+  elif [ -n "$current" ]; then
+    sed -i.sedbak -E "s|^(\s*websocketMaxMsgLen:).*|\1 ${OPENIM_MAX_MSG_LEN}|" "$cfg" \
+      && rm -f "$cfg.sedbak"
+    echo "已设 websocketMaxMsgLen=${OPENIM_MAX_MSG_LEN}（原为 ${current}）"
+  else
+    echo "⚠ 配置里没有 websocketMaxMsgLen —— 请人工在 longConnSvr 段补上"
+  fi
+}
+harden_ws_msg_len
+
 # ── 3. 汇总当前仍对 0.0.0.0 暴露的端口，供人工核对 ──────────────────────────
 echo
 if [ "$COLLAPSE_PUBLIC_PORTS" = 1 ]; then

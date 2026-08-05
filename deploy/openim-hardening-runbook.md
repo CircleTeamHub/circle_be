@@ -101,6 +101,18 @@ docker exec circle-prometheus kill -HUP 1   # 或 curl -X POST localhost:9090/-/
 # 验证抓到了:
 curl -s localhost:9090/api/v1/targets | grep -o '"job":"openim"[^}]*"health":"[a-z]*"' | head
 
+# 7b) 消息大小上限（第 1 步的脚本已自动写入，这里核对）
+grep -n websocketMaxMsgLen ~/openim-docker/config/openim-msggateway.yml
+# 预期 16384（上游默认 4096 对含 @提及 / 引用的正常消息偏紧）。
+# 需要别的值：OPENIM_MAX_MSG_LEN=32768 bash deploy/openim-harden.sh ~/openim-docker
+#
+# 这是服务端唯一能安全强制消息大小的地方。客户端映射层也有 8000 字的渲染截断，
+# 但那只保护自家用户、拦不住「发出去」那一侧。
+# 为什么不用 before-send webhook 做内容校验：OpenIM 的 webhook 客户端直接上抛回调
+# 错误，`failedContinue` 只是个从未被读取的配置字段（2026-08 复核 openim-server
+# main 的 pkg/common/webhook/http_client.go，仍然如此）。于是回调是 fail-CLOSED——
+# circle_be 一挂或一慢就阻塞全体消息，连部署重启的窗口都算。详见 docs/credit-gate.md。
+
 # 8) 收口（域名 + Caddy 就绪后才做，做完客户端不能再直连网关）
 # 前置 8a：客户端已发版到 wss://<域名>/openim-ws + https://<域名>/openim-api
 # 前置 8b：Caddy 必须先换成带 rate_limit 模块的自建镜像。不换的话 Caddyfile 里的

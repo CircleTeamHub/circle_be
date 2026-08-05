@@ -197,6 +197,15 @@ describe('production Redis deployment configuration', () => {
 
     // Kafka 的容器上限必须配套压堆，否则洪泛时 JVM 撑爆被 OOM kill 成崩溃循环。
     expect(harden).toContain('KAFKA_HEAP_OPTS');
+
+    // 消息大小上限：服务端唯一能安全强制的地方。before-send 回调是 fail-CLOSED
+    // （OpenIM 从不读 failedContinue，2026-08 复核仍如此），circle_be 一挂就阻塞
+    // 全体消息；websocketMaxMsgLen 在网关本地判定，没有这个风险。
+    expect(harden).toContain('websocketMaxMsgLen');
+    expect(harden).toContain('OPENIM_MAX_MSG_LEN');
+    // glob 不匹配时必须 `|| true`：脚本开着 set -euo pipefail，否则配置目录布局
+    // 一变就从这里静默中止，而此前的改动已经落盘、只做了一半。
+    expect(harden).toMatch(/openim-msggateway\.y\*ml[\s\S]{0,80}?\|\| true/);
     // metrics 端口要常驻放行，否则重跑加固会把它钉掉，洪泛重新变成不可见。
     expect(harden).toContain('OPENIM_METRICS_PORTS');
   });
