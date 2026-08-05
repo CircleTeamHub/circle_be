@@ -384,6 +384,34 @@ describe('OpenimService group/auth admin calls', () => {
     });
   });
 
+  it('forceLogoutAllPlatforms covers every platform that can hold a session', async () => {
+    const ok = await service.forceLogoutAllPlatforms('gX-Y-Z');
+
+    // force_logout 一次只作用于一个端。真实用户走 getUserToken 默认的 2（Android），
+    // 访客走 5（Web）—— 只按 forceLogout 的默认值 5 踢一个被封的正常用户，请求会成功
+    // 返回而人还在线，是个不报错的空操作。所以必须逐端覆盖。
+    const platforms = fetchMock.mock.calls
+      .filter(([u]) => String(u).endsWith('/auth/force_logout'))
+      .map(([, init]) => JSON.parse(init.body));
+
+    expect(ok).toBe(true);
+    expect(platforms).toHaveLength(3);
+    expect(platforms.map((p) => p.platformID).sort()).toEqual([1, 2, 5]);
+    expect(new Set(platforms.map((p) => p.userID))).toEqual(new Set(['gXYZ']));
+  });
+
+  it('forceLogoutAllPlatforms reports failure without throwing', async () => {
+    fetchMock.mockImplementation(async (url: string) => ({
+      json: async () =>
+        url.endsWith('/auth/get_admin_token')
+          ? { errCode: 0, data: { token: 'admin-token' } }
+          : { errCode: 1001, errMsg: 'boom' },
+    }));
+
+    // 封禁流程调用它：踢人失败不能把已提交的封禁操作也拖失败，但必须让调用方知道。
+    await expect(service.forceLogoutAllPlatforms('u1')).resolves.toBe(false);
+  });
+
   it('includes OpenIM errDlt details in thrown API errors', async () => {
     fetchMock.mockImplementation(async (url: string) => ({
       json: async () =>

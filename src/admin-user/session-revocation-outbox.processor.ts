@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 const SESSION_REVOCATION_BATCH_SIZE = 100;
@@ -8,6 +9,7 @@ const SESSION_REVOCATION_MAX_BACKOFF_MS = 60 * 60 * 1000;
 const SESSION_REVOCATION_CLAIM_LEASE_MS = 55 * 1000;
 const REVOCATION_UNAVAILABLE =
   'Redis revocation or socket broadcast unavailable';
+const IM_KICK_UNAVAILABLE = 'OpenIM force-logout unavailable';
 
 @Injectable()
 export class SessionRevocationOutboxProcessor {
@@ -16,6 +18,7 @@ export class SessionRevocationOutboxProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sessionRevocation: SessionRevocationService,
+    private readonly openim: OpenimService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -61,6 +64,13 @@ export class SessionRevocationOutboxProcessor {
           job.revokedAt.getTime(),
         );
         if (!revoked) throw new Error(REVOCATION_UNAVAILABLE);
+
+        // 撤销业务会话只挡住 circle_be 的 HTTP/WS；聊天消息不经过 circle_be，
+        // 被封的人拿着已签发的 IM token 直连 msggateway 就能继续发。两半都成
+        // 才算封禁生效，任一半失败都留着这行按退避重试。
+        // revokeUserAt 以 revokedAt 为幂等键，重试时重复执行是安全的。
+        const kicked = await this.openim.forceLogoutAllPlatforms(job.userID);
+        if (!kicked) throw new Error(IM_KICK_UNAVAILABLE);
 
         const deleted = await this.prisma.sessionRevocationOutbox.deleteMany({
           where: { userID: job.userID, revokedAt: job.revokedAt },

@@ -57,6 +57,13 @@ export interface OpenimAdminGroupList {
 
 @Injectable()
 export class OpenimService implements OnModuleInit {
+  /**
+   * 本系统会签发 IM token 的所有端。1=iOS、2=Android、5=Web。
+   * 真实用户走 getUserToken 默认的 2，临时聊天访客走 5；1 预留给显式传 iOS 的调用方。
+   * 封禁下线要逐端执行，见 forceLogoutAllPlatforms。
+   */
+  private static readonly LOGIN_PLATFORM_IDS = [1, 2, 5] as const;
+
   private readonly logger = new Logger(OpenimService.name);
   private readonly loggingConfig = createLoggingConfig();
   private adminToken: string | null = null;
@@ -785,6 +792,30 @@ export class OpenimService implements OnModuleInit {
       { userID: OpenimService.toImUserId(userID), platformID },
       adminToken,
     );
+  }
+
+  /**
+   * 把某用户在**所有端**踢下线。封禁 / 删号必须走这个，而不是 forceLogout()。
+   *
+   * force_logout 一次只作用于一个 platformID，而两条签发路径用的端并不一样：
+   * 真实用户走 getUserToken 的默认值 2（Android，platformID 全程没人显式传过），
+   * 临时聊天访客走 5（Web）。所以按 forceLogout 的默认值 5 去踢一个被封的正常用户，
+   * 请求会成功返回、人却还在线上继续发消息 —— 一个不会报错的空操作。
+   *
+   * 逐端调用而不是依赖某个「全部下线」的魔数：那取决于 OpenIM 版本，而本仓库并不
+   * 管理 OpenIM 的部署（配置在服务器上的独立 clone 里）。
+   *
+   * best-effort：任一端失败都不抛，返回是否全部成功，交调用方决定要不要记账重试。
+   */
+  async forceLogoutAllPlatforms(userID: string): Promise<boolean> {
+    if (!this.enabled) return true;
+
+    const results = await Promise.allSettled(
+      OpenimService.LOGIN_PLATFORM_IDS.map((platformID) =>
+        this.forceLogout(userID, platformID),
+      ),
+    );
+    return results.every((result) => result.status === 'fulfilled');
   }
 
   // ─── HTTP helper ─────────────────────────────────────────────────────────────

@@ -42,11 +42,15 @@ describe('AdminUserService', () => {
     invalidateUserProfileSummaryCache: jest.fn(),
     broadcastUserProfileSummary: jest.fn(),
   };
+  const openim = {
+    forceLogoutAllPlatforms: jest.fn(),
+  };
   const service = new AdminUserService(
     prisma as never,
     audit as never,
     sessionRevocation as never,
     realtime as never,
+    openim as never,
   );
 
   beforeEach(() => {
@@ -59,6 +63,7 @@ describe('AdminUserService', () => {
     prisma.sessionRevocationOutbox.deleteMany.mockResolvedValue({ count: 1 });
     realtime.invalidateUserProfileSummaryCache.mockResolvedValue(undefined);
     realtime.broadcastUserProfileSummary.mockResolvedValue(undefined);
+    openim.forceLogoutAllPlatforms.mockResolvedValue(true);
   });
 
   describe('listUsers', () => {
@@ -486,6 +491,96 @@ describe('AdminUserService', () => {
       });
     });
 
+    it.each([UserStatus.BANNED, UserStatus.DELETED])(
+      'force-logs the user out of OpenIM when moving to %s',
+      async (status) => {
+        tx.user.findUnique.mockResolvedValue({
+          id: 'user-1',
+          accountId: 'jim-1001',
+          status: UserStatus.ACTIVE,
+        });
+        tx.user.updateMany.mockResolvedValue({ count: 1 });
+        tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+        audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+        await service.updateStatus(actor, 'user-1', {
+          status,
+          reason: 'policy violation',
+          // 删号路径要求确认账号 ID 与目标一致；封禁路径忽略该字段。
+          confirmationAccountId: 'jim-1001',
+        });
+
+        // 撤销业务会话只挡住 circle_be 的 HTTP/WS。聊天消息不经过 circle_be，
+        // 被封的人拿着已签发的 IM token 直连 OpenIM 就能继续发消息 —— 不踢 IM
+        // 会话的封禁只是「登不进 app」。
+        expect(openim.forceLogoutAllPlatforms).toHaveBeenCalledWith('user-1');
+      },
+    );
+
+    it('does not force-log out OpenIM when unbanning', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.BANNED,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.ACTIVE,
+        reason: 'appeal accepted',
+      });
+
+      expect(openim.forceLogoutAllPlatforms).not.toHaveBeenCalled();
+    });
+
+    it('leaves the revocation outbox row when the OpenIM kick fails', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+      openim.forceLogoutAllPlatforms.mockResolvedValue(false);
+
+      const result = await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      // Redis 撤销成功但没踢掉 IM = 封禁在聊天侧还没生效。行必须留着让 cron 重试，
+      // 并把「尚未完成」如实报给管理台，而不是显示成功。
+      expect(prisma.sessionRevocationOutbox.deleteMany).not.toHaveBeenCalled();
+      expect(result.sessionRevocationPending).toBe(true);
+      expect(result.status).toBe(UserStatus.BANNED);
+    });
+
+    it('still reports the ban as applied when OpenIM force-logout fails', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.ACTIVE,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 2 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+      // OpenIM 挂了不能让封禁整体失败：状态已经提交，抛出去只会让管理员以为没封成、
+      // 重复操作，而账号其实已经是 BANNED。
+      openim.forceLogoutAllPlatforms.mockRejectedValue(
+        new Error('openim down'),
+      );
+
+      const result = await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.BANNED,
+        reason: 'policy violation',
+      });
+
+      expect(result.status).toBe(UserStatus.BANNED);
+    });
+
     it.each([
       [UserStatus.ACTIVE, UserStatus.BANNED, 'USER_BANNED', true],
       [UserStatus.ACTIVE, UserStatus.DELETED, 'USER_DELETED', true],
@@ -653,6 +748,7 @@ describe('AdminUserService', () => {
           audit as never,
           sessionRevocation as never,
           realtime as never,
+          openim as never,
         );
         const logSpy = jest
           .spyOn(Logger.prototype, 'log')

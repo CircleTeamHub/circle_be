@@ -34,6 +34,9 @@ describe('UserService.update normalization', () => {
         new Map([['user-1', { vipLevel: 0, avatarFrame: null }]]),
       ),
   };
+  const openim = {
+    forceLogoutAllPlatforms: jest.fn().mockResolvedValue(true),
+  };
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.userProfileSyncOutbox.upsert.mockReset();
@@ -73,6 +76,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', { birthday: '2018-04-04' });
@@ -97,6 +101,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -132,6 +137,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -159,6 +165,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -186,6 +193,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -221,6 +229,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -250,6 +259,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', { nickname: '   ' } as any);
@@ -271,6 +281,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', {
@@ -298,6 +309,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
     prisma.userProfileSyncOutbox.upsert.mockRejectedValue(
       new Error('profile outbox unavailable'),
@@ -318,6 +330,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', { nickname: 'newer' });
@@ -337,6 +350,7 @@ describe('UserService.update normalization', () => {
       realtimeService as any,
       privacySettings as any,
       avatarFrames as any,
+      openim as any,
     );
 
     await service.update('user-1', { persona: 'just a bio' } as any);

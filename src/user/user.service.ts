@@ -208,6 +208,7 @@ export class UserService {
     // phone/wechat/qq. PrivacySettingsModule is imported by UserModule.
     private privacySettings: PrivacySettingsService,
     private avatarFrames: AvatarFrameService,
+    private openim: OpenimService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -584,6 +585,25 @@ export class UserService {
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
+    // 撤销 refresh token 只切断 circle_be 这一侧。聊天不经过 circle_be：客户端手里
+    // 已签发的 OpenIM token 在其 TTL 内照样能连 msggateway，于是一个「已注销」的账号
+    // 还在群里正常收发消息。管理员封号那条路径已经会踢（AdminUserService），
+    // 自助注销这条不能漏，否则两条删号路径行为不一致。
+    // best-effort：踢人失败不该让注销本身失败（状态已经落库）。
+    try {
+      const kicked = await this.openim.forceLogoutAllPlatforms(id);
+      if (!kicked) {
+        this.logger.warn(
+          `User ${id} deleted but at least one OpenIM platform session may still be live`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `User ${id} deleted but OpenIM force-logout failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     const displayIcons = await this.iconService.getDisplayIconsForUser(id);
     let avatarFrameAppearance: AvatarFramePublicAppearance | null = null;
     try {
