@@ -5,21 +5,24 @@ describe('admin community management persistence contract', () => {
   const root = join(__dirname, '..', '..');
 
   it('adds recoverable circle state, durable group operations, and non-blocking dashboard indexes', () => {
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
     const sql = readFileSync(
       join(
         root,
         'prisma/migrations/20260729130000_admin_operations_dashboard/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
     const dismissedSql = readFileSync(
       join(
         root,
         'prisma/migrations/20260729140000_admin_circle_dismissed_state/migration.sql',
       ),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
     const dashboardIndexPath = join(
       root,
       'prisma/migrations/20260729131000_admin_dashboard_indexes/migration.sql',
@@ -36,7 +39,10 @@ describe('admin community management persistence contract', () => {
     expect(sql).not.toMatch(/\bDROP\s+(TABLE|COLUMN)\b/i);
     expect(sql).not.toContain('User_lastOnline_idx');
     expect(existsSync(dashboardIndexPath)).toBe(true);
-    const dashboardIndexSql = readFileSync(dashboardIndexPath, 'utf8');
+    const dashboardIndexSql = readFileSync(dashboardIndexPath, 'utf8').replace(
+      /\r\n/g,
+      '\n',
+    );
     expect(dashboardIndexSql).toContain(
       'CREATE INDEX CONCURRENTLY IF NOT EXISTS "User_lastOnline_idx"',
     );

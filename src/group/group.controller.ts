@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Param,
+  Patch,
   Post,
   Req,
   UseGuards,
@@ -22,7 +23,9 @@ import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import {
   GroupMemberSyncResultDto,
+  GroupMemberRoleResultDto,
   InviteGroupMembersDto,
+  UpdateGroupMemberRoleDto,
 } from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
 import { GroupService } from './group.service';
@@ -74,6 +77,25 @@ export class GroupController {
       req.user.userId,
       groupID,
       userID,
+    );
+  }
+
+  @Patch(':groupID/members/:userID/role')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Grant or revoke group administrator role' })
+  @ApiOkResponse({ type: GroupMemberRoleResultDto })
+  @ApiTooManyRequestsResponse({ description: 'Too many group role changes' })
+  updateGroupMemberRole(
+    @Param('groupID') groupID: string,
+    @Param('userID') userID: string,
+    @Body() dto: UpdateGroupMemberRoleDto,
+    @Req() req: RequestWithUser,
+  ): Promise<GroupMemberRoleResultDto> {
+    return this.groupService.updateGroupMemberRole(
+      req.user.userId,
+      groupID,
+      userID,
+      dto,
     );
   }
 

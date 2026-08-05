@@ -10,7 +10,7 @@ const SCHEMA_PATH = join(__dirname, '../../prisma/schema.prisma');
 describe('production review follow-up migration', () => {
   it('restores rolling-deploy compatibility and adds worker ownership state', () => {
     const sql = existsSync(MIGRATION_SQL_PATH)
-      ? readFileSync(MIGRATION_SQL_PATH, 'utf8')
+      ? readFileSync(MIGRATION_SQL_PATH, 'utf8').replace(/\r\n/g, '\n')
       : '';
 
     expect(sql).toContain('ADD COLUMN IF NOT EXISTS "isPublic"');
@@ -20,7 +20,7 @@ describe('production review follow-up migration', () => {
   });
 
   it('keeps the final Prisma schema aligned with the forward migration', () => {
-    const schema = readFileSync(SCHEMA_PATH, 'utf8');
+    const schema = readFileSync(SCHEMA_PATH, 'utf8').replace(/\r\n/g, '\n');
 
     expect(schema).toContain('TERMINAL');
     expect(schema).toMatch(/generation\s+Int\s+@default\(0\)/);

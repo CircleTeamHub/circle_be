@@ -11,8 +11,11 @@ describe('AdminAuditLog migration', () => {
   it('extends the shared audit table instead of creating a second one', () => {
     expect(existsSync(migrationPath)).toBe(true);
 
-    const schema = readFileSync(join(root, 'prisma/schema.prisma'), 'utf8');
-    const sql = readFileSync(migrationPath, 'utf8');
+    const schema = readFileSync(
+      join(root, 'prisma/schema.prisma'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     // 治理侧 20260721130000 已经建表，再 CREATE 一次会直接炸迁移。
     expect(sql).not.toContain('CREATE TABLE "AdminAuditLog"');

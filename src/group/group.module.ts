@@ -4,6 +4,7 @@ import { MembershipPolicyModule } from 'src/membership/membership-policy.module'
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { GroupController } from './group.controller';
+import { GroupPrivacyBackfillProcessor } from './group-privacy-backfill.processor';
 import { GroupSyncOutboxProcessor } from './group-sync-outbox.processor';
 import { GroupService } from './group.service';
 
@@ -12,6 +13,7 @@ import { GroupService } from './group.service';
   controllers: [GroupController],
   providers: [
     GroupService,
+    GroupPrivacyBackfillProcessor,
     GroupSyncOutboxProcessor,
     CircleAdmissionPolicy,
     CircleMemberLockService,

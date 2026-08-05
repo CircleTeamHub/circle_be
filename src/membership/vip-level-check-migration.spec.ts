@@ -9,7 +9,7 @@ describe('VIP level check migration', () => {
     );
 
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     expect(sql).toMatch(/UPDATE "User"/i);
     expect(sql).toMatch(/SET "vipLevel"\s*=\s*4/i);

@@ -9,7 +9,7 @@ describe('refresh-token family migration', () => {
 
   it('backfills isolated families and keeps historical revocation reasons unknown', () => {
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     expect(sql).toContain('CREATE TYPE "RefreshTokenRevocationReason"');
     expect(sql).toMatch(
@@ -28,7 +28,7 @@ describe('refresh-token family migration', () => {
 
   it('wraps the migration in an explicit transaction so deploy retries do not see partial enum or column state', () => {
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     expect(sql).toMatch(/^\s*BEGIN;\s+CREATE\s+EXTENSION/i);
     expect(sql).toMatch(/CREATE\s+INDEX[\s\S]+;\s*COMMIT;\s*$/i);

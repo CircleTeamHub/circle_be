@@ -2,14 +2,18 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
+import { plainToInstance } from 'class-transformer';
+import { validateSync } from 'class-validator';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { GroupController } from './group.controller';
 import { GroupService } from './group.service';
+import * as groupMemberDtos from './dto/group-member.dto';
 
 describe('GroupService reportGroup', () => {
   let prisma: {
@@ -32,6 +36,7 @@ describe('GroupService reportGroup', () => {
       updateMany: jest.Mock;
     };
     circleInvitation: { updateMany: jest.Mock };
+    adminAuditLog: { create: jest.Mock };
     groupReport: {
       findFirst: jest.Mock;
       create: jest.Mock;
@@ -42,8 +47,10 @@ describe('GroupService reportGroup', () => {
   };
   let openim: {
     addGroupMembers: jest.Mock;
+    getGroupMemberRole: jest.Mock;
     isGroupMember: jest.Mock;
     removeGroupMember: jest.Mock;
+    setGroupMemberRole: jest.Mock;
   };
   let admissionPolicy: {
     activateMembers: jest.Mock;
@@ -76,6 +83,7 @@ describe('GroupService reportGroup', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       circleInvitation: { updateMany: jest.fn() },
+      adminAuditLog: { create: jest.fn().mockResolvedValue(undefined) },
       groupReport: {
         findFirst: jest.fn(),
         create: jest.fn(),
@@ -86,8 +94,10 @@ describe('GroupService reportGroup', () => {
     };
     openim = {
       addGroupMembers: jest.fn().mockResolvedValue(undefined),
+      getGroupMemberRole: jest.fn(),
       isGroupMember: jest.fn().mockResolvedValue(false),
       removeGroupMember: jest.fn().mockResolvedValue(undefined),
+      setGroupMemberRole: jest.fn().mockResolvedValue(undefined),
     };
     admissionPolicy = {
       activateMembers: jest.fn(async (_tx, _circleID, userIDs) => userIDs),
@@ -1007,5 +1017,456 @@ describe('GroupService reportGroup', () => {
     ).resolves.toEqual({ handled: false });
 
     expect(openim.removeGroupMember).not.toHaveBeenCalled();
+  });
+
+  it('validates administrator role changes against the public enum', () => {
+    const Dto = (groupMemberDtos as any).UpdateGroupMemberRoleDto;
+    expect(typeof Dto).toBe('function');
+    expect(validateSync(plainToInstance(Dto, { role: 'ADMIN' }))).toHaveLength(
+      0,
+    );
+    expect(
+      validateSync(plainToInstance(Dto, { role: 'OWNER' })),
+    ).not.toHaveLength(0);
+  });
+
+  it('passes member role changes through the controller with the current user', async () => {
+    const serviceMock = {
+      updateGroupMemberRole: jest
+        .fn()
+        .mockResolvedValue({ handled: true, role: 'ADMIN' }),
+    };
+    const controller = new GroupController(serviceMock as any);
+
+    expect(typeof (controller as any).updateGroupMemberRole).toBe('function');
+    await expect(
+      (controller as any).updateGroupMemberRole(
+        'group-1',
+        'target-1',
+        { role: 'ADMIN' },
+        { user: { userId: 'owner-1' } },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(serviceMock.updateGroupMemberRole).toHaveBeenCalledWith(
+      'owner-1',
+      'group-1',
+      'target-1',
+      { role: 'ADMIN' },
+    );
+  });
+
+  it('lets a circle owner promote an active member and syncs OpenIM', async () => {
+    expect(typeof (service as any).updateGroupMemberRole).toBe('function');
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      // 提交后的快路径重读：推 DB 真值而非请求参数。
+      .mockResolvedValueOnce({
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockResolvedValue({});
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'owner-1',
+      'target-user',
+    ]);
+    expect(prisma.circleMember.update).toHaveBeenCalledWith({
+      where: { id: 'target-member' },
+      data: { role: CircleMemberRole.ADMIN },
+    });
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'group-1',
+      'target-user',
+      60,
+    );
+    // review P2：升权审计带前后角色。
+    expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        actorID: 'owner-1',
+        action: 'GROUP_MEMBER_ROLE_UPDATED',
+        entityType: 'CircleMember',
+        entityID: 'target-member',
+        metadata: expect.objectContaining({
+          previousRole: CircleMemberRole.MEMBER,
+          newRole: CircleMemberRole.ADMIN,
+          targetUserID: 'target-user',
+        }),
+      }),
+    });
+    // review P1：角色写与 outbox 同事务，OpenIM 收敛不依赖快路径成功。
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [
+          expect.objectContaining({
+            operation: 'ADD_MEMBER',
+            groupID: 'group-1',
+            userID: 'target-user',
+          }),
+        ],
+      }),
+    );
+  });
+
+  it('audits demotion with the previous and new role', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockResolvedValue({});
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'MEMBER' },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'MEMBER' });
+
+    expect(prisma.circleMember.update).toHaveBeenCalledWith({
+      where: { id: 'target-member' },
+      data: { role: CircleMemberRole.MEMBER },
+    });
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'group-1',
+      'target-user',
+      20,
+    );
+    expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        metadata: expect.objectContaining({
+          previousRole: CircleMemberRole.ADMIN,
+          newRole: CircleMemberRole.MEMBER,
+        }),
+      }),
+    });
+  });
+
+  it('keeps OpenIM untouched when the role transaction fails', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow('db down');
+
+    // review P1：DB 没提交就绝不动 OpenIM——不会出现外部已提权、本地回滚。
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  it('still succeeds when the immediate OpenIM push fails and leaves convergence to the outbox', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockResolvedValue({});
+    openim.setGroupMemberRole.mockRejectedValue(new Error('openim down'));
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: [
+          expect.objectContaining({
+            operation: 'ADD_MEMBER',
+            groupID: 'group-1',
+            userID: 'target-user',
+          }),
+        ],
+      }),
+    );
+  });
+
+  it('pushes the committed role, not the request role, when a concurrent change landed last', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      // review R2：本请求 promote，但并发 demote 后提交——重读到 MEMBER，
+      // 快路径必须推 20 而不是把请求参数 60 写回 OpenIM。
+      .mockResolvedValueOnce({
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockResolvedValue({});
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(openim.setGroupMemberRole).toHaveBeenCalledTimes(1);
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'group-1',
+      'target-user',
+      20,
+    );
+  });
+
+  it('rejects administrator attempts to grant administrator role', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'admin-member',
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'admin-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(prisma.circleMember.update).not.toHaveBeenCalled();
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  it('verifies the owner in OpenIM before changing a raw group role', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole
+      .mockResolvedValueOnce(100)
+      .mockResolvedValueOnce(20);
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'raw-group',
+      'target-user',
+      60,
+    );
+    // review P2：裸群同样审计（entityType 区分，带前后角色等级）。
+    expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        actorID: 'owner-1',
+        action: 'GROUP_MEMBER_ROLE_UPDATED',
+        entityType: 'OpenimGroup',
+        entityID: 'raw-group',
+        metadata: expect.objectContaining({
+          previousRoleLevel: 20,
+          newRoleLevel: 60,
+        }),
+      }),
+    });
+  });
+
+  it('maps raw-group role lookup outages to a stable 503', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole.mockRejectedValue(new Error('lookup timeout'));
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ServiceUnavailableException);
+
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  it('maps raw-group role mutation outages to a stable 503', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole
+      .mockResolvedValueOnce(100)
+      .mockResolvedValueOnce(20);
+    openim.setGroupMemberRole.mockRejectedValue(new Error('provider 502'));
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ServiceUnavailableException);
+  });
+
+  // review R2：「查无此群/成员」是拒绝（403/404），不是可重试的 503。
+  it('denies with 403 when the raw-group actor lookup reports record-not-found', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole.mockImplementation(
+      async (_groupID: string, userID: string) => {
+        if (userID === 'owner-1')
+          throw new Error('errCode 1004 RecordNotFoundError');
+        return 20;
+      },
+    );
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  it('denies with 404 when the raw-group target is no longer a member', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole.mockImplementation(
+      async (_groupID: string, userID: string) => {
+        if (userID === 'owner-1') return 100;
+        throw new Error('member does not exist in this group');
+      },
+    );
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  // review R2：审计不可静默丢——审计写失败时请求必须失败（角色 set 幂等，
+  // 重试会补齐审计），不能返回无审计痕迹的成功。
+  it('fails the raw-group role change when the audit write fails', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole
+      .mockResolvedValueOnce(100)
+      .mockResolvedValueOnce(20);
+    prisma.adminAuditLog.create.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow('db down');
+
+    expect(openim.setGroupMemberRole).toHaveBeenCalledWith(
+      'raw-group',
+      'target-user',
+      60,
+    );
   });
 });

@@ -8,7 +8,7 @@ describe('registration invite-code migration', () => {
       'prisma/migrations/20260715000000_add_registration_invite_codes/migration.sql',
     );
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     expect(sql).toMatch(/ADD COLUMN\s+"inviteCode"\s+TEXT/i);
     expect(sql).toMatch(/SET\s+"inviteCode"\s*=\s*lower\("accountId"\)/i);

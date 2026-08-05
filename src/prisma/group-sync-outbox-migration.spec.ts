@@ -7,7 +7,9 @@ const migrationPath = join(
 );
 
 describe('group sync desired-state migration', () => {
-  const sql = readFileSync(migrationPath, 'utf8');
+  // Normalize CRLF: Windows checkouts (core.autocrlf=true) rewrite the working
+  // tree, and the CTE regexes below anchor on a literal "\n".
+  const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
   it('rolls back dedupe, probes, and index replacement on validation failure', () => {
     expect(sql.trimStart().startsWith('BEGIN;')).toBe(true);

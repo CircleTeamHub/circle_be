@@ -112,6 +112,11 @@ describe('normalizeRoute', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
       '/api/v1/group/:groupID/members/:userID',
     );
+    // review R2：新的角色 PATCH 路由必须有模板，否则裸 group/user id 会把
+    // route 标签打成高基数。
+    expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2/role')).toBe(
+      '/api/v1/group/:groupID/members/:userID/role',
+    );
     expect(
       normalizeRoute(
         '/api/v1/chat-history/conversations/si_user-a_user-b/messages',

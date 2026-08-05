@@ -16,7 +16,10 @@ function filesUnder(root: string): string[] {
 
 describe('membership writer boundary', () => {
   it('keeps the retired operational VIP writer inert', () => {
-    const source = readFileSync(join(REPO_ROOT, 'scripts/set-vip.mjs'), 'utf8');
+    const source = readFileSync(
+      join(REPO_ROOT, 'scripts/set-vip.mjs'),
+      'utf8',
+    ).replace(/\r\n/g, '\n');
 
     expect(source).toContain('Direct VIP writes are retired');
     expect(source).not.toContain('PrismaClient');
@@ -27,7 +30,7 @@ describe('membership writer boundary', () => {
     const source = readFileSync(
       join(REPO_ROOT, 'scripts/seed-test-data.js'),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(source).not.toMatch(/vipLevel\s*:/);
     expect(source).toContain('admin membership grant API');
@@ -43,7 +46,7 @@ describe('membership writer boundary', () => {
     const offenders = productionFiles
       .filter((file) => {
         // eslint-disable-next-line security/detect-non-literal-fs-filename
-        const source = readFileSync(file, 'utf8');
+        const source = readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
         return /data\s*:\s*\{[^{}]*vip(?:Level|ExpiresAt)\s*:/.test(source);
       })
       .map((file) => relative(REPO_ROOT, file));
@@ -58,7 +61,8 @@ describe('membership writer boundary', () => {
       .filter((file) => /\.ts$/.test(file) && !/\.spec\.ts$/.test(file))
       .filter((file) => {
         // eslint-disable-next-line security/detect-non-literal-fs-filename
-        return retiredEntitlement.test(readFileSync(file, 'utf8'));
+        const source = readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+        return retiredEntitlement.test(source);
       })
       .map((file) => relative(REPO_ROOT, file));
 

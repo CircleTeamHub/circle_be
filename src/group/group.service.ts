@@ -20,11 +20,15 @@ import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
 import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
-import { InviteGroupMembersDto } from './dto/group-member.dto';
+import {
+  GroupMemberRoleInput,
+  GroupMemberRoleResultDto,
+  InviteGroupMembersDto,
+  UpdateGroupMemberRoleDto,
+} from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
 
 type GroupMemberSyncResult = { handled: boolean };
-
 type CircleGroupLookup = {
   id: string;
   groupID: string | null;
@@ -47,6 +51,255 @@ export class GroupService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
   ) {}
+
+  async updateGroupMemberRole(
+    actorId: string,
+    groupID: string,
+    targetUserID: string,
+    dto: UpdateGroupMemberRoleDto,
+  ): Promise<GroupMemberRoleResultDto> {
+    const normalizedGroupID = this.normalizeGroupID(groupID);
+    const normalizedTargetUserID = OpenimService.fromImUserId(
+      targetUserID.trim(),
+    );
+    if (!normalizedTargetUserID || normalizedTargetUserID === actorId) {
+      throw new ForbiddenException({
+        message: 'The group owner cannot change their own role',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
+
+    const circle = await this.findCircleByGroupID(normalizedGroupID);
+    const roleLevel = dto.role === GroupMemberRoleInput.ADMIN ? 60 : 20;
+
+    if (!circle) {
+      return this.updateRawGroupMemberRole(
+        actorId,
+        this.rawOpenimGroupID(normalizedGroupID),
+        normalizedTargetUserID,
+        dto,
+        roleLevel,
+      );
+    }
+
+    const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
+    // review P1：先落库（角色 + outbox + 审计原子提交），OpenIM 放到提交后。
+    // 旧顺序在事务内先调 OpenIM，提交失败会回滚本地状态而外部已提权。
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      await this.memberLock.lock(tx, circle.id, [
+        actorId,
+        normalizedTargetUserID,
+      ]);
+      const [actor, target] = await Promise.all([
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: actorId, circleID: circle.id },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: normalizedTargetUserID,
+              circleID: circle.id,
+            },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+      ]);
+
+      if (
+        !actor ||
+        actor.status !== CircleMemberStatus.ACTIVE ||
+        actor.role !== CircleMemberRole.OWNER
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+      if (
+        !target ||
+        target.status !== CircleMemberStatus.ACTIVE ||
+        target.role === CircleMemberRole.OWNER
+      ) {
+        throw new NotFoundException({
+          message: 'Group member not found',
+          errorCode: GroupErrorCode.MemberNotFound,
+        });
+      }
+
+      const nextRole =
+        dto.role === GroupMemberRoleInput.ADMIN
+          ? CircleMemberRole.ADMIN
+          : CircleMemberRole.MEMBER;
+      await tx.circleMember.update({
+        where: { id: target.id },
+        data: { role: nextRole },
+      });
+      // review P2：特权变更留结构化审计（脱敏：只有 ID 与角色），与角色写同事务。
+      await tx.adminAuditLog.create({
+        data: {
+          actorID: actorId,
+          action: 'GROUP_MEMBER_ROLE_UPDATED',
+          entityType: 'CircleMember',
+          entityID: target.id,
+          metadata: {
+            circleID: circle.id,
+            groupID: openimGroupID,
+            targetUserID: normalizedTargetUserID,
+            previousRole: target.role,
+            newRole: nextRole,
+          },
+        },
+      });
+      // ADD_MEMBER 的 outbox 语义 = 「成员在群里且角色与 DB 一致」；提交后由
+      // processor 兜底收敛 OpenIM，本地权限真值不依赖外呼成功。
+      await enqueueCircleMemberSync(tx, 'ADD_MEMBER', openimGroupID, [
+        normalizedTargetUserID,
+      ]);
+    });
+
+    // 提交成功后立即推一把 OpenIM（快路径）；失败不回滚也不报错——outbox
+    // 会以 DB 真值重试直到收敛。review R2：推送前重读已提交的角色而非请求参数
+    // ——并发升/降级时本请求可能不是最后提交者，推参数会把旧角色写回 OpenIM。
+    try {
+      const committed = await this.prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: normalizedTargetUserID,
+            circleID: circle.id,
+          },
+        },
+        select: { role: true, status: true },
+      });
+      if (
+        committed?.status === CircleMemberStatus.ACTIVE &&
+        committed.role !== CircleMemberRole.OWNER
+      ) {
+        await this.openimService.setGroupMemberRole(
+          openimGroupID,
+          normalizedTargetUserID,
+          committed.role === CircleMemberRole.ADMIN ? 60 : 20,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `OpenIM role push deferred to outbox for group ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    return { handled: true, role: dto.role };
+  }
+
+  private async updateRawGroupMemberRole(
+    actorId: string,
+    openimGroupID: string,
+    targetUserID: string,
+    dto: UpdateGroupMemberRoleDto,
+    roleLevel: 20 | 60,
+  ): Promise<GroupMemberRoleResultDto> {
+    // review P2：裸 OpenIM 群没有本地状态，OpenIM 故障要映射成稳定的 503
+    // （与 reportGroup 的裸群成员校验先例一致），而不是裸抛 500。
+    // review R2：群/成员不存在类错误不是故障——归一成 null 走下面的 403/404
+    // 拒绝路径，只有真正的依赖故障才 503。
+    const lookupRole = async (
+      userID: string,
+    ): Promise<20 | 60 | 100 | null> => {
+      try {
+        return await this.openimService.getGroupMemberRole(
+          openimGroupID,
+          userID,
+        );
+      } catch (error) {
+        if (this.isOpenimNotFoundError(error)) return null;
+        this.logger.warn(
+          `Failed to verify raw OpenIM group roles for group ${openimGroupID}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        throw new ServiceUnavailableException({
+          message: 'Group membership cannot be verified right now',
+          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+        });
+      }
+    };
+    const [actorRole, targetRole] = await Promise.all([
+      lookupRole(actorId),
+      lookupRole(targetUserID),
+    ]);
+    if (actorRole !== 100) {
+      throw new ForbiddenException({
+        message: 'Only the group owner can change administrator roles',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
+    if (targetRole !== 20 && targetRole !== 60) {
+      throw new NotFoundException({
+        message: 'Group member not found',
+        errorCode: GroupErrorCode.MemberNotFound,
+      });
+    }
+
+    try {
+      await this.openimService.setGroupMemberRole(
+        openimGroupID,
+        targetUserID,
+        roleLevel,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to update raw OpenIM group role for group ${openimGroupID}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      throw new ServiceUnavailableException({
+        message: 'Group role cannot be updated right now',
+        errorCode: GroupErrorCode.MembershipVerifyUnavailable,
+      });
+    }
+
+    // review P2/R2：裸群同样留审计，且审计不可静默丢——写失败就让整个请求
+    // 失败（角色 set 幂等，客户端重试会重放同一角色并重试审计，最终两者都齐），
+    // 绝不返回一个没有审计痕迹的成功。
+    await this.prisma.adminAuditLog.create({
+      data: {
+        actorID: actorId,
+        action: 'GROUP_MEMBER_ROLE_UPDATED',
+        entityType: 'OpenimGroup',
+        entityID: openimGroupID,
+        metadata: {
+          groupID: openimGroupID,
+          targetUserID,
+          previousRoleLevel: targetRole,
+          newRoleLevel: roleLevel,
+          newRole: dto.role,
+        },
+      },
+    });
+
+    return { handled: true, role: dto.role };
+  }
+
+  /**
+   * OpenIM 「查无此群/此成员」类错误。这是业务上的拒绝信号（403/404），
+   * 不是依赖故障，调用方不应把它映射成可重试的 503。
+   */
+  private isOpenimNotFoundError(error: unknown): boolean {
+    const message = (
+      error instanceof Error ? error.message : String(error)
+    ).toLowerCase();
+    return (
+      message.includes('recordnotfound') ||
+      message.includes('record not found') ||
+      message.includes('not found') ||
+      message.includes('not exist') ||
+      message.includes('not in group') ||
+      message.includes('not group member')
+    );
+  }
 
   async inviteGroupMembers(
     actorId: string,

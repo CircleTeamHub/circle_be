@@ -38,6 +38,40 @@ describe('OpenimService group/auth admin calls', () => {
       groupID: 'tmpABC',
       groupName: 'Weekend Hike',
       groupType: 2,
+      lookMemberInfo: 1,
+      applyMemberFriend: 1,
+    });
+  });
+
+  it('enforces member privacy on an existing group via set_group_info', async () => {
+    expect(typeof (service as any).enforceGroupMemberPrivacy).toBe('function');
+
+    await (service as any).enforceGroupMemberPrivacy('legacy-group');
+
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/group/set_group_info'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      groupInfoForSet: {
+        groupID: 'legacy-group',
+        lookMemberInfo: 1,
+        applyMemberFriend: 1,
+      },
+    });
+  });
+
+  it('sets a group member role through the OpenIM admin API', async () => {
+    expect(typeof (service as any).setGroupMemberRole).toBe('function');
+
+    await (service as any).setGroupMemberRole('group-1', 'user-123', 60);
+
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/group/set_group_member_info'),
+    );
+    expect(call).toBeDefined();
+    expect(JSON.parse(call![1].body)).toEqual({
+      members: [{ groupID: 'group-1', userID: 'user123', roleLevel: 60 }],
     });
   });
 
@@ -222,6 +256,31 @@ describe('OpenimService group/auth admin calls', () => {
     await expect(service.isGroupMember('group-1', 'user-123')).resolves.toBe(
       false,
     );
+  });
+
+  it('reads a normalized group member role from OpenIM', async () => {
+    fetchMock.mockImplementation(async (url: string) => ({
+      json: async () =>
+        url.endsWith('/auth/get_admin_token')
+          ? { errCode: 0, data: { token: 'admin-token' } }
+          : {
+              errCode: 0,
+              data: { members: [{ userID: 'user123', roleLevel: 100 }] },
+            },
+    }));
+
+    expect(typeof (service as any).getGroupMemberRole).toBe('function');
+    await expect(
+      (service as any).getGroupMemberRole('group-1', 'user-123'),
+    ).resolves.toBe(100);
+
+    const call = fetchMock.mock.calls.find(([u]) =>
+      String(u).endsWith('/group/get_group_members_info'),
+    );
+    expect(JSON.parse(call![1].body)).toEqual({
+      groupID: 'group-1',
+      userIDs: ['user123'],
+    });
   });
 
   it('importFriends posts /friend/import_friend with normalized user ids', async () => {

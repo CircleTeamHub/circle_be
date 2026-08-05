@@ -9,7 +9,7 @@ describe('leveled display icon dedupe migration', () => {
     );
 
     expect(existsSync(migrationPath)).toBe(true);
-    const sql = readFileSync(migrationPath, 'utf8');
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
     expect(sql).toMatch(/ROW_NUMBER\(\)\s+OVER/i);
     expect(sql).toMatch(/PARTITION BY\s+"userID",\s*"systemKey"/i);

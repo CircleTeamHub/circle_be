@@ -47,7 +47,7 @@ describe('account_id_lower_unique migration', () => {
   });
 
   describe('migration.sql artifact', () => {
-    const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8');
+    const sql = readFileSync(MIGRATION_SQL_PATH, 'utf8').replace(/\r\n/g, '\n');
 
     it('creates a UNIQUE index', () => {
       expect(sql).toMatch(/CREATE\s+UNIQUE\s+INDEX/i);

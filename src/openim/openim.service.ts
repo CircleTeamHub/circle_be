@@ -42,6 +42,9 @@ export interface OpenimAdminGroup {
     status: number;
     memberCount?: number;
     createTime?: number;
+    /** 0/缺省 = 允许普通成员看目录；1 = 仅管理员（AllowType.NotAllowed）。 */
+    lookMemberInfo?: number;
+    applyMemberFriend?: number;
   };
   groupOwnerUserID?: string;
   groupOwnerUserName?: string;
@@ -297,7 +300,54 @@ export class OpenimService implements OnModuleInit {
           groupID,
           groupName,
           groupType: 2, // 2 = work group
+          lookMemberInfo: 1,
+          applyMemberFriend: 1,
         },
+      },
+      adminToken,
+    );
+  }
+
+  /**
+   * 把已有群的成员目录收紧为「仅群主/管理员可见」（lookMemberInfo=1）并禁止
+   * 通过群目录加好友（applyMemberFriend=1）。管理员令牌绕过 OpenIM 的
+   * 群主/管理员校验，可用于服务端 backfill 存量群。
+   */
+  async enforceGroupMemberPrivacy(groupID: string): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/group/set_group_info',
+      {
+        groupInfoForSet: {
+          groupID,
+          lookMemberInfo: 1,
+          applyMemberFriend: 1,
+        },
+      },
+      adminToken,
+    );
+  }
+
+  async setGroupMemberRole(
+    groupID: string,
+    userID: string,
+    roleLevel: 20 | 60,
+  ): Promise<void> {
+    if (!this.enabled) return;
+
+    const adminToken = await this.getAdminToken();
+    await this.post(
+      '/group/set_group_member_info',
+      {
+        members: [
+          {
+            groupID,
+            userID: OpenimService.toImUserId(userID),
+            roleLevel,
+          },
+        ],
       },
       adminToken,
     );
@@ -348,6 +398,30 @@ export class OpenimService implements OnModuleInit {
     );
 
     return (res.members ?? []).some((member) => member.userID === imUserID);
+  }
+
+  async getGroupMemberRole(
+    groupID: string,
+    userID: string,
+  ): Promise<20 | 60 | 100 | null> {
+    if (!this.enabled) return null;
+
+    const imUserID = OpenimService.toImUserId(userID);
+    const adminToken = await this.getAdminToken();
+    const res = await this.post<{
+      members?: Array<{ userID: string; roleLevel: number }>;
+    }>(
+      '/group/get_group_members_info',
+      { groupID, userIDs: [imUserID] },
+      adminToken,
+    );
+    const roleLevel = (res.members ?? []).find(
+      (member) => member.userID === imUserID,
+    )?.roleLevel;
+
+    return roleLevel === 20 || roleLevel === 60 || roleLevel === 100
+      ? roleLevel
+      : null;
   }
 
   // ─── Message history (chat-history restore) ──────────────────────────────────

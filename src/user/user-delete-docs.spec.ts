@@ -6,7 +6,7 @@ describe('user deletion API guide', () => {
     const guide = readFileSync(
       join(process.cwd(), 'docs/frontend-api-guide.md'),
       'utf8',
-    );
+    ).replace(/\r\n/g, '\n');
 
     expect(guide).toContain('DELETE /user/:id');
     expect(guide).toContain('只能删除自己');
