@@ -2,6 +2,7 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsEnum, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { UserStatus } from 'src/generated/prisma';
+import { MAX_PAGE } from 'src/common/pagination';
 
 export class GetUserDto {
   @ApiPropertyOptional({ example: 1, description: 'Current page number' })
@@ -9,6 +10,7 @@ export class GetUserDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page?: number;
 
   @ApiPropertyOptional({

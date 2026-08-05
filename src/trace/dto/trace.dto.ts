@@ -16,6 +16,7 @@ import {
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { AvatarFrameAppearanceDto } from 'src/user/dto/public-user.dto';
+import { MAX_PAGE } from 'src/common/pagination';
 
 const TRACE_VISIBILITY = ['FRIENDS_ONLY', 'PRIVATE'] as const;
 
@@ -76,6 +77,7 @@ export class TraceFeedQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   @IsOptional()
   page?: number;
 

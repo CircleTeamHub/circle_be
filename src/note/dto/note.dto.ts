@@ -24,6 +24,7 @@ import {
   ValidatorConstraintInterface,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { MAX_PAGE } from 'src/common/pagination';
 
 export const NOTE_STATUS = ['ACTIVE', 'UNLISTED', 'DELETED'] as const;
 export type NoteStatus = (typeof NOTE_STATUS)[number];
@@ -275,6 +276,7 @@ export class RecycleBinQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page = 1;
 
   @ApiPropertyOptional({ default: 50, maximum: 200 })
@@ -307,6 +309,7 @@ export class ListNotesQueryDto {
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page?: number;
 
   @ApiPropertyOptional({ default: 50 })

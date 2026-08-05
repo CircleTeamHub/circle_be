@@ -20,6 +20,7 @@ import {
   AvatarFrameAppearanceDto,
   PublicMembershipAppearanceDto,
 } from 'src/user/dto/public-user.dto';
+import { MAX_PAGE } from 'src/common/pagination';
 
 // ── Request DTOs ─────────────────────────────────────────────────────────────
 
@@ -198,6 +199,7 @@ export class PlazaFeedQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   @IsOptional()
   page?: number;
 
@@ -245,6 +247,7 @@ export class PlazaFeedSearchDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   @IsOptional()
   page?: number;
 
