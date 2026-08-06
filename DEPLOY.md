@@ -585,6 +585,26 @@ git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
 之后把 `OPENIM_API_URL` / `OPENIM_ADMIN_SECRET` / `OPENIM_IM_WS_URL` / `OPENIM_IM_API_URL`
 追加进 `.env.production`,重启 circle_be。OpenIM 约吃 4G 内存。
 
+### 5.1 敏感词拦截(OpenIM before-send webhook)
+
+发消息前 OpenIM 回调 circle_be 检敏感词,命中即拒(客户端收 errCode 73001,App 弹「包含敏感词」)。
+
+1. circle_be 侧: `.env.production` 加 `OPENIM_CALLBACK_TOKEN=$(openssl rand -hex 24)`,重启。
+2. OpenIM 侧: openim-docker 的 `.env` 加
+   `OPENIM_WEBHOOK_BEFORE_SEND_ENABLE=true` 与
+   `OPENIM_WEBHOOK_URL=http://host.docker.internal:3000/api/v1/openim/callback/<同一个 token>`
+   (docker-compose.yaml 需含 IMENV_WEBHOOKS_* 环境变量与 extra_hosts host-gateway 映射,
+   照本仓已改的本地 openim-docker 版本抄),然后 `docker compose up -d openim-server`。
+3. 词库: `POST /api/v1/admin/sensitive-words/add`(admin JWT,body `{"words":[...]}`,单批 ≤1000)。
+   空词库 = 全放行,导入公开词库(如 tencent-sensitive-words)后即生效,改动 ≤60s 内收敛。
+4. 验证: 用测试账号发含词消息,应发送失败;`docker logs openim-server` 无 webhook 网络错误。
+
+⚠️ 可用性: v3.8.3 下该回调**不可达时消息会发送失败**(failedContinue 不生效),
+circle_be 蓝绿切换的瞬间窗口内发消息可能报错、重试即可;若要临时全局关闭拦截,
+把 `OPENIM_WEBHOOK_BEFORE_SEND_ENABLE=false` 后 `docker compose up -d openim-server`。
+⚠️ 路由末段是 OpenIM 的 callbackCommand 常量原文(带 `Command` 后缀);写错会 404,
+而 OpenIM 把 404 JSON 当全零响应 = **静默放行一切**,上线后务必跑一次第 4 步验证。
+
 ## 阶段 6 预告:LiveKit Cloud(音视频)
 
 注册 livekit.io → 建项目(免费层)→ 拿 `LIVEKIT_URL` / API Key / Secret,

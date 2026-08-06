@@ -172,6 +172,9 @@ export function createEnvValidationSchema(
       then: Joi.string().min(secretMin).required(),
       otherwise: Joi.string().optional(),
     }),
+    // OpenIM before-send 回调（敏感词拦截）URL token。未设 = 回调端点整体
+    // 404（功能关闭）。设了就必须够长 —— 它是该无鉴权端点唯一的门。
+    OPENIM_CALLBACK_TOKEN: Joi.string().min(24).optional(),
     LIVEKIT_URL: Joi.string().uri().optional(),
     LIVEKIT_API_KEY: Joi.string().optional(),
     LIVEKIT_API_SECRET: Joi.string().optional(),
