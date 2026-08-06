@@ -22,6 +22,7 @@ const MEDIA_KEY_FIELDS: Record<string, Array<{ key: string; url: string }>> = {
     { key: 'thumbKey', url: 'thumbUrl' },
   ],
   voice: [{ key: 'key', url: 'url' }],
+  file: [{ key: 'key', url: 'url' }],
 };
 
 @Injectable()

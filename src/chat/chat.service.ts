@@ -110,7 +110,7 @@ export class ChatService {
     }
     // 媒体消息只收 object key,拒绝 URL 形态 —— 防「URL 固化进消息体」回潮
     // (读路径统一由 ChatMediaService 签发,见 docs/self-hosted-chat.md)。
-    if (payload.type === 'image' || payload.type === 'voice') {
+    if (['image', 'voice', 'file'].includes(payload.type)) {
       const key = payload.content['key'];
       const thumbKey = payload.content['thumbKey'];
       const isValidKey = (value: unknown): boolean =>

@@ -34,6 +34,7 @@ export const CLIENT_MESSAGE_TYPES = [
   'quote',
   'image',
   'voice',
+  'file',
   'location',
   'note-card',
   'friend-card',
