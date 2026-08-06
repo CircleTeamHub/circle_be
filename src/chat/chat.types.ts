@@ -79,6 +79,8 @@ export interface ChatConversationDto {
   /** DIRECT 会话的对端用户;其余类型为 null。 */
   peer: ChatSenderInfo | null;
   circleId: string | null;
+  /** GROUP 会话的圈子展示信息(名称/头像即群名/群头像);其余类型为 null。 */
+  circle: { id: string; name: string; avatarUrl: string | null } | null;
   lastMessage: ChatMessageDto | null;
   unreadCount: number;
   pinned: boolean;

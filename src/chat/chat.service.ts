@@ -253,10 +253,15 @@ export class ChatService {
       .filter((m) => m.conversation.type === 'DIRECT')
       .map((m) => m.conversationID);
 
-    const [lastMessages, unreadCounts, peers] = await Promise.all([
+    const [lastMessages, unreadCounts, peers, circles] = await Promise.all([
       this.loadLastMessages(conversationIds),
       this.loadUnreadCounts(userId, memberships),
       this.loadDirectPeers(userId, directIds),
+      this.loadCircleInfos(
+        memberships
+          .map((m) => m.conversation.circleID)
+          .filter((id): id is string => id !== null),
+      ),
     ]);
 
     const senderIds = [...lastMessages.values()]
@@ -271,6 +276,9 @@ export class ChatService {
         type: m.conversation.type,
         peer: peers.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
+        circle: m.conversation.circleID
+          ? (circles.get(m.conversation.circleID) ?? null)
+          : null,
         lastMessage: last
           ? this.toMessageDto(last, this.senderFor(last, senders))
           : null,
@@ -390,11 +398,20 @@ export class ChatService {
       lastMessage = this.toMessageDto(last, this.senderFor(last, senders));
       await this.media.attachMediaUrls([lastMessage]);
     }
+    const circles = member.conversation.circleID
+      ? await this.loadCircleInfos([member.conversation.circleID])
+      : new Map<
+          string,
+          { id: string; name: string; avatarUrl: string | null }
+        >();
     return {
       id: conversationId,
       type: member.conversation.type,
       peer: peers.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
+      circle: member.conversation.circleID
+        ? (circles.get(member.conversation.circleID) ?? null)
+        : null,
       lastMessage,
       unreadCount: unread.get(conversationId) ?? 0,
       pinned: member.pinned,
@@ -512,6 +529,7 @@ export class ChatService {
       type: conv.type,
       peer: { id: peer.id, nickname: peer.nickname, avatarUrl: peer.avatarUrl },
       circleId: null,
+      circle: null,
       lastMessage: null,
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
@@ -634,6 +652,26 @@ export class ChatService {
       if (user) map.set(o.conversationID, user);
     });
     return map;
+  }
+
+  /** GROUP 会话的圈子展示信息(群名/群头像来源)。 */
+  private async loadCircleInfos(
+    circleIds: string[],
+  ): Promise<
+    Map<string, { id: string; name: string; avatarUrl: string | null }>
+  > {
+    const unique = [...new Set(circleIds)];
+    if (unique.length === 0) return new Map();
+    const circles = await this.prisma.circle.findMany({
+      where: { id: { in: unique } },
+      select: { id: true, name: true, avatarUrl: true },
+    });
+    return new Map(
+      circles.map((c) => [
+        c.id,
+        { id: c.id, name: c.name, avatarUrl: c.avatarUrl },
+      ]),
+    );
   }
 
   private async resolveSenders(

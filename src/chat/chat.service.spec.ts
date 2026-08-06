@@ -30,6 +30,7 @@ describe('ChatService', () => {
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
+    circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
@@ -98,6 +99,7 @@ describe('ChatService', () => {
     prisma.user.findMany.mockResolvedValue([
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
+    prisma.circle.findMany.mockResolvedValue([]);
   });
 
   describe('sendMessage', () => {
