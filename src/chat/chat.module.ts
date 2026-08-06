@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigEnum } from 'src/enum/config.enum';
 import { NotificationModule } from 'src/notification/notification.module';
+import { RedisModule } from 'src/redis/redis.module';
 import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -11,6 +12,7 @@ import { ChatController } from './chat.controller';
 import { ChatGateway } from './chat.gateway';
 import { ChatMediaService } from './chat-media.service';
 import { ChatPushService } from './chat-push.service';
+import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatService } from './chat.service';
 
 // PrismaService 与 SessionRevocationService 来自 @Global 模块(Prisma/Auth);
@@ -18,6 +20,7 @@ import { ChatService } from './chat.service';
 @Module({
   imports: [
     NotificationModule,
+    RedisModule,
     SensitiveWordModule,
     UploadModule,
     JwtModule.registerAsync({
@@ -36,6 +39,7 @@ import { ChatService } from './chat.service';
     ChatCircleSyncService,
     ChatMediaService,
     ChatPushService,
+    ChatSystemMessageService,
   ],
   exports: [ChatService, ChatBroadcastService, ChatCircleSyncService],
 })

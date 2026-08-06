@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatSystemMessageService } from './chat-system-message.service';
 
 /**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
@@ -23,6 +24,7 @@ export class ChatCircleSyncService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
+    private readonly systemMessage: ChatSystemMessageService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -71,6 +73,7 @@ export class ChatCircleSyncService {
     if (!circle) return null;
 
     const result = await this.prisma.$transaction(async (tx) => {
+      let created = false;
       let conversation = await tx.chatConversation.findUnique({
         where: { circleID: circleId },
         select: { id: true },
@@ -81,6 +84,7 @@ export class ChatCircleSyncService {
             data: { type: 'GROUP', circleID: circleId },
             select: { id: true },
           });
+          created = true;
         } catch (error) {
           if (!isUniqueViolation(error)) throw error;
           conversation = await tx.chatConversation.findUnique({
@@ -137,7 +141,7 @@ export class ChatCircleSyncService {
         });
       }
 
-      return { conversationId: conversation.id, toJoin, toRemove };
+      return { conversationId: conversation.id, toJoin, toRemove, created };
     });
 
     // 座位变更后的在线房间对齐(尽力而为;掉线成员重连时按座位重新派生)。
@@ -152,6 +156,14 @@ export class ChatCircleSyncService {
           ),
         );
     }
+    // 进/退群系统提示:初始建会话是存量播种,不逐人刷屏;之后的增量变化才提示。
+    if (!result.created) {
+      void this.emitMembershipNotices(
+        result.conversationId,
+        result.toJoin,
+        result.toRemove,
+      );
+    }
     for (const userID of result.toRemove) {
       void this.broadcast
         .removeUserFromConversation(userID, result.conversationId)
@@ -164,6 +176,39 @@ export class ChatCircleSyncService {
         );
     }
     return result.conversationId;
+  }
+
+  /** 结构化系统提示:本地化留给前端 im.notification.* 词表。 */
+  private async emitMembershipNotices(
+    conversationId: string,
+    joined: string[],
+    removed: string[],
+  ): Promise<void> {
+    try {
+      if (joined.length > 0) {
+        const users = await this.prisma.user.findMany({
+          where: { id: { in: joined } },
+          select: { nickname: true },
+        });
+        const names = users.map((u) => u.nickname).filter(Boolean);
+        if (names.length > 0) {
+          await this.systemMessage.emit(conversationId, {
+            kind: 'member-joined',
+            names,
+          });
+        }
+      }
+      // 对账器分不清退出还是被移出,统一「有成员退出群聊」措辞。
+      for (let i = 0; i < removed.length; i += 1) {
+        await this.systemMessage.emit(conversationId, { kind: 'member-left' });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `membership notice failed conversation=${conversationId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
 

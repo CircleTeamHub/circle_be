@@ -3,6 +3,7 @@ import { ChatCircleSyncService } from './chat-circle-sync.service';
 describe('ChatCircleSyncService', () => {
   const prisma = {
     circle: { findUnique: jest.fn() },
+    user: { findMany: jest.fn() },
     circleMember: { findMany: jest.fn() },
     chatConversation: { findUnique: jest.fn(), create: jest.fn() },
     chatMember: {
@@ -16,10 +17,12 @@ describe('ChatCircleSyncService', () => {
     joinUserToConversation: jest.fn(),
     removeUserFromConversation: jest.fn(),
   };
+  const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
 
   const service = new ChatCircleSyncService(
     prisma as never,
     broadcast as never,
+    systemMessage as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
 
@@ -30,6 +33,8 @@ describe('ChatCircleSyncService', () => {
     prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);
     broadcast.removeUserFromConversation.mockResolvedValue(undefined);
+    systemMessage.emit.mockResolvedValue(undefined);
+    prisma.user.findMany.mockResolvedValue([]);
   });
 
   it('creates the conversation and seats every ACTIVE member', async () => {

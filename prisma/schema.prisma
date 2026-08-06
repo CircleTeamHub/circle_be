@@ -1933,6 +1933,8 @@ model ChatConversation {
   tempChatID String?              @unique
   /// 会话列表排序依据；发送事务内更新。
   lastMessageAt DateTime?
+  /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
+  muteAllAt     DateTime?
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 

@@ -17,6 +17,7 @@ describe('AdminGroupOperationProcessor', () => {
       findUnique: jest.fn(),
     },
     circle: { update: jest.fn() },
+    chatConversation: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     adminAuditLog: { create: jest.fn() },
     $transaction: jest.fn(async (callback: (client: unknown) => unknown) =>
       callback(prisma),

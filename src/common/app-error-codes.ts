@@ -307,6 +307,7 @@ export const ChatErrorCode = {
   SensitiveWord: 'CHAT_SENSITIVE_WORD_BLOCKED',
   InvalidPayload: 'CHAT_INVALID_PAYLOAD',
   RateLimited: 'CHAT_RATE_LIMITED',
+  ConversationMuted: 'CHAT_CONVERSATION_MUTED',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)

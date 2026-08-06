@@ -18,6 +18,17 @@ export class AdminGroupOperationProcessor {
     private readonly openim: OpenimService,
   ) {}
 
+  /** 自研会话侧禁言开关(groupID === circle.id;会话未建时为 no-op,建时对账兜底)。 */
+  private async setChatMuteAll(
+    circleId: string,
+    muted: boolean,
+  ): Promise<void> {
+    await this.prisma.chatConversation.updateMany({
+      where: { circleID: circleId },
+      data: { muteAllAt: muted ? new Date() : null },
+    });
+  }
+
   @Interval(PROCESS_INTERVAL_MS)
   async processAvailable(): Promise<void> {
     if (this.running) return;
@@ -66,14 +77,17 @@ export class AdminGroupOperationProcessor {
     return true;
   }
 
-  private execute(operation: AdminGroupOperation) {
+  private async execute(operation: AdminGroupOperation) {
     if (!this.openim.isEnabled()) {
       throw new Error('OpenIM is not configured');
     }
     if (operation.type === 'MUTE') {
+      // 双轨:OpenIM 与自研会话同步禁言(groupID === circle.id)。
+      await this.setChatMuteAll(operation.groupID, true);
       return this.openim.muteGroup(operation.groupID);
     }
     if (operation.type === 'UNMUTE') {
+      await this.setChatMuteAll(operation.groupID, false);
       return this.openim.unmuteGroup(operation.groupID);
     }
     return this.openim.dismissGroup(operation.groupID);

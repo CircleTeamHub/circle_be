@@ -162,6 +162,9 @@ export class ChatService {
     if (conversation.type === 'DIRECT') {
       await this.assertDirectNotBlocked(conversation, senderUserId);
     }
+    if (conversation.type === 'GROUP' && conversation.muteAllAt) {
+      await this.assertNotMutedAll(conversation, senderUserId);
+    }
 
     const content = payload.content as Prisma.InputJsonObject;
     const created = await this.prisma.$transaction(async (tx) => {
@@ -723,6 +726,32 @@ export class ChatService {
     const peerId = pair.find((id) => id !== senderUserId);
     if (!peerId) return;
     await this.assertNotBlockedBetween(senderUserId, peerId);
+  }
+
+  /** 管理台群禁言:全员禁言时仅圈主/管理员可发。 */
+  private async assertNotMutedAll(
+    conversation: ChatConversation,
+    senderUserId: string,
+  ): Promise<void> {
+    if (!conversation.circleID) return;
+    const membership = await this.prisma.circleMember.findUnique({
+      where: {
+        userID_circleID: {
+          userID: senderUserId,
+          circleID: conversation.circleID,
+        },
+      },
+      select: { role: true, status: true },
+    });
+    const exempt =
+      membership?.status === 'ACTIVE' &&
+      (membership.role === 'OWNER' || membership.role === 'ADMIN');
+    if (!exempt) {
+      throw new ForbiddenException({
+        message: '该群已被禁言',
+        errorCode: ChatErrorCode.ConversationMuted,
+      });
+    }
   }
 
   private async assertNotBlockedBetween(

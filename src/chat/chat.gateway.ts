@@ -4,6 +4,11 @@ import type { Server as HttpServer } from 'http';
 import { Server, type Socket } from 'socket.io';
 import type { JwtPayload } from 'src/auth/types';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import {
+  SESSION_REVOCATION_CHANNEL,
+  parseSessionRevocationBroadcast,
+} from 'src/auth/session-revocation.broadcast';
+import { RedisService } from 'src/redis/redis.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import {
   CHAT_EVENTS,
@@ -32,6 +37,13 @@ type CorsOrigin = (
 ) => void;
 
 type AckFn<T> = (response: T) => void;
+
+/** 毫秒级签发时间:优先显式声明,回退 iat;与 RealtimeGateway 同一取法。 */
+function issuedAtMsOf(payload: JwtPayload): number | null {
+  if (typeof payload.issuedAtMs === 'number') return payload.issuedAtMs;
+  if (typeof payload.iat === 'number') return payload.iat * 1000;
+  return null;
+}
 
 /**
  * 自研聊天网关(squady websocket.gateway 的移植,收窄到 circle 需要的事件面)。
@@ -69,6 +81,7 @@ export class ChatGateway {
     private readonly chatService: ChatService,
     private readonly broadcast: ChatBroadcastService,
     private readonly chatPush: ChatPushService,
+    private readonly redisService: RedisService,
   ) {}
 
   attach(httpServer: HttpServer, options: { corsOrigin: CorsOrigin }): void {
@@ -103,6 +116,16 @@ export class ChatGateway {
 
     this.io = io;
     this.broadcast.setServer(io);
+    // 封禁/登出吊销 → 踢掉在线 chat socket(否则旧连接可继续收发到自然断开)。
+    void this.redisService
+      .subscribePattern(SESSION_REVOCATION_CHANNEL, (_channel, message) => {
+        void this.handleRevocation(message);
+      })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `revocation subscribe failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
   }
 
@@ -123,7 +146,33 @@ export class ChatGateway {
     if (typeof payload?.sub !== 'string') return null;
     if (typeof payload?.accountId !== 'string') return null;
     if (await this.sessionRevocation.isRevoked(payload)) return null;
+    socket.data.sessionId =
+      typeof payload.sid === 'string' ? payload.sid : null;
+    socket.data.issuedAtMs = issuedAtMsOf(payload);
     return payload.sub;
+  }
+
+  /** 与 RealtimeGateway 同源的吊销语义:user 级按签发时间比对,session 级按 sid。 */
+  private async handleRevocation(message: string): Promise<void> {
+    const io = this.io;
+    if (!io) return;
+    const broadcast = parseSessionRevocationBroadcast(message);
+    if (!broadcast) return;
+    const sockets =
+      broadcast.kind === 'user'
+        ? await io.in(userRoom(broadcast.userId)).fetchSockets()
+        : await io.fetchSockets();
+    for (const socket of sockets) {
+      const data = socket.data as {
+        sessionId?: string | null;
+        issuedAtMs?: number | null;
+      };
+      const dead =
+        broadcast.kind === 'user'
+          ? data.issuedAtMs == null || data.issuedAtMs <= broadcast.revokedAtMs
+          : data.sessionId === broadcast.sessionId;
+      if (dead) socket.disconnect(true);
+    }
   }
 
   private async handleConnection(socket: Socket): Promise<void> {
