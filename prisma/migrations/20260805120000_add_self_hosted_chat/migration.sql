@@ -27,6 +27,7 @@ CREATE TABLE "ChatMember" (
     "lastReadHeight" INTEGER NOT NULL DEFAULT 0,
     "pinned" BOOLEAN NOT NULL DEFAULT false,
     "muted" BOOLEAN NOT NULL DEFAULT false,
+    "hiddenAt" TIMESTAMP(3),
     "joinedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "leftAt" TIMESTAMP(3),
 

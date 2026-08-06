@@ -182,6 +182,14 @@ export class ChatService {
         where: { id: payload.conversationId },
         data: { lastMessageAt: row.createdAt },
       });
+      // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
+      await tx.chatMember.updateMany({
+        where: {
+          conversationID: payload.conversationId,
+          hiddenAt: { not: null },
+        },
+        data: { hiddenAt: null },
+      });
       return { row, reused: false };
     });
 
@@ -228,10 +236,10 @@ export class ChatService {
     return rows.map((r) => r.conversationID);
   }
 
-  /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数。 */
+  /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数;隐藏的不出。 */
   async listConversations(userId: string): Promise<ChatConversationDto[]> {
     const memberships = await this.prisma.chatMember.findMany({
-      where: { userID: userId, leftAt: null },
+      where: { userID: userId, leftAt: null, hiddenAt: null },
       include: { conversation: true },
       orderBy: {
         conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
@@ -309,14 +317,18 @@ export class ChatService {
     return this.buildConversationDto(userId, conversationId);
   }
 
-  /** 会话偏好(置顶/免打扰):每成员独立,替代 OpenIM 的会话属性。 */
+  /** 会话偏好(置顶/免打扰/隐藏):每成员独立,替代 OpenIM 的会话属性。 */
   async setConversationPreferences(
     userId: string,
     conversationId: string,
-    prefs: { pinned?: boolean; muted?: boolean },
+    prefs: { pinned?: boolean; muted?: boolean; hidden?: boolean },
   ): Promise<ChatConversationDto> {
     await this.requireMembership(conversationId, userId);
-    if (prefs.pinned !== undefined || prefs.muted !== undefined) {
+    if (
+      prefs.pinned !== undefined ||
+      prefs.muted !== undefined ||
+      prefs.hidden !== undefined
+    ) {
       await this.prisma.chatMember.update({
         where: {
           conversationID_userID: {
@@ -327,6 +339,10 @@ export class ChatService {
         data: {
           ...(prefs.pinned !== undefined ? { pinned: prefs.pinned } : {}),
           ...(prefs.muted !== undefined ? { muted: prefs.muted } : {}),
+          // 隐藏是时间戳语义:新消息落库会整体清空(见 sendMessage)。
+          ...(prefs.hidden !== undefined
+            ? { hiddenAt: prefs.hidden ? new Date() : null }
+            : {}),
         },
       });
     }

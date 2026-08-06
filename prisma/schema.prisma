@@ -1950,6 +1950,8 @@ model ChatMember {
   lastReadHeight Int       @default(0)
   pinned         Boolean   @default(false)
   muted          Boolean   @default(false)
+  /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。
+  hiddenAt       DateTime?
   joinedAt       DateTime  @default(now())
   leftAt         DateTime?
 

@@ -11,4 +11,9 @@ export class ConversationPreferencesDto {
   @IsOptional()
   @IsBoolean()
   muted?: boolean;
+
+  @ApiPropertyOptional({ description: '从列表隐藏(新消息到达自动浮出)' })
+  @IsOptional()
+  @IsBoolean()
+  hidden?: boolean;
 }

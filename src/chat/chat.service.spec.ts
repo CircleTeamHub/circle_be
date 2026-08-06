@@ -540,5 +540,44 @@ describe('ChatService', () => {
         data: { pinned: true },
       });
     });
+
+    it('maps hidden boolean onto the hiddenAt timestamp', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMember.update.mockResolvedValue({});
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.setConversationPreferences('u1', 'conv-1', {
+        hidden: true,
+      });
+      expect(prisma.chatMember.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { hiddenAt: expect.any(Date) } }),
+      );
+
+      await service.setConversationPreferences('u1', 'conv-1', {
+        hidden: false,
+      });
+      expect(prisma.chatMember.update).toHaveBeenLastCalledWith(
+        expect.objectContaining({ data: { hiddenAt: null } }),
+      );
+    });
+  });
+
+  it('a new message unhides the conversation for every member', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 3 } });
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.sendMessage('u1', sendPayload());
+
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', hiddenAt: { not: null } },
+      data: { hiddenAt: null },
+    });
   });
 });
