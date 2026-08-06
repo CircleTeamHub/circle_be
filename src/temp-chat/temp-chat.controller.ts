@@ -17,6 +17,8 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from 'src/chat/chat.service';
 import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
+import { UploadService } from 'src/upload/upload.service';
+import { PresignDto } from 'src/upload/dto/presign.dto';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import {
@@ -32,6 +34,7 @@ export class TempChatController {
   constructor(
     private readonly service: TempChatService,
     private readonly chatService: ChatService,
+    private readonly uploadService: UploadService,
   ) {}
 
   @Post()
@@ -105,6 +108,24 @@ export class TempChatController {
       req.tempChatGuest.conversationId,
       query.beforeHeight,
       query.limit,
+    );
+  }
+
+  // 访客发图:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
+  @Post('guest/upload-presign')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客图片上传预签名' })
+  guestUploadPresign(
+    @Req() req: RequestWithTempChatGuest,
+    @Body() dto: PresignDto,
+  ) {
+    return this.uploadService.presign(
+      dto.filename,
+      dto.contentType,
+      dto.sizeBytes,
+      'chat',
+      req.tempChatGuest.guestId,
     );
   }
 

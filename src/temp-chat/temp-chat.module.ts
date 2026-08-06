@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { ChatModule } from 'src/chat/chat.module';
+import { UploadModule } from 'src/upload/upload.module';
 import { LinkTokenService } from './link-token.service';
 import { TempChatCleanup } from './temp-chat.cleanup';
 import { TempChatController } from './temp-chat.controller';
@@ -11,6 +12,7 @@ import { TempChatService } from './temp-chat.service';
 @Module({
   imports: [
     ChatModule,
+    UploadModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
