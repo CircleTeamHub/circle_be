@@ -65,7 +65,12 @@ describe('ChatPushService', () => {
       expect.objectContaining({
         title: '发送者',
         body: 'hello world',
-        data: { type: 'chat', conversationId: 'conv-1' },
+        data: expect.objectContaining({
+          type: 'chat',
+          conversationId: 'conv-1',
+          sourceID: 'u-sender',
+          conversationType: 'private',
+        }),
       }),
     );
   });
@@ -122,7 +127,14 @@ describe('ChatPushService', () => {
 
     expect(push.sendToTokens).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ title: '登山圈', body: '发送者: [图片]' }),
+      expect.objectContaining({
+        title: '登山圈',
+        body: '发送者: [图片]',
+        data: expect.objectContaining({
+          sourceID: 'circle-1',
+          conversationType: 'group',
+        }),
+      }),
     );
   });
 

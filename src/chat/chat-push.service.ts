@@ -108,16 +108,32 @@ export class ChatPushService {
         where: { id: conversation.circleID },
         select: { name: true },
       });
+      const title = circle?.name ?? senderName;
       return {
-        title: circle?.name ?? senderName,
+        title,
         body: senderName ? `${senderName}: ${preview}` : preview,
-        data: { type: 'chat', conversationId: message.conversationId },
+        // 点按路由参数与聊天页入参对齐:GROUP 的 sourceID = 圈子 id。
+        data: {
+          type: 'chat',
+          conversationId: message.conversationId,
+          sourceID: conversation.circleID,
+          conversationType: 'group',
+          title,
+        },
       };
     }
+    const title = senderName || '新消息';
     return {
-      title: senderName || '新消息',
+      title,
       body: preview,
-      data: { type: 'chat', conversationId: message.conversationId },
+      // DIRECT:收件人视角的对端 = 发送者。
+      data: {
+        type: 'chat',
+        conversationId: message.conversationId,
+        ...(message.sender ? { sourceID: message.sender.id } : {}),
+        conversationType: 'private',
+        title,
+      },
     };
   }
 
