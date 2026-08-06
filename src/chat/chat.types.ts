@@ -72,6 +72,25 @@ export interface ChatTypingBroadcast {
   userId: string;
 }
 
+/** 会话成员 DTO(GET /chat/conversations/:id/members)。role 仅 GROUP 有值。 */
+export interface ChatMemberDto {
+  userId: string;
+  nickname: string;
+  avatarUrl: string | null;
+  role: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
+}
+
+/** chat:presence 客户端查询载荷(带 ack:{[userId]: boolean})。 */
+export interface ChatPresenceQuery {
+  userIds: string[];
+}
+
+/** chat:presence 服务端广播:某用户上/下线。 */
+export interface ChatPresenceBroadcast {
+  userId: string;
+  online: boolean;
+}
+
 /** 会话列表项 DTO(REST GET /chat/conversations)。 */
 export interface ChatConversationDto {
   id: string;

@@ -17,6 +17,7 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatService } from './chat.service';
 import type {
   ChatAckError,
+  ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
   ChatSendAck,
@@ -55,6 +56,10 @@ export class ChatGateway {
   private readonly typingLimiter = new SlidingWindowRateLimiter(
     CHAT_RATE_LIMITS.typing.limit,
     CHAT_RATE_LIMITS.typing.windowMs,
+  );
+  private readonly presenceLimiter = new SlidingWindowRateLimiter(
+    CHAT_RATE_LIMITS.presence.limit,
+    CHAT_RATE_LIMITS.presence.windowMs,
   );
 
   constructor(
@@ -121,9 +126,9 @@ export class ChatGateway {
 
   private async handleConnection(socket: Socket): Promise<void> {
     const userId = socket.data.userId as string;
+    let conversationIds: string[];
     try {
-      const conversationIds =
-        await this.chatService.listConversationIds(userId);
+      conversationIds = await this.chatService.listConversationIds(userId);
       await socket.join(userRoom(userId));
       await socket.join(conversationIds.map(conversationRoom));
     } catch (error) {
@@ -150,11 +155,48 @@ export class ChatGateway {
     socket.on(CHAT_EVENTS.typing, (payload: ChatTypingPayload) => {
       void this.handleTyping(socket, userId, payload);
     });
+    socket.on(
+      CHAT_EVENTS.presence,
+      (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
+        void this.handlePresenceQuery(socket, payload, ack);
+      },
+    );
     socket.on('disconnect', () => {
       this.sendLimiter.clear(socket.id);
       this.readLimiter.clear(socket.id);
       this.typingLimiter.clear(socket.id);
+      this.presenceLimiter.clear(socket.id);
+      // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
+      void this.broadcast.isUserOnline(userId).then((online) => {
+        if (online) return;
+        this.broadcast.emitPresence(conversationIds, { userId, online: false });
+      });
     });
+
+    // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
+    this.broadcast.emitPresence(conversationIds, { userId, online: true });
+  }
+
+  /** 在线状态查询:一次最多 50 个 userId,ack 回 {userId: online}。 */
+  private async handlePresenceQuery(
+    socket: Socket,
+    payload: ChatPresenceQuery,
+    ack?: AckFn<Record<string, boolean>>,
+  ): Promise<void> {
+    if (typeof ack !== 'function') return;
+    if (!this.presenceLimiter.tryAcquire(socket.id)) {
+      ack({});
+      return;
+    }
+    const userIds = Array.isArray(payload?.userIds)
+      ? payload.userIds.filter((id) => typeof id === 'string').slice(0, 50)
+      : [];
+    const entries = await Promise.all(
+      userIds.map(
+        async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
+      ),
+    );
+    ack(Object.fromEntries(entries));
   }
 
   private async handleSend(

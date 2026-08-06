@@ -12,6 +12,8 @@ export const CHAT_EVENTS = {
   typing: 'chat:typing',
   /** 服务端 → 客户端:新消息 */
   message: 'chat:msg',
+  /** 双向:在线状态(客户端带 ack 查询;服务端上下线广播) */
+  presence: 'chat:presence',
 } as const;
 
 /** 个人房:登录即加入,用于跨会话的定向推送。 */
@@ -59,6 +61,7 @@ export const CHAT_RATE_LIMITS = {
   send: { limit: 20, windowMs: 10_000 },
   read: { limit: 30, windowMs: 10_000 },
   typing: { limit: 10, windowMs: 5_000 },
+  presence: { limit: 20, windowMs: 10_000 },
 } as const;
 
 /** 单次历史分页的最大条数。 */

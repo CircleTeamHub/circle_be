@@ -34,6 +34,8 @@ describe('ChatGateway', () => {
     emitMessage: jest.fn(),
     emitRead: jest.fn(),
     emitTyping: jest.fn(),
+    emitPresence: jest.fn(),
+    isUserOnline: jest.fn().mockResolvedValue(false),
   };
 
   const gateway = new ChatGateway(

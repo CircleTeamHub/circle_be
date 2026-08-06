@@ -28,6 +28,7 @@ import {
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
+  ChatMemberDto,
   HistoryFilters,
   ChatMessageDto,
   ChatSenderInfo,
@@ -652,6 +653,42 @@ export class ChatService {
       muted: mine?.muted ?? false,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
     };
+  }
+
+  /** 会话成员目录:在座成员 + 用户展示信息;GROUP 会话附圈子角色。 */
+  async listMembers(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatMemberDto[]> {
+    const conversation = await this.requireMembership(conversationId, userId);
+    const seats = await this.prisma.chatMember.findMany({
+      where: { conversationID: conversationId, leftAt: null },
+      select: { userID: true },
+    });
+    const userIds = seats.map((s) => s.userID);
+    const [users, roles] = await Promise.all([
+      this.resolveSenders(userIds),
+      conversation.circleID
+        ? this.prisma.circleMember
+            .findMany({
+              where: { circleID: conversation.circleID, status: 'ACTIVE' },
+              select: { userID: true, role: true },
+            })
+            .then((rows) => new Map(rows.map((r) => [r.userID, r.role])))
+        : Promise.resolve(new Map<string, 'OWNER' | 'ADMIN' | 'MEMBER'>()),
+    ]);
+    return userIds
+      .map((id) => {
+        const user = users.get(id);
+        if (!user) return null;
+        return {
+          userId: id,
+          nickname: user.nickname,
+          avatarUrl: user.avatarUrl,
+          role: roles.get(id) ?? null,
+        };
+      })
+      .filter((m): m is ChatMemberDto => m !== null);
   }
 
   /** 成员校验:会话存在且本人在座(未退出),返回会话行供类型分支使用。 */

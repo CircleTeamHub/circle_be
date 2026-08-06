@@ -50,6 +50,26 @@ export class ChatBroadcastService {
     );
   }
 
+  /** 某用户当前是否有在线 socket(个人房占用判定)。 */
+  async isUserOnline(userId: string): Promise<boolean> {
+    const server = this.requireServer('isUserOnline');
+    if (!server) return false;
+    const sockets = await server.in(userRoom(userId)).fetchSockets();
+    return sockets.length > 0;
+  }
+
+  /** 上/下线广播到其全部会话房(会话成员可见,与消息可见面一致)。 */
+  emitPresence(
+    conversationIds: string[],
+    payload: { userId: string; online: boolean },
+  ): void {
+    const server = this.requireServer('emitPresence');
+    if (!server || conversationIds.length === 0) return;
+    server
+      .to(conversationIds.map(conversationRoom))
+      .emit(CHAT_EVENTS.presence, payload);
+  }
+
   /** 定向下发(如会话新建/成员变更时通知个人房)。 */
   emitToUser(userId: string, event: string, payload: unknown): void {
     const server = this.requireServer('emitToUser');

@@ -24,6 +24,7 @@ import { MessageDaysQueryDto } from './dto/message-days-query.dto';
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
+  ChatMemberDto,
   ChatMessageDto,
 } from './chat.types';
 
@@ -100,6 +101,16 @@ export class ChatController {
       query.keyword,
       query.limit,
     );
+  }
+
+  @Get('conversations/:id/members')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '会话成员目录(GROUP 附圈子角色)' })
+  listMembers(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<ChatMemberDto[]> {
+    return this.chatService.listMembers(req.user.userId, conversationId);
   }
 
   @Get('conversations/:id/message-days')
