@@ -1,4 +1,5 @@
 import { HttpException, Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import type { Server as HttpServer } from 'http';
 import { Server, type Socket } from 'socket.io';
@@ -82,6 +83,7 @@ export class ChatGateway {
     private readonly broadcast: ChatBroadcastService,
     private readonly chatPush: ChatPushService,
     private readonly redisService: RedisService,
+    private readonly configService: ConfigService,
   ) {}
 
   attach(httpServer: HttpServer, options: { corsOrigin: CorsOrigin }): void {
@@ -177,9 +179,15 @@ export class ChatGateway {
 
   private async handleConnection(socket: Socket): Promise<void> {
     const userId = socket.data.userId as string;
+    const guestConversationId =
+      typeof socket.data.guestConversationId === 'string'
+        ? socket.data.guestConversationId
+        : null;
     let conversationIds: string[];
     try {
-      conversationIds = await this.chatService.listConversationIds(userId);
+      conversationIds = guestConversationId
+        ? [guestConversationId]
+        : await this.chatService.listConversationIds(userId);
       await socket.join(userRoom(userId));
       await socket.join(conversationIds.map(conversationRoom));
     } catch (error) {

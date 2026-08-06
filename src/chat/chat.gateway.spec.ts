@@ -42,6 +42,7 @@ describe('ChatGateway', () => {
     onMessageBroadcast: jest.fn().mockResolvedValue(undefined),
   };
   const redisService = { subscribePattern: jest.fn().mockResolvedValue(true) };
+  const configService = { get: jest.fn().mockReturnValue('guest-secret') };
 
   const gateway = new ChatGateway(
     jwtService as never,
@@ -50,6 +51,7 @@ describe('ChatGateway', () => {
     broadcast as never,
     chatPush as never,
     redisService as never,
+    configService as never,
   );
 
   beforeEach(() => {

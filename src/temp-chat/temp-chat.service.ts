@@ -5,14 +5,13 @@ import {
   GoneException,
   Injectable,
   Logger,
-  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
 import { TempChatStatus } from 'src/generated/prisma';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { OpenimService } from 'src/openim/openim.service';
+import { ChatBroadcastService } from 'src/chat/chat-broadcast.service';
 import { LinkTokenService } from './link-token.service';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
@@ -21,6 +20,7 @@ import { newGroupId, newGuestId } from './temp-chat.ids';
 export interface CreateTempChatResult {
   id: string;
   groupId: string;
+  conversationId: string;
   title: string;
   maxMembers: number;
   expiresAt: string;
@@ -39,6 +39,7 @@ export interface TempChatMeta {
 export interface TempChatListItem {
   id: string;
   groupId: string;
+  conversationId: string | null;
   title: string;
   status: string;
   guestCount: number;
@@ -50,8 +51,23 @@ export interface TempChatListItem {
   shareUrl: string | null;
 }
 
+export interface JoinTempChatResult {
+  guestId: string;
+  displayName: string;
+  conversationId: string;
+  /** 访客聊天凭证:socket 握手 auth.token 与访客历史接口 Bearer 共用。 */
+  chatToken: string;
+  /** socket.io 挂载路径(origin 用 API 同源)。 */
+  wsPath: string;
+}
+
 const MAX_ACTIVE_ROOMS_PER_HOST = 200;
 
+/**
+ * 临时聊天(自研栈版):房间 ←→ ChatConversation(type=TEMP) 一一对应,
+ * 访客以 TempChatGuest 身份(非 User 行)入座 ChatMember;凭证与实时通道
+ * 全部走自研 chat —— OpenIM 的注册/建群/发token/强退在本模块已出清。
+ */
 @Injectable()
 export class TempChatService {
   private static readonly CLEANUP_LEASE_MS = 2 * 60 * 1000;
@@ -59,9 +75,9 @@ export class TempChatService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openim: OpenimService,
     private readonly linkToken: LinkTokenService,
     private readonly config: ConfigService,
+    private readonly chatBroadcast: ChatBroadcastService,
   ) {}
 
   async create(
@@ -76,30 +92,14 @@ export class TempChatService {
       dto.maxMembers ?? this.config.get<number>('TEMP_CHAT_MAX_MEMBERS', 50);
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
 
-    // round 3 review：/mine 有 200 条护栏 —— 不设创建上限的话，第 201 间
-    // 活跃房间建得出来却列不出来（拿不到 id 去结束它），只能等 TTL。上限
-    // 与护栏对齐；count+create 用 per-host advisory 锁串行化防并发越界。
-    // 先做一次便宜的锁内预检，避免已满时白建 OpenIM 群。真正落库前必须在
-    // 同一把锁里再次 count 并 create；否则两个 199→200 的并发请求会一起
-    // 通过预检、释放锁，最后落成 201 个活跃房间。
+    // round 3 review:/mine 有 200 条护栏 —— 上限与护栏对齐;count+create 在
+    // 同一把 per-host advisory 锁里,防两个 199→200 的并发请求落成 201。
+    // (原先「先建 OpenIM 群再落库」的两段式与回滚补偿随 OpenIM 一并移除:
+    // 会话行与房间行现在同事务原子创建,不存在孤儿群问题。)
     const quotaLockKey = `temp-chat:${hostUserId}`;
-    await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
-      const active = await tx.tempChat.count({
-        where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
-      });
-      if (active >= MAX_ACTIVE_ROOMS_PER_HOST) {
-        throw new BadRequestException(
-          `活跃临时聊天数量已达上限（${MAX_ACTIVE_ROOMS_PER_HOST}），请先结束不再使用的房间`,
-        );
-      }
-    });
-
     const groupId = newGroupId();
-    // 先建群；落库失败要回滚群，避免 OpenIM 留孤儿群。
-    await this.openim.createGroup(groupId, title, hostUserId, [hostUserId]);
-    try {
-      const row = await this.prisma.$transaction(async (tx) => {
+    const { row, conversationId } = await this.prisma.$transaction(
+      async (tx) => {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
         const active = await tx.tempChat.count({
           where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
@@ -109,28 +109,41 @@ export class TempChatService {
             `活跃临时聊天数量已达上限（${MAX_ACTIVE_ROOMS_PER_HOST}），请先结束不再使用的房间`,
           );
         }
-        return tx.tempChat.create({
+        const row = await tx.tempChat.create({
           data: { groupId, hostUserId, title, maxMembers, expiresAt },
         });
-      });
-      const seconds = Math.max(
-        1,
-        Math.floor((expiresAt.getTime() - Date.now()) / 1000),
-      );
-      const token = this.linkToken.sign(row.id, seconds);
-      const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
-      return {
-        id: row.id,
-        groupId: row.groupId,
-        title: row.title,
-        maxMembers: row.maxMembers,
-        expiresAt: row.expiresAt.toISOString(),
-        shareUrl: `${base}/t/${token}`,
-      };
-    } catch (err) {
-      await this.openim.dismissGroup(groupId).catch(() => undefined);
-      throw err;
-    }
+        const conversation = await tx.chatConversation.create({
+          data: {
+            type: 'TEMP',
+            tempChatID: row.id,
+            members: { create: [{ userID: hostUserId }] },
+          },
+          select: { id: true },
+        });
+        return { row, conversationId: conversation.id };
+      },
+    );
+
+    // 房主已在线的 socket 立即入房,不必等重连。
+    void this.chatBroadcast
+      .joinUserToConversation(hostUserId, conversationId)
+      .catch(() => undefined);
+
+    const seconds = Math.max(
+      1,
+      Math.floor((expiresAt.getTime() - Date.now()) / 1000),
+    );
+    const token = this.linkToken.sign(row.id, seconds);
+    const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
+    return {
+      id: row.id,
+      groupId: row.groupId,
+      conversationId,
+      title: row.title,
+      maxMembers: row.maxMembers,
+      expiresAt: row.expiresAt.toISOString(),
+      shareUrl: `${base}/t/${token}`,
+    };
   }
 
   async getByToken(token: string): Promise<TempChatMeta> {
@@ -170,6 +183,13 @@ export class TempChatService {
         },
       },
     });
+    const conversations = await this.prisma.chatConversation.findMany({
+      where: { tempChatID: { in: rows.map((row) => row.id) } },
+      select: { id: true, tempChatID: true },
+    });
+    const conversationByRoom = new Map(
+      conversations.map((c) => [c.tempChatID, c.id]),
+    );
 
     const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
     const now = Date.now();
@@ -191,6 +211,7 @@ export class TempChatService {
       return {
         id: row.id,
         groupId: row.groupId,
+        conversationId: conversationByRoom.get(row.id) ?? null,
         title: row.title,
         status: effectiveStatus,
         guestCount,
@@ -204,27 +225,16 @@ export class TempChatService {
     });
   }
 
-  async join(
-    token: string,
-    dto: JoinTempChatDto,
-  ): Promise<{
-    imUserId: string;
-    imToken: string;
-    groupId: string;
-    wsUrl: string;
-    apiUrl: string;
-    displayName: string;
-  }> {
+  async join(token: string, dto: JoinTempChatDto): Promise<JoinTempChatResult> {
     const { tcId } = this.linkToken.verify(token);
     const displayName = (
       dto.displayName?.trim() || `访客${randomInt(1000, 10000)}`
     ).slice(0, 20);
-    const guestImId = newGuestId();
+    const guestId = newGuestId();
 
-    // 原子占座：Serializable 事务内复查房间状态 + 人数后再建 guest 行。
-    // 既防并发超员，也关上「访客加入与房间销毁(teardown)同时发生」的竞态窗口
-    // —— 房间状态在事务内复核，销毁后不可能再占到座。
-    const { guest, room } = await this.prisma.$transaction(
+    // 原子占座：Serializable 事务内复查房间状态 + 人数后建 guest 行与座位。
+    // 既防并发超员,也关上「加入与销毁同时发生」的竞态 —— 销毁后占不到座。
+    const { room, conversationId } = await this.prisma.$transaction(
       async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${tcId}`}))`;
         const room = await tx.tempChat.findUnique({ where: { id: tcId } });
@@ -233,6 +243,17 @@ export class TempChatService {
           room.status !== 'ACTIVE' ||
           room.expiresAt.getTime() <= Date.now()
         ) {
+          throw new GoneException({
+            message: '临时聊天已结束',
+            errorCode: TempChatErrorCode.Ended,
+          });
+        }
+        const conversation = await tx.chatConversation.findUnique({
+          where: { tempChatID: tcId },
+          select: { id: true },
+        });
+        if (!conversation) {
+          // 旧 OpenIM 时代遗留房间没有会话行:按已结束处理,不再补建。
           throw new GoneException({
             message: '临时聊天已结束',
             errorCode: TempChatErrorCode.Ended,
@@ -247,59 +268,32 @@ export class TempChatService {
             errorCode: TempChatErrorCode.Full,
           });
         }
-        const guest = await tx.tempChatGuest.create({
-          data: { tempChatId: tcId, imUserId: guestImId, displayName },
+        await tx.tempChatGuest.create({
+          data: { tempChatId: tcId, imUserId: guestId, displayName },
         });
-        return { guest, room };
+        await tx.chatMember.create({
+          data: { conversationID: conversation.id, userID: guestId },
+        });
+        return { room, conversationId: conversation.id };
       },
       { isolationLevel: 'Serializable' },
     );
 
-    try {
-      await this.openim.registerUser(guestImId, displayName);
-      await this.openim.addGroupMembers(room.groupId, [guestImId]);
-      const imToken = await this.openim.getUserToken(guestImId, 5);
-      const stillActive = await this.prisma.$transaction(
-        async (tx) => {
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${tcId}`}))`;
-          const current = await tx.tempChat.findUnique({
-            where: { id: tcId },
-            select: { status: true, expiresAt: true },
-          });
-          return Boolean(
-            current?.status === TempChatStatus.ACTIVE &&
-            current.expiresAt.getTime() > Date.now(),
-          );
-        },
-        { isolationLevel: 'Serializable' },
-      );
-      if (!stillActive) {
-        throw new GoneException({
-          message: '临时聊天已结束',
-          errorCode: TempChatErrorCode.Ended,
-        });
-      }
-      return {
-        imUserId: guestImId,
-        imToken,
-        groupId: room.groupId,
-        wsUrl: this.config.get<string>('OPENIM_IM_WS_URL', ''),
-        apiUrl: this.config.get<string>('OPENIM_IM_API_URL', ''),
-        displayName,
-      };
-    } catch (err) {
-      // 补偿：OpenIM 任一步失败，释放座位，让访客可重试。
-      this.logger.warn(
-        `Temp chat OpenIM join failed for guest ${guest.id}`,
-        err instanceof Error ? err.stack : undefined,
-      );
-      await this.compensateGuest(room.groupId, guestImId, guest.id);
-      if (err instanceof GoneException) throw err;
-      throw new ServiceUnavailableException({
-        message: '加入失败，请重试',
-        errorCode: TempChatErrorCode.JoinFailed,
-      });
-    }
+    const remainingSeconds = Math.max(
+      1,
+      Math.floor((room.expiresAt.getTime() - Date.now()) / 1000),
+    );
+    const chatToken = this.linkToken.signGuest(
+      { guestId, tcId, conversationId },
+      remainingSeconds,
+    );
+    return {
+      guestId,
+      displayName,
+      conversationId,
+      chatToken,
+      wsPath: '/chat-ws',
+    };
   }
 
   async end(hostUserId: string, id: string): Promise<{ status: string }> {
@@ -319,7 +313,10 @@ export class TempChatService {
     return { status: finalStatus };
   }
 
-  /** 解散群 + 强制访客下线 + 落库状态。幂等：仅对 ACTIVE 房调用。 */
+  /**
+   * 结束房间:落库状态 + 访客离座 + 断开访客 socket。幂等:仅对 ACTIVE 房调用。
+   * 全部是本地库/本进程操作;租约与 cleanedUp 语义保留,兼容旧行重扫。
+   */
   async teardown(
     room: { id: string; groupId: string },
     status: TempChatStatus,
@@ -328,7 +325,12 @@ export class TempChatService {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${room.id}`}))`;
       const current = await tx.tempChat.findUnique({ where: { id: room.id } });
       if (!current) {
-        return { finalStatus: status, shouldCleanup: false, guests: [] };
+        return {
+          finalStatus: status,
+          shouldCleanup: false,
+          guests: [] as { imUserId: string }[],
+          conversationId: null as string | null,
+        };
       }
       const finalStatus =
         current.status === TempChatStatus.ACTIVE ? status : current.status;
@@ -339,7 +341,12 @@ export class TempChatService {
         current.cleanupCompletedAt ||
         (current.cleanupLockedAt && current.cleanupLockedAt > staleBefore)
       ) {
-        return { finalStatus, shouldCleanup: false, guests: [] };
+        return {
+          finalStatus,
+          shouldCleanup: false,
+          guests: [] as { imUserId: string }[],
+          conversationId: null as string | null,
+        };
       }
       const claimedAt = new Date();
       await tx.tempChat.update({
@@ -354,119 +361,50 @@ export class TempChatService {
         where: { tempChatId: room.id, cleanedUp: false },
         select: { imUserId: true },
       });
+      const conversation = await tx.chatConversation.findUnique({
+        where: { tempChatID: room.id },
+        select: { id: true },
+      });
+      if (conversation && guests.length > 0) {
+        // 访客座位统一离座:membership 校验即刻拒发,历史仍留给房主。
+        await tx.chatMember.updateMany({
+          where: {
+            conversationID: conversation.id,
+            userID: { in: guests.map((g) => g.imUserId) },
+            leftAt: null,
+          },
+          data: { leftAt: claimedAt },
+        });
+      }
+      if (guests.length > 0) {
+        await tx.tempChatGuest.updateMany({
+          where: {
+            tempChatId: room.id,
+            imUserId: { in: guests.map((g) => g.imUserId) },
+          },
+          data: { cleanedUp: true },
+        });
+      }
+      await tx.tempChat.updateMany({
+        where: { id: room.id, cleanupLockedAt: claimedAt },
+        data: { cleanupCompletedAt: new Date(), cleanupLockedAt: null },
+      });
       return {
         finalStatus,
         shouldCleanup: true,
         guests,
-        claimedAt,
-        groupDismissed: Boolean(current.cleanupGroupDismissedAt),
+        conversationId: conversation?.id ?? null,
       };
     });
 
     if (!claim.shouldCleanup) return claim.finalStatus;
 
-    let dismissFailure: unknown;
-    if (!claim.groupDismissed) {
-      let dismissed = false;
-      try {
-        await this.openim.dismissGroup(room.groupId);
-        dismissed = true;
-      } catch (error) {
-        if (this.isAlreadyAbsent(error)) dismissed = true;
-        else dismissFailure = error;
-      }
-      if (dismissed) {
-        await this.prisma.tempChat.updateMany({
-          where: { id: room.id, cleanupLockedAt: claim.claimedAt },
-          data: { cleanupGroupDismissedAt: new Date() },
-        });
-      }
-    }
-    const guestFailures: unknown[] = [];
-    const cleanupConcurrency = 10;
-    for (
-      let offset = 0;
-      offset < claim.guests.length;
-      offset += cleanupConcurrency
-    ) {
-      const batch = claim.guests.slice(offset, offset + cleanupConcurrency);
-      const results = await Promise.allSettled(
-        batch.map((guest) => this.openim.forceLogout(guest.imUserId)),
-      );
-      const successfulGuests: string[] = [];
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') {
-          successfulGuests.push(batch[index].imUserId);
-        } else {
-          guestFailures.push(result.reason);
-        }
-      });
-      if (successfulGuests.length > 0) {
-        await this.prisma.tempChatGuest.updateMany({
-          where: {
-            tempChatId: room.id,
-            imUserId: { in: successfulGuests },
-          },
-          data: { cleanedUp: true },
-        });
-      }
-    }
-    const cleanupSucceeded = !dismissFailure && guestFailures.length === 0;
-
-    await this.prisma.$transaction(async (tx) => {
-      await tx.tempChat.updateMany({
-        where: { id: room.id, cleanupLockedAt: claim.claimedAt },
-        data: cleanupSucceeded
-          ? { cleanupCompletedAt: new Date(), cleanupLockedAt: null }
-          : { cleanupLockedAt: null },
-      });
-    });
-
-    if (!cleanupSucceeded) {
-      throw dismissFailure ?? guestFailures[0];
+    // 断开访客在线 socket(尽力而为;凭证过期与 membership 校验双重兜底)。
+    for (const guest of claim.guests) {
+      void this.chatBroadcast
+        .disconnectUser(guest.imUserId)
+        .catch(() => undefined);
     }
     return claim.finalStatus;
-  }
-
-  private async compensateGuest(
-    groupId: string,
-    imUserId: string,
-    guestId: string,
-  ): Promise<void> {
-    const results = await Promise.allSettled([
-      this.openim.removeGroupMember(groupId, imUserId),
-      this.openim.forceLogout(imUserId),
-    ]);
-    const compensated = results.every(
-      (result) =>
-        result.status === 'fulfilled' || this.isAlreadyAbsent(result.reason),
-    );
-    if (!compensated) {
-      await this.prisma.tempChatGuest
-        .update({
-          where: { id: guestId },
-          data: { provisioningFailedAt: new Date() },
-        })
-        .catch(() => undefined);
-      this.logger.warn(
-        `OpenIM guest compensation incomplete; retaining guest ${guestId} for teardown retry`,
-      );
-      return;
-    }
-    try {
-      await this.prisma.tempChatGuest.delete({ where: { id: guestId } });
-    } catch (cleanupError) {
-      this.logger.warn(
-        `Temp chat guest cleanup failed after OpenIM join failure: ${guestId}`,
-        cleanupError instanceof Error ? cleanupError.stack : undefined,
-      );
-    }
-  }
-
-  private isAlreadyAbsent(error: unknown): boolean {
-    const value = error instanceof Error ? error.message : String(error);
-    return /RecordNotFoundError|not group member|already dismissed/i.test(
-      value,
-    );
   }
 }

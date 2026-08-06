@@ -1,15 +1,16 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
-import { OpenimModule } from 'src/openim/openim.module';
+import { ChatModule } from 'src/chat/chat.module';
 import { LinkTokenService } from './link-token.service';
 import { TempChatCleanup } from './temp-chat.cleanup';
 import { TempChatController } from './temp-chat.controller';
+import { TempChatGuestGuard } from './temp-chat-guest.guard';
 import { TempChatService } from './temp-chat.service';
 
 @Module({
   imports: [
-    OpenimModule,
+    ChatModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -18,7 +19,12 @@ import { TempChatService } from './temp-chat.service';
     }),
   ],
   controllers: [TempChatController],
-  providers: [TempChatService, LinkTokenService, TempChatCleanup],
+  providers: [
+    TempChatService,
+    LinkTokenService,
+    TempChatCleanup,
+    TempChatGuestGuard,
+  ],
   exports: [TempChatService],
 })
 export class TempChatModule {}

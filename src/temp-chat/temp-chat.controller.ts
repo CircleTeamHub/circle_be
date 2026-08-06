@@ -7,6 +7,7 @@ import {
   NotFoundException,
   Param,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -14,15 +15,24 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
+import { ChatService } from 'src/chat/chat.service';
+import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
+import {
+  TempChatGuestGuard,
+  type RequestWithTempChatGuest,
+} from './temp-chat-guest.guard';
 import { TempChatService } from './temp-chat.service';
 
 @ApiTags('Temp Chat')
 @Controller('temp-chat')
 @UseGuards(ThrottlerGuard)
 export class TempChatController {
-  constructor(private readonly service: TempChatService) {}
+  constructor(
+    private readonly service: TempChatService,
+    private readonly chatService: ChatService,
+  ) {}
 
   @Post()
   @UseGuards(JwtGuard)
@@ -79,6 +89,23 @@ export class TempChatController {
       }
       throw err;
     }
+  }
+
+  // 访客历史(冷路径):Bearer 访客聊天凭证;实时走 /chat-ws 二形态握手。
+  @Get('guest/messages')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客拉取房间历史(height 键集分页)' })
+  guestHistory(
+    @Req() req: RequestWithTempChatGuest,
+    @Query() query: HistoryQueryDto,
+  ) {
+    return this.chatService.getHistory(
+      req.tempChatGuest.guestId,
+      req.tempChatGuest.conversationId,
+      query.beforeHeight,
+      query.limit,
+    );
   }
 
   @Post(':id/end')

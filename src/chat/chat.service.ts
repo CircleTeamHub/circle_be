@@ -165,6 +165,9 @@ export class ChatService {
     if (conversation.type === 'GROUP' && conversation.muteAllAt) {
       await this.assertNotMutedAll(conversation, senderUserId);
     }
+    if (conversation.type === 'TEMP') {
+      await this.assertTempChatActive(conversation);
+    }
 
     const content = payload.content as Prisma.InputJsonObject;
     const created = await this.prisma.$transaction(async (tx) => {
@@ -694,6 +697,29 @@ export class ChatService {
       .filter((m): m is ChatMemberDto => m !== null);
   }
 
+  /** 网关访客鉴权用:房间是否仍 ACTIVE 未过期。 */
+  async getActiveTempChat(tempChatId: string): Promise<boolean> {
+    const room = await this.prisma.tempChat.findUnique({
+      where: { id: tempChatId },
+      select: { status: true, expiresAt: true },
+    });
+    return room?.status === 'ACTIVE' && room.expiresAt.getTime() > Date.now();
+  }
+
+  /** 网关访客鉴权用:是否在座(未离座)。 */
+  async hasSeat(conversationId: string, userId: string): Promise<boolean> {
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: userId,
+        },
+      },
+      select: { leftAt: true },
+    });
+    return Boolean(seat && !seat.leftAt);
+  }
+
   /** 成员校验:会话存在且本人在座(未退出),返回会话行供类型分支使用。 */
   private async requireMembership(
     conversationId: string,
@@ -750,6 +776,25 @@ export class ChatService {
       throw new ForbiddenException({
         message: '该群已被禁言',
         errorCode: ChatErrorCode.ConversationMuted,
+      });
+    }
+  }
+
+  /** 临时房已结束/过期即拒发(访客凭证 TTL 之外的第二道闸)。 */
+  private async assertTempChatActive(
+    conversation: ChatConversation,
+  ): Promise<void> {
+    if (!conversation.tempChatID) return;
+    const room = await this.prisma.tempChat.findUnique({
+      where: { id: conversation.tempChatID },
+      select: { status: true, expiresAt: true },
+    });
+    const active =
+      room?.status === 'ACTIVE' && room.expiresAt.getTime() > Date.now();
+    if (!active) {
+      throw new ForbiddenException({
+        message: '临时聊天已结束',
+        errorCode: ChatErrorCode.ConversationNotFound,
       });
     }
   }
@@ -865,12 +910,28 @@ export class ChatService {
       where: { id: { in: unique } },
       select: { id: true, nickname: true, avatarUrl: true },
     });
-    return new Map(
+    const resolved = new Map<string, ChatSenderInfo>(
       users.map((u) => [
         u.id,
         { id: u.id, nickname: u.nickname, avatarUrl: u.avatarUrl },
       ]),
     );
+    // 临时房访客不是 User 行:剩余 id 兜底查 TempChatGuest(展示名,无头像)。
+    const missing = unique.filter((id) => !resolved.has(id));
+    if (missing.length > 0) {
+      const guests = await this.prisma.tempChatGuest.findMany({
+        where: { imUserId: { in: missing } },
+        select: { imUserId: true, displayName: true },
+      });
+      for (const guest of guests) {
+        resolved.set(guest.imUserId, {
+          id: guest.imUserId,
+          nickname: guest.displayName,
+          avatarUrl: null,
+        });
+      }
+    }
+    return resolved;
   }
 
   private senderFor(

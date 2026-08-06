@@ -75,6 +75,16 @@ export class ChatBroadcastService {
     return ids;
   }
 
+  /** 断开某用户全部在线 socket(临时房结束/访客清退用)。 */
+  async disconnectUser(userId: string): Promise<void> {
+    const server = this.requireServer('disconnectUser');
+    if (!server) return;
+    const sockets = await server.in(userRoom(userId)).fetchSockets();
+    for (const socket of sockets) {
+      socket.disconnect(true);
+    }
+  }
+
   /** 上/下线广播到其全部会话房(会话成员可见,与消息可见面一致)。 */
   emitPresence(
     conversationIds: string[],
