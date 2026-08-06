@@ -296,6 +296,19 @@ export const ChatHistoryErrorCode = {
   ConversationNotFound: 'CHAT_HISTORY_CONVERSATION_NOT_FOUND',
 } as const;
 
+// 自研聊天(src/chat):REST 与 socket ack 共用同一批码。
+// (注:前端 serverErrors 词条随 FE 接线批次补齐。)
+export const ChatErrorCode = {
+  ConversationNotFound: 'CHAT_CONVERSATION_NOT_FOUND',
+  NotMember: 'CHAT_NOT_MEMBER',
+  PeerNotFound: 'CHAT_PEER_NOT_FOUND',
+  SelfConversation: 'CHAT_SELF_CONVERSATION',
+  Blocked: 'CHAT_BLOCKED',
+  SensitiveWord: 'CHAT_SENSITIVE_WORD_BLOCKED',
+  InvalidPayload: 'CHAT_INVALID_PAYLOAD',
+  RateLimited: 'CHAT_RATE_LIMITED',
+} as const;
+
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
 export const CollectionErrorCode = {
   NotFound: 'COLLECTION_NOT_FOUND',
@@ -364,6 +377,7 @@ export type AppErrorCode =
   | (typeof CallErrorCode)[keyof typeof CallErrorCode]
   | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode]
   | (typeof ChatHistoryErrorCode)[keyof typeof ChatHistoryErrorCode]
+  | (typeof ChatErrorCode)[keyof typeof ChatErrorCode]
   | (typeof UploadErrorCode)[keyof typeof UploadErrorCode]
   | (typeof CollectionErrorCode)[keyof typeof CollectionErrorCode]
   | (typeof IconErrorCode)[keyof typeof IconErrorCode]
@@ -391,6 +405,7 @@ export const APP_ERROR_CODE_GROUPS = [
   UploadErrorCode,
   ConversationGroupErrorCode,
   ChatHistoryErrorCode,
+  ChatErrorCode,
   CollectionErrorCode,
   IconErrorCode,
   LikeErrorCode,

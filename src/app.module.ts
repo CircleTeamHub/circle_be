@@ -45,6 +45,7 @@ import { DashboardModule } from './admin-dashboard/dashboard.module';
 import { AvatarFrameModule } from './avatar-frame/avatar-frame.module';
 import { AdminCommunityModule } from './admin-community/admin-community.module';
 import { SensitiveWordModule } from './sensitive-word/sensitive-word.module';
+import { ChatModule } from './chat/chat.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -96,6 +97,7 @@ const envFilePath = `.env.${nodeEnv}`;
     AvatarFrameModule,
     AdminCommunityModule,
     SensitiveWordModule,
+    ChatModule,
   ],
   controllers: [],
   providers: [Logger],
