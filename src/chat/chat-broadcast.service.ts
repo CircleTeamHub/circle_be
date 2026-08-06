@@ -58,6 +58,23 @@ export class ChatBroadcastService {
     return sockets.length > 0;
   }
 
+  /** 会话房内当前在线的 userId 集合(离线推送分流用)。 */
+  async getOnlineUserIdsInConversation(
+    conversationId: string,
+  ): Promise<Set<string>> {
+    const server = this.requireServer('getOnlineUserIdsInConversation');
+    if (!server) return new Set();
+    const sockets = await server
+      .in(conversationRoom(conversationId))
+      .fetchSockets();
+    const ids = new Set<string>();
+    for (const socket of sockets) {
+      const userId = (socket.data as { userId?: unknown })?.userId;
+      if (typeof userId === 'string') ids.add(userId);
+    }
+    return ids;
+  }
+
   /** 上/下线广播到其全部会话房(会话成员可见,与消息可见面一致)。 */
   emitPresence(
     conversationIds: string[],

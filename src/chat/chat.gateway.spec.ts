@@ -38,11 +38,16 @@ describe('ChatGateway', () => {
     isUserOnline: jest.fn().mockResolvedValue(false),
   };
 
+  const chatPush = {
+    onMessageBroadcast: jest.fn().mockResolvedValue(undefined),
+  };
+
   const gateway = new ChatGateway(
     jwtService as never,
     sessionRevocation as never,
     chatService as never,
     broadcast as never,
+    chatPush as never,
   );
 
   beforeEach(() => {

@@ -14,6 +14,7 @@ import {
 } from './chat.constants';
 import { SlidingWindowRateLimiter } from './chat-rate-limiter';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatPushService } from './chat-push.service';
 import { ChatService } from './chat.service';
 import type {
   ChatAckError,
@@ -67,6 +68,7 @@ export class ChatGateway {
     private readonly sessionRevocation: SessionRevocationService,
     private readonly chatService: ChatService,
     private readonly broadcast: ChatBroadcastService,
+    private readonly chatPush: ChatPushService,
   ) {}
 
   attach(httpServer: HttpServer, options: { corsOrigin: CorsOrigin }): void {
@@ -221,6 +223,8 @@ export class ChatGateway {
       // 幂等复用(断线重发撞库)不再广播,首次投递时房间里已经收到过了。
       if (!result.reused) {
         this.broadcast.emitMessage(result.message);
+        // 离线成员推送:best-effort,不阻塞发送方 ack 路径。
+        void this.chatPush.onMessageBroadcast(result.message);
       }
     } catch (error) {
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));
