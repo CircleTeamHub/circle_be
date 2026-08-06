@@ -236,7 +236,8 @@ export class TempChatService {
     // 既防并发超员,也关上「加入与销毁同时发生」的竞态 —— 销毁后占不到座。
     const { room, conversationId } = await this.prisma.$transaction(
       async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${tcId}`}))`;
+        const roomLockKey = `temp-chat:${tcId}`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${roomLockKey}))`;
         const room = await tx.tempChat.findUnique({ where: { id: tcId } });
         if (
           !room ||
@@ -322,7 +323,8 @@ export class TempChatService {
     status: TempChatStatus,
   ): Promise<TempChatStatus> {
     const claim = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`temp-chat:${room.id}`}))`;
+      const roomLockKey = `temp-chat:${room.id}`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${roomLockKey}))`;
       const current = await tx.tempChat.findUnique({ where: { id: room.id } });
       if (!current) {
         return {
