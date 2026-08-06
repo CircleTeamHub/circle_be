@@ -29,13 +29,21 @@ describe('ChatService', () => {
       create: jest.fn(),
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
+    circleMember: { findUnique: jest.fn() },
     block: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
   };
   const sensitiveWords = { check: jest.fn() };
+  const circleSync = { ensureCircleConversation: jest.fn() };
+  const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
 
-  const service = new ChatService(prisma as never, sensitiveWords as never);
+  const service = new ChatService(
+    prisma as never,
+    sensitiveWords as never,
+    circleSync as never,
+    media as never,
+  );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
@@ -466,6 +474,71 @@ describe('ChatService', () => {
           where: expect.objectContaining({ NOT: { senderID: 'u1' } }),
         }),
       );
+    });
+  });
+
+  describe('getOrCreateCircleConversation', () => {
+    it('rejects callers that are not ACTIVE circle members', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'PENDING' });
+      await expect(
+        service.getOrCreateCircleConversation('u1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.NotMember },
+      });
+      expect(circleSync.ensureCircleConversation).not.toHaveBeenCalled();
+    });
+
+    it('syncs seats on access and returns the conversation dto', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      circleSync.ensureCircleConversation.mockResolvedValue('conv-g');
+      prisma.chatMember.findUnique.mockResolvedValue({
+        ...membership(),
+        conversationID: 'conv-g',
+        conversation: {
+          id: 'conv-g',
+          type: 'GROUP',
+          directKey: null,
+          circleID: 'circle-1',
+          tempChatID: null,
+          lastMessageAt: null,
+        },
+      });
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+
+      const dto = await service.getOrCreateCircleConversation('u1', 'circle-1');
+
+      expect(circleSync.ensureCircleConversation).toHaveBeenCalledWith(
+        'circle-1',
+      );
+      expect(dto).toMatchObject({
+        id: 'conv-g',
+        type: 'GROUP',
+        circleId: 'circle-1',
+        unreadCount: 0,
+      });
+    });
+  });
+
+  describe('setConversationPreferences', () => {
+    it('updates pinned/muted for the caller seat only', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMember.update.mockResolvedValue({});
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.setConversationPreferences('u1', 'conv-1', {
+        pinned: true,
+      });
+
+      expect(prisma.chatMember.update).toHaveBeenCalledWith({
+        where: {
+          conversationID_userID: { conversationID: 'conv-1', userID: 'u1' },
+        },
+        data: { pinned: true },
+      });
     });
   });
 });

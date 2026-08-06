@@ -22,6 +22,7 @@ import {
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CIRCLE_CREATE_LIMIT } from './circle-limits';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleMemberLockService } from './circle-member-lock';
 import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
@@ -54,6 +55,7 @@ export class CircleService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
+    private readonly chatCircleSync: ChatCircleSyncService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -195,6 +197,15 @@ export class CircleService {
         `Failed to create OpenIM group for circle ${circle.id}: ${error}`,
       );
     }
+
+    // 自研聊天:建圈即建群会话(尽力而为;失败由每分钟对账兜底,不阻塞建圈)。
+    void this.chatCircleSync.ensureCircleConversation(circle.id).catch((e) => {
+      this.logger.warn(
+        `chat conversation sync failed for circle ${circle.id}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    });
 
     return {
       ...this.toCircleDto(circle),

@@ -10,6 +10,7 @@ import { MembershipPolicyService } from 'src/membership/membership-policy.servic
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import {
   CreateCircleDto,
   MyCirclesQueryDto,
@@ -78,6 +79,10 @@ describe('CircleService', () => {
     getInvitationForViewer: jest.fn(),
   };
   const memberLock = { lock: jest.fn() };
+  const chatCircleSync = {
+    ensureCircleConversation: jest.fn().mockResolvedValue('conv-x'),
+  };
+  const directChatCircleSync = chatCircleSync as any;
   const directMembershipPolicy = new MembershipPolicyService(prisma as any);
   const directMemberLock = new CircleMemberLockService(directMembershipPolicy);
   const directAdmissionPolicy = new CircleAdmissionPolicy(
@@ -100,6 +105,7 @@ describe('CircleService', () => {
         { provide: MembershipProgramService, useValue: membershipProgram },
         CircleAdmissionPolicy,
         { provide: CircleMemberLockService, useValue: memberLock },
+        { provide: ChatCircleSyncService, useValue: chatCircleSync },
       ],
     }).compile();
 
@@ -108,6 +114,8 @@ describe('CircleService', () => {
     // 与加入上限都靠 count，默认必须显式归零。
     prisma.circle.count.mockResolvedValue(0);
     prisma.circleMember.count.mockResolvedValue(0);
+    // clearAllMocks 后必须重设:建圈钩子对返回值 .catch(),undefined 会直接抛。
+    chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-x');
     circleInvitationService.getInvitationForViewer.mockResolvedValue({
       id: 'inv-1',
       status: 'PENDING',
@@ -411,6 +419,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -770,6 +779,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -800,6 +810,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -834,6 +845,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',

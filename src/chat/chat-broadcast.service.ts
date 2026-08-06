@@ -70,6 +70,19 @@ export class ChatBroadcastService {
     }
   }
 
+  /** 成员被移出后把其在线 socket 撤出会话房(座位收回即时生效,不等重连)。 */
+  async removeUserFromConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    const server = this.requireServer('removeUserFromConversation');
+    if (!server) return;
+    const sockets = await server.in(userRoom(userId)).fetchSockets();
+    for (const socket of sockets) {
+      socket.leave(conversationRoom(conversationId));
+    }
+  }
+
   private requireServer(caller: string): Server | null {
     if (!this.server) {
       // attach 之前不应有业务调用;出现即是接线错误,记下但不崩发送方。

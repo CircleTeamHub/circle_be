@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -14,6 +15,8 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatService } from './chat.service';
+import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
+import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
 import type { ChatConversationDto, ChatHistoryPageDto } from './chat.types';
@@ -48,6 +51,34 @@ export class ChatController {
     return this.chatService.getOrCreateDirectConversation(
       req.user.userId,
       body.peerUserId,
+    );
+  }
+
+  @Post('conversations/circle')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '取或建圈子群会话(仅 ACTIVE 圈成员)' })
+  createCircleConversation(
+    @Req() req: RequestWithUser,
+    @Body() body: CreateCircleConversationDto,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.getOrCreateCircleConversation(
+      req.user.userId,
+      body.circleId,
+    );
+  }
+
+  @Patch('conversations/:id/preferences')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '会话偏好:置顶/免打扰' })
+  setPreferences(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: ConversationPreferencesDto,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.setConversationPreferences(
+      req.user.userId,
+      conversationId,
+      body,
     );
   }
 
