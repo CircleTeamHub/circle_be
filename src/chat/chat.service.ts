@@ -28,6 +28,7 @@ import {
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
+  HistoryFilters,
   ChatMessageDto,
   ChatSenderInfo,
   ChatSendPayload,
@@ -106,6 +107,23 @@ export class ChatService {
         message: 'replyToId 非法',
         errorCode: ChatErrorCode.InvalidPayload,
       });
+    }
+    // 媒体消息只收 object key,拒绝 URL 形态 —— 防「URL 固化进消息体」回潮
+    // (读路径统一由 ChatMediaService 签发,见 docs/self-hosted-chat.md)。
+    if (payload.type === 'image' || payload.type === 'voice') {
+      const key = payload.content['key'];
+      const thumbKey = payload.content['thumbKey'];
+      const isValidKey = (value: unknown): boolean =>
+        typeof value === 'string' && value.length > 0 && !value.includes('://');
+      if (
+        !isValidKey(key) ||
+        (thumbKey !== undefined && !isValidKey(thumbKey))
+      ) {
+        throw new BadRequestException({
+          message: '媒体消息必须携带 object key(不接受 URL)',
+          errorCode: ChatErrorCode.InvalidPayload,
+        });
+      }
     }
     const text = payload.content['text'];
     if (text !== undefined) {
@@ -426,6 +444,7 @@ export class ChatService {
     conversationId: string,
     beforeHeight?: number,
     limit: number = HISTORY_PAGE_DEFAULT,
+    filters: HistoryFilters = {},
   ): Promise<ChatHistoryPageDto> {
     await this.requireMembership(conversationId, userId);
     const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
@@ -434,6 +453,7 @@ export class ChatService {
         conversationID: conversationId,
         deleted: false,
         ...(beforeHeight !== undefined ? { height: { lt: beforeHeight } } : {}),
+        ...this.buildHistoryFilterWhere(filters),
       },
       orderBy: { height: 'desc' },
       take,
@@ -452,6 +472,102 @@ export class ChatService {
       nextBeforeHeight:
         rows.length === take ? rows[rows.length - 1].height : null,
     };
+  }
+
+  /**
+   * 历史过滤条件(聊天记录搜索/媒体/按日期共用):
+   * keyword 走 jsonb path 包含(大小写敏感,CJK 主场景无损;拉丁小写化随
+   * 后续全文索引批次);date 按客户端时区解释成当天 [00:00, 24:00) 的 UTC 区间。
+   */
+  private buildHistoryFilterWhere(
+    filters: HistoryFilters,
+  ): Prisma.ChatMessageWhereInput {
+    const where: Prisma.ChatMessageWhereInput = {};
+    if (filters.types?.length) {
+      where.type = { in: filters.types };
+    }
+    if (filters.keyword) {
+      where.content = { path: ['text'], string_contains: filters.keyword };
+    }
+    if (filters.date) {
+      const tzOffset = filters.tzOffsetMinutes ?? 0;
+      const start = Date.parse(`${filters.date}T00:00:00Z`) + tzOffset * 60_000;
+      if (Number.isFinite(start)) {
+        where.createdAt = {
+          gte: new Date(start),
+          lt: new Date(start + 24 * 60 * 60 * 1000),
+        };
+      }
+    }
+    return where;
+  }
+
+  /**
+   * 某月内有聊天记录的日期集合('YYYY-MM-DD',按客户端时区归日),
+   * 按日期日历给有记录的天上色用。上限 5000 行,极端活跃会话截断可接受。
+   */
+  async listMessageDays(
+    userId: string,
+    conversationId: string,
+    year: number,
+    month: number,
+    tzOffsetMinutes = 0,
+  ): Promise<string[]> {
+    await this.requireMembership(conversationId, userId);
+    const monthStart = Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
+    const monthEnd = Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
+    if (!Number.isFinite(monthStart) || !Number.isFinite(monthEnd)) return [];
+    const rows = await this.prisma.chatMessage.findMany({
+      where: {
+        conversationID: conversationId,
+        deleted: false,
+        createdAt: { gte: new Date(monthStart), lt: new Date(monthEnd) },
+      },
+      select: { createdAt: true },
+      take: 5000,
+    });
+    const days = new Set<string>();
+    for (const row of rows) {
+      const local = new Date(
+        row.createdAt.getTime() - tzOffsetMinutes * 60_000,
+      );
+      days.add(local.toISOString().slice(0, 10));
+    }
+    return [...days].sort((a, b) => (a < b ? -1 : 1));
+  }
+
+  /**
+   * 全局搜索:跨本人全部在座会话搜文本(最新在前,扁平返回;
+   * 会话展示信息由前端用自己的会话列表补,不在此放大查询)。
+   */
+  async searchAllMessages(
+    userId: string,
+    keyword: string,
+    limit = 50,
+  ): Promise<ChatMessageDto[]> {
+    const trimmed = keyword.trim();
+    if (!trimmed) return [];
+    const memberships = await this.prisma.chatMember.findMany({
+      where: { userID: userId, leftAt: null },
+      select: { conversationID: true },
+    });
+    if (memberships.length === 0) return [];
+    const rows = await this.prisma.chatMessage.findMany({
+      where: {
+        conversationID: { in: memberships.map((m) => m.conversationID) },
+        deleted: false,
+        type: { in: ['text', 'quote'] },
+        content: { path: ['text'], string_contains: trimmed },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX),
+    });
+    const senders = await this.resolveSenders(
+      rows.map((r) => r.senderID).filter((id): id is string => id !== null),
+    );
+    return rows.map((row) =>
+      this.toMessageDto(row, this.senderFor(row, senders)),
+    );
   }
 
   /**

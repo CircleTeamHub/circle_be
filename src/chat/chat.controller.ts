@@ -18,8 +18,14 @@ import { ChatService } from './chat.service';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
+import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
-import type { ChatConversationDto, ChatHistoryPageDto } from './chat.types';
+import { MessageDaysQueryDto } from './dto/message-days-query.dto';
+import type {
+  ChatConversationDto,
+  ChatHistoryPageDto,
+  ChatMessageDto,
+} from './chat.types';
 
 /**
  * 自研聊天 REST 面:会话列表 / 建单聊 / 历史分页。
@@ -82,6 +88,37 @@ export class ChatController {
     );
   }
 
+  @Get('messages/search')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '全局搜索:跨本人全部会话搜文本消息(最新在前)' })
+  searchAllMessages(
+    @Req() req: RequestWithUser,
+    @Query() query: GlobalSearchQueryDto,
+  ): Promise<ChatMessageDto[]> {
+    return this.chatService.searchAllMessages(
+      req.user.userId,
+      query.keyword,
+      query.limit,
+    );
+  }
+
+  @Get('conversations/:id/message-days')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: '某月内有聊天记录的日期集合(按日期日历上色)' })
+  listMessageDays(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Query() query: MessageDaysQueryDto,
+  ): Promise<string[]> {
+    return this.chatService.listMessageDays(
+      req.user.userId,
+      conversationId,
+      query.year,
+      query.month,
+      query.tzOffsetMinutes,
+    );
+  }
+
   @Get('conversations/:id/messages')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: '会话历史(height 键集分页,页内升序)' })
@@ -95,6 +132,12 @@ export class ChatController {
       conversationId,
       query.beforeHeight,
       query.limit,
+      {
+        types: query.types,
+        keyword: query.keyword,
+        date: query.date,
+        tzOffsetMinutes: query.tzOffsetMinutes,
+      },
     );
   }
 }

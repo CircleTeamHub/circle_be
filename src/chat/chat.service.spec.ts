@@ -184,6 +184,28 @@ describe('ChatService', () => {
       });
     });
 
+    it('rejects media payloads that carry URLs instead of object keys', async () => {
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: { key: 'https://evil.example/a.jpg' },
+          }),
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({ type: 'voice', content: { duration: 3 } }),
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+    });
+
     it('rejects oversized content', async () => {
       await expect(
         service.sendMessage(
@@ -428,11 +450,88 @@ describe('ChatService', () => {
       expect(page.nextBeforeHeight).toBeNull();
     });
 
+    it('applies type/keyword/date filters onto the where clause', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      // 东八区(getTimezoneOffset = -480)的 2026-08-05:UTC 前一日 16:00 起算。
+      await service.getHistory('u1', 'conv-1', undefined, 50, {
+        types: ['image'],
+        keyword: '合同',
+        date: '2026-08-05',
+        tzOffsetMinutes: -480,
+      });
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            type: { in: ['image'] },
+            content: { path: ['text'], string_contains: '合同' },
+            createdAt: {
+              gte: new Date('2026-08-04T16:00:00.000Z'),
+              lt: new Date('2026-08-05T16:00:00.000Z'),
+            },
+          }),
+        }),
+      );
+    });
+
     it('denies non-members', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
       await expect(service.getHistory('u1', 'conv-1')).rejects.toThrow(
         ForbiddenException,
       );
+    });
+  });
+
+  describe('listMessageDays', () => {
+    it('groups message timestamps into client-timezone days', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        // UTC 8/4 17:00 = 东八区 8/5 01:00;UTC 8/5 15:00 = 东八区 8/5 23:00。
+        { createdAt: new Date('2026-08-04T17:00:00.000Z') },
+        { createdAt: new Date('2026-08-05T15:00:00.000Z') },
+        { createdAt: new Date('2026-08-05T17:00:00.000Z') }, // 东八区 8/6
+      ]);
+
+      const days = await service.listMessageDays('u1', 'conv-1', 2026, 7, -480);
+      expect(days).toEqual(['2026-08-05', '2026-08-06']);
+    });
+
+    it('denies non-members', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+      await expect(
+        service.listMessageDays('u1', 'conv-1', 2026, 7, 0),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('searchAllMessages', () => {
+    it('returns empty for blank keywords without querying', async () => {
+      await expect(service.searchAllMessages('u1', '  ')).resolves.toEqual([]);
+      expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    it('scopes the search to conversations the user is seated in', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1' },
+        { conversationID: 'conv-2' },
+      ]);
+      prisma.chatMessage.findMany.mockResolvedValue([createdRow]);
+
+      const rows = await service.searchAllMessages('u1', 'hello');
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            conversationID: { in: ['conv-1', 'conv-2'] },
+            type: { in: ['text', 'quote'] },
+            content: { path: ['text'], string_contains: 'hello' },
+          }),
+          orderBy: { createdAt: 'desc' },
+        }),
+      );
+      expect(rows).toHaveLength(1);
     });
   });
 

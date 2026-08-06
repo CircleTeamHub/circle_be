@@ -88,6 +88,18 @@ export interface ChatConversationDto {
   lastMessageAt: string | null;
 }
 
+/** 历史查询的可选过滤(聊天记录搜索/媒体/按日期共用一个端点)。 */
+export interface HistoryFilters {
+  /** 消息类型白名单(如 ['image'] / ['text','quote'])。 */
+  types?: string[];
+  /** 文本关键词(content.text jsonb 包含匹配)。 */
+  keyword?: string;
+  /** 'YYYY-MM-DD',按 tzOffsetMinutes 解释成客户端当天。 */
+  date?: string;
+  /** 客户端时区偏移(new Date().getTimezoneOffset() 语义,分钟)。 */
+  tzOffsetMinutes?: number;
+}
+
 /** 历史分页 DTO(REST GET /chat/conversations/:id/messages)。 */
 export interface ChatHistoryPageDto {
   messages: ChatMessageDto[];
