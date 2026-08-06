@@ -37,28 +37,46 @@ describe('FriendChatReplayOutboxProcessor', () => {
         }),
       },
     };
-    const openim = {
-      importFriends: jest.fn().mockResolvedValue(undefined),
-      sendTextMessage: jest.fn().mockResolvedValue(undefined),
+    const chatService = {
+      getOrCreateDirectConversation: jest
+        .fn()
+        .mockResolvedValue({ id: 'conv-1' }),
+    };
+    const chatMessages = {
+      insertServerMessage: jest.fn().mockResolvedValue(undefined),
     };
 
     const processor = new FriendChatReplayOutboxProcessor(
       prisma as any,
-      openim as any,
+      chatService as any,
+      chatMessages as any,
     );
 
     await processor.processPending();
 
-    expect(openim.importFriends).toHaveBeenCalledWith('user-1', ['user-2']);
-    expect(openim.sendTextMessage).toHaveBeenCalledWith(
+    // 申请期消息以原发送者身份回放进双方 1:1 会话
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-1',
       expect.objectContaining({
-        sendID: 'user-1',
-        recvID: 'user-2',
-        content: 'hello',
-        notOfflinePush: true,
-        clientMsgID: 'friend-request:request-1:message-1',
+        senderID: 'user-1',
+        type: 'text',
+        content: { text: 'hello' },
+        clientMessageId: 'friend-request:request-1:message-1',
       }),
     );
+    // 接受方的固定答复也补进会话（stage 3）
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({
+        senderID: 'user-2',
+        clientMessageId: 'friend-request:request-1:accepted',
+      }),
+    );
+    // 回放是补历史，任何一条都不触发离线推送
+    const pushed = chatMessages.insertServerMessage.mock.calls.some(
+      ([, options]: [string, { push?: boolean }]) => options.push,
+    );
+    expect(pushed).toBe(false);
     const writes = prisma.friendChatReplayOutbox.updateMany.mock.calls.map(
       ([input]) => input,
     );
@@ -104,10 +122,8 @@ describe('FriendChatReplayOutboxProcessor', () => {
     };
     const processor = new FriendChatReplayOutboxProcessor(
       prisma as any,
-      {
-        importFriends: jest.fn(),
-        sendTextMessage: jest.fn(),
-      } as any,
+      { getOrCreateDirectConversation: jest.fn() } as any,
+      { insertServerMessage: jest.fn() } as any,
     );
 
     await processor.processPending();

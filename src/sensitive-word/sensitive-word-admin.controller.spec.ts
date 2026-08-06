@@ -24,7 +24,10 @@ describe('SensitiveWordAdminController', () => {
   it('add 调服务并写审计', async () => {
     const result = await controller.add({ words: ['赌博', 'casino'] }, req);
     expect(result).toEqual({ requested: 2, added: 2 });
-    expect(service.addWords).toHaveBeenCalledWith(['赌博', 'casino'], 'admin-1');
+    expect(service.addWords).toHaveBeenCalledWith(
+      ['赌博', 'casino'],
+      'admin-1',
+    );
     expect(audit.record).toHaveBeenCalledWith(
       expect.objectContaining({
         actorID: 'admin-1',

@@ -41,6 +41,11 @@ import { ChatService } from './chat.service';
     ChatPushService,
     ChatSystemMessageService,
   ],
-  exports: [ChatService, ChatBroadcastService, ChatCircleSyncService],
+  exports: [
+    ChatService,
+    ChatBroadcastService,
+    ChatCircleSyncService,
+    ChatSystemMessageService,
+  ],
 })
 export class ChatModule {}

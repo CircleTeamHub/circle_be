@@ -2,9 +2,9 @@
 	email {$ACME_EMAIL}
 }
 
-# ⚠️ 不要给下面的站点开 access log（`log` 指令）。OpenIM 协议把 IM token 放在 WS 握手
-#    URL 的 query 里（msggateway 只从 query 读 token，没有 header 通道），access log 会把
-#    可用的 token 明文写进磁盘。若确需排障日志，务必先过滤掉 query。
+# ⚠️ 不要给下面的站点开 access log（`log` 指令）。历史上曾有把凭证放进 WS 握手
+#    URL query 的通道经此反代;自研栈 token 走 socket.io auth payload 不落 URL，
+#    但媒体预签名 URL 仍带签名 query —— 开日志前务必先过滤 query。
 
 {$API_DOMAIN} {
 	@metrics path /metrics /metrics/*
@@ -25,22 +25,8 @@
 		reverse_proxy minio:9000
 	}
 
-	# OpenIM 消息网关 WebSocket（默认 :10001）。必须经此 TLS 反代：token 在握手 URL 里，
-	# 明文 ws:// 等于把它裸奔在公网上。reverse_proxy 自动处理 WebSocket 升级。
-	# 后端设 OPENIM_IM_WS_URL=wss://<API_DOMAIN>/openim-ws（与 temp-chat-web 同一路径约定）。
-	@openimWs path /openim-ws /openim-ws/*
-	handle @openimWs {
-		uri strip_prefix /openim-ws
-		reverse_proxy {$OPENIM_WS_UPSTREAM:host.docker.internal:10001}
-	}
-
-	# OpenIM API（默认 :10002）。后端设 OPENIM_IM_API_URL=https://<API_DOMAIN>/openim-api。
-	@openimApi path /openim-api /openim-api/*
-	handle @openimApi {
-		uri strip_prefix /openim-api
-		reverse_proxy {$OPENIM_API_UPSTREAM:host.docker.internal:10002}
-	}
-
+	# 自研 chat 网关(socket.io,/chat-ws)与 /realtime 原生 WS 都挂在 circle_be
+	# 同一 HTTP 端口,由下面的 catch-all 反代;reverse_proxy 自动处理 WS 升级。
 	handle {
 		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000}
 	}

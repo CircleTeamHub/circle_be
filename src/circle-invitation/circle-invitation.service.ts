@@ -15,7 +15,6 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
-import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -414,12 +413,6 @@ export class CircleInvitationService {
         { locksHeld: true, actor: 'third-party' },
       );
       if (updatedInvitation.circle.groupID) {
-        await enqueueCircleMemberSync(
-          tx,
-          'ADD_MEMBER',
-          updatedInvitation.circle.groupID,
-          admitted,
-        );
       }
 
       return {
@@ -543,12 +536,6 @@ export class CircleInvitationService {
         { locksHeld: true, actor: 'third-party' },
       );
       if (pendingInvitation.circle.groupID) {
-        await enqueueCircleMemberSync(
-          tx,
-          'ADD_MEMBER',
-          pendingInvitation.circle.groupID,
-          admitted,
-        );
       }
 
       return {
@@ -643,12 +630,6 @@ export class CircleInvitationService {
             { locksHeld: true },
           );
           if (invitation.circle.groupID) {
-            await enqueueCircleMemberSync(
-              tx,
-              'ADD_MEMBER',
-              invitation.circle.groupID,
-              admitted,
-            );
           }
           return {
             admitted: admitted.length > 0,

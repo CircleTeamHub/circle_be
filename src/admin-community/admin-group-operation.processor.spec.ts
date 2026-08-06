@@ -17,31 +17,22 @@ describe('AdminGroupOperationProcessor', () => {
       findUnique: jest.fn(),
     },
     circle: { update: jest.fn() },
-    chatConversation: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    chatConversation: { updateMany: jest.fn(), findUnique: jest.fn() },
+    chatMember: { updateMany: jest.fn() },
     adminAuditLog: { create: jest.fn() },
     $transaction: jest.fn(async (callback: (client: unknown) => unknown) =>
       callback(prisma),
     ),
   };
-  const openim = {
-    isEnabled: jest.fn(),
-    muteGroup: jest.fn(),
-    unmuteGroup: jest.fn(),
-    dismissGroup: jest.fn(),
-  };
   let processor: AdminGroupOperationProcessor;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    processor = new AdminGroupOperationProcessor(
-      prisma as never,
-      openim as never,
-    );
-    openim.muteGroup.mockReset().mockResolvedValue(undefined);
-    openim.unmuteGroup.mockReset().mockResolvedValue(undefined);
-    openim.dismissGroup.mockReset().mockResolvedValue(undefined);
+    processor = new AdminGroupOperationProcessor(prisma as never);
     prisma.adminGroupOperation.updateMany.mockResolvedValue({ count: 1 });
-    openim.isEnabled.mockReturnValue(true);
+    prisma.chatConversation.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.updateMany.mockResolvedValue({ count: 3 });
     prisma.adminGroupOperation.findFirst.mockResolvedValue({
       ...operation,
       status: 'PENDING',
@@ -50,10 +41,13 @@ describe('AdminGroupOperationProcessor', () => {
     prisma.adminGroupOperation.findUnique.mockResolvedValue(operation);
   });
 
-  it('mutes the OpenIM group and completes circle disabling', async () => {
+  it('mutes the chat conversation and completes circle disabling', async () => {
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(openim.muteGroup).toHaveBeenCalledWith('group-1');
+    expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+      where: { circleID: 'group-1' },
+      data: { muteAllAt: expect.any(Date) },
+    });
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { adminState: 'DISABLED' },
@@ -71,7 +65,7 @@ describe('AdminGroupOperationProcessor', () => {
     });
   });
 
-  it('makes a restored circle visible only after OpenIM unmute succeeds', async () => {
+  it('makes a restored circle visible only after the chat unmute succeeds', async () => {
     prisma.adminGroupOperation.findUnique.mockResolvedValue({
       ...operation,
       type: 'UNMUTE',
@@ -79,7 +73,10 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(openim.unmuteGroup).toHaveBeenCalledWith('group-1');
+    expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+      where: { circleID: 'group-1' },
+      data: { muteAllAt: null },
+    });
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: {
@@ -92,8 +89,10 @@ describe('AdminGroupOperationProcessor', () => {
     });
   });
 
-  it('requeues a transient OpenIM failure with backoff', async () => {
-    openim.muteGroup.mockRejectedValue(new Error('OpenIM timeout'));
+  it('requeues a transient chat-write failure with backoff', async () => {
+    prisma.chatConversation.updateMany.mockRejectedValue(
+      new Error('db timeout'),
+    );
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
@@ -105,23 +104,11 @@ describe('AdminGroupOperationProcessor', () => {
       },
       data: expect.objectContaining({
         status: 'PENDING',
-        lastError: 'OpenIM timeout',
+        lastError: 'db timeout',
         claimedAt: null,
       }),
     });
     expect(prisma.circle.update).not.toHaveBeenCalled();
-  });
-
-  it('does not report success when OpenIM is not configured', async () => {
-    openim.isEnabled.mockReturnValue(false);
-
-    await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
-
-    expect(openim.muteGroup).not.toHaveBeenCalled();
-    expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
-      where: expect.objectContaining({ id: 'operation-1' }),
-      data: expect.objectContaining({ status: 'PENDING' }),
-    });
   });
 
   it('marks the operation and circle failed after the final attempt', async () => {
@@ -130,7 +117,9 @@ describe('AdminGroupOperationProcessor', () => {
       attempts: 5,
       maxAttempts: 5,
     });
-    openim.muteGroup.mockRejectedValue(new Error('OpenIM unavailable'));
+    prisma.chatConversation.updateMany.mockRejectedValue(
+      new Error('db unavailable'),
+    );
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
@@ -144,25 +133,24 @@ describe('AdminGroupOperationProcessor', () => {
     });
   });
 
-  it('treats dismissing an already absent group as idempotent success', async () => {
+  it('treats dismissing a group with no conversation as idempotent success', async () => {
     prisma.adminGroupOperation.findUnique.mockResolvedValue({
       ...operation,
       circleID: null,
       type: 'DISMISS',
     });
-    openim.dismissGroup.mockRejectedValue(
-      new Error('OpenIM error: RecordNotFoundError'),
-    );
+    prisma.chatConversation.findUnique.mockResolvedValue(null);
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
+    expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
     expect(prisma.adminGroupOperation.updateMany).toHaveBeenCalledWith({
       where: expect.objectContaining({ id: 'operation-1' }),
       data: expect.objectContaining({ status: 'SUCCEEDED' }),
     });
   });
 
-  it('marks a linked circle permanently dismissed after group dismissal', async () => {
+  it('marks a linked circle permanently dismissed after retiring every seat', async () => {
     prisma.adminGroupOperation.findUnique.mockResolvedValue({
       ...operation,
       type: 'DISMISS',
@@ -170,7 +158,11 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(openim.dismissGroup).toHaveBeenCalledWith('group-1');
+    // 解散 = 会话全员离座(历史保留;发送被 membership 校验拒绝)。
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      data: { leftAt: expect.any(Date) },
+    });
     expect(prisma.circle.update).toHaveBeenCalledWith({
       where: { id: 'circle-1' },
       data: { deleted: true, adminState: 'DISMISSED' },
@@ -184,7 +176,7 @@ describe('AdminGroupOperationProcessor', () => {
 
     await processor.processOne(new Date('2026-07-29T12:00:00.000Z'));
 
-    expect(openim.muteGroup).toHaveBeenCalledWith('group-1');
+    expect(prisma.chatConversation.updateMany).toHaveBeenCalled();
     expect(prisma.circle.update).not.toHaveBeenCalled();
     expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
   });

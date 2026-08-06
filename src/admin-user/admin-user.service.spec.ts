@@ -180,7 +180,6 @@ describe('AdminUserService', () => {
         whatsup: null,
         securityCodeLockedUntil: new Date('2099-01-01T00:00:00.000Z'),
         singleDeviceLoginEnabled: true,
-        openimSynced: true,
         creditScore: 88,
       });
       prisma.refreshToken.count.mockResolvedValue(2);
@@ -258,7 +257,6 @@ describe('AdminUserService', () => {
           singleDeviceLoginEnabled: true,
           activeSessionCount: 2,
           activePushDeviceCount: 3,
-          openimSynced: true,
         },
         summary: {
           creditScore: 88,
@@ -297,7 +295,6 @@ describe('AdminUserService', () => {
         whatsup: null,
         securityCodeLockedUntil: null,
         singleDeviceLoginEnabled: false,
-        openimSynced: false,
         creditScore: 100,
       });
       prisma.refreshToken.count.mockResolvedValue(0);

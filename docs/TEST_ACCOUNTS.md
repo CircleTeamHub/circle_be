@@ -8,10 +8,9 @@
 >
 > ```bash
 > node scripts/seed-test-data.js   # 账号 / 圈子 / 帖子 / 报名 / 好友（写 PostgreSQL）
-> node scripts/seed-chat.js        # 注册 IM 用户 + 建群 + 单聊/群聊（写 OpenIM）
 > ```
 >
-> `seed-chat.js` 依赖 OpenIM 可用。若 IM 调用超时报 `no children to pick from`，先 `docker restart openim-server`（etcd 服务注册丢失，重启即恢复）。
+> 聊天记录不再单独种子（自研 chat 存业务 PostgreSQL，登录两个种子账号互发即可造数据；原 seed-chat.js 随 OpenIM 拆除）。
 >
 > 脚本默认只允许连接本地数据库（`localhost` / `127.0.0.1` / Docker 本地服务名）。如果确实要对非本地库做一次性种子操作，必须显式设置 `ALLOW_NON_LOCAL_SEED=true`。
 
@@ -98,7 +97,7 @@
 
 ## 注意事项
 
-- 这些脚本仅用于**本地 dev**（连接 `.env.development` 的 `DATABASE_URL` 与 `.env` 的 OpenIM 配置）。
+- 这些脚本仅用于**本地 dev**（连接 `.env.development` 的 `DATABASE_URL`）。
 - 脚本会拒绝 `NODE_ENV=production` 或非本地 `DATABASE_URL`，除非显式设置 `ALLOW_NON_LOCAL_SEED=true`。
-- 聊天记录存在 OpenIM 的 MongoDB（`openim_v3.msg`），不在业务 PostgreSQL 里。
+- 聊天记录存在业务 PostgreSQL 的 `ChatMessage` 表（自研 chat 栈）。
 - 重跑脚本是安全的（幂等），会更新已有数据而非重复插入。

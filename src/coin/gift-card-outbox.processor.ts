@@ -1,11 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { OpenimService } from 'src/openim/openim.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 const GRACE_MS = 2 * 60 * 1000;
-// review 修复：5 次（≈5 分钟）就永久放弃会让一次略长的 OpenIM 抖动永久
-// 丢卡。60 次 ≈ 1 小时逐分钟重试；clientMsgID 幂等使重复投递无害。
+// review 修复：5 次（≈5 分钟）就永久放弃会让一次略长的数据库抖动永久
+// 丢卡。60 次 ≈ 1 小时逐分钟重试；clientMessageId 幂等使重复投递无害。
 const MAX_ATTEMPTS = 60;
 const BATCH = 50;
 
@@ -22,17 +23,12 @@ export class GiftCardOutboxProcessor {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openim: OpenimService,
+    private readonly chatService: ChatService,
+    private readonly chatMessages: ChatSystemMessageService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
   async compensate(now: Date = new Date()): Promise<number> {
-    // round 2 review：OpenIM 未配置时 sendTransferCardMessage 直接静默返回 ——
-    // 继续跑会把根本没发出去的卡标成已送达、永久压掉补偿。整个 cron 停摆，
-    // 待 OpenIM 配好后这些行仍在待补名单里。
-    if (!this.openim.isEnabled()) {
-      return 0;
-    }
     const gifts = await this.prisma.coinGift.findMany({
       where: {
         cardDeliveredAt: null,
@@ -62,16 +58,19 @@ export class GiftCardOutboxProcessor {
       });
       if (claimed.count === 0) continue;
       try {
-        await this.openim.sendTransferCardMessage({
-          sendID: gift.senderID,
-          recvID: gift.recipientID,
-          amount: gift.amount,
-          message: gift.message ?? null,
-          senderNickname: gift.sender?.nickname,
-          senderFaceURL: gift.sender?.avatarUrl ?? null,
-          // gift 派生的固定幂等键：重复补偿（超时重试/多副本）在 OpenIM
-          // 侧合并成同一条消息，接收端永远只看到一张卡。
-          clientMsgID: `gift_card_${gift.id}`,
+        const conversation =
+          await this.chatService.getOrCreateDirectConversation(
+            gift.senderID,
+            gift.recipientID,
+          );
+        // gift 派生的固定幂等键:重复补偿(超时重试/多副本)在唯一约束上合并,
+        // 接收端永远只看到一张卡。
+        await this.chatMessages.insertServerMessage(conversation.id, {
+          senderID: gift.senderID,
+          type: 'transfer-card',
+          content: { amount: gift.amount, message: gift.message ?? null },
+          clientMessageId: `gift_card_${gift.id}`,
+          push: true,
         });
         await this.prisma.coinGift.update({
           where: { id: gift.id },

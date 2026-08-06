@@ -6,7 +6,6 @@ import { RegisterDto } from '../dto/register.dto';
 import { LoginDto } from '../dto/login.dto';
 import { RefreshTokenDto } from '../dto/refresh-token.dto';
 import { SetLoginSecurityCodeDto } from '../dto/login-security-code.dto';
-import { ImTokenThrottlerGuard } from '../im-token-throttler.guard';
 
 describe('AuthController', () => {
   let controller: AuthController;
@@ -112,14 +111,10 @@ describe('AuthController', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      // GET /auth/im-token opts into ThrottlerGuard, which needs the module
-      // options present even though this spec calls handlers directly.
+      // 找回密码路由挂 ThrottlerGuard，需要模块选项在位（本 spec 直呼 handler）。
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [AuthController],
-      providers: [
-        { provide: AuthService, useValue: mockAuthService },
-        ImTokenThrottlerGuard,
-      ],
+      providers: [{ provide: AuthService, useValue: mockAuthService }],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);

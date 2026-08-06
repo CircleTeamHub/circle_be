@@ -16,7 +16,6 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -157,7 +156,6 @@ export class FriendService {
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly notificationService: NotificationService,
-    private readonly openimService: OpenimService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
   ) {}
@@ -610,21 +608,6 @@ export class FriendService {
       );
 
       if (decision === FriendState.ACCEPTED) {
-        await tx.friendSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'IMPORT_FRIEND',
-              userID: nextRequest.userID,
-              targetUserID: recipientId,
-            },
-            {
-              operation: 'IMPORT_FRIEND',
-              userID: recipientId,
-              targetUserID: nextRequest.userID,
-            },
-          ],
-          skipDuplicates: true,
-        });
         await tx.friendChatReplayOutbox.upsert({
           where: { requestId: nextRequest.id },
           create: {
@@ -706,26 +689,6 @@ export class FriendService {
         `;
       }
       await tx.friend.delete({ where: { id: record.id } });
-      await tx.friendSyncOutbox.createMany({
-        data: [
-          {
-            operation: 'DELETE_FRIEND',
-            userID: userId,
-            targetUserID: friendId,
-          },
-          {
-            operation: 'DELETE_FRIEND',
-            userID: friendId,
-            targetUserID: userId,
-          },
-          {
-            operation: 'CLEAR_CONVERSATION',
-            userID: userId,
-            targetUserID: friendId,
-          },
-        ],
-        skipDuplicates: true,
-      });
     });
   }
 
@@ -1176,26 +1139,6 @@ export class FriendService {
         await tx.block.create({
           data: { blockerID: blockerId, blockedID: targetId },
         });
-        await tx.friendSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'ADD_BLACKLIST',
-              userID: blockerId,
-              targetUserID: targetId,
-            },
-            {
-              operation: 'DELETE_FRIEND',
-              userID: blockerId,
-              targetUserID: targetId,
-            },
-            {
-              operation: 'DELETE_FRIEND',
-              userID: targetId,
-              targetUserID: blockerId,
-            },
-          ],
-          skipDuplicates: true,
-        });
       });
     } catch (error) {
       if (this.isPrismaUniqueConstraintError(error)) {
@@ -1226,16 +1169,6 @@ export class FriendService {
           where: {
             blockerID_blockedID: { blockerID: blockerId, blockedID: targetId },
           },
-        });
-        await tx.friendSyncOutbox.createMany({
-          data: [
-            {
-              operation: 'REMOVE_BLACKLIST',
-              userID: blockerId,
-              targetUserID: targetId,
-            },
-          ],
-          skipDuplicates: true,
         });
       });
     } catch (error) {

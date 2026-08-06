@@ -5,7 +5,7 @@
 | 阶段 | 内容 | 组件 |
 |------|------|------|
 | 4 | 核心后端 | circle_be + PostgreSQL + Redis + MinIO |
-| 5 | 实时聊天 | OpenIM 全套(Mongo/Redis/Kafka) |
+| 5 | 实时聊天 | 自研 chat(随 circle_be 同进程,/chat-ws;无额外组件) |
 | 6 | 音视频 | LiveKit Cloud(免费层,不自托管) |
 
 本文件覆盖**阶段 4**;阶段 5/6 见末尾预告。
@@ -518,7 +518,7 @@ $S3 s3api get-object --bucket <bucket> \
 |---|---|
 | **RPO = 一次发版** | 备份只在发版时产生。两次发版之间(可能几天到几周)写入的数据,VPS 挂掉就没了。要更小的 RPO 得另做定时备份或 WAL 归档(pgBackRest / WAL-G)。 |
 | **MinIO 对象** | 头像、图片、附件全在 `minio_data` 卷里,**完全没有异地副本**。只恢复数据库的话,这些引用会变成坏链。 |
-| **OpenIM 聊天记录** | 阶段 5 的 Mongo / Redis / Kafka 数据不在备份范围。 |
+| **聊天记录** | 自研 chat 存业务 PostgreSQL,随数据库备份一并覆盖(旧 OpenIM Mongo 栈退役)。 |
 | **Redis** | 内置 Redis 只做缓存/限流,故意不备份。 |
 | **自动恢复验证** | 没有任何自动化在验证备份可用。上面的演练要人去跑。 |
 
@@ -576,34 +576,19 @@ $S3 s3api get-object --bucket <bucket> \
 
 ---
 
-## 阶段 5 预告:OpenIM(实时聊天)
+## 阶段 5:实时聊天(自研 chat,无需独立部署)
+
+聊天栈已并入 circle_be 本体(socket.io 网关挂在同一 HTTP 端口的 `/chat-ws`,
+数据存业务 PostgreSQL 三表),**没有独立的聊天组件要部署**;Caddy 的 API 域
+catch-all 反代已覆盖 WS 升级。旧 OpenIM(openim-docker,约 4G 内存)退役:
 
 ```bash
-git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
-# 编辑 .env 设 OPENIM_IP=<公网IP> 与 secret,然后 docker compose up -d
+cd ~/openim-docker && docker compose down   # 确认新栈跑通后再执行;卷按需清理
 ```
-之后把 `OPENIM_API_URL` / `OPENIM_ADMIN_SECRET` / `OPENIM_IM_WS_URL` / `OPENIM_IM_API_URL`
-追加进 `.env.production`,重启 circle_be。OpenIM 约吃 4G 内存。
 
-### 5.1 敏感词拦截(OpenIM before-send webhook)
-
-发消息前 OpenIM 回调 circle_be 检敏感词,命中即拒(客户端收 errCode 73001,App 弹「包含敏感词」)。
-
-1. circle_be 侧: `.env.production` 加 `OPENIM_CALLBACK_TOKEN=$(openssl rand -hex 24)`,重启。
-2. OpenIM 侧: openim-docker 的 `.env` 加
-   `OPENIM_WEBHOOK_BEFORE_SEND_ENABLE=true` 与
-   `OPENIM_WEBHOOK_URL=http://host.docker.internal:3000/api/v1/openim/callback/<同一个 token>`
-   (docker-compose.yaml 需含 IMENV_WEBHOOKS_* 环境变量与 extra_hosts host-gateway 映射,
-   照本仓已改的本地 openim-docker 版本抄),然后 `docker compose up -d openim-server`。
-3. 词库: `POST /api/v1/admin/sensitive-words/add`(admin JWT,body `{"words":[...]}`,单批 ≤1000)。
-   空词库 = 全放行,导入公开词库(如 tencent-sensitive-words)后即生效,改动 ≤60s 内收敛。
-4. 验证: 用测试账号发含词消息,应发送失败;`docker logs openim-server` 无 webhook 网络错误。
-
-⚠️ 可用性: v3.8.3 下该回调**不可达时消息会发送失败**(failedContinue 不生效),
-circle_be 蓝绿切换的瞬间窗口内发消息可能报错、重试即可;若要临时全局关闭拦截,
-把 `OPENIM_WEBHOOK_BEFORE_SEND_ENABLE=false` 后 `docker compose up -d openim-server`。
-⚠️ 路由末段是 OpenIM 的 callbackCommand 常量原文(带 `Command` 后缀);写错会 404,
-而 OpenIM 把 404 JSON 当全零响应 = **静默放行一切**,上线后务必跑一次第 4 步验证。
+敏感词拦截为进程内检查(`CHAT_SENSITIVE_WORD_BLOCKED`),无需 webhook 配置;
+词库仍用 `POST /api/v1/admin/sensitive-words/add` 管理(admin JWT,单批 ≤1000,
+空词库 = 全放行,改动 ≤60s 内收敛)。
 
 ## 阶段 6 预告:LiveKit Cloud(音视频)
 
@@ -615,15 +600,15 @@ circle_be 蓝绿切换的瞬间窗口内发消息可能报错、重试即可;若
 
 ## 阶段 7:持续备份(**上线前必做**)
 
-`pg_data`、`minio_data` 和 OpenIM 的 Mongo(**全部聊天记录**)都是同一台机器上的
-docker volume。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会**同时**
-全部消失,且没有任何第二份副本。
+`pg_data`、`minio_data` 都是同一台机器上的 docker volume(自研 chat 后聊天记录
+就在 `pg_data` 里)。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会
+**同时**全部消失,且没有任何第二份副本。
 
 > **和上面「异地备份」的区别 —— 两者都要,不是二选一。**
 > 上面那节(`deploy/offsite-backup.sh`)只在**发版时**打一份 pg_dump 快照传到异地,
 > 保护的是「这次迁移把库改坏了」,而且**只覆盖 Postgres**。
-> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒)、对象每 15 分钟镜像、
-> 聊天记录每小时加密 dump,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
+> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒,已含聊天记录)、
+> 对象每 15 分钟镜像,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
 > 所有聊天消息,只有本节覆盖得到。
 
 完整方案(覆盖范围、RPO/RTO、运维必须自行创建的桶和凭证、恢复演练、灾难恢复流程)
@@ -634,10 +619,8 @@ cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
 docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
 ```
 
-> 聊天记录备份(OpenIM Mongo)的凭证在**单独的** `.env.backup.mongo`,只有 `backup_mongo`
-> 服务加载它 —— env_file 是整份注入容器的,Mongo 密码放进 `.env.backup` 会连 postgres
-> 容器一起给到,而它根本不需要。另外 `OPENIM_NETWORK` 要写进 `.env`(compose 顶层插值
-> 只认 `.env`/shell,不认 env_file),写在备份配置里不会生效。
+> 遗留:`openim-backup` profile(OpenIM Mongo 每小时加密 dump)仅在退役前的旧栈
+> 迁移期有用 —— 新聊天数据全在 Postgres,不再需要它;旧栈 down 掉后请勿启用该 profile。
 
 > 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
 > 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础

@@ -13,7 +13,6 @@ import {
 } from 'src/common/app-error-codes';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
@@ -24,7 +23,6 @@ import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CIRCLE_CREATE_LIMIT } from './circle-limits';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleMemberLockService } from './circle-member-lock';
-import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
   CircleDetailDto,
   CircleDto,
@@ -49,7 +47,6 @@ export class CircleService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openimService: OpenimService,
     private readonly circleInvitationService: CircleInvitationService,
     private readonly config: ConfigService,
     private readonly membershipPolicy: MembershipPolicyService,
@@ -180,23 +177,13 @@ export class CircleService {
       return created;
     });
 
-    // Create bound OpenIM group (non-blocking — don't fail circle creation if IM is down)
-    let groupID: string | null = null;
-
-    try {
-      await this.openimService.createGroup(circle.id, circle.name, userId, [
-        userId,
-      ]);
-      await this.prisma.circle.update({
-        where: { id: circle.id },
-        data: { groupID: circle.id },
-      });
-      groupID = circle.id;
-    } catch (error) {
-      this.logger.warn(
-        `Failed to create OpenIM group for circle ${circle.id}: ${error}`,
-      );
-    }
+    // groupID 列保留(历史引用/群扩容等按它寻址),恒等于 circle.id;
+    // OpenIM 群不再创建 —— 聊天会话由下方 chatCircleSync 负责。
+    await this.prisma.circle.update({
+      where: { id: circle.id },
+      data: { groupID: circle.id },
+    });
+    const groupID: string | null = circle.id;
 
     // 自研聊天:建圈即建群会话(尽力而为;失败由每分钟对账兜底,不阻塞建圈)。
     void this.chatCircleSync.ensureCircleConversation(circle.id).catch((e) => {
@@ -509,9 +496,6 @@ export class CircleService {
         select: { groupID: true },
       });
       if (circle?.groupID) {
-        await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
-          userId,
-        ]);
       }
     });
   }

@@ -61,7 +61,6 @@ const ADMIN_USER_DETAIL_SELECT = {
   whatsup: true,
   securityCodeLockedUntil: true,
   singleDeviceLoginEnabled: true,
-  openimSynced: true,
   creditScore: true,
 } as const;
 
@@ -216,7 +215,6 @@ export class AdminUserService {
         singleDeviceLoginEnabled: user.singleDeviceLoginEnabled,
         activeSessionCount,
         activePushDeviceCount,
-        openimSynced: user.openimSynced,
       },
       summary: {
         creditScore: user.creditScore,

@@ -23,7 +23,10 @@ describe('SensitiveWordService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    prisma.sensitiveWord.findMany.mockResolvedValue([row('赌博'), row('casino')]);
+    prisma.sensitiveWord.findMany.mockResolvedValue([
+      row('赌博'),
+      row('casino'),
+    ]);
     const module = await Test.createTestingModule({
       providers: [
         SensitiveWordService,
@@ -105,7 +108,10 @@ describe('SensitiveWordService', () => {
       expect(prisma.sensitiveWord.findMany).toHaveBeenCalledTimes(1);
 
       await jest.runOnlyPendingTimersAsync();
-      expect(service.check('新词来了')).toEqual({ blocked: true, word: '新词' });
+      expect(service.check('新词来了')).toEqual({
+        blocked: true,
+        word: '新词',
+      });
     } finally {
       jest.useRealTimers();
     }

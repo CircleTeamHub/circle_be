@@ -3,7 +3,6 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
@@ -61,18 +60,8 @@ describe('CircleService', () => {
       create: jest.fn(),
       updateMany: jest.fn(),
     },
-    groupSyncOutbox: {
-      createMany: jest.fn(),
-      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
-    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
-  };
-
-  const openimService = {
-    createGroup: jest.fn(),
-    addGroupMembers: jest.fn(),
-    removeGroupMember: jest.fn(),
   };
 
   const circleInvitationService = {
@@ -98,7 +87,6 @@ describe('CircleService', () => {
       providers: [
         CircleService,
         { provide: PrismaService, useValue: prisma },
-        { provide: OpenimService, useValue: openimService },
         { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         MembershipPolicyService,
@@ -193,7 +181,6 @@ describe('CircleService', () => {
     });
     // PENDING 不占正式名额、不进 OpenIM 群——转正统一发生在担保 finalize。
     expect(prisma.circle.update).not.toHaveBeenCalled();
-    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
   it('join reuses an existing pending invitation instead of duplicating it', async () => {
@@ -370,48 +357,9 @@ describe('CircleService', () => {
     });
   });
 
-  it('durably queues the latest REMOVE state when leaving an OpenIM-backed circle', async () => {
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      role: 'MEMBER',
-      status: 'ACTIVE',
-    });
-    prisma.circle.findUnique.mockResolvedValue({ groupID: 'group-1' });
-
-    await service.leaveCircle('user-1', 'circle-1');
-
-    expect(prisma.groupSyncOutbox.updateMany).toHaveBeenCalledWith({
-      where: {
-        groupID: 'group-1',
-        userID: { in: ['user-1'] },
-      },
-      data: {
-        operation: 'REMOVE_MEMBER',
-        generation: { increment: 1 },
-        status: 'PENDING',
-        attempts: 0,
-        lastError: null,
-        nextAttemptAt: expect.any(Date),
-        processedAt: null,
-      },
-    });
-    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          operation: 'REMOVE_MEMBER',
-          groupID: 'group-1',
-          userID: 'user-1',
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(openimService.removeGroupMember).not.toHaveBeenCalled();
-  });
-
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -771,7 +719,6 @@ describe('CircleService', () => {
   it('rejects setCircleAvatar with an off-origin URL when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -802,7 +749,6 @@ describe('CircleService', () => {
   it('rejects uploadCircleIcon with an off-origin URL when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -837,7 +783,6 @@ describe('CircleService', () => {
   it('accepts uploadCircleIcon for a URL served from this app storage', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),

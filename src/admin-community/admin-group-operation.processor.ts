@@ -1,7 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { AdminGroupOperation } from 'src/generated/prisma';
-import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 
@@ -13,10 +12,19 @@ export class AdminGroupOperationProcessor {
   private readonly logger = new Logger(AdminGroupOperationProcessor.name);
   private running = false;
 
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly openim: OpenimService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
+
+  private async dismissChatConversation(circleId: string): Promise<void> {
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { circleID: circleId },
+      select: { id: true },
+    });
+    if (!conversation) return;
+    await this.prisma.chatMember.updateMany({
+      where: { conversationID: conversation.id, leftAt: null },
+      data: { leftAt: new Date() },
+    });
+  }
 
   /** 自研会话侧禁言开关(groupID === circle.id;会话未建时为 no-op,建时对账兜底)。 */
   private async setChatMuteAll(
@@ -78,19 +86,14 @@ export class AdminGroupOperationProcessor {
   }
 
   private async execute(operation: AdminGroupOperation) {
-    if (!this.openim.isEnabled()) {
-      throw new Error('OpenIM is not configured');
-    }
     if (operation.type === 'MUTE') {
-      // 双轨:OpenIM 与自研会话同步禁言(groupID === circle.id)。
-      await this.setChatMuteAll(operation.groupID, true);
-      return this.openim.muteGroup(operation.groupID);
+      return this.setChatMuteAll(operation.groupID, true);
     }
     if (operation.type === 'UNMUTE') {
-      await this.setChatMuteAll(operation.groupID, false);
-      return this.openim.unmuteGroup(operation.groupID);
+      return this.setChatMuteAll(operation.groupID, false);
     }
-    return this.openim.dismissGroup(operation.groupID);
+    // 解散:会话全员离座(历史保留;发送被 membership 校验拒绝)。
+    return this.dismissChatConversation(operation.groupID);
   }
 
   private complete(operation: AdminGroupOperation, now: Date) {

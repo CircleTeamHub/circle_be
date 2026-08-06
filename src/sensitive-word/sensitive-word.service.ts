@@ -55,7 +55,12 @@ export class SensitiveWordService implements OnModuleInit {
 
   async listWords(): Promise<{
     total: number;
-    words: { id: string; word: string; createdAt: Date; createdBy: string | null }[];
+    words: {
+      id: string;
+      word: string;
+      createdAt: Date;
+      createdBy: string | null;
+    }[];
   }> {
     const words = await this.prisma.sensitiveWord.findMany({
       orderBy: { createdAt: 'desc' },

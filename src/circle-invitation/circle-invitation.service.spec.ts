@@ -1,6 +1,5 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -47,17 +46,9 @@ describe('CircleInvitationService', () => {
     friend: {
       findFirst: jest.fn(),
     },
-    groupSyncOutbox: {
-      createMany: jest.fn(),
-      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
-    },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
-  };
-
-  const openimService = {
-    addGroupMembers: jest.fn(),
   };
 
   const realtimeService = {
@@ -89,7 +80,6 @@ describe('CircleInvitationService', () => {
       providers: [
         CircleInvitationService,
         { provide: PrismaService, useValue: prisma },
-        { provide: OpenimService, useValue: openimService },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: NotificationService, useValue: notificationService },
@@ -580,17 +570,7 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true, actor: 'third-party' },
     );
-    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          operation: 'ADD_MEMBER',
-          groupID: 'group-1',
-          userID: 'applicant-1',
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
   });
 
   it('uses the admission policy for admin-approved activation', async () => {
@@ -623,17 +603,7 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true, actor: 'third-party' },
     );
-    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          operation: 'ADD_MEMBER',
-          groupID: 'group-1',
-          userID: 'applicant-1',
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
   });
 
   it('uses the admission policy when reconciling a threshold-approved invitation', async () => {
@@ -660,17 +630,7 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true },
     );
-    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          operation: 'ADD_MEMBER',
-          groupID: 'group-1',
-          userID: 'applicant-1',
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
+    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
   });
 
   it('does not reactivate an applicant from a cancelled invitation', async () => {
@@ -691,7 +651,6 @@ describe('CircleInvitationService', () => {
     );
 
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
-    expect(prisma.groupSyncOutbox.createMany).not.toHaveBeenCalled();
   });
 
   it('rejects admin approval when the locked admin was demoted', async () => {

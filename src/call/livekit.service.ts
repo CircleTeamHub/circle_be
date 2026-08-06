@@ -27,10 +27,9 @@ type CreateRoomInput = {
 };
 
 // #109：LiveKit 出站调用超时。RoomServiceClient 不接受 AbortSignal（Twirp
-// 内部自持 fetch），用 Promise.race 兜底 —— 与 openim.service 的
-// AbortSignal.timeout 同一个动机：LiveKit 不可达且不 RST 时，发起通话的请求
-// 不该挂到平台默认超时。竞输的原请求会在后台自然结束，无资源泄漏风险
-//（HTTP 请求自身有 socket 生命周期）。
+// 内部自持 fetch），用 Promise.race 兜底：LiveKit 不可达且不 RST 时，发起
+// 通话的请求不该挂到平台默认超时。竞输的原请求会在后台自然结束，无资源
+// 泄漏风险（HTTP 请求自身有 socket 生命周期）。
 const LIVEKIT_REQUEST_TIMEOUT_MS = 5_000;
 
 class LiveKitTimeoutError extends Error {

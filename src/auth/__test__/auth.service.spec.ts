@@ -13,7 +13,6 @@ import {
 import * as argon2 from 'argon2';
 import { PrismaService } from '../../prisma/prisma.service';
 import { RefreshTokenService } from '../refresh-token.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { IconService } from 'src/icon/icon.service';
 import { EmailVerificationService } from '../email-verification.service';
 import { Prisma } from 'src/generated/prisma';
@@ -101,11 +100,6 @@ describe('AuthService', () => {
     signAsync: jest.fn(() => Promise.resolve('access-token')),
   };
 
-  const mockOpenimService = {
-    getUserToken: jest.fn(() => Promise.resolve('')),
-    registerUser: jest.fn(() => Promise.resolve()),
-  };
-
   const mockIconService = {
     getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
   };
@@ -184,7 +178,6 @@ describe('AuthService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: RefreshTokenService, useValue: mockRefreshTokenService },
         { provide: JwtService, useValue: mockJwt },
-        { provide: OpenimService, useValue: mockOpenimService },
         { provide: IconService, useValue: mockIconService },
         {
           provide: EmailVerificationService,
@@ -365,36 +358,6 @@ describe('AuthService', () => {
       password: 'password1',
     } as any);
     expect(result.accessToken).toBe('access-token');
-  });
-
-  it('login still succeeds with empty imToken and logs an error when OpenIM token fetch fails', async () => {
-    const passwordHash = await argon2.hash('password1');
-    users.push({
-      id: 'uuid-1',
-      accountId: 'AAA111',
-      email: 'a@example.com',
-      passwordHash,
-      status: 'ACTIVE',
-      role: 'USER',
-    });
-    mockOpenimService.getUserToken.mockRejectedValueOnce(
-      new Error('OpenIM timeout'),
-    );
-    const errorSpy = jest
-      .spyOn((service as any).logger, 'error')
-      .mockImplementation(() => undefined);
-
-    const result = await service.login({
-      email: 'a@example.com',
-      password: 'password1',
-    } as any);
-
-    // 登录不被 IM 故障阻断：accessToken 正常、imToken 退化为空串
-    expect(result.accessToken).toBe('access-token');
-    expect(result.imToken).toBe('');
-    // 失败必须「喊出来」——error 级日志且带 userId 上下文
-    expect(errorSpy).toHaveBeenCalledTimes(1);
-    expect(String(errorSpy.mock.calls[0][0])).toContain('uuid-1');
   });
 
   it('login throws ForbiddenException for unknown email', async () => {

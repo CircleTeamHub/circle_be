@@ -12,8 +12,8 @@
 - **冷路径**:REST(`/api/v1/chat/*`)承担打开 App 时的全量拉取与历史翻页。
 - **存储**:Postgres 三表 `ChatConversation` / `ChatMember` / `ChatMessage`。
 - **鉴权**:握手 `auth.token` 携带 app access JWT(不走 URL query),
-  验签 + 吊销检查;**没有 OpenIM 式独立 IM token**,`/auth/im-token` 将随
-  Phase 3 下线。
+  验签 + 吊销检查;**没有 OpenIM 式独立 IM token**(`/auth/im-token` 已随
+  Phase 3 拆除)。
 
 ## 消息序与可靠性(核心不变量)
 

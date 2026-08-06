@@ -12,7 +12,8 @@ import { CallService } from './call.service';
 describe('CallService', () => {
   const now = new Date('2026-06-11T03:00:00.000Z');
   let prisma: any;
-  let openim: any;
+  let chatService: any;
+  let chatMessages: any;
   let livekit: any;
   let realtime: any;
   let service: CallService;
@@ -42,7 +43,14 @@ describe('CallService', () => {
         updateMany: jest.fn(),
       },
     };
-    openim = { isGroupMember: jest.fn() };
+    chatService = {
+      getOrCreateDirectConversation: jest
+        .fn()
+        .mockResolvedValue({ id: 'conv-direct-1' }),
+    };
+    chatMessages = {
+      insertServerMessage: jest.fn().mockResolvedValue(undefined),
+    };
     prisma.callSession.findMany.mockResolvedValue([]);
     livekit = {
       createRoom: jest.fn().mockResolvedValue(undefined),
@@ -71,7 +79,14 @@ describe('CallService', () => {
       get: jest.fn((key: string): unknown => configValues[key]),
     } as unknown as ConfigService;
 
-    service = new CallService(prisma, openim, livekit, realtime, config);
+    service = new CallService(
+      prisma,
+      chatService,
+      chatMessages,
+      livekit,
+      realtime,
+      config,
+    );
   });
 
   afterEach(() => {

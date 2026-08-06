@@ -23,8 +23,9 @@ describe('production review follow-up migration', () => {
     const schema = readFileSync(SCHEMA_PATH, 'utf8').replace(/\r\n/g, '\n');
 
     expect(schema).toContain('TERMINAL');
-    expect(schema).toMatch(/generation\s+Int\s+@default\(0\)/);
-    expect(schema.match(/leaseToken\s+String\?/g)).toHaveLength(3);
+    // 三张 OpenIM 同步 outbox 表已在 20260806 拆栈迁移中删除;当年 3 处
+    // leaseToken 只剩非同步类 outbox 的 2 处,generation 列随表一起消失。
+    expect(schema.match(/leaseToken\s+String\?/g)).toHaveLength(2);
     expect(schema).toContain('isPublic');
   });
 });

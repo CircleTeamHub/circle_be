@@ -12,7 +12,6 @@ import { AuthModule } from './auth/auth.module';
 import { WinstonLoggingModule } from './logging/winston-logging.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { PrismaModule } from './prisma/prisma.module';
-import { OpenimModule } from './openim/openim.module';
 import { UploadModule } from './upload/upload.module';
 import { FriendModule } from './friend/friend.module';
 import { CoinModule } from './coin/coin.module';
@@ -31,9 +30,7 @@ import { NotificationModule } from './notification/notification.module';
 import { ConversationGroupModule } from './conversation-group/conversation-group.module';
 import { TempChatModule } from './temp-chat/temp-chat.module';
 import { createEnvValidationSchema } from './config/env.validation';
-import { ChatHistoryModule } from './chat-history/chat-history.module';
 import { GroupModule } from './group/group.module';
-import { OutboxModule } from './outbox/outbox.module';
 import { CallModule } from './call/call.module';
 import { PrivacySettingsModule } from './privacy/privacy-settings.module';
 import { RedisModule } from './redis/redis.module';
@@ -66,7 +63,6 @@ const envFilePath = `.env.${nodeEnv}`;
     AuthModule,
     WinstonLoggingModule,
     ModerationModule,
-    OpenimModule,
     UploadModule,
     FriendModule,
     CoinModule,
@@ -84,9 +80,7 @@ const envFilePath = `.env.${nodeEnv}`;
     NotificationModule,
     ConversationGroupModule,
     TempChatModule,
-    ChatHistoryModule,
     GroupModule,
-    OutboxModule,
     PrivacySettingsModule,
     CreditModule,
     CallModule,
