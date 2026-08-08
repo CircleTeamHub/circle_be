@@ -1368,6 +1368,75 @@ describe('GroupService reportGroup', () => {
     });
   });
 
+  it('rejects a disabled linked circle instead of treating it as a raw OpenIM group', async () => {
+    prisma.circle.findFirst.mockImplementation(async (args: any) =>
+      args.where.deleted === false
+        ? null
+        : {
+            id: 'circle-1',
+            groupID: 'group-1',
+            ownerID: 'owner-1',
+            deleted: true,
+          },
+    );
+    openim.getGroupMemberRole
+      .mockResolvedValueOnce(100)
+      .mockResolvedValueOnce(20);
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(openim.getGroupMemberRole).not.toHaveBeenCalled();
+    expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
+  });
+
+  it('authorizes the raw-group actor before looking up the target', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole.mockImplementation(
+      async (_groupID: string, userID: string) => {
+        if (userID === 'owner-1') return 20;
+        throw new Error('target provider timeout');
+      },
+    );
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(openim.getGroupMemberRole).toHaveBeenCalledTimes(1);
+    expect(openim.getGroupMemberRole).toHaveBeenCalledWith(
+      'raw-group',
+      'owner-1',
+    );
+  });
+
+  it('keeps provider HTTP 404 responses on the raw-group outage path', async () => {
+    prisma.circle.findFirst.mockResolvedValue(null);
+    openim.getGroupMemberRole.mockRejectedValue(
+      new Error('OpenIM HTTP 404: 404 page not found'),
+    );
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'raw-group',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(ServiceUnavailableException);
+  });
+
   it('maps raw-group role lookup outages to a stable 503', async () => {
     prisma.circle.findFirst.mockResolvedValue(null);
     openim.getGroupMemberRole.mockRejectedValue(new Error('lookup timeout'));

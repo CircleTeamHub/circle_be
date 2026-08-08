@@ -33,6 +33,7 @@ type CircleGroupLookup = {
   id: string;
   groupID: string | null;
   ownerID: string;
+  deleted?: boolean;
 };
 
 type CircleGroupMemberLookup = {
@@ -69,8 +70,15 @@ export class GroupService {
       });
     }
 
-    const circle = await this.findCircleByGroupID(normalizedGroupID);
+    const circle = await this.findCircleByGroupID(normalizedGroupID, true);
     const roleLevel = dto.role === GroupMemberRoleInput.ADMIN ? 60 : 20;
+
+    if (circle?.deleted) {
+      throw new ForbiddenException({
+        message: 'Administrator roles cannot be changed for an inactive group',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
 
     if (!circle) {
       return this.updateRawGroupMemberRole(
@@ -226,16 +234,14 @@ export class GroupService {
         });
       }
     };
-    const [actorRole, targetRole] = await Promise.all([
-      lookupRole(actorId),
-      lookupRole(targetUserID),
-    ]);
+    const actorRole = await lookupRole(actorId);
     if (actorRole !== 100) {
       throw new ForbiddenException({
         message: 'Only the group owner can change administrator roles',
         errorCode: GroupErrorCode.ManagerOnly,
       });
     }
+    const targetRole = await lookupRole(targetUserID);
     if (targetRole !== 20 && targetRole !== 60) {
       throw new NotFoundException({
         message: 'Group member not found',
@@ -294,7 +300,6 @@ export class GroupService {
     return (
       message.includes('recordnotfound') ||
       message.includes('record not found') ||
-      message.includes('not found') ||
       message.includes('not exist') ||
       message.includes('not in group') ||
       message.includes('not group member')
@@ -681,17 +686,18 @@ export class GroupService {
 
   private async findCircleByGroupID(
     groupID: string,
+    includeDeleted = false,
   ): Promise<CircleGroupLookup | null> {
     const groupIDCandidates = this.groupIDCandidates(groupID);
     return this.prisma.circle.findFirst({
       where: {
-        deleted: false,
+        ...(includeDeleted ? {} : { deleted: false }),
         OR: [
           { id: groupID },
           ...groupIDCandidates.map((candidate) => ({ groupID: candidate })),
         ],
       },
-      select: { id: true, groupID: true, ownerID: true },
+      select: { id: true, groupID: true, ownerID: true, deleted: true },
     });
   }
 
