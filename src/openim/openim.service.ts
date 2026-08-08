@@ -318,13 +318,11 @@ export class OpenimService implements OnModuleInit {
 
     const adminToken = await this.getAdminToken();
     await this.post(
-      '/group/set_group_info',
+      '/group/set_group_info_ex',
       {
-        groupInfoForSet: {
-          groupID,
-          lookMemberInfo: 1,
-          applyMemberFriend: 1,
-        },
+        groupID,
+        lookMemberInfo: 1,
+        applyMemberFriend: 1,
       },
       adminToken,
     );
