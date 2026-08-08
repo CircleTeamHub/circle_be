@@ -1090,8 +1090,10 @@ describe('GroupService reportGroup', () => {
       ),
     ).resolves.toEqual({ handled: true, role: 'ADMIN' });
 
-    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+    expect(memberLock.lock).toHaveBeenNthCalledWith(1, prisma, 'circle-1', [
       'owner-1',
+    ]);
+    expect(memberLock.lock).toHaveBeenNthCalledWith(2, prisma, 'circle-1', [
       'target-user',
     ]);
     expect(prisma.circleMember.update).toHaveBeenCalledWith({
@@ -1314,11 +1316,7 @@ describe('GroupService reportGroup', () => {
         role: CircleMemberRole.ADMIN,
         status: CircleMemberStatus.ACTIVE,
       })
-      .mockResolvedValueOnce({
-        id: 'target-member',
-        role: CircleMemberRole.MEMBER,
-        status: CircleMemberStatus.ACTIVE,
-      });
+      .mockRejectedValueOnce(new Error('target query must not run'));
 
     await expect(
       (service as any).updateGroupMemberRole(
@@ -1329,6 +1327,11 @@ describe('GroupService reportGroup', () => {
       ),
     ).rejects.toThrow(ForbiddenException);
 
+    expect(memberLock.lock).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+      'admin-1',
+    ]);
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
     expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
   });
