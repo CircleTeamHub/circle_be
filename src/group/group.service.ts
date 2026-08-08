@@ -94,13 +94,45 @@ export class GroupService {
     // review P1：先落库（角色 + outbox + 审计原子提交），OpenIM 放到提交后。
     // 旧顺序在事务内先调 OpenIM，提交失败会回滚本地状态而外部已提权。
     await runSerializableTransaction(this.prisma, async (tx) => {
-      await this.memberLock.lock(tx, circle.id, [actorId]);
-      const actor = await tx.circleMember.findUnique({
+      const preflightActor = await tx.circleMember.findUnique({
         where: {
           userID_circleID: { userID: actorId, circleID: circle.id },
         },
         select: { id: true, role: true, status: true },
       });
+
+      if (
+        !preflightActor ||
+        preflightActor.status !== CircleMemberStatus.ACTIVE ||
+        preflightActor.role !== CircleMemberRole.OWNER
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+
+      await this.memberLock.lock(tx, circle.id, [
+        actorId,
+        normalizedTargetUserID,
+      ]);
+      const [actor, target] = await Promise.all([
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: { userID: actorId, circleID: circle.id },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+        tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: normalizedTargetUserID,
+              circleID: circle.id,
+            },
+          },
+          select: { id: true, role: true, status: true },
+        }),
+      ]);
 
       if (
         !actor ||
@@ -112,17 +144,6 @@ export class GroupService {
           errorCode: GroupErrorCode.ManagerOnly,
         });
       }
-
-      await this.memberLock.lock(tx, circle.id, [normalizedTargetUserID]);
-      const target = await tx.circleMember.findUnique({
-        where: {
-          userID_circleID: {
-            userID: normalizedTargetUserID,
-            circleID: circle.id,
-          },
-        },
-        select: { id: true, role: true, status: true },
-      });
 
       if (
         !target ||

@@ -1070,6 +1070,11 @@ describe('GroupService reportGroup', () => {
         status: CircleMemberStatus.ACTIVE,
       })
       .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
         id: 'target-member',
         role: CircleMemberRole.MEMBER,
         status: CircleMemberStatus.ACTIVE,
@@ -1090,10 +1095,9 @@ describe('GroupService reportGroup', () => {
       ),
     ).resolves.toEqual({ handled: true, role: 'ADMIN' });
 
-    expect(memberLock.lock).toHaveBeenNthCalledWith(1, prisma, 'circle-1', [
+    expect(memberLock.lock).toHaveBeenCalledTimes(1);
+    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
       'owner-1',
-    ]);
-    expect(memberLock.lock).toHaveBeenNthCalledWith(2, prisma, 'circle-1', [
       'target-user',
     ]);
     expect(prisma.circleMember.update).toHaveBeenCalledWith({
@@ -1140,6 +1144,11 @@ describe('GroupService reportGroup', () => {
       ownerID: 'owner-1',
     });
     prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
       .mockResolvedValueOnce({
         id: 'owner-member',
         role: CircleMemberRole.OWNER,
@@ -1197,6 +1206,11 @@ describe('GroupService reportGroup', () => {
         status: CircleMemberStatus.ACTIVE,
       })
       .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
         id: 'target-member',
         role: CircleMemberRole.MEMBER,
         status: CircleMemberStatus.ACTIVE,
@@ -1223,6 +1237,11 @@ describe('GroupService reportGroup', () => {
       ownerID: 'owner-1',
     });
     prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
       .mockResolvedValueOnce({
         id: 'owner-member',
         role: CircleMemberRole.OWNER,
@@ -1269,6 +1288,11 @@ describe('GroupService reportGroup', () => {
       ownerID: 'owner-1',
     });
     prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
       .mockResolvedValueOnce({
         id: 'owner-member',
         role: CircleMemberRole.OWNER,
@@ -1327,10 +1351,7 @@ describe('GroupService reportGroup', () => {
       ),
     ).rejects.toThrow(ForbiddenException);
 
-    expect(memberLock.lock).toHaveBeenCalledTimes(1);
-    expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
-      'admin-1',
-    ]);
+    expect(memberLock.lock).not.toHaveBeenCalled();
     expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
     expect(openim.setGroupMemberRole).not.toHaveBeenCalled();
