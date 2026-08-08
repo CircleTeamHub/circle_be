@@ -46,12 +46,16 @@ describe('TempChatService', () => {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
     disconnectUser: jest.fn().mockResolvedValue(undefined),
   };
+  const chatService = {
+    listMembers: jest.fn().mockResolvedValue([]),
+  };
 
   const service = new TempChatService(
     prisma as never,
     linkToken as never,
     config as never,
     chatBroadcast as never,
+    chatService as never,
   );
 
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
@@ -70,6 +74,7 @@ describe('TempChatService', () => {
     });
     chatBroadcast.joinUserToConversation.mockResolvedValue(undefined);
     chatBroadcast.disconnectUser.mockResolvedValue(undefined);
+    chatService.listMembers.mockResolvedValue([]);
   });
 
   describe('create', () => {
@@ -268,6 +273,57 @@ describe('TempChatService', () => {
       await service.end('host-1', 'tc-1');
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
       expect(chatBroadcast.disconnectUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listGuestMembers', () => {
+    const guest = {
+      kind: 'temp-chat-guest' as const,
+      guestId: 'guest-1',
+      tcId: 'tc-1',
+      conversationId: 'conv-1',
+    };
+
+    it('returns the seated roster and flags the host', async () => {
+      prisma.tempChat.findUnique.mockResolvedValue({ hostUserId: 'host-1' });
+      chatService.listMembers.mockResolvedValue([
+        { userId: 'host-1', nickname: '房主', avatarUrl: 'a.png', role: null },
+        { userId: 'guest-1', nickname: '我', avatarUrl: null, role: null },
+      ]);
+
+      const members = await service.listGuestMembers(guest);
+
+      expect(chatService.listMembers).toHaveBeenCalledWith('guest-1', 'conv-1');
+      expect(members).toEqual([
+        {
+          userId: 'host-1',
+          nickname: '房主',
+          avatarUrl: 'a.png',
+          isHost: true,
+        },
+        { userId: 'guest-1', nickname: '我', avatarUrl: null, isHost: false },
+      ]);
+    });
+
+    it('still lists members when the room row is gone (nobody flagged host)', async () => {
+      prisma.tempChat.findUnique.mockResolvedValue(null);
+      chatService.listMembers.mockResolvedValue([
+        { userId: 'guest-1', nickname: '我', avatarUrl: null, role: null },
+      ]);
+
+      const members = await service.listGuestMembers(guest);
+      expect(members).toEqual([
+        { userId: 'guest-1', nickname: '我', avatarUrl: null, isHost: false },
+      ]);
+    });
+
+    it('propagates the membership check (a cleared guest gets nothing)', async () => {
+      prisma.tempChat.findUnique.mockResolvedValue({ hostUserId: 'host-1' });
+      chatService.listMembers.mockRejectedValue(new ForbiddenException());
+
+      await expect(service.listGuestMembers(guest)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
     });
   });
 });

@@ -12,7 +12,11 @@ import { TempChatStatus } from 'src/generated/prisma';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from 'src/chat/chat-broadcast.service';
-import { LinkTokenService } from './link-token.service';
+import { ChatService } from 'src/chat/chat.service';
+import {
+  LinkTokenService,
+  type GuestChatTokenPayload,
+} from './link-token.service';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import { newGroupId, newGuestId } from './temp-chat.ids';
@@ -51,6 +55,14 @@ export interface TempChatListItem {
   shareUrl: string | null;
 }
 
+/** 访客可见的成员条目:头衔只区分「房主 / 其他」,不外泄圈子角色。 */
+export interface TempChatMemberItem {
+  userId: string;
+  nickname: string;
+  avatarUrl: string | null;
+  isHost: boolean;
+}
+
 export interface JoinTempChatResult {
   guestId: string;
   displayName: string;
@@ -78,6 +90,7 @@ export class TempChatService {
     private readonly linkToken: LinkTokenService,
     private readonly config: ConfigService,
     private readonly chatBroadcast: ChatBroadcastService,
+    private readonly chatService: ChatService,
   ) {}
 
   async create(
@@ -295,6 +308,31 @@ export class TempChatService {
       chatToken,
       wsPath: '/chat-ws',
     };
+  }
+
+  /**
+   * 访客成员目录:复用会话成员目录(在座 + 展示名,访客走 TempChatGuest 兜底),
+   * 再按 TempChat.hostUserId 标出房主 —— TEMP 会话没有 circleID,
+   * ChatMemberDto.role 恒为 null,房主身份只有这里知道。
+   * 鉴权由 chatService.listMembers 的 requireMembership 兜底:凭证里的 guestId
+   * 必须仍在座,离座访客拿不到名单。
+   */
+  async listGuestMembers(
+    guest: GuestChatTokenPayload,
+  ): Promise<TempChatMemberItem[]> {
+    const [room, members] = await Promise.all([
+      this.prisma.tempChat.findUnique({
+        where: { id: guest.tcId },
+        select: { hostUserId: true },
+      }),
+      this.chatService.listMembers(guest.guestId, guest.conversationId),
+    ]);
+    return members.map((member) => ({
+      userId: member.userId,
+      nickname: member.nickname,
+      avatarUrl: member.avatarUrl,
+      isHost: member.userId === room?.hostUserId,
+    }));
   }
 
   async end(hostUserId: string, id: string): Promise<{ status: string }> {

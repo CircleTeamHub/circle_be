@@ -111,6 +111,15 @@ export class TempChatController {
     );
   }
 
+  // 访客成员目录(冷路径):访客页成员面板用,房主由 isHost 标出。
+  @Get('guest/members')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客拉取房间成员目录' })
+  guestMembers(@Req() req: RequestWithTempChatGuest) {
+    return this.service.listGuestMembers(req.tempChatGuest);
+  }
+
   // 访客发图:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
   @Post('guest/upload-presign')
   @UseGuards(TempChatGuestGuard)
