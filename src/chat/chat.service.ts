@@ -48,6 +48,17 @@ type MessageRow = ChatMessage;
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
 
+/** 媒体 content 里只应持久化 object key;展示地址一律由读路径现签。 */
+const MEDIA_PRESENTATION_FIELDS = ['url', 'thumbUrl', 'localUri'] as const;
+
+function stripMediaPresentationFields(
+  content: Record<string, unknown>,
+): Record<string, unknown> {
+  const cleaned = { ...content };
+  for (const field of MEDIA_PRESENTATION_FIELDS) delete cleaned[field];
+  return cleaned;
+}
+
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
@@ -182,7 +193,17 @@ export class ChatService {
       await this.assertTempChatActive(conversation);
     }
 
-    const content = payload.content as Prisma.InputJsonObject;
+    // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
+    // 按 key 现签),不是消息体的一部分 —— 留着的话:
+    // 1) 客户端塞的 url/thumbUrl 会在签名失败(存储不可用)时原样存活并被渲染;
+    // 2) localUri 本该只是发送方的本机路径,一旦被塞成 https://attacker/1x1.gif,
+    //    每个滑过这条消息的人都会静默 GET 一次,把 IP 和已读时刻交给对方。
+    // 客户端的本地预览应当只留在本地,不上行。
+    const content = (
+      MEDIA_MESSAGE_TYPES.includes(payload.type)
+        ? stripMediaPresentationFields(payload.content)
+        : payload.content
+    ) as Prisma.InputJsonObject;
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${payload.conversationId}))`;
 

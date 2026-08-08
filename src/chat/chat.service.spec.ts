@@ -264,6 +264,32 @@ describe('ChatService', () => {
       ).not.toThrow();
     });
 
+    it('strips client-supplied presentation fields from media content', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 3 } });
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {
+            key: 'chat/u1/a.jpg',
+            // 客户端塞的展示地址:签名失败时会原样存活并被渲染。
+            url: 'https://attacker.example/1x1.gif',
+            thumbUrl: 'https://attacker.example/t.gif',
+            // 本机预览地址本不该上行;被塞成 https 就是个静默追踪信标。
+            localUri: 'https://attacker.example/beacon.gif',
+          },
+        }),
+      );
+
+      const persisted = prisma.chatMessage.create.mock.calls[0][0].data.content;
+      expect(persisted).toEqual({ key: 'chat/u1/a.jpg' });
+    });
+
     it('rejects oversized content', async () => {
       await expect(
         service.sendMessage(
