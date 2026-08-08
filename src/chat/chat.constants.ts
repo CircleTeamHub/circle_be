@@ -48,6 +48,20 @@ export const CLIENT_MESSAGE_TYPES = [
 
 export const SYSTEM_MESSAGE_TYPE = 'system';
 
+/** 携带 object key 的媒体消息类型(读路径由 ChatMediaService 补签名 URL)。 */
+export const MEDIA_MESSAGE_TYPES: readonly string[] = [
+  'image',
+  'voice',
+  'file',
+];
+
+/**
+ * 聊天媒体的对象前缀。上传 presign 固定把 key 落在 chat/{userId}/ 下,
+ * 发送校验按 chat/{senderId}/ 收口,签发也只认这个前缀 —— 两道一起,
+ * 聊天读路径就无法被用来续签别的目录(notes/ 等)里的私有对象。
+ */
+export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
+
 /** content JSON 序列化后的字节上限(超限直接拒收,防 socket 消息膨胀)。 */
 export const MAX_CONTENT_BYTES = 8 * 1024;
 
@@ -63,6 +77,13 @@ export const CHAT_RATE_LIMITS = {
   typing: { limit: 10, windowMs: 5_000 },
   presence: { limit: 20, windowMs: 10_000 },
 } as const;
+
+/**
+ * 临时房访客 chatToken 的 kind 声明。定义放在 chat 侧是因为依赖方向是
+ * TempChatModule → ChatModule:签发在 temp-chat(LinkTokenService),
+ * 验签在 chat 网关,反向 import 会成环。
+ */
+export const TEMP_CHAT_GUEST_TOKEN_KIND = 'temp-chat-guest';
 
 /** 单次历史分页的最大条数。 */
 export const HISTORY_PAGE_MAX = 100;

@@ -8,6 +8,8 @@ import {
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
 import type {
@@ -17,6 +19,7 @@ import type {
 } from 'src/generated/prisma';
 import {
   CHAT_ADVISORY_LOCK_NS,
+  CHAT_MEDIA_KEY_PREFIX,
   CLIENT_MESSAGE_ID_MAX_LENGTH,
   CLIENT_MESSAGE_TYPES,
   CONVERSATION_LIST_MAX,
@@ -24,6 +27,7 @@ import {
   HISTORY_PAGE_MAX,
   MAX_CONTENT_BYTES,
   MAX_TEXT_LENGTH,
+  MEDIA_MESSAGE_TYPES,
 } from './chat.constants';
 import type {
   ChatConversationDto,
@@ -53,13 +57,15 @@ export class ChatService {
     private readonly sensitiveWords: SensitiveWordService,
     private readonly circleSync: ChatCircleSyncService,
     private readonly media: ChatMediaService,
+    private readonly privacySettings: PrivacySettingsService,
+    private readonly broadcast: ChatBroadcastService,
   ) {}
 
   /**
    * 发送校验:类型白名单、content 形状与体积、幂等键、敏感词。
    * socket 载荷不经过全局 ValidationPipe,必须在这里手动收口。
    */
-  validateSendPayload(payload: ChatSendPayload): void {
+  validateSendPayload(senderUserId: string, payload: ChatSendPayload): void {
     if (
       !payload ||
       typeof payload.conversationId !== 'string' ||
@@ -109,19 +115,26 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    // 媒体消息只收 object key,拒绝 URL 形态 —— 防「URL 固化进消息体」回潮
-    // (读路径统一由 ChatMediaService 签发,见 docs/self-hosted-chat.md)。
-    if (['image', 'voice', 'file'].includes(payload.type)) {
-      const key = payload.content['key'];
+    // 媒体消息只收 object key,且必须是发送者自己的 chat/{senderId}/ 命名空间。
+    // 拒 URL 形态是防「URL 固化进消息体」回潮(读路径统一由 ChatMediaService
+    // 签发,见 docs/self-hosted-chat.md);绑命名空间是防拿到别人的 key
+    // (例如从早期授权响应里学到的 notes/<别人>/...)后借聊天读路径无限续签,
+    // 把已撤销授权的私有对象转手分发出去。
+    if (MEDIA_MESSAGE_TYPES.includes(payload.type)) {
+      const ownPrefix = `${CHAT_MEDIA_KEY_PREFIX}${senderUserId}/`;
+      const isOwnKey = (value: unknown): boolean =>
+        typeof value === 'string' &&
+        value.startsWith(ownPrefix) &&
+        value.length > ownPrefix.length &&
+        !value.includes('://') &&
+        !value.includes('..');
       const thumbKey = payload.content['thumbKey'];
-      const isValidKey = (value: unknown): boolean =>
-        typeof value === 'string' && value.length > 0 && !value.includes('://');
       if (
-        !isValidKey(key) ||
-        (thumbKey !== undefined && !isValidKey(thumbKey))
+        !isOwnKey(payload.content['key']) ||
+        (thumbKey !== undefined && !isOwnKey(thumbKey))
       ) {
         throw new BadRequestException({
-          message: '媒体消息必须携带 object key(不接受 URL)',
+          message: '媒体消息必须携带你自己的 object key',
           errorCode: ChatErrorCode.InvalidPayload,
         });
       }
@@ -154,7 +167,7 @@ export class ChatService {
     senderUserId: string,
     payload: ChatSendPayload,
   ): Promise<SendResult> {
-    this.validateSendPayload(payload);
+    this.validateSendPayload(senderUserId, payload);
     const conversation = await this.requireMembership(
       payload.conversationId,
       senderUserId,
@@ -228,12 +241,15 @@ export class ChatService {
     return { message, reused: created.reused };
   }
 
-  /** 已读水位只前进不后退;返回是否发生了推进(未推进不必广播)。 */
+  /**
+   * 已读水位只前进不后退。返回是否发生了推进(未推进不必广播)以及
+   * 实际落库的高度 —— 广播必须用这个值,否则钳位之后仍会播出客户端报的假水位。
+   */
   async markRead(
     userId: string,
     conversationId: string,
     height: number,
-  ): Promise<boolean> {
+  ): Promise<{ advanced: boolean; height: number }> {
     if (!Number.isInteger(height) || height < 0) {
       throw new BadRequestException({
         message: '已读水位非法',
@@ -241,15 +257,53 @@ export class ChatService {
       });
     }
     await this.requireMembership(conversationId, userId);
+    // 钳到会话当前最大 height:客户端可以报任意非负整数,直接落库的话
+    // 一条 height=2e9 的 chat:read 会永久压掉后续所有未读,还会广播一条
+    // 假的已读回执,直到会话真的涨到那个高度为止。
+    const top = await this.prisma.chatMessage.aggregate({
+      where: { conversationID: conversationId, deleted: false },
+      _max: { height: true },
+    });
+    const ceiling = top._max.height ?? 0;
+    const clamped = Math.min(height, ceiling);
+    if (clamped <= 0) return { advanced: false, height: 0 };
     const updated = await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
         userID: userId,
-        lastReadHeight: { lt: height },
+        lastReadHeight: { lt: clamped },
       },
-      data: { lastReadHeight: height },
+      data: { lastReadHeight: clamped },
     });
-    return updated.count > 0;
+    return { advanced: updated.count > 0, height: clamped };
+  }
+
+  /**
+   * 在线状态查询的可见范围:请求方与目标必须同处一个双方都在座的会话。
+   * 返回请求列表里被允许的子集(自己始终可见)。
+   */
+  async filterVisiblePresenceTargets(
+    userId: string,
+    targetIds: string[],
+  ): Promise<string[]> {
+    const wanted = new Set(targetIds);
+    const allowed = new Set<string>();
+    if (wanted.delete(userId)) allowed.add(userId);
+    if (wanted.size === 0) return [...allowed];
+
+    const myConversationIds = await this.listConversationIds(userId);
+    if (myConversationIds.length === 0) return [...allowed];
+    const shared = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: { in: myConversationIds },
+        userID: { in: [...wanted] },
+        leftAt: null,
+      },
+      select: { userID: true },
+      distinct: ['userID'],
+    });
+    for (const row of shared) allowed.add(row.userID);
+    return [...allowed];
   }
 
   /** 连接建立时的房间派生:该用户所有在座会话的 id。 */
@@ -611,7 +665,22 @@ export class ChatService {
       where: { directKey },
       include: { members: true },
     });
+    // 首次建会话才过对方的「接收陌生人消息」开关 —— 与好友申请链路同一判定。
+    // 只查拉黑是不够的:把开关关掉的用户仍会被任何知道其 UUID 的人直接开聊,
+    // 建完会话就能立刻 socket 发消息。已有会话不复查:那是既存关系,
+    // 事后改开关不该把历史会话锁死。
     if (!conversation) {
+      const friends = await this.areFriends(userId, peerUserId);
+      const allowed = await this.privacySettings.canReceiveStrangerMessage(
+        peerUserId,
+        friends,
+      );
+      if (!allowed) {
+        throw new ForbiddenException({
+          message: '对方不接收陌生人消息',
+          errorCode: ChatErrorCode.StrangerNotAllowed,
+        });
+      }
       try {
         conversation = await this.prisma.chatConversation.create({
           data: {
@@ -641,24 +710,80 @@ export class ChatService {
         data: { leftAt: null },
       });
     }
+    // 双方已在线的 socket 立刻入会话房:座位落库不会自动 join,不补这一步
+    // 首条消息的广播就会漏掉在线的对端,推送分流还会把他当成离线用户。
+    // 尽力而为,失败不阻断建会话(客户端重连时 handleConnection 会补上)。
+    await Promise.all(
+      [userId, peerUserId].map((memberId) =>
+        this.broadcast
+          .joinUserToConversation(memberId, conv.id)
+          .catch((error: unknown) => {
+            this.logger.warn(
+              `join direct conversation room failed user=${memberId} conv=${conv.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }),
+      ),
+    );
 
-    const unread = mine
-      ? await this.loadUnreadCounts(userId, [
-          { conversationID: conv.id, lastReadHeight: mine.lastReadHeight },
-        ])
-      : new Map<string, number>();
+    const [unread, lastMessage] = await Promise.all([
+      mine
+        ? this.loadUnreadCounts(userId, [
+            { conversationID: conv.id, lastReadHeight: mine.lastReadHeight },
+          ])
+        : Promise.resolve(new Map<string, number>()),
+      // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
+      // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
+      this.loadLastMessageFor(conv.id),
+    ]);
     return {
       id: conv.id,
       type: conv.type,
       peer: { id: peer.id, nickname: peer.nickname, avatarUrl: peer.avatarUrl },
       circleId: null,
       circle: null,
-      lastMessage: null,
+      lastMessage,
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
       muted: mine?.muted ?? false,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
     };
+  }
+
+  /** 好友判定(任一方向的 ACCEPTED 行);陌生人消息开关按它放行。 */
+  private async areFriends(
+    userId: string,
+    peerUserId: string,
+  ): Promise<boolean> {
+    const row = await this.prisma.friend.findFirst({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: userId, friendID: peerUserId },
+          { userID: peerUserId, friendID: userId },
+        ],
+      },
+      select: { id: true },
+    });
+    return row !== null;
+  }
+
+  /** 单个会话的末条消息 DTO(带签名后的媒体 URL);无消息时 null。 */
+  private async loadLastMessageFor(
+    conversationId: string,
+  ): Promise<ChatMessageDto | null> {
+    const row = await this.prisma.chatMessage.findFirst({
+      where: { conversationID: conversationId, deleted: false },
+      orderBy: { height: 'desc' },
+    });
+    if (!row) return null;
+    const senders = await this.resolveSenders(
+      row.senderID ? [row.senderID] : [],
+    );
+    const dto = this.toMessageDto(row, this.senderFor(row, senders));
+    await this.media.attachMediaUrls([dto]);
+    return dto;
   }
 
   /** 会话成员目录:在座成员 + 用户展示信息;GROUP 会话附圈子角色。 */
@@ -820,43 +945,57 @@ export class ChatService {
     }
   }
 
+  /**
+   * 每个会话的末条消息,一次集合查询取回。
+   * 原来是每会话一次 findFirst:100 个会话的列表页就要 100 次往返,叠加
+   * 未读计数共 ~201 次,正常用户打开会话列表就能把 Prisma 连接池吃干。
+   * DISTINCT ON + (conversationID, height desc) 命中既有索引,单次即可。
+   */
   private async loadLastMessages(
     conversationIds: string[],
   ): Promise<Map<string, MessageRow>> {
-    const rows = await Promise.all(
-      conversationIds.map((id) =>
-        this.prisma.chatMessage.findFirst({
-          where: { conversationID: id, deleted: false },
-          orderBy: { height: 'desc' },
-        }),
-      ),
-    );
+    if (conversationIds.length === 0) return new Map();
+    const rows = await this.prisma.$queryRaw<MessageRow[]>`
+      SELECT DISTINCT ON ("conversationID") *
+      FROM "ChatMessage"
+      WHERE "conversationID" = ANY(${conversationIds}::text[])
+        AND "deleted" = false
+      ORDER BY "conversationID", "height" DESC
+    `;
     const map = new Map<string, MessageRow>();
-    rows.forEach((row) => {
-      if (row) map.set(row.conversationID, row);
-    });
+    for (const row of rows) map.set(row.conversationID, row);
     return map;
   }
 
+  /**
+   * 每个会话的未读数,一次 GROUP BY 取回(每会话各自的 lastReadHeight 水位)。
+   * 同上:原来每会话一次 count。
+   */
   private async loadUnreadCounts(
     userId: string,
     memberships: Array<{ conversationID: string; lastReadHeight: number }>,
   ): Promise<Map<string, number>> {
-    const counts = await Promise.all(
-      memberships.map(async (m) => {
-        const count = await this.prisma.chatMessage.count({
-          where: {
-            conversationID: m.conversationID,
-            deleted: false,
-            height: { gt: m.lastReadHeight },
-            // 自己发的消息不计未读。
-            NOT: { senderID: userId },
-          },
-        });
-        return [m.conversationID, count] as const;
-      }),
+    const map = new Map<string, number>(
+      memberships.map((m) => [m.conversationID, 0]),
     );
-    return new Map(counts);
+    if (memberships.length === 0) return map;
+    const ids = memberships.map((m) => m.conversationID);
+    const floors = memberships.map((m) => m.lastReadHeight);
+    const rows = await this.prisma.$queryRaw<
+      Array<{ conversationID: string; count: bigint }>
+    >`
+      SELECT m."conversationID", COUNT(*)::bigint AS count
+      FROM "ChatMessage" AS m
+      JOIN unnest(${ids}::text[], ${floors}::int[]) AS w("conversationID", floor)
+        ON w."conversationID" = m."conversationID"
+      WHERE m."deleted" = false
+        AND m."height" > w.floor
+        -- 自己发的消息不计未读。
+        AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
+      GROUP BY m."conversationID"
+    `;
+    for (const row of rows) map.set(row.conversationID, Number(row.count));
+    return map;
   }
 
   /** DIRECT 会话的对端信息:conversationId → 对端用户。 */

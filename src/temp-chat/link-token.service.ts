@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { TEMP_CHAT_GUEST_TOKEN_KIND } from 'src/chat/chat.constants';
+import type { GuestChatTokenPayload } from 'src/chat/chat.types';
 
 export interface LinkTokenPayload {
   tcId: string;
@@ -8,14 +10,10 @@ export interface LinkTokenPayload {
 /**
  * 访客聊天凭证(join 后发放):kind 判别使其与分享链接 token 不可互换 ——
  * 拿分享链接直接连 socket 会因缺 kind/guestId 被网关拒绝。
- * 与 chat 网关的访客验签是同一份契约(同秘钥 TEMP_CHAT_LINK_SECRET)。
+ * 载荷类型与 kind 常量都定义在 chat 侧(依赖方向 TempChatModule → ChatModule),
+ * 这里 re-export 给 temp-chat 内部沿用。
  */
-export interface GuestChatTokenPayload {
-  kind: 'temp-chat-guest';
-  guestId: string;
-  tcId: string;
-  conversationId: string;
-}
+export type { GuestChatTokenPayload };
 
 @Injectable()
 export class LinkTokenService {
@@ -38,7 +36,7 @@ export class LinkTokenService {
     expiresInSeconds: number,
   ): string {
     return this.jwt.sign(
-      { kind: 'temp-chat-guest', ...payload },
+      { kind: TEMP_CHAT_GUEST_TOKEN_KIND, ...payload },
       { expiresIn: expiresInSeconds },
     );
   }
@@ -47,7 +45,7 @@ export class LinkTokenService {
   verifyGuest(token: string): GuestChatTokenPayload {
     const payload = this.jwt.verify<GuestChatTokenPayload>(token);
     if (
-      payload.kind !== 'temp-chat-guest' ||
+      payload.kind !== TEMP_CHAT_GUEST_TOKEN_KIND ||
       typeof payload.guestId !== 'string' ||
       typeof payload.tcId !== 'string' ||
       typeof payload.conversationId !== 'string'
@@ -55,7 +53,7 @@ export class LinkTokenService {
       throw new Error('not a guest chat token');
     }
     return {
-      kind: 'temp-chat-guest',
+      kind: TEMP_CHAT_GUEST_TOKEN_KIND,
       guestId: payload.guestId,
       tcId: payload.tcId,
       conversationId: payload.conversationId,

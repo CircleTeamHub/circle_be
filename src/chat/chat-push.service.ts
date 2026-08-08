@@ -16,7 +16,15 @@ import type { ChatMessageDto } from './chat.types';
  * 但 @提及/@所有人 穿透免打扰。
  */
 const PREVIEW_MAX_LENGTH = 60;
-const PUSH_TARGET_CAP = 200;
+/**
+ * 一条消息最多考虑多少个在座成员。圈子扩容上限 3000,留一倍余量;
+ * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
+ */
+const PUSH_TARGET_CAP = 6000;
+/** 座位翻页大小。 */
+const PUSH_SEAT_PAGE = 500;
+/** 单批并发的推送数,给连接池和推送供应商留背压。 */
+const PUSH_SEND_CONCURRENCY = 50;
 
 @Injectable()
 export class ChatPushService {
@@ -44,15 +52,7 @@ export class ChatPushService {
   private async dispatch(message: ChatMessageDto): Promise<void> {
     const senderId = message.sender?.id ?? null;
     const [seats, conversation, onlineIds] = await Promise.all([
-      this.prisma.chatMember.findMany({
-        where: {
-          conversationID: message.conversationId,
-          leftAt: null,
-          ...(senderId ? { userID: { not: senderId } } : {}),
-        },
-        select: { userID: true, muted: true },
-        take: PUSH_TARGET_CAP,
-      }),
+      this.listSeats(message.conversationId, senderId),
       this.prisma.chatConversation.findUnique({
         where: { id: message.conversationId },
         select: {
@@ -75,13 +75,55 @@ export class ChatPushService {
     if (targets.length === 0) return;
 
     const payload = await this.composePayload(message, conversation);
-    await Promise.allSettled(
-      targets.map(async (seat) => {
-        const tokens = await this.push.listActiveTokens(seat.userID);
-        if (tokens.length === 0) return;
-        await this.push.sendToTokens(tokens, payload);
-      }),
-    );
+    // 分批并发发送:扩容后的圈子可到 3000 人,一次性 allSettled 三千个
+    // listActiveTokens 会把连接池和推送供应商同时打满。
+    for (let i = 0; i < targets.length; i += PUSH_SEND_CONCURRENCY) {
+      const batch = targets.slice(i, i + PUSH_SEND_CONCURRENCY);
+      await Promise.allSettled(
+        batch.map(async (seat) => {
+          const tokens = await this.push.listActiveTokens(seat.userID);
+          if (tokens.length === 0) return;
+          await this.push.sendToTokens(tokens, payload);
+        }),
+      );
+    }
+  }
+
+  /**
+   * 会话内除发送者外的全部在座成员(游标翻页跑完)。
+   * 原来是 take:200 且无排序:圈子扩容上限 3000,大群里绝大多数成员会被
+   * 静默跳过 —— 而且每次跳过的都是同一批(无序 = 由计划器决定),
+   * 那些人等于永久收不到新消息推送。
+   */
+  private async listSeats(
+    conversationId: string,
+    senderId: string | null,
+  ): Promise<Array<{ userID: string; muted: boolean }>> {
+    const seats: Array<{ userID: string; muted: boolean }> = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.prisma.chatMember.findMany({
+        where: {
+          conversationID: conversationId,
+          leftAt: null,
+          ...(senderId ? { userID: { not: senderId } } : {}),
+        },
+        select: { id: true, userID: true, muted: true },
+        orderBy: { id: 'asc' },
+        take: PUSH_SEAT_PAGE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      seats.push(...page.map((s) => ({ userID: s.userID, muted: s.muted })));
+      if (page.length < PUSH_SEAT_PAGE) return seats;
+      if (seats.length >= PUSH_TARGET_CAP) {
+        // 触顶记一条:静默截断会让「已推送全部成员」的假象留在日志里。
+        this.logger.warn(
+          `push seats hit the ${PUSH_TARGET_CAP} cap for conversation=${conversationId}; remainder skipped`,
+        );
+        return seats;
+      }
+      cursor = page[page.length - 1].id;
+    }
   }
 
   private mentionedUserIds(message: ChatMessageDto): Set<string> {

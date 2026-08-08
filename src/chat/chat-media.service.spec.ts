@@ -80,6 +80,17 @@ describe('ChatMediaService', () => {
     expect(image.content.url).toBeUndefined();
   });
 
+  it('never signs keys outside the chat/ prefix', async () => {
+    // 第二道防线:历史行里混进别的目录也不会被读路径签成可分发 URL。
+    const foreign = dto({
+      type: 'image',
+      content: { key: 'notes/u2/private.jpg' },
+    });
+    await service.attachMediaUrls([foreign]);
+    expect(uploadService.createPresignedGetUrl).not.toHaveBeenCalled();
+    expect(foreign.content.url).toBeUndefined();
+  });
+
   it('patches content immutably (new object, original untouched)', async () => {
     const original = { key: 'chat/a.jpg' };
     const image = dto({ type: 'image', content: original });

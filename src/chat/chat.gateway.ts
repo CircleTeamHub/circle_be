@@ -15,6 +15,7 @@ import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
   CHAT_WS_PATH,
+  TEMP_CHAT_GUEST_TOKEN_KIND,
   conversationRoom,
   userRoom,
 } from './chat.constants';
@@ -24,6 +25,7 @@ import { ChatPushService } from './chat-push.service';
 import { ChatService } from './chat.service';
 import type {
   ChatAckError,
+  GuestChatTokenPayload,
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
@@ -132,13 +134,21 @@ export class ChatGateway {
   }
 
   /**
-   * 握手鉴权:仅接受 access token(sub + accountId 均为 string),
-   * 与 RealtimeGateway.verifyToken 同一判定;再过一次吊销检查。
+   * 握手鉴权,两种形态共用 auth.token:
+   * - app access token(sub + accountId 均为 string),与 RealtimeGateway.verifyToken
+   *   同一判定,再过一次吊销检查;
+   * - 临时房访客 chatToken(kind=temp-chat-guest,秘钥 TEMP_CHAT_LINK_SECRET)。
+   *
+   * 先用「未验签的 kind 声明」分流:分流只决定用哪把钥匙验签,伪造 kind
+   * 只会被另一把钥匙拒掉,不构成绕过。
    */
   private async authenticate(socket: Socket): Promise<string | null> {
     const token = (socket.handshake.auth as Record<string, unknown> | undefined)
       ?.token;
     if (typeof token !== 'string' || token.length === 0) return null;
+    if (this.claimsGuestKind(token)) {
+      return this.authenticateGuest(socket, token);
+    }
     let payload: JwtPayload;
     try {
       payload = this.jwtService.verify<JwtPayload>(token);
@@ -152,6 +162,63 @@ export class ChatGateway {
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
     return payload.sub;
+  }
+
+  /** 不验签地读一下 kind,仅用于分流到对应的验签分支。 */
+  private claimsGuestKind(token: string): boolean {
+    try {
+      const decoded: unknown = this.jwtService.decode(token);
+      return (
+        typeof decoded === 'object' &&
+        decoded !== null &&
+        (decoded as Record<string, unknown>).kind === TEMP_CHAT_GUEST_TOKEN_KIND
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 访客握手:TEMP_CHAT_LINK_SECRET 验签 + 房间仍 ACTIVE 未过期 + 座位未离座。
+   * 三道都过才放行,并把会话 id 钉在 socket.data 上 —— handleConnection 只让
+   * 访客进这一个会话房,拿不到 listConversationIds 的全量会话。
+   * 访客没有 app 会话,吊销广播按 sessionId/issuedAtMs 判定天然不命中它;
+   * 房间结束/清退走 TempChatService 的 disconnectUser。
+   */
+  private async authenticateGuest(
+    socket: Socket,
+    token: string,
+  ): Promise<string | null> {
+    const secret = this.configService.get<string>('TEMP_CHAT_LINK_SECRET');
+    if (!secret) {
+      this.logger.warn('TEMP_CHAT_LINK_SECRET 未配置,访客握手一律拒绝');
+      return null;
+    }
+    let payload: GuestChatTokenPayload;
+    try {
+      payload = this.jwtService.verify<GuestChatTokenPayload>(token, {
+        secret,
+      });
+    } catch {
+      return null;
+    }
+    if (
+      payload?.kind !== TEMP_CHAT_GUEST_TOKEN_KIND ||
+      typeof payload.guestId !== 'string' ||
+      typeof payload.tcId !== 'string' ||
+      typeof payload.conversationId !== 'string'
+    ) {
+      return null;
+    }
+    if (!(await this.chatService.getActiveTempChat(payload.tcId))) return null;
+    if (
+      !(await this.chatService.hasSeat(payload.conversationId, payload.guestId))
+    )
+      return null;
+    socket.data.guestConversationId = payload.conversationId;
+    socket.data.sessionId = null;
+    socket.data.issuedAtMs = null;
+    return payload.guestId;
   }
 
   /** 与 RealtimeGateway 同源的吊销语义:user 级按签发时间比对,session 级按 sid。 */
@@ -247,11 +314,23 @@ export class ChatGateway {
       ack({});
       return;
     }
-    const userIds = Array.isArray(payload?.userIds)
+    const requested = Array.isArray(payload?.userIds)
       ? payload.userIds.filter((id) => typeof id === 'string').slice(0, 50)
       : [];
+    if (requested.length === 0) {
+      ack({});
+      return;
+    }
+    // 收窄到「与请求方同处在座会话」的用户。不过滤的话,任何登录账号都能
+    // 拿任意 UUID(API 里到处都在返回)持续轮询别人的在线状态 —— 陌生人、
+    // 被拉黑的人都能被长期追踪。上下线广播本身就只发到会话房,查询也对齐。
+    const userId = socket.data.userId as string;
+    const visible = await this.chatService.filterVisiblePresenceTargets(
+      userId,
+      requested,
+    );
     const entries = await Promise.all(
-      userIds.map(
+      [...visible].map(
         async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
       ),
     );
@@ -302,14 +381,19 @@ export class ChatGateway {
     try {
       const conversationId = payload?.conversationId;
       const height = Number(payload?.height);
-      const advanced = await this.chatService.markRead(
+      const result = await this.chatService.markRead(
         userId,
         conversationId,
         height,
       );
       reply({ ok: true });
-      if (advanced) {
-        this.broadcast.emitRead({ conversationId, userId, height });
+      if (result.advanced) {
+        // 播落库后的高度,不是客户端报的那个 —— 后者可能被钳过。
+        this.broadcast.emitRead({
+          conversationId,
+          userId,
+          height: result.height,
+        });
       }
     } catch (error) {
       reply(this.toAckError(error, 'read', userId, payload?.conversationId));

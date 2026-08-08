@@ -32,18 +32,28 @@ describe('ChatService', () => {
     circleMember: { findUnique: jest.fn() },
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn() },
+    friend: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
   };
   const sensitiveWords = { check: jest.fn() };
   const circleSync = { ensureCircleConversation: jest.fn() };
   const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
+  const privacySettings = {
+    canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
+  };
+  const broadcast = {
+    joinUserToConversation: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatService(
     prisma as never,
     sensitiveWords as never,
     circleSync as never,
     media as never,
+    privacySettings as never,
+    broadcast as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -100,6 +110,11 @@ describe('ChatService', () => {
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
     prisma.circle.findMany.mockResolvedValue([]);
+    // loadLastMessages / loadUnreadCounts 现在是集合查询,默认「无行」。
+    prisma.$queryRaw.mockResolvedValue([]);
+    privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    broadcast.joinUserToConversation.mockResolvedValue(undefined);
+    prisma.friend.findFirst.mockResolvedValue(null);
   });
 
   describe('sendMessage', () => {
@@ -206,6 +221,49 @@ describe('ChatService', () => {
       });
     });
 
+    it("rejects media keys outside the sender's own chat namespace", async () => {
+      // 从早期授权响应里学到的别人的私有 key,不能借聊天读路径无限续签。
+      for (const key of [
+        'notes/u2/private.jpg',
+        'chat/u2/other.jpg',
+        'chat/u1',
+        'chat/u1/../notes/u2/private.jpg',
+      ]) {
+        await expect(
+          service.sendMessage(
+            'u1',
+            sendPayload({ type: 'image', content: { key } }),
+          ),
+        ).rejects.toMatchObject({
+          response: { errorCode: ChatErrorCode.InvalidPayload },
+        });
+      }
+      // thumbKey 同样收口。
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: { key: 'chat/u1/a.jpg', thumbKey: 'chat/u2/t.jpg' },
+          }),
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+    });
+
+    it("accepts a media key inside the sender's own namespace", () => {
+      expect(() =>
+        service.validateSendPayload(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: { key: 'chat/u1/a.jpg', thumbKey: 'chat/u1/t.jpg' },
+          }),
+        ),
+      ).not.toThrow();
+    });
+
     it('rejects oversized content', async () => {
       await expect(
         service.sendMessage(
@@ -240,8 +298,12 @@ describe('ChatService', () => {
   describe('markRead', () => {
     it('advances the watermark and reports advancement', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
-      await expect(service.markRead('u1', 'conv-1', 5)).resolves.toBe(true);
+      await expect(service.markRead('u1', 'conv-1', 5)).resolves.toEqual({
+        advanced: true,
+        height: 5,
+      });
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
         where: {
           conversationID: 'conv-1',
@@ -254,8 +316,38 @@ describe('ChatService', () => {
 
     it('reports no advancement for stale watermarks (forward-only)', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
       prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
-      await expect(service.markRead('u1', 'conv-1', 1)).resolves.toBe(false);
+      await expect(service.markRead('u1', 'conv-1', 1)).resolves.toEqual({
+        advanced: false,
+        height: 1,
+      });
+    });
+
+    it('clamps a future watermark to the conversation height', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      // height=2e9 未钳位的话会永久压掉后续所有未读,并广播一条假已读。
+      await expect(
+        service.markRead('u1', 'conv-1', 2_000_000_000),
+      ).resolves.toEqual({ advanced: true, height: 9 });
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastReadHeight: 9 } }),
+      );
+    });
+
+    it('is a no-op on an empty conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({
+        _max: { height: null },
+      });
+      await expect(service.markRead('u1', 'conv-1', 5)).resolves.toEqual({
+        advanced: false,
+        height: 0,
+      });
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
     });
 
     it('rejects non-integer heights', async () => {
@@ -265,12 +357,64 @@ describe('ChatService', () => {
     });
   });
 
+  describe('filterVisiblePresenceTargets', () => {
+    it('drops users that share no conversation with the requester', async () => {
+      prisma.chatMember.findMany
+        // listConversationIds
+        .mockResolvedValueOnce([{ conversationID: 'conv-1' }])
+        // 共处会话的目标
+        .mockResolvedValueOnce([{ userID: 'u2' }]);
+
+      await expect(
+        service.filterVisiblePresenceTargets('u1', ['u2', 'stranger']),
+      ).resolves.toEqual(['u2']);
+    });
+
+    it('always allows the requester itself and short-circuits', async () => {
+      await expect(
+        service.filterVisiblePresenceTargets('u1', ['u1']),
+      ).resolves.toEqual(['u1']);
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('returns nothing when the requester has no conversations', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([]);
+      await expect(
+        service.filterVisiblePresenceTargets('u1', ['u2']),
+      ).resolves.toEqual([]);
+    });
+  });
+
   describe('getOrCreateDirectConversation', () => {
     const peer = {
       id: 'u2',
       nickname: '对方',
       avatarUrl: null,
       status: 'ACTIVE',
+    };
+    const conversationRow = {
+      id: 'conv-9',
+      type: 'DIRECT',
+      directKey: 'u1:u2',
+      lastMessageAt: null,
+      members: [
+        {
+          id: 'm1',
+          userID: 'u1',
+          leftAt: null,
+          pinned: false,
+          muted: false,
+          lastReadHeight: 0,
+        },
+        {
+          id: 'm2',
+          userID: 'u2',
+          leftAt: null,
+          pinned: false,
+          muted: false,
+          lastReadHeight: 0,
+        },
+      ],
     };
 
     it('rejects self conversations', async () => {
@@ -300,6 +444,108 @@ describe('ChatService', () => {
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.Blocked },
       });
+    });
+
+    it('refuses to open a chat with a stranger who disallows stranger messages', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canReceiveStrangerMessage.mockResolvedValue(false);
+
+      await expect(
+        service.getOrCreateDirectConversation('u1', 'u2'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.StrangerNotAllowed },
+      });
+      // 只查拉黑放行的话,这里已经建好会话并可以立刻 socket 发消息了。
+      expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+    });
+
+    it('lets accepted friends through regardless of the stranger switch', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ id: 'f1' });
+      prisma.chatConversation.create.mockResolvedValue(conversationRow);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+
+      await service.getOrCreateDirectConversation('u1', 'u2');
+      expect(privacySettings.canReceiveStrangerMessage).toHaveBeenCalledWith(
+        'u2',
+        true,
+      );
+    });
+
+    it('does not re-check the switch for an existing conversation', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(conversationRow);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+
+      await service.getOrCreateDirectConversation('u1', 'u2');
+      // 事后关掉开关不该把既有会话锁死。
+      expect(privacySettings.canReceiveStrangerMessage).not.toHaveBeenCalled();
+    });
+
+    it("joins both members' live sockets to the conversation room", async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      prisma.chatConversation.create.mockResolvedValue(conversationRow);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+
+      await service.getOrCreateDirectConversation('u1', 'u2');
+      // 不 join 的话首条消息的房广播会漏掉在线的对端,推送还会误判他离线。
+      expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+        'u1',
+        'conv-9',
+      );
+      expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+        'u2',
+        'conv-9',
+      );
+    });
+
+    it('still returns the conversation when joining a room fails', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(conversationRow);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      broadcast.joinUserToConversation.mockRejectedValue(
+        new Error('no server'),
+      );
+
+      await expect(
+        service.getOrCreateDirectConversation('u1', 'u2'),
+      ).resolves.toMatchObject({ id: 'conv-9' });
+    });
+
+    it('returns the real last message for an existing conversation', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(conversationRow);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue({
+        id: 'msg-7',
+        conversationID: 'conv-9',
+        height: 7,
+        senderID: 'u1',
+        type: 'text',
+        content: { text: '在吗' },
+        clientMessageId: 'd-7',
+        replyToID: null,
+        deleted: false,
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      });
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+      // 恒 null 会把客户端缓存里的会话预览抹成空白。
+      expect(dto.lastMessage).toMatchObject({ id: 'msg-7', height: 7 });
     });
 
     it('creates with a sorted directKey and both member rows', async () => {
@@ -553,8 +799,12 @@ describe('ChatService', () => {
         ])
         // loadDirectPeers 的对端成员查询。
         .mockResolvedValueOnce([{ conversationID: 'conv-1', userID: 'u2' }]);
-      prisma.chatMessage.findFirst.mockResolvedValue(createdRow);
-      prisma.chatMessage.count.mockResolvedValue(2);
+      // 末条消息与未读数各一次集合查询(不再每会话一次往返)。
+      prisma.$queryRaw
+        .mockResolvedValueOnce([createdRow])
+        .mockResolvedValueOnce([
+          { conversationID: 'conv-1', count: BigInt(2) },
+        ]);
       prisma.user.findMany.mockResolvedValue([
         { id: 'u1', nickname: '一波', avatarUrl: null },
         { id: 'u2', nickname: '对方', avatarUrl: null },
@@ -570,11 +820,30 @@ describe('ChatService', () => {
         unreadCount: 2,
         lastMessage: { id: 'msg-1' },
       });
-      expect(prisma.chatMessage.count).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ NOT: { senderID: 'u1' } }),
-        }),
-      );
+    });
+
+    it('keeps the query count flat as the conversation list grows', async () => {
+      const rows = Array.from({ length: 60 }, (_, i) => ({
+        ...membership(),
+        conversationID: `conv-${i}`,
+        conversation: {
+          id: `conv-${i}`,
+          type: 'GROUP',
+          directKey: null,
+          circleID: null,
+          tempChatID: null,
+          lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+        },
+      }));
+      prisma.chatMember.findMany.mockResolvedValueOnce(rows);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.listConversations('u1');
+
+      // 60 个会话 → 2 次集合查询(末条 + 未读),而不是 120 次往返。
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+      expect(prisma.chatMessage.findFirst).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.count).not.toHaveBeenCalled();
     });
   });
 

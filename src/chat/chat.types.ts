@@ -1,6 +1,7 @@
 // 自研聊天的线上契约类型:socket 载荷 / ack / 广播 DTO。
 // 与前端 src/chat-core/protocol.ts 镜像,字段名即协议,改动需两仓同步。
 import type { AppErrorCode } from 'src/common/app-error-codes';
+import type { TEMP_CHAT_GUEST_TOKEN_KIND } from './chat.constants';
 
 /** chat:send 客户端载荷。d = 客户端生成的幂等键(deliveryId)。 */
 export interface ChatSendPayload {
@@ -117,6 +118,18 @@ export interface HistoryFilters {
   date?: string;
   /** 客户端时区偏移(new Date().getTimezoneOffset() 语义,分钟)。 */
   tzOffsetMinutes?: number;
+}
+
+/**
+ * 临时房访客 chatToken 载荷:temp-chat 签发(LinkTokenService),chat 网关验签。
+ * 定义放在 chat 侧是因为依赖方向是 TempChatModule → ChatModule,反向 import 成环。
+ * kind 判别使它与分享链接 token 不可互换。
+ */
+export interface GuestChatTokenPayload {
+  kind: typeof TEMP_CHAT_GUEST_TOKEN_KIND;
+  guestId: string;
+  tcId: string;
+  conversationId: string;
 }
 
 /** 历史分页 DTO(REST GET /chat/conversations/:id/messages)。 */

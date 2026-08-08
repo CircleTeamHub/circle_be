@@ -18,14 +18,15 @@ import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from 'src/chat/chat.service';
 import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
 import { UploadService } from 'src/upload/upload.service';
-import { PresignDto } from 'src/upload/dto/presign.dto';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
+import { GuestPresignDto } from './dto/guest-presign.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import {
   TempChatGuestGuard,
   type RequestWithTempChatGuest,
 } from './temp-chat-guest.guard';
 import { TempChatService } from './temp-chat.service';
+import { TempChatUploadQuota } from './temp-chat-upload-quota';
 
 @ApiTags('Temp Chat')
 @Controller('temp-chat')
@@ -35,6 +36,7 @@ export class TempChatController {
     private readonly service: TempChatService,
     private readonly chatService: ChatService,
     private readonly uploadService: UploadService,
+    private readonly uploadQuota: TempChatUploadQuota,
   ) {}
 
   @Post()
@@ -121,14 +123,21 @@ export class TempChatController {
   }
 
   // 访客发图:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
+  // 入参用 GuestPresignDto 而非 upload 的 PresignDto —— 后者放行 video/* 且上限
+  // 100 MiB,匿名访客不该有那种申请面。次数限流之外再走累计字节配额。
   @Post('guest/upload-presign')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: '访客图片上传预签名' })
-  guestUploadPresign(
+  async guestUploadPresign(
     @Req() req: RequestWithTempChatGuest,
-    @Body() dto: PresignDto,
+    @Body() dto: GuestPresignDto,
   ) {
+    await this.uploadQuota.consume(
+      req.tempChatGuest.guestId,
+      req.tempChatGuest.tcId,
+      dto.sizeBytes,
+    );
     return this.uploadService.presign(
       dto.filename,
       dto.contentType,

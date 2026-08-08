@@ -8,6 +8,7 @@ import { TempChatCleanup } from './temp-chat.cleanup';
 import { TempChatController } from './temp-chat.controller';
 import { TempChatGuestGuard } from './temp-chat-guest.guard';
 import { TempChatService } from './temp-chat.service';
+import { TempChatUploadQuota } from './temp-chat-upload-quota';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { TempChatService } from './temp-chat.service';
     LinkTokenService,
     TempChatCleanup,
     TempChatGuestGuard,
+    TempChatUploadQuota,
   ],
   exports: [TempChatService],
 })

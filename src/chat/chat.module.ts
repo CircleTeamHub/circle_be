@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
 import { ConfigEnum } from 'src/enum/config.enum';
 import { NotificationModule } from 'src/notification/notification.module';
 import { RedisModule } from 'src/redis/redis.module';
+import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -22,6 +23,7 @@ import { ChatService } from './chat.service';
     NotificationModule,
     RedisModule,
     SensitiveWordModule,
+    PrivacySettingsModule,
     UploadModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],

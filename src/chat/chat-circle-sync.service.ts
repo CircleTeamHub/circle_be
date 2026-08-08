@@ -5,6 +5,18 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 
 /**
+ * 不再持有群聊的管理态。DISABLING/RESTORING 也算在内:处理中的圈子
+ * 默认拒绝(宁可晚一分钟恢复,也不要在停用窗口里把门开着)。
+ */
+const DISABLED_ADMIN_STATES = new Set<string>([
+  'DISABLING',
+  'DISABLED',
+  'RESTORING',
+  'SYNC_FAILED',
+  'DISMISSED',
+]);
+
+/**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
  *
  * 机制:幂等 ensure + 定时对账,不在 7 处 CircleMember 写点逐一埋钩子 ——
@@ -19,7 +31,15 @@ export class ChatCircleSyncService {
 
   /** 对账扫描窗口:2 个周期重叠,防止边界上的变更漏扫。 */
   private static readonly RECONCILE_WINDOW_MS = 2 * 60_000;
-  private static readonly RECONCILE_BATCH = 200;
+  /** 单轮扫描上限,纯粹是失控查询的兜底(正常量级远低于此)。 */
+  private static readonly RECONCILE_SCAN_MAX = 10_000;
+  private static readonly RETRY_QUEUE_MAX = 1000;
+
+  /**
+   * 上轮失败、需要继续重试的圈子。进程内保存:重启会丢,但重启后任一成员
+   * 变更都会把它重新带回扫描窗口,而窗口本身是从数据推导的(无需持久游标)。
+   */
+  private readonly retryQueue = new Set<string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -32,25 +52,27 @@ export class ChatCircleSyncService {
     const since = new Date(
       Date.now() - ChatCircleSyncService.RECONCILE_WINDOW_MS,
     );
-    let changed: Array<{ circleID: string }>;
+    let changed: string[];
     try {
-      changed = await this.prisma.circleMember.findMany({
-        where: { updatedAt: { gt: since } },
-        select: { circleID: true },
-        distinct: ['circleID'],
-        take: ChatCircleSyncService.RECONCILE_BATCH,
-      });
+      changed = await this.scanChangedCircles(since);
     } catch (error) {
       this.logger.error(
         `reconcile scan failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       return;
     }
-    for (const { circleID } of changed) {
+    // 上轮失败的圈子跟着重试:只靠窗口重叠的话,连续失败超过 2 分钟就永远
+    // 掉出扫描范围,被踢成员的座位会一直留着(还能读能发)。
+    const pending = [...this.retryQueue];
+    this.retryQueue.clear();
+    for (const circleID of new Set([...changed, ...pending])) {
       try {
         await this.ensureCircleConversation(circleID);
       } catch (error) {
-        // 单圈失败不拖垮整轮,下个周期窗口重叠会再试。
+        // 单圈失败不拖垮整轮;排进重试队列,直到成功为止。
+        if (this.retryQueue.size < ChatCircleSyncService.RETRY_QUEUE_MAX) {
+          this.retryQueue.add(circleID);
+        }
         this.logger.warn(
           `reconcile circle ${circleID} failed: ${
             error instanceof Error ? error.message : String(error)
@@ -61,6 +83,30 @@ export class ChatCircleSyncService {
   }
 
   /**
+   * 窗口内发生过成员变更的全部圈子(游标翻页跑完)。
+   * 原来只取首批 200 且不翻页:一分钟内变更超过 200 个圈子时,多出来的
+   * 会被静默丢掉且再也不会被选中 —— 那些圈子里被移除的成员会无限期保留座位。
+   */
+  private async scanChangedCircles(since: Date): Promise<string[]> {
+    // 一次 SELECT DISTINCT 取回窗口内全部圈子 id(只有 UUID,量级很小),
+    // 不再靠 take:200 截断 —— circleID 在 CircleMember 上不唯一,做不了游标翻页,
+    // 而截断就意味着多出来的圈子这一轮直接消失。上限只是失控兜底。
+    const rows = await this.prisma.$queryRaw<Array<{ circleID: string }>>`
+      SELECT DISTINCT "circleID"
+      FROM "CircleMember"
+      WHERE "updatedAt" > ${since}
+      LIMIT ${ChatCircleSyncService.RECONCILE_SCAN_MAX}
+    `;
+    if (rows.length >= ChatCircleSyncService.RECONCILE_SCAN_MAX) {
+      // 触顶只可能是异常量级的写入洪峰:记一条,剩余部分下个周期继续。
+      this.logger.warn(
+        `reconcile scan hit the ${ChatCircleSyncService.RECONCILE_SCAN_MAX}-circle cap; remainder deferred to the next tick`,
+      );
+    }
+    return rows.map((row) => row.circleID);
+  }
+
+  /**
    * 幂等:确保圈子的 GROUP 会话存在,且座位与 CircleMember(ACTIVE) 对齐。
    * 返回 conversationId;圈子不存在返回 null。
    * 集合式写法(createMany skipDuplicates / 条件 updateMany),并发重入安全。
@@ -68,9 +114,16 @@ export class ChatCircleSyncService {
   async ensureCircleConversation(circleId: string): Promise<string | null> {
     const circle = await this.prisma.circle.findUnique({
       where: { id: circleId },
-      select: { id: true },
+      select: { id: true, deleted: true, adminState: true },
     });
     if (!circle) return null;
+    // 解散/停用的圈子一律默认拒绝。管理台 DISMISS 只把座位置 leftAt,
+    // CircleMember 行仍是 ACTIVE —— 若照常对账,下一轮就会把 leftAt 清回去,
+    // 已解散的群聊自己重新开门(建会话端点同理,它走的是同一个方法)。
+    if (circle.deleted || DISABLED_ADMIN_STATES.has(circle.adminState)) {
+      await this.evictAllSeats(circleId);
+      return null;
+    }
 
     const result = await this.prisma.$transaction(async (tx) => {
       let created = false;
@@ -176,6 +229,38 @@ export class ChatCircleSyncService {
         );
     }
     return result.conversationId;
+  }
+
+  /**
+   * 圈子被解散/停用时收回全部在座座位,并把在线 socket 踢出会话房。
+   * 幂等:座位已经清干净就什么都不做,不重复广播。
+   */
+  private async evictAllSeats(circleId: string): Promise<void> {
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { circleID: circleId },
+      select: { id: true },
+    });
+    if (!conversation) return;
+    const seated = await this.prisma.chatMember.findMany({
+      where: { conversationID: conversation.id, leftAt: null },
+      select: { userID: true },
+    });
+    if (seated.length === 0) return;
+    await this.prisma.chatMember.updateMany({
+      where: { conversationID: conversation.id, leftAt: null },
+      data: { leftAt: new Date() },
+    });
+    for (const { userID } of seated) {
+      void this.broadcast
+        .removeUserFromConversation(userID, conversation.id)
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `evict room failed user=${userID}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
   }
 
   /** 结构化系统提示:本地化留给前端 im.notification.* 词表。 */

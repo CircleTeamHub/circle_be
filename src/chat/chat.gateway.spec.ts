@@ -8,7 +8,8 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
   const handlers = new Map<string, Handler>();
   return {
     id: 'socket-1',
-    data: { userId: 'u1' },
+    // 网关会往 data 上钉 guestConversationId / sessionId / issuedAtMs。
+    data: { userId: 'u1' } as Record<string, unknown>,
     rooms: new Set<string>(['socket-1', 'c:conv-1']),
     handshake: { auth: { token: 'jwt' } },
     join: jest.fn().mockResolvedValue(undefined),
@@ -22,12 +23,15 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ChatGateway', () => {
-  const jwtService = { verify: jest.fn() };
+  const jwtService = { verify: jest.fn(), decode: jest.fn() };
   const sessionRevocation = { isRevoked: jest.fn() };
   const chatService = {
     listConversationIds: jest.fn(),
     sendMessage: jest.fn(),
     markRead: jest.fn(),
+    getActiveTempChat: jest.fn(),
+    hasSeat: jest.fn(),
+    filterVisiblePresenceTargets: jest.fn(),
   };
   const broadcast = {
     setServer: jest.fn(),
@@ -57,6 +61,9 @@ describe('ChatGateway', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     sessionRevocation.isRevoked.mockResolvedValue(false);
+    configService.get.mockReturnValue('guest-secret');
+    // 默认不是访客 token:app 分支的既有用例不受分流影响。
+    jwtService.decode.mockReturnValue({ sub: 'u1' });
   });
 
   describe('authenticate', () => {
@@ -95,6 +102,70 @@ describe('ChatGateway', () => {
     });
   });
 
+  describe('authenticate (temp-chat guest)', () => {
+    const guestPayload = {
+      kind: 'temp-chat-guest',
+      guestId: 'g1',
+      tcId: 'tc-1',
+      conversationId: 'conv-9',
+    };
+
+    beforeEach(() => {
+      jwtService.decode.mockReturnValue({ kind: 'temp-chat-guest' });
+      jwtService.verify.mockReturnValue(guestPayload);
+      chatService.getActiveTempChat.mockResolvedValue(true);
+      chatService.hasSeat.mockResolvedValue(true);
+    });
+
+    it('accepts a guest chatToken and pins it to its single conversation', async () => {
+      const socket = fakeSocket();
+      await expect(gateway['authenticate'](socket as never)).resolves.toBe(
+        'g1',
+      );
+      // 用访客秘钥验签,不是 app 的 SECRET。
+      expect(jwtService.verify).toHaveBeenCalledWith('jwt', {
+        secret: 'guest-secret',
+      });
+      expect(socket.data.guestConversationId).toBe('conv-9');
+      // 访客没有 app 会话,吊销广播的两个判据都不该命中它。
+      expect(socket.data.sessionId).toBeNull();
+      expect(socket.data.issuedAtMs).toBeNull();
+      expect(sessionRevocation.isRevoked).not.toHaveBeenCalled();
+    });
+
+    it('rejects once the room is no longer active', async () => {
+      chatService.getActiveTempChat.mockResolvedValue(false);
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+      expect(chatService.hasSeat).not.toHaveBeenCalled();
+    });
+
+    it('rejects a guest whose seat was cleared', async () => {
+      chatService.hasSeat.mockResolvedValue(false);
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+    });
+
+    it('rejects a forged kind claim (it still needs the guest signing key)', async () => {
+      jwtService.verify.mockImplementation(() => {
+        throw new Error('bad signature');
+      });
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+    });
+
+    it('rejects every guest handshake when the secret is unconfigured', async () => {
+      configService.get.mockReturnValue(undefined);
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+      expect(jwtService.verify).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleConnection', () => {
     it('joins the personal room plus every membership conversation room', async () => {
       const socket = fakeSocket();
@@ -113,6 +184,47 @@ describe('ChatGateway', () => {
       await gateway['handleConnection'](socket as never);
       expect(socket.disconnect).toHaveBeenCalledWith(true);
       expect(socket.handlers.size).toBe(0);
+    });
+
+    it('confines a guest socket to its own room and skips the membership lookup', async () => {
+      const socket = fakeSocket({
+        data: { userId: 'g1', guestConversationId: 'conv-9' },
+      });
+      await gateway['handleConnection'](socket as never);
+      expect(chatService.listConversationIds).not.toHaveBeenCalled();
+      expect(socket.join).toHaveBeenCalledWith(['c:conv-9']);
+    });
+  });
+
+  describe('handlePresenceQuery', () => {
+    it('only answers for users sharing a conversation with the requester', async () => {
+      chatService.filterVisiblePresenceTargets.mockResolvedValue(['u2']);
+      broadcast.isUserOnline.mockResolvedValue(true);
+      const ack = jest.fn();
+
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: ['u2', 'stranger', 'blocked'] } as never,
+        ack,
+      );
+
+      expect(chatService.filterVisiblePresenceTargets).toHaveBeenCalledWith(
+        'u1',
+        ['u2', 'stranger', 'blocked'],
+      );
+      // 不过滤的话,任何登录账号都能拿 UUID 长期轮询陌生人的在线状态。
+      expect(ack).toHaveBeenCalledWith({ u2: true });
+    });
+
+    it('answers empty without touching presence when nothing was requested', async () => {
+      const ack = jest.fn();
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: [] } as never,
+        ack,
+      );
+      expect(ack).toHaveBeenCalledWith({});
+      expect(chatService.filterVisiblePresenceTargets).not.toHaveBeenCalled();
     });
   });
 
@@ -216,7 +328,7 @@ describe('ChatGateway', () => {
 
   describe('handleRead', () => {
     it('acks and broadcasts only when the watermark advanced', async () => {
-      chatService.markRead.mockResolvedValue(true);
+      chatService.markRead.mockResolvedValue({ advanced: true, height: 5 });
       const ack = jest.fn();
       await gateway['handleRead'](
         fakeSocket() as never,
@@ -232,7 +344,7 @@ describe('ChatGateway', () => {
       });
 
       broadcast.emitRead.mockClear();
-      chatService.markRead.mockResolvedValue(false);
+      chatService.markRead.mockResolvedValue({ advanced: false, height: 4 });
       await gateway['handleRead'](
         fakeSocket() as never,
         'u1',

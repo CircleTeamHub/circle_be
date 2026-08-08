@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { UploadService } from 'src/upload/upload.service';
+import { CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 
 /**
@@ -43,7 +44,14 @@ export class ChatMediaService {
       if (!fields) continue;
       for (const field of fields) {
         const value = message.content[field.key];
-        if (typeof value === 'string' && value.length > 0) wanted.add(value);
+        // 只给 chat/ 目录下的 key 签名。发送校验已经把新消息收口到
+        // chat/{senderId}/,这里是第二道:历史行里若混进别的目录(notes/ 等),
+        // 读路径也不会把它变成一条新的可分发签名 URL。
+        if (
+          typeof value === 'string' &&
+          value.startsWith(CHAT_MEDIA_KEY_PREFIX)
+        )
+          wanted.add(value);
       }
     }
     if (wanted.size === 0) return;

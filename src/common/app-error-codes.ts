@@ -165,6 +165,7 @@ export const TempChatErrorCode = {
   Full: 'TEMP_CHAT_FULL',
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
   JoinFailed: 'TEMP_CHAT_JOIN_FAILED',
+  UploadQuotaExceeded: 'TEMP_CHAT_UPLOAD_QUOTA_EXCEEDED',
 } as const;
 
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
@@ -308,6 +309,7 @@ export const ChatErrorCode = {
   InvalidPayload: 'CHAT_INVALID_PAYLOAD',
   RateLimited: 'CHAT_RATE_LIMITED',
   ConversationMuted: 'CHAT_CONVERSATION_MUTED',
+  StrangerNotAllowed: 'CHAT_STRANGER_NOT_ALLOWED',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
