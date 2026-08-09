@@ -290,7 +290,16 @@ REST。避免本地库无限膨胀。
 
 **验收**：飞行模式冷启动能看到会话列表和最近历史；搜索离线可用；红点冷启动即准。
 
-### 2.3 G-02 + G-09 + S-04：撤回与真引用（强耦合，必须一起）
+### 2.3 G-02 + G-09 + S-04：撤回与真引用（强耦合，必须一起）【已落地】
+
+> **落地记录（2026-08-09，`feat/chat-remediation` 双仓）**：撤回走 `chat:revoke`
+> 事件（ack + 会话房广播 `{conversationId, messageId, revokedBy}`），发送者 2 分钟
+> 窗、圈主/管理员无窗口；撤回仍占 height，content 落库清空，媒体对象按 key 尽力
+> 删除（UploadService 首条删除路径，storage-reclamation 哨兵已更新）。真引用为
+> `replyTo{id,height,senderNickname,type,preview,revoked}` 快照（getHistory 与发送
+> ack/广播一次 IN 批量附带），FE 引用块可点击定位（内存窗口内；更早历史待批 1
+> 本地库后升级「拉一页再滚」）；原消息撤回 → 引用块同步「消息已撤回」。
+> 错误码 3 枚 + 词条 ×5 语种齐。原方案如下，备查：
 
 **撤回（G-02）**：
 - `ChatMessage` 复用现有 `deleted Boolean`，加 `revokedAt DateTime?` + `revokedBy String?`
@@ -477,7 +486,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | **0 ✅** | G-12 + S-02 主动触发（已落地 `feat/chat-remediation`） | **权限漏洞**；改动最小 | 否 |
 | **0.5 ✅** | G-13 重连对账（内存版 + afterHeight 接口）+ G-15 多端未读 + G-18 轻方案（已落地，同分支） | **消息静默丢失**用户可感知；三件都是纯接线 | 否 |
 | **1** | G-01 SQLite（含 outbox/重发）+ G-03 FTS5 + G-10 红点 + G-13 升级 sync_state 对账 | 用户每次开 App 都感知；FTS5 是 SQLite 的附带品 | **是** |
-| **2** | G-02 撤回 + G-09/S-04 真引用 | 强耦合，必须一起 | 否 |
+| **2 ✅** | G-02 撤回 + G-09/S-04 真引用（已落地，同分支） | 强耦合，必须一起 | 否 |
 | **3** | S-01 焚毁语义 + S-02 事件面 + G-14 清空/删除 | 语义正确性 | 否 |
 | **4** | G-05 发号 + G-06 热路径 + G-04 adapter | 规模，当前量级尚未触顶 | 否 |
 | **5** | G-07 送达 / reaction / 编辑 + G-18 推送侧 badge | 增量能力 | 否 |
