@@ -4,8 +4,6 @@ import { UserController } from './user.controller';
 import { UserService } from './user.service';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
-import { OpenimModule } from 'src/openim/openim.module';
-import { UserProfileSyncOutboxProcessor } from './user-profile-sync-outbox.processor';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 
 @Global()
@@ -14,11 +12,10 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     ConfigModule,
     RealtimeModule,
     PrivacySettingsModule,
-    OpenimModule,
     AvatarFrameModule,
   ],
   controllers: [UserController],
-  providers: [UserService, UserProfileSyncOutboxProcessor],
+  providers: [UserService],
   exports: [UserService],
 })
 export class UserModule {}

@@ -149,50 +149,39 @@ describe('dashboard metric providers', () => {
     });
   });
 
-  it('summarizes friend and group outboxes', async () => {
-    const outbox = {
-      getHealth: jest.fn().mockResolvedValue({
-        friend: {
-          pending: 2,
-          processing: 1,
-          failed: 3,
-          oldestPendingAt: new Date('2026-07-29T11:00:00.000Z'),
-          oldestFailedAt: null,
-        },
-        group: {
-          pending: 4,
-          processing: 0,
-          failed: 5,
-          oldestPendingAt: new Date('2026-07-29T10:00:00.000Z'),
-          oldestFailedAt: new Date('2026-07-29T09:00:00.000Z'),
-        },
-      }),
-    };
+  it('reports service health with zeroed legacy outbox fields', async () => {
     const prisma = { $queryRaw: jest.fn().mockResolvedValue([{ ok: 1 }]) };
     const redis = { ping: jest.fn().mockResolvedValue(true) };
-    const openim = {
-      listGroups: jest.fn().mockResolvedValue({ total: 0, groups: [] }),
-    };
 
     await expect(
-      new DashboardSystemMetrics(
-        outbox as never,
-        prisma as never,
-        redis as never,
-        openim as never,
-      ).getMetrics(),
+      new DashboardSystemMetrics(prisma as never, redis as never).getMetrics(),
     ).resolves.toMatchObject({
-      pending: 6,
-      processing: 1,
-      failed: 8,
-      oldestPendingAt: '2026-07-29T10:00:00.000Z',
-      oldestFailedAt: '2026-07-29T09:00:00.000Z',
+      // OpenIM 同步 outbox 已拆除:字段保形置零,admin_web 面板无需同步升级。
+      pending: 0,
+      processing: 0,
+      failed: 0,
+      oldestPendingAt: null,
+      oldestFailedAt: null,
+      friend: null,
+      group: null,
       services: {
         api: 'healthy',
         database: 'healthy',
         redis: 'healthy',
-        openim: 'healthy',
       },
+    });
+  });
+
+  it('reports database down when the probe rejects', async () => {
+    const prisma = {
+      $queryRaw: jest.fn().mockRejectedValue(new Error('db down')),
+    };
+    const redis = { ping: jest.fn().mockResolvedValue(true) };
+
+    await expect(
+      new DashboardSystemMetrics(prisma as never, redis as never).getMetrics(),
+    ).resolves.toMatchObject({
+      services: { api: 'healthy', database: 'down', redis: 'healthy' },
     });
   });
 });

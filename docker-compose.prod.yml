@@ -2,7 +2,7 @@
 #
 #   postgres + redis + minio(+ 建桶)+ 一次性 migrate + circle_be
 #
-# OpenIM(阶段5)用官方 openim-docker 单独编排;LiveKit(阶段6)用 LiveKit Cloud。
+# 聊天走自研 chat 网关(随 circle_be 同进程,/chat-ws);LiveKit(阶段6)用 LiveKit Cloud。
 # 完整步骤见 DEPLOY.md。
 #
 # compose 变量插值从同目录 .env 读(DB_PASSWORD / REDIS_PASSWORD / MinIO 密钥)。
@@ -160,8 +160,6 @@ services:
       minio-init: { condition: service_completed_successfully }
     environment:
       NODE_ENV: production
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro
@@ -213,17 +211,10 @@ services:
       # required: false 的理由同 admin_web —— 在役颜色可能是 circle_be_green。
       circle_be: { condition: service_healthy, required: false }
       admin_web: { condition: service_started, required: false }
-    # OpenIM 用官方 openim-docker 独立编排，不在本 compose 的网络里，网关跑在宿主机。
-    # 容器里的 127.0.0.1 是容器自己 —— 要回宿主机只能走 host-gateway。
-    # （OpenIM 若挪到别的主机，用 OPENIM_WS_UPSTREAM/OPENIM_API_UPSTREAM 覆盖成其内网地址。）
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
     environment:
       API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?set ADMIN_DOMAIN in .env}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
-      OPENIM_WS_UPSTREAM: ${OPENIM_WS_UPSTREAM:-host.docker.internal:10001}
-      OPENIM_API_UPSTREAM: ${OPENIM_API_UPSTREAM:-host.docker.internal:10002}
     ports:
       - '80:80'
       - '443:443'

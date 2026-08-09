@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
+# 从仓库文件读,不要写死。release-deploy.sh 强制要求
+# RELEASE_SCHEMA_COMPATIBILITY == 签出树里的值,写死的话每次抬高兼容级别
+# (不可逆迁移都要抬)整个套件都会红,而失败原因跟被测行为毫无关系。
+REPO_SCHEMA_COMPATIBILITY="$(cat "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY")"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REAL_MV="$(command -v mv)"
 
@@ -186,7 +190,7 @@ run_release() {
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
-    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-1}" \
+    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-$REPO_SCHEMA_COMPATIBILITY}" \
     SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
@@ -413,14 +417,14 @@ test_release_cannot_understate_checked_out_schema_compatibility() {
   new_case
   RELEASE_SCHEMA_COMPATIBILITY=0
   ! run_release || return 1
-  grep -q 'does not match checked-out schema compatibility 1' "$CASE_DIR/release.log" &&
+  grep -q "does not match checked-out schema compatibility $REPO_SCHEMA_COMPATIBILITY" "$CASE_DIR/release.log" &&
     [ ! -s "$TEST_COMMAND_LOG" ]
 }
 
 test_irreversible_release_records_minimum_schema_compatibility() {
   prepare_irreversible_case
   run_release || return 1
-  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "1" ]
+  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "$REPO_SCHEMA_COMPATIBILITY" ]
 }
 
 test_irreversible_migration_failure_restores_old_binary() {

@@ -1,5 +1,7 @@
 import { UploadErrorCode } from 'src/common/app-error-codes';
+import { CHAT_ONLY_UPLOAD_TYPES } from './dto/presign.dto';
 import {
+  BadRequestException,
   Injectable,
   Logger,
   OnModuleInit,
@@ -55,9 +57,11 @@ export function buildPublicReadBucketPolicy(bucket: string) {
     'posts',
     // 'notes' 已移除：私有笔记(available:false)的媒体不再匿名可读，改由 note.service
     // 读取时发短时签名 URL(presign-on-read)。历史直链 url 仍在库里但不再被读取路径返回。
-    // 'chat' 保留：key 是不可枚举 UUID，且图 URL 固化在 OpenIM 消息体、无法迁移历史，
-    // 接受 key-secrecy 现状(单独决策，见 note-media 修复说明)。
-    'chat',
+    // 'chat' 已移除：原先保留的唯一理由是「图 URL 固化在 OpenIM 消息体、无法迁移历史」，
+    // 而自研聊天栈落地后 OpenIM 已出清，ChatMessage 存的是 key 而不是 URL，读取一律走
+    // ChatMediaService 的 presign-on-read。留着 chat/* 匿名可读的话，发送侧的归属校验
+    // (chat/{senderId}/ 命名空间)和读取侧的短时签名就全是摆设 —— 拿到过 key 的人可以
+    // 无限期直连对象存储，绕过所有会话成员校验。
     'friends',
     'uploads',
   ];
@@ -264,9 +268,24 @@ export class UploadService implements OnModuleInit {
       );
     }
 
+    // 语音/文件只对 chat 目录开放。DTO 的白名单是全局的,只放宽它等于让头像、
+    // 封面、圈子帖目录也能收 pdf/zip —— 目录收口必须在这里再做一次。
+    if (CHAT_ONLY_UPLOAD_TYPES.includes(contentType) && folder !== 'chat') {
+      throw new BadRequestException({
+        message: `${contentType} uploads are only allowed in chat`,
+        errorCode: UploadErrorCode.InvalidContentType,
+      });
+    }
+
+    // 按类分档:视频 100 MiB 照旧;语音是几十秒的片段,给 20 MiB 已经很宽;
+    // 文件给 50 MiB —— 比视频紧,避免 chat 目录变成通用网盘。
     const maxBytes = contentType.startsWith('video/')
       ? 100 * 1024 * 1024
-      : 20 * 1024 * 1024;
+      : contentType.startsWith('audio/')
+        ? 20 * 1024 * 1024
+        : CHAT_ONLY_UPLOAD_TYPES.includes(contentType)
+          ? 50 * 1024 * 1024
+          : 20 * 1024 * 1024;
     if (
       !Number.isSafeInteger(sizeBytes) ||
       sizeBytes < 1 ||

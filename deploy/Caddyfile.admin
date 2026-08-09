@@ -12,13 +12,9 @@
 # 直接映射到本机、前面没有 CDN/代理，所以 {remote_host} 就是真实客户端 IP；哪天
 # 挪到 Cloudflare 之类后面，必须同时配 trusted_proxies，否则所有人会共用一个桶。
 #
-# ⚠️ 大前提：这些限制只有在 OpenIM 的 10001/10002 收口到回环之后才有意义 ——
-# 在那之前客户端直连网关、整个 Caddy 被绕过。收口见
-# deploy/openim-harden.sh --collapse-public-ports。
-#
-# ⚠️ 不要给下面的站点开 access log（`log` 指令）。OpenIM 协议把 IM token 放在 WS 握手
-#    URL 的 query 里（msggateway 只从 query 读 token，没有 header 通道），access log 会把
-#    可用的 token 明文写进磁盘。若确需排障日志，务必先过滤掉 query。
+# ⚠️ 不要给下面的站点开 access log（`log` 指令）。历史上曾有把凭证放进 WS 握手
+#    URL query 的通道经此反代;自研栈 token 走 socket.io auth payload 不落 URL，
+#    但媒体预签名 URL 仍带签名 query —— 开日志前务必先过滤 query。
 
 {$API_DOMAIN} {
 	@metrics path /metrics /metrics/*
@@ -42,7 +38,7 @@
 	# @Throttle）一条都作用不到。
 	# 也就是说：任何人拿到一张头像 URL（在 app 里随手可见），就能无账号、无令牌地
 	# 无限次拉取。攻击成本是一次上传，代价是运营方的出网带宽账单，同时和 Postgres、
-	# Redis、OpenIM 网关抢同一台机器。
+	# Redis、MinIO 抢同一台机器。
 	# 额度给得比接口宽：一屏朋友圈就可能几十张图，但必须封顶。
 	handle /circle/* {
 		rate_limit {
@@ -55,46 +51,8 @@
 		reverse_proxy minio:9000
 	}
 
-	# OpenIM 消息网关 WebSocket（默认 :10001）。必须经此 TLS 反代：token 在握手 URL 里，
-	# 明文 ws:// 等于把它裸奔在公网上。reverse_proxy 自动处理 WebSocket 升级。
-	# 后端设 OPENIM_IM_WS_URL=wss://<API_DOMAIN>/openim-ws（与 temp-chat-web 同一路径约定）。
-	@openimWs path /openim-ws /openim-ws/*
-	handle @openimWs {
-		# 这一条挡的是**连接洪泛**，不是消息洪泛：消息在已建立的 WS 里跑，反向代理
-		# 根本看不见，限流对它无能为力（消息侧的额度要在 OpenIM 自身配）。
-		#
-		# 所以额度要往宽了给。按 IP 计数时，一个校园/公司 NAT 后面可能有几十上百个
-		# 真实用户，服务端重启后他们会同时重连；卡太死的直接后果是「一批人完全连不上
-		# 聊天」，看起来和全站故障没区别 —— 而收益仅仅是限制了连接频率。
-		# 120 次/分钟（≈2/秒持续）既容得下 NAT 群体的重连风暴，也仍然能把脚本化的
-		# 无限重连循环摁住。
-		rate_limit {
-			zone openim_ws {
-				key {remote_host}
-				events 120
-				window 1m
-			}
-		}
-		uri strip_prefix /openim-ws
-		reverse_proxy {$OPENIM_WS_UPSTREAM:host.docker.internal:10001}
-	}
-
-	# OpenIM API（默认 :10002）。后端设 OPENIM_IM_API_URL=https://<API_DOMAIN>/openim-api。
-	@openimApi path /openim-api /openim-api/*
-	handle @openimApi {
-		# 发消息走的是上面的 WS，不是这条；这条主要是拉会话列表 / 历史消息。
-		# 200 次/分钟对正常使用绰绰有余（冷启动同步也就几十次）。
-		rate_limit {
-			zone openim_api {
-				key {remote_host}
-				events 200
-				window 1m
-			}
-		}
-		uri strip_prefix /openim-api
-		reverse_proxy {$OPENIM_API_UPSTREAM:host.docker.internal:10002}
-	}
-
+	# 自研 chat 网关(socket.io,/chat-ws)与 /realtime 原生 WS 都挂在 circle_be
+	# 同一 HTTP 端口,由下面的 catch-all 反代;reverse_proxy 自动处理 WS 升级。
 	handle {
 		# 业务 API 的兜底闸。circle_be 自己有每 IP 300 次/分钟的全局限流
 		# （src/setup.ts），这里放宽到 600 只做 DoS 兜底：真正的业务额度由后端

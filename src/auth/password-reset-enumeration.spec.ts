@@ -18,7 +18,6 @@ describe('requestPasswordReset anti-enumeration (PR #120 review)', () => {
       {}, // prisma —— 本路径不触达
       {}, // refreshTokenService
       {}, // jwt
-      {}, // openim
       {}, // iconService
       { requestCode },
       {}, // configService（#117 合并后存在；此前多传无害）

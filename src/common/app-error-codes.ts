@@ -165,6 +165,7 @@ export const TempChatErrorCode = {
   Full: 'TEMP_CHAT_FULL',
   CreatorOnly: 'TEMP_CHAT_CREATOR_ONLY',
   JoinFailed: 'TEMP_CHAT_JOIN_FAILED',
+  UploadQuotaExceeded: 'TEMP_CHAT_UPLOAD_QUOTA_EXCEEDED',
 } as const;
 
 // 圈子广场:发帖 / 报名 / 合作认可(战绩)。帖子不存在统一用 PostNotFound;
@@ -283,6 +284,8 @@ export const CallErrorCode = {
 // 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)
 export const UploadErrorCode = {
   PayloadTooLarge: 'UPLOAD_PAYLOAD_TOO_LARGE',
+  // 语音/文件类型只对 chat 目录开放(见 UploadService.presign 的目录收口)。
+  InvalidContentType: 'UPLOAD_INVALID_CONTENT_TYPE',
 } as const;
 
 // 会话分组(本地消息分组):同名分组已存在 / 分组不存在。
@@ -294,6 +297,21 @@ export const ConversationGroupErrorCode = {
 // 会话历史(按日期查看聊天记录):会话不存在。
 export const ChatHistoryErrorCode = {
   ConversationNotFound: 'CHAT_HISTORY_CONVERSATION_NOT_FOUND',
+} as const;
+
+// 自研聊天(src/chat):REST 与 socket ack 共用同一批码。
+// (注:前端 serverErrors 词条随 FE 接线批次补齐。)
+export const ChatErrorCode = {
+  ConversationNotFound: 'CHAT_CONVERSATION_NOT_FOUND',
+  NotMember: 'CHAT_NOT_MEMBER',
+  PeerNotFound: 'CHAT_PEER_NOT_FOUND',
+  SelfConversation: 'CHAT_SELF_CONVERSATION',
+  Blocked: 'CHAT_BLOCKED',
+  SensitiveWord: 'CHAT_SENSITIVE_WORD_BLOCKED',
+  InvalidPayload: 'CHAT_INVALID_PAYLOAD',
+  RateLimited: 'CHAT_RATE_LIMITED',
+  ConversationMuted: 'CHAT_CONVERSATION_MUTED',
+  StrangerNotAllowed: 'CHAT_STRANGER_NOT_ALLOWED',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
@@ -364,6 +382,7 @@ export type AppErrorCode =
   | (typeof CallErrorCode)[keyof typeof CallErrorCode]
   | (typeof ConversationGroupErrorCode)[keyof typeof ConversationGroupErrorCode]
   | (typeof ChatHistoryErrorCode)[keyof typeof ChatHistoryErrorCode]
+  | (typeof ChatErrorCode)[keyof typeof ChatErrorCode]
   | (typeof UploadErrorCode)[keyof typeof UploadErrorCode]
   | (typeof CollectionErrorCode)[keyof typeof CollectionErrorCode]
   | (typeof IconErrorCode)[keyof typeof IconErrorCode]
@@ -391,6 +410,7 @@ export const APP_ERROR_CODE_GROUPS = [
   UploadErrorCode,
   ConversationGroupErrorCode,
   ChatHistoryErrorCode,
+  ChatErrorCode,
   CollectionErrorCode,
   IconErrorCode,
   LikeErrorCode,

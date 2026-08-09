@@ -11,7 +11,8 @@ import { CallService } from './call.service';
 describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
   const now = new Date('2026-07-21T03:00:00.000Z');
   let prisma: any;
-  let openim: any;
+  let chatService: any;
+  let chatMessages: any;
   let livekit: any;
   let realtime: any;
   let service: CallService;
@@ -24,8 +25,9 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       $queryRaw: jest.fn().mockResolvedValue([]),
       friend: { findFirst: jest.fn() },
       block: { findFirst: jest.fn() },
-      // 群留痕的 conversationID→OpenIM 群 id 解析（round 3）；null = 非 Circle 行
       circle: { findFirst: jest.fn().mockResolvedValue(null) },
+      // 群留痕的 conversationID→chat 会话解析(先按 id、再按 circleID);null = 无会话
+      chatConversation: { findUnique: jest.fn().mockResolvedValue(null) },
       user: { findMany: jest.fn() },
       callSession: {
         create: jest.fn(),
@@ -43,9 +45,14 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
         updateMany: jest.fn(),
       },
     };
-    openim = {
-      isGroupMember: jest.fn(),
-      sendCallRecordMessage: jest.fn().mockResolvedValue(undefined),
+    chatService = {
+      // 通话留痕走结算专用解析:通话已经发生过,拉黑不该让留痕永久缺失。
+      ensureDirectConversationForSettlement: jest
+        .fn()
+        .mockResolvedValue('conv-direct-1'),
+    };
+    chatMessages = {
+      insertServerMessage: jest.fn().mockResolvedValue(undefined),
     };
     livekit = {
       createRoom: jest.fn().mockResolvedValue(undefined),
@@ -72,7 +79,14 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       get: jest.fn((key: string): unknown => configValues[key]),
     } as unknown as ConfigService;
 
-    service = new CallService(prisma, openim, livekit, realtime, config);
+    service = new CallService(
+      prisma,
+      chatService,
+      chatMessages,
+      livekit,
+      realtime,
+      config,
+    );
   });
 
   afterEach(() => jest.useRealTimers());
@@ -156,8 +170,8 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
 
     const createArgs = prisma.callSession.create.mock.calls[0][0];
     expect(createArgs.data.sessionType).toBe(1);
-    // OpenIM 单聊会话规约：si_ + 双方去连字符 id 升序
-    expect(createArgs.data.conversationID).toMatch(/^si_user1_user2$/);
+    // 自研栈 1:1 会话规约:direct: + 双方 id 码点升序
+    expect(createArgs.data.conversationID).toBe('direct:user-1:user-2');
     expect(result.call.sessionType).toBe('single');
     expect(realtime.broadcastCallInvite).toHaveBeenCalledWith(
       'user-2',
@@ -250,17 +264,21 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+    expect(
+      chatService.ensureDirectConversationForSettlement,
+    ).toHaveBeenCalledWith('user-1', 'user-2');
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-direct-1',
       expect.objectContaining({
-        sendID: 'user-1',
-        target: { kind: 'single', recvID: 'user-2' },
-        data: expect.objectContaining({
-          type: 'call_record',
+        senderID: 'user-1',
+        type: 'call-record',
+        clientMessageId: 'call_record_call-1',
+        push: false,
+        content: expect.objectContaining({
           endReason: CallEndReason.CANCELED,
           sessionType: 'single',
           durationSeconds: null,
         }),
-        offlinePush: null,
       }),
     );
   });
@@ -298,12 +316,13 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-direct-1',
       expect.objectContaining({
-        data: expect.objectContaining({
+        push: true,
+        content: expect.objectContaining({
           endReason: CallEndReason.NO_ANSWER,
         }),
-        offlinePush: expect.objectContaining({ desc: '语音通话未接听' }),
       }),
     );
   });
@@ -389,13 +408,14 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-direct-1',
       expect.objectContaining({
-        data: expect.objectContaining({
+        // 刚拒接的人不该再收到「未接来电」离线推送
+        push: false,
+        content: expect.objectContaining({
           endReason: CallEndReason.NO_ANSWER,
         }),
-        // 刚拒接的人不该再收到「未接来电」离线推送
-        offlinePush: null,
       }),
     );
   });
@@ -490,7 +510,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
 
     expect(a.status).toBe(CallStatus.CANCELED);
     expect(b.status).toBe(CallStatus.CANCELED);
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledTimes(1);
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledTimes(1);
   });
 
   it('ends an ACTIVE 1:1 call for BOTH sides on the first leave', async () => {
@@ -548,9 +568,10 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     );
     expect(livekit.deleteRoom).toHaveBeenCalledWith('room-1');
     expect(realtime.broadcastCallEnded).toHaveBeenCalledTimes(2);
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-direct-1',
       expect.objectContaining({
-        data: expect.objectContaining({
+        content: expect.objectContaining({
           endReason: CallEndReason.ALL_LEFT,
           durationSeconds: 65,
         }),
@@ -619,23 +640,26 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     prisma.callSession.findMany.mockResolvedValue([groupCall]);
     prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatConversation.findUnique.mockResolvedValueOnce({
+      id: 'conv-g1',
+    });
 
     await service.sweepExpiredRingingCalls();
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-g1',
       expect.objectContaining({
-        target: { kind: 'group', groupID: 'group-1' },
         // 重试幂等键：固定 call_record_<id>
-        clientMsgID: 'call_record_gcall-1',
-        // 群聊未接绝不 offlinePush（会推给全群非被邀成员）
-        offlinePush: null,
+        clientMessageId: 'call_record_gcall-1',
+        // 群聊未接绝不离线推送（会推给全群非被邀成员）
+        push: false,
       }),
     );
   });
 
-  it('resolves a Circle.id conversation to the real OpenIM group for records (round 3)', async () => {
+  it('resolves a Circle.id conversation to the chat conversation for records (round 3)', async () => {
     const circleCall = {
       id: 'gcall-2',
       conversationID: 'circle-uuid-1',
@@ -663,20 +687,19 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     prisma.callSession.findMany.mockResolvedValue([circleCall]);
     prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
-    // conversationID 是 Circle.id：留痕必须发到 circle.groupID 对应的 openim 群
-    prisma.circle.findFirst.mockResolvedValue({
-      groupID: 'sg_real-openim-group',
-    });
+    // conversationID 是 Circle.id：按 id 查不到会话,回退按 circleID 解析
+    prisma.chatConversation.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'conv-circle-1' });
 
     await service.sweepExpiredRingingCalls();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        target: { kind: 'group', groupID: 'real-openim-group' },
-      }),
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-circle-1',
+      expect.anything(),
     );
   });
 
@@ -710,8 +733,8 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       .mockResolvedValue(canceled);
     prisma.callSession.updateMany.mockResolvedValue({ count: 1 });
     prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
-    openim.sendCallRecordMessage
-      .mockRejectedValueOnce(new Error('admin token expired'))
+    chatMessages.insertServerMessage
+      .mockRejectedValueOnce(new Error('db transient error'))
       .mockResolvedValueOnce(undefined);
 
     await service.cancelCall('user-1', 'call-1');
@@ -720,6 +743,6 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     await Promise.resolve();
     await jest.advanceTimersByTimeAsync(1_000);
 
-    expect(openim.sendCallRecordMessage).toHaveBeenCalledTimes(2);
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledTimes(2);
   });
 });

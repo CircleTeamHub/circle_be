@@ -15,8 +15,6 @@ import { MAILER } from './mailer/mailer.interface';
 import { ConsoleMailer } from './mailer/console.mailer';
 import { UnconfiguredMailer } from './mailer/unconfigured.mailer';
 import { SmtpMailer } from './mailer/smtp.mailer';
-import { OpenimModule } from 'src/openim/openim.module';
-import { ImTokenThrottlerGuard } from './im-token-throttler.guard';
 import { FancyNumberModule } from 'src/fancy-number/fancy-number.module';
 import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 
@@ -38,7 +36,6 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
       },
       inject: [ConfigService],
     }),
-    OpenimModule,
     FancyNumberModule,
     AvatarFrameModule,
   ],
@@ -74,7 +71,6 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     },
     JwtStrategy,
     CaslAbilityService,
-    ImTokenThrottlerGuard,
   ],
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when
