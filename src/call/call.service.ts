@@ -931,6 +931,21 @@ export class CallService {
 
     // 自研栈:非 Circle 形态的 conversationID 一律按会话座位校验
     // (圈子群聊/临时房统一语义:在座才可参与群呼)。
+    //
+    // 但必须先把单聊会话挡在门外。座位校验对 DIRECT 会话同样成立(双方都在座),
+    // 于是拿一个单聊 conversationID 打群呼端点就能整个绕过 assertDirectCallee ——
+    // 好友关系和双向拉黑都不再校验,被拉黑的人可以照样把对方呼起来。
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationID },
+      select: { type: true },
+    });
+    if (conversation?.type === 'DIRECT') {
+      throw new BadRequestException({
+        message: 'CALL_INVITEE_INVALID',
+        errorCode: CallErrorCode.InviteeInvalid,
+      });
+    }
+
     const seats = await this.prisma.chatMember.findMany({
       where: {
         conversationID,

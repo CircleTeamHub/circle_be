@@ -314,16 +314,34 @@ export class ChatService {
 
     const myConversationIds = await this.listConversationIds(userId);
     if (myConversationIds.length === 0) return [...allowed];
-    const shared = await this.prisma.chatMember.findMany({
-      where: {
-        conversationID: { in: myConversationIds },
-        userID: { in: [...wanted] },
-        leftAt: null,
-      },
-      select: { userID: true },
-      distinct: ['userID'],
-    });
-    for (const row of shared) allowed.add(row.userID);
+    const [shared, blocks] = await Promise.all([
+      this.prisma.chatMember.findMany({
+        where: {
+          conversationID: { in: myConversationIds },
+          userID: { in: [...wanted] },
+          leftAt: null,
+        },
+        select: { userID: true },
+        distinct: ['userID'],
+      }),
+      // 拉黑不动 ChatMember,座位照旧留着 —— 只按共享会话过滤的话,拉黑双方
+      // 仍能互相看到在线状态。双向都排除:被拉黑方能看到对方在线同样是泄漏。
+      this.prisma.block.findMany({
+        where: {
+          OR: [
+            { blockerID: userId, blockedID: { in: [...wanted] } },
+            { blockerID: { in: [...wanted] }, blockedID: userId },
+          ],
+        },
+        select: { blockerID: true, blockedID: true },
+      }),
+    ]);
+    const blocked = new Set(
+      blocks.map((b) => (b.blockerID === userId ? b.blockedID : b.blockerID)),
+    );
+    for (const row of shared) {
+      if (!blocked.has(row.userID)) allowed.add(row.userID);
+    }
     return [...allowed];
   }
 
@@ -341,9 +359,13 @@ export class ChatService {
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null, hiddenAt: null },
       include: { conversation: true },
-      orderBy: {
-        conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } },
-      },
+      // pinned 必须排在 take 之前参与排序。只按 lastMessageAt 取前 N 的话,
+      // 置顶只是把已经取回来的这一页重排 —— 一个很久没说话的置顶会话会掉出
+      // 前 N,在客户端彻底消失,而置顶的语义恰恰是「不管多久都要留在顶上」。
+      orderBy: [
+        { pinned: 'desc' },
+        { conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } } },
+      ],
       take: CONVERSATION_LIST_MAX,
     });
     if (memberships.length === 0) return [];

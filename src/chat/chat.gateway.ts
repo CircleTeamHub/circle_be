@@ -325,16 +325,29 @@ export class ChatGateway {
     // 拿任意 UUID(API 里到处都在返回)持续轮询别人的在线状态 —— 陌生人、
     // 被拉黑的人都能被长期追踪。上下线广播本身就只发到会话房,查询也对齐。
     const userId = socket.data.userId as string;
-    const visible = await this.chatService.filterVisiblePresenceTargets(
-      userId,
-      requested,
-    );
-    const entries = await Promise.all(
-      [...visible].map(
-        async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
-      ),
-    );
-    ack(Object.fromEntries(entries));
+    // 依赖失败必须收在这里:监听侧是 void this.handlePresenceQuery(...),抛出去
+    // 只会变成一条 unhandled rejection,而客户端的 ack 永远等不到 —— 界面上就是
+    // 在线状态一直转圈。handleSend / handleRead 都已各自兜住,presence 是漏网的那个。
+    try {
+      const visible = await this.chatService.filterVisiblePresenceTargets(
+        userId,
+        requested,
+      );
+      const entries = await Promise.all(
+        [...visible].map(
+          async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
+        ),
+      );
+      ack(Object.fromEntries(entries));
+    } catch (error) {
+      // 只记会话与用户 id,不带 requested 列表(那是一串他人 UUID)。
+      this.logger.warn(
+        `presence query failed user=${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      ack({});
+    }
   }
 
   private async handleSend(

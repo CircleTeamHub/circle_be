@@ -31,7 +31,7 @@ describe('ChatService', () => {
     user: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     circle: { findMany: jest.fn() },
-    block: { findFirst: jest.fn() },
+    block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
@@ -394,6 +394,30 @@ describe('ChatService', () => {
       await expect(
         service.filterVisiblePresenceTargets('u1', ['u2', 'stranger']),
       ).resolves.toEqual(['u2']);
+    });
+
+    // 拉黑不动 ChatMember,座位照旧留着 —— 只按共享会话过滤的话,拉黑双方
+    // 仍能互相看到在线状态,等于把「我拉黑了你」变成一个可长期追踪的信道。
+    it('hides peers on either side of a block even when a seat is shared', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([{ conversationID: 'conv-1' }])
+        .mockResolvedValueOnce([
+          { userID: 'blocked-by-me' },
+          { userID: 'blocked-me' },
+          { userID: 'ok' },
+        ]);
+      prisma.block.findMany.mockResolvedValue([
+        { blockerID: 'u1', blockedID: 'blocked-by-me' },
+        { blockerID: 'blocked-me', blockedID: 'u1' },
+      ]);
+
+      await expect(
+        service.filterVisiblePresenceTargets('u1', [
+          'blocked-by-me',
+          'blocked-me',
+          'ok',
+        ]),
+      ).resolves.toEqual(['ok']);
     });
 
     it('always allows the requester itself and short-circuits', async () => {

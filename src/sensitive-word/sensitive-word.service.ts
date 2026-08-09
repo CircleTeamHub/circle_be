@@ -8,6 +8,16 @@ import {
 
 /** 词表缓存刷新周期。到期后由下一次 check 触发后台刷新，不阻塞判定。 */
 const REFRESH_TTL_MS = 60_000;
+/**
+ * 刷新失败后的退避区间。
+ *
+ * 失败时 loadedAt 不会前进,于是「已过期」这个条件在下一条消息上依然成立 ——
+ * 没有退避的话,数据库一抖就变成每条消息一次全表 findMany,把本来只是慢的
+ * 依赖直接压垮(check 在发消息热路径上,每条消息都会走到)。
+ * 指数退避,上限 5 分钟:词表更新本就允许分钟级收敛,不必抢着重试。
+ */
+const RELOAD_BACKOFF_BASE_MS = 5_000;
+const RELOAD_BACKOFF_MAX_MS = 5 * 60_000;
 
 export interface SensitiveWordVerdict {
   blocked: boolean;
@@ -29,6 +39,9 @@ export class SensitiveWordService implements OnModuleInit {
   private matcher: SensitiveWordMatcher | null = null;
   private loadedAt = 0;
   private reloadPromise: Promise<void> | null = null;
+  /** 退避截止时间;连续失败次数只用来算下一次的间隔。 */
+  private nextRetryAt = 0;
+  private consecutiveFailures = 0;
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -45,7 +58,8 @@ export class SensitiveWordService implements OnModuleInit {
 
   /** 同步判定文本是否包含敏感词。缓存过期时踢一次后台刷新。 */
   check(text: string): SensitiveWordVerdict {
-    if (Date.now() - this.loadedAt >= REFRESH_TTL_MS) {
+    const now = Date.now();
+    if (now - this.loadedAt >= REFRESH_TTL_MS && now >= this.nextRetryAt) {
       this.scheduleReload();
     }
     if (!this.matcher) return { blocked: false };
@@ -112,8 +126,16 @@ export class SensitiveWordService implements OnModuleInit {
     if (this.reloadPromise) return;
     this.reloadPromise = this.reload()
       .catch((error) => {
-        // fail-open：刷新失败保留旧匹配器继续用。
-        this.logger.error(`敏感词词表刷新失败: ${String(error)}`);
+        // fail-open：刷新失败保留旧匹配器继续用，但要退避后再试。
+        this.consecutiveFailures += 1;
+        const delay = Math.min(
+          RELOAD_BACKOFF_BASE_MS * 2 ** (this.consecutiveFailures - 1),
+          RELOAD_BACKOFF_MAX_MS,
+        );
+        this.nextRetryAt = Date.now() + delay;
+        this.logger.error(
+          `敏感词词表刷新失败(第 ${this.consecutiveFailures} 次)，${delay}ms 后重试: ${String(error)}`,
+        );
       })
       .finally(() => {
         this.reloadPromise = null;
@@ -126,6 +148,8 @@ export class SensitiveWordService implements OnModuleInit {
     });
     this.matcher = buildSensitiveWordMatcher(rows.map((r) => r.word));
     this.loadedAt = Date.now();
+    this.consecutiveFailures = 0;
+    this.nextRetryAt = 0;
     this.logger.log(`敏感词词表已加载：${this.matcher.size} 条`);
   }
 }
