@@ -116,6 +116,32 @@ export class GroupService {
         actorId,
         normalizedTargetUserID,
       ]);
+      // 事务内复查圈子是否已被停用,并对 Circle 行加锁。
+      //
+      // 上面那次 deleted 判定是在事务外做的:管理员在那之后按下停用,本事务
+      // 照样会提权、写审计、压 OpenIM 同步 outbox,最后给一个已停用的群返回成功。
+      //
+      // 只是重读一遍不够。事务是 SERIALIZABLE,但 SSI 要形成 dangerous structure
+      // 才会中止,单独一条 rw 依赖(我读 Circle、别人写 Circle)并不必然触发 ——
+      // 靠「读到就一定被序列化」是想当然。FOR UPDATE 拿真实行锁才有确定语义:
+      // 停用先提交 → 这里报 40001(P2034),runSerializableTransaction 重试后
+      // 读到 deleted=true 正常拒绝;本事务先拿到锁 → 停用阻塞到提交后再生效,
+      // 此时角色变更确实发生在停用之前,放行是对的。
+      //
+      // 位置必须在 memberLock 之后:removeGroupMember / leaveGroup 都是「先成员
+      // advisory 锁、后 Circle 行锁」(circle.update 扣 memberCount),反过来加就
+      // 和它们构成 ABBA 死锁。停用路径只写 Circle、不取成员锁,不参与成环。
+      const [lockedCircle] = await tx.$queryRaw<Array<{ deleted: boolean }>>`
+        SELECT "deleted" FROM "Circle" WHERE "id" = ${circle.id} FOR UPDATE
+      `;
+      if (!lockedCircle || lockedCircle.deleted) {
+        throw new ForbiddenException({
+          message:
+            'Administrator roles cannot be changed for an inactive group',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+
       const [actor, target] = await Promise.all([
         tx.circleMember.findUnique({
           where: {
