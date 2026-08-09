@@ -56,6 +56,7 @@ jobs:
           bash test/release-deploy.spec.sh
           bash test/release-launcher.spec.sh
           bash test/sync-metrics-token.spec.sh
+          node --test test/prometheus-alerts.spec.mjs
 
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
