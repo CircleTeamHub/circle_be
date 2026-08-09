@@ -58,14 +58,17 @@ export class GiftCardOutboxProcessor {
       });
       if (claimed.count === 0) continue;
       try {
-        const conversation =
-          await this.chatService.getOrCreateDirectConversation(
+        // 走结算专用解析,不过拉黑/陌生人消息那两道闸:那是给用户主动发消息
+        // 设的。钱已经划走,收款人有权拿到凭证 —— 宽限期内对方随手一拉黑就让
+        // 60 次尝试全部抛错、卡片永久丢失,是把授权检查用在了错误的地方。
+        const conversationId =
+          await this.chatService.ensureDirectConversationForSettlement(
             gift.senderID,
             gift.recipientID,
           );
         // gift 派生的固定幂等键:重复补偿(超时重试/多副本)在唯一约束上合并,
         // 接收端永远只看到一张卡。
-        await this.chatMessages.insertServerMessage(conversation.id, {
+        await this.chatMessages.insertServerMessage(conversationId, {
           senderID: gift.senderID,
           type: 'transfer-card',
           content: { amount: gift.amount, message: gift.message ?? null },

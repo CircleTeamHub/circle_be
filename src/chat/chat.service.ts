@@ -709,6 +709,49 @@ export class ChatService {
    * 取或建单聊会话。directKey = 两个 userID 升序拼接,唯一约束防并发重建;
    * 撞唯一约束(P2002)说明对方先建成,重查取回即可。
    */
+  /**
+   * 服务端结算类消息用的单聊会话解析 —— 只保证会话存在,不做交互授权。
+   *
+   * 拉黑与「接收陌生人消息」是给**用户主动发消息**设的闸。转账卡这类回执是
+   * 钱已经结算之后由服务端补投的凭证:走交互路径的话,宽限期内对方随手一拉黑,
+   * 补偿的每一次尝试都会抛错,打光重试次数后卡片永久丢失 —— 而钱已经划走了。
+   * 收款人有权拿到自己那笔钱的凭证,这跟他愿不愿意继续聊天是两回事。
+   *
+   * 只给服务端补偿链路用,不要接到任何用户可直接触发的路径上。
+   */
+  async ensureDirectConversationForSettlement(
+    userId: string,
+    peerUserId: string,
+  ): Promise<string> {
+    const [low, high] =
+      userId < peerUserId ? [userId, peerUserId] : [peerUserId, userId];
+    const directKey = `${low}:${high}`;
+    const existing = await this.prisma.chatConversation.findUnique({
+      where: { directKey },
+      select: { id: true },
+    });
+    if (existing) return existing.id;
+    try {
+      const created = await this.prisma.chatConversation.create({
+        data: {
+          type: 'DIRECT',
+          directKey,
+          members: { create: [{ userID: userId }, { userID: peerUserId }] },
+        },
+        select: { id: true },
+      });
+      return created.id;
+    } catch (error) {
+      if (!this.isUniqueViolation(error)) throw error;
+      const raced = await this.prisma.chatConversation.findUnique({
+        where: { directKey },
+        select: { id: true },
+      });
+      if (!raced) throw error;
+      return raced.id;
+    }
+  }
+
   async getOrCreateDirectConversation(
     userId: string,
     peerUserId: string,

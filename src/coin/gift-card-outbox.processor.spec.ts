@@ -24,9 +24,9 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
       },
     };
     const chatService = {
-      getOrCreateDirectConversation: jest
+      ensureDirectConversationForSettlement: jest
         .fn()
-        .mockResolvedValue({ id: 'conv-1' }),
+        .mockResolvedValue('conv-1'),
     };
     const chatMessages = {
       insertServerMessage: jest.fn().mockResolvedValue(undefined),
@@ -55,11 +55,13 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
     const sendOrder =
       chatMessages.insertServerMessage.mock.invocationCallOrder[0];
     expect(claimOrder).toBeLessThan(sendOrder);
-    // 卡片补进双方 1:1 会话；幂等键使重复投递合并成同一条消息
-    expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
-      'user-1',
-      'user-2',
-    );
+    // 卡片补进双方 1:1 会话；幂等键使重复投递合并成同一条消息。
+    // 用结算专用解析而不是交互式的 getOrCreateDirectConversation：后者带拉黑与
+    // 「接收陌生人消息」两道闸，宽限期内对方一拉黑就会让 60 次尝试全部抛错、
+    // 卡片永久丢失 —— 而钱已经划走了。
+    expect(
+      chatService.ensureDirectConversationForSettlement,
+    ).toHaveBeenCalledWith('user-1', 'user-2');
     expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
       'conv-1',
       expect.objectContaining({
