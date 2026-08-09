@@ -161,4 +161,91 @@ describe('StorageAuditService', () => {
       expect(source).toContain(`this.prisma.${accessor}.findMany`);
     }
   });
+
+  it('keeps pending friend-request photos out of the orphan list', async () => {
+    // 建好友申请时带的照片在接受之前一直存在 pendingPhotosBySender。
+    // 漏掉它:一个挂了超过 24h 宽限期的待处理申请,它那批仍被引用的照片会被
+    // 报成孤儿 —— 而这份账正是用来授权后续删除的,误报一条就可能删掉用户的照片。
+    const { service } = harness({
+      objects: {
+        'friends/': [
+          { key: 'friends/pending.jpg', size: 10, lastModified: old },
+        ],
+      },
+      referenced: {
+        friend: [
+          {
+            id: 'f1',
+            photosA: [],
+            photosB: [],
+            pendingPhotosBySender: [
+              'https://cdn.test/circle/friends/pending.jpg',
+            ],
+          },
+        ],
+      },
+    });
+
+    const result = await service.audit(now);
+    expect(result?.orphanCount).toBe(0);
+  });
+
+  it('never writes a raw object key into the logs', async () => {
+    // key 里带用户 id;friends/ 这类前缀又是匿名可读的,拿到 key 就能拼出可下载的
+    // URL。而这份账**会误报** —— 被列出来的对象未必真没人引用,等于把仍在使用的
+    // 用户媒体地址抄进了日志。
+    const secretKey = 'friends/u-12345/private-photo.jpg';
+    const { service } = harness({
+      objects: {
+        'friends/': [{ key: secretKey, size: 10, lastModified: old }],
+      },
+    });
+    const logged: string[] = [];
+    jest
+      .spyOn(
+        (service as unknown as { logger: { log: (m: string) => void } }).logger,
+        'log',
+      )
+      .mockImplementation((message: string) => {
+        logged.push(String(message));
+      });
+
+    const result = await service.audit(now);
+    expect(result?.orphanCount).toBe(1);
+    const all = logged.join('\n');
+    expect(all).not.toContain(secretKey);
+    expect(all).not.toContain('u-12345');
+    expect(all).not.toContain('private-photo');
+    // 前缀级信息仍然保留,足够定位是哪一类对象在堆积。
+    expect(all).toContain('friends/');
+  });
+
+  it('reads references in bounded sequential batches, not one big findMany', async () => {
+    // 九张表并发全量物化会同时吃掉连接池十条里的九条,并把整份结果集留在
+    // 1 GiB 的容器里 —— 05:00 那一刻要么把请求饿死,要么 OOM。
+    const { service, prisma } = harness({});
+    const page = (start: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `u-${String(start + i).padStart(5, '0')}`,
+        avatarUrl: null,
+        avatarFrame: null,
+        cover: null,
+      }));
+    prisma.user.findMany = jest
+      .fn()
+      .mockResolvedValueOnce(page(0, 1000))
+      .mockResolvedValueOnce(page(1000, 1000))
+      .mockResolvedValueOnce(page(2000, 7));
+
+    await service.audit(now);
+
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(3);
+    const first = prisma.user.findMany.mock.calls[0][0];
+    const second = prisma.user.findMany.mock.calls[1][0];
+    expect(first.take).toBe(1000);
+    expect(first.cursor).toBeUndefined();
+    // 第二页起必须带游标,否则会一直重复取第一页。
+    expect(second.cursor).toEqual({ id: 'u-00999' });
+    expect(second.skip).toBe(1);
+  });
 });

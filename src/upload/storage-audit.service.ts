@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from './upload.service';
 
@@ -42,8 +43,16 @@ export class StorageAuditService {
    */
   private static readonly GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
-  /** 报告里最多列几个样例 key，避免把日志刷爆。 */
+  /** 报告里最多列几个样例，避免把日志刷爆。 */
   private static readonly SAMPLE_SIZE = 20;
+
+  /**
+   * 每批从 Postgres 取多少行。九张表同时 findMany 全量物化,大表(笔记媒体、
+   * 朋友圈、帖子、好友照片数组)在生产体量下会同时占掉连接池十条里的九条,
+   * 并把整份结果集连同所有引用留在 1 GiB 的容器里 —— 05:00 那一刻要么把请求
+   * 饿死,要么直接 OOM。改成逐表、游标分批,并且只留下还原后的 key。
+   */
+  private static readonly REFERENCE_BATCH_SIZE = 1000;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -79,7 +88,7 @@ export class StorageAuditService {
             orphanCount += 1;
             orphanBytes += object.size;
             if (samples.length < StorageAuditService.SAMPLE_SIZE) {
-              samples.push(object.key);
+              samples.push(this.redactKey(object.key));
             }
           }
         } while (token);
@@ -104,6 +113,41 @@ export class StorageAuditService {
   }
 
   /**
+   * 样例 key 只记「前缀 + 不可逆摘要」。
+   *
+   * 原样打进日志有两个问题:key 里带用户 id;而 friends/ 这类前缀是匿名可读的,
+   * 拿到 key 就能拼出可直接下载的 URL。更麻烦的是这份账**会误报** ——
+   * 被列出来的对象未必真的没人引用,等于把仍在使用的用户媒体地址抄进了日志。
+   * 出问题时按前缀计数定位足够,要具体 key 就去查对象存储本身。
+   */
+  private redactKey(key: string): string {
+    const slash = key.indexOf('/');
+    const prefix = slash === -1 ? '' : key.slice(0, slash + 1);
+    const digest = createHash('sha256').update(key).digest('hex').slice(0, 12);
+    return `${prefix}<${digest}>`;
+  }
+
+  /**
+   * 逐批读一张表并把引用喂给 add,读完即丢 —— 不把 Prisma 行留在内存里。
+   * 用 id 游标而不是 skip:大表上 OFFSET 会越翻越慢。
+   */
+  private async collectFrom<T extends { id: string }>(
+    fetchPage: (cursor: string | undefined, take: number) => Promise<T[]>,
+    extract: (row: T) => void,
+  ): Promise<void> {
+    let cursor: string | undefined;
+    for (;;) {
+      const rows = await fetchPage(
+        cursor,
+        StorageAuditService.REFERENCE_BATCH_SIZE,
+      );
+      for (const row of rows) extract(row);
+      if (rows.length < StorageAuditService.REFERENCE_BATCH_SIZE) return;
+      cursor = rows[rows.length - 1].id;
+    }
+  }
+
+  /**
    * 收集 Postgres 里所有引用到的对象 key。
    *
    * 存的是完整 URL（形如 https://<域名>/circle/<key>），这里统一还原成 key 再比对 ——
@@ -121,54 +165,125 @@ export class StorageAuditService {
 
     // 这份清单是从 schema 里逐个 String 字段筛出来的（名字含 url/avatar/cover/
     // image/photo 的全部 14 个），不是凭印象列的。少一处 = 那批对象被误报成孤儿。
-    const [
-      users,
-      avatarFrameAssets,
-      iconAssets,
-      friends,
-      circles,
-      noteMedia,
-      traces,
-      traceComments,
-      circlePosts,
-    ] = await Promise.all([
-      this.prisma.user.findMany({
-        select: { avatarUrl: true, avatarFrame: true, cover: true },
-      }),
-      this.prisma.avatarFrameAsset.findMany({ select: { imageUrl: true } }),
-      this.prisma.iconAsset.findMany({ select: { imageUrl: true } }),
-      this.prisma.friend.findMany({ select: { photosA: true, photosB: true } }),
-      this.prisma.circle.findMany({ select: { avatarUrl: true, cover: true } }),
-      this.prisma.noteMedia.findMany({
-        select: { url: true, posterUrl: true },
-      }),
-      this.prisma.trace.findMany({ select: { images: true } }),
-      this.prisma.traceComment.findMany({ select: { images: true } }),
-      this.prisma.circlePost.findMany({ select: { images: true } }),
-    ]);
-
-    for (const row of users) {
-      add(row.avatarUrl);
-      add(row.avatarFrame);
-      add(row.cover);
-    }
-    for (const row of avatarFrameAssets) add(row.imageUrl);
-    for (const row of iconAssets) add(row.imageUrl);
-    for (const row of friends) {
-      row.photosA.forEach(add);
-      row.photosB.forEach(add);
-    }
-    for (const row of circles) {
-      add(row.avatarUrl);
-      add(row.cover);
-    }
-    for (const row of noteMedia) {
-      add(row.url);
-      add(row.posterUrl);
-    }
-    for (const row of traces) row.images.forEach(add);
-    for (const row of traceComments) row.images.forEach(add);
-    for (const row of circlePosts) row.images.forEach(add);
+    //
+    // 逐表串行、分批读:九张表并发全量物化会同时吃掉连接池十条里的九条,
+    // 并把整份结果集留在内存里。这份账每天只跑一次,慢一点无所谓,
+    // 把生产在 05:00 拖垮才是问题。
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.user.findMany({
+          select: { id: true, avatarUrl: true, avatarFrame: true, cover: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => {
+        add(row.avatarUrl);
+        add(row.avatarFrame);
+        add(row.cover);
+      },
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.avatarFrameAsset.findMany({
+          select: { id: true, imageUrl: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.imageUrl),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.iconAsset.findMany({
+          select: { id: true, imageUrl: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.imageUrl),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.friend.findMany({
+          select: {
+            id: true,
+            photosA: true,
+            photosB: true,
+            // 建好友申请时带的照片在接受之前一直存在这里。漏掉它的话,
+            // 一个挂了超过 24h 宽限期的待处理申请,它那批仍被引用的照片
+            // 会被报成孤儿 —— 而这份账正是用来授权后续清理的。
+            pendingPhotosBySender: true,
+          },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => {
+        row.photosA.forEach(add);
+        row.photosB.forEach(add);
+        row.pendingPhotosBySender.forEach(add);
+      },
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.circle.findMany({
+          select: { id: true, avatarUrl: true, cover: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => {
+        add(row.avatarUrl);
+        add(row.cover);
+      },
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.noteMedia.findMany({
+          select: { id: true, url: true, posterUrl: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => {
+        add(row.url);
+        add(row.posterUrl);
+      },
+    );
+    // 下面三张刻意逐张写死,不走动态表名:storage-audit.service.spec.ts 用
+    // `this.prisma.<table>.findMany` 的字面量守「九张表一个都不能漏」——
+    // 漏一处就是那批对象被误报成孤儿,而这份账是用来授权删除的。
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.trace.findMany({
+          select: { id: true, images: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => row.images.forEach(add),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.traceComment.findMany({
+          select: { id: true, images: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => row.images.forEach(add),
+    );
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.circlePost.findMany({
+          select: { id: true, images: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => row.images.forEach(add),
+    );
 
     return keys;
   }

@@ -113,10 +113,16 @@ groups:
 
       # 洪泛的第二个落点是磁盘：Kafka 日志段 + Mongo 消息集合。容器日志已配轮转
       # （runbook 第 3 步），但消息数据本身没有任何上限。
+      # fstype 白名单而不是黑名单:snap 包/只读镜像会让 node_exporter 把
+      # squashfs 报成 100% 已用、可用 0 字节。只排除 tmpfs|overlay 的话,
+      # 装了 snap 的主机上这条告警会永久处于 firing —— 运维很快就学会无视它,
+      # 那本来是用来发现 Kafka/Mongo 撑满磁盘的。这里只保留可写的持久化文件系统。
+      # readonly 的挂载(只读 bind、恢复模式)同样排除:它们不会「填满」。
       - alert: HostDiskFilling
         expr: |
-          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
-            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} < 0.15
+          node_filesystem_avail_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"}
+            / node_filesystem_size_bytes{fstype=~"ext4|xfs|btrfs|zfs|ext3", mountpoint!~"/(boot|snap)(/.*)?"} < 0.15
+          and on(instance, mountpoint) node_filesystem_readonly == 0
         for: 10m
         labels:
           severity: warning
