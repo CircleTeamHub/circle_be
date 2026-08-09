@@ -1,0 +1,13 @@
+# Caddy + rate_limit 模块。
+#
+# 官方 caddy:2-alpine 不带任何限流能力 —— 而 Caddy 是 OpenIM 网关唯一的公网入口
+# （deploy/openim-harden.sh --collapse-public-ports 收口之后）。没有这个模块，
+# /openim-ws 与 /openim-api 就是两个不限速、不限连接数的裸反代。
+#
+# 固定模块版本，避免每次重建都拉到不同的上游提交。升级时同步改这里的 tag。
+FROM caddy:2-builder-alpine AS builder
+RUN xcaddy build \
+    --with github.com/mholt/caddy-ratelimit@v0.1.0
+
+FROM caddy:2-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

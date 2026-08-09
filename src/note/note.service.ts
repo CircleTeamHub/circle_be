@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MembershipErrorCode, NoteErrorCode } from 'src/common/app-error-codes';
-import { randomBytes, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import PDFDocument from 'pdfkit';
 import { Prisma } from 'src/generated/prisma';
@@ -690,17 +690,58 @@ export class NoteService {
     return finished;
   }
 
+  /**
+   * 对象 key 的内容指纹。
+   *
+   * 不能拿导出件的字节去算:带媒体的笔记在导出前会现签一批预签名 URL(签名与
+   * 过期参数每次都不同),这些 URL 直接嵌在 SVG/PDF 里 —— 于是同一篇没改过的
+   * 笔记每次导出 body 都不同、哈希都不同、key 都不同,每导出一次就多留一个
+   * 永久对象。这正是内容哈希本来要堵掉的那条磁盘耗尽路径,等于白做。
+   *
+   * 改用稳定量:笔记修订时间 + 参与导出的媒体对象 key(排序后)。
+   *
+   * 复用 key 不会让导出件里的签名 URL 过期:body 每次仍然重新生成并 PUT 覆盖
+   * 同一个 key,key 只用于给存储去重,不用于跳过生成。
+   */
+  private exportFingerprint(
+    note: { updatedAt: Date | null },
+    objectKeys: readonly string[],
+  ): string {
+    return JSON.stringify({
+      revision: note.updatedAt?.toISOString() ?? null,
+      media: [...objectKeys].sort((left, right) =>
+        left < right ? -1 : left > right ? 1 : 0,
+      ),
+    });
+  }
+
   private async uploadExportArtifact(input: {
     ownerID: string;
     noteID: string;
     filename: string;
     mimeType: string;
     body: Buffer;
+    /** 见 {@link exportFingerprint} —— 必须是稳定量,不能由 body 派生。 */
+    contentFingerprint: string;
   }): Promise<NoteExportResultDto> {
     if (!this.uploadService) {
       throw new ServiceUnavailableException('File export is not configured');
     }
-    const key = `note-exports/${input.ownerID}/${input.noteID}/${randomUUID()}-${input.filename}`;
+    // key 用内容哈希而不是 randomUUID：同一篇笔记、同一种格式、同样的内容重复导出
+    // 时复用同一个对象，而不是每次落一个新的永久对象。
+    //
+    // 之前是每调用一次就新建一个 key，而后端没有任何删除对象的代码路径，于是一个
+    // 循环调用导出的脚本能持续往磁盘里堆几十上百 GiB —— 和 Postgres 同机，写满时
+    // 倒下的是数据库。now 生命周期规则（docker-compose minio-init）把上限压到一天，
+    // 这里再把「同样的内容反复占新空间」这条也堵掉：内容不变则 key 不变，PUT 覆盖
+    // 同一个对象。内容变了哈希才变，所以不会返回过期的导出。
+    const contentHash = createHash('sha256')
+      .update(input.mimeType)
+      .update(input.filename)
+      .update(input.contentFingerprint)
+      .digest('hex')
+      .slice(0, 32);
+    const key = `note-exports/${input.ownerID}/${input.noteID}/${contentHash}-${input.filename}`;
     const uploaded = await this.uploadService.uploadBuffer({
       key,
       body: input.body,
@@ -2152,8 +2193,12 @@ export class NoteService {
     if (input.format === 'IMAGE' || input.format === 'PDF') {
       // 导出件里嵌的 URL 也要现签：notes/* 已不再匿名可读，原始直链对收件人是 403。
       // 与其它读取路径同一条流水线（collect → presign → map）。
-      const presignedUrls = await this.presignNoteMedia(
-        this.collectNoteMediaTargets(note),
+      const mediaTargets = this.collectNoteMediaTargets(note);
+      const presignedUrls = await this.presignNoteMedia(mediaTargets);
+      // 指纹取自笔记修订与媒体对象 key,不能取自 body —— presignedUrls 每次都变。
+      const contentFingerprint = this.exportFingerprint(
+        note,
+        mediaTargets.map((target) => target.objectKey),
       );
       return input.format === 'IMAGE'
         ? this.uploadExportArtifact({
@@ -2162,6 +2207,7 @@ export class NoteService {
             filename: `${basename}.svg`,
             mimeType: 'image/svg+xml',
             body: this.createLongImageSvg(note, presignedUrls),
+            contentFingerprint,
           })
         : this.uploadExportArtifact({
             ownerID: note.ownerID,
@@ -2169,6 +2215,7 @@ export class NoteService {
             filename: `${basename}.pdf`,
             mimeType: 'application/pdf',
             body: await this.createPdf(note, presignedUrls),
+            contentFingerprint,
           });
     }
 
@@ -2240,6 +2287,12 @@ export class NoteService {
       filename,
       mimeType: 'application/zip',
       body: createZip(entries),
+      // 这条路径的 body 是真实媒体字节、本来就稳定,但仍走同一套指纹:
+      // 免得 createZip 里任何时间戳类字段悄悄把 key 变成一次性的。
+      contentFingerprint: this.exportFingerprint(
+        note,
+        selected.map((item) => item.objectKey),
+      ),
     });
   }
 

@@ -14,7 +14,6 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 
 describe('UserService', () => {
@@ -30,9 +29,6 @@ describe('UserService', () => {
     },
     userLike: {
       findUnique: jest.fn(),
-    },
-    userProfileSyncOutbox: {
-      upsert: jest.fn(),
     },
     accountIdentifier: {
       findUnique: jest.fn(),
@@ -53,9 +49,6 @@ describe('UserService', () => {
   const privacySettings = {
     canViewProfileField: jest.fn(),
   };
-  const openim = {
-    updateUserInfo: jest.fn().mockResolvedValue(undefined),
-  };
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
@@ -73,7 +66,6 @@ describe('UserService', () => {
         { provide: IconService, useValue: iconService },
         { provide: RealtimeService, useValue: realtimeService },
         { provide: PrivacySettingsService, useValue: privacySettings },
-        { provide: OpenimService, useValue: openim },
         { provide: AvatarFrameService, useValue: avatarFrames },
       ],
     }).compile();

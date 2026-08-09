@@ -15,7 +15,6 @@ import {
 import { CircleErrorCode, PlazaErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { IconService } from 'src/icon/icon.service';
@@ -1337,7 +1336,8 @@ export class CirclePlazaService {
         post.status === 'ENDED' && post.collaborationRecognizedAt === null,
       items: signups.map((s) => ({
         userId: s.user.id,
-        imUserId: OpenimService.toImUserId(s.user.id),
+        // 兼容字段:OpenIM 时代的去连字符形态已弃用,直接回传 UUID。
+        imUserId: s.user.id,
         nickname: s.user.nickname,
         avatarUrl: s.user.avatarUrl,
         accountId: s.user.accountId,

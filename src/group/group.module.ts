@@ -1,23 +1,15 @@
 import { Module } from '@nestjs/common';
-import { OpenimModule } from 'src/openim/openim.module';
+import { ChatModule } from 'src/chat/chat.module';
 import { MembershipPolicyModule } from 'src/membership/membership-policy.module';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { GroupController } from './group.controller';
-import { GroupPrivacyBackfillProcessor } from './group-privacy-backfill.processor';
-import { GroupSyncOutboxProcessor } from './group-sync-outbox.processor';
 import { GroupService } from './group.service';
 
 @Module({
-  imports: [OpenimModule, MembershipPolicyModule],
+  imports: [ChatModule, MembershipPolicyModule],
   controllers: [GroupController],
-  providers: [
-    GroupService,
-    GroupPrivacyBackfillProcessor,
-    GroupSyncOutboxProcessor,
-    CircleAdmissionPolicy,
-    CircleMemberLockService,
-  ],
+  providers: [GroupService, CircleAdmissionPolicy, CircleMemberLockService],
   exports: [GroupService],
 })
 export class GroupModule {}

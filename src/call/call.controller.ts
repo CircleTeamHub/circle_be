@@ -11,6 +11,7 @@ import {
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallService } from './call.service';
 import {
@@ -21,7 +22,9 @@ import {
 
 @ApiTags('Calls')
 @ApiBearerAuth()
-@UseGuards(ThrottlerGuard, JwtGuard)
+// AppAudienceGuard:通话与聊天同属消费端通信能力,管理台没有对应 UI,
+// 它的 ADMIN token 不该能发起或接听通话(与 ChatController 同一条判据)。
+@UseGuards(ThrottlerGuard, JwtGuard, AppAudienceGuard)
 @Controller('calls')
 export class CallController {
   constructor(private readonly callService: CallService) {}

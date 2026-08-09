@@ -1,7 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma } from 'src/generated/prisma';
-import { OutboxService } from 'src/outbox/outbox.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import { buildDailySeries, type DashboardPeriod } from './dashboard-period';
@@ -167,38 +165,24 @@ export class DashboardModerationMetrics {
 @Injectable()
 export class DashboardSystemMetrics {
   constructor(
-    private readonly outbox: OutboxService,
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
-    private readonly openim: OpenimService,
   ) {}
 
   async getMetrics() {
-    const [outboxResult, databaseResult, redisResult, openimResult] =
-      await Promise.allSettled([
-        this.outbox.getHealth(),
-        this.prisma.$queryRaw(Prisma.sql`SELECT 1 AS "ok"`),
-        this.redis.ping(),
-        this.openim.listGroups({ page: 1, limit: 1 }),
-      ]);
-    const health =
-      outboxResult.status === 'fulfilled' ? outboxResult.value : null;
+    const [databaseResult, redisResult] = await Promise.allSettled([
+      this.prisma.$queryRaw(Prisma.sql`SELECT 1 AS "ok"`),
+      this.redis.ping(),
+    ]);
     return {
-      pending: health ? health.friend.pending + health.group.pending : 0,
-      processing: health
-        ? health.friend.processing + health.group.processing
-        : 0,
-      failed: health ? health.friend.failed + health.group.failed : 0,
-      oldestPendingAt: oldestIso(
-        health?.friend.oldestPendingAt ?? null,
-        health?.group.oldestPendingAt ?? null,
-      ),
-      oldestFailedAt: oldestIso(
-        health?.friend.oldestFailedAt ?? null,
-        health?.group.oldestFailedAt ?? null,
-      ),
-      friend: health?.friend ?? null,
-      group: health?.group ?? null,
+      // OpenIM 同步 outbox 已拆除:字段保形置零,admin_web 面板无需同步升级。
+      pending: 0,
+      processing: 0,
+      failed: 0,
+      oldestPendingAt: null,
+      oldestFailedAt: null,
+      friend: null,
+      group: null,
       services: {
         api: 'healthy',
         database: databaseResult.status === 'fulfilled' ? 'healthy' : 'down',
@@ -206,17 +190,7 @@ export class DashboardSystemMetrics {
           redisResult.status === 'fulfilled' && redisResult.value
             ? 'healthy'
             : 'down',
-        openim: openimResult.status === 'fulfilled' ? 'healthy' : 'down',
       },
     };
   }
-}
-
-function oldestIso(...values: Array<Date | null>): string | null {
-  const timestamps = values
-    .filter((value): value is Date => value instanceof Date)
-    .map((value) => value.getTime());
-  return timestamps.length > 0
-    ? new Date(Math.min(...timestamps)).toISOString()
-    : null;
 }

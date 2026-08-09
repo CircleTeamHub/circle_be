@@ -146,73 +146,39 @@ echo "==> 6/7 Deploy the remaining pending migrations onto the existing database
 # Every post-baseline schema/data migration runs exactly once here.
 npx prisma migrate deploy
 
-echo "==> 7/7 Assert desired-state index compatibility and no schema drift"
+echo "==> 7/7 Assert the OpenIM outbox teardown landed and no schema drift"
+# 20260806000000_drop_openim_sync_outbox 拆掉了三张 OpenIM 同步 outbox 表,所以
+# 这一步不再断言 GroupSyncOutbox 的 desired-state 行/索引 —— deploy 跑完它们
+# 已经不存在了。20260722010000 的索引修复语义仍由 3/7、4/7 在 deploy 之前覆盖;
+# 它在真实链路里的重放安全性由 6/7 的 deploy 成功本身证明。
 npx prisma db execute --stdin <<'SQL'
 DO $$
 DECLARE
-  key_columns text[];
+  leftover_tables text[];
+  leftover_column integer;
 BEGIN
   SELECT ARRAY(
-    SELECT attribute.attname
-    FROM unnest(index_meta.indkey::smallint[]) WITH ORDINALITY AS key(attnum, position)
-    JOIN pg_catalog.pg_attribute AS attribute
-      ON attribute.attrelid = index_meta.indrelid
-     AND attribute.attnum = key.attnum
-    WHERE key.position <= index_meta.indnkeyatts
-    ORDER BY key.position
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = current_schema()
+      AND table_name IN (
+        'GroupSyncOutbox', 'FriendSyncOutbox', 'UserProfileSyncOutbox'
+      )
+    ORDER BY table_name
   )
-  INTO key_columns
-  FROM pg_catalog.pg_index AS index_meta
-  WHERE index_meta.indexrelid = '"GroupSyncOutbox_desired_state_key"'::regclass
-    AND index_meta.indisunique
-    AND index_meta.indisvalid
-    AND index_meta.indpred IS NULL;
+  INTO leftover_tables;
 
-  IF key_columns IS DISTINCT FROM ARRAY['groupID', 'userID']::text[] THEN
-    RAISE EXCEPTION 'Unexpected desired-state index columns: %', key_columns;
-  END IF;
+  SELECT COUNT(*)
+  INTO leftover_column
+  FROM information_schema.columns
+  WHERE table_schema = current_schema()
+    AND table_name = 'User'
+    AND column_name = 'openimSynced';
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM "GroupSyncOutbox"
-    WHERE "groupID" = 'migration-group'
-      AND "userID" = 'migration-user'
-      AND "operation" = 'REMOVE_MEMBER'
-      AND "generation" = 2
-      AND "processingGeneration" = 1
-      AND "processingOperation" = 'ADD_MEMBER'
-      AND "status" = 'PENDING'
-  ) THEN
-    RAISE EXCEPTION 'Migration did not preserve newer REMOVE over older processing ADD';
-  END IF;
-
-  IF NOT EXISTS (
-    SELECT 1
-    FROM "GroupSyncOutbox"
-    WHERE "groupID" = 'inverse-group'
-      AND "userID" = 'inverse-user'
-      AND "operation" = 'ADD_MEMBER'
-      AND "generation" = 2
-      AND "processingGeneration" = 1
-      AND "processingOperation" = 'REMOVE_MEMBER'
-      AND "status" = 'PENDING'
-  ) THEN
-    RAISE EXCEPTION 'Migration did not preserve newer ADD over older processing REMOVE';
-  END IF;
-
-  IF NOT EXISTS (
-    SELECT 1
-    FROM "GroupSyncOutbox"
-    WHERE "id" = 'tie-z-desired'
-      AND "groupID" = 'tie-group'
-      AND "userID" = 'tie-user'
-      AND "operation" = 'REMOVE_MEMBER'
-      AND "generation" = 2
-      AND "processingGeneration" = 1
-      AND "processingOperation" = 'ADD_MEMBER'
-      AND "status" = 'PENDING'
-  ) THEN
-    RAISE EXCEPTION 'Migration did not use descending id for equal timestamps';
+  IF leftover_tables <> ARRAY[]::text[] OR leftover_column <> 0 THEN
+    RAISE EXCEPTION
+      'OpenIM outbox teardown incomplete: tables=%, User.openimSynced columns=%',
+      leftover_tables, leftover_column;
   END IF;
 END
 $$;

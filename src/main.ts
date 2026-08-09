@@ -8,6 +8,7 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { setupApp } from './setup';
 import { RealtimeGateway } from './realtime/realtime.gateway';
+import { ChatGateway } from './chat/chat.gateway';
 // import { AllExceptionFilter } from './filters/all-exception.filter';
 import { getServerConfig } from './config/server.config';
 
@@ -149,6 +150,9 @@ async function bootstrap() {
   }
 
   app.get(RealtimeGateway).attach(app.getHttpServer());
+  app.get(ChatGateway).attach(app.getHttpServer(), {
+    corsOrigin: resolveCorsOriginChecker(),
+  });
 
   const port = resolveAppPort(config['APP_PORT'] ?? 3000);
   await app.listen(port);

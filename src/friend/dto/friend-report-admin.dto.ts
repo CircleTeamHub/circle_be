@@ -11,6 +11,7 @@ import {
   Min,
 } from 'class-validator';
 import { FriendReportStatus } from 'src/generated/prisma';
+import { MAX_PAGE } from 'src/common/pagination';
 
 export const FRIEND_REPORT_REVIEW_DECISIONS = ['APPROVE', 'REJECT'] as const;
 export type FriendReportReviewDecision =
@@ -30,6 +31,7 @@ export class ListFriendReportsQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   @IsOptional()
   page?: number;
 

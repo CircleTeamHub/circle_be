@@ -1,10 +1,20 @@
 {
 	email {$ACME_EMAIL}
+
+	# rate_limit 由 Dockerfile.caddy 编进来（官方镜像没有）。它是 HTTP handler，
+	# 必须在 order 里给出相对位置，否则 Caddy 起不来。放在 reverse_proxy 之前：
+	# 超限的请求要在打到上游之前就被挡下，否则限流毫无意义。
+	order rate_limit before reverse_proxy
 }
 
-# ⚠️ 不要给下面的站点开 access log（`log` 指令）。OpenIM 协议把 IM token 放在 WS 握手
-#    URL 的 query 里（msggateway 只从 query 读 token，没有 header 通道），access log 会把
-#    可用的 token 明文写进磁盘。若确需排障日志，务必先过滤掉 query。
+# ── 限流说明 ──────────────────────────────────────────────────────────────────
+# 各 handle 块里的 rate_limit 都按 {remote_host}（对端 IP）计数。compose 把 80/443
+# 直接映射到本机、前面没有 CDN/代理，所以 {remote_host} 就是真实客户端 IP；哪天
+# 挪到 Cloudflare 之类后面，必须同时配 trusted_proxies，否则所有人会共用一个桶。
+#
+# ⚠️ 不要给下面的站点开 access log（`log` 指令）。历史上曾有把凭证放进 WS 握手
+#    URL query 的通道经此反代;自研栈 token 走 socket.io auth payload 不落 URL，
+#    但媒体预签名 URL 仍带签名 query —— 开日志前务必先过滤 query。
 
 {$API_DOMAIN} {
 	@metrics path /metrics /metrics/*
@@ -21,37 +31,66 @@
 		respond 404
 	}
 
+	# MinIO 媒体直读。这里必须有限流，理由和别处不同：avatars / covers / posts /
+	# chat / friends / uploads 这些前缀是**匿名可读**的（upload.service.ts 的
+	# buildPublicReadBucketPolicy，Principal: '*'），而这条路由在 Caddy 就转给了
+	# MinIO，根本不经过 Node —— 应用层那套限流（300/min/IP 的 express 兜底、
+	# @Throttle）一条都作用不到。
+	# 也就是说：任何人拿到一张头像 URL（在 app 里随手可见），就能无账号、无令牌地
+	# 无限次拉取。攻击成本是一次上传，代价是运营方的出网带宽账单，同时和 Postgres、
+	# Redis、MinIO 抢同一台机器。
+	# 额度给得比接口宽：一屏朋友圈就可能几十张图，但必须封顶。
 	handle /circle/* {
+		rate_limit {
+			zone minio_media {
+				key {remote_host}
+				events 300
+				window 1m
+			}
+		}
 		reverse_proxy minio:9000
 	}
 
-	# OpenIM 消息网关 WebSocket（默认 :10001）。必须经此 TLS 反代：token 在握手 URL 里，
-	# 明文 ws:// 等于把它裸奔在公网上。reverse_proxy 自动处理 WebSocket 升级。
-	# 后端设 OPENIM_IM_WS_URL=wss://<API_DOMAIN>/openim-ws（与 temp-chat-web 同一路径约定）。
-	@openimWs path /openim-ws /openim-ws/*
-	handle @openimWs {
-		uri strip_prefix /openim-ws
-		reverse_proxy {$OPENIM_WS_UPSTREAM:host.docker.internal:10001}
-	}
-
-	# OpenIM API（默认 :10002）。后端设 OPENIM_IM_API_URL=https://<API_DOMAIN>/openim-api。
-	@openimApi path /openim-api /openim-api/*
-	handle @openimApi {
-		uri strip_prefix /openim-api
-		reverse_proxy {$OPENIM_API_UPSTREAM:host.docker.internal:10002}
-	}
-
+	# 自研 chat 网关(socket.io,/chat-ws)与 /realtime 原生 WS 都挂在 circle_be
+	# 同一 HTTP 端口,由下面的 catch-all 反代;reverse_proxy 自动处理 WS 升级。
 	handle {
+		# 业务 API 的兜底闸。circle_be 自己有每 IP 300 次/分钟的全局限流
+		# （src/setup.ts），这里放宽到 600 只做 DoS 兜底：真正的业务额度由后端
+		# 判定（它认得账号，这里只认 IP），网关这层的职责是别让洪泛打到 Node 进程。
+		rate_limit {
+			zone api_fallback {
+				key {remote_host}
+				events 600
+				window 1m
+			}
+		}
 		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000}
 	}
 }
 
 {$ADMIN_DOMAIN} {
+	# 管理域同样要限流：它把后端整个 API 也暴露在另一个域名下（/api/*），
+	# 只在 API_DOMAIN 那边限流等于留了一扇没上锁的后门 —— 攻击者换个 Host 就绕过。
+	# 管理台用户少、操作频次低，额度可以比主域紧。
 	handle /api/* {
+		rate_limit {
+			zone admin_api {
+				key {remote_host}
+				events 300
+				window 1m
+			}
+		}
 		reverse_proxy {$CIRCLE_BE_UPSTREAM:circle-be-blue:3000}
 	}
 
 	handle {
+		rate_limit {
+			zone admin_web {
+				key {remote_host}
+				events 300
+				window 1m
+			}
+		}
 		reverse_proxy admin_web:80
 	}
 }

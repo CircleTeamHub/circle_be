@@ -59,7 +59,6 @@ async function main() {
       nickname: 'Local Admin',
       role: 'ADMIN',
       status: 'ACTIVE',
-      openimSynced: false,
     },
   });
 

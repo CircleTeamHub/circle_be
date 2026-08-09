@@ -1783,7 +1783,8 @@ describe('CirclePlazaService', () => {
       expect(result.items[0]).toEqual(
         expect.objectContaining({
           userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
-          imUserId: '0a9ad3d6ef1d47bd9cbccda1cee57547',
+          // 兼容字段:OpenIM 去连字符形态已弃用,直接回传 UUID。
+          imUserId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
           nickname: 'meiguici',
           seen: false,
           displayIcons,

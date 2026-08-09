@@ -143,6 +143,22 @@ const traceDetailReadLimiterOptions = {
   message: { message: 'Too many moment lookups, please try again later.' },
 } satisfies Partial<RateLimitOptions>;
 
+/**
+ * Circle reads: 600 lookups / 15 min per IP.
+ *
+ * 圈子列表按城市过滤走的是数组包含查询，而且 findMany 与 count 是并发发出的 ——
+ * 一个请求占两个 Prisma 连接（池共 10 个）。放开只让 300 次/分钟/IP 的全局兜底管，
+ * 单个脚本就能把在飞请求堆到远超池容量，把整个实例拖到 P2024 超时。
+ * 额度对着正常浏览给（一屏列表 + 翻页远用不到 600/15min），对脚本则是硬顶。
+ */
+const circleReadLimiterOptions = {
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many circle lookups, please try again later.' },
+} satisfies Partial<RateLimitOptions>;
+
 /** Conversation-group writes: 60 mutating requests / 15 min per IP. */
 const conversationGroupWriteLimiterOptions = {
   windowMs: 15 * 60 * 1000,
@@ -266,6 +282,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const circleWriteLimiter = createLimiter(
     'circle_write',
     circleWriteLimiterOptions,
+  );
+  const circleReadLimiter = createLimiter(
+    'circle_read',
+    circleReadLimiterOptions,
   );
   const circleInvitationWriteLimiter = createLimiter(
     'circle_invitation_write',
@@ -440,7 +460,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     if (req.method === 'POST' || req.method === 'DELETE') {
       return circleWriteLimiter(req, res, next);
     }
-    next();
+    // 读也要限：GET /circle?city= 是数组包含查询，且 service 用 Promise.all 并发发出
+    // findMany 与 count —— 一个请求就占两个池连接（池共 10 个）。只靠 300 次/分钟/IP
+    // 的全局兜底时，单个脚本能把在飞请求堆到远超池容量，整个实例的其它请求全部
+    // P2024 超时。单次成本已由 Circle.cities 的 GIN 索引压下去
+    //（迁移 20260804120000_add_circle_cities_gin_index），这里再收一道频次。
+    return circleReadLimiter(req, res, next);
   });
   app.use('/api/v1/circle-invitation', (req: any, res: any, next: any) => {
     if (req.method === 'POST') {

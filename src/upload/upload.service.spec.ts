@@ -24,7 +24,6 @@ describe('UploadService', () => {
             'arn:aws:s3:::circle/avatars/*',
             'arn:aws:s3:::circle/covers/*',
             'arn:aws:s3:::circle/posts/*',
-            'arn:aws:s3:::circle/chat/*',
             'arn:aws:s3:::circle/friends/*',
             'arn:aws:s3:::circle/uploads/*',
           ],
@@ -33,10 +32,12 @@ describe('UploadService', () => {
     });
     expect(JSON.stringify(policy)).not.toContain('note-exports');
     // notes/* 不再匿名公开：私有笔记(available:false)的媒体改由读取时的短时签名 URL
-    // 提供(见 note.service 的 presign-on-read)。chat/* 仍公开——key 是不可枚举的 UUID，
-    // 且改造需破坏 OpenIM 消息体里固化的历史图，接受 key-secrecy 现状(单独决策)。
+    // 提供(见 note.service 的 presign-on-read)。
     expect(JSON.stringify(policy)).not.toContain('circle/notes/*');
-    expect(JSON.stringify(policy)).toContain('circle/chat/*');
+    // chat/* 同理：自研聊天栈存 key 不存 URL，读取走 ChatMediaService 的 presign-on-read。
+    // 一旦回潮，发送侧的 chat/{senderId}/ 归属校验和读取侧的短时签名会同时失效 ——
+    // 拿到过 key 的人可以绕过会话成员校验直连对象存储，所以这条断言不能删。
+    expect(JSON.stringify(policy)).not.toContain('circle/chat/*');
   });
 
   it('applies a public-read bucket policy during module init', async () => {
@@ -469,4 +470,56 @@ describe('UploadService', () => {
     expect(service.objectKeyFromPublicUrl(null)).toBeNull();
     expect(service.objectKeyFromPublicUrl(undefined)).toBeNull();
   });
+
+  // 自研聊天接受 voice / file 消息,并要求它们带 chat/{userId}/ 的 object key ——
+  // 而唯一能签出这种 key 的 presign 此前只放行 image/video:这两个"已支持"的
+  // 消息类型在拿到上传授权之前就被拒了,实际根本发不出去。
+  it('presigns voice and document uploads for the chat folder', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: privateMinioUrl,
+          MINIO_ACCESS_KEY: 'ak',
+          MINIO_SECRET_KEY: 'sk',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: privateMinioUrl,
+        })[key],
+    } as never);
+    (service as any).enabled = true;
+    (service as any).ready = true;
+    jest.mocked(getSignedUrl).mockResolvedValue('https://signed.example/put');
+
+    await expect(
+      service.presign('note.m4a', 'audio/mp4', 1024, 'chat', 'user-1'),
+    ).resolves.toMatchObject({ key: expect.stringContaining('chat/user-1/') });
+    await expect(
+      service.presign('spec.pdf', 'application/pdf', 1024, 'chat', 'user-1'),
+    ).resolves.toMatchObject({ key: expect.stringContaining('chat/user-1/') });
+  });
+
+  // DTO 的白名单是全局的:只放宽它等于让头像/封面/圈子帖目录也能收 pdf、zip。
+  // 目录收口必须在 service 里再做一次。
+  it.each(['avatars', 'posts', 'notes', 'friends'])(
+    'refuses chat-only content types in the %s folder',
+    async (folder) => {
+      const service = new UploadService({
+        get: (key: string) =>
+          ({
+            MINIO_ENDPOINT: privateMinioUrl,
+            MINIO_ACCESS_KEY: 'ak',
+            MINIO_SECRET_KEY: 'sk',
+            MINIO_BUCKET: 'circle',
+            MINIO_PUBLIC_URL: privateMinioUrl,
+          })[key],
+      } as never);
+      (service as any).enabled = true;
+      (service as any).ready = true;
+
+      await expect(
+        service.presign('x.pdf', 'application/pdf', 1024, folder, 'user-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'UPLOAD_INVALID_CONTENT_TYPE' },
+      });
+    },
+  );
 });

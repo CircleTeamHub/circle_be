@@ -5,7 +5,7 @@
 | 阶段 | 内容 | 组件 |
 |------|------|------|
 | 4 | 核心后端 | circle_be + PostgreSQL + Redis + MinIO |
-| 5 | 实时聊天 | OpenIM 全套(Mongo/Redis/Kafka) |
+| 5 | 实时聊天 | 自研 chat(随 circle_be 同进程,/chat-ws;无额外组件) |
 | 6 | 音视频 | LiveKit Cloud(免费层,不自托管) |
 
 本文件覆盖**阶段 4**;阶段 5/6 见末尾预告。
@@ -518,7 +518,7 @@ $S3 s3api get-object --bucket <bucket> \
 |---|---|
 | **RPO = 一次发版** | 备份只在发版时产生。两次发版之间(可能几天到几周)写入的数据,VPS 挂掉就没了。要更小的 RPO 得另做定时备份或 WAL 归档(pgBackRest / WAL-G)。 |
 | **MinIO 对象** | 头像、图片、附件全在 `minio_data` 卷里,**完全没有异地副本**。只恢复数据库的话,这些引用会变成坏链。 |
-| **OpenIM 聊天记录** | 阶段 5 的 Mongo / Redis / Kafka 数据不在备份范围。 |
+| **聊天记录** | 自研 chat 存业务 PostgreSQL,随数据库备份一并覆盖(旧 OpenIM Mongo 栈退役)。 |
 | **Redis** | 内置 Redis 只做缓存/限流,故意不备份。 |
 | **自动恢复验证** | 没有任何自动化在验证备份可用。上面的演练要人去跑。 |
 
@@ -555,6 +555,20 @@ $S3 s3api get-object --bucket <bucket> \
   只 up 对应服务(`docker compose -f docker-compose.prod.yml up -d caddy`),
   不要裸跑整栈 `up -d`——那会按 build 路径把停用的那一色重新拉起来。
 - **首次自动发版**:会把手动 `--build` 的旧容器无缝换成 GHCR 镜像(蓝→绿切换),数据卷不动。
+- **存量环境补齐 note-exports 生命周期规则(一次性,必做)**:
+  规则写在 `minio-init` 的 entrypoint 里,而它是一次性服务、且发版**不碰数据面**(见 §4)——
+  在本次之前就已初始化过的环境,升级到这版代码后不会执行到它,`note-exports/` 会一直堆到
+  磁盘写满(和 Postgres 同机,倒下的是数据库)。手工跑一次即可,可重复执行:
+  ```bash
+  docker compose -f docker-compose.prod.yml run --rm minio-init
+  ```
+  预期末行是 `minio bucket [circle] ready`;若看到 `WARN: note-exports lifecycle rule is
+  NOT active` 说明规则没装上(通常是老版本 `mc` 的子命令名不同),必须处理后重跑,
+  否则导出产物没有任何回收机制。核验:
+  ```bash
+  docker compose -f docker-compose.prod.yml run --rm --entrypoint sh minio-init -c \
+    "mc alias set local http://minio:9000 \$MINIO_ROOT_USER \$MINIO_ROOT_PASSWORD >/dev/null && mc ilm rule ls local/circle"
+  ```
 
 ---
 
@@ -576,14 +590,34 @@ $S3 s3api get-object --bucket <bucket> \
 
 ---
 
-## 阶段 5 预告:OpenIM(实时聊天)
+## 阶段 5:实时聊天(自研 chat,无需独立部署)
+
+聊天栈已并入 circle_be 本体(socket.io 网关挂在同一 HTTP 端口的 `/chat-ws`,
+数据存业务 PostgreSQL 三表),**没有独立的聊天组件要部署**;Caddy 的 API 域
+catch-all 反代已覆盖 WS 升级。旧 OpenIM(openim-docker,约 4G 内存)退役:
 
 ```bash
-git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
-# 编辑 .env 设 OPENIM_IP=<公网IP> 与 secret,然后 docker compose up -d
+cd ~/openim-docker && docker compose down   # 确认新栈跑通后再执行;卷按需清理
 ```
-之后把 `OPENIM_API_URL` / `OPENIM_ADMIN_SECRET` / `OPENIM_IM_WS_URL` / `OPENIM_IM_API_URL`
-追加进 `.env.production`,重启 circle_be。OpenIM 约吃 4G 内存。
+
+敏感词拦截为进程内检查(`CHAT_SENSITIVE_WORD_BLOCKED`),无需 webhook 配置;
+词库仍用 `POST /api/v1/admin/sensitive-words/add` 管理(admin JWT,单批 ≤1000,
+空词库 = 全放行,改动 ≤60s 内收敛)。
+
+### ⚠️ 规模上限备忘(有意的取舍,用户量上来再动,勿提前优化)
+
+自研 chat 移植自 squady 协议,下面三条是**评估时就知道、当前规模下刻意接受**的
+上限。它们不是 bug,不要顺手"修";触发条件到了再按升级路径动。
+
+| 限制 | 现状为什么可接受 | 触发条件 | 升级路径 |
+|---|---|---|---|
+| **单实例实时**:socket.io 房间广播是进程内的,多实例互相看不见对方的连接 | 当前单机蓝绿,任一时刻只有一色在服务。切换瞬间旧色上未断开的长连接收不到新色广播,但旧色随发版即停,客户端断线重连后按 height 补拉收敛,不丢消息 | circle_be 需要 >1 个实例同时服务(横向扩容/多机) | 加 socket.io Redis adapter。广播已收口在 `src/chat/chat-broadcast.service.ts` 一个类里,改动面可控;Redis 本身已在栈内 |
+| **每会话写串行**:height 用 `pg_advisory_xact_lock` 串行分配,单会话吞吐有上限 | 这是消息序正确性的代价(height 单调无洞);极热单群消息洪峰会排队,普通群/单聊无感 | 出现真实的超热大群且发送延迟可感知 | 先量化(慢查询/锁等待监控),再考虑按会话分片或批量分配;**别在没有数据前动它** |
+| **客户端无本地消息库**:消息真值在服务端,内存每会话只留 200 条 | 比 OpenIM 本地 SQLite 简单一个量级;弱网下翻更早历史不可用,但已拉内容可看,重连按 height 增量补 | 用户明确需要离线读历史 | chat-core store 后面补一层客户端持久化缓存;height 键集天然支持增量同步,**协议不用改** |
+
+另:限流(每 socket 滑动窗口)、服务端产消息幂等(`insertServerMessage`)、
+媒体 key 契约强制(拒收 URL 形态)是移植时**补上的**缺口,不在此列 ——
+它们已随代码上线,不需要部署侧动作。
 
 ## 阶段 6 预告:LiveKit Cloud(音视频)
 
@@ -595,15 +629,15 @@ git clone https://github.com/openimsdk/openim-docker.git ~/openim-docker
 
 ## 阶段 7:持续备份(**上线前必做**)
 
-`pg_data`、`minio_data` 和 OpenIM 的 Mongo(**全部聊天记录**)都是同一台机器上的
-docker volume。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会**同时**
-全部消失,且没有任何第二份副本。
+`pg_data`、`minio_data` 都是同一台机器上的 docker volume(自研 chat 后聊天记录
+就在 `pg_data` 里)。一次 `docker compose down -v`、一块坏盘,业务数据和聊天记录会
+**同时**全部消失,且没有任何第二份副本。
 
 > **和上面「异地备份」的区别 —— 两者都要,不是二选一。**
 > 上面那节(`deploy/offsite-backup.sh`)只在**发版时**打一份 pg_dump 快照传到异地,
 > 保护的是「这次迁移把库改坏了」,而且**只覆盖 Postgres**。
-> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒)、对象每 15 分钟镜像、
-> 聊天记录每小时加密 dump,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
+> 本节是**持续**备份:WAL 连续归档(Postgres RPO ≈ 60–90 秒,已含聊天记录)、
+> 对象每 15 分钟镜像,保护的是「机器没了」。发版之间的写入、用户上传的媒体、
 > 所有聊天消息,只有本节覆盖得到。
 
 完整方案(覆盖范围、RPO/RTO、运维必须自行创建的桶和凭证、恢复演练、灾难恢复流程)
@@ -614,10 +648,8 @@ cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
 docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
 ```
 
-> 聊天记录备份(OpenIM Mongo)的凭证在**单独的** `.env.backup.mongo`,只有 `backup_mongo`
-> 服务加载它 —— env_file 是整份注入容器的,Mongo 密码放进 `.env.backup` 会连 postgres
-> 容器一起给到,而它根本不需要。另外 `OPENIM_NETWORK` 要写进 `.env`(compose 顶层插值
-> 只认 `.env`/shell,不认 env_file),写在备份配置里不会生效。
+> 遗留:`openim-backup` profile(OpenIM Mongo 每小时加密 dump)仅在退役前的旧栈
+> 迁移期有用 —— 新聊天数据全在 Postgres,不再需要它;旧栈 down 掉后请勿启用该 profile。
 
 > 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
 > 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础

@@ -25,6 +25,7 @@ import {
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import { ClampPagePipe } from 'src/common/pagination';
 import { CirclePlazaService } from './circle-plaza.service';
 import {
   CollaborationRecognitionResultDto,
@@ -188,7 +189,10 @@ export class CirclePlazaController {
   })
   myPosts(
     @Req() req: RequestWithUser,
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    // 这条没走 DTO，所以 @Max 管不到它 —— 用 ParseIntPipe 之后再夹一次，
+    // 否则 ?page=100000000 依旧能强制 Postgres 扫完再把结果丢掉。
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe, ClampPagePipe)
+    page: number,
   ): Promise<{
     items: MyCirclePostDto[];
     total: number;

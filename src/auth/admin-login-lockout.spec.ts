@@ -58,14 +58,12 @@ function buildService(user: UserRow | null) {
     revoke: jest.fn(),
   };
   const jwt = { signAsync: jest.fn().mockResolvedValue('jwt') };
-  const openim = { getUserToken: jest.fn().mockResolvedValue('im') };
   const config = { get: jest.fn().mockReturnValue(undefined) };
 
   const service = new AuthService(
     prisma as never,
     refreshTokenService as never,
     jwt as never,
-    openim as never,
     { listForUser: jest.fn() } as never,
     { verifyCode: jest.fn() } as never,
     config as never,

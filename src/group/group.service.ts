@@ -14,10 +14,10 @@ import {
   ReportReviewStatus,
 } from 'src/generated/prisma';
 import { GroupErrorCode } from 'src/common/app-error-codes';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
-import { enqueueCircleMemberSync } from 'src/circle/circle-member-sync';
-import { OpenimService } from 'src/openim/openim.service';
+import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
@@ -33,7 +33,7 @@ type CircleGroupLookup = {
   id: string;
   groupID: string | null;
   ownerID: string;
-  deleted?: boolean;
+  deleted: boolean;
 };
 
 type CircleGroupMemberLookup = {
@@ -48,9 +48,9 @@ export class GroupService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openimService: OpenimService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
+    private readonly chatCircleSync: ChatCircleSyncService,
   ) {}
 
   async updateGroupMemberRole(
@@ -60,9 +60,7 @@ export class GroupService {
     dto: UpdateGroupMemberRoleDto,
   ): Promise<GroupMemberRoleResultDto> {
     const normalizedGroupID = this.normalizeGroupID(groupID);
-    const normalizedTargetUserID = OpenimService.fromImUserId(
-      targetUserID.trim(),
-    );
+    const normalizedTargetUserID = normalizeUserIdAlias(targetUserID.trim());
     if (!normalizedTargetUserID || normalizedTargetUserID === actorId) {
       throw new ForbiddenException({
         message: 'The group owner cannot change their own role',
@@ -70,37 +68,36 @@ export class GroupService {
       });
     }
 
+    // includeDeleted:停用的圈子要能被查出来,好给一个「群已停用」的明确回复。
+    // 若沿用默认的 deleted:false 过滤,已停用的群会退化成 404「群不存在」——
+    // 管理员分不清是自己记错了群还是这个群被停用了。
     const circle = await this.findCircleByGroupID(normalizedGroupID, true);
-    const roleLevel = dto.role === GroupMemberRoleInput.ADMIN ? 60 : 20;
 
-    if (circle?.deleted) {
+    if (!circle) {
+      // 自研栈下群 = 圈子;OpenIM 时代的裸群已不存在。
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
+    }
+    if (circle.deleted) {
       throw new ForbiddenException({
         message: 'Administrator roles cannot be changed for an inactive group',
         errorCode: GroupErrorCode.ManagerOnly,
       });
     }
 
-    if (!circle) {
-      return this.updateRawGroupMemberRole(
-        actorId,
-        this.rawOpenimGroupID(normalizedGroupID),
-        normalizedTargetUserID,
-        dto,
-        roleLevel,
-      );
-    }
-
-    const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
-    // review P1：先落库（角色 + outbox + 审计原子提交），OpenIM 放到提交后。
-    // 旧顺序在事务内先调 OpenIM，提交失败会回滚本地状态而外部已提权。
+    const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
+      // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID
+      // 取一遍成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」
+      // 的探测接口,顺带还能拿锁竞争当侧信道。
       const preflightActor = await tx.circleMember.findUnique({
         where: {
           userID_circleID: { userID: actorId, circleID: circle.id },
         },
         select: { id: true, role: true, status: true },
       });
-
       if (
         !preflightActor ||
         preflightActor.status !== CircleMemberStatus.ACTIVE ||
@@ -118,15 +115,14 @@ export class GroupService {
       ]);
       // 事务内复查圈子是否已被停用,并对 Circle 行加锁。
       //
-      // 上面那次 deleted 判定是在事务外做的:管理员在那之后按下停用,本事务
-      // 照样会提权、写审计、压 OpenIM 同步 outbox,最后给一个已停用的群返回成功。
+      // findCircleByGroupID 的 deleted:false 是在事务外筛的:管理员在那之后
+      // 按下停用,本事务照样提权并写审计,给一个已停用的群返回成功。
       //
       // 只是重读一遍不够。事务是 SERIALIZABLE,但 SSI 要形成 dangerous structure
-      // 才会中止,单独一条 rw 依赖(我读 Circle、别人写 Circle)并不必然触发 ——
-      // 靠「读到就一定被序列化」是想当然。FOR UPDATE 拿真实行锁才有确定语义:
-      // 停用先提交 → 这里报 40001(P2034),runSerializableTransaction 重试后
-      // 读到 deleted=true 正常拒绝;本事务先拿到锁 → 停用阻塞到提交后再生效,
-      // 此时角色变更确实发生在停用之前,放行是对的。
+      // 才会中止,单独一条 rw 依赖(我读 Circle、别人写 Circle)并不必然触发。
+      // FOR UPDATE 拿真实行锁才有确定语义:停用先提交 → 这里报 40001(P2034),
+      // runSerializableTransaction 重试后读到 deleted=true 正常拒绝;本事务先
+      // 拿到锁 → 停用阻塞到提交后生效,此时角色变更确实发生在停用之前,放行是对的。
       //
       // 位置必须在 memberLock 之后:removeGroupMember / leaveGroup 都是「先成员
       // advisory 锁、后 Circle 行锁」(circle.update 扣 memberCount),反过来加就
@@ -170,7 +166,6 @@ export class GroupService {
           errorCode: GroupErrorCode.ManagerOnly,
         });
       }
-
       if (
         !target ||
         target.status !== CircleMemberStatus.ACTIVE ||
@@ -199,156 +194,17 @@ export class GroupService {
           entityID: target.id,
           metadata: {
             circleID: circle.id,
-            groupID: openimGroupID,
+            groupID: auditGroupID,
             targetUserID: normalizedTargetUserID,
             previousRole: target.role,
             newRole: nextRole,
           },
         },
       });
-      // ADD_MEMBER 的 outbox 语义 = 「成员在群里且角色与 DB 一致」；提交后由
-      // processor 兜底收敛 OpenIM，本地权限真值不依赖外呼成功。
-      await enqueueCircleMemberSync(tx, 'ADD_MEMBER', openimGroupID, [
-        normalizedTargetUserID,
-      ]);
-    });
-
-    // 提交成功后立即推一把 OpenIM（快路径）；失败不回滚也不报错——outbox
-    // 会以 DB 真值重试直到收敛。review R2：推送前重读已提交的角色而非请求参数
-    // ——并发升/降级时本请求可能不是最后提交者，推参数会把旧角色写回 OpenIM。
-    try {
-      const committed = await this.prisma.circleMember.findUnique({
-        where: {
-          userID_circleID: {
-            userID: normalizedTargetUserID,
-            circleID: circle.id,
-          },
-        },
-        select: { role: true, status: true },
-      });
-      if (
-        committed?.status === CircleMemberStatus.ACTIVE &&
-        committed.role !== CircleMemberRole.OWNER
-      ) {
-        await this.openimService.setGroupMemberRole(
-          openimGroupID,
-          normalizedTargetUserID,
-          committed.role === CircleMemberRole.ADMIN ? 60 : 20,
-        );
-      }
-    } catch (error) {
-      this.logger.warn(
-        `OpenIM role push deferred to outbox for group ${openimGroupID}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-
-    return { handled: true, role: dto.role };
-  }
-
-  private async updateRawGroupMemberRole(
-    actorId: string,
-    openimGroupID: string,
-    targetUserID: string,
-    dto: UpdateGroupMemberRoleDto,
-    roleLevel: 20 | 60,
-  ): Promise<GroupMemberRoleResultDto> {
-    // review P2：裸 OpenIM 群没有本地状态，OpenIM 故障要映射成稳定的 503
-    // （与 reportGroup 的裸群成员校验先例一致），而不是裸抛 500。
-    // review R2：群/成员不存在类错误不是故障——归一成 null 走下面的 403/404
-    // 拒绝路径，只有真正的依赖故障才 503。
-    const lookupRole = async (
-      userID: string,
-    ): Promise<20 | 60 | 100 | null> => {
-      try {
-        return await this.openimService.getGroupMemberRole(
-          openimGroupID,
-          userID,
-        );
-      } catch (error) {
-        if (this.isOpenimNotFoundError(error)) return null;
-        this.logger.warn(
-          `Failed to verify raw OpenIM group roles for group ${openimGroupID}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        throw new ServiceUnavailableException({
-          message: 'Group membership cannot be verified right now',
-          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
-        });
-      }
-    };
-    const actorRole = await lookupRole(actorId);
-    if (actorRole !== 100) {
-      throw new ForbiddenException({
-        message: 'Only the group owner can change administrator roles',
-        errorCode: GroupErrorCode.ManagerOnly,
-      });
-    }
-    const targetRole = await lookupRole(targetUserID);
-    if (targetRole !== 20 && targetRole !== 60) {
-      throw new NotFoundException({
-        message: 'Group member not found',
-        errorCode: GroupErrorCode.MemberNotFound,
-      });
-    }
-
-    try {
-      await this.openimService.setGroupMemberRole(
-        openimGroupID,
-        targetUserID,
-        roleLevel,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Failed to update raw OpenIM group role for group ${openimGroupID}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      throw new ServiceUnavailableException({
-        message: 'Group role cannot be updated right now',
-        errorCode: GroupErrorCode.MembershipVerifyUnavailable,
-      });
-    }
-
-    // review P2/R2：裸群同样留审计，且审计不可静默丢——写失败就让整个请求
-    // 失败（角色 set 幂等，客户端重试会重放同一角色并重试审计，最终两者都齐），
-    // 绝不返回一个没有审计痕迹的成功。
-    await this.prisma.adminAuditLog.create({
-      data: {
-        actorID: actorId,
-        action: 'GROUP_MEMBER_ROLE_UPDATED',
-        entityType: 'OpenimGroup',
-        entityID: openimGroupID,
-        metadata: {
-          groupID: openimGroupID,
-          targetUserID,
-          previousRoleLevel: targetRole,
-          newRoleLevel: roleLevel,
-          newRole: dto.role,
-        },
-      },
+      // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
     });
 
     return { handled: true, role: dto.role };
-  }
-
-  /**
-   * OpenIM 「查无此群/此成员」类错误。这是业务上的拒绝信号（403/404），
-   * 不是依赖故障，调用方不应把它映射成可重试的 503。
-   */
-  private isOpenimNotFoundError(error: unknown): boolean {
-    const message = (
-      error instanceof Error ? error.message : String(error)
-    ).toLowerCase();
-    return (
-      message.includes('recordnotfound') ||
-      message.includes('record not found') ||
-      message.includes('not exist') ||
-      message.includes('not in group') ||
-      message.includes('not group member')
-    );
   }
 
   async inviteGroupMembers(
@@ -367,7 +223,7 @@ export class GroupService {
       (userID) => userID !== actorId,
     );
 
-    const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
+    const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.memberLock.lock(tx, circle.id, [actorId, ...targetUserIDs]);
       const [actor, existingMemberships] = await Promise.all([
@@ -410,13 +266,6 @@ export class GroupService {
       if (activatingUserIDs.length === 0) {
         return;
       }
-
-      await enqueueCircleMemberSync(
-        tx,
-        'ADD_MEMBER',
-        openimGroupID,
-        activatingUserIDs,
-      );
     });
 
     return { handled: true };
@@ -448,7 +297,8 @@ export class GroupService {
       });
     }
 
-    const openimGroupID = this.openimGroupID(circle, normalizedGroupID);
+    const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
+    let releasedConversationId: string | null = null;
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.memberLock.lock(tx, circle.id, [
         actorId,
@@ -487,6 +337,13 @@ export class GroupService {
           where: { userID: normalizedTargetUserID, circleID: circle.id },
         });
         await tx.circleMember.delete({ where: { id: target.id } });
+        // 踢人走 delete,对账的 updatedAt 窗口扫不到被删的行 —— 座位必须在同一
+        // 事务里收掉,否则被踢的人照样能读能发、还继续收群消息。
+        releasedConversationId = await this.chatCircleSync.releaseSeatInTx(
+          tx,
+          circle.id,
+          normalizedTargetUserID,
+        );
 
         if (target.status === CircleMemberStatus.ACTIVE) {
           await tx.circle.update({
@@ -504,11 +361,13 @@ export class GroupService {
           group: { ownerID: normalizedTargetUserID },
         },
       });
-
-      await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', openimGroupID, [
-        normalizedTargetUserID,
-      ]);
     });
+    if (releasedConversationId) {
+      this.chatCircleSync.detachSeat(
+        normalizedTargetUserID,
+        releasedConversationId,
+      );
+    }
 
     return { handled: true };
   }
@@ -530,6 +389,7 @@ export class GroupService {
       select: { id: true, groupID: true, ownerID: true },
     });
 
+    let leftConversationId: string | null = null;
     await runSerializableTransaction(this.prisma, async (tx) => {
       let membership: CircleGroupMemberLookup | null = null;
       if (circle) {
@@ -565,14 +425,6 @@ export class GroupService {
       });
 
       if (!circle || !membership) {
-        if (circle) {
-          await enqueueCircleMemberSync(
-            tx,
-            'REMOVE_MEMBER',
-            this.openimGroupID(circle, normalizedGroupID),
-            [userId],
-          );
-        }
         return;
       }
 
@@ -580,6 +432,13 @@ export class GroupService {
         where: { userID: userId, circleID: circle.id },
       });
       await tx.circleMember.delete({ where: { id: membership.id } });
+      // 退群走 delete,对账的 updatedAt 窗口扫不到被删的行 —— 座位必须在同一
+      // 事务里收掉,否则退群的人照样能读能发、还继续收群消息。
+      leftConversationId = await this.chatCircleSync.releaseSeatInTx(
+        tx,
+        circle.id,
+        userId,
+      );
 
       if (membership.status === CircleMemberStatus.ACTIVE) {
         await tx.circle.update({
@@ -587,13 +446,10 @@ export class GroupService {
           data: { memberCount: { decrement: 1 } },
         });
       }
-      await enqueueCircleMemberSync(
-        tx,
-        'REMOVE_MEMBER',
-        this.openimGroupID(circle, normalizedGroupID),
-        [userId],
-      );
     });
+    if (leftConversationId) {
+      this.chatCircleSync.detachSeat(userId, leftConversationId);
+    }
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);
   }
@@ -648,31 +504,11 @@ export class GroupService {
       }
       circleID = circle.id;
     } else {
-      reportGroupID = this.rawOpenimGroupID(normalizedGroupID);
-      let isMember = false;
-      try {
-        isMember = await this.openimService.isGroupMember(
-          reportGroupID,
-          reporterId,
-        );
-      } catch (error) {
-        this.logger.warn(
-          `Failed to verify raw OpenIM group membership for ${reporterId} -> ${reportGroupID}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        throw new ServiceUnavailableException({
-          message: 'Group membership cannot be verified right now',
-          errorCode: GroupErrorCode.MembershipVerifyUnavailable,
-        });
-      }
-
-      if (!isMember) {
-        throw new ForbiddenException({
-          message: 'Only verified group members can report',
-          errorCode: GroupErrorCode.ReportNotVerified,
-        });
-      }
+      // 自研栈下群 = 圈子;OpenIM 时代的裸群不再可举报。
+      throw new NotFoundException({
+        message: 'Group not found',
+        errorCode: GroupErrorCode.NotFound,
+      });
     }
 
     // 只挡「同一举报仍在 PENDING」的重复；APPROVED/REJECTED 审结后允许再次举报新事件
@@ -729,6 +565,10 @@ export class GroupService {
     return undefined;
   }
 
+  /**
+   * includeDeleted:调用方需要区分「群不存在」与「群已停用」时传 true。
+   * 默认过滤掉 deleted —— 其余路径把停用群当作不存在处理即可。
+   */
   private async findCircleByGroupID(
     groupID: string,
     includeDeleted = false,
@@ -785,7 +625,8 @@ export class GroupService {
     return normalizedGroupID;
   }
 
-  private openimGroupID(circle: CircleGroupLookup, fallbackGroupID: string) {
+  /** 审计元数据里的对外群号:沿用 Circle.groupID(=== circle.id),兼容历史行。 */
+  private auditGroupID(circle: CircleGroupLookup, fallbackGroupID: string) {
     return circle.groupID ?? fallbackGroupID;
   }
 
@@ -831,10 +672,6 @@ export class GroupService {
         errorCode: GroupErrorCode.InviteNotAllowed,
       });
     }
-  }
-
-  private rawOpenimGroupID(groupID: string): string {
-    return groupID.startsWith('sg_') ? groupID.slice(3) : groupID;
   }
 
   private uniqueIDs(ids: string[]): string[] {

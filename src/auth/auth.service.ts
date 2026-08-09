@@ -35,7 +35,6 @@ import {
   RefreshTokenService,
   SessionContext,
 } from './refresh-token.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { accessTokenTtlSeconds } from './session-revocation.service';
 import { ConfigService } from '@nestjs/config';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -74,14 +73,6 @@ const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
  * OpenIM 1004「record not found」——请求的用户还没在 OpenIM 落库。
  * getUserToken 抢在异步注册前面时会命中，属于可重试的瞬时竞态。
  */
-export function isOpenImRecordNotFoundError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err ?? '');
-  return (
-    message.includes('record not found') ||
-    message.includes('RecordNotFound') ||
-    message.includes('1004')
-  );
-}
 
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
@@ -135,7 +126,6 @@ export class AuthService {
     private prisma: PrismaService,
     private refreshTokenService: RefreshTokenService,
     private jwt: JwtService,
-    private openim: OpenimService,
     private iconService: IconService,
     private emailVerification: EmailVerificationService,
     private configService: ConfigService,
@@ -187,22 +177,6 @@ export class AuthService {
       email,
       ...(inviter ? { invitedByUserId: inviter.id } : {}),
     });
-
-    // Sync to OpenIM non-blocking. Mark openimSynced=true on success so
-    // login() can detect and retry if this first attempt failed.
-    this.openim
-      .registerUser(user.id, user.nickname, user.avatarUrl)
-      .then(() =>
-        this.prisma.user.update({
-          where: { id: user.id },
-          data: { openimSynced: true },
-        }),
-      )
-      .catch((err) =>
-        this.logger.warn(
-          `OpenIM registerUser failed for ${user.id}: ${err?.message}. Will retry on next login.`,
-        ),
-      );
 
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -459,7 +433,6 @@ export class AuthService {
       undefined,
       {
         audience: 'ADMIN',
-        issueImToken: false,
       },
     );
 
@@ -520,7 +493,6 @@ export class AuthService {
       role: string;
       nickname: string;
       avatarUrl: string | null;
-      openimSynced: boolean;
       singleDeviceLoginEnabled: boolean;
     },
     sessionContext?: SessionContext,
@@ -528,21 +500,6 @@ export class AuthService {
   ) {
     // Retry OpenIM registration for users that weren't synced at register time
     // (e.g. OpenIM was down). Non-blocking — login succeeds regardless.
-    if (!user.openimSynced) {
-      this.openim
-        .registerUser(user.id, user.nickname, user.avatarUrl)
-        .then(() =>
-          this.prisma.user.update({
-            where: { id: user.id },
-            data: { openimSynced: true },
-          }),
-        )
-        .catch((err) =>
-          this.logger.warn(
-            `OpenIM re-sync failed for ${user.id}: ${err?.message}`,
-          ),
-        );
-    }
 
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
     this.prisma.user
@@ -1289,11 +1246,9 @@ export class AuthService {
     platformID?: 1 | 2 | 5,
     options?: {
       audience?: RefreshTokenAudience;
-      issueImToken?: boolean;
     },
   ) {
     const audience = options?.audience ?? 'APP';
-    const issueImToken = options?.issueImToken ?? true;
     let createSession: Promise<{ token: string; sessionId: string }>;
     if (audience === 'APP') {
       createSession = this.refreshTokenService.createAppSession(
@@ -1309,10 +1264,7 @@ export class AuthService {
         );
     }
 
-    const [{ token: refreshToken, sessionId }, imToken] = await Promise.all([
-      createSession,
-      issueImToken ? this.resolveImToken(userId, platformID) : '',
-    ]);
+    const { token: refreshToken, sessionId } = await createSession;
     const accessToken = await this.signAccessToken(
       userId,
       accountId,
@@ -1321,71 +1273,7 @@ export class AuthService {
       audience,
     );
     await this.refreshTokenService.assertSessionActive(userId, sessionId);
-    return issueImToken
-      ? { accessToken, refreshToken, imToken }
-      : { accessToken, refreshToken };
-  }
-
-  /**
-   * 单独签发 IM token，供客户端在「不重新登录」的前提下重建 IM 会话
-   * （登录时 imToken 为空、IM token 过期、连接瞬时失败后恢复等）。
-   *
-   * 身份只来自调用方的 JWT —— 见 AuthController.imToken，不接受任何 userId 入参。
-   *
-   * 与登录的差异只在失败语义：登录时 IM 只是附加能力，拿不到 token 也要放行；
-   * 而这个接口的全部意义就是返回 token，此时再退化成空串就成了「200 + 静默失败」，
-   * 客户端无法区分「IM 未配置」和「OpenIM 挂了」，只能把空值存下来再次陷入
-   * resolveImToken 注释里描述的死角。因此这里显式抛 503，让客户端能退避重试。
-   */
-  async getImToken(
-    userId: string,
-    platformID?: 1 | 2 | 5,
-  ): Promise<{ imToken: string }> {
-    const imToken = await this.resolveImToken(userId, platformID);
-    if (!imToken) {
-      throw new ServiceUnavailableException(
-        'IM token is temporarily unavailable',
-      );
-    }
-    return { imToken };
-  }
-
-  /**
-   * 取 OpenIM 用户 token。IM 不是登录的硬依赖：拿不到时退化为空串，让登录照常完成。
-   * 但失败必须「喊出来」——否则 OpenIM 宕机（如 Kafka 抽风导致 get_user_token 超时）时，
-   * 前端只会静默拿到空 imToken、连不上 IM、会话加载不出来，问题极难定位。
-   *
-   * 注意：OpenIM 被显式禁用（未配置 API/secret）时 getUserToken 直接返回空串、不抛错，
-   * 因此这里的 error 日志只会在「真实故障」时触发，不会对预期内的禁用态误报。
-   */
-  private async resolveImToken(
-    userId: string,
-    platformID?: 1 | 2 | 5,
-  ): Promise<string> {
-    // OpenIM 用户注册是异步非阻塞的（见 registerUser 调用点），注册后紧接着的首个
-    // getUserToken 可能抢在用户落库之前，OpenIM 返回 1004 "record not found"。这是
-    // 可自愈的瞬时竞态 —— 短暂退避后重试即可，避免把「空 imToken」持久化到客户端
-    // （客户端只在登录时刷新 imToken，一旦存了空值会静默跳过 IM 登录、极难定位）。
-    // 真正的宕机/超时不重试：重试也白搭，且每次 getUserToken 有 5s 超时，重试会把
-    // 登录拖到十几秒。这类情况退化为空串并 error 喊出来。
-    const MAX_ATTEMPTS = 3;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-      try {
-        return await this.openim.getUserToken(userId, platformID);
-      } catch (err) {
-        if (attempt < MAX_ATTEMPTS && isOpenImRecordNotFoundError(err)) {
-          await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
-          continue;
-        }
-        this.logger.error(
-          `OpenIM getUserToken failed for userId=${userId} platformID=${platformID ?? 'default'} ` +
-            `after ${attempt} attempt(s); returning empty imToken — client IM login will be skipped`,
-          err instanceof Error ? err.stack : String(err),
-        );
-        return '';
-      }
-    }
-    return '';
+    return { accessToken, refreshToken };
   }
 
   private signAccessToken(

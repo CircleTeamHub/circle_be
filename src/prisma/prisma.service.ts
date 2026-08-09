@@ -21,11 +21,25 @@ const DEFAULT_POOL_MAX = 10;
  * that into a visible error instead.
  */
 const DEFAULT_POOL_ACQUIRE_TIMEOUT_MS = 10_000;
+/**
+ * 单条语句在服务端的最长执行时间。Postgres 默认 0 = 不限。
+ *
+ * 没有它时，一条昂贵的查询（缺索引的数组包含过滤、深 OFFSET、大表 count）会一直
+ * 占着自己那个连接直到跑完 —— 池只有 10 个，几个这样的请求就足以让整个实例的其它
+ * 请求全卡在 connectionTimeoutMillis 上。也就是说上面那个「取连接超时」只让饥饿
+ * 变得可见，真正该限的是单条语句能占多久。
+ *
+ * 15s 远高于任何正常查询（p95 是毫秒级），只用来兜住失控的那种：越界的语句拿到
+ * Postgres 的 57014 错误并立刻归还连接，而不是把整个池拖垮。
+ */
+const DEFAULT_STATEMENT_TIMEOUT_MS = 15_000;
 
 /** The pg pool knobs we expose — named to match pg's `PoolConfig` fields. */
 export interface DatabasePoolConfig {
   max: number;
   connectionTimeoutMillis: number;
+  /** snake_case 是 pg 的字段名（它直接透传给 Postgres），不是笔误。 */
+  statement_timeout: number;
 }
 
 function readPositiveInt(value: unknown, fallback: number): number {
@@ -50,6 +64,10 @@ export function resolveDatabasePoolConfig(
     connectionTimeoutMillis: readPositiveInt(
       env['DATABASE_POOL_ACQUIRE_TIMEOUT_MS'],
       DEFAULT_POOL_ACQUIRE_TIMEOUT_MS,
+    ),
+    statement_timeout: readPositiveInt(
+      env['DATABASE_STATEMENT_TIMEOUT_MS'],
+      DEFAULT_STATEMENT_TIMEOUT_MS,
     ),
   };
 }

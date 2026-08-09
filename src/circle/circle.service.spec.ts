@@ -3,13 +3,13 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import {
   CreateCircleDto,
   MyCirclesQueryDto,
@@ -60,24 +60,20 @@ describe('CircleService', () => {
       create: jest.fn(),
       updateMany: jest.fn(),
     },
-    groupSyncOutbox: {
-      createMany: jest.fn(),
-      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
-    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
-  };
-
-  const openimService = {
-    createGroup: jest.fn(),
-    addGroupMembers: jest.fn(),
-    removeGroupMember: jest.fn(),
   };
 
   const circleInvitationService = {
     getInvitationForViewer: jest.fn(),
   };
   const memberLock = { lock: jest.fn() };
+  const chatCircleSync = {
+    ensureCircleConversation: jest.fn().mockResolvedValue('conv-x'),
+    releaseSeatInTx: jest.fn().mockResolvedValue(null),
+    detachSeat: jest.fn(),
+  };
+  const directChatCircleSync = chatCircleSync as any;
   const directMembershipPolicy = new MembershipPolicyService(prisma as any);
   const directMemberLock = new CircleMemberLockService(directMembershipPolicy);
   const directAdmissionPolicy = new CircleAdmissionPolicy(
@@ -93,13 +89,13 @@ describe('CircleService', () => {
       providers: [
         CircleService,
         { provide: PrismaService, useValue: prisma },
-        { provide: OpenimService, useValue: openimService },
         { provide: CircleInvitationService, useValue: circleInvitationService },
         { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
         MembershipPolicyService,
         { provide: MembershipProgramService, useValue: membershipProgram },
         CircleAdmissionPolicy,
         { provide: CircleMemberLockService, useValue: memberLock },
+        { provide: ChatCircleSyncService, useValue: chatCircleSync },
       ],
     }).compile();
 
@@ -108,6 +104,10 @@ describe('CircleService', () => {
     // 与加入上限都靠 count，默认必须显式归零。
     prisma.circle.count.mockResolvedValue(0);
     prisma.circleMember.count.mockResolvedValue(0);
+    // clearAllMocks 后必须重设:建圈钩子对返回值 .catch(),undefined 会直接抛。
+    chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-x');
+    // 同理:退圈路径要 await 它的返回值,undefined 会让 releasedConversationId 判断失真。
+    chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
     circleInvitationService.getInvitationForViewer.mockResolvedValue({
       id: 'inv-1',
       status: 'PENDING',
@@ -185,7 +185,6 @@ describe('CircleService', () => {
     });
     // PENDING 不占正式名额、不进 OpenIM 群——转正统一发生在担保 finalize。
     expect(prisma.circle.update).not.toHaveBeenCalled();
-    expect(openimService.addGroupMembers).not.toHaveBeenCalled();
   });
 
   it('join reuses an existing pending invitation instead of duplicating it', async () => {
@@ -331,6 +330,28 @@ describe('CircleService', () => {
     });
   });
 
+  // 退圈走 circleMember.delete,而对账扫的是 CircleMember.updatedAt 窗口 ——
+  // 被删的行扫描永远看不见。座位不在同一事务里收掉的话,退圈的人仍是
+  // leftAt=null:能拉历史、能发言、还继续收群消息。
+  it('releases the chat seat inside the leave transaction and detaches the socket', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: 'MEMBER',
+      status: 'ACTIVE',
+    });
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conv-1');
+
+    await service.leaveCircle('user-1', 'circle-1');
+
+    // 第一个参数是事务客户端而不是 this.prisma —— 即「与删除同事务」的证据。
+    expect(chatCircleSync.releaseSeatInTx).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      'user-1',
+    );
+    expect(chatCircleSync.detachSeat).toHaveBeenCalledWith('user-1', 'conv-1');
+  });
+
   it('uses the locked membership state when approval races with leave', async () => {
     prisma.circleMember.findUnique.mockResolvedValue({
       id: 'member-1',
@@ -362,48 +383,9 @@ describe('CircleService', () => {
     });
   });
 
-  it('durably queues the latest REMOVE state when leaving an OpenIM-backed circle', async () => {
-    prisma.circleMember.findUnique.mockResolvedValue({
-      id: 'member-1',
-      role: 'MEMBER',
-      status: 'ACTIVE',
-    });
-    prisma.circle.findUnique.mockResolvedValue({ groupID: 'group-1' });
-
-    await service.leaveCircle('user-1', 'circle-1');
-
-    expect(prisma.groupSyncOutbox.updateMany).toHaveBeenCalledWith({
-      where: {
-        groupID: 'group-1',
-        userID: { in: ['user-1'] },
-      },
-      data: {
-        operation: 'REMOVE_MEMBER',
-        generation: { increment: 1 },
-        status: 'PENDING',
-        attempts: 0,
-        lastError: null,
-        nextAttemptAt: expect.any(Date),
-        processedAt: null,
-      },
-    });
-    expect(prisma.groupSyncOutbox.createMany).toHaveBeenCalledWith({
-      data: [
-        {
-          operation: 'REMOVE_MEMBER',
-          groupID: 'group-1',
-          userID: 'user-1',
-        },
-      ],
-      skipDuplicates: true,
-    });
-    expect(openimService.removeGroupMember).not.toHaveBeenCalled();
-  });
-
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -411,6 +393,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -762,7 +745,6 @@ describe('CircleService', () => {
   it('rejects setCircleAvatar with an off-origin URL when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -770,6 +752,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -792,7 +775,6 @@ describe('CircleService', () => {
   it('rejects uploadCircleIcon with an off-origin URL when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -800,6 +782,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -826,7 +809,6 @@ describe('CircleService', () => {
   it('accepts uploadCircleIcon for a URL served from this app storage', async () => {
     const guarded = new CircleService(
       prisma as any,
-      openimService as any,
       circleInvitationService as any,
       {
         get: jest.fn(() => 'http://10.0.0.195:9000'),
@@ -834,6 +816,7 @@ describe('CircleService', () => {
       directMembershipPolicy,
       directAdmissionPolicy,
       directMemberLock,
+      directChatCircleSync,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',

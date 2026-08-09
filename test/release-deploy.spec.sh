@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
+# 从仓库文件读,不要写死。release-deploy.sh 强制要求
+# RELEASE_SCHEMA_COMPATIBILITY == 签出树里的值,写死的话每次抬高兼容级别
+# (不可逆迁移都要抬)整个套件都会红,而失败原因跟被测行为毫无关系。
+REPO_SCHEMA_COMPATIBILITY="$(cat "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY")"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REAL_MV="$(command -v mv)"
 
@@ -13,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -82,6 +86,16 @@ if [ "${1:-}" = "compose" ]; then
       fi
       ;;
     exec)
+      # 部署脚本会先探一次 Caddy 是否带 rate_limit 模块(deploy/Caddyfile.admin 依赖它)。
+      # 桩不认这条命令的话它恒返回空,守卫必失败,整套用例在第一步就退出。
+      if printf '%s\n' "$*" | grep -q 'caddy list-modules'; then
+        if [ "${CADDY_NO_RATE_LIMIT:-0}" = "1" ]; then
+          printf 'http.handlers.reverse_proxy\n'
+        else
+          printf 'http.handlers.reverse_proxy\nhttp.handlers.rate_limit\n'
+        fi
+        exit 0
+      fi
       if [ -n "${CADDY_RELOAD_FAIL_TARGET:-}" ] &&
         printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=$CADDY_RELOAD_FAIL_TARGET"; then
         exit 43
@@ -176,7 +190,7 @@ run_release() {
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
     RELEASE_DOWNTIME="${RELEASE_DOWNTIME:-0}" \
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
-    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-1}" \
+    RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-$REPO_SCHEMA_COMPATIBILITY}" \
     SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
@@ -187,6 +201,7 @@ run_release() {
     SMOKE_CONTENT_TYPE="${SMOKE_CONTENT_TYPE:-application/json}" \
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
+    CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -258,6 +273,33 @@ test_interrupted_rollout_preserves_recorded_live_color() {
   RELEASE_DOWNTIME=1 MIGRATE_FAIL=1
   ! run_release || return 1
   assert_running circle_be_green && assert_absent circle_be
+}
+
+# deploy/Caddyfile.admin 用了 rate_limit,而官方 caddy 镜像不带这个模块。
+# 镜像没换就切流的话:switch_proxy 的 caddy validate 必失败 → 每次发布都红;
+# 更糟的是 caddy 一旦重启就 crash-loop(entrypoint 是 caddy run,遇未知指令起不来),
+# 等于公网入口整个消失。所以这道前置检查必须真的拦得住,且不能碰任何颜色。
+test_missing_caddy_rate_limit_module_aborts_before_touching_colors() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  CADDY_NO_RATE_LIMIT=1
+  ! run_release || return 1
+  # 现役颜色原封不动,备用颜色没被拉起来 —— 失败必须是「什么都没发生」。
+  assert_running circle_be && assert_absent circle_be_green &&
+    assert_active_color circle_be
+}
+
+test_caddy_rate_limit_check_is_skipped_when_caddy_is_down() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  CADDY_NO_RATE_LIMIT=1
+  # caddy 没在跑时这道检查要让路,由 switch_proxy 自己的「Caddy is not running」
+  # 报错负责 —— 否则错误信息会指向一个不相干的方向。
+  ! run_release || return 1
+  grep -q 'Caddy is not running' "$CASE_DIR/release.log"
 }
 
 test_proxy_switch_precedes_old_color_retirement() {
@@ -375,14 +417,14 @@ test_release_cannot_understate_checked_out_schema_compatibility() {
   new_case
   RELEASE_SCHEMA_COMPATIBILITY=0
   ! run_release || return 1
-  grep -q 'does not match checked-out schema compatibility 1' "$CASE_DIR/release.log" &&
+  grep -q "does not match checked-out schema compatibility $REPO_SCHEMA_COMPATIBILITY" "$CASE_DIR/release.log" &&
     [ ! -s "$TEST_COMMAND_LOG" ]
 }
 
 test_irreversible_release_records_minimum_schema_compatibility() {
   prepare_irreversible_case
   run_release || return 1
-  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "1" ]
+  [ "$(cat "$RELEASE_STATE_DIR/minimum-schema-compatibility")" = "$REPO_SCHEMA_COMPATIBILITY" ]
 }
 
 test_irreversible_migration_failure_restores_old_binary() {
@@ -463,6 +505,8 @@ failures=0
 for test_name in \
   test_migration_failure_restores_downtime_live_color \
   test_interrupted_rollout_preserves_recorded_live_color \
+  test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
+  test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \

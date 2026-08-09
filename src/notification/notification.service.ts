@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  ForbiddenException,
   HttpException,
   HttpStatus,
   Injectable,
@@ -45,6 +46,16 @@ function chunkArray<T>(items: readonly T[], size: number): T[][] {
     chunks.push(items.slice(i, i + size));
   }
   return chunks;
+}
+
+/** Prisma 唯一约束冲突（P2002）。 */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'P2002'
+  );
 }
 
 @Injectable()
@@ -104,27 +115,75 @@ export class NotificationService {
     const revocationSecretHash = dto.revocationSecret
       ? this.hashRevocationSecret(dto.revocationSecret)
       : undefined;
-    await this.prisma.devicePushToken.upsert({
-      where: { token: dto.token },
-      create: {
+
+    // 换绑保护：upsert 的键是 token 本身。没有这道校验的话，任何拿到别人设备令牌的人
+    // 都能把它改挂到自己账号下 —— 受害者从此收不到自己的推送，反而会在锁屏上收到
+    // 攻击者的通知；而且这次 update 还会把原有的 revocationSecretHash 直接置空，
+    // 把设备侧的撤销能力一并抹掉。
+    // 规则：令牌已属于别人时，必须出示与登记时一致的 revocationSecret 才允许换绑
+    // （同一台设备换账号登录是正常场景，客户端本来就持有这个 secret）。
+    //
+    // 归属判定必须与写入是同一条语句。先 findUnique 再 upsert 的话中间有窗口：
+    // 两个账号同时登记一个此前没见过的令牌，都会读到「无主」，后写的那个直接
+    // 把令牌抢走且完全没出示过 secret；同样的读-改-写竞态也会覆盖掉这期间
+    // 别人刚改的归属或 secret。
+    // 做法：带归属谓词的条件更新 → 命中即完成；未命中就尝试 create，
+    // 撞唯一约束(P2002)说明行确实存在但谓词不满足 = 属于别人且没证明 → 拒绝。
+    const update = {
+      userID: userId,
+      platform: dto.platform,
+      provider: dto.provider,
+      projectId: dto.projectId ?? null,
+      appVersion: dto.appVersion ?? null,
+      disabledAt: null,
+      // 只在本次确实带了 secret 时才写。用 `?? null` 的话，老客户端(或任何一次
+      // 不带 secret 的重新登记)会把已有的撤销密钥抹成 null —— 这台设备的令牌
+      // 就从「受保护」降级回「谁知道令牌谁就能抢」，等于自己把下面那道闸拆了。
+      ...(revocationSecretHash ? { revocationSecretHash } : {}),
+    };
+    const claimed = await this.prisma.devicePushToken.updateMany({
+      where: {
         token: dto.token,
-        userID: userId,
-        platform: dto.platform,
-        provider: dto.provider,
-        projectId: dto.projectId ?? null,
-        appVersion: dto.appVersion ?? null,
-        ...(revocationSecretHash ? { revocationSecretHash } : {}),
+        OR: [
+          { userID: userId },
+          ...(revocationSecretHash ? [{ revocationSecretHash }] : []),
+          // 迁移通道：secret 是可选字段，存量行(以及任何没带 secret 登记过的
+          // 客户端)的 revocationSecretHash 是 null。不放行的话，同一台设备换个
+          // 账号登录就永远命中不了谓词 → create 撞唯一约束 → 403，而且是**永久**
+          // 的:直到推送服务商轮换令牌为止，新账号一条推送都收不到。
+          //
+          // 放行 null 行不是新开口子 —— 修复前所有行都能这么抢，这里只是没能
+          // 追溯保护「本来就没有 secret」的那部分。带了 secret 的行依然抢不走，
+          // 而认领方一旦带上 secret，上面的 update 会顺手把这行升级成受保护，
+          // 存量因此会随客户端升级自然收敛。
+          { revocationSecretHash: null },
+        ],
       },
-      update: {
-        userID: userId,
-        platform: dto.platform,
-        provider: dto.provider,
-        projectId: dto.projectId ?? null,
-        appVersion: dto.appVersion ?? null,
-        disabledAt: null,
-        revocationSecretHash: revocationSecretHash ?? null,
-      },
+      data: update,
     });
+    if (claimed.count === 0) {
+      try {
+        await this.prisma.devicePushToken.create({
+          data: {
+            token: dto.token,
+            userID: userId,
+            platform: dto.platform,
+            provider: dto.provider,
+            projectId: dto.projectId ?? null,
+            appVersion: dto.appVersion ?? null,
+            ...(revocationSecretHash ? { revocationSecretHash } : {}),
+          },
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        // 行存在但归属谓词没命中 —— 属于别人且没出示正确的 secret。
+        this.logger.warn(
+          `Rejected push-token rebind: token is owned by another account (requester=${userId})`,
+        );
+        throw new ForbiddenException('Push token belongs to another account');
+      }
+    }
+
     const findTokens = this.prisma.devicePushToken.findMany;
     if (!findTokens) return;
     const excess = await findTokens({

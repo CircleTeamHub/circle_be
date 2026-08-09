@@ -53,32 +53,22 @@ test('Caddy routes requests only to healthy blue-green backends', () => {
   assert.doesNotMatch(caddy, /\}:3000/);
 });
 
-test('production routes backend and public OpenIM paths to the host gateway', () => {
-  const compose = read('docker-compose.prod.yml').replaceAll('\r\n', '\n');
-  const backend = compose
-    .split('\n  circle_be:\n')[1]
-    ?.split('\n  admin_web:')[0];
+test('production carries no OpenIM routing or env residue (self-hosted chat)', () => {
+  const compose = read('docker-compose.prod.yml');
   const exampleEnv = read('.env.production.example');
   const caddy = read('deploy/Caddyfile.admin');
 
-  assert.match(
-    backend,
-    /extra_hosts:\s*\n\s+- ['"]host\.docker\.internal:host-gateway['"]/,
-  );
-  assert.match(
-    exampleEnv,
-    /OPENIM_API_URL=http:\/\/host\.docker\.internal:10002/,
-  );
-  assert.match(caddy, /@openimWs path \/openim-ws \/openim-ws\/\*/);
-  assert.match(caddy, /@openimApi path \/openim-api \/openim-api\/\*/);
-  assert.match(
-    caddy,
-    /handle @openimWs \{[\s\S]*uri strip_prefix \/openim-ws[\s\S]*reverse_proxy \{\$OPENIM_WS_UPSTREAM/,
-  );
-  assert.match(
-    caddy,
-    /handle @openimApi \{[\s\S]*uri strip_prefix \/openim-api[\s\S]*reverse_proxy \{\$OPENIM_API_UPSTREAM/,
-  );
+  // 自研 chat 网关随 circle_be 同端口(/chat-ws),API 域 catch-all 反代即覆盖,
+  // 不允许再出现独立的 OpenIM 路由/上游/环境变量。
+  assert.doesNotMatch(caddy, /openim/i);
+  assert.doesNotMatch(compose, /OPENIM|host\.docker\.internal/);
+  assert.doesNotMatch(exampleEnv, /OPENIM/);
+  // API 域的 catch-all 必须落到 circle_be。不再要求 reverse_proxy 紧跟 handle：
+  // #137 在这个块里加了 api_fallback 限流,中间隔着 rate_limit —— 断言的意图是
+  // 「兜底指向自研后端」,不是「块里除了反代什么都不许有」。
+  const apiFallbackHandle =
+    /handle \{[^}]*zone api_fallback \{[\s\S]{0,200}?reverse_proxy \{\$CIRCLE_BE_UPSTREAM:circle-be-blue:3000\}/;
+  assert.match(caddy, apiFallbackHandle);
 });
 
 test('Caddy switches only between unique blue-green container endpoints', () => {
@@ -526,4 +516,27 @@ test('backend workflow and server use the same strict version format', () => {
   assert.ok(read('.github/workflows/release.yml').includes(strictVersion));
   assert.ok(read('deploy/release-deploy.sh').includes(strictVersion));
   assert.ok(read('deploy/admin-web-deploy.sh').includes(strictVersion));
+});
+
+// note-exports/ 的生命周期规则是它唯一的回收机制,而它挂在一次性的 minio-init 上,
+// 发版又不碰数据面(release-deploy.sh 契约 / DEPLOY.md §4)—— 存量环境升级后根本
+// 执行不到它。所以 entrypoint 必须可重复执行,且必须有一条文档化的补齐步骤,
+// 否则导出产物会一直堆到和 Postgres 同机的磁盘写满。
+test('note-exports lifecycle rule is re-appliable and has a documented rollout', () => {
+  const compose = read('docker-compose.prod.yml');
+  const deployDoc = read('DEPLOY.md');
+
+  // 幂等:先查后加。直接 add 会在重复执行时把规则叠一遍。
+  assert.match(compose, /mc ilm rule ls local\/circle .*\| grep -q 'note-exports\/'/);
+  assert.match(
+    compose,
+    /mc ilm rule add --expire-days 1 --prefix 'note-exports\/' local\/circle/,
+  );
+  // 装完必须自检并在失败时明确告警,不能静默地"看起来成功"。
+  assert.match(compose, /note-exports lifecycle rule is NOT active/);
+  // 存量环境的补齐步骤必须写进 DEPLOY.md,否则老环境永远拿不到这条规则。
+  assert.match(
+    deployDoc,
+    /docker compose -f docker-compose\.prod\.yml run --rm minio-init/,
+  );
 });

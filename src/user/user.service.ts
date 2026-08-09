@@ -10,6 +10,7 @@ import { AuthErrorCode, UserErrorCode } from 'src/common/app-error-codes';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { normalizeUserIdAlias } from './user-id-alias';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
@@ -18,7 +19,6 @@ import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
-import { OpenimService } from 'src/openim/openim.service';
 import { likedOnToday } from '../like/like.util';
 import {
   generateUniqueRegistrationCode,
@@ -228,7 +228,7 @@ export class UserService {
     // 用户默认成 VIP0。
     const aliasesByNormalized = new Map<string, string[]>();
     for (const id of uniqueIds) {
-      const normalized = OpenimService.fromImUserId(id);
+      const normalized = normalizeUserIdAlias(id);
       const list = aliasesByNormalized.get(normalized);
       if (list) {
         list.push(id);
@@ -264,7 +264,7 @@ export class UserService {
 
     const aliasesByNormalized = new Map<string, string[]>();
     for (const id of uniqueIds) {
-      const normalized = OpenimService.fromImUserId(id).toLowerCase();
+      const normalized = normalizeUserIdAlias(id).toLowerCase();
       if (!UUID_PATTERN.test(normalized)) {
         continue;
       }
@@ -545,20 +545,6 @@ export class UserService {
         data: normalizedInput,
         select: PUBLIC_SELECT,
       });
-      if (input.nickname !== undefined || input.avatarUrl !== undefined) {
-        await tx.userProfileSyncOutbox.upsert({
-          where: { userID: id },
-          create: { userID: id, generation: 1 },
-          update: {
-            status: 'PENDING',
-            generation: { increment: 1 },
-            attempts: 0,
-            lastError: null,
-            nextAttemptAt: new Date(),
-            processedAt: null,
-          },
-        });
-      }
       return updated;
     });
     const [displayIcons, appearances] = await Promise.all([

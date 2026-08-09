@@ -23,19 +23,24 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
         update: jest.fn().mockResolvedValue({}),
       },
     };
-    const openim = {
-      isEnabled: jest.fn().mockReturnValue(true),
-      sendTransferCardMessage: jest.fn().mockResolvedValue(undefined),
+    const chatService = {
+      ensureDirectConversationForSettlement: jest
+        .fn()
+        .mockResolvedValue('conv-1'),
+    };
+    const chatMessages = {
+      insertServerMessage: jest.fn().mockResolvedValue(undefined),
     };
     const processor = new GiftCardOutboxProcessor(
       prisma as never,
-      openim as never,
+      chatService as never,
+      chatMessages as never,
     );
-    return { prisma, openim, processor };
+    return { prisma, chatService, chatMessages, processor };
   }
 
-  it('claims the row BEFORE the external send and passes a gift-derived clientMsgID', async () => {
-    const { prisma, openim, processor } = buildHarness();
+  it('claims the row BEFORE the send and passes a gift-derived clientMessageId', async () => {
+    const { prisma, chatService, chatMessages, processor } = buildHarness();
 
     const delivered = await processor.compensate(now);
 
@@ -45,14 +50,27 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
       where: { id: 'gift-1', cardDeliveredAt: null, cardAttempts: 0 },
       data: { cardAttempts: { increment: 1 } },
     });
-    // 抢占调用先于外呼
+    // 抢占调用先于发送
     const claimOrder = prisma.coinGift.updateMany.mock.invocationCallOrder[0];
     const sendOrder =
-      openim.sendTransferCardMessage.mock.invocationCallOrder[0];
+      chatMessages.insertServerMessage.mock.invocationCallOrder[0];
     expect(claimOrder).toBeLessThan(sendOrder);
-    // OpenIM 侧幂等键：重复投递合并成同一条消息
-    expect(openim.sendTransferCardMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ clientMsgID: 'gift_card_gift-1' }),
+    // 卡片补进双方 1:1 会话；幂等键使重复投递合并成同一条消息。
+    // 用结算专用解析而不是交互式的 getOrCreateDirectConversation：后者带拉黑与
+    // 「接收陌生人消息」两道闸，宽限期内对方一拉黑就会让 60 次尝试全部抛错、
+    // 卡片永久丢失 —— 而钱已经划走了。
+    expect(
+      chatService.ensureDirectConversationForSettlement,
+    ).toHaveBeenCalledWith('user-1', 'user-2');
+    expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({
+        senderID: 'user-1',
+        type: 'transfer-card',
+        content: { amount: 50, message: '请喝咖啡' },
+        clientMessageId: 'gift_card_gift-1',
+        push: true,
+      }),
     );
     expect(prisma.coinGift.update).toHaveBeenCalledWith({
       where: { id: 'gift-1' },
@@ -60,33 +78,20 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
     });
   });
 
-  it('does nothing (and marks nothing delivered) while OpenIM is unconfigured (round 2)', async () => {
-    const { prisma, openim, processor } = buildHarness();
-    openim.isEnabled.mockReturnValue(false);
-
-    const delivered = await processor.compensate(now);
-
-    expect(delivered).toBe(0);
-    // 关键：未发出的卡绝不能被标成已送达（那会永久压掉补偿）
-    expect(prisma.coinGift.update).not.toHaveBeenCalled();
-    expect(prisma.coinGift.updateMany).not.toHaveBeenCalled();
-    expect(openim.sendTransferCardMessage).not.toHaveBeenCalled();
-  });
-
   it('skips the send entirely when another replica (or the client receipt) wins the claim', async () => {
-    const { openim, processor } = buildHarness({ claimCount: 0 });
+    const { chatMessages, processor } = buildHarness({ claimCount: 0 });
 
     const delivered = await processor.compensate(now);
 
     expect(delivered).toBe(0);
-    expect(openim.sendTransferCardMessage).not.toHaveBeenCalled();
+    expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
   });
 
   it('logs a permanent-failure error once attempts are exhausted (visible dead-letter)', async () => {
-    const { openim, processor } = buildHarness({
+    const { chatMessages, processor } = buildHarness({
       gifts: [{ ...gift, cardAttempts: 59 }], // 本次失败即打满 60
     });
-    openim.sendTransferCardMessage.mockRejectedValue(new Error('im down'));
+    chatMessages.insertServerMessage.mockRejectedValue(new Error('db down'));
     const errorSpy = jest
       .spyOn(
         (processor as unknown as { logger: { error: (msg: string) => void } })

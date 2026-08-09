@@ -5,8 +5,8 @@
  * Creates accounts, circle memberships, posts, mutual sign-ups and friendships
  * so the circle/plaza + signup features can be exercised end to end.
  *
- * Chat history is intentionally NOT seeded: it lives in OpenIM (MongoDB), and
- * the OpenIM API is currently unreachable from this environment.
+ * Chat history is intentionally NOT seeded here: it lives in the self-hosted
+ * chat tables and is easiest to produce by chatting in the app.
  *
  * Idempotent: seeded rows use deterministic IDs (sha1 of a stable key) and are
  * upserted, so re-running updates in place instead of duplicating.
@@ -363,7 +363,6 @@ async function main() {
         gender: u.gender,
         city: u.city,
         status: 'ACTIVE',
-        openimSynced: false,
       },
     });
   }

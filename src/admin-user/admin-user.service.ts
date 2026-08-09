@@ -61,7 +61,6 @@ const ADMIN_USER_DETAIL_SELECT = {
   whatsup: true,
   securityCodeLockedUntil: true,
   singleDeviceLoginEnabled: true,
-  openimSynced: true,
   creditScore: true,
 } as const;
 
@@ -216,7 +215,6 @@ export class AdminUserService {
         singleDeviceLoginEnabled: user.singleDeviceLoginEnabled,
         activeSessionCount,
         activePushDeviceCount,
-        openimSynced: user.openimSynced,
       },
       summary: {
         creditScore: user.creditScore,
@@ -380,6 +378,16 @@ export class AdminUserService {
         dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
       if (revokedAt) {
         await this.persistSessionRevocation(tx, targetId, revokedAt);
+      } else {
+        // 复活(→ ACTIVE)必须同事务撤掉还排着队的封禁作业。
+        // 封禁那半失败时 outbox 行会留着按退避重试;管理员在重试跑起来之前解封的话,
+        // 处理器照样会把这个已经恢复正常的用户的会话吊销掉,而且失败一次就再重试
+        // 一次 —— 用户被反复踢下线,直到作业成功或过期。
+        // (随 #137 合入 main 一并带过来:那边的原始改动同时含 OpenIM 强制登出,
+        // 本分支已出清 OpenIM,只保留这半。)
+        await tx.sessionRevocationOutbox.deleteMany({
+          where: { userID: targetId },
+        });
       }
 
       return {

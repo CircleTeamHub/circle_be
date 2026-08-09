@@ -103,33 +103,6 @@ enum CircleMemberStatus {
   REJECTED
 }
 
-enum GroupSyncOperation {
-  ADD_MEMBER
-  REMOVE_MEMBER
-}
-
-enum GroupSyncStatus {
-  PENDING
-  PROCESSING
-  COMPLETED
-  FAILED
-}
-
-enum FriendSyncOperation {
-  IMPORT_FRIEND
-  DELETE_FRIEND
-  CLEAR_CONVERSATION
-  ADD_BLACKLIST
-  REMOVE_BLACKLIST
-}
-
-enum FriendSyncStatus {
-  PENDING
-  PROCESSING
-  COMPLETED
-  FAILED
-}
-
 enum FriendChatReplayStatus {
   PENDING
   PROCESSING
@@ -155,13 +128,6 @@ enum NotificationPushDeliveryStatus {
   CONFIRMED
   FAILED
   TERMINAL
-}
-
-enum UserProfileSyncStatus {
-  PENDING
-  PROCESSING
-  COMPLETED
-  FAILED
 }
 
 enum IconAssetSourceType {
@@ -374,7 +340,6 @@ model User {
   fancyNumberExpiresAt         DateTime?
   fancyNumberPermanent         Boolean    @default(false)
   iconPreferencesInitialized   Boolean    @default(false)
-  openimSynced                 Boolean    @default(false)
   lastOnline                   DateTime?
   /// Set once the one-time friend-activity backfill has run for this user.
   activitiesBackfilledAt       DateTime?
@@ -436,7 +401,6 @@ model User {
   conversationGroups                ConversationGroup[]
   callSessionsInitiated             CallSession[]               @relation("callInitiator")
   callParticipants                  CallParticipant[]
-  profileSyncOutbox                 UserProfileSyncOutbox?
   membershipGrantsReceived          MembershipGrant[]           @relation("membershipGrantTarget")
   membershipGrantsIssued            MembershipGrant[]           @relation("membershipGrantOperator")
   membershipBenefitGrants           MembershipBenefitGrant[]
@@ -632,25 +596,6 @@ model FancyNumberOrder {
   @@index([fancyNumberID, createdAt])
   @@index([leaseID, createdAt])
   @@index([createdAt])
-}
-
-model UserProfileSyncOutbox {
-  id            String                @id @default(uuid())
-  userID        String                @unique
-  status        UserProfileSyncStatus @default(PENDING)
-  generation    Int                   @default(0)
-  leaseToken    String?
-  attempts      Int                   @default(0)
-  lastError     String?
-  nextAttemptAt DateTime              @default(now())
-  lockedAt      DateTime?
-  processedAt   DateTime?
-  createdAt     DateTime              @default(now())
-  updatedAt     DateTime              @updatedAt
-
-  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
-
-  @@index([status, nextAttemptAt])
 }
 
 model SessionRevocationOutbox {
@@ -864,46 +809,6 @@ model CreditEvent {
   @@index([userID, createdAt])
   @@index([actorID, createdAt])
   @@index([sourceType, sourceID])
-}
-
-model GroupSyncOutbox {
-  id                   String              @id @default(uuid())
-  operation            GroupSyncOperation
-  generation           Int                 @default(1)
-  processingGeneration Int?
-  processingOperation  GroupSyncOperation?
-  status               GroupSyncStatus     @default(PENDING)
-  groupID              String
-  userID               String
-  attempts             Int                 @default(0)
-  lastError            String?
-  nextAttemptAt        DateTime            @default(now())
-  lockedAt             DateTime?
-  processedAt          DateTime?
-  createdAt            DateTime            @default(now())
-  updatedAt            DateTime            @updatedAt
-
-  @@unique([groupID, userID], map: "GroupSyncOutbox_desired_state_key")
-  @@index([status, nextAttemptAt])
-  @@index([groupID, userID, status])
-}
-
-model FriendSyncOutbox {
-  id            String              @id @default(uuid())
-  operation     FriendSyncOperation
-  status        FriendSyncStatus    @default(PENDING)
-  userID        String
-  targetUserID  String
-  attempts      Int                 @default(0)
-  lastError     String?
-  nextAttemptAt DateTime            @default(now())
-  lockedAt      DateTime?
-  processedAt   DateTime?
-  createdAt     DateTime            @default(now())
-  updatedAt     DateTime            @updatedAt
-
-  @@index([status, nextAttemptAt])
-  @@index([userID, targetUserID, status])
 }
 
 model Note {
@@ -1603,6 +1508,12 @@ model Circle {
   @@index([ownerID])
   @@index([adminState, createdAt])
   @@index([deleted, createdAt])
+  /// GET /circle?city= 走 `cities has ?`（= cities @> ARRAY[?]），数组包含查询用不了
+  /// btree。没有这个 GIN 索引时每次请求都是一次全表顺序扫描 + 一次排序，而且
+  /// service 里 findMany 与 count 是 Promise.all 并发发出的 —— 一个请求同时占用两个
+  /// 连接（池只有 10 个）。GET 上又没有路由级限流，只有 300 次/分钟/IP 的兜底，
+  /// 这是纯读接口里最容易被一个脚本打爆的一条。CirclePost.cities 早就有同款索引。
+  @@index([cities], type: Gin)
 }
 
 model AdminGroupOperation {
@@ -1897,4 +1808,94 @@ model UserLike {
   // Composite backs the per-day quota count (WHERE fromUserID = ? AND likedOn = ?);
   // its fromUserID prefix also serves any fromUserID-only lookup.
   @@index([fromUserID, likedOn])
+}
+
+/// 聊天敏感词词表（OpenIM before-send 回调用）。word 存规范形态
+/// （NFKC + 小写 + 裁剪，见 sensitive-word.matcher.ts），入库前由服务层统一规范化。
+/// createdBy 只作审计参考，不建外键 —— 管理员账号删除不应连带删词。
+model SensitiveWord {
+  id        String   @id @default(uuid())
+  word      String   @unique
+  createdAt DateTime @default(now())
+  createdBy String?
+}
+
+// ===== 自研聊天（替代 OpenIM，src/chat）=====
+
+/// 会话类型：单聊 / 圈子群聊 / 临时群 / 客服。
+enum ChatConversationType {
+  DIRECT
+  GROUP
+  TEMP
+  SUPPORT
+}
+
+/// 聊天会话。消息序协议参考 squady：每会话维护单调递增 height 序号，
+/// 排序、已读水位、增量补拉共用同一坐标系。
+/// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
+/// 不随账号删除级联清除（保留群聊上下文；同 SensitiveWord.createdBy 先例）。
+model ChatConversation {
+  id         String               @id @default(uuid())
+  type       ChatConversationType
+  /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
+  directKey  String?              @unique
+  /// GROUP 会话 ←→ Circle.id（一圈一群）；TEMP 会话 ←→ TempChat.id。
+  circleID   String?              @unique
+  tempChatID String?              @unique
+  /// 会话列表排序依据；发送事务内更新。
+  lastMessageAt DateTime?
+  /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
+  muteAllAt     DateTime?
+  createdAt  DateTime             @default(now())
+  updatedAt  DateTime             @updatedAt
+
+  members  ChatMember[]
+  messages ChatMessage[]
+}
+
+/// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
+/// pinned/muted 是每成员的会话偏好（原 OpenIM 会话属性）。
+model ChatMember {
+  id             String    @id @default(uuid())
+  conversationID String
+  userID         String
+  /// 已读水位：该成员已读的最大 height，只前进不后退。
+  lastReadHeight Int       @default(0)
+  pinned         Boolean   @default(false)
+  muted          Boolean   @default(false)
+  /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。
+  hiddenAt       DateTime?
+  joinedAt       DateTime  @default(now())
+  leftAt         DateTime?
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+
+  @@unique([conversationID, userID])
+  @@index([userID])
+}
+
+/// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
+/// (conversationID, height) 唯一约束兜底乱序；
+/// (conversationID, senderID, clientMessageId) 唯一约束兜底断线重发幂等。
+model ChatMessage {
+  id              String   @id @default(uuid())
+  conversationID  String
+  height          Int
+  /// 发送者 userID；系统消息为 null。
+  senderID        String?
+  /// 消息类型（text/image/voice/… 与各类卡片），content 形状随 type 而定。
+  type            String
+  content         Json
+  /// 客户端幂等键；系统消息为 null（null 不参与唯一约束冲突）。
+  clientMessageId String?  @db.VarChar(128)
+  replyToID       String?
+  deleted         Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+
+  @@unique([conversationID, height])
+  @@unique([conversationID, senderID, clientMessageId])
+  // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
+  @@index([conversationID, createdAt])
 }

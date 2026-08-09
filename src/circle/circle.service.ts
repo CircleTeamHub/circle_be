@@ -13,7 +13,6 @@ import {
 } from 'src/common/app-error-codes';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { OpenimService } from 'src/openim/openim.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import {
@@ -22,8 +21,8 @@ import {
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CIRCLE_CREATE_LIMIT } from './circle-limits';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleMemberLockService } from './circle-member-lock';
-import { enqueueCircleMemberSync } from './circle-member-sync';
 import {
   CircleDetailDto,
   CircleDto,
@@ -48,12 +47,12 @@ export class CircleService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openimService: OpenimService,
     private readonly circleInvitationService: CircleInvitationService,
     private readonly config: ConfigService,
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
+    private readonly chatCircleSync: ChatCircleSyncService,
   ) {
     this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
   }
@@ -175,26 +174,30 @@ export class CircleService {
         },
       });
 
+      // groupID 列保留(历史引用/群扩容等按它寻址),恒等于 circle.id;
+      // OpenIM 群不再创建 —— 聊天会话由下方 chatCircleSync 负责。
+      //
+      // 必须留在事务里:放到事务外的话,这一步失败会留下一个已提交、带 OWNER
+      // 成员、groupID 却为 null 的圈子,而请求已经报错返回 —— 用户重试又要吃掉
+      // 一个 CIRCLE_CREATE_LIMIT 名额(配额按 deleted:false 计数,这个残圈算数)。
+      await tx.circle.update({
+        where: { id: created.id },
+        data: { groupID: created.id },
+      });
+
       return created;
     });
 
-    // Create bound OpenIM group (non-blocking — don't fail circle creation if IM is down)
-    let groupID: string | null = null;
+    const groupID: string | null = circle.id;
 
-    try {
-      await this.openimService.createGroup(circle.id, circle.name, userId, [
-        userId,
-      ]);
-      await this.prisma.circle.update({
-        where: { id: circle.id },
-        data: { groupID: circle.id },
-      });
-      groupID = circle.id;
-    } catch (error) {
+    // 自研聊天:建圈即建群会话(尽力而为;失败由每分钟对账兜底,不阻塞建圈)。
+    void this.chatCircleSync.ensureCircleConversation(circle.id).catch((e) => {
       this.logger.warn(
-        `Failed to create OpenIM group for circle ${circle.id}: ${error}`,
+        `chat conversation sync failed for circle ${circle.id}: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
       );
-    }
+    });
 
     return {
       ...this.toCircleDto(circle),
@@ -452,57 +455,57 @@ export class CircleService {
   }
 
   async leaveCircle(userId: string, circleId: string): Promise<void> {
-    await runSerializableTransaction(this.prisma, async (tx) => {
-      await this.memberLock.lock(tx, circleId, [userId]);
-      const lockedMembership = await tx.circleMember.findUnique({
-        where: { userID_circleID: { userID: userId, circleID: circleId } },
-      });
-      if (!lockedMembership) {
-        throw new NotFoundException({
-          message: 'Not a member',
-          errorCode: CircleErrorCode.NotMember,
+    const releasedConversationId = await runSerializableTransaction(
+      this.prisma,
+      async (tx) => {
+        await this.memberLock.lock(tx, circleId, [userId]);
+        const lockedMembership = await tx.circleMember.findUnique({
+          where: { userID_circleID: { userID: userId, circleID: circleId } },
         });
-      }
-      if (lockedMembership.role === 'OWNER') {
-        throw new ForbiddenException({
-          message: 'Owner cannot leave — transfer ownership first',
-          errorCode: CircleErrorCode.OwnerCannotLeave,
+        if (!lockedMembership) {
+          throw new NotFoundException({
+            message: 'Not a member',
+            errorCode: CircleErrorCode.NotMember,
+          });
+        }
+        if (lockedMembership.role === 'OWNER') {
+          throw new ForbiddenException({
+            message: 'Owner cannot leave — transfer ownership first',
+            errorCode: CircleErrorCode.OwnerCannotLeave,
+          });
+        }
+
+        const wasActive = lockedMembership.status === 'ACTIVE';
+
+        await tx.circleInvitation.updateMany({
+          where: {
+            circleID: circleId,
+            applicantID: userId,
+            status: 'PENDING',
+          },
+          data: { status: 'CANCELLED' },
         });
-      }
 
-      const wasActive = lockedMembership.status === 'ACTIVE';
-
-      await tx.circleInvitation.updateMany({
-        where: {
-          circleID: circleId,
-          applicantID: userId,
-          status: 'PENDING',
-        },
-        data: { status: 'CANCELLED' },
-      });
-
-      await tx.userDisplayIcon.deleteMany({
-        where: { userID: userId, circleID: circleId },
-      });
-      await tx.circleMember.delete({ where: { id: lockedMembership.id } });
-
-      if (wasActive) {
-        await tx.circle.update({
-          where: { id: circleId },
-          data: { memberCount: { decrement: 1 } },
+        await tx.userDisplayIcon.deleteMany({
+          where: { userID: userId, circleID: circleId },
         });
-      }
+        await tx.circleMember.delete({ where: { id: lockedMembership.id } });
 
-      const circle = await tx.circle.findUnique({
-        where: { id: circleId },
-        select: { groupID: true },
-      });
-      if (circle?.groupID) {
-        await enqueueCircleMemberSync(tx, 'REMOVE_MEMBER', circle.groupID, [
-          userId,
-        ]);
-      }
-    });
+        if (wasActive) {
+          await tx.circle.update({
+            where: { id: circleId },
+            data: { memberCount: { decrement: 1 } },
+          });
+        }
+
+        // 退圈走的是 delete,对账的 updatedAt 窗口扫描永远看不见被删的行 ——
+        // 座位必须在这里、在同一事务里收掉,否则退圈的人还能读能发能收群消息。
+        return this.chatCircleSync.releaseSeatInTx(tx, circleId, userId);
+      },
+    );
+    if (releasedConversationId) {
+      this.chatCircleSync.detachSeat(userId, releasedConversationId);
+    }
   }
 
   async uploadCircleIcon(

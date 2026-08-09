@@ -20,7 +20,8 @@ import {
   Prisma,
   UserStatus,
 } from 'src/generated/prisma';
-import { OpenimService } from 'src/openim/openim.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
@@ -84,7 +85,8 @@ export class CallService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly openimService: OpenimService,
+    private readonly chatService: ChatService,
+    private readonly chatMessages: ChatSystemMessageService,
     private readonly livekit: LiveKitCallService,
     private readonly realtime: RealtimeService,
     private readonly config: ConfigService,
@@ -153,12 +155,13 @@ export class CallService {
     const revalidate = (tx: Prisma.TransactionClient) =>
       this.assertDirectCallee(initiatorID, calleeID, tx);
     const users = await this.loadActiveUsers(participantIDs);
-    // 会话 id 用 OpenIM 单聊规约（si_ + 双方 IM id 升序），与客户端会话一致，
-    // 通话留痕消息（#115）正好落进同一个会话。
-    const conversationID = OpenimService.singleConversationID(
-      initiatorID,
-      calleeID,
-    );
+    // 单聊通话的会话标识:确定性双方键(与 chat 的 directKey 同序),
+    // 留痕落库时按参与人取(或建)真实会话,这里只作 CallSession 的稳定标识。
+    const [low, high] =
+      initiatorID < calleeID
+        ? [initiatorID, calleeID]
+        : [calleeID, initiatorID];
+    const conversationID = `direct:${low}:${high}`;
     return this.startCall({
       initiatorID,
       conversationID,
@@ -926,33 +929,43 @@ export class CallService {
       return;
     }
 
-    const rawGroupID = this.rawOpenimGroupID(conversationID);
-    try {
-      const checks = await Promise.all(
-        participantIDs.map((userID) =>
-          this.openimService.isGroupMember(rawGroupID, userID),
-        ),
-      );
-      if (!checks[0]) {
-        throw new ForbiddenException({
-          message: 'CALL_NOT_GROUP_MEMBER',
-          errorCode: CallErrorCode.NotGroupMember,
-        });
-      }
-      if (checks.some((isMember) => !isMember)) {
-        throw new BadRequestException({
-          message: 'CALL_INVITEE_INVALID',
-          errorCode: CallErrorCode.InviteeInvalid,
-        });
-      }
-    } catch (error) {
-      if (
-        error instanceof ForbiddenException ||
-        error instanceof BadRequestException
-      ) {
-        throw error;
-      }
-      throw new ServiceUnavailableException('Group membership unavailable');
+    // 自研栈:非 Circle 形态的 conversationID 一律按会话座位校验
+    // (圈子群聊/临时房统一语义:在座才可参与群呼)。
+    //
+    // 但必须先把单聊会话挡在门外。座位校验对 DIRECT 会话同样成立(双方都在座),
+    // 于是拿一个单聊 conversationID 打群呼端点就能整个绕过 assertDirectCallee ——
+    // 好友关系和双向拉黑都不再校验,被拉黑的人可以照样把对方呼起来。
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationID },
+      select: { type: true },
+    });
+    if (conversation?.type === 'DIRECT') {
+      throw new BadRequestException({
+        message: 'CALL_INVITEE_INVALID',
+        errorCode: CallErrorCode.InviteeInvalid,
+      });
+    }
+
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID,
+        userID: { in: participantIDs },
+        leftAt: null,
+      },
+      select: { userID: true },
+    });
+    const seated = new Set(seats.map((seat) => seat.userID));
+    if (!seated.has(initiatorID)) {
+      throw new ForbiddenException({
+        message: 'CALL_NOT_GROUP_MEMBER',
+        errorCode: CallErrorCode.NotGroupMember,
+      });
+    }
+    if (!participantIDs.every((userID) => seated.has(userID))) {
+      throw new BadRequestException({
+        message: 'CALL_INVITEE_INVALID',
+        errorCode: CallErrorCode.InviteeInvalid,
+      });
     }
   }
 
@@ -1300,67 +1313,63 @@ export class CallService {
           : null;
 
       const isSingle = call.sessionType !== GROUP_SESSION_TYPE;
-      let target:
-        | { kind: 'single'; recvID: string }
-        | { kind: 'group'; groupID: string };
+      // 留痕会话解析:单聊取(或建)双人会话;群呼的 conversationID 可能是
+      // chat 会话 id(新)或 Circle.id(旧入参),两种都解析。
+      let conversationId: string | null = null;
       if (isSingle) {
         const other = call.participants?.find(
           (participant) => participant.userID !== call.initiatorID,
         );
         if (!other) return;
-        target = { kind: 'single', recvID: other.userID };
+        // 走结算专用解析,不过拉黑/陌生人消息那两道闸 —— 那是给用户主动发消息
+        // 设的。通话已经发生过,这条是既成事实的留痕:任一方在通话结束前拉黑,
+        // 交互式路径会让 3 次重试全部抛错,通话记录**永久缺失**,而通话确实打过。
+        // 与转账卡补偿同一条判据(见 ensureDirectConversationForSettlement)。
+        conversationId =
+          await this.chatService.ensureDirectConversationForSettlement(
+            call.initiatorID,
+            other.userID,
+          );
       } else {
-        // round 3 review：/calls/group 接受 Circle.id 作为 conversationID ——
-        // 直接拿它当 OpenIM groupID 发留痕必失败。是 Circle 行则解析出真实
-        // openim 群 id；否则按原样（sg_ 前缀剥离）。
-        target = {
-          kind: 'group',
-          groupID: await this.resolveOpenimGroupID(call.conversationID),
-        };
+        const direct = await this.prisma.chatConversation.findUnique({
+          where: { id: call.conversationID },
+          select: { id: true },
+        });
+        conversationId =
+          direct?.id ??
+          (
+            await this.prisma.chatConversation.findUnique({
+              where: { circleID: call.conversationID },
+              select: { id: true },
+            })
+          )?.id ??
+          null;
       }
+      if (!conversationId) return;
 
-      const message = {
-        sendID: call.initiatorID,
-        senderNickname: initiator?.nickname,
-        senderFaceURL: initiator?.avatarUrl ?? null,
-        target,
-        // 与 Circle_frontend 的 customElem.extension 判别式约定对齐
-        extension: 'call-record-v1',
-        data: {
-          type: 'call_record',
-          callId: call.id,
-          callType: call.callType ?? 'AUDIO',
-          sessionType: isSingle ? 'single' : 'group',
-          endReason,
-          durationSeconds,
-          initiatorID: call.initiatorID,
-        },
-        // round 2 review：重试幂等 —— 固定 clientMsgID 让「超时但 OpenIM 已
-        // 收下」的重试在服务端合并，不再写出第二条留痕。终局转换是 CAS，
-        // 每通电话只有一条留痕在飞，按 callId 定键即可。
-        clientMsgID: `call_record_${call.id}`,
-        // round 2 review：未接推送只对单聊成立 —— 群消息挂 offlinePush 会
-        // 推给全群，而被邀请的可能只是群里两三个人；其余成员会收到一条
-        // 与自己无关的「未接来电」。群聊留痕入历史但不推送。
-        offlinePush:
-          isSingle &&
-          endReason === CallEndReason.NO_ANSWER &&
-          !options.suppressOfflinePush
-            ? {
-                title: initiator?.nickname ?? 'Circle',
-                desc:
-                  call.callType === 'VIDEO'
-                    ? '视频通话未接听'
-                    : '语音通话未接听',
-              }
-            : null,
+      const content = {
+        callId: call.id,
+        callType: call.callType ?? 'AUDIO',
+        sessionType: isSingle ? 'single' : 'group',
+        endReason,
+        durationSeconds,
+        initiatorID: call.initiatorID,
       };
-      // review 修复：一次瞬断（admin token 轮换 / 连接抖动）就永久丢一条
-      // 通话历史太脆 —— 带退避重试 3 次。仍是 fire-and-forget（teardown 的
-      // 广播/删房在此之前已完成），不打断通话收尾。
+      // review 修复:一次瞬断就永久丢一条通话历史太脆 —— 带退避重试 3 次。
+      // 幂等键 call_record_<id>:重试撞唯一约束即合并,永远只有一条留痕。
+      // 未接推送只对单聊成立:群消息推送会打扰与本次通话无关的成员。
       for (let attempt = 1; attempt <= CALL_RECORD_SEND_ATTEMPTS; attempt++) {
         try {
-          await this.openimService.sendCallRecordMessage(message);
+          await this.chatMessages.insertServerMessage(conversationId, {
+            senderID: call.initiatorID,
+            type: 'call-record',
+            content,
+            clientMessageId: `call_record_${call.id}`,
+            push:
+              isSingle &&
+              endReason === CallEndReason.NO_ANSWER &&
+              !options.suppressOfflinePush,
+          });
           return;
         } catch (error) {
           if (attempt === CALL_RECORD_SEND_ATTEMPTS) throw error;
@@ -1504,21 +1513,6 @@ export class CallService {
   }
 
   /** conversationID → 真实 OpenIM 群 id（Circle.id 时查表解析）。 */
-  private async resolveOpenimGroupID(conversationID: string): Promise<string> {
-    const raw = this.rawOpenimGroupID(conversationID);
-    const circle = await this.prisma.circle.findFirst({
-      where: { OR: [{ id: conversationID }, { id: raw }] },
-      select: { groupID: true },
-    });
-    if (circle?.groupID) {
-      return this.rawOpenimGroupID(circle.groupID);
-    }
-    return raw;
-  }
-
-  private rawOpenimGroupID(groupID: string): string {
-    return groupID.startsWith('sg_') ? groupID.slice(3) : groupID;
-  }
 
   private groupIDCandidates(groupID: string): string[] {
     return Array.from(

@@ -16,6 +16,7 @@ import {
   AdminGroupOperationType,
   CircleAdminState,
 } from 'src/generated/prisma';
+import { MAX_PAGE } from 'src/common/pagination';
 
 function trim(value: unknown): unknown {
   return typeof value === 'string' ? value.trim() : value;
@@ -34,6 +35,7 @@ export class AdminCommunityListQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page = 1;
 
   @ApiPropertyOptional({ minimum: 1, maximum: 50, default: 20 })

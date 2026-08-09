@@ -22,14 +22,14 @@ describe('AdminCommunityService', () => {
       callback(tx),
     ),
     circle: { findMany: jest.fn(), count: jest.fn() },
+    chatConversation: { findMany: jest.fn().mockResolvedValue([]) },
     adminGroupOperation: { findMany: jest.fn() },
   };
-  const openim = { listGroups: jest.fn() };
   let service: AdminCommunityService;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new AdminCommunityService(prisma as never, openim as never);
+    service = new AdminCommunityService(prisma as never);
     tx.$executeRaw.mockResolvedValue(1);
     tx.circle.findFirst.mockResolvedValue(null);
     tx.adminGroupOperation.findFirst.mockResolvedValue(null);
@@ -443,24 +443,21 @@ describe('AdminCommunityService', () => {
     expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
   });
 
-  it('merges OpenIM groups with linked circles and pending operations', async () => {
-    openim.listGroups.mockResolvedValue({
-      total: 1,
-      groups: [
-        {
-          groupInfo: {
-            groupID: 'group-1',
-            groupName: '摄影爱好者',
-            status: 3,
-            memberCount: 10,
-          },
-          groupOwnerUserID: 'owner-1',
-          groupOwnerUserName: 'Alice',
-        },
-      ],
-    });
+  it('lists circles as groups with mute state from the chat conversation', async () => {
+    prisma.circle.count.mockResolvedValue(1);
     prisma.circle.findMany.mockResolvedValue([
-      { id: 'circle-1', groupID: 'group-1', name: '摄影圈' },
+      {
+        id: 'circle-1',
+        groupID: 'group-1',
+        name: '摄影圈',
+        avatarUrl: null,
+        memberCount: 10,
+        ownerID: 'owner-1',
+        owner: { nickname: 'Alice' },
+      },
+    ]);
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { circleID: 'circle-1', muteAllAt: new Date() },
     ]);
     prisma.adminGroupOperation.findMany.mockResolvedValue([
       {
@@ -478,9 +475,11 @@ describe('AdminCommunityService', () => {
       search: '',
     });
 
+    expect(result.total).toBe(1);
     expect(result.items[0]).toMatchObject({
       groupId: 'group-1',
       muted: true,
+      ownerName: 'Alice',
       linkedCircle: { id: 'circle-1', name: '摄影圈' },
       pendingOperation: { id: 'operation-1', type: 'MUTE' },
     });

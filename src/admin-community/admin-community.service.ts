@@ -8,10 +8,6 @@ import {
   CircleAdminState,
   Prisma,
 } from 'src/generated/prisma';
-import {
-  type OpenimAdminGroup,
-  OpenimService,
-} from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   prismaErrorCode,
@@ -37,10 +33,7 @@ type GroupAction = {
 
 @Injectable()
 export class AdminCommunityService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly openim: OpenimService,
-  ) {}
+  constructor(private readonly prisma: PrismaService) {}
 
   async listCircles(query: {
     page: number;
@@ -123,36 +116,59 @@ export class AdminCommunityService {
   }
 
   async listGroups(query: { page: number; limit: number; search?: string }) {
-    const response = await this.openim.listGroups({
-      page: query.page,
-      limit: query.limit,
-      keyword: query.search,
-    });
-    const groupIds = response.groups.map((group) => group.groupInfo.groupID);
-    const [circles, operations] = await Promise.all([
+    // 自研栈:群 = 圈子,列表直接查 Circle(禁言态来自会话 muteAllAt)。
+    const where = {
+      deleted: false,
+      ...(query.search
+        ? { name: { contains: query.search, mode: 'insensitive' as const } }
+        : {}),
+    };
+    const [total, circles] = await Promise.all([
+      this.prisma.circle.count({ where }),
       this.prisma.circle.findMany({
-        where: { groupID: { in: groupIds } },
-        select: { id: true, name: true, groupID: true },
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (query.page - 1) * query.limit,
+        take: query.limit,
+        select: {
+          id: true,
+          name: true,
+          groupID: true,
+          avatarUrl: true,
+          memberCount: true,
+          ownerID: true,
+          owner: { select: { nickname: true } },
+        },
       }),
-      this.latestOperations(groupIds),
     ]);
-    const circlesByGroup = new Map(
-      circles
-        .filter((circle) => circle.groupID)
-        .map((circle) => [
-          circle.groupID as string,
-          { id: circle.id, name: circle.name },
-        ]),
+    const groupIds = circles.map((circle) => circle.groupID ?? circle.id);
+    const [operations, conversations] = await Promise.all([
+      this.latestOperations(groupIds),
+      this.prisma.chatConversation.findMany({
+        where: { circleID: { in: circles.map((circle) => circle.id) } },
+        select: { circleID: true, muteAllAt: true },
+      }),
+    ]);
+    const mutedByCircle = new Map(
+      conversations.map((c) => [c.circleID, c.muteAllAt !== null]),
     );
     return {
-      items: response.groups.map((group) =>
-        this.mapGroup(
-          group,
-          circlesByGroup.get(group.groupInfo.groupID) ?? null,
-          operations.get(group.groupInfo.groupID) ?? null,
-        ),
-      ),
-      total: response.total,
+      items: circles.map((circle) => {
+        const groupId = circle.groupID ?? circle.id;
+        return {
+          groupId,
+          name: circle.name,
+          faceUrl: circle.avatarUrl ?? null,
+          status: mutedByCircle.get(circle.id) ? 3 : 0,
+          muted: mutedByCircle.get(circle.id) ?? false,
+          memberCount: circle.memberCount,
+          ownerUserId: circle.ownerID,
+          ownerName: circle.owner?.nickname ?? null,
+          linkedCircle: { id: circle.id, name: circle.name },
+          pendingOperation: operations.get(groupId) ?? null,
+        };
+      }),
+      total,
       page: query.page,
       limit: query.limit,
     };
@@ -174,8 +190,16 @@ export class AdminCommunityService {
     try {
       return await runSerializableTransaction(this.prisma, async (tx) => {
         await this.lockGroup(tx, groupID);
+        // groupID 为空是受支持的历史状态(早年 OpenIM 建群失败时留下的),
+        // 而列表接口对外报的正是 `circle.groupID ?? circle.id` —— 只按 groupID
+        // 反查的话,这类圈子必然查不到:操作记成 circleID=null,处理器"成功"返回,
+        // Circle 却从没被标记 deleted,之后有人打开圈聊,座位又整套重建出来。
+        // 管理员看到的是"已解散",实际群聊照常能用。
+        // 所以按 id 兜一次底 —— 与列表的取值口径对齐。
         const linkedCircle = await tx.circle.findFirst({
-          where: { groupID },
+          where: {
+            OR: [{ groupID }, { id: groupID, groupID: null }],
+          },
           select: {
             id: true,
             name: true,
@@ -474,30 +498,6 @@ export class AdminCommunityService {
         });
         return result;
       });
-  }
-
-  private mapGroup(
-    group: OpenimAdminGroup,
-    linkedCircle: { id: string; name: string } | null,
-    pendingOperation: {
-      id: string;
-      type: AdminGroupOperationType;
-      status: string;
-      lastError: string | null;
-    } | null,
-  ) {
-    return {
-      groupId: group.groupInfo.groupID,
-      name: group.groupInfo.groupName,
-      faceUrl: group.groupInfo.faceURL ?? null,
-      status: group.groupInfo.status,
-      muted: group.groupInfo.status === 3,
-      memberCount: group.groupInfo.memberCount ?? 0,
-      ownerUserId: group.groupOwnerUserID ?? null,
-      ownerName: group.groupOwnerUserName ?? null,
-      linkedCircle,
-      pendingOperation,
-    };
   }
 
   private async assertNoActiveOperation(

@@ -2,7 +2,7 @@
 #
 #   postgres + redis + minio(+ 建桶)+ 一次性 migrate + circle_be
 #
-# OpenIM(阶段5)用官方 openim-docker 单独编排;LiveKit(阶段6)用 LiveKit Cloud。
+# 聊天走自研 chat 网关(随 circle_be 同进程,/chat-ws);LiveKit(阶段6)用 LiveKit Cloud。
 # 完整步骤见 DEPLOY.md。
 #
 # compose 变量插值从同目录 .env 读(DB_PASSWORD / REDIS_PASSWORD / MinIO 密钥)。
@@ -93,11 +93,37 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set}
+    # note-exports/ 的生命周期规则是这里唯一的存量回收机制。
+    # 后端代码里没有任何一处删除 MinIO 对象（全仓 grep DeleteObject/removeObject 为空），
+    # 而笔记导出每次调用都写一个新 key（randomUUID，不去重）。note.service.ts 里的
+    # NOTE_EXPORT_TTL_SECONDS = 15 分钟只是**意图**：upload.service.ts 拿它算了个响应
+    # 字段就丢了，对象本身是永久的。所以导出产物会单调增长，直到和 Postgres 同机的
+    # 磁盘被写满 —— 那时倒下的是数据库，不只是上传功能。
+    # 下发的预签名 URL 15 分钟就失效，所以按天回收不影响任何正常使用；
+    # ilm 失败不阻断建桶（老版本 mc 的子命令名不同），只告警。
+    #
+    # 本服务是一次性的，且发版**不碰**数据面（release-deploy.sh 的契约、
+    # DEPLOY.md §4）：存量环境的 minio-init 早就跑完退出了，光把规则写在这里，
+    # 老环境永远不会执行到 —— 而这是 note-exports/ 唯一的回收机制。
+    # 所以 entrypoint 必须可重复执行，存量环境按 DEPLOY.md 的补齐步骤手工跑一次：
+    #   docker compose -f docker-compose.prod.yml run --rm minio-init
+    # 重复执行安全：mc mb -p 幂等；ilm 先查后加，已存在就跳过（直接 add 会重复叠规则）。
     entrypoint: >
       sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
       mc mb -p local/circle &&
-      echo 'minio bucket [circle] ready'
+      if mc ilm rule ls local/circle 2>/dev/null | grep -q 'note-exports/'; then
+        echo 'note-exports lifecycle rule already present';
+      elif mc ilm rule add --expire-days 1 --prefix 'note-exports/' local/circle; then
+        echo 'note-exports lifecycle rule installed';
+      else
+        echo 'WARN: could not install note-exports lifecycle rule';
+      fi;
+      if mc ilm rule ls local/circle 2>/dev/null | grep -q 'note-exports/'; then
+        echo 'minio bucket [circle] ready';
+      else
+        echo 'WARN: note-exports lifecycle rule is NOT active; exports will accumulate';
+      fi
       "
     restart: 'no'
 
@@ -134,8 +160,6 @@ services:
       minio-init: { condition: service_completed_successfully }
     environment:
       NODE_ENV: production
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro
@@ -171,7 +195,14 @@ services:
       - '80'
 
   caddy:
-    image: caddy:2-alpine
+    # 官方镜像不带限流模块，故本地构建（见 Dockerfile.caddy）。
+    # release-deploy.sh 只 pull circle_be/migrate、只 `up --no-build` 在役颜色，
+    # 因此这里的 build 不参与发布流程；首次或升级 Caddy 时手动
+    # `docker compose -f docker-compose.prod.yml build caddy && ... up -d caddy`。
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    image: circle-caddy:ratelimit
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 256m
@@ -180,17 +211,10 @@ services:
       # required: false 的理由同 admin_web —— 在役颜色可能是 circle_be_green。
       circle_be: { condition: service_healthy, required: false }
       admin_web: { condition: service_started, required: false }
-    # OpenIM 用官方 openim-docker 独立编排，不在本 compose 的网络里，网关跑在宿主机。
-    # 容器里的 127.0.0.1 是容器自己 —— 要回宿主机只能走 host-gateway。
-    # （OpenIM 若挪到别的主机，用 OPENIM_WS_UPSTREAM/OPENIM_API_UPSTREAM 覆盖成其内网地址。）
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
     environment:
       API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env}
       ADMIN_DOMAIN: ${ADMIN_DOMAIN:?set ADMIN_DOMAIN in .env}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
-      OPENIM_WS_UPSTREAM: ${OPENIM_WS_UPSTREAM:-host.docker.internal:10001}
-      OPENIM_API_UPSTREAM: ${OPENIM_API_UPSTREAM:-host.docker.internal:10002}
     ports:
       - '80:80'
       - '443:443'

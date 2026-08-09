@@ -1289,6 +1289,75 @@ describe('NoteService', () => {
     });
   });
 
+  // key 用内容哈希是为了让「同一篇没改过的笔记反复导出」复用同一个对象。
+  // 但带媒体的笔记在导出前会现签一批预签名 URL,签名每次都不同,这些 URL 直接
+  // 嵌在 SVG/PDF 里 —— 若拿 body 去算哈希,key 每次都变,每导出一次就多留一个
+  // 永久对象,防磁盘耗尽的整个机制形同虚设。指纹必须取自稳定量。
+  it('reuses one object key across repeated exports of an unchanged media note', async () => {
+    const mediaNote = () => ({
+      id: 'note-stable',
+      ownerID: 'user-1',
+      title: '稳定导出',
+      content: '正文',
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      coverMedia: null,
+      media: [
+        {
+          id: 'img-1',
+          type: 'IMAGE',
+          objectKey: 'notes/user-1/stable.jpg',
+          url: 'https://cdn.example.com/stable.jpg',
+          mimeType: 'image/jpeg',
+          size: 10,
+          sortOrder: 0,
+        },
+      ],
+      createdAt: new Date('2026-06-01T00:00:00.000Z'),
+      // 两次导出之间笔记没有任何改动。
+      updatedAt: new Date('2026-06-02T00:00:00.000Z'),
+    });
+    prisma.note.findFirst
+      .mockResolvedValueOnce(mediaNote())
+      .mockResolvedValueOnce(mediaNote());
+    // 真实签名每次都不同 —— 默认那个确定性 mock 会让这条回归测试永远是绿的。
+    let signature = 0;
+    uploadService.createPresignedGetUrl.mockImplementation((key: string) => {
+      signature += 1;
+      return Promise.resolve({
+        url: `https://signed.example.com/${key}?sig=${signature}`,
+        expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+      });
+    });
+    uploadService.uploadBuffer.mockResolvedValue({
+      url: 'https://cdn.example.com/note-exports/user-1/note-stable/a.svg',
+      key: 'note-exports/user-1/note-stable/a.svg',
+      size: 1234,
+      expiresAt: new Date('2026-06-29T12:15:00.000Z'),
+    });
+
+    for (let round = 0; round < 2; round += 1) {
+      await (service as any).createNoteExport('user-1', 'note-stable', {
+        format: 'IMAGE',
+      });
+    }
+
+    const keys = uploadService.uploadBuffer.mock.calls.map(
+      ([args]: [{ key: string }]) => args.key,
+    );
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    // 签名确实变过,否则这条测试没有区分力。
+    expect(signature).toBeGreaterThan(2);
+  });
+
   it('exports PDF with embedded note images from storage objects', async () => {
     const expiresAt = new Date('2026-06-29T12:15:00.000Z');
     prisma.note.findFirst.mockResolvedValueOnce({

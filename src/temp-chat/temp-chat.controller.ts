@@ -7,25 +7,41 @@ import {
   NotFoundException,
   Param,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
+import { ChatService } from 'src/chat/chat.service';
+import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
+import { UploadService } from 'src/upload/upload.service';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
+import { GuestPresignDto } from './dto/guest-presign.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
+import {
+  TempChatGuestGuard,
+  type RequestWithTempChatGuest,
+} from './temp-chat-guest.guard';
 import { TempChatService } from './temp-chat.service';
+import { TempChatUploadQuota } from './temp-chat-upload-quota';
 
 @ApiTags('Temp Chat')
 @Controller('temp-chat')
 @UseGuards(ThrottlerGuard)
 export class TempChatController {
-  constructor(private readonly service: TempChatService) {}
+  constructor(
+    private readonly service: TempChatService,
+    private readonly chatService: ChatService,
+    private readonly uploadService: UploadService,
+    private readonly uploadQuota: TempChatUploadQuota,
+  ) {}
 
   @Post()
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: '创建临时聊天（发起人）' })
   create(@Req() req: any, @Body() dto: CreateTempChatDto) {
@@ -33,7 +49,7 @@ export class TempChatController {
   }
 
   @Get('mine')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: '发起人的临时聊天列表' })
   listMine(@Req() req: any) {
@@ -81,8 +97,63 @@ export class TempChatController {
     }
   }
 
+  // 访客历史(冷路径):Bearer 访客聊天凭证;实时走 /chat-ws 二形态握手。
+  @Get('guest/messages')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客拉取房间历史(height 键集分页)' })
+  guestHistory(
+    @Req() req: RequestWithTempChatGuest,
+    @Query() query: HistoryQueryDto,
+  ) {
+    return this.chatService.getHistory(
+      req.tempChatGuest.guestId,
+      req.tempChatGuest.conversationId,
+      query.beforeHeight,
+      query.limit,
+      {},
+      // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
+      // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
+      { applyViewerRetention: false },
+    );
+  }
+
+  // 访客成员目录(冷路径):访客页成员面板用,房主由 isHost 标出。
+  @Get('guest/members')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客拉取房间成员目录' })
+  guestMembers(@Req() req: RequestWithTempChatGuest) {
+    return this.service.listGuestMembers(req.tempChatGuest);
+  }
+
+  // 访客发图:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
+  // 入参用 GuestPresignDto 而非 upload 的 PresignDto —— 后者放行 video/* 且上限
+  // 100 MiB,匿名访客不该有那种申请面。次数限流之外再走累计字节配额。
+  @Post('guest/upload-presign')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客图片上传预签名' })
+  async guestUploadPresign(
+    @Req() req: RequestWithTempChatGuest,
+    @Body() dto: GuestPresignDto,
+  ) {
+    await this.uploadQuota.consume(
+      req.tempChatGuest.guestId,
+      req.tempChatGuest.tcId,
+      dto.sizeBytes,
+    );
+    return this.uploadService.presign(
+      dto.filename,
+      dto.contentType,
+      dto.sizeBytes,
+      'chat',
+      req.tempChatGuest.guestId,
+    );
+  }
+
   @Post(':id/end')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: '发起人手动结束' })
