@@ -31,6 +31,11 @@ describe('ChatService', () => {
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
+    chatMessageReaction: {
+      create: jest.fn(),
+      deleteMany: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
@@ -1375,6 +1380,207 @@ describe('ChatService', () => {
       expect(dto.revokedBy).toBe('u1');
       expect(prisma.chatMessage.update).not.toHaveBeenCalled();
       expect(broadcast.emitRevoke).not.toHaveBeenCalled();
+    });
+  });
+
+
+  describe('markDelivered(G-07 送达水位)', () => {
+    it('clamps to the conversation ceiling and only moves forward', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      const result = await service.markDelivered('u1', 'conv-1', 2_000_000);
+
+      expect(result).toEqual({ advanced: true, height: 9 });
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: 'u1',
+          lastDeliveredHeight: { lt: 9 },
+        },
+        data: { lastDeliveredHeight: 9 },
+      });
+    });
+  });
+
+  describe('toggleReaction(G-07 表情回应)', () => {
+    const reactableRow = {
+      conversationID: 'conv-1',
+      deleted: false,
+      revokedAt: null,
+    };
+
+    it('rejects emojis outside the whitelist', async () => {
+      await expect(
+        service.toggleReaction('u1', 'conv-1', 'm1', '🦖', 'add'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_INVALID_PAYLOAD' },
+      });
+    });
+
+    it('adds once and treats duplicate adds as no-change', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
+      prisma.chatMessageReaction.create.mockResolvedValueOnce({});
+
+      await expect(
+        service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
+      ).resolves.toEqual({ changed: true });
+
+      prisma.chatMessageReaction.create.mockRejectedValueOnce({
+        code: 'P2002',
+      });
+      await expect(
+        service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
+      ).resolves.toEqual({ changed: false });
+    });
+
+    it('silently ignores reactions on revoked messages', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...reactableRow,
+        revokedAt: new Date(),
+      });
+      await expect(
+        service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
+      ).resolves.toEqual({ changed: false });
+      expect(prisma.chatMessageReaction.create).not.toHaveBeenCalled();
+    });
+
+    it('removes an existing reaction', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
+      prisma.chatMessageReaction.deleteMany.mockResolvedValue({ count: 1 });
+      await expect(
+        service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'remove'),
+      ).resolves.toEqual({ changed: true });
+    });
+  });
+
+  describe('editMessage(G-07 消息编辑)', () => {
+    const editableRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'm1',
+      conversationID: 'conv-1',
+      senderID: 'u1',
+      type: 'text',
+      content: { text: 'old text' },
+      height: 5,
+      replyToID: null,
+      clientMessageId: 'd1',
+      deleted: false,
+      revokedAt: null,
+      revokedBy: null,
+      editedAt: null,
+      contentHistory: null,
+      createdAt: new Date(),
+      ...overrides,
+    });
+
+    it('lets the sender edit text within the window and keeps a history trail', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      prisma.chatMessage.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          ...editableRow(),
+          ...data,
+        }),
+      );
+
+      const dto = await service.editMessage('u1', 'conv-1', 'm1', {
+        text: 'new text',
+      });
+
+      expect(prisma.chatMessage.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'm1' }),
+          data: expect.objectContaining({
+            content: expect.objectContaining({ text: 'new text' }),
+            editedAt: expect.any(Date),
+            contentHistory: [{ text: 'old text' }],
+          }),
+        }),
+      );
+      expect(dto.content['text']).toBe('new text');
+      expect(dto.editedAt).toEqual(expect.any(String));
+    });
+
+    it('rejects a non-sender with CHAT_EDIT_FORBIDDEN', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ userID: 'u2' }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      await expect(
+        service.editMessage('u2', 'conv-1', 'm1', { text: 'x' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_EDIT_FORBIDDEN' },
+      });
+    });
+
+    it('rejects outside the window with CHAT_EDIT_WINDOW_EXPIRED', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        editableRow({ createdAt: new Date(Date.now() - 3 * 60_000) }),
+      );
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'x' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_EDIT_WINDOW_EXPIRED' },
+      });
+    });
+
+    it('runs the sensitive-word check on the new text', async () => {
+      sensitiveWords.check.mockReturnValue({ blocked: true, word: '敏感' });
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: '有敏感词' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_SENSITIVE_WORD_BLOCKED' },
+      });
+    });
+
+    it('refuses to edit non-text types', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        editableRow({ type: 'image', content: { key: 'chat/u1/a.jpg' } }),
+      );
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'x' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_EDIT_FORBIDDEN' },
+      });
+    });
+  });
+
+  describe('listMessageReaders(G-07 逐条已读)', () => {
+    it('returns seated members whose read watermark covers the height, excluding the sender', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        conversationID: 'conv-1',
+        height: 5,
+        senderID: 'u1',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u2' },
+        { userID: 'u3' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u2', nickname: 'B', avatarUrl: null },
+        { id: 'u3', nickname: 'C', avatarUrl: null },
+      ]);
+
+      const result = await service.listMessageReaders('u1', 'conv-1', 'm1');
+
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            lastReadHeight: { gte: 5 },
+            userID: { not: 'u1' },
+            leftAt: null,
+          }),
+        }),
+      );
+      expect(result.total).toBe(2);
+      expect(result.readers.map((r) => r.nickname)).toEqual(['B', 'C']);
     });
   });
 

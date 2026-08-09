@@ -23,6 +23,8 @@ const PREVIEW_MAX_LENGTH = 60;
 const PUSH_TARGET_CAP = 6000;
 /** 单批并发的推送数,给连接池和推送供应商留背压。 */
 const PUSH_SEND_CONCURRENCY = 50;
+/** 附带 badge 的最大扇出规模:超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
+const BADGE_TARGETS_MAX = 200;
 
 @Injectable()
 export class ChatPushService {
@@ -73,6 +75,12 @@ export class ChatPushService {
     if (targets.length === 0) return;
 
     const payload = await this.composePayload(message, conversation);
+    // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
+    // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
+    const badges =
+      targets.length <= BADGE_TARGETS_MAX
+        ? await this.loadUnreadBadges(targets.map((t) => t.userID))
+        : new Map<string, number>();
     // 分批并发发送:扩容后的圈子可到 3000 人,一次性 allSettled 三千个
     // listActiveTokens 会把连接池和推送供应商同时打满。
     let failed = 0;
@@ -83,7 +91,11 @@ export class ChatPushService {
         batch.map(async (seat) => {
           const tokens = await this.push.listActiveTokens(seat.userID);
           if (tokens.length === 0) return;
-          await this.push.sendToTokens(tokens, payload);
+          const badge = badges.get(seat.userID);
+          await this.push.sendToTokens(
+            tokens,
+            badge !== undefined ? { ...payload, badge } : payload,
+          );
         }),
       );
       // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
@@ -132,6 +144,39 @@ export class ChatPushService {
       );
     }
     return seats;
+  }
+
+  /**
+   * G-18:一条聚合查询算出这批收件人的全局未读总数(底数 = 已读与清空水位
+   * 的更高者,不计自己发的、不计已删)。失败返回空 map,推送不带 badge。
+   */
+  private async loadUnreadBadges(
+    userIds: string[],
+  ): Promise<Map<string, number>> {
+    if (userIds.length === 0) return new Map();
+    try {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ userID: string; count: bigint }>
+      >`
+        SELECT cm."userID", COUNT(*)::bigint AS count
+        FROM "ChatMember" cm
+        JOIN "ChatMessage" m ON m."conversationID" = cm."conversationID"
+        WHERE cm."userID" = ANY(${userIds}::text[])
+          AND cm."leftAt" IS NULL
+          AND m."deleted" = false
+          AND m."height" > GREATEST(cm."lastReadHeight", cm."clearedBeforeHeight")
+          AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")
+        GROUP BY cm."userID"
+      `;
+      return new Map(rows.map((row) => [row.userID, Number(row.count)]));
+    } catch (error) {
+      this.logger.warn(
+        `push badge aggregation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return new Map();
+    }
   }
 
   private mentionedUserIds(message: ChatMessageDto): Set<string> {

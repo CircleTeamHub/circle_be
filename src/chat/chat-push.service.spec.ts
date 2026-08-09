@@ -18,6 +18,7 @@ function msg(overrides: Partial<ChatMessageDto> = {}): ChatMessageDto {
 
 describe('ChatPushService', () => {
   const prisma = {
+    $queryRaw: jest.fn().mockResolvedValue([]),
     chatMember: { findMany: jest.fn() },
     chatConversation: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn() },
@@ -45,6 +46,21 @@ describe('ChatPushService', () => {
       { token: 'ExponentPushToken[a]', projectId: null },
     ]);
     push.sendToTokens.mockResolvedValue([]);
+  });
+
+
+  it('attaches a per-recipient unread badge on small fanouts (G-18)', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'u-peer', muted: false },
+    ]);
+    prisma.$queryRaw.mockResolvedValue([{ userID: 'u-peer', count: 7n }]);
+
+    await service.onMessageBroadcast(msg());
+
+    expect(push.sendToTokens).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ badge: 7 }),
+    );
   });
 
   it('fetches every seat in one bounded query instead of paging (G-06)', async () => {

@@ -1867,6 +1867,8 @@ model ChatMember {
   userID         String
   /// 已读水位：该成员已读的最大 height，只前进不后退。
   lastReadHeight Int       @default(0)
+  /// 送达水位（G-07）：客户端收到 chat:msg 后回报的最大 height；只前进。
+  lastDeliveredHeight Int  @default(0)
   /// 清空聊天记录水位（G-14）：本人只看得到 height 大于该值的消息；只前进。
   clearedBeforeHeight Int  @default(0)
   pinned         Boolean   @default(false)
@@ -1902,12 +1904,32 @@ model ChatMessage {
   revokedAt       DateTime?
   /// 执行撤回的人（发送者本人或圈主/管理员）。
   revokedBy       String?
+  /// 编辑时间（G-07）；仅发送者、仅 text/quote、时间窗内。height 不变。
+  editedAt        DateTime?
+  /// 编辑前的历史 content 数组（留痕，不外发）。
+  contentHistory  Json?
   createdAt       DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  reactions    ChatMessageReaction[]
 
   @@unique([conversationID, height])
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
+}
+
+/// 消息表情回应（G-07）。不进 height 坐标系：不是消息、不推进未读、
+/// 不改 lastMessageAt；emoji 收白名单（服务端校验），同人同 emoji 唯一。
+model ChatMessageReaction {
+  id        String   @id @default(uuid())
+  messageID String
+  userID    String
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now())
+
+  message ChatMessage @relation(fields: [messageID], references: [id], onDelete: Cascade)
+
+  @@unique([messageID, userID, emoji])
+  @@index([messageID])
 }

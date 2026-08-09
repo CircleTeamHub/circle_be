@@ -36,6 +36,9 @@ import type {
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
+  ChatDeliveredPayload,
+  ChatEditPayload,
+  ChatReactionPayload,
   ChatRevokePayload,
   ChatSendAck,
   ChatSendPayload,
@@ -75,6 +78,9 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly typingLimiter: DistributedRateLimiter;
   private readonly presenceLimiter: DistributedRateLimiter;
   private readonly revokeLimiter: DistributedRateLimiter;
+  private readonly deliveredLimiter: DistributedRateLimiter;
+  private readonly reactionLimiter: DistributedRateLimiter;
+  private readonly editLimiter: DistributedRateLimiter;
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
@@ -111,6 +117,9 @@ export class ChatGateway implements OnModuleDestroy {
     this.typingLimiter = make('typing');
     this.presenceLimiter = make('presence');
     this.revokeLimiter = make('revoke');
+    this.deliveredLimiter = make('delivered');
+    this.reactionLimiter = make('reaction');
+    this.editLimiter = make('edit');
   }
 
   /**
@@ -443,6 +452,21 @@ export class ChatGateway implements OnModuleDestroy {
         whenReady(() => void this.handleRevoke(userId, payload, ack));
       },
     );
+    socket.on(CHAT_EVENTS.delivered, (payload: ChatDeliveredPayload) => {
+      whenReady(() => void this.handleDelivered(userId, payload));
+    });
+    socket.on(
+      CHAT_EVENTS.reaction,
+      (payload: ChatReactionPayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleReaction(userId, payload, ack));
+      },
+    );
+    socket.on(
+      CHAT_EVENTS.edit,
+      (payload: ChatEditPayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleEdit(userId, payload, ack));
+      },
+    );
     socket.on(
       CHAT_EVENTS.presence,
       (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
@@ -464,6 +488,9 @@ export class ChatGateway implements OnModuleDestroy {
       this.typingLimiter.pruneExpired(userId);
       this.presenceLimiter.pruneExpired(userId);
       this.revokeLimiter.pruneExpired(userId);
+      this.deliveredLimiter.pruneExpired(userId);
+      this.reactionLimiter.pruneExpired(userId);
+      this.editLimiter.pruneExpired(userId);
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
@@ -636,6 +663,124 @@ export class ChatGateway implements OnModuleDestroy {
       }
     } catch (error) {
       reply(this.toAckError(error, 'read', userId, payload?.conversationId));
+    }
+  }
+
+  /** G-07 送达:无 ack 尽力而为(丢了影响小,下一条消息会再报更高水位)。 */
+  private async handleDelivered(
+    userId: string,
+    payload: ChatDeliveredPayload,
+  ): Promise<void> {
+    if (!(await this.deliveredLimiter.tryAcquire(userId))) return;
+    try {
+      const conversationId = payload?.conversationId;
+      const height = Number(payload?.height);
+      if (typeof conversationId !== 'string' || conversationId.length === 0) {
+        return;
+      }
+      const result = await this.chatService.markDelivered(
+        userId,
+        conversationId,
+        height,
+      );
+      if (result.advanced) {
+        this.broadcast.emitDelivered({
+          conversationId,
+          userId,
+          height: result.height,
+        });
+      }
+    } catch (error) {
+      this.logger.debug(
+        `delivered report dropped user=${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** G-07 表情回应:白名单与成员校验在 service;无变化不广播(幂等重放静默)。 */
+  private async handleReaction(
+    userId: string,
+    payload: ChatReactionPayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.reactionLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const { conversationId, messageId, emoji, op } = payload ?? {};
+      if (
+        typeof conversationId !== 'string' ||
+        typeof messageId !== 'string' ||
+        typeof emoji !== 'string' ||
+        (op !== 'add' && op !== 'remove')
+      ) {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      const result = await this.chatService.toggleReaction(
+        userId,
+        conversationId,
+        messageId,
+        emoji,
+        op,
+      );
+      reply({ ok: true });
+      if (result.changed) {
+        this.broadcast.emitReaction({
+          conversationId,
+          messageId,
+          emoji,
+          op,
+          userId,
+        });
+      }
+    } catch (error) {
+      reply(
+        this.toAckError(error, 'reaction', userId, payload?.conversationId),
+      );
+    }
+  }
+
+  /** G-07 编辑:authz/窗口/敏感词在 service;成功即广播新 content。 */
+  private async handleEdit(
+    userId: string,
+    payload: ChatEditPayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.editLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const conversationId = payload?.conversationId;
+      const messageId = payload?.messageId;
+      if (
+        typeof conversationId !== 'string' ||
+        typeof messageId !== 'string'
+      ) {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      const dto = await this.chatService.editMessage(
+        userId,
+        conversationId,
+        messageId,
+        payload?.content,
+      );
+      reply({ ok: true });
+      this.broadcast.emitEdit({
+        conversationId,
+        messageId,
+        content: dto.content,
+        editedAt: dto.editedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      reply(this.toAckError(error, 'edit', userId, payload?.conversationId));
     }
   }
 

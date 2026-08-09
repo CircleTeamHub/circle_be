@@ -162,6 +162,23 @@ export class ChatController {
     return this.chatService.clearHistory(req.user.userId, conversationId);
   }
 
+  @Get('conversations/:id/messages/:messageId/readers')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '逐条已读回执:读者 = 已读水位 ≥ 该消息 height 的成员',
+  })
+  listMessageReaders(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('messageId', ParseUUIDPipe) messageId: string,
+  ): Promise<{ readers: unknown[]; total: number }> {
+    return this.chatService.listMessageReaders(
+      req.user.userId,
+      conversationId,
+      messageId,
+    );
+  }
+
   @Get('conversations/:id/messages')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: '会话历史(height 键集分页,页内升序)' })

@@ -18,7 +18,26 @@ export const CHAT_EVENTS = {
   conversation: 'chat:conversation',
   /** 双向:消息撤回(客户端带 ack 发起;服务端广播到会话房) */
   revoke: 'chat:revoke',
+  /** 双向:送达水位(客户端收到 chat:msg 后上报,无 ack;服务端广播推进) */
+  delivered: 'chat:delivered',
+  /** 双向:表情回应(客户端带 ack;服务端广播到会话房) */
+  reaction: 'chat:reaction',
+  /** 双向:消息编辑(客户端带 ack;服务端广播到会话房) */
+  edit: 'chat:edit',
 } as const;
+
+/** 消息编辑的时间窗(仅发送者本人;与撤回同窗)。 */
+export const CHAT_EDIT_WINDOW_MS = 2 * 60_000;
+
+/** 表情回应白名单:防任意字符串当 emoji 灌库。 */
+export const CHAT_REACTION_EMOJIS: readonly string[] = [
+  '👍',
+  '❤️',
+  '😂',
+  '😮',
+  '😢',
+  '🙏',
+];
 
 /** 发送者本人的可撤回时间窗;圈主/管理员撤回群消息不受此限。 */
 export const CHAT_REVOKE_WINDOW_MS = 2 * 60_000;
@@ -98,6 +117,9 @@ export const CHAT_RATE_LIMITS = {
   typing: { limit: 10, windowMs: 5_000 },
   presence: { limit: 20, windowMs: 10_000 },
   revoke: { limit: 10, windowMs: 10_000 },
+  delivered: { limit: 30, windowMs: 10_000 },
+  reaction: { limit: 20, windowMs: 10_000 },
+  edit: { limit: 10, windowMs: 10_000 },
 } as const;
 
 /**
@@ -106,6 +128,9 @@ export const CHAT_RATE_LIMITS = {
  * 验签在 chat 网关,反向 import 会成环。
  */
 export const TEMP_CHAT_GUEST_TOKEN_KIND = 'temp-chat-guest';
+
+/** 逐条已读回执单次返回的读者上限(超大群按前 N 展示)。 */
+export const READERS_PAGE_MAX = 200;
 
 /** 单次历史分页的最大条数。 */
 export const HISTORY_PAGE_MAX = 100;

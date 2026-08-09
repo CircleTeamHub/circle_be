@@ -71,6 +71,52 @@ export interface ChatRevokeBroadcast {
   revokedBy: string;
 }
 
+/** chat:delivered:C→S 上报载荷与 S→C 广播同形。 */
+export interface ChatDeliveredPayload {
+  conversationId: string;
+  height: number;
+}
+
+export interface ChatDeliveredBroadcast {
+  conversationId: string;
+  userId: string;
+  height: number;
+}
+
+/** chat:reaction 客户端载荷(带 ack)。 */
+export interface ChatReactionPayload {
+  conversationId: string;
+  messageId: string;
+  emoji: string;
+  op: 'add' | 'remove';
+}
+
+/** chat:reaction 服务端广播。 */
+export interface ChatReactionBroadcast extends ChatReactionPayload {
+  userId: string;
+}
+
+/** chat:edit 客户端载荷(带 ack);content 仅允许 {text}。 */
+export interface ChatEditPayload {
+  conversationId: string;
+  messageId: string;
+  content: { text: string };
+}
+
+/** chat:edit 服务端广播。 */
+export interface ChatEditBroadcast {
+  conversationId: string;
+  messageId: string;
+  content: Record<string, unknown>;
+  editedAt: string;
+}
+
+/** 消息上的表情回应聚合(读路径批量附带)。 */
+export interface ChatReactionSummary {
+  emoji: string;
+  userIds: string[];
+}
+
 export interface ChatMessageDto {
   id: string;
   conversationId: string;
@@ -84,6 +130,10 @@ export interface ChatMessageDto {
   /** 撤回时间(ISO);未撤回为 null。撤回消息仍占 height,content 为空对象。 */
   revokedAt?: string | null;
   revokedBy?: string | null;
+  /** 编辑时间(ISO);未编辑缺省。height 不变。 */
+  editedAt?: string | null;
+  /** 表情回应聚合;无回应缺省。 */
+  reactions?: ChatReactionSummary[];
   /** 发送者本人的 ack 与广播共用此字段做本地乐观消息对账。 */
   d: string | null;
   createdAt: string;

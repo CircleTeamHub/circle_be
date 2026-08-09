@@ -4,7 +4,10 @@ import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
   ChatConversationBroadcast,
+  ChatDeliveredBroadcast,
+  ChatEditBroadcast,
   ChatMessageDto,
+  ChatReactionBroadcast,
   ChatReadBroadcast,
   ChatRevokeBroadcast,
   ChatTypingBroadcast,
@@ -128,6 +131,33 @@ export class ChatBroadcastService {
     const server = this.requireServer('emitToUser');
     if (!server) return;
     server.to(userRoom(userId)).emit(event, payload);
+  }
+
+  /** 送达水位推进 → 会话房(发送方靠它渲染「已送达」)。 */
+  emitDelivered(payload: ChatDeliveredBroadcast): void {
+    const server = this.requireServer('emitDelivered');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.delivered, payload);
+  }
+
+  /** 表情回应 → 会话房(发起者也收,幂等对账本地乐观状态)。 */
+  emitReaction(payload: ChatReactionBroadcast): void {
+    const server = this.requireServer('emitReaction');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.reaction, payload);
+  }
+
+  /** 消息编辑 → 会话房。 */
+  emitEdit(payload: ChatEditBroadcast): void {
+    const server = this.requireServer('emitEdit');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.edit, payload);
   }
 
   /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */

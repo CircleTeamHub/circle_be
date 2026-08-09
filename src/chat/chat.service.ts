@@ -28,8 +28,11 @@ import {
   HISTORY_PAGE_MAX,
   MAX_CONTENT_BYTES,
   MAX_TEXT_LENGTH,
+  CHAT_EDIT_WINDOW_MS,
+  CHAT_REACTION_EMOJIS,
   CHAT_REVOKE_WINDOW_MS,
   MEDIA_MESSAGE_TYPES,
+  READERS_PAGE_MAX,
 } from './chat.constants';
 import type {
   ChatConversationDto,
@@ -710,6 +713,7 @@ export class ChatService {
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
     await this.attachReplyTo(messages);
+    await this.attachReactions(messages);
     await this.media.attachMediaUrls(messages);
     if (ascendingPull) {
       return {
@@ -1441,6 +1445,7 @@ export class ChatService {
       replyToId: row.replyToID,
       revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
       revokedBy: row.revokedBy ?? null,
+      ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       d: row.clientMessageId,
       createdAt: row.createdAt.toISOString(),
     };
@@ -1546,6 +1551,236 @@ export class ChatService {
       updated.senderID ? [updated.senderID] : [],
     );
     return this.toMessageDto(updated, this.senderFor(updated, senders));
+  }
+
+  /** G-07 送达水位:与 markRead 同款钳制与只前进语义。 */
+  async markDelivered(
+    userId: string,
+    conversationId: string,
+    height: number,
+  ): Promise<{ advanced: boolean; height: number }> {
+    if (!Number.isInteger(height) || height < 0) {
+      throw new BadRequestException({
+        message: '送达水位非法',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    await this.requireMembership(conversationId, userId);
+    const top = await this.prisma.chatMessage.aggregate({
+      where: { conversationID: conversationId, deleted: false },
+      _max: { height: true },
+    });
+    const clamped = Math.min(height, top._max.height ?? 0);
+    if (clamped <= 0) return { advanced: false, height: 0 };
+    const updated = await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: conversationId,
+        userID: userId,
+        lastDeliveredHeight: { lt: clamped },
+      },
+      data: { lastDeliveredHeight: clamped },
+    });
+    return { advanced: updated.count > 0, height: clamped };
+  }
+
+  /**
+   * G-07 表情回应:不进 height 坐标系(不是消息、不推进未读、不改
+   * lastMessageAt)。emoji 收白名单;add 幂等(撞唯一约束视为已存在)。
+   * 返回 changed=false 表示无变化(重复 add / remove 不存在的行),
+   * 调用方据此决定是否广播。
+   */
+  async toggleReaction(
+    userId: string,
+    conversationId: string,
+    messageId: string,
+    emoji: string,
+    op: 'add' | 'remove',
+  ): Promise<{ changed: boolean }> {
+    if (!CHAT_REACTION_EMOJIS.includes(emoji)) {
+      throw new BadRequestException({
+        message: '不支持的表情',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    await this.requireMembership(conversationId, userId);
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+      select: { conversationID: true, deleted: true, revokedAt: true },
+    });
+    if (!row || row.conversationID !== conversationId || row.deleted) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    if (row.revokedAt) {
+      // 已撤回的消息不接受新回应;静默无变化,不给撤回消息续热度。
+      return { changed: false };
+    }
+    if (op === 'add') {
+      try {
+        await this.prisma.chatMessageReaction.create({
+          data: { messageID: messageId, userID: userId, emoji },
+        });
+        return { changed: true };
+      } catch (error) {
+        if (this.isUniqueViolation(error)) return { changed: false };
+        throw error;
+      }
+    }
+    const removed = await this.prisma.chatMessageReaction.deleteMany({
+      where: { messageID: messageId, userID: userId, emoji },
+    });
+    return { changed: removed.count > 0 };
+  }
+
+  /**
+   * G-07 消息编辑:仅发送者本人、仅 text/quote、CHAT_EDIT_WINDOW_MS 窗口内。
+   * height 不变(排序坐标系不动);旧 content 进 contentHistory 留痕;
+   * 新文本照常过敏感词。
+   */
+  async editMessage(
+    userId: string,
+    conversationId: string,
+    messageId: string,
+    content: { text: string },
+  ): Promise<ChatMessageDto> {
+    const text = typeof content?.text === 'string' ? content.text.trim() : '';
+    if (text.length === 0 || text.length > MAX_TEXT_LENGTH) {
+      throw new BadRequestException({
+        message: '编辑内容非法',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    const hit = this.sensitiveWords.check(text);
+    if (hit.blocked) {
+      throw new BadRequestException({
+        message: '内容包含敏感词',
+        errorCode: ChatErrorCode.SensitiveWord,
+      });
+    }
+    await this.requireMembership(conversationId, userId);
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+    });
+    if (
+      !row ||
+      row.conversationID !== conversationId ||
+      row.deleted ||
+      row.revokedAt
+    ) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    if (row.senderID !== userId) {
+      throw new ForbiddenException({
+        message: '只能编辑自己的消息',
+        errorCode: ChatErrorCode.EditForbidden,
+      });
+    }
+    if (row.type !== 'text' && row.type !== 'quote') {
+      throw new BadRequestException({
+        message: '该类型消息不支持编辑',
+        errorCode: ChatErrorCode.EditForbidden,
+      });
+    }
+    if (Date.now() - row.createdAt.getTime() > CHAT_EDIT_WINDOW_MS) {
+      throw new ForbiddenException({
+        message: '超出可编辑时间',
+        errorCode: ChatErrorCode.EditWindowExpired,
+      });
+    }
+    const previous = (row.content ?? {}) as Record<string, unknown>;
+    const history = Array.isArray(row.contentHistory)
+      ? [...(row.contentHistory as unknown[])]
+      : [];
+    history.push(previous);
+    // quote 只改 text,引用快照字段原样保留。
+    const nextContent = { ...previous, text } as Prisma.InputJsonObject;
+    const updated = await this.prisma.chatMessage.update({
+      where: { id: messageId },
+      data: {
+        content: nextContent,
+        editedAt: new Date(),
+        contentHistory: history as Prisma.InputJsonValue,
+      },
+    });
+    const senders = await this.resolveSenders(
+      updated.senderID ? [updated.senderID] : [],
+    );
+    const dto = this.toMessageDto(updated, this.senderFor(updated, senders));
+    await this.attachReplyTo([dto]);
+    return dto;
+  }
+
+  /**
+   * G-07 逐条已读回执:读者 = lastReadHeight ≥ 该消息 height 的在座成员。
+   * 自研栈红利 —— 不需要回执表,水位即事实。发送者本人不计入。
+   */
+  async listMessageReaders(
+    userId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<{ readers: ChatSenderInfo[]; total: number }> {
+    await this.requireMembership(conversationId, userId);
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+      select: { conversationID: true, height: true, senderID: true },
+    });
+    if (!row || row.conversationID !== conversationId) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        lastReadHeight: { gte: row.height },
+        ...(row.senderID ? { userID: { not: row.senderID } } : {}),
+      },
+      select: { userID: true },
+      take: READERS_PAGE_MAX,
+    });
+    const senders = await this.resolveSenders(seats.map((s) => s.userID));
+    const readers = seats
+      .map((s) => senders.get(s.userID))
+      .filter((s): s is ChatSenderInfo => Boolean(s));
+    return { readers, total: readers.length };
+  }
+
+  /** G-07:一次 IN 批量把表情回应聚合挂到消息上(禁 N+1)。 */
+  private async attachReactions(messages: ChatMessageDto[]): Promise<void> {
+    const ids = messages
+      .filter((m) => m.height > 0 && !m.revokedAt)
+      .map((m) => m.id);
+    if (ids.length === 0) return;
+    const rows = await this.prisma.chatMessageReaction.findMany({
+      where: { messageID: { in: ids } },
+      orderBy: { createdAt: 'asc' },
+      select: { messageID: true, userID: true, emoji: true },
+    });
+    if (rows.length === 0) return;
+    const byMessage = new Map<string, Map<string, string[]>>();
+    for (const row of rows) {
+      const perEmoji =
+        byMessage.get(row.messageID) ?? new Map<string, string[]>();
+      const users = perEmoji.get(row.emoji) ?? [];
+      users.push(row.userID);
+      perEmoji.set(row.emoji, users);
+      byMessage.set(row.messageID, perEmoji);
+    }
+    for (const message of messages) {
+      const perEmoji = byMessage.get(message.id);
+      if (!perEmoji) continue;
+      message.reactions = [...perEmoji.entries()].map(([emoji, userIds]) => ({
+        emoji,
+        userIds,
+      }));
+    }
   }
 
   /**
