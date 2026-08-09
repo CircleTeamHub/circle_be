@@ -206,6 +206,10 @@ export class ChatService {
     ) as Prisma.InputJsonObject;
     const created = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${payload.conversationId}))`;
+      // 锁之后复查一遍。上面那几道是在锁外读的,和落库之间存在窗口:踢人、
+      // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
+      // advisory lock 之后才是真正串行的位置,所以复查放在这里。
+      await this.assertStillSendable(tx, payload.conversationId, senderUserId);
 
       const existing = await tx.chatMessage.findUnique({
         where: {
@@ -1038,6 +1042,101 @@ export class ChatService {
         message: '临时聊天已结束',
         errorCode: ChatErrorCode.ConversationNotFound,
       });
+    }
+  }
+
+  /**
+   * 发送事务内的最终复查 —— 与锁外那几道是同一组判定,只是换成事务客户端在
+   * advisory lock 之后重跑一遍。
+   *
+   * 为什么值得重跑:锁外校验到落库之间是一个真实窗口,而这几种状态恰恰都是
+   * 「别人可以在这一瞬改掉」的 —— 被踢出圈子(座位置 leftAt)、被对方拉黑、
+   * 管理台按下禁言、临时房到期。窗口虽短,但踢人/封禁这类操作的语义就是
+   * 「立刻生效」,让一条消息在生效之后还能挤进去,是把安全边界做成了概率问题。
+   */
+  private async assertStillSendable(
+    tx: Prisma.TransactionClient,
+    conversationId: string,
+    senderUserId: string,
+  ): Promise<void> {
+    const seat = await tx.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: senderUserId,
+        },
+      },
+      include: { conversation: true },
+    });
+    if (!seat || seat.leftAt) {
+      throw new ForbiddenException({
+        message: '不是会话成员',
+        errorCode: ChatErrorCode.NotMember,
+      });
+    }
+    const conversation = seat.conversation;
+
+    if (conversation.type === 'DIRECT') {
+      const peerId = conversation.directKey
+        ?.split(':')
+        .find((id) => id !== senderUserId);
+      if (peerId) {
+        const block = await tx.block.findFirst({
+          where: {
+            OR: [
+              { blockerID: senderUserId, blockedID: peerId },
+              { blockerID: peerId, blockedID: senderUserId },
+            ],
+          },
+          select: { id: true },
+        });
+        if (block) {
+          throw new ForbiddenException({
+            message: '对方不可用',
+            errorCode: ChatErrorCode.Blocked,
+          });
+        }
+      }
+    }
+
+    if (
+      conversation.type === 'GROUP' &&
+      conversation.muteAllAt &&
+      conversation.circleID
+    ) {
+      const membership = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: senderUserId,
+            circleID: conversation.circleID,
+          },
+        },
+        select: { role: true, status: true },
+      });
+      const exempt =
+        membership?.status === 'ACTIVE' &&
+        (membership.role === 'OWNER' || membership.role === 'ADMIN');
+      if (!exempt) {
+        throw new ForbiddenException({
+          message: '该群已被禁言',
+          errorCode: ChatErrorCode.ConversationMuted,
+        });
+      }
+    }
+
+    if (conversation.type === 'TEMP' && conversation.tempChatID) {
+      const room = await tx.tempChat.findUnique({
+        where: { id: conversation.tempChatID },
+        select: { status: true, expiresAt: true },
+      });
+      const active =
+        room?.status === 'ACTIVE' && room.expiresAt.getTime() > Date.now();
+      if (!active) {
+        throw new ForbiddenException({
+          message: '临时聊天已结束',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
     }
   }
 

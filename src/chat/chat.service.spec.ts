@@ -123,6 +123,24 @@ describe('ChatService', () => {
   });
 
   describe('sendMessage', () => {
+    // 锁外校验与落库之间是一个真实窗口:踢人、拉黑、管理台禁言、临时房到期
+    // 都可能恰好落在这中间。advisory lock 之后才是真正串行的位置,所以那几道
+    // 判定必须在事务内用事务客户端再跑一遍 —— 否则「立刻生效」的封禁语义
+    // 就变成了概率问题。
+    it('rejects when the seat is revoked between the pre-check and the transaction', async () => {
+      prisma.chatMember.findUnique
+        // 锁外 requireMembership:此刻还在座
+        .mockResolvedValueOnce(membership())
+        // 事务内复查:已被踢出(座位置了 leftAt)
+        .mockResolvedValueOnce(membership({ leftAt: new Date() }));
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+
+      await expect(service.sendMessage('u1', sendPayload())).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     it('persists with height = max + 1 and returns the dto', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(null);
