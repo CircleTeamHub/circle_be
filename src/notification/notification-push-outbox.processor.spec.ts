@@ -15,10 +15,30 @@ describe('fair batch selection contract', () => {
       join(__dirname, 'notification-push-outbox.processor.ts'),
       'utf8',
     );
-    expect(source).toContain('PARTITION BY n."fromUserID"');
+    expect(source).toContain(`'sender:' || n."fromUserID"`);
     expect(source).toContain('rn <= ');
     // 先取窗口再调度正是被 review 指出的那个失效模式,不能回潮。
     expect(source).not.toContain('CANDIDATE_WINDOW');
+  });
+
+  // 公告扇出的每一行都挂同一个管理员,套发送者配额等于「整条公告 10 条/轮」,
+  // 10000 人要发约 17 小时。按公告分区 + 独立名额,同时保证公告吃不满整批。
+  it('gives system announcements their own partition and quota', () => {
+    const source = readFileSync(
+      join(__dirname, 'notification-push-outbox.processor.ts'),
+      'utf8',
+    );
+    expect(source).toContain(`'announcement:' || n."systemAnnouncementID"`);
+    // 两个分支都是绑定参数,漏掉 ::int 时 Postgres 把 CASE 解成 text,整条出队
+    // 查询在运行时报 `operator does not exist: bigint <= text` —— 推送全线停摆,
+    // 而这里的 $queryRaw 是桩,单测照样绿。所以把转型本身钉住。
+    expect(source).toContain('THEN ${SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK}::int');
+    expect(source).toContain('ELSE ${MAX_PER_SENDER_PER_TICK}::int');
+    // 名额必须严格小于整批,否则一条大公告会把日常推送顶到公告发完为止 ——
+    // 那只是把饿死的方向调了个头。写成 BATCH_SIZE 的分数,改批量时不会失配。
+    expect(source).toMatch(
+      /SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK = BATCH_SIZE \/ [2-9]/,
+    );
   });
 });
 

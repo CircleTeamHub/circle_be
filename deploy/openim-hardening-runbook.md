@@ -58,8 +58,11 @@ cd ~/circle_be && docker compose -f docker-compose.prod.yml up -d --force-recrea
 # 加载这个文件名）。上一步的 force-recreate 就已经带上了上限，这里只需核对：
 docker inspect --format '{{.Name}} mem={{.HostConfig.Memory}}' \
   $(docker ps -q) | grep -Ei 'openim|mongo|kafka|zookeeper|etcd'
-# 预期每个都是 1073741824（1g）而不是 0。额度不合适就改：
-#   OPENIM_MEM_LIMIT=2g bash deploy/openim-harden.sh ~/openim-docker
+# 预期都不是 0，且分两档（脚本按服务名分流，不是统一一个值）：
+#   数据面 kafka/mongo/zookeeper/minio → 2147483648（2g，OPENIM_DATA_MEM_LIMIT 默认值）
+#   其余 openim-* 服务              → 536870912（512m，OPENIM_SVC_MEM_LIMIT 默认值）
+# 额度不合适就改（两档各自独立，脚本不认 OPENIM_MEM_LIMIT）：
+#   OPENIM_DATA_MEM_LIMIT=3g OPENIM_SVC_MEM_LIMIT=768m bash deploy/openim-harden.sh ~/openim-docker
 #   cd ~/openim-docker && docker compose up -d
 #
 # 为什么不再用 `docker update --memory`：那只作用于**当前这批容器**，之后任何一次

@@ -29,6 +29,20 @@ const STALE_LOCK_MS = 10 * 60 * 1000;
  */
 const MAX_PER_SENDER_PER_TICK = 10;
 /**
+ * 系统公告一轮的名额，独立于发送者配额。
+ *
+ * 公告扇出给每个活跃用户建一行，而这些行的 fromUserID 全是同一个管理员，落进
+ * 发送者配额里就是「整条公告共用 10 条/轮」—— 10000 人的公告要发约 17 小时。
+ * 但公告不是发送者洪水：每一行的收件人都不同，管理员也不是要防的那个角色，
+ * 拿发送者配额去套它属于误伤。
+ *
+ * 所以公告改成**按公告 ID 分区**（同一管理员发的两条公告互不挤占），并给一份
+ * 更宽的名额。上限仍然存在而不是完全豁免 —— 豁免的话一条大公告会吃满整批
+ * BATCH_SIZE，把好友请求、评论回复挤到公告发完为止，等于把饿死方向调了个头。
+ * 取 BATCH_SIZE 的一半：公告按 50 条/轮走，另外一半永远留给日常推送。
+ */
+const SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK = BATCH_SIZE / 2;
+/**
  * Push outbox 处理器（#88 重构后）。
  *
  * 旧行为的两处硬伤：outbox 只有整通知一行，部分 token 失败 → 整通知重发 →
@@ -64,8 +78,13 @@ export class NotificationPushOutboxProcessor {
         SELECT
           o."id",
           o."createdAt",
+          (n."systemAnnouncementID" IS NOT NULL) AS is_announcement,
           ROW_NUMBER() OVER (
-            PARTITION BY n."fromUserID"
+            PARTITION BY CASE
+              WHEN n."systemAnnouncementID" IS NOT NULL
+                THEN 'announcement:' || n."systemAnnouncementID"
+              ELSE 'sender:' || n."fromUserID"
+            END
             ORDER BY o."createdAt" ASC, o."id" ASC
           ) AS rn
         FROM "NotificationPushOutbox" AS o
@@ -76,7 +95,12 @@ export class NotificationPushOutboxProcessor {
       )
       SELECT "id"
       FROM eligible
-      WHERE rn <= ${MAX_PER_SENDER_PER_TICK}
+      -- 两个分支都是绑定参数,不显式转型的话 Postgres 推不出 CASE 的结果类型
+      -- (两侧都是 unknown),会直接报 could not determine data type。
+      WHERE rn <= CASE
+        WHEN is_announcement THEN ${SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK}::int
+        ELSE ${MAX_PER_SENDER_PER_TICK}::int
+      END
       ORDER BY rn ASC, "createdAt" ASC, "id" ASC
       LIMIT ${BATCH_SIZE}
     `;
