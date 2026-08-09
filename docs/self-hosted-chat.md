@@ -19,7 +19,7 @@
 
 | 风险 | 防线 |
 |---|---|
-| 乱序 | `ChatMessage @@unique(conversationID, height)`;height 在事务内 `pg_advisory_xact_lock(7301, hashtext(conversationID))` 下按 max+1 分配 |
+| 乱序 | `ChatMessage @@unique(conversationID, height)`;height 在事务内会话行锁(`SELECT..FOR UPDATE`)下由 `nextHeight` 计数器分配(批4 起;此前为 advisory lock + max 聚合) |
 | 断线重发重复 | `@@unique(conversationID, senderID, clientMessageId)`;撞库返回原行(`reused`),不重广播 |
 | 丢消息 | 先落库后 ack:ack 返回 = 已持久化;客户端超时未 ack 可安全重发(幂等兜底) |
 | 已读回退 | `ChatMember.lastReadHeight` 只前进不后退(`updateMany` 带 `lt` 条件) |
@@ -60,7 +60,7 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 ## 防刷
 
 每 socket 滑动窗口:send 20/10s、read 30/10s、typing 10/5s
-(`chat-rate-limiter.ts`,单实例语义;多实例部署时每实例独立计数)。
+(`chat-rate-limiter.ts`;批4 起配 Redis 时为 ZSET 滑动窗口全局配额,缺 Redis 回退每实例独立计数)。
 REST 面沿用 ThrottlerGuard 每路由限流。
 
 ## Phase 2+ 待办(有意不在本批)
