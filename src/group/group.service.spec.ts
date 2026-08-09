@@ -52,7 +52,10 @@ describe('GroupService reportGroup', () => {
     prisma = {
       $transaction: jest.fn(async (callback) => callback(prisma)),
       $executeRaw: jest.fn(),
-      $queryRaw: jest.fn().mockResolvedValue([{ id: 'circle-1' }]),
+      // 事务内的 SELECT ... FOR UPDATE 复查:默认返回「未停用」。
+      $queryRaw: jest
+        .fn()
+        .mockResolvedValue([{ id: 'circle-1', deleted: false }]),
       circle: {
         findFirst: jest.fn(),
         findUnique: jest.fn(),
@@ -1009,6 +1012,68 @@ describe('GroupService reportGroup', () => {
       'group-1',
       'target-1',
       { role: 'ADMIN' },
+    );
+  });
+
+  // findCircleByGroupID 的 deleted:false 是在事务外筛的:管理员在那之后按下
+  // 停用,原实现照样提权并写审计,给一个已停用的群返回成功。事务内必须对
+  // Circle 行加锁复查(SELECT ... FOR UPDATE)。
+  it('writes nothing when the circle is disabled after the pre-transaction lookup', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'owner-member',
+      role: CircleMemberRole.OWNER,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    // 事务内加锁复查时,停用已经提交。
+    prisma.$queryRaw.mockResolvedValue([{ deleted: true }]);
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'GROUP_MANAGER_ONLY' },
+    });
+
+    expect(prisma.circleMember.update).not.toHaveBeenCalled();
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  // 复查必须排在成员 advisory 锁之后:removeGroupMember / leaveGroup 都是
+  // 「先成员锁、后 Circle 行锁」(circle.update 扣 memberCount),反过来就
+  // 和它们构成 ABBA 死锁。
+  it('takes the circle row lock after the member locks, matching the other paths', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'owner-member',
+      role: CircleMemberRole.OWNER,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.$queryRaw.mockResolvedValue([{ deleted: true }]);
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toBeDefined();
+
+    expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.$queryRaw.mock.invocationCallOrder[0],
     );
   });
 
