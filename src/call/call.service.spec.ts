@@ -16,6 +16,7 @@ describe('CallService', () => {
   let chatMessages: any;
   let livekit: any;
   let realtime: any;
+  let privacySettings: any;
   let service: CallService;
 
   beforeEach(() => {
@@ -26,6 +27,8 @@ describe('CallService', () => {
       $queryRaw: jest.fn().mockResolvedValue([]),
       circle: { findFirst: jest.fn() },
       circleMember: { findMany: jest.fn() },
+      // 群呼按被邀请人各自的 callPermission 过滤，FRIENDS_ONLY 需要好友关系。
+      friend: { findMany: jest.fn().mockResolvedValue([]) },
       user: { findMany: jest.fn() },
       callSession: {
         create: jest.fn(),
@@ -80,6 +83,10 @@ describe('CallService', () => {
       get: jest.fn((key: string): unknown => configValues[key]),
     } as unknown as ConfigService;
 
+    privacySettings = {
+      canBeCalled: jest.fn().mockResolvedValue(true),
+    };
+
     service = new CallService(
       prisma,
       chatService,
@@ -87,6 +94,7 @@ describe('CallService', () => {
       livekit,
       realtime,
       config,
+      privacySettings,
     );
   });
 
@@ -372,6 +380,51 @@ describe('CallService', () => {
       CallErrorCode.VideoDisabled,
     );
 
+    expect(livekit.createRoom).not.toHaveBeenCalled();
+  });
+
+  // 群呼之前完全不看 callPermission：设了「不接受呼叫」的人照样被拉进群通话。
+  it('drops group-call invitees who disabled calls, without failing the call', async () => {
+    mockCircleMembers();
+    privacySettings.canBeCalled.mockImplementation(
+      async (userID: string) => userID !== 'user-3',
+    );
+    prisma.callSession.create.mockImplementation(({ data }: any) =>
+      Promise.resolve({
+        ...data,
+        createdAt: now,
+        updatedAt: now,
+        initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+        participants: [],
+      }),
+    );
+
+    await service.createGroupCall('user-1', {
+      conversationID: 'sg_group-1',
+      callType: 'AUDIO',
+      inviteeIDs: ['user-2', 'user-3'],
+    });
+
+    const created = prisma.callSession.create.mock.calls[0][0].data;
+    const invited = created.participants.create.map((p: any) => p.userID);
+    expect(invited).toContain('user-2');
+    expect(invited).not.toContain('user-3');
+  });
+
+  // 全员都关掉时退化成「没有可邀请的人」，而不是指名道姓说谁拒收 —— 后者等于
+  // 把对方的隐私设置回显给发起方。
+  it('reports no invitees rather than naming who declined when everyone opted out', async () => {
+    mockCircleMembers();
+    privacySettings.canBeCalled.mockResolvedValue(false);
+
+    await expectErrorCode(
+      service.createGroupCall('user-1', {
+        conversationID: 'sg_group-1',
+        callType: 'AUDIO',
+        inviteeIDs: ['user-2', 'user-3'],
+      }),
+      CallErrorCode.InviteesRequired,
+    );
     expect(livekit.createRoom).not.toHaveBeenCalled();
   });
 

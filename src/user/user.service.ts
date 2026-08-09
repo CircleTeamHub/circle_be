@@ -358,6 +358,19 @@ export class UserService {
     if (!user) {
       return null;
     }
+
+    // 「可通过账号号码添加我」的收口点。这是唯一能把账号号码变成 userID 的接口，
+    // 关掉之后这条发现路径就断了，好友请求根本形不成 —— 比在发请求时判来源可靠，
+    // 因为来源是客户端自报的、可以随便填。返回 null 而不是抛错：能区分「不存在」
+    // 和「拒绝被搜到」的话，这个接口就成了设置探测器。
+    // 自己搜自己不挡：用户要能核对自己的账号号码。
+    if (viewerId !== user.id) {
+      const { addMeByAccount } = await this.privacySettings.getSettings(
+        user.id,
+      );
+      if (!addMeByAccount) return null;
+    }
+
     const [filteredUser, appearances] = await Promise.all([
       this.applyProfilePrivacy(user, viewerId),
       this.avatarFrames.resolvePublicAppearances([user.id]),

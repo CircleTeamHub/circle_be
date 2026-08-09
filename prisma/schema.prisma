@@ -1172,7 +1172,8 @@ model UserTracePreference {
 model UserPrivacySetting {
   id                      String   @id @default(uuid())
   userID                  String   @unique
-  messageSelfDestructDays Int      @default(2)
+  /// 0 = 关闭自动销毁。与 DEFAULT_PRIVACY_SETTINGS 保持一致。
+  messageSelfDestructDays Int      @default(0)
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)
   showPhone               Boolean  @default(false)

@@ -22,6 +22,7 @@ import {
 } from 'src/generated/prisma';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
@@ -90,6 +91,7 @@ export class CallService {
     private readonly livekit: LiveKitCallService,
     private readonly realtime: RealtimeService,
     private readonly config: ConfigService,
+    private readonly privacySettings: PrivacySettingsService,
   ) {}
 
   async createGroupCall(
@@ -112,7 +114,21 @@ export class CallService {
     }
     this.assertCallTypeEnabled(dto.callType);
 
-    const participantIDs = [initiatorID, ...inviteeIDs];
+    // callPermission=NONE 的成员从邀请名单里剔除，而不是让整通群呼失败：一个人
+    // 关掉通话不该连累其他人，而「因为某人拒收所以整通失败」本身就把他的设置
+    // 回显给了发起方。全员都拒时退化成「没有可邀请的人」，同样不指名道姓。
+    const callableIDs = await this.filterCallableInvitees(
+      initiatorID,
+      inviteeIDs,
+    );
+    if (callableIDs.length === 0) {
+      throw new BadRequestException({
+        message: 'CALL_INVITEES_REQUIRED',
+        errorCode: CallErrorCode.InviteesRequired,
+      });
+    }
+
+    const participantIDs = [initiatorID, ...callableIDs];
     this.assertParticipantLimit(participantIDs.length);
 
     await this.assertGroupMembers(conversationID, participantIDs, initiatorID);
@@ -122,7 +138,7 @@ export class CallService {
       conversationID,
       sessionType: GROUP_SESSION_TYPE,
       callType: dto.callType,
-      inviteeIDs,
+      inviteeIDs: callableIDs,
       users,
       idempotencyKey,
     });
@@ -970,6 +986,40 @@ export class CallService {
   }
 
   /**
+   * 按被邀请人各自的 callPermission 过滤群呼名单。
+   *
+   * FRIENDS_ONLY 要判断「发起方是不是我的好友」，所以先一次性把发起方与全部
+   * 被邀请人之间的好友关系捞出来，避免每人一次查询。
+   */
+  private async filterCallableInvitees(
+    initiatorID: string,
+    inviteeIDs: string[],
+  ): Promise<string[]> {
+    const friendships = await this.prisma.friend.findMany({
+      where: {
+        state: FriendState.ACCEPTED,
+        OR: [
+          { userID: initiatorID, friendID: { in: inviteeIDs } },
+          { friendID: initiatorID, userID: { in: inviteeIDs } },
+        ],
+      },
+      select: { userID: true, friendID: true },
+    });
+    const friendIDs = new Set(
+      friendships.map((row) =>
+        row.userID === initiatorID ? row.friendID : row.userID,
+      ),
+    );
+
+    const decisions = await Promise.all(
+      inviteeIDs.map((userID) =>
+        this.privacySettings.canBeCalled(userID, friendIDs.has(userID)),
+      ),
+    );
+    return inviteeIDs.filter((_, index) => decisions[index]);
+  }
+
+  /**
    * 1:1 呼叫的成员校验（#113）：必须是已接受的好友，且双向都没有拉黑。
    * 两种拒绝共用 CALL_NOT_FRIEND —— 把「对方拉黑了你」翻译成可感知的差异
    * 等于把拉黑状态做成了探测接口。
@@ -1004,6 +1054,18 @@ export class CallService {
       throw new ForbiddenException({
         message: 'CALL_NOT_FRIEND',
         errorCode: CallErrorCode.NotFriend,
+      });
+    }
+
+    // 好友关系是底线，callPermission 只能在其之上继续收紧：走到这里双方已经是
+    // 好友，所以 isFriend 恒为 true，EVERYONE 与 FRIENDS_ONLY 都放行，只有 NONE
+    // 会拒。这一句之前根本不存在 —— 设置在库里、隐私设置页也能改，
+    // PrivacySettingsService.canBeCalled 却零调用者，选了「不接受呼叫」的用户
+    // 照样被打进来，且失效时没有任何信号。
+    if (!(await this.privacySettings.canBeCalled(calleeID, true))) {
+      throw new ForbiddenException({
+        message: 'CALL_PERMISSION_DENIED',
+        errorCode: CallErrorCode.PermissionDenied,
       });
     }
   }

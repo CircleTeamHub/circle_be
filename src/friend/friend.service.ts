@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { FriendErrorCode } from 'src/common/app-error-codes';
 import {
+  CircleMemberStatus,
   FriendPermission,
   FriendReportStatus,
   FriendState,
@@ -217,6 +218,8 @@ export class FriendService {
         errorCode: FriendErrorCode.StrangerMsgNotAllowed,
       });
     }
+
+    await this.assertDiscoverableBy(senderId, targetId);
 
     // Enforce friend limit for the sender
     await this.assertBelowFriendLimit(senderId);
@@ -1931,6 +1934,58 @@ export class FriendService {
   }
 
   // ─── Helper ───────────────────────────────────────────────────────────────────
+
+  /**
+   * 「可通过 X 添加我」四个开关的 enforcement。
+   *
+   * 判定按**服务端能证实的发现路径**做，而不是让客户端在请求里自报来源：自报的
+   * 字段谁都能填成对方唯一放行的那一项，加了等于没加。规则是「对方开放的路径里，
+   * 至少有一条对这次请求成立」：
+   *
+   * - addMeByAccount：开着就直接放行。任何人都可能知道对方的账号号码，
+   *   「他是搜账号找到我的」无法证伪，硬拦只会误伤正常添加。真正的收口在
+   *   UserService.findByExactAccountId —— 关掉之后账号搜索直接查不到人，
+   *   请求根本形不成。
+   * - addMeByGroup：可证实 —— 双方是否同在一个未删除的圈子且都是 ACTIVE 成员。
+   * - addMeByPhone / addMeByQrCode：这两条发现路径**在产品里还不存在**（没有手机号
+   *   搜人接口，扫码器 resolveMessageScanResult 也解析不出用户），所以它们不可能是
+   *   本次请求的来源，开着也不构成放行理由。等这两个功能落地时，各自的入口要像
+   *   账号搜索一样自己收口。
+   */
+  private async assertDiscoverableBy(
+    senderId: string,
+    targetId: string,
+  ): Promise<void> {
+    const settings = await this.privacySettings.getSettings(targetId);
+    if (settings.addMeByAccount) return;
+    if (settings.addMeByGroup && (await this.sharesCircle(senderId, targetId)))
+      return;
+
+    throw new ForbiddenException({
+      message: 'This user cannot be added through this path',
+      errorCode: FriendErrorCode.NotDiscoverable,
+    });
+  }
+
+  private async sharesCircle(
+    senderId: string,
+    targetId: string,
+  ): Promise<boolean> {
+    const shared = await this.prisma.circleMember.findFirst({
+      where: {
+        userID: senderId,
+        status: CircleMemberStatus.ACTIVE,
+        circle: {
+          deleted: false,
+          members: {
+            some: { userID: targetId, status: CircleMemberStatus.ACTIVE },
+          },
+        },
+      },
+      select: { id: true },
+    });
+    return shared !== null;
+  }
 
   private async assertBelowFriendLimit(userId: string): Promise<void> {
     const user = await this.prisma.user.findUnique({

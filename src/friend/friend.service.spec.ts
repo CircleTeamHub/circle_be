@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
+import { FriendErrorCode } from 'src/common/app-error-codes';
 import { FriendState, NotificationType, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -86,6 +87,10 @@ describe('FriendService', () => {
       findMany: jest.fn().mockResolvedValue([]),
       count: jest.fn().mockResolvedValue(0),
     },
+    // addMeByGroup 的服务端佐证：双方是否同在一个圈子。
+    circleMember: {
+      findFirst: jest.fn().mockResolvedValue(null),
+    },
     $executeRaw: jest.fn(),
     $transaction: jest.fn((operations: any) =>
       typeof operations === 'function'
@@ -109,6 +114,7 @@ describe('FriendService', () => {
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
+    getSettings: jest.fn(),
   };
   const creditService = {
     applyDeltaInTransaction: jest.fn(),
@@ -135,6 +141,15 @@ describe('FriendService', () => {
     notificationService.createFriendRequestNotification.mockReset();
     privacySettings.canReceiveStrangerMessage.mockReset();
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    privacySettings.getSettings.mockReset();
+    // 默认 addMeByAccount=true —— 与 DEFAULT_PRIVACY_SETTINGS 一致，既有用例
+    // 不该因为新增的发现路径校验而改变行为。
+    privacySettings.getSettings.mockResolvedValue({
+      addMeByAccount: true,
+      addMeByPhone: false,
+      addMeByQrCode: true,
+      addMeByGroup: true,
+    });
     creditService.applyDeltaInTransaction.mockResolvedValue({
       eventId: 'credit-event-1',
       scoreBefore: 100,
@@ -547,6 +562,97 @@ describe('FriendService', () => {
 
     expect(prisma.friend.create).not.toHaveBeenCalled();
     expect(prisma.friendActivity.createMany).not.toHaveBeenCalled();
+  });
+
+  // addMeByAccount / Phone / QrCode / Group 四个开关此前零 enforcement：库里有、
+  // 隐私设置页也能改，friend.service 只查了 allowStrangerMessages。
+  //
+  // 判定按「服务端能证实的发现路径」来，而不是让客户端自报来源 —— 自报的字段
+  // 谁都能填成对方唯一放行的那一项，等于没有校验。
+  describe('discovery paths (addMeBy*)', () => {
+    function mockTarget() {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-2',
+        status: 'ACTIVE',
+        role: 'USER',
+      });
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.friend.count.mockResolvedValue(0);
+    }
+
+    it('rejects the request when every discovery path the target allows is impossible', async () => {
+      mockTarget();
+      privacySettings.getSettings.mockResolvedValue({
+        addMeByAccount: false,
+        addMeByPhone: true,
+        addMeByQrCode: true,
+        addMeByGroup: false,
+      });
+
+      await expect(
+        service.sendRequest('user-1', 'user-2', 'hello'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: FriendErrorCode.NotDiscoverable,
+        }),
+      });
+      expect(prisma.friend.create).not.toHaveBeenCalled();
+    });
+
+    // 账号添加开着时，「他是搜账号找到我的」永远无法证伪，硬拦只会误伤。
+    it('allows the request whenever the target still accepts account lookups', async () => {
+      mockTarget();
+      prisma.friend.findFirst.mockResolvedValue(null);
+      prisma.friend.create.mockResolvedValue({ id: 'request-1' });
+      privacySettings.getSettings.mockResolvedValue({
+        addMeByAccount: true,
+        addMeByPhone: false,
+        addMeByQrCode: false,
+        addMeByGroup: false,
+      });
+
+      await service.sendRequest('user-1', 'user-2', 'hello');
+
+      expect(prisma.circleMember.findFirst).not.toHaveBeenCalled();
+      expect(prisma.friend.create).toHaveBeenCalled();
+    });
+
+    it('falls back to a server-verified shared circle when account lookup is off', async () => {
+      mockTarget();
+      prisma.friend.findFirst.mockResolvedValue(null);
+      prisma.friend.create.mockResolvedValue({ id: 'request-1' });
+      privacySettings.getSettings.mockResolvedValue({
+        addMeByAccount: false,
+        addMeByPhone: false,
+        addMeByQrCode: false,
+        addMeByGroup: true,
+      });
+      prisma.circleMember.findFirst.mockResolvedValue({ id: 'member-1' });
+
+      await service.sendRequest('user-1', 'user-2', 'hello');
+
+      expect(prisma.friend.create).toHaveBeenCalled();
+    });
+
+    it('rejects a group-only target when the two share no circle', async () => {
+      mockTarget();
+      privacySettings.getSettings.mockResolvedValue({
+        addMeByAccount: false,
+        addMeByPhone: false,
+        addMeByQrCode: false,
+        addMeByGroup: true,
+      });
+      prisma.circleMember.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.sendRequest('user-1', 'user-2', 'hello'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: FriendErrorCode.NotDiscoverable,
+        }),
+      });
+      expect(prisma.friend.create).not.toHaveBeenCalled();
+    });
   });
 
   it('creates and broadcasts a friend request notification for the recipient', async () => {
