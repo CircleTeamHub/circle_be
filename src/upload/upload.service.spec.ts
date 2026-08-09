@@ -24,7 +24,6 @@ describe('UploadService', () => {
             'arn:aws:s3:::circle/avatars/*',
             'arn:aws:s3:::circle/covers/*',
             'arn:aws:s3:::circle/posts/*',
-            'arn:aws:s3:::circle/chat/*',
             'arn:aws:s3:::circle/friends/*',
             'arn:aws:s3:::circle/uploads/*',
           ],
@@ -33,10 +32,12 @@ describe('UploadService', () => {
     });
     expect(JSON.stringify(policy)).not.toContain('note-exports');
     // notes/* 不再匿名公开：私有笔记(available:false)的媒体改由读取时的短时签名 URL
-    // 提供(见 note.service 的 presign-on-read)。chat/* 仍公开——key 是不可枚举的 UUID，
-    // 且改造需破坏 OpenIM 消息体里固化的历史图，接受 key-secrecy 现状(单独决策)。
+    // 提供(见 note.service 的 presign-on-read)。
     expect(JSON.stringify(policy)).not.toContain('circle/notes/*');
-    expect(JSON.stringify(policy)).toContain('circle/chat/*');
+    // chat/* 同理：自研聊天栈存 key 不存 URL，读取走 ChatMediaService 的 presign-on-read。
+    // 一旦回潮，发送侧的 chat/{senderId}/ 归属校验和读取侧的短时签名会同时失效 ——
+    // 拿到过 key 的人可以绕过会话成员校验直连对象存储，所以这条断言不能删。
+    expect(JSON.stringify(policy)).not.toContain('circle/chat/*');
   });
 
   it('applies a public-read bucket policy during module init', async () => {

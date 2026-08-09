@@ -70,6 +70,8 @@ describe('CircleService', () => {
   const memberLock = { lock: jest.fn() };
   const chatCircleSync = {
     ensureCircleConversation: jest.fn().mockResolvedValue('conv-x'),
+    releaseSeatInTx: jest.fn().mockResolvedValue(null),
+    detachSeat: jest.fn(),
   };
   const directChatCircleSync = chatCircleSync as any;
   const directMembershipPolicy = new MembershipPolicyService(prisma as any);
@@ -104,6 +106,8 @@ describe('CircleService', () => {
     prisma.circleMember.count.mockResolvedValue(0);
     // clearAllMocks 后必须重设:建圈钩子对返回值 .catch(),undefined 会直接抛。
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-x');
+    // 同理:退圈路径要 await 它的返回值,undefined 会让 releasedConversationId 判断失真。
+    chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
     circleInvitationService.getInvitationForViewer.mockResolvedValue({
       id: 'inv-1',
       status: 'PENDING',
@@ -324,6 +328,28 @@ describe('CircleService', () => {
       },
       data: { status: 'CANCELLED' },
     });
+  });
+
+  // 退圈走 circleMember.delete,而对账扫的是 CircleMember.updatedAt 窗口 ——
+  // 被删的行扫描永远看不见。座位不在同一事务里收掉的话,退圈的人仍是
+  // leftAt=null:能拉历史、能发言、还继续收群消息。
+  it('releases the chat seat inside the leave transaction and detaches the socket', async () => {
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: 'MEMBER',
+      status: 'ACTIVE',
+    });
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conv-1');
+
+    await service.leaveCircle('user-1', 'circle-1');
+
+    // 第一个参数是事务客户端而不是 this.prisma —— 即「与删除同事务」的证据。
+    expect(chatCircleSync.releaseSeatInTx).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      'user-1',
+    );
+    expect(chatCircleSync.detachSeat).toHaveBeenCalledWith('user-1', 'conv-1');
   });
 
   it('uses the locked membership state when approval races with leave', async () => {

@@ -45,6 +45,7 @@ describe('GroupService reportGroup', () => {
     activateMembers: jest.Mock;
   };
   let memberLock: { lock: jest.Mock };
+  let chatCircleSync: { releaseSeatInTx: jest.Mock; detachSeat: jest.Mock };
   let service: GroupService;
 
   beforeEach(() => {
@@ -81,10 +82,15 @@ describe('GroupService reportGroup', () => {
       activateMembers: jest.fn(async (_tx, _circleID, userIDs) => userIDs),
     };
     memberLock = { lock: jest.fn() };
+    chatCircleSync = {
+      releaseSeatInTx: jest.fn().mockResolvedValue(null),
+      detachSeat: jest.fn(),
+    };
     service = new GroupService(
       prisma as any,
       admissionPolicy as any,
       memberLock as any,
+      chatCircleSync as any,
     );
   });
 
@@ -830,6 +836,70 @@ describe('GroupService reportGroup', () => {
       where: { id: 'circle-1' },
       data: { memberCount: { decrement: 1 } },
     });
+  });
+
+  // 座位回收必须发生在删除所在的那个事务里。对账扫的是 CircleMember.updatedAt
+  // 窗口,而踢人走的是 delete —— 行被抹掉,扫描永远看不见它。漏了这一步的话,
+  // 被踢的人座位仍是 leftAt=null:照样能拉历史、能发言、还继续收群消息。
+  it('releases the chat seat inside the removal transaction and detaches the socket', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+
+    await service.removeGroupMember('admin-1', 'group-1', 'target-user');
+
+    // 传的是事务客户端而不是 this.prisma —— 这正是「与删除同事务」的证据。
+    expect(chatCircleSync.releaseSeatInTx).toHaveBeenCalledWith(
+      prisma,
+      'circle-1',
+      'target-user',
+    );
+    expect(chatCircleSync.detachSeat).toHaveBeenCalledWith(
+      'target-user',
+      'conversation-1',
+    );
+  });
+
+  it('does not detach a socket when the removed member held no seat', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+
+    await service.removeGroupMember('admin-1', 'group-1', 'target-user');
+
+    expect(chatCircleSync.detachSeat).not.toHaveBeenCalled();
   });
 
   it('does not allow a circle admin to remove another manager', async () => {

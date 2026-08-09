@@ -14,6 +14,7 @@ import {
   ReportReviewStatus,
 } from 'src/generated/prisma';
 import { GroupErrorCode } from 'src/common/app-error-codes';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
@@ -48,6 +49,7 @@ export class GroupService {
     private readonly prisma: PrismaService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
+    private readonly chatCircleSync: ChatCircleSyncService,
   ) {}
 
   async updateGroupMemberRole(
@@ -241,6 +243,7 @@ export class GroupService {
     }
 
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
+    let releasedConversationId: string | null = null;
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.memberLock.lock(tx, circle.id, [
         actorId,
@@ -279,6 +282,13 @@ export class GroupService {
           where: { userID: normalizedTargetUserID, circleID: circle.id },
         });
         await tx.circleMember.delete({ where: { id: target.id } });
+        // 踢人走 delete,对账的 updatedAt 窗口扫不到被删的行 —— 座位必须在同一
+        // 事务里收掉,否则被踢的人照样能读能发、还继续收群消息。
+        releasedConversationId = await this.chatCircleSync.releaseSeatInTx(
+          tx,
+          circle.id,
+          normalizedTargetUserID,
+        );
 
         if (target.status === CircleMemberStatus.ACTIVE) {
           await tx.circle.update({
@@ -297,6 +307,12 @@ export class GroupService {
         },
       });
     });
+    if (releasedConversationId) {
+      this.chatCircleSync.detachSeat(
+        normalizedTargetUserID,
+        releasedConversationId,
+      );
+    }
 
     return { handled: true };
   }
@@ -318,6 +334,7 @@ export class GroupService {
       select: { id: true, groupID: true, ownerID: true },
     });
 
+    let leftConversationId: string | null = null;
     await runSerializableTransaction(this.prisma, async (tx) => {
       let membership: CircleGroupMemberLookup | null = null;
       if (circle) {
@@ -353,8 +370,6 @@ export class GroupService {
       });
 
       if (!circle || !membership) {
-        if (circle) {
-        }
         return;
       }
 
@@ -362,6 +377,13 @@ export class GroupService {
         where: { userID: userId, circleID: circle.id },
       });
       await tx.circleMember.delete({ where: { id: membership.id } });
+      // 退群走 delete,对账的 updatedAt 窗口扫不到被删的行 —— 座位必须在同一
+      // 事务里收掉,否则退群的人照样能读能发、还继续收群消息。
+      leftConversationId = await this.chatCircleSync.releaseSeatInTx(
+        tx,
+        circle.id,
+        userId,
+      );
 
       if (membership.status === CircleMemberStatus.ACTIVE) {
         await tx.circle.update({
@@ -370,6 +392,9 @@ export class GroupService {
         });
       }
     });
+    if (leftConversationId) {
+      this.chatCircleSync.detachSeat(userId, leftConversationId);
+    }
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);
   }

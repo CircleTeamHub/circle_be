@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
@@ -229,6 +230,57 @@ export class ChatCircleSyncService {
         );
     }
     return result.conversationId;
+  }
+
+  /**
+   * 成员行被**物理删除**时的座位回收,必须在删除所在的同一事务里调用。
+   *
+   * 为什么这一类变更不能交给对账:对账扫的是 `CircleMember.updatedAt` 窗口,
+   * 而 DELETE 把整行抹掉 —— 扫描永远看不见它。踢人/退圈走的都是 delete,
+   * 于是被移除的人座位一直是 leftAt=null,照样能读能发、还继续收群消息。
+   * 这是对账机制结构上唯一覆盖不到的写法,所以只给 delete 埋钩子,增改仍旧
+   * 交给对账(不破坏「不在 7 处写点逐一埋钩」的原设计)。
+   *
+   * 也不能挪到事务外做尽力而为:那样一次失败就再没有任何机制会回来收座位。
+   *
+   * 返回被回收座位所在的会话 id(本来就没在座则返回 null),调用方在事务提交后
+   * 用它调 {@link detachSeat} 把在线 socket 踢出房间。
+   */
+  async releaseSeatInTx(
+    tx: Prisma.TransactionClient,
+    circleId: string,
+    userId: string,
+  ): Promise<string | null> {
+    const conversation = await tx.chatConversation.findUnique({
+      where: { circleID: circleId },
+      select: { id: true },
+    });
+    if (!conversation) return null;
+    const released = await tx.chatMember.updateMany({
+      where: {
+        conversationID: conversation.id,
+        userID: userId,
+        leftAt: null,
+      },
+      data: { leftAt: new Date() },
+    });
+    return released.count > 0 ? conversation.id : null;
+  }
+
+  /**
+   * 事务提交后把 socket 踢出会话房。尽力而为:失败也只是这一条连接还留在房里,
+   * 座位已经是 leftAt(发送与拉历史都会被 requireMembership 拒),重连即归位。
+   */
+  detachSeat(userId: string, conversationId: string): void {
+    void this.broadcast
+      .removeUserFromConversation(userId, conversationId)
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `detach seat failed user=${userId} conversation=${conversationId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
   }
 
   /**
