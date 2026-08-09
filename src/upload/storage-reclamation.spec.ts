@@ -34,7 +34,9 @@ describe('MinIO storage reclamation', () => {
     expect(keyLine).not.toContain('randomUUID');
     expect(keyLine).toContain('contentHash');
     // 哈希必须覆盖正文，否则内容变了 key 不变，会返回上一次的导出。
-    expect(source).toMatch(/createHash\('sha256'\)[\s\S]{0,200}?update\(input\.body\)/);
+    expect(source).toMatch(
+      /createHash\('sha256'\)[\s\S]{0,200}?update\(input\.body\)/,
+    );
   });
 
   it('still has no object-delete path, so the lifecycle rule is load-bearing', () => {

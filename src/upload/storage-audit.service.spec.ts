@@ -24,15 +24,19 @@ describe('StorageAuditService', () => {
       circlePost: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
-      (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany =
-        jest.fn().mockResolvedValue(rows);
+      (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
+        .fn()
+        .mockResolvedValue(rows);
     }
     const listObjects = jest.fn(async (prefix: string) => ({
       objects: options.objects?.[prefix] ?? [],
     }));
-    const service = new StorageAuditService(prisma as never, {
-      listObjects,
-    } as never);
+    const service = new StorageAuditService(
+      prisma as never,
+      {
+        listObjects,
+      } as never,
+    );
     return { service, listObjects, prisma };
   }
 
@@ -48,11 +52,13 @@ describe('StorageAuditService', () => {
 
     const scannedPrefixes = listObjects.mock.calls.map((call) => call[0]);
     expect(scannedPrefixes).not.toContain('chat/');
-    expect(scannedPrefixes.some((p: string) => p.startsWith('chat'))).toBe(false);
-    // note-exports/ 由 MinIO 生命周期规则回收，也不归这里管。
-    expect(scannedPrefixes.some((p: string) => p.startsWith('note-exports'))).toBe(
+    expect(scannedPrefixes.some((p: string) => p.startsWith('chat'))).toBe(
       false,
     );
+    // note-exports/ 由 MinIO 生命周期规则回收，也不归这里管。
+    expect(
+      scannedPrefixes.some((p: string) => p.startsWith('note-exports')),
+    ).toBe(false);
   });
 
   it('reports unreferenced objects without deleting anything', async () => {
@@ -108,7 +114,9 @@ describe('StorageAuditService', () => {
     const fresh = new Date(now.getTime() - 60 * 1000);
     const { service } = harness({
       objects: {
-        'avatars/': [{ key: 'avatars/fresh.jpg', size: 5, lastModified: fresh }],
+        'avatars/': [
+          { key: 'avatars/fresh.jpg', size: 5, lastModified: fresh },
+        ],
       },
     });
 
