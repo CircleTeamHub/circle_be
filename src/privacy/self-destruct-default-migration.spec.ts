@@ -11,7 +11,7 @@ import { join } from 'node:path';
  * 只改其中一处会得到一个「看起来改了、实际按用户群分裂成两种行为」的状态，
  * 而这个设置失效时没有任何报错 —— 消息只是安静地翻不到。
  *
- * 存量行刻意不动，见下面那条用例。
+ * 存量行由迁移一并归零，见下面那条用例。
  */
 describe('message self-destruct default', () => {
   const root = join(__dirname, '../..');
@@ -41,25 +41,20 @@ describe('message self-destruct default', () => {
   });
 
   /**
-   * 迁移不得改写任何存量行。
+   * 存量行全部归零，不带 WHERE —— 产品未上线，所有人从关闭状态起步。
    *
-   * 库里分不清「显式选了 2 天」和「建行时吃到旧列默认值」，而这两种代价不对称：
-   * 留着，最坏是一部分动过设置的账号继续保留两天窗口，他们随时能自己改；重置，
-   * 最坏是把某人主动开启的自毁悄悄关掉 —— 隐私设置只能由用户自己放松，不能被
-   * 一条迁移替他放松。
-   *
-   * 而且真正受影响的那批人库里根本没有行，靠 DEFAULT_PRIVACY_SETTINGS 就全覆盖了，
-   * 改存量对修复本身没有任何贡献。
+   * 带上 WHERE 会漏掉显式选过 1 / 7 / 30 天的行，那不是这里想要的语义。
    */
-  it('never rewrites existing rows, so an explicit 2-day choice survives', () => {
+  it('resets every existing row, not just the ones holding the old default', () => {
     const sql = readFileSync(migrationPath, 'utf8')
       .replace(/\r\n/g, '\n')
       // 去掉注释行再断言，避免注释里出现的关键字造成假阴性。
       .replace(/^\s*--.*$/gm, '');
 
-    expect(sql).not.toMatch(/\bUPDATE\b/i);
-    expect(sql).not.toMatch(/\bDELETE\b/i);
-    expect(sql).not.toMatch(/\bUSING\b/i);
+    const update = sql.match(/UPDATE "UserPrivacySetting"[^;]*;/i);
+    expect(update).not.toBeNull();
+    expect(update![0]).toMatch(/SET "messageSelfDestructDays" = 0/);
+    expect(update![0]).not.toMatch(/\bWHERE\b/i);
   });
 
   it('keeps 0 as a selectable option so "off" is reachable from the UI', () => {
