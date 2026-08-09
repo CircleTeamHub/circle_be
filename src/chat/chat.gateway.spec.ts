@@ -183,7 +183,27 @@ describe('ChatGateway', () => {
       chatService.listConversationIds.mockRejectedValue(new Error('db down'));
       await gateway['handleConnection'](socket as never);
       expect(socket.disconnect).toHaveBeenCalledWith(true);
-      expect(socket.handlers.size).toBe(0);
+      // 监听现在是同步注册的(在入房之前),所以这里不再断言 handlers 为空 ——
+      // 要保证的是它们「注册了但不干活」:入房失败后事件一律不落到业务处理器。
+      const ack = jest.fn();
+      socket.handlers.get('chat:send')?.({ conversationId: 'c' }, ack);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(chatService.sendMessage).not.toHaveBeenCalled();
+    });
+
+    // 入房要 await,而监听若在 await 之后注册,这段窗口里到达的 chat:send
+    // 没有任何监听者 —— Socket.IO 直接丢弃且不回 ack,客户端表现为「刚连上
+    // 发的第一条消息石沉大海」。所以监听必须先于第一个 await 注册。
+    it('registers event handlers before awaiting room setup', async () => {
+      const socket = fakeSocket();
+      let handlersAtLookup = 0;
+      chatService.listConversationIds.mockImplementation(() => {
+        handlersAtLookup = socket.handlers.size;
+        return Promise.resolve(['conv-1']);
+      });
+      await gateway['handleConnection'](socket as never);
+      expect(handlersAtLookup).toBeGreaterThan(0);
     });
 
     it('confines a guest socket to its own room and skips the membership lookup', async () => {
@@ -293,7 +313,7 @@ describe('ChatGateway', () => {
       expect(broadcast.emitMessage).not.toHaveBeenCalled();
     });
 
-    it('rate limits per socket with an explicit ack code', async () => {
+    it('rate limits per authenticated user with an explicit ack code', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: false,
         message: { id: 'm', conversationId: 'conv-1', height: 1, d: 'd' },
@@ -303,7 +323,7 @@ describe('ChatGateway', () => {
       for (let i = 0; i < 21; i += 1) {
         await gateway['handleSend'](
           socket as never,
-          'u1',
+          'flood-user',
           payload as never,
           (a: unknown) => acks.push(a),
         );
@@ -313,6 +333,37 @@ describe('ChatGateway', () => {
         code: ChatErrorCode.RateLimited,
       });
       expect(chatService.sendMessage).toHaveBeenCalledTimes(20);
+    });
+
+    // 配额按用户算,不按连接算。按 socket.id 计数的话,发满就重连是一个免费的
+    // 配额重置 —— 限流形同虚设。换一条 socket 继续发,必须仍然被拒。
+    it('keeps the budget across reconnects (a new socket does not reset it)', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        message: { id: 'm', conversationId: 'conv-1', height: 1, d: 'd' },
+      });
+      for (let i = 0; i < 20; i += 1) {
+        await gateway['handleSend'](
+          fakeSocket({ id: `sock-${i}` }) as never,
+          'reconnect-user',
+          payload as never,
+          () => {},
+        );
+      }
+      chatService.sendMessage.mockClear();
+
+      const ack = jest.fn();
+      await gateway['handleSend'](
+        fakeSocket({ id: 'brand-new-socket' }) as never,
+        'reconnect-user',
+        payload as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({ code: ChatErrorCode.RateLimited }),
+      );
+      expect(chatService.sendMessage).not.toHaveBeenCalled();
     });
 
     it('survives a missing ack callback', async () => {

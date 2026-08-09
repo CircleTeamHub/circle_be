@@ -34,10 +34,21 @@ describe('SlidingWindowRateLimiter', () => {
     expect(limiter.tryAcquire('s1', 1_050)).toBe(true);
   });
 
-  it('clear removes all state for a key', () => {
+  // 断开重连不能重置配额 —— 那正是把 key 从 socket.id 换成 userId 要堵的洞:
+  // 客户端只要每发满就重连一次,限流等于不存在。
+  it('pruneExpired keeps an in-window budget so reconnecting does not reset it', () => {
     const limiter = new SlidingWindowRateLimiter(1, 1_000);
-    expect(limiter.tryAcquire('s1', 0)).toBe(true);
-    limiter.clear('s1');
-    expect(limiter.tryAcquire('s1', 1)).toBe(true);
+    expect(limiter.tryAcquire('u1', 0)).toBe(true);
+    // 断开:此刻窗口内还有记录,必须原样保留。
+    limiter.pruneExpired('u1', 100);
+    expect(limiter.tryAcquire('u1', 200)).toBe(false);
+  });
+
+  it('pruneExpired reclaims a key once its window has fully passed', () => {
+    const limiter = new SlidingWindowRateLimiter(1, 1_000);
+    expect(limiter.tryAcquire('u1', 0)).toBe(true);
+    // 窗口整个过完再断开:回收,不占内存。
+    limiter.pruneExpired('u1', 2_000);
+    expect(limiter.tryAcquire('u1', 2_001)).toBe(true);
   });
 });

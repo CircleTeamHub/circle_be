@@ -78,6 +78,17 @@ export class ChatGateway {
     CHAT_RATE_LIMITS.presence.windowMs,
   );
 
+  private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
+  private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
+  private revocationSubscribed = false;
+  private revocationRetryAttempt = 0;
+  private revocationRetryTimer: NodeJS.Timeout | null = null;
+  /** access token 到期即断连的计时器,按 socket 保存以便断开时清掉。 */
+  private readonly expiryTimers = new Map<Socket, NodeJS.Timeout>();
+  /** 多设备是正当需求,但单账号不该能开出无上限的连接来摊薄限流成本。 */
+  private static readonly MAX_SOCKETS_PER_USER = 10;
+  private readonly connectionsByUser = new Map<string, Set<Socket>>();
+
   constructor(
     private readonly jwtService: JwtService,
     private readonly sessionRevocation: SessionRevocationService,
@@ -120,17 +131,52 @@ export class ChatGateway {
 
     this.io = io;
     this.broadcast.setServer(io);
-    // 封禁/登出吊销 → 踢掉在线 chat socket(否则旧连接可继续收发到自然断开)。
+    this.ensureRevocationSubscription();
+    this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
+  }
+
+  /**
+   * 封禁/登出吊销 → 踢掉在线 chat socket(否则旧连接可继续收发到自然断开)。
+   *
+   * subscribePattern 从不 reject:连接/psubscribe 失败它自己吞掉并返回 false,
+   * Redis 没配也返回 false。所以原来挂的 .catch() 是永远走不到的死代码 ——
+   * 启动瞬间 Redis 恰好不可用,订阅就永久缺失,被封禁的人直到自己断线为止
+   * 都能继续收发。改成认返回值 + 退避重试(照搬 RealtimeService 的做法)。
+   */
+  private ensureRevocationSubscription(): void {
+    if (this.revocationSubscribed || this.revocationRetryTimer) return;
+    // Redis 未配置是部署形态(单实例),不是故障:不重试、不刷日志。
+    if (!this.redisService.isEnabled()) return;
     void this.redisService
       .subscribePattern(SESSION_REVOCATION_CHANNEL, (_channel, message) => {
         void this.handleRevocation(message);
       })
-      .catch((error: unknown) => {
-        this.logger.warn(
-          `revocation subscribe failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      .then((subscribed) => {
+        if (subscribed) {
+          this.revocationSubscribed = true;
+          this.revocationRetryAttempt = 0;
+          return;
+        }
+        this.scheduleRevocationRetry();
       });
-    this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
+  }
+
+  private scheduleRevocationRetry(): void {
+    if (this.revocationRetryTimer) return;
+    const delay = Math.min(
+      ChatGateway.SUBSCRIBE_RETRY_BASE_MS * 2 ** this.revocationRetryAttempt,
+      ChatGateway.SUBSCRIBE_RETRY_MAX_MS,
+    );
+    this.revocationRetryAttempt += 1;
+    this.logger.warn(
+      `revocation subscribe failed; retrying in ${delay}ms (attempt ${this.revocationRetryAttempt})`,
+    );
+    this.revocationRetryTimer = setTimeout(() => {
+      this.revocationRetryTimer = null;
+      this.ensureRevocationSubscription();
+    }, delay);
+    // 重试计时器不应拖住进程退出。
+    this.revocationRetryTimer.unref?.();
   }
 
   /**
@@ -161,7 +207,35 @@ export class ChatGateway {
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
+    socket.data.expMs =
+      typeof payload.exp === 'number' ? payload.exp * 1000 : null;
     return payload.sub;
+  }
+
+  /**
+   * access token 到期即断连。
+   *
+   * 握手只在连接建立那一刻验一次签,之后 socket 可以活到自然断开为止 ——
+   * 不排期断连的话,一条长连接能在 token 过期后继续收发几小时甚至几天,
+   * 「让 token 短命」这个前提就不成立了。RealtimeGateway 早就是这么做的
+   * (realtime.gateway.ts 的 expiryTimers),chat 侧对齐。
+   *
+   * 访客 token 走另一条分支(expMs 为 undefined),其时效由房间生命周期兜底。
+   */
+  private scheduleExpiryDisconnect(socket: Socket): void {
+    const expMs = socket.data.expMs as number | null | undefined;
+    if (typeof expMs !== 'number') return;
+    const ttl = expMs - Date.now();
+    if (ttl <= 0) {
+      socket.disconnect(true);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.expiryTimers.delete(socket);
+      socket.disconnect(true);
+    }, ttl);
+    timer.unref?.();
+    this.expiryTimers.set(socket, timer);
   }
 
   /** 不验签地读一下 kind,仅用于分流到对应的验签分支。 */
@@ -250,7 +324,73 @@ export class ChatGateway {
       typeof socket.data.guestConversationId === 'string'
         ? socket.data.guestConversationId
         : null;
-    let conversationIds: string[];
+
+    if (!this.claimConnectionSlot(userId, socket)) {
+      this.logger.warn(
+        `connection cap reached for user ${userId}; rejecting new socket`,
+      );
+      socket.disconnect(true);
+      return;
+    }
+    this.scheduleExpiryDisconnect(socket);
+
+    // 监听必须**同步**注册,在任何 await 之前。反过来的话,入房那几个 await
+    // 期间到达的 chat:send / chat:read 没有任何监听者 —— Socket.IO 直接丢弃
+    // 且不回 ack,客户端表现是「刚连上发的第一条消息石沉大海」,且没有任何
+    // 错误可供重试判定。处理器统一先 await ready:入房未完成时排队而不是丢。
+    let resolveReady!: (ok: boolean) => void;
+    const ready = new Promise<boolean>((resolve) => {
+      resolveReady = resolve;
+    });
+    let conversationIds: string[] = [];
+
+    const whenReady = (run: () => void): void => {
+      void ready.then((ok) => {
+        if (ok) run();
+      });
+    };
+
+    socket.on(
+      CHAT_EVENTS.send,
+      (payload: ChatSendPayload, ack?: AckFn<ChatSendAck>) => {
+        whenReady(() => void this.handleSend(socket, userId, payload, ack));
+      },
+    );
+    socket.on(
+      CHAT_EVENTS.read,
+      (payload: ChatReadPayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleRead(socket, userId, payload, ack));
+      },
+    );
+    socket.on(CHAT_EVENTS.typing, (payload: ChatTypingPayload) => {
+      whenReady(() => void this.handleTyping(socket, userId, payload));
+    });
+    socket.on(
+      CHAT_EVENTS.presence,
+      (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
+        whenReady(() => void this.handlePresenceQuery(socket, payload, ack));
+      },
+    );
+    socket.on('disconnect', () => {
+      resolveReady(false);
+      this.releaseConnectionSlot(userId, socket);
+      const timer = this.expiryTimers.get(socket);
+      if (timer) {
+        clearTimeout(timer);
+        this.expiryTimers.delete(socket);
+      }
+      // 限流窗口按用户保留:直接清掉等于「断开重连即重置配额」。
+      this.sendLimiter.pruneExpired(userId);
+      this.readLimiter.pruneExpired(userId);
+      this.typingLimiter.pruneExpired(userId);
+      this.presenceLimiter.pruneExpired(userId);
+      // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
+      void this.broadcast.isUserOnline(userId).then((online) => {
+        if (online) return;
+        this.broadcast.emitPresence(conversationIds, { userId, online: false });
+      });
+    });
+
     try {
       conversationIds = guestConversationId
         ? [guestConversationId]
@@ -262,45 +402,36 @@ export class ChatGateway {
       this.logger.error(
         `join rooms failed for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      resolveReady(false);
       socket.disconnect(true);
       return;
     }
-
-    socket.on(
-      CHAT_EVENTS.send,
-      (payload: ChatSendPayload, ack?: AckFn<ChatSendAck>) => {
-        void this.handleSend(socket, userId, payload, ack);
-      },
-    );
-    socket.on(
-      CHAT_EVENTS.read,
-      (payload: ChatReadPayload, ack?: AckFn<ChatReadAck>) => {
-        void this.handleRead(socket, userId, payload, ack);
-      },
-    );
-    socket.on(CHAT_EVENTS.typing, (payload: ChatTypingPayload) => {
-      void this.handleTyping(socket, userId, payload);
-    });
-    socket.on(
-      CHAT_EVENTS.presence,
-      (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
-        void this.handlePresenceQuery(socket, payload, ack);
-      },
-    );
-    socket.on('disconnect', () => {
-      this.sendLimiter.clear(socket.id);
-      this.readLimiter.clear(socket.id);
-      this.typingLimiter.clear(socket.id);
-      this.presenceLimiter.clear(socket.id);
-      // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
-      void this.broadcast.isUserOnline(userId).then((online) => {
-        if (online) return;
-        this.broadcast.emitPresence(conversationIds, { userId, online: false });
-      });
-    });
+    resolveReady(true);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
     this.broadcast.emitPresence(conversationIds, { userId, online: true });
+  }
+
+  /**
+   * 单用户并发连接上限。
+   *
+   * 限流改成按 userId 计数之后,单条连接吃不满配额了;但一个账号仍然可以开
+   * 几百条 socket 摊薄每条的成本,并且每条都占着内存与房间订阅。多设备是正当
+   * 需求,所以不是限 1,而是给一个宽松但有界的上限。
+   */
+  private claimConnectionSlot(userId: string, socket: Socket): boolean {
+    const sockets = this.connectionsByUser.get(userId) ?? new Set<Socket>();
+    if (sockets.size >= ChatGateway.MAX_SOCKETS_PER_USER) return false;
+    sockets.add(socket);
+    this.connectionsByUser.set(userId, sockets);
+    return true;
+  }
+
+  private releaseConnectionSlot(userId: string, socket: Socket): void {
+    const sockets = this.connectionsByUser.get(userId);
+    if (!sockets) return;
+    sockets.delete(socket);
+    if (sockets.size === 0) this.connectionsByUser.delete(userId);
   }
 
   /** 在线状态查询:一次最多 50 个 userId,ack 回 {userId: online}。 */
@@ -310,7 +441,8 @@ export class ChatGateway {
     ack?: AckFn<Record<string, boolean>>,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
-    if (!this.presenceLimiter.tryAcquire(socket.id)) {
+    const userId = socket.data.userId as string;
+    if (!this.presenceLimiter.tryAcquire(userId)) {
       ack({});
       return;
     }
@@ -324,7 +456,6 @@ export class ChatGateway {
     // 收窄到「与请求方同处在座会话」的用户。不过滤的话,任何登录账号都能
     // 拿任意 UUID(API 里到处都在返回)持续轮询别人的在线状态 —— 陌生人、
     // 被拉黑的人都能被长期追踪。上下线广播本身就只发到会话房,查询也对齐。
-    const userId = socket.data.userId as string;
     // 依赖失败必须收在这里:监听侧是 void this.handlePresenceQuery(...),抛出去
     // 只会变成一条 unhandled rejection,而客户端的 ack 永远等不到 —— 界面上就是
     // 在线状态一直转圈。handleSend / handleRead 都已各自兜住,presence 是漏网的那个。
@@ -357,7 +488,7 @@ export class ChatGateway {
     ack?: AckFn<ChatSendAck>,
   ): Promise<void> {
     const reply = this.ackOnce(ack);
-    if (!this.sendLimiter.tryAcquire(socket.id)) {
+    if (!this.sendLimiter.tryAcquire(userId)) {
       reply(this.ackError(ChatErrorCode.RateLimited, '发送太频繁'));
       return;
     }
@@ -387,7 +518,7 @@ export class ChatGateway {
     ack?: AckFn<ChatReadAck>,
   ): Promise<void> {
     const reply = this.ackOnce(ack);
-    if (!this.readLimiter.tryAcquire(socket.id)) {
+    if (!this.readLimiter.tryAcquire(userId)) {
       reply(this.ackError(ChatErrorCode.RateLimited));
       return;
     }
@@ -418,7 +549,7 @@ export class ChatGateway {
     userId: string,
     payload: ChatTypingPayload,
   ): Promise<void> {
-    if (!this.typingLimiter.tryAcquire(socket.id)) return;
+    if (!this.typingLimiter.tryAcquire(userId)) return;
     const conversationId = payload?.conversationId;
     if (typeof conversationId !== 'string' || conversationId.length === 0)
       return;
