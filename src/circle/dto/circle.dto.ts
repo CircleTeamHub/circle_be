@@ -17,6 +17,7 @@ import {
   MinLength,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { MAX_PAGE } from 'src/common/pagination';
 
 const MY_CIRCLE_TABS = ['joined', 'created', 'applied'] as const;
 const URL_VALIDATION_OPTIONS = {
@@ -128,6 +129,7 @@ export class ListCirclesQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   @IsOptional()
   page?: number;
 

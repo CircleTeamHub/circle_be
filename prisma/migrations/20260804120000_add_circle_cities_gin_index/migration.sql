@@ -1,0 +1,12 @@
+-- GET /api/v1/circle?city= filters with `cities has ?`, i.e. `cities @> ARRAY[?]`.
+-- Array containment cannot use a btree index, so without this every such request
+-- was a full sequential scan of "Circle" plus a sort — and circle.service.ts issues
+-- the findMany and the count concurrently via Promise.all, so one request occupied
+-- two of the ten pool connections for the whole scan. GET carries no route-level
+-- limiter (the express one only fires on POST/DELETE), which made this the cheapest
+-- read-side way to exhaust the pool for the entire instance.
+--
+-- CONCURRENTLY is deliberately NOT used: Prisma migrations run inside a transaction,
+-- and the table is small pre-launch. Revisit if this ever needs to run against a
+-- large live table.
+CREATE INDEX "Circle_cities_idx" ON "Circle" USING GIN ("cities");

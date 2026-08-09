@@ -1,4 +1,9 @@
-import { Logger, ServiceUnavailableException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { UserStatus } from 'src/generated/prisma';
 import { AuthService } from './auth.service';
 
 /**
@@ -9,11 +14,21 @@ import { AuthService } from './auth.service';
  * token has nothing to fall back on.
  */
 describe('AuthService.getImToken', () => {
-  // getImToken only touches this.openim + this.logger, so the other ctor deps
-  // can be null for this focused test (mirrors auth-im-token.spec.ts).
-  function makeService(getUserToken: jest.Mock): AuthService {
+  // getImToken touches this.prisma（封禁校验）+ this.openim + this.logger，
+  // 其余 ctor 依赖对本组测试无关，仍传 null（沿用 auth-im-token.spec.ts 的写法）。
+  function makeService(
+    getUserToken: jest.Mock,
+    status: UserStatus | null = UserStatus.ACTIVE,
+  ): AuthService {
+    const prisma = {
+      user: {
+        findUnique: jest
+          .fn()
+          .mockResolvedValue(status === null ? null : { status }),
+      },
+    };
     return new AuthService(
-      null as any,
+      prisma as any,
       null as any,
       null as any,
       { getUserToken } as any,
@@ -80,5 +95,30 @@ describe('AuthService.getImToken', () => {
     await expect(
       makeService(getUserToken).getImToken('user-1'),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  // 封禁在 IM 侧唯一还起作用的关卡就在这里。JWT 会话撤销走 Redis，而 Redis 不可用时
+  // 它是 fail-open 的 —— 那时被封的人 access token 依然验得过，只要调这个接口就能换到
+  // 一枚新的 OpenIM token、重连 msggateway，把封禁时的强制下线原样抵消。
+  // 聊天流量不经过 circle_be，放过这里就等于封禁在聊天里完全无效。
+  it.each([UserStatus.BANNED, UserStatus.DELETED])(
+    'refuses to mint an IM token for a %s account',
+    async (status) => {
+      const getUserToken = jest.fn().mockResolvedValue('im-token-abc');
+
+      await expect(
+        makeService(getUserToken, status).getImToken('user-1'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(getUserToken).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses to mint an IM token when the user no longer exists', async () => {
+    const getUserToken = jest.fn().mockResolvedValue('im-token-abc');
+
+    await expect(
+      makeService(getUserToken, null).getImToken('user-1'),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(getUserToken).not.toHaveBeenCalled();
   });
 });

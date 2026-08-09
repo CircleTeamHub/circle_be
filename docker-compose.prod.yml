@@ -93,11 +93,37 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set}
+    # note-exports/ 的生命周期规则是这里唯一的存量回收机制。
+    # 后端代码里没有任何一处删除 MinIO 对象（全仓 grep DeleteObject/removeObject 为空），
+    # 而笔记导出每次调用都写一个新 key（randomUUID，不去重）。note.service.ts 里的
+    # NOTE_EXPORT_TTL_SECONDS = 15 分钟只是**意图**：upload.service.ts 拿它算了个响应
+    # 字段就丢了，对象本身是永久的。所以导出产物会单调增长，直到和 Postgres 同机的
+    # 磁盘被写满 —— 那时倒下的是数据库，不只是上传功能。
+    # 下发的预签名 URL 15 分钟就失效，所以按天回收不影响任何正常使用；
+    # ilm 失败不阻断建桶（老版本 mc 的子命令名不同），只告警。
+    #
+    # 本服务是一次性的，且发版**不碰**数据面（release-deploy.sh 的契约、
+    # DEPLOY.md §4）：存量环境的 minio-init 早就跑完退出了，光把规则写在这里，
+    # 老环境永远不会执行到 —— 而这是 note-exports/ 唯一的回收机制。
+    # 所以 entrypoint 必须可重复执行，存量环境按 DEPLOY.md 的补齐步骤手工跑一次：
+    #   docker compose -f docker-compose.prod.yml run --rm minio-init
+    # 重复执行安全：mc mb -p 幂等；ilm 先查后加，已存在就跳过（直接 add 会重复叠规则）。
     entrypoint: >
       sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
       mc mb -p local/circle &&
-      echo 'minio bucket [circle] ready'
+      if mc ilm rule ls local/circle 2>/dev/null | grep -q 'note-exports/'; then
+        echo 'note-exports lifecycle rule already present';
+      elif mc ilm rule add --expire-days 1 --prefix 'note-exports/' local/circle; then
+        echo 'note-exports lifecycle rule installed';
+      else
+        echo 'WARN: could not install note-exports lifecycle rule';
+      fi;
+      if mc ilm rule ls local/circle 2>/dev/null | grep -q 'note-exports/'; then
+        echo 'minio bucket [circle] ready';
+      else
+        echo 'WARN: note-exports lifecycle rule is NOT active; exports will accumulate';
+      fi
       "
     restart: 'no'
 
@@ -171,7 +197,14 @@ services:
       - '80'
 
   caddy:
-    image: caddy:2-alpine
+    # 官方镜像不带限流模块，故本地构建（见 Dockerfile.caddy）。
+    # release-deploy.sh 只 pull circle_be/migrate、只 `up --no-build` 在役颜色，
+    # 因此这里的 build 不参与发布流程；首次或升级 Caddy 时手动
+    # `docker compose -f docker-compose.prod.yml build caddy && ... up -d caddy`。
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    image: circle-caddy:ratelimit
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 256m

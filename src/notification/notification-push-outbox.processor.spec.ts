@@ -1,4 +1,46 @@
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
+
+// 名额分配已经从内存里的 selectFairBatch 挪进 SQL(PARTITION BY 发送者排名),
+// 因为在内存里只能对「按时间取的窗口」做调度,而窗口本身会被洪水占满 ——
+// 灌 13000 条之后,每一轮候选里都只有洪水发送者,正常推送要等约 22 小时。
+//
+// 排名逻辑本身是 SQL,单元测试跑不到(要真库);这里钉住的是调用契约:
+// 确实用了跨全队列的排名查询、每发送者有上限、批量有上限,以及水合之后
+// 顺序仍然是名次序 —— 顺序就是公平性本身,水合打乱了等于白排。
+describe('fair batch selection contract', () => {
+  it('ranks per sender across the whole queue, not inside a time window', () => {
+    const source = readFileSync(
+      join(__dirname, 'notification-push-outbox.processor.ts'),
+      'utf8',
+    );
+    expect(source).toContain(`'sender:' || n."fromUserID"`);
+    expect(source).toContain('rn <= ');
+    // 先取窗口再调度正是被 review 指出的那个失效模式,不能回潮。
+    expect(source).not.toContain('CANDIDATE_WINDOW');
+  });
+
+  // 公告扇出的每一行都挂同一个管理员,套发送者配额等于「整条公告 10 条/轮」,
+  // 10000 人要发约 17 小时。按公告分区 + 独立名额,同时保证公告吃不满整批。
+  it('gives system announcements their own partition and quota', () => {
+    const source = readFileSync(
+      join(__dirname, 'notification-push-outbox.processor.ts'),
+      'utf8',
+    );
+    expect(source).toContain(`'announcement:' || n."systemAnnouncementID"`);
+    // 两个分支都是绑定参数,漏掉 ::int 时 Postgres 把 CASE 解成 text,整条出队
+    // 查询在运行时报 `operator does not exist: bigint <= text` —— 推送全线停摆,
+    // 而这里的 $queryRaw 是桩,单测照样绿。所以把转型本身钉住。
+    expect(source).toContain('THEN ${SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK}::int');
+    expect(source).toContain('ELSE ${MAX_PER_SENDER_PER_TICK}::int');
+    // 名额必须严格小于整批,否则一条大公告会把日常推送顶到公告发完为止 ——
+    // 那只是把饿死的方向调了个头。写成 BATCH_SIZE 的分数,改批量时不会失配。
+    expect(source).toMatch(
+      /SYSTEM_ANNOUNCEMENT_ROWS_PER_TICK = BATCH_SIZE \/ [2-9]/,
+    );
+  });
+});
 
 const notification = {
   id: 'notification-1',
@@ -28,6 +70,11 @@ function buildHarness({
   tokens?: Array<{ token: string; projectId: string | null }>;
 }) {
   const prisma = {
+    // 名额分配现在跨整个队列用 PARTITION BY 排名(见 processor 注释),
+    // 排名只回 id,再按 id 水合。桩照这个两步来。
+    $queryRaw: jest
+      .fn()
+      .mockResolvedValue(jobs.map((job: { id: string }) => ({ id: job.id }))),
     notificationPushOutbox: {
       findMany: jest.fn().mockResolvedValue(jobs),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),

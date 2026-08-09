@@ -167,6 +167,30 @@ restore_minimum_schema_compatibility_floor() {
   fi
 }
 
+# deploy/Caddyfile.admin 用了 rate_limit，而官方 caddy 镜像不带这个模块（本仓库用
+# Dockerfile.caddy 自行构建）。镜像没换而配置已同步过去时：switch_proxy 的
+# `caddy validate` 必失败 → 拒绝切流 → 之后每一次发布都红；更糟的是 caddy 一旦因
+# 任何原因重启（宿主机重启、docker 升级）就会 crash-loop —— entrypoint 是
+# `caddy run`，遇到未知指令根本起不来，等于公网入口整个消失。
+#
+# 所以提前查一次，并直接给出可执行的修复命令，而不是让人对着 validate 的报错猜。
+assert_caddy_has_rate_limit() {
+  # caddy 没在跑：交给 switch_proxy 自己的「Caddy is not running」检查处理。
+  [ -n "$(running caddy)" ] || return 0
+  if compose exec -T caddy caddy list-modules 2>/dev/null |
+    grep -qx 'http\.handlers\.rate_limit'; then
+    return 0
+  fi
+  cat >&2 <<'CADDY_MSG'
+The running Caddy has no rate_limit module, but deploy/Caddyfile.admin requires it.
+Leaving it as-is blocks every future release and makes any Caddy restart crash-loop.
+Rebuild and recreate Caddy once, then re-run this deploy:
+  docker compose -f docker-compose.prod.yml build caddy
+  docker compose -f docker-compose.prod.yml up -d --force-recreate caddy
+CADDY_MSG
+  return 1
+}
+
 switch_proxy() {
   local target
   target="$(container_upstream "$1")" || return 1
@@ -193,6 +217,10 @@ if [ -n "${GHCR_TOKEN:-}" ]; then
 fi
 
 export CIRCLE_BE_IMAGE
+
+# 放在拉镜像之前：这是纯本地检查，几秒出结果，没必要等到切流那一步（几分钟后）
+# 才发现代理根本不可能被 reload。
+assert_caddy_has_rate_limit || exit 1
 
 echo "==> Pulling release image: $CIRCLE_BE_IMAGE"
 if ! compose pull --quiet circle_be migrate; then

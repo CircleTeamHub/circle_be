@@ -14,6 +14,7 @@ import {
 } from 'class-validator';
 import { UserRole, UserStatus } from 'src/generated/prisma';
 import { SENSITIVE_FIELDS, SensitiveField } from '../admin-user.constants';
+import { MAX_PAGE } from 'src/common/pagination';
 
 // 审计原因必须是真内容：不 trim 的话 '   ' 能过 MinLength(3)，管理员就能在
 // 只留一串空格的情况下查看/封禁，审计留痕等于没留。
@@ -54,6 +55,7 @@ export class ListAdminUsersQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page = 1;
 
   @ApiPropertyOptional({ default: 20, minimum: 1, maximum: 100 })

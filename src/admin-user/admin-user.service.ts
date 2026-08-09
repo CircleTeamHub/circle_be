@@ -13,6 +13,7 @@ import { AdminUserErrorCode } from 'src/common/app-error-codes';
 import { Prisma, UserStatus } from 'src/generated/prisma';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { createLoggingConfig } from 'src/logging/logging.config';
+import { OpenimService } from 'src/openim/openim.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { AdminUserAuditService } from './admin-user-audit.service';
@@ -75,6 +76,7 @@ export class AdminUserService {
     private readonly audit: AdminUserAuditService,
     private readonly sessionRevocation: SessionRevocationService,
     private readonly realtime: RealtimeService,
+    private readonly openim: OpenimService,
   ) {}
 
   async listUsers(query: ListAdminUsersQueryDto) {
@@ -380,6 +382,14 @@ export class AdminUserService {
         dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
       if (revokedAt) {
         await this.persistSessionRevocation(tx, targetId, revokedAt);
+      } else {
+        // 复活(→ ACTIVE)必须同事务撤掉还排着队的封禁作业。
+        // 封禁那半失败时 outbox 行会留着按退避重试;管理员在重试跑起来之前解封的话,
+        // 处理器照样会把这个已经恢复正常的用户从所有 IM 平台强制登出,
+        // 而且失败一次就再重试一次 —— 用户被反复踢下线,直到作业成功或过期。
+        await tx.sessionRevocationOutbox.deleteMany({
+          where: { userID: targetId },
+        });
       }
 
       return {
@@ -394,6 +404,7 @@ export class AdminUserService {
     const sessionRevocationPending = result.revokedAt
       ? !(await this.completeSessionRevocation(targetId, result.revokedAt))
       : false;
+
     await this.runPostCommitHook('invalidate profile summary cache', () =>
       this.realtime.invalidateUserProfileSummaryCache(targetId),
     );
@@ -427,6 +438,16 @@ export class AdminUserService {
     };
   }
 
+  /**
+   * 「封禁真正生效」是两件事：撤销 circle_be 的业务会话（Redis），以及把用户踢下
+   * OpenIM。缺任何一半都不算完成 —— 撤销只挡住 HTTP/WS，而聊天消息根本不走
+   * circle_be，客户端拿着已签发的 IM token 直连 msggateway 就能继续在群里发消息。
+   *
+   * 所以两件事都成功才删 outbox 行；否则留着让 SessionRevocationOutboxProcessor
+   * 按退避重试。这一点很关键：OpenIM 过载时最容易踢失败，而那恰恰是最需要封禁
+   * 立刻生效的时刻（比如正在封一个刷屏的人）。只打一行 warn 就放过，等于让封禁在
+   * 聊天侧静默失效，且除了日志没有任何人会知道。
+   */
   private async completeSessionRevocation(
     userId: string,
     revokedAt: Date,
@@ -445,6 +466,23 @@ export class AdminUserService {
         `Admin user status committed but failed to revoke user sessions: ${
           error instanceof Error ? error.message : String(error)
         }`,
+      );
+      return false;
+    }
+
+    let kicked = false;
+    try {
+      kicked = await this.openim.forceLogoutAllPlatforms(userId);
+    } catch (error) {
+      this.logger.warn(
+        `Admin user status committed but failed to force-logout OpenIM sessions: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!kicked) {
+      this.logger.warn(
+        `Admin user ${userId} status committed but at least one OpenIM platform session may still be live; left queued for retry`,
       );
       return false;
     }

@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
-import { Prisma } from 'src/generated/prisma';
+import { Prisma, UserStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -1341,6 +1341,20 @@ export class AuthService {
     userId: string,
     platformID?: 1 | 2 | 5,
   ): Promise<{ imToken: string }> {
+    // 封禁/删号必须在这里也拦一道，不能只靠 JWT 会话撤销。撤销走的是 Redis
+    // （SessionRevocationService），而 Redis 不可用时它是 fail-open 的 —— 那种时候
+    // 被封的人手里的 access token 依然验得过，于是他只要调这个接口就能换到一枚全新的
+    // OpenIM token、重连 msggateway，把封禁时刚做的强制下线原样抵消掉。
+    // 聊天流量不经过 circle_be，这是封禁在 IM 侧唯一还能起作用的关卡。
+    // 代价是一次带索引的主键查询，而这个接口本身限流 10 次/分钟。
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { status: true },
+    });
+    if (!user || user.status !== UserStatus.ACTIVE) {
+      throw new ForbiddenException('Account is not active');
+    }
+
     const imToken = await this.resolveImToken(userId, platformID);
     if (!imToken) {
       throw new ServiceUnavailableException(

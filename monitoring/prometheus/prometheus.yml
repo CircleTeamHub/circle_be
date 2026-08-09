@@ -34,9 +34,12 @@ scrape_configs:
   # 端口因版本而异 —— 先在服务器上确认（deploy/openim-hardening-runbook.md 第 7 步：
   #   grep -rn "prometheusPort" ~/openim-docker/config），把下面的占位端口换成真实值
   # 再 reload prometheus。目标不可达时 Prometheus 只标记 target down，不影响其它 job。
-  # - job_name: openim
-  #   static_configs:
-  #     # msggateway（连接数/在线数——容量规划最需要的那组）
-  #     - targets: ["host.docker.internal:20112"]
-  #     # openim-api（消息吞吐）
-  #     - targets: ["host.docker.internal:20113"]
+  #
+  # 保持启用（不要再注释掉）：聊天消息不经过 circle-be，这是唯一能看见消息吞吐和
+  # 连接数的地方。关掉它 = 恶意刷屏在监控上完全不可见。
+  - job_name: openim
+    static_configs:
+      # msggateway（连接数/在线数——容量规划与洪泛最需要的那组）
+      - targets: ["host.docker.internal:20112"]
+      # openim-api（消息吞吐）
+      - targets: ["host.docker.internal:20113"]

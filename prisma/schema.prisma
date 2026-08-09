@@ -1603,6 +1603,12 @@ model Circle {
   @@index([ownerID])
   @@index([adminState, createdAt])
   @@index([deleted, createdAt])
+  /// GET /circle?city= 走 `cities has ?`（= cities @> ARRAY[?]），数组包含查询用不了
+  /// btree。没有这个 GIN 索引时每次请求都是一次全表顺序扫描 + 一次排序，而且
+  /// service 里 findMany 与 count 是 Promise.all 并发发出的 —— 一个请求同时占用两个
+  /// 连接（池只有 10 个）。GET 上又没有路由级限流，只有 300 次/分钟/IP 的兜底，
+  /// 这是纯读接口里最容易被一个脚本打爆的一条。CirclePost.cities 早就有同款索引。
+  @@index([cities], type: Gin)
 }
 
 model AdminGroupOperation {
