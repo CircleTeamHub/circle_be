@@ -14,6 +14,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   CreateBucketCommand,
+  DeleteObjectCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
   ListObjectsV2Command,
@@ -367,6 +368,24 @@ export class UploadService implements OnModuleInit {
    * 引用」查清楚、人工核对过，再谈删。判错一个对象就是删掉用户的头像或笔记配图。
    */
   async listObjects(
+    prefix: string,
+    continuationToken?: string,
+  ): Promise<{
+    objects: { key: string; size: number; lastModified: Date | null }[];
+    nextContinuationToken?: string;
+  }> {
+    return this.listObjectsPage(prefix, continuationToken);
+  }
+
+  /** 按 key 删除单个对象(撤回/焚毁配套)。存储未配置时 no-op。 */
+  async deleteObjectByKey(key: string): Promise<void> {
+    if (!this.enabled) return;
+    await this.client.send(
+      new DeleteObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+  }
+
+  private async listObjectsPage(
     prefix: string,
     continuationToken?: string,
   ): Promise<{

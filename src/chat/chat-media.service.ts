@@ -33,6 +33,26 @@ export class ChatMediaService {
   constructor(private readonly uploadService: UploadService) {}
 
   /**
+   * 撤回/焚毁配套:按 key 删除对象存储里的媒体,只清 DB 等于没撤。
+   * 逐个尽力而为:单个失败只记日志(对象成孤儿,交 StorageAudit 类兜底),
+   * 不让撤回本身失败。只认 chat/ 前缀,别的目录不替删。
+   */
+  async deleteObjects(keys: string[]): Promise<void> {
+    for (const key of keys) {
+      if (!key.startsWith(CHAT_MEDIA_KEY_PREFIX)) continue;
+      try {
+        await this.uploadService.deleteObjectByKey(key);
+      } catch (error) {
+        this.logger.warn(
+          `revoked media delete failed key=${key}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  /**
    * 就地把 dto.content 换成带签名 URL 的新对象(不改数据库行)。
    * 存储未配置/签名失败时降级:保留 key、缺 url,前端按占位图处理 ——
    * 读路径绝不因媒体签名把整页历史打挂。

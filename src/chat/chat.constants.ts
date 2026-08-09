@@ -16,7 +16,12 @@ export const CHAT_EVENTS = {
   presence: 'chat:presence',
   /** 服务端 → 客户端(个人房定向):接收者本人的会话成员关系变化 */
   conversation: 'chat:conversation',
+  /** 双向:消息撤回(客户端带 ack 发起;服务端广播到会话房) */
+  revoke: 'chat:revoke',
 } as const;
+
+/** 发送者本人的可撤回时间窗;圈主/管理员撤回群消息不受此限。 */
+export const CHAT_REVOKE_WINDOW_MS = 2 * 60_000;
 
 /** 个人房:登录即加入,用于跨会话的定向推送。 */
 export const userRoom = (userId: string): string => `u:${userId}`;
@@ -99,6 +104,7 @@ export const CHAT_RATE_LIMITS = {
   read: { limit: 30, windowMs: 10_000 },
   typing: { limit: 10, windowMs: 5_000 },
   presence: { limit: 20, windowMs: 10_000 },
+  revoke: { limit: 10, windowMs: 10_000 },
 } as const;
 
 /**

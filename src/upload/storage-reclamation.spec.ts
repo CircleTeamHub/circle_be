@@ -54,10 +54,13 @@ describe('MinIO storage reclamation', () => {
     expect(source).toMatch(/private exportFingerprint\(/);
   });
 
-  it('still has no object-delete path, so the lifecycle rule is load-bearing', () => {
-    // 这条是提醒而非禁令：哪天真的实现了 GC，把这里一并更新，
-    // 免得「以为有 GC 了」而把生命周期规则删掉。
+  it('has a narrow object-delete path; the lifecycle rule still reclaims orphans', () => {
+    // 2026-08-09 起有了第一条删除路径:消息撤回(G-02)按 key 删聊天媒体
+    // (deleteObjectByKey,ChatMediaService 收口且只认 chat/ 前缀)。
+    // 它只覆盖"被撤回的消息"——presign 后未发送、发送后行被清理等孤儿
+    // 仍然只有生命周期规则兜底,所以那条规则依旧是 load-bearing,别删。
     const uploadService = read('src/upload/upload.service.ts');
-    expect(uploadService).not.toContain('DeleteObjectCommand');
+    expect(uploadService).toContain('DeleteObjectCommand');
+    expect(uploadService).toMatch(/deleteObjectByKey/);
   });
 });

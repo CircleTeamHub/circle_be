@@ -47,6 +47,30 @@ export interface ChatSenderInfo {
 }
 
 /** chat:msg 广播 / 历史接口共用的消息 DTO。 */
+/** 被引用消息的只读快照(G-09 真引用),getHistory/发送路径批量附带。 */
+export interface ChatReplyToSnapshot {
+  id: string;
+  height: number;
+  senderNickname: string;
+  type: string;
+  /** 服务端生成的短摘要;原消息已撤回时为空串。 */
+  preview: string;
+  revoked: boolean;
+}
+
+/** chat:revoke 客户端载荷(带 ack)。 */
+export interface ChatRevokePayload {
+  conversationId: string;
+  messageId: string;
+}
+
+/** chat:revoke 服务端广播。 */
+export interface ChatRevokeBroadcast {
+  conversationId: string;
+  messageId: string;
+  revokedBy: string;
+}
+
 export interface ChatMessageDto {
   id: string;
   conversationId: string;
@@ -55,6 +79,11 @@ export interface ChatMessageDto {
   content: Record<string, unknown>;
   sender: ChatSenderInfo | null;
   replyToId: string | null;
+  /** 被引用消息快照(读路径批量附带;原消息被物理删除时缺省)。 */
+  replyTo?: ChatReplyToSnapshot;
+  /** 撤回时间(ISO);未撤回为 null。撤回消息仍占 height,content 为空对象。 */
+  revokedAt?: string | null;
+  revokedBy?: string | null;
   /** 发送者本人的 ack 与广播共用此字段做本地乐观消息对账。 */
   d: string | null;
   createdAt: string;

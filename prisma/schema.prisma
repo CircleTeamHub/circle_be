@@ -1891,6 +1891,10 @@ model ChatMessage {
   clientMessageId String?  @db.VarChar(128)
   replyToID       String?
   deleted         Boolean  @default(false)
+  /// 撤回时间；撤回的消息仍占 height（坐标系不塌陷），content 已清空。
+  revokedAt       DateTime?
+  /// 执行撤回的人（发送者本人或圈主/管理员）。
+  revokedBy       String?
   createdAt       DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)

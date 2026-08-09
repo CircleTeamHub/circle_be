@@ -5,6 +5,7 @@ import type {
   ChatConversationBroadcast,
   ChatMessageDto,
   ChatReadBroadcast,
+  ChatRevokeBroadcast,
   ChatTypingBroadcast,
 } from './chat.types';
 
@@ -116,6 +117,15 @@ export class ChatBroadcastService {
     const server = this.requireServer('emitToUser');
     if (!server) return;
     server.to(userRoom(userId)).emit(event, payload);
+  }
+
+  /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */
+  emitRevoke(payload: ChatRevokeBroadcast): void {
+    const server = this.requireServer('emitRevoke');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.revoke, payload);
   }
 
   /** 本人会话成员关系变化(入座/退出/被移出) → 个人房定向。 */

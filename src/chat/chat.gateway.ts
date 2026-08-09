@@ -34,6 +34,7 @@ import type {
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
+  ChatRevokePayload,
   ChatSendAck,
   ChatSendPayload,
   ChatTypingPayload,
@@ -81,6 +82,10 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly presenceLimiter = new SlidingWindowRateLimiter(
     CHAT_RATE_LIMITS.presence.limit,
     CHAT_RATE_LIMITS.presence.windowMs,
+  );
+  private readonly revokeLimiter = new SlidingWindowRateLimiter(
+    CHAT_RATE_LIMITS.revoke.limit,
+    CHAT_RATE_LIMITS.revoke.windowMs,
   );
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
@@ -401,6 +406,12 @@ export class ChatGateway implements OnModuleDestroy {
       whenReady(() => void this.handleTyping(socket, userId, payload));
     });
     socket.on(
+      CHAT_EVENTS.revoke,
+      (payload: ChatRevokePayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleRevoke(userId, payload, ack));
+      },
+    );
+    socket.on(
       CHAT_EVENTS.presence,
       (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
         whenReady(() => void this.handlePresenceQuery(socket, payload, ack));
@@ -419,6 +430,7 @@ export class ChatGateway implements OnModuleDestroy {
       this.readLimiter.pruneExpired(userId);
       this.typingLimiter.pruneExpired(userId);
       this.presenceLimiter.pruneExpired(userId);
+      this.revokeLimiter.pruneExpired(userId);
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
@@ -589,6 +601,36 @@ export class ChatGateway implements OnModuleDestroy {
       }
     } catch (error) {
       reply(this.toAckError(error, 'read', userId, payload?.conversationId));
+    }
+  }
+
+  /** G-02 撤回:权限与广播都在 service 内收口,这里只做限流与 ack。 */
+  private async handleRevoke(
+    userId: string,
+    payload: ChatRevokePayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!this.revokeLimiter.tryAcquire(userId)) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const conversationId = payload?.conversationId;
+      const messageId = payload?.messageId;
+      if (
+        typeof conversationId !== 'string' ||
+        conversationId.length === 0 ||
+        typeof messageId !== 'string' ||
+        messageId.length === 0
+      ) {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      await this.chatService.revokeMessage(userId, conversationId, messageId);
+      reply({ ok: true });
+    } catch (error) {
+      reply(this.toAckError(error, 'revoke', userId, payload?.conversationId));
     }
   }
 

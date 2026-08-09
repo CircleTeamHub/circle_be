@@ -27,6 +27,7 @@ import {
   HISTORY_PAGE_MAX,
   MAX_CONTENT_BYTES,
   MAX_TEXT_LENGTH,
+  CHAT_REVOKE_WINDOW_MS,
   MEDIA_MESSAGE_TYPES,
 } from './chat.constants';
 import type {
@@ -279,8 +280,9 @@ export class ChatService {
       );
     }
     const message = this.toMessageDto(created.row, sender);
-    // ack 与广播共用这份 DTO:媒体 key 在此签出 url(读路径,不落库)。
+    // ack 与广播共用这份 DTO:引用快照与媒体 url 都在此附上(读路径,不落库)。
     // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛。
+    await this.attachReplyTo([message]);
     await this.media.attachMediaUrls([message]);
     return { message, reused: created.reused };
   }
@@ -656,6 +658,7 @@ export class ChatService {
     const messages = ascending.map((row) =>
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
+    await this.attachReplyTo(messages);
     await this.media.attachMediaUrls(messages);
     if (ascendingPull) {
       return {
@@ -1372,9 +1375,141 @@ export class ChatService {
       content: (row.content ?? {}) as Record<string, unknown>,
       sender,
       replyToId: row.replyToID,
+      revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
+      revokedBy: row.revokedBy ?? null,
       d: row.clientMessageId,
       createdAt: row.createdAt.toISOString(),
     };
+  }
+
+  /**
+   * G-09 真引用:一次 IN 批量取被引用消息,挂 replyTo 快照(禁 N+1)。
+   * 原消息被物理删除时缺省(前端回落 quotedText 文本快照);已撤回则
+   * revoked=true 且 preview 为空,前端渲染「消息已撤回」。
+   */
+  private async attachReplyTo(messages: ChatMessageDto[]): Promise<void> {
+    const ids = [
+      ...new Set(
+        messages
+          .map((m) => m.replyToId)
+          .filter((v): v is string => typeof v === 'string' && v.length > 0),
+      ),
+    ];
+    if (ids.length === 0) return;
+    const rows = await this.prisma.chatMessage.findMany({
+      where: { id: { in: ids } },
+    });
+    const senderIds = rows
+      .map((r) => r.senderID)
+      .filter((id): id is string => id !== null);
+    const senders = await this.resolveSenders(senderIds);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const message of messages) {
+      if (!message.replyToId) continue;
+      const row = byId.get(message.replyToId);
+      if (!row || row.deleted) continue;
+      const revoked = row.revokedAt !== null;
+      message.replyTo = {
+        id: row.id,
+        height: row.height,
+        senderNickname: this.senderFor(row, senders)?.nickname ?? '',
+        type: row.type,
+        preview: revoked ? '' : previewOfContent(row.type, row.content),
+        revoked,
+      };
+    }
+  }
+
+  /**
+   * G-02 消息撤回:发送者本人限 CHAT_REVOKE_WINDOW_MS 时间窗;
+   * GROUP 会话的圈主/管理员不受窗口限制、可撤他人消息。
+   * 撤回的消息仍占 height(坐标系不塌陷),content 清空,媒体对象一并删。
+   */
+  async revokeMessage(
+    userId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<ChatMessageDto> {
+    const conversation = await this.requireMembership(conversationId, userId);
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+    });
+    if (!row || row.conversationID !== conversationId || row.deleted) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    if (row.revokedAt) {
+      // 幂等:双端并发撤回/重试不再广播第二次。
+      const senders = await this.resolveSenders(
+        row.senderID ? [row.senderID] : [],
+      );
+      return this.toMessageDto(row, this.senderFor(row, senders));
+    }
+    if (row.senderID === userId) {
+      const expired =
+        Date.now() - row.createdAt.getTime() > CHAT_REVOKE_WINDOW_MS;
+      // 窗口过期的自己消息:圈主/管理员身份可豁免(管理动作),普通成员拒。
+      if (expired && !(await this.isCircleModerator(conversation, userId))) {
+        throw new ForbiddenException({
+          message: '超出可撤回时间',
+          errorCode: ChatErrorCode.RevokeWindowExpired,
+        });
+      }
+    } else if (!(await this.isCircleModerator(conversation, userId))) {
+      throw new ForbiddenException({
+        message: '无权撤回该消息',
+        errorCode: ChatErrorCode.RevokeForbidden,
+      });
+    }
+
+    const mediaKeys = this.collectMediaKeys(row);
+    const updated = await this.prisma.chatMessage.update({
+      where: { id: messageId },
+      data: { content: {}, revokedAt: new Date(), revokedBy: userId },
+    });
+    if (mediaKeys.length > 0) {
+      // 尽力而为:删失败只留孤儿对象,不让撤回失败(deleteObjects 内部逐个 catch)。
+      void this.media.deleteObjects(mediaKeys);
+    }
+    this.broadcast.emitRevoke({
+      conversationId,
+      messageId,
+      revokedBy: userId,
+    });
+    const senders = await this.resolveSenders(
+      updated.senderID ? [updated.senderID] : [],
+    );
+    return this.toMessageDto(updated, this.senderFor(updated, senders));
+  }
+
+  /** GROUP 会话按圈子角色判定管理权(OWNER/ADMIN 且 ACTIVE)。 */
+  private async isCircleModerator(
+    conversation: ChatConversation,
+    userId: string,
+  ): Promise<boolean> {
+    if (conversation.type !== 'GROUP' || !conversation.circleID) return false;
+    const member = await this.prisma.circleMember.findUnique({
+      where: {
+        userID_circleID: { userID: userId, circleID: conversation.circleID },
+      },
+      select: { role: true, status: true },
+    });
+    return (
+      !!member &&
+      member.status === 'ACTIVE' &&
+      (member.role === 'OWNER' || member.role === 'ADMIN')
+    );
+  }
+
+  /** 媒体消息 content 里的对象 key(撤回时要一并删的那些)。 */
+  private collectMediaKeys(row: { type: string; content: unknown }): string[] {
+    if (!MEDIA_MESSAGE_TYPES.includes(row.type)) return [];
+    const content = (row.content ?? {}) as Record<string, unknown>;
+    return ['key', 'thumbKey']
+      .map((field) => content[field])
+      .filter((v): v is string => typeof v === 'string' && v.length > 0);
   }
 
   private isUniqueViolation(error: unknown): boolean {
@@ -1385,4 +1520,35 @@ export class ChatService {
       (error as { code?: unknown }).code === 'P2002'
     );
   }
+}
+
+/**
+ * 被引用消息的短摘要(服务端生成,进 replyTo 快照)。
+ * 与 chat-push 的预览同一取向:文本截断,媒体/卡片用类型标签,
+ * 具体文案的本地化仍由前端词表负责,这里只是兜底展示。
+ */
+const REPLY_PREVIEW_MAX = 40;
+const REPLY_PREVIEW_LABELS: Record<string, string> = {
+  image: '[图片]',
+  voice: '[语音]',
+  file: '[文件]',
+  location: '[位置]',
+  'note-card': '[笔记]',
+  'friend-card': '[名片]',
+  'circle-card': '[圈子]',
+  'plaza-post-card': '[帖子]',
+  'transfer-card': '[转账]',
+  'verification-card': '[验证]',
+  'call-record': '[通话]',
+};
+
+function previewOfContent(type: string, content: unknown): string {
+  const record = (content ?? {}) as Record<string, unknown>;
+  if (type === 'text' || type === 'quote') {
+    const text = typeof record['text'] === 'string' ? record['text'] : '';
+    return text.length > REPLY_PREVIEW_MAX
+      ? `${text.slice(0, REPLY_PREVIEW_MAX)}…`
+      : text;
+  }
+  return REPLY_PREVIEW_LABELS[type] ?? '[消息]';
 }

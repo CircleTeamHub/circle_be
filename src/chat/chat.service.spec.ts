@@ -27,6 +27,7 @@ describe('ChatService', () => {
       aggregate: jest.fn(),
       count: jest.fn(),
       create: jest.fn(),
+      update: jest.fn(),
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
@@ -39,7 +40,10 @@ describe('ChatService', () => {
   };
   const sensitiveWords = { check: jest.fn() };
   const circleSync = { ensureCircleConversation: jest.fn() };
-  const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
+  const media = {
+    attachMediaUrls: jest.fn().mockResolvedValue(undefined),
+    deleteObjects: jest.fn().mockResolvedValue(undefined),
+  };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
     // 默认关掉自动销毁,让既有用例不受时间窗口影响;需要时逐例覆盖。
@@ -47,6 +51,7 @@ describe('ChatService', () => {
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
+    emitRevoke: jest.fn(),
   };
 
   const service = new ChatService(
@@ -1205,6 +1210,209 @@ describe('ChatService', () => {
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', hiddenAt: { not: null } },
       data: { hiddenAt: null },
+    });
+  });
+
+  describe('revokeMessage(G-02)', () => {
+    const revokableRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'm1',
+      conversationID: 'conv-1',
+      senderID: 'u1',
+      type: 'image',
+      content: { key: 'chat/u1/a.jpg', thumbKey: 'chat/u1/a.t.jpg' },
+      height: 5,
+      replyToID: null,
+      clientMessageId: 'd1',
+      deleted: false,
+      revokedAt: null,
+      revokedBy: null,
+      createdAt: new Date(),
+      ...overrides,
+    });
+
+    it('sender revokes within the window: clears content, deletes media, broadcasts', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+      prisma.chatMessage.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          ...revokableRow(),
+          ...data,
+        }),
+      );
+
+      const dto = await service.revokeMessage('u1', 'conv-1', 'm1');
+
+      expect(prisma.chatMessage.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: 'm1' }),
+          data: expect.objectContaining({
+            content: {},
+            revokedBy: 'u1',
+            revokedAt: expect.any(Date),
+          }),
+        }),
+      );
+      // 撤回即焚:对象存储里的媒体一并删,只清 DB 等于没撤。
+      expect(media.deleteObjects).toHaveBeenCalledWith([
+        'chat/u1/a.jpg',
+        'chat/u1/a.t.jpg',
+      ]);
+      expect(broadcast.emitRevoke).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        messageId: 'm1',
+        revokedBy: 'u1',
+      });
+      expect(dto.revokedBy).toBe('u1');
+      expect(dto.content).toEqual({});
+    });
+
+    it('rejects the sender outside the two-minute window', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        revokableRow({ createdAt: new Date(Date.now() - 3 * 60_000) }),
+      );
+
+      await expect(
+        service.revokeMessage('u1', 'conv-1', 'm1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_REVOKE_WINDOW_EXPIRED' },
+      });
+      expect(prisma.chatMessage.update).not.toHaveBeenCalled();
+    });
+
+    const circleConversation = {
+      id: 'conv-1',
+      type: 'GROUP',
+      directKey: null,
+      circleID: 'circle-1',
+      tempChatID: null,
+      lastMessageAt: null,
+    };
+
+    it('lets a circle owner/admin revoke others messages without a window', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ userID: 'admin-1', conversation: circleConversation }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        revokableRow({ createdAt: new Date(Date.now() - 60 * 60_000) }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+      prisma.chatMessage.update.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => ({
+          ...revokableRow(),
+          ...data,
+        }),
+      );
+
+      const dto = await service.revokeMessage('admin-1', 'conv-1', 'm1');
+      expect(dto.revokedBy).toBe('admin-1');
+    });
+
+    it('rejects an unrelated member', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ userID: 'u2', conversation: circleConversation }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.revokeMessage('u2', 'conv-1', 'm1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_REVOKE_FORBIDDEN' },
+      });
+    });
+
+    it('is idempotent for an already revoked message', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        revokableRow({
+          content: {},
+          revokedAt: new Date(),
+          revokedBy: 'u1',
+        }),
+      );
+
+      const dto = await service.revokeMessage('u1', 'conv-1', 'm1');
+      expect(dto.revokedBy).toBe('u1');
+      expect(prisma.chatMessage.update).not.toHaveBeenCalled();
+      expect(broadcast.emitRevoke).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getHistory replyTo(G-09 真引用)', () => {
+    it('attaches reply snapshots in one batch and flags revoked originals', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      const original = {
+        id: 'orig-1',
+        conversationID: 'conv-1',
+        senderID: 'u2',
+        type: 'text',
+        content: { text: '原始内容原始内容' },
+        height: 3,
+        replyToID: null,
+        clientMessageId: null,
+        deleted: false,
+        revokedAt: null,
+        revokedBy: null,
+        createdAt: new Date(),
+      };
+      const revokedOriginal = {
+        ...original,
+        id: 'orig-2',
+        height: 4,
+        content: {},
+        revokedAt: new Date(),
+        revokedBy: 'u2',
+      };
+      const quote = {
+        ...original,
+        id: 'q-1',
+        senderID: 'u1',
+        type: 'quote',
+        content: { text: '回帖', quotedText: '原始内容原始内容' },
+        height: 5,
+        replyToID: 'orig-1',
+      };
+      const quoteOfRevoked = {
+        ...quote,
+        id: 'q-2',
+        height: 6,
+        replyToID: 'orig-2',
+      };
+      prisma.chatMessage.findMany
+        .mockResolvedValueOnce([quoteOfRevoked, quote])
+        // 第二次 findMany = replyTo 批量取原消息
+        .mockResolvedValueOnce([original, revokedOriginal]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u1', nickname: 'A', avatarUrl: null },
+        { id: 'u2', nickname: 'B', avatarUrl: null },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      const q1 = page.messages.find((m) => m.id === 'q-1');
+      expect(q1?.replyTo).toEqual(
+        expect.objectContaining({
+          id: 'orig-1',
+          height: 3,
+          senderNickname: 'B',
+          type: 'text',
+          revoked: false,
+        }),
+      );
+      expect(typeof q1?.replyTo?.preview).toBe('string');
+      const q2 = page.messages.find((m) => m.id === 'q-2');
+      expect(q2?.replyTo).toEqual(
+        expect.objectContaining({ id: 'orig-2', revoked: true }),
+      );
+      // 只允许一次批量 IN,不得逐条 N+1
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledTimes(2);
     });
   });
 });
