@@ -114,6 +114,20 @@ export class CallService {
     }
     this.assertCallTypeEnabled(dto.callType);
 
+    // 上限与群成员校验都在**原始**名单上做，且必须排在隐私过滤之前：
+    //
+    // - 排在后面，隐私过滤会改变错误码。同一个「不在群里」的目标，设 NONE 时先被
+    //   过滤掉、报 CALL_INVITEES_REQUIRED，设 EVERYONE 时才走到成员校验、报
+    //   CALL_NOT_GROUP_MEMBER —— 发起方对比两次返回就读出了对方的 callPermission。
+    // - 上限按原始名单算，否则既能靠「别人关了通话」把超限名单挤进来，又会让一个
+    //   必然被拒的超限请求先把全部隐私查询跑完。
+    this.assertParticipantLimit(inviteeIDs.length + 1);
+    await this.assertGroupMembers(
+      conversationID,
+      [initiatorID, ...inviteeIDs],
+      initiatorID,
+    );
+
     // callPermission=NONE 的成员从邀请名单里剔除，而不是让整通群呼失败：一个人
     // 关掉通话不该连累其他人，而「因为某人拒收所以整通失败」本身就把他的设置
     // 回显给了发起方。全员都拒时退化成「没有可邀请的人」，同样不指名道姓。
@@ -129,9 +143,6 @@ export class CallService {
     }
 
     const participantIDs = [initiatorID, ...callableIDs];
-    this.assertParticipantLimit(participantIDs.length);
-
-    await this.assertGroupMembers(conversationID, participantIDs, initiatorID);
     const users = await this.loadActiveUsers(participantIDs);
     return this.startCall({
       initiatorID,
@@ -988,35 +999,41 @@ export class CallService {
   /**
    * 按被邀请人各自的 callPermission 过滤群呼名单。
    *
-   * FRIENDS_ONLY 要判断「发起方是不是我的好友」，所以先一次性把发起方与全部
-   * 被邀请人之间的好友关系捞出来，避免每人一次查询。
+   * 两次查询封顶，与名单长度无关：好友关系一把捞（FRIENDS_ONLY 要判断「发起方是
+   * 不是我的好友」），隐私设置走 getSettingsForUsers 批量取。逐个 canBeCalled 会
+   * 变成 N 次 UserPrivacySetting 查询 —— DTO 允许 100 个被邀请人。
    */
   private async filterCallableInvitees(
     initiatorID: string,
     inviteeIDs: string[],
   ): Promise<string[]> {
-    const friendships = await this.prisma.friend.findMany({
-      where: {
-        state: FriendState.ACCEPTED,
-        OR: [
-          { userID: initiatorID, friendID: { in: inviteeIDs } },
-          { friendID: initiatorID, userID: { in: inviteeIDs } },
-        ],
-      },
-      select: { userID: true, friendID: true },
-    });
+    const [friendships, settingsByUser] = await Promise.all([
+      this.prisma.friend.findMany({
+        where: {
+          state: FriendState.ACCEPTED,
+          OR: [
+            { userID: initiatorID, friendID: { in: inviteeIDs } },
+            { friendID: initiatorID, userID: { in: inviteeIDs } },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      }),
+      this.privacySettings.getSettingsForUsers(inviteeIDs),
+    ]);
     const friendIDs = new Set(
       friendships.map((row) =>
         row.userID === initiatorID ? row.friendID : row.userID,
       ),
     );
 
-    const decisions = await Promise.all(
-      inviteeIDs.map((userID) =>
-        this.privacySettings.canBeCalled(userID, friendIDs.has(userID)),
-      ),
-    );
-    return inviteeIDs.filter((_, index) => decisions[index]);
+    return inviteeIDs.filter((userID) => {
+      // getSettingsForUsers 对没有行的用户填默认值，这里的 ?? 只是防御性兜底。
+      const permission =
+        settingsByUser.get(userID)?.callPermission ?? 'EVERYONE';
+      if (permission === 'NONE') return false;
+      if (permission === 'FRIENDS_ONLY') return friendIDs.has(userID);
+      return true;
+    });
   }
 
   /**
