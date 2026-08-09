@@ -1,4 +1,6 @@
+import { ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationService } from './notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -23,6 +25,9 @@ describe('NotificationService', () => {
       createManyAndReturn: jest.fn(),
     },
     devicePushToken: {
+      findUnique: jest.fn(),
+      updateMany: jest.fn(),
+      create: jest.fn(),
       upsert: jest.fn(),
       deleteMany: jest.fn(),
     },
@@ -506,10 +511,9 @@ describe('NotificationService', () => {
   });
 
   describe('push tokens', () => {
-    it('upserts the current user device push token', async () => {
-      prisma.devicePushToken.upsert.mockResolvedValue({
-        id: 'token-row-1',
-      });
+    it('registers a brand-new device push token', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.devicePushToken.create.mockResolvedValue({ id: 'token-row-1' });
 
       await service.registerPushToken('user-1', {
         token: 'ExponentPushToken[abc]',
@@ -519,26 +523,161 @@ describe('NotificationService', () => {
         appVersion: '1.0.0',
       });
 
-      expect(prisma.devicePushToken.upsert).toHaveBeenCalledWith({
-        where: { token: 'ExponentPushToken[abc]' },
-        create: {
+      // 归属判定必须与写入同一条语句:先读后写会让两个账号同时登记一个
+      // 此前没见过的令牌时都读到「无主」,后写的那个不出示 secret 就把它抢走。
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          token: 'ExponentPushToken[abc]',
+          OR: [
+            { userID: 'user-1' },
+            // 无 secret 登记时,谓词只多出 null 这一支(没有 hash 可比)。
+            { revocationSecretHash: null },
+          ],
+        },
+        data: expect.objectContaining({ userID: 'user-1' }),
+      });
+      expect(prisma.devicePushToken.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
           token: 'ExponentPushToken[abc]',
           userID: 'user-1',
-          platform: 'ios',
-          provider: 'expo',
-          projectId: 'project-1',
-          appVersion: '1.0.0',
-        },
-        update: {
-          userID: 'user-1',
-          platform: 'ios',
-          provider: 'expo',
-          projectId: 'project-1',
-          appVersion: '1.0.0',
-          disabledAt: null,
-          revocationSecretHash: null,
-        },
+        }),
       });
+    });
+
+    it('re-registering an own token never falls through to create', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('user-1', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+      });
+
+      expect(prisma.devicePushToken.create).not.toHaveBeenCalled();
+    });
+
+    it('loses the race safely: a concurrent claim surfaces as Forbidden', async () => {
+      // 两个账号都先跑完条件更新(都没命中),然后才有人写。
+      // 后写的那个撞唯一约束 —— 必须变成拒绝,而不是悄悄换绑。
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.devicePushToken.create.mockRejectedValue(
+        Object.assign(new Error('unique'), { code: 'P2002' }),
+      );
+
+      await expect(
+        service.registerPushToken('loser', {
+          token: 'ExponentPushToken[abc]',
+          platform: 'ios',
+          provider: 'expo',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('refuses to rebind a token owned by another account', async () => {
+      // 拿到别人的设备令牌就能改挂到自己名下 = 受害者收不到自己的推送，反而在锁屏上
+      // 收到攻击者的通知；顺带还把设备侧的撤销密钥抹掉。
+      // 条件更新的归属谓词不命中(不是本人、也没给出正确 secret),
+      // 随后的 create 撞唯一约束 → 拒绝。
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 0 });
+      prisma.devicePushToken.create.mockRejectedValue(
+        Object.assign(new Error('unique'), { code: 'P2002' }),
+      );
+
+      await expect(
+        service.registerPushToken('attacker', {
+          token: 'ExponentPushToken[abc]',
+          platform: 'ios',
+          provider: 'expo',
+        }),
+      ).rejects.toThrow(ForbiddenException);
+      expect(prisma.devicePushToken.upsert).not.toHaveBeenCalled();
+    });
+
+    // revocationSecret 是可选字段:存量行、以及任何没带 secret 登记过的客户端,
+    // 存的都是 null。谓词若不放行 null,同一台设备换账号登录就永远命中不了 →
+    // create 撞唯一约束 → 403,而且是永久的(直到推送服务商轮换令牌),新账号
+    // 一条推送都收不到。这是把「安全加固」变成了「功能永久损坏」。
+    it('still lets a device switch accounts when the stored row has no secret', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('new-owner', {
+        token: 'ExponentPushToken[legacy]',
+        platform: 'ios',
+        provider: 'expo',
+      });
+
+      const [[args]] = prisma.devicePushToken.updateMany.mock.calls as [
+        [{ where: { OR: Array<Record<string, unknown>> } }],
+      ];
+      expect(args.where.OR).toContainEqual({ revocationSecretHash: null });
+      expect(prisma.devicePushToken.create).not.toHaveBeenCalled();
+    });
+
+    // 认领一行 null-secret 时若带了 secret,应顺手把它升级成受保护 ——
+    // 存量靠这个随客户端升级自然收敛,而不是永远敞着。
+    it('upgrades a null-secret row to protected when the claimer supplies one', async () => {
+      const secret = 'fresh-secret';
+      const hash = createHash('sha256').update(secret).digest('hex');
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('new-owner', {
+        token: 'ExponentPushToken[legacy]',
+        platform: 'ios',
+        provider: 'expo',
+        revocationSecret: secret,
+      });
+
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ revocationSecretHash: hash }),
+        }),
+      );
+    });
+
+    // 反过来:不带 secret 的重新登记绝不能把已有的哈希抹成 null —— 那等于
+    // 自己把上面那道闸拆了,这行从此谁知道令牌谁就能抢走。
+    it('never clears an existing secret when re-registering without one', async () => {
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('user-1', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+      });
+
+      const [[args]] = prisma.devicePushToken.updateMany.mock.calls as [
+        [{ data: Record<string, unknown> }],
+      ];
+      expect(args.data).not.toHaveProperty('revocationSecretHash');
+    });
+
+    it('allows rebinding when the caller proves the revocation secret', async () => {
+      // 同一台设备换账号登录是正常场景：客户端手里本来就有这个 secret。
+      const secret = 'device-secret';
+      const hash = createHash('sha256').update(secret).digest('hex');
+      // 归属谓词把 secret 哈希也算进去,所以条件更新直接命中原属他人的那一行。
+      prisma.devicePushToken.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.registerPushToken('new-owner', {
+        token: 'ExponentPushToken[abc]',
+        platform: 'ios',
+        provider: 'expo',
+        revocationSecret: secret,
+      });
+
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          token: 'ExponentPushToken[abc]',
+          OR: [
+            { userID: 'new-owner' },
+            { revocationSecretHash: hash },
+            // 迁移通道:存量 null-secret 行必须仍可认领,否则换账号永久 403。
+            { revocationSecretHash: null },
+          ],
+        },
+        data: expect.objectContaining({ userID: 'new-owner' }),
+      });
+      expect(prisma.devicePushToken.create).not.toHaveBeenCalled();
     });
 
     it('deletes only the current user device push token', async () => {

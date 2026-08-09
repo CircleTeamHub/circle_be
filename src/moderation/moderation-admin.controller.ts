@@ -26,6 +26,7 @@ import { JwtGuard } from 'src/guards/jwt.guard';
 import { AdminGuard } from 'src/guards/admin.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { ModerationAdminService } from './moderation-admin.service';
+import { MAX_PAGE } from 'src/common/pagination';
 
 class ListReportsQueryDto {
   @IsOptional()
@@ -36,6 +37,7 @@ class ListReportsQueryDto {
   @IsOptional()
   @IsInt()
   @Min(1)
+  @Max(MAX_PAGE)
   page = 1;
 
   @Type(() => Number)

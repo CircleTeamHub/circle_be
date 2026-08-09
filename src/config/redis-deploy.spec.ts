@@ -155,6 +155,30 @@ describe('production Redis deployment configuration', () => {
     expect(caddy).toContain('respond 404');
     expect(caddy).toContain('handle /circle/*');
     expect(caddy).toContain('reverse_proxy minio:9000');
+
+    // 限流：Caddy 是公网唯一入口，每条 handle 都必须有自己的桶，否则一个脚本
+    // 就能直接压上游。openim_ws / openim_api 两个 zone 随 OpenIM 出清一并删除。
+    expect(caddy).toContain('order rate_limit before reverse_proxy');
+    for (const zone of [
+      'minio_media',
+      'api_fallback',
+      'admin_api',
+      'admin_web',
+    ]) {
+      expect(caddy).toContain(`zone ${zone} {`);
+    }
+    // 回潮防线：OpenIM 已出清，这两条 handle 不该再出现。
+    expect(caddy).not.toContain('openim');
+
+    // rate_limit 不在官方 caddy 镜像里，必须用带该模块的自定义构建；
+    // 镜像换回 caddy:2-alpine 会让上面的指令直接把 Caddy 启动打挂。
+    const caddyDockerfile = readFileSync(
+      join(repositoryRoot, 'Dockerfile.caddy'),
+      'utf8',
+    );
+    expect(caddyDockerfile).toContain('caddy-ratelimit');
+    expect(compose).toContain('dockerfile: Dockerfile.caddy');
+    expect(compose).not.toMatch(/^\s+image: caddy:2-alpine\s*$/m);
   });
 
   it('regenerates an empty password and merges the bundled profile on upgrade', () => {

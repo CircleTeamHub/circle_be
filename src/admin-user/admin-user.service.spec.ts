@@ -32,7 +32,8 @@ describe('AdminUserService', () => {
       updateMany: jest.fn(),
     },
     refreshToken: { updateMany: jest.fn() },
-    sessionRevocationOutbox: { upsert: jest.fn() },
+    // 解封(→ ACTIVE)要在同事务里撤掉还排队的封禁作业,所以 tx 侧也要有 deleteMany。
+    sessionRevocationOutbox: { upsert: jest.fn(), deleteMany: jest.fn() },
   };
   const sessionRevocation = {
     revokeUserAt: jest.fn(),
@@ -481,6 +482,33 @@ describe('AdminUserService', () => {
         status: UserStatus.BANNED,
         sessionRevocationPending: false,
       });
+    });
+
+    // 封禁那半失败时 outbox 行会留着按退避重试。管理员在重试跑起来之前解封的话,
+    // 处理器照样会把这个已经恢复正常的用户的会话吊销掉,失败一次再重试一次 ——
+    // 用户被反复踢下线,直到作业成功或过期。撤销必须和解封同事务。
+    // (#137 合入 main 时带来的修复;那边原始改动还含 OpenIM 强制登出,本分支已出清。)
+    it('cancels a queued ban job in the same transaction as the unban', async () => {
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.BANNED,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.ACTIVE,
+        reason: 'appeal accepted',
+      });
+
+      // 用的是事务客户端而不是 this.prisma —— 这正是「与解封同事务」的证据。
+      expect(tx.sessionRevocationOutbox.deleteMany).toHaveBeenCalledWith({
+        where: { userID: 'user-1' },
+      });
+      // 解封不该再排新的吊销作业。
+      expect(tx.sessionRevocationOutbox.upsert).not.toHaveBeenCalled();
     });
 
     it.each([
