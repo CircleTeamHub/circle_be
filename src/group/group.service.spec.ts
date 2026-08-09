@@ -1077,6 +1077,120 @@ describe('GroupService reportGroup', () => {
     );
   });
 
+  // 群主对已停用的群要拿到「群已停用」的明确回复,而不是 404「群不存在」——
+  // 否则分不清是自己记错了群还是群被停用。(#139 的改动,随 OpenIM 出清保留。)
+  it('tells the owner that the circle is inactive, not that it is missing', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+      deleted: true,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'owner-member',
+      role: CircleMemberRole.OWNER,
+      status: CircleMemberStatus.ACTIVE,
+    });
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'owner-1',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({
+      response: {
+        errorCode: 'GROUP_MANAGER_ONLY',
+        message: 'Administrator roles cannot be changed for an inactive group',
+      },
+    });
+    // 停用判定在鉴权之后、取锁之前短路。
+    expect(memberLock.lock).not.toHaveBeenCalled();
+    // 查询必须带上 includeDeleted,否则这一行根本查不出来。
+    expect(prisma.circle.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.not.objectContaining({ deleted: false }),
+      }),
+    );
+  });
+
+  // 停用状态只对已证明身份的群主披露。放在鉴权之前的话,任何登录用户拿一个
+  // 圈子 ID 试一次就能分辨「不存在(404)/ 已停用(独有文案)/ 正常(群主校验失败)」
+  // 三态 —— 等于把停用状态做成对全站开放的探测接口,而 preflightActor 的全部
+  // 意义恰恰是「先鉴权再暴露任何东西」。
+  it('gives a non-owner the same answer whether the circle is inactive or not', async () => {
+    const askAsNonOwner = async (deleted: boolean) => {
+      jest.clearAllMocks();
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        groupID: 'group-1',
+        ownerID: 'owner-1',
+        deleted,
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        id: 'member-1',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+      return (service as any)
+        .updateGroupMemberRole('snooper', 'group-1', 'target-user', {
+          role: 'ADMIN',
+        })
+        .catch((error: any) => error.response);
+    };
+
+    const onInactive = await askAsNonOwner(true);
+    const onActive = await askAsNonOwner(false);
+
+    // 两种情况必须字节级一致 —— 任何差异都是可用的探测信号。
+    expect(onInactive).toEqual(onActive);
+    expect(onInactive).toMatchObject({
+      errorCode: 'GROUP_MANAGER_ONLY',
+      message: 'Only the group owner can change administrator roles',
+    });
+  });
+
+  // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID 取一遍
+  // 成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」的探测接口。
+  // (#139 的改动;它原本只覆盖了已删除的裸群路径,这里补圈子路径。)
+  it('authorizes the actor before taking locks or looking up the target', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+      deleted: false,
+    });
+    // 调用方不是群主。
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'member-1',
+      role: CircleMemberRole.MEMBER,
+      status: CircleMemberStatus.ACTIVE,
+    });
+
+    await expect(
+      (service as any).updateGroupMemberRole(
+        'not-owner',
+        'group-1',
+        'target-user',
+        { role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({
+      response: { errorCode: 'GROUP_MANAGER_ONLY' },
+    });
+
+    // 只查了发起人自己那一次,没有为 target-user 做任何查询。
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          userID_circleID: { userID: 'not-owner', circleID: 'circle-1' },
+        },
+      }),
+    );
+    expect(memberLock.lock).not.toHaveBeenCalled();
+  });
+
   it('lets a circle owner promote an active member', async () => {
     expect(typeof (service as any).updateGroupMemberRole).toBe('function');
     prisma.circle.findFirst.mockResolvedValue({
@@ -1085,6 +1199,12 @@ describe('GroupService reportGroup', () => {
       ownerID: 'owner-1',
     });
     prisma.circleMember.findUnique
+      // 事务开头的 preflight 鉴权先消费一次(先鉴权再取锁,不为非群主做目标查询)。
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
       .mockResolvedValueOnce({
         id: 'owner-member',
         role: CircleMemberRole.OWNER,
@@ -1142,6 +1262,12 @@ describe('GroupService reportGroup', () => {
       ownerID: 'owner-1',
     });
     prisma.circleMember.findUnique
+      // 事务开头的 preflight 鉴权先消费一次(先鉴权再取锁,不为非群主做目标查询)。
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
       .mockResolvedValueOnce({
         id: 'owner-member',
         role: CircleMemberRole.OWNER,

@@ -33,6 +33,7 @@ type CircleGroupLookup = {
   id: string;
   groupID: string | null;
   ownerID: string;
+  deleted: boolean;
 };
 
 type CircleGroupMemberLookup = {
@@ -67,7 +68,16 @@ export class GroupService {
       });
     }
 
-    const circle = await this.findCircleByGroupID(normalizedGroupID);
+    // includeDeleted:停用的圈子要能被查出来,好给群主一个「群已停用」的明确回复
+    // (沿用默认的 deleted:false 过滤的话,已停用的群会退化成 404「群不存在」,
+    // 群主分不清是自己记错了群还是群被停用)。
+    //
+    // 但**查出来不等于可以立刻据此回话**:停用状态只对已证明身份的群主披露,
+    // 判定放在下面 preflightActor 之后。放在这里的话,任何登录用户拿一个圈子 ID
+    // 试一次就能分辨「不存在(404)/ 已停用(独有文案)/ 正常(群主校验失败)」三态,
+    // 等于把停用状态做成了对全站开放的探测接口 —— 而 preflightActor 的全部意义
+    // 恰恰是「先鉴权再暴露任何东西」,在它前面开这个口等于把它架空。
+    const circle = await this.findCircleByGroupID(normalizedGroupID, true);
 
     if (!circle) {
       // 自研栈下群 = 圈子;OpenIM 时代的裸群已不存在。
@@ -79,6 +89,37 @@ export class GroupService {
 
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
     await runSerializableTransaction(this.prisma, async (tx) => {
+      // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID
+      // 取一遍成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」
+      // 的探测接口,顺带还能拿锁竞争当侧信道。
+      const preflightActor = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: actorId, circleID: circle.id },
+        },
+        select: { id: true, role: true, status: true },
+      });
+      if (
+        !preflightActor ||
+        preflightActor.status !== CircleMemberStatus.ACTIVE ||
+        preflightActor.role !== CircleMemberRole.OWNER
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+
+      // 身份已证明,现在才可以披露停用状态。非群主走到上面那条统一回复为止,
+      // 拿到的错误与「圈子正常但你不是群主」完全一致,分辨不出停用与否。
+      // (下面 FOR UPDATE 那次复查针对的是并发窗口,与这次职责不同,两者都要留。)
+      if (circle.deleted) {
+        throw new ForbiddenException({
+          message:
+            'Administrator roles cannot be changed for an inactive group',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+
       await this.memberLock.lock(tx, circle.id, [
         actorId,
         normalizedTargetUserID,
@@ -535,19 +576,24 @@ export class GroupService {
     return undefined;
   }
 
+  /**
+   * includeDeleted:调用方需要区分「群不存在」与「群已停用」时传 true。
+   * 默认过滤掉 deleted —— 其余路径把停用群当作不存在处理即可。
+   */
   private async findCircleByGroupID(
     groupID: string,
+    includeDeleted = false,
   ): Promise<CircleGroupLookup | null> {
     const groupIDCandidates = this.groupIDCandidates(groupID);
     return this.prisma.circle.findFirst({
       where: {
-        deleted: false,
+        ...(includeDeleted ? {} : { deleted: false }),
         OR: [
           { id: groupID },
           ...groupIDCandidates.map((candidate) => ({ groupID: candidate })),
         ],
       },
-      select: { id: true, groupID: true, ownerID: true },
+      select: { id: true, groupID: true, ownerID: true, deleted: true },
     });
   }
 
