@@ -139,6 +139,11 @@ export interface HistoryFilters {
   date?: string;
   /** 客户端时区偏移(new Date().getTimezoneOffset() 语义,分钟)。 */
   tzOffsetMinutes?: number;
+  /**
+   * 增量补拉游标(G-13 重连对账):取该 height **之后**的消息,升序返回。
+   * 与 beforeHeight 互斥;续拉游标经 nextAfterHeight 返回。
+   */
+  afterHeight?: number;
 }
 
 /**
@@ -158,4 +163,6 @@ export interface ChatHistoryPageDto {
   messages: ChatMessageDto[];
   /** 继续向前翻页的 beforeHeight;没有更早消息时为 null。 */
   nextBeforeHeight: number | null;
+  /** afterHeight 增量补拉的续拉游标;已追平为 null(仅 afterHeight 查询返回)。 */
+  nextAfterHeight?: number | null;
 }

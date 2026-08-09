@@ -21,6 +21,16 @@ export class HistoryQueryDto {
   beforeHeight?: number;
 
   @ApiPropertyOptional({
+    description:
+      '增量补拉:取该 height 之后的消息,升序返回(与 beforeHeight 互斥;0 = 从头拉)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  afterHeight?: number;
+
+  @ApiPropertyOptional({
     description: `单页条数,默认 50,上限 ${HISTORY_PAGE_MAX}`,
   })
   @IsOptional()

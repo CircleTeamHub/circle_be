@@ -150,6 +150,7 @@ export class ChatController {
         keyword: query.keyword,
         date: query.date,
         tzOffsetMinutes: query.tzOffsetMinutes,
+        afterHeight: query.afterHeight,
       },
     );
   }

@@ -853,6 +853,55 @@ describe('ChatService', () => {
       expect(page.nextBeforeHeight).toBeNull();
     });
 
+    // G-13 重连对账:断线窗口内的消息要能按 height 升序增量补拉。
+    it('pulls forward incrementally with afterHeight and an ascending cursor', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { ...createdRow, id: 'msg-7', height: 7 },
+        { ...createdRow, id: 'msg-8', height: 8 },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 2, {
+        afterHeight: 6,
+      });
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            height: { gt: 6 },
+            deleted: false,
+          }),
+          orderBy: { height: 'asc' },
+          take: 2,
+        }),
+      );
+      expect(page.messages.map((m) => m.height)).toEqual([7, 8]);
+      // 满页 → 可能还没追平,游标 = 页内最高 height;向旧翻页的游标不混用。
+      expect(page.nextAfterHeight).toBe(8);
+      expect(page.nextBeforeHeight).toBeNull();
+    });
+
+    it('signals caught-up with a null afterHeight cursor on a short page', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { ...createdRow, id: 'msg-7', height: 7 },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50, {
+        afterHeight: 6,
+      });
+
+      expect(page.nextAfterHeight).toBeNull();
+    });
+
+    it('rejects supplying both pagination cursors at once', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+
+      await expect(
+        service.getHistory('u1', 'conv-1', 9, 50, { afterHeight: 6 }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
     // 按日期过滤同样写 createdAt。销毁截止若和它并在同一层,会被整个盖掉 ——
     // 客户端带上 date 就能翻出窗口之外的消息。两者必须同时成立。
     it('keeps the self-destruct cutoff when a date filter is also supplied', async () => {

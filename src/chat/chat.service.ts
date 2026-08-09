@@ -610,6 +610,14 @@ export class ChatService {
     options: { applyViewerRetention?: boolean } = {},
   ): Promise<ChatHistoryPageDto> {
     await this.requireMembership(conversationId, userId);
+    const afterHeight = filters.afterHeight;
+    // 两个游标语义相反(向旧翻页 vs 增量追平),同时给等于没说清要哪一页。
+    if (beforeHeight !== undefined && afterHeight !== undefined) {
+      throw new BadRequestException({
+        message: 'beforeHeight and afterHeight are mutually exclusive',
+      });
+    }
+    const ascendingPull = afterHeight !== undefined;
     const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
     // 自动销毁窗口:拆栈前由 chat-history.service 负责,自研栈落地时漏掉了 ——
     // 设置在库里、UI 上也能改,但读取路径根本不看它,用户以为过期的消息其实
@@ -625,6 +633,7 @@ export class ChatService {
       conversationID: conversationId,
       deleted: false,
       ...(beforeHeight !== undefined ? { height: { lt: beforeHeight } } : {}),
+      ...(afterHeight !== undefined ? { height: { gt: afterHeight } } : {}),
       ...this.buildHistoryFilterWhere(filters),
     };
     // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
@@ -635,18 +644,27 @@ export class ChatService {
     }
     const rows = await this.prisma.chatMessage.findMany({
       where,
-      orderBy: { height: 'desc' },
+      // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
+      orderBy: { height: ascendingPull ? 'asc' : 'desc' },
       take,
     });
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
     const senders = await this.resolveSenders(senderIds);
-    const ascending = [...rows].reverse();
+    const ascending = ascendingPull ? rows : [...rows].reverse();
     const messages = ascending.map((row) =>
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
     await this.media.attachMediaUrls(messages);
+    if (ascendingPull) {
+      return {
+        messages,
+        nextBeforeHeight: null,
+        nextAfterHeight:
+          rows.length === take ? rows[rows.length - 1].height : null,
+      };
+    }
     return {
       messages,
       nextBeforeHeight:
