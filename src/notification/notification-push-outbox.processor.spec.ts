@@ -1,77 +1,24 @@
-import {
-  NotificationPushOutboxProcessor,
-  selectFairBatch,
-} from './notification-push-outbox.processor';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { NotificationPushOutboxProcessor } from './notification-push-outbox.processor';
 
-describe('selectFairBatch', () => {
-  const job = (fromUserID: string, seq: number) => ({
-    id: `${fromUserID}-${seq}`,
-    notification: { fromUserID },
-  });
-
-  it('stops one sender from starving everyone else out of a tick', () => {
-    // 攻击者一次发圈帖扇出 500 条，而出队是 100 条/分钟。按 createdAt 升序取的话，
-    // 这 100 个名额会被攻击者全部占满，后面排队的好友请求 / 评论回复一条也发不出去 ——
-    // 脚本跑十分钟就能买到约两小时的全站推送黑屏。
-    const flood = Array.from({ length: 500 }, (_, i) => job('attacker', i));
-    const legit = [job('alice', 0), job('bob', 0), job('carol', 0)];
-    const picked = selectFairBatch([...flood, ...legit]);
-
-    const senders = picked.map((p) => p.notification?.fromUserID);
-    expect(senders.filter((s) => s === 'attacker').length).toBeLessThanOrEqual(
-      10,
+// 名额分配已经从内存里的 selectFairBatch 挪进 SQL(PARTITION BY 发送者排名),
+// 因为在内存里只能对「按时间取的窗口」做调度,而窗口本身会被洪水占满 ——
+// 灌 13000 条之后,每一轮候选里都只有洪水发送者,正常推送要等约 22 小时。
+//
+// 排名逻辑本身是 SQL,单元测试跑不到(要真库);这里钉住的是调用契约:
+// 确实用了跨全队列的排名查询、每发送者有上限、批量有上限,以及水合之后
+// 顺序仍然是名次序 —— 顺序就是公平性本身,水合打乱了等于白排。
+describe('fair batch selection contract', () => {
+  it('ranks per sender across the whole queue, not inside a time window', () => {
+    const source = readFileSync(
+      join(__dirname, 'notification-push-outbox.processor.ts'),
+      'utf8',
     );
-    // 正常用户必须在同一个 tick 里就发出去，而不是排在 500 条洪水后面。
-    for (const victim of ['alice', 'bob', 'carol']) {
-      expect(senders).toContain(victim);
-    }
-  });
-
-  it('leaves a normal backlog untouched and preserves arrival order', () => {
-    // 没有洪水时不该改变任何行为：候选不超过一批就原样返回。
-    const jobs = [job('alice', 0), job('bob', 0), job('alice', 1)];
-    expect(selectFairBatch(jobs)).toEqual(jobs);
-  });
-
-  it('still fills the whole batch, and spreads it across senders', () => {
-    // 名额不能因为限流而空着 —— 否则公平调度反倒把整体吞吐打下去了。
-    // 发送者足够多时轮转在第一轮就取满，于是攻击者只拿到 1 条（比上限 10 更公平）。
-    const flood = Array.from({ length: 300 }, (_, i) => job('attacker', i));
-    const others = Array.from({ length: 200 }, (_, i) => job(`user-${i}`, 0));
-    const picked = selectFairBatch([...flood, ...others]);
-
-    expect(picked).toHaveLength(100);
-    expect(
-      picked.filter((p) => p.notification?.fromUserID === 'attacker').length,
-    ).toBeLessThanOrEqual(10);
-    // 一个 tick 里应该覆盖到尽可能多的发送者，而不是被少数几个占满。
-    expect(new Set(picked.map((p) => p.notification?.fromUserID)).size).toBe(
-      100,
-    );
-  });
-
-  it('gives a sender its full quota when there are few senders', () => {
-    // 只有两个发送者时，攻击者拿满 10 条上限，其余名额归另一个人 —— 上限生效，
-    // 但不会因为「候选里发送者少」就让批次发不满。
-    const flood = Array.from({ length: 300 }, (_, i) => job('attacker', i));
-    const alice = Array.from({ length: 300 }, (_, i) => job('alice', i));
-    const picked = selectFairBatch([...flood, ...alice]);
-
-    expect(
-      picked.filter((p) => p.notification?.fromUserID === 'attacker'),
-    ).toHaveLength(10);
-    expect(
-      picked.filter((p) => p.notification?.fromUserID === 'alice'),
-    ).toHaveLength(10);
-  });
-
-  it('does not bucket unrelated senderless rows together', () => {
-    // fromUserID 取不到时若归成同一个桶，它们会互相饿死；每条应自成一组。
-    const orphans = Array.from({ length: 200 }, () => ({
-      id: 'x',
-      notification: null,
-    }));
-    expect(selectFairBatch(orphans)).toHaveLength(100);
+    expect(source).toContain('PARTITION BY n."fromUserID"');
+    expect(source).toContain('rn <= ');
+    // 先取窗口再调度正是被 review 指出的那个失效模式,不能回潮。
+    expect(source).not.toContain('CANDIDATE_WINDOW');
   });
 });
 
@@ -103,6 +50,11 @@ function buildHarness({
   tokens?: Array<{ token: string; projectId: string | null }>;
 }) {
   const prisma = {
+    // 名额分配现在跨整个队列用 PARTITION BY 排名(见 processor 注释),
+    // 排名只回 id,再按 id 水合。桩照这个两步来。
+    $queryRaw: jest
+      .fn()
+      .mockResolvedValue(jobs.map((job: { id: string }) => ({ id: job.id }))),
     notificationPushOutbox: {
       findMany: jest.fn().mockResolvedValue(jobs),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),

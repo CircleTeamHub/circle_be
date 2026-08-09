@@ -382,6 +382,14 @@ export class AdminUserService {
         dto.status !== UserStatus.ACTIVE ? new Date() : undefined;
       if (revokedAt) {
         await this.persistSessionRevocation(tx, targetId, revokedAt);
+      } else {
+        // 复活(→ ACTIVE)必须同事务撤掉还排着队的封禁作业。
+        // 封禁那半失败时 outbox 行会留着按退避重试;管理员在重试跑起来之前解封的话,
+        // 处理器照样会把这个已经恢复正常的用户从所有 IM 平台强制登出,
+        // 而且失败一次就再重试一次 —— 用户被反复踢下线,直到作业成功或过期。
+        await tx.sessionRevocationOutbox.deleteMany({
+          where: { userID: targetId },
+        });
       }
 
       return {

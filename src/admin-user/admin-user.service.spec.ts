@@ -32,7 +32,7 @@ describe('AdminUserService', () => {
       updateMany: jest.fn(),
     },
     refreshToken: { updateMany: jest.fn() },
-    sessionRevocationOutbox: { upsert: jest.fn() },
+    sessionRevocationOutbox: { upsert: jest.fn(), deleteMany: jest.fn() },
   };
   const sessionRevocation = {
     revokeUserAt: jest.fn(),
@@ -533,6 +533,31 @@ describe('AdminUserService', () => {
       });
 
       expect(openim.forceLogoutAllPlatforms).not.toHaveBeenCalled();
+    });
+
+    it('cancels a queued ban job in the same transaction as the unban', async () => {
+      // 封禁那半失败时 outbox 行会留着按退避重试。管理员在重试跑起来之前解封,
+      // 处理器仍会把这个已恢复正常的用户从所有 IM 平台强制登出 —— 而且失败一次
+      // 就再重试一次,用户被反复踢下线,直到作业成功或过期。
+      tx.user.findUnique.mockResolvedValue({
+        id: 'user-1',
+        accountId: 'jim-1001',
+        status: UserStatus.BANNED,
+      });
+      tx.user.updateMany.mockResolvedValue({ count: 1 });
+      tx.refreshToken.updateMany.mockResolvedValue({ count: 0 });
+      audit.recordInTransaction.mockResolvedValue({ id: 'audit-1' });
+
+      await service.updateStatus(actor, 'user-1', {
+        status: UserStatus.ACTIVE,
+        reason: 'appeal accepted',
+      });
+
+      // 必须走事务客户端:解封提交了而作业没删掉的话,窗口期内照样会踢人。
+      expect(tx.sessionRevocationOutbox.deleteMany).toHaveBeenCalledWith({
+        where: { userID: 'user-1' },
+      });
+      expect(tx.sessionRevocationOutbox.upsert).not.toHaveBeenCalled();
     });
 
     it('leaves the revocation outbox row when the OpenIM kick fails', async () => {

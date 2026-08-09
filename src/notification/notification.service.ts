@@ -48,6 +48,16 @@ function chunkArray<T>(items: readonly T[], size: number): T[][] {
   return chunks;
 }
 
+/** Prisma 唯一约束冲突（P2002）。 */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'P2002'
+  );
+}
+
 @Injectable()
 export class NotificationService {
   private readonly logger = new Logger(NotificationService.name);
@@ -112,16 +122,48 @@ export class NotificationService {
     // 把设备侧的撤销能力一并抹掉。
     // 规则：令牌已属于别人时，必须出示与登记时一致的 revocationSecret 才允许换绑
     // （同一台设备换账号登录是正常场景，客户端本来就持有这个 secret）。
-    const existing = await this.prisma.devicePushToken.findUnique({
-      where: { token: dto.token },
-      select: { userID: true, revocationSecretHash: true },
+    //
+    // 归属判定必须与写入是同一条语句。先 findUnique 再 upsert 的话中间有窗口：
+    // 两个账号同时登记一个此前没见过的令牌，都会读到「无主」，后写的那个直接
+    // 把令牌抢走且完全没出示过 secret；同样的读-改-写竞态也会覆盖掉这期间
+    // 别人刚改的归属或 secret。
+    // 做法：带归属谓词的条件更新 → 命中即完成；未命中就尝试 create，
+    // 撞唯一约束(P2002)说明行确实存在但谓词不满足 = 属于别人且没证明 → 拒绝。
+    const update = {
+      userID: userId,
+      platform: dto.platform,
+      provider: dto.provider,
+      projectId: dto.projectId ?? null,
+      appVersion: dto.appVersion ?? null,
+      disabledAt: null,
+      revocationSecretHash: revocationSecretHash ?? null,
+    };
+    const claimed = await this.prisma.devicePushToken.updateMany({
+      where: {
+        token: dto.token,
+        OR: [
+          { userID: userId },
+          ...(revocationSecretHash ? [{ revocationSecretHash }] : []),
+        ],
+      },
+      data: update,
     });
-    if (existing && existing.userID !== userId) {
-      const proven =
-        !!existing.revocationSecretHash &&
-        !!revocationSecretHash &&
-        existing.revocationSecretHash === revocationSecretHash;
-      if (!proven) {
+    if (claimed.count === 0) {
+      try {
+        await this.prisma.devicePushToken.create({
+          data: {
+            token: dto.token,
+            userID: userId,
+            platform: dto.platform,
+            provider: dto.provider,
+            projectId: dto.projectId ?? null,
+            appVersion: dto.appVersion ?? null,
+            ...(revocationSecretHash ? { revocationSecretHash } : {}),
+          },
+        });
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        // 行存在但归属谓词没命中 —— 属于别人且没出示正确的 secret。
         this.logger.warn(
           `Rejected push-token rebind: token is owned by another account (requester=${userId})`,
         );
@@ -129,27 +171,6 @@ export class NotificationService {
       }
     }
 
-    await this.prisma.devicePushToken.upsert({
-      where: { token: dto.token },
-      create: {
-        token: dto.token,
-        userID: userId,
-        platform: dto.platform,
-        provider: dto.provider,
-        projectId: dto.projectId ?? null,
-        appVersion: dto.appVersion ?? null,
-        ...(revocationSecretHash ? { revocationSecretHash } : {}),
-      },
-      update: {
-        userID: userId,
-        platform: dto.platform,
-        provider: dto.provider,
-        projectId: dto.projectId ?? null,
-        appVersion: dto.appVersion ?? null,
-        disabledAt: null,
-        revocationSecretHash: revocationSecretHash ?? null,
-      },
-    });
     const findTokens = this.prisma.devicePushToken.findMany;
     if (!findTokens) return;
     const excess = await findTokens({

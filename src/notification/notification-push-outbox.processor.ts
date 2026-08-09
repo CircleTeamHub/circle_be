@@ -28,55 +28,6 @@ const STALE_LOCK_MS = 10 * 60 * 1000;
  * 被上游限流或封禁的风险。攻击者仍会占满自己的配额，但吃不掉别人的。
  */
 const MAX_PER_SENDER_PER_TICK = 10;
-/** 要挑出公平的一批，得看比 BATCH_SIZE 更大的窗口 —— 否则窗口本身就已被洪水占满。 */
-const CANDIDATE_WINDOW = BATCH_SIZE * 10;
-
-type FairJob = { notification?: { fromUserID?: string | null } | null };
-
-/**
- * 按发送者轮转取批：先按 createdAt 顺序分组，再一轮一轮地每个发送者取一条，
- * 直到取满 batchSize 或候选耗尽。组内保持原有先后（老的先发）。
- *
- * 导出是为了能脱离数据库直接测这套调度逻辑。
- */
-export function selectFairBatch<T extends FairJob>(
-  candidates: readonly T[],
-  batchSize = BATCH_SIZE,
-  maxPerSender = MAX_PER_SENDER_PER_TICK,
-): T[] {
-  if (candidates.length <= batchSize) return [...candidates];
-
-  // Map 保留插入顺序 = 各发送者首次出现的先后，所以轮转本身也偏向最早排队的人。
-  const bySender = new Map<string, T[]>();
-  for (const job of candidates) {
-    // 取不到发送者时每条自成一组 —— 归进同一个桶会让它们互相饿死。
-    const key = job.notification?.fromUserID ?? `__unknown__:${bySender.size}`;
-    const bucket = bySender.get(key);
-    if (bucket) bucket.push(job);
-    else bySender.set(key, [job]);
-  }
-
-  const picked: T[] = [];
-  const queues = [...bySender.values()];
-  for (
-    let round = 0;
-    round < maxPerSender && picked.length < batchSize;
-    round += 1
-  ) {
-    let tookAny = false;
-    for (const queue of queues) {
-      if (picked.length >= batchSize) break;
-      const job = queue[round];
-      if (job) {
-        picked.push(job);
-        tookAny = true;
-      }
-    }
-    if (!tookAny) break;
-  }
-  return picked;
-}
-
 /**
  * Push outbox 处理器（#88 重构后）。
  *
@@ -101,19 +52,44 @@ export class NotificationPushOutboxProcessor {
   async processPending(): Promise<number> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);
-    const candidates = await this.prisma.notificationPushOutbox.findMany({
-      where: {
-        OR: [
-          { status: 'PENDING', nextAttemptAt: { lte: now } },
-          { status: 'FAILED', nextAttemptAt: { lte: now } },
-          { status: 'PROCESSING', lockedAt: { lt: staleBefore } },
-        ],
-      },
-      orderBy: { createdAt: 'asc' },
-      take: CANDIDATE_WINDOW,
+    // 名额分配必须跨**整个**待发队列做,不能先按 createdAt 取一个窗口再在窗口里调度。
+    // 取窗口的话洪水本身就把窗口占满了:一个发送者灌 13000 条之后再来一条正常推送,
+    // 每一轮的候选窗口里都只有洪水发送者,公平调度每分钟只挪走 10 条 ——
+    // 那条正常推送要等约 22 小时,比改之前的纯 FIFO 还慢。
+    // 用 PARTITION BY 按发送者分组排名,每人每轮最多 MAX_PER_SENDER_PER_TICK 条,
+    // 再按名次(而不是时间)取前 BATCH_SIZE —— 名次相同的按时间,于是「每个人的第一条」
+    // 一定先于「任何人的第二条」,新来的发送者立刻能挤进这一轮。
+    const ranked = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      WITH eligible AS (
+        SELECT
+          o."id",
+          o."createdAt",
+          ROW_NUMBER() OVER (
+            PARTITION BY n."fromUserID"
+            ORDER BY o."createdAt" ASC, o."id" ASC
+          ) AS rn
+        FROM "NotificationPushOutbox" AS o
+        JOIN "Notification" AS n ON n."id" = o."notificationID"
+        WHERE (o."status" = 'PENDING' AND o."nextAttemptAt" <= ${now})
+           OR (o."status" = 'FAILED' AND o."nextAttemptAt" <= ${now})
+           OR (o."status" = 'PROCESSING' AND o."lockedAt" < ${staleBefore})
+      )
+      SELECT "id"
+      FROM eligible
+      WHERE rn <= ${MAX_PER_SENDER_PER_TICK}
+      ORDER BY rn ASC, "createdAt" ASC, "id" ASC
+      LIMIT ${BATCH_SIZE}
+    `;
+    if (ranked.length === 0) return 0;
+    const order = new Map(ranked.map((row, index) => [row.id, index]));
+    const hydrated = await this.prisma.notificationPushOutbox.findMany({
+      where: { id: { in: ranked.map((row) => row.id) } },
       include: { notification: { include: NOTIFICATION_REALTIME_INCLUDE } },
     });
-    const jobs = selectFairBatch(candidates);
+    // findMany 不保证顺序,而这一批的顺序就是公平性本身,按名次重排回去。
+    const jobs = hydrated.sort(
+      (a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0),
+    );
     let processed = 0;
     for (const job of jobs) {
       const claimNow = new Date();
