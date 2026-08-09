@@ -5,15 +5,17 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { ChatErrorCode } from 'src/common/app-error-codes';
+import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
 import type {
   ChatConversation,
+  ChatMember,
   ChatMessage,
   Prisma,
 } from 'src/generated/prisma';
@@ -71,6 +73,7 @@ export class ChatService {
     private readonly media: ChatMediaService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly broadcast: ChatBroadcastService,
+    private readonly systemMessage: ChatSystemMessageService,
   ) {}
 
   /**
@@ -421,7 +424,17 @@ export class ChatService {
 
     const [lastMessages, unreadCounts, peers, circles] = await Promise.all([
       this.loadLastMessages(conversationIds),
-      this.loadUnreadCounts(userId, memberships),
+      this.loadUnreadCounts(
+        userId,
+        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+        memberships.map((m) => ({
+          conversationID: m.conversationID,
+          lastReadHeight: Math.max(
+            m.lastReadHeight,
+            m.clearedBeforeHeight ?? 0,
+          ),
+        })),
+      ),
       this.loadDirectPeers(userId, directIds),
       this.loadCircleInfos(
         memberships
@@ -436,7 +449,12 @@ export class ChatService {
     const senders = await this.resolveSenders(senderIds);
 
     const list = memberships.map((m) => {
-      const last = lastMessages.get(m.conversationID) ?? null;
+      const rawLast = lastMessages.get(m.conversationID) ?? null;
+      // 清空水位之下的末条不给本人当预览:清空过的会话看起来就是空的。
+      const last =
+        rawLast && rawLast.height <= (m.clearedBeforeHeight ?? 0)
+          ? null
+          : rawLast;
       return {
         id: m.conversationID,
         type: m.conversation.type,
@@ -451,6 +469,7 @@ export class ChatService {
         unreadCount: unreadCounts.get(m.conversationID) ?? 0,
         pinned: m.pinned,
         muted: m.muted,
+        burnDurationSec: m.conversation.burnDurationSec ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
       };
     });
@@ -582,6 +601,7 @@ export class ChatService {
       unreadCount: unread.get(conversationId) ?? 0,
       pinned: member.pinned,
       muted: member.muted,
+      burnDurationSec: member.conversation.burnDurationSec ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
     };
   }
@@ -611,7 +631,10 @@ export class ChatService {
     filters: HistoryFilters = {},
     options: { applyViewerRetention?: boolean } = {},
   ): Promise<ChatHistoryPageDto> {
-    await this.requireMembership(conversationId, userId);
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
     const afterHeight = filters.afterHeight;
     // 两个游标语义相反(向旧翻页 vs 增量追平),同时给等于没说清要哪一页。
     if (beforeHeight !== undefined && afterHeight !== undefined) {
@@ -621,21 +644,42 @@ export class ChatService {
     }
     const ascendingPull = afterHeight !== undefined;
     const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
+    // G-14 清空水位:本人只看得到水位之上的消息,与增量游标取更高者。
+    const heightFloor = Math.max(
+      afterHeight ?? 0,
+      member.clearedBeforeHeight ?? 0,
+    );
     // 自动销毁窗口:拆栈前由 chat-history.service 负责,自研栈落地时漏掉了 ——
     // 设置在库里、UI 上也能改,但读取路径根本不看它,用户以为过期的消息其实
     // 一直在。收在 where 里而不是取回来再 filter:后者会让分页数不准。
     // 访客(临时房)没有 User 行,查隐私设置只会拿到 2 天的默认值 —— 而临时房
     // 本身可以开 3 天甚至 7 天,于是活着的房间里超过 2 天的消息对访客凭空消失,
     // 他还没有任何地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
-    const cutoff =
+    const viewerCutoff =
       options.applyViewerRetention === false
         ? null
         : await this.selfDestructCutoff(userId);
+    // S-01 会话级焚毁:与查看者保留期取更严(更晚的截止时间)。sweeper 每分钟
+    // 真删,这里的过滤盖住「已到期、尚未被扫掉」的窗口。
+    const burnCutoff = conversation.burnDurationSec
+      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
+      : null;
+    const cutoff =
+      viewerCutoff && burnCutoff
+        ? viewerCutoff > burnCutoff
+          ? viewerCutoff
+          : burnCutoff
+        : (viewerCutoff ?? burnCutoff);
+    const heightCondition: Prisma.IntFilter = {
+      ...(heightFloor > 0 ? { gt: heightFloor } : {}),
+      ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
+    };
     const where: Prisma.ChatMessageWhereInput = {
       conversationID: conversationId,
       deleted: false,
-      ...(beforeHeight !== undefined ? { height: { lt: beforeHeight } } : {}),
-      ...(afterHeight !== undefined ? { height: { gt: afterHeight } } : {}),
+      ...(Object.keys(heightCondition).length > 0
+        ? { height: heightCondition }
+        : {}),
       ...this.buildHistoryFilterWhere(filters),
     };
     // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
@@ -934,6 +978,7 @@ export class ChatService {
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
       muted: mine?.muted ?? false,
+      burnDurationSec: conv.burnDurationSec ?? null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
     };
   }
@@ -1037,6 +1082,18 @@ export class ChatService {
     conversationId: string,
     userId: string,
   ): Promise<ChatConversation> {
+    const { conversation } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    return conversation;
+  }
+
+  /** 同 requireMembership,但把成员行也带回来(清空水位等 per-viewer 状态在行上)。 */
+  private async requireMembershipSeat(
+    conversationId: string,
+    userId: string,
+  ): Promise<{ conversation: ChatConversation; member: ChatMember }> {
     const member = await this.prisma.chatMember.findUnique({
       where: {
         conversationID_userID: {
@@ -1052,7 +1109,7 @@ export class ChatService {
         errorCode: ChatErrorCode.NotMember,
       });
     }
-    return member.conversation;
+    return { conversation: member.conversation, member };
   }
 
   /** 单聊发送前的拉黑复查(任一方向拉黑即拒发)。 */
@@ -1482,6 +1539,85 @@ export class ChatService {
       updated.senderID ? [updated.senderID] : [],
     );
     return this.toMessageDto(updated, this.senderFor(updated, senders));
+  }
+
+  /**
+   * S-01 会话级阅后即焚:任一方(DIRECT)或圈主/管理员(GROUP)设置,双方生效。
+   * 变更留系统消息痕迹;真删由每分钟 sweeper 执行,读路径过滤盖住间隙。
+   */
+  async setBurnDuration(
+    userId: string,
+    conversationId: string,
+    seconds: number | null,
+  ): Promise<{ burnDurationSec: number | null }> {
+    const { conversation } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    if (conversation.type === 'TEMP') {
+      // 访客的保留边界是房间寿命,不是会话设置。
+      throw new BadRequestException({
+        message: '临时聊天不支持阅后即焚',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    if (
+      conversation.type === 'GROUP' &&
+      !(await this.isCircleModerator(conversation, userId))
+    ) {
+      throw new ForbiddenException({
+        message: '仅圈主或管理员可设置',
+        errorCode: GroupErrorCode.ManagerOnly,
+      });
+    }
+    const normalized =
+      seconds !== null && Number.isInteger(seconds) && seconds > 0
+        ? seconds
+        : null;
+    const updated = await this.prisma.chatConversation.update({
+      where: { id: conversationId },
+      data: { burnDurationSec: normalized },
+    });
+    // 微信/Signal 式留痕:开关变化必须双方可见,防「对方偷偷开了焚毁」。
+    void this.systemMessage.emit(conversationId, {
+      kind: 'burn-changed',
+      seconds: normalized ?? 0,
+    });
+    return { burnDurationSec: updated.burnDurationSec ?? null };
+  }
+
+  /**
+   * G-14 清空聊天记录:per-viewer 水位,只前进不后退;对端与服务端数据不受影响
+   * (物理删除是撤回/焚毁的事)。清空即已读:lastReadHeight 同步推到同一高度。
+   */
+  async clearHistory(
+    userId: string,
+    conversationId: string,
+  ): Promise<{ clearedBeforeHeight: number }> {
+    await this.requireMembershipSeat(conversationId, userId);
+    const top = await this.prisma.chatMessage.aggregate({
+      where: { conversationID: conversationId },
+      _max: { height: true },
+    });
+    const watermark = top._max.height ?? 0;
+    if (watermark <= 0) return { clearedBeforeHeight: 0 };
+    await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: conversationId,
+        userID: userId,
+        clearedBeforeHeight: { lt: watermark },
+      },
+      data: { clearedBeforeHeight: watermark },
+    });
+    await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: conversationId,
+        userID: userId,
+        lastReadHeight: { lt: watermark },
+      },
+      data: { lastReadHeight: watermark },
+    });
+    return { clearedBeforeHeight: watermark };
   }
 
   /** GROUP 会话按圈子角色判定管理权(OWNER/ADMIN 且 ACTIVE)。 */

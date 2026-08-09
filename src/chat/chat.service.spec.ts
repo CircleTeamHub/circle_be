@@ -53,6 +53,7 @@ describe('ChatService', () => {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
     emitRevoke: jest.fn(),
   };
+  const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
 
   const service = new ChatService(
     prisma as never,
@@ -61,6 +62,7 @@ describe('ChatService', () => {
     media as never,
     privacySettings as never,
     broadcast as never,
+    systemMessage as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -1342,6 +1344,209 @@ describe('ChatService', () => {
       expect(dto.revokedBy).toBe('u1');
       expect(prisma.chatMessage.update).not.toHaveBeenCalled();
       expect(broadcast.emitRevoke).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('setBurnDuration(S-01 会话级阅后即焚)', () => {
+    it('any DIRECT member sets it for both sides and a notice is left', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: 3600,
+      });
+
+      const result = await service.setBurnDuration('u1', 'conv-1', 3600);
+
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { burnDurationSec: 3600 },
+      });
+      // 开关变更必须留系统痕迹,防「对方偷偷开了焚毁」。
+      expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
+        kind: 'burn-changed',
+        seconds: 3600,
+      });
+      expect(result.burnDurationSec).toBe(3600);
+    });
+
+    it('normalizes 0 to off(null)', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 3600,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: null,
+      });
+
+      const result = await service.setBurnDuration('u1', 'conv-1', 0);
+      expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+        where: { id: 'conv-1' },
+        data: { burnDurationSec: null },
+      });
+      expect(result.burnDurationSec).toBeNull();
+      expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
+        kind: 'burn-changed',
+        seconds: 0,
+      });
+    });
+
+    it('GROUP requires a circle owner/admin', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: 'circle-1',
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.setBurnDuration('u1', 'conv-1', 3600),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      });
+    });
+
+    it('TEMP conversations reject the toggle (guest retention = room lifetime)', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'TEMP',
+            directKey: null,
+            circleID: null,
+            tempChatID: 'tc-1',
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+      await expect(
+        service.setBurnDuration('u1', 'conv-1', 3600),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_INVALID_PAYLOAD' },
+      });
+    });
+  });
+
+  describe('clearHistory(G-14 清空聊天记录)', () => {
+    it('advances the personal watermark and read floor to the current max height', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      const result = await service.clearHistory('u1', 'conv-1');
+
+      expect(result.clearedBeforeHeight).toBe(42);
+      // 只前进不后退:并发/重放不能把水位拉回去。
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: 'u1',
+          clearedBeforeHeight: { lt: 42 },
+        },
+        data: { clearedBeforeHeight: 42 },
+      });
+      // 清空即已读:未读同时归零,底数与水位一致。
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: 'u1',
+          lastReadHeight: { lt: 42 },
+        },
+        data: { lastReadHeight: 42 },
+      });
+    });
+
+    it('is a no-op for an empty conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.aggregate.mockResolvedValue({
+        _max: { height: null },
+      });
+
+      const result = await service.clearHistory('u1', 'conv-1');
+      expect(result.clearedBeforeHeight).toBe(0);
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getHistory 清空水位与会话级焚毁', () => {
+    it('applies the personal cleared floor together with keyset cursors', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ clearedBeforeHeight: 7 }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', 20, 50);
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ height: { gt: 7, lt: 20 } }),
+        }),
+      );
+    });
+
+    it('tightens retention to the stricter of viewer setting and conversation burn', async () => {
+      privacySettings.getSettings.mockResolvedValue({
+        messageSelfDestructDays: 7,
+      });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 3600,
+          },
+        }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+        [{ where: { AND?: Array<{ createdAt: { gte: Date } }> } }],
+      ];
+      const cutoff = args.where.AND?.[0]?.createdAt?.gte;
+      expect(cutoff).toBeInstanceOf(Date);
+      // 更严 = 更晚的截止:1 小时焚毁窗口应覆盖 7 天的查看者设置。
+      expect(Date.now() - (cutoff as Date).getTime()).toBeLessThan(
+        2 * 60 * 60 * 1000,
+      );
     });
   });
 

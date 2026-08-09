@@ -1847,6 +1847,8 @@ model ChatConversation {
   lastMessageAt DateTime?
   /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
   muteAllAt     DateTime?
+  /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
+  burnDurationSec Int?
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 
@@ -1862,6 +1864,8 @@ model ChatMember {
   userID         String
   /// 已读水位：该成员已读的最大 height，只前进不后退。
   lastReadHeight Int       @default(0)
+  /// 清空聊天记录水位（G-14）：本人只看得到 height 大于该值的消息；只前进。
+  clearedBeforeHeight Int  @default(0)
   pinned         Boolean   @default(false)
   muted          Boolean   @default(false)
   /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。

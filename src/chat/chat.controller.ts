@@ -20,6 +20,7 @@ import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
 import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
+import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
 import type {
@@ -130,6 +131,35 @@ export class ChatController {
       query.month,
       query.tzOffsetMinutes,
     );
+  }
+
+  @Post('conversations/:id/burn')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '会话级阅后即焚(任一方设置双方生效,变更留系统痕迹)',
+  })
+  setBurnDuration(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetBurnDurationDto,
+  ): Promise<{ burnDurationSec: number | null }> {
+    return this.chatService.setBurnDuration(
+      req.user.userId,
+      conversationId,
+      body.seconds ?? null,
+    );
+  }
+
+  @Post('conversations/:id/clear')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '清空聊天记录(仅本人视图水位,对端与服务端数据不动)',
+  })
+  clearHistory(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<{ clearedBeforeHeight: number }> {
+    return this.chatService.clearHistory(req.user.userId, conversationId);
   }
 
   @Get('conversations/:id/messages')
