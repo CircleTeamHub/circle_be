@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from 'src/chat/chat.service';
@@ -40,7 +41,7 @@ export class TempChatController {
   ) {}
 
   @Post()
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: '创建临时聊天（发起人）' })
   create(@Req() req: any, @Body() dto: CreateTempChatDto) {
@@ -48,7 +49,7 @@ export class TempChatController {
   }
 
   @Get('mine')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: '发起人的临时聊天列表' })
   listMine(@Req() req: any) {
@@ -152,7 +153,7 @@ export class TempChatController {
   }
 
   @Post(':id/end')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, AppAudienceGuard)
   @ApiBearerAuth()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: '发起人手动结束' })

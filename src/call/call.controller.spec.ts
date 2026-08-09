@@ -1,5 +1,6 @@
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CallController } from './call.controller';
 
@@ -8,7 +9,9 @@ describe('CallController', () => {
     const guards = Reflect.getMetadata(GUARDS_METADATA, CallController);
     const createGroup = CallController.prototype.createGroupCall;
 
-    expect(guards).toEqual([ThrottlerGuard, JwtGuard]);
+    // AppAudienceGuard:通话与聊天同属消费端通信能力,管理台的 ADMIN token
+    // 同样能过 JwtGuard,却没有任何通话 UI —— 不该能发起或接听。
+    expect(guards).toEqual([ThrottlerGuard, JwtGuard, AppAudienceGuard]);
     expect(Reflect.getMetadata('THROTTLER:LIMITdefault', createGroup)).toBe(10);
     expect(Reflect.getMetadata('THROTTLER:TTLdefault', createGroup)).toBe(
       60_000,
