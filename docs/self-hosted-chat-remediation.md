@@ -2,8 +2,9 @@
 
 > 配套文档：[self-hosted-chat.md](./self-hosted-chat.md)（协议契约与架构）。
 > 跨仓：本计划同时覆盖 `circle_be`（BE）、`circle-im`（App）、`temp-chat-web`（访客网页）。
-> 成文日期：2026-08-09。基线：BE `feat/self-hosted-im`（领先 main 31 commit，未合），
-> FE `main`（#145 已合）。
+> 成文日期：2026-08-09。基线（当日晚更新）：**BE `feat/self-hosted-im` 已经
+> PR #138 squash 合入 main**（+#139 群鉴权加固），FE main 到 #148 —— 两仓 main
+> 已对齐。批 0 / 批 0.5 已在双仓 `feat/chat-remediation` 分支落地（见 §4）。
 
 ## 0. 这份文档为什么存在
 
@@ -122,22 +123,22 @@ OpenIM SDK 内部就是 SQLite，冷启动秒开、离线可翻历史。现在�
 
 后果：被踢出圈子的人 UI 上一直停在群里，直到自己退出重进。
 
-### G-12 被踢后有 ≤1min 的收消息窗口 —— 权限问题
+### G-12 被踢后有 ≤1min 的收消息窗口 —— 权限问题【已闭合】
 
-座位收回本身是接好的（`removeUserFromConversation` 在 `chat-circle-sync.service.ts` 里
-被调用），但**主动触发只有 3 处**：
-
-| 触发点 | 位置 |
-|---|---|
-| 建圈 | `circle.service.ts:194` |
-| 前端开群聊 | `chat.service.ts:482` |
-| 管理台群操作 | `admin-group-operation.processor.ts:137` |
-
-其余 **9 处 `CircleMember` 写点**（`circle.service.ts` ×4 / `group.service.ts` ×3 /
-`circle-admission-policy.ts` ×2）全靠 `@Cron(EVERY_MINUTE)` 对账兜底。
-
-这一分钟里，人已经不是成员了，socket 还在会话房里，**照收群消息**。发送侧有
-`assertStillSendable` 在事务内复查，**接收侧没有任何对应复查**。
+> **二轮更正**：本节初稿基于早期分支状态。合入 main 前的 Codex 轮已给三条
+> **delete 写点**（踢人 `group.service:350` / 退群 `:445` / 退圈
+> `circle.service:492`）加上事务内 `releaseSeatInTx` + 提交后 `detachSeat`
+> 即时踢房 —— 被踢者的**收消息窗口在 delete 路径上已经闭合**（对账的
+> `updatedAt` 窗口扫不到被删的行，这类只能靠钩子，注释里已写明机理）。
+>
+> 剩余的真实缺口是**加人侧**：4 处激活路径（拉人进群 `group.service`、担保
+> 达标 / 管理员强批 / 补偿重放 `circle-invitation.service` ×3）只靠 ≤1min
+> 对账入座 —— 新成员一分钟内没有座位、收不到群消息。以及所有路径都没有
+> 个人事件面（G-11）。
+>
+> **批 0 已落地（`feat/chat-remediation`）**：4 处激活路径提交后即时幂等
+> `ensureCircleConversation`（失败仍由对账兜底）；`chat:conversation`
+> 事件面接通（详见 §2.1 落地记录）。
 
 ### G-13 断线重连不对账 —— 消息静默丢失窗口
 
@@ -220,23 +221,31 @@ OpenIM 推送侧累加系统角标。新推送 payload 只有 `{title, body, dat
 
 ## 2. 补齐方案
 
-### 2.1 G-12 + S-02：成员变更实时化（权限优先）
+### 2.1 G-12 + S-02：成员变更实时化（权限优先）【已落地】
 
-1. **补主动触发**：在 9 处 `CircleMember` 写点调用
-   `ChatCircleSyncService.ensureCircleConversation(circleId)`。sync 本来就是幂等 ensure，
-   补调用点即可，无需改其内部逻辑。每分钟对账降级为兜底。
-2. **新增 socket 事件** `chat:conversation`：
+**落地记录（2026-08-09，`feat/chat-remediation` 双仓）**：
+
+1. **加人侧即时化**：4 处激活路径（`group.service` 拉人进群；
+   `circle-invitation.service` 担保达标 / 管理员强批 / 补偿重放）提交后
+   `void ensureCircleConversation(circleId)`，失败留给每分钟对账兜底。
+   删除侧此前已有事务内钩子（见 G-12 更正），无需再补。
+2. **`chat:conversation` 事件**（个人房定向，走 `emitToUser` —— 那个死方法
+   正是为此留的口子）：
 
    ```ts
-   { kind: 'joined' | 'left' | 'removed' | 'updated', conversationId: string, userId: string }
+   { kind: 'joined' | 'left' | 'removed' | 'updated', conversationId, userId }
    ```
 
-   走已有的 `emitToUser`（那个死方法正是为此留的口子）。
-3. **接收侧复查**：客户端 `chat:msg` 落库前校验自己仍在该会话成员表内。广播前不查（太贵），
-   把复查放到客户端 + 上面的即时离房双保险。
-4. **FE**：收到 `kind: 'removed'` 即从列表移除并提示「你已被移出该群聊」。
+   发射点收在 sync 服务：ensure 的 toJoin→`joined` / toRemove→`removed`；
+   `detachSeat` 按语义带 kind（踢人=`removed`、退群退圈=`left`）；
+   `evictAllSeats`（解散/停用）→`removed`。`updated` 预留无生产方。
+3. **FE 消费 + 防复活**：`removed`/`left` 即时收走会话，正看着的群被移出时
+   弹 `im.conversation.removedFromGroup`（×5 语种）；有界防复活集合挡住
+   离房前一瞬迟到的广播（不入库、不触发补拉），`joined` 解除标记并补拉元信息。
+   原方案的「客户端逐条查成员表」改为这个更便宜的等价物。
 
-**验收**：踢人后被踢者在线端 **≤1s** 内不再收到该群消息，且 UI 立即反映。
+**验收（已由测试覆盖）**：踢人后被踢者在线端 ≤1s 内不再收到该群消息（delete
+钩子 + 房间即时移除），UI 即刻反映（事件 + 防复活）；新成员入座不再等对账。
 
 ### 2.2 G-01 + G-03 + G-10：本地持久化（最大件）
 
@@ -367,7 +376,7 @@ REST。避免本地库无限膨胀。
 `chat:presence` 加订阅面：`chat:presence:subscribe {userIds}`，服务端把这些人加进一个
 presence 房。好友基本都有共同会话，实际影响小 —— 排最后。
 
-### 2.9 G-13：重连对账
+### 2.9 G-13：重连对账【内存版已落地；sync_state 升级随批 1】
 
 - **BE**：`GET /chat/conversations/:id/messages?afterHeight&limit`（升序返回，复用现有
   查询 + presign 注入；进 §3 契约）。
@@ -394,13 +403,13 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
      **不能再假清空**。
 - 不做物理删除（那是撤回/焚毁的事），水位过滤即可，无历史包袱。
 
-### 2.11 G-15：多端未读同步
+### 2.11 G-15：多端未读同步【已落地】
 
 - **FE**：`applyRead` 里 `userId === currentUserId` 时，把该会话 `unreadCount` 收敛到
   `max(0, latestHeight - height)` 并更新 tab 汇总。BE 广播语义已正确，**不动**。
 - `pendingReads` 落盘随 G-01 的 outbox 表走。
 
-### 2.12 G-18：图标角标
+### 2.12 G-18：图标角标【轻方案已落地；推送侧 badge 随批 5】
 
 - **轻方案（先做）**：FE 在前后台切换与未读汇总变化时
   `Notifications.setBadgeCountAsync(总未读)` —— App 活着时角标即准。
@@ -465,8 +474,8 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 
 | 批次 | 内容 | 理由 | 需要 prebuild |
 |---|---|---|---|
-| **0** | G-12 + S-02 主动触发 | **权限漏洞**；改动最小（sync 是现成的，补 9 个调用点） | 否 |
-| **0.5** | G-13 重连对账（内存版 + afterHeight 接口）+ G-15 多端未读 + G-18 轻方案 | **消息静默丢失**用户可感知；三件都是纯接线 | 否 |
+| **0 ✅** | G-12 + S-02 主动触发（已落地 `feat/chat-remediation`） | **权限漏洞**；改动最小 | 否 |
+| **0.5 ✅** | G-13 重连对账（内存版 + afterHeight 接口）+ G-15 多端未读 + G-18 轻方案（已落地，同分支） | **消息静默丢失**用户可感知；三件都是纯接线 | 否 |
 | **1** | G-01 SQLite（含 outbox/重发）+ G-03 FTS5 + G-10 红点 + G-13 升级 sync_state 对账 | 用户每次开 App 都感知；FTS5 是 SQLite 的附带品 | **是** |
 | **2** | G-02 撤回 + G-09/S-04 真引用 | 强耦合，必须一起 | 否 |
 | **3** | S-01 焚毁语义 + S-02 事件面 + G-14 清空/删除 | 语义正确性 | 否 |
@@ -478,9 +487,9 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 
 ## 5. 前置阻塞
 
-1. **`circle_be` 的 `feat/self-hosted-im` 还没合 main**（领先 31 commit）。而 FE 的 #145
-   已在 main —— **两仓 main 目前对不上**（BE main 仍是 `src/openim` + 无 `/chat-ws`）。
-   本计划任何一批落地前，先把这条分支合掉。
+1. ~~`circle_be` 的 `feat/self-hosted-im` 还没合 main~~ **已解除（2026-08-09）**：
+   PR #138 已 squash 合入 main（内容与分支 tip 零差异），两仓 main 已对齐。
+   批 0 / 批 0.5 基于新 main 在双仓 `feat/chat-remediation` 分支落地。
 2. 批次 1 需要 `prebuild` + 重建 + 重装真机。参考既有流程：Expo CLI 认不出真机，走纯
    `xcodebuild` 构建 + `devicectl` 装 / 启动；真机 dev-client 连 Metro 要 Mac 局域网 IP。
 3. **G-17 存量割接决策必须发生在自研栈切生产之前**：写 OpenIM→三表迁移脚本，或明确
