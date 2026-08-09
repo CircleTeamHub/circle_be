@@ -118,6 +118,8 @@ export interface HistoryFilters {
   date?: string;
   /** 客户端时区偏移(new Date().getTimezoneOffset() 语义,分钟)。 */
   tzOffsetMinutes?: number;
+  /** 次日本地零点的偏移;DST 切换日可能与 tzOffsetMinutes 不同。 */
+  tzEndOffsetMinutes?: number;
 }
 
 /**

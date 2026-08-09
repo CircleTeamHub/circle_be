@@ -671,11 +671,14 @@ export class ChatService {
     }
     if (filters.date) {
       const tzOffset = filters.tzOffsetMinutes ?? 0;
-      const start = Date.parse(`${filters.date}T00:00:00Z`) + tzOffset * 60_000;
+      const tzEndOffset = filters.tzEndOffsetMinutes ?? tzOffset;
+      const utcStart = Date.parse(`${filters.date}T00:00:00Z`);
+      const start = utcStart + tzOffset * 60_000;
+      const end = utcStart + 24 * 60 * 60 * 1000 + tzEndOffset * 60_000;
       if (Number.isFinite(start)) {
         where.createdAt = {
           gte: new Date(start),
-          lt: new Date(start + 24 * 60 * 60 * 1000),
+          lt: new Date(end),
         };
       }
     }
@@ -692,10 +695,23 @@ export class ChatService {
     year: number,
     month: number,
     tzOffsetMinutes = 0,
+    timeZone?: string,
   ): Promise<string[]> {
     await this.requireMembership(conversationId, userId);
-    const monthStart = Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
-    const monthEnd = Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
+    const formatter = timeZone
+      ? new Intl.DateTimeFormat('en-US', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+        })
+      : undefined;
+    const monthStart = formatter
+      ? this.findUtcStartOfZonedDate(formatter, year, month, 1)
+      : Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
+    const monthEnd = formatter
+      ? this.findUtcStartOfZonedDate(formatter, year, month + 1, 1)
+      : Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
     if (!Number.isFinite(monthStart) || !Number.isFinite(monthEnd)) return [];
     const rows = await this.prisma.chatMessage.findMany({
       where: {
@@ -708,12 +724,45 @@ export class ChatService {
     });
     const days = new Set<string>();
     for (const row of rows) {
-      const local = new Date(
-        row.createdAt.getTime() - tzOffsetMinutes * 60_000,
-      );
-      days.add(local.toISOString().slice(0, 10));
+      if (formatter) {
+        days.add(this.formatZonedDate(formatter, row.createdAt));
+      } else {
+        const local = new Date(
+          row.createdAt.getTime() - tzOffsetMinutes * 60_000,
+        );
+        days.add(local.toISOString().slice(0, 10));
+      }
     }
     return [...days].sort((a, b) => (a < b ? -1 : 1));
+  }
+
+  private findUtcStartOfZonedDate(
+    formatter: Intl.DateTimeFormat,
+    year: number,
+    month: number,
+    day: number,
+  ): number {
+    const normalized = new Date(Date.UTC(year, month, day));
+    const target = normalized.toISOString().slice(0, 10);
+    let low = normalized.getTime() - 36 * 60 * 60 * 1000;
+    let high = normalized.getTime() + 36 * 60 * 60 * 1000;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (this.formatZonedDate(formatter, new Date(middle)) < target) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    return low;
+  }
+
+  private formatZonedDate(formatter: Intl.DateTimeFormat, date: Date): string {
+    const parts = formatter.formatToParts(date);
+    const year = parts.find((part) => part.type === 'year')?.value;
+    const month = parts.find((part) => part.type === 'month')?.value;
+    const day = parts.find((part) => part.type === 'day')?.value;
+    return `${year}-${month}-${day}`;
   }
 
   /**
@@ -958,6 +1007,28 @@ export class ChatService {
     conversationId: string,
   ): Promise<ChatMemberDto[]> {
     const conversation = await this.requireMembership(conversationId, userId);
+    if (conversation.type === 'GROUP') {
+      const membership = conversation.circleID
+        ? await this.prisma.circleMember.findUnique({
+            where: {
+              userID_circleID: {
+                userID: userId,
+                circleID: conversation.circleID,
+              },
+            },
+            select: { role: true, status: true },
+          })
+        : null;
+      const canViewDirectory =
+        membership?.status === 'ACTIVE' &&
+        (membership.role === 'OWNER' || membership.role === 'ADMIN');
+      if (!canViewDirectory) {
+        throw new ForbiddenException({
+          message: '仅圈主和管理员可查看群成员目录',
+          errorCode: ChatErrorCode.MemberDirectoryForbidden,
+        });
+      }
+    }
     const seats = await this.prisma.chatMember.findMany({
       where: { conversationID: conversationId, leftAt: null },
       select: { userID: true },
