@@ -170,10 +170,24 @@ export class ChatCircleSyncService {
         .filter((s) => s.leftAt === null && !activeSet.has(s.userID))
         .map((s) => s.userID);
 
+      // 新座位的已读水位必须落在当前最高消息高度上,而不是 schema 默认的 0。
+      // 落 0 的话,新入群成员一进来就背着整个群的历史未读数(老群可能是几万),
+      // 红点永远清不掉;重新入群的人同理 —— 离座期间的消息本就与他无关。
+      // height 只增不减,所以直接取当前最大值即可,不必逐人比大小。
+      const top = await tx.chatMessage.aggregate({
+        where: { conversationID: conversation.id },
+        _max: { height: true },
+      });
+      const watermark = top._max.height ?? 0;
+
       await tx.chatMember.createMany({
         data: activeIds
           .filter((id) => !seatByUser.has(id))
-          .map((userID) => ({ conversationID: conversation.id, userID })),
+          .map((userID) => ({
+            conversationID: conversation.id,
+            userID,
+            lastReadHeight: watermark,
+          })),
         skipDuplicates: true,
       });
       await tx.chatMember.updateMany({
@@ -182,7 +196,7 @@ export class ChatCircleSyncService {
           userID: { in: activeIds },
           leftAt: { not: null },
         },
-        data: { leftAt: null },
+        data: { leftAt: null, lastReadHeight: watermark },
       });
       if (activeIds.length > 0) {
         await tx.chatMember.updateMany({

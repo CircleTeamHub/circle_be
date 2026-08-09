@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { AdminGroupOperation } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
@@ -12,7 +13,10 @@ export class AdminGroupOperationProcessor {
   private readonly logger = new Logger(AdminGroupOperationProcessor.name);
   private running = false;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly chatCircleSync: ChatCircleSyncService,
+  ) {}
 
   private async dismissChatConversation(circleId: string): Promise<void> {
     const conversation = await this.prisma.chatConversation.findUnique({
@@ -75,6 +79,7 @@ export class AdminGroupOperationProcessor {
     try {
       await this.execute(operation);
       await this.complete(operation, now);
+      await this.afterComplete(operation);
     } catch (error) {
       if (operation.type === 'DISMISS' && this.isAlreadyAbsentGroup(error)) {
         await this.complete(operation, now);
@@ -87,13 +92,49 @@ export class AdminGroupOperationProcessor {
 
   private async execute(operation: AdminGroupOperation) {
     if (operation.type === 'MUTE') {
-      return this.setChatMuteAll(operation.groupID, true);
+      await this.setChatMuteAll(operation.groupID, true);
+      // 停用必须同时收回座位,只静音是不够的:静音只挡发送,而且
+      // assertNotMutedAll 对 OWNER/ADMIN 还开了口子 —— 圈子被管理员停用之后,
+      // 群主和管理员照样能发言,全体成员照样能拉历史、照样收到实时消息。
+      //
+      // 入队时已经写了 deleted=true / adminState=DISABLING,所以这里直接复用
+      // ensureCircleConversation:它对 deleted 或停用态的圈子会清空全部在座座位
+      // 并把在线 socket 踢出会话房。机制本来就在,只是从来没有人触发它。
+      await this.syncCircleSeats(operation);
+      return;
     }
     if (operation.type === 'UNMUTE') {
+      // 恢复时不能在这里重新入座:此刻 adminState 还是 RESTORING、deleted 仍为
+      // true,ensureCircleConversation 只会再清一次座位。重新入座放到
+      // complete() 写回 ACTIVE 之后(见 afterComplete)。
       return this.setChatMuteAll(operation.groupID, false);
     }
     // 解散:会话全员离座(历史保留;发送被 membership 校验拒绝)。
     return this.dismissChatConversation(operation.groupID);
+  }
+
+  /**
+   * complete() 把 Circle 写回 ACTIVE 之后才能重新入座 —— 座位状态是从圈子状态
+   * 派生的,顺序反了就会把刚恢复的圈子又清空一遍。
+   *
+   * 失败只记日志:座位是可对账的派生态,下一次成员变更或有人打开圈聊都会
+   * 重新收敛,不该让一个已经成功的恢复操作被判失败再重跑。
+   */
+  private async afterComplete(operation: AdminGroupOperation): Promise<void> {
+    if (operation.type !== 'UNMUTE') return;
+    try {
+      await this.syncCircleSeats(operation);
+    } catch (error) {
+      this.logger.warn(
+        `reseat after unmute failed for ${operation.circleID ?? operation.groupID}: ${this.errorMessage(error)}`,
+      );
+    }
+  }
+
+  private async syncCircleSeats(operation: AdminGroupOperation): Promise<void> {
+    const circleId = operation.circleID ?? operation.groupID;
+    if (!circleId) return;
+    await this.chatCircleSync.ensureCircleConversation(circleId);
   }
 
   private complete(operation: AdminGroupOperation, now: Date) {

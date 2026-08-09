@@ -11,6 +11,10 @@ describe('ChatCircleSyncService', () => {
       createMany: jest.fn(),
       updateMany: jest.fn(),
     },
+    // 新座位的已读水位要落在当前最高 height 上,不能是默认 0。
+    chatMessage: {
+      aggregate: jest.fn().mockResolvedValue({ _max: { height: null } }),
+    },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
   };
@@ -104,8 +108,8 @@ describe('ChatCircleSyncService', () => {
     );
     expect(prisma.chatMember.createMany).toHaveBeenCalledWith({
       data: [
-        { conversationID: 'conv-1', userID: 'u1' },
-        { conversationID: 'conv-1', userID: 'u2' },
+        { conversationID: 'conv-1', userID: 'u1', lastReadHeight: 0 },
+        { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 0 },
       ],
       skipDuplicates: true,
     });
@@ -141,7 +145,9 @@ describe('ChatCircleSyncService', () => {
           userID: { in: ['u1'] },
           leftAt: { not: null },
         }),
-        data: { leftAt: null },
+        // 复活座位同时把水位推到当前高度:离座期间的消息本就与他无关,
+        // 留着旧水位会让重新入群的人一进来就背一堆"未读"。
+        data: { leftAt: null, lastReadHeight: 0 },
       }),
     );
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
@@ -161,6 +167,33 @@ describe('ChatCircleSyncService', () => {
       'u2',
       'conv-1',
     );
+  });
+
+  // 落 schema 默认的 0 的话,新成员一进老群就背着全部历史的未读数(可能几万),
+  // 红点永远清不掉 —— 他加入之前的消息本来就不该算他头上。
+  it('seats new members at the current message height, not at zero', async () => {
+    prisma.circle.findUnique.mockResolvedValue({
+      id: 'circle-1',
+      deleted: false,
+      adminState: 'ACTIVE',
+    });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.circleMember.findMany.mockResolvedValue([{ userID: 'newcomer' }]);
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 4321 } });
+
+    await service.ensureCircleConversation('circle-1');
+
+    expect(prisma.chatMember.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          conversationID: 'conv-1',
+          userID: 'newcomer',
+          lastReadHeight: 4321,
+        },
+      ],
+      skipDuplicates: true,
+    });
   });
 
   it('is a no-op returning null for a missing circle', async () => {
