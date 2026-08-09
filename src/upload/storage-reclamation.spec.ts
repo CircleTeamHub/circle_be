@@ -22,10 +22,18 @@ describe('MinIO storage reclamation', () => {
     expect(compose).toContain('mc ilm rule add');
     expect(compose).toContain("--prefix 'note-exports/'");
     // 规则失败不能连带把建桶也弄挂 —— 桶没了才是真的起不来。
-    expect(compose).toMatch(/mc ilm rule add[\s\S]{0,200}?\|\|/);
+    expect(compose).toContain(
+      "echo 'WARN: could not install note-exports lifecycle rule'",
+    );
+    // minio-init 是一次性服务,而发版不碰数据面:存量环境升级后根本执行不到它。
+    // 所以必须可重复执行(先查后加,直接 add 会叠规则),并在装完自检。
+    expect(compose).toMatch(
+      /mc ilm rule ls local\/circle .*\| grep -q 'note-exports\/'/,
+    );
+    expect(compose).toContain('note-exports lifecycle rule is NOT active');
   });
 
-  it('keys note exports by content, not by a fresh uuid per call', () => {
+  it('keys note exports by stable content identity, not by volatile bytes', () => {
     const source = read('src/note/note.service.ts');
     const keyLine = /const key = `note-exports\/[^`]*`/.exec(source)?.[0] ?? '';
 
@@ -33,10 +41,17 @@ describe('MinIO storage reclamation', () => {
     // randomUUID 会让每次调用都新建一个永久对象：循环调用 = 无界增长。
     expect(keyLine).not.toContain('randomUUID');
     expect(keyLine).toContain('contentHash');
-    // 哈希必须覆盖正文，否则内容变了 key 不变，会返回上一次的导出。
+    // 哈希必须取自稳定量。曾经拿 input.body 算 —— 但带媒体的笔记在导出前会现签
+    // 一批预签名 URL 并嵌进 SVG/PDF,签名每次都不同,于是同一篇没改过的笔记每次
+    // 导出 key 都变,复用彻底失效、每次照样多留一个永久对象。
     expect(source).toMatch(
+      /createHash\('sha256'\)[\s\S]{0,200}?update\(input\.contentFingerprint\)/,
+    );
+    expect(source).not.toMatch(
       /createHash\('sha256'\)[\s\S]{0,200}?update\(input\.body\)/,
     );
+    // 指纹本身必须由笔记修订 + 媒体对象 key 派生,不能回头去碰 body。
+    expect(source).toMatch(/private exportFingerprint\(/);
   });
 
   it('still has no object-delete path, so the lifecycle rule is load-bearing', () => {

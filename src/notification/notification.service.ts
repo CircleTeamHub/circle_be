@@ -136,7 +136,10 @@ export class NotificationService {
       projectId: dto.projectId ?? null,
       appVersion: dto.appVersion ?? null,
       disabledAt: null,
-      revocationSecretHash: revocationSecretHash ?? null,
+      // 只在本次确实带了 secret 时才写。用 `?? null` 的话，老客户端(或任何一次
+      // 不带 secret 的重新登记)会把已有的撤销密钥抹成 null —— 这台设备的令牌
+      // 就从「受保护」降级回「谁知道令牌谁就能抢」，等于自己把下面那道闸拆了。
+      ...(revocationSecretHash ? { revocationSecretHash } : {}),
     };
     const claimed = await this.prisma.devicePushToken.updateMany({
       where: {
@@ -144,6 +147,16 @@ export class NotificationService {
         OR: [
           { userID: userId },
           ...(revocationSecretHash ? [{ revocationSecretHash }] : []),
+          // 迁移通道：secret 是可选字段，存量行(以及任何没带 secret 登记过的
+          // 客户端)的 revocationSecretHash 是 null。不放行的话，同一台设备换个
+          // 账号登录就永远命中不了谓词 → create 撞唯一约束 → 403，而且是**永久**
+          // 的:直到推送服务商轮换令牌为止，新账号一条推送都收不到。
+          //
+          // 放行 null 行不是新开口子 —— 修复前所有行都能这么抢，这里只是没能
+          // 追溯保护「本来就没有 secret」的那部分。带了 secret 的行依然抢不走，
+          // 而认领方一旦带上 secret，上面的 update 会顺手把这行升级成受保护，
+          // 存量因此会随客户端升级自然收敛。
+          { revocationSecretHash: null },
         ],
       },
       data: update,

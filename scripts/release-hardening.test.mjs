@@ -527,3 +527,26 @@ test('backend workflow and server use the same strict version format', () => {
   assert.ok(read('deploy/release-deploy.sh').includes(strictVersion));
   assert.ok(read('deploy/admin-web-deploy.sh').includes(strictVersion));
 });
+
+// note-exports/ 的生命周期规则是它唯一的回收机制,而它挂在一次性的 minio-init 上,
+// 发版又不碰数据面(release-deploy.sh 契约 / DEPLOY.md §4)—— 存量环境升级后根本
+// 执行不到它。所以 entrypoint 必须可重复执行,且必须有一条文档化的补齐步骤,
+// 否则导出产物会一直堆到和 Postgres 同机的磁盘写满。
+test('note-exports lifecycle rule is re-appliable and has a documented rollout', () => {
+  const compose = read('docker-compose.prod.yml');
+  const deployDoc = read('DEPLOY.md');
+
+  // 幂等:先查后加。直接 add 会在重复执行时把规则叠一遍。
+  assert.match(compose, /mc ilm rule ls local\/circle .*\| grep -q 'note-exports\/'/);
+  assert.match(
+    compose,
+    /mc ilm rule add --expire-days 1 --prefix 'note-exports\/' local\/circle/,
+  );
+  // 装完必须自检并在失败时明确告警,不能静默地"看起来成功"。
+  assert.match(compose, /note-exports lifecycle rule is NOT active/);
+  // 存量环境的补齐步骤必须写进 DEPLOY.md,否则老环境永远拿不到这条规则。
+  assert.match(
+    deployDoc,
+    /docker compose -f docker-compose\.prod\.yml run --rm minio-init/,
+  );
+});

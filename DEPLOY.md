@@ -555,6 +555,20 @@ $S3 s3api get-object --bucket <bucket> \
   只 up 对应服务(`docker compose -f docker-compose.prod.yml up -d caddy`),
   不要裸跑整栈 `up -d`——那会按 build 路径把停用的那一色重新拉起来。
 - **首次自动发版**:会把手动 `--build` 的旧容器无缝换成 GHCR 镜像(蓝→绿切换),数据卷不动。
+- **存量环境补齐 note-exports 生命周期规则(一次性,必做)**:
+  规则写在 `minio-init` 的 entrypoint 里,而它是一次性服务、且发版**不碰数据面**(见 §4)——
+  在本次之前就已初始化过的环境,升级到这版代码后不会执行到它,`note-exports/` 会一直堆到
+  磁盘写满(和 Postgres 同机,倒下的是数据库)。手工跑一次即可,可重复执行:
+  ```bash
+  docker compose -f docker-compose.prod.yml run --rm minio-init
+  ```
+  预期末行是 `minio bucket [circle] ready`;若看到 `WARN: note-exports lifecycle rule is
+  NOT active` 说明规则没装上(通常是老版本 `mc` 的子命令名不同),必须处理后重跑,
+  否则导出产物没有任何回收机制。核验:
+  ```bash
+  docker compose -f docker-compose.prod.yml run --rm --entrypoint sh minio-init -c \
+    "mc alias set local http://minio:9000 \$MINIO_ROOT_USER \$MINIO_ROOT_PASSWORD >/dev/null && mc ilm rule ls local/circle"
+  ```
 
 ---
 
