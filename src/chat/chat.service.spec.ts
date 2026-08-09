@@ -42,6 +42,8 @@ describe('ChatService', () => {
   const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
+    // 默认关掉自动销毁,让既有用例不受时间窗口影响;需要时逐例覆盖。
+    getSettings: jest.fn().mockResolvedValue({ messageSelfDestructDays: 0 }),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -113,6 +115,9 @@ describe('ChatService', () => {
     // loadLastMessages / loadUnreadCounts 现在是集合查询,默认「无行」。
     prisma.$queryRaw.mockResolvedValue([]);
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    privacySettings.getSettings.mockResolvedValue({
+      messageSelfDestructDays: 0,
+    });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);
     prisma.friend.findFirst.mockResolvedValue(null);
   });
@@ -746,6 +751,34 @@ describe('ChatService', () => {
       expect(page.nextBeforeHeight).toBeNull();
     });
 
+    // 按日期过滤同样写 createdAt。销毁截止若和它并在同一层,会被整个盖掉 ——
+    // 客户端带上 date 就能翻出窗口之外的消息。两者必须同时成立。
+    it('keeps the self-destruct cutoff when a date filter is also supplied', async () => {
+      privacySettings.getSettings.mockResolvedValue({
+        messageSelfDestructDays: 2,
+      });
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', undefined, 50, {
+        date: '2020-01-01',
+        tzOffsetMinutes: 0,
+      });
+
+      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+        [{ where: Record<string, any> }],
+      ];
+      // 日期过滤照常生效……
+      expect(args.where.createdAt).toEqual({
+        gte: new Date('2020-01-01T00:00:00.000Z'),
+        lt: new Date('2020-01-02T00:00:00.000Z'),
+      });
+      // ……而销毁截止作为独立的 AND 条件仍然在,没有被它顶掉。
+      expect(args.where.AND).toEqual([
+        { createdAt: { gte: expect.any(Date) } },
+      ]);
+    });
+
     it('applies type/keyword/date filters onto the where clause', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findMany.mockResolvedValue([]);
@@ -806,6 +839,29 @@ describe('ChatService', () => {
     it('returns empty for blank keywords without querying', async () => {
       await expect(service.searchAllMessages('u1', '  ')).resolves.toEqual([]);
       expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    // 搜索必须和 getHistory 用同一把尺子:自动销毁窗口之外的消息在历史里
+    // 看不到、一搜就出来的话,这个设置等于形同虚设。
+    it('applies the same self-destruct cutoff as history', async () => {
+      privacySettings.getSettings.mockResolvedValue({
+        messageSelfDestructDays: 2,
+      });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1' },
+      ]);
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.searchAllMessages('u1', 'hello');
+
+      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+        [{ where: { createdAt?: { gte: Date } } }],
+      ];
+      expect(args.where.createdAt?.gte).toBeInstanceOf(Date);
+      const ageMs =
+        Date.now() - (args.where.createdAt as { gte: Date }).gte.getTime();
+      expect(ageMs).toBeGreaterThan(47 * 60 * 60 * 1000);
+      expect(ageMs).toBeLessThan(49 * 60 * 60 * 1000);
     });
 
     it('scopes the search to conversations the user is seated in', async () => {

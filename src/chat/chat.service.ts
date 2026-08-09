@@ -542,6 +542,22 @@ export class ChatService {
     };
   }
 
+  /**
+   * 查看者自己的「消息自动销毁」截止时间。
+   *
+   * 这是每个用户对自己的设置(UserPrivacySetting.messageSelfDestructDays,
+   * 默认 2 天):超过窗口的消息在**他自己的**客户端上不再出现。不是双方协商的
+   * 阅后即焚,所以只按查看者过滤,不动库里的行。
+   *
+   * 返回 null 表示该用户关掉了自动销毁(0/未设置),不做任何过滤。
+   */
+  private async selfDestructCutoff(userId: string): Promise<Date | null> {
+    const { messageSelfDestructDays } =
+      await this.privacySettings.getSettings(userId);
+    if (!messageSelfDestructDays) return null;
+    return new Date(Date.now() - messageSelfDestructDays * 24 * 60 * 60 * 1000);
+  }
+
   /** 历史分页:height 键集向前翻,页内升序返回。 */
   async getHistory(
     userId: string,
@@ -552,13 +568,24 @@ export class ChatService {
   ): Promise<ChatHistoryPageDto> {
     await this.requireMembership(conversationId, userId);
     const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
+    // 自动销毁窗口:拆栈前由 chat-history.service 负责,自研栈落地时漏掉了 ——
+    // 设置在库里、UI 上也能改,但读取路径根本不看它,用户以为过期的消息其实
+    // 一直在。收在 where 里而不是取回来再 filter:后者会让分页数不准。
+    const cutoff = await this.selfDestructCutoff(userId);
+    const where: Prisma.ChatMessageWhereInput = {
+      conversationID: conversationId,
+      deleted: false,
+      ...(beforeHeight !== undefined ? { height: { lt: beforeHeight } } : {}),
+      ...this.buildHistoryFilterWhere(filters),
+    };
+    // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
+    // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
+    // 之外的消息,等于给这个设置留了个后门。
+    if (cutoff) {
+      where.AND = [{ createdAt: { gte: cutoff } }];
+    }
     const rows = await this.prisma.chatMessage.findMany({
-      where: {
-        conversationID: conversationId,
-        deleted: false,
-        ...(beforeHeight !== undefined ? { height: { lt: beforeHeight } } : {}),
-        ...this.buildHistoryFilterWhere(filters),
-      },
+      where,
       orderBy: { height: 'desc' },
       take,
     });
@@ -656,12 +683,16 @@ export class ChatService {
       select: { conversationID: true },
     });
     if (memberships.length === 0) return [];
+    // 搜索必须和 getHistory 用同一把尺子:否则自动销毁窗口之外的消息
+    // 在历史里看不到、一搜就出来了,等于开了后门。
+    const cutoff = await this.selfDestructCutoff(userId);
     const rows = await this.prisma.chatMessage.findMany({
       where: {
         conversationID: { in: memberships.map((m) => m.conversationID) },
         deleted: false,
         type: { in: ['text', 'quote'] },
         content: { path: ['text'], string_contains: trimmed },
+        ...(cutoff ? { createdAt: { gte: cutoff } } : {}),
       },
       orderBy: { createdAt: 'desc' },
       take: Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX),
