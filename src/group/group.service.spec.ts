@@ -1077,15 +1077,19 @@ describe('GroupService reportGroup', () => {
     );
   });
 
-  // 停用的圈子要给「群已停用」的明确回复。沿用默认的 deleted:false 过滤的话,
-  // 已停用的群会退化成 404「群不存在」—— 管理员分不清是自己记错了群,还是这个
-  // 群被停用了。(#139 的改动,随 OpenIM 出清一并保留下来。)
-  it('rejects an inactive circle with a distinct error, not 404', async () => {
+  // 群主对已停用的群要拿到「群已停用」的明确回复,而不是 404「群不存在」——
+  // 否则分不清是自己记错了群还是群被停用。(#139 的改动,随 OpenIM 出清保留。)
+  it('tells the owner that the circle is inactive, not that it is missing', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
       ownerID: 'owner-1',
       deleted: true,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'owner-member',
+      role: CircleMemberRole.OWNER,
+      status: CircleMemberStatus.ACTIVE,
     });
 
     await expect(
@@ -1096,9 +1100,12 @@ describe('GroupService reportGroup', () => {
         { role: 'ADMIN' },
       ),
     ).rejects.toMatchObject({
-      response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      response: {
+        errorCode: 'GROUP_MANAGER_ONLY',
+        message: 'Administrator roles cannot be changed for an inactive group',
+      },
     });
-    // 停用判定在事务外就该短路,不进事务、不取锁。
+    // 停用判定在鉴权之后、取锁之前短路。
     expect(memberLock.lock).not.toHaveBeenCalled();
     // 查询必须带上 includeDeleted,否则这一行根本查不出来。
     expect(prisma.circle.findFirst).toHaveBeenCalledWith(
@@ -1106,6 +1113,42 @@ describe('GroupService reportGroup', () => {
         where: expect.not.objectContaining({ deleted: false }),
       }),
     );
+  });
+
+  // 停用状态只对已证明身份的群主披露。放在鉴权之前的话,任何登录用户拿一个
+  // 圈子 ID 试一次就能分辨「不存在(404)/ 已停用(独有文案)/ 正常(群主校验失败)」
+  // 三态 —— 等于把停用状态做成对全站开放的探测接口,而 preflightActor 的全部
+  // 意义恰恰是「先鉴权再暴露任何东西」。
+  it('gives a non-owner the same answer whether the circle is inactive or not', async () => {
+    const askAsNonOwner = async (deleted: boolean) => {
+      jest.clearAllMocks();
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        groupID: 'group-1',
+        ownerID: 'owner-1',
+        deleted,
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        id: 'member-1',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      });
+      return (service as any)
+        .updateGroupMemberRole('snooper', 'group-1', 'target-user', {
+          role: 'ADMIN',
+        })
+        .catch((error: any) => error.response);
+    };
+
+    const onInactive = await askAsNonOwner(true);
+    const onActive = await askAsNonOwner(false);
+
+    // 两种情况必须字节级一致 —— 任何差异都是可用的探测信号。
+    expect(onInactive).toEqual(onActive);
+    expect(onInactive).toMatchObject({
+      errorCode: 'GROUP_MANAGER_ONLY',
+      message: 'Only the group owner can change administrator roles',
+    });
   });
 
   // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID 取一遍

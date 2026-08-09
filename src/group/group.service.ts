@@ -68,9 +68,15 @@ export class GroupService {
       });
     }
 
-    // includeDeleted:停用的圈子要能被查出来,好给一个「群已停用」的明确回复。
-    // 若沿用默认的 deleted:false 过滤,已停用的群会退化成 404「群不存在」——
-    // 管理员分不清是自己记错了群还是这个群被停用了。
+    // includeDeleted:停用的圈子要能被查出来,好给群主一个「群已停用」的明确回复
+    // (沿用默认的 deleted:false 过滤的话,已停用的群会退化成 404「群不存在」,
+    // 群主分不清是自己记错了群还是群被停用)。
+    //
+    // 但**查出来不等于可以立刻据此回话**:停用状态只对已证明身份的群主披露,
+    // 判定放在下面 preflightActor 之后。放在这里的话,任何登录用户拿一个圈子 ID
+    // 试一次就能分辨「不存在(404)/ 已停用(独有文案)/ 正常(群主校验失败)」三态,
+    // 等于把停用状态做成了对全站开放的探测接口 —— 而 preflightActor 的全部意义
+    // 恰恰是「先鉴权再暴露任何东西」,在它前面开这个口等于把它架空。
     const circle = await this.findCircleByGroupID(normalizedGroupID, true);
 
     if (!circle) {
@@ -78,12 +84,6 @@ export class GroupService {
       throw new NotFoundException({
         message: 'Group not found',
         errorCode: GroupErrorCode.NotFound,
-      });
-    }
-    if (circle.deleted) {
-      throw new ForbiddenException({
-        message: 'Administrator roles cannot be changed for an inactive group',
-        errorCode: GroupErrorCode.ManagerOnly,
       });
     }
 
@@ -105,6 +105,17 @@ export class GroupService {
       ) {
         throw new ForbiddenException({
           message: 'Only the group owner can change administrator roles',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+
+      // 身份已证明,现在才可以披露停用状态。非群主走到上面那条统一回复为止,
+      // 拿到的错误与「圈子正常但你不是群主」完全一致,分辨不出停用与否。
+      // (下面 FOR UPDATE 那次复查针对的是并发窗口,与这次职责不同,两者都要留。)
+      if (circle.deleted) {
+        throw new ForbiddenException({
+          message:
+            'Administrator roles cannot be changed for an inactive group',
           errorCode: GroupErrorCode.ManagerOnly,
         });
       }
