@@ -15,6 +15,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
   let chatMessages: any;
   let livekit: any;
   let realtime: any;
+  let privacySettings: any;
   let service: CallService;
 
   beforeEach(() => {
@@ -79,6 +80,10 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       get: jest.fn((key: string): unknown => configValues[key]),
     } as unknown as ConfigService;
 
+    privacySettings = {
+      canBeCalled: jest.fn().mockResolvedValue(true),
+    };
+
     service = new CallService(
       prisma,
       chatService,
@@ -86,6 +91,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
       livekit,
       realtime,
       config,
+      privacySettings,
     );
   });
 
@@ -124,6 +130,39 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
 
   it('rejects a blocked pair with the same CALL_NOT_FRIEND (no block-status oracle)', async () => {
     mockFriendship({ friends: true, blocked: true });
+    await expectErrorCode(
+      service.createDirectCall('user-1', {
+        calleeID: 'user-2',
+        callType: 'AUDIO',
+      }),
+      CallErrorCode.NotFriend,
+    );
+  });
+
+  // callPermission 之前在库里、隐私设置页也能改,但 call.service 从头到尾没查过
+  // (canBeCalled 零调用者):选「不接受呼叫」的用户照样被好友打进来。
+  it('rejects the call when the callee set callPermission to NONE', async () => {
+    mockFriendship();
+    privacySettings.canBeCalled.mockResolvedValue(false);
+
+    await expectErrorCode(
+      service.createDirectCall('user-1', {
+        calleeID: 'user-2',
+        callType: 'AUDIO',
+      }),
+      CallErrorCode.PermissionDenied,
+    );
+    // 好友关系是底线,callPermission 只能在其之上收紧 —— 判定按被叫来问。
+    expect(privacySettings.canBeCalled).toHaveBeenCalledWith('user-2', true);
+    expect(livekit.createRoom).not.toHaveBeenCalled();
+  });
+
+  // 不复用 CALL_NOT_FRIEND:「不是好友」和「对方关掉了通话」对发起方是两件事,
+  // 合并成一个码会让用户以为好友关系断了,跑去重加好友。
+  it('keeps CALL_NOT_FRIEND and the permission rejection distinguishable', async () => {
+    mockFriendship({ friends: false });
+    privacySettings.canBeCalled.mockResolvedValue(false);
+
     await expectErrorCode(
       service.createDirectCall('user-1', {
         calleeID: 'user-2',

@@ -232,6 +232,10 @@ export const FriendErrorCode = {
   RequestMessageLimit: 'FRIEND_REQUEST_MESSAGE_LIMIT',
   RequestNotPending: 'FRIEND_REQUEST_NOT_PENDING',
   RequestAlreadyHandled: 'FRIEND_REQUEST_ALREADY_HANDLED',
+  // 对方开放的「可通过 X 添加我」路径，没有一条对本次请求成立。与
+  // FRIEND_STRANGER_MSG_NOT_ALLOWED 分开：那个是「不收陌生人消息」，这个是
+  // 「不从这条路径加人」，用户能做的事不一样（后者可以先进同一个圈子）。
+  NotDiscoverable: 'FRIEND_NOT_DISCOVERABLE',
 } as const;
 
 // 笔记:分组重名/数量上限、导出媒体(无媒体/单文件过大/总量过大/数量过多)。
@@ -279,6 +283,9 @@ export const CallErrorCode = {
   // 1:1 呼叫（#113）：非好友或任一方向已拉黑。共用一个码，不向发起方泄露
   // 「被拉黑」这一事实。
   NotFriend: 'CALL_NOT_FRIEND',
+  // 被叫把 callPermission 设成了 NONE。与 CALL_NOT_FRIEND 分开：好友关系还在，
+  // 合并成一个码会让发起方以为好友断了、跑去重加。
+  PermissionDenied: 'CALL_PERMISSION_DENIED',
 } as const;
 
 // 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)

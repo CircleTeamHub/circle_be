@@ -48,6 +48,7 @@ describe('UserService', () => {
   };
   const privacySettings = {
     canViewProfileField: jest.fn(),
+    getSettings: jest.fn().mockResolvedValue({ addMeByAccount: true }),
   };
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
@@ -75,6 +76,8 @@ describe('UserService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     privacySettings.canViewProfileField.mockResolvedValue(true);
+    // clearAllMocks 只清调用记录、不清实现，逐个用例覆盖过的返回值会漏给下一个。
+    privacySettings.getSettings.mockResolvedValue({ addMeByAccount: true });
     prisma.userLike.findUnique.mockResolvedValue(null);
     prisma.accountIdentifier.findUnique.mockResolvedValue(null);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
@@ -381,6 +384,38 @@ describe('UserService', () => {
   it('returns null for empty accountId search keywords', async () => {
     await expect(service.findByExactAccountId('   ')).resolves.toBeNull();
     expect(prisma.user.findFirst).not.toHaveBeenCalled();
+  });
+
+  // addMeByAccount 的收口点：关掉之后账号搜索就该查不到人，好友请求根本形不成。
+  // 放在这里而不是发请求时判，是因为这条路径服务端无从证实来源 —— 只能在唯一
+  // 能把账号号码变成 userID 的接口上拦。
+  it('hides users who turned off account lookup, indistinguishably from not found', async () => {
+    prisma.user.findFirst.mockResolvedValue({
+      id: 'user-9',
+      accountId: 'jimmy',
+      nickname: 'Jimmy',
+    });
+    privacySettings.getSettings.mockResolvedValue({ addMeByAccount: false });
+
+    await expect(
+      service.findByExactAccountId('jimmy', 'viewer-1'),
+    ).resolves.toBeNull();
+  });
+
+  // 自己搜自己不该被自己的设置挡住 —— 用户要能在资料页核对自己的账号号码。
+  it('still returns the viewer to themselves when account lookup is off', async () => {
+    prisma.user.findFirst.mockResolvedValue({
+      id: 'user-9',
+      accountId: 'jimmy',
+      nickname: 'Jimmy',
+    });
+    privacySettings.getSettings.mockResolvedValue({ addMeByAccount: false });
+    privacySettings.canViewProfileField.mockResolvedValue(true);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+
+    await expect(
+      service.findByExactAccountId('jimmy', 'user-9'),
+    ).resolves.toMatchObject({ id: 'user-9' });
   });
 
   it('applies the target profile-privacy gate to account search results (F-01)', async () => {

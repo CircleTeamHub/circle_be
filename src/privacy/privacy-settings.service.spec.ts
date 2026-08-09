@@ -21,7 +21,9 @@ describe('PrivacySettingsService', () => {
     prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
 
     await expect(service.getSettings('user-1')).resolves.toMatchObject({
-      messageSelfDestructDays: 2,
+      // 自动销毁默认关闭:绝大多数用户库里没有这行,走的就是这份默认值。
+      // 默认非 0 等于替所有从没进过隐私设置的人开了「只看得到最近 N 天」。
+      messageSelfDestructDays: 0,
       momentsVisibility: 'ALL',
       allowStrangerMessages: true,
       showPhone: false,
