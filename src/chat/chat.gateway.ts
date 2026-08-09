@@ -1,4 +1,9 @@
-import { HttpException, Injectable, Logger } from '@nestjs/common';
+import {
+  HttpException,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import type { Server as HttpServer } from 'http';
@@ -57,7 +62,7 @@ function issuedAtMsOf(payload: JwtPayload): number | null {
  * 验签 + 吊销检查通过才建立连接 —— 复用 app 会话,没有 OpenIM 式双 token。
  */
 @Injectable()
-export class ChatGateway {
+export class ChatGateway implements OnModuleDestroy {
   private readonly logger = new Logger(ChatGateway.name);
   private io: Server | null = null;
 
@@ -98,6 +103,29 @@ export class ChatGateway {
     private readonly redisService: RedisService,
     private readonly configService: ConfigService,
   ) {}
+
+  /**
+   * SIGTERM 时必须主动关掉 Socket.IO。
+   *
+   * app.close() 只关 HTTP server,而已经升级成 WebSocket 的连接不算在内 ——
+   * 只要还有一个聊天客户端连着,close 就一直 pending,进程挂到编排器超时后被
+   * SIGKILL:优雅退出的清理和日志 flush 全部跳过。任何一个连着的客户端都能
+   * 单方面把发布卡在这一步。RealtimeGateway 早就有这个钩子,chat 侧漏了。
+   *
+   * 计时器也要一并清:退避重试和 token 到期断连都是 setTimeout,虽然都
+   * unref 过(不阻止退出),但留着会在关闭后继续对已销毁的 io 动手。
+   */
+  onModuleDestroy(): void {
+    if (this.revocationRetryTimer) {
+      clearTimeout(this.revocationRetryTimer);
+      this.revocationRetryTimer = null;
+    }
+    for (const timer of this.expiryTimers.values()) clearTimeout(timer);
+    this.expiryTimers.clear();
+    this.connectionsByUser.clear();
+    this.io?.close();
+    this.io = null;
+  }
 
   attach(httpServer: HttpServer, options: { corsOrigin: CorsOrigin }): void {
     const io = new Server(httpServer, {
@@ -203,6 +231,11 @@ export class ChatGateway {
     }
     if (typeof payload?.sub !== 'string') return null;
     if (typeof payload?.accountId !== 'string') return null;
+    // 管理台走 /auth/admin/login 拿的是 ADMIN audience,它同样能过签名校验 ——
+    // 而管理台压根没有消息 UI。拆 OpenIM 之前这道闸在 /auth/im-token 里(显式拒
+    // ADMIN),自研栈直接复用 app JWT 连 socket,闸随端点一起没了。这是迁移带回来
+    // 的能力扩张,不是新需求。REST 侧同源判定见 AppAudienceGuard。
+    if (payload.aud !== 'APP') return null;
     if (await this.sessionRevocation.isRevoked(payload)) return null;
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
@@ -343,6 +376,8 @@ export class ChatGateway {
       resolveReady = resolve;
     });
     let conversationIds: string[] = [];
+    // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
+    let blockedPeers: string[] = [];
 
     const whenReady = (run: () => void): void => {
       void ready.then((ok) => {
@@ -387,14 +422,23 @@ export class ChatGateway {
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
-        this.broadcast.emitPresence(conversationIds, { userId, online: false });
+        this.broadcast.emitPresence(
+          conversationIds,
+          { userId, online: false },
+          blockedPeers,
+        );
       });
     });
 
     try {
-      conversationIds = guestConversationId
-        ? [guestConversationId]
-        : await this.chatService.listConversationIds(userId);
+      if (guestConversationId) {
+        conversationIds = [guestConversationId];
+      } else {
+        [conversationIds, blockedPeers] = await Promise.all([
+          this.chatService.listConversationIds(userId),
+          this.chatService.listBlockedCounterparties(userId),
+        ]);
+      }
       await socket.join(userRoom(userId));
       await socket.join(conversationIds.map(conversationRoom));
     } catch (error) {
@@ -409,7 +453,11 @@ export class ChatGateway {
     resolveReady(true);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
-    this.broadcast.emitPresence(conversationIds, { userId, online: true });
+    this.broadcast.emitPresence(
+      conversationIds,
+      { userId, online: true },
+      blockedPeers,
+    );
   }
 
   /**

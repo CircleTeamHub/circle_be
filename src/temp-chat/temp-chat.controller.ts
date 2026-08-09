@@ -110,6 +110,10 @@ export class TempChatController {
       req.tempChatGuest.conversationId,
       query.beforeHeight,
       query.limit,
+      {},
+      // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
+      // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
+      { applyViewerRetention: false },
     );
   }
 

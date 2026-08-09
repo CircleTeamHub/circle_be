@@ -212,8 +212,16 @@ export class TempChatService {
       const remainingSeconds = Math.floor(
         (row.expiresAt.getTime() - now) / 1000,
       );
+      const conversationId = conversationByRoom.get(row.id) ?? null;
+      // 拆栈前建的房间没有 ChatConversation。这类行照旧报 ACTIVE 并签一个新的
+      // 分享链接,而 join 走到最后会把「会话缺失」当成房间已结束 —— 房主可以
+      // 反复分享一条对访客必然失败的链接,自己却完全看不出问题。
+      // 状态口径与 join 的实际行为对齐:没有会话 = 不可加入。
+      const migrationPending =
+        row.status === TempChatStatus.ACTIVE && conversationId === null;
       const effectiveStatus =
-        row.status === TempChatStatus.ACTIVE && remainingSeconds <= 0
+        row.status === TempChatStatus.ACTIVE &&
+        (remainingSeconds <= 0 || migrationPending)
           ? TempChatStatus.EXPIRED
           : row.status;
       const shareUrl =
@@ -224,7 +232,7 @@ export class TempChatService {
       return {
         id: row.id,
         groupId: row.groupId,
-        conversationId: conversationByRoom.get(row.id) ?? null,
+        conversationId,
         title: row.title,
         status: effectiveStatus,
         guestCount,

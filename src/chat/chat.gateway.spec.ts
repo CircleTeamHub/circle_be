@@ -32,6 +32,8 @@ describe('ChatGateway', () => {
     getActiveTempChat: jest.fn(),
     hasSeat: jest.fn(),
     filterVisiblePresenceTargets: jest.fn(),
+    // 上下线广播要剔掉互相拉黑的人;默认无拉黑关系。
+    listBlockedCounterparties: jest.fn().mockResolvedValue([]),
   };
   const broadcast = {
     setServer: jest.fn(),
@@ -64,11 +66,17 @@ describe('ChatGateway', () => {
     configService.get.mockReturnValue('guest-secret');
     // 默认不是访客 token:app 分支的既有用例不受分流影响。
     jwtService.decode.mockReturnValue({ sub: 'u1' });
+    // clearAllMocks 会连实现一起清掉,这里重设默认「无拉黑关系」。
+    chatService.listBlockedCounterparties.mockResolvedValue([]);
   });
 
   describe('authenticate', () => {
     it('accepts a valid access token and returns the userId', async () => {
-      jwtService.verify.mockReturnValue({ sub: 'u1', accountId: 'acc1' });
+      jwtService.verify.mockReturnValue({
+        sub: 'u1',
+        accountId: 'acc1',
+        aud: 'APP',
+      });
       await expect(
         gateway['authenticate'](fakeSocket() as never),
       ).resolves.toBe('u1');
@@ -94,8 +102,35 @@ describe('ChatGateway', () => {
         gateway['authenticate'](fakeSocket() as never),
       ).resolves.toBeNull();
 
-      jwtService.verify.mockReturnValue({ sub: 'u1', accountId: 'acc1' });
+      jwtService.verify.mockReturnValue({
+        sub: 'u1',
+        accountId: 'acc1',
+        aud: 'APP',
+      });
       sessionRevocation.isRevoked.mockResolvedValue(true);
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+    });
+
+    // 管理台走 /auth/admin/login 拿的是 ADMIN audience,它同样能过签名校验,
+    // 而管理台压根没有消息 UI。拆 OpenIM 前这道闸在 /auth/im-token 里(显式拒
+    // ADMIN),自研栈直接复用 app JWT 连 socket,闸随端点一起没了。
+    it('rejects an admin-audience token (chat is an app-only capability)', async () => {
+      jwtService.verify.mockReturnValue({
+        sub: 'admin-1',
+        accountId: 'acc-admin',
+        aud: 'ADMIN',
+      });
+      await expect(
+        gateway['authenticate'](fakeSocket() as never),
+      ).resolves.toBeNull();
+      // 连吊销检查都不该走到 —— 这类 token 根本不该进入聊天面。
+      expect(sessionRevocation.isRevoked).not.toHaveBeenCalled();
+    });
+
+    it('rejects a token with no audience claim at all', async () => {
+      jwtService.verify.mockReturnValue({ sub: 'u1', accountId: 'acc1' });
       await expect(
         gateway['authenticate'](fakeSocket() as never),
       ).resolves.toBeNull();
@@ -195,6 +230,22 @@ describe('ChatGateway', () => {
     // 入房要 await,而监听若在 await 之后注册,这段窗口里到达的 chat:send
     // 没有任何监听者 —— Socket.IO 直接丢弃且不回 ack,客户端表现为「刚连上
     // 发的第一条消息石沉大海」。所以监听必须先于第一个 await 注册。
+    // 查询侧已经按拉黑收口了,广播侧不收口等于换个通道把同一份信息免费送出去,
+    // 而且是推的、连轮询都不用。拉黑不动 ChatMember,座位一直在。
+    it('excludes blocked counterparties from the online broadcast', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listBlockedCounterparties.mockResolvedValue(['blocked-1']);
+
+      await gateway['handleConnection'](socket as never);
+
+      expect(broadcast.emitPresence).toHaveBeenCalledWith(
+        ['conv-1'],
+        { userId: 'u1', online: true },
+        ['blocked-1'],
+      );
+    });
+
     it('registers event handlers before awaiting room setup', async () => {
       const socket = fakeSocket();
       let handlersAtLookup = 0;

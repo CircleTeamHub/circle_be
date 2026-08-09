@@ -44,9 +44,10 @@ describe('CallService', () => {
       },
     };
     chatService = {
-      getOrCreateDirectConversation: jest
+      // 通话留痕走结算专用解析:通话已经发生过,拉黑不该让留痕永久缺失。
+      ensureDirectConversationForSettlement: jest
         .fn()
-        .mockResolvedValue({ id: 'conv-direct-1' }),
+        .mockResolvedValue('conv-direct-1'),
     };
     chatMessages = {
       insertServerMessage: jest.fn().mockResolvedValue(undefined),

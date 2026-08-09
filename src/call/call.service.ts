@@ -1321,12 +1321,15 @@ export class CallService {
           (participant) => participant.userID !== call.initiatorID,
         );
         if (!other) return;
-        const conversation =
-          await this.chatService.getOrCreateDirectConversation(
+        // 走结算专用解析,不过拉黑/陌生人消息那两道闸 —— 那是给用户主动发消息
+        // 设的。通话已经发生过,这条是既成事实的留痕:任一方在通话结束前拉黑,
+        // 交互式路径会让 3 次重试全部抛错,通话记录**永久缺失**,而通话确实打过。
+        // 与转账卡补偿同一条判据(见 ensureDirectConversationForSettlement)。
+        conversationId =
+          await this.chatService.ensureDirectConversationForSettlement(
             call.initiatorID,
             other.userID,
           );
-        conversationId = conversation.id;
       } else {
         const direct = await this.prisma.chatConversation.findUnique({
           where: { id: call.conversationID },

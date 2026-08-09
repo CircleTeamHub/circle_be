@@ -284,6 +284,8 @@ export const CallErrorCode = {
 // 上传:载荷超限。(#96 —— 原为裸英文插值文案直达用户。)
 export const UploadErrorCode = {
   PayloadTooLarge: 'UPLOAD_PAYLOAD_TOO_LARGE',
+  // 语音/文件类型只对 chat 目录开放(见 UploadService.presign 的目录收口)。
+  InvalidContentType: 'UPLOAD_INVALID_CONTENT_TYPE',
 } as const;
 
 // 会话分组(本地消息分组):同名分组已存在 / 分组不存在。

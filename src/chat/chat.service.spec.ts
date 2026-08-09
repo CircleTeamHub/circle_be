@@ -122,6 +122,90 @@ describe('ChatService', () => {
     prisma.friend.findFirst.mockResolvedValue(null);
   });
 
+  // 访客(临时房)没有 User 行:查隐私设置只会拿到 2 天默认值,而房间可以开
+  // 3 天甚至 7 天 —— 活着的房间里超过 2 天的消息对访客凭空消失,他还没有任何
+  // 地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
+  it('does not apply viewer retention to guest history', async () => {
+    privacySettings.getSettings.mockResolvedValue({
+      messageSelfDestructDays: 2,
+    });
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findMany.mockResolvedValue([]);
+
+    await service.getHistory(
+      'guest-1',
+      'conv-1',
+      undefined,
+      50,
+      {},
+      {
+        applyViewerRetention: false,
+      },
+    );
+
+    const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+      [{ where: Record<string, unknown> }],
+    ];
+    expect(args.where.AND).toBeUndefined();
+    // 隐私设置压根不该被查 —— 访客 id 不对应任何 User。
+    expect(privacySettings.getSettings).not.toHaveBeenCalled();
+  });
+
+  // 事务已提交,之后的富化只是装饰。抛出去的话 handleSend 既不广播也不推送,
+  // 而客户端同 d 重发会命中幂等分支(刻意不广播)—— 一次瞬时的昵称查询失败
+  // 就让这条消息对所有收件人永久消失,数据库里却存着。
+  it('still returns the message when post-commit sender enrichment fails', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 3 } });
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.user.findMany.mockRejectedValue(new Error('db down'));
+
+    const result = await service.sendMessage('u1', sendPayload());
+
+    expect(result.reused).toBe(false);
+    expect(result.message.id).toBe('msg-1');
+    // 降级:昵称取不到就发 null,客户端仍有 senderID 可用。
+    expect(result.message.sender).toBeNull();
+  });
+
+  describe('server-only message types', () => {
+    // transfer-card 断言的是「钱已经划走」。它只由 GiftCardOutboxProcessor 在结算
+    // 之后签发,客户端能发就等于能凭空捏造一笔转账 —— 伪造卡和真卡在收件人眼里
+    // 完全一样。call-record / verification-card 同理(既成事实的服务端回执)。
+    it.each(['transfer-card', 'call-record', 'verification-card', 'system'])(
+      'rejects a client-sent %s',
+      (type) => {
+        expect(() =>
+          service.validateSendPayload('u1', {
+            conversationId: 'conv-1',
+            type,
+            d: 'client-1',
+            content: { amount: 999_999 },
+          } as never),
+        ).toThrow(BadRequestException);
+      },
+    );
+
+    // 分享类卡片只是指针(收件人点开会自己取真值),伪造顶多是条无效链接,
+    // 不该被这条收口误伤。
+    it.each(['text', 'image', 'note-card', 'friend-card', 'plaza-post-card'])(
+      'still accepts %s from clients',
+      (type) => {
+        expect(() =>
+          service.validateSendPayload('u1', {
+            conversationId: 'conv-1',
+            type,
+            d: 'client-1',
+            content:
+              type === 'image' ? { key: 'chat/u1/a.jpg' } : { text: 'hi' },
+          } as never),
+        ).not.toThrow();
+      },
+    );
+  });
+
   describe('sendMessage', () => {
     // 锁外校验与落库之间是一个真实窗口:踢人、拉黑、管理台禁言、临时房到期
     // 都可能恰好落在这中间。advisory lock 之后才是真正串行的位置,所以那几道

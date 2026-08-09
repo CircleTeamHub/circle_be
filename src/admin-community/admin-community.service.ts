@@ -190,8 +190,16 @@ export class AdminCommunityService {
     try {
       return await runSerializableTransaction(this.prisma, async (tx) => {
         await this.lockGroup(tx, groupID);
+        // groupID 为空是受支持的历史状态(早年 OpenIM 建群失败时留下的),
+        // 而列表接口对外报的正是 `circle.groupID ?? circle.id` —— 只按 groupID
+        // 反查的话,这类圈子必然查不到:操作记成 circleID=null,处理器"成功"返回,
+        // Circle 却从没被标记 deleted,之后有人打开圈聊,座位又整套重建出来。
+        // 管理员看到的是"已解散",实际群聊照常能用。
+        // 所以按 id 兜一次底 —— 与列表的取值口径对齐。
         const linkedCircle = await tx.circle.findFirst({
-          where: { groupID },
+          where: {
+            OR: [{ groupID }, { id: groupID, groupID: null }],
+          },
           select: {
             id: true,
             name: true,

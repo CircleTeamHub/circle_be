@@ -1,5 +1,7 @@
 import { UploadErrorCode } from 'src/common/app-error-codes';
+import { CHAT_ONLY_UPLOAD_TYPES } from './dto/presign.dto';
 import {
+  BadRequestException,
   Injectable,
   Logger,
   OnModuleInit,
@@ -266,9 +268,24 @@ export class UploadService implements OnModuleInit {
       );
     }
 
+    // 语音/文件只对 chat 目录开放。DTO 的白名单是全局的,只放宽它等于让头像、
+    // 封面、圈子帖目录也能收 pdf/zip —— 目录收口必须在这里再做一次。
+    if (CHAT_ONLY_UPLOAD_TYPES.includes(contentType) && folder !== 'chat') {
+      throw new BadRequestException({
+        message: `${contentType} uploads are only allowed in chat`,
+        errorCode: UploadErrorCode.InvalidContentType,
+      });
+    }
+
+    // 按类分档:视频 100 MiB 照旧;语音是几十秒的片段,给 20 MiB 已经很宽;
+    // 文件给 50 MiB —— 比视频紧,避免 chat 目录变成通用网盘。
     const maxBytes = contentType.startsWith('video/')
       ? 100 * 1024 * 1024
-      : 20 * 1024 * 1024;
+      : contentType.startsWith('audio/')
+        ? 20 * 1024 * 1024
+        : CHAT_ONLY_UPLOAD_TYPES.includes(contentType)
+          ? 50 * 1024 * 1024
+          : 20 * 1024 * 1024;
     if (
       !Number.isSafeInteger(sizeBytes) ||
       sizeBytes < 1 ||

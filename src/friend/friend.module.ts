@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { NotificationModule } from 'src/notification/notification.module';
 import { ChatModule } from 'src/chat/chat.module';
+import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { RealtimeModule } from 'src/realtime/realtime.module';
 import { CreditModule } from 'src/credit/credit.module';
@@ -16,6 +17,8 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     RealtimeModule,
     NotificationModule,
     ChatModule,
+    // 好友申请线程回放要过敏感词(insertServerMessage 是特权原语,不自带校验)。
+    SensitiveWordModule,
     PrivacySettingsModule,
     CreditModule,
     AvatarFrameModule,

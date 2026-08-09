@@ -92,7 +92,9 @@ export class ChatService {
       });
     }
     if (!CLIENT_TYPE_SET.has(payload.type)) {
-      // 'system' 等服务端专属类型也会落到这里:客户端不可伪造系统消息。
+      // 服务端专属类型(system / transfer-card / call-record / verification-card)
+      // 也落到这里:它们断言的是已经发生过的服务端事实(钱已划走、通话已结束),
+      // 客户端能发就等于能凭空捏造 —— 一张伪造的转账卡和真卡在收件人眼里毫无区别。
       throw new BadRequestException({
         message: `不支持的消息类型: ${payload.type}`,
         errorCode: ChatErrorCode.InvalidPayload,
@@ -256,12 +258,29 @@ export class ChatService {
       return { row, reused: false };
     });
 
-    const sender = await this.resolveSenders([senderUserId]);
-    const message = this.toMessageDto(
-      created.row,
-      sender.get(senderUserId) ?? null,
-    );
+    // 事务已经提交 —— 这之后的一切都只是「把行装饰成 DTO」,绝不能因此抛错。
+    //
+    // 抛出去的后果不是"这次失败重试就好":handleSend 捕获后既不广播也不推送,
+    // 而客户端拿同一个 d 重发时会命中幂等分支(reused=true),那条分支**刻意
+    // 不广播**(首次投递时房间里已经收到过了 —— 但这次并没有)。于是一次瞬时的
+    // 昵称查询失败,就让这条消息对所有收件人永久消失,数据库里却明明存着。
+    //
+    // 昵称/头像是装饰:取不到就发 sender=null,客户端仍有 senderID 可用。
+    // 用降级换投递,而不是用投递换完整性。
+    let sender: ChatSenderInfo | null = null;
+    try {
+      sender =
+        (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
+    } catch (error) {
+      this.logger.warn(
+        `sender enrichment failed after commit message=${created.row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const message = this.toMessageDto(created.row, sender);
     // ack 与广播共用这份 DTO:媒体 key 在此签出 url(读路径,不落库)。
+    // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛。
     await this.media.attachMediaUrls([message]);
     return { message, reused: created.reused };
   }
@@ -347,6 +366,25 @@ export class ChatService {
       if (!blocked.has(row.userID)) allowed.add(row.userID);
     }
     return [...allowed];
+  }
+
+  /**
+   * 与该用户存在拉黑关系的对端(双向)。
+   *
+   * 上下线广播要拿它把这些人从收件面里剔掉:拉黑不动 ChatMember,座位一直在,
+   * 不剔的话拉黑双方会持续互相收到在线状态推送 —— 查询侧已经收口了
+   * (filterVisiblePresenceTargets),广播侧不收口等于换个通道免费送同一份信息。
+   */
+  async listBlockedCounterparties(userId: string): Promise<string[]> {
+    const rows = await this.prisma.block.findMany({
+      where: { OR: [{ blockerID: userId }, { blockedID: userId }] },
+      select: { blockerID: true, blockedID: true },
+    });
+    const out = new Set<string>();
+    for (const row of rows) {
+      out.add(row.blockerID === userId ? row.blockedID : row.blockerID);
+    }
+    return [...out];
   }
 
   /** 连接建立时的房间派生:该用户所有在座会话的 id。 */
@@ -569,13 +607,20 @@ export class ChatService {
     beforeHeight?: number,
     limit: number = HISTORY_PAGE_DEFAULT,
     filters: HistoryFilters = {},
+    options: { applyViewerRetention?: boolean } = {},
   ): Promise<ChatHistoryPageDto> {
     await this.requireMembership(conversationId, userId);
     const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
     // 自动销毁窗口:拆栈前由 chat-history.service 负责,自研栈落地时漏掉了 ——
     // 设置在库里、UI 上也能改,但读取路径根本不看它,用户以为过期的消息其实
     // 一直在。收在 where 里而不是取回来再 filter:后者会让分页数不准。
-    const cutoff = await this.selfDestructCutoff(userId);
+    // 访客(临时房)没有 User 行,查隐私设置只会拿到 2 天的默认值 —— 而临时房
+    // 本身可以开 3 天甚至 7 天,于是活着的房间里超过 2 天的消息对访客凭空消失,
+    // 他还没有任何地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
+    const cutoff =
+      options.applyViewerRetention === false
+        ? null
+        : await this.selfDestructCutoff(userId);
     const where: Prisma.ChatMessageWhereInput = {
       conversationID: conversationId,
       deleted: false,

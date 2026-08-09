@@ -196,6 +196,22 @@ describe('ChatCircleSyncService', () => {
     });
   });
 
+  // 对账的 toRemove 只挑「座位仍 leftAt=null 却已不在 ACTIVE 名单」的人,而
+  // releaseSeatInTx 在事务里就把 leftAt 置好了 —— 等对账跑到时已不满足条件;
+  // 何况 CircleMember 行已被删除,updatedAt 窗口根本扫不到这个圈子。结果就是
+  // 真实的退群/踢人一条提示都没有。提示必须由删除钩子自己补。
+  it('emits a member-left notice when a deletion hook releases a seat', () => {
+    service.detachSeat('u1', 'conv-1');
+
+    expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
+    expect(broadcast.removeUserFromConversation).toHaveBeenCalledWith(
+      'u1',
+      'conv-1',
+    );
+  });
+
   it('is a no-op returning null for a missing circle', async () => {
     prisma.circle.findUnique.mockResolvedValue(null);
     await expect(service.ensureCircleConversation('gone')).resolves.toBeNull();

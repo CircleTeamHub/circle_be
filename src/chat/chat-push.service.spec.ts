@@ -176,4 +176,25 @@ describe('ChatPushService', () => {
     await service.onMessageBroadcast(msg());
     expect(push.sendToTokens).not.toHaveBeenCalled();
   });
+
+  // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
+  // 整体故障时 dispatch 照样"成功"返回,外层失败日志一次都不触发 —— 整场扇出
+  // 静默蒸发,运维侧没有任何信号。
+  it('logs a bounded summary when every recipient fails', async () => {
+    prisma.chatMember.findMany.mockResolvedValueOnce([
+      { id: 's1', userID: 'u2', muted: false },
+      { id: 's2', userID: 'u3', muted: false },
+    ]);
+    push.listActiveTokens.mockRejectedValue(new Error('provider down'));
+    const logger = { warn: jest.fn(), error: jest.fn(), log: jest.fn() };
+    (service as any).logger = logger;
+
+    await service.onMessageBroadcast(msg());
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('2/2 recipients failed'),
+    );
+    // 3000 人的群失败不能刷 3000 行:只汇总一条。
+    expect(logger.error).toHaveBeenCalledTimes(1);
+  });
 });

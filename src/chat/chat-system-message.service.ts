@@ -143,6 +143,14 @@ export class ChatSystemMessageService {
           where: { id: conversationId },
           data: { lastMessageAt: created.createdAt },
         });
+        // 新消息让隐藏的会话重新浮出 —— 与客户端发送、insertServerMessage 同一
+        // 语义(微信式)。漏掉这一步的话:用户 swipe 隐藏了群,之后的进/退群提示
+        // 照常落库并计入未读,但会话本身不回到 GET /chat/conversations 里,
+        // 表现为"有未读却找不到会话"。
+        await tx.chatMember.updateMany({
+          where: { conversationID: conversationId, hiddenAt: { not: null } },
+          data: { hiddenAt: null },
+        });
         return created;
       });
 

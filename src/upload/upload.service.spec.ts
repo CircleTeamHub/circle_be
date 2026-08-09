@@ -470,4 +470,56 @@ describe('UploadService', () => {
     expect(service.objectKeyFromPublicUrl(null)).toBeNull();
     expect(service.objectKeyFromPublicUrl(undefined)).toBeNull();
   });
+
+  // 自研聊天接受 voice / file 消息,并要求它们带 chat/{userId}/ 的 object key ——
+  // 而唯一能签出这种 key 的 presign 此前只放行 image/video:这两个"已支持"的
+  // 消息类型在拿到上传授权之前就被拒了,实际根本发不出去。
+  it('presigns voice and document uploads for the chat folder', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: privateMinioUrl,
+          MINIO_ACCESS_KEY: 'ak',
+          MINIO_SECRET_KEY: 'sk',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: privateMinioUrl,
+        })[key],
+    } as never);
+    (service as any).enabled = true;
+    (service as any).ready = true;
+    jest.mocked(getSignedUrl).mockResolvedValue('https://signed.example/put');
+
+    await expect(
+      service.presign('note.m4a', 'audio/mp4', 1024, 'chat', 'user-1'),
+    ).resolves.toMatchObject({ key: expect.stringContaining('chat/user-1/') });
+    await expect(
+      service.presign('spec.pdf', 'application/pdf', 1024, 'chat', 'user-1'),
+    ).resolves.toMatchObject({ key: expect.stringContaining('chat/user-1/') });
+  });
+
+  // DTO 的白名单是全局的:只放宽它等于让头像/封面/圈子帖目录也能收 pdf、zip。
+  // 目录收口必须在 service 里再做一次。
+  it.each(['avatars', 'posts', 'notes', 'friends'])(
+    'refuses chat-only content types in the %s folder',
+    async (folder) => {
+      const service = new UploadService({
+        get: (key: string) =>
+          ({
+            MINIO_ENDPOINT: privateMinioUrl,
+            MINIO_ACCESS_KEY: 'ak',
+            MINIO_SECRET_KEY: 'sk',
+            MINIO_BUCKET: 'circle',
+            MINIO_PUBLIC_URL: privateMinioUrl,
+          })[key],
+      } as never);
+      (service as any).enabled = true;
+      (service as any).ready = true;
+
+      await expect(
+        service.presign('x.pdf', 'application/pdf', 1024, folder, 'user-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'UPLOAD_INVALID_CONTENT_TYPE' },
+      });
+    },
+  );
 });

@@ -30,7 +30,18 @@ export const conversationRoom = (conversationId: string): string =>
  */
 export const CHAT_ADVISORY_LOCK_NS = 7301;
 
-/** 客户端可发送的消息类型;'system' 只能由服务端产生(防伪造)。 */
+/**
+ * 客户端可发送的消息类型。
+ *
+ * 判据是「这条消息断言的事实,服务端能不能替它背书」:
+ * 分享类卡片(笔记/好友/圈子/广场帖)只是一个指针,收件人点开时会自己去取真值,
+ * 伪造它顶多是发了条无效链接;而回执类卡片断言的是**已经发生过的服务端事实**
+ * (钱已划走、身份已核验、通话已结束),客户端能发就等于能凭空捏造这些事实。
+ *
+ * 所以回执类一律放进 SERVER_MESSAGE_TYPES:transfer-card 由 GiftCardOutboxProcessor
+ * 在结算之后签发,call-record 由 CallService 在通话结束后签发,verification-card
+ * 同理(目前没有生产者,但语义属同一类,先按服务端专属收口,免得日后接线时漏掉)。
+ */
 export const CLIENT_MESSAGE_TYPES = [
   'text',
   'quote',
@@ -41,12 +52,22 @@ export const CLIENT_MESSAGE_TYPES = [
   'note-card',
   'friend-card',
   'circle-card',
-  'transfer-card',
-  'verification-card',
   'plaza-post-card',
 ] as const;
 
 export const SYSTEM_MESSAGE_TYPE = 'system';
+
+/**
+ * 只能由服务端写入的消息类型 —— 客户端发这些一律拒。
+ * 这些类型都经 ChatSystemMessageService.insertServerMessage 落库,该方法不走
+ * validateSendPayload,因此不受本清单限制。
+ */
+export const SERVER_MESSAGE_TYPES: readonly string[] = [
+  SYSTEM_MESSAGE_TYPE,
+  'transfer-card',
+  'verification-card',
+  'call-record',
+];
 
 /** 携带 object key 的媒体消息类型(读路径由 ChatMediaService 补签名 URL)。 */
 export const MEDIA_MESSAGE_TYPES: readonly string[] = [

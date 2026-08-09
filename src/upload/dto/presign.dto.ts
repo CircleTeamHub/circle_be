@@ -9,7 +9,8 @@ import {
   Min,
 } from 'class-validator';
 
-const ALLOWED_CONTENT_TYPES = [
+// 图片/视频:所有目录通用。
+const VISUAL_CONTENT_TYPES = [
   'image/jpeg',
   'image/png',
   'image/webp',
@@ -19,6 +20,43 @@ const ALLOWED_CONTENT_TYPES = [
   'video/mp4',
   'video/quicktime', // .mov
   'video/x-m4v',
+];
+
+/**
+ * 语音与文件:**只对 chat 目录开放**(UploadService.presign 按目录二次收口)。
+ *
+ * 自研聊天协议接受 voice / file 两种消息类型,并要求它们携带 chat/{userId}/ 的
+ * object key —— 而唯一能签出这种 key 的 POST /upload/presign 此前只放行
+ * image/video,于是一段 audio/mp4 录音或一个 pdf 在拿到上传授权之前就被 DTO 拒了:
+ * 这两个"已支持"的消息类型实际根本发不出去。
+ *
+ * 不能直接并进通用清单:那等于头像、封面、圈子帖目录也能上传 pdf/可执行体。
+ */
+const CHAT_ONLY_CONTENT_TYPES = [
+  // 语音:iOS 录 m4a(audio/mp4)、Android 多为 aac/ogg,webm 来自 Web 端。
+  'audio/mp4',
+  'audio/m4a',
+  'audio/aac',
+  'audio/mpeg',
+  'audio/ogg',
+  'audio/webm',
+  'audio/wav',
+  // 文件:常见办公与压缩格式,刻意不含任何可执行/脚本类型。
+  'application/pdf',
+  'application/zip',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'text/plain',
+];
+
+export const CHAT_ONLY_UPLOAD_TYPES: readonly string[] =
+  CHAT_ONLY_CONTENT_TYPES;
+
+const ALLOWED_CONTENT_TYPES = [
+  ...VISUAL_CONTENT_TYPES,
+  ...CHAT_ONLY_CONTENT_TYPES,
 ];
 
 const ALLOWED_FOLDERS = [

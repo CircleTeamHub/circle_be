@@ -38,18 +38,23 @@ describe('FriendChatReplayOutboxProcessor', () => {
       },
     };
     const chatService = {
-      getOrCreateDirectConversation: jest
+      // 回放走结算专用解析(不过拉黑/陌生人闸):申请已被接受,这些是既成事实的补投。
+      ensureDirectConversationForSettlement: jest
         .fn()
-        .mockResolvedValue({ id: 'conv-1' }),
+        .mockResolvedValue('conv-1'),
     };
     const chatMessages = {
       insertServerMessage: jest.fn().mockResolvedValue(undefined),
     };
 
+    const sensitiveWords = {
+      check: jest.fn().mockReturnValue({ blocked: false }),
+    };
     const processor = new FriendChatReplayOutboxProcessor(
       prisma as any,
       chatService as any,
       chatMessages as any,
+      sensitiveWords as any,
     );
 
     await processor.processPending();
@@ -122,8 +127,9 @@ describe('FriendChatReplayOutboxProcessor', () => {
     };
     const processor = new FriendChatReplayOutboxProcessor(
       prisma as any,
-      { getOrCreateDirectConversation: jest.fn() } as any,
+      { ensureDirectConversationForSettlement: jest.fn() } as any,
       { insertServerMessage: jest.fn() } as any,
+      { check: jest.fn().mockReturnValue({ blocked: false }) } as any,
     );
 
     await processor.processPending();

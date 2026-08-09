@@ -77,14 +77,34 @@ export class ChatPushService {
     const payload = await this.composePayload(message, conversation);
     // 分批并发发送:扩容后的圈子可到 3000 人,一次性 allSettled 三千个
     // listActiveTokens 会把连接池和推送供应商同时打满。
+    let failed = 0;
+    let firstError: string | null = null;
     for (let i = 0; i < targets.length; i += PUSH_SEND_CONCURRENCY) {
       const batch = targets.slice(i, i + PUSH_SEND_CONCURRENCY);
-      await Promise.allSettled(
+      const settled = await Promise.allSettled(
         batch.map(async (seat) => {
           const tokens = await this.push.listActiveTokens(seat.userID);
           if (tokens.length === 0) return;
           await this.push.sendToTokens(tokens, payload);
         }),
+      );
+      // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
+      // 整体故障时这里照样"成功"返回,外层的失败日志一次都不会触发 —— 整场扇出
+      // 静默蒸发,而运维侧没有任何信号。逐批统计,最后汇总一条。
+      for (const outcome of settled) {
+        if (outcome.status !== 'rejected') continue;
+        failed += 1;
+        firstError ??=
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : String(outcome.reason);
+      }
+    }
+    if (failed > 0) {
+      // 只记数量与首条原因,不逐条刷屏(3000 人的群失败就是 3000 行)。
+      const level = failed === targets.length ? 'error' : 'warn';
+      this.logger[level](
+        `chat push fanout: ${failed}/${targets.length} recipients failed message=${message.id} firstError=${firstError}`,
       );
     }
   }

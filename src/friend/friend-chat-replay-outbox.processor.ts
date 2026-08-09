@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 
 const REPLAY_BATCH_SIZE = 20;
 const REPLAY_STALE_LOCK_MS = 5 * 60 * 1000;
@@ -30,6 +31,7 @@ export class FriendChatReplayOutboxProcessor {
     private readonly prisma: PrismaService,
     private readonly chatService: ChatService,
     private readonly chatMessages: ChatSystemMessageService,
+    private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -106,6 +108,8 @@ export class FriendChatReplayOutboxProcessor {
 
       if (stage === 2) {
         const replay = thread ?? [];
+        // 会话解析提到循环外:原来每条消息都重解析一次,N 条就是 N 次多余查询。
+        const conversationId = await this.replayConversationId(job);
         if (replay.length > 0) {
           for (
             let index = job.messageIndex;
@@ -113,12 +117,20 @@ export class FriendChatReplayOutboxProcessor {
             index += 1
           ) {
             const message = replay[index];
-            const conversation =
-              await this.chatService.getOrCreateDirectConversation(
-                job.requesterUserID,
-                job.accepterUserID,
-              );
-            await this.chatMessages.insertServerMessage(conversation.id, {
+            // 申请线程里的文本是**用户写的**,而 insertServerMessage 是特权原语、
+            // 不过敏感词。不拦的话:把违禁词写进好友申请,等对方一通过,它就以
+            // 普通聊天消息的身份落库并广播 —— 同样的话走 socket 发会被直接拒。
+            // 好友申请创建处也没有这道校验,所以这里是唯一的关卡。
+            if (this.isBlockedText(message.content, job.requestId)) {
+              job.messageIndex = index + 1;
+              await this.persistProgress(job.id, leaseToken, {
+                stage: 2,
+                messageIndex: job.messageIndex,
+                lockedAt: new Date(),
+              });
+              continue;
+            }
+            await this.chatMessages.insertServerMessage(conversationId, {
               senderID: message.senderId,
               type: 'text',
               content: { text: message.content },
@@ -133,17 +145,15 @@ export class FriendChatReplayOutboxProcessor {
           }
         } else {
           const greeting = request?.message?.trim() || `我是${requesterName}`;
-          const conversation =
-            await this.chatService.getOrCreateDirectConversation(
-              job.requesterUserID,
-              job.accepterUserID,
-            );
-          await this.chatMessages.insertServerMessage(conversation.id, {
-            senderID: job.requesterUserID,
-            type: 'text',
-            content: { text: greeting },
-            clientMessageId: `friend-request:${job.requestId}:greeting`,
-          });
+          // 同上:招呼语来自申请人。兜底文案「我是{昵称}」里的昵称也是用户可控的。
+          if (!this.isBlockedText(greeting, job.requestId)) {
+            await this.chatMessages.insertServerMessage(conversationId, {
+              senderID: job.requesterUserID,
+              type: 'text',
+              content: { text: greeting },
+              clientMessageId: `friend-request:${job.requestId}:greeting`,
+            });
+          }
         }
         stage = 3;
         await this.persistProgress(job.id, leaseToken, {
@@ -153,12 +163,9 @@ export class FriendChatReplayOutboxProcessor {
       }
 
       if (stage === 3) {
-        const conversation =
-          await this.chatService.getOrCreateDirectConversation(
-            job.accepterUserID,
-            job.requesterUserID,
-          );
-        await this.chatMessages.insertServerMessage(conversation.id, {
+        // ACCEPTED_REPLY 是服务端常量,不过敏感词。
+        const conversationId = await this.replayConversationId(job);
+        await this.chatMessages.insertServerMessage(conversationId, {
           senderID: job.accepterUserID,
           type: 'text',
           content: { text: ACCEPTED_REPLY },
@@ -216,6 +223,40 @@ export class FriendChatReplayOutboxProcessor {
           60_000 * 2 ** Math.max(0, attempts - 1),
         ),
     );
+  }
+
+  /**
+   * 回放用的单聊会话 id —— 走结算专用解析,不过拉黑/陌生人消息两道闸。
+   *
+   * 那两道是给用户主动发消息设的。好友申请**已经被接受**,这些消息是既成事实
+   * 的补投:任一方在接受之后、回放跑完之前拉黑,交互式路径会让整个 outbox 作业
+   * 永久失败,申请线程一条都补不出来。与转账卡补偿、通话留痕同一条判据。
+   */
+  private replayConversationId(job: {
+    requesterUserID: string;
+    accepterUserID: string;
+  }): Promise<string> {
+    return this.chatService.ensureDirectConversationForSettlement(
+      job.requesterUserID,
+      job.accepterUserID,
+    );
+  }
+
+  /**
+   * 命中敏感词的回放文本一律丢弃(不落库、不广播),并记一条。
+   *
+   * 不能像正常发送那样"拒绝"——申请早就被接受了,没有可以回报错误的调用方;
+   * 也不该原样放行:那等于给了一条绕过敏感词的通道。丢弃与 socket 发送路径
+   * 的判定一致(同样的话走 socket 会被直接拒),只是时机不同。
+   */
+  private isBlockedText(text: string, requestId: string): boolean {
+    const verdict = this.sensitiveWords.check(text);
+    if (!verdict.blocked) return false;
+    // 只记请求 id 与命中的词,不记正文。
+    this.logger.warn(
+      `friend-request replay dropped a message containing a blocked word (request=${requestId}, word=${verdict.word})`,
+    );
+    return true;
   }
 
   private displayName(

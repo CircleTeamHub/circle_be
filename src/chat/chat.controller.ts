@@ -13,6 +13,7 @@ import {
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
+import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatService } from './chat.service';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
@@ -33,7 +34,8 @@ import type {
  * 实时收发走 /chat-ws socket;这里只承担冷路径(打开 App 时的全量拉取)。
  */
 @Controller('chat')
-@UseGuards(JwtGuard, ThrottlerGuard)
+// AppAudienceGuard:聊天是普通用户能力,管理台的 ADMIN token 不该能收发消息。
+@UseGuards(JwtGuard, AppAudienceGuard, ThrottlerGuard)
 @ApiTags('Chat')
 @ApiBearerAuth()
 export class ChatController {

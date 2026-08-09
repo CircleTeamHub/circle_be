@@ -85,16 +85,29 @@ export class ChatBroadcastService {
     }
   }
 
-  /** 上/下线广播到其全部会话房(会话成员可见,与消息可见面一致)。 */
+  /**
+   * 上/下线广播到其全部会话房(会话成员可见,与消息可见面一致)。
+   *
+   * excludeUserIds:与之互相拉黑的人。拉黑不动 ChatMember,座位照旧留着,
+   * 所以不排除的话,拉黑双方仍会持续收到对方的上下线事件 —— 查询侧已经按
+   * 拉黑收口了(filterVisiblePresenceTargets),广播侧不收口等于把同一份信息
+   * 换个通道免费送出去,而且是推的、连轮询都不用。
+   *
+   * 每个用户都在自己的 u:{userId} 房里,所以用 except 一次覆盖单聊与群聊:
+   * 单聊房里对端被排除即无人可收,群聊房里只少发给被拉黑的那几个人。
+   */
   emitPresence(
     conversationIds: string[],
     payload: { userId: string; online: boolean },
+    excludeUserIds: readonly string[] = [],
   ): void {
     const server = this.requireServer('emitPresence');
     if (!server || conversationIds.length === 0) return;
-    server
-      .to(conversationIds.map(conversationRoom))
-      .emit(CHAT_EVENTS.presence, payload);
+    const target = server.to(conversationIds.map(conversationRoom));
+    const scoped = excludeUserIds.length
+      ? target.except(excludeUserIds.map(userRoom))
+      : target;
+    scoped.emit(CHAT_EVENTS.presence, payload);
   }
 
   /** 定向下发(如会话新建/成员变更时通知个人房)。 */

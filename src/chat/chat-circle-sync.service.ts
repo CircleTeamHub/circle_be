@@ -282,8 +282,15 @@ export class ChatCircleSyncService {
   }
 
   /**
-   * 事务提交后把 socket 踢出会话房。尽力而为:失败也只是这一条连接还留在房里,
-   * 座位已经是 leftAt(发送与拉历史都会被 requireMembership 拒),重连即归位。
+   * 事务提交后:把 socket 踢出会话房,并补一条「有成员退出群聊」的系统提示。
+   *
+   * 提示必须在这里发。对账里的 toRemove 只挑「座位仍是 leftAt=null 却已不在
+   * ACTIVE 名单」的人,而 releaseSeatInTx 在事务里就把 leftAt 置好了 ——
+   * 等对账跑到时它已经不满足条件;何况 CircleMember 行本身已被删除,对账的
+   * updatedAt 窗口根本扫不到这个圈子。结果就是:真实的退群/踢人一条提示都没有,
+   * 只有对账自己发现的差异才会提示,而那条路径实际上永远走不到。
+   *
+   * 两件事都是尽力而为:座位状态已经落库,提示丢了只是少一行灰字。
    */
   detachSeat(userId: string, conversationId: string): void {
     void this.broadcast
@@ -291,6 +298,15 @@ export class ChatCircleSyncService {
       .catch((error: unknown) =>
         this.logger.warn(
           `detach seat failed user=${userId} conversation=${conversationId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+    void this.systemMessage
+      .emit(conversationId, { kind: 'member-left' })
+      .catch((error: unknown) =>
+        this.logger.warn(
+          `member-left notice failed conversation=${conversationId}: ${
             error instanceof Error ? error.message : String(error)
           }`,
         ),
