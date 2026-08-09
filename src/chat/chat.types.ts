@@ -73,6 +73,27 @@ export interface ChatTypingBroadcast {
   userId: string;
 }
 
+/**
+ * chat:conversation 的变化种类:
+ * - joined:本人入座(被拉进群/入圈获批/开圈聊播种)
+ * - left:本人主动退出(通知同账号其它设备收走会话)
+ * - removed:本人被移出(踢人/解散/停用/对账收敛)
+ * - updated:会话元数据变化(预留,当前无生产方)
+ */
+export type ChatConversationChangeKind =
+  | 'joined'
+  | 'left'
+  | 'removed'
+  | 'updated';
+
+/** chat:conversation 服务端定向下发(个人房):接收者本人的会话成员关系变化。 */
+export interface ChatConversationBroadcast {
+  kind: ChatConversationChangeKind;
+  conversationId: string;
+  /** 变化的成员即接收者本人;冗余带上便于客户端校验与多端复用。 */
+  userId: string;
+}
+
 /** 会话成员 DTO(GET /chat/conversations/:id/members)。role 仅 GROUP 有值。 */
 export interface ChatMemberDto {
   userId: string;

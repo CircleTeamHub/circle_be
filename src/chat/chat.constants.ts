@@ -14,6 +14,8 @@ export const CHAT_EVENTS = {
   message: 'chat:msg',
   /** 双向:在线状态(客户端带 ack 查询;服务端上下线广播) */
   presence: 'chat:presence',
+  /** 服务端 → 客户端(个人房定向):接收者本人的会话成员关系变化 */
+  conversation: 'chat:conversation',
 } as const;
 
 /** 个人房:登录即加入,用于跨会话的定向推送。 */

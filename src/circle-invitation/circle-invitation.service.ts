@@ -15,6 +15,7 @@ import {
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -77,7 +78,24 @@ export class CircleInvitationService {
     private readonly notificationService: NotificationService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
+    private readonly chatCircleSync: ChatCircleSyncService,
   ) {}
+
+  /**
+   * 激活提交后立刻触发一次幂等座位同步,新成员不必等 ≤1min 的对账才拿到
+   * 会话与消息。失败只记日志:每分钟对账本来就是这条路径的兜底。
+   */
+  private syncCircleSeatsSoon(circleID: string): void {
+    void this.chatCircleSync
+      .ensureCircleConversation(circleID)
+      .catch((error) =>
+        this.logger.warn(
+          `post-admission seat sync failed circle=${circleID}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+  }
 
   async invite(
     inviterId: string,
@@ -412,14 +430,13 @@ export class CircleInvitationService {
         [updatedInvitation.applicantID],
         { locksHeld: true, actor: 'third-party' },
       );
-      if (updatedInvitation.circle.groupID) {
-      }
 
       return {
         admission:
           admitted.length > 0
             ? {
                 applicantId: updatedInvitation.applicantID,
+                circleID: updatedInvitation.circleID,
                 groupID: updatedInvitation.circle.groupID,
               }
             : null,
@@ -432,6 +449,10 @@ export class CircleInvitationService {
         },
       };
     });
+
+    if (result.admission) {
+      this.syncCircleSeatsSoon(result.admission.circleID);
+    }
 
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
@@ -535,14 +556,13 @@ export class CircleInvitationService {
         [pendingInvitation.applicantID],
         { locksHeld: true, actor: 'third-party' },
       );
-      if (pendingInvitation.circle.groupID) {
-      }
 
       return {
         admission:
           admitted.length > 0
             ? {
                 applicantId: pendingInvitation.applicantID,
+                circleID: pendingInvitation.circleID,
                 groupID: pendingInvitation.circle.groupID,
               }
             : null,
@@ -555,6 +575,10 @@ export class CircleInvitationService {
         },
       };
     });
+
+    if (result.admission) {
+      this.syncCircleSeatsSoon(result.admission.circleID);
+    }
 
     const notificationTarget = await this.prisma.circleInvitation.findUnique({
       where: { id: invitationId },
@@ -629,8 +653,6 @@ export class CircleInvitationService {
             [invitation.applicantID],
             { locksHeld: true },
           );
-          if (invitation.circle.groupID) {
-          }
           return {
             admitted: admitted.length > 0,
             applicantId: invitation.applicantID,
@@ -647,6 +669,9 @@ export class CircleInvitationService {
         });
         if (!result) continue;
         finalizedCount += 1;
+        if (result.admitted) {
+          this.syncCircleSeatsSoon(result.circleId);
+        }
         await this.createAndBroadcastInvitationNotification(
           result.notificationData,
         );

@@ -45,7 +45,11 @@ describe('GroupService reportGroup', () => {
     activateMembers: jest.Mock;
   };
   let memberLock: { lock: jest.Mock };
-  let chatCircleSync: { releaseSeatInTx: jest.Mock; detachSeat: jest.Mock };
+  let chatCircleSync: {
+    releaseSeatInTx: jest.Mock;
+    detachSeat: jest.Mock;
+    ensureCircleConversation: jest.Mock;
+  };
   let service: GroupService;
 
   beforeEach(() => {
@@ -88,6 +92,7 @@ describe('GroupService reportGroup', () => {
     chatCircleSync = {
       releaseSeatInTx: jest.fn().mockResolvedValue(null),
       detachSeat: jest.fn(),
+      ensureCircleConversation: jest.fn().mockResolvedValue('conv-1'),
     };
     service = new GroupService(
       prisma as any,
@@ -620,6 +625,62 @@ describe('GroupService reportGroup', () => {
     expect(prisma.circleMember.updateMany).not.toHaveBeenCalled();
   });
 
+  it('triggers an immediate seat sync after invite activation instead of waiting for the cron', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.circle.findUnique.mockResolvedValue({
+      maxMembers: null,
+      memberCount: 5,
+    });
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      }),
+    ).resolves.toEqual({ handled: true });
+
+    // 被拉进群的人不该等 ≤1min 的对账才拿到座位/收到消息。
+    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+      'circle-1',
+    );
+  });
+
+  it('skips the invite seat sync when nobody was actually activated', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.ADMIN,
+      status: CircleMemberStatus.ACTIVE,
+    });
+    prisma.circleMember.findMany.mockResolvedValue([]);
+    prisma.circle.findUnique.mockResolvedValue({
+      maxMembers: null,
+      memberCount: 5,
+    });
+    admissionPolicy.activateMembers.mockResolvedValueOnce([]);
+
+    await expect(
+      service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      }),
+    ).resolves.toEqual({ handled: true });
+
+    expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+  });
+
   it('rejects circle group invites blocked by the target privacy setting', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -876,6 +937,7 @@ describe('GroupService reportGroup', () => {
     expect(chatCircleSync.detachSeat).toHaveBeenCalledWith(
       'target-user',
       'conversation-1',
+      'removed',
     );
   });
 

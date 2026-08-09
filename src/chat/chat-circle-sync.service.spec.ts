@@ -21,6 +21,7 @@ describe('ChatCircleSyncService', () => {
   const broadcast = {
     joinUserToConversation: jest.fn(),
     removeUserFromConversation: jest.fn(),
+    emitConversationChange: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
 
@@ -67,6 +68,17 @@ describe('ChatCircleSyncService', () => {
       'u1',
       'conv-1',
     );
+    // 被清座的人要收到个人事件,否则 UI 一直停在已解散的群里。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
@@ -122,6 +134,12 @@ describe('ChatCircleSyncService', () => {
       'u2',
       'conv-1',
     );
+    // 个人事件让会话即刻出现在列表里,不必等下一次全量拉取。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'joined',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
   });
 
   it('revives left seats and retires seats of members no longer active', async () => {
@@ -167,6 +185,17 @@ describe('ChatCircleSyncService', () => {
       'u2',
       'conv-1',
     );
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'joined',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    // 对账分不清主动退出还是被移出,统一按 removed 下发(UI 行为一致:移除会话)。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
   });
 
   // 落 schema 默认的 0 的话,新成员一进老群就背着全部历史的未读数(可能几万),
@@ -201,7 +230,7 @@ describe('ChatCircleSyncService', () => {
   // 何况 CircleMember 行已被删除,updatedAt 窗口根本扫不到这个圈子。结果就是
   // 真实的退群/踢人一条提示都没有。提示必须由删除钩子自己补。
   it('emits a member-left notice when a deletion hook releases a seat', () => {
-    service.detachSeat('u1', 'conv-1');
+    service.detachSeat('u1', 'conv-1', 'removed');
 
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',
@@ -210,6 +239,26 @@ describe('ChatCircleSyncService', () => {
       'u1',
       'conv-1',
     );
+    // 被踢者本人要立即收到 removed:socket 离房只是收不到消息,UI 还得靠这条收走会话。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+  });
+
+  it('tells the leaver own devices with kind left instead of removed', () => {
+    service.detachSeat('u1', 'conv-1', 'left');
+
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'left',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    // 群里其他人看到的灰条措辞不区分主动被动,保持 member-left。
+    expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
   });
 
   it('is a no-op returning null for a missing circle', async () => {

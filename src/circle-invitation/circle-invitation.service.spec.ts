@@ -6,6 +6,7 @@ import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
+import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -67,6 +68,7 @@ describe('CircleInvitationService', () => {
     activateMembers: jest.fn(),
   };
   const memberLock = { lock: jest.fn() };
+  const chatCircleSync = { ensureCircleConversation: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -75,6 +77,7 @@ describe('CircleInvitationService', () => {
     notificationService.createCircleInvitationNotification.mockReset();
     admissionPolicy.assertCanApply.mockResolvedValue(undefined);
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
+    chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -85,6 +88,7 @@ describe('CircleInvitationService', () => {
         { provide: NotificationService, useValue: notificationService },
         { provide: CircleAdmissionPolicy, useValue: admissionPolicy },
         { provide: CircleMemberLockService, useValue: memberLock },
+        { provide: ChatCircleSyncService, useValue: chatCircleSync },
       ],
     }).compile();
 
@@ -570,7 +574,10 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true, actor: 'third-party' },
     );
-    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
+    // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
+    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+      'circle-1',
+    );
   });
 
   it('uses the admission policy for admin-approved activation', async () => {
@@ -603,7 +610,10 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true, actor: 'third-party' },
     );
-    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
+    // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
+    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+      'circle-1',
+    );
   });
 
   it('uses the admission policy when reconciling a threshold-approved invitation', async () => {
@@ -630,7 +640,10 @@ describe('CircleInvitationService', () => {
       ['applicant-1'],
       { locksHeld: true },
     );
-    // 会话座位由 ChatCircleSync 对账收敛,本服务不再直写同步任务。
+    // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
+    expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+      'circle-1',
+    );
   });
 
   it('does not reactivate an applicant from a cancelled invitation', async () => {
@@ -651,6 +664,7 @@ describe('CircleInvitationService', () => {
     );
 
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
   });
 
   it('rejects admin approval when the locked admin was demoted', async () => {
@@ -676,6 +690,7 @@ describe('CircleInvitationService', () => {
     ]);
     expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
     expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
   });
 
   it('addVerifier sends a circle-verification interaction message', async () => {

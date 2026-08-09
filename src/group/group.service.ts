@@ -235,6 +235,7 @@ export class GroupService {
     );
 
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
+    let activatedCircleId: string | null = null;
     await runSerializableTransaction(this.prisma, async (tx) => {
       await this.memberLock.lock(tx, circle.id, [actorId, ...targetUserIDs]);
       const [actor, existingMemberships] = await Promise.all([
@@ -277,7 +278,21 @@ export class GroupService {
       if (activatingUserIDs.length === 0) {
         return;
       }
+      activatedCircleId = circle.id;
     });
+
+    // 座位不等对账:激活提交后立刻触发一次幂等 ensure(失败留给每分钟对账兜底)。
+    if (activatedCircleId) {
+      void this.chatCircleSync
+        .ensureCircleConversation(activatedCircleId)
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `invite seat sync failed circle=${activatedCircleId ?? ''}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
 
     return { handled: true };
   }
@@ -377,6 +392,7 @@ export class GroupService {
       this.chatCircleSync.detachSeat(
         normalizedTargetUserID,
         releasedConversationId,
+        'removed',
       );
     }
 
@@ -459,7 +475,7 @@ export class GroupService {
       }
     });
     if (leftConversationId) {
-      this.chatCircleSync.detachSeat(userId, leftConversationId);
+      this.chatCircleSync.detachSeat(userId, leftConversationId, 'left');
     }
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);

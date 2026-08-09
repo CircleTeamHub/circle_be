@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { Server } from 'socket.io';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
+  ChatConversationBroadcast,
   ChatMessageDto,
   ChatReadBroadcast,
   ChatTypingBroadcast,
@@ -115,6 +116,14 @@ export class ChatBroadcastService {
     const server = this.requireServer('emitToUser');
     if (!server) return;
     server.to(userRoom(userId)).emit(event, payload);
+  }
+
+  /** 本人会话成员关系变化(入座/退出/被移出) → 个人房定向。 */
+  emitConversationChange(
+    userId: string,
+    payload: ChatConversationBroadcast,
+  ): void {
+    this.emitToUser(userId, CHAT_EVENTS.conversation, payload);
   }
 
   /** 成员进群后把其在线 socket 拉入会话房(否则要重连才收得到消息)。 */

@@ -20,11 +20,13 @@ const DISABLED_ADMIN_STATES = new Set<string>([
 /**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
  *
- * 机制:幂等 ensure + 定时对账,不在 7 处 CircleMember 写点逐一埋钩子 ——
- * 主动触发只有两个:建圈后(circle.service 尽力而为调用)与前端开圈聊时
- * (POST /chat/conversations/circle);其余变更由每分钟的对账兜底
- * (CircleMember.updatedAt 窗口扫描,与 like-reconciliation 同款模式)。
- * 代价:踢人/退圈的座位收回最迟延后一个对账周期(≤1min),测试期可接受。
+ * 机制:幂等 ensure + 定时对账 + 两类主动触发:
+ * - 删除写点(踢人/退群/退圈)在事务内 releaseSeatInTx + 提交后 detachSeat ——
+ *   对账的 updatedAt 窗口永远看不见被删的行,这类只能靠钩子;
+ * - 激活写点(建圈/开圈聊/拉人进群/入圈获批)提交后尽力而为调 ensure,
+ *   新成员即刻入座;失败由每分钟对账兜底
+ *   (CircleMember.updatedAt 窗口扫描,与 like-reconciliation 同款模式)。
+ * 座位变化会经 chat:conversation 个人事件通知本人(见 ChatBroadcastService)。
  */
 @Injectable()
 export class ChatCircleSyncService {
@@ -223,6 +225,12 @@ export class ChatCircleSyncService {
             }`,
           ),
         );
+      // 个人事件:会话即刻出现在本人列表里,不必等下一次全量拉取。
+      this.broadcast.emitConversationChange(userID, {
+        kind: 'joined',
+        conversationId: result.conversationId,
+        userId: userID,
+      });
     }
     // 进/退群系统提示:初始建会话是存量播种,不逐人刷屏;之后的增量变化才提示。
     if (!result.created) {
@@ -242,6 +250,12 @@ export class ChatCircleSyncService {
             }`,
           ),
         );
+      // 对账分不清主动退出还是被移出,统一 removed(UI 行为一致:收走会话)。
+      this.broadcast.emitConversationChange(userID, {
+        kind: 'removed',
+        conversationId: result.conversationId,
+        userId: userID,
+      });
     }
     return result.conversationId;
   }
@@ -292,7 +306,18 @@ export class ChatCircleSyncService {
    *
    * 两件事都是尽力而为:座位状态已经落库,提示丢了只是少一行灰字。
    */
-  detachSeat(userId: string, conversationId: string): void {
+  detachSeat(
+    userId: string,
+    conversationId: string,
+    kind: 'left' | 'removed',
+  ): void {
+    // 个人事件先行:socket 离房只保证收不到新消息,UI 收走会话要靠这条。
+    // left 与 removed 的区别只在客户端文案(被移出才提示),行为一致。
+    this.broadcast.emitConversationChange(userId, {
+      kind,
+      conversationId,
+      userId,
+    });
     void this.broadcast
       .removeUserFromConversation(userId, conversationId)
       .catch((error: unknown) =>
@@ -342,6 +367,11 @@ export class ChatCircleSyncService {
             }`,
           ),
         );
+      this.broadcast.emitConversationChange(userID, {
+        kind: 'removed',
+        conversationId: conversation.id,
+        userId: userID,
+      });
     }
   }
 
