@@ -31,13 +31,6 @@ export const conversationRoom = (conversationId: string): string =>
   `c:${conversationId}`;
 
 /**
- * height 分配的咨询锁命名空间(pg_advisory_xact_lock 的第一个 int4)。
- * 第二个键用 hashtext(conversationID) —— 哈希碰撞只会让不同会话偶发地
- * 串行化一次分配,不影响正确性。
- */
-export const CHAT_ADVISORY_LOCK_NS = 7301;
-
-/**
  * 客户端可发送的消息类型。
  *
  * 判据是「这条消息断言的事实,服务端能不能替它背书」:

@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { Prisma } from 'src/generated/prisma';
-import { CHAT_ADVISORY_LOCK_NS, SYSTEM_MESSAGE_TYPE } from './chat.constants';
+import { SYSTEM_MESSAGE_TYPE } from './chat.constants';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import type { ChatMessageDto, ChatSenderInfo } from './chat.types';
@@ -45,7 +45,14 @@ export class ChatSystemMessageService {
     input: ServerMessageInput,
   ): Promise<ChatMessageDto> {
     const { row, reused } = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${conversationId}))`;
+      // G-05:与客户端发送同一把行锁、同一个计数器(两条发号路径必须一致,
+      // 否则并发下撞 (conversationID, height) 唯一约束)。
+      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (counter.length === 0) {
+        throw new Error(`conversation ${conversationId} not found`);
+      }
       if (input.clientMessageId && input.senderID) {
         const existing = await tx.chatMessage.findUnique({
           where: {
@@ -58,14 +65,11 @@ export class ChatSystemMessageService {
         });
         if (existing) return { row: existing, reused: true };
       }
-      const maxHeight = await tx.chatMessage.aggregate({
-        where: { conversationID: conversationId },
-        _max: { height: true },
-      });
+      const height = counter[0].nextHeight + 1;
       const row = await tx.chatMessage.create({
         data: {
           conversationID: conversationId,
-          height: (maxHeight._max.height ?? 0) + 1,
+          height,
           senderID: input.senderID,
           type: input.type,
           content: input.content as Prisma.InputJsonObject,
@@ -77,7 +81,7 @@ export class ChatSystemMessageService {
       });
       await tx.chatConversation.update({
         where: { id: conversationId },
-        data: { lastMessageAt: row.createdAt },
+        data: { nextHeight: height, lastMessageAt: row.createdAt },
       });
       await tx.chatMember.updateMany({
         where: { conversationID: conversationId, hiddenAt: { not: null } },
@@ -124,15 +128,17 @@ export class ChatSystemMessageService {
   ): Promise<void> {
     try {
       const row = await this.prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${conversationId}))`;
-        const maxHeight = await tx.chatMessage.aggregate({
-          where: { conversationID: conversationId },
-          _max: { height: true },
-        });
+        const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+          SELECT "nextHeight" FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        if (counter.length === 0) {
+          throw new Error(`conversation ${conversationId} not found`);
+        }
+        const height = counter[0].nextHeight + 1;
         const created = await tx.chatMessage.create({
           data: {
             conversationID: conversationId,
-            height: (maxHeight._max.height ?? 0) + 1,
+            height,
             senderID: null,
             type: SYSTEM_MESSAGE_TYPE,
             content: content as Prisma.InputJsonObject,
@@ -141,7 +147,7 @@ export class ChatSystemMessageService {
         });
         await tx.chatConversation.update({
           where: { id: conversationId },
-          data: { lastMessageAt: created.createdAt },
+          data: { nextHeight: height, lastMessageAt: created.createdAt },
         });
         // 新消息让隐藏的会话重新浮出 —— 与客户端发送、insertServerMessage 同一
         // 语义(微信式)。漏掉这一步的话:用户 swipe 隐藏了群,之后的进/退群提示

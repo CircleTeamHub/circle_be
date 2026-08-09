@@ -1849,6 +1849,9 @@ model ChatConversation {
   muteAllAt     DateTime?
   /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
   burnDurationSec Int?
+  /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
+  /// 迁移时必须回填成 MAX(height)，默认 0 会撞 (conversationID, height) 唯一约束。
+  nextHeight Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 

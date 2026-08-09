@@ -6,6 +6,7 @@ describe('ChatSystemMessageService', () => {
     chatConversation: { update: jest.fn() },
     chatMember: { updateMany: jest.fn() },
     $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(),
   };
   const broadcast = { emitMessage: jest.fn() };
@@ -23,6 +24,8 @@ describe('ChatSystemMessageService', () => {
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
     prisma.$executeRaw.mockResolvedValue(1);
+    // G-05:发号走会话行计数器(SELECT..FOR UPDATE),不再做聚合扫描。
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 7 }]);
     prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 7 } });
     prisma.chatMessage.create.mockResolvedValue({
       id: 'sys-1',

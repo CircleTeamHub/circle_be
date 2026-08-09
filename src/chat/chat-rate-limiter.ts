@@ -79,3 +79,39 @@ export class SlidingWindowRateLimiter {
     this.hits.set(key, recent);
   }
 }
+
+/**
+ * G-04 跨实例限流:Redis ZSET 滑动窗口(Lua 原子)为主,Redis 不可用时
+ * 回退到上面的每实例本地限流 —— 限流放宽 N 倍但仍有界,好过整条链路
+ * 因 Redis 故障拒绝服务。
+ */
+import type { RedisService } from 'src/redis/redis.service';
+
+export class DistributedRateLimiter {
+  private readonly local: SlidingWindowRateLimiter;
+
+  constructor(
+    private readonly name: string,
+    private readonly limit: number,
+    private readonly windowMs: number,
+    private readonly redis: RedisService,
+  ) {
+    this.local = new SlidingWindowRateLimiter(limit, windowMs);
+  }
+
+  async tryAcquire(key: string): Promise<boolean> {
+    const verdict = await this.redis.slidingWindowAcquire(
+      `chat:rl:${this.name}:${key}`,
+      this.limit,
+      this.windowMs,
+      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+    );
+    if (verdict === null) return this.local.tryAcquire(key);
+    return verdict;
+  }
+
+  /** 本地回退态的清理;Redis 侧靠 PEXPIRE 自清。 */
+  pruneExpired(key: string): void {
+    this.local.pruneExpired(key);
+  }
+}

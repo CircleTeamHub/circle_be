@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { Server } from 'socket.io';
+import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
   ChatConversationBroadcast,
@@ -18,6 +19,8 @@ import type {
 export class ChatBroadcastService {
   private readonly logger = new Logger(ChatBroadcastService.name);
   private server: Server | null = null;
+
+  constructor(private readonly presence: ChatPresenceRegistry) {}
 
   setServer(server: Server): void {
     this.server = server;
@@ -52,18 +55,26 @@ export class ChatBroadcastService {
     );
   }
 
-  /** 某用户当前是否有在线 socket(个人房占用判定)。 */
+  /**
+   * 某用户当前是否有在线 socket(个人房占用判定)。
+   * G-04:优先问跨实例注册表;Redis 不可用回退本实例 fetchSockets
+   * (多实例 + adapter 下 fetchSockets 是跨节点 RPC,大群里很贵)。
+   */
   async isUserOnline(userId: string): Promise<boolean> {
+    const viaRegistry = await this.presence.isOnline(userId);
+    if (viaRegistry !== null) return viaRegistry;
     const server = this.requireServer('isUserOnline');
     if (!server) return false;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
     return sockets.length > 0;
   }
 
-  /** 会话房内当前在线的 userId 集合(离线推送分流用)。 */
+  /** 会话房内当前在线的 userId 集合(离线推送分流用);注册表优先。 */
   async getOnlineUserIdsInConversation(
     conversationId: string,
   ): Promise<Set<string>> {
+    const viaRegistry = await this.presence.getOnlineUserIds(conversationId);
+    if (viaRegistry !== null) return new Set(viaRegistry);
     const server = this.requireServer('getOnlineUserIdsInConversation');
     if (!server) return new Set();
     const sockets = await server
@@ -141,6 +152,8 @@ export class ChatBroadcastService {
     userId: string,
     conversationId: string,
   ): Promise<void> {
+    // 注册表联动:座位变化时在线集合同步(内部会先确认该用户全局在线)。
+    void this.presence.conversationJoined(userId, conversationId);
     const server = this.requireServer('joinUserToConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
@@ -154,6 +167,7 @@ export class ChatBroadcastService {
     userId: string,
     conversationId: string,
   ): Promise<void> {
+    void this.presence.conversationLeft(userId, conversationId);
     const server = this.requireServer('removeUserFromConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();

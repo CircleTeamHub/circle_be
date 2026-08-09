@@ -20,7 +20,6 @@ import type {
   Prisma,
 } from 'src/generated/prisma';
 import {
-  CHAT_ADVISORY_LOCK_NS,
   CHAT_MEDIA_KEY_PREFIX,
   CLIENT_MESSAGE_ID_MAX_LENGTH,
   CLIENT_MESSAGE_TYPES,
@@ -211,10 +210,21 @@ export class ChatService {
         : payload.content
     ) as Prisma.InputJsonObject;
     const created = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${payload.conversationId}))`;
+      // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
+      // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
+      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
+        WHERE "id" = ${payload.conversationId} FOR UPDATE`;
+      if (counter.length === 0) {
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
       // 锁之后复查一遍。上面那几道是在锁外读的,和落库之间存在窗口:踢人、
       // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
-      // advisory lock 之后才是真正串行的位置,所以复查放在这里。
+      // 行锁之后才是真正串行的位置,所以复查放在这里 —— 且在取号之前,
+      // 被拒绝的发送不推进计数器,height 无空洞。
       await this.assertStillSendable(tx, payload.conversationId, senderUserId);
 
       const existing = await tx.chatMessage.findUnique({
@@ -230,11 +240,7 @@ export class ChatService {
         return { row: existing, reused: true };
       }
 
-      const maxHeight = await tx.chatMessage.aggregate({
-        where: { conversationID: payload.conversationId },
-        _max: { height: true },
-      });
-      const height = (maxHeight._max.height ?? 0) + 1;
+      const height = counter[0].nextHeight + 1;
 
       const row = await tx.chatMessage.create({
         data: {
@@ -247,9 +253,10 @@ export class ChatService {
           replyToID: payload.replyToId ?? null,
         },
       });
+      // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
       await tx.chatConversation.update({
         where: { id: payload.conversationId },
-        data: { lastMessageAt: row.createdAt },
+        data: { nextHeight: height, lastMessageAt: row.createdAt },
       });
       // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
       await tx.chatMember.updateMany({

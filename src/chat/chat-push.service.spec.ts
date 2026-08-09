@@ -47,28 +47,21 @@ describe('ChatPushService', () => {
     push.sendToTokens.mockResolvedValue([]);
   });
 
-  it('pages past the first batch instead of silently dropping members', async () => {
-    // 圈子扩容上限 3000:旧实现 take:200 会让绝大多数成员永远收不到推送。
-    const page = (offset: number, size: number) =>
-      Array.from({ length: size }, (_, i) => ({
-        id: `s${offset + i}`,
-        userID: `u${offset + i}`,
-        muted: false,
-      }));
-    prisma.chatMember.findMany
-      .mockResolvedValueOnce(page(0, 500))
-      .mockResolvedValueOnce(page(500, 500))
-      .mockResolvedValueOnce(page(1000, 120));
+  it('fetches every seat in one bounded query instead of paging (G-06)', async () => {
+    // 3000 人群从 6 次游标往返降到 1 次;上限 6000 只是失控兜底(触顶打 warn)。
+    const seats = Array.from({ length: 1120 }, (_, i) => ({
+      userID: `u${i}`,
+      muted: false,
+    }));
+    prisma.chatMember.findMany.mockResolvedValue(seats);
 
     await service.onMessageBroadcast(msg());
 
-    expect(prisma.chatMember.findMany).toHaveBeenCalledTimes(3);
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(1120);
-    // 第二页起要带游标,否则会一直重复取第一页。
-    expect(prisma.chatMember.findMany).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ cursor: { id: 's499' }, skip: 1 }),
+    expect(prisma.chatMember.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 6000 }),
     );
+    expect(push.listActiveTokens).toHaveBeenCalledTimes(1120);
   });
 
   it('pushes to offline unmuted members and excludes the sender in the query', async () => {

@@ -119,8 +119,9 @@ describe('ChatService', () => {
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
     prisma.circle.findMany.mockResolvedValue([]);
-    // loadLastMessages / loadUnreadCounts 现在是集合查询,默认「无行」。
-    prisma.$queryRaw.mockResolvedValue([]);
+    // 默认返回发号计数器行(G-05 行锁读)。列表类集合查询($queryRaw 复用同一 mock)
+    // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
     privacySettings.getSettings.mockResolvedValue({
       messageSelfDestructDays: 0,
@@ -161,6 +162,35 @@ describe('ChatService', () => {
   // 事务已提交,之后的富化只是装饰。抛出去的话 handleSend 既不广播也不推送,
   // 而客户端同 d 重发会命中幂等分支(刻意不广播)—— 一次瞬时的昵称查询失败
   // 就让这条消息对所有收件人永久消失,数据库里却存着。
+  // G-05:发号走会话行计数器(SELECT..FOR UPDATE 行锁),不再做聚合扫描;
+  // 复查与幂等判定在取号之前 —— 被拒/重发不烧号,height 无空洞无重复。
+  it('allocates height from the conversation counter under a row lock', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMessage.create.mockResolvedValue(createdRow);
+    prisma.chatConversation.update.mockResolvedValue({});
+
+    const result = await service.sendMessage('u1', sendPayload());
+
+    expect(result.reused).toBe(false);
+    expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ height: 4 }),
+      }),
+    );
+    // 计数器前进与 lastMessageAt 合并成同一条 UPDATE。
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          nextHeight: 4,
+          lastMessageAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
   it('still returns the message when post-commit sender enrichment fails', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findUnique.mockResolvedValue(null);
@@ -232,10 +262,10 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
-    it('persists with height = max + 1 and returns the dto', async () => {
+    it('persists with height = counter + 1 and returns the dto', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(null);
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 3 } });
+      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
       prisma.chatConversation.update.mockResolvedValue({});
 
@@ -261,8 +291,9 @@ describe('ChatService', () => {
       expect(prisma.chatConversation.update).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: 'conv-1' } }),
       );
-      // height 分配必须发生在会话级咨询锁之内。
-      expect(prisma.$executeRaw).toHaveBeenCalled();
+      // G-05:height 分配走会话行锁读(SELECT..FOR UPDATE),advisory lock 退役。
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
     });
 
     it('returns the existing row on clientMessageId replay without re-persisting', async () => {

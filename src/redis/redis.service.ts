@@ -511,6 +511,177 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * 供 socket.io redis-adapter 用的 pub/sub 客户端对(G-04 多实例广播)。
+   * pub 复用命令连接;sub 独立连接并纳入销毁清理。Redis 未配置/连不上返回 null,
+   * 调用方保持单实例语义。
+   */
+  async getAdapterClients(): Promise<{ pub: Redis; sub: Redis } | null> {
+    const pub = await this.getCommandClient();
+    if (!pub) return null;
+    const sub = this.createClient();
+    try {
+      await sub.connect();
+      this.subscriberClients.add(sub);
+      return { pub, sub };
+    } catch (error) {
+      this.recordCommandFailure('subscribe', error);
+      this.logger.warn(`Redis adapter sub failed: ${this.formatError(error)}`);
+      sub.disconnect();
+      return null;
+    }
+  }
+
+  /**
+   * 跨实例滑动窗口限流(ZSET + Lua 原子)。true=放行,false=超限,
+   * null=Redis 不可用(调用方回退每实例本地限流)。
+   */
+  async slidingWindowAcquire(
+    key: string,
+    limit: number,
+    windowMs: number,
+    member: string,
+  ): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('increment');
+      return null;
+    }
+    try {
+      const verdict = await client.eval(
+        [
+          "redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, tonumber(ARGV[1]) - tonumber(ARGV[2]))",
+          "if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end",
+          "redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])",
+          "redis.call('PEXPIRE', KEYS[1], ARGV[2])",
+          'return 1',
+        ].join('\n'),
+        1,
+        key,
+        String(Date.now()),
+        String(windowMs),
+        String(limit),
+        member,
+      );
+      return Number(verdict) === 1;
+    } catch (error) {
+      this.recordCommandFailure('increment', error);
+      this.logger.warn(
+        `Redis sliding window failed for ${key}: ${this.formatError(error)}`,
+      );
+      return null;
+    }
+  }
+
+  /** DECR 但不落到负数(计数器成对使用时防崩溃期错配)。null=不可用。 */
+  async decrementFloorZero(key: string): Promise<number | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('increment');
+      return null;
+    }
+    try {
+      const value = await client.eval(
+        [
+          "local v = redis.call('DECR', KEYS[1])",
+          "if v < 0 then redis.call('SET', KEYS[1], '0') return 0 end",
+          'return v',
+        ].join('\n'),
+        1,
+        key,
+      );
+      return Number(value);
+    } catch (error) {
+      this.recordCommandFailure('increment', error);
+      this.logger.warn(
+        `Redis decrement failed for ${key}: ${this.formatError(error)}`,
+      );
+      return null;
+    }
+  }
+
+  /** SADD + 续 TTL(集合级过期,崩溃遗留的幽灵成员随 key 一起过期自愈)。 */
+  async addToSet(
+    key: string,
+    member: string,
+    ttlSeconds: number,
+  ): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+    try {
+      await client.sadd(key, member);
+      await client.expire(key, ttlSeconds);
+      return true;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      return null;
+    }
+  }
+
+  async removeFromSet(key: string, member: string): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+    try {
+      await client.srem(key, member);
+      return true;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      return null;
+    }
+  }
+
+  async getSetMembers(key: string): Promise<string[] | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return null;
+    }
+    try {
+      return await client.smembers(key);
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      return null;
+    }
+  }
+
+  /** 只续期不改值(在线注册表的定时自愈)。 */
+  async touchTtl(key: string, ttlSeconds: number): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+    try {
+      await client.expire(key, ttlSeconds);
+      return true;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      return null;
+    }
+  }
+
+  /** 读普通计数键(chat:conn:* 在线连接数);key 不存在返回 0。null=不可用。 */
+  async getCounter(key: string): Promise<number | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return null;
+    }
+    try {
+      const raw = await client.get(key);
+      return raw === null ? 0 : Number(raw);
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      return null;
+    }
+  }
+
   createRateLimitStore(limiterName: string): Store | undefined {
     if (!this.isEnabled()) {
       return undefined;

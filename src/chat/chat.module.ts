@@ -15,6 +15,7 @@ import { ChatMediaService } from './chat-media.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
+import { ChatPresenceRegistry } from './chat-presence.registry';
 import { ChatService } from './chat.service';
 
 // PrismaService 与 SessionRevocationService 来自 @Global 模块(Prisma/Auth);
@@ -44,6 +45,7 @@ import { ChatService } from './chat.service';
     ChatPushService,
     ChatSystemMessageService,
     ChatBurnSweeperService,
+    ChatPresenceRegistry,
   ],
   exports: [
     ChatService,

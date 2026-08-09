@@ -47,8 +47,23 @@ describe('ChatGateway', () => {
   const chatPush = {
     onMessageBroadcast: jest.fn().mockResolvedValue(undefined),
   };
-  const redisService = { subscribePattern: jest.fn().mockResolvedValue(true) };
+  const redisService = {
+    subscribePattern: jest.fn().mockResolvedValue(true),
+    isEnabled: jest.fn().mockReturnValue(false),
+    // Redis 缺省:限流回退本地、注册表全 null、adapter 不挂 —— 单实例语义。
+    slidingWindowAcquire: jest.fn().mockResolvedValue(null),
+    getAdapterClients: jest.fn().mockResolvedValue(null),
+  };
   const configService = { get: jest.fn().mockReturnValue('guest-secret') };
+  const presence = {
+    registerSocket: jest.fn().mockResolvedValue(null),
+    registerConversations: jest.fn().mockResolvedValue(undefined),
+    socketDisconnected: jest.fn().mockResolvedValue(undefined),
+    conversationJoined: jest.fn().mockResolvedValue(undefined),
+    conversationLeft: jest.fn().mockResolvedValue(undefined),
+    getOnlineUserIds: jest.fn().mockResolvedValue(null),
+    isOnline: jest.fn().mockResolvedValue(null),
+  };
 
   const gateway = new ChatGateway(
     jwtService as never,
@@ -58,6 +73,7 @@ describe('ChatGateway', () => {
     chatPush as never,
     redisService as never,
     configService as never,
+    presence as never,
   );
 
   beforeEach(() => {

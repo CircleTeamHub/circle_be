@@ -21,8 +21,6 @@ const PREVIEW_MAX_LENGTH = 60;
  * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
  */
 const PUSH_TARGET_CAP = 6000;
-/** 座位翻页大小。 */
-const PUSH_SEAT_PAGE = 500;
 /** 单批并发的推送数,给连接池和推送供应商留背压。 */
 const PUSH_SEND_CONCURRENCY = 50;
 
@@ -110,40 +108,30 @@ export class ChatPushService {
   }
 
   /**
-   * 会话内除发送者外的全部在座成员(游标翻页跑完)。
-   * 原来是 take:200 且无排序:圈子扩容上限 3000,大群里绝大多数成员会被
-   * 静默跳过 —— 而且每次跳过的都是同一批(无序 = 由计划器决定),
-   * 那些人等于永久收不到新消息推送。
+   * G-06:一条查询捞全量座位(上限内),替掉 500/页的游标翻页 —— 3000 人群
+   * 从 6 次往返降到 1 次。在线/免打扰的过滤仍在内存做(在线集合来自
+   * Redis 注册表,免打扰要给 @提及穿透留口子)。
    */
   private async listSeats(
     conversationId: string,
     senderId: string | null,
   ): Promise<Array<{ userID: string; muted: boolean }>> {
-    const seats: Array<{ userID: string; muted: boolean }> = [];
-    let cursor: string | undefined;
-    for (;;) {
-      const page = await this.prisma.chatMember.findMany({
-        where: {
-          conversationID: conversationId,
-          leftAt: null,
-          ...(senderId ? { userID: { not: senderId } } : {}),
-        },
-        select: { id: true, userID: true, muted: true },
-        orderBy: { id: 'asc' },
-        take: PUSH_SEAT_PAGE,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      });
-      seats.push(...page.map((s) => ({ userID: s.userID, muted: s.muted })));
-      if (page.length < PUSH_SEAT_PAGE) return seats;
-      if (seats.length >= PUSH_TARGET_CAP) {
-        // 触顶记一条:静默截断会让「已推送全部成员」的假象留在日志里。
-        this.logger.warn(
-          `push seats hit the ${PUSH_TARGET_CAP} cap for conversation=${conversationId}; remainder skipped`,
-        );
-        return seats;
-      }
-      cursor = page[page.length - 1].id;
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        ...(senderId ? { userID: { not: senderId } } : {}),
+      },
+      select: { userID: true, muted: true },
+      take: PUSH_TARGET_CAP,
+    });
+    if (seats.length >= PUSH_TARGET_CAP) {
+      // 触顶记一条:静默截断会让「已推送全部成员」的假象留在日志里。
+      this.logger.warn(
+        `push seats hit the ${PUSH_TARGET_CAP} cap for conversation=${conversationId}; remainder skipped`,
+      );
     }
+    return seats;
   }
 
   private mentionedUserIds(message: ChatMessageDto): Set<string> {
