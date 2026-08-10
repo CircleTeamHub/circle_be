@@ -428,7 +428,10 @@ describe('ChatGateway', () => {
         kind: 'websocket',
       });
       expect(ack).toHaveBeenCalledWith(
-        expect.objectContaining({ ok: false, code: ChatErrorCode.InvalidPayload }),
+        expect.objectContaining({
+          ok: false,
+          code: ChatErrorCode.InvalidPayload,
+        }),
       );
       report.mockRestore();
     });

@@ -110,7 +110,11 @@ function safeErrorMessage(context: ErrorAggregationContext): string {
 function toSafeError(error: unknown, context: ErrorAggregationContext): Error {
   const message = safeErrorMessage(context);
   if (error && typeof error === 'object' && 'message' in error) {
-    const errorLike = error as { message?: unknown; name?: unknown; stack?: unknown };
+    const errorLike = error as {
+      message?: unknown;
+      name?: unknown;
+      stack?: unknown;
+    };
     const safe = new Error(message);
     const candidateName =
       typeof errorLike.name === 'string' ? errorLike.name : 'Error';
@@ -230,7 +234,8 @@ function sanitizeAutomaticEvent(event: unknown): unknown {
       'operation',
       'kind',
     ]) {
-      if (key in sourceTags) safeTags[key] = sanitizeEventValue(sourceTags[key], 0);
+      if (key in sourceTags)
+        safeTags[key] = sanitizeEventValue(sourceTags[key], 0);
     }
     if (Object.keys(safeTags).length > 0) safe.tags = safeTags;
   }

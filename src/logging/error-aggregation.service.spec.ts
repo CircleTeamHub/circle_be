@@ -381,7 +381,9 @@ describe('createSentryInitOptions', () => {
       },
       request: { headers: { authorization: 'Bearer secret' } },
     }) as Record<string, any>;
-    expect(JSON.stringify(filtered)).not.toMatch(/blue pineapple|Bearer secret/);
+    expect(JSON.stringify(filtered)).not.toMatch(
+      /blue pineapple|Bearer secret/,
+    );
     expect(filtered.exception.values[0].stacktrace.frames).toEqual([
       {
         filename: 'src/chat.ts',
