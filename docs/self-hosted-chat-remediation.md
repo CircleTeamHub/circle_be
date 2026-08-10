@@ -576,37 +576,40 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | OpenIM webhook/回调 | 路由已全拆，无消费方残留（常量文件除外，见 §9） |
 | 管理台群操作 | `AdminGroupOperationProcessor` 已改写本地表（muteAllAt/清座/解散），不再调 OpenIM admin API；管理台本就没有消息级审查能力，无回归 |
 
-## 9. 顺带清理项（不立 G，逢批顺手做）
+## 9. 顺带清理项（不立 G，逢批顺手做）—— ✅ 全部完成（2026-08-09，§9 清理批）
 
 **FE（circle-im）**
 
-- `chat-send-payloads.ts:55-75` `buildAtMessagePayload`：OpenIM 形状死代码（`atUserList`
-  / `AtAllTag`），实际协议是 `client.ts` 的 `{mentions, atAll}` —— 删
-- `system-notice-dedupe.ts` 读的 `systemNoticeKind` 等字段无人产出，
-  `collapseDuplicateFriendAddedNotices` 已是 pass-through —— 删，或决定是否由 BE 系统
-  消息补回旧栈的「你们已成为好友」提示条（旧栈本地插入 `friend_added`，新栈无产方）
-- `use-app-settings-store.ts:22-23` `singleTyping`/`groupTyping` 死开关：typing 接线时
-  一并处置 —— **接上**（发送已有节流函数、BE 已广播，差 dispatcher 监听 + UI）**或删掉**
-- `file` 消息类型半开：BE `CLIENT_MESSAGE_TYPES` 收、FE 发不出也渲染不了（default 分支
-  空气泡），`ChatHistoryFilesScreen` 永远空 —— 要么补全（发送 + 气泡 + 搜索），要么 BE
-  摘掉该类型 + FE 藏入口；同理清掉 `ChatHistoryMediaScreen.tsx:146` 的 video 死分支
-- 免打扰不抑制端内横幅：`dispatcher.ts:220-245` 补一条 `conversation.muted` 判定
-- 会话列表项无「发送失败」标记（`mappers.ts:123-136`）：outbox 落地时顺带
-- 收到未知 type 渲染成空文本气泡（`message-mappers.ts:365-373`）：给个「[暂不支持的消息
-  类型]」占位，为将来新增类型的旧版本兼容兜底
+- [x] `buildAtMessagePayload` OpenIM 形状死代码 —— 已删（`AT_ALL_USER_ID` 是活跃的
+  本地哨兵，`@所有人` 选取/高亮在用，保留并把注释改为「本地哨兵」）
+- [x] `system-notice-dedupe.ts` + `systemNotice*` 三个死字段 + 配套测试 —— 已删。
+  「你们已成为好友」由 BE `friend-chat-replay-outbox` 产出的真系统消息覆盖，无需补
+- [x] `singleTyping`/`groupTyping` —— **接上**：ChatDetailScreen 草稿变化按开关上报
+  （2s 节流在 socket-manager），dispatcher 监听 `chat:typing`（跳过自己多端），
+  store 记 4s 有效期，单聊头部显示「对方正在输入…」（词条 ×5）
+- [x] `file` 类型 —— **渲染补全**（📄 文件名气泡；发送入口刻意不加）。依据：
+  temp-chat-web 访客能发任意文件（Composer 有 pdf 用例），App 端必须能渲染；
+  App 自己不发文件与旧栈行为一致。video 死分支保留渲染、查询刻意不带
+  （ChatHistoryMediaScreen 顶部已有知情注释：混进查询会 400，真加视频时两边一起放开）
+- [x] 免打扰抑制端内横幅 —— dispatcher `conversation.muted → 'suppressed'`（未读照常）
+- [x] 会话列表「发送失败」前缀 —— MessagesScreen 按 store 里挂失败消息的会话集合
+  给预览加 `[发送失败]`（词条 ×5，引用稳定不抖列表）
+- [x] 未知 type 占位 —— `im.message.unsupported` ×5；text 缺字段仍空串，
+  畸形 call-record 也落占位而非空气泡
 
 **BE（circle_be）**
 
-- `sensitive-word.constants.ts:7-86`：整个 OpenIM before-send 回调契约（73001、
-  `OpenimBeforeSendCallbackBody` 等）已无消费方 —— 删，`SensitiveWord` 表的 schema
-  注释同步改
-- `auth-tokens.dto.ts:13-16` 可选 `imToken` 字段 + `auth.service.ts:488,501-502,71-75`
-  孤儿注释 —— 删
-- `StorageAuditService`：把 `chat/` 排除的注释理由（「URL 固化在 OpenIM Mongo」）已失真，
-  key 现在就在 `ChatMessage.content` —— `chat/` 前缀纳入盘点，并补孤儿对象策略
-  （presign 后未发送的对象目前无人回收）
-- admin 域 `entityType: 'OpenIMGroup'` 文案与 Swagger 描述里的 OpenIM 字样 —— 随手改
-- 敏感词只检 `content['text']`：卡片标题 / location 描述 / 文件名不过滤 —— 记录现状，
-  扩不扩由产品定
-- `chat-circle-sync.service.ts:43` `retryQueue` 是进程内状态：单实例无碍（cron 兜底），
-  多实例批次（G-04）时记得它的语义是 best-effort
+- [x] `sensitive-word.constants.ts` —— 整档删除（全仓零引用；进程内检查直连
+  `SensitiveWordService.check`）；`SensitiveWord` 表 schema 注释同步改
+- [x] `AuthTokensDto.imToken` + `auth.service` 三处孤儿注释 —— 已删
+- [x] `StorageAuditService` —— `chat/` 从「绝不能扫」翻转为纳入盘点：媒体 key 字段表
+  上收到 `chat.constants.CHAT_MEDIA_KEY_FIELDS`（presign-on-read 与盘点单一事实源），
+  只扫有媒体的类型；presign 后未发送的孤儿对象由这份日报兜底（24h 宽限期覆盖正常
+  窗口），spec 头号用例随语义反转重写
+- [x] admin 域 Swagger/注释 OpenIM 字样 —— admin-community ×3、conversation-group、
+  group-member、call.service 已改；`entityType: 'OpenIMGroup'` **存量值刻意不动**
+  （审计日志数据兼容）
+- [x] 敏感词只检 `content['text']`（卡片标题 / location 描述 / 文件名不过滤）——
+  维持现状，扩不扩由产品定（记录在案，不算缺口）
+- [x] `chat-circle-sync.service.ts` `retryQueue` —— 维持进程内 best-effort 语义
+  （cron 兜底；G-04 多实例下最坏丢一次重试、下轮 cron 补齐，已在批4确认）

@@ -1811,7 +1811,7 @@ model UserLike {
   @@index([fromUserID, likedOn])
 }
 
-/// 聊天敏感词词表（OpenIM before-send 回调用）。word 存规范形态
+/// 聊天敏感词词表（chat.service 发送前进程内检查用）。word 存规范形态
 /// （NFKC + 小写 + 裁剪，见 sensitive-word.matcher.ts），入库前由服务层统一规范化。
 /// createdBy 只作审计参考，不建外键 —— 管理员账号删除不应连带删词。
 model SensitiveWord {
