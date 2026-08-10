@@ -9,6 +9,9 @@ import { ChatSystemMessageService } from './chat-system-message.service';
  * 不再持有群聊的管理态。DISABLING/RESTORING 也算在内:处理中的圈子
  * 默认拒绝(宁可晚一分钟恢复,也不要在停用窗口里把门开着)。
  */
+/** 圈子座位对账的 advisory lock 命名空间(与 chat 的其它锁不撞)。 */
+const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
+
 const DISABLED_ADMIN_STATES = new Set<string>([
   'DISABLING',
   'DISABLED',
@@ -20,11 +23,13 @@ const DISABLED_ADMIN_STATES = new Set<string>([
 /**
  * 圈子成员 ←→ 群会话座位的同步(自研聊天版的 group-sync)。
  *
- * 机制:幂等 ensure + 定时对账,不在 7 处 CircleMember 写点逐一埋钩子 ——
- * 主动触发只有两个:建圈后(circle.service 尽力而为调用)与前端开圈聊时
- * (POST /chat/conversations/circle);其余变更由每分钟的对账兜底
- * (CircleMember.updatedAt 窗口扫描,与 like-reconciliation 同款模式)。
- * 代价:踢人/退圈的座位收回最迟延后一个对账周期(≤1min),测试期可接受。
+ * 机制:幂等 ensure + 定时对账 + 两类主动触发:
+ * - 删除写点(踢人/退群/退圈)在事务内 releaseSeatInTx + 提交后 detachSeat ——
+ *   对账的 updatedAt 窗口永远看不见被删的行,这类只能靠钩子;
+ * - 激活写点(建圈/开圈聊/拉人进群/入圈获批)提交后尽力而为调 ensure,
+ *   新成员即刻入座;失败由每分钟对账兜底
+ *   (CircleMember.updatedAt 窗口扫描,与 like-reconciliation 同款模式)。
+ * 座位变化会经 chat:conversation 个人事件通知本人(见 ChatBroadcastService)。
  */
 @Injectable()
 export class ChatCircleSyncService {
@@ -47,6 +52,19 @@ export class ChatCircleSyncService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
   ) {}
+
+  /**
+   * 把一个圈子排进下一轮对账重试。
+   *
+   * 给对账**之外**触发的即时同步用(入圈通过后的那次 ensureCircleConversation)。
+   * 那条路径失败只记日志的话:数据库正好在停机,而对账扫的是
+   * `CircleMember.updatedAt` 的 2 分钟窗口 —— 库恢复时那次变更早就滑出窗口,
+   * 于是这位新成员的聊天座位一直缺着,直到该圈碰巧再发生一次成员变更。
+   */
+  scheduleRetry(circleID: string): void {
+    if (this.retryQueue.size >= ChatCircleSyncService.RETRY_QUEUE_MAX) return;
+    this.retryQueue.add(circleID);
+  }
 
   @Cron(CronExpression.EVERY_MINUTE)
   async reconcileRecent(): Promise<void> {
@@ -127,6 +145,11 @@ export class ChatCircleSyncService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 同一圈子的对账串行化。集合式写法本身是并发安全的(不会写坏数据),
+      // 但**副作用**不是:两个实例同时对账同一个圈子时,双方都会在各自的
+      // 快照里把同一个人算进 toJoin —— 于是 joined 事件播两遍、进群系统提示
+      // 也写两条。谁先拿到锁谁做,后来者在锁后重读座位,toJoin 自然是空的。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
       let created = false;
       let conversation = await tx.chatConversation.findUnique({
         where: { circleID: circleId },
@@ -196,7 +219,9 @@ export class ChatCircleSyncService {
           userID: { in: activeIds },
           leftAt: { not: null },
         },
-        data: { leftAt: null, lastReadHeight: watermark },
+        // joinedAt 也要重置:逐条已读回执按 joinedAt 排掉「入群前的消息」,
+        // 复位座位不刷新它的话,重新入群的人会显示成他离座期间每一条消息的已读者。
+        data: { leftAt: null, lastReadHeight: watermark, joinedAt: new Date() },
       });
       if (activeIds.length > 0) {
         await tx.chatMember.updateMany({
@@ -213,17 +238,33 @@ export class ChatCircleSyncService {
     });
 
     // 座位变更后的在线房间对齐(尽力而为;掉线成员重连时按座位重新派生)。
-    for (const userID of result.toJoin) {
-      void this.broadcast
-        .joinUserToConversation(userID, result.conversationId)
-        .catch((error: unknown) =>
+    //
+    // 入房必须**先于** joined 事件完成。反过来的话:客户端收到 joined 立刻拉一次
+    // 历史,而 joinUserToConversation 内部还在 await fetchSockets —— 这中间落库并
+    // 广播的消息,历史拉取够不着(它还没写完?不,是拉取已经返回了),房间订阅也还
+    // 没建立,于是那几条消息对这位新成员凭空消失,直到下次重连才补上。
+    await Promise.all(
+      result.toJoin.map(async (userID) => {
+        try {
+          await this.broadcast.joinUserToConversation(
+            userID,
+            result.conversationId,
+          );
+        } catch (error: unknown) {
           this.logger.warn(
             `join room failed user=${userID}: ${
               error instanceof Error ? error.message : String(error)
             }`,
-          ),
-        );
-    }
+          );
+        }
+        // 个人事件:会话即刻出现在本人列表里,不必等下一次全量拉取。
+        this.broadcast.emitConversationChange(userID, {
+          kind: 'joined',
+          conversationId: result.conversationId,
+          userId: userID,
+        });
+      }),
+    );
     // 进/退群系统提示:初始建会话是存量播种,不逐人刷屏;之后的增量变化才提示。
     if (!result.created) {
       void this.emitMembershipNotices(
@@ -242,6 +283,12 @@ export class ChatCircleSyncService {
             }`,
           ),
         );
+      // 对账分不清主动退出还是被移出,统一 removed(UI 行为一致:收走会话)。
+      this.broadcast.emitConversationChange(userID, {
+        kind: 'removed',
+        conversationId: result.conversationId,
+        userId: userID,
+      });
     }
     return result.conversationId;
   }
@@ -290,18 +337,48 @@ export class ChatCircleSyncService {
    * updatedAt 窗口根本扫不到这个圈子。结果就是:真实的退群/踢人一条提示都没有,
    * 只有对账自己发现的差异才会提示,而那条路径实际上永远走不到。
    *
-   * 两件事都是尽力而为:座位状态已经落库,提示丢了只是少一行灰字。
+   * 提示是尽力而为(座位状态已经落库,丢了只是少一行灰字);**离房不是**。
+   * 返回的 Promise 在离房尝试结束后 resolve,调用方应当 await 它。
    */
-  detachSeat(userId: string, conversationId: string): void {
-    void this.broadcast
-      .removeUserFromConversation(userId, conversationId)
-      .catch((error: unknown) =>
-        this.logger.warn(
-          `detach seat failed user=${userId} conversation=${conversationId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        ),
+  async detachSeat(
+    userId: string,
+    conversationId: string,
+    kind: 'left' | 'removed',
+  ): Promise<void> {
+    // 先离房,再发个人事件。
+    //
+    // 反过来的话(原来的顺序):emitConversationChange 立刻返回,而离房内部
+    // 还在 await fetchSockets —— 这中间广播到会话房的消息,那位已经被移出的
+    // 成员照样收得到(广播不会再查一次 ChatMember)。离房失败时更糟:他会一直
+    // 留在房里收群消息,直到自己重连。所以失败要踢连接,让他重连时按座位重新派生。
+    try {
+      await this.broadcast.removeUserFromConversation(userId, conversationId);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `detach seat failed user=${userId} conversation=${conversationId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
+      // 离不了房就断连接:重连时 handleConnection 会按当前座位重新派生房间,
+      // 而他已经没有这个会话的座位了。
+      await this.broadcast
+        .disconnectUserSockets(userId)
+        .catch((disconnectError: unknown) =>
+          this.logger.error(
+            `detach seat could not evict sockets user=${userId}: ${
+              disconnectError instanceof Error
+                ? disconnectError.message
+                : String(disconnectError)
+            }`,
+          ),
+        );
+    }
+    // 个人事件:UI 收走会话靠它。left 与 removed 的区别只在客户端文案。
+    this.broadcast.emitConversationChange(userId, {
+      kind,
+      conversationId,
+      userId,
+    });
     void this.systemMessage
       .emit(conversationId, { kind: 'member-left' })
       .catch((error: unknown) =>
@@ -342,6 +419,11 @@ export class ChatCircleSyncService {
             }`,
           ),
         );
+      this.broadcast.emitConversationChange(userID, {
+        kind: 'removed',
+        conversationId: conversation.id,
+        userId: userID,
+      });
     }
   }
 

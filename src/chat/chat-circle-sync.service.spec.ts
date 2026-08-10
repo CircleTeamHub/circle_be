@@ -17,10 +17,14 @@ describe('ChatCircleSyncService', () => {
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    // 同圈对账串行化的 advisory lock(多实例下防 joined 事件与系统提示重复)。
+    $executeRaw: jest.fn(),
   };
   const broadcast = {
     joinUserToConversation: jest.fn(),
     removeUserFromConversation: jest.fn(),
+    emitConversationChange: jest.fn(),
+    disconnectUserSockets: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
 
@@ -34,10 +38,12 @@ describe('ChatCircleSyncService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(runTx as never);
+    prisma.$executeRaw.mockResolvedValue(1);
     prisma.chatMember.createMany.mockResolvedValue({ count: 0 });
     prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);
     broadcast.removeUserFromConversation.mockResolvedValue(undefined);
+    broadcast.disconnectUserSockets.mockResolvedValue(undefined);
     systemMessage.emit.mockResolvedValue(undefined);
     prisma.user.findMany.mockResolvedValue([]);
     prisma.$queryRaw.mockResolvedValue([]);
@@ -67,6 +73,17 @@ describe('ChatCircleSyncService', () => {
       'u1',
       'conv-1',
     );
+    // 被清座的人要收到个人事件,否则 UI 一直停在已解散的群里。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
@@ -122,6 +139,12 @@ describe('ChatCircleSyncService', () => {
       'u2',
       'conv-1',
     );
+    // 个人事件让会话即刻出现在列表里,不必等下一次全量拉取。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'joined',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
   });
 
   it('revives left seats and retires seats of members no longer active', async () => {
@@ -147,7 +170,12 @@ describe('ChatCircleSyncService', () => {
         }),
         // 复活座位同时把水位推到当前高度:离座期间的消息本就与他无关,
         // 留着旧水位会让重新入群的人一进来就背一堆"未读"。
-        data: { leftAt: null, lastReadHeight: 0 },
+        // joinedAt 同步刷新 —— 逐条已读回执按它排掉「入群前的消息」。
+        data: {
+          leftAt: null,
+          lastReadHeight: 0,
+          joinedAt: expect.any(Date) as Date,
+        },
       }),
     );
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
@@ -167,6 +195,17 @@ describe('ChatCircleSyncService', () => {
       'u2',
       'conv-1',
     );
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'joined',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    // 对账分不清主动退出还是被移出,统一按 removed 下发(UI 行为一致:移除会话)。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u2', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u2',
+    });
   });
 
   // 落 schema 默认的 0 的话,新成员一进老群就背着全部历史的未读数(可能几万),
@@ -200,8 +239,8 @@ describe('ChatCircleSyncService', () => {
   // releaseSeatInTx 在事务里就把 leftAt 置好了 —— 等对账跑到时已不满足条件;
   // 何况 CircleMember 行已被删除,updatedAt 窗口根本扫不到这个圈子。结果就是
   // 真实的退群/踢人一条提示都没有。提示必须由删除钩子自己补。
-  it('emits a member-left notice when a deletion hook releases a seat', () => {
-    service.detachSeat('u1', 'conv-1');
+  it('emits a member-left notice when a deletion hook releases a seat', async () => {
+    await service.detachSeat('u1', 'conv-1', 'removed');
 
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',
@@ -210,6 +249,45 @@ describe('ChatCircleSyncService', () => {
       'u1',
       'conv-1',
     );
+    // 被踢者本人要立即收到 removed:socket 离房只是收不到消息,UI 还得靠这条收走会话。
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    // 顺序要紧:离房必须先完成。反过来的话,离房内部还在 await fetchSockets
+    // 时广播到会话房的消息,被移出的人照样收得到。
+    expect(
+      broadcast.removeUserFromConversation.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      broadcast.emitConversationChange.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('disconnects the socket when the room leave fails', async () => {
+    // 离不了房 = 他会一直留在房里收群消息,直到自己重连。断连接是唯一兜底:
+    // 重连时 handleConnection 按当前座位重新派生房间,而他已经没有座位了。
+    broadcast.removeUserFromConversation.mockRejectedValueOnce(
+      new Error('adapter down'),
+    );
+
+    await service.detachSeat('u1', 'conv-1', 'removed');
+
+    expect(broadcast.disconnectUserSockets).toHaveBeenCalledWith('u1');
+  });
+
+  it('tells the leaver own devices with kind left instead of removed', async () => {
+    await service.detachSeat('u1', 'conv-1', 'left');
+
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'left',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    // 群里其他人看到的灰条措辞不区分主动被动,保持 member-left。
+    expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+    });
   });
 
   it('is a no-op returning null for a missing circle', async () => {

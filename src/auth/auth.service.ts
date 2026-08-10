@@ -69,11 +69,6 @@ const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
 const MAX_SECURITY_CODE_ATTEMPTS = 5;
 const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
 
-/**
- * OpenIM 1004「record not found」——请求的用户还没在 OpenIM 落库。
- * getUserToken 抢在异步注册前面时会命中，属于可重试的瞬时竞态。
- */
-
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
     throw new BadRequestException({
@@ -485,7 +480,7 @@ export class AuthService {
     );
   }
 
-  /** 密码登录与验证码登录共用的收尾：OpenIM 重同步、lastOnline、发 token、记日志。 */
+  /** 密码登录与验证码登录共用的收尾：lastOnline、发 token、记日志。 */
   private async finishLogin(
     user: {
       id: string;
@@ -498,9 +493,6 @@ export class AuthService {
     sessionContext?: SessionContext,
     platform?: 1 | 2 | 5,
   ) {
-    // Retry OpenIM registration for users that weren't synced at register time
-    // (e.g. OpenIM was down). Non-blocking — login succeeds regardless.
-
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })

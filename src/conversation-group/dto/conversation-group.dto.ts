@@ -34,7 +34,7 @@ export class ConversationGroupDto {
 
   @ApiProperty({
     type: [String],
-    description: 'OpenIM conversationIDs that belong to this group.',
+    description: 'Chat conversation ids that belong to this group.',
   })
   @Expose()
   conversationIDs: string[];

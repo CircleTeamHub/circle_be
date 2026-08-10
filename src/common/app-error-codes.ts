@@ -320,6 +320,11 @@ export const ChatErrorCode = {
   RateLimited: 'CHAT_RATE_LIMITED',
   ConversationMuted: 'CHAT_CONVERSATION_MUTED',
   StrangerNotAllowed: 'CHAT_STRANGER_NOT_ALLOWED',
+  MessageNotFound: 'CHAT_MESSAGE_NOT_FOUND',
+  RevokeWindowExpired: 'CHAT_REVOKE_WINDOW_EXPIRED',
+  RevokeForbidden: 'CHAT_REVOKE_FORBIDDEN',
+  EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
+  EditForbidden: 'CHAT_EDIT_FORBIDDEN',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)

@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { Prisma } from 'src/generated/prisma';
-import { CHAT_ADVISORY_LOCK_NS, SYSTEM_MESSAGE_TYPE } from './chat.constants';
+import { SYSTEM_MESSAGE_TYPE } from './chat.constants';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import type { ChatMessageDto, ChatSenderInfo } from './chat.types';
@@ -45,7 +45,14 @@ export class ChatSystemMessageService {
     input: ServerMessageInput,
   ): Promise<ChatMessageDto> {
     const { row, reused } = await this.prisma.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${conversationId}))`;
+      // G-05:与客户端发送同一把行锁、同一个计数器(两条发号路径必须一致,
+      // 否则并发下撞 (conversationID, height) 唯一约束)。
+      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (counter.length === 0) {
+        throw new Error(`conversation ${conversationId} not found`);
+      }
       if (input.clientMessageId && input.senderID) {
         const existing = await tx.chatMessage.findUnique({
           where: {
@@ -58,14 +65,11 @@ export class ChatSystemMessageService {
         });
         if (existing) return { row: existing, reused: true };
       }
-      const maxHeight = await tx.chatMessage.aggregate({
-        where: { conversationID: conversationId },
-        _max: { height: true },
-      });
+      const height = counter[0].nextHeight + 1;
       const row = await tx.chatMessage.create({
         data: {
           conversationID: conversationId,
-          height: (maxHeight._max.height ?? 0) + 1,
+          height,
           senderID: input.senderID,
           type: input.type,
           content: input.content as Prisma.InputJsonObject,
@@ -77,7 +81,7 @@ export class ChatSystemMessageService {
       });
       await tx.chatConversation.update({
         where: { id: conversationId },
-        data: { lastMessageAt: row.createdAt },
+        data: { nextHeight: height, lastMessageAt: row.createdAt },
       });
       await tx.chatMember.updateMany({
         where: { conversationID: conversationId, hiddenAt: { not: null } },
@@ -117,55 +121,74 @@ export class ChatSystemMessageService {
       : null;
   }
 
+  /**
+   * 在**调用方的事务里**落一条系统消息,返回可广播的 DTO。
+   *
+   * 给「设置变更必须留痕」这类场景用:调用方把设置更新和这条提示放进同一个
+   * 事务,要么都成、要么都不成。提交之后再拿返回值调 broadcastSystemMessage。
+   */
+  async insertSystemMessageInTx(
+    tx: Prisma.TransactionClient,
+    conversationId: string,
+    content: Record<string, unknown>,
+  ): Promise<ChatMessageDto> {
+    const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+      SELECT "nextHeight" FROM "ChatConversation"
+      WHERE "id" = ${conversationId} FOR UPDATE`;
+    if (counter.length === 0) {
+      throw new Error(`conversation ${conversationId} not found`);
+    }
+    const height = counter[0].nextHeight + 1;
+    const created = await tx.chatMessage.create({
+      data: {
+        conversationID: conversationId,
+        height,
+        senderID: null,
+        type: SYSTEM_MESSAGE_TYPE,
+        content: content as Prisma.InputJsonObject,
+        clientMessageId: null,
+      },
+    });
+    await tx.chatConversation.update({
+      where: { id: conversationId },
+      data: { nextHeight: height, lastMessageAt: created.createdAt },
+    });
+    // 新消息让隐藏的会话重新浮出 —— 与客户端发送、insertServerMessage 同一
+    // 语义(微信式)。漏掉这一步的话:用户 swipe 隐藏了群,之后的进/退群提示
+    // 照常落库并计入未读,但会话本身不回到 GET /chat/conversations 里,
+    // 表现为"有未读却找不到会话"。
+    await tx.chatMember.updateMany({
+      where: { conversationID: conversationId, hiddenAt: { not: null } },
+      data: { hiddenAt: null },
+    });
+    return {
+      id: created.id,
+      conversationId,
+      height: created.height,
+      type: SYSTEM_MESSAGE_TYPE,
+      content,
+      sender: null,
+      replyToId: null,
+      d: null,
+      createdAt: created.createdAt.toISOString(),
+    };
+  }
+
+  /** 事务提交之后再播,别在事务里播(回滚了消息却已经发出去)。 */
+  broadcastSystemMessage(dto: ChatMessageDto): void {
+    this.broadcast.emitMessage(dto);
+  }
+
   /** 落库(height 同一坐标系)并广播;失败只记日志(提示消息可丢)。 */
   async emit(
     conversationId: string,
     content: Record<string, unknown>,
   ): Promise<void> {
     try {
-      const row = await this.prisma.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CHAT_ADVISORY_LOCK_NS}, hashtext(${conversationId}))`;
-        const maxHeight = await tx.chatMessage.aggregate({
-          where: { conversationID: conversationId },
-          _max: { height: true },
-        });
-        const created = await tx.chatMessage.create({
-          data: {
-            conversationID: conversationId,
-            height: (maxHeight._max.height ?? 0) + 1,
-            senderID: null,
-            type: SYSTEM_MESSAGE_TYPE,
-            content: content as Prisma.InputJsonObject,
-            clientMessageId: null,
-          },
-        });
-        await tx.chatConversation.update({
-          where: { id: conversationId },
-          data: { lastMessageAt: created.createdAt },
-        });
-        // 新消息让隐藏的会话重新浮出 —— 与客户端发送、insertServerMessage 同一
-        // 语义(微信式)。漏掉这一步的话:用户 swipe 隐藏了群,之后的进/退群提示
-        // 照常落库并计入未读,但会话本身不回到 GET /chat/conversations 里,
-        // 表现为"有未读却找不到会话"。
-        await tx.chatMember.updateMany({
-          where: { conversationID: conversationId, hiddenAt: { not: null } },
-          data: { hiddenAt: null },
-        });
-        return created;
-      });
-
-      const dto: ChatMessageDto = {
-        id: row.id,
-        conversationId,
-        height: row.height,
-        type: SYSTEM_MESSAGE_TYPE,
-        content,
-        sender: null,
-        replyToId: null,
-        d: null,
-        createdAt: row.createdAt.toISOString(),
-      };
-      this.broadcast.emitMessage(dto);
+      const dto = await this.prisma.$transaction((tx) =>
+        this.insertSystemMessageInTx(tx, conversationId, content),
+      );
+      this.broadcastSystemMessage(dto);
     } catch (error) {
       this.logger.warn(
         `system message emit failed conversation=${conversationId}: ${

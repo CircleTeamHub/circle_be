@@ -1811,7 +1811,7 @@ model UserLike {
   @@index([fromUserID, likedOn])
 }
 
-/// 聊天敏感词词表（OpenIM before-send 回调用）。word 存规范形态
+/// 聊天敏感词词表（chat.service 发送前进程内检查用）。word 存规范形态
 /// （NFKC + 小写 + 裁剪，见 sensitive-word.matcher.ts），入库前由服务层统一规范化。
 /// createdBy 只作审计参考，不建外键 —— 管理员账号删除不应连带删词。
 model SensitiveWord {
@@ -1847,6 +1847,11 @@ model ChatConversation {
   lastMessageAt DateTime?
   /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
   muteAllAt     DateTime?
+  /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
+  burnDurationSec Int?
+  /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
+  /// 迁移时必须回填成 MAX(height)，默认 0 会撞 (conversationID, height) 唯一约束。
+  nextHeight Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 
@@ -1862,6 +1867,10 @@ model ChatMember {
   userID         String
   /// 已读水位：该成员已读的最大 height，只前进不后退。
   lastReadHeight Int       @default(0)
+  /// 送达水位（G-07）：客户端收到 chat:msg 后回报的最大 height；只前进。
+  lastDeliveredHeight Int  @default(0)
+  /// 清空聊天记录水位（G-14）：本人只看得到 height 大于该值的消息；只前进。
+  clearedBeforeHeight Int  @default(0)
   pinned         Boolean   @default(false)
   muted          Boolean   @default(false)
   /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。
@@ -1891,12 +1900,62 @@ model ChatMessage {
   clientMessageId String?  @db.VarChar(128)
   replyToID       String?
   deleted         Boolean  @default(false)
+  /// 撤回时间；撤回的消息仍占 height（坐标系不塌陷），content 已清空。
+  revokedAt       DateTime?
+  /// 执行撤回的人（发送者本人或圈主/管理员）。
+  revokedBy       String?
+  /// 编辑时间（G-07）；仅发送者、仅 text/quote、时间窗内。height 不变。
+  editedAt        DateTime?
+  /// 编辑前的历史 content 数组（留痕，不外发）。
+  contentHistory  Json?
   createdAt       DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  reactions    ChatMessageReaction[]
 
   @@unique([conversationID, height])
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
+  /// 重连追平（GET /chat/messages/mutations）按变更时刻扫。没有这两条的话，
+  /// 高频群里每次重连都要全表扫那个会话的整段历史，只为捞出几条撤回/编辑。
+  /// 查询里的粗筛写成 `revokedAt >= x OR editedAt >= x` 正是为了走它们
+  /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
+  @@index([conversationID, revokedAt])
+  @@index([conversationID, editedAt])
+}
+
+/// 消息表情回应（G-07）。不进 height 坐标系：不是消息、不推进未读、
+/// 不改 lastMessageAt；emoji 收白名单（服务端校验），同人同 emoji 唯一。
+/// 待删除的聊天媒体对象(撤回 / 焚毁的配套物删)。
+///
+/// 为什么要持久化:消息行的 content 在撤回/焚毁那一刻就清空了,object key
+/// 从此**没有任何业务数据能重建**。删除只在进程内存里重试的话,存储侧一次
+/// 超过重试次数的故障、或者一次普通的重启,那个 key 就永远丢了 ——
+/// 被撤回的图片继续留在桶里,而 StorageAudit 只报告孤儿、不删。
+model ChatMediaDeletion {
+  id        String   @id @default(uuid())
+  /// object storage key（只收 chat/ 前缀）。
+  objectKey String   @unique
+  attempts  Int      @default(0)
+  /// 最近一次失败原因（排障用，不外发）。
+  lastError String?
+  /// 下次可重试时刻（指数退避）。
+  nextAttemptAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([nextAttemptAt])
+}
+
+model ChatMessageReaction {
+  id        String   @id @default(uuid())
+  messageID String
+  userID    String
+  emoji     String   @db.VarChar(16)
+  createdAt DateTime @default(now())
+
+  message ChatMessage @relation(fields: [messageID], references: [id], onDelete: Cascade)
+
+  @@unique([messageID, userID, emoji])
+  @@index([messageID])
 }

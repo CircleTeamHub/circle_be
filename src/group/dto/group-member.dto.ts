@@ -48,7 +48,7 @@ export class InviteGroupMembersDto {
 export class GroupMemberSyncResultDto {
   @ApiProperty({
     description:
-      'True when this backend handled the group operation; false means the group is a raw OpenIM group and the client should use the SDK.',
+      'True when this backend handled the group operation; false means the group id could not be resolved to a known circle group.',
   })
   @IsBoolean()
   handled: boolean;

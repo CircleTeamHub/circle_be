@@ -20,13 +20,16 @@ import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
 import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
+import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
+import { MutationsQueryDto } from './dto/mutations-query.dto';
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
   ChatMemberDto,
   ChatMessageDto,
+  ChatMutationsPageDto,
 } from './chat.types';
 
 /**
@@ -105,6 +108,23 @@ export class ChatController {
     );
   }
 
+  @Get('messages/mutations')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '离线期间的撤回/编辑增量(重连追平;撤回不改 height,补拉够不着)',
+  })
+  listMutations(
+    @Req() req: RequestWithUser,
+    @Query() query: MutationsQueryDto,
+  ): Promise<ChatMutationsPageDto> {
+    return this.chatService.listMutationsSince(
+      req.user.userId,
+      new Date(query.since),
+      query.limit,
+      query.sinceId,
+    );
+  }
+
   @Get('conversations/:id/members')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: '会话成员目录(GROUP 附圈子角色)' })
@@ -133,6 +153,52 @@ export class ChatController {
     );
   }
 
+  @Post('conversations/:id/burn')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '会话级阅后即焚(任一方设置双方生效,变更留系统痕迹)',
+  })
+  setBurnDuration(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetBurnDurationDto,
+  ): Promise<{ burnDurationSec: number | null }> {
+    return this.chatService.setBurnDuration(
+      req.user.userId,
+      conversationId,
+      body.seconds ?? null,
+    );
+  }
+
+  @Post('conversations/:id/clear')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '清空聊天记录(仅本人视图水位,对端与服务端数据不动)',
+  })
+  clearHistory(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<{ clearedBeforeHeight: number }> {
+    return this.chatService.clearHistory(req.user.userId, conversationId);
+  }
+
+  @Get('conversations/:id/messages/:messageId/readers')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '逐条已读回执:读者 = 已读水位 ≥ 该消息 height 的成员',
+  })
+  listMessageReaders(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('messageId', ParseUUIDPipe) messageId: string,
+  ): Promise<{ readers: unknown[]; total: number }> {
+    return this.chatService.listMessageReaders(
+      req.user.userId,
+      conversationId,
+      messageId,
+    );
+  }
+
   @Get('conversations/:id/messages')
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   @ApiOperation({ summary: '会话历史(height 键集分页,页内升序)' })
@@ -151,6 +217,7 @@ export class ChatController {
         keyword: query.keyword,
         date: query.date,
         tzOffsetMinutes: query.tzOffsetMinutes,
+        afterHeight: query.afterHeight,
         tzEndOffsetMinutes: query.tzEndOffsetMinutes,
       },
     );

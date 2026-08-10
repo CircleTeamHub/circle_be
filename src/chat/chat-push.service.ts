@@ -21,10 +21,10 @@ const PREVIEW_MAX_LENGTH = 60;
  * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
  */
 const PUSH_TARGET_CAP = 6000;
-/** 座位翻页大小。 */
-const PUSH_SEAT_PAGE = 500;
 /** 单批并发的推送数,给连接池和推送供应商留背压。 */
 const PUSH_SEND_CONCURRENCY = 50;
+/** 附带 badge 的最大扇出规模:超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
+const BADGE_TARGETS_MAX = 200;
 
 @Injectable()
 export class ChatPushService {
@@ -75,6 +75,12 @@ export class ChatPushService {
     if (targets.length === 0) return;
 
     const payload = await this.composePayload(message, conversation);
+    // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
+    // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
+    const badges =
+      targets.length <= BADGE_TARGETS_MAX
+        ? await this.loadUnreadBadges(targets.map((t) => t.userID))
+        : new Map<string, number>();
     // 分批并发发送:扩容后的圈子可到 3000 人,一次性 allSettled 三千个
     // listActiveTokens 会把连接池和推送供应商同时打满。
     let failed = 0;
@@ -85,7 +91,11 @@ export class ChatPushService {
         batch.map(async (seat) => {
           const tokens = await this.push.listActiveTokens(seat.userID);
           if (tokens.length === 0) return;
-          await this.push.sendToTokens(tokens, payload);
+          const badge = badges.get(seat.userID);
+          await this.push.sendToTokens(
+            tokens,
+            badge !== undefined ? { ...payload, badge } : payload,
+          );
         }),
       );
       // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
@@ -110,39 +120,66 @@ export class ChatPushService {
   }
 
   /**
-   * 会话内除发送者外的全部在座成员(游标翻页跑完)。
-   * 原来是 take:200 且无排序:圈子扩容上限 3000,大群里绝大多数成员会被
-   * 静默跳过 —— 而且每次跳过的都是同一批(无序 = 由计划器决定),
-   * 那些人等于永久收不到新消息推送。
+   * G-06:一条查询捞全量座位(上限内),替掉 500/页的游标翻页 —— 3000 人群
+   * 从 6 次往返降到 1 次。在线/免打扰的过滤仍在内存做(在线集合来自
+   * Redis 注册表,免打扰要给 @提及穿透留口子)。
    */
   private async listSeats(
     conversationId: string,
     senderId: string | null,
   ): Promise<Array<{ userID: string; muted: boolean }>> {
-    const seats: Array<{ userID: string; muted: boolean }> = [];
-    let cursor: string | undefined;
-    for (;;) {
-      const page = await this.prisma.chatMember.findMany({
-        where: {
-          conversationID: conversationId,
-          leftAt: null,
-          ...(senderId ? { userID: { not: senderId } } : {}),
-        },
-        select: { id: true, userID: true, muted: true },
-        orderBy: { id: 'asc' },
-        take: PUSH_SEAT_PAGE,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      });
-      seats.push(...page.map((s) => ({ userID: s.userID, muted: s.muted })));
-      if (page.length < PUSH_SEAT_PAGE) return seats;
-      if (seats.length >= PUSH_TARGET_CAP) {
-        // 触顶记一条:静默截断会让「已推送全部成员」的假象留在日志里。
-        this.logger.warn(
-          `push seats hit the ${PUSH_TARGET_CAP} cap for conversation=${conversationId}; remainder skipped`,
-        );
-        return seats;
-      }
-      cursor = page[page.length - 1].id;
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: conversationId,
+        leftAt: null,
+        ...(senderId ? { userID: { not: senderId } } : {}),
+      },
+      select: { userID: true, muted: true },
+      take: PUSH_TARGET_CAP,
+    });
+    if (seats.length >= PUSH_TARGET_CAP) {
+      // 触顶记一条:静默截断会让「已推送全部成员」的假象留在日志里。
+      this.logger.warn(
+        `push seats hit the ${PUSH_TARGET_CAP} cap for conversation=${conversationId}; remainder skipped`,
+      );
+    }
+    return seats;
+  }
+
+  /**
+   * G-18:一条聚合查询算出这批收件人的全局未读总数(底数 = 已读与清空水位
+   * 的更高者,不计自己发的、不计已删)。失败返回空 map,推送不带 badge。
+   */
+  private async loadUnreadBadges(
+    userIds: string[],
+  ): Promise<Map<string, number>> {
+    if (userIds.length === 0) return new Map();
+    try {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ userID: string; count: bigint }>
+      >`
+        SELECT cm."userID", COUNT(*)::bigint AS count
+        FROM "ChatMember" cm
+        JOIN "ChatMessage" m ON m."conversationID" = cm."conversationID"
+        WHERE cm."userID" = ANY(${userIds}::text[])
+          AND cm."leftAt" IS NULL
+          -- 隐藏的会话不出现在 GET /chat/conversations 里,自然也不进 app 的
+          -- tab 未读数。这里不排掉的话,任何一条别的会话的推送都会把 iOS 角标
+          -- 顶到一个比 app 里看得见的总数更大的值,而且每来一条推送就复现一次。
+          AND cm."hiddenAt" IS NULL
+          AND m."deleted" = false
+          AND m."height" > GREATEST(cm."lastReadHeight", cm."clearedBeforeHeight")
+          AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")
+        GROUP BY cm."userID"
+      `;
+      return new Map(rows.map((row) => [row.userID, Number(row.count)]));
+    } catch (error) {
+      this.logger.warn(
+        `push badge aggregation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return new Map();
     }
   }
 

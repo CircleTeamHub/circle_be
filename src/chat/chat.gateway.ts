@@ -25,7 +25,9 @@ import {
   conversationRoom,
   userRoom,
 } from './chat.constants';
-import { SlidingWindowRateLimiter } from './chat-rate-limiter';
+import { DistributedRateLimiter } from './chat-rate-limiter';
+import { ChatPresenceRegistry } from './chat-presence.registry';
+import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatService } from './chat.service';
@@ -39,6 +41,10 @@ import type {
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
+  ChatDeliveredPayload,
+  ChatEditPayload,
+  ChatReactionPayload,
+  ChatRevokePayload,
   ChatSendAck,
   ChatSendPayload,
   ChatTypingPayload,
@@ -72,28 +78,28 @@ export class ChatGateway implements OnModuleDestroy {
   private metrics: ChatMetrics = defaultChatMetrics;
   private io: Server | null = null;
 
-  private readonly sendLimiter = new SlidingWindowRateLimiter(
-    CHAT_RATE_LIMITS.send.limit,
-    CHAT_RATE_LIMITS.send.windowMs,
-  );
-  private readonly readLimiter = new SlidingWindowRateLimiter(
-    CHAT_RATE_LIMITS.read.limit,
-    CHAT_RATE_LIMITS.read.windowMs,
-  );
-  private readonly typingLimiter = new SlidingWindowRateLimiter(
-    CHAT_RATE_LIMITS.typing.limit,
-    CHAT_RATE_LIMITS.typing.windowMs,
-  );
-  private readonly presenceLimiter = new SlidingWindowRateLimiter(
-    CHAT_RATE_LIMITS.presence.limit,
-    CHAT_RATE_LIMITS.presence.windowMs,
-  );
+  // G-04:限流走 Redis ZSET 滑动窗口(跨实例全局配额),Redis 缺席回退每实例本地。
+  private readonly sendLimiter: DistributedRateLimiter;
+  private readonly readLimiter: DistributedRateLimiter;
+  private readonly typingLimiter: DistributedRateLimiter;
+  private readonly presenceLimiter: DistributedRateLimiter;
+  private readonly revokeLimiter: DistributedRateLimiter;
+  private readonly deliveredLimiter: DistributedRateLimiter;
+  private readonly reactionLimiter: DistributedRateLimiter;
+  private readonly editLimiter: DistributedRateLimiter;
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
   private revocationSubscribed = false;
   private revocationRetryAttempt = 0;
   private revocationRetryTimer: NodeJS.Timeout | null = null;
+  /** Redis adapter 挂载重试(启动时 Redis 不可用 → 房间广播会退化成单实例)。 */
+  private static readonly ADAPTER_RETRY_BASE_MS = 5_000;
+  private static readonly ADAPTER_RETRY_MAX_MS = 60_000;
+  /** 连续失败到这个次数时报一次 error(之后只静默退避,不刷屏)。 */
+  private static readonly ADAPTER_WARN_AFTER_ATTEMPTS = 5;
+  private adapterAttempts = 0;
+  private adapterRetryTimer: NodeJS.Timeout | null = null;
   /** access token 到期即断连的计时器,按 socket 保存以便断开时清掉。 */
   private readonly expiryTimers = new Map<Socket, NodeJS.Timeout>();
   /** 多设备是正当需求,但单账号不该能开出无上限的连接来摊薄限流成本。 */
@@ -108,7 +114,26 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly chatPush: ChatPushService,
     private readonly redisService: RedisService,
     private readonly configService: ConfigService,
-  ) {}
+    private readonly presence: ChatPresenceRegistry,
+  ) {
+    const make = (
+      name: keyof typeof CHAT_RATE_LIMITS,
+    ): DistributedRateLimiter =>
+      new DistributedRateLimiter(
+        name,
+        CHAT_RATE_LIMITS[name].limit,
+        CHAT_RATE_LIMITS[name].windowMs,
+        this.redisService,
+      );
+    this.sendLimiter = make('send');
+    this.readLimiter = make('read');
+    this.typingLimiter = make('typing');
+    this.presenceLimiter = make('presence');
+    this.revokeLimiter = make('revoke');
+    this.deliveredLimiter = make('delivered');
+    this.reactionLimiter = make('reaction');
+    this.editLimiter = make('edit');
+  }
 
   /**
    * SIGTERM 时必须主动关掉 Socket.IO。
@@ -126,6 +151,10 @@ export class ChatGateway implements OnModuleDestroy {
       clearTimeout(this.revocationRetryTimer);
       this.revocationRetryTimer = null;
     }
+    if (this.adapterRetryTimer) {
+      clearTimeout(this.adapterRetryTimer);
+      this.adapterRetryTimer = null;
+    }
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);
     this.expiryTimers.clear();
     this.connectionsByUser.clear();
@@ -140,6 +169,8 @@ export class ChatGateway implements OnModuleDestroy {
       // 单条 socket 报文上限,与 content 8KB 上限同数量级留余量。
       maxHttpBufferSize: 64 * 1024,
     });
+    // G-04:Redis adapter 让房间广播跨实例;未配 Redis 保持单实例语义。
+    void this.attachRedisAdapter(io);
 
     io.use((socket, next) => {
       void this.authenticate(socket)
@@ -174,6 +205,52 @@ export class ChatGateway implements OnModuleDestroy {
     this.broadcast.setServer(io);
     this.ensureRevocationSubscription();
     this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
+  }
+
+  /**
+   * G-04:adapter 让 to(room).emit 跨实例投递。pub 复用命令连接、sub 独立连接,
+   * 都由 RedisService 管生命周期;未配 Redis 就保持单实例语义。
+   *
+   * 配了 Redis 但启动那一刻连不上,必须重试。原来一次拿不到就放弃:进程活着、
+   * RedisService 随后自己重连成功,于是**在线注册表是跨实例的、房间广播却仍是
+   * 本实例的** —— 别的实例上的用户被判成在线(不推离线通知),消息又跨不过去,
+   * 结果是这些人既收不到 socket 消息也收不到推送,直到重启。
+   */
+  private async attachRedisAdapter(io: Server): Promise<void> {
+    if (!this.redisService.isEnabled()) return;
+    // 重试**不设次数上限**,只做退避。
+    //
+    // 上一版封了 10 次 × 5 秒 = 50 秒就永久放弃 —— 而这正是最该坚持的场景:
+    // Redis 停机往往不止一分钟,进程却活着,RedisService 随后自己就连上了。
+    // 那之后在线注册表是跨实例的、房间广播却仍是本实例的:别的实例上的用户
+    // 被判成在线(不推离线通知),消息又跨不过去,这些人既收不到 socket 消息
+    // 也收不到推送,直到重启为止。宁可一直退避重试,也不能进入这个状态。
+    let delay = ChatGateway.ADAPTER_RETRY_BASE_MS;
+    for (;;) {
+      const clients = await this.redisService.getAdapterClients();
+      if (clients) {
+        io.adapter(createAdapter(clients.pub, clients.sub));
+        this.logger.log(
+          'chat gateway: redis adapter attached (multi-instance)',
+        );
+        return;
+      }
+      this.adapterAttempts += 1;
+      if (this.adapterAttempts === ChatGateway.ADAPTER_WARN_AFTER_ATTEMPTS) {
+        this.logger.error(
+          'chat gateway: redis adapter still unavailable; realtime is ' +
+            'per-instance until it attaches (cross-instance delivery is lost)',
+        );
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, delay);
+        timer.unref?.();
+        this.adapterRetryTimer = timer;
+      });
+      // onModuleDestroy 之后不再重试(io 已销毁)。
+      if (this.io === null) return;
+      delay = Math.min(delay * 2, ChatGateway.ADAPTER_RETRY_MAX_MS);
+    }
   }
 
   /**
@@ -379,6 +456,31 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
+    // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
+    // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
+    // 那条活着的连接(共享标量 DECR 会)。
+    const globalCount = await this.presence.registerSocket(userId, socket.id);
+    // 这次 await 期间断开的连接,'disconnect' 监听器还没挂上(见下面那段注释:
+    // 监听器必须在业务 await 之前注册,但注册本身排在这一步之后)—— 事件就此丢失,
+    // 本实例的连接槽和跨实例在线条目都留给了一条已死的 socket。Redis 慢的时候
+    // 反复连了就断,能把用户永久标成在线(离线推送全被吞掉)并耗尽连接上限。
+    if (socket.disconnected) {
+      void this.presence.socketDisconnected(userId, socket.id);
+      this.releaseConnectionSlot(userId, socket);
+      return;
+    }
+    if (
+      globalCount !== null &&
+      globalCount > ChatGateway.MAX_SOCKETS_PER_USER
+    ) {
+      this.logger.warn(
+        `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
+      );
+      void this.presence.socketDisconnected(userId, socket.id);
+      this.releaseConnectionSlot(userId, socket);
+      socket.disconnect(true);
+      return;
+    }
     this.metrics.observeConnectionOpened(this.connectionsByUser.size);
     this.scheduleExpiryDisconnect(socket);
 
@@ -416,6 +518,27 @@ export class ChatGateway implements OnModuleDestroy {
       whenReady(() => void this.handleTyping(socket, userId, payload));
     });
     socket.on(
+      CHAT_EVENTS.revoke,
+      (payload: ChatRevokePayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleRevoke(userId, payload, ack));
+      },
+    );
+    socket.on(CHAT_EVENTS.delivered, (payload: ChatDeliveredPayload) => {
+      whenReady(() => void this.handleDelivered(userId, payload));
+    });
+    socket.on(
+      CHAT_EVENTS.reaction,
+      (payload: ChatReactionPayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleReaction(userId, payload, ack));
+      },
+    );
+    socket.on(
+      CHAT_EVENTS.edit,
+      (payload: ChatEditPayload, ack?: AckFn<ChatReadAck>) => {
+        whenReady(() => void this.handleEdit(userId, payload, ack));
+      },
+    );
+    socket.on(
       CHAT_EVENTS.presence,
       (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
         whenReady(() => void this.handlePresenceQuery(socket, payload, ack));
@@ -424,6 +547,7 @@ export class ChatGateway implements OnModuleDestroy {
     socket.on('disconnect', () => {
       resolveReady(false);
       this.releaseConnectionSlot(userId, socket);
+      void this.presence.socketDisconnected(userId, socket.id);
       this.metrics.observeConnectionClosed(this.connectionsByUser.size);
       const timer = this.expiryTimers.get(socket);
       if (timer) {
@@ -435,6 +559,10 @@ export class ChatGateway implements OnModuleDestroy {
       this.readLimiter.pruneExpired(userId);
       this.typingLimiter.pruneExpired(userId);
       this.presenceLimiter.pruneExpired(userId);
+      this.revokeLimiter.pruneExpired(userId);
+      this.deliveredLimiter.pruneExpired(userId);
+      this.reactionLimiter.pruneExpired(userId);
+      this.editLimiter.pruneExpired(userId);
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
@@ -475,6 +603,8 @@ export class ChatGateway implements OnModuleDestroy {
       return;
     }
     resolveReady(true);
+    // 会话房派生完成 → 挂进跨实例在线集合(推送分流/在线判定的数据源)。
+    void this.presence.registerConversations(userId, conversationIds);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
     this.observeBroadcast('presence', () =>
@@ -518,7 +648,7 @@ export class ChatGateway implements OnModuleDestroy {
     const startedAt = process.hrtime.bigint();
     const userId = socket.data.userId as string;
     try {
-      if (!this.presenceLimiter.tryAcquire(userId)) {
+      if (!(await this.presenceLimiter.tryAcquire(userId))) {
         this.metrics.observeEvent('presence', 'rate_limited');
         ack({});
         return;
@@ -579,7 +709,7 @@ export class ChatGateway implements OnModuleDestroy {
     const reply = this.ackOnce(ack);
     const startedAt = process.hrtime.bigint();
     try {
-      if (!this.sendLimiter.tryAcquire(userId)) {
+      if (!(await this.sendLimiter.tryAcquire(userId))) {
         this.metrics.observeEvent('send', 'rate_limited');
         reply(this.ackError(ChatErrorCode.RateLimited, '发送太频繁'));
         return;
@@ -620,7 +750,7 @@ export class ChatGateway implements OnModuleDestroy {
     const reply = this.ackOnce(ack);
     const startedAt = process.hrtime.bigint();
     try {
-      if (!this.readLimiter.tryAcquire(userId)) {
+      if (!(await this.readLimiter.tryAcquire(userId))) {
         this.metrics.observeEvent('read', 'rate_limited');
         reply(this.ackError(ChatErrorCode.RateLimited));
         return;
@@ -655,12 +785,157 @@ export class ChatGateway implements OnModuleDestroy {
     }
   }
 
+  /** G-07 送达:无 ack 尽力而为(丢了影响小,下一条消息会再报更高水位)。 */
+  private async handleDelivered(
+    userId: string,
+    payload: ChatDeliveredPayload,
+  ): Promise<void> {
+    if (!(await this.deliveredLimiter.tryAcquire(userId))) return;
+    try {
+      const conversationId = payload?.conversationId;
+      const height = Number(payload?.height);
+      if (typeof conversationId !== 'string' || conversationId.length === 0) {
+        return;
+      }
+      const result = await this.chatService.markDelivered(
+        userId,
+        conversationId,
+        height,
+      );
+      if (result.advanced) {
+        this.broadcast.emitDelivered({
+          conversationId,
+          userId,
+          height: result.height,
+        });
+      }
+    } catch (error) {
+      this.logger.debug(
+        `delivered report dropped user=${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** G-07 表情回应:白名单与成员校验在 service;无变化不广播(幂等重放静默)。 */
+  private async handleReaction(
+    userId: string,
+    payload: ChatReactionPayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.reactionLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const { conversationId, messageId, emoji, op } = payload ?? {};
+      if (
+        typeof conversationId !== 'string' ||
+        typeof messageId !== 'string' ||
+        typeof emoji !== 'string' ||
+        (op !== 'add' && op !== 'remove')
+      ) {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      const result = await this.chatService.toggleReaction(
+        userId,
+        conversationId,
+        messageId,
+        emoji,
+        op,
+      );
+      reply({ ok: true });
+      if (result.changed) {
+        this.broadcast.emitReaction({
+          conversationId,
+          messageId,
+          emoji,
+          op,
+          userId,
+        });
+      }
+    } catch (error) {
+      reply(
+        this.toAckError(error, 'reaction', userId, payload?.conversationId),
+      );
+    }
+  }
+
+  /** G-07 编辑:authz/窗口/敏感词在 service;成功即广播新 content。 */
+  private async handleEdit(
+    userId: string,
+    payload: ChatEditPayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.editLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const conversationId = payload?.conversationId;
+      const messageId = payload?.messageId;
+      if (typeof conversationId !== 'string' || typeof messageId !== 'string') {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      const dto = await this.chatService.editMessage(
+        userId,
+        conversationId,
+        messageId,
+        payload?.content,
+      );
+      reply({ ok: true });
+      this.broadcast.emitEdit({
+        conversationId,
+        messageId,
+        content: dto.content,
+        editedAt: dto.editedAt ?? new Date().toISOString(),
+      });
+    } catch (error) {
+      reply(this.toAckError(error, 'edit', userId, payload?.conversationId));
+    }
+  }
+
+  /** G-02 撤回:权限与广播都在 service 内收口,这里只做限流与 ack。 */
+  private async handleRevoke(
+    userId: string,
+    payload: ChatRevokePayload,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.revokeLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    try {
+      const conversationId = payload?.conversationId;
+      const messageId = payload?.messageId;
+      if (
+        typeof conversationId !== 'string' ||
+        conversationId.length === 0 ||
+        typeof messageId !== 'string' ||
+        messageId.length === 0
+      ) {
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
+      await this.chatService.revokeMessage(userId, conversationId, messageId);
+      reply({ ok: true });
+    } catch (error) {
+      reply(this.toAckError(error, 'revoke', userId, payload?.conversationId));
+    }
+  }
+
   private async handleTyping(
     socket: Socket,
     userId: string,
     payload: ChatTypingPayload,
   ): Promise<void> {
-    if (!this.typingLimiter.tryAcquire(userId)) {
+    if (!(await this.typingLimiter.tryAcquire(userId))) {
       this.metrics.observeEvent('typing', 'rate_limited');
       return;
     }

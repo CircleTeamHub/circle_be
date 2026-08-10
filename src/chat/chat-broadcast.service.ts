@@ -1,9 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { Server } from 'socket.io';
+import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
+  ChatConversationBroadcast,
+  ChatDeliveredBroadcast,
+  ChatEditBroadcast,
   ChatMessageDto,
+  ChatReactionBroadcast,
   ChatReadBroadcast,
+  ChatRevokeBroadcast,
   ChatTypingBroadcast,
 } from './chat.types';
 
@@ -16,6 +22,8 @@ import type {
 export class ChatBroadcastService {
   private readonly logger = new Logger(ChatBroadcastService.name);
   private server: Server | null = null;
+
+  constructor(private readonly presence: ChatPresenceRegistry) {}
 
   setServer(server: Server): void {
     this.server = server;
@@ -50,18 +58,26 @@ export class ChatBroadcastService {
     );
   }
 
-  /** 某用户当前是否有在线 socket(个人房占用判定)。 */
+  /**
+   * 某用户当前是否有在线 socket(个人房占用判定)。
+   * G-04:优先问跨实例注册表;Redis 不可用回退本实例 fetchSockets
+   * (多实例 + adapter 下 fetchSockets 是跨节点 RPC,大群里很贵)。
+   */
   async isUserOnline(userId: string): Promise<boolean> {
+    const viaRegistry = await this.presence.isOnline(userId);
+    if (viaRegistry !== null) return viaRegistry;
     const server = this.requireServer('isUserOnline');
     if (!server) return false;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
     return sockets.length > 0;
   }
 
-  /** 会话房内当前在线的 userId 集合(离线推送分流用)。 */
+  /** 会话房内当前在线的 userId 集合(离线推送分流用);注册表优先。 */
   async getOnlineUserIdsInConversation(
     conversationId: string,
   ): Promise<Set<string>> {
+    const viaRegistry = await this.presence.getOnlineUserIds(conversationId);
+    if (viaRegistry !== null) return new Set(viaRegistry);
     const server = this.requireServer('getOnlineUserIdsInConversation');
     if (!server) return new Set();
     const sockets = await server
@@ -117,11 +133,57 @@ export class ChatBroadcastService {
     server.to(userRoom(userId)).emit(event, payload);
   }
 
+  /** 送达水位推进 → 会话房(发送方靠它渲染「已送达」)。 */
+  emitDelivered(payload: ChatDeliveredBroadcast): void {
+    const server = this.requireServer('emitDelivered');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.delivered, payload);
+  }
+
+  /** 表情回应 → 会话房(发起者也收,幂等对账本地乐观状态)。 */
+  emitReaction(payload: ChatReactionBroadcast): void {
+    const server = this.requireServer('emitReaction');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.reaction, payload);
+  }
+
+  /** 消息编辑 → 会话房。 */
+  emitEdit(payload: ChatEditBroadcast): void {
+    const server = this.requireServer('emitEdit');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.edit, payload);
+  }
+
+  /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */
+  emitRevoke(payload: ChatRevokeBroadcast): void {
+    const server = this.requireServer('emitRevoke');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.revoke, payload);
+  }
+
+  /** 本人会话成员关系变化(入座/退出/被移出) → 个人房定向。 */
+  emitConversationChange(
+    userId: string,
+    payload: ChatConversationBroadcast,
+  ): void {
+    this.emitToUser(userId, CHAT_EVENTS.conversation, payload);
+  }
+
   /** 成员进群后把其在线 socket 拉入会话房(否则要重连才收得到消息)。 */
   async joinUserToConversation(
     userId: string,
     conversationId: string,
   ): Promise<void> {
+    // 注册表联动:座位变化时在线集合同步(内部会先确认该用户全局在线)。
+    void this.presence.conversationJoined(userId, conversationId);
     const server = this.requireServer('joinUserToConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
@@ -135,12 +197,25 @@ export class ChatBroadcastService {
     userId: string,
     conversationId: string,
   ): Promise<void> {
+    void this.presence.conversationLeft(userId, conversationId);
     const server = this.requireServer('removeUserFromConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
     for (const socket of sockets) {
       socket.leave(conversationRoom(conversationId));
     }
+  }
+
+  /**
+   * 兜底驱逐:房间离不掉时直接断掉该用户的全部 socket。
+   * 重连后 handleConnection 会按当前座位重新派生房间 —— 已经没座位的会话
+   * 自然就不在里面了。
+   */
+  async disconnectUserSockets(userId: string): Promise<void> {
+    const server = this.requireServer('disconnectUserSockets');
+    if (!server) return;
+    const sockets = await server.in(userRoom(userId)).fetchSockets();
+    for (const socket of sockets) socket.disconnect(true);
   }
 
   private requireServer(caller: string): Server | null {

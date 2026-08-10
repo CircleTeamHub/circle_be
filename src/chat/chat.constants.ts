@@ -14,7 +14,33 @@ export const CHAT_EVENTS = {
   message: 'chat:msg',
   /** 双向:在线状态(客户端带 ack 查询;服务端上下线广播) */
   presence: 'chat:presence',
+  /** 服务端 → 客户端(个人房定向):接收者本人的会话成员关系变化 */
+  conversation: 'chat:conversation',
+  /** 双向:消息撤回(客户端带 ack 发起;服务端广播到会话房) */
+  revoke: 'chat:revoke',
+  /** 双向:送达水位(客户端收到 chat:msg 后上报,无 ack;服务端广播推进) */
+  delivered: 'chat:delivered',
+  /** 双向:表情回应(客户端带 ack;服务端广播到会话房) */
+  reaction: 'chat:reaction',
+  /** 双向:消息编辑(客户端带 ack;服务端广播到会话房) */
+  edit: 'chat:edit',
 } as const;
+
+/** 消息编辑的时间窗(仅发送者本人;与撤回同窗)。 */
+export const CHAT_EDIT_WINDOW_MS = 2 * 60_000;
+
+/** 表情回应白名单:防任意字符串当 emoji 灌库。 */
+export const CHAT_REACTION_EMOJIS: readonly string[] = [
+  '👍',
+  '❤️',
+  '😂',
+  '😮',
+  '😢',
+  '🙏',
+];
+
+/** 发送者本人的可撤回时间窗;圈主/管理员撤回群消息不受此限。 */
+export const CHAT_REVOKE_WINDOW_MS = 2 * 60_000;
 
 /** 个人房:登录即加入,用于跨会话的定向推送。 */
 export const userRoom = (userId: string): string => `u:${userId}`;
@@ -22,13 +48,6 @@ export const userRoom = (userId: string): string => `u:${userId}`;
 /** 会话房:按 ChatMember 成员关系在连接时由服务端加入。 */
 export const conversationRoom = (conversationId: string): string =>
   `c:${conversationId}`;
-
-/**
- * height 分配的咨询锁命名空间(pg_advisory_xact_lock 的第一个 int4)。
- * 第二个键用 hashtext(conversationID) —— 哈希碰撞只会让不同会话偶发地
- * 串行化一次分配,不影响正确性。
- */
-export const CHAT_ADVISORY_LOCK_NS = 7301;
 
 /**
  * 客户端可发送的消息类型。
@@ -83,6 +102,24 @@ export const MEDIA_MESSAGE_TYPES: readonly string[] = [
  */
 export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
 
+/**
+ * 媒体消息 content 里的 object-key 字段表(key 字段名 → 读路径补的 URL 字段名)。
+ * presign-on-read(ChatMediaService)与存量盘点(StorageAuditService)共用:
+ * 新增带媒体的消息类型时在这里补一行,两边同时生效 —— 只改一边的话,
+ * 要么新类型渲染不出图,要么它的对象全部被盘点误报成孤儿。
+ */
+export const CHAT_MEDIA_KEY_FIELDS: Record<
+  string,
+  Array<{ key: string; url: string }>
+> = {
+  image: [
+    { key: 'key', url: 'url' },
+    { key: 'thumbKey', url: 'thumbUrl' },
+  ],
+  voice: [{ key: 'key', url: 'url' }],
+  file: [{ key: 'key', url: 'url' }],
+};
+
 /** content JSON 序列化后的字节上限(超限直接拒收,防 socket 消息膨胀)。 */
 export const MAX_CONTENT_BYTES = 8 * 1024;
 
@@ -97,6 +134,10 @@ export const CHAT_RATE_LIMITS = {
   read: { limit: 30, windowMs: 10_000 },
   typing: { limit: 10, windowMs: 5_000 },
   presence: { limit: 20, windowMs: 10_000 },
+  revoke: { limit: 10, windowMs: 10_000 },
+  delivered: { limit: 30, windowMs: 10_000 },
+  reaction: { limit: 20, windowMs: 10_000 },
+  edit: { limit: 10, windowMs: 10_000 },
 } as const;
 
 /**
@@ -106,9 +147,46 @@ export const CHAT_RATE_LIMITS = {
  */
 export const TEMP_CHAT_GUEST_TOKEN_KIND = 'temp-chat-guest';
 
+/** 逐条已读回执单次返回的读者上限(超大群按前 N 展示)。 */
+export const READERS_PAGE_MAX = 200;
+
 /** 单次历史分页的最大条数。 */
 export const HISTORY_PAGE_MAX = 100;
 export const HISTORY_PAGE_DEFAULT = 50;
 
 /** 会话列表单次返回上限(Phase 1 无分页,超过则取最近活跃的前 N 个)。 */
 export const CONVERSATION_LIST_MAX = 100;
+
+/**
+ * 放宽/关闭焚毁前的兜底真删:分批处理的批量与批次上限。
+ * 一次性 findMany 会把整段积压的完整 JSON content 拉进内存,后面再跟一条
+ * 巨大的 IN 更新 —— 内存、查询参数上限、接口超时三样一起顶上来。
+ */
+export const RELAX_PURGE_BATCH = 500;
+export const RELAX_PURGE_BATCHES_MAX = 20;
+
+/** 离线撤回/编辑增量单次返回上限(重连后一次追平)。 */
+export const MUTATION_PAGE_MAX = 200;
+/** 增量最多回溯多久:超过这个跨度的离线,客户端本地缓存本来也已经翻篇。 */
+export const MUTATION_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * 增量游标的安全滞后。
+ *
+ * revokedAt/editedAt 是**写语句构造时**在 Node 侧生成的,而行要到 COMMIT 才对
+ * 别的事务可见 —— 中间隔着锁等待。于是可以出现「时间戳很早、提交很晚」的行:
+ * 一次同步在它提交前跑完、把游标推到更晚的 serverTime,它提交之后就永远落在
+ * 游标后面,再也追不到(那条撤回的正文会一直留在对方屏幕上)。
+ *
+ * 所以游标绝不越过 `now - MUTATION_SAFETY_LAG_MS`。这个值必须严格大于
+ * DATABASE_STATEMENT_TIMEOUT_MS(默认 15s)—— 超时的写会被 Postgres 掐掉,
+ * 不可能悬挂得比它更久,所以 60s 有充分余量。
+ *
+ * 代价只是重叠区间被重复投递一次,而 ingest 本来就是幂等的。
+ *
+ * 为什么不按 reviewer 建议改成「提交序」的 outbox/sequence:普通序列同样不保证
+ * 提交序(拿到 6 的事务可能先于拿到 5 的提交),真要做得靠 pg_current_snapshot()
+ * 的 xmin 逐行记录——那是 CDC 级别的机制,与这条通道的收益不成比例。
+ * 在 statement_timeout 有界的前提下,安全水位是**充分**的。
+ */
+export const MUTATION_SAFETY_LAG_MS = 60_000;

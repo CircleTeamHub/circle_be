@@ -349,7 +349,11 @@ describe('CircleService', () => {
       'circle-1',
       'user-1',
     );
-    expect(chatCircleSync.detachSeat).toHaveBeenCalledWith('user-1', 'conv-1');
+    expect(chatCircleSync.detachSeat).toHaveBeenCalledWith(
+      'user-1',
+      'conv-1',
+      'left',
+    );
   });
 
   it('uses the locked membership state when approval races with leave', async () => {

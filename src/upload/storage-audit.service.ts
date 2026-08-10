@@ -2,23 +2,28 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
 import { UploadService } from './upload.service';
 
 /**
  * 存量对象盘点（**只报告，不删除**）。
  *
- * 背景：本仓库至今没有任何一处删除 MinIO 对象 —— 删笔记、换头像、注销账号都不释放
- * 一个字节，minio_data 与 Postgres 同机，写满时倒下的是数据库。
+ * 背景：除聊天栈的撤回/焚毁/清空外，本仓库没有别的删除 MinIO 对象的路径 ——
+ * 删笔记、换头像、注销账号都不释放一个字节，minio_data 与 Postgres 同机，
+ * 写满时倒下的是数据库。
  *
  * 为什么先只报告：判错一个对象就是删掉用户的头像或笔记配图，且不可逆。真正的 GC
  * 必须先用真实数据核对过引用清单才能开。这个 cron 每天出一份「疑似无人引用」的
  * 账，人工核对若干天、确认零误判后，才谈自动删除。
  *
- * ⚠️ 绝对不能扫的前缀：`chat/`。
- * 聊天图片的 URL 固化在 OpenIM 的消息体里（Mongo），circle_be 的 Postgres 里
- * **一条引用都没有**（见 upload.service.ts 的 publicPrefixes 注释）。按 Postgres
- * 找孤儿的话，每一张聊天图片都会被判成孤儿 —— 一次「清理」就能删光全站聊天图片。
- * 同理 `note-exports/` 由 MinIO 生命周期规则回收，不归这里管。
+ * `chat/`（自研聊天栈起）：媒体消息 content 只存 object key
+ * （字段表见 chat.constants 的 CHAT_MEDIA_KEY_FIELDS），引用完全落在 Postgres 的
+ * ChatMessage 表里，纳入盘点。撤回/焚毁/清空会主动删对象但是尽力而为
+ * （ChatMediaService.deleteObjects 单个失败只记日志），删失败的与
+ * 「上传成功但消息没发出去」的对象靠这份账兜底；presign 到发消息之间的
+ * 正常窗口由 24h 宽限期覆盖。OpenIM 时代这个前缀是绝对不能扫的
+ * （引用固化在 Mongo，Postgres 一条都没有），那条禁令随迁移作废。
+ * `note-exports/` 由 MinIO 生命周期规则回收，不归这里管。
  */
 @Injectable()
 export class StorageAuditService {
@@ -34,6 +39,7 @@ export class StorageAuditService {
     'posts/',
     'notes/',
     'friends/',
+    'chat/',
   ] as const;
 
   /**
@@ -47,7 +53,7 @@ export class StorageAuditService {
   private static readonly SAMPLE_SIZE = 20;
 
   /**
-   * 每批从 Postgres 取多少行。九张表同时 findMany 全量物化,大表(笔记媒体、
+   * 每批从 Postgres 取多少行。十张表同时 findMany 全量物化,大表(聊天媒体、笔记媒体、
    * 朋友圈、帖子、好友照片数组)在生产体量下会同时占掉连接池十条里的九条,
    * 并把整份结果集连同所有引用留在 1 GiB 的容器里 —— 05:00 那一刻要么把请求
    * 饿死,要么直接 OOM。改成逐表、游标分批,并且只留下还原后的 key。
@@ -166,7 +172,7 @@ export class StorageAuditService {
     // 这份清单是从 schema 里逐个 String 字段筛出来的（名字含 url/avatar/cover/
     // image/photo 的全部 14 个），不是凭印象列的。少一处 = 那批对象被误报成孤儿。
     //
-    // 逐表串行、分批读:九张表并发全量物化会同时吃掉连接池十条里的九条,
+    // 逐表串行、分批读:十张表并发全量物化会一口吃满连接池,
     // 并把整份结果集留在内存里。这份账每天只跑一次,慢一点无所谓,
     // 把生产在 05:00 拖垮才是问题。
     await this.collectFrom(
@@ -252,7 +258,7 @@ export class StorageAuditService {
       },
     );
     // 下面三张刻意逐张写死,不走动态表名:storage-audit.service.spec.ts 用
-    // `this.prisma.<table>.findMany` 的字面量守「九张表一个都不能漏」——
+    // `this.prisma.<table>.findMany` 的字面量守「十张表一个都不能漏」——
     // 漏一处就是那批对象被误报成孤儿,而这份账是用来授权删除的。
     await this.collectFrom(
       (cursor, take) =>
@@ -283,6 +289,28 @@ export class StorageAuditService {
           ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         }),
       (row) => row.images.forEach(add),
+    );
+    // 聊天媒体:content 只存裸 key(add 的 toObjectKey 对裸 key 原样放行)。
+    // 只扫字段表里有媒体的类型 —— ChatMessage 是全库最大的表,text/卡片类
+    // 没有媒体 key,全表扫一遍纯属把 05:00 的账拖慢。
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.chatMessage.findMany({
+          where: { type: { in: Object.keys(CHAT_MEDIA_KEY_FIELDS) } },
+          select: { id: true, type: true, content: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => {
+        const fields = CHAT_MEDIA_KEY_FIELDS[row.type];
+        if (!fields) return;
+        const content = row.content;
+        if (typeof content !== 'object' || content === null) return;
+        for (const field of fields) {
+          add((content as Record<string, unknown>)[field.key]);
+        }
+      },
     );
 
     return keys;

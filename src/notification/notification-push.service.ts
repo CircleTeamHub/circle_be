@@ -44,6 +44,8 @@ export type ExpoPushPayload = {
   title: string;
   body: string;
   data: Record<string, unknown>;
+  /** iOS 图标角标数(G-18);缺省不改角标。 */
+  badge?: number;
 };
 
 const RETRYABLE_TICKET_ERRORS = new Set([
@@ -460,6 +462,7 @@ export class NotificationPushService {
       title: payload.title,
       body: payload.body,
       data: payload.data,
+      ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
     }));
 
     for (let attempt = 1; attempt <= EXPO_MAX_ATTEMPTS; attempt += 1) {

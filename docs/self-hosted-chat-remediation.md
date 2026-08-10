@@ -2,8 +2,9 @@
 
 > 配套文档：[self-hosted-chat.md](./self-hosted-chat.md)（协议契约与架构）。
 > 跨仓：本计划同时覆盖 `circle_be`（BE）、`circle-im`（App）、`temp-chat-web`（访客网页）。
-> 成文日期：2026-08-09。基线：BE `feat/self-hosted-im`（领先 main 31 commit，未合），
-> FE `main`（#145 已合）。
+> 成文日期：2026-08-09。基线（当日晚更新）：**BE `feat/self-hosted-im` 已经
+> PR #138 squash 合入 main**（+#139 群鉴权加固），FE main 到 #148 —— 两仓 main
+> 已对齐。批 0 / 批 0.5 已在双仓 `feat/chat-remediation` 分支落地（见 §4）。
 
 ## 0. 这份文档为什么存在
 
@@ -122,22 +123,22 @@ OpenIM SDK 内部就是 SQLite，冷启动秒开、离线可翻历史。现在�
 
 后果：被踢出圈子的人 UI 上一直停在群里，直到自己退出重进。
 
-### G-12 被踢后有 ≤1min 的收消息窗口 —— 权限问题
+### G-12 被踢后有 ≤1min 的收消息窗口 —— 权限问题【已闭合】
 
-座位收回本身是接好的（`removeUserFromConversation` 在 `chat-circle-sync.service.ts` 里
-被调用），但**主动触发只有 3 处**：
-
-| 触发点 | 位置 |
-|---|---|
-| 建圈 | `circle.service.ts:194` |
-| 前端开群聊 | `chat.service.ts:482` |
-| 管理台群操作 | `admin-group-operation.processor.ts:137` |
-
-其余 **9 处 `CircleMember` 写点**（`circle.service.ts` ×4 / `group.service.ts` ×3 /
-`circle-admission-policy.ts` ×2）全靠 `@Cron(EVERY_MINUTE)` 对账兜底。
-
-这一分钟里，人已经不是成员了，socket 还在会话房里，**照收群消息**。发送侧有
-`assertStillSendable` 在事务内复查，**接收侧没有任何对应复查**。
+> **二轮更正**：本节初稿基于早期分支状态。合入 main 前的 Codex 轮已给三条
+> **delete 写点**（踢人 `group.service:350` / 退群 `:445` / 退圈
+> `circle.service:492`）加上事务内 `releaseSeatInTx` + 提交后 `detachSeat`
+> 即时踢房 —— 被踢者的**收消息窗口在 delete 路径上已经闭合**（对账的
+> `updatedAt` 窗口扫不到被删的行，这类只能靠钩子，注释里已写明机理）。
+>
+> 剩余的真实缺口是**加人侧**：4 处激活路径（拉人进群 `group.service`、担保
+> 达标 / 管理员强批 / 补偿重放 `circle-invitation.service` ×3）只靠 ≤1min
+> 对账入座 —— 新成员一分钟内没有座位、收不到群消息。以及所有路径都没有
+> 个人事件面（G-11）。
+>
+> **批 0 已落地（`feat/chat-remediation`）**：4 处激活路径提交后即时幂等
+> `ensureCircleConversation`（失败仍由对账兜底）；`chat:conversation`
+> 事件面接通（详见 §2.1 落地记录）。
 
 ### G-13 断线重连不对账 —— 消息静默丢失窗口
 
@@ -184,7 +185,7 @@ BE 侧数据已经在线上：`chat:read` 广播给整个会话房、刻意不 e
 （`circle-im/docs/superpowers/specs/2026-08-09-support-agent-config-design.md`），
 本清单挂账不重复排期。
 
-### G-17 存量数据割接没有方案 —— 部署级
+### G-17 存量数据割接没有方案 —— 部署级【已拍板:路线 2,接受历史清零】
 
 全仓**没有任何** OpenIM→ChatMessage 的数据迁移脚本（`scripts/` 与 `prisma/migrations`
 均无）。直接切栈 = 线上用户的历史消息、会话列表全部清零。两条路必选其一，
@@ -193,6 +194,20 @@ BE 侧数据已经在线上：`chat:read` 广播给整个会话房、刻意不 e
 1. 写迁移：OpenIM Mongo 消息 → 三表；height 按各会话 seq 升序重排；
    `si_`/`sg_` 会话 id → 新 uuid 映射。
 2. 明确拍板「测试期接受历史清零」并留档。
+
+> **拍板（2026-08-09，用户决定）：走 2。** 测试期用户量小，聊天历史不迁；
+> 用户/好友/圈子等业务数据全在 Postgres，不受影响。曾评估过的迁移通道备查：
+> 不碰 Mongo 内部，经 OpenIM 管理端 HTTP API（`/msg/pull_msg_by_seq` +
+> `get_conversations_has_read_and_max_seq`，旧 `chat-history` 模块的成熟路径，
+> git 历史 `70d9e60^` 可寻），height 可直取 seq。哪天要补迁移从这里起步。
+>
+> **割接清单（切生产时执行，建议进 DEPLOY.md 阶段 5）：**
+> 1. `mongodump` 全库留底（哪天要找回历史还有原始数据），归档到备份桶；
+> 2. `npx prisma migrate deploy`（本轮共 4 个新迁移）；
+> 3. 清掉会话分组里的 OpenIM 旧 id（否则用户的自定义分组永远是空组）：
+>    `DELETE FROM "ConversationGroupMembership" WHERE "conversationID" LIKE 'si\_%' OR "conversationID" LIKE 'sg\_%';`
+> 4. 冒烟通过后 `openim-docker down` 退役（既有步骤）；
+> 5. 事后清理项：`user/user-id-alias.ts` 兼容层可删（见 §9）。
 
 连带两处旧 id 残留，割接时一并处理：
 - `conversation-groups`（会话分组）线上行里存的成员是 OpenIM conversationID
@@ -220,25 +235,33 @@ OpenIM 推送侧累加系统角标。新推送 payload 只有 `{title, body, dat
 
 ## 2. 补齐方案
 
-### 2.1 G-12 + S-02：成员变更实时化（权限优先）
+### 2.1 G-12 + S-02：成员变更实时化（权限优先）【已落地】
 
-1. **补主动触发**：在 9 处 `CircleMember` 写点调用
-   `ChatCircleSyncService.ensureCircleConversation(circleId)`。sync 本来就是幂等 ensure，
-   补调用点即可，无需改其内部逻辑。每分钟对账降级为兜底。
-2. **新增 socket 事件** `chat:conversation`：
+**落地记录（2026-08-09，`feat/chat-remediation` 双仓）**：
+
+1. **加人侧即时化**：4 处激活路径（`group.service` 拉人进群；
+   `circle-invitation.service` 担保达标 / 管理员强批 / 补偿重放）提交后
+   `void ensureCircleConversation(circleId)`，失败留给每分钟对账兜底。
+   删除侧此前已有事务内钩子（见 G-12 更正），无需再补。
+2. **`chat:conversation` 事件**（个人房定向，走 `emitToUser` —— 那个死方法
+   正是为此留的口子）：
 
    ```ts
-   { kind: 'joined' | 'left' | 'removed' | 'updated', conversationId: string, userId: string }
+   { kind: 'joined' | 'left' | 'removed' | 'updated', conversationId, userId }
    ```
 
-   走已有的 `emitToUser`（那个死方法正是为此留的口子）。
-3. **接收侧复查**：客户端 `chat:msg` 落库前校验自己仍在该会话成员表内。广播前不查（太贵），
-   把复查放到客户端 + 上面的即时离房双保险。
-4. **FE**：收到 `kind: 'removed'` 即从列表移除并提示「你已被移出该群聊」。
+   发射点收在 sync 服务：ensure 的 toJoin→`joined` / toRemove→`removed`；
+   `detachSeat` 按语义带 kind（踢人=`removed`、退群退圈=`left`）；
+   `evictAllSeats`（解散/停用）→`removed`。`updated` 预留无生产方。
+3. **FE 消费 + 防复活**：`removed`/`left` 即时收走会话，正看着的群被移出时
+   弹 `im.conversation.removedFromGroup`（×5 语种）；有界防复活集合挡住
+   离房前一瞬迟到的广播（不入库、不触发补拉），`joined` 解除标记并补拉元信息。
+   原方案的「客户端逐条查成员表」改为这个更便宜的等价物。
 
-**验收**：踢人后被踢者在线端 **≤1s** 内不再收到该群消息，且 UI 立即反映。
+**验收（已由测试覆盖）**：踢人后被踢者在线端 ≤1s 内不再收到该群消息（delete
+钩子 + 房间即时移除），UI 即刻反映（事件 + 防复活）；新成员入座不再等对账。
 
-### 2.2 G-01 + G-03 + G-10：本地持久化（最大件）
+### 2.2 G-01 + G-03 + G-10：本地持久化（最大件）【代码已落地，待 prebuild + 真机冒烟】
 
 **依赖**：`expo-sqlite`（native module → 需要 `prebuild` + 重建 + 重装真机；
 `ios/` `android/` 本来就是 gitignore、每次生成）。项目已在跑 dev-client，路径是通的。
@@ -281,7 +304,16 @@ REST。避免本地库无限膨胀。
 
 **验收**：飞行模式冷启动能看到会话列表和最近历史；搜索离线可用；红点冷启动即准。
 
-### 2.3 G-02 + G-09 + S-04：撤回与真引用（强耦合，必须一起）
+### 2.3 G-02 + G-09 + S-04：撤回与真引用（强耦合，必须一起）【已落地】
+
+> **落地记录（2026-08-09，`feat/chat-remediation` 双仓）**：撤回走 `chat:revoke`
+> 事件（ack + 会话房广播 `{conversationId, messageId, revokedBy}`），发送者 2 分钟
+> 窗、圈主/管理员无窗口；撤回仍占 height，content 落库清空，媒体对象按 key 尽力
+> 删除（UploadService 首条删除路径，storage-reclamation 哨兵已更新）。真引用为
+> `replyTo{id,height,senderNickname,type,preview,revoked}` 快照（getHistory 与发送
+> ack/广播一次 IN 批量附带），FE 引用块可点击定位（内存窗口内；更早历史待批 1
+> 本地库后升级「拉一页再滚」）；原消息撤回 → 引用块同步「消息已撤回」。
+> 错误码 3 枚 + 词条 ×5 语种齐。原方案如下，备查：
 
 **撤回（G-02）**：
 - `ChatMessage` 复用现有 `deleted Boolean`，加 `revokedAt DateTime?` + `revokedBy String?`
@@ -298,7 +330,7 @@ REST。避免本地库无限膨胀。
 - 点击按 `height` 定位；不在当前内存窗口就拉一页再滚过去
 - 原消息被撤回 → 引用块显示「消息已撤回」**（这就是两件事必须一起做的原因）**
 
-### 2.4 G-04：水平扩展
+### 2.4 G-04：水平扩展【已落地】
 
 装 `@socket.io/redis-adapter`，在 `ChatGateway.attach()` 里
 `io.adapter(createAdapter(pub, sub))`；Redis 未配置就跳过（保住单实例可跑）。
@@ -314,7 +346,7 @@ REST。避免本地库无限膨胀。
 
 `expiryTimers`（每实例管自己的 socket）与吊销 pub/sub（本就跨实例）**不用改**。
 
-### 2.5 G-05 + G-06：吞吐与大群热路径
+### 2.5 G-05 + G-06：吞吐与大群热路径【已落地（发号为行锁变体，见下）】
 
 **height 发号（G-05）** —— 换成会话行上的计数器：
 
@@ -341,7 +373,7 @@ REST。避免本地库无限膨胀。
 
 群人数上限 3000 是产品决定，不是技术天花板，本轮不动。
 
-### 2.6 G-07：能力面
+### 2.6 G-07：能力面【已落地】
 
 | 能力 | 方案 | 备注 |
 |---|---|---|
@@ -350,7 +382,7 @@ REST。避免本地库无限膨胀。
 | **表情回复** | 新表 `ChatMessageReaction(messageID, userID, emoji)` + 唯一约束；事件 `chat:reaction` | **不进 height 坐标系** —— 不是消息，不推进未读、不改 `lastMessageAt` |
 | **消息编辑** | `ChatMessage` 加 `editedAt` + `contentHistory Json?`；事件 `chat:edit` | 仅发送者、仅 text/quote、2 分钟窗口；**不改 height**（否则排序坐标系要重算） |
 
-### 2.7 S-01：阅后即焚回到会话级
+### 2.7 S-01：阅后即焚回到会话级【已落地】
 
 - `ChatConversation` 加 `burnDurationSec Int?`（null / 0 = 关）
 - 按 OpenIM 语义：**任一方设置即双方生效**
@@ -367,7 +399,7 @@ REST。避免本地库无限膨胀。
 `chat:presence` 加订阅面：`chat:presence:subscribe {userIds}`，服务端把这些人加进一个
 presence 房。好友基本都有共同会话，实际影响小 —— 排最后。
 
-### 2.9 G-13：重连对账
+### 2.9 G-13：重连对账【内存版已落地；sync_state 升级随批 1】
 
 - **BE**：`GET /chat/conversations/:id/messages?afterHeight&limit`（升序返回，复用现有
   查询 + presign 注入；进 §3 契约）。
@@ -380,7 +412,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 
 **验收**：飞行模式 1 分钟期间对端发 3 条 → 恢复网络 ≤3s，当前会话与列表都齐，无重复。
 
-### 2.10 G-14：清空/删除聊天记录
+### 2.10 G-14：清空/删除聊天记录【已落地】
 
 - **Schema**：`ChatMember.clearedBeforeHeight Int @default(0)` —— per-user 可见性水位，
   与旧栈「只清自己、不动对端」语义一致。
@@ -394,13 +426,13 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
      **不能再假清空**。
 - 不做物理删除（那是撤回/焚毁的事），水位过滤即可，无历史包袱。
 
-### 2.11 G-15：多端未读同步
+### 2.11 G-15：多端未读同步【已落地】
 
 - **FE**：`applyRead` 里 `userId === currentUserId` 时，把该会话 `unreadCount` 收敛到
   `max(0, latestHeight - height)` 并更新 tab 汇总。BE 广播语义已正确，**不动**。
 - `pendingReads` 落盘随 G-01 的 outbox 表走。
 
-### 2.12 G-18：图标角标
+### 2.12 G-18：图标角标【轻方案已落地；推送侧 badge 随批 5】
 
 - **轻方案（先做）**：FE 在前后台切换与未读汇总变化时
   `Notifications.setBadgeCountAsync(总未读)` —— App 活着时角标即准。
@@ -465,22 +497,22 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 
 | 批次 | 内容 | 理由 | 需要 prebuild |
 |---|---|---|---|
-| **0** | G-12 + S-02 主动触发 | **权限漏洞**；改动最小（sync 是现成的，补 9 个调用点） | 否 |
-| **0.5** | G-13 重连对账（内存版 + afterHeight 接口）+ G-15 多端未读 + G-18 轻方案 | **消息静默丢失**用户可感知；三件都是纯接线 | 否 |
-| **1** | G-01 SQLite（含 outbox/重发）+ G-03 FTS5 + G-10 红点 + G-13 升级 sync_state 对账 | 用户每次开 App 都感知；FTS5 是 SQLite 的附带品 | **是** |
-| **2** | G-02 撤回 + G-09/S-04 真引用 | 强耦合，必须一起 | 否 |
-| **3** | S-01 焚毁语义 + S-02 事件面 + G-14 清空/删除 | 语义正确性 | 否 |
-| **4** | G-05 发号 + G-06 热路径 + G-04 adapter | 规模，当前量级尚未触顶 | 否 |
-| **5** | G-07 送达 / reaction / 编辑 + G-18 推送侧 badge | 增量能力 | 否 |
+| **0 ✅** | G-12 + S-02 主动触发（已落地 `feat/chat-remediation`） | **权限漏洞**；改动最小 | 否 |
+| **0.5 ✅** | G-13 重连对账（内存版 + afterHeight 接口）+ G-15 多端未读 + G-18 轻方案（已落地，同分支） | **消息静默丢失**用户可感知；三件都是纯接线 | 否 |
+| **1 🚧** | G-01 SQLite（含 outbox/重发）+ G-03 FTS5 + G-10 红点 + G-13 升级 sync_state 对账（**代码已落地**，待 prebuild+真机冒烟） | 用户每次开 App 都感知 | **是** |
+| **2 ✅** | G-02 撤回 + G-09/S-04 真引用（已落地，同分支） | 强耦合，必须一起 | 否 |
+| **3 ✅** | S-01 焚毁语义 + S-02 事件面 + G-14 清空/删除（已落地，同分支） | 语义正确性 | 否 |
+| **4 ✅** | G-05 发号 + G-06 热路径 + G-04 adapter（已落地，同分支；发号采 SELECT..FOR UPDATE 行锁变体：复查在取号前，height 无空洞） | 规模 | 否 |
+| **5 ✅** | G-07 送达 / reaction / 编辑 / 逐条已读 + G-18 推送侧 badge（已落地，同分支） | 增量能力 | 否 |
 | **—** | G-08 推送通道 | 有意取舍，记录备查，暂不动 | — |
 | **—** | G-16 客服账号 | 已在 `feat/support-agent-config` 处理 | — |
-| **前置** | G-17 存量割接决策 | 切生产**之前**必须拍板（见 §5.3） | — |
+| **前置 ✅** | G-17 存量割接决策 | **已拍板走清零留档**，割接清单见 G-17 节 | — |
 
 ## 5. 前置阻塞
 
-1. **`circle_be` 的 `feat/self-hosted-im` 还没合 main**（领先 31 commit）。而 FE 的 #145
-   已在 main —— **两仓 main 目前对不上**（BE main 仍是 `src/openim` + 无 `/chat-ws`）。
-   本计划任何一批落地前，先把这条分支合掉。
+1. ~~`circle_be` 的 `feat/self-hosted-im` 还没合 main~~ **已解除（2026-08-09）**：
+   PR #138 已 squash 合入 main（内容与分支 tip 零差异），两仓 main 已对齐。
+   批 0 / 批 0.5 基于新 main 在双仓 `feat/chat-remediation` 分支落地。
 2. 批次 1 需要 `prebuild` + 重建 + 重装真机。参考既有流程：Expo CLI 认不出真机，走纯
    `xcodebuild` 构建 + `devicectl` 装 / 启动；真机 dev-client 连 Metro 要 Mac 局域网 IP。
 3. **G-17 存量割接决策必须发生在自研栈切生产之前**：写 OpenIM→三表迁移脚本，或明确
@@ -544,37 +576,198 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | OpenIM webhook/回调 | 路由已全拆，无消费方残留（常量文件除外，见 §9） |
 | 管理台群操作 | `AdminGroupOperationProcessor` 已改写本地表（muteAllAt/清座/解散），不再调 OpenIM admin API；管理台本就没有消息级审查能力，无回归 |
 
-## 9. 顺带清理项（不立 G，逢批顺手做）
+## 9. 顺带清理项（不立 G，逢批顺手做）—— ✅ 全部完成（2026-08-09，§9 清理批）
 
 **FE（circle-im）**
 
-- `chat-send-payloads.ts:55-75` `buildAtMessagePayload`：OpenIM 形状死代码（`atUserList`
-  / `AtAllTag`），实际协议是 `client.ts` 的 `{mentions, atAll}` —— 删
-- `system-notice-dedupe.ts` 读的 `systemNoticeKind` 等字段无人产出，
-  `collapseDuplicateFriendAddedNotices` 已是 pass-through —— 删，或决定是否由 BE 系统
-  消息补回旧栈的「你们已成为好友」提示条（旧栈本地插入 `friend_added`，新栈无产方）
-- `use-app-settings-store.ts:22-23` `singleTyping`/`groupTyping` 死开关：typing 接线时
-  一并处置 —— **接上**（发送已有节流函数、BE 已广播，差 dispatcher 监听 + UI）**或删掉**
-- `file` 消息类型半开：BE `CLIENT_MESSAGE_TYPES` 收、FE 发不出也渲染不了（default 分支
-  空气泡），`ChatHistoryFilesScreen` 永远空 —— 要么补全（发送 + 气泡 + 搜索），要么 BE
-  摘掉该类型 + FE 藏入口；同理清掉 `ChatHistoryMediaScreen.tsx:146` 的 video 死分支
-- 免打扰不抑制端内横幅：`dispatcher.ts:220-245` 补一条 `conversation.muted` 判定
-- 会话列表项无「发送失败」标记（`mappers.ts:123-136`）：outbox 落地时顺带
-- 收到未知 type 渲染成空文本气泡（`message-mappers.ts:365-373`）：给个「[暂不支持的消息
-  类型]」占位，为将来新增类型的旧版本兼容兜底
+- [x] `buildAtMessagePayload` OpenIM 形状死代码 —— 已删（`AT_ALL_USER_ID` 是活跃的
+  本地哨兵，`@所有人` 选取/高亮在用，保留并把注释改为「本地哨兵」）
+- [x] `system-notice-dedupe.ts` + `systemNotice*` 三个死字段 + 配套测试 —— 已删。
+  「你们已成为好友」由 BE `friend-chat-replay-outbox` 产出的真系统消息覆盖，无需补
+- [x] `singleTyping`/`groupTyping` —— **接上**：ChatDetailScreen 草稿变化按开关上报
+  （2s 节流在 socket-manager），dispatcher 监听 `chat:typing`（跳过自己多端），
+  store 记 4s 有效期，单聊头部显示「对方正在输入…」（词条 ×5）
+- [x] `file` 类型 —— **渲染补全**（📄 文件名气泡；发送入口刻意不加）。依据：
+  temp-chat-web 访客能发任意文件（Composer 有 pdf 用例），App 端必须能渲染；
+  App 自己不发文件与旧栈行为一致。video 死分支保留渲染、查询刻意不带
+  （ChatHistoryMediaScreen 顶部已有知情注释：混进查询会 400，真加视频时两边一起放开）
+- [x] 免打扰抑制端内横幅 —— dispatcher `conversation.muted → 'suppressed'`（未读照常）
+- [x] 会话列表「发送失败」前缀 —— MessagesScreen 按 store 里挂失败消息的会话集合
+  给预览加 `[发送失败]`（词条 ×5，引用稳定不抖列表）
+- [x] 未知 type 占位 —— `im.message.unsupported` ×5；text 缺字段仍空串，
+  畸形 call-record 也落占位而非空气泡
 
 **BE（circle_be）**
 
-- `sensitive-word.constants.ts:7-86`：整个 OpenIM before-send 回调契约（73001、
-  `OpenimBeforeSendCallbackBody` 等）已无消费方 —— 删，`SensitiveWord` 表的 schema
-  注释同步改
-- `auth-tokens.dto.ts:13-16` 可选 `imToken` 字段 + `auth.service.ts:488,501-502,71-75`
-  孤儿注释 —— 删
-- `StorageAuditService`：把 `chat/` 排除的注释理由（「URL 固化在 OpenIM Mongo」）已失真，
-  key 现在就在 `ChatMessage.content` —— `chat/` 前缀纳入盘点，并补孤儿对象策略
-  （presign 后未发送的对象目前无人回收）
-- admin 域 `entityType: 'OpenIMGroup'` 文案与 Swagger 描述里的 OpenIM 字样 —— 随手改
-- 敏感词只检 `content['text']`：卡片标题 / location 描述 / 文件名不过滤 —— 记录现状，
-  扩不扩由产品定
-- `chat-circle-sync.service.ts:43` `retryQueue` 是进程内状态：单实例无碍（cron 兜底），
-  多实例批次（G-04）时记得它的语义是 best-effort
+- [x] `sensitive-word.constants.ts` —— 整档删除（全仓零引用；进程内检查直连
+  `SensitiveWordService.check`）；`SensitiveWord` 表 schema 注释同步改
+- [x] `AuthTokensDto.imToken` + `auth.service` 三处孤儿注释 —— 已删
+- [x] `StorageAuditService` —— `chat/` 从「绝不能扫」翻转为纳入盘点：媒体 key 字段表
+  上收到 `chat.constants.CHAT_MEDIA_KEY_FIELDS`（presign-on-read 与盘点单一事实源），
+  只扫有媒体的类型；presign 后未发送的孤儿对象由这份日报兜底（24h 宽限期覆盖正常
+  窗口），spec 头号用例随语义反转重写
+- [x] admin 域 Swagger/注释 OpenIM 字样 —— admin-community ×3、conversation-group、
+  group-member、call.service 已改；`entityType: 'OpenIMGroup'` **存量值刻意不动**
+  （审计日志数据兼容）
+- [x] 敏感词只检 `content['text']`（卡片标题 / location 描述 / 文件名不过滤）——
+  维持现状，扩不扩由产品定（记录在案，不算缺口）
+- [x] `chat-circle-sync.service.ts` `retryQueue` —— 维持进程内 best-effort 语义
+  （cron 兜底；G-04 多实例下最坏丢一次重试、下轮 cron 补齐，已在批4确认）
+
+---
+
+## 10. Codex review 处置（PR BE#141 / FE#150，2026-08-09）
+
+两仓共 61 条自动 review 意见。绝大多数已修（见两仓各一条 `fix: 按 Codex review …`
+提交）。下面只留**刻意不修**的四条与理由 —— 别再翻回来重查。
+
+### 10.1 混合版本部署下的 height 分配（migration.sql，P1）
+
+意见：`nextHeight` 一次性回填之后、旧 pod 仍在写消息时,新老两套取号逻辑
+（旧的 advisory lock vs 新的会话行锁）会各自选到同一个 height，撞唯一约束。
+
+不修：本项目是**单机自托管、停机替换**的发布方式（见 DEPLOY.md），
+不存在新老 pod 并存的窗口。真要上滚动发布，届时需要一个过渡取号器 ——
+那是部署形态变更的配套工作，不是这个 PR 的范围。
+
+### 10.2 同一 object key 被多条消息引用时的撤回删除（P2）
+
+意见：客户端若把一次上传的 key 复用到两条消息上，撤回其中一条会把对象删掉，
+另一条永久坏图。
+
+不修：客户端每次上传都 presign 出独立 key（`chat/{userId}/{uuid}`），没有复用
+路径。要做引用计数就得在 JSON content 里按 key 反查，代价与收益不成比例。
+真要收紧，正确的位置是发送侧强制 key 唯一，不是删除侧扫描。
+
+### 10.3 历史页的表情回应无上界（P2）
+
+意见：3000 人群 × 100 条 × 6 种表情 = 180 万行。
+
+不修：现阶段群规模离这个量级很远，而截断 `userIds` 会破坏「我点没点过」的判定
+（比慢更糟）。真到那个量级要改的是返回结构（聚合计数 + 本人标记），不是加个
+`take`。留档，等群规模真的上来再动。
+
+### 10.4 焚毁物删对离线设备的传播（部分修）
+
+`GET /chat/messages/mutations` 覆盖了**撤回与编辑**（按 `revokedAt` / `editedAt`
+时间轴）。焚毁的物理删除没有对应的时间戳列，同一条通道带不上 ——
+离线设备上那些已被 sweeper 删掉的消息，要等重新进会话拉历史才消失。
+补它需要给 `ChatMessage` 加 `updatedAt` + 索引，留到需要时再做。
+
+---
+
+## 11. Codex review 第二轮（2026-08-10）
+
+10 条，全部已修 —— 其中 3 条是 §10 那一批**自己引入**的，记在这里当教训。
+
+### 11.1 自己引入的三条
+
+- **mutations 的游标语义**：单页 200 条截断时仍返回 `serverTime`，客户端照它
+  前进就把没返回的那些撤回永久跳过了。改成 `nextSince`/`hasMore`，截断时游标
+  停在本页最后一次变更上。教训：**任何带上限的增量接口，「本页到哪儿」和
+  「现在几点」是两个值，不能混用。**
+- **mutations 的可见性过滤位置**：清空水位原来是取回来再 filter，被过滤掉的行
+  照样占 LIMIT 名额；焚毁窗口更是完全没管。教训：**过滤必须在 LIMIT 之前，
+  也就是必须进 SQL。**（撤回与编辑各有各的时间戳，统一成 `GREATEST` 才排得出
+  单调游标，Prisma 的多字段 orderBy 做不到 —— 这条查询因此走原始 SQL。）
+- **FE 的游标初始化**：首次重连时游标还是 null，于是「以现在为起点」问一遍，
+  第一次断线窗口里的撤回被整段跳过。游标改为首连即种下并按 userId 落 MMKV
+  （冷启动也能追平上次退出之后发生的撤回）。
+
+### 11.2 上一批只修了一半的
+
+- **在线注册表**：上一批把会话在线集合从 SET 换成了 ZSET 逐成员到期，但**连接
+  计数仍是共享标量 + 整键 TTL**，同一个坑原封不动 —— pod A 崩了、pod B 还在
+  续期，A 那次 +1 就永不过期，DECR 减不到 0。现在两张表都是逐条目租约
+  （`chat:conn:z:{userId}`，成员 = socket.id）。教训：**同一个模式在两处出现时，
+  修一处等于没修。**
+- **撤回媒体的物删**：上一批加的是进程内重试队列 —— 而消息 content 在撤回那一刻
+  就清空了，key 没有任何业务数据能重建，一次重启就永久丢。改为持久化待办表
+  `ChatMediaDeletion` + 指数退避，次数用尽只死信不删行。
+
+### 11.3 其余
+
+多实例下同圈对账会重复播 `joined` 与进群提示（加 advisory 锁串行化）；
+`inviteGroupMembers` 的即时座位同步失败没进重试队列（邀请审批那条已经有了）；
+冷启动水合过的会话再进屏幕时缺口对账被跳过；本地搜索结果被 `await` 服务端挡住
+（离线要等满 15 秒超时）；群聊头部的「正在输入」永远显示不出来。
+
+---
+
+## 12. Codex review 第三轮（2026-08-10）
+
+9 条。**6 条打的是前两轮自己新写的代码** —— 每次 push 都会重扫整个 diff，
+修得越多新增面越大，这一轮集中在 §10/§11 加的 mutations 端点（3 条）、
+adapter 重试（1 条）、放宽焚毁前的清理（1 条）、以及一条**上一轮以为修了其实没修**的。
+
+### 12.1 又是自己引入的
+
+- **游标不防并列**：`nextSince` 只带毫秒时间戳，而 `DateTime` 就是毫秒精度。
+  一批同刻的变更跨在页边界上时，下一次 `> from` 把剩下那些同刻的行永久跳过。
+  改成 `(mutatedAt, id)` 复合 keyset。
+- **重试封了次数**：adapter 挂载 10 次 × 5 秒就永久放弃 —— 而 Redis 停机常常
+  不止一分钟。改成无上限退避重试（第 5 次失败报一次 error，之后静默）。
+- **放宽焚毁前的清理不分批**：一次 findMany 把整段积压的完整 JSON content
+  拉进内存 + 一条巨大的 IN 更新。改为分批；批次上限内清不完就**拒绝这次放宽**
+  （宁可晚点放宽，也不能让已经烧掉的内容重新可读）。
+- **保留窗口外的游标被默默抬高**：客户端于是以为追平了，而那段区间被撤回的
+  消息在它缓存里永远是原文。改成返回 `resetRequired`，客户端丢缓存重拉。
+
+### 12.2 上一轮「以为修了其实没修」
+
+`setBurnDuration` 的留痕：上一轮只是把 `emit` 从 fire-and-forget 改成 `await` ——
+**没用**，`emit` 内部就把失败吞成 warn 了，await 一个从不失败的调用等于什么都没做。
+现在设置更新与系统消息在同一个事务里（`insertSystemMessageInTx`），广播放在提交之后。
+**教训：给一个自己吞异常的函数加 await，是纯粹的自我安慰。**
+
+### 12.3 其余
+
+mutations 查询缺索引（新增 `[conversationID, revokedAt]` / `[conversationID, editedAt]`，
+WHERE 里的粗筛写成 `revokedAt >= x OR editedAt >= x` 正是为了走它们）；
+`detachSeat` 先播事件后离房（离房那几个 await 期间的广播，被移出的人照样收得到；
+现在先离房、失败则踢连接）；`quotedText` 不过敏感词（text 无害 + 引用目标不存在
++ 违禁内容全塞进 quotedText，检查一个字都看不到）。
+
+### 12.4 刻意不修
+
+**StorageAudit 的内存占用**（`collectReferencedKeys` 把全部 chat 媒体 key 收进一个
+Set）。分批取行已经做了，但 Set 本身与历史媒体总量成正比。这是纯规模问题：
+当前量级远够不着，而改成数据库侧对账是另一个体量的工程。与 §10.3 同类，留档。
+
+### 12.5 收口规则（2026-08-10 拍板）
+
+**从第四轮起：只修 P1，P2 一律记进本节留档，不再逐条追。**
+
+理由是三轮下来的实测规律：Codex 每次 push 重扫整个 diff，所以**每一批修复本身
+就是下一批的受检面**。三轮 9/10/9 条里，分别有 6、5、6 条打的是上一轮刚写的代码 ——
+这个过程不会自然收敛，只会随 diff 增大而延续。P1（安全、隐私、数据丢失）值得
+继续付这个成本；P2（规模、体验、边角一致性）到此为止，需要时再单独开批。
+
+已按此规则留档不修的 P2：§10.2 共享 object key 的撤回删除、§10.3 历史页表情回应
+无上界、§12.4 StorageAudit 的 key Set 内存。
+
+### 12.6 追加 P1：增量游标越过未提交的写（2026-08-10）
+
+`revokedAt`/`editedAt` 是在 Node 侧、写语句**构造时**生成的，而行要到 COMMIT 才对
+别的事务可见 —— 中间隔着锁等待（并发编辑、焚毁 sweeper 的 updateMany 都会持锁）。
+于是存在「时间戳很早、提交很晚」的行：
+
+```
+T=0s  A 撤回 M → 盖上 revokedAt=0s，UPDATE 卡在行锁上
+T=3s  设备 D 同步 → 查不到未提交的行 → 游标推到 3s
+T=5s  A 提交，revokedAt 仍然是 0s
+之后  D 拿 since=3s 来问 → 0s > 3s 不成立 → 这条撤回永远追不到
+```
+
+修法是**安全水位**：游标绝不越过 `now - MUTATION_SAFETY_LAG_MS`（60s）。
+DATABASE_STATEMENT_TIMEOUT_MS 默认 15s，超时的写会被 Postgres 掐掉，不可能悬挂
+得比 60s 更久，所以这个水位是充分的。代价只是重叠区间被重复投递，ingest 幂等。
+
+三条路径都要卡：正常分页、**空响应**（「一次什么都没查到的同步」恰恰是最容易
+跨过去的时刻）、resetRequired 之后的第一段。水位会让游标推不动时（整页都在不安全
+窗口里）报「已追平」而不是谎报 hasMore —— 后者会让客户端空转。
+
+**没有**采用 reviewer 建议的 commit-order sequence/outbox：普通序列同样不保证提交序
+（拿到 6 的事务可能先于拿到 5 的提交），真做得靠 `pg_current_snapshot()` 的 xmin
+逐行记录，那是 CDC 级别的机制，与这条通道的收益不成比例。在 statement_timeout
+有界的前提下安全水位是充分的 —— 这是一个**有意的取舍**，不是等价替换。
