@@ -5,8 +5,12 @@ import {
 import {
   NoopErrorAggregationProvider,
   SentryErrorAggregationProvider,
+  configureErrorAggregationProvider,
   createErrorAggregationConfig,
   createErrorAggregationProvider,
+  createSentryInitOptions,
+  reportOperationalError,
+  type ErrorAggregationProvider,
   type SentryClientLike,
 } from './error-aggregation.service';
 
@@ -133,7 +137,7 @@ describe('SentryErrorAggregationProvider', () => {
 
     expect(client.captureException).toHaveBeenCalledTimes(1);
     expect(client.captureException).toHaveBeenCalledWith(
-      error,
+      expect.objectContaining({ message: 'http server error' }),
       expect.objectContaining({
         tags: expect.objectContaining({
           requestId: 'req-1',
@@ -144,6 +148,24 @@ describe('SentryErrorAggregationProvider', () => {
         }),
         user: { id: 'user-1' },
       }),
+    );
+    expect(client.captureException.mock.calls[0]?.[0]).not.toBe(error);
+  });
+
+  it('sanitizes secrets and PII from captured exception messages and stacks', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+    const error = new Error(
+      'private chat says blue pineapple for person@example.test with Bearer top-secret at https://store.test/object?X-Amz-Signature=secret',
+    );
+    error.stack = `${error.message}\n at eyJheader.payload.signature`;
+
+    provider.captureError(error, { statusCode: 500 });
+
+    const captured = client.captureException.mock.calls[0]?.[0] as Error;
+    expect(captured).not.toBe(error);
+    expect(`${captured.message}\n${captured.stack}`).not.toMatch(
+      /blue pineapple|person@example\.test|top-secret|X-Amz-Signature|eyJheader\.payload\.signature/,
     );
   });
 
@@ -266,6 +288,107 @@ describe('SentryErrorAggregationProvider', () => {
 
     await expect(provider.flush(2000)).resolves.toBe(true);
     expect(client.flush).toHaveBeenCalledWith(2000);
+  });
+});
+
+describe('reportOperationalError', () => {
+  afterEach(() => {
+    configureErrorAggregationProvider(new NoopErrorAggregationProvider());
+  });
+
+  it('routes non-HTTP failures through the configured provider with stable tags', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+
+    reportOperationalError(new Error('db down'), {
+      component: 'CallCleanup',
+      operation: 'sweepExpiredRingingCalls',
+      kind: 'scheduler',
+    });
+
+    expect(provider.captureError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: 'CallCleanup.sweepExpiredRingingCalls failure',
+      }),
+      {
+        component: 'CallCleanup',
+        operation: 'sweepExpiredRingingCalls',
+        kind: 'scheduler',
+      },
+    );
+  });
+
+  it('deduplicates repeated operational failures so outages do not flood Sentry', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+    const context = {
+      component: 'RealtimeGateway',
+      operation: 'emitSnapshot',
+      kind: 'websocket',
+    };
+
+    reportOperationalError(new Error('first'), context);
+    reportOperationalError(new Error('second'), context);
+
+    expect(provider.captureError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createSentryInitOptions', () => {
+  it('disables automatic integrations and applies a final privacy filter', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://a@o/1',
+      environment: 'production',
+      release: 'circle-be@abc',
+    });
+
+    expect(options).toEqual(
+      expect.objectContaining({
+        sendDefaultPii: false,
+        defaultIntegrations: false,
+        tracesSampleRate: 0,
+      }),
+    );
+    expect(typeof options.beforeSend).toBe('function');
+    const filtered = (options.beforeSend as (event: unknown) => unknown)({
+      exception: {
+        values: [
+          {
+            type: 'Error',
+            value: 'private blue pineapple',
+            stacktrace: {
+              frames: [
+                {
+                  filename: 'src/chat.ts',
+                  function: 'send',
+                  lineno: 42,
+                  vars: { message: 'private blue pineapple' },
+                  context_line: 'const message = privateContent',
+                },
+              ],
+            },
+          },
+        ],
+      },
+      request: { headers: { authorization: 'Bearer secret' } },
+    }) as Record<string, any>;
+    expect(JSON.stringify(filtered)).not.toMatch(/blue pineapple|Bearer secret/);
+    expect(filtered.exception.values[0].stacktrace.frames).toEqual([
+      {
+        filename: 'src/chat.ts',
+        function: 'send',
+        lineno: 42,
+      },
+    ]);
   });
 });
 

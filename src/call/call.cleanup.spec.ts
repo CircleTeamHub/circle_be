@@ -1,4 +1,5 @@
 import { CallCleanup } from './call.cleanup';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 describe('CallCleanup', () => {
   it('sweeps expired ringing calls through CallService', async () => {
@@ -20,6 +21,16 @@ describe('CallCleanup', () => {
     };
     const cleanup = new CallCleanup(service as any);
 
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation(() => undefined);
+
     await expect(cleanup.sweepExpiredRingingCalls()).resolves.toBeUndefined();
+    expect(report).toHaveBeenCalledWith(expect.any(Error), {
+      component: 'CallCleanup',
+      operation: 'sweepExpiredRingingCalls',
+      kind: 'scheduler',
+    });
+    report.mockRestore();
   });
 });

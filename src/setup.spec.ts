@@ -6,6 +6,7 @@ import { RedisService } from './redis/redis.service';
 import { setupApp } from './setup';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
+import * as errorAggregation from './logging/error-aggregation.service';
 
 function buildAppMock(
   redisService?: Pick<RedisService, 'createRateLimitStore'> &
@@ -47,6 +48,21 @@ describe('setupApp', () => {
     expect(app.useGlobalInterceptors).toHaveBeenCalledWith(
       expect.any(ResponseInterceptor),
     );
+  });
+
+  it('makes the configured aggregation provider available to non-HTTP jobs', () => {
+    const configure = jest.spyOn(
+      errorAggregation,
+      'configureErrorAggregationProvider',
+    );
+    const app = buildAppMock();
+
+    setupApp(app as any);
+
+    expect(configure).toHaveBeenCalledWith(
+      expect.objectContaining({ captureError: expect.any(Function) }),
+    );
+    configure.mockRestore();
   });
 
   it('registers global exception filters (All + Prisma)', () => {

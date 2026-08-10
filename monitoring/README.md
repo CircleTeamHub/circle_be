@@ -33,12 +33,12 @@ cp monitoring/alertmanager/discord.url.example monitoring/alertmanager/discord.u
 docker compose -f monitoring/docker-compose.yml up -d
 ```
 
-| UI           | URL                   | Login                        |
-| ------------ | --------------------- | ---------------------------- |
-| Grafana      | http://localhost:3001 | from `monitoring/.env`       |
-| Prometheus   | http://localhost:9090 | —                            |
-| Alertmanager | http://localhost:9093 | —                            |
-| Uptime-Kuma  | http://localhost:3002 | set on first visit           |
+| UI           | URL                   | Login                  |
+| ------------ | --------------------- | ---------------------- |
+| Grafana      | http://localhost:3001 | from `monitoring/.env` |
+| Prometheus   | http://localhost:9090 | —                      |
+| Alertmanager | http://localhost:9093 | —                      |
+| Uptime-Kuma  | http://localhost:3002 | set on first visit     |
 
 In Grafana the **Prometheus** datasource and the **circle_be — RED** dashboard
 are auto-provisioned (Dashboards → circle_be — RED).
@@ -52,10 +52,10 @@ every start, which reads like it applied, but it did not.
 
 Verified against `grafana/grafana:13.1.0` on an existing volume:
 
-| Login attempt after changing the env var and recreating | Result |
-| --- | --- |
-| the **new** `GRAFANA_ADMIN_PASSWORD` | **401** — never applied |
-| the password the volume was **originally** seeded with | **200** — still live |
+| Login attempt after changing the env var and recreating | Result                  |
+| ------------------------------------------------------- | ----------------------- |
+| the **new** `GRAFANA_ADMIN_PASSWORD`                    | **401** — never applied |
+| the password the volume was **originally** seeded with  | **200** — still live    |
 
 So **if your `grafana_data` volume predates this password being set, changing it
 buys you nothing** — the old credential still works and the new one does not.
@@ -200,11 +200,11 @@ permanently red, which just teaches you to ignore red.
 So the job resolves **both container names via Docker's embedded DNS** and takes
 whatever exists:
 
-| Situation | Targets |
-| --- | --- |
-| Steady state | 1 — the live colour. The absent name is NXDOMAIN and contributes nothing (no error, no lookup failure). |
-| Mid-release | 2 — both colours, with distinct `instance` labels. You can watch the new colour before Caddy switches to it. |
-| After the switch | 1 — the removed colour's series goes stale within ~30s, well inside `TargetDown`'s `for: 2m`, so a release does not page you. |
+| Situation         | Targets                                                                                                                                                                     |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Steady state      | 1 — the live colour. The absent name is NXDOMAIN and contributes nothing (no error, no lookup failure).                                                                     |
+| Mid-release       | 2 — both colours, with distinct `instance` labels. You can watch the new colour before Caddy switches to it.                                                                |
+| After the switch  | 1 — the removed colour's series goes stale within ~30s, well inside `TargetDown`'s `for: 2m`, so a release does not page you.                                               |
 | No backend at all | 0 — **`up` stops existing rather than going to 0**, so `up == 0` cannot fire. The `CircleBeNoTarget` `absent()` rule in `alerts.yml` covers exactly this. Do not delete it. |
 
 `instance` is relabelled from the resolved name to a stable `circle-be-blue` /
@@ -231,41 +231,11 @@ release), and a `color` label is added so you can tell them apart mid-release.
   itself. On a real Linux server it measures the host. `cAdvisor` can be flaky on
   Docker Desktop for Mac — if it crash-loops, comment out the `cadvisor` service
   and its scrape job; the rest is unaffected.
-- **OpenIM metrics:** a commented scrape job is in `prometheus/prometheus.yml`;
-  enable it once you confirm OpenIM's metrics port for your version.
-
-## Relationship to OpenIM's own monitoring stack
-
-`DEPLOY.md` has the operator clone
-[openim-docker](https://github.com/openimsdk/openim-docker) separately, and that
-compose file **also ships prometheus / alertmanager / grafana / node-exporter**.
-Two things stop it colliding with this stack — both are upstream defaults, not
-local tweaks:
-
-- **It is opt-in.** All four services sit behind `profiles: [m]`, so a plain
-  `docker compose up -d` in openim-docker starts **no** monitoring at all. You
-  only get them with `--profile m`.
-- **Its ports are renumbered into the 1xxxx range** and it uses
-  `network_mode: host` (no published ports):
-
-  | Service       | OpenIM (`--profile m`) | This stack |
-  | ------------- | ---------------------- | ---------- |
-  | Prometheus    | 19090                  | 9090       |
-  | Alertmanager  | 19093                  | 9093       |
-  | Grafana       | 13000                  | 3001       |
-  | node-exporter | 19100                  | (internal) |
-
-So both can run on one box. If you do run both with `--profile m`, you get two
-node-exporters measuring the same host — harmless, just redundant.
-
-**We deliberately do not add a `circle-be` job to OpenIM's Prometheus.** Its
-config lives in the upstream checkout (`config/prometheus.yml`), so any edit is
-lost on the operator's next `git pull`; replacing it via an override would mean
-vendoring OpenIM's whole service-discovery config into this repo and keeping it
-in sync with their releases. Its Grafana also runs
-`GF_AUTH_ANONYMOUS_ENABLED=true` with `GF_AUTH_ANONYMOUS_ORG_ROLE=Admin` —
-anyone who reaches the port is an admin — which is a worse home for our
-dashboards than the password-protected Grafana here.
+- **Self-hosted chat metrics:** the chat gateway exports connection count,
+  per-instance online users, event QPS, ACK/broadcast latency, auth failures,
+  connection rejections, and rate-limit events through the backend `/metrics`.
+  The Grafana dashboard and alert rules are already provisioned for these
+  metric families.
 
 ## Alerts → Discord
 
@@ -320,7 +290,7 @@ in its own UI (data persists in a volume).
   `monitoring/.env` file on the box.
 - **The base compose file targets the dev backend.** Scraping production needs
   the prod overlay — see [Scraping production](#scraping-production). Bringing
-  this stack up on a server *without* the overlay monitors nothing.
+  this stack up on a server _without_ the overlay monitors nothing.
 - **Never point the `circle-be` job at a public URL.** `deploy/Caddyfile.admin`
   returns 404 for `/metrics` on purpose; the scrape path is the internal compose
   network, and the bearer token is a second layer behind that, not a substitute

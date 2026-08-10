@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /**
  * Prunes dead RefreshToken rows so the table doesn't grow unbounded (F-09).
@@ -41,6 +42,11 @@ export class RefreshTokenCleanup {
         this.logger.log(`Pruned ${count} expired/revoked refresh tokens`);
       }
     } catch (err) {
+      reportOperationalError(err, {
+        component: 'RefreshTokenCleanup',
+        operation: 'sweep',
+        kind: 'scheduler',
+      });
       // Best-effort housekeeping: never let a prune failure crash the scheduler.
       this.logger.error(`Refresh-token prune failed: ${String(err)}`);
     }

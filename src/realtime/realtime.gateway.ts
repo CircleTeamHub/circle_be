@@ -9,6 +9,7 @@ import {
   RealtimeService,
   type RealtimeSocketIdentity,
 } from './realtime.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
@@ -119,7 +120,16 @@ export class RealtimeGateway implements OnModuleDestroy {
         return;
       }
 
-      void this.acceptAuthenticatedSocket(socket, verified, authTimeout);
+      void this.acceptAuthenticatedSocket(socket, verified, authTimeout).catch(
+        (error: unknown) => {
+          reportOperationalError(error, {
+            component: 'RealtimeGateway',
+            operation: 'admitSocket',
+            kind: 'websocket',
+          });
+          socket.close(1011, 'Internal error');
+        },
+      );
     });
 
     socket.on('error', (error) => {
@@ -222,6 +232,11 @@ export class RealtimeGateway implements OnModuleDestroy {
     try {
       await this.realtimeService.emitSnapshot(userId);
     } catch (error) {
+      reportOperationalError(error, {
+        component: 'RealtimeGateway',
+        operation: 'emitSnapshot',
+        kind: 'websocket',
+      });
       this.logger.warn(
         `Failed to emit initial snapshot for ${userId}: ${error instanceof Error ? error.message : error}`,
       );

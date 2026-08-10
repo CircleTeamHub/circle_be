@@ -65,11 +65,22 @@ REST 面沿用 ThrottlerGuard 每路由限流。
 
 ## Phase 2+ 待办(有意不在本批)
 
+> **这份清单是不完整的**,2026-08-09 的全量对照发现它漏了整整一层。
+> 完整缺口清单与补齐计划见 [self-hosted-chat-remediation.md](./self-hosted-chat-remediation.md)。
+>
+> 漏的原因:下面 6 条**全部是服务端视角**,是从「网关还缺什么」倒推出来的,
+> 于是 OpenIM SDK 免费提供的那一层(本地 SQLite、消息撤回、真引用、全局未读、
+> 成员变更事件)在迁移里没有任何人认领。换掉自带电池的 SDK 时,逐个方法找替代
+> 是不够的 —— 要连同「方法背后的基础设施」一起清点。
+
+以下 6 条已随 Phase 2–3 落地:
+
 - 群聊会话与 Circle 成员的同步(建圈建会话、进圈入座、踢人离座)+ 系统消息。
 - 离线推送:接现有 NotificationPushOutbox 管道,加「新消息」推送类型
   (@提及去重参考 squady mention 分流)。
 - temp-chat 重接(guest 身份 → socket 鉴权的第二形态)+ chat-history 模块
   从 OpenIM 查询改为本表 SQL。
 - 媒体:content 存 object key,读时 presign(复用 notes 的 presign-on-read)。
-- 多实例:`@socket.io/redis-adapter`(依赖未装,单实例阶段不需要)。
+- 多实例:`@socket.io/redis-adapter`(依赖未装,单实例阶段不需要)。**未做**,
+  见 remediation G-04 —— 且 adapter 之外还有四处进程内状态要一并改。
 - FE serverErrors 词表补 `CHAT_*` 五语种词条(接线批次一并做)。

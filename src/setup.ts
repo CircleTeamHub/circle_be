@@ -24,6 +24,7 @@ import { createRateLimitHandler } from './logging/rate-limit-logger';
 import {
   createErrorAggregationConfig,
   createErrorAggregationProvider,
+  configureErrorAggregationProvider,
   type ErrorAggregationProvider,
 } from './logging/error-aggregation.service';
 import { Registry } from 'prom-client';
@@ -34,6 +35,7 @@ import { createInfraStatusMetrics } from './metrics/infra-status.metrics';
 import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
+import { chatMetrics } from './chat/chat-metrics';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -373,6 +375,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         redisMetrics.registry,
         uploadMetrics.registry,
         infraStatusMetrics.registry,
+        chatMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),
@@ -401,6 +404,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
       String(config['NODE_ENV'] || process.env.NODE_ENV || 'development'),
     ),
   );
+  configureErrorAggregationProvider(errorAggregation);
   if (logger && loggingConfig.httpLogOn) {
     app.useGlobalInterceptors(
       new ErrorLoggingInterceptor(logger, errorAggregation),
