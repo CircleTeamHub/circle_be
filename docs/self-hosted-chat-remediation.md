@@ -771,3 +771,35 @@ DATABASE_STATEMENT_TIMEOUT_MS 默认 15s，超时的写会被 Postgres 掐掉，
 （拿到 6 的事务可能先于拿到 5 的提交），真做得靠 `pg_current_snapshot()` 的 xmin
 逐行记录，那是 CDC 级别的机制，与这条通道的收益不成比例。在 statement_timeout
 有界的前提下安全水位是充分的 —— 这是一个**有意的取舍**，不是等价替换。
+
+---
+
+## 13. Codex review 第四轮（2026-08-10，FE PR #153）
+
+按 §12.5 的收口规则：**3 条 P1 已修，2 条 P2 留档不追**。
+
+### 13.1 已修的 P1
+
+- **清空会话不删 outbox**：`clearLocalConversationMessages` 只删 `messages` 与
+  `sync_state`，那条没发出去的私信正文原样留在 `outbox` 里 —— 而且下次冷启动
+  `hydrateFromLocalDb` 会把它当「发送失败」气泡还原出来。清空既没清干净也没清住。
+- **焚毁到期的消息留在本地缓存**：服务端 sweeper 物删之后，本地库无从得知
+  （没有到期元数据、没有删除事件，后续 REST 页「少了哪些行」也对不出来）。
+  于是冷启动水合与本地 FTS 搜索仍然能把本该烧掉的正文端出来 —— 阅后即焚在
+  本地这一侧等于没生效。新增 `purgeExpiredLocalMessages` + store 侧
+  `purgeExpiredBurnMessages`，在**拿到会话快照 / 档位变更 / 冷启动水合**三处触发
+  （DELETE 会触发 `messages_fts_ad`，FTS 影子表跟着清）。
+- **清空全部聊天谎报成功**：`Promise.allSettled` 把 rejection 全吞了，接着照样清
+  本地并弹「已全部清空」。没清成的会话服务端历史还在，下次加载或来一条新消息就
+  整段回来，而用户被告知已经删干净了。改成统计失败数并如实提示重试（水位幂等，
+  再点一次只补没写成的那些）。
+
+### 13.2 留档不修的 P2
+
+- **`nextSinceId` 没随 `nextSince` 一起落盘**：App 在翻页中途被杀，重启后
+  `sinceId` 回到空串。实际影响只是**边界那一刻的变更被重复投递一次**（`id > ''`
+  对所有 id 成立，所以不会漏），而 ingest 本来就幂等。两行就能改，但按收口规则
+  记在这里，需要时再动。
+- **ack 之后的 outbox 删除是 fire-and-forget**：ack 回来后进程立刻被杀，那条已成功
+  的 outbox 行会留下，冷启动可能把已确认的消息换成失败气泡、诱导一次无意义的重发。
+  窗口极窄（ack 与 delete 之间），且重发本身是幂等的。
