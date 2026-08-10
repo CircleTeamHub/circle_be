@@ -217,10 +217,6 @@ function sanitizeAutomaticEvent(event: unknown): unknown {
   if (exception) safe.exception = exception;
   const stacktrace = sanitizeEventStacktrace(source.stacktrace);
   if (stacktrace) safe.stacktrace = stacktrace;
-  if (source.user && typeof source.user === 'object') {
-    const id = (source.user as Record<string, unknown>).id;
-    if (typeof id === 'string' && id.trim()) safe.user = { id: id.trim() };
-  }
   if (source.tags && typeof source.tags === 'object') {
     const sourceTags = source.tags as Record<string, unknown>;
     const safeTags: Record<string, unknown> = {};
@@ -312,14 +308,9 @@ export class SentryErrorAggregationProvider implements ErrorAggregationProvider 
 
     const captureContext: {
       tags: Record<string, string>;
-      user?: { id: string };
     } = {
       tags: buildTags(context, this.limitPathCardinality),
     };
-
-    if (context.userId) {
-      captureContext.user = { id: context.userId };
-    }
 
     this.client.captureException(toSafeError(error, context), captureContext);
   }
@@ -451,9 +442,9 @@ export function createSentryInitOptions(
     environment: config.environment,
     release: config.release,
     sendDefaultPii: false,
-    // This service intentionally captures only explicit, allowlisted events.
-    // Disable request/console/local-variable and global exception integrations.
-    defaultIntegrations: false,
+    // Keep the SDK's process-level crash integrations. beforeSend rebuilds every
+    // event from an allowlist, so global events cannot include request data,
+    // local variables, breadcrumbs, extras, or account identifiers.
     beforeSend: sanitizeAutomaticEvent,
     // Error aggregation only — no performance tracing by default.
     tracesSampleRate: 0,

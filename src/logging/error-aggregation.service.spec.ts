@@ -121,7 +121,7 @@ describe('createErrorAggregationProvider', () => {
 });
 
 describe('SentryErrorAggregationProvider', () => {
-  it('captures server errors with sanitized request tags and user id', () => {
+  it('captures server errors with sanitized request tags but no account identity', () => {
     const client = createFakeClient();
     const provider = new SentryErrorAggregationProvider(client);
     const error = new Error('boom');
@@ -146,8 +146,10 @@ describe('SentryErrorAggregationProvider', () => {
           path: '/api/v1/circle',
           statusCode: '500',
         }),
-        user: { id: 'user-1' },
       }),
+    );
+    expect(client.captureException.mock.calls[0]?.[1]).not.toHaveProperty(
+      'user',
     );
     expect(client.captureException.mock.calls[0]?.[0]).not.toBe(error);
   });
@@ -343,7 +345,7 @@ describe('reportOperationalError', () => {
 });
 
 describe('createSentryInitOptions', () => {
-  it('disables automatic integrations and applies a final privacy filter', () => {
+  it('keeps default crash integrations and applies a final privacy filter', () => {
     const options = createSentryInitOptions({
       provider: 'sentry',
       dsn: 'https://a@o/1',
@@ -354,10 +356,10 @@ describe('createSentryInitOptions', () => {
     expect(options).toEqual(
       expect.objectContaining({
         sendDefaultPii: false,
-        defaultIntegrations: false,
         tracesSampleRate: 0,
       }),
     );
+    expect(options).not.toHaveProperty('defaultIntegrations');
     expect(typeof options.beforeSend).toBe('function');
     const filtered = (options.beforeSend as (event: unknown) => unknown)({
       exception: {
