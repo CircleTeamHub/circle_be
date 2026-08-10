@@ -35,6 +35,8 @@ import {
   MUTATION_LOOKBACK_MS,
   MUTATION_PAGE_MAX,
   READERS_PAGE_MAX,
+  RELAX_PURGE_BATCH,
+  RELAX_PURGE_BATCHES_MAX,
 } from './chat.constants';
 import type {
   ChatConversationDto,
@@ -170,15 +172,22 @@ export class ChatService {
         });
       }
     }
-    const text = payload.content['text'];
-    if (text !== undefined) {
-      if (typeof text !== 'string' || text.length > MAX_TEXT_LENGTH) {
+    // quotedText 与 text 同等对待。
+    //
+    // 它是客户端塞的「被引用消息原文」快照,在引用目标已被物删时作为兜底展示 ——
+    // 也就是说它会原样落库、原样广播。只检 text 的话:发一条 type='quote'、
+    // text 无害、replyToId 指向一条不存在的消息(于是归属校验把引用降级成 null)、
+    // 把违禁内容全塞进 quotedText —— 敏感词检查一个字都看不到。
+    for (const field of ['text', 'quotedText']) {
+      const value = payload.content[field];
+      if (value === undefined) continue;
+      if (typeof value !== 'string' || value.length > MAX_TEXT_LENGTH) {
         throw new BadRequestException({
           message: '文本超限',
           errorCode: ChatErrorCode.InvalidPayload,
         });
       }
-      const verdict = this.sensitiveWords.check(text);
+      const verdict = this.sensitiveWords.check(value);
       if (verdict.blocked) {
         throw new BadRequestException({
           message: '消息包含敏感词',
@@ -965,20 +974,29 @@ export class ChatService {
     userId: string,
     since: Date,
     limit = MUTATION_PAGE_MAX,
+    sinceId = '',
   ): Promise<ChatMutationsPageDto> {
     const serverTime = new Date().toISOString();
     const lookbackFloor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
-    const from = since > lookbackFloor ? since : lookbackFloor;
-    const memberships = await this.prisma.chatMember.findMany({
-      where: { userID: userId, leftAt: null },
-      select: { conversationID: true, clearedBeforeHeight: true },
-    });
     const empty: ChatMutationsPageDto = {
       messages: [],
       serverTime,
       nextSince: serverTime,
+      nextSinceId: '',
       hasMore: false,
+      resetRequired: false,
     };
+    // 游标比保留窗口还老:这段时间里的撤回/编辑已经查不到了。
+    // 原来是默默把游标抬到窗口下沿 —— 客户端于是以为自己追平了,而那段区间里
+    // 被撤回的消息在它的缓存里永远是原文(撤回不改 height,历史补拉够不着)。
+    // 如实告诉它「缓存作废,重新拉」。
+    if (since < lookbackFloor) {
+      return { ...empty, resetRequired: true };
+    }
+    const memberships = await this.prisma.chatMember.findMany({
+      where: { userID: userId, leftAt: null },
+      select: { conversationID: true, clearedBeforeHeight: true },
+    });
     if (memberships.length === 0) return empty;
 
     // 每会话的可见边界:清空水位 + 焚毁/自动销毁截止。必须进 SQL 的 WHERE ——
@@ -1006,9 +1024,15 @@ export class ChatService {
       heightFloors.set(m.conversationID, m.clearedBeforeHeight ?? 0);
     }
 
-    // 多取一条用来判断「还有没有」。撤回与编辑各有各的时间戳,统一成
-    // GREATEST 才能给出一条真正按时间单调的游标 —— Prisma 的多字段 orderBy
-    // 做不到这件事(它会先按 revokedAt 排完再排 editedAt)。
+    // 多取一条用来判断「还有没有」。
+    //
+    // 游标是 (mutatedAt, id) 复合键,不是单一时间戳:DateTime 只有毫秒精度,
+    // 一批同毫秒的变更跨在页边界上时,单时间戳游标配 `> from` 会把剩下那些
+    // 同刻的行永久跳过。撤回与编辑各有各的时间戳,统一成 GREATEST 才排得出
+    // 单调序 —— Prisma 的多字段 orderBy 做不到这件事,所以走原始 SQL。
+    //
+    // WHERE 里那条 `revokedAt >= ... OR editedAt >= ...` 是给索引用的粗筛
+    // (GREATEST 表达式本身走不了索引);精确的 keyset 判定叠在它上面。
     const take = Math.min(Math.max(limit, 1), MUTATION_PAGE_MAX);
     const rows = await this.prisma.$queryRaw<
       Array<MessageRow & { mutatedAt: Date }>
@@ -1026,24 +1050,33 @@ export class ChatService {
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
         AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
-        AND GREATEST(
+        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since})
+        AND (
+          GREATEST(
+            COALESCE(m."revokedAt", to_timestamp(0)),
+            COALESCE(m."editedAt", to_timestamp(0))
+          ) > ${since}
+          OR (
+            GREATEST(
               COALESCE(m."revokedAt", to_timestamp(0)),
               COALESCE(m."editedAt", to_timestamp(0))
-            ) > ${from}
-      ORDER BY "mutatedAt" ASC
+            ) = ${since}
+            AND m."id" > ${sinceId}
+          )
+        )
+      ORDER BY "mutatedAt" ASC, m."id" ASC
       LIMIT ${take + 1}
     `;
 
     const hasMore = rows.length > take;
     const page = hasMore ? rows.slice(0, take) : rows;
-    // 截断了就把游标停在这一页的最后一次变更上,绝不能回 serverTime ——
-    // 客户端照它前进的话,没返回的那些变更会被永久跳过(撤回的正文因此
-    // 一直留在对方屏幕上)。
-    const nextSince =
-      hasMore && page.length > 0
-        ? page[page.length - 1].mutatedAt.toISOString()
-        : serverTime;
     if (page.length === 0) return empty;
+    // 截断了就把游标停在这一页的最后一条上,绝不能回 serverTime ——
+    // 客户端照它前进的话,没返回的那些变更会被永久跳过(撤回的正文因此
+    // 一直留在对方屏幕上)。id 一起带回去,同毫秒的行才不会丢。
+    const last = page[page.length - 1];
+    const nextSince = hasMore ? last.mutatedAt.toISOString() : serverTime;
+    const nextSinceId = hasMore ? last.id : '';
     const senders = await this.resolveSenders(
       page.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
@@ -1051,7 +1084,14 @@ export class ChatService {
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
     await this.attachReplyTo(messages, { heightFloors });
-    return { messages, serverTime, nextSince, hasMore };
+    return {
+      messages,
+      serverTime,
+      nextSince,
+      nextSinceId,
+      hasMore,
+      resetRequired: false,
+    };
   }
 
   /** 两个「不早于」截止时间取更严的一个(更晚者);都为空则不过滤。 */
@@ -2212,17 +2252,25 @@ export class ChatService {
       conversation.burnDurationSec,
       normalized,
     );
-    const updated = await this.prisma.chatConversation.update({
-      where: { id: conversationId },
-      data: { burnDurationSec: normalized },
-    });
     // 微信/Signal 式留痕:开关变化必须双方可见,防「对方偷偷开了焚毁」。
-    // 必须等它落库:emit 里已经把失败吞成 warn,这里再 fire-and-forget 一次,
-    // 就成了「设置生效了、痕迹没留下」也照样返回成功。
-    await this.systemMessage.emit(conversationId, {
-      kind: 'burn-changed',
-      seconds: normalized ?? 0,
+    //
+    // 设置与痕迹必须在**同一个事务**里。上一版只是把 emit 从 fire-and-forget
+    // 改成 await —— 没用:emit 内部就把失败吞成 warn 了,await 一个从不失败的
+    // 调用,等于什么都没做。破坏性的保留策略照样能在无人知晓的情况下生效。
+    const { updated, notice } = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.chatConversation.update({
+        where: { id: conversationId },
+        data: { burnDurationSec: normalized },
+      });
+      const dto = await this.systemMessage.insertSystemMessageInTx(
+        tx,
+        conversationId,
+        { kind: 'burn-changed', seconds: normalized ?? 0 },
+      );
+      return { updated: row, notice: dto };
     });
+    // 广播放在提交之后:事务回滚了却已经播出去,客户端会显示一条并不存在的提示。
+    this.systemMessage.broadcastSystemMessage(notice);
     return { burnDurationSec: updated.burnDurationSec ?? null };
   }
 
@@ -2239,27 +2287,41 @@ export class ChatService {
     if (!previousSeconds || previousSeconds <= 0) return;
     if (nextSeconds !== null && nextSeconds <= previousSeconds) return;
     const cutoff = new Date(Date.now() - previousSeconds * 1000);
-    const expired = await this.prisma.chatMessage.findMany({
-      where: {
-        conversationID: conversationId,
-        deleted: false,
-        createdAt: { lt: cutoff },
-      },
-      select: { id: true, type: true, content: true },
+    // 分批。刚开了 30 秒焚毁又立刻关掉的长会话,积压可能是整段历史:
+    // 一次 findMany 会把每一行的完整 JSON content 都拉进内存,后面再跟一条
+    // 巨大的 IN 更新 —— 内存、查询参数上限、接口超时三样一起顶上来。
+    for (let round = 0; round < RELAX_PURGE_BATCHES_MAX; round += 1) {
+      const expired = await this.prisma.chatMessage.findMany({
+        where: {
+          conversationID: conversationId,
+          deleted: false,
+          createdAt: { lt: cutoff },
+        },
+        select: { id: true, type: true, content: true },
+        take: RELAX_PURGE_BATCH,
+      });
+      if (expired.length === 0) return;
+      await this.prisma.chatMessage.updateMany({
+        where: { id: { in: expired.map((row) => row.id) } },
+        // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
+        // 只清 content 等于「烧掉的只是最后一版」。
+        data: {
+          deleted: true,
+          content: {},
+          contentHistory: [] as Prisma.InputJsonValue,
+        },
+      });
+      const mediaKeys = expired.flatMap((row) => this.collectMediaKeys(row));
+      if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
+      if (expired.length < RELAX_PURGE_BATCH) return;
+    }
+    // 批次上限也没清完(异常量级的积压):设置**不放宽**,让读路径继续按旧
+    // 截止过滤,剩下的交给每分钟 sweeper。宁可晚点放宽,也不能让已经烧掉的
+    // 内容重新可读。
+    throw new BadRequestException({
+      message: '历史清理中,请稍后再试',
+      errorCode: ChatErrorCode.RateLimited,
     });
-    if (expired.length === 0) return;
-    await this.prisma.chatMessage.updateMany({
-      where: { id: { in: expired.map((row) => row.id) } },
-      // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
-      // 只清 content 等于「烧掉的只是最后一版」。
-      data: {
-        deleted: true,
-        content: {},
-        contentHistory: [] as Prisma.InputJsonValue,
-      },
-    });
-    const mediaKeys = expired.flatMap((row) => this.collectMediaKeys(row));
-    if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
   }
 
   /**

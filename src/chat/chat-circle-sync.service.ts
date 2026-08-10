@@ -337,29 +337,48 @@ export class ChatCircleSyncService {
    * updatedAt 窗口根本扫不到这个圈子。结果就是:真实的退群/踢人一条提示都没有,
    * 只有对账自己发现的差异才会提示,而那条路径实际上永远走不到。
    *
-   * 两件事都是尽力而为:座位状态已经落库,提示丢了只是少一行灰字。
+   * 提示是尽力而为(座位状态已经落库,丢了只是少一行灰字);**离房不是**。
+   * 返回的 Promise 在离房尝试结束后 resolve,调用方应当 await 它。
    */
-  detachSeat(
+  async detachSeat(
     userId: string,
     conversationId: string,
     kind: 'left' | 'removed',
-  ): void {
-    // 个人事件先行:socket 离房只保证收不到新消息,UI 收走会话要靠这条。
-    // left 与 removed 的区别只在客户端文案(被移出才提示),行为一致。
+  ): Promise<void> {
+    // 先离房,再发个人事件。
+    //
+    // 反过来的话(原来的顺序):emitConversationChange 立刻返回,而离房内部
+    // 还在 await fetchSockets —— 这中间广播到会话房的消息,那位已经被移出的
+    // 成员照样收得到(广播不会再查一次 ChatMember)。离房失败时更糟:他会一直
+    // 留在房里收群消息,直到自己重连。所以失败要踢连接,让他重连时按座位重新派生。
+    try {
+      await this.broadcast.removeUserFromConversation(userId, conversationId);
+    } catch (error: unknown) {
+      this.logger.warn(
+        `detach seat failed user=${userId} conversation=${conversationId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      // 离不了房就断连接:重连时 handleConnection 会按当前座位重新派生房间,
+      // 而他已经没有这个会话的座位了。
+      await this.broadcast
+        .disconnectUserSockets(userId)
+        .catch((disconnectError: unknown) =>
+          this.logger.error(
+            `detach seat could not evict sockets user=${userId}: ${
+              disconnectError instanceof Error
+                ? disconnectError.message
+                : String(disconnectError)
+            }`,
+          ),
+        );
+    }
+    // 个人事件:UI 收走会话靠它。left 与 removed 的区别只在客户端文案。
     this.broadcast.emitConversationChange(userId, {
       kind,
       conversationId,
       userId,
     });
-    void this.broadcast
-      .removeUserFromConversation(userId, conversationId)
-      .catch((error: unknown) =>
-        this.logger.warn(
-          `detach seat failed user=${userId} conversation=${conversationId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        ),
-      );
     void this.systemMessage
       .emit(conversationId, { kind: 'member-left' })
       .catch((error: unknown) =>

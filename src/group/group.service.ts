@@ -395,7 +395,9 @@ export class GroupService {
       });
     });
     if (releasedConversationId) {
-      this.chatCircleSync.detachSeat(
+      // await:离房完成之前不能宣布移除,否则这中间广播到会话房的消息
+      // 那位已被移出的成员照样收得到(广播不会再查一次 ChatMember)。
+      await this.chatCircleSync.detachSeat(
         normalizedTargetUserID,
         releasedConversationId,
         'removed',
@@ -481,7 +483,7 @@ export class GroupService {
       }
     });
     if (leftConversationId) {
-      this.chatCircleSync.detachSeat(userId, leftConversationId, 'left');
+      await this.chatCircleSync.detachSeat(userId, leftConversationId, 'left');
     }
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);

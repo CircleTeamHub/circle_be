@@ -262,6 +262,18 @@ export interface ChatMutationsPageDto {
   serverTime: string;
   /** 下一次请求应当传的 since。 */
   nextSince: string;
+  /**
+   * 与 nextSince 配对的 id 游标(复合 keyset)。
+   * DateTime 只有毫秒精度:一批同毫秒的变更跨在页边界上时,只带时间戳的游标
+   * 会把剩下那些同刻的行永久跳过。未截断时为空串。
+   */
+  nextSinceId: string;
   /** 还有没追完的变更(被单页上限截断)。 */
   hasMore: boolean;
+  /**
+   * 请求的 since 比服务端保留窗口(MUTATION_LOOKBACK_MS)还老 ——
+   * 那段区间的变更已经查不到了。客户端必须丢掉本地消息缓存重新拉,
+   * 否则那段时间里被撤回的消息会永远显示原文。
+   */
+  resetRequired: boolean;
 }

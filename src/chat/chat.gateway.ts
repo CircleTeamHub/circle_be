@@ -88,8 +88,11 @@ export class ChatGateway implements OnModuleDestroy {
   private revocationRetryAttempt = 0;
   private revocationRetryTimer: NodeJS.Timeout | null = null;
   /** Redis adapter 挂载重试(启动时 Redis 不可用 → 房间广播会退化成单实例)。 */
-  private static readonly ADAPTER_ATTACH_MAX_ATTEMPTS = 10;
-  private static readonly ADAPTER_RETRY_DELAY_MS = 5_000;
+  private static readonly ADAPTER_RETRY_BASE_MS = 5_000;
+  private static readonly ADAPTER_RETRY_MAX_MS = 60_000;
+  /** 连续失败到这个次数时报一次 error(之后只静默退避,不刷屏)。 */
+  private static readonly ADAPTER_WARN_AFTER_ATTEMPTS = 5;
+  private adapterAttempts = 0;
   private adapterRetryTimer: NodeJS.Timeout | null = null;
   /** access token 到期即断连的计时器,按 socket 保存以便断开时清掉。 */
   private readonly expiryTimers = new Map<Socket, NodeJS.Timeout>();
@@ -202,12 +205,15 @@ export class ChatGateway implements OnModuleDestroy {
    */
   private async attachRedisAdapter(io: Server): Promise<void> {
     if (!this.redisService.isEnabled()) return;
-    for (
-      let attempt = 0;
-      attempt < ChatGateway.ADAPTER_ATTACH_MAX_ATTEMPTS;
-      attempt += 1
-    ) {
-      if (this.io === null && attempt > 0) return; // 已 onModuleDestroy
+    // 重试**不设次数上限**,只做退避。
+    //
+    // 上一版封了 10 次 × 5 秒 = 50 秒就永久放弃 —— 而这正是最该坚持的场景:
+    // Redis 停机往往不止一分钟,进程却活着,RedisService 随后自己就连上了。
+    // 那之后在线注册表是跨实例的、房间广播却仍是本实例的:别的实例上的用户
+    // 被判成在线(不推离线通知),消息又跨不过去,这些人既收不到 socket 消息
+    // 也收不到推送,直到重启为止。宁可一直退避重试,也不能进入这个状态。
+    let delay = ChatGateway.ADAPTER_RETRY_BASE_MS;
+    for (;;) {
       const clients = await this.redisService.getAdapterClients();
       if (clients) {
         io.adapter(createAdapter(clients.pub, clients.sub));
@@ -216,16 +222,22 @@ export class ChatGateway implements OnModuleDestroy {
         );
         return;
       }
+      this.adapterAttempts += 1;
+      if (this.adapterAttempts === ChatGateway.ADAPTER_WARN_AFTER_ATTEMPTS) {
+        this.logger.error(
+          'chat gateway: redis adapter still unavailable; realtime is ' +
+            'per-instance until it attaches (cross-instance delivery is lost)',
+        );
+      }
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, ChatGateway.ADAPTER_RETRY_DELAY_MS);
+        const timer = setTimeout(resolve, delay);
         timer.unref?.();
         this.adapterRetryTimer = timer;
       });
+      // onModuleDestroy 之后不再重试(io 已销毁)。
+      if (this.io === null) return;
+      delay = Math.min(delay * 2, ChatGateway.ADAPTER_RETRY_MAX_MS);
     }
-    this.logger.error(
-      'chat gateway: redis adapter unavailable after retries; ' +
-        'realtime stays per-instance (cross-instance delivery will be lost)',
-    );
   }
 
   /**

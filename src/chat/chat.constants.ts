@@ -157,6 +157,14 @@ export const HISTORY_PAGE_DEFAULT = 50;
 /** 会话列表单次返回上限(Phase 1 无分页,超过则取最近活跃的前 N 个)。 */
 export const CONVERSATION_LIST_MAX = 100;
 
+/**
+ * 放宽/关闭焚毁前的兜底真删:分批处理的批量与批次上限。
+ * 一次性 findMany 会把整段积压的完整 JSON content 拉进内存,后面再跟一条
+ * 巨大的 IN 更新 —— 内存、查询参数上限、接口超时三样一起顶上来。
+ */
+export const RELAX_PURGE_BATCH = 500;
+export const RELAX_PURGE_BATCHES_MAX = 20;
+
 /** 离线撤回/编辑增量单次返回上限(重连后一次追平)。 */
 export const MUTATION_PAGE_MAX = 200;
 /** 增量最多回溯多久:超过这个跨度的离线,客户端本地缓存本来也已经翻篇。 */

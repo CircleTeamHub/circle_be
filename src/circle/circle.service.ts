@@ -504,7 +504,11 @@ export class CircleService {
       },
     );
     if (releasedConversationId) {
-      this.chatCircleSync.detachSeat(userId, releasedConversationId, 'left');
+      await this.chatCircleSync.detachSeat(
+        userId,
+        releasedConversationId,
+        'left',
+      );
     }
   }
 

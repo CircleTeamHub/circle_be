@@ -206,6 +206,18 @@ export class ChatBroadcastService {
     }
   }
 
+  /**
+   * 兜底驱逐:房间离不掉时直接断掉该用户的全部 socket。
+   * 重连后 handleConnection 会按当前座位重新派生房间 —— 已经没座位的会话
+   * 自然就不在里面了。
+   */
+  async disconnectUserSockets(userId: string): Promise<void> {
+    const server = this.requireServer('disconnectUserSockets');
+    if (!server) return;
+    const sockets = await server.in(userRoom(userId)).fetchSockets();
+    for (const socket of sockets) socket.disconnect(true);
+  }
+
   private requireServer(caller: string): Server | null {
     if (!this.server) {
       // attach 之前不应有业务调用;出现即是接线错误,记下但不崩发送方。

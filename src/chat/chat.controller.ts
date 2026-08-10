@@ -121,6 +121,7 @@ export class ChatController {
       req.user.userId,
       new Date(query.since),
       query.limit,
+      query.sinceId,
     );
   }
 

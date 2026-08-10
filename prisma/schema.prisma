@@ -1917,6 +1917,12 @@ model ChatMessage {
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
+  /// 重连追平（GET /chat/messages/mutations）按变更时刻扫。没有这两条的话，
+  /// 高频群里每次重连都要全表扫那个会话的整段历史，只为捞出几条撤回/编辑。
+  /// 查询里的粗筛写成 `revokedAt >= x OR editedAt >= x` 正是为了走它们
+  /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
+  @@index([conversationID, revokedAt])
+  @@index([conversationID, editedAt])
 }
 
 /// 消息表情回应（G-07）。不进 height 坐标系：不是消息、不推进未读、

@@ -64,7 +64,12 @@ describe('ChatService', () => {
     emitRevoke: jest.fn(),
     emitRead: jest.fn(),
   };
-  const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
+  const systemMessage = {
+    emit: jest.fn().mockResolvedValue(undefined),
+    // 设置变更的留痕必须与设置本身同事务落地(emit 内部吞异常,await 它无用)。
+    insertSystemMessageInTx: jest.fn(),
+    broadcastSystemMessage: jest.fn(),
+  };
 
   const service = new ChatService(
     prisma as never,
@@ -142,6 +147,17 @@ describe('ChatService', () => {
     prisma.friend.findFirst.mockResolvedValue(null);
     // 搜索/焚毁读路径:默认没有会话开焚毁。
     prisma.chatConversation.findMany.mockResolvedValue([]);
+    systemMessage.insertSystemMessageInTx.mockResolvedValue({
+      id: 'sys-1',
+      conversationId: 'conv-1',
+      height: 9,
+      type: 'system',
+      content: {},
+      sender: null,
+      replyToId: null,
+      d: null,
+      createdAt: new Date().toISOString(),
+    });
   });
 
   // 访客(临时房)没有 User 行:查隐私设置只会拿到 2 天默认值,而房间可以开
@@ -1638,11 +1654,15 @@ describe('ChatService', () => {
         where: { id: 'conv-1' },
         data: { burnDurationSec: 3600 },
       });
-      // 开关变更必须留系统痕迹,防「对方偷偷开了焚毁」。
-      expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
-        kind: 'burn-changed',
-        seconds: 3600,
-      });
+      // 开关变更必须留系统痕迹,防「对方偷偷开了焚毁」——
+      // 而且要和设置更新在同一个事务里(emit 内部吞异常,await 它等于没做)。
+      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+        expect.anything(),
+        'conv-1',
+        { kind: 'burn-changed', seconds: 3600 },
+      );
+      // 广播在提交之后,否则事务回滚了客户端却已经收到那条提示。
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalled();
       expect(result.burnDurationSec).toBe(3600);
     });
 
@@ -1665,16 +1685,20 @@ describe('ChatService', () => {
         burnDurationSec: null,
       });
 
+      // 关掉焚毁 = 放宽:先把旧策略下已过期的消息真删掉(分批,这里一批清完)。
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
       const result = await service.setBurnDuration('u1', 'conv-1', 0);
       expect(prisma.chatConversation.update).toHaveBeenCalledWith({
         where: { id: 'conv-1' },
         data: { burnDurationSec: null },
       });
       expect(result.burnDurationSec).toBeNull();
-      expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
-        kind: 'burn-changed',
-        seconds: 0,
-      });
+      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+        expect.anything(),
+        'conv-1',
+        { kind: 'burn-changed', seconds: 0 },
+      );
     });
 
     it('GROUP requires a circle owner/admin', async () => {
@@ -2219,11 +2243,31 @@ describe('ChatService', () => {
         mutatedRow({ id: 'm3', mutatedAt: new Date('2026-08-10T04:00:00Z') }),
       ]);
 
-      const result = await service.listMutationsSince('u1', new Date(0), 2);
+      const result = await service.listMutationsSince(
+        'u1',
+        new Date(Date.now() - 60_000),
+        2,
+      );
 
       expect(result.messages.map((m) => m.id)).toEqual(['m1', 'm2']);
       expect(result.hasMore).toBe(true);
       expect(result.nextSince).toBe(boundary.toISOString());
+      // id 必须一起带回去:毫秒精度下同刻并列很常见,只带时间戳的游标配
+      // `> from` 会把剩下那些同刻的行永久跳过。
+      expect(result.nextSinceId).toBe('m2');
+    });
+
+    it('reports resetRequired instead of silently clamping an ancient cursor', async () => {
+      // 默默把游标抬到窗口下沿的话,客户端以为自己追平了,而那段区间里被撤回的
+      // 消息在它缓存里永远是原文(撤回不改 height,历史补拉够不着)。
+      const result = await service.listMutationsSince(
+        'u1',
+        new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+      );
+
+      expect(result.resetRequired).toBe(true);
+      expect(result.messages).toEqual([]);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
 
     it('pushes the clear watermark and burn cutoff into the query, not a post-filter', async () => {
@@ -2237,7 +2281,10 @@ describe('ChatService', () => {
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
-      const result = await service.listMutationsSince('u1', new Date(0));
+      const result = await service.listMutationsSince(
+        'u1',
+        new Date(Date.now() - 60_000),
+      );
 
       expect(result.messages).toEqual([]);
       // 原始 SQL 的参数里带上了每会话的 height 下界与截止时间。
@@ -2250,6 +2297,31 @@ describe('ChatService', () => {
           Array.isArray(p) && p[0] instanceof Date && p.length === 1,
       );
       expect(cutoffs?.[0]).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('quote 兜底快照的内容审核', () => {
+    it('rejects blocked words hidden in content.quotedText', async () => {
+      // quotedText 是客户端塞的原文快照,会原样落库并广播。只检 text 的话:
+      // text 无害 + replyToId 指向不存在的消息(引用被降级成 null)+ 违禁内容
+      // 全塞进 quotedText —— 敏感词检查一个字都看不到。
+      sensitiveWords.check.mockImplementation((value: string) => ({
+        blocked: value.includes('违禁'),
+      }));
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'quote',
+            content: { text: '你看这个', quotedText: '违禁内容' },
+          }),
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_SENSITIVE_WORD_BLOCKED' },
+      });
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
   });
 

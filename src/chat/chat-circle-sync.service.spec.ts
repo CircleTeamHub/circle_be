@@ -24,6 +24,7 @@ describe('ChatCircleSyncService', () => {
     joinUserToConversation: jest.fn(),
     removeUserFromConversation: jest.fn(),
     emitConversationChange: jest.fn(),
+    disconnectUserSockets: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
 
@@ -42,6 +43,7 @@ describe('ChatCircleSyncService', () => {
     prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);
     broadcast.removeUserFromConversation.mockResolvedValue(undefined);
+    broadcast.disconnectUserSockets.mockResolvedValue(undefined);
     systemMessage.emit.mockResolvedValue(undefined);
     prisma.user.findMany.mockResolvedValue([]);
     prisma.$queryRaw.mockResolvedValue([]);
@@ -237,8 +239,8 @@ describe('ChatCircleSyncService', () => {
   // releaseSeatInTx 在事务里就把 leftAt 置好了 —— 等对账跑到时已不满足条件;
   // 何况 CircleMember 行已被删除,updatedAt 窗口根本扫不到这个圈子。结果就是
   // 真实的退群/踢人一条提示都没有。提示必须由删除钩子自己补。
-  it('emits a member-left notice when a deletion hook releases a seat', () => {
-    service.detachSeat('u1', 'conv-1', 'removed');
+  it('emits a member-left notice when a deletion hook releases a seat', async () => {
+    await service.detachSeat('u1', 'conv-1', 'removed');
 
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',
@@ -253,10 +255,29 @@ describe('ChatCircleSyncService', () => {
       conversationId: 'conv-1',
       userId: 'u1',
     });
+    // 顺序要紧:离房必须先完成。反过来的话,离房内部还在 await fetchSockets
+    // 时广播到会话房的消息,被移出的人照样收得到。
+    expect(
+      broadcast.removeUserFromConversation.mock.invocationCallOrder[0],
+    ).toBeLessThan(
+      broadcast.emitConversationChange.mock.invocationCallOrder[0],
+    );
   });
 
-  it('tells the leaver own devices with kind left instead of removed', () => {
-    service.detachSeat('u1', 'conv-1', 'left');
+  it('disconnects the socket when the room leave fails', async () => {
+    // 离不了房 = 他会一直留在房里收群消息,直到自己重连。断连接是唯一兜底:
+    // 重连时 handleConnection 按当前座位重新派生房间,而他已经没有座位了。
+    broadcast.removeUserFromConversation.mockRejectedValueOnce(
+      new Error('adapter down'),
+    );
+
+    await service.detachSeat('u1', 'conv-1', 'removed');
+
+    expect(broadcast.disconnectUserSockets).toHaveBeenCalledWith('u1');
+  });
+
+  it('tells the leaver own devices with kind left instead of removed', async () => {
+    await service.detachSeat('u1', 'conv-1', 'left');
 
     expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
       kind: 'left',
