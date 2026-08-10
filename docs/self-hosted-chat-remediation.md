@@ -185,7 +185,7 @@ BE 侧数据已经在线上：`chat:read` 广播给整个会话房、刻意不 e
 （`circle-im/docs/superpowers/specs/2026-08-09-support-agent-config-design.md`），
 本清单挂账不重复排期。
 
-### G-17 存量数据割接没有方案 —— 部署级
+### G-17 存量数据割接没有方案 —— 部署级【已拍板:路线 2,接受历史清零】
 
 全仓**没有任何** OpenIM→ChatMessage 的数据迁移脚本（`scripts/` 与 `prisma/migrations`
 均无）。直接切栈 = 线上用户的历史消息、会话列表全部清零。两条路必选其一，
@@ -194,6 +194,20 @@ BE 侧数据已经在线上：`chat:read` 广播给整个会话房、刻意不 e
 1. 写迁移：OpenIM Mongo 消息 → 三表；height 按各会话 seq 升序重排；
    `si_`/`sg_` 会话 id → 新 uuid 映射。
 2. 明确拍板「测试期接受历史清零」并留档。
+
+> **拍板（2026-08-09，用户决定）：走 2。** 测试期用户量小，聊天历史不迁；
+> 用户/好友/圈子等业务数据全在 Postgres，不受影响。曾评估过的迁移通道备查：
+> 不碰 Mongo 内部，经 OpenIM 管理端 HTTP API（`/msg/pull_msg_by_seq` +
+> `get_conversations_has_read_and_max_seq`，旧 `chat-history` 模块的成熟路径，
+> git 历史 `70d9e60^` 可寻），height 可直取 seq。哪天要补迁移从这里起步。
+>
+> **割接清单（切生产时执行，建议进 DEPLOY.md 阶段 5）：**
+> 1. `mongodump` 全库留底（哪天要找回历史还有原始数据），归档到备份桶；
+> 2. `npx prisma migrate deploy`（本轮共 4 个新迁移）；
+> 3. 清掉会话分组里的 OpenIM 旧 id（否则用户的自定义分组永远是空组）：
+>    `DELETE FROM "ConversationGroupMembership" WHERE "conversationID" LIKE 'si\_%' OR "conversationID" LIKE 'sg\_%';`
+> 4. 冒烟通过后 `openim-docker down` 退役（既有步骤）；
+> 5. 事后清理项：`user/user-id-alias.ts` 兼容层可删（见 §9）。
 
 连带两处旧 id 残留，割接时一并处理：
 - `conversation-groups`（会话分组）线上行里存的成员是 OpenIM conversationID
@@ -492,7 +506,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | **5 ✅** | G-07 送达 / reaction / 编辑 / 逐条已读 + G-18 推送侧 badge（已落地，同分支） | 增量能力 | 否 |
 | **—** | G-08 推送通道 | 有意取舍，记录备查，暂不动 | — |
 | **—** | G-16 客服账号 | 已在 `feat/support-agent-config` 处理 | — |
-| **前置** | G-17 存量割接决策 | 切生产**之前**必须拍板（见 §5.3） | — |
+| **前置 ✅** | G-17 存量割接决策 | **已拍板走清零留档**，割接清单见 G-17 节 | — |
 
 ## 5. 前置阻塞
 
