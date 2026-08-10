@@ -29,7 +29,7 @@ describe('ChatService', () => {
       create: jest.fn(),
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
-    circleMember: { findUnique: jest.fn() },
+    circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
@@ -907,6 +907,28 @@ describe('ChatService', () => {
       );
     });
 
+    it('uses the next local-midnight offset on a DST transition day', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', undefined, 50, {
+        date: '2026-03-08',
+        tzOffsetMinutes: 480,
+        tzEndOffsetMinutes: 420,
+      });
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            createdAt: {
+              gte: new Date('2026-03-08T08:00:00.000Z'),
+              lt: new Date('2026-03-09T07:00:00.000Z'),
+            },
+          }),
+        }),
+      );
+    });
+
     it('denies non-members', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
       await expect(service.getHistory('u1', 'conv-1')).rejects.toThrow(
@@ -929,11 +951,85 @@ describe('ChatService', () => {
       expect(days).toEqual(['2026-08-05', '2026-08-06']);
     });
 
+    it('uses the IANA timezone for month boundaries and per-message days', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { createdAt: new Date('2026-03-08T07:30:00.000Z') }, // 3/7 23:30 PST
+        { createdAt: new Date('2026-03-08T08:30:00.000Z') }, // 3/8 00:30 PST
+      ]);
+
+      const days = await service.listMessageDays(
+        'u1',
+        'conv-1',
+        2026,
+        2,
+        420,
+        'America/Los_Angeles',
+      );
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            createdAt: {
+              gte: new Date('2026-03-01T08:00:00.000Z'),
+              lt: new Date('2026-04-01T07:00:00.000Z'),
+            },
+          }),
+        }),
+      );
+      expect(days).toEqual(['2026-03-07', '2026-03-08']);
+    });
+
     it('denies non-members', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
       await expect(
         service.listMessageDays('u1', 'conv-1', 2026, 7, 0),
       ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('listMembers', () => {
+    it('rejects ordinary GROUP members before reading the directory', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            circleID: 'circle-1',
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+
+      await expect(service.listMembers('u1', 'conv-1')).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('allows active GROUP administrators to read the directory', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            circleID: 'circle-1',
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+      prisma.circleMember.findMany.mockResolvedValue([
+        { userID: 'u1', role: 'ADMIN' },
+      ]);
+
+      await expect(service.listMembers('u1', 'conv-1')).resolves.toEqual([
+        expect.objectContaining({ userId: 'u1', role: 'ADMIN' }),
+      ]);
     });
   });
 

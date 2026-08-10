@@ -62,4 +62,14 @@ export class HistoryQueryDto {
   @Min(-840)
   @Max(840)
   tzOffsetMinutes?: number;
+
+  @ApiPropertyOptional({
+    description: '次日本地零点的时区偏移分钟(DST 日期可能与起点不同)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(-840)
+  @Max(840)
+  tzEndOffsetMinutes?: number;
 }

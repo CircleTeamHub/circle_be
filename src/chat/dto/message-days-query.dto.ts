@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { IsInt, IsOptional, IsTimeZone, Max, Min } from 'class-validator';
 
 export class MessageDaysQueryDto {
   @ApiProperty({ description: '年份(如 2026)' })
@@ -26,4 +26,13 @@ export class MessageDaysQueryDto {
   @Min(-840)
   @Max(840)
   tzOffsetMinutes?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'IANA timezone used for DST-aware month bounds and day grouping',
+    example: 'America/Los_Angeles',
+  })
+  @IsOptional()
+  @IsTimeZone()
+  timeZone?: string;
 }
