@@ -23,6 +23,7 @@ import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
 import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
+import { MutationsQueryDto } from './dto/mutations-query.dto';
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
@@ -102,6 +103,22 @@ export class ChatController {
     return this.chatService.searchAllMessages(
       req.user.userId,
       query.keyword,
+      query.limit,
+    );
+  }
+
+  @Get('messages/mutations')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '离线期间的撤回/编辑增量(重连追平;撤回不改 height,补拉够不着)',
+  })
+  listMutations(
+    @Req() req: RequestWithUser,
+    @Query() query: MutationsQueryDto,
+  ): Promise<{ messages: ChatMessageDto[]; serverTime: string }> {
+    return this.chatService.listMutationsSince(
+      req.user.userId,
+      new Date(query.since),
       query.limit,
     );
   }

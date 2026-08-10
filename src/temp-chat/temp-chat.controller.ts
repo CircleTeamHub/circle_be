@@ -111,7 +111,11 @@ export class TempChatController {
       req.tempChatGuest.conversationId,
       query.beforeHeight,
       query.limit,
-      {},
+      // afterHeight 是重连增量补拉的游标。HistoryQueryDto 是和主端共用的,
+      // 加了这个参数之后 Swagger 上访客端也接受它,这里却传空 filters ——
+      // 访客重连时拿回的是「最近一页」,还没有 nextAfterHeight 可以继续追,
+      // 断线期间的消息就此缺着。
+      { afterHeight: query.afterHeight },
       // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
       // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
       { applyViewerRetention: false },

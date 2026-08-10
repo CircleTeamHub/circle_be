@@ -14,11 +14,20 @@ import { MEDIA_MESSAGE_TYPES } from './chat.constants';
  */
 const SWEEP_BATCH = 500;
 const SWEEP_BATCHES_MAX = 4;
+/**
+ * 单轮扫描的会话数上限。不封顶的话,开焚毁的会话一多,每分钟一次的全表
+ * findMany 会把整份结果拉进内存,后面又逐会话串行查消息 —— 一轮扫描跑过一分钟,
+ * 下一轮直接被 running 挡掉,过期消息越积越久。按 id 排序 + 游标续扫,
+ * 跨轮次轮转,长期覆盖不丢会话。
+ */
+const SWEEP_CONVERSATIONS_MAX = 200;
 
 @Injectable()
 export class ChatBurnSweeperService {
   private readonly logger = new Logger(ChatBurnSweeperService.name);
   private running = false;
+  /** 上一轮扫到的最后一个会话 id(轮转游标);扫完一圈回到开头。 */
+  private cursor: string | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -31,9 +40,18 @@ export class ChatBurnSweeperService {
     this.running = true;
     try {
       const burning = await this.prisma.chatConversation.findMany({
-        where: { burnDurationSec: { not: null } },
+        where: {
+          burnDurationSec: { not: null },
+          ...(this.cursor ? { id: { gt: this.cursor } } : {}),
+        },
         select: { id: true, burnDurationSec: true },
+        orderBy: { id: 'asc' },
+        take: SWEEP_CONVERSATIONS_MAX,
       });
+      this.cursor =
+        burning.length === SWEEP_CONVERSATIONS_MAX
+          ? burning[burning.length - 1].id
+          : null;
       for (const conversation of burning) {
         const seconds = conversation.burnDurationSec;
         if (!seconds || seconds <= 0) continue;
@@ -52,8 +70,22 @@ export class ChatBurnSweeperService {
     conversationId: string,
     seconds: number,
   ): Promise<void> {
-    const cutoff = new Date(Date.now() - seconds * 1000);
     for (let round = 0; round < SWEEP_BATCHES_MAX; round += 1) {
+      // 每一批都重读当前策略,而不是复用进入本轮时的那份。批与批之间可能过了
+      // 好几秒,期间 POST /burn 完全可能把时长改长或关掉 —— 拿旧 cutoff 接着删,
+      // 删掉的就是用户刚刚决定要留下的消息,而且不可逆。
+      const current = await this.prisma.chatConversation.findUnique({
+        where: { id: conversationId },
+        select: { burnDurationSec: true },
+      });
+      const live = current?.burnDurationSec ?? null;
+      if (!live || live <= 0) return;
+      if (round === 0 && live !== seconds) {
+        this.logger.log(
+          `burn duration changed mid-sweep conversation=${conversationId}`,
+        );
+      }
+      const cutoff = new Date(Date.now() - live * 1000);
       const rows = await this.prisma.chatMessage.findMany({
         where: {
           conversationID: conversationId,
@@ -74,7 +106,9 @@ export class ChatBurnSweeperService {
         });
       await this.prisma.chatMessage.updateMany({
         where: { id: { in: rows.map((row) => row.id) } },
-        data: { deleted: true, content: {} },
+        // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
+        // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
+        data: { deleted: true, content: {}, contentHistory: [] },
       });
       if (mediaKeys.length > 0) {
         // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。

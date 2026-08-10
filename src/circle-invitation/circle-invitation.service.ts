@@ -83,18 +83,23 @@ export class CircleInvitationService {
 
   /**
    * 激活提交后立刻触发一次幂等座位同步,新成员不必等 ≤1min 的对账才拿到
-   * 会话与消息。失败只记日志:每分钟对账本来就是这条路径的兜底。
+   * 会话与消息。
+   *
+   * 失败必须排进对账的重试队列,不能只记日志:对账扫的是
+   * `CircleMember.updatedAt` 的 2 分钟窗口,一次超过两分钟的数据库故障过后,
+   * 这次激活早已滑出窗口 —— 没有任何机制会回来补,新成员的聊天座位就一直缺着。
    */
   private syncCircleSeatsSoon(circleID: string): void {
     void this.chatCircleSync
       .ensureCircleConversation(circleID)
-      .catch((error) =>
+      .catch((error) => {
+        this.chatCircleSync.scheduleRetry(circleID);
         this.logger.warn(
-          `post-admission seat sync failed circle=${circleID}: ${
+          `post-admission seat sync failed circle=${circleID} (queued for retry): ${
             error instanceof Error ? error.message : String(error)
           }`,
-        ),
-      );
+        );
+      });
   }
 
   async invite(

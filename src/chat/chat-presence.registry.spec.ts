@@ -5,9 +5,9 @@ describe('ChatPresenceRegistry', () => {
     isEnabled: jest.fn(),
     incrementWithTtl: jest.fn(),
     decrementFloorZero: jest.fn(),
-    addToSet: jest.fn(),
-    removeFromSet: jest.fn(),
-    getSetMembers: jest.fn(),
+    addToExpiringSet: jest.fn(),
+    removeFromExpiringSet: jest.fn(),
+    getLiveSetMembers: jest.fn(),
     getCounter: jest.fn(),
     deleteKey: jest.fn(),
     touchTtl: jest.fn(),
@@ -17,8 +17,8 @@ describe('ChatPresenceRegistry', () => {
     jest.clearAllMocks();
     redis.isEnabled.mockReturnValue(true);
     redis.deleteKey.mockResolvedValue(true);
-    redis.addToSet.mockResolvedValue(true);
-    redis.removeFromSet.mockResolvedValue(true);
+    redis.addToExpiringSet.mockResolvedValue(true);
+    redis.removeFromExpiringSet.mockResolvedValue(true);
   });
 
   it('registers globally and joins the conversation online sets', async () => {
@@ -29,13 +29,13 @@ describe('ChatPresenceRegistry', () => {
     expect(count).toBe(1);
     await registry.registerConversations('u1', ['c1', 'c2']);
 
-    expect(redis.addToSet).toHaveBeenCalledWith(
-      'chat:online:c1',
+    expect(redis.addToExpiringSet).toHaveBeenCalledWith(
+      'chat:online:z:c1',
       'u1',
       expect.any(Number),
     );
-    expect(redis.addToSet).toHaveBeenCalledWith(
-      'chat:online:c2',
+    expect(redis.addToExpiringSet).toHaveBeenCalledWith(
+      'chat:online:z:c2',
       'u1',
       expect.any(Number),
     );
@@ -52,11 +52,14 @@ describe('ChatPresenceRegistry', () => {
     redis.decrementFloorZero.mockResolvedValueOnce(1);
     await registry.socketDisconnected('u1');
     // 另一端还在线:不能把人从在线集合里摘掉。
-    expect(redis.removeFromSet).not.toHaveBeenCalled();
+    expect(redis.removeFromExpiringSet).not.toHaveBeenCalled();
 
     redis.decrementFloorZero.mockResolvedValueOnce(0);
     await registry.socketDisconnected('u1');
-    expect(redis.removeFromSet).toHaveBeenCalledWith('chat:online:c1', 'u1');
+    expect(redis.removeFromExpiringSet).toHaveBeenCalledWith(
+      'chat:online:z:c1',
+      'u1',
+    );
     expect(redis.deleteKey).toHaveBeenCalledWith('chat:conn:u1');
     registry.onModuleDestroy();
   });
@@ -65,12 +68,46 @@ describe('ChatPresenceRegistry', () => {
     const registry = new ChatPresenceRegistry(redis as never);
     redis.getCounter.mockResolvedValueOnce(0);
     await registry.conversationJoined('u1', 'c1');
-    expect(redis.addToSet).not.toHaveBeenCalled();
+    expect(redis.addToExpiringSet).not.toHaveBeenCalled();
 
     redis.getCounter.mockResolvedValueOnce(2);
     await registry.conversationJoined('u1', 'c1');
-    expect(redis.addToSet).toHaveBeenCalledWith(
-      'chat:online:c1',
+    expect(redis.addToExpiringSet).toHaveBeenCalledWith(
+      'chat:online:z:c1',
+      'u1',
+      expect.any(Number),
+    );
+    registry.onModuleDestroy();
+  });
+
+  it('does not decrement a lease it never acquired (redis down at connect)', async () => {
+    // Redis 那一刻不可用:incrementWithTtl 返回 null,这条连接没有全局计数。
+    redis.incrementWithTtl.mockResolvedValue(null);
+    const registry = new ChatPresenceRegistry(redis as never);
+    expect(await registry.registerSocket('u1')).toBeNull();
+
+    await registry.socketDisconnected('u1', false);
+
+    // 不能去减:另一实例上那条活着的连接的计数会被抹到 0,人被判成离线。
+    expect(redis.decrementFloorZero).not.toHaveBeenCalled();
+    expect(redis.removeFromExpiringSet).not.toHaveBeenCalled();
+    registry.onModuleDestroy();
+  });
+
+  it('refreshes only its own member score, never the whole set', async () => {
+    redis.incrementWithTtl.mockResolvedValue(1);
+    const registry = new ChatPresenceRegistry(redis as never);
+    await registry.registerSocket('u1');
+    await registry.registerConversations('u1', ['c1']);
+    redis.addToExpiringSet.mockClear();
+
+    await (
+      registry as unknown as { refreshLocal(): Promise<void> }
+    ).refreshLocal();
+
+    // ZADD 只抬 u1 这一条的到期时刻;崩溃实例留下的成员照常到期。
+    expect(redis.addToExpiringSet).toHaveBeenCalledWith(
+      'chat:online:z:c1',
       'u1',
       expect.any(Number),
     );

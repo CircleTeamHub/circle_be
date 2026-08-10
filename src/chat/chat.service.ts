@@ -32,6 +32,8 @@ import {
   CHAT_REACTION_EMOJIS,
   CHAT_REVOKE_WINDOW_MS,
   MEDIA_MESSAGE_TYPES,
+  MUTATION_LOOKBACK_MS,
+  MUTATION_PAGE_MAX,
   READERS_PAGE_MAX,
 } from './chat.constants';
 import type {
@@ -49,7 +51,16 @@ interface SendResult {
   reused: boolean;
 }
 
-type MessageRow = ChatMessage;
+/**
+ * 读路径拿到的消息行。
+ *
+ * contentHistory(每次编辑压一版旧正文的审计数组)不在里面:它从不出现在
+ * 任何 DTO 上,却会被 findMany 默认全取回来 —— 一页 100 条、几条被反复编辑过的
+ * 长文本,就是几 MB 无人使用的 JSON 在热接口上来回搬运和解析。写路径要用它的
+ * 地方(editMessage)单独把它读回来。
+ */
+type MessageRow = Omit<ChatMessage, 'contentHistory'>;
+const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
 
@@ -200,6 +211,14 @@ export class ChatService {
     if (conversation.type === 'TEMP') {
       await this.assertTempChatActive(conversation);
     }
+    // G-09 真引用的归属校验。replyToId 之前只校验「是个字符串」,于是任何人都能
+    // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,
+    // 把那条消息的发送者昵称、类型和文本摘要广播进当前房间。退群的人手里留着
+    // 旧 UUID 同样能这么捞。放在事务外做:被引用消息不会换会话,没有 TOCTOU。
+    const replyToId = await this.resolveReplyTarget(
+      payload.conversationId,
+      payload.replyToId,
+    );
 
     // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
     // 按 key 现签),不是消息体的一部分 —— 留着的话:
@@ -253,7 +272,7 @@ export class ChatService {
           type: payload.type,
           content,
           clientMessageId: payload.d,
-          replyToID: payload.replyToId ?? null,
+          replyToID: replyToId,
         },
       });
       // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
@@ -294,10 +313,46 @@ export class ChatService {
     }
     const message = this.toMessageDto(created.row, sender);
     // ack 与广播共用这份 DTO:引用快照与媒体 url 都在此附上(读路径,不落库)。
-    // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛。
-    await this.attachReplyTo([message]);
+    // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛;attachReplyTo 会 ——
+    // 它要多查一次库。理由与上面的昵称同款,而且更狠:引用快照丢了只是少个
+    // 折叠条,抛出去却会让整条消息对所有收件人永久消失。
+    try {
+      await this.attachReplyTo([message]);
+    } catch (error) {
+      this.logger.warn(
+        `reply enrichment failed after commit message=${created.row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     await this.media.attachMediaUrls([message]);
     return { message, reused: created.reused };
+  }
+
+  /**
+   * 引用目标解析:只认**本会话**里仍存在的消息。
+   *
+   * - 找不到 / 已物删(焚毁、清理):返回 null,降级成客户端的 quotedText 文本
+   *   快照,不拒发 —— 这是正常的时序,不是攻击。
+   * - 存在但属于别的会话:拒发。这条路径没有任何正当用法,放过去就是跨会话读。
+   */
+  private async resolveReplyTarget(
+    conversationId: string,
+    replyToId: string | null | undefined,
+  ): Promise<string | null> {
+    if (typeof replyToId !== 'string' || replyToId.length === 0) return null;
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: replyToId },
+      select: { conversationID: true, deleted: true },
+    });
+    if (!row || row.deleted) return null;
+    if (row.conversationID !== conversationId) {
+      throw new ForbiddenException({
+        message: '引用的消息不属于该会话',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    return replyToId;
   }
 
   /**
@@ -572,19 +627,24 @@ export class ChatService {
         errorCode: ChatErrorCode.NotMember,
       });
     }
+    // 清空水位在这里同样要生效。只在 GET /chat/conversations 里过滤的话,
+    // 客户端从「取或建会话」「改偏好」这两个响应回填缓存时,刚清掉的末条预览
+    // (以及一条新签名的媒体 URL)就又回来了。
+    const floor = member.clearedBeforeHeight ?? 0;
     const [lastMessages, unread, peers] = await Promise.all([
       this.loadLastMessages([conversationId]),
       this.loadUnreadCounts(userId, [
         {
           conversationID: conversationId,
-          lastReadHeight: member.lastReadHeight,
+          lastReadHeight: Math.max(member.lastReadHeight, floor),
         },
       ]),
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
         : Promise.resolve(new Map<string, ChatSenderInfo>()),
     ]);
-    const last = lastMessages.get(conversationId) ?? null;
+    const rawLast = lastMessages.get(conversationId) ?? null;
+    const last = rawLast && rawLast.height <= floor ? null : rawLast;
     let lastMessage: ChatMessageDto | null = null;
     if (last) {
       const senders = last.senderID
@@ -674,12 +734,7 @@ export class ChatService {
     const burnCutoff = conversation.burnDurationSec
       ? new Date(Date.now() - conversation.burnDurationSec * 1000)
       : null;
-    const cutoff =
-      viewerCutoff && burnCutoff
-        ? viewerCutoff > burnCutoff
-          ? viewerCutoff
-          : burnCutoff
-        : (viewerCutoff ?? burnCutoff);
+    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
     const heightCondition: Prisma.IntFilter = {
       ...(heightFloor > 0 ? { gt: heightFloor } : {}),
       ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
@@ -700,6 +755,7 @@ export class ChatService {
     }
     const rows = await this.prisma.chatMessage.findMany({
       where,
+      omit: MESSAGE_READ_OMIT,
       // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
       orderBy: { height: ascendingPull ? 'asc' : 'desc' },
       take,
@@ -712,7 +768,14 @@ export class ChatService {
     const messages = ascending.map((row) =>
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
-    await this.attachReplyTo(messages);
+    // 引用快照必须和这一页用同一把尺子:清空水位之下、销毁窗口之外的原文
+    // 不能借引用块绕回来。
+    await this.attachReplyTo(messages, {
+      heightFloors: new Map([
+        [conversationId, member.clearedBeforeHeight ?? 0],
+      ]),
+      cutoff,
+    });
     await this.attachReactions(messages);
     await this.media.attachMediaUrls(messages);
     if (ascendingPull) {
@@ -769,15 +832,32 @@ export class ChatService {
     month: number,
     tzOffsetMinutes = 0,
   ): Promise<string[]> {
-    await this.requireMembership(conversationId, userId);
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
     const monthStart = Date.UTC(year, month, 1) + tzOffsetMinutes * 60_000;
     const monthEnd = Date.UTC(year, month + 1, 1) + tzOffsetMinutes * 60_000;
     if (!Number.isFinite(monthStart) || !Number.isFinite(monthEnd)) return [];
+    // 日历同样要按 getHistory 的尺子上色:清空/销毁/焚毁之后那些天点进去是空的,
+    // 日历却还标着有记录。
+    const floor = member.clearedBeforeHeight ?? 0;
+    const cutoff = this.strictestCutoff(
+      await this.selfDestructCutoff(userId),
+      conversation.burnDurationSec
+        ? new Date(Date.now() - conversation.burnDurationSec * 1000)
+        : null,
+    );
+    const lowerBound = new Date(monthStart);
     const rows = await this.prisma.chatMessage.findMany({
       where: {
         conversationID: conversationId,
         deleted: false,
-        createdAt: { gte: new Date(monthStart), lt: new Date(monthEnd) },
+        ...(floor > 0 ? { height: { gt: floor } } : {}),
+        createdAt: {
+          gte: cutoff && cutoff > lowerBound ? cutoff : lowerBound,
+          lt: new Date(monthEnd),
+        },
       },
       select: { createdAt: true },
       take: 5000,
@@ -805,15 +885,50 @@ export class ChatService {
     if (!trimmed) return [];
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null },
-      select: { conversationID: true },
+      select: { conversationID: true, clearedBeforeHeight: true },
     });
     if (memberships.length === 0) return [];
     // 搜索必须和 getHistory 用同一把尺子:否则自动销毁窗口之外的消息
-    // 在历史里看不到、一搜就出来了,等于开了后门。
+    // 在历史里看不到、一搜就出来了,等于开了后门。清空水位与会话焚毁同理 ——
+    // 「清空聊天记录」之后原文一搜即出,这个功能就等于没做。
     const cutoff = await this.selfDestructCutoff(userId);
+    const burning = await this.prisma.chatConversation.findMany({
+      where: {
+        id: { in: memberships.map((m) => m.conversationID) },
+        burnDurationSec: { not: null },
+      },
+      select: { id: true, burnDurationSec: true },
+    });
+    const burnById = new Map(burning.map((c) => [c.id, c.burnDurationSec]));
+    // 大多数会话既没清空过也没开焚毁 —— 那些合成一个 IN,只有带水位/焚毁的
+    // 才各自展开一支,OR 的分支数因此正比于「特殊会话数」而不是会话总数。
+    const plain: string[] = [];
+    const scoped: Prisma.ChatMessageWhereInput[] = [];
+    const heightFloors = new Map<string, number>();
+    const cutoffs = new Map<string, Date | null>();
+    for (const m of memberships) {
+      const floor = m.clearedBeforeHeight ?? 0;
+      const seconds = burnById.get(m.conversationID) ?? null;
+      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
+      const viewerCutoff = this.strictestCutoff(cutoff, burnCutoff);
+      heightFloors.set(m.conversationID, floor);
+      cutoffs.set(m.conversationID, viewerCutoff);
+      if (floor <= 0 && !burnCutoff) {
+        plain.push(m.conversationID);
+        continue;
+      }
+      scoped.push({
+        conversationID: m.conversationID,
+        ...(floor > 0 ? { height: { gt: floor } } : {}),
+        ...(burnCutoff ? { createdAt: { gte: burnCutoff } } : {}),
+      });
+    }
+    const scope: Prisma.ChatMessageWhereInput[] = [];
+    if (plain.length > 0) scope.push({ conversationID: { in: plain } });
+    scope.push(...scoped);
     const rows = await this.prisma.chatMessage.findMany({
       where: {
-        conversationID: { in: memberships.map((m) => m.conversationID) },
+        OR: scope,
         deleted: false,
         type: { in: ['text', 'quote'] },
         content: { path: ['text'], string_contains: trimmed },
@@ -825,9 +940,69 @@ export class ChatService {
     const senders = await this.resolveSenders(
       rows.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
-    return rows.map((row) =>
+    const messages = rows.map((row) =>
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
+    // quote 行的 content.quotedText 是客户端塞的原文快照:搜索之前从不过
+    // attachReplyTo,于是被撤回的原文在搜索结果里原样返回。
+    await this.attachReplyTo(messages, { heightFloors, cutoffs });
+    return messages;
+  }
+
+  /**
+   * 离线期间发生过的撤回/编辑增量(重连后一次追平)。
+   *
+   * 重连补拉走的是 `height > afterHeight` —— 撤回**不改 height**,所以那条路径
+   * 结构上永远看不到它:设备离线时被撤回的那条消息,本地缓存里一直是原文,
+   * 只有等它恰好落进某次历史分页才会被覆盖。会话热闹一点就永远等不到。
+   * 于是这里按 revokedAt/editedAt 时间轴单独给一条增量通道。
+   *
+   * 只回本人在座会话;仍旧套清空水位与销毁/焚毁窗口(不可见的行连撤回状态
+   * 都不必回,客户端本来就该看不到)。
+   */
+  async listMutationsSince(
+    userId: string,
+    since: Date,
+    limit = MUTATION_PAGE_MAX,
+  ): Promise<{ messages: ChatMessageDto[]; serverTime: string }> {
+    const serverTime = new Date().toISOString();
+    const floor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
+    const from = since > floor ? since : floor;
+    const memberships = await this.prisma.chatMember.findMany({
+      where: { userID: userId, leftAt: null },
+      select: { conversationID: true, clearedBeforeHeight: true },
+    });
+    if (memberships.length === 0) return { messages: [], serverTime };
+    const heightFloors = new Map(
+      memberships.map((m) => [m.conversationID, m.clearedBeforeHeight ?? 0]),
+    );
+    const rows = await this.prisma.chatMessage.findMany({
+      where: {
+        conversationID: { in: [...heightFloors.keys()] },
+        OR: [{ revokedAt: { gt: from } }, { editedAt: { gt: from } }],
+      },
+      omit: MESSAGE_READ_OMIT,
+      orderBy: [{ revokedAt: 'asc' }, { editedAt: 'asc' }],
+      take: Math.min(Math.max(limit, 1), MUTATION_PAGE_MAX),
+    });
+    const visible = rows.filter(
+      (row) => row.height > (heightFloors.get(row.conversationID) ?? 0),
+    );
+    if (visible.length === 0) return { messages: [], serverTime };
+    const senders = await this.resolveSenders(
+      visible.map((r) => r.senderID).filter((id): id is string => id !== null),
+    );
+    const messages = visible.map((row) =>
+      this.toMessageDto(row, this.senderFor(row, senders)),
+    );
+    await this.attachReplyTo(messages, { heightFloors });
+    return { messages, serverTime };
+  }
+
+  /** 两个「不早于」截止时间取更严的一个(更晚者);都为空则不过滤。 */
+  private strictestCutoff(a: Date | null, b: Date | null): Date | null {
+    if (a && b) return a > b ? a : b;
+    return a ?? b;
   }
 
   /**
@@ -969,15 +1144,20 @@ export class ChatService {
       ),
     );
 
+    const clearedFloor = mine?.clearedBeforeHeight ?? 0;
     const [unread, lastMessage] = await Promise.all([
       mine
         ? this.loadUnreadCounts(userId, [
-            { conversationID: conv.id, lastReadHeight: mine.lastReadHeight },
+            {
+              conversationID: conv.id,
+              lastReadHeight: Math.max(mine.lastReadHeight, clearedFloor),
+            },
           ])
         : Promise.resolve(new Map<string, number>()),
       // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
-      this.loadLastMessageFor(conv.id),
+      // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
+      this.loadLastMessageFor(conv.id, clearedFloor),
     ]);
     return {
       id: conv.id,
@@ -1015,9 +1195,15 @@ export class ChatService {
   /** 单个会话的末条消息 DTO(带签名后的媒体 URL);无消息时 null。 */
   private async loadLastMessageFor(
     conversationId: string,
+    heightFloor = 0,
   ): Promise<ChatMessageDto | null> {
     const row = await this.prisma.chatMessage.findFirst({
-      where: { conversationID: conversationId, deleted: false },
+      where: {
+        conversationID: conversationId,
+        deleted: false,
+        ...(heightFloor > 0 ? { height: { gt: heightFloor } } : {}),
+      },
+      omit: MESSAGE_READ_OMIT,
       orderBy: { height: 'desc' },
     });
     if (!row) return null;
@@ -1121,6 +1307,21 @@ export class ChatService {
       });
     }
     return { conversation: member.conversation, member };
+  }
+
+  /**
+   * 单聊里「改动已有消息 / 改动会话共享设置」前的拉黑复查。
+   *
+   * sendMessage 早就拦了拉黑,但回应、编辑、阅后即焚这些后加的写路径只查了在座 ——
+   * 而拉黑**故意**不摘座位,于是被拉黑的一方照样能改消息、往对方房间推事件,
+   * 甚至把整个会话设成 30 秒焚毁,替对方销毁历史。非单聊会话直接放行。
+   */
+  private async assertDirectMutationAllowed(
+    conversation: ChatConversation,
+    userId: string,
+  ): Promise<void> {
+    if (conversation.type !== 'DIRECT') return;
+    await this.assertDirectNotBlocked(conversation, userId);
   }
 
   /** 单聊发送前的拉黑复查(任一方向拉黑即拒发)。 */
@@ -1305,8 +1506,13 @@ export class ChatService {
     conversationIds: string[],
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
+    // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
+    // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写。
     const rows = await this.prisma.$queryRaw<MessageRow[]>`
-      SELECT DISTINCT ON ("conversationID") *
+      SELECT DISTINCT ON ("conversationID")
+        "id", "conversationID", "height", "senderID", "type", "content",
+        "clientMessageId", "replyToID", "deleted", "revokedAt", "revokedBy",
+        "editedAt", "createdAt"
       FROM "ChatMessage"
       WHERE "conversationID" = ANY(${conversationIds}::text[])
         AND "deleted" = false
@@ -1455,8 +1661,22 @@ export class ChatService {
    * G-09 真引用:一次 IN 批量取被引用消息,挂 replyTo 快照(禁 N+1)。
    * 原消息被物理删除时缺省(前端回落 quotedText 文本快照);已撤回则
    * revoked=true 且 preview 为空,前端渲染「消息已撤回」。
+   *
+   * 快照必须按**查看者**能看到什么来生成,不是按库里有什么:
+   * - 跨会话的引用一律不挂(发送侧已拦,历史里的存量数据同样不能漏);
+   * - 被引用消息在查看者的清空水位之下、或超出他的自动销毁/会话焚毁窗口时,
+   *   引用块等于把已经藏起来的内容原样端回来,所以按「不可见」处理;
+   * - 上述任一情况下,连客户端塞的 `content.quotedText` 文本快照也要一起抹掉 ——
+   *   否则撤回/清空之后,那段原文仍然躺在引用消息自己的 content 里照常返回。
    */
-  private async attachReplyTo(messages: ChatMessageDto[]): Promise<void> {
+  private async attachReplyTo(
+    messages: ChatMessageDto[],
+    visibility: {
+      heightFloors?: Map<string, number>;
+      cutoffs?: Map<string, Date | null>;
+      cutoff?: Date | null;
+    } = {},
+  ): Promise<void> {
     const ids = [
       ...new Set(
         messages
@@ -1467,6 +1687,7 @@ export class ChatService {
     if (ids.length === 0) return;
     const rows = await this.prisma.chatMessage.findMany({
       where: { id: { in: ids } },
+      omit: MESSAGE_READ_OMIT,
     });
     const senderIds = rows
       .map((r) => r.senderID)
@@ -1476,7 +1697,19 @@ export class ChatService {
     for (const message of messages) {
       if (!message.replyToId) continue;
       const row = byId.get(message.replyToId);
-      if (!row || row.deleted) continue;
+      const cutoff =
+        visibility.cutoffs?.get(message.conversationId) ?? visibility.cutoff;
+      const visible =
+        !!row &&
+        !row.deleted &&
+        row.conversationID === message.conversationId &&
+        row.height >
+          (visibility.heightFloors?.get(message.conversationId) ?? 0) &&
+        (!cutoff || row.createdAt >= cutoff);
+      if (!visible || row.revokedAt !== null) {
+        this.stripQuotedText(message);
+      }
+      if (!visible || !row) continue;
       const revoked = row.revokedAt !== null;
       message.replyTo = {
         id: row.id,
@@ -1487,6 +1720,13 @@ export class ChatService {
         revoked,
       };
     }
+  }
+
+  /** 引用源不可见/已撤回时,连客户端的文本快照一并抹掉(不改库,只改出参)。 */
+  private stripQuotedText(message: ChatMessageDto): void {
+    const content = message.content;
+    if (!content || typeof content['quotedText'] !== 'string') return;
+    message.content = { ...content, quotedText: '' };
   }
 
   /**
@@ -1502,6 +1742,7 @@ export class ChatService {
     const conversation = await this.requireMembership(conversationId, userId);
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
+      omit: MESSAGE_READ_OMIT,
     });
     if (!row || row.conversationID !== conversationId || row.deleted) {
       throw new NotFoundException({
@@ -1515,6 +1756,16 @@ export class ChatService {
         row.senderID ? [row.senderID] : [],
       );
       return this.toMessageDto(row, this.senderFor(row, senders));
+    }
+    if (row.senderID === null) {
+      // 系统消息(进退群提示、burn-changed 留痕)没有作者,下面那条
+      // 「不是我发的 → 看管理员身份」的分支会把它算成管理员可撤 ——
+      // 于是圈主可以开了阅后即焚,再顺手把「对方开启了阅后即焚」这条
+      // 唯一的痕迹撤掉。留痕的意义正在于撤不掉。
+      throw new ForbiddenException({
+        message: '系统消息不可撤回',
+        errorCode: ChatErrorCode.RevokeForbidden,
+      });
     }
     if (row.senderID === userId) {
       const expired =
@@ -1534,10 +1785,24 @@ export class ChatService {
     }
 
     const mediaKeys = this.collectMediaKeys(row);
-    const updated = await this.prisma.chatMessage.update({
-      where: { id: messageId },
+    // 条件更新替无条件 update:上面那次 revokedAt 读取和这次写入之间有窗口,
+    // 双端并发撤回(或发送者与管理员同时动手)会两个都读到 null、两个都写、
+    // 两个都广播,revokedBy 归后写者 —— 幂等承诺和审计归属一起破。
+    // 谓词带上 revokedAt: null,只有赢家 count>0,输家走幂等分支重读。
+    const claimed = await this.prisma.chatMessage.updateMany({
+      where: { id: messageId, revokedAt: null },
       data: { content: {}, revokedAt: new Date(), revokedBy: userId },
     });
+    const updated = await this.prisma.chatMessage.findUniqueOrThrow({
+      where: { id: messageId },
+      omit: MESSAGE_READ_OMIT,
+    });
+    if (claimed.count === 0) {
+      const senders = await this.resolveSenders(
+        updated.senderID ? [updated.senderID] : [],
+      );
+      return this.toMessageDto(updated, this.senderFor(updated, senders));
+    }
     if (mediaKeys.length > 0) {
       // 尽力而为:删失败只留孤儿对象,不让撤回失败(deleteObjects 内部逐个 catch)。
       void this.media.deleteObjects(mediaKeys);
@@ -1602,7 +1867,10 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    await this.requireMembership(conversationId, userId);
+    const conversation = await this.requireMembership(conversationId, userId);
+    // 单聊拉黑不摘座位(两边的 ChatMember 都留着),所以只查在座是不够的:
+    // 被拉黑的一方发不了消息,却能靠回应和编辑继续往对方房间里推事件。
+    await this.assertDirectMutationAllowed(conversation, userId);
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
       select: { conversationID: true, deleted: true, revokedAt: true },
@@ -1659,7 +1927,8 @@ export class ChatService {
         errorCode: ChatErrorCode.SensitiveWord,
       });
     }
-    await this.requireMembership(conversationId, userId);
+    const conversation = await this.requireMembership(conversationId, userId);
+    await this.assertDirectMutationAllowed(conversation, userId);
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
     });
@@ -1699,19 +1968,62 @@ export class ChatService {
     history.push(previous);
     // quote 只改 text,引用快照字段原样保留。
     const nextContent = { ...previous, text } as Prisma.InputJsonObject;
-    const updated = await this.prisma.chatMessage.update({
-      where: { id: messageId },
+    // 谓词带上 revokedAt/deleted:上面那次读到写入之间,这条消息可能刚被撤回
+    // 或被焚毁扫走。按 id 无条件写会把正文塞回一条 revokedAt 非空的行 ——
+    // 库里成了「已撤回但有内容」,随后的 chat:edit 广播还会在客户端盖掉
+    // 撤回事件,搜索也能搜出那段本该消失的文本。输了就当消息不存在。
+    const applied = await this.prisma.chatMessage.updateMany({
+      where: { id: messageId, revokedAt: null, deleted: false },
       data: {
         content: nextContent,
         editedAt: new Date(),
         contentHistory: history as Prisma.InputJsonValue,
       },
     });
-    const senders = await this.resolveSenders(
-      updated.senderID ? [updated.senderID] : [],
-    );
-    const dto = this.toMessageDto(updated, this.senderFor(updated, senders));
-    await this.attachReplyTo([dto]);
+    if (applied.count === 0) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    const updated = await this.prisma.chatMessage.findUniqueOrThrow({
+      where: { id: messageId },
+      omit: MESSAGE_READ_OMIT,
+    });
+    // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
+    // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
+    // 重试只会再往 contentHistory 里压一层。
+    const dto = await this.decorateCommittedMessage(updated);
+    return dto;
+  }
+
+  /** 写已提交之后的装饰(昵称/引用快照):任何失败都降级,绝不抛。 */
+  private async decorateCommittedMessage(
+    row: MessageRow,
+  ): Promise<ChatMessageDto> {
+    let sender: ChatSenderInfo | null = null;
+    try {
+      sender = row.senderID
+        ? ((await this.resolveSenders([row.senderID])).get(row.senderID) ??
+          null)
+        : null;
+    } catch (error) {
+      this.logger.warn(
+        `sender enrichment failed after commit message=${row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const dto = this.toMessageDto(row, sender);
+    try {
+      await this.attachReplyTo([dto]);
+    } catch (error) {
+      this.logger.warn(
+        `reply enrichment failed after commit message=${row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     return dto;
   }
 
@@ -1727,7 +2039,12 @@ export class ChatService {
     await this.requireMembership(conversationId, userId);
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
-      select: { conversationID: true, height: true, senderID: true },
+      select: {
+        conversationID: true,
+        height: true,
+        senderID: true,
+        createdAt: true,
+      },
     });
     if (!row || row.conversationID !== conversationId) {
       throw new NotFoundException({
@@ -1735,21 +2052,32 @@ export class ChatService {
         errorCode: ChatErrorCode.MessageNotFound,
       });
     }
-    const seats = await this.prisma.chatMember.findMany({
-      where: {
-        conversationID: conversationId,
-        leftAt: null,
-        lastReadHeight: { gte: row.height },
-        ...(row.senderID ? { userID: { not: row.senderID } } : {}),
-      },
-      select: { userID: true },
-      take: READERS_PAGE_MAX,
-    });
+    // 新入群/重新入群的座位,lastReadHeight 是按「当前最高」初始化的(否则新人
+    // 一进来就背着全群历史未读)。那个初始水位不是回执:不排掉的话,一个刚进群
+    // 的人会显示成群里每一条老消息的已读者。座位的 joinedAt 之后才算数。
+    const where: Prisma.ChatMemberWhereInput = {
+      conversationID: conversationId,
+      leftAt: null,
+      lastReadHeight: { gte: row.height },
+      joinedAt: { lte: row.createdAt },
+      ...(row.senderID ? { userID: { not: row.senderID } } : {}),
+    };
+    const [seats, total] = await Promise.all([
+      this.prisma.chatMember.findMany({
+        where,
+        select: { userID: true },
+        orderBy: { joinedAt: 'asc' },
+        take: READERS_PAGE_MAX,
+      }),
+      // total 必须单独 count:拿这一页的长度当总数,3000 人的群会稳定显示
+      // 「200 人已读」,前端也没法判断该不该提示还有更多。
+      this.prisma.chatMember.count({ where }),
+    ]);
     const senders = await this.resolveSenders(seats.map((s) => s.userID));
     const readers = seats
       .map((s) => senders.get(s.userID))
       .filter((s): s is ChatSenderInfo => Boolean(s));
-    return { readers, total: readers.length };
+    return { readers, total };
   }
 
   /** G-07:一次 IN 批量把表情回应聚合挂到消息上(禁 N+1)。 */
@@ -1812,20 +2140,71 @@ export class ChatService {
         errorCode: GroupErrorCode.ManagerOnly,
       });
     }
+    // 单聊拉黑之后座位仍在,不复查的话被拉黑的一方可以把会话设成 30 秒焚毁,
+    // 隔一分钟 sweeper 就替他把对方的整段历史真删了 —— 一个连消息都发不出去的
+    // 人,不该有销毁对方数据的能力。
+    await this.assertDirectMutationAllowed(conversation, userId);
     const normalized =
       seconds !== null && Number.isInteger(seconds) && seconds > 0
         ? seconds
         : null;
+    // 放宽/关闭之前,先把旧策略下**已经到期**的消息落成真删。
+    // 读路径的过滤是按「当前 burnDurationSec」算的,一旦放宽,那些已经过期、
+    // 只是还没轮到 sweeper 的消息会连同签名的媒体 URL 一起重新可读 ——
+    // 用户以为烧掉的东西又回来了。
+    await this.tombstoneExpiredBeforeRelax(
+      conversationId,
+      conversation.burnDurationSec,
+      normalized,
+    );
     const updated = await this.prisma.chatConversation.update({
       where: { id: conversationId },
       data: { burnDurationSec: normalized },
     });
     // 微信/Signal 式留痕:开关变化必须双方可见,防「对方偷偷开了焚毁」。
-    void this.systemMessage.emit(conversationId, {
+    // 必须等它落库:emit 里已经把失败吞成 warn,这里再 fire-and-forget 一次,
+    // 就成了「设置生效了、痕迹没留下」也照样返回成功。
+    await this.systemMessage.emit(conversationId, {
       kind: 'burn-changed',
       seconds: normalized ?? 0,
     });
     return { burnDurationSec: updated.burnDurationSec ?? null };
+  }
+
+  /**
+   * 焚毁时长放宽/关闭前的兜底真删:按**旧**时长算出的过期消息立刻落成
+   * deleted,免得放宽之后它们从读路径的过滤里溜回来。
+   * 收紧(新时长更短)不需要处理 —— 新截止只会更晚,sweeper 下一轮就到。
+   */
+  private async tombstoneExpiredBeforeRelax(
+    conversationId: string,
+    previousSeconds: number | null,
+    nextSeconds: number | null,
+  ): Promise<void> {
+    if (!previousSeconds || previousSeconds <= 0) return;
+    if (nextSeconds !== null && nextSeconds <= previousSeconds) return;
+    const cutoff = new Date(Date.now() - previousSeconds * 1000);
+    const expired = await this.prisma.chatMessage.findMany({
+      where: {
+        conversationID: conversationId,
+        deleted: false,
+        createdAt: { lt: cutoff },
+      },
+      select: { id: true, type: true, content: true },
+    });
+    if (expired.length === 0) return;
+    await this.prisma.chatMessage.updateMany({
+      where: { id: { in: expired.map((row) => row.id) } },
+      // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
+      // 只清 content 等于「烧掉的只是最后一版」。
+      data: {
+        deleted: true,
+        content: {},
+        contentHistory: [] as Prisma.InputJsonValue,
+      },
+    });
+    const mediaKeys = expired.flatMap((row) => this.collectMediaKeys(row));
+    if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
   }
 
   /**
@@ -1851,7 +2230,7 @@ export class ChatService {
       },
       data: { clearedBeforeHeight: watermark },
     });
-    await this.prisma.chatMember.updateMany({
+    const read = await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
         userID: userId,
@@ -1859,6 +2238,16 @@ export class ChatService {
       },
       data: { lastReadHeight: watermark },
     });
+    // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
+    // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
+    // 那就播出和 markRead 完全一样的事件。
+    if (read.count > 0) {
+      this.broadcast.emitRead({
+        conversationId,
+        userId,
+        height: watermark,
+      });
+    }
     return { clearedBeforeHeight: watermark };
   }
 

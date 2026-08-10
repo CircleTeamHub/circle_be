@@ -50,6 +50,19 @@ export class ChatCircleSyncService {
     private readonly systemMessage: ChatSystemMessageService,
   ) {}
 
+  /**
+   * 把一个圈子排进下一轮对账重试。
+   *
+   * 给对账**之外**触发的即时同步用(入圈通过后的那次 ensureCircleConversation)。
+   * 那条路径失败只记日志的话:数据库正好在停机,而对账扫的是
+   * `CircleMember.updatedAt` 的 2 分钟窗口 —— 库恢复时那次变更早就滑出窗口,
+   * 于是这位新成员的聊天座位一直缺着,直到该圈碰巧再发生一次成员变更。
+   */
+  scheduleRetry(circleID: string): void {
+    if (this.retryQueue.size >= ChatCircleSyncService.RETRY_QUEUE_MAX) return;
+    this.retryQueue.add(circleID);
+  }
+
   @Cron(CronExpression.EVERY_MINUTE)
   async reconcileRecent(): Promise<void> {
     const since = new Date(
@@ -198,7 +211,9 @@ export class ChatCircleSyncService {
           userID: { in: activeIds },
           leftAt: { not: null },
         },
-        data: { leftAt: null, lastReadHeight: watermark },
+        // joinedAt 也要重置:逐条已读回执按 joinedAt 排掉「入群前的消息」,
+        // 复位座位不刷新它的话,重新入群的人会显示成他离座期间每一条消息的已读者。
+        data: { leftAt: null, lastReadHeight: watermark, joinedAt: new Date() },
       });
       if (activeIds.length > 0) {
         await tx.chatMember.updateMany({
@@ -215,23 +230,33 @@ export class ChatCircleSyncService {
     });
 
     // 座位变更后的在线房间对齐(尽力而为;掉线成员重连时按座位重新派生)。
-    for (const userID of result.toJoin) {
-      void this.broadcast
-        .joinUserToConversation(userID, result.conversationId)
-        .catch((error: unknown) =>
+    //
+    // 入房必须**先于** joined 事件完成。反过来的话:客户端收到 joined 立刻拉一次
+    // 历史,而 joinUserToConversation 内部还在 await fetchSockets —— 这中间落库并
+    // 广播的消息,历史拉取够不着(它还没写完?不,是拉取已经返回了),房间订阅也还
+    // 没建立,于是那几条消息对这位新成员凭空消失,直到下次重连才补上。
+    await Promise.all(
+      result.toJoin.map(async (userID) => {
+        try {
+          await this.broadcast.joinUserToConversation(
+            userID,
+            result.conversationId,
+          );
+        } catch (error: unknown) {
           this.logger.warn(
             `join room failed user=${userID}: ${
               error instanceof Error ? error.message : String(error)
             }`,
-          ),
-        );
-      // 个人事件:会话即刻出现在本人列表里,不必等下一次全量拉取。
-      this.broadcast.emitConversationChange(userID, {
-        kind: 'joined',
-        conversationId: result.conversationId,
-        userId: userID,
-      });
-    }
+          );
+        }
+        // 个人事件:会话即刻出现在本人列表里,不必等下一次全量拉取。
+        this.broadcast.emitConversationChange(userID, {
+          kind: 'joined',
+          conversationId: result.conversationId,
+          userId: userID,
+        });
+      }),
+    );
     // 进/退群系统提示:初始建会话是存量播种,不逐人刷屏;之后的增量变化才提示。
     if (!result.created) {
       void this.emitMembershipNotices(

@@ -156,3 +156,8 @@ export const HISTORY_PAGE_DEFAULT = 50;
 
 /** 会话列表单次返回上限(Phase 1 无分页,超过则取最近活跃的前 N 个)。 */
 export const CONVERSATION_LIST_MAX = 100;
+
+/** 离线撤回/编辑增量单次返回上限(重连后一次追平)。 */
+export const MUTATION_PAGE_MAX = 200;
+/** 增量最多回溯多久:超过这个跨度的离线,客户端本地缓存本来也已经翻篇。 */
+export const MUTATION_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;

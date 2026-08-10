@@ -163,6 +163,10 @@ export class ChatPushService {
         JOIN "ChatMessage" m ON m."conversationID" = cm."conversationID"
         WHERE cm."userID" = ANY(${userIds}::text[])
           AND cm."leftAt" IS NULL
+          -- 隐藏的会话不出现在 GET /chat/conversations 里,自然也不进 app 的
+          -- tab 未读数。这里不排掉的话,任何一条别的会话的推送都会把 iOS 角标
+          -- 顶到一个比 app 里看得见的总数更大的值,而且每来一条推送就复现一次。
+          AND cm."hiddenAt" IS NULL
           AND m."deleted" = false
           AND m."height" > GREATEST(cm."lastReadHeight", cm."clearedBeforeHeight")
           AND (m."senderID" IS NULL OR m."senderID" <> cm."userID")

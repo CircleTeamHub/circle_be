@@ -87,6 +87,10 @@ export class ChatGateway implements OnModuleDestroy {
   private revocationSubscribed = false;
   private revocationRetryAttempt = 0;
   private revocationRetryTimer: NodeJS.Timeout | null = null;
+  /** Redis adapter 挂载重试(启动时 Redis 不可用 → 房间广播会退化成单实例)。 */
+  private static readonly ADAPTER_ATTACH_MAX_ATTEMPTS = 10;
+  private static readonly ADAPTER_RETRY_DELAY_MS = 5_000;
+  private adapterRetryTimer: NodeJS.Timeout | null = null;
   /** access token 到期即断连的计时器,按 socket 保存以便断开时清掉。 */
   private readonly expiryTimers = new Map<Socket, NodeJS.Timeout>();
   /** 多设备是正当需求,但单账号不该能开出无上限的连接来摊薄限流成本。 */
@@ -138,6 +142,10 @@ export class ChatGateway implements OnModuleDestroy {
       clearTimeout(this.revocationRetryTimer);
       this.revocationRetryTimer = null;
     }
+    if (this.adapterRetryTimer) {
+      clearTimeout(this.adapterRetryTimer);
+      this.adapterRetryTimer = null;
+    }
     for (const timer of this.expiryTimers.values()) clearTimeout(timer);
     this.expiryTimers.clear();
     this.connectionsByUser.clear();
@@ -185,14 +193,39 @@ export class ChatGateway implements OnModuleDestroy {
 
   /**
    * G-04:adapter 让 to(room).emit 跨实例投递。pub 复用命令连接、sub 独立连接,
-   * 都由 RedisService 管生命周期;拿不到客户端(未配/连不上)就保持单实例语义。
+   * 都由 RedisService 管生命周期;未配 Redis 就保持单实例语义。
+   *
+   * 配了 Redis 但启动那一刻连不上,必须重试。原来一次拿不到就放弃:进程活着、
+   * RedisService 随后自己重连成功,于是**在线注册表是跨实例的、房间广播却仍是
+   * 本实例的** —— 别的实例上的用户被判成在线(不推离线通知),消息又跨不过去,
+   * 结果是这些人既收不到 socket 消息也收不到推送,直到重启。
    */
   private async attachRedisAdapter(io: Server): Promise<void> {
     if (!this.redisService.isEnabled()) return;
-    const clients = await this.redisService.getAdapterClients();
-    if (!clients) return;
-    io.adapter(createAdapter(clients.pub, clients.sub));
-    this.logger.log('chat gateway: redis adapter attached (multi-instance)');
+    for (
+      let attempt = 0;
+      attempt < ChatGateway.ADAPTER_ATTACH_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      if (this.io === null && attempt > 0) return; // 已 onModuleDestroy
+      const clients = await this.redisService.getAdapterClients();
+      if (clients) {
+        io.adapter(createAdapter(clients.pub, clients.sub));
+        this.logger.log(
+          'chat gateway: redis adapter attached (multi-instance)',
+        );
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ChatGateway.ADAPTER_RETRY_DELAY_MS);
+        timer.unref?.();
+        this.adapterRetryTimer = timer;
+      });
+    }
+    this.logger.error(
+      'chat gateway: redis adapter unavailable after retries; ' +
+        'realtime stays per-instance (cross-instance delivery will be lost)',
+    );
   }
 
   /**
@@ -399,6 +432,18 @@ export class ChatGateway implements OnModuleDestroy {
     }
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
     const globalCount = await this.presence.registerSocket(userId);
+    // null = 这次 +1 没落到 Redis 上(未配置,或那一刻不可用)。断开时必须
+    // 如实告诉注册表,否则会去减一个从没加上的计数(见 socketDisconnected)。
+    const hasLease = globalCount !== null;
+    // 这次 await 期间断开的连接,'disconnect' 监听器还没挂上(见下面那段注释:
+    // 监听器必须在业务 await 之前注册,但注册本身排在这一步之后)—— 事件就此丢失,
+    // 本实例的连接槽和跨实例在线条目都留给了一条已死的 socket。Redis 慢的时候
+    // 反复连了就断,能把用户永久标成在线(离线推送全被吞掉)并耗尽连接上限。
+    if (socket.disconnected) {
+      void this.presence.socketDisconnected(userId, hasLease);
+      this.releaseConnectionSlot(userId, socket);
+      return;
+    }
     if (
       globalCount !== null &&
       globalCount > ChatGateway.MAX_SOCKETS_PER_USER
@@ -406,7 +451,7 @@ export class ChatGateway implements OnModuleDestroy {
       this.logger.warn(
         `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
       );
-      void this.presence.socketDisconnected(userId);
+      void this.presence.socketDisconnected(userId, hasLease);
       this.releaseConnectionSlot(userId, socket);
       socket.disconnect(true);
       return;
@@ -476,7 +521,7 @@ export class ChatGateway implements OnModuleDestroy {
     socket.on('disconnect', () => {
       resolveReady(false);
       this.releaseConnectionSlot(userId, socket);
-      void this.presence.socketDisconnected(userId);
+      void this.presence.socketDisconnected(userId, hasLease);
       const timer = this.expiryTimers.get(socket);
       if (timer) {
         clearTimeout(timer);

@@ -636,6 +636,69 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * 带**逐成员**过期的集合(ZSET,score = 到期时刻的 epoch ms)。
+   *
+   * 普通 SET 只有整键 TTL,而在线注册表里每个存活实例都会给自己那些成员续期 ——
+   * 续的却是整个键:只要会话里还有一个人在线,某个实例崩掉后留下的幽灵成员就
+   * 永远不会过期。改成 ZSET 之后,续期只抬自己那一条的 score,别人的该老还是老。
+   */
+  async addToExpiringSet(
+    key: string,
+    member: string,
+    ttlSeconds: number,
+  ): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+    try {
+      await client.zadd(key, String(Date.now() + ttlSeconds * 1000), member);
+      // 整键 TTL 只当兜底:整个会话都没人了,键自己消失,不用扫。
+      await client.expire(key, ttlSeconds);
+      return true;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      return null;
+    }
+  }
+
+  async removeFromExpiringSet(
+    key: string,
+    member: string,
+  ): Promise<boolean | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('set');
+      return null;
+    }
+    try {
+      await client.zrem(key, member);
+      return true;
+    } catch (error) {
+      this.recordCommandFailure('set', error);
+      return null;
+    }
+  }
+
+  /** 未过期的成员;顺带把过期的清掉(读多写少,清理搭车即可)。 */
+  async getLiveSetMembers(key: string): Promise<string[] | null> {
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('get');
+      return null;
+    }
+    try {
+      const now = Date.now();
+      await client.zremrangebyscore(key, '-inf', `(${now}`);
+      return await client.zrangebyscore(key, now, '+inf');
+    } catch (error) {
+      this.recordCommandFailure('get', error);
+      return null;
+    }
+  }
+
   async getSetMembers(key: string): Promise<string[] | null> {
     const client = await this.getCommandClient();
     if (!client) {

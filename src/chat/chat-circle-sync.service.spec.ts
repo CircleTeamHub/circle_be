@@ -165,7 +165,12 @@ describe('ChatCircleSyncService', () => {
         }),
         // 复活座位同时把水位推到当前高度:离座期间的消息本就与他无关,
         // 留着旧水位会让重新入群的人一进来就背一堆"未读"。
-        data: { leftAt: null, lastReadHeight: 0 },
+        // joinedAt 同步刷新 —— 逐条已读回执按它排掉「入群前的消息」。
+        data: {
+          leftAt: null,
+          lastReadHeight: 0,
+          joinedAt: expect.any(Date) as Date,
+        },
       }),
     );
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
