@@ -5,10 +5,15 @@ import {
 import {
   NoopErrorAggregationProvider,
   SentryErrorAggregationProvider,
+  configureErrorAggregationProvider,
   createErrorAggregationConfig,
   createErrorAggregationProvider,
+  createSentryInitOptions,
+  reportOperationalError,
+  type ErrorAggregationProvider,
   type SentryClientLike,
 } from './error-aggregation.service';
+import { execFileSync } from 'node:child_process';
 
 function createFakeClient(): jest.Mocked<SentryClientLike> {
   return {
@@ -117,7 +122,7 @@ describe('createErrorAggregationProvider', () => {
 });
 
 describe('SentryErrorAggregationProvider', () => {
-  it('captures server errors with sanitized request tags and user id', () => {
+  it('captures server errors with sanitized request tags but no account identity', () => {
     const client = createFakeClient();
     const provider = new SentryErrorAggregationProvider(client);
     const error = new Error('boom');
@@ -133,7 +138,7 @@ describe('SentryErrorAggregationProvider', () => {
 
     expect(client.captureException).toHaveBeenCalledTimes(1);
     expect(client.captureException).toHaveBeenCalledWith(
-      error,
+      expect.objectContaining({ message: 'http server error' }),
       expect.objectContaining({
         tags: expect.objectContaining({
           requestId: 'req-1',
@@ -142,8 +147,28 @@ describe('SentryErrorAggregationProvider', () => {
           path: '/api/v1/circle',
           statusCode: '500',
         }),
-        user: { id: 'user-1' },
       }),
+    );
+    expect(client.captureException.mock.calls[0]?.[1]).not.toHaveProperty(
+      'user',
+    );
+    expect(client.captureException.mock.calls[0]?.[0]).not.toBe(error);
+  });
+
+  it('sanitizes secrets and PII from captured exception messages and stacks', () => {
+    const client = createFakeClient();
+    const provider = new SentryErrorAggregationProvider(client);
+    const error = new Error(
+      'private chat says blue pineapple for person@example.test with Bearer top-secret at https://store.test/object?X-Amz-Signature=secret',
+    );
+    error.stack = `${error.message}\n at eyJheader.payload.signature`;
+
+    provider.captureError(error, { statusCode: 500 });
+
+    const captured = client.captureException.mock.calls[0]?.[0] as Error;
+    expect(captured).not.toBe(error);
+    expect(`${captured.message}\n${captured.stack}`).not.toMatch(
+      /blue pineapple|person@example\.test|top-secret|X-Amz-Signature|eyJheader\.payload\.signature/,
     );
   });
 
@@ -266,6 +291,196 @@ describe('SentryErrorAggregationProvider', () => {
 
     await expect(provider.flush(2000)).resolves.toBe(true);
     expect(client.flush).toHaveBeenCalledWith(2000);
+  });
+});
+
+describe('reportOperationalError', () => {
+  afterEach(() => {
+    configureErrorAggregationProvider(new NoopErrorAggregationProvider());
+  });
+
+  it('routes non-HTTP failures through the configured provider with stable tags', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+
+    reportOperationalError(new Error('db down'), {
+      component: 'CallCleanup',
+      operation: 'sweepExpiredRingingCalls',
+      kind: 'scheduler',
+    });
+
+    expect(provider.captureError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: 'CallCleanup.sweepExpiredRingingCalls failure',
+      }),
+      {
+        component: 'CallCleanup',
+        operation: 'sweepExpiredRingingCalls',
+        kind: 'scheduler',
+      },
+    );
+  });
+
+  it('deduplicates only repeated operational failures with the same failure signature', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+    const context = {
+      component: 'RealtimeGateway',
+      operation: 'emitSnapshot',
+      kind: 'websocket',
+    };
+
+    const error = new Error('first private message');
+    error.stack =
+      'Error: first private message\n    at emitSnapshot (/srv/realtime.ts:42:1)';
+
+    reportOperationalError(error, context);
+    reportOperationalError(error, context);
+
+    expect(provider.captureError).toHaveBeenCalledTimes(1);
+  });
+
+  it('captures distinct operational failures from the same operation', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+    const context = {
+      component: 'ChatGateway',
+      operation: 'send',
+      kind: 'websocket',
+    };
+    const databaseFailure = new Error('database private message');
+    databaseFailure.stack =
+      'Error: database private message\n    at persist (/srv/chat-store.ts:42:1)';
+    const broadcastFailure = new Error('broadcast private message');
+    broadcastFailure.stack =
+      'Error: broadcast private message\n    at broadcast (/srv/chat-broadcast.ts:88:1)';
+
+    reportOperationalError(databaseFailure, context);
+    reportOperationalError(broadcastFailure, context);
+
+    expect(provider.captureError).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('createSentryInitOptions', () => {
+  it('keeps default crash integrations and applies a final privacy filter', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://a@o/1',
+      environment: 'production',
+      release: 'circle-be@abc',
+    });
+
+    expect(options).toEqual(
+      expect.objectContaining({
+        sendDefaultPii: false,
+        tracesSampleRate: 0,
+      }),
+    );
+    expect(options).not.toHaveProperty('defaultIntegrations');
+    expect(typeof options.beforeSend).toBe('function');
+    const filtered = (options.beforeSend as (event: unknown) => unknown)({
+      exception: {
+        values: [
+          {
+            type: 'Error',
+            value: 'private blue pineapple',
+            stacktrace: {
+              frames: [
+                {
+                  filename: 'src/chat.ts',
+                  function: 'send',
+                  lineno: 42,
+                  vars: { message: 'private blue pineapple' },
+                  context_line: 'const message = privateContent',
+                },
+              ],
+            },
+          },
+        ],
+      },
+      request: { headers: { authorization: 'Bearer secret' } },
+    }) as Record<string, any>;
+    expect(JSON.stringify(filtered)).not.toMatch(
+      /blue pineapple|Bearer secret/,
+    );
+    expect(filtered.exception.values[0].stacktrace.frames).toEqual([
+      {
+        filename: 'src/chat.ts',
+        function: 'send',
+        lineno: 42,
+      },
+    ]);
+  });
+
+  it('captures and sanitizes an uncaught child-process exception through the default integrations', () => {
+    const script = `
+      const { createSentryInitOptions } = require('./src/logging/error-aggregation.service');
+      const Sentry = require('@sentry/node');
+      const envelopes = [];
+      Sentry.init({
+        ...createSentryInitOptions({ provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' }),
+        transport: () => ({
+          send: async (envelope) => {
+            envelopes.push(envelope);
+            return { status: 'success' };
+          },
+          flush: async () => true,
+        }),
+      });
+      process.on('uncaughtException', () => {
+        setTimeout(async () => {
+          await Sentry.flush(500);
+          process.stdout.write(JSON.stringify(envelopes));
+          process.exit(0);
+        }, 50);
+      });
+      setTimeout(() => {
+        throw new Error('private message person@example.test Bearer child-secret');
+      }, 0);
+    `;
+
+    const output = execFileSync(
+      process.execPath,
+      ['-r', 'ts-node/register/transpile-only', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TS_NODE_COMPILER_OPTIONS: JSON.stringify({ rootDir: '.' }),
+        },
+      },
+    );
+
+    expect(output).not.toContain('private message');
+    expect(output).not.toContain('person@example.test');
+    expect(output).not.toContain('child-secret');
+    const eventEnvelopes = JSON.parse(output).filter(
+      (envelope: unknown) =>
+        Array.isArray(envelope) &&
+        Array.isArray(envelope[1]) &&
+        envelope[1].some(
+          (item: unknown) =>
+            Array.isArray(item) &&
+            item[0] &&
+            typeof item[0] === 'object' &&
+            (item[0] as { type?: unknown }).type === 'event',
+        ),
+    );
+    expect(eventEnvelopes).toHaveLength(1);
   });
 });
 

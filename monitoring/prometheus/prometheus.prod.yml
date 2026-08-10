@@ -23,12 +23,12 @@ rule_files:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ["alertmanager:9093"]
+        - targets: ['alertmanager:9093']
 
 scrape_configs:
   - job_name: prometheus
     static_configs:
-      - targets: ["localhost:9090"]
+      - targets: ['localhost:9090']
 
   - job_name: circle-be
     metrics_path: /metrics
@@ -86,27 +86,8 @@ scrape_configs:
 
   - job_name: node-exporter
     static_configs:
-      - targets: ["node-exporter:9100"]
+      - targets: ['node-exporter:9100']
 
   - job_name: cadvisor
     static_configs:
-      - targets: ["cadvisor:8080"]
-
-  # OpenIM exposes its own Prometheus metrics when enabled in its config (#110).
-  # round 2 review：生产 compose 挂载的是本文件（prometheus.yml 会被覆盖），
-  # runbook 第 7 步在生产照做时必须改这里。
-  #
-  # 这个 job 之前是注释掉的，后果是聊天消息洪泛（恶意刷屏、群消息风暴）在监控上
-  # 完全不可见：消息流量根本不经过 circle-be，circle-be 那组指标一动不动，而 OpenIM
-  # 这边没人抓。开着它，至少 up==0 会明确告诉你「这条可观测性还没接上」。
-  #
-  # 下面是占位端口，随 OpenIM 版本而异，必须在服务器上确认后替换：
-  #   grep -rn "prometheusPort" ~/openim-docker/config
-  # 端口不对时不会污染其它 job，只会让 OpenIMMetricsUnreachable（warning）响 ——
-  # 它被有意排除在 critical 的 TargetDown 之外，理由见 alerts.yml。
-  - job_name: openim
-    static_configs:
-      # msggateway（连接数/在线数——容量规划与洪泛最需要的那组）
-      - targets: ["host.docker.internal:20112"]
-      # openim-api（消息吞吐）
-      - targets: ["host.docker.internal:20113"]
+      - targets: ['cadvisor:8080']

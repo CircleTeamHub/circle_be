@@ -3,6 +3,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TempChatService } from './temp-chat.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /** 单轮处理的房间数上限。剩余的留给下一轮,不在一次 sweep 里跑完。 */
 const SWEEP_BATCH = 200;
@@ -35,6 +36,11 @@ export class TempChatCleanup {
           try {
             await this.service.teardown(room, TempChatStatus.EXPIRED);
           } catch (err) {
+            reportOperationalError(err, {
+              component: 'TempChatCleanup',
+              operation: 'teardownExpiredRoom',
+              kind: 'scheduler',
+            });
             this.logger.error(`teardown failed for ${room.id}: ${String(err)}`);
           }
         }
@@ -45,6 +51,17 @@ export class TempChatCleanup {
       // 剩下的下一轮继续 —— 静默截断会让人以为已经清干净了。
       this.logger.warn(
         `temp chat sweep hit the ${SWEEP_BATCH * SWEEP_MAX_BATCHES}-room cap; remainder deferred to the next tick`,
+      );
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'TempChatCleanup',
+        operation: 'claimBatch',
+        kind: 'scheduler',
+      });
+      this.logger.error(
+        `temp chat batch claim failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
     } finally {
       this.running = false;

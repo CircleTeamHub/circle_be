@@ -6,6 +6,8 @@ import { RedisService } from './redis/redis.service';
 import { setupApp } from './setup';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
+import { chatMetrics } from './chat/chat-metrics';
+import * as errorAggregation from './logging/error-aggregation.service';
 
 function buildAppMock(
   redisService?: Pick<RedisService, 'createRateLimitStore'> &
@@ -47,6 +49,21 @@ describe('setupApp', () => {
     expect(app.useGlobalInterceptors).toHaveBeenCalledWith(
       expect.any(ResponseInterceptor),
     );
+  });
+
+  it('makes the configured aggregation provider available to non-HTTP jobs', () => {
+    const configure = jest.spyOn(
+      errorAggregation,
+      'configureErrorAggregationProvider',
+    );
+    const app = buildAppMock();
+
+    setupApp(app as any);
+
+    expect(configure).toHaveBeenCalledWith(
+      expect.objectContaining({ captureError: expect.any(Function) }),
+    );
+    configure.mockRestore();
   });
 
   it('registers global exception filters (All + Prisma)', () => {
@@ -239,6 +256,33 @@ describe('setupApp', () => {
         /upload_presign_rate_limited_total\{store="memory"\}\s+[1-9]/,
       ),
     );
+  });
+
+  it('exposes the production chat metrics singleton on the metrics endpoint', async () => {
+    chatMetrics.observeConnectionOpened(1);
+    try {
+      const app = buildAppMock();
+      setupApp(app as any);
+      const metricsCall = app.use.mock.calls.find(
+        ([path]) => path === '/metrics',
+      );
+      const handler = metricsCall?.[1] as
+        | ((req: unknown, res: unknown) => Promise<void>)
+        | undefined;
+      const response = {
+        setHeader: jest.fn(),
+        end: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      };
+
+      await handler?.({ headers: {} }, response);
+
+      expect(response.end).toHaveBeenCalledWith(
+        expect.stringMatching(/chat_connections_active\s+1/),
+      );
+    } finally {
+      chatMetrics.observeConnectionClosed(0);
+    }
   });
 
   it('mounts /healthz and /readyz ahead of every rate limiter', () => {

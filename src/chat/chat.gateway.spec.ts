@@ -1,6 +1,8 @@
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, HttpException } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatGateway } from './chat.gateway';
+import type { ChatMetrics } from './chat-metrics';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 type Handler = (...args: unknown[]) => void;
 
@@ -49,6 +51,16 @@ describe('ChatGateway', () => {
   };
   const redisService = { subscribePattern: jest.fn().mockResolvedValue(true) };
   const configService = { get: jest.fn().mockReturnValue('guest-secret') };
+  const metrics: jest.Mocked<ChatMetrics> = {
+    registry: {} as ChatMetrics['registry'],
+    observeConnectionOpened: jest.fn(),
+    observeConnectionClosed: jest.fn(),
+    observeConnectionRejected: jest.fn(),
+    observeAuthFailure: jest.fn(),
+    observeEvent: jest.fn(),
+    observeAckDuration: jest.fn(),
+    observeBroadcast: jest.fn(),
+  };
 
   const gateway = new ChatGateway(
     jwtService as never,
@@ -59,6 +71,7 @@ describe('ChatGateway', () => {
     redisService as never,
     configService as never,
   );
+  (gateway as any).metrics = metrics;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -211,13 +224,20 @@ describe('ChatGateway', () => {
       expect(socket.handlers.has('chat:send')).toBe(true);
       expect(socket.handlers.has('chat:read')).toBe(true);
       expect(socket.handlers.has('chat:typing')).toBe(true);
+      expect(metrics.observeConnectionOpened).toHaveBeenCalledWith(1);
     });
 
     it('disconnects instead of leaving a silent no-room connection on join failure', async () => {
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
       const socket = fakeSocket();
       chatService.listConversationIds.mockRejectedValue(new Error('db down'));
       await gateway['handleConnection'](socket as never);
       expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
+        'join_failed',
+      );
       // 监听现在是同步注册的(在入房之前),所以这里不再断言 handlers 为空 ——
       // 要保证的是它们「注册了但不干活」:入房失败后事件一律不落到业务处理器。
       const ack = jest.fn();
@@ -225,6 +245,12 @@ describe('ChatGateway', () => {
       await Promise.resolve();
       await Promise.resolve();
       expect(chatService.sendMessage).not.toHaveBeenCalled();
+      expect(report).toHaveBeenCalledWith(expect.any(Error), {
+        component: 'ChatGateway',
+        operation: 'joinRooms',
+        kind: 'websocket',
+      });
+      report.mockRestore();
     });
 
     // 入房要 await,而监听若在 await 之后注册,这段窗口里到达的 chat:send
@@ -326,6 +352,11 @@ describe('ChatGateway', () => {
         d: 'd1',
       });
       expect(broadcast.emitMessage).toHaveBeenCalledTimes(1);
+      expect(metrics.observeEvent).toHaveBeenCalledWith('send', 'success');
+      expect(metrics.observeBroadcast).toHaveBeenCalledWith(
+        'message',
+        expect.any(Number),
+      );
     });
 
     it('does not rebroadcast idempotent replays', async () => {
@@ -345,6 +376,9 @@ describe('ChatGateway', () => {
     });
 
     it('maps service errorCode exceptions into the ack instead of throwing', async () => {
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
       chatService.sendMessage.mockRejectedValue(
         new ForbiddenException({
           message: '不是会话成员',
@@ -362,6 +396,71 @@ describe('ChatGateway', () => {
         expect.objectContaining({ ok: false, code: ChatErrorCode.NotMember }),
       );
       expect(broadcast.emitMessage).not.toHaveBeenCalled();
+      expect(report).not.toHaveBeenCalled();
+      report.mockRestore();
+    });
+
+    it('reports a 5xx HttpException even when its body includes an errorCode', async () => {
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      chatService.sendMessage.mockRejectedValue(
+        new HttpException(
+          {
+            message: 'database failed',
+            errorCode: ChatErrorCode.InvalidPayload,
+          },
+          500,
+        ),
+      );
+      const ack = jest.fn();
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        ack,
+      );
+
+      expect(report).toHaveBeenCalledWith(expect.any(HttpException), {
+        component: 'ChatGateway',
+        operation: 'send',
+        kind: 'websocket',
+      });
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: false,
+          code: ChatErrorCode.InvalidPayload,
+        }),
+      );
+      report.mockRestore();
+    });
+
+    it('reports an unexpected send failure without user, conversation, or message content', async () => {
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      chatService.sendMessage.mockRejectedValue(
+        new Error('private message blue pineapple'),
+      );
+      const ack = jest.fn();
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'unexpected-user',
+        payload as never,
+        ack,
+      );
+
+      expect(report).toHaveBeenCalledWith(expect.any(Error), {
+        component: 'ChatGateway',
+        operation: 'send',
+        kind: 'websocket',
+      });
+      expect(JSON.stringify(report.mock.calls[0]?.[1])).not.toMatch(
+        /unexpected-user|conv-1|blue pineapple|hi/,
+      );
+      report.mockRestore();
     });
 
     it('rate limits per authenticated user with an explicit ack code', async () => {
@@ -384,6 +483,7 @@ describe('ChatGateway', () => {
         code: ChatErrorCode.RateLimited,
       });
       expect(chatService.sendMessage).toHaveBeenCalledTimes(20);
+      expect(metrics.observeEvent).toHaveBeenCalledWith('send', 'rate_limited');
     });
 
     // 配额按用户算,不按连接算。按 socket.id 计数的话,发满就重连是一个免费的

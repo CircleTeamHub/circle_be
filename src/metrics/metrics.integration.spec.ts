@@ -1,14 +1,22 @@
 import express from 'express';
 import request from 'supertest';
+import { Registry } from 'prom-client';
 import { createMetrics } from './metrics.service';
 import { createHttpMetricsMiddleware } from './http-metrics.middleware';
 import { createMetricsHandler } from './metrics.endpoint';
+import { createChatMetrics } from '../chat/chat-metrics';
 
 function buildApp() {
   const metrics = createMetrics({ collectDefault: false });
+  const chatMetrics = createChatMetrics();
   const app = express();
   app.use(createHttpMetricsMiddleware(metrics));
-  app.use('/metrics', createMetricsHandler(metrics.registry));
+  app.use(
+    '/metrics',
+    createMetricsHandler(
+      Registry.merge([metrics.registry, chatMetrics.registry]),
+    ),
+  );
   app.get('/api/v1/circle/:id', (_req, res) => {
     res.status(200).json({ ok: true });
   });
@@ -25,6 +33,14 @@ describe('metrics endpoint (integration)', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toContain('text/plain');
     expect(res.text).toContain('http_requests_total');
+  });
+
+  it('serves self-hosted chat capacity metrics', async () => {
+    const res = await request(buildApp()).get('/metrics');
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('chat_connections_active');
+    expect(res.text).toContain('chat_messages_received_total');
   });
 
   it('records a normalized route and status after a real request', async () => {

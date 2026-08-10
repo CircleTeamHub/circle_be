@@ -1,5 +1,6 @@
 import { TempChatStatus } from 'src/generated/prisma';
 import { TempChatCleanup } from './temp-chat.cleanup';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 describe('TempChatCleanup', () => {
   const prisma = { tempChat: { findMany: jest.fn() } };
@@ -27,6 +28,9 @@ describe('TempChatCleanup', () => {
   });
 
   it('one failing room does not block the others', async () => {
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation(() => undefined);
     prisma.tempChat.findMany.mockResolvedValue([
       { id: 'a', groupId: 'tmpA' },
       { id: 'b', groupId: 'tmpB' },
@@ -34,6 +38,13 @@ describe('TempChatCleanup', () => {
     service.teardown.mockRejectedValueOnce(new Error('boom'));
     await job.sweep();
     expect(service.teardown).toHaveBeenCalledTimes(2);
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledWith(expect.any(Error), {
+      component: 'TempChatCleanup',
+      operation: 'teardownExpiredRoom',
+      kind: 'scheduler',
+    });
+    report.mockRestore();
   });
 
   // 房间上限是按主机算的、TTL 又普遍相同,一次大批量到期会把无界 findMany
@@ -85,5 +96,24 @@ describe('TempChatCleanup', () => {
 
     release();
     await first;
+  });
+
+  it('reports a batch-claim failure and releases the reentry guard', async () => {
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation(() => undefined);
+    prisma.tempChat.findMany.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(job.sweep()).resolves.toBeUndefined();
+    expect(report).toHaveBeenCalledWith(expect.any(Error), {
+      component: 'TempChatCleanup',
+      operation: 'claimBatch',
+      kind: 'scheduler',
+    });
+
+    prisma.tempChat.findMany.mockResolvedValueOnce([]);
+    await job.sweep();
+    expect(prisma.tempChat.findMany).toHaveBeenCalledTimes(2);
+    report.mockRestore();
   });
 });
