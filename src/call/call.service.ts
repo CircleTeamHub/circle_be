@@ -1591,7 +1591,7 @@ export class CallService {
     return Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
   }
 
-  /** conversationID → 真实 OpenIM 群 id（Circle.id 时查表解析）。 */
+  /** conversationID → 真实群 id 候选（含 sg_ 前缀的历史形态与 Circle.id）。 */
 
   private groupIDCandidates(groupID: string): string[] {
     return Array.from(

@@ -46,7 +46,7 @@ export class AdminCommunityController {
 
   @Post('circles/:id/disable')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Disable a circle and mute its OpenIM group' })
+  @ApiOperation({ summary: 'Disable a circle and mute its chat group' })
   @ApiCreatedResponse()
   disableCircle(
     @Param('id', ParseUUIDPipe) id: string,
@@ -64,7 +64,7 @@ export class AdminCommunityController {
 
   @Post('circles/:id/restore')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: 'Restore a circle and unmute its OpenIM group' })
+  @ApiOperation({ summary: 'Restore a circle and unmute its chat group' })
   @ApiCreatedResponse()
   restoreCircle(
     @Param('id', ParseUUIDPipe) id: string,
@@ -81,7 +81,7 @@ export class AdminCommunityController {
   }
 
   @Get('groups')
-  @ApiOperation({ summary: 'List all OpenIM groups for administration' })
+  @ApiOperation({ summary: 'List all chat groups for administration' })
   @ApiOkResponse()
   listGroups(@Query() query: AdminCommunityListQueryDto) {
     return this.community.listGroups(query);

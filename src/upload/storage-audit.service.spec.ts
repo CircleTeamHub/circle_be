@@ -22,6 +22,7 @@ describe('StorageAuditService', () => {
       trace: emptyRows(),
       traceComment: emptyRows(),
       circlePost: emptyRows(),
+      chatMessage: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
       (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
@@ -43,22 +44,59 @@ describe('StorageAuditService', () => {
   const old = new Date('2020-01-01T00:00:00.000Z');
   const now = new Date('2020-02-01T00:00:00.000Z');
 
-  it('NEVER scans chat/ — those references live in OpenIM, not Postgres', async () => {
-    // 这是本文件最重要的一条。聊天图片的 URL 固化在 OpenIM 消息体（Mongo）里，
-    // circle_be 的 Postgres 一条引用都没有。一旦把 chat/ 纳入扫描，每一张聊天图片
-    // 都会被判成孤儿 —— 真开了删除就是一次点全站聊天图片的删除。
-    const { service, listObjects } = harness({});
-    await service.audit(now);
+  it('audits chat/ against the keys embedded in ChatMessage.content', async () => {
+    // OpenIM 时代这里守的是「绝不扫 chat/」——引用固化在 Mongo,Postgres 一条
+    // 都没有。自研栈把媒体收敛成 content 只存 object key(image: key/thumbKey,
+    // voice/file: key),引用回到了 Postgres,chat/ 从「绝不能扫」翻转成
+    // 「必须扫」:撤回/焚毁的对象删除是尽力而为,删失败靠这份账兜底。
+    const { service, listObjects } = harness({
+      objects: {
+        'chat/': [
+          { key: 'chat/u1/kept.jpg', size: 10, lastModified: old },
+          { key: 'chat/u1/kept_thumb.jpg', size: 2, lastModified: old },
+          { key: 'chat/u1/orphan.jpg', size: 32, lastModified: old },
+        ],
+      },
+      referenced: {
+        chatMessage: [
+          {
+            id: 'm1',
+            type: 'image',
+            content: {
+              key: 'chat/u1/kept.jpg',
+              thumbKey: 'chat/u1/kept_thumb.jpg',
+            },
+          },
+        ],
+      },
+    });
+    const result = await service.audit(now);
 
     const scannedPrefixes = listObjects.mock.calls.map((call) => call[0]);
-    expect(scannedPrefixes).not.toContain('chat/');
-    expect(scannedPrefixes.some((p: string) => p.startsWith('chat'))).toBe(
-      false,
-    );
-    // note-exports/ 由 MinIO 生命周期规则回收，也不归这里管。
+    expect(scannedPrefixes).toContain('chat/');
+    // key 与 thumbKey 都算引用;只有真没人指的对象记孤儿。
+    expect(result).toMatchObject({ orphanCount: 1, orphanBytes: 32 });
+    // note-exports/ 由 MinIO 生命周期规则回收，仍不归这里管。
     expect(
       scannedPrefixes.some((p: string) => p.startsWith('note-exports')),
     ).toBe(false);
+  });
+
+  it('media types without a field map never leak keys into the reference set', async () => {
+    // text/卡片类 content 没有媒体 key;万一有行混进扫描,提取器要按 type
+    // 白名单跳过,而不是把 content 里碰巧叫 key 的字符串当引用。
+    const { service } = harness({
+      objects: {
+        'chat/': [{ key: 'chat/u1/orphan.jpg', size: 8, lastModified: old }],
+      },
+      referenced: {
+        chatMessage: [
+          { id: 'm2', type: 'text', content: { key: 'chat/u1/orphan.jpg' } },
+        ],
+      },
+    });
+    const result = await service.audit(now);
+    expect(result).toMatchObject({ orphanCount: 1 });
   });
 
   it('reports unreferenced objects without deleting anything', async () => {

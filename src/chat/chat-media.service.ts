@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { UploadService } from 'src/upload/upload.service';
-import { CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
+import { CHAT_MEDIA_KEY_FIELDS, CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 
 /**
@@ -16,15 +16,6 @@ import type { ChatMessageDto } from './chat.types';
  */
 const CHAT_MEDIA_URL_WINDOW_MS = 60 * 60 * 1000;
 const CHAT_MEDIA_URL_TTL_SECONDS = 2 * 60 * 60;
-
-const MEDIA_KEY_FIELDS: Record<string, Array<{ key: string; url: string }>> = {
-  image: [
-    { key: 'key', url: 'url' },
-    { key: 'thumbKey', url: 'thumbUrl' },
-  ],
-  voice: [{ key: 'key', url: 'url' }],
-  file: [{ key: 'key', url: 'url' }],
-};
 
 @Injectable()
 export class ChatMediaService {
@@ -60,7 +51,7 @@ export class ChatMediaService {
   async attachMediaUrls(messages: ChatMessageDto[]): Promise<void> {
     const wanted = new Set<string>();
     for (const message of messages) {
-      const fields = MEDIA_KEY_FIELDS[message.type];
+      const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
       if (!fields) continue;
       for (const field of fields) {
         const value = message.content[field.key];
@@ -102,7 +93,7 @@ export class ChatMediaService {
     if (signed.size === 0) return;
 
     for (const message of messages) {
-      const fields = MEDIA_KEY_FIELDS[message.type];
+      const fields = CHAT_MEDIA_KEY_FIELDS[message.type];
       if (!fields) continue;
       const patch: Record<string, unknown> = {};
       for (const field of fields) {

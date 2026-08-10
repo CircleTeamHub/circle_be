@@ -102,6 +102,24 @@ export const MEDIA_MESSAGE_TYPES: readonly string[] = [
  */
 export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
 
+/**
+ * 媒体消息 content 里的 object-key 字段表(key 字段名 → 读路径补的 URL 字段名)。
+ * presign-on-read(ChatMediaService)与存量盘点(StorageAuditService)共用:
+ * 新增带媒体的消息类型时在这里补一行,两边同时生效 —— 只改一边的话,
+ * 要么新类型渲染不出图,要么它的对象全部被盘点误报成孤儿。
+ */
+export const CHAT_MEDIA_KEY_FIELDS: Record<
+  string,
+  Array<{ key: string; url: string }>
+> = {
+  image: [
+    { key: 'key', url: 'url' },
+    { key: 'thumbKey', url: 'thumbUrl' },
+  ],
+  voice: [{ key: 'key', url: 'url' }],
+  file: [{ key: 'key', url: 'url' }],
+};
+
 /** content JSON 序列化后的字节上限(超限直接拒收,防 socket 消息膨胀)。 */
 export const MAX_CONTENT_BYTES = 8 * 1024;
 

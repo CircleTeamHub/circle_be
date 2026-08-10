@@ -52,7 +52,10 @@ describe('ChatPushService', () => {
     prisma.chatMember.findMany.mockResolvedValue([
       { userID: 'u-peer', muted: false },
     ]);
-    prisma.$queryRaw.mockResolvedValue([{ userID: 'u-peer', count: 7n }]);
+    // BigInt() 而非 7n 字面量:tsconfig target 是 es2017,字面量过不了 tsc。
+    prisma.$queryRaw.mockResolvedValue([
+      { userID: 'u-peer', count: BigInt(7) },
+    ]);
 
     await service.onMessageBroadcast(msg());
 
