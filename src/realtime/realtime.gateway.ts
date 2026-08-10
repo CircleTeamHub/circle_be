@@ -127,6 +127,7 @@ export class RealtimeGateway implements OnModuleDestroy {
             operation: 'admitSocket',
             kind: 'websocket',
           });
+          this.logger.error('Realtime socket admission failed');
           socket.close(1011, 'Internal error');
         },
       );

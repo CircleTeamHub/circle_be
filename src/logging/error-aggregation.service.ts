@@ -351,6 +351,26 @@ const OPERATIONAL_ERROR_DEDUP_MS = 60_000;
 const MAX_OPERATIONAL_ERROR_SIGNATURES = 200;
 const operationalErrorLastReportedAt = new Map<string, number>();
 
+function operationalFailureSignature(error: unknown): string {
+  if (!(error instanceof Error)) return 'Unknown:unknown';
+
+  const errorName = stableTagSegment(error.name) ?? 'Error';
+  const topFrame = error.stack
+    ?.split('\n')
+    .slice(1)
+    .find((line) => line.trim().startsWith('at '));
+  const match = topFrame
+    ? /(?:\(|\s)([^()\s]+):(\d+):\d+\)?$/.exec(topFrame)
+    : undefined;
+  if (!match) return `${errorName}:unknown`;
+
+  const filename = match[1].split(/[\\/]/).pop() ?? 'unknown';
+  const safeFilename = /^[A-Za-z0-9_.-]{1,80}$/.test(filename)
+    ? filename
+    : 'unknown';
+  return `${errorName}:${safeFilename}:${match[2]}`;
+}
+
 /** Installs the provider created during bootstrap for non-HTTP failure paths. */
 export function configureErrorAggregationProvider(
   provider: ErrorAggregationProvider,
@@ -372,6 +392,7 @@ export function reportOperationalError(
       context.component ?? 'unknown-component',
       context.operation ?? 'unknown-operation',
       context.kind ?? 'unknown-kind',
+      operationalFailureSignature(error),
     ].join(':');
     const signature =
       operationalErrorLastReportedAt.has(rawSignature) ||

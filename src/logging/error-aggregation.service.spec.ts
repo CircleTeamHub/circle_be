@@ -325,7 +325,7 @@ describe('reportOperationalError', () => {
     );
   });
 
-  it('deduplicates repeated operational failures so outages do not flood Sentry', () => {
+  it('deduplicates only repeated operational failures with the same failure signature', () => {
     const provider: ErrorAggregationProvider = {
       name: 'sentry',
       captureError: jest.fn(),
@@ -338,10 +338,39 @@ describe('reportOperationalError', () => {
       kind: 'websocket',
     };
 
-    reportOperationalError(new Error('first'), context);
-    reportOperationalError(new Error('second'), context);
+    const error = new Error('first private message');
+    error.stack =
+      'Error: first private message\n    at emitSnapshot (/srv/realtime.ts:42:1)';
+
+    reportOperationalError(error, context);
+    reportOperationalError(error, context);
 
     expect(provider.captureError).toHaveBeenCalledTimes(1);
+  });
+
+  it('captures distinct operational failures from the same operation', () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'sentry',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+    const context = {
+      component: 'ChatGateway',
+      operation: 'send',
+      kind: 'websocket',
+    };
+    const databaseFailure = new Error('database private message');
+    databaseFailure.stack =
+      'Error: database private message\n    at persist (/srv/chat-store.ts:42:1)';
+    const broadcastFailure = new Error('broadcast private message');
+    broadcastFailure.stack =
+      'Error: broadcast private message\n    at broadcast (/srv/chat-broadcast.ts:88:1)';
+
+    reportOperationalError(databaseFailure, context);
+    reportOperationalError(broadcastFailure, context);
+
+    expect(provider.captureError).toHaveBeenCalledTimes(2);
   });
 });
 
