@@ -745,3 +745,29 @@ Set）。分批取行已经做了，但 Set 本身与历史媒体总量成正比
 
 已按此规则留档不修的 P2：§10.2 共享 object key 的撤回删除、§10.3 历史页表情回应
 无上界、§12.4 StorageAudit 的 key Set 内存。
+
+### 12.6 追加 P1：增量游标越过未提交的写（2026-08-10）
+
+`revokedAt`/`editedAt` 是在 Node 侧、写语句**构造时**生成的，而行要到 COMMIT 才对
+别的事务可见 —— 中间隔着锁等待（并发编辑、焚毁 sweeper 的 updateMany 都会持锁）。
+于是存在「时间戳很早、提交很晚」的行：
+
+```
+T=0s  A 撤回 M → 盖上 revokedAt=0s，UPDATE 卡在行锁上
+T=3s  设备 D 同步 → 查不到未提交的行 → 游标推到 3s
+T=5s  A 提交，revokedAt 仍然是 0s
+之后  D 拿 since=3s 来问 → 0s > 3s 不成立 → 这条撤回永远追不到
+```
+
+修法是**安全水位**：游标绝不越过 `now - MUTATION_SAFETY_LAG_MS`（60s）。
+DATABASE_STATEMENT_TIMEOUT_MS 默认 15s，超时的写会被 Postgres 掐掉，不可能悬挂
+得比 60s 更久，所以这个水位是充分的。代价只是重叠区间被重复投递，ingest 幂等。
+
+三条路径都要卡：正常分页、**空响应**（「一次什么都没查到的同步」恰恰是最容易
+跨过去的时刻）、resetRequired 之后的第一段。水位会让游标推不动时（整页都在不安全
+窗口里）报「已追平」而不是谎报 hasMore —— 后者会让客户端空转。
+
+**没有**采用 reviewer 建议的 commit-order sequence/outbox：普通序列同样不保证提交序
+（拿到 6 的事务可能先于拿到 5 的提交），真做得靠 `pg_current_snapshot()` 的 xmin
+逐行记录，那是 CDC 级别的机制，与这条通道的收益不成比例。在 statement_timeout
+有界的前提下安全水位是充分的 —— 这是一个**有意的取舍**，不是等价替换。

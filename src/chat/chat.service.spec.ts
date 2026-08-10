@@ -2224,9 +2224,12 @@ describe('ChatService', () => {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0].revokedAt).toEqual(expect.any(String));
       expect(typeof result.serverTime).toBe('string');
-      // 没被截断:游标可以安全地推到服务端时刻。
+      // 没被截断,但游标**不能**贴到 serverTime:未提交的写会被跨过去。
+      // 停在安全水位上(见 MUTATION_SAFETY_LAG_MS)。
       expect(result.hasMore).toBe(false);
-      expect(result.nextSince).toBe(result.serverTime);
+      expect(Date.parse(result.nextSince)).toBeLessThan(
+        Date.parse(result.serverTime),
+      );
     });
 
     it('stops the cursor at the last returned mutation when truncated', async () => {
@@ -2235,17 +2238,19 @@ describe('ChatService', () => {
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', clearedBeforeHeight: 0 },
       ]);
-      const boundary = new Date('2026-08-10T03:00:00.000Z');
+      // 时间取相对值:这一页必须整体落在安全水位**之下**,否则游标会被水位
+      // 卡住(那是另一条用例在测的行为)。
+      const boundary = new Date(Date.now() - 80 * 60_000);
       // 服务端多取一条用于判断「还有没有」:limit=2 时返回 3 条。
       prisma.$queryRaw.mockResolvedValue([
-        mutatedRow({ id: 'm1', mutatedAt: new Date('2026-08-10T01:00:00Z') }),
+        mutatedRow({ id: 'm1', mutatedAt: new Date(Date.now() - 90 * 60_000) }),
         mutatedRow({ id: 'm2', mutatedAt: boundary }),
-        mutatedRow({ id: 'm3', mutatedAt: new Date('2026-08-10T04:00:00Z') }),
+        mutatedRow({ id: 'm3', mutatedAt: new Date(Date.now() - 70 * 60_000) }),
       ]);
 
       const result = await service.listMutationsSince(
         'u1',
-        new Date(Date.now() - 60_000),
+        new Date(Date.now() - 120 * 60_000),
         2,
       );
 
@@ -2255,6 +2260,60 @@ describe('ChatService', () => {
       // id 必须一起带回去:毫秒精度下同刻并列很常见,只带时间戳的游标配
       // `> from` 会把剩下那些同刻的行永久跳过。
       expect(result.nextSinceId).toBe('m2');
+    });
+
+    it('never advances the cursor into the uncommitted-write window', async () => {
+      // 时间戳在写语句构造时生成,行到 COMMIT 才可见:一次被锁住的撤回完全
+      // 可以「时间戳很早、提交很晚」。同步把游标推到 serverTime 的话,它提交
+      // 之后就永远落在游标后面 —— 那条撤回的正文会一直留在对方屏幕上。
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const since = new Date(Date.now() - 10 * 60_000);
+      const result = await service.listMutationsSince('u1', since);
+
+      const advanced = Date.parse(result.nextSince);
+      // 空同步也一样:游标必须停在安全水位之下,不能贴到 serverTime。
+      expect(advanced).toBeLessThanOrEqual(Date.now() - 59_000);
+      expect(advanced).toBeGreaterThan(since.getTime());
+    });
+
+    it('does not rewind the cursor when the safety lag would push it backwards', async () => {
+      // 客户端刚同步过(since 很新),安全水位比它还老 —— 这时既不能倒退,
+      // 也不能谎报 hasMore 让它空转。
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const since = new Date(Date.now() - 1_000);
+      const result = await service.listMutationsSince('u1', since);
+
+      expect(result.nextSince).toBe(since.toISOString());
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('stops paging rather than spinning when the whole page is too fresh', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+      ]);
+      const since = new Date(Date.now() - 2_000);
+      // 整页都落在不安全窗口里:游标推不动。
+      prisma.$queryRaw.mockResolvedValue([
+        mutatedRow({ id: 'm1', mutatedAt: new Date(Date.now() - 1_500) }),
+        mutatedRow({ id: 'm2', mutatedAt: new Date(Date.now() - 1_000) }),
+        mutatedRow({ id: 'm3', mutatedAt: new Date(Date.now() - 500) }),
+      ]);
+
+      const result = await service.listMutationsSince('u1', since, 2);
+
+      // 消息照常投递(用户马上就能看到撤回),但游标原地不动 + hasMore=false:
+      // 谎报 hasMore 而游标不动会让客户端一直空转。
+      expect(result.messages).toHaveLength(2);
+      expect(result.nextSince).toBe(since.toISOString());
+      expect(result.hasMore).toBe(false);
     });
 
     it('reports resetRequired instead of silently clamping an ancient cursor', async () => {

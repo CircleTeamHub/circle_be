@@ -34,6 +34,7 @@ import {
   MEDIA_MESSAGE_TYPES,
   MUTATION_LOOKBACK_MS,
   MUTATION_PAGE_MAX,
+  MUTATION_SAFETY_LAG_MS,
   READERS_PAGE_MAX,
   RELAX_PURGE_BATCH,
   RELAX_PURGE_BATCHES_MAX,
@@ -978,10 +979,17 @@ export class ChatService {
   ): Promise<ChatMutationsPageDto> {
     const serverTime = new Date().toISOString();
     const lookbackFloor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
+    // 空响应的游标同样不能推到 serverTime —— 「一次什么都没查到的同步」正是
+    // 未提交写最容易被跨过去的时刻:那条撤回的时间戳已经生成、行还没可见,
+    // 游标一旦越过它,它提交之后就永远追不到了。同样卡在安全水位上,
+    // 且绝不倒退到 since 之前。
+    const safeCursor = new Date(
+      Math.max(since.getTime(), Date.now() - MUTATION_SAFETY_LAG_MS),
+    ).toISOString();
     const empty: ChatMutationsPageDto = {
       messages: [],
       serverTime,
-      nextSince: serverTime,
+      nextSince: safeCursor,
       nextSinceId: '',
       hasMore: false,
       resetRequired: false,
@@ -991,7 +999,12 @@ export class ChatService {
     // 被撤回的消息在它的缓存里永远是原文(撤回不改 height,历史补拉够不着)。
     // 如实告诉它「缓存作废,重新拉」。
     if (since < lookbackFloor) {
-      return { ...empty, resetRequired: true };
+      return {
+        ...empty,
+        // 全量重建之后的第一段增量同样从安全水位起算。
+        nextSince: new Date(Date.now() - MUTATION_SAFETY_LAG_MS).toISOString(),
+        resetRequired: true,
+      };
     }
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null },
@@ -1071,12 +1084,7 @@ export class ChatService {
     const hasMore = rows.length > take;
     const page = hasMore ? rows.slice(0, take) : rows;
     if (page.length === 0) return empty;
-    // 截断了就把游标停在这一页的最后一条上,绝不能回 serverTime ——
-    // 客户端照它前进的话,没返回的那些变更会被永久跳过(撤回的正文因此
-    // 一直留在对方屏幕上)。id 一起带回去,同毫秒的行才不会丢。
-    const last = page[page.length - 1];
-    const nextSince = hasMore ? last.mutatedAt.toISOString() : serverTime;
-    const nextSinceId = hasMore ? last.id : '';
+    const cursor = this.nextMutationCursor(since, sinceId, page, hasMore);
     const senders = await this.resolveSenders(
       page.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
@@ -1084,13 +1092,45 @@ export class ChatService {
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
     await this.attachReplyTo(messages, { heightFloors });
+    return { messages, serverTime, ...cursor, resetRequired: false };
+  }
+
+  /**
+   * 下一次请求该用的游标。
+   *
+   * 两条约束叠在一起:
+   * ① 截断了就停在本页最后一条上(回 serverTime 会把没返回的那些永久跳过);
+   * ② 无论如何不越过安全水位 `now - MUTATION_SAFETY_LAG_MS` —— 时间戳在写语句
+   *    构造时生成、行到 COMMIT 才可见,一次被锁住的撤回完全可能「时间戳很早、
+   *    提交很晚」,游标越过它的时间戳它就永远追不到了(见常量处的说明)。
+   *
+   * ② 会让游标推不动(整页都落在不安全窗口里、且水位不比 since 新):那就报
+   * 「已追平」让客户端停手 —— 本页已经投递过了,剩下的下次同步再来。谎报
+   * hasMore 而游标原地不动会让客户端空转。
+   */
+  private nextMutationCursor(
+    since: Date,
+    sinceId: string,
+    page: Array<MessageRow & { mutatedAt: Date }>,
+    truncated: boolean,
+  ): { nextSince: string; nextSinceId: string; hasMore: boolean } {
+    const last = page[page.length - 1];
+    const safeCeiling = Date.now() - MUTATION_SAFETY_LAG_MS;
+    const desired = truncated ? last.mutatedAt.getTime() : Date.now();
+    const capped = Math.min(desired, safeCeiling);
+    if (capped <= since.getTime()) {
+      return {
+        nextSince: since.toISOString(),
+        nextSinceId: sinceId,
+        hasMore: false,
+      };
+    }
+    // 游标正好落在某一行上时才带 id(复合 keyset);落在水位上则没有对应行。
+    const landedOnRow = truncated && capped === last.mutatedAt.getTime();
     return {
-      messages,
-      serverTime,
-      nextSince,
-      nextSinceId,
-      hasMore,
-      resetRequired: false,
+      nextSince: new Date(capped).toISOString(),
+      nextSinceId: landedOnRow ? last.id : '',
+      hasMore: truncated,
     };
   }
 

@@ -169,3 +169,24 @@ export const RELAX_PURGE_BATCHES_MAX = 20;
 export const MUTATION_PAGE_MAX = 200;
 /** 增量最多回溯多久:超过这个跨度的离线,客户端本地缓存本来也已经翻篇。 */
 export const MUTATION_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * 增量游标的安全滞后。
+ *
+ * revokedAt/editedAt 是**写语句构造时**在 Node 侧生成的,而行要到 COMMIT 才对
+ * 别的事务可见 —— 中间隔着锁等待。于是可以出现「时间戳很早、提交很晚」的行:
+ * 一次同步在它提交前跑完、把游标推到更晚的 serverTime,它提交之后就永远落在
+ * 游标后面,再也追不到(那条撤回的正文会一直留在对方屏幕上)。
+ *
+ * 所以游标绝不越过 `now - MUTATION_SAFETY_LAG_MS`。这个值必须严格大于
+ * DATABASE_STATEMENT_TIMEOUT_MS(默认 15s)—— 超时的写会被 Postgres 掐掉,
+ * 不可能悬挂得比它更久,所以 60s 有充分余量。
+ *
+ * 代价只是重叠区间被重复投递一次,而 ingest 本来就是幂等的。
+ *
+ * 为什么不按 reviewer 建议改成「提交序」的 outbox/sequence:普通序列同样不保证
+ * 提交序(拿到 6 的事务可能先于拿到 5 的提交),真要做得靠 pg_current_snapshot()
+ * 的 xmin 逐行记录——那是 CDC 级别的机制,与这条通道的收益不成比例。
+ * 在 statement_timeout 有界的前提下,安全水位是**充分**的。
+ */
+export const MUTATION_SAFETY_LAG_MS = 60_000;
