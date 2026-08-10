@@ -311,6 +311,7 @@ export const ChatHistoryErrorCode = {
 export const ChatErrorCode = {
   ConversationNotFound: 'CHAT_CONVERSATION_NOT_FOUND',
   NotMember: 'CHAT_NOT_MEMBER',
+  MemberDirectoryForbidden: 'CHAT_MEMBER_DIRECTORY_FORBIDDEN',
   PeerNotFound: 'CHAT_PEER_NOT_FOUND',
   SelfConversation: 'CHAT_SELF_CONVERSATION',
   Blocked: 'CHAT_BLOCKED',

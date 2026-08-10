@@ -149,6 +149,7 @@ export class ChatController {
       query.year,
       query.month,
       query.tzOffsetMinutes,
+      query.timeZone,
     );
   }
 
@@ -217,6 +218,7 @@ export class ChatController {
         date: query.date,
         tzOffsetMinutes: query.tzOffsetMinutes,
         afterHeight: query.afterHeight,
+        tzEndOffsetMinutes: query.tzEndOffsetMinutes,
       },
     );
   }

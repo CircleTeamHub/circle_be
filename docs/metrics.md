@@ -47,17 +47,33 @@ public; everything else stays internal.)
 
 ## What is exposed
 
-| Metric | Type | Labels | Meaning |
-|---|---|---|---|
-| `http_requests_total` | counter | `method`, `route`, `status_code` | Request count (Rate + Errors) |
-| `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Latency (Duration) |
-| `business_events_total` | counter | `event`, `result` | App-domain events (login, coin gift, …) by name + success/failure |
-| `process_*`, `nodejs_*` | gauges/counters | — | Default process metrics (CPU, memory, event loop, GC) |
+| Metric                                                              | Type            | Labels                           | Meaning                                                           |
+| ------------------------------------------------------------------- | --------------- | -------------------------------- | ----------------------------------------------------------------- |
+| `http_requests_total`                                               | counter         | `method`, `route`, `status_code` | Request count (Rate + Errors)                                     |
+| `http_request_duration_seconds`                                     | histogram       | `method`, `route`, `status_code` | Latency (Duration)                                                |
+| `business_events_total`                                             | counter         | `event`, `result`                | App-domain events (login, coin gift, …) by name + success/failure |
+| `process_*`, `nodejs_*`                                             | gauges/counters | —                                | Default process metrics (CPU, memory, event loop, GC)             |
+| `chat_connections_active` / `chat_users_online`                     | gauge           | —                                | Self-hosted chat sockets and distinct users on this instance      |
+| `chat_messages_received_total`                                      | counter         | `action`, `result`               | Chat events received by the gateway (send/read/typing/presence)   |
+| `chat_message_ack_duration_seconds`                                 | histogram       | `action`                         | Chat handler ACK latency                                          |
+| `chat_broadcast_duration_seconds`                                   | histogram       | `action`                         | Time spent handing events to Socket.IO                            |
+| `chat_connection_events_total` / `chat_connection_rejections_total` | counter         | `event` / `reason`               | Connection churn and rejected connections                         |
 
 `business_events_total` increments automatically whenever a business event is
 logged (`src/logging/business-event.logger.ts`), independent of `BUSINESS_LOG_ON`
 — so Grafana can graph business activity without per-event metric code. The
 `event` label is the same bounded set as the `business_event` log field.
+
+### Self-hosted chat metrics
+
+`chat_connections_active` and `chat_users_online` are per-backend-instance
+gauges. Summing connections across instances is valid; summing users is not a
+globally deduplicated online-user count when the same user has sockets on more
+than one instance. A future shared-presence implementation should provide the
+global user count through Redis or another shared store.
+
+No metric label contains a user ID, conversation ID, or socket ID, so normal
+traffic cannot create an unbounded Prometheus series set.
 
 **Routes are normalized** to keep cardinality bounded: dynamic segments (UUIDs,
 Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.
@@ -74,7 +90,7 @@ scrape_configs:
   - job_name: circle-be
     metrics_path: /metrics
     static_configs:
-      - targets: ["<backend-host>:3000"]
+      - targets: ['<backend-host>:3000']
 ```
 
 **Production needs more than this** and the difference is not optional: the
@@ -105,6 +121,31 @@ sum by (event) (rate(business_events_total[1m])) * 60
 # Business — success ratio for a given event
 sum(rate(business_events_total{event="auth_login",result="success"}[5m]))
   / sum(rate(business_events_total{event="auth_login"}[5m]))
+
+# Self-hosted chat — active connections across backend instances
+sum(chat_connections_active)
+
+# Self-hosted chat — successful message send QPS
+sum(rate(chat_messages_received_total{action="send",result="success"}[1m]))
+
+# Self-hosted chat — send ACK p95
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(chat_message_ack_duration_seconds_bucket{action="send"}[5m])
+  )
+)
+
+# Self-hosted chat — message broadcast p95
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(chat_broadcast_duration_seconds_bucket{action="message"}[5m])
+  )
+)
+
+# Self-hosted chat — rate-limited event rate
+sum(rate(chat_messages_received_total{result="rate_limited"}[5m]))
 ```
 
 ## Verifying locally

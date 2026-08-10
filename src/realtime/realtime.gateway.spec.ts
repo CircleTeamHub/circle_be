@@ -8,6 +8,7 @@ import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { SESSION_REVOCATION_CHANNEL } from 'src/auth/session-revocation.broadcast';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeService } from './realtime.service';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 /**
  * In-process stand-in for Redis pub/sub. `publish` fans out to every handler
@@ -198,6 +199,77 @@ describe('RealtimeGateway session revocation', () => {
   describe('with Redis enabled', () => {
     beforeEach(async () => {
       await boot(createRedisBus(true));
+    });
+
+    it('reports an initial snapshot failure without attaching the user id', async () => {
+      const report = jest
+        .spyOn(errorAggregation, 'reportOperationalError')
+        .mockImplementation(() => undefined);
+      jest
+        .spyOn(realtime, 'emitSnapshot')
+        .mockRejectedValue(new Error('private snapshot blue pineapple'));
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', resolve);
+        socket.once('error', reject);
+      });
+
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          token: signToken({ sub: 'private-user', sid: 'session-1' }),
+        }),
+      );
+      await tick();
+
+      expect(report).toHaveBeenCalledWith(expect.any(Error), {
+        component: 'RealtimeGateway',
+        operation: 'emitSnapshot',
+        kind: 'websocket',
+      });
+      expect(JSON.stringify(report.mock.calls[0]?.[1])).not.toContain(
+        'private-user',
+      );
+      report.mockRestore();
+    });
+
+    it('logs an admission failure without Sentry or account identifiers', async () => {
+      errorAggregation.configureErrorAggregationProvider(
+        new errorAggregation.NoopErrorAggregationProvider(),
+      );
+      const logError = jest
+        .spyOn((gateway as any).logger, 'error')
+        .mockImplementation(() => undefined);
+      jest.spyOn(realtime, 'registerPendingClient').mockImplementation(() => {
+        throw new Error(
+          'admission failed for private-user token=private-token',
+        );
+      });
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', resolve);
+        socket.once('error', reject);
+      });
+      const closed = waitForClose(socket);
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          token: signToken({ sub: 'private-user', sid: 'session-1' }),
+        }),
+      );
+
+      await expect(closed).resolves.toEqual({
+        code: 1011,
+        reason: 'Internal error',
+      });
+      expect(logError).toHaveBeenCalledWith('Realtime socket admission failed');
+      expect(JSON.stringify(logError.mock.calls)).not.toContain('private-user');
+      expect(JSON.stringify(logError.mock.calls)).not.toContain(
+        'private-token',
+      );
+      logError.mockRestore();
     });
 
     it('rejects a socket authenticating with an already-revoked token', async () => {

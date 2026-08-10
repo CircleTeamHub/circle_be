@@ -12,17 +12,17 @@
 
 ## 速查表
 
-| 工具              | 哪条线     | 检测 / 存储什么数据                         | 现状                      |
-| ----------------- | ---------- | ------------------------------------------- | ------------------------- |
-| **Sentry**        | 错误       | 异常、崩溃、堆栈、出错上下文                | 后端 ✅ 上线 · 前端待激活 |
-| **Prometheus**    | 指标       | 时序指标的**存储 + 抓取**（存下面所有指标） | ✅ `:9090`                |
-| 后端 `/metrics`   | 指标       | 接口 QPS/错误/延迟、业务事件、进程 CPU/内存 | ✅                        |
-| **node-exporter** | 指标       | 机器：CPU / 内存 / 磁盘 / 网络 / 负载       | ✅（Mac 上 = Docker VM）  |
-| **cAdvisor**      | 指标       | 每个容器：CPU / 内存 / 重启次数             | ✅                        |
-| **Grafana**       | 指标(展示) | 不产数据，把 Prometheus 画成大盘            | ✅ `:3001`                |
-| **Alertmanager**  | 指标(告警) | 不产数据，越界告警路由                      | ✅ `:9093`（飞书待接）    |
-| OpenIM `/metrics` | 指标       | IM 在线连接数、消息吞吐                     | ⏳ 未接                   |
-| **PostHog** 等    | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
+| 工具                | 哪条线     | 检测 / 存储什么数据                         | 现状                      |
+| ------------------- | ---------- | ------------------------------------------- | ------------------------- |
+| **Sentry**          | 错误       | 异常、崩溃、堆栈、出错上下文                | 后端 ✅ 上线 · 前端待激活 |
+| **Prometheus**      | 指标       | 时序指标的**存储 + 抓取**（存下面所有指标） | ✅ `:9090`                |
+| 后端 `/metrics`     | 指标       | 接口 QPS/错误/延迟、业务事件、进程 CPU/内存 | ✅                        |
+| **node-exporter**   | 指标       | 机器：CPU / 内存 / 磁盘 / 网络 / 负载       | ✅（Mac 上 = Docker VM）  |
+| **cAdvisor**        | 指标       | 每个容器：CPU / 内存 / 重启次数             | ✅                        |
+| **Grafana**         | 指标(展示) | 不产数据，把 Prometheus 画成大盘            | ✅ `:3001`                |
+| **Alertmanager**    | 指标(告警) | 不产数据，越界告警路由                      | ✅ `:9093`（飞书待接）    |
+| 自建聊天 `/metrics` | 指标       | 在线连接、聊天事件吞吐、ACK/广播延迟        | ✅                        |
+| **PostHog** 等      | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
 
 ---
 
@@ -44,7 +44,7 @@
 
 时序数据库 + 抓取器。每 **15s** 从各 target 拉 `/metrics`，存成时间序列，供 PromQL 查询、Grafana 画图、Alertmanager 判断。**本身不产生数据**，是"存储 + 查询引擎"。
 
-- 抓取目标：后端 `/metrics`、node-exporter、cAdvisor（OpenIM 待接）
+- 抓取目标：后端 `/metrics`、node-exporter、cAdvisor
 - 入口 `:9090`：**Status → Targets** 看抓取健康；**Graph** 跑 PromQL
 
 ### 3. 后端 `/metrics` —— 接口压力 + 业务 + 进程
@@ -79,9 +79,19 @@
 
 Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。当前规则：5xx 率 > 5%、p95 > 1s、target down、主机内存 > 85%。出口：飞书 webhook（占位，需接一个转换器）。入口 `:9093`。
 
-### 8. OpenIM `/metrics`（⏳ 未接）
+### 8. 自建聊天指标
 
-IM 的**在线连接数、消息吞吐**——IM 核心负载。来自 OpenIM 自己（不是你后端）。需在 OpenIM config 开 metrics + 取消 `prometheus.yml` 里的注释 job。
+自建 Socket.IO 网关会把连接数、实例在线用户数、消息事件吞吐、ACK
+延迟、广播延迟、连接拒绝和限流事件合并到后端 `/metrics`。关键指标包括：
+
+- `chat_connections_active`：当前连接数，多实例可以求和。
+- `chat_users_online`：当前实例去重后的用户数，多实例不能直接求和。
+- `chat_messages_received_total`：发送/已读/正在输入/在线查询事件速率。
+- `chat_message_ack_duration_seconds`：消息处理 ACK 延迟。
+- `chat_broadcast_duration_seconds`：交给 Socket.IO 广播的耗时。
+
+这些指标不带 userId、conversationId、socketId 标签，避免 Prometheus
+高基数。OpenIM scrape job 已从监控配置移除。
 
 ### 9. 产品分析 / 业务埋点（❌ 未做）
 
@@ -100,7 +110,7 @@ IM 的**在线连接数、消息吞吐**——IM 核心负载。来自 OpenIM �
   后端 /metrics ──┐
   node-exporter ──┼─► Prometheus ─┬─► Grafana       (大盘)
   cAdvisor      ──┘   (存 + 查)    └─► Alertmanager ─► 飞书(待接)
-  (OpenIM 待接) ──┘
+  (自建聊天指标合并在后端 /metrics) ──┘
 
 业务分析线(未做):
   前端/后端 ─────► PostHog 等   (漏斗/留存/转化)
@@ -122,12 +132,12 @@ IM 的**在线连接数、消息吞吐**——IM 核心负载。来自 OpenIM �
 
 ## 访问入口
 
-|                                      | 地址                          | 登录          |
-| ------------------------------------ | ----------------------------- | ------------- |
-| Grafana（日常大盘）                  | http://localhost:3001         | admin / admin |
-| Prometheus（原始查询 / target 健康） | http://localhost:9090         | —             |
-| Alertmanager                         | http://localhost:9093         | —             |
-| 后端原始指标                         | http://localhost:3000/metrics | —             |
+|                                      | 地址                          | 登录                       |
+| ------------------------------------ | ----------------------------- | -------------------------- |
+| Grafana（日常大盘）                  | http://localhost:3001         | `monitoring/.env` 中的密码 |
+| Prometheus（原始查询 / target 健康） | http://localhost:9090         | —                          |
+| Alertmanager                         | http://localhost:9093         | —                          |
+| 后端原始指标                         | http://localhost:3000/metrics | —                          |
 
 启动监控栈：`docker compose -f monitoring/docker-compose.yml up -d`
 停止：`docker compose -f monitoring/docker-compose.yml down`

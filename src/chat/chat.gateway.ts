@@ -16,6 +16,7 @@ import {
 } from 'src/auth/session-revocation.broadcast';
 import { RedisService } from 'src/redis/redis.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
@@ -30,6 +31,10 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatService } from './chat.service';
+import {
+  chatMetrics as defaultChatMetrics,
+  type ChatMetrics,
+} from './chat-metrics';
 import type {
   ChatAckError,
   GuestChatTokenPayload,
@@ -70,6 +75,7 @@ function issuedAtMsOf(payload: JwtPayload): number | null {
 @Injectable()
 export class ChatGateway implements OnModuleDestroy {
   private readonly logger = new Logger(ChatGateway.name);
+  private metrics: ChatMetrics = defaultChatMetrics;
   private io: Server | null = null;
 
   // G-04:限流走 Redis ZSET 滑动窗口(跨实例全局配额),Redis 缺席回退每实例本地。
@@ -170,6 +176,7 @@ export class ChatGateway implements OnModuleDestroy {
       void this.authenticate(socket)
         .then((userId) => {
           if (!userId) {
+            this.metrics.observeAuthFailure('rejected');
             next(new Error('unauthorized'));
             return;
           }
@@ -177,6 +184,12 @@ export class ChatGateway implements OnModuleDestroy {
           next();
         })
         .catch((error: unknown) => {
+          this.metrics.observeAuthFailure('error');
+          reportOperationalError(error, {
+            component: 'ChatGateway',
+            operation: 'handshakeAuth',
+            kind: 'websocket',
+          });
           this.logger.warn(
             `handshake auth errored: ${error instanceof Error ? error.message : String(error)}`,
           );
@@ -436,6 +449,7 @@ export class ChatGateway implements OnModuleDestroy {
         : null;
 
     if (!this.claimConnectionSlot(userId, socket)) {
+      this.metrics.observeConnectionRejected('per_user_limit');
       this.logger.warn(
         `connection cap reached for user ${userId}; rejecting new socket`,
       );
@@ -467,6 +481,7 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
+    this.metrics.observeConnectionOpened(this.connectionsByUser.size);
     this.scheduleExpiryDisconnect(socket);
 
     // 监听必须**同步**注册,在任何 await 之前。反过来的话,入房那几个 await
@@ -533,6 +548,7 @@ export class ChatGateway implements OnModuleDestroy {
       resolveReady(false);
       this.releaseConnectionSlot(userId, socket);
       void this.presence.socketDisconnected(userId, socket.id);
+      this.metrics.observeConnectionClosed(this.connectionsByUser.size);
       const timer = this.expiryTimers.get(socket);
       if (timer) {
         clearTimeout(timer);
@@ -550,10 +566,12 @@ export class ChatGateway implements OnModuleDestroy {
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
-        this.broadcast.emitPresence(
-          conversationIds,
-          { userId, online: false },
-          blockedPeers,
+        this.observeBroadcast('presence', () =>
+          this.broadcast.emitPresence(
+            conversationIds,
+            { userId, online: false },
+            blockedPeers,
+          ),
         );
       });
     });
@@ -571,9 +589,15 @@ export class ChatGateway implements OnModuleDestroy {
       await socket.join(conversationIds.map(conversationRoom));
     } catch (error) {
       // 房间加入失败的连接是"在线但收不到任何推送"的哑连接,直接断开让客户端重连。
+      reportOperationalError(error, {
+        component: 'ChatGateway',
+        operation: 'joinRooms',
+        kind: 'websocket',
+      });
       this.logger.error(
         `join rooms failed for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      this.metrics.observeConnectionRejected('join_failed');
       resolveReady(false);
       socket.disconnect(true);
       return;
@@ -583,10 +607,12 @@ export class ChatGateway implements OnModuleDestroy {
     void this.presence.registerConversations(userId, conversationIds);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
-    this.broadcast.emitPresence(
-      conversationIds,
-      { userId, online: true },
-      blockedPeers,
+    this.observeBroadcast('presence', () =>
+      this.broadcast.emitPresence(
+        conversationIds,
+        { userId, online: true },
+        blockedPeers,
+      ),
     );
   }
 
@@ -619,25 +645,28 @@ export class ChatGateway implements OnModuleDestroy {
     ack?: AckFn<Record<string, boolean>>,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
+    const startedAt = process.hrtime.bigint();
     const userId = socket.data.userId as string;
-    if (!(await this.presenceLimiter.tryAcquire(userId))) {
-      ack({});
-      return;
-    }
-    const requested = Array.isArray(payload?.userIds)
-      ? payload.userIds.filter((id) => typeof id === 'string').slice(0, 50)
-      : [];
-    if (requested.length === 0) {
-      ack({});
-      return;
-    }
-    // 收窄到「与请求方同处在座会话」的用户。不过滤的话,任何登录账号都能
-    // 拿任意 UUID(API 里到处都在返回)持续轮询别人的在线状态 —— 陌生人、
-    // 被拉黑的人都能被长期追踪。上下线广播本身就只发到会话房,查询也对齐。
-    // 依赖失败必须收在这里:监听侧是 void this.handlePresenceQuery(...),抛出去
-    // 只会变成一条 unhandled rejection,而客户端的 ack 永远等不到 —— 界面上就是
-    // 在线状态一直转圈。handleSend / handleRead 都已各自兜住,presence 是漏网的那个。
     try {
+      if (!(await this.presenceLimiter.tryAcquire(userId))) {
+        this.metrics.observeEvent('presence', 'rate_limited');
+        ack({});
+        return;
+      }
+      const requested = Array.isArray(payload?.userIds)
+        ? payload.userIds.filter((id) => typeof id === 'string').slice(0, 50)
+        : [];
+      if (requested.length === 0) {
+        this.metrics.observeEvent('presence', 'success');
+        ack({});
+        return;
+      }
+      // 收窄到「与请求方同处在座会话」的用户。不过滤的话,任何登录账号都能
+      // 拿任意 UUID(API 里到处都在返回)持续轮询别人的在线状态 —— 陌生人、
+      // 被拉黑的人都能被长期追踪。上下线广播本身就只发到会话房,查询也对齐。
+      // 依赖失败必须收在这里:监听侧是 void this.handlePresenceQuery(...),抛出去
+      // 只会变成一条 unhandled rejection,而客户端的 ack 永远等不到 —— 界面上就是
+      // 在线状态一直转圈。handleSend / handleRead 都已各自兜住,presence 是漏网的那个。
       const visible = await this.chatService.filterVisiblePresenceTargets(
         userId,
         requested,
@@ -648,7 +677,14 @@ export class ChatGateway implements OnModuleDestroy {
         ),
       );
       ack(Object.fromEntries(entries));
+      this.metrics.observeEvent('presence', 'success');
     } catch (error) {
+      this.metrics.observeEvent('presence', 'failure');
+      reportOperationalError(error, {
+        component: 'ChatGateway',
+        operation: 'presence',
+        kind: 'websocket',
+      });
       // 只记会话与用户 id,不带 requested 列表(那是一串他人 UUID)。
       this.logger.warn(
         `presence query failed user=${userId}: ${
@@ -656,6 +692,11 @@ export class ChatGateway implements OnModuleDestroy {
         }`,
       );
       ack({});
+    } finally {
+      this.metrics.observeAckDuration(
+        'presence',
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
     }
   }
 
@@ -666,12 +707,15 @@ export class ChatGateway implements OnModuleDestroy {
     ack?: AckFn<ChatSendAck>,
   ): Promise<void> {
     const reply = this.ackOnce(ack);
-    if (!(await this.sendLimiter.tryAcquire(userId))) {
-      reply(this.ackError(ChatErrorCode.RateLimited, '发送太频繁'));
-      return;
-    }
+    const startedAt = process.hrtime.bigint();
     try {
+      if (!(await this.sendLimiter.tryAcquire(userId))) {
+        this.metrics.observeEvent('send', 'rate_limited');
+        reply(this.ackError(ChatErrorCode.RateLimited, '发送太频繁'));
+        return;
+      }
       const result = await this.chatService.sendMessage(userId, payload);
+      this.metrics.observeEvent('send', 'success');
       reply({
         ok: true,
         messageId: result.message.id,
@@ -680,12 +724,20 @@ export class ChatGateway implements OnModuleDestroy {
       });
       // 幂等复用(断线重发撞库)不再广播,首次投递时房间里已经收到过了。
       if (!result.reused) {
-        this.broadcast.emitMessage(result.message);
+        this.observeBroadcast('message', () =>
+          this.broadcast.emitMessage(result.message),
+        );
         // 离线成员推送:best-effort,不阻塞发送方 ack 路径。
         void this.chatPush.onMessageBroadcast(result.message);
       }
     } catch (error) {
+      this.metrics.observeEvent('send', 'failure');
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));
+    } finally {
+      this.metrics.observeAckDuration(
+        'send',
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
     }
   }
 
@@ -696,11 +748,13 @@ export class ChatGateway implements OnModuleDestroy {
     ack?: AckFn<ChatReadAck>,
   ): Promise<void> {
     const reply = this.ackOnce(ack);
-    if (!(await this.readLimiter.tryAcquire(userId))) {
-      reply(this.ackError(ChatErrorCode.RateLimited));
-      return;
-    }
+    const startedAt = process.hrtime.bigint();
     try {
+      if (!(await this.readLimiter.tryAcquire(userId))) {
+        this.metrics.observeEvent('read', 'rate_limited');
+        reply(this.ackError(ChatErrorCode.RateLimited));
+        return;
+      }
       const conversationId = payload?.conversationId;
       const height = Number(payload?.height);
       const result = await this.chatService.markRead(
@@ -708,17 +762,26 @@ export class ChatGateway implements OnModuleDestroy {
         conversationId,
         height,
       );
+      this.metrics.observeEvent('read', 'success');
       reply({ ok: true });
       if (result.advanced) {
         // 播落库后的高度,不是客户端报的那个 —— 后者可能被钳过。
-        this.broadcast.emitRead({
-          conversationId,
-          userId,
-          height: result.height,
-        });
+        this.observeBroadcast('read', () =>
+          this.broadcast.emitRead({
+            conversationId,
+            userId,
+            height: result.height,
+          }),
+        );
       }
     } catch (error) {
+      this.metrics.observeEvent('read', 'failure');
       reply(this.toAckError(error, 'read', userId, payload?.conversationId));
+    } finally {
+      this.metrics.observeAckDuration(
+        'read',
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
     }
   }
 
@@ -872,14 +935,40 @@ export class ChatGateway implements OnModuleDestroy {
     userId: string,
     payload: ChatTypingPayload,
   ): Promise<void> {
-    if (!(await this.typingLimiter.tryAcquire(userId))) return;
-    const conversationId = payload?.conversationId;
-    if (typeof conversationId !== 'string' || conversationId.length === 0)
+    if (!(await this.typingLimiter.tryAcquire(userId))) {
+      this.metrics.observeEvent('typing', 'rate_limited');
       return;
+    }
+    const conversationId = payload?.conversationId;
+    if (typeof conversationId !== 'string' || conversationId.length === 0) {
+      this.metrics.observeEvent('typing', 'failure');
+      return;
+    }
     // typing 是尽力而为的提示,不做成员查询放大;但只对本人已在的房间转发,
     // socket.rooms 本身就是服务端派生的成员关系,非成员房不会命中。
-    if (!socket.rooms.has(conversationRoom(conversationId))) return;
-    this.broadcast.emitTyping({ conversationId, userId }, socket.id);
+    if (!socket.rooms.has(conversationRoom(conversationId))) {
+      this.metrics.observeEvent('typing', 'failure');
+      return;
+    }
+    this.metrics.observeEvent('typing', 'success');
+    this.observeBroadcast('typing', () =>
+      this.broadcast.emitTyping({ conversationId, userId }, socket.id),
+    );
+  }
+
+  private observeBroadcast(
+    action: 'message' | 'read' | 'typing' | 'presence',
+    callback: () => void,
+  ): void {
+    const startedAt = process.hrtime.bigint();
+    try {
+      callback();
+    } finally {
+      this.metrics.observeBroadcast(
+        action,
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
+    }
   }
 
   /** ack 只回一次;缺省 ack(异常客户端)则丢弃,不让回调报错毁掉事件循环。 */
@@ -914,18 +1003,26 @@ export class ChatGateway implements OnModuleDestroy {
   ): ChatAckError {
     if (error instanceof HttpException) {
       const response = error.getResponse();
-      if (
-        typeof response === 'object' &&
-        response !== null &&
-        'errorCode' in response
-      ) {
-        const { errorCode, message } = response as {
-          errorCode: AppErrorCode;
-          message?: string;
-        };
-        return this.ackError(errorCode, message);
+      if (error.getStatus() < 500) {
+        if (
+          typeof response === 'object' &&
+          response !== null &&
+          'errorCode' in response
+        ) {
+          const { errorCode, message } = response as {
+            errorCode: AppErrorCode;
+            message?: string;
+          };
+          return this.ackError(errorCode, message);
+        }
+        return this.ackError(ChatErrorCode.InvalidPayload, '请求失败');
       }
     }
+    reportOperationalError(error, {
+      component: 'ChatGateway',
+      operation: action,
+      kind: 'websocket',
+    });
     this.logger.error(
       `chat ${action} failed user=${userId} conversation=${conversationId ?? '-'}: ${
         error instanceof Error ? (error.stack ?? error.message) : String(error)

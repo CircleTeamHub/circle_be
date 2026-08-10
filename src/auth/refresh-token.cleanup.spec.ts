@@ -1,4 +1,5 @@
 import { RefreshTokenCleanup } from './refresh-token.cleanup';
+import * as errorAggregation from '../logging/error-aggregation.service';
 
 describe('RefreshTokenCleanup', () => {
   const deleteMany = jest.fn();
@@ -25,7 +26,16 @@ describe('RefreshTokenCleanup', () => {
   });
 
   it('never throws when the prune query fails', async () => {
+    const report = jest
+      .spyOn(errorAggregation, 'reportOperationalError')
+      .mockImplementation(() => undefined);
     deleteMany.mockRejectedValue(new Error('db down'));
     await expect(cleanup.sweep(new Date())).resolves.toBeUndefined();
+    expect(report).toHaveBeenCalledWith(expect.any(Error), {
+      component: 'RefreshTokenCleanup',
+      operation: 'sweep',
+      kind: 'scheduler',
+    });
+    report.mockRestore();
   });
 });

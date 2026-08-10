@@ -225,6 +225,8 @@ export interface HistoryFilters {
    * 与 beforeHeight 互斥;续拉游标经 nextAfterHeight 返回。
    */
   afterHeight?: number;
+  /** 次日本地零点的偏移;DST 切换日可能与 tzOffsetMinutes 不同。 */
+  tzEndOffsetMinutes?: number;
 }
 
 /**
