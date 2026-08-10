@@ -247,3 +247,21 @@ export interface ChatHistoryPageDto {
   /** afterHeight 增量补拉的续拉游标;已追平为 null(仅 afterHeight 查询返回)。 */
   nextAfterHeight?: number | null;
 }
+
+/**
+ * GET /chat/messages/mutations 的响应:离线期间的撤回/编辑增量。
+ *
+ * 撤回不改 height,所以重连的 afterHeight 补拉结构上永远看不到它 ——
+ * 这条通道按 max(revokedAt, editedAt) 的时间轴补。客户端拿 nextSince 当下一次
+ * 的游标(截断时它停在本页最后一次变更上,而不是 serverTime),hasMore 为 true
+ * 时应当立刻再拉一页,直到追平。
+ */
+export interface ChatMutationsPageDto {
+  messages: ChatMessageDto[];
+  /** 本次响应的服务端时刻。 */
+  serverTime: string;
+  /** 下一次请求应当传的 since。 */
+  nextSince: string;
+  /** 还有没追完的变更(被单页上限截断)。 */
+  hasMore: boolean;
+}

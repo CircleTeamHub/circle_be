@@ -9,6 +9,9 @@ import { ChatSystemMessageService } from './chat-system-message.service';
  * 不再持有群聊的管理态。DISABLING/RESTORING 也算在内:处理中的圈子
  * 默认拒绝(宁可晚一分钟恢复,也不要在停用窗口里把门开着)。
  */
+/** 圈子座位对账的 advisory lock 命名空间(与 chat 的其它锁不撞)。 */
+const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
+
 const DISABLED_ADMIN_STATES = new Set<string>([
   'DISABLING',
   'DISABLED',
@@ -142,6 +145,11 @@ export class ChatCircleSyncService {
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
+      // 同一圈子的对账串行化。集合式写法本身是并发安全的(不会写坏数据),
+      // 但**副作用**不是:两个实例同时对账同一个圈子时,双方都会在各自的
+      // 快照里把同一个人算进 toJoin —— 于是 joined 事件播两遍、进群系统提示
+      // 也写两条。谁先拿到锁谁做,后来者在锁后重读座位,toJoin 自然是空的。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
       let created = false;
       let conversation = await tx.chatConversation.findUnique({
         where: { circleID: circleId },

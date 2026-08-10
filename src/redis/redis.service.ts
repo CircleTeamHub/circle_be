@@ -572,70 +572,6 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
   }
-
-  /** DECR 但不落到负数(计数器成对使用时防崩溃期错配)。null=不可用。 */
-  async decrementFloorZero(key: string): Promise<number | null> {
-    const client = await this.getCommandClient();
-    if (!client) {
-      this.recordUnavailable('increment');
-      return null;
-    }
-    try {
-      const value = await client.eval(
-        [
-          "local v = redis.call('DECR', KEYS[1])",
-          "if v < 0 then redis.call('SET', KEYS[1], '0') return 0 end",
-          'return v',
-        ].join('\n'),
-        1,
-        key,
-      );
-      return Number(value);
-    } catch (error) {
-      this.recordCommandFailure('increment', error);
-      this.logger.warn(
-        `Redis decrement failed for ${key}: ${this.formatError(error)}`,
-      );
-      return null;
-    }
-  }
-
-  /** SADD + 续 TTL(集合级过期,崩溃遗留的幽灵成员随 key 一起过期自愈)。 */
-  async addToSet(
-    key: string,
-    member: string,
-    ttlSeconds: number,
-  ): Promise<boolean | null> {
-    const client = await this.getCommandClient();
-    if (!client) {
-      this.recordUnavailable('set');
-      return null;
-    }
-    try {
-      await client.sadd(key, member);
-      await client.expire(key, ttlSeconds);
-      return true;
-    } catch (error) {
-      this.recordCommandFailure('set', error);
-      return null;
-    }
-  }
-
-  async removeFromSet(key: string, member: string): Promise<boolean | null> {
-    const client = await this.getCommandClient();
-    if (!client) {
-      this.recordUnavailable('set');
-      return null;
-    }
-    try {
-      await client.srem(key, member);
-      return true;
-    } catch (error) {
-      this.recordCommandFailure('set', error);
-      return null;
-    }
-  }
-
   /**
    * 带**逐成员**过期的集合(ZSET,score = 到期时刻的 epoch ms)。
    *
@@ -698,21 +634,6 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
   }
-
-  async getSetMembers(key: string): Promise<string[] | null> {
-    const client = await this.getCommandClient();
-    if (!client) {
-      this.recordUnavailable('get');
-      return null;
-    }
-    try {
-      return await client.smembers(key);
-    } catch (error) {
-      this.recordCommandFailure('get', error);
-      return null;
-    }
-  }
-
   /** 只续期不改值(在线注册表的定时自愈)。 */
   async touchTtl(key: string, ttlSeconds: number): Promise<boolean | null> {
     const client = await this.getCommandClient();
@@ -725,22 +646,6 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       return true;
     } catch (error) {
       this.recordCommandFailure('set', error);
-      return null;
-    }
-  }
-
-  /** 读普通计数键(chat:conn:* 在线连接数);key 不存在返回 0。null=不可用。 */
-  async getCounter(key: string): Promise<number | null> {
-    const client = await this.getCommandClient();
-    if (!client) {
-      this.recordUnavailable('get');
-      return null;
-    }
-    try {
-      const raw = await client.get(key);
-      return raw === null ? 0 : Number(raw);
-    } catch (error) {
-      this.recordCommandFailure('get', error);
       return null;
     }
   }

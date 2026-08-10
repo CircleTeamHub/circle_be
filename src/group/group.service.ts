@@ -281,17 +281,23 @@ export class GroupService {
       activatedCircleId = circle.id;
     });
 
-    // 座位不等对账:激活提交后立刻触发一次幂等 ensure(失败留给每分钟对账兜底)。
+    // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
+    // 失败必须排进对账重试队列,不能只记日志 —— 对账扫的是
+    // `CircleMember.updatedAt` 的 2 分钟窗口,一次更久的数据库故障过后,
+    // 这次激活早已滑出窗口,被邀请的人会一直是没有聊天座位的正式成员。
+    // (邀请审批那条路径已经这么做了,这里漏了。)
     if (activatedCircleId) {
+      const circleId = activatedCircleId;
       void this.chatCircleSync
-        .ensureCircleConversation(activatedCircleId)
-        .catch((error: unknown) =>
+        .ensureCircleConversation(circleId)
+        .catch((error: unknown) => {
+          this.chatCircleSync.scheduleRetry(circleId);
           this.logger.warn(
-            `invite seat sync failed circle=${activatedCircleId ?? ''}: ${
+            `invite seat sync failed circle=${circleId} (queued for retry): ${
               error instanceof Error ? error.message : String(error)
             }`,
-          ),
-        );
+          );
+        });
     }
 
     return { handled: true };

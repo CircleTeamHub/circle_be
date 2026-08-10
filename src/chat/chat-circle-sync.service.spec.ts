@@ -17,6 +17,8 @@ describe('ChatCircleSyncService', () => {
     },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    // 同圈对账串行化的 advisory lock(多实例下防 joined 事件与系统提示重复)。
+    $executeRaw: jest.fn(),
   };
   const broadcast = {
     joinUserToConversation: jest.fn(),
@@ -35,6 +37,7 @@ describe('ChatCircleSyncService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(runTx as never);
+    prisma.$executeRaw.mockResolvedValue(1);
     prisma.chatMember.createMany.mockResolvedValue({ count: 0 });
     prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);

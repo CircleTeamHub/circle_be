@@ -40,6 +40,7 @@ import type {
   ChatConversationDto,
   ChatHistoryPageDto,
   ChatMemberDto,
+  ChatMutationsPageDto,
   HistoryFilters,
   ChatMessageDto,
   ChatSenderInfo,
@@ -964,39 +965,93 @@ export class ChatService {
     userId: string,
     since: Date,
     limit = MUTATION_PAGE_MAX,
-  ): Promise<{ messages: ChatMessageDto[]; serverTime: string }> {
+  ): Promise<ChatMutationsPageDto> {
     const serverTime = new Date().toISOString();
-    const floor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
-    const from = since > floor ? since : floor;
+    const lookbackFloor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
+    const from = since > lookbackFloor ? since : lookbackFloor;
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null },
       select: { conversationID: true, clearedBeforeHeight: true },
     });
-    if (memberships.length === 0) return { messages: [], serverTime };
-    const heightFloors = new Map(
-      memberships.map((m) => [m.conversationID, m.clearedBeforeHeight ?? 0]),
-    );
-    const rows = await this.prisma.chatMessage.findMany({
+    const empty: ChatMutationsPageDto = {
+      messages: [],
+      serverTime,
+      nextSince: serverTime,
+      hasMore: false,
+    };
+    if (memberships.length === 0) return empty;
+
+    // 每会话的可见边界:清空水位 + 焚毁/自动销毁截止。必须进 SQL 的 WHERE ——
+    // 取回来再 filter 的话,被过滤掉的行照样占着 LIMIT 的名额,一页里真正
+    // 该返回的变更就少了,而客户端游标照常前进,那些变更从此再也追不到。
+    const burning = await this.prisma.chatConversation.findMany({
       where: {
-        conversationID: { in: [...heightFloors.keys()] },
-        OR: [{ revokedAt: { gt: from } }, { editedAt: { gt: from } }],
+        id: { in: memberships.map((m) => m.conversationID) },
+        burnDurationSec: { not: null },
       },
-      omit: MESSAGE_READ_OMIT,
-      orderBy: [{ revokedAt: 'asc' }, { editedAt: 'asc' }],
-      take: Math.min(Math.max(limit, 1), MUTATION_PAGE_MAX),
+      select: { id: true, burnDurationSec: true },
     });
-    const visible = rows.filter(
-      (row) => row.height > (heightFloors.get(row.conversationID) ?? 0),
-    );
-    if (visible.length === 0) return { messages: [], serverTime };
+    const burnById = new Map(burning.map((c) => [c.id, c.burnDurationSec]));
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const ids: string[] = [];
+    const floors: number[] = [];
+    const cutoffs: (Date | null)[] = [];
+    const heightFloors = new Map<string, number>();
+    for (const m of memberships) {
+      const seconds = burnById.get(m.conversationID) ?? null;
+      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
+      ids.push(m.conversationID);
+      floors.push(m.clearedBeforeHeight ?? 0);
+      cutoffs.push(this.strictestCutoff(viewerCutoff, burnCutoff));
+      heightFloors.set(m.conversationID, m.clearedBeforeHeight ?? 0);
+    }
+
+    // 多取一条用来判断「还有没有」。撤回与编辑各有各的时间戳,统一成
+    // GREATEST 才能给出一条真正按时间单调的游标 —— Prisma 的多字段 orderBy
+    // 做不到这件事(它会先按 revokedAt 排完再排 editedAt)。
+    const take = Math.min(Math.max(limit, 1), MUTATION_PAGE_MAX);
+    const rows = await this.prisma.$queryRaw<
+      Array<MessageRow & { mutatedAt: Date }>
+    >`
+      SELECT m."id", m."conversationID", m."height", m."senderID", m."type",
+             m."content", m."clientMessageId", m."replyToID", m."deleted",
+             m."revokedAt", m."revokedBy", m."editedAt", m."createdAt",
+             GREATEST(
+               COALESCE(m."revokedAt", to_timestamp(0)),
+               COALESCE(m."editedAt", to_timestamp(0))
+             ) AS "mutatedAt"
+      FROM "ChatMessage" AS m
+      JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
+        AS w("conversationID", floor, cutoff)
+        ON w."conversationID" = m."conversationID"
+      WHERE m."height" > w.floor
+        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND GREATEST(
+              COALESCE(m."revokedAt", to_timestamp(0)),
+              COALESCE(m."editedAt", to_timestamp(0))
+            ) > ${from}
+      ORDER BY "mutatedAt" ASC
+      LIMIT ${take + 1}
+    `;
+
+    const hasMore = rows.length > take;
+    const page = hasMore ? rows.slice(0, take) : rows;
+    // 截断了就把游标停在这一页的最后一次变更上,绝不能回 serverTime ——
+    // 客户端照它前进的话,没返回的那些变更会被永久跳过(撤回的正文因此
+    // 一直留在对方屏幕上)。
+    const nextSince =
+      hasMore && page.length > 0
+        ? page[page.length - 1].mutatedAt.toISOString()
+        : serverTime;
+    if (page.length === 0) return empty;
     const senders = await this.resolveSenders(
-      visible.map((r) => r.senderID).filter((id): id is string => id !== null),
+      page.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
-    const messages = visible.map((row) =>
+    const messages = page.map((row) =>
       this.toMessageDto(row, this.senderFor(row, senders)),
     );
     await this.attachReplyTo(messages, { heightFloors });
-    return { messages, serverTime };
+    return { messages, serverTime, nextSince, hasMore };
   }
 
   /** 两个「不早于」截止时间取更严的一个(更晚者);都为空则不过滤。 */

@@ -431,16 +431,15 @@ export class ChatGateway implements OnModuleDestroy {
       return;
     }
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
-    const globalCount = await this.presence.registerSocket(userId);
-    // null = 这次 +1 没落到 Redis 上(未配置,或那一刻不可用)。断开时必须
-    // 如实告诉注册表,否则会去减一个从没加上的计数(见 socketDisconnected)。
-    const hasLease = globalCount !== null;
+    // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
+    // 那条活着的连接(共享标量 DECR 会)。
+    const globalCount = await this.presence.registerSocket(userId, socket.id);
     // 这次 await 期间断开的连接,'disconnect' 监听器还没挂上(见下面那段注释:
     // 监听器必须在业务 await 之前注册,但注册本身排在这一步之后)—— 事件就此丢失,
     // 本实例的连接槽和跨实例在线条目都留给了一条已死的 socket。Redis 慢的时候
     // 反复连了就断,能把用户永久标成在线(离线推送全被吞掉)并耗尽连接上限。
     if (socket.disconnected) {
-      void this.presence.socketDisconnected(userId, hasLease);
+      void this.presence.socketDisconnected(userId, socket.id);
       this.releaseConnectionSlot(userId, socket);
       return;
     }
@@ -451,7 +450,7 @@ export class ChatGateway implements OnModuleDestroy {
       this.logger.warn(
         `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
       );
-      void this.presence.socketDisconnected(userId, hasLease);
+      void this.presence.socketDisconnected(userId, socket.id);
       this.releaseConnectionSlot(userId, socket);
       socket.disconnect(true);
       return;
@@ -521,7 +520,7 @@ export class ChatGateway implements OnModuleDestroy {
     socket.on('disconnect', () => {
       resolveReady(false);
       this.releaseConnectionSlot(userId, socket);
-      void this.presence.socketDisconnected(userId, hasLease);
+      void this.presence.socketDisconnected(userId, socket.id);
       const timer = this.expiryTimers.get(socket);
       if (timer) {
         clearTimeout(timer);

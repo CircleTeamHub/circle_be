@@ -2167,28 +2167,30 @@ describe('ChatService', () => {
   });
 
   describe('listMutationsSince(离线撤回/编辑追平)', () => {
+    const mutatedRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'm-revoked',
+      conversationID: 'conv-1',
+      height: 2,
+      senderID: 'u1',
+      type: 'text',
+      content: {},
+      clientMessageId: null,
+      replyToID: null,
+      deleted: false,
+      revokedAt: new Date(),
+      revokedBy: 'u1',
+      editedAt: null,
+      createdAt: new Date(),
+      mutatedAt: new Date(),
+      ...overrides,
+    });
+
     it('returns rows mutated after the cursor regardless of height', async () => {
       // 撤回不改 height,所以 afterHeight 补拉结构上永远看不到它。
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', clearedBeforeHeight: 0 },
       ]);
-      prisma.chatMessage.findMany.mockResolvedValue([
-        {
-          id: 'm-revoked',
-          conversationID: 'conv-1',
-          height: 2,
-          senderID: 'u1',
-          type: 'text',
-          content: {},
-          clientMessageId: null,
-          replyToID: null,
-          deleted: false,
-          revokedAt: new Date(),
-          revokedBy: 'u1',
-          editedAt: null,
-          createdAt: new Date(),
-        },
-      ]);
+      prisma.$queryRaw.mockResolvedValue([mutatedRow()]);
 
       const result = await service.listMutationsSince(
         'u1',
@@ -2198,39 +2200,56 @@ describe('ChatService', () => {
       expect(result.messages).toHaveLength(1);
       expect(result.messages[0].revokedAt).toEqual(expect.any(String));
       expect(typeof result.serverTime).toBe('string');
-      const [[args]] = prisma.chatMessage.findMany.mock.calls as [
-        [{ where: { OR: unknown[] } }],
-      ];
-      expect(args.where.OR).toEqual([
-        { revokedAt: { gt: expect.any(Date) } },
-        { editedAt: { gt: expect.any(Date) } },
-      ]);
+      // 没被截断:游标可以安全地推到服务端时刻。
+      expect(result.hasMore).toBe(false);
+      expect(result.nextSince).toBe(result.serverTime);
     });
 
-    it('drops mutations below the viewer clear watermark', async () => {
+    it('stops the cursor at the last returned mutation when truncated', async () => {
+      // 截断了还回 serverTime 的话,没返回的那些变更被永久跳过 ——
+      // 撤回的正文会一直留在对方屏幕上。
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+      ]);
+      const boundary = new Date('2026-08-10T03:00:00.000Z');
+      // 服务端多取一条用于判断「还有没有」:limit=2 时返回 3 条。
+      prisma.$queryRaw.mockResolvedValue([
+        mutatedRow({ id: 'm1', mutatedAt: new Date('2026-08-10T01:00:00Z') }),
+        mutatedRow({ id: 'm2', mutatedAt: boundary }),
+        mutatedRow({ id: 'm3', mutatedAt: new Date('2026-08-10T04:00:00Z') }),
+      ]);
+
+      const result = await service.listMutationsSince('u1', new Date(0), 2);
+
+      expect(result.messages.map((m) => m.id)).toEqual(['m1', 'm2']);
+      expect(result.hasMore).toBe(true);
+      expect(result.nextSince).toBe(boundary.toISOString());
+    });
+
+    it('pushes the clear watermark and burn cutoff into the query, not a post-filter', async () => {
+      // 取回来再 filter 的话,被过滤掉的行照样占着 LIMIT 的名额:一页里真正
+      // 该返回的变更变少了,而客户端游标照常前进。
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', clearedBeforeHeight: 5 },
       ]);
-      prisma.chatMessage.findMany.mockResolvedValue([
-        {
-          id: 'm-old',
-          conversationID: 'conv-1',
-          height: 2,
-          senderID: 'u1',
-          type: 'text',
-          content: {},
-          clientMessageId: null,
-          replyToID: null,
-          deleted: false,
-          revokedAt: new Date(),
-          revokedBy: 'u1',
-          editedAt: null,
-          createdAt: new Date(),
-        },
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-1', burnDurationSec: 30 },
       ]);
+      prisma.$queryRaw.mockResolvedValue([]);
 
       const result = await service.listMutationsSince('u1', new Date(0));
+
       expect(result.messages).toEqual([]);
+      // 原始 SQL 的参数里带上了每会话的 height 下界与截止时间。
+      const calls = prisma.$queryRaw.mock.calls as unknown[][];
+      const params = calls[calls.length - 1].slice(1);
+      expect(params).toContainEqual(['conv-1']);
+      expect(params).toContainEqual([5]);
+      const cutoffs = params.find(
+        (p): p is (Date | null)[] =>
+          Array.isArray(p) && p[0] instanceof Date && p.length === 1,
+      );
+      expect(cutoffs?.[0]).toBeInstanceOf(Date);
     });
   });
 

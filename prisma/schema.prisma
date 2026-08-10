@@ -1921,6 +1921,26 @@ model ChatMessage {
 
 /// 消息表情回应（G-07）。不进 height 坐标系：不是消息、不推进未读、
 /// 不改 lastMessageAt；emoji 收白名单（服务端校验），同人同 emoji 唯一。
+/// 待删除的聊天媒体对象(撤回 / 焚毁的配套物删)。
+///
+/// 为什么要持久化:消息行的 content 在撤回/焚毁那一刻就清空了,object key
+/// 从此**没有任何业务数据能重建**。删除只在进程内存里重试的话,存储侧一次
+/// 超过重试次数的故障、或者一次普通的重启,那个 key 就永远丢了 ——
+/// 被撤回的图片继续留在桶里,而 StorageAudit 只报告孤儿、不删。
+model ChatMediaDeletion {
+  id        String   @id @default(uuid())
+  /// object storage key（只收 chat/ 前缀）。
+  objectKey String   @unique
+  attempts  Int      @default(0)
+  /// 最近一次失败原因（排障用，不外发）。
+  lastError String?
+  /// 下次可重试时刻（指数退避）。
+  nextAttemptAt DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  @@index([nextAttemptAt])
+}
+
 model ChatMessageReaction {
   id        String   @id @default(uuid())
   messageID String

@@ -17,14 +17,76 @@ function dto(overrides: Partial<ChatMessageDto>): ChatMessageDto {
 }
 
 describe('ChatMediaService', () => {
-  const uploadService = { createPresignedGetUrl: jest.fn() };
-  const service = new ChatMediaService(uploadService as never);
+  const uploadService = {
+    createPresignedGetUrl: jest.fn(),
+    deleteObjectByKey: jest.fn(),
+  };
+  const prisma = {
+    chatMediaDeletion: {
+      upsert: jest.fn(),
+      findMany: jest.fn(),
+      update: jest.fn(),
+      delete: jest.fn(),
+    },
+  };
+  const service = new ChatMediaService(uploadService as never, prisma as never);
+
+  afterAll(() => service.onModuleDestroy());
 
   beforeEach(() => {
     jest.clearAllMocks();
     uploadService.createPresignedGetUrl.mockImplementation((key: string) =>
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
     );
+    uploadService.deleteObjectByKey.mockResolvedValue(undefined);
+    prisma.chatMediaDeletion.upsert.mockResolvedValue({});
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
+    prisma.chatMediaDeletion.update.mockResolvedValue({});
+    prisma.chatMediaDeletion.delete.mockResolvedValue({});
+  });
+
+  it('persists a failed deletion instead of losing the key on restart', async () => {
+    // 消息 content 在撤回那一刻已经清空:key 只存在于这条待办里,
+    // 内存队列一重启就等于把那张图永久留在桶里。
+    uploadService.deleteObjectByKey.mockRejectedValueOnce(
+      new Error('minio down'),
+    );
+
+    await service.deleteObjects(['chat/u1/a.jpg']);
+
+    expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { objectKey: 'chat/u1/a.jpg' } }),
+    );
+  });
+
+  it('keeps dead-lettered rows instead of dropping the key', async () => {
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([
+      { id: 'd1', objectKey: 'chat/u1/a.jpg', attempts: 7 },
+    ]);
+    uploadService.deleteObjectByKey.mockRejectedValue(new Error('still down'));
+
+    await service.drainPendingDeletions();
+
+    // 次数用尽只是停止自动重试,行必须留着 —— 删了就再也无从得知这个 key。
+    expect(prisma.chatMediaDeletion.delete).not.toHaveBeenCalled();
+    expect(prisma.chatMediaDeletion.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'd1' },
+        data: expect.objectContaining({ attempts: 8 }),
+      }),
+    );
+  });
+
+  it('clears the row once storage confirms the deletion', async () => {
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([
+      { id: 'd1', objectKey: 'chat/u1/a.jpg', attempts: 2 },
+    ]);
+
+    await service.drainPendingDeletions();
+
+    expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
+      where: { id: 'd1' },
+    });
   });
 
   it('signs image key + thumbKey and voice key onto the dto content', async () => {

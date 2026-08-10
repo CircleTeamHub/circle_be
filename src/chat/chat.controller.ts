@@ -29,6 +29,7 @@ import type {
   ChatHistoryPageDto,
   ChatMemberDto,
   ChatMessageDto,
+  ChatMutationsPageDto,
 } from './chat.types';
 
 /**
@@ -115,7 +116,7 @@ export class ChatController {
   listMutations(
     @Req() req: RequestWithUser,
     @Query() query: MutationsQueryDto,
-  ): Promise<{ messages: ChatMessageDto[]; serverTime: string }> {
+  ): Promise<ChatMutationsPageDto> {
     return this.chatService.listMutationsSince(
       req.user.userId,
       new Date(query.since),
