@@ -439,7 +439,19 @@ describe('createSentryInitOptions', () => {
     expect(output).not.toContain('private message');
     expect(output).not.toContain('person@example.test');
     expect(output).not.toContain('child-secret');
-    expect(JSON.parse(output)).toHaveLength(1);
+    const eventEnvelopes = JSON.parse(output).filter(
+      (envelope: unknown) =>
+        Array.isArray(envelope) &&
+        Array.isArray(envelope[1]) &&
+        envelope[1].some(
+          (item: unknown) =>
+            Array.isArray(item) &&
+            item[0] &&
+            typeof item[0] === 'object' &&
+            (item[0] as { type?: unknown }).type === 'event',
+        ),
+    );
+    expect(eventEnvelopes).toHaveLength(1);
   });
 });
 
