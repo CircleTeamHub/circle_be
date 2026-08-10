@@ -48,7 +48,6 @@ describe('ChatPushService', () => {
     push.sendToTokens.mockResolvedValue([]);
   });
 
-
   it('attaches a per-recipient unread badge on small fanouts (G-18)', async () => {
     prisma.chatMember.findMany.mockResolvedValue([
       { userID: 'u-peer', muted: false },

@@ -36,9 +36,7 @@ describe('ChatBurnSweeperService', () => {
     ];
     // 截止 = 现在 - burnDurationSec,允许极小的执行耗时误差。
     expect(
-      Math.abs(
-        Date.now() - 3600_000 - query.where.createdAt.lt.getTime(),
-      ),
+      Math.abs(Date.now() - 3600_000 - query.where.createdAt.lt.getTime()),
     ).toBeLessThan(5_000);
     // 软删 + 清 content:height 坐标保留,读路径靠 deleted 过滤。
     expect(prisma.chatMessage.updateMany).toHaveBeenCalledWith({

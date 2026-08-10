@@ -759,10 +759,7 @@ export class ChatGateway implements OnModuleDestroy {
     try {
       const conversationId = payload?.conversationId;
       const messageId = payload?.messageId;
-      if (
-        typeof conversationId !== 'string' ||
-        typeof messageId !== 'string'
-      ) {
+      if (typeof conversationId !== 'string' || typeof messageId !== 'string') {
         reply(this.ackError(ChatErrorCode.InvalidPayload));
         return;
       }

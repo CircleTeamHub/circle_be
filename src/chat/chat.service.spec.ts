@@ -1383,7 +1383,6 @@ describe('ChatService', () => {
     });
   });
 
-
   describe('markDelivered(G-07 送达水位)', () => {
     it('clamps to the conversation ceiling and only moves forward', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
