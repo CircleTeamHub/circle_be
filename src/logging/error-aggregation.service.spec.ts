@@ -13,6 +13,7 @@ import {
   type ErrorAggregationProvider,
   type SentryClientLike,
 } from './error-aggregation.service';
+import { execFileSync } from 'node:child_process';
 
 function createFakeClient(): jest.Mocked<SentryClientLike> {
   return {
@@ -393,6 +394,52 @@ describe('createSentryInitOptions', () => {
         lineno: 42,
       },
     ]);
+  });
+
+  it('captures and sanitizes an uncaught child-process exception through the default integrations', () => {
+    const script = `
+      const { createSentryInitOptions } = require('./src/logging/error-aggregation.service');
+      const Sentry = require('@sentry/node');
+      const envelopes = [];
+      Sentry.init({
+        ...createSentryInitOptions({ provider: 'sentry', dsn: 'https://a@o/1', environment: 'test' }),
+        transport: () => ({
+          send: async (envelope) => {
+            envelopes.push(envelope);
+            return { status: 'success' };
+          },
+          flush: async () => true,
+        }),
+      });
+      process.on('uncaughtException', () => {
+        setTimeout(async () => {
+          await Sentry.flush(500);
+          process.stdout.write(JSON.stringify(envelopes));
+          process.exit(0);
+        }, 50);
+      });
+      setTimeout(() => {
+        throw new Error('private message person@example.test Bearer child-secret');
+      }, 0);
+    `;
+
+    const output = execFileSync(
+      process.execPath,
+      ['-r', 'ts-node/register/transpile-only', '-e', script],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TS_NODE_COMPILER_OPTIONS: JSON.stringify({ rootDir: '.' }),
+        },
+      },
+    );
+
+    expect(output).not.toContain('private message');
+    expect(output).not.toContain('person@example.test');
+    expect(output).not.toContain('child-secret');
+    expect(JSON.parse(output)).toHaveLength(1);
   });
 });
 
