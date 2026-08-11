@@ -750,6 +750,87 @@ describe('ChatService', () => {
       ).resolves.toMatchObject({ id: 'conv-9' });
     });
 
+    // ─── 结算专用解析 ────────────────────────────────────────────────────
+    //
+    // 服务端签发的回执(转账卡 / 通话留痕 / 好友申请回放)走这条路解析会话。
+    // 座位落库不会自动 join 房间,而 handleConnection 只在**连接那一刻**把当时
+    // 已有的会话加进来 —— 所以刚建出来的会话,双方在线的 socket 都不在房里,
+    // 紧接着的 insertServerMessage 广播会播进一个空房间、静默丢给双方。
+    describe('ensureDirectConversationForSettlement', () => {
+      it("joins both members' live sockets when it creates the conversation", async () => {
+        prisma.chatConversation.findUnique.mockResolvedValue(null);
+        prisma.chatConversation.create.mockResolvedValue({ id: 'conv-new' });
+
+        const id = await service.ensureDirectConversationForSettlement(
+          'u1',
+          'u2',
+        );
+
+        expect(id).toBe('conv-new');
+        expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+          'u1',
+          'conv-new',
+        );
+        expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+          'u2',
+          'conv-new',
+        );
+      });
+
+      it('joins both members when it loses the create race', async () => {
+        // 对手赢了插入,但它的 join 未必已经跑完 —— 而我们马上就要往这个房间里
+        // 播一条回执。补一次幂等的 join 比赌时序便宜。
+        prisma.chatConversation.findUnique
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce({ id: 'conv-raced' });
+        prisma.chatConversation.create.mockRejectedValue({ code: 'P2002' });
+
+        const id = await service.ensureDirectConversationForSettlement(
+          'u1',
+          'u2',
+        );
+
+        expect(id).toBe('conv-raced');
+        expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+          'u1',
+          'conv-raced',
+        );
+        expect(broadcast.joinUserToConversation).toHaveBeenCalledWith(
+          'u2',
+          'conv-raced',
+        );
+      });
+
+      it('does not re-join when the conversation already existed', async () => {
+        // 会话在连接之前就存在 → handleConnection 已经把双方加进房了
+        // (DIRECT 座位的 leftAt 恒为 null,不会被那条过滤挡掉)。
+        // 多播一次 join 是一次跨节点 fetchSockets,白花的。
+        prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-9' });
+
+        const id = await service.ensureDirectConversationForSettlement(
+          'u1',
+          'u2',
+        );
+
+        expect(id).toBe('conv-9');
+        expect(broadcast.joinUserToConversation).not.toHaveBeenCalled();
+      });
+
+      it('still returns the conversation when joining fails', async () => {
+        // 尽力而为:结算链路不能因为「房间没加上」而失败 —— 钱/通话已经发生了,
+        // 客户端下次重连时 handleConnection 会补上。
+        prisma.chatConversation.findUnique.mockResolvedValue(null);
+        prisma.chatConversation.create.mockResolvedValue({ id: 'conv-new' });
+        broadcast.joinUserToConversation.mockRejectedValue(
+          new Error('no server'),
+        );
+
+        await expect(
+          service.ensureDirectConversationForSettlement('u1', 'u2'),
+        ).resolves.toBe('conv-new');
+      });
+    });
+
     it('returns the real last message for an existing conversation', async () => {
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
