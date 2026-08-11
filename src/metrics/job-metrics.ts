@@ -1,6 +1,13 @@
 import { Counter, Gauge, Registry } from 'prom-client';
 
-export type JobRunResult = 'success' | 'failure';
+/**
+ * `skipped` 是第三种结果，不是 success 的变体：几个 sweeper 有重入闸
+ * （`if (this.running) return`），上一轮还没跑完时下一次调度直接返回。那既不是
+ * 「干成了」也不是「失败了」—— 记成 success 的话，一个永远卡住的任务会被后续
+ * 每一次跳过持续刷新心跳，CronJobStalled 和 CronJobFailing 双双打不中；记成
+ * failure 又会在一次正常的长执行期间凭空报警。
+ */
+export type JobRunResult = 'success' | 'failure' | 'skipped';
 
 /** 一次队列深度采样。三个字段都必须给：留空会让序列消失，见 setOutboxDepth。 */
 export interface OutboxDepthSample {
@@ -187,6 +194,10 @@ export function createJobMetrics(): JobMetrics {
     recordRun(job, result, durationSeconds, nowMs = Date.now()) {
       const name = clampName(job);
       runsTotal.inc({ job: name, result });
+      // 跳过只计数，其余一律不碰：last_duration 会被跳过那一瞬的 ~0 秒盖掉，
+      // 大盘上正好在任务卡住时显示「耗时 0 秒」；last_result 则要保留上一次
+      // 真实运行的结论。心跳当然更不能推进 —— 那正是这个分支存在的理由。
+      if (result === 'skipped') return;
       lastDuration.set({ job: name }, durationSeconds);
       // 与执行频率无关的失败信号：rate() 窗口对每天/每小时的任务不可靠
       // （单次失败的增量在 for: 满足之前就滑出窗口）。

@@ -139,11 +139,24 @@ groups:
         annotations:
           summary: 'Outbox {{ $labels.queue }} depth has not been read for 10m — its pending/dead gauges are stale, not healthy'
 
-      # 用 delta 而不是 `> 0`：死信是只增不减的存量，按存量告警会在第一行死信
-      # 之后永久 firing —— 正是本文件反复警告的「永远红 → 训练运维忽略告警」。
-      # 按「过去 1 小时又多了几条」告警，处理完就自动消。存量本身留给大盘看。
+      # 不按存量 `> 0` 告警：死信基本只增不减，按存量会在第一行死信之后永久
+      # firing —— 正是本文件反复警告的「永远红 → 训练运维忽略告警」。要的是
+      # 「过去 1 小时又多了几条」，处理完自动消，存量本身留给大盘看。
+      #
+      # 但也**不能**用 delta()：它只拿窗口两端的值相减，而这个 gauge 是会回落的
+      # —— 文档写明的补救手段 `UPDATE "CoinGift" SET "cardAttempts"=0` 正是把它
+      # 打回去。5 → 0（人工重发）→ 1（另一份礼物在同一小时内永久丢失）算出来
+      # 是 -4，这条 critical 于是一直哑到那批清零前的样本滑出窗口为止。
+      #
+      # `当前值 - 窗口内最小值` 对中途的回落免疫：只要现在比这一小时的谷底高，
+      # 就说明谷底之后新增过。语义与 delta 一致（存量原地不动满一小时后自动
+      # 归零消警），但少了「被一次回落抹掉」这个洞。
       - alert: OutboxDeadLettersAppearing
-        expr: max by (queue) (delta(circle_outbox_dead{queue!="gift_card"}[1h])) > 0
+        expr: |
+          max by (queue) (
+            circle_outbox_dead{queue!="gift_card"}
+              - min_over_time(circle_outbox_dead{queue!="gift_card"}[1h])
+          ) > 0
         for: 5m
         labels:
           severity: warning
@@ -154,8 +167,15 @@ groups:
       # 重试后永久丢失 —— 收款人拿不到任何凭证，需要人工对账
       # （UPDATE "CoinGift" SET "cardAttempts"=0 可安全重发，clientMessageId 幂等）。
       # 处理器为此打了 error 级日志，但日志没有接告警通道，这条规则是唯一的叫醒机制。
+      #
+      # max by (queue) 与上面一致：蓝绿期间两个颜色各报一份同样的 gauge，不聚合
+      # 就会为同一件事发两条。
       - alert: GiftCardPermanentlyLost
-        expr: delta(circle_outbox_dead{queue="gift_card"}[1h]) > 0
+        expr: |
+          max by (queue) (
+            circle_outbox_dead{queue="gift_card"}
+              - min_over_time(circle_outbox_dead{queue="gift_card"}[1h])
+          ) > 0
         for: 5m
         labels:
           severity: critical

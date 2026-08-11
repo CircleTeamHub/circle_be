@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import {
   reportHandledJobFailure,
+  reportJobSkipped,
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { TempChatStatus } from 'src/generated/prisma';
@@ -30,7 +31,13 @@ export class TempChatCleanup {
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'temp_chat_cleanup')
   async sweep(): Promise<void> {
-    if (this.running) return;
+    // 跳过不是成功。上一轮吊死在 teardown 上时，后面每分钟的跳过都会把心跳
+    // 刷新一遍，于是 CronJobStalled（心跳一直新鲜）和 CronJobFailing（没有
+    // 失败）同时打不中 —— 一个永久卡死的清理任务在大盘上完全健康。
+    if (this.running) {
+      reportJobSkipped();
+      return;
+    }
     this.running = true;
     try {
       for (let batch = 0; batch < SWEEP_MAX_BATCHES; batch += 1) {

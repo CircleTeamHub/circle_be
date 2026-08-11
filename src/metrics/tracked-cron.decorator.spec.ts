@@ -9,6 +9,7 @@ import {
 import { createJobMetrics } from './job-metrics';
 import {
   reportHandledJobFailure,
+  reportJobSkipped,
   runTracked,
   TrackedCron,
 } from './tracked-cron.decorator';
@@ -275,5 +276,114 @@ describe('reportHandledJobFailure', () => {
     const text = await metrics.registry.metrics();
     expect(text).toMatch(/circle_cron_last_result\{job="job_a"\}\s+0/);
     expect(text).toMatch(/circle_cron_last_result\{job="job_b"\}\s+1/);
+  });
+});
+
+describe('reportJobSkipped', () => {
+  it('does not refresh the heartbeat of a job that is still stuck', async () => {
+    // review #150：几个 sweeper 有重入闸（`if (this.running) return`）。跳过和
+    // 干完了长得一模一样——都是正常返回——所以一次吊死的执行会被后面每一分钟
+    // 的跳过持续刷新心跳：CronJobStalled 因为心跳新鲜打不中，CronJobFailing
+    // 因为没有失败也打不中，任务实际上已经永久停摆。
+    const metrics = createJobMetrics();
+    metrics.registerJob('stuck_sweeper', { nowMs: 1_000_000 });
+
+    // 第一轮吊住不返回，随后的 3 次调度全部撞上重入闸。
+    let running = false;
+    let release = () => {};
+    const stuck = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sweep = () =>
+      runTracked(
+        metrics,
+        'stuck_sweeper',
+        async () => {
+          if (running) {
+            reportJobSkipped();
+            return;
+          }
+          running = true;
+          await stuck;
+        },
+        { elapsedMs: () => 0, nowMs: () => 9_000_000 },
+      );
+
+    const hung = sweep();
+    for (let tick = 0; tick < 3; tick += 1) await sweep();
+
+    const text = await metrics.registry.metrics();
+    // 心跳停在播种值 1000s 上，没有被跳过刷新 —— 卡到 3 × 周期之后
+    // CronJobStalled 就能报出来。
+    expect(text).toMatch(
+      /circle_cron_last_success_timestamp_seconds\{job="stuck_sweeper"\}\s+1000\b/,
+    );
+    expect(text).toMatch(
+      /circle_cron_runs_total\{[^}]*job="stuck_sweeper"[^}]*result="skipped"[^}]*\}\s+3/,
+    );
+    expect(text).not.toMatch(
+      /circle_cron_runs_total\{[^}]*job="stuck_sweeper"[^}]*result="success"/,
+    );
+
+    release();
+    await hung;
+  });
+
+  it('does not report a skip as a failure', async () => {
+    // 一次**正常**的长执行（大批量到期）也会让下一轮跳过。那不该叫醒任何人：
+    // 记成 failure 的话 CronJobFailing 会在完全健康的高负载期间误报。
+    const metrics = createJobMetrics();
+    // TrackedCron 在装饰期就 registerJob，last_result 因此被播种成 1。
+    metrics.registerJob('busy_sweeper');
+
+    await runTracked(metrics, 'busy_sweeper', () => {
+      reportJobSkipped();
+    });
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(/circle_cron_last_result\{job="busy_sweeper"\}\s+1/);
+    expect(text).not.toMatch(
+      /circle_cron_runs_total\{[^}]*job="busy_sweeper"[^}]*result="failure"/,
+    );
+  });
+
+  it('keeps the duration of the last real run instead of the skip’s ~0s', async () => {
+    // 跳过瞬间返回。让它覆盖 last_duration 的话，大盘会恰好在任务卡住时
+    // 显示「耗时 0 秒」。
+    const metrics = createJobMetrics();
+    const elapsed = jest
+      .fn<number, []>()
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(7_000)
+      .mockReturnValue(0);
+    const clock = { elapsedMs: elapsed, nowMs: () => 5_000 };
+
+    await runTracked(metrics, 'timed_sweeper', () => undefined, clock);
+    await runTracked(metrics, 'timed_sweeper', () => reportJobSkipped(), clock);
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_cron_last_duration_seconds\{job="timed_sweeper"\}\s+7\b/,
+    );
+  });
+
+  it('loses to a failure reported in the same run', async () => {
+    // 重入闸之外还有别的 catch 时，一轮里可能两种都报。按更严重的算。
+    const metrics = createJobMetrics();
+
+    await runTracked(metrics, 'both_sweeper', () => {
+      reportJobSkipped();
+      reportHandledJobFailure();
+    });
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(/circle_cron_last_result\{job="both_sweeper"\}\s+0/);
+    expect(text).toMatch(
+      /circle_cron_runs_total\{[^}]*job="both_sweeper"[^}]*result="failure"[^}]*\}\s+1/,
+    );
+  });
+
+  it('survives being called outside any tracked job', () => {
+    expect(() => reportJobSkipped()).not.toThrow();
   });
 });

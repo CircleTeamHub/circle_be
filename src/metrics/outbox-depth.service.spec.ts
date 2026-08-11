@@ -1,6 +1,7 @@
 import { createJobMetrics } from './job-metrics';
 import {
   collectOutboxDepths,
+  OUTBOX_PROBE_MAX_CONCURRENT_QUERIES,
   OUTBOX_QUEUES,
   type OutboxDepthSource,
 } from './outbox-depth.service';
@@ -171,6 +172,60 @@ describe('collectOutboxDepths', () => {
       oldestAgeSeconds: 600,
       dead: 2,
     });
+  });
+
+  it('never holds more than one database call open at a time', async () => {
+    // review #150：并发版本在每个整分钟同时开 8 个连接（5 个队列 × pending/dead
+    // 两查），而池默认只有 10、其余 EVERY_MINUTE 处理器又都在同一个边界点火。
+    // 一次慢查询就足以让这个纯观测任务把池吃干净，把真实请求排到 10 秒获取
+    // 超时上。
+    let inFlight = 0;
+    let peak = 0;
+    const track = async <T>(value: T): Promise<T> => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // 让出一个 microtask，模拟真实查询的等待窗口：并发实现会在这里把所有
+      // 调用一起挂起，peak 随之冲高。
+      await Promise.resolve();
+      await Promise.resolve();
+      inFlight -= 1;
+      return value;
+    };
+    const delegate = () => ({
+      aggregate: jest.fn(() =>
+        track({ _count: { _all: 0 }, _min: { createdAt: null } }),
+      ),
+      count: jest.fn(() => track(0)),
+    });
+    const prisma = {
+      sessionRevocationOutbox: delegate(),
+      notificationPushOutbox: delegate(),
+      friendChatReplayOutbox: delegate(),
+      coinGift: delegate(),
+      circleInvitationVerifier: delegate(),
+    } as unknown as OutboxDepthSource;
+
+    const samples = await collectOutboxDepths(prisma, NOW);
+
+    expect(samples).toHaveLength(OUTBOX_QUEUES.length);
+    expect(peak).toBeLessThanOrEqual(OUTBOX_PROBE_MAX_CONCURRENT_QUERIES);
+  });
+
+  it('keeps probing the remaining queues after a slow one fails', async () => {
+    // 串行化不能把「单队列失败只丢它自己」丢掉：那是这段代码最初的设计约束。
+    // 失败的队列排在中间时，后面的队列必须照常读到数。
+    const prisma = fakePrisma();
+    prisma.notificationPushOutbox.aggregate = jest
+      .fn()
+      .mockRejectedValue(new Error('lock timeout'));
+
+    const samples = await collectOutboxDepths(prisma, NOW);
+
+    expect(samples.map((sample) => sample.queue).sort()).toEqual(
+      OUTBOX_QUEUES.filter((queue) => queue.name !== 'notification_push')
+        .map((queue) => queue.name)
+        .sort(),
+    );
   });
 
   it('scopes the verification-card queue exactly like its sweeper does', async () => {

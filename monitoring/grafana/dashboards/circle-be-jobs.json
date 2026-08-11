@@ -154,11 +154,11 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (job) (rate(circle_cron_runs_total{result=\"failure\"}[15m])) / sum by (job) (rate(circle_cron_runs_total[15m]))",
+          "expr": "sum by (job) (rate(circle_cron_runs_total{result=\"failure\"}[15m])) / sum by (job) (rate(circle_cron_runs_total{result!=\"skipped\"}[15m]))",
           "legendFormat": "{{job}}"
         }
       ],
-      "description": "注意：4 个 outbox 处理器会自己 catch 异常并写进行上的 lastError，所以队列堵死时这张图可能一直是 0 —— 那种故障要看下面的积压和死信。"
+      "description": "分母排除 skipped（重入闸挡掉的调度不是一次执行，算进去会把卡死任务的失败率稀释成接近 0）。注意：4 个 outbox 处理器会自己 catch 异常并写进行上的 lastError，所以队列堵死时这张图可能一直是 0 —— 那种故障要看下面的积压和死信。"
     },
     {
       "id": 4,
@@ -248,11 +248,11 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (job) (rate(circle_cron_runs_total[15m])) * 60",
-          "legendFormat": "{{job}}"
+          "expr": "sum by (job, result) (rate(circle_cron_runs_total[15m])) * 60",
+          "legendFormat": "{{job}} · {{result}}"
         }
       ],
-      "description": "次/分钟。掉到 0 而心跳不涨 = 调度器停了。"
+      "description": "次/分钟，按结果拆开。掉到 0 而心跳不涨 = 调度器停了；整条线全变成 skipped = 上一轮吊死在里面、重入闸把后续每一次调度都挡掉了（心跳同时会停住，CronJobStalled 负责报出来）。"
     },
     {
       "id": 6,

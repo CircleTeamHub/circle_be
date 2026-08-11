@@ -58,7 +58,7 @@ public; everything else stays internal.)
 | `chat_message_ack_duration_seconds`                                 | histogram       | `action`                         | Chat handler ACK latency                                          |
 | `chat_broadcast_duration_seconds`                                   | histogram       | `action`                         | Time spent handing events to Socket.IO                            |
 | `chat_connection_events_total` / `chat_connection_rejections_total` | counter         | `event` / `reason`               | Connection churn and rejected connections                         |
-| `circle_cron_runs_total`                                            | counter         | `job`, `result`                  | Scheduled-job runs — catches "running but always failing"          |
+| `circle_cron_runs_total`                                            | counter         | `job`, `result`                  | Scheduled-job runs — catches "running but always failing". `result` is `success` / `failure` / `skipped`; `skipped` is a tick the job's re-entrancy guard turned away and is neither, so it advances no heartbeat and belongs in no failure ratio |
 | `circle_cron_last_success_timestamp_seconds`                        | gauge           | `job`                            | Heartbeat — catches "not running at all"; seeded at process start  |
 | `circle_cron_interval_seconds`                                      | gauge           | `job`                            | Expected period, so one alert rule fits every job                  |
 | `circle_cron_last_duration_seconds`                                 | gauge           | `job`                            | Last run's wall-clock duration                                     |

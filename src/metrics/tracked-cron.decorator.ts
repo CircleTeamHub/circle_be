@@ -57,6 +57,7 @@ const systemClock: JobClock = {
 
 interface TrackedJobContext {
   failed: boolean;
+  skipped: boolean;
 }
 
 /**
@@ -81,10 +82,31 @@ export function reportHandledJobFailure(): void {
 }
 
 /**
- * 执行一次任务并记账：成功/失败计数、耗时、成功心跳。**不吞异常** —— 原样
- * 重抛，让 @sentry/node 的进程级集成照旧收到未处理 rejection。
+ * 标记「这一轮压根没跑」，供**重入闸**使用（`if (this.running) return`）。
+ *
+ * 几个 sweeper 用这个闸防止两轮无界扫描叠在一起。问题是跳过看起来和干完了
+ * 一模一样：都是正常返回。于是一次卡死的执行（teardown 吊在某个依赖上）会被
+ * 后面每一分钟的跳过持续刷新心跳 —— CronJobStalled 因为心跳一直新鲜打不中，
+ * CronJobFailing 因为没有失败也打不中，而这个任务实际上已经停摆到天荒地老。
+ *
+ * 刻意不记成 failure：一次**正常**的长执行（大批量到期）也会跳过几轮，那不该
+ * 叫醒任何人。跳过只进 `circle_cron_runs_total{result="skipped"}`，让心跳自然
+ * 变陈旧 —— 卡死超过 3 × 周期时由 CronJobStalled 负责报出来。
+ *
+ * 与 reportHandledJobFailure 同样：脱离 cron 上下文调用是无操作，绝不抛。
+ */
+export function reportJobSkipped(): void {
+  const context = currentJob.getStore();
+  if (context) context.skipped = true;
+}
+
+/**
+ * 执行一次任务并记账：成功/失败/跳过计数、耗时、成功心跳。**不吞异常** ——
+ * 原样重抛，让 @sentry/node 的进程级集成照旧收到未处理 rejection。
  *
  * 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种结果。
+ * 调用过 reportJobSkipped() 的那一轮记成 skipped：只计数，心跳、耗时、
+ * last_result 一律不动。
  *
  * 墙钟只在任务返回之后读。包装器若在调用原函数**之前**读 Date.now()，就会
  * 打乱被包装方法自己的时钟序列 —— notification-retention 的扫表预算用
@@ -99,13 +121,19 @@ export async function runTracked<T>(
   clock: JobClock = systemClock,
 ): Promise<T> {
   const startedAt = clock.elapsedMs();
-  const context: TrackedJobContext = { failed: false };
+  const context: TrackedJobContext = { failed: false, skipped: false };
   try {
     const result = await currentJob.run(context, () => run());
     // 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种
     // 结果：心跳不前进，failure 计数递增。
     if (context.failed) {
       metrics.recordRun(job, 'failure', (clock.elapsedMs() - startedAt) / 1000);
+      return result;
+    }
+    // 跳过排在成功之前判定，但排在失败之后：一轮里既报了失败又报了跳过时
+    // （重入闸之外还有别的 catch），按更严重的失败算。
+    if (context.skipped) {
+      metrics.recordRun(job, 'skipped', (clock.elapsedMs() - startedAt) / 1000);
       return result;
     }
     metrics.recordRun(

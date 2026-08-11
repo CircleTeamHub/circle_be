@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
@@ -88,6 +91,17 @@ export class SessionRevocationOutboxProcessor {
           revokedAt: job.revokedAt.toISOString(),
           attempts: job.attempts + 1,
         });
+        // 这一条撤销**没有生效**：会话还活着，登出/封禁/盗号撤销都没落地。
+        // 异常在这里被吞掉后方法正常返回，包装器只看「有没有抛」的话会把这
+        // 一轮记成功、心跳照常前进 —— Redis 或广播长时间不可用时
+        // CronJobFailing 一路绿灯，而队列一条都没处理掉。
+        //
+        // 这里刻意不做「单项失败可以容忍」的区分（temp-chat 的单房 teardown
+        // 就是那么处理的）：撤销失败的成因是 Redis / socket 广播不可用，是整条
+        // 路径的故障而不是某一行的坏数据，而且它踩的是安全路径。CronJobFailing
+        // 要 last_result 连续 15 分钟为 0 才响，下一分钟只要有一轮全成功就会
+        // 翻回 1，单次抖动不会惊动人。
+        reportHandledJobFailure();
       }
     }
 

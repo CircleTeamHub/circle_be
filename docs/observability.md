@@ -121,7 +121,7 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
 
 | 指标                                          | 检测什么                                            |
 | --------------------------------------------- | --------------------------------------------------- |
-| `circle_cron_runs_total{job,result}`          | 任务在跑但一直报错                                  |
+| `circle_cron_runs_total{job,result}`          | 任务在跑但一直报错。`result` 为 `success`/`failure`/`skipped`；`skipped` 是被重入闸挡回去的那一次调度（上一轮还没返回），它既不推进心跳也不进失败率 —— 记成 success 的话，一轮吊死之后每分钟的跳过都会刷新心跳，`CronJobStalled` 和 `CronJobFailing` 会一起失明 |
 | `circle_cron_last_success_timestamp_seconds{job}` | 任务**根本没在跑**（进程活着、调度器停了）      |
 | `circle_cron_interval_seconds{job}`           | 该任务的预期周期，供告警算 `3 × 周期` 的阈值        |
 | `circle_cron_last_duration_seconds{job}`      | 单次耗时（是否越来越慢、是否会与下一轮重叠）        |

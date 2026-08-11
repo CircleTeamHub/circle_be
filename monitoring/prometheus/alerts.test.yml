@@ -147,3 +147,62 @@ tests:
       - eval_time: 20m
         alertname: OutboxProbeStale
         exp_alerts: []
+
+  # ── 死信:必须对「人工清零」造成的回落免疫 ────────────────────────────
+  - interval: 1m
+    name: 存量被人工重发清零后,同一小时内新增的永久丢失仍然要报
+    input_series:
+      # 5 条积压的死信 → 运维照文档执行
+      # `UPDATE "CoinGift" SET "cardAttempts"=0` 把它们放回重试 → 另一份礼物
+      # 打光 60 次重试、永久丢失。delta() 在这里算出 -4,这条 critical 会一直
+      # 哑到清零前的样本滑出 1 小时窗口 —— 钱已结算、凭证没了,没人被叫醒。
+      - series: 'circle_outbox_dead{queue="gift_card"}'
+        values: '5+0x10 0+0x10 1+0x25'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GiftCardPermanentlyLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              queue: gift_card
+            exp_annotations:
+              summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
+
+  - interval: 1m
+    name: 新增的死信要报,而放着不动的存量满一小时后自动消
+    input_series:
+      # t=6 冒出 3 条死信,此后原地不动。
+      - series: 'circle_outbox_dead{queue="notification_push"}'
+        values: '0+0x5 3+0x120'
+    alert_rule_test:
+      # 刚出现:报。
+      - eval_time: 15m
+        alertname: OutboxDeadLettersAppearing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              queue: notification_push
+            exp_annotations:
+              summary: 'Outbox notification_push produced new dead letters in the last hour (never retried again)'
+      # 存量原地不动满一小时:自动消,不留一条永远红的告警。
+      - eval_time: 90m
+        alertname: OutboxDeadLettersAppearing
+        exp_alerts: []
+
+  - interval: 1m
+    name: 蓝绿期间同一件事只发一条
+    input_series:
+      # 两个颜色各报一份同样的 gauge。不按 queue 聚合就会发两条。
+      - series: 'circle_outbox_dead{queue="gift_card",instance="blue"}'
+        values: '0+0x5 1+0x30'
+      - series: 'circle_outbox_dead{queue="gift_card",instance="green"}'
+        values: '0+0x5 1+0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GiftCardPermanentlyLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              queue: gift_card
+            exp_annotations:
+              summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'

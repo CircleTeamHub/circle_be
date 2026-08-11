@@ -111,51 +111,56 @@ const logger = new Logger('OutboxDepth');
 /**
  * 采集一轮队列深度。**单个队列失败只丢它自己**：整轮 reject 会让所有队列的
  * 序列一起消失（迁移中、单表锁等待都可能触发），积压告警随之集体静默。
+ *
+ * 刻意**串行**跑，一次只占一个连接。并发版本（外层 Promise.all 5 个队列 ×
+ * 内层 pending/dead 两查）在每个整分钟同时开 8 个连接，而池默认只有 10、
+ * 其余 EVERY_MINUTE 的处理器又都在同一个边界点火 —— 一张变大的 outbox 表
+ * 或一次慢查询，就足以让这个**纯观测**任务把池吃干净、把真实请求排到
+ * 10 秒获取超时上。观测代码抢生产流量的连接是本末倒置；这里的代价只是
+ * 几个 count 从并行变串行，探测周期是 60 秒，完全付得起。
  */
+export const OUTBOX_PROBE_MAX_CONCURRENT_QUERIES = 1;
+
 export async function collectOutboxDepths(
   prisma: OutboxDepthSource,
   now: Date,
 ): Promise<OutboxDepthSample[]> {
-  const results = await Promise.all(
-    OUTBOX_QUEUES.map(async (queue) => {
-      const delegate = prisma[queue.model];
-      try {
-        const [pending, dead] = await Promise.all([
-          delegate.aggregate({
-            where: queue.pendingWhere,
-            _count: { _all: true },
-            _min: { createdAt: true },
-          }),
-          queue.deadWhere
-            ? delegate.count({ where: queue.deadWhere })
-            : Promise.resolve(0),
-        ]);
+  const samples: OutboxDepthSample[] = [];
 
-        const oldest = pending._min.createdAt;
-        return {
-          queue: queue.name,
-          pending: pending._count._all,
-          // 下限 0：多实例时钟漂移下 createdAt 可能落在 now 之后，负数会让
-          // `> 阈值` 的积压告警变成永远打不中。
-          oldestAgeSeconds: oldest
-            ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000))
-            : 0,
-          dead,
-        } satisfies OutboxDepthSample;
-      } catch (error) {
-        logger.warn(
-          `Failed to probe outbox depth for ${queue.name}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-        return undefined;
-      }
-    }),
-  );
+  for (const queue of OUTBOX_QUEUES) {
+    const delegate = prisma[queue.model];
+    try {
+      const pending = await delegate.aggregate({
+        where: queue.pendingWhere,
+        _count: { _all: true },
+        _min: { createdAt: true },
+      });
+      const dead = queue.deadWhere
+        ? await delegate.count({ where: queue.deadWhere })
+        : 0;
 
-  return results.filter((sample): sample is OutboxDepthSample =>
-    Boolean(sample),
-  );
+      const oldest = pending._min.createdAt;
+      samples.push({
+        queue: queue.name,
+        pending: pending._count._all,
+        // 下限 0：多实例时钟漂移下 createdAt 可能落在 now 之后，负数会让
+        // `> 阈值` 的积压告警变成永远打不中。
+        oldestAgeSeconds: oldest
+          ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000))
+          : 0,
+        dead,
+      });
+    } catch (error) {
+      // 继续跑下一个队列 —— 一张表锁住不该让其余队列的读数一起消失。
+      logger.warn(
+        `Failed to probe outbox depth for ${queue.name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  return samples;
 }
 
 /**

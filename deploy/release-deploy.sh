@@ -553,6 +553,17 @@ irreversible_migration_applied=1
 set_release_env_value() {
   local file="$1" key="$2" value="$3"
   local tmp="${file}.tmp"
+  # 临时文件装的是**整份生产密钥**(awk 把 $file 原样抄一遍)。直接
+  # `awk ... > "$tmp"` 会用部署机常见的 umask 022 建出 0644,于是从写入到
+  # mv 的这段窗口里同机任何用户都读得到 —— 而 .env.production 本身是 0600,
+  # 等于绕过了它的权限。
+  #
+  # 先删再建:残留的旧 .env.production.tmp(上一次发布被 Ctrl-C 掐断等)会让
+  # `>` 只做截断、保留它原来的宽松权限,umask 对已存在的文件不起作用。
+  # mv 是同目录 rename,0600 跟着 inode 一起到目标,所以目标文件也不存在
+  # 「先 0644 再 chmod」的窗口。
+  rm -f "$tmp" || return 1
+  (umask 077 && : > "$tmp") || return 1
   awk -v key="$key" -v value="$value" '
     BEGIN { prefix = key "="; replaced = 0 }
     index($0, prefix) == 1 {
@@ -562,8 +573,10 @@ set_release_env_value() {
     }
     { print }
     END { if (!replaced) print prefix value }
-  ' "$file" > "$tmp"
-  mv "$tmp" "$file"
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  # 任何一步失败都必须把临时文件带走,否则密钥副本会一直躺在部署目录里 ——
+  # 打标签失败只是警告、发布照常继续,不会有人回头来收拾它。
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
 # 路径可覆盖,理由与 RELEASE_STATE_DIR / RELEASE_MARKER_PATH 相同:脚本第 28 行
@@ -576,6 +589,8 @@ APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 # 写不进去而一直下线。一个 release 标签不值得拿可用性去换。
 if [ -f "$APP_ENV_FILE" ]; then
   echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
+  # chmod 是兜底:替换用的临时文件已经是 0600,rename 之后目标文件天然就是
+  # 0600,这一行只负责收拾「文件在这次发布之前就被人放成了 0644」的历史遗留。
   if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
     chmod 600 "$APP_ENV_FILE"; then
     :
