@@ -1,0 +1,220 @@
+import { BadRequestException } from '@nestjs/common';
+import { PrismaService } from 'src/prisma/prisma.service';
+import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
+import { SupportService } from './support.service';
+
+const user = (id: string, overrides: Record<string, unknown> = {}) => ({
+  id,
+  nickname: `nick-${id}`,
+  avatarUrl: null,
+  vipLevel: 0,
+  ...overrides,
+});
+
+describe('SupportService', () => {
+  const tx = {
+    supportAgent: {
+      findMany: jest.fn(),
+      deleteMany: jest.fn(),
+      upsert: jest.fn(),
+    },
+  };
+  const prisma = {
+    supportAgent: {
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
+    },
+    user: { findMany: jest.fn() },
+    $transaction: jest.fn((callback) => callback(tx)),
+  };
+  const audit = { recordInTransaction: jest.fn() };
+  const service = new SupportService(
+    prisma as unknown as PrismaService,
+    audit as unknown as AdminUserAuditService,
+  );
+  const operator = { userId: 'admin-1', accountId: 'admin-account' };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  describe('getConfig', () => {
+    it('groups agents by category and always returns all five keys', async () => {
+      prisma.supportAgent.findMany.mockResolvedValue([
+        { category: 'recharge', user: user('u1') },
+        { category: 'recharge', user: user('u2') },
+        { category: 'membership', user: user('u3') },
+      ]);
+
+      const { agents } = await service.getConfig();
+
+      expect(agents.recharge.map((a) => a.userID)).toEqual(['u1', 'u2']);
+      expect(agents.membership.map((a) => a.userID)).toEqual(['u3']);
+      // 未配置的类必须是空数组而不是 undefined —— App 直接渲染空态。
+      expect(agents.issue).toEqual([]);
+      expect(agents.dispute).toEqual([]);
+      expect(agents.account).toEqual([]);
+    });
+
+    // 账号被封/注销却仍出现在列表里,就回到了 imAdmin 时代「渲染成功、点击失败」的老毛病。
+    it('asks the database for enabled rows whose user is still ACTIVE, ordered by sortOrder', async () => {
+      prisma.supportAgent.findMany.mockResolvedValue([]);
+
+      await service.getConfig();
+
+      const args = prisma.supportAgent.findMany.mock.calls[0][0];
+      expect(args.where).toEqual({ enabled: true, user: { status: 'ACTIVE' } });
+      expect(args.orderBy).toContainEqual({ sortOrder: 'asc' });
+    });
+  });
+
+  describe('replaceAgents', () => {
+    const activeUsers = (ids: string[]) =>
+      prisma.user.findMany.mockResolvedValue(
+        ids.map((id) => ({ id, status: 'ACTIVE' })),
+      );
+
+    beforeEach(() => {
+      tx.supportAgent.findMany.mockResolvedValue([]);
+      prisma.supportAgent.findMany.mockResolvedValue([]);
+    });
+
+    it('rejects a user that does not exist', async () => {
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.replaceAgents(operator, [
+          { category: 'recharge', userID: 'ghost', sortOrder: 0 },
+        ]),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it.each(['BANNED', 'DELETED'])('rejects a %s user', async (status) => {
+      prisma.user.findMany.mockResolvedValue([{ id: 'u1', status }]);
+
+      await expect(
+        service.replaceAgents(operator, [
+          { category: 'recharge', userID: 'u1', sortOrder: 0 },
+        ]),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects the same user twice in one category', async () => {
+      activeUsers(['u1']);
+
+      await expect(
+        service.replaceAgents(operator, [
+          { category: 'recharge', userID: 'u1', sortOrder: 0 },
+          { category: 'recharge', userID: 'u1', sortOrder: 1 },
+        ]),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('allows the same user in two different categories', async () => {
+      activeUsers(['u1']);
+
+      await service.replaceAgents(operator, [
+        { category: 'recharge', userID: 'u1', sortOrder: 0 },
+        { category: 'dispute', userID: 'u1', sortOrder: 0 },
+      ]);
+
+      expect(tx.supportAgent.upsert).toHaveBeenCalledTimes(2);
+    });
+
+    // 覆盖式写入的语义:没出现在 payload 里的行才删。用 upsert 而不是
+    // deleteMany+createMany,否则调一次顺序就让所有行看起来像刚创建。
+    it('deletes only the rows missing from the payload and upserts the rest', async () => {
+      activeUsers(['u1']);
+      tx.supportAgent.findMany.mockResolvedValue([
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+        { category: 'issue', userID: 'gone', sortOrder: 0, enabled: true },
+      ]);
+
+      await service.replaceAgents(operator, [
+        { category: 'recharge', userID: 'u1', sortOrder: 5 },
+      ]);
+
+      expect(tx.supportAgent.deleteMany).toHaveBeenCalledWith({
+        where: { OR: [{ category: 'issue', userID: 'gone' }] },
+      });
+      expect(tx.supportAgent.upsert).toHaveBeenCalledTimes(1);
+      expect(tx.supportAgent.upsert.mock.calls[0][0].update).toEqual({
+        sortOrder: 5,
+        enabled: true,
+      });
+    });
+
+    // 停用要靠 enabled=false 传进来,而不是从 payload 里省略 —— 省略等于删除。
+    it('keeps a disabled row instead of deleting it', async () => {
+      activeUsers(['u1']);
+
+      await service.replaceAgents(operator, [
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: false },
+      ]);
+
+      expect(tx.supportAgent.deleteMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.upsert.mock.calls[0][0].update).toEqual({
+        sortOrder: 0,
+        enabled: false,
+      });
+    });
+
+    it('records a before/after audit row in the same transaction', async () => {
+      activeUsers(['u1']);
+      const before = [
+        { category: 'recharge', userID: 'old', sortOrder: 0, enabled: true },
+      ];
+      tx.supportAgent.findMany.mockResolvedValue(before);
+
+      await service.replaceAgents(operator, [
+        { category: 'recharge', userID: 'u1', sortOrder: 0 },
+      ]);
+
+      expect(audit.recordInTransaction).toHaveBeenCalledWith(
+        tx,
+        expect.objectContaining({
+          actorId: 'admin-1',
+          actorAccountId: 'admin-account',
+          action: 'support.agents.replace',
+          targetType: 'support_agents',
+          before,
+          after: [
+            { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+          ],
+        }),
+      );
+    });
+
+    it('clears the table when given an empty payload', async () => {
+      tx.supportAgent.findMany.mockResolvedValue([
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+      ]);
+
+      await service.replaceAgents(operator, []);
+
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.deleteMany).toHaveBeenCalledWith({
+        where: { OR: [{ category: 'recharge', userID: 'u1' }] },
+      });
+      expect(tx.supportAgent.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('isSupportAgent', () => {
+    it('only counts enabled rows', async () => {
+      prisma.supportAgent.findFirst.mockResolvedValue({ id: 'row-1' });
+
+      await expect(service.isSupportAgent('u1')).resolves.toBe(true);
+      expect(prisma.supportAgent.findFirst.mock.calls[0][0].where).toEqual({
+        userID: 'u1',
+        enabled: true,
+      });
+    });
+
+    it('is false for a user that is not a support agent', async () => {
+      prisma.supportAgent.findFirst.mockResolvedValue(null);
+
+      await expect(service.isSupportAgent('u1')).resolves.toBe(false);
+    });
+  });
+});

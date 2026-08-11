@@ -15,6 +15,16 @@ enum UserStatus {
   DELETED
 }
 
+/// 客服类型。前四类对应 App 客服中心的四个入口，membership 收编原先独立的
+/// EXPO_PUBLIC_MEMBERSHIP_SUPPORT_USER_ID，不再让两套机制并存。
+enum SupportAgentCategory {
+  recharge
+  issue
+  dispute
+  account
+  membership
+}
+
 enum RefreshTokenAudience {
   APP
   ADMIN
@@ -417,6 +427,7 @@ model User {
   fancyNumberLeases                 FancyNumberLease[]
   fancyNumberOrders                 FancyNumberOrder[]
   groupExpansionOrders              GroupExpansionOrder[]
+  supportAgentRoles                 SupportAgent[]
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -498,6 +509,26 @@ model MembershipProgramState {
   enabledByUserId String?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @default(now()) @updatedAt
+}
+
+/// 客服账号。原本是 App 的编译期常量（EXPO_PUBLIC_SUPPORT_*），换客服要重新出包发版；
+/// 改为服务端存储 + 管理台维护 + App 运行时拉取。用行而不是逗号分隔字符串：
+/// 「一类多客服」是既有需求，行结构还能排序和单独停用。
+model SupportAgent {
+  id        String               @id @default(uuid())
+  category  SupportAgentCategory
+  userID    String
+  sortOrder Int                  @default(0)
+  /// 停用而不删除：保留配置痕迹，避免「删了又加回来」丢失顺序。
+  enabled   Boolean              @default(true)
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @default(now()) @updatedAt
+
+  user User @relation(fields: [userID], references: [id], onDelete: Cascade)
+
+  /// 同一类里不允许重复挂同一个人。
+  @@unique([category, userID])
+  @@index([category, enabled, sortOrder])
 }
 
 model MembershipBenefitGrant {

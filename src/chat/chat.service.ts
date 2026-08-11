@@ -9,6 +9,7 @@ import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
+import { SupportService } from 'src/support/support.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
@@ -91,6 +92,7 @@ export class ChatService {
     private readonly privacySettings: PrivacySettingsService,
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
+    private readonly support: SupportService,
   ) {}
 
   /**
@@ -1318,10 +1320,17 @@ export class ChatService {
     // 事后改开关不该把历史会话锁死。
     if (!conversation) {
       const friends = await this.areFriends(userId, peerUserId);
-      const allowed = await this.privacySettings.canReceiveStrangerMessage(
-        peerUserId,
-        friends,
-      );
+      // 客服豁免:客服本人在 App 里关掉「接收陌生人消息」会静默切断整条客服通道,
+      // 而且失效时没有任何信号 —— 用户只会看到「对方不接收陌生人消息」。做成服务端
+      // 规则而不是靠约束客服的个人设置,后者防不住误操作。
+      // 拉黑判定(上面的 assertNotBlockedBetween)与账号 status 检查不在豁免范围内。
+      const isSupport = await this.support.isSupportAgent(peerUserId);
+      const allowed =
+        isSupport ||
+        (await this.privacySettings.canReceiveStrangerMessage(
+          peerUserId,
+          friends,
+        ));
       if (!allowed) {
         throw new ForbiddenException({
           message: '对方不接收陌生人消息',

@@ -7,6 +7,7 @@ import { RedisModule } from 'src/redis/redis.module';
 import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
+import { SupportModule } from 'src/support/support.module';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatController } from './chat.controller';
@@ -27,6 +28,7 @@ import { ChatService } from './chat.service';
     SensitiveWordModule,
     PrivacySettingsModule,
     UploadModule,
+    SupportModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
