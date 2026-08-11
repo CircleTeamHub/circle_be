@@ -31,7 +31,6 @@ Admin data is for moderators, support, and business operators. It should answer:
 - User status: `ACTIVE`, `BANNED`, `DELETED`.
 - User actions: ban, unban, delete/deactivate.
 - User profile summary: account ID, nickname, avatar, role, status, credit score, created time, last online.
-- OpenIM outbox health summary from `GET /api/v1/outbox/health`.
 
 ### Useful Admin Dashboard Cards
 

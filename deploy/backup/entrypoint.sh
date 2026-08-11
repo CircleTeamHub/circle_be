@@ -8,9 +8,8 @@
 #   <anything else>      exec'd verbatim (psql, pgbackrest, mc, bash, ...)
 #
 # Which jobs this container schedules comes from BACKUP_JOBS (comma separated),
-# set per-service in docker-compose.backup.yml rather than in .env.backup: the
-# pg/minio scheduler and the OpenIM-Mongo scheduler are different services on
-# different networks, but share this one image.
+# set per-service in docker-compose.backup.yml rather than in .env.backup, so a
+# second scheduler service can be added later without rebuilding the image.
 LOG_TAG=entrypoint
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -22,11 +21,10 @@ run_job() {
     pg-full)   shift; exec "$JOBS_DIR/backup-postgres.sh" full "$@" ;;
     pg-diff)   shift; exec "$JOBS_DIR/backup-postgres.sh" diff "$@" ;;
     pg-incr)   shift; exec "$JOBS_DIR/backup-postgres.sh" incr "$@" ;;
-    mongo)     shift; exec "$JOBS_DIR/backup-mongo.sh" "$@" ;;
     minio)     shift; exec "$JOBS_DIR/backup-minio.sh" "$@" ;;
     check)     shift; exec "$JOBS_DIR/check.sh" "$@" ;;
     drill)     shift; exec "$JOBS_DIR/drill.sh" "$@" ;;
-    *) die "unknown job '${1:-}' (want: pg-full|pg-diff|pg-incr|mongo|minio|check|drill)" ;;
+    *) die "unknown job '${1:-}' (want: pg-full|pg-diff|pg-incr|minio|check|drill)" ;;
   esac
 }
 
@@ -36,12 +34,6 @@ _schedule_for() {
     pg-diff) printf '%s' "${BACKUP_CRON_PG_DIFF:-0 3 * * 1-6}" ;;
     pg-incr) printf '%s' "${BACKUP_CRON_PG_INCR:-0 3 * * 1-6}" ;;
     minio)   printf '%s' "${BACKUP_CRON_MINIO:-*/15 * * * *}" ;;
-    # Hourly, not daily. Each run is a FULL dump, so this is the direct
-    # RPO-vs-cost knob for chat history: RPO == this interval, because OpenIM's
-    # mongod is standalone (no --replSet => no oplog => no point-in-time
-    # recovery). Daily would mean losing up to 24h of messages. See
-    # docs/backups.md "RPO gap: chat history".
-    mongo)   printf '%s' "${BACKUP_CRON_MONGO:-0 * * * *}" ;;
     check)   printf '%s' "${BACKUP_CRON_CHECK:-17 * * * *}" ;;
     *) die "unknown job in BACKUP_JOBS: '$1'" ;;
   esac

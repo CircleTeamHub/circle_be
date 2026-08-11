@@ -11,7 +11,7 @@ die()  { log "FATAL $*" >&2; exit 1; }
 # require_env VAR... — fail fast on missing configuration.
 # Every secret in this system comes from the environment. There is deliberately
 # no default value for any credential: a default credential is a published
-# credential (see the openIM123 defaults the upstream openim-docker stack ships).
+# credential.
 require_env() {
   local missing=() name
   for name in "$@"; do

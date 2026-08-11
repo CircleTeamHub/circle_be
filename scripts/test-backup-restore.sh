@@ -42,9 +42,6 @@ export MINIO_ROOT_PASSWORD=test-only-minio-password
 export API_DOMAIN=api.example.test
 export ADMIN_DOMAIN=admin.example.test
 export ACME_EMAIL=ops@example.test
-# Deliberately bogus: proves the openim-backup profile really is optional and a
-# missing OpenIM stack does not stop Postgres/MinIO backups from running.
-export OPENIM_NETWORK="definitely-not-a-real-network-$$"
 
 certs_dir="tmp/backup-test-certs-$$"
 
@@ -127,13 +124,6 @@ services:
       backup-s3-init: { condition: service_completed_successfully }
 
   backup:
-    env_file: !override
-      - $tmp_env
-
-  # Never started here (profile-gated), but compose validates env_file paths for
-  # EVERY service while parsing, so the operator's real .env.backup would become
-  # a hard requirement for running this test. Point it at the test env instead.
-  backup_mongo:
     env_file: !override
       - $tmp_env
 EOF

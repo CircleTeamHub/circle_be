@@ -11,17 +11,17 @@ restore drill that proves it works.
 
 ## The risk this mitigates
 
-`pg_data` and `minio_data` are docker volumes on **one box**. OpenIM's Mongo —
-which holds **every chat message** — is a volume on that same box, in a separate
-compose stack. One `docker compose down -v`, one bad disk, one compromised root,
-and the business data *and* the entire chat history are gone at the same instant,
+`pg_data` and `minio_data` are docker volumes on **one box**. Chat history is not
+a separate store — the self-hosted chat stack keeps its three tables in the same
+business Postgres — so one `docker compose down -v`, one bad disk, one compromised
+root takes the business data *and* the entire chat history at the same instant,
 with no second copy anywhere.
 
 Before this, the only thing resembling a backup was the `pg_dump` in
 `deploy/release-deploy.sh` (~line 271), which writes to `$HOME/circle_be_backups`
 **on the same host**. That is a migration-rollback aid, not a backup: it dies with
-the disk, it only runs at deploy time, and it does not cover MinIO or Mongo. It is
-still there and still useful for its actual job — this system does not replace it.
+the disk, it only runs at deploy time, and it does not cover MinIO. It is still
+there and still useful for its actual job — this system does not replace it.
 
 Off-host is the entire point. Everything below follows from that.
 
@@ -31,15 +31,14 @@ Off-host is the entire point. Everything below follows from that.
 
 | Store | Contents | Method | Destination prefix |
 |---|---|---|---|
-| **Postgres** (`pg_data`) | All business data | pgBackRest: weekly full + daily differential + **continuous WAL archiving** | `/pgbackrest` |
+| **Postgres** (`pg_data`) | All business data **and every chat message** (`ChatConversation` / `ChatMember` / `ChatMessage`) | pgBackRest: weekly full + daily differential + **continuous WAL archiving** | `/pgbackrest` |
 | **MinIO** (`minio_data`) | Avatars, chat attachments, note media | `mc mirror` every 15 min | `/minio/<bucket>` |
-| **OpenIM Mongo** | **Every chat message** | `mongodump` hourly, age-encrypted | `/mongo` |
 
-OpenIM runs as a **separate compose stack** (`openim-docker`, per
-`docker-compose.prod.yml:5` and `DEPLOY.md` phase 5). It is a third-party upstream
-checkout and **nothing in it is modified**. The backup container joins its docker
-network from our side and reads with credentials the operator supplies. That is
-the whole integration.
+Two stores, not three: the retired OpenIM stack kept chat in its own Mongo and
+needed a separate hourly `mongodump` with its own credentials, network and
+encryption key. The self-hosted chat gateway writes to the business database, so
+chat history inherits Postgres's RPO (continuous WAL) for free — that hourly-dump
+gap is gone, along with the tooling that worked around it.
 
 ### What is deliberately NOT backed up
 
@@ -72,7 +71,7 @@ Target set by the owner: **RPO ≈ 15 min, RTO ≈ 1 hour.**
 |---|---|---|
 | **Postgres** | **≈ 60–90 s** (beats target) | `archive_timeout=60` forces a WAL segment switch every 60s even when the segment is not full; pgBackRest pushes it immediately. `scripts/test-backup-restore.sh` writes rows, waits out `archive_timeout` with **no** manual `pg_switch_wal()`, destroys PGDATA, restores, and asserts those exact rows come back. |
 | **MinIO objects** | **≈ 15 min** (meets target) | `mc mirror` runs every 15 min. Worst case a file uploaded just after a run is lost if the box dies before the next one. |
-| **OpenIM chat history** | **≈ 1 hour** ❗ **misses the 15-min target** | Hourly `mongodump`. See below — this is a real, documented gap, not an oversight. |
+| **Chat history** | **same as Postgres** (beats target) | Not a separate store — `ChatMessage` and friends are ordinary tables in the business database, so WAL archiving covers them. |
 
 **RTO ≈ 1 hour** is met for Postgres by construction: a differential restore
 fetches the last full + **one** differential (not a week of incrementals), then
@@ -82,28 +81,11 @@ trading a little storage for a much shorter restore. Actual RTO is dominated by
 download bandwidth from the destination, so **size the destination for restore
 speed, not just cost** (R2 has zero egress fees, which matters here).
 
-### RPO gap: chat history
-
-**Chat-history RPO equals the mongodump interval, and cannot be made continuous
-without changing the OpenIM stack.**
-
-OpenIM's mongod is started as a **standalone** — verified against the running
-container, its command is `mongod --wiredTigerCacheSizeGB N --auth` with **no
-`--replSet`**. A standalone mongod has **no oplog**, and without an oplog:
-
-- `mongodump --oplog` does not work,
-- there is no point-in-time recovery,
-- there is nothing to tail for continuous capture.
-
-So the only lever is dump frequency, and each dump is a **full** dump. The default
-is hourly (`BACKUP_CRON_MONGO=0 * * * *`) as the balance between RPO and cost;
-lower it if the dump is small and fast enough, and watch the destination bill.
-
-Closing this gap properly requires converting OpenIM's Mongo to a single-node
-replica set (`--replSet`) to get an oplog. That is a change to the third-party
-`openim-docker` stack, which is **explicitly out of scope** here. It is the right
-follow-up if a 15-min RPO on chat history is a hard requirement — track it
-separately.
+> Historical note: under the retired OpenIM stack chat history sat in a standalone
+> mongod (no `--replSet` ⇒ no oplog ⇒ no point-in-time recovery), so its RPO was
+> stuck at the hourly full-dump interval and **missed the 15-min target**. Moving
+> chat into Postgres closed that gap as a side effect; there is no longer a store
+> in this system with a worse RPO than WAL archiving.
 
 **Trade-off you are accepting elsewhere:** if `archive_command` starts failing
 (destination down, credentials rotated), WAL accumulates in `pg_wal` until the
@@ -189,8 +171,6 @@ instead:
 # Retention MUST be shorter than BACKUP_PG_RETENTION_FULL (see the warning below)
 wrangler r2 bucket lock add YOUR-BACKUP-BUCKET \
   --name pgbackrest-immutable --prefix pgbackrest/ --retention-days 30
-wrangler r2 bucket lock add YOUR-BACKUP-BUCKET \
-  --name mongo-immutable --prefix mongo/ --retention-days 30
 ```
 
 Then create a **scoped API token** (R2 → Manage API Tokens) with *Object
@@ -210,8 +190,7 @@ compromised S3 credential cannot remove them, which is exactly what we want.
 > ⚠️ **Never put a lifecycle expiry rule on the `pgbackrest/` prefix.** pgBackRest
 > maintains its own manifest; lifecycle deleting objects behind its back silently
 > corrupts the backup set, and you find out at restore time. Retention there is
-> `pgbackrest expire`'s job **only**. Lifecycle rules on `mongo/` are fine (those
-> are independent files), and `minio/` never deletes anything by design.
+> `pgbackrest expire`'s job **only**. `minio/` never deletes anything by design.
 
 ### 3. A read-only MinIO user for the source
 
@@ -232,66 +211,34 @@ mc admin policy attach local circle-backup-ro --user circle-backup
 
 Put that access key / secret in `BACKUP_MINIO_ACCESS_KEY` / `BACKUP_MINIO_SECRET_KEY`.
 
-### 4. An age keypair for the Mongo dumps
+> Note on encryption asymmetry: pgBackRest encryption is **symmetric**, because it
+> must read the repo to build differentials. The server therefore holds
+> `BACKUP_PG_CIPHER_PASS` and can decrypt its own Postgres repo. That is inherent
+> to pgBackRest, not an oversight. The object mirror relies on the destination's
+> server-side encryption at rest rather than client-side encryption, because
+> `mc mirror` copies bytes as-is — those are the same media files the app already
+> serves.
 
-**Generate this on your workstation, never on the server.**
-
-```bash
-age-keygen -o circle-backup-age.key      # keep OFF the server, in a password manager
-grep 'public key' circle-backup-age.key  # -> age1... goes in BACKUP_AGE_RECIPIENT
-```
-
-Only the **public** key goes on the server. The dumps are encrypted to it, so a
-full compromise of the box cannot decrypt any existing chat-history backup. The
-private key is needed only at restore time (`restore-mongo.sh --identity`).
-
-> The Postgres repo does **not** have this property: pgBackRest encryption is
-> symmetric, because it must read the repo to build differentials. The server
-> therefore holds `BACKUP_PG_CIPHER_PASS` and can decrypt its own Postgres repo.
-> That is inherent to pgBackRest, not an oversight. The object mirror relies on
-> the destination's server-side encryption at rest rather than client-side
-> encryption, because `mc mirror` copies bytes as-is — those are the same media
-> files the app already serves.
-
-### 5. `.env.backup` and `.env.backup.mongo`
+### 4. `.env.backup`
 
 ```bash
-cp .env.backup.example       .env.backup       && chmod 600 .env.backup
-cp .env.backup.mongo.example .env.backup.mongo && chmod 600 .env.backup.mongo   # only if backing up OpenIM
+cp .env.backup.example .env.backup && chmod 600 .env.backup
 ```
 
-**Two files, on purpose.** `docker compose` injects an `env_file` into a service
-wholesale, so every variable in it is readable from inside that container.
-`.env.backup` is loaded by all three services — including `postgres`, which is
-the container most exposed to application traffic. `BACKUP_MONGO_URI` is the
-password to *another system's* database holding every chat message, so it lives
-in `.env.backup.mongo`, which only `backup_mongo` loads. Compromising our
-Postgres should not hand over OpenIM's chat database with it.
+Loaded by both services in the overlay (`postgres` and `backup`), so it must hold
+only what both may see. `docker compose` injects an `env_file` into a service
+wholesale — every variable in it is readable from inside that container, including
+`postgres`, which is the container most exposed to application traffic.
 
-> Remaining trade-off, stated rather than hidden: `postgres` still receives the
-> MinIO source credentials from `.env.backup`. They are read-only and scoped to
-> a bucket whose contents postgres can already reference, so the marginal
-> exposure is small — unlike the Mongo URI, which reaches a different system.
+> Trade-off, stated rather than hidden: `postgres` receives the MinIO source
+> credentials from `.env.backup`. They are read-only and scoped to a bucket whose
+> contents postgres can already reference, so the marginal exposure is small.
 
 Fill in every value. There are no defaults for credentials, deliberately: a
-default credential is a published credential. (The `openim-docker` stack next
-door ships `openIM123` as the default for four separate secrets. If your OpenIM
-Mongo still uses it, **change it there before** pointing this at it — otherwise
-your chat-history backup is protected by a password published in a public repo.)
+default credential is a published credential.
 
 **`BACKUP_PG_CIPHER_PASS` is not recoverable.** Lose it and every Postgres backup
 is permanently unreadable. Put it in a password manager before you continue.
-
-**`OPENIM_NETWORK` goes in `.env`, not in either file above.** It is a top-level
-compose interpolation (`networks.openim.name`), and compose resolves those from
-`.env` or the shell **only** — never from a service's `env_file`. Setting it in
-`.env.backup` silently does nothing and you fall back to the default
-`openim-docker_openim`:
-
-```bash
-docker network ls                                    # find the real name
-echo 'OPENIM_NETWORK=<name>' >> .env
-```
 
 ---
 
@@ -301,12 +248,6 @@ Backups are an **opt-in overlay**. The base stack is unchanged without it.
 
 ```bash
 docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
-```
-
-To include the chat-history backup, add the profile to `.env`:
-
-```
-COMPOSE_PROFILES=bundled-redis,openim-backup
 ```
 
 > ⚠️ **Make the overlay sticky.** Enabling archiving means postgres is recreated
@@ -342,7 +283,6 @@ Run jobs by hand at any time:
 ```bash
 docker compose ... run --rm backup run pg-full   # full backup now
 docker compose ... run --rm backup run minio     # mirror objects now
-docker compose ... run --rm backup run mongo     # dump chat history now
 docker compose ... run --rm backup run drill     # restore drill
 ```
 
@@ -356,7 +296,6 @@ knowing exactly what a passing check proves.
 | Postgres WAL archiving | `pgbackrest check` forces a segment switch and confirms it landed | overlay dropped (`archive_mode` back to off), expired S3 credentials |
 | Postgres backup freshness | newest `stop` timestamp in `pgbackrest info`, fails over 48h | a stalled or crash-looping schedule |
 | Destination reachability | `mc ls` on the destination bucket | rotated/revoked `BACKUP_S3_*` |
-| **Chat-history freshness** | newest object under `mongo/`, fails over `BACKUP_CHECK_MONGO_MAX_AGE` (default `3h`) | the mongo dump failing every run — see below |
 | **Source MinIO readability** | `mc ls` on the source bucket | rotated `BACKUP_MINIO_*`, which breaks every mirror run |
 
 **Not checked, by design:** object-mirror freshness. The mirror only creates
@@ -364,10 +303,9 @@ objects when users upload, so "nothing new this hour" is indistinguishable from
 a broken mirror. The source-credential probe above is the closest proxy; the
 drill is what actually proves the objects are there.
 
-The chat-history check is deliberately conditional on `mongo/` being non-empty:
-`backup_mongo` is profile-gated and legitimately absent until OpenIM is deployed
-(DEPLOY.md stage 5), and a job that was never enabled must not raise an alarm.
-Once a single dump exists, the schedule is assumed live and staleness fails.
+Chat history has no check of its own: it lives in the same Postgres the first two
+rows already cover, so a passing WAL/freshness check is a passing chat-history
+check.
 
 ---
 
@@ -429,33 +367,11 @@ Last verified result:
 250 of those 750 were archived solely by `archive_timeout`, with no manual
 `pg_switch_wal()` — that is the measurement the RPO number rests on.
 
-### Chat-history proof (separate script)
+Chat history needs no separate proof: `ChatConversation` / `ChatMember` /
+`ChatMessage` are ordinary tables in that same database, so the round trip above
+restores them along with everything else.
 
-The Postgres round trip says nothing about Mongo, so the chat-history path has
-its own end-to-end test. It seeds a throwaway mongod, runs the real
-`backup-mongo.sh` through `run mongo`, then **decrypts with the age private key
-and restores into a second database** to compare document counts — proving the
-archive is genuinely restorable rather than merely present and plausibly sized.
-
-```bash
-scripts/test-mongo-backup.sh
-```
-
-It also pins down the two failure modes that are otherwise invisible:
-
-```
-round trip             : 500 / 500 documents, decrypted with the age private key
-failed dump            : left 0 objects behind
-stale-dump alarm       : fires
-never-enabled job      : stays quiet
-```
-
-Useful numbers it establishes, which is where `BACKUP_MONGO_MIN_BYTES` gets its
-default: an age-wrapped **empty** archive is **200 bytes**, and 500 small
-documents come to **3810 bytes**. If your own dumps ever approach the floor,
-lower it rather than letting a real backup be discarded as empty.
-
-### Object-mirror proof (third script)
+### Object-mirror proof (second script)
 
 The object path has its own test too, because the two round trips above say
 nothing about user media. It seeds the app's real MinIO, runs `backup-minio.sh`
@@ -522,17 +438,7 @@ restore. Use the root credentials for this, once.
 
 ### Chat history
 
-Needs the age **private** key, which is not on the server. Mount it read-only for
-the restore and take it away afterwards:
-
-```bash
-docker compose ... run --rm --no-deps \
-  -v /path/to/circle-backup-age.key:/key:ro backup \
-  /opt/backup/restore-mongo.sh --identity /key
-```
-
-`--key` selects a specific dump (default: the most recent). `--drop` replaces
-collections instead of merging into them.
+No separate procedure — restoring Postgres restores it.
 
 ---
 
@@ -561,22 +467,12 @@ collections instead of merging into them.
   in backups via a retention window; decide the retention you want and add a
   lifecycle rule on `minio/` accordingly. This is a policy decision, not a
   technical one, and it is not made for you here.
-- **The three stores are not mutually consistent.** Postgres, objects, and chat
-  history are captured on independent schedules; a restore can land a Postgres
-  row referencing an object that the mirror had not copied yet. Given the data
-  model (objects are immutable and referenced by UUID) the failure mode is a
-  broken media link, not corruption. A cross-store consistent snapshot would need
+- **The two stores are not mutually consistent.** Postgres and objects are
+  captured on independent schedules; a restore can land a Postgres row
+  referencing an object that the mirror had not copied yet. Given the data model
+  (objects are immutable and referenced by UUID) the failure mode is a broken
+  media link, not corruption. A cross-store consistent snapshot would need
   coordinated quiescing and is not worth it here.
-- **A failed Mongo dump deletes its own object.** `mongodump | age | mc pipe` is
-  not safe on its own: if `mongodump` dies, `age` still sees a clean EOF and
-  emits a *structurally valid* archive wrapping zero bytes, which `mc pipe`
-  uploads. `pipefail` fails the run, but the object is already in the bucket —
-  and `restore-mongo.sh` without `--key` picks the **newest** object under
-  `mongo/`, which is exactly that one. So the upload runs under `if !`, and any
-  failure (or an object below `BACKUP_MONGO_MIN_BYTES`) is deleted again before
-  the script exits non-zero. If the delete itself fails — an object-lock window
-  can legitimately block it — the log says so explicitly and the object must be
-  removed by hand before the next restore.
 - **Single repo.** One destination bucket, one provider. If that provider loses
   the bucket, there is no third copy. A second `repo2-*` destination is a
   supported pgBackRest configuration if that risk ever matters.

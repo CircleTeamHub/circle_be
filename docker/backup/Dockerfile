@@ -1,4 +1,4 @@
-# Backup toolbox — one image that can reach all three stateful stores.
+# Backup toolbox — one image that can reach both stateful stores.
 #
 # Base is postgres:16-alpine on purpose:
 #   * pgbackrest comes from the same Alpine repo as docker/postgres/Dockerfile,
@@ -9,10 +9,7 @@
 #
 # Tools and why:
 #   pgbackrest     Postgres full/incr backup + WAL archive to S3 (encrypted).
-#   mongodb-tools  mongodump/mongorestore for OpenIM's Mongo (all chat history).
 #   mc             MinIO's own client; mirrors the object bucket off-host.
-#   age            Encrypts the Mongo dump to a PUBLIC key, so this host cannot
-#                  decrypt its own backups. See docs/backups.md.
 FROM minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc
 
 FROM postgres:16-alpine
@@ -23,8 +20,6 @@ COPY --from=mc /usr/bin/mc /usr/local/bin/mc
 
 RUN apk add --no-cache \
       pgbackrest \
-      mongodb-tools \
-      age \
       bash \
       tzdata \
     && mkdir -p /var/log/pgbackrest /var/spool/pgbackrest /var/log/circle-backup \

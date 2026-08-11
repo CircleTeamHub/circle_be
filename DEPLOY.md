@@ -518,7 +518,7 @@ $S3 s3api get-object --bucket <bucket> \
 |---|---|
 | **RPO = 一次发版** | 备份只在发版时产生。两次发版之间(可能几天到几周)写入的数据,VPS 挂掉就没了。要更小的 RPO 得另做定时备份或 WAL 归档(pgBackRest / WAL-G)。 |
 | **MinIO 对象** | 头像、图片、附件全在 `minio_data` 卷里,**完全没有异地副本**。只恢复数据库的话,这些引用会变成坏链。 |
-| **聊天记录** | 自研 chat 存业务 PostgreSQL,随数据库备份一并覆盖(旧 OpenIM Mongo 栈退役)。 |
+| **聊天记录** | 自研 chat 的三张表就在业务 PostgreSQL 里,随数据库备份一并覆盖。 |
 | **Redis** | 内置 Redis 只做缓存/限流,故意不备份。 |
 | **自动恢复验证** | 没有任何自动化在验证备份可用。上面的演练要人去跑。 |
 
@@ -647,9 +647,6 @@ cd ~/openim-docker && docker compose down   # 确认新栈跑通后再执行;卷
 cp .env.backup.example .env.backup && chmod 600 .env.backup   # 填好再启用
 docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml up -d
 ```
-
-> 遗留:`openim-backup` profile(OpenIM Mongo 每小时加密 dump)仅在退役前的旧栈
-> 迁移期有用 —— 新聊天数据全在 Postgres,不再需要它;旧栈 down 掉后请勿启用该 profile。
 
 > 注意:备份是**可选 overlay**。不叠加 `docker-compose.backup.yml` 时基础栈行为完全不变;
 > 但反过来,叠加启用后若某次只用 `-f docker-compose.prod.yml up -d`,postgres 会被按基础

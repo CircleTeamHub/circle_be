@@ -5,7 +5,7 @@
 ## 项目概览
 
 - 技术栈：NestJS 11 + Prisma 7 + PostgreSQL 16
-- 包管理器：pnpm
+- 包管理器：npm（仓库里只有 `package-lock.json`，CI 走 `npm ci`）
 - 认证方案：`accessToken + refreshToken`
 - 接口文档：Swagger
 - 数据查看：Prisma Studio
@@ -43,7 +43,7 @@ test/
 ## 环境要求
 
 - Node.js 20+
-- pnpm 10+
+- npm 10+
 - Docker / Docker Compose
 
 ## 环境变量
@@ -77,26 +77,33 @@ test/
 1. 安装依赖
 
 ```bash
-pnpm install
+npm ci
 ```
 
-2. 启动 PostgreSQL
+> 用 `npm ci` 而不是 `npm install`：在已有的旧 `node_modules` 上 `install` 会留下残缺依赖树
+> （典型症状是 `request-ip` 解析不出类型、`nest` 编译报 TS2307），CI 走的也是 `npm ci`。
+
+2. 启动本地依赖容器（PostgreSQL / MinIO / Redis）
 
 ```bash
-docker compose down -v
 docker compose up -d
 ```
 
-3. 同步开发库表结构
+> 加 `-v` 的 `docker compose down -v` 会连数据卷一起删，只在需要把本地库推倒重来时用。
+
+3. 应用数据库迁移
 
 ```bash
-NODE_ENV=development pnpm exec prisma db push
+NODE_ENV=development npx prisma migrate deploy
 ```
+
+> 本项目是迁移驱动的（`prisma/migrations/`），不要用 `prisma db push` —— 它会绕开迁移历史
+> 直接改表结构，之后 `migrate deploy` 会因为 drift 失败。
 
 4. 启动项目
 
 ```bash
-pnpm start
+npm run start:dev
 ```
 
 启动后默认地址：
@@ -109,18 +116,28 @@ pnpm start
 启动 Prisma Studio：
 
 ```bash
-NODE_ENV=development pnpm run prisma:studio
+NODE_ENV=development npm run prisma:studio
 ```
 
 默认打开：
 
 - Prisma Studio：`http://localhost:5555`
 
-## Docker 数据库说明
+## Docker 本地依赖说明
 
-[docker-compose.yml](docker-compose.yml) 会启动一个 PostgreSQL 16 容器。
+[docker-compose.yml](docker-compose.yml) 启动三个服务，都只服务本地开发（应用本体跑在宿主机上，
+这样才有 `start:dev` 的热重载和断点）：
 
-默认连接参数：
+| 服务 | 端口 | 说明 |
+| --- | --- | --- |
+| `postgres` | 5432 | PostgreSQL 16，业务库 |
+| `minio` | 9000 / 9001 | S3 对象存储，9001 是控制台（`minioadmin` / `minioadmin123`）。bucket 由应用启动时自建，无需手工初始化 |
+| `redis` | 6379 | 可选。`.env.development` 里**不配** `REDIS_URL` 时应用会退化成单实例内存态（实时推送和限流不跨进程共享），本地一般够用；要验证跨实例行为才需要配上 |
+
+生产侧的完整编排（含应用、迁移、admin_web、Caddy、蓝绿）在
+[docker-compose.prod.yml](docker-compose.prod.yml)，部署流程见 [DEPLOY.md](DEPLOY.md)。
+
+PostgreSQL 默认连接参数：
 
 - Host：`localhost`
 - Port：`5432`
@@ -132,18 +149,21 @@ NODE_ENV=development pnpm run prisma:studio
 - `nestjs_dev`
 - `nestjs_test`
 
+`.env.development` 里的 `DATABASE_URL` 需要指向其中之一（通常是 `nestjs_dev`）；指向别的库名时
+容器初始化脚本不会替你建，`migrate deploy` 会直接连不上。
+
 ## 常用命令
 
 ```bash
-pnpm start
-pnpm start:dev
-pnpm build
-pnpm lint
-pnpm test
-pnpm test:e2e
-pnpm exec prisma generate
-pnpm exec prisma db push
-pnpm run prisma:studio
+npm start
+npm run start:dev
+npm run build
+npm run lint
+npm test
+npm run test:e2e
+npx prisma generate
+npx prisma migrate deploy
+npm run prisma:studio
 ```
 
 ## 认证说明
@@ -178,5 +198,5 @@ pnpm run prisma:studio
 - 如果你修改了 [schema.prisma](prisma/schema.prisma)，请重新执行：
 
 ```bash
-pnpm exec prisma generate
+npx prisma generate
 ```
