@@ -16,6 +16,8 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
@@ -79,6 +81,8 @@ export class CircleInvitationService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
+    private readonly chatService: ChatService,
+    private readonly chatMessages: ChatSystemMessageService,
   ) {}
 
   /**
@@ -306,6 +310,79 @@ export class CircleInvitationService {
     });
 
     await this.createAndBroadcastInvitationNotification(notificationData);
+    await this.issueVerificationCard({
+      invitationId,
+      circleId: notificationData.fromCircleID,
+      // 上面的 ApplicantOnly 检查已经保证 callerId 就是申请人本人。
+      applicantId: callerId,
+      verifierId,
+    });
+  }
+
+  /**
+   * 验证邀请卡片:席位提交之后由服务端签发给验证人。
+   *
+   * 为什么不是客户端发:verification-card 断言的是「这个人被邀请当验证人」这个
+   * 服务端事实,客户端能发就等于能凭空捏造它 —— 所以它在 SERVER_MESSAGE_TYPES 里,
+   * 客户端发一律被 validateSendPayload 拒。SelectVerifierScreen 以前正是这么发的,
+   * 失败还被 best-effort 的 catch 吞掉,于是这张卡从来没送达过。
+   *
+   * 为什么在事务外:insertServerMessage 自带事务并在成功后广播。放进邀请事务里,
+   * 一次回滚就等于把一条并不存在的验证请求广播给了对方。
+   *
+   * 为什么失败不抛:席位已经落库。为一张发不出去的卡把请求判失败,申请人会重试,
+   * 而重试撞 @@unique([invitationID, verifierID]) → AlreadyVerifier 冲突,
+   * 表现成「加不进去也退不掉」。卡片是站内通知之外的第二条通道,可降级 ——
+   * 与本类其它提交后副作用(见 createAndBroadcastInvitationNotification)同一取舍。
+   *
+   * clientMessageId 取 (invitationId, verifierId),与
+   * CircleInvitationVerifier 的唯一约束同源:一个邀请里同一个验证人只有一席,
+   * 卡片也就只该有一张;重试撞
+   * (conversationID, senderID, clientMessageId) 唯一约束时合并,不重复广播。
+   */
+  private async issueVerificationCard(params: {
+    invitationId: string;
+    circleId: string;
+    applicantId: string;
+    verifierId: string;
+  }): Promise<void> {
+    try {
+      // 名字只是卡面文案 —— 取不到就留空,卡片的实际价值是那个 invitationId 深链。
+      const [circle, applicant] = await Promise.all([
+        this.prisma.circle.findUnique({
+          where: { id: params.circleId },
+          select: { name: true },
+        }),
+        this.prisma.user.findUnique({
+          where: { id: params.applicantId },
+          select: { nickname: true },
+        }),
+      ]);
+      // 走结算专用解析:与转账卡同一判据 —— 不过拉黑/陌生人消息那两道闸,
+      // 那是给用户主动发消息设的,而这里是一条已经发生的邀请的回执。
+      const conversationId =
+        await this.chatService.ensureDirectConversationForSettlement(
+          params.applicantId,
+          params.verifierId,
+        );
+      await this.chatMessages.insertServerMessage(conversationId, {
+        senderID: params.applicantId,
+        type: 'verification-card',
+        content: {
+          invitationId: params.invitationId,
+          circleName: circle?.name ?? '',
+          applicantName: applicant?.nickname ?? '',
+        },
+        clientMessageId: `verification_card_${params.invitationId}_${params.verifierId}`,
+        push: true,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `verification card issuance failed invitation=${params.invitationId} verifier=${params.verifierId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async respond(

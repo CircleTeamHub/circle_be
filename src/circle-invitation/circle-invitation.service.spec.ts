@@ -7,6 +7,8 @@ import { NotificationService } from 'src/notification/notification.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
 describe('CircleInvitationService', () => {
@@ -69,6 +71,8 @@ describe('CircleInvitationService', () => {
   };
   const memberLock = { lock: jest.fn() };
   const chatCircleSync = { ensureCircleConversation: jest.fn() };
+  const chatService = { ensureDirectConversationForSettlement: jest.fn() };
+  const chatMessages = { insertServerMessage: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -78,6 +82,8 @@ describe('CircleInvitationService', () => {
     admissionPolicy.assertCanApply.mockResolvedValue(undefined);
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
+    chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
+    chatMessages.insertServerMessage.mockResolvedValue({ id: 'msg-1' });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -89,6 +95,8 @@ describe('CircleInvitationService', () => {
         { provide: CircleAdmissionPolicy, useValue: admissionPolicy },
         { provide: CircleMemberLockService, useValue: memberLock },
         { provide: ChatCircleSyncService, useValue: chatCircleSync },
+        { provide: ChatService, useValue: chatService },
+        { provide: ChatSystemMessageService, useValue: chatMessages },
       ],
     }).compile();
 
@@ -745,6 +753,124 @@ describe('CircleInvitationService', () => {
         fromInvitation: expect.objectContaining({ id: 'inv-1' }),
       }),
     );
+  });
+
+  // ─── 验证邀请卡片:服务端签发 ──────────────────────────────────────────────
+  //
+  // 卡片以前由 SelectVerifierScreen 在客户端发。verification-card 在后端的
+  // SERVER_MESSAGE_TYPES 里(客户端能发 = 能凭空捏造「这人被邀请当验证人」),
+  // 于是那次发送 100% 被 validateSendPayload 拒,还被 best-effort 的 catch 吞掉
+  // —— 验证人从来收不到这张卡(与转账卡不同,这里连补偿 cron 都没有)。
+  describe('verification card issuance', () => {
+    function arrangeAddVerifier() {
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        verifiers: [],
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.circle.findUnique.mockResolvedValue({ name: 'Trusted Circle' });
+      prisma.user.findUnique.mockResolvedValue({ nickname: 'Applicant' });
+      notificationService.createCircleInvitationNotification.mockResolvedValue(
+        null,
+      );
+    }
+
+    it('issues the card to the verifier once the invitation commits', async () => {
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      // 会话是「申请人 → 验证人」的单聊,与客户端此前发卡的收件人一致。
+      expect(
+        chatService.ensureDirectConversationForSettlement,
+      ).toHaveBeenCalledWith('applicant-1', 'verifier-9');
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
+        senderID: 'applicant-1',
+        type: 'verification-card',
+        content: {
+          invitationId: 'inv-1',
+          circleName: 'Trusted Circle',
+          applicantName: 'Applicant',
+        },
+        clientMessageId: 'verification_card_inv-1_verifier-9',
+        push: true,
+      });
+    });
+
+    it('issues the card only after the invitation transaction commits', async () => {
+      // 事务里签发的话:回滚掉的邀请已经把卡片广播出去了 —— 验证人点进去
+      // 会看到一条并不存在的验证请求。
+      arrangeAddVerifier();
+      const order: string[] = [];
+      prisma.$transaction.mockImplementation(async (input: any) => {
+        const result = await input(prisma);
+        order.push('commit');
+        return result;
+      });
+      chatMessages.insertServerMessage.mockImplementation(async () => {
+        order.push('card');
+        return { id: 'msg-1' };
+      });
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(order).toEqual(['commit', 'card']);
+    });
+
+    it('does not fail addVerifier when card issuance fails', async () => {
+      // 验证人席位已经落库了。为一张发不出去的卡把请求判失败,申请人会重试,
+      // 而重试撞 (invitationID, verifierID) 唯一约束 → AlreadyVerifier 冲突,
+      // 表现为「加不进去也取消不掉」。卡片是通知之外的第二条通道,可降级。
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalled();
+    });
+
+    it('keys the card on (invitation, verifier) so a retry cannot double-post', async () => {
+      // 与 CircleInvitationVerifier 的 @@unique([invitationID, verifierID]) 同源:
+      // 一个邀请里同一个验证人只可能有一席,卡片也就只该有一张。
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      const [, input] = chatMessages.insertServerMessage.mock.calls[0] as [
+        string,
+        { clientMessageId: string },
+      ];
+      expect(input.clientMessageId).toBe('verification_card_inv-1_verifier-9');
+    });
+
+    it('still issues the card when the circle or applicant lookup comes back empty', async () => {
+      // 名字只是卡面文案,取不到不该让整张卡消失 —— 卡片的实际价值是那个
+      // invitationId 深链。
+      arrangeAddVerifier();
+      prisma.circle.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+        'dm-1',
+        expect.objectContaining({
+          content: {
+            invitationId: 'inv-1',
+            circleName: '',
+            applicantName: '',
+          },
+        }),
+      );
+    });
   });
 
   it('does not fail addVerifier when notification delivery fails', async () => {
