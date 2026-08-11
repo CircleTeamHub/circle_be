@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
@@ -77,7 +77,12 @@ export class SupportAgentInputDto {
   @Max(9999)
   sortOrder: number;
 
+  // 全局 ValidationPipe 开着 enableImplicitConversion(src/setup.ts),它会把任意
+  // 非空字符串转成 true —— `enabled: "false"` 会被静默当成「启用」,管理员以为停用了
+  // 某个客服、它其实还在线上接待。@Transform 读转换前的原值,让 @IsBoolean 能看见
+  // 真实类型并拒绝掉。
   @ApiPropertyOptional({ default: true })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.enabled)
   @IsOptional()
   @IsBoolean()
   enabled?: boolean;

@@ -1,7 +1,11 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { SupportErrorCode } from 'src/common/app-error-codes';
 import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
+import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+
+// 覆盖式写入的串行化锁。整表只有一份配置,所以固定一个 key 就够。
+const SUPPORT_AGENTS_LOCK_KEY = 'support-agents-replace';
 import {
   AdminSupportAgentDto,
   SUPPORT_AGENT_CATEGORIES,
@@ -109,6 +113,15 @@ export class SupportService {
     await this.assertUsersUsable(input);
 
     await this.prisma.$transaction(async (tx) => {
+      // 两个管理员同时提交时,默认隔离级别下双方都会读到同一份 before 快照,
+      // 各自只删自己快照里、payload 外的行 —— 最终落库的是两份 payload 的并集,
+      // 而这个组合谁都没提交过。用与会员开关同款的事务级 advisory lock 串行化。
+      await tx.$executeRaw(Prisma.sql`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(${SUPPORT_AGENTS_LOCK_KEY}, 0)
+        )
+      `);
+
       const before = await tx.supportAgent.findMany({
         select: {
           category: true,
