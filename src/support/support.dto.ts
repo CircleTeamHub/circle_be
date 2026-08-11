@@ -109,8 +109,13 @@ export class ReplaceSupportAgentsDto {
 
   // 读到这份配置时的 revision。整表覆盖没有它就是「最后保存的人赢」:开着旧页签的
   // 管理员一保存,另一个人刚存的改动会被整个抹掉,双方都收不到任何提示。
-  @ApiProperty({ description: 'GET 返回的 revision，原样回传' })
+  //
+  // 过渡期先做成可选:后端与管理台是分开部署的,一上来就必填会让「新后端 + 旧管理台」
+  // 这段窗口里的每一次保存都 400。缺省时退回旧行为(不做并发校验),等管理台版本铺开后
+  // 再由后续一个后端版本改成必填。带上它的客户端立刻就受保护。
+  @ApiPropertyOptional({ description: 'GET 返回的 revision，原样回传' })
+  @IsOptional()
   @IsString()
   @IsNotEmpty()
-  expectedRevision: string;
+  expectedRevision?: string;
 }

@@ -67,6 +67,34 @@ describe('SupportService', () => {
     });
   });
 
+  describe('listForAdminWithRevision', () => {
+    // agents 与 revision 必须来自同一次查询。分成两条独立查询时,期间若有别人提交
+    // 成功,就可能返回「旧 agents + 新 revision」—— 这份陈旧列表随后能通过冲突校验,
+    // 把更新的配置覆盖掉,正是 revision 想拦的事。
+    it('derives both the list and the revision from a single query', async () => {
+      const rows = [
+        {
+          category: 'recharge',
+          userID: 'u1',
+          sortOrder: 0,
+          enabled: true,
+          user: user('u1'),
+        },
+      ];
+      prisma.supportAgent.findMany.mockResolvedValue(rows);
+
+      const result = await service.listForAdminWithRevision();
+
+      expect(prisma.supportAgent.findMany).toHaveBeenCalledTimes(1);
+      expect(result.agents.map((a) => a.userID)).toEqual(['u1']);
+      expect(result.revision).toBe(
+        supportAgentsRevision([
+          { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+        ]),
+      );
+    });
+  });
+
   describe('replaceAgents', () => {
     const activeUsers = (ids: string[]) =>
       prisma.user.findMany.mockResolvedValue(
@@ -247,6 +275,40 @@ describe('SupportService', () => {
         replace([{ category: 'recharge', userID: 'u1', sortOrder: 1 }]),
       ).resolves.toBeDefined();
       expect(tx.supportAgent.upsert).toHaveBeenCalled();
+    });
+
+    // 过渡期兼容:后端与管理台分开部署,一上来就必填会让「新后端 + 旧管理台」
+    // 窗口里的每次保存都 400。缺省时退回旧行为,不做并发校验。
+    it('still applies a write that omits the revision (rolling-deploy window)', async () => {
+      activeUsers(['u1']);
+      beforeRows = [
+        { category: 'recharge', userID: 'other', sortOrder: 0, enabled: true },
+      ];
+
+      await service.replaceAgents(
+        operator,
+        [{ category: 'recharge', userID: 'u1', sortOrder: 0 }],
+        undefined,
+      );
+
+      expect(tx.supportAgent.upsert).toHaveBeenCalled();
+    });
+
+    // 两个管理员各自把表改成同样的结果 —— 后提交的那个是空操作,不该报冲突。
+    // 内容哈希的意义就在这里;报 409 会和上面 revisionOf 的文档自相矛盾。
+    it('accepts a stale save whose payload already equals the current state', async () => {
+      activeUsers(['u1']);
+      const target = {
+        category: 'recharge' as const,
+        userID: 'u1',
+        sortOrder: 0,
+      };
+      // 库里已经是目标状态了(别人先存的),而本次带的是更早的 revision。
+      beforeRows = [{ ...target, enabled: true }];
+
+      await expect(
+        service.replaceAgents(operator, [target], supportAgentsRevision([])),
+      ).resolves.toBeDefined();
     });
 
     it('clears the table when given an empty payload', async () => {

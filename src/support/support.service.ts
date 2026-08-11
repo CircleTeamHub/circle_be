@@ -103,22 +103,14 @@ export class SupportService {
     return { agents };
   }
 
-  private async currentRevision(
-    db: Pick<PrismaService, 'supportAgent'> = this.prisma,
-  ): Promise<string> {
-    const rows = await db.supportAgent.findMany({
-      select: {
-        category: true,
-        userID: true,
-        sortOrder: true,
-        enabled: true,
-      },
-    });
-    return supportAgentsRevision(rows);
-  }
-
-  /** 管理台读取:含停用行,否则管理台无法把停用的客服改回启用。 */
-  async listForAdmin(): Promise<AdminSupportAgentDto[]> {
+  /**
+   * 管理台读取:含停用行(否则管理台无法把停用的客服改回启用),并带上 revision。
+   *
+   * agents 与 revision 必须来自**同一次查询**。分成两条独立查询时,若期间有别的
+   * 管理员提交成功,就可能返回「旧 agents + 新 revision」—— 这份陈旧列表随后能
+   * 通过冲突校验,把更新的配置覆盖掉,正好是 revision 想拦的事;反过来则是假 409。
+   */
+  async listForAdminWithRevision(): Promise<AdminSupportAgentsDto> {
     const rows = await this.prisma.supportAgent.findMany({
       orderBy: [
         { category: 'asc' },
@@ -127,27 +119,22 @@ export class SupportService {
       ],
       select: {
         category: true,
+        userID: true,
         sortOrder: true,
         enabled: true,
         user: { select: AGENT_USER_SELECT },
       },
     });
 
-    return rows.map((row) => ({
-      ...toView(row.user),
-      category: row.category as SupportAgentCategory,
-      sortOrder: row.sortOrder,
-      enabled: row.enabled,
-    }));
-  }
-
-  /** 管理台读取 + 版本号:写回时要带上它做乐观并发校验。 */
-  async listForAdminWithRevision(): Promise<AdminSupportAgentsDto> {
-    const [agents, revision] = await Promise.all([
-      this.listForAdmin(),
-      this.currentRevision(),
-    ]);
-    return { agents, revision };
+    return {
+      agents: rows.map((row) => ({
+        ...toView(row.user),
+        category: row.category as SupportAgentCategory,
+        sortOrder: row.sortOrder,
+        enabled: row.enabled,
+      })),
+      revision: supportAgentsRevision(rows),
+    };
   }
 
   /**
@@ -160,7 +147,7 @@ export class SupportService {
   async replaceAgents(
     operator: { userId: string; accountId: string },
     input: SupportAgentInputDto[],
-    expectedRevision: string,
+    expectedRevision: string | undefined,
   ): Promise<AdminSupportAgentsDto> {
     this.assertNoDuplicates(input);
     await this.assertUsersUsable(input);
@@ -189,7 +176,21 @@ export class SupportService {
       // 旧数据会一直停在那儿)保存一次,另一个管理员刚存的增删/顺序/启用状态就没了,
       // 而且双方都不会收到任何提示。版本对不上就 409,让管理台去重载并提示冲突。
       const actualRevision = supportAgentsRevision(before);
-      if (actualRevision !== expectedRevision) {
+      // 提交的内容如果**已经就是**库里现在的样子,这次写入是空操作 —— 两个管理员
+      // 各自把表改成同样的结果时不该互相判冲突(内容哈希的意义就在这里)。
+      const submittedRevision = supportAgentsRevision(
+        input.map((agent) => ({
+          category: agent.category,
+          userID: agent.userID,
+          sortOrder: agent.sortOrder,
+          enabled: agent.enabled ?? true,
+        })),
+      );
+      const stale =
+        expectedRevision !== undefined &&
+        actualRevision !== expectedRevision &&
+        actualRevision !== submittedRevision;
+      if (stale) {
         throw new ConflictException({
           message: '客服配置已被其他管理员修改，请刷新后重试',
           errorCode: SupportErrorCode.AgentsConflict,
