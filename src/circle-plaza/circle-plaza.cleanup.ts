@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { CirclePlazaService } from './circle-plaza.service';
 
 // Safety cap on batches drained per tick so a huge backlog can't make a single
@@ -39,6 +42,7 @@ export class CirclePlazaCleanup {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

@@ -125,14 +125,17 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
 | `circle_cron_last_success_timestamp_seconds{job}` | 任务**根本没在跑**（进程活着、调度器停了）      |
 | `circle_cron_interval_seconds{job}`           | 该任务的预期周期，供告警算 `3 × 周期` 的阈值        |
 | `circle_cron_last_duration_seconds{job}`      | 单次耗时（是否越来越慢、是否会与下一轮重叠）        |
+| `circle_cron_last_result{job}`                | 最近一次运行的结果，与执行频率无关                  |
 | `circle_outbox_pending{queue}`                | 仍会被重试的积压量                                  |
 | `circle_outbox_oldest_age_seconds{queue}`     | 最老一条待处理行的滞留时长 —— 队列到底有没有在排空  |
 | `circle_outbox_dead{queue}`                   | 已放弃、不会再重试的行（死信）                      |
+| `circle_outbox_last_probe_timestamp_seconds{queue}` | 该队列读数的新鲜度 —— 探测一直失败时它会变陈旧 |
 
-四个队列：`session_revocation`、`notification_push`、`friend_chat_replay`、
-`gift_card`（`CoinGift` 上的虚拟队列）。
+五个队列：`session_revocation`、`notification_push`、`friend_chat_replay`、
+`gift_card`（`CoinGift` 上的虚拟队列）、`verification_card`
+（`CircleInvitationVerifier` 上的虚拟队列，与前者同构）。
 
-两个关键设计，改动前务必先读懂：
+四个关键设计，改动前务必先读懂：
 
 1. **心跳在装饰期就播种成进程启动时刻**，不是等第一次成功。否则首次成功前序列
    不存在，`time() - metric > 阈值` 求值为空，一个从开机起就没跑过的任务反而
@@ -142,6 +145,17 @@ Prometheus 规则越界 → 发给它 → 去重 / 聚合 / 静默 / 路由。�
    `OutboxDepthService`（自身也是 `@TrackedCron`）每分钟刷新，gauge 只报最近
    一次读数。抓取时查库的话，数据库慢或挂掉会让整个 `/metrics` 卡到 scrape
    超时 —— 恰好在数据库事故期间，把 RED、事件循环、chat 延迟一并弄丢。
+
+3. **吞掉异常的任务必须显式上报失败**。多数任务把整轮工作包在 try/catch 里、
+   失败后正常返回。包装器只看「有没有抛」的话，持续故障期间它们每轮都算成功、
+   心跳照常前进 —— `CronJobFailing` 与 `CronJobStalled` 双双打不中。在 catch 里
+   调 `reportHandledJobFailure()`（靠 AsyncLocalStorage 绑定当前任务，不用写
+   任务名）。**循环内的单项 catch 不要调** —— 那是按设计的部分容错，整轮并没有
+   失败，而且积压指标已经覆盖。
+4. **探测新鲜度**。单个队列探测失败只丢它自己（整轮 reject 会让所有队列的序列
+   一起消失），代价是失败的队列会保留上一次读数不动而 `refresh()` 仍然成功。
+   `circle_outbox_last_probe_timestamp_seconds` 是那种情况下唯一的信号 ——
+   否则一个正在堆积的队列可以永远停在 0 上装健康。
 
 新增定时任务请用 `@TrackedCron(表达式, '任务名')` 而不是裸 `@Cron`；
 `src/metrics/tracked-cron.coverage.spec.ts` 会在 CI 上把漏用、重名、以及表达式

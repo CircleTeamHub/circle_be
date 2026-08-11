@@ -30,13 +30,19 @@ export interface JobMetrics {
    * 声明一个已知任务，并把心跳播种到 `nowMs`（默认现在）。重复调用只播种一次。
    */
   registerJob(job: string, options?: RegisterJobOptions): void;
+  /**
+   * 声明一个已知 outbox 队列，并把「上次成功探测时刻」播种到 nowMs。
+   * 与 registerJob 播种心跳同理：不播种的话，一个从开机起探测就一直失败的
+   * 队列没有序列，新鲜度告警反而永远不响。
+   */
+  registerOutboxQueue(queue: string, nowMs?: number): void;
   recordRun(
     job: string,
     result: JobRunResult,
     durationSeconds: number,
     nowMs?: number,
   ): void;
-  setOutboxDepth(sample: OutboxDepthSample): void;
+  setOutboxDepth(sample: OutboxDepthSample, nowMs?: number): void;
 }
 
 /** 任务名超预算后的归并桶 —— 约束 `job` / `queue` 的标签基数。 */
@@ -91,6 +97,13 @@ export function createJobMetrics(): JobMetrics {
     registers: [registry],
   });
 
+  const lastResult = new Gauge({
+    name: 'circle_cron_last_result',
+    help: 'Result of the most recent run of a scheduled job: 1 success, 0 failure.',
+    labelNames: ['job'],
+    registers: [registry],
+  });
+
   const intervalSeconds = new Gauge({
     name: 'circle_cron_interval_seconds',
     help: 'Expected seconds between runs of a scheduled job.',
@@ -108,6 +121,17 @@ export function createJobMetrics(): JobMetrics {
   const outboxOldestAge = new Gauge({
     name: 'circle_outbox_oldest_age_seconds',
     help: 'Age of the oldest unprocessed row in an outbox queue, 0 when empty.',
+    labelNames: ['queue'],
+    registers: [registry],
+  });
+
+  const outboxLastProbe = new Gauge({
+    name: 'circle_outbox_last_probe_timestamp_seconds',
+    help:
+      'Unix timestamp of the last successful depth probe for a queue. Goes ' +
+      "stale when that queue's probe keeps failing while the other queues " +
+      'keep succeeding — the gauges below would otherwise hold their last ' +
+      'reading (possibly 0) and look healthy forever.',
     labelNames: ['queue'],
     registers: [registry],
   });
@@ -132,6 +156,7 @@ export function createJobMetrics(): JobMetrics {
 
   // 心跳的权威副本留在闭包里，不去反射 prom-client 的内部结构。
   const heartbeatSeconds = new Map<string, number>();
+  const probedQueues = new Set<string>();
 
   const advanceHeartbeat = (job: string, seconds: number): void => {
     // 只进不退：并发/重叠执行时，一次早开始晚结束的运行不能把心跳拨回去，
@@ -154,18 +179,38 @@ export function createJobMetrics(): JobMetrics {
       // 播种的是心跳，不是「跑过一次」—— 刻意不碰 runsTotal，否则大盘上
       // 一个从没执行过的任务会显示成功率 100%。
       advanceHeartbeat(name, (options.nowMs ?? Date.now()) / 1000);
+      // last_result 播种为成功：从没跑过属于「停摆」，由 CronJobStalled 负责；
+      // 一开机就报红只会制造噪音。
+      lastResult.set({ job: name }, 1);
     },
 
     recordRun(job, result, durationSeconds, nowMs = Date.now()) {
       const name = clampName(job);
       runsTotal.inc({ job: name, result });
       lastDuration.set({ job: name }, durationSeconds);
+      // 与执行频率无关的失败信号：rate() 窗口对每天/每小时的任务不可靠
+      // （单次失败的增量在 for: 满足之前就滑出窗口）。
+      lastResult.set({ job: name }, result === 'success' ? 1 : 0);
       if (result !== 'success') return;
       advanceHeartbeat(name, nowMs / 1000);
     },
 
-    setOutboxDepth({ queue, pending, oldestAgeSeconds, dead }) {
+    registerOutboxQueue(queue, nowMs = Date.now()) {
       const name = clampName(queue);
+      if (probedQueues.has(name)) return;
+      probedQueues.add(name);
+      outboxLastProbe.set({ queue: name }, nowMs / 1000);
+    },
+
+    setOutboxDepth(
+      { queue, pending, oldestAgeSeconds, dead },
+      nowMs = Date.now(),
+    ) {
+      const name = clampName(queue);
+      probedQueues.add(name);
+      // 只有真的读到数才推进新鲜度。探测失败的队列不会走到这里，于是它的
+      // 时间戳停住 —— OutboxProbeStale 据此发现「这个队列的数字已经不可信了」。
+      outboxLastProbe.set({ queue: name }, nowMs / 1000);
       // 三个都显式写：队列排空时留着上一次的非零值会让告警永远 firing，
       // 而干脆不写这个 label 又会让序列消失、`> 阈值` 打不中。
       outboxPending.set({ queue: name }, pending);

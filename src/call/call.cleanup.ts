@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { CallService } from './call.service';
 import { reportOperationalError } from '../logging/error-aggregation.service';
 
@@ -25,6 +28,7 @@ export class CallCleanup {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      reportHandledJobFailure();
     }
   }
 }

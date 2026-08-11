@@ -122,3 +122,28 @@ test('Watchdog is unconditional and kept out of the normal severities', () => {
   assert.match(expr, /severity: none/);
   assert.doesNotMatch(expr, /for:/);
 });
+
+test('CronJobFailing is cadence-independent', () => {
+  const expr = alertExpr('CronJobFailing');
+  // rate(...[15m]) 配 for: 15m 对每小时/每天的任务打不中:单次失败的增量在
+  // for 满足之前就滑出窗口。行为断言见 monitoring/prometheus/alerts.test.yml。
+  assert.doesNotMatch(expr, /rate\(/);
+  assert.match(expr, /circle_cron_last_result/);
+  assert.match(expr, /max by \(job\)/);
+});
+
+test('DbPoolExhausted scales with the configured pool size', () => {
+  const expr = alertExpr('DbPoolExhausted');
+  // 写死阈值在小池子上漏报、在大池子上误报。
+  assert.match(expr, /circle_db_pool_max/);
+  assert.doesNotMatch(expr, />\s*5\b/);
+});
+
+test('OutboxProbeStale covers the queue whose probe silently keeps failing', () => {
+  // collectOutboxDepths 单队列失败只丢它自己(整轮 reject 会让所有队列的序列
+  // 一起消失)。代价是失败的队列保留上一次读数不动、refresh() 仍然成功 ——
+  // 没有这条规则的话,一个堆积中的队列可以永远停在 0 上装健康。
+  const expr = alertExpr('OutboxProbeStale');
+  assert.match(expr, /circle_outbox_last_probe_timestamp_seconds/);
+  assert.match(expr, /time\(\) -/);
+});

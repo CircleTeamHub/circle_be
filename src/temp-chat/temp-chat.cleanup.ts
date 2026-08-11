@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TempChatService } from './temp-chat.service';
@@ -64,6 +67,9 @@ export class TempChatCleanup {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      // 认领批次失败 = 这一轮一间房都没清。（循环内单房 teardown 失败是
+      // 按设计的单项容错，不记整轮失败。）
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

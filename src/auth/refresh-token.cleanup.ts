@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
@@ -50,6 +53,8 @@ export class RefreshTokenCleanup {
       });
       // Best-effort housekeeping: never let a prune failure crash the scheduler.
       this.logger.error(`Refresh-token prune failed: ${String(err)}`);
+      // 但要记成失败：不上报的话包装器会把这一轮算成成功，心跳照常前进。
+      reportHandledJobFailure();
     }
   }
 }

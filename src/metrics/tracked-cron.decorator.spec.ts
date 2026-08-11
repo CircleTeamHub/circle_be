@@ -7,7 +7,11 @@ import {
   SchedulerRegistry,
 } from '@nestjs/schedule';
 import { createJobMetrics } from './job-metrics';
-import { runTracked, TrackedCron } from './tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  runTracked,
+  TrackedCron,
+} from './tracked-cron.decorator';
 import { jobMetrics } from './job-metrics';
 
 describe('runTracked', () => {
@@ -195,5 +199,81 @@ describe('TrackedCron runtime registration', () => {
     } finally {
       await app.close();
     }
+  });
+});
+
+describe('reportHandledJobFailure', () => {
+  it('turns a swallowed failure into a recorded failure', async () => {
+    // 多数定时任务把整轮工作包在 try/catch 里、失败后正常返回（chat-circle-sync
+    // 扫描失败即 return，各 cleanup 记日志后继续）。包装器只看「有没有抛」的话，
+    // 持续故障期间它们每轮都算成功、心跳照常前进 —— CronJobFailing 和
+    // CronJobStalled 双双打不中，而实际上一点活都没干。
+    const metrics = createJobMetrics();
+
+    await runTracked(metrics, 'swallower', () => {
+      try {
+        throw new Error('db down');
+      } catch {
+        reportHandledJobFailure();
+      }
+    });
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_cron_runs_total\{[^}]*job="swallower"[^}]*result="failure"[^}]*\}\s+1/,
+    );
+    expect(text).toMatch(/circle_cron_last_result\{job="swallower"\}\s+0/);
+  });
+
+  it('does not advance the heartbeat for a handled failure', async () => {
+    const metrics = createJobMetrics();
+    metrics.registerJob('swallower', { nowMs: 1_000_000 });
+
+    await runTracked(
+      metrics,
+      'swallower',
+      () => {
+        reportHandledJobFailure();
+      },
+      { elapsedMs: () => 0, nowMs: () => 9_000_000 },
+    );
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_cron_last_success_timestamp_seconds\{job="swallower"\}\s+1000\b/,
+    );
+  });
+
+  it('still returns the job’s value', async () => {
+    const metrics = createJobMetrics();
+    const result = await runTracked(metrics, 'swallower', () => {
+      reportHandledJobFailure();
+      return 7;
+    });
+    expect(result).toBe(7);
+  });
+
+  it('survives being called outside any tracked job', () => {
+    // 这些方法也会被别处直接调用（测试、管理台手动触发）。脱离 cron 上下文
+    // 时必须是无操作，绝不能抛 —— 观测代码不该改变业务行为。
+    expect(() => reportHandledJobFailure()).not.toThrow();
+  });
+
+  it('attributes the failure to the job that is actually running', async () => {
+    // 并发任务共用一个模块级 storage，串台会把失败记到无辜的任务头上。
+    const metrics = createJobMetrics();
+    await Promise.all([
+      runTracked(metrics, 'job_a', async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        reportHandledJobFailure();
+      }),
+      runTracked(metrics, 'job_b', async () => {
+        await new Promise((r) => setTimeout(r, 1));
+      }),
+    ]);
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(/circle_cron_last_result\{job="job_a"\}\s+0/);
+    expect(text).toMatch(/circle_cron_last_result\{job="job_b"\}\s+1/);
   });
 });

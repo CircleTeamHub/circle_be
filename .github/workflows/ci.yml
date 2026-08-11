@@ -69,6 +69,15 @@ jobs:
             -v "$PWD/monitoring/prometheus:/rules:ro" \
             prom/prometheus:v3.7.3 check rules /rules/alerts.yml
 
+      # check rules 只查语法 —— 一条语法完全正确但永远打不中的规则它照样报
+      # SUCCESS。这一步喂合成时序、断言告警到底响不响，覆盖阈值缩放、蓝绿
+      # 多实例、以及每日任务单次失败这类 rate() 窗口打不中的场景。
+      - name: Unit-test Prometheus rules (promtool test)
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/monitoring/prometheus:/rules:ro" \
+            prom/prometheus:v3.7.3 test rules /rules/alerts.test.yml
+
       # 路由树写错不会报错,只会把告警**静悄悄地**送去错误的接收者 —— 最坏的
       # 情况是 critical 落进 warning 的节流里,或者 Watchdog 被并进普通频道从而
       # 完全失去 dead-man's switch 的作用。这里直接断言三条关键路径的落点。

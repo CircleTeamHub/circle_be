@@ -41,7 +41,9 @@ import {
 // 与其为此再加一列租约时间戳(这条补偿路径的严重性远不及转账),不如把预算
 // 放宽到能吸收副本倍数 —— 3 副本下仍有 ≈1 小时的真实覆盖。
 const VERIFICATION_CARD_GRACE_MS = 2 * 60 * 1000;
-const VERIFICATION_CARD_MAX_ATTEMPTS = 36;
+// 导出给 metrics/outbox-depth.service：死信行的判定必须和这里同一个数，
+// 否则积压指标会和实际放弃行为分叉（与 GIFT_CARD_MAX_ATTEMPTS 同理）。
+export const VERIFICATION_CARD_MAX_ATTEMPTS = 36;
 const VERIFICATION_CARD_BATCH = 50;
 
 type CircleInvitationNotificationData = {
@@ -489,7 +491,7 @@ export class CircleInvitationService {
    * 不复用 reconcileApprovedInvitations:那条是把票数够了的邀请落成 APPROVED,
    * 与卡片投递没有共享的查询或事务,塞进去只会让两件事互相拖慢、失败互相污染。
    */
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @TrackedCron(CronExpression.EVERY_5_MINUTES, 'verification_card_outbox')
   async sweepUndeliveredVerificationCards(
     now: Date = new Date(),
   ): Promise<number> {

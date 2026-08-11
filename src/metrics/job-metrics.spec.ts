@@ -135,3 +135,73 @@ describe('createJobMetrics', () => {
     expect(textB).not.toMatch(/job="temp_chat_cleanup"/);
   });
 });
+
+describe('createJobMetrics — review #150 follow-ups', () => {
+  it('exposes the last run result so cadence-independent alerting works', async () => {
+    // rate(...[15m]) 对每天/每小时的任务不可靠：单次失败的增量在 for: 15m
+    // 满足之前就滑出窗口，storage_audit / refresh_token_cleanup 这类任务
+    // 可以每次都失败而告警始终静默。last_result 与执行频率无关。
+    const metrics = createJobMetrics();
+
+    metrics.registerJob('storage_audit', { nowMs: 1_000_000 });
+    let text = await metrics.registry.metrics();
+    // 播种为成功：任务从没跑过属于「停摆」，由 CronJobStalled 负责，
+    // 不该让 last_result 一开机就报红。
+    expect(text).toMatch(/circle_cron_last_result\{job="storage_audit"\}\s+1/);
+
+    metrics.recordRun('storage_audit', 'failure', 1, 2_000_000);
+    text = await metrics.registry.metrics();
+    expect(text).toMatch(/circle_cron_last_result\{job="storage_audit"\}\s+0/);
+
+    metrics.recordRun('storage_audit', 'success', 1, 3_000_000);
+    text = await metrics.registry.metrics();
+    expect(text).toMatch(/circle_cron_last_result\{job="storage_audit"\}\s+1/);
+  });
+
+  it('tracks per-queue probe freshness so a silently failing probe is visible', async () => {
+    // collectOutboxDepths 刻意让单个队列失败不影响其它队列，代价是失败的队列
+    // 会保留上一次读数不动，而 refresh() 仍然成功 —— 队列积压时 gauge 可能
+    // 停在 0 上一直是绿的。新鲜度是那种情况下唯一的信号。
+    const metrics = createJobMetrics();
+
+    metrics.registerOutboxQueue('session_revocation', 1_000_000);
+    let text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_outbox_last_probe_timestamp_seconds\{queue="session_revocation"\}\s+1000\b/,
+    );
+
+    metrics.setOutboxDepth(
+      {
+        queue: 'session_revocation',
+        pending: 3,
+        oldestAgeSeconds: 30,
+        dead: 0,
+      },
+      2_000_000,
+    );
+    text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_outbox_last_probe_timestamp_seconds\{queue="session_revocation"\}\s+2000\b/,
+    );
+  });
+
+  it('leaves a failing queue stale while its healthy neighbours stay fresh', async () => {
+    const metrics = createJobMetrics();
+    metrics.registerOutboxQueue('gift_card', 1_000_000);
+    metrics.registerOutboxQueue('notification_push', 1_000_000);
+
+    // 只有 notification_push 探测成功
+    metrics.setOutboxDepth(
+      { queue: 'notification_push', pending: 0, oldestAgeSeconds: 0, dead: 0 },
+      9_000_000,
+    );
+
+    const text = await metrics.registry.metrics();
+    expect(text).toMatch(
+      /circle_outbox_last_probe_timestamp_seconds\{queue="notification_push"\}\s+9000\b/,
+    );
+    expect(text).toMatch(
+      /circle_outbox_last_probe_timestamp_seconds\{queue="gift_card"\}\s+1000\b/,
+    );
+  });
+});

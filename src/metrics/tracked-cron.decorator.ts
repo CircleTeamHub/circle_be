@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Logger } from '@nestjs/common';
 import { Cron, CronExpression, CronOptions } from '@nestjs/schedule';
 import { jobMetrics, type JobMetrics } from './job-metrics';
@@ -54,9 +55,36 @@ const systemClock: JobClock = {
   nowMs: () => Date.now(),
 };
 
+interface TrackedJobContext {
+  failed: boolean;
+}
+
+/**
+ * 当前正在执行的任务。用 AsyncLocalStorage 而不是给每个方法加参数：调用点
+ * 只写 reportHandledJobFailure()，不必重复一遍任务名（重复就会漂移）。
+ */
+const currentJob = new AsyncLocalStorage<TrackedJobContext>();
+
+/**
+ * 在 catch 里标记「这一轮实际失败了」，供**吞掉异常后正常返回**的任务使用。
+ *
+ * 大多数定时任务把整轮工作包在 try/catch 里并在失败后正常返回
+ * （chat-circle-sync 扫描失败即 return，各 cleanup 记完日志继续）。包装器只
+ * 看「有没有抛」的话，持续故障期间它们每轮都算成功、心跳照常前进 ——
+ * CronJobFailing 与 CronJobStalled 双双打不中，而实际上一点活都没干。
+ *
+ * 脱离 cron 上下文调用（单测、管理台手动触发）是无操作，绝不抛。
+ */
+export function reportHandledJobFailure(): void {
+  const context = currentJob.getStore();
+  if (context) context.failed = true;
+}
+
 /**
  * 执行一次任务并记账：成功/失败计数、耗时、成功心跳。**不吞异常** —— 原样
  * 重抛，让 @sentry/node 的进程级集成照旧收到未处理 rejection。
+ *
+ * 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种结果。
  *
  * 墙钟只在任务返回之后读。包装器若在调用原函数**之前**读 Date.now()，就会
  * 打乱被包装方法自己的时钟序列 —— notification-retention 的扫表预算用
@@ -71,8 +99,15 @@ export async function runTracked<T>(
   clock: JobClock = systemClock,
 ): Promise<T> {
   const startedAt = clock.elapsedMs();
+  const context: TrackedJobContext = { failed: false };
   try {
-    const result = await run();
+    const result = await currentJob.run(context, () => run());
+    // 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种
+    // 结果：心跳不前进，failure 计数递增。
+    if (context.failed) {
+      metrics.recordRun(job, 'failure', (clock.elapsedMs() - startedAt) / 1000);
+      return result;
+    }
     metrics.recordRun(
       job,
       'success',

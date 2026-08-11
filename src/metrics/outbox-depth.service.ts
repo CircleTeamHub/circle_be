@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { GIFT_CARD_MAX_ATTEMPTS } from '../coin/gift-card-outbox.processor';
+import { VERIFICATION_CARD_MAX_ATTEMPTS } from '../circle-invitation/circle-invitation.service';
 import { jobMetrics, type OutboxDepthSample } from './job-metrics';
 import { TrackedCron } from './tracked-cron.decorator';
 
@@ -20,6 +21,7 @@ export interface OutboxDepthSource {
   notificationPushOutbox: OutboxDelegateLike;
   friendChatReplayOutbox: OutboxDelegateLike;
   coinGift: OutboxDelegateLike;
+  circleInvitationVerifier: OutboxDelegateLike;
 }
 
 interface OutboxQueueSpec {
@@ -50,6 +52,12 @@ interface OutboxQueueSpec {
  *   所以没有死信态。
  * - gift_card：coinGift 上的虚拟队列。处理器有 2 分钟宽限期才补发，所以稳态下
  *   oldestAge 会在 ~120s 附近浮动 —— 告警阈值必须显著高于它。
+ * - verification_card：circleInvitationVerifier 上的虚拟队列（#147 引入）。
+ *   schema 注释写明它与 CoinGift 的 cardDeliveredAt/cardAttempts **同构**；
+ *   差别是这张卡之外还有站内通知和待验证列表两条通道，所以它的死信不像
+ *   gift_card 那样是「钱已结算却没有任何凭证」，走通用 warning 而非 critical。
+ *   待处理条件必须与 sweepUndeliveredVerificationCards 完全一致（含父邀请仍
+ *   PENDING 这一条），否则指标会把补偿任务根本不会碰的行算成积压。
  */
 export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
   {
@@ -67,6 +75,22 @@ export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
     name: 'friend_chat_replay',
     model: 'friendChatReplayOutbox',
     pendingWhere: { status: { in: ['PENDING', 'PROCESSING', 'FAILED'] } },
+  },
+  {
+    name: 'verification_card',
+    model: 'circleInvitationVerifier',
+    pendingWhere: {
+      status: 'PENDING',
+      invitation: { is: { status: 'PENDING' } },
+      cardDeliveredAt: null,
+      cardAttempts: { lt: VERIFICATION_CARD_MAX_ATTEMPTS },
+    },
+    deadWhere: {
+      status: 'PENDING',
+      invitation: { is: { status: 'PENDING' } },
+      cardDeliveredAt: null,
+      cardAttempts: { gte: VERIFICATION_CARD_MAX_ATTEMPTS },
+    },
   },
   {
     name: 'gift_card',
@@ -149,7 +173,14 @@ export async function collectOutboxDepths(
  */
 @Injectable()
 export class OutboxDepthService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) {
+    // 播种每个队列的「上次成功探测时刻」。不播种的话，一个从开机起探测就一直
+    // 失败的队列压根没有序列，OutboxProbeStale 反而永远不响 —— 与心跳播种
+    // 同一个理由。
+    for (const queue of OUTBOX_QUEUES) {
+      jobMetrics.registerOutboxQueue(queue.name);
+    }
+  }
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'outbox_depth_probe')
   async refresh(now: Date = new Date()): Promise<number> {
@@ -160,7 +191,10 @@ export class OutboxDepthService {
       now,
     );
     for (const sample of samples) {
-      jobMetrics.setOutboxDepth(sample);
+      // 只有真读到数才推进新鲜度；失败的队列时间戳停住，由 OutboxProbeStale
+      // 发现「这个队列的数字已经不可信」—— 单队列失败不影响其它队列这一点
+      // 保持不变（那正是它当初被吞掉的原因）。
+      jobMetrics.setOutboxDepth(sample, now.getTime());
     }
     return samples.length;
   }

@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatMediaService } from './chat-media.service';
 import { MEDIA_MESSAGE_TYPES } from './chat.constants';
@@ -62,6 +65,7 @@ export class ChatBurnSweeperService {
       this.logger.error(
         `burn sweep failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

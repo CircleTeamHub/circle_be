@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -177,6 +177,15 @@ if [ -n "${PERSIST_FAIL_COLOR:-}" ] &&
   [ "$(cat "${@: -2:1}" 2>/dev/null || true)" = "$PERSIST_FAIL_COLOR" ]; then
   exit 44
 fi
+# 模拟磁盘写满/权限问题导致 Sentry release 打标失败(磁盘写满时 awk 或 mv 都
+# 可能挂)。脚本开头是 set -e,所以这一步必须是 best-effort,否则会在迁移之后
+# 直接退出 —— 停机模式下旧色已经停了,API 就那样一直下线。
+if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
+  # mv 桩是独立脚本,没有外层的 last_arg helper,直接取最后一个参数。
+  case "${@: -1}" in
+    *.env.production) exit 47 ;;
+  esac
+fi
 exec "$REAL_MV" "$@"
 MV
   chmod +x "$CASE_DIR/bin/mv"
@@ -203,6 +212,7 @@ run_release() {
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
+    ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -346,6 +356,30 @@ test_release_stamps_sentry_release_before_starting_the_new_color() {
   start_line="$(grep -n 'Starting circle_be_green' "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
   [ -n "$tag_line" ] && [ -n "$start_line" ] && [ "$tag_line" -lt "$start_line" ] || {
     echo "expected the Sentry release stamp to precede starting the new color" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  }
+}
+
+test_release_survives_a_failed_sentry_stamp_in_downtime_mode() {
+  # review #150：打标发生在迁移之后。set -e 下 awk/mv 失败会直接退出,不进
+  # handle_post_migration_failure —— 而停机模式已经把旧色停了,于是 API 仅仅
+  # 因为一个可观测性标签写不进去就一直下线。一个 release 标签不值得拿可用性换。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  RELEASE_DOWNTIME=1
+  ENV_STAMP_FAIL=1
+
+  run_release || return 1
+
+  assert_running circle_be_green || return 1
+  grep -q 'could not stamp SENTRY_RELEASE' "$CASE_DIR/release.log" || {
+    echo "expected a warning about the failed stamp" >&2
     cat "$CASE_DIR/release.log" >&2
     return 1
   }
@@ -557,6 +591,7 @@ for test_name in \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
+  test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \

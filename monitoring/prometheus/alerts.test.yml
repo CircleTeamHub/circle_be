@@ -1,0 +1,149 @@
+# promtool 规则单测。跑法（CI 里自动跑）：
+#
+#   docker run --rm --entrypoint promtool -v "$PWD/monitoring/prometheus:/rules:ro" \
+#     prom/prometheus:v3.7.3 test rules /rules/alerts.test.yml
+#
+# 这里喂的是合成时序、断言的是「在某个时刻这条告警到底响不响」—— 与
+# test/prometheus-alerts.spec.mjs 的正则断言互补：那边钉的是规则的写法
+# （用了哪个选择器、有没有用 delta），这边钉的是它的**行为**。
+#
+# 阈值类改动务必在这里补一条：`promtool check rules` 只查语法，一条语法完全
+# 正确但永远打不中的规则它照样报 SUCCESS。
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── 连接池：阈值必须跟着 DATABASE_POOL_MAX 走 ──────────────────────────
+  - interval: 1m
+    name: 小池子上适度的排队也是严重饱和
+    input_series:
+      - series: 'circle_db_pool_waiting'
+        values: '3+0x20'
+      - series: 'circle_db_pool_max'
+        values: '4+0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DbPoolExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 'pg connection pool is deeply saturated — requests are about to hit the 10s acquire timeout and fail'
+
+  - interval: 1m
+    name: 大池子上同样的等待数不该 critical
+    input_series:
+      - series: 'circle_db_pool_waiting'
+        values: '6+0x20'
+      - series: 'circle_db_pool_max'
+        values: '100+0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DbPoolExhausted
+        exp_alerts: []
+      # 但任何持续排队都值得一条 warning，与池大小无关。
+      - eval_time: 10m
+        alertname: DbPoolQueueing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Requests are queueing for a pg connection — the pool, not Postgres, is the bottleneck'
+
+  # ── 定时任务失败：必须与执行频率无关 ─────────────────────────────────
+  - interval: 1m
+    name: 每天一次的任务失败一次就要报（rate 窗口做不到）
+    input_series:
+      # 每天 4 点的任务：跑了一次、失败了，之后 24 小时不会再有新样本。
+      # 旧写法 rate(...[15m]) 配 for: 15m 在这里必然打不中 —— 单次失败的增量
+      # 在 for 满足之前就滑出了窗口。
+      - series: 'circle_cron_last_result{job="storage_audit"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CronJobFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: storage_audit
+            exp_annotations:
+              summary: 'Scheduled job storage_audit last run failed (including handled failures it swallowed)'
+
+  - interval: 1m
+    name: 恢复成功后立刻停止告警
+    input_series:
+      - series: 'circle_cron_last_result{job="storage_audit"}'
+        values: '0+0x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 39m
+        alertname: CronJobFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: 蓝绿期间只要有一个实例干成了就不报
+    input_series:
+      - series: 'circle_cron_last_result{job="chat_burn_sweeper",color="blue"}'
+        values: '0+0x30'
+      - series: 'circle_cron_last_result{job="chat_burn_sweeper",color="green"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CronJobFailing
+        exp_alerts: []
+
+  # ── 心跳：阈值按各任务自己的周期缩放 ─────────────────────────────────
+  - interval: 1m
+    name: 每分钟的任务停摆几分钟就报，每天的任务不会因此误报
+    input_series:
+      # 心跳停在 t=0，两个任务的周期不同。
+      - series: 'circle_cron_last_success_timestamp_seconds{job="per_minute"}'
+        values: '0+0x60'
+      - series: 'circle_cron_interval_seconds{job="per_minute"}'
+        values: '60+0x60'
+      - series: 'circle_cron_last_success_timestamp_seconds{job="daily"}'
+        values: '0+0x60'
+      - series: 'circle_cron_interval_seconds{job="daily"}'
+        values: '86400+0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CronJobStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: per_minute
+            exp_annotations:
+              summary: 'Scheduled job per_minute has not succeeded in 3x its interval'
+
+  # ── outbox 探测新鲜度 ────────────────────────────────────────────────
+  - interval: 1m
+    name: 探测持续失败的队列即使读数是 0 也要报
+    input_series:
+      # 这正是「一个队列的探测一直失败」的形状：时间戳停住不动，
+      # 而 pending 保留着上一次读到的 0，看上去一片健康。
+      - series: 'circle_outbox_last_probe_timestamp_seconds{queue="gift_card"}'
+        values: '0+0x40'
+      - series: 'circle_outbox_pending{queue="gift_card"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OutboxProbeStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              queue: gift_card
+            exp_annotations:
+              summary: 'Outbox gift_card depth has not been read for 10m — its pending/dead gauges are stale, not healthy'
+
+  - interval: 1m
+    name: 正常刷新的队列不报
+    input_series:
+      # 时间戳每分钟跟着推进。
+      - series: 'circle_outbox_last_probe_timestamp_seconds{queue="notification_push"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OutboxProbeStale
+        exp_alerts: []

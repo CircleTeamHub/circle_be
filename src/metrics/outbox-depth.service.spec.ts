@@ -37,6 +37,9 @@ function fakePrisma(
     notificationPushOutbox: delegate(overrides.notificationPushOutbox ?? empty),
     friendChatReplayOutbox: delegate(overrides.friendChatReplayOutbox ?? empty),
     coinGift: delegate(overrides.coinGift ?? empty),
+    circleInvitationVerifier: delegate(
+      overrides.circleInvitationVerifier ?? empty,
+    ),
   };
 }
 
@@ -144,5 +147,46 @@ describe('collectOutboxDepths', () => {
     expect(text).toMatch(
       /circle_outbox_oldest_age_seconds\{queue="session_revocation"\}\s+600/,
     );
+  });
+
+  it('covers the verification-card queue introduced by the server-issued cards work', async () => {
+    // #147 新增的 sweepUndeliveredVerificationCards 是又一条「静默丢失」路径：
+    // 席位提交后卡片就地签发，失败则留空由补偿任务逐轮补投，打光 36 次后
+    // 永久放弃。schema 注释写明它与 CoinGift 同构。
+    const samples = await collectOutboxDepths(
+      fakePrisma({
+        circleInvitationVerifier: {
+          count: 4,
+          oldest: TEN_MINUTES_AGO,
+          dead: 2,
+        },
+      }),
+      NOW,
+    );
+
+    const card = samples.find((s) => s.queue === 'verification_card');
+    expect(card).toEqual({
+      queue: 'verification_card',
+      pending: 4,
+      oldestAgeSeconds: 600,
+      dead: 2,
+    });
+  });
+
+  it('scopes the verification-card queue exactly like its sweeper does', async () => {
+    // 待处理条件与 sweepUndeliveredVerificationCards 必须一致 —— 少了「父邀请
+    // 仍 PENDING」这条，指标会把补偿任务根本不会碰的行算成积压，积压告警
+    // 于是常年 firing。
+    const prisma = fakePrisma();
+    await collectOutboxDepths(prisma, NOW);
+
+    const where = (prisma.circleInvitationVerifier.aggregate as jest.Mock).mock
+      .calls[0][0].where;
+    expect(where).toMatchObject({
+      status: 'PENDING',
+      invitation: { is: { status: 'PENDING' } },
+      cardDeliveredAt: null,
+    });
+    expect(where.cardAttempts).toEqual({ lt: 36 });
   });
 });

@@ -84,15 +84,24 @@ groups:
         annotations:
           summary: 'Scheduled job {{ $labels.job }} has not succeeded in 3x its interval'
 
+      # 用「最近一次运行的结果」而不是 rate() 窗口。
+      #
+      # rate(...[15m]) 配 for: 15m 对每小时/每天的任务打不中：单次失败的增量在
+      # for 满足之前就滑出了窗口，而且首次出现 failure 标签时没有前一个零样本
+      # 可供 rate() 求增量。storage_audit / refresh_token_cleanup /
+      # push_stale_token_cleanup 因此可以每次调度都失败而这条始终静默，只剩
+      # 晚得多的 CronJobStalled 兜底。last_result 与执行频率无关。
+      #
+      # max by (job)：蓝绿期间只要有一个实例把活干成了就不该响。
+      # 注册时播种为 1，所以从没跑过的任务不会一开机就报红（那属于停摆，
+      # 由 CronJobStalled 负责）。
       - alert: CronJobFailing
-        expr: |
-          sum by (job) (rate(circle_cron_runs_total{result="failure"}[15m]))
-            / sum by (job) (rate(circle_cron_runs_total[15m])) > 0.5
+        expr: max by (job) (circle_cron_last_result) == 0
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: 'Scheduled job {{ $labels.job }} is failing more than half its runs'
+          summary: 'Scheduled job {{ $labels.job }} last run failed (including handled failures it swallowed)'
 
       # 会话撤销队列堵死 = 登出/封禁/盗号撤销静默失效。与 RedisDown 是同一条
       # 安全路径的两个故障点：Redis 挂了撤销 fail-open，队列堵了撤销压根没执行。
@@ -114,6 +123,21 @@ groups:
           severity: warning
         annotations:
           summary: 'Outbox {{ $labels.queue }} has work older than 15m — the queue is not draining'
+
+      # collectOutboxDepths 刻意让单个队列探测失败不影响其它队列（整轮 reject
+      # 会让所有队列的序列一起消失）。代价是失败的队列会保留上一次读数不动，
+      # 而 refresh() 仍然成功、心跳照常前进 —— 队列真在堆积时 gauge 却可能
+      # 停在 0 上一直是绿的。新鲜度是那种情况下唯一的信号。
+      #
+      # 阈值 10 分钟 = 探测周期（1 分钟）的 10 倍，容得下几次瞬时抖动。
+      - alert: OutboxProbeStale
+        expr: |
+          time() - max by (queue) (circle_outbox_last_probe_timestamp_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Outbox {{ $labels.queue }} depth has not been read for 10m — its pending/dead gauges are stale, not healthy'
 
       # 用 delta 而不是 `> 0`：死信是只增不减的存量，按存量告警会在第一行死信
       # 之后永久 firing —— 正是本文件反复警告的「永远红 → 训练运维忽略告警」。
@@ -307,8 +331,11 @@ groups:
 
       # 排队深度持续超过池容量的一半：后续请求会陆续撞上 10s 取连接超时并
       # 变成 5xx。这时已经不是「慢」而是「开始掉请求」。
+      # 阈值跟着 DATABASE_POOL_MAX 走，不写死。池配成 4 时三个等待者已经是严重
+      # 饱和却打不中写死的 5；配成 100 时六个等待者又会造成没理由的 critical。
+      # 两边都套 max() 去标签，否则两条序列标签集不同、向量匹配失败恒为空。
       - alert: DbPoolExhausted
-        expr: max(circle_db_pool_waiting) > 5
+        expr: max(circle_db_pool_waiting) > max(circle_db_pool_max) * 0.5
         for: 2m
         labels:
           severity: critical

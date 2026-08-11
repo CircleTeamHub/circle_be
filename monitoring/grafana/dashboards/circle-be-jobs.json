@@ -855,6 +855,116 @@
         }
       ],
       "description": "非 0 = 撞到 maxclients。"
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "最近一次运行失败的任务",
+      "description": "与执行频率无关的失败信号。rate() 窗口对每天/每小时的任务打不中 —— 单次失败的增量在 for 满足之前就滑出窗口。\n\n也覆盖「吞掉异常后正常返回」的任务：它们在 catch 里调 reportHandledJobFailure()，否则会被记成成功。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max by (job) (circle_cron_last_result) == 0",
+          "legendFormat": "{{job}}"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "队列读数新鲜度",
+      "description": "上面那些队列数字距离上次真正读到有多久。单个队列探测失败只丢它自己（整轮失败会让所有队列的序列一起消失），代价是失败的队列会保留上一次读数不动 —— 一个正在堆积的队列可以永远停在 0 上装健康。红线 600s = OutboxProbeStale。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "time() - max by (queue) (circle_outbox_last_probe_timestamp_seconds)",
+          "legendFormat": "{{queue}}"
+        }
+      ]
     }
   ]
 }

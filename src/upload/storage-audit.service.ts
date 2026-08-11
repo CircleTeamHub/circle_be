@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
@@ -115,6 +118,7 @@ export class StorageAuditService {
         'storage audit failed',
         err instanceof Error ? err.stack : String(err),
       );
+      reportHandledJobFailure();
       return null;
     }
   }

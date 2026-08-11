@@ -62,8 +62,10 @@ public; everything else stays internal.)
 | `circle_cron_last_success_timestamp_seconds`                        | gauge           | `job`                            | Heartbeat — catches "not running at all"; seeded at process start  |
 | `circle_cron_interval_seconds`                                      | gauge           | `job`                            | Expected period, so one alert rule fits every job                  |
 | `circle_cron_last_duration_seconds`                                 | gauge           | `job`                            | Last run's wall-clock duration                                     |
+| `circle_cron_last_result`                                           | gauge           | `job`                            | 1 success / 0 failure — cadence-independent, unlike a rate() window |
 | `circle_outbox_pending` / `circle_outbox_oldest_age_seconds`         | gauge           | `queue`                          | Retryable backlog and how long the oldest row has waited           |
 | `circle_outbox_dead`                                                 | gauge           | `queue`                          | Rows in a terminal state that will never be retried                |
+| `circle_outbox_last_probe_timestamp_seconds`                         | gauge           | `queue`                          | Freshness of that queue's reading — goes stale when its probe keeps failing |
 | `circle_db_pool_waiting`                                             | gauge           | —                                | Requests queued for a pg connection — the pool, not Postgres, is the bottleneck |
 | `circle_db_pool_total` / `circle_db_pool_idle` / `circle_db_pool_max` | gauge          | —                                | pg pool occupancy against its configured `DATABASE_POOL_MAX`       |
 
