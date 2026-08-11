@@ -6,7 +6,9 @@ import {
   IsBoolean,
   IsIn,
   IsInt,
+  IsNotEmpty,
   IsOptional,
+  IsString,
   IsUUID,
   Max,
   Min,
@@ -60,6 +62,10 @@ export class AdminSupportAgentDto extends SupportAgentViewDto {
 export class AdminSupportAgentsDto {
   @ApiProperty({ type: [AdminSupportAgentDto] })
   agents: AdminSupportAgentDto[];
+
+  /** 当前配置的内容哈希;写回时必须原样带上,用于乐观并发校验。 */
+  @ApiProperty()
+  revision: string;
 }
 
 export class SupportAgentInputDto {
@@ -100,4 +106,11 @@ export class ReplaceSupportAgentsDto {
   @ValidateNested({ each: true })
   @Type(() => SupportAgentInputDto)
   agents: SupportAgentInputDto[];
+
+  // 读到这份配置时的 revision。整表覆盖没有它就是「最后保存的人赢」:开着旧页签的
+  // 管理员一保存,另一个人刚存的改动会被整个抹掉,双方都收不到任何提示。
+  @ApiProperty({ description: 'GET 返回的 revision，原样回传' })
+  @IsString()
+  @IsNotEmpty()
+  expectedRevision: string;
 }

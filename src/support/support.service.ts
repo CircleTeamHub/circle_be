@@ -1,6 +1,11 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+} from '@nestjs/common';
 import { SupportErrorCode } from 'src/common/app-error-codes';
 import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
+import { createHash } from 'node:crypto';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 
@@ -8,6 +13,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 const SUPPORT_AGENTS_LOCK_KEY = 'support-agents-replace';
 import {
   AdminSupportAgentDto,
+  AdminSupportAgentsDto,
   SUPPORT_AGENT_CATEGORIES,
   SupportAgentCategory,
   SupportAgentViewDto,
@@ -42,6 +48,29 @@ function toView(user: {
   };
 }
 
+/**
+ * 当前配置的版本号 —— 对「配置本身」取哈希,而不是时间戳。
+ *
+ * 用内容哈希的好处:两个管理员各自把表改成同样的结果时不会互相判冲突,
+ * 而且不依赖时钟。先排序再拼接,数据库返回顺序的抖动不会造成假冲突。
+ */
+export function supportAgentsRevision(
+  rows: {
+    category: string;
+    userID: string;
+    sortOrder: number;
+    enabled: boolean;
+  }[],
+): string {
+  const canonical = rows
+    .map(
+      (row) => `${row.category}:${row.userID}:${row.sortOrder}:${row.enabled}`,
+    )
+    .sort()
+    .join('|');
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
+
 @Injectable()
 export class SupportService {
   constructor(
@@ -74,6 +103,20 @@ export class SupportService {
     return { agents };
   }
 
+  private async currentRevision(
+    db: Pick<PrismaService, 'supportAgent'> = this.prisma,
+  ): Promise<string> {
+    const rows = await db.supportAgent.findMany({
+      select: {
+        category: true,
+        userID: true,
+        sortOrder: true,
+        enabled: true,
+      },
+    });
+    return supportAgentsRevision(rows);
+  }
+
   /** 管理台读取:含停用行,否则管理台无法把停用的客服改回启用。 */
   async listForAdmin(): Promise<AdminSupportAgentDto[]> {
     const rows = await this.prisma.supportAgent.findMany({
@@ -98,6 +141,15 @@ export class SupportService {
     }));
   }
 
+  /** 管理台读取 + 版本号:写回时要带上它做乐观并发校验。 */
+  async listForAdminWithRevision(): Promise<AdminSupportAgentsDto> {
+    const [agents, revision] = await Promise.all([
+      this.listForAdmin(),
+      this.currentRevision(),
+    ]);
+    return { agents, revision };
+  }
+
   /**
    * 整表覆盖式写入。
    *
@@ -108,7 +160,8 @@ export class SupportService {
   async replaceAgents(
     operator: { userId: string; accountId: string },
     input: SupportAgentInputDto[],
-  ): Promise<AdminSupportAgentDto[]> {
+    expectedRevision: string,
+  ): Promise<AdminSupportAgentsDto> {
     this.assertNoDuplicates(input);
     await this.assertUsersUsable(input);
 
@@ -130,6 +183,18 @@ export class SupportService {
           enabled: true,
         },
       });
+
+      // 乐观并发:advisory lock 只保证两个写入不交错,拦不住「后到的整表覆盖把先
+      // 到的改动整个抹掉」。管理台开着旧页签(该应用 refetchOnWindowFocus=false,
+      // 旧数据会一直停在那儿)保存一次,另一个管理员刚存的增删/顺序/启用状态就没了,
+      // 而且双方都不会收到任何提示。版本对不上就 409,让管理台去重载并提示冲突。
+      const actualRevision = supportAgentsRevision(before);
+      if (actualRevision !== expectedRevision) {
+        throw new ConflictException({
+          message: '客服配置已被其他管理员修改，请刷新后重试',
+          errorCode: SupportErrorCode.AgentsConflict,
+        });
+      }
 
       const keep = new Set(input.map((a) => `${a.category}:${a.userID}`));
       const removed = before.filter(
@@ -174,7 +239,7 @@ export class SupportService {
       });
     });
 
-    return this.listForAdmin();
+    return this.listForAdminWithRevision();
   }
 
   /**

@@ -12,6 +12,7 @@ function validate(enabled: unknown) {
   const dto = plainToInstance(
     ReplaceSupportAgentsDto,
     {
+      expectedRevision: 'deadbeef',
       agents: [
         {
           category: 'recharge',
@@ -55,6 +56,7 @@ describe('ReplaceSupportAgentsDto', () => {
     const dto = plainToInstance(
       ReplaceSupportAgentsDto,
       {
+        expectedRevision: 'deadbeef',
         agents: [
           {
             category: 'recharge',
