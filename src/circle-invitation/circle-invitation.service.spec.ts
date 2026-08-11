@@ -28,6 +28,7 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     circleMember: {
       findUnique: jest.fn(),
@@ -851,6 +852,29 @@ describe('CircleInvitationService', () => {
       expect(input.clientMessageId).toBe('verification_card_inv-1_verifier-9');
     });
 
+    it('marks the seat delivered when the inline issuance succeeds', async () => {
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledWith({
+        where: { invitationID: 'inv-1', verifierID: 'verifier-9' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
+    });
+
+    it('leaves the seat undelivered when issuance fails, for the sweep to pick up', async () => {
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      // 置位是补偿任务的唯一判据 —— 失败时绝不能置位,否则这张卡永久丢失。
+      expect(prisma.circleInvitationVerifier.updateMany).not.toHaveBeenCalled();
+    });
+
     it('still issues the card when the circle or applicant lookup comes back empty', async () => {
       // 名字只是卡面文案,取不到不该让整张卡消失 —— 卡片的实际价值是那个
       // invitationId 深链。
@@ -870,6 +894,138 @@ describe('CircleInvitationService', () => {
           },
         }),
       );
+    });
+  });
+
+  // ─── 验证卡片补偿 ─────────────────────────────────────────────────────────
+  //
+  // 席位提交之后卡片才签发,中间那一小段(圈子/用户查询、会话解析、消息写入)
+  // 任何一步抖动都会让卡片丢掉 —— 而席位已经落库,申请人重试会撞
+  // @@unique([invitationID, verifierID]) 变成 AlreadyVerifier,「加不进去也退不掉」。
+  // 与转账卡同型的补偿:先抢占后外呼,幂等键让重复投递在唯一约束上合并。
+  describe('sweepUndeliveredVerificationCards', () => {
+    const now = new Date('2026-08-11T12:00:00.000Z');
+    const seat = {
+      id: 'seat-1',
+      invitationID: 'inv-1',
+      verifierID: 'verifier-9',
+      addedByID: 'applicant-1',
+      cardAttempts: 0,
+      invitation: {
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        circle: { name: 'Trusted Circle' },
+        applicant: { nickname: 'Applicant' },
+      },
+    };
+
+    function arrangeSweep({ seats = [seat], claimCount = 1 } = {}) {
+      prisma.circleInvitationVerifier.findMany.mockResolvedValue(seats);
+      prisma.circleInvitationVerifier.updateMany.mockResolvedValue({
+        count: claimCount,
+      });
+    }
+
+    it('claims the row BEFORE the send, then delivers exactly once', async () => {
+      arrangeSweep();
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(1);
+      // 抢占:条件 updateMany(仍未送达 + attempts 没被别人动过)。多副本同时
+      // 扫表时输家 count=0 直接跳过,不会出现「发完才发现别人已置位」的窗口。
+      expect(
+        prisma.circleInvitationVerifier.updateMany,
+      ).toHaveBeenNthCalledWith(1, {
+        where: { id: 'seat-1', cardDeliveredAt: null, cardAttempts: 0 },
+        data: { cardAttempts: { increment: 1 } },
+      });
+      const claimOrder =
+        prisma.circleInvitationVerifier.updateMany.mock.invocationCallOrder[0];
+      const sendOrder =
+        chatMessages.insertServerMessage.mock.invocationCallOrder[0];
+      expect(claimOrder).toBeLessThan(sendOrder);
+
+      // 与 inline 签发同键 —— 两条路径撞唯一约束时合并,验证人只看到一张卡。
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
+        senderID: 'applicant-1',
+        type: 'verification-card',
+        content: {
+          invitationId: 'inv-1',
+          circleName: 'Trusted Circle',
+          applicantName: 'Applicant',
+        },
+        clientMessageId: 'verification_card_inv-1_verifier-9',
+        push: true,
+      });
+    });
+
+    it('skips the row when another replica already claimed it', async () => {
+      arrangeSweep({ claimCount: 0 });
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+
+    it('never sweeps the auto-approved inviter seat', async () => {
+      // invite() 把邀请人自己记成 APPROVED 的那一席,cardDeliveredAt 同样为空 ——
+      // 不按 status 过滤的话,每个邀请人都会收到一张凭空出现的「请你验证」卡。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.status).toBe('PENDING');
+    });
+
+    it('only looks at seats past the grace period', async () => {
+      // 宽限期内 inline 签发可能还在飞 —— 立刻补投等于和它自己抢。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.cardDeliveredAt).toBeNull();
+      expect(args.where.createdAt.lt.getTime()).toBeLessThan(now.getTime());
+    });
+
+    it('does not mark delivered when the send fails', async () => {
+      arrangeSweep();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      // 只有抢占那一次 updateMany;置位的那次不能发生。
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledTimes(
+        1,
+      );
+    });
+
+    it('gives up loudly once attempts are exhausted', async () => {
+      // 打光后这行会被查询永久排除 —— 必须留下 error 级日志,否则「卡片永久
+      // 丢失」这件事在生产上没有任何信号。
+      const warn = jest
+        .spyOn(
+          (service as never as { logger: { error: () => void } }).logger,
+          'error',
+        )
+        .mockImplementation(() => undefined);
+      arrangeSweep({ seats: [{ ...seat, cardAttempts: 11 }] });
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('verification card PERMANENTLY failed'),
+      );
+      warn.mockRestore();
     });
   });
 

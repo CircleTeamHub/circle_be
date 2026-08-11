@@ -1727,11 +1727,19 @@ model CircleInvitationVerifier {
   addedByID    String
   status       CircleInvitationVerifierStatus @default(PENDING)
   respondedAt  DateTime?
+  /// 验证邀请卡片的投递状态。席位提交后由 addVerifier 就地签发并置位；
+  /// 失败(聊天侧抖动/对端会话解析失败)留空，由 sweepUndeliveredVerificationCards
+  /// 逐轮补投。与 CoinGift 的 cardDeliveredAt/cardAttempts 同构 —— 差别是那张卡
+  /// 是收款方拿到钱的唯一凭证，这张卡之外还有站内通知与待验证列表两条通道。
+  cardDeliveredAt DateTime?
+  cardAttempts    Int                         @default(0)
   createdAt    DateTime                       @default(now())
 
   invitation CircleInvitation @relation(fields: [invitationID], references: [id], onDelete: Cascade)
   verifier   User             @relation("verifierUser", fields: [verifierID], references: [id], onDelete: Cascade)
   addedBy    User             @relation("verifierAddedBy", fields: [addedByID], references: [id], onDelete: Cascade)
+  // 待补卡片的局部索引（WHERE "cardDeliveredAt" IS NULL）在迁移
+  // 20260811120000 里用原生 SQL 建 —— Prisma schema 无法表达 partial index。
 
   @@unique([invitationID, verifierID])
   @@index([verifierID, status])

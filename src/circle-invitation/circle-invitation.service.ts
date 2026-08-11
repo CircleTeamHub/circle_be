@@ -30,6 +30,12 @@ import {
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
 
+// 验证卡片补偿的节流参数。5 分钟一轮 × 12 次 ≈ 1 小时,与转账卡补偿
+// (每分钟 × 60)覆盖同样长的抖动窗口;宽限期给 inline 签发留出完成时间。
+const VERIFICATION_CARD_GRACE_MS = 2 * 60 * 1000;
+const VERIFICATION_CARD_MAX_ATTEMPTS = 12;
+const VERIFICATION_CARD_BATCH = 50;
+
 type CircleInvitationNotificationData = {
   toUserID: string;
   fromUserID: string;
@@ -358,31 +364,149 @@ export class CircleInvitationService {
           select: { nickname: true },
         }),
       ]);
-      // 走结算专用解析:与转账卡同一判据 —— 不过拉黑/陌生人消息那两道闸,
-      // 那是给用户主动发消息设的,而这里是一条已经发生的邀请的回执。
-      const conversationId =
-        await this.chatService.ensureDirectConversationForSettlement(
-          params.applicantId,
-          params.verifierId,
-        );
-      await this.chatMessages.insertServerMessage(conversationId, {
-        senderID: params.applicantId,
-        type: 'verification-card',
-        content: {
-          invitationId: params.invitationId,
-          circleName: circle?.name ?? '',
-          applicantName: applicant?.nickname ?? '',
+      await this.deliverVerificationCard({
+        invitationId: params.invitationId,
+        applicantId: params.applicantId,
+        verifierId: params.verifierId,
+        circleName: circle?.name ?? '',
+        applicantName: applicant?.nickname ?? '',
+      });
+      // 置位是补偿任务的唯一判据 —— 只有真送出去了才置。
+      await this.prisma.circleInvitationVerifier.updateMany({
+        where: {
+          invitationID: params.invitationId,
+          verifierID: params.verifierId,
         },
-        clientMessageId: `verification_card_${params.invitationId}_${params.verifierId}`,
-        push: true,
+        data: { cardDeliveredAt: new Date() },
       });
     } catch (error) {
       this.logger.warn(
-        `verification card issuance failed invitation=${params.invitationId} verifier=${params.verifierId}: ${
+        `verification card issuance failed invitation=${params.invitationId} verifier=${params.verifierId}, leaving it to the sweep: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
+  }
+
+  /** 卡片投递本体(inline 签发与补偿任务共用,保证两条路径同键同形状)。 */
+  private async deliverVerificationCard(card: {
+    invitationId: string;
+    applicantId: string;
+    verifierId: string;
+    circleName: string;
+    applicantName: string;
+  }): Promise<void> {
+    // 走结算专用解析:与转账卡同一判据 —— 不过拉黑/陌生人消息那两道闸,
+    // 那是给用户主动发消息设的,而这里是一条已经发生的邀请的回执。
+    const conversationId =
+      await this.chatService.ensureDirectConversationForSettlement(
+        card.applicantId,
+        card.verifierId,
+      );
+    await this.chatMessages.insertServerMessage(conversationId, {
+      senderID: card.applicantId,
+      type: 'verification-card',
+      content: {
+        invitationId: card.invitationId,
+        circleName: card.circleName,
+        applicantName: card.applicantName,
+      },
+      clientMessageId: `verification_card_${card.invitationId}_${card.verifierId}`,
+      push: true,
+    });
+  }
+
+  /**
+   * 验证卡片补偿(review 反馈)。
+   *
+   * inline 签发跑在席位事务**提交之后**,中间那一小段(圈子/用户查询、会话解析、
+   * 消息写入)任何一步抖动都会让卡片丢掉 —— 而席位已经落库,申请人重试会撞
+   * @@unique([invitationID, verifierID]) 变成 AlreadyVerifier,「加不进去也退不掉」。
+   * 这一轮把漏掉的补回来。
+   *
+   * 与 GiftCardOutboxProcessor 同型:先抢占后外呼(条件 updateMany 抢到这一轮的
+   * 投递权才发 —— 多副本同时扫表时输家 count=0 直接跳过);attempts 先记账,
+   * 所以「HTTP 超时但对端已收下」也算一次尝试;clientMessageId 与 inline 同键,
+   * 重复投递在 (conversationID, senderID, clientMessageId) 唯一约束上合并。
+   *
+   * 不复用 reconcileApprovedInvitations:那条是把票数够了的邀请落成 APPROVED,
+   * 与卡片投递没有共享的查询或事务,塞进去只会让两件事互相拖慢、失败互相污染。
+   */
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async sweepUndeliveredVerificationCards(
+    now: Date = new Date(),
+  ): Promise<number> {
+    const seats = await this.prisma.circleInvitationVerifier.findMany({
+      where: {
+        // 只有还没表态的验证人需要这张邀请卡。这条同时挡掉两类行:
+        // 1. invite() 里把邀请人自动记成 APPROVED 的那一席 —— 它从来不需要卡,
+        //    没有这条过滤会给每个邀请人补一张凭空出现的验证邀请;
+        // 2. 已经通过站内通知/待验证列表表过态的人 —— 卡片对他们已无意义。
+        status: 'PENDING',
+        cardDeliveredAt: null,
+        cardAttempts: { lt: VERIFICATION_CARD_MAX_ATTEMPTS },
+        // 宽限期:inline 签发可能还在飞,立刻补投等于和它自己抢。
+        createdAt: {
+          lt: new Date(now.getTime() - VERIFICATION_CARD_GRACE_MS),
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: VERIFICATION_CARD_BATCH,
+      include: {
+        invitation: {
+          select: {
+            applicantID: true,
+            circle: { select: { name: true } },
+            applicant: { select: { nickname: true } },
+          },
+        },
+      },
+    });
+
+    let delivered = 0;
+    for (const seat of seats) {
+      const claimed = await this.prisma.circleInvitationVerifier.updateMany({
+        where: {
+          id: seat.id,
+          cardDeliveredAt: null,
+          cardAttempts: seat.cardAttempts,
+        },
+        data: { cardAttempts: { increment: 1 } },
+      });
+      if (claimed.count === 0) continue;
+      try {
+        await this.deliverVerificationCard({
+          invitationId: seat.invitationID,
+          applicantId: seat.invitation.applicantID,
+          verifierId: seat.verifierID,
+          circleName: seat.invitation.circle?.name ?? '',
+          applicantName: seat.invitation.applicant?.nickname ?? '',
+        });
+        await this.prisma.circleInvitationVerifier.updateMany({
+          where: { id: seat.id },
+          data: { cardDeliveredAt: new Date() },
+        });
+        delivered += 1;
+      } catch (error) {
+        const attemptsNow = seat.cardAttempts + 1;
+        if (attemptsNow >= VERIFICATION_CARD_MAX_ATTEMPTS) {
+          // 打光后这行被查询永久排除 —— 用 error 级日志把「卡片永久丢失」暴露
+          // 出来(重投安全,同 clientMessageId:
+          // UPDATE "CircleInvitationVerifier" SET "cardAttempts"=0)。
+          this.logger.error(
+            `verification card PERMANENTLY failed after ${attemptsNow} attempts ` +
+              `invitation=${seat.invitationID} verifier=${seat.verifierID}`,
+          );
+        } else {
+          this.logger.warn(
+            `verification card sweep failed invitation=${seat.invitationID} verifier=${seat.verifierID}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
+    return delivered;
   }
 
   async respond(
