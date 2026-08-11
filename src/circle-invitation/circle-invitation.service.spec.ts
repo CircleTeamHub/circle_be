@@ -7,7 +7,13 @@ import { NotificationService } from 'src/notification/notification.service';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleInvitationService } from './circle-invitation.service';
+
+// 卡片签发已从请求路径脱钩(不能让聊天投递挡住 add-verifier 的响应),
+// 所以断言之前要把这一拍排空。
+const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe('CircleInvitationService', () => {
   let service: CircleInvitationService;
@@ -26,6 +32,7 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     circleMember: {
       findUnique: jest.fn(),
@@ -69,6 +76,11 @@ describe('CircleInvitationService', () => {
   };
   const memberLock = { lock: jest.fn() };
   const chatCircleSync = { ensureCircleConversation: jest.fn() };
+  const chatService = {
+    ensureDirectConversationForSettlement: jest.fn(),
+    getOrCreateDirectConversation: jest.fn(),
+  };
+  const chatMessages = { insertServerMessage: jest.fn() };
 
   beforeEach(async () => {
     jest.resetAllMocks();
@@ -78,6 +90,9 @@ describe('CircleInvitationService', () => {
     admissionPolicy.assertCanApply.mockResolvedValue(undefined);
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
+    chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
+    chatService.getOrCreateDirectConversation.mockResolvedValue({ id: 'dm-1' });
+    chatMessages.insertServerMessage.mockResolvedValue({ id: 'msg-1' });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -89,6 +104,8 @@ describe('CircleInvitationService', () => {
         { provide: CircleAdmissionPolicy, useValue: admissionPolicy },
         { provide: CircleMemberLockService, useValue: memberLock },
         { provide: ChatCircleSyncService, useValue: chatCircleSync },
+        { provide: ChatService, useValue: chatService },
+        { provide: ChatSystemMessageService, useValue: chatMessages },
       ],
     }).compile();
 
@@ -745,6 +762,376 @@ describe('CircleInvitationService', () => {
         fromInvitation: expect.objectContaining({ id: 'inv-1' }),
       }),
     );
+  });
+
+  // ─── 验证邀请卡片:服务端签发 ──────────────────────────────────────────────
+  //
+  // 卡片以前由 SelectVerifierScreen 在客户端发。verification-card 在后端的
+  // SERVER_MESSAGE_TYPES 里(客户端能发 = 能凭空捏造「这人被邀请当验证人」),
+  // 于是那次发送 100% 被 validateSendPayload 拒,还被 best-effort 的 catch 吞掉
+  // —— 验证人从来收不到这张卡(与转账卡不同,这里连补偿 cron 都没有)。
+  describe('verification card issuance', () => {
+    function arrangeAddVerifier() {
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        verifiers: [],
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.circle.findUnique.mockResolvedValue({ name: 'Trusted Circle' });
+      prisma.user.findUnique.mockResolvedValue({ nickname: 'Applicant' });
+      notificationService.createCircleInvitationNotification.mockResolvedValue(
+        null,
+      );
+    }
+
+    it('issues the card to the verifier once the invitation commits', async () => {
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      // 会话是「申请人 → 验证人」的单聊,与客户端此前发卡的收件人一致。
+      expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
+        'applicant-1',
+        'verifier-9',
+      );
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
+        senderID: 'applicant-1',
+        type: 'verification-card',
+        content: {
+          invitationId: 'inv-1',
+          circleName: 'Trusted Circle',
+          applicantName: 'Applicant',
+        },
+        clientMessageId: 'verification_card_inv-1_verifier-9',
+        push: true,
+      });
+    });
+
+    it('issues the card only after the invitation transaction commits', async () => {
+      // 事务里签发的话:回滚掉的邀请已经把卡片广播出去了 —— 验证人点进去
+      // 会看到一条并不存在的验证请求。
+      arrangeAddVerifier();
+      const order: string[] = [];
+      prisma.$transaction.mockImplementation(async (input: any) => {
+        const result = await input(prisma);
+        order.push('commit');
+        return result;
+      });
+      chatMessages.insertServerMessage.mockImplementation(async () => {
+        order.push('card');
+        return { id: 'msg-1' };
+      });
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      expect(order).toEqual(['commit', 'card']);
+    });
+
+    it('does not fail addVerifier when card issuance fails', async () => {
+      // 验证人席位已经落库了。为一张发不出去的卡把请求判失败,申请人会重试,
+      // 而重试撞 (invitationID, verifierID) 唯一约束 → AlreadyVerifier 冲突,
+      // 表现为「加不进去也取消不掉」。卡片是通知之外的第二条通道,可降级。
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalled();
+    });
+
+    it('keys the card on (invitation, verifier) so a retry cannot double-post', async () => {
+      // 与 CircleInvitationVerifier 的 @@unique([invitationID, verifierID]) 同源:
+      // 一个邀请里同一个验证人只可能有一席,卡片也就只该有一张。
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      const [, input] = chatMessages.insertServerMessage.mock.calls[0] as [
+        string,
+        { clientMessageId: string },
+      ];
+      expect(input.clientMessageId).toBe('verification_card_inv-1_verifier-9');
+    });
+
+    it('never opens an unsolicited DM channel to deliver the card (P1)', async () => {
+      // 加验证人只要求对方是圈子活跃成员,**不要求是好友**,而这一步是申请人
+      // 主动挑人触发的。用结算专用解析会绕过对方的「接收陌生人消息」开关直接
+      // 建出正常 DIRECT 会话 —— 那道闸全仓只在建会话时查一次、发送路径永不复查,
+      // 于是 add-verifier 就成了任何人强开私聊通道的入口。
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      expect(
+        chatService.ensureDirectConversationForSettlement,
+      ).not.toHaveBeenCalled();
+      expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
+        'applicant-1',
+        'verifier-9',
+      );
+    });
+
+    it('treats a privacy refusal as terminal, not as a failure to retry', async () => {
+      // 对方关了陌生人消息 = 隐私设置在正确地生效,不是故障。按失败处理会白烧
+      // 12 次重试,最后还打一条「永久丢失、需人工介入」的 error 日志。
+      arrangeAddVerifier();
+      chatService.getOrCreateDirectConversation.mockRejectedValue(
+        new ForbiddenException({ message: '对方不接收陌生人消息' }),
+      );
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+      // 终结这一席:补偿任务不再捡它。验证人照样能从站内通知与待验证列表看到请求。
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledWith({
+        where: { invitationID: 'inv-1', verifierID: 'verifier-9' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
+    });
+
+    it('returns even when the chat dependency never settles', async () => {
+      // 席位与站内通知都已提交。挂住的话客户端超时重试会撞 AlreadyVerifier
+      //(「加不进去也退不掉」),而补偿任务要等这个请求被放弃才轮得到。
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockImplementation(
+        () => new Promise(() => undefined), // 永不兑现
+      );
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalled();
+    });
+
+    it('marks the seat delivered when the inline issuance succeeds', async () => {
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledWith({
+        where: { invitationID: 'inv-1', verifierID: 'verifier-9' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
+    });
+
+    it('leaves the seat undelivered when issuance fails, for the sweep to pick up', async () => {
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      // 置位是补偿任务的唯一判据 —— 失败时绝不能置位,否则这张卡永久丢失。
+      expect(prisma.circleInvitationVerifier.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('still issues the card when the circle or applicant lookup comes back empty', async () => {
+      // 名字只是卡面文案,取不到不该让整张卡消失 —— 卡片的实际价值是那个
+      // invitationId 深链。
+      arrangeAddVerifier();
+      prisma.circle.findUnique.mockResolvedValue(null);
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
+
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
+        'dm-1',
+        expect.objectContaining({
+          content: {
+            invitationId: 'inv-1',
+            circleName: '',
+            applicantName: '',
+          },
+        }),
+      );
+    });
+  });
+
+  // ─── 验证卡片补偿 ─────────────────────────────────────────────────────────
+  //
+  // 席位提交之后卡片才签发,中间那一小段(圈子/用户查询、会话解析、消息写入)
+  // 任何一步抖动都会让卡片丢掉 —— 而席位已经落库,申请人重试会撞
+  // @@unique([invitationID, verifierID]) 变成 AlreadyVerifier,「加不进去也退不掉」。
+  // 与转账卡同型的补偿:先抢占后外呼,幂等键让重复投递在唯一约束上合并。
+  describe('sweepUndeliveredVerificationCards', () => {
+    const now = new Date('2026-08-11T12:00:00.000Z');
+    const seat = {
+      id: 'seat-1',
+      invitationID: 'inv-1',
+      verifierID: 'verifier-9',
+      addedByID: 'applicant-1',
+      cardAttempts: 0,
+      invitation: {
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        circle: { name: 'Trusted Circle' },
+        applicant: { nickname: 'Applicant' },
+      },
+    };
+
+    function arrangeSweep({ seats = [seat], claimCount = 1 } = {}) {
+      prisma.circleInvitationVerifier.findMany.mockResolvedValue(seats);
+      prisma.circleInvitationVerifier.updateMany.mockResolvedValue({
+        count: claimCount,
+      });
+    }
+
+    it('claims the row BEFORE the send, then delivers exactly once', async () => {
+      arrangeSweep();
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(1);
+      // 抢占:条件 updateMany(仍未送达 + attempts 没被别人动过)。多副本同时
+      // 扫表时输家 count=0 直接跳过,不会出现「发完才发现别人已置位」的窗口。
+      expect(
+        prisma.circleInvitationVerifier.updateMany,
+      ).toHaveBeenNthCalledWith(1, {
+        where: {
+          id: 'seat-1',
+          // 扫表与抢占之间 respond / adminApprove / reconcile 都可能把席位或
+          // 父邀请落成终态,抢占必须把资格条件一起复查,而不是只 CAS attempts。
+          status: 'PENDING',
+          invitation: { is: { status: 'PENDING' } },
+          cardDeliveredAt: null,
+          cardAttempts: 0,
+        },
+        data: { cardAttempts: { increment: 1 } },
+      });
+      const claimOrder =
+        prisma.circleInvitationVerifier.updateMany.mock.invocationCallOrder[0];
+      const sendOrder =
+        chatMessages.insertServerMessage.mock.invocationCallOrder[0];
+      expect(claimOrder).toBeLessThan(sendOrder);
+
+      // 与 inline 签发同键 —— 两条路径撞唯一约束时合并,验证人只看到一张卡。
+      expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
+        senderID: 'applicant-1',
+        type: 'verification-card',
+        content: {
+          invitationId: 'inv-1',
+          circleName: 'Trusted Circle',
+          applicantName: 'Applicant',
+        },
+        clientMessageId: 'verification_card_inv-1_verifier-9',
+        push: true,
+      });
+    });
+
+    it('skips the row when another replica already claimed it', async () => {
+      arrangeSweep({ claimCount: 0 });
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+
+    it('never sweeps the auto-approved inviter seat', async () => {
+      // invite() 把邀请人自己记成 APPROVED 的那一席,cardDeliveredAt 同样为空 ——
+      // 不按 status 过滤的话,每个邀请人都会收到一张凭空出现的「请你验证」卡。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.status).toBe('PENDING');
+    });
+
+    it('never resends a card for an invitation that is no longer pending', async () => {
+      // adminApprove / reconcileApprovedInvitations 把邀请落成 ADMIN_APPROVED /
+      // APPROVED 时不动席位行 —— 只看席位状态的话会补出一张过期卡,
+      // 验证人点进去只会拿到 NotPending。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.invitation).toEqual({ is: { status: 'PENDING' } });
+    });
+
+    it('only looks at seats past the grace period', async () => {
+      // 宽限期内 inline 签发可能还在飞 —— 立刻补投等于和它自己抢。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.cardDeliveredAt).toBeNull();
+      expect(args.where.createdAt.lt.getTime()).toBeLessThan(now.getTime());
+    });
+
+    it('settles the seat instead of retrying when the peer refuses (P1)', async () => {
+      arrangeSweep();
+      chatService.getOrCreateDirectConversation.mockRejectedValue(
+        new ForbiddenException({ message: '对方不接收陌生人消息' }),
+      );
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      // 抢占 + 终结,各一次;不应留在队列里反复重试。
+      expect(
+        prisma.circleInvitationVerifier.updateMany,
+      ).toHaveBeenNthCalledWith(2, {
+        where: { id: 'seat-1' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
+    });
+
+    it('does not mark delivered when the send fails', async () => {
+      arrangeSweep();
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      // 只有抢占那一次 updateMany;置位的那次不能发生。
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledTimes(
+        1,
+      );
+    });
+
+    it('gives up loudly once attempts are exhausted', async () => {
+      // 打光后这行会被查询永久排除 —— 必须留下 error 级日志,否则「卡片永久
+      // 丢失」这件事在生产上没有任何信号。
+      const warn = jest
+        .spyOn(
+          (service as never as { logger: { error: () => void } }).logger,
+          'error',
+        )
+        .mockImplementation(() => undefined);
+      arrangeSweep({ seats: [{ ...seat, cardAttempts: 35 }] });
+      chatMessages.insertServerMessage.mockRejectedValue(
+        new Error('chat down'),
+      );
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('verification card PERMANENTLY failed'),
+      );
+      warn.mockRestore();
+    });
   });
 
   it('does not fail addVerifier when notification delivery fails', async () => {

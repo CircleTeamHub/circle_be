@@ -1233,7 +1233,12 @@ export class ChatService {
       where: { directKey },
       select: { id: true },
     });
+    // 会话在本次调用之前就存在 → 双方连接时 handleConnection 已经把它们加进房了
+    // (它按 leftAt: null 取,而 DIRECT 座位的 leftAt 恒为空 —— 置空只发生在
+    //  圈子同步与临时房访客收座上)。这里再 join 一次只是白花一次跨节点
+    // fetchSockets。
     if (existing) return existing.id;
+    let conversationId: string;
     try {
       const created = await this.prisma.chatConversation.create({
         data: {
@@ -1243,7 +1248,7 @@ export class ChatService {
         },
         select: { id: true },
       });
-      return created.id;
+      conversationId = created.id;
     } catch (error) {
       if (!this.isUniqueViolation(error)) throw error;
       const raced = await this.prisma.chatConversation.findUnique({
@@ -1251,8 +1256,30 @@ export class ChatService {
         select: { id: true },
       });
       if (!raced) throw error;
-      return raced.id;
+      // 竞态里对手赢了插入,但它的 join 未必已经跑完 —— 而调用方紧接着就要往
+      // 这个房间里播回执。补一次(join 幂等)比赌时序便宜。
+      conversationId = raced.id;
     }
+    // 刚建出来的会话:座位落库不会自动 join,而 handleConnection 只把**连接那一刻**
+    // 已存在的会话加进房。不补这一步,调用方紧接着 insertServerMessage 的广播就播
+    // 进一个空房间 —— 转账卡/通话留痕/好友申请回放对双方都静默消失,要等下次重连
+    // 或拉历史才看得见;推送分流还会把在线的对端当成离线用户。补偿 cron 那条路更糟:
+    // 它在广播之后就置位 cardDeliveredAt,于是永远不会再重试。
+    // 尽力而为,失败不阻断结算链路(客户端重连时 handleConnection 会补上)。
+    await Promise.all(
+      [userId, peerUserId].map((memberId) =>
+        this.broadcast
+          .joinUserToConversation(memberId, conversationId)
+          .catch((error: unknown) => {
+            this.logger.warn(
+              `join settlement conversation room failed user=${memberId} conv=${conversationId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }),
+      ),
+    );
+    return conversationId;
   }
 
   async getOrCreateDirectConversation(

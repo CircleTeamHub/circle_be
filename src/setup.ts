@@ -450,15 +450,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
-  // review 修复：只有「真发礼物」吃 20/15min 配额。前缀挂载会把
-  // /coin/gift/card-sent 回执也算进去 —— 发 10 单+逐单回执就顶满配额，
-  // 且回执被 429 会让 cardDeliveredAt 悬空、补偿 cron 之后重复发卡。
-  app.use('/api/v1/coin/gift', (req: any, res: any, next: any) => {
-    if (req.path === '/' || req.path === '') {
-      return coinGiftLimiter(req, res, next);
-    }
-    next();
-  });
+  // /coin/gift 下只剩「真发礼物」这一条路由 —— 卡片送达回执端点随客户端发卡
+  // 路径一起删了（卡片改由 CoinService 结算后服务端签发），前缀挂载不会再
+  // 误把回执算进 20/15min 配额里。
+  app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', noteWriteLimiter);
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
