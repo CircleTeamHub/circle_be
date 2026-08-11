@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -66,7 +67,7 @@ export class ChatCircleSyncService {
     this.retryQueue.add(circleID);
   }
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_circle_sync')
   async reconcileRecent(): Promise<void> {
     const since = new Date(
       Date.now() - ChatCircleSyncService.RECONCILE_WINDOW_MS,

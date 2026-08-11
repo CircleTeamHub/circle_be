@@ -1,15 +1,89 @@
 route:
-  receiver: discord
-  group_by: ['alertname']
+  receiver: discord-warning
+  # severity 必须进 group_by：否则 Alertmanager 会把同名告警的不同严重度合进
+  # 同一条通知，critical 被裹在一堆 warning 里发出去。
+  group_by: ['alertname', 'severity']
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h
 
+  routes:
+    # Watchdog 永远 firing，方向和其他所有告警相反：外部服务**收不到**它才报警。
+    # 必须单独路由 —— 混进 Discord 只会得到一条每 4 小时刷一次的噪音，而且完全
+    # 起不到作用（整台机器挂掉时，本地 Alertmanager 也发不出任何东西）。
+    #
+    # repeat_interval 要显著小于外部服务的超时窗口，否则心跳会在正常情况下超时。
+    # healthchecks.io 建议：period 15m / grace 10m，配这里的 5m 重发。
+    - matchers:
+        - alertname = "Watchdog"
+      receiver: external-heartbeat
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 5m
+      continue: false
+
+    - matchers:
+        - severity = "critical"
+      receiver: discord-critical
+      # critical 更早发、更频繁地重提。4h 对「会话撤销正在静默失效」这类
+      # 事故太慢了。
+      group_wait: 10s
+      repeat_interval: 1h
+
+# 抑制：上游故障 firing 时，压掉它必然引发的下游告警。
+#
+# 没有这一段的话，后端整个没了会同时刷出 CircleBeNoTarget + BackendHigh5xx +
+# BackendHighLatencyP95 + BackendEventLoopLag + 一堆 CronJobStalled —— 一次故障
+# 五种叫法，正是本项目反复警惕的告警疲劳。
+inhibit_rules:
+  # 后端一个副本都不在 → 5xx/延迟/事件循环/定时任务全部是它的结果。
+  - source_matchers:
+      - alertname = "CircleBeNoTarget"
+    target_matchers:
+      - alertname =~ "BackendHigh5xx|BackendHighLatencyP95|BackendEventLoopLag|CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck"
+    # 这两条规则的标签集没有公共维度（不同 alertname、不同 severity），
+    # 所以 equal 留空 —— 只要 source 在 firing 就抑制，不做标签配对。
+    equal: []
+
+  # 数据库挂了 → 所有依赖它的任务/队列都会积压，别再各报一遍。
+  - source_matchers:
+      - alertname = "PostgresDown"
+    target_matchers:
+      - alertname =~ "CronJobStalled|CronJobFailing|OutboxBacklogStuck|SessionRevocationOutboxStuck|BackendHigh5xx"
+    equal: []
+
+  # 同一件事已经以 critical 发出去了，就不要再发一遍 warning。
+  - source_matchers:
+      - severity = "critical"
+    target_matchers:
+      - severity = "warning"
+    # 这条**必须**按 alertname 配对：不加的话，任何一条 critical 都会把全站
+    # 所有 warning 一起静音掉。
+    equal: ['alertname']
+
 receivers:
-  - name: discord
-    # Native Discord support (Alertmanager >= 0.25). The webhook URL is read from
-    # a gitignored file so it never lands in the repo — create it from
-    # discord.url.example and put your Discord channel webhook in it.
+  # Alertmanager 原生支持 Discord（>= 0.25），不需要转换器。webhook URL 从
+  # gitignored 的文件读取，永不进仓库 —— 从 discord.url.example 创建。
+  - name: discord-warning
     discord_configs:
       - webhook_url_file: /etc/alertmanager/discord.url
         send_resolved: true
+
+  - name: discord-critical
+    discord_configs:
+      # 默认与 warning 同一个 webhook：一个频道也能靠 severity 分组区分。
+      # 想要单独的频道/@here，就建第二个 webhook 写进 discord-critical.url
+      # 并把下面这行指过去（见 README「告警分级」）。
+      - webhook_url_file: /etc/alertmanager/discord.url
+        send_resolved: true
+        title: '🔴 CRITICAL — {{ .CommonLabels.alertname }}'
+
+  # 外部心跳。URL 从 gitignored 的 heartbeat.url 读取（healthchecks.io 的 ping
+  # 地址等）。文件不存在时 Alertmanager 照常启动，只是心跳发不出去 —— 而外部
+  # 服务会因此报警，这正是期望行为：配错等同于监控没接上，必须可见。
+  #
+  # send_resolved: false —— 心跳只需要「我还活着」这一个信号。
+  - name: external-heartbeat
+    webhook_configs:
+      - url_file: /etc/alertmanager/heartbeat.url
+        send_resolved: false

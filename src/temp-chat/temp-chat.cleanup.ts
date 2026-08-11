@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TempChatService } from './temp-chat.service';
@@ -24,7 +25,7 @@ export class TempChatCleanup {
     private readonly service: TempChatService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'temp_chat_cleanup')
   async sweep(): Promise<void> {
     if (this.running) return;
     this.running = true;

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { Prisma } from 'src/generated/prisma';
 
@@ -21,7 +22,7 @@ export class LikeReconciliationService {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @Cron(CronExpression.EVERY_HOUR)
+  @TrackedCron(CronExpression.EVERY_HOUR, 'like_reconciliation')
   async reconcileReceivedLikeCounts(): Promise<number> {
     for (let attempt = 0; attempt < SERIALIZATION_RETRIES; attempt += 1) {
       try {

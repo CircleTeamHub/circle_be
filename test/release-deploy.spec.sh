@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -202,6 +202,7 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -312,6 +313,53 @@ test_proxy_switch_precedes_old_color_retirement() {
     assert_reload_target circle-be-green:3000 &&
     assert_command_before 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' 'stop circle_be' &&
     assert_running circle_be_green && assert_absent circle_be
+}
+
+test_release_stamps_sentry_release_before_starting_the_new_color() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\nSENTRY_RELEASE=circle-be@v0.0.1\n' > "$APP_ENV_FILE"
+  export APP_ENV_FILE
+
+  run_release || return 1
+
+  # 蓝绿发布最需要「这个 bug 是哪次发版引入的」这个问题的答案,而它完全取决于
+  # 每次发布都把 release 标上去。既有值必须被**替换**而不是追加 —— dotenv 取
+  # 最后一个赋值,追加碰巧也能工作,但文件会随每次发版无限增长。
+  grep -q '^SENTRY_RELEASE=circle-be@v1\.2\.3$' "$APP_ENV_FILE" || {
+    echo "expected SENTRY_RELEASE to be stamped with the release tag" >&2
+    cat "$APP_ENV_FILE" >&2
+    return 1
+  }
+  [ "$(grep -c '^SENTRY_RELEASE=' "$APP_ENV_FILE")" = "1" ] || {
+    echo "SENTRY_RELEASE was appended instead of replaced" >&2
+    return 1
+  }
+  # 必须在起新色**之前**写好,否则新容器挂载到的还是上一版的 release。
+  # 这里比对的是脚本自身输出的行号 —— 打标签是文件写入,不经过 docker,
+  # 所以 assert_command_before(读 docker 命令日志)对它无效。
+  local tag_line start_line
+  tag_line="$(grep -n 'Tagging Sentry release circle-be@v1\.2\.3' "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  start_line="$(grep -n 'Starting circle_be_green' "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  [ -n "$tag_line" ] && [ -n "$start_line" ] && [ "$tag_line" -lt "$start_line" ] || {
+    echo "expected the Sentry release stamp to precede starting the new color" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  }
+}
+
+test_release_without_env_file_still_deploys() {
+  # 手动开通流程可能没有 .env.production 在预期位置;打标签失败不该阻断发布。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+
+  run_release || return 1
+  assert_running circle_be_green
 }
 
 test_smoke_failure_restores_proxy_before_removing_standby() {
@@ -508,6 +556,8 @@ for test_name in \
   test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
+  test_release_stamps_sentry_release_before_starting_the_new_color \
+  test_release_without_env_file_still_deploys \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \

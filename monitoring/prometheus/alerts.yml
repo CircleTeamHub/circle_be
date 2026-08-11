@@ -59,6 +59,104 @@ groups:
         annotations:
           summary: 'No circle-be scrape target exists (no backend container is running)'
 
+  # 定时任务与 outbox 队列 —— 「什么都没发生」这一类故障。
+  #
+  # 这一组补的是此前完全无信号的盲区：Sentry 的 captureError 只在
+  # ErrorLoggingInterceptor 里被调用，即只覆盖 HTTP 5xx；而 4 个 outbox 处理器
+  # 都自己 catch 异常、写进行上的 lastError 然后继续，异常永远不逃出去。队列
+  # 堵死时 RED 大盘一切正常、Sentry 一片安静。
+  - name: jobs
+    rules:
+      # 阈值不写死：每分钟任务和每天 4 点的任务共用这一条规则，各自的预期周期
+      # 由 circle_cron_interval_seconds 带过来（在 TrackedCron 装饰期写入）。
+      # 为每个任务手写阈值的结果必然是新任务漏配、悄无声息。
+      #
+      # max by (job)：蓝绿发布期间两个颜色同时在跑，只要有一个实例把活干了就
+      # 不该响。心跳在进程启动时就播种（不是等第一次成功），所以新容器不会
+      # 立刻误报，一个从开机起就没跑过的任务也不会因为序列不存在而逃过告警。
+      - alert: CronJobStalled
+        expr: |
+          time() - max by (job) (circle_cron_last_success_timestamp_seconds)
+            > 3 * max by (job) (circle_cron_interval_seconds)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Scheduled job {{ $labels.job }} has not succeeded in 3x its interval'
+
+      - alert: CronJobFailing
+        expr: |
+          sum by (job) (rate(circle_cron_runs_total{result="failure"}[15m]))
+            / sum by (job) (rate(circle_cron_runs_total[15m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Scheduled job {{ $labels.job }} is failing more than half its runs'
+
+      # 会话撤销队列堵死 = 登出/封禁/盗号撤销静默失效。与 RedisDown 是同一条
+      # 安全路径的两个故障点：Redis 挂了撤销 fail-open，队列堵了撤销压根没执行。
+      # 两者都必须叫醒人，所以同为 critical。
+      - alert: SessionRevocationOutboxStuck
+        expr: max(circle_outbox_oldest_age_seconds{queue="session_revocation"}) > 600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Session-revocation outbox stuck >10m — logout/ban/stolen-token revocation is not being applied'
+
+      # gift_card 稳态下 oldestAge 会在 ~120s 附近浮动（处理器有 2 分钟宽限期
+      # 才补发），阈值必须显著高于它，否则这条会常年 firing。
+      - alert: OutboxBacklogStuck
+        expr: max by (queue) (circle_outbox_oldest_age_seconds) > 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Outbox {{ $labels.queue }} has work older than 15m — the queue is not draining'
+
+      # 用 delta 而不是 `> 0`：死信是只增不减的存量，按存量告警会在第一行死信
+      # 之后永久 firing —— 正是本文件反复警告的「永远红 → 训练运维忽略告警」。
+      # 按「过去 1 小时又多了几条」告警，处理完就自动消。存量本身留给大盘看。
+      - alert: OutboxDeadLettersAppearing
+        expr: max by (queue) (delta(circle_outbox_dead{queue!="gift_card"}[1h])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Outbox {{ $labels.queue }} produced new dead letters in the last hour (never retried again)'
+
+      # 单列出来是因为后果不同：钱已经在 sendGift 里强一致结算，卡片打光 60 次
+      # 重试后永久丢失 —— 收款人拿不到任何凭证，需要人工对账
+      # （UPDATE "CoinGift" SET "cardAttempts"=0 可安全重发，clientMessageId 幂等）。
+      # 处理器为此打了 error 级日志，但日志没有接告警通道，这条规则是唯一的叫醒机制。
+      - alert: GiftCardPermanentlyLost
+        expr: delta(circle_outbox_dead{queue="gift_card"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'A settled coin gift permanently lost its transfer card — manual reconciliation required'
+
+  # 监控自身的存活证明。
+  - name: meta
+    rules:
+      # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
+      #
+      # 整套监控栈和被监控对象在同一台机器上：机器宕机、磁盘写满、网络断开时，
+      # Prometheus / Alertmanager / Uptime-Kuma 一起没了，Discord 一条消息都不会
+      # 有 —— 而 HostDiskFilling、HighMemory 这些恰恰是「真触发时离整机不可用
+      # 不远了」的告警。这条是唯一能覆盖「监控自己死了」的机制：外部服务**收不到**
+      # 心跳就报警，方向和其他所有告警相反。
+      #
+      # 不要给它加 for:，也不要在 Alertmanager 里把它并进普通 receiver。
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+        annotations:
+          summary: 'Alerting pipeline heartbeat — an external service pages when this STOPS arriving'
+
   # 自建聊天容量与宿主机资源。
   - name: capacity
     rules:
@@ -150,6 +248,101 @@ groups:
           severity: warning
         annotations:
           summary: 'Filesystem {{ $labels.mountpoint }} below 15% free'
+
+  # 数据库与缓存。指标名与标签均已对着 postgres-exporter v0.19.0 /
+  # redis_exporter v1.83.0 的真实输出核对过。
+  - name: datastores
+    rules:
+      # pg_up 是 exporter 自己判定的「连得上库吗」，与 up{job=...}（能不能连上
+      # exporter）是两回事：exporter 活着而数据库挂了时，只有这条会响。
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'PostgreSQL is unreachable from postgres-exporter'
+
+      # 两边都套 max() 是必须的，不是风格问题：
+      # pg_settings_max_connections 带 server="host:port" 标签，而
+      # pg_stat_database_numbackends **不带**。直接相除标签集不一致，
+      # 向量匹配失败、结果恒为空 —— 一条永远不会触发的告警，比没有更糟。
+      # max() 去掉标签后两边都是 {}，才能匹配上。
+      - alert: PostgresConnectionsNearMax
+        expr: |
+          sum(pg_stat_database_numbackends) / max(pg_settings_max_connections) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'PostgreSQL is using >80% of max_connections'
+
+      # 连接被开着但事务不结束 —— 典型的忘记 commit / 长事务泄漏。它会一直占
+      # 着连接名额，是 PostgresConnectionsNearMax 最常见的前因。
+      - alert: PostgresIdleInTransaction
+        expr: |
+          sum(pg_stat_activity_count{state="idle in transaction"}) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'More than 5 backends stuck idle-in-transaction for 10m'
+
+      # 连接池排队 —— postgres-exporter **看不到**的那一面。
+      #
+      # 池排队发生在 Node 进程内部：从 Postgres 视角连接数没涨、没有慢查询、
+      # 没有锁等待，而应用侧请求已经在 connectionTimeoutMillis(10s)上排队。
+      # 等 BackendHighLatencyP95 响的时候早就晚了。
+      #
+      # 池只有 10 个（DATABASE_POOL_MAX 默认值），而圈子列表这类接口的
+      # findMany + count 是并发发出的、一个请求就占两个连接 —— 这条告警针对的
+      # 正是那种「Postgres 一切正常但服务已经在排队」的场景。
+      - alert: DbPoolQueueing
+        expr: max(circle_db_pool_waiting) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Requests are queueing for a pg connection — the pool, not Postgres, is the bottleneck'
+
+      # 排队深度持续超过池容量的一半：后续请求会陆续撞上 10s 取连接超时并
+      # 变成 5xx。这时已经不是「慢」而是「开始掉请求」。
+      - alert: DbPoolExhausted
+        expr: max(circle_db_pool_waiting) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'pg connection pool is deeply saturated — requests are about to hit the 10s acquire timeout and fail'
+
+      - alert: RedisExporterDown
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Redis is unreachable from redis-exporter'
+
+      # 生产 Redis 跑的是 maxmemory-policy noeviction（见 docker-compose.prod.yml）：
+      # 撑到上限不会淘汰旧键，而是让**写入直接报错**。会话撤销依赖 Redis 写入，
+      # 所以这等价于 RedisDown 那条描述的 fail-open —— 同为 critical。
+      # 分母加 > 0：未设 maxmemory 时该指标为 0，不过滤会得到 +Inf 永远告警
+      # （与 ContainerMemoryNearLimit 同一个坑）。
+      - alert: RedisMemoryNearLimit
+        expr: redis_memory_used_bytes / (redis_memory_max_bytes > 0) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Redis is at >90% of maxmemory — with noeviction, writes start failing (session revocation included)'
+
+      - alert: RedisRejectingConnections
+        expr: increase(redis_rejected_connections_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Redis rejected connections in the last 10m (maxclients reached)'
 
   - name: host
     rules:

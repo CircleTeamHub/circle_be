@@ -1,12 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { FancyNumberService } from './fancy-number.service';
 
 @Injectable()
 export class FancyNumberCleanup {
   constructor(private readonly service: FancyNumberService) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'fancy_number_lease_sweep')
   async sweepExpiredLeases(): Promise<void> {
     await this.service.expireDue();
   }

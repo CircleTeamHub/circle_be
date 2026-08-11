@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatMediaService } from './chat-media.service';
 import { MEDIA_MESSAGE_TYPES } from './chat.constants';
@@ -34,7 +35,7 @@ export class ChatBurnSweeperService {
     private readonly media: ChatMediaService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_burn_sweeper')
   async sweep(): Promise<void> {
     if (this.running) return;
     this.running = true;

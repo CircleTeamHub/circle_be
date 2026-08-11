@@ -6,7 +6,8 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import {
   CircleErrorCode,
@@ -886,7 +887,10 @@ export class CircleInvitationService {
    * restart cannot leave a permanently pending invitation with a full set of
    * approvals.
    */
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @TrackedCron(
+    CronExpression.EVERY_5_MINUTES,
+    'circle_invitation_reconciliation',
+  )
   async reconcileApprovedInvitations(): Promise<number> {
     const candidates = await this.prisma.$queryRaw<
       Array<{ id: string; circleID: string; applicantID: string }>

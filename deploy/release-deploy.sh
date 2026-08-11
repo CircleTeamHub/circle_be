@@ -539,6 +539,43 @@ if ! compose run --rm migrate; then
 fi
 irreversible_migration_applied=1
 
+# ── 给这次发布盖上 Sentry release 标签 ─────────────────────────
+# 没有 release,Sentry 里就没法回答「这个 bug 是哪次发版引入的」,regression
+# 检测退化、release health 完全不可用 —— 而蓝绿发布恰恰是最需要按版本归因的
+# 场景。RELEASE_TAG 已在脚本开头按 vX.Y.Z 校验过,直接用它做 release 标识,
+# 比 git sha 更贴合「部署出去的是哪个制品」。
+#
+# 写进 .env.production(应用只读挂载它,getServerConfig 从这里读,不看
+# 容器环境变量)。已在运行的旧色早已把配置读进内存,不受影响。
+#
+# 注意:发布失败回滚后,旧色若因任何原因重启,会读到这个新的 release 值而跑着
+# 旧代码。这只影响归因准确性,不影响功能;真正回滚时应重跑对应版本的发布。
+set_release_env_value() {
+  local file="$1" key="$2" value="$3"
+  local tmp="${file}.tmp"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { prefix = key "="; replaced = 0 }
+    index($0, prefix) == 1 {
+      if (!replaced) print prefix value
+      replaced = 1
+      next
+    }
+    { print }
+    END { if (!replaced) print prefix value }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+# 路径可覆盖,理由与 RELEASE_STATE_DIR / RELEASE_MARKER_PATH 相同:脚本第 28 行
+# 就 cd 到仓库根,契约测试也在仓库根跑 —— 写死路径会让跑一次测试就改掉开发机上
+# 真实的 .env.production。
+APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
+if [ -f "$APP_ENV_FILE" ]; then
+  echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
+  set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG"
+  chmod 600 "$APP_ENV_FILE"
+fi
+
 # ── 起新色并等健康 ──────────────────────────────────────────────
 echo "==> Starting $standby"
 if ! compose up -d --no-build --no-deps "$standby"; then

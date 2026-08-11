@@ -68,3 +68,57 @@ test('HostDiskFilling still guards the disks the flood actually lands on', () =>
   assert.match(expr, /< 0\.15/);
   assert.match(alertExpr('HostDiskFilling'), /for: 10m/);
 });
+
+test('CronJobStalled derives its threshold from the exported interval', () => {
+  const expr = alertExpr('CronJobStalled');
+  // 写死阈值就必然要么让每日任务天天误报,要么让每分钟任务停摆一天才响。
+  // 周期由 circle_cron_interval_seconds 从代码里带过来,新任务自动被覆盖。
+  assert.match(expr, /circle_cron_interval_seconds/);
+  assert.match(expr, /time\(\) - max by \(job\)/);
+  // max by (job):蓝绿发布期间两个颜色同时在跑,只要有一个把活干了就不该响。
+  assert.doesNotMatch(expr, /min by \(job\)/);
+});
+
+test('dead-letter alerts fire on new arrivals, not on the standing count', () => {
+  // 死信是只增不减的存量。按 `> 0` 告警会在第一行死信之后永久 firing ——
+  // 本文件反复警告的「永远红 → 训练运维忽略告警」。必须用 delta。
+  for (const name of ['OutboxDeadLettersAppearing', 'GiftCardPermanentlyLost']) {
+    const expr = alertExpr(name);
+    assert.match(expr, /delta\(circle_outbox_dead/, `${name} must use delta()`);
+  }
+});
+
+test('gift-card dead letters are not double-reported', () => {
+  // 钱已结算、卡永久丢失是 critical;通用死信告警必须把它排除,否则同一件事
+  // 在两个严重度上各响一次。
+  assert.match(
+    alertExpr('OutboxDeadLettersAppearing'),
+    /queue!="gift_card"/,
+  );
+  assert.match(alertExpr('GiftCardPermanentlyLost'), /severity: critical/);
+});
+
+test('session-revocation backlog is critical, like RedisDown on the same path', () => {
+  // Redis 挂了撤销 fail-open,队列堵了撤销压根没执行 —— 同一条安全路径的
+  // 两个故障点,都必须叫醒人。
+  const expr = alertExpr('SessionRevocationOutboxStuck');
+  assert.match(expr, /severity: critical/);
+  assert.match(expr, /queue="session_revocation"/);
+});
+
+test('OutboxBacklogStuck clears the gift-card grace period', () => {
+  // gift_card 处理器有 2 分钟宽限期才补发,所以稳态下 oldestAge 常驻 ~120s。
+  // 阈值必须显著高于它,否则这条常年 firing。
+  const expr = alertExpr('OutboxBacklogStuck');
+  const threshold = Number(expr.match(/>\s*(\d+)/)?.[1]);
+  assert.ok(threshold >= 600, `threshold ${threshold}s is too close to the 120s grace period`);
+});
+
+test('Watchdog is unconditional and kept out of the normal severities', () => {
+  const expr = alertExpr('Watchdog');
+  // 它的意义在于「永远 firing」,外部服务收不到才报警。加 for: 或让它带上
+  // warning/critical 都会把它并进普通告警流,那就完全失去作用了。
+  assert.match(expr, /expr: vector\(1\)/);
+  assert.match(expr, /severity: none/);
+  assert.doesNotMatch(expr, /for:/);
+});

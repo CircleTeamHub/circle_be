@@ -5,7 +5,9 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { Pool } from 'pg';
 import { PrismaClient } from 'src/generated/prisma';
+import type { PoolStats } from 'src/metrics/db-pool.metrics';
 import {
   allowsStartWithoutDatabase,
   shouldSkipPrismaConnectOnBoot,
@@ -80,6 +82,10 @@ export class PrismaService
   private readonly logger = new Logger(PrismaService.name);
   private readonly connectionString: string;
   private readonly allowStartWithoutDb: boolean;
+  /** 我们自己创建、因此也由我们负责销毁的池。见 onModuleDestroy。 */
+  private readonly pool: Pool | null;
+  /** 配置上限。pg.Pool 不暴露 max，只能自己记着。 */
+  private readonly poolMax: number;
   private isConnected = false;
 
   constructor() {
@@ -99,16 +105,43 @@ export class PrismaService
     // process.env wins over the .env file, same precedence as DATABASE_URL above.
     const poolConfig = resolveDatabasePoolConfig({ ...config, ...process.env });
 
-    super(
-      connectionString
-        ? {
-            adapter: new PrismaPg({ connectionString, ...poolConfig }),
-          }
-        : {},
-    );
+    // 自己建池再交给适配器，而不是把配置丢给 PrismaPg 让它内部建 ——
+    // 为的是留住这个引用：pg.Pool 的 waitingCount 是「有多少请求正在排队等
+    // 连接」的确定读数，而池排队恰恰是 postgres-exporter 看不见的那类故障
+    // （从 Postgres 视角一切正常，应用侧已经在 connectionTimeoutMillis 上排队）。
+    //
+    // Prisma 自带的 $metrics 在 Prisma 7 已被移除（previewFeatures = ["metrics"]
+    // 会直接报 P1012），所以这是拿到池遥测的唯一途径。
+    const pool = connectionString
+      ? new Pool({ connectionString, ...poolConfig })
+      : null;
 
+    super(pool ? { adapter: new PrismaPg(pool) } : {});
+
+    this.pool = pool;
+    this.poolMax = poolConfig.max;
     this.connectionString = connectionString;
     this.allowStartWithoutDb = allowStartWithoutDb;
+  }
+
+  /**
+   * 连接池实时读数，供 `/metrics` 抓取时求值。读的全是内存计数器，无 I/O。
+   * 无 DATABASE_URL 启动时返回 null —— 调用方据此不注册这几条 gauge，
+   * 而不是让它们恒 0（恒 0 看起来像「池很空闲」，正好是相反的结论）。
+   */
+  getPoolStats(): PoolStats | null {
+    if (!this.pool) return null;
+    return {
+      max: this.poolMax,
+      total: this.pool.totalCount,
+      idle: this.pool.idleCount,
+      waiting: this.pool.waitingCount,
+    };
+  }
+
+  /** 仅供单测断言适配器拿到的是同一个池实例。 */
+  getPoolForTest(): Pool | null {
+    return this.pool;
   }
 
   async onModuleInit() {
@@ -141,6 +174,20 @@ export class PrismaService
   async onModuleDestroy() {
     await this.$disconnect();
     this.isConnected = false;
+    // @prisma/adapter-pg 只在**自己**创建池时负责销毁它（内部用 externalPool
+    // 区分）。既然改成由这里建池，关闭责任也一并转移过来 —— 漏掉这一步，每次
+    // 优雅重启都会留下一把不归还的 Postgres 连接，蓝绿发布下尤其明显。
+    //
+    // 已经关过的池再 end 会抛；关闭失败不该让整个 shutdown 挂掉。
+    try {
+      await this.pool?.end();
+    } catch (error) {
+      this.logger.warn(
+        `Failed to close the pg pool during shutdown: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   isDatabaseConnected(): boolean {

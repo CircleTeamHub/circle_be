@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
@@ -18,7 +19,7 @@ export class SessionRevocationOutboxProcessor {
     private readonly sessionRevocation: SessionRevocationService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'session_revocation_outbox')
   async processPending(): Promise<number> {
     const now = new Date();
     const jobs = await this.prisma.sessionRevocationOutbox.findMany({

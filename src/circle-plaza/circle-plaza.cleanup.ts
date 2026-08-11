@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { CirclePlazaService } from './circle-plaza.service';
 
 // Safety cap on batches drained per tick so a huge backlog can't make a single
@@ -17,7 +18,7 @@ export class CirclePlazaCleanup {
 
   constructor(private readonly service: CirclePlazaService) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'circle_plaza_post_sweep')
   async sweepExpiredPosts(): Promise<void> {
     if (this.running) {
       this.logger.debug('expired circle post sweep already running; skipping');

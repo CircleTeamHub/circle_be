@@ -58,6 +58,44 @@ jobs:
           bash test/sync-metrics-token.spec.sh
           node --test test/prometheus-alerts.spec.mjs
 
+      # prometheus-alerts.spec.mjs 断言的是规则的**语义**（阈值、选择器、
+      # 用 delta 而不是存量…），它读不出 PromQL 语法错误 —— 一个打错的
+      # 表达式会让 Prometheus 在启动时拒绝加载整个规则文件，也就是所有
+      # 告警一起失效。promtool 是唯一能在合并前抓到这个的东西。
+      # 版本与 docker-compose.prod.yml 里锁定的 Prometheus 保持一致。
+      - name: Validate Prometheus rules (promtool)
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/monitoring/prometheus:/rules:ro" \
+            prom/prometheus:v3.7.3 check rules /rules/alerts.yml
+
+      # 路由树写错不会报错,只会把告警**静悄悄地**送去错误的接收者 —— 最坏的
+      # 情况是 critical 落进 warning 的节流里,或者 Watchdog 被并进普通频道从而
+      # 完全失去 dead-man's switch 的作用。这里直接断言三条关键路径的落点。
+      - name: Validate Alertmanager routing (amtool)
+        run: |
+          docker run --rm --entrypoint amtool \
+            -v "$PWD/monitoring/alertmanager:/cfg:ro" \
+            prom/alertmanager:v0.29.0 check-config /cfg/alertmanager.yml
+
+          route_for() {
+            docker run --rm --entrypoint amtool \
+              -v "$PWD/monitoring/alertmanager:/cfg:ro" \
+              prom/alertmanager:v0.29.0 config routes test \
+              --config.file=/cfg/alertmanager.yml "$@" | tail -1
+          }
+          assert_route() {
+            actual="$(route_for "$2" "$3")"
+            if [ "$actual" != "$1" ]; then
+              echo "❌ $2 $3 routed to '$actual', expected '$1'" >&2
+              exit 1
+            fi
+            echo "✅ $2 $3 → $1"
+          }
+          assert_route external-heartbeat alertname=Watchdog severity=none
+          assert_route discord-critical   alertname=RedisDown severity=critical
+          assert_route discord-warning    alertname=HostCpuSaturated severity=warning
+
       - name: Lint
         run: npx eslint "{src,apps,libs,test}/**/*.ts"
 

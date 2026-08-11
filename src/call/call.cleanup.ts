@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { CallService } from './call.service';
 import { reportOperationalError } from '../logging/error-aggregation.service';
 
@@ -9,7 +10,7 @@ export class CallCleanup {
 
   constructor(private readonly callService: CallService) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'call_ringing_sweep')
   async sweepExpiredRingingCalls(): Promise<void> {
     try {
       await this.callService.sweepExpiredRingingCalls();

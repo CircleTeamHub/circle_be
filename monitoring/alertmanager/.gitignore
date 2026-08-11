@@ -1,2 +1,7 @@
 # Real Discord webhook URL — never commit. Create from discord.url.example.
 discord.url
+
+# Real external heartbeat ping URL (healthchecks.io etc.) — never commit.
+# Create from heartbeat.url.example. This is the dead-man's switch: the
+# external service pages when it STOPS receiving pings.
+heartbeat.url

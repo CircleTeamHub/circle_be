@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { createHash } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CHAT_MEDIA_KEY_FIELDS } from 'src/chat/chat.constants';
@@ -65,7 +66,7 @@ export class StorageAuditService {
     private readonly upload: UploadService,
   ) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_5AM)
+  @TrackedCron(CronExpression.EVERY_DAY_AT_5AM, 'storage_audit')
   async audit(now: Date = new Date()): Promise<{
     scanned: number;
     orphanCount: number;
