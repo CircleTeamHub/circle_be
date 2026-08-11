@@ -489,6 +489,10 @@ export class CircleInvitationService {
         //    没有这条过滤会给每个邀请人补一张凭空出现的验证邀请;
         // 2. 已经通过站内通知/待验证列表表过态的人 —— 卡片对他们已无意义。
         status: 'PENDING',
+        // 父邀请也必须还在 PENDING。adminApprove / reconcileApprovedInvitations
+        // 把邀请落成 ADMIN_APPROVED / APPROVED 时**不动席位行** —— 只看席位状态的话,
+        // 补偿任务会补出一张过期卡,验证人点进去只会拿到 NotPending。
+        invitation: { is: { status: 'PENDING' } },
         cardDeliveredAt: null,
         cardAttempts: { lt: VERIFICATION_CARD_MAX_ATTEMPTS },
         // 宽限期:inline 签发可能还在飞,立刻补投等于和它自己抢。

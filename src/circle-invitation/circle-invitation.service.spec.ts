@@ -1021,6 +1021,18 @@ describe('CircleInvitationService', () => {
       expect(args.where.status).toBe('PENDING');
     });
 
+    it('never resends a card for an invitation that is no longer pending', async () => {
+      // adminApprove / reconcileApprovedInvitations 把邀请落成 ADMIN_APPROVED /
+      // APPROVED 时不动席位行 —— 只看席位状态的话会补出一张过期卡,
+      // 验证人点进去只会拿到 NotPending。
+      arrangeSweep();
+
+      await service.sweepUndeliveredVerificationCards(now);
+
+      const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
+      expect(args.where.invitation).toEqual({ is: { status: 'PENDING' } });
+    });
+
     it('only looks at seats past the grace period', async () => {
       // 宽限期内 inline 签发可能还在飞 —— 立刻补投等于和它自己抢。
       arrangeSweep();
