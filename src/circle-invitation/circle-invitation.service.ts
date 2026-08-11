@@ -30,10 +30,17 @@ import {
   InvitationVerifierDto,
 } from './dto/circle-invitation.dto';
 
-// 验证卡片补偿的节流参数。5 分钟一轮 × 12 次 ≈ 1 小时,与转账卡补偿
-// (每分钟 × 60)覆盖同样长的抖动窗口;宽限期给 inline 签发留出完成时间。
+// 验证卡片补偿的节流参数。宽限期给 inline 签发留出完成时间。
+//
+// attempts 上限给到 36(5 分钟一轮 ≈ 3 小时)而不是刚好覆盖 1 小时的 12,
+// 是因为「条件 updateMany」是 CAS 而**不是独占租约**:副本 B 若在副本 A 自增之后、
+// A 还没发完之前扫表,会读到新的 attempts 值并成功再自增一次,于是一个 5 分钟
+// 窗口里可能烧掉多次尝试。重复投递本身无害(clientMessageId 在唯一约束上合并),
+// 真正的代价只是预算提前见底、过早打出「永久丢失」的 error 日志。
+// 与其为此再加一列租约时间戳(这条补偿路径的严重性远不及转账),不如把预算
+// 放宽到能吸收副本倍数 —— 3 副本下仍有 ≈1 小时的真实覆盖。
 const VERIFICATION_CARD_GRACE_MS = 2 * 60 * 1000;
-const VERIFICATION_CARD_MAX_ATTEMPTS = 12;
+const VERIFICATION_CARD_MAX_ATTEMPTS = 36;
 const VERIFICATION_CARD_BATCH = 50;
 
 type CircleInvitationNotificationData = {

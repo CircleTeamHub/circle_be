@@ -1120,7 +1120,7 @@ describe('CircleInvitationService', () => {
           'error',
         )
         .mockImplementation(() => undefined);
-      arrangeSweep({ seats: [{ ...seat, cardAttempts: 11 }] });
+      arrangeSweep({ seats: [{ ...seat, cardAttempts: 35 }] });
       chatMessages.insertServerMessage.mockRejectedValue(
         new Error('chat down'),
       );
