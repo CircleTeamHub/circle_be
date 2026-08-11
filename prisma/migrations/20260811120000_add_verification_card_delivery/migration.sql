@@ -8,11 +8,23 @@ ALTER TABLE "CircleInvitationVerifier"
   ADD COLUMN IF NOT EXISTS "cardDeliveredAt" TIMESTAMP(3),
   ADD COLUMN IF NOT EXISTS "cardAttempts" INTEGER NOT NULL DEFAULT 0;
 
--- 存量行视为「无需补投」：它们的邀请早已发出，卡片当年由客户端发（且必然失败）。
--- 不回填的话补偿任务上线后会给所有历史验证人重发一遍旧邀请卡。
-UPDATE "CircleInvitationVerifier"
-  SET "cardDeliveredAt" = "createdAt"
-  WHERE "cardDeliveredAt" IS NULL;
+-- 存量行回填，但**放过仍然有效的待验证席位**。
+--
+-- 不回填的话，补偿任务上线后会给所有历史验证人重发一遍早已了结的旧邀请卡。
+-- 但一律回填又会误伤真正该补的那批：邀请没有过期机制，"席位 PENDING + 邀请
+-- PENDING" 的行是**当前仍可操作**的请求，而它们的卡片当年由客户端发、必然失败
+-- 过——那才是这次补偿要救的人。写死成已送达等于永久跳过他们。
+-- 所以只回填「已了结」的行；活着的留空，交给 sweep 补投。
+UPDATE "CircleInvitationVerifier" v
+  SET "cardDeliveredAt" = v."createdAt"
+  WHERE v."cardDeliveredAt" IS NULL
+    AND NOT (
+      v."status" = 'PENDING'
+      AND EXISTS (
+        SELECT 1 FROM "CircleInvitation" i
+        WHERE i."id" = v."invitationID" AND i."status" = 'PENDING'
+      )
+    );
 
 -- 补偿任务每 5 分钟查待补行。谓词必须同时带上 status = 'PENDING'：
 -- invite() 建的「邀请人自动通过」那一席，以及已表态但当年 inline 失败的席位，

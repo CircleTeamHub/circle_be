@@ -316,7 +316,10 @@ export class CircleInvitationService {
     });
 
     await this.createAndBroadcastInvitationNotification(notificationData);
-    await this.issueVerificationCard({
+    // 同转账卡:席位与站内通知都已提交,发卡不该再挡住响应。挂住的话客户端超时
+    // 重试会撞 AlreadyVerifier(「加不进去也退不掉」),而补偿任务要等这个请求
+    // 被放弃才轮得到。脱钩,失败/超时都由补偿任务按 cardDeliveredAt 兜。
+    void this.issueVerificationCard({
       invitationId,
       circleId: notificationData.fromCircleID,
       // 上面的 ApplicantOnly 检查已经保证 callerId 就是申请人本人。
@@ -515,9 +518,14 @@ export class CircleInvitationService {
 
     let delivered = 0;
     for (const seat of seats) {
+      // 抢占必须把资格条件一起复查,而不是只 CAS attempts:扫表与抢占之间
+      // respond / adminApprove / reconcile 都可能把席位或父邀请落成终态,
+      // 只按快照发的话就补出一张点进去只会 NotPending 的过期卡。
       const claimed = await this.prisma.circleInvitationVerifier.updateMany({
         where: {
           id: seat.id,
+          status: 'PENDING',
+          invitation: { is: { status: 'PENDING' } },
           cardDeliveredAt: null,
           cardAttempts: seat.cardAttempts,
         },

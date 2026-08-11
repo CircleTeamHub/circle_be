@@ -13,6 +13,10 @@ import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 
 const IDEM = 'idem-key-1';
 
+// 卡片签发已从请求路径脱钩(review P1:不能让聊天投递挡住钱的响应),
+// 所以断言之前要把这一拍排空。
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 describe('CoinService', () => {
   let service: CoinService;
 
@@ -297,6 +301,7 @@ describe('CoinService', () => {
       arrangeHealthyGift();
 
       await service.sendGift('sender-1', 'recipient-1', 100, IDEM, 'happy');
+      await flush();
 
       expect(
         chatService.ensureDirectConversationForSettlement,
@@ -330,6 +335,7 @@ describe('CoinService', () => {
       });
 
       await service.sendGift('sender-1', 'recipient-1', 100, IDEM);
+      await flush();
 
       expect(order).toEqual(['commit', 'card']);
     });
@@ -345,9 +351,27 @@ describe('CoinService', () => {
       await expect(
         service.sendGift('sender-1', 'recipient-1', 100, IDEM),
       ).resolves.toBeUndefined();
+      await flush();
 
       // cardDeliveredAt 保持空 —— cron 的查询条件正是它,兜底才捡得到。
       expect(prisma.coinGift.update).not.toHaveBeenCalled();
+    });
+
+    it('returns even when the chat dependency never settles (P1)', async () => {
+      // 钱已经落库了。发卡要碰聊天库与跨节点 fetchSockets,任何一处卡住都不能
+      // 把 POST /coin/gift 的响应一起挂住 —— 代理/客户端超时后付款方不知道钱
+      // 到底动没动,回转账页重试会生成新的幂等键,那是第二次真实扣款。
+      arrangeHealthyGift();
+      chatMessages.insertServerMessage.mockImplementation(
+        () => new Promise(() => undefined), // 永不兑现
+      );
+
+      await expect(
+        service.sendGift('sender-1', 'recipient-1', 100, IDEM),
+      ).resolves.toBeUndefined();
+
+      // 钱确实提交了,而且没有被发卡挡住。
+      expect(tx.coinGift.create).toHaveBeenCalled();
     });
 
     it('shares one idempotency key with the compensation cron', async () => {
@@ -356,6 +380,7 @@ describe('CoinService', () => {
       arrangeHealthyGift();
 
       await service.sendGift('sender-1', 'recipient-1', 100, IDEM);
+      await flush();
 
       const [, input] = chatMessages.insertServerMessage.mock.calls[0] as [
         string,
@@ -370,6 +395,7 @@ describe('CoinService', () => {
       prisma.coinGift.findUnique.mockResolvedValue({ id: 'gift-prior' });
 
       await service.sendGift('sender-1', 'recipient-1', 100, IDEM);
+      await flush();
 
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
     });

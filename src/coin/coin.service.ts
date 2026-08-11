@@ -228,7 +228,14 @@ export class CoinService {
     );
 
     if (giftId) {
-      await this.issueTransferCard(giftId, senderId, recipientId, amount, {
+      // **不 await**(review P1)。钱已经落库,这一步只是发凭证 —— 但它要碰聊天库
+      // 与跨节点的 fetchSockets,任何一处卡住都会把 POST /coin/gift 的响应一起挂住。
+      // catch 只兜「最终 reject」,兜不住「一直不返回」:代理/客户端超时后付款方
+      // 不知道钱到底动没动,回转账页重试会生成**新的幂等键** —— 那是第二次真实扣款。
+      // 脱钩之后请求在钱提交后立刻返回;卡片照常在毫秒级落地(进程不会取消这个
+      // promise),真出故障则由 GiftCardOutboxProcessor 在 2 分钟宽限后接手。
+      // issueTransferCard 内部自吞异常,不会产生 unhandled rejection。
+      void this.issueTransferCard(giftId, senderId, recipientId, amount, {
         message: message ?? null,
       });
     }

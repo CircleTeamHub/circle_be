@@ -11,6 +11,10 @@ import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleInvitationService } from './circle-invitation.service';
 
+// 卡片签发已从请求路径脱钩(不能让聊天投递挡住 add-verifier 的响应),
+// 所以断言之前要把这一拍排空。
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 describe('CircleInvitationService', () => {
   let service: CircleInvitationService;
 
@@ -788,6 +792,7 @@ describe('CircleInvitationService', () => {
       arrangeAddVerifier();
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       // 会话是「申请人 → 验证人」的单聊,与客户端此前发卡的收件人一致。
       expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
@@ -823,6 +828,7 @@ describe('CircleInvitationService', () => {
       });
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       expect(order).toEqual(['commit', 'card']);
     });
@@ -849,6 +855,7 @@ describe('CircleInvitationService', () => {
       arrangeAddVerifier();
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       const [, input] = chatMessages.insertServerMessage.mock.calls[0] as [
         string,
@@ -865,6 +872,7 @@ describe('CircleInvitationService', () => {
       arrangeAddVerifier();
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       expect(
         chatService.ensureDirectConversationForSettlement,
@@ -884,6 +892,7 @@ describe('CircleInvitationService', () => {
       );
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
       // 终结这一席:补偿任务不再捡它。验证人照样能从站内通知与待验证列表看到请求。
@@ -893,10 +902,26 @@ describe('CircleInvitationService', () => {
       });
     });
 
+    it('returns even when the chat dependency never settles', async () => {
+      // 席位与站内通知都已提交。挂住的话客户端超时重试会撞 AlreadyVerifier
+      //(「加不进去也退不掉」),而补偿任务要等这个请求被放弃才轮得到。
+      arrangeAddVerifier();
+      chatMessages.insertServerMessage.mockImplementation(
+        () => new Promise(() => undefined), // 永不兑现
+      );
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalled();
+    });
+
     it('marks the seat delivered when the inline issuance succeeds', async () => {
       arrangeAddVerifier();
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledWith({
         where: { invitationID: 'inv-1', verifierID: 'verifier-9' },
@@ -924,6 +949,7 @@ describe('CircleInvitationService', () => {
       prisma.user.findUnique.mockResolvedValue(null);
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+      await flush();
 
       expect(chatMessages.insertServerMessage).toHaveBeenCalledWith(
         'dm-1',
@@ -978,7 +1004,15 @@ describe('CircleInvitationService', () => {
       expect(
         prisma.circleInvitationVerifier.updateMany,
       ).toHaveBeenNthCalledWith(1, {
-        where: { id: 'seat-1', cardDeliveredAt: null, cardAttempts: 0 },
+        where: {
+          id: 'seat-1',
+          // 扫表与抢占之间 respond / adminApprove / reconcile 都可能把席位或
+          // 父邀请落成终态,抢占必须把资格条件一起复查,而不是只 CAS attempts。
+          status: 'PENDING',
+          invitation: { is: { status: 'PENDING' } },
+          cardDeliveredAt: null,
+          cardAttempts: 0,
+        },
         data: { cardAttempts: { increment: 1 } },
       });
       const claimOrder =
