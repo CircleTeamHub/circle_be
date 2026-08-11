@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { randomUUID } from 'crypto';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
@@ -34,7 +35,7 @@ export class FriendChatReplayOutboxProcessor {
     private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'friend_chat_replay_outbox')
   async processPending(): Promise<void> {
     const now = new Date();
     const staleBefore = new Date(Date.now() - REPLAY_STALE_LOCK_MS);

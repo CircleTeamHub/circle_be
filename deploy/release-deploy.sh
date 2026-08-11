@@ -539,6 +539,67 @@ if ! compose run --rm migrate; then
 fi
 irreversible_migration_applied=1
 
+# ── 给这次发布盖上 Sentry release 标签 ─────────────────────────
+# 没有 release,Sentry 里就没法回答「这个 bug 是哪次发版引入的」,regression
+# 检测退化、release health 完全不可用 —— 而蓝绿发布恰恰是最需要按版本归因的
+# 场景。RELEASE_TAG 已在脚本开头按 vX.Y.Z 校验过,直接用它做 release 标识,
+# 比 git sha 更贴合「部署出去的是哪个制品」。
+#
+# 写进 .env.production(应用只读挂载它,getServerConfig 从这里读,不看
+# 容器环境变量)。已在运行的旧色早已把配置读进内存,不受影响。
+#
+# 注意:发布失败回滚后,旧色若因任何原因重启,会读到这个新的 release 值而跑着
+# 旧代码。这只影响归因准确性,不影响功能;真正回滚时应重跑对应版本的发布。
+set_release_env_value() {
+  local file="$1" key="$2" value="$3"
+  local tmp="${file}.tmp"
+  # 临时文件装的是**整份生产密钥**(awk 把 $file 原样抄一遍)。直接
+  # `awk ... > "$tmp"` 会用部署机常见的 umask 022 建出 0644,于是从写入到
+  # mv 的这段窗口里同机任何用户都读得到 —— 而 .env.production 本身是 0600,
+  # 等于绕过了它的权限。
+  #
+  # 先删再建:残留的旧 .env.production.tmp(上一次发布被 Ctrl-C 掐断等)会让
+  # `>` 只做截断、保留它原来的宽松权限,umask 对已存在的文件不起作用。
+  # mv 是同目录 rename,0600 跟着 inode 一起到目标,所以目标文件也不存在
+  # 「先 0644 再 chmod」的窗口。
+  rm -f "$tmp" || return 1
+  (umask 077 && : > "$tmp") || return 1
+  awk -v key="$key" -v value="$value" '
+    BEGIN { prefix = key "="; replaced = 0 }
+    index($0, prefix) == 1 {
+      if (!replaced) print prefix value
+      replaced = 1
+      next
+    }
+    { print }
+    END { if (!replaced) print prefix value }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  # 任何一步失败都必须把临时文件带走,否则密钥副本会一直躺在部署目录里 ——
+  # 打标签失败只是警告、发布照常继续,不会有人回头来收拾它。
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+# 路径可覆盖,理由与 RELEASE_STATE_DIR / RELEASE_MARKER_PATH 相同:脚本第 28 行
+# 就 cd 到仓库根,契约测试也在仓库根跑 —— 写死路径会让跑一次测试就改掉开发机上
+# 真实的 .env.production。
+APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
+# 尽力而为,失败绝不中断发版。脚本开头是 set -e:awk/mv 因磁盘写满或权限问题
+# 失败的话,会在迁移之后、进入 handle_post_migration_failure 之前直接退出 ——
+# 在 RELEASE_DOWNTIME=1 模式下旧色已经停了,于是 API 仅仅因为一个可观测性标签
+# 写不进去而一直下线。一个 release 标签不值得拿可用性去换。
+if [ -f "$APP_ENV_FILE" ]; then
+  echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
+  # chmod 是兜底:替换用的临时文件已经是 0600,rename 之后目标文件天然就是
+  # 0600,这一行只负责收拾「文件在这次发布之前就被人放成了 0644」的历史遗留。
+  if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
+    chmod 600 "$APP_ENV_FILE"; then
+    :
+  else
+    echo "WARNING: could not stamp SENTRY_RELEASE into $APP_ENV_FILE; continuing." >&2
+    echo "         Sentry will attribute this release to the previous tag." >&2
+  fi
+fi
+
 # ── 起新色并等健康 ──────────────────────────────────────────────
 echo "==> Starting $standby"
 if ! compose up -d --no-build --no-deps "$standby"; then

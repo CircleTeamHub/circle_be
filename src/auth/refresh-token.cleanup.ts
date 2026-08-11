@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
@@ -23,7 +27,7 @@ export class RefreshTokenCleanup {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'refresh_token_cleanup')
   async sweep(now: Date = new Date()): Promise<void> {
     const revokedCutoff = new Date(
       now.getTime() -
@@ -49,6 +53,8 @@ export class RefreshTokenCleanup {
       });
       // Best-effort housekeeping: never let a prune failure crash the scheduler.
       this.logger.error(`Refresh-token prune failed: ${String(err)}`);
+      // 但要记成失败：不上报的话包装器会把这一轮算成成功，心跳照常前进。
+      reportHandledJobFailure();
     }
   }
 }

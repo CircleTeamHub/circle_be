@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
@@ -62,7 +63,7 @@ export class NotificationPushOutboxProcessor {
     private readonly pushService: NotificationPushService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'notification_push_outbox')
   async processPending(): Promise<number> {
     const now = new Date();
     const staleBefore = new Date(now.getTime() - STALE_LOCK_MS);

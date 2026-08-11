@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 const DEFAULT_NOTIFICATION_RETENTION_DAYS = 90;
@@ -44,7 +45,10 @@ export class NotificationRetentionCleanup {
     );
   }
 
-  @Cron(CronExpression.EVERY_30_MINUTES)
+  @TrackedCron(
+    CronExpression.EVERY_30_MINUTES,
+    'notification_retention_cleanup',
+  )
   async sweep(now: Date = new Date()): Promise<void> {
     await this.runSweep(now);
   }

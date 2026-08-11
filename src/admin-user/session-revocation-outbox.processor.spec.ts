@@ -1,5 +1,28 @@
 import { Logger } from '@nestjs/common';
+import { jobMetrics } from '../metrics/job-metrics';
 import { SessionRevocationOutboxProcessor } from './session-revocation-outbox.processor';
+
+/**
+ * processPending 已经被 @TrackedCron 包住，所以记账断言必须读**全局**的
+ * jobMetrics（装饰器用的就是它）。刻意不在测试里再套一层 runTracked：那会
+ * 变成嵌套，reportHandledJobFailure() 只会落进里层那个真正的上下文，外层
+ * 看到的是一次干净返回 —— 测试于是恒绿，正好漏掉要测的东西。
+ */
+const REVOCATION_JOB = 'session_revocation_outbox';
+const FAILURE_RUNS = new RegExp(
+  `circle_cron_runs_total\\{[^}]*job="${REVOCATION_JOB}"[^}]*result="failure"[^}]*\\}\\s+(\\d+)`,
+);
+const LAST_RESULT = new RegExp(
+  `circle_cron_last_result\\{job="${REVOCATION_JOB}"\\}\\s+([\\d.]+)`,
+);
+const HEARTBEAT = new RegExp(
+  `circle_cron_last_success_timestamp_seconds\\{job="${REVOCATION_JOB}"\\}\\s+([\\d.]+)`,
+);
+
+async function readJobMetric(pattern: RegExp): Promise<number> {
+  const match = pattern.exec(await jobMetrics.registry.metrics());
+  return match ? Number(match[1]) : 0;
+}
 
 describe('SessionRevocationOutboxProcessor', () => {
   const revokedAt = new Date('2026-07-23T20:00:00.000Z');
@@ -102,6 +125,78 @@ describe('SessionRevocationOutboxProcessor', () => {
         attempts: 3,
       }),
     );
+    warn.mockRestore();
+  });
+
+  it('records a failed run when a claimed revocation could not be applied', async () => {
+    // review #150：异常在 catch 里被吞掉、方法正常返回，包装器只看「有没有抛」
+    // 就会把这一轮记成功并推进心跳 —— Redis / 广播长时间不可用时
+    // CronJobFailing 和 CronJobStalled 双双打不中，而一条撤销都没生效。
+    const { prisma, sessionRevocation, processor } = createHarness();
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    prisma.sessionRevocationOutbox.findMany.mockResolvedValue([
+      {
+        userID: 'user-1',
+        revokedAt,
+        nextAttemptAt: revokedAt,
+        expiresAt: futureExpiry(),
+        attempts: 0,
+      },
+    ]);
+    prisma.sessionRevocationOutbox.updateMany.mockResolvedValue({ count: 1 });
+    sessionRevocation.revokeUserAt.mockRejectedValue(new Error('redis down'));
+
+    const failuresBefore = await readJobMetric(FAILURE_RUNS);
+    const heartbeatBefore = await readJobMetric(HEARTBEAT);
+
+    await expect(processor.processPending()).resolves.toBe(0);
+
+    expect(await readJobMetric(FAILURE_RUNS)).toBe(failuresBefore + 1);
+    expect(await readJobMetric(LAST_RESULT)).toBe(0);
+    // 心跳不许前进：前进了 CronJobStalled 也会一起哑掉，两条告警同时失明。
+    expect(await readJobMetric(HEARTBEAT)).toBe(heartbeatBefore);
+    // 记失败不能打断重试循环 —— 这一行仍然要退避重排。
+    expect(prisma.sessionRevocationOutbox.updateMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({ attempts: { increment: 1 } }),
+      }),
+    );
+    warn.mockRestore();
+  });
+
+  it('keeps draining the batch after one revocation fails', async () => {
+    // 失败记账不得改变遍历行为：第一行挂掉，后面的行照样要被处理完。
+    const { prisma, sessionRevocation, processor } = createHarness();
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    prisma.sessionRevocationOutbox.findMany.mockResolvedValue([
+      {
+        userID: 'user-1',
+        revokedAt,
+        nextAttemptAt: revokedAt,
+        expiresAt: futureExpiry(),
+        attempts: 0,
+      },
+      {
+        userID: 'user-2',
+        revokedAt,
+        nextAttemptAt: revokedAt,
+        expiresAt: futureExpiry(),
+        attempts: 0,
+      },
+    ]);
+    prisma.sessionRevocationOutbox.updateMany.mockResolvedValue({ count: 1 });
+    prisma.sessionRevocationOutbox.deleteMany.mockResolvedValue({ count: 1 });
+    sessionRevocation.revokeUserAt
+      .mockRejectedValueOnce(new Error('redis down'))
+      .mockResolvedValueOnce(true);
+
+    await expect(processor.processPending()).resolves.toBe(1);
+
+    expect(sessionRevocation.revokeUserAt).toHaveBeenCalledTimes(2);
+    expect(prisma.sessionRevocationOutbox.deleteMany).toHaveBeenCalledWith({
+      where: { userID: 'user-2', revokedAt },
+    });
     warn.mockRestore();
   });
 

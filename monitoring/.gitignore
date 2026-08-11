@@ -1,0 +1,7 @@
+# Compose environment for the monitoring stack (Grafana admin password) —
+# never commit. Create from .env.example.
+.env
+
+# Exporter connection strings derived from .env.production by
+# monitoring/sync-exporter-env.sh. Contains the database and Redis passwords.
+.env.exporters

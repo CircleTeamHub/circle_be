@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 /**
@@ -19,7 +23,7 @@ export class NoteShareLinkCleanup {
 
   constructor(private readonly prisma: PrismaService) {}
 
-  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'note_share_link_cleanup')
   async sweep(now: Date = new Date()): Promise<void> {
     const cutoff = new Date(
       now.getTime() - NoteShareLinkCleanup.RETENTION_DAYS * 24 * 60 * 60 * 1000,
@@ -40,6 +44,7 @@ export class NoteShareLinkCleanup {
         'share link cleanup failed',
         err instanceof Error ? err.stack : String(err),
       );
+      reportHandledJobFailure();
     }
   }
 }

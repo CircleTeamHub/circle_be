@@ -10,8 +10,12 @@
 # backend on the host at host.docker.internal:3000, no auth). See README.md
 # "Scraping production".
 #
-# Only the circle-be job differs from prometheus.yml; the other jobs and the
-# alert rules are identical, so keep them in sync when editing either file.
+# Differences from prometheus.yml (keep the rest in sync when editing either):
+#   - the circle-be job (blue-green DNS discovery + bearer auth);
+#   - the postgres/redis exporter jobs, which exist only here. On a dev machine
+#     Postgres and Redis often are not in Docker (or not running at all), so
+#     putting them in the base file would mean two permanently DOWN targets —
+#     which just teaches everyone to ignore red.
 
 global:
   scrape_interval: 15s
@@ -91,3 +95,18 @@ scrape_configs:
   - job_name: cadvisor
     static_configs:
       - targets: ['cadvisor:8080']
+
+  # pg_stat_activity_count 带 application_name / usename / wait_event /
+  # wait_event_type / backend_type 五个维度，看着像基数风险，但取值都来自
+  # PostgreSQL 的固定枚举（实测空库 24 条序列，真实负载下也就几百条）。
+  #
+  # 不要为此加 labeldrop：只差一个被丢掉的标签的两条序列会塌缩成同名同标签,
+  # Prometheus 判定为 duplicate sample 并丢弃**整次抓取** —— 为了省几百条
+  # 序列，换来的是这个 job 的所有指标一起消失。
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  - job_name: redis-exporter
+    static_configs:
+      - targets: ['redis-exporter:9121']

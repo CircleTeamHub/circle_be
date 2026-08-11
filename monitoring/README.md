@@ -40,8 +40,18 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Alertmanager | http://localhost:9093 | —                      |
 | Uptime-Kuma  | http://localhost:3002 | set on first visit     |
 
-In Grafana the **Prometheus** datasource and the **circle_be — RED** dashboard
-are auto-provisioned (Dashboards → circle_be — RED).
+In Grafana the **Prometheus** datasource and two dashboards are auto-provisioned:
+
+| Dashboard | Covers |
+| --------- | ------ |
+| **circle_be — RED** | per-route request rate, 5xx ratio, p95 latency, process memory, chat gateway |
+| **circle_be — Jobs, Queues & Datastores** | cron heartbeat lag and failure rate, outbox backlog / dead letters, pg pool queueing, Postgres connections, Redis memory |
+
+The jobs dashboard normalises cron heartbeat lag by each job's own expected
+interval, so a per-minute job and a daily job are readable on one axis — the
+red line at 3.0 is exactly the `CronJobStalled` threshold. Note that the
+postgres/redis panels stay empty in local dev: those exporters exist only in the
+prod overlay.
 
 ### ⚠️ `GRAFANA_ADMIN_PASSWORD` only applies on the FIRST boot of the volume
 
@@ -153,20 +163,38 @@ Run these on the server, from the repo root, **after** the app stack is up.
    Passwordless sudo for `install` and `mv` (or running the script as root) is
    required so repeated rotations never try to overwrite a Prometheus-owned file.
 
-3. **Set the Grafana password** (see the first-boot caveat above):
+3. **Publish the database/Redis credentials to the exporters.** They are derived
+   from `.env.production`, never hand-copied — `DATABASE_URL` carries Prisma's
+   `?schema=public`, which libpq rejects outright, so pasting it verbatim gives
+   you an exporter that starts fine and fails every scrape:
+
+   ```bash
+   bash monitoring/sync-exporter-env.sh
+   ```
+
+   Re-run it after rotating `DB_PASSWORD` or `REDIS_URL`. If the file is missing
+   the two exporters fail to start and their targets go DOWN (a `TargetDown`
+   alert) — deliberately scoped, so a forgotten script never keeps Prometheus
+   and Alertmanager themselves from starting.
+
+4. **Set the Grafana password** (see the first-boot caveat above):
 
    ```bash
    cp monitoring/.env.example monitoring/.env   # then fill GRAFANA_ADMIN_PASSWORD
    ```
 
-4. **Start it:**
+5. **Wire the external heartbeat** — see [External heartbeat](#external-heartbeat-dead-mans-switch).
+   Skipping this leaves the single biggest blind spot open: nothing alerts when
+   the monitoring host itself goes down.
+
+6. **Start it:**
 
    ```bash
    docker compose -f monitoring/docker-compose.yml \
                   -f monitoring/docker-compose.prod.yml up -d
    ```
 
-5. **Verify — do not skip this.** The whole failure mode here is monitoring that
+7. **Verify — do not skip this.** The whole failure mode here is monitoring that
    looks installed and reports nothing:
 
    ```bash
@@ -263,6 +291,78 @@ curl -XPOST http://localhost:9093/api/v2/alerts -H 'Content-Type: application/js
   -d '[{"labels":{"alertname":"DiscordTest","severity":"critical"}}]'
 ```
 
+## External heartbeat (dead man's switch)
+
+**This is the one thing in this stack that covers "the monitoring itself died."**
+
+Everything else here runs on the same machine as the thing it watches. When that
+machine goes down — hard crash, disk full, network cut, someone's `down -v` —
+Prometheus, Alertmanager and Uptime-Kuma all go with it and **Discord gets
+nothing**. `HostDiskFilling` and `HighMemory` are precisely the alerts whose
+firing means the host is close to unusable, and they are delivered by the host
+that is about to become unusable.
+
+The `Watchdog` rule in [`prometheus/alerts.yml`](prometheus/alerts.yml) is
+always firing and is routed on its own to an outside service. The direction is
+inverted from every other alert here: the outside service pages you when it
+**stops** receiving pings.
+
+1. Create a check at [healthchecks.io](https://healthchecks.io) (free tier is
+   enough) — or Better Stack / Cronitor / an existing PagerDuty heartbeat.
+   Set **period 15m, grace 10m**; Alertmanager re-sends the Watchdog every 5m,
+   so a healthy pipeline never times out and a dead one is caught within ~25m.
+2. Put the ping URL in the gitignored file:
+
+   ```bash
+   cp monitoring/alertmanager/heartbeat.url.example monitoring/alertmanager/heartbeat.url
+   # then paste the real ping URL into heartbeat.url
+   ```
+
+3. Reload Alertmanager:
+
+   ```bash
+   docker compose -f monitoring/docker-compose.yml restart alertmanager
+   ```
+
+Alertmanager still starts if the file is missing — it just cannot ping, and the
+external service alerts on the silence. That is the intended behaviour: a
+misconfigured heartbeat is indistinguishable from no monitoring, so it must be
+loud rather than silently absent.
+
+Verify it end to end by confirming the external check flips to "up" within a few
+minutes of starting the stack. Do not treat this step as done until you have
+seen that, then **deliberately stop Alertmanager and confirm you get paged.**
+An untested dead man's switch is worse than none — it buys false confidence.
+
+## Alert tiers and inhibition
+
+[`alertmanager/alertmanager.yml`](alertmanager/alertmanager.yml) routes by
+`severity`:
+
+| Tier       | Receiver             | `group_wait` | `repeat_interval` |
+| ---------- | -------------------- | ------------ | ----------------- |
+| `critical` | `discord-critical`   | 10s          | 1h                |
+| `warning`  | `discord-warning`    | 30s          | 4h                |
+| `none`     | `external-heartbeat` | 0s           | 5m                |
+
+Both Discord receivers point at the same webhook by default; `severity` is in
+`group_by`, so the two never get merged into one message. For a separate channel
+or an `@here`, create a second webhook, drop it in
+`alertmanager/discord-critical.url`, and point the `discord-critical` receiver
+at that file.
+
+Inhibition suppresses the alerts a known upstream failure is *guaranteed* to
+cause, so one incident is not reported five different ways:
+
+- `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox
+- `PostgresDown` → suppresses cron / outbox / 5xx
+- any `critical` → suppresses the `warning` **with the same `alertname`**
+  (the `equal: ['alertname']` there is load-bearing: without it, a single
+  critical would mute every warning in the system)
+
+CI asserts the three key routing paths with `amtool config routes test`, because
+a mis-routed alert fails *silently* — it just goes somewhere useless.
+
 ## Uptime monitoring (Uptime-Kuma)
 
 Covers the gap Prometheus can't: **"is the service even reachable?"** Configured
@@ -281,8 +381,13 @@ in its own UI (data persists in a volume).
 
 ## Production
 
-- Pin image versions (these are `:latest` for a quick local start) before using
-  this stack outside local development.
+- Image versions are pinned **in the prod overlay**, not in the base file — the
+  base keeps `:latest` for a frictionless local start. That means a bare
+  `docker compose -f monitoring/docker-compose.yml up -d` on a server runs
+  unpinned images, which is one more reason never to bring this stack up without
+  the overlay. Bump the pins deliberately, one image at a time, reading release
+  notes; a surprise major upgrade tends to land while you are already debugging
+  something else.
 - Keep `/metrics`, Prometheus, Grafana, Alertmanager, and Uptime-Kuma on an
   internal network — do not expose them publicly (see the security note in
   `../docs/metrics.md`).
