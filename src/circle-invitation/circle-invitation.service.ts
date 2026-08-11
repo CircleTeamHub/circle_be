@@ -372,20 +372,56 @@ export class CircleInvitationService {
         applicantName: applicant?.nickname ?? '',
       });
       // 置位是补偿任务的唯一判据 —— 只有真送出去了才置。
-      await this.prisma.circleInvitationVerifier.updateMany({
-        where: {
-          invitationID: params.invitationId,
-          verifierID: params.verifierId,
-        },
-        data: { cardDeliveredAt: new Date() },
+      await this.settleVerificationCard({
+        invitationID: params.invitationId,
+        verifierID: params.verifierId,
       });
     } catch (error) {
+      if (this.isTerminalDeliveryRefusal(error)) {
+        // 隐私设置在正确地生效,不是故障 —— 终结这一席,别让补偿任务反复重试。
+        await this.settleVerificationCard({
+          invitationID: params.invitationId,
+          verifierID: params.verifierId,
+        }).catch(() => undefined);
+        this.logger.log(
+          `verification card not delivered (peer does not accept it) invitation=${params.invitationId} verifier=${params.verifierId}`,
+        );
+        return;
+      }
       this.logger.warn(
         `verification card issuance failed invitation=${params.invitationId} verifier=${params.verifierId}, leaving it to the sweep: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
+  }
+
+  /**
+   * 卡片投递被**终局**拒绝(而不是瞬时故障)。
+   *
+   * 对方关了「接收陌生人消息」、拉黑了申请人、账号已注销 —— 这些重试一万次都
+   * 不会变。按失败处理会白烧 12 次尝试,最后还打一条「永久丢失、需人工介入」的
+   * error 日志,而这其实是**隐私设置在正确地生效**。终局拒绝直接把这一席标成
+   * 「不再欠卡」:验证人照样能从站内通知与「我的待验证」列表看到这条请求。
+   */
+  private isTerminalDeliveryRefusal(error: unknown): boolean {
+    return (
+      error instanceof ForbiddenException ||
+      error instanceof NotFoundException ||
+      error instanceof BadRequestException
+    );
+  }
+
+  /** 这一席不再欠卡(已送达,或按隐私设置不投)—— 补偿任务据此不再捡它。 */
+  private async settleVerificationCard(where: {
+    invitationID?: string;
+    verifierID?: string;
+    id?: string;
+  }): Promise<void> {
+    await this.prisma.circleInvitationVerifier.updateMany({
+      where,
+      data: { cardDeliveredAt: new Date() },
+    });
   }
 
   /** 卡片投递本体(inline 签发与补偿任务共用,保证两条路径同键同形状)。 */
@@ -396,13 +432,23 @@ export class CircleInvitationService {
     circleName: string;
     applicantName: string;
   }): Promise<void> {
-    // 走结算专用解析:与转账卡同一判据 —— 不过拉黑/陌生人消息那两道闸,
-    // 那是给用户主动发消息设的,而这里是一条已经发生的邀请的回执。
-    const conversationId =
-      await this.chatService.ensureDirectConversationForSettlement(
-        card.applicantId,
-        card.verifierId,
-      );
+    // **必须走交互式解析**,不能用结算专用那条(review P1)。
+    //
+    // 转账卡能用结算解析,是因为 sendGift 只在好友之间成立、且钱已经划走 ——
+    // 既成事实的回执。加验证人不同:验证人只需要是圈子活跃成员,**不需要是好友**,
+    // 而这一步是申请人主动挑人触发的。用结算解析会绕过对方的「接收陌生人消息」
+    // 开关直接建出一个正常的 DIRECT 会话 —— 而那道闸全仓只在建会话时查一次,
+    // 发送路径永不复查(见 chat.service 里那段注释:「建完会话就能立刻 socket
+    // 发消息」)。于是 POST /circle-invitation/:id/add-verifier 就成了任何人
+    // 强开私聊通道的入口。
+    //
+    // 交互式解析会照常过拉黑与陌生人开关;被拒是**终局**,由调用方按终局处理,
+    // 不进重试(见 issueVerificationCard / sweep 的 isTerminalDeliveryRefusal)。
+    const conversation = await this.chatService.getOrCreateDirectConversation(
+      card.applicantId,
+      card.verifierId,
+    );
+    const conversationId = conversation.id;
     await this.chatMessages.insertServerMessage(conversationId, {
       senderID: card.applicantId,
       type: 'verification-card',
@@ -482,12 +528,18 @@ export class CircleInvitationService {
           circleName: seat.invitation.circle?.name ?? '',
           applicantName: seat.invitation.applicant?.nickname ?? '',
         });
-        await this.prisma.circleInvitationVerifier.updateMany({
-          where: { id: seat.id },
-          data: { cardDeliveredAt: new Date() },
-        });
+        await this.settleVerificationCard({ id: seat.id });
         delivered += 1;
       } catch (error) {
+        if (this.isTerminalDeliveryRefusal(error)) {
+          await this.settleVerificationCard({ id: seat.id }).catch(
+            () => undefined,
+          );
+          this.logger.log(
+            `verification card not delivered (peer does not accept it) invitation=${seat.invitationID} verifier=${seat.verifierID}`,
+          );
+          continue;
+        }
         const attemptsNow = seat.cardAttempts + 1;
         if (attemptsNow >= VERIFICATION_CARD_MAX_ATTEMPTS) {
           // 打光后这行被查询永久排除 —— 用 error 级日志把「卡片永久丢失」暴露

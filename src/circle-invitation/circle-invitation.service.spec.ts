@@ -72,7 +72,10 @@ describe('CircleInvitationService', () => {
   };
   const memberLock = { lock: jest.fn() };
   const chatCircleSync = { ensureCircleConversation: jest.fn() };
-  const chatService = { ensureDirectConversationForSettlement: jest.fn() };
+  const chatService = {
+    ensureDirectConversationForSettlement: jest.fn(),
+    getOrCreateDirectConversation: jest.fn(),
+  };
   const chatMessages = { insertServerMessage: jest.fn() };
 
   beforeEach(async () => {
@@ -84,6 +87,7 @@ describe('CircleInvitationService', () => {
     admissionPolicy.activateMembers.mockResolvedValue(['applicant-1']);
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-1');
     chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
+    chatService.getOrCreateDirectConversation.mockResolvedValue({ id: 'dm-1' });
     chatMessages.insertServerMessage.mockResolvedValue({ id: 'msg-1' });
 
     const module: TestingModule = await Test.createTestingModule({
@@ -786,9 +790,10 @@ describe('CircleInvitationService', () => {
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
 
       // 会话是「申请人 → 验证人」的单聊,与客户端此前发卡的收件人一致。
-      expect(
-        chatService.ensureDirectConversationForSettlement,
-      ).toHaveBeenCalledWith('applicant-1', 'verifier-9');
+      expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
+        'applicant-1',
+        'verifier-9',
+      );
       expect(chatMessages.insertServerMessage).toHaveBeenCalledWith('dm-1', {
         senderID: 'applicant-1',
         type: 'verification-card',
@@ -850,6 +855,42 @@ describe('CircleInvitationService', () => {
         { clientMessageId: string },
       ];
       expect(input.clientMessageId).toBe('verification_card_inv-1_verifier-9');
+    });
+
+    it('never opens an unsolicited DM channel to deliver the card (P1)', async () => {
+      // 加验证人只要求对方是圈子活跃成员,**不要求是好友**,而这一步是申请人
+      // 主动挑人触发的。用结算专用解析会绕过对方的「接收陌生人消息」开关直接
+      // 建出正常 DIRECT 会话 —— 那道闸全仓只在建会话时查一次、发送路径永不复查,
+      // 于是 add-verifier 就成了任何人强开私聊通道的入口。
+      arrangeAddVerifier();
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(
+        chatService.ensureDirectConversationForSettlement,
+      ).not.toHaveBeenCalled();
+      expect(chatService.getOrCreateDirectConversation).toHaveBeenCalledWith(
+        'applicant-1',
+        'verifier-9',
+      );
+    });
+
+    it('treats a privacy refusal as terminal, not as a failure to retry', async () => {
+      // 对方关了陌生人消息 = 隐私设置在正确地生效,不是故障。按失败处理会白烧
+      // 12 次重试,最后还打一条「永久丢失、需人工介入」的 error 日志。
+      arrangeAddVerifier();
+      chatService.getOrCreateDirectConversation.mockRejectedValue(
+        new ForbiddenException({ message: '对方不接收陌生人消息' }),
+      );
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+      // 终结这一席:补偿任务不再捡它。验证人照样能从站内通知与待验证列表看到请求。
+      expect(prisma.circleInvitationVerifier.updateMany).toHaveBeenCalledWith({
+        where: { invitationID: 'inv-1', verifierID: 'verifier-9' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
     });
 
     it('marks the seat delivered when the inline issuance succeeds', async () => {
@@ -989,6 +1030,24 @@ describe('CircleInvitationService', () => {
       const [args] = prisma.circleInvitationVerifier.findMany.mock.calls[0];
       expect(args.where.cardDeliveredAt).toBeNull();
       expect(args.where.createdAt.lt.getTime()).toBeLessThan(now.getTime());
+    });
+
+    it('settles the seat instead of retrying when the peer refuses (P1)', async () => {
+      arrangeSweep();
+      chatService.getOrCreateDirectConversation.mockRejectedValue(
+        new ForbiddenException({ message: '对方不接收陌生人消息' }),
+      );
+
+      const delivered = await service.sweepUndeliveredVerificationCards(now);
+
+      expect(delivered).toBe(0);
+      // 抢占 + 终结,各一次;不应留在队列里反复重试。
+      expect(
+        prisma.circleInvitationVerifier.updateMany,
+      ).toHaveBeenNthCalledWith(2, {
+        where: { id: 'seat-1' },
+        data: { cardDeliveredAt: expect.any(Date) },
+      });
     });
 
     it('does not mark delivered when the send fails', async () => {
