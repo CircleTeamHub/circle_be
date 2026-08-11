@@ -13,6 +13,7 @@ const user = (id: string, overrides: Record<string, unknown> = {}) => ({
 
 describe('SupportService', () => {
   const tx = {
+    $executeRaw: jest.fn(),
     supportAgent: {
       findMany: jest.fn(),
       deleteMany: jest.fn(),
@@ -182,6 +183,26 @@ describe('SupportService', () => {
             { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
           ],
         }),
+      );
+    });
+
+    // 没有这把锁,两个管理员同时提交会各自读到同一份 before 快照、各自只删自己
+    // 快照里的行,最终落库的是两份 payload 的并集 —— 谁都没提交过那个组合。
+    it('serializes the whole-table replacement behind an advisory lock taken before the read', async () => {
+      activeUsers(['u1']);
+
+      await service.replaceAgents(operator, [
+        { category: 'recharge', userID: 'u1', sortOrder: 0 },
+      ]);
+
+      expect(tx.$executeRaw).toHaveBeenCalled();
+      const lockSql = JSON.stringify(tx.$executeRaw.mock.calls[0][0]);
+      expect(lockSql).toMatch(/pg_advisory_xact_lock/);
+      expect(lockSql).toMatch(/support-agents-replace/);
+
+      // 锁必须先于 before 快照,否则两个事务照样能读到同一份旧值。
+      expect(tx.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        tx.supportAgent.findMany.mock.invocationCallOrder[0],
       );
     });
 
