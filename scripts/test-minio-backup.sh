@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end proof for the object (MinIO) backup path.
 #
-# Third of three: test-backup-restore.sh covers Postgres+WAL, test-mongo-backup.sh
-# covers chat history, this covers user media — avatars, chat attachments, note
-# media. Until this existed, backup-minio.sh and restore-minio.sh had never been
-# executed once, in any test.
+# Second of two: test-backup-restore.sh covers Postgres+WAL (聊天记录也在里面,
+# 自研 chat 的三张表就是业务库的表), this covers user media — avatars, chat
+# attachments, note media. Until this existed, backup-minio.sh and
+# restore-minio.sh had never been executed once, in any test.
 #
 # What it proves, in order:
 #   1. The mirror actually copies objects off-host, with byte-identical content
@@ -95,9 +95,6 @@ services:
 
   # Not started, but compose validates env_file for every service while parsing.
   postgres:
-    env_file: !override
-      - $tmp_env
-  backup_mongo:
     env_file: !override
       - $tmp_env
 EOF

@@ -76,7 +76,6 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/notification/profile/read-all',
   '/api/v1/notification/read-all',
   '/api/v1/notification/unread-summary',
-  '/api/v1/outbox/health',
   '/api/v1/privacy/settings',
   '/api/v1/roles',
   '/api/v1/temp-chat',

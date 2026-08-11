@@ -64,7 +64,6 @@
     "joi": "^18.1.2",
     "livekit-server-sdk": "^2.15.4",
     "module-alias": "^2.2.2",
-    "mongodb": "^6.21.0",
     "nest-winston": "^1.10.2",
     "nodemailer": "^9.0.3",
     "passport": "^0.7.0",

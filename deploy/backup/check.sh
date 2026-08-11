@@ -50,37 +50,8 @@ else
   rc=1
 fi
 
-# ── chat history ──────────────────────────────────────────────────────────────
-# `pgbackrest check` covers Postgres and nothing else. Without the block below,
-# the mongo dump — every message in the product — could fail on every single run
-# (OpenIM rotated its Mongo password, the openim network went away, the age
-# recipient is malformed) and this check would still print "all checks passed",
-# because the only thing it proved was that the DESTINATION answers.
-#
-# Freshness, not reachability, is the property that matters: the dump is a full
-# dump on a fixed schedule, so "nothing new landed" is the failure signal.
-#
-# Presence of any object under mongo/ is what tells us the mongo job is supposed
-# to be running at all — backup_mongo is profile-gated and legitimately absent
-# until OpenIM is deployed (DEPLOY.md stage 5), and an unconfigured job must not
-# raise a false alarm.
-MONGO_PREFIX="backup/${BACKUP_S3_BUCKET}/mongo/"
-if [ -n "$(mc ls --recursive "$MONGO_PREFIX" 2>/dev/null | head -1)" ]; then
-  # A duration string, not a bare hour count: `mc find` takes 7d10h31s form, and
-  # expressing the threshold the same way keeps it honest for sub-hour schedules
-  # (and lets the test suite drive it to 1s to prove the alarm actually fires).
-  max_age="${BACKUP_CHECK_MONGO_MAX_AGE:-3h}"
-  if [ -n "$(mc find "$MONGO_PREFIX" --newer-than "$max_age" 2>/dev/null | head -1)" ]; then
-    log "OK  mongo: a chat-history dump landed within ${max_age}"
-  else
-    warn "FAIL mongo: NO chat-history dump in the last ${max_age}."
-    warn "     Chat history is not being backed up. Check the backup_mongo service:"
-    warn "     docker compose -f docker-compose.prod.yml -f docker-compose.backup.yml logs backup_mongo"
-    rc=1
-  fi
-else
-  log "skip mongo: nothing under mongo/ yet (backup_mongo profile not enabled)"
-fi
+# 聊天记录不再需要独立检查:自研 chat 的三张表就在业务 Postgres 里,`pgbackrest check`
+# 与上面的目的地新鲜度检查已经覆盖。(旧 OpenIM Mongo 的 dump 检查随该栈退役一并删除。)
 
 # ── object mirror ─────────────────────────────────────────────────────────────
 # The mirror cannot be checked by freshness: it only creates objects when users

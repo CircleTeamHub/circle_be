@@ -60,9 +60,9 @@ Current events:
 - `http_error`: error event for thrown HTTP or server errors.
 - `rate_limit_hit`: explicit limiter hit with limiter name.
 - `business_event`: currently used for auth and selected friend actions.
-- `external_call_failed`: currently used for OpenIM and MinIO presign failures.
+- `external_call_failed`: currently used for MinIO presign failures.
 - `security_event`: currently used for 401, 403, and rate limit hits.
-- `external_call_slow`: warning event for slow OpenIM or MinIO calls.
+- `external_call_slow`: warning event for slow MinIO calls.
 
 Deferred production events:
 
@@ -76,7 +76,6 @@ Never log:
 - Passwords.
 - JWT access tokens.
 - Refresh tokens.
-- OpenIM tokens.
 - Verification codes.
 - Cookies.
 - Authorization headers.
@@ -94,7 +93,7 @@ Access logs record the route path without query values. Error logs record error 
 4. Check for `http_error` with the same request ID.
 5. If duration is high, check for `http_slow`.
 6. If a write failed due to repeated calls, check for `rate_limit_hit`.
-7. If OpenIM or MinIO failed, check for `external_call_failed`.
+7. If MinIO failed, check for `external_call_failed`.
 
 ## Error Aggregation (Sentry)
 

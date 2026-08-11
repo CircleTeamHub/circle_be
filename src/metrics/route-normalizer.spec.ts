@@ -108,7 +108,7 @@ describe('normalizeRoute', () => {
     ).toBe('/api/v1/note/share-links/:token');
   });
 
-  it('collapses OpenIM string ids used in group and chat-history routes', () => {
+  it('collapses non-uuid string ids in group and chat-history routes', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
       '/api/v1/group/:groupID/members/:userID',
     );
