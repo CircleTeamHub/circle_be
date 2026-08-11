@@ -1204,6 +1204,39 @@ describe('ChatService', () => {
   });
 
   describe('listConversations', () => {
+    it('pushes viewer retention into preview and unread queries', async () => {
+      privacySettings.getSettings.mockResolvedValue({
+        messageSelfDestructDays: 2,
+      });
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        {
+          ...membership(),
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            burnDurationSec: null,
+            lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+          },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.listConversations('u1');
+
+      expect(privacySettings.getSettings).toHaveBeenCalledWith('u1');
+      const cutoffParams = (prisma.$queryRaw.mock.calls as unknown[][])
+        .map((call) => call.slice(1))
+        .flat()
+        .filter(
+          (param): param is (Date | null)[] =>
+            Array.isArray(param) && param[0] instanceof Date,
+        );
+      expect(cutoffParams).toHaveLength(2);
+    });
+
     it('returns dtos with unread counts excluding own messages', async () => {
       prisma.chatMember.findMany
         .mockResolvedValueOnce([
