@@ -14,5 +14,8 @@ import { SessionRevocationOutboxProcessor } from './session-revocation-outbox.pr
     AdminUserAuditService,
     SessionRevocationOutboxProcessor,
   ],
+  // 治理侧与用户中心共用同一张 AdminAuditLog;客服配置也走这条链路,
+  // 所以审计服务需要跨模块可注入,而不是每个模块各起一份。
+  exports: [AdminUserAuditService],
 })
 export class AdminUserModule {}

@@ -21,6 +21,7 @@ import {
   NoteErrorCode,
   PlazaErrorCode,
   PrivacyErrorCode,
+  SupportErrorCode,
   TempChatErrorCode,
   TraceErrorCode,
   UploadErrorCode,
@@ -60,6 +61,7 @@ describe('app error code catalog', () => {
     IconErrorCode,
     LikeErrorCode,
     PrivacyErrorCode,
+    SupportErrorCode,
     UserErrorCode,
   } as const;
 

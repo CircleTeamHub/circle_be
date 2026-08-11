@@ -358,6 +358,13 @@ export const PrivacyErrorCode = {
   InvitePermissionInvalid: 'PRIVACY_INVITE_PERMISSION_INVALID',
 } as const;
 
+// 客服账号配置(管理台写入时的校验)。把「配错了要等用户点击才暴露」提前到配置那一刻。
+export const SupportErrorCode = {
+  AgentUserNotFound: 'SUPPORT_AGENT_USER_NOT_FOUND',
+  AgentUserInactive: 'SUPPORT_AGENT_USER_INACTIVE',
+  AgentDuplicate: 'SUPPORT_AGENT_DUPLICATE',
+} as const;
+
 // 用户资料:仅本人可改 / 仅本人可删 / 生日取值非法。
 export const UserErrorCode = {
   UpdateOwnOnly: 'USER_UPDATE_OWN_ONLY',
@@ -401,6 +408,7 @@ export type AppErrorCode =
   | (typeof IconErrorCode)[keyof typeof IconErrorCode]
   | (typeof LikeErrorCode)[keyof typeof LikeErrorCode]
   | (typeof PrivacyErrorCode)[keyof typeof PrivacyErrorCode]
+  | (typeof SupportErrorCode)[keyof typeof SupportErrorCode]
   | (typeof UserErrorCode)[keyof typeof UserErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
@@ -428,6 +436,7 @@ export const APP_ERROR_CODE_GROUPS = [
   IconErrorCode,
   LikeErrorCode,
   PrivacyErrorCode,
+  SupportErrorCode,
   UserErrorCode,
 ] as const;
 

@@ -3,14 +3,17 @@ import { Prisma } from 'src/generated/prisma';
 import { getRequestContext } from 'src/logging/request-context';
 import { PrismaService } from 'src/prisma/prisma.service';
 
+/** 快照既可能是单个实体(用户中心),也可能是整表(客服配置的覆盖式写入)。 */
+type AuditSnapshot = Record<string, unknown> | Record<string, unknown>[];
+
 export type AuditInput = {
   actorId: string;
   actorAccountId: string;
   action: string;
-  targetType: 'user';
+  targetType: 'user' | 'support_agents';
   targetId: string;
-  before?: Record<string, unknown>;
-  after?: Record<string, unknown>;
+  before?: AuditSnapshot;
+  after?: AuditSnapshot;
   reason?: string;
   metadata?: Record<string, unknown>;
 };

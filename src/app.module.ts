@@ -38,6 +38,7 @@ import { CreditModule } from './credit/credit.module';
 import { AdminUserModule } from './admin-user/admin-user.module';
 import { FancyNumberModule } from './fancy-number/fancy-number.module';
 import { GroupExpansionModule } from './group-expansion/group-expansion.module';
+import { SupportModule } from './support/support.module';
 import { DashboardModule } from './admin-dashboard/dashboard.module';
 import { AvatarFrameModule } from './avatar-frame/avatar-frame.module';
 import { AdminCommunityModule } from './admin-community/admin-community.module';
@@ -87,6 +88,7 @@ const envFilePath = `.env.${nodeEnv}`;
     AdminUserModule,
     FancyNumberModule,
     GroupExpansionModule,
+    SupportModule,
     DashboardModule,
     AvatarFrameModule,
     AdminCommunityModule,

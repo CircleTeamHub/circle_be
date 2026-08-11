@@ -71,6 +71,12 @@ describe('ChatService', () => {
     broadcastSystemMessage: jest.fn(),
   };
 
+  // 默认不是客服 —— 陌生人开关的既有用例必须继续走 privacySettings 那条判定,
+  // 否则豁免会把它们全部无声放行。
+  const support = {
+    isSupportAgent: jest.fn().mockResolvedValue(false),
+  };
+
   const service = new ChatService(
     prisma as never,
     sensitiveWords as never,
@@ -79,6 +85,7 @@ describe('ChatService', () => {
     privacySettings as never,
     broadcast as never,
     systemMessage as never,
+    support as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -140,6 +147,8 @@ describe('ChatService', () => {
     // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
     prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
+    // 必须每个用例重置:客服豁免一旦泄漏成 true,所有陌生人开关的用例都会被无声放行。
+    support.isSupportAgent.mockResolvedValue(false);
     privacySettings.getSettings.mockResolvedValue({
       messageSelfDestructDays: 0,
     });
@@ -685,6 +694,61 @@ describe('ChatService', () => {
       });
       // 只查拉黑放行的话,这里已经建好会话并可以立刻 socket 发消息了。
       expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+    });
+
+    // 客服本人在 App 里关掉「接收陌生人消息」会静默切断整条客服通道,且失效时
+    // 没有任何信号 —— 用户只看到「对方不接收陌生人消息」。豁免做在服务端。
+    it('lets a stranger open a chat with a support agent who disallows strangers', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      prisma.chatConversation.create.mockResolvedValue(conversationRow);
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canReceiveStrangerMessage.mockResolvedValue(false);
+      support.isSupportAgent.mockResolvedValue(true);
+
+      await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(prisma.chatConversation.create).toHaveBeenCalled();
+    });
+
+    // 豁免只对客服放行,不能顺手把所有人都放行。
+    it('still refuses a non-agent stranger while the exemption exists', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canReceiveStrangerMessage.mockResolvedValue(false);
+      support.isSupportAgent.mockResolvedValue(false);
+
+      await expect(
+        service.getOrCreateDirectConversation('u1', 'u2'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.StrangerNotAllowed },
+      });
+    });
+
+    // 拉黑不在豁免范围内:客服也不该绕过拉黑。
+    it('does not let the support exemption bypass a block', async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+      support.isSupportAgent.mockResolvedValue(true);
+
+      await expect(
+        service.getOrCreateDirectConversation('u1', 'u2'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.Blocked },
+      });
+    });
+
+    // 账号被封的客服同样不该被豁免放行 —— status 检查在豁免之前。
+    it('does not let the support exemption revive a banned peer', async () => {
+      prisma.user.findUnique.mockResolvedValue({ ...peer, status: 'BANNED' });
+      support.isSupportAgent.mockResolvedValue(true);
+
+      await expect(
+        service.getOrCreateDirectConversation('u1', 'u2'),
+      ).rejects.toThrow(NotFoundException);
     });
 
     it('lets accepted friends through regardless of the stranger switch', async () => {
