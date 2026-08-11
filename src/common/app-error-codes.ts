@@ -363,6 +363,7 @@ export const SupportErrorCode = {
   AgentUserNotFound: 'SUPPORT_AGENT_USER_NOT_FOUND',
   AgentUserInactive: 'SUPPORT_AGENT_USER_INACTIVE',
   AgentDuplicate: 'SUPPORT_AGENT_DUPLICATE',
+  AgentsConflict: 'SUPPORT_AGENTS_CONFLICT',
 } as const;
 
 // 用户资料:仅本人可改 / 仅本人可删 / 生日取值非法。

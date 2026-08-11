@@ -23,7 +23,7 @@ export class SupportAdminController {
   @ApiOperation({ summary: '客服账号配置(含停用行)' })
   @ApiOkResponse({ type: AdminSupportAgentsDto })
   async list(): Promise<AdminSupportAgentsDto> {
-    return { agents: await this.support.listForAdmin() };
+    return this.support.listForAdminWithRevision();
   }
 
   @Put('agents')
@@ -33,10 +33,10 @@ export class SupportAdminController {
     @Req() req: RequestWithUser,
     @Body() body: ReplaceSupportAgentsDto,
   ): Promise<AdminSupportAgentsDto> {
-    const agents = await this.support.replaceAgents(
+    return this.support.replaceAgents(
       { userId: req.user.userId, accountId: req.user.accountId },
       body.agents,
+      body.expectedRevision,
     );
-    return { agents };
   }
 }

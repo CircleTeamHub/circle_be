@@ -12,6 +12,7 @@ function validate(enabled: unknown) {
   const dto = plainToInstance(
     ReplaceSupportAgentsDto,
     {
+      expectedRevision: 'deadbeef',
       agents: [
         {
           category: 'recharge',
@@ -31,6 +32,26 @@ function validate(enabled: unknown) {
 }
 
 describe('ReplaceSupportAgentsDto', () => {
+  // 过渡期:旧管理台不会带这个字段,必填会让「新后端 + 旧管理台」窗口里每次保存都 400。
+  it('accepts a body without expectedRevision during the rollout window', () => {
+    const dto = plainToInstance(
+      ReplaceSupportAgentsDto,
+      {
+        agents: [
+          {
+            category: 'recharge',
+            userID: '11111111-1111-4111-8111-111111111111',
+            sortOrder: 0,
+            enabled: true,
+          },
+        ],
+      },
+      PIPE_OPTIONS.transformOptions,
+    );
+    expect(validateSync(dto)).toEqual([]);
+    expect(dto.expectedRevision).toBeUndefined();
+  });
+
   it('keeps real booleans intact', () => {
     expect(validate(true)).toMatchObject({ value: true, errors: [] });
     expect(validate(false)).toMatchObject({ value: false, errors: [] });
@@ -55,6 +76,7 @@ describe('ReplaceSupportAgentsDto', () => {
     const dto = plainToInstance(
       ReplaceSupportAgentsDto,
       {
+        expectedRevision: 'deadbeef',
         agents: [
           {
             category: 'recharge',
