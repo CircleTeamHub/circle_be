@@ -16,6 +16,8 @@ const NUMERIC = /^\d+$/;
 // fall to the id-collapse fallback.
 export const STATIC_ROUTES = new Set([
   '/api/v1/admin/memberships/program/enable',
+  '/api/v1/admin/support/agents',
+  '/api/v1/admin/support/agents/audit-logs',
   '/api/v1/admin/users',
   '/api/v1/auth/admin/login',
   '/api/v1/auth/admin/refresh',
@@ -78,6 +80,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/notification/unread-summary',
   '/api/v1/privacy/settings',
   '/api/v1/roles',
+  '/api/v1/support/config',
   '/api/v1/temp-chat',
   '/api/v1/temp-chat/mine',
   '/api/v1/trace',

@@ -1,6 +1,6 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { ReplaceSupportAgentsDto } from './support.dto';
+import { ReplaceSupportAgentsDto, SUPPORT_AGENTS_MAX } from './support.dto';
 
 // 与 src/setup.ts 的全局 ValidationPipe 同款设置。implicit conversion 是全局开启的,
 // 单独给这个 DTO 关不掉,所以校验必须自己扛住字符串输入。
@@ -89,5 +89,32 @@ describe('ReplaceSupportAgentsDto', () => {
     );
     expect(validateSync(dto)).toEqual([]);
     expect(dto.agents[0].enabled).toBeUndefined();
+  });
+
+  // 上限就是 support.service 推算事务超时的那个数。放宽这里而不同步那边,会让一个
+  // 合法的大 payload 卡在事务超时上被整个回滚,所以两处必须钉在同一个常量上。
+  describe(`the ${SUPPORT_AGENTS_MAX}-row cap`, () => {
+    const payload = (size: number) =>
+      plainToInstance(
+        ReplaceSupportAgentsDto,
+        {
+          agents: Array.from({ length: size }, (_, i) => ({
+            category: 'recharge',
+            userID: `11111111-1111-4111-8111-${String(i).padStart(12, '0')}`,
+            sortOrder: i,
+          })),
+        },
+        PIPE_OPTIONS.transformOptions,
+      );
+
+    it('accepts a payload exactly at the cap', () => {
+      expect(validateSync(payload(SUPPORT_AGENTS_MAX))).toEqual([]);
+    });
+
+    it('rejects one row over the cap', () => {
+      const errors = validateSync(payload(SUPPORT_AGENTS_MAX + 1));
+      expect(errors).toHaveLength(1);
+      expect(errors[0].constraints).toHaveProperty('arrayMaxSize');
+    });
   });
 });

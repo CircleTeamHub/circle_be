@@ -6,11 +6,19 @@ import { PrismaService } from 'src/prisma/prisma.service';
 /** 快照既可能是单个实体(用户中心),也可能是整表(客服配置的覆盖式写入)。 */
 type AuditSnapshot = Record<string, unknown> | Record<string, unknown>[];
 
+/**
+ * 写入端与读取端共用一套目标类型。
+ *
+ * 之前只有写入端认识 support_agents、读取端签名写死 'user',结果是客服配置的审计
+ * 只进不出。新增一类审计目标时,这个联合类型会同时把两端带上。
+ */
+export type AuditTargetType = 'user' | 'support_agents';
+
 export type AuditInput = {
   actorId: string;
   actorAccountId: string;
   action: string;
-  targetType: 'user' | 'support_agents';
+  targetType: AuditTargetType;
   targetId: string;
   before?: AuditSnapshot;
   after?: AuditSnapshot;
@@ -82,7 +90,11 @@ export class AdminUserAuditService {
     });
   }
 
-  async listForTarget(targetType: 'user', targetId: string, limit = 20) {
+  async listForTarget(
+    targetType: AuditTargetType,
+    targetId: string,
+    limit = 20,
+  ) {
     const boundedLimit = Math.min(100, Math.max(1, Math.trunc(limit)));
 
     const rows = await this.prisma.adminAuditLog.findMany({

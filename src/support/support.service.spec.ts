@@ -1,7 +1,13 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
-import { SupportService, supportAgentsRevision } from './support.service';
+import { SUPPORT_AGENTS_MAX } from './support.dto';
+import {
+  REPLACE_TRANSACTION_TIMEOUT_MS,
+  SUPPORT_AGENTS_AUDIT_TARGET_ID,
+  SupportService,
+  supportAgentsRevision,
+} from './support.service';
 
 const user = (id: string, overrides: Record<string, unknown> = {}) => ({
   id,
@@ -17,18 +23,24 @@ describe('SupportService', () => {
     supportAgent: {
       findMany: jest.fn(),
       deleteMany: jest.fn(),
-      upsert: jest.fn(),
+      createMany: jest.fn(),
+      update: jest.fn(),
     },
   };
+  type TxCallback = (client: typeof tx) => Promise<unknown>;
+  const runTransaction: (
+    callback: TxCallback,
+    options?: { timeout?: number },
+  ) => Promise<unknown> = (callback) => callback(tx);
   const prisma = {
     supportAgent: {
       findMany: jest.fn(),
       findFirst: jest.fn(),
     },
     user: { findMany: jest.fn() },
-    $transaction: jest.fn((callback) => callback(tx)),
+    $transaction: jest.fn(runTransaction),
   };
-  const audit = { recordInTransaction: jest.fn() };
+  const audit = { recordInTransaction: jest.fn(), listForTarget: jest.fn() };
   const service = new SupportService(
     prisma as unknown as PrismaService,
     audit as unknown as AdminUserAuditService,
@@ -156,12 +168,16 @@ describe('SupportService', () => {
         { category: 'dispute', userID: 'u1', sortOrder: 0 },
       ]);
 
-      expect(tx.supportAgent.upsert).toHaveBeenCalledTimes(2);
+      expect(tx.supportAgent.createMany).toHaveBeenCalledTimes(1);
+      expect(tx.supportAgent.createMany.mock.calls[0][0].data).toEqual([
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+        { category: 'dispute', userID: 'u1', sortOrder: 0, enabled: true },
+      ]);
     });
 
-    // 覆盖式写入的语义:没出现在 payload 里的行才删。用 upsert 而不是
-    // deleteMany+createMany,否则调一次顺序就让所有行看起来像刚创建。
-    it('deletes only the rows missing from the payload and upserts the rest', async () => {
+    // 覆盖式写入的语义:没出现在 payload 里的行才删。已存在的行走 update 而不是
+    // 整表 deleteMany+createMany,否则调一次顺序就让所有行看起来像刚创建。
+    it('deletes only the rows missing from the payload and updates the rest in place', async () => {
       activeUsers(['u1']);
       beforeRows = [
         { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
@@ -173,10 +189,11 @@ describe('SupportService', () => {
       expect(tx.supportAgent.deleteMany).toHaveBeenCalledWith({
         where: { OR: [{ category: 'issue', userID: 'gone' }] },
       });
-      expect(tx.supportAgent.upsert).toHaveBeenCalledTimes(1);
-      expect(tx.supportAgent.upsert.mock.calls[0][0].update).toEqual({
-        sortOrder: 5,
-        enabled: true,
+      expect(tx.supportAgent.createMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.update).toHaveBeenCalledTimes(1);
+      expect(tx.supportAgent.update.mock.calls[0][0]).toEqual({
+        where: { category_userID: { category: 'recharge', userID: 'u1' } },
+        data: { sortOrder: 5, enabled: true },
       });
     });
 
@@ -189,9 +206,29 @@ describe('SupportService', () => {
       ]);
 
       expect(tx.supportAgent.deleteMany).not.toHaveBeenCalled();
-      expect(tx.supportAgent.upsert.mock.calls[0][0].update).toEqual({
-        sortOrder: 0,
-        enabled: false,
+      expect(tx.supportAgent.createMany.mock.calls[0][0].data).toEqual([
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: false },
+      ]);
+    });
+
+    // 「只挪一行顺序」不该重写整张表:没变的行连一次 update 都不该发出去,
+    // 否则满额 payload 每次保存都是 200 次串行往返,updatedAt 也全被刷成本次。
+    it('skips rows whose sortOrder and enabled are unchanged', async () => {
+      activeUsers(['u1', 'u2']);
+      beforeRows = [
+        { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
+        { category: 'recharge', userID: 'u2', sortOrder: 1, enabled: true },
+      ];
+
+      await replace([
+        { category: 'recharge', userID: 'u1', sortOrder: 0 },
+        { category: 'recharge', userID: 'u2', sortOrder: 9 },
+      ]);
+
+      expect(tx.supportAgent.createMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.update).toHaveBeenCalledTimes(1);
+      expect(tx.supportAgent.update.mock.calls[0][0].where).toEqual({
+        category_userID: { category: 'recharge', userID: 'u2' },
       });
     });
 
@@ -261,7 +298,8 @@ describe('SupportService', () => {
 
       // 冲突时一行都不能动。
       expect(tx.supportAgent.deleteMany).not.toHaveBeenCalled();
-      expect(tx.supportAgent.upsert).not.toHaveBeenCalled();
+      expect(tx.supportAgent.createMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.update).not.toHaveBeenCalled();
       expect(audit.recordInTransaction).not.toHaveBeenCalled();
     });
 
@@ -274,7 +312,7 @@ describe('SupportService', () => {
       await expect(
         replace([{ category: 'recharge', userID: 'u1', sortOrder: 1 }]),
       ).resolves.toBeDefined();
-      expect(tx.supportAgent.upsert).toHaveBeenCalled();
+      expect(tx.supportAgent.update).toHaveBeenCalled();
     });
 
     // 过渡期兼容:后端与管理台分开部署,一上来就必填会让「新后端 + 旧管理台」
@@ -291,7 +329,7 @@ describe('SupportService', () => {
         undefined,
       );
 
-      expect(tx.supportAgent.upsert).toHaveBeenCalled();
+      expect(tx.supportAgent.createMany).toHaveBeenCalled();
     });
 
     // 两个管理员各自把表改成同样的结果 —— 后提交的那个是空操作,不该报冲突。
@@ -322,7 +360,120 @@ describe('SupportService', () => {
       expect(tx.supportAgent.deleteMany).toHaveBeenCalledWith({
         where: { OR: [{ category: 'recharge', userID: 'u1' }] },
       });
-      expect(tx.supportAgent.upsert).not.toHaveBeenCalled();
+      expect(tx.supportAgent.createMany).not.toHaveBeenCalled();
+      expect(tx.supportAgent.update).not.toHaveBeenCalled();
+    });
+
+    // Prisma 交互式事务默认 5s。满额 payload 的整体重排在生产的坏时段里根本跑不完,
+    // 于是一个完全合法的请求被整个回滚 —— 且回滚的是「已经删了旧行」的中途状态。
+    describe('at the maximum payload size', () => {
+      const ROUND_TRIP_MS = 50; // 坏时段的单次往返预算,和 service 里的推算同源
+      const PRISMA_DEFAULT_TIMEOUT_MS = 5_000;
+
+      // 记账用的假事务:每次落到数据库的调用推进一次虚拟时钟,末了按事务实际
+      // 拿到的 timeout 判定这次替换是被提交了还是被超时回滚了。
+      const runWithSimulatedLatency = async (
+        input: Parameters<typeof service.replaceAgents>[1],
+      ) => {
+        let elapsed = 0;
+        const tick =
+          <T>(result: T) =>
+          () => {
+            elapsed += ROUND_TRIP_MS;
+            return Promise.resolve(result);
+          };
+        tx.$executeRaw.mockImplementation(tick(0));
+        tx.supportAgent.findMany.mockImplementation(tick(beforeRows));
+        tx.supportAgent.deleteMany.mockImplementation(tick({ count: 0 }));
+        tx.supportAgent.createMany.mockImplementation(tick({ count: 0 }));
+        tx.supportAgent.update.mockImplementation(tick({}));
+        audit.recordInTransaction.mockImplementation(tick({}));
+
+        let timeout = PRISMA_DEFAULT_TIMEOUT_MS;
+        prisma.$transaction.mockImplementation((callback, options) => {
+          timeout = options?.timeout ?? PRISMA_DEFAULT_TIMEOUT_MS;
+          return callback(tx);
+        });
+
+        await service.replaceAgents(operator, input, undefined);
+        return { elapsed, timeout };
+      };
+
+      const fullPayload = Array.from(
+        { length: SUPPORT_AGENTS_MAX },
+        (_, i) => ({
+          category: 'recharge' as const,
+          userID: `u${i}`,
+          sortOrder: i,
+        }),
+      );
+
+      beforeEach(() => {
+        activeUsers(fullPayload.map((agent) => agent.userID));
+      });
+
+      // jest.clearAllMocks() 只清调用记录、不还原 implementation,不还原就会把
+      // 这个假事务泄漏给后面的用例。
+      afterEach(() => {
+        prisma.$transaction.mockImplementation(runTransaction);
+      });
+
+      it('finishes inside the configured transaction timeout', async () => {
+        // 全是新行:一次 createMany 就够,逐行 update 一条都不发。
+        const { elapsed, timeout } = await runWithSimulatedLatency(fullPayload);
+
+        expect(tx.supportAgent.createMany).toHaveBeenCalledTimes(1);
+        expect(tx.supportAgent.update).not.toHaveBeenCalled();
+        expect(timeout).toBe(REPLACE_TRANSACTION_TIMEOUT_MS);
+        expect(elapsed).toBeLessThan(timeout);
+      });
+
+      // 最坏情况:满额的表被整体重排,每一行都得单独 update。
+      it('still finishes when every row changed, which the 5s default would not', async () => {
+        beforeRows = fullPayload.map((agent) => ({
+          ...agent,
+          sortOrder: agent.sortOrder + 1,
+          enabled: true,
+        }));
+
+        const { elapsed, timeout } = await runWithSimulatedLatency(fullPayload);
+
+        expect(tx.supportAgent.update).toHaveBeenCalledTimes(
+          SUPPORT_AGENTS_MAX,
+        );
+        expect(elapsed).toBeLessThan(timeout);
+        // 这一行是这个用例的意义所在:没有显式 timeout 就会在这里超时回滚。
+        expect(elapsed).toBeGreaterThan(PRISMA_DEFAULT_TIMEOUT_MS);
+      });
+    });
+  });
+
+  describe('listAuditLogs', () => {
+    // 审计只写不可读是这条读路径存在的全部理由:哨兵目标过不了
+    // /admin/users/:id/audit-logs 的 ParseUUIDPipe。
+    it('reads back the sentinel target the replacement writes to', async () => {
+      audit.listForTarget.mockResolvedValue([{ id: 'audit-1' }]);
+
+      await expect(service.listAuditLogs(50)).resolves.toEqual([
+        { id: 'audit-1' },
+      ]);
+      expect(audit.listForTarget).toHaveBeenCalledWith(
+        'support_agents',
+        SUPPORT_AGENTS_AUDIT_TARGET_ID,
+        50,
+      );
+    });
+
+    it('defaults to a bounded page', async () => {
+      audit.listForTarget.mockResolvedValue([]);
+
+      await service.listAuditLogs();
+
+      expect(audit.listForTarget).toHaveBeenCalledWith(
+        'support_agents',
+        SUPPORT_AGENTS_AUDIT_TARGET_ID,
+        20,
+      );
     });
   });
 

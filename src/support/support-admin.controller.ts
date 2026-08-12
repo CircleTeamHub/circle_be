@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Put, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  DefaultValuePipe,
+  Get,
+  ParseIntPipe,
+  Put,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiOkResponse,
@@ -24,6 +34,17 @@ export class SupportAdminController {
   @ApiOkResponse({ type: AdminSupportAgentsDto })
   async list(): Promise<AdminSupportAgentsDto> {
     return this.support.listForAdminWithRevision();
+  }
+
+  // 覆盖式写入的审计挂在哨兵目标 (support_agents, all) 上,用户中心那条
+  // /admin/users/:id/audit-logs 的参数过 ParseUUIDPipe,永远取不到它 ——
+  // 少了这个端点,客服配置的审计就是只写不可读。
+  @Get('agents/audit-logs')
+  @ApiOperation({ summary: '客服配置的覆盖式写入历史(最近若干条)' })
+  auditLogs(
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
+  ) {
+    return this.support.listAuditLogs(limit);
   }
 
   @Put('agents')
