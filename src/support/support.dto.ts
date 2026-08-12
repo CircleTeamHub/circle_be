@@ -25,6 +25,14 @@ export const SUPPORT_AGENT_CATEGORIES = [
 
 export type SupportAgentCategory = (typeof SUPPORT_AGENT_CATEGORIES)[number];
 
+/**
+ * 单次整表覆盖能提交的最大行数。
+ *
+ * support.service 拿它推算事务超时 —— 放宽上限而不同步超时,就会让一个完全合法的
+ * 大 payload 卡在事务超时上回滚,所以两处必须共用同一个常量。
+ */
+export const SUPPORT_AGENTS_MAX = 200;
+
 /** App 渲染一行客服所需的全部信息 —— 避免客户端拿到 userID 后再逐个查用户。 */
 export class SupportAgentViewDto {
   @ApiProperty()
@@ -102,7 +110,7 @@ export class ReplaceSupportAgentsDto {
       '这样顺序与创建时间得以保留。',
   })
   @IsArray()
-  @ArrayMaxSize(200)
+  @ArrayMaxSize(SUPPORT_AGENTS_MAX)
   @ValidateNested({ each: true })
   @Type(() => SupportAgentInputDto)
   agents: SupportAgentInputDto[];

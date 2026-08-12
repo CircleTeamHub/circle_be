@@ -12,14 +12,59 @@ import { PrismaService } from 'src/prisma/prisma.service';
 // 覆盖式写入的串行化锁。整表只有一份配置,所以固定一个 key 就够。
 const SUPPORT_AGENTS_LOCK_KEY = 'support-agents-replace';
 import {
-  AdminSupportAgentDto,
   AdminSupportAgentsDto,
   SUPPORT_AGENT_CATEGORIES,
+  SUPPORT_AGENTS_MAX,
   SupportAgentCategory,
   SupportAgentViewDto,
   SupportConfigDto,
   SupportAgentInputDto,
 } from './support.dto';
+
+/**
+ * 覆盖式写入没有单一目标实体,审计统一挂在这个哨兵 id 上。
+ *
+ * 写入侧和读取侧各写一遍字面量就会漂移 —— 一漂,写进去的审计再也读不出来。
+ */
+export const SUPPORT_AGENTS_AUDIT_TARGET_ID = 'all';
+
+/** 事务里与 payload 大小无关的固定往返:锁、快照、deleteMany、createMany、审计。 */
+const REPLACE_FIXED_ROUND_TRIPS = 5;
+
+/** 生产坏时段(锁竞争 / 连接池排队)下单次往返的预算,不是常态值。 */
+const ROUND_TRIP_BUDGET_MS = 50;
+
+/**
+ * 覆盖式写入的事务超时。
+ *
+ * Prisma 交互式事务默认 5s。最坏情况是管理员把满额 payload 整体重排:固定往返
+ * 之外还有最多 SUPPORT_AGENTS_MAX 次逐行 update,按坏时段单次 50ms 估已经 10s
+ * 出头 —— 默认值会在一个完全合法的请求上把整次替换回滚掉,管理员只看到一个没头
+ * 没尾的事务超时。按上限推算再留一倍余量,上限改了这里自动跟着走。
+ */
+export const REPLACE_TRANSACTION_TIMEOUT_MS =
+  (SUPPORT_AGENTS_MAX + REPLACE_FIXED_ROUND_TRIPS) * ROUND_TRIP_BUDGET_MS * 2;
+
+type NormalizedAgent = {
+  category: SupportAgentCategory;
+  userID: string;
+  sortOrder: number;
+  enabled: boolean;
+};
+
+/** enabled 缺省即启用。补默认值的逻辑散在多处就会各自漂移,统一收在这儿。 */
+function normalize(input: SupportAgentInputDto[]): NormalizedAgent[] {
+  return input.map((agent) => ({
+    category: agent.category,
+    userID: agent.userID,
+    sortOrder: agent.sortOrder,
+    enabled: agent.enabled ?? true,
+  }));
+}
+
+function rowKey(row: { category: string; userID: string }): string {
+  return `${row.category}:${row.userID}`;
+}
 
 const AGENT_USER_SELECT = {
   id: true,
@@ -140,9 +185,10 @@ export class SupportService {
   /**
    * 整表覆盖式写入。
    *
-   * 实现为 diff:未出现在 payload 里的行才删除,出现的按 (category,userID) upsert。
-   * 不用 deleteMany+createMany 是因为那会重置 id 与 createdAt —— 调整一次顺序就让
-   * 所有行看起来像刚创建,审计日志里再也分不出「新增了谁」和「只是挪了个位置」。
+   * 实现为 diff:未出现在 payload 里的行才删除,新增的一次 createMany 落库,已存在
+   * 的只在 sortOrder / enabled 真的变了时才逐行 update。不用 deleteMany+createMany
+   * 全量重建是因为那会重置 id 与 createdAt —— 调整一次顺序就让所有行看起来像刚创建,
+   * 审计日志里再也分不出「新增了谁」和「只是挪了个位置」。
    */
   async replaceAgents(
     operator: { userId: string; accountId: string },
@@ -152,95 +198,116 @@ export class SupportService {
     this.assertNoDuplicates(input);
     await this.assertUsersUsable(input);
 
-    await this.prisma.$transaction(async (tx) => {
-      // 两个管理员同时提交时,默认隔离级别下双方都会读到同一份 before 快照,
-      // 各自只删自己快照里、payload 外的行 —— 最终落库的是两份 payload 的并集,
-      // 而这个组合谁都没提交过。用与会员开关同款的事务级 advisory lock 串行化。
-      await tx.$executeRaw(Prisma.sql`
-        SELECT pg_advisory_xact_lock(
-          hashtextextended(${SUPPORT_AGENTS_LOCK_KEY}, 0)
-        )
-      `);
+    const desired = normalize(input);
 
-      const before = await tx.supportAgent.findMany({
-        select: {
-          category: true,
-          userID: true,
-          sortOrder: true,
-          enabled: true,
-        },
-      });
+    await this.prisma.$transaction(
+      async (tx) => {
+        // 两个管理员同时提交时,默认隔离级别下双方都会读到同一份 before 快照,
+        // 各自只删自己快照里、payload 外的行 —— 最终落库的是两份 payload 的并集,
+        // 而这个组合谁都没提交过。用与会员开关同款的事务级 advisory lock 串行化。
+        await tx.$executeRaw(Prisma.sql`
+          SELECT pg_advisory_xact_lock(
+            hashtextextended(${SUPPORT_AGENTS_LOCK_KEY}, 0)
+          )
+        `);
 
-      // 乐观并发:advisory lock 只保证两个写入不交错,拦不住「后到的整表覆盖把先
-      // 到的改动整个抹掉」。管理台开着旧页签(该应用 refetchOnWindowFocus=false,
-      // 旧数据会一直停在那儿)保存一次,另一个管理员刚存的增删/顺序/启用状态就没了,
-      // 而且双方都不会收到任何提示。版本对不上就 409,让管理台去重载并提示冲突。
-      const actualRevision = supportAgentsRevision(before);
-      // 提交的内容如果**已经就是**库里现在的样子,这次写入是空操作 —— 两个管理员
-      // 各自把表改成同样的结果时不该互相判冲突(内容哈希的意义就在这里)。
-      const submittedRevision = supportAgentsRevision(
-        input.map((agent) => ({
-          category: agent.category,
-          userID: agent.userID,
-          sortOrder: agent.sortOrder,
-          enabled: agent.enabled ?? true,
-        })),
-      );
-      const stale =
-        expectedRevision !== undefined &&
-        actualRevision !== expectedRevision &&
-        actualRevision !== submittedRevision;
-      if (stale) {
-        throw new ConflictException({
-          message: '客服配置已被其他管理员修改，请刷新后重试',
-          errorCode: SupportErrorCode.AgentsConflict,
-        });
-      }
-
-      const keep = new Set(input.map((a) => `${a.category}:${a.userID}`));
-      const removed = before.filter(
-        (row) => !keep.has(`${row.category}:${row.userID}`),
-      );
-      if (removed.length > 0) {
-        await tx.supportAgent.deleteMany({
-          where: {
-            OR: removed.map(({ category, userID }) => ({ category, userID })),
+        const before = await tx.supportAgent.findMany({
+          select: {
+            category: true,
+            userID: true,
+            sortOrder: true,
+            enabled: true,
           },
         });
-      }
 
-      for (const agent of input) {
-        const data = {
-          sortOrder: agent.sortOrder,
-          enabled: agent.enabled ?? true,
-        };
-        await tx.supportAgent.upsert({
-          where: {
-            category_userID: { category: agent.category, userID: agent.userID },
-          },
-          create: { category: agent.category, userID: agent.userID, ...data },
-          update: data,
+        // 乐观并发:advisory lock 只保证两个写入不交错,拦不住「后到的整表覆盖把先
+        // 到的改动整个抹掉」。管理台开着旧页签(该应用 refetchOnWindowFocus=false,
+        // 旧数据会一直停在那儿)保存一次,另一个管理员刚存的增删/顺序/启用状态就没了,
+        // 而且双方都不会收到任何提示。版本对不上就 409,让管理台去重载并提示冲突。
+        const actualRevision = supportAgentsRevision(before);
+        // 提交的内容如果**已经就是**库里现在的样子,这次写入是空操作 —— 两个管理员
+        // 各自把表改成同样的结果时不该互相判冲突(内容哈希的意义就在这里)。
+        const submittedRevision = supportAgentsRevision(desired);
+        const stale =
+          expectedRevision !== undefined &&
+          actualRevision !== expectedRevision &&
+          actualRevision !== submittedRevision;
+        if (stale) {
+          throw new ConflictException({
+            message: '客服配置已被其他管理员修改，请刷新后重试',
+            errorCode: SupportErrorCode.AgentsConflict,
+          });
+        }
+
+        const keep = new Set(desired.map(rowKey));
+        const removed = before.filter((row) => !keep.has(rowKey(row)));
+        if (removed.length > 0) {
+          await tx.supportAgent.deleteMany({
+            where: {
+              OR: removed.map(({ category, userID }) => ({ category, userID })),
+            },
+          });
+        }
+
+        // 逐行 upsert 会让往返次数等于 payload 行数:满额 payload 就是 200 次串行
+        // 往返压在一个事务里。新增行合成一次 createMany(advisory lock 已经保证这
+        // 张表没有别的写入者,不存在 upsert 要防的并发插入),没变的行直接跳过 ——
+        // 「只挪一行顺序」不该重写整张表,updatedAt 也就还原成了「上次真的改过」。
+        const current = new Map(before.map((row) => [rowKey(row), row]));
+        const created = desired.filter((row) => !current.has(rowKey(row)));
+        const changed = desired.filter((row) => {
+          const existing = current.get(rowKey(row));
+          return (
+            existing !== undefined &&
+            (existing.sortOrder !== row.sortOrder ||
+              existing.enabled !== row.enabled)
+          );
         });
-      }
 
-      await this.audit.recordInTransaction(tx, {
-        actorId: operator.userId,
-        actorAccountId: operator.accountId,
-        action: 'support.agents.replace',
-        targetType: 'support_agents',
-        // 覆盖式写入没有单一目标实体,固定用哨兵 id 让整表变更也能被检索到。
-        targetId: 'all',
-        before,
-        after: input.map((agent) => ({
-          category: agent.category,
-          userID: agent.userID,
-          sortOrder: agent.sortOrder,
-          enabled: agent.enabled ?? true,
-        })),
-      });
-    });
+        if (created.length > 0) {
+          await tx.supportAgent.createMany({ data: created });
+        }
+        for (const row of changed) {
+          await tx.supportAgent.update({
+            where: {
+              category_userID: { category: row.category, userID: row.userID },
+            },
+            data: { sortOrder: row.sortOrder, enabled: row.enabled },
+          });
+        }
+
+        await this.audit.recordInTransaction(tx, {
+          actorId: operator.userId,
+          actorAccountId: operator.accountId,
+          action: 'support.agents.replace',
+          targetType: 'support_agents',
+          // 覆盖式写入没有单一目标实体,固定用哨兵 id 让整表变更也能被检索到。
+          targetId: SUPPORT_AGENTS_AUDIT_TARGET_ID,
+          before,
+          after: desired,
+        });
+      },
+      // 默认 5s 兜不住满额 payload 的逐行 update,见常量上的推算。
+      { timeout: REPLACE_TRANSACTION_TIMEOUT_MS },
+    );
 
     return this.listForAdminWithRevision();
+  }
+
+  /**
+   * 覆盖式写入的审计历史。
+   *
+   * 审计行挂在 (support_agents, all) 这个哨兵目标上,而唯一的审计读路径
+   * /admin/users/:id/audit-logs 的路径参数过 ParseUUIDPipe、服务层还要先确认
+   * 这个 id 是个真实用户 —— 哨兵 id 两道都过不去。没有这个端点,「谁在什么时候
+   * 把客服表改成了什么」就是只写不可读:数据一直在攒,运维一条也查不到。
+   */
+  listAuditLogs(limit = 20) {
+    return this.audit.listForTarget(
+      'support_agents',
+      SUPPORT_AGENTS_AUDIT_TARGET_ID,
+      limit,
+    );
   }
 
   /**
