@@ -187,9 +187,13 @@ export class ChatBroadcastService {
     const server = this.requireServer('joinUserToConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
-    for (const socket of sockets) {
-      socket.join(conversationRoom(conversationId));
-    }
+    // 必须 await。多副本部署下 fetchSockets() 拿到的是 RemoteSocket,它的
+    // join() 是跨节点异步调用 —— 不等的话本方法会在对方真正入房之前就返回,
+    // 调用方紧接着广播的第一条消息直接丢空(结算卡片就是这么丢的:客户端
+    // 连 chat:msg 都收不到,也就没有任何东西能触发它自愈补拉)。
+    await Promise.all(
+      sockets.map((socket) => socket.join(conversationRoom(conversationId))),
+    );
   }
 
   /** 成员被移出后把其在线 socket 撤出会话房(座位收回即时生效,不等重连)。 */

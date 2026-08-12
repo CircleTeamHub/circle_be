@@ -6,7 +6,10 @@
 # Run:  docker compose -f monitoring/docker-compose.yml up -d
 # Stop: docker compose -f monitoring/docker-compose.yml down
 #
-# Images are :latest for an easy local start — pin explicit versions for prod.
+# Images are :latest for an easy local start. Production does NOT run them that
+# way — docker-compose.prod.yml pins every one of them. See README.md
+# "Production"; bringing this file up on a server without the overlay is wrong
+# for several reasons, and unpinned images is one of them.
 
 # #107：容器日志默认无上限，写满磁盘会连带 pg_data 所在宿主机一起挂。
 # 与 docker-compose.prod.yml 同款轮转 + 内存上限。
@@ -35,6 +38,11 @@ services:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-lifecycle'
+      # 没有上限的 TSDB 是同一台机器上一个只增不减的写入者 —— 而这套栈自己
+      # 就带着 HostDiskFilling 告警。时间保留是 Prometheus 的默认值(15d),
+      # 但**大小上限默认没有**,磁盘紧张时先被撑爆的往往是它。两者取先到者。
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=8GB'
     ports:
       - '127.0.0.1:9090:9090'
 

@@ -138,4 +138,4 @@ EOF
 chmod 600 .env .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN"
-echo "   OpenIM(阶段5)、LiveKit(阶段6)配置稍后再追加到 .env.production"
+echo "   LiveKit(阶段6)配置稍后再追加到 .env.production"

@@ -10,6 +10,8 @@ import { CoinErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { ChatService } from 'src/chat/chat.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
   prismaErrorCode,
   runSerializableTransaction,
@@ -30,6 +32,8 @@ export class CoinService {
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
     private readonly notificationService: NotificationService,
+    private readonly chatService: ChatService,
+    private readonly chatMessages: ChatSystemMessageService,
   ) {}
 
   // ─── Wallet ───────────────────────────────────────────────────────────────────
@@ -117,8 +121,9 @@ export class CoinService {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
+    let giftId: string | null = null;
     try {
-      await runSerializableTransaction(this.prisma, async (tx) => {
+      giftId = await runSerializableTransaction(this.prisma, async (tx) => {
         const sentToday = await tx.coinTransaction.aggregate({
           where: {
             userID: senderId,
@@ -202,6 +207,8 @@ export class CoinService {
             },
           ],
         });
+
+        return gift.id;
       });
     } catch (error) {
       // Lost the race against a concurrent request reusing the same key —
@@ -219,25 +226,73 @@ export class CoinService {
     this.logger.log(
       `Gift sent: ${senderId} → ${recipientId} (${amount} coins)`,
     );
+
+    if (giftId) {
+      // **不 await**(review P1)。钱已经落库,这一步只是发凭证 —— 但它要碰聊天库
+      // 与跨节点的 fetchSockets,任何一处卡住都会把 POST /coin/gift 的响应一起挂住。
+      // catch 只兜「最终 reject」,兜不住「一直不返回」:代理/客户端超时后付款方
+      // 不知道钱到底动没动,回转账页重试会生成**新的幂等键** —— 那是第二次真实扣款。
+      // 脱钩之后请求在钱提交后立刻返回;卡片照常在毫秒级落地(进程不会取消这个
+      // promise),真出故障则由 GiftCardOutboxProcessor 在 2 分钟宽限后接手。
+      // issueTransferCard 内部自吞异常,不会产生 unhandled rejection。
+      void this.issueTransferCard(giftId, senderId, recipientId, amount, {
+        message: message ?? null,
+      });
+    }
   }
 
   /**
-   * 客户端 IM 发卡成功回执（#100）：置位 cardDeliveredAt，补偿 cron 不再
-   * 补发。按 idempotencyKey 定位（客户端本就持有它；sendGift 响应无 id）。
-   * 幂等；仅发送方本人可回执。找不到礼物静默成功 —— 回执迟到于清理属可容忍。
+   * 转账卡片:结算提交之后由服务端就地签发。
+   *
+   * 为什么不是客户端发:transfer-card 断言的是「钱已经划走」这个服务端事实,
+   * 客户端能发就等于能凭空捏造它 —— 所以它在 SERVER_MESSAGE_TYPES 里,
+   * 客户端发一律被 validateSendPayload 拒(见 chat.constants.ts 的判据)。
+   *
+   * 为什么在事务外:insertServerMessage 自带事务并在成功后广播。放进结算事务里
+   * 的话,一次回滚就等于把一张没有对应资金流水的凭证广播了出去;而且会把聊天
+   * 写入拖进 Serializable 的冲突面,重试连广播一起重放。
+   *
+   * 为什么失败不抛:钱已经划走了。为一张发不出去的凭证把请求判失败,付款方会以为
+   * 没转成、回转账页重试 —— 那是新的幂等键、第二次真实扣款。发不出去就留着
+   * cardDeliveredAt 为空,GiftCardOutboxProcessor 在 2 分钟宽限后接手。
+   *
+   * clientMessageId 与 cron 同键(gift_card_<id>):两条路径撞
+   * (conversationID, senderID, clientMessageId) 唯一约束时合并成一条,
+   * 收款方永远只看到一张卡 —— cron 因此退化成纯兜底,而不是主路径。
    */
-  async markGiftCardSent(
+  private async issueTransferCard(
+    giftId: string,
     senderId: string,
-    idempotencyKey: string,
+    recipientId: string,
+    amount: number,
+    options: { message: string | null },
   ): Promise<void> {
-    await this.prisma.coinGift.updateMany({
-      where: {
-        idempotencyKey,
+    try {
+      // 走结算专用解析,不过拉黑/陌生人消息那两道闸:那是给用户主动发消息设的。
+      // 钱已经划走,收款人有权拿到凭证(与补偿 cron 同一判据)。
+      const conversationId =
+        await this.chatService.ensureDirectConversationForSettlement(
+          senderId,
+          recipientId,
+        );
+      await this.chatMessages.insertServerMessage(conversationId, {
         senderID: senderId,
-        cardDeliveredAt: null,
-      },
-      data: { cardDeliveredAt: new Date() },
-    });
+        type: 'transfer-card',
+        content: { amount, message: options.message },
+        clientMessageId: `gift_card_${giftId}`,
+        push: true,
+      });
+      await this.prisma.coinGift.update({
+        where: { id: giftId },
+        data: { cardDeliveredAt: new Date() },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `inline transfer card failed for gift ${giftId}, leaving it to the compensation cron: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   private async notifyRecharge(userId: string, amount: number): Promise<void> {

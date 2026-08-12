@@ -93,13 +93,20 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set}
-    # note-exports/ 的生命周期规则是这里唯一的存量回收机制。
-    # 后端代码里没有任何一处删除 MinIO 对象（全仓 grep DeleteObject/removeObject 为空），
-    # 而笔记导出每次调用都写一个新 key（randomUUID，不去重）。note.service.ts 里的
-    # NOTE_EXPORT_TTL_SECONDS = 15 分钟只是**意图**：upload.service.ts 拿它算了个响应
-    # 字段就丢了，对象本身是永久的。所以导出产物会单调增长，直到和 Postgres 同机的
-    # 磁盘被写满 —— 那时倒下的是数据库，不只是上传功能。
-    # 下发的预签名 URL 15 分钟就失效，所以按天回收不影响任何正常使用；
+    # 建桶其实是冗余的（应用 onModuleInit 的 ensureBucketExists 也会建，本地就靠它）。
+    # 本服务不可替代的是下面那条 ilm 规则 —— 它是 note-exports/ 唯一的回收机制。
+    #
+    # MinIO 三类对象的回收责任是分开的：chat/ 由 ChatMediaService.deleteObjects 主动删
+    # （删失败落 ChatMediaDeletion 表退避重投）；头像与笔记媒体的引用在 Postgres 里，
+    # 由 StorageAuditService 盘点孤儿；而 note-exports/ 没有任何代码碰它
+    # （storage-audit.service.ts 的注释明写「由 MinIO 生命周期规则回收，不归这里管」）。
+    #
+    # 导出对象本身是永久的：note.service.ts 的 NOTE_EXPORT_TTL_SECONDS = 15 分钟只决定
+    # 下发的预签名 URL 有效期，跟对象存活无关。key 是 note-exports/{ownerID}/{noteID}/
+    # {contentHash}-{filename}，同内容重复导出会覆盖同一个 key，所以增长不是按调用次数、
+    # 而是按不同的导出版本 —— 慢，但无上界。MinIO 与 Postgres 同机同盘，攒满了先倒的是
+    # 数据库，不只是上传功能。
+    # 预签名 URL 15 分钟就失效，所以按天回收不影响任何正常使用；
     # ilm 失败不阻断建桶（老版本 mc 的子命令名不同），只告警。
     #
     # 本服务是一次性的，且发版**不碰**数据面（release-deploy.sh 的契约、

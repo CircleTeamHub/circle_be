@@ -499,9 +499,15 @@ export class ChatService {
     const directIds = memberships
       .filter((m) => m.conversation.type === 'DIRECT')
       .map((m) => m.conversationID);
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const cutoffs = memberships.map((m) => {
+      const seconds = m.conversation.burnDurationSec;
+      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
+      return this.strictestCutoff(viewerCutoff, burnCutoff);
+    });
 
     const [lastMessages, unreadCounts, peers, circles] = await Promise.all([
-      this.loadLastMessages(conversationIds),
+      this.loadLastMessages(conversationIds, cutoffs),
       this.loadUnreadCounts(
         userId,
         // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
@@ -512,6 +518,7 @@ export class ChatService {
             m.clearedBeforeHeight ?? 0,
           ),
         })),
+        cutoffs,
       ),
       this.loadDirectPeers(userId, directIds),
       this.loadCircleInfos(
@@ -644,14 +651,24 @@ export class ChatService {
     // 客户端从「取或建会话」「改偏好」这两个响应回填缓存时,刚清掉的末条预览
     // (以及一条新签名的媒体 URL)就又回来了。
     const floor = member.clearedBeforeHeight ?? 0;
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const seconds = member.conversation.burnDurationSec;
+    const cutoff = this.strictestCutoff(
+      viewerCutoff,
+      seconds ? new Date(Date.now() - seconds * 1000) : null,
+    );
     const [lastMessages, unread, peers] = await Promise.all([
-      this.loadLastMessages([conversationId]),
-      this.loadUnreadCounts(userId, [
-        {
-          conversationID: conversationId,
-          lastReadHeight: Math.max(member.lastReadHeight, floor),
-        },
-      ]),
+      this.loadLastMessages([conversationId], [cutoff]),
+      this.loadUnreadCounts(
+        userId,
+        [
+          {
+            conversationID: conversationId,
+            lastReadHeight: Math.max(member.lastReadHeight, floor),
+          },
+        ],
+        [cutoff],
+      ),
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
         : Promise.resolve(new Map<string, ChatSenderInfo>()),
@@ -1218,7 +1235,12 @@ export class ChatService {
       where: { directKey },
       select: { id: true },
     });
+    // 会话在本次调用之前就存在 → 双方连接时 handleConnection 已经把它们加进房了
+    // (它按 leftAt: null 取,而 DIRECT 座位的 leftAt 恒为空 —— 置空只发生在
+    //  圈子同步与临时房访客收座上)。这里再 join 一次只是白花一次跨节点
+    // fetchSockets。
     if (existing) return existing.id;
+    let conversationId: string;
     try {
       const created = await this.prisma.chatConversation.create({
         data: {
@@ -1228,7 +1250,7 @@ export class ChatService {
         },
         select: { id: true },
       });
-      return created.id;
+      conversationId = created.id;
     } catch (error) {
       if (!this.isUniqueViolation(error)) throw error;
       const raced = await this.prisma.chatConversation.findUnique({
@@ -1236,8 +1258,30 @@ export class ChatService {
         select: { id: true },
       });
       if (!raced) throw error;
-      return raced.id;
+      // 竞态里对手赢了插入,但它的 join 未必已经跑完 —— 而调用方紧接着就要往
+      // 这个房间里播回执。补一次(join 幂等)比赌时序便宜。
+      conversationId = raced.id;
     }
+    // 刚建出来的会话:座位落库不会自动 join,而 handleConnection 只把**连接那一刻**
+    // 已存在的会话加进房。不补这一步,调用方紧接着 insertServerMessage 的广播就播
+    // 进一个空房间 —— 转账卡/通话留痕/好友申请回放对双方都静默消失,要等下次重连
+    // 或拉历史才看得见;推送分流还会把在线的对端当成离线用户。补偿 cron 那条路更糟:
+    // 它在广播之后就置位 cardDeliveredAt,于是永远不会再重试。
+    // 尽力而为,失败不阻断结算链路(客户端重连时 handleConnection 会补上)。
+    await Promise.all(
+      [userId, peerUserId].map((memberId) =>
+        this.broadcast
+          .joinUserToConversation(memberId, conversationId)
+          .catch((error: unknown) => {
+            this.logger.warn(
+              `join settlement conversation room failed user=${memberId} conv=${conversationId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }),
+      ),
+    );
+    return conversationId;
   }
 
   async getOrCreateDirectConversation(
@@ -1340,19 +1384,29 @@ export class ChatService {
     );
 
     const clearedFloor = mine?.clearedBeforeHeight ?? 0;
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const burnSeconds = conv.burnDurationSec;
+    const cutoff = this.strictestCutoff(
+      viewerCutoff,
+      burnSeconds ? new Date(Date.now() - burnSeconds * 1000) : null,
+    );
     const [unread, lastMessage] = await Promise.all([
       mine
-        ? this.loadUnreadCounts(userId, [
-            {
-              conversationID: conv.id,
-              lastReadHeight: Math.max(mine.lastReadHeight, clearedFloor),
-            },
-          ])
+        ? this.loadUnreadCounts(
+            userId,
+            [
+              {
+                conversationID: conv.id,
+                lastReadHeight: Math.max(mine.lastReadHeight, clearedFloor),
+              },
+            ],
+            [cutoff],
+          )
         : Promise.resolve(new Map<string, number>()),
       // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
       // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
-      this.loadLastMessageFor(conv.id, clearedFloor),
+      this.loadLastMessageFor(conv.id, clearedFloor, cutoff),
     ]);
     return {
       id: conv.id,
@@ -1391,12 +1445,14 @@ export class ChatService {
   private async loadLastMessageFor(
     conversationId: string,
     heightFloor = 0,
+    cutoff: Date | null = null,
   ): Promise<ChatMessageDto | null> {
     const row = await this.prisma.chatMessage.findFirst({
       where: {
         conversationID: conversationId,
         deleted: false,
         ...(heightFloor > 0 ? { height: { gt: heightFloor } } : {}),
+        ...(cutoff ? { createdAt: { gte: cutoff } } : {}),
       },
       omit: MESSAGE_READ_OMIT,
       orderBy: { height: 'desc' },
@@ -1721,19 +1777,23 @@ export class ChatService {
    */
   private async loadLastMessages(
     conversationIds: string[],
+    cutoffs: (Date | null)[],
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
     // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
     // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写。
     const rows = await this.prisma.$queryRaw<MessageRow[]>`
-      SELECT DISTINCT ON ("conversationID")
-        "id", "conversationID", "height", "senderID", "type", "content",
-        "clientMessageId", "replyToID", "deleted", "revokedAt", "revokedBy",
-        "editedAt", "createdAt"
-      FROM "ChatMessage"
-      WHERE "conversationID" = ANY(${conversationIds}::text[])
-        AND "deleted" = false
-      ORDER BY "conversationID", "height" DESC
+      SELECT DISTINCT ON (m."conversationID")
+        m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
+        m."clientMessageId", m."replyToID", m."deleted", m."revokedAt", m."revokedBy",
+        m."editedAt", m."createdAt"
+      FROM "ChatMessage" AS m
+      JOIN unnest(${conversationIds}::text[], ${cutoffs}::timestamptz[])
+        AS w("conversationID", cutoff)
+        ON w."conversationID" = m."conversationID"
+      WHERE m."deleted" = false
+        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+      ORDER BY m."conversationID", m."height" DESC
     `;
     const map = new Map<string, MessageRow>();
     for (const row of rows) map.set(row.conversationID, row);
@@ -1747,6 +1807,7 @@ export class ChatService {
   private async loadUnreadCounts(
     userId: string,
     memberships: Array<{ conversationID: string; lastReadHeight: number }>,
+    cutoffs: (Date | null)[],
   ): Promise<Map<string, number>> {
     const map = new Map<string, number>(
       memberships.map((m) => [m.conversationID, 0]),
@@ -1759,10 +1820,12 @@ export class ChatService {
     >`
       SELECT m."conversationID", COUNT(*)::bigint AS count
       FROM "ChatMessage" AS m
-      JOIN unnest(${ids}::text[], ${floors}::int[]) AS w("conversationID", floor)
+      JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
+        AS w("conversationID", floor, cutoff)
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
         AND m."height" > w.floor
+        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
         -- 自己发的消息不计未读。
         AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
       GROUP BY m."conversationID"

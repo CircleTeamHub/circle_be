@@ -2,7 +2,7 @@
 
 ## Repository context
 
-This repository is a production NestJS backend using TypeScript, Prisma, PostgreSQL, Redis, JWT/Passport, CASL-style authorization, throttling, Sentry, Winston logging, Prometheus metrics, MinIO/S3 upload flows, LiveKit, OpenIM, and background/outbox processors.
+This repository is a production NestJS backend using TypeScript, Prisma, PostgreSQL, Redis, JWT/Passport, CASL-style authorization, throttling, Sentry, Winston logging, Prometheus metrics, MinIO/S3 upload flows, LiveKit, a self-hosted socket.io chat gateway (`src/chat`, `/chat-ws`), and background/outbox processors.
 
 Primary verification commands:
 
@@ -64,7 +64,7 @@ Do not rewrite code or propose broad architectural rewrites during review. Recom
 
 ### Reliability and failure handling
 
-- Check downstream calls to Redis, PostgreSQL/Prisma, S3/MinIO, OpenIM, LiveKit, push providers, email/SMS providers, and other external services for timeouts, cancellation, retry safety, and useful error mapping.
+- Check downstream calls to Redis, PostgreSQL/Prisma, S3/MinIO, LiveKit, push providers, email/SMS providers, and other external services for timeouts, cancellation, retry safety, and useful error mapping.
 - Do not recommend retries for non-idempotent operations unless deduplication, idempotency keys, locks, or outbox semantics make retries safe.
 - Verify partial failures are handled explicitly, especially multi-step writes mixed with external calls.
 - Check rollback or compensation needs for user creation, group/circle membership, invites, notifications, upload finalization, wallet/coin actions, calls, and outbox processors.
@@ -89,7 +89,7 @@ Do not rewrite code or propose broad architectural rewrites during review. Recom
 
 - Check database query shape, indexes, pagination, batching, caching, repeated Prisma calls, Redis usage, memory growth, large payloads, and expensive synchronous work.
 - Verify hot endpoints and realtime paths avoid blocking work, unbounded fanout, event storms, and per-request initialization of heavy clients.
-- For upload, notification, call, OpenIM, LiveKit, and outbox flows, check throughput, backpressure, batching, and graceful degradation under dependency latency.
+- For upload, notification, call, chat gateway, LiveKit, and outbox flows, check throughput, backpressure, batching, and graceful degradation under dependency latency.
 - Suggest optimizations only when tied to a plausible production bottleneck.
 
 ### Testing expectations

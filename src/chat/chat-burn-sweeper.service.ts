@@ -1,5 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatMediaService } from './chat-media.service';
 import { MEDIA_MESSAGE_TYPES } from './chat.constants';
@@ -34,9 +39,14 @@ export class ChatBurnSweeperService {
     private readonly media: ChatMediaService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_burn_sweeper')
   async sweep(): Promise<void> {
-    if (this.running) return;
+    // 跳过不是成功 —— 详见 temp-chat.cleanup 里同一处守卫的注释：卡死的那一轮
+    // 会被后续每一次跳过持续刷新心跳，两条 cron 告警一起失明。
+    if (this.running) {
+      reportJobSkipped();
+      return;
+    }
     this.running = true;
     try {
       const burning = await this.prisma.chatConversation.findMany({
@@ -61,6 +71,7 @@ export class ChatBurnSweeperService {
       this.logger.error(
         `burn sweep failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

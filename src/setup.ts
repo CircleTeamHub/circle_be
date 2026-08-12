@@ -32,6 +32,8 @@ import { createMetrics } from './metrics/metrics.service';
 import { createHttpMetricsMiddleware } from './metrics/http-metrics.middleware';
 import { createMetricsHandler } from './metrics/metrics.endpoint';
 import { createInfraStatusMetrics } from './metrics/infra-status.metrics';
+import { jobMetrics } from './metrics/job-metrics';
+import { createDbPoolMetrics } from './metrics/db-pool.metrics';
 import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
@@ -366,6 +368,14 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     // RedisDown 告警对着一个本来就不存在的依赖长鸣。
     redisPing: redisService?.isEnabled() ? () => redisService.ping() : null,
   });
+  // 连接池计数（#pg 池只有 10 是已知阻塞项）。池排队发生在 Node 进程内部，
+  // postgres-exporter 完全看不到 —— 从 Postgres 视角连接数没涨、没有慢查询，
+  // 而应用侧请求已经在 connectionTimeoutMillis 上排队。抓取时求值是安全的：
+  // 读的是 pg.Pool 的内存计数器，不产生任何 I/O。
+  const prismaForMetrics = getOptionalPrismaService(app);
+  const dbPoolMetrics = createDbPoolMetrics(() =>
+    prismaForMetrics ? prismaForMetrics.getPoolStats() : null,
+  );
   app.use(
     '/metrics',
     createMetricsHandler(
@@ -376,6 +386,8 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
         uploadMetrics.registry,
         infraStatusMetrics.registry,
         chatMetrics.registry,
+        jobMetrics.registry,
+        dbPoolMetrics.registry,
       ]),
       { authToken: metricsAuthToken },
     ),
@@ -450,15 +462,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);
   app.use('/api/v1/friend/requests', friendRequestLimiter);
-  // review 修复：只有「真发礼物」吃 20/15min 配额。前缀挂载会把
-  // /coin/gift/card-sent 回执也算进去 —— 发 10 单+逐单回执就顶满配额，
-  // 且回执被 429 会让 cardDeliveredAt 悬空、补偿 cron 之后重复发卡。
-  app.use('/api/v1/coin/gift', (req: any, res: any, next: any) => {
-    if (req.path === '/' || req.path === '') {
-      return coinGiftLimiter(req, res, next);
-    }
-    next();
-  });
+  // /coin/gift 下只剩「真发礼物」这一条路由 —— 卡片送达回执端点随客户端发卡
+  // 路径一起删了（卡片改由 CoinService 结算后服务端签发），前缀挂载不会再
+  // 误把回执算进 20/15min 配额里。
+  app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', noteWriteLimiter);
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
@@ -544,6 +551,20 @@ function getOptionalUploadService(
       typeof uploadService.objectStoreStatus === 'function'
       ? uploadService
       : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * PrismaService 供 `/metrics` 读连接池计数用。拿不到就返回 null（无
+ * DATABASE_URL 的降级启动、或裁剪过的测试 app），此时几条池 gauge 干脆
+ * 不注册，而不是恒 0。
+ */
+function getOptionalPrismaService(app: INestApplication): PrismaService | null {
+  try {
+    const prisma = app.get(PrismaService, { strict: false });
+    return prisma && typeof prisma.getPoolStats === 'function' ? prisma : null;
   } catch {
     return null;
   }

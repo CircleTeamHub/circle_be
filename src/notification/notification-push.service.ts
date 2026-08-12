@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { NotificationRealtimeDto } from './notification.dto';
 
@@ -203,7 +204,7 @@ export class NotificationPushService {
   // 24h 后被「过期视同送达」吞掉 —— DeviceNotRegistered 与可重试错误全被
   // 静默错过。加密频率到 5 分钟，且单轮循环抽批直到抽干（对 Expo 尚未生成
   // 回执的行记入跳过清单，避免同轮空转重查）。
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @TrackedCron(CronExpression.EVERY_5_MINUTES, 'push_receipt_poll')
   async pollReceipts(now: Date = new Date()): Promise<number> {
     let total = 0;
     const skipIDs: string[] = [];
@@ -403,7 +404,7 @@ export class NotificationPushService {
     });
   }
 
-  @Cron(CronExpression.EVERY_DAY_AT_4AM)
+  @TrackedCron(CronExpression.EVERY_DAY_AT_4AM, 'push_stale_token_cleanup')
   async deleteStaleTokens(): Promise<{ count: number }> {
     return this.prisma.$transaction(
       async (tx) => {

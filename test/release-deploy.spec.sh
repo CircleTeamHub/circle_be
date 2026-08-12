@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -177,6 +177,26 @@ if [ -n "${PERSIST_FAIL_COLOR:-}" ] &&
   [ "$(cat "${@: -2:1}" 2>/dev/null || true)" = "$PERSIST_FAIL_COLOR" ]; then
   exit 44
 fi
+# 记下临时文件在 rename **之前**的权限。它是 .env.production 的完整副本,
+# 默认 umask 022 下会落成 0644 —— 那样同机其它用户在这段窗口里就能读到整份
+# 生产密钥,而目标文件本身是 0600。这是唯一能观察到那个窗口的时刻。
+case "${@: -1}" in
+  *.env.production)
+    # GNU 的 -c 与 BSD 的 -f 互不认;先试 GNU(Linux CI),失败再退 BSD(macOS)。
+    # BSD stat 见到 -c 会直接报错退出,不会误判成成功。
+    stat -c '%a' "${@: -2:1}" 2>/dev/null > "$CASE_DIR/env-tmp-mode" ||
+      stat -f '%Lp' "${@: -2:1}" > "$CASE_DIR/env-tmp-mode"
+    ;;
+esac
+# 模拟磁盘写满/权限问题导致 Sentry release 打标失败(磁盘写满时 awk 或 mv 都
+# 可能挂)。脚本开头是 set -e,所以这一步必须是 best-effort,否则会在迁移之后
+# 直接退出 —— 停机模式下旧色已经停了,API 就那样一直下线。
+if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
+  # mv 桩是独立脚本,没有外层的 last_arg helper,直接取最后一个参数。
+  case "${@: -1}" in
+    *.env.production) exit 47 ;;
+  esac
+fi
 exec "$REAL_MV" "$@"
 MV
   chmod +x "$CASE_DIR/bin/mv"
@@ -202,6 +222,8 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
+    ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -216,6 +238,21 @@ assert_running() {
 assert_absent() {
   [ ! -e "$TEST_STATE_DIR/$1" ] || {
     echo "expected $1 to be absent" >&2
+    return 1
+  }
+}
+
+# 八进制权限位。GNU 的 -c 与 BSD 的 -f 互不认,而这个套件本地在 macOS 跑、
+# CI 在 Linux 跑 —— 先试 GNU,失败再退 BSD(BSD stat 见到 -c 会直接报错)。
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+assert_mode() {
+  local path="$1" expected="$2" actual
+  actual="$(file_mode "$path")"
+  [ "$actual" = "$expected" ] || {
+    echo "expected $path to be mode $expected, got $actual" >&2
     return 1
   }
 }
@@ -312,6 +349,133 @@ test_proxy_switch_precedes_old_color_retirement() {
     assert_reload_target circle-be-green:3000 &&
     assert_command_before 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' 'stop circle_be' &&
     assert_running circle_be_green && assert_absent circle_be
+}
+
+test_release_stamps_sentry_release_before_starting_the_new_color() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\nSENTRY_RELEASE=circle-be@v0.0.1\n' > "$APP_ENV_FILE"
+  export APP_ENV_FILE
+
+  run_release || return 1
+
+  # 蓝绿发布最需要「这个 bug 是哪次发版引入的」这个问题的答案,而它完全取决于
+  # 每次发布都把 release 标上去。既有值必须被**替换**而不是追加 —— dotenv 取
+  # 最后一个赋值,追加碰巧也能工作,但文件会随每次发版无限增长。
+  grep -q '^SENTRY_RELEASE=circle-be@v1\.2\.3$' "$APP_ENV_FILE" || {
+    echo "expected SENTRY_RELEASE to be stamped with the release tag" >&2
+    cat "$APP_ENV_FILE" >&2
+    return 1
+  }
+  [ "$(grep -c '^SENTRY_RELEASE=' "$APP_ENV_FILE")" = "1" ] || {
+    echo "SENTRY_RELEASE was appended instead of replaced" >&2
+    return 1
+  }
+  # 必须在起新色**之前**写好,否则新容器挂载到的还是上一版的 release。
+  # 这里比对的是脚本自身输出的行号 —— 打标签是文件写入,不经过 docker,
+  # 所以 assert_command_before(读 docker 命令日志)对它无效。
+  local tag_line start_line
+  tag_line="$(grep -n 'Tagging Sentry release circle-be@v1\.2\.3' "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  start_line="$(grep -n 'Starting circle_be_green' "$CASE_DIR/release.log" | head -n 1 | cut -d: -f1)"
+  [ -n "$tag_line" ] && [ -n "$start_line" ] && [ "$tag_line" -lt "$start_line" ] || {
+    echo "expected the Sentry release stamp to precede starting the new color" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  }
+}
+
+test_release_never_widens_permissions_on_the_secrets_it_rewrites() {
+  # review #150(P1):打标签是「读 .env.production → 写临时文件 → mv 回去」,
+  # 临时文件因此装着整份生产密钥。默认 umask 022 下它会落成 0644,在 mv 之前
+  # 的这段窗口里同机任何用户都读得到 —— 而目标文件本身是 0600,等于绕过了它
+  # 的权限。这里断言的是 mv **之前**那一刻的模式(由 mv 桩记录),不是事后
+  # chmod 的结果:事后 chmod 补不上已经发生的泄露。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'DATABASE_URL=postgres://u:p@h/db\nJWT_SECRET=s3cr3t\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+
+  run_release || return 1
+
+  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "600" ] || {
+    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 600" >&2
+    return 1
+  }
+  assert_mode "$APP_ENV_FILE" 600 || return 1
+  [ ! -e "${APP_ENV_FILE}.tmp" ] || {
+    echo "expected the temp secrets copy to be gone after a successful stamp" >&2
+    return 1
+  }
+}
+
+test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
+  # 同一条 P1 的失败路径:mv 挂掉(磁盘写满/权限)时,旧写法把一份 0644 的
+  # 密钥副本永久留在部署目录里 —— 而打标签失败只是一条警告、发布照常继续,
+  # 不会有人回头收拾它。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'DATABASE_URL=postgres://u:p@h/db\nJWT_SECRET=s3cr3t\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  ENV_STAMP_FAIL=1
+
+  run_release || return 1
+
+  [ ! -e "${APP_ENV_FILE}.tmp" ] || {
+    echo "mv failure left a $(file_mode "${APP_ENV_FILE}.tmp") copy of the secrets behind" >&2
+    return 1
+  }
+  # 原文件必须原封不动(内容和权限都是),打标签失败不该动到它。
+  assert_mode "$APP_ENV_FILE" 600 || return 1
+  grep -q '^JWT_SECRET=s3cr3t$' "$APP_ENV_FILE" || {
+    echo "expected the original env file to survive a failed stamp untouched" >&2
+    return 1
+  }
+}
+
+test_release_survives_a_failed_sentry_stamp_in_downtime_mode() {
+  # review #150：打标发生在迁移之后。set -e 下 awk/mv 失败会直接退出,不进
+  # handle_post_migration_failure —— 而停机模式已经把旧色停了,于是 API 仅仅
+  # 因为一个可观测性标签写不进去就一直下线。一个 release 标签不值得拿可用性换。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  RELEASE_DOWNTIME=1
+  ENV_STAMP_FAIL=1
+
+  run_release || return 1
+
+  assert_running circle_be_green || return 1
+  grep -q 'could not stamp SENTRY_RELEASE' "$CASE_DIR/release.log" || {
+    echo "expected a warning about the failed stamp" >&2
+    cat "$CASE_DIR/release.log" >&2
+    return 1
+  }
+}
+
+test_release_without_env_file_still_deploys() {
+  # 手动开通流程可能没有 .env.production 在预期位置;打标签失败不该阻断发布。
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+
+  run_release || return 1
+  assert_running circle_be_green
 }
 
 test_smoke_failure_restores_proxy_before_removing_standby() {
@@ -508,6 +672,11 @@ for test_name in \
   test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
+  test_release_stamps_sentry_release_before_starting_the_new_color \
+  test_release_never_widens_permissions_on_the_secrets_it_rewrites \
+  test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
+  test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
+  test_release_without_env_file_still_deploys \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \

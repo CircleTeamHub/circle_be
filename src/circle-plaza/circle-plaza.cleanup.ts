@@ -1,5 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { CirclePlazaService } from './circle-plaza.service';
 
 // Safety cap on batches drained per tick so a huge backlog can't make a single
@@ -17,10 +22,13 @@ export class CirclePlazaCleanup {
 
   constructor(private readonly service: CirclePlazaService) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'circle_plaza_post_sweep')
   async sweepExpiredPosts(): Promise<void> {
     if (this.running) {
       this.logger.debug('expired circle post sweep already running; skipping');
+      // 跳过不是成功 —— 详见 temp-chat.cleanup 里同一处守卫的注释：卡死的
+      // 那一轮会被后续每一次跳过持续刷新心跳，两条 cron 告警一起失明。
+      reportJobSkipped();
       return;
     }
     this.running = true;
@@ -38,6 +46,7 @@ export class CirclePlazaCleanup {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

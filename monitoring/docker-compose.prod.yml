@@ -6,18 +6,40 @@
 # Without it, the stack scrapes the DEV backend (host.docker.internal:3000) and
 # monitors nothing in production — see README.md "Scraping production".
 #
-# It changes Prometheus only, in three ways:
+# It changes Prometheus in three ways:
 #   1. joins it to the circle-be compose network, the only place the backend is
 #      reachable (docker-compose.prod.yml only does `expose: 3000`);
 #   2. swaps in prometheus.prod.yml (blue-green DNS discovery + bearer auth);
 #   3. mounts the METRICS_AUTH_TOKEN credentials file.
 #
+# It also PINS every image and adds the postgres/redis exporters — see the two
+# sections below for why neither belongs in the base file.
+#
 # Prerequisites:
 #   - the circle-be stack is up, so its network exists;
-#   - monitoring/prometheus/metrics_token exists — run monitoring/sync-metrics-token.sh.
+#   - monitoring/prometheus/metrics_token exists — run monitoring/sync-metrics-token.sh;
+#   - monitoring/.env.exporters exists — run monitoring/sync-exporter-env.sh.
+
+# ── Pinned image versions ─────────────────────────────────────────────────────
+# The base file uses :latest for a frictionless local start. On a server that is
+# a live hazard: the next `up -d` — typically run *while debugging some other
+# incident* — silently pulls a new major, the stack fails to come back, and the
+# monitoring is gone exactly when it is needed. Prometheus 3.x and Grafana 12→13
+# both shipped breaking changes this way.
+#
+# Bump these deliberately, one at a time, and check the release notes.
+# The Grafana pin matches the version the README's admin-password reset caveat
+# was verified against; the Prometheus pin matches the promtool version CI runs.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
 
 services:
   prometheus:
+    image: prom/prometheus:v3.7.3
     networks:
       # Named explicitly because adding a second network would otherwise drop
       # the implicit default, and Prometheus must keep reaching alertmanager /
@@ -30,6 +52,66 @@ services:
       # Gitignored, 0600, owned by uid 65534 (the `nobody` user Prometheus runs
       # as) — otherwise the container cannot read it and every scrape 401s.
       - ./prometheus/metrics_token:/etc/prometheus/metrics_token:ro
+
+  node-exporter:
+    image: prom/node-exporter:v1.11.0
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+
+  alertmanager:
+    image: prom/alertmanager:v0.29.0
+
+  grafana:
+    image: grafana/grafana:13.1.0
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1.23.16
+
+  # ── 数据库与缓存指标 ────────────────────────────────────────────────────
+  # 只在生产 overlay 里定义,不进基础文件:开发机上 Postgres/Redis 常常不在
+  # Docker 里跑(或压根没跑),放进基础文件会得到两个永远 DOWN 的 target ——
+  # 正是这套配置里反复警惕的「常年红 → 训练运维忽略红色」。
+  #
+  # 补的是此前完全没有的一面:`circle_redis_up` 只有 0/1,Postgres 一个指标
+  # 都没有。而生产就绪审计里「pg 连接池只有 10」是已知阻塞项 —— 池打满不会
+  # 立刻变成 5xx,而是先表现为请求排队,等 BackendHighLatencyP95 响的时候
+  # 已经晚了。pg_stat_activity 的连接数是唯一能提前看到它的东西。
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.19.0
+    container_name: circle-postgres-exporter
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
+    # DATA_SOURCE_NAME —— 由 sync-exporter-env.sh 从 .env.production 派生,
+    # 因为 DATABASE_URL 带着 Prisma 的 ?schema=public,libpq 会直接拒绝。
+    env_file:
+      # required: false —— 漏跑 sync-exporter-env.sh 时只让这个 exporter 起不来
+      # (target DOWN → TargetDown 告警),而不是让整个监控栈拒绝启动。一个忘跑的
+      # 脚本不该把 Prometheus 和 Alertmanager 一起拖下水。
+      - path: .env.exporters
+        required: false
+    networks:
+      - default
+      - circle-be
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.83.0
+    container_name: circle-redis-exporter
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 128m
+    # REDIS_ADDR 收完整的 redis:// URI,凭据由 exporter 自己解析(含百分号编码)。
+    # 托管 Redis 同样适用 —— 它不依赖 bundled-redis profile 是否启用。
+    env_file:
+      # required: false —— 漏跑 sync-exporter-env.sh 时只让这个 exporter 起不来
+      # (target DOWN → TargetDown 告警),而不是让整个监控栈拒绝启动。一个忘跑的
+      # 脚本不该把 Prometheus 和 Alertmanager 一起拖下水。
+      - path: .env.exporters
+        required: false
+    networks:
+      - default
+      - circle-be
 
 networks:
   circle-be:

@@ -29,7 +29,6 @@
 |---|---|---|
 | `accessToken` | 所有业务 API 请求的凭证 | 15 分钟 |
 | `refreshToken` | `accessToken` 过期后用于换新 | 7 天 |
-| `imToken` | 初始化 OpenIM SDK（即时通讯） | ~24 小时 |
 
 ### 如何携带 accessToken
 
@@ -60,12 +59,12 @@ nickname": "Test User",       // 可选，1-30位，默认同username
 ```json
 {
   "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "refreshToken": "c8c1f46b2b9c...",
-  "imToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  "refreshToken": "c8c1f46b2b9c..."
 }
 ```
 
-> `imToken` 为空字符串时，表示 OpenIM 服务未启动，跳过 SDK 初始化。
+> 聊天不再需要独立的 IM token：`/chat-ws` 用同一个 `accessToken` 握手（见
+> [self-hosted-chat.md](self-hosted-chat.md)）。
 
 ---
 
@@ -107,12 +106,9 @@ POST /auth/refresh
 ```json
 {
   "accessToken": "eyJhbGci...",
-  "refreshToken": "新的refreshToken（旧的立即失效）",
-  "imToken": ""
+  "refreshToken": "新的refreshToken（旧的立即失效）"
 }
 ```
-
-> 注意：refresh 不返回新的 imToken，imToken 有效期较长无需频繁刷新。
 
 ---
 
@@ -1302,7 +1298,6 @@ import * as SecureStore from 'expo-secure-store';
 
 await SecureStore.setItemAsync('accessToken', accessToken);
 await SecureStore.setItemAsync('refreshToken', refreshToken);
-await SecureStore.setItemAsync('imToken', imToken);
 ```
 
 ### 2. Axios 拦截器自动刷新 Token
@@ -1333,25 +1328,20 @@ api.interceptors.response.use(
 );
 ```
 
-### 3. OpenIM SDK 初始化
+### 3. 聊天连接
+
+聊天不再需要 SDK 或独立 token：用 `accessToken` 直接握手同域的 socket.io 端点
+`/chat-ws`。事件名、载荷与错误码见
+[self-hosted-chat.md](self-hosted-chat.md)。
 
 ```typescript
-import { OpenIMSDK } from 'open-im-sdk-rn';
+import { io } from 'socket.io-client';
 
-async function initIM(userID: string, imToken: string) {
-  if (!imToken) return; // OpenIM 未启动时跳过
-
-  await OpenIMSDK.initSDK({
-    platformID: Platform.OS === 'ios' ? 1 : 2,
-    apiAddr: 'http://localhost:10002',
-    wsAddr: 'ws://localhost:10001',
-    dataDir: '.',
-    logLevel: 5,
-    isLogStandardOutput: true,
-  });
-
-  await OpenIMSDK.login({ userID, token: imToken });
-}
+const socket = io(API_BASE, {
+  path: '/chat-ws',
+  transports: ['websocket'],
+  auth: { token: accessToken },
+});
 ```
 
 ### 4. 设备名（会话管理）

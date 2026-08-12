@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -66,7 +70,7 @@ export class ChatCircleSyncService {
     this.retryQueue.add(circleID);
   }
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_circle_sync')
   async reconcileRecent(): Promise<void> {
     const since = new Date(
       Date.now() - ChatCircleSyncService.RECONCILE_WINDOW_MS,
@@ -78,6 +82,8 @@ export class ChatCircleSyncService {
       this.logger.error(
         `reconcile scan failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      // 扫描失败 = 这一轮一个圈子都没对账。不上报的话包装器会记成成功。
+      reportHandledJobFailure();
       return;
     }
     // 上轮失败的圈子跟着重试:只靠窗口重叠的话,连续失败超过 2 分钟就永远

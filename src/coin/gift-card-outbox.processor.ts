@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -7,7 +8,11 @@ import { PrismaService } from 'src/prisma/prisma.service';
 const GRACE_MS = 2 * 60 * 1000;
 // review 修复：5 次（≈5 分钟）就永久放弃会让一次略长的数据库抖动永久
 // 丢卡。60 次 ≈ 1 小时逐分钟重试；clientMessageId 幂等使重复投递无害。
-const MAX_ATTEMPTS = 60;
+//
+// 导出给 metrics/outbox-depth.service：死信行（钱已结算但卡永久丢失）的判定
+// 必须和这里同一个数，否则积压指标会和实际放弃行为分叉。
+export const GIFT_CARD_MAX_ATTEMPTS = 60;
+const MAX_ATTEMPTS = GIFT_CARD_MAX_ATTEMPTS;
 const BATCH = 50;
 
 /**
@@ -27,7 +32,7 @@ export class GiftCardOutboxProcessor {
     private readonly chatMessages: ChatSystemMessageService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'gift_card_outbox')
   async compensate(now: Date = new Date()): Promise<number> {
     const gifts = await this.prisma.coinGift.findMany({
       where: {

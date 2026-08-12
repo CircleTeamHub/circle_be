@@ -1,5 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { CronExpression } from '@nestjs/schedule';
+import {
+  reportHandledJobFailure,
+  reportJobSkipped,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { TempChatStatus } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { TempChatService } from './temp-chat.service';
@@ -24,9 +29,15 @@ export class TempChatCleanup {
     private readonly service: TempChatService,
   ) {}
 
-  @Cron(CronExpression.EVERY_MINUTE)
+  @TrackedCron(CronExpression.EVERY_MINUTE, 'temp_chat_cleanup')
   async sweep(): Promise<void> {
-    if (this.running) return;
+    // 跳过不是成功。上一轮吊死在 teardown 上时，后面每分钟的跳过都会把心跳
+    // 刷新一遍，于是 CronJobStalled（心跳一直新鲜）和 CronJobFailing（没有
+    // 失败）同时打不中 —— 一个永久卡死的清理任务在大盘上完全健康。
+    if (this.running) {
+      reportJobSkipped();
+      return;
+    }
     this.running = true;
     try {
       for (let batch = 0; batch < SWEEP_MAX_BATCHES; batch += 1) {
@@ -63,6 +74,9 @@ export class TempChatCleanup {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      // 认领批次失败 = 这一轮一间房都没清。（循环内单房 teardown 失败是
+      // 按设计的单项容错，不记整轮失败。）
+      reportHandledJobFailure();
     } finally {
       this.running = false;
     }

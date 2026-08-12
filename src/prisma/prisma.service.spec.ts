@@ -2,6 +2,24 @@ const connectMock = jest.fn();
 const disconnectMock = jest.fn();
 const prismaPgMock = jest.fn();
 const getServerConfigMock = jest.fn();
+const poolConstructorMock = jest.fn();
+const poolEndMock = jest.fn();
+
+/** 每个 new Pool() 的替身,带 pg.Pool 那几个实时计数器。 */
+class MockPool {
+  totalCount = 0;
+  idleCount = 0;
+  waitingCount = 0;
+  end = poolEndMock;
+
+  constructor(config: unknown) {
+    poolConstructorMock(config);
+  }
+}
+
+jest.mock('pg', () => ({
+  Pool: jest.fn().mockImplementation((config: unknown) => new MockPool(config)),
+}));
 
 jest.mock('src/generated/prisma', () => ({
   PrismaClient: class MockPrismaClient {
@@ -17,9 +35,9 @@ jest.mock('src/generated/prisma', () => ({
 }));
 
 jest.mock('@prisma/adapter-pg', () => ({
-  PrismaPg: jest.fn().mockImplementation((options: unknown) => {
-    prismaPgMock(options);
-    return { options };
+  PrismaPg: jest.fn().mockImplementation((poolOrConfig: unknown) => {
+    prismaPgMock(poolOrConfig);
+    return { poolOrConfig };
   }),
 }));
 
@@ -111,6 +129,7 @@ describe('PrismaService', () => {
 
     expect(() => new PrismaService()).not.toThrow();
     expect(prismaPgMock).not.toHaveBeenCalled();
+    expect(poolConstructorMock).not.toHaveBeenCalled();
   });
 
   it('passes the pool size and acquire timeout to the pg adapter', () => {
@@ -118,12 +137,17 @@ describe('PrismaService', () => {
 
     expect(() => new PrismaService()).not.toThrow();
 
-    expect(prismaPgMock).toHaveBeenCalledWith({
+    // 池现在由 PrismaService 自己建并持有(为了读 waitingCount),配置因此落在
+    // Pool 构造函数上而不是适配器上。
+    expect(poolConstructorMock).toHaveBeenCalledWith({
       connectionString: 'postgresql://example',
       max: 10,
       connectionTimeoutMillis: 10_000,
       statement_timeout: 15_000,
     });
+    // 适配器拿到的必须是同一个池实例,不是另一份配置 —— 否则会凭空多出
+    // 第二个连接池,而指标读的是没人用的那个。
+    expect(prismaPgMock).toHaveBeenCalledWith(expect.any(MockPool));
   });
 
   it('lets the environment override pool settings from the .env file', () => {
@@ -135,7 +159,7 @@ describe('PrismaService', () => {
 
     expect(() => new PrismaService()).not.toThrow();
 
-    expect(prismaPgMock).toHaveBeenCalledWith(
+    expect(poolConstructorMock).toHaveBeenCalledWith(
       expect.objectContaining({
         connectionString: 'postgresql://from-file',
         max: 30,
@@ -173,5 +197,52 @@ describe('PrismaService', () => {
     expect(connectMock).toHaveBeenCalledTimes(1);
     expect(service.isDatabaseConnected()).toBe(true);
     expect(logSpy).toHaveBeenCalled();
+  });
+
+  it('exposes the live pool counters for /metrics', () => {
+    process.env.DATABASE_URL = 'postgresql://example';
+    const service = new PrismaService();
+
+    const pool = service.getPoolForTest() as unknown as MockPool;
+    pool.totalCount = 9;
+    pool.idleCount = 1;
+    pool.waitingCount = 4;
+
+    expect(service.getPoolStats()).toEqual({
+      max: 10,
+      total: 9,
+      idle: 1,
+      waiting: 4,
+    });
+  });
+
+  it('reports no pool stats when running without a database', () => {
+    process.env.ALLOW_START_WITHOUT_DB = 'true';
+    const service = new PrismaService();
+
+    expect(service.getPoolStats()).toBeNull();
+  });
+
+  it('closes the pool it owns on shutdown', async () => {
+    // @prisma/adapter-pg 只在**自己**创建池时负责销毁它。既然改成由
+    // PrismaService 建池(为了读 waitingCount),关闭责任就一并转移过来 ——
+    // 漏掉这一步,每次优雅重启都会留下一把不归还的 Postgres 连接。
+    process.env.DATABASE_URL = 'postgresql://example';
+    const service = new PrismaService();
+
+    await service.onModuleDestroy();
+
+    expect(disconnectMock).toHaveBeenCalledTimes(1);
+    expect(poolEndMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fail shutdown when the pool is already closed', async () => {
+    process.env.DATABASE_URL = 'postgresql://example';
+    const service = new PrismaService();
+    poolEndMock.mockRejectedValueOnce(
+      new Error('Called end on pool more than once'),
+    );
+
+    await expect(service.onModuleDestroy()).resolves.toBeUndefined();
   });
 });
