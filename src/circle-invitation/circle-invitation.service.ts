@@ -144,26 +144,6 @@ export class CircleInvitationService {
       });
     }
 
-    // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
-    // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
-    // 且邀请人是 OWNER/ADMIN 时更是「立刻入圈」。拉黑是比邀请权限更硬的意愿
-    // 表达,两个方向都拦;错误与隐私拒绝同一条,不泄露「他拉黑了你」。
-    const blocked = await this.prisma.block.findFirst({
-      where: {
-        OR: [
-          { blockerID: applicantId, blockedID: inviterId },
-          { blockerID: inviterId, blockedID: applicantId },
-        ],
-      },
-      select: { id: true },
-    });
-    if (blocked) {
-      throw new ForbiddenException({
-        message: 'User does not allow circle invites',
-        errorCode: CircleInvitationErrorCode.NotAllowed,
-      });
-    }
-
     // 6. Create invitation; the inviter takes the first seat only if they may vouch
     const invitation = await this.runInvitationTransaction(async (tx) => {
       // CircleInvitation has no DB-level unique constraint, so serialize
@@ -173,6 +153,32 @@ export class CircleInvitationService {
       // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
       // 收严返回成功之后,一个读到旧策略的建单仍会提交。
       await this.memberLock.lockPolicy(tx, circleId);
+
+      // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
+      // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
+      // 且邀请人是 OWNER/ADMIN 时更是「立刻入圈」。拉黑是比邀请权限更硬的
+      // 意愿表达,两个方向都拦;错误与隐私拒绝同一条,不泄露「他拉黑了你」。
+      //
+      // 读放在事务内而不是预检:本事务是 Serializable,这次读会与并发的
+      // 「拉黑」写形成 rw 冲突,SSI 判定后其中一方 40001 回滚并重试(见
+      // runSerializableTransaction 的 P2034 重试)—— 拿不到「读完才拉黑、
+      // 却仍然入圈」这种交叉。比再引一把 call-user:* advisory 锁更省:那要
+      // 把好友模块的锁序引进圈子模块,多一处跨模块的死锁面。
+      const blocked = await tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: applicantId, blockedID: inviterId },
+            { blockerID: inviterId, blockedID: applicantId },
+          ],
+        },
+        select: { id: true },
+      });
+      if (blocked) {
+        throw new ForbiddenException({
+          message: 'User does not allow circle invites',
+          errorCode: CircleInvitationErrorCode.NotAllowed,
+        });
+      }
 
       const [inviterMembership, lockedMembership, circlePolicy] =
         await Promise.all([

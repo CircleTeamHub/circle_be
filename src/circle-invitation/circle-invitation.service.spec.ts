@@ -104,6 +104,7 @@ describe('CircleInvitationService', () => {
     // 这里给好友那一半一个成立的默认值,想测反例的用例自己覆写成 null。
     prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
     prisma.block.findFirst.mockResolvedValue(null);
+    // invite 事务里读的是 tx.block(与 prisma 同一份桩,见 $transaction 的实现)。
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -1684,6 +1685,18 @@ describe('CircleInvitationService', () => {
         expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
         expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
       }
+    });
+
+    // 预检式的读拦不住「读完之后才拉黑」:必须在事务内读,让 Serializable 的
+    // SSI 把它与并发的拉黑写判成冲突。
+    it('reads the block relation inside the invitation transaction', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.block.findFirst.mock.invocationCallOrder[0],
+      );
     });
 
     // 成员锁是按 (circle, user) 对取的,与 PATCH /circle/:id 拿的那几把不相交,
