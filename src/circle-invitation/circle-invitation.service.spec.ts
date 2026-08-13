@@ -1687,6 +1687,26 @@ describe('CircleInvitationService', () => {
       }
     });
 
+    // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:
+    // 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分。
+    it('does not let a non-member distinguish a block from the membership error', async () => {
+      for (const block of [null, { blockerID: 'applicant-1' }]) {
+        jest.clearAllMocks();
+        arrangeInviteFlow();
+        privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+        prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+        prisma.block.findFirst.mockResolvedValue(block);
+        // 调用者根本不是本圈成员。
+        prisma.circleMember.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.invite('stranger-1', 'applicant-1', 'circle-1'),
+        ).rejects.toMatchObject({
+          response: { errorCode: CircleInvitationErrorCode.InviterNotMember },
+        });
+      }
+    });
+
     // 预检式的读拦不住「读完之后才拉黑」:必须在事务内读,让 Serializable 的
     // SSI 把它与并发的拉黑写判成冲突。
     it('reads the block relation inside the invitation transaction', async () => {

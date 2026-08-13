@@ -137,6 +137,33 @@ describe('UpdateCircleDto', () => {
     expect(dto.memberCanPost).toBe(true);
   });
 
+  // 数字字段吃的是 enableImplicitConversion 的另一面:@Type(() => Number) 把
+  // false→0、true→1。于是 joinVipRestriction:false 等同「清空限制」,
+  // requiredVerifierCount:true 等同 1 —— 把入圈验证整个关掉。
+  it('rejects booleans on the numeric admission fields', () => {
+    for (const property of [
+      'joinVipRestriction',
+      'joinCreditRestriction',
+      'requiredVerifierCount',
+    ]) {
+      expect(failed({ [property]: false }, property)).toBe(true);
+      expect(failed({ [property]: true }, property)).toBe(true);
+    }
+  });
+
+  it('still accepts real numbers and the nullable clears', () => {
+    const { dto, errors } = parse({
+      joinVipRestriction: 3,
+      requiredVerifierCount: 10,
+      joinCreditRestriction: null,
+    });
+
+    expect(errors).toHaveLength(0);
+    expect(dto.joinVipRestriction).toBe(3);
+    expect(dto.requiredVerifierCount).toBe(10);
+    expect(dto.joinCreditRestriction).toBeNull();
+  });
+
   // MINIO_PUBLIC_URL 没配时 assertAvatarUrlIsSafe 直接短路,不设长度上限的话
   // 任意长的字符串会入库,再被圈子列表/详情原样发出去。
   it('bounds the avatar url length', () => {

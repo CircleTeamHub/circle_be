@@ -138,10 +138,12 @@ export class CreateCircleDto {
 /**
  * PATCH /circle/:id 的字段面 = FE 编辑页实际发送的 11 个字段 + 两个招新策略开关。
  *
- * 三个布尔字段都带 @Transform 读原值:全局 ValidationPipe 开着
+ * 布尔与数字字段一律 @Transform 读转换前的原值:全局 ValidationPipe 开着
  * enableImplicitConversion,它会把任意非空字符串转成 true —— `memberCanInvite:
- * "false"` 会被静默当成「开着」,圈主以为关掉了成员邀请,其实没关。做法与
- * support.dto.ts 里的 enabled 一致。
+ * "false"` 会被静默当成「开着」,圈主以为关掉了成员邀请,其实没关。数字字段
+ * 吃的是同一个亏的另一面:`@Type(() => Number)` 把 false→0、true→1,于是
+ * `joinVipRestriction: false` 等同「清空限制」、`requiredVerifierCount: true`
+ * 等同 1(把入圈验证整个关掉)。做法与 support.dto.ts 里的 enabled 一致。
  *
  * 刻意不含 maxMembers:容量走会员配额/扩容流程,不归这条通用编辑路由管。
  * description 允许空串 —— 自研栈下「群公告即圈子简介」,清空公告是合法操作,
@@ -203,7 +205,9 @@ export class UpdateCircleDto {
   tags?: string[];
 
   @ApiPropertyOptional({ nullable: true, minimum: 0, maximum: 4 })
-  @Type(() => Number)
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinVipRestriction,
+  )
   @IsInt()
   @Min(0)
   @Max(4)
@@ -211,7 +215,9 @@ export class UpdateCircleDto {
   joinVipRestriction?: number | null;
 
   @ApiPropertyOptional({ nullable: true })
-  @Type(() => Number)
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinCreditRestriction,
+  )
   @IsInt()
   @Min(0)
   @Max(100)
@@ -238,7 +244,9 @@ export class UpdateCircleDto {
     description:
       'Verifier votes required to admit an applicant; snapshotted per invitation.',
   })
-  @Type(() => Number)
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.requiredVerifierCount,
+  )
   @IsInt()
   @Min(1)
   @Max(10)
