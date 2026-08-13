@@ -28,6 +28,7 @@ import {
   CircleDto,
   MyCircleDto,
   CreateCircleDto,
+  UpdateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
   SelectCircleIconDto,
@@ -160,6 +161,10 @@ export class CircleService {
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
           maxMembers,
           memberCanPost: dto.memberCanPost ?? true,
+          // 不传则不写键,默认值只有 schema(宣传期 1)一个来源。
+          ...(dto.requiredVerifierCount !== undefined
+            ? { requiredVerifierCount: dto.requiredVerifierCount }
+            : {}),
           memberCount: 1,
         },
       });
@@ -376,6 +381,122 @@ export class CircleService {
     };
   }
 
+  /**
+   * PATCH /circle/:id —— FE 编辑圈子从 2026-04-22、改群名/群公告从 #145 弃
+   * OpenIM 起就在打这个地址,而这条路由此前从不存在,三个入口全 404。
+   *
+   * 权限对齐 FE 入口(isOwnerOrAdmin / canManageGroup):ACTIVE 的 OWNER 或
+   * ADMIN。joinVipRestriction 的天花板锚在**圈主**的会员档而不是操作者 ——
+   * 错误码语义就是 EXCEEDS_CREATOR,管理员不能替圈主抬高门槛。
+   *
+   * data 只收显式传入的字段(undefined 一律跳过):PATCH 语义,漏传不等于清空。
+   */
+  async updateCircle(
+    userId: string,
+    circleId: string,
+    dto: UpdateCircleDto,
+  ): Promise<CircleDetailDto> {
+    this.assertAvatarUrlIsSafe(dto.avatarUrl);
+    const categories =
+      dto.categories !== undefined
+        ? this.normalizeStringList(dto.categories, 'category')
+        : undefined;
+
+    await this.prisma.$transaction(async (tx) => {
+      const circle = await tx.circle.findFirst({
+        where: { id: circleId, deleted: false },
+        select: { id: true, ownerID: true },
+      });
+      if (!circle) {
+        throw new NotFoundException({
+          message: 'Circle not found',
+          errorCode: CircleErrorCode.NotFound,
+        });
+      }
+
+      const membership = await tx.circleMember.findUnique({
+        where: { userID_circleID: { userID: userId, circleID: circleId } },
+        select: { role: true, status: true },
+      });
+      if (
+        !membership ||
+        membership.status !== 'ACTIVE' ||
+        (membership.role !== 'OWNER' && membership.role !== 'ADMIN')
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the circle owner or admin can edit circle settings',
+          errorCode: CircleErrorCode.EditForbidden,
+        });
+      }
+
+      let joinVipRestriction: number | null | undefined;
+      if (dto.joinVipRestriction !== undefined) {
+        if (dto.joinVipRestriction == null || dto.joinVipRestriction === 0) {
+          // 与 create 同规:0/null 都落成「无限制」,不必读圈主会员档。
+          joinVipRestriction = null;
+        } else {
+          // 同 createCircle:锁住圈主再读会员档,门槛决策不能在过期的
+          // rollout floor 下提交。
+          await this.membershipPolicy.lockUsers(tx, [circle.ownerID]);
+          const owner = await tx.user.findUnique({
+            where: { id: circle.ownerID },
+            select: { vipLevel: true, vipExpiresAt: true },
+          });
+          if (!owner) {
+            throw new NotFoundException({
+              message: 'Circle owner not found',
+              errorCode: CircleErrorCode.UserNotFound,
+            });
+          }
+          const policy = await this.membershipPolicy.resolveEntitlement(
+            owner,
+            tx,
+            new Date(),
+            { lockForWrite: true },
+          );
+          joinVipRestriction =
+            this.admissionPolicy.normalizeCreatorVipRestriction(
+              dto.joinVipRestriction,
+              policy.level,
+            );
+        }
+      }
+
+      const data = {
+        ...(dto.name !== undefined ? { name: dto.name } : {}),
+        ...(categories !== undefined ? { categories } : {}),
+        ...(dto.description !== undefined
+          ? { description: dto.description }
+          : {}),
+        ...(dto.avatarUrl !== undefined ? { avatarUrl: dto.avatarUrl } : {}),
+        ...(dto.cities !== undefined ? { cities: dto.cities } : {}),
+        ...(dto.rules !== undefined ? { rules: dto.rules } : {}),
+        ...(dto.tags !== undefined ? { tags: dto.tags } : {}),
+        ...(dto.joinVipRestriction !== undefined ? { joinVipRestriction } : {}),
+        ...(dto.joinCreditRestriction !== undefined
+          ? { joinCreditRestriction: dto.joinCreditRestriction }
+          : {}),
+        ...(dto.joinFancyRestriction !== undefined
+          ? { joinFancyRestriction: dto.joinFancyRestriction }
+          : {}),
+        ...(dto.memberCanPost !== undefined
+          ? { memberCanPost: dto.memberCanPost }
+          : {}),
+        ...(dto.requiredVerifierCount !== undefined
+          ? { requiredVerifierCount: dto.requiredVerifierCount }
+          : {}),
+        ...(dto.memberCanInvite !== undefined
+          ? { memberCanInvite: dto.memberCanInvite }
+          : {}),
+      };
+      if (Object.keys(data).length > 0) {
+        await tx.circle.update({ where: { id: circleId }, data });
+      }
+    });
+
+    return this.getCircleDetail(userId, circleId);
+  }
+
   async joinCircle(userId: string, circleId: string) {
     // All joins are reviewed. The pair lock is shared with the member-invite
     // path so a direct join and an invitation cannot create two applications.
@@ -426,11 +547,24 @@ export class CircleService {
             select: { id: true },
           });
           if (!existingInvitation) {
+            // 票数是建单那一刻圈子策略的快照:后续调 requiredVerifierCount
+            // 不影响在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
+            const policy = await tx.circle.findFirst({
+              where: { id: circleId, deleted: false },
+              select: { requiredVerifierCount: true },
+            });
+            if (!policy) {
+              throw new NotFoundException({
+                message: 'Circle not found',
+                errorCode: CircleErrorCode.NotFound,
+              });
+            }
             const created = await tx.circleInvitation.create({
               data: {
                 circleID: circleId,
                 applicantID: userId,
                 inviterID: userId,
+                requiredCount: policy.requiredVerifierCount,
               },
               select: { id: true },
             });
@@ -669,6 +803,8 @@ export class CircleService {
       joinFancyRestriction: circle.joinFancyRestriction,
       maxMembers: circle.maxMembers,
       memberCanPost: circle.memberCanPost,
+      requiredVerifierCount: circle.requiredVerifierCount,
+      memberCanInvite: circle.memberCanInvite,
       groupID: circle.groupID,
       memberCount: circle.memberCount,
       postCount: circle.postCount,

@@ -1514,6 +1514,11 @@ model Circle {
   maxMembers            Int?
   expansionSeats        Int              @default(0)
   memberCanPost         Boolean          @default(true)
+  /// 建担保单时快照进 CircleInvitation.requiredCount。宣传期默认 1:成员邀请自动
+  /// 带首票,建单即满 → 立即入圈;后期收紧改成 10 恢复满员担保。改值不影响在途申请。
+  requiredVerifierCount Int              @default(1)
+  /// false = 普通成员的邀请入口关闭,只留 OWNER/ADMIN(「只有管理员拉人」的严格形态)。
+  memberCanInvite       Boolean          @default(true)
   groupID               String?          @unique
   memberCount           Int              @default(0)
   postCount             Int              @default(0)

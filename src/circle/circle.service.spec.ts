@@ -13,6 +13,7 @@ import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import {
   CreateCircleDto,
   MyCirclesQueryDto,
+  UpdateCircleDto,
   SetCircleAvatarDto,
   SetCircleCoverDto,
   UploadCircleIconDto,
@@ -40,6 +41,7 @@ describe('CircleService', () => {
     },
     iconAsset: {
       findFirst: jest.fn(),
+      findMany: jest.fn(),
       create: jest.fn(),
       deleteMany: jest.fn(),
     },
@@ -151,6 +153,7 @@ describe('CircleService', () => {
       joinCreditRestriction: null,
       joinFancyRestriction: false,
       groupID: 'group-1',
+      requiredVerifierCount: 10,
     });
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 0,
@@ -174,12 +177,14 @@ describe('CircleService', () => {
         data: expect.objectContaining({ status: 'PENDING' }),
       }),
     );
-    // 申请人自任 inviter 的担保单（0/10 起步），驱动「邀请好友为我验证」入口。
+    // 申请人自任 inviter 的担保单（0/N 起步），驱动「邀请好友为我验证」入口。
+    // N 是建单那一刻圈子 requiredVerifierCount 的快照,后续调策略不影响在途申请。
     expect(prisma.circleInvitation.create).toHaveBeenCalledWith({
       data: {
         circleID: 'circle-1',
         applicantID: 'user-1',
         inviterID: 'user-1',
+        requiredCount: 10,
       },
       select: { id: true },
     });
@@ -649,6 +654,56 @@ describe('CircleService', () => {
     expect(prisma.circle.create).not.toHaveBeenCalled();
   });
 
+  it('createCircle passes requiredVerifierCount through to the row', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 3,
+      vipExpiresAt: null,
+    });
+    prisma.circle.create.mockResolvedValue({
+      id: 'circle-1',
+      name: 'Gated Circle',
+      description: 'a'.repeat(20),
+      avatarUrl: null,
+      ownerID: 'user-1',
+      cities: [],
+      categories: ['food'],
+      rules: '',
+      tags: [],
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      maxMembers: null,
+      memberCanPost: true,
+      requiredVerifierCount: 5,
+      memberCanInvite: true,
+      groupID: null,
+      memberCount: 1,
+      postCount: 0,
+      createdAt: new Date('2026-08-12T12:00:00.000Z'),
+    });
+
+    await service.createCircle('user-1', {
+      name: 'Gated Circle',
+      categories: ['food'],
+      description: 'a'.repeat(20),
+      requiredVerifierCount: 5,
+    });
+
+    expect(prisma.circle.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ requiredVerifierCount: 5 }),
+    });
+
+    // 不传则不进 data —— 留给 schema 默认值(宣传期 1),两处默认只有一个来源。
+    prisma.circle.create.mockClear();
+    await service.createCircle('user-1', {
+      name: 'Gated Circle',
+      categories: ['food'],
+      description: 'a'.repeat(20),
+    });
+    const data = prisma.circle.create.mock.calls[0][0].data;
+    expect('requiredVerifierCount' in data).toBe(false);
+  });
+
   it('stores legacy joinVipRestriction zero as no restriction', async () => {
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -1096,6 +1151,229 @@ describe('CircleService', () => {
     });
 
     expect(prisma.circle.findMany).not.toHaveBeenCalled();
+  });
+  // ─── PATCH /circle/:id ──────────────────────────────────────────────────────
+  //
+  // FE 从 2026-04-22 起就在打这个地址(编辑圈子),#145 弃 OpenIM 后改群名/群公告
+  // 也指过来了 —— 而 BE 从来没有这条路由,三个入口全是 404。字段面以 FE 实际发送
+  // 的为准;description 允许空串(群公告可清空,不复用 create 的 MinLength(10))。
+  describe('updateCircle', () => {
+    const circleRow = {
+      id: 'circle-1',
+      ownerID: 'owner-1',
+      deleted: false,
+      name: '旧名',
+      description: '一段足够长的旧简介',
+      avatarUrl: null,
+      currentIconAssetID: null,
+      currentIconAsset: null,
+      cover: null,
+      cities: [],
+      categories: ['life'],
+      rules: '',
+      tags: [],
+      joinVipRestriction: null,
+      joinCreditRestriction: null,
+      joinFancyRestriction: false,
+      maxMembers: 100,
+      memberCanPost: true,
+      requiredVerifierCount: 1,
+      memberCanInvite: true,
+      groupID: 'circle-1',
+      memberCount: 3,
+      postCount: 0,
+      createdAt: new Date('2026-08-01T00:00:00.000Z'),
+    };
+
+    beforeEach(() => {
+      prisma.circle.findFirst.mockResolvedValue(circleRow);
+      prisma.iconAsset.findMany.mockResolvedValue([]);
+    });
+
+    it('lets the owner update exactly the fields it was sent', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      const result = await service.updateCircle('owner-1', 'circle-1', {
+        name: '新名字',
+        description: '',
+      } as UpdateCircleDto);
+
+      // 精确匹配:没发的字段不准出现在 update data 里,群公告清空(空串)要能过。
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { name: '新名字', description: '' },
+      });
+      expect(result.myRole).toBe('OWNER');
+    });
+
+    it('lets an active ADMIN update (FE 的编辑入口是 isOwnerOrAdmin)', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('admin-1', 'circle-1', {
+        description: '公告改一下',
+      } as UpdateCircleDto);
+
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { description: '公告改一下' },
+      });
+    });
+
+    it('rejects a plain member and a non-member', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+      await expect(
+        service.updateCircle('member-1', 'circle-1', {
+          name: '越权',
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CIRCLE_EDIT_FORBIDDEN' },
+      });
+
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+      await expect(
+        service.updateCircle('stranger-1', 'circle-1', {
+          name: '越权',
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CIRCLE_EDIT_FORBIDDEN' },
+      });
+      expect(prisma.circle.update).not.toHaveBeenCalled();
+    });
+
+    it('404s on an unknown or deleted circle', async () => {
+      prisma.circle.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateCircle('owner-1', 'missing', {
+          name: '不存在',
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CIRCLE_NOT_FOUND' },
+      });
+    });
+
+    it('anchors joinVipRestriction to the OWNER entitlement, not the caller', async () => {
+      // ADMIN 改限制,天花板仍是圈主的会员档 —— 错误码语义就是 EXCEEDS_CREATOR。
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: null,
+      });
+
+      await expect(
+        service.updateCircle('admin-1', 'circle-1', {
+          joinVipRestriction: 3,
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR' },
+      });
+      expect(prisma.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'owner-1' } }),
+      );
+      expect(prisma.circle.update).not.toHaveBeenCalled();
+    });
+
+    it('clearing joinVipRestriction skips the entitlement read', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        joinVipRestriction: null,
+      } as UpdateCircleDto);
+
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { joinVipRestriction: null },
+      });
+    });
+
+    it('threads the promotional knobs into the update', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        requiredVerifierCount: 10,
+        memberCanInvite: false,
+      } as UpdateCircleDto);
+
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { requiredVerifierCount: 10, memberCanInvite: false },
+      });
+    });
+
+    it('rejects an off-origin avatarUrl when MinIO is configured', async () => {
+      const guarded = new CircleService(
+        prisma as any,
+        circleInvitationService as any,
+        {
+          get: jest.fn(() => 'http://10.0.0.195:9000'),
+        } as any,
+        directMembershipPolicy,
+        directAdmissionPolicy,
+        directMemberLock,
+        directChatCircleSync,
+      );
+
+      await expect(
+        guarded.updateCircle('owner-1', 'circle-1', {
+          avatarUrl: 'https://evil.example.com/track.gif',
+        } as UpdateCircleDto),
+      ).rejects.toThrow(BadRequestException);
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('UpdateCircleDto: 全字段可选,requiredVerifierCount 限 1..10,name 仍限 2..20', () => {
+      expect(validateSync(plainToInstance(UpdateCircleDto, {}))).toHaveLength(
+        0,
+      );
+      expect(
+        validateSync(plainToInstance(UpdateCircleDto, { description: '' })),
+      ).toHaveLength(0);
+      expect(
+        validateSync(
+          plainToInstance(UpdateCircleDto, { requiredVerifierCount: 5 }),
+        ),
+      ).toHaveLength(0);
+      expect(
+        validateSync(
+          plainToInstance(UpdateCircleDto, { requiredVerifierCount: 0 }),
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        validateSync(
+          plainToInstance(UpdateCircleDto, { requiredVerifierCount: 11 }),
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        validateSync(plainToInstance(UpdateCircleDto, { name: 'x' })).length,
+      ).toBeGreaterThan(0);
+      // maxMembers 不在 PATCH 面里(容量归会员配额/扩容流程管)。全局管道是
+      // whitelist + forbidNonWhitelisted(setup.ts),多余字段直接 400 ——
+      // 用同配置跑 validateSync 复现这一层。
+      const errors = validateSync(
+        plainToInstance(UpdateCircleDto, { maxMembers: 500 }),
+        { whitelist: true, forbidNonWhitelisted: true },
+      );
+      expect(errors.length).toBeGreaterThan(0);
+    });
   });
 });
 

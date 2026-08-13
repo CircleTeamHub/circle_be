@@ -7,6 +7,7 @@ import {
   HttpStatus,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -28,6 +29,7 @@ import {
   CircleDto,
   MyCircleDto,
   CreateCircleDto,
+  UpdateCircleDto,
   ListCirclesQueryDto,
   MyCirclesQueryDto,
   SelectCircleIconDto,
@@ -83,6 +85,17 @@ export class CircleController {
     @Req() req: RequestWithUser,
   ): Promise<CircleDetailDto> {
     return this.circleService.getCircleDetail(req.user.userId, id);
+  }
+
+  @Patch(':id')
+  @ApiOperation({ summary: 'Update circle settings (owner/admin only)' })
+  @ApiOkResponse({ type: CircleDetailDto })
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateCircleDto,
+    @Req() req: RequestWithUser,
+  ): Promise<CircleDetailDto> {
+    return this.circleService.updateCircle(req.user.userId, id, dto);
   }
 
   @Post(':id/join')

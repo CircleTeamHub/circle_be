@@ -25,6 +25,7 @@ import {
   AddVerifierDto,
   InvitationDto,
   InvitationListQueryDto,
+  InvitationUserDto,
   InviteToCircleDto,
   RespondVerificationDto,
 } from './dto/circle-invitation.dto';
@@ -100,10 +101,24 @@ export class CircleInvitationController {
     return this.invitationService.getInvitationForViewer(req.user.userId, id);
   }
 
+  @Get(':id/eligible-verifiers')
+  @ApiOperation({
+    summary:
+      'Applicant-only: friends who are also active members of the circle',
+  })
+  @ApiOkResponse({ type: [InvitationUserDto] })
+  eligibleVerifiers(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<InvitationUserDto[]> {
+    return this.invitationService.getEligibleVerifiers(req.user.userId, id);
+  }
+
   @Post(':id/add-verifier')
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({
-    summary: 'Applicant adds a verifier (must be circle member)',
+    summary:
+      'Applicant adds a verifier (must be a friend AND an active circle member)',
   })
   @ApiNoContentResponse()
   addVerifier(
