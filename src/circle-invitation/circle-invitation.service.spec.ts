@@ -52,6 +52,7 @@ describe('CircleInvitationService', () => {
     },
     user: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
     },
     friend: {
       findFirst: jest.fn(),
@@ -1376,14 +1377,17 @@ describe('CircleInvitationService', () => {
       });
     }
 
+    // 成员查询只取 id;profile 在交集之后单独 hydrate。
     function member(id: string) {
+      return { userID: id };
+    }
+
+    function profile(id: string) {
       return {
-        user: {
-          id,
-          nickname: `nick-${id}`,
-          avatarUrl: null,
-          accountId: `acct-${id}`,
-        },
+        id,
+        nickname: `nick-${id}`,
+        avatarUrl: null,
+        accountId: `acct-${id}`,
       };
     }
 
@@ -1398,8 +1402,16 @@ describe('CircleInvitationService', () => {
         // 反向存储的好友行也算,friend 表一对只有一行。
         { userID: 'friend-elsewhere', friendID: 'applicant-1' },
       ]);
+      prisma.user.findMany.mockResolvedValue([profile('friend-member')]);
 
       const result = await service.getEligibleVerifiers('applicant-1', 'inv-1');
+
+      // 只为交集付 hydration,不是把全圈成员的资料先拉一遍再过滤。
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: { in: ['friend-member'] } },
+        }),
+      );
 
       expect(result).toEqual([
         {

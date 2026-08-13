@@ -73,6 +73,39 @@ describe('UpdateCircleDto', () => {
     expect(dto.name).toBe('周末露营');
   });
 
+  // 全局 ValidationPipe 开着 enableImplicitConversion,它把任意非空字符串转成
+  // true —— 没有 @Transform 读原值的话,`memberCanInvite: "false"` 会被静默当成
+  // 「开着」:圈主以为关掉了成员邀请,其实一个都没关。
+  it('rejects string booleans instead of silently reading them as true', () => {
+    for (const property of [
+      'memberCanInvite',
+      'memberCanPost',
+      'joinFancyRestriction',
+    ]) {
+      expect(failed({ [property]: 'false' }, property)).toBe(true);
+      expect(failed({ [property]: 'true' }, property)).toBe(true);
+      expect(failed({ [property]: '0' }, property)).toBe(true);
+    }
+  });
+
+  it('keeps real booleans working, false included', () => {
+    const { dto, errors } = parse({
+      memberCanInvite: false,
+      memberCanPost: true,
+    });
+
+    expect(errors).toHaveLength(0);
+    expect(dto.memberCanInvite).toBe(false);
+    expect(dto.memberCanPost).toBe(true);
+  });
+
+  // MINIO_PUBLIC_URL 没配时 assertAvatarUrlIsSafe 直接短路,不设长度上限的话
+  // 任意长的字符串会入库,再被圈子列表/详情原样发出去。
+  it('bounds the avatar url length', () => {
+    expect(failed({ avatarUrl: 'a'.repeat(501) }, 'avatarUrl')).toBe(true);
+    expect(parse({ avatarUrl: 'a'.repeat(500) }).errors).toHaveLength(0);
+  });
+
   // PATCH 语义:没传的字段一律不校验、不写。
   it('accepts an empty patch and an empty description', () => {
     expect(parse({}).errors).toHaveLength(0);

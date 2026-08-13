@@ -359,6 +359,8 @@ export class CircleInvitationService {
     ).length;
     if (activeSlots >= invitation.requiredCount) return [];
 
+    // 只取 id,不带 profile:交集之前把成员表整张拉成用户资料,是在为
+    // 「最后只会剩几个好友」的结果付一次全员 hydration(圈子可以很大)。
     const members = await this.prisma.circleMember.findMany({
       where: {
         circleID: invitation.circleID,
@@ -370,12 +372,12 @@ export class CircleInvitationService {
           ],
         },
       },
-      select: { user: { select: INVITATION_USER_SELECT } },
+      select: { userID: true },
       orderBy: { createdAt: 'asc' },
     });
     if (members.length === 0) return [];
 
-    const memberIds = members.map((member) => member.user.id);
+    const memberIds = members.map((member) => member.userID);
     const friendships = await this.prisma.friend.findMany({
       where: {
         state: 'ACCEPTED',
@@ -396,16 +398,28 @@ export class CircleInvitationService {
       ),
     );
 
-    return members
-      .filter((member) => friendIds.has(member.user.id))
-      .map(
-        (member): InvitationUserDto => ({
-          id: member.user.id,
-          nickname: member.user.nickname,
-          avatarUrl: member.user.avatarUrl,
-          accountId: member.user.accountId,
-        }),
-      );
+    // 入圈先后序由 memberIds 保着,hydration 只落在交集上。
+    const eligibleIds = memberIds.filter((memberId) => friendIds.has(memberId));
+    if (eligibleIds.length === 0) return [];
+
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: eligibleIds } },
+      select: INVITATION_USER_SELECT,
+    });
+    const byId = new Map(users.map((user) => [user.id, user]));
+    return eligibleIds.flatMap((memberId) => {
+      const user = byId.get(memberId);
+      return user
+        ? [
+            {
+              id: user.id,
+              nickname: user.nickname,
+              avatarUrl: user.avatarUrl,
+              accountId: user.accountId,
+            } satisfies InvitationUserDto,
+          ]
+        : [];
+    });
   }
 
   async addVerifier(

@@ -136,6 +136,11 @@ export class CreateCircleDto {
 /**
  * PATCH /circle/:id 的字段面 = FE 编辑页实际发送的 11 个字段 + 两个招新策略开关。
  *
+ * 三个布尔字段都带 @Transform 读原值:全局 ValidationPipe 开着
+ * enableImplicitConversion,它会把任意非空字符串转成 true —— `memberCanInvite:
+ * "false"` 会被静默当成「开着」,圈主以为关掉了成员邀请,其实没关。做法与
+ * support.dto.ts 里的 enabled 一致。
+ *
  * 刻意不含 maxMembers:容量走会员配额/扩容流程,不归这条通用编辑路由管。
  * description 允许空串 —— 自研栈下「群公告即圈子简介」,清空公告是合法操作,
  * 不能复用 create 的 MinLength(10)。
@@ -167,6 +172,7 @@ export class UpdateCircleDto {
 
   @ApiPropertyOptional()
   @IsString()
+  @MaxLength(500)
   @ValidateIf((_object, value) => value !== undefined)
   avatarUrl?: string;
 
@@ -211,11 +217,15 @@ export class UpdateCircleDto {
   joinCreditRestriction?: number | null;
 
   @ApiPropertyOptional()
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinFancyRestriction,
+  )
   @IsBoolean()
   @ValidateIf((_object, value) => value !== undefined)
   joinFancyRestriction?: boolean;
 
   @ApiPropertyOptional()
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanPost)
   @IsBoolean()
   @ValidateIf((_object, value) => value !== undefined)
   memberCanPost?: boolean;
@@ -236,6 +246,7 @@ export class UpdateCircleDto {
   @ApiPropertyOptional({
     description: 'false = only OWNER/ADMIN may invite new members.',
   })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanInvite)
   @IsBoolean()
   @ValidateIf((_object, value) => value !== undefined)
   memberCanInvite?: boolean;

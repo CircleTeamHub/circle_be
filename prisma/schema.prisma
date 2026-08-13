@@ -1740,7 +1740,9 @@ model CircleInvitation {
   circleID      String
   applicantID   String
   inviterID     String
-  requiredCount Int                    @default(10)
+  /// 默认值只在「迁移已落地、旧色还没换掉」的发布窗口里有意义:新代码两条
+  /// 建单路径都显式写入 Circle.requiredVerifierCount 的快照。
+  requiredCount Int                    @default(1)
   approvedCount Int                    @default(0)
   status        CircleInvitationStatus @default(PENDING)
   createdAt     DateTime               @default(now())
