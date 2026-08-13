@@ -103,6 +103,39 @@ describe('CoinService', () => {
     service = module.get<CoinService>(CoinService);
   });
 
+  it('credits a wallet and its immutable ledger row in the caller transaction', async () => {
+    tx.wallet.upsert.mockResolvedValue({ balance: 0 });
+    tx.wallet.update.mockResolvedValue({ balance: 20 });
+    tx.coinTransaction.create.mockResolvedValue({ id: 'tx-1' });
+
+    await expect(
+      service.creditInTransaction(tx as never, {
+        userId: 'user-1',
+        amount: 20,
+        type: 'REFERRAL_REWARD',
+        note: '邀请好友奖励',
+        relatedId: 'referral-1',
+        idempotencyKey: 'referral:inviter:referral-1',
+      }),
+    ).resolves.toBe(20);
+
+    expect(tx.wallet.update).toHaveBeenCalledWith({
+      where: { userID: 'user-1' },
+      data: { balance: { increment: 20 } },
+      select: { balance: true },
+    });
+    expect(tx.coinTransaction.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userID: 'user-1',
+        type: 'REFERRAL_REWARD',
+        amount: 20,
+        balance: 20,
+        relatedID: 'referral-1',
+        idempotencyKey: 'referral:inviter:referral-1',
+      }),
+    });
+  });
+
   it('rejects gifts to missing or inactive recipients', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'recipient-1',

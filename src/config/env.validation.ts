@@ -192,6 +192,15 @@ export function createEnvValidationSchema(
     // #95：通知 / 好友动态保留天数。0 = 关闭该表清理。
     NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(0).default(90),
     FRIEND_ACTIVITY_RETENTION_DAYS: Joi.number().integer().min(0).default(180),
+    REFERRAL_REWARDS_ENABLED: Joi.boolean().default(true),
+    REFERRAL_INVITER_REWARD: Joi.number().integer().min(1).default(20),
+    REFERRAL_INVITEE_REWARD: Joi.number().integer().min(1).default(5),
+    REFERRAL_QUALIFICATION_DAYS: Joi.number().integer().min(1).default(7),
+    REFERRAL_EXPIRY_DAYS: Joi.number()
+      .integer()
+      .greater(Joi.ref('REFERRAL_QUALIFICATION_DAYS'))
+      .default(30),
+    REFERRAL_MONTHLY_CAP: Joi.number().integer().min(1).default(10),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),

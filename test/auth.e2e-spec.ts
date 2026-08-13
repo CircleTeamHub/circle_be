@@ -70,10 +70,45 @@ describe('Auth e2e', () => {
     const prisma = getE2eApp().get(PrismaService);
     const invitedUser = await prisma.user.findUnique({
       where: { email: 'invited-user@example.com' },
-      select: { invitedByUserId: true },
+      select: { id: true, invitedByUserId: true },
     });
 
     expect(invitedUser?.invitedByUserId).toBe(inviter.id);
+    const referral = await prisma.referral.findUnique({
+      where: { inviteeID: invitedUser!.id },
+      select: {
+        id: true,
+        inviterID: true,
+        status: true,
+        inviterReward: true,
+        inviteeReward: true,
+      },
+    });
+    expect(referral).toEqual({
+      id: expect.any(String),
+      inviterID: inviter.id,
+      status: 'PENDING',
+      inviterReward: 20,
+      inviteeReward: 5,
+    });
+
+    const referralCenter = await pactum
+      .spec()
+      .get('/api/v1/referrals/me')
+      .withHeaders('Authorization', `Bearer ${inviterTokens.accessToken}`)
+      .expectStatus(200)
+      .returns('data');
+    expect(referralCenter.rules).toMatchObject({
+      inviterReward: 20,
+      inviteeReward: 5,
+      qualificationDays: 7,
+      monthlyCap: 10,
+    });
+    expect(referralCenter.summary).toMatchObject({ total: 1, pending: 1 });
+    expect(referralCenter.items[0]).toMatchObject({
+      id: referral?.id,
+      status: 'PENDING',
+    });
   });
 
   it('register rejects an invalid invite code without creating a user', async () => {

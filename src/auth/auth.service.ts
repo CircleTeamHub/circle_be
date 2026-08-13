@@ -53,6 +53,11 @@ import {
 } from 'src/avatar-frame/avatar-frame.service';
 import { lockFancyNumberUser } from 'src/fancy-number/fancy-number-user-lock';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
+import {
+  buildPendingReferralData,
+  readReferralRules,
+  type ReferralRules,
+} from 'src/referral/referral.rules';
 
 const ME_SELECT = USER_ME_SELECT;
 
@@ -116,6 +121,7 @@ export type SafeUser = {
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
   private readonly loggingConfig = createLoggingConfig();
+  private readonly referralRules: ReferralRules;
 
   constructor(
     private prisma: PrismaService,
@@ -126,7 +132,9 @@ export class AuthService {
     private configService: ConfigService,
     private fancyNumberService: FancyNumberService,
     private avatarFrames: AvatarFrameService,
-  ) {}
+  ) {
+    this.referralRules = readReferralRules(configService);
+  }
 
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
     const email = normalizeEmail(dto.email);
@@ -1209,12 +1217,24 @@ export class AuthService {
         this.prisma,
       );
       try {
-        return await this.prisma.user.create({
-          data: {
-            ...data,
-            accountId: registrationCode,
-            inviteCode: registrationCode,
-          },
+        return await this.prisma.$transaction(async (tx) => {
+          const user = await tx.user.create({
+            data: {
+              ...data,
+              accountId: registrationCode,
+              inviteCode: registrationCode,
+            },
+          });
+          if (data.invitedByUserId) {
+            await tx.referral.create({
+              data: buildPendingReferralData(this.referralRules, {
+                inviterId: data.invitedByUserId,
+                inviteeId: user.id,
+                createdAt: user.createdAt,
+              }),
+            });
+          }
+          return user;
         });
       } catch (error) {
         if (isRegistrationCodeUniqueCollision(error)) {

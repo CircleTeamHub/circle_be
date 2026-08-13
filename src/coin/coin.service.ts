@@ -5,7 +5,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { FriendState } from 'src/generated/prisma';
+import { CoinTxType, FriendState, Prisma } from 'src/generated/prisma';
 import { CoinErrorCode } from 'src/common/app-error-codes';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -54,6 +54,51 @@ export class CoinService {
       orderBy: { createdAt: 'desc' },
       take: 50,
     });
+  }
+
+  /**
+   * Credits an internal, server-authorized reward inside the caller's
+   * transaction. Keeping the wallet update and immutable ledger row together
+   * prevents a referral from changing the displayed balance without leaving
+   * an auditable transaction.
+   */
+  async creditInTransaction(
+    tx: Prisma.TransactionClient,
+    input: {
+      userId: string;
+      amount: number;
+      type: CoinTxType;
+      note: string;
+      relatedId: string;
+      idempotencyKey: string;
+    },
+  ): Promise<number> {
+    if (!Number.isInteger(input.amount) || input.amount <= 0) {
+      throw new Error('Wallet credit amount must be a positive integer');
+    }
+
+    await tx.wallet.upsert({
+      where: { userID: input.userId },
+      update: {},
+      create: { userID: input.userId },
+    });
+    const wallet = await tx.wallet.update({
+      where: { userID: input.userId },
+      data: { balance: { increment: input.amount } },
+      select: { balance: true },
+    });
+    await tx.coinTransaction.create({
+      data: {
+        userID: input.userId,
+        type: input.type,
+        amount: input.amount,
+        balance: wallet.balance,
+        note: input.note,
+        relatedID: input.relatedId,
+        idempotencyKey: input.idempotencyKey,
+      },
+    });
+    return wallet.balance;
   }
 
   // ─── Gift ─────────────────────────────────────────────────────────────────────

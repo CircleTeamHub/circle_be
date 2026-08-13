@@ -42,6 +42,38 @@ describe('createEnvValidationSchema', () => {
     expect(value.CALL_ENABLE_VIDEO).toBe(true);
   });
 
+  it('normalizes referral reward defaults', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value).toMatchObject({
+      REFERRAL_REWARDS_ENABLED: true,
+      REFERRAL_INVITER_REWARD: 20,
+      REFERRAL_INVITEE_REWARD: 5,
+      REFERRAL_QUALIFICATION_DAYS: 7,
+      REFERRAL_EXPIRY_DAYS: 30,
+      REFERRAL_MONTHLY_CAP: 10,
+    });
+  });
+
+  it('rejects a referral expiry window that does not outlive qualification', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      REFERRAL_QUALIFICATION_DAYS: '7',
+      REFERRAL_EXPIRY_DAYS: '7',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('REFERRAL_EXPIRY_DAYS');
+  });
+
   it('rejects access-token lifetime longer than refresh-session retention', () => {
     const env = {
       ...baseEnv,
