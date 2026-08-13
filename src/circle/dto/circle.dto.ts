@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayUnique,
@@ -15,6 +15,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { MAX_PAGE } from 'src/common/pagination';
@@ -141,11 +142,12 @@ export class CreateCircleDto {
  */
 export class UpdateCircleDto {
   @ApiPropertyOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   @IsString()
   @IsNotEmpty()
   @MinLength(2)
   @MaxLength(20)
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   name?: string;
 
   @ApiPropertyOptional({ type: [String] })
@@ -154,18 +156,18 @@ export class UpdateCircleDto {
   @MaxLength(20, { each: true })
   @ArrayUnique()
   @ArrayMaxSize(5)
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   categories?: string[];
 
   @ApiPropertyOptional()
   @IsString()
   @MaxLength(500)
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   description?: string;
 
   @ApiPropertyOptional()
   @IsString()
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   avatarUrl?: string;
 
   @ApiPropertyOptional({ type: [String] })
@@ -174,12 +176,12 @@ export class UpdateCircleDto {
   @ArrayUnique()
   @ArrayMaxSize(10)
   @MaxLength(50, { each: true })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   cities?: string[];
 
   @ApiPropertyOptional()
   @IsString()
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   @MaxLength(1000)
   rules?: string;
 
@@ -189,7 +191,7 @@ export class UpdateCircleDto {
   @ArrayUnique()
   @ArrayMaxSize(3)
   @MaxLength(30, { each: true })
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   tags?: string[];
 
   @ApiPropertyOptional({ nullable: true, minimum: 0, maximum: 4 })
@@ -210,12 +212,12 @@ export class UpdateCircleDto {
 
   @ApiPropertyOptional()
   @IsBoolean()
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   joinFancyRestriction?: boolean;
 
   @ApiPropertyOptional()
   @IsBoolean()
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   memberCanPost?: boolean;
 
   @ApiPropertyOptional({
@@ -228,14 +230,14 @@ export class UpdateCircleDto {
   @IsInt()
   @Min(1)
   @Max(10)
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   requiredVerifierCount?: number;
 
   @ApiPropertyOptional({
     description: 'false = only OWNER/ADMIN may invite new members.',
   })
   @IsBoolean()
-  @IsOptional()
+  @ValidateIf((_object, value) => value !== undefined)
   memberCanInvite?: boolean;
 }
 

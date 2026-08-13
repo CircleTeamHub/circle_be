@@ -1180,6 +1180,27 @@ describe('CircleInvitationService', () => {
   // POST /circle-invitation/:id/add-verifier 就能把圈里任意 ACTIVE 成员塞成
   // 自己的验证人。这一组把交集的两半都钉在服务端。
   describe('verifier eligibility (friend ∩ active member)', () => {
+    function arrangeRespondSeat() {
+      prisma.circleInvitation.findUnique
+        .mockResolvedValueOnce({
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+        })
+        .mockResolvedValueOnce({
+          id: 'inv-1',
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+          status: 'PENDING',
+          requiredCount: 10,
+          approvedCount: 1,
+          circle: { id: 'circle-1', name: 'Circle' },
+        });
+      prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+        id: 'seat-1',
+        status: 'PENDING',
+      });
+    }
+
     function arrangePendingInvitation() {
       prisma.circleInvitation.findUnique.mockResolvedValue({
         id: 'inv-1',
@@ -1281,6 +1302,59 @@ describe('CircleInvitationService', () => {
 
       expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
       expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    // 闸只对「同意」设。挡掉拒绝的话那一席永远 PENDING 且计入 activeSlots ——
+    // 本仓既没有撤销验证人的接口、PENDING 担保单也不会过期,申请人补不上人、
+    // 也永远凑不满票,整单卡死到管理员来兜底。
+    it('respond lets a verifier who lost eligibility still reject, freeing the seat', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.friend.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', false),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'seat-1' },
+          data: expect.objectContaining({ status: 'REJECTED' }),
+        }),
+      );
+      // 反对票不加票数,只把席位让出来。
+      expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('respond lets a verifier who left the circle still reject', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', false),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'REJECTED' }),
+        }),
+      );
+    });
+
+    it('respond still blocks approval from a verifier who left the circle', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', true),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: CircleInvitationErrorCode.VerifierNotMember,
+        },
+      });
+      expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
     });
   });
 
@@ -1526,6 +1600,46 @@ describe('CircleInvitationService', () => {
         circleId: 'circle-1',
         status: 'APPROVED',
       });
+    });
+
+    // 自动首票 = 邀请人替被邀请人担保,资格与申请人自己挑的验证人同规,
+    // 否则「验证人必须是好友」这条闸从 invite 这条路整条绕过去。
+    it('invite withholds the first vote when a plain member is not the friend', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1, approvedCount: 0 },
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ approvedCount: 0 }),
+        }),
+      );
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      // 没有首票就没满票:陌生人不会被瞬间塞进圈子。
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    it('invite keeps the first vote for a non-friend owner or admin', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 10 },
+        inviterRole: 'ADMIN',
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ approvedCount: 1 }),
+        }),
+      );
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
     });
 
     it('invite rejects a plain member when memberCanInvite is off', async () => {

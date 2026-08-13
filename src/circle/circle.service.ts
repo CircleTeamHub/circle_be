@@ -414,6 +414,11 @@ export class CircleService {
         });
       }
 
+      // 权限读必须与成员变更串行化：不拿锁的话，一次“退员/降为普通成员”与本事务
+      // 可以各自提交，已经被撑下管理权的人仍然改得掉招新策略。圈主一并锁：
+      // joinVipRestriction 天花板读的是圈主会员档，一次排序好的获锁比分两步拿安全。
+      await this.memberLock.lock(tx, circleId, [userId, circle.ownerID]);
+
       const membership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },
         select: { role: true, status: true },

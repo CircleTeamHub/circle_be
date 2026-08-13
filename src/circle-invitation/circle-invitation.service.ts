@@ -144,7 +144,7 @@ export class CircleInvitationService {
       });
     }
 
-    // 6. Create invitation + auto-approve inviter as first verifier
+    // 6. Create invitation; the inviter takes the first seat only if they may vouch
     const invitation = await this.runInvitationTransaction(async (tx) => {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
@@ -219,12 +219,27 @@ export class CircleInvitationService {
         });
       }
 
+      // 自动首票 = 邀请人替被邀请人担保,所以担保资格必须与申请人自己挑的验证人
+      // 同规(好友 ∩ 本圈 ACTIVE 成员)—— 否则「验证人必须是好友」这条闸从
+      // invite 这条路就绕过去了:requiredVerifierCount=1 时等于任何成员都能把
+      // 任何把入圈邀请开成 EVERYONE(默认值)的陌生人瞬间塞进圈子。
+      //
+      // OWNER/ADMIN 例外:圈子的管理者本来就是这个圈的信任根,「管理员拉人进来
+      // 就能进」正是宣传期要的形态;要连管理员也收掉就把 memberCanInvite 关掉。
+      //
+      // 好友读放在 pair 锁内,与 addVerifier / respond 同口径(锁外那次只用于
+      // 隐私开关判定,不能拿来发席位)。
+      const inviterCanVouch =
+        inviterMembership.role === 'OWNER' ||
+        inviterMembership.role === 'ADMIN' ||
+        (await this.areFriends(inviterId, applicantId, tx));
+
       const created = await tx.circleInvitation.create({
         data: {
           circleID: circleId,
           applicantID: applicantId,
           inviterID: inviterId,
-          approvedCount: 1,
+          approvedCount: inviterCanVouch ? 1 : 0,
           // 建单那一刻圈子策略的快照:之后调 requiredVerifierCount 不影响
           // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
           requiredCount: circlePolicy.requiredVerifierCount,
@@ -236,15 +251,17 @@ export class CircleInvitationService {
         },
       });
 
-      await tx.circleInvitationVerifier.create({
-        data: {
-          invitationID: created.id,
-          verifierID: inviterId,
-          addedByID: inviterId,
-          status: 'APPROVED',
-          respondedAt: new Date(),
-        },
-      });
+      if (inviterCanVouch) {
+        await tx.circleInvitationVerifier.create({
+          data: {
+            invitationID: created.id,
+            verifierID: inviterId,
+            addedByID: inviterId,
+            status: 'APPROVED',
+            respondedAt: new Date(),
+          },
+        });
+      }
 
       // 宣传期形态(requiredVerifierCount=1):邀请人自动首票已经满票,建单
       // 即成结 —— 「拉人进来就能进」。与 respond 的满票收尾同一套动作,放在
@@ -811,31 +828,35 @@ export class CircleInvitationService {
         });
       }
 
-      // Leaving or being removed from the circle deletes the membership but
-      // leaves the verifier row behind, so eligibility is re-checked at vote
-      // time rather than trusting the check made when the slot was assigned.
-      const verifierMembership = await tx.circleMember.findUnique({
-        where: {
-          userID_circleID: {
-            userID: verifierId,
-            circleID: invitation.circleID,
+      // 加席之后退圈、加席之后解除好友,是同一形状:资格必须在投票这一刻重算,
+      // 不能信加席那次检查。
+      //
+      // 但闸只对**同意**设:反对票放不进人,却能把席位让出来(REJECTED 不计入
+      // activeSlots),所以失去资格的人必须仍然能拒绝。挡掉拒绝的话那一席永远
+      // PENDING —— 本仓既没有撤销验证人的接口、PENDING 担保单也不会过期,
+      // 申请人既补不上人也永远凑不满票,只能等管理员 admin-approve 兜底。
+      if (approve) {
+        const verifierMembership = await tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: verifierId,
+              circleID: invitation.circleID,
+            },
           },
-        },
-      });
-      if (!verifierMembership || verifierMembership.status !== 'ACTIVE') {
-        throw new ForbiddenException({
-          message: '验证人必须是本圈子的活跃成员',
-          errorCode: CircleInvitationErrorCode.VerifierNotMember,
         });
-      }
+        if (!verifierMembership || verifierMembership.status !== 'ACTIVE') {
+          throw new ForbiddenException({
+            message: '验证人必须是本圈子的活跃成员',
+            errorCode: CircleInvitationErrorCode.VerifierNotMember,
+          });
+        }
 
-      // 好友那一半同理:加席之后解除好友,与加席之后退圈是同一形状,资格必须
-      // 在投票这一刻重算,不能信加席那次检查。
-      if (!(await this.areFriends(application.applicantID, verifierId, tx))) {
-        throw new ForbiddenException({
-          message: '验证人必须是申请人的好友',
-          errorCode: CircleInvitationErrorCode.VerifierNotFriend,
-        });
+        if (!(await this.areFriends(application.applicantID, verifierId, tx))) {
+          throw new ForbiddenException({
+            message: '验证人必须是申请人的好友',
+            errorCode: CircleInvitationErrorCode.VerifierNotFriend,
+          });
+        }
       }
 
       await tx.circleInvitationVerifier.update({

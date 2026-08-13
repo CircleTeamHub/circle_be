@@ -1209,6 +1209,27 @@ describe('CircleService', () => {
       expect(result.myRole).toBe('OWNER');
     });
 
+    // 不拿锁的话,「把这个管理员降为普通成员」与本事务可以各自提交,
+    // 已经被撤下管理权的人仍然改得掉招新策略。
+    it('locks the caller and the owner before reading authorization', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('admin-1', 'circle-1', {
+        requiredVerifierCount: 10,
+      } as UpdateCircleDto);
+
+      expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+        'admin-1',
+        'owner-1',
+      ]);
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+      );
+    });
+
     it('lets an active ADMIN update (FE 的编辑入口是 isOwnerOrAdmin)', async () => {
       prisma.circleMember.findUnique.mockResolvedValue({
         role: 'ADMIN',
