@@ -164,6 +164,15 @@ export class ReferralService {
         if (due.length === 0) break;
 
         for (const { id } of due) {
+          // 预算要按行判,不能只在批与批之间判:数据库或通知慢下来时,一批
+          // 100 行会把 10 分钟远远跑超,而 sweepInFlight 一直举着 —— 后面几轮
+          // 整点触发全被记成 skipped,奖励反而更晚。没轮到的行留给下一轮,
+          // 反正 nextCheckAt 没动,它们仍然是 due。
+          if (Date.now() - startedAt >= REFERRAL_SWEEP_BUDGET_MS) {
+            truncated = true;
+            break;
+          }
+          processed += 1;
           try {
             const settlement = await this.settleOne(id, now);
             if (settlement.kind in totals) {
@@ -181,8 +190,7 @@ export class ReferralService {
             );
           }
         }
-        processed += due.length;
-
+        if (truncated) break;
         if (due.length < REFERRAL_BATCH_SIZE) break;
         if (Date.now() - startedAt >= REFERRAL_SWEEP_BUDGET_MS) {
           truncated = true;

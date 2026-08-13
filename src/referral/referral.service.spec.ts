@@ -364,6 +364,31 @@ describe('ReferralService', () => {
       expect(prisma.referral.findMany).toHaveBeenCalledTimes(1);
     });
 
+    // 预算只在批与批之间判的话,一批 100 行会把 10 分钟远远跑超,而
+    // sweepInFlight 一直举着 —— 后面几轮整点触发全被记成 skipped。
+    it('stops mid-batch once the runtime budget is spent', async () => {
+      const fullBatch = Array.from({ length: 100 }, (_, index) => ({
+        id: `referral-${index}`,
+      }));
+      prisma.referral.findMany.mockResolvedValue(fullBatch);
+
+      // 每结算一行就把单调时钟推进 6 分钟:第二行开头就超出 10 分钟预算。
+      const realNow = Date.now;
+      let clock = realNow();
+      jest.spyOn(Date, 'now').mockImplementation(() => clock);
+      coins.creditInTransaction.mockImplementation(() => {
+        clock += 6 * 60 * 1000;
+        return Promise.resolve(20);
+      });
+
+      const result = await service.processDue(NOW);
+
+      // 第一行跑完就超预算,第二行开头即停 —— 不会把整批 100 行跑完。
+      expect(result.rewarded).toBe(1);
+      expect(prisma.referral.findMany).toHaveBeenCalledTimes(1);
+      (Date.now as jest.Mock).mockRestore();
+    });
+
     // 抛错的行不推进 nextCheckAt —— 不排掉的话下一批把它原样再抽一遍,
     // 排空循环会退化成对同一批坏行的重试风暴。
     it('excludes rows that threw from the batches that follow', async () => {
