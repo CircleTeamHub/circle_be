@@ -3,7 +3,10 @@ import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
 import { CoinService } from 'src/coin/coin.service';
 import { Prisma, ReferralStatus } from 'src/generated/prisma';
-import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
+import {
+  reportJobSkipped,
+  TrackedCron,
+} from 'src/metrics/tracked-cron.decorator';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
@@ -122,7 +125,16 @@ export class ReferralService {
     expired: number;
   }> {
     const totals = { rewarded: 0, capped: 0, rejected: 0, expired: 0 };
-    if (!this.rules.enabled || this.sweepInFlight) return totals;
+    // 活动关掉是合法的空跑:照常记成功、心跳照常刷新,否则 CronJobStalled 会
+    // 对一个「本来就没事干」的任务一直叫。
+    if (!this.rules.enabled) return totals;
+    // 上一轮还没跑完则是另一回事:必须记成 skipped(不刷心跳)。当成功返回的话,
+    // 心跳会被这些空转的调用一直保鲜,一个卡死在数据库/通知上的扫描就永远
+    // 触发不了 CronJobStalled —— 看起来每小时都健康,实际早就停摆了。
+    if (this.sweepInFlight) {
+      reportJobSkipped();
+      return totals;
+    }
     const startedAt = Date.now();
 
     this.sweepInFlight = true;

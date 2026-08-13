@@ -83,6 +83,27 @@ describe('createEnvValidationSchema', () => {
     expect(withReward('REFERRAL_INVITER_REWARD', '100000')).toBeUndefined();
   });
 
+  // 天数没有上限的话,3000000000 天能过启动校验,然后 buildPendingReferralData
+  // 算出一个越界 Date,每一次带邀请码的注册都在写 referral 行时回滚成 500。
+  it('rejects referral windows long enough to overflow a Date', () => {
+    const withDays = (key: string, days: string) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        [key]: days,
+      };
+      return createEnvValidationSchema(env).validate(env).error?.message;
+    };
+
+    expect(withDays('REFERRAL_EXPIRY_DAYS', '3000000000')).toContain(
+      'REFERRAL_EXPIRY_DAYS',
+    );
+    expect(withDays('REFERRAL_QUALIFICATION_DAYS', '3000000000')).toContain(
+      'REFERRAL_QUALIFICATION_DAYS',
+    );
+    expect(withDays('REFERRAL_EXPIRY_DAYS', '365')).toBeUndefined();
+  });
+
   it('rejects a referral expiry window that does not outlive qualification', () => {
     const env = {
       ...baseEnv,

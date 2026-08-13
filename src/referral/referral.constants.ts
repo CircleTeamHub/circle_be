@@ -20,6 +20,12 @@ export const REFERRAL_SWEEP_BUDGET_MS = 10 * 60 * 1000;
 export const REFERRAL_SETTLEMENT_GRACE_MS = 2 * 60 * 60 * 1000;
 /** 单笔奖励上限。落库列是 PostgreSQL INTEGER,业务上也没有更大的合理值。 */
 export const REFERRAL_MAX_REWARD = 100_000;
+/**
+ * 达标窗口/有效期的天数上限。没有上限的话 `REFERRAL_EXPIRY_DAYS=3000000000`
+ * 能过启动校验,然后 buildPendingReferralData 算出一个越界的 Date,
+ * 每一次带邀请码的注册都会在写 referral 行时回滚成 500。
+ */
+export const REFERRAL_MAX_DAYS = 365;
 export const REFERRAL_LIST_DEFAULT_LIMIT = 20;
 export const REFERRAL_LIST_MAX_LIMIT = 50;
 export const REFERRAL_MS_PER_DAY = 24 * 60 * 60 * 1000;

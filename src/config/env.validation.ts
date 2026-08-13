@@ -3,6 +3,7 @@
 import * as Joi from 'joi';
 import {
   REFERRAL_DEFAULTS,
+  REFERRAL_MAX_DAYS,
   REFERRAL_MAX_REWARD,
 } from 'src/referral/referral.constants';
 import { parseDurationMilliseconds } from 'src/utils/duration';
@@ -213,10 +214,12 @@ export function createEnvValidationSchema(
     REFERRAL_QUALIFICATION_DAYS: Joi.number()
       .integer()
       .min(1)
+      .max(REFERRAL_MAX_DAYS)
       .default(REFERRAL_DEFAULTS.qualificationDays),
     REFERRAL_EXPIRY_DAYS: Joi.number()
       .integer()
       .greater(Joi.ref('REFERRAL_QUALIFICATION_DAYS'))
+      .max(REFERRAL_MAX_DAYS)
       .default(REFERRAL_DEFAULTS.expiryDays),
     REFERRAL_MONTHLY_CAP: Joi.number()
       .integer()

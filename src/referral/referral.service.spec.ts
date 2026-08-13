@@ -4,6 +4,7 @@ import { CoinService } from 'src/coin/coin.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import * as trackedCron from 'src/metrics/tracked-cron.decorator';
 import { ReferralService } from './referral.service';
 import { buildPendingReferralData } from './referral.rules';
 
@@ -294,6 +295,47 @@ describe('ReferralService', () => {
         failureReason: 'QUALIFICATION_WINDOW_EXPIRED',
       },
     });
+  });
+
+  // 重叠的那一轮当成功返回的话,心跳会被这些空转调用一直保鲜 —— 一个卡死在
+  // 数据库/通知上的扫描就永远触发不了 CronJobStalled,看起来每小时都健康。
+  it('reports an overlapping sweep as skipped instead of a success', async () => {
+    const skipped = jest.spyOn(trackedCron, 'reportJobSkipped');
+
+    let releaseFirst!: () => void;
+    prisma.referral.findMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () => resolve([]);
+        }),
+    );
+
+    const first = service.processDue(NOW);
+    await Promise.resolve();
+    // 第一轮还挂着的时候第二轮触发。
+    await service.processDue(NOW);
+
+    expect(skipped).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await first;
+    skipped.mockRestore();
+  });
+
+  // 活动关掉是合法空跑:照常记成功,否则 CronJobStalled 会对一个本来就没事干
+  // 的任务一直叫。
+  it('does not mark a disabled campaign as skipped', async () => {
+    const skipped = jest.spyOn(trackedCron, 'reportJobSkipped');
+    (service as unknown as { rules: { enabled: boolean } }).rules.enabled =
+      false;
+
+    await service.processDue(NOW);
+
+    expect(skipped).not.toHaveBeenCalled();
+    expect(prisma.referral.findMany).not.toHaveBeenCalled();
+    skipped.mockRestore();
+    (service as unknown as { rules: { enabled: boolean } }).rules.enabled =
+      true;
   });
 
   describe('sweep drains the whole due queue', () => {
