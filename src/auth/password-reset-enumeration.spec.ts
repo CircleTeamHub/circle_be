@@ -20,7 +20,9 @@ describe('requestPasswordReset anti-enumeration (PR #120 review)', () => {
       {}, // jwt
       {}, // iconService
       { requestCode },
-      {}, // configService（#117 合并后存在；此前多传无害）
+      // configService：构造函数体里会读它(readReferralRules),给个返回
+      // undefined 的 get 就够 —— 各项都落到 REFERRAL_DEFAULTS 上。
+      { get: () => undefined },
     );
   }
 

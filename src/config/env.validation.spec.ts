@@ -61,6 +61,28 @@ describe('createEnvValidationSchema', () => {
     });
   });
 
+  // 奖励额度落的是 PostgreSQL INTEGER 列(Referral.inviterReward /
+  // CoinTransaction.amount / Wallet.balance)。没有上限的话越界配置能过启动
+  // 校验,然后让每一次被邀请注册都在写 referral 行时炸掉。
+  it('rejects reward amounts beyond the integer columns they are written to', () => {
+    const withReward = (key: string, amount: string) => {
+      const env = {
+        ...baseEnv,
+        DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+        [key]: amount,
+      };
+      return createEnvValidationSchema(env).validate(env).error?.message;
+    };
+
+    expect(withReward('REFERRAL_INVITER_REWARD', '3000000000')).toContain(
+      'REFERRAL_INVITER_REWARD',
+    );
+    expect(withReward('REFERRAL_INVITEE_REWARD', '3000000000')).toContain(
+      'REFERRAL_INVITEE_REWARD',
+    );
+    expect(withReward('REFERRAL_INVITER_REWARD', '100000')).toBeUndefined();
+  });
+
   it('rejects a referral expiry window that does not outlive qualification', () => {
     const env = {
       ...baseEnv,

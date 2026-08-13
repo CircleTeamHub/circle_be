@@ -1,6 +1,10 @@
 //这个文件负责环境变量的验证，使用 Joi 库来定义和校验 .env 中的配置。
 
 import * as Joi from 'joi';
+import {
+  REFERRAL_DEFAULTS,
+  REFERRAL_MAX_REWARD,
+} from 'src/referral/referral.constants';
 import { parseDurationMilliseconds } from 'src/utils/duration';
 
 type EnvLike = NodeJS.ProcessEnv | Record<string, unknown>;
@@ -192,15 +196,32 @@ export function createEnvValidationSchema(
     // #95：通知 / 好友动态保留天数。0 = 关闭该表清理。
     NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(0).default(90),
     FRIEND_ACTIVITY_RETENTION_DAYS: Joi.number().integer().min(0).default(180),
-    REFERRAL_REWARDS_ENABLED: Joi.boolean().default(true),
-    REFERRAL_INVITER_REWARD: Joi.number().integer().min(1).default(20),
-    REFERRAL_INVITEE_REWARD: Joi.number().integer().min(1).default(5),
-    REFERRAL_QUALIFICATION_DAYS: Joi.number().integer().min(1).default(7),
+    REFERRAL_REWARDS_ENABLED: Joi.boolean().default(REFERRAL_DEFAULTS.enabled),
+    // 上限不是装饰:Referral.inviterReward / CoinTransaction.amount / Wallet.balance
+    // 都是 PostgreSQL INTEGER,越界的配置能过启动校验,然后让每一次被邀请注册
+    // 都在写 referral 行时炸掉。
+    REFERRAL_INVITER_REWARD: Joi.number()
+      .integer()
+      .min(1)
+      .max(REFERRAL_MAX_REWARD)
+      .default(REFERRAL_DEFAULTS.inviterReward),
+    REFERRAL_INVITEE_REWARD: Joi.number()
+      .integer()
+      .min(1)
+      .max(REFERRAL_MAX_REWARD)
+      .default(REFERRAL_DEFAULTS.inviteeReward),
+    REFERRAL_QUALIFICATION_DAYS: Joi.number()
+      .integer()
+      .min(1)
+      .default(REFERRAL_DEFAULTS.qualificationDays),
     REFERRAL_EXPIRY_DAYS: Joi.number()
       .integer()
       .greater(Joi.ref('REFERRAL_QUALIFICATION_DAYS'))
-      .default(30),
-    REFERRAL_MONTHLY_CAP: Joi.number().integer().min(1).default(10),
+      .default(REFERRAL_DEFAULTS.expiryDays),
+    REFERRAL_MONTHLY_CAP: Joi.number()
+      .integer()
+      .min(1)
+      .default(REFERRAL_DEFAULTS.monthlyCap),
     MINIO_ENDPOINT: Joi.string().uri().optional(),
     MINIO_ACCESS_KEY: Joi.string().optional(),
     MINIO_SECRET_KEY: Joi.string().optional(),

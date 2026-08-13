@@ -9,7 +9,13 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import { MyReferralsDto, ReferralListQueryDto } from './dto/referral.dto';
-import { REFERRAL_BATCH_SIZE, REFERRAL_RECHECK_MS } from './referral.constants';
+import {
+  REFERRAL_BATCH_SIZE,
+  REFERRAL_RECHECK_MS,
+  REFERRAL_SETTLEMENT_GRACE_MS,
+  REFERRAL_SWEEP_BUDGET_MS,
+  REFERRAL_SWEEP_MAX_BATCHES,
+} from './referral.constants';
 import { readReferralRules, type ReferralRules } from './referral.rules';
 
 type RewardedSettlement = {
@@ -117,38 +123,73 @@ export class ReferralService {
   }> {
     const totals = { rewarded: 0, capped: 0, rejected: 0, expired: 0 };
     if (!this.rules.enabled || this.sweepInFlight) return totals;
+    const startedAt = Date.now();
 
     this.sweepInFlight = true;
     let firstError: unknown = null;
+    let processed = 0;
+    let truncated = false;
+    // 抛错的行不会推进 nextCheckAt,不排掉的话下一批会把它们原样再抽一遍,
+    // 排空循环就变成了对同一批坏行的重试风暴。
+    const stuck: string[] = [];
     try {
-      const due = await this.prisma.referral.findMany({
-        where: { status: 'PENDING', nextCheckAt: { lte: now } },
-        select: { id: true },
-        orderBy: [{ nextCheckAt: 'asc' }, { id: 'asc' }],
-        take: REFERRAL_BATCH_SIZE,
-      });
+      // 一批抽完就停的话,吞吐被钉死在 BATCH_SIZE/小时:每条还没达成条件的
+      // 担保关系每 6 小时就回到队列一次,几百条长期不达标的就能把每天的额度
+      // 吃光,真正达标的排在后面等到 expiresAt 之后才被看到。所以要连抽到
+      // 抽空为止,只用运行预算封顶(每一趟 settleOne 要么让 nextCheckAt 前进、
+      // 要么把状态落终态,due 集合单调变小,循环必然收敛)。
+      for (let batch = 0; batch < REFERRAL_SWEEP_MAX_BATCHES; batch += 1) {
+        const due = await this.prisma.referral.findMany({
+          where: {
+            status: 'PENDING',
+            nextCheckAt: { lte: now },
+            ...(stuck.length > 0 ? { id: { notIn: stuck } } : {}),
+          },
+          select: { id: true },
+          orderBy: [{ nextCheckAt: 'asc' }, { id: 'asc' }],
+          take: REFERRAL_BATCH_SIZE,
+        });
+        if (due.length === 0) break;
 
-      for (const { id } of due) {
-        try {
-          const settlement = await this.settleOne(id, now);
-          if (settlement.kind in totals) {
-            totals[settlement.kind as keyof typeof totals] += 1;
+        for (const { id } of due) {
+          try {
+            const settlement = await this.settleOne(id, now);
+            if (settlement.kind in totals) {
+              totals[settlement.kind as keyof typeof totals] += 1;
+            }
+            if (settlement.kind === 'rewarded') {
+              await this.notifyReward(settlement);
+            }
+          } catch (error) {
+            firstError ??= error;
+            stuck.push(id);
+            this.logger.error(
+              `Referral settlement failed for ${id}`,
+              error instanceof Error ? error.stack : String(error),
+            );
           }
-          if (settlement.kind === 'rewarded') {
-            await this.notifyReward(settlement);
-          }
-        } catch (error) {
-          firstError ??= error;
-          this.logger.error(
-            `Referral settlement failed for ${id}`,
-            error instanceof Error ? error.stack : String(error),
-          );
         }
+        processed += due.length;
+
+        if (due.length < REFERRAL_BATCH_SIZE) break;
+        if (Date.now() - startedAt >= REFERRAL_SWEEP_BUDGET_MS) {
+          truncated = true;
+          break;
+        }
+        if (batch === REFERRAL_SWEEP_MAX_BATCHES - 1) truncated = true;
       }
+
       if (firstError) throw firstError;
-      if (due.length > 0) {
+      if (processed > 0) {
         this.logger.log(
-          `Referral sweep processed ${due.length}: ${JSON.stringify(totals)}`,
+          `Referral sweep processed ${processed}: ${JSON.stringify(totals)}`,
+        );
+      }
+      // 没抽空就说明还有欠账:必须说出来,否则「跑完了」和「跑到一半没时间了」
+      // 在日志里长得一模一样。
+      if (truncated) {
+        this.logger.warn(
+          `Referral sweep hit its budget after ${processed} rows; more remain due`,
         );
       }
       return totals;
@@ -173,7 +214,16 @@ export class ReferralService {
       });
       if (!referral || referral.status !== 'PENDING') return { kind: 'noop' };
 
-      if (now >= referral.expiresAt) {
+      // 判过期之前先看条件:定时器整点跑,而 deferPending 会把终检夹到
+      // expiresAt,那一检必然落在 expiresAt 之后一点点。先判过期的话,窗口
+      // 最后一段时间里补了头像 / 加到第一个好友的人会被判 EXPIRED —— 明明
+      // 是我们自己晚到了。所以过期只作为「条件没达成」的收尾,并给一个覆盖
+      // 定时器节拍的宽限;超出宽限仍未达成才算真过期。
+      const expired = now.getTime() >= referral.expiresAt.getTime();
+      const graceExhausted =
+        now.getTime() >=
+        referral.expiresAt.getTime() + REFERRAL_SETTLEMENT_GRACE_MS;
+      const failWindow = async () => {
         await tx.referral.update({
           where: { id: referral.id },
           data: {
@@ -181,6 +231,9 @@ export class ReferralService {
             failureReason: 'QUALIFICATION_WINDOW_EXPIRED',
           },
         });
+      };
+      if (graceExhausted) {
+        await failWindow();
         return { kind: 'expired' };
       }
       // nextCheckAt is an optimization, not the source of truth. Keep the
@@ -204,6 +257,10 @@ export class ReferralService {
         return { kind: 'rejected' };
       }
       if (!referral.invitee.avatarUrl) {
+        if (expired) {
+          await failWindow();
+          return { kind: 'expired' };
+        }
         await this.deferPending(tx, referral.id, referral.expiresAt, now);
         return { kind: 'pending' };
       }
@@ -225,6 +282,10 @@ export class ReferralService {
         select: { id: true },
       });
       if (!acceptedFriend) {
+        if (expired) {
+          await failWindow();
+          return { kind: 'expired' };
+        }
         await this.deferPending(tx, referral.id, referral.expiresAt, now);
         return { kind: 'pending' };
       }

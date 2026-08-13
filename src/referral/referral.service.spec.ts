@@ -227,7 +227,12 @@ describe('ReferralService', () => {
 
   it('expires an unqualified referral without issuing rewards', async () => {
     tx.referral.findUnique.mockResolvedValue(
-      pendingReferral({ expiresAt: new Date('2026-08-12T12:00:00.000Z') }),
+      // 名字说的是「没达成条件」,那 fixture 就不能是个合格的人:窗口到点
+      // 但头像还没传,才是这条断言想覆盖的形状。
+      pendingReferral({
+        expiresAt: NOW,
+        invitee: { id: 'invitee-1', status: 'ACTIVE', avatarUrl: null },
+      }),
     );
 
     const result = await service.processDue(NOW);
@@ -240,6 +245,101 @@ describe('ReferralService', () => {
         status: 'EXPIRED',
         failureReason: 'QUALIFICATION_WINDOW_EXPIRED',
       },
+    });
+  });
+
+  // 定时器整点跑,而 deferPending 把终检夹到 expiresAt —— 那一检必然落在
+  // expiresAt 之后一点点。先判过期的话,窗口最后一段时间里补上条件的人会
+  // 被判 EXPIRED,而那是我们自己晚到了。
+  it('still rewards someone who qualified before the deadline the sweep arrived late for', async () => {
+    tx.referral.findUnique.mockResolvedValue(
+      pendingReferral({ expiresAt: new Date('2026-08-12T11:30:00.000Z') }),
+    );
+
+    const result = await service.processDue(NOW);
+
+    expect(result.rewarded).toBe(1);
+    expect(coins.creditInTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('expires a qualified referral once the grace after the deadline is spent', async () => {
+    tx.referral.findUnique.mockResolvedValue(
+      // expiresAt + 2h 宽限之外:再合格也不补发了。
+      pendingReferral({ expiresAt: new Date('2026-08-12T09:00:00.000Z') }),
+    );
+
+    const result = await service.processDue(NOW);
+
+    expect(result.expired).toBe(1);
+    expect(coins.creditInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('expires an incomplete invitee at the deadline instead of deferring past it', async () => {
+    tx.referral.findUnique.mockResolvedValue(
+      pendingReferral({
+        expiresAt: NOW,
+        invitee: { id: 'invitee-1', status: 'ACTIVE', avatarUrl: 'a.jpg' },
+      }),
+    );
+    tx.friend.findFirst.mockResolvedValue(null);
+
+    const result = await service.processDue(NOW);
+
+    expect(result.expired).toBe(1);
+    // 不能再往后排一个永远等不到的 nextCheckAt。
+    expect(tx.referral.update).toHaveBeenCalledWith({
+      where: { id: 'referral-1' },
+      data: {
+        status: 'EXPIRED',
+        failureReason: 'QUALIFICATION_WINDOW_EXPIRED',
+      },
+    });
+  });
+
+  describe('sweep drains the whole due queue', () => {
+    // 一批抽完就停 = 吞吐钉死在 100/小时,而每条不达标的行每 6 小时回队一次,
+    // 几百条长期不达标的就能把额度吃光,达标的排在后面等到过期。
+    it('keeps claiming batches until a short batch comes back', async () => {
+      const fullBatch = Array.from({ length: 100 }, (_, index) => ({
+        id: `referral-${index}`,
+      }));
+      prisma.referral.findMany
+        .mockResolvedValueOnce(fullBatch)
+        .mockResolvedValueOnce(fullBatch)
+        .mockResolvedValueOnce([{ id: 'referral-tail' }]);
+
+      const result = await service.processDue(NOW);
+
+      expect(prisma.referral.findMany).toHaveBeenCalledTimes(3);
+      expect(result.rewarded).toBe(201);
+    });
+
+    it('stops after one pass when the first batch is already short', async () => {
+      prisma.referral.findMany.mockResolvedValue([{ id: 'referral-1' }]);
+
+      await service.processDue(NOW);
+
+      expect(prisma.referral.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    // 抛错的行不推进 nextCheckAt —— 不排掉的话下一批把它原样再抽一遍,
+    // 排空循环会退化成对同一批坏行的重试风暴。
+    it('excludes rows that threw from the batches that follow', async () => {
+      const fullBatch = Array.from({ length: 100 }, (_, index) => ({
+        id: `referral-${index}`,
+      }));
+      prisma.referral.findMany
+        .mockResolvedValueOnce(fullBatch)
+        .mockResolvedValueOnce([]);
+      coins.creditInTransaction.mockRejectedValueOnce(new Error('boom'));
+
+      await expect(service.processDue(NOW)).rejects.toThrow('boom');
+
+      expect(prisma.referral.findMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: { notIn: ['referral-0'] } }),
+        }),
+      );
     });
   });
 });
