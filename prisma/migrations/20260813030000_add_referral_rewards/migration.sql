@@ -9,6 +9,11 @@ CREATE TYPE "ReferralStatus" AS ENUM (
   'EXPIRED'
 );
 
+-- 新增两个 CoinTxType 取值。回滚下限随之抬高(deploy/SCHEMA_COMPATIBILITY 2 → 3):
+-- 一旦结算写出 REFERRAL_REWARD / REFERRAL_BONUS,回滚到旧二进制时它生成的 Prisma
+-- 枚举里没有这两个值,GET /coin/transactions 会在反序列化时炸掉——受影响的正是
+-- 刚拿到奖励的用户。抬高 floor 之后 release-deploy 会直接拒绝回滚到那些镜像,
+-- 而不是把这个故障留到线上被用户撞见。
 ALTER TYPE "CoinTxType" ADD VALUE IF NOT EXISTS 'REFERRAL_REWARD';
 ALTER TYPE "CoinTxType" ADD VALUE IF NOT EXISTS 'REFERRAL_BONUS';
 
