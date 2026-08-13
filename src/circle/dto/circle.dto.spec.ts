@@ -29,6 +29,44 @@ function failed(payload: Record<string, unknown>, property: string) {
   return parse(payload).errors.some((error) => error.property === property);
 }
 
+// createCircle 也只把 undefined 当「没传」,@IsOptional() 却连 null 一起跳过,
+// 于是 null 会写到非空整型列上变成 500 —— 与 PATCH 那半是两条独立的请求路径。
+describe('CreateCircleDto requiredVerifierCount', () => {
+  it('rejects an explicit null', () => {
+    const dto = plainToInstance(
+      CreateCircleDto,
+      { requiredVerifierCount: null },
+      { enableImplicitConversion: true },
+    );
+
+    expect(
+      validateSync(dto).some((e) => e.property === 'requiredVerifierCount'),
+    ).toBe(true);
+  });
+
+  it('still accepts an omitted value and a real count', () => {
+    const omitted = plainToInstance(
+      CreateCircleDto,
+      {},
+      { enableImplicitConversion: true },
+    );
+    expect(
+      validateSync(omitted).some((e) => e.property === 'requiredVerifierCount'),
+    ).toBe(false);
+
+    const provided = plainToInstance(
+      CreateCircleDto,
+      { requiredVerifierCount: 10 },
+      { enableImplicitConversion: true },
+    );
+    expect(
+      validateSync(provided).some(
+        (e) => e.property === 'requiredVerifierCount',
+      ),
+    ).toBe(false);
+  });
+});
+
 describe('UpdateCircleDto', () => {
   // @IsOptional() 对 undefined 和 null 一视同仁地跳过校验,而 updateCircle 只把
   // undefined 当「没传」—— 于是 null 会一路走到 normalizeStringList().map 或者

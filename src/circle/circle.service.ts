@@ -153,9 +153,9 @@ export class CircleService {
           description: dto.description,
           avatarUrl: dto.avatarUrl ?? null,
           ownerID: userId,
-          cities: dto.cities ?? [],
+          cities: this.normalizeStringList(dto.cities ?? [], 'city'),
           rules: dto.rules ?? '',
-          tags: dto.tags ?? [],
+          tags: this.normalizeStringList(dto.tags ?? [], 'tag'),
           joinVipRestriction,
           joinCreditRestriction: dto.joinCreditRestriction ?? null,
           joinFancyRestriction: dto.joinFancyRestriction ?? false,
@@ -401,6 +401,16 @@ export class CircleService {
       dto.categories !== undefined
         ? this.normalizeStringList(dto.categories, 'category')
         : undefined;
+    // cities / tags 原来直写:" Paris " 会入库,而 GET /circle?city=Paris
+    // 是精确匹配,从此再也筛不到这个圈子;纯空白项也会被存起来发给客户端。
+    const cities =
+      dto.cities !== undefined
+        ? this.normalizeStringList(dto.cities, 'city')
+        : undefined;
+    const tags =
+      dto.tags !== undefined
+        ? this.normalizeStringList(dto.tags, 'tag')
+        : undefined;
 
     await this.prisma.$transaction(async (tx) => {
       const circle = await tx.circle.findFirst({
@@ -418,6 +428,9 @@ export class CircleService {
       // 可以各自提交，已经被撑下管理权的人仍然改得掉招新策略。圈主一并锁：
       // joinVipRestriction 天花板读的是圈主会员档，一次排序好的获锁比分两步拿安全。
       await this.memberLock.lock(tx, circleId, [userId, circle.ownerID]);
+      // 招新策略的写与建单方的读串行化:成员锁两边不相交,不加这把的话
+      // 「收严已返回成功」之后仍会有读到旧策略的担保单提交进来。
+      await this.memberLock.lockPolicy(tx, circleId);
 
       const membership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },
@@ -474,9 +487,9 @@ export class CircleService {
           ? { description: dto.description }
           : {}),
         ...(dto.avatarUrl !== undefined ? { avatarUrl: dto.avatarUrl } : {}),
-        ...(dto.cities !== undefined ? { cities: dto.cities } : {}),
+        ...(cities !== undefined ? { cities } : {}),
         ...(dto.rules !== undefined ? { rules: dto.rules } : {}),
-        ...(dto.tags !== undefined ? { tags: dto.tags } : {}),
+        ...(tags !== undefined ? { tags } : {}),
         ...(dto.joinVipRestriction !== undefined ? { joinVipRestriction } : {}),
         ...(dto.joinCreditRestriction !== undefined
           ? { joinCreditRestriction: dto.joinCreditRestriction }
@@ -511,6 +524,9 @@ export class CircleService {
         this.prisma,
         async (tx) => {
           await this.memberLock.lock(tx, circleId, [userId]);
+          // 自助 join 也要快照 requiredVerifierCount,与 invite / PATCH 同一把
+          // 策略锁下串行。
+          await this.memberLock.lockPolicy(tx, circleId);
 
           const existing = await tx.circleMember.findUnique({
             where: {

@@ -58,6 +58,9 @@ describe('CircleInvitationService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
     },
+    block: {
+      findFirst: jest.fn(),
+    },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
@@ -78,7 +81,7 @@ describe('CircleInvitationService', () => {
     assertCanApply: jest.fn(),
     activateMembers: jest.fn(),
   };
-  const memberLock = { lock: jest.fn() };
+  const memberLock = { lock: jest.fn(), lockPolicy: jest.fn() };
   const chatCircleSync = { ensureCircleConversation: jest.fn() };
   const chatService = {
     ensureDirectConversationForSettlement: jest.fn(),
@@ -100,6 +103,7 @@ describe('CircleInvitationService', () => {
     // 验证人资格 = 好友 ∩ 本圈 ACTIVE 成员。既有用例大多只关心成员那一半,
     // 这里给好友那一半一个成立的默认值,想测反例的用例自己覆写成 null。
     prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+    prisma.block.findFirst.mockResolvedValue(null);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -1652,6 +1656,47 @@ describe('CircleInvitationService', () => {
         }),
       );
       expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
+    });
+
+    // 隐私开关只看 groupInvitePermission 与好友关系,默认 EVERYONE 之下
+    // 被拉黑的人照样拉得动对方 —— 而管理员例外 + requiredVerifierCount=1
+    // 时那是「立刻入圈」。
+    it('invite refuses when either side has blocked the other', async () => {
+      for (const block of [
+        { blockerID: 'applicant-1', blockedID: 'inviter-1' },
+        { blockerID: 'inviter-1', blockedID: 'applicant-1' },
+      ]) {
+        jest.clearAllMocks();
+        arrangeInviteFlow({
+          inviterRole: 'ADMIN',
+          circle: { requiredVerifierCount: 1 },
+          created: { requiredCount: 1 },
+        });
+        privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+        prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+        prisma.block.findFirst.mockResolvedValue(block);
+
+        await expect(
+          service.invite('inviter-1', 'applicant-1', 'circle-1'),
+        ).rejects.toMatchObject({
+          response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+        });
+        expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+        expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+      }
+    });
+
+    // 成员锁是按 (circle, user) 对取的,与 PATCH /circle/:id 拿的那几把不相交,
+    // 策略快照必须另有一把圈级锁,否则「收严已返回成功」之后还会放进来一个人。
+    it('invite takes the circle policy lock before snapshotting the policy', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+      expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.findFirst.mock.invocationCallOrder[0],
+      );
     });
 
     it('invite rejects a plain member when memberCanInvite is off', async () => {

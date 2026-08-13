@@ -129,7 +129,9 @@ export class CreateCircleDto {
   @IsInt()
   @Min(1)
   @Max(10)
-  @IsOptional()
+  // 与 UpdateCircleDto 同规:@IsOptional() 连 null 一起跳过校验,而 createCircle
+  // 只把 undefined 当「没传」,null 会直接写到非空整型列上变成 500。
+  @ValidateIf((_object, value) => value !== undefined)
   requiredVerifierCount?: number;
 }
 

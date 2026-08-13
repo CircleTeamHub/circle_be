@@ -144,12 +144,35 @@ export class CircleInvitationService {
       });
     }
 
+    // 隐私开关只看 groupInvitePermission 与好友关系,从不看拉黑。默认值是
+    // EVERYONE,所以被拉黑的人照样能把对方拉进圈子 —— requiredVerifierCount=1
+    // 且邀请人是 OWNER/ADMIN 时更是「立刻入圈」。拉黑是比邀请权限更硬的意愿
+    // 表达,两个方向都拦;错误与隐私拒绝同一条,不泄露「他拉黑了你」。
+    const blocked = await this.prisma.block.findFirst({
+      where: {
+        OR: [
+          { blockerID: applicantId, blockedID: inviterId },
+          { blockerID: inviterId, blockedID: applicantId },
+        ],
+      },
+      select: { id: true },
+    });
+    if (blocked) {
+      throw new ForbiddenException({
+        message: 'User does not allow circle invites',
+        errorCode: CircleInvitationErrorCode.NotAllowed,
+      });
+    }
+
     // 6. Create invitation; the inviter takes the first seat only if they may vouch
     const invitation = await this.runInvitationTransaction(async (tx) => {
       // CircleInvitation has no DB-level unique constraint, so serialize
       // concurrent invites for the same (circle, applicant) pair with a
       // transaction-scoped advisory lock, then re-check inside the lock.
       await this.memberLock.lock(tx, circleId, [inviterId, applicantId]);
+      // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
+      // 收严返回成功之后,一个读到旧策略的建单仍会提交。
+      await this.memberLock.lockPolicy(tx, circleId);
 
       const [inviterMembership, lockedMembership, circlePolicy] =
         await Promise.all([

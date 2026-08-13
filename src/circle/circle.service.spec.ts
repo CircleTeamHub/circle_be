@@ -3,6 +3,7 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import { CircleErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
@@ -69,7 +70,7 @@ describe('CircleService', () => {
   const circleInvitationService = {
     getInvitationForViewer: jest.fn(),
   };
-  const memberLock = { lock: jest.fn() };
+  const memberLock = { lock: jest.fn(), lockPolicy: jest.fn() };
   const chatCircleSync = {
     ensureCircleConversation: jest.fn().mockResolvedValue('conv-x'),
     releaseSeatInTx: jest.fn().mockResolvedValue(null),
@@ -1228,6 +1229,78 @@ describe('CircleService', () => {
       expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.circleMember.findUnique.mock.invocationCallOrder[0],
       );
+    });
+
+    // 成员锁是按 (circle, user) 对取的:建单方拿申请人/邀请人那两把,这里拿
+    // 操作者/圈主那两把,两组不相交。策略的读写必须另有一把圈级锁,否则
+    // 「收严已经返回 200」之后,一个读到旧策略的担保单仍会提交。
+    it('takes the circle policy lock before writing admission policy', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        memberCanInvite: false,
+      } as UpdateCircleDto);
+
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+      expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.update.mock.invocationCallOrder[0],
+      );
+      // 一律排在成员锁之后,保证全仓获锁顺序一致。
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        memberLock.lockPolicy.mock.invocationCallOrder[0],
+      );
+    });
+
+    // 没归一化的话 " Paris " 入库,而 GET /circle?city=Paris 是精确匹配,
+    // 这个圈子从此再也筛不到;纯空白项也会被存起来发给客户端。
+    it('normalizes cities and tags the way categories are normalized', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        cities: ['  Paris  ', ' Tokyo'],
+        tags: [' 户外 '],
+      } as UpdateCircleDto);
+
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { cities: ['Paris', 'Tokyo'], tags: ['户外'] },
+      });
+    });
+
+    it('rejects blank and trim-colliding city entries', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          cities: ['  '],
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.ListItemBlank },
+      });
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          cities: ['Paris', ' Paris '],
+        } as UpdateCircleDto),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.ListItemDuplicate },
+      });
+
+      // 空数组仍是合法的「清空」。
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          cities: [],
+        } as UpdateCircleDto),
+      ).resolves.toBeDefined();
     });
 
     it('lets an active ADMIN update (FE 的编辑入口是 isOwnerOrAdmin)', async () => {
