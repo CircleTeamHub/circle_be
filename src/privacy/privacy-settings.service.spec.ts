@@ -8,12 +8,15 @@ describe('PrivacySettingsService', () => {
       upsert: jest.fn(),
       findMany: jest.fn(),
     },
+    $queryRaw: jest.fn(),
+    $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
   let service: PrivacySettingsService;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     service = new PrivacySettingsService(prisma as any);
   });
 
@@ -78,6 +81,26 @@ describe('PrivacySettingsService', () => {
         allowStrangerMessages: false,
       },
     });
+  });
+
+  it('serializes privacy changes with authorization reads for the same user', async () => {
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      groupInvitePermission: 'NONE',
+    });
+
+    await service.updateSettings('user-1', {
+      groupInvitePermission: 'NONE',
+    });
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+      expect.anything(),
+      'call-user:user-1',
+    );
+    expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.userPrivacySetting.upsert.mock.invocationCallOrder[0],
+    );
   });
 
   it('evaluates viewer permissions from account privacy settings', async () => {

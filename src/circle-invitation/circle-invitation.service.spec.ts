@@ -1239,7 +1239,7 @@ describe('CircleInvitationService', () => {
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
     });
 
-    it('addVerifier reads friendship inside the pair lock', async () => {
+    it('addVerifier takes the shared user lock before reading friendship', async () => {
       arrangePendingInvitation();
       notificationService.createCircleInvitationNotification.mockResolvedValue({
         id: 'notification-1',
@@ -1256,9 +1256,19 @@ describe('CircleInvitationService', () => {
 
       await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
 
-      // 与成员检查同一取向:好友关系也可能在这一拍被并发解除,读之前必须已经
-      // 拿到这一对用户的锁,否则「解除好友」与「加席」会交叉通过。
-      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+      // 圈成员锁只和圈成员写共享；解除好友拿的是 call-user:*。资格读取必须
+      // 先拿同一把 user lock，才能与解除好友严格串行。
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        'call-user:applicant-1',
+      );
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        'call-user:verifier-9',
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[0],
       );
       expect(prisma.friend.findFirst).toHaveBeenCalledWith(
@@ -1308,6 +1318,37 @@ describe('CircleInvitationService', () => {
 
       expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
       expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('respond approval takes the shared user lock before rechecking friendship', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        approvedCount: 2,
+        circle: { id: 'circle-1', name: 'Circle' },
+      });
+
+      await service.respond('verifier-9', 'inv-1', true);
+
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        'call-user:applicant-1',
+      );
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        'call-user:verifier-9',
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        prisma.friend.findFirst.mock.invocationCallOrder[0],
+      );
     });
 
     // 闸只对「同意」设。挡掉拒绝的话那一席永远 PENDING 且计入 activeSlots ——
@@ -1776,6 +1817,29 @@ describe('CircleInvitationService', () => {
 
       expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
         prisma.block.findFirst.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('takes the shared user lock before rechecking invite authorization', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        1,
+        expect.anything(),
+        'call-user:applicant-1',
+      );
+      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+        2,
+        expect.anything(),
+        'call-user:inviter-1',
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        prisma.block.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+        prisma.friend.findFirst.mock.invocationCallOrder[1],
       );
     });
 
