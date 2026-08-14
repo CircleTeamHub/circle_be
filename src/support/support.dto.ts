@@ -57,6 +57,9 @@ export class SupportConfigDto {
 
 /** 管理台读取用：包含停用行，否则管理台无法把它们改回启用。 */
 export class AdminSupportAgentDto extends SupportAgentViewDto {
+  @ApiProperty()
+  accountId: string;
+
   @ApiProperty({ enum: SUPPORT_AGENT_CATEGORIES })
   category: SupportAgentCategory;
 
