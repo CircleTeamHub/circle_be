@@ -60,6 +60,7 @@ describe('AuthService', () => {
       }),
       update: jest.fn(),
     },
+    referral: { create: jest.fn() },
     fancyNumberLease: {
       findFirst: jest.fn(() => Promise.resolve(null)),
     },
@@ -229,6 +230,15 @@ describe('AuthService', () => {
 
     const invitee = users.find((user) => user.email === 'invitee@example.com');
     expect(invitee.invitedByUserId).toBe('inviter-1');
+    expect(mockPrisma.referral.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        inviterID: 'inviter-1',
+        inviteeID: invitee.id,
+        status: 'PENDING',
+        inviterReward: 20,
+        inviteeReward: 5,
+      }),
+    });
   });
 
   it('register rejects an unknown invite code with a stable error code', async () => {

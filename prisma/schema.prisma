@@ -361,6 +361,8 @@ model User {
   refreshTokens                     RefreshToken[]
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
   invitees                          User[]                      @relation("UserInvitations")
+  referralsSent                     Referral[]                  @relation("ReferralInviter")
+  referralReceived                 Referral?                   @relation("ReferralInvitee")
   friendsAsUser                     Friend[]                    @relation("userFriends")
   friendsAsFriend                   Friend[]                    @relation("userFriendsTo")
   blocksIssued                      Block[]                     @relation("blocker")
@@ -1226,6 +1228,14 @@ model UserPrivacySetting {
 
 // ─── Coin / Wallet ────────────────────────────────────────────────────────────
 
+enum ReferralStatus {
+  PENDING
+  REWARDED
+  CAPPED
+  REJECTED
+  EXPIRED
+}
+
 enum CoinTxType {
   RECHARGE // top-up by admin / payment
   GIFT_SENT // deducted when sending a gift
@@ -1233,6 +1243,8 @@ enum CoinTxType {
   REFUND // admin refund
   PURCHASE // deducted when buying membership or mall items
   ADJUSTMENT // manual admin correction
+  REFERRAL_REWARD // credited to the inviter after a referral qualifies
+  REFERRAL_BONUS // credited to the qualified invitee
 }
 
 enum CollectionType {
@@ -1266,6 +1278,29 @@ model CoinTransaction {
 
   @@index([userID, createdAt])
   @@index([type, createdAt])
+}
+
+model Referral {
+  id            String         @id @default(uuid())
+  inviterID     String
+  inviteeID     String         @unique
+  status        ReferralStatus @default(PENDING)
+  inviterReward Int
+  inviteeReward Int
+  eligibleAt    DateTime
+  nextCheckAt   DateTime
+  expiresAt     DateTime
+  qualifiedAt   DateTime?
+  rewardedAt    DateTime?
+  failureReason String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  inviter       User           @relation("ReferralInviter", fields: [inviterID], references: [id], onDelete: Cascade)
+  invitee       User           @relation("ReferralInvitee", fields: [inviteeID], references: [id], onDelete: Cascade)
+
+  @@index([status, nextCheckAt])
+  @@index([inviterID, rewardedAt])
+  @@index([inviterID, createdAt])
 }
 
 model CoinGift {

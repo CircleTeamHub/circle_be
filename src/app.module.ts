@@ -45,6 +45,7 @@ import { AdminCommunityModule } from './admin-community/admin-community.module';
 import { SensitiveWordModule } from './sensitive-word/sensitive-word.module';
 import { ChatModule } from './chat/chat.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { ReferralModule } from './referral/referral.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -96,6 +97,7 @@ const envFilePath = `.env.${nodeEnv}`;
     SensitiveWordModule,
     ChatModule,
     MetricsModule,
+    ReferralModule,
   ],
   controllers: [],
   providers: [Logger],
