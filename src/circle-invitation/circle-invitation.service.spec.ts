@@ -1712,15 +1712,39 @@ describe('CircleInvitationService', () => {
       expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
     });
 
-    // 好友关系没变时不该多打一次隐私查询(那是每次邀请都要付的一次读)。
-    it('does not re-query privacy when the friendship is unchanged', async () => {
+    // 只在「好友关系变了」时复核是不够的:对方完全可以保持好友关系不变,只把
+    // groupInvitePermission 改成 NONE —— 那样锁外那个 true 照样过期,而一票圈
+    // 会当场把人放进来。所以事务内无条件复核一次。
+    it('revalidates privacy even when the friendship is unchanged', async () => {
+      arrangeInviteFlow({
+        inviterRole: 'ADMIN',
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1 },
+      });
+      // 一直是好友;预检放行,事务内对方已经改成 NONE。
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      privacySettings.canBeInvitedToGroupOrCircle
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    // 复核读必须走 tx:读在事务外拿不到 Serializable 的保护,再怎么复核也只是
+    // 把窗口缩小,拦不住「读到允许 → 对方改成 NONE → 仍然入圈」。
+    it('reads the privacy setting through the transaction client', async () => {
       arrangeInviteFlow();
 
       await service.invite('inviter-1', 'applicant-1', 'circle-1');
 
-      expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledTimes(
-        1,
-      );
+      expect(
+        privacySettings.canBeInvitedToGroupOrCircle,
+      ).toHaveBeenLastCalledWith('applicant-1', true, prisma);
     });
 
     // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:

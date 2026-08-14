@@ -30,3 +30,21 @@ describe('CircleInvitationController pagination', () => {
     );
   });
 });
+
+// requiredVerifierCount=1 下这条路由是「当场入圈 + 通知 + 实时广播 + 席位同步」。
+// AppModule 没装全局 throttler,不在路由上限就等于一个成员可以一路刷到圈子容量。
+describe('invite throttling', () => {
+  it('guards the controller with the throttler and budgets invite at 20/min', () => {
+    const guards = Reflect.getMetadata(
+      '__guards__',
+      CircleInvitationController,
+    ) as Array<{ name: string }>;
+    expect(guards.map((guard) => guard.name)).toContain('ThrottlerGuard');
+
+    // 与 POST /group/:groupID/members/invite 同一条预算(@Throttle 展开成
+    // 每个命名空间一个 key,不是一个对象)。
+    const invite = CircleInvitationController.prototype.invite;
+    expect(Reflect.getMetadata('THROTTLER:LIMITdefault', invite)).toBe(20);
+    expect(Reflect.getMetadata('THROTTLER:TTLdefault', invite)).toBe(60_000);
+  });
+});

@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import { CircleInvitationService } from './circle-invitation.service';
@@ -32,12 +33,16 @@ import {
 
 @ApiTags('Circle Invitation')
 @ApiBearerAuth()
-@UseGuards(JwtGuard)
+@UseGuards(ThrottlerGuard, JwtGuard)
 @Controller('circle-invitation')
 export class CircleInvitationController {
   constructor(private readonly invitationService: CircleInvitationService) {}
 
   @Post('invite')
+  // requiredVerifierCount=1(宣传期默认)下这条路由是「当场入圈 + 通知 +
+  // 实时广播 + 席位同步」,与 POST /group/:groupID/members/invite 同量级,
+  // 沿用它那条 20/min。不限的话一个成员可以一路刷到圈子容量上限。
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({
     summary: 'Invite a user to join a circle (starts 10-person verification)',
   })

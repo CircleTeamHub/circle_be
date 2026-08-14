@@ -265,22 +265,27 @@ export class CircleInvitationService {
       // 事务内的好友关系是唯一可信的那份:锁外那次只用于快速失败。
       const stillFriends = await this.areFriends(inviterId, applicantId, tx);
 
-      // 隐私开关也要按事务内的好友关系复核一次。对方设成 FRIENDS_ONLY 时,
-      // 预检通过之后、事务开始之前把好友删掉,锁外那个 true 就过期了 ——
-      // 而 OWNER/ADMIN 这条捷径原本连好友结果都不看,一票圈会当场把人放进来,
-      // 违背的正是对方此刻的设置。
-      if (!inviterIsFriend !== !stillFriends) {
-        const stillAllowed =
-          await this.privacySettings.canBeInvitedToGroupOrCircle(
-            applicantId,
-            stillFriends,
-          );
-        if (!stillAllowed) {
-          throw new ForbiddenException({
-            message: 'User does not allow circle invites',
-            errorCode: CircleInvitationErrorCode.NotAllowed,
-          });
-        }
+      // 隐私开关在事务内**无条件**复核一次,读也走 tx。
+      //
+      // 只在「好友关系变了」时才复核是不够的:对方完全可以保持好友关系不变,
+      // 只把 groupInvitePermission 从 EVERYONE/FRIENDS_ONLY 改成 NONE ——
+      // 那样锁外那个 true 照样过期,而一票圈会当场把人放进来。
+      //
+      // 读用 tx 而不是 this.prisma:本事务是 Serializable,事务内的这次读会与
+      // 并发的隐私设置写形成 rw 冲突,SSI 判定后一方 40001 回滚重试(见
+      // runSerializableTransaction 的 P2034 重试)。读在事务外的话拿不到这层
+      // 保护,再怎么复核也只是把窗口缩小。
+      const stillAllowed =
+        await this.privacySettings.canBeInvitedToGroupOrCircle(
+          applicantId,
+          stillFriends,
+          tx,
+        );
+      if (!stillAllowed) {
+        throw new ForbiddenException({
+          message: 'User does not allow circle invites',
+          errorCode: CircleInvitationErrorCode.NotAllowed,
+        });
       }
 
       const inviterCanVouch =

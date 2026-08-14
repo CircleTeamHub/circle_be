@@ -1,3 +1,4 @@
+import { Prisma } from 'src/generated/prisma';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -42,8 +43,16 @@ type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
 export class PrivacySettingsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async getSettings(userId: string): Promise<PrivacySettingsDto> {
-    const existing = await this.prisma.userPrivacySetting.findUnique({
+  /**
+   * `client` 默认走 this.prisma。需要与一次写入串行的调用方(建担保单)必须传
+   * 事务客户端:读在事务外的话拿不到 Serializable 的保护,「读到允许 → 对方改
+   * 成 NONE → 仍然入圈」这种交叉就拦不住。
+   */
+  async getSettings(
+    userId: string,
+    client: Pick<Prisma.TransactionClient, 'userPrivacySetting'> = this.prisma,
+  ): Promise<PrivacySettingsDto> {
+    const existing = await client.userPrivacySetting.findUnique({
       where: { userID: userId },
     });
 
@@ -176,8 +185,9 @@ export class PrivacySettingsService {
   async canBeInvitedToGroupOrCircle(
     targetUserId: string,
     isFriend: boolean,
+    client?: Pick<Prisma.TransactionClient, 'userPrivacySetting'>,
   ): Promise<boolean> {
-    const settings = await this.getSettings(targetUserId);
+    const settings = await this.getSettings(targetUserId, client);
     return this.permissionAllows(settings.groupInvitePermission, isFriend);
   }
 
