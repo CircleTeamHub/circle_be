@@ -16,7 +16,7 @@ describe('RegisterDto inviteCode', () => {
     expect(errors).toHaveLength(0);
   });
 
-  it('trims and lowercases a valid invite code', async () => {
+  it('trims and uppercases a valid invite code', async () => {
     const dto = plainToInstance(RegisterDto, {
       ...validPayload,
       inviteCode: '  AbC-123  ',
@@ -26,7 +26,7 @@ describe('RegisterDto inviteCode', () => {
 
     expect(errors).toHaveLength(0);
     expect((dto as RegisterDto & { inviteCode?: string }).inviteCode).toBe(
-      'abc-123',
+      'ABC-123',
     );
   });
 

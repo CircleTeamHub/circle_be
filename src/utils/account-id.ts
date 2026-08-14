@@ -6,25 +6,28 @@ export const ACCOUNT_ID_PATTERN = /^[a-zA-Z0-9_-]{4,32}$/;
 export const ACCOUNT_ID_RULE_MESSAGE =
   '账号需为4-32位字母、数字、下划线或短横线';
 
-// accountId 统一以小写存储（规范化大小写），与好友精确查找的
-// case-insensitive 行为及 changeAccountId 的小写归一保持一致。
-const CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789';
-const SUFFIX_LENGTH = 6;
-// Largest multiple of 36 that fits in a byte. Bytes ≥ this value are
-// rejected so the modulo doesn't bias the first four characters of CHARS.
-const ACCEPT_THRESHOLD = Math.floor(256 / CHARS.length) * CHARS.length;
+const ACCOUNT_ID_CHARS = '0123456789';
+const INVITE_CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+const CODE_LENGTH = 6;
 
-export function generateAccountId(): string {
-  const suffix: string[] = [];
-  while (suffix.length < SUFFIX_LENGTH) {
-    // Generate one byte per remaining character; the rejection rate is ~1.5%
-    // so a single batch almost always covers the deficit.
-    const buf = randomBytes(SUFFIX_LENGTH - suffix.length);
+function generateCode(chars: string): string {
+  const result: string[] = [];
+  const acceptThreshold = Math.floor(256 / chars.length) * chars.length;
+  while (result.length < CODE_LENGTH) {
+    const buf = randomBytes(CODE_LENGTH - result.length);
     for (const b of buf) {
-      if (b >= ACCEPT_THRESHOLD) continue;
-      suffix.push(CHARS[b % CHARS.length]);
-      if (suffix.length >= SUFFIX_LENGTH) break;
+      if (b >= acceptThreshold) continue;
+      result.push(chars[b % chars.length]);
+      if (result.length >= CODE_LENGTH) break;
     }
   }
-  return suffix.join('');
+  return result.join('');
+}
+
+export function generateAccountId(): string {
+  return generateCode(ACCOUNT_ID_CHARS);
+}
+
+export function generateInviteCode(): string {
+  return generateCode(INVITE_CODE_CHARS);
 }

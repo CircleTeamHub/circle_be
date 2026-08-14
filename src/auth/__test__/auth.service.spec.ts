@@ -28,6 +28,7 @@ describe('AuthService', () => {
   const mockPrisma = {
     accountIdentifier: {
       findUnique: jest.fn(() => Promise.resolve(null)),
+      findMany: jest.fn(() => Promise.resolve([])),
     },
     user: {
       findUnique: jest.fn(({ where }) =>
@@ -41,6 +42,18 @@ describe('AuthService', () => {
               (where.id !== undefined && u.id === where.id) ||
               (where.email !== undefined && u.email === where.email),
           ) ?? null,
+        ),
+      ),
+      // 账号/邀请码分配改成批量候选查询：按内存用户表回答 IN 查询。
+      findMany: jest.fn(({ where }: any) =>
+        Promise.resolve(
+          where.accountId
+            ? users
+                .filter((u) => where.accountId.in.includes(u.accountId))
+                .map((u) => ({ accountId: u.accountId }))
+            : users
+                .filter((u) => where.inviteCode.in.includes(u.inviteCode))
+                .map((u) => ({ inviteCode: u.inviteCode })),
         ),
       ),
       create: jest.fn(async ({ data }) => {
@@ -138,6 +151,18 @@ describe('AuthService', () => {
         ) ?? null,
       ),
     );
+    mockPrisma.user.findMany.mockImplementation(({ where }: any) =>
+      Promise.resolve(
+        where.accountId
+          ? users
+              .filter((u) => where.accountId.in.includes(u.accountId))
+              .map((u) => ({ accountId: u.accountId }))
+          : users
+              .filter((u) => where.inviteCode.in.includes(u.inviteCode))
+              .map((u) => ({ inviteCode: u.inviteCode })),
+      ),
+    );
+    mockPrisma.accountIdentifier.findMany.mockResolvedValue([]);
     mockPrisma.user.create.mockImplementation(async ({ data }) => {
       const { invitedBy, ...fields } = data;
       const user = {
@@ -206,8 +231,8 @@ describe('AuthService', () => {
     } as any);
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('refresh-token');
-    expect(users[0].accountId).toMatch(/^[a-z0-9]{6}$/);
-    expect(users[0].inviteCode).toBe(users[0].accountId);
+    expect(users[0].accountId).toMatch(/^\d{6}$/);
+    expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
   });
 
@@ -215,7 +240,7 @@ describe('AuthService', () => {
     users.push({
       id: 'inviter-1',
       accountId: 'renamed',
-      inviteCode: 'abc123',
+      inviteCode: 'ABC123',
       email: 'inviter@example.com',
       status: 'ACTIVE',
     });
@@ -225,7 +250,7 @@ describe('AuthService', () => {
       code: '123456',
       password: 'password1',
       nickname: 'Invitee',
-      inviteCode: '  ABC123  ',
+      inviteCode: '  abc123  ',
     } as any);
 
     const invitee = users.find((user) => user.email === 'invitee@example.com');
@@ -262,7 +287,7 @@ describe('AuthService', () => {
     users.push({
       id: 'inviter-1',
       accountId: 'renamed',
-      inviteCode: 'abc123',
+      inviteCode: 'ABC123',
       email: 'inviter@example.com',
       status: 'BANNED',
     });
@@ -302,6 +327,71 @@ describe('AuthService', () => {
     expect(result.accessToken).toBe('access-token');
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
     expect(users).toHaveLength(1);
+  });
+
+  // review 修复：触发器抢占报的是 plpgsql P0001（'account identifier collision'），
+  // 不是 Prisma 的 P2002。不分类它，输掉并发的那次注册会以 500 收场而不是换码重试。
+  it('register retries when the identifier trigger reports a claim collision', async () => {
+    let rejectedAccountId = '';
+    mockPrisma.user.create.mockImplementationOnce(({ data }: any) => {
+      rejectedAccountId = data.accountId;
+      return Promise.reject(
+        new Error(
+          'Raw query failed. Code: `P0001`. Message: `ERROR: account identifier ' +
+            `collision: ${data.accountId}\``,
+        ),
+      );
+    });
+
+    const result = await service.register({
+      email: 'trigger-race@example.com',
+      code: '123456',
+      password: 'password1',
+      nickname: 'TriggerRace',
+    } as any);
+
+    expect(rejectedAccountId).toMatch(/^\d{6}$/);
+    expect(result.accessToken).toBe('access-token');
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
+    expect(users).toHaveLength(1);
+    expect(users[0].accountId).not.toBe(rejectedAccountId);
+  });
+
+  it('register retries when the trigger rejects the generated invite code', async () => {
+    let rejectedInviteCode = '';
+    mockPrisma.user.create.mockImplementationOnce(({ data }: any) => {
+      rejectedInviteCode = data.inviteCode;
+      return Promise.reject(
+        new Error(`account identifier collision: ${data.inviteCode}`),
+      );
+    });
+
+    const result = await service.register({
+      email: 'trigger-invite@example.com',
+      code: '123456',
+      password: 'password1',
+      nickname: 'TriggerInvite',
+    } as any);
+
+    expect(rejectedInviteCode).toMatch(/^[A-Z0-9]{6}$/);
+    expect(result.accessToken).toBe('access-token');
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('register surfaces unrelated database errors instead of retrying', async () => {
+    mockPrisma.user.create.mockImplementation(() =>
+      Promise.reject(new Error('connection reset')),
+    );
+
+    await expect(
+      service.register({
+        email: 'db-down@example.com',
+        code: '123456',
+        password: 'password1',
+        nickname: 'DbDown',
+      } as any),
+    ).rejects.toThrow('connection reset');
+    expect(mockPrisma.user.create).toHaveBeenCalledTimes(1);
   });
 
   it('register returns service unavailable after exhausting uniqueness-race retries', async () => {

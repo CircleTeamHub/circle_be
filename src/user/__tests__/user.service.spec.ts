@@ -32,6 +32,7 @@ describe('UserService', () => {
     },
     accountIdentifier: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
     },
     $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
@@ -80,6 +81,9 @@ describe('UserService', () => {
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: true });
     prisma.userLike.findUnique.mockResolvedValue(null);
     prisma.accountIdentifier.findUnique.mockResolvedValue(null);
+    // 邀请码分配改成批量候选查询：默认没有任何候选被占用。
+    prisma.user.findMany.mockResolvedValue([]);
+    prisma.accountIdentifier.findMany.mockResolvedValue([]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
@@ -266,7 +270,7 @@ describe('UserService', () => {
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: {
         accountId: 'Alice_01',
-        inviteCode: expect.stringMatching(/^[a-z0-9]{6}$/),
+        inviteCode: expect.stringMatching(/^[A-Z0-9]{6}$/),
         passwordHash: expect.any(String),
         nickname: 'Alice',
       },
