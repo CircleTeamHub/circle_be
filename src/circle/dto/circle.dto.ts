@@ -125,7 +125,11 @@ export class CreateCircleDto {
     description:
       'Verifier votes required to admit an applicant; 1 = no verification. Snapshotted per invitation.',
   })
-  @Type(() => Number)
+  // 与 UpdateCircleDto 同规:@Type(() => Number) 会把 true→1,等于建出一个
+  // 入圈验证已经关掉的圈子,而且零校验错误。读转换前的原值。
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.requiredVerifierCount,
+  )
   @IsInt()
   @Min(1)
   @Max(10)

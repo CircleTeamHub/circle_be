@@ -44,6 +44,20 @@ describe('CreateCircleDto requiredVerifierCount', () => {
     ).toBe(true);
   });
 
+  // @Type(() => Number) 会把 true→1,等于建出一个入圈验证已经关掉的圈子。
+  it('rejects booleans', () => {
+    for (const raw of [true, false]) {
+      const dto = plainToInstance(
+        CreateCircleDto,
+        { requiredVerifierCount: raw },
+        { enableImplicitConversion: true },
+      );
+      expect(
+        validateSync(dto).some((e) => e.property === 'requiredVerifierCount'),
+      ).toBe(true);
+    }
+  });
+
   it('still accepts an omitted value and a real count', () => {
     const omitted = plainToInstance(
       CreateCircleDto,

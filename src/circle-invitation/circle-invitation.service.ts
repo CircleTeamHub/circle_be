@@ -262,10 +262,31 @@ export class CircleInvitationService {
       //
       // 好友读放在 pair 锁内,与 addVerifier / respond 同口径(锁外那次只用于
       // 隐私开关判定,不能拿来发席位)。
+      // 事务内的好友关系是唯一可信的那份:锁外那次只用于快速失败。
+      const stillFriends = await this.areFriends(inviterId, applicantId, tx);
+
+      // 隐私开关也要按事务内的好友关系复核一次。对方设成 FRIENDS_ONLY 时,
+      // 预检通过之后、事务开始之前把好友删掉,锁外那个 true 就过期了 ——
+      // 而 OWNER/ADMIN 这条捷径原本连好友结果都不看,一票圈会当场把人放进来,
+      // 违背的正是对方此刻的设置。
+      if (!inviterIsFriend !== !stillFriends) {
+        const stillAllowed =
+          await this.privacySettings.canBeInvitedToGroupOrCircle(
+            applicantId,
+            stillFriends,
+          );
+        if (!stillAllowed) {
+          throw new ForbiddenException({
+            message: 'User does not allow circle invites',
+            errorCode: CircleInvitationErrorCode.NotAllowed,
+          });
+        }
+      }
+
       const inviterCanVouch =
         inviterMembership.role === 'OWNER' ||
         inviterMembership.role === 'ADMIN' ||
-        (await this.areFriends(inviterId, applicantId, tx));
+        stillFriends;
 
       const created = await tx.circleInvitation.create({
         data: {

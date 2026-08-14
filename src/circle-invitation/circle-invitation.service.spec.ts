@@ -1687,6 +1687,42 @@ describe('CircleInvitationService', () => {
       }
     });
 
+    // 对方设成 FRIENDS_ONLY 时,预检通过之后、事务开始之前把好友删掉,锁外
+    // 那个 true 就过期了 —— 而管理员捷径原本连好友结果都不看,一票圈会当场
+    // 把人放进来,违背的正是对方此刻的设置。
+    it('revalidates invite privacy against the in-transaction friendship', async () => {
+      arrangeInviteFlow({
+        inviterRole: 'ADMIN',
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1 },
+      });
+      // 预检时还是好友 → 放行;事务内已经不是了。
+      privacySettings.canBeInvitedToGroupOrCircle
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+      prisma.friend.findFirst
+        .mockResolvedValueOnce({ userID: 'applicant-1' })
+        .mockResolvedValue(null);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    // 好友关系没变时不该多打一次隐私查询(那是每次邀请都要付的一次读)。
+    it('does not re-query privacy when the friendship is unchanged', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(privacySettings.canBeInvitedToGroupOrCircle).toHaveBeenCalledTimes(
+        1,
+      );
+    });
+
     // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:
     // 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分。
     it('does not let a non-member distinguish a block from the membership error', async () => {
