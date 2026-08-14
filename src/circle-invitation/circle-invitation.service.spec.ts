@@ -1,5 +1,6 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
+import { CircleInvitationErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
@@ -36,6 +37,7 @@ describe('CircleInvitationService', () => {
     },
     circleMember: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
@@ -50,8 +52,13 @@ describe('CircleInvitationService', () => {
     },
     user: {
       findUnique: jest.fn(),
+      findMany: jest.fn(),
     },
     friend: {
+      findFirst: jest.fn(),
+      findMany: jest.fn(),
+    },
+    block: {
       findFirst: jest.fn(),
     },
     $executeRaw: jest.fn(),
@@ -74,7 +81,7 @@ describe('CircleInvitationService', () => {
     assertCanApply: jest.fn(),
     activateMembers: jest.fn(),
   };
-  const memberLock = { lock: jest.fn() };
+  const memberLock = { lock: jest.fn(), lockPolicy: jest.fn() };
   const chatCircleSync = { ensureCircleConversation: jest.fn() };
   const chatService = {
     ensureDirectConversationForSettlement: jest.fn(),
@@ -93,6 +100,11 @@ describe('CircleInvitationService', () => {
     chatService.ensureDirectConversationForSettlement.mockResolvedValue('dm-1');
     chatService.getOrCreateDirectConversation.mockResolvedValue({ id: 'dm-1' });
     chatMessages.insertServerMessage.mockResolvedValue({ id: 'msg-1' });
+    // 验证人资格 = 好友 ∩ 本圈 ACTIVE 成员。既有用例大多只关心成员那一半,
+    // 这里给好友那一半一个成立的默认值,想测反例的用例自己覆写成 null。
+    prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+    prisma.block.findFirst.mockResolvedValue(null);
+    // invite 事务里读的是 tx.block(与 prisma 同一份桩,见 $transaction 的实现)。
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -265,6 +277,11 @@ describe('CircleInvitationService', () => {
         ? { status: 'ACTIVE', role: 'MEMBER' }
         : null,
     );
+    // invite 事务内多了圈子策略读(requiredVerifierCount / memberCanInvite)。
+    prisma.circle.findFirst.mockResolvedValue({
+      requiredVerifierCount: 10,
+      memberCanInvite: true,
+    });
     prisma.circleInvitation.findFirst.mockResolvedValue(null);
     prisma.circleInvitation.create.mockResolvedValue({ id: 'inv-new' });
     prisma.circleInvitationVerifier.create.mockResolvedValue({ id: 'ver-new' });
@@ -1159,6 +1176,647 @@ describe('CircleInvitationService', () => {
         addedByID: 'applicant-1',
         status: 'PENDING',
       },
+    });
+  });
+  // ─── 验证人资格:好友 ∩ 本圈 ACTIVE 成员 ────────────────────────────────────
+  //
+  // 「成员」那一半一直有(加席查一次、投票再复查一次),「好友」那一半此前一处都
+  // 没有 —— 错误码 VerifierNotFriend 只存在于枚举里,全仓零处 throw。于是这条
+  // 规则只靠 SelectVerifierScreen 拉好友列表这个 UI 约定撑着:直接打
+  // POST /circle-invitation/:id/add-verifier 就能把圈里任意 ACTIVE 成员塞成
+  // 自己的验证人。这一组把交集的两半都钉在服务端。
+  describe('verifier eligibility (friend ∩ active member)', () => {
+    function arrangeRespondSeat() {
+      prisma.circleInvitation.findUnique
+        .mockResolvedValueOnce({
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+        })
+        .mockResolvedValueOnce({
+          id: 'inv-1',
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+          status: 'PENDING',
+          requiredCount: 10,
+          approvedCount: 1,
+          circle: { id: 'circle-1', name: 'Circle' },
+        });
+      prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+        id: 'seat-1',
+        status: 'PENDING',
+      });
+    }
+
+    function arrangePendingInvitation() {
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        verifiers: [],
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    }
+
+    it('addVerifier rejects an active member who is not the applicant friend', async () => {
+      arrangePendingInvitation();
+      prisma.friend.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.addVerifier('applicant-1', 'inv-1', 'verifier-9'),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: CircleInvitationErrorCode.VerifierNotFriend,
+        },
+      });
+
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      expect(
+        notificationService.createCircleInvitationNotification,
+      ).not.toHaveBeenCalled();
+      await flush();
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+
+    it('addVerifier reads friendship inside the pair lock', async () => {
+      arrangePendingInvitation();
+      notificationService.createCircleInvitationNotification.mockResolvedValue({
+        id: 'notification-1',
+        type: 'CIRCLE_VERIFICATION_REQUESTED',
+        content: '',
+        read: false,
+        createdAt: new Date('2026-08-12T00:00:00.000Z'),
+        fromUser: { id: 'applicant-1', nickname: 'Applicant', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: { id: 'circle-1', name: 'Circle' },
+        fromInvitation: { id: 'inv-1', status: 'PENDING' },
+      });
+
+      await service.addVerifier('applicant-1', 'inv-1', 'verifier-9');
+
+      // 与成员检查同一取向:好友关系也可能在这一拍被并发解除,读之前必须已经
+      // 拿到这一对用户的锁,否则「解除好友」与「加席」会交叉通过。
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.friend.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(prisma.friend.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            state: 'ACCEPTED',
+            OR: [
+              { userID: 'applicant-1', friendID: 'verifier-9' },
+              { userID: 'verifier-9', friendID: 'applicant-1' },
+            ],
+          }),
+        }),
+      );
+    });
+
+    it('respond rejects a verifier who is no longer the applicant friend', async () => {
+      prisma.circleInvitation.findUnique
+        .mockResolvedValueOnce({
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+        })
+        .mockResolvedValueOnce({
+          id: 'inv-1',
+          circleID: 'circle-1',
+          applicantID: 'applicant-1',
+          status: 'PENDING',
+          requiredCount: 10,
+          approvedCount: 1,
+          circle: { id: 'circle-1', name: 'Circle' },
+        });
+      prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+        id: 'seat-1',
+        status: 'PENDING',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      // 加席时是好友,投票前解除了 —— 与「加席后退圈」同一形状,资格必须在
+      // 投票这一刻重算,不能信加席那次检查。
+      prisma.friend.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', true),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: CircleInvitationErrorCode.VerifierNotFriend,
+        },
+      });
+
+      expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    // 闸只对「同意」设。挡掉拒绝的话那一席永远 PENDING 且计入 activeSlots ——
+    // 本仓既没有撤销验证人的接口、PENDING 担保单也不会过期,申请人补不上人、
+    // 也永远凑不满票,整单卡死到管理员来兜底。
+    it('respond lets a verifier who lost eligibility still reject, freeing the seat', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+      prisma.friend.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', false),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'seat-1' },
+          data: expect.objectContaining({ status: 'REJECTED' }),
+        }),
+      );
+      // 反对票不加票数,只把席位让出来。
+      expect(prisma.circleInvitation.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('respond lets a verifier who left the circle still reject', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', false),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.circleInvitationVerifier.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'REJECTED' }),
+        }),
+      );
+    });
+
+    it('respond still blocks approval from a verifier who left the circle', async () => {
+      arrangeRespondSeat();
+      prisma.circleMember.findUnique.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+
+      await expect(
+        service.respond('verifier-9', 'inv-1', true),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: CircleInvitationErrorCode.VerifierNotMember,
+        },
+      });
+      expect(prisma.circleInvitationVerifier.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // 选人页此前拉的是**全部好友**,不在圈里的也照列 —— 点下去才被服务端打回。
+  // 资格规则归服务端所有,列表也就该由服务端算好再给,前端不做集合运算。
+  describe('getEligibleVerifiers', () => {
+    function arrangeInvitation(overrides = {}) {
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-1',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        status: 'PENDING',
+        requiredCount: 10,
+        verifiers: [
+          { verifierID: 'inviter-1', status: 'APPROVED' },
+          { verifierID: 'verifier-rejected', status: 'REJECTED' },
+        ],
+        ...overrides,
+      });
+    }
+
+    // 成员查询只取 id;profile 在交集之后单独 hydrate。
+    function member(id: string) {
+      return { userID: id };
+    }
+
+    function profile(id: string) {
+      return {
+        id,
+        nickname: `nick-${id}`,
+        avatarUrl: null,
+        accountId: `acct-${id}`,
+      };
+    }
+
+    it('returns active circle members who are also friends', async () => {
+      arrangeInvitation();
+      prisma.circleMember.findMany.mockResolvedValue([
+        member('friend-member'),
+        member('stranger-member'),
+      ]);
+      prisma.friend.findMany.mockResolvedValue([
+        { userID: 'applicant-1', friendID: 'friend-member' },
+        // 反向存储的好友行也算,friend 表一对只有一行。
+        { userID: 'friend-elsewhere', friendID: 'applicant-1' },
+      ]);
+      prisma.user.findMany.mockResolvedValue([profile('friend-member')]);
+
+      const result = await service.getEligibleVerifiers('applicant-1', 'inv-1');
+
+      // 只为交集付 hydration,不是把全圈成员的资料先拉一遍再过滤。
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: { in: ['friend-member'] } },
+        }),
+      );
+
+      expect(result).toEqual([
+        {
+          id: 'friend-member',
+          nickname: 'nick-friend-member',
+          avatarUrl: null,
+          accountId: 'acct-friend-member',
+        },
+      ]);
+      // 已占席的(含 REJECTED —— addVerifier 的 AlreadyVerifier 不看状态)
+      // 和申请人自己都不该再出现在候选里。
+      expect(prisma.circleMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            circleID: 'circle-1',
+            status: 'ACTIVE',
+            userID: {
+              notIn: ['inviter-1', 'verifier-rejected', 'applicant-1'],
+            },
+          }),
+        }),
+      );
+    });
+
+    it('returns an empty list without querying friends when no member is left', async () => {
+      arrangeInvitation();
+      prisma.circleMember.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.getEligibleVerifiers('applicant-1', 'inv-1'),
+      ).resolves.toEqual([]);
+      expect(prisma.friend.findMany).not.toHaveBeenCalled();
+    });
+
+    it('returns an empty list once every slot is filled', async () => {
+      arrangeInvitation({
+        requiredCount: 1,
+        verifiers: [{ verifierID: 'inviter-1', status: 'APPROVED' }],
+      });
+
+      await expect(
+        service.getEligibleVerifiers('applicant-1', 'inv-1'),
+      ).resolves.toEqual([]);
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects a caller who is not the applicant', async () => {
+      arrangeInvitation();
+
+      await expect(
+        service.getEligibleVerifiers('someone-else', 'inv-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.ApplicantOnly },
+      });
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('rejects a settled invitation', async () => {
+      arrangeInvitation({ status: 'APPROVED' });
+
+      await expect(
+        service.getEligibleVerifiers('applicant-1', 'inv-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.NotPending },
+      });
+      expect(prisma.circleMember.findMany).not.toHaveBeenCalled();
+    });
+  });
+  // ─── 宣传期招新策略:requiredVerifierCount 快照 + memberCanInvite 闸 ────────
+  //
+  // 宣传期把圈子的 requiredVerifierCount 设为 1:成员邀请自动带首票,建单即满
+  // → 立即入圈;后期收紧改回 10 就恢复满员担保。担保单存的是**建单那一刻的快照**,
+  // 调整策略不影响在途申请。memberCanInvite=false 时普通成员的邀请入口关闭,
+  // 只留圈主/管理员 —— 「只有管理员拉人进来才能进」的严格形态。
+  describe('promotional admission policy', () => {
+    function arrangeInviteFlow(
+      params: {
+        inviterRole?: string;
+        circle?: Record<string, unknown>;
+        created?: Record<string, unknown>;
+      } = {},
+    ) {
+      prisma.circleMember.findUnique.mockImplementation(({ where }: any) =>
+        where.userID_circleID.userID === 'inviter-1'
+          ? { status: 'ACTIVE', role: params.inviterRole ?? 'MEMBER' }
+          : null,
+      );
+      prisma.circle.findFirst.mockResolvedValue({
+        requiredVerifierCount: 10,
+        memberCanInvite: true,
+        ...params.circle,
+      });
+      prisma.circleInvitation.findFirst.mockResolvedValue(null);
+      prisma.circleInvitation.create.mockResolvedValue({
+        id: 'inv-new',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        inviterID: 'inviter-1',
+        requiredCount: 10,
+        approvedCount: 1,
+        status: 'PENDING',
+        circle: { id: 'circle-1', name: 'Circle', groupID: 'circle-1' },
+        ...params.created,
+      });
+      prisma.circleInvitationVerifier.create.mockResolvedValue({
+        id: 'ver-new',
+      });
+      // 收尾的 fetchInvitationDto 读。
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-new',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        inviterID: 'inviter-1',
+        requiredCount: 10,
+        approvedCount: 1,
+        status: 'PENDING',
+        createdAt: new Date('2026-08-12T00:00:00.000Z'),
+        circle: { id: 'circle-1', name: 'Circle' },
+        applicant: {
+          id: 'applicant-1',
+          nickname: 'Applicant',
+          avatarUrl: null,
+          accountId: 'applicant',
+        },
+        inviter: {
+          id: 'inviter-1',
+          nickname: 'Inviter',
+          avatarUrl: null,
+          accountId: 'inviter',
+        },
+        verifiers: [],
+      });
+    }
+
+    it('invite snapshots the circle requiredVerifierCount into the invitation', async () => {
+      arrangeInviteFlow({ circle: { requiredVerifierCount: 10 } });
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ requiredCount: 10 }),
+        }),
+      );
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+      expect(
+        realtimeService.broadcastCircleInvitationReviewed,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('invite admits immediately when the inviter first vote satisfies the policy', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1 },
+      });
+      notificationService.createCircleInvitationNotification.mockResolvedValue({
+        id: 'notification-1',
+        type: 'CIRCLE_INVITATION_APPROVED',
+        content: '',
+        read: false,
+        createdAt: new Date('2026-08-12T00:00:00.000Z'),
+        fromUser: { id: 'inviter-1', nickname: 'Inviter', avatarUrl: null },
+        fromTrace: null,
+        fromReply: null,
+        fromCircle: { id: 'circle-1', name: 'Circle' },
+        fromInvitation: { id: 'inv-new', status: 'APPROVED' },
+      });
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.update).toHaveBeenCalledWith({
+        where: { id: 'inv-new' },
+        data: { status: 'APPROVED' },
+      });
+      expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+        prisma,
+        'circle-1',
+        ['applicant-1'],
+        { locksHeld: true, actor: 'third-party' },
+      );
+      // 席位同步 + 申请人通知 + 实时广播,与 respond 的满票收尾同一套。
+      expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+        'circle-1',
+      );
+      expect(
+        notificationService.createCircleInvitationNotification,
+      ).toHaveBeenCalledWith(
+        expect.objectContaining({
+          toUserID: 'applicant-1',
+          fromUserID: 'inviter-1',
+          type: 'CIRCLE_INVITATION_APPROVED',
+        }),
+      );
+      expect(
+        realtimeService.broadcastCircleInvitationReviewed,
+      ).toHaveBeenCalledWith('applicant-1', {
+        invitationId: 'inv-new',
+        circleId: 'circle-1',
+        status: 'APPROVED',
+      });
+    });
+
+    // 自动首票 = 邀请人替被邀请人担保,资格与申请人自己挑的验证人同规,
+    // 否则「验证人必须是好友」这条闸从 invite 这条路整条绕过去。
+    it('invite withholds the first vote when a plain member is not the friend', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1, approvedCount: 0 },
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ approvedCount: 0 }),
+        }),
+      );
+      expect(prisma.circleInvitationVerifier.create).not.toHaveBeenCalled();
+      // 没有首票就没满票:陌生人不会被瞬间塞进圈子。
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    it('invite keeps the first vote for a non-friend owner or admin', async () => {
+      arrangeInviteFlow({
+        circle: { requiredVerifierCount: 10 },
+        inviterRole: 'ADMIN',
+      });
+      prisma.friend.findFirst.mockResolvedValue(null);
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ approvedCount: 1 }),
+        }),
+      );
+      expect(prisma.circleInvitationVerifier.create).toHaveBeenCalledTimes(1);
+    });
+
+    // 隐私开关只看 groupInvitePermission 与好友关系,默认 EVERYONE 之下
+    // 被拉黑的人照样拉得动对方 —— 而管理员例外 + requiredVerifierCount=1
+    // 时那是「立刻入圈」。
+    it('invite refuses when either side has blocked the other', async () => {
+      for (const block of [
+        { blockerID: 'applicant-1', blockedID: 'inviter-1' },
+        { blockerID: 'inviter-1', blockedID: 'applicant-1' },
+      ]) {
+        jest.clearAllMocks();
+        arrangeInviteFlow({
+          inviterRole: 'ADMIN',
+          circle: { requiredVerifierCount: 1 },
+          created: { requiredCount: 1 },
+        });
+        privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+        prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+        prisma.block.findFirst.mockResolvedValue(block);
+
+        await expect(
+          service.invite('inviter-1', 'applicant-1', 'circle-1'),
+        ).rejects.toMatchObject({
+          response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+        });
+        expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+        expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+      }
+    });
+
+    // 对方设成 FRIENDS_ONLY 时,预检通过之后、事务开始之前把好友删掉,锁外
+    // 那个 true 就过期了 —— 而管理员捷径原本连好友结果都不看,一票圈会当场
+    // 把人放进来,违背的正是对方此刻的设置。
+    it('revalidates invite privacy against the in-transaction friendship', async () => {
+      arrangeInviteFlow({
+        inviterRole: 'ADMIN',
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1 },
+      });
+      // 预检时还是好友 → 放行;事务内已经不是了。
+      privacySettings.canBeInvitedToGroupOrCircle
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+      prisma.friend.findFirst
+        .mockResolvedValueOnce({ userID: 'applicant-1' })
+        .mockResolvedValue(null);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    // 只在「好友关系变了」时复核是不够的:对方完全可以保持好友关系不变,只把
+    // groupInvitePermission 改成 NONE —— 那样锁外那个 true 照样过期,而一票圈
+    // 会当场把人放进来。所以事务内无条件复核一次。
+    it('revalidates privacy even when the friendship is unchanged', async () => {
+      arrangeInviteFlow({
+        inviterRole: 'ADMIN',
+        circle: { requiredVerifierCount: 1 },
+        created: { requiredCount: 1 },
+      });
+      // 一直是好友;预检放行,事务内对方已经改成 NONE。
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      privacySettings.canBeInvitedToGroupOrCircle
+        .mockResolvedValueOnce(true)
+        .mockResolvedValueOnce(false);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleInvitationErrorCode.NotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    // 复核读必须走 tx:读在事务外拿不到 Serializable 的保护,再怎么复核也只是
+    // 把窗口缩小,拦不住「读到允许 → 对方改成 NONE → 仍然入圈」。
+    it('reads the privacy setting through the transaction client', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(
+        privacySettings.canBeInvitedToGroupOrCircle,
+      ).toHaveBeenLastCalledWith('applicant-1', true, prisma);
+    });
+
+    // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:
+    // 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分。
+    it('does not let a non-member distinguish a block from the membership error', async () => {
+      for (const block of [null, { blockerID: 'applicant-1' }]) {
+        jest.clearAllMocks();
+        arrangeInviteFlow();
+        privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(true);
+        prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+        prisma.block.findFirst.mockResolvedValue(block);
+        // 调用者根本不是本圈成员。
+        prisma.circleMember.findUnique.mockResolvedValue(null);
+
+        await expect(
+          service.invite('stranger-1', 'applicant-1', 'circle-1'),
+        ).rejects.toMatchObject({
+          response: { errorCode: CircleInvitationErrorCode.InviterNotMember },
+        });
+      }
+    });
+
+    // 预检式的读拦不住「读完之后才拉黑」:必须在事务内读,让 Serializable 的
+    // SSI 把它与并发的拉黑写判成冲突。
+    it('reads the block relation inside the invitation transaction', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.block.findFirst.mock.invocationCallOrder[0],
+      );
+    });
+
+    // 成员锁是按 (circle, user) 对取的,与 PATCH /circle/:id 拿的那几把不相交,
+    // 策略快照必须另有一把圈级锁,否则「收严已返回成功」之后还会放进来一个人。
+    it('invite takes the circle policy lock before snapshotting the policy', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(memberLock.lockPolicy).toHaveBeenCalledWith(prisma, 'circle-1');
+      expect(memberLock.lockPolicy.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.findFirst.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('invite rejects a plain member when memberCanInvite is off', async () => {
+      arrangeInviteFlow({
+        circle: { memberCanInvite: false },
+        inviterRole: 'MEMBER',
+      });
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: {
+          errorCode: CircleInvitationErrorCode.MemberInviteDisabled,
+        },
+      });
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+    });
+
+    it('invite keeps owner and admin invites when memberCanInvite is off', async () => {
+      arrangeInviteFlow({
+        circle: { memberCanInvite: false },
+        inviterRole: 'ADMIN',
+      });
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      expect(prisma.circleInvitation.create).toHaveBeenCalledTimes(1);
     });
   });
 });

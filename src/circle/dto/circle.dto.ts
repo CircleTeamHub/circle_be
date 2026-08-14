@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayUnique,
@@ -15,6 +15,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { MAX_PAGE } from 'src/common/pagination';
@@ -117,6 +118,152 @@ export class CreateCircleDto {
   @IsBoolean()
   @IsOptional()
   memberCanPost?: boolean;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 10,
+    description:
+      'Verifier votes required to admit an applicant; 1 = no verification. Snapshotted per invitation.',
+  })
+  // 与 UpdateCircleDto 同规:@Type(() => Number) 会把 true→1,等于建出一个
+  // 入圈验证已经关掉的圈子,而且零校验错误。读转换前的原值。
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.requiredVerifierCount,
+  )
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  // 与 UpdateCircleDto 同规:@IsOptional() 连 null 一起跳过校验,而 createCircle
+  // 只把 undefined 当「没传」,null 会直接写到非空整型列上变成 500。
+  @ValidateIf((_object, value) => value !== undefined)
+  requiredVerifierCount?: number;
+}
+
+/**
+ * PATCH /circle/:id 的字段面 = FE 编辑页实际发送的 11 个字段 + 两个招新策略开关。
+ *
+ * 布尔与数字字段一律 @Transform 读转换前的原值:全局 ValidationPipe 开着
+ * enableImplicitConversion,它会把任意非空字符串转成 true —— `memberCanInvite:
+ * "false"` 会被静默当成「开着」,圈主以为关掉了成员邀请,其实没关。数字字段
+ * 吃的是同一个亏的另一面:`@Type(() => Number)` 把 false→0、true→1,于是
+ * `joinVipRestriction: false` 等同「清空限制」、`requiredVerifierCount: true`
+ * 等同 1(把入圈验证整个关掉)。做法与 support.dto.ts 里的 enabled 一致。
+ *
+ * 刻意不含 maxMembers:容量走会员配额/扩容流程,不归这条通用编辑路由管。
+ * description 允许空串 —— 自研栈下「群公告即圈子简介」,清空公告是合法操作,
+ * 不能复用 create 的 MinLength(10)。
+ */
+export class UpdateCircleDto {
+  @ApiPropertyOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(2)
+  @MaxLength(20)
+  @ValidateIf((_object, value) => value !== undefined)
+  name?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @MaxLength(20, { each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(5)
+  @ValidateIf((_object, value) => value !== undefined)
+  categories?: string[];
+
+  @ApiPropertyOptional()
+  @IsString()
+  @MaxLength(500)
+  @ValidateIf((_object, value) => value !== undefined)
+  description?: string;
+
+  @ApiPropertyOptional()
+  @IsString()
+  @MaxLength(500)
+  @ValidateIf((_object, value) => value !== undefined)
+  avatarUrl?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(10)
+  @MaxLength(50, { each: true })
+  @ValidateIf((_object, value) => value !== undefined)
+  cities?: string[];
+
+  @ApiPropertyOptional()
+  @IsString()
+  @ValidateIf((_object, value) => value !== undefined)
+  @MaxLength(1000)
+  rules?: string;
+
+  @ApiPropertyOptional({ type: [String] })
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayUnique()
+  @ArrayMaxSize(3)
+  @MaxLength(30, { each: true })
+  @ValidateIf((_object, value) => value !== undefined)
+  tags?: string[];
+
+  @ApiPropertyOptional({ nullable: true, minimum: 0, maximum: 4 })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinVipRestriction,
+  )
+  @IsInt()
+  @Min(0)
+  @Max(4)
+  @IsOptional()
+  joinVipRestriction?: number | null;
+
+  @ApiPropertyOptional({ nullable: true })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinCreditRestriction,
+  )
+  @IsInt()
+  @Min(0)
+  @Max(100)
+  @IsOptional()
+  joinCreditRestriction?: number | null;
+
+  @ApiPropertyOptional()
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.joinFancyRestriction,
+  )
+  @IsBoolean()
+  @ValidateIf((_object, value) => value !== undefined)
+  joinFancyRestriction?: boolean;
+
+  @ApiPropertyOptional()
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanPost)
+  @IsBoolean()
+  @ValidateIf((_object, value) => value !== undefined)
+  memberCanPost?: boolean;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 10,
+    description:
+      'Verifier votes required to admit an applicant; snapshotted per invitation.',
+  })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.requiredVerifierCount,
+  )
+  @IsInt()
+  @Min(1)
+  @Max(10)
+  @ValidateIf((_object, value) => value !== undefined)
+  requiredVerifierCount?: number;
+
+  @ApiPropertyOptional({
+    description: 'false = only OWNER/ADMIN may invite new members.',
+  })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanInvite)
+  @IsBoolean()
+  @ValidateIf((_object, value) => value !== undefined)
+  memberCanInvite?: boolean;
 }
 
 export class ListCirclesQueryDto {
@@ -209,6 +356,8 @@ export class CircleDto {
   joinFancyRestriction: boolean;
   maxMembers: number;
   memberCanPost: boolean;
+  requiredVerifierCount: number;
+  memberCanInvite: boolean;
   groupID: string | null;
   memberCount: number;
   postCount: number;
