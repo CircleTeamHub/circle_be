@@ -25,11 +25,16 @@ export const REGISTRATION_CODE_MAX_ATTEMPTS = 10;
 
 // 6 位十进制账号只有 100 万个取值。逐个候选、只试 10 次的老策略在半满时就有
 // 约 1/1024 的注册直接 503(80% 占用时超过 10%),远早于命名空间真的用尽。
+//
 // 改成按批取候选:一批 CANDIDATE_BATCH_SIZE 个候选合并成 3 条 IN 查询(而不是
-// 32×3 条),最多 CANDIDATE_BATCH_ROUNDS 批。128 个候选在 50% 占用下全部撞库
-// 的概率约 3e-39,90% 占用下也只有 1.4e-6,同时把往返轮次从 10 压到 4。
+// 32×3 条),命中就立刻返回 —— 空旷时永远只花 1 轮 / 3 条查询。轮次上限按"最坏
+// 情况也别提前放弃"来定:1024 个候选在 95% 占用下全撞的概率约 5e-23,99% 占用
+// (还剩 1 万个空号)也只有 3e-5;代价只有在真的撞满时才付,而那时候慢一点远好过
+// 直接 503。
+//
+// 再往上(>99% 占用)不该靠加轮次解决:那说明 6 位命名空间本身到头了,要加位数。
 const CANDIDATE_BATCH_SIZE = 32;
-const CANDIDATE_BATCH_ROUNDS = 4;
+const CANDIDATE_BATCH_ROUNDS = 32;
 
 function uniqueCollisionTargets(error: unknown): string[] {
   if (

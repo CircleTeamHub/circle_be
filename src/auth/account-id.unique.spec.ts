@@ -111,8 +111,35 @@ describe('generateUniqueAccountId', () => {
     await expect(
       generateUniqueAccountId(prisma as any, () => '100001'),
     ).rejects.toThrow(/unique account ID/);
-    // 4 批 × 2 条 user 查询;候选去重后每批只剩一个值,不会退化成 32 条查询。
-    expect(prisma.user.findMany).toHaveBeenCalledTimes(8);
+    // 32 批 × 2 条 user 查询;候选去重后每批只剩一个值,不会退化成每候选一条。
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(64);
+  });
+
+  // review 修复:固定 4 批(128 个候选)在 99% 占用时仍有约 28% 的注册被拒,
+  // 而那时还剩一万个空号。空闲值落在前几批之外时也必须能找到。
+  it('finds a free id that sits far outside the first random batches', async () => {
+    const taken = Array.from({ length: 900 }, (_, index) =>
+      String(100000 + index).padStart(6, '0'),
+    );
+    const prisma = fakePrisma({ accounts: taken });
+    let index = 0;
+    const generate = () =>
+      index < taken.length ? taken[index++] : String(900000 + index++);
+
+    await expect(
+      generateUniqueAccountId(prisma as any, generate),
+    ).resolves.toBe('900900');
+    // 命中之前每批只花 3 条查询,不是每个候选一条。
+    expect(prisma.user.findMany.mock.calls.length).toBeLessThanOrEqual(64);
+  });
+
+  it('still returns on the first batch when the namespace is empty', async () => {
+    const prisma = fakePrisma({});
+    await expect(
+      generateUniqueAccountId(prisma as any, () => '123456'),
+    ).resolves.toBe('123456');
+    // 空旷时不该因为上限抬高就多跑轮次。
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(2);
   });
 
   it('works without the AccountIdentifier table (pre-migration schemas)', async () => {
