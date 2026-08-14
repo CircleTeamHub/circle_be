@@ -73,6 +73,11 @@ const AGENT_USER_SELECT = {
   vipLevel: true,
 } as const;
 
+const ADMIN_AGENT_USER_SELECT = {
+  ...AGENT_USER_SELECT,
+  accountId: true,
+} as const;
+
 function emptyConfig(): Record<SupportAgentCategory, SupportAgentViewDto[]> {
   return Object.fromEntries(
     SUPPORT_AGENT_CATEGORIES.map((category) => [category, []]),
@@ -167,13 +172,14 @@ export class SupportService {
         userID: true,
         sortOrder: true,
         enabled: true,
-        user: { select: AGENT_USER_SELECT },
+        user: { select: ADMIN_AGENT_USER_SELECT },
       },
     });
 
     return {
       agents: rows.map((row) => ({
         ...toView(row.user),
+        accountId: row.user.accountId,
         category: row.category as SupportAgentCategory,
         sortOrder: row.sortOrder,
         enabled: row.enabled,

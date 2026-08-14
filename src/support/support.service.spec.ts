@@ -11,6 +11,7 @@ import {
 
 const user = (id: string, overrides: Record<string, unknown> = {}) => ({
   id,
+  accountId: `account-${id}`,
   nickname: `nick-${id}`,
   avatarUrl: null,
   vipLevel: 0,
@@ -99,6 +100,7 @@ describe('SupportService', () => {
 
       expect(prisma.supportAgent.findMany).toHaveBeenCalledTimes(1);
       expect(result.agents.map((a) => a.userID)).toEqual(['u1']);
+      expect(result.agents[0].accountId).toBe('account-u1');
       expect(result.revision).toBe(
         supportAgentsRevision([
           { category: 'recharge', userID: 'u1', sortOrder: 0, enabled: true },
