@@ -24,10 +24,19 @@ BEGIN
     old_invite_identifier := lower(OLD."inviteCode");
   END IF;
 
+  -- 只给"真的要认领"的标识符加锁。事务级 advisory 锁到 COMMIT 才释放,而下面
+  -- 的回填 UPDATE 会扫过整张 User 表:逐行无条件加锁会把共享锁表(默认约
+  -- max_locks_per_transaction * max_connections 个槽)撑爆,迁移直接 out of
+  -- shared memory。只改大小写的行两个规范化标识符都没变,不涉及认领,无需锁。
   PERFORM pg_advisory_xact_lock(hashtextextended(identifier, 0))
   FROM (
     SELECT DISTINCT identifier
-    FROM (VALUES (new_account_identifier), (new_invite_identifier)) values_to_lock(identifier)
+    FROM (
+      VALUES
+        (new_account_identifier, old_account_identifier),
+        (new_invite_identifier, old_invite_identifier)
+    ) values_to_lock(identifier, previous_identifier)
+    WHERE identifier IS DISTINCT FROM previous_identifier
   ) identifiers_to_lock
   ORDER BY identifier;
 

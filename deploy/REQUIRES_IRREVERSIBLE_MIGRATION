@@ -1,1 +1,4 @@
 Membership permissions contract migration requires coordinated downtime and irreversible confirmation.
+Uppercase invite-code backfill (20260814000000) rewrites every stored invite code; binaries released
+before it look invite codes up in lowercase and cannot resolve them, so the old color must be stopped
+before the migration runs and is not a valid rollback target afterwards.

@@ -192,6 +192,16 @@ fail closed,不会连接服务器。必须从 Actions 手动运行 Release,同�
 `docs/operations/membership-rollout.md`。标记只能由**后续已成功部署**、且不再包含
 不可逆迁移的版本移除,不能在会员迁移 tag 上提前删除。
 
+**邀请码大写化迁移(`20260814000000_uppercase_invite_codes`)同样必须走停机路径。**
+默认蓝绿模式下旧色在迁移期间仍然在服务(`deploy/release-deploy.sh` 先跑 migrate 再切流),
+而这次迁移把 `User.inviteCode` 全表改成大写,发布前的二进制却按小写查邀请码 ——
+在"迁移完成、还没切流"这段窗口里,所有走旧色的邀请注册都会返回 InviteCodeInvalid,
+新色健康检查失败回滚到旧色后还会一直坏下去。因此这个版本继续携带
+`deploy/REQUIRES_IRREVERSIBLE_MIGRATION`(tag push fail closed,只能从 Actions 手动
+勾 `downtime` + `irreversible_migration`,脚本会先停旧色再跑迁移),并把
+`deploy/SCHEMA_COMPATIBILITY` 抬到 `4`:迁移后旧二进制不再是合法回滚目标,
+launcher 会拒绝任何兼容级别低于 4 的 tag。
+
 ### 一次性配置(GitHub 仓库 Settings → Secrets and variables → Actions)
 
 | 类型 | 名称 | 值 |

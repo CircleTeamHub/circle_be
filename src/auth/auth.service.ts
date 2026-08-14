@@ -19,6 +19,7 @@ import { EmailVerificationService } from './email-verification.service';
 import {
   generateUniqueAccountId,
   generateUniqueRegistrationCode,
+  isAccountIdentifierClaimCollision,
   isRegistrationCodeUniqueCollision,
   REGISTRATION_CODE_MAX_ATTEMPTS,
 } from './account-id.unique';
@@ -1239,7 +1240,12 @@ export class AuthService {
           return user;
         });
       } catch (error) {
-        if (isRegistrationCodeUniqueCollision(error)) {
+        // 唯一索引冲突(P2002)和触发器的认领冲突(plpgsql P0001)都是"这个候选值
+        // 被并发注册抢走了",都该换一组码重试;只有其它错误才真正上抛。
+        if (
+          isRegistrationCodeUniqueCollision(error) ||
+          isAccountIdentifierClaimCollision(error, [accountId, inviteCode])
+        ) {
           if (attempt < maxAttempts - 1) continue;
           break;
         }

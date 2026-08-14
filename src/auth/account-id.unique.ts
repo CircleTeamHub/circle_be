@@ -4,32 +4,32 @@ import { Prisma } from 'src/generated/prisma';
 
 type AccountIdGenerator = () => string;
 
-interface AccountIdLookup {
+interface RegistrationCodeLookup {
   user: {
-    findUnique(args: {
-      where: { accountId: string };
-      select: { id: true };
-    }): Promise<{ id: string } | null>;
-  };
-}
-
-interface RegistrationCodeLookup extends AccountIdLookup {
-  user: AccountIdLookup['user'] & {
-    findUnique(args: {
-      where: { inviteCode: string };
-      select: { id: true };
-    }): Promise<{ id: string } | null>;
+    findMany(args: {
+      where: { accountId: { in: string[] } } | { inviteCode: { in: string[] } };
+      select: { accountId: true } | { inviteCode: true };
+    }): Promise<
+      Array<{ accountId?: string | null; inviteCode?: string | null }>
+    >;
   };
   accountIdentifier?: {
-    findUnique(args: {
-      where: { value: string };
+    findMany(args: {
+      where: { value: { in: string[] } };
       select: { value: true };
-    }): Promise<{ value: string } | null>;
+    }): Promise<Array<{ value: string }>>;
   };
 }
 
 export const REGISTRATION_CODE_MAX_ATTEMPTS = 10;
-const MAX_ATTEMPTS = REGISTRATION_CODE_MAX_ATTEMPTS;
+
+// 6 位十进制账号只有 100 万个取值。逐个候选、只试 10 次的老策略在半满时就有
+// 约 1/1024 的注册直接 503(80% 占用时超过 10%),远早于命名空间真的用尽。
+// 改成按批取候选:一批 CANDIDATE_BATCH_SIZE 个候选合并成 3 条 IN 查询(而不是
+// 32×3 条),最多 CANDIDATE_BATCH_ROUNDS 批。128 个候选在 50% 占用下全部撞库
+// 的概率约 3e-39,90% 占用下也只有 1.4e-6,同时把往返轮次从 10 压到 4。
+const CANDIDATE_BATCH_SIZE = 32;
+const CANDIDATE_BATCH_ROUNDS = 4;
 
 function uniqueCollisionTargets(error: unknown): string[] {
   if (
@@ -41,6 +41,14 @@ function uniqueCollisionTargets(error: unknown): string[] {
   const target = error.meta?.target;
   const fields = Array.isArray(target) ? target : [target];
   return fields.map((field) => String(field ?? ''));
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return String(error);
 }
 
 export function isRegistrationCodeUniqueCollision(error: unknown): boolean {
@@ -56,35 +64,97 @@ export function isInviteCodeUniqueCollision(error: unknown): boolean {
 }
 
 /**
- * 生成一个数据库内唯一的 accountId。复用纯随机生成器 generateAccountId()，
- * 碰撞则重试；MAX_ATTEMPTS 次仍冲突视为异常（概率极低，通常是 DB 故障）。
+ * User_account_identifier_prepare 触发器在标识符被别人占用时 `RAISE EXCEPTION
+ * 'account identifier collision: <value>'`。它走的是 plpgsql 的 P0001,不是
+ * Prisma 的 P2002,所以必须单独识别 —— 否则并发注册撞到同一个候选值时,输的那
+ * 边会以未分类的 500 结束,而不是走上层的换码重试。
  */
+export function isAccountIdentifierClaimCollision(
+  error: unknown,
+  values: Array<string | null | undefined>,
+): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return values.some(
+    (value) =>
+      !!value &&
+      message.includes(`account identifier collision: ${value.toLowerCase()}`),
+  );
+}
+
+/** Collects a de-duplicated batch of candidates in their stored casing. */
+function collectCandidates(
+  generate: AccountIdGenerator,
+  format: (raw: string) => string,
+): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < CANDIDATE_BATCH_SIZE; i += 1) {
+    const candidate = format(generate());
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+  return candidates;
+}
+
+/**
+ * 返回一个在「可变账号 / 邀请码 / 靓号库」三处都空闲的候选值(按 format 决定的
+ * 存储大小写返回)。AccountIdentifier 是三个命名空间共用的小写规范登记表,所以
+ * 三处都按小写规范值比对。
+ */
+async function findFreeCandidate(
+  prisma: RegistrationCodeLookup,
+  generate: AccountIdGenerator,
+  format: (raw: string) => string,
+): Promise<string | null> {
+  for (let round = 0; round < CANDIDATE_BATCH_ROUNDS; round += 1) {
+    const candidates = collectCandidates(generate, format);
+    const canonical = candidates.map((candidate) => candidate.toLowerCase());
+    const upper = candidates.map((candidate) => candidate.toUpperCase());
+    const [accounts, invites, identifiers] = await Promise.all([
+      prisma.user.findMany({
+        where: { accountId: { in: canonical } },
+        select: { accountId: true },
+      }),
+      prisma.user.findMany({
+        where: { inviteCode: { in: upper } },
+        select: { inviteCode: true },
+      }),
+      prisma.accountIdentifier
+        ? prisma.accountIdentifier.findMany({
+            where: { value: { in: canonical } },
+            select: { value: true },
+          })
+        : Promise.resolve([]),
+    ]);
+    const taken = new Set<string>();
+    for (const row of accounts) {
+      if (row.accountId) taken.add(row.accountId.toLowerCase());
+    }
+    for (const row of invites) {
+      if (row.inviteCode) taken.add(row.inviteCode.toLowerCase());
+    }
+    for (const row of identifiers) taken.add(row.value.toLowerCase());
+
+    const free = candidates.find(
+      (candidate) => !taken.has(candidate.toLowerCase()),
+    );
+    if (free) return free;
+  }
+  return null;
+}
+
+/** Generates a numeric account ID that is free across all three namespaces. */
 export async function generateUniqueAccountId(
   prisma: RegistrationCodeLookup,
   generate: AccountIdGenerator = generateAccountId,
 ): Promise<string> {
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidate = generate().toLowerCase();
-    const [account, invite, identifier] = await Promise.all([
-      prisma.user.findUnique({
-        where: { accountId: candidate },
-        select: { id: true },
-      }),
-      prisma.user.findUnique({
-        where: { inviteCode: candidate.toUpperCase() },
-        select: { id: true },
-      }),
-      prisma.accountIdentifier
-        ? prisma.accountIdentifier.findUnique({
-            where: { value: candidate },
-            select: { value: true },
-          })
-        : Promise.resolve(null),
-    ]);
-    if (!account && !invite && !identifier) return candidate;
-  }
-  // 10 次随机候选全部撞库概率极低，真发生通常意味着 DB 异常。抛 503 而非裸
-  // Error，让全局过滤器返回干净的 5xx，且语义上是"暂时不可用、可重试"。
+  const candidate = await findFreeCandidate(prisma, generate, (raw) =>
+    raw.toLowerCase(),
+  );
+  if (candidate) return candidate;
+  // 4×32 个候选全部撞库,说明命名空间接近枯竭(或 DB 异常)。抛 503 而非裸
+  // Error,让全局过滤器返回干净的 5xx,且语义上是"暂时不可用、可重试"。
   throw new ServiceUnavailableException(
     'Failed to generate a unique account ID',
   );
@@ -95,27 +165,10 @@ export async function generateUniqueRegistrationCode(
   prisma: RegistrationCodeLookup,
   generate: AccountIdGenerator = generateInviteCode,
 ): Promise<string> {
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidate = generate().toUpperCase();
-    const canonicalIdentifier = candidate.toLowerCase();
-    const [account, invite, identifier] = await Promise.all([
-      prisma.user.findUnique({
-        where: { accountId: canonicalIdentifier },
-        select: { id: true },
-      }),
-      prisma.user.findUnique({
-        where: { inviteCode: candidate },
-        select: { id: true },
-      }),
-      prisma.accountIdentifier
-        ? prisma.accountIdentifier.findUnique({
-            where: { value: canonicalIdentifier },
-            select: { value: true },
-          })
-        : Promise.resolve(null),
-    ]);
-    if (!account && !invite && !identifier) return candidate;
-  }
+  const candidate = await findFreeCandidate(prisma, generate, (raw) =>
+    raw.toUpperCase(),
+  );
+  if (candidate) return candidate;
 
   throw new ServiceUnavailableException(
     'Failed to generate a unique registration code',
