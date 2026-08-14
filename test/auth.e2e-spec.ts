@@ -54,7 +54,8 @@ describe('Auth e2e', () => {
       .expectStatus(200)
       .returns('data');
 
-    expect(inviter.inviteCode).toMatch(/^[a-z0-9]{6}$/);
+    expect(inviter.inviteCode).toMatch(/^[A-Z0-9]{6}$/);
+    expect(inviter.accountId).toMatch(/^\d{6}$/);
 
     await pactum
       .spec()
@@ -62,7 +63,7 @@ describe('Auth e2e', () => {
       .withBody(
         registerBody({
           email: 'invited-user@example.com',
-          inviteCode: `  ${inviter.inviteCode.toUpperCase()}  `,
+          inviteCode: `  ${inviter.inviteCode.toLowerCase()}  `,
         }),
       )
       .expectStatus(201);

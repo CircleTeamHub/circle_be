@@ -15,4 +15,20 @@ describe('registration invite-code migration', () => {
     expect(sql).toMatch(/"User_inviteCode_key".*UNIQUE/i);
     expect(sql).toMatch(/ON DELETE SET NULL/i);
   });
+
+  it('uppercases stored invite codes while keeping the shared identifier registry lowercase', () => {
+    const migrationPath = join(
+      process.cwd(),
+      'prisma/migrations/20260814000000_uppercase_invite_codes/migration.sql',
+    );
+    expect(existsSync(migrationPath)).toBe(true);
+    const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
+
+    expect(sql).toContain('NEW."inviteCode" := upper(NEW."inviteCode")');
+    expect(sql).toContain('new_invite_identifier := lower(NEW."inviteCode")');
+    expect(sql).toContain('invite_identifier TEXT := lower(NEW."inviteCode")');
+    expect(sql).toMatch(
+      /UPDATE "User"[\s\S]*SET "inviteCode" = upper\("inviteCode"\)/,
+    );
+  });
 });

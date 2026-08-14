@@ -1,5 +1,5 @@
 import { ServiceUnavailableException } from '@nestjs/common';
-import { generateAccountId } from 'src/utils/account-id';
+import { generateAccountId, generateInviteCode } from 'src/utils/account-id';
 import { Prisma } from 'src/generated/prisma';
 
 type AccountIdGenerator = () => string;
@@ -60,18 +60,28 @@ export function isInviteCodeUniqueCollision(error: unknown): boolean {
  * 碰撞则重试；MAX_ATTEMPTS 次仍冲突视为异常（概率极低，通常是 DB 故障）。
  */
 export async function generateUniqueAccountId(
-  prisma: AccountIdLookup,
+  prisma: RegistrationCodeLookup,
   generate: AccountIdGenerator = generateAccountId,
 ): Promise<string> {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidate = generate();
-    const existing = await prisma.user.findUnique({
-      where: { accountId: candidate },
-      select: { id: true },
-    });
-    if (!existing) {
-      return candidate;
-    }
+    const candidate = generate().toLowerCase();
+    const [account, invite, identifier] = await Promise.all([
+      prisma.user.findUnique({
+        where: { accountId: candidate },
+        select: { id: true },
+      }),
+      prisma.user.findUnique({
+        where: { inviteCode: candidate.toUpperCase() },
+        select: { id: true },
+      }),
+      prisma.accountIdentifier
+        ? prisma.accountIdentifier.findUnique({
+            where: { value: candidate },
+            select: { value: true },
+          })
+        : Promise.resolve(null),
+    ]);
+    if (!account && !invite && !identifier) return candidate;
   }
   // 10 次随机候选全部撞库概率极低，真发生通常意味着 DB 异常。抛 503 而非裸
   // Error，让全局过滤器返回干净的 5xx，且语义上是"暂时不可用、可重试"。
@@ -83,13 +93,14 @@ export async function generateUniqueAccountId(
 /** Generates a value that is free in both mutable account IDs and invite codes. */
 export async function generateUniqueRegistrationCode(
   prisma: RegistrationCodeLookup,
-  generate: AccountIdGenerator = generateAccountId,
+  generate: AccountIdGenerator = generateInviteCode,
 ): Promise<string> {
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    const candidate = generate();
+    const candidate = generate().toUpperCase();
+    const canonicalIdentifier = candidate.toLowerCase();
     const [account, invite, identifier] = await Promise.all([
       prisma.user.findUnique({
-        where: { accountId: candidate },
+        where: { accountId: canonicalIdentifier },
         select: { id: true },
       }),
       prisma.user.findUnique({
@@ -98,7 +109,7 @@ export async function generateUniqueRegistrationCode(
       }),
       prisma.accountIdentifier
         ? prisma.accountIdentifier.findUnique({
-            where: { value: candidate },
+            where: { value: canonicalIdentifier },
             select: { value: true },
           })
         : Promise.resolve(null),

@@ -37,10 +37,10 @@ export class RegisterDto {
   @Length(1, 50)
   nickname: string;
 
-  @ApiPropertyOptional({ example: 'abc123' })
+  @ApiPropertyOptional({ example: 'ABC123' })
   @Transform(({ value }: { value: unknown }) => {
     if (typeof value !== 'string') return value;
-    const normalized = value.trim().toLowerCase();
+    const normalized = value.trim().toUpperCase();
     return normalized || undefined;
   })
   @IsOptional()

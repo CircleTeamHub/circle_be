@@ -17,6 +17,7 @@ import { RegisterDto } from './dto/register.dto';
 import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
 import {
+  generateUniqueAccountId,
   generateUniqueRegistrationCode,
   isRegistrationCodeUniqueCollision,
   REGISTRATION_CODE_MAX_ATTEMPTS,
@@ -159,7 +160,7 @@ export class AuthService {
       });
     }
 
-    const normalizedInviteCode = dto.inviteCode?.trim().toLowerCase() || null;
+    const normalizedInviteCode = dto.inviteCode?.trim().toUpperCase() || null;
     const inviter = normalizedInviteCode
       ? await this.prisma.user.findUnique({
           where: { inviteCode: normalizedInviteCode },
@@ -1213,16 +1214,17 @@ export class AuthService {
   ) {
     const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const registrationCode = await generateUniqueRegistrationCode(
-        this.prisma,
-      );
+      const [accountId, inviteCode] = await Promise.all([
+        generateUniqueAccountId(this.prisma),
+        generateUniqueRegistrationCode(this.prisma),
+      ]);
       try {
         return await this.prisma.$transaction(async (tx) => {
           const user = await tx.user.create({
             data: {
               ...data,
-              accountId: registrationCode,
-              inviteCode: registrationCode,
+              accountId,
+              inviteCode,
             },
           });
           if (data.invitedByUserId) {
@@ -1246,7 +1248,7 @@ export class AuthService {
     }
 
     throw new ServiceUnavailableException(
-      'Failed to create a user with a unique registration code',
+      'Failed to create a user with unique account and invite codes',
     );
   }
 

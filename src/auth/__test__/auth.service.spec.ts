@@ -206,8 +206,8 @@ describe('AuthService', () => {
     } as any);
     expect(result.accessToken).toBe('access-token');
     expect(result.refreshToken).toBe('refresh-token');
-    expect(users[0].accountId).toMatch(/^[a-z0-9]{6}$/);
-    expect(users[0].inviteCode).toBe(users[0].accountId);
+    expect(users[0].accountId).toMatch(/^\d{6}$/);
+    expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
   });
 
@@ -215,7 +215,7 @@ describe('AuthService', () => {
     users.push({
       id: 'inviter-1',
       accountId: 'renamed',
-      inviteCode: 'abc123',
+      inviteCode: 'ABC123',
       email: 'inviter@example.com',
       status: 'ACTIVE',
     });
@@ -225,7 +225,7 @@ describe('AuthService', () => {
       code: '123456',
       password: 'password1',
       nickname: 'Invitee',
-      inviteCode: '  ABC123  ',
+      inviteCode: '  abc123  ',
     } as any);
 
     const invitee = users.find((user) => user.email === 'invitee@example.com');
@@ -262,7 +262,7 @@ describe('AuthService', () => {
     users.push({
       id: 'inviter-1',
       accountId: 'renamed',
-      inviteCode: 'abc123',
+      inviteCode: 'ABC123',
       email: 'inviter@example.com',
       status: 'BANNED',
     });

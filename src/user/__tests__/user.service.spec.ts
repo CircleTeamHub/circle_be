@@ -266,7 +266,7 @@ describe('UserService', () => {
     expect(prisma.user.create).toHaveBeenCalledWith({
       data: {
         accountId: 'Alice_01',
-        inviteCode: expect.stringMatching(/^[a-z0-9]{6}$/),
+        inviteCode: expect.stringMatching(/^[A-Z0-9]{6}$/),
         passwordHash: expect.any(String),
         nickname: 'Alice',
       },
