@@ -24,6 +24,7 @@ import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { feedCursorWhere } from 'src/utils/feed-cursor';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
   DEFAULT_INVITATION_LIST_LIMIT,
   InvitationDto,
@@ -153,6 +154,10 @@ export class CircleInvitationService {
       // 策略快照与 PATCH /circle/:id 串行化:成员锁两边不相交,不加这把的话
       // 收严返回成功之后,一个读到旧策略的建单仍会提交。
       await this.memberLock.lockPolicy(tx, circleId);
+      // Serializable isolation alone does not guarantee a retry for one
+      // read/write anti-dependency. Share the relationship/privacy lock used
+      // by block, unfriend and privacy writes before rechecking authorization.
+      await lockUserRelationshipState(tx, [inviterId, applicantId]);
 
       const [inviterMembership, lockedMembership, circlePolicy] =
         await Promise.all([
@@ -193,11 +198,9 @@ export class CircleInvitationService {
       // 探针 —— 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分,
       // 「不泄露」就成了空话。
       //
-      // 读放在事务内而不是预检:本事务是 Serializable,这次读会与并发的
-      // 「拉黑」写形成 rw 冲突,SSI 判定后其中一方 40001 回滚并重试(见
-      // runSerializableTransaction 的 P2034 重试)—— 拿不到「读完才拉黑、
-      // 却仍然入圈」这种交叉。比再引一把 call-user:* advisory 锁更省:那要
-      // 把好友模块的锁序引进圈子模块,多一处跨模块的死锁面。
+      // 读仍放在事务内；上面的共享 user lock 会与并发拉黑/解除好友严格
+      // 串行。仅靠 Serializable 不够：单个 rw 反依赖不一定形成 SSI 危险结构，
+      // 事务仍可能按「邀请在先、拉黑在后」的顺序一起提交。
       const blocked = await tx.block.findFirst({
         where: {
           OR: [
@@ -271,10 +274,8 @@ export class CircleInvitationService {
       // 只把 groupInvitePermission 从 EVERYONE/FRIENDS_ONLY 改成 NONE ——
       // 那样锁外那个 true 照样过期,而一票圈会当场把人放进来。
       //
-      // 读用 tx 而不是 this.prisma:本事务是 Serializable,事务内的这次读会与
-      // 并发的隐私设置写形成 rw 冲突,SSI 判定后一方 40001 回滚重试(见
-      // runSerializableTransaction 的 P2034 重试)。读在事务外的话拿不到这层
-      // 保护,再怎么复核也只是把窗口缩小。
+      // 读用 tx 而不是 this.prisma：共享 user lock 与这次复核必须属于同一
+      // 事务，才能一直持有到邀请提交；否则仍只是缩小竞态窗口。
       const stillAllowed =
         await this.privacySettings.canBeInvitedToGroupOrCircle(
           applicantId,
@@ -499,6 +500,10 @@ export class CircleInvitationService {
       }
       await this.memberLock.lock(tx, application.circleID, [
         callerId,
+        verifierId,
+      ]);
+      await lockUserRelationshipState(tx, [
+        application.applicantID,
         verifierId,
       ]);
 
@@ -909,6 +914,10 @@ export class CircleInvitationService {
       // PENDING —— 本仓既没有撤销验证人的接口、PENDING 担保单也不会过期,
       // 申请人既补不上人也永远凑不满票,只能等管理员 admin-approve 兜底。
       if (approve) {
+        await lockUserRelationshipState(tx, [
+          application.applicantID,
+          verifierId,
+        ]);
         const verifierMembership = await tx.circleMember.findUnique({
           where: {
             userID_circleID: {

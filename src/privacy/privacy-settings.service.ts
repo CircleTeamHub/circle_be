@@ -2,6 +2,7 @@ import { Prisma } from 'src/generated/prisma';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
   MOMENTS_VISIBILITY_OPTIONS,
   PERMISSION_OPTIONS,
@@ -44,9 +45,8 @@ export class PrivacySettingsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * `client` 默认走 this.prisma。需要与一次写入串行的调用方(建担保单)必须传
-   * 事务客户端:读在事务外的话拿不到 Serializable 的保护,「读到允许 → 对方改
-   * 成 NONE → 仍然入圈」这种交叉就拦不住。
+   * `client` 默认走 this.prisma。需要与一次授权判定串行的调用方必须在共享
+   * user lock 的同一事务内传入事务客户端，确保锁一直持有到动作提交。
    */
   async getSettings(
     userId: string,
@@ -100,10 +100,17 @@ export class PrivacySettingsService {
   ): Promise<PrivacySettingsDto> {
     this.assertValid(input);
     const update = this.compactUpdate(input);
-    const saved = await this.prisma.userPrivacySetting.upsert({
-      where: { userID: userId },
-      create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
-      update,
+    const saved = await this.prisma.$transaction(async (tx) => {
+      // Call creation, circle admission, friend removal and blocking all make
+      // authorization decisions under this same per-user lock. Without it a
+      // stricter privacy setting can return success while a concurrent action
+      // still commits from an older snapshot.
+      await lockUserRelationshipState(tx, [userId]);
+      return tx.userPrivacySetting.upsert({
+        where: { userID: userId },
+        create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
+        update,
+      });
     });
     return this.toDto(saved as StoredPrivacySettings);
   }
