@@ -201,6 +201,8 @@ export interface ChatConversationDto {
   circleId: string | null;
   /** GROUP 会话的圈子展示信息(名称/头像即群名/群头像);其余类型为 null。 */
   circle: { id: string; name: string; avatarUrl: string | null } | null;
+  /** TEMP 会话的稳定房间信息;其余类型为 null。 */
+  tempChat: { id: string; title: string } | null;
   lastMessage: ChatMessageDto | null;
   unreadCount: number;
   pinned: boolean;

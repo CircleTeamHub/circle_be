@@ -34,6 +34,7 @@ describe('ChatService', () => {
       updateMany: jest.fn(),
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
+    tempChat: { findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
     chatMessageReaction: {
@@ -142,6 +143,7 @@ describe('ChatService', () => {
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
     prisma.circle.findMany.mockResolvedValue([]);
+    prisma.tempChat.findMany.mockResolvedValue([]);
     prisma.tempChatGuest.findMany.mockResolvedValue([]);
     // 默认返回发号计数器行(G-05 行锁读)。列表类集合查询($queryRaw 复用同一 mock)
     // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
@@ -196,6 +198,38 @@ describe('ChatService', () => {
     expect(args.where.AND).toBeUndefined();
     // 隐私设置压根不该被查 —— 访客 id 不对应任何 User。
     expect(privacySettings.getSettings).not.toHaveBeenCalled();
+  });
+
+  describe('getNoteCardNoteId', () => {
+    it('returns a note pointer only from a visible card in the same conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValueOnce({
+        content: { noteId: 'note-1' },
+      });
+
+      await expect(
+        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
+      ).resolves.toBe('note-1');
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'msg-1',
+          conversationID: 'conv-1',
+          type: 'note-card',
+          deleted: false,
+          revokedAt: null,
+        },
+        select: { content: true },
+      });
+    });
+
+    it('does not resolve a missing, revoked, or malformed card', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValueOnce({ content: {} });
+
+      await expect(
+        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
+      ).rejects.toThrow(NotFoundException);
+    });
   });
 
   // 事务已提交,之后的富化只是装饰。抛出去的话 handleSend 既不广播也不推送,
@@ -266,20 +300,26 @@ describe('ChatService', () => {
 
     // 分享类卡片只是指针(收件人点开会自己取真值),伪造顶多是条无效链接,
     // 不该被这条收口误伤。
-    it.each(['text', 'image', 'note-card', 'friend-card', 'plaza-post-card'])(
-      'still accepts %s from clients',
-      (type) => {
-        expect(() =>
-          service.validateSendPayload('u1', {
-            conversationId: 'conv-1',
-            type,
-            d: 'client-1',
-            content:
-              type === 'image' ? { key: 'chat/u1/a.jpg' } : { text: 'hi' },
-          } as never),
-        ).not.toThrow();
-      },
-    );
+    it.each([
+      'text',
+      'image',
+      'video',
+      'note-card',
+      'friend-card',
+      'plaza-post-card',
+    ])('still accepts %s from clients', (type) => {
+      expect(() =>
+        service.validateSendPayload('u1', {
+          conversationId: 'conv-1',
+          type,
+          d: 'client-1',
+          content:
+            type === 'image' || type === 'video'
+              ? { key: `chat/u1/a.${type === 'video' ? 'mp4' : 'jpg'}` }
+              : { text: 'hi' },
+        } as never),
+      ).not.toThrow();
+    });
   });
 
   describe('sendMessage', () => {
@@ -1417,8 +1457,45 @@ describe('ChatService', () => {
         id: 'conv-1',
         type: 'DIRECT',
         peer: { id: 'u2' },
+        tempChat: null,
         unreadCount: 2,
         lastMessage: { id: 'msg-1' },
+      });
+    });
+
+    it('returns the stable room title for TEMP conversations', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        {
+          ...membership(),
+          conversationID: 'conv-temp',
+          conversation: {
+            id: 'conv-temp',
+            type: 'TEMP',
+            directKey: null,
+            circleID: null,
+            tempChatID: 'tc-1',
+            burnDurationSec: null,
+            lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+          },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+      prisma.tempChat.findMany.mockResolvedValue([
+        { id: 'tc-1', title: '周末临时群' },
+      ]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0]).toMatchObject({
+        id: 'conv-temp',
+        type: 'TEMP',
+        peer: null,
+        circle: null,
+        tempChat: { id: 'tc-1', title: '周末临时群' },
+      });
+      expect(prisma.tempChat.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['tc-1'] } },
+        select: { id: true, title: true },
       });
     });
 

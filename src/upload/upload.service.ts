@@ -300,9 +300,15 @@ export class UploadService implements OnModuleInit {
 
     // `split('.').pop()` returns the whole string when there is no dot, so
     // gate on an actual extension and fall back to `bin`.
-    const ext = filename.includes('.')
-      ? filename.split('.').pop() || 'bin'
-      : 'bin';
+    //
+    // 扩展名会原样拼进 object key 和 `fileUrl`(裸字符串拼接,不做 URL 编码),
+    // 所以这里必须自己收口,不能依赖调用方 DTO 的 filename 正则:访客那份为了
+    // 放行 Unicode 文件名已经放宽到「只禁路径分隔符与控制字符」,`a.mp4?x=y`
+    // 这种名字会造出带 `?`/`#` 的 key,让签名 URL 与公开 URL 的解析全部错位。
+    const rawExt = filename.includes('.')
+      ? (filename.split('.').pop() ?? '')
+      : '';
+    const ext = rawExt.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
     // Include userId in the path so the note service can enforce per-user
     // media ownership at write time without trusting the client-supplied key.
     const key = userId

@@ -13,6 +13,8 @@ import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from 'src/chat/chat-broadcast.service';
 import { ChatService } from 'src/chat/chat.service';
+import { NoteService } from 'src/note/note.service';
+import type { NoteDetailDto } from 'src/note/dto/note.dto';
 import {
   LinkTokenService,
   type GuestChatTokenPayload,
@@ -91,6 +93,7 @@ export class TempChatService {
     private readonly config: ConfigService,
     private readonly chatBroadcast: ChatBroadcastService,
     private readonly chatService: ChatService,
+    private readonly noteService: NoteService,
   ) {}
 
   async create(
@@ -113,7 +116,7 @@ export class TempChatService {
     const groupId = newGroupId();
     const { row, conversationId } = await this.prisma.$transaction(
       async (tx) => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
         const active = await tx.tempChat.count({
           where: { hostUserId, endedAt: null, expiresAt: { gt: new Date() } },
         });
@@ -341,6 +344,18 @@ export class TempChatService {
       avatarUrl: member.avatarUrl,
       isHost: member.userId === room?.hostUserId,
     }));
+  }
+
+  async getGuestNote(
+    guest: GuestChatTokenPayload,
+    messageId: string,
+  ): Promise<NoteDetailDto> {
+    const noteId = await this.chatService.getNoteCardNoteId(
+      guest.guestId,
+      guest.conversationId,
+      messageId,
+    );
+    return this.noteService.getSharedNoteForGuest(noteId);
   }
 
   async end(hostUserId: string, id: string): Promise<{ status: string }> {

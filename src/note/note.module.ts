@@ -10,5 +10,6 @@ import { NoteShareLinkCleanup } from './note-share-link.cleanup';
   imports: [UploadModule, MembershipPolicyModule],
   controllers: [NoteController, NoteShareLinkPublicController],
   providers: [NoteService, NoteShareLinkCleanup],
+  exports: [NoteService],
 })
 export class NoteModule {}

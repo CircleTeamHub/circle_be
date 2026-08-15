@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { ChatModule } from 'src/chat/chat.module';
+import { NoteModule } from 'src/note/note.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { LinkTokenService } from './link-token.service';
 import { TempChatCleanup } from './temp-chat.cleanup';
@@ -13,6 +14,7 @@ import { TempChatUploadQuota } from './temp-chat-upload-quota';
 @Module({
   imports: [
     ChatModule,
+    NoteModule,
     UploadModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

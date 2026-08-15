@@ -89,7 +89,7 @@ describe('ChatMediaService', () => {
     });
   });
 
-  it('signs image key + thumbKey and voice key onto the dto content', async () => {
+  it('signs image, video, and voice object keys onto the dto content', async () => {
     const image = dto({
       type: 'image',
       content: { key: 'chat/a.jpg', thumbKey: 'chat/a-thumb.jpg', width: 100 },
@@ -99,8 +99,13 @@ describe('ChatMediaService', () => {
       type: 'voice',
       content: { key: 'chat/b.m4a', duration: 3 },
     });
+    const video = dto({
+      id: 'm3',
+      type: 'video',
+      content: { key: 'chat/c.mp4', duration: 8 },
+    });
 
-    await service.attachMediaUrls([image, voice]);
+    await service.attachMediaUrls([image, voice, video]);
 
     expect(image.content).toMatchObject({
       key: 'chat/a.jpg',
@@ -109,6 +114,7 @@ describe('ChatMediaService', () => {
       width: 100,
     });
     expect(voice.content).toMatchObject({ url: 'https://signed/chat/b.m4a' });
+    expect(video.content).toMatchObject({ url: 'https://signed/chat/c.mp4' });
   });
 
   it('signs each distinct key once across a page of messages', async () => {

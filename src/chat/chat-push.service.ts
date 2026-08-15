@@ -249,6 +249,8 @@ export class ChatPushService {
       }
       case 'image':
         return '[图片]';
+      case 'video':
+        return '[视频]';
       case 'voice':
         return '[语音]';
       case 'file':

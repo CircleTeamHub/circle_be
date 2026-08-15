@@ -1933,6 +1933,31 @@ export class NoteService {
     return this.mapDetailResolved(note, ownerID);
   }
 
+  /**
+   * 已由聊天层证明「请求者持有包含这张卡片的会话」后读取详情。
+   * 笔记主人仍可随时通过 available=false 或删除让旧卡片失效。
+   */
+  async getSharedNoteForGuest(noteId: string): Promise<NoteDetailDto> {
+    const note = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        available: true,
+      },
+      include: NOTE_INCLUDE,
+    });
+
+    if (!note) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+
+    // 固定访客 viewer：不可编辑，也不会带出主人私有的 collectedFrom 定位信息。
+    return this.mapDetailResolved(note, SHARE_LINK_GUEST_VIEWER);
+  }
+
   private buildCollectedFrom(
     source: NoteCollectSourceDto,
     note: Pick<NoteRow, 'id' | 'ownerID'>,

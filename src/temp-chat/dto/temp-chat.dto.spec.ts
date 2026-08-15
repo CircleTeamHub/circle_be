@@ -1,6 +1,7 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { CreateTempChatDto } from './create-temp-chat.dto';
+import { GuestPresignDto, GUEST_VIDEO_MAX_BYTES } from './guest-presign.dto';
 import { JoinTempChatDto } from './join-temp-chat.dto';
 
 const errKeys = (obj: unknown, cls: any) =>
@@ -45,5 +46,66 @@ describe('JoinTempChatDto', () => {
     expect(errKeys({ displayName: 'x'.repeat(21) }, JoinTempChatDto)).toContain(
       'displayName',
     );
+  });
+});
+
+describe('GuestPresignDto', () => {
+  const valid = {
+    filename: 'photo.jpg',
+    contentType: 'image/jpeg',
+    sizeBytes: 1024,
+  };
+
+  it('accepts a safe Unicode filename', () => {
+    expect(
+      errKeys({ ...valid, filename: '测试图片.png' }, GuestPresignDto),
+    ).toEqual([]);
+  });
+
+  it.each([
+    '../photo.png',
+    'folder/photo.png',
+    'folder\\photo.png',
+    'bad\u0000.png',
+  ])('rejects a path-like or control-character filename: %s', (filename) => {
+    expect(errKeys({ ...valid, filename }, GuestPresignDto)).toContain(
+      'filename',
+    );
+  });
+
+  it('rejects unsupported image MIME types', () => {
+    expect(
+      errKeys({ ...valid, contentType: 'image/avif' }, GuestPresignDto),
+    ).toContain('contentType');
+  });
+
+  it.each(['video/mp4', 'video/quicktime', 'video/x-m4v'])(
+    'accepts supported guest video MIME type %s',
+    (contentType) => {
+      expect(
+        errKeys(
+          {
+            filename:
+              contentType === 'video/quicktime' ? 'clip.mov' : 'clip.mp4',
+            contentType,
+            sizeBytes: GUEST_VIDEO_MAX_BYTES,
+          },
+          GuestPresignDto,
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it('rejects a guest video above the 50MB limit', () => {
+    expect(
+      errKeys(
+        {
+          filename: 'clip.mp4',
+          contentType: 'video/mp4',
+          sizeBytes: GUEST_VIDEO_MAX_BYTES + 1,
+        },
+        GuestPresignDto,
+      ),
+    ).toContain('sizeBytes');
   });
 });

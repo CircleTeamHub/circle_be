@@ -303,6 +303,44 @@ describe('UploadService', () => {
     });
   });
 
+  // 访客那份 filename 正则为了放行 Unicode 名称,只禁路径分隔符与控制字符 ——
+  // `?`/`#`/空格照样能进来。扩展名会裸拼进 object key 与 fileUrl,不在这里收口
+  // 就会造出解析错位的 URL。
+  it('sanitizes the filename extension before it reaches the object key', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'http://localhost:9000',
+          MINIO_ACCESS_KEY: 'minioadmin',
+          MINIO_SECRET_KEY: 'minioadmin123',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'https://api.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).ready = true;
+
+    const hostile = await service.presign(
+      '\u6d4b\u8bd5 clip.mp4?x=1#frag',
+      'video/mp4',
+      1024,
+      'chat',
+      'guest-1',
+    );
+    expect(hostile.key).toMatch(/^chat\/guest-1\/[0-9a-f-]{36}\.mp4x1frag$/);
+    expect(hostile.fileUrl).toBe(
+      `https://api.example.com/circle/${hostile.key}`,
+    );
+
+    const noExtension = await service.presign(
+      '\u6d4b\u8bd5',
+      'image/jpeg',
+      1024,
+      'chat',
+      'guest-1',
+    );
+    expect(noExtension.key).toMatch(/^chat\/guest-1\/[0-9a-f-]{36}\.bin$/);
+  });
+
   it('rejects oversized images before signing', async () => {
     const callsBefore = jest.mocked(getSignedUrl).mock.calls.length;
     const service = new UploadService({

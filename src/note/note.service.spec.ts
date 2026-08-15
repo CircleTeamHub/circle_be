@@ -1179,6 +1179,54 @@ describe('NoteService', () => {
     });
   });
 
+  it('returns an available shared note to an authorized chat guest without private metadata', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-shared',
+      ownerID: 'user-1',
+      title: '群里分享的笔记',
+      content: '完整正文',
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      collectedFrom: { conversationID: 'owner-private-location' },
+      groupMemberships: [],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getSharedNoteForGuest('note-shared');
+
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-shared',
+          status: { not: 'DELETED' },
+          available: true,
+        },
+      }),
+    );
+    expect(result).toMatchObject({
+      id: 'note-shared',
+      canEdit: false,
+      collectedFrom: null,
+    });
+  });
+
+  it('does not expose an unavailable or deleted shared note to a guest', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(service.getSharedNoteForGuest('note-private')).rejects.toThrow(
+      NotFoundException,
+    );
+  });
+
   it('rejects reading a deleted or unavailable note owned by someone else', async () => {
     prisma.note.findFirst.mockResolvedValueOnce(null);
 
