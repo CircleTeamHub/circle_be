@@ -299,6 +299,33 @@ describe('ChatGateway', () => {
       expect(handlersAtLookup).toBeGreaterThan(0);
     });
 
+    it('registers and queues event handlers before awaiting global presence registration', async () => {
+      const socket = fakeSocket();
+      let finishRegistration!: (count: number | null) => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockResolvedValue(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const earlyHandler = socket.handlers.get('chat:send');
+      expect(earlyHandler).toBeDefined();
+
+      earlyHandler?.({ conversationId: 'conv-1' }, jest.fn());
+      expect(handleSend).not.toHaveBeenCalled();
+
+      finishRegistration(null);
+      await pending;
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(1);
+      handleSend.mockRestore();
+    });
+
     it('confines a guest socket to its own room and skips the membership lookup', async () => {
       const socket = fakeSocket({
         data: { userId: 'g1', guestConversationId: 'conv-9' },

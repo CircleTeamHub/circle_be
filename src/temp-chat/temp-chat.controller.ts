@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   HttpCode,
@@ -6,6 +7,7 @@ import {
   Get,
   NotFoundException,
   Param,
+  ParseUUIDPipe,
   Post,
   Query,
   Req,
@@ -20,7 +22,10 @@ import { ChatService } from 'src/chat/chat.service';
 import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
 import { UploadService } from 'src/upload/upload.service';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
-import { GuestPresignDto } from './dto/guest-presign.dto';
+import {
+  GuestPresignDto,
+  GUEST_IMAGE_MAX_BYTES,
+} from './dto/guest-presign.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import {
   TempChatGuestGuard,
@@ -131,17 +136,33 @@ export class TempChatController {
     return this.service.listGuestMembers(req.tempChatGuest);
   }
 
-  // 访客发图:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
-  // 入参用 GuestPresignDto 而非 upload 的 PresignDto —— 后者放行 video/* 且上限
-  // 100 MiB,匿名访客不该有那种申请面。次数限流之外再走累计字节配额。
+  @Get('guest/messages/:messageId/note')
+  @UseGuards(TempChatGuestGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({ summary: '访客读取本房间笔记卡片的只读详情' })
+  guestNote(
+    @Req() req: RequestWithTempChatGuest,
+    @Param('messageId', ParseUUIDPipe) messageId: string,
+  ) {
+    return this.service.getGuestNote(req.tempChatGuest, messageId);
+  }
+
+  // 访客发图片/视频:presign 归 chat 目录,key 以 guestId 命名空间(所有权可校验)。
+  // 匿名访客使用独立的格式/单文件上限,次数限流之外再走累计字节配额。
   @Post('guest/upload-presign')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: '访客图片上传预签名' })
+  @ApiOperation({ summary: '访客聊天媒体上传预签名' })
   async guestUploadPresign(
     @Req() req: RequestWithTempChatGuest,
     @Body() dto: GuestPresignDto,
   ) {
+    if (
+      dto.contentType.startsWith('image/') &&
+      dto.sizeBytes > GUEST_IMAGE_MAX_BYTES
+    ) {
+      throw new BadRequestException('图片不能超过 10MB');
+    }
     await this.uploadQuota.consume(
       req.tempChatGuest.guestId,
       req.tempChatGuest.tcId,

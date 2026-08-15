@@ -506,27 +506,33 @@ export class ChatService {
       return this.strictestCutoff(viewerCutoff, burnCutoff);
     });
 
-    const [lastMessages, unreadCounts, peers, circles] = await Promise.all([
-      this.loadLastMessages(conversationIds, cutoffs),
-      this.loadUnreadCounts(
-        userId,
-        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
-        memberships.map((m) => ({
-          conversationID: m.conversationID,
-          lastReadHeight: Math.max(
-            m.lastReadHeight,
-            m.clearedBeforeHeight ?? 0,
-          ),
-        })),
-        cutoffs,
-      ),
-      this.loadDirectPeers(userId, directIds),
-      this.loadCircleInfos(
-        memberships
-          .map((m) => m.conversation.circleID)
-          .filter((id): id is string => id !== null),
-      ),
-    ]);
+    const [lastMessages, unreadCounts, peers, circles, tempChats] =
+      await Promise.all([
+        this.loadLastMessages(conversationIds, cutoffs),
+        this.loadUnreadCounts(
+          userId,
+          // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+          memberships.map((m) => ({
+            conversationID: m.conversationID,
+            lastReadHeight: Math.max(
+              m.lastReadHeight,
+              m.clearedBeforeHeight ?? 0,
+            ),
+          })),
+          cutoffs,
+        ),
+        this.loadDirectPeers(userId, directIds),
+        this.loadCircleInfos(
+          memberships
+            .map((m) => m.conversation.circleID)
+            .filter((id): id is string => id !== null),
+        ),
+        this.loadTempChatInfos(
+          memberships
+            .map((m) => m.conversation.tempChatID)
+            .filter((id): id is string => id !== null),
+        ),
+      ]);
 
     const senderIds = [...lastMessages.values()]
       .map((m) => m.senderID)
@@ -547,6 +553,9 @@ export class ChatService {
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
           ? (circles.get(m.conversation.circleID) ?? null)
+          : null,
+        tempChat: m.conversation.tempChatID
+          ? (tempChats.get(m.conversation.tempChatID) ?? null)
           : null,
         lastMessage: last
           ? this.toMessageDto(last, this.senderFor(last, senders))
@@ -657,7 +666,7 @@ export class ChatService {
       viewerCutoff,
       seconds ? new Date(Date.now() - seconds * 1000) : null,
     );
-    const [lastMessages, unread, peers] = await Promise.all([
+    const [lastMessages, unread, peers, tempChats] = await Promise.all([
       this.loadLastMessages([conversationId], [cutoff]),
       this.loadUnreadCounts(
         userId,
@@ -672,6 +681,9 @@ export class ChatService {
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
         : Promise.resolve(new Map<string, ChatSenderInfo>()),
+      member.conversation.tempChatID
+        ? this.loadTempChatInfos([member.conversation.tempChatID])
+        : Promise.resolve(new Map<string, { id: string; title: string }>()),
     ]);
     const rawLast = lastMessages.get(conversationId) ?? null;
     const last = rawLast && rawLast.height <= floor ? null : rawLast;
@@ -696,6 +708,9 @@ export class ChatService {
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
         ? (circles.get(member.conversation.circleID) ?? null)
+        : null,
+      tempChat: member.conversation.tempChatID
+        ? (tempChats.get(member.conversation.tempChatID) ?? null)
         : null,
       lastMessage,
       unreadCount: unread.get(conversationId) ?? 0,
@@ -1414,6 +1429,7 @@ export class ChatService {
       peer: { id: peer.id, nickname: peer.nickname, avatarUrl: peer.avatarUrl },
       circleId: null,
       circle: null,
+      tempChat: null,
       lastMessage,
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
@@ -1545,6 +1561,40 @@ export class ChatService {
       select: { leftAt: true },
     });
     return Boolean(seat && !seat.leftAt);
+  }
+
+  /**
+   * 访客打开笔记卡片前的授权解析：必须仍在本会话座位上，消息必须属于本会话、
+   * 未删除/未撤回且确实是 note-card。只返回指针，不在聊天层读取笔记正文。
+   */
+  async getNoteCardNoteId(
+    userId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<string> {
+    await this.requireMembership(conversationId, userId);
+    const row = await this.prisma.chatMessage.findFirst({
+      where: {
+        id: messageId,
+        conversationID: conversationId,
+        type: 'note-card',
+        deleted: false,
+        revokedAt: null,
+      },
+      select: { content: true },
+    });
+    const content = row?.content;
+    const noteId =
+      content && typeof content === 'object' && !Array.isArray(content)
+        ? (content as Record<string, unknown>)['noteId']
+        : undefined;
+    if (typeof noteId !== 'string' || noteId.length === 0) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    return noteId;
   }
 
   /** 成员校验:会话存在且本人在座(未退出),返回会话行供类型分支使用。 */
@@ -1874,6 +1924,19 @@ export class ChatService {
         { id: c.id, name: c.name, avatarUrl: c.avatarUrl },
       ]),
     );
+  }
+
+  /** TEMP 会话的稳定展示信息(房间名来源)。 */
+  private async loadTempChatInfos(
+    tempChatIds: string[],
+  ): Promise<Map<string, { id: string; title: string }>> {
+    const unique = [...new Set(tempChatIds)];
+    if (unique.length === 0) return new Map();
+    const rooms = await this.prisma.tempChat.findMany({
+      where: { id: { in: unique } },
+      select: { id: true, title: true },
+    });
+    return new Map(rooms.map((room) => [room.id, room]));
   }
 
   private async resolveSenders(
@@ -2599,6 +2662,7 @@ export class ChatService {
 const REPLY_PREVIEW_MAX = 40;
 const REPLY_PREVIEW_LABELS: Record<string, string> = {
   image: '[图片]',
+  video: '[视频]',
   voice: '[语音]',
   file: '[文件]',
   location: '[位置]',

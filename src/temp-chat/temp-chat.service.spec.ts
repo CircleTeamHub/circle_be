@@ -48,6 +48,10 @@ describe('TempChatService', () => {
   };
   const chatService = {
     listMembers: jest.fn().mockResolvedValue([]),
+    getNoteCardNoteId: jest.fn(),
+  };
+  const noteService = {
+    getSharedNoteForGuest: jest.fn(),
   };
 
   const service = new TempChatService(
@@ -56,6 +60,7 @@ describe('TempChatService', () => {
     config as never,
     chatBroadcast as never,
     chatService as never,
+    noteService as never,
   );
 
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
@@ -75,6 +80,27 @@ describe('TempChatService', () => {
     chatBroadcast.joinUserToConversation.mockResolvedValue(undefined);
     chatBroadcast.disconnectUser.mockResolvedValue(undefined);
     chatService.listMembers.mockResolvedValue([]);
+    chatService.getNoteCardNoteId.mockResolvedValue('note-1');
+    noteService.getSharedNoteForGuest.mockResolvedValue({ id: 'note-1' });
+  });
+
+  it('resolves a guest note through the authorized card in that conversation', async () => {
+    const guest = {
+      kind: 'temp-chat-guest' as const,
+      guestId: 'guest-1',
+      tcId: 'tc-1',
+      conversationId: 'conv-1',
+    };
+
+    await expect(service.getGuestNote(guest, 'msg-1')).resolves.toEqual({
+      id: 'note-1',
+    });
+    expect(chatService.getNoteCardNoteId).toHaveBeenCalledWith(
+      'guest-1',
+      'conv-1',
+      'msg-1',
+    );
+    expect(noteService.getSharedNoteForGuest).toHaveBeenCalledWith('note-1');
   });
 
   describe('create', () => {
@@ -100,6 +126,8 @@ describe('TempChatService', () => {
           }),
         }),
       );
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
       expect(result.conversationId).toBe('conv-1');
       expect(result.shareUrl).toBe('https://t.example/t/link-token');
       // 房主在线 socket 即刻入房。

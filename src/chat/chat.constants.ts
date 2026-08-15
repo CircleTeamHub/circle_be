@@ -65,6 +65,7 @@ export const CLIENT_MESSAGE_TYPES = [
   'text',
   'quote',
   'image',
+  'video',
   'voice',
   'file',
   'location',
@@ -91,6 +92,7 @@ export const SERVER_MESSAGE_TYPES: readonly string[] = [
 /** 携带 object key 的媒体消息类型(读路径由 ChatMediaService 补签名 URL)。 */
 export const MEDIA_MESSAGE_TYPES: readonly string[] = [
   'image',
+  'video',
   'voice',
   'file',
 ];
@@ -116,6 +118,7 @@ export const CHAT_MEDIA_KEY_FIELDS: Record<
     { key: 'key', url: 'url' },
     { key: 'thumbKey', url: 'thumbUrl' },
   ],
+  video: [{ key: 'key', url: 'url' }],
   voice: [{ key: 'key', url: 'url' }],
   file: [{ key: 'key', url: 'url' }],
 };

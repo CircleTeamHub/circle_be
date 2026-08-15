@@ -456,38 +456,10 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
-    // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
-    // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
-    // 那条活着的连接(共享标量 DECR 会)。
-    const globalCount = await this.presence.registerSocket(userId, socket.id);
-    // 这次 await 期间断开的连接,'disconnect' 监听器还没挂上(见下面那段注释:
-    // 监听器必须在业务 await 之前注册,但注册本身排在这一步之后)—— 事件就此丢失,
-    // 本实例的连接槽和跨实例在线条目都留给了一条已死的 socket。Redis 慢的时候
-    // 反复连了就断,能把用户永久标成在线(离线推送全被吞掉)并耗尽连接上限。
-    if (socket.disconnected) {
-      void this.presence.socketDisconnected(userId, socket.id);
-      this.releaseConnectionSlot(userId, socket);
-      return;
-    }
-    if (
-      globalCount !== null &&
-      globalCount > ChatGateway.MAX_SOCKETS_PER_USER
-    ) {
-      this.logger.warn(
-        `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
-      );
-      void this.presence.socketDisconnected(userId, socket.id);
-      this.releaseConnectionSlot(userId, socket);
-      socket.disconnect(true);
-      return;
-    }
-    this.metrics.observeConnectionOpened(this.connectionsByUser.size);
-    this.scheduleExpiryDisconnect(socket);
 
-    // 监听必须**同步**注册,在任何 await 之前。反过来的话,入房那几个 await
-    // 期间到达的 chat:send / chat:read 没有任何监听者 —— Socket.IO 直接丢弃
-    // 且不回 ack,客户端表现是「刚连上发的第一条消息石沉大海」,且没有任何
-    // 错误可供重试判定。处理器统一先 await ready:入房未完成时排队而不是丢。
+    // 监听必须**同步**注册,在任何 await 之前。全局 presence 注册和入房都可能被
+    // Redis/数据库拖慢；这段窗口里的首条消息要等 ready 后处理,不能被 Socket.IO
+    // 当成无人监听的事件直接丢掉。
     let resolveReady!: (ok: boolean) => void;
     const ready = new Promise<boolean>((resolve) => {
       resolveReady = resolve;
@@ -575,6 +547,32 @@ export class ChatGateway implements OnModuleDestroy {
         );
       });
     });
+
+    // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
+    // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
+    // 那条活着的连接(共享标量 DECR 会)。
+    const globalCount = await this.presence.registerSocket(userId, socket.id);
+    // presence 注册期间断开时,上面的监听器先清理一次；await 返回后再清一次,
+    // 覆盖“删除先于注册落地”的时序,避免留下跨实例在线脏数据。
+    if (socket.disconnected) {
+      void this.presence.socketDisconnected(userId, socket.id);
+      this.releaseConnectionSlot(userId, socket);
+      return;
+    }
+    if (
+      globalCount !== null &&
+      globalCount > ChatGateway.MAX_SOCKETS_PER_USER
+    ) {
+      this.logger.warn(
+        `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
+      );
+      void this.presence.socketDisconnected(userId, socket.id);
+      this.releaseConnectionSlot(userId, socket);
+      socket.disconnect(true);
+      return;
+    }
+    this.metrics.observeConnectionOpened(this.connectionsByUser.size);
+    this.scheduleExpiryDisconnect(socket);
 
     try {
       if (guestConversationId) {
