@@ -118,7 +118,12 @@ export const CHAT_MEDIA_KEY_FIELDS: Record<
     { key: 'key', url: 'url' },
     { key: 'thumbKey', url: 'thumbUrl' },
   ],
-  video: [{ key: 'key', url: 'url' }],
+  video: [
+    { key: 'key', url: 'url' },
+    // 封面帧目前没有生产者(App/访客页都不上传),但读路径必须先支持:
+    // 否则将来补上 thumbKey 的那一版,历史消息与新消息的签名行为会不一致。
+    { key: 'thumbKey', url: 'thumbUrl' },
+  ],
   voice: [{ key: 'key', url: 'url' }],
   file: [{ key: 'key', url: 'url' }],
 };

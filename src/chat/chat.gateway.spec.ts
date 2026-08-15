@@ -326,6 +326,21 @@ describe('ChatGateway', () => {
       handleSend.mockRestore();
     });
 
+    // opened/closed 是一对 Gauge inc/dec。disconnect 监听器现在同步注册,早于
+    // 全局上限那一步 —— 如果 opened 还留在 await 之后,被拒的连接就会只发 closed,
+    // chat_connections_active 一路 dec 成负数。
+    it('never emits a connection close without a matching open', async () => {
+      const socket = fakeSocket();
+      presence.registerSocket.mockResolvedValueOnce(999);
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.(undefined as never, jest.fn());
+
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(metrics.observeConnectionOpened).toHaveBeenCalledTimes(1);
+      expect(metrics.observeConnectionClosed).toHaveBeenCalledTimes(1);
+    });
+
     it('confines a guest socket to its own room and skips the membership lookup', async () => {
       const socket = fakeSocket({
         data: { userId: 'g1', guestConversationId: 'conv-9' },

@@ -21,6 +21,7 @@ import { TempChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from 'src/chat/chat.service';
 import { HistoryQueryDto } from 'src/chat/dto/history-query.dto';
 import { UploadService } from 'src/upload/upload.service';
+import { UploadErrorCode } from 'src/common/app-error-codes';
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import {
   GuestPresignDto,
@@ -157,11 +158,17 @@ export class TempChatController {
     @Req() req: RequestWithTempChatGuest,
     @Body() dto: GuestPresignDto,
   ) {
+    // 全仓错误响应统一是 {message, errorCode} 信封(all-exception.filter 依赖它,
+    // 客户端按 errorCode 本地化)。裸字符串会退化成无 code 的 message,访客页
+    // 只能原样展示服务端中文。
     if (
       dto.contentType.startsWith('image/') &&
       dto.sizeBytes > GUEST_IMAGE_MAX_BYTES
     ) {
-      throw new BadRequestException('图片不能超过 10MB');
+      throw new BadRequestException({
+        message: '图片不能超过 10MB',
+        errorCode: UploadErrorCode.PayloadTooLarge,
+      });
     }
     await this.uploadQuota.consume(
       req.tempChatGuest.guestId,

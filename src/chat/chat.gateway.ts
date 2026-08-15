@@ -456,6 +456,10 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
+    // opened 必须与 disconnect 监听器的 closed 配对,且**先于**它注册:反过来的话
+    // presence 注册期间断开、或全局上限拒绝,都会在没有 opened 的情况下触发一次
+    // closed —— chat_connections_active 这个 Gauge 会一路 dec 成负数。
+    this.metrics.observeConnectionOpened(this.connectionsByUser.size);
 
     // 监听必须**同步**注册,在任何 await 之前。全局 presence 注册和入房都可能被
     // Redis/数据库拖慢；这段窗口里的首条消息要等 ready 后处理,不能被 Socket.IO
@@ -571,7 +575,6 @@ export class ChatGateway implements OnModuleDestroy {
       socket.disconnect(true);
       return;
     }
-    this.metrics.observeConnectionOpened(this.connectionsByUser.size);
     this.scheduleExpiryDisconnect(socket);
 
     try {
