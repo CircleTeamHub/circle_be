@@ -102,12 +102,21 @@ describe('RealtimeService', () => {
   it('builds a badge snapshot keeping interaction and signup counts separate', async () => {
     prisma.friendActivity.count.mockResolvedValue(3);
     prisma.circlePostSignup.count.mockResolvedValue(4);
-    prisma.notification.count.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    // 六个 count 并发发出，按 where.type.in 分派而不是靠调用顺序。
+    prisma.notification.count.mockImplementation(({ where }: any) => {
+      const types = where.type.in as string[];
+      if (types.includes('SYSTEM')) return Promise.resolve(1);
+      if (types.includes('TRACE_LIKE'))
+        return Promise.resolve(types.includes('CIRCLE_POST_PUBLISHED') ? 2 : 1);
+      return Promise.resolve(1);
+    });
 
     await expect(service.buildSnapshot('user-1')).resolves.toEqual({
       messagesUnread: 0,
       contactsUnread: 3,
       discoverUnread: 2,
+      momentsUnread: 1,
+      circleUnread: 1,
       signupUnread: 4,
       profileUnread: 1,
       systemUnread: 1,
@@ -120,6 +129,8 @@ describe('RealtimeService', () => {
       expect.objectContaining({
         contactsUnread: 3,
         discoverUnread: 2,
+        momentsUnread: 1,
+        circleUnread: 1,
         signupUnread: 4,
         profileUnread: 1,
       }),
@@ -169,15 +180,27 @@ describe('RealtimeService', () => {
     expect(prisma.circlePostSignup.count).not.toHaveBeenCalled();
   });
 
-  it('broadcastInteractionUnread emits the interaction-message unread count', async () => {
+  it('broadcastInteractionUnread emits total plus per-bell unread counts', async () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
-    prisma.notification.count.mockResolvedValue(5);
+    prisma.notification.count.mockImplementation(({ where }: any) => {
+      const types = where.type.in as string[];
+      if (types.includes('TRACE_LIKE'))
+        return Promise.resolve(types.includes('CIRCLE_POST_PUBLISHED') ? 5 : 2);
+      return Promise.resolve(3);
+    });
 
     await service.broadcastInteractionUnread('user-1');
 
+    // 两个铃铛各自读 momentsUnread / circleUnread；count 仍是互动域总数，
+    // 老客户端照旧只认它。
     expect(broadcast).toHaveBeenCalledWith('user-1', {
       type: 'interaction.unread.changed',
-      payload: { count: 5, changedAt: expect.any(String) },
+      payload: {
+        count: 5,
+        momentsUnread: 2,
+        circleUnread: 3,
+        changedAt: expect.any(String),
+      },
     });
   });
 
