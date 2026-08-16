@@ -26,12 +26,14 @@ import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
+  CopyNoteChatMediaDto,
   CreateNoteDto,
   CreateNoteExportDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  NoteChatMediaImportDto,
   RecycleBinQueryDto,
   NoteDetailDto,
   NoteExportResultDto,
@@ -40,6 +42,7 @@ import {
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
+  SetNoteRemarkDto,
   SetNoteStatusDto,
   SetPinnedDto,
   UpdateNoteDto,
@@ -124,6 +127,17 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setPinned(req.user.userId, id, dto.pinned);
+  }
+
+  @Patch(':id/remark')
+  @ApiOperation({ summary: 'Set owner-only note remark' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', remark: '重要客户' } } })
+  setRemark(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteRemarkDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setRemark(req.user.userId, id, dto.remark ?? null);
   }
 
   @Patch(':id/available')
@@ -252,6 +266,27 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteExportResultDto> {
     return this.noteService.createNoteExport(req.user.userId, id, dto);
+  }
+
+  // 把笔记指定分区的媒体复制进请求者 chat/{userId}/ 命名空间(供聊天发送)。
+  // 限流对齐 exports:都是「读笔记 → 批量对象存储操作」的重接口。
+  @Post(':id/chat-media')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Copy note media into my chat namespace for sending',
+  })
+  @ApiOkResponse({ type: NoteChatMediaImportDto })
+  copyNoteChatMedia(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CopyNoteChatMediaDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteChatMediaImportDto> {
+    return this.noteService.copyNoteMediaForChat(
+      req.user.userId,
+      id,
+      dto.sections,
+    );
   }
 
   @Post('group')

@@ -2,10 +2,12 @@ import { Type } from 'class-transformer';
 import { Trim } from 'src/decorators/trim.decorator';
 import {
   ArrayMaxSize,
+  ArrayNotEmpty,
   IsArray,
   IsBoolean,
   IsDefined,
   IsEnum,
+  IsIn,
   IsInt,
   IsNotEmpty,
   IsNumber,
@@ -258,6 +260,17 @@ export class SetPinnedDto {
   pinned: boolean;
 }
 
+/** 备注长度上限 —— FE 输入框 maxLength 与此对齐 */
+export const NOTE_REMARK_MAX_LENGTH = 200;
+
+export class SetNoteRemarkDto {
+  @ApiPropertyOptional({ nullable: true, maxLength: NOTE_REMARK_MAX_LENGTH })
+  @IsOptional()
+  @IsString()
+  @MaxLength(NOTE_REMARK_MAX_LENGTH)
+  remark?: string | null;
+}
+
 export class SetNoteAvailableDto {
   @ApiProperty()
   @IsBoolean()
@@ -472,6 +485,11 @@ export class NoteSummaryDto {
   @ApiProperty({ enum: NOTE_STATUS }) status: NoteStatus;
   @ApiProperty() available: boolean;
   @ApiProperty() pinned: boolean;
+  @ApiPropertyOptional({
+    nullable: true,
+    description: '仅笔记主人可见的私人备注；他人视角恒为 null',
+  })
+  remark: string | null;
   @ApiProperty({ type: [Object] }) groups: { id: string; name: string }[];
   @ApiPropertyOptional() cover: {
     id: string;
@@ -613,4 +631,38 @@ export class NoteExportResultDto {
   @ApiProperty() mimeType: string;
   @ApiPropertyOptional() size: number | null;
   @ApiPropertyOptional() expiresAt: Date | null;
+}
+
+export const NOTE_CHAT_MEDIA_SECTION = ['media', 'showcase'] as const;
+export type NoteChatMediaSection = (typeof NOTE_CHAT_MEDIA_SECTION)[number];
+
+export class CopyNoteChatMediaDto {
+  @ApiProperty({
+    enum: NOTE_CHAT_MEDIA_SECTION,
+    isArray: true,
+    description: 'Which note sections to copy media from.',
+  })
+  @IsArray()
+  @ArrayNotEmpty()
+  @ArrayMaxSize(NOTE_CHAT_MEDIA_SECTION.length)
+  @IsIn(NOTE_CHAT_MEDIA_SECTION, { each: true })
+  sections: NoteChatMediaSection[];
+}
+
+export class NoteChatMediaItemDto {
+  @ApiProperty() id: string;
+  @ApiProperty({ enum: NOTE_CHAT_MEDIA_SECTION }) section: NoteChatMediaSection;
+  @ApiProperty({ enum: NOTE_MEDIA_TYPE }) type: NoteMediaType;
+  /** 已复制进请求者 chat/{userId}/ 命名空间的新 object key。 */
+  @ApiProperty() key: string;
+  @ApiPropertyOptional() width: number | null;
+  @ApiPropertyOptional() height: number | null;
+  @ApiPropertyOptional() durationMs: number | null;
+  @ApiPropertyOptional() size: number | null;
+  @ApiPropertyOptional() mimeType: string | null;
+}
+
+export class NoteChatMediaImportDto {
+  @ApiProperty({ type: [NoteChatMediaItemDto] })
+  items: NoteChatMediaItemDto[];
 }

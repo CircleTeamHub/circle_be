@@ -13,6 +13,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  CopyObjectCommand,
   CreateBucketCommand,
   DeleteObjectCommand,
   HeadBucketCommand,
@@ -471,6 +472,54 @@ export class UploadService implements OnModuleInit {
       size: input.body.byteLength,
       expiresAt: ttl ? new Date(Date.now() + ttl * 1000) : null,
     };
+  }
+
+  /**
+   * 桶内服务端拷贝(S3 CopyObject)：不经业务进程搬字节。
+   * 「把笔记媒体转发进聊天」用它把 notes/{owner}/ 对象复制成
+   * chat/{sender}/ 下的新对象 —— 聊天发送校验只认发送者自己的命名空间,
+   * 且两侧生命周期独立(删笔记不影响聊天消息,撤回聊天不影响笔记)。
+   * 来源 key 的读取授权由调用方负责,这里只做搬运。
+   */
+  async copyObjectToKey(sourceKey: string, destKey: string): Promise<void> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+
+    const command = new CopyObjectCommand({
+      Bucket: this.bucket,
+      // CopySource 要求 URL 编码(键里出现空格/非 ASCII 时不编码会签名不匹配)。
+      CopySource: `${this.bucket}/${sourceKey
+        .split('/')
+        .map(encodeURIComponent)
+        .join('/')}`,
+      Key: destKey,
+    });
+
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
+    try {
+      await this.client.send(command);
+    } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'minio',
+        operation: 'copy_object',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'minio',
+        operation: 'copy_object',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
+    }
   }
 
   async createPresignedGetUrl(

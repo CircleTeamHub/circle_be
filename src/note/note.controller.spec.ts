@@ -6,6 +6,7 @@ describe('NoteController', () => {
     createNoteExport: jest.fn(),
     revokeShareLink: jest.fn(),
     listShareLinks: jest.fn(),
+    setRemark: jest.fn(),
   };
   const req = {
     user: { userId: 'user-1' },
@@ -122,5 +123,27 @@ describe('NoteController', () => {
       cursor: '11111111-1111-4111-8111-111111111111',
     });
     expect(result).toEqual(links);
+  });
+
+  it('patches note remark with the JWT identity and normalizes absent input to null', async () => {
+    noteService.setRemark.mockResolvedValue({ id: 'note-1', remark: '客户' });
+    const controller = new NoteController(noteService as any);
+
+    await controller.setRemark('note-1', { remark: '客户' } as any, req);
+    // remark 字段缺省（body 为 {}）等价于清空 —— controller 归一成 null 再进 service。
+    await controller.setRemark('note-1', {} as any, req);
+
+    expect(noteService.setRemark).toHaveBeenNthCalledWith(
+      1,
+      'user-1',
+      'note-1',
+      '客户',
+    );
+    expect(noteService.setRemark).toHaveBeenNthCalledWith(
+      2,
+      'user-1',
+      'note-1',
+      null,
+    );
   });
 });

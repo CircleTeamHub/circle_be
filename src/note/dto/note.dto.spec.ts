@@ -6,7 +6,9 @@ import {
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
+  NOTE_REMARK_MAX_LENGTH,
   ReorderNoteGroupsDto,
+  SetNoteRemarkDto,
   UpdateNoteGroupDto,
 } from './note.dto';
 
@@ -113,6 +115,25 @@ describe('CreateNoteDto', () => {
     expect(
       validateSync(invalidDto).some((error) => error.property === 'groupIds'),
     ).toBe(true);
+  });
+});
+
+describe('SetNoteRemarkDto', () => {
+  it('accepts a remark, explicit null (clear), and absent field', () => {
+    for (const body of [{ remark: '重要客户' }, { remark: null }, {}]) {
+      const errors = validateSync(plainToInstance(SetNoteRemarkDto, body));
+      expect(errors).toHaveLength(0);
+    }
+  });
+
+  it('rejects remarks above the length cap and non-string payloads', () => {
+    for (const body of [
+      { remark: 'a'.repeat(NOTE_REMARK_MAX_LENGTH + 1) },
+      { remark: 123 },
+    ]) {
+      const errors = validateSync(plainToInstance(SetNoteRemarkDto, body));
+      expect(errors.some((error) => error.property === 'remark')).toBe(true);
+    }
   });
 });
 

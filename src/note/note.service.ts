@@ -16,6 +16,7 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { UploadService } from 'src/upload/upload.service';
+import { CHAT_MEDIA_KEY_PREFIX } from 'src/chat/chat.constants';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import {
   prismaErrorCode,
@@ -30,6 +31,10 @@ import {
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  NOTE_CHAT_MEDIA_SECTION,
+  NoteChatMediaImportDto,
+  NoteChatMediaItemDto,
+  NoteChatMediaSection,
   NoteCollectSourceDto,
   NoteDetailDto,
   NoteExportResultDto,
@@ -120,6 +125,7 @@ type NoteRow = {
   status: NoteStatus;
   available: boolean;
   pinned: boolean;
+  remark?: string | null;
   imageCount: number;
   videoCount: number;
   mediaCount: number;
@@ -1306,6 +1312,8 @@ export class NoteService {
       status: note.status,
       available: note.available,
       pinned: note.pinned,
+      // 备注与来源名片同属笔记主人的私人标注，绝不随分享/访客视图外发。
+      remark: note.ownerID === viewerID ? (note.remark ?? null) : null,
       groups,
       cover: coverMedia
         ? {
@@ -1934,6 +1942,92 @@ export class NoteService {
   }
 
   /**
+   * 把笔记指定分区的媒体复制进请求者的 chat/{userId}/ 命名空间,供其作为
+   * 图片/视频消息发送。聊天发送校验只认发送者自己的 key(防「借聊天读路径
+   * 给他人私有对象无限续签」),所以转发笔记媒体必须真实拷贝而不是引用。
+   *
+   * 读取授权与 getNote 完全一致(自己的笔记,或 available=true 的笔记)。
+   * sections JSON 里的 item 只有 objectKey 能对回本笔记 media 行时才算数 ——
+   * 行在写入侧做过属主/豁免校验,挡住把外部 key 冻进 JSON 借拷贝洗白的路。
+   * 拷贝出的对象生命周期归聊天侧:撤回/焚毁按消息 key 删,与笔记原件互不影响。
+   */
+  async copyNoteMediaForChat(
+    viewerID: string,
+    noteId: string,
+    sections: NoteChatMediaSection[],
+  ): Promise<NoteChatMediaImportDto> {
+    const uploadService = this.uploadService;
+    if (!uploadService) {
+      throw new ServiceUnavailableException(
+        'Chat media copy is not configured',
+      );
+    }
+
+    const note = await this.prisma.note.findFirst({
+      where: {
+        id: noteId,
+        status: { not: 'DELETED' },
+        OR: [{ ownerID: viewerID }, { available: true }],
+      },
+      include: NOTE_INCLUDE,
+    });
+    if (!note) {
+      throw new NotFoundException({
+        message: 'Note not found',
+        errorCode: NoteErrorCode.NotFound,
+      });
+    }
+
+    const rowByKey = new Map<string, NoteMediaRow>();
+    for (const row of note.media ?? []) rowByKey.set(row.objectKey, row);
+
+    // buildSectionsFromRow 统一 legacy 语义(没有显式 sections 的老笔记:
+    // media=全部行、showcase=图片行),这里不重复发明第二套回退。
+    const resolved = this.buildSectionsFromRow(note as NoteRow);
+    const requested = NOTE_CHAT_MEDIA_SECTION.filter((section) =>
+      sections.includes(section),
+    );
+    const targets: Array<{
+      row: NoteMediaRow;
+      section: NoteChatMediaSection;
+    }> = [];
+    const seen = new Set<string>();
+    for (const section of requested) {
+      for (const item of resolved[section].items) {
+        const objectKey = this.isRecord(item) ? item.objectKey : null;
+        if (typeof objectKey !== 'string') continue;
+        const row = rowByKey.get(objectKey);
+        if (!row || seen.has(objectKey)) continue;
+        seen.add(objectKey);
+        targets.push({ row, section });
+      }
+    }
+
+    const items: NoteChatMediaItemDto[] = await Promise.all(
+      targets.map(async ({ row, section }) => {
+        const ext = /\.([A-Za-z0-9]{1,8})$/.exec(row.objectKey)?.[1];
+        const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${randomUUID()}${
+          ext ? `.${ext.toLowerCase()}` : ''
+        }`;
+        await uploadService.copyObjectToKey(row.objectKey, destKey);
+        return {
+          id: row.id,
+          section,
+          type: row.type,
+          key: destKey,
+          width: row.width ?? null,
+          height: row.height ?? null,
+          durationMs: row.durationMs ?? null,
+          size: row.size ?? null,
+          mimeType: row.mimeType ?? null,
+        };
+      }),
+    );
+
+    return { items };
+  }
+
+  /**
    * 已由聊天层证明「请求者持有包含这张卡片的会话」后读取详情。
    * 笔记主人仍可随时通过 available=false 或删除让旧卡片失效。
    */
@@ -2496,6 +2590,20 @@ export class NoteService {
       select: {
         id: true,
         pinned: true,
+      },
+    });
+  }
+
+  async setRemark(ownerID: string, noteId: string, remark: string | null) {
+    await this.requireOwnedNote(ownerID, noteId);
+    const trimmed = remark?.trim() ?? '';
+    // Include ownerID + status guard in the write to close the TOCTOU window.
+    return this.prisma.note.update({
+      where: { id: noteId, ownerID, status: { not: 'DELETED' } },
+      data: { remark: trimmed.length > 0 ? trimmed : null },
+      select: {
+        id: true,
+        remark: true,
       },
     });
   }

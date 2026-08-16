@@ -3,6 +3,7 @@ import {
   BadRequestException,
   ConflictException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { mkdtempSync, writeFileSync } from 'fs';
@@ -71,6 +72,7 @@ describe('NoteService', () => {
     uploadBuffer: jest.fn(),
     downloadObjectBuffer: jest.fn(),
     createPresignedGetUrl: jest.fn(),
+    copyObjectToKey: jest.fn(),
     // 反推 object key（真 UploadService 的行为）：从本站直链 .../circle/<key>[?...] 取 <key>。
     objectKeyFromPublicUrl: jest.fn((url: unknown) =>
       typeof url === 'string'
@@ -3580,6 +3582,327 @@ describe('NoteService', () => {
       ).rejects.toBeInstanceOf(BadRequestException);
 
       expect(prisma.note.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('copyNoteMediaForChat', () => {
+    const mediaRow = (over: Record<string, unknown> = {}) => ({
+      id: 'media-1',
+      type: 'IMAGE',
+      objectKey: 'notes/owner-1/a.jpg',
+      url: 'https://cdn.example.com/circle/notes/owner-1/a.jpg',
+      mimeType: 'image/jpeg',
+      size: 100,
+      width: 800,
+      height: 600,
+      durationMs: null,
+      posterUrl: null,
+      sortOrder: 0,
+      ...over,
+    });
+
+    const noteRow = (over: Record<string, unknown> = {}) => ({
+      id: 'note-1',
+      ownerID: 'owner-1',
+      title: 't',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      groupMemberships: [],
+      collectedFrom: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      media: [mediaRow()],
+      ...over,
+    });
+
+    beforeEach(() => {
+      // 顶层是 clearAllMocks(不清 Once 队列),先把本组要用的 mock 彻底重置,
+      // 免得别的测试没消费完的 mockResolvedValueOnce 漏进来。
+      prisma.note.findFirst.mockReset();
+      uploadService.copyObjectToKey.mockReset();
+      uploadService.copyObjectToKey.mockResolvedValue(undefined);
+    });
+
+    it('copies media-section objects into the viewer chat namespace', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
+      const [source, dest] = uploadService.copyObjectToKey.mock.calls[0];
+      expect(source).toBe('notes/owner-1/a.jpg');
+      expect(dest).toMatch(/^chat\/owner-1\/note-import\/[0-9a-f-]{36}\.jpg$/);
+
+      expect(result.items).toEqual([
+        {
+          id: 'media-1',
+          section: 'media',
+          type: 'IMAGE',
+          key: dest,
+          width: 800,
+          height: 600,
+          durationMs: null,
+          size: 100,
+          mimeType: 'image/jpeg',
+        },
+      ]);
+    });
+
+    it('scopes the lookup to readable notes (own or available)', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
+
+      expect(prisma.note.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: 'note-1',
+            status: { not: 'DELETED' },
+            OR: [{ ownerID: 'viewer-2' }, { available: true }],
+          }),
+        }),
+      );
+      const [, dest] = uploadService.copyObjectToKey.mock.calls[0];
+      expect(dest.startsWith('chat/viewer-2/note-import/')).toBe(true);
+    });
+
+    it('throws NotFound when the note is invisible to the viewer', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
+    });
+
+    it('copies only the requested sections', async () => {
+      const rowA = mediaRow();
+      const rowB = mediaRow({
+        id: 'media-2',
+        objectKey: 'notes/owner-1/b.jpg',
+        url: 'https://cdn.example.com/circle/notes/owner-1/b.jpg',
+        sortOrder: 1,
+      });
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [rowA, rowB],
+          sections: {
+            media: { items: [{ objectKey: rowA.objectKey }] },
+            showcase: { items: [{ objectKey: rowB.objectKey }] },
+          },
+        }),
+      );
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'showcase',
+      ]);
+
+      expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
+      expect(uploadService.copyObjectToKey.mock.calls[0][0]).toBe(
+        'notes/owner-1/b.jpg',
+      );
+      expect(result.items.map((item) => item.section)).toEqual(['showcase']);
+      expect(result.items[0].id).toBe('media-2');
+    });
+
+    it('dedupes an object that sits in both requested sections', async () => {
+      const rowA = mediaRow();
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          sections: {
+            media: { items: [{ objectKey: rowA.objectKey }] },
+            showcase: { items: [{ objectKey: rowA.objectKey }] },
+          },
+        }),
+      );
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+        'showcase',
+      ]);
+
+      expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].section).toBe('media');
+    });
+
+    it('skips section items whose objectKey is not a media row of this note', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          sections: {
+            media: {
+              items: [
+                { objectKey: 'notes/someone-else/foreign.jpg' },
+                { objectKey: 'notes/owner-1/a.jpg' },
+              ],
+            },
+          },
+        }),
+      );
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
+      expect(uploadService.copyObjectToKey.mock.calls[0][0]).toBe(
+        'notes/owner-1/a.jpg',
+      );
+      expect(result.items).toHaveLength(1);
+    });
+
+    it('legacy note without sections: showcase falls back to image rows only', async () => {
+      const image = mediaRow();
+      const video = mediaRow({
+        id: 'media-2',
+        type: 'VIDEO',
+        objectKey: 'notes/owner-1/v.mp4',
+        url: 'https://cdn.example.com/circle/notes/owner-1/v.mp4',
+        mimeType: 'video/mp4',
+        durationMs: 12000,
+        sortOrder: 1,
+      });
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({ media: [image, video], sections: null }),
+      );
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'showcase',
+      ]);
+
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].id).toBe('media-1');
+    });
+
+    it('video items carry duration/size metadata and keep their extension', async () => {
+      const video = mediaRow({
+        id: 'media-2',
+        type: 'VIDEO',
+        objectKey: 'notes/owner-1/v.mp4',
+        url: 'https://cdn.example.com/circle/notes/owner-1/v.mp4',
+        mimeType: 'video/mp4',
+        durationMs: 12000,
+        size: 5000,
+      });
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow({ media: [video] }));
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(result.items[0]).toMatchObject({
+        type: 'VIDEO',
+        durationMs: 12000,
+        size: 5000,
+      });
+      expect(result.items[0].key).toMatch(/\.mp4$/);
+    });
+
+    it('rejects with 503 when storage is not configured', async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          NoteService,
+          MembershipPolicyService,
+          { provide: MembershipProgramService, useValue: membershipProgram },
+          { provide: PrismaService, useValue: prisma },
+          { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        ],
+      }).compile();
+      const bare = module.get<NoteService>(NoteService);
+
+      await expect(
+        bare.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  describe('note remark', () => {
+    const remarkNoteRow = (over: Record<string, unknown> = {}) => ({
+      id: 'note-1',
+      ownerID: 'owner-1',
+      title: 't',
+      content: null,
+      contentJson: null,
+      sections: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      remark: '重要客户',
+      groupMemberships: [],
+      collectedFrom: null,
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      media: [],
+      ...over,
+    });
+
+    beforeEach(() => {
+      // 同 copyNoteMediaForChat:顶层 clearAllMocks 不清 Once 队列,先重置。
+      prisma.note.findFirst.mockReset();
+      prisma.note.update.mockReset();
+    });
+
+    it('setRemark trims and stores the value with a TOCTOU-guarded write', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(remarkNoteRow());
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        remark: '重要客户',
+      });
+
+      const result = await service.setRemark('owner-1', 'note-1', ' 重要客户 ');
+
+      expect(prisma.note.update).toHaveBeenCalledWith({
+        where: { id: 'note-1', ownerID: 'owner-1', status: { not: 'DELETED' } },
+        data: { remark: '重要客户' },
+        select: { id: true, remark: true },
+      });
+      expect(result).toEqual({ id: 'note-1', remark: '重要客户' });
+    });
+
+    it('setRemark stores null for empty/whitespace/cleared input', async () => {
+      prisma.note.findFirst.mockResolvedValue(remarkNoteRow());
+      prisma.note.update.mockResolvedValue({ id: 'note-1', remark: null });
+
+      await service.setRemark('owner-1', 'note-1', '   ');
+      await service.setRemark('owner-1', 'note-1', null);
+
+      for (const call of prisma.note.update.mock.calls.slice(-2)) {
+        expect(call[0].data).toEqual({ remark: null });
+      }
+    });
+
+    it('setRemark rejects notes the caller does not own', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(null);
+
+      await expect(
+        service.setRemark('intruder', 'note-1', 'x'),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      expect(prisma.note.update).not.toHaveBeenCalled();
+    });
+
+    it('remark is visible to the owner and blanked for other viewers', async () => {
+      prisma.note.findFirst
+        .mockResolvedValueOnce(remarkNoteRow())
+        .mockResolvedValueOnce(remarkNoteRow());
+
+      const own = await service.getNote('owner-1', 'note-1');
+      const foreign = await service.getNote('viewer-2', 'note-1');
+
+      expect(own.remark).toBe('重要客户');
+      expect(foreign.remark).toBeNull();
     });
   });
 
