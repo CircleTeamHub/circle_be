@@ -269,10 +269,12 @@ export class NoteController {
   }
 
   // 把笔记指定分区的媒体复制进请求者 chat/{userId}/ 命名空间(供聊天发送)。
-  // 限流对齐 exports:都是「读笔记 → 批量对象存储操作」的重接口。
+  // 限流:客户端批量上限一次 9 条笔记(每条一个请求),10/min 会让同一分钟内的
+  // 第二批/重试必然 429、媒体静默丢失 —— 放到 20/min,配合服务内的复制并发上限
+  // (NOTE_CHAT_MEDIA_COPY_CONCURRENCY)兜住对象存储压力。
   @Post(':id/chat-media')
   @UseGuards(ThrottlerGuard)
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({
     summary: 'Copy note media into my chat namespace for sending',
   })

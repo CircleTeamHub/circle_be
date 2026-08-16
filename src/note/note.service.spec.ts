@@ -3807,6 +3807,82 @@ describe('NoteService', () => {
       expect(result.items[0].key).toMatch(/\.mp4$/);
     });
 
+    it('skips a failed copy but returns the successes (no all-or-nothing 500)', async () => {
+      const rowA = mediaRow();
+      const rowB = mediaRow({
+        id: 'media-2',
+        objectKey: 'notes/owner-1/b.jpg',
+        url: 'https://cdn.example.com/circle/notes/owner-1/b.jpg',
+        sortOrder: 1,
+      });
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: [rowA, rowB],
+          sections: {
+            media: {
+              items: [
+                { objectKey: rowA.objectKey },
+                { objectKey: rowB.objectKey },
+              ],
+            },
+          },
+        }),
+      );
+      uploadService.copyObjectToKey
+        .mockRejectedValueOnce(new Error('transient minio error'))
+        .mockResolvedValueOnce(undefined);
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].id).toBe('media-2');
+    });
+
+    it('throws the first error when every copy fails', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      uploadService.copyObjectToKey.mockRejectedValue(new Error('minio down'));
+
+      await expect(
+        service.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+      ).rejects.toThrow('minio down');
+    });
+
+    it('bounds copy concurrency instead of fanning out all objects at once', async () => {
+      const rows = Array.from({ length: 12 }, (_, index) =>
+        mediaRow({
+          id: `media-${index}`,
+          objectKey: `notes/owner-1/${index}.jpg`,
+          url: `https://cdn.example.com/circle/notes/owner-1/${index}.jpg`,
+          sortOrder: index,
+        }),
+      );
+      prisma.note.findFirst.mockResolvedValueOnce(
+        noteRow({
+          media: rows,
+          sections: {
+            media: { items: rows.map((row) => ({ objectKey: row.objectKey })) },
+          },
+        }),
+      );
+      let inFlight = 0;
+      let peak = 0;
+      uploadService.copyObjectToKey.mockImplementation(async () => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setImmediate(resolve));
+        inFlight -= 1;
+      });
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(result.items).toHaveLength(12);
+      expect(peak).toBeLessThanOrEqual(5);
+    });
+
     it('rejects with 503 when storage is not configured', async () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [

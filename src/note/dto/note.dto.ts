@@ -267,6 +267,9 @@ export class SetNoteRemarkDto {
   @ApiPropertyOptional({ nullable: true, maxLength: NOTE_REMARK_MAX_LENGTH })
   @IsOptional()
   @IsString()
+  // @Trim 让 @MaxLength 量 trim 后的长度：两端带空白的 200 字合法备注不被误拒。
+  // 服务层仍会 trim→null 归一(空白串=清除),这里只是把校验口径对齐。
+  @Trim()
   @MaxLength(NOTE_REMARK_MAX_LENGTH)
   remark?: string | null;
 }

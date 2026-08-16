@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
   Optional,
   ServiceUnavailableException,
@@ -207,6 +208,8 @@ const NOTE_EXPORT_TTL_SECONDS = 15 * 60;
 // URL，客户端(expo-image)按-URL 缓存才命中；TTL = 窗口 + buffer，保证窗口内始终有效。
 const NOTE_MEDIA_URL_WINDOW_MS = 60 * 60 * 1000; // 1h
 const NOTE_MEDIA_URL_TTL_SECONDS = 2 * 60 * 60; // 2h
+/** 单请求内 S3 CopyObject 的并发上限（转发笔记媒体进聊天时）。 */
+const NOTE_CHAT_MEDIA_COPY_CONCURRENCY = 5;
 const MAX_EXPORT_MEDIA_ITEMS = 50;
 const MAX_EXPORT_SINGLE_MEDIA_BYTES = 8 * 1024 * 1024;
 const MAX_EXPORT_TOTAL_MEDIA_BYTES = 16 * 1024 * 1024;
@@ -356,6 +359,7 @@ function escapeXml(value: string) {
 
 @Injectable()
 export class NoteService {
+  private readonly logger = new Logger(NoteService.name);
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -1945,6 +1949,7 @@ export class NoteService {
    * 把笔记指定分区的媒体复制进请求者的 chat/{userId}/ 命名空间,供其作为
    * 图片/视频消息发送。聊天发送校验只认发送者自己的 key(防「借聊天读路径
    * 给他人私有对象无限续签」),所以转发笔记媒体必须真实拷贝而不是引用。
+   * 单请求最多 ~100 个对象(两个分区各 50 上限),复制按下方常量限并发。
    *
    * 读取授权与 getNote 完全一致(自己的笔记,或 available=true 的笔记)。
    * sections JSON 里的 item 只有 objectKey 能对回本笔记 media 行时才算数 ——
@@ -2003,26 +2008,63 @@ export class NoteService {
       }
     }
 
-    const items: NoteChatMediaItemDto[] = await Promise.all(
-      targets.map(async ({ row, section }) => {
-        const ext = /\.([A-Za-z0-9]{1,8})$/.exec(row.objectKey)?.[1];
-        const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${randomUUID()}${
-          ext ? `.${ext.toLowerCase()}` : ''
-        }`;
-        await uploadService.copyObjectToKey(row.objectKey, destKey);
-        return {
-          id: row.id,
-          section,
-          type: row.type,
-          key: destKey,
-          width: row.width ?? null,
-          height: row.height ?? null,
-          durationMs: row.durationMs ?? null,
-          size: row.size ?? null,
-          mimeType: row.mimeType ?? null,
-        };
-      }),
-    );
+    // 有界并发 + 单条失败不拖垮整批:一条笔记最多 media+showcase 各 50 个对象,
+    // 无界 Promise.all 会对 MinIO 一口气开百连接;而任一条 CopyObject 失败若让
+    // 整个请求 500,已复制成功的兄弟对象会变成永远无消息引用的孤儿(StorageAudit
+    // 只报告不删),客户端重试还会再铸一批新 key 的孤儿。所以逐块复制、单条失败
+    // 跳过该条(成功的照常返回并被发送引用);全军覆没才把首个错误抛出去。
+    const items: NoteChatMediaItemDto[] = [];
+    let firstCopyError: unknown = null;
+    for (
+      let start = 0;
+      start < targets.length;
+      start += NOTE_CHAT_MEDIA_COPY_CONCURRENCY
+    ) {
+      const chunk = targets.slice(
+        start,
+        start + NOTE_CHAT_MEDIA_COPY_CONCURRENCY,
+      );
+      const copied = await Promise.all(
+        chunk.map(async ({ row, section }) => {
+          const ext = /\.([A-Za-z0-9]{1,8})$/.exec(row.objectKey)?.[1];
+          const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${randomUUID()}${
+            ext ? `.${ext.toLowerCase()}` : ''
+          }`;
+          try {
+            await uploadService.copyObjectToKey(row.objectKey, destKey);
+          } catch (error) {
+            firstCopyError ??= error;
+            this.logger.warn(
+              `note chat-media copy failed note=${noteId} media=${row.id}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return null;
+          }
+          return {
+            id: row.id,
+            section,
+            type: row.type,
+            key: destKey,
+            width: row.width ?? null,
+            height: row.height ?? null,
+            durationMs: row.durationMs ?? null,
+            size: row.size ?? null,
+            mimeType: row.mimeType ?? null,
+          };
+        }),
+      );
+      for (const item of copied) {
+        if (item) items.push(item);
+      }
+    }
+
+    if (targets.length > 0 && items.length === 0) {
+      // 一条都没复制成功:大概率存储整体不可用,把真实原因抛给统一异常层。
+      throw firstCopyError instanceof Error
+        ? firstCopyError
+        : new ServiceUnavailableException('Chat media copy failed');
+    }
 
     return { items };
   }
