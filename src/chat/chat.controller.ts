@@ -19,6 +19,11 @@ import { ChatService } from './chat.service';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
+import {
+  CreateGroupConversationDto,
+  InviteGroupMembersDto,
+  RenameGroupConversationDto,
+} from './dto/group-conversation.dto';
 import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
 import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
@@ -76,6 +81,62 @@ export class ChatController {
     return this.chatService.getOrCreateCircleConversation(
       req.user.userId,
       body.circleId,
+    );
+  }
+
+  @Post('conversations/group')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '创建独立群聊(不挂圈子;初始成员必须是好友)' })
+  createGroupConversation(
+    @Req() req: RequestWithUser,
+    @Body() body: CreateGroupConversationDto,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.createGroupConversation(req.user.userId, {
+      name: body.name ?? null,
+      memberIds: body.memberIds,
+    });
+  }
+
+  @Post('conversations/:id/members')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '独立群聊:成员拉自己的好友进群' })
+  inviteGroupMembers(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: InviteGroupMembersDto,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.inviteToGroupConversation(
+      req.user.userId,
+      conversationId,
+      body.memberIds,
+    );
+  }
+
+  @Post('conversations/:id/leave')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '独立群聊:退出群聊(群主退群自动转移)' })
+  leaveGroupConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<void> {
+    return this.chatService.leaveGroupConversation(
+      req.user.userId,
+      conversationId,
+    );
+  }
+
+  @Patch('conversations/:id/name')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '独立群聊:改群名(任一在座成员)' })
+  renameGroupConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: RenameGroupConversationDto,
+  ): Promise<ChatConversationDto> {
+    return this.chatService.renameGroupConversation(
+      req.user.userId,
+      conversationId,
+      body.name,
     );
   }
 

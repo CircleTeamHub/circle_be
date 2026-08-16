@@ -1922,8 +1922,14 @@ model ChatConversation {
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
   directKey  String?              @unique
   /// GROUP 会话 ←→ Circle.id（一圈一群）；TEMP 会话 ←→ TempChat.id。
+  /// circleID 为 null 的 GROUP = 独立群聊（微信群语义，成员即 ChatMember）。
   circleID   String?              @unique
   tempChatID String?              @unique
+  /// 独立群聊的群名（可空 = 客户端按成员昵称兜底）；圈子群名走 Circle.name。
+  name       String?
+  /// 独立群聊的群主（建群人；退群时转给最早入群的在座成员）。不建 User 外键，
+  /// 同 ChatMessage.senderID 先例：聊天行不随账号删除级联。
+  ownerID    String?
   /// 会话列表排序依据；发送事务内更新。
   lastMessageAt DateTime?
   /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。

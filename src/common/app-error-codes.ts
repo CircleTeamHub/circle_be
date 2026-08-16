@@ -328,6 +328,11 @@ export const ChatErrorCode = {
   RevokeForbidden: 'CHAT_REVOKE_FORBIDDEN',
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
+  // 独立群聊(不挂圈子的 GROUP):建群/邀请只能选好友;圈子群的成员由圈子管理,
+  // 独立群专属操作(邀请/退群/改名)打到圈子群上要显式拒绝而不是静默生效。
+  GroupFriendsOnly: 'CHAT_GROUP_FRIENDS_ONLY',
+  GroupMinMembers: 'CHAT_GROUP_MIN_MEMBERS',
+  GroupCircleManaged: 'CHAT_GROUP_CIRCLE_MANAGED',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
