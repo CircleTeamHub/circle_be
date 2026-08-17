@@ -26,6 +26,7 @@ import {
   TraceErrorCode,
   UploadErrorCode,
   UserErrorCode,
+  QrErrorCode,
 } from './app-error-codes';
 
 // These codes are a stable contract shared with the frontend i18n map
@@ -63,6 +64,7 @@ describe('app error code catalog', () => {
     PrivacyErrorCode,
     SupportErrorCode,
     UserErrorCode,
+    QrErrorCode,
   } as const;
 
   const allEntries = Object.entries(groups).flatMap(([group, codes]) =>
