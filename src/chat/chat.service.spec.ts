@@ -64,6 +64,7 @@ describe('ChatService', () => {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
     emitRevoke: jest.fn(),
     emitRead: jest.fn(),
+    emitHistoryCleared: jest.fn(),
   };
   const systemMessage = {
     emit: jest.fn().mockResolvedValue(undefined),
@@ -2113,7 +2114,7 @@ describe('ChatService', () => {
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
         where: {
           conversationID: 'conv-1',
-          userID: 'u1',
+          userID: { in: ['u1'] },
           clearedBeforeHeight: { lt: 42 },
         },
         data: { clearedBeforeHeight: 42 },
@@ -2122,7 +2123,7 @@ describe('ChatService', () => {
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
         where: {
           conversationID: 'conv-1',
-          userID: 'u1',
+          userID: { in: ['u1'] },
           lastReadHeight: { lt: 42 },
         },
         data: { lastReadHeight: 42 },
@@ -2138,6 +2139,74 @@ describe('ChatService', () => {
       const result = await service.clearHistory('u1', 'conv-1');
       expect(result.clearedBeforeHeight).toBe(0);
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('advances both active members and broadcasts a direct-chat clear', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+
+      await service.clearHistory('u1', 'conv-1', true);
+
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['u1', 'u2'] },
+          clearedBeforeHeight: { lt: 42 },
+        },
+        data: { clearedBeforeHeight: 42 },
+      });
+      expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        clearedBeforeHeight: 42,
+        clearedBy: 'u1',
+      });
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps direct-chat clearing personal unless explicitly requested', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.clearHistory('u1', 'conv-1');
+
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['u1'] },
+          clearedBeforeHeight: { lt: 42 },
+        },
+        data: { clearedBeforeHeight: 42 },
+      });
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
     });
   });
 

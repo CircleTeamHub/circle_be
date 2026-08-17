@@ -16,6 +16,7 @@ import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatService } from './chat.service';
+import { ClearHistoryDto } from './dto/clear-history.dto';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
@@ -234,13 +235,18 @@ export class ChatController {
   @Post('conversations/:id/clear')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
-    summary: '清空聊天记录(仅本人视图水位,对端与服务端数据不动)',
+    summary: '清空聊天记录(私聊可显式双方生效,群聊仅本人视图生效)',
   })
   clearHistory(
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body?: ClearHistoryDto,
   ): Promise<{ clearedBeforeHeight: number }> {
-    return this.chatService.clearHistory(req.user.userId, conversationId);
+    return this.chatService.clearHistory(
+      req.user.userId,
+      conversationId,
+      body?.forEveryone ?? false,
+    );
   }
 
   @Get('conversations/:id/messages/:messageId/readers')

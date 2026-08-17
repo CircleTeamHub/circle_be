@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -66,6 +67,10 @@ interface SendResult {
  */
 type MessageRow = Omit<ChatMessage, 'contentHistory'>;
 const MESSAGE_READ_OMIT = { contentHistory: true } as const;
+
+// 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
+// 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
+const STANDALONE_GROUP_MAX_MEMBERS = 200;
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
 
@@ -710,6 +715,78 @@ export class ChatService {
     await this.seatMembersIntoRoom(conversation.id, toJoin);
     void this.emitGroupJoinNotice(conversation.id, toJoin);
     return this.buildConversationDto(userId, conversation.id);
+  }
+
+  /**
+   * 扫码进群(独立群聊):QrService 已验过令牌,令牌即授权 —— 不要求与在座成员
+   * 是好友,群二维码本来就是递给陌生人的(微信语义)。幂等:已在座直接返回。
+   */
+  async joinStandaloneGroupViaQr(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatConversationDto> {
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationId },
+      select: { id: true, type: true, circleID: true },
+    });
+    if (
+      !conversation ||
+      conversation.type !== 'GROUP' ||
+      conversation.circleID
+    ) {
+      throw new NotFoundException({
+        message: '群聊不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const existing = await this.prisma.chatMember.findFirst({
+      where: { conversationID: conversationId, userID: userId },
+      select: { id: true, leftAt: true },
+    });
+    if (existing && existing.leftAt === null) {
+      return this.buildConversationDto(userId, conversationId);
+    }
+    await this.prisma.$transaction(async (tx) => {
+      const seated = await tx.chatMember.count({
+        where: { conversationID: conversationId, leftAt: null },
+      });
+      // 全员退光的死群,码不再开门 —— 扫进去只会得到一间没人的空房。
+      if (seated === 0) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      if (seated >= STANDALONE_GROUP_MAX_MEMBERS) {
+        throw new ConflictException({
+          message: '群聊人数已达上限',
+          errorCode: ChatErrorCode.GroupFull,
+        });
+      }
+      if (existing) {
+        // 退过群又扫码回来:复位座位并抬清空水位,退群前的历史不回放
+        // (与好友邀请路径同一语义)。
+        const top = await tx.chatMessage.aggregate({
+          where: { conversationID: conversationId, deleted: false },
+          _max: { height: true },
+        });
+        await tx.chatMember.update({
+          where: { id: existing.id },
+          data: {
+            leftAt: null,
+            joinedAt: new Date(),
+            clearedBeforeHeight: top._max.height ?? 0,
+          },
+        });
+      } else {
+        await tx.chatMember.create({
+          data: { conversationID: conversationId, userID: userId },
+        });
+      }
+    });
+    await this.seatMembersIntoRoom(conversationId, [userId]);
+    void this.emitGroupJoinNotice(conversationId, [userId]);
+    return this.buildConversationDto(userId, conversationId);
   }
 
   /** 独立群聊退群:座位置 leftAt;群主退群转给最早入群的在座成员。 */
@@ -2850,24 +2927,35 @@ export class ChatService {
   }
 
   /**
-   * G-14 清空聊天记录:per-viewer 水位,只前进不后退;对端与服务端数据不受影响
-   * (物理删除是撤回/焚毁的事)。清空即已读:lastReadHeight 同步推到同一高度。
+   * G-14 清空聊天记录:私聊推进双方成员水位,群聊仅推进发起者水位；都只前进
+   * 不后退。消息行保留用于审计/合规,但目标成员的所有设备都无法再读到旧记录。
+   * 清空即已读:lastReadHeight 同步推到同一高度。
    */
   async clearHistory(
     userId: string,
     conversationId: string,
+    forEveryone = false,
   ): Promise<{ clearedBeforeHeight: number }> {
-    await this.requireMembershipSeat(conversationId, userId);
+    const member = await this.requireMembershipSeat(conversationId, userId);
     const top = await this.prisma.chatMessage.aggregate({
       where: { conversationID: conversationId },
       _max: { height: true },
     });
     const watermark = top._max.height ?? 0;
     if (watermark <= 0) return { clearedBeforeHeight: 0 };
+    const targetUserIds =
+      forEveryone && member.conversation.type === 'DIRECT'
+        ? (
+            await this.prisma.chatMember.findMany({
+              where: { conversationID: conversationId, leftAt: null },
+              select: { userID: true },
+            })
+          ).map((target) => target.userID)
+        : [userId];
     await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
-        userID: userId,
+        userID: { in: targetUserIds },
         clearedBeforeHeight: { lt: watermark },
       },
       data: { clearedBeforeHeight: watermark },
@@ -2875,7 +2963,7 @@ export class ChatService {
     const read = await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
-        userID: userId,
+        userID: { in: targetUserIds },
         lastReadHeight: { lt: watermark },
       },
       data: { lastReadHeight: watermark },
@@ -2884,10 +2972,19 @@ export class ChatService {
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
     if (read.count > 0) {
-      this.broadcast.emitRead({
+      for (const targetUserId of targetUserIds) {
+        this.broadcast.emitRead({
+          conversationId,
+          userId: targetUserId,
+          height: watermark,
+        });
+      }
+    }
+    if (forEveryone && member.conversation.type === 'DIRECT') {
+      this.broadcast.emitHistoryCleared({
         conversationId,
-        userId,
-        height: watermark,
+        clearedBeforeHeight: watermark,
+        clearedBy: userId,
       });
     }
     return { clearedBeforeHeight: watermark };

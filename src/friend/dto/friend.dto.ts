@@ -57,6 +57,16 @@ export class SendFriendRequestDto {
   tagIds?: string[];
 
   @ApiPropertyOptional({
+    example: 'qr token issued by the target user',
+    description:
+      '扫名片码加好友时带上:服务端验真后按对方 addMeByQrCode 开关放行(可证实的发现路径,不是客户端自报)',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  qrToken?: string;
+
+  @ApiPropertyOptional({
     example: 'Met at the 2026 design conference, leads the UI team.',
     description: 'Sender-owned private description note, promoted on accept',
   })

@@ -430,6 +430,7 @@ model User {
   fancyNumberOrders                 FancyNumberOrder[]
   groupExpansionOrders              GroupExpansionOrder[]
   supportAgentRoles                 SupportAgent[]
+  qrTokensIssued                    QrToken[]                   @relation("qrTokenIssuer")
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -2047,4 +2048,28 @@ model ChatMessageReaction {
 
   @@unique([messageID, userID, emoji])
   @@index([messageID])
+}
+
+/// 二维码令牌类型:个人名片 / 独立群聊 / 圈子。
+enum QrTokenType {
+  USER
+  GROUP
+  CIRCLE
+}
+
+/// 服务端签发的二维码令牌。UUID 不是授权 —— 扫码入群/入圈的准入凭据就是这一行:
+/// token 随机不可枚举,GROUP/CIRCLE 七天过期(微信语义),USER 长效可撤销重置。
+/// 校验一律读库,不做无状态签名:过期/撤销/签发者失权都要立刻生效。
+model QrToken {
+  id        String      @id @default(uuid())
+  token     String      @unique
+  type      QrTokenType
+  targetID  String
+  issuerID  String
+  issuer    User        @relation("qrTokenIssuer", fields: [issuerID], references: [id], onDelete: Cascade)
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime    @default(now())
+
+  @@index([type, targetID, issuerID, createdAt])
 }

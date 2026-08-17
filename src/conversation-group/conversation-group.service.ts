@@ -61,7 +61,10 @@ export class ConversationGroupService {
       // 造出列不出来的第 201 个分组。
       const quotaLockKey = `conv-group:${ownerID}`;
       const created = await this.prisma.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+        // pg_advisory_xact_lock returns PostgreSQL `void`. Prisma's PG adapter
+        // cannot deserialize a raw `void` column (P2010), so cast the result to
+        // a supported scalar while keeping the same transaction-scoped lock.
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))::text`;
         const existing = await tx.conversationGroup.count({
           where: { ownerID },
         });
