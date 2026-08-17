@@ -24,6 +24,8 @@ export const CHAT_EVENTS = {
   reaction: 'chat:reaction',
   /** 双向:消息编辑(客户端带 ack;服务端广播到会话房) */
   edit: 'chat:edit',
+  /** 服务端 → 客户端:私聊任一方清空后,双方设备同步清空到该水位 */
+  historyCleared: 'chat:history_cleared',
 } as const;
 
 /** 消息编辑的时间窗(仅发送者本人;与撤回同窗)。 */

@@ -173,6 +173,7 @@ export class FriendService {
       description?: string;
       photos?: string[];
       permission?: FriendPermission;
+      qrToken?: string;
     },
   ): Promise<void> {
     if (senderId === targetId) {
@@ -210,8 +211,19 @@ export class FriendService {
       });
     }
 
+    // 扫名片码加好友:token 是目标用户让服务端签发的,验真即「本人把码递了出去」,
+    // 这是可证实的发现路径(不是客户端自报)。对方 addMeByQrCode 开着时,
+    // 陌生人消息开关与其它发现路径都不再构成拦截理由 —— 递码本身就是邀请。
+    const viaVerifiedQr = extras?.qrToken
+      ? await this.isValidUserQrToken(extras.qrToken, targetId)
+      : false;
+    const qrDoorOpen =
+      viaVerifiedQr &&
+      (await this.privacySettings.getSettings(targetId)).addMeByQrCode;
+
     const canReceiveStrangerMessage =
-      await this.privacySettings.canReceiveStrangerMessage(targetId, false);
+      qrDoorOpen ||
+      (await this.privacySettings.canReceiveStrangerMessage(targetId, false));
     if (!canReceiveStrangerMessage) {
       throw new ForbiddenException({
         message: 'This user does not allow stranger messages',
@@ -219,7 +231,9 @@ export class FriendService {
       });
     }
 
-    await this.assertDiscoverableBy(senderId, targetId);
+    if (!qrDoorOpen) {
+      await this.assertDiscoverableBy(senderId, targetId);
+    }
 
     // Enforce friend limit for the sender
     await this.assertBelowFriendLimit(senderId);
@@ -1947,11 +1961,34 @@ export class FriendService {
    *   UserService.findByExactAccountId —— 关掉之后账号搜索直接查不到人，
    *   请求根本形不成。
    * - addMeByGroup：可证实 —— 双方是否同在一个未删除的圈子且都是 ACTIVE 成员。
-   * - addMeByPhone / addMeByQrCode：这两条发现路径**在产品里还不存在**（没有手机号
-   *   搜人接口，扫码器 resolveMessageScanResult 也解析不出用户），所以它们不可能是
-   *   本次请求的来源，开着也不构成放行理由。等这两个功能落地时，各自的入口要像
+   * - addMeByQrCode：已落地 —— 扫码路径带服务端签发的 QrToken(type=USER 且
+   *   targetID 对得上),sendRequest 验真后在调用本函数**之前**就放行了(qrDoorOpen),
+   *   走不到这里;开关关着或 token 无效时,扫码请求回落到这里按其余路径判。
+   * - addMeByPhone：这条发现路径**在产品里还不存在**（没有手机号搜人接口），
+   *   不可能是本次请求的来源，开着也不构成放行理由。功能落地时,入口要像
    *   账号搜索一样自己收口。
    */
+  /**
+   * 名片码验真:必须是目标用户名下、未撤销、未过期的 USER 令牌。直接读 QrToken
+   * 表而不是引 QrService —— 避免 Friend↔Qr 模块环(QrModule 已依赖一串重模块)。
+   */
+  private async isValidUserQrToken(
+    token: string,
+    targetId: string,
+  ): Promise<boolean> {
+    const row = await this.prisma.qrToken.findUnique({
+      where: { token },
+      select: { type: true, targetID: true, revokedAt: true, expiresAt: true },
+    });
+    return (
+      row !== null &&
+      row.type === 'USER' &&
+      row.targetID === targetId &&
+      row.revokedAt === null &&
+      (row.expiresAt === null || row.expiresAt.getTime() > Date.now())
+    );
+  }
+
   private async assertDiscoverableBy(
     senderId: string,
     targetId: string,
