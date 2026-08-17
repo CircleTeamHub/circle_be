@@ -56,6 +56,39 @@ describe('NotificationController', () => {
     );
   });
 
+  it('forwards the bell domain to the notification list', async () => {
+    const notificationService = {
+      getNotifications: jest.fn().mockResolvedValue([]),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.list({ page: 2, domain: 'circle' }, {
+      user: { userId: 'user-1' },
+    } as any);
+
+    expect(notificationService.getNotifications).toHaveBeenCalledWith(
+      'user-1',
+      2,
+      'circle',
+    );
+  });
+
+  it('forwards the bell domain to mark-all-read so one bell cannot clear the other', async () => {
+    const notificationService = {
+      markAllNotificationsRead: jest.fn().mockResolvedValue({ count: 1 }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await controller.readAll({ domain: 'moments' }, {
+      user: { userId: 'user-1' },
+    } as any);
+
+    expect(notificationService.markAllNotificationsRead).toHaveBeenCalledWith(
+      'user-1',
+      'moments',
+    );
+  });
+
   it('checks notification ownership using the authenticated user and route id', async () => {
     const notificationService = {
       getNotificationOpenOwnership: jest

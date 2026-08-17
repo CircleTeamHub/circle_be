@@ -1,5 +1,9 @@
 import { Prisma, NotificationType } from 'src/generated/prisma';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  NOTIFICATION_DOMAINS,
+  type NotificationDomain,
+} from './notification.constants';
 import { Transform, Type } from 'class-transformer';
 import {
   IsIn,
@@ -22,6 +26,21 @@ export class NotificationPageQueryDto {
   @ApiPropertyOptional({ minimum: 1, maximum: 10_000, default: 1 })
   @IsOptional()
   page = 1;
+}
+
+export class NotificationListQueryDto extends NotificationPageQueryDto {
+  // 省略 domain = 全域（老客户端）。moments = 朋友圈铃铛，circle = 圈子铃铛。
+  @ApiPropertyOptional({ enum: NOTIFICATION_DOMAINS })
+  @IsIn(NOTIFICATION_DOMAINS)
+  @IsOptional()
+  domain?: NotificationDomain;
+}
+
+export class NotificationDomainQueryDto {
+  @ApiPropertyOptional({ enum: NOTIFICATION_DOMAINS })
+  @IsIn(NOTIFICATION_DOMAINS)
+  @IsOptional()
+  domain?: NotificationDomain;
 }
 
 export class PublishSystemAnnouncementDto {

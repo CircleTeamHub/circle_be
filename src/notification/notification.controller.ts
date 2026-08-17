@@ -14,7 +14,11 @@ import {
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { DeletePushTokenDto, RegisterPushTokenDto } from './notification.dto';
-import { NotificationPageQueryDto } from './notification.dto';
+import {
+  NotificationDomainQueryDto,
+  NotificationListQueryDto,
+  NotificationPageQueryDto,
+} from './notification.dto';
 import { NotificationService } from './notification.service';
 
 @ApiTags('notification')
@@ -33,11 +37,15 @@ export class NotificationController {
   }
 
   @Get('list')
-  @ApiOperation({ summary: 'Paginated interactive notification list' })
-  list(@Query() query: NotificationPageQueryDto, @Req() req: any) {
+  @ApiOperation({
+    summary:
+      'Paginated interactive notification list, optionally scoped to one bell domain',
+  })
+  list(@Query() query: NotificationListQueryDto, @Req() req: any) {
     return this.notificationService.getNotifications(
       req.user.userId,
       query.page,
+      query.domain,
     );
   }
 
@@ -53,9 +61,15 @@ export class NotificationController {
   }
 
   @Put('read-all')
-  @ApiOperation({ summary: 'Mark all interactive notifications as read' })
-  readAll(@Req() req: any) {
-    return this.notificationService.markAllNotificationsRead(req.user.userId);
+  @ApiOperation({
+    summary:
+      'Mark all interactive notifications as read, optionally within one bell domain',
+  })
+  readAll(@Query() query: NotificationDomainQueryDto, @Req() req: any) {
+    return this.notificationService.markAllNotificationsRead(
+      req.user.userId,
+      query.domain,
+    );
   }
 
   @Put('push-token')
