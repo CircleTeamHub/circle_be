@@ -26,12 +26,14 @@ import type { RequestWithUser } from 'src/auth/types';
 import {
   CollectNoteDto,
   CollectNoteResultDto,
+  CopyNoteChatMediaDto,
   CreateNoteDto,
   CreateNoteExportDto,
   CreateNoteGroupDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   ListNotesQueryDto,
+  NoteChatMediaImportDto,
   RecycleBinQueryDto,
   NoteDetailDto,
   NoteExportResultDto,
@@ -40,6 +42,7 @@ import {
   NoteSummaryDto,
   ReorderNoteGroupsDto,
   SetNoteAvailableDto,
+  SetNoteRemarkDto,
   SetNoteStatusDto,
   SetPinnedDto,
   UpdateNoteDto,
@@ -124,6 +127,17 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ) {
     return this.noteService.setPinned(req.user.userId, id, dto.pinned);
+  }
+
+  @Patch(':id/remark')
+  @ApiOperation({ summary: 'Set owner-only note remark' })
+  @ApiOkResponse({ schema: { example: { id: 'uuid', remark: '重要客户' } } })
+  setRemark(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SetNoteRemarkDto,
+    @Req() req: RequestWithUser,
+  ) {
+    return this.noteService.setRemark(req.user.userId, id, dto.remark ?? null);
   }
 
   @Patch(':id/available')
@@ -252,6 +266,29 @@ export class NoteController {
     @Req() req: RequestWithUser,
   ): Promise<NoteExportResultDto> {
     return this.noteService.createNoteExport(req.user.userId, id, dto);
+  }
+
+  // 把笔记指定分区的媒体复制进请求者 chat/{userId}/ 命名空间(供聊天发送)。
+  // 限流:客户端批量上限一次 9 条笔记(每条一个请求),10/min 会让同一分钟内的
+  // 第二批/重试必然 429、媒体静默丢失 —— 放到 20/min,配合服务内的复制并发上限
+  // (NOTE_CHAT_MEDIA_COPY_CONCURRENCY)兜住对象存储压力。
+  @Post(':id/chat-media')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: 'Copy note media into my chat namespace for sending',
+  })
+  @ApiOkResponse({ type: NoteChatMediaImportDto })
+  copyNoteChatMedia(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: CopyNoteChatMediaDto,
+    @Req() req: RequestWithUser,
+  ): Promise<NoteChatMediaImportDto> {
+    return this.noteService.copyNoteMediaForChat(
+      req.user.userId,
+      id,
+      dto.sections,
+    );
   }
 
   @Post('group')
