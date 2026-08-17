@@ -89,7 +89,8 @@ describe('QrService', () => {
       const dto = await service.issueToken('u1', 'GROUP', 'conv-1');
 
       expect(dto.expiresAt).not.toBeNull();
-      const remaining = new Date(dto.expiresAt as string).getTime() - Date.now();
+      const remaining =
+        new Date(dto.expiresAt as string).getTime() - Date.now();
       expect(remaining).toBeGreaterThan(6.9 * 24 * 3600 * 1000);
       expect(remaining).toBeLessThanOrEqual(7 * 24 * 3600 * 1000);
     });

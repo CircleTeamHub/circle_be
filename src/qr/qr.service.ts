@@ -130,7 +130,11 @@ export class QrService {
           where: { conversationID: row.targetID, leftAt: null },
         }),
         this.prisma.chatMember.findFirst({
-          where: { conversationID: row.targetID, userID: viewerId, leftAt: null },
+          where: {
+            conversationID: row.targetID,
+            userID: viewerId,
+            leftAt: null,
+          },
           select: { id: true },
         }),
       ]);
@@ -188,7 +192,11 @@ export class QrService {
         viewerId,
         row.targetID,
       );
-      return { type: 'GROUP', conversationId: conversation.id, status: 'JOINED' };
+      return {
+        type: 'GROUP',
+        conversationId: conversation.id,
+        status: 'JOINED',
+      };
     }
 
     // 圈子:签发人立场的邀请。快照语义(requiredVerifierCount=1 且签发人可担保)
@@ -201,7 +209,8 @@ export class QrService {
       { applicantConsented: true },
     );
     const joined =
-      invitation.status === 'APPROVED' || invitation.status === 'ADMIN_APPROVED';
+      invitation.status === 'APPROVED' ||
+      invitation.status === 'ADMIN_APPROVED';
     return {
       type: 'CIRCLE',
       circleId: row.targetID,
