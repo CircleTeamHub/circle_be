@@ -27,7 +27,6 @@ import {
   TraceErrorCode,
   UploadErrorCode,
   UserErrorCode,
-  QrErrorCode,
 } from './app-error-codes';
 
 // These codes are a stable contract shared with the frontend i18n map
