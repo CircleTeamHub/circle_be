@@ -14,6 +14,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   CreateBucketCommand,
+  CopyObjectCommand,
   DeleteObjectCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
@@ -388,6 +389,31 @@ export class UploadService implements OnModuleInit {
     if (!this.enabled) return;
     await this.client.send(
       new DeleteObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+  }
+
+  /** 服务端内部复制私有对象；不签发 URL，也不改变桶的公开策略。 */
+  async copyObjectByKey(
+    sourceKey: string,
+    destinationKey: string,
+  ): Promise<void> {
+    if (!this.enabled) {
+      throw new ServiceUnavailableException('File upload is not configured');
+    }
+    if (!(await this.ensureReady())) {
+      throw new ServiceUnavailableException(
+        'File upload is temporarily unavailable',
+      );
+    }
+    const copySource = [this.bucket, ...sourceKey.split('/')]
+      .map((part) => encodeURIComponent(part))
+      .join('/');
+    await this.client.send(
+      new CopyObjectCommand({
+        Bucket: this.bucket,
+        Key: destinationKey,
+        CopySource: copySource,
+      }),
     );
   }
 

@@ -1,4 +1,10 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+} from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
 import { CHAT_MEDIA_KEY_FIELDS, CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
@@ -71,6 +77,58 @@ export class ChatMediaService implements OnModuleDestroy {
       } catch (error) {
         await this.enqueueDeletion(key, error);
       }
+    }
+  }
+
+  /**
+   * 转发媒体时复制对象到转发者自己的命名空间。源 key 只从已通过消息可见性
+   * 校验的数据库行读取；展示 URL 会被移除，目标消息只持久化新 key。
+   */
+  async copyForForward(
+    type: string,
+    sourceContent: Record<string, unknown>,
+    userId: string,
+  ): Promise<{ content: Record<string, unknown>; copiedKeys: string[] }> {
+    const fields = CHAT_MEDIA_KEY_FIELDS[type];
+    if (!fields) {
+      throw new BadRequestException('Only media messages can be forwarded');
+    }
+
+    const content = { ...sourceContent };
+    delete content['url'];
+    delete content['thumbUrl'];
+    delete content['localUri'];
+    const copiedKeys: string[] = [];
+    try {
+      for (const field of fields) {
+        const sourceKey = sourceContent[field.key];
+        if (sourceKey === undefined && field.key !== 'key') continue;
+        if (
+          typeof sourceKey !== 'string' ||
+          !sourceKey.startsWith(CHAT_MEDIA_KEY_PREFIX) ||
+          sourceKey.includes('://') ||
+          sourceKey.includes('..')
+        ) {
+          throw new BadRequestException('Invalid source media object key');
+        }
+        const fileName = sourceKey.split('/').pop() ?? '';
+        const rawExtension = fileName.includes('.')
+          ? (fileName.split('.').pop() ?? '')
+          : '';
+        const extension =
+          rawExtension.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
+        const destinationKey = `${CHAT_MEDIA_KEY_PREFIX}${userId}/${randomUUID()}.${extension}`;
+        await this.uploadService.copyObjectByKey(sourceKey, destinationKey);
+        copiedKeys.push(destinationKey);
+        content[field.key] = destinationKey;
+      }
+      if (copiedKeys.length === 0) {
+        throw new BadRequestException('Source media is missing its object key');
+      }
+      return { content, copiedKeys };
+    } catch (error) {
+      if (copiedKeys.length > 0) await this.deleteObjects(copiedKeys);
+      throw error;
     }
   }
 

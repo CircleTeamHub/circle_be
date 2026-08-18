@@ -509,6 +509,36 @@ describe('UploadService', () => {
     expect(service.objectKeyFromPublicUrl(undefined)).toBeNull();
   });
 
+  it('copies a private object without exposing a new public URL', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: privateMinioUrl,
+          MINIO_ACCESS_KEY: 'ak',
+          MINIO_SECRET_KEY: 'sk',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: privateMinioUrl,
+        })[key],
+    } as never);
+    (service as any).enabled = true;
+    (service as any).ready = true;
+    (service as any).client = { send };
+
+    await service.copyObjectByKey(
+      'chat/u2/source image.jpg',
+      'chat/u1/copied.jpg',
+    );
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].constructor.name).toBe('CopyObjectCommand');
+    expect(send.mock.calls[0][0].input).toEqual({
+      Bucket: 'circle',
+      Key: 'chat/u1/copied.jpg',
+      CopySource: 'circle/chat/u2/source%20image.jpg',
+    });
+  });
+
   // 自研聊天接受 voice / file 消息,并要求它们带 chat/{userId}/ 的 object key ——
   // 而唯一能签出这种 key 的 presign 此前只放行 image/video:这两个"已支持"的
   // 消息类型在拿到上传授权之前就被拒了,实际根本发不出去。
