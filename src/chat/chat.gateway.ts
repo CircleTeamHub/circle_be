@@ -483,7 +483,21 @@ export class ChatGateway implements OnModuleDestroy {
       try {
         while (admissionState === 'ready' && preReadyQueue.length > 0) {
           const run = preReadyQueue.shift();
-          if (run) await run();
+          if (!run) continue;
+          // 单条排队事件失败不能带走整条队列。让它抛出去会中止 drain,而
+          // admissionState 仍是 ready —— 之后的新事件直接走即时分支,没人再回来
+          // 排空剩下的积压:那些消息既不执行也不回 ack,在客户端看就是凭空消失。
+          // 各 handler 内部已各自回过错误 ack,这里只兜住漏到外面的 rejection
+          // (限流器的 tryAcquire 就在各自的 try 之外)。
+          try {
+            await run();
+          } catch (error) {
+            this.logger.warn(
+              `pre-ready event failed for user ${userId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
         }
       } finally {
         drainingPreReadyQueue = false;

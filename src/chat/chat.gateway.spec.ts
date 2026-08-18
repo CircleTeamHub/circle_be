@@ -403,6 +403,40 @@ describe('ChatGateway', () => {
       handleSend.mockRestore();
     });
 
+    // 串行 drain 的代价是共享失败面:一条排队事件把 rejection 漏出来就会中止
+    // 整个循环,而 admissionState 仍是 ready —— 没人再回来排空剩下的积压,那些
+    // 消息既不执行也不回 ack。限流器的 tryAcquire 就在各 handler 的 try 之外,
+    // Redis 抖一下就能触发。
+    it('keeps draining the pre-ready queue after one event rejects', async () => {
+      const socket = fakeSocket();
+      let finishRegistration!: (count: number | null) => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockRejectedValueOnce(new Error('rate limiter unavailable'))
+        .mockResolvedValueOnce(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const earlyHandler = socket.handlers.get('chat:send');
+      earlyHandler?.({ conversationId: 'conv-first' }, jest.fn());
+      earlyHandler?.({ conversationId: 'conv-second' }, jest.fn());
+
+      finishRegistration(null);
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(handleSend).toHaveBeenCalledTimes(2);
+      expect(handleSend.mock.calls[1][2]).toEqual(
+        expect.objectContaining({ conversationId: 'conv-second' }),
+      );
+      handleSend.mockRestore();
+    });
+
     // opened/closed 是一对 Gauge inc/dec。disconnect 监听器现在同步注册,早于
     // 全局上限那一步 —— 如果 opened 还留在 await 之后,被拒的连接就会只发 closed,
     // chat_connections_active 一路 dec 成负数。
