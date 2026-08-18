@@ -257,6 +257,11 @@ export class ChatService {
           type: source.type,
           content: copied.content,
           d: payload.d,
+          // 被源消息接管的只有 type/content;引用是本次发送自己的意图,
+          // 漏掉它等于静默丢掉客户端明确发上来的 replyToId。
+          ...(payload.replyToId !== undefined
+            ? { replyToId: payload.replyToId }
+            : {}),
         };
         this.validateSendPayload(senderUserId, effectivePayload);
       }
@@ -344,6 +349,25 @@ export class ChatService {
         return { row, reused: false };
       });
 
+      // 提交完成的那一刻就把复制出来的对象交割掉。继续留在 copiedKeys 里的话,
+      // 提交之后任何一次抛错都会走到下面的 catch,把一条**已经落库**的消息所
+      // 引用的媒体删掉 —— 行还在,图永远打不开。
+      const orphanedCopies = copiedKeys;
+      copiedKeys = [];
+      if (created.reused && orphanedCopies.length > 0) {
+        // 幂等重放:库里那条引用的是首次复制出来的 key,这一轮复制的是孤儿。
+        // 清不掉只是留下垃圾对象,不该让一条已落库的消息投递失败。
+        try {
+          await this.media.deleteObjects(orphanedCopies);
+        } catch (error) {
+          this.logger.warn(
+            `forward copy cleanup failed message=${created.row.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+
       // 事务已经提交 —— 这之后的一切都只是「把行装饰成 DTO」,绝不能因此抛错。
       //
       // 抛出去的后果不是"这次失败重试就好":handleSend 捕获后既不广播也不推送,
@@ -379,10 +403,6 @@ export class ChatService {
         );
       }
       await this.media.attachMediaUrls([message]);
-      if (created.reused && copiedKeys.length > 0) {
-        await this.media.deleteObjects(copiedKeys);
-        copiedKeys = [];
-      }
       return { message, reused: created.reused };
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
@@ -413,11 +433,17 @@ export class ChatService {
       row.conversationID,
       userId,
     );
-    const viewerCutoff = await this.selfDestructCutoff(userId);
-    const burnCutoff = conversation.burnDurationSec
-      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
-      : null;
-    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
+    // 可见性只回答「你现在能不能看见」,回答不了「你能不能让别人永远看见」。
+    // 阅后即焚会话的短暂性是发送者的承诺:把对象复制进一个没有 burn 的会话
+    // 等于绕开那条承诺把它永久化,而且副本活得比源消息还久。
+    if (conversation.burnDurationSec) {
+      throw new ForbiddenException({
+        message: '阅后即焚会话中的消息不可转发',
+        errorCode: ChatErrorCode.ForwardForbidden,
+      });
+    }
+    // 会话级 burn 上面已经整段拒掉了,这里只剩查看者自己的定时清理水位。
+    const cutoff = await this.selfDestructCutoff(userId);
     if (
       row.height <= (member.clearedBeforeHeight ?? 0) ||
       (cutoff !== null && row.createdAt < cutoff)

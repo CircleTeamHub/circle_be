@@ -425,6 +425,48 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
+    // 可见性只回答「你现在能不能看见」。阅后即焚会话里的媒体仍在窗口内 ——
+    // 就是说它**可见** —— 但把对象复制进一个没有 burn 的会话等于绕开发送者的
+    // 短暂性承诺,而且副本比源消息活得更久。
+    it('refuses to forward media out of a burn-after-read conversation', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            clearedBeforeHeight: 0,
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: 30,
+            },
+          }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg' },
+        createdAt: new Date(),
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(media.copyForForward).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     it('deletes speculative copies when an idempotent forward already exists', async () => {
       const targetMembership = membership();
       prisma.chatMember.findUnique

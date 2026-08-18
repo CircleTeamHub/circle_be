@@ -328,6 +328,7 @@ export const ChatErrorCode = {
   RevokeForbidden: 'CHAT_REVOKE_FORBIDDEN',
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
+  ForwardForbidden: 'CHAT_FORWARD_FORBIDDEN',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
