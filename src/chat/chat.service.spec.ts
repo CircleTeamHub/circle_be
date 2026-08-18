@@ -318,9 +318,33 @@ describe('ChatService', () => {
           content:
             type === 'image' || type === 'video'
               ? { key: `chat/u1/a.${type === 'video' ? 'mp4' : 'jpg'}` }
-              : { text: 'hi' },
+              : type === 'qr-card'
+                ? {
+                    token: 'AbcdEFGH_1234567',
+                    qrType: 'CIRCLE',
+                    name: 'Circle',
+                    avatarUrl: 'https://cdn.example.com/circle.png',
+                  }
+                : { text: 'hi' },
         } as never),
       ).not.toThrow();
+    });
+
+    it.each([
+      {},
+      { token: 'short' },
+      { token: '0123456789abcde+' },
+      { token: 1234567890123456 },
+      { token: 'a'.repeat(129) },
+    ])('rejects a qr-card with an invalid token: %j', (content) => {
+      expect(() =>
+        service.validateSendPayload('u1', {
+          conversationId: 'conv-1',
+          type: 'qr-card',
+          d: 'client-1',
+          content,
+        } as never),
+      ).toThrow(BadRequestException);
     });
   });
 

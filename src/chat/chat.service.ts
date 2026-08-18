@@ -181,6 +181,18 @@ export class ChatService {
         });
       }
     }
+    if (payload.type === 'qr-card') {
+      const token = payload.content['token'];
+      if (
+        typeof token !== 'string' ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(token)
+      ) {
+        throw new BadRequestException({
+          message: '二维码令牌非法',
+          errorCode: ChatErrorCode.InvalidPayload,
+        });
+      }
+    }
     // quotedText 与 text 同等对待。
     //
     // 它是客户端塞的「被引用消息原文」快照,在引用目标已被物删时作为兜底展示 ——
