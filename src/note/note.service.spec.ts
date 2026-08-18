@@ -3655,6 +3655,7 @@ describe('NoteService', () => {
           mimeType: 'image/jpeg',
         },
       ]);
+      expect(result.failedCount).toBe(0);
     });
 
     it('scopes the lookup to readable notes (own or available)', async () => {
@@ -3838,6 +3839,7 @@ describe('NoteService', () => {
 
       expect(result.items).toHaveLength(1);
       expect(result.items[0].id).toBe('media-2');
+      expect(result.failedCount).toBe(1);
     });
 
     it('throws the first error when every copy fails', async () => {

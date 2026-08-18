@@ -2066,7 +2066,7 @@ export class NoteService {
         : new ServiceUnavailableException('Chat media copy failed');
     }
 
-    return { items };
+    return { items, failedCount: targets.length - items.length };
   }
 
   /**
