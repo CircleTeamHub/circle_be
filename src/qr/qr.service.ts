@@ -10,7 +10,7 @@ import { QrErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatService } from 'src/chat/chat.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
-import type { QrToken } from 'src/generated/prisma';
+import type { Prisma, QrToken } from 'src/generated/prisma';
 import type {
   QrJoinResultDto,
   QrResolveDto,
@@ -46,35 +46,65 @@ export class QrService {
     targetId?: string,
   ): Promise<QrTokenDto> {
     const targetID = await this.assertCanIssue(userId, type, targetId);
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockTokenKey(tx, userId, type, targetID);
 
-    const reuseHorizon = new Date(Date.now() + ROTATE_BELOW_REMAINING_MS);
-    const existing = await this.prisma.qrToken.findFirst({
-      where: {
-        type,
-        targetID,
-        issuerID: userId,
-        revokedAt: null,
-        OR: [{ expiresAt: null }, { expiresAt: { gt: reuseHorizon } }],
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { token: true, expiresAt: true },
-    });
-    if (existing) {
-      return {
-        token: existing.token,
-        type,
-        expiresAt: existing.expiresAt?.toISOString() ?? null,
-      };
-    }
+      const reuseHorizon = new Date(Date.now() + ROTATE_BELOW_REMAINING_MS);
+      const existing = await tx.qrToken.findFirst({
+        where: {
+          type,
+          targetID,
+          issuerID: userId,
+          revokedAt: null,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: reuseHorizon } }],
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { token: true, expiresAt: true },
+      });
+      if (existing) {
+        return {
+          token: existing.token,
+          type,
+          expiresAt: existing.expiresAt?.toISOString() ?? null,
+        };
+      }
 
-    // 192 bit 随机,URL 安全;唯一冲突概率可忽略,不做重试。
-    const token = randomBytes(24).toString('base64url');
-    const expiresAt =
-      type === 'USER' ? null : new Date(Date.now() + GROUP_CIRCLE_TTL_MS);
-    await this.prisma.qrToken.create({
-      data: { token, type, targetID, issuerID: userId, expiresAt },
+      // 192 bit 随机,URL 安全;唯一冲突概率可忽略,不做重试。
+      const token = randomBytes(24).toString('base64url');
+      const expiresAt =
+        type === 'USER' ? null : new Date(Date.now() + GROUP_CIRCLE_TTL_MS);
+      await tx.qrToken.create({
+        data: { token, type, targetID, issuerID: userId, expiresAt },
+      });
+      return { token, type, expiresAt: expiresAt?.toISOString() ?? null };
     });
-    return { token, type, expiresAt: expiresAt?.toISOString() ?? null };
+  }
+
+  async rotateUserToken(userId: string): Promise<QrTokenDto> {
+    return this.prisma.$transaction(async (tx) => {
+      await this.lockTokenKey(tx, userId, 'USER', userId);
+      await tx.qrToken.updateMany({
+        where: {
+          type: 'USER',
+          targetID: userId,
+          issuerID: userId,
+          revokedAt: null,
+        },
+        data: { revokedAt: new Date() },
+      });
+
+      const token = randomBytes(24).toString('base64url');
+      await tx.qrToken.create({
+        data: {
+          token,
+          type: 'USER',
+          targetID: userId,
+          issuerID: userId,
+          expiresAt: null,
+        },
+      });
+      return { token, type: 'USER', expiresAt: null };
+    });
   }
 
   async resolveToken(viewerId: string, token: string): Promise<QrResolveDto> {
@@ -240,6 +270,18 @@ export class QrService {
       message: '二维码无效或已失效',
       errorCode: QrErrorCode.Invalid,
     });
+  }
+
+  private async lockTokenKey(
+    tx: Prisma.TransactionClient,
+    issuerId: string,
+    type: QrTokenTypeDto,
+    targetId: string,
+  ): Promise<void> {
+    const lockKey = `qr-token:${issuerId}:${type}:${targetId}`;
+    // pg_advisory_xact_lock 返回 void；转成 text，避免 Prisma PG adapter
+    // 在反序列化 raw void 列时抛 P2010。
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))::text`;
   }
 
   /** 签发资格,返回归一化的 targetID。 */

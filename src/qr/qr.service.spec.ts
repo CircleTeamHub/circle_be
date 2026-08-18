@@ -12,6 +12,7 @@ describe('QrService', () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       create: jest.fn(),
+      updateMany: jest.fn(),
     },
     user: { findUnique: jest.fn() },
     chatConversation: { findUnique: jest.fn() },
@@ -19,6 +20,8 @@ describe('QrService', () => {
     circle: { findUnique: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     friend: { findFirst: jest.fn() },
+    $transaction: jest.fn(),
+    $queryRaw: jest.fn(),
   };
   const chatService = { joinStandaloneGroupViaQr: jest.fn() };
   const circleInvitation = { invite: jest.fn() };
@@ -27,6 +30,10 @@ describe('QrService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.$transaction.mockImplementation(
+      async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
+    );
+    prisma.$queryRaw.mockResolvedValue([{ locked: null }]);
     service = new QrService(
       prisma as any,
       chatService as any,
@@ -158,6 +165,80 @@ describe('QrService', () => {
       await expect(
         service.issueToken('u1', 'CIRCLE', 'circle-1'),
       ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('creates only one token for concurrent requests with the same key', async () => {
+      let stored: { token: string; expiresAt: Date | null } | null = null;
+      prisma.qrToken.findFirst.mockImplementation(async () => stored);
+      prisma.qrToken.create.mockImplementation(async ({ data }: any) => {
+        stored = { token: data.token, expiresAt: data.expiresAt };
+        return stored;
+      });
+
+      let lockTail = Promise.resolve();
+      prisma.$transaction.mockImplementation(
+        async (cb: (tx: typeof prisma) => unknown) => {
+          const previous = lockTail;
+          let releaseLock!: () => void;
+          lockTail = new Promise<void>((resolve) => {
+            releaseLock = resolve;
+          });
+          const tx = {
+            ...prisma,
+            $queryRaw: jest.fn(async () => {
+              await previous;
+              return [{ locked: null }];
+            }),
+          };
+          try {
+            return await cb(tx as typeof prisma);
+          } finally {
+            releaseLock();
+          }
+        },
+      );
+
+      const [first, second] = await Promise.all([
+        service.issueToken('u1', 'USER'),
+        service.issueToken('u1', 'USER'),
+      ]);
+
+      expect(first.token).toBe(second.token);
+      expect(prisma.qrToken.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('rotateUserToken', () => {
+    it('revokes prior USER tokens and returns a fresh token atomically', async () => {
+      prisma.qrToken.updateMany.mockResolvedValue({ count: 2 });
+      prisma.qrToken.create.mockResolvedValue({});
+
+      const dto = await service.rotateUserToken('u1');
+
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          type: 'USER',
+          targetID: 'u1',
+          issuerID: 'u1',
+          revokedAt: null,
+        },
+        data: { revokedAt: expect.any(Date) },
+      });
+      expect(prisma.qrToken.create).toHaveBeenCalledWith({
+        data: {
+          token: expect.any(String),
+          type: 'USER',
+          targetID: 'u1',
+          issuerID: 'u1',
+          expiresAt: null,
+        },
+      });
+      expect(dto).toMatchObject({ type: 'USER', expiresAt: null });
+      expect(dto.token).toHaveLength(32);
+      expect(
+        prisma.qrToken.updateMany.mock.invocationCallOrder[0],
+      ).toBeLessThan(prisma.qrToken.create.mock.invocationCallOrder[0]);
     });
   });
 

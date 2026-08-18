@@ -1,4 +1,8 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from './chat.service';
 
@@ -17,6 +21,7 @@ describe('ChatService standalone group conversations', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       findFirst: jest.fn(),
+      count: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
@@ -26,6 +31,7 @@ describe('ChatService standalone group conversations', () => {
     friend: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     $transaction: jest.fn(),
+    $queryRaw: jest.fn(),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -75,6 +81,10 @@ describe('ChatService standalone group conversations', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.$queryRaw.mockResolvedValue([
+      { id: 'conv-1', type: 'GROUP', circleID: null },
+    ]);
+    prisma.chatMember.count.mockResolvedValue(1);
     prisma.$transaction.mockImplementation(
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
@@ -112,6 +122,19 @@ describe('ChatService standalone group conversations', () => {
       constructor: ForbiddenException,
       response: { errorCode: ChatErrorCode.GroupFriendsOnly },
     });
+    expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects group creation above the 200-member cap', async () => {
+    const memberIds = Array.from({ length: 200 }, (_, index) => `f${index}`);
+
+    await expect(
+      service.createGroupConversation('owner-1', { memberIds }),
+    ).rejects.toMatchObject({
+      constructor: ConflictException,
+      response: { errorCode: ChatErrorCode.GroupFull },
+    });
+    expect(prisma.friend.findMany).not.toHaveBeenCalled();
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
@@ -192,6 +215,79 @@ describe('ChatService standalone group conversations', () => {
       'conv-1',
       expect.objectContaining({ kind: 'member-joined', names: ['f-seated'] }),
     );
+  });
+
+  it('rejects invitations that would exceed the 200-member cap', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.friend.findMany.mockResolvedValue(
+      friendRows('owner-1', ['f1', 'f2']),
+    );
+    prisma.$queryRaw.mockResolvedValue([
+      { id: 'conv-1', type: 'GROUP', circleID: null },
+    ]);
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.chatMember.count.mockResolvedValue(199);
+
+    await expect(
+      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1', 'f2']),
+    ).rejects.toMatchObject({
+      constructor: ConflictException,
+      response: { errorCode: ChatErrorCode.GroupFull },
+    });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+    expect(prisma.chatMember.update).not.toHaveBeenCalled();
+  });
+
+  it('admits at most one concurrent QR join when 199 members are seated', async () => {
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      type: 'GROUP',
+      circleID: null,
+    });
+    prisma.chatMember.findFirst.mockResolvedValue(null);
+
+    let seatedCount = 199;
+    prisma.chatMember.count.mockImplementation(async () => seatedCount);
+    prisma.chatMember.create.mockImplementation(async () => {
+      seatedCount += 1;
+      return { id: `seat-${seatedCount}` };
+    });
+
+    let lockTail = Promise.resolve();
+    prisma.$transaction.mockImplementation(
+      async (cb: (tx: typeof prisma) => unknown) => {
+        const previous = lockTail;
+        let releaseLock!: () => void;
+        lockTail = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        const tx = {
+          ...prisma,
+          $queryRaw: jest.fn(async () => {
+            await previous;
+            return [{ id: 'conv-1', type: 'GROUP', circleID: null }];
+          }),
+        };
+        try {
+          return await cb(tx as typeof prisma);
+        } finally {
+          releaseLock();
+        }
+      },
+    );
+
+    const results = await Promise.allSettled([
+      service.joinStandaloneGroupViaQr('u1', 'conv-1'),
+      service.joinStandaloneGroupViaQr('u2', 'conv-1'),
+    ]);
+
+    expect(
+      results.filter((result) => result.status === 'fulfilled'),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.status === 'rejected'),
+    ).toHaveLength(1);
+    expect(seatedCount).toBe(200);
   });
 
   it('owner leaving hands the group to the earliest seated member', async () => {

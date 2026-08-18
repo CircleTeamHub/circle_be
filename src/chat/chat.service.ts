@@ -628,6 +628,12 @@ export class ChatService {
         errorCode: ChatErrorCode.GroupMinMembers,
       });
     }
+    if (memberIds.length + 1 > STANDALONE_GROUP_MAX_MEMBERS) {
+      throw new ConflictException({
+        message: '群聊人数已达上限',
+        errorCode: ChatErrorCode.GroupFull,
+      });
+    }
     await this.assertAllFriends(userId, memberIds);
     const activeCount = await this.prisma.user.count({
       where: { id: { in: memberIds }, status: 'ACTIVE' },
@@ -676,20 +682,41 @@ export class ChatService {
       });
     }
     await this.assertAllFriends(userId, invitees);
-    const seats = await this.prisma.chatMember.findMany({
-      where: { conversationID: conversation.id, userID: { in: invitees } },
-      select: { id: true, userID: true, leftAt: true },
-    });
-    const seated = new Map(seats.map((seat) => [seat.userID, seat]));
-    const toJoin = invitees.filter((id) => {
-      const seat = seated.get(id);
-      return !seat || seat.leftAt !== null;
-    });
-    if (toJoin.length === 0) {
-      return this.buildConversationDto(userId, conversation.id);
-    }
-    await this.prisma.$transaction(async (tx) => {
-      for (const id of toJoin) {
+    const toJoin = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{ id: string; type: string; circleID: string | null }>
+      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        WHERE "id" = ${conversation.id} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const seats = await tx.chatMember.findMany({
+        where: { conversationID: conversation.id, userID: { in: invitees } },
+        select: { id: true, userID: true, leftAt: true },
+      });
+      const seated = new Map(seats.map((seat) => [seat.userID, seat]));
+      const joining = invitees.filter((id) => {
+        const seat = seated.get(id);
+        return !seat || seat.leftAt !== null;
+      });
+      if (joining.length === 0) return joining;
+      const seatedCount = await tx.chatMember.count({
+        where: { conversationID: conversation.id, leftAt: null },
+      });
+      if (seatedCount + joining.length > STANDALONE_GROUP_MAX_MEMBERS) {
+        throw new ConflictException({
+          message: '群聊人数已达上限',
+          errorCode: ChatErrorCode.GroupFull,
+        });
+      }
+      for (const id of joining) {
         const seat = seated.get(id);
         if (seat) {
           // 退过群的好友重新拉回:复位座位并抬清空水位,退群前的历史不回放。
@@ -711,7 +738,11 @@ export class ChatService {
           });
         }
       }
+      return joining;
     });
+    if (toJoin.length === 0) {
+      return this.buildConversationDto(userId, conversation.id);
+    }
     await this.seatMembersIntoRoom(conversation.id, toJoin);
     void this.emitGroupJoinNotice(conversation.id, toJoin);
     return this.buildConversationDto(userId, conversation.id);
@@ -739,14 +770,26 @@ export class ChatService {
         errorCode: ChatErrorCode.ConversationNotFound,
       });
     }
-    const existing = await this.prisma.chatMember.findFirst({
-      where: { conversationID: conversationId, userID: userId },
-      select: { id: true, leftAt: true },
-    });
-    if (existing && existing.leftAt === null) {
-      return this.buildConversationDto(userId, conversationId);
-    }
-    await this.prisma.$transaction(async (tx) => {
+    const joined = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{ id: string; type: string; circleID: string | null }>
+      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const existing = await tx.chatMember.findFirst({
+        where: { conversationID: conversationId, userID: userId },
+        select: { id: true, leftAt: true },
+      });
+      if (existing && existing.leftAt === null) return false;
       const seated = await tx.chatMember.count({
         where: { conversationID: conversationId, leftAt: null },
       });
@@ -783,7 +826,9 @@ export class ChatService {
           data: { conversationID: conversationId, userID: userId },
         });
       }
+      return true;
     });
+    if (!joined) return this.buildConversationDto(userId, conversationId);
     await this.seatMembersIntoRoom(conversationId, [userId]);
     void this.emitGroupJoinNotice(conversationId, [userId]);
     return this.buildConversationDto(userId, conversationId);

@@ -12,7 +12,7 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
-import { IssueQrTokenDto } from './dto/qr.dto';
+import { IssueQrTokenDto, RotateQrTokenDto } from './dto/qr.dto';
 import { QrService } from './qr.service';
 import type { QrJoinResultDto, QrResolveDto, QrTokenDto } from './qr.types';
 
@@ -35,6 +35,16 @@ export class QrController {
     @Body() dto: IssueQrTokenDto,
   ): Promise<QrTokenDto> {
     return this.qrService.issueToken(req.user.userId, dto.type, dto.targetId);
+  }
+
+  @Post('tokens/rotate')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '撤销并重签当前用户的个人名片二维码' })
+  rotate(
+    @Req() req: RequestWithUser,
+    @Body() _dto: RotateQrTokenDto,
+  ): Promise<QrTokenDto> {
+    return this.qrService.rotateUserToken(req.user.userId);
   }
 
   @Get('tokens/:token')

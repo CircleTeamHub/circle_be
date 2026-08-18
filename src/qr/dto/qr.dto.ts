@@ -13,3 +13,9 @@ export class IssueQrTokenDto {
   @IsUUID()
   targetId?: string;
 }
+
+export class RotateQrTokenDto {
+  @ApiProperty({ enum: ['USER'] })
+  @IsIn(['USER'])
+  type: 'USER';
+}
