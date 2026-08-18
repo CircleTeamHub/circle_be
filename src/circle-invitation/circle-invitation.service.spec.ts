@@ -1788,6 +1788,27 @@ describe('CircleInvitationService', () => {
       ).toHaveBeenLastCalledWith('applicant-1', true, prisma);
     });
 
+    it('skips group-invite privacy for applicant-consented QR joins inside the transaction', async () => {
+      arrangeInviteFlow();
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+        }),
+      ).resolves.toMatchObject({ id: 'inv-new', status: 'PENDING' });
+
+      expect(privacySettings.canBeInvitedToGroupOrCircle).not.toHaveBeenCalled();
+      expect(prisma.block.findFirst).toHaveBeenCalled();
+      expect(admissionPolicy.assertCanApply).toHaveBeenCalledWith(
+        prisma,
+        'circle-1',
+        'applicant-1',
+        { actor: 'third-party' },
+      );
+    });
+
     // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:
     // 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分。
     it('does not let a non-member distinguish a block from the membership error', async () => {

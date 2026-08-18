@@ -286,17 +286,19 @@ export class CircleInvitationService {
       //
       // 读用 tx 而不是 this.prisma：共享 user lock 与这次复核必须属于同一
       // 事务，才能一直持有到邀请提交；否则仍只是缩小竞态窗口。
-      const stillAllowed =
-        await this.privacySettings.canBeInvitedToGroupOrCircle(
-          applicantId,
-          stillFriends,
-          tx,
-        );
-      if (!stillAllowed) {
-        throw new ForbiddenException({
-          message: 'User does not allow circle invites',
-          errorCode: CircleInvitationErrorCode.NotAllowed,
-        });
+      if (!opts?.applicantConsented) {
+        const stillAllowed =
+          await this.privacySettings.canBeInvitedToGroupOrCircle(
+            applicantId,
+            stillFriends,
+            tx,
+          );
+        if (!stillAllowed) {
+          throw new ForbiddenException({
+            message: 'User does not allow circle invites',
+            errorCode: CircleInvitationErrorCode.NotAllowed,
+          });
+        }
       }
 
       const inviterCanVouch =
