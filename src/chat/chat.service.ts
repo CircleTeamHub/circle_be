@@ -11,6 +11,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SupportService } from 'src/support/support.service';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
@@ -634,27 +635,30 @@ export class ChatService {
         errorCode: ChatErrorCode.GroupFull,
       });
     }
-    await this.assertAllFriends(userId, memberIds);
-    const activeCount = await this.prisma.user.count({
-      where: { id: { in: memberIds }, status: 'ACTIVE' },
-    });
-    if (activeCount !== memberIds.length) {
-      throw new NotFoundException({
-        message: '部分成员不存在或不可用',
-        errorCode: ChatErrorCode.PeerNotFound,
-      });
-    }
     const name = input.name?.trim() || null;
-    const conversation = await this.prisma.chatConversation.create({
-      data: {
-        type: 'GROUP',
-        name,
-        ownerID: userId,
-        members: {
-          create: [userId, ...memberIds].map((id) => ({ userID: id })),
+    const conversation = await this.prisma.$transaction(async (tx) => {
+      await lockUserRelationshipState(tx, [userId, ...memberIds]);
+      await this.assertInviteTargetsAllowed(tx, userId, memberIds);
+      const activeCount = await tx.user.count({
+        where: { id: { in: memberIds }, status: 'ACTIVE' },
+      });
+      if (activeCount !== memberIds.length) {
+        throw new NotFoundException({
+          message: '部分成员不存在或不可用',
+          errorCode: ChatErrorCode.PeerNotFound,
+        });
+      }
+      return tx.chatConversation.create({
+        data: {
+          type: 'GROUP',
+          name,
+          ownerID: userId,
+          members: {
+            create: [userId, ...memberIds].map((id) => ({ userID: id })),
+          },
         },
-      },
-      select: { id: true },
+        select: { id: true },
+      });
     });
     await this.seatMembersIntoRoom(conversation.id, [userId, ...memberIds]);
     // 建群提示一条就够;成员名单首屏可见,不再逐人刷「加入群聊」。
@@ -681,7 +685,6 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    await this.assertAllFriends(userId, invitees);
     const toJoin = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
         Array<{ id: string; type: string; circleID: string | null }>
@@ -697,6 +700,23 @@ export class ChatService {
           errorCode: ChatErrorCode.ConversationNotFound,
         });
       }
+      await lockUserRelationshipState(tx, [userId, ...invitees]);
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      await this.assertInviteTargetsAllowed(tx, userId, invitees);
       const seats = await tx.chatMember.findMany({
         where: { conversationID: conversation.id, userID: { in: invitees } },
         select: { id: true, userID: true, leftAt: true },
@@ -922,27 +942,54 @@ export class ChatService {
     return conversation;
   }
 
-  /** 全部是 ACCEPTED 好友,任一不是即拒绝(独立群聊的信任边界)。 */
-  private async assertAllFriends(
+  /**
+   * 独立群邀请的共同授权边界:目标仍是好友,且其群邀请隐私允许当前关系。
+   * 调用方必须先拿 call-user 关系锁,这样好友/隐私切换不能在检查与落座之间穿插。
+   */
+  private async assertInviteTargetsAllowed(
+    tx: Prisma.TransactionClient,
     userId: string,
     memberIds: string[],
   ): Promise<void> {
-    const rows = await this.prisma.friend.findMany({
-      where: {
-        state: 'ACCEPTED',
-        OR: [
-          { userID: userId, friendID: { in: memberIds } },
-          { friendID: userId, userID: { in: memberIds } },
-        ],
-      },
-      select: { userID: true, friendID: true },
-    });
+    const [rows, privacyRows] = await Promise.all([
+      tx.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            { userID: userId, friendID: { in: memberIds } },
+            { friendID: userId, userID: { in: memberIds } },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      }),
+      tx.userPrivacySetting.findMany({
+        where: { userID: { in: memberIds } },
+        select: { userID: true, groupInvitePermission: true },
+      }),
+    ]);
     const friendIds = new Set(
       rows.map((r) => (r.userID === userId ? r.friendID : r.userID)),
     );
     if (memberIds.some((id) => !friendIds.has(id))) {
       throw new ForbiddenException({
         message: '只能邀请好友进群',
+        errorCode: ChatErrorCode.GroupFriendsOnly,
+      });
+    }
+    const permissions = new Map(
+      privacyRows.map((row) => [row.userID, row.groupInvitePermission]),
+    );
+    if (
+      memberIds.some((id) => {
+        const permission = permissions.get(id) ?? 'EVERYONE';
+        return (
+          permission === 'NONE' ||
+          (permission === 'FRIENDS_ONLY' && !friendIds.has(id))
+        );
+      })
+    ) {
+      throw new ForbiddenException({
+        message: '对方不允许群邀请',
         errorCode: ChatErrorCode.GroupFriendsOnly,
       });
     }

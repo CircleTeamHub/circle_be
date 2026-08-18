@@ -29,6 +29,7 @@ describe('ChatService standalone group conversations', () => {
     chatMessage: { aggregate: jest.fn() },
     user: { findMany: jest.fn(), count: jest.fn() },
     friend: { findMany: jest.fn() },
+    userPrivacySetting: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
@@ -85,6 +86,7 @@ describe('ChatService standalone group conversations', () => {
       { id: 'conv-1', type: 'GROUP', circleID: null },
     ]);
     prisma.chatMember.count.mockResolvedValue(1);
+    prisma.userPrivacySetting.findMany.mockResolvedValue([]);
     prisma.$transaction.mockImplementation(
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
@@ -117,6 +119,26 @@ describe('ChatService standalone group conversations', () => {
     await expect(
       service.createGroupConversation('owner-1', {
         memberIds: ['f1', 'stranger-1'],
+      }),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupFriendsOnly },
+    });
+    expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects group creation when a friend disables group invitations', async () => {
+    prisma.friend.findMany.mockResolvedValue(
+      friendRows('owner-1', ['f1', 'f2']),
+    );
+    prisma.userPrivacySetting.findMany.mockResolvedValue([
+      { userID: 'f2', groupInvitePermission: 'NONE' },
+    ]);
+    prisma.user.count.mockResolvedValue(2);
+
+    await expect(
+      service.createGroupConversation('owner-1', {
+        memberIds: ['f1', 'f2'],
       }),
     ).rejects.toMatchObject({
       constructor: ForbiddenException,
@@ -215,6 +237,44 @@ describe('ChatService standalone group conversations', () => {
       'conv-1',
       expect.objectContaining({ kind: 'member-joined', names: ['f-seated'] }),
     );
+  });
+
+  it('rejects an invite when target privacy changes to NONE before the transaction check', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f1']));
+    prisma.userPrivacySetting.findMany.mockResolvedValue([
+      { userID: 'f1', groupInvitePermission: 'NONE' },
+    ]);
+    prisma.chatMember.findMany.mockResolvedValue([]);
+
+    await expect(
+      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupFriendsOnly },
+    });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects an invite when the actor has left before the locked transaction check', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f1']));
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.$transaction.mockImplementation(
+      async (cb: (tx: typeof prisma) => unknown) =>
+        cb({
+          ...prisma,
+          chatMember: { ...prisma.chatMember, findUnique: jest.fn() },
+        } as typeof prisma),
+    );
+
+    await expect(
+      service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.NotMember },
+    });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
   });
 
   it('rejects invitations that would exceed the 200-member cap', async () => {
