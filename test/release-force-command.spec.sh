@@ -61,6 +61,31 @@ grep -q '^image=ghcr.io/circleteamhub/circle_be@sha256:b\{64\}$' "$LOG"
 grep -q '^user=github-actions\[bot\]$' "$LOG"
 grep -q '^token=test-token$' "$LOG"
 
+# 启动器不可信(部署账号可写)是服务器侧的配置问题。activate 必须拒绝,但刚上传
+# 完的发布包要原样留着 —— 清理钩子装在校验之前的话,运维改好配置后还得让 CI 把
+# 整包重传一次。
+KEEP_STAGE="124-1-$SHA"
+run_gate "circle-release stage $KEEP_STAGE $SHA" < "$CASE_DIR/stage.tar.gz"
+chmod 0755 "$STATE_DIR/release-launcher.sh"
+if {
+  printf '%s\n' \
+    0 \
+    v1.2.3 \
+    ghcr.io/circleteamhub/circle_be@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    0 \
+    0 \
+    'github-actions[bot]' \
+    test-token
+} | run_gate "circle-release activate $KEEP_STAGE" >"$CASE_DIR/untrusted.log" 2>&1; then
+  echo "unexpectedly activated through a deploy-account-writable launcher" >&2
+  exit 1
+fi
+if [ ! -d "$STATE_DIR/incoming/$KEEP_STAGE" ]; then
+  echo "staged release was destroyed by a server-side launcher misconfiguration" >&2
+  exit 1
+fi
+chmod 0555 "$STATE_DIR/release-launcher.sh"
+
 for rejected in \
   'bash -s' \
   'bash deploy/release-deploy.sh' \

@@ -448,7 +448,7 @@ test('release selection and active-color state fail closed', () => {
     release,
     /head_sha=\$SHA&event=push&branch=main&status=completed/,
   );
-  assert.match(release, /--exclude=\/\.release/);
+  assert.match(release, /--exclude=\.\/\.release/);
   assert.match(deploy, /recorded_live_color\(\)/);
   assert.match(deploy, /Refusing to guess which container is live/);
   assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);

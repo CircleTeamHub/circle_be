@@ -95,12 +95,15 @@ activate_release() {
   [ -d "$staged" ] || fail 'staged release not found'
   [ -f "$staged/.release-source-sha" ] || fail 'staged release has no source identity'
   [ "$(cat "$staged/.release-source-sha")" = "${stage_name##*-}" ] || fail 'staged release identity mismatch'
+  # 启动器缺失/可写是服务器侧的配置问题,不是这批 stage 的问题。清理钩子要装在
+  # 这两道检查之后 —— 装在前面的话,一次配置错误会顺手删掉刚上传完的发布包,
+  # 运维改好配置后还得让 CI 把整包重传一遍。
+  [ -f "$LAUNCHER" ] && [ -x "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || fail 'trusted release launcher is unavailable'
+  [ ! -w "$LAUNCHER" ] || fail 'trusted release launcher must not be writable by the deployment account'
   cleanup_activation() {
     rm -rf -- "$staged"
   }
   trap cleanup_activation EXIT
-  [ -f "$LAUNCHER" ] && [ -x "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || fail 'trusted release launcher is unavailable'
-  [ ! -w "$LAUNCHER" ] || fail 'trusted release launcher must not be writable by the deployment account'
 
   local schema tag image downtime irreversible ghcr_user ghcr_token extra
   read_activation_value schema
