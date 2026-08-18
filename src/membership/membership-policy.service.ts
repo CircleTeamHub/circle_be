@@ -24,6 +24,31 @@ import {
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
 
+function withoutQuotaCeilings(tier: MembershipTier): MembershipTier {
+  return {
+    ...tier,
+    quotas: {
+      groupMembers: {
+        ...tier.quotas.groupMembers,
+        actual: Number.MAX_SAFE_INTEGER,
+      },
+      joinedCircles: {
+        ...tier.quotas.joinedCircles,
+        actual: Number.MAX_SAFE_INTEGER,
+      },
+      notes: { ...tier.quotas.notes, actual: Number.MAX_SAFE_INTEGER },
+      cityFilters: {
+        ...tier.quotas.cityFilters,
+        actual: Number.MAX_SAFE_INTEGER,
+      },
+    },
+  };
+}
+
+const ROLLOUT_DISABLED_TIERS = MEMBERSHIP_CATALOG.map((tier) =>
+  withoutQuotaCeilings(tier),
+);
+
 export enum MembershipQuota {
   GroupMembers = 'group-members',
   JoinedCircles = 'joined-circles',
@@ -97,7 +122,9 @@ export class MembershipPolicyService {
     const entitlementLevel = level as MembershipLevel;
     return {
       level: entitlementLevel,
-      tier: MEMBERSHIP_CATALOG[entitlementLevel],
+      tier: program.enabled
+        ? MEMBERSHIP_CATALOG[entitlementLevel]
+        : ROLLOUT_DISABLED_TIERS[entitlementLevel],
       vipExpiresAt: actual.vipExpiresAt,
     };
   }

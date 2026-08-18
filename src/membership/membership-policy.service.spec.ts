@@ -64,8 +64,19 @@ describe('MembershipPolicyService', () => {
 
     expect(regular.level).toBe(2);
     expect(regular.tier.key).toBe('gold');
+    expect(regular.tier.quotas).toEqual({
+      groupMembers: { actual: Number.MAX_SAFE_INTEGER, display: '400' },
+      joinedCircles: { actual: Number.MAX_SAFE_INTEGER, display: '300' },
+      notes: { actual: Number.MAX_SAFE_INTEGER, display: '500' },
+      cityFilters: { actual: Number.MAX_SAFE_INTEGER, display: '10' },
+    });
     expect(superMember.level).toBe(4);
     expect(superMember.tier.key).toBe('super');
+    expect(
+      Object.values(superMember.tier.quotas).every(
+        (quota) => quota.actual === Number.MAX_SAFE_INTEGER,
+      ),
+    ).toBe(true);
   });
 
   it('uses the real effective tier after the program is enabled', async () => {
