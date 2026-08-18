@@ -58,6 +58,7 @@ export class ChatPushService {
         select: {
           type: true,
           circleID: true,
+          tempChatID: true,
         },
       }),
       this.broadcast.getOnlineUserIdsInConversation(message.conversationId),
@@ -198,7 +199,11 @@ export class ChatPushService {
 
   private async composePayload(
     message: ChatMessageDto,
-    conversation: { type: string; circleID: string | null },
+    conversation: {
+      type: string;
+      circleID: string | null;
+      tempChatID: string | null;
+    },
   ): Promise<{ title: string; body: string; data: Record<string, unknown> }> {
     const senderName = message.sender?.nickname ?? '';
     const preview = this.previewFor(message);
@@ -217,6 +222,27 @@ export class ChatPushService {
           conversationId: message.conversationId,
           sourceID: conversation.circleID,
           conversationType: 'group',
+          title,
+        },
+      };
+    }
+    if (conversation.type === 'TEMP') {
+      const room = conversation.tempChatID
+        ? await this.prisma.tempChat.findUnique({
+            where: { id: conversation.tempChatID },
+            select: { title: true },
+          })
+        : null;
+      const title = room?.title ?? '临时群聊';
+      return {
+        title,
+        body: senderName ? `${senderName}: ${preview}` : preview,
+        data: {
+          type: 'chat',
+          conversationId: message.conversationId,
+          sourceID: message.conversationId,
+          conversationType: 'group',
+          conversationKind: 'temp',
           title,
         },
       };
