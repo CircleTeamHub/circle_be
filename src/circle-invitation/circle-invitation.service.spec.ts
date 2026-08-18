@@ -1809,6 +1809,49 @@ describe('CircleInvitationService', () => {
       );
     });
 
+    it('returns the existing pending invitation when the applicant scans again', async () => {
+      arrangeInviteFlow();
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      prisma.circleInvitation.findFirst.mockResolvedValue({
+        id: 'inv-existing',
+        status: 'PENDING',
+      });
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-existing',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        inviterID: 'inviter-1',
+        requiredCount: 10,
+        approvedCount: 1,
+        status: 'PENDING',
+        createdAt: new Date('2026-08-12T00:00:00.000Z'),
+        circle: { id: 'circle-1', name: 'Circle' },
+        applicant: {
+          id: 'applicant-1',
+          nickname: 'Applicant',
+          avatarUrl: null,
+          accountId: 'applicant',
+        },
+        inviter: {
+          id: 'inviter-1',
+          nickname: 'Inviter',
+          avatarUrl: null,
+          accountId: 'inviter',
+        },
+        verifiers: [],
+      });
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+        }),
+      ).resolves.toMatchObject({ id: 'inv-existing', status: 'PENDING' });
+
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+      expect(prisma.block.findFirst).toHaveBeenCalled();
+      expect(admissionPolicy.assertCanApply).toHaveBeenCalled();
+    });
+
     // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:
     // 被拉黑返回 NotAllowed、没拉黑返回 InviterNotMember,两者可分。
     it('does not let a non-member distinguish a block from the membership error', async () => {

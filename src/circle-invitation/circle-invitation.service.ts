@@ -259,6 +259,9 @@ export class CircleInvitationService {
         },
       });
       if (existingInvitation) {
+        if (opts?.applicantConsented) {
+          return { created: existingInvitation, admission: null };
+        }
         throw new ConflictException({
           message: 'There is already a pending invitation for this user',
           errorCode: CircleInvitationErrorCode.AlreadyPending,
