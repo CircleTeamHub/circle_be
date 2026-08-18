@@ -64,17 +64,19 @@ describe('MembershipPolicyService', () => {
 
     expect(regular.level).toBe(2);
     expect(regular.tier.key).toBe('gold');
+    // 地板把所有人抬到 gold,但额度仍是真实值:「未开放」不等于「无上限」,
+    // 否则圈子数、群成员数、笔记数的反滥用天花板会跟着一起消失。
     expect(regular.tier.quotas).toEqual({
-      groupMembers: { actual: Number.MAX_SAFE_INTEGER, display: '400' },
-      joinedCircles: { actual: Number.MAX_SAFE_INTEGER, display: '300' },
-      notes: { actual: Number.MAX_SAFE_INTEGER, display: '500' },
-      cityFilters: { actual: Number.MAX_SAFE_INTEGER, display: '10' },
+      groupMembers: { actual: 400, display: '400' },
+      joinedCircles: { actual: 300, display: '300' },
+      notes: { actual: 500, display: '500' },
+      cityFilters: { actual: 10, display: '10' },
     });
     expect(superMember.level).toBe(4);
     expect(superMember.tier.key).toBe('super');
     expect(
       Object.values(superMember.tier.quotas).every(
-        (quota) => quota.actual === Number.MAX_SAFE_INTEGER,
+        (quota) => Number.isFinite(quota.actual) && quota.actual > 0,
       ),
     ).toBe(true);
   });

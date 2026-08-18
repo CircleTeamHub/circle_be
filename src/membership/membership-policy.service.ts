@@ -24,31 +24,6 @@ import {
 
 const MEMBERSHIP_USER_LOCK_PREFIX = 'membership-user:';
 
-function withoutQuotaCeilings(tier: MembershipTier): MembershipTier {
-  return {
-    ...tier,
-    quotas: {
-      groupMembers: {
-        ...tier.quotas.groupMembers,
-        actual: Number.MAX_SAFE_INTEGER,
-      },
-      joinedCircles: {
-        ...tier.quotas.joinedCircles,
-        actual: Number.MAX_SAFE_INTEGER,
-      },
-      notes: { ...tier.quotas.notes, actual: Number.MAX_SAFE_INTEGER },
-      cityFilters: {
-        ...tier.quotas.cityFilters,
-        actual: Number.MAX_SAFE_INTEGER,
-      },
-    },
-  };
-}
-
-const ROLLOUT_DISABLED_TIERS = MEMBERSHIP_CATALOG.map((tier) =>
-  withoutQuotaCeilings(tier),
-);
-
 export enum MembershipQuota {
   GroupMembers = 'group-members',
   JoinedCircles = 'joined-circles',
@@ -122,9 +97,10 @@ export class MembershipPolicyService {
     const entitlementLevel = level as MembershipLevel;
     return {
       level: entitlementLevel,
-      tier: program.enabled
-        ? MEMBERSHIP_CATALOG[entitlementLevel]
-        : ROLLOUT_DISABLED_TIERS[entitlementLevel],
+      // 未开放期间「不被额度挡住」由 entitlementLevel 的 gold 地板负责,不是靠把
+      // 额度拉到无穷大 —— 那会连反滥用上限一起取消(圈子数/群成员数/笔记数全部
+      // 无界),而这些上限的并发守卫本身就是靠额度值成立的。
+      tier: MEMBERSHIP_CATALOG[entitlementLevel],
       vipExpiresAt: actual.vipExpiresAt,
     };
   }
