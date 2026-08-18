@@ -281,6 +281,8 @@ export class ChatPushService {
         return '[转账]';
       case 'note-card':
         return '[笔记]';
+      case 'qr-card':
+        return '[二维码]';
       default:
         return '[消息]';
     }

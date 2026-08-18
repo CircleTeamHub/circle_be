@@ -308,6 +308,7 @@ describe('ChatService', () => {
       'note-card',
       'friend-card',
       'plaza-post-card',
+      'qr-card',
     ])('still accepts %s from clients', (type) => {
       expect(() =>
         service.validateSendPayload('u1', {

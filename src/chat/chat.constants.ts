@@ -75,6 +75,9 @@ export const CLIENT_MESSAGE_TYPES = [
   'friend-card',
   'circle-card',
   'plaza-post-card',
+  // 二维码卡片(名片 / 群 / 圈子):载荷只是一个令牌指针,收件人点开时走 /qr 预览
+  // 端点自己去核验 —— 伪造它顶多是发了张扫不通的码,属分享类而非回执类。
+  'qr-card',
 ] as const;
 
 export const SYSTEM_MESSAGE_TYPE = 'system';

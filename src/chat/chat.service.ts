@@ -3044,6 +3044,7 @@ const REPLY_PREVIEW_LABELS: Record<string, string> = {
   'friend-card': '[名片]',
   'circle-card': '[圈子]',
   'plaza-post-card': '[帖子]',
+  'qr-card': '[二维码]',
   'transfer-card': '[转账]',
   'verification-card': '[验证]',
   'call-record': '[通话]',
