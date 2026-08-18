@@ -83,7 +83,7 @@ describe('ChatService standalone group conversations', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$queryRaw.mockResolvedValue([
-      { id: 'conv-1', type: 'GROUP', circleID: null },
+      { id: 'conv-1', type: 'GROUP', circleID: null, ownerID: 'owner-1' },
     ]);
     prisma.chatMember.count.mockResolvedValue(1);
     prisma.userPrivacySetting.findMany.mockResolvedValue([]);
@@ -385,6 +385,44 @@ describe('ChatService standalone group conversations', () => {
     await service.leaveGroupConversation('f1', 'conv-1');
 
     expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+  });
+
+  it('uses the locked owner snapshot when ownership changes before leave commits', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(
+      seat({
+        conversation: { ...seat().conversation, ownerID: 'f1' },
+      }),
+    );
+    prisma.$queryRaw.mockResolvedValue([
+      { id: 'conv-1', type: 'GROUP', circleID: null, ownerID: 'owner-1' },
+    ]);
+    prisma.chatMember.findFirst.mockResolvedValue({ userID: 'f2' });
+
+    await service.leaveGroupConversation('owner-1', 'conv-1');
+
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { ownerID: 'f2' },
+    });
+  });
+
+  it('rejects leave when the actor seat disappeared before the locked re-read', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.$transaction.mockImplementation(
+      async (cb: (tx: typeof prisma) => unknown) =>
+        cb({
+          ...prisma,
+          chatMember: { ...prisma.chatMember, findUnique: jest.fn() },
+        } as typeof prisma),
+    );
+
+    await expect(
+      service.leaveGroupConversation('owner-1', 'conv-1'),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.NotMember },
+    });
+    expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
   });
 
   it('rename trims, persists, and leaves a system notice', async () => {

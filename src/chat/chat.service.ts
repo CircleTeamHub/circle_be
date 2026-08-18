@@ -864,6 +864,40 @@ export class ChatService {
       userId,
     );
     await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          ownerID: string | null;
+        }>
+      >`SELECT "id", "type", "circleID", "ownerID" FROM "ChatConversation"
+        WHERE "id" = ${conversation.id} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
       await tx.chatMember.updateMany({
         where: {
           conversationID: conversation.id,
@@ -872,7 +906,7 @@ export class ChatService {
         },
         data: { leftAt: new Date() },
       });
-      if (conversation.ownerID === userId) {
+      if (locked[0].ownerID === userId) {
         const successor = await tx.chatMember.findFirst({
           where: { conversationID: conversation.id, leftAt: null },
           orderBy: { joinedAt: 'asc' },
