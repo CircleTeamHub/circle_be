@@ -13,8 +13,12 @@ import { AdminAuditService } from 'src/moderation/admin-audit.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
+  CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
+  MOMENT_NOTIFICATION_TYPES,
+  notificationTypesForDomain,
   PROFILE_NOTIFICATION_TYPES,
+  type NotificationDomain,
 } from './notification.constants';
 import {
   mapNotificationRealtimeDto,
@@ -223,30 +227,37 @@ export class NotificationService {
   }
 
   async getUnreadSummary(userId: string) {
-    const [discoverUnread, profileUnread] = await Promise.all([
-      this.prisma.notification.count({
-        where: {
-          toUserID: userId,
-          deleted: false,
-          read: false,
-          type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-        },
-      }),
-      this.prisma.notification.count({
-        where: {
-          toUserID: userId,
-          deleted: false,
-          read: false,
-          type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-        },
-      }),
-    ]);
+    // momentsUnread / circleUnread 各自喂一个铃铛（朋友圈 / 圈子广场）；
+    // discoverUnread 仍是整个互动域的总数，老客户端和 tab 徽标继续读它。
+    const [discoverUnread, momentsUnread, circleUnread, profileUnread] =
+      await Promise.all([
+        this.countUnreadByTypes(userId, DISCOVER_NOTIFICATION_TYPES),
+        this.countUnreadByTypes(userId, MOMENT_NOTIFICATION_TYPES),
+        this.countUnreadByTypes(userId, CIRCLE_NOTIFICATION_TYPES),
+        this.countUnreadByTypes(userId, PROFILE_NOTIFICATION_TYPES),
+      ]);
 
     return {
       discoverUnread,
+      momentsUnread,
+      circleUnread,
       profileUnread,
       totalUnread: discoverUnread + profileUnread,
     };
+  }
+
+  private countUnreadByTypes(
+    userId: string,
+    types: readonly NotificationType[],
+  ): Promise<number> {
+    return this.prisma.notification.count({
+      where: {
+        toUserID: userId,
+        deleted: false,
+        read: false,
+        type: { in: [...types] },
+      },
+    });
   }
 
   async markProfileNotificationsRead(userId: string) {
@@ -714,14 +725,18 @@ export class NotificationService {
     });
   }
 
-  async getNotifications(userId: string, page = 1) {
+  async getNotifications(
+    userId: string,
+    page = 1,
+    domain?: NotificationDomain,
+  ) {
     const take = 20;
     const skip = (Math.max(1, page) - 1) * take;
     const rows = await this.prisma.notification.findMany({
       where: {
         toUserID: userId,
         deleted: false,
-        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+        type: { in: [...notificationTypesForDomain(domain)] },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -775,13 +790,18 @@ export class NotificationService {
     }
   }
 
-  async markAllNotificationsRead(userId: string): Promise<{ count: number }> {
+  // domain 收窄「全部已读」的作用范围：朋友圈铃铛的「全部已读」不该顺手把
+  // 圈子通知也清了，反之亦然。不传 domain 时行为与老客户端一致（清全域）。
+  async markAllNotificationsRead(
+    userId: string,
+    domain?: NotificationDomain,
+  ): Promise<{ count: number }> {
     const result = await this.prisma.notification.updateMany({
       where: {
         toUserID: userId,
         deleted: false,
         read: false,
-        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
+        type: { in: [...notificationTypesForDomain(domain)] },
       },
       data: { read: true },
     });

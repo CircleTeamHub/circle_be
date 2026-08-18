@@ -5,7 +5,11 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationService } from './notification.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationType, Prisma } from 'src/generated/prisma';
-import { DISCOVER_NOTIFICATION_TYPES } from './notification.constants';
+import {
+  CIRCLE_NOTIFICATION_TYPES,
+  DISCOVER_NOTIFICATION_TYPES,
+  MOMENT_NOTIFICATION_TYPES,
+} from './notification.constants';
 import { NotificationPushService } from './notification-push.service';
 import { AdminAuditService } from 'src/moderation/admin-audit.service';
 
@@ -103,12 +107,83 @@ describe('NotificationService', () => {
   });
 
   it('builds discover/profile unread summary from notification domains', async () => {
-    prisma.notification.count.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    // 按 where.type.in 分派，而不是靠调用顺序 —— 四个 count 是并发发出的。
+    prisma.notification.count.mockImplementation(({ where }: any) => {
+      const types = where.type.in as string[];
+      if (types.includes('SYSTEM')) return Promise.resolve(1);
+      if (
+        types.includes('TRACE_LIKE') &&
+        types.includes('CIRCLE_POST_PUBLISHED')
+      )
+        return Promise.resolve(2);
+      if (types.includes('TRACE_LIKE')) return Promise.resolve(1);
+      return Promise.resolve(1);
+    });
 
     await expect(service.getUnreadSummary('user-1')).resolves.toEqual({
       discoverUnread: 2,
+      momentsUnread: 1,
+      circleUnread: 1,
       profileUnread: 1,
       totalUnread: 3,
+    });
+  });
+
+  it('scopes the unread summary domains to disjoint notification types', async () => {
+    const seen: string[][] = [];
+    prisma.notification.count.mockImplementation(({ where }: any) => {
+      seen.push(where.type.in as string[]);
+      return Promise.resolve(0);
+    });
+
+    await service.getUnreadSummary('user-1');
+
+    const [, momentTypes, circleTypes] = seen;
+    expect(momentTypes).toEqual([...MOMENT_NOTIFICATION_TYPES]);
+    expect(circleTypes).toEqual([...CIRCLE_NOTIFICATION_TYPES]);
+    // 朋友圈铃铛不得收圈子事件，圈子铃铛不得收朋友圈事件。
+    expect(momentTypes.filter((type) => circleTypes.includes(type))).toEqual(
+      [],
+    );
+    expect(momentTypes.some((type) => type.startsWith('CIRCLE_'))).toBe(false);
+    expect(circleTypes.every((type) => type.startsWith('CIRCLE_'))).toBe(true);
+  });
+
+  it('getNotifications scopes rows to one bell domain when asked', async () => {
+    prisma.notification.findMany.mockResolvedValue([]);
+
+    await service.getNotifications('user-1', 1, 'moments');
+    expect(prisma.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          type: { in: [...MOMENT_NOTIFICATION_TYPES] },
+        }),
+      }),
+    );
+
+    await service.getNotifications('user-1', 1, 'circle');
+    expect(prisma.notification.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          type: { in: [...CIRCLE_NOTIFICATION_TYPES] },
+        }),
+      }),
+    );
+  });
+
+  it('markAllNotificationsRead only clears the requested domain', async () => {
+    prisma.notification.updateMany.mockResolvedValue({ count: 2 });
+
+    await service.markAllNotificationsRead('user-1', 'moments');
+
+    expect(prisma.notification.updateMany).toHaveBeenCalledWith({
+      where: {
+        toUserID: 'user-1',
+        deleted: false,
+        read: false,
+        type: { in: [...MOMENT_NOTIFICATION_TYPES] },
+      },
+      data: { read: true },
     });
   });
 

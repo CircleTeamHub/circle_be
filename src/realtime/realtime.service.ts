@@ -8,10 +8,13 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { WebSocket } from 'ws';
+import { NotificationType } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
 import {
+  CIRCLE_NOTIFICATION_TYPES,
   DISCOVER_NOTIFICATION_TYPES,
+  MOMENT_NOTIFICATION_TYPES,
   PROFILE_NOTIFICATION_TYPES,
 } from 'src/notification/notification.constants';
 import type { NotificationRealtimeDto } from 'src/notification/notification.dto';
@@ -55,7 +58,12 @@ export type RealtimeSocketIdentity = {
 type BadgeSnapshot = {
   messagesUnread: number;
   contactsUnread: number;
+  /** 互动域未读总数（= momentsUnread + circleUnread + 好友申请通知）。 */
   discoverUnread: number;
+  /** 朋友圈铃铛未读 —— 动态互动 + 资料点赞。 */
+  momentsUnread: number;
+  /** 圈子铃铛未读 —— 担保验证/入圈审批/圈子帖动态（不含报名，见 signupUnread）。 */
+  circleUnread: number;
   signupUnread: number;
   profileUnread: number;
   systemUnread: number;
@@ -132,10 +140,20 @@ type RealtimeEvent =
   | {
       type:
         | 'friend.activity.unread.changed'
-        | 'interaction.unread.changed'
         | 'circle.signup.unread.changed'
         | 'system.notification.unread.changed';
       payload: { count: number; changedAt: string };
+    }
+  | {
+      type: 'interaction.unread.changed';
+      // count 是互动域总数（老客户端读它）；两个 per-domain 字段让朋友圈 /
+      // 圈子铃铛各自更新，不必额外拉一次 unread-summary。
+      payload: {
+        count: number;
+        momentsUnread: number;
+        circleUnread: number;
+        changedAt: string;
+      };
     }
   | {
       type: 'membership.status.changed';
@@ -460,40 +478,50 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async queryBadgeSnapshot(userId: string): Promise<BadgeSnapshot> {
-    const [contactsUnread, discoverUnread, signupUnread, profileUnread] =
-      await Promise.all([
-        this.prisma.friendActivity.count({
-          where: { viewerId: userId, readAt: null },
-        }),
-        this.prisma.notification.count({
-          where: {
-            toUserID: userId,
-            deleted: false,
-            read: false,
-            type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-          },
-        }),
-        this.countUnreadSignups(userId),
-        this.prisma.notification.count({
-          where: {
-            toUserID: userId,
-            deleted: false,
-            read: false,
-            type: { in: [...PROFILE_NOTIFICATION_TYPES] },
-          },
-        }),
-      ]);
+    const [
+      contactsUnread,
+      discoverUnread,
+      momentsUnread,
+      circleUnread,
+      signupUnread,
+      profileUnread,
+    ] = await Promise.all([
+      this.prisma.friendActivity.count({
+        where: { viewerId: userId, readAt: null },
+      }),
+      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
+      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
+      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
+      this.countUnreadSignups(userId),
+      this.countUnreadNotifications(userId, PROFILE_NOTIFICATION_TYPES),
+    ]);
 
     const snapshot: BadgeSnapshot = {
       messagesUnread: 0,
       contactsUnread,
       discoverUnread,
+      momentsUnread,
+      circleUnread,
       signupUnread,
       profileUnread,
       systemUnread: profileUnread,
       syncedAt: new Date().toISOString(),
     };
     return snapshot;
+  }
+
+  private countUnreadNotifications(
+    userId: string,
+    types: readonly NotificationType[],
+  ): Promise<number> {
+    return this.prisma.notification.count({
+      where: {
+        toUserID: userId,
+        deleted: false,
+        read: false,
+        type: { in: [...types] },
+      },
+    });
   }
 
   async emitSnapshot(userId: string) {
@@ -532,19 +560,18 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   /** "互动消息" unread — trace comments/replies + circle verification/invitation. */
   async broadcastInteractionUnread(userId: string) {
     await this.invalidateBadgeSnapshotCache(userId);
-    const count = await this.prisma.notification.count({
-      where: {
-        toUserID: userId,
-        deleted: false,
-        read: false,
-        type: { in: [...DISCOVER_NOTIFICATION_TYPES] },
-      },
-    });
+    const [count, momentsUnread, circleUnread] = await Promise.all([
+      this.countUnreadNotifications(userId, DISCOVER_NOTIFICATION_TYPES),
+      this.countUnreadNotifications(userId, MOMENT_NOTIFICATION_TYPES),
+      this.countUnreadNotifications(userId, CIRCLE_NOTIFICATION_TYPES),
+    ]);
 
     this.broadcast(userId, {
       type: 'interaction.unread.changed',
       payload: {
         count,
+        momentsUnread,
+        circleUnread,
         changedAt: new Date().toISOString(),
       },
     });

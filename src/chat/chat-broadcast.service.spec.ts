@@ -59,3 +59,26 @@ describe('ChatBroadcastService.joinUserToConversation', () => {
     ).resolves.toBeUndefined();
   });
 });
+
+describe('ChatBroadcastService.emitHistoryCleared', () => {
+  it('broadcasts the authoritative watermark to the conversation room', () => {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const presence = {};
+    const service = new ChatBroadcastService(presence as never);
+    service.setServer({ to } as never);
+
+    service.emitHistoryCleared({
+      conversationId: 'conv-1',
+      clearedBeforeHeight: 42,
+      clearedBy: 'u1',
+    });
+
+    expect(to).toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:history_cleared', {
+      conversationId: 'conv-1',
+      clearedBeforeHeight: 42,
+      clearedBy: 'u1',
+    });
+  });
+});

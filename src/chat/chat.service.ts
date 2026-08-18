@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -66,6 +67,10 @@ interface SendResult {
  */
 type MessageRow = Omit<ChatMessage, 'contentHistory'>;
 const MESSAGE_READ_OMIT = { contentHistory: true } as const;
+
+// 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
+// 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
+const STANDALONE_GROUP_MAX_MEMBERS = 200;
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
 
@@ -554,6 +559,8 @@ export class ChatService {
         circle: m.conversation.circleID
           ? (circles.get(m.conversation.circleID) ?? null)
           : null,
+        name: m.conversation.name ?? null,
+        ownerId: m.conversation.ownerID ?? null,
         tempChat: m.conversation.tempChatID
           ? (tempChats.get(m.conversation.tempChatID) ?? null)
           : null,
@@ -602,6 +609,394 @@ export class ChatService {
       });
     }
     return this.buildConversationDto(userId, conversationId);
+  }
+
+  /**
+   * 独立群聊(微信群语义):不挂圈子,成员即 ChatMember 行,建群人是群主。
+   * 只能拉自己的好友 —— 与单聊的陌生人开关同一信任边界:UUID 不是授权。
+   */
+  async createGroupConversation(
+    userId: string,
+    input: { name?: string | null; memberIds: string[] },
+  ): Promise<ChatConversationDto> {
+    const memberIds = [...new Set(input.memberIds)].filter(
+      (id) => id !== userId,
+    );
+    if (memberIds.length < 2) {
+      throw new BadRequestException({
+        message: '至少选择 2 位好友',
+        errorCode: ChatErrorCode.GroupMinMembers,
+      });
+    }
+    if (memberIds.length + 1 > STANDALONE_GROUP_MAX_MEMBERS) {
+      throw new ConflictException({
+        message: '群聊人数已达上限',
+        errorCode: ChatErrorCode.GroupFull,
+      });
+    }
+    await this.assertAllFriends(userId, memberIds);
+    const activeCount = await this.prisma.user.count({
+      where: { id: { in: memberIds }, status: 'ACTIVE' },
+    });
+    if (activeCount !== memberIds.length) {
+      throw new NotFoundException({
+        message: '部分成员不存在或不可用',
+        errorCode: ChatErrorCode.PeerNotFound,
+      });
+    }
+    const name = input.name?.trim() || null;
+    const conversation = await this.prisma.chatConversation.create({
+      data: {
+        type: 'GROUP',
+        name,
+        ownerID: userId,
+        members: {
+          create: [userId, ...memberIds].map((id) => ({ userID: id })),
+        },
+      },
+      select: { id: true },
+    });
+    await this.seatMembersIntoRoom(conversation.id, [userId, ...memberIds]);
+    // 建群提示一条就够;成员名单首屏可见,不再逐人刷「加入群聊」。
+    void this.systemMessage
+      .emit(conversation.id, { kind: 'group-created' })
+      .catch(() => undefined);
+    return this.buildConversationDto(userId, conversation.id);
+  }
+
+  /** 独立群聊邀请:任一在座成员可拉自己的好友(微信语义);圈子群走圈子成员管理。 */
+  async inviteToGroupConversation(
+    userId: string,
+    conversationId: string,
+    memberIds: string[],
+  ): Promise<ChatConversationDto> {
+    const conversation = await this.requireStandaloneGroup(
+      conversationId,
+      userId,
+    );
+    const invitees = [...new Set(memberIds)].filter((id) => id !== userId);
+    if (invitees.length === 0) {
+      throw new BadRequestException({
+        message: '未选择邀请对象',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    await this.assertAllFriends(userId, invitees);
+    const toJoin = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{ id: string; type: string; circleID: string | null }>
+      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        WHERE "id" = ${conversation.id} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const seats = await tx.chatMember.findMany({
+        where: { conversationID: conversation.id, userID: { in: invitees } },
+        select: { id: true, userID: true, leftAt: true },
+      });
+      const seated = new Map(seats.map((seat) => [seat.userID, seat]));
+      const joining = invitees.filter((id) => {
+        const seat = seated.get(id);
+        return !seat || seat.leftAt !== null;
+      });
+      if (joining.length === 0) return joining;
+      const seatedCount = await tx.chatMember.count({
+        where: { conversationID: conversation.id, leftAt: null },
+      });
+      if (seatedCount + joining.length > STANDALONE_GROUP_MAX_MEMBERS) {
+        throw new ConflictException({
+          message: '群聊人数已达上限',
+          errorCode: ChatErrorCode.GroupFull,
+        });
+      }
+      for (const id of joining) {
+        const seat = seated.get(id);
+        if (seat) {
+          // 退过群的好友重新拉回:复位座位并抬清空水位,退群前的历史不回放。
+          const top = await tx.chatMessage.aggregate({
+            where: { conversationID: conversation.id, deleted: false },
+            _max: { height: true },
+          });
+          await tx.chatMember.update({
+            where: { id: seat.id },
+            data: {
+              leftAt: null,
+              joinedAt: new Date(),
+              clearedBeforeHeight: top._max.height ?? 0,
+            },
+          });
+        } else {
+          await tx.chatMember.create({
+            data: { conversationID: conversation.id, userID: id },
+          });
+        }
+      }
+      return joining;
+    });
+    if (toJoin.length === 0) {
+      return this.buildConversationDto(userId, conversation.id);
+    }
+    await this.seatMembersIntoRoom(conversation.id, toJoin);
+    void this.emitGroupJoinNotice(conversation.id, toJoin);
+    return this.buildConversationDto(userId, conversation.id);
+  }
+
+  /**
+   * 扫码进群(独立群聊):QrService 已验过令牌,令牌即授权 —— 不要求与在座成员
+   * 是好友,群二维码本来就是递给陌生人的(微信语义)。幂等:已在座直接返回。
+   */
+  async joinStandaloneGroupViaQr(
+    userId: string,
+    conversationId: string,
+  ): Promise<ChatConversationDto> {
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationId },
+      select: { id: true, type: true, circleID: true },
+    });
+    if (
+      !conversation ||
+      conversation.type !== 'GROUP' ||
+      conversation.circleID
+    ) {
+      throw new NotFoundException({
+        message: '群聊不存在',
+        errorCode: ChatErrorCode.ConversationNotFound,
+      });
+    }
+    const joined = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{ id: string; type: string; circleID: string | null }>
+      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const existing = await tx.chatMember.findFirst({
+        where: { conversationID: conversationId, userID: userId },
+        select: { id: true, leftAt: true },
+      });
+      if (existing && existing.leftAt === null) return false;
+      const seated = await tx.chatMember.count({
+        where: { conversationID: conversationId, leftAt: null },
+      });
+      // 全员退光的死群,码不再开门 —— 扫进去只会得到一间没人的空房。
+      if (seated === 0) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      if (seated >= STANDALONE_GROUP_MAX_MEMBERS) {
+        throw new ConflictException({
+          message: '群聊人数已达上限',
+          errorCode: ChatErrorCode.GroupFull,
+        });
+      }
+      if (existing) {
+        // 退过群又扫码回来:复位座位并抬清空水位,退群前的历史不回放
+        // (与好友邀请路径同一语义)。
+        const top = await tx.chatMessage.aggregate({
+          where: { conversationID: conversationId, deleted: false },
+          _max: { height: true },
+        });
+        await tx.chatMember.update({
+          where: { id: existing.id },
+          data: {
+            leftAt: null,
+            joinedAt: new Date(),
+            clearedBeforeHeight: top._max.height ?? 0,
+          },
+        });
+      } else {
+        await tx.chatMember.create({
+          data: { conversationID: conversationId, userID: userId },
+        });
+      }
+      return true;
+    });
+    if (!joined) return this.buildConversationDto(userId, conversationId);
+    await this.seatMembersIntoRoom(conversationId, [userId]);
+    void this.emitGroupJoinNotice(conversationId, [userId]);
+    return this.buildConversationDto(userId, conversationId);
+  }
+
+  /** 独立群聊退群:座位置 leftAt;群主退群转给最早入群的在座成员。 */
+  async leaveGroupConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    const conversation = await this.requireStandaloneGroup(
+      conversationId,
+      userId,
+    );
+    await this.prisma.$transaction(async (tx) => {
+      await tx.chatMember.updateMany({
+        where: {
+          conversationID: conversation.id,
+          userID: userId,
+          leftAt: null,
+        },
+        data: { leftAt: new Date() },
+      });
+      if (conversation.ownerID === userId) {
+        const successor = await tx.chatMember.findFirst({
+          where: { conversationID: conversation.id, leftAt: null },
+          orderBy: { joinedAt: 'asc' },
+          select: { userID: true },
+        });
+        // 最后一人退群:群主字段留着(会话已无在座成员,等价于死会话)。
+        if (successor) {
+          await tx.chatConversation.update({
+            where: { id: conversation.id },
+            data: { ownerID: successor.userID },
+          });
+        }
+      }
+    });
+    void this.broadcast
+      .removeUserFromConversation(userId, conversation.id)
+      .catch(() => undefined);
+    this.broadcast.emitConversationChange(userId, {
+      kind: 'left',
+      conversationId: conversation.id,
+      userId,
+    });
+    void this.systemMessage
+      .emit(conversation.id, { kind: 'member-left' })
+      .catch(() => undefined);
+  }
+
+  /** 独立群聊改名:任一在座成员可改(微信语义);改完发系统提示留痕。 */
+  async renameGroupConversation(
+    userId: string,
+    conversationId: string,
+    name: string,
+  ): Promise<ChatConversationDto> {
+    const conversation = await this.requireStandaloneGroup(
+      conversationId,
+      userId,
+    );
+    const trimmed = name.trim();
+    if (!trimmed) {
+      throw new BadRequestException({
+        message: '群名不能为空',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    await this.prisma.chatConversation.update({
+      where: { id: conversation.id },
+      data: { name: trimmed },
+    });
+    void this.systemMessage
+      .emit(conversation.id, { kind: 'group-renamed', name: trimmed })
+      .catch(() => undefined);
+    return this.buildConversationDto(userId, conversation.id);
+  }
+
+  /** 独立群聊专属操作的共同门:必须是在座成员,且会话是不挂圈子的 GROUP。 */
+  private async requireStandaloneGroup(
+    conversationId: string,
+    userId: string,
+  ): Promise<ChatConversation> {
+    const conversation = await this.requireMembership(conversationId, userId);
+    if (conversation.type !== 'GROUP' || conversation.circleID) {
+      throw new ForbiddenException({
+        message: '该群由圈子管理',
+        errorCode: ChatErrorCode.GroupCircleManaged,
+      });
+    }
+    return conversation;
+  }
+
+  /** 全部是 ACCEPTED 好友,任一不是即拒绝(独立群聊的信任边界)。 */
+  private async assertAllFriends(
+    userId: string,
+    memberIds: string[],
+  ): Promise<void> {
+    const rows = await this.prisma.friend.findMany({
+      where: {
+        state: 'ACCEPTED',
+        OR: [
+          { userID: userId, friendID: { in: memberIds } },
+          { friendID: userId, userID: { in: memberIds } },
+        ],
+      },
+      select: { userID: true, friendID: true },
+    });
+    const friendIds = new Set(
+      rows.map((r) => (r.userID === userId ? r.friendID : r.userID)),
+    );
+    if (memberIds.some((id) => !friendIds.has(id))) {
+      throw new ForbiddenException({
+        message: '只能邀请好友进群',
+        errorCode: ChatErrorCode.GroupFriendsOnly,
+      });
+    }
+  }
+
+  /** 座位落库后入房 + 个人事件(与圈子同步/单聊同一套广播语义;尽力而为)。 */
+  private async seatMembersIntoRoom(
+    conversationId: string,
+    userIds: string[],
+  ): Promise<void> {
+    await Promise.all(
+      userIds.map(async (memberId) => {
+        try {
+          await this.broadcast.joinUserToConversation(memberId, conversationId);
+        } catch (error: unknown) {
+          this.logger.warn(
+            `join room failed user=${memberId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        this.broadcast.emitConversationChange(memberId, {
+          kind: 'joined',
+          conversationId,
+          userId: memberId,
+        });
+      }),
+    );
+  }
+
+  /** 进群系统提示(带昵称;查不到昵称就不发,不发空名单刷屏)。 */
+  private async emitGroupJoinNotice(
+    conversationId: string,
+    joined: string[],
+  ): Promise<void> {
+    try {
+      const users = await this.prisma.user.findMany({
+        where: { id: { in: joined } },
+        select: { nickname: true },
+      });
+      const names = users.map((u) => u.nickname).filter(Boolean);
+      if (names.length > 0) {
+        await this.systemMessage.emit(conversationId, {
+          kind: 'member-joined',
+          names,
+        });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `join notice failed conversation=${conversationId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** 会话偏好(置顶/免打扰/隐藏):每成员独立,替代 OpenIM 的会话属性。 */
@@ -709,6 +1104,8 @@ export class ChatService {
       circle: member.conversation.circleID
         ? (circles.get(member.conversation.circleID) ?? null)
         : null,
+      name: member.conversation.name ?? null,
+      ownerId: member.conversation.ownerID ?? null,
       tempChat: member.conversation.tempChatID
         ? (tempChats.get(member.conversation.tempChatID) ?? null)
         : null,
@@ -1429,6 +1826,8 @@ export class ChatService {
       peer: { id: peer.id, nickname: peer.nickname, avatarUrl: peer.avatarUrl },
       circleId: null,
       circle: null,
+      name: null,
+      ownerId: null,
       tempChat: null,
       lastMessage,
       unreadCount: unread.get(conv.id) ?? 0,
@@ -1488,18 +1887,18 @@ export class ChatService {
     conversationId: string,
   ): Promise<ChatMemberDto[]> {
     const conversation = await this.requireMembership(conversationId, userId);
-    if (conversation.type === 'GROUP') {
-      const membership = conversation.circleID
-        ? await this.prisma.circleMember.findUnique({
-            where: {
-              userID_circleID: {
-                userID: userId,
-                circleID: conversation.circleID,
-              },
-            },
-            select: { role: true, status: true },
-          })
-        : null;
+    // 圈子群的目录只开放给圈主/管理员;独立群聊(无 circleID)是微信群语义,
+    // 成员就是彼此拉进来的好友网络,全员可见目录(邀请选人也依赖它)。
+    if (conversation.type === 'GROUP' && conversation.circleID) {
+      const membership = await this.prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: userId,
+            circleID: conversation.circleID,
+          },
+        },
+        select: { role: true, status: true },
+      });
       const canViewDirectory =
         membership?.status === 'ACTIVE' &&
         (membership.role === 'OWNER' || membership.role === 'ADMIN');
@@ -2573,24 +2972,35 @@ export class ChatService {
   }
 
   /**
-   * G-14 清空聊天记录:per-viewer 水位,只前进不后退;对端与服务端数据不受影响
-   * (物理删除是撤回/焚毁的事)。清空即已读:lastReadHeight 同步推到同一高度。
+   * G-14 清空聊天记录:私聊推进双方成员水位,群聊仅推进发起者水位；都只前进
+   * 不后退。消息行保留用于审计/合规,但目标成员的所有设备都无法再读到旧记录。
+   * 清空即已读:lastReadHeight 同步推到同一高度。
    */
   async clearHistory(
     userId: string,
     conversationId: string,
+    forEveryone = false,
   ): Promise<{ clearedBeforeHeight: number }> {
-    await this.requireMembershipSeat(conversationId, userId);
+    const member = await this.requireMembershipSeat(conversationId, userId);
     const top = await this.prisma.chatMessage.aggregate({
       where: { conversationID: conversationId },
       _max: { height: true },
     });
     const watermark = top._max.height ?? 0;
     if (watermark <= 0) return { clearedBeforeHeight: 0 };
+    const targetUserIds =
+      forEveryone && member.conversation.type === 'DIRECT'
+        ? (
+            await this.prisma.chatMember.findMany({
+              where: { conversationID: conversationId, leftAt: null },
+              select: { userID: true },
+            })
+          ).map((target) => target.userID)
+        : [userId];
     await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
-        userID: userId,
+        userID: { in: targetUserIds },
         clearedBeforeHeight: { lt: watermark },
       },
       data: { clearedBeforeHeight: watermark },
@@ -2598,7 +3008,7 @@ export class ChatService {
     const read = await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
-        userID: userId,
+        userID: { in: targetUserIds },
         lastReadHeight: { lt: watermark },
       },
       data: { lastReadHeight: watermark },
@@ -2607,10 +3017,19 @@ export class ChatService {
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
     if (read.count > 0) {
-      this.broadcast.emitRead({
+      for (const targetUserId of targetUserIds) {
+        this.broadcast.emitRead({
+          conversationId,
+          userId: targetUserId,
+          height: watermark,
+        });
+      }
+    }
+    if (forEveryone && member.conversation.type === 'DIRECT') {
+      this.broadcast.emitHistoryCleared({
         conversationId,
-        userId,
-        height: watermark,
+        clearedBeforeHeight: watermark,
+        clearedBy: userId,
       });
     }
     return { clearedBeforeHeight: watermark };
@@ -2670,6 +3089,7 @@ const REPLY_PREVIEW_LABELS: Record<string, string> = {
   'friend-card': '[名片]',
   'circle-card': '[圈子]',
   'plaza-post-card': '[帖子]',
+  'qr-card': '[二维码]',
   'transfer-card': '[转账]',
   'verification-card': '[验证]',
   'call-record': '[通话]',

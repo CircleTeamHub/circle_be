@@ -5,11 +5,12 @@ import { NoteShareLinkPublicController } from './note-share-link-public.controll
 import { NoteController } from './note.controller';
 import { NoteService } from './note.service';
 import { NoteShareLinkCleanup } from './note-share-link.cleanup';
+import { NoteRecycleBinCleanup } from './note-recycle-bin.cleanup';
 
 @Module({
   imports: [UploadModule, MembershipPolicyModule],
   controllers: [NoteController, NoteShareLinkPublicController],
-  providers: [NoteService, NoteShareLinkCleanup],
+  providers: [NoteService, NoteShareLinkCleanup, NoteRecycleBinCleanup],
   exports: [NoteService],
 })
 export class NoteModule {}
