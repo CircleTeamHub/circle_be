@@ -12,13 +12,12 @@ import {
   prismaErrorCode,
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
+import { GROUP_CAPACITY_HARD_LIMIT } from 'src/circle/circle-limits';
 import {
   GROUP_EXPANSION_PRODUCTS,
   GroupExpansionProductId,
   getGroupExpansionProduct,
 } from './group-expansion.catalog';
-
-const GROUP_CAPACITY_HARD_LIMIT = 3000;
 
 interface StoredExpansionOrder {
   id: string;

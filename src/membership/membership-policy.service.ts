@@ -97,6 +97,9 @@ export class MembershipPolicyService {
     const entitlementLevel = level as MembershipLevel;
     return {
       level: entitlementLevel,
+      // 未开放期间「不被额度挡住」由 entitlementLevel 的 gold 地板负责,不是靠把
+      // 额度拉到无穷大 —— 那会连反滥用上限一起取消(圈子数/群成员数/笔记数全部
+      // 无界),而这些上限的并发守卫本身就是靠额度值成立的。
       tier: MEMBERSHIP_CATALOG[entitlementLevel],
       vipExpiresAt: actual.vipExpiresAt,
     };

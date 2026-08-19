@@ -104,6 +104,8 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly expiryTimers = new Map<Socket, NodeJS.Timeout>();
   /** 多设备是正当需求,但单账号不该能开出无上限的连接来摊薄限流成本。 */
   private static readonly MAX_SOCKETS_PER_USER = 10;
+  /** 初始化期间只保留一个小型 FIFO；超过它说明客户端正在洪泛而不是正常抢发。 */
+  private static readonly MAX_PRE_READY_EVENTS = 64;
   private readonly connectionsByUser = new Map<string, Set<Socket>>();
 
   constructor(
@@ -464,64 +466,125 @@ export class ChatGateway implements OnModuleDestroy {
     // 监听必须**同步**注册,在任何 await 之前。全局 presence 注册和入房都可能被
     // Redis/数据库拖慢；这段窗口里的首条消息要等 ready 后处理,不能被 Socket.IO
     // 当成无人监听的事件直接丢掉。
-    let resolveReady!: (ok: boolean) => void;
-    const ready = new Promise<boolean>((resolve) => {
-      resolveReady = resolve;
-    });
+    let admissionState: 'pending' | 'ready' | 'failed' = 'pending';
+    const preReadyQueue: Array<() => Promise<void>> = [];
+    let drainingPreReadyQueue = false;
     let conversationIds: string[] = [];
     // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
     let blockedPeers: string[] = [];
 
-    const whenReady = (run: () => void): void => {
-      void ready.then((ok) => {
-        if (ok) run();
-      });
+    const failAdmission = (): void => {
+      admissionState = 'failed';
+      preReadyQueue.length = 0;
+    };
+    const drainPreReadyQueue = async (): Promise<void> => {
+      if (drainingPreReadyQueue || admissionState !== 'ready') return;
+      drainingPreReadyQueue = true;
+      try {
+        while (admissionState === 'ready' && preReadyQueue.length > 0) {
+          const run = preReadyQueue.shift();
+          if (!run) continue;
+          // 单条排队事件失败不能带走整条队列。让它抛出去会中止 drain,而
+          // admissionState 仍是 ready —— 之后的新事件直接走即时分支,没人再回来
+          // 排空剩下的积压:那些消息既不执行也不回 ack,在客户端看就是凭空消失。
+          // 各 handler 内部已各自回过错误 ack,这里只兜住漏到外面的 rejection
+          // (限流器的 tryAcquire 就在各自的 try 之外)。
+          try {
+            await run();
+          } catch (error) {
+            this.logger.warn(
+              `pre-ready event failed for user ${userId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
+      } finally {
+        drainingPreReadyQueue = false;
+      }
+    };
+    const whenReady = (run: () => Promise<void>): boolean => {
+      if (admissionState === 'ready') {
+        void run();
+        return true;
+      }
+      if (admissionState === 'failed') return false;
+      if (preReadyQueue.length >= ChatGateway.MAX_PRE_READY_EVENTS) {
+        failAdmission();
+        this.metrics.observeConnectionRejected('pre_ready_overflow');
+        socket.disconnect(true);
+        return false;
+      }
+      preReadyQueue.push(run);
+      return true;
     };
 
     socket.on(
       CHAT_EVENTS.send,
       (payload: ChatSendPayload, ack?: AckFn<ChatSendAck>) => {
-        whenReady(() => void this.handleSend(socket, userId, payload, ack));
+        if (!whenReady(() => this.handleSend(socket, userId, payload, ack))) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
       },
     );
     socket.on(
       CHAT_EVENTS.read,
       (payload: ChatReadPayload, ack?: AckFn<ChatReadAck>) => {
-        whenReady(() => void this.handleRead(socket, userId, payload, ack));
+        if (!whenReady(() => this.handleRead(socket, userId, payload, ack))) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
       },
     );
     socket.on(CHAT_EVENTS.typing, (payload: ChatTypingPayload) => {
-      whenReady(() => void this.handleTyping(socket, userId, payload));
+      whenReady(() => this.handleTyping(socket, userId, payload));
     });
     socket.on(
       CHAT_EVENTS.revoke,
       (payload: ChatRevokePayload, ack?: AckFn<ChatReadAck>) => {
-        whenReady(() => void this.handleRevoke(userId, payload, ack));
+        if (!whenReady(() => this.handleRevoke(userId, payload, ack))) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
       },
     );
     socket.on(CHAT_EVENTS.delivered, (payload: ChatDeliveredPayload) => {
-      whenReady(() => void this.handleDelivered(userId, payload));
+      whenReady(() => this.handleDelivered(userId, payload));
     });
     socket.on(
       CHAT_EVENTS.reaction,
       (payload: ChatReactionPayload, ack?: AckFn<ChatReadAck>) => {
-        whenReady(() => void this.handleReaction(userId, payload, ack));
+        if (!whenReady(() => this.handleReaction(userId, payload, ack))) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
       },
     );
     socket.on(
       CHAT_EVENTS.edit,
       (payload: ChatEditPayload, ack?: AckFn<ChatReadAck>) => {
-        whenReady(() => void this.handleEdit(userId, payload, ack));
+        if (!whenReady(() => this.handleEdit(userId, payload, ack))) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
       },
     );
     socket.on(
       CHAT_EVENTS.presence,
       (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
-        whenReady(() => void this.handlePresenceQuery(socket, payload, ack));
+        if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
+          if (typeof ack === 'function') ack({});
+        }
       },
     );
     socket.on('disconnect', () => {
-      resolveReady(false);
+      failAdmission();
       this.releaseConnectionSlot(userId, socket);
       void this.presence.socketDisconnected(userId, socket.id);
       this.metrics.observeConnectionClosed(this.connectionsByUser.size);
@@ -572,6 +635,7 @@ export class ChatGateway implements OnModuleDestroy {
       );
       void this.presence.socketDisconnected(userId, socket.id);
       this.releaseConnectionSlot(userId, socket);
+      failAdmission();
       socket.disconnect(true);
       return;
     }
@@ -599,11 +663,12 @@ export class ChatGateway implements OnModuleDestroy {
         `join rooms failed for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
       );
       this.metrics.observeConnectionRejected('join_failed');
-      resolveReady(false);
+      failAdmission();
       socket.disconnect(true);
       return;
     }
-    resolveReady(true);
+    admissionState = 'ready';
+    void drainPreReadyQueue();
     // 会话房派生完成 → 挂进跨实例在线集合(推送分流/在线判定的数据源)。
     void this.presence.registerConversations(userId, conversationIds);
 

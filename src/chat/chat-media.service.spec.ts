@@ -19,6 +19,7 @@ function dto(overrides: Partial<ChatMessageDto>): ChatMessageDto {
 describe('ChatMediaService', () => {
   const uploadService = {
     createPresignedGetUrl: jest.fn(),
+    copyObjectToKey: jest.fn(),
     deleteObjectByKey: jest.fn(),
   };
   const prisma = {
@@ -39,6 +40,7 @@ describe('ChatMediaService', () => {
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
     );
     uploadService.deleteObjectByKey.mockResolvedValue(undefined);
+    uploadService.copyObjectToKey.mockResolvedValue(undefined);
     prisma.chatMediaDeletion.upsert.mockResolvedValue({});
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
@@ -165,5 +167,58 @@ describe('ChatMediaService', () => {
     await service.attachMediaUrls([image]);
     expect(image.content).not.toBe(original);
     expect(original).toEqual({ key: 'chat/a.jpg' });
+  });
+
+  it('copies every media object into the forwarding user namespace', async () => {
+    const result = await service.copyForForward(
+      'image',
+      {
+        key: 'chat/u2/source.jpg',
+        thumbKey: 'chat/u2/source-thumb.jpg',
+        width: 640,
+        url: 'https://expired.example/source.jpg',
+      },
+      'u1',
+    );
+
+    expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(2);
+    expect(uploadService.copyObjectToKey).toHaveBeenNthCalledWith(
+      1,
+      'chat/u2/source.jpg',
+      expect.stringMatching(/^chat\/u1\/[0-9a-f-]+\.jpg$/),
+    );
+    expect(result.content).toMatchObject({
+      key: expect.stringMatching(/^chat\/u1\/[0-9a-f-]+\.jpg$/),
+      thumbKey: expect.stringMatching(/^chat\/u1\/[0-9a-f-]+\.jpg$/),
+      width: 640,
+    });
+    expect(result.content).not.toHaveProperty('url');
+    expect(result.copiedKeys).toHaveLength(2);
+  });
+
+  it('cleans up earlier copies when a later media object copy fails', async () => {
+    uploadService.copyObjectToKey
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('copy failed'));
+
+    await expect(
+      service.copyForForward(
+        'image',
+        {
+          key: 'chat/u2/source.jpg',
+          thumbKey: 'chat/u2/source-thumb.jpg',
+        },
+        'u1',
+      ),
+    ).rejects.toThrow('copy failed');
+
+    expect(uploadService.deleteObjectByKey).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to copy non-chat object keys', async () => {
+    await expect(
+      service.copyForForward('image', { key: 'notes/u2/private.jpg' }, 'u1'),
+    ).rejects.toThrow();
+    expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
   });
 });

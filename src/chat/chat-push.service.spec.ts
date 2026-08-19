@@ -22,6 +22,7 @@ describe('ChatPushService', () => {
     chatMember: { findMany: jest.fn() },
     chatConversation: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn() },
+    tempChat: { findUnique: jest.fn() },
   };
   const push = {
     listActiveTokens: jest.fn(),
@@ -168,6 +169,34 @@ describe('ChatPushService', () => {
         data: expect.objectContaining({
           sourceID: 'circle-1',
           conversationType: 'group',
+        }),
+      }),
+    );
+  });
+
+  it('routes TEMP pushes back into the temporary group conversation', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([
+      { id: 's1', userID: 'u-host', muted: false },
+    ]);
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      type: 'TEMP',
+      circleID: null,
+      tempChatID: 'tc-1',
+    });
+    prisma.tempChat.findUnique.mockResolvedValue({ title: '周末临时群' });
+
+    await service.onMessageBroadcast(msg());
+
+    expect(push.sendToTokens).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        title: '周末临时群',
+        body: '发送者: hello world',
+        data: expect.objectContaining({
+          conversationId: 'conv-1',
+          sourceID: 'conv-1',
+          conversationType: 'group',
+          conversationKind: 'temp',
         }),
       }),
     );

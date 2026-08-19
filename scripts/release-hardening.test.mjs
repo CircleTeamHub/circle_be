@@ -324,18 +324,26 @@ esac
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
 });
 
-test('workflow stages target content and delegates activation to the persistent launcher', () => {
+test('workflow stages and activates only through the restricted release protocol', () => {
   const release = read('.github/workflows/release.yml');
-  assert.match(
-    release,
-    /ref: \$\{\{ github\.workflow_sha \}\}[\s\S]*path: \.release-workflow/,
-  );
-  assert.match(
-    release,
-    /stage_path="\$DEPLOY_PATH\/\.release\/incoming\/\$STAGED_RELEASE_NAME"/,
-  );
-  assert.match(release, /\.release\/release-launcher\.sh/);
-  assert.doesNotMatch(release, /exec bash %q\/deploy\/release-deploy\.sh/);
+  assert.match(release, /circle-release stage \$STAGED_RELEASE_NAME \$RELEASE_SHA/);
+  assert.match(release, /circle-release activate \$STAGED_RELEASE_NAME/);
+  assert.doesNotMatch(release, /ssh[^\n]*bash -s/);
+  assert.doesNotMatch(release, /rsync[\s\S]*ssh -i/);
+  assert.doesNotMatch(release, /Install persistent release launcher/);
+});
+
+test('server ForceCommand accepts no general shell or launcher replacement command', () => {
+  const gate = read('deploy/release-force-command.sh');
+  assert.match(gate, /SSH_ORIGINAL_COMMAND/);
+  assert.match(gate, /command_parts\[0\].*circle-release/);
+  assert.match(gate, /stage\) stage_release/);
+  assert.match(gate, /activate\) activate_release/);
+  assert.match(gate, /! -w "\$LAUNCHER"/);
+  assert.match(gate, /exec env -i/);
+  assert.doesNotMatch(gate, /eval /);
+  assert.doesNotMatch(gate, /bash -c/);
+  assert.doesNotMatch(gate, /install-launcher/);
 });
 
 test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
@@ -414,6 +422,7 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
   assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
+  assert.match(ci, /bash test\/release-force-command\.spec\.sh/);
 });
 
 test('every main push creates the exact-SHA CI run required by release', () => {
@@ -439,7 +448,7 @@ test('release selection and active-color state fail closed', () => {
     release,
     /head_sha=\$SHA&event=push&branch=main&status=completed/,
   );
-  assert.match(release, /--exclude=\/\.release/);
+  assert.match(release, /--exclude=\.\/\.release/);
   assert.match(deploy, /recorded_live_color\(\)/);
   assert.match(deploy, /Refusing to guess which container is live/);
   assert.match(deploy, /caddy reload --config \/etc\/caddy\/Caddyfile/);

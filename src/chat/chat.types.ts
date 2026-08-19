@@ -10,6 +10,8 @@ export interface ChatSendPayload {
   content: Record<string, unknown>;
   d: string;
   replyToId?: string;
+  /** 媒体转发的源消息。服务端重新校验可见性并复制对象，不信任 content 中的 key。 */
+  forwardFromMessageId?: string;
 }
 
 /** chat:read 客户端载荷:上报某会话的已读水位。 */

@@ -173,6 +173,66 @@ describe('TempChatService', () => {
     });
   });
 
+  describe('listMine', () => {
+    it('returns every currently active room before filling the 200-row history cap', async () => {
+      const activeRoom = {
+        id: 'tc-active-old',
+        groupId: 'g-active-old',
+        title: '仍在使用',
+        status: 'ACTIVE',
+        maxMembers: 50,
+        expiresAt: future,
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        endedAt: null,
+        _count: { guests: 0 },
+      };
+      const endedRoom = {
+        ...activeRoom,
+        id: 'tc-ended-new',
+        groupId: 'g-ended-new',
+        title: '最近已结束',
+        status: 'ENDED',
+        createdAt: new Date('2026-08-17T00:00:00Z'),
+        endedAt: new Date('2026-08-17T01:00:00Z'),
+      };
+      prisma.tempChat.findMany
+        .mockResolvedValueOnce([activeRoom])
+        .mockResolvedValueOnce([endedRoom]);
+      prisma.chatConversation.findMany.mockResolvedValue([
+        { id: 'conv-active', tempChatID: activeRoom.id },
+        { id: 'conv-ended', tempChatID: endedRoom.id },
+      ]);
+
+      const result = await service.listMine('host-1');
+
+      expect(prisma.tempChat.findMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          where: {
+            hostUserId: 'host-1',
+            status: 'ACTIVE',
+            expiresAt: { gt: expect.any(Date) },
+          },
+          take: 200,
+        }),
+      );
+      expect(prisma.tempChat.findMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: {
+            hostUserId: 'host-1',
+            id: { notIn: [activeRoom.id] },
+          },
+          take: 199,
+        }),
+      );
+      expect(result.map((room) => room.id)).toEqual([
+        activeRoom.id,
+        endedRoom.id,
+      ]);
+    });
+  });
+
   describe('join', () => {
     beforeEach(() => {
       linkToken.verify.mockReturnValue({ tcId: 'tc-1' });

@@ -189,16 +189,36 @@ export class TempChatService {
   }
 
   async listMine(hostUserId: string): Promise<TempChatListItem[]> {
-    const rows = await this.prisma.tempChat.findMany({
-      where: { hostUserId },
+    const include = {
+      _count: {
+        select: { guests: { where: { provisioningFailedAt: null } } },
+      },
+    } as const;
+    const activeRows = await this.prisma.tempChat.findMany({
+      where: {
+        hostUserId,
+        status: TempChatStatus.ACTIVE,
+        expiresAt: { gt: new Date() },
+      },
       orderBy: [{ createdAt: 'desc' }],
       take: 200, // #108：防爆护栏
-      include: {
-        _count: {
-          select: { guests: { where: { provisioningFailedAt: null } } },
-        },
-      },
+      include,
     });
+    const remaining = 200 - activeRows.length;
+    const activeIds = activeRows.map((row) => row.id);
+    const recentRows =
+      remaining > 0
+        ? await this.prisma.tempChat.findMany({
+            where: {
+              hostUserId,
+              ...(activeIds.length > 0 ? { id: { notIn: activeIds } } : {}),
+            },
+            orderBy: [{ createdAt: 'desc' }],
+            take: remaining,
+            include,
+          })
+        : [];
+    const rows = [...activeRows, ...recentRows];
     const conversations = await this.prisma.chatConversation.findMany({
       where: { tempChatID: { in: rows.map((row) => row.id) } },
       select: { id: true, tempChatID: true },

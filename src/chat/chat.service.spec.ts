@@ -53,6 +53,7 @@ describe('ChatService', () => {
   const circleSync = { ensureCircleConversation: jest.fn() };
   const media = {
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
+    copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
   };
   const privacySettings = {
@@ -325,6 +326,299 @@ describe('ChatService', () => {
   });
 
   describe('sendMessage', () => {
+    it('copies visible source media into the forwarding user namespace', async () => {
+      const targetMembership = membership();
+      const sourceMembership = membership({
+        conversationID: 'source-conv',
+        clearedBeforeHeight: 0,
+        conversation: {
+          ...membership().conversation,
+          id: 'source-conv',
+          burnDurationSec: null,
+        },
+      });
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(sourceMembership)
+        .mockResolvedValueOnce(targetMembership);
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce({
+          ...createdRow,
+          id: 'source-message',
+          conversationID: 'source-conv',
+          height: 8,
+          type: 'image',
+          content: { key: 'chat/u2/source.jpg', width: 640 },
+          revokedAt: null,
+        })
+        .mockResolvedValueOnce(null);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+        copiedKeys: ['chat/u1/copied.jpg'],
+      });
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/copied.jpg', width: 640 },
+      });
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-message',
+        } as never),
+      );
+
+      expect(media.copyForForward).toHaveBeenCalledWith(
+        'image',
+        { key: 'chat/u2/source.jpg', width: 640 },
+        'u1',
+      );
+      expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            type: 'image',
+            content: { key: 'chat/u1/copied.jpg', width: 640 },
+          }),
+        }),
+      );
+      expect(result.reused).toBe(false);
+      expect(media.deleteObjects).not.toHaveBeenCalled();
+    });
+
+    it('rejects forwarding media hidden below the viewer clear watermark', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            clearedBeforeHeight: 8,
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: null,
+            },
+          }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg' },
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toThrow(NotFoundException);
+      expect(media.copyForForward).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    // 可见性只回答「你现在能不能看见」。阅后即焚会话里**别人**发的媒体仍在
+    // 窗口内 —— 就是说它可见 —— 但把它复制进一个没有 burn 的会话等于绕开发送者
+    // 的短暂性承诺,而且副本比源消息活得更久。
+    it('refuses to forward another user media out of a burn-after-read conversation', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            clearedBeforeHeight: 0,
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: 30,
+            },
+          }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u2',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg' },
+        createdAt: new Date(),
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(media.copyForForward).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    // 自己发的是自己的内容,key 也在自己命名空间里 —— 从相册重发一次效果一样,
+    // 拦下来不保护任何人。但仍然要过烧毁水位:已经烧掉的自己的消息不能复活。
+    it('lets a user forward their own media out of a burn-after-read conversation', async () => {
+      const targetMembership = membership();
+      const burnMembership = membership({
+        conversationID: 'source-conv',
+        clearedBeforeHeight: 0,
+        conversation: {
+          ...membership().conversation,
+          id: 'source-conv',
+          burnDurationSec: 3600,
+        },
+      });
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(burnMembership)
+        .mockResolvedValueOnce(targetMembership);
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce({
+          ...createdRow,
+          id: 'source-message',
+          conversationID: 'source-conv',
+          senderID: 'u1',
+          height: 8,
+          type: 'image',
+          content: { key: 'chat/u1/mine.jpg' },
+          createdAt: new Date(),
+          revokedAt: null,
+        })
+        .mockResolvedValueOnce(null);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/copied.jpg' },
+        copiedKeys: ['chat/u1/copied.jpg'],
+      });
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/copied.jpg' },
+      });
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-message',
+        } as never),
+      );
+
+      expect(media.copyForForward).toHaveBeenCalledWith(
+        'image',
+        { key: 'chat/u1/mine.jpg' },
+        'u1',
+      );
+      expect(result.reused).toBe(false);
+    });
+
+    it('still refuses a self-forward once the burn window has passed', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            clearedBeforeHeight: 0,
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: 60,
+            },
+          }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u1',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u1/mine.jpg' },
+        createdAt: new Date(Date.now() - 3600 * 1000),
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toThrow(NotFoundException);
+      expect(media.copyForForward).not.toHaveBeenCalled();
+    });
+
+    it('deletes speculative copies when an idempotent forward already exists', async () => {
+      const targetMembership = membership();
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: null,
+            },
+          }),
+        )
+        .mockResolvedValueOnce(targetMembership);
+      const source = {
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        type: 'image',
+        content: { key: 'chat/u2/source.jpg' },
+        revokedAt: null,
+      };
+      const existing = {
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/existing.jpg' },
+      };
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(source)
+        .mockResolvedValueOnce(existing);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/speculative.jpg' },
+        copiedKeys: ['chat/u1/speculative.jpg'],
+      });
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-message',
+        } as never),
+      );
+
+      expect(result.reused).toBe(true);
+      expect(media.deleteObjects).toHaveBeenCalledWith([
+        'chat/u1/speculative.jpg',
+      ]);
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     // 锁外校验与落库之间是一个真实窗口:踢人、拉黑、管理台禁言、临时房到期
     // 都可能恰好落在这中间。advisory lock 之后才是真正串行的位置,所以那几道
     // 判定必须在事务内用事务客户端再跑一遍 —— 否则「立刻生效」的封禁语义

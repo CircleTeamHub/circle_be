@@ -16,6 +16,7 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
     handshake: { auth: { token: 'jwt' } },
     join: jest.fn().mockResolvedValue(undefined),
     disconnect: jest.fn(),
+    disconnected: false,
     on: jest.fn((event: string, handler: Handler) => {
       handlers.set(event, handler);
     }),
@@ -98,6 +99,8 @@ describe('ChatGateway', () => {
     // clearAllMocks 会连实现一起清掉,这里重设默认「无拉黑关系」。
     chatService.listBlockedCounterparties.mockResolvedValue([]);
   });
+
+  afterEach(() => jest.restoreAllMocks());
 
   describe('authenticate', () => {
     it('accepts a valid access token and returns the userId', async () => {
@@ -323,6 +326,114 @@ describe('ChatGateway', () => {
       await pending;
       await Promise.resolve();
       expect(handleSend).toHaveBeenCalledTimes(1);
+      handleSend.mockRestore();
+    });
+
+    it('disconnects when the shared pre-ready queue exceeds its fixed cap', async () => {
+      const socket = fakeSocket({ disconnected: false });
+      socket.disconnect.mockImplementation(() => {
+        socket.disconnected = true;
+      });
+      let finishRegistration!: (count: number | null) => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockResolvedValue(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const earlyHandler = socket.handlers.get('chat:send');
+      const acknowledgements = Array.from({ length: 65 }, () => jest.fn());
+      acknowledgements.forEach((ack, index) => {
+        earlyHandler?.({ conversationId: `conv-${index}` }, ack);
+      });
+
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
+        'pre_ready_overflow',
+      );
+      expect(acknowledgements[64]).toHaveBeenCalledWith(
+        expect.objectContaining({ ok: false, code: ChatErrorCode.RateLimited }),
+      );
+      finishRegistration(null);
+      await pending;
+      await Promise.resolve();
+      expect(handleSend).not.toHaveBeenCalled();
+      handleSend.mockRestore();
+    });
+
+    it('drains accepted pre-ready events sequentially after admission', async () => {
+      const socket = fakeSocket();
+      let finishRegistration!: (count: number | null) => void;
+      let finishFirst!: () => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const earlyHandler = socket.handlers.get('chat:send');
+      earlyHandler?.({ conversationId: 'conv-first' }, jest.fn());
+      earlyHandler?.({ conversationId: 'conv-second' }, jest.fn());
+
+      finishRegistration(null);
+      await pending;
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(1);
+
+      finishFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(2);
+      handleSend.mockRestore();
+    });
+
+    // 串行 drain 的代价是共享失败面:一条排队事件把 rejection 漏出来就会中止
+    // 整个循环,而 admissionState 仍是 ready —— 没人再回来排空剩下的积压,那些
+    // 消息既不执行也不回 ack。限流器的 tryAcquire 就在各 handler 的 try 之外,
+    // Redis 抖一下就能触发。
+    it('keeps draining the pre-ready queue after one event rejects', async () => {
+      const socket = fakeSocket();
+      let finishRegistration!: (count: number | null) => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockRejectedValueOnce(new Error('rate limiter unavailable'))
+        .mockResolvedValueOnce(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const earlyHandler = socket.handlers.get('chat:send');
+      earlyHandler?.({ conversationId: 'conv-first' }, jest.fn());
+      earlyHandler?.({ conversationId: 'conv-second' }, jest.fn());
+
+      finishRegistration(null);
+      await pending;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(handleSend).toHaveBeenCalledTimes(2);
+      expect(handleSend.mock.calls[1][2]).toEqual(
+        expect.objectContaining({ conversationId: 'conv-second' }),
+      );
       handleSend.mockRestore();
     });
 

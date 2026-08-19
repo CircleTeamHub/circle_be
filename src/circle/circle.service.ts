@@ -20,7 +20,10 @@ import {
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
-import { CIRCLE_CREATE_LIMIT } from './circle-limits';
+import {
+  CIRCLE_CREATE_LIMIT,
+  GROUP_CAPACITY_HARD_LIMIT,
+} from './circle-limits';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { CircleMemberLockService } from './circle-member-lock';
 import {
@@ -132,7 +135,13 @@ export class CircleService {
         });
       }
 
-      const capacity = policy.tier.quotas.groupMembers.actual;
+      // 客户端建群不传 maxMembers,所以这一列的默认值直接就是会员配额。配额是
+      // 目录数据不是入参,夹一道之后,配额被写大只会退化成"按上限建",而不是一条
+      // Postgres 数值溢出的 500(int4 上限 21 亿)。扩容路径用的是同一个常量。
+      const capacity = Math.min(
+        policy.tier.quotas.groupMembers.actual,
+        GROUP_CAPACITY_HARD_LIMIT,
+      );
       const maxMembers = dto.maxMembers ?? capacity;
       if (maxMembers > capacity) {
         throw new ForbiddenException({

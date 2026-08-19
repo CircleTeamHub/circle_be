@@ -156,12 +156,26 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
+    if (
+      payload.forwardFromMessageId !== undefined &&
+      (typeof payload.forwardFromMessageId !== 'string' ||
+        payload.forwardFromMessageId.length === 0 ||
+        payload.forwardFromMessageId.length > CLIENT_MESSAGE_ID_MAX_LENGTH)
+    ) {
+      throw new BadRequestException({
+        message: 'forwardFromMessageId 非法',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
     // 媒体消息只收 object key,且必须是发送者自己的 chat/{senderId}/ 命名空间。
     // 拒 URL 形态是防「URL 固化进消息体」回潮(读路径统一由 ChatMediaService
     // 签发,见 docs/self-hosted-chat.md);绑命名空间是防拿到别人的 key
     // (例如从早期授权响应里学到的 notes/<别人>/...)后借聊天读路径无限续签,
     // 把已撤销授权的私有对象转手分发出去。
-    if (MEDIA_MESSAGE_TYPES.includes(payload.type)) {
+    if (
+      MEDIA_MESSAGE_TYPES.includes(payload.type) &&
+      payload.forwardFromMessageId === undefined
+    ) {
       const ownPrefix = `${CHAT_MEDIA_KEY_PREFIX}${senderUserId}/`;
       const isOwnKey = (value: unknown): boolean =>
         typeof value === 'string' &&
@@ -229,122 +243,237 @@ export class ChatService {
     if (conversation.type === 'TEMP') {
       await this.assertTempChatActive(conversation);
     }
-    // G-09 真引用的归属校验。replyToId 之前只校验「是个字符串」,于是任何人都能
-    // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,
-    // 把那条消息的发送者昵称、类型和文本摘要广播进当前房间。退群的人手里留着
-    // 旧 UUID 同样能这么捞。放在事务外做:被引用消息不会换会话,没有 TOCTOU。
-    const replyToId = await this.resolveReplyTarget(
-      payload.conversationId,
-      payload.replyToId,
-    );
+    let effectivePayload = payload;
+    let copiedKeys: string[] = [];
+    try {
+      if (payload.forwardFromMessageId) {
+        const source = await this.resolveForwardableMedia(
+          senderUserId,
+          payload.forwardFromMessageId,
+        );
+        const copied = await this.media.copyForForward(
+          source.type,
+          source.content,
+          senderUserId,
+        );
+        copiedKeys = copied.copiedKeys;
+        effectivePayload = {
+          conversationId: payload.conversationId,
+          type: source.type,
+          content: copied.content,
+          d: payload.d,
+          // 被源消息接管的只有 type/content;引用是本次发送自己的意图,
+          // 漏掉它等于静默丢掉客户端明确发上来的 replyToId。
+          ...(payload.replyToId !== undefined
+            ? { replyToId: payload.replyToId }
+            : {}),
+        };
+        this.validateSendPayload(senderUserId, effectivePayload);
+      }
+      // G-09 真引用的归属校验。replyToId 之前只校验「是个字符串」,于是任何人都能
+      // 拿一条**别的会话**里的消息 UUID 当引用发出去 —— attachReplyTo 照单全收,
+      // 把那条消息的发送者昵称、类型和文本摘要广播进当前房间。退群的人手里留着
+      // 旧 UUID 同样能这么捞。放在事务外做:被引用消息不会换会话,没有 TOCTOU。
+      const replyToId = await this.resolveReplyTarget(
+        effectivePayload.conversationId,
+        effectivePayload.replyToId,
+      );
 
-    // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
-    // 按 key 现签),不是消息体的一部分 —— 留着的话:
-    // 1) 客户端塞的 url/thumbUrl 会在签名失败(存储不可用)时原样存活并被渲染;
-    // 2) localUri 本该只是发送方的本机路径,一旦被塞成 https://attacker/1x1.gif,
-    //    每个滑过这条消息的人都会静默 GET 一次,把 IP 和已读时刻交给对方。
-    // 客户端的本地预览应当只留在本地,不上行。
-    const content = (
-      MEDIA_MESSAGE_TYPES.includes(payload.type)
-        ? stripMediaPresentationFields(payload.content)
-        : payload.content
-    ) as Prisma.InputJsonObject;
-    const created = await this.prisma.$transaction(async (tx) => {
-      // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
-      // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
-      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+      // 媒体消息落库前剥掉展示字段。这些字段是读路径的产物(ChatMediaService
+      // 按 key 现签),不是消息体的一部分 —— 留着的话:
+      // 1) 客户端塞的 url/thumbUrl 会在签名失败(存储不可用)时原样存活并被渲染;
+      // 2) localUri 本该只是发送方的本机路径,一旦被塞成 https://attacker/1x1.gif,
+      //    每个滑过这条消息的人都会静默 GET 一次,把 IP 和已读时刻交给对方。
+      // 客户端的本地预览应当只留在本地,不上行。
+      const content = (
+        MEDIA_MESSAGE_TYPES.includes(effectivePayload.type)
+          ? stripMediaPresentationFields(effectivePayload.content)
+          : effectivePayload.content
+      ) as Prisma.InputJsonObject;
+      const created = await this.prisma.$transaction(async (tx) => {
+        // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
+        // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
+        const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
         SELECT "nextHeight" FROM "ChatConversation"
-        WHERE "id" = ${payload.conversationId} FOR UPDATE`;
-      if (counter.length === 0) {
-        throw new NotFoundException({
-          message: '会话不存在',
-          errorCode: ChatErrorCode.ConversationNotFound,
-        });
-      }
-      // 锁之后复查一遍。上面那几道是在锁外读的,和落库之间存在窗口:踢人、
-      // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
-      // 行锁之后才是真正串行的位置,所以复查放在这里 —— 且在取号之前,
-      // 被拒绝的发送不推进计数器,height 无空洞。
-      await this.assertStillSendable(tx, payload.conversationId, senderUserId);
+        WHERE "id" = ${effectivePayload.conversationId} FOR UPDATE`;
+        if (counter.length === 0) {
+          throw new NotFoundException({
+            message: '会话不存在',
+            errorCode: ChatErrorCode.ConversationNotFound,
+          });
+        }
+        // 锁之后复查一遍。上面那几道是在锁外读的,和落库之间存在窗口:踢人、
+        // 拉黑、管理台禁言、临时房到期都可能恰好落在这中间,消息照样写进去。
+        // 行锁之后才是真正串行的位置,所以复查放在这里 —— 且在取号之前,
+        // 被拒绝的发送不推进计数器,height 无空洞。
+        await this.assertStillSendable(
+          tx,
+          effectivePayload.conversationId,
+          senderUserId,
+        );
 
-      const existing = await tx.chatMessage.findUnique({
-        where: {
-          conversationID_senderID_clientMessageId: {
-            conversationID: payload.conversationId,
-            senderID: senderUserId,
-            clientMessageId: payload.d,
+        const existing = await tx.chatMessage.findUnique({
+          where: {
+            conversationID_senderID_clientMessageId: {
+              conversationID: effectivePayload.conversationId,
+              senderID: senderUserId,
+              clientMessageId: effectivePayload.d,
+            },
           },
-        },
+        });
+        if (existing) {
+          return { row: existing, reused: true };
+        }
+
+        const height = counter[0].nextHeight + 1;
+
+        const row = await tx.chatMessage.create({
+          data: {
+            conversationID: effectivePayload.conversationId,
+            height,
+            senderID: senderUserId,
+            type: effectivePayload.type,
+            content,
+            clientMessageId: effectivePayload.d,
+            replyToID: replyToId,
+          },
+        });
+        // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
+        await tx.chatConversation.update({
+          where: { id: effectivePayload.conversationId },
+          data: { nextHeight: height, lastMessageAt: row.createdAt },
+        });
+        // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
+        await tx.chatMember.updateMany({
+          where: {
+            conversationID: effectivePayload.conversationId,
+            hiddenAt: { not: null },
+          },
+          data: { hiddenAt: null },
+        });
+        return { row, reused: false };
       });
-      if (existing) {
-        return { row: existing, reused: true };
+
+      // 提交完成的那一刻就把复制出来的对象交割掉。继续留在 copiedKeys 里的话,
+      // 提交之后任何一次抛错都会走到下面的 catch,把一条**已经落库**的消息所
+      // 引用的媒体删掉 —— 行还在,图永远打不开。
+      const orphanedCopies = copiedKeys;
+      copiedKeys = [];
+      if (created.reused && orphanedCopies.length > 0) {
+        // 幂等重放:库里那条引用的是首次复制出来的 key,这一轮复制的是孤儿。
+        // 清不掉只是留下垃圾对象,不该让一条已落库的消息投递失败。
+        try {
+          await this.media.deleteObjects(orphanedCopies);
+        } catch (error) {
+          this.logger.warn(
+            `forward copy cleanup failed message=${created.row.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
 
-      const height = counter[0].nextHeight + 1;
+      // 事务已经提交 —— 这之后的一切都只是「把行装饰成 DTO」,绝不能因此抛错。
+      //
+      // 抛出去的后果不是"这次失败重试就好":handleSend 捕获后既不广播也不推送,
+      // 而客户端拿同一个 d 重发时会命中幂等分支(reused=true),那条分支**刻意
+      // 不广播**(首次投递时房间里已经收到过了 —— 但这次并没有)。于是一次瞬时的
+      // 昵称查询失败,就让这条消息对所有收件人永久消失,数据库里却明明存着。
+      //
+      // 昵称/头像是装饰:取不到就发 sender=null,客户端仍有 senderID 可用。
+      // 用降级换投递,而不是用投递换完整性。
+      let sender: ChatSenderInfo | null = null;
+      try {
+        sender =
+          (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
+      } catch (error) {
+        this.logger.warn(
+          `sender enrichment failed after commit message=${created.row.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      const message = this.toMessageDto(created.row, sender);
+      // ack 与广播共用这份 DTO:引用快照与媒体 url 都在此附上(读路径,不落库)。
+      // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛;attachReplyTo 会 ——
+      // 它要多查一次库。理由与上面的昵称同款,而且更狠:引用快照丢了只是少个
+      // 折叠条,抛出去却会让整条消息对所有收件人永久消失。
+      try {
+        await this.attachReplyTo([message]);
+      } catch (error) {
+        this.logger.warn(
+          `reply enrichment failed after commit message=${created.row.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      await this.media.attachMediaUrls([message]);
+      return { message, reused: created.reused };
+    } catch (error) {
+      if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
+      throw error;
+    }
+  }
 
-      const row = await tx.chatMessage.create({
-        data: {
-          conversationID: payload.conversationId,
-          height,
-          senderID: senderUserId,
-          type: payload.type,
-          content,
-          clientMessageId: payload.d,
-          replyToID: replyToId,
-        },
-      });
-      // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
-      await tx.chatConversation.update({
-        where: { id: payload.conversationId },
-        data: { nextHeight: height, lastMessageAt: row.createdAt },
-      });
-      // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
-      await tx.chatMember.updateMany({
-        where: {
-          conversationID: payload.conversationId,
-          hiddenAt: { not: null },
-        },
-        data: { hiddenAt: null },
-      });
-      return { row, reused: false };
+  private async resolveForwardableMedia(
+    userId: string,
+    messageId: string,
+  ): Promise<{ type: string; content: Record<string, unknown> }> {
+    const row = await this.prisma.chatMessage.findUnique({
+      where: { id: messageId },
+      omit: MESSAGE_READ_OMIT,
     });
-
-    // 事务已经提交 —— 这之后的一切都只是「把行装饰成 DTO」,绝不能因此抛错。
-    //
-    // 抛出去的后果不是"这次失败重试就好":handleSend 捕获后既不广播也不推送,
-    // 而客户端拿同一个 d 重发时会命中幂等分支(reused=true),那条分支**刻意
-    // 不广播**(首次投递时房间里已经收到过了 —— 但这次并没有)。于是一次瞬时的
-    // 昵称查询失败,就让这条消息对所有收件人永久消失,数据库里却明明存着。
-    //
-    // 昵称/头像是装饰:取不到就发 sender=null,客户端仍有 senderID 可用。
-    // 用降级换投递,而不是用投递换完整性。
-    let sender: ChatSenderInfo | null = null;
-    try {
-      sender =
-        (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
-    } catch (error) {
-      this.logger.warn(
-        `sender enrichment failed after commit message=${created.row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+    if (
+      !row ||
+      row.deleted ||
+      row.revokedAt ||
+      !MEDIA_MESSAGE_TYPES.includes(row.type)
+    ) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
     }
-    const message = this.toMessageDto(created.row, sender);
-    // ack 与广播共用这份 DTO:引用快照与媒体 url 都在此附上(读路径,不落库)。
-    // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛;attachReplyTo 会 ——
-    // 它要多查一次库。理由与上面的昵称同款,而且更狠:引用快照丢了只是少个
-    // 折叠条,抛出去却会让整条消息对所有收件人永久消失。
-    try {
-      await this.attachReplyTo([message]);
-    } catch (error) {
-      this.logger.warn(
-        `reply enrichment failed after commit message=${created.row.id}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+    const { conversation, member } = await this.requireMembershipSeat(
+      row.conversationID,
+      userId,
+    );
+    // 可见性只回答「你现在能不能看见」,回答不了「你能不能让别人永远看见」。
+    // 阅后即焚会话的短暂性是**发送者对收件人的承诺**:把别人发的对象复制进一个
+    // 没有 burn 的会话,等于绕开那条承诺把它永久化,副本还活得比源消息久。
+    //
+    // 自己发的除外。那是你自己的内容、key 本来就在你自己的命名空间里,你打开
+    // 相册重发一次效果完全一样 —— 拦下来不保护任何人,只是让你多走一步。
+    if (conversation.burnDurationSec && row.senderID !== userId) {
+      throw new ForbiddenException({
+        message: '阅后即焚会话中的消息不可转发',
+        errorCode: ChatErrorCode.ForwardForbidden,
+      });
     }
-    await this.media.attachMediaUrls([message]);
-    return { message, reused: created.reused };
+    // burn 会话现在还能走到这儿(自己发的),所以烧毁水位必须重新参与判定 ——
+    // 否则「自己的」这个口子会顺带放行自己早就烧掉的消息。
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const burnCutoff = conversation.burnDurationSec
+      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
+      : null;
+    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
+    if (
+      row.height <= (member.clearedBeforeHeight ?? 0) ||
+      (cutoff !== null && row.createdAt < cutoff)
+    ) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    const content = row.content;
+    if (!content || typeof content !== 'object' || Array.isArray(content)) {
+      throw new NotFoundException({
+        message: '消息不存在',
+        errorCode: ChatErrorCode.MessageNotFound,
+      });
+    }
+    return { type: row.type, content: content as Record<string, unknown> };
   }
 
   /**

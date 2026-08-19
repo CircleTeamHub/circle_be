@@ -8,7 +8,8 @@
 #   promote   — on tag push only, stamp the prebuilt sha image with the version tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
-#   deploy    — stage the tagged repo, then use the persistent locked launcher
+#   deploy    — stage the tagged repo through the server ForceCommand protocol,
+#               then use the persistent locked launcher
 #               to activate it and run release-deploy.sh: DB backup → migrate → start the
 #               standby color → health gate → switch → public smoke test,
 #               with automatic rollback if the new version fails
@@ -287,16 +288,6 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.tag }}
 
-      # A rollback target may predate the launcher. Fetch the launcher from the
-      # commit that defined this workflow, never from target tag contents.
-      - name: Checkout trusted release launcher
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: .release-workflow
-          sparse-checkout: deploy/release-launcher.sh
-          sparse-checkout-cone-mode: false
-
       - name: Configure SSH
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -316,57 +307,30 @@ jobs:
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Install persistent release launcher
-        env:
-          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
-          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
-        run: |
-          set -euo pipefail
-          launcher_tmp="$DEPLOY_PATH/.release/release-launcher.sh.$GITHUB_RUN_ID.tmp"
-          ssh_target="$DEPLOY_USER@$DEPLOY_HOST"
-          ssh_args=(-i "$HOME/.ssh/deploy_key" -o StrictHostKeyChecking=yes)
-          ssh "${ssh_args[@]}" "$ssh_target" "mkdir -p $(printf '%q' "$DEPLOY_PATH/.release")"
-          rsync -az -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
-            .release-workflow/deploy/release-launcher.sh "$ssh_target:$launcher_tmp"
-          {
-            printf 'deploy_path=%q launcher_tmp=%q\n' "$DEPLOY_PATH" "$launcher_tmp"
-            cat <<'REMOTE'
-          set -euo pipefail
-          exec 201>"$deploy_path/.release/deploy.lock"
-          flock -x 201
-          install -m 0755 "$launcher_tmp" "$deploy_path/.release/release-launcher.sh"
-          rm -f "$launcher_tmp"
-          REMOTE
-          } | ssh "${ssh_args[@]}" "$ssh_target" bash -s
-
-      # Upload is inert. The launcher performs the only rsync into the live tree
-      # after acquiring the persistent lock and re-reading the compatibility floor.
+      # The deployment key has a server-side ForceCommand. It accepts only this
+      # bounded stage protocol and the activate protocol below; historical
+      # workflow revisions cannot obtain a shell or replace the trusted launcher.
       - name: Stage release on server
         id: stage
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
         run: |
           set -euo pipefail
           STAGED_RELEASE_NAME="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_SHA"
-          stage_path="$DEPLOY_PATH/.release/incoming/$STAGED_RELEASE_NAME"
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" \
-            "mkdir -p $(printf '%q' "$stage_path")"
-          rsync -az --delete \
-            --exclude=/.env \
-            --exclude=/.env.production \
-            --exclude=/.release \
-            --exclude=/.release-workflow \
-            --exclude=.git \
-            --exclude=node_modules \
-            --exclude=dist \
-            --exclude=logs \
-            --exclude=coverage \
-            -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
-            ./ "$DEPLOY_USER@$DEPLOY_HOST:$stage_path/"
+          tar -czf - \
+            --exclude=./.env \
+            --exclude=./.env.production \
+            --exclude=./.release \
+            --exclude=./.git \
+            --exclude=./node_modules \
+            --exclude=./dist \
+            --exclude=./logs \
+            --exclude=./coverage \
+            . | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "circle-release stage $STAGED_RELEASE_NAME $RELEASE_SHA"
           echo "name=$STAGED_RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Activate staged release on server
@@ -384,17 +348,20 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
-          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'circle_be' }}
         run: |
           set -euo pipefail
-          # Env travels over stdin (printf %q-escaped), never argv, so the
-          # registry token cannot show up in `ps` output on the server.
-          {
-            printf 'export TARGET_SCHEMA_COMPATIBILITY=%q RELEASE_TAG=%q CIRCLE_BE_IMAGE=%q RELEASE_DOWNTIME=%q RELEASE_IRREVERSIBLE_MIGRATION=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
-              "$RELEASE_SCHEMA_COMPATIBILITY" \
-              "$RELEASE_TAG" "$CIRCLE_BE_IMAGE" "$RELEASE_DOWNTIME" "$RELEASE_IRREVERSIBLE_MIGRATION" "$GHCR_USER" "$GHCR_TOKEN"
-            printf 'exec bash %q/.release/release-launcher.sh %q\n' "$DEPLOY_PATH" "$STAGED_RELEASE_NAME"
-          } | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "$DEPLOY_USER@$DEPLOY_HOST" bash -s
+          # Values travel as a fixed seven-line stdin protocol, never shell or
+          # argv. The server validates every field before invoking the launcher.
+          printf '%s\n' \
+            "$RELEASE_SCHEMA_COMPATIBILITY" \
+            "$RELEASE_TAG" \
+            "$CIRCLE_BE_IMAGE" \
+            "$RELEASE_DOWNTIME" \
+            "$RELEASE_IRREVERSIBLE_MIGRATION" \
+            "$GHCR_USER" \
+            "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "circle-release activate $STAGED_RELEASE_NAME"
 
       # Outside-in verification from a network the server does not control:
       # the runner probes the public API domain after the switch.
