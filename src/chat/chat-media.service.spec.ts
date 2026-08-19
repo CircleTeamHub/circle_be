@@ -19,7 +19,7 @@ function dto(overrides: Partial<ChatMessageDto>): ChatMessageDto {
 describe('ChatMediaService', () => {
   const uploadService = {
     createPresignedGetUrl: jest.fn(),
-    copyObjectByKey: jest.fn(),
+    copyObjectToKey: jest.fn(),
     deleteObjectByKey: jest.fn(),
   };
   const prisma = {
@@ -40,7 +40,7 @@ describe('ChatMediaService', () => {
       Promise.resolve({ url: `https://signed/${key}`, expiresAt: new Date() }),
     );
     uploadService.deleteObjectByKey.mockResolvedValue(undefined);
-    uploadService.copyObjectByKey.mockResolvedValue(undefined);
+    uploadService.copyObjectToKey.mockResolvedValue(undefined);
     prisma.chatMediaDeletion.upsert.mockResolvedValue({});
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
@@ -181,8 +181,8 @@ describe('ChatMediaService', () => {
       'u1',
     );
 
-    expect(uploadService.copyObjectByKey).toHaveBeenCalledTimes(2);
-    expect(uploadService.copyObjectByKey).toHaveBeenNthCalledWith(
+    expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(2);
+    expect(uploadService.copyObjectToKey).toHaveBeenNthCalledWith(
       1,
       'chat/u2/source.jpg',
       expect.stringMatching(/^chat\/u1\/[0-9a-f-]+\.jpg$/),
@@ -197,7 +197,7 @@ describe('ChatMediaService', () => {
   });
 
   it('cleans up earlier copies when a later media object copy fails', async () => {
-    uploadService.copyObjectByKey
+    uploadService.copyObjectToKey
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('copy failed'));
 
@@ -219,6 +219,6 @@ describe('ChatMediaService', () => {
     await expect(
       service.copyForForward('image', { key: 'notes/u2/private.jpg' }, 'u1'),
     ).rejects.toThrow();
-    expect(uploadService.copyObjectByKey).not.toHaveBeenCalled();
+    expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
   });
 });

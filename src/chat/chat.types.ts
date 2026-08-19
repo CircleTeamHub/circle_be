@@ -148,6 +148,13 @@ export interface ChatReadBroadcast {
   height: number;
 }
 
+/** 私聊双方清空广播；群聊的个人清空不会发送该事件。 */
+export interface ChatHistoryClearedBroadcast {
+  conversationId: string;
+  clearedBeforeHeight: number;
+  clearedBy: string;
+}
+
 /** chat:typing 服务端广播。 */
 export interface ChatTypingBroadcast {
   conversationId: string;
@@ -203,6 +210,10 @@ export interface ChatConversationDto {
   circleId: string | null;
   /** GROUP 会话的圈子展示信息(名称/头像即群名/群头像);其余类型为 null。 */
   circle: { id: string; name: string; avatarUrl: string | null } | null;
+  /** 独立群聊(GROUP 且无 circleId)的群名;可空=客户端按成员昵称兜底。 */
+  name: string | null;
+  /** 独立群聊的群主 userId;圈子群/其他类型为 null。 */
+  ownerId: string | null;
   /** TEMP 会话的稳定房间信息;其余类型为 null。 */
   tempChat: { id: string; title: string } | null;
   lastMessage: ChatMessageDto | null;

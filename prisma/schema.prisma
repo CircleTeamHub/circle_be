@@ -430,6 +430,7 @@ model User {
   fancyNumberOrders                 FancyNumberOrder[]
   groupExpansionOrders              GroupExpansionOrder[]
   supportAgentRoles                 SupportAgent[]
+  qrTokensIssued                    QrToken[]                   @relation("qrTokenIssuer")
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -859,6 +860,8 @@ model Note {
   mediaCount          Int        @default(0)
   imageCount          Int        @default(0)
   videoCount          Int        @default(0)
+  // 仅笔记主人可见的私人备注 —— 不随分享/访客视图外发（序列化时按 viewer 判空）。
+  remark              String?
   // 从聊天收藏他人笔记时的来源快照（会话类型、群/发送者名片、消息定位信息）。
   // 自建笔记为 null；collectedFromNoteID 冗余成单列用于幂等去重查询。
   collectedFrom       Json?
@@ -1922,8 +1925,14 @@ model ChatConversation {
   /// DIRECT 会话防重键：两个 userID 升序以 ':' 拼接；其余类型为 null。
   directKey  String?              @unique
   /// GROUP 会话 ←→ Circle.id（一圈一群）；TEMP 会话 ←→ TempChat.id。
+  /// circleID 为 null 的 GROUP = 独立群聊（微信群语义，成员即 ChatMember）。
   circleID   String?              @unique
   tempChatID String?              @unique
+  /// 独立群聊的群名（可空 = 客户端按成员昵称兜底）；圈子群名走 Circle.name。
+  name       String?
+  /// 独立群聊的群主（建群人；退群时转给最早入群的在座成员）。不建 User 外键，
+  /// 同 ChatMessage.senderID 先例：聊天行不随账号删除级联。
+  ownerID    String?
   /// 会话列表排序依据；发送事务内更新。
   lastMessageAt DateTime?
   /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
@@ -2039,4 +2048,28 @@ model ChatMessageReaction {
 
   @@unique([messageID, userID, emoji])
   @@index([messageID])
+}
+
+/// 二维码令牌类型:个人名片 / 独立群聊 / 圈子。
+enum QrTokenType {
+  USER
+  GROUP
+  CIRCLE
+}
+
+/// 服务端签发的二维码令牌。UUID 不是授权 —— 扫码入群/入圈的准入凭据就是这一行:
+/// token 随机不可枚举,GROUP/CIRCLE 七天过期(微信语义),USER 长效可撤销重置。
+/// 校验一律读库,不做无状态签名:过期/撤销/签发者失权都要立刻生效。
+model QrToken {
+  id        String      @id @default(uuid())
+  token     String      @unique
+  type      QrTokenType
+  targetID  String
+  issuerID  String
+  issuer    User        @relation("qrTokenIssuer", fields: [issuerID], references: [id], onDelete: Cascade)
+  expiresAt DateTime?
+  revokedAt DateTime?
+  createdAt DateTime    @default(now())
+
+  @@index([type, targetID, issuerID, createdAt])
 }

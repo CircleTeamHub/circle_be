@@ -160,6 +160,7 @@ export class FriendController {
         description: dto.description,
         photos: dto.photos,
         permission: dto.permission,
+        qrToken: dto.qrToken,
       },
     );
   }

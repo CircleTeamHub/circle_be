@@ -59,6 +59,7 @@ export class ChatPushService {
           type: true,
           circleID: true,
           tempChatID: true,
+          name: true,
         },
       }),
       this.broadcast.getOnlineUserIdsInConversation(message.conversationId),
@@ -203,6 +204,7 @@ export class ChatPushService {
       type: string;
       circleID: string | null;
       tempChatID: string | null;
+      name: string | null;
     },
   ): Promise<{ title: string; body: string; data: Record<string, unknown> }> {
     const senderName = message.sender?.nickname ?? '';
@@ -247,6 +249,21 @@ export class ChatPushService {
         },
       };
     }
+    if (conversation.type === 'GROUP') {
+      // 独立群聊:标题用群名(空群名退化到发送者);sourceID = 会话 id。
+      const title = conversation.name?.trim() || senderName || '群聊';
+      return {
+        title,
+        body: senderName ? `${senderName}: ${preview}` : preview,
+        data: {
+          type: 'chat',
+          conversationId: message.conversationId,
+          sourceID: message.conversationId,
+          conversationType: 'group',
+          title,
+        },
+      };
+    }
     const title = senderName || '新消息';
     return {
       title,
@@ -287,6 +304,8 @@ export class ChatPushService {
         return '[转账]';
       case 'note-card':
         return '[笔记]';
+      case 'qr-card':
+        return '[二维码]';
       default:
         return '[消息]';
     }

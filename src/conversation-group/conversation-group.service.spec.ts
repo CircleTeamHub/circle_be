@@ -97,6 +97,10 @@ describe('ConversationGroupService', () => {
         },
         include: { memberships: true },
       });
+      const [lockQuery] = prisma.$queryRaw.mock.calls[0];
+      expect(lockQuery.join('?')).toContain(
+        'pg_advisory_xact_lock(hashtext(?))::text',
+      );
     });
 
     it('translates P2002 (unique constraint) into ConflictException', async () => {

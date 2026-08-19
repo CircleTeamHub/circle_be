@@ -24,6 +24,8 @@ export const CHAT_EVENTS = {
   reaction: 'chat:reaction',
   /** 双向:消息编辑(客户端带 ack;服务端广播到会话房) */
   edit: 'chat:edit',
+  /** 服务端 → 客户端:私聊任一方清空后,双方设备同步清空到该水位 */
+  historyCleared: 'chat:history_cleared',
 } as const;
 
 /** 消息编辑的时间窗(仅发送者本人;与撤回同窗)。 */
@@ -73,6 +75,9 @@ export const CLIENT_MESSAGE_TYPES = [
   'friend-card',
   'circle-card',
   'plaza-post-card',
+  // 二维码卡片(名片 / 群 / 圈子):载荷只是一个令牌指针,收件人点开时走 /qr 预览
+  // 端点自己去核验 —— 伪造它顶多是发了张扫不通的码,属分享类而非回执类。
+  'qr-card',
 ] as const;
 
 export const SYSTEM_MESSAGE_TYPE = 'system';

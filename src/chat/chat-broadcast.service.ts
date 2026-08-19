@@ -6,6 +6,7 @@ import type {
   ChatConversationBroadcast,
   ChatDeliveredBroadcast,
   ChatEditBroadcast,
+  ChatHistoryClearedBroadcast,
   ChatMessageDto,
   ChatReactionBroadcast,
   ChatReadBroadcast,
@@ -45,6 +46,15 @@ export class ChatBroadcastService {
     server
       .to(conversationRoom(payload.conversationId))
       .emit(CHAT_EVENTS.read, payload);
+  }
+
+  /** 私聊双方历史水位推进 → 会话房内所有在线设备。 */
+  emitHistoryCleared(payload: ChatHistoryClearedBroadcast): void {
+    const server = this.requireServer('emitHistoryCleared');
+    if (!server) return;
+    server
+      .to(conversationRoom(payload.conversationId))
+      .emit(CHAT_EVENTS.historyCleared, payload);
   }
 
   /** 正在输入 → 会话房内除本人外的成员。 */

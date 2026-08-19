@@ -329,6 +329,22 @@ export const ChatErrorCode = {
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
   ForwardForbidden: 'CHAT_FORWARD_FORBIDDEN',
+  // 独立群聊(不挂圈子的 GROUP):建群/邀请只能选好友;圈子群的成员由圈子管理,
+  // 独立群专属操作(邀请/退群/改名)打到圈子群上要显式拒绝而不是静默生效。
+  GroupFriendsOnly: 'CHAT_GROUP_FRIENDS_ONLY',
+  GroupMinMembers: 'CHAT_GROUP_MIN_MEMBERS',
+  GroupCircleManaged: 'CHAT_GROUP_CIRCLE_MANAGED',
+  // 扫码进群放开了好友边界,没有容量闸的话一张群码等于无限进人。
+  GroupFull: 'CHAT_GROUP_FULL',
+} as const;
+
+// 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /
+// 无签发资格(非本人名片、不在群、无圈子邀请权)。
+export const QrErrorCode = {
+  Invalid: 'QR_INVALID',
+  Expired: 'QR_EXPIRED',
+  TypeUnsupported: 'QR_TYPE_UNSUPPORTED',
+  IssueForbidden: 'QR_ISSUE_FORBIDDEN',
 } as const;
 
 // 收藏:收藏项不存在。(注:收藏页暂未接入 getApiErrorMessage,码先就位,待前端接线。)
@@ -414,7 +430,8 @@ export type AppErrorCode =
   | (typeof LikeErrorCode)[keyof typeof LikeErrorCode]
   | (typeof PrivacyErrorCode)[keyof typeof PrivacyErrorCode]
   | (typeof SupportErrorCode)[keyof typeof SupportErrorCode]
-  | (typeof UserErrorCode)[keyof typeof UserErrorCode];
+  | (typeof UserErrorCode)[keyof typeof UserErrorCode]
+  | (typeof QrErrorCode)[keyof typeof QrErrorCode];
 
 export const APP_ERROR_CODE_GROUPS = [
   AdminUserErrorCode,
@@ -443,6 +460,7 @@ export const APP_ERROR_CODE_GROUPS = [
   PrivacyErrorCode,
   SupportErrorCode,
   UserErrorCode,
+  QrErrorCode,
 ] as const;
 
 export const APP_ERROR_CODES = APP_ERROR_CODE_GROUPS.flatMap((group) =>

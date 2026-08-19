@@ -118,7 +118,7 @@ export class ChatMediaService implements OnModuleDestroy {
         const extension =
           rawExtension.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
         const destinationKey = `${CHAT_MEDIA_KEY_PREFIX}${userId}/${randomUUID()}.${extension}`;
-        await this.uploadService.copyObjectByKey(sourceKey, destinationKey);
+        await this.uploadService.copyObjectToKey(sourceKey, destinationKey);
         copiedKeys.push(destinationKey);
         content[field.key] = destinationKey;
       }

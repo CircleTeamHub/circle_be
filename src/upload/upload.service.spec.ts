@@ -525,7 +525,7 @@ describe('UploadService', () => {
     (service as any).ready = true;
     (service as any).client = { send };
 
-    await service.copyObjectByKey(
+    await service.copyObjectToKey(
       'chat/u2/source image.jpg',
       'chat/u1/copied.jpg',
     );

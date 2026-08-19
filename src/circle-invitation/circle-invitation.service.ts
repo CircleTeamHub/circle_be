@@ -128,21 +128,31 @@ export class CircleInvitationService {
     inviterId: string,
     applicantId: string,
     circleId: string,
+    opts?: {
+      /**
+       * 扫圈子二维码入圈:applicant 本人主动扫码,这不是「被拉」。
+       * groupInvitePermission 是防打扰开关(不许别人拉我),对本人动作不适用,
+       * 跳过;拉黑是更硬的意愿表达,在下面的事务里照拦,两个方向都不放。
+       */
+      applicantConsented?: boolean;
+    },
   ): Promise<InvitationDto> {
-    // Pass real friendship status: a FRIENDS_ONLY invite permission must let
-    // friends through. Hardcoding false here would collapse FRIENDS_ONLY into
-    // NONE and block invites even from friends.
-    const inviterIsFriend = await this.areFriends(inviterId, applicantId);
-    const canInviteApplicant =
-      await this.privacySettings.canBeInvitedToGroupOrCircle(
-        applicantId,
-        inviterIsFriend,
-      );
-    if (!canInviteApplicant) {
-      throw new ForbiddenException({
-        message: 'User does not allow circle invites',
-        errorCode: CircleInvitationErrorCode.NotAllowed,
-      });
+    if (!opts?.applicantConsented) {
+      // Pass real friendship status: a FRIENDS_ONLY invite permission must let
+      // friends through. Hardcoding false here would collapse FRIENDS_ONLY into
+      // NONE and block invites even from friends.
+      const inviterIsFriend = await this.areFriends(inviterId, applicantId);
+      const canInviteApplicant =
+        await this.privacySettings.canBeInvitedToGroupOrCircle(
+          applicantId,
+          inviterIsFriend,
+        );
+      if (!canInviteApplicant) {
+        throw new ForbiddenException({
+          message: 'User does not allow circle invites',
+          errorCode: CircleInvitationErrorCode.NotAllowed,
+        });
+      }
     }
 
     // 6. Create invitation; the inviter takes the first seat only if they may vouch
