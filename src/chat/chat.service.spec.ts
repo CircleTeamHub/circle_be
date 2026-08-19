@@ -643,6 +643,37 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
+    it('returns an existing forwarded delivery before resolving or copying its source', async () => {
+      const existing = {
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/existing.jpg' },
+      };
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValueOnce(existing);
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-now-revoked',
+        } as never),
+      );
+
+      expect(result.reused).toBe(true);
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledTimes(1);
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          senderID: 'u1',
+          clientMessageId: 'client-msg-1',
+        },
+      });
+      expect(media.copyForForward).not.toHaveBeenCalled();
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
     // 锁外校验与落库之间是一个真实窗口:踢人、拉黑、管理台禁言、临时房到期
     // 都可能恰好落在这中间。advisory lock 之后才是真正串行的位置,所以那几道
     // 判定必须在事务内用事务客户端再跑一遍 —— 否则「立刻生效」的封禁语义
