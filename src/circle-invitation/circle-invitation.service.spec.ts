@@ -1830,7 +1830,9 @@ describe('CircleInvitationService', () => {
         }),
       ).resolves.toMatchObject({ id: 'inv-new', status: 'PENDING' });
 
-      expect(privacySettings.canBeInvitedToGroupOrCircle).not.toHaveBeenCalled();
+      expect(
+        privacySettings.canBeInvitedToGroupOrCircle,
+      ).not.toHaveBeenCalled();
       expect(prisma.block.findFirst).toHaveBeenCalled();
       expect(admissionPolicy.assertCanApply).toHaveBeenCalledWith(
         prisma,

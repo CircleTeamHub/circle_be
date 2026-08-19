@@ -184,10 +184,7 @@ export class ChatService {
     }
     if (payload.type === 'qr-card') {
       const token = payload.content['token'];
-      if (
-        typeof token !== 'string' ||
-        !/^[A-Za-z0-9_-]{16,128}$/.test(token)
-      ) {
+      if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(token)) {
         throw new BadRequestException({
           message: '二维码令牌非法',
           errorCode: ChatErrorCode.InvalidPayload,

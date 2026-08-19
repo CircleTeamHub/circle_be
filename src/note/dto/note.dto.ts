@@ -669,6 +669,8 @@ export class NoteChatMediaImportDto {
   @ApiProperty({ type: [NoteChatMediaItemDto] })
   items: NoteChatMediaItemDto[];
 
-  @ApiProperty({ description: 'Number of requested objects that failed to copy.' })
+  @ApiProperty({
+    description: 'Number of requested objects that failed to copy.',
+  })
   failedCount: number;
 }

@@ -1671,6 +1671,33 @@ describe('ChatService', () => {
       ...overrides,
     });
 
+    // 笔记导入的 key 是 (viewer, note, media) 的确定性指纹：同一个人把同一张
+    // 笔记图发进两个会话会落到同一个对象上。对象删除没有引用计数，撤回其中一条
+    // 若把对象删了，另一条的图就对所有人永久坏掉 —— 这类 key 的生命周期跟着
+    // 笔记媒体走，不跟着任何单条消息走。
+    it('leaves the shared note-import object alone when one message is revoked', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      const shared = revokableRow({
+        content: {
+          key: 'chat/u1/note-import/abc123.jpg',
+          thumbKey: 'chat/u1/note-import/abc123.t.jpg',
+        },
+      });
+      prisma.chatMessage.findUnique.mockResolvedValue(shared);
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...shared,
+        content: {},
+        revokedAt: new Date(),
+        revokedBy: 'u1',
+      });
+
+      await service.revokeMessage('u1', 'conv-1', 'm1');
+
+      expect(prisma.chatMessage.updateMany).toHaveBeenCalled();
+      expect(media.deleteObjects).not.toHaveBeenCalled();
+    });
+
     it('sender revokes within the window: clears content, deletes media, broadcasts', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(revokableRow());
@@ -2615,32 +2642,6 @@ describe('ChatService', () => {
         }),
       );
       expect(media.deleteObjects).toHaveBeenCalledWith(['chat/u1/a.jpg']);
-    });
-
-    // 笔记导入的 key 是 (viewer, note, media) 的确定性指纹：同一个人把同一张
-    // 笔记图发进两个会话会共用一个对象。删除没有引用计数，撤回其中一条若把
-    // 对象删了，另一条的图就永久坏掉。
-    it('keeps the shared note-import object when one message is revoked', async () => {
-      prisma.chatMessage.findUnique.mockResolvedValue({
-        ...createdRow,
-        type: 'image',
-        content: {
-          key: 'chat/u1/note-import/abc123.jpg',
-          thumbKey: 'chat/u1/note-import/abc123-thumb.jpg',
-        },
-        revokedAt: null,
-      });
-      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
-      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
-        ...createdRow,
-        type: 'image',
-        content: {},
-        revokedAt: new Date(),
-      });
-
-      await service.revokeMessage('u1', 'conv-1', 'msg-1');
-
-      expect(media.deleteObjects).not.toHaveBeenCalled();
     });
   });
 
