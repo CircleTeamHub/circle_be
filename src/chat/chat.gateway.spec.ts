@@ -403,6 +403,65 @@ describe('ChatGateway', () => {
       handleSend.mockRestore();
     });
 
+    it('keeps ready-time events behind the draining pre-ready FIFO', async () => {
+      const socket = fakeSocket();
+      let finishRegistration!: (count: number | null) => void;
+      let finishFirst!: () => void;
+      let finishSecond!: () => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              finishSecond = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const send = socket.handlers.get('chat:send');
+      send?.({ conversationId: 'conv-first' }, jest.fn());
+      send?.({ conversationId: 'conv-second' }, jest.fn());
+
+      finishRegistration(null);
+      await pending;
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(1);
+
+      send?.({ conversationId: 'conv-third' }, jest.fn());
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(1);
+
+      finishFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(2);
+      expect(handleSend.mock.calls[1][2]).toEqual(
+        expect.objectContaining({ conversationId: 'conv-second' }),
+      );
+
+      finishSecond();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(handleSend).toHaveBeenCalledTimes(3);
+      expect(handleSend.mock.calls[2][2]).toEqual(
+        expect.objectContaining({ conversationId: 'conv-third' }),
+      );
+      handleSend.mockRestore();
+    });
+
     // 串行 drain 的代价是共享失败面:一条排队事件把 rejection 漏出来就会中止
     // 整个循环,而 admissionState 仍是 ready —— 没人再回来排空剩下的积压,那些
     // 消息既不执行也不回 ack。限流器的 tryAcquire 就在各 handler 的 try 之外,

@@ -504,7 +504,11 @@ export class ChatGateway implements OnModuleDestroy {
       }
     };
     const whenReady = (run: () => Promise<void>): boolean => {
-      if (admissionState === 'ready') {
+      if (
+        admissionState === 'ready' &&
+        !drainingPreReadyQueue &&
+        preReadyQueue.length === 0
+      ) {
         void run();
         return true;
       }
@@ -516,6 +520,7 @@ export class ChatGateway implements OnModuleDestroy {
         return false;
       }
       preReadyQueue.push(run);
+      if (admissionState === 'ready') void drainPreReadyQueue();
       return true;
     };
 
