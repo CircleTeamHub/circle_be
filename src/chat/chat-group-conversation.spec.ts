@@ -3,7 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
 } from '@nestjs/common';
-import { ChatErrorCode } from 'src/common/app-error-codes';
+import { ChatErrorCode, GroupErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from './chat.service';
 
 /**
@@ -142,7 +142,7 @@ describe('ChatService standalone group conversations', () => {
       }),
     ).rejects.toMatchObject({
       constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.GroupFriendsOnly },
+      response: { errorCode: GroupErrorCode.InviteNotAllowed },
     });
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
@@ -251,7 +251,7 @@ describe('ChatService standalone group conversations', () => {
       service.inviteToGroupConversation('owner-1', 'conv-1', ['f1']),
     ).rejects.toMatchObject({
       constructor: ForbiddenException,
-      response: { errorCode: ChatErrorCode.GroupFriendsOnly },
+      response: { errorCode: GroupErrorCode.InviteNotAllowed },
     });
     expect(prisma.chatMember.create).not.toHaveBeenCalled();
   });

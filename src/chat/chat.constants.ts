@@ -110,6 +110,16 @@ export const MEDIA_MESSAGE_TYPES: readonly string[] = [
 export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
 
 /**
+ * 笔记媒体导入聊天时的目标命名空间。
+ *
+ * 这段路径下的对象 key 是 (viewer, note, media) 的确定性指纹,同一个人重复把
+ * 同一张笔记图发进聊天会落到**同一个对象**上(这正是导入幂等的实现方式)。
+ * 于是它的生命周期不再属于任何单条消息 —— 撤回/阅后即焚清扫按 key 删对象时
+ * 必须跳过它,否则删掉的是所有引用它的消息共用的那一份。
+ */
+export const CHAT_NOTE_IMPORT_SEGMENT = 'note-import/';
+
+/**
  * 媒体消息 content 里的 object-key 字段表(key 字段名 → 读路径补的 URL 字段名)。
  * presign-on-read(ChatMediaService)与存量盘点(StorageAuditService)共用:
  * 新增带媒体的消息类型时在这里补一行,两边同时生效 —— 只改一边的话,

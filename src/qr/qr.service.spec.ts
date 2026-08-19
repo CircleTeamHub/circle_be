@@ -210,20 +210,26 @@ describe('QrService', () => {
   });
 
   describe('rotateUserToken', () => {
-    it('returns the current token when rotation is retried within 60 seconds', async () => {
+    // 「重置」是用户主动作废旧码的动作,客户端随后会弹"旧二维码已失效"。
+    // 刚签发/刚轮换过就再点一次,也必须真的换掉令牌,否则那句提示就是假的。
+    it('always rotates, even when the current token was just issued', async () => {
       prisma.qrToken.findFirst.mockResolvedValue({
         id: 'qr-1',
         token: 'same-token',
-        createdAt: new Date(Date.now() - 30_000),
+        createdAt: new Date(Date.now() - 5_000),
       });
 
-      await expect(service.rotateUserToken('u1')).resolves.toMatchObject({
-        token: 'same-token',
-      });
+      const result = await service.rotateUserToken('u1');
 
-      expect(prisma.$queryRaw).toHaveBeenCalled();
-      expect(prisma.qrToken.update).not.toHaveBeenCalled();
-      expect(prisma.qrToken.create).not.toHaveBeenCalled();
+      expect(result.token).not.toBe('same-token');
+      expect(prisma.qrToken.update).toHaveBeenCalledWith({
+        where: { id: 'qr-1' },
+        data: {
+          token: expect.any(String),
+          createdAt: expect.any(Date),
+          revokedAt: null,
+        },
+      });
     });
 
     it('updates an older active USER token in place', async () => {

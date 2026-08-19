@@ -2616,6 +2616,32 @@ describe('ChatService', () => {
       );
       expect(media.deleteObjects).toHaveBeenCalledWith(['chat/u1/a.jpg']);
     });
+
+    // 笔记导入的 key 是 (viewer, note, media) 的确定性指纹：同一个人把同一张
+    // 笔记图发进两个会话会共用一个对象。删除没有引用计数，撤回其中一条若把
+    // 对象删了，另一条的图就永久坏掉。
+    it('keeps the shared note-import object when one message is revoked', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: {
+          key: 'chat/u1/note-import/abc123.jpg',
+          thumbKey: 'chat/u1/note-import/abc123-thumb.jpg',
+        },
+        revokedAt: null,
+      });
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: {},
+        revokedAt: new Date(),
+      });
+
+      await service.revokeMessage('u1', 'conv-1', 'msg-1');
+
+      expect(media.deleteObjects).not.toHaveBeenCalled();
+    });
   });
 
   describe('清空即已读要广播', () => {

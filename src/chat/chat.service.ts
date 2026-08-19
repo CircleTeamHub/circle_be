@@ -24,6 +24,7 @@ import type {
 } from 'src/generated/prisma';
 import {
   CHAT_MEDIA_KEY_PREFIX,
+  CHAT_NOTE_IMPORT_SEGMENT,
   CLIENT_MESSAGE_ID_MAX_LENGTH,
   CLIENT_MESSAGE_TYPES,
   CONVERSATION_LIST_MAX,
@@ -1036,7 +1037,11 @@ export class ChatService {
     ) {
       throw new ForbiddenException({
         message: '对方不允许群邀请',
-        errorCode: ChatErrorCode.GroupFriendsOnly,
+        // 好友校验上面已经过了,这里被拒的都是"是好友但关了群邀请"。复用
+        // GroupFriendsOnly 会让客户端显示"只能邀请好友进群"—— 客户端严格按
+        // 错误码出文案、丢弃服务端 message,用户看到的就是一句与事实相反、
+        // 也无法照着做的提示。圈子群的同一场景用的就是这个码。
+        errorCode: GroupErrorCode.InviteNotAllowed,
       });
     }
   }
@@ -3148,12 +3153,21 @@ export class ChatService {
   }
 
   /** 媒体消息 content 里的对象 key(撤回时要一并删的那些)。 */
+  /**
+   * 这条消息**独占**的对象 key —— 调用方拿它去删对象(撤回、阅后即焚清扫)。
+   *
+   * 笔记导入的 key 是 (viewer, note, media) 的确定性指纹,同一个人把同一张
+   * 笔记图发进两个会话会共用同一个对象。删除没有引用计数,所以这类 key 必须
+   * 排除:否则撤回其中一条,另一条的图就永久坏掉。这些对象的生命周期跟着
+   * 笔记媒体走,不跟着任何一条消息走。
+   */
   private collectMediaKeys(row: { type: string; content: unknown }): string[] {
     if (!MEDIA_MESSAGE_TYPES.includes(row.type)) return [];
     const content = (row.content ?? {}) as Record<string, unknown>;
     return ['key', 'thumbKey']
       .map((field) => content[field])
-      .filter((v): v is string => typeof v === 'string' && v.length > 0);
+      .filter((v): v is string => typeof v === 'string' && v.length > 0)
+      .filter((key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`));
   }
 
   private isUniqueViolation(error: unknown): boolean {
