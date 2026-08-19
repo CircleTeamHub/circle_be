@@ -20,6 +20,7 @@ import {
   UploadCircleIconDto,
 } from './dto/circle.dto';
 import { CircleService } from './circle.service';
+import { GROUP_CAPACITY_HARD_LIMIT } from './circle-limits';
 
 describe('CircleService', () => {
   let service: CircleService;
@@ -500,6 +501,47 @@ describe('CircleService', () => {
       });
     },
   );
+
+  // 配额一旦超过 int4,这一列拿到的就不是"很大的上限"而是一条插入期的数值溢出。
+  // 建群路径不传 maxMembers,所以配额直达列值,夹的这一道是它唯一的护栏。
+  it('clamps an oversized membership quota to the stored capacity ceiling', async () => {
+    jest
+      .spyOn(
+        (
+          service as unknown as {
+            membershipPolicy: { resolveEntitlement: () => unknown };
+          }
+        ).membershipPolicy,
+        'resolveEntitlement',
+      )
+      .mockResolvedValue({
+        level: 4,
+        vipExpiresAt: null,
+        tier: {
+          quotas: {
+            groupMembers: {
+              actual: Number.MAX_SAFE_INTEGER,
+              display: 'unlimited',
+            },
+          },
+        },
+      } as never);
+    prisma.user.findUnique.mockResolvedValue({
+      vipLevel: 4,
+      vipExpiresAt: null,
+    });
+    prisma.circle.create.mockResolvedValue(
+      circleRecord(GROUP_CAPACITY_HARD_LIMIT),
+    );
+
+    await service.createCircle('user-1', validCircle());
+
+    expect(prisma.circle.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        maxMembers: GROUP_CAPACITY_HARD_LIMIT,
+      }),
+    });
+  });
 
   it('gives a regular creator the gold capacity while rollout is disabled', async () => {
     programEnabled = false;
