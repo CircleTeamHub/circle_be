@@ -2027,7 +2027,16 @@ export class NoteService {
       const copied = await Promise.all(
         chunk.map(async ({ row, section }) => {
           const ext = /\.([A-Za-z0-9]{1,8})$/.exec(row.objectKey)?.[1];
-          const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${randomUUID()}${
+          const fingerprint = createHash('sha256')
+            .update(viewerID)
+            .update('\0')
+            .update(noteId)
+            .update('\0')
+            .update(row.id)
+            .update('\0')
+            .update(row.objectKey)
+            .digest('hex');
+          const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${fingerprint}${
             ext ? `.${ext.toLowerCase()}` : ''
           }`;
           try {
