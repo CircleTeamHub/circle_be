@@ -12,6 +12,7 @@ describe('QrService', () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       create: jest.fn(),
+      update: jest.fn(),
       updateMany: jest.fn(),
     },
     user: { findUnique: jest.fn() },
@@ -209,36 +210,41 @@ describe('QrService', () => {
   });
 
   describe('rotateUserToken', () => {
-    it('revokes prior USER tokens and returns a fresh token atomically', async () => {
-      prisma.qrToken.updateMany.mockResolvedValue({ count: 2 });
-      prisma.qrToken.create.mockResolvedValue({});
+    it('returns the current token when rotation is retried within 60 seconds', async () => {
+      prisma.qrToken.findFirst.mockResolvedValue({
+        id: 'qr-1',
+        token: 'same-token',
+        createdAt: new Date(Date.now() - 30_000),
+      });
 
-      const dto = await service.rotateUserToken('u1');
+      await expect(service.rotateUserToken('u1')).resolves.toMatchObject({
+        token: 'same-token',
+      });
 
       expect(prisma.$queryRaw).toHaveBeenCalled();
-      expect(prisma.qrToken.updateMany).toHaveBeenCalledWith({
-        where: {
-          type: 'USER',
-          targetID: 'u1',
-          issuerID: 'u1',
-          revokedAt: null,
-        },
-        data: { revokedAt: expect.any(Date) },
+      expect(prisma.qrToken.update).not.toHaveBeenCalled();
+      expect(prisma.qrToken.create).not.toHaveBeenCalled();
+    });
+
+    it('updates an older active USER token in place', async () => {
+      prisma.qrToken.findFirst.mockResolvedValue({
+        id: 'qr-1',
+        token: 'old-token',
+        createdAt: new Date(Date.now() - 61_000),
       });
-      expect(prisma.qrToken.create).toHaveBeenCalledWith({
+
+      await service.rotateUserToken('u1');
+
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.qrToken.update).toHaveBeenCalledWith({
+        where: { id: 'qr-1' },
         data: {
           token: expect.any(String),
-          type: 'USER',
-          targetID: 'u1',
-          issuerID: 'u1',
-          expiresAt: null,
+          createdAt: expect.any(Date),
+          revokedAt: null,
         },
       });
-      expect(dto).toMatchObject({ type: 'USER', expiresAt: null });
-      expect(dto.token).toHaveLength(32);
-      expect(
-        prisma.qrToken.updateMany.mock.invocationCallOrder[0],
-      ).toBeLessThan(prisma.qrToken.create.mock.invocationCallOrder[0]);
+      expect(prisma.qrToken.create).not.toHaveBeenCalled();
     });
   });
 

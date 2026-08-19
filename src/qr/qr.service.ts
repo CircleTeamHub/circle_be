@@ -83,26 +83,37 @@ export class QrService {
   async rotateUserToken(userId: string): Promise<QrTokenDto> {
     return this.prisma.$transaction(async (tx) => {
       await this.lockTokenKey(tx, userId, 'USER', userId);
-      await tx.qrToken.updateMany({
+      const current = await tx.qrToken.findFirst({
         where: {
           type: 'USER',
           targetID: userId,
           issuerID: userId,
           revokedAt: null,
         },
-        data: { revokedAt: new Date() },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, token: true, createdAt: true },
       });
+      if (current && Date.now() - current.createdAt.getTime() < 60_000) {
+        return { token: current.token, type: 'USER', expiresAt: null };
+      }
 
       const token = randomBytes(24).toString('base64url');
-      await tx.qrToken.create({
-        data: {
-          token,
-          type: 'USER',
-          targetID: userId,
-          issuerID: userId,
-          expiresAt: null,
-        },
-      });
+      if (current) {
+        await tx.qrToken.update({
+          where: { id: current.id },
+          data: { token, createdAt: new Date(), revokedAt: null },
+        });
+      } else {
+        await tx.qrToken.create({
+          data: {
+            token,
+            type: 'USER',
+            targetID: userId,
+            issuerID: userId,
+            expiresAt: null,
+          },
+        });
+      }
       return { token, type: 'USER', expiresAt: null };
     });
   }
