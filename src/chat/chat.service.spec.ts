@@ -427,10 +427,10 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
-    // 可见性只回答「你现在能不能看见」。阅后即焚会话里的媒体仍在窗口内 ——
-    // 就是说它**可见** —— 但把对象复制进一个没有 burn 的会话等于绕开发送者的
-    // 短暂性承诺,而且副本比源消息活得更久。
-    it('refuses to forward media out of a burn-after-read conversation', async () => {
+    // 可见性只回答「你现在能不能看见」。阅后即焚会话里**别人**发的媒体仍在
+    // 窗口内 —— 就是说它可见 —— 但把它复制进一个没有 burn 的会话等于绕开发送者
+    // 的短暂性承诺,而且副本比源消息活得更久。
+    it('refuses to forward another user media out of a burn-after-read conversation', async () => {
       prisma.chatMember.findUnique
         .mockResolvedValueOnce(membership())
         .mockResolvedValueOnce(
@@ -448,6 +448,7 @@ describe('ChatService', () => {
         ...createdRow,
         id: 'source-message',
         conversationID: 'source-conv',
+        senderID: 'u2',
         height: 8,
         type: 'image',
         content: { key: 'chat/u2/source.jpg' },
@@ -467,6 +468,103 @@ describe('ChatService', () => {
       ).rejects.toThrow(ForbiddenException);
       expect(media.copyForForward).not.toHaveBeenCalled();
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    // 自己发的是自己的内容,key 也在自己命名空间里 —— 从相册重发一次效果一样,
+    // 拦下来不保护任何人。但仍然要过烧毁水位:已经烧掉的自己的消息不能复活。
+    it('lets a user forward their own media out of a burn-after-read conversation', async () => {
+      const targetMembership = membership();
+      const burnMembership = membership({
+        conversationID: 'source-conv',
+        clearedBeforeHeight: 0,
+        conversation: {
+          ...membership().conversation,
+          id: 'source-conv',
+          burnDurationSec: 3600,
+        },
+      });
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(targetMembership)
+        .mockResolvedValueOnce(burnMembership)
+        .mockResolvedValueOnce(targetMembership);
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce({
+          ...createdRow,
+          id: 'source-message',
+          conversationID: 'source-conv',
+          senderID: 'u1',
+          height: 8,
+          type: 'image',
+          content: { key: 'chat/u1/mine.jpg' },
+          createdAt: new Date(),
+          revokedAt: null,
+        })
+        .mockResolvedValueOnce(null);
+      media.copyForForward.mockResolvedValue({
+        content: { key: 'chat/u1/copied.jpg' },
+        copiedKeys: ['chat/u1/copied.jpg'],
+      });
+      prisma.chatMessage.create.mockResolvedValue({
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/copied.jpg' },
+      });
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-message',
+        } as never),
+      );
+
+      expect(media.copyForForward).toHaveBeenCalledWith(
+        'image',
+        { key: 'chat/u1/mine.jpg' },
+        'u1',
+      );
+      expect(result.reused).toBe(false);
+    });
+
+    it('still refuses a self-forward once the burn window has passed', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({
+            conversationID: 'source-conv',
+            clearedBeforeHeight: 0,
+            conversation: {
+              ...membership().conversation,
+              id: 'source-conv',
+              burnDurationSec: 60,
+            },
+          }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValueOnce({
+        ...createdRow,
+        id: 'source-message',
+        conversationID: 'source-conv',
+        senderID: 'u1',
+        height: 8,
+        type: 'image',
+        content: { key: 'chat/u1/mine.jpg' },
+        createdAt: new Date(Date.now() - 3600 * 1000),
+        revokedAt: null,
+      });
+
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({
+            type: 'image',
+            content: {},
+            forwardFromMessageId: 'source-message',
+          } as never),
+        ),
+      ).rejects.toThrow(NotFoundException);
+      expect(media.copyForForward).not.toHaveBeenCalled();
     });
 
     it('deletes speculative copies when an idempotent forward already exists', async () => {

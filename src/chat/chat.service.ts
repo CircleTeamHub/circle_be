@@ -439,16 +439,24 @@ export class ChatService {
       userId,
     );
     // 可见性只回答「你现在能不能看见」,回答不了「你能不能让别人永远看见」。
-    // 阅后即焚会话的短暂性是发送者的承诺:把对象复制进一个没有 burn 的会话
-    // 等于绕开那条承诺把它永久化,而且副本活得比源消息还久。
-    if (conversation.burnDurationSec) {
+    // 阅后即焚会话的短暂性是**发送者对收件人的承诺**:把别人发的对象复制进一个
+    // 没有 burn 的会话,等于绕开那条承诺把它永久化,副本还活得比源消息久。
+    //
+    // 自己发的除外。那是你自己的内容、key 本来就在你自己的命名空间里,你打开
+    // 相册重发一次效果完全一样 —— 拦下来不保护任何人,只是让你多走一步。
+    if (conversation.burnDurationSec && row.senderID !== userId) {
       throw new ForbiddenException({
         message: '阅后即焚会话中的消息不可转发',
         errorCode: ChatErrorCode.ForwardForbidden,
       });
     }
-    // 会话级 burn 上面已经整段拒掉了,这里只剩查看者自己的定时清理水位。
-    const cutoff = await this.selfDestructCutoff(userId);
+    // burn 会话现在还能走到这儿(自己发的),所以烧毁水位必须重新参与判定 ——
+    // 否则「自己的」这个口子会顺带放行自己早就烧掉的消息。
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const burnCutoff = conversation.burnDurationSec
+      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
+      : null;
+    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
     if (
       row.height <= (member.clearedBeforeHeight ?? 0) ||
       (cutoff !== null && row.createdAt < cutoff)
