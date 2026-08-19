@@ -14,6 +14,8 @@ fail() {
 [[ "$1" = /* ]] || fail 'server deploy root must be absolute'
 [ -d "$1" ] || fail 'server deploy root does not exist'
 DEPLOY_ROOT="$(cd "$1" && pwd -P)"
+[ -n "${HOME:-}" ] || fail 'deployment home is unavailable'
+DEPLOY_HOME="$(cd "$HOME" && pwd -P)"
 RELEASE_STATE_DIR="$DEPLOY_ROOT/.release"
 INCOMING_DIR="$RELEASE_STATE_DIR/incoming"
 LAUNCHER="$RELEASE_STATE_DIR/release-launcher.sh"
@@ -127,7 +129,7 @@ activate_release() {
 
   exec env -i \
     PATH=/usr/bin:/bin \
-    HOME="$DEPLOY_ROOT" \
+    HOME="$DEPLOY_HOME" \
     RELEASE_STATE_DIR="$RELEASE_STATE_DIR" \
     TARGET_SCHEMA_COMPATIBILITY="$schema" \
     RELEASE_TAG="$tag" \

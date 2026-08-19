@@ -5,13 +5,14 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GATE="$ROOT_DIR/deploy/release-force-command.sh"
 CASE_DIR="$(mktemp -d)"
 DEPLOY_ROOT="$CASE_DIR/circle_be"
+DEPLOY_HOME="$CASE_DIR/deploy-home"
 STATE_DIR="$DEPLOY_ROOT/.release"
 LOG="$STATE_DIR/activation.log"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 STAGE="123-1-$SHA"
 trap 'rm -rf "$CASE_DIR"' EXIT
 
-mkdir -p "$STATE_DIR" "$CASE_DIR/source/deploy"
+mkdir -p "$STATE_DIR" "$DEPLOY_HOME" "$CASE_DIR/source/deploy"
 printf 'payload\n' > "$CASE_DIR/source/VERSION"
 printf '#!/usr/bin/env bash\n' > "$CASE_DIR/source/deploy/release-deploy.sh"
 printf '0\n' > "$CASE_DIR/source/deploy/SCHEMA_COMPATIBILITY"
@@ -29,6 +30,7 @@ set -euo pipefail
   printf 'irreversible=%s\n' "$RELEASE_IRREVERSIBLE_MIGRATION"
   printf 'user=%s\n' "$GHCR_USER"
   printf 'token=%s\n' "$GHCR_TOKEN"
+  printf 'home=%s\n' "$HOME"
 } > "$RELEASE_STATE_DIR/activation.log"
 LAUNCHER
 chmod 0555 "$STATE_DIR/release-launcher.sh"
@@ -36,7 +38,7 @@ chmod 0555 "$STATE_DIR/release-launcher.sh"
 run_gate() {
   local command="$1"
   shift
-  SSH_ORIGINAL_COMMAND="$command" bash "$GATE" "$DEPLOY_ROOT" "$@"
+  HOME="$DEPLOY_HOME" SSH_ORIGINAL_COMMAND="$command" bash "$GATE" "$DEPLOY_ROOT" "$@"
 }
 
 run_gate "circle-release stage $STAGE $SHA" < "$CASE_DIR/stage.tar.gz"
@@ -60,6 +62,7 @@ grep -q '^tag=v1.2.3$' "$LOG"
 grep -q '^image=ghcr.io/circleteamhub/circle_be@sha256:b\{64\}$' "$LOG"
 grep -q '^user=github-actions\[bot\]$' "$LOG"
 grep -q '^token=test-token$' "$LOG"
+grep -Fqx "home=$DEPLOY_HOME" "$LOG"
 
 # 启动器不可信(部署账号可写)是服务器侧的配置问题。activate 必须拒绝,但刚上传
 # 完的发布包要原样留着 —— 清理钩子装在校验之前的话,运维改好配置后还得让 CI 把
