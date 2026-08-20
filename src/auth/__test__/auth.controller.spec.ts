@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { AuthController } from '../auth.controller';
+import { QrLoginService } from '../qr-login.service';
 import { AuthService } from '../auth.service';
 import { RegisterDto } from '../dto/register.dto';
 import { LoginDto } from '../dto/login.dto';
@@ -114,7 +115,13 @@ describe('AuthController', () => {
       // 找回密码路由挂 ThrottlerGuard，需要模块选项在位（本 spec 直呼 handler）。
       imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
       controllers: [AuthController],
-      providers: [{ provide: AuthService, useValue: mockAuthService }],
+      providers: [
+        { provide: AuthService, useValue: mockAuthService },
+        {
+          provide: QrLoginService,
+          useValue: { create: jest.fn(), status: jest.fn(), approve: jest.fn() },
+        },
+      ],
     }).compile();
 
     controller = module.get<AuthController>(AuthController);

@@ -1,6 +1,6 @@
 /** 二维码令牌 REST 面的响应形状(前端 src/services/api/qr.ts 按此对齐)。 */
 
-export type QrTokenTypeDto = 'USER' | 'GROUP' | 'CIRCLE';
+export type QrTokenTypeDto = 'USER' | 'GROUP' | 'CIRCLE' | 'LOGIN';
 
 /** POST /qr/tokens:签发(或复用仍在有效窗口内的)令牌。 */
 export interface QrTokenDto {

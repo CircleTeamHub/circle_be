@@ -9,6 +9,7 @@ describe('PrivacySettingsService', () => {
       findMany: jest.fn(),
     },
     $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -94,11 +95,11 @@ describe('PrivacySettingsService', () => {
     });
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(prisma.$queryRaw).toHaveBeenCalledWith(
+    expect(prisma.$executeRaw).toHaveBeenCalledWith(
       expect.anything(),
       'call-user:user-1',
     );
-    expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
       prisma.userPrivacySetting.upsert.mock.invocationCallOrder[0],
     );
   });

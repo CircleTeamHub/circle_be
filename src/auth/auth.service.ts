@@ -27,6 +27,7 @@ import { normalizeEmail } from 'src/utils/email';
 import {
   AuthErrorCode,
   FancyNumberErrorCode,
+  QrErrorCode,
 } from 'src/common/app-error-codes';
 import {
   ACCOUNT_ID_PATTERN,
@@ -530,6 +531,36 @@ export class AuthService {
     });
 
     return tokens;
+  }
+
+  /**
+   * 扫码登录的账号闸门：与普通登录同一政策 —— ACTIVE 且非 ADMIN
+   * （管理台自有短 TTL 会话模型，扫码不放行）。文案统一"二维码已失效"，
+   * 不泄露账号状态。
+   */
+  async assertQrLoginEligible(userId: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { status: true, role: true },
+    });
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException({
+        message: '二维码已失效，请刷新后重试',
+        errorCode: QrErrorCode.Invalid,
+      });
+    }
+  }
+
+  /** 扫码登录消费侧换发正式会话（QrLoginService 在 CONSUMED 抢占成功后调）。 */
+  async issueQrLoginTokens(userId: string, sessionContext?: SessionContext) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
+      throw new ForbiddenException({
+        message: '二维码已失效，请刷新后重试',
+        errorCode: QrErrorCode.Invalid,
+      });
+    }
+    return this.finishLogin(user, sessionContext);
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {
