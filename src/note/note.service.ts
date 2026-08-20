@@ -1698,7 +1698,10 @@ export class NoteService {
         // 200 护栏。锁按 owner 分片，不同用户互不阻塞；xact 锁随事务自动释放。
         const quotaLockKey = `note-share-link:${ownerID}`;
         const row = await this.prisma.$transaction(async (tx) => {
-          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))`;
+          // pg_advisory_xact_lock returns PostgreSQL `void`. Prisma's PG adapter
+          // cannot deserialize a raw `void` column (P2010), so cast the result to
+          // a supported scalar while keeping the same transaction-scoped lock.
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${quotaLockKey}))::text`;
           const activeLinks = await tx.noteShareLink.count({
             where: {
               ownerID,

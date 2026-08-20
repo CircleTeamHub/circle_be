@@ -123,7 +123,10 @@ export class EmailVerificationService {
     // 锁内复检让后到者拿到 CodeRateLimited，只有一封信发出。
     const lockKey = `email-code:${purpose}:${email}`;
     const created = await this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+      // pg_advisory_xact_lock returns PostgreSQL `void`. Prisma's PG adapter
+      // cannot deserialize a raw `void` column (P2010), so cast the result to
+      // a supported scalar while keeping the same transaction-scoped lock.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))::text`;
       const latest = await tx.emailVerificationCode.findFirst({
         where: { email, purpose },
         orderBy: { createdAt: 'desc' },
