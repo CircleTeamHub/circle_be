@@ -1111,10 +1111,10 @@ export class CallService {
 
   private async lockParticipantsForCall(
     userIDs: string[],
-    prisma: Pick<PrismaService, '$queryRaw'>,
+    prisma: Pick<PrismaService, '$executeRaw'>,
   ): Promise<void> {
     for (const userID of [...userIDs].sort((a, b) => a.localeCompare(b))) {
-      await prisma.$queryRaw`
+      await prisma.$executeRaw`
         SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${userID}`}, 0))
       `;
     }

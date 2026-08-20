@@ -38,7 +38,7 @@ export class CollectionService {
     // round 2 review：count+create 用 per-user advisory 锁串行化（与
     // note share-link 同款）—— 499 时并发 N 发不再全部越过上限。
     return this.prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`collection:${userId}`}))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`collection:${userId}`}))`;
       const existing = await tx.userCollection.count({
         where: { userID: userId },
       });
