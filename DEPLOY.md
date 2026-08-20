@@ -253,35 +253,25 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——
   改从异地副本恢复,见下面「异地备份」。
 
-### ⚠️ 加固待办:锁死历史 workflow 绕过 floor(需服务器端配置)
+### 发布通道加固(已落地;**服务器侧配置是发版硬前置**)
 
-> 本项目尚未上线,此项当前不触发;上线前须逐条复评 —— 见
-> [docs/pre-launch-checklist.md](docs/pre-launch-checklist.md)。
+历史上这里记的是一项"加固待办":旧版 Release workflow 会把自己的检出 rsync 到
+`DEPLOY_PATH` 并直接执行那份**旧的、无守卫的** `release-deploy.sh`,绕过持久 launcher 与
+`minimum-schema-compatibility` 下限;而唯一能拦住它的层在服务器的 `authorized_keys` 里,
+仓库内改不掉。当时未落地的原因是 workflow 用 `bash -s` 经 stdin 传脚本,ForceCommand 无法
+内省 stdin。
 
-**残留风险(未闭合)**:`.release/release-launcher.sh` 的持久锁 + `minimum-schema-compatibility`
-下限,以及 `release-deploy.sh` 顶部的 `RELEASE_LAUNCHER_ACTIVE` 守卫,都只保护**当前**发版
-管线。若有人重跑一个**在 launcher 引入之前**的旧 Release workflow,它会把自己的检出用 rsync
-直接盖到 `DEPLOY_PATH` 并执行**那份旧的、无守卫的** `release-deploy.sh` —— 既不经过持久
-launcher、也不读 `minimum-schema-compatibility`,于是可能在已抬高 floor 之后仍启动旧二进制、
-打到已被不可逆迁移契约化的 schema 上。
+**这一项现已完成。** 发版流已改成显式命令协议(GHCR token 仍走 stdin,不进 `argv`):
 
-**为什么仓库内改不掉**:旧 workflow 发给服务器的命令(`rsync … DEPLOY_PATH/` + `bash
-deploy/release-deploy.sh`)由**旧的检出**决定,新代码无法改变历史 workflow 会发什么。唯一
-能拦截它的层是**服务器的 `~/.ssh/authorized_keys`**,不在本仓库里。
+- 部署 key 挂 `command="…"`,只放行 `circle-release stage-v2` 与 `circle-release activate-v2`,
+  其余 SSH 会话一律拒绝 —— 包括通用 shell 和直接执行目标树内的 `release-deploy.sh`。
+- 发布包连同一份**离线签名的清单**上传;服务器验签、比对归档摘要,并把激活参数逐项与清单
+  交叉校验。清单带签名的 `issued_at`,有效期 1 小时,防止旧的签名三元组被重放降级。
+- launcher 与签名公钥必须 root 持有且部署账号不可写,否则脚本直接拒绝执行。
 
-**目标修法(SSH ForceCommand)**:给部署 key 挂 `command="…"`,把该 key 的所有 SSH 会话
-强制经过 `.release/` 下的持久入口 —— 只放行「rsync 进 `.release/incoming/`」「安装 / 调用
-launcher」,拒绝「live-tree rsync」和「直接执行 `release-deploy.sh`」。因为 `command=` 写在
-服务器 authorized_keys 里,任何被 rsync 覆盖的仓库代码都替换不了它,历史 workflow 也就绕
-不过去。
-
-**为何尚未落地**:`.github/workflows/release.yml` 现用 `bash -s`(经 stdin 传 GHCR token,
-刻意不进 `argv` 以免出现在 `ps`)。ForceCommand 无法内省 stdin 脚本,所以启用它必须同时把
-发版流改成**显式命令**且保持 token 不进 argv —— 属较大、需在 **staging 真跑一次**验证的独立
-运维改动,不在应用代码 PR 范围内。
-
-**在此之前的运维硬约束**:① 绝不重跑「抬高 floor 之前」的历史 Release workflow;② 回滚一律
-走上面〈回滚 / 重放〉的持久 launcher 手动流程,绝不直接执行目标树内的 `release-deploy.sh`。
+**服务器侧配置没做完之前,任何 tag 发布都会失败**(停在 `circle-release: command not found`)。
+四样东西怎么装、顺序为什么不能颠倒、装完怎么自检,见
+**[docs/release-hardening-runbook.md](docs/release-hardening-runbook.md)**。
 
 ### ⚠️ 加固待办:不可逆重放的空跑不应封死可兼容活色(需 staging 验证)
 
@@ -559,8 +549,9 @@ $S3 s3api get-object --bucket <bucket> \
 - **构建时长**:amd64 runner 经 QEMU 交叉构建 arm64,首次 ~15–25 分钟,有 GHA 缓存后明显变快;
   构建在 main push 时异步发生,不占发版时间。仓库转 public 后可把两个构建 job 的
   `runs-on` 改成 `ubuntu-24.04-arm` 原生构建并删掉 QEMU 步骤(私有仓库的 ARM runner 收费)。
-- **SSH 加固(可选)**:服务器 `authorized_keys` 里可给部署公钥加
-  `no-port-forwarding,no-agent-forwarding,no-X11-forwarding` 等限制,收窄这把钥匙的能力。
+- **SSH 加固(必需,非可选)**:部署公钥必须挂 `restrict,command="…"` 走受限发布协议;
+  只加 `no-port-forwarding` 之类的限制并不够 —— 那仍然留着一个通用 shell。
+  见 [docs/release-hardening-runbook.md](docs/release-hardening-runbook.md)。
 - **转入自动发版后的日常运维**:改动基础设施(如 caddy/minio 配置)时,
   只 up 对应服务(`docker compose -f docker-compose.prod.yml up -d caddy`),
   不要裸跑整栈 `up -d`——那会按 build 路径把停用的那一色重新拉起来。
