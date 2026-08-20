@@ -52,12 +52,14 @@ run_gate() {
 }
 
 sign_stage() {
-  local stage="$1" archive="$2" manifest signature
+  local stage="$1" archive="$2" issued_at="${3:-}" manifest signature
   local digest
+  [ -n "$issued_at" ] || issued_at="$(date -u +%s)"
   manifest="$CASE_DIR/$stage.manifest"
   signature="$CASE_DIR/$stage.sig"
   digest="$(sha256sum "$archive" | awk '{print $1}')"
-  printf '%s\n' 'version=1' "stage=$stage" "source_sha=${stage##*-}" \
+  printf '%s\n' 'version=2' "issued_at=$issued_at" "stage=$stage" \
+    "source_sha=${stage##*-}" \
     "archive_sha256=$digest" 'release_tag=v1.2.3' "image=$IMAGE" \
     'schema=0' 'downtime=0' 'irreversible=0' > "$manifest"
   openssl dgst -sha256 -sign "$CASE_DIR/signing.pem" -out "$signature" "$manifest"
@@ -65,8 +67,8 @@ sign_stage() {
 }
 
 stage_archive() {
-  local stage="$1" archive="$2" manifest_b64 signature_b64
-  read -r manifest_b64 signature_b64 < <(sign_stage "$stage" "$archive")
+  local stage="$1" archive="$2" issued_at="${3:-}" manifest_b64 signature_b64
+  read -r manifest_b64 signature_b64 < <(sign_stage "$stage" "$archive" "$issued_at")
   run_gate "circle-release stage-v2 $stage $manifest_b64 $signature_b64" < "$archive"
 }
 
@@ -156,5 +158,37 @@ for rejected in 'bash -s' 'circle-release stage old' \
     exit 1
   fi
 done
+
+# 签名只证明「出自 CI」，不证明「CI 现在要发它」。没有新鲜度绑定，任何历史上
+# 签过的 (manifest, 签名, 归档) 三元组就永久有效 —— 拿到部署密钥的人可以把旧
+# 发布重新 stage 再 activate，把服务降级回任意同 schema 代的历史版本。
+echo "checking manifest freshness"
+STALE_STAGE="126-1-$SHA"
+STALE_AT="$(( $(date -u +%s) - 7200 ))"
+if stage_archive "$STALE_STAGE" "$CASE_DIR/stage.tar.gz" "$STALE_AT" >"$CASE_DIR/stale.log" 2>&1; then
+  echo "unexpectedly staged an expired manifest" >&2
+  exit 1
+fi
+grep -q "expired" "$CASE_DIR/stale.log" || {
+  echo "expired manifest rejected for the wrong reason:" >&2
+  cat "$CASE_DIR/stale.log" >&2
+  exit 1
+}
+[ ! -e "$STATE_DIR/incoming/$STALE_STAGE" ] || {
+  echo "expired manifest left a staged release behind" >&2
+  exit 1
+}
+
+FUTURE_STAGE="127-1-$SHA"
+FUTURE_AT="$(( $(date -u +%s) + 7200 ))"
+if stage_archive "$FUTURE_STAGE" "$CASE_DIR/stage.tar.gz" "$FUTURE_AT" >"$CASE_DIR/future.log" 2>&1; then
+  echo "unexpectedly staged a future-dated manifest" >&2
+  exit 1
+fi
+grep -q "future" "$CASE_DIR/future.log" || {
+  echo "future-dated manifest rejected for the wrong reason:" >&2
+  cat "$CASE_DIR/future.log" >&2
+  exit 1
+}
 
 printf 'PASS signed release protocol and archive resource bounds\n'

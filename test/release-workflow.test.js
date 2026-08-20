@@ -11,7 +11,8 @@ test('release workflow signs and stages the exact immutable release manifest', (
 
   for (const expected of [
     'RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}',
-    'version=1',
+    'version=2',
+    'issued_at=',
     'archive_sha256=',
     'openssl dgst -sha256 -sign',
     'circle-release stage-v2',

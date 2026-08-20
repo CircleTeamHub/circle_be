@@ -345,8 +345,10 @@ jobs:
             --exclude=./coverage \
             .
           archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          issued_at="$(date -u +%s)"
           printf '%s\n' \
-            'version=1' \
+            'version=2' \
+            "issued_at=$issued_at" \
             "stage=$STAGED_RELEASE_NAME" \
             "source_sha=$RELEASE_SHA" \
             "archive_sha256=$archive_sha256" \

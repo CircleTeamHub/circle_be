@@ -27,6 +27,10 @@ ARCHIVE_MAX_ENTRIES=10000
 ARCHIVE_MAX_EXPANDED_BYTES=$((1024 * 1024 * 1024))
 ARCHIVE_MAX_FILE_BYTES=$((128 * 1024 * 1024))
 ARCHIVE_CAPACITY_RESERVE_BYTES=$((256 * 1024 * 1024))
+# stage 与 activate 都在同一次发布流水线内发生,一小时足够覆盖重试与人工确认,
+# 又把重放窗口压到远小于"下一次发布"的尺度。
+MANIFEST_MAX_AGE_SECONDS=3600
+MANIFEST_MAX_CLOCK_SKEW_SECONDS=300
 
 read -r -a command_parts <<< "$ORIGINAL_COMMAND"
 [ "${#command_parts[@]}" -ge 2 ] || fail 'missing protocol command'
@@ -40,23 +44,25 @@ read_manifest() {
   local manifest="$1"
   local -a lines
   mapfile -t lines < "$manifest"
-  [ "${#lines[@]}" -eq 9 ] || fail 'release manifest must contain exactly nine lines'
-  [ "${lines[0]}" = 'version=1' ] || fail 'unsupported release manifest version'
-  [[ "${lines[1]}" =~ ^stage=([0-9]+-[0-9]+-[0-9a-f]{40})$ ]] || fail 'invalid manifest stage'
+  [ "${#lines[@]}" -eq 10 ] || fail 'release manifest must contain exactly ten lines'
+  [ "${lines[0]}" = 'version=2' ] || fail 'unsupported release manifest version'
+  [[ "${lines[1]}" =~ ^issued_at=([0-9]{10,11})$ ]] || fail 'invalid manifest issue time'
+  MANIFEST_ISSUED_AT="${BASH_REMATCH[1]}"
+  [[ "${lines[2]}" =~ ^stage=([0-9]+-[0-9]+-[0-9a-f]{40})$ ]] || fail 'invalid manifest stage'
   MANIFEST_STAGE="${BASH_REMATCH[1]}"
-  [[ "${lines[2]}" =~ ^source_sha=([0-9a-f]{40})$ ]] || fail 'invalid manifest source SHA'
+  [[ "${lines[3]}" =~ ^source_sha=([0-9a-f]{40})$ ]] || fail 'invalid manifest source SHA'
   MANIFEST_SOURCE_SHA="${BASH_REMATCH[1]}"
-  [[ "${lines[3]}" =~ ^archive_sha256=([0-9a-f]{64})$ ]] || fail 'invalid manifest archive digest'
+  [[ "${lines[4]}" =~ ^archive_sha256=([0-9a-f]{64})$ ]] || fail 'invalid manifest archive digest'
   MANIFEST_ARCHIVE_SHA256="${BASH_REMATCH[1]}"
-  [[ "${lines[4]}" =~ ^release_tag=(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]] || fail 'invalid manifest release tag'
+  [[ "${lines[5]}" =~ ^release_tag=(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]] || fail 'invalid manifest release tag'
   MANIFEST_RELEASE_TAG="${BASH_REMATCH[1]}"
-  [[ "${lines[5]}" =~ ^image=(ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64})$ ]] || fail 'invalid manifest image'
+  [[ "${lines[6]}" =~ ^image=(ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64})$ ]] || fail 'invalid manifest image'
   MANIFEST_IMAGE="${BASH_REMATCH[1]}"
-  [[ "${lines[6]}" =~ ^schema=([0-9]+)$ ]] || fail 'invalid manifest schema compatibility'
+  [[ "${lines[7]}" =~ ^schema=([0-9]+)$ ]] || fail 'invalid manifest schema compatibility'
   MANIFEST_SCHEMA="${BASH_REMATCH[1]}"
-  [[ "${lines[7]}" =~ ^downtime=([01])$ ]] || fail 'invalid manifest downtime flag'
+  [[ "${lines[8]}" =~ ^downtime=([01])$ ]] || fail 'invalid manifest downtime flag'
   MANIFEST_DOWNTIME="${BASH_REMATCH[1]}"
-  [[ "${lines[8]}" =~ ^irreversible=([01])$ ]] || fail 'invalid manifest irreversible flag'
+  [[ "${lines[9]}" =~ ^irreversible=([01])$ ]] || fail 'invalid manifest irreversible flag'
   MANIFEST_IRREVERSIBLE="${BASH_REMATCH[1]}"
   [ "${MANIFEST_STAGE##*-}" = "$MANIFEST_SOURCE_SHA" ] || fail 'manifest stage does not match source SHA'
 }
@@ -67,6 +73,19 @@ verify_manifest_signature() {
     -signature "$signature" "$manifest" >/dev/null 2>&1 ||
     fail 'release manifest signature verification failed'
   read_manifest "$manifest"
+}
+
+# 签名回答的是"这份 manifest 出自 CI",不是"CI 现在要发它"。少了这一步,任何
+# 一份历史上签过的 (manifest, 签名, 归档) 三元组永久有效:拿到部署密钥的人可以
+# 把旧发布重新 stage 再 activate,把服务降级回任意同 schema 代的历史版本 ——
+# 而这套 ForceCommand 防的就是部署密钥泄露。
+assert_manifest_fresh() {
+  local now skew_ahead age
+  now="$(date -u +%s)"
+  skew_ahead=$((MANIFEST_ISSUED_AT - now))
+  (( skew_ahead <= MANIFEST_MAX_CLOCK_SKEW_SECONDS )) || fail 'release manifest is issued in the future'
+  age=$((now - MANIFEST_ISSUED_AT))
+  (( age <= MANIFEST_MAX_AGE_SECONDS )) || fail 'release manifest has expired'
 }
 
 validate_archive() {
@@ -149,6 +168,7 @@ stage_release() {
   printf '%s' "$manifest_b64" | base64 --decode > "$manifest" 2>/dev/null || fail 'release manifest decoding failed'
   printf '%s' "$signature_b64" | base64 --decode > "$signature" 2>/dev/null || fail 'release signature decoding failed'
   verify_manifest_signature "$manifest" "$signature"
+  assert_manifest_fresh
   [ "$MANIFEST_STAGE" = "$stage_name" ] || fail 'manifest stage does not match command'
 
   dd bs=1048576 count=257 iflag=fullblock status=none > "$archive"
@@ -187,6 +207,7 @@ activate_release() {
   [ -f "$staged/.release-manifest" ] && [ ! -L "$staged/.release-manifest" ] || fail 'staged release has no signed manifest'
   [ -f "$staged/.release-manifest.sig" ] && [ ! -L "$staged/.release-manifest.sig" ] || fail 'staged release has no manifest signature'
   verify_manifest_signature "$staged/.release-manifest" "$staged/.release-manifest.sig"
+  assert_manifest_fresh
   [ "$MANIFEST_STAGE" = "$stage_name" ] || fail 'staged manifest identity mismatch'
   # 启动器缺失/可写是服务器侧的配置问题,不是这批 stage 的问题。清理钩子要装在
   # 这两道检查之后 —— 装在前面的话,一次配置错误会顺手删掉刚上传完的发布包,

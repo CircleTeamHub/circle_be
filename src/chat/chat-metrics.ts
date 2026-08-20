@@ -9,7 +9,11 @@ export interface ChatMetrics {
   observeConnectionOpened(activeUsers: number): void;
   observeConnectionClosed(activeUsers: number): void;
   observeConnectionRejected(
-    reason: 'per_user_limit' | 'join_failed' | 'pre_ready_overflow',
+    reason:
+      | 'per_user_limit'
+      | 'join_failed'
+      | 'pre_ready_overflow'
+      | 'drain_backlog_overflow',
   ): void;
   observeAuthFailure(reason: 'rejected' | 'error'): void;
   observeEvent(action: ChatAction, result: ChatEventResult): void;

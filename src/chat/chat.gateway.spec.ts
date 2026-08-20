@@ -329,6 +329,67 @@ describe('ChatGateway', () => {
       handleSend.mockRestore();
     });
 
+    // 就绪之后队列只为保序而存在:准入期攒下的积压还在排空时,后到的事件必须
+    // 排在它后面,否则先发的消息会后落库。这时队满代表 drain 慢(数据库/Redis
+    // 抖动),不代表客户端在洪泛 —— 各 handler 自己有限流器。把整条会话断开,
+    // 等于把一次延迟事件放大成连接故障,还会丢掉已受理的那 64 条。
+    it('rejects one event without dropping an established session when the drain backlog is full', async () => {
+      const socket = fakeSocket({ disconnected: false });
+      socket.disconnect.mockImplementation(() => {
+        socket.disconnected = true;
+      });
+      let finishRegistration!: (count: number | null) => void;
+      presence.registerSocket.mockImplementationOnce(
+        () =>
+          new Promise<number | null>((resolve) => {
+            finishRegistration = resolve;
+          }),
+      );
+      // 排空时的第一条卡住,drain 就一直在跑,后到的事件只能排队。
+      let releaseFirst!: () => void;
+      const handleSend = jest
+        .spyOn(gateway as any, 'handleSend')
+        .mockImplementationOnce(
+          () =>
+            new Promise<void>((resolve) => {
+              releaseFirst = resolve;
+            }),
+        )
+        .mockResolvedValue(undefined);
+
+      const pending = gateway['handleConnection'](socket as never);
+      const handler = socket.handlers.get('chat:send');
+      handler?.({ conversationId: 'conv-lead' }, jest.fn());
+
+      finishRegistration(null);
+      await pending;
+      await Promise.resolve();
+
+      for (let i = 0; i < ChatGateway['MAX_PRE_READY_EVENTS']; i += 1) {
+        handler?.({ conversationId: `conv-${i}` }, jest.fn());
+      }
+      const overflowAck = jest.fn();
+      handler?.({ conversationId: 'conv-overflow' }, overflowAck);
+
+      expect(socket.disconnect).not.toHaveBeenCalled();
+      expect(socket.disconnected).toBe(false);
+      expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
+        'drain_backlog_overflow',
+      );
+      expect(metrics.observeConnectionRejected).not.toHaveBeenCalledWith(
+        'pre_ready_overflow',
+      );
+      expect(overflowAck).toHaveBeenCalledWith(
+        expect.objectContaining({ ok: false, code: ChatErrorCode.RateLimited }),
+      );
+
+      releaseFirst();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // 已受理的那批照常排空,不因为一次溢出被清掉。
+      expect(handleSend.mock.calls.length).toBeGreaterThan(1);
+      handleSend.mockRestore();
+    });
+
     it('disconnects when the shared pre-ready queue exceeds its fixed cap', async () => {
       const socket = fakeSocket({ disconnected: false });
       socket.disconnect.mockImplementation(() => {

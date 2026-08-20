@@ -335,6 +335,11 @@ test('workflow stages and activates only through the restricted release protocol
   // 签名是这一版的信任根:少了它,服务器只能凭"谁连上来"判断发布包真伪。
   assert.match(release, /openssl dgst -sha256 -sign/);
   assert.match(release, /archive_sha256=/);
+  // 签名不带新鲜度就等于永久有效:旧的 (manifest, 签名, 归档) 可被重放降级。
+  assert.match(release, /issued_at=/);
+  const gate = read('deploy/release-force-command.sh');
+  assert.match(gate, /assert_manifest_fresh/);
+  assert.match(gate, /MANIFEST_MAX_AGE_SECONDS/);
   assert.doesNotMatch(release, /ssh[^\n]*bash -s/);
   assert.doesNotMatch(release, /rsync[\s\S]*ssh -i/);
   assert.doesNotMatch(release, /Install persistent release launcher/);
