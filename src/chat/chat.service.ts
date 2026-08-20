@@ -254,6 +254,18 @@ export class ChatService {
     if (conversation.type === 'TEMP') {
       await this.assertTempChatActive(conversation);
     }
+    if (payload.forwardFromMessageId) {
+      const existing = await this.prisma.chatMessage.findFirst({
+        where: {
+          conversationID: payload.conversationId,
+          senderID: senderUserId,
+          clientMessageId: payload.d,
+        },
+      });
+      if (existing) {
+        return this.presentSentMessage(existing, senderUserId, true);
+      }
+    }
     let effectivePayload = payload;
     let copiedKeys: string[] = [];
     try {
@@ -349,6 +361,14 @@ export class ChatService {
             replyToID: replyToId,
           },
         });
+        if (copiedKeys.length > 0) {
+          const claimed = await tx.chatMediaDeletion.deleteMany({
+            where: { objectKey: { in: copiedKeys } },
+          });
+          if (claimed.count !== copiedKeys.length) {
+            throw new Error('Forward media reservation claim mismatch');
+          }
+        }
         // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
         await tx.chatConversation.update({
           where: { id: effectivePayload.conversationId },
@@ -384,46 +404,42 @@ export class ChatService {
         }
       }
 
-      // 事务已经提交 —— 这之后的一切都只是「把行装饰成 DTO」,绝不能因此抛错。
-      //
-      // 抛出去的后果不是"这次失败重试就好":handleSend 捕获后既不广播也不推送,
-      // 而客户端拿同一个 d 重发时会命中幂等分支(reused=true),那条分支**刻意
-      // 不广播**(首次投递时房间里已经收到过了 —— 但这次并没有)。于是一次瞬时的
-      // 昵称查询失败,就让这条消息对所有收件人永久消失,数据库里却明明存着。
-      //
-      // 昵称/头像是装饰:取不到就发 sender=null,客户端仍有 senderID 可用。
-      // 用降级换投递,而不是用投递换完整性。
-      let sender: ChatSenderInfo | null = null;
-      try {
-        sender =
-          (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
-      } catch (error) {
-        this.logger.warn(
-          `sender enrichment failed after commit message=${created.row.id}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-      const message = this.toMessageDto(created.row, sender);
-      // ack 与广播共用这份 DTO:引用快照与媒体 url 都在此附上(读路径,不落库)。
-      // attachMediaUrls 自身已经把签名失败收敛成 warn,不会抛;attachReplyTo 会 ——
-      // 它要多查一次库。理由与上面的昵称同款,而且更狠:引用快照丢了只是少个
-      // 折叠条,抛出去却会让整条消息对所有收件人永久消失。
-      try {
-        await this.attachReplyTo([message]);
-      } catch (error) {
-        this.logger.warn(
-          `reply enrichment failed after commit message=${created.row.id}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-      await this.media.attachMediaUrls([message]);
-      return { message, reused: created.reused };
+      return this.presentSentMessage(created.row, senderUserId, created.reused);
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
       throw error;
     }
+  }
+
+  /** 把已提交消息装饰成发送结果；装饰失败绝不能反转持久化成功。 */
+  private async presentSentMessage(
+    row: MessageRow,
+    senderUserId: string,
+    reused: boolean,
+  ): Promise<SendResult> {
+    let sender: ChatSenderInfo | null = null;
+    try {
+      sender =
+        (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
+    } catch (error) {
+      this.logger.warn(
+        `sender enrichment failed after commit message=${row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const message = this.toMessageDto(row, sender);
+    try {
+      await this.attachReplyTo([message]);
+    } catch (error) {
+      this.logger.warn(
+        `reply enrichment failed after commit message=${row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    await this.media.attachMediaUrls([message]);
+    return { message, reused };
   }
 
   private async resolveForwardableMedia(

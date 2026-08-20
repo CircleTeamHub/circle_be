@@ -504,18 +504,35 @@ export class ChatGateway implements OnModuleDestroy {
       }
     };
     const whenReady = (run: () => Promise<void>): boolean => {
-      if (admissionState === 'ready') {
+      if (
+        admissionState === 'ready' &&
+        !drainingPreReadyQueue &&
+        preReadyQueue.length === 0
+      ) {
         void run();
         return true;
       }
       if (admissionState === 'failed') return false;
       if (preReadyQueue.length >= ChatGateway.MAX_PRE_READY_EVENTS) {
+        // 就绪之后队列存在的唯一理由是保序 —— 排空一开始,后到的事件就得排在
+        // 积压后面,否则先发的消息会后落库。这时队满只说明 drain 慢(数据库/
+        // Redis 抖动),不说明客户端在洪泛:各 handler 自己有限流器兜着。
+        //
+        // 所以这里只拒这一条(调用方会回 RateLimited ack),不再 failAdmission ——
+        // 那会连同已受理的 64 条一起丢掉,还把一条早就连好的会话直接断开,
+        // 把一次延迟事件放大成连接故障,并记成 pre_ready_overflow。
+        if (admissionState === 'ready') {
+          this.metrics.observeConnectionRejected('drain_backlog_overflow');
+          return false;
+        }
+        // 准入期:还没连上就把队列打满,是洪泛而不是抢发,按原样断连。
         failAdmission();
         this.metrics.observeConnectionRejected('pre_ready_overflow');
         socket.disconnect(true);
         return false;
       }
       preReadyQueue.push(run);
+      if (admissionState === 'ready') void drainPreReadyQueue();
       return true;
     };
 

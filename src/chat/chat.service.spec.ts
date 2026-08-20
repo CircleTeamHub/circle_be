@@ -42,6 +42,7 @@ describe('ChatService', () => {
       deleteMany: jest.fn(),
       findMany: jest.fn().mockResolvedValue([]),
     },
+    chatMediaDeletion: { deleteMany: jest.fn() },
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
@@ -150,6 +151,7 @@ describe('ChatService', () => {
     // 默认返回发号计数器行(G-05 行锁读)。列表类集合查询($queryRaw 复用同一 mock)
     // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
     prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+    prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
     // 必须每个用例重置:客服豁免一旦泄漏成 true,所有陌生人开关的用例都会被无声放行。
     support.isSupportAgent.mockResolvedValue(false);
@@ -549,6 +551,9 @@ describe('ChatService', () => {
         { key: 'chat/u1/mine.jpg' },
         'u1',
       );
+      expect(prisma.chatMediaDeletion.deleteMany).toHaveBeenCalledWith({
+        where: { objectKey: { in: ['chat/u1/copied.jpg'] } },
+      });
       expect(result.reused).toBe(false);
     });
 
@@ -640,6 +645,37 @@ describe('ChatService', () => {
       expect(media.deleteObjects).toHaveBeenCalledWith([
         'chat/u1/speculative.jpg',
       ]);
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('returns an existing forwarded delivery before resolving or copying its source', async () => {
+      const existing = {
+        ...createdRow,
+        type: 'image',
+        content: { key: 'chat/u1/existing.jpg' },
+      };
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValueOnce(existing);
+
+      const result = await service.sendMessage(
+        'u1',
+        sendPayload({
+          type: 'image',
+          content: {},
+          forwardFromMessageId: 'source-now-revoked',
+        } as never),
+      );
+
+      expect(result.reused).toBe(true);
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledTimes(1);
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          senderID: 'u1',
+          clientMessageId: 'client-msg-1',
+        },
+      });
+      expect(media.copyForForward).not.toHaveBeenCalled();
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 

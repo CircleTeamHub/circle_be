@@ -314,12 +314,27 @@ jobs:
         id: stage
         env:
           RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          CIRCLE_BE_IMAGE: ${{ needs.resolve.outputs.image_ref }}
+          RELEASE_SCHEMA_COMPATIBILITY: ${{ needs.resolve.outputs.schema_compatibility }}
+          RELEASE_DOWNTIME: ${{ inputs.downtime && '1' || '0' }}
+          RELEASE_IRREVERSIBLE_MIGRATION: ${{ inputs.irreversible_migration && '1' || '0' }}
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
           DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
           DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
         run: |
           set -euo pipefail
+          if [ -z "$RELEASE_SIGNING_PRIVATE_KEY" ]; then
+            echo "Missing RELEASE_SIGNING_PRIVATE_KEY." >&2
+            exit 1
+          fi
           STAGED_RELEASE_NAME="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RELEASE_SHA"
-          tar -czf - \
+          archive="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.tar.gz"
+          manifest="$RUNNER_TEMP/release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.manifest"
+          signature="$manifest.sig"
+          private_key="$RUNNER_TEMP/release-signing-key.pem"
+          trap 'rm -f "$archive" "$manifest" "$signature" "$private_key"' EXIT
+          tar -czf "$archive" \
             --exclude=./.env \
             --exclude=./.env.production \
             --exclude=./.release \
@@ -328,9 +343,28 @@ jobs:
             --exclude=./dist \
             --exclude=./logs \
             --exclude=./coverage \
-            . | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            .
+          archive_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+          issued_at="$(date -u +%s)"
+          printf '%s\n' \
+            'version=2' \
+            "issued_at=$issued_at" \
+            "stage=$STAGED_RELEASE_NAME" \
+            "source_sha=$RELEASE_SHA" \
+            "archive_sha256=$archive_sha256" \
+            "release_tag=$RELEASE_TAG" \
+            "image=$CIRCLE_BE_IMAGE" \
+            "schema=$RELEASE_SCHEMA_COMPATIBILITY" \
+            "downtime=$RELEASE_DOWNTIME" \
+            "irreversible=$RELEASE_IRREVERSIBLE_MIGRATION" > "$manifest"
+          printf '%s\n' "$RELEASE_SIGNING_PRIVATE_KEY" > "$private_key"
+          chmod 0600 "$private_key"
+          openssl dgst -sha256 -sign "$private_key" -out "$signature" "$manifest"
+          manifest_b64="$(base64 -w0 "$manifest")"
+          signature_b64="$(base64 -w0 "$signature")"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
               "$DEPLOY_USER@$DEPLOY_HOST" \
-              "circle-release stage $STAGED_RELEASE_NAME $RELEASE_SHA"
+              "circle-release stage-v2 $STAGED_RELEASE_NAME $manifest_b64 $signature_b64" < "$archive"
           echo "name=$STAGED_RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Activate staged release on server
@@ -361,7 +395,7 @@ jobs:
             "$GHCR_USER" \
             "$GHCR_TOKEN" | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
               "$DEPLOY_USER@$DEPLOY_HOST" \
-              "circle-release activate $STAGED_RELEASE_NAME"
+              "circle-release activate-v2 $STAGED_RELEASE_NAME"
 
       # Outside-in verification from a network the server does not control:
       # the runner probes the public API domain after the switch.
