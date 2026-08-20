@@ -1592,6 +1592,37 @@ describe('CircleInvitationService', () => {
       });
     }
 
+    function arrangeExistingPending() {
+      prisma.circleInvitation.findFirst.mockResolvedValue({
+        id: 'inv-existing',
+        status: 'PENDING',
+      });
+      prisma.circleInvitation.findUnique.mockResolvedValue({
+        id: 'inv-existing',
+        circleID: 'circle-1',
+        applicantID: 'applicant-1',
+        inviterID: 'inviter-1',
+        requiredCount: 10,
+        approvedCount: 1,
+        status: 'PENDING',
+        createdAt: new Date('2026-08-12T00:00:00.000Z'),
+        circle: { id: 'circle-1', name: 'Circle' },
+        applicant: {
+          id: 'applicant-1',
+          nickname: 'Applicant',
+          avatarUrl: null,
+          accountId: 'applicant',
+        },
+        inviter: {
+          id: 'inviter-1',
+          nickname: 'Inviter',
+          avatarUrl: null,
+          accountId: 'inviter',
+        },
+        verifiers: [],
+      });
+    }
+
     it('invite snapshots the circle requiredVerifierCount into the invitation', async () => {
       arrangeInviteFlow({ circle: { requiredVerifierCount: 10 } });
 
@@ -1786,6 +1817,62 @@ describe('CircleInvitationService', () => {
       expect(
         privacySettings.canBeInvitedToGroupOrCircle,
       ).toHaveBeenLastCalledWith('applicant-1', true, prisma);
+    });
+
+    it('skips group-invite privacy for applicant-consented QR joins inside the transaction', async () => {
+      arrangeInviteFlow();
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      privacySettings.canBeInvitedToGroupOrCircle.mockResolvedValue(false);
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+        }),
+      ).resolves.toMatchObject({ id: 'inv-new', status: 'PENDING' });
+
+      expect(
+        privacySettings.canBeInvitedToGroupOrCircle,
+      ).not.toHaveBeenCalled();
+      expect(prisma.block.findFirst).toHaveBeenCalled();
+      expect(admissionPolicy.assertCanApply).toHaveBeenCalledWith(
+        prisma,
+        'circle-1',
+        'applicant-1',
+        { actor: 'third-party' },
+      );
+    });
+
+    it('returns the existing pending invitation when the applicant scans again', async () => {
+      arrangeInviteFlow({ circle: { memberCanInvite: false } });
+      prisma.friend.findFirst.mockResolvedValue({ userID: 'applicant-1' });
+      arrangeExistingPending();
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+        }),
+      ).resolves.toMatchObject({ id: 'inv-existing', status: 'PENDING' });
+
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
+      expect(prisma.block.findFirst).toHaveBeenCalled();
+      expect(admissionPolicy.assertCanApply).not.toHaveBeenCalled();
+    });
+
+    it('returns the existing QR application before mutable admission gates', async () => {
+      arrangeInviteFlow();
+      arrangeExistingPending();
+      admissionPolicy.assertCanApply.mockRejectedValue(
+        new ForbiddenException('circle became full'),
+      );
+
+      await expect(
+        service.invite('inviter-1', 'applicant-1', 'circle-1', {
+          applicantConsented: true,
+        }),
+      ).resolves.toMatchObject({ id: 'inv-existing', status: 'PENDING' });
+
+      expect(admissionPolicy.assertCanApply).not.toHaveBeenCalled();
+      expect(prisma.circleInvitation.create).not.toHaveBeenCalled();
     });
 
     // 拉黑判定排在成员校验之前的话,任何登录用户都能拿这个接口当拉黑探针:

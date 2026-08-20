@@ -29,7 +29,6 @@ export const CIRCLE_NOTIFICATION_TYPES = compactNotificationTypes([
   NotificationType.CIRCLE_INVITATION_REJECTED,
   NotificationType.CIRCLE_ADMIN_OVERRIDE_APPROVED,
   NotificationType.CIRCLE_POST_PUBLISHED,
-  NotificationType.CIRCLE_POST_SIGNUP_CREATED,
   NotificationType.CIRCLE_POST_AUTO_ENDED,
   NotificationType.CIRCLE_POST_COLLABORATION_RECOGNIZED,
 ] as const);

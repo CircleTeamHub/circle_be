@@ -83,26 +83,40 @@ export class QrService {
   async rotateUserToken(userId: string): Promise<QrTokenDto> {
     return this.prisma.$transaction(async (tx) => {
       await this.lockTokenKey(tx, userId, 'USER', userId);
-      await tx.qrToken.updateMany({
+      const current = await tx.qrToken.findFirst({
         where: {
           type: 'USER',
           targetID: userId,
           issuerID: userId,
           revokedAt: null,
         },
-        data: { revokedAt: new Date() },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, token: true, createdAt: true },
       });
+      // 这里刻意不做「N 秒内重复调用返回原令牌」的去重。本接口只有一个调用方:
+      // 用户手动点「重置二维码」(POST tokens/rotate,文档即"撤销并重签"),而客户端
+      // 随后会弹"旧二维码已失效"。用时间窗做重试幂等分不清"网络重传"和"用户第二次
+      // 主动重置",后者被静默吞掉时用户会以为泄露出去的码已经作废 —— 而它还活着。
+      // 真需要重试幂等应由调用方带幂等键,不能靠墙上时钟猜。
+      // 历史无界增长由下面的原地更新解决,与是否去重无关。
 
       const token = randomBytes(24).toString('base64url');
-      await tx.qrToken.create({
-        data: {
-          token,
-          type: 'USER',
-          targetID: userId,
-          issuerID: userId,
-          expiresAt: null,
-        },
-      });
+      if (current) {
+        await tx.qrToken.update({
+          where: { id: current.id },
+          data: { token, createdAt: new Date(), revokedAt: null },
+        });
+      } else {
+        await tx.qrToken.create({
+          data: {
+            token,
+            type: 'USER',
+            targetID: userId,
+            issuerID: userId,
+            expiresAt: null,
+          },
+        });
+      }
       return { token, type: 'USER', expiresAt: null };
     });
   }

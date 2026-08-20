@@ -3640,7 +3640,7 @@ describe('NoteService', () => {
       expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
       const [source, dest] = uploadService.copyObjectToKey.mock.calls[0];
       expect(source).toBe('notes/owner-1/a.jpg');
-      expect(dest).toMatch(/^chat\/owner-1\/note-import\/[0-9a-f-]{36}\.jpg$/);
+      expect(dest).toMatch(/^chat\/owner-1\/note-import\/[0-9a-f]{64}\.jpg$/);
 
       expect(result.items).toEqual([
         {
@@ -3655,6 +3655,21 @@ describe('NoteService', () => {
           mimeType: 'image/jpeg',
         },
       ]);
+      expect(result.failedCount).toBe(0);
+    });
+
+    it('reuses the same destination key when an import request is retried', async () => {
+      prisma.note.findFirst.mockResolvedValue(noteRow());
+
+      await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
+      await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
+
+      expect(uploadService.copyObjectToKey.mock.calls[0][1]).toBe(
+        uploadService.copyObjectToKey.mock.calls[1][1],
+      );
+      expect(uploadService.copyObjectToKey.mock.calls[0][1]).toMatch(
+        /^chat\/viewer-2\/note-import\/[0-9a-f]{64}\.jpg$/,
+      );
     });
 
     it('scopes the lookup to readable notes (own or available)', async () => {
@@ -3838,6 +3853,7 @@ describe('NoteService', () => {
 
       expect(result.items).toHaveLength(1);
       expect(result.items[0].id).toBe('media-2');
+      expect(result.failedCount).toBe(1);
     });
 
     it('throws the first error when every copy fails', async () => {

@@ -232,6 +232,21 @@ export class CircleInvitationService {
           errorCode: CircleErrorCode.NotFound,
         });
       }
+
+      const existingInvitation = await tx.circleInvitation.findFirst({
+        where: {
+          circleID: circleId,
+          applicantID: applicantId,
+          status: 'PENDING',
+        },
+      });
+      // 本人扫码是幂等的：签发人仍在圈、申请人尚未入圈、圈仍存在且双方未
+      // 拉黑后，已有 PENDING 就是本次请求的完成结果。容量、额度和成员邀请
+      // 开关都是仅影响“能否新建”的可变门禁，不能让一次成功申请的网络重试
+      // 突然变成失败。
+      if (existingInvitation && opts?.applicantConsented) {
+        return { created: existingInvitation, admission: null };
+      }
       // 宣传期严格形态:关掉成员邀请后,只有圈主/管理员还能拉人 ——
       // requiredVerifierCount=1 时成员邀请等于「谁都能瞬间塞人进圈」,这道闸
       // 必须在服务端(客户端藏入口挡不住直接打接口)。
@@ -251,13 +266,6 @@ export class CircleInvitationService {
         actor: 'third-party',
       });
 
-      const existingInvitation = await tx.circleInvitation.findFirst({
-        where: {
-          circleID: circleId,
-          applicantID: applicantId,
-          status: 'PENDING',
-        },
-      });
       if (existingInvitation) {
         throw new ConflictException({
           message: 'There is already a pending invitation for this user',
@@ -286,17 +294,19 @@ export class CircleInvitationService {
       //
       // 读用 tx 而不是 this.prisma：共享 user lock 与这次复核必须属于同一
       // 事务，才能一直持有到邀请提交；否则仍只是缩小竞态窗口。
-      const stillAllowed =
-        await this.privacySettings.canBeInvitedToGroupOrCircle(
-          applicantId,
-          stillFriends,
-          tx,
-        );
-      if (!stillAllowed) {
-        throw new ForbiddenException({
-          message: 'User does not allow circle invites',
-          errorCode: CircleInvitationErrorCode.NotAllowed,
-        });
+      if (!opts?.applicantConsented) {
+        const stillAllowed =
+          await this.privacySettings.canBeInvitedToGroupOrCircle(
+            applicantId,
+            stillFriends,
+            tx,
+          );
+        if (!stillAllowed) {
+          throw new ForbiddenException({
+            message: 'User does not allow circle invites',
+            errorCode: CircleInvitationErrorCode.NotAllowed,
+          });
+        }
       }
 
       const inviterCanVouch =

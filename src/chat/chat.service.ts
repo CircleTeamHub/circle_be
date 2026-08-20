@@ -11,6 +11,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SupportService } from 'src/support/support.service';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
@@ -23,6 +24,7 @@ import type {
 } from 'src/generated/prisma';
 import {
   CHAT_MEDIA_KEY_PREFIX,
+  CHAT_NOTE_IMPORT_SEGMENT,
   CLIENT_MESSAGE_ID_MAX_LENGTH,
   CLIENT_MESSAGE_TYPES,
   CONVERSATION_LIST_MAX,
@@ -190,6 +192,15 @@ export class ChatService {
       ) {
         throw new BadRequestException({
           message: '媒体消息必须携带你自己的 object key',
+          errorCode: ChatErrorCode.InvalidPayload,
+        });
+      }
+    }
+    if (payload.type === 'qr-card') {
+      const token = payload.content['token'];
+      if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(token)) {
+        throw new BadRequestException({
+          message: '二维码令牌非法',
           errorCode: ChatErrorCode.InvalidPayload,
         });
       }
@@ -763,27 +774,30 @@ export class ChatService {
         errorCode: ChatErrorCode.GroupFull,
       });
     }
-    await this.assertAllFriends(userId, memberIds);
-    const activeCount = await this.prisma.user.count({
-      where: { id: { in: memberIds }, status: 'ACTIVE' },
-    });
-    if (activeCount !== memberIds.length) {
-      throw new NotFoundException({
-        message: '部分成员不存在或不可用',
-        errorCode: ChatErrorCode.PeerNotFound,
-      });
-    }
     const name = input.name?.trim() || null;
-    const conversation = await this.prisma.chatConversation.create({
-      data: {
-        type: 'GROUP',
-        name,
-        ownerID: userId,
-        members: {
-          create: [userId, ...memberIds].map((id) => ({ userID: id })),
+    const conversation = await this.prisma.$transaction(async (tx) => {
+      await lockUserRelationshipState(tx, [userId, ...memberIds]);
+      await this.assertInviteTargetsAllowed(tx, userId, memberIds);
+      const activeCount = await tx.user.count({
+        where: { id: { in: memberIds }, status: 'ACTIVE' },
+      });
+      if (activeCount !== memberIds.length) {
+        throw new NotFoundException({
+          message: '部分成员不存在或不可用',
+          errorCode: ChatErrorCode.PeerNotFound,
+        });
+      }
+      return tx.chatConversation.create({
+        data: {
+          type: 'GROUP',
+          name,
+          ownerID: userId,
+          members: {
+            create: [userId, ...memberIds].map((id) => ({ userID: id })),
+          },
         },
-      },
-      select: { id: true },
+        select: { id: true },
+      });
     });
     await this.seatMembersIntoRoom(conversation.id, [userId, ...memberIds]);
     // 建群提示一条就够;成员名单首屏可见,不再逐人刷「加入群聊」。
@@ -810,7 +824,6 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    await this.assertAllFriends(userId, invitees);
     const toJoin = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
         Array<{ id: string; type: string; circleID: string | null }>
@@ -826,6 +839,23 @@ export class ChatService {
           errorCode: ChatErrorCode.ConversationNotFound,
         });
       }
+      await lockUserRelationshipState(tx, [userId, ...invitees]);
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      await this.assertInviteTargetsAllowed(tx, userId, invitees);
       const seats = await tx.chatMember.findMany({
         where: { conversationID: conversation.id, userID: { in: invitees } },
         select: { id: true, userID: true, leftAt: true },
@@ -973,6 +1003,40 @@ export class ChatService {
       userId,
     );
     await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          ownerID: string | null;
+        }>
+      >`SELECT "id", "type", "circleID", "ownerID" FROM "ChatConversation"
+        WHERE "id" = ${conversation.id} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
       await tx.chatMember.updateMany({
         where: {
           conversationID: conversation.id,
@@ -981,7 +1045,7 @@ export class ChatService {
         },
         data: { leftAt: new Date() },
       });
-      if (conversation.ownerID === userId) {
+      if (locked[0].ownerID === userId) {
         const successor = await tx.chatMember.findFirst({
           where: { conversationID: conversation.id, leftAt: null },
           orderBy: { joinedAt: 'asc' },
@@ -1051,21 +1115,31 @@ export class ChatService {
     return conversation;
   }
 
-  /** 全部是 ACCEPTED 好友,任一不是即拒绝(独立群聊的信任边界)。 */
-  private async assertAllFriends(
+  /**
+   * 独立群邀请的共同授权边界:目标仍是好友,且其群邀请隐私允许当前关系。
+   * 调用方必须先拿 call-user 关系锁,这样好友/隐私切换不能在检查与落座之间穿插。
+   */
+  private async assertInviteTargetsAllowed(
+    tx: Prisma.TransactionClient,
     userId: string,
     memberIds: string[],
   ): Promise<void> {
-    const rows = await this.prisma.friend.findMany({
-      where: {
-        state: 'ACCEPTED',
-        OR: [
-          { userID: userId, friendID: { in: memberIds } },
-          { friendID: userId, userID: { in: memberIds } },
-        ],
-      },
-      select: { userID: true, friendID: true },
-    });
+    const [rows, privacyRows] = await Promise.all([
+      tx.friend.findMany({
+        where: {
+          state: 'ACCEPTED',
+          OR: [
+            { userID: userId, friendID: { in: memberIds } },
+            { friendID: userId, userID: { in: memberIds } },
+          ],
+        },
+        select: { userID: true, friendID: true },
+      }),
+      tx.userPrivacySetting.findMany({
+        where: { userID: { in: memberIds } },
+        select: { userID: true, groupInvitePermission: true },
+      }),
+    ]);
     const friendIds = new Set(
       rows.map((r) => (r.userID === userId ? r.friendID : r.userID)),
     );
@@ -1073,6 +1147,27 @@ export class ChatService {
       throw new ForbiddenException({
         message: '只能邀请好友进群',
         errorCode: ChatErrorCode.GroupFriendsOnly,
+      });
+    }
+    const permissions = new Map(
+      privacyRows.map((row) => [row.userID, row.groupInvitePermission]),
+    );
+    if (
+      memberIds.some((id) => {
+        const permission = permissions.get(id) ?? 'EVERYONE';
+        return (
+          permission === 'NONE' ||
+          (permission === 'FRIENDS_ONLY' && !friendIds.has(id))
+        );
+      })
+    ) {
+      throw new ForbiddenException({
+        message: '对方不允许群邀请',
+        // 好友校验上面已经过了,这里被拒的都是"是好友但关了群邀请"。复用
+        // GroupFriendsOnly 会让客户端显示"只能邀请好友进群"—— 客户端严格按
+        // 错误码出文案、丢弃服务端 message,用户看到的就是一句与事实相反、
+        // 也无法照着做的提示。圈子群的同一场景用的就是这个码。
+        errorCode: GroupErrorCode.InviteNotAllowed,
       });
     }
   }
@@ -3184,12 +3279,21 @@ export class ChatService {
   }
 
   /** 媒体消息 content 里的对象 key(撤回时要一并删的那些)。 */
+  /**
+   * 这条消息**独占**的对象 key —— 调用方拿它去删对象(撤回、阅后即焚清扫)。
+   *
+   * 笔记导入的 key 是 (viewer, note, media) 的确定性指纹,同一个人把同一张
+   * 笔记图发进两个会话会共用同一个对象。删除没有引用计数,所以这类 key 必须
+   * 排除:否则撤回其中一条,另一条的图就永久坏掉。这些对象的生命周期跟着
+   * 笔记媒体走,不跟着任何一条消息走。
+   */
   private collectMediaKeys(row: { type: string; content: unknown }): string[] {
     if (!MEDIA_MESSAGE_TYPES.includes(row.type)) return [];
     const content = (row.content ?? {}) as Record<string, unknown>;
     return ['key', 'thumbKey']
       .map((field) => content[field])
-      .filter((v): v is string => typeof v === 'string' && v.length > 0);
+      .filter((v): v is string => typeof v === 'string' && v.length > 0)
+      .filter((key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`));
   }
 
   private isUniqueViolation(error: unknown): boolean {

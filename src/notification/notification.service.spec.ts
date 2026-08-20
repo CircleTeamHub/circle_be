@@ -147,6 +147,7 @@ describe('NotificationService', () => {
     );
     expect(momentTypes.some((type) => type.startsWith('CIRCLE_'))).toBe(false);
     expect(circleTypes.every((type) => type.startsWith('CIRCLE_'))).toBe(true);
+    expect(circleTypes).not.toContain('CIRCLE_POST_SIGNUP_CREATED');
   });
 
   it('getNotifications scopes rows to one bell domain when asked', async () => {

@@ -17,7 +17,10 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { UploadService } from 'src/upload/upload.service';
-import { CHAT_MEDIA_KEY_PREFIX } from 'src/chat/chat.constants';
+import {
+  CHAT_MEDIA_KEY_PREFIX,
+  CHAT_NOTE_IMPORT_SEGMENT,
+} from 'src/chat/chat.constants';
 import { assertUrlsFromStorage } from 'src/utils/storage-url';
 import {
   prismaErrorCode,
@@ -2027,7 +2030,16 @@ export class NoteService {
       const copied = await Promise.all(
         chunk.map(async ({ row, section }) => {
           const ext = /\.([A-Za-z0-9]{1,8})$/.exec(row.objectKey)?.[1];
-          const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/note-import/${randomUUID()}${
+          const fingerprint = createHash('sha256')
+            .update(viewerID)
+            .update('\0')
+            .update(noteId)
+            .update('\0')
+            .update(row.id)
+            .update('\0')
+            .update(row.objectKey)
+            .digest('hex');
+          const destKey = `${CHAT_MEDIA_KEY_PREFIX}${viewerID}/${CHAT_NOTE_IMPORT_SEGMENT}${fingerprint}${
             ext ? `.${ext.toLowerCase()}` : ''
           }`;
           try {
@@ -2066,7 +2078,7 @@ export class NoteService {
         : new ServiceUnavailableException('Chat media copy failed');
     }
 
-    return { items };
+    return { items, failedCount: targets.length - items.length };
   }
 
   /**
