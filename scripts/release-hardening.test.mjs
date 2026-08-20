@@ -326,8 +326,15 @@ esac
 
 test('workflow stages and activates only through the restricted release protocol', () => {
   const release = read('.github/workflows/release.yml');
-  assert.match(release, /circle-release stage \$STAGED_RELEASE_NAME \$RELEASE_SHA/);
-  assert.match(release, /circle-release activate \$STAGED_RELEASE_NAME/);
+  // v2:归档走 stdin,身份与参数走一份离线签名的 manifest（见下面的签名断言）。
+  assert.match(
+    release,
+    /circle-release stage-v2 \$STAGED_RELEASE_NAME \$manifest_b64 \$signature_b64/,
+  );
+  assert.match(release, /circle-release activate-v2 \$STAGED_RELEASE_NAME/);
+  // 签名是这一版的信任根:少了它,服务器只能凭"谁连上来"判断发布包真伪。
+  assert.match(release, /openssl dgst -sha256 -sign/);
+  assert.match(release, /archive_sha256=/);
   assert.doesNotMatch(release, /ssh[^\n]*bash -s/);
   assert.doesNotMatch(release, /rsync[\s\S]*ssh -i/);
   assert.doesNotMatch(release, /Install persistent release launcher/);
@@ -337,8 +344,8 @@ test('server ForceCommand accepts no general shell or launcher replacement comma
   const gate = read('deploy/release-force-command.sh');
   assert.match(gate, /SSH_ORIGINAL_COMMAND/);
   assert.match(gate, /command_parts\[0\].*circle-release/);
-  assert.match(gate, /stage\) stage_release/);
-  assert.match(gate, /activate\) activate_release/);
+  assert.match(gate, /stage-v2\) stage_release/);
+  assert.match(gate, /activate-v2\) activate_release/);
   assert.match(gate, /! -w "\$LAUNCHER"/);
   assert.match(gate, /exec env -i/);
   assert.doesNotMatch(gate, /eval /);
