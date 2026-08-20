@@ -701,7 +701,7 @@ export class FriendService {
       // round 2 review：删好友与拉黑一样，须与 1:1 呼叫创建串行化
       //（同款 call-user pair 锁，见 blockUser 内注释）。
       for (const id of [userId, friendId].sort((a, b) => a.localeCompare(b))) {
-        await tx.$queryRaw`
+        await tx.$executeRaw`
           SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${id}`}, 0))
         `;
       }
@@ -1141,7 +1141,7 @@ export class FriendService {
         for (const id of [blockerId, targetId].sort((a, b) =>
           a.localeCompare(b),
         )) {
-          await tx.$queryRaw`
+          await tx.$executeRaw`
             SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${id}`}, 0))
           `;
         }

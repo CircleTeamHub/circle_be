@@ -1,6 +1,6 @@
 import { Prisma } from 'src/generated/prisma';
 
-type UserRelationshipLockClient = Pick<Prisma.TransactionClient, '$queryRaw'>;
+type UserRelationshipLockClient = Pick<Prisma.TransactionClient, '$executeRaw'>;
 
 /**
  * Serializes authorization decisions with relationship and privacy changes.
@@ -15,7 +15,7 @@ export async function lockUserRelationshipState(
 ): Promise<void> {
   const orderedIds = [...new Set(userIds)].sort((a, b) => a.localeCompare(b));
   for (const userId of orderedIds) {
-    await client.$queryRaw`
+    await client.$executeRaw`
       SELECT pg_advisory_xact_lock(hashtextextended(${`call-user:${userId}`}, 0))
     `;
   }

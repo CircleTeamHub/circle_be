@@ -26,6 +26,7 @@ describe('CallService', () => {
     prisma = {
       $transaction: jest.fn(async (callback) => callback(prisma)),
       $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: jest.fn().mockResolvedValue(0),
       circle: { findFirst: jest.fn() },
       circleMember: { findMany: jest.fn() },
       // 群呼按被邀请人各自的 callPermission 过滤，FRIENDS_ONLY 需要好友关系。
@@ -241,7 +242,7 @@ describe('CallService', () => {
       expect.any(Function),
       expect.objectContaining({ isolationLevel: 'Serializable' }),
     );
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
   });
 
   it('returns an existing call for a repeated create idempotency key', async () => {
