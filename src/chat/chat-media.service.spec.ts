@@ -28,6 +28,7 @@ describe('ChatMediaService', () => {
       findMany: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
+      deleteMany: jest.fn(),
     },
   };
   const service = new ChatMediaService(uploadService as never, prisma as never);
@@ -45,6 +46,7 @@ describe('ChatMediaService', () => {
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
     prisma.chatMediaDeletion.delete.mockResolvedValue({});
+    prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
   });
 
   it('persists a failed deletion instead of losing the key on restart', async () => {
@@ -194,6 +196,12 @@ describe('ChatMediaService', () => {
     });
     expect(result.content).not.toHaveProperty('url');
     expect(result.copiedKeys).toHaveLength(2);
+    expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledTimes(2);
+    const lastReservation = Math.max(
+      ...prisma.chatMediaDeletion.upsert.mock.invocationCallOrder,
+    );
+    const firstCopy = uploadService.copyObjectToKey.mock.invocationCallOrder[0];
+    expect(lastReservation).toBeLessThan(firstCopy);
   });
 
   it('cleans up earlier copies when a later media object copy fails', async () => {
@@ -212,7 +220,7 @@ describe('ChatMediaService', () => {
       ),
     ).rejects.toThrow('copy failed');
 
-    expect(uploadService.deleteObjectByKey).toHaveBeenCalledTimes(1);
+    expect(uploadService.deleteObjectByKey).toHaveBeenCalledTimes(2);
   });
 
   it('refuses to copy non-chat object keys', async () => {

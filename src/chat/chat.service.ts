@@ -361,6 +361,14 @@ export class ChatService {
             replyToID: replyToId,
           },
         });
+        if (copiedKeys.length > 0) {
+          const claimed = await tx.chatMediaDeletion.deleteMany({
+            where: { objectKey: { in: copiedKeys } },
+          });
+          if (claimed.count !== copiedKeys.length) {
+            throw new Error('Forward media reservation claim mismatch');
+          }
+        }
         // 计数器前进与会话排序时间合并成一条 UPDATE(临界区少一次往返)。
         await tx.chatConversation.update({
           where: { id: effectivePayload.conversationId },

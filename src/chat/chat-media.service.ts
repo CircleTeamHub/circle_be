@@ -34,6 +34,7 @@ const DELETE_BACKOFF_MAX_MS = 60 * 60_000;
 const DELETE_SWEEP_INTERVAL_MS = 60_000;
 /** 单轮重投的条数上限(存储长时间不可用时不要一口气打爆)。 */
 const DELETE_SWEEP_BATCH = 200;
+const FORWARD_COPY_RESERVATION_MS = 15 * 60_000;
 
 @Injectable()
 export class ChatMediaService implements OnModuleDestroy {
@@ -74,6 +75,9 @@ export class ChatMediaService implements OnModuleDestroy {
       if (!key.startsWith(CHAT_MEDIA_KEY_PREFIX)) continue;
       try {
         await this.uploadService.deleteObjectByKey(key);
+        await this.prisma.chatMediaDeletion.deleteMany({
+          where: { objectKey: key },
+        });
       } catch (error) {
         await this.enqueueDeletion(key, error);
       }
@@ -98,36 +102,68 @@ export class ChatMediaService implements OnModuleDestroy {
     delete content['url'];
     delete content['thumbUrl'];
     delete content['localUri'];
-    const copiedKeys: string[] = [];
+    const plannedCopies: Array<{
+      field: string;
+      sourceKey: string;
+      destinationKey: string;
+    }> = [];
+    for (const field of fields) {
+      const sourceKey = sourceContent[field.key];
+      if (sourceKey === undefined && field.key !== 'key') continue;
+      if (
+        typeof sourceKey !== 'string' ||
+        !sourceKey.startsWith(CHAT_MEDIA_KEY_PREFIX) ||
+        sourceKey.includes('://') ||
+        sourceKey.includes('..')
+      ) {
+        throw new BadRequestException('Invalid source media object key');
+      }
+      const fileName = sourceKey.split('/').pop() ?? '';
+      const rawExtension = fileName.includes('.')
+        ? (fileName.split('.').pop() ?? '')
+        : '';
+      const extension =
+        rawExtension.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
+      plannedCopies.push({
+        field: field.key,
+        sourceKey,
+        destinationKey: `${CHAT_MEDIA_KEY_PREFIX}${userId}/${randomUUID()}.${extension}`,
+      });
+    }
+    if (plannedCopies.length === 0) {
+      throw new BadRequestException('Source media is missing its object key');
+    }
+
+    const reservedKeys: string[] = [];
     try {
-      for (const field of fields) {
-        const sourceKey = sourceContent[field.key];
-        if (sourceKey === undefined && field.key !== 'key') continue;
-        if (
-          typeof sourceKey !== 'string' ||
-          !sourceKey.startsWith(CHAT_MEDIA_KEY_PREFIX) ||
-          sourceKey.includes('://') ||
-          sourceKey.includes('..')
-        ) {
-          throw new BadRequestException('Invalid source media object key');
-        }
-        const fileName = sourceKey.split('/').pop() ?? '';
-        const rawExtension = fileName.includes('.')
-          ? (fileName.split('.').pop() ?? '')
-          : '';
-        const extension =
-          rawExtension.replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'bin';
-        const destinationKey = `${CHAT_MEDIA_KEY_PREFIX}${userId}/${randomUUID()}.${extension}`;
-        await this.uploadService.copyObjectToKey(sourceKey, destinationKey);
-        copiedKeys.push(destinationKey);
-        content[field.key] = destinationKey;
+      const nextAttemptAt = new Date(Date.now() + FORWARD_COPY_RESERVATION_MS);
+      for (const copy of plannedCopies) {
+        await this.prisma.chatMediaDeletion.upsert({
+          where: { objectKey: copy.destinationKey },
+          create: {
+            objectKey: copy.destinationKey,
+            attempts: 0,
+            lastError: 'forward copy pending message commit',
+            nextAttemptAt,
+          },
+          update: {
+            attempts: 0,
+            lastError: 'forward copy pending message commit',
+            nextAttemptAt,
+          },
+        });
+        reservedKeys.push(copy.destinationKey);
       }
-      if (copiedKeys.length === 0) {
-        throw new BadRequestException('Source media is missing its object key');
+      for (const copy of plannedCopies) {
+        await this.uploadService.copyObjectToKey(
+          copy.sourceKey,
+          copy.destinationKey,
+        );
+        content[copy.field] = copy.destinationKey;
       }
-      return { content, copiedKeys };
+      return { content, copiedKeys: reservedKeys };
     } catch (error) {
-      if (copiedKeys.length > 0) await this.deleteObjects(copiedKeys);
+      if (reservedKeys.length > 0) await this.deleteObjects(reservedKeys);
       throw error;
     }
   }
