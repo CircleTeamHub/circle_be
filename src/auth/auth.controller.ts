@@ -6,6 +6,7 @@ import {
   Param,
   Post,
   Put,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -25,6 +26,7 @@ import {
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { AuthService } from './auth.service';
+import { QrLoginService } from './qr-login.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
 import { LoginDto } from './dto/login.dto';
@@ -70,7 +72,40 @@ function getSessionContext(req?: Request): SessionContext {
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private qrLoginService: QrLoginService,
+  ) {}
+
+  // ---- 网页扫码登录（桌面网页版）----
+  // 固定路径 qr-login 段独立于其余路由；create/status 公开（与 login 同级
+  // 的未认证面），approve 走手机端已登录会话。
+
+  @Post('qr-login')
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '网页端创建扫码登录会话' })
+  createQrLogin() {
+    return this.qrLoginService.create();
+  }
+
+  @Get('qr-login/:token')
+  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @ApiOperation({ summary: '网页端轮询扫码登录状态（key=pollKey）' })
+  qrLoginStatus(
+    @Param('token') token: string,
+    @Query('key') key: string | undefined,
+    @Req() req?: Request,
+  ) {
+    return this.qrLoginService.status(token, key ?? '', getSessionContext(req));
+  }
+
+  @Post('qr-login/:token/approve')
+  @UseGuards(JwtGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '手机端确认网页登录' })
+  approveQrLogin(@Req() req: RequestWithUser, @Param('token') token: string) {
+    return this.qrLoginService.approve(req.user.userId, token);
+  }
 
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })

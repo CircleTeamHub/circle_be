@@ -42,7 +42,8 @@ export class QrService {
 
   async issueToken(
     userId: string,
-    type: QrTokenTypeDto,
+    // LOGIN 令牌住独立表（QrLoginSession），签发面只收三种实体码。
+    type: Exclude<QrTokenTypeDto, 'LOGIN'>,
     targetId?: string,
   ): Promise<QrTokenDto> {
     const targetID = await this.assertCanIssue(userId, type, targetId);
@@ -78,6 +79,33 @@ export class QrService {
   }
 
   async resolveToken(viewerId: string, token: string): Promise<QrResolveDto> {
+    // 网页扫码登录的令牌存在独立表：先查它，命中即返回 LOGIN 预览
+    // （落地页据此渲染"确认登录"面板）。失效/已用与普通令牌同文案，不给探测面。
+    const loginSession = await this.prisma.qrLoginSession.findUnique({
+      where: { qrToken: token },
+    });
+    if (loginSession) {
+      if (
+        loginSession.status !== 'PENDING' ||
+        loginSession.expiresAt.getTime() <= Date.now()
+      ) {
+        throw new NotFoundException({
+          message: '二维码已失效',
+          errorCode: QrErrorCode.Expired,
+        });
+      }
+      return {
+        type: 'LOGIN',
+        targetId: loginSession.id,
+        name: '',
+        avatarUrl: null,
+        memberCount: null,
+        issuerNickname: '',
+        expiresAt: loginSession.expiresAt.toISOString(),
+        viewerState: 'NONE',
+      };
+    }
+
     const row = await this.requireValidToken(token);
     const issuer = await this.prisma.user.findUnique({
       where: { id: row.issuerID },

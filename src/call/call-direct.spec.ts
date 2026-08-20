@@ -24,6 +24,7 @@ describe('CallService direct calls (#113 #115) + current (#FE93)', () => {
     prisma = {
       $transaction: jest.fn(async (callback: any) => callback(prisma)),
       $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: jest.fn().mockResolvedValue(0),
       friend: { findFirst: jest.fn() },
       block: { findFirst: jest.fn() },
       circle: { findFirst: jest.fn().mockResolvedValue(null) },

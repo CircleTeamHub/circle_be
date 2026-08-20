@@ -8,6 +8,10 @@ import { QrService } from './qr.service';
 
 describe('QrService', () => {
   const prisma = {
+    // resolveToken 先查网页扫码登录表(默认不命中,走原有实体码路径)。
+    qrLoginSession: {
+      findUnique: jest.fn().mockResolvedValue(null),
+    },
     qrToken: {
       findFirst: jest.fn(),
       findUnique: jest.fn(),

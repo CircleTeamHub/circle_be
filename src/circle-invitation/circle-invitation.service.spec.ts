@@ -63,6 +63,7 @@ describe('CircleInvitationService', () => {
     },
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -1258,17 +1259,17 @@ describe('CircleInvitationService', () => {
 
       // 圈成员锁只和圈成员写共享；解除好友拿的是 call-user:*。资格读取必须
       // 先拿同一把 user lock，才能与解除好友严格串行。
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         1,
         expect.anything(),
         'call-user:applicant-1',
       );
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         2,
         expect.anything(),
         'call-user:verifier-9',
       );
-      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[0],
       );
       expect(prisma.friend.findFirst).toHaveBeenCalledWith(
