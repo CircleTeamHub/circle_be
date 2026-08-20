@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GATE="$PROJECT_ROOT/deploy/release-force-command.sh"
 CASE_DIR="$(mktemp -d "$PROJECT_ROOT/.tmp-release-test.XXXXXX")"
+GATE="$CASE_DIR/release-force-command.sh"
 DEPLOY_ROOT="$CASE_DIR/circle_be"
 DEPLOY_HOME="$CASE_DIR/deploy-home"
 STATE_DIR="$DEPLOY_ROOT/.release"
@@ -11,6 +11,14 @@ LOG="$STATE_DIR/activation.log"
 SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 IMAGE=ghcr.io/circleteamhub/circle_be@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 trap 'rm -rf "$CASE_DIR"' EXIT
+
+cp "$PROJECT_ROOT/deploy/release-force-command.sh" "$GATE"
+if [ "${OS:-}" = 'Windows_NT' ]; then
+  # NTFS reports statfs free-inode count as -1. Exercise the same capacity
+  # branch with its numeric free-block count; production keeps the fail-closed
+  # %d inode probe and Linux CI exercises it unchanged.
+  sed -i "s/'%a %S %d'/'%a %S %f'/" "$GATE"
+fi
 
 mkdir -p "$STATE_DIR" "$DEPLOY_HOME" "$CASE_DIR/source/deploy"
 printf 'payload\n' > "$CASE_DIR/source/VERSION"
