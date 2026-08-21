@@ -634,6 +634,23 @@ test('server ForceCommand accepts no general shell or launcher replacement comma
   assert.doesNotMatch(gate, /install-launcher/);
 });
 
+test('release hardening runbook verifies the trusted launcher directly', () => {
+  const runbook = read('docs/release-hardening-runbook.md');
+  const selfChecks = runbook.slice(
+    runbook.indexOf('## 自检'),
+    runbook.indexOf('## 故障对照'),
+  );
+
+  assert.match(selfChecks, /sudo test -f "\$launcher"/);
+  assert.match(selfChecks, /sudo test -x "\$launcher"/);
+  assert.match(selfChecks, /sudo test ! -L "\$launcher"/);
+  assert.match(
+    selfChecks,
+    /sudo -u "\$DEPLOY_USER" test ! -w "\$launcher"/,
+  );
+  assert.doesNotMatch(selfChecks, /circle-release activate-v2/);
+});
+
 test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
   const launcher = read('deploy/release-launcher.sh');
   const lock = launcher.indexOf('flock -x 201');

@@ -159,7 +159,8 @@ restrict,command="/usr/local/bin/circle-release-force-command /home/ubuntu/circl
 
 ## 自检
 
-用**新密钥**跑这三项。三项都符合预期,才算装对了。
+前两项用**新密钥**执行;第三项用独立的管理员/root 登录直接检查服务器文件。
+三项都符合预期,才算装对了。
 
 **一、通用 shell 必须被拒**
 
@@ -182,18 +183,28 @@ ssh -i deploy_key_new ubuntu@$DEPLOY_HOST "circle-release stage-v2"
 这条说明脚本装到位、两个参数都收到了。若看到
 `server deploy root or signing public key is not configured`,是 `command=` 里少传了第二个参数。
 
-**三、launcher 与公钥的权限正确**
+**三、launcher 必须真实满足执行前置**
+
+用独立的管理员/root 登录服务器执行:
 
 ```bash
-ssh -i deploy_key_new ubuntu@$DEPLOY_HOST \
-  "circle-release activate-v2 1-1-0000000000000000000000000000000000000000"
+DEPLOY_USER=ubuntu
+DEPLOY_ROOT=/home/$DEPLOY_USER/circle_be
+launcher="$DEPLOY_ROOT/.release/release-launcher.sh"
+
+sudo test -f "$launcher"
+sudo test -x "$launcher"
+sudo test ! -L "$launcher"
+sudo -u "$DEPLOY_USER" test ! -w "$launcher"
+sudo stat -c '%U %G %a %n' "$launcher"
 ```
 
-预期:`release command rejected: staged release not found`
+前四条 `test` 预期没有输出且全部返回 0;`stat` 预期显示 `root root 555` 和 launcher 路径。
+若任一条失败,回第 2 步重新安装 launcher。
 
-走到「找不到发布包」说明公钥和 launcher 的权限校验都过了。若报
-`must not be writable by the deployment account`,回第 2 步把对应文件的属主改成 root、
-权限改成 `0555`/`0444`。
+不能用一个不存在的 stage 来验证 launcher:ForceCommand 会先返回 `staged release not found`,
+根本还没有执行到 launcher 的存在、符号链接和可写性检查。前两项能进入协议参数校验,
+已经同时证明签名公钥存在且部署账号不可写;本项再直接覆盖 launcher 的四个执行前置。
 
 ---
 
