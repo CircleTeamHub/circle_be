@@ -18,6 +18,16 @@ if [ "${OS:-}" = 'Windows_NT' ]; then
   # branch with its numeric free-block count; production keeps the fail-closed
   # %d inode probe and Linux CI exercises it unchanged.
   sed -i "s/'%a %S %d'/'%a %S %f'/" "$GATE"
+  mkdir -p "$CASE_DIR/bin"
+  cat > "$CASE_DIR/bin/flock" <<'FLOCK'
+#!/usr/bin/env bash
+if [ "${FLOCK_TEST_BUSY:-0}" = 1 ]; then
+  exit 1
+fi
+exit 0
+FLOCK
+  chmod +x "$CASE_DIR/bin/flock"
+  sed -i "s|/usr/bin/flock|$CASE_DIR/bin/flock|" "$GATE"
 fi
 
 mkdir -p "$STATE_DIR" "$DEPLOY_HOME" "$CASE_DIR/source/deploy"
@@ -99,6 +109,41 @@ activate_stage() {
   printf '%s\n' 0 "$tag" "$IMAGE" 0 0 'github-actions[bot]' test-token |
     run_gate "circle-release activate-v2 $stage"
 }
+
+LOCKED_STAGE="122-1-$SHA"
+read -r LOCKED_MANIFEST_B64 LOCKED_SIGNATURE_B64 < <(
+  sign_stage "$LOCKED_STAGE" "$CASE_DIR/stage.tar.gz"
+)
+exec 203>"$STATE_DIR/deploy.lock"
+if [ "${OS:-}" = 'Windows_NT' ]; then
+  export FLOCK_TEST_BUSY=1
+else
+  flock -n 203
+fi
+if run_gate "circle-release stage-v2 $LOCKED_STAGE $LOCKED_MANIFEST_B64 $LOCKED_SIGNATURE_B64" \
+  < "$CASE_DIR/stage.tar.gz" > "$CASE_DIR/locked-stage.log" 2>&1; then
+  echo 'concurrent stage unexpectedly acquired the release lock' >&2
+  exit 1
+fi
+grep -Fq 'another release operation is in progress' "$CASE_DIR/locked-stage.log"
+if compgen -G "$STATE_DIR/upload.*" >/dev/null ||
+  compgen -G "$STATE_DIR/manifest.*" >/dev/null ||
+  compgen -G "$STATE_DIR/signature.*" >/dev/null ||
+  compgen -G "$STATE_DIR/incoming/.extract-$LOCKED_STAGE.*" >/dev/null ||
+  [ -e "$STATE_DIR/incoming/$LOCKED_STAGE" ]; then
+  echo 'contended stage allocated release artifacts before locking' >&2
+  exit 1
+fi
+if [ "${OS:-}" = 'Windows_NT' ]; then
+  unset FLOCK_TEST_BUSY
+else
+  flock -u 203
+fi
+
+RECOVERY_STAGE="122-2-$SHA"
+stage_archive "$RECOVERY_STAGE" "$CASE_DIR/stage.tar.gz"
+[ "$(cat "$STATE_DIR/incoming/$RECOVERY_STAGE/VERSION")" = payload ]
+rm -rf "$STATE_DIR/incoming/$RECOVERY_STAGE"
 
 STAGE="123-1-$SHA"
 stage_archive "$STAGE" "$CASE_DIR/stage.tar.gz"
