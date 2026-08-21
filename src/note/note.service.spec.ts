@@ -66,6 +66,9 @@ describe('NoteService', () => {
       findMany: jest.fn(),
       updateMany: jest.fn(),
     },
+    chatMediaDeletion: {
+      upsert: jest.fn(),
+    },
   };
 
   const uploadService = {
@@ -3628,6 +3631,8 @@ describe('NoteService', () => {
       prisma.note.findFirst.mockReset();
       uploadService.copyObjectToKey.mockReset();
       uploadService.copyObjectToKey.mockResolvedValue(undefined);
+      prisma.chatMediaDeletion.upsert.mockReset();
+      prisma.chatMediaDeletion.upsert.mockResolvedValue({});
     });
 
     it('copies media-section objects into the viewer chat namespace', async () => {
@@ -3656,6 +3661,43 @@ describe('NoteService', () => {
         },
       ]);
       expect(result.failedCount).toBe(0);
+    });
+
+    it('persists a cleanup reservation before copying each note import object', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const destination = uploadService.copyObjectToKey.mock.calls[0][1];
+      expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { objectKey: destination },
+          create: expect.objectContaining({
+            objectKey: destination,
+            attempts: 0,
+            nextAttemptAt: expect.any(Date),
+          }),
+        }),
+      );
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
+      );
+      expect(
+        prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
+      ).toBeLessThan(uploadService.copyObjectToKey.mock.invocationCallOrder[0]);
+    });
+
+    it('does not copy an object when its durable cleanup reservation fails', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+        new Error('database unavailable'),
+      );
+
+      await expect(
+        service.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+      ).rejects.toThrow('database unavailable');
+      expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
     });
 
     it('reuses the same destination key when an import request is retried', async () => {

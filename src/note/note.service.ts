@@ -20,6 +20,8 @@ import { UploadService } from 'src/upload/upload.service';
 import {
   CHAT_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_SEGMENT,
+  CHAT_NOTE_IMPORT_RESERVATION_MS,
+  CHAT_NOTE_IMPORT_RESERVATION_REASON,
 } from 'src/chat/chat.constants';
 import {
   assertUrlsFromStorage,
@@ -2051,6 +2053,28 @@ export class NoteService {
             ext ? `.${ext.toLowerCase()}` : ''
           }`;
           try {
+            const nextAttemptAt = new Date(
+              Date.now() + CHAT_NOTE_IMPORT_RESERVATION_MS,
+            );
+            await this.prisma.$transaction(async (tx) => {
+              // 与删除 worker 共用同一把 key 锁。若过期 reservation 正被清理,
+              // 先等它结束再续租并复制；否则「刚复制完」的对象可能被旧 worker 删掉。
+              await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${destKey}))`;
+              await tx.chatMediaDeletion.upsert({
+                where: { objectKey: destKey },
+                create: {
+                  objectKey: destKey,
+                  attempts: 0,
+                  lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+                  nextAttemptAt,
+                },
+                update: {
+                  attempts: 0,
+                  lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+                  nextAttemptAt,
+                },
+              });
+            });
             await uploadService.copyObjectToKey(row.objectKey, destKey);
           } catch (error) {
             firstCopyError ??= error;

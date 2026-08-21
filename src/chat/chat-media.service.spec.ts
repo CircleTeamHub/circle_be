@@ -23,11 +23,19 @@ describe('ChatMediaService', () => {
     deleteObjectByKey: jest.fn(),
   };
   const prisma = {
+    $transaction: jest.fn(),
+    $queryRaw: jest.fn(),
     chatMediaDeletion: {
       upsert: jest.fn(),
+      findUnique: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    chatMediaReference: {
+      count: jest.fn(),
+      createMany: jest.fn(),
       deleteMany: jest.fn(),
     },
   };
@@ -47,6 +55,14 @@ describe('ChatMediaService', () => {
     prisma.chatMediaDeletion.update.mockResolvedValue({});
     prisma.chatMediaDeletion.delete.mockResolvedValue({});
     prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(null);
+    prisma.chatMediaReference.count.mockResolvedValue(0);
+    prisma.chatMediaReference.createMany.mockResolvedValue({ count: 1 });
+    prisma.chatMediaReference.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.$transaction.mockImplementation(
+      async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
+    );
+    prisma.$queryRaw.mockResolvedValue([]);
   });
 
   it('persists a failed deletion instead of losing the key on restart', async () => {
@@ -64,9 +80,14 @@ describe('ChatMediaService', () => {
   });
 
   it('keeps dead-lettered rows instead of dropping the key', async () => {
-    prisma.chatMediaDeletion.findMany.mockResolvedValue([
-      { id: 'd1', objectKey: 'chat/u1/a.jpg', attempts: 7 },
-    ]);
+    const due = {
+      id: 'd1',
+      objectKey: 'chat/u1/a.jpg',
+      attempts: 7,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(due);
     uploadService.deleteObjectByKey.mockRejectedValue(new Error('still down'));
 
     await service.drainPendingDeletions();
@@ -82,12 +103,36 @@ describe('ChatMediaService', () => {
   });
 
   it('clears the row once storage confirms the deletion', async () => {
-    prisma.chatMediaDeletion.findMany.mockResolvedValue([
-      { id: 'd1', objectKey: 'chat/u1/a.jpg', attempts: 2 },
-    ]);
+    const due = {
+      id: 'd1',
+      objectKey: 'chat/u1/a.jpg',
+      attempts: 2,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(due);
 
     await service.drainPendingDeletions();
 
+    expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
+      where: { id: 'd1' },
+    });
+  });
+
+  it('cancels a stale deletion without touching an object that is still referenced', async () => {
+    const due = {
+      id: 'd1',
+      objectKey: 'chat/u1/note-import/shared.jpg',
+      attempts: 0,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(due);
+    prisma.chatMediaReference.count.mockResolvedValue(1);
+
+    await service.drainPendingDeletions();
+
+    expect(uploadService.deleteObjectByKey).not.toHaveBeenCalled();
     expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
       where: { id: 'd1' },
     });

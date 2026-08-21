@@ -118,6 +118,9 @@ export const CHAT_MEDIA_KEY_PREFIX = 'chat/';
  * 必须跳过它,否则删掉的是所有引用它的消息共用的那一份。
  */
 export const CHAT_NOTE_IMPORT_SEGMENT = 'note-import/';
+export const CHAT_NOTE_IMPORT_RESERVATION_MS = 15 * 60_000;
+export const CHAT_NOTE_IMPORT_RESERVATION_REASON =
+  'note import pending message reference';
 
 /**
  * 媒体消息 content 里的 object-key 字段表(key 字段名 → 读路径补的 URL 字段名)。

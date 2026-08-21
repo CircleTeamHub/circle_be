@@ -7,7 +7,13 @@ import {
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
-import { CHAT_MEDIA_KEY_FIELDS, CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
+import type { Prisma } from 'src/generated/prisma';
+import {
+  CHAT_MEDIA_KEY_FIELDS,
+  CHAT_MEDIA_KEY_PREFIX,
+  CHAT_NOTE_IMPORT_RESERVATION_REASON,
+  CHAT_NOTE_IMPORT_SEGMENT,
+} from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 
 /**
@@ -57,6 +63,106 @@ export class ChatMediaService implements OnModuleDestroy {
     if (this.retryTimer) {
       clearInterval(this.retryTimer);
       this.retryTimer = null;
+    }
+  }
+
+  private noteImportKeys(keys: string[]): string[] {
+    return [...new Set(keys)]
+      .filter((key) => key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`))
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private async lockNoteImportKeys(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+  ): Promise<void> {
+    for (const key of this.noteImportKeys(keys)) {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+    }
+  }
+
+  async attachNoteImportReferences(
+    tx: Prisma.TransactionClient,
+    messageId: string,
+    keys: string[],
+  ): Promise<void> {
+    const noteKeys = this.noteImportKeys(keys);
+    if (noteKeys.length === 0) return;
+    await this.lockNoteImportKeys(tx, noteKeys);
+    const now = Date.now();
+    for (const objectKey of noteKeys) {
+      const [referenceCount, reservation] = await Promise.all([
+        tx.chatMediaReference.count({ where: { objectKey } }),
+        tx.chatMediaDeletion.findUnique({
+          where: { objectKey },
+          select: { attempts: true, lastError: true, nextAttemptAt: true },
+        }),
+      ]);
+      const liveReservation =
+        reservation?.attempts === 0 &&
+        reservation.lastError === CHAT_NOTE_IMPORT_RESERVATION_REASON &&
+        reservation.nextAttemptAt.getTime() > now;
+      if (referenceCount === 0 && !liveReservation) {
+        throw new BadRequestException('Note media import has expired');
+      }
+    }
+    await tx.chatMediaReference.createMany({
+      data: noteKeys.map((objectKey) => ({ messageID: messageId, objectKey })),
+      skipDuplicates: true,
+    });
+    await tx.chatMediaDeletion.deleteMany({
+      where: { objectKey: { in: noteKeys } },
+    });
+  }
+
+  async releaseNoteImportReferences(
+    tx: Prisma.TransactionClient,
+    messageIds: string[],
+    keys: string[],
+  ): Promise<void> {
+    const noteKeys = this.noteImportKeys(keys);
+    if (noteKeys.length === 0 || messageIds.length === 0) return;
+    await this.lockNoteImportKeys(tx, noteKeys);
+    await tx.chatMediaReference.deleteMany({
+      where: {
+        messageID: { in: messageIds },
+        objectKey: { in: noteKeys },
+      },
+    });
+    for (const objectKey of noteKeys) {
+      const referenceCount = await tx.chatMediaReference.count({
+        where: { objectKey },
+      });
+      if (referenceCount > 0) {
+        await tx.chatMediaDeletion.deleteMany({ where: { objectKey } });
+        continue;
+      }
+      const reservation = await tx.chatMediaDeletion.findUnique({
+        where: { objectKey },
+        select: { attempts: true, lastError: true, nextAttemptAt: true },
+      });
+      if (
+        reservation?.attempts === 0 &&
+        reservation.lastError === CHAT_NOTE_IMPORT_RESERVATION_REASON &&
+        reservation.nextAttemptAt.getTime() > Date.now()
+      ) {
+        continue;
+      }
+      const nextAttemptAt = new Date();
+      await tx.chatMediaDeletion.upsert({
+        where: { objectKey },
+        create: {
+          objectKey,
+          attempts: 0,
+          lastError: 'last note import reference removed',
+          nextAttemptAt,
+        },
+        update: {
+          attempts: 0,
+          lastError: 'last note import reference removed',
+          nextAttemptAt,
+        },
+      });
     }
   }
 
@@ -212,34 +318,52 @@ export class ChatMediaService implements OnModuleDestroy {
         take: DELETE_SWEEP_BATCH,
       });
       for (const row of due) {
-        try {
-          await this.uploadService.deleteObjectByKey(row.objectKey);
-          await this.prisma.chatMediaDeletion.delete({ where: { id: row.id } });
-        } catch (error) {
-          const attempts = row.attempts + 1;
-          const backoff = Math.min(
-            DELETE_BACKOFF_BASE_MS * 2 ** row.attempts,
-            DELETE_BACKOFF_MAX_MS,
-          );
-          await this.prisma.chatMediaDeletion.update({
+        await this.prisma.$transaction(async (tx) => {
+          await this.lockNoteImportKeys(tx, [row.objectKey]);
+          const current = await tx.chatMediaDeletion.findUnique({
             where: { id: row.id },
-            data: {
-              attempts,
-              lastError: (error instanceof Error
-                ? error.message
-                : String(error)
-              ).slice(0, 500),
-              nextAttemptAt: new Date(Date.now() + backoff),
-            },
           });
-          if (attempts >= DELETE_MAX_ATTEMPTS) {
-            // 死信:停止自动重试,但**留在表里** —— 删掉这一行,那个 key 就
-            // 再也无从得知了。
-            this.logger.error(
-              `chat media delete dead-lettered key=${row.objectKey} after ${attempts} attempts`,
-            );
+          if (
+            !current ||
+            current.attempts >= DELETE_MAX_ATTEMPTS ||
+            current.nextAttemptAt.getTime() > Date.now()
+          ) {
+            return;
           }
-        }
+          const referenceCount = await tx.chatMediaReference.count({
+            where: { objectKey: current.objectKey },
+          });
+          if (referenceCount > 0) {
+            await tx.chatMediaDeletion.delete({ where: { id: current.id } });
+            return;
+          }
+          try {
+            await this.uploadService.deleteObjectByKey(current.objectKey);
+            await tx.chatMediaDeletion.delete({ where: { id: current.id } });
+          } catch (error) {
+            const attempts = current.attempts + 1;
+            const backoff = Math.min(
+              DELETE_BACKOFF_BASE_MS * 2 ** current.attempts,
+              DELETE_BACKOFF_MAX_MS,
+            );
+            await tx.chatMediaDeletion.update({
+              where: { id: current.id },
+              data: {
+                attempts,
+                lastError: (error instanceof Error
+                  ? error.message
+                  : String(error)
+                ).slice(0, 500),
+                nextAttemptAt: new Date(Date.now() + backoff),
+              },
+            });
+            if (attempts >= DELETE_MAX_ATTEMPTS) {
+              this.logger.error(
+                `chat media delete dead-lettered key=${current.objectKey} after ${attempts} attempts`,
+              );
+            }
+          }
+        });
       }
     } catch (error) {
       this.logger.warn(
