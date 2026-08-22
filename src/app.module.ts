@@ -60,7 +60,10 @@ const envFilePath = `.env.${nodeEnv}`;
       validationSchema: createEnvValidationSchema(),
     }),
     ScheduleModule.forRoot(),
-    ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }]),
+    ThrottlerModule.forRoot([
+      { name: 'default', ttl: 60_000, limit: 100 },
+      { name: 'qrSession', ttl: 60_000, limit: 120 },
+    ]),
     RedisModule,
     PrismaModule,
     UserModule,

@@ -23,6 +23,9 @@ export interface QrResolveDto {
   expiresAt: string | null;
   /** 扫到自己的名片 / 已在群里 / 已在圈子里:落地页据此换按钮。 */
   viewerState: 'SELF' | 'ALREADY_IN' | 'FRIEND' | 'NONE';
+  /** LOGIN preview only: server-derived browser/OS and a comparison code. */
+  requestDevice?: string;
+  verificationCode?: string;
 }
 
 /** POST /qr/tokens/:token/join。 */

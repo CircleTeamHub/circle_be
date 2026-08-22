@@ -8,6 +8,10 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { QrErrorCode } from 'src/common/app-error-codes';
 import { AuthService } from './auth.service';
 import type { SessionContext } from './refresh-token.service';
+import {
+  describeQrLoginDevice,
+  qrLoginVerificationCode,
+} from './qr-login-context';
 
 /**
  * 网页扫码登录（桌面网页版 M3）。
@@ -47,18 +51,27 @@ export class QrLoginService {
     private readonly authService: AuthService,
   ) {}
 
-  async create() {
+  async create(sessionContext?: SessionContext) {
+    const requestDevice = describeQrLoginDevice(sessionContext);
     const session = await this.prisma.qrLoginSession.create({
       data: {
         qrToken: randomBytes(24).toString('base64url'),
         pollKey: randomBytes(24).toString('base64url'),
+        requestDevice,
         expiresAt: new Date(Date.now() + QR_LOGIN_TTL_MS),
       },
-      select: { qrToken: true, pollKey: true, expiresAt: true },
+      select: {
+        qrToken: true,
+        pollKey: true,
+        requestDevice: true,
+        expiresAt: true,
+      },
     });
     return {
       qrToken: session.qrToken,
       pollKey: session.pollKey,
+      requestDevice: session.requestDevice,
+      verificationCode: qrLoginVerificationCode(session.qrToken),
       expiresAt: session.expiresAt.toISOString(),
     };
   }

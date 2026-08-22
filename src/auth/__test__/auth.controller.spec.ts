@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common/constants';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import { AuthController } from '../auth.controller';
+import { AuthController, getQrLoginStatusTracker } from '../auth.controller';
 import { QrLoginService } from '../qr-login.service';
 import { AuthService } from '../auth.service';
 import { RegisterDto } from '../dto/register.dto';
@@ -345,6 +345,37 @@ describe('AuthController 扫码登录端点的传输面', () => {
       'secret-key',
       {},
     );
+  });
+
+  it('创建会话记录服务端看到的浏览器上下文', async () => {
+    await controller.createQrLogin({
+      headers: { 'user-agent': 'Chrome on macOS' },
+      ip: '203.0.113.10',
+    } as any);
+    expect(qrLoginService.create).toHaveBeenCalledWith({
+      deviceName: null,
+      ip: '203.0.113.10',
+      userAgent: 'Chrome on macOS',
+    });
+  });
+
+  it('同 IP 的不同二维码使用独立 session tracker', async () => {
+    const first = await getQrLoginStatusTracker(
+      { ip: '203.0.113.10', params: { token: 'token-a' } },
+      {} as never,
+    );
+    const second = await getQrLoginStatusTracker(
+      { ip: '203.0.113.10', params: { token: 'token-b' } },
+      {} as never,
+    );
+    const sameFromAnotherIp = await getQrLoginStatusTracker(
+      { ip: '203.0.113.11', params: { token: 'token-a' } },
+      {} as never,
+    );
+
+    expect(first).not.toBe(second);
+    expect(first).toBe(sameFromAnotherIp);
+    expect(first).not.toContain('token-a');
   });
 
   it('轮询走 POST + no-store：带令牌的响应不该被任何一层缓存', () => {

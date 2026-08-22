@@ -259,6 +259,24 @@ describe('QrService', () => {
   });
 
   describe('resolveToken', () => {
+    it('resolves LOGIN with browser context and comparison code', async () => {
+      prisma.qrLoginSession.findUnique.mockResolvedValueOnce({
+        id: 'login-1',
+        qrToken: 'q'.repeat(32),
+        status: 'PENDING',
+        requestDevice: 'Chrome · macOS',
+        expiresAt: new Date(Date.now() + 60_000),
+      });
+
+      await expect(
+        service.resolveToken('u1', 'q'.repeat(32)),
+      ).resolves.toMatchObject({
+        type: 'LOGIN',
+        requestDevice: 'Chrome · macOS',
+        verificationCode: expect.stringMatching(/^\d{6}$/),
+      });
+    });
+
     it('404s on unknown or revoked tokens', async () => {
       prisma.qrToken.findUnique.mockResolvedValue(null);
       await expect(service.resolveToken('u1', 'nope')).rejects.toThrow(

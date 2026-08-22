@@ -8,13 +8,17 @@ import {
   Param,
   Post,
   Put,
-  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
 import { Request } from 'express';
+import { createHash } from 'crypto';
 import * as requestIp from 'request-ip';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import {
+  Throttle,
+  ThrottlerGuard,
+  type ThrottlerGetTrackerFunction,
+} from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -72,6 +76,16 @@ function getSessionContext(req?: Request): SessionContext {
   };
 }
 
+export const getQrLoginStatusTracker: ThrottlerGetTrackerFunction = (req) => {
+  const params = req.params as Record<string, unknown> | undefined;
+  const token = params?.token;
+  if (typeof token === 'string' && token.length > 0) {
+    const digest = createHash('sha256').update(token).digest('base64url');
+    return `qr-session:${digest.slice(0, 22)}`;
+  }
+  return `ip:${String(req.ip ?? 'unknown')}`;
+};
+
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
@@ -92,8 +106,8 @@ export class AuthController {
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @Header('Cache-Control', 'no-store')
   @ApiOperation({ summary: '网页端创建扫码登录会话' })
-  createQrLogin() {
-    return this.qrLoginService.create();
+  createQrLogin(@Req() req?: Request) {
+    return this.qrLoginService.create(getSessionContext(req));
   }
 
   // POST 而非 GET：这个响应在 APPROVED 那一次会带上 access/refresh 令牌，
@@ -102,7 +116,17 @@ export class AuthController {
   @Post('qr-login/:token/status')
   @UseGuards(ThrottlerGuard)
   @HttpCode(200)
-  @Throttle({ default: { limit: 120, ttl: 60_000 } })
+  @Throttle({
+    // Keep the existing aggregate IP ceiling and add a stricter independent
+    // session bucket. The client polls slowly enough for several NAT peers to
+    // share the IP allowance without one hot session consuming it all.
+    default: { limit: 120, ttl: 60_000 },
+    qrSession: {
+      limit: 20,
+      ttl: 60_000,
+      getTracker: getQrLoginStatusTracker,
+    },
+  })
   @Header('Cache-Control', 'no-store')
   @ApiOperation({ summary: '网页端轮询扫码登录状态' })
   qrLoginStatus(

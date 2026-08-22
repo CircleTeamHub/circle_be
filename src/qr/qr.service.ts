@@ -17,6 +17,7 @@ import type {
   QrTokenDto,
   QrTokenTypeDto,
 } from './qr.types';
+import { qrLoginVerificationCode } from 'src/auth/qr-login-context';
 
 // 微信语义:群/圈子码 7 天有效,「重新进入将更新」。剩余不足 24 小时才轮换新码,
 // 不然每次打开页面都插一行令牌;旧码在自己的 7 天线内继续有效(与微信一致)。
@@ -147,6 +148,8 @@ export class QrService {
         issuerNickname: '',
         expiresAt: loginSession.expiresAt.toISOString(),
         viewerState: 'NONE',
+        requestDevice: loginSession.requestDevice,
+        verificationCode: qrLoginVerificationCode(loginSession.qrToken),
       };
     }
 

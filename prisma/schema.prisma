@@ -2082,6 +2082,7 @@ model QrLoginSession {
   id           String        @id @default(uuid())
   qrToken      String        @unique
   pollKey      String        @unique
+  requestDevice String       @default("Unknown browser · Unknown OS")
   status       QrLoginStatus @default(PENDING)
   approvedByID String?
   approvedBy   User?         @relation("qrLoginApprover", fields: [approvedByID], references: [id], onDelete: Cascade)

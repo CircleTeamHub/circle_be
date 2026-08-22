@@ -18,6 +18,7 @@ describe('QrLoginService', () => {
         create: jest.fn().mockResolvedValue({
           qrToken: 'q'.repeat(32),
           pollKey: 'p'.repeat(32),
+          requestDevice: 'Chrome · macOS',
           expiresAt: future,
         }),
         findUnique: jest.fn().mockResolvedValue(overrides?.session ?? null),
@@ -57,11 +58,16 @@ describe('QrLoginService', () => {
     expiresAt: future,
   };
 
-  it('create 返回双令牌与过期时间', async () => {
+  it('create 返回双令牌、设备上下文、确认码与过期时间', async () => {
     const { service } = build();
-    const result = await service.create();
+    const result = await service.create({
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0 Safari/537.36',
+    });
     expect(result.qrToken).toHaveLength(32);
     expect(result.pollKey).toHaveLength(32);
+    expect(result.requestDevice).toBe('Chrome · macOS');
+    expect(result.verificationCode).toMatch(/^\d{6}$/);
     expect(typeof result.expiresAt).toBe('string');
   });
 
