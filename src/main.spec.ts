@@ -111,7 +111,8 @@ describe('production HTTP CORS integration', () => {
     await app.close();
     if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previousNodeEnv;
-    if (previousAllowedOrigins === undefined) delete process.env.ALLOWED_ORIGINS;
+    if (previousAllowedOrigins === undefined)
+      delete process.env.ALLOWED_ORIGINS;
     else process.env.ALLOWED_ORIGINS = previousAllowedOrigins;
   });
 
