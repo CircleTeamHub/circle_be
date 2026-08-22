@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { RequestMethod } from '@nestjs/common';
+import { INestApplication, RequestMethod } from '@nestjs/common';
 import {
   GUARDS_METADATA,
   HEADERS_METADATA,
@@ -15,6 +15,7 @@ import { RegisterDto } from '../dto/register.dto';
 import { LoginDto } from '../dto/login.dto';
 import { RefreshTokenDto } from '../dto/refresh-token.dto';
 import { SetLoginSecurityCodeDto } from '../dto/login-security-code.dto';
+import request from 'supertest';
 
 describe('AuthController', () => {
   let controller: AuthController;
@@ -361,21 +362,43 @@ describe('AuthController 扫码登录端点的传输面', () => {
 
   it('同 IP 的不同二维码使用独立 session tracker', async () => {
     const first = await getQrLoginStatusTracker(
-      { ip: '203.0.113.10', params: { token: 'token-a' } },
+      {
+        ip: '203.0.113.10',
+        params: { token: 'a'.repeat(32) },
+        body: { pollKey: 'p'.repeat(32) },
+      },
       {} as never,
     );
     const second = await getQrLoginStatusTracker(
-      { ip: '203.0.113.10', params: { token: 'token-b' } },
+      {
+        ip: '203.0.113.10',
+        params: { token: 'b'.repeat(32) },
+        body: { pollKey: 'p'.repeat(32) },
+      },
       {} as never,
     );
     const sameFromAnotherIp = await getQrLoginStatusTracker(
-      { ip: '203.0.113.11', params: { token: 'token-a' } },
+      {
+        ip: '203.0.113.11',
+        params: { token: 'a'.repeat(32) },
+        body: { pollKey: 'p'.repeat(32) },
+      },
+      {} as never,
+    );
+    const differentPollKey = await getQrLoginStatusTracker(
+      {
+        ip: '203.0.113.10',
+        params: { token: 'a'.repeat(32) },
+        body: { pollKey: 'x'.repeat(32) },
+      },
       {} as never,
     );
 
     expect(first).not.toBe(second);
     expect(first).toBe(sameFromAnotherIp);
-    expect(first).not.toContain('token-a');
+    expect(first).not.toBe(differentPollKey);
+    expect(first).not.toContain('a'.repeat(32));
+    expect(first).not.toContain('p'.repeat(32));
   });
 
   it('轮询走 POST + no-store：带令牌的响应不该被任何一层缓存', () => {
@@ -408,5 +431,71 @@ describe('AuthController 扫码登录端点的传输面', () => {
         AuthController.prototype.approveQrLogin,
       ),
     ).toContain(JwtGuard);
+  });
+});
+
+describe('AuthController 扫码登录 session 限流', () => {
+  let app: INestApplication;
+  const qrLoginService = {
+    create: jest.fn(),
+    status: jest.fn().mockResolvedValue({ status: 'PENDING' }),
+    approve: jest.fn(),
+  };
+
+  beforeAll(async () => {
+    const module = await Test.createTestingModule({
+      imports: [
+        ThrottlerModule.forRoot([
+          { name: 'default', ttl: 60_000, limit: 1_000 },
+          { name: 'qrSession', ttl: 60_000, limit: 20 },
+        ]),
+      ],
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthService, useValue: mockAuthServiceForQr },
+        { provide: QrLoginService, useValue: qrLoginService },
+      ],
+    }).compile();
+
+    app = module.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('错误 pollKey 不会耗尽正确凭证的 session bucket', async () => {
+    const token = 'q'.repeat(32);
+    const wrongPollKey = 'w'.repeat(32);
+    const correctPollKey = 'p'.repeat(32);
+    const endpoint = `/auth/qr-login/${token}/status`;
+
+    for (let index = 0; index < 20; index += 1) {
+      await request(app.getHttpServer())
+        .post(endpoint)
+        .send({ pollKey: wrongPollKey })
+        .expect(200);
+    }
+    await request(app.getHttpServer())
+      .post(endpoint)
+      .send({ pollKey: wrongPollKey })
+      .expect(429);
+
+    await request(app.getHttpServer())
+      .post(endpoint)
+      .send({ pollKey: correctPollKey })
+      .expect(200);
+
+    for (let index = 1; index < 20; index += 1) {
+      await request(app.getHttpServer())
+        .post(endpoint)
+        .send({ pollKey: correctPollKey })
+        .expect(200);
+    }
+    await request(app.getHttpServer())
+      .post(endpoint)
+      .send({ pollKey: correctPollKey })
+      .expect(429);
   });
 });

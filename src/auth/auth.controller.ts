@@ -79,8 +79,18 @@ function getSessionContext(req?: Request): SessionContext {
 export const getQrLoginStatusTracker: ThrottlerGetTrackerFunction = (req) => {
   const params = req.params as Record<string, unknown> | undefined;
   const token = params?.token;
-  if (typeof token === 'string' && token.length > 0) {
-    const digest = createHash('sha256').update(token).digest('base64url');
+  const body = req.body as Record<string, unknown> | undefined;
+  const pollKey = body?.pollKey;
+  const credentialPattern = /^[A-Za-z0-9_-]{16,128}$/;
+  if (
+    typeof token === 'string' &&
+    credentialPattern.test(token) &&
+    typeof pollKey === 'string' &&
+    credentialPattern.test(pollKey)
+  ) {
+    const digest = createHash('sha256')
+      .update(`${token}\0${pollKey}`)
+      .digest('base64url');
     return `qr-session:${digest.slice(0, 22)}`;
   }
   return `ip:${String(req.ip ?? 'unknown')}`;
