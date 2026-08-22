@@ -15,7 +15,7 @@
 ## 0. 前置
 
 - Oracle Always Free 实例:Ubuntu 22.04 / ARM64 / 2 OCPU / 12 GB
-- 已把 `API_DOMAIN`、`ADMIN_DOMAIN` 的 DNS A/AAAA 记录指向服务器公网 IP
+- 已把 `API_DOMAIN`、`ADMIN_DOMAIN`、`WEB_DOMAIN` 的 DNS A/AAAA 记录指向服务器公网 IP
 - 已能用 `ssh -i ~/.ssh/circle_oracle ubuntu@<公网IP>` 登录
 
 ## 1. 安装 Docker(服务器上,一次性)
@@ -61,14 +61,15 @@ rsync -az --delete \
 
 ```bash
 cd ~/circle_be
-bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱>
+bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户Web域名>
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
 
-已有部署可再次运行 `gen-env.sh`:脚本只补齐 Redis 配置,不会覆盖数据库、JWT、MinIO 等现有密钥。
+已有部署可再次运行 `gen-env.sh`:脚本会补齐 Redis 配置，并把 Admin/用户 Web
+来源幂等加入 `ALLOWED_ORIGINS`；不会覆盖数据库、JWT、MinIO 等现有密钥。
 使用托管 Redis 时,把 `.env.production` 的 `REDIS_URL` 改成带认证的 `rediss://...`,
 设置 `REDIS_ALLOW_INSECURE=false`,并从 `.env` 的 `COMPOSE_PROFILES` 中移除
 `bundled-redis`;此时 Compose 不会启动内置 Redis。

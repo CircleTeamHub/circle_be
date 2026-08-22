@@ -64,6 +64,7 @@ describe('production Redis deployment configuration', () => {
       'api.example.com',
       'admin.example.com',
       'ops@example.com',
+      'app.example.com',
     ];
     execFileSync(bashExecutable, args, { cwd: workspace });
     const firstComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
@@ -82,6 +83,10 @@ describe('production Redis deployment configuration', () => {
     expect(firstComposeEnv).toContain('API_DOMAIN=api.example.com');
     expect(firstComposeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(firstComposeEnv).toContain('ACME_EMAIL=ops@example.com');
+    expect(firstComposeEnv).toContain('WEB_DOMAIN=app.example.com');
+    expect(firstAppEnv).toContain(
+      'ALLOWED_ORIGINS=https://admin.example.com,https://app.example.com',
+    );
     if (process.platform !== 'win32') {
       expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
       expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
@@ -197,6 +202,7 @@ describe('production Redis deployment configuration', () => {
         'API_DOMAIN=',
         'ADMIN_DOMAIN=',
         'ACME_EMAIL=',
+        'WEB_DOMAIN=',
         'REDIS_PASSWORD=bad#password',
         'COMPOSE_PROFILES=debug-tools',
         '',
@@ -204,7 +210,12 @@ describe('production Redis deployment configuration', () => {
     );
     writeFileSync(
       join(workspace, '.env.production'),
-      'NODE_ENV=production\nREDIS_URL="redis://default:@redis:6379"\n',
+      [
+        'NODE_ENV=production',
+        'REDIS_URL="redis://default:@redis:6379"',
+        'ALLOWED_ORIGINS="https://legacy.example.com"',
+        '',
+      ].join('\n'),
     );
 
     execFileSync(
@@ -215,6 +226,7 @@ describe('production Redis deployment configuration', () => {
         'api.example.com',
         'admin.example.com',
         'ops@example.com',
+        'app.example.com',
       ],
       { cwd: workspace },
     );
@@ -227,6 +239,10 @@ describe('production Redis deployment configuration', () => {
     expect(composeEnv).toContain('API_DOMAIN=api.example.com');
     expect(composeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(composeEnv).toContain('ACME_EMAIL=ops@example.com');
+    expect(composeEnv).toContain('WEB_DOMAIN=app.example.com');
+    expect(appEnv).toContain(
+      'ALLOWED_ORIGINS=https://legacy.example.com,https://admin.example.com,https://app.example.com',
+    );
     expect(appEnv).toContain(
       `REDIS_URL="redis://default:${password}@redis:6379"`,
     );
@@ -240,6 +256,30 @@ describe('production Redis deployment configuration', () => {
       join(workspace, 'deploy', 'gen-env.sh'),
     );
     writeFileSync(join(workspace, '.env.production'), 'NODE_ENV=production\n');
+
+    expect(() =>
+      execFileSync(
+        bashExecutable,
+        [
+          'deploy/gen-env.sh',
+          '203.0.113.10',
+          'api.example.com',
+          'admin.example.com',
+          'ops@example.com',
+          'app.example.com',
+        ],
+        { cwd: workspace, stdio: 'pipe' },
+      ),
+    ).toThrow();
+  });
+
+  it('requires the user web domain so fresh deployments cannot omit CORS', () => {
+    const workspace = createWorkspace('circle-web-origin-required-');
+    mkdirSync(join(workspace, 'deploy'));
+    cpSync(
+      join(repositoryRoot, 'deploy', 'gen-env.sh'),
+      join(workspace, 'deploy', 'gen-env.sh'),
+    );
 
     expect(() =>
       execFileSync(
