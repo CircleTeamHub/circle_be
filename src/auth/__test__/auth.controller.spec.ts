@@ -1,5 +1,13 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { RequestMethod } from '@nestjs/common';
+import {
+  GUARDS_METADATA,
+  HEADERS_METADATA,
+  METHOD_METADATA,
+  PATH_METADATA,
+} from '@nestjs/common/constants';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { JwtGuard } from 'src/guards/jwt.guard';
 import { AuthController } from '../auth.controller';
 import { QrLoginService } from '../qr-login.service';
 import { AuthService } from '../auth.service';
@@ -119,7 +127,11 @@ describe('AuthController', () => {
         { provide: AuthService, useValue: mockAuthService },
         {
           provide: QrLoginService,
-          useValue: { create: jest.fn(), status: jest.fn(), approve: jest.fn() },
+          useValue: {
+            create: jest.fn(),
+            status: jest.fn(),
+            approve: jest.fn(),
+          },
         },
       ],
     }).compile();
@@ -300,5 +312,70 @@ describe('AuthController', () => {
       'uuid-1',
       '1234',
     );
+  });
+});
+
+const mockAuthServiceForQr: Partial<AuthService> = {};
+
+describe('AuthController 扫码登录端点的传输面', () => {
+  const qrLoginService = {
+    create: jest.fn(),
+    status: jest.fn().mockResolvedValue({ status: 'PENDING' }),
+    approve: jest.fn(),
+  };
+  let controller: AuthController;
+
+  beforeEach(async () => {
+    jest.clearAllMocks();
+    const module: TestingModule = await Test.createTestingModule({
+      imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
+      controllers: [AuthController],
+      providers: [
+        { provide: AuthService, useValue: mockAuthServiceForQr },
+        { provide: QrLoginService, useValue: qrLoginService },
+      ],
+    }).compile();
+    controller = module.get<AuthController>(AuthController);
+  });
+
+  it('轮询凭证从 body 读，不经过 query', async () => {
+    await controller.qrLoginStatus('qr-token', { pollKey: 'secret-key' });
+    expect(qrLoginService.status).toHaveBeenCalledWith(
+      'qr-token',
+      'secret-key',
+      {},
+    );
+  });
+
+  it('轮询走 POST + no-store：带令牌的响应不该被任何一层缓存', () => {
+    const handler = AuthController.prototype.qrLoginStatus;
+    expect(Reflect.getMetadata(METHOD_METADATA, handler)).toBe(
+      RequestMethod.POST,
+    );
+    expect(Reflect.getMetadata(PATH_METADATA, handler)).toBe(
+      'qr-login/:token/status',
+    );
+    expect(Reflect.getMetadata(HEADERS_METADATA, handler)).toEqual([
+      { name: 'Cache-Control', value: 'no-store' },
+    ]);
+  });
+
+  it('三个端点各自挂了 ThrottlerGuard（没有全局守卫兜底）', () => {
+    // AppModule 没注册全局 ThrottlerGuard，光有 @Throttle 是不生效的限速牌。
+    for (const handler of [
+      AuthController.prototype.createQrLogin,
+      AuthController.prototype.qrLoginStatus,
+      AuthController.prototype.approveQrLogin,
+    ]) {
+      const guards = Reflect.getMetadata(GUARDS_METADATA, handler) as unknown[];
+      expect(guards).toContain(ThrottlerGuard);
+    }
+    // 确认端点仍然要求登录态。
+    expect(
+      Reflect.getMetadata(
+        GUARDS_METADATA,
+        AuthController.prototype.approveQrLogin,
+      ),
+    ).toContain(JwtGuard);
   });
 });

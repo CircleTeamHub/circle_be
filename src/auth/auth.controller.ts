@@ -3,6 +3,8 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
+  HttpCode,
   Param,
   Post,
   Put,
@@ -36,6 +38,7 @@ import {
   RequestPasswordResetDto,
   ResetPasswordDto,
 } from './dto/password-reset.dto';
+import { QrLoginStatusDto } from './dto/qr-login-status.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -81,26 +84,41 @@ export class AuthController {
   // 固定路径 qr-login 段独立于其余路由；create/status 公开（与 login 同级
   // 的未认证面），approve 走手机端已登录会话。
 
+  // 三个端点都自己挂 ThrottlerGuard：AppModule 没有注册全局 ThrottlerGuard，
+  // 光写 @Throttle 是一张不生效的限速牌 —— 匿名端点会被无限次调用，
+  // 每次 create 都往认证表里插一行。
   @Post('qr-login')
+  @UseGuards(ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Header('Cache-Control', 'no-store')
   @ApiOperation({ summary: '网页端创建扫码登录会话' })
   createQrLogin() {
     return this.qrLoginService.create();
   }
 
-  @Get('qr-login/:token')
+  // POST 而非 GET：这个响应在 APPROVED 那一次会带上 access/refresh 令牌，
+  // 而 GET 是浏览器/反代/CDN 眼里天然可缓存的 —— 缓存一份就等于把「一次性
+  // 交付」变成可重放，哪怕库里的行早已 CONSUMED。no-store 再兜一层。
+  @Post('qr-login/:token/status')
+  @UseGuards(ThrottlerGuard)
+  @HttpCode(200)
   @Throttle({ default: { limit: 120, ttl: 60_000 } })
-  @ApiOperation({ summary: '网页端轮询扫码登录状态（key=pollKey）' })
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({ summary: '网页端轮询扫码登录状态' })
   qrLoginStatus(
     @Param('token') token: string,
-    @Query('key') key: string | undefined,
+    @Body() dto: QrLoginStatusDto,
     @Req() req?: Request,
   ) {
-    return this.qrLoginService.status(token, key ?? '', getSessionContext(req));
+    return this.qrLoginService.status(
+      token,
+      dto.pollKey,
+      getSessionContext(req),
+    );
   }
 
   @Post('qr-login/:token/approve')
-  @UseGuards(JwtGuard)
+  @UseGuards(JwtGuard, ThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({ summary: '手机端确认网页登录' })
   approveQrLogin(@Req() req: RequestWithUser, @Param('token') token: string) {

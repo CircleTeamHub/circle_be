@@ -1,6 +1,7 @@
 import { Global, Logger, Module } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { QrLoginService } from './qr-login.service';
+import { QrLoginCleanup } from './qr-login.cleanup';
 import { AuthController } from './auth.controller';
 import { PassportModule } from '@nestjs/passport';
 import { JwtModule } from '@nestjs/jwt';
@@ -43,6 +44,7 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
   providers: [
     AuthService,
     QrLoginService,
+    QrLoginCleanup,
     RefreshTokenService,
     RefreshTokenCleanup,
     SessionRevocationService,

@@ -1,4 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { QrErrorCode } from 'src/common/app-error-codes';
@@ -19,6 +23,8 @@ import type { SessionContext } from './refresh-token.service';
  * 测试零新增。
  */
 const QR_LOGIN_TTL_MS = 2 * 60_000;
+/** 过期后仍保留行的时长，之后由 cron 删除。 */
+const QR_LOGIN_RETENTION_MS = 60 * 60_000;
 
 export type QrLoginStatusResult =
   | { status: 'PENDING' | 'EXPIRED' }
@@ -107,29 +113,71 @@ export class QrLoginService {
     if (!session || !safeEqual(session.pollKey, pollKey)) {
       return { status: 'EXPIRED' };
     }
+    // 过期先于状态判定。曾经只在 PENDING 分支里查 expiresAt —— 于是「临到期
+    // 前一秒确认」的会话变成永久有效：APPROVED 之后拖几小时甚至几天再来轮询
+    // 照样换得走完整会话，两分钟的有效期形同虚设。
+    if (session.expiresAt.getTime() <= Date.now()) {
+      return { status: 'EXPIRED' };
+    }
     if (session.status === 'PENDING') {
-      if (session.expiresAt.getTime() <= Date.now()) {
-        return { status: 'EXPIRED' };
-      }
       return { status: 'PENDING' };
     }
     if (session.status !== 'APPROVED' || !session.approvedByID) {
       return { status: 'EXPIRED' };
     }
 
-    // 原子抢占消费位：并发双轮询只有一个能换走会话。
+    // 原子抢占消费位：并发双轮询只有一个能换走会话。expiresAt 也进谓词 ——
+    // 上面那次检查到这里之间可能刚好跨过期限（check/update 竞态）。
     const consumed = await this.prisma.qrLoginSession.updateMany({
-      where: { id: session.id, status: 'APPROVED' },
+      where: {
+        id: session.id,
+        status: 'APPROVED',
+        expiresAt: { gt: new Date() },
+      },
       data: { status: 'CONSUMED', consumedAt: new Date() },
     });
     if (consumed.count !== 1) {
       return { status: 'EXPIRED' };
     }
 
-    const tokens = await this.authService.issueQrLoginTokens(
-      session.approvedByID,
-      sessionContext,
-    );
-    return { status: 'APPROVED', tokens };
+    try {
+      const tokens = await this.authService.issueQrLoginTokens(
+        session.approvedByID,
+        sessionContext,
+      );
+      return { status: 'APPROVED', tokens };
+    } catch (error) {
+      // 令牌没发出去就把消费位放回去。不放回的话，一次瞬时故障（DB 抖动、
+      // JWT 签发失败）就把会话钉死在 CONSUMED：网页端后续每次轮询都拿
+      // EXPIRED，用户除了重新扫码别无出路，而故障本身早就过去了。
+      //
+      // 残留风险留档：若失败发生在 finishLogin 建完 refresh session 之后，
+      // 那条会话会成为孤儿（用户在会话管理页多看到一台设备）。它归属同一
+      // 用户、受 RefreshTokenCleanup 管理，比「永久锁死」的代价小得多；
+      // 要彻底消除需要把 issue 纳入同一事务，届时再改。
+      await this.prisma.qrLoginSession
+        .updateMany({
+          where: { id: session.id, status: 'CONSUMED' },
+          data: { status: 'APPROVED', consumedAt: null },
+        })
+        // 回滚失败不能盖掉原始错误 —— 那才是要往上抛的那个。
+        .catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * 清掉过了保留期的会话行。每个匿名 create 都插一行，没有任何删除路径的话
+   * 这张认证表和它的两个唯一索引会随正常流量无限长大（刷一次二维码就是一行）。
+   *
+   * 保留期比 TTL 长一截：刚过期的行还要留着，好让还在轮询的网页端拿到
+   * EXPIRED 而不是「查无此码」—— 两者响应虽同，行还在时少一次索引未命中。
+   */
+  purgeExpired(now: Date = new Date()) {
+    return this.prisma.qrLoginSession.deleteMany({
+      where: {
+        expiresAt: { lt: new Date(now.getTime() - QR_LOGIN_RETENTION_MS) },
+      },
+    });
   }
 }
