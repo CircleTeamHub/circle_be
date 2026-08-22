@@ -15,7 +15,8 @@
 ## 0. 前置
 
 - Oracle Always Free 实例:Ubuntu 22.04 / ARM64 / 2 OCPU / 12 GB
-- 已把 `API_DOMAIN`、`ADMIN_DOMAIN`、`WEB_DOMAIN` 的 DNS A/AAAA 记录指向服务器公网 IP
+- 已把 `API_DOMAIN`、`ADMIN_DOMAIN` 的 DNS A/AAAA 记录指向服务器公网 IP
+- 已确定 `WEB_DOMAIN`（生产用户 Web 的 hostname，可由独立平台托管，不要求指向本服务器）
 - 已能用 `ssh -i ~/.ssh/circle_oracle ubuntu@<公网IP>` 登录
 
 ## 1. 安装 Docker(服务器上,一次性)
@@ -61,7 +62,7 @@ rsync -az --delete \
 
 ```bash
 cd ~/circle_be
-bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户Web域名>
+bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户Web域名hostname>
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 

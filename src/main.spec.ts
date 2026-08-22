@@ -4,6 +4,20 @@ import {
   resolveAppPort,
   resolveCorsOriginChecker,
 } from './main';
+import { Controller, Get, INestApplication, Module } from '@nestjs/common';
+import { NestFactory } from '@nestjs/core';
+import request from 'supertest';
+
+@Controller('cors-probe')
+class CorsProbeController {
+  @Get()
+  probe() {
+    return { ok: true };
+  }
+}
+
+@Module({ controllers: [CorsProbeController] })
+class CorsProbeModule {}
 
 function checkOrigin(
   env: NodeJS.ProcessEnv,
@@ -75,6 +89,50 @@ describe('resolveCorsOriginChecker', () => {
     const prod = jest.fn();
     checker('http://localhost:3000', prod);
     expect(prod.mock.calls[0][0]).toBeInstanceOf(Error);
+  });
+});
+
+describe('production HTTP CORS integration', () => {
+  let app: INestApplication;
+  const previousNodeEnv = process.env.NODE_ENV;
+  const previousAllowedOrigins = process.env.ALLOWED_ORIGINS;
+
+  beforeAll(async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.ALLOWED_ORIGINS = 'https://web.example.test';
+    app = await NestFactory.create(CorsProbeModule, {
+      ...buildNestFactoryOptions(),
+      logger: false,
+    });
+    await app.listen(0, '127.0.0.1');
+  });
+
+  afterAll(async () => {
+    await app.close();
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    if (previousAllowedOrigins === undefined) delete process.env.ALLOWED_ORIGINS;
+    else process.env.ALLOWED_ORIGINS = previousAllowedOrigins;
+  });
+
+  it('emits credentialed preflight headers only for the configured web origin', async () => {
+    const allowed = await request(app.getHttpServer())
+      .options('/cors-probe')
+      .set('Origin', 'https://web.example.test')
+      .set('Access-Control-Request-Method', 'GET');
+
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers['access-control-allow-origin']).toBe(
+      'https://web.example.test',
+    );
+    expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+
+    const blocked = await request(app.getHttpServer())
+      .options('/cors-probe')
+      .set('Origin', 'https://evil.example.test')
+      .set('Access-Control-Request-Method', 'GET');
+
+    expect(blocked.headers['access-control-allow-origin']).toBeUndefined();
   });
 });
 
