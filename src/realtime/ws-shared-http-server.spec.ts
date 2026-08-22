@@ -4,6 +4,8 @@ import { WebSocket } from 'ws';
 import { Server as IoServer } from 'socket.io';
 import { RealtimeGateway } from './realtime.gateway';
 import { CHAT_WS_PATH } from 'src/chat/chat.constants';
+import { buildChatCorsOptions } from 'src/chat/chat.gateway';
+import { resolveCorsOriginChecker } from 'src/main';
 
 /**
  * 两个网关共用一个 HTTP server 的升级路由契约。
@@ -38,7 +40,15 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
 
     // main.ts 的挂载顺序。
     gateway.attach(httpServer);
-    io = new IoServer(httpServer, { path: CHAT_WS_PATH });
+    io = new IoServer(httpServer, {
+      path: CHAT_WS_PATH,
+      ...buildChatCorsOptions(
+        resolveCorsOriginChecker({
+          NODE_ENV: 'production',
+          ALLOWED_ORIGINS: 'https://web.example.test',
+        }),
+      ),
+    });
   });
 
   afterEach(async () => {
@@ -55,11 +65,14 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
   /** 打开一条 ws,返回握手结果(成功 or 失败原因)。 */
   function handshake(
     path: string,
+    origin?: string,
   ): Promise<
     { ok: true; firstMessage: string } | { ok: false; error: string }
   > {
     return new Promise((resolve) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`);
+      const socket = new WebSocket(`ws://127.0.0.1:${port}${path}`, {
+        origin,
+      });
       openSockets.push(socket);
       socket.once('open', () => {
         // engine.io 升级成功后立刻推 OPEN 包(`0{...}`);raw-ws 侧不主动发包,
@@ -82,11 +95,21 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
   it('lets socket.io complete the /chat-ws upgrade', async () => {
     const result = await handshake(
       `${CHAT_WS_PATH}/?EIO=4&transport=websocket`,
+      'https://web.example.test',
     );
 
     expect(result).toMatchObject({ ok: true });
     // 确认真的是 engine.io 接住了,而不是别的东西把连接放行到空处。
     expect(result.ok && result.firstMessage).toMatch(/^0\{/);
+  });
+
+  it('rejects a chat websocket upgrade from an unlisted browser origin', async () => {
+    const result = await handshake(
+      `${CHAT_WS_PATH}/?EIO=4&transport=websocket`,
+      'https://evil.example.test',
+    );
+
+    expect(result).toMatchObject({ ok: false });
   });
 
   it('still serves the raw-ws /realtime upgrade', async () => {

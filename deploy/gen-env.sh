@@ -2,7 +2,7 @@
 # 生成 .env(compose 变量插值用)和 .env.production(应用配置),
 # 随机密钥、两个文件的 DB / Redis 密码和 MinIO 密钥自动保持一致。
 #
-# 用法: bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱>
+# 用法: bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户Web域名>
 set -euo pipefail
 umask 077
 trap 'rm -f .env.tmp .env.production.tmp' EXIT
@@ -11,6 +11,7 @@ PUBLIC_IP="${1:?缺少 SERVER_PUBLIC_IP}"
 API_DOMAIN="${2:?缺少 API_DOMAIN}"
 ADMIN_DOMAIN="${3:?缺少 ADMIN_DOMAIN}"
 ACME_EMAIL="${4:?缺少 ACME_EMAIL}"
+WEB_DOMAIN="${5:?缺少 WEB_DOMAIN}"
 cd "$(dirname "$0")/.."
 
 # 32+ 位随机串,去掉 / + = 以免干扰 dotenv / URL 解析
@@ -45,6 +46,21 @@ ensure_compose_profile() {
   fi
 }
 
+ensure_env_csv_value() {
+  local file="$1" key="$2" value="$3" current
+  current="$(sed -n "s/^${key}=//p" "$file" | tail -n 1)"
+  current="${current#\"}"
+  current="${current%\"}"
+  case ",$current," in
+    *",$value,"*) return ;;
+  esac
+  if [ -n "$current" ]; then
+    set_env_value "$file" "$key" "$current,$value"
+  else
+    set_env_value "$file" "$key" "$value"
+  fi
+}
+
 if [ -f .env.production ]; then
   if [ ! -f .env ]; then
     echo "❌ .env.production 已存在但 .env 缺失;拒绝生成不完整的 Compose 配置。" >&2
@@ -59,6 +75,9 @@ if [ -f .env.production ]; then
   grep -Eq '^API_DOMAIN=.+' .env || set_env_value .env API_DOMAIN "$API_DOMAIN"
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
+  grep -Eq '^WEB_DOMAIN=.+' .env || set_env_value .env WEB_DOMAIN "$WEB_DOMAIN"
+  ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$ADMIN_DOMAIN"
+  ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$WEB_DOMAIN"
   if grep -q '^REDIS_PASSWORD=' .env; then
     REDIS_PASSWORD="$(sed -n 's/^REDIS_PASSWORD=//p' .env | tail -n 1)"
   fi
@@ -104,6 +123,7 @@ COMPOSE_PROFILES=bundled-redis
 API_DOMAIN=$API_DOMAIN
 ADMIN_DOMAIN=$ADMIN_DOMAIN
 ACME_EMAIL=$ACME_EMAIL
+WEB_DOMAIN=$WEB_DOMAIN
 EOF
 
 cat > .env.production <<EOF
@@ -116,8 +136,8 @@ SECRET="$SECRET"
 JWT_EXPIRES_IN=1h
 REFRESH_EXPIRES_IN=30d
 TEMP_CHAT_LINK_SECRET="$TEMP_CHAT_LINK_SECRET"
-# Web 管理端来源;原生 App 无 Origin 头,不受此项影响。
-ALLOWED_ORIGINS=https://$ADMIN_DOMAIN
+# Admin Web 与用户 Web 来源;原生 App 无 Origin 头,不受此项影响。
+ALLOWED_ORIGINS=https://$ADMIN_DOMAIN,https://$WEB_DOMAIN
 APP_PORT=3000
 LOG_ON=true
 LOG_LEVEL=info
@@ -137,5 +157,5 @@ EOF
 
 chmod 600 .env .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
-echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN"
+echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"
 echo "   LiveKit(阶段6)配置稍后再追加到 .env.production"

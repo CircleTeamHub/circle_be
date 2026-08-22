@@ -359,6 +359,7 @@ model User {
   updatedAt                    DateTime   @updatedAt
 
   refreshTokens                     RefreshToken[]
+  qrLoginApprovals                  QrLoginSession[]  @relation("qrLoginApprover")
   invitedBy                         User?                       @relation("UserInvitations", fields: [invitedByUserId], references: [id], onDelete: SetNull)
   invitees                          User[]                      @relation("UserInvitations")
   referralsSent                     Referral[]                  @relation("ReferralInviter")
@@ -2072,4 +2073,28 @@ model QrToken {
   createdAt DateTime    @default(now())
 
   @@index([type, targetID, issuerID, createdAt])
+}
+
+/// 网页扫码登录会话：网页匿名创建（qrToken 进二维码、pollKey 只留在网页端），
+/// 手机端扫码确认后置 APPROVED，网页轮询用 qrToken+pollKey 一次性换正式会话
+/// （CONSUMED 后不可复用）。双令牌：旁观者拍到二维码只有 qrToken，无法轮询换token。
+model QrLoginSession {
+  id           String        @id @default(uuid())
+  qrToken      String        @unique
+  pollKey      String        @unique
+  requestDevice String       @default("Unknown browser · Unknown OS")
+  status       QrLoginStatus @default(PENDING)
+  approvedByID String?
+  approvedBy   User?         @relation("qrLoginApprover", fields: [approvedByID], references: [id], onDelete: Cascade)
+  createdAt    DateTime      @default(now())
+  expiresAt    DateTime
+  consumedAt   DateTime?
+
+  @@index([expiresAt])
+}
+
+enum QrLoginStatus {
+  PENDING
+  APPROVED
+  CONSUMED
 }

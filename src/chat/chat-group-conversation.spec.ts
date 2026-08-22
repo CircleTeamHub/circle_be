@@ -33,6 +33,7 @@ describe('ChatService standalone group conversations', () => {
     circleMember: { findUnique: jest.fn() },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),

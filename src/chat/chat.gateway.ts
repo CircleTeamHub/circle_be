@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import type { Server as HttpServer } from 'http';
+import type { IncomingMessage, Server as HttpServer } from 'http';
 import { Server, type Socket } from 'socket.io';
 import type { JwtPayload } from 'src/auth/types';
 import { SessionRevocationService } from 'src/auth/session-revocation.service';
@@ -54,6 +54,24 @@ type CorsOrigin = (
   origin: string | undefined,
   callback: (err: Error | null, allow?: boolean) => void,
 ) => void;
+
+export function buildChatCorsOptions(corsOrigin: CorsOrigin) {
+  return {
+    cors: { origin: corsOrigin, credentials: true },
+    // Socket.IO 的 `cors` 只保护 HTTP long-polling；浏览器 WebSocket upgrade
+    // 不受浏览器 CORS 机制约束，必须用 allowRequest 复用同一来源白名单。
+    allowRequest: (
+      request: IncomingMessage,
+      callback: (error: string | null | undefined, success: boolean) => void,
+    ) => {
+      const header = request.headers.origin;
+      const origin = Array.isArray(header) ? header[0] : header;
+      corsOrigin(origin, (error, allow) => {
+        callback(null, error === null && allow === true);
+      });
+    },
+  };
+}
 
 type AckFn<T> = (response: T) => void;
 
@@ -167,7 +185,7 @@ export class ChatGateway implements OnModuleDestroy {
   attach(httpServer: HttpServer, options: { corsOrigin: CorsOrigin }): void {
     const io = new Server(httpServer, {
       path: CHAT_WS_PATH,
-      cors: { origin: options.corsOrigin, credentials: true },
+      ...buildChatCorsOptions(options.corsOrigin),
       // 单条 socket 报文上限,与 content 8KB 上限同数量级留余量。
       maxHttpBufferSize: 64 * 1024,
     });

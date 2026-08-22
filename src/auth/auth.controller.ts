@@ -3,6 +3,8 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
+  HttpCode,
   Param,
   Post,
   Put,
@@ -10,8 +12,13 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Request } from 'express';
+import { createHash } from 'crypto';
 import * as requestIp from 'request-ip';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import {
+  Throttle,
+  ThrottlerGuard,
+  type ThrottlerGetTrackerFunction,
+} from '@nestjs/throttler';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -25,6 +32,7 @@ import {
 } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { AuthService } from './auth.service';
+import { QrLoginService } from './qr-login.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
 import { LoginDto } from './dto/login.dto';
@@ -34,6 +42,7 @@ import {
   RequestPasswordResetDto,
   ResetPasswordDto,
 } from './dto/password-reset.dto';
+import { QrLoginStatusDto } from './dto/qr-login-status.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
@@ -67,10 +76,88 @@ function getSessionContext(req?: Request): SessionContext {
   };
 }
 
+export const getQrLoginStatusTracker: ThrottlerGetTrackerFunction = (req) => {
+  const params = req.params as Record<string, unknown> | undefined;
+  const token = params?.token;
+  const body = req.body as Record<string, unknown> | undefined;
+  const pollKey = body?.pollKey;
+  const credentialPattern = /^[A-Za-z0-9_-]{16,128}$/;
+  if (
+    typeof token === 'string' &&
+    credentialPattern.test(token) &&
+    typeof pollKey === 'string' &&
+    credentialPattern.test(pollKey)
+  ) {
+    const digest = createHash('sha256')
+      .update(`${token}\0${pollKey}`)
+      .digest('base64url');
+    return `qr-session:${digest.slice(0, 22)}`;
+  }
+  return `ip:${String(req.ip ?? 'unknown')}`;
+};
+
 @Controller('auth')
 @ApiTags('Auth')
 export class AuthController {
-  constructor(private authService: AuthService) {}
+  constructor(
+    private authService: AuthService,
+    private qrLoginService: QrLoginService,
+  ) {}
+
+  // ---- 网页扫码登录（桌面网页版）----
+  // 固定路径 qr-login 段独立于其余路由；create/status 公开（与 login 同级
+  // 的未认证面），approve 走手机端已登录会话。
+
+  // 三个端点都自己挂 ThrottlerGuard：AppModule 没有注册全局 ThrottlerGuard，
+  // 光写 @Throttle 是一张不生效的限速牌 —— 匿名端点会被无限次调用，
+  // 每次 create 都往认证表里插一行。
+  @Post('qr-login')
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({ summary: '网页端创建扫码登录会话' })
+  createQrLogin(@Req() req?: Request) {
+    return this.qrLoginService.create(getSessionContext(req));
+  }
+
+  // POST 而非 GET：这个响应在 APPROVED 那一次会带上 access/refresh 令牌，
+  // 而 GET 是浏览器/反代/CDN 眼里天然可缓存的 —— 缓存一份就等于把「一次性
+  // 交付」变成可重放，哪怕库里的行早已 CONSUMED。no-store 再兜一层。
+  @Post('qr-login/:token/status')
+  @UseGuards(ThrottlerGuard)
+  @HttpCode(200)
+  @Throttle({
+    // Keep the existing aggregate IP ceiling and add a stricter independent
+    // session bucket. The client polls slowly enough for several NAT peers to
+    // share the IP allowance without one hot session consuming it all.
+    default: { limit: 120, ttl: 60_000 },
+    qrSession: {
+      limit: 20,
+      ttl: 60_000,
+      getTracker: getQrLoginStatusTracker,
+    },
+  })
+  @Header('Cache-Control', 'no-store')
+  @ApiOperation({ summary: '网页端轮询扫码登录状态' })
+  qrLoginStatus(
+    @Param('token') token: string,
+    @Body() dto: QrLoginStatusDto,
+    @Req() req?: Request,
+  ) {
+    return this.qrLoginService.status(
+      token,
+      dto.pollKey,
+      getSessionContext(req),
+    );
+  }
+
+  @Post('qr-login/:token/approve')
+  @UseGuards(JwtGuard, ThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: '手机端确认网页登录' })
+  approveQrLogin(@Req() req: RequestWithUser, @Param('token') token: string) {
+    return this.qrLoginService.approve(req.user.userId, token);
+  }
 
   @Post('register')
   @ApiOperation({ summary: 'Register a new user' })

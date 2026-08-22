@@ -9,6 +9,7 @@ describe('CollectionService', () => {
   const prisma = {
     $transaction: jest.fn(async (fn: any) => fn(prisma)),
     $queryRaw: jest.fn().mockResolvedValue([]),
+    $executeRaw: jest.fn().mockResolvedValue(0),
     userCollection: {
       findMany: jest.fn(),
       create: jest.fn(),
