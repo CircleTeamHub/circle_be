@@ -96,6 +96,11 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/admin/users/:id/audit-logs',
   '/api/v1/admin/users/:id/sensitive-access',
   '/api/v1/admin/users/:id/status',
+  // 扫码登录的 token 段是 32 字符 base64url,既不是 UUID 也不是纯数字,
+  // 兜底规则收不掉它 —— 不登记的话每次轮询都产出一个新的 route 标签,
+  // 指标基数无上限增长（轮询是 1.5 秒一次）。
+  '/api/v1/auth/qr-login/:token/approve',
+  '/api/v1/auth/qr-login/:token/status',
   '/api/v1/auth/sessions/:sessionId',
   '/api/v1/calls/:callId/accept',
   '/api/v1/calls/:callId/cancel',

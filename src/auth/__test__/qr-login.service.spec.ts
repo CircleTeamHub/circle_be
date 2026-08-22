@@ -72,9 +72,16 @@ describe('QrLoginService', () => {
     ).resolves.toEqual({ ok: true });
     expect(authService.assertQrLoginEligible).toHaveBeenCalledWith('user-1');
     expect(prisma.qrLoginSession.updateMany).toHaveBeenCalledWith({
-      where: { id: 'sid', status: 'PENDING' },
+      where: expect.objectContaining({ id: 'sid', status: 'PENDING' }),
       data: { status: 'APPROVED', approvedByID: 'user-1' },
     });
+    // 确认谓词也必须自带 expiresAt:查过之后还隔着一次 assertQrLoginEligible
+    // 查库,掐着点确认会写出「已 APPROVED 但已过期」的行,轮询侧照样拒 ——
+    // 用户看到的是「手机说确认成功、网页一直不动」。
+    const approveCall = (
+      prisma.qrLoginSession.updateMany as jest.Mock
+    ).mock.calls.find(([arg]) => arg.data.status === 'APPROVED');
+    expect(approveCall?.[0].where.expiresAt).toEqual({ gt: expect.any(Date) });
   });
 
   it('approve：不存在 / 非 PENDING → NotFound', async () => {

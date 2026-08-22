@@ -85,8 +85,16 @@ export class QrLoginService {
     // 不把不可登录的账号写成 approver。
     await this.authService.assertQrLoginEligible(userId);
 
+    // expiresAt 也进谓词,理由与 status() 里那次消费相同:上面查过之后到这里
+    // 之间隔着一次 assertQrLoginEligible 查库,足够跨过期限。不带这一条的话,
+    // 掐着点确认会写出一个「已 APPROVED 但已过期」的行 —— 轮询侧照样拒,
+    // 用户看到的是「手机说确认成功、网页一直不动」,最难排查的那种。
     const claimed = await this.prisma.qrLoginSession.updateMany({
-      where: { id: session.id, status: 'PENDING' },
+      where: {
+        id: session.id,
+        status: 'PENDING',
+        expiresAt: { gt: new Date() },
+      },
       data: { status: 'APPROVED', approvedByID: userId },
     });
     if (claimed.count !== 1) {
