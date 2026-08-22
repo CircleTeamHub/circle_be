@@ -5,6 +5,14 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
 
+/**
+ * 「VIP 仍在有效期内」。必须相对当前时间算 —— 这里原本写死
+ * 2026-08-21（写这些用例时的"两周后"），到了那天之后这 7 条用例
+ * 会集体翻红：等级掉回 0，配额从 200/300/1000 变成 100。而且红的不是
+ * 被改动的那次 PR，是之后所有 PR，很难第一时间联想到日期。
+ */
+const ACTIVE_VIP_EXPIRES_AT = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
 describe('CircleAdmissionPolicy', () => {
   let programEnabled = true;
   const membershipProgram = {
@@ -91,9 +99,9 @@ describe('CircleAdmissionPolicy', () => {
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
+    [1, ACTIVE_VIP_EXPIRES_AT, 200],
+    [2, ACTIVE_VIP_EXPIRES_AT, 300],
+    [3, ACTIVE_VIP_EXPIRES_AT, 1000],
     [4, null, 2000],
   ])(
     'allows effective level %i at limit - 1 and exposes its joined-circle limit',
@@ -124,9 +132,9 @@ describe('CircleAdmissionPolicy', () => {
 
   it.each([
     [0, null, 100],
-    [1, new Date('2026-08-21T00:00:00.000Z'), 200],
-    [2, new Date('2026-08-21T00:00:00.000Z'), 300],
-    [3, new Date('2026-08-21T00:00:00.000Z'), 1000],
+    [1, ACTIVE_VIP_EXPIRES_AT, 200],
+    [2, ACTIVE_VIP_EXPIRES_AT, 300],
+    [3, ACTIVE_VIP_EXPIRES_AT, 1000],
     [4, null, 2000],
   ])(
     'denies effective level %i at its joined-circle limit',
@@ -275,7 +283,7 @@ describe('CircleAdmissionPolicy', () => {
 
   it('rejects a new application at the effective membership limit', async () => {
     prisma.user.findUnique.mockResolvedValue(
-      user({ vipLevel: 2, vipExpiresAt: new Date('2026-08-21T00:00:00.000Z') }),
+      user({ vipLevel: 2, vipExpiresAt: ACTIVE_VIP_EXPIRES_AT }),
     );
     prisma.circleMember.count.mockResolvedValue(300);
 
