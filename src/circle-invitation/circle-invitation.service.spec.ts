@@ -61,9 +61,8 @@ describe('CircleInvitationService', () => {
     block: {
       findFirst: jest.fn(),
     },
-    $executeRaw: jest.fn(),
-    $queryRaw: jest.fn(),
     $executeRaw: jest.fn().mockResolvedValue(0),
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -1337,17 +1336,17 @@ describe('CircleInvitationService', () => {
 
       await service.respond('verifier-9', 'inv-1', true);
 
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         1,
         expect.anything(),
         'call-user:applicant-1',
       );
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         2,
         expect.anything(),
         'call-user:verifier-9',
       );
-      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[0],
       );
     });
@@ -1913,20 +1912,20 @@ describe('CircleInvitationService', () => {
 
       await service.invite('inviter-1', 'applicant-1', 'circle-1');
 
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         1,
         expect.anything(),
         'call-user:applicant-1',
       );
-      expect(prisma.$queryRaw).toHaveBeenNthCalledWith(
+      expect(prisma.$executeRaw).toHaveBeenNthCalledWith(
         2,
         expect.anything(),
         'call-user:inviter-1',
       );
-      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
         prisma.block.findFirst.mock.invocationCallOrder[0],
       );
-      expect(prisma.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
         prisma.friend.findFirst.mock.invocationCallOrder[1],
       );
     });
