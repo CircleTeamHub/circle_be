@@ -40,14 +40,15 @@ COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
 # from this exact image, and deploys must not download tooling from npm at
 # runtime. Installing at build time also fetches the schema engine through the
 # package's postinstall, so migrations on the server stay npm-offline.
+# npm 12.0.2 still bundles tar 7.5.19. Install the fixed tar as a global
+# sibling, then remove npm's vulnerable nested copy; Node's module resolution
+# falls back to the fixed sibling while npm/npx remain available to migrations.
 RUN npm prune --omit=dev \
     && npm install --no-save --omit=dev \
         "prisma@$(node -p "require('./package-lock.json').packages['node_modules/prisma'].version")" \
-    # 基础镜像自带的 npm CLI 捆绑着带 CVE 的 tar/brace-expansion（Trivy 扫
-    # /usr/local/lib/node_modules/npm）。镜像里 npm/npx 必须保留（release
-    # overlay 用本镜像跑 `npx prisma migrate deploy`），所以就地升级 npm 到
-    # 固定到已验证版本，让捆绑依赖吃到修复版且保持构建可复现。
-    && npm install -g npm@12.0.2 --no-audit --no-fund
+    && npm install -g npm@12.0.2 --no-audit --no-fund \
+    && npm install -g tar@7.5.21 --no-audit --no-fund \
+    && rm -rf "$(npm root -g)/npm/node_modules/tar"
 
 USER app
 

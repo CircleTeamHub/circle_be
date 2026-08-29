@@ -13,6 +13,18 @@ describe('production image npm toolchain', () => {
 
     expect(buildStage).toContain('npm install -g npm@12.0.2');
     expect(productionStage).toContain('npm install -g npm@12.0.2');
+
+    const npmInstall = productionStage.indexOf('npm install -g npm@12.0.2');
+    const patchedTarInstall = productionStage.indexOf(
+      'npm install -g tar@7.5.21',
+    );
+    const bundledTarRemoval = productionStage.indexOf(
+      'rm -rf "$(npm root -g)/npm/node_modules/tar"',
+    );
+
+    expect(patchedTarInstall).toBeGreaterThan(npmInstall);
+    expect(bundledTarRemoval).toBeGreaterThan(patchedTarInstall);
+
     expect(dockerfile).not.toContain('npm@latest');
   });
 });
