@@ -19,6 +19,7 @@ describe('production image npm toolchain', () => {
     expect(productionStage).toContain(
       'apt-get install -y --no-install-recommends openssl',
     );
+    expect(productionStage).toContain('install -d -o app -g app /app/logs');
     expect(productionStage).toContain('rm -rf /usr/local/lib/node_modules/npm');
     expect(productionStage).not.toContain('npm install -g npm@12.0.2');
     expect(compose).toContain(

@@ -31,7 +31,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as non-root.
-RUN groupadd --system app && useradd --system --gid app --shell /usr/sbin/nologin app
+RUN groupadd --system app \
+    && useradd --system --gid app --shell /usr/sbin/nologin app \
+    && install -d -o app -g app /app/logs
 
 COPY --from=build-stage --chown=app:app /app/package.json /app/package-lock.json ./
 COPY --from=build-stage --chown=app:app /app/node_modules ./node_modules
