@@ -7,7 +7,11 @@
 # 固定模块版本，避免每次重建都拉到不同的上游提交。升级时同步改这里的 tag。
 FROM caddy:2-builder-alpine AS builder
 RUN xcaddy build \
-    --with github.com/mholt/caddy-ratelimit@v0.1.0
+    --with github.com/mholt/caddy-ratelimit@v0.1.0 \
+    --with golang.org/x/net@v0.56.0 \
+    --with golang.org/x/text@v0.39.0 \
+    --with google.golang.org/grpc@v1.82.1
 
 FROM caddy:2-alpine
+RUN apk upgrade --no-cache
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
