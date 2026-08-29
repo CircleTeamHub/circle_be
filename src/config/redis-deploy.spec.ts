@@ -182,6 +182,10 @@ describe('production Redis deployment configuration', () => {
       'utf8',
     );
     expect(caddyDockerfile).toContain('caddy-ratelimit');
+    expect(caddyDockerfile).toContain('golang.org/x/net@v0.56.0');
+    expect(caddyDockerfile).toContain('golang.org/x/text@v0.39.0');
+    expect(caddyDockerfile).toContain('google.golang.org/grpc@v1.82.1');
+    expect(caddyDockerfile).toContain('RUN apk upgrade --no-cache');
     expect(compose).toContain('dockerfile: Dockerfile.caddy');
     expect(compose).not.toMatch(/^\s+image: caddy:2-alpine\s*$/m);
   });
