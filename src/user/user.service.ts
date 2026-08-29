@@ -13,7 +13,10 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeUserIdAlias } from './user-id-alias';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
-import { assertUrlsFromStorage } from 'src/utils/storage-url';
+import {
+  assertUrlsFromStorage,
+  storagePublicObjectBaseFromConfig,
+} from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
@@ -195,7 +198,7 @@ function normalizeUpdateInput(input: UpdateUserInput) {
 @Injectable()
 export class UserService {
   private readonly logger = new Logger(UserService.name);
-  private readonly minioPublicUrl: string | null;
+  private readonly storagePublicObjectBase: string | null;
 
   constructor(
     private prisma: PrismaService,
@@ -209,7 +212,9 @@ export class UserService {
     private privacySettings: PrivacySettingsService,
     private avatarFrames: AvatarFrameService,
   ) {
-    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
   }
 
   /**
@@ -299,7 +304,7 @@ export class UserService {
   private assertUrlsAreSafe(input: UpdateUserInput): void {
     assertUrlsFromStorage(
       URL_FIELDS.map((field) => input[field] as string | undefined),
-      this.minioPublicUrl,
+      this.storagePublicObjectBase,
       'profile image url',
     );
   }

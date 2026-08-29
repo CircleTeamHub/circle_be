@@ -321,10 +321,23 @@ export class StorageAuditService {
     return keys;
   }
 
-  /** 从完整 URL 还原对象 key：https://host/<bucket>/<key> → <key>。 */
+  /**
+   * 从完整 URL 还原对象 key，兼容当前配置、历史域名、path-style 与
+   * virtual-hosted-style。
+   */
   private toObjectKey(value: string): string | null {
+    const canonical = this.upload.objectKeyFromPublicUrl(value);
+    if (canonical) return canonical;
+
     try {
       const path = new URL(value).pathname.replace(/^\/+/, '');
+      if (
+        StorageAuditService.AUDITED_PREFIXES.some((prefix) =>
+          path.startsWith(prefix),
+        )
+      ) {
+        return path;
+      }
       const slash = path.indexOf('/');
       return slash === -1 ? null : path.slice(slash + 1);
     } catch {

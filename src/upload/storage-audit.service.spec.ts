@@ -32,10 +32,12 @@ describe('StorageAuditService', () => {
     const listObjects = jest.fn(async (prefix: string) => ({
       objects: options.objects?.[prefix] ?? [],
     }));
+    const objectKeyFromPublicUrl = jest.fn(() => null);
     const service = new StorageAuditService(
       prisma as never,
       {
         listObjects,
+        objectKeyFromPublicUrl,
       } as never,
     );
     return { service, listObjects, prisma };
@@ -136,6 +138,26 @@ describe('StorageAuditService', () => {
         user: [
           {
             avatarUrl: 'http://192.168.1.65:9000/circle/avatars/a.jpg',
+            avatarFrame: null,
+            cover: null,
+          },
+        ],
+      },
+    });
+
+    expect((await service.audit(now))?.orphanCount).toBe(0);
+  });
+
+  it('keeps the first path segment for virtual-hosted COS URLs', async () => {
+    const { service } = harness({
+      objects: {
+        'avatars/': [{ key: 'avatars/u1/a.jpg', size: 1, lastModified: old }],
+      },
+      referenced: {
+        user: [
+          {
+            avatarUrl:
+              'https://windnote-123.cos.ap-tokyo.myqcloud.com/avatars/u1/a.jpg',
             avatarFrame: null,
             cover: null,
           },
