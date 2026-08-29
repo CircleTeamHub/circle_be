@@ -303,6 +303,104 @@ describe('UploadService', () => {
     });
   });
 
+  it('uses virtual-hosted COS addressing and the configured region', async () => {
+    const signedUrlMock = jest.mocked(getSignedUrl);
+    signedUrlMock.mockResolvedValueOnce(
+      'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/avatars/test.jpeg?signature=123',
+    );
+    const config = {
+      MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+      MINIO_ACCESS_KEY: 'cos-secret-id',
+      MINIO_SECRET_KEY: 'cos-secret-key',
+      MINIO_BUCKET: 'windnote-1234567890',
+      MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+      OBJECT_STORAGE_REGION: 'ap-tokyo',
+      OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    };
+    const service = new UploadService({
+      get: (key: string) => (config as Record<string, string>)[key] ?? null,
+    } as any);
+    (service as any).ready = true;
+
+    const result = await service.presign(
+      'avatar.jpeg',
+      'image/jpeg',
+      1024,
+      'avatars',
+    );
+    const signingClient = signedUrlMock.mock.lastCall?.[0] as {
+      config: {
+        region: () => Promise<string>;
+        forcePathStyle: boolean;
+      };
+    };
+
+    await expect(signingClient.config.region()).resolves.toBe('ap-tokyo');
+    expect(signingClient.config.forcePathStyle).toBe(false);
+    expect(result.fileUrl).toBe(
+      `https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/${result.key}`,
+    );
+    expect(service.objectKeyFromPublicUrl(result.fileUrl)).toBe(result.key);
+  });
+
+  it('checks but does not mutate an externally managed COS bucket', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+
+    await service.onModuleInit();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
+    expect(service.objectStoreStatus()).toBe('ok');
+  });
+
+  it('does not create an externally managed COS bucket when it is missing', async () => {
+    const missingBucket = Object.assign(new Error('missing'), {
+      name: 'NotFound',
+      $metadata: { httpStatusCode: 404 },
+    });
+    const send = jest.fn().mockRejectedValueOnce(missingBucket);
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+    (service as any).logger = {
+      error: jest.fn(),
+      log: jest.fn(),
+      warn: jest.fn(),
+    };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
+  });
+
   // 访客那份 filename 正则为了放行 Unicode 名称,只禁路径分隔符与控制字符 ——
   // `?`/`#`/空格照样能进来。扩展名会裸拼进 object key 与 fileUrl,不在这里收口
   // 就会造出解析错位的 URL。

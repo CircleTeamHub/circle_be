@@ -166,6 +166,34 @@ function isMissingBucketError(error: unknown) {
   );
 }
 
+function readBooleanConfig(
+  config: ConfigService,
+  key: string,
+  fallback: boolean,
+): boolean {
+  const value = config.get<boolean | string>(key);
+  if (value === undefined || value === null || value === '') return fallback;
+  return typeof value === 'boolean' ? value : value.toLowerCase() === 'true';
+}
+
+function buildPublicObjectBase(
+  publicUrl: string,
+  bucket: string,
+  forcePathStyle: boolean,
+): string {
+  let end = publicUrl.length;
+  while (end > 0 && publicUrl[end - 1] === '/') end -= 1;
+  const normalized = publicUrl.slice(0, end);
+  if (forcePathStyle) return `${normalized}/${bucket}`;
+
+  const url = new URL(normalized);
+  if (!url.hostname.startsWith(`${bucket}.`)) {
+    url.hostname = `${bucket}.${url.hostname}`;
+  }
+  const serialized = url.toString();
+  return serialized.endsWith('/') ? serialized.slice(0, -1) : serialized;
+}
+
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
@@ -174,6 +202,8 @@ export class UploadService implements OnModuleInit {
   private readonly publicClient: S3Client;
   private readonly bucket: string;
   private readonly publicUrl: string;
+  private readonly publicObjectBase: string;
+  private readonly manageBucket: boolean;
   private readonly enabled: boolean;
   private readonly production: boolean;
   private ready = false;
@@ -189,6 +219,23 @@ export class UploadService implements OnModuleInit {
     const secretKey = this.config.get<string>('MINIO_SECRET_KEY') ?? '';
     this.bucket = this.config.get<string>('MINIO_BUCKET') ?? 'circle';
     this.publicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? endpoint;
+    const region =
+      this.config.get<string>('OBJECT_STORAGE_REGION') ?? 'us-east-1';
+    const forcePathStyle = readBooleanConfig(
+      this.config,
+      'OBJECT_STORAGE_FORCE_PATH_STYLE',
+      true,
+    );
+    this.manageBucket = readBooleanConfig(
+      this.config,
+      'OBJECT_STORAGE_MANAGE_BUCKET',
+      true,
+    );
+    this.publicObjectBase = buildPublicObjectBase(
+      this.publicUrl,
+      this.bucket,
+      forcePathStyle,
+    );
     this.production =
       (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
       'production';
@@ -197,17 +244,17 @@ export class UploadService implements OnModuleInit {
 
     this.client = new S3Client({
       endpoint,
-      region: 'us-east-1', // MinIO 需要填但值随意
+      region,
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: true, // MinIO 必须开启
+      forcePathStyle,
       requestChecksumCalculation: 'WHEN_REQUIRED',
     });
 
     this.publicClient = new S3Client({
       endpoint: this.publicUrl,
-      region: 'us-east-1',
+      region,
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
-      forcePathStyle: true,
+      forcePathStyle,
       requestChecksumCalculation: 'WHEN_REQUIRED',
     });
   }
@@ -354,7 +401,7 @@ export class UploadService implements OnModuleInit {
     }
 
     // 把 uploadUrl 里的内网地址替换为公开访问地址
-    const fileUrl = `${this.publicUrl}/${this.bucket}/${key}`;
+    const fileUrl = `${this.publicObjectBase}/${key}`;
 
     return {
       uploadUrl,
@@ -467,7 +514,7 @@ export class UploadService implements OnModuleInit {
 
     const ttl = input.expiresInSeconds ?? null;
     return {
-      url: `${this.publicUrl}/${this.bucket}/${input.key}`,
+      url: `${this.publicObjectBase}/${input.key}`,
       key: input.key,
       size: input.body.byteLength,
       expiresAt: ttl ? new Date(Date.now() + ttl * 1000) : null,
@@ -549,13 +596,13 @@ export class UploadService implements OnModuleInit {
   }
 
   /**
-   * 从本站直链反推 object key（fileUrl = `${publicUrl}/${bucket}/${key}` 的逆）。
+   * 从本站直链反推 object key（兼容 path-style 与 virtual-hosted-style）的逆。
    * presign-on-read 用它处理只有 url、没有独立 objectKey 的字段（如 NoteMedia.posterUrl）。
    * off-origin / 空 → null（不把外链误当本站 key）；读取路径回给的签名 url 里的 query 会被 strip。
    */
   objectKeyFromPublicUrl(url: string | null | undefined): string | null {
     if (!url) return null;
-    const base = `${this.publicUrl.replace(/\/$/, '')}/${this.bucket}/`;
+    const base = `${this.publicObjectBase}/`;
     if (!url.startsWith(base)) return null;
     return url.slice(base.length).split('?')[0];
   }
@@ -607,6 +654,7 @@ export class UploadService implements OnModuleInit {
       if (!isMissingBucketError(error)) {
         throw error;
       }
+      if (!this.manageBucket) throw error;
       this.logger.log(`Bucket "${this.bucket}" not found, creating...`);
       await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
       this.logger.log(`Bucket "${this.bucket}" created.`);
@@ -631,8 +679,14 @@ export class UploadService implements OnModuleInit {
       'ensure_bucket_exists';
     try {
       await this.ensureBucketExists();
-      step = 'put_bucket_policy';
-      await this.ensureBucketIsPublicReadable();
+      if (this.manageBucket) {
+        step = 'put_bucket_policy';
+        await this.ensureBucketIsPublicReadable();
+      } else {
+        // 外部对象存储（如腾讯 COS）的桶与匿名公开前缀由云控制台/CAM 管理。
+        // HeadBucket 成功证明凭据可访问目标桶；启动时不改 ACL/策略。
+        this.mediaPolicyApplied = true;
+      }
       return true;
     } catch (error) {
       // error（不是 warn）并且点名后果：这条失败意味着桶策略没换上，notes/* 可能

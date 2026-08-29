@@ -64,6 +64,7 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    profiles: ['bundled-storage']
     restart: unless-stopped
     logging: *default-logging
     mem_limit: 1g
@@ -87,6 +88,7 @@ services:
   # 一次性:确保 bucket 存在；最小公开读策略由应用启动时安装。
   minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    profiles: ['bundled-storage']
     logging: *default-logging
     depends_on:
       minio: { condition: service_healthy }
@@ -164,7 +166,9 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy, required: false }
       migrate: { condition: service_completed_successfully }
-      minio-init: { condition: service_completed_successfully }
+      # 腾讯 COS 等外部 S3 存储不启用 bundled-storage profile；本地 MinIO
+      # 启用时仍等待建桶/生命周期规则完成。
+      minio-init: { condition: service_completed_successfully, required: false }
     environment:
       NODE_ENV: production
     volumes:
