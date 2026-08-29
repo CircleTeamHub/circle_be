@@ -16,6 +16,9 @@ describe('production image npm toolchain', () => {
     );
 
     expect(buildStage).toContain('npm install -g npm@12.0.2');
+    expect(productionStage).toContain(
+      'apt-get install -y --no-install-recommends openssl',
+    );
     expect(productionStage).toContain('rm -rf /usr/local/lib/node_modules/npm');
     expect(productionStage).not.toContain('npm install -g npm@12.0.2');
     expect(compose).toContain(
