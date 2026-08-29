@@ -150,7 +150,7 @@ services:
     environment:
       # prisma CLI 从环境变量读 DATABASE_URL(schema.prisma datasource url=env(...))
       DATABASE_URL: 'postgresql://circle:${DB_PASSWORD:?set}@postgres:5432/circle?schema=public'
-    command: npx prisma migrate deploy
+    command: ./node_modules/.bin/prisma migrate deploy
     restart: 'no'
 
   circle_be:

@@ -14,8 +14,8 @@
 services:
   migrate:
     # 与应用同一个运行时镜像:Dockerfile.prod 在生产阶段保留了 lockfile 钉版的
-    # Prisma CLI,正是为了让 migrate(命令沿用基础文件的 npx prisma migrate
-    # deploy)在部署时零 npm 下载。DATABASE_URL 沿用基础文件的定义。
+    # Prisma CLI,正是为了让 migrate 直接运行本地 Prisma 二进制，在部署时
+    # 零 npm 下载。DATABASE_URL 沿用基础文件的定义。
     image: ${CIRCLE_BE_IMAGE:?export CIRCLE_BE_IMAGE, e.g. via deploy/release-deploy.sh}
     environment:
       # 生产镜像以系统用户 app 运行,home 目录不存在;把 HOME 指到可写位置,
