@@ -8,9 +8,9 @@
 FROM caddy:2-builder-alpine AS builder
 RUN xcaddy build \
     --with github.com/mholt/caddy-ratelimit@v0.1.0 \
-    --with golang.org/x/net@v0.56.0 \
-    --with golang.org/x/text@v0.39.0 \
-    --with google.golang.org/grpc@v1.82.1
+    --replace golang.org/x/net=golang.org/x/net@v0.56.0 \
+    --replace golang.org/x/text=golang.org/x/text@v0.39.0 \
+    --replace google.golang.org/grpc=google.golang.org/grpc@v1.82.1
 
 FROM caddy:2-alpine
 RUN apk upgrade --no-cache
