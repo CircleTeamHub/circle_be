@@ -1,2 +1,3 @@
 monitoring/sync-metrics-token.sh text eol=lf
 test/sync-metrics-token.spec.sh text eol=lf
+deploy/caddy-entrypoint.sh text eol=lf
