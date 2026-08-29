@@ -100,6 +100,9 @@ if [ -f .env.production ]; then
   if ! grep -Eq '^MINIO_PUBLIC_URL=https://' .env.production; then
     set_env_value .env.production MINIO_PUBLIC_URL "https://$API_DOMAIN"
   fi
+  if grep -Eq '^MINIO_ENDPOINT=http://minio:9000/?$' .env.production; then
+    ensure_compose_profile bundled-storage
+  fi
   chmod 600 .env .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
   exit 0
@@ -119,7 +122,7 @@ DB_PASSWORD=$DB_PASSWORD
 MINIO_ROOT_USER=$MINIO_ROOT_USER
 MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD
 REDIS_PASSWORD=$REDIS_PASSWORD
-COMPOSE_PROFILES=bundled-redis
+COMPOSE_PROFILES=bundled-redis,bundled-storage
 API_DOMAIN=$API_DOMAIN
 ADMIN_DOMAIN=$ADMIN_DOMAIN
 ACME_EMAIL=$ACME_EMAIL
@@ -153,6 +156,9 @@ MINIO_ACCESS_KEY=$MINIO_ROOT_USER
 MINIO_SECRET_KEY=$MINIO_ROOT_PASSWORD
 MINIO_BUCKET=circle
 MINIO_PUBLIC_URL=https://$API_DOMAIN
+OBJECT_STORAGE_REGION=us-east-1
+OBJECT_STORAGE_FORCE_PATH_STYLE=true
+OBJECT_STORAGE_MANAGE_BUCKET=true
 EOF
 
 chmod 600 .env .env.production

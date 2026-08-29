@@ -11,7 +11,10 @@ import { TraceErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { assertUrlsFromStorage } from 'src/utils/storage-url';
+import {
+  assertUrlsFromStorage,
+  storagePublicObjectBaseFromConfig,
+} from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
   decodeFeedCursor,
@@ -64,7 +67,7 @@ const MOMENTS_POKE_MAX_PAGES = 20;
 @Injectable()
 export class TraceService {
   private readonly logger = new Logger(TraceService.name);
-  private readonly minioPublicUrl: string | null;
+  private readonly storagePublicObjectBase: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -74,7 +77,9 @@ export class TraceService {
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
   ) {
-    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
   }
 
   // ─── Feed ──────────────────────────────────────────────────────────────────
@@ -333,7 +338,11 @@ export class TraceService {
   // ─── Create / Delete ───────────────────────────────────────────────────────
 
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
-    assertUrlsFromStorage(dto.images ?? [], this.minioPublicUrl, 'trace image');
+    assertUrlsFromStorage(
+      dto.images ?? [],
+      this.storagePublicObjectBase,
+      'trace image',
+    );
 
     // Resolve this fallible projection before the non-idempotent write. If the
     // lookup fails, the client can safely retry without creating a duplicate.
@@ -670,7 +679,11 @@ export class TraceService {
         errorCode: TraceErrorCode.EmptyComment,
       });
     }
-    assertUrlsFromStorage(images, this.minioPublicUrl, 'comment image');
+    assertUrlsFromStorage(
+      images,
+      this.storagePublicObjectBase,
+      'comment image',
+    );
 
     const trace = await this.requireVisibleTrace(traceId, userId);
 

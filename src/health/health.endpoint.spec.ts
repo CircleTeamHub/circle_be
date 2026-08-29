@@ -31,7 +31,7 @@ function buildRedis(enabled: boolean, reachable = true): HealthRedis {
 }
 
 function buildObjectStore(
-  status: 'ok' | 'policy-unconfirmed' | 'disabled',
+  status: 'ok' | 'policy-unconfirmed' | 'external-unverified' | 'disabled',
 ): HealthObjectStore {
   return { objectStoreStatus: jest.fn(() => status) };
 }
@@ -180,6 +180,23 @@ describe('createReadinessHandler object store reporting', () => {
     })({} as never, res as never);
 
     expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('reports externally managed policy as unverified without claiming ok', async () => {
+    errorSpy.mockClear();
+    const res = buildResponse();
+
+    await createReadinessHandler({
+      database: buildDatabase(Promise.resolve([])),
+      redis: buildRedis(false),
+      objectStore: buildObjectStore('external-unverified'),
+    })({} as never, res as never);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ objectStore: 'external-unverified' }),
+    );
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('reports disabled when no object store is wired', async () => {
