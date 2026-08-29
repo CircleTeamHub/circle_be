@@ -450,6 +450,12 @@ test('every main push creates the exact-SHA CI run required by release', () => {
   assert.match(pullRequest, /paths-ignore:/);
 });
 
+test('the mounted Caddy entrypoint is always checked out with Linux line endings', () => {
+  const attributes = read('.gitattributes');
+
+  assert.match(attributes, /^deploy\/caddy-entrypoint\.sh text eol=lf$/m);
+});
+
 test('release selection and active-color state fail closed', () => {
   const release = read('.github/workflows/release.yml');
   const deploy = read('deploy/release-deploy.sh');
