@@ -16,15 +16,21 @@ import {
   CreateBucketCommand,
   CopyObjectCommand,
   DeleteObjectCommand,
+  GetBucketLifecycleConfigurationCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
   ListObjectsV2Command,
+  type BucketLocationConstraint,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
+import {
+  buildStoragePublicObjectBase,
+  type ObjectStoreStatus,
+} from 'src/utils/storage-url';
 
 export interface PresignResult {
   uploadUrl: string;
@@ -176,24 +182,6 @@ function readBooleanConfig(
   return typeof value === 'boolean' ? value : value.toLowerCase() === 'true';
 }
 
-function buildPublicObjectBase(
-  publicUrl: string,
-  bucket: string,
-  forcePathStyle: boolean,
-): string {
-  let end = publicUrl.length;
-  while (end > 0 && publicUrl[end - 1] === '/') end -= 1;
-  const normalized = publicUrl.slice(0, end);
-  if (forcePathStyle) return `${normalized}/${bucket}`;
-
-  const url = new URL(normalized);
-  if (!url.hostname.startsWith(`${bucket}.`)) {
-    url.hostname = `${bucket}.${url.hostname}`;
-  }
-  const serialized = url.toString();
-  return serialized.endsWith('/') ? serialized.slice(0, -1) : serialized;
-}
-
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
@@ -203,6 +191,7 @@ export class UploadService implements OnModuleInit {
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly publicObjectBase: string;
+  private readonly region: string;
   private readonly manageBucket: boolean;
   private readonly enabled: boolean;
   private readonly production: boolean;
@@ -219,7 +208,7 @@ export class UploadService implements OnModuleInit {
     const secretKey = this.config.get<string>('MINIO_SECRET_KEY') ?? '';
     this.bucket = this.config.get<string>('MINIO_BUCKET') ?? 'circle';
     this.publicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? endpoint;
-    const region =
+    this.region =
       this.config.get<string>('OBJECT_STORAGE_REGION') ?? 'us-east-1';
     const forcePathStyle = readBooleanConfig(
       this.config,
@@ -231,7 +220,7 @@ export class UploadService implements OnModuleInit {
       'OBJECT_STORAGE_MANAGE_BUCKET',
       true,
     );
-    this.publicObjectBase = buildPublicObjectBase(
+    this.publicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
       forcePathStyle,
@@ -244,7 +233,7 @@ export class UploadService implements OnModuleInit {
 
     this.client = new S3Client({
       endpoint,
-      region,
+      region: this.region,
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle,
       requestChecksumCalculation: 'WHEN_REQUIRED',
@@ -252,7 +241,7 @@ export class UploadService implements OnModuleInit {
 
     this.publicClient = new S3Client({
       endpoint: this.publicUrl,
-      region,
+      region: this.region,
       credentials: { accessKeyId: accessKey, secretAccessKey: secretKey },
       forcePathStyle,
       requestChecksumCalculation: 'WHEN_REQUIRED',
@@ -656,7 +645,18 @@ export class UploadService implements OnModuleInit {
       }
       if (!this.manageBucket) throw error;
       this.logger.log(`Bucket "${this.bucket}" not found, creating...`);
-      await this.client.send(new CreateBucketCommand({ Bucket: this.bucket }));
+      await this.client.send(
+        new CreateBucketCommand({
+          Bucket: this.bucket,
+          ...(this.region === 'us-east-1'
+            ? {}
+            : {
+                CreateBucketConfiguration: {
+                  LocationConstraint: this.region as BucketLocationConstraint,
+                },
+              }),
+        }),
+      );
       this.logger.log(`Bucket "${this.bucket}" created.`);
     }
   }
@@ -675,8 +675,10 @@ export class UploadService implements OnModuleInit {
   }
 
   private async bootstrap(): Promise<boolean> {
-    let step: 'ensure_bucket_exists' | 'put_bucket_policy' =
-      'ensure_bucket_exists';
+    let step:
+      | 'ensure_bucket_exists'
+      | 'put_bucket_policy'
+      | 'verify_export_lifecycle' = 'ensure_bucket_exists';
     try {
       await this.ensureBucketExists();
       if (this.manageBucket) {
@@ -684,8 +686,13 @@ export class UploadService implements OnModuleInit {
         await this.ensureBucketIsPublicReadable();
       } else {
         // 外部对象存储（如腾讯 COS）的桶与匿名公开前缀由云控制台/CAM 管理。
-        // HeadBucket 成功证明凭据可访问目标桶；启动时不改 ACL/策略。
-        this.mediaPolicyApplied = true;
+        // HeadBucket 成功只证明凭据可访问目标桶，不能证明私有前缀策略正确；
+        // 启动时不改 ACL/策略，因此 objectStoreStatus 保持 external-unverified。
+        step = 'verify_export_lifecycle';
+        await this.ensureExternalExportLifecycle();
+        this.logger.warn(
+          'Application cannot verify externally managed bucket policy; audit notes/ and chat/ anonymous access in the provider console.',
+        );
       }
       return true;
     } catch (error) {
@@ -711,6 +718,52 @@ export class UploadService implements OnModuleInit {
     this.mediaPolicyApplied = true;
   }
 
+  private async ensureExternalExportLifecycle(): Promise<void> {
+    const response = await this.client.send(
+      new GetBucketLifecycleConfigurationCommand({ Bucket: this.bucket }),
+    );
+    const hasExpiry = (response.Rules ?? []).some((rule) => {
+      const filter = rule.Filter as
+        | {
+            Prefix?: string;
+            Tag?: unknown;
+            ObjectSizeGreaterThan?: number;
+            ObjectSizeLessThan?: number;
+            And?: {
+              Prefix?: string;
+              Tags?: unknown[];
+              ObjectSizeGreaterThan?: number;
+              ObjectSizeLessThan?: number;
+            };
+          }
+        | undefined;
+      const legacyPrefix = (rule as { Prefix?: string }).Prefix;
+      const prefix = filter?.Prefix ?? filter?.And?.Prefix ?? legacyPrefix;
+      const hasAdditionalPredicates = Boolean(
+        filter?.Tag ||
+        typeof filter?.ObjectSizeGreaterThan === 'number' ||
+        typeof filter?.ObjectSizeLessThan === 'number' ||
+        (filter?.And?.Tags?.length ?? 0) > 0 ||
+        typeof filter?.And?.ObjectSizeGreaterThan === 'number' ||
+        typeof filter?.And?.ObjectSizeLessThan === 'number',
+      );
+      const days = rule.Expiration?.Days;
+      return (
+        rule.Status === 'Enabled' &&
+        prefix === 'note-exports/' &&
+        !hasAdditionalPredicates &&
+        typeof days === 'number' &&
+        days > 0 &&
+        days <= 1
+      );
+    });
+    if (!hasExpiry) {
+      throw new Error(
+        'External object storage must expire note-exports/ objects within 1 day',
+      );
+    }
+  }
+
   /**
    * 桶策略是否确认应用成功 —— 供 readiness 探针观测。
    *
@@ -722,8 +775,9 @@ export class UploadService implements OnModuleInit {
    * 刻意不用它去 gate 预签名：签名是本地 SigV4 计算，不需要 MinIO 在线；拿它挡读
    * 只会把「MinIO 短暂不可达」放大成「所有笔记媒体读取全挂」。
    */
-  objectStoreStatus(): 'ok' | 'policy-unconfirmed' | 'disabled' {
+  objectStoreStatus(): ObjectStoreStatus {
     if (!this.enabled) return 'disabled';
+    if (!this.manageBucket) return 'external-unverified';
     return this.mediaPolicyApplied ? 'ok' : 'policy-unconfirmed';
   }
 }

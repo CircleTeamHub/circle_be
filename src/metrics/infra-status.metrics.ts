@@ -1,4 +1,5 @@
 import { Gauge, Registry } from 'prom-client';
+import type { ObjectStoreStatus } from 'src/utils/storage-url';
 
 /**
  * 基建状态 gauge（#87 / #102-confirm 的告警面）。
@@ -14,7 +15,7 @@ import { Gauge, Registry } from 'prom-client';
  */
 export interface InfraStatusDeps {
   /** UploadService.objectStoreStatus；对象存储未启用时传 null。 */
-  objectStoreStatus?: (() => 'ok' | 'policy-unconfirmed' | 'disabled') | null;
+  objectStoreStatus?: (() => ObjectStoreStatus) | null;
   /** RedisService.ping；Redis 未配置时传 null（不注册该指标，避免误报）。 */
   redisPing?: (() => Promise<boolean>) | null;
 }
@@ -30,10 +31,16 @@ export function createInfraStatusMetrics(deps: InfraStatusDeps): {
       name: 'circle_object_store_policy_unconfirmed',
       help:
         '1 when the private-media bucket policy could not be confirmed applied ' +
-        '(notes/* may be anonymously readable), else 0.',
+        '(notes/* may be anonymously readable), or when an external policy ' +
+        'cannot be verified, else 0.',
       registers: [registry],
       collect() {
-        this.set(objectStoreStatus() === 'policy-unconfirmed' ? 1 : 0);
+        const status = objectStoreStatus();
+        this.set(
+          status === 'policy-unconfirmed' || status === 'external-unverified'
+            ? 1
+            : 0,
+        );
       },
     });
   }

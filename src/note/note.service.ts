@@ -21,7 +21,10 @@ import {
   CHAT_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_SEGMENT,
 } from 'src/chat/chat.constants';
-import { assertUrlsFromStorage } from 'src/utils/storage-url';
+import {
+  assertUrlsFromStorage,
+  storagePublicObjectBaseFromConfig,
+} from 'src/utils/storage-url';
 import {
   prismaErrorCode,
   runSerializableTransaction,
@@ -363,7 +366,7 @@ function escapeXml(value: string) {
 @Injectable()
 export class NoteService {
   private readonly logger = new Logger(NoteService.name);
-  private readonly minioPublicUrl: string | null;
+  private readonly storagePublicObjectBase: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -371,7 +374,9 @@ export class NoteService {
     private readonly membershipPolicy: MembershipPolicyService,
     @Optional() private readonly uploadService?: UploadService,
   ) {
-    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
   }
 
   /**
@@ -863,7 +868,7 @@ export class NoteService {
     for (const item of media) {
       urls.push(item.url, item.posterUrl);
     }
-    assertUrlsFromStorage(urls, this.minioPublicUrl, 'media url');
+    assertUrlsFromStorage(urls, this.storagePublicObjectBase, 'media url');
   }
 
   private buildMediaStats(media: CreateNoteDto['media']) {

@@ -1,4 +1,52 @@
 import { BadRequestException } from '@nestjs/common';
+import type { ConfigService } from '@nestjs/config';
+
+export type ObjectStoreStatus =
+  | 'ok'
+  | 'policy-unconfirmed'
+  | 'external-unverified'
+  | 'disabled';
+
+function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value[end - 1] === '/') end -= 1;
+  return value.slice(0, end);
+}
+
+export function buildStoragePublicObjectBase(
+  publicUrl: string,
+  bucket: string,
+  forcePathStyle: boolean,
+): string {
+  const normalized = stripTrailingSlashes(publicUrl);
+  if (forcePathStyle) return `${normalized}/${bucket}`;
+
+  const url = new URL(normalized);
+  if (!url.hostname.startsWith(`${bucket}.`)) {
+    url.hostname = `${bucket}.${url.hostname}`;
+  }
+  return stripTrailingSlashes(url.toString());
+}
+
+export function storagePublicObjectBaseFromConfig(
+  config: Pick<ConfigService, 'get'>,
+): string | null {
+  const publicUrl =
+    config.get<string>('MINIO_PUBLIC_URL') ??
+    config.get<string>('MINIO_ENDPOINT');
+  if (!publicUrl) return null;
+  const bucket = config.get<string>('MINIO_BUCKET') ?? 'circle';
+  const configuredPathStyle = config.get<boolean | string>(
+    'OBJECT_STORAGE_FORCE_PATH_STYLE',
+  );
+  let forcePathStyle = true;
+  if (typeof configuredPathStyle === 'boolean') {
+    forcePathStyle = configuredPathStyle;
+  } else if (typeof configuredPathStyle === 'string') {
+    forcePathStyle = configuredPathStyle.toLowerCase() === 'true';
+  }
+  return buildStoragePublicObjectBase(publicUrl, bucket, forcePathStyle);
+}
 
 /**
  * True if `url` is served from `publicUrl`'s origin.
