@@ -84,13 +84,17 @@ describe('production Redis deployment configuration', () => {
     expect(firstComposeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(firstComposeEnv).toContain('ACME_EMAIL=ops@example.com');
     expect(firstComposeEnv).toContain('WEB_DOMAIN=app.example.com');
+    expect(firstComposeEnv).toContain(`APP_ENV_GID=${process.getgid?.()}`);
     expect(firstAppEnv).toContain(
       'ALLOWED_ORIGINS=https://admin.example.com,https://app.example.com',
     );
     if (process.platform !== 'win32') {
       expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
       expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
-        0o600,
+        0o640,
+      );
+      expect(statSync(join(workspace, '.env.production')).gid).toBe(
+        process.getgid(),
       );
     }
 
@@ -102,6 +106,7 @@ describe('production Redis deployment configuration', () => {
     );
 
     expect(upgradedComposeEnv.match(/^REDIS_PASSWORD=/gm)).toHaveLength(1);
+    expect(upgradedComposeEnv.match(/^APP_ENV_GID=/gm)).toHaveLength(1);
     expect(upgradedAppEnv.match(/^REDIS_URL=/gm)).toHaveLength(1);
     expect(upgradedAppEnv.match(/^REDIS_ALLOW_INSECURE=/gm)).toHaveLength(1);
     expect(upgradedAppEnv).toContain(`SECRET=${originalSecret}`);
