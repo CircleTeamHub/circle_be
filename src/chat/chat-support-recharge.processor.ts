@@ -255,11 +255,12 @@ export class ChatSupportRechargeProcessor {
     }
 
     const kind = classifyRechargeRequest(text);
-    if (!kind) {
+    if (!kind || kind === 'GENERAL') {
       const welcomedRecently =
         state.lastWelcomeAt !== null &&
         Date.now() - state.lastWelcomeAt.getTime() < WELCOME_COOLDOWN_MS;
-      if (welcomedRecently) return;
+      // “充值/付款/收款码”是明确请求菜单，不受欢迎语冷却限制；普通闲聊才限频。
+      if (!kind && welcomedRecently) return;
       await this.sendWelcome(message, agentUserID);
       await this.prisma.supportRechargeConversationState.update({
         where: { conversationID: message.conversationID },

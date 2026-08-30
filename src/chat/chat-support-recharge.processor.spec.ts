@@ -105,6 +105,21 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
     );
   });
 
+  it('shows the menu instead of creating an order for a general recharge request', async () => {
+    const { processor, prisma, messages } = textMessageHarness('充值');
+
+    await processor.processMessage('message-text');
+
+    expect(messages.insertServerMessage).toHaveBeenCalledWith(
+      'conversation-1',
+      expect.objectContaining({
+        clientMessageId: 'sr-welcome-message-text',
+      }),
+    );
+    expect(prisma.supportRechargePaymentCode.findMany).not.toHaveBeenCalled();
+    expect(prisma.supportRechargeOrder.create).not.toHaveBeenCalled();
+  });
+
   it('keeps the conversation unread when option 3 requests a human', async () => {
     const { processor, prisma, messages, broadcast } = textMessageHarness('3');
 
