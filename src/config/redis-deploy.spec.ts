@@ -148,6 +148,77 @@ describe('production Redis deployment configuration', () => {
     );
   });
 
+  it('clears inherited default ACLs before writing fresh secrets', () => {
+    if (process.platform !== 'linux') return;
+    for (const command of ['setfacl', 'getfacl']) {
+      if (spawnSync(command, ['--version'], { stdio: 'ignore' }).status !== 0)
+        return;
+    }
+    if (
+      spawnSync('getent', ['passwd', 'nobody'], { stdio: 'ignore' }).status !==
+      0
+    )
+      return;
+
+    const workspace = createWorkspace('circle-default-acl-env-');
+    mkdirSync(join(workspace, 'deploy'));
+    cpSync(
+      join(repositoryRoot, 'deploy', 'gen-env.sh'),
+      join(workspace, 'deploy', 'gen-env.sh'),
+    );
+    execFileSync('setfacl', [
+      '-m',
+      'u:nobody:r-x,d:u:nobody:r-x',
+      workspace,
+    ]);
+
+    const bin = join(workspace, 'bin');
+    mkdirSync(bin);
+    const catProbe = join(bin, 'cat');
+    writeFileSync(
+      catProbe,
+      `#!/usr/bin/env bash
+set -euo pipefail
+for file in .env.tmp .env.production.tmp; do
+  if [ -e "$file" ] && getfacl -cp "$file" | grep -q '^user:nobody:'; then
+    echo "named ACL was still active before secrets were written to $file" >&2
+    exit 91
+  fi
+done
+exec "$REAL_CAT" "$@"
+`,
+      { mode: 0o755 },
+    );
+    const realCat = execFileSync('/bin/sh', ['-c', 'command -v cat'])
+      .toString()
+      .trim();
+    execFileSync(
+      bashExecutable,
+      [
+        'deploy/gen-env.sh',
+        '203.0.113.10',
+        'api.example.com',
+        'admin.example.com',
+        'ops@example.com',
+        'app.example.com',
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          REAL_CAT: realCat,
+        },
+      },
+    );
+
+    const acl = execFileSync('getfacl', [
+      '-cp',
+      join(workspace, '.env.production'),
+    ]).toString();
+    expect(acl).not.toMatch(/^user:nobody:/m);
+  });
+
   it('bounds Redis memory and lets application config choose the endpoint', () => {
     const compose = readFileSync(
       join(repositoryRoot, 'docker-compose.prod.yml'),

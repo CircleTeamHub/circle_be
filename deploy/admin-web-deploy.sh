@@ -39,6 +39,14 @@ if ! flock -n 200; then
   exit 1
 fi
 
+# docker-compose.prod.yml is shared with the backend and requires APP_ENV_GID.
+# Old hosts predate that key, so backfill and validate it before the first
+# Compose parse (including the read-only `compose ps` below).
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
+resolved_app_env_gid=""
+. deploy/app-env-preflight.sh
+prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"
+
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.admin-release.yml "$@"
 }

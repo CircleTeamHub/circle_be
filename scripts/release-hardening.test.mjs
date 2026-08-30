@@ -75,6 +75,7 @@ test('non-root app can read the group-protected production env file', () => {
   const compose = read('docker-compose.prod.yml');
   const generator = read('deploy/gen-env.sh');
   const release = read('deploy/release-deploy.sh');
+  const preflight = read('deploy/app-env-preflight.sh');
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
   assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
@@ -83,11 +84,14 @@ test('non-root app can read the group-protected production env file', () => {
   assert.match(generator, /setfacl -b "\$file"/);
   assert.match(
     generator,
-    /chmod 600 \.env\s+chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production\s+clear_file_acl \.env\.production\s+chmod 640 \.env\.production/,
+    /prepare_empty_secret_file \.env\.production\.tmp[\s\S]*chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production\.tmp[\s\S]*chmod 640 \.env\.production\.tmp[\s\S]*mv \.env\.production\.tmp \.env\.production/,
   );
-  assert.match(release, /prepare_app_env_access\s*\(\)/);
-  assert.match(release, /expected_gid="\$\(id -g "\$deploy_user"\)"/);
-  assert.match(release, /validate_private_app_env_gid "\$deploy_user" "\$configured_gid"/);
+  assert.match(release, /prepare_compose_app_env_gid "\$COMPOSE_ENV_FILE"/);
+  assert.match(preflight, /expected_gid="\$\(id -g "\$deploy_user"\)"/);
+  assert.match(
+    preflight,
+    /validate_private_app_env_gid "\$deploy_user" "\$configured_gid"/,
+  );
   assert.match(release, /chgrp "\$resolved_app_env_gid" "\$APP_ENV_FILE"/);
   assert.match(release, /clear_app_env_acl "\$APP_ENV_FILE"/);
   assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
@@ -520,8 +524,11 @@ test('server crosses an explicit no-rollback boundary after irreversible migrati
   assert.match(deploy, /schema compatibility.*below server minimum/);
 });
 
-test('admin deploy validates digests, uses strict smoke checks, and rolls back', () => {
+test('admin deploy validates digests, backfills legacy env, uses strict smoke checks, and rolls back', (t) => {
   const deploy = read('deploy/admin-web-deploy.sh');
+  const preflightPath = fileURLToPath(
+    new URL('../deploy/app-env-preflight.sh', import.meta.url),
+  );
 
   assert.match(deploy, /ADMIN_WEB_IMAGE.*sha256:\[0-9a-f\]\{64\}/);
   assert.match(deploy, /previous_image=.*\.Config\.Image/);
@@ -535,6 +542,35 @@ test('admin deploy validates digests, uses strict smoke checks, and rolls back',
   assert.doesNotMatch(deploy, /api:404|index:401|index:403/);
   assert.match(deploy, /if ! wait_running/);
   assert.match(deploy, /rollback_admin/);
+  const preflight = deploy.indexOf(
+    'prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"',
+  );
+  const firstCompose = deploy.indexOf('previous_container_id="$(compose ps');
+  assert.ok(preflight >= 0 && preflight < firstCompose);
+
+  if (process.platform !== 'win32') {
+    const directory = mkdtempSync(join(tmpdir(), 'circle-admin-preflight-'));
+    t.after(() => rmSync(directory, { recursive: true, force: true }));
+    const composeEnv = join(directory, '.env');
+    writeFileSync(composeEnv, 'DB_PASSWORD=test-only\n', { mode: 0o600 });
+    const result = spawnSync(
+      '/bin/bash',
+      [
+        '-c',
+        '. "$PREFLIGHT"; resolved_app_env_gid=""; prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PREFLIGHT: preflightPath,
+          COMPOSE_ENV_FILE: composeEnv,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(readFileSync(composeEnv, 'utf8'), /^APP_ENV_GID=\d+$/m);
+  }
 });
 
 test('backend CI blocks release contract regressions', () => {

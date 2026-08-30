@@ -77,6 +77,16 @@ clear_file_acl() {
   esac
 }
 
+# Default directory ACLs override umask. Create each secrets temp file empty,
+# remove inherited ACL entries, and only then write any credential bytes.
+prepare_empty_secret_file() {
+  local file="$1"
+  rm -f "$file"
+  (umask 077 && : > "$file")
+  clear_file_acl "$file"
+  chmod 600 "$file"
+}
+
 existing_app_env_gid=""
 if [ -f .env ]; then
   existing_app_env_gid="$(sed -n 's/^APP_ENV_GID=//p' .env | tail -n 1)"
@@ -96,6 +106,7 @@ gen() { openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48; }
 set_env_value() {
   local file="$1" key="$2" value="$3"
   local tmp="${file}.tmp"
+  prepare_empty_secret_file "$tmp"
   awk -v key="$key" -v value="$value" '
     BEGIN { prefix = key "="; replaced = 0 }
     index($0, prefix) == 1 {
@@ -106,6 +117,10 @@ set_env_value() {
     { print }
     END { if (!replaced) print prefix value }
   ' "$file" > "$tmp"
+  if [ "$file" = ".env.production" ]; then
+    chgrp "$DEPLOY_APP_ENV_GID" "$tmp"
+    chmod 640 "$tmp"
+  fi
   mv "$tmp" "$file"
 }
 
@@ -148,6 +163,11 @@ if [ -f .env.production ]; then
       exit 1
     fi
   done
+  clear_file_acl .env
+  chmod 600 .env
+  clear_file_acl .env.production
+  chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  chmod 640 .env.production
   grep -Eq '^API_DOMAIN=.+' .env || set_env_value .env API_DOMAIN "$API_DOMAIN"
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
@@ -196,7 +216,10 @@ SECRET="$(gen)"
 TEMP_CHAT_LINK_SECRET="$(gen)"
 METRICS_AUTH_TOKEN="$(openssl rand -hex 24)"
 
-cat > .env <<EOF
+prepare_empty_secret_file .env.tmp
+prepare_empty_secret_file .env.production.tmp
+
+cat > .env.tmp <<EOF
 # docker-compose 变量插值用 —— 勿提交
 DB_PASSWORD=$DB_PASSWORD
 MINIO_ROOT_USER=$MINIO_ROOT_USER
@@ -210,7 +233,7 @@ WEB_DOMAIN=$WEB_DOMAIN
 APP_ENV_GID=$DEPLOY_APP_ENV_GID
 EOF
 
-cat > .env.production <<EOF
+cat > .env.production.tmp <<EOF
 NODE_ENV=production
 DATABASE_URL="postgresql://circle:$DB_PASSWORD@postgres:5432/circle?schema=public"
 REDIS_URL="redis://default:$REDIS_PASSWORD@redis:6379"
@@ -242,10 +265,11 @@ OBJECT_STORAGE_FORCE_PATH_STYLE=true
 OBJECT_STORAGE_MANAGE_BUCKET=true
 EOF
 
-chmod 600 .env
-chgrp "$DEPLOY_APP_ENV_GID" .env.production
-clear_file_acl .env.production
-chmod 640 .env.production
+chmod 600 .env.tmp
+chgrp "$DEPLOY_APP_ENV_GID" .env.production.tmp
+chmod 640 .env.production.tmp
+mv .env.tmp .env
+mv .env.production.tmp .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"
 echo "   LiveKit(阶段6)配置稍后再追加到 .env.production"

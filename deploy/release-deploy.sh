@@ -107,38 +107,10 @@ COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
 APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 resolved_app_env_gid=""
 legacy_app_env_backup=""
-
-validate_private_app_env_gid() {
-  local deploy_user="$1" gid="$2" group_record members other_primary_users
-  [[ "$gid" =~ ^[0-9]+$ ]] || {
-    echo "APP_ENV_GID must be a numeric gid" >&2
-    return 1
-  }
-  case " $(id -G "$deploy_user") " in
-    *" $gid "*) ;;
-    *) echo "APP_ENV_GID=$gid does not belong to deploy user $deploy_user" >&2; return 1 ;;
-  esac
-  if [ "$(uname -s)" = "Linux" ]; then
-    command -v getent >/dev/null || {
-      echo "getent is required to verify APP_ENV_GID privacy" >&2
-      return 1
-    }
-    group_record="$(getent group "$gid")" || {
-      echo "APP_ENV_GID=$gid does not exist in the group database" >&2
-      return 1
-    }
-    members="${group_record##*:}"
-    case "$members" in
-      ""|"$deploy_user") ;;
-      *) echo "APP_ENV_GID=$gid has other explicit members; refusing to share production secrets" >&2; return 1 ;;
-    esac
-    other_primary_users="$(getent passwd | awk -F: -v gid="$gid" -v user="$deploy_user" '$4 == gid && $1 != user { print $1 }')"
-    [ -z "$other_primary_users" ] || {
-      echo "APP_ENV_GID=$gid is another account's primary group; refusing to share production secrets" >&2
-      return 1
-    }
-  fi
-}
+app_env_staged_file=""
+app_env_transaction_committed=0
+release_docker_config=""
+. deploy/app-env-preflight.sh
 
 clear_app_env_acl() {
   local file="$1" mode setfacl_command="${SETFACL_COMMAND:-setfacl}"
@@ -172,45 +144,29 @@ can_rewrite_app_env_acl_safely() {
 # 这里只校验组，不提前修改 .env.production：旧容器可能创建于 group_add 加入之前，
 # 停机迁移失败后 compose start 仍会启动那个旧容器；若此时文件已变成 0640 + 新组，
 # 它会因无补充组而读不到配置，形成“回滚成功但服务仍起不来”。
-prepare_app_env_access() {
-  local deploy_user expected_gid configured_gid
-  [ -f "$COMPOSE_ENV_FILE" ] || {
-    echo "Compose env file is missing: $COMPOSE_ENV_FILE" >&2
-    return 1
-  }
-  deploy_user="$(id -un)"
-  expected_gid="$(id -g "$deploy_user")"
-  configured_gid="$(awk -F= '$1 == "APP_ENV_GID" { value = $2 } END { print value }' "$COMPOSE_ENV_FILE")"
-  if [ -z "$configured_gid" ]; then
-    configured_gid="$expected_gid"
-    printf '\nAPP_ENV_GID=%s\n' "$configured_gid" >> "$COMPOSE_ENV_FILE"
-    chmod 600 "$COMPOSE_ENV_FILE"
-    echo "==> Added APP_ENV_GID=$configured_gid to legacy Compose env"
-  fi
-  validate_private_app_env_gid "$deploy_user" "$configured_gid" || return 1
-  resolved_app_env_gid="$configured_gid"
-}
-
 # 迁移成功后才为新容器准备 0640 + APP_ENV_GID 的副本。原 inode 连同其 owner、
 # group、mode、ACL 都保留在同目录；可逆失败时直接 rename 回来，不需要猜测老容器
 # 原先靠哪一组/ACL 读取，也不要求部署账号有权把文件 chgrp 回旧组。
 stage_app_env_for_new_container() {
-  local staged_file
+  local backup_candidate staged_candidate
   [ -f "$APP_ENV_FILE" ] || return 0
-  legacy_app_env_backup="${APP_ENV_FILE}.legacy-rollback.$$"
-  staged_file="${APP_ENV_FILE}.access.tmp.$$"
-  [ ! -e "$legacy_app_env_backup" ] && [ ! -e "$staged_file" ] || {
+  backup_candidate="${APP_ENV_FILE}.legacy-rollback.$$"
+  staged_candidate="${APP_ENV_FILE}.access.tmp.$$"
+  [ ! -e "$backup_candidate" ] && [ ! -e "$staged_candidate" ] || {
     echo "App env staging path already exists; refusing to overwrite it" >&2
     return 1
   }
+  legacy_app_env_backup="$backup_candidate"
+  app_env_staged_file="$staged_candidate"
 
   mv "$APP_ENV_FILE" "$legacy_app_env_backup" || return 1
-  if ! (umask 077 && cp "$legacy_app_env_backup" "$staged_file") ||
-    ! mv "$staged_file" "$APP_ENV_FILE" ||
+  if ! (umask 077 && cp "$legacy_app_env_backup" "$app_env_staged_file") ||
+    ! mv "$app_env_staged_file" "$APP_ENV_FILE" ||
     ! chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" ||
     ! clear_app_env_acl "$APP_ENV_FILE" ||
     ! chmod 640 "$APP_ENV_FILE"; then
-    rm -f "$staged_file" "$APP_ENV_FILE"
+    rm -f "$app_env_staged_file" "$APP_ENV_FILE"
+    app_env_staged_file=""
     if mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
       legacy_app_env_backup=""
     else
@@ -218,6 +174,7 @@ stage_app_env_for_new_container() {
     fi
     return 1
   fi
+  app_env_staged_file=""
 }
 
 restore_legacy_app_env_access() {
@@ -244,7 +201,38 @@ discard_legacy_app_env_backup() {
   legacy_app_env_backup=""
 }
 
-prepare_app_env_access
+prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"
+
+# Keep the env-file rename transaction recoverable when the SSH session drops,
+# the workflow times out, or the process receives TERM/INT. Before a successful
+# cutover, a reversible exit restores the exact legacy inode; after the
+# no-rollback boundary or a completed cutover, only the obsolete backup is
+# removed. This trap also owns cleanup of the temporary Docker credential store.
+cleanup_release_on_exit() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [ -n "$app_env_staged_file" ]; then
+    rm -f "$app_env_staged_file"
+    app_env_staged_file=""
+  fi
+  if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
+    if [ "$app_env_transaction_committed" = "1" ] ||
+      { [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
+        [ "${irreversible_migration_applied:-0}" = "1" ]; }; then
+      discard_legacy_app_env_backup || true
+    else
+      restore_legacy_app_env_access || true
+    fi
+  fi
+  if [ -n "$release_docker_config" ]; then
+    rm -rf "$release_docker_config"
+  fi
+  exit "$status"
+}
+trap cleanup_release_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
@@ -352,9 +340,9 @@ switch_proxy() {
 
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
-  DOCKER_CONFIG="$(mktemp -d)"
+  release_docker_config="$(mktemp -d)"
+  DOCKER_CONFIG="$release_docker_config"
   export DOCKER_CONFIG
-  trap 'rm -rf "$DOCKER_CONFIG"' EXIT
   printf '%s' "$GHCR_TOKEN" |
     docker login ghcr.io -u "${GHCR_USER:?GHCR_USER is required when GHCR_TOKEN is set}" --password-stdin
 fi
@@ -829,6 +817,7 @@ if smoke; then
     fi
     compose rm -f "$live"
   fi
+  app_env_transaction_committed=1
   discard_legacy_app_env_backup
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
 else
