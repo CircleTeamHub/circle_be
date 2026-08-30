@@ -23,6 +23,7 @@ describe('StorageAuditService', () => {
       traceComment: emptyRows(),
       circlePost: emptyRows(),
       chatMessage: emptyRows(),
+      supportRechargePaymentCode: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
       (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
@@ -80,6 +81,26 @@ describe('StorageAuditService', () => {
     expect(
       scannedPrefixes.some((p: string) => p.startsWith('note-exports')),
     ).toBe(false);
+  });
+
+  it('keeps configured recharge payment codes out of the orphan list', async () => {
+    const { service } = harness({
+      objects: {
+        'chat/': [
+          { key: 'chat/admin-1/payment.png', size: 20, lastModified: old },
+        ],
+      },
+      referenced: {
+        supportRechargePaymentCode: [
+          {
+            id: 'code-1',
+            objectKey: 'chat/admin-1/payment.png',
+          },
+        ],
+      },
+    });
+
+    expect((await service.audit(now))?.orphanCount).toBe(0);
   });
 
   it('media types without a field map never leak keys into the reference set', async () => {

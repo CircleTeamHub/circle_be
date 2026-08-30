@@ -298,6 +298,12 @@ export class ChatService {
         where: { id: payload.conversationId },
         data: { nextHeight: height, lastMessageAt: row.createdAt },
       });
+      await this.enqueueRechargeAutomationInTx(
+        tx,
+        conversation,
+        senderUserId,
+        row,
+      );
       // 新消息让所有成员的隐藏会话重新浮出(微信式语义)。
       await tx.chatMember.updateMany({
         where: {
@@ -345,6 +351,46 @@ export class ChatService {
     }
     await this.media.attachMediaUrls([message]);
     return { message, reused: created.reused };
+  }
+
+  /**
+   * 充值客服 durable inbox：与用户消息同事务写入。
+   *
+   * 这里只做资格判定和入队，不匹配关键词、不发消息，避免把客服业务塞进聊天热
+   * 路径。网关提交后即时 kick；若进程恰好在两者之间退出，定时处理器仍会从这张
+   * 表补消费。服务端自动消息走 insertServerMessage，不经过这里，因此不会自触发。
+   */
+  private async enqueueRechargeAutomationInTx(
+    tx: Prisma.TransactionClient,
+    conversation: ChatConversation,
+    senderUserId: string,
+    message: Pick<ChatMessage, 'id' | 'type'>,
+  ): Promise<void> {
+    if (
+      conversation.type !== 'DIRECT' ||
+      !['text', 'quote', 'image'].includes(message.type)
+    ) {
+      return;
+    }
+    const peerUserId = conversation.directKey
+      ?.split(':')
+      .find((id) => id !== senderUserId);
+    if (!peerUserId) return;
+
+    const rechargeAgent = await tx.supportAgent.findFirst({
+      where: {
+        category: 'recharge',
+        userID: peerUserId,
+        enabled: true,
+        user: { status: 'ACTIVE' },
+      },
+      select: { id: true },
+    });
+    if (!rechargeAgent) return;
+
+    await tx.supportRechargeJob.create({
+      data: { sourceMessageID: message.id },
+    });
   }
 
   /**

@@ -3,6 +3,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import type { Prisma } from 'src/generated/prisma';
 import { SYSTEM_MESSAGE_TYPE } from './chat.constants';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatMediaService } from './chat-media.service';
 import { ChatPushService } from './chat-push.service';
 import type { ChatMessageDto, ChatSenderInfo } from './chat.types';
 
@@ -33,6 +34,7 @@ export class ChatSystemMessageService {
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
     private readonly chatPush: ChatPushService,
+    private readonly media: ChatMediaService,
   ) {}
 
   /**
@@ -90,9 +92,20 @@ export class ChatSystemMessageService {
       return { row, reused: false };
     });
 
-    const sender = input.senderID
-      ? await this.resolveSender(input.senderID)
-      : null;
+    let sender: ChatSenderInfo | null = null;
+    if (input.senderID) {
+      try {
+        sender = await this.resolveSender(input.senderID);
+      } catch (error) {
+        // 消息已经提交，昵称/头像只是装饰。查询失败不能把一次可重试调用变成
+        // 「数据库里有消息、实时端永远没收到」的半成功状态。
+        this.logger.warn(
+          `server message sender enrichment failed message=${row.id}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
     const dto: ChatMessageDto = {
       id: row.id,
       conversationId,
@@ -104,6 +117,9 @@ export class ChatSystemMessageService {
       d: row.clientMessageId,
       createdAt: row.createdAt.toISOString(),
     };
+    // 服务端也会产 image（充值收款码）。数据库只存 object key，实时广播前必须
+    // 和历史读取一样现签 URL，否则图片要等用户重进会话后才显示出来。
+    await this.media.attachMediaUrls([dto]);
     if (!reused) {
       this.broadcast.emitMessage(dto);
       if (input.push) void this.chatPush.onMessageBroadcast(dto);

@@ -45,6 +45,8 @@ describe('ChatService', () => {
     circle: { findMany: jest.fn() },
     block: { findFirst: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
     friend: { findFirst: jest.fn() },
+    supportAgent: { findFirst: jest.fn().mockResolvedValue(null) },
+    supportRechargeJob: { create: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
@@ -143,6 +145,7 @@ describe('ChatService', () => {
     prisma.user.findMany.mockResolvedValue([
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
+    prisma.supportAgent.findFirst.mockResolvedValue(null);
     prisma.circle.findMany.mockResolvedValue([]);
     prisma.tempChat.findMany.mockResolvedValue([]);
     prisma.tempChatGuest.findMany.mockResolvedValue([]);

@@ -317,6 +317,19 @@ export class StorageAuditService {
         }
       },
     );
+    // 充值收款码在第一次被机器人发送前还没有 ChatMessage 引用，但它已经是运营
+    // 配置中的有效资产。漏掉这张表会把长期备用码误报成 chat/ 孤儿；未来若按
+    // 盘点结果启用真正 GC，就会删掉仍处于启用/待启用状态的收款码。
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.supportRechargePaymentCode.findMany({
+          select: { id: true, objectKey: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.objectKey),
+    );
 
     return keys;
   }
