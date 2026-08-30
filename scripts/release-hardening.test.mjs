@@ -557,7 +557,7 @@ test('admin deploy validates digests, backfills legacy env, uses strict smoke ch
       '/bin/bash',
       [
         '-c',
-        '. "$PREFLIGHT"; resolved_app_env_gid=""; prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"',
+        '. "$PREFLIGHT"; resolved_app_env_gid=""; prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"; printf "validated=%s\\n" "$APP_ENV_GID"',
       ],
       {
         encoding: 'utf8',
@@ -565,11 +565,16 @@ test('admin deploy validates digests, backfills legacy env, uses strict smoke ch
           ...process.env,
           PREFLIGHT: preflightPath,
           COMPOSE_ENV_FILE: composeEnv,
+          APP_ENV_GID: '999999',
         },
       },
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.match(readFileSync(composeEnv, 'utf8'), /^APP_ENV_GID=\d+$/m);
+    const configuredGid = readFileSync(composeEnv, 'utf8').match(
+      /^APP_ENV_GID=(\d+)$/m,
+    )?.[1];
+    assert.ok(configuredGid);
+    assert.match(result.stdout, new RegExp(`validated=${configuredGid}\\n$`));
   }
 });
 

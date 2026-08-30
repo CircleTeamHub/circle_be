@@ -109,6 +109,10 @@ resolved_app_env_gid=""
 legacy_app_env_backup=""
 app_env_staged_file=""
 app_env_transaction_committed=0
+app_env_transaction_active=0
+APP_ENV_BACKUP_PATH="${APP_ENV_FILE}.legacy-rollback"
+APP_ENV_STAGED_PATH="${APP_ENV_FILE}.access.tmp"
+APP_ENV_TRANSACTION_PATH="${APP_ENV_FILE}.release-transaction"
 release_docker_config=""
 . deploy/app-env-preflight.sh
 
@@ -147,19 +151,84 @@ can_rewrite_app_env_acl_safely() {
 # 迁移成功后才为新容器准备 0640 + APP_ENV_GID 的副本。原 inode 连同其 owner、
 # group、mode、ACL 都保留在同目录；可逆失败时直接 rename 回来，不需要猜测老容器
 # 原先靠哪一组/ACL 读取，也不要求部署账号有权把文件 chgrp 回旧组。
+persist_app_env_transaction_state() {
+  local state="$1" temp="${APP_ENV_TRANSACTION_PATH}.tmp"
+  rm -f "$temp" || return 1
+  (umask 077 && printf '%s\n' "$state" > "$temp") || return 1
+  mv -f "$temp" "$APP_ENV_TRANSACTION_PATH"
+}
+
+clear_app_env_transaction_state() {
+  rm -f "$APP_ENV_TRANSACTION_PATH" "${APP_ENV_TRANSACTION_PATH}.tmp"
+  app_env_transaction_active=0
+}
+
+# EXIT traps cannot run after SIGKILL or a host reboot. Recover the deterministic
+# transaction before the first Compose parse so a legacy container never starts
+# against a half-replaced env file. A committed marker keeps the new file and
+# only removes the obsolete backup; a staged marker restores the exact old inode.
+recover_interrupted_app_env_transaction() {
+  local state
+  if [ ! -e "$APP_ENV_TRANSACTION_PATH" ]; then
+    if [ -e "$APP_ENV_BACKUP_PATH" ] || [ -e "$APP_ENV_STAGED_PATH" ]; then
+      echo "App env staging files exist without a transaction marker; refusing to guess recovery state" >&2
+      return 1
+    fi
+    rm -f "${APP_ENV_TRANSACTION_PATH}.tmp"
+    return 0
+  fi
+
+  state="$(cat "$APP_ENV_TRANSACTION_PATH")" || return 1
+  case "$state" in
+    staged|staged-irreversible)
+      rm -f "$APP_ENV_STAGED_PATH"
+      if [ -e "$APP_ENV_BACKUP_PATH" ]; then
+        if [ "$state" = "staged-irreversible" ] && [ -e "$APP_ENV_FILE" ]; then
+          # The migrated release finished installing its restricted env copy.
+          # The old binary cannot be restarted, so retain the new access mode.
+          rm -f "$APP_ENV_BACKUP_PATH" || return 1
+          echo "==> Finalized app env access after an interrupted irreversible release" >&2
+        else
+          # No complete replacement exists, or rollback is still allowed.
+          rm -f "$APP_ENV_FILE" || return 1
+          mv "$APP_ENV_BACKUP_PATH" "$APP_ENV_FILE" || return 1
+          echo "==> Recovered legacy app env access from an interrupted release" >&2
+        fi
+      fi
+      clear_app_env_transaction_state
+      ;;
+    committed)
+      rm -f "$APP_ENV_BACKUP_PATH" "$APP_ENV_STAGED_PATH"
+      clear_app_env_transaction_state
+      ;;
+    *)
+      echo "Invalid app env transaction state: $state" >&2
+      return 1
+      ;;
+  esac
+}
+
 stage_app_env_for_new_container() {
-  local backup_candidate staged_candidate
+  local transaction_state="staged"
   [ -f "$APP_ENV_FILE" ] || return 0
-  backup_candidate="${APP_ENV_FILE}.legacy-rollback.$$"
-  staged_candidate="${APP_ENV_FILE}.access.tmp.$$"
-  [ ! -e "$backup_candidate" ] && [ ! -e "$staged_candidate" ] || {
+  [ ! -e "$APP_ENV_BACKUP_PATH" ] && [ ! -e "$APP_ENV_STAGED_PATH" ] || {
     echo "App env staging path already exists; refusing to overwrite it" >&2
     return 1
   }
-  legacy_app_env_backup="$backup_candidate"
-  app_env_staged_file="$staged_candidate"
+  if irreversible_boundary_crossed; then
+    transaction_state="staged-irreversible"
+  fi
+  persist_app_env_transaction_state "$transaction_state" || return 1
+  app_env_transaction_active=1
+  legacy_app_env_backup="$APP_ENV_BACKUP_PATH"
+  app_env_staged_file="$APP_ENV_STAGED_PATH"
 
-  mv "$APP_ENV_FILE" "$legacy_app_env_backup" || return 1
+  if ! mv "$APP_ENV_FILE" "$legacy_app_env_backup"; then
+    legacy_app_env_backup=""
+    app_env_staged_file=""
+    clear_app_env_transaction_state
+    return 1
+  fi
   if ! (umask 077 && cp "$legacy_app_env_backup" "$app_env_staged_file") ||
     ! mv "$app_env_staged_file" "$APP_ENV_FILE" ||
     ! chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" ||
@@ -169,6 +238,7 @@ stage_app_env_for_new_container() {
     app_env_staged_file=""
     if mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
       legacy_app_env_backup=""
+      clear_app_env_transaction_state
     else
       echo "CRITICAL: original app env remains at $legacy_app_env_backup" >&2
     fi
@@ -178,20 +248,13 @@ stage_app_env_for_new_container() {
 }
 
 restore_legacy_app_env_access() {
-  local failed_release_file
   [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ] || return 0
-  failed_release_file="${APP_ENV_FILE}.failed-release.$$"
-  rm -f "$failed_release_file"
-  if [ -e "$APP_ENV_FILE" ]; then
-    mv "$APP_ENV_FILE" "$failed_release_file" || return 1
-  fi
+  rm -f "$APP_ENV_FILE"
   if ! mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
-    [ ! -e "$APP_ENV_FILE" ] && [ -e "$failed_release_file" ] &&
-      mv "$failed_release_file" "$APP_ENV_FILE" || true
     return 1
   fi
-  rm -f "$failed_release_file"
   legacy_app_env_backup=""
+  clear_app_env_transaction_state
   echo "==> Restored legacy app env access for the previous container" >&2
 }
 
@@ -201,7 +264,16 @@ discard_legacy_app_env_backup() {
   legacy_app_env_backup=""
 }
 
+commit_app_env_transaction() {
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  persist_app_env_transaction_state committed || return 1
+  app_env_transaction_committed=1
+  discard_legacy_app_env_backup || return 1
+  clear_app_env_transaction_state
+}
+
 prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"
+recover_interrupted_app_env_transaction
 
 # Keep the env-file rename transaction recoverable when the SSH session drops,
 # the workflow times out, or the process receives TERM/INT. Before a successful
@@ -209,17 +281,22 @@ prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"
 # no-rollback boundary or a completed cutover, only the obsolete backup is
 # removed. This trap also owns cleanup of the temporary Docker credential store.
 cleanup_release_on_exit() {
-  local status=$?
+  local status=$? persisted_transaction_state=""
   trap - EXIT INT TERM HUP
-  if [ -n "$app_env_staged_file" ]; then
+  if [ -e "$APP_ENV_TRANSACTION_PATH" ]; then
+    persisted_transaction_state="$(cat "$APP_ENV_TRANSACTION_PATH" 2>/dev/null || true)"
+  fi
+  if [ "$app_env_transaction_active" = "1" ] && [ -n "$app_env_staged_file" ]; then
     rm -f "$app_env_staged_file"
     app_env_staged_file=""
   fi
   if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
     if [ "$app_env_transaction_committed" = "1" ] ||
+      [ "$persisted_transaction_state" = "committed" ] ||
       { [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
-        [ "${irreversible_migration_applied:-0}" = "1" ]; }; then
-      discard_legacy_app_env_backup || true
+        [ "${irreversible_migration_applied:-0}" = "1" ] &&
+        [ -e "$APP_ENV_FILE" ]; }; then
+      commit_app_env_transaction || true
     else
       restore_legacy_app_env_access || true
     fi
@@ -491,7 +568,7 @@ enter_irreversible_maintenance() {
     compose stop "$live" || true
   fi
   # 旧二进制已明确不可回滚；不再保留可能沿用历史宽松权限的密钥副本。
-  discard_legacy_app_env_backup || true
+  commit_app_env_transaction || true
 }
 
 probe_irreversible_contract_state() {
@@ -686,6 +763,9 @@ if ! stage_app_env_for_new_container; then
   handle_post_migration_failure
   exit 1
 fi
+if irreversible_boundary_crossed; then
+  commit_app_env_transaction
+fi
 
 # ── 给这次发布盖上 Sentry release 标签 ─────────────────────────
 # 没有 release,Sentry 里就没法回答「这个 bug 是哪次发版引入的」,regression
@@ -810,6 +890,9 @@ if ! persist_active_color "$standby"; then
 fi
 
 if smoke; then
+  # Persist the no-rollback decision before retiring the old color. If the host
+  # dies after this point, the next release keeps the validated 0640 env file.
+  commit_app_env_transaction
   if [ -n "$live" ]; then
     if [ -n "$(running "$live")" ]; then
       echo "==> Public smoke passed; stopping $live"
@@ -817,8 +900,6 @@ if smoke; then
     fi
     compose rm -f "$live"
   fi
-  app_env_transaction_committed=1
-  discard_legacy_app_env_backup
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2

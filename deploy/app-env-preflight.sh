@@ -55,4 +55,9 @@ prepare_compose_app_env_gid() {
   # validated numeric value after sourcing this helper.
   # shellcheck disable=SC2034
   resolved_app_env_gid="$configured_gid"
+  # Compose gives an inherited shell variable precedence over the value in
+  # its .env file. Export the value we just validated so a stale or hostile
+  # caller environment cannot silently replace the supplementary group.
+  APP_ENV_GID="$configured_gid"
+  export APP_ENV_GID
 }
