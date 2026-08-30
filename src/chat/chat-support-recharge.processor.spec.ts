@@ -40,6 +40,7 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       chatMessage: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'message-1',
+          height: 7,
           conversationID: 'conversation-1',
           senderID: 'user-1',
           type: 'image',
@@ -66,12 +67,15 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
           .fn()
           .mockResolvedValue({ ...order, status: 'WAITING_REVIEW' }),
       },
+      chatMember: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     };
     const messages = { insertServerMessage: jest.fn().mockResolvedValue({}) };
+    const broadcast = { emitRead: jest.fn() };
     const processor = new ChatSupportRechargeProcessor(
       prisma as never,
       messages as never,
       { copyObjectToKey: jest.fn() } as never,
+      broadcast as never,
     );
 
     await processor.processMessage('message-1');
@@ -92,6 +96,11 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
         }),
       }),
     );
+    expect(broadcast.emitRead).toHaveBeenCalledWith({
+      conversationId: 'conversation-1',
+      userId: 'agent-1',
+      height: 7,
+    });
     expect(prisma.supportRechargeJob.update).toHaveBeenLastCalledWith({
       where: { id: 'job-1' },
       data: { status: 'COMPLETED', lockedAt: null, lastError: null },
@@ -111,6 +120,7 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       chatMessage: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'message-2',
+          height: 8,
           conversationID: 'conversation-1',
           senderID: 'user-1',
           type: 'text',
@@ -149,6 +159,7 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
           status: 'AWAITING_PROOF',
         }),
       },
+      chatMember: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     };
     const messages = { insertServerMessage: jest.fn().mockResolvedValue({}) };
     const upload = { copyObjectToKey: jest.fn().mockResolvedValue(undefined) };
@@ -156,6 +167,7 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       prisma as never,
       messages as never,
       upload as never,
+      { emitRead: jest.fn() } as never,
     );
 
     await processor.processMessage('message-2');

@@ -20,6 +20,7 @@ import {
   ListSupportRechargeOrdersQueryDto,
   RejectSupportRechargeOrderDto,
   SetSupportRechargePaymentCodeEnabledDto,
+  UpdateSupportRechargePaymentCodeDto,
 } from './support-recharge.dto';
 import { SupportRechargeService } from './support-recharge.service';
 
@@ -43,6 +44,16 @@ export class SupportRechargeAdminController {
     @Body() dto: CreateSupportRechargePaymentCodeDto,
   ) {
     return this.recharge.createPaymentCode(this.operator(req), dto);
+  }
+
+  @Patch('payment-codes/:id')
+  @ApiOperation({ summary: '更新收款码图片、说明或有效期' })
+  updatePaymentCode(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSupportRechargePaymentCodeDto,
+  ) {
+    return this.recharge.updatePaymentCode(this.operator(req), id, dto);
   }
 
   @Patch('payment-codes/:id/enabled')

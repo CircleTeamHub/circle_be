@@ -22,6 +22,7 @@ import {
   ApproveSupportRechargeOrderDto,
   CreateSupportRechargePaymentCodeDto,
   ListSupportRechargeOrdersQueryDto,
+  UpdateSupportRechargePaymentCodeDto,
 } from './support-recharge.dto';
 
 type Operator = { userId: string; accountId: string };
@@ -102,12 +103,7 @@ export class SupportRechargeService {
     }
     // 普通上传接口只允许签出 chat/{当前用户}/...。创建配置时再绑一次当前
     // 管理员，避免拿一个从聊天历史里看到的别人 object key 变成全局收款码。
-    if (!dto.objectKey.startsWith(`chat/${operator.userId}/`)) {
-      throw new BadRequestException({
-        message: '收款码图片必须由当前管理员上传',
-        errorCode: SupportErrorCode.RechargePaymentCodeInvalid,
-      });
-    }
+    this.assertPaymentCodeObjectOwned(operator, dto.objectKey);
 
     const created = await this.prisma.$transaction(async (tx) => {
       const row = await tx.supportRechargePaymentCode.create({
@@ -133,6 +129,71 @@ export class SupportRechargeService {
       ...created,
       previewUrl: await this.signEvidence(created.objectKey),
     };
+  }
+
+  async updatePaymentCode(
+    operator: Operator,
+    id: string,
+    dto: UpdateSupportRechargePaymentCodeDto,
+  ) {
+    if (Object.values(dto).every((value) => value === undefined)) {
+      throw new BadRequestException({
+        message: '请至少修改一项收款码配置',
+        errorCode: SupportErrorCode.RechargePaymentCodeInvalid,
+      });
+    }
+    if (dto.objectKey) {
+      this.assertPaymentCodeObjectOwned(operator, dto.objectKey);
+    }
+
+    const after = await this.prisma.$transaction(async (tx) => {
+      const before = await tx.supportRechargePaymentCode.findUnique({
+        where: { id },
+      });
+      if (!before) {
+        throw new NotFoundException({
+          message: '收款码不存在',
+          errorCode: SupportErrorCode.RechargePaymentCodeNotFound,
+        });
+      }
+      const validFrom = dto.validFrom
+        ? new Date(dto.validFrom)
+        : before.validFrom;
+      const validUntil =
+        dto.validUntil === undefined
+          ? before.validUntil
+          : dto.validUntil
+            ? new Date(dto.validUntil)
+            : null;
+      if (validUntil && validUntil <= validFrom) {
+        throw new BadRequestException({
+          message: '收款码失效时间必须晚于生效时间',
+          errorCode: SupportErrorCode.RechargePaymentCodeInvalid,
+        });
+      }
+      const updated = await tx.supportRechargePaymentCode.update({
+        where: { id },
+        data: {
+          ...(dto.label !== undefined ? { label: dto.label } : {}),
+          ...(dto.objectKey !== undefined
+            ? { objectKey: dto.objectKey }
+            : {}),
+          validFrom,
+          validUntil,
+        },
+      });
+      await this.audit.recordInTransaction(tx, {
+        actorId: operator.userId,
+        actorAccountId: operator.accountId,
+        action: 'support.recharge.payment_code.update',
+        targetType: 'support_recharge_payment_code',
+        targetId: id,
+        before: this.paymentCodeAudit(before),
+        after: this.paymentCodeAudit(updated),
+      });
+      return updated;
+    });
+    return { ...after, previewUrl: await this.signEvidence(after.objectKey) };
   }
 
   async setPaymentCodeEnabled(
@@ -578,6 +639,18 @@ export class SupportRechargeService {
       return (await this.upload.createPresignedGetUrl(objectKey, 15 * 60)).url;
     } catch {
       return null;
+    }
+  }
+
+  private assertPaymentCodeObjectOwned(
+    operator: Operator,
+    objectKey: string,
+  ): void {
+    if (!objectKey.startsWith(`chat/${operator.userId}/`)) {
+      throw new BadRequestException({
+        message: '收款码图片必须由当前管理员上传',
+        errorCode: SupportErrorCode.RechargePaymentCodeInvalid,
+      });
     }
   }
 
