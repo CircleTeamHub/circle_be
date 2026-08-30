@@ -76,6 +76,7 @@ if [ -f .env.production ]; then
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
   grep -Eq '^WEB_DOMAIN=.+' .env || set_env_value .env WEB_DOMAIN "$WEB_DOMAIN"
+  grep -Eq '^APP_ENV_GID=[0-9]+$' .env || set_env_value .env APP_ENV_GID "$(id -g)"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$ADMIN_DOMAIN"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$WEB_DOMAIN"
   if grep -q '^REDIS_PASSWORD=' .env; then
@@ -127,6 +128,7 @@ API_DOMAIN=$API_DOMAIN
 ADMIN_DOMAIN=$ADMIN_DOMAIN
 ACME_EMAIL=$ACME_EMAIL
 WEB_DOMAIN=$WEB_DOMAIN
+APP_ENV_GID=$(id -g)
 EOF
 
 cat > .env.production <<EOF

@@ -66,6 +66,10 @@ bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
+`gen-env.sh` 会把执行部署的宿主机用户主组写入 `.env` 的 `APP_ENV_GID`。
+应用容器以非 root 用户运行，并通过这个只读补充组读取权限为 `0640` 的
+`.env.production`；不要把该文件放宽为 `0644`。
+
 启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
 
@@ -215,6 +219,7 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 | Variable | `DEPLOY_USER` | 可选,默认 `ubuntu` |
 | Variable | `DEPLOY_PATH` | 可选,默认 `circle_be`(相对远端 $HOME) |
 | Variable | `API_SMOKE_URL` | 可选，必须指向无需凭据时返回 `401/403` JSON 的已知 API 路由，如 `https://<API域名>/api/v1/auth/me`；设了则 runner 侧再做一次外部视角烟测 |
+| Variable | `RELEASE_PLATFORM` | 发布服务器架构：`linux/arm64` 或 `linux/amd64`；默认沿用原 Oracle ARM 的 `linux/arm64` |
 
 镜像推/拉全用内置 `GITHUB_TOKEN`,无需额外 PAT;服务器只在部署那一刻用临时 token
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,

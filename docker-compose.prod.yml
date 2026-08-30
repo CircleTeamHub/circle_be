@@ -171,6 +171,10 @@ services:
       minio-init: { condition: service_completed_successfully, required: false }
     environment:
       NODE_ENV: production
+    # .env.production 在宿主机上保持 owner 可写、部署组只读(0640)。生产
+    # 镜像里的 app 用户通过这个补充组读取 bind mount，不需要 root 或 0644。
+    group_add:
+      - '${APP_ENV_GID:?set APP_ENV_GID to the deploy user primary gid}'
     volumes:
       # getServerConfig 读这个文件;只读挂载
       - ./.env.production:/app/.env.production:ro

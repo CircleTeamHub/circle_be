@@ -561,7 +561,8 @@ set_release_env_value() {
   # 先删再建:残留的旧 .env.production.tmp(上一次发布被 Ctrl-C 掐断等)会让
   # `>` 只做截断、保留它原来的宽松权限,umask 对已存在的文件不起作用。
   # mv 是同目录 rename,0600 跟着 inode 一起到目标,所以目标文件也不存在
-  # 「先 0644 再 chmod」的窗口。
+  # 「先 0644 再 chmod」的窗口。rename 完成后才改成 0640；容器通过 .env
+  # 里的 APP_ENV_GID 补充组读取，宿主机其他用户仍然无权访问。
   rm -f "$tmp" || return 1
   (umask 077 && : > "$tmp") || return 1
   awk -v key="$key" -v value="$value" '
@@ -589,10 +590,10 @@ APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 # 写不进去而一直下线。一个 release 标签不值得拿可用性去换。
 if [ -f "$APP_ENV_FILE" ]; then
   echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
-  # chmod 是兜底:替换用的临时文件已经是 0600,rename 之后目标文件天然就是
-  # 0600,这一行只负责收拾「文件在这次发布之前就被人放成了 0644」的历史遗留。
+  # 临时文件在 rename 前始终是 0600；rename 后改为 0640，让只加入
+  # APP_ENV_GID 的非 root 容器用户可以读取 bind mount。
   if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
-    chmod 600 "$APP_ENV_FILE"; then
+    chmod 640 "$APP_ENV_FILE"; then
     :
   else
     echo "WARNING: could not stamp SENTRY_RELEASE into $APP_ENV_FILE; continuing." >&2

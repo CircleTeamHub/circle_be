@@ -71,6 +71,16 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
   assert.match(caddy, apiFallbackHandle);
 });
 
+test('non-root app can read the group-protected production env file', () => {
+  const compose = read('docker-compose.prod.yml');
+  const generator = read('deploy/gen-env.sh');
+  const release = read('deploy/release-deploy.sh');
+
+  assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
+  assert.match(generator, /APP_ENV_GID=\$\(id -g\)/);
+  assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
+});
+
 test('Caddy switches only between unique blue-green container endpoints', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const deploy = read('deploy/release-deploy.sh');
@@ -171,13 +181,14 @@ test('backend release gate actions are pinned to full commit SHAs', () => {
   }
 });
 
-test('releasable ARM64 image is scanned before either registry push', () => {
+test('the configured single-platform release image is scanned before either registry push', () => {
   const workflow = read('.github/workflows/build-image.yml');
-  const build = workflow.indexOf('- name: Build and load ARM64 image');
-  const scan = workflow.indexOf('- name: Scan releasable ARM64 image');
+  const build = workflow.indexOf('- name: Build and load release image');
+  const scan = workflow.indexOf('- name: Scan releasable image');
   const push = workflow.indexOf('- name: Push scanned image tags');
 
-  assert.match(workflow, /platforms: linux\/arm64/);
+  assert.match(workflow, /linux\/amd64\|linux\/arm64/);
+  assert.match(workflow, /platforms: \$\{\{ steps\.meta\.outputs\.platform \}\}/);
   assert.match(workflow, /push: false/);
   assert.match(workflow, /load: true/);
   assert.match(
@@ -190,7 +201,7 @@ test('releasable ARM64 image is scanned before either registry push', () => {
   );
   assert.ok(
     build >= 0 && build < scan,
-    'the ARM64 image must be built before scanning',
+    'the release image must be built before scanning',
   );
   assert.ok(
     scan < push,

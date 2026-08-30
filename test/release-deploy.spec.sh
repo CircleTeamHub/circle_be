@@ -387,7 +387,7 @@ test_release_stamps_sentry_release_before_starting_the_new_color() {
   }
 }
 
-test_release_never_widens_permissions_on_the_secrets_it_rewrites() {
+test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
   # review #150(P1):打标签是「读 .env.production → 写临时文件 → mv 回去」,
   # 临时文件因此装着整份生产密钥。默认 umask 022 下它会落成 0644,在 mv 之前
   # 的这段窗口里同机任何用户都读得到 —— 而目标文件本身是 0600,等于绕过了它
@@ -408,7 +408,7 @@ test_release_never_widens_permissions_on_the_secrets_it_rewrites() {
     echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 600" >&2
     return 1
   }
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   [ ! -e "${APP_ENV_FILE}.tmp" ] || {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
     return 1
@@ -673,7 +673,7 @@ for test_name in \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
-  test_release_never_widens_permissions_on_the_secrets_it_rewrites \
+  test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \
