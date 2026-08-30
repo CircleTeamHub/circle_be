@@ -32,6 +32,8 @@ export function classifyRechargeRequest(
 ): SupportRechargeRequestKind | null {
   const normalized = text.trim().toLocaleLowerCase();
   if (!normalized) return null;
+  if (normalized === '1') return 'MEMBERSHIP';
+  if (normalized === '2') return 'COIN';
   return (
     REQUEST_KEYWORDS.find(({ words }) =>
       words.some((word) => normalized.includes(word)),
@@ -41,6 +43,7 @@ export function classifyRechargeRequest(
 
 function asksForHuman(text: string): boolean {
   const normalized = text.trim().toLocaleLowerCase();
+  if (normalized === '3') return true;
   return ['人工', '真人客服', '转人工'].some((word) =>
     normalized.includes(word),
   );
@@ -236,7 +239,7 @@ export class ChatSupportRechargeProcessor {
         senderID: agentUserID,
         type: 'text',
         content: {
-          text: '已记录你的人工服务请求。请说明需要处理的问题和相关充值信息，客服上线后会接着处理。',
+          text: '已转人工客服。请直接说明问题，客服上线后会在本会话回复。',
         },
         clientMessageId: `sr-human-${message.id}`,
         push: true,
@@ -245,7 +248,7 @@ export class ChatSupportRechargeProcessor {
         where: { conversationID: message.conversationID },
         data: { mode: 'HUMAN' },
       });
-      await this.markHandledRead(message, agentUserID);
+      // 原消息已经走正常聊天推送；不要替真人客服标记已读，让会话保留未读提醒。
       return;
     } else if (state.mode === 'HUMAN') {
       return;
@@ -300,7 +303,7 @@ export class ChatSupportRechargeProcessor {
       senderID: agentUserID,
       type: 'text',
       content: {
-        text: '你好，这里是充值服务。目前支持积分充值和会员开通/续费。请发送“积分”或“会员”，我会提供当前可用的付款方式和操作步骤。',
+        text: '你好，这里是充值服务。请回复数字选择：\n1. 充值会员\n2. 充值积分\n3. 人工客服',
       },
       clientMessageId: `sr-welcome-${message.id}`,
       push: true,
@@ -342,6 +345,19 @@ export class ChatSupportRechargeProcessor {
       },
       orderBy: { createdAt: 'desc' },
     });
+    if (active?.status === 'AWAITING_PROOF') {
+      await this.messages.insertServerMessage(message.conversationID, {
+        senderID: agentUserID,
+        type: 'text',
+        content: {
+          text: `充值申请 ${active.orderNo} 正在等待付款截图，请勿重复付款。`,
+        },
+        clientMessageId: `sr-awaiting-proof-${message.id}`,
+        push: true,
+      });
+      return;
+    }
+
     const order =
       active ?? (await this.createOrder(message, agentUserID, requestKind));
 
@@ -352,8 +368,8 @@ export class ChatSupportRechargeProcessor {
         content: {
           text:
             order.status === 'PROCESSING'
-              ? `充值申请 ${order.orderNo} 已核对，权益正在发放，请勿重复付款。`
-              : `充值申请 ${order.orderNo} 的付款记录正在人工核对，请勿重复付款。需要补充更清晰的付款记录时，可以直接发送新截图。`,
+              ? `充值申请 ${order.orderNo} 已核对，正在发放，请勿重复付款。`
+              : `充值申请 ${order.orderNo} 正在人工核对，请勿重复付款。`,
         },
         clientMessageId: `sr-pending-${message.id}`,
         push: true,
@@ -361,13 +377,16 @@ export class ChatSupportRechargeProcessor {
       return;
     }
 
+    const paymentMethods = codes
+      .map((code, index) =>
+        codes.length === 1 ? code.label : `${index + 1}. ${code.label}`,
+      )
+      .join('\n');
     await this.messages.insertServerMessage(message.conversationID, {
       senderID: agentUserID,
       type: 'text',
       content: {
-        text:
-          `已为你建立充值申请 ${order.orderNo}。请使用下方当前有效的收款码完成付款。` +
-          '付款前请核对收款信息；不要使用聊天记录里的旧二维码。',
+        text: `充值申请：${order.orderNo}\n付款方式：${paymentMethods}\n请使用下方收款码付款，勿使用历史二维码。付款后发送转账截图（保留金额、时间和交易编号）。`,
       },
       clientMessageId: `sr-intro-${message.id}`,
       push: true,
@@ -380,28 +399,11 @@ export class ChatSupportRechargeProcessor {
       await this.upload.copyObjectToKey(code.objectKey, deliveryKey);
       await this.messages.insertServerMessage(message.conversationID, {
         senderID: agentUserID,
-        type: 'text',
-        content: { text: `付款方式：${code.label}` },
-        clientMessageId: `sr-label-${message.id}-${code.id}`,
-      });
-      await this.messages.insertServerMessage(message.conversationID, {
-        senderID: agentUserID,
         type: 'image',
         content: { key: deliveryKey },
         clientMessageId: `sr-code-${message.id}-${code.id}`,
       });
     }
-    await this.messages.insertServerMessage(message.conversationID, {
-      senderID: agentUserID,
-      type: 'text',
-      content: {
-        text:
-          `付款后请在本会话发送充值申请 ${order.orderNo} 的转账记录截图。` +
-          '截图请保留金额、时间和交易编号；可以遮挡其他隐私信息，请勿发送密码或验证码。',
-      },
-      clientMessageId: `sr-steps-${message.id}`,
-      push: true,
-    });
     await this.prisma.supportRechargeConversationState.update({
       where: { conversationID: message.conversationID },
       data: { lastWelcomeAt: now },
