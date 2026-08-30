@@ -2,6 +2,7 @@ import { ChatSystemMessageService } from './chat-system-message.service';
 
 describe('ChatSystemMessageService', () => {
   const prisma = {
+    user: { findUnique: jest.fn() },
     chatMessage: { aggregate: jest.fn(), create: jest.fn() },
     chatConversation: { update: jest.fn() },
     chatMember: { updateMany: jest.fn() },
@@ -11,11 +12,13 @@ describe('ChatSystemMessageService', () => {
   };
   const broadcast = { emitMessage: jest.fn() };
   const push = { onMessageBroadcast: jest.fn().mockResolvedValue(undefined) };
+  const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
 
   const service = new ChatSystemMessageService(
     prisma as never,
     broadcast as never,
     push as never,
+    media as never,
   );
 
   beforeEach(() => {
@@ -34,6 +37,12 @@ describe('ChatSystemMessageService', () => {
     });
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'agent-1',
+      nickname: '客服',
+      avatarUrl: null,
+    });
+    media.attachMediaUrls.mockResolvedValue(undefined);
   });
 
   // 用户 swipe 隐藏了群之后,进/退群提示照常落库并计入未读,但会话本身不回到
@@ -56,6 +65,39 @@ describe('ChatSystemMessageService', () => {
     );
     expect(broadcast.emitMessage).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', type: 'system' }),
+    );
+  });
+
+  it('can rebroadcast an idempotently reused message after a pre-broadcast failure', async () => {
+    const existing = {
+      id: 'message-existing',
+      conversationID: 'conversation-1',
+      height: 4,
+      senderID: 'agent-1',
+      type: 'image',
+      content: { key: 'chat/agent-1/code.png' },
+      clientMessageId: 'qr-1',
+      createdAt: new Date('2026-08-29T00:00:00.000Z'),
+    };
+    prisma.$transaction.mockImplementation(async (callback) =>
+      callback({
+        $queryRaw: jest.fn().mockResolvedValue([{ nextHeight: 4 }]),
+        chatMessage: {
+          findUnique: jest.fn().mockResolvedValue(existing),
+        },
+      }),
+    );
+
+    await service.insertServerMessage('conversation-1', {
+      senderID: 'agent-1',
+      type: 'image',
+      content: { key: 'chat/agent-1/code.png' },
+      clientMessageId: 'qr-1',
+      rebroadcastOnReplay: true,
+    });
+
+    expect(broadcast.emitMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'message-existing' }),
     );
   });
 });

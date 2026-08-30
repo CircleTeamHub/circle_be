@@ -30,6 +30,7 @@ import { ChatPresenceRegistry } from './chat-presence.registry';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
+import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
 import { ChatService } from './chat.service';
 import {
   chatMetrics as defaultChatMetrics,
@@ -135,6 +136,7 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly redisService: RedisService,
     private readonly configService: ConfigService,
     private readonly presence: ChatPresenceRegistry,
+    private readonly supportRecharge: ChatSupportRechargeProcessor,
   ) {
     const make = (
       name: keyof typeof CHAT_RATE_LIMITS,
@@ -831,6 +833,17 @@ export class ChatGateway implements OnModuleDestroy {
         // 离线成员推送:best-effort,不阻塞发送方 ack 路径。
         void this.chatPush.onMessageBroadcast(result.message);
       }
+      // 原消息和 durable job 已在同一事务提交。这里做低延迟 kick；若本次进程
+      // 恰好退出或数据库短暂失败，processor 的定时扫描会继续补消费。
+      void this.supportRecharge
+        .processMessage(result.message.id)
+        .catch((error) =>
+          this.logger.warn(
+            `support recharge immediate kick failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
     } catch (error) {
       this.metrics.observeEvent('send', 'failure');
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));

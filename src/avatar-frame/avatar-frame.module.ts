@@ -10,6 +10,6 @@ import { AvatarFrameService } from './avatar-frame.service';
   imports: [RealtimeModule, ModerationModule],
   controllers: [AvatarFrameController, AvatarFrameAdminController],
   providers: [AvatarFrameService, AvatarFrameAdminService],
-  exports: [AvatarFrameService],
+  exports: [AvatarFrameService, AvatarFrameAdminService],
 })
 export class AvatarFrameModule {}

@@ -47,6 +47,7 @@ import { SensitiveWordModule } from './sensitive-word/sensitive-word.module';
 import { ChatModule } from './chat/chat.module';
 import { MetricsModule } from './metrics/metrics.module';
 import { ReferralModule } from './referral/referral.module';
+import { SupportRechargeModule } from './support-recharge/support-recharge.module';
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 const envFilePath = `.env.${nodeEnv}`;
@@ -103,6 +104,7 @@ const envFilePath = `.env.${nodeEnv}`;
     MetricsModule,
     ReferralModule,
     QrModule,
+    SupportRechargeModule,
   ],
   controllers: [],
   providers: [Logger],
