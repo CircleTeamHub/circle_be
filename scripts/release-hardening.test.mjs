@@ -80,14 +80,16 @@ test('non-root app can read the group-protected production env file', () => {
   assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
   assert.match(generator, /APP_ENV_GID=\$DEPLOY_APP_ENV_GID/);
   assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
+  assert.match(generator, /setfacl -b "\$file"/);
   assert.match(
     generator,
-    /chmod 600 \.env\s+chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production\s+chmod 640 \.env\.production/,
+    /chmod 600 \.env\s+chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production\s+clear_file_acl \.env\.production\s+chmod 640 \.env\.production/,
   );
   assert.match(release, /prepare_app_env_access\s*\(\)/);
   assert.match(release, /expected_gid="\$\(id -g "\$deploy_user"\)"/);
   assert.match(release, /validate_private_app_env_gid "\$deploy_user" "\$configured_gid"/);
   assert.match(release, /chgrp "\$resolved_app_env_gid" "\$APP_ENV_FILE"/);
+  assert.match(release, /clear_app_env_acl "\$APP_ENV_FILE"/);
   assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
 });
 
@@ -207,7 +209,7 @@ test('the configured single-platform release image is scanned before either regi
   );
   assert.match(
     workflow,
-    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}/,
+    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/,
   );
   assert.ok(
     build >= 0 && build < scan,
@@ -332,6 +334,7 @@ esac
       SHA: 'a'.repeat(40),
       RELEASE_TAG: 'v1.2.3',
       GHCR_TOKEN: 'token',
+      RELEASE_PLATFORM: 'linux/arm64',
       GITHUB_REPOSITORY: 'circleteamhub/circle_be',
       GITHUB_ACTOR: 'release-test',
       GITHUB_OUTPUT: output,
@@ -342,7 +345,27 @@ esac
   const outputs = readFileSync(output, 'utf8');
   assert.match(outputs, /digest=sha256:0{64}/);
   assert.match(outputs, /needs_promotion=true/);
+  assert.match(outputs, /sha_image=.*:sha-a{40}-arm64/);
+  assert.match(outputs, /release_image=.*:v1\.2\.3-arm64/);
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+});
+
+test('platform changes cannot overwrite commit or version image tags', () => {
+  const build = read('.github/workflows/build-image.yml');
+  const release = read('.github/workflows/release.yml');
+
+  assert.match(build, /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /main-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(release, /sha_image="\$repo:sha-\$SHA-\$arch"/);
+  assert.match(release, /release_image="\$repo:\$RELEASE_TAG-\$arch"/);
+
+  const sha = 'a'.repeat(40);
+  const refs = ['arm64', 'amd64'].map((arch) => ({
+    commit: `sha-${sha}-${arch}`,
+    version: `v1.2.3-${arch}`,
+  }));
+  assert.notEqual(refs[0].commit, refs[1].commit);
+  assert.notEqual(refs[0].version, refs[1].version);
 });
 
 test('workflow stages and activates only through the restricted release protocol', () => {

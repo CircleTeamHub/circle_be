@@ -58,6 +58,21 @@ validate_private_gid() {
   fi
 }
 
+clear_file_acl() {
+  local file="$1"
+  case "$(uname -s)" in
+    Linux)
+      command -v setfacl >/dev/null || {
+        echo "❌ 缺少 setfacl；请先安装 acl 包，才能安全设置生产配置权限。" >&2
+        return 1
+      }
+      setfacl -b "$file"
+      ;;
+    Darwin) chmod -N "$file" ;;
+    *) echo "❌ 不支持在当前系统安全清除生产配置 ACL。" >&2; return 1 ;;
+  esac
+}
+
 existing_app_env_gid=""
 if [ -f .env ]; then
   existing_app_env_gid="$(sed -n 's/^APP_ENV_GID=//p' .env | tail -n 1)"
@@ -163,6 +178,7 @@ if [ -f .env.production ]; then
   fi
   chmod 600 .env
   chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  clear_file_acl .env.production
   chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
   exit 0
@@ -224,6 +240,7 @@ EOF
 
 chmod 600 .env
 chgrp "$DEPLOY_APP_ENV_GID" .env.production
+clear_file_acl .env.production
 chmod 640 .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"

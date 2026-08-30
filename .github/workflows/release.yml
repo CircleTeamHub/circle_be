@@ -1,11 +1,12 @@
 # Promote half of the build-once-promote release architecture.
 #
 # Pushing a `v*` tag (or dispatching this workflow with an existing tag)
-# releases that commit to the Oracle ARM server:
+# releases that commit to the configured server platform:
 #
 #   resolve   — pin the tag to a commit, require it to be on main with a green
 #               CI run, and resolve an existing immutable registry manifest
-#   promote   — on tag push only, stamp the prebuilt sha image with the version tag
+#   promote   — stamp the prebuilt platform-specific sha image with a matching
+#               platform-specific version image tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
 #   deploy    — stage the tagged repo through the server ForceCommand protocol,
@@ -185,11 +186,17 @@ jobs:
           SHA: ${{ steps.verify.outputs.sha }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PLATFORM: ${{ vars.RELEASE_PLATFORM || 'linux/arm64' }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha_image="$repo:sha-$SHA"
-          release_image="$repo:$RELEASE_TAG"
+          case "$RELEASE_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "Unsupported RELEASE_PLATFORM: $RELEASE_PLATFORM" >&2; exit 1 ;;
+          esac
+          arch="${RELEASE_PLATFORM#linux/}"
+          sha_image="$repo:sha-$SHA-$arch"
+          release_image="$repo:$RELEASE_TAG-$arch"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
           digest_of() {

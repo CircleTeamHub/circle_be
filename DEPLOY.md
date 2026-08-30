@@ -23,6 +23,7 @@
 
 ```bash
 curl -fsSL https://get.docker.com | sudo sh
+sudo apt-get update && sudo apt-get install -y acl
 sudo usermod -aG docker $USER && newgrp docker
 docker version && docker compose version
 ```
@@ -134,7 +135,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 push main ──► build-image.yml:QEMU 交叉构建 linux/arm64
                 └─► 阻断式 Trivy 扫描该 ARM64 镜像
-                    └─► 通过后才 push sha-<commit>(+ :main)
+                    └─► 通过后才 push sha-<commit>-<arch>(+ :main-<arch>)
 
 push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像

@@ -139,6 +139,21 @@ validate_private_app_env_gid() {
   fi
 }
 
+clear_app_env_acl() {
+  local file="$1"
+  case "$(uname -s)" in
+    Linux)
+      command -v setfacl >/dev/null || {
+        echo "setfacl is required to remove inherited ACLs from $file" >&2
+        return 1
+      }
+      setfacl -b "$file"
+      ;;
+    Darwin) chmod -N "$file" ;;
+    *) echo "cannot safely clear ACLs on $file for this operating system" >&2; return 1 ;;
+  esac
+}
+
 # 旧服务器的 .env 早于 APP_ENV_GID：release rsync 会刻意保留配置，也不会重跑
 # gen-env.sh。必须在第一次 Compose 解析前原地补齐，否则升级永远卡在变量插值。
 # 只接受部署用户自己的主组，确保它既能安全 chgrp，又不会被配置注入额外宿主机组。
@@ -161,6 +176,7 @@ prepare_app_env_access() {
   resolved_app_env_gid="$configured_gid"
   if [ -f "$APP_ENV_FILE" ]; then
     chgrp "$resolved_app_env_gid" "$APP_ENV_FILE"
+    clear_app_env_acl "$APP_ENV_FILE"
     chmod 640 "$APP_ENV_FILE"
   fi
 }
@@ -657,6 +673,7 @@ if [ -f "$APP_ENV_FILE" ]; then
   # APP_ENV_GID 的非 root 容器用户可以读取 bind mount。
   if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
     chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" &&
+    clear_app_env_acl "$APP_ENV_FILE" &&
     chmod 640 "$APP_ENV_FILE"; then
     :
   else

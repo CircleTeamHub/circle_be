@@ -488,6 +488,31 @@ GETENT
   [ ! -s "$TEST_COMMAND_LOG" ] || return 1
 }
 
+test_release_strips_named_acl_before_enabling_group_read() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  command -v setfacl >/dev/null || return 0
+  command -v getfacl >/dev/null || return 0
+  getent passwd nobody >/dev/null || return 0
+
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  setfacl -m u:nobody:r "$APP_ENV_FILE"
+  export APP_ENV_FILE
+
+  run_release || return 1
+
+  ! getfacl -cp "$APP_ENV_FILE" | grep -q '^user:nobody:' || {
+    echo "expected named ACL entries to be removed before mode 0640" >&2
+    return 1
+  }
+  assert_mode "$APP_ENV_FILE" 640
+}
+
 test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
   # 同一条 P1 的失败路径:mv 挂掉(磁盘写满/权限)时,旧写法把一份 0644 的
   # 密钥副本永久留在部署目录里 —— 而打标签失败只是一条警告、发布照常继续,
@@ -755,6 +780,7 @@ for test_name in \
   test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
   test_release_reapplies_gid_after_replace_with_different_effective_group \
   test_release_rejects_a_group_shared_with_another_account \
+  test_release_strips_named_acl_before_enabling_group_read \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \

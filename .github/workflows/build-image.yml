@@ -1,9 +1,9 @@
 # Build-once half of the build-once-promote release architecture.
 #
 # Every push to main builds the production image for the configured server
-# platform, scans that exact image, and only then pushes `sha-<commit>` (immutable)
-# plus a `main` convenience tag. A release (release.yml) then *promotes* it by
-# stamping it with the version tag — no rebuild — which guarantees the deployed
+# platform, scans that exact image, and only then pushes `sha-<commit>-<arch>`
+# (immutable) plus a `main-<arch>` convenience tag. A release (release.yml) then
+# *promotes* it by stamping `v<tag>-<arch>` — no rebuild — which guarantees the deployed
 # artifact is byte-identical to the platform image scanned here and keeps releases
 # down to minutes.
 #
@@ -57,6 +57,7 @@ jobs:
           # GHCR requires a lowercase repository path.
           echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "platform=$RELEASE_PLATFORM" >> "$GITHUB_OUTPUT"
+          echo "arch=${RELEASE_PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -82,8 +83,8 @@ jobs:
           push: false
           load: true
           tags: |
-            ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
-            ${{ steps.meta.outputs.repo }}:main
+            ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
+            ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -96,7 +97,7 @@ jobs:
       - name: Scan releasable image
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          image-ref: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+          image-ref: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
           scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
@@ -105,8 +106,8 @@ jobs:
 
       - name: Push scanned image tags
         env:
-          SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
-          MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main
+          SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
+          MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
         run: |
           set -euo pipefail
           docker push "$SHA_IMAGE"
