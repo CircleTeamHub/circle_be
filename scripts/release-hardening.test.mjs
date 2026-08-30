@@ -368,6 +368,71 @@ test('platform changes cannot overwrite commit or version image tags', () => {
   assert.notEqual(refs[0].version, refs[1].version);
 });
 
+test('manual dispatch accepts only platform-compatible legacy image tags', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-legacy-release-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const sha = 'a'.repeat(40);
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+format="$6"
+case "$ref" in
+  *:v1.2.3|*:sha-${sha}) ;;
+  *) exit 1 ;;
+esac
+case "$format" in
+  *Image*) printf '{"os":"linux","architecture":"%s"}\n' "\${LEGACY_ARCH:-arm64}" ;;
+  *) printf '{"digest":"sha256:%064d"}\n' 7 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (legacyArch, outputName) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'workflow_dispatch',
+        SHA: sha,
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: 'linux/arm64',
+        LEGACY_ARCH: legacyArch,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, outputName),
+      },
+    });
+
+  const compatible = run('arm64', 'compatible-output');
+  assert.equal(compatible.status, 0, compatible.stderr);
+  const outputs = readFileSync(join(directory, 'compatible-output'), 'utf8');
+  assert.match(outputs, /release_image=.*:v1\.2\.3$/m);
+  assert.match(outputs, /needs_promotion=false/);
+
+  const incompatible = run('amd64', 'incompatible-output');
+  assert.notEqual(incompatible.status, 0);
+  assert.match(incompatible.stderr, /is linux\/amd64, expected linux\/arm64/);
+});
+
 test('workflow stages and activates only through the restricted release protocol', () => {
   const release = read('.github/workflows/release.yml');
   // v2:归档走 stdin,身份与参数走一份离线签名的 manifest（见下面的签名断言）。

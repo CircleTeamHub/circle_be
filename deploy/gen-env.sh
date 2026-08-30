@@ -59,14 +59,18 @@ validate_private_gid() {
 }
 
 clear_file_acl() {
-  local file="$1"
+  local file="$1" mode
   case "$(uname -s)" in
     Linux)
-      command -v setfacl >/dev/null || {
-        echo "❌ 缺少 setfacl；请先安装 acl 包，才能安全设置生产配置权限。" >&2
-        return 1
-      }
-      setfacl -b "$file"
+      if command -v setfacl >/dev/null; then
+        setfacl -b "$file"
+      else
+        mode="$(LC_ALL=C ls -ld -- "$file" | awk '{ print $1 }')"
+        case "$mode" in
+          *+) echo "❌ $file 含扩展 ACL；请先安装 acl 包再继续。" >&2; return 1 ;;
+          *) ;;
+        esac
+      fi
       ;;
     Darwin) chmod -N "$file" ;;
     *) echo "❌ 不支持在当前系统安全清除生产配置 ACL。" >&2; return 1 ;;

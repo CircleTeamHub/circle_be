@@ -140,17 +140,29 @@ validate_private_app_env_gid() {
 }
 
 clear_app_env_acl() {
-  local file="$1"
+  local file="$1" mode setfacl_command="${SETFACL_COMMAND:-setfacl}"
   case "$(uname -s)" in
     Linux)
-      command -v setfacl >/dev/null || {
-        echo "setfacl is required to remove inherited ACLs from $file" >&2
-        return 1
-      }
-      setfacl -b "$file"
+      if command -v "$setfacl_command" >/dev/null; then
+        "$setfacl_command" -b "$file"
+      else
+        mode="$(LC_ALL=C ls -ld -- "$file" | awk '{ print $1 }')"
+        case "$mode" in
+          *+) echo "$file has an extended ACL; install the acl package before release" >&2; return 1 ;;
+          *) ;;
+        esac
+      fi
       ;;
     Darwin) chmod -N "$file" ;;
     *) echo "cannot safely clear ACLs on $file for this operating system" >&2; return 1 ;;
+  esac
+}
+
+can_rewrite_app_env_acl_safely() {
+  case "$(uname -s)" in
+    Linux) command -v "${SETFACL_COMMAND:-setfacl}" >/dev/null ;;
+    Darwin) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -671,7 +683,9 @@ if [ -f "$APP_ENV_FILE" ]; then
   echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
   # 临时文件在 rename 前始终是 0600；rename 后改为 0640，让只加入
   # APP_ENV_GID 的非 root 容器用户可以读取 bind mount。
-  if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
+  if ! can_rewrite_app_env_acl_safely; then
+    echo "WARNING: setfacl is unavailable; preserving $APP_ENV_FILE and skipping SENTRY_RELEASE stamp." >&2
+  elif set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
     chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" &&
     clear_app_env_acl "$APP_ENV_FILE" &&
     chmod 640 "$APP_ENV_FILE"; then

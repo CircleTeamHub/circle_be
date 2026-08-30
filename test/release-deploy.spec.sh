@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE SETFACL_COMMAND ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -513,6 +513,24 @@ test_release_strips_named_acl_before_enabling_group_read() {
   assert_mode "$APP_ENV_FILE" 640
 }
 
+test_legacy_host_without_setfacl_still_releases_without_acl() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  SETFACL_COMMAND=missing-setfacl-for-release-test
+  export APP_ENV_FILE SETFACL_COMMAND
+
+  run_release || return 1
+
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+  grep -q 'setfacl is unavailable.*skipping SENTRY_RELEASE stamp' "$CASE_DIR/release.log"
+}
+
 test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
   # 同一条 P1 的失败路径:mv 挂掉(磁盘写满/权限)时,旧写法把一份 0644 的
   # 密钥副本永久留在部署目录里 —— 而打标签失败只是一条警告、发布照常继续,
@@ -781,6 +799,7 @@ for test_name in \
   test_release_reapplies_gid_after_replace_with_different_effective_group \
   test_release_rejects_a_group_shared_with_another_account \
   test_release_strips_named_acl_before_enabling_group_read \
+  test_legacy_host_without_setfacl_still_releases_without_acl \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \

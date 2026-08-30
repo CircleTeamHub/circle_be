@@ -197,11 +197,30 @@ jobs:
           arch="${RELEASE_PLATFORM#linux/}"
           sha_image="$repo:sha-$SHA-$arch"
           release_image="$repo:$RELEASE_TAG-$arch"
+          legacy_sha_image="$repo:sha-$SHA"
+          legacy_release_image="$repo:$RELEASE_TAG"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
           digest_of() {
             docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
               jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+          }
+
+          platform_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
+              jq -er '"\(.os)/\(.architecture)"'
+          }
+
+          require_release_platform() {
+            local image="$1" actual
+            actual="$(platform_of "$image")" || {
+              echo "Could not determine platform for legacy image $image." >&2
+              return 1
+            }
+            if [ "$actual" != "$RELEASE_PLATFORM" ]; then
+              echo "Legacy image $image is $actual, expected $RELEASE_PLATFORM." >&2
+              return 1
+            fi
           }
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -212,11 +231,27 @@ jobs:
               fi
               needs_promotion=false
             else
-              if ! digest="$(digest_of "$sha_image")"; then
-                echo "Neither release image $release_image nor prebuilt commit image $sha_image exists." >&2
+              if digest="$(digest_of "$sha_image" 2>/dev/null)"; then
+                needs_promotion=true
+              elif digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_release_image"
+                if legacy_sha_digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                  require_release_platform "$legacy_sha_image"
+                  if [ "$legacy_sha_digest" != "$digest" ]; then
+                    echo "Refusing mismatched legacy release image: $legacy_release_image ($digest != $legacy_sha_digest)." >&2
+                    exit 1
+                  fi
+                fi
+                release_image="$legacy_release_image"
+                needs_promotion=false
+              elif digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_sha_image"
+                sha_image="$legacy_sha_image"
+                needs_promotion=true
+              else
+                echo "No platform-specific or compatible legacy image exists for $RELEASE_TAG ($SHA)." >&2
                 exit 1
               fi
-              needs_promotion=true
             fi
           else
             if ! digest="$(digest_of "$sha_image")"; then
