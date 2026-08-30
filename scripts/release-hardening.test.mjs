@@ -92,9 +92,14 @@ test('non-root app can read the group-protected production env file', () => {
     preflight,
     /validate_private_app_env_gid "\$deploy_user" "\$configured_gid"/,
   );
-  assert.match(release, /chgrp "\$resolved_app_env_gid" "\$APP_ENV_FILE"/);
-  assert.match(release, /clear_app_env_acl "\$APP_ENV_FILE"/);
-  assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
+  assert.match(
+    release,
+    /: > "\$app_env_staged_file"[\s\S]*clear_app_env_acl "\$app_env_staged_file"[\s\S]*cat "\$legacy_app_env_backup" > "\$app_env_staged_file"[\s\S]*chgrp "\$resolved_app_env_gid" "\$app_env_staged_file"[\s\S]*chmod 640 "\$app_env_staged_file"[\s\S]*mv "\$app_env_staged_file" "\$APP_ENV_FILE"/,
+  );
+  assert.match(
+    release,
+    /awk -v key=[\s\S]*chgrp "\$gid" "\$tmp"[\s\S]*clear_app_env_acl "\$tmp"[\s\S]*chmod 640 "\$tmp"[\s\S]*mv "\$tmp" "\$file"/,
+  );
 });
 
 test('Caddy switches only between unique blue-green container endpoints', () => {

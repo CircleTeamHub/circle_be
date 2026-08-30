@@ -229,11 +229,17 @@ stage_app_env_for_new_container() {
     clear_app_env_transaction_state
     return 1
   fi
-  if ! (umask 077 && cp "$legacy_app_env_backup" "$app_env_staged_file") ||
-    ! mv "$app_env_staged_file" "$APP_ENV_FILE" ||
-    ! chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" ||
-    ! clear_app_env_acl "$APP_ENV_FILE" ||
-    ! chmod 640 "$APP_ENV_FILE"; then
+  # A directory default ACL is applied when the inode is created, regardless
+  # of umask. Clear it while the file is empty; after copying, prepare every
+  # final access bit on the temporary inode before replacing the live path.
+  if ! (umask 077 && : > "$app_env_staged_file") ||
+    ! clear_app_env_acl "$app_env_staged_file" ||
+    ! chmod 600 "$app_env_staged_file" ||
+    ! cat "$legacy_app_env_backup" > "$app_env_staged_file" ||
+    ! chgrp "$resolved_app_env_gid" "$app_env_staged_file" ||
+    ! clear_app_env_acl "$app_env_staged_file" ||
+    ! chmod 640 "$app_env_staged_file" ||
+    ! mv "$app_env_staged_file" "$APP_ENV_FILE"; then
     rm -f "$app_env_staged_file" "$APP_ENV_FILE"
     app_env_staged_file=""
     if mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
@@ -779,7 +785,7 @@ fi
 # 注意:发布失败回滚后,旧色若因任何原因重启,会读到这个新的 release 值而跑着
 # 旧代码。这只影响归因准确性,不影响功能;真正回滚时应重跑对应版本的发布。
 set_release_env_value() {
-  local file="$1" key="$2" value="$3"
+  local file="$1" key="$2" value="$3" gid="$4"
   local tmp="${file}.tmp"
   # 临时文件装的是**整份生产密钥**(awk 把 $file 原样抄一遍)。直接
   # `awk ... > "$tmp"` 会用部署机常见的 umask 022 建出 0644,于是从写入到
@@ -788,11 +794,12 @@ set_release_env_value() {
   #
   # 先删再建:残留的旧 .env.production.tmp(上一次发布被 Ctrl-C 掐断等)会让
   # `>` 只做截断、保留它原来的宽松权限,umask 对已存在的文件不起作用。
-  # mv 是同目录 rename,0600 跟着 inode 一起到目标,所以目标文件也不存在
-  # 「先 0644 再 chmod」的窗口。rename 完成后才改成 0640；容器通过 .env
-  # 里的 APP_ENV_GID 补充组读取，宿主机其他用户仍然无权访问。
+  # 默认 ACL 不受 umask 限制，所以必须趁文件为空时清掉。组和最终权限也都在
+  # rename 前设置；任何权限命令失败都只删除临时文件，正式配置仍是可读的 0640。
   rm -f "$tmp" || return 1
   (umask 077 && : > "$tmp") || return 1
+  clear_app_env_acl "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
   awk -v key="$key" -v value="$value" '
     BEGIN { prefix = key "="; replaced = 0 }
     index($0, prefix) == 1 {
@@ -803,6 +810,9 @@ set_release_env_value() {
     { print }
     END { if (!replaced) print prefix value }
   ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chgrp "$gid" "$tmp" || { rm -f "$tmp"; return 1; }
+  clear_app_env_acl "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
   # 任何一步失败都必须把临时文件带走,否则密钥副本会一直躺在部署目录里 ——
   # 打标签失败只是警告、发布照常继续,不会有人回头来收拾它。
   mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
@@ -817,14 +827,13 @@ set_release_env_value() {
 # 写不进去而一直下线。一个 release 标签不值得拿可用性去换。
 if [ -f "$APP_ENV_FILE" ]; then
   echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
-  # 临时文件在 rename 前始终是 0600；rename 后改为 0640，让只加入
-  # APP_ENV_GID 的非 root 容器用户可以读取 bind mount。
+  # 临时文件在写入期间是 0600；原子替换前改为 0640，让只加入
+  # APP_ENV_GID 的非 root 容器用户读取 bind mount。正式文件替换后不再
+  # 执行可能失败的权限修改。
   if ! can_rewrite_app_env_acl_safely; then
     echo "WARNING: setfacl is unavailable; preserving $APP_ENV_FILE and skipping SENTRY_RELEASE stamp." >&2
-  elif set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
-    chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" &&
-    clear_app_env_acl "$APP_ENV_FILE" &&
-    chmod 640 "$APP_ENV_FILE"; then
+  elif set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" \
+    "$resolved_app_env_gid"; then
     :
   else
     echo "WARNING: could not stamp SENTRY_RELEASE into $APP_ENV_FILE; continuing." >&2

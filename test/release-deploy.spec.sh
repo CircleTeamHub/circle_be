@@ -9,6 +9,10 @@ DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
 REPO_SCHEMA_COMPATIBILITY="$(cat "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY")"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REAL_MV="$(command -v mv)"
+REAL_CAT="$(command -v cat)"
+REAL_CHGRP="$(command -v chgrp)"
+REAL_CHMOD="$(command -v chmod)"
+REAL_SETFACL="$(command -v setfacl || true)"
 
 last_arg() {
   local value=""
@@ -17,7 +21,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID SETFACL_COMMAND ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT LEGACY_LIVE_NO_APP_ENV_GROUP INTERRUPT_AFTER_ENV_STAGE KILL_AFTER_ENV_STAGE || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID SETFACL_COMMAND ENV_STAMP_FAIL ENV_PERMISSION_FAIL PROBE_STAGE_DEFAULT_ACL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT LEGACY_LIVE_NO_APP_ENV_GROUP INTERRUPT_AFTER_ENV_STAGE KILL_AFTER_ENV_STAGE || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -227,11 +231,60 @@ fi
 exec "$REAL_MV" "$@"
 MV
   chmod +x "$CASE_DIR/bin/mv"
+  cat > "$CASE_DIR/bin/cat" <<'CAT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${PROBE_STAGE_DEFAULT_ACL:-0}" = "1" ] && [ "$#" = "1" ] &&
+  [ "$1" = "${APP_ENV_FILE}.legacy-rollback" ]; then
+  getfacl -cp "${APP_ENV_FILE}.access.tmp" > "$CASE_DIR/staged-env-acl-before-copy"
+fi
+exec "$REAL_CAT" "$@"
+CAT
+  cat > "$CASE_DIR/bin/chgrp" <<'CHGRP'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${ENV_PERMISSION_FAIL:-}" = "chgrp" ] &&
+  [ "${@: -1}" = "${APP_ENV_FILE}.tmp" ]; then
+  exit 49
+fi
+exec "$REAL_CHGRP" "$@"
+CHGRP
+  cat > "$CASE_DIR/bin/chmod" <<'CHMOD'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${ENV_PERMISSION_FAIL:-}" = "chmod" ] && [ "${1:-}" = "640" ] &&
+  [ "${@: -1}" = "${APP_ENV_FILE}.tmp" ]; then
+  exit 50
+fi
+exec "$REAL_CHMOD" "$@"
+CHMOD
+  cat > "$CASE_DIR/bin/setfacl" <<'SETFACL'
+#!/usr/bin/env bash
+set -euo pipefail
+target="${@: -1}"
+if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ] &&
+  [ "$target" = "${APP_ENV_FILE}.tmp" ]; then
+  count_file="$CASE_DIR/sentry-tmp-setfacl-count"
+  count=$(($(cat "$count_file" 2>/dev/null || echo 0) + 1))
+  printf '%s\n' "$count" > "$count_file"
+  [ "$count" -lt 2 ] || exit 51
+fi
+if [ -n "$REAL_SETFACL" ]; then
+  exec "$REAL_SETFACL" "$@"
+fi
+exit 0
+SETFACL
+  chmod +x "$CASE_DIR/bin/cat" "$CASE_DIR/bin/chgrp" "$CASE_DIR/bin/chmod" \
+    "$CASE_DIR/bin/setfacl"
 }
 
 run_release() {
   PATH="$CASE_DIR/bin:$PATH" \
     REAL_MV="$REAL_MV" \
+    REAL_CAT="$REAL_CAT" \
+    REAL_CHGRP="$REAL_CHGRP" \
+    REAL_CHMOD="$REAL_CHMOD" \
+    REAL_SETFACL="$REAL_SETFACL" \
     RELEASE_TAG=v1.2.3 \
     RELEASE_LAUNCHER_ACTIVE=1 \
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
@@ -255,6 +308,8 @@ run_release() {
     COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
+    ENV_PERMISSION_FAIL="${ENV_PERMISSION_FAIL:-}" \
+    PROBE_STAGE_DEFAULT_ACL="${PROBE_STAGE_DEFAULT_ACL:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -523,12 +578,12 @@ test_release_backfills_env_gid_before_first_compose_call() {
   grep -q '^==> Added APP_ENV_GID=' "$CASE_DIR/release.log" || return 1
 }
 
-test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
+test_release_atomically_installs_private_group_read_access() {
   # review #150(P1):打标签是「读 .env.production → 写临时文件 → mv 回去」,
   # 临时文件因此装着整份生产密钥。默认 umask 022 下它会落成 0644,在 mv 之前
   # 的这段窗口里同机任何用户都读得到 —— 而目标文件本身是 0600,等于绕过了它
-  # 的权限。这里断言的是 mv **之前**那一刻的模式(由 mv 桩记录),不是事后
-  # chmod 的结果:事后 chmod 补不上已经发生的泄露。
+  # 的权限。这里断言的是 mv **之前**那一刻的模式(由 mv 桩记录):最终 0640
+  # 必须先在临时 inode 上就绪，rename 后不再执行可能失败的权限修改。
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
   printf 'running\n' > "$TEST_STATE_DIR/caddy"
@@ -540,8 +595,8 @@ test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
 
   run_release || return 1
 
-  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "600" ] || {
-    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 600" >&2
+  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "640" ] || {
+    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 640" >&2
     return 1
   }
   assert_mode "$APP_ENV_FILE" 640 || return 1
@@ -631,6 +686,35 @@ test_release_strips_named_acl_before_enabling_group_read() {
   assert_mode "$APP_ENV_FILE" 640
 }
 
+test_release_clears_default_acl_before_copying_staged_secrets() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  command -v setfacl >/dev/null || return 0
+  command -v getfacl >/dev/null || return 0
+  getent passwd nobody >/dev/null || return 0
+
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'DATABASE_URL=postgres://u:p@h/db\nJWT_SECRET=default-acl-secret\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  # New files in this directory inherit read access for nobody. The cat stub
+  # snapshots the staged file immediately before the first secret byte is read.
+  setfacl -m d:u:nobody:r "$CASE_DIR"
+  export APP_ENV_FILE
+  PROBE_STAGE_DEFAULT_ACL=1
+
+  run_release || return 1
+
+  [ -s "$CASE_DIR/staged-env-acl-before-copy" ] || return 1
+  ! grep -q '^user:nobody:' "$CASE_DIR/staged-env-acl-before-copy" || {
+    echo "staged secrets file retained a default named-user ACL before copying" >&2
+    cat "$CASE_DIR/staged-env-acl-before-copy" >&2
+    return 1
+  }
+}
+
 test_legacy_host_without_setfacl_still_releases_without_acl() {
   [ "$(uname -s)" = "Linux" ] || return 0
   new_case
@@ -675,6 +759,33 @@ test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
     echo "expected the original env file to survive a failed stamp untouched" >&2
     return 1
   }
+}
+
+test_irreversible_sentry_permission_failures_preserve_the_live_env() {
+  local operation operations="chgrp chmod"
+  if [ "$(uname -s)" = "Linux" ]; then
+    operations="chgrp setfacl chmod"
+  fi
+
+  for operation in $operations; do
+    prepare_irreversible_case
+    APP_ENV_FILE="$CASE_DIR/.env.production"
+    printf 'NODE_ENV=production\nSENTRY_RELEASE=circle-be@v0.0.1\n' > "$APP_ENV_FILE"
+    chmod 600 "$APP_ENV_FILE"
+    export APP_ENV_FILE
+    ENV_PERMISSION_FAIL="$operation"
+
+    run_release || return 1
+
+    assert_running circle_be_green || return 1
+    assert_mode "$APP_ENV_FILE" 640 || return 1
+    grep -q '^SENTRY_RELEASE=circle-be@v0\.0\.1$' "$APP_ENV_FILE" || {
+      echo "$operation failure replaced the live env with a partial Sentry stamp" >&2
+      return 1
+    }
+    [ ! -e "${APP_ENV_FILE}.tmp" ] || return 1
+    grep -q 'could not stamp SENTRY_RELEASE' "$CASE_DIR/release.log" || return 1
+  done
 }
 
 test_release_survives_a_failed_sentry_stamp_in_downtime_mode() {
@@ -900,7 +1011,7 @@ test_irreversible_smoke_failure_stays_in_maintenance() {
 }
 
 if [ "${RELEASE_EFFECTIVE_GID_CASE_ONLY:-0}" = "1" ]; then
-  test_release_only_grants_the_deploy_group_read_access_after_atomic_replace
+  test_release_atomically_installs_private_group_read_access
   exit
 fi
 
@@ -916,12 +1027,14 @@ for test_name in \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
   test_release_backfills_env_gid_before_first_compose_call \
-  test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
+  test_release_atomically_installs_private_group_read_access \
   test_release_reapplies_gid_after_replace_with_different_effective_group \
   test_release_rejects_a_group_shared_with_another_account \
   test_release_strips_named_acl_before_enabling_group_read \
+  test_release_clears_default_acl_before_copying_staged_secrets \
   test_legacy_host_without_setfacl_still_releases_without_acl \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
+  test_irreversible_sentry_permission_failures_preserve_the_live_env \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \
   test_smoke_failure_restores_proxy_before_removing_standby \
