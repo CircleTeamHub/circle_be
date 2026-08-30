@@ -1,6 +1,5 @@
 import { Module } from '@nestjs/common';
 import { AdminUserModule } from 'src/admin-user/admin-user.module';
-import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
 import { ChatModule } from 'src/chat/chat.module';
 import { CoinModule } from 'src/coin/coin.module';
 import { MembershipModule } from 'src/membership/membership.module';
@@ -12,7 +11,6 @@ import { SupportRechargeService } from './support-recharge.service';
 @Module({
   imports: [
     AdminUserModule,
-    AvatarFrameModule,
     ChatModule,
     CoinModule,
     MembershipModule,
