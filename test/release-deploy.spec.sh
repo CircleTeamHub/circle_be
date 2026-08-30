@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE SETFACL_COMMAND ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE SETFACL_COMMAND ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT LEGACY_LIVE_NO_APP_ENV_GROUP || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -64,6 +64,15 @@ if [ "${1:-}" = "compose" ]; then
       ;;
     start)
       service="$(last_arg "$@")"
+      if [ "${LEGACY_LIVE_NO_APP_ENV_GROUP:-0}" = "1" ] &&
+        [ "$service" = "circle_be" ]; then
+        mode="$(stat -c '%a' "$APP_ENV_FILE" 2>/dev/null || stat -f '%Lp' "$APP_ENV_FILE")"
+        other_digit="${mode#${mode%?}}"
+        if (( (10#$other_digit & 4) == 0 )); then
+          echo "legacy live container cannot read $APP_ENV_FILE at mode $mode" >&2
+          exit 48
+        fi
+      fi
       printf 'running\n' > "$(service_file "$service")"
       ;;
     up)
@@ -195,10 +204,13 @@ esac
 # 可能挂)。脚本开头是 set -e,所以这一步必须是 best-effort,否则会在迁移之后
 # 直接退出 —— 停机模式下旧色已经停了,API 就那样一直下线。
 if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
-  # mv 桩是独立脚本,没有外层的 last_arg helper,直接取最后一个参数。
-  case "${@: -1}" in
-    *.env.production) exit 47 ;;
-  esac
+  # 只模拟 Sentry 打标的 `.tmp -> .env.production` 失败；发布现在会先把一份
+  # 受限副本 `.access.tmp.* -> .env.production` 给新容器使用，那一步不是
+  # 可观测性打标，失败必须中止发布，不能被这个故障注入误伤。
+  if [ "${@: -2:1}" = "${APP_ENV_FILE}.tmp" ] &&
+    [ "${@: -1}" = "$APP_ENV_FILE" ]; then
+    exit 47
+  fi
 fi
 exec "$REAL_MV" "$@"
 MV
@@ -225,6 +237,7 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    LEGACY_LIVE_NO_APP_ENV_GROUP="${LEGACY_LIVE_NO_APP_ENV_GROUP:-0}" \
     COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
@@ -304,9 +317,38 @@ test_migration_failure_restores_downtime_live_color() {
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
   printf 'running\n' > "$TEST_STATE_DIR/caddy"
   printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
-  RELEASE_DOWNTIME=1 MIGRATE_FAIL=1
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\nLEGACY_ONLY=readable-before-group-add\n' > "$APP_ENV_FILE"
+  # 老容器没有 APP_ENV_GID 补充组，只能沿用历史上的 world-readable 文件。
+  # 新发布会收紧成 0640；失败回滚时必须先恢复 0644，否则旧容器起不来。
+  chmod 644 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  RELEASE_DOWNTIME=1 MIGRATE_FAIL=1 LEGACY_LIVE_NO_APP_ENV_GROUP=1
   ! run_release || return 1
-  assert_running circle_be
+  assert_running circle_be &&
+    assert_mode "$APP_ENV_FILE" 644 &&
+    grep -q '^LEGACY_ONLY=readable-before-group-add$' "$APP_ENV_FILE" &&
+    assert_command_before 'stop circle_be' 'start circle_be'
+}
+
+test_startup_failure_restores_legacy_app_env_before_restarting_live_color() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\nLEGACY_ONLY=readable-before-group-add\n' > "$APP_ENV_FILE"
+  chmod 644 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  RELEASE_DOWNTIME=1 START_FAIL=1 LEGACY_LIVE_NO_APP_ENV_GROUP=1
+
+  ! run_release || return 1
+
+  assert_running circle_be &&
+    assert_mode "$APP_ENV_FILE" 644 &&
+    grep -q '^LEGACY_ONLY=readable-before-group-add$' "$APP_ENV_FILE" &&
+    grep -q 'Restored legacy app env access' "$CASE_DIR/release.log" &&
+    [ -z "$(find "$CASE_DIR" -name '.env.production.legacy-rollback.*' -print -quit)" ]
 }
 
 test_interrupted_rollout_preserves_recorded_live_color() {
@@ -437,6 +479,10 @@ test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
   }
   [ ! -e "${APP_ENV_FILE}.tmp" ] || {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
+    return 1
+  }
+  [ -z "$(find "$CASE_DIR" -name '.env.production.legacy-rollback.*' -print -quit)" ] || {
+    echo "successful release left a legacy secrets backup behind" >&2
     return 1
   }
 }
@@ -789,6 +835,7 @@ fi
 failures=0
 for test_name in \
   test_migration_failure_restores_downtime_live_color \
+  test_startup_failure_restores_legacy_app_env_before_restarting_live_color \
   test_interrupted_rollout_preserves_recorded_live_color \
   test_missing_caddy_rate_limit_module_aborts_before_touching_colors \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \

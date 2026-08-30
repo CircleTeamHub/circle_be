@@ -106,6 +106,7 @@ fi
 COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
 APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 resolved_app_env_gid=""
+legacy_app_env_backup=""
 
 validate_private_app_env_gid() {
   local deploy_user="$1" gid="$2" group_record members other_primary_users
@@ -167,8 +168,10 @@ can_rewrite_app_env_acl_safely() {
 }
 
 # 旧服务器的 .env 早于 APP_ENV_GID：release rsync 会刻意保留配置，也不会重跑
-# gen-env.sh。必须在第一次 Compose 解析前原地补齐，否则升级永远卡在变量插值。
-# 只接受部署用户自己的主组，确保它既能安全 chgrp，又不会被配置注入额外宿主机组。
+# gen-env.sh。必须在第一次 Compose 解析前补齐，否则升级永远卡在变量插值。
+# 这里只校验组，不提前修改 .env.production：旧容器可能创建于 group_add 加入之前，
+# 停机迁移失败后 compose start 仍会启动那个旧容器；若此时文件已变成 0640 + 新组，
+# 它会因无补充组而读不到配置，形成“回滚成功但服务仍起不来”。
 prepare_app_env_access() {
   local deploy_user expected_gid configured_gid
   [ -f "$COMPOSE_ENV_FILE" ] || {
@@ -186,11 +189,59 @@ prepare_app_env_access() {
   fi
   validate_private_app_env_gid "$deploy_user" "$configured_gid" || return 1
   resolved_app_env_gid="$configured_gid"
-  if [ -f "$APP_ENV_FILE" ]; then
-    chgrp "$resolved_app_env_gid" "$APP_ENV_FILE"
-    clear_app_env_acl "$APP_ENV_FILE"
-    chmod 640 "$APP_ENV_FILE"
+}
+
+# 迁移成功后才为新容器准备 0640 + APP_ENV_GID 的副本。原 inode 连同其 owner、
+# group、mode、ACL 都保留在同目录；可逆失败时直接 rename 回来，不需要猜测老容器
+# 原先靠哪一组/ACL 读取，也不要求部署账号有权把文件 chgrp 回旧组。
+stage_app_env_for_new_container() {
+  local staged_file
+  [ -f "$APP_ENV_FILE" ] || return 0
+  legacy_app_env_backup="${APP_ENV_FILE}.legacy-rollback.$$"
+  staged_file="${APP_ENV_FILE}.access.tmp.$$"
+  [ ! -e "$legacy_app_env_backup" ] && [ ! -e "$staged_file" ] || {
+    echo "App env staging path already exists; refusing to overwrite it" >&2
+    return 1
+  }
+
+  mv "$APP_ENV_FILE" "$legacy_app_env_backup" || return 1
+  if ! (umask 077 && cp "$legacy_app_env_backup" "$staged_file") ||
+    ! mv "$staged_file" "$APP_ENV_FILE" ||
+    ! chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" ||
+    ! clear_app_env_acl "$APP_ENV_FILE" ||
+    ! chmod 640 "$APP_ENV_FILE"; then
+    rm -f "$staged_file" "$APP_ENV_FILE"
+    if mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
+      legacy_app_env_backup=""
+    else
+      echo "CRITICAL: original app env remains at $legacy_app_env_backup" >&2
+    fi
+    return 1
   fi
+}
+
+restore_legacy_app_env_access() {
+  local failed_release_file
+  [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ] || return 0
+  failed_release_file="${APP_ENV_FILE}.failed-release.$$"
+  rm -f "$failed_release_file"
+  if [ -e "$APP_ENV_FILE" ]; then
+    mv "$APP_ENV_FILE" "$failed_release_file" || return 1
+  fi
+  if ! mv "$legacy_app_env_backup" "$APP_ENV_FILE"; then
+    [ ! -e "$APP_ENV_FILE" ] && [ -e "$failed_release_file" ] &&
+      mv "$failed_release_file" "$APP_ENV_FILE" || true
+    return 1
+  fi
+  rm -f "$failed_release_file"
+  legacy_app_env_backup=""
+  echo "==> Restored legacy app env access for the previous container" >&2
+}
+
+discard_legacy_app_env_backup() {
+  [ -n "$legacy_app_env_backup" ] || return 0
+  rm -f "$legacy_app_env_backup"
+  legacy_app_env_backup=""
 }
 
 prepare_app_env_access
@@ -403,6 +454,10 @@ ensure_live() {
   if [ -z "$live" ]; then
     return 1
   fi
+  if ! restore_legacy_app_env_access; then
+    echo "CRITICAL: previous app env access could not be restored" >&2
+    return 1
+  fi
   if [ -z "$(running "$live")" ] && ! compose start "$live"; then
     echo "CRITICAL: previous version $live could not be restarted" >&2
     return 1
@@ -417,6 +472,11 @@ ensure_live() {
 # Reversible failures may restore it; irreversible failures call this only after
 # the database contract is positively proven unapplied.
 restore_live() {
+  if [ -n "$live" ]; then
+    restore_legacy_app_env_access || return 1
+  else
+    discard_legacy_app_env_backup || return 1
+  fi
   if [ "${RELEASE_DOWNTIME:-0}" != "1" ] || [ -z "$live" ]; then
     return 0
   fi
@@ -442,6 +502,8 @@ enter_irreversible_maintenance() {
   if [ -n "${live:-}" ] && [ -n "$(running "$live")" ]; then
     compose stop "$live" || true
   fi
+  # 旧二进制已明确不可回滚；不再保留可能沿用历史宽松权限的密钥副本。
+  discard_legacy_app_env_backup || true
 }
 
 probe_irreversible_contract_state() {
@@ -631,6 +693,12 @@ if ! compose run --rm migrate; then
 fi
 irreversible_migration_applied=1
 
+if ! stage_app_env_for_new_container; then
+  echo "Could not prepare app env access for the new container" >&2
+  handle_post_migration_failure
+  exit 1
+fi
+
 # ── 给这次发布盖上 Sentry release 标签 ─────────────────────────
 # 没有 release,Sentry 里就没法回答「这个 bug 是哪次发版引入的」,regression
 # 检测退化、release health 完全不可用 —— 而蓝绿发布恰恰是最需要按版本归因的
@@ -761,6 +829,7 @@ if smoke; then
     fi
     compose rm -f "$live"
   fi
+  discard_legacy_app_env_backup
   echo "==> Release $RELEASE_TAG deployed: $standby is live on $CIRCLE_BE_IMAGE"
 else
   echo "==> Smoke test failed; rolling back to previous version" >&2
