@@ -25,6 +25,39 @@ enum SupportAgentCategory {
   membership
 }
 
+enum SupportRechargeRequestKind {
+  GENERAL
+  AVATAR_FRAME
+  COIN
+  MEMBERSHIP
+}
+
+enum SupportRechargeOrderStatus {
+  AWAITING_PROOF
+  WAITING_REVIEW
+  PROCESSING
+  APPROVED
+  REJECTED
+}
+
+enum SupportRechargeJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SupportRechargeAutomationMode {
+  BOT
+  HUMAN
+}
+
+enum SupportRechargeFulfillmentType {
+  COIN
+  MEMBERSHIP
+  AVATAR_FRAME
+}
+
 enum RefreshTokenAudience {
   APP
   ADMIN
@@ -533,6 +566,80 @@ model SupportAgent {
   /// 同一类里不允许重复挂同一个人。
   @@unique([category, userID])
   @@index([category, enabled, sortOrder])
+}
+
+/// 管理台维护的收款码。objectKey 指向私有 chat/ 对象，消息读取时现签 URL；
+/// validFrom/validUntil 在发送瞬间校验，过期码不会因为客户端缓存而继续被自动回复。
+model SupportRechargePaymentCode {
+  id         String    @id @default(uuid())
+  label      String
+  objectKey  String    @unique
+  validFrom  DateTime
+  validUntil DateTime?
+  enabled    Boolean   @default(true)
+  createdBy  String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([enabled, validFrom, validUntil])
+}
+
+/// 每个充值客服会话的自动化状态。用户要求人工后切到 HUMAN，机器人不再继续插话。
+model SupportRechargeConversationState {
+  conversationID String                        @id
+  userID         String
+  agentUserID    String
+  mode           SupportRechargeAutomationMode @default(BOT)
+  lastWelcomeAt  DateTime?
+  createdAt      DateTime                      @default(now())
+  updatedAt      DateTime                      @updatedAt
+
+  @@index([userID, updatedAt])
+  @@index([agentUserID, updatedAt])
+}
+
+/// 用户的一次充值申请。付款截图只是 evidenceMessageID，不代表到账；管理员必须
+/// 提交唯一 paymentTransactionID 后才能进入 APPROVED。
+model SupportRechargeOrder {
+  id                   String                          @id @default(uuid())
+  orderNo              String                          @unique
+  conversationID       String
+  userID               String
+  agentUserID          String
+  sourceMessageID      String                          @unique
+  requestKind          SupportRechargeRequestKind
+  status               SupportRechargeOrderStatus      @default(AWAITING_PROOF)
+  evidenceMessageID    String?                         @unique
+  evidenceObjectKey    String?
+  submittedAt          DateTime?
+  fulfillmentType      SupportRechargeFulfillmentType?
+  fulfillmentPayload   Json?
+  paymentTransactionID String?                         @unique
+  reviewedBy           String?
+  reviewedAt           DateTime?
+  rejectionReason      String?
+  createdAt            DateTime                        @default(now())
+  updatedAt            DateTime                        @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userID, createdAt])
+  @@index([conversationID, status, createdAt])
+}
+
+/// ChatMessage 同事务写入的 durable inbox。网关会即时 kick；进程恰好崩溃时，
+/// 定时处理器仍能补发。sourceMessageID 唯一保证同一条用户消息只消费一次。
+model SupportRechargeJob {
+  id              String                   @id @default(uuid())
+  sourceMessageID String                   @unique
+  status          SupportRechargeJobStatus @default(PENDING)
+  attempts        Int                      @default(0)
+  nextAttemptAt   DateTime                 @default(now())
+  lockedAt        DateTime?
+  lastError       String?
+  createdAt       DateTime                 @default(now())
+  updatedAt       DateTime                 @updatedAt
+
+  @@index([status, nextAttemptAt, createdAt])
 }
 
 model MembershipBenefitGrant {

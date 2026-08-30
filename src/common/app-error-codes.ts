@@ -384,6 +384,12 @@ export const SupportErrorCode = {
   AgentUserInactive: 'SUPPORT_AGENT_USER_INACTIVE',
   AgentDuplicate: 'SUPPORT_AGENT_DUPLICATE',
   AgentsConflict: 'SUPPORT_AGENTS_CONFLICT',
+  RechargeOrderNotFound: 'SUPPORT_RECHARGE_ORDER_NOT_FOUND',
+  RechargeOrderStateConflict: 'SUPPORT_RECHARGE_ORDER_STATE_CONFLICT',
+  RechargeApprovalConflict: 'SUPPORT_RECHARGE_APPROVAL_CONFLICT',
+  RechargePaymentDuplicate: 'SUPPORT_RECHARGE_PAYMENT_DUPLICATE',
+  RechargePaymentCodeNotFound: 'SUPPORT_RECHARGE_PAYMENT_CODE_NOT_FOUND',
+  RechargePaymentCodeInvalid: 'SUPPORT_RECHARGE_PAYMENT_CODE_INVALID',
 } as const;
 
 // 用户资料:仅本人可改 / 仅本人可删 / 生日取值非法。

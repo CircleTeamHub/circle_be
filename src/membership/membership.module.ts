@@ -26,6 +26,6 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     MembershipProgramAdminController,
   ],
   providers: [MembershipService, MembershipAdminService],
-  exports: [MembershipService],
+  exports: [MembershipService, MembershipAdminService],
 })
 export class MembershipModule {}

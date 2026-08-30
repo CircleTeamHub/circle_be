@@ -67,6 +67,9 @@ describe('ChatGateway', () => {
     getOnlineUserIds: jest.fn().mockResolvedValue(null),
     isOnline: jest.fn().mockResolvedValue(null),
   };
+  const supportRecharge = {
+    processMessage: jest.fn().mockResolvedValue(undefined),
+  };
   const metrics: jest.Mocked<ChatMetrics> = {
     registry: {} as ChatMetrics['registry'],
     observeConnectionOpened: jest.fn(),
@@ -87,6 +90,7 @@ describe('ChatGateway', () => {
     redisService as never,
     configService as never,
     presence as never,
+    supportRecharge as never,
   );
   (gateway as any).metrics = metrics;
 

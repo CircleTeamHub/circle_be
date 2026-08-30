@@ -11,11 +11,13 @@ describe('ChatSystemMessageService', () => {
   };
   const broadcast = { emitMessage: jest.fn() };
   const push = { onMessageBroadcast: jest.fn().mockResolvedValue(undefined) };
+  const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
 
   const service = new ChatSystemMessageService(
     prisma as never,
     broadcast as never,
     push as never,
+    media as never,
   );
 
   beforeEach(() => {
@@ -34,6 +36,7 @@ describe('ChatSystemMessageService', () => {
     });
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+    media.attachMediaUrls.mockResolvedValue(undefined);
   });
 
   // 用户 swipe 隐藏了群之后,进/退群提示照常落库并计入未读,但会话本身不回到
