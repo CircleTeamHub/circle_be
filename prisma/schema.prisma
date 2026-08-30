@@ -27,7 +27,6 @@ enum SupportAgentCategory {
 
 enum SupportRechargeRequestKind {
   GENERAL
-  AVATAR_FRAME
   COIN
   MEMBERSHIP
 }
@@ -55,7 +54,6 @@ enum SupportRechargeAutomationMode {
 enum SupportRechargeFulfillmentType {
   COIN
   MEMBERSHIP
-  AVATAR_FRAME
 }
 
 enum RefreshTokenAudience {

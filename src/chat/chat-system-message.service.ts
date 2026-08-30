@@ -16,6 +16,11 @@ export interface ServerMessageInput {
   clientMessageId?: string;
   /** 是否走离线推送分流(默认 false:群留痕类不推)。 */
   push?: boolean;
+  /**
+   * 幂等重试时重新广播已落库的消息。仅用于“消息已提交、首次广播前失败”也必须
+   * 恢复投递的流程；客户端按 message id 去重。
+   */
+  rebroadcastOnReplay?: boolean;
 }
 
 /**
@@ -120,9 +125,9 @@ export class ChatSystemMessageService {
     // 服务端也会产 image（充值收款码）。数据库只存 object key，实时广播前必须
     // 和历史读取一样现签 URL，否则图片要等用户重进会话后才显示出来。
     await this.media.attachMediaUrls([dto]);
-    if (!reused) {
+    if (!reused || input.rebroadcastOnReplay) {
       this.broadcast.emitMessage(dto);
-      if (input.push) void this.chatPush.onMessageBroadcast(dto);
+      if (!reused && input.push) void this.chatPush.onMessageBroadcast(dto);
     }
     return dto;
   }

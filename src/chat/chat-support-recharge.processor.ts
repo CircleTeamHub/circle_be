@@ -221,6 +221,10 @@ export class ChatSupportRechargeProcessor {
       },
     });
 
+    // 人工接管后，任何后续内容都应留给真人客服。尤其不能把截图自动消费并替
+    // 客服标记已读，否则客服端会失去提醒。
+    if (state.mode === 'HUMAN' && message.type === 'image') return;
+
     if (message.type === 'image') {
       await this.acceptPaymentEvidence(message, agentUserID);
       await this.markHandledRead(message, agentUserID);
@@ -270,8 +274,8 @@ export class ChatSupportRechargeProcessor {
       return;
     }
 
-    await this.startRecharge(message, agentUserID, kind);
-    await this.markHandledRead(message, agentUserID);
+    const handled = await this.startRecharge(message, agentUserID, kind);
+    if (handled) await this.markHandledRead(message, agentUserID);
   }
 
   private async markHandledRead(
@@ -315,17 +319,17 @@ export class ChatSupportRechargeProcessor {
     message: IncomingMessage,
     agentUserID: string,
     requestKind: SupportRechargeRequestKind,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const now = new Date();
-    const codes = await this.prisma.supportRechargePaymentCode.findMany({
+    const code = await this.prisma.supportRechargePaymentCode.findFirst({
       where: {
         enabled: true,
         validFrom: { lte: now },
         OR: [{ validUntil: null }, { validUntil: { gt: now } }],
       },
-      orderBy: [{ validUntil: 'asc' }, { createdAt: 'asc' }],
+      orderBy: [{ validFrom: 'desc' }, { createdAt: 'desc' }],
     });
-    if (codes.length === 0) {
+    if (!code) {
       await this.messages.insertServerMessage(message.conversationID, {
         senderID: agentUserID,
         type: 'text',
@@ -335,7 +339,11 @@ export class ChatSupportRechargeProcessor {
         clientMessageId: `sr-unavailable-${message.id}`,
         push: true,
       });
-      return;
+      await this.prisma.supportRechargeConversationState.update({
+        where: { conversationID: message.conversationID },
+        data: { mode: 'HUMAN' },
+      });
+      return false;
     }
 
     const active = await this.prisma.supportRechargeOrder.findFirst({
@@ -346,7 +354,10 @@ export class ChatSupportRechargeProcessor {
       },
       orderBy: { createdAt: 'desc' },
     });
-    if (active?.status === 'AWAITING_PROOF') {
+    if (
+      active?.status === 'AWAITING_PROOF' &&
+      active.sourceMessageID !== message.id
+    ) {
       await this.messages.insertServerMessage(message.conversationID, {
         senderID: agentUserID,
         type: 'text',
@@ -356,7 +367,7 @@ export class ChatSupportRechargeProcessor {
         clientMessageId: `sr-awaiting-proof-${message.id}`,
         push: true,
       });
-      return;
+      return true;
     }
 
     const order =
@@ -375,40 +386,35 @@ export class ChatSupportRechargeProcessor {
         clientMessageId: `sr-pending-${message.id}`,
         push: true,
       });
-      return;
+      return true;
     }
 
-    const paymentMethods = codes
-      .map((code, index) =>
-        codes.length === 1 ? code.label : `${index + 1}. ${code.label}`,
-      )
-      .join('\n');
     await this.messages.insertServerMessage(message.conversationID, {
       senderID: agentUserID,
       type: 'text',
       content: {
-        text: `充值申请：${order.orderNo}\n付款方式：${paymentMethods}\n请使用下方收款码付款，勿使用历史二维码。付款后发送转账截图（保留金额、时间和交易编号）。`,
+        text: `充值申请：${order.orderNo}\n付款方式：${code.label}\n请使用下方收款码付款，勿使用历史二维码。付款后发送转账截图（保留金额、时间和交易编号）。`,
       },
       clientMessageId: `sr-intro-${message.id}`,
       push: true,
     });
-    for (const code of codes) {
-      // 每条二维码消息使用自己的对象。聊天撤回/焚毁会物删该消息的媒体；如果
-      // 直接复用配置原图，撤回任一历史消息就会让所有会话和后续发送一起失效。
-      const extension = code.objectKey.split('.').pop()?.toLowerCase() || 'png';
-      const deliveryKey = `chat/${agentUserID}/${message.id}-${code.id}.${extension}`;
-      await this.upload.copyObjectToKey(code.objectKey, deliveryKey);
-      await this.messages.insertServerMessage(message.conversationID, {
-        senderID: agentUserID,
-        type: 'image',
-        content: { key: deliveryKey },
-        clientMessageId: `sr-code-${message.id}-${code.id}`,
-      });
-    }
+    // 二维码使用消息独立对象；确定性 key + clientMessageId 让 durable job 可从
+    // copy、落库或广播任一步失败后安全续跑。
+    const extension = code.objectKey.split('.').pop()?.toLowerCase() || 'png';
+    const deliveryKey = `chat/${agentUserID}/${message.id}-${code.id}.${extension}`;
+    await this.upload.copyObjectToKey(code.objectKey, deliveryKey);
+    await this.messages.insertServerMessage(message.conversationID, {
+      senderID: agentUserID,
+      type: 'image',
+      content: { key: deliveryKey },
+      clientMessageId: `sr-code-${message.id}-${code.id}`,
+      rebroadcastOnReplay: true,
+    });
     await this.prisma.supportRechargeConversationState.update({
       where: { conversationID: message.conversationID },
       data: { lastWelcomeAt: now },
     });
+    return true;
   }
 
   private async createOrder(
@@ -457,22 +463,7 @@ export class ChatSupportRechargeProcessor {
       },
       orderBy: { createdAt: 'desc' },
     });
-    if (order) {
-      const changed = await this.prisma.supportRechargeOrder.updateMany({
-        where: { id: order.id, status: 'AWAITING_PROOF' },
-        data: {
-          status: 'WAITING_REVIEW',
-          evidenceMessageID: message.id,
-          evidenceObjectKey: key,
-          submittedAt: new Date(),
-        },
-      });
-      if (changed.count === 1) {
-        order = await this.prisma.supportRechargeOrder.findUniqueOrThrow({
-          where: { id: order.id },
-        });
-      }
-    } else {
+    if (!order) {
       order = await this.prisma.supportRechargeOrder.findFirst({
         where: {
           conversationID: message.conversationID,
@@ -481,23 +472,6 @@ export class ChatSupportRechargeProcessor {
         },
         orderBy: { createdAt: 'desc' },
       });
-      // 人工开始处理前，用户补发的更清晰截图应成为审核台看到的最新版。
-      // PROCESSING 后不再替换证据，避免管理员核对期间页面里的依据悄悄变化。
-      if (order?.status === 'WAITING_REVIEW') {
-        const changed = await this.prisma.supportRechargeOrder.updateMany({
-          where: { id: order.id, status: 'WAITING_REVIEW' },
-          data: {
-            evidenceMessageID: message.id,
-            evidenceObjectKey: key,
-            submittedAt: new Date(),
-          },
-        });
-        if (changed.count === 1) {
-          order = await this.prisma.supportRechargeOrder.findUniqueOrThrow({
-            where: { id: order.id },
-          });
-        }
-      }
     }
 
     if (!order) {
@@ -511,6 +485,26 @@ export class ChatSupportRechargeProcessor {
         push: true,
       });
       return;
+    }
+
+    if (order.status !== 'PROCESSING') {
+      const extension = key.split('.').pop()?.toLowerCase() || 'png';
+      const evidenceKey = `support-recharge/evidence/${order.id}/${message.id}.${extension}`;
+      await this.upload.copyObjectToKey(key, evidenceKey);
+      const changed = await this.prisma.supportRechargeOrder.updateMany({
+        where: { id: order.id, status: order.status },
+        data: {
+          status: 'WAITING_REVIEW',
+          evidenceMessageID: message.id,
+          evidenceObjectKey: evidenceKey,
+          submittedAt: new Date(),
+        },
+      });
+      if (changed.count === 1) {
+        order = await this.prisma.supportRechargeOrder.findUniqueOrThrow({
+          where: { id: order.id },
+        });
+      }
     }
 
     await this.messages.insertServerMessage(message.conversationID, {

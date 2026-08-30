@@ -1,8 +1,8 @@
-CREATE TYPE "SupportRechargeRequestKind" AS ENUM ('GENERAL', 'AVATAR_FRAME', 'COIN', 'MEMBERSHIP');
+CREATE TYPE "SupportRechargeRequestKind" AS ENUM ('GENERAL', 'COIN', 'MEMBERSHIP');
 CREATE TYPE "SupportRechargeOrderStatus" AS ENUM ('AWAITING_PROOF', 'WAITING_REVIEW', 'PROCESSING', 'APPROVED', 'REJECTED');
 CREATE TYPE "SupportRechargeJobStatus" AS ENUM ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED');
 CREATE TYPE "SupportRechargeAutomationMode" AS ENUM ('BOT', 'HUMAN');
-CREATE TYPE "SupportRechargeFulfillmentType" AS ENUM ('COIN', 'MEMBERSHIP', 'AVATAR_FRAME');
+CREATE TYPE "SupportRechargeFulfillmentType" AS ENUM ('COIN', 'MEMBERSHIP');
 
 CREATE TABLE "SupportRechargePaymentCode" (
     "id" TEXT NOT NULL,

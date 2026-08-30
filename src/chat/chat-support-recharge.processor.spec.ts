@@ -23,10 +23,17 @@ describe('classifyRechargeRequest', () => {
 function textMessageHarness(
   text: string,
   options: {
+    mode?: 'BOT' | 'HUMAN';
+    paymentCode?: {
+      id: string;
+      label: string;
+      objectKey: string;
+    } | null;
     activeOrder?: {
       id: string;
       orderNo: string;
       status: 'AWAITING_PROOF' | 'WAITING_REVIEW' | 'PROCESSING';
+      sourceMessageID?: string;
     } | null;
   } = {},
 ) {
@@ -58,17 +65,22 @@ function textMessageHarness(
     },
     supportAgent: { findFirst: jest.fn().mockResolvedValue({ id: 'agent' }) },
     supportRechargeConversationState: {
-      upsert: jest.fn().mockResolvedValue({ mode: 'BOT', lastWelcomeAt: null }),
+      upsert: jest.fn().mockResolvedValue({
+        mode: options.mode ?? 'BOT',
+        lastWelcomeAt: null,
+      }),
       update: jest.fn().mockResolvedValue({}),
     },
     supportRechargePaymentCode: {
-      findMany: jest.fn().mockResolvedValue([
-        {
-          id: 'code-1',
-          label: '当前收款码',
-          objectKey: 'chat/admin-1/master.png',
-        },
-      ]),
+      findFirst: jest.fn().mockResolvedValue(
+        options.paymentCode === undefined
+          ? {
+              id: 'code-1',
+              label: '当前收款码',
+              objectKey: 'chat/admin-1/master.png',
+            }
+          : options.paymentCode,
+      ),
     },
     supportRechargeOrder: {
       findFirst: jest.fn().mockResolvedValue(options.activeOrder ?? null),
@@ -116,7 +128,7 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
         clientMessageId: 'sr-welcome-message-text',
       }),
     );
-    expect(prisma.supportRechargePaymentCode.findMany).not.toHaveBeenCalled();
+    expect(prisma.supportRechargePaymentCode.findFirst).not.toHaveBeenCalled();
     expect(prisma.supportRechargeOrder.create).not.toHaveBeenCalled();
   });
 
@@ -164,6 +176,49 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       }),
     );
     expect(upload.copyObjectToKey).not.toHaveBeenCalled();
+  });
+
+  it('resumes QR delivery when the same durable job retries after creating its order', async () => {
+    const { processor, prisma, messages, upload } = textMessageHarness('2', {
+      activeOrder: {
+        id: 'order-open',
+        orderNo: 'RC202608290099',
+        status: 'AWAITING_PROOF',
+        sourceMessageID: 'message-text',
+      },
+    });
+
+    await processor.processMessage('message-text');
+
+    expect(prisma.supportRechargeOrder.create).not.toHaveBeenCalled();
+    expect(upload.copyObjectToKey).toHaveBeenCalledWith(
+      'chat/admin-1/master.png',
+      'chat/agent-1/message-text-code-1.png',
+    );
+    expect(messages.insertServerMessage).toHaveBeenCalledWith(
+      'conversation-1',
+      expect.objectContaining({
+        type: 'image',
+        rebroadcastOnReplay: true,
+      }),
+    );
+  });
+
+  it('switches to human mode and preserves unread when no payment code is active', async () => {
+    const { processor, prisma, broadcast } = textMessageHarness('1', {
+      paymentCode: null,
+    });
+
+    await processor.processMessage('message-text');
+
+    expect(prisma.supportRechargeConversationState.update).toHaveBeenCalledWith(
+      {
+        where: { conversationID: 'conversation-1' },
+        data: { mode: 'HUMAN' },
+      },
+    );
+    expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    expect(broadcast.emitRead).not.toHaveBeenCalled();
   });
 
   it('moves a screenshot to manual review without granting any benefit', async () => {
@@ -217,22 +272,27 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       chatMember: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
     };
     const messages = { insertServerMessage: jest.fn().mockResolvedValue({}) };
+    const upload = { copyObjectToKey: jest.fn().mockResolvedValue(undefined) };
     const broadcast = { emitRead: jest.fn() };
     const processor = new ChatSupportRechargeProcessor(
       prisma as never,
       messages as never,
-      { copyObjectToKey: jest.fn() } as never,
+      upload as never,
       broadcast as never,
     );
 
     await processor.processMessage('message-1');
 
+    expect(upload.copyObjectToKey).toHaveBeenCalledWith(
+      'chat/user-1/proof.png',
+      'support-recharge/evidence/order-1/message-1.png',
+    );
     expect(prisma.supportRechargeOrder.updateMany).toHaveBeenCalledWith({
       where: { id: 'order-1', status: 'AWAITING_PROOF' },
       data: expect.objectContaining({
         status: 'WAITING_REVIEW',
         evidenceMessageID: 'message-1',
-        evidenceObjectKey: 'chat/user-1/proof.png',
+        evidenceObjectKey: 'support-recharge/evidence/order-1/message-1.png',
       }),
     });
     expect(messages.insertServerMessage).toHaveBeenCalledWith(
@@ -289,13 +349,11 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
         update: jest.fn().mockResolvedValue({}),
       },
       supportRechargePaymentCode: {
-        findMany: jest.fn().mockResolvedValue([
-          {
-            id: 'code-1',
-            label: '当前收款码',
-            objectKey: 'chat/admin-1/master.png',
-          },
-        ]),
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'code-1',
+          label: '当前收款码',
+          objectKey: 'chat/admin-1/master.png',
+        }),
       },
       supportRechargeOrder: {
         findFirst: jest.fn().mockResolvedValue(null),
@@ -339,7 +397,64 @@ describe('ChatSupportRechargeProcessor payment evidence', () => {
       expect.objectContaining({
         type: 'image',
         content: { key: 'chat/agent-1/message-2-code-1.png' },
+        rebroadcastOnReplay: true,
       }),
     );
+  });
+
+  it('does not consume or mark screenshots read while a human owns the conversation', async () => {
+    const prisma = {
+      supportRechargeJob: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'job-human-image' }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          sourceMessageID: 'message-human-image',
+          attempts: 1,
+        }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+      chatMessage: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'message-human-image',
+          height: 10,
+          conversationID: 'conversation-1',
+          senderID: 'user-1',
+          type: 'image',
+          content: { key: 'chat/user-1/proof.png' },
+          deleted: false,
+          revokedAt: null,
+          conversation: {
+            id: 'conversation-1',
+            type: 'DIRECT',
+            directKey: 'agent-1:user-1',
+          },
+        }),
+      },
+      supportAgent: { findFirst: jest.fn().mockResolvedValue({ id: 'agent' }) },
+      supportRechargeConversationState: {
+        upsert: jest
+          .fn()
+          .mockResolvedValue({ mode: 'HUMAN', lastWelcomeAt: null }),
+      },
+      supportRechargeOrder: { findFirst: jest.fn() },
+      chatMember: { updateMany: jest.fn() },
+    };
+    const messages = { insertServerMessage: jest.fn() };
+    const upload = { copyObjectToKey: jest.fn() };
+    const broadcast = { emitRead: jest.fn() };
+    const processor = new ChatSupportRechargeProcessor(
+      prisma as never,
+      messages as never,
+      upload as never,
+      broadcast as never,
+    );
+
+    await processor.processMessage('message-human-image');
+
+    expect(prisma.supportRechargeOrder.findFirst).not.toHaveBeenCalled();
+    expect(upload.copyObjectToKey).not.toHaveBeenCalled();
+    expect(messages.insertServerMessage).not.toHaveBeenCalled();
+    expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+    expect(broadcast.emitRead).not.toHaveBeenCalled();
   });
 });

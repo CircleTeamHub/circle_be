@@ -8,6 +8,7 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   Max,
   MaxLength,
@@ -69,6 +70,14 @@ export class ListSupportRechargeOrdersQueryDto {
   @IsOptional()
   @IsEnum(SupportRechargeOrderStatus)
   status?: SupportRechargeOrderStatus;
+
+  @ApiPropertyOptional({
+    format: 'uuid',
+    description: '上一页最后一条申请的 id',
+  })
+  @IsOptional()
+  @IsUUID()
+  cursor?: string;
 
   @ApiPropertyOptional({ minimum: 1, maximum: 100, default: 50 })
   @IsOptional()

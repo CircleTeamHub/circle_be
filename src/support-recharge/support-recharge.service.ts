@@ -106,6 +106,17 @@ export class SupportRechargeService {
     this.assertPaymentCodeObjectOwned(operator, dto.objectKey);
 
     const created = await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      if (validFrom <= now) {
+        await tx.supportRechargePaymentCode.updateMany({
+          where: {
+            enabled: true,
+            validFrom: { lte: now },
+            OR: [{ validUntil: null }, { validUntil: { gt: now } }],
+          },
+          data: { enabled: false },
+        });
+      }
       const row = await tx.supportRechargePaymentCode.create({
         data: {
           label: dto.label,
@@ -209,6 +220,12 @@ export class SupportRechargeService {
           errorCode: SupportErrorCode.RechargePaymentCodeNotFound,
         });
       }
+      if (enabled) {
+        await tx.supportRechargePaymentCode.updateMany({
+          where: { id: { not: id }, enabled: true },
+          data: { enabled: false },
+        });
+      }
       const after = await tx.supportRechargePaymentCode.update({
         where: { id },
         data: { enabled },
@@ -230,7 +247,8 @@ export class SupportRechargeService {
   async listOrders(query: ListSupportRechargeOrdersQueryDto) {
     const orders = await this.prisma.supportRechargeOrder.findMany({
       where: query.status ? { status: query.status } : undefined,
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      ...(query.cursor ? { cursor: { id: query.cursor }, skip: 1 } : {}),
       take: query.limit,
       select: ORDER_SELECT,
     });
