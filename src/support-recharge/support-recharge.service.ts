@@ -5,7 +5,6 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AdminUserAuditService } from 'src/admin-user/admin-user-audit.service';
-import { AvatarFrameAdminService } from 'src/avatar-frame/avatar-frame-admin.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CoinService } from 'src/coin/coin.service';
 import { SupportErrorCode } from 'src/common/app-error-codes';
@@ -27,13 +26,16 @@ import {
 
 type Operator = { userId: string; accountId: string };
 
+type SupportedFulfillmentType = Extract<
+  SupportRechargeFulfillmentType,
+  'COIN' | 'MEMBERSHIP'
+>;
+
 type CanonicalFulfillment = {
-  fulfillmentType: SupportRechargeFulfillmentType;
+  fulfillmentType: SupportedFulfillmentType;
   paymentTransactionId: string;
   coinAmount?: number;
   membershipLevel?: number;
-  frameId?: string;
-  frameExpiresAt?: string | null;
   note: string | null;
 };
 
@@ -67,7 +69,6 @@ export class SupportRechargeService {
     private readonly messages: ChatSystemMessageService,
     private readonly coins: CoinService,
     private readonly memberships: MembershipAdminService,
-    private readonly avatarFrames: AvatarFrameAdminService,
     private readonly realtime: RealtimeService,
   ) {}
 
@@ -223,19 +224,11 @@ export class SupportRechargeService {
           order.userID,
           input.coinAmount!,
         );
-      } else if (input.fulfillmentType === 'MEMBERSHIP') {
+      } else {
         await this.memberships.grant(order.reviewedBy!, order.userID, {
           targetLevel: input.membershipLevel!,
           idempotencyKey: order.id,
           note: input.note ?? `充值申请 ${order.orderNo}`,
-        });
-        await this.finalizeApproval(operator, order.id);
-      } else {
-        await this.avatarFrames.grant(order.reviewedBy!, order.userID, {
-          frameId: input.frameId!,
-          expiresAt: input.frameExpiresAt,
-          reason: input.note ?? `充值申请 ${order.orderNo}`,
-          idempotencyKey: order.id,
         });
         await this.finalizeApproval(operator, order.id);
       }
@@ -305,17 +298,12 @@ export class SupportRechargeService {
   ): CanonicalFulfillment {
     let benefit: Pick<
       CanonicalFulfillment,
-      'coinAmount' | 'membershipLevel' | 'frameId' | 'frameExpiresAt'
+      'coinAmount' | 'membershipLevel'
     > = {};
     if (dto.fulfillmentType === 'COIN') {
       benefit = { coinAmount: dto.coinAmount! };
-    } else if (dto.fulfillmentType === 'MEMBERSHIP') {
-      benefit = { membershipLevel: dto.membershipLevel! };
     } else {
-      benefit = {
-        frameId: dto.frameId!,
-        frameExpiresAt: dto.frameExpiresAt ?? null,
-      };
+      benefit = { membershipLevel: dto.membershipLevel! };
     }
     return {
       fulfillmentType: dto.fulfillmentType,
@@ -355,18 +343,6 @@ export class SupportRechargeService {
         message: '会员等级必须高于用户当前等级',
         errorCode: SupportErrorCode.RechargeApprovalConflict,
       });
-    }
-    if (input.fulfillmentType === 'AVATAR_FRAME') {
-      const frame = await this.prisma.avatarFrameAsset.findUnique({
-        where: { id: input.frameId! },
-        select: { isActive: true },
-      });
-      if (!frame?.isActive) {
-        throw new ConflictException({
-          message: '头像框不存在或已停用',
-          errorCode: SupportErrorCode.RechargeApprovalConflict,
-        });
-      }
     }
   }
 
@@ -526,17 +502,8 @@ export class SupportRechargeService {
     let result: string;
     if (input.fulfillmentType === 'COIN') {
       result = `已发放积分：${input.coinAmount}`;
-    } else if (input.fulfillmentType === 'MEMBERSHIP') {
-      result = `会员已开通：Lv.${input.membershipLevel}`;
     } else {
-      const frame = await this.prisma.avatarFrameAsset.findUnique({
-        where: { id: input.frameId! },
-        select: { name: true },
-      });
-      const expiry = input.frameExpiresAt
-        ? `，有效期至 ${input.frameExpiresAt.slice(0, 10)}`
-        : '，长期有效';
-      result = `头像框已添加：${frame?.name ?? '所选头像框'}${expiry}`;
+      result = `会员已开通：Lv.${input.membershipLevel}`;
     }
     await this.messages.insertServerMessage(order.conversationID, {
       senderID: order.agentUserID,
@@ -569,10 +536,7 @@ export class SupportRechargeService {
       (input.fulfillmentType === 'COIN' &&
         payload.coinAmount !== input.coinAmount) ||
       (input.fulfillmentType === 'MEMBERSHIP' &&
-        payload.membershipLevel !== input.membershipLevel) ||
-      (input.fulfillmentType === 'AVATAR_FRAME' &&
-        (payload.frameId !== input.frameId ||
-          (payload.frameExpiresAt ?? null) !== input.frameExpiresAt))
+        payload.membershipLevel !== input.membershipLevel)
     ) {
       throw new ConflictException({
         message: '该充值申请已经使用不同的发放参数处理',

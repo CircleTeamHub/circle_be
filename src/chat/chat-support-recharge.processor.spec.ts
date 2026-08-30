@@ -7,7 +7,6 @@ describe('classifyRechargeRequest', () => {
   it.each([
     ['我想充值积分', 'COIN'],
     ['购买 VIP', 'MEMBERSHIP'],
-    ['冲个头像装饰', 'AVATAR_FRAME'],
     ['收款码发一下', 'GENERAL'],
   ] as const)('classifies %s as %s', (text, expected) => {
     expect(classifyRechargeRequest(text)).toBe(expected);
@@ -15,6 +14,7 @@ describe('classifyRechargeRequest', () => {
 
   it('does not treat unrelated text as a payment instruction', () => {
     expect(classifyRechargeRequest('你好，请问有人吗')).toBeNull();
+    expect(classifyRechargeRequest('购买头像框')).toBeNull();
   });
 });
 

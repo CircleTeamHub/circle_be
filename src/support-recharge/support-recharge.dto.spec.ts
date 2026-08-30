@@ -30,6 +30,13 @@ describe('support recharge DTOs', () => {
         coinAmount: 100,
       }),
     ).toHaveLength(0);
+    expect(
+      errorsFor(ApproveSupportRechargeOrderDto, {
+        fulfillmentType: 'AVATAR_FRAME',
+        paymentTransactionId: 'trade-1',
+        frameId: '11111111-1111-4111-8111-111111111111',
+      }),
+    ).not.toHaveLength(0);
   });
 
   it('rejects string booleans instead of enabling a payment code by coercion', () => {

@@ -5,9 +5,9 @@ import {
   IsEnum,
   IsISO8601,
   IsInt,
+  IsIn,
   IsOptional,
   IsString,
-  IsUUID,
   Matches,
   Max,
   MaxLength,
@@ -76,9 +76,12 @@ export class ListSupportRechargeOrdersQueryDto {
 }
 
 export class ApproveSupportRechargeOrderDto {
-  @ApiProperty({ enum: SupportRechargeFulfillmentType })
-  @IsEnum(SupportRechargeFulfillmentType)
-  fulfillmentType: SupportRechargeFulfillmentType;
+  @ApiProperty({ enum: ['COIN', 'MEMBERSHIP'] })
+  @IsIn(['COIN', 'MEMBERSHIP'])
+  fulfillmentType: Extract<
+    SupportRechargeFulfillmentType,
+    'COIN' | 'MEMBERSHIP'
+  >;
 
   @ApiProperty({ minLength: 1, maxLength: 128 })
   @Transform(trimmed)
@@ -107,23 +110,6 @@ export class ApproveSupportRechargeOrderDto {
   @Min(1)
   @Max(4)
   membershipLevel?: number;
-
-  @ApiPropertyOptional({ format: 'uuid' })
-  @ValidateIf(
-    (dto: ApproveSupportRechargeOrderDto) =>
-      dto.fulfillmentType === 'AVATAR_FRAME',
-  )
-  @IsUUID()
-  frameId?: string;
-
-  @ApiPropertyOptional({ format: 'date-time', nullable: true })
-  @IsOptional()
-  @ValidateIf(
-    (dto: ApproveSupportRechargeOrderDto) =>
-      dto.fulfillmentType === 'AVATAR_FRAME' && dto.frameExpiresAt != null,
-  )
-  @IsISO8601({ strict: true })
-  frameExpiresAt?: string | null;
 
   @ApiPropertyOptional({ maxLength: 500 })
   @Transform(trimmed)

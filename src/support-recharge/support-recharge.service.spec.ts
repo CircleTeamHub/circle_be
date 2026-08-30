@@ -9,7 +9,6 @@ describe('SupportRechargeService approval replay', () => {
     {} as never,
     {} as never,
     {} as never,
-    {} as never,
   );
 
   it('compares stored JSON by fields instead of JSON property order', () => {

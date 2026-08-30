@@ -21,10 +21,9 @@ const REQUEST_KEYWORDS: ReadonlyArray<{
   kind: SupportRechargeRequestKind;
   words: readonly string[];
 }> = [
-  { kind: 'AVATAR_FRAME', words: ['头像框', '头像装饰'] },
   { kind: 'COIN', words: ['积分', '元宝', '金币'] },
   { kind: 'MEMBERSHIP', words: ['会员', 'vip'] },
-  { kind: 'GENERAL', words: ['充值', '购买', '付款', '收款码'] },
+  { kind: 'GENERAL', words: ['充值', '付款', '收款码'] },
 ];
 
 export function classifyRechargeRequest(
@@ -273,7 +272,7 @@ export class ChatSupportRechargeProcessor {
       senderID: agentUserID,
       type: 'text',
       content: {
-        text: '你好，这里是充值服务。你可以发送“头像框”“积分”“会员”或“充值”，我会根据你的选择提供当前可用的付款方式和提交步骤。',
+        text: '你好，这里是充值服务。目前支持积分充值和会员开通/续费。请发送“积分”或“会员”，我会提供当前可用的付款方式和操作步骤。',
       },
       clientMessageId: `sr-welcome-${message.id}`,
       push: true,
@@ -475,7 +474,7 @@ export class ChatSupportRechargeProcessor {
         senderID: agentUserID,
         type: 'text',
         content: {
-          text: '我还没有找到与你对应的充值申请。请先发送“头像框”“积分”“会员”或“充值”，获取当前付款步骤后再提交记录。',
+          text: '我还没有找到与你对应的充值申请。请先发送“积分”或“会员”，获取当前付款步骤后再提交记录。',
         },
         clientMessageId: `sr-no-order-${message.id}`,
         push: true,
