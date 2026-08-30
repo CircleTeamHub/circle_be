@@ -394,4 +394,36 @@ describe('EmailVerificationService', () => {
       }
     }
   });
+
+  it('does not write the verified email address to logs when the bypass is used', async () => {
+    const prevNodeEnv = process.env.NODE_ENV;
+    const prevBypass = process.env.EMAIL_CODE_DEV_BYPASS;
+    const prevProductionOptIn = process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS;
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    process.env.NODE_ENV = 'production';
+    process.env.EMAIL_CODE_DEV_BYPASS = '999999';
+    process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = 'true';
+    try {
+      await expect(
+        service.verifyCode('private.user@example.com', 'LOGIN', '999999'),
+      ).resolves.toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.flat().join(' ')).not.toContain(
+        'private.user@example.com',
+      );
+    } finally {
+      warn.mockRestore();
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prevNodeEnv;
+      if (prevBypass === undefined) delete process.env.EMAIL_CODE_DEV_BYPASS;
+      else process.env.EMAIL_CODE_DEV_BYPASS = prevBypass;
+      if (prevProductionOptIn === undefined) {
+        delete process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS;
+      } else {
+        process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = prevProductionOptIn;
+      }
+    }
+  });
 });

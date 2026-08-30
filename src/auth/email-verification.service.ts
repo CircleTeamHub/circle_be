@@ -220,7 +220,7 @@ export class EmailVerificationService {
     const bypass = this.getDevBypassCode();
     if (bypass && code === bypass) {
       this.logger.warn(
-        `[DEV] email code bypass used for ${email} (${purpose}) — disable in production`,
+        `[DEV] email code bypass used (${purpose}) — disable in production`,
       );
       return true;
     }
