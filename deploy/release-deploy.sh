@@ -105,6 +105,39 @@ fi
 
 COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
 APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
+resolved_app_env_gid=""
+
+validate_private_app_env_gid() {
+  local deploy_user="$1" gid="$2" group_record members other_primary_users
+  [[ "$gid" =~ ^[0-9]+$ ]] || {
+    echo "APP_ENV_GID must be a numeric gid" >&2
+    return 1
+  }
+  case " $(id -G "$deploy_user") " in
+    *" $gid "*) ;;
+    *) echo "APP_ENV_GID=$gid does not belong to deploy user $deploy_user" >&2; return 1 ;;
+  esac
+  if [ "$(uname -s)" = "Linux" ]; then
+    command -v getent >/dev/null || {
+      echo "getent is required to verify APP_ENV_GID privacy" >&2
+      return 1
+    }
+    group_record="$(getent group "$gid")" || {
+      echo "APP_ENV_GID=$gid does not exist in the group database" >&2
+      return 1
+    }
+    members="${group_record##*:}"
+    case "$members" in
+      ""|"$deploy_user") ;;
+      *) echo "APP_ENV_GID=$gid has other explicit members; refusing to share production secrets" >&2; return 1 ;;
+    esac
+    other_primary_users="$(getent passwd | awk -F: -v gid="$gid" -v user="$deploy_user" '$4 == gid && $1 != user { print $1 }')"
+    [ -z "$other_primary_users" ] || {
+      echo "APP_ENV_GID=$gid is another account's primary group; refusing to share production secrets" >&2
+      return 1
+    }
+  fi
+}
 
 # 旧服务器的 .env 早于 APP_ENV_GID：release rsync 会刻意保留配置，也不会重跑
 # gen-env.sh。必须在第一次 Compose 解析前原地补齐，否则升级永远卡在变量插值。
@@ -118,17 +151,16 @@ prepare_app_env_access() {
   deploy_user="$(id -un)"
   expected_gid="$(id -g "$deploy_user")"
   configured_gid="$(awk -F= '$1 == "APP_ENV_GID" { value = $2 } END { print value }' "$COMPOSE_ENV_FILE")"
-  if [ -n "$configured_gid" ] && [ "$configured_gid" != "$expected_gid" ]; then
-    echo "APP_ENV_GID=$configured_gid does not match deploy gid $expected_gid" >&2
-    return 1
-  fi
   if [ -z "$configured_gid" ]; then
-    printf '\nAPP_ENV_GID=%s\n' "$expected_gid" >> "$COMPOSE_ENV_FILE"
+    configured_gid="$expected_gid"
+    printf '\nAPP_ENV_GID=%s\n' "$configured_gid" >> "$COMPOSE_ENV_FILE"
     chmod 600 "$COMPOSE_ENV_FILE"
-    echo "==> Added APP_ENV_GID=$expected_gid to legacy Compose env"
+    echo "==> Added APP_ENV_GID=$configured_gid to legacy Compose env"
   fi
+  validate_private_app_env_gid "$deploy_user" "$configured_gid" || return 1
+  resolved_app_env_gid="$configured_gid"
   if [ -f "$APP_ENV_FILE" ]; then
-    chgrp "$expected_gid" "$APP_ENV_FILE"
+    chgrp "$resolved_app_env_gid" "$APP_ENV_FILE"
     chmod 640 "$APP_ENV_FILE"
   fi
 }
@@ -624,6 +656,7 @@ if [ -f "$APP_ENV_FILE" ]; then
   # 临时文件在 rename 前始终是 0600；rename 后改为 0640，让只加入
   # APP_ENV_GID 的非 root 容器用户可以读取 bind mount。
   if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
+    chgrp "$resolved_app_env_gid" "$APP_ENV_FILE" &&
     chmod 640 "$APP_ENV_FILE"; then
     :
   else

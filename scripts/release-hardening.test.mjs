@@ -77,15 +77,17 @@ test('non-root app can read the group-protected production env file', () => {
   const release = read('deploy/release-deploy.sh');
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
-  assert.match(generator, /DEPLOY_PRIMARY_GID="\$\(id -g "\$DEPLOY_USER_NAME"\)"/);
-  assert.match(generator, /APP_ENV_GID=\$DEPLOY_PRIMARY_GID/);
-  assert.match(generator, /chgrp "\$DEPLOY_PRIMARY_GID" \.env\.production/);
+  assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
+  assert.match(generator, /APP_ENV_GID=\$DEPLOY_APP_ENV_GID/);
+  assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
   assert.match(
     generator,
-    /chmod 600 \.env\s+chgrp "\$DEPLOY_PRIMARY_GID" \.env\.production\s+chmod 640 \.env\.production/,
+    /chmod 600 \.env\s+chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production\s+chmod 640 \.env\.production/,
   );
   assert.match(release, /prepare_app_env_access\s*\(\)/);
   assert.match(release, /expected_gid="\$\(id -g "\$deploy_user"\)"/);
+  assert.match(release, /validate_private_app_env_gid "\$deploy_user" "\$configured_gid"/);
+  assert.match(release, /chgrp "\$resolved_app_env_gid" "\$APP_ENV_FILE"/);
   assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
 });
 

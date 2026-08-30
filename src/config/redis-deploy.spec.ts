@@ -122,7 +122,9 @@ describe('production Redis deployment configuration', () => {
 
     writeFileSync(
       join(workspace, '.env'),
-      upgradedComposeEnv.replace(/^COMPOSE_PROFILES=.*\n?/m, ''),
+      upgradedComposeEnv
+        .replace(/^COMPOSE_PROFILES=.*\n?/m, '')
+        .replace(/^APP_ENV_GID=.*$/m, 'APP_ENV_GID=999999'),
     );
     writeFileSync(
       join(workspace, '.env.production'),
@@ -134,9 +136,13 @@ describe('production Redis deployment configuration', () => {
         .replace(/^REDIS_ALLOW_INSECURE=.*\n?/m, ''),
     );
     execFileSync(bashExecutable, args, { cwd: workspace });
-    expect(readFileSync(join(workspace, '.env'), 'utf8')).not.toContain(
+    const regeneratedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
+    expect(regeneratedComposeEnv).not.toContain(
       'COMPOSE_PROFILES=bundled-redis',
     );
+    if (process.platform !== 'win32') {
+      expect(regeneratedComposeEnv).toContain(`APP_ENV_GID=${primaryGid}`);
+    }
     expect(readFileSync(join(workspace, '.env.production'), 'utf8')).toContain(
       'REDIS_ALLOW_INSECURE=false',
     );

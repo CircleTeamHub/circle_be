@@ -9,7 +9,6 @@ DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
 REPO_SCHEMA_COMPATIBILITY="$(cat "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY")"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REAL_MV="$(command -v mv)"
-REAL_ID="$(command -v id)"
 
 last_arg() {
   local value=""
@@ -410,36 +409,6 @@ test_release_backfills_env_gid_before_first_compose_call() {
   grep -q '^==> Added APP_ENV_GID=' "$CASE_DIR/release.log" || return 1
 }
 
-test_release_uses_primary_gid_when_effective_group_differs() {
-  new_case
-  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
-  printf 'running\n' > "$TEST_STATE_DIR/caddy"
-  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
-  APP_ENV_FILE="$CASE_DIR/.env.production"
-  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
-  export APP_ENV_FILE
-
-  TEST_PRIMARY_GID="$($REAL_ID -g "$($REAL_ID -un)")"
-  TEST_EFFECTIVE_GID=$((TEST_PRIMARY_GID + 1))
-  export TEST_PRIMARY_GID TEST_EFFECTIVE_GID
-  cat > "$CASE_DIR/bin/id" <<'ID'
-#!/usr/bin/env bash
-set -euo pipefail
-case "${1:-}:${2:-}" in
-  -un:) printf 'deploy-test\n' ;;
-  -g:) printf '%s\n' "$TEST_EFFECTIVE_GID" ;;
-  -g:deploy-test) printf '%s\n' "$TEST_PRIMARY_GID" ;;
-  *) exit 64 ;;
-esac
-ID
-  chmod +x "$CASE_DIR/bin/id"
-
-  run_release || return 1
-
-  grep -qx "APP_ENV_GID=$TEST_PRIMARY_GID" "$COMPOSE_ENV_FILE" || return 1
-  [ "$(file_gid "$APP_ENV_FILE")" = "$TEST_PRIMARY_GID" ] || return 1
-}
-
 test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
   # review #150(P1):打标签是「读 .env.production → 写临时文件 → mv 回去」,
   # 临时文件因此装着整份生产密钥。默认 umask 022 下它会落成 0644,在 mv 之前
@@ -462,10 +431,61 @@ test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
     return 1
   }
   assert_mode "$APP_ENV_FILE" 640 || return 1
+  [ "$(file_gid "$APP_ENV_FILE")" = "$(id -g "$(id -un)")" ] || {
+    echo "expected the replaced app env to retain the deploy account group" >&2
+    return 1
+  }
   [ ! -e "${APP_ENV_FILE}.tmp" ] || {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
     return 1
   }
+}
+
+test_release_reapplies_gid_after_replace_with_different_effective_group() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  command -v sg >/dev/null || return 0
+  local user primary_gid gid group_name
+  user="$(id -un)"
+  primary_gid="$(id -g "$user")"
+  for gid in $(id -G "$user"); do
+    [ "$gid" != "$primary_gid" ] || continue
+    group_name="$(getent group "$gid" | cut -d: -f1)"
+    [ -n "$group_name" ] || continue
+    RELEASE_EFFECTIVE_GID_CASE_ONLY=1 sg "$group_name" -c "bash '$0'"
+    return
+  done
+  echo "SKIP no supplementary group is available for the effective-GID integration case"
+}
+
+test_release_rejects_a_group_shared_with_another_account() {
+  new_case
+  printf 'APP_ENV_GID=4242\n' >> "$COMPOSE_ENV_FILE"
+  cat > "$CASE_DIR/bin/uname" <<'UNAME'
+#!/usr/bin/env bash
+printf 'Linux\n'
+UNAME
+  cat > "$CASE_DIR/bin/id" <<'ID'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  -un:) printf 'deploy-test\n' ;;
+  -G:deploy-test) printf '4242\n' ;;
+  -g:deploy-test) printf '4242\n' ;;
+  *) exit 64 ;;
+esac
+ID
+  cat > "$CASE_DIR/bin/getent" <<'GETENT'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  group:4242) printf 'shared:x:4242:deploy-test,other-user\n' ;;
+  passwd:) printf 'deploy-test:x:1000:4242::/home/deploy-test:/bin/bash\nother-user:x:1001:4242::/home/other-user:/bin/bash\n' ;;
+  *) exit 2 ;;
+esac
+GETENT
+  chmod +x "$CASE_DIR/bin/uname" "$CASE_DIR/bin/id" "$CASE_DIR/bin/getent"
+
+  ! run_release || return 1
+  grep -q 'refusing to share production secrets' "$CASE_DIR/release.log" || return 1
+  [ ! -s "$TEST_COMMAND_LOG" ] || return 1
 }
 
 test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
@@ -718,6 +738,11 @@ test_irreversible_smoke_failure_stays_in_maintenance() {
   assert_maintenance && assert_not_restarted
 }
 
+if [ "${RELEASE_EFFECTIVE_GID_CASE_ONLY:-0}" = "1" ]; then
+  test_release_only_grants_the_deploy_group_read_access_after_atomic_replace
+  exit
+fi
+
 failures=0
 for test_name in \
   test_migration_failure_restores_downtime_live_color \
@@ -727,8 +752,9 @@ for test_name in \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
   test_release_backfills_env_gid_before_first_compose_call \
-  test_release_uses_primary_gid_when_effective_group_differs \
   test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
+  test_release_reapplies_gid_after_replace_with_different_effective_group \
+  test_release_rejects_a_group_shared_with_another_account \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \
   test_release_without_env_file_still_deploys \

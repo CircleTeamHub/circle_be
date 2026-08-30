@@ -66,7 +66,9 @@ bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户
 docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-`gen-env.sh` 会把执行部署的宿主机用户主组写入 `.env` 的 `APP_ENV_GID`。
+`gen-env.sh` 默认把执行部署的宿主机用户主组写入 `.env` 的 `APP_ENV_GID`，并验证该组
+没有其他宿主机账号；共享组会直接失败，避免同组用户读取生产密钥。需要使用专用组时，先把
+部署账号加入该私有组，再以 `APP_ENV_GID=<专用组GID> bash deploy/gen-env.sh ...` 运行。
 应用容器以非 root 用户运行，并通过这个只读补充组读取权限为 `0640` 的
 `.env.production`；不要把该文件放宽为 `0644`。
 
