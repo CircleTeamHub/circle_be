@@ -1,4 +1,8 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  ApiProperty,
+  ApiPropertyOptional,
+  PartialType,
+} from '@nestjs/swagger';
 import { Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
@@ -52,6 +56,10 @@ export class CreateSupportRechargePaymentCodeDto {
   @IsISO8601({ strict: true })
   validUntil?: string | null;
 }
+
+export class UpdateSupportRechargePaymentCodeDto extends PartialType(
+  CreateSupportRechargePaymentCodeDto,
+) {}
 
 export class SetSupportRechargePaymentCodeEnabledDto {
   @ApiProperty()

@@ -8,6 +8,7 @@ import type {
   SupportRechargeOrder,
   SupportRechargeRequestKind,
 } from 'src/generated/prisma';
+import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { UploadService } from 'src/upload/upload.service';
 
@@ -95,6 +96,7 @@ export class ChatSupportRechargeProcessor {
     private readonly prisma: PrismaService,
     private readonly messages: ChatSystemMessageService,
     private readonly upload: UploadService,
+    private readonly broadcast: ChatBroadcastService,
   ) {}
 
   /** WebSocket 提交后走这条，尽量即时回复；失败由持久化任务的定时扫描补偿。 */
@@ -218,6 +220,7 @@ export class ChatSupportRechargeProcessor {
 
     if (message.type === 'image') {
       await this.acceptPaymentEvidence(message, agentUserID);
+      await this.markHandledRead(message, agentUserID);
       return;
     }
     if (message.type !== 'text' && message.type !== 'quote') return;
@@ -242,6 +245,7 @@ export class ChatSupportRechargeProcessor {
         where: { conversationID: message.conversationID },
         data: { mode: 'HUMAN' },
       });
+      await this.markHandledRead(message, agentUserID);
       return;
     } else if (state.mode === 'HUMAN') {
       return;
@@ -258,10 +262,34 @@ export class ChatSupportRechargeProcessor {
         where: { conversationID: message.conversationID },
         data: { lastWelcomeAt: new Date() },
       });
+      await this.markHandledRead(message, agentUserID);
       return;
     }
 
     await this.startRecharge(message, agentUserID, kind);
+    await this.markHandledRead(message, agentUserID);
+  }
+
+  private async markHandledRead(
+    message: IncomingMessage,
+    agentUserID: string,
+  ): Promise<void> {
+    const updated = await this.prisma.chatMember.updateMany({
+      where: {
+        conversationID: message.conversationID,
+        userID: agentUserID,
+        leftAt: null,
+        lastReadHeight: { lt: message.height },
+      },
+      data: { lastReadHeight: message.height },
+    });
+    if (updated.count > 0) {
+      this.broadcast.emitRead({
+        conversationId: message.conversationID,
+        userId: agentUserID,
+        height: message.height,
+      });
+    }
   }
 
   private async sendWelcome(
