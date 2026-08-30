@@ -166,11 +166,7 @@ describe('production Redis deployment configuration', () => {
       join(repositoryRoot, 'deploy', 'gen-env.sh'),
       join(workspace, 'deploy', 'gen-env.sh'),
     );
-    execFileSync('setfacl', [
-      '-m',
-      'u:nobody:r-x,d:u:nobody:r-x',
-      workspace,
-    ]);
+    execFileSync('setfacl', ['-m', 'u:nobody:r-x,d:u:nobody:r-x', workspace]);
 
     const bin = join(workspace, 'bin');
     mkdirSync(bin);
