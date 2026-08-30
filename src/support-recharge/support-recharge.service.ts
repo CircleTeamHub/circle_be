@@ -175,9 +175,7 @@ export class SupportRechargeService {
         where: { id },
         data: {
           ...(dto.label !== undefined ? { label: dto.label } : {}),
-          ...(dto.objectKey !== undefined
-            ? { objectKey: dto.objectKey }
-            : {}),
+          ...(dto.objectKey !== undefined ? { objectKey: dto.objectKey } : {}),
           validFrom,
           validUntil,
         },
@@ -357,10 +355,8 @@ export class SupportRechargeService {
   private canonicalizeFulfillment(
     dto: ApproveSupportRechargeOrderDto,
   ): CanonicalFulfillment {
-    let benefit: Pick<
-      CanonicalFulfillment,
-      'coinAmount' | 'membershipLevel'
-    > = {};
+    let benefit: Pick<CanonicalFulfillment, 'coinAmount' | 'membershipLevel'> =
+      {};
     if (dto.fulfillmentType === 'COIN') {
       benefit = { coinAmount: dto.coinAmount! };
     } else {
