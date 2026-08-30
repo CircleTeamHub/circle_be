@@ -74,6 +74,17 @@ describe('production Redis deployment configuration', () => {
     );
     const password = firstComposeEnv.match(/^REDIS_PASSWORD=(.+)$/m)?.[1];
     const originalSecret = firstAppEnv.match(/^SECRET=(.+)$/m)?.[1];
+    const primaryGid =
+      process.platform === 'win32'
+        ? undefined
+        : Number(
+            execFileSync('/usr/bin/id', [
+              '-g',
+              execFileSync('/usr/bin/id', ['-un']).toString().trim(),
+            ])
+              .toString()
+              .trim(),
+          );
 
     expect(password).toMatch(/^[a-f0-9]{48}$/);
     expect(firstAppEnv).toContain(
@@ -84,18 +95,16 @@ describe('production Redis deployment configuration', () => {
     expect(firstComposeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
     expect(firstComposeEnv).toContain('ACME_EMAIL=ops@example.com');
     expect(firstComposeEnv).toContain('WEB_DOMAIN=app.example.com');
-    expect(firstComposeEnv).toContain(`APP_ENV_GID=${process.getgid?.()}`);
     expect(firstAppEnv).toContain(
       'ALLOWED_ORIGINS=https://admin.example.com,https://app.example.com',
     );
     if (process.platform !== 'win32') {
+      expect(firstComposeEnv).toContain(`APP_ENV_GID=${primaryGid}`);
       expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
       expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
         0o640,
       );
-      expect(statSync(join(workspace, '.env.production')).gid).toBe(
-        process.getgid(),
-      );
+      expect(statSync(join(workspace, '.env.production')).gid).toBe(primaryGid);
     }
 
     execFileSync(bashExecutable, args, { cwd: workspace });

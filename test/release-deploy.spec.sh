@@ -9,6 +9,7 @@ DEPLOY_SCRIPT="$ROOT_DIR/deploy/release-deploy.sh"
 REPO_SCHEMA_COMPATIBILITY="$(cat "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY")"
 DIGEST_IMAGE="ghcr.io/circleteamhub/circle_be@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REAL_MV="$(command -v mv)"
+REAL_ID="$(command -v id)"
 
 last_arg() {
   local value=""
@@ -261,6 +262,10 @@ assert_mode() {
   }
 }
 
+file_gid() {
+  stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1"
+}
+
 assert_active_color() {
   [ "$(cat "$RELEASE_STATE_DIR/active-color" 2>/dev/null || true)" = "$1" ] || {
     echo "expected active color to be $1" >&2
@@ -400,9 +405,39 @@ test_release_backfills_env_gid_before_first_compose_call() {
   run_release || return 1
 
   [ "$(grep -c '^APP_ENV_GID=' "$COMPOSE_ENV_FILE")" = "1" ] || return 1
-  grep -qx "APP_ENV_GID=$(id -g)" "$COMPOSE_ENV_FILE" || return 1
+  grep -qx "APP_ENV_GID=$(id -g "$(id -un)")" "$COMPOSE_ENV_FILE" || return 1
   assert_mode "$COMPOSE_ENV_FILE" 600 || return 1
   grep -q '^==> Added APP_ENV_GID=' "$CASE_DIR/release.log" || return 1
+}
+
+test_release_uses_primary_gid_when_effective_group_differs() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\n' > "$APP_ENV_FILE"
+  export APP_ENV_FILE
+
+  TEST_PRIMARY_GID="$($REAL_ID -g "$($REAL_ID -un)")"
+  TEST_EFFECTIVE_GID=$((TEST_PRIMARY_GID + 1))
+  export TEST_PRIMARY_GID TEST_EFFECTIVE_GID
+  cat > "$CASE_DIR/bin/id" <<'ID'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}:${2:-}" in
+  -un:) printf 'deploy-test\n' ;;
+  -g:) printf '%s\n' "$TEST_EFFECTIVE_GID" ;;
+  -g:deploy-test) printf '%s\n' "$TEST_PRIMARY_GID" ;;
+  *) exit 64 ;;
+esac
+ID
+  chmod +x "$CASE_DIR/bin/id"
+
+  run_release || return 1
+
+  grep -qx "APP_ENV_GID=$TEST_PRIMARY_GID" "$COMPOSE_ENV_FILE" || return 1
+  [ "$(file_gid "$APP_ENV_FILE")" = "$TEST_PRIMARY_GID" ] || return 1
 }
 
 test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
@@ -692,6 +727,7 @@ for test_name in \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
   test_release_backfills_env_gid_before_first_compose_call \
+  test_release_uses_primary_gid_when_effective_group_differs \
   test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \

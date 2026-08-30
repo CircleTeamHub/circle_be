@@ -110,12 +110,13 @@ APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 # gen-env.sh。必须在第一次 Compose 解析前原地补齐，否则升级永远卡在变量插值。
 # 只接受部署用户自己的主组，确保它既能安全 chgrp，又不会被配置注入额外宿主机组。
 prepare_app_env_access() {
-  local expected_gid configured_gid
+  local deploy_user expected_gid configured_gid
   [ -f "$COMPOSE_ENV_FILE" ] || {
     echo "Compose env file is missing: $COMPOSE_ENV_FILE" >&2
     return 1
   }
-  expected_gid="$(id -g)"
+  deploy_user="$(id -un)"
+  expected_gid="$(id -g "$deploy_user")"
   configured_gid="$(awk -F= '$1 == "APP_ENV_GID" { value = $2 } END { print value }' "$COMPOSE_ENV_FILE")"
   if [ -n "$configured_gid" ] && [ "$configured_gid" != "$expected_gid" ]; then
     echo "APP_ENV_GID=$configured_gid does not match deploy gid $expected_gid" >&2

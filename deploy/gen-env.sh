@@ -14,6 +14,12 @@ ACME_EMAIL="${4:?缺少 ACME_EMAIL}"
 WEB_DOMAIN="${5:?缺少 WEB_DOMAIN}"
 cd "$(dirname "$0")/.."
 
+# `newgrp docker` changes the effective group for this shell, but the next SSH
+# login returns to the account's primary group. Record that stable group so the
+# generated bind mount remains readable across sessions.
+DEPLOY_USER_NAME="$(id -un)"
+DEPLOY_PRIMARY_GID="$(id -g "$DEPLOY_USER_NAME")"
+
 # 32+ 位随机串,去掉 / + = 以免干扰 dotenv / URL 解析
 gen() { openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48; }
 
@@ -76,7 +82,7 @@ if [ -f .env.production ]; then
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
   grep -Eq '^WEB_DOMAIN=.+' .env || set_env_value .env WEB_DOMAIN "$WEB_DOMAIN"
-  grep -Eq '^APP_ENV_GID=[0-9]+$' .env || set_env_value .env APP_ENV_GID "$(id -g)"
+  grep -Eq '^APP_ENV_GID=[0-9]+$' .env || set_env_value .env APP_ENV_GID "$DEPLOY_PRIMARY_GID"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$ADMIN_DOMAIN"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$WEB_DOMAIN"
   if grep -q '^REDIS_PASSWORD=' .env; then
@@ -105,6 +111,7 @@ if [ -f .env.production ]; then
     ensure_compose_profile bundled-storage
   fi
   chmod 600 .env
+  chgrp "$DEPLOY_PRIMARY_GID" .env.production
   chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
   exit 0
@@ -129,7 +136,7 @@ API_DOMAIN=$API_DOMAIN
 ADMIN_DOMAIN=$ADMIN_DOMAIN
 ACME_EMAIL=$ACME_EMAIL
 WEB_DOMAIN=$WEB_DOMAIN
-APP_ENV_GID=$(id -g)
+APP_ENV_GID=$DEPLOY_PRIMARY_GID
 EOF
 
 cat > .env.production <<EOF
@@ -165,6 +172,7 @@ OBJECT_STORAGE_MANAGE_BUCKET=true
 EOF
 
 chmod 600 .env
+chgrp "$DEPLOY_PRIMARY_GID" .env.production
 chmod 640 .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"
