@@ -103,6 +103,37 @@ if ! flock -n 200; then
   exit 1
 fi
 
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
+APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
+
+# 旧服务器的 .env 早于 APP_ENV_GID：release rsync 会刻意保留配置，也不会重跑
+# gen-env.sh。必须在第一次 Compose 解析前原地补齐，否则升级永远卡在变量插值。
+# 只接受部署用户自己的主组，确保它既能安全 chgrp，又不会被配置注入额外宿主机组。
+prepare_app_env_access() {
+  local expected_gid configured_gid
+  [ -f "$COMPOSE_ENV_FILE" ] || {
+    echo "Compose env file is missing: $COMPOSE_ENV_FILE" >&2
+    return 1
+  }
+  expected_gid="$(id -g)"
+  configured_gid="$(awk -F= '$1 == "APP_ENV_GID" { value = $2 } END { print value }' "$COMPOSE_ENV_FILE")"
+  if [ -n "$configured_gid" ] && [ "$configured_gid" != "$expected_gid" ]; then
+    echo "APP_ENV_GID=$configured_gid does not match deploy gid $expected_gid" >&2
+    return 1
+  fi
+  if [ -z "$configured_gid" ]; then
+    printf '\nAPP_ENV_GID=%s\n' "$expected_gid" >> "$COMPOSE_ENV_FILE"
+    chmod 600 "$COMPOSE_ENV_FILE"
+    echo "==> Added APP_ENV_GID=$expected_gid to legacy Compose env"
+  fi
+  if [ -f "$APP_ENV_FILE" ]; then
+    chgrp "$expected_gid" "$APP_ENV_FILE"
+    chmod 640 "$APP_ENV_FILE"
+  fi
+}
+
+prepare_app_env_access
+
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
 }
@@ -583,7 +614,6 @@ set_release_env_value() {
 # 路径可覆盖,理由与 RELEASE_STATE_DIR / RELEASE_MARKER_PATH 相同:脚本第 28 行
 # 就 cd 到仓库根,契约测试也在仓库根跑 —— 写死路径会让跑一次测试就改掉开发机上
 # 真实的 .env.production。
-APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 # 尽力而为,失败绝不中断发版。脚本开头是 set -e:awk/mv 因磁盘写满或权限问题
 # 失败的话,会在迁移之后、进入 handle_post_migration_failure 之前直接退出 ——
 # 在 RELEASE_DOWNTIME=1 模式下旧色已经停了,于是 API 仅仅因为一个可观测性标签

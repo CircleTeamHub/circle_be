@@ -104,7 +104,8 @@ if [ -f .env.production ]; then
   if grep -Eq '^MINIO_ENDPOINT=http://minio:9000/?$' .env.production; then
     ensure_compose_profile bundled-storage
   fi
-  chmod 600 .env .env.production
+  chmod 600 .env
+  chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
   exit 0
 fi
@@ -163,7 +164,8 @@ OBJECT_STORAGE_FORCE_PATH_STYLE=true
 OBJECT_STORAGE_MANAGE_BUCKET=true
 EOF
 
-chmod 600 .env .env.production
+chmod 600 .env
+chmod 640 .env.production
 echo "✅ 已生成 .env 与 .env.production (PUBLIC_IP=$PUBLIC_IP)"
 echo "   ALLOWED_ORIGINS 已设置为 https://$ADMIN_DOMAIN,https://$WEB_DOMAIN"
 echo "   LiveKit(阶段6)配置稍后再追加到 .env.production"

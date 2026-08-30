@@ -17,13 +17,16 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
   export RELEASE_STATE_DIR="$CASE_DIR/release-state"
   export TEST_COMMAND_LOG="$CASE_DIR/commands.log"
+  export COMPOSE_ENV_FILE="$CASE_DIR/.env"
   mkdir -p "$TEST_STATE_DIR" "$RELEASE_STATE_DIR" "$CASE_DIR/bin"
+  printf 'DB_PASSWORD=test-only\n' > "$COMPOSE_ENV_FILE"
+  chmod 600 "$COMPOSE_ENV_FILE"
 
   cat > "$CASE_DIR/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
@@ -222,6 +225,7 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
@@ -387,6 +391,20 @@ test_release_stamps_sentry_release_before_starting_the_new_color() {
   }
 }
 
+test_release_backfills_env_gid_before_first_compose_call() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+
+  run_release || return 1
+
+  [ "$(grep -c '^APP_ENV_GID=' "$COMPOSE_ENV_FILE")" = "1" ] || return 1
+  grep -qx "APP_ENV_GID=$(id -g)" "$COMPOSE_ENV_FILE" || return 1
+  assert_mode "$COMPOSE_ENV_FILE" 600 || return 1
+  grep -q '^==> Added APP_ENV_GID=' "$CASE_DIR/release.log" || return 1
+}
+
 test_release_only_grants_the_deploy_group_read_access_after_atomic_replace() {
   # review #150(P1):打标签是「读 .env.production → 写临时文件 → mv 回去」,
   # 临时文件因此装着整份生产密钥。默认 umask 022 下它会落成 0644,在 mv 之前
@@ -435,8 +453,8 @@ test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
     echo "mv failure left a $(file_mode "${APP_ENV_FILE}.tmp") copy of the secrets behind" >&2
     return 1
   }
-  # 原文件必须原封不动(内容和权限都是),打标签失败不该动到它。
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  # 内容必须原封不动；发布前访问准备会把旧的 0600 规范化为部署组只读 0640。
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   grep -q '^JWT_SECRET=s3cr3t$' "$APP_ENV_FILE" || {
     echo "expected the original env file to survive a failed stamp untouched" >&2
     return 1
@@ -673,6 +691,7 @@ for test_name in \
   test_caddy_rate_limit_check_is_skipped_when_caddy_is_down \
   test_proxy_switch_precedes_old_color_retirement \
   test_release_stamps_sentry_release_before_starting_the_new_color \
+  test_release_backfills_env_gid_before_first_compose_call \
   test_release_only_grants_the_deploy_group_read_access_after_atomic_replace \
   test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets \
   test_release_survives_a_failed_sentry_stamp_in_downtime_mode \

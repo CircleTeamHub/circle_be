@@ -78,6 +78,8 @@ test('non-root app can read the group-protected production env file', () => {
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
   assert.match(generator, /APP_ENV_GID=\$\(id -g\)/);
+  assert.match(generator, /chmod 600 \.env\s+chmod 640 \.env\.production/);
+  assert.match(release, /prepare_app_env_access\s*\(\)/);
   assert.match(release, /chmod 640 "\$APP_ENV_FILE"/);
 });
 
