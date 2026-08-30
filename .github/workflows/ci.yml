@@ -275,6 +275,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build Caddy edge image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.caddy
+          push: false
+          load: true
+          tags: circle-caddy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify Caddy rate-limit module
+        run: |
+          docker run --rm circle-caddy:ci caddy list-modules \
+            | grep -Fx 'http.handlers.rate_limit'
+
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
@@ -284,6 +300,16 @@ jobs:
           ignore-unfixed: true
           trivyignores: .trivyignore
           exit-code: "1" # blocking — fails on any unignored fixable HIGH/CRITICAL
+
+      - name: Trivy Caddy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: circle-caddy:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1"
 
       - name: Job Duration
         if: always()
