@@ -82,6 +82,26 @@ else
   test "$(stat -c '%g' "$token_file")" = "$expected_gid"
 fi
 
+# A failed sync must never consume gen-env's durable reminder. Model Docker's
+# accidental non-empty directory at the bind-mount source: validation succeeds,
+# replacement fails, and the marker must remain for the next operator run.
+failed_token_path="$tmp_dir/non-empty-token-dir"
+failed_sync_marker="$tmp_dir/failed-sync-required"
+mkdir -p "$failed_token_path"
+printf 'keep\n' > "$failed_token_path/content"
+printf '%s\n' 'METRICS_AUTH_TOKEN=valid-but-unsynced' > "$env_file"
+: > "$failed_sync_marker"
+if ENV_FILE="$env_file" \
+  TOKEN_FILE="$failed_token_path" \
+  METRICS_SYNC_MARKER="$failed_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/failed-sync.log" 2>&1; then
+  echo 'expected metrics sync to reject a non-empty token directory' >&2
+  exit 1
+fi
+test -e "$failed_sync_marker"
+
 # A production sudoers policy may authorize only the two commands the sync
 # needs. Simulate that policy even when this suite itself runs as root: the fake
 # id keeps the script on its non-root path, while fake sudo rejects `true` and
