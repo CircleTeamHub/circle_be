@@ -10,6 +10,21 @@ fake_bin="$tmp_dir/bin"
 sudo_log="$tmp_dir/sudo.log"
 sync_marker="$tmp_dir/metrics-token-sync-required"
 export METRICS_SYNC_MARKER="$sync_marker"
+docker_log="$tmp_dir/docker.log"
+docker_stub="$tmp_dir/docker"
+cat > "$docker_stub" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+[ "${DOCKER_FAIL:-0}" != "1" ] || exit 1
+case "$*" in
+  *' ps --status running -q prometheus')
+    [ "${DOCKER_PS_EMPTY:-0}" = "1" ] || printf 'prometheus-test-id\n'
+    ;;
+esac
+SH
+chmod +x "$docker_stub"
+export DOCKER="$docker_stub"
+export DOCKER_LOG="$docker_log"
 
 cleanup() {
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
@@ -54,8 +69,9 @@ run_sync() {
     METRICS_SYNC_MARKER="$sync_marker" \
     PROM_UID="$prom_uid" \
     PROM_GID="$prom_gid" \
-    bash "$script"
+  bash "$script"
   test ! -e "$sync_marker"
+  grep -F 'compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus' "$docker_log" >/dev/null
 }
 
 read_token_file() {
@@ -101,6 +117,38 @@ if ENV_FILE="$env_file" \
   exit 1
 fi
 test -e "$failed_sync_marker"
+
+recreate_token_file="$tmp_dir/recreate-failure-token"
+recreate_sync_marker="$tmp_dir/recreate-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=recreate-failure-token' > "$env_file"
+: > "$recreate_sync_marker"
+if DOCKER_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$recreate_token_file" \
+  METRICS_SYNC_MARKER="$recreate_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/recreate-failure.log" 2>&1; then
+  echo 'expected metrics sync to fail when Prometheus recreate fails' >&2
+  exit 1
+fi
+test -e "$recreate_sync_marker"
+
+verify_token_file="$tmp_dir/verify-failure-token"
+verify_sync_marker="$tmp_dir/verify-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=verify-failure-token' > "$env_file"
+: > "$verify_sync_marker"
+if DOCKER_PS_EMPTY=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$verify_token_file" \
+  METRICS_SYNC_MARKER="$verify_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/verify-failure.log" 2>&1; then
+  echo 'expected metrics sync to fail when Prometheus is not running' >&2
+  exit 1
+fi
+test -e "$verify_sync_marker"
 
 # A production sudoers policy may authorize only the two commands the sync
 # needs. Simulate that policy even when this suite itself runs as root: the fake
@@ -196,6 +244,7 @@ fi
 # up locally. Write it, warn loudly, exit 0.
 local_file="$tmp_dir/local_token"
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-token' > "$env_file"
+: > "$sync_marker"
 local_out="$(ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
   PROM_UID="$prom_uid" \
@@ -209,6 +258,7 @@ case "$(uname -s)" in
   *) test "$(file_mode "$local_file")" = '600' ;;
 esac
 printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+test -e "$sync_marker"
 
 # Rotation still has to work on the following run — the file is ours now, which
 # must not be mistaken for the "owned by somebody else" case above.
