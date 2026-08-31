@@ -367,6 +367,8 @@ jobs:
           path: .trusted-release-tooling
           sparse-checkout: |
             deploy/release-deploy.sh
+            deploy/caddy-entrypoint.sh
+            deploy/overlay-trusted-release-tooling.sh
             deploy/app-env-preflight.sh
             deploy/Caddyfile.admin
             docker-compose.prod.yml
@@ -377,12 +379,8 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
-          mkdir -p deploy
-          install -m 0755 .trusted-release-tooling/deploy/release-deploy.sh deploy/release-deploy.sh
-          install -m 0644 .trusted-release-tooling/deploy/app-env-preflight.sh deploy/app-env-preflight.sh
-          install -m 0644 .trusted-release-tooling/deploy/Caddyfile.admin deploy/Caddyfile.admin
-          install -m 0644 .trusted-release-tooling/docker-compose.prod.yml docker-compose.prod.yml
-          install -m 0644 .trusted-release-tooling/docker-compose.release.yml docker-compose.release.yml
+          bash .trusted-release-tooling/deploy/overlay-trusted-release-tooling.sh \
+            .trusted-release-tooling .
           rm -rf -- .trusted-release-tooling
 
       - name: Configure SSH

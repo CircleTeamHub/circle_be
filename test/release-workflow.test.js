@@ -53,6 +53,8 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
   assert.match(block, /ref: \$\{\{ needs\.resolve\.outputs\.main_sha \}\}/);
   for (const operationalFile of [
     'deploy/release-deploy.sh',
+    'deploy/caddy-entrypoint.sh',
+    'deploy/overlay-trusted-release-tooling.sh',
     'deploy/app-env-preflight.sh',
     'deploy/Caddyfile.admin',
     'docker-compose.prod.yml',
@@ -90,8 +92,15 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       path.join(directory, 'docker-compose.prod.yml'),
       'old compose\n',
     );
+    assert.equal(
+      fs.existsSync(path.join(directory, 'deploy', 'caddy-entrypoint.sh')),
+      false,
+      'historical tree should model a tag from before the Caddy entrypoint existed',
+    );
     for (const operationalFile of [
       'deploy/release-deploy.sh',
+      'deploy/caddy-entrypoint.sh',
+      'deploy/overlay-trusted-release-tooling.sh',
       'deploy/app-env-preflight.sh',
       'deploy/Caddyfile.admin',
       'docker-compose.prod.yml',
@@ -123,6 +132,15 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       /group_add:[\s\S]*APP_ENV_GID/,
     );
     assert.equal(
+      fs.existsSync(path.join(directory, 'deploy', 'caddy-entrypoint.sh')),
+      true,
+      'current Compose must never be staged without its entrypoint',
+    );
+    fs.accessSync(
+      path.join(directory, 'deploy', 'caddy-entrypoint.sh'),
+      fs.constants.X_OK,
+    );
+    assert.equal(
       fs.readFileSync(
         path.join(directory, 'deploy', 'SCHEMA_COMPATIBILITY'),
         'utf8',
@@ -134,6 +152,28 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('documented offline rollback overlays live trusted tooling before activation', () => {
+  const deploymentGuide = fs.readFileSync(
+    path.join(__dirname, '..', 'DEPLOY.md'),
+    'utf8',
+  );
+  const offlineStart = deploymentGuide.indexOf(
+    '- **服务器上手动**(GitHub 不可用时)',
+  );
+  const databaseStart = deploymentGuide.indexOf('- **数据库**:', offlineStart);
+  const offline = deploymentGuide.slice(offlineStart, databaseStart);
+  const overlay = offline.indexOf(
+    'bash deploy/overlay-trusted-release-tooling.sh . ".release/incoming/$stage"',
+  );
+  const activation = offline.indexOf(
+    'bash .release/release-launcher.sh "$stage"',
+  );
+
+  assert.ok(offlineStart >= 0 && databaseStart > offlineStart);
+  assert.ok(overlay >= 0 && overlay < activation);
+  assert.match(offline, /不要从历史 checkout 运行同名脚本/);
 });
 
 test('manual rollback refuses unverified main deployment tooling even when target CI is forced', () => {

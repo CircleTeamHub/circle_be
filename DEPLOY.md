@@ -244,6 +244,9 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
     --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
     /path/to/external-v0.1.0-checkout/ ".release/incoming/$stage/"
+  # 历史 tag 只提供应用与 schema 元数据。必须从当前 live tree 叠加最后一套已上线、
+  # 已验证的部署契约；不要从历史 checkout 运行同名脚本。
+  bash deploy/overlay-trusted-release-tooling.sh . ".release/incoming/$stage"
   TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
   RELEASE_TAG=v0.1.0 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
