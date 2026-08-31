@@ -63,7 +63,7 @@ test('manual rollback rejects application tags below the trusted runtime contrac
       '#!/usr/bin/env bash\nprintf "%s\\n" "$TRUSTED_RUNTIME"\n',
     );
     fs.chmodSync(git, 0o755);
-    const runGate = (target, trusted = '1') => {
+    const runGate = (target, trusted = '2') => {
       const targetFile = path.join(deploy, 'RELEASE_RUNTIME_COMPATIBILITY');
       if (target === null) fs.rmSync(targetFile, { force: true });
       else fs.writeFileSync(targetFile, `${target}\n`);
@@ -78,11 +78,12 @@ test('manual rollback rejects application tags below the trusted runtime contrac
       });
     };
 
-    assert.equal(runGate('1').status, 0);
+    assert.equal(runGate('2').status, 0);
+    assert.notEqual(runGate('1').status, 0);
     assert.notEqual(runGate(null).status, 0);
     assert.notEqual(runGate('0').status, 0);
     assert.notEqual(runGate('invalid').status, 0);
-    assert.notEqual(runGate('1', 'invalid').status, 0);
+    assert.notEqual(runGate('2', 'invalid').status, 0);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

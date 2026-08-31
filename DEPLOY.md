@@ -227,9 +227,10 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   `deploy/RELEASE_RUNTIME_COMPATIBILITY` 且兼容级别不低于当前可信主线的旧 tag。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
-- **首次启用 runtime contract**:先按 `docs/release-hardening-runbook.md` 原子升级
-  root 持有的 ForceCommand 与 launcher，再发布并保留第一个 compatibility=1 tag，
-  把它作为新的最早在线回滚点。未包含 runtime marker 的历史 tag 会被工作流、
+- **提升 runtime contract**:先按 `docs/release-hardening-runbook.md` 原子升级
+  root 持有的 ForceCommand 与 launcher，再发布并保留当前兼容级别的第一个成功 tag
+  （当前 `compatibility=2`），把它作为新的最早在线回滚点。更低级别或未包含
+  runtime marker 的历史 tag 会被工作流、
   ForceCommand capability preflight 和 launcher 拒绝，`force` 也不能绕过。
 - **pre-contract 灾备**:若必须恢复到没有 runtime marker 的历史版本，不要把它送入
   当前 live tree。应恢复该版本同期的整机/数据卷、`.env.production` 与数据库备份，

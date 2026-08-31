@@ -71,13 +71,65 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
   assert.match(caddy, apiFallbackHandle);
 });
 
+test('production app env access uses recoverable group-read transactions', () => {
+  const compose = read('docker-compose.prod.yml');
+  const generator = read('deploy/gen-env.sh');
+  const release = read('deploy/release-deploy.sh');
+  const admin = read('deploy/admin-web-deploy.sh');
+  const ci = read('.github/workflows/ci.yml');
+  const deployDocs = read('DEPLOY.md');
+  const runtimeCompatibility = read(
+    'deploy/RELEASE_RUNTIME_COMPATIBILITY',
+  ).trim();
+
+  assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
+  assert.equal(runtimeCompatibility, '2');
+  assert.ok(
+    deployDocs.includes(`当前 \`compatibility=${runtimeCompatibility}\``),
+    'rollback docs must name the current runtime compatibility baseline',
+  );
+  assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
+  assert.match(generator, /prepare_empty_secret_file "\$tmp"/);
+  assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
+  assert.match(generator, /chmod 640 \.env\.production/);
+  assert.match(generator, /必须先通过 Release 工作流完成可恢复权限迁移/);
+  assert.match(release, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(release, /\. deploy\/app-env-transaction\.sh/);
+  assert.match(
+    release,
+    /initialize_app_env_transaction[\s\S]*prepare_compose_app_env_gid[\s\S]*recover_interrupted_app_env_transaction/,
+  );
+  assert.match(release, /stage_app_env_for_new_container/);
+  assert.match(release, /restore_legacy_app_env_access/);
+  assert.match(release, /commit_app_env_transaction/);
+  assert.match(admin, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(admin, /prepare_compose_app_env_gid "\$COMPOSE_ENV_FILE"/);
+  assert.match(ci, /Verify both non-root app colors can read the protected env/);
+  assert.match(ci, /fs\.accessSync\('\/app\/\.env\.production',fs\.constants\.R_OK\)/);
+});
+
 test('Caddy switches only between unique blue-green container endpoints', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const deploy = read('deploy/release-deploy.sh');
   const productionCompose = read('docker-compose.prod.yml');
   const releaseCompose = read('docker-compose.release.yml');
   const healthGate = deploy.indexOf('if ! wait_healthy "$standby" 300; then');
-  const cutover = deploy.indexOf('if ! switch_proxy "$standby"; then');
+  const cutover = deploy.indexOf(
+    'switch_proxy "$standby" || switch_proxy_status=$?',
+  );
+  const activeColorPersist = deploy.indexOf(
+    'if ! persist_active_color "$standby"',
+    cutover,
+  );
+  const smokeDecision = deploy.indexOf('if smoke; then', cutover);
+  const transactionCommit = deploy.indexOf(
+    'commit_app_env_transaction',
+    smokeDecision,
+  );
+  const restoreSignals = deploy.indexOf(
+    'restore_release_signals',
+    transactionCommit,
+  );
 
   assert.doesNotMatch(productionCompose, /circle-be-app/);
   assert.doesNotMatch(releaseCompose, /circle-be-app/);
@@ -97,6 +149,15 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
   assert.ok(
     healthGate >= 0 && healthGate < cutover,
     'standby health must precede cutover',
+  );
+  assert.match(
+    deploy.slice(cutover, activeColorPersist),
+    /switch_proxy[\s\S]*cutover_activated=1/,
+  );
+  assert.doesNotMatch(deploy.slice(cutover, smokeDecision), /restore_release_signals/);
+  assert.ok(
+    smokeDecision < transactionCommit && transactionCommit < restoreSignals,
+    'signals must remain deferred until public smoke commits or rolls back',
   );
 });
 

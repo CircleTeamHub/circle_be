@@ -74,6 +74,17 @@ describe('production Redis deployment configuration', () => {
     );
     const password = firstComposeEnv.match(/^REDIS_PASSWORD=(.+)$/m)?.[1];
     const originalSecret = firstAppEnv.match(/^SECRET=(.+)$/m)?.[1];
+    const primaryGid =
+      process.platform === 'win32'
+        ? undefined
+        : Number(
+            execFileSync('/usr/bin/id', [
+              '-g',
+              execFileSync('/usr/bin/id', ['-un']).toString().trim(),
+            ])
+              .toString()
+              .trim(),
+          );
 
     expect(password).toMatch(/^[a-f0-9]{48}$/);
     expect(firstAppEnv).toContain(
@@ -88,10 +99,12 @@ describe('production Redis deployment configuration', () => {
       'ALLOWED_ORIGINS=https://admin.example.com,https://app.example.com',
     );
     if (process.platform !== 'win32') {
+      expect(firstComposeEnv).toContain(`APP_ENV_GID=${primaryGid}`);
       expect(statSync(join(workspace, '.env')).mode & 0o777).toBe(0o600);
       expect(statSync(join(workspace, '.env.production')).mode & 0o777).toBe(
-        0o600,
+        0o640,
       );
+      expect(statSync(join(workspace, '.env.production')).gid).toBe(primaryGid);
     }
 
     const composeStat = statSync(join(workspace, '.env'));
@@ -110,6 +123,73 @@ describe('production Redis deployment configuration', () => {
     expect(statSync(join(workspace, '.env')).ino).toBe(composeStat.ino);
     expect(statSync(join(workspace, '.env.production')).ino).toBe(appStat.ino);
     expect(firstAppEnv).toContain(`SECRET=${originalSecret}`);
+  });
+
+  it('clears inherited default ACLs before writing fresh secrets', () => {
+    if (process.platform !== 'linux') return;
+    for (const command of ['setfacl', 'getfacl']) {
+      if (spawnSync(command, ['--version'], { stdio: 'ignore' }).status !== 0)
+        return;
+    }
+    if (
+      spawnSync('getent', ['passwd', 'nobody'], { stdio: 'ignore' }).status !==
+      0
+    )
+      return;
+
+    const workspace = createWorkspace('circle-default-acl-env-');
+    mkdirSync(join(workspace, 'deploy'));
+    cpSync(
+      join(repositoryRoot, 'deploy', 'gen-env.sh'),
+      join(workspace, 'deploy', 'gen-env.sh'),
+    );
+    execFileSync('setfacl', ['-m', 'u:nobody:r-x,d:u:nobody:r-x', workspace]);
+
+    const bin = join(workspace, 'bin');
+    mkdirSync(bin);
+    const catProbe = join(bin, 'cat');
+    writeFileSync(
+      catProbe,
+      `#!/usr/bin/env bash
+set -euo pipefail
+for file in .env.tmp .env.production.tmp; do
+  if [ -e "$file" ] && getfacl -cp "$file" | grep -q '^user:nobody:'; then
+    echo "named ACL was still active before secrets were written to $file" >&2
+    exit 91
+  fi
+done
+exec "$REAL_CAT" "$@"
+`,
+      { mode: 0o755 },
+    );
+    const realCat = execFileSync('/bin/sh', ['-c', 'command -v cat'])
+      .toString()
+      .trim();
+    execFileSync(
+      bashExecutable,
+      [
+        'deploy/gen-env.sh',
+        '203.0.113.10',
+        'api.example.com',
+        'admin.example.com',
+        'ops@example.com',
+        'app.example.com',
+      ],
+      {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          REAL_CAT: realCat,
+        },
+      },
+    );
+
+    const acl = execFileSync('getfacl', [
+      '-cp',
+      join(workspace, '.env.production'),
+    ]).toString();
+    expect(acl).not.toMatch(/^user:nobody:/m);
   });
 
   it('bounds Redis memory and lets application config choose the endpoint', () => {
@@ -211,7 +291,6 @@ describe('production Redis deployment configuration', () => {
         '',
       ].join('\n'),
     );
-
     const originalComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const originalAppEnv = readFileSync(
       join(workspace, '.env.production'),

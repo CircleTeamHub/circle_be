@@ -12,6 +12,10 @@ initialize_app_env_transaction() {
   app_env_staged_file=""
   app_env_transaction_committed=0
   app_env_transaction_active=0
+  app_env_recovery_deferred=0
+  recovered_app_env_cutover_color=""
+  recovered_app_env_previous_color=""
+  recovered_app_env_recovery_phase=""
 }
 
 clear_app_env_acl() {
@@ -89,6 +93,36 @@ recover_interrupted_app_env_transaction() {
       fi
       clear_app_env_transaction_state
       ;;
+    cutover-pending:*|cutover:*|rollback-pending:*)
+      local cutover_fields phase target previous
+      IFS=: read -r phase target previous cutover_fields <<< "$state"
+      case "$phase:$target:$previous" in
+        cutover-pending:circle_be:circle_be_green|cutover-pending:circle_be_green:circle_be|cutover-pending:circle_be:none|cutover-pending:circle_be_green:none|cutover:circle_be:circle_be_green|cutover:circle_be_green:circle_be|cutover:circle_be:none|cutover:circle_be_green:none|rollback-pending:circle_be:circle_be_green|rollback-pending:circle_be_green:circle_be) ;;
+        *) echo "Invalid app env cutover transaction state: $state" >&2; return 1 ;;
+      esac
+      [ -z "$cutover_fields" ] || {
+        echo "Invalid app env cutover transaction state: $state" >&2
+        return 1
+      }
+      [ -e "$APP_ENV_FILE" ] || {
+        echo "Interrupted cutover is missing an app env version; refusing recovery" >&2
+        return 1
+      }
+      if [ "$phase" != "rollback-pending" ] && [ ! -e "$APP_ENV_BACKUP_PATH" ]; then
+        echo "Interrupted cutover is missing its legacy app env backup; refusing recovery" >&2
+        return 1
+      fi
+      rm -f "$APP_ENV_STAGED_PATH"
+      recovered_app_env_cutover_color="$target"
+      recovered_app_env_previous_color="$previous"
+      recovered_app_env_recovery_phase="$phase"
+      if [ -e "$APP_ENV_BACKUP_PATH" ]; then
+        legacy_app_env_backup="$APP_ENV_BACKUP_PATH"
+      fi
+      app_env_transaction_active=1
+      app_env_recovery_deferred=1
+      echo "==> Found interrupted cutover to $recovered_app_env_cutover_color; deferring env recovery until Caddy is reconciled" >&2
+      ;;
     committed)
       rm -f "$APP_ENV_BACKUP_PATH" "$APP_ENV_STAGED_PATH"
       clear_app_env_transaction_state
@@ -98,6 +132,42 @@ recover_interrupted_app_env_transaction() {
       return 1
       ;;
   esac
+}
+
+mark_app_env_cutover_pending() {
+  local color="$1" previous="$2"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  case "$color" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  case "$previous" in circle_be|circle_be_green|none) ;; *) return 1 ;; esac
+  [ "$color" != "$previous" ] || return 1
+  persist_app_env_transaction_state "cutover-pending:$color:$previous" || return 1
+  app_env_recovery_deferred=1
+}
+
+mark_app_env_rollback_pending() {
+  local color="$1" failed="$2"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  case "$color" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  case "$failed" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  [ "$color" != "$failed" ] || return 1
+  persist_app_env_transaction_state "rollback-pending:$color:$failed" || return 1
+  app_env_recovery_deferred=1
+}
+
+mark_app_env_cutover_complete() {
+  local color="$1" previous="$2"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  case "$color" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  case "$previous" in circle_be|circle_be_green|none) ;; *) return 1 ;; esac
+  [ "$color" != "$previous" ] || return 1
+  persist_app_env_transaction_state "cutover:$color:$previous"
+}
+
+mark_app_env_cutover_rolled_back() {
+  local state="staged"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  irreversible_boundary_crossed && state="staged-irreversible"
+  persist_app_env_transaction_state "$state"
 }
 
 stage_app_env_for_new_container() {
@@ -151,6 +221,27 @@ restore_legacy_app_env_access() {
   echo "==> Restored legacy app env access for the previous container" >&2
 }
 
+restore_legacy_app_env_access_for_rollback() {
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
+    rm -f "$APP_ENV_FILE"
+    mv "$legacy_app_env_backup" "$APP_ENV_FILE" || return 1
+    legacy_app_env_backup=""
+    echo "==> Restored legacy app env access for rollback" >&2
+  fi
+  [ -e "$APP_ENV_FILE" ]
+}
+
+complete_app_env_rollback_transaction() {
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  [ ! -e "$APP_ENV_BACKUP_PATH" ] || return 1
+  app_env_recovery_deferred=0
+  recovered_app_env_cutover_color=""
+  recovered_app_env_previous_color=""
+  recovered_app_env_recovery_phase=""
+  clear_app_env_transaction_state
+}
+
 discard_legacy_app_env_backup() {
   [ -n "$legacy_app_env_backup" ] || return 0
   rm -f "$legacy_app_env_backup"
@@ -161,6 +252,10 @@ commit_app_env_transaction() {
   [ "$app_env_transaction_active" = "1" ] || return 0
   persist_app_env_transaction_state committed || return 1
   app_env_transaction_committed=1
+  app_env_recovery_deferred=0
+  recovered_app_env_cutover_color=""
+  recovered_app_env_previous_color=""
+  recovered_app_env_recovery_phase=""
   discard_legacy_app_env_backup || return 1
   clear_app_env_transaction_state
 }
