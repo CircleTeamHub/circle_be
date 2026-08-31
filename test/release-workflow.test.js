@@ -135,3 +135,57 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('manual rollback refuses unverified main deployment tooling even when target CI is forced', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  const gate = workflow.indexOf(
+    '- name: Verify CI succeeded for trusted deployment tooling',
+  );
+  const resolver = workflow.indexOf('- name: Resolve immutable image');
+  assert.ok(gate >= 0 && gate < resolver);
+
+  const block = workflow.slice(gate, resolver);
+  assert.match(
+    block,
+    /if: \$\{\{ github\.event_name == 'workflow_dispatch' \}\}/,
+  );
+  assert.doesNotMatch(block, /inputs\.force/);
+  assert.match(block, /SHA: \$\{\{ steps\.verify\.outputs\.main_sha \}\}/);
+
+  const script = block
+    .slice(block.indexOf('        run: |\n') + '        run: |\n'.length)
+    .split(/\r?\n/)
+    .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
+    .join('\n');
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'circle-main-tooling-ci-'),
+  );
+  try {
+    const gh = path.join(directory, 'gh');
+    fs.writeFileSync(gh, '#!/usr/bin/env bash\nprintf "%s\\n" "$CI_CONCLUSION"\n');
+    fs.chmodSync(gh, 0o755);
+    const runGate = (conclusion) =>
+      spawnSync('/bin/bash', ['-c', script], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${directory}:${process.env.PATH}`,
+          CI_CONCLUSION: conclusion,
+          GITHUB_REPOSITORY: 'CircleTeamHub/circle_be',
+          SHA: '0123456789abcdef0123456789abcdef01234567',
+        },
+      });
+
+    assert.equal(runGate('success').status, 0);
+    for (const conclusion of ['', 'pending', 'failure']) {
+      const result = runGate(conclusion);
+      assert.notEqual(result.status, 0, `must reject ${conclusion || 'missing'} CI`);
+      assert.match(result.stderr, /trusted deployment tooling/);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
