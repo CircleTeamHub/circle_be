@@ -122,9 +122,9 @@ clear_app_env_acl() {
   case "$(uname -s)" in
     Linux)
       if command -v "$setfacl_command" >/dev/null; then
-        "$setfacl_command" -b "$file"
+        "$setfacl_command" -b "$file" || return 1
         if [ -d "$file" ]; then
-          "$setfacl_command" -k "$file"
+          "$setfacl_command" -k "$file" || return 1
         fi
       else
         mode="$(LC_ALL=C ls -ld -- "$file" | awk '{ print $1 }')"
