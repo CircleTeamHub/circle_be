@@ -263,11 +263,12 @@ CHMOD
 set -euo pipefail
 target="${@: -1}"
 if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ] &&
-  [ "$target" = "${APP_ENV_FILE}.tmp" ]; then
-  count_file="$CASE_DIR/sentry-tmp-setfacl-count"
-  count=$(($(cat "$count_file" 2>/dev/null || echo 0) + 1))
-  printf '%s\n' "$count" > "$count_file"
-  [ "$count" -lt 2 ] || exit 51
+  [ "$target" = "${APP_ENV_FILE}.tmp" ] &&
+  grep -q '^SENTRY_RELEASE=circle-be@v1\.2\.3$' "$target"; then
+  # Fail the post-write ACL cleanup specifically. Counting setfacl calls is
+  # brittle because transaction-directory hardening can legitimately add more
+  # calls before the Sentry temporary file reaches this state.
+  exit 51
 fi
 if [ -n "$REAL_SETFACL" ]; then
   exec "$REAL_SETFACL" "$@"
