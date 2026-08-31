@@ -238,6 +238,7 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   激活。不要直接执行目标树内的 `deploy/release-deploy.sh`。
 
   ```bash
+  set -euo pipefail
   cd ~/circle_be
   stage=manual-v0.1.0-$(date +%s)
   mkdir -p ".release/incoming/$stage"

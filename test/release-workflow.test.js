@@ -28,6 +28,15 @@ test('release workflow signs and stages the exact immutable release manifest', (
 });
 
 test('manual rollback keeps current trusted deploy tooling with the historical application tag', () => {
+  const operationalFiles = [
+    'deploy/release-deploy.sh',
+    'deploy/caddy-entrypoint.sh',
+    'deploy/overlay-trusted-release-tooling.sh',
+    'deploy/app-env-preflight.sh',
+    'deploy/Caddyfile.admin',
+    'docker-compose.prod.yml',
+    'docker-compose.release.yml',
+  ];
   const workflow = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),
     'utf8',
@@ -51,15 +60,7 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     /if: \$\{\{ github\.event_name == 'workflow_dispatch' \}\}/,
   );
   assert.match(block, /ref: \$\{\{ needs\.resolve\.outputs\.main_sha \}\}/);
-  for (const operationalFile of [
-    'deploy/release-deploy.sh',
-    'deploy/caddy-entrypoint.sh',
-    'deploy/overlay-trusted-release-tooling.sh',
-    'deploy/app-env-preflight.sh',
-    'deploy/Caddyfile.admin',
-    'docker-compose.prod.yml',
-    'docker-compose.release.yml',
-  ]) {
+  for (const operationalFile of operationalFiles) {
     assert.match(block, new RegExp(operationalFile.replaceAll('.', '\\.')));
   }
   assert.doesNotMatch(
@@ -84,28 +85,19 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       path.join(directory, 'deploy', 'SCHEMA_COMPATIBILITY'),
       '0\n',
     );
-    fs.writeFileSync(
-      path.join(directory, 'deploy', 'release-deploy.sh'),
-      'old deploy\n',
-    );
-    fs.writeFileSync(
-      path.join(directory, 'docker-compose.prod.yml'),
-      'old compose\n',
-    );
+    for (const operationalFile of operationalFiles) {
+      if (operationalFile === 'deploy/caddy-entrypoint.sh') continue;
+      const historical = path.join(directory, operationalFile);
+      fs.mkdirSync(path.dirname(historical), { recursive: true });
+      fs.writeFileSync(historical, `historical:${operationalFile}\n`);
+      fs.chmodSync(historical, 0o600);
+    }
     assert.equal(
       fs.existsSync(path.join(directory, 'deploy', 'caddy-entrypoint.sh')),
       false,
       'historical tree should model a tag from before the Caddy entrypoint existed',
     );
-    for (const operationalFile of [
-      'deploy/release-deploy.sh',
-      'deploy/caddy-entrypoint.sh',
-      'deploy/overlay-trusted-release-tooling.sh',
-      'deploy/app-env-preflight.sh',
-      'deploy/Caddyfile.admin',
-      'docker-compose.prod.yml',
-      'docker-compose.release.yml',
-    ]) {
+    for (const operationalFile of operationalFiles) {
       const destination = path.join(trusted, operationalFile);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.copyFileSync(path.join(__dirname, '..', operationalFile), destination);
@@ -127,6 +119,27 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       encoding: 'utf8',
     });
     assert.equal(result.status, 0, result.stderr);
+    for (const operationalFile of operationalFiles) {
+      const installed = path.join(directory, operationalFile);
+      const source = path.join(__dirname, '..', operationalFile);
+      assert.deepEqual(
+        fs.readFileSync(installed),
+        fs.readFileSync(source),
+        `${operationalFile} must come from the trusted source`,
+      );
+      const expectedMode = [
+        'deploy/release-deploy.sh',
+        'deploy/caddy-entrypoint.sh',
+        'deploy/overlay-trusted-release-tooling.sh',
+      ].includes(operationalFile)
+        ? 0o755
+        : 0o644;
+      assert.equal(
+        fs.statSync(installed).mode & 0o777,
+        expectedMode,
+        `${operationalFile} must have its operational mode`,
+      );
+    }
     assert.match(
       fs.readFileSync(path.join(directory, 'docker-compose.prod.yml'), 'utf8'),
       /group_add:[\s\S]*APP_ENV_GID/,
@@ -173,7 +186,55 @@ test('documented offline rollback overlays live trusted tooling before activatio
 
   assert.ok(offlineStart >= 0 && databaseStart > offlineStart);
   assert.ok(overlay >= 0 && overlay < activation);
+  assert.match(offline, /```bash\s+set -euo pipefail/);
   assert.match(offline, /不要从历史 checkout 运行同名脚本/);
+
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'circle-offline-rollback-failure-'),
+  );
+  try {
+    const target = path.join(directory, 'target');
+    const launcher = path.join(directory, 'release-launcher.sh');
+    const sentinel = path.join(directory, 'launcher-ran');
+    fs.mkdirSync(target);
+    fs.writeFileSync(
+      launcher,
+      '#!/usr/bin/env bash\n: > "$LAUNCHER_SENTINEL"\n',
+    );
+    fs.chmodSync(launcher, 0o755);
+    const helper = path.join(
+      __dirname,
+      '..',
+      'deploy',
+      'overlay-trusted-release-tooling.sh',
+    );
+    const result = spawnSync(
+      '/bin/bash',
+      [
+        '-c',
+        'set -euo pipefail\nbash "$HELPER" "$MISSING_SOURCE" "$TARGET"\nbash "$LAUNCHER"',
+      ],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HELPER: helper,
+          MISSING_SOURCE: path.join(directory, 'missing'),
+          TARGET: target,
+          LAUNCHER: launcher,
+          LAUNCHER_SENTINEL: sentinel,
+        },
+      },
+    );
+    assert.notEqual(result.status, 0);
+    assert.equal(
+      fs.existsSync(sentinel),
+      false,
+      'offline activation must not run after a partial tooling overlay',
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('manual rollback refuses unverified main deployment tooling even when target CI is forced', () => {
