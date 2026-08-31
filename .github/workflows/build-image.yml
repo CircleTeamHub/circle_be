@@ -1,10 +1,10 @@
 # Build-once half of the build-once-promote release architecture.
 #
-# Every push to main cross-builds the production image for the Oracle ARM box,
-# scans that exact ARM64 image, and only then pushes `sha-<commit>` (immutable)
-# plus a `main` convenience tag. A release (release.yml) then *promotes* it by
-# stamping it with the version tag — no rebuild — which guarantees the deployed
-# artifact is byte-identical to the ARM64 image scanned here and keeps releases
+# Every push to main builds the production image for the configured server
+# platform, scans that exact image, and only then pushes `sha-<commit>-<arch>`
+# (immutable) plus `main-<arch>` and the migration-period `main` alias. A release then
+# *promotes* it by stamping `v<tag>-<arch>` — no rebuild — which guarantees the deployed
+# artifact is byte-identical to the platform image scanned here and keeps releases
 # down to minutes.
 #
 # If this build fails, release.yml fails closed instead of rebuilding source at
@@ -35,7 +35,7 @@ permissions:
 jobs:
   build_push:
     runs-on: ubuntu-latest
-    name: "Build, scan & push linux/arm64 image"
+    name: "Build, scan & push release image"
     timeout-minutes: 90
     permissions:
       contents: read
@@ -44,10 +44,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Compute image repository
+      - name: Compute image repository and platform
         id: meta
-        # GHCR requires a lowercase repository path.
-        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_PLATFORM: ${{ vars.RELEASE_PLATFORM || 'linux/arm64' }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "Unsupported RELEASE_PLATFORM: $RELEASE_PLATFORM" >&2; exit 1 ;;
+          esac
+          # GHCR requires a lowercase repository path.
+          echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "platform=$RELEASE_PLATFORM" >> "$GITHUB_OUTPUT"
+          echo "arch=${RELEASE_PLATFORM#linux/}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -64,16 +74,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and load ARM64 image
+      - name: Build and load release image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.prod
-          platforms: linux/arm64
+          platforms: ${{ steps.meta.outputs.platform }}
           push: false
           load: true
           tags: |
-            ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+            ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
+            ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
             ${{ steps.meta.outputs.repo }}:main
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -84,10 +95,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan releasable ARM64 image
+      - name: Scan releasable image
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
-          image-ref: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
+          image-ref: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
           scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
@@ -96,12 +107,14 @@ jobs:
 
       - name: Push scanned image tags
         env:
-          SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}
-          MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main
+          SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
+          MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
+          LEGACY_MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main
         run: |
           set -euo pipefail
           docker push "$SHA_IMAGE"
           docker push "$MAIN_IMAGE"
+          docker push "$LEGACY_MAIN_IMAGE"
 
       # A missing main image blocks release, so report build failure loudly.
       - name: Notify Discord on failure

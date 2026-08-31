@@ -1,11 +1,12 @@
 # Promote half of the build-once-promote release architecture.
 #
 # Pushing a `v*` tag (or dispatching this workflow with an existing tag)
-# releases that commit to the Oracle ARM server:
+# releases that commit to the configured server platform:
 #
 #   resolve   — pin the tag to a commit, require it to be on main with a green
 #               CI run, and resolve an existing immutable registry manifest
-#   promote   — on tag push only, stamp the prebuilt sha image with the version tag
+#   promote   — stamp the prebuilt platform-specific sha image with a matching
+#               platform-specific version image tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
 #   deploy    — stage the tagged repo through the server ForceCommand protocol,
@@ -74,6 +75,8 @@ jobs:
       digest: ${{ steps.image.outputs.digest }}
       image_ref: ${{ steps.image.outputs.image_ref }}
       needs_promotion: ${{ steps.image.outputs.needs_promotion }}
+      legacy_release_image: ${{ steps.image.outputs.legacy_release_image }}
+      needs_legacy_promotion: ${{ steps.image.outputs.needs_legacy_promotion }}
       schema_compatibility: ${{ steps.compatibility.outputs.level }}
     steps:
       - name: Determine release tag
@@ -185,16 +188,41 @@ jobs:
           SHA: ${{ steps.verify.outputs.sha }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PLATFORM: ${{ vars.RELEASE_PLATFORM || 'linux/arm64' }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha_image="$repo:sha-$SHA"
-          release_image="$repo:$RELEASE_TAG"
+          case "$RELEASE_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "Unsupported RELEASE_PLATFORM: $RELEASE_PLATFORM" >&2; exit 1 ;;
+          esac
+          arch="${RELEASE_PLATFORM#linux/}"
+          sha_image="$repo:sha-$SHA-$arch"
+          release_image="$repo:$RELEASE_TAG-$arch"
+          legacy_sha_image="$repo:sha-$SHA"
+          legacy_release_image="$repo:$RELEASE_TAG"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
           digest_of() {
             docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
               jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+          }
+
+          platform_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
+              jq -er '"\(.os)/\(.architecture)"'
+          }
+
+          require_release_platform() {
+            local image="$1" actual
+            actual="$(platform_of "$image")" || {
+              echo "Could not determine platform for legacy image $image." >&2
+              return 1
+            }
+            if [ "$actual" != "$RELEASE_PLATFORM" ]; then
+              echo "Legacy image $image is $actual, expected $RELEASE_PLATFORM." >&2
+              return 1
+            fi
           }
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -205,11 +233,27 @@ jobs:
               fi
               needs_promotion=false
             else
-              if ! digest="$(digest_of "$sha_image")"; then
-                echo "Neither release image $release_image nor prebuilt commit image $sha_image exists." >&2
+              if digest="$(digest_of "$sha_image" 2>/dev/null)"; then
+                needs_promotion=true
+              elif digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_release_image"
+                if legacy_sha_digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                  require_release_platform "$legacy_sha_image"
+                  if [ "$legacy_sha_digest" != "$digest" ]; then
+                    echo "Refusing mismatched legacy release image: $legacy_release_image ($digest != $legacy_sha_digest)." >&2
+                    exit 1
+                  fi
+                fi
+                release_image="$legacy_release_image"
+                needs_promotion=false
+              elif digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_sha_image"
+                sha_image="$legacy_sha_image"
+                needs_promotion=true
+              else
+                echo "No platform-specific or compatible legacy image exists for $RELEASE_TAG ($SHA)." >&2
                 exit 1
               fi
-              needs_promotion=true
             fi
           else
             if ! digest="$(digest_of "$sha_image")"; then
@@ -228,12 +272,27 @@ jobs:
             fi
           fi
 
+          needs_legacy_promotion=false
+          if [ "$release_image" != "$legacy_release_image" ]; then
+            if legacy_release_digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+              require_release_platform "$legacy_release_image"
+              if [ "$legacy_release_digest" != "$digest" ]; then
+                echo "Refusing to overwrite legacy release alias: $legacy_release_image ($legacy_release_digest != $digest)." >&2
+                exit 1
+              fi
+            else
+              needs_legacy_promotion=true
+            fi
+          fi
+
           {
             echo "sha_image=$sha_image"
             echo "release_image=$release_image"
             echo "digest=$digest"
             echo "image_ref=$repo@$digest"
             echo "needs_promotion=$needs_promotion"
+            echo "legacy_release_image=$legacy_release_image"
+            echo "needs_legacy_promotion=$needs_legacy_promotion"
           } >> "$GITHUB_OUTPUT"
 
   # Stamp the sha image with the immutable version tag. A manifest copy inside
@@ -243,7 +302,7 @@ jobs:
     runs-on: ubuntu-latest
     name: "Promote image to version tag"
     needs: [resolve]
-    if: ${{ needs.resolve.outputs.needs_promotion == 'true' }}
+    if: ${{ needs.resolve.outputs.needs_promotion == 'true' || needs.resolve.outputs.needs_legacy_promotion == 'true' }}
     timeout-minutes: 10
     permissions:
       packages: write
@@ -260,14 +319,23 @@ jobs:
           EXPECTED_DIGEST: ${{ needs.resolve.outputs.digest }}
           SHA_IMAGE: ${{ needs.resolve.outputs.sha_image }}
           RELEASE_IMAGE: ${{ needs.resolve.outputs.release_image }}
+          LEGACY_RELEASE_IMAGE: ${{ needs.resolve.outputs.legacy_release_image }}
+          NEEDS_PROMOTION: ${{ needs.resolve.outputs.needs_promotion }}
+          NEEDS_LEGACY_PROMOTION: ${{ needs.resolve.outputs.needs_legacy_promotion }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create -t "$RELEASE_IMAGE" "$SHA_IMAGE"
-          actual="$(docker buildx imagetools inspect "$RELEASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')"
-          if [ "$actual" != "$EXPECTED_DIGEST" ]; then
-            echo "Promoted digest mismatch: $actual != $EXPECTED_DIGEST" >&2
-            exit 1
-          fi
+          for promotion in \
+            "$NEEDS_PROMOTION:$RELEASE_IMAGE" \
+            "$NEEDS_LEGACY_PROMOTION:$LEGACY_RELEASE_IMAGE"; do
+            [ "${promotion%%:*}" = "true" ] || continue
+            target="${promotion#*:}"
+            docker buildx imagetools create -t "$target" "$SHA_IMAGE"
+            actual="$(docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' | jq -er '.digest')"
+            if [ "$actual" != "$EXPECTED_DIGEST" ]; then
+              echo "Promoted digest mismatch for $target: $actual != $EXPECTED_DIGEST" >&2
+              exit 1
+            fi
+          done
 
   deploy:
     runs-on: ubuntu-latest

@@ -147,7 +147,7 @@ test('backend release never rebuilds tags and deploys immutable digests', () => 
   assert.match(release, /needs_promotion/);
   assert.match(
     release,
-    /if: \$\{\{ needs\.resolve\.outputs\.needs_promotion == 'true' \}\}/,
+    /needs\.resolve\.outputs\.needs_promotion == 'true' \|\| needs\.resolve\.outputs\.needs_legacy_promotion == 'true'/,
   );
   assert.match(release, /image_ref=\$repo@\$digest/);
   assert.match(
@@ -171,13 +171,14 @@ test('backend release gate actions are pinned to full commit SHAs', () => {
   }
 });
 
-test('releasable ARM64 image is scanned before either registry push', () => {
+test('the configured single-platform release image is scanned before either registry push', () => {
   const workflow = read('.github/workflows/build-image.yml');
-  const build = workflow.indexOf('- name: Build and load ARM64 image');
-  const scan = workflow.indexOf('- name: Scan releasable ARM64 image');
+  const build = workflow.indexOf('- name: Build and load release image');
+  const scan = workflow.indexOf('- name: Scan releasable image');
   const push = workflow.indexOf('- name: Push scanned image tags');
 
-  assert.match(workflow, /platforms: linux\/arm64/);
+  assert.match(workflow, /linux\/amd64\|linux\/arm64/);
+  assert.match(workflow, /platforms: \$\{\{ steps\.meta\.outputs\.platform \}\}/);
   assert.match(workflow, /push: false/);
   assert.match(workflow, /load: true/);
   assert.match(
@@ -186,11 +187,11 @@ test('releasable ARM64 image is scanned before either registry push', () => {
   );
   assert.match(
     workflow,
-    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}/,
+    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/,
   );
   assert.ok(
     build >= 0 && build < scan,
-    'the ARM64 image must be built before scanning',
+    'the release image must be built before scanning',
   );
   assert.ok(
     scan < push,
@@ -293,6 +294,11 @@ test('manual dispatch promotes the commit image when the version image is absent
     `#!/bin/sh
 if [ "$1" = "login" ]; then exit 0; fi
 ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
 case "$ref" in
   *:sha-*) printf '{"digest":"sha256:%064d"}\\n' 0 ;;
   *) exit 1 ;;
@@ -311,6 +317,7 @@ esac
       SHA: 'a'.repeat(40),
       RELEASE_TAG: 'v1.2.3',
       GHCR_TOKEN: 'token',
+      RELEASE_PLATFORM: 'linux/arm64',
       GITHUB_REPOSITORY: 'circleteamhub/circle_be',
       GITHUB_ACTOR: 'release-test',
       GITHUB_OUTPUT: output,
@@ -321,7 +328,212 @@ esac
   const outputs = readFileSync(output, 'utf8');
   assert.match(outputs, /digest=sha256:0{64}/);
   assert.match(outputs, /needs_promotion=true/);
+  assert.match(outputs, /sha_image=.*:sha-a{40}-arm64/);
+  assert.match(outputs, /release_image=.*:v1\.2\.3-arm64/);
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+});
+
+test('tag push resolves each platform image and never overwrites a mismatched version tag', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-tag-push-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const expectedDigest = `sha256:${'1'.repeat(64)}`;
+  const conflictingDigest = `sha256:${'2'.repeat(64)}`;
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
+case "$ref" in
+  *:sha-*) printf '{"digest":"${expectedDigest}"}\\n' ;;
+  *:v*)
+    case "\${TAG_STATE:-absent}" in
+      absent) exit 1 ;;
+      same) printf '{"digest":"${expectedDigest}"}\\n' ;;
+      mismatch) printf '{"digest":"${conflictingDigest}"}\\n' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (arch, tagState) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'push',
+        SHA: 'a'.repeat(40),
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: `linux/${arch}`,
+        RELEASE_ARCH: arch,
+        TAG_STATE: tagState,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, `${arch}-${tagState}-output`),
+      },
+    });
+
+  for (const arch of ['arm64', 'amd64']) {
+    const absent = run(arch, 'absent');
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-absent-output`), 'utf8'),
+      new RegExp(
+        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true[\\s\\S]*legacy_release_image=.*:v1\\.2\\.3[\\s\\S]*needs_legacy_promotion=true`,
+      ),
+    );
+
+    const same = run(arch, 'same');
+    assert.equal(same.status, 0, same.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-same-output`), 'utf8'),
+      /needs_promotion=false/,
+    );
+
+    const mismatch = run(arch, 'mismatch');
+    assert.notEqual(mismatch.status, 0);
+    assert.match(mismatch.stderr, /Refusing to overwrite/);
+  }
+});
+
+test('platform changes cannot overwrite commit or version image tags', () => {
+  const build = read('.github/workflows/build-image.yml');
+  const release = read('.github/workflows/release.yml');
+
+  assert.match(build, /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /main-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /\$\{\{ steps\.meta\.outputs\.repo \}\}:main\n/);
+  assert.match(build, /docker push "\$LEGACY_MAIN_IMAGE"/);
+  assert.match(release, /sha_image="\$repo:sha-\$SHA-\$arch"/);
+  assert.match(release, /release_image="\$repo:\$RELEASE_TAG-\$arch"/);
+  assert.match(release, /legacy_release_image="\$repo:\$RELEASE_TAG"/);
+  assert.match(release, /NEEDS_LEGACY_PROMOTION/);
+
+  const cleanup = read('.github/workflows/cleanup-images.yml');
+  assert.match(cleanup, /\.tags \| index\("main"\) \| not/);
+
+  const sha = 'a'.repeat(40);
+  const refs = ['arm64', 'amd64'].map((arch) => ({
+    commit: `sha-${sha}-${arch}`,
+    version: `v1.2.3-${arch}`,
+  }));
+  assert.notEqual(refs[0].commit, refs[1].commit);
+  assert.notEqual(refs[0].version, refs[1].version);
+});
+
+test('manual dispatch accepts only platform-compatible legacy image tags', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-legacy-release-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const sha = 'a'.repeat(40);
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+format="$6"
+case "$ref" in
+  *:v1.2.3) [ "\${LEGACY_AVAILABLE:-both}" != "sha" ] || exit 1 ;;
+  *:sha-${sha}) [ "\${LEGACY_AVAILABLE:-both}" != "release" ] || exit 1 ;;
+  *) exit 1 ;;
+esac
+case "$format" in
+  *Image*) printf '{"os":"linux","architecture":"%s"}\n' "\${LEGACY_ARCH:-arm64}" ;;
+  *)
+    case "$ref" in
+      *:sha-${sha}) digest="\${LEGACY_SHA_DIGEST:-7}" ;;
+      *) digest="\${LEGACY_RELEASE_DIGEST:-7}" ;;
+    esac
+    printf '{"digest":"sha256:%064d"}\n' "$digest"
+    ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (legacyArch, outputName, overrides = {}) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'workflow_dispatch',
+        SHA: sha,
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: 'linux/arm64',
+        LEGACY_ARCH: legacyArch,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, outputName),
+        ...overrides,
+      },
+    });
+
+  const compatible = run('arm64', 'compatible-output');
+  assert.equal(compatible.status, 0, compatible.stderr);
+  const outputs = readFileSync(join(directory, 'compatible-output'), 'utf8');
+  assert.match(outputs, /release_image=.*:v1\.2\.3$/m);
+  assert.match(outputs, /needs_promotion=false/);
+
+  const shaOnly = run('arm64', 'sha-only-output', {
+    LEGACY_AVAILABLE: 'sha',
+  });
+  assert.equal(shaOnly.status, 0, shaOnly.stderr);
+  const shaOnlyOutputs = readFileSync(
+    join(directory, 'sha-only-output'),
+    'utf8',
+  );
+  assert.match(shaOnlyOutputs, new RegExp(`sha_image=.*:sha-${sha}$`, 'm'));
+  assert.match(shaOnlyOutputs, /release_image=.*:v1\.2\.3-arm64$/m);
+  assert.match(shaOnlyOutputs, /needs_promotion=true/);
+
+  const mismatch = run('arm64', 'mismatch-output', {
+    LEGACY_RELEASE_DIGEST: '7',
+    LEGACY_SHA_DIGEST: '8',
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /Refusing mismatched legacy release image/);
+
+  const incompatible = run('amd64', 'incompatible-output');
+  assert.notEqual(incompatible.status, 0);
+  assert.match(incompatible.stderr, /is linux\/amd64, expected linux\/arm64/);
 });
 
 test('workflow stages and activates only through the restricted release protocol', () => {
