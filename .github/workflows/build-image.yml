@@ -2,7 +2,7 @@
 #
 # Every push to main builds the production image for the configured server
 # platform, scans that exact image, and only then pushes `sha-<commit>-<arch>`
-# (immutable) plus a `main-<arch>` convenience tag. A release (release.yml) then
+# (immutable) plus `main-<arch>` and the migration-period `main` alias. A release then
 # *promotes* it by stamping `v<tag>-<arch>` — no rebuild — which guarantees the deployed
 # artifact is byte-identical to the platform image scanned here and keeps releases
 # down to minutes.
@@ -85,6 +85,7 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
             ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
+            ${{ steps.meta.outputs.repo }}:main
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -108,10 +109,12 @@ jobs:
         env:
           SHA_IMAGE: ${{ steps.meta.outputs.repo }}:sha-${{ github.sha }}-${{ steps.meta.outputs.arch }}
           MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main-${{ steps.meta.outputs.arch }}
+          LEGACY_MAIN_IMAGE: ${{ steps.meta.outputs.repo }}:main
         run: |
           set -euo pipefail
           docker push "$SHA_IMAGE"
           docker push "$MAIN_IMAGE"
+          docker push "$LEGACY_MAIN_IMAGE"
 
       # A missing main image blocks release, so report build failure loudly.
       - name: Notify Discord on failure

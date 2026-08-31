@@ -75,6 +75,8 @@ jobs:
       digest: ${{ steps.image.outputs.digest }}
       image_ref: ${{ steps.image.outputs.image_ref }}
       needs_promotion: ${{ steps.image.outputs.needs_promotion }}
+      legacy_release_image: ${{ steps.image.outputs.legacy_release_image }}
+      needs_legacy_promotion: ${{ steps.image.outputs.needs_legacy_promotion }}
       schema_compatibility: ${{ steps.compatibility.outputs.level }}
     steps:
       - name: Determine release tag
@@ -270,12 +272,27 @@ jobs:
             fi
           fi
 
+          needs_legacy_promotion=false
+          if [ "$release_image" != "$legacy_release_image" ]; then
+            if legacy_release_digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+              require_release_platform "$legacy_release_image"
+              if [ "$legacy_release_digest" != "$digest" ]; then
+                echo "Refusing to overwrite legacy release alias: $legacy_release_image ($legacy_release_digest != $digest)." >&2
+                exit 1
+              fi
+            else
+              needs_legacy_promotion=true
+            fi
+          fi
+
           {
             echo "sha_image=$sha_image"
             echo "release_image=$release_image"
             echo "digest=$digest"
             echo "image_ref=$repo@$digest"
             echo "needs_promotion=$needs_promotion"
+            echo "legacy_release_image=$legacy_release_image"
+            echo "needs_legacy_promotion=$needs_legacy_promotion"
           } >> "$GITHUB_OUTPUT"
 
   # Stamp the sha image with the immutable version tag. A manifest copy inside
@@ -285,7 +302,7 @@ jobs:
     runs-on: ubuntu-latest
     name: "Promote image to version tag"
     needs: [resolve]
-    if: ${{ needs.resolve.outputs.needs_promotion == 'true' }}
+    if: ${{ needs.resolve.outputs.needs_promotion == 'true' || needs.resolve.outputs.needs_legacy_promotion == 'true' }}
     timeout-minutes: 10
     permissions:
       packages: write
@@ -302,14 +319,23 @@ jobs:
           EXPECTED_DIGEST: ${{ needs.resolve.outputs.digest }}
           SHA_IMAGE: ${{ needs.resolve.outputs.sha_image }}
           RELEASE_IMAGE: ${{ needs.resolve.outputs.release_image }}
+          LEGACY_RELEASE_IMAGE: ${{ needs.resolve.outputs.legacy_release_image }}
+          NEEDS_PROMOTION: ${{ needs.resolve.outputs.needs_promotion }}
+          NEEDS_LEGACY_PROMOTION: ${{ needs.resolve.outputs.needs_legacy_promotion }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create -t "$RELEASE_IMAGE" "$SHA_IMAGE"
-          actual="$(docker buildx imagetools inspect "$RELEASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')"
-          if [ "$actual" != "$EXPECTED_DIGEST" ]; then
-            echo "Promoted digest mismatch: $actual != $EXPECTED_DIGEST" >&2
-            exit 1
-          fi
+          for promotion in \
+            "$NEEDS_PROMOTION:$RELEASE_IMAGE" \
+            "$NEEDS_LEGACY_PROMOTION:$LEGACY_RELEASE_IMAGE"; do
+            [ "${promotion%%:*}" = "true" ] || continue
+            target="${promotion#*:}"
+            docker buildx imagetools create -t "$target" "$SHA_IMAGE"
+            actual="$(docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' | jq -er '.digest')"
+            if [ "$actual" != "$EXPECTED_DIGEST" ]; then
+              echo "Promoted digest mismatch for $target: $actual != $EXPECTED_DIGEST" >&2
+              exit 1
+            fi
+          done
 
   deploy:
     runs-on: ubuntu-latest

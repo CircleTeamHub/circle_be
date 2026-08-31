@@ -147,7 +147,7 @@ test('backend release never rebuilds tags and deploys immutable digests', () => 
   assert.match(release, /needs_promotion/);
   assert.match(
     release,
-    /if: \$\{\{ needs\.resolve\.outputs\.needs_promotion == 'true' \}\}/,
+    /needs\.resolve\.outputs\.needs_promotion == 'true' \|\| needs\.resolve\.outputs\.needs_legacy_promotion == 'true'/,
   );
   assert.match(release, /image_ref=\$repo@\$digest/);
   assert.match(
@@ -294,6 +294,11 @@ test('manual dispatch promotes the commit image when the version image is absent
     `#!/bin/sh
 if [ "$1" = "login" ]; then exit 0; fi
 ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
 case "$ref" in
   *:sha-*) printf '{"digest":"sha256:%064d"}\\n' 0 ;;
   *) exit 1 ;;
@@ -351,6 +356,11 @@ test('tag push resolves each platform image and never overwrites a mismatched ve
     `#!/bin/sh
 if [ "$1" = "login" ]; then exit 0; fi
 ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
 case "$ref" in
   *:sha-*) printf '{"digest":"${expectedDigest}"}\\n' ;;
   *:v*)
@@ -378,6 +388,7 @@ esac
         RELEASE_TAG: 'v1.2.3',
         GHCR_TOKEN: 'token',
         RELEASE_PLATFORM: `linux/${arch}`,
+        RELEASE_ARCH: arch,
         TAG_STATE: tagState,
         GITHUB_REPOSITORY: 'circleteamhub/circle_be',
         GITHUB_ACTOR: 'release-test',
@@ -391,7 +402,7 @@ esac
     assert.match(
       readFileSync(join(directory, `${arch}-absent-output`), 'utf8'),
       new RegExp(
-        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true`,
+        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true[\\s\\S]*legacy_release_image=.*:v1\\.2\\.3[\\s\\S]*needs_legacy_promotion=true`,
       ),
     );
 
@@ -414,8 +425,15 @@ test('platform changes cannot overwrite commit or version image tags', () => {
 
   assert.match(build, /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
   assert.match(build, /main-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /\$\{\{ steps\.meta\.outputs\.repo \}\}:main\n/);
+  assert.match(build, /docker push "\$LEGACY_MAIN_IMAGE"/);
   assert.match(release, /sha_image="\$repo:sha-\$SHA-\$arch"/);
   assert.match(release, /release_image="\$repo:\$RELEASE_TAG-\$arch"/);
+  assert.match(release, /legacy_release_image="\$repo:\$RELEASE_TAG"/);
+  assert.match(release, /NEEDS_LEGACY_PROMOTION/);
+
+  const cleanup = read('.github/workflows/cleanup-images.yml');
+  assert.match(cleanup, /\.tags \| index\("main"\) \| not/);
 
   const sha = 'a'.repeat(40);
   const refs = ['arm64', 'amd64'].map((arch) => ({

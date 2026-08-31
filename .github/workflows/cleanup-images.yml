@@ -7,7 +7,7 @@
 # - any version carrying a `v*` tag is a release — kept forever. NOTE: promote
 #   stamps the version tag onto the SAME digest as its sha- tag, so a released
 #   version typically carries both tags and is protected by this rule;
-# - `main-<arch>` convenience tags are kept;
+# - `main-<arch>` and the migration-period `main` convenience tags are kept;
 # - other versions (sha-only or untagged) are deleted once they are BOTH
 #   outside the newest 20 AND older than 14 days.
 #
@@ -56,6 +56,7 @@ jobs:
             jq -s --arg cutoff "$cutoff" '
               map(select(
                 (.tags | any(startswith("v")) | not) and
+                (.tags | index("main") | not) and
                 (.tags | any(startswith("main-")) | not)
               ))
               | sort_by(.created_at) | reverse
