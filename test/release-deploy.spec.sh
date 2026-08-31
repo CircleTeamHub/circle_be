@@ -266,6 +266,10 @@ CHMOD
 #!/usr/bin/env bash
 set -euo pipefail
 target="${@: -1}"
+if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ]; then
+  printf '%s marker=%s\n' "$target" "$([ -e "$CASE_DIR/fail-next-sentry-setfacl" ] && echo yes || echo no)" \
+    >> "$CASE_DIR/setfacl-invocations.log"
+fi
 if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ] &&
   [ "$target" = "${APP_ENV_FILE}.tmp" ] &&
   [ -e "$CASE_DIR/fail-next-sentry-setfacl" ]; then
@@ -791,6 +795,8 @@ test_irreversible_sentry_permission_failures_preserve_the_live_env() {
     assert_mode "$APP_ENV_FILE" 640 || return 1
     grep -q '^SENTRY_RELEASE=circle-be@v0\.0\.1$' "$APP_ENV_FILE" || {
       echo "$operation failure replaced the live env with a partial Sentry stamp" >&2
+      cat "$CASE_DIR/setfacl-invocations.log" 2>/dev/null >&2 || true
+      cat "$CASE_DIR/release.log" >&2
       return 1
     }
     [ ! -e "${APP_ENV_FILE}.tmp" ] || return 1
