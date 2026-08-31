@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -102,6 +102,16 @@ if [ "${1:-}" = "compose" ]; then
       if [ -n "${CADDY_RELOAD_FAIL_TARGET:-}" ] &&
         printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=$CADDY_RELOAD_FAIL_TARGET"; then
         exit 43
+      fi
+      if printf '%s\n' "$*" | grep -q 'caddy reload'; then
+        for arg in "$@"; do
+          case "$arg" in
+            CIRCLE_BE_UPSTREAM=*)
+              printf '%s\n' "${arg#CIRCLE_BE_UPSTREAM=}" > "$CASE_DIR/caddy-upstream"
+              printf 'reload %s\n' "${arg#CIRCLE_BE_UPSTREAM=}" >> "$TEST_COMMAND_LOG"
+              ;;
+          esac
+        done
       fi
       if [ "${TERM_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
         printf '%s\n' "$*" | grep -q 'caddy reload' &&
@@ -191,6 +201,12 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+[ -z "${EXPECTED_SMOKE_UPSTREAM:-}" ] ||
+  [ "$(cat "$CASE_DIR/caddy-upstream" 2>/dev/null || true)" = "$EXPECTED_SMOKE_UPSTREAM" ] || {
+    printf '599'
+    exit 0
+  }
+printf 'smoke %s\n' "$(cat "$CASE_DIR/caddy-upstream" 2>/dev/null || true)" >> "$TEST_COMMAND_LOG"
 [ -z "$headers" ] || printf 'HTTP/2 %s\r\ncontent-type: %s\r\n\r\n' \
   "${SMOKE_CODE:-401}" "${SMOKE_CONTENT_TYPE:-application/json}" > "$headers"
 [ -z "$body" ] || printf '%s' "${SMOKE_BODY:-{\"statusCode\":401}}" > "$body"
@@ -237,6 +253,14 @@ if [ "${KILL_BEFORE_CADDY_RELOAD:-0}" = "1" ] &&
   exit 137
 fi
 "$REAL_MV" "$@"
+if [ "${KILL_AFTER_CUTOVER_COMPLETE:-0}" = "1" ] &&
+  [ "${@: -1}" = "$RELEASE_STATE_DIR/app-env-transaction/state" ] &&
+  grep -q '^cutover:' "${@: -1}" &&
+  [ ! -e "$CASE_DIR/kill-after-cutover-complete-injected" ]; then
+  : > "$CASE_DIR/kill-after-cutover-complete-injected"
+  kill -KILL "$PPID"
+  exit 137
+fi
 if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ] &&
   [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
   [ "${@: -1}" = "$APP_ENV_FILE" ]; then
@@ -272,10 +296,12 @@ run_release() {
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     KILL_AFTER_ENV_STAGE="${KILL_AFTER_ENV_STAGE:-0}" \
     KILL_BEFORE_CADDY_RELOAD="${KILL_BEFORE_CADDY_RELOAD:-0}" \
+    KILL_AFTER_CUTOVER_COMPLETE="${KILL_AFTER_CUTOVER_COMPLETE:-0}" \
     KILL_AFTER_CADDY_RELOAD="${KILL_AFTER_CADDY_RELOAD:-0}" \
     KILL_AFTER_CADDY_RELOAD_TARGET="${KILL_AFTER_CADDY_RELOAD_TARGET:-}" \
     TERM_AFTER_CADDY_RELOAD="${TERM_AFTER_CADDY_RELOAD:-0}" \
     TERM_AFTER_CADDY_RELOAD_TARGET="${TERM_AFTER_CADDY_RELOAD_TARGET:-}" \
+    EXPECTED_SMOKE_UPSTREAM="${EXPECTED_SMOKE_UPSTREAM:-}" \
     IMAGE_MISSING="${IMAGE_MISSING:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
@@ -689,6 +715,39 @@ prepare_cutover_recovery_case() {
   printf 'SECRET=cutover-recovery\n' > "$APP_ENV_FILE"
   chmod 600 "$APP_ENV_FILE"
   export APP_ENV_FILE
+  printf 'circle-be-blue:3000\n' > "$CASE_DIR/caddy-upstream"
+}
+
+test_sigkill_after_complete_marker_recovers_forward_and_smokes_new_color() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-after-cutover-complete-injected" ] || return 1
+  grep -q '^cutover:circle_be_green:circle_be$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  EXPECTED_SMOKE_UPSTREAM=circle-be-green:3000
+  IMAGE_MISSING=1
+  ! run_release || return 1
+
+  grep -q '^smoke circle-be-green:3000$' "$TEST_COMMAND_LOG" || return 1
+  assert_active_color circle_be_green && assert_mode "$APP_ENV_FILE" 640 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  EXPECTED_SMOKE_UPSTREAM=circle-be-green:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+
+  grep -q '^smoke circle-be-green:3000$' "$TEST_COMMAND_LOG" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
 test_sigkill_after_cutover_recovers_forward_before_early_failure() {
@@ -960,6 +1019,8 @@ for test_name in \
   test_startup_failure_restores_legacy_env_before_live_restart \
   test_interrupted_env_stage_recovers_through_launcher \
   test_term_after_cutover_finalizes_new_env_and_active_color \
+  test_sigkill_after_complete_marker_recovers_forward_and_smokes_new_color \
+  test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails \
   test_sigkill_after_cutover_recovers_forward_before_early_failure \
   test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails \
   test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails \
