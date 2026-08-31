@@ -247,6 +247,10 @@ if [ "${ENV_PERMISSION_FAIL:-}" = "chgrp" ] &&
   [ "${@: -1}" = "${APP_ENV_FILE}.tmp" ]; then
   exit 49
 fi
+if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ] &&
+  [ "${@: -1}" = "${APP_ENV_FILE}.tmp" ]; then
+  : > "$CASE_DIR/fail-next-sentry-setfacl"
+fi
 exec "$REAL_CHGRP" "$@"
 CHGRP
   cat > "$CASE_DIR/bin/chmod" <<'CHMOD'
@@ -264,10 +268,10 @@ set -euo pipefail
 target="${@: -1}"
 if [ "${ENV_PERMISSION_FAIL:-}" = "setfacl" ] &&
   [ "$target" = "${APP_ENV_FILE}.tmp" ] &&
-  grep -q '^SENTRY_RELEASE=circle-be@v1\.2\.3$' "$target"; then
-  # Fail the post-write ACL cleanup specifically. Counting setfacl calls is
-  # brittle because transaction-directory hardening can legitimately add more
-  # calls before the Sentry temporary file reaches this state.
+  [ -e "$CASE_DIR/fail-next-sentry-setfacl" ]; then
+  # chgrp runs only after awk has populated the Sentry temporary file. Its
+  # marker makes this target the post-write ACL cleanup without depending on
+  # how many unrelated setfacl calls the transaction hardening performs.
   exit 51
 fi
 if [ -n "$REAL_SETFACL" ]; then
@@ -286,6 +290,7 @@ run_release() {
     REAL_CHGRP="$REAL_CHGRP" \
     REAL_CHMOD="$REAL_CHMOD" \
     REAL_SETFACL="$REAL_SETFACL" \
+    SETFACL_COMMAND="${SETFACL_COMMAND:-setfacl}" \
     RELEASE_TAG=v1.2.3 \
     RELEASE_LAUNCHER_ACTIVE=1 \
     CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
@@ -776,6 +781,9 @@ test_irreversible_sentry_permission_failures_preserve_the_live_env() {
     chmod 600 "$APP_ENV_FILE"
     export APP_ENV_FILE
     ENV_PERMISSION_FAIL="$operation"
+    if [ "$operation" = "setfacl" ]; then
+      SETFACL_COMMAND="$CASE_DIR/bin/setfacl"
+    fi
 
     run_release || return 1
 
