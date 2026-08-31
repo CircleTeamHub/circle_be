@@ -30,6 +30,7 @@ test('release workflow signs and stages the exact immutable release manifest', (
 test('manual rollback keeps current trusted deploy tooling with the historical application tag', () => {
   const operationalFiles = [
     'deploy/release-deploy.sh',
+    'deploy/gen-env.sh',
     'deploy/admin-web-deploy.sh',
     'deploy/caddy-entrypoint.sh',
     'deploy/overlay-trusted-release-tooling.sh',
@@ -37,6 +38,7 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
     'deploy/app-env-transaction.sh',
     'deploy/offsite-backup.sh',
     'deploy/Caddyfile.admin',
+    'monitoring/sync-metrics-token.sh',
     'Dockerfile.caddy',
     'docker-compose.prod.yml',
     'docker-compose.release.yml',
@@ -138,9 +140,11 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       );
       const expectedMode = [
         'deploy/release-deploy.sh',
+        'deploy/gen-env.sh',
         'deploy/admin-web-deploy.sh',
         'deploy/caddy-entrypoint.sh',
         'deploy/overlay-trusted-release-tooling.sh',
+        'monitoring/sync-metrics-token.sh',
       ].includes(operationalFile)
         ? 0o755
         : 0o644;
@@ -349,7 +353,11 @@ test('manual rollback refuses unverified main deployment tooling even when targe
   );
   try {
     const gh = path.join(directory, 'gh');
-    fs.writeFileSync(gh, '#!/usr/bin/env bash\nprintf "%s\\n" "$CI_CONCLUSION"\n');
+    const argsLog = path.join(directory, 'gh-args.log');
+    fs.writeFileSync(
+      gh,
+      '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_ARGS_LOG"\nprintf "%s\\n" "$CI_CONCLUSION"\n',
+    );
     fs.chmodSync(gh, 0o755);
     const runGate = (conclusion) =>
       spawnSync('/bin/bash', ['-c', script], {
@@ -358,12 +366,19 @@ test('manual rollback refuses unverified main deployment tooling even when targe
           ...process.env,
           PATH: `${directory}:${process.env.PATH}`,
           CI_CONCLUSION: conclusion,
+          GH_ARGS_LOG: argsLog,
           GITHUB_REPOSITORY: 'CircleTeamHub/circle_be',
           SHA: '0123456789abcdef0123456789abcdef01234567',
         },
       });
 
     assert.equal(runGate('success').status, 0);
+    assert.deepEqual(fs.readFileSync(argsLog, 'utf8').trim().split('\n'), [
+      'api',
+      'repos/CircleTeamHub/circle_be/actions/workflows/ci.yml/runs?head_sha=0123456789abcdef0123456789abcdef01234567&event=push&branch=main&status=completed&per_page=1',
+      '--jq',
+      '.workflow_runs[0].conclusion // ""',
+    ]);
     for (const conclusion of ['', 'pending', 'failure']) {
       const result = runGate(conclusion);
       assert.notEqual(result.status, 0, `must reject ${conclusion || 'missing'} CI`);

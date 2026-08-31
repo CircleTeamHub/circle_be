@@ -411,6 +411,7 @@ jobs:
           path: .trusted-release-tooling
           sparse-checkout: |
             deploy/release-deploy.sh
+            deploy/gen-env.sh
             deploy/admin-web-deploy.sh
             deploy/caddy-entrypoint.sh
             deploy/overlay-trusted-release-tooling.sh
@@ -418,6 +419,7 @@ jobs:
             deploy/app-env-transaction.sh
             deploy/offsite-backup.sh
             deploy/Caddyfile.admin
+            monitoring/sync-metrics-token.sh
             Dockerfile.caddy
             docker-compose.prod.yml
             docker-compose.release.yml
