@@ -258,7 +258,19 @@ activate_release() {
     /usr/bin/bash "$LAUNCHER" "$stage_name"
 }
 
+release_capabilities() {
+  [ "${#command_parts[@]}" -eq 2 ] || fail 'capabilities accepts no arguments'
+  [ -f "$LAUNCHER" ] && [ -x "$LAUNCHER" ] && [ ! -L "$LAUNCHER" ] || fail 'trusted release launcher is unavailable'
+  [ ! -w "$LAUNCHER" ] || fail 'trusted release launcher must not be writable by the deployment account'
+  local launcher_contract
+  launcher_contract="$("$LAUNCHER" --contract-version 2>/dev/null)" ||
+    fail 'trusted release launcher predates the runtime contract'
+  [ "$launcher_contract" = "1" ] || fail 'trusted release launcher has an unsupported runtime contract'
+  printf 'release-gate=1 launcher-runtime=%s\n' "$launcher_contract"
+}
+
 case "${command_parts[1]}" in
+  capabilities) release_capabilities ;;
   stage-v2) stage_release ;;
   activate-v2) activate_release ;;
   *) fail 'unknown release protocol command' ;;

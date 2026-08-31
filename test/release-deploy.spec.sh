@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -212,6 +212,7 @@ run_release() {
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
     RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-$REPO_SCHEMA_COMPATIBILITY}" \
     SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
+    RUNTIME_COMPATIBILITY_PATH="${RUNTIME_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
     CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
@@ -567,6 +568,14 @@ test_marker_requires_irreversible_confirmation() {
   grep -q 'requires RELEASE_IRREVERSIBLE_MIGRATION=1' "$CASE_DIR/release.log"
 }
 
+test_pre_contract_release_is_rejected_before_any_deployment_action() {
+  new_case
+  RUNTIME_COMPATIBILITY_PATH="$CASE_DIR/no-runtime-compatibility"
+  ! run_release || return 1
+  grep -q 'below the trusted deployment contract minimum' "$CASE_DIR/release.log" || return 1
+  [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
 test_pre_marker_release_is_rejected_after_boundary_is_recorded() {
   new_case
   printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
@@ -683,6 +692,7 @@ for test_name in \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
+  test_pre_contract_release_is_rejected_before_any_deployment_action \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \
   test_release_cannot_understate_checked_out_schema_compatibility \
   test_irreversible_release_records_minimum_schema_compatibility \

@@ -544,6 +544,8 @@ test('workflow stages and activates only through the restricted release protocol
     /circle-release stage-v2 \$STAGED_RELEASE_NAME \$manifest_b64 \$signature_b64/,
   );
   assert.match(release, /circle-release activate-v2 \$STAGED_RELEASE_NAME/);
+  assert.match(release, /circle-release capabilities/);
+  assert.match(release, /release-gate=1 launcher-runtime=1/);
   // 签名是这一版的信任根:少了它,服务器只能凭"谁连上来"判断发布包真伪。
   assert.match(release, /openssl dgst -sha256 -sign/);
   assert.match(release, /archive_sha256=/);
@@ -563,6 +565,7 @@ test('server ForceCommand accepts no general shell or launcher replacement comma
   assert.match(gate, /command_parts\[0\].*circle-release/);
   assert.match(gate, /stage-v2\) stage_release/);
   assert.match(gate, /activate-v2\) activate_release/);
+  assert.match(gate, /capabilities\) release_capabilities/);
   assert.match(gate, /! -w "\$LAUNCHER"/);
   assert.match(gate, /exec env -i/);
   assert.doesNotMatch(gate, /eval /);

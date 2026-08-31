@@ -9,9 +9,12 @@ STATE_DIR="$DEPLOY_ROOT/.release"
 START_LOG="$CASE_DIR/start.log"
 trap 'rm -rf "$CASE_DIR"' EXIT
 
-mkdir -p "$STATE_DIR/incoming/old/deploy" "$STATE_DIR/incoming/new/deploy" "$CASE_DIR/bin"
+mkdir -p "$STATE_DIR/incoming/old/deploy" "$STATE_DIR/incoming/new/deploy" \
+  "$STATE_DIR/incoming/runtime-old/deploy" \
+  "$STATE_DIR/incoming/pre-contract/deploy" "$CASE_DIR/bin"
 cp "$LAUNCHER" "$STATE_DIR/release-launcher.sh"
 chmod +x "$STATE_DIR/release-launcher.sh"
+[ "$(bash "$STATE_DIR/release-launcher.sh" --contract-version)" = "1" ]
 
 # macOS does not provide flock; launcher ordering is asserted separately by the
 # hardening test, while this deterministic regression controls the interleaving.
@@ -24,11 +27,14 @@ chmod +x "$CASE_DIR/bin/flock"
 cat > "$STATE_DIR/incoming/new/deploy/release-deploy.sh" <<'NEW_RELEASE'
 #!/usr/bin/env bash
 set -euo pipefail
+[ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged" ]
+[ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
 printf 'new-start\n' >> "$START_LOG"
 NEW_RELEASE
 chmod +x "$STATE_DIR/incoming/new/deploy/release-deploy.sh"
 printf '1\n' > "$STATE_DIR/incoming/new/deploy/SCHEMA_COMPATIBILITY"
+printf '1\n' > "$STATE_DIR/incoming/new/deploy/RELEASE_RUNTIME_COMPATIBILITY"
 printf 'new\n' > "$STATE_DIR/incoming/new/VERSION"
 
 cat > "$STATE_DIR/incoming/old/deploy/release-deploy.sh" <<'OLD_RELEASE'
@@ -38,7 +44,18 @@ printf 'old-start\n' >> "$START_LOG"
 OLD_RELEASE
 chmod +x "$STATE_DIR/incoming/old/deploy/release-deploy.sh"
 printf 'old\n' > "$STATE_DIR/incoming/old/VERSION"
+
+cp "$STATE_DIR/incoming/old/deploy/release-deploy.sh" \
+  "$STATE_DIR/incoming/runtime-old/deploy/release-deploy.sh"
+printf '1\n' > "$STATE_DIR/incoming/runtime-old/deploy/SCHEMA_COMPATIBILITY"
+printf 'runtime-old\n' > "$STATE_DIR/incoming/runtime-old/VERSION"
+cp "$STATE_DIR/incoming/old/deploy/release-deploy.sh" \
+  "$STATE_DIR/incoming/pre-contract/deploy/release-deploy.sh"
+printf 'pre-contract\n' > "$STATE_DIR/incoming/pre-contract/VERSION"
 printf 'initial\n' > "$DEPLOY_ROOT/VERSION"
+mkdir -p "$STATE_DIR/app-env-transaction"
+printf 'staged\n' > "$STATE_DIR/app-env-transaction/state"
+printf 'legacy-env\n' > "$STATE_DIR/app-env-transaction/legacy-rollback"
 
 run_launcher() {
   local stage="$1" compatibility="$2"
@@ -54,12 +71,36 @@ run_launcher() {
     bash "$STATE_DIR/release-launcher.sh" "$stage"
 }
 
+# A freshly upgraded root-owned launcher may run while both the active tree and
+# a previously staged historical release predate runtime metadata. Its own
+# minimum must reject the stage before rsync mutates the live checkout.
+if run_launcher pre-contract 0 >"$CASE_DIR/pre-contract.log" 2>&1; then
+  echo "pre-contract deployment unexpectedly activated" >&2
+  exit 1
+fi
+grep -q 'Staged runtime compatibility 0 is below required runtime contract 1' \
+  "$CASE_DIR/pre-contract.log"
+[ "$(cat "$DEPLOY_ROOT/VERSION")" = "initial" ]
+[ ! -e "$START_LOG" ]
+
 # The old deployment has completed upload/preflight and is paused before the
 # authoritative launcher lock. A newer irreversible release wins the lock and
 # records floor 1 before the old deployment resumes.
 run_launcher new 1
 [ "$(cat "$STATE_DIR/minimum-schema-compatibility")" = "1" ]
 [ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
+[ "$(cat "$STATE_DIR/app-env-transaction/state")" = "staged" ]
+[ "$(cat "$STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
+
+if run_launcher runtime-old 1 >"$CASE_DIR/runtime-old.log" 2>&1; then
+  echo "runtime-incompatible deployment unexpectedly activated" >&2
+  exit 1
+fi
+
+grep -q 'Staged runtime compatibility 0 is below required runtime contract 1' \
+  "$CASE_DIR/runtime-old.log"
+[ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
+[ "$(cat "$START_LOG")" = "new-start" ]
 
 if run_launcher old 0 >"$CASE_DIR/old.log" 2>&1; then
   echo "old deployment unexpectedly activated" >&2
