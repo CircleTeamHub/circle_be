@@ -44,6 +44,18 @@ describe('production Redis deployment configuration', () => {
     workspaces.push(workspace);
     return workspace;
   };
+  const existingRerunEnv = (workspace: string) => {
+    const bin = join(workspace, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'flock'), '#!/usr/bin/env bash\nexit 0\n', {
+      mode: 0o755,
+    });
+    return {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      RELEASE_STATE_DIR: join(workspace, '.release'),
+    };
+  };
 
   afterEach(() => {
     for (const workspace of workspaces.splice(0)) {
@@ -51,7 +63,7 @@ describe('production Redis deployment configuration', () => {
     }
   });
 
-  it('generates matching Redis credentials and rejects legacy reruns without mutation', () => {
+  it('generates matching Redis credentials and supports migrated reruns without rotation', () => {
     const workspace = createWorkspace('circle-redis-env-');
     mkdirSync(join(workspace, 'deploy'));
     cpSync(
@@ -67,7 +79,8 @@ describe('production Redis deployment configuration', () => {
       'ops@example.com',
       'app.example.com',
     ];
-    execFileSync(bashExecutable, args, { cwd: workspace });
+    const rerunEnv = existingRerunEnv(workspace);
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
     const firstComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const firstAppEnv = readFileSync(
       join(workspace, '.env.production'),
@@ -108,7 +121,7 @@ describe('production Redis deployment configuration', () => {
       expect(statSync(join(workspace, '.env.production')).gid).toBe(primaryGid);
     }
 
-    execFileSync(bashExecutable, args, { cwd: workspace });
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
     const upgradedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const upgradedAppEnv = readFileSync(
       join(workspace, '.env.production'),
@@ -136,7 +149,7 @@ describe('production Redis deployment configuration', () => {
         )
         .replace(/^REDIS_ALLOW_INSECURE=.*\n?/m, ''),
     );
-    execFileSync(bashExecutable, args, { cwd: workspace });
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
     const regeneratedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     expect(regeneratedComposeEnv).not.toContain(
       'COMPOSE_PROFILES=bundled-redis',
@@ -284,7 +297,7 @@ exec "$REAL_CAT" "$@"
     expect(compose).not.toMatch(/^\s+image: caddy:2-alpine\s*$/m);
   });
 
-  it('regenerates an empty password and merges the bundled profile on upgrade', () => {
+  it('preserves a non-hex live password and merges the bundled profile on upgrade', () => {
     if (process.platform === 'win32') return;
     const workspace = createWorkspace('circle-redis-upgrade-');
     mkdirSync(join(workspace, 'deploy'));
@@ -302,7 +315,7 @@ exec "$REAL_CAT" "$@"
         'ADMIN_DOMAIN=',
         'ACME_EMAIL=',
         'WEB_DOMAIN=',
-        'REDIS_PASSWORD=bad#password',
+        'REDIS_PASSWORD=legacy-password',
         'COMPOSE_PROFILES=debug-tools',
         `APP_ENV_GID=${execFileSync('/usr/bin/id', ['-g']).toString().trim()}`,
         '',
@@ -312,7 +325,7 @@ exec "$REAL_CAT" "$@"
       join(workspace, '.env.production'),
       [
         'NODE_ENV=production',
-        'REDIS_URL="redis://default:@redis:6379"',
+        'REDIS_URL="redis://default:legacy-password@redis:6379"',
         'ALLOWED_ORIGINS="https://legacy.example.com"',
         '',
       ].join('\n'),
@@ -329,13 +342,13 @@ exec "$REAL_CAT" "$@"
         'ops@example.com',
         'app.example.com',
       ],
-      { cwd: workspace },
+      { cwd: workspace, env: existingRerunEnv(workspace) },
     );
 
     const composeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const appEnv = readFileSync(join(workspace, '.env.production'), 'utf8');
     const password = composeEnv.match(/^REDIS_PASSWORD=(.+)$/m)?.[1];
-    expect(password).toMatch(/^[a-f0-9]{48}$/);
+    expect(password).toBe('legacy-password');
     expect(composeEnv).toContain('COMPOSE_PROFILES=debug-tools,bundled-redis');
     expect(composeEnv).toContain('API_DOMAIN=api.example.com');
     expect(composeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
