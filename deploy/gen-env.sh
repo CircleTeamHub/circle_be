@@ -100,6 +100,14 @@ else
 fi
 validate_private_gid "$DEPLOY_APP_ENV_GID"
 
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+file_gid() {
+  stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1"
+}
+
 # 32+ 位随机串,去掉 / + = 以免干扰 dotenv / URL 解析
 gen() { openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48; }
 
@@ -163,12 +171,21 @@ if [ -f .env.production ]; then
       exit 1
     fi
   done
-  echo "❌ 存量 .env.production 必须先通过 Release 工作流完成可恢复权限迁移；拒绝原地重写。" >&2
-  exit 1
+  if [ "$(file_mode .env.production)" != "640" ] ||
+    [ "$(file_gid .env.production)" != "$DEPLOY_APP_ENV_GID" ]; then
+    echo "❌ 存量 .env.production 尚未完成可恢复权限迁移；请先走 Release 工作流，拒绝原地改权限。" >&2
+    exit 1
+  fi
+  clear_file_acl .env
+  chmod 600 .env
+  clear_file_acl .env.production
+  chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  chmod 640 .env.production
   grep -Eq '^API_DOMAIN=.+' .env || set_env_value .env API_DOMAIN "$API_DOMAIN"
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
   grep -Eq '^WEB_DOMAIN=.+' .env || set_env_value .env WEB_DOMAIN "$WEB_DOMAIN"
+  set_env_value .env APP_ENV_GID "$DEPLOY_APP_ENV_GID"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$ADMIN_DOMAIN"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$WEB_DOMAIN"
   if grep -q '^REDIS_PASSWORD=' .env; then
@@ -196,7 +213,10 @@ if [ -f .env.production ]; then
   if grep -Eq '^MINIO_ENDPOINT=http://minio:9000/?$' .env.production; then
     ensure_compose_profile bundled-storage
   fi
-  chmod 600 .env .env.production
+  chmod 600 .env
+  chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  clear_file_acl .env.production
+  chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
   exit 0
 fi

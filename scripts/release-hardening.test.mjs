@@ -92,7 +92,7 @@ test('production app env access uses recoverable group-read transactions', () =>
   assert.match(generator, /prepare_empty_secret_file "\$tmp"/);
   assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
   assert.match(generator, /chmod 640 \.env\.production/);
-  assert.match(generator, /必须先通过 Release 工作流完成可恢复权限迁移/);
+  assert.match(generator, /尚未完成可恢复权限迁移/);
   assert.match(release, /\. deploy\/app-env-preflight\.sh/);
   assert.match(release, /\. deploy\/app-env-transaction\.sh/);
   assert.match(
@@ -712,6 +712,7 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
   assert.match(ci, /bash test\/app-env-primitives\.spec\.sh/);
   assert.match(ci, /bash test\/gen-env-legacy-guard\.spec\.sh/);
+  assert.match(ci, /bash test\/gen-env-existing\.spec\.sh/);
   assert.match(ci, /bash test\/release-force-command\.spec\.sh/);
 });
 
