@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import {
   cpSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -283,7 +284,8 @@ exec "$REAL_CAT" "$@"
     expect(compose).not.toMatch(/^\s+image: caddy:2-alpine\s*$/m);
   });
 
-  it('rejects legacy upgrades before changing either env file', () => {
+  it('regenerates an empty password and merges the bundled profile on upgrade', () => {
+    if (process.platform === 'win32') return;
     const workspace = createWorkspace('circle-redis-upgrade-');
     mkdirSync(join(workspace, 'deploy'));
     cpSync(
@@ -302,6 +304,7 @@ exec "$REAL_CAT" "$@"
         'WEB_DOMAIN=',
         'REDIS_PASSWORD=bad#password',
         'COMPOSE_PROFILES=debug-tools',
+        `APP_ENV_GID=${execFileSync('/usr/bin/id', ['-g']).toString().trim()}`,
         '',
       ].join('\n'),
     );
@@ -314,13 +317,9 @@ exec "$REAL_CAT" "$@"
         '',
       ].join('\n'),
     );
+    chmodSync(join(workspace, '.env.production'), 0o640);
 
-    const originalComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
-    const originalAppEnv = readFileSync(
-      join(workspace, '.env.production'),
-      'utf8',
-    );
-    const result = spawnSync(
+    execFileSync(
       bashExecutable,
       [
         'deploy/gen-env.sh',
@@ -330,16 +329,23 @@ exec "$REAL_CAT" "$@"
         'ops@example.com',
         'app.example.com',
       ],
-      { cwd: workspace, encoding: 'utf8' },
+      { cwd: workspace },
     );
 
-    expect(result.status).not.toBe(0);
-    expect(`${result.stdout}${result.stderr}`).toContain('拒绝原地重写');
-    expect(readFileSync(join(workspace, '.env'), 'utf8')).toBe(
-      originalComposeEnv,
+    const composeEnv = readFileSync(join(workspace, '.env'), 'utf8');
+    const appEnv = readFileSync(join(workspace, '.env.production'), 'utf8');
+    const password = composeEnv.match(/^REDIS_PASSWORD=(.+)$/m)?.[1];
+    expect(password).toMatch(/^[a-f0-9]{48}$/);
+    expect(composeEnv).toContain('COMPOSE_PROFILES=debug-tools,bundled-redis');
+    expect(composeEnv).toContain('API_DOMAIN=api.example.com');
+    expect(composeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
+    expect(composeEnv).toContain('ACME_EMAIL=ops@example.com');
+    expect(composeEnv).toContain('WEB_DOMAIN=app.example.com');
+    expect(appEnv).toContain(
+      'ALLOWED_ORIGINS=https://legacy.example.com,https://admin.example.com,https://app.example.com',
     );
-    expect(readFileSync(join(workspace, '.env.production'), 'utf8')).toBe(
-      originalAppEnv,
+    expect(appEnv).toContain(
+      `REDIS_URL="redis://default:${password}@redis:6379"`,
     );
   });
 
