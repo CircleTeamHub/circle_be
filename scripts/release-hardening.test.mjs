@@ -328,6 +328,86 @@ esac
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
 });
 
+test('tag push resolves each platform image and never overwrites a mismatched version tag', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-tag-push-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const expectedDigest = `sha256:${'1'.repeat(64)}`;
+  const conflictingDigest = `sha256:${'2'.repeat(64)}`;
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+case "$ref" in
+  *:sha-*) printf '{"digest":"${expectedDigest}"}\\n' ;;
+  *:v*)
+    case "\${TAG_STATE:-absent}" in
+      absent) exit 1 ;;
+      same) printf '{"digest":"${expectedDigest}"}\\n' ;;
+      mismatch) printf '{"digest":"${conflictingDigest}"}\\n' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (arch, tagState) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'push',
+        SHA: 'a'.repeat(40),
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: `linux/${arch}`,
+        TAG_STATE: tagState,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, `${arch}-${tagState}-output`),
+      },
+    });
+
+  for (const arch of ['arm64', 'amd64']) {
+    const absent = run(arch, 'absent');
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-absent-output`), 'utf8'),
+      new RegExp(
+        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true`,
+      ),
+    );
+
+    const same = run(arch, 'same');
+    assert.equal(same.status, 0, same.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-same-output`), 'utf8'),
+      /needs_promotion=false/,
+    );
+
+    const mismatch = run(arch, 'mismatch');
+    assert.notEqual(mismatch.status, 0);
+    assert.match(mismatch.stderr, /Refusing to overwrite/);
+  }
+});
+
 test('platform changes cannot overwrite commit or version image tags', () => {
   const build = read('.github/workflows/build-image.yml');
   const release = read('.github/workflows/release.yml');
