@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -185,6 +185,7 @@ fi
 # 生产密钥,而目标文件本身是 0600。这是唯一能观察到那个窗口的时刻。
 case "${@: -1}" in
   *.env.production)
+    printf 'mv %s %s\n' "${@: -2:1}" "${@: -1}" >> "$TEST_COMMAND_LOG"
     # GNU 的 -c 与 BSD 的 -f 互不认;先试 GNU(Linux CI),失败再退 BSD(macOS)。
     # BSD stat 见到 -c 会直接报错退出,不会误判成成功。
     stat -c '%a' "${@: -2:1}" 2>/dev/null > "$CASE_DIR/env-tmp-mode" ||
@@ -202,7 +203,12 @@ if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
     exit 47
   fi
 fi
-exec "$REAL_MV" "$@"
+"$REAL_MV" "$@"
+if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ] &&
+  [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
+  [ "${@: -1}" = "$APP_ENV_FILE" ]; then
+  kill -KILL "$PPID"
+fi
 MV
   chmod +x "$CASE_DIR/bin/mv"
 }
@@ -231,6 +237,7 @@ run_release() {
     COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
+    KILL_AFTER_ENV_STAGE="${KILL_AFTER_ENV_STAGE:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -253,6 +260,10 @@ assert_absent() {
 # CI 在 Linux 跑 —— 先试 GNU,失败再退 BSD(BSD stat 见到 -c 会直接报错)。
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+file_inode() {
+  stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"
 }
 
 assert_mode() {
@@ -522,6 +533,93 @@ test_downtime_switch_failure_restores_previous_color_first() {
     assert_command_before 'start circle_be' 'rm -sf circle_be_green'
 }
 
+test_startup_failure_restores_legacy_env_before_live_restart() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=legacy\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  legacy_inode="$(file_inode "$APP_ENV_FILE")"
+  RELEASE_DOWNTIME=1 START_FAIL=1
+
+  ! run_release || return 1
+
+  [ "$(file_inode "$APP_ENV_FILE")" = "$legacy_inode" ] || {
+    echo "expected rollback to restore the original app env inode" >&2
+    return 1
+  }
+  assert_mode "$APP_ENV_FILE" 600 || return 1
+  [ "$(cat "$APP_ENV_FILE")" = 'SECRET=legacy' ] || return 1
+  assert_command_before \
+    "mv $RELEASE_STATE_DIR/app-env-transaction/legacy-rollback $APP_ENV_FILE" \
+    'start circle_be'
+}
+
+run_staged_release_through_launcher() {
+  local staged_name="$1"
+  PATH="$CASE_DIR/bin:$PATH" \
+    REAL_MV="$REAL_MV" \
+    TARGET_SCHEMA_COMPATIBILITY="$REPO_SCHEMA_COMPATIBILITY" \
+    RELEASE_TAG=v1.2.3 \
+    CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
+    RELEASE_DOWNTIME=0 \
+    RELEASE_IRREVERSIBLE_MIGRATION=0 \
+    RELEASE_MARKER_PATH="$CASE_DIR/no-marker" \
+    COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
+    APP_ENV_FILE="$APP_ENV_FILE" \
+    KILL_AFTER_ENV_STAGE=0 \
+    bash "$RELEASE_STATE_DIR/release-launcher.sh" "$staged_name" \
+      >>"$CASE_DIR/release.log" 2>&1
+}
+
+test_interrupted_env_stage_recovers_through_launcher() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+
+  live_root="$CASE_DIR/live"
+  RELEASE_STATE_DIR="$live_root/.release"
+  export RELEASE_STATE_DIR
+  mkdir -p "$RELEASE_STATE_DIR"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  mkdir -p "$live_root/deploy"
+  cp "$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY" "$live_root/deploy/"
+
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=survives-crash\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  legacy_inode="$(file_inode "$APP_ENV_FILE")"
+  KILL_AFTER_ENV_STAGE=1
+
+  ! run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged" ] || return 1
+  [ "$(file_inode "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback")" = "$legacy_inode" ] || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+
+  staged_name="next-release"
+  staged_root="$RELEASE_STATE_DIR/incoming/$staged_name"
+  mkdir -p "$staged_root/deploy"
+  cp "$ROOT_DIR/deploy/release-launcher.sh" "$RELEASE_STATE_DIR/release-launcher.sh"
+  cp "$ROOT_DIR/deploy/release-deploy.sh" \
+    "$ROOT_DIR/deploy/app-env-preflight.sh" \
+    "$ROOT_DIR/deploy/app-env-transaction.sh" \
+    "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY" \
+    "$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY" \
+    "$staged_root/deploy/"
+  cp "$ROOT_DIR/docker-compose.prod.yml" "$ROOT_DIR/docker-compose.release.yml" "$staged_root/"
+
+  run_staged_release_through_launcher "$staged_name" || return 1
+
+  grep -q 'Recovered legacy app env access from an interrupted release' "$CASE_DIR/release.log" || return 1
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
+  [ ! -e "$staged_root" ] || return 1
+  assert_mode "$APP_ENV_FILE" 640 && assert_running circle_be_green
+}
+
 test_state_write_failure_rolls_proxy_back_before_cleanup() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -696,6 +794,8 @@ for test_name in \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \
+  test_startup_failure_restores_legacy_env_before_live_restart \
+  test_interrupted_env_stage_recovers_through_launcher \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
