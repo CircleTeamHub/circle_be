@@ -15,8 +15,18 @@ docker_stub="$tmp_dir/docker"
 cat > "$docker_stub" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DOCKER_LOG"
-[ "${DOCKER_FAIL:-0}" != "1" ] || exit 1
+if [ "${1:-}" = "inspect" ]; then
+  [ "${PROMETHEUS_ABSENT:-0}" != "1" ]
+  exit
+fi
+if [ "${1:-}" = "info" ]; then
+  [ "${DOCKER_INFO_FAIL:-0}" != "1" ]
+  exit
+fi
 case "$*" in
+  *' up -d --force-recreate prometheus')
+    [ "${DOCKER_FAIL:-0}" != "1" ]
+    ;;
   *' ps --status running -q prometheus')
     [ "${DOCKER_PS_EMPTY:-0}" = "1" ] || printf 'prometheus-test-id\n'
     ;;
@@ -117,6 +127,42 @@ if ENV_FILE="$env_file" \
   exit 1
 fi
 test -e "$failed_sync_marker"
+
+docker_unavailable_token="$tmp_dir/docker-unavailable-token"
+docker_unavailable_marker="$tmp_dir/docker-unavailable-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=docker-unavailable-token' > "$env_file"
+: > "$docker_unavailable_marker"
+if DOCKER_INFO_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$docker_unavailable_token" \
+  METRICS_SYNC_MARKER="$docker_unavailable_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/docker-unavailable.log" 2>&1; then
+  echo 'expected metrics sync to retain the marker when Docker is unavailable' >&2
+  exit 1
+fi
+test -e "$docker_unavailable_marker"
+
+bootstrap_token_file="$tmp_dir/bootstrap-token"
+bootstrap_sync_marker="$tmp_dir/bootstrap-sync-required"
+bootstrap_log="$tmp_dir/bootstrap-docker.log"
+printf '%s\n' 'METRICS_AUTH_TOKEN=bootstrap-token' > "$env_file"
+: > "$bootstrap_sync_marker"
+PROMETHEUS_ABSENT=1 \
+  DOCKER_LOG="$bootstrap_log" \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$bootstrap_token_file" \
+  METRICS_SYNC_MARKER="$bootstrap_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/bootstrap.log"
+test ! -e "$bootstrap_sync_marker"
+grep -F 'inspect circle-prometheus' "$bootstrap_log" >/dev/null
+if grep -F 'compose ' "$bootstrap_log" >/dev/null; then
+  echo 'first bootstrap must not parse production Compose before monitoring/.env exists' >&2
+  exit 1
+fi
 
 recreate_token_file="$tmp_dir/recreate-failure-token"
 recreate_sync_marker="$tmp_dir/recreate-failure-required"

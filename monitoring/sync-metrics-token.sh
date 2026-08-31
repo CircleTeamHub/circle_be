@@ -128,6 +128,16 @@ if [ "$unprivileged" = "1" ]; then
   exit 0
 fi
 
+if ! "$DOCKER" info >/dev/null 2>&1; then
+  echo "❌ Docker is unavailable; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+fi
+if ! "$DOCKER" inspect circle-prometheus >/dev/null 2>&1; then
+  rm -f "$METRICS_SYNC_MARKER"
+  echo "✅ Prometheus is not installed yet; the first start will bind the new token inode"
+  exit 0
+fi
+
 echo "==> Recreating Prometheus to bind the rotated token inode"
 if ! "$DOCKER" compose \
   -f monitoring/docker-compose.yml \
