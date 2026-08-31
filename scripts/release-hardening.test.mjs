@@ -650,6 +650,7 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
   assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
   assert.match(ci, /bash test\/app-env-primitives\.spec\.sh/);
+  assert.match(ci, /bash test\/gen-env-legacy-guard\.spec\.sh/);
   assert.match(ci, /bash test\/release-force-command\.spec\.sh/);
 });
 

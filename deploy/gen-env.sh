@@ -72,6 +72,8 @@ if [ -f .env.production ]; then
       exit 1
     fi
   done
+  echo "❌ 存量 .env.production 必须先通过 Release 工作流完成可恢复权限迁移；拒绝原地重写。" >&2
+  exit 1
   grep -Eq '^API_DOMAIN=.+' .env || set_env_value .env API_DOMAIN "$API_DOMAIN"
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"

@@ -55,6 +55,7 @@ jobs:
           bash test/release-deploy.spec.sh
           bash test/release-launcher.spec.sh
           bash test/app-env-primitives.spec.sh
+          bash test/gen-env-legacy-guard.spec.sh
           bash test/release-force-command.spec.sh
           bash test/sync-metrics-token.spec.sh
           node --test test/prometheus-alerts.spec.mjs
