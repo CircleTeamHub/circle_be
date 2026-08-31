@@ -8,6 +8,7 @@ RELEASE_STATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_ROOT="$(cd "$RELEASE_STATE_DIR/.." && pwd)"
 MINIMUM_SCHEMA_COMPATIBILITY_PATH="$RELEASE_STATE_DIR/minimum-schema-compatibility"
 RUNTIME_COMPATIBILITY_FILE="deploy/RELEASE_RUNTIME_COMPATIBILITY"
+MINIMUM_RELEASE_RUNTIME_COMPATIBILITY=1
 STAGED_RELEASE_NAME="${1:-}"
 
 if [[ ! "$STAGED_RELEASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -79,8 +80,12 @@ if [[ ! "$live_runtime_compatibility" =~ ^[0-9]+$ ]] ||
   echo "Invalid release runtime compatibility metadata" >&2
   exit 1
 fi
-if (( staged_runtime_compatibility < live_runtime_compatibility )); then
-  echo "Staged runtime compatibility $staged_runtime_compatibility is below active runtime contract $live_runtime_compatibility." >&2
+required_runtime_compatibility="$MINIMUM_RELEASE_RUNTIME_COMPATIBILITY"
+if (( live_runtime_compatibility > required_runtime_compatibility )); then
+  required_runtime_compatibility="$live_runtime_compatibility"
+fi
+if (( staged_runtime_compatibility < required_runtime_compatibility )); then
+  echo "Staged runtime compatibility $staged_runtime_compatibility is below required runtime contract $required_runtime_compatibility." >&2
   exit 1
 fi
 

@@ -230,7 +230,8 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
 ### 回滚 / 重放
 
-- **一键回滚**:Actions → Release → Run workflow,填兼容的旧 tag(如 `v0.1.0`)。
+- **一键回滚**:Actions → Release → Run workflow,填兼容的旧 tag(如包含
+  `RELEASE_RUNTIME_COMPATIBILITY=1` 的 `v1.2.3`)。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
 - **服务器上手动**(GitHub 不可用时):将目标 tag 检出到 live tree 之外,按 workflow
@@ -240,16 +241,16 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   ```bash
   set -euo pipefail
   cd ~/circle_be
-  stage=manual-v0.1.0-$(date +%s)
+  stage=manual-v1.2.3-$(date +%s)
   mkdir -p ".release/incoming/$stage"
   rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
     --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
-    /path/to/external-v0.1.0-checkout/ ".release/incoming/$stage/"
+    /path/to/external-v1.2.3-checkout/ ".release/incoming/$stage/"
   # 历史 tag 只提供应用与 schema 元数据。必须从当前 live tree 叠加最后一套已上线、
   # 已验证的部署契约；不要从历史 checkout 运行同名脚本。
   bash deploy/overlay-trusted-release-tooling.sh . ".release/incoming/$stage"
   TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
-  RELEASE_TAG=v0.1.0 \
+  RELEASE_TAG=v1.2.3 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
     bash .release/release-launcher.sh "$stage"
   ```
