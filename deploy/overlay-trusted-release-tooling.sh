@@ -13,9 +13,11 @@ fi
 
 mkdir -p "$TARGET_ROOT/deploy"
 install -m 0755 "$SOURCE_ROOT/deploy/release-deploy.sh" "$TARGET_ROOT/deploy/release-deploy.sh"
+install -m 0755 "$SOURCE_ROOT/deploy/admin-web-deploy.sh" "$TARGET_ROOT/deploy/admin-web-deploy.sh"
 install -m 0755 "$SOURCE_ROOT/deploy/caddy-entrypoint.sh" "$TARGET_ROOT/deploy/caddy-entrypoint.sh"
 install -m 0755 "$SOURCE_ROOT/deploy/overlay-trusted-release-tooling.sh" "$TARGET_ROOT/deploy/overlay-trusted-release-tooling.sh"
 install -m 0644 "$SOURCE_ROOT/deploy/app-env-preflight.sh" "$TARGET_ROOT/deploy/app-env-preflight.sh"
 install -m 0644 "$SOURCE_ROOT/deploy/Caddyfile.admin" "$TARGET_ROOT/deploy/Caddyfile.admin"
 install -m 0644 "$SOURCE_ROOT/docker-compose.prod.yml" "$TARGET_ROOT/docker-compose.prod.yml"
 install -m 0644 "$SOURCE_ROOT/docker-compose.release.yml" "$TARGET_ROOT/docker-compose.release.yml"
+install -m 0644 "$SOURCE_ROOT/docker-compose.admin-release.yml" "$TARGET_ROOT/docker-compose.admin-release.yml"

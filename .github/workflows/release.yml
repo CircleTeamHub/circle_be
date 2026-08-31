@@ -367,12 +367,14 @@ jobs:
           path: .trusted-release-tooling
           sparse-checkout: |
             deploy/release-deploy.sh
+            deploy/admin-web-deploy.sh
             deploy/caddy-entrypoint.sh
             deploy/overlay-trusted-release-tooling.sh
             deploy/app-env-preflight.sh
             deploy/Caddyfile.admin
             docker-compose.prod.yml
             docker-compose.release.yml
+            docker-compose.admin-release.yml
           sparse-checkout-cone-mode: false
 
       - name: Overlay trusted deployment tooling for manual rollback

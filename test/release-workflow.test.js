@@ -30,12 +30,14 @@ test('release workflow signs and stages the exact immutable release manifest', (
 test('manual rollback keeps current trusted deploy tooling with the historical application tag', () => {
   const operationalFiles = [
     'deploy/release-deploy.sh',
+    'deploy/admin-web-deploy.sh',
     'deploy/caddy-entrypoint.sh',
     'deploy/overlay-trusted-release-tooling.sh',
     'deploy/app-env-preflight.sh',
     'deploy/Caddyfile.admin',
     'docker-compose.prod.yml',
     'docker-compose.release.yml',
+    'docker-compose.admin-release.yml',
   ];
   const workflow = fs.readFileSync(
     path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),
@@ -129,6 +131,7 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       );
       const expectedMode = [
         'deploy/release-deploy.sh',
+        'deploy/admin-web-deploy.sh',
         'deploy/caddy-entrypoint.sh',
         'deploy/overlay-trusted-release-tooling.sh',
       ].includes(operationalFile)
