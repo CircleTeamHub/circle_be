@@ -8,6 +8,8 @@ env_file="$tmp_dir/env.production"
 token_file="$tmp_dir/metrics_token"
 fake_bin="$tmp_dir/bin"
 sudo_log="$tmp_dir/sudo.log"
+sync_marker="$tmp_dir/metrics-token-sync-required"
+export METRICS_SYNC_MARKER="$sync_marker"
 
 cleanup() {
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
@@ -46,11 +48,14 @@ SH
 fi
 
 run_sync() {
+  : > "$sync_marker"
   ENV_FILE="$env_file" \
     TOKEN_FILE="$token_file" \
+    METRICS_SYNC_MARKER="$sync_marker" \
     PROM_UID="$prom_uid" \
     PROM_GID="$prom_gid" \
     bash "$script"
+  test ! -e "$sync_marker"
 }
 
 read_token_file() {

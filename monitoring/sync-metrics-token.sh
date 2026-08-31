@@ -23,6 +23,7 @@ TOKEN_FILE="${TOKEN_FILE:-monitoring/prometheus/metrics_token}"
 PROM_UID="${PROM_UID:-65534}"
 PROM_GID="${PROM_GID:-$PROM_UID}"
 SUDO="${SUDO:-sudo}"
+METRICS_SYNC_MARKER="${METRICS_SYNC_MARKER:-.release/metrics-token-sync-required}"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "❌ $ENV_FILE not found. Run deploy/gen-env.sh first (see DEPLOY.md §4)." >&2
@@ -126,3 +127,4 @@ fi
 
 echo "   Recreate Prometheus to bind the rotated token inode:"
 echo "     docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus"
+rm -f "$METRICS_SYNC_MARKER"

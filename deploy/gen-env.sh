@@ -160,6 +160,22 @@ ensure_env_csv_value() {
   fi
 }
 
+read_env_scalar() {
+  local file="$1" key="$2" value
+  value="$(sed -n "s/^${key}=//p" "$file" | tail -n 1)"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+decode_url_password() {
+  local encoded="$1"
+  [[ "$encoded" =~ ^([A-Za-z0-9._~-]|%[A-Fa-f0-9]{2})+$ ]] || return 1
+  printf '%b' "${encoded//%/\\x}"
+}
+
 if [ -f .env.production ]; then
   command -v flock >/dev/null || {
     echo "❌ 缺少 flock，无法与发版流程安全互斥。" >&2
@@ -172,9 +188,13 @@ if [ -f .env.production ]; then
     exit 1
   fi
   release_state_dir="${RELEASE_STATE_DIR:-.release}"
+  metrics_sync_marker="$release_state_dir/metrics-token-sync-required"
   if [ -e "$release_state_dir/app-env-transaction/state" ]; then
     echo "❌ 检测到未完成的 app env 事务；请先运行 Release 恢复流程。" >&2
     exit 1
+  fi
+  if [ -e "$metrics_sync_marker" ]; then
+    echo "⚠️  监控 token 仍待同步；运行 bash monitoring/sync-metrics-token.sh 并重新创建 Prometheus。" >&2
   fi
   if [ ! -f .env ]; then
     echo "❌ .env.production 已存在但 .env 缺失;拒绝生成不完整的 Compose 配置。" >&2
@@ -192,12 +212,8 @@ if [ -f .env.production ]; then
     exit 1
   fi
 
-  redis_password="$(sed -n 's/^REDIS_PASSWORD=//p' .env | tail -n 1)"
-  redis_url="$(sed -n 's/^REDIS_URL=//p' .env.production | tail -n 1)"
-  redis_url="${redis_url#\"}"
-  redis_url="${redis_url%\"}"
-  redis_url="${redis_url#\'}"
-  redis_url="${redis_url%\'}"
+  redis_password="$(read_env_scalar .env REDIS_PASSWORD)"
+  redis_url="$(read_env_scalar .env.production REDIS_URL)"
   bundled_redis=0
   redis_password_generated=0
   if [ -n "$redis_url" ]; then
@@ -208,9 +224,13 @@ if [ -f .env.production ]; then
           echo "❌ bundled Redis 已配置，但 .env 缺少 REDIS_PASSWORD；拒绝猜测或轮换运行中凭据。" >&2
           exit 1
         fi
-        expected_redis_url="redis://default:$redis_password@redis:6379"
-        if [ "$redis_url" != "$expected_redis_url" ] &&
-          [ "$redis_url" != "$expected_redis_url/" ]; then
+        encoded_redis_password="${redis_url#redis://default:}"
+        encoded_redis_password="${encoded_redis_password%@redis:6379*}"
+        decoded_redis_password="$(decode_url_password "$encoded_redis_password")" || {
+          echo "❌ bundled REDIS_URL 的密码必须使用标准 percent-encoding。" >&2
+          exit 1
+        }
+        if [ "$decoded_redis_password" != "$redis_password" ]; then
           echo "❌ .env 与 .env.production 的 bundled Redis 凭据不一致；请先恢复一致配置。" >&2
           exit 1
         fi
@@ -221,12 +241,15 @@ if [ -f .env.production ]; then
     if [ -z "$redis_password" ]; then
       redis_password="$(openssl rand -hex 24)"
       redis_password_generated=1
+    elif ! [[ "$redis_password" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+      echo "❌ REDIS_PASSWORD 含 URI 特殊字符；请先在 .env.production 显式配置 percent-encoded REDIS_URL。" >&2
+      exit 1
     fi
   fi
 
-  metrics_auth_token="$(sed -n 's/^METRICS_AUTH_TOKEN=//p' .env.production | tail -n 1)"
+  metrics_auth_token="$(read_env_scalar .env.production METRICS_AUTH_TOKEN)"
   metrics_auth_token_generated=0
-  if [ -z "$metrics_auth_token" ]; then
+  if [ -z "$metrics_auth_token" ] || [ "$metrics_auth_token" = "__REPLACE_RANDOM__" ]; then
     metrics_auth_token="$(openssl rand -hex 24)"
     metrics_auth_token_generated=1
   fi
@@ -257,6 +280,10 @@ if [ -f .env.production ]; then
   fi
   grep -q '^REDIS_REQUIRED=' .env.production || printf 'REDIS_REQUIRED=false\n' >> .env.production
   if [ "$metrics_auth_token_generated" = "1" ]; then
+    mkdir -p "$release_state_dir"
+    chmod 700 "$release_state_dir"
+    : > "$metrics_sync_marker"
+    chmod 600 "$metrics_sync_marker"
     set_env_value .env.production METRICS_AUTH_TOKEN "$metrics_auth_token"
   fi
   if ! grep -Eq '^MINIO_PUBLIC_URL=https://' .env.production; then
@@ -270,8 +297,8 @@ if [ -f .env.production ]; then
   clear_file_acl .env.production
   chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
-  if [ "$metrics_auth_token_generated" = "1" ]; then
-    echo "⚠️  已生成缺失的 METRICS_AUTH_TOKEN。启动后端前必须运行：bash monitoring/sync-metrics-token.sh，并重新创建 Prometheus。" >&2
+  if [ -e "$metrics_sync_marker" ]; then
+    echo "⚠️  METRICS_AUTH_TOKEN 尚未同步。启动后端前必须运行：bash monitoring/sync-metrics-token.sh，并重新创建 Prometheus。" >&2
   fi
   exit 0
 fi

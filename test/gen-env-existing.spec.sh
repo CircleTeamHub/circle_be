@@ -57,6 +57,16 @@ run_gen_env() {
   )
 }
 
+run_gen_env_with_real_lock() {
+  local root="$1"
+  (
+    cd "$root"
+    RELEASE_STATE_DIR="$root/.release" \
+      bash deploy/gen-env.sh 203.0.113.10 api.example.test admin.example.test \
+      ops@example.test web.example.test
+  )
+}
+
 prepare_case success
 chmod 640 "$CASE_DIR/success/.env.production"
 if command -v setfacl >/dev/null && command -v getfacl >/dev/null && id nobody >/dev/null 2>&1; then
@@ -89,6 +99,23 @@ grep -q '另一个发版或配置更新正在进行' "$CASE_DIR/locked.log" || {
 }
 echo "PASS existing rerun fails closed while a release holds the shared lock"
 
+if command -v flock >/dev/null; then
+  prepare_case real_lock
+  chmod 640 "$CASE_DIR/real_lock/.env.production"
+  real_lock_env="$(cat "$CASE_DIR/real_lock/.env")"
+  real_lock_app_env="$(cat "$CASE_DIR/real_lock/.env.production")"
+  exec 9>/tmp/circle-be-release.lock
+  flock -n 9 || fail "could not acquire shared release lock for test"
+  if run_gen_env_with_real_lock "$CASE_DIR/real_lock" >"$CASE_DIR/real_lock.log" 2>&1; then
+    fail "rerun did not contend on the release lock path"
+  fi
+  [ "$(cat "$CASE_DIR/real_lock/.env")" = "$real_lock_env" ] || fail "real lock refusal mutated .env"
+  [ "$(cat "$CASE_DIR/real_lock/.env.production")" = "$real_lock_app_env" ] || fail "real lock refusal mutated .env.production"
+  flock -u 9
+  run_gen_env_with_real_lock "$CASE_DIR/real_lock" >/dev/null
+  echo "PASS existing rerun uses the exact shared release lock path"
+fi
+
 prepare_case transaction
 chmod 640 "$CASE_DIR/transaction/.env.production"
 mkdir -p "$CASE_DIR/transaction/.release/app-env-transaction"
@@ -110,9 +137,93 @@ mv "$CASE_DIR/missing_metrics/app-env.tmp" "$CASE_DIR/missing_metrics/.env.produ
 chmod 640 "$CASE_DIR/missing_metrics/.env.production"
 run_gen_env "$CASE_DIR/missing_metrics" >"$CASE_DIR/missing_metrics.log" 2>&1
 grep -Eq '^METRICS_AUTH_TOKEN=.{32,}$' "$CASE_DIR/missing_metrics/.env.production" || fail "rerun did not generate a missing metrics token"
+test -e "$CASE_DIR/missing_metrics/.release/metrics-token-sync-required" || fail "missing metrics token did not persist a sync marker"
 grep -q 'monitoring/sync-metrics-token.sh' "$CASE_DIR/missing_metrics.log" || fail "new metrics token did not print the required sync action"
 grep -q '重新创建 Prometheus' "$CASE_DIR/missing_metrics.log" || fail "new metrics token did not warn about the Prometheus restart"
+run_gen_env "$CASE_DIR/missing_metrics" >"$CASE_DIR/missing_metrics-rerun.log" 2>&1
+grep -q '监控 token 仍待同步' "$CASE_DIR/missing_metrics-rerun.log" || fail "pending metrics sync did not survive a rerun"
 echo "PASS missing metrics token generation prints the required consumer sync"
+
+prepare_case placeholder_metrics
+chmod 640 "$CASE_DIR/placeholder_metrics/.env.production"
+sed 's/^METRICS_AUTH_TOKEN=.*/METRICS_AUTH_TOKEN="__REPLACE_RANDOM__"/' \
+  "$CASE_DIR/placeholder_metrics/.env.production" > "$CASE_DIR/placeholder_metrics/app-env.tmp"
+mv "$CASE_DIR/placeholder_metrics/app-env.tmp" "$CASE_DIR/placeholder_metrics/.env.production"
+chmod 640 "$CASE_DIR/placeholder_metrics/.env.production"
+run_gen_env "$CASE_DIR/placeholder_metrics" >/dev/null 2>&1
+! grep -q '__REPLACE_RANDOM__' "$CASE_DIR/placeholder_metrics/.env.production" || fail "placeholder metrics token was preserved"
+test -e "$CASE_DIR/placeholder_metrics/.release/metrics-token-sync-required" || fail "placeholder replacement did not persist a sync marker"
+echo "PASS placeholder metrics token is replaced with a recoverable sync requirement"
+
+prepare_case missing_url
+chmod 640 "$CASE_DIR/missing_url/.env.production"
+grep -v '^REDIS_URL=' "$CASE_DIR/missing_url/.env.production" > "$CASE_DIR/missing_url/app-env.tmp"
+mv "$CASE_DIR/missing_url/app-env.tmp" "$CASE_DIR/missing_url/.env.production"
+chmod 640 "$CASE_DIR/missing_url/.env.production"
+run_gen_env "$CASE_DIR/missing_url" >/dev/null 2>&1
+grep -q '^REDIS_PASSWORD=legacy-password$' "$CASE_DIR/missing_url/.env" || fail "missing URL rotated the existing password"
+grep -q '^REDIS_URL="redis://default:legacy-password@redis:6379"$' "$CASE_DIR/missing_url/.env.production" || fail "missing URL was not filled from the existing password"
+echo "PASS missing bundled Redis URL is filled without rotation"
+
+prepare_case missing_both
+chmod 640 "$CASE_DIR/missing_both/.env.production"
+grep -v '^REDIS_PASSWORD=' "$CASE_DIR/missing_both/.env" > "$CASE_DIR/missing_both/compose.tmp"
+mv "$CASE_DIR/missing_both/compose.tmp" "$CASE_DIR/missing_both/.env"
+grep -v '^REDIS_URL=' "$CASE_DIR/missing_both/.env.production" > "$CASE_DIR/missing_both/app-env.tmp"
+mv "$CASE_DIR/missing_both/app-env.tmp" "$CASE_DIR/missing_both/.env.production"
+chmod 600 "$CASE_DIR/missing_both/.env"
+chmod 640 "$CASE_DIR/missing_both/.env.production"
+run_gen_env "$CASE_DIR/missing_both" >/dev/null 2>&1
+generated_password="$(sed -n 's/^REDIS_PASSWORD=//p' "$CASE_DIR/missing_both/.env")"
+printf '%s' "$generated_password" | grep -Eq '^[a-f0-9]{48}$' || fail "missing Redis credentials did not generate a safe password"
+grep -q "^REDIS_URL=\"redis://default:$generated_password@redis:6379\"$" "$CASE_DIR/missing_both/.env.production" || fail "generated Redis credentials do not match"
+echo "PASS fully missing bundled Redis credentials are generated as a matching pair"
+
+for refusal in missing_password mismatched_password; do
+  prepare_case "$refusal"
+  chmod 640 "$CASE_DIR/$refusal/.env.production"
+  if [ "$refusal" = "missing_password" ]; then
+    grep -v '^REDIS_PASSWORD=' "$CASE_DIR/$refusal/.env" > "$CASE_DIR/$refusal/compose.tmp"
+  else
+    sed 's/^REDIS_PASSWORD=.*/REDIS_PASSWORD=other-password/' "$CASE_DIR/$refusal/.env" > "$CASE_DIR/$refusal/compose.tmp"
+  fi
+  mv "$CASE_DIR/$refusal/compose.tmp" "$CASE_DIR/$refusal/.env"
+  chmod 600 "$CASE_DIR/$refusal/.env"
+  refusal_env="$(cat "$CASE_DIR/$refusal/.env")"
+  refusal_app_env="$(cat "$CASE_DIR/$refusal/.env.production")"
+  if run_gen_env "$CASE_DIR/$refusal" >/dev/null 2>&1; then
+    fail "$refusal Redis configuration unexpectedly succeeded"
+  fi
+  [ "$(cat "$CASE_DIR/$refusal/.env")" = "$refusal_env" ] || fail "$refusal refusal mutated .env"
+  [ "$(cat "$CASE_DIR/$refusal/.env.production")" = "$refusal_app_env" ] || fail "$refusal refusal mutated .env.production"
+done
+echo "PASS missing and inconsistent bundled Redis passwords fail without mutation"
+
+prepare_case special_missing_url
+chmod 640 "$CASE_DIR/special_missing_url/.env.production"
+sed 's/^REDIS_PASSWORD=.*/REDIS_PASSWORD="p#ss"/' "$CASE_DIR/special_missing_url/.env" > "$CASE_DIR/special_missing_url/compose.tmp"
+mv "$CASE_DIR/special_missing_url/compose.tmp" "$CASE_DIR/special_missing_url/.env"
+grep -v '^REDIS_URL=' "$CASE_DIR/special_missing_url/.env.production" > "$CASE_DIR/special_missing_url/app-env.tmp"
+mv "$CASE_DIR/special_missing_url/app-env.tmp" "$CASE_DIR/special_missing_url/.env.production"
+chmod 600 "$CASE_DIR/special_missing_url/.env"
+chmod 640 "$CASE_DIR/special_missing_url/.env.production"
+if run_gen_env "$CASE_DIR/special_missing_url" >"$CASE_DIR/special_missing_url.log" 2>&1; then
+  fail "special-character password was interpolated into a Redis URL"
+fi
+grep -q 'percent-encoded REDIS_URL' "$CASE_DIR/special_missing_url.log" || fail "special password refusal was not actionable"
+echo "PASS special-character password requires an explicit encoded Redis URL"
+
+prepare_case encoded_url
+chmod 640 "$CASE_DIR/encoded_url/.env.production"
+sed 's/^REDIS_PASSWORD=.*/REDIS_PASSWORD="p#ss"/' "$CASE_DIR/encoded_url/.env" > "$CASE_DIR/encoded_url/compose.tmp"
+mv "$CASE_DIR/encoded_url/compose.tmp" "$CASE_DIR/encoded_url/.env"
+sed 's#^REDIS_URL=.*#REDIS_URL="redis://default:p%23ss@redis:6379"#' "$CASE_DIR/encoded_url/.env.production" > "$CASE_DIR/encoded_url/app-env.tmp"
+mv "$CASE_DIR/encoded_url/app-env.tmp" "$CASE_DIR/encoded_url/.env.production"
+chmod 600 "$CASE_DIR/encoded_url/.env"
+chmod 640 "$CASE_DIR/encoded_url/.env.production"
+run_gen_env "$CASE_DIR/encoded_url" >/dev/null 2>&1
+grep -q '^REDIS_URL="redis://default:p%23ss@redis:6379"$' "$CASE_DIR/encoded_url/.env.production" || fail "encoded Redis URL was rewritten"
+echo "PASS percent-encoded bundled Redis URL matches the dotenv password"
 
 prepare_case failure
 legacy_inode="$(file_inode "$CASE_DIR/failure/.env.production")"

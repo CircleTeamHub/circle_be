@@ -77,6 +77,9 @@ docker compose -f docker-compose.prod.yml up -d --build
 创建 Prometheus 后再启动后端。首次从
 旧权限升级时必须先走 Release 工作流完成可恢复迁移；在此之前脚本会拒绝原地修改
 `.env.production`，避免旧容器重启后失去读取权限。不要手工绕过为它 `chgrp/chmod`。
+如果存量 `REDIS_PASSWORD` 含 `#`、`@` 等 URI 特殊字符，脚本不会猜测编码；请先在
+`.env.production` 明确写入 percent-encoded `REDIS_URL`。两边解码后的密码不一致时
+重跑会在修改任何文件前拒绝。
 使用托管 Redis 时,把 `.env.production` 的 `REDIS_URL` 改成带认证的 `rediss://...`,
 设置 `REDIS_ALLOW_INSECURE=false`,并从 `.env` 的 `COMPOSE_PROFILES` 中移除
 `bundled-redis`;此时 Compose 不会启动内置 Redis。
