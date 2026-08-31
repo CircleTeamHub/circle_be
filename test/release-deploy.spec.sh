@@ -791,7 +791,7 @@ test_irreversible_sentry_permission_failures_preserve_the_live_env() {
     assert_mode "$APP_ENV_FILE" 640 || return 1
     grep -q '^SENTRY_RELEASE=circle-be@v0\.0\.1$' "$APP_ENV_FILE" || {
       echo "$operation failure replaced the live env with a partial Sentry stamp" >&2
-      cat "$CASE_DIR/setfacl-invocations.log" 2>/dev/null >&2 || true
+      cat "$CASE_DIR/setfacl-invocations.log" >&2 2>/dev/null || true
       cat "$CASE_DIR/release.log" >&2
       return 1
     }
