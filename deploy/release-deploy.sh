@@ -110,9 +110,10 @@ legacy_app_env_backup=""
 app_env_staged_file=""
 app_env_transaction_committed=0
 app_env_transaction_active=0
-APP_ENV_BACKUP_PATH="${APP_ENV_FILE}.legacy-rollback"
-APP_ENV_STAGED_PATH="${APP_ENV_FILE}.access.tmp"
-APP_ENV_TRANSACTION_PATH="${APP_ENV_FILE}.release-transaction"
+APP_ENV_TRANSACTION_DIR="$RELEASE_STATE_DIR/app-env-transaction"
+APP_ENV_BACKUP_PATH="$APP_ENV_TRANSACTION_DIR/legacy-rollback"
+APP_ENV_STAGED_PATH="$APP_ENV_TRANSACTION_DIR/access.tmp"
+APP_ENV_TRANSACTION_PATH="$APP_ENV_TRANSACTION_DIR/state"
 release_docker_config=""
 . deploy/app-env-preflight.sh
 
@@ -122,6 +123,9 @@ clear_app_env_acl() {
     Linux)
       if command -v "$setfacl_command" >/dev/null; then
         "$setfacl_command" -b "$file"
+        if [ -d "$file" ]; then
+          "$setfacl_command" -k "$file"
+        fi
       else
         mode="$(LC_ALL=C ls -ld -- "$file" | awk '{ print $1 }')"
         case "$mode" in
@@ -153,6 +157,13 @@ can_rewrite_app_env_acl_safely() {
 # 原先靠哪一组/ACL 读取，也不要求部署账号有权把文件 chgrp 回旧组。
 persist_app_env_transaction_state() {
   local state="$1" temp="${APP_ENV_TRANSACTION_PATH}.tmp"
+  # release-launcher.sh preserves RELEASE_STATE_DIR while atomically replacing
+  # the checked-out tree. Keeping all crash-recovery artifacts here prevents a
+  # later `rsync --delete` activation from erasing the evidence needed to
+  # recover a SIGKILL or host reboot.
+  mkdir -p "$APP_ENV_TRANSACTION_DIR" || return 1
+  clear_app_env_acl "$APP_ENV_TRANSACTION_DIR" || return 1
+  chmod 700 "$APP_ENV_TRANSACTION_DIR" || return 1
   rm -f "$temp" || return 1
   (umask 077 && printf '%s\n' "$state" > "$temp") || return 1
   mv -f "$temp" "$APP_ENV_TRANSACTION_PATH"
@@ -160,6 +171,7 @@ persist_app_env_transaction_state() {
 
 clear_app_env_transaction_state() {
   rm -f "$APP_ENV_TRANSACTION_PATH" "${APP_ENV_TRANSACTION_PATH}.tmp"
+  rmdir "$APP_ENV_TRANSACTION_DIR" 2>/dev/null || true
   app_env_transaction_active=0
 }
 

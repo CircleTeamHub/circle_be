@@ -73,11 +73,19 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
 
 test('non-root app can read the group-protected production env file', () => {
   const compose = read('docker-compose.prod.yml');
+  const ci = read('.github/workflows/ci.yml');
   const generator = read('deploy/gen-env.sh');
   const release = read('deploy/release-deploy.sh');
   const preflight = read('deploy/app-env-preflight.sh');
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
+  assert.match(
+    ci,
+    /Verify both non-root app colors can read the protected env/,
+  );
+  assert.match(ci, /for service in circle_be circle_be_green/);
+  assert.match(ci, /process\.getuid\(\)===0/);
+  assert.match(ci, /accessSync\('\/app\/\.env\.production'/);
   assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
   assert.match(generator, /APP_ENV_GID=\$DEPLOY_APP_ENV_GID/);
   assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
@@ -209,7 +217,10 @@ test('the configured single-platform release image is scanned before either regi
   const push = workflow.indexOf('- name: Push scanned image tags');
 
   assert.match(workflow, /linux\/amd64\|linux\/arm64/);
-  assert.match(workflow, /platforms: \$\{\{ steps\.meta\.outputs\.platform \}\}/);
+  assert.match(
+    workflow,
+    /platforms: \$\{\{ steps\.meta\.outputs\.platform \}\}/,
+  );
   assert.match(workflow, /push: false/);
   assert.match(workflow, /load: true/);
   assert.match(
@@ -356,14 +367,100 @@ esac
   assert.match(outputs, /needs_promotion=true/);
   assert.match(outputs, /sha_image=.*:sha-a{40}-arm64/);
   assert.match(outputs, /release_image=.*:v1\.2\.3-arm64/);
-  assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+  assert.match(
+    outputs,
+    /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/,
+  );
+});
+
+test('tag push resolves each platform image and never overwrites a mismatched version tag', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-tag-push-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const expectedDigest = `sha256:${'1'.repeat(64)}`;
+  const conflictingDigest = `sha256:${'2'.repeat(64)}`;
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+case "$ref" in
+  *:sha-*) printf '{"digest":"${expectedDigest}"}\\n' ;;
+  *:v*)
+    case "\${TAG_STATE:-absent}" in
+      absent) exit 1 ;;
+      same) printf '{"digest":"${expectedDigest}"}\\n' ;;
+      mismatch) printf '{"digest":"${conflictingDigest}"}\\n' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (arch, tagState) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'push',
+        SHA: 'a'.repeat(40),
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: `linux/${arch}`,
+        TAG_STATE: tagState,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, `${arch}-${tagState}-output`),
+      },
+    });
+
+  for (const arch of ['arm64', 'amd64']) {
+    const absent = run(arch, 'absent');
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-absent-output`), 'utf8'),
+      new RegExp(
+        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true`,
+      ),
+    );
+
+    const same = run(arch, 'same');
+    assert.equal(same.status, 0, same.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-same-output`), 'utf8'),
+      /needs_promotion=false/,
+    );
+
+    const mismatch = run(arch, 'mismatch');
+    assert.notEqual(mismatch.status, 0);
+    assert.match(mismatch.stderr, /Refusing to overwrite/);
+  }
 });
 
 test('platform changes cannot overwrite commit or version image tags', () => {
   const build = read('.github/workflows/build-image.yml');
   const release = read('.github/workflows/release.yml');
 
-  assert.match(build, /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(
+    build,
+    /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/,
+  );
   assert.match(build, /main-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
   assert.match(release, /sha_image="\$repo:sha-\$SHA-\$arch"/);
   assert.match(release, /release_image="\$repo:\$RELEASE_TAG-\$arch"/);
@@ -689,7 +786,10 @@ test('Caddy restart preserves only the active upstream and loads the current Cad
   });
 
   assert.equal(invalid.status, 1);
-  assert.match(invalid.stderr, /does not identify the active blue\/green backend/);
+  assert.match(
+    invalid.stderr,
+    /does not identify the active blue\/green backend/,
+  );
 });
 
 test('backend workflow and server use the same strict version format', () => {
@@ -709,7 +809,10 @@ test('note-exports lifecycle rule is re-appliable and has a documented rollout',
   const deployDoc = read('DEPLOY.md');
 
   // 幂等:先查后加。直接 add 会在重复执行时把规则叠一遍。
-  assert.match(compose, /mc ilm rule ls local\/circle .*\| grep -q 'note-exports\/'/);
+  assert.match(
+    compose,
+    /mc ilm rule ls local\/circle .*\| grep -q 'note-exports\/'/,
+  );
   assert.match(
     compose,
     /mc ilm rule add --expire-days 1 --prefix 'note-exports\/' local\/circle/,

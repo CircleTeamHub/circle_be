@@ -218,7 +218,7 @@ if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
 fi
 if { [ "${INTERRUPT_AFTER_ENV_STAGE:-0}" = "1" ] ||
   [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ]; } &&
-  [[ "${@: -2:1}" = *.access.tmp ]] &&
+  [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
   [ "${@: -1}" = "$APP_ENV_FILE" ]; then
   "$REAL_MV" "$@"
   if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ]; then
@@ -235,8 +235,8 @@ MV
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${PROBE_STAGE_DEFAULT_ACL:-0}" = "1" ] && [ "$#" = "1" ] &&
-  [ "$1" = "${APP_ENV_FILE}.legacy-rollback" ]; then
-  getfacl -cp "${APP_ENV_FILE}.access.tmp" > "$CASE_DIR/staged-env-acl-before-copy"
+  [ "$1" = "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ]; then
+  getfacl -cp "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" > "$CASE_DIR/staged-env-acl-before-copy"
 fi
 exec "$REAL_CAT" "$@"
 CAT
@@ -421,8 +421,8 @@ test_startup_failure_restores_legacy_app_env_before_restarting_live_color() {
     assert_mode "$APP_ENV_FILE" 644 &&
     grep -q '^LEGACY_ONLY=readable-before-group-add$' "$APP_ENV_FILE" &&
     grep -q 'Restored legacy app env access' "$CASE_DIR/release.log" &&
-    [ ! -e "${APP_ENV_FILE}.legacy-rollback" ] &&
-    [ ! -e "${APP_ENV_FILE}.release-transaction" ]
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
 test_uncatchable_exit_is_recovered_before_the_next_release() {
@@ -439,8 +439,8 @@ test_uncatchable_exit_is_recovered_before_the_next_release() {
   RELEASE_DOWNTIME=1 KILL_AFTER_ENV_STAGE=1
 
   ! run_release || return 1
-  [ -e "${APP_ENV_FILE}.legacy-rollback" ] || return 1
-  [ "$(cat "${APP_ENV_FILE}.release-transaction")" = "staged" ] || return 1
+  [ -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged" ] || return 1
 
   # Simulate the legacy service returning after a host reboot, then start a new
   # release. Recovery must happen before its first Compose command.
@@ -452,8 +452,8 @@ test_uncatchable_exit_is_recovered_before_the_next_release() {
     assert_mode "$APP_ENV_FILE" 644 &&
     grep -q '^LEGACY_ONLY=survives-sigkill$' "$APP_ENV_FILE" &&
     grep -q 'Recovered legacy app env access from an interrupted release' "$CASE_DIR/release.log" &&
-    [ ! -e "${APP_ENV_FILE}.legacy-rollback" ] &&
-    [ ! -e "${APP_ENV_FILE}.release-transaction" ]
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
 test_interrupted_env_staging_restores_the_legacy_inode() {
@@ -474,8 +474,8 @@ test_interrupted_env_staging_restores_the_legacy_inode() {
   [ "$(file_inode "$APP_ENV_FILE")" = "$original_inode" ] &&
     assert_mode "$APP_ENV_FILE" 644 &&
     grep -q '^LEGACY_ONLY=survives-interrupt$' "$APP_ENV_FILE" &&
-    [ ! -e "${APP_ENV_FILE}.legacy-rollback" ] &&
-    [ ! -e "${APP_ENV_FILE}.release-transaction" ]
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
 test_interrupted_rollout_preserves_recorded_live_color() {
@@ -608,7 +608,7 @@ test_release_atomically_installs_private_group_read_access() {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
     return 1
   }
-  [ ! -e "${APP_ENV_FILE}.legacy-rollback" ] || {
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] || {
     echo "successful release left a legacy secrets backup behind" >&2
     return 1
   }
@@ -699,9 +699,10 @@ test_release_clears_default_acl_before_copying_staged_secrets() {
   APP_ENV_FILE="$CASE_DIR/.env.production"
   printf 'DATABASE_URL=postgres://u:p@h/db\nJWT_SECRET=default-acl-secret\n' > "$APP_ENV_FILE"
   chmod 600 "$APP_ENV_FILE"
-  # New files in this directory inherit read access for nobody. The cat stub
-  # snapshots the staged file immediately before the first secret byte is read.
-  setfacl -m d:u:nobody:r "$CASE_DIR"
+  # New transaction directories inherit read access for nobody. The release
+  # must clear both access and default ACLs on its persistent transaction
+  # directory before creating the staged secrets file inside it.
+  setfacl -m d:u:nobody:r "$RELEASE_STATE_DIR"
   export APP_ENV_FILE
   PROBE_STAGE_DEFAULT_ACL=1
 
@@ -897,6 +898,35 @@ prepare_irreversible_case() {
   RELEASE_IRREVERSIBLE_MIGRATION=1
 }
 
+test_irreversible_sigkill_finalizes_restricted_env_before_next_release() {
+  prepare_irreversible_case
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'NODE_ENV=production\nIRREVERSIBLE_ONLY=survives-sigkill\n' > "$APP_ENV_FILE"
+  chmod 644 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  KILL_AFTER_ENV_STAGE=1
+
+  ! run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged-irreversible" ] || return 1
+  [ -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+  local restricted_inode
+  restricted_inode="$(file_inode "$APP_ENV_FILE")"
+
+  # Recovery runs before the first Compose call. Force the new attempt to stop
+  # at the Caddy preflight so it cannot create a second env transaction.
+  KILL_AFTER_ENV_STAGE=0 CADDY_NO_RATE_LIMIT=1
+  ! run_release || return 1
+
+  [ "$(file_inode "$APP_ENV_FILE")" = "$restricted_inode" ] &&
+    assert_mode "$APP_ENV_FILE" 640 &&
+    grep -q '^IRREVERSIBLE_ONLY=survives-sigkill$' "$APP_ENV_FILE" &&
+    grep -q 'Finalized app env access after an interrupted irreversible release' "$CASE_DIR/release.log" &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback" ] &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] &&
+    assert_not_restarted
+}
+
 test_irreversible_confirmation_requires_downtime() {
   new_case
   RELEASE_DOWNTIME=0 RELEASE_IRREVERSIBLE_MIGRATION=1
@@ -1041,6 +1071,7 @@ for test_name in \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
+  test_irreversible_sigkill_finalizes_restricted_env_before_next_release \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \
@@ -1056,6 +1087,10 @@ for test_name in \
   test_irreversible_proxy_failure_stays_in_maintenance \
   test_irreversible_state_failure_stays_in_maintenance \
   test_irreversible_smoke_failure_stays_in_maintenance; do
+  if [ -n "${RELEASE_DEPLOY_TEST_FILTER:-}" ] &&
+    [ "$test_name" != "$RELEASE_DEPLOY_TEST_FILTER" ]; then
+    continue
+  fi
   if "$test_name"; then
     echo "PASS $test_name"
   else

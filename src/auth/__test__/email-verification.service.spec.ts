@@ -379,9 +379,14 @@ describe('EmailVerificationService', () => {
     process.env.EMAIL_CODE_DEV_BYPASS = '999999';
     process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = 'true';
     try {
+      const warn = jest.spyOn((service as any).logger, 'warn');
       await expect(
-        service.verifyCode('nobody@b.com', 'REGISTER', '999999'),
+        service.verifyCode('Nobody@B.com', 'REGISTER', '999999'),
       ).resolves.toBe(true);
+      const warning = JSON.stringify(warn.mock.calls);
+      expect(warning).toContain('REGISTER');
+      expect(warning).not.toContain('Nobody@B.com');
+      expect(warning).not.toContain('nobody@b.com');
     } finally {
       if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = prevNodeEnv;

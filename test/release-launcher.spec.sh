@@ -24,6 +24,8 @@ chmod +x "$CASE_DIR/bin/flock"
 cat > "$STATE_DIR/incoming/new/deploy/release-deploy.sh" <<'NEW_RELEASE'
 #!/usr/bin/env bash
 set -euo pipefail
+[ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged" ]
+[ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 printf '1\n' > "$RELEASE_STATE_DIR/minimum-schema-compatibility"
 printf 'new-start\n' >> "$START_LOG"
 NEW_RELEASE
@@ -39,6 +41,9 @@ OLD_RELEASE
 chmod +x "$STATE_DIR/incoming/old/deploy/release-deploy.sh"
 printf 'old\n' > "$STATE_DIR/incoming/old/VERSION"
 printf 'initial\n' > "$DEPLOY_ROOT/VERSION"
+mkdir -p "$STATE_DIR/app-env-transaction"
+printf 'staged\n' > "$STATE_DIR/app-env-transaction/state"
+printf 'legacy-env\n' > "$STATE_DIR/app-env-transaction/legacy-rollback"
 
 run_launcher() {
   local stage="$1" compatibility="$2"
@@ -60,6 +65,8 @@ run_launcher() {
 run_launcher new 1
 [ "$(cat "$STATE_DIR/minimum-schema-compatibility")" = "1" ]
 [ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
+[ "$(cat "$STATE_DIR/app-env-transaction/state")" = "staged" ]
+[ "$(cat "$STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
 
 if run_launcher old 0 >"$CASE_DIR/old.log" 2>&1; then
   echo "old deployment unexpectedly activated" >&2
