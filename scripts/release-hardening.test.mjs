@@ -450,18 +450,25 @@ if [ "$1" = "login" ]; then exit 0; fi
 ref="$4"
 format="$6"
 case "$ref" in
-  *:v1.2.3|*:sha-${sha}) ;;
+  *:v1.2.3) [ "\${LEGACY_AVAILABLE:-both}" != "sha" ] || exit 1 ;;
+  *:sha-${sha}) [ "\${LEGACY_AVAILABLE:-both}" != "release" ] || exit 1 ;;
   *) exit 1 ;;
 esac
 case "$format" in
   *Image*) printf '{"os":"linux","architecture":"%s"}\n' "\${LEGACY_ARCH:-arm64}" ;;
-  *) printf '{"digest":"sha256:%064d"}\n' 7 ;;
+  *)
+    case "$ref" in
+      *:sha-${sha}) digest="\${LEGACY_SHA_DIGEST:-7}" ;;
+      *) digest="\${LEGACY_RELEASE_DIGEST:-7}" ;;
+    esac
+    printf '{"digest":"sha256:%064d"}\n' "$digest"
+    ;;
 esac
 `,
   );
   chmodSync(join(bin, 'docker'), 0o755);
 
-  const run = (legacyArch, outputName) =>
+  const run = (legacyArch, outputName, overrides = {}) =>
     spawnSync('/bin/bash', ['-c', script], {
       cwd: directory,
       encoding: 'utf8',
@@ -477,6 +484,7 @@ esac
         GITHUB_REPOSITORY: 'circleteamhub/circle_be',
         GITHUB_ACTOR: 'release-test',
         GITHUB_OUTPUT: join(directory, outputName),
+        ...overrides,
       },
     });
 
@@ -485,6 +493,25 @@ esac
   const outputs = readFileSync(join(directory, 'compatible-output'), 'utf8');
   assert.match(outputs, /release_image=.*:v1\.2\.3$/m);
   assert.match(outputs, /needs_promotion=false/);
+
+  const shaOnly = run('arm64', 'sha-only-output', {
+    LEGACY_AVAILABLE: 'sha',
+  });
+  assert.equal(shaOnly.status, 0, shaOnly.stderr);
+  const shaOnlyOutputs = readFileSync(
+    join(directory, 'sha-only-output'),
+    'utf8',
+  );
+  assert.match(shaOnlyOutputs, new RegExp(`sha_image=.*:sha-${sha}$`, 'm'));
+  assert.match(shaOnlyOutputs, /release_image=.*:v1\.2\.3-arm64$/m);
+  assert.match(shaOnlyOutputs, /needs_promotion=true/);
+
+  const mismatch = run('arm64', 'mismatch-output', {
+    LEGACY_RELEASE_DIGEST: '7',
+    LEGACY_SHA_DIGEST: '8',
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /Refusing mismatched legacy release image/);
 
   const incompatible = run('amd64', 'incompatible-output');
   assert.notEqual(incompatible.status, 0);
