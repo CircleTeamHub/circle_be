@@ -23,6 +23,7 @@
 
 ```bash
 curl -fsSL https://get.docker.com | sudo sh
+sudo apt-get update && sudo apt-get install -y acl
 sudo usermod -aG docker $USER && newgrp docker
 docker version && docker compose version
 ```
@@ -65,6 +66,12 @@ cd ~/circle_be
 bash deploy/gen-env.sh <公网IP> <API域名> <Admin域名> <ACME邮箱> <用户Web域名hostname>
 docker compose -f docker-compose.prod.yml up -d --build
 ```
+
+`gen-env.sh` 默认把执行部署的宿主机用户主组写入 `.env` 的 `APP_ENV_GID`，并验证该组
+没有其他宿主机账号；共享组会直接失败，避免同组用户读取生产密钥。需要使用专用组时，先把
+部署账号加入该私有组，再以 `APP_ENV_GID=<专用组GID> bash deploy/gen-env.sh ...` 运行。
+应用容器以非 root 用户运行，并通过这个只读补充组读取权限为 `0640` 的
+`.env.production`；不要把该文件放宽为 `0644`。
 
 启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
@@ -137,7 +144,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 push main ──► build-image.yml:QEMU 交叉构建 linux/arm64
                 └─► 阻断式 Trivy 扫描该 ARM64 镜像
-                    └─► 通过后才 push sha-<commit>(+ :main)
+                    └─► 通过后才 push sha-<commit>-<arch>(+ :main-<arch>)
 
 push tag v* ──► release.yml:
   resolve  校验 tag 在 main 历史上、该 commit 的 CI 是绿的、找 sha- 镜像
@@ -224,6 +231,7 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 | Variable | `DEPLOY_USER` | 可选,默认 `ubuntu` |
 | Variable | `DEPLOY_PATH` | 可选,默认 `circle_be`(相对远端 $HOME) |
 | Variable | `API_SMOKE_URL` | 可选，必须指向无需凭据时返回 `401/403` JSON 的已知 API 路由，如 `https://<API域名>/api/v1/auth/me`；设了则 runner 侧再做一次外部视角烟测 |
+| Variable | `RELEASE_PLATFORM` | 发布服务器架构：`linux/arm64` 或 `linux/amd64`；默认沿用原 Oracle ARM 的 `linux/arm64` |
 
 镜像推/拉全用内置 `GITHUB_TOKEN`,无需额外 PAT;服务器只在部署那一刻用临时 token
 登录 GHCR(隔离的 DOCKER_CONFIG,用完即删),镜像随后留在本地 Docker 缓存,
@@ -248,6 +256,7 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   激活。不要直接执行目标树内的 `deploy/release-deploy.sh`。
 
   ```bash
+  set -euo pipefail
   cd ~/circle_be
   test "$(bash .release/release-launcher.sh --contract-version)" = 1
   stage=manual-v1.2.3-$(date +%s)
@@ -255,6 +264,9 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
   rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
     --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
     /path/to/external-v1.2.3-checkout/ ".release/incoming/$stage/"
+  # 历史 tag 只提供应用与 schema 元数据。必须从当前 live tree 叠加最后一套已上线、
+  # 已验证的部署契约；不要从历史 checkout 运行同名脚本。
+  bash deploy/overlay-trusted-release-tooling.sh . ".release/incoming/$stage"
   TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
   RELEASE_TAG=v1.2.3 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
@@ -269,6 +281,13 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
   镜像还在本地缓存时无需登录;缓存已清且仓库私有,先用带 `read:packages` 的
   PAT `docker login ghcr.io` 再跑。
+
+  `deploy/RELEASE_RUNTIME_COMPATIBILITY` 是应用与当前部署契约的兼容级别。健康探针、
+  Caddy 路由或 Compose 运行时约定发生不向后兼容的变化时必须提升它。当前可信工具会
+  先由持久 launcher 在改写 live tree 前比较 staged/active 级别，再由部署脚本复核；
+  缺少该文件或级别更低的 tag 会被拒绝。`force` 和清除数据库
+  schema floor 都不会绕过此检查。第一代自动发布契约之前的 `/readyz`/OpenIM tag
+  因此只能按完整历史栈另行灾备恢复，不能通过当前 launcher 原地回滚。
 - **数据库**:迁移前备份在 `~/circle_be_backups/`,恢复:
   `gunzip -c <备份文件> | docker compose -f docker-compose.prod.yml exec -T postgres psql -U circle -d circle`。
   这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——

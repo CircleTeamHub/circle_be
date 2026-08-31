@@ -72,6 +72,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.verify.outputs.sha }}
+      main_sha: ${{ steps.verify.outputs.main_sha }}
       sha_image: ${{ steps.image.outputs.sha_image }}
       release_image: ${{ steps.image.outputs.release_image }}
       digest: ${{ steps.image.outputs.digest }}
@@ -160,12 +161,14 @@ jobs:
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
+          MAIN_SHA="$(git rev-parse origin/main)"
           if ! git merge-base --is-ancestor "$SHA" origin/main; then
             echo "Tag ${{ steps.tag.outputs.tag }} ($SHA) is not an ancestor of origin/main." >&2
             echo "Releases must point at commits that went through main (PR + full CI)." >&2
             exit 1
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Verify manual rollback runtime compatibility
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -198,6 +201,26 @@ jobs:
             exit 1
           fi
           echo "CI is green for $SHA"
+
+      # Manual rollback overlays operational files from origin/main. Unlike the
+      # historical target tag, this exact tooling commit must always have a
+      # successful main-push CI run; force only handles expired CI history for
+      # the old application commit and must never authorize unverified tooling.
+      - name: Verify CI succeeded for trusted deployment tooling
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.verify.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // ""')"
+          if [ "$conclusion" != "success" ]; then
+            echo "CI for trusted deployment tooling $SHA is '${conclusion:-not found}', not 'success'." >&2
+            echo "Wait for or fix main CI before deploying a manual rollback." >&2
+            exit 1
+          fi
+          echo "CI is green for trusted deployment tooling $SHA"
 
       - name: Resolve immutable image
         id: image
@@ -373,6 +396,43 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.resolve.outputs.tag }}
+
+      # A manual rollback intentionally checks out old application source and
+      # deploys its old immutable image, but must not downgrade the server-side
+      # deployment contract. In particular, pre-group_add Compose revisions
+      # cannot read the current 0640 .env.production bind mount. Pin the exact
+      # main commit verified by the resolve job and overlay only operational
+      # tooling; the target tag keeps its own schema compatibility metadata.
+      - name: Checkout trusted deployment tooling for manual rollback
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.main_sha }}
+          path: .trusted-release-tooling
+          sparse-checkout: |
+            deploy/release-deploy.sh
+            deploy/gen-env.sh
+            deploy/admin-web-deploy.sh
+            deploy/caddy-entrypoint.sh
+            deploy/overlay-trusted-release-tooling.sh
+            deploy/app-env-preflight.sh
+            deploy/app-env-transaction.sh
+            deploy/offsite-backup.sh
+            deploy/Caddyfile.admin
+            monitoring/sync-metrics-token.sh
+            Dockerfile.caddy
+            docker-compose.prod.yml
+            docker-compose.release.yml
+            docker-compose.admin-release.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Overlay trusted deployment tooling for manual rollback
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          bash .trusted-release-tooling/deploy/overlay-trusted-release-tooling.sh \
+            .trusted-release-tooling .
+          rm -rf -- .trusted-release-tooling
 
       - name: Configure SSH
         env:
