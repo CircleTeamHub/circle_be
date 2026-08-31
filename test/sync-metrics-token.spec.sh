@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 script="$repo_root/monitoring/sync-metrics-token.sh"
+grep -Eq '^[[:space:]]+container_name:[[:space:]]+circle-prometheus[[:space:]]*$' \
+  "$repo_root/monitoring/docker-compose.yml"
+grep -F "name=^/circle-prometheus\$" "$script" >/dev/null
 tmp_dir="$(mktemp -d)"
 env_file="$tmp_dir/env.production"
 token_file="$tmp_dir/metrics_token"
@@ -15,8 +18,9 @@ docker_stub="$tmp_dir/docker"
 cat > "$docker_stub" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DOCKER_LOG"
-if [ "${1:-}" = "inspect" ]; then
-  [ "${PROMETHEUS_ABSENT:-0}" != "1" ]
+if [ "${1:-}" = "ps" ]; then
+  [ "${PROMETHEUS_QUERY_FAIL:-0}" != "1" ] || exit 1
+  [ "${PROMETHEUS_ABSENT:-0}" = "1" ] || printf 'prometheus-existing-id\n'
   exit
 fi
 if [ "${1:-}" = "info" ]; then
@@ -144,6 +148,22 @@ if DOCKER_INFO_FAIL=1 \
 fi
 test -e "$docker_unavailable_marker"
 
+query_failure_token="$tmp_dir/query-failure-token"
+query_failure_marker="$tmp_dir/query-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=query-failure-token' > "$env_file"
+: > "$query_failure_marker"
+if PROMETHEUS_QUERY_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$query_failure_token" \
+  METRICS_SYNC_MARKER="$query_failure_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/query-failure.log" 2>&1; then
+  echo 'expected metrics sync to retain the marker when container query fails' >&2
+  exit 1
+fi
+test -e "$query_failure_marker"
+
 bootstrap_token_file="$tmp_dir/bootstrap-token"
 bootstrap_sync_marker="$tmp_dir/bootstrap-sync-required"
 bootstrap_log="$tmp_dir/bootstrap-docker.log"
@@ -158,7 +178,7 @@ PROMETHEUS_ABSENT=1 \
   PROM_GID="$prom_gid" \
   bash "$script" >"$tmp_dir/bootstrap.log"
 test ! -e "$bootstrap_sync_marker"
-grep -F 'inspect circle-prometheus' "$bootstrap_log" >/dev/null
+grep -F 'ps -aq --filter name=^/circle-prometheus$' "$bootstrap_log" >/dev/null
 if grep -F 'compose ' "$bootstrap_log" >/dev/null; then
   echo 'first bootstrap must not parse production Compose before monitoring/.env exists' >&2
   exit 1

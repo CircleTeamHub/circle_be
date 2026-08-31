@@ -132,7 +132,11 @@ if ! "$DOCKER" info >/dev/null 2>&1; then
   echo "❌ Docker is unavailable; preserving $METRICS_SYNC_MARKER." >&2
   exit 1
 fi
-if ! "$DOCKER" inspect circle-prometheus >/dev/null 2>&1; then
+prometheus_container_id="$("$DOCKER" ps -aq --filter 'name=^/circle-prometheus$')" || {
+  echo "❌ Could not query the Prometheus container; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+}
+if [ -z "$prometheus_container_id" ]; then
   rm -f "$METRICS_SYNC_MARKER"
   echo "✅ Prometheus is not installed yet; the first start will bind the new token inode"
   exit 0
