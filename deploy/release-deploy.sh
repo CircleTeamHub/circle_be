@@ -123,6 +123,7 @@ APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 resolved_app_env_gid=""
 release_docker_config=""
 cutover_activated=0
+deferred_cutover_exit=0
 . deploy/app-env-preflight.sh
 . deploy/app-env-transaction.sh
 initialize_app_env_transaction
@@ -146,7 +147,9 @@ cleanup_release_on_exit() {
     app_env_staged_file=""
   fi
   if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
-    if [ "$app_env_transaction_committed" = "1" ] ||
+    if [ "$app_env_recovery_deferred" = "1" ]; then
+      echo "WARNING: preserving interrupted cutover state for the next recovery attempt" >&2
+    elif [ "$app_env_transaction_committed" = "1" ] ||
       [ "$persisted_transaction_state" = "committed" ] ||
       [ "$cutover_activated" = "1" ] ||
       { [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
@@ -171,6 +174,19 @@ trap cleanup_release_on_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+defer_cutover_signals() {
+  deferred_cutover_exit=0
+  trap 'deferred_cutover_exit=129' HUP
+  trap 'deferred_cutover_exit=130' INT
+  trap 'deferred_cutover_exit=143' TERM
+}
+
+restore_release_signals() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
 
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
@@ -276,6 +292,26 @@ switch_proxy() {
     caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 
+finalize_interrupted_app_env_cutover() {
+  local color="$recovered_app_env_cutover_color" cid health
+  [ -n "$color" ] || return 0
+  cid="$(running "$color")"
+  [ -n "$cid" ] || {
+    echo "Interrupted cutover target $color is not running; preserving recovery state" >&2
+    return 1
+  }
+  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+  [ "$health" = "healthy" ] || {
+    echo "Interrupted cutover target $color is not healthy; preserving recovery state" >&2
+    return 1
+  }
+  switch_proxy "$color" || return 1
+  persist_active_color "$color" || return 1
+  mark_app_env_cutover_complete "$color" || return 1
+  commit_app_env_transaction || return 1
+  echo "==> Finalized interrupted cutover to $color before starting a new release" >&2
+}
+
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
   release_docker_config="$(mktemp -d)"
@@ -290,6 +326,7 @@ export CIRCLE_BE_IMAGE
 # 放在拉镜像之前：这是纯本地检查，几秒出结果，没必要等到切流那一步（几分钟后）
 # 才发现代理根本不可能被 reload。
 assert_caddy_has_rate_limit || exit 1
+finalize_interrupted_app_env_cutover || exit 1
 
 echo "==> Pulling release image: $CIRCLE_BE_IMAGE"
 if ! compose pull --quiet circle_be migrate; then
@@ -718,7 +755,27 @@ fi
 
 # ── 切换代理 → 烟测 → 通过后才停/删旧色 ──────────────────────
 echo "==> $standby healthy; switching Caddy upstream"
-if ! switch_proxy "$standby"; then
+if ! mark_app_env_cutover_pending "$standby"; then
+  echo "==> Could not persist cutover intent; refusing to reload Caddy" >&2
+  exit 1
+fi
+defer_cutover_signals
+switch_proxy_status=0
+switch_proxy "$standby" || switch_proxy_status=$?
+if [ "$switch_proxy_status" -eq 0 ]; then
+  # A signal delivered immediately after a successful Caddy reload runs the
+  # deferred handler first, then reaches this assignment. Cleanup can therefore
+  # never restore the old env/state while Caddy already routes to the new color.
+  cutover_activated=1
+  if ! mark_app_env_cutover_complete "$standby"; then
+    echo "WARNING: cutover completed with the durable pending marker; recovery will reconcile it" >&2
+  fi
+fi
+restore_release_signals
+if [ "$deferred_cutover_exit" -ne 0 ]; then
+  exit "$deferred_cutover_exit"
+fi
+if [ "$switch_proxy_status" -ne 0 ]; then
   echo "==> Caddy switch failed; leaving previous version $live live" >&2
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
@@ -735,7 +792,6 @@ if ! switch_proxy "$standby"; then
   fi
   exit 1
 fi
-cutover_activated=1
 if ! persist_active_color "$standby"; then
   echo "==> Could not persist active color; rolling Caddy back" >&2
   if irreversible_boundary_crossed; then
@@ -747,6 +803,8 @@ if ! persist_active_color "$standby"; then
       echo "warning: Caddy rollback failed; leaving both colors running" >&2
       exit 1
     fi
+    mark_app_env_cutover_rolled_back || true
+    cutover_activated=0
     compose rm -sf "$standby" || true
   else
     echo "warning: no previous version exists; leaving standby running" >&2
@@ -783,6 +841,8 @@ else
       echo "warning: Caddy rollback failed; leaving both colors running for manual recovery" >&2
       exit 1
     fi
+    mark_app_env_cutover_rolled_back || true
+    cutover_activated=0
     persist_active_color "$live"
     compose rm -sf "$standby" || true
     echo "==> Rolled back: $live restored" >&2

@@ -147,6 +147,21 @@ echo "PASS committed recovery removes stale transaction files"
 
 initialize_app_env_transaction
 mkdir -p "$APP_ENV_TRANSACTION_DIR"
+printf 'SECRET=legacy\n' > "$APP_ENV_BACKUP_PATH"
+printf 'SECRET=cutover\n' > "$APP_ENV_FILE"
+chmod 640 "$APP_ENV_FILE"
+printf 'cutover-pending:circle_be_green\n' > "$APP_ENV_TRANSACTION_PATH"
+recover_interrupted_app_env_transaction
+[ "$app_env_recovery_deferred" = "1" ] || fail "cutover recovery was not deferred"
+[ "$recovered_app_env_cutover_color" = "circle_be_green" ] || fail "cutover recovery lost its target color"
+[ -e "$APP_ENV_BACKUP_PATH" ] || fail "cutover recovery removed rollback state before proxy reconciliation"
+[ "$(cat "$APP_ENV_FILE")" = 'SECRET=cutover' ] || fail "cutover recovery restored obsolete secrets"
+commit_app_env_transaction
+assert_transaction_cleared
+echo "PASS cutover recovery preserves the protected env until proxy reconciliation"
+
+initialize_app_env_transaction
+mkdir -p "$APP_ENV_TRANSACTION_DIR"
 printf 'SECRET=orphan\n' > "$APP_ENV_BACKUP_PATH"
 if recover_interrupted_app_env_transaction 2>/dev/null; then
   fail "markerless recovery state did not fail closed"

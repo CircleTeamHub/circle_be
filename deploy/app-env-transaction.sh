@@ -12,6 +12,8 @@ initialize_app_env_transaction() {
   app_env_staged_file=""
   app_env_transaction_committed=0
   app_env_transaction_active=0
+  app_env_recovery_deferred=0
+  recovered_app_env_cutover_color=""
 }
 
 clear_app_env_acl() {
@@ -89,6 +91,18 @@ recover_interrupted_app_env_transaction() {
       fi
       clear_app_env_transaction_state
       ;;
+    cutover-pending:circle_be|cutover-pending:circle_be_green|cutover:circle_be|cutover:circle_be_green)
+      [ -e "$APP_ENV_BACKUP_PATH" ] && [ -e "$APP_ENV_FILE" ] || {
+        echo "Interrupted cutover is missing an app env version; refusing recovery" >&2
+        return 1
+      }
+      rm -f "$APP_ENV_STAGED_PATH"
+      recovered_app_env_cutover_color="${state##*:}"
+      legacy_app_env_backup="$APP_ENV_BACKUP_PATH"
+      app_env_transaction_active=1
+      app_env_recovery_deferred=1
+      echo "==> Found interrupted cutover to $recovered_app_env_cutover_color; deferring env recovery until Caddy is reconciled" >&2
+      ;;
     committed)
       rm -f "$APP_ENV_BACKUP_PATH" "$APP_ENV_STAGED_PATH"
       clear_app_env_transaction_state
@@ -98,6 +112,27 @@ recover_interrupted_app_env_transaction() {
       return 1
       ;;
   esac
+}
+
+mark_app_env_cutover_pending() {
+  local color="$1"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  case "$color" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  persist_app_env_transaction_state "cutover-pending:$color"
+}
+
+mark_app_env_cutover_complete() {
+  local color="$1"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  case "$color" in circle_be|circle_be_green) ;; *) return 1 ;; esac
+  persist_app_env_transaction_state "cutover:$color"
+}
+
+mark_app_env_cutover_rolled_back() {
+  local state="staged"
+  [ "$app_env_transaction_active" = "1" ] || return 0
+  irreversible_boundary_crossed && state="staged-irreversible"
+  persist_app_env_transaction_state "$state"
 }
 
 stage_app_env_for_new_container() {
@@ -161,6 +196,8 @@ commit_app_env_transaction() {
   [ "$app_env_transaction_active" = "1" ] || return 0
   persist_app_env_transaction_state committed || return 1
   app_env_transaction_committed=1
+  app_env_recovery_deferred=0
+  recovered_app_env_cutover_color=""
   discard_legacy_app_env_backup || return 1
   clear_app_env_transaction_state
 }

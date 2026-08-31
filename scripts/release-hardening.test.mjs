@@ -77,12 +77,17 @@ test('production app env access uses recoverable group-read transactions', () =>
   const release = read('deploy/release-deploy.sh');
   const admin = read('deploy/admin-web-deploy.sh');
   const ci = read('.github/workflows/ci.yml');
+  const deployDocs = read('DEPLOY.md');
   const runtimeCompatibility = read(
     'deploy/RELEASE_RUNTIME_COMPATIBILITY',
   ).trim();
 
   assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
   assert.equal(runtimeCompatibility, '2');
+  assert.ok(
+    deployDocs.includes(`当前 \`compatibility=${runtimeCompatibility}\``),
+    'rollback docs must name the current runtime compatibility baseline',
+  );
   assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
   assert.match(generator, /prepare_empty_secret_file "\$tmp"/);
   assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
@@ -109,7 +114,13 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
   const productionCompose = read('docker-compose.prod.yml');
   const releaseCompose = read('docker-compose.release.yml');
   const healthGate = deploy.indexOf('if ! wait_healthy "$standby" 300; then');
-  const cutover = deploy.indexOf('if ! switch_proxy "$standby"; then');
+  const cutover = deploy.indexOf(
+    'switch_proxy "$standby" || switch_proxy_status=$?',
+  );
+  const activeColorPersist = deploy.indexOf(
+    'if ! persist_active_color "$standby"',
+    cutover,
+  );
 
   assert.doesNotMatch(productionCompose, /circle-be-app/);
   assert.doesNotMatch(releaseCompose, /circle-be-app/);
@@ -129,6 +140,10 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
   assert.ok(
     healthGate >= 0 && healthGate < cutover,
     'standby health must precede cutover',
+  );
+  assert.match(
+    deploy.slice(cutover, activeColorPersist),
+    /switch_proxy[\s\S]*cutover_activated=1[\s\S]*restore_release_signals[\s\S]*deferred_cutover_exit/,
   );
 });
 

@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE TERM_BEFORE_ACTIVE_PERSIST MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -103,6 +103,21 @@ if [ "${1:-}" = "compose" ]; then
         printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=$CADDY_RELOAD_FAIL_TARGET"; then
         exit 43
       fi
+      if [ "${TERM_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
+        printf '%s\n' "$*" | grep -q 'caddy reload' &&
+        printf '%s\n' "$*" | grep -q 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' &&
+        [ ! -e "$CASE_DIR/term-injected" ]; then
+        : > "$CASE_DIR/term-injected"
+        kill -TERM "$PPID"
+      fi
+      if [ "${KILL_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
+        printf '%s\n' "$*" | grep -q 'caddy reload' &&
+        printf '%s\n' "$*" | grep -q 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' &&
+        [ ! -e "$CASE_DIR/kill-after-cutover-injected" ]; then
+        : > "$CASE_DIR/kill-after-cutover-injected"
+        kill -KILL "$PPID"
+        exit 137
+      fi
       ;;
     *)
       echo "unexpected docker compose command: $subcommand $*" >&2
@@ -112,7 +127,10 @@ if [ "${1:-}" = "compose" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then exit 0; fi
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  [ "${IMAGE_MISSING:-0}" != "1" ]
+  exit
+fi
 if [ "${1:-}" = "inspect" ]; then
   container="$(last_arg "$@")"
   service="${container#cid-}"
@@ -203,14 +221,6 @@ if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
     exit 47
   fi
 fi
-if [ "${TERM_BEFORE_ACTIVE_PERSIST:-0}" = "1" ] &&
-  [ "${@: -1}" = "$RELEASE_STATE_DIR/active-color" ] &&
-  [ "$(cat "${@: -2:1}" 2>/dev/null || true)" = "circle_be_green" ] &&
-  [ ! -e "$CASE_DIR/term-injected" ]; then
-  : > "$CASE_DIR/term-injected"
-  kill -TERM "$PPID"
-  exit 143
-fi
 "$REAL_MV" "$@"
 if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ] &&
   [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
@@ -246,7 +256,9 @@ run_release() {
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     KILL_AFTER_ENV_STAGE="${KILL_AFTER_ENV_STAGE:-0}" \
-    TERM_BEFORE_ACTIVE_PERSIST="${TERM_BEFORE_ACTIVE_PERSIST:-0}" \
+    KILL_AFTER_CADDY_RELOAD="${KILL_AFTER_CADDY_RELOAD:-0}" \
+    TERM_AFTER_CADDY_RELOAD="${TERM_AFTER_CADDY_RELOAD:-0}" \
+    IMAGE_MISSING="${IMAGE_MISSING:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -638,7 +650,7 @@ test_term_after_cutover_finalizes_new_env_and_active_color() {
   printf 'SECRET=cutover\n' > "$APP_ENV_FILE"
   chmod 600 "$APP_ENV_FILE"
   export APP_ENV_FILE
-  TERM_BEFORE_ACTIVE_PERSIST=1
+  TERM_AFTER_CADDY_RELOAD=1
 
   ! run_release || return 1
 
@@ -646,6 +658,36 @@ test_term_after_cutover_finalizes_new_env_and_active_color() {
   assert_active_color circle_be_green || return 1
   assert_mode "$APP_ENV_FILE" 640 || return 1
   grep -q '^SECRET=cutover$' "$APP_ENV_FILE" || return 1
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
+  assert_running circle_be_green
+}
+
+test_sigkill_after_cutover_recovers_forward_before_early_failure() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=cutover-kill\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  KILL_AFTER_CADDY_RELOAD=1
+
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-after-cutover-injected" ] || return 1
+  grep -q '^cutover-pending:circle_be_green$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+
+  KILL_AFTER_CADDY_RELOAD=0
+  IMAGE_MISSING=1
+  ! run_release || return 1
+
+  grep -q 'Finalized interrupted cutover to circle_be_green' "$CASE_DIR/release.log" || return 1
+  grep -q 'Image not available locally' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be_green || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+  grep -q '^SECRET=cutover-kill$' "$APP_ENV_FILE" || return 1
   [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
   assert_running circle_be_green
 }
@@ -827,6 +869,7 @@ for test_name in \
   test_startup_failure_restores_legacy_env_before_live_restart \
   test_interrupted_env_stage_recovers_through_launcher \
   test_term_after_cutover_finalizes_new_env_and_active_color \
+  test_sigkill_after_cutover_recovers_forward_before_early_failure \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
