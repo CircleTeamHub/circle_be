@@ -71,6 +71,33 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
   assert.match(caddy, apiFallbackHandle);
 });
 
+test('production app env access uses recoverable group-read transactions', () => {
+  const compose = read('docker-compose.prod.yml');
+  const generator = read('deploy/gen-env.sh');
+  const release = read('deploy/release-deploy.sh');
+  const admin = read('deploy/admin-web-deploy.sh');
+  const ci = read('.github/workflows/ci.yml');
+
+  assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
+  assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
+  assert.match(generator, /prepare_empty_secret_file "\$tmp"/);
+  assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
+  assert.match(generator, /chmod 640 \.env\.production/);
+  assert.match(release, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(release, /\. deploy\/app-env-transaction\.sh/);
+  assert.match(
+    release,
+    /initialize_app_env_transaction[\s\S]*prepare_compose_app_env_gid[\s\S]*recover_interrupted_app_env_transaction/,
+  );
+  assert.match(release, /stage_app_env_for_new_container/);
+  assert.match(release, /restore_legacy_app_env_access/);
+  assert.match(release, /commit_app_env_transaction/);
+  assert.match(admin, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(admin, /prepare_compose_app_env_gid "\$COMPOSE_ENV_FILE"/);
+  assert.match(ci, /Verify both non-root app colors can read the protected env/);
+  assert.match(ci, /fs\.accessSync\('\/app\/\.env\.production',fs\.constants\.R_OK\)/);
+});
+
 test('Caddy switches only between unique blue-green container endpoints', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const deploy = read('deploy/release-deploy.sh');

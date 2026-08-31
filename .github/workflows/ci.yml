@@ -275,6 +275,36 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Verify both non-root app colors can read the protected env
+        run: |
+          set -euo pipefail
+          test ! -e .env.production
+          printf 'NODE_ENV=production\n' > .env.production
+          export APP_ENV_GID="$(id -g)"
+          chgrp "$APP_ENV_GID" .env.production
+          chmod 640 .env.production
+          export CIRCLE_BE_IMAGE=circle-be:ci
+          export DB_PASSWORD=test-only
+          export MINIO_ROOT_USER=test-only
+          export MINIO_ROOT_PASSWORD=test-only-password
+          export API_DOMAIN=api.example.test
+          export ADMIN_DOMAIN=admin.example.test
+          export ACME_EMAIL=ops@example.test
+          project="circle-env-read-$GITHUB_RUN_ID"
+          cleanup() {
+            docker compose -p "$project" \
+              -f docker-compose.prod.yml -f docker-compose.release.yml \
+              down --remove-orphans >/dev/null 2>&1 || true
+            rm -f .env.production
+          }
+          trap cleanup EXIT
+          for service in circle_be circle_be_green; do
+            docker compose -p "$project" \
+              -f docker-compose.prod.yml -f docker-compose.release.yml \
+              run --rm --no-deps --entrypoint node "$service" \
+              -e "const fs=require('node:fs'); if(process.getuid()===0) throw new Error('app is root'); fs.accessSync('/app/.env.production',fs.constants.R_OK)"
+          done
+
       - name: Build Caddy edge image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:

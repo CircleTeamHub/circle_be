@@ -37,6 +37,7 @@ compose=(docker compose -p "$project"
 # docker-compose.prod.yml interpolates these; values are irrelevant here because
 # only postgres/backup are ever started.
 export DB_PASSWORD=test-only-db-password
+export APP_ENV_GID="$(id -g)"
 export MINIO_ROOT_USER=test-only-minio
 export MINIO_ROOT_PASSWORD=test-only-minio-password
 export API_DOMAIN=api.example.test

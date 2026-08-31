@@ -17,13 +17,16 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
   export RELEASE_STATE_DIR="$CASE_DIR/release-state"
   export TEST_COMMAND_LOG="$CASE_DIR/commands.log"
+  export COMPOSE_ENV_FILE="$CASE_DIR/.env"
   mkdir -p "$TEST_STATE_DIR" "$RELEASE_STATE_DIR" "$CASE_DIR/bin"
+  printf 'DB_PASSWORD=test-only\n' > "$COMPOSE_ENV_FILE"
+  chmod 600 "$COMPOSE_ENV_FILE"
 
   cat > "$CASE_DIR/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
@@ -192,10 +195,12 @@ esac
 # 可能挂)。脚本开头是 set -e,所以这一步必须是 best-effort,否则会在迁移之后
 # 直接退出 —— 停机模式下旧色已经停了,API 就那样一直下线。
 if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
-  # mv 桩是独立脚本,没有外层的 last_arg helper,直接取最后一个参数。
-  case "${@: -1}" in
-    *.env.production) exit 47 ;;
-  esac
+  # Only fail the best-effort Sentry stamp. The earlier access.tmp rename is
+  # the mandatory secure env installation and must still succeed.
+  if [ "${@: -2:1}" = "${APP_ENV_FILE}.tmp" ] &&
+    [ "${@: -1}" = "$APP_ENV_FILE" ]; then
+    exit 47
+  fi
 fi
 exec "$REAL_MV" "$@"
 MV
@@ -223,6 +228,7 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
@@ -405,11 +411,11 @@ test_release_never_widens_permissions_on_the_secrets_it_rewrites() {
 
   run_release || return 1
 
-  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "600" ] || {
-    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 600" >&2
+  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "640" ] || {
+    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 640" >&2
     return 1
   }
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   [ ! -e "${APP_ENV_FILE}.tmp" ] || {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
     return 1
@@ -436,8 +442,9 @@ test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
     echo "mv failure left a $(file_mode "${APP_ENV_FILE}.tmp") copy of the secrets behind" >&2
     return 1
   }
-  # 原文件必须原封不动(内容和权限都是),打标签失败不该动到它。
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  # The access transaction has already installed the group-readable inode;
+  # a failed observability stamp must preserve its contents and permissions.
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   grep -q '^JWT_SECRET=s3cr3t$' "$APP_ENV_FILE" || {
     echo "expected the original env file to survive a failed stamp untouched" >&2
     return 1

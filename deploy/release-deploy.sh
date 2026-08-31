@@ -118,6 +118,53 @@ if ! flock -n 200; then
   exit 1
 fi
 
+COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
+APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
+resolved_app_env_gid=""
+release_docker_config=""
+. deploy/app-env-preflight.sh
+. deploy/app-env-transaction.sh
+initialize_app_env_transaction
+
+prepare_compose_app_env_gid "$COMPOSE_ENV_FILE"
+recover_interrupted_app_env_transaction
+
+# Keep the env-file rename transaction recoverable when the SSH session drops,
+# the workflow times out, or the process receives TERM/INT. Before a successful
+# cutover, a reversible exit restores the exact legacy inode; after the
+# no-rollback boundary or a completed cutover, only the obsolete backup is
+# removed. This trap also owns cleanup of the temporary Docker credential store.
+cleanup_release_on_exit() {
+  local status=$? persisted_transaction_state=""
+  trap - EXIT INT TERM HUP
+  if [ -e "$APP_ENV_TRANSACTION_PATH" ]; then
+    persisted_transaction_state="$(cat "$APP_ENV_TRANSACTION_PATH" 2>/dev/null || true)"
+  fi
+  if [ "$app_env_transaction_active" = "1" ] && [ -n "$app_env_staged_file" ]; then
+    rm -f "$app_env_staged_file"
+    app_env_staged_file=""
+  fi
+  if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
+    if [ "$app_env_transaction_committed" = "1" ] ||
+      [ "$persisted_transaction_state" = "committed" ] ||
+      { [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
+        [ "${irreversible_migration_applied:-0}" = "1" ] &&
+        [ -e "$APP_ENV_FILE" ]; }; then
+      commit_app_env_transaction || true
+    else
+      restore_legacy_app_env_access || true
+    fi
+  fi
+  if [ -n "$release_docker_config" ]; then
+    rm -rf "$release_docker_config"
+  fi
+  exit "$status"
+}
+trap cleanup_release_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
 }
@@ -224,9 +271,9 @@ switch_proxy() {
 
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
 if [ -n "${GHCR_TOKEN:-}" ]; then
-  DOCKER_CONFIG="$(mktemp -d)"
+  release_docker_config="$(mktemp -d)"
+  DOCKER_CONFIG="$release_docker_config"
   export DOCKER_CONFIG
-  trap 'rm -rf "$DOCKER_CONFIG"' EXIT
   printf '%s' "$GHCR_TOKEN" |
     docker login ghcr.io -u "${GHCR_USER:?GHCR_USER is required when GHCR_TOKEN is set}" --password-stdin
 fi
@@ -326,6 +373,10 @@ ensure_live() {
   if [ -z "$live" ]; then
     return 1
   fi
+  if ! restore_legacy_app_env_access; then
+    echo "CRITICAL: previous app env access could not be restored" >&2
+    return 1
+  fi
   if [ -z "$(running "$live")" ] && ! compose start "$live"; then
     echo "CRITICAL: previous version $live could not be restarted" >&2
     return 1
@@ -340,6 +391,11 @@ ensure_live() {
 # Reversible failures may restore it; irreversible failures call this only after
 # the database contract is positively proven unapplied.
 restore_live() {
+  if [ -n "$live" ]; then
+    restore_legacy_app_env_access || return 1
+  else
+    discard_legacy_app_env_backup || return 1
+  fi
   if [ "${RELEASE_DOWNTIME:-0}" != "1" ] || [ -z "$live" ]; then
     return 0
   fi
@@ -365,6 +421,8 @@ enter_irreversible_maintenance() {
   if [ -n "${live:-}" ] && [ -n "$(running "$live")" ]; then
     compose stop "$live" || true
   fi
+  # 旧二进制已明确不可回滚；不再保留可能沿用历史宽松权限的密钥副本。
+  commit_app_env_transaction || true
 }
 
 probe_irreversible_contract_state() {
@@ -554,6 +612,15 @@ if ! compose run --rm migrate; then
 fi
 irreversible_migration_applied=1
 
+if ! stage_app_env_for_new_container; then
+  echo "Could not prepare app env access for the new container" >&2
+  handle_post_migration_failure
+  exit 1
+fi
+if irreversible_boundary_crossed; then
+  commit_app_env_transaction
+fi
+
 # ── 给这次发布盖上 Sentry release 标签 ─────────────────────────
 # 没有 release,Sentry 里就没法回答「这个 bug 是哪次发版引入的」,regression
 # 检测退化、release health 完全不可用 —— 而蓝绿发布恰恰是最需要按版本归因的
@@ -566,7 +633,7 @@ irreversible_migration_applied=1
 # 注意:发布失败回滚后,旧色若因任何原因重启,会读到这个新的 release 值而跑着
 # 旧代码。这只影响归因准确性,不影响功能;真正回滚时应重跑对应版本的发布。
 set_release_env_value() {
-  local file="$1" key="$2" value="$3"
+  local file="$1" key="$2" value="$3" gid="$4"
   local tmp="${file}.tmp"
   # 临时文件装的是**整份生产密钥**(awk 把 $file 原样抄一遍)。直接
   # `awk ... > "$tmp"` 会用部署机常见的 umask 022 建出 0644,于是从写入到
@@ -575,10 +642,12 @@ set_release_env_value() {
   #
   # 先删再建:残留的旧 .env.production.tmp(上一次发布被 Ctrl-C 掐断等)会让
   # `>` 只做截断、保留它原来的宽松权限,umask 对已存在的文件不起作用。
-  # mv 是同目录 rename,0600 跟着 inode 一起到目标,所以目标文件也不存在
-  # 「先 0644 再 chmod」的窗口。
+  # 默认 ACL 不受 umask 限制，所以必须趁文件为空时清掉。组和最终权限也都在
+  # rename 前设置；任何权限命令失败都只删除临时文件，正式配置仍是可读的 0640。
   rm -f "$tmp" || return 1
   (umask 077 && : > "$tmp") || return 1
+  clear_app_env_acl "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
   awk -v key="$key" -v value="$value" '
     BEGIN { prefix = key "="; replaced = 0 }
     index($0, prefix) == 1 {
@@ -589,6 +658,9 @@ set_release_env_value() {
     { print }
     END { if (!replaced) print prefix value }
   ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chgrp "$gid" "$tmp" || { rm -f "$tmp"; return 1; }
+  clear_app_env_acl "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 640 "$tmp" || { rm -f "$tmp"; return 1; }
   # 任何一步失败都必须把临时文件带走,否则密钥副本会一直躺在部署目录里 ——
   # 打标签失败只是警告、发布照常继续,不会有人回头来收拾它。
   mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
@@ -597,17 +669,19 @@ set_release_env_value() {
 # 路径可覆盖,理由与 RELEASE_STATE_DIR / RELEASE_MARKER_PATH 相同:脚本第 28 行
 # 就 cd 到仓库根,契约测试也在仓库根跑 —— 写死路径会让跑一次测试就改掉开发机上
 # 真实的 .env.production。
-APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 # 尽力而为,失败绝不中断发版。脚本开头是 set -e:awk/mv 因磁盘写满或权限问题
 # 失败的话,会在迁移之后、进入 handle_post_migration_failure 之前直接退出 ——
 # 在 RELEASE_DOWNTIME=1 模式下旧色已经停了,于是 API 仅仅因为一个可观测性标签
 # 写不进去而一直下线。一个 release 标签不值得拿可用性去换。
 if [ -f "$APP_ENV_FILE" ]; then
   echo "==> Tagging Sentry release circle-be@$RELEASE_TAG"
-  # chmod 是兜底:替换用的临时文件已经是 0600,rename 之后目标文件天然就是
-  # 0600,这一行只负责收拾「文件在这次发布之前就被人放成了 0644」的历史遗留。
-  if set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" &&
-    chmod 600 "$APP_ENV_FILE"; then
+  # 临时文件在写入期间是 0600；原子替换前改为 0640，让只加入
+  # APP_ENV_GID 的非 root 容器用户读取 bind mount。正式文件替换后不再
+  # 执行可能失败的权限修改。
+  if ! can_rewrite_app_env_acl_safely; then
+    echo "WARNING: setfacl is unavailable; preserving $APP_ENV_FILE and skipping SENTRY_RELEASE stamp." >&2
+  elif set_release_env_value "$APP_ENV_FILE" SENTRY_RELEASE "circle-be@$RELEASE_TAG" \
+    "$resolved_app_env_gid"; then
     :
   else
     echo "WARNING: could not stamp SENTRY_RELEASE into $APP_ENV_FILE; continuing." >&2
@@ -673,6 +747,9 @@ if ! persist_active_color "$standby"; then
 fi
 
 if smoke; then
+  # Persist the no-rollback decision before retiring the old color. If the host
+  # dies after this point, the next release keeps the validated 0640 env file.
+  commit_app_env_transaction
   if [ -n "$live" ]; then
     if [ -n "$(running "$live")" ]; then
       echo "==> Public smoke passed; stopping $live"
