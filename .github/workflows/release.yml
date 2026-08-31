@@ -1,11 +1,12 @@
 # Promote half of the build-once-promote release architecture.
 #
 # Pushing a `v*` tag (or dispatching this workflow with an existing tag)
-# releases that commit to the Oracle ARM server:
+# releases that commit to the configured server platform:
 #
 #   resolve   — pin the tag to a commit, require it to be on main with a green
 #               CI run, and resolve an existing immutable registry manifest
-#   promote   — on tag push only, stamp the prebuilt sha image with the version tag
+#   promote   — stamp the prebuilt platform-specific sha image with a matching
+#               platform-specific version image tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
 #   deploy    — stage the tagged repo through the server ForceCommand protocol,
@@ -185,16 +186,41 @@ jobs:
           SHA: ${{ steps.verify.outputs.sha }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PLATFORM: ${{ vars.RELEASE_PLATFORM || 'linux/arm64' }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha_image="$repo:sha-$SHA"
-          release_image="$repo:$RELEASE_TAG"
+          case "$RELEASE_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "Unsupported RELEASE_PLATFORM: $RELEASE_PLATFORM" >&2; exit 1 ;;
+          esac
+          arch="${RELEASE_PLATFORM#linux/}"
+          sha_image="$repo:sha-$SHA-$arch"
+          release_image="$repo:$RELEASE_TAG-$arch"
+          legacy_sha_image="$repo:sha-$SHA"
+          legacy_release_image="$repo:$RELEASE_TAG"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
           digest_of() {
             docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
               jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+          }
+
+          platform_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
+              jq -er '"\(.os)/\(.architecture)"'
+          }
+
+          require_release_platform() {
+            local image="$1" actual
+            actual="$(platform_of "$image")" || {
+              echo "Could not determine platform for legacy image $image." >&2
+              return 1
+            }
+            if [ "$actual" != "$RELEASE_PLATFORM" ]; then
+              echo "Legacy image $image is $actual, expected $RELEASE_PLATFORM." >&2
+              return 1
+            fi
           }
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -205,11 +231,27 @@ jobs:
               fi
               needs_promotion=false
             else
-              if ! digest="$(digest_of "$sha_image")"; then
-                echo "Neither release image $release_image nor prebuilt commit image $sha_image exists." >&2
+              if digest="$(digest_of "$sha_image" 2>/dev/null)"; then
+                needs_promotion=true
+              elif digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_release_image"
+                if legacy_sha_digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                  require_release_platform "$legacy_sha_image"
+                  if [ "$legacy_sha_digest" != "$digest" ]; then
+                    echo "Refusing mismatched legacy release image: $legacy_release_image ($digest != $legacy_sha_digest)." >&2
+                    exit 1
+                  fi
+                fi
+                release_image="$legacy_release_image"
+                needs_promotion=false
+              elif digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_sha_image"
+                sha_image="$legacy_sha_image"
+                needs_promotion=true
+              else
+                echo "No platform-specific or compatible legacy image exists for $RELEASE_TAG ($SHA)." >&2
                 exit 1
               fi
-              needs_promotion=true
             fi
           else
             if ! digest="$(digest_of "$sha_image")"; then
