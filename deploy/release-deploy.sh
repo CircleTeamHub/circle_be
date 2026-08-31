@@ -375,7 +375,13 @@ finalize_interrupted_app_env_cutover() {
     echo "==> Finalized interrupted rollback to $color before starting a new release" >&2
     return 0
   fi
-  ensure_recovery_color_healthy "$color" || return 1
+  if ! ensure_recovery_color_healthy "$color"; then
+    [ "$previous" != "none" ] || return 1
+    mark_app_env_rollback_pending "$previous" "$color" || return 1
+    finish_recovered_rollback "$previous" || return 1
+    echo "==> Rolled interrupted cutover back to $previous because $color was unhealthy" >&2
+    return 1
+  fi
   switch_proxy "$color" || return 1
   persist_active_color "$color" || return 1
   mark_app_env_cutover_complete "$color" "$previous" || return 1

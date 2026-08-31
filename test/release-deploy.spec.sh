@@ -750,6 +750,32 @@ test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails() {
     [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
+test_pending_cutover_rolls_back_when_recovery_color_is_unhealthy() {
+  prepare_cutover_recovery_case
+  KILL_BEFORE_CADDY_RELOAD=1
+  ! run_release || return 1
+  KILL_BEFORE_CADDY_RELOAD=0
+  HEALTH_FAIL=1
+  ! run_release || return 1
+
+  grep -q 'because circle_be_green was unhealthy' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_complete_cutover_rolls_back_when_recovery_color_is_unhealthy() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  HEALTH_FAIL=1
+  ! run_release || return 1
+
+  grep -q 'because circle_be_green was unhealthy' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
 test_sigkill_after_cutover_recovers_forward_before_early_failure() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -1021,6 +1047,8 @@ for test_name in \
   test_term_after_cutover_finalizes_new_env_and_active_color \
   test_sigkill_after_complete_marker_recovers_forward_and_smokes_new_color \
   test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails \
+  test_pending_cutover_rolls_back_when_recovery_color_is_unhealthy \
+  test_complete_cutover_rolls_back_when_recovery_color_is_unhealthy \
   test_sigkill_after_cutover_recovers_forward_before_early_failure \
   test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails \
   test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails \
