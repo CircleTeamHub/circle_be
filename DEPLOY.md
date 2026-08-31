@@ -230,7 +230,7 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
 ### 回滚 / 重放
 
-- **一键回滚**:Actions → Release → Run workflow,填旧 tag(如 `v0.1.0`)。
+- **一键回滚**:Actions → Release → Run workflow,填兼容的旧 tag(如 `v0.1.0`)。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
 - **服务器上手动**(GitHub 不可用时):将目标 tag 检出到 live tree 之外,按 workflow
@@ -262,6 +262,13 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
   镜像还在本地缓存时无需登录;缓存已清且仓库私有,先用带 `read:packages` 的
   PAT `docker login ghcr.io` 再跑。
+
+  `deploy/RELEASE_RUNTIME_COMPATIBILITY` 是应用与当前部署契约的兼容级别。健康探针、
+  Caddy 路由或 Compose 运行时约定发生不向后兼容的变化时必须提升它。当前可信工具会
+  先由持久 launcher 在改写 live tree 前比较 staged/active 级别，再由部署脚本复核；
+  缺少该文件或级别更低的 tag 会被拒绝。`force` 和清除数据库
+  schema floor 都不会绕过此检查。第一代自动发布契约之前的 `/readyz`/OpenIM tag
+  因此只能按完整历史栈另行灾备恢复，不能通过当前 launcher 原地回滚。
 - **数据库**:迁移前备份在 `~/circle_be_backups/`,恢复:
   `gunzip -c <备份文件> | docker compose -f docker-compose.prod.yml exec -T postgres psql -U circle -d circle`。
   这台服务器本身已经没了(磁盘损坏 / 实例丢失 / 主机被入侵)时,本地备份也一起没了 ——

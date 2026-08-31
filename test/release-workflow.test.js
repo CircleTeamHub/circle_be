@@ -89,6 +89,10 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       path.join(directory, 'deploy', 'SCHEMA_COMPATIBILITY'),
       '0\n',
     );
+    fs.writeFileSync(
+      path.join(directory, 'deploy', 'RELEASE_RUNTIME_COMPATIBILITY'),
+      '1\n',
+    );
     for (const operationalFile of operationalFiles) {
       if (operationalFile === 'deploy/caddy-entrypoint.sh') continue;
       const historical = path.join(directory, operationalFile);
@@ -166,6 +170,14 @@ test('manual rollback keeps current trusted deploy tooling with the historical a
       '0\n',
       'historical schema metadata must remain from the target tag',
     );
+    assert.equal(
+      fs.readFileSync(
+        path.join(directory, 'deploy', 'RELEASE_RUNTIME_COMPATIBILITY'),
+        'utf8',
+      ),
+      '1\n',
+      'historical runtime compatibility metadata must remain from the target tag',
+    );
     assert.equal(fs.existsSync(trusted), false);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -237,6 +249,70 @@ test('documented offline rollback overlays live trusted tooling before activatio
       false,
       'offline activation must not run after a partial tooling overlay',
     );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('manual rollback rejects application tags below the trusted runtime contract', () => {
+  const workflow = fs.readFileSync(
+    path.join(__dirname, '..', '.github', 'workflows', 'release.yml'),
+    'utf8',
+  );
+  const gate = workflow.indexOf(
+    '- name: Verify manual rollback runtime compatibility',
+  );
+  const nextStep = workflow.indexOf(
+    '- name: Verify CI succeeded for this commit',
+    gate,
+  );
+  const block = workflow.slice(gate, nextStep);
+  assert.ok(gate >= 0 && nextStep > gate);
+  assert.match(
+    block,
+    /if: \$\{\{ github\.event_name == 'workflow_dispatch' \}\}/,
+  );
+  assert.doesNotMatch(block, /inputs\.force/);
+
+  const script = block
+    .slice(block.indexOf('        run: |\n') + '        run: |\n'.length)
+    .split(/\r?\n/)
+    .map((line) => (line.startsWith('          ') ? line.slice(10) : line))
+    .join('\n');
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'circle-runtime-contract-'),
+  );
+  try {
+    const bin = path.join(directory, 'bin');
+    const deploy = path.join(directory, 'deploy');
+    fs.mkdirSync(bin);
+    fs.mkdirSync(deploy);
+    const git = path.join(bin, 'git');
+    fs.writeFileSync(
+      git,
+      '#!/usr/bin/env bash\nprintf "%s\\n" "$TRUSTED_RUNTIME"\n',
+    );
+    fs.chmodSync(git, 0o755);
+    const runGate = (target, trusted = '1') => {
+      const targetFile = path.join(deploy, 'RELEASE_RUNTIME_COMPATIBILITY');
+      if (target === null) fs.rmSync(targetFile, { force: true });
+      else fs.writeFileSync(targetFile, `${target}\n`);
+      return spawnSync('/bin/bash', ['-c', script], {
+        cwd: directory,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          TRUSTED_RUNTIME: trusted,
+        },
+      });
+    };
+
+    assert.equal(runGate('1').status, 0);
+    assert.notEqual(runGate(null).status, 0);
+    assert.notEqual(runGate('0').status, 0);
+    assert.notEqual(runGate('invalid').status, 0);
+    assert.notEqual(runGate('1', 'invalid').status, 0);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

@@ -7,6 +7,7 @@ set -euo pipefail
 RELEASE_STATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_ROOT="$(cd "$RELEASE_STATE_DIR/.." && pwd)"
 MINIMUM_SCHEMA_COMPATIBILITY_PATH="$RELEASE_STATE_DIR/minimum-schema-compatibility"
+RUNTIME_COMPATIBILITY_FILE="deploy/RELEASE_RUNTIME_COMPATIBILITY"
 STAGED_RELEASE_NAME="${1:-}"
 
 if [[ ! "$STAGED_RELEASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -58,6 +59,28 @@ if (( TARGET_SCHEMA_COMPATIBILITY != staged_schema_compatibility )); then
 fi
 if (( TARGET_SCHEMA_COMPATIBILITY < minimum_schema_compatibility )); then
   echo "Target schema compatibility $TARGET_SCHEMA_COMPATIBILITY is below server minimum $minimum_schema_compatibility; restore and verify the database before explicitly clearing $MINIMUM_SCHEMA_COMPATIBILITY_PATH." >&2
+  exit 1
+fi
+
+# Runtime contracts (Compose health checks, proxy routes, mounted entrypoints)
+# are independent of database schema. Compare the staged application against
+# the currently active tree before rsync so an incompatible rollback cannot
+# partially replace live source and only then discover that it is unsafe.
+live_runtime_compatibility=0
+staged_runtime_compatibility=0
+if [ -e "$DEPLOY_ROOT/$RUNTIME_COMPATIBILITY_FILE" ]; then
+  live_runtime_compatibility="$(cat "$DEPLOY_ROOT/$RUNTIME_COMPATIBILITY_FILE")"
+fi
+if [ -e "$STAGED_RELEASE/$RUNTIME_COMPATIBILITY_FILE" ]; then
+  staged_runtime_compatibility="$(cat "$STAGED_RELEASE/$RUNTIME_COMPATIBILITY_FILE")"
+fi
+if [[ ! "$live_runtime_compatibility" =~ ^[0-9]+$ ]] ||
+  [[ ! "$staged_runtime_compatibility" =~ ^[0-9]+$ ]]; then
+  echo "Invalid release runtime compatibility metadata" >&2
+  exit 1
+fi
+if (( staged_runtime_compatibility < live_runtime_compatibility )); then
+  echo "Staged runtime compatibility $staged_runtime_compatibility is below active runtime contract $live_runtime_compatibility." >&2
   exit 1
 fi
 

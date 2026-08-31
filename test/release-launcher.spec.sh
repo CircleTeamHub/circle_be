@@ -9,7 +9,8 @@ STATE_DIR="$DEPLOY_ROOT/.release"
 START_LOG="$CASE_DIR/start.log"
 trap 'rm -rf "$CASE_DIR"' EXIT
 
-mkdir -p "$STATE_DIR/incoming/old/deploy" "$STATE_DIR/incoming/new/deploy" "$CASE_DIR/bin"
+mkdir -p "$STATE_DIR/incoming/old/deploy" "$STATE_DIR/incoming/new/deploy" \
+  "$STATE_DIR/incoming/runtime-old/deploy" "$CASE_DIR/bin"
 cp "$LAUNCHER" "$STATE_DIR/release-launcher.sh"
 chmod +x "$STATE_DIR/release-launcher.sh"
 
@@ -31,6 +32,7 @@ printf 'new-start\n' >> "$START_LOG"
 NEW_RELEASE
 chmod +x "$STATE_DIR/incoming/new/deploy/release-deploy.sh"
 printf '1\n' > "$STATE_DIR/incoming/new/deploy/SCHEMA_COMPATIBILITY"
+printf '1\n' > "$STATE_DIR/incoming/new/deploy/RELEASE_RUNTIME_COMPATIBILITY"
 printf 'new\n' > "$STATE_DIR/incoming/new/VERSION"
 
 cat > "$STATE_DIR/incoming/old/deploy/release-deploy.sh" <<'OLD_RELEASE'
@@ -40,6 +42,11 @@ printf 'old-start\n' >> "$START_LOG"
 OLD_RELEASE
 chmod +x "$STATE_DIR/incoming/old/deploy/release-deploy.sh"
 printf 'old\n' > "$STATE_DIR/incoming/old/VERSION"
+
+cp "$STATE_DIR/incoming/old/deploy/release-deploy.sh" \
+  "$STATE_DIR/incoming/runtime-old/deploy/release-deploy.sh"
+printf '1\n' > "$STATE_DIR/incoming/runtime-old/deploy/SCHEMA_COMPATIBILITY"
+printf 'runtime-old\n' > "$STATE_DIR/incoming/runtime-old/VERSION"
 printf 'initial\n' > "$DEPLOY_ROOT/VERSION"
 mkdir -p "$STATE_DIR/app-env-transaction"
 printf 'staged\n' > "$STATE_DIR/app-env-transaction/state"
@@ -67,6 +74,16 @@ run_launcher new 1
 [ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
 [ "$(cat "$STATE_DIR/app-env-transaction/state")" = "staged" ]
 [ "$(cat "$STATE_DIR/app-env-transaction/legacy-rollback")" = "legacy-env" ]
+
+if run_launcher runtime-old 1 >"$CASE_DIR/runtime-old.log" 2>&1; then
+  echo "runtime-incompatible deployment unexpectedly activated" >&2
+  exit 1
+fi
+
+grep -q 'Staged runtime compatibility 0 is below active runtime contract 1' \
+  "$CASE_DIR/runtime-old.log"
+[ "$(cat "$DEPLOY_ROOT/VERSION")" = "new" ]
+[ "$(cat "$START_LOG")" = "new-start" ]
 
 if run_launcher old 0 >"$CASE_DIR/old.log" 2>&1; then
   echo "old deployment unexpectedly activated" >&2

@@ -21,7 +21,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID SETFACL_COMMAND ENV_STAMP_FAIL ENV_PERMISSION_FAIL PROBE_STAGE_DEFAULT_ACL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT LEGACY_LIVE_NO_APP_ENV_GROUP INTERRUPT_AFTER_ENV_STAGE KILL_AFTER_ENV_STAGE || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID SETFACL_COMMAND ENV_STAMP_FAIL ENV_PERMISSION_FAIL PROBE_STAGE_DEFAULT_ACL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT LEGACY_LIVE_NO_APP_ENV_GROUP INTERRUPT_AFTER_ENV_STAGE KILL_AFTER_ENV_STAGE || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -296,6 +296,7 @@ run_release() {
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
     RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-$REPO_SCHEMA_COMPATIBILITY}" \
     SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
+    RUNTIME_COMPATIBILITY_PATH="${RUNTIME_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
     CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
@@ -956,6 +957,14 @@ test_pre_marker_release_is_rejected_after_boundary_is_recorded() {
     [ ! -s "$TEST_COMMAND_LOG" ]
 }
 
+test_pre_contract_release_is_rejected_before_any_deployment_action() {
+  new_case
+  RUNTIME_COMPATIBILITY_PATH="$CASE_DIR/no-runtime-compatibility"
+  ! run_release || return 1
+  grep -q 'runtime compatibility 0 is below the trusted deployment contract minimum 1' "$CASE_DIR/release.log" &&
+    [ ! -s "$TEST_COMMAND_LOG" ]
+}
+
 test_release_cannot_understate_checked_out_schema_compatibility() {
   new_case
   RELEASE_SCHEMA_COMPATIBILITY=0
@@ -1079,6 +1088,7 @@ for test_name in \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \
+  test_pre_contract_release_is_rejected_before_any_deployment_action \
   test_release_cannot_understate_checked_out_schema_compatibility \
   test_irreversible_release_records_minimum_schema_compatibility \
   test_irreversible_migration_failure_restores_old_binary \

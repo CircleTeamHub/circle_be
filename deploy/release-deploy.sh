@@ -51,7 +51,22 @@ fi
 
 RELEASE_STATE_DIR="${RELEASE_STATE_DIR:-.release}"
 SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-deploy/SCHEMA_COMPATIBILITY}"
+RUNTIME_COMPATIBILITY_PATH="${RUNTIME_COMPATIBILITY_PATH:-deploy/RELEASE_RUNTIME_COMPATIBILITY}"
+MINIMUM_RELEASE_RUNTIME_COMPATIBILITY=1
 MINIMUM_SCHEMA_COMPATIBILITY_PATH="$RELEASE_STATE_DIR/minimum-schema-compatibility"
+checked_out_runtime_compatibility=0
+if [ -e "$RUNTIME_COMPATIBILITY_PATH" ]; then
+  checked_out_runtime_compatibility="$(cat "$RUNTIME_COMPATIBILITY_PATH")"
+  if [[ ! "$checked_out_runtime_compatibility" =~ ^[0-9]+$ ]]; then
+    echo "Invalid release runtime compatibility: $RUNTIME_COMPATIBILITY_PATH" >&2
+    exit 1
+  fi
+fi
+if (( checked_out_runtime_compatibility < MINIMUM_RELEASE_RUNTIME_COMPATIBILITY )); then
+  echo "Release runtime compatibility $checked_out_runtime_compatibility is below the trusted deployment contract minimum $MINIMUM_RELEASE_RUNTIME_COMPATIBILITY." >&2
+  echo "This application tag cannot safely use the current Compose, health-check, and proxy contract." >&2
+  exit 1
+fi
 checked_out_schema_compatibility=0
 if [ -e "$SCHEMA_COMPATIBILITY_PATH" ]; then
   checked_out_schema_compatibility="$(cat "$SCHEMA_COMPATIBILITY_PATH")"
