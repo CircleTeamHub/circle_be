@@ -17,7 +17,7 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
@@ -105,18 +105,24 @@ if [ "${1:-}" = "compose" ]; then
       fi
       if [ "${TERM_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
         printf '%s\n' "$*" | grep -q 'caddy reload' &&
-        printf '%s\n' "$*" | grep -q 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' &&
+        printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=${TERM_AFTER_CADDY_RELOAD_TARGET:-circle-be-green:3000}" &&
         [ ! -e "$CASE_DIR/term-injected" ]; then
-        : > "$CASE_DIR/term-injected"
-        kill -TERM "$PPID"
+        if [ "${TERM_AFTER_CADDY_RELOAD_TARGET:-}" != "circle-be-blue:3000" ] ||
+          grep -q '^rollback-pending:' "$RELEASE_STATE_DIR/app-env-transaction/state" 2>/dev/null; then
+          : > "$CASE_DIR/term-injected"
+          kill -TERM "$PPID"
+        fi
       fi
       if [ "${KILL_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
         printf '%s\n' "$*" | grep -q 'caddy reload' &&
-        printf '%s\n' "$*" | grep -q 'CIRCLE_BE_UPSTREAM=circle-be-green:3000' &&
+        printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=${KILL_AFTER_CADDY_RELOAD_TARGET:-circle-be-green:3000}" &&
         [ ! -e "$CASE_DIR/kill-after-cutover-injected" ]; then
-        : > "$CASE_DIR/kill-after-cutover-injected"
-        kill -KILL "$PPID"
-        exit 137
+        if [ "${KILL_AFTER_CADDY_RELOAD_TARGET:-}" != "circle-be-blue:3000" ] ||
+          grep -q '^rollback-pending:' "$RELEASE_STATE_DIR/app-env-transaction/state" 2>/dev/null; then
+          : > "$CASE_DIR/kill-after-cutover-injected"
+          kill -KILL "$PPID"
+          exit 137
+        fi
       fi
       ;;
     *)
@@ -221,6 +227,15 @@ if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
     exit 47
   fi
 fi
+if [ "${KILL_BEFORE_CADDY_RELOAD:-0}" = "1" ] &&
+  [ "${@: -1}" = "$RELEASE_STATE_DIR/app-env-transaction/state" ] &&
+  grep -q '^cutover-pending:' "${@: -2:1}" &&
+  [ ! -e "$CASE_DIR/kill-before-cutover-injected" ]; then
+  : > "$CASE_DIR/kill-before-cutover-injected"
+  "$REAL_MV" "$@"
+  kill -KILL "$PPID"
+  exit 137
+fi
 "$REAL_MV" "$@"
 if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ] &&
   [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
@@ -256,8 +271,11 @@ run_release() {
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
     KILL_AFTER_ENV_STAGE="${KILL_AFTER_ENV_STAGE:-0}" \
+    KILL_BEFORE_CADDY_RELOAD="${KILL_BEFORE_CADDY_RELOAD:-0}" \
     KILL_AFTER_CADDY_RELOAD="${KILL_AFTER_CADDY_RELOAD:-0}" \
+    KILL_AFTER_CADDY_RELOAD_TARGET="${KILL_AFTER_CADDY_RELOAD_TARGET:-}" \
     TERM_AFTER_CADDY_RELOAD="${TERM_AFTER_CADDY_RELOAD:-0}" \
+    TERM_AFTER_CADDY_RELOAD_TARGET="${TERM_AFTER_CADDY_RELOAD_TARGET:-}" \
     IMAGE_MISSING="${IMAGE_MISSING:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
@@ -662,6 +680,17 @@ test_term_after_cutover_finalizes_new_env_and_active_color() {
   assert_running circle_be_green
 }
 
+prepare_cutover_recovery_case() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=cutover-recovery\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+}
+
 test_sigkill_after_cutover_recovers_forward_before_early_failure() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -675,7 +704,7 @@ test_sigkill_after_cutover_recovers_forward_before_early_failure() {
 
   ! run_release || return 1
   [ -e "$CASE_DIR/kill-after-cutover-injected" ] || return 1
-  grep -q '^cutover-pending:circle_be_green$' \
+  grep -q '^cutover-pending:circle_be_green:circle_be$' \
     "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
   assert_mode "$APP_ENV_FILE" 640 || return 1
 
@@ -690,6 +719,68 @@ test_sigkill_after_cutover_recovers_forward_before_early_failure() {
   grep -q '^SECRET=cutover-kill$' "$APP_ENV_FILE" || return 1
   [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
   assert_running circle_be_green
+}
+
+test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CADDY_RELOAD=1
+  ! run_release || return 1
+  KILL_AFTER_CADDY_RELOAD=0
+  SMOKE_CODE=500
+  ! run_release || return 1
+  grep -q 'Rolled interrupted cutover back to circle_be' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_BEFORE_CADDY_RELOAD=1
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-before-cutover-injected" ] || return 1
+  KILL_BEFORE_CADDY_RELOAD=0
+  SMOKE_CODE=500
+  ! run_release || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_term_during_failed_smoke_completes_rollback() {
+  prepare_cutover_recovery_case
+  TERM_AFTER_CADDY_RELOAD=1
+  SMOKE_CODE=500
+  ! run_release || return 1
+  [ -e "$CASE_DIR/term-injected" ] || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_during_rollback_recovers_before_early_failure() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CADDY_RELOAD=1
+  KILL_AFTER_CADDY_RELOAD_TARGET=circle-be-blue:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+  grep -q '^rollback-pending:circle_be:circle_be_green$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+  KILL_AFTER_CADDY_RELOAD=0
+  IMAGE_MISSING=1
+  ! run_release || return 1
+  grep -q 'Finalized interrupted rollback to circle_be' "$CASE_DIR/release.log" || return 1
+  grep -q 'Image not available locally' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_term_during_rollback_completes_state_before_exit() {
+  prepare_cutover_recovery_case
+  TERM_AFTER_CADDY_RELOAD=1
+  TERM_AFTER_CADDY_RELOAD_TARGET=circle-be-blue:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+  [ -e "$CASE_DIR/term-injected" ] || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
 }
 
 test_state_write_failure_rolls_proxy_back_before_cleanup() {
@@ -870,6 +961,11 @@ for test_name in \
   test_interrupted_env_stage_recovers_through_launcher \
   test_term_after_cutover_finalizes_new_env_and_active_color \
   test_sigkill_after_cutover_recovers_forward_before_early_failure \
+  test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails \
+  test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails \
+  test_term_during_failed_smoke_completes_rollback \
+  test_sigkill_during_rollback_recovers_before_early_failure \
+  test_term_during_rollback_completes_state_before_exit \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \

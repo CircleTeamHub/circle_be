@@ -69,10 +69,9 @@ docker compose -f docker-compose.prod.yml up -d --build
 启动顺序由 `depends_on` 保证:`postgres` + `redis`(healthy)→ `migrate` + `minio-init`(跑完退出)→ `circle_be`。
 首次 `--build` 在 ARM 上约需几分钟。
 
-已有部署可再次运行 `gen-env.sh`:脚本会补齐 Redis 配置，并把 Admin/用户 Web
-来源幂等加入 `ALLOWED_ORIGINS`；不会覆盖数据库、JWT、MinIO 等现有密钥。首次从
-旧权限升级时必须先走 Release 工作流完成可恢复迁移；在此之前脚本会拒绝原地修改
-`.env.production`，避免旧容器重启后失去读取权限。不要手工绕过为它 `chgrp/chmod`。
+存量部署暂时不要再次运行 `gen-env.sh`:在 Release 工作流完成可恢复的应用配置
+权限迁移前，脚本会 fail closed，保持原 inode、权限和内容不变。完成后续权限迁移
+版本的首次成功发布后，才能恢复使用幂等配置补齐流程。
 使用托管 Redis 时,把 `.env.production` 的 `REDIS_URL` 改成带认证的 `rediss://...`,
 设置 `REDIS_ALLOW_INSECURE=false`,并从 `.env` 的 `COMPOSE_PROFILES` 中移除
 `bundled-redis`;此时 Compose 不会启动内置 Redis。

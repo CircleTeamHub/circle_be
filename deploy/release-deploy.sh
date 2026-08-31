@@ -188,6 +188,15 @@ restore_release_signals() {
   trap 'exit 143' TERM
 }
 
+exit_after_cutover_decision() {
+  local status="$1" deferred_status="$deferred_cutover_exit"
+  restore_release_signals
+  if [ "$deferred_status" -ne 0 ]; then
+    exit "$deferred_status"
+  fi
+  exit "$status"
+}
+
 compose() {
   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml "$@"
 }
@@ -292,24 +301,97 @@ switch_proxy() {
     caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
 }
 
-finalize_interrupted_app_env_cutover() {
-  local color="$recovered_app_env_cutover_color" cid health
-  [ -n "$color" ] || return 0
+# 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
+# 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
+smoke() {
+  local api_domain attempt code headers body
+  api_domain="$(sed -n 's/^API_DOMAIN=//p' .env | tail -n 1)"
+  if [ -z "$api_domain" ]; then
+    echo "API_DOMAIN is unset; public smoke verification is mandatory" >&2
+    return 1
+  fi
+  if [ -z "$(running caddy)" ]; then
+    echo "caddy is not running; public smoke verification cannot proceed" >&2
+    return 1
+  fi
+
+  headers="$(mktemp)"
+  body="$(mktemp)"
+  for attempt in $(seq 1 12); do
+    : >"$headers"
+    : >"$body"
+    if ! code="$(curl -m 5 -sS -H 'Accept: application/json' -D "$headers" -o "$body" \
+      -w '%{http_code}' "https://$api_domain/api/v1/auth/me")"; then
+      code=000
+    fi
+    case "$code" in
+      401|403)
+        if grep -Eqi '^content-type:[[:space:]]*application/(problem\+)?json([;[:space:]]|$)' "$headers"; then
+          echo "public smoke ok (HTTP $code JSON via https://$api_domain)"
+          rm -f "$headers" "$body"
+          return 0
+        fi
+        ;;
+    esac
+    sleep 5
+  done
+  echo "public smoke failed after 12 attempts (last HTTP $code; expected 401/403 JSON)" >&2
+  head -c 500 "$body" >&2 || true
+  rm -f "$headers" "$body"
+  return 1
+}
+
+ensure_recovery_color_healthy() {
+  local color="$1" cid health attempt
   cid="$(running "$color")"
-  [ -n "$cid" ] || {
-    echo "Interrupted cutover target $color is not running; preserving recovery state" >&2
-    return 1
-  }
-  health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
-  [ "$health" = "healthy" ] || {
-    echo "Interrupted cutover target $color is not healthy; preserving recovery state" >&2
-    return 1
-  }
+  if [ -z "$cid" ]; then
+    compose start "$color" || return 1
+    cid="$(running "$color")"
+  fi
+  [ -n "$cid" ] || return 1
+  for attempt in $(seq 1 24); do
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)"
+    [ "$health" = "healthy" ] && return 0
+    sleep 5
+  done
+  echo "Recovery color $color is not healthy; preserving recovery state" >&2
+  return 1
+}
+
+finish_recovered_rollback() {
+  local color="$1"
+  restore_legacy_app_env_access_for_rollback || return 1
+  ensure_recovery_color_healthy "$color" || return 1
   switch_proxy "$color" || return 1
   persist_active_color "$color" || return 1
-  mark_app_env_cutover_complete "$color" || return 1
-  commit_app_env_transaction || return 1
-  echo "==> Finalized interrupted cutover to $color before starting a new release" >&2
+  complete_app_env_rollback_transaction || return 1
+}
+
+finalize_interrupted_app_env_cutover() {
+  local color="$recovered_app_env_cutover_color" previous="$recovered_app_env_previous_color"
+  [ -n "$color" ] || return 0
+  if [ "$recovered_app_env_recovery_phase" = "rollback-pending" ]; then
+    finish_recovered_rollback "$color" || return 1
+    echo "==> Finalized interrupted rollback to $color before starting a new release" >&2
+    return 0
+  fi
+  ensure_recovery_color_healthy "$color" || return 1
+  switch_proxy "$color" || return 1
+  persist_active_color "$color" || return 1
+  mark_app_env_cutover_complete "$color" "$previous" || return 1
+  if smoke; then
+    commit_app_env_transaction || return 1
+    echo "==> Finalized interrupted cutover to $color after public smoke verification" >&2
+    return 0
+  fi
+  [ "$previous" != "none" ] || {
+    echo "Interrupted first cutover failed public smoke; preserving recovery state" >&2
+    return 1
+  }
+  mark_app_env_rollback_pending "$previous" "$color" || return 1
+  finish_recovered_rollback "$previous" || return 1
+  echo "==> Rolled interrupted cutover back to $previous after failed public smoke" >&2
+  return 1
 }
 
 # 登录凭证放进一次性的隔离 DOCKER_CONFIG,不污染主机默认凭证存储。
@@ -556,46 +638,6 @@ handle_post_migration_failure() {
   fi
 }
 
-# 走 Caddy 的公网烟测:外部视角验证 TLS/反代/应用整条链路。auth/me 是
-# 已知存在的路由;未带鉴权时 401/403 是健康响应,404 必须视为路由故障。
-smoke() {
-  local api_domain attempt code headers body
-  api_domain="$(sed -n 's/^API_DOMAIN=//p' .env | tail -n 1)"
-  if [ -z "$api_domain" ]; then
-    echo "API_DOMAIN is unset; public smoke verification is mandatory" >&2
-    return 1
-  fi
-  if [ -z "$(running caddy)" ]; then
-    echo "caddy is not running; public smoke verification cannot proceed" >&2
-    return 1
-  fi
-
-  headers="$(mktemp)"
-  body="$(mktemp)"
-  for attempt in $(seq 1 12); do
-    : >"$headers"
-    : >"$body"
-    if ! code="$(curl -m 5 -sS -H 'Accept: application/json' -D "$headers" -o "$body" \
-      -w '%{http_code}' "https://$api_domain/api/v1/auth/me")"; then
-      code=000
-    fi
-    case "$code" in
-      401|403)
-        if grep -Eqi '^content-type:[[:space:]]*application/(problem\+)?json([;[:space:]]|$)' "$headers"; then
-          echo "public smoke ok (HTTP $code JSON via https://$api_domain)"
-          rm -f "$headers" "$body"
-          return 0
-        fi
-        ;;
-    esac
-    sleep 5
-  done
-  echo "public smoke failed after 12 attempts (last HTTP $code; expected 401/403 JSON)" >&2
-  head -c 500 "$body" >&2 || true
-  rm -f "$headers" "$body"
-  return 1
-}
-
 # 异地备份的函数定义(只定义,不执行)。未配置目标存储桶时
 # ship_backup_offsite 直接返回,行为与引入它之前完全一致。
 #
@@ -755,7 +797,7 @@ fi
 
 # ── 切换代理 → 烟测 → 通过后才停/删旧色 ──────────────────────
 echo "==> $standby healthy; switching Caddy upstream"
-if ! mark_app_env_cutover_pending "$standby"; then
+if ! mark_app_env_cutover_pending "$standby" "${live:-none}"; then
   echo "==> Could not persist cutover intent; refusing to reload Caddy" >&2
   exit 1
 fi
@@ -767,49 +809,46 @@ if [ "$switch_proxy_status" -eq 0 ]; then
   # deferred handler first, then reaches this assignment. Cleanup can therefore
   # never restore the old env/state while Caddy already routes to the new color.
   cutover_activated=1
-  if ! mark_app_env_cutover_complete "$standby"; then
+  if ! mark_app_env_cutover_complete "$standby" "${live:-none}"; then
     echo "WARNING: cutover completed with the durable pending marker; recovery will reconcile it" >&2
   fi
-fi
-restore_release_signals
-if [ "$deferred_cutover_exit" -ne 0 ]; then
-  exit "$deferred_cutover_exit"
 fi
 if [ "$switch_proxy_status" -ne 0 ]; then
   echo "==> Caddy switch failed; leaving previous version $live live" >&2
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
-    exit 1
+    exit_after_cutover_decision 1
   fi
   if [ -n "$live" ]; then
-    if ! ensure_live; then
-      echo "warning: leaving both colors running for manual recovery" >&2
-      exit 1
+    if ! mark_app_env_rollback_pending "$live" "$standby" ||
+      ! finish_recovered_rollback "$live"; then
+      echo "warning: preserving interrupted rollback for the next release" >&2
+      exit_after_cutover_decision 1
     fi
     compose rm -sf "$standby" || true
   else
     echo "warning: no previous version exists; leaving standby running" >&2
   fi
-  exit 1
+  exit_after_cutover_decision 1
 fi
 if ! persist_active_color "$standby"; then
   echo "==> Could not persist active color; rolling Caddy back" >&2
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
-    exit 1
+    exit_after_cutover_decision 1
   fi
   if [ -n "$live" ]; then
-    if ! ensure_live || ! switch_proxy "$live"; then
+    if ! mark_app_env_rollback_pending "$live" "$standby" ||
+      ! finish_recovered_rollback "$live"; then
       echo "warning: Caddy rollback failed; leaving both colors running" >&2
-      exit 1
+      exit_after_cutover_decision 1
     fi
-    mark_app_env_cutover_rolled_back || true
     cutover_activated=0
     compose rm -sf "$standby" || true
   else
     echo "warning: no previous version exists; leaving standby running" >&2
   fi
-  exit 1
+  exit_after_cutover_decision 1
 fi
 
 if smoke; then
@@ -817,6 +856,10 @@ if smoke; then
   # dies after this point, the next release keeps the validated 0640 env file.
   commit_app_env_transaction
   cutover_activated=0
+  restore_release_signals
+  if [ "$deferred_cutover_exit" -ne 0 ]; then
+    exit "$deferred_cutover_exit"
+  fi
   if [ -n "$live" ]; then
     if [ -n "$(running "$live")" ]; then
       echo "==> Public smoke passed; stopping $live"
@@ -830,24 +873,19 @@ else
   compose logs --tail 100 "$standby" >&2 || true
   if irreversible_boundary_crossed; then
     enter_irreversible_maintenance
-    exit 1
+    exit_after_cutover_decision 1
   fi
   if [ -n "$live" ]; then
-    if ! ensure_live; then
+    if ! mark_app_env_rollback_pending "$live" "$standby" ||
+      ! finish_recovered_rollback "$live"; then
       echo "warning: previous version is unavailable; leaving standby in service" >&2
-      exit 1
+      exit_after_cutover_decision 1
     fi
-    if ! switch_proxy "$live"; then
-      echo "warning: Caddy rollback failed; leaving both colors running for manual recovery" >&2
-      exit 1
-    fi
-    mark_app_env_cutover_rolled_back || true
     cutover_activated=0
-    persist_active_color "$live"
     compose rm -sf "$standby" || true
     echo "==> Rolled back: $live restored" >&2
   else
     echo "warning: no previous version exists; leaving the healthy standby running" >&2
   fi
-  exit 1
+  exit_after_cutover_decision 1
 fi
