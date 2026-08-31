@@ -646,6 +646,7 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
   assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
+  assert.match(ci, /bash test\/app-env-primitives\.spec\.sh/);
   assert.match(ci, /bash test\/release-force-command\.spec\.sh/);
 });
 
