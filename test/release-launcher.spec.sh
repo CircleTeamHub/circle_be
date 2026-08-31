@@ -14,6 +14,7 @@ mkdir -p "$STATE_DIR/incoming/old/deploy" "$STATE_DIR/incoming/new/deploy" \
   "$STATE_DIR/incoming/pre-contract/deploy" "$CASE_DIR/bin"
 cp "$LAUNCHER" "$STATE_DIR/release-launcher.sh"
 chmod +x "$STATE_DIR/release-launcher.sh"
+[ "$(bash "$STATE_DIR/release-launcher.sh" --contract-version)" = "1" ]
 
 # macOS does not provide flock; launcher ordering is asserted separately by the
 # hardening test, while this deterministic regression controls the interleaving.

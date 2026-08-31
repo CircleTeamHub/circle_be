@@ -17,8 +17,10 @@
 #   publish   — GitHub Release with generated notes (tag pushes only)
 #   notify    — Discord, success or failure, always
 #
-# Rollback / redeploy: run this workflow manually (workflow_dispatch) with any
-# previously released tag. `downtime: true` switches the server script to
+# Rollback / redeploy: run this workflow manually with a tag whose
+# RELEASE_RUNTIME_COMPATIBILITY meets the trusted main contract. Pre-contract
+# tags require restoring their matching host/database backup instead.
+# `downtime: true` switches the server script to
 # stop-first mode for migrations that are not backward-compatible.
 #
 # One-time setup (repo Settings) is documented in DEPLOY.md §6:
@@ -34,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing v* tag to (re)deploy — rollback = dispatch an older tag"
+        description: "Compatible v* tag to (re)deploy; pre-runtime-contract tags are rejected"
         required: true
         type: string
       downtime:
@@ -394,6 +396,20 @@ jobs:
       # The deployment key has a server-side ForceCommand. It accepts only this
       # bounded stage protocol and the activate protocol below; historical
       # workflow revisions cannot obtain a shell or replace the trusted launcher.
+      - name: Verify server release gate contract
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          capabilities="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "circle-release capabilities")"
+          if [ "$capabilities" != "release-gate=1 launcher-runtime=1" ]; then
+            echo "Server release gate is not upgraded for runtime compatibility: $capabilities" >&2
+            echo "Install the root-owned gate and launcher from DEPLOY.md before releasing." >&2
+            exit 1
+          fi
+
       - name: Stage release on server
         id: stage
         env:

@@ -32,6 +32,10 @@ chmod 0444 "$CASE_DIR/signing.pub"
 cat > "$STATE_DIR/release-launcher.sh" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "$1" = "--contract-version" ]; then
+  printf '1\n'
+  exit 0
+fi
 {
   printf 'stage=%s\n' "$1"
   printf 'schema=%s\n' "$TARGET_SCHEMA_COMPATIBILITY"
@@ -45,11 +49,27 @@ set -euo pipefail
 } > "$RELEASE_STATE_DIR/activation.log"
 LAUNCHER
 chmod 0555 "$STATE_DIR/release-launcher.sh"
+cp "$STATE_DIR/release-launcher.sh" "$CASE_DIR/current-launcher.sh"
 
 run_gate() {
   local command="$1"
   HOME="$DEPLOY_HOME" SSH_ORIGINAL_COMMAND="$command" bash "$GATE" "$DEPLOY_ROOT" "$CASE_DIR/signing.pub"
 }
+
+[ "$(run_gate 'circle-release capabilities')" = 'release-gate=1 launcher-runtime=1' ]
+printf 'live-sentinel\n' > "$DEPLOY_ROOT/VERSION"
+chmod 0755 "$STATE_DIR/release-launcher.sh"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STATE_DIR/release-launcher.sh"
+chmod 0555 "$STATE_DIR/release-launcher.sh"
+if run_gate 'circle-release capabilities' >"$CASE_DIR/old-launcher.log" 2>&1; then
+  echo 'pre-contract launcher unexpectedly passed the capability gate' >&2
+  exit 1
+fi
+grep -q 'predates the runtime contract' "$CASE_DIR/old-launcher.log"
+[ "$(cat "$DEPLOY_ROOT/VERSION")" = 'live-sentinel' ]
+chmod 0755 "$STATE_DIR/release-launcher.sh"
+cp "$CASE_DIR/current-launcher.sh" "$STATE_DIR/release-launcher.sh"
+chmod 0555 "$STATE_DIR/release-launcher.sh"
 
 sign_stage() {
   local stage="$1" archive="$2" issued_at="${3:-}" manifest signature
@@ -63,7 +83,9 @@ sign_stage() {
     "archive_sha256=$digest" 'release_tag=v1.2.3' "image=$IMAGE" \
     'schema=0' 'downtime=0' 'irreversible=0' > "$manifest"
   openssl dgst -sha256 -sign "$CASE_DIR/signing.pem" -out "$signature" "$manifest"
-  printf '%s %s\n' "$(base64 -w0 "$manifest")" "$(base64 -w0 "$signature")"
+  printf '%s %s\n' \
+    "$(base64 < "$manifest" | tr -d '\n')" \
+    "$(base64 < "$signature" | tr -d '\n')"
 }
 
 stage_archive() {

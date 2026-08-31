@@ -11,6 +11,11 @@ RUNTIME_COMPATIBILITY_FILE="deploy/RELEASE_RUNTIME_COMPATIBILITY"
 MINIMUM_RELEASE_RUNTIME_COMPATIBILITY=1
 STAGED_RELEASE_NAME="${1:-}"
 
+if [ "$STAGED_RELEASE_NAME" = "--contract-version" ]; then
+  printf '%s\n' "$MINIMUM_RELEASE_RUNTIME_COMPATIBILITY"
+  exit 0
+fi
+
 if [[ ! "$STAGED_RELEASE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "Invalid staged release name: $STAGED_RELEASE_NAME" >&2
   exit 1

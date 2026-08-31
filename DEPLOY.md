@@ -222,22 +222,31 @@ launcher 会拒绝任何兼容级别低于 4 的 tag。
 
 ### 回滚 / 重放
 
-- **一键回滚**:Actions → Release → Run workflow,填旧 tag(如 `v0.1.0`)。
+- **一键回滚**:Actions → Release → Run workflow,填写带有
+  `deploy/RELEASE_RUNTIME_COMPATIBILITY` 且兼容级别不低于当前可信主线的旧 tag。
   走同一条管线:镜像已存在 → 秒级 promote → 蓝绿切换。tag 太老、
   CI run 已过期(90 天)时勾 `force` 跳过绿灯校验。
+- **首次启用 runtime contract**:先按 `docs/release-hardening-runbook.md` 原子升级
+  root 持有的 ForceCommand 与 launcher，再发布并保留第一个 compatibility=1 tag，
+  把它作为新的最早在线回滚点。未包含 runtime marker 的历史 tag 会被工作流、
+  ForceCommand capability preflight 和 launcher 拒绝，`force` 也不能绕过。
+- **pre-contract 灾备**:若必须恢复到没有 runtime marker 的历史版本，不要把它送入
+  当前 live tree。应恢复该版本同期的整机/数据卷、`.env.production` 与数据库备份，
+  在隔离主机验证后再切换流量；新 launcher 不支持跨 runtime contract 原地降级。
 - **服务器上手动**(GitHub 不可用时):将目标 tag 检出到 live tree 之外,按 workflow
   的排除规则暂存到 `~/circle_be/.release/incoming/<唯一名称>/`,然后通过持久 launcher
   激活。不要直接执行目标树内的 `deploy/release-deploy.sh`。
 
   ```bash
   cd ~/circle_be
-  stage=manual-v0.1.0-$(date +%s)
+  test "$(bash .release/release-launcher.sh --contract-version)" = 1
+  stage=manual-v1.2.3-$(date +%s)
   mkdir -p ".release/incoming/$stage"
   rsync -a --delete --exclude=/.release --exclude=/.env --exclude=/.env.production \
     --exclude=.git --exclude=node_modules --exclude=dist --exclude=logs \
-    /path/to/external-v0.1.0-checkout/ ".release/incoming/$stage/"
+    /path/to/external-v1.2.3-checkout/ ".release/incoming/$stage/"
   TARGET_SCHEMA_COMPATIBILITY=$(cat ".release/incoming/$stage/deploy/SCHEMA_COMPATIBILITY" 2>/dev/null || printf 0) \
-  RELEASE_TAG=v0.1.0 \
+  RELEASE_TAG=v1.2.3 \
   CIRCLE_BE_IMAGE=ghcr.io/circleteamhub/circle_be@sha256:<64位digest> \
     bash .release/release-launcher.sh "$stage"
   ```
