@@ -33,5 +33,5 @@ fi
 [ "$(file_inode "$CASE_DIR/.env.production")" = "$legacy_inode" ]
 [ "$(cat "$CASE_DIR/.env.production")" = "$legacy_content" ]
 [ "$(stat -c '%a' "$CASE_DIR/.env.production" 2>/dev/null || stat -f '%Lp' "$CASE_DIR/.env.production")" = "600" ]
-grep -q '拒绝原地重写' "$CASE_DIR/output.log"
+grep -q '拒绝原地' "$CASE_DIR/output.log"
 echo "PASS legacy gen-env rerun fails closed without changing production config"

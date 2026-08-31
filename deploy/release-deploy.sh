@@ -122,6 +122,7 @@ COMPOSE_ENV_FILE="${COMPOSE_ENV_FILE:-.env}"
 APP_ENV_FILE="${APP_ENV_FILE:-.env.production}"
 resolved_app_env_gid=""
 release_docker_config=""
+cutover_activated=0
 . deploy/app-env-preflight.sh
 . deploy/app-env-transaction.sh
 initialize_app_env_transaction
@@ -147,9 +148,15 @@ cleanup_release_on_exit() {
   if [ -n "$legacy_app_env_backup" ] && [ -e "$legacy_app_env_backup" ]; then
     if [ "$app_env_transaction_committed" = "1" ] ||
       [ "$persisted_transaction_state" = "committed" ] ||
+      [ "$cutover_activated" = "1" ] ||
       { [ "${RELEASE_IRREVERSIBLE_MIGRATION:-0}" = "1" ] &&
         [ "${irreversible_migration_applied:-0}" = "1" ] &&
         [ -e "$APP_ENV_FILE" ]; }; then
+      if [ "$cutover_activated" = "1" ] && [ -n "${standby:-}" ]; then
+        if ! persist_active_color "$standby"; then
+          echo "CRITICAL: cutover succeeded but active-color state could not be finalized" >&2
+        fi
+      fi
       commit_app_env_transaction || true
     else
       restore_legacy_app_env_access || true
@@ -728,6 +735,7 @@ if ! switch_proxy "$standby"; then
   fi
   exit 1
 fi
+cutover_activated=1
 if ! persist_active_color "$standby"; then
   echo "==> Could not persist active color; rolling Caddy back" >&2
   if irreversible_boundary_crossed; then
@@ -750,6 +758,7 @@ if smoke; then
   # Persist the no-rollback decision before retiring the old color. If the host
   # dies after this point, the next release keeps the validated 0640 env file.
   commit_app_env_transaction
+  cutover_activated=0
   if [ -n "$live" ]; then
     if [ -n "$(running "$live")" ]; then
       echo "==> Public smoke passed; stopping $live"
