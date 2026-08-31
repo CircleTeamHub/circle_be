@@ -3,11 +3,42 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 script="$repo_root/monitoring/sync-metrics-token.sh"
+grep -Eq '^[[:space:]]+container_name:[[:space:]]+circle-prometheus[[:space:]]*$' \
+  "$repo_root/monitoring/docker-compose.yml"
+grep -F "name=^/circle-prometheus\$" "$script" >/dev/null
 tmp_dir="$(mktemp -d)"
 env_file="$tmp_dir/env.production"
 token_file="$tmp_dir/metrics_token"
 fake_bin="$tmp_dir/bin"
 sudo_log="$tmp_dir/sudo.log"
+sync_marker="$tmp_dir/metrics-token-sync-required"
+export METRICS_SYNC_MARKER="$sync_marker"
+docker_log="$tmp_dir/docker.log"
+docker_stub="$tmp_dir/docker"
+cat > "$docker_stub" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+if [ "${1:-}" = "ps" ]; then
+  [ "${PROMETHEUS_QUERY_FAIL:-0}" != "1" ] || exit 1
+  [ "${PROMETHEUS_ABSENT:-0}" = "1" ] || printf 'prometheus-existing-id\n'
+  exit
+fi
+if [ "${1:-}" = "info" ]; then
+  [ "${DOCKER_INFO_FAIL:-0}" != "1" ]
+  exit
+fi
+case "$*" in
+  *' up -d --force-recreate prometheus')
+    [ "${DOCKER_FAIL:-0}" != "1" ]
+    ;;
+  *' ps --status running -q prometheus')
+    [ "${DOCKER_PS_EMPTY:-0}" = "1" ] || printf 'prometheus-test-id\n'
+    ;;
+esac
+SH
+chmod +x "$docker_stub"
+export DOCKER="$docker_stub"
+export DOCKER_LOG="$docker_log"
 
 cleanup() {
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
@@ -46,11 +77,15 @@ SH
 fi
 
 run_sync() {
+  : > "$sync_marker"
   ENV_FILE="$env_file" \
     TOKEN_FILE="$token_file" \
+    METRICS_SYNC_MARKER="$sync_marker" \
     PROM_UID="$prom_uid" \
     PROM_GID="$prom_gid" \
-    bash "$script"
+  bash "$script"
+  test ! -e "$sync_marker"
+  grep -F 'compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus' "$docker_log" >/dev/null
 }
 
 read_token_file() {
@@ -76,6 +111,110 @@ else
   test "$(stat -c '%u' "$token_file")" = "$expected_uid"
   test "$(stat -c '%g' "$token_file")" = "$expected_gid"
 fi
+
+# A failed sync must never consume gen-env's durable reminder. Model Docker's
+# accidental non-empty directory at the bind-mount source: validation succeeds,
+# replacement fails, and the marker must remain for the next operator run.
+failed_token_path="$tmp_dir/non-empty-token-dir"
+failed_sync_marker="$tmp_dir/failed-sync-required"
+mkdir -p "$failed_token_path"
+printf 'keep\n' > "$failed_token_path/content"
+printf '%s\n' 'METRICS_AUTH_TOKEN=valid-but-unsynced' > "$env_file"
+: > "$failed_sync_marker"
+if ENV_FILE="$env_file" \
+  TOKEN_FILE="$failed_token_path" \
+  METRICS_SYNC_MARKER="$failed_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/failed-sync.log" 2>&1; then
+  echo 'expected metrics sync to reject a non-empty token directory' >&2
+  exit 1
+fi
+test -e "$failed_sync_marker"
+
+docker_unavailable_token="$tmp_dir/docker-unavailable-token"
+docker_unavailable_marker="$tmp_dir/docker-unavailable-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=docker-unavailable-token' > "$env_file"
+: > "$docker_unavailable_marker"
+if DOCKER_INFO_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$docker_unavailable_token" \
+  METRICS_SYNC_MARKER="$docker_unavailable_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/docker-unavailable.log" 2>&1; then
+  echo 'expected metrics sync to retain the marker when Docker is unavailable' >&2
+  exit 1
+fi
+test -e "$docker_unavailable_marker"
+
+query_failure_token="$tmp_dir/query-failure-token"
+query_failure_marker="$tmp_dir/query-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=query-failure-token' > "$env_file"
+: > "$query_failure_marker"
+if PROMETHEUS_QUERY_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$query_failure_token" \
+  METRICS_SYNC_MARKER="$query_failure_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/query-failure.log" 2>&1; then
+  echo 'expected metrics sync to retain the marker when container query fails' >&2
+  exit 1
+fi
+test -e "$query_failure_marker"
+
+bootstrap_token_file="$tmp_dir/bootstrap-token"
+bootstrap_sync_marker="$tmp_dir/bootstrap-sync-required"
+bootstrap_log="$tmp_dir/bootstrap-docker.log"
+printf '%s\n' 'METRICS_AUTH_TOKEN=bootstrap-token' > "$env_file"
+: > "$bootstrap_sync_marker"
+PROMETHEUS_ABSENT=1 \
+  DOCKER_LOG="$bootstrap_log" \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$bootstrap_token_file" \
+  METRICS_SYNC_MARKER="$bootstrap_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/bootstrap.log"
+test ! -e "$bootstrap_sync_marker"
+grep -F 'ps -aq --filter name=^/circle-prometheus$' "$bootstrap_log" >/dev/null
+if grep -F 'compose ' "$bootstrap_log" >/dev/null; then
+  echo 'first bootstrap must not parse production Compose before monitoring/.env exists' >&2
+  exit 1
+fi
+
+recreate_token_file="$tmp_dir/recreate-failure-token"
+recreate_sync_marker="$tmp_dir/recreate-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=recreate-failure-token' > "$env_file"
+: > "$recreate_sync_marker"
+if DOCKER_FAIL=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$recreate_token_file" \
+  METRICS_SYNC_MARKER="$recreate_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/recreate-failure.log" 2>&1; then
+  echo 'expected metrics sync to fail when Prometheus recreate fails' >&2
+  exit 1
+fi
+test -e "$recreate_sync_marker"
+
+verify_token_file="$tmp_dir/verify-failure-token"
+verify_sync_marker="$tmp_dir/verify-failure-required"
+printf '%s\n' 'METRICS_AUTH_TOKEN=verify-failure-token' > "$env_file"
+: > "$verify_sync_marker"
+if DOCKER_PS_EMPTY=1 \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$verify_token_file" \
+  METRICS_SYNC_MARKER="$verify_sync_marker" \
+  PROM_UID="$prom_uid" \
+  PROM_GID="$prom_gid" \
+  bash "$script" >"$tmp_dir/verify-failure.log" 2>&1; then
+  echo 'expected metrics sync to fail when Prometheus is not running' >&2
+  exit 1
+fi
+test -e "$verify_sync_marker"
 
 # A production sudoers policy may authorize only the two commands the sync
 # needs. Simulate that policy even when this suite itself runs as root: the fake
@@ -171,6 +310,7 @@ fi
 # up locally. Write it, warn loudly, exit 0.
 local_file="$tmp_dir/local_token"
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-token' > "$env_file"
+: > "$sync_marker"
 local_out="$(ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
   PROM_UID="$prom_uid" \
@@ -184,6 +324,7 @@ case "$(uname -s)" in
   *) test "$(file_mode "$local_file")" = '600' ;;
 esac
 printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+test -e "$sync_marker"
 
 # Rotation still has to work on the following run — the file is ours now, which
 # must not be mistaken for the "owned by somebody else" case above.

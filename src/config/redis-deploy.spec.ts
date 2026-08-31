@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'child_process';
 import {
   cpSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -43,6 +44,18 @@ describe('production Redis deployment configuration', () => {
     workspaces.push(workspace);
     return workspace;
   };
+  const existingRerunEnv = (workspace: string) => {
+    const bin = join(workspace, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'flock'), '#!/usr/bin/env bash\nexit 0\n', {
+      mode: 0o755,
+    });
+    return {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      RELEASE_STATE_DIR: join(workspace, '.release'),
+    };
+  };
 
   afterEach(() => {
     for (const workspace of workspaces.splice(0)) {
@@ -50,7 +63,7 @@ describe('production Redis deployment configuration', () => {
     }
   });
 
-  it('generates matching Redis credentials and rejects legacy reruns without mutation', () => {
+  it('generates matching Redis credentials and supports migrated reruns without rotation', () => {
     const workspace = createWorkspace('circle-redis-env-');
     mkdirSync(join(workspace, 'deploy'));
     cpSync(
@@ -66,7 +79,8 @@ describe('production Redis deployment configuration', () => {
       'ops@example.com',
       'app.example.com',
     ];
-    execFileSync(bashExecutable, args, { cwd: workspace });
+    const rerunEnv = existingRerunEnv(workspace);
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
     const firstComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
     const firstAppEnv = readFileSync(
       join(workspace, '.env.production'),
@@ -107,22 +121,45 @@ describe('production Redis deployment configuration', () => {
       expect(statSync(join(workspace, '.env.production')).gid).toBe(primaryGid);
     }
 
-    const composeStat = statSync(join(workspace, '.env'));
-    const appStat = statSync(join(workspace, '.env.production'));
-    const rerun = spawnSync(bashExecutable, args, {
-      cwd: workspace,
-      encoding: 'utf8',
-    });
-
-    expect(rerun.status).not.toBe(0);
-    expect(`${rerun.stdout}${rerun.stderr}`).toContain('拒绝原地重写');
-    expect(readFileSync(join(workspace, '.env'), 'utf8')).toBe(firstComposeEnv);
-    expect(readFileSync(join(workspace, '.env.production'), 'utf8')).toBe(
-      firstAppEnv,
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
+    const upgradedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
+    const upgradedAppEnv = readFileSync(
+      join(workspace, '.env.production'),
+      'utf8',
     );
-    expect(statSync(join(workspace, '.env')).ino).toBe(composeStat.ino);
-    expect(statSync(join(workspace, '.env.production')).ino).toBe(appStat.ino);
-    expect(firstAppEnv).toContain(`SECRET=${originalSecret}`);
+
+    expect(upgradedComposeEnv.match(/^REDIS_PASSWORD=/gm)).toHaveLength(1);
+    expect(upgradedComposeEnv.match(/^APP_ENV_GID=/gm)).toHaveLength(1);
+    expect(upgradedAppEnv.match(/^REDIS_URL=/gm)).toHaveLength(1);
+    expect(upgradedAppEnv.match(/^REDIS_ALLOW_INSECURE=/gm)).toHaveLength(1);
+    expect(upgradedAppEnv).toContain(`SECRET=${originalSecret}`);
+
+    writeFileSync(
+      join(workspace, '.env'),
+      upgradedComposeEnv
+        .replace(/^COMPOSE_PROFILES=.*\n?/m, '')
+        .replace(/^APP_ENV_GID=.*$/m, 'APP_ENV_GID=999999'),
+    );
+    writeFileSync(
+      join(workspace, '.env.production'),
+      upgradedAppEnv
+        .replace(
+          /^REDIS_URL=.*$/m,
+          'REDIS_URL="rediss://default:secret@cache.example.com:6380"',
+        )
+        .replace(/^REDIS_ALLOW_INSECURE=.*\n?/m, ''),
+    );
+    execFileSync(bashExecutable, args, { cwd: workspace, env: rerunEnv });
+    const regeneratedComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
+    expect(regeneratedComposeEnv).not.toContain(
+      'COMPOSE_PROFILES=bundled-redis',
+    );
+    if (process.platform !== 'win32') {
+      expect(regeneratedComposeEnv).toContain(`APP_ENV_GID=${primaryGid}`);
+    }
+    expect(readFileSync(join(workspace, '.env.production'), 'utf8')).toContain(
+      'REDIS_ALLOW_INSECURE=false',
+    );
   });
 
   it('clears inherited default ACLs before writing fresh secrets', () => {
@@ -260,7 +297,8 @@ exec "$REAL_CAT" "$@"
     expect(compose).not.toMatch(/^\s+image: caddy:2-alpine\s*$/m);
   });
 
-  it('rejects legacy upgrades before changing either env file', () => {
+  it('preserves a non-hex live password and merges the bundled profile on upgrade', () => {
+    if (process.platform === 'win32') return;
     const workspace = createWorkspace('circle-redis-upgrade-');
     mkdirSync(join(workspace, 'deploy'));
     cpSync(
@@ -277,8 +315,9 @@ exec "$REAL_CAT" "$@"
         'ADMIN_DOMAIN=',
         'ACME_EMAIL=',
         'WEB_DOMAIN=',
-        'REDIS_PASSWORD=bad#password',
+        'REDIS_PASSWORD=legacy-password',
         'COMPOSE_PROFILES=debug-tools',
+        `APP_ENV_GID=${execFileSync('/usr/bin/id', ['-g']).toString().trim()}`,
         '',
       ].join('\n'),
     );
@@ -286,17 +325,14 @@ exec "$REAL_CAT" "$@"
       join(workspace, '.env.production'),
       [
         'NODE_ENV=production',
-        'REDIS_URL="redis://default:@redis:6379"',
+        'REDIS_URL="redis://default:legacy-password@redis:6379"',
         'ALLOWED_ORIGINS="https://legacy.example.com"',
         '',
       ].join('\n'),
     );
-    const originalComposeEnv = readFileSync(join(workspace, '.env'), 'utf8');
-    const originalAppEnv = readFileSync(
-      join(workspace, '.env.production'),
-      'utf8',
-    );
-    const result = spawnSync(
+    chmodSync(join(workspace, '.env.production'), 0o640);
+
+    execFileSync(
       bashExecutable,
       [
         'deploy/gen-env.sh',
@@ -306,16 +342,23 @@ exec "$REAL_CAT" "$@"
         'ops@example.com',
         'app.example.com',
       ],
-      { cwd: workspace, encoding: 'utf8' },
+      { cwd: workspace, env: existingRerunEnv(workspace) },
     );
 
-    expect(result.status).not.toBe(0);
-    expect(`${result.stdout}${result.stderr}`).toContain('拒绝原地重写');
-    expect(readFileSync(join(workspace, '.env'), 'utf8')).toBe(
-      originalComposeEnv,
+    const composeEnv = readFileSync(join(workspace, '.env'), 'utf8');
+    const appEnv = readFileSync(join(workspace, '.env.production'), 'utf8');
+    const password = composeEnv.match(/^REDIS_PASSWORD=(.+)$/m)?.[1];
+    expect(password).toBe('legacy-password');
+    expect(composeEnv).toContain('COMPOSE_PROFILES=debug-tools,bundled-redis');
+    expect(composeEnv).toContain('API_DOMAIN=api.example.com');
+    expect(composeEnv).toContain('ADMIN_DOMAIN=admin.example.com');
+    expect(composeEnv).toContain('ACME_EMAIL=ops@example.com');
+    expect(composeEnv).toContain('WEB_DOMAIN=app.example.com');
+    expect(appEnv).toContain(
+      'ALLOWED_ORIGINS=https://legacy.example.com,https://admin.example.com,https://app.example.com',
     );
-    expect(readFileSync(join(workspace, '.env.production'), 'utf8')).toBe(
-      originalAppEnv,
+    expect(appEnv).toContain(
+      `REDIS_URL="redis://default:${password}@redis:6379"`,
     );
   });
 

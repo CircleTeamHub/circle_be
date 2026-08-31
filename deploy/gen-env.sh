@@ -100,6 +100,14 @@ else
 fi
 validate_private_gid "$DEPLOY_APP_ENV_GID"
 
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+file_gid() {
+  stat -c '%g' "$1" 2>/dev/null || stat -f '%g' "$1"
+}
+
 # 32+ 位随机串,去掉 / + = 以免干扰 dotenv / URL 解析
 gen() { openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48; }
 
@@ -152,7 +160,42 @@ ensure_env_csv_value() {
   fi
 }
 
+read_env_scalar() {
+  local file="$1" key="$2" value
+  value="$(sed -n "s/^${key}=//p" "$file" | tail -n 1)"
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+decode_url_password() {
+  local encoded="$1"
+  [[ "$encoded" =~ ^([A-Za-z0-9._~-]|%[A-Fa-f0-9]{2})+$ ]] || return 1
+  printf '%b' "${encoded//%/\\x}"
+}
+
 if [ -f .env.production ]; then
+  command -v flock >/dev/null || {
+    echo "❌ 缺少 flock，无法与发版流程安全互斥。" >&2
+    exit 1
+  }
+  release_lock_file=/tmp/circle-be-release.lock
+  exec 200>"$release_lock_file"
+  if ! flock -n 200; then
+    echo "❌ 另一个发版或配置更新正在进行（锁：${release_lock_file}）。" >&2
+    exit 1
+  fi
+  release_state_dir="${RELEASE_STATE_DIR:-.release}"
+  metrics_sync_marker="$release_state_dir/metrics-token-sync-required"
+  if [ -e "$release_state_dir/app-env-transaction/state" ]; then
+    echo "❌ 检测到未完成的 app env 事务；请先运行 Release 恢复流程。" >&2
+    exit 1
+  fi
+  if [ -e "$metrics_sync_marker" ]; then
+    echo "⚠️  监控 token 仍待同步；运行 bash monitoring/sync-metrics-token.sh 并重新创建 Prometheus。" >&2
+  fi
   if [ ! -f .env ]; then
     echo "❌ .env.production 已存在但 .env 缺失;拒绝生成不完整的 Compose 配置。" >&2
     exit 1
@@ -163,32 +206,85 @@ if [ -f .env.production ]; then
       exit 1
     fi
   done
-  echo "❌ 存量 .env.production 必须先通过 Release 工作流完成可恢复权限迁移；拒绝原地重写。" >&2
-  exit 1
+  if [ "$(file_mode .env.production)" != "640" ] ||
+    [ "$(file_gid .env.production)" != "$DEPLOY_APP_ENV_GID" ]; then
+    echo "❌ 存量 .env.production 尚未完成可恢复权限迁移；请先走 Release 工作流，拒绝原地改权限。" >&2
+    exit 1
+  fi
+
+  redis_password="$(read_env_scalar .env REDIS_PASSWORD)"
+  redis_url="$(read_env_scalar .env.production REDIS_URL)"
+  bundled_redis=0
+  redis_password_generated=0
+  if [ -n "$redis_url" ]; then
+    case "$redis_url" in
+      redis://default:*@redis:6379|redis://default:*@redis:6379/)
+        bundled_redis=1
+        if [ -z "$redis_password" ]; then
+          echo "❌ bundled Redis 已配置，但 .env 缺少 REDIS_PASSWORD；拒绝猜测或轮换运行中凭据。" >&2
+          exit 1
+        fi
+        encoded_redis_password="${redis_url#redis://default:}"
+        encoded_redis_password="${encoded_redis_password%@redis:6379*}"
+        decoded_redis_password="$(decode_url_password "$encoded_redis_password")" || {
+          echo "❌ bundled REDIS_URL 的密码必须使用标准 percent-encoding。" >&2
+          exit 1
+        }
+        if [ "$decoded_redis_password" != "$redis_password" ]; then
+          echo "❌ .env 与 .env.production 的 bundled Redis 凭据不一致；请先恢复一致配置。" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  else
+    bundled_redis=1
+    if [ -z "$redis_password" ]; then
+      redis_password="$(openssl rand -hex 24)"
+      redis_password_generated=1
+    elif ! [[ "$redis_password" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+      echo "❌ REDIS_PASSWORD 含 URI 特殊字符；请先在 .env.production 显式配置 percent-encoded REDIS_URL。" >&2
+      exit 1
+    fi
+  fi
+
+  metrics_auth_token="$(read_env_scalar .env.production METRICS_AUTH_TOKEN)"
+  metrics_auth_token_generated=0
+  if [ -z "$metrics_auth_token" ] || [ "$metrics_auth_token" = "__REPLACE_RANDOM__" ]; then
+    metrics_auth_token="$(openssl rand -hex 24)"
+    metrics_auth_token_generated=1
+  fi
+
+  clear_file_acl .env
+  chmod 600 .env
+  clear_file_acl .env.production
+  chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  chmod 640 .env.production
   grep -Eq '^API_DOMAIN=.+' .env || set_env_value .env API_DOMAIN "$API_DOMAIN"
   grep -Eq '^ADMIN_DOMAIN=.+' .env || set_env_value .env ADMIN_DOMAIN "$ADMIN_DOMAIN"
   grep -Eq '^ACME_EMAIL=.+' .env || set_env_value .env ACME_EMAIL "$ACME_EMAIL"
   grep -Eq '^WEB_DOMAIN=.+' .env || set_env_value .env WEB_DOMAIN "$WEB_DOMAIN"
+  set_env_value .env APP_ENV_GID "$DEPLOY_APP_ENV_GID"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$ADMIN_DOMAIN"
   ensure_env_csv_value .env.production ALLOWED_ORIGINS "https://$WEB_DOMAIN"
-  if grep -q '^REDIS_PASSWORD=' .env; then
-    REDIS_PASSWORD="$(sed -n 's/^REDIS_PASSWORD=//p' .env | tail -n 1)"
+  if [ "$redis_password_generated" = "1" ]; then
+    set_env_value .env REDIS_PASSWORD "$redis_password"
   fi
-  if ! printf '%s' "${REDIS_PASSWORD:-}" | grep -Eq '^[a-f0-9]{48}$'; then
-    REDIS_PASSWORD="$(openssl rand -hex 24)"
-    set_env_value .env REDIS_PASSWORD "$REDIS_PASSWORD"
+  if [ -z "$redis_url" ]; then
+    set_env_value .env.production REDIS_URL "\"redis://default:$redis_password@redis:6379\""
   fi
-  grep -q '^REDIS_URL=' .env.production || printf '\nREDIS_URL="redis://default:%s@redis:6379"\n' "$REDIS_PASSWORD" >> .env.production
-  if grep -Eq '^REDIS_URL=.*@redis:6379' .env.production; then
-    set_env_value .env.production REDIS_URL "\"redis://default:$REDIS_PASSWORD@redis:6379\""
+  if [ "$bundled_redis" = "1" ]; then
     ensure_compose_profile bundled-redis
     grep -q '^REDIS_ALLOW_INSECURE=' .env.production || printf 'REDIS_ALLOW_INSECURE=true\n' >> .env.production
   else
     grep -q '^REDIS_ALLOW_INSECURE=' .env.production || printf 'REDIS_ALLOW_INSECURE=false\n' >> .env.production
   fi
   grep -q '^REDIS_REQUIRED=' .env.production || printf 'REDIS_REQUIRED=false\n' >> .env.production
-  if ! grep -Eq '^METRICS_AUTH_TOKEN=.{32,}$' .env.production; then
-    set_env_value .env.production METRICS_AUTH_TOKEN "$(openssl rand -hex 24)"
+  if [ "$metrics_auth_token_generated" = "1" ]; then
+    mkdir -p "$release_state_dir"
+    chmod 700 "$release_state_dir"
+    : > "$metrics_sync_marker"
+    chmod 600 "$metrics_sync_marker"
+    set_env_value .env.production METRICS_AUTH_TOKEN "$metrics_auth_token"
   fi
   if ! grep -Eq '^MINIO_PUBLIC_URL=https://' .env.production; then
     set_env_value .env.production MINIO_PUBLIC_URL "https://$API_DOMAIN"
@@ -196,8 +292,14 @@ if [ -f .env.production ]; then
   if grep -Eq '^MINIO_ENDPOINT=http://minio:9000/?$' .env.production; then
     ensure_compose_profile bundled-storage
   fi
-  chmod 600 .env .env.production
+  chmod 600 .env
+  chgrp "$DEPLOY_APP_ENV_GID" .env.production
+  clear_file_acl .env.production
+  chmod 640 .env.production
   echo "✅ 已保留现有配置并补齐 Redis 配置"
+  if [ -e "$metrics_sync_marker" ]; then
+    echo "⚠️  METRICS_AUTH_TOKEN 尚未同步。启动后端前必须运行：bash monitoring/sync-metrics-token.sh，并重新创建 Prometheus。" >&2
+  fi
   exit 0
 fi
 
