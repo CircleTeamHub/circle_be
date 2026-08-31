@@ -371,7 +371,9 @@ jobs:
             deploy/caddy-entrypoint.sh
             deploy/overlay-trusted-release-tooling.sh
             deploy/app-env-preflight.sh
+            deploy/offsite-backup.sh
             deploy/Caddyfile.admin
+            Dockerfile.caddy
             docker-compose.prod.yml
             docker-compose.release.yml
             docker-compose.admin-release.yml
