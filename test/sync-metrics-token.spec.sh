@@ -305,18 +305,22 @@ if [ "$(id -u)" != "0" ] && [ -e "$foreign_file" ] && [ ! -O "$foreign_file" ]; 
   fi
 fi
 
-# (2) Token absent or already ours: local development. Docker Desktop maps uids
-# so Prometheus can still read it; failing here only blocks bringing monitoring
-# up locally. Write it, warn loudly, exit 0.
+# (2) Token absent or already ours: fail by default because a real Linux host
+# cannot serve metrics from the resulting current-user-owned 0600 file.
 local_file="$tmp_dir/local_token"
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-token' > "$env_file"
 : > "$sync_marker"
-local_out="$(ENV_FILE="$env_file" \
+if local_out="$(ALLOW_UNPRIVILEGED_METRICS_TOKEN=0 \
+  PATH="$least_bin:$PATH" \
+  ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
-  PROM_UID="$prom_uid" \
-  PROM_GID="$prom_gid" \
+  PROM_UID=65534 \
+  PROM_GID=65534 \
   SUDO=false \
-  bash "$script")"
+  bash "$script" 2>&1)"; then
+  echo 'expected unprivileged sync to fail without an explicit local-development override' >&2
+  exit 1
+fi
 
 test "$(cat "$local_file")" = 'local-dev-token'
 case "$(uname -s)" in
@@ -324,18 +328,28 @@ case "$(uname -s)" in
   *) test "$(file_mode "$local_file")" = '600' ;;
 esac
 printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+printf '%s' "$local_out" | grep -F 'ALLOW_UNPRIVILEGED_METRICS_TOKEN=1' >/dev/null
+printf '%s' "$local_out" | grep -F 'Configure passwordless sudo for install and mv, or run this script as root.' >/dev/null
+if printf '%s' "$local_out" | grep -F 'sudo chown' >/dev/null; then
+  echo 'sync failure must not recommend a chown that makes the next unprivileged run fail' >&2
+  exit 1
+fi
 test -e "$sync_marker"
 
-# Rotation still has to work on the following run — the file is ours now, which
-# must not be mistaken for the "owned by somebody else" case above.
+# Docker Desktop maps uids for local development. Keep that compatibility only
+# behind an explicit opt-in, including subsequent rotations.
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-rotated' > "$env_file"
-ENV_FILE="$env_file" \
+local_out="$(ALLOW_UNPRIVILEGED_METRICS_TOKEN=1 \
+  PATH="$least_bin:$PATH" \
+  ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
-  PROM_UID="$prom_uid" \
-  PROM_GID="$prom_gid" \
+  PROM_UID=65534 \
+  PROM_GID=65534 \
   SUDO=false \
-  bash "$script" >/dev/null
+  bash "$script")"
 
 test "$(cat "$local_file")" = 'local-dev-rotated'
+printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+test -e "$sync_marker"
 
 echo 'sync-metrics-token regression tests passed'

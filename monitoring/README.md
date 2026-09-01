@@ -162,6 +162,8 @@ Run these on the server, from the repo root, **after** the app stack is up.
    `monitoring/prometheus/metrics_token` as uid `65534` with mode `0600`.
    Passwordless sudo for `install` and `mv` (or running the script as root) is
    required so repeated rotations never try to overwrite a Prometheus-owned file.
+   Docker Desktop users whose containers map the host user may explicitly set
+   `ALLOW_UNPRIVILEGED_METRICS_TOKEN=1`; never use that override on a Linux host.
 
 3. **Publish the database/Redis credentials to the exporters.** They are derived
    from `.env.production`, never hand-copied — `DATABASE_URL` carries Prisma's
