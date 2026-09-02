@@ -58,6 +58,7 @@ public; everything else stays internal.)
 | `chat_message_ack_duration_seconds`                                 | histogram       | `action`                         | Chat handler ACK latency                                          |
 | `chat_broadcast_duration_seconds`                                   | histogram       | `action`                         | Time spent handing events to Socket.IO                            |
 | `chat_connection_events_total` / `chat_connection_rejections_total` | counter         | `event` / `reason`               | Connection churn and rejected connections                         |
+| `chat_auth_failures_total`                                          | counter         | `reason`                         | Bounded authentication rejection reason                           |
 | `circle_cron_runs_total`                                            | counter         | `job`, `result`                  | Scheduled-job runs — catches "running but always failing". `result` is `success` / `failure` / `skipped`; `skipped` is a tick the job's re-entrancy guard turned away and is neither, so it advances no heartbeat and belongs in no failure ratio |
 | `circle_cron_last_success_timestamp_seconds`                        | gauge           | `job`                            | Heartbeat — catches "not running at all"; seeded at process start  |
 | `circle_cron_interval_seconds`                                      | gauge           | `job`                            | Expected period, so one alert rule fits every job                  |
@@ -84,6 +85,27 @@ global user count through Redis or another shared store.
 
 No metric label contains a user ID, conversation ID, or socket ID, so normal
 traffic cannot create an unbounded Prometheus series set.
+
+### Tracing a failed chat connection
+
+Each app socket lifecycle carries a random `ws-...` trace ID. It contains no
+account, conversation, message, token, IP, or device identifier. The same value
+appears in the mobile Sentry `chatConnect` event, the Caddy `/chat-ws` access
+entry, and the backend `ChatGateway` lifecycle entry.
+
+```bash
+# Proxy view: HTTP upgrade status and duration. Query, headers, and IP are removed.
+docker logs --since 10m circle-be-caddy-1 2>&1 | grep ws_proxy_access
+
+# Gateway view: upgrade/auth/admission/ready/closed stage and bounded reason.
+docker logs --since 10m circle-be-blue 2>&1 | grep -E 'ws_(auth|connection)'
+```
+
+Search the copied trace ID in both outputs. Expected event names are
+`ws_proxy_access`, `ws_auth_rejected`, `ws_connection_rejected`,
+`ws_connection_ready`, and `ws_connection_closed`. Rejection reason values are
+closed enums; raw exception messages and handshake credentials are deliberately
+excluded.
 
 **Routes are normalized** to keep cardinality bounded: dynamic segments (UUIDs,
 Mongo ObjectIds, numeric ids) collapse to `:id`, e.g.

@@ -71,6 +71,33 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
   assert.match(caddy, apiFallbackHandle);
 });
 
+test('Caddy emits privacy-safe access logs only for websocket handshakes', () => {
+  const caddy = read('deploy/Caddyfile.admin');
+  const apiBlock = caddy.slice(
+    caddy.indexOf('{$API_DOMAIN}'),
+    caddy.indexOf('{$ADMIN_DOMAIN}'),
+  );
+
+  assert.match(apiBlock, /@chat_ws path \/chat-ws \/chat-ws\/\*/);
+  assert.match(
+    apiBlock,
+    /@chat_ws_traced \{[\s\S]*path \/chat-ws \/chat-ws\/\*[\s\S]*header_regexp connection_trace X-Connection-Trace-Id \^ws-\[a-zA-Z0-9-\]\{8,96\}\$/,
+  );
+  assert.match(
+    apiBlock,
+    /log chat_ws \{[\s\S]*no_hostname[\s\S]*output stdout/,
+  );
+  assert.match(apiBlock, /log_name @chat_ws chat_ws/);
+  assert.match(
+    apiBlock,
+    /log_append @chat_ws_traced traceId \{http\.request\.header\.X-Connection-Trace-Id\}/,
+  );
+  assert.match(apiBlock, /request>uri regexp \\\?\.\*\$ ""/);
+  assert.match(apiBlock, /request>headers delete/);
+  assert.match(apiBlock, /request>remote_ip delete/);
+  assert.match(apiBlock, /request>client_ip delete/);
+});
+
 test('production app env access uses recoverable group-read transactions', () => {
   const compose = read('docker-compose.prod.yml');
   const generator = read('deploy/gen-env.sh');

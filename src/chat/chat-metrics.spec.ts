@@ -7,7 +7,7 @@ describe('ChatMetrics', () => {
     metrics.observeConnectionOpened(3);
     metrics.observeConnectionClosed(2);
     metrics.observeConnectionRejected('per_user_limit');
-    metrics.observeAuthFailure('rejected');
+    metrics.observeAuthFailure('invalid_token');
     metrics.observeEvent('send', 'success');
     metrics.observeEvent('send', 'rate_limited');
     metrics.observeAckDuration('send', 0.025);
@@ -20,7 +20,9 @@ describe('ChatMetrics', () => {
     expect(output).toMatch(
       /chat_connection_rejections_total\{reason="per_user_limit"\}\s+1/,
     );
-    expect(output).toMatch(/chat_auth_failures_total\{reason="rejected"\}\s+1/);
+    expect(output).toMatch(
+      /chat_auth_failures_total\{reason="invalid_token"\}\s+1/,
+    );
     expect(output).toMatch(
       /chat_messages_received_total\{action="send",result="success"\}\s+1/,
     );
