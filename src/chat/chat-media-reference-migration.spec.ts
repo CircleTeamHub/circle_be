@@ -4,7 +4,7 @@ import { resolve } from 'path';
 describe('chat media reference migration', () => {
   const migrationPath = resolve(
     process.cwd(),
-    'prisma/migrations/20260820190000_chat_media_references/migration.sql',
+    'prisma/migrations/20260902000000_chat_media_references/migration.sql',
   );
 
   it('creates and backfills active note-import message references', () => {
