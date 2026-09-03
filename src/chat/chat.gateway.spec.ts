@@ -227,6 +227,60 @@ describe('ChatGateway', () => {
       expect(JSON.stringify(warn.mock.calls)).not.toMatch(/jwt|u1|account/i);
     });
 
+    it('bounds auth-rejection warnings while still counting every failure', () => {
+      // /chat-ws 是公网端点:过期 token 的自动重连客户端能无限触发认证失败。
+      // 指标必须条条都计,日志不能 —— 否则 30MB 日志配额会被冲掉。
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      for (let i = 0; i < 50; i += 1) {
+        const socket = fakeSocket();
+        socket.data.authFailureReason = 'revoked';
+        gateway['observeAuthRejection'](socket as never, `ws-trace-${i}`);
+      }
+
+      expect(metrics.observeAuthFailure).toHaveBeenCalledTimes(50);
+      const rejected = warn.mock.calls.filter(
+        ([record]) =>
+          (record as { event?: string }).event === 'ws_auth_rejected',
+      );
+      expect(rejected).toHaveLength(5);
+      // 压掉的不能无声消失:窗口翻页时汇总补报一次。
+      const base = Date.now();
+      jest.spyOn(Date, 'now').mockReturnValue(base + 61_000);
+      const socket = fakeSocket();
+      socket.data.authFailureReason = 'revoked';
+      gateway['observeAuthRejection'](socket as never, 'ws-next-window');
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'ws_auth_rejected_suppressed',
+          reason: 'revoked',
+          suppressed: 45,
+        }),
+      );
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    it('never samples away an internal auth error', () => {
+      // 'error' 是服务端内部/配置故障,客户端触发不了,条条都要记。
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      for (let i = 0; i < 20; i += 1) {
+        const socket = fakeSocket();
+        socket.data.authFailureReason = 'error';
+        gateway['observeAuthRejection'](socket as never, `ws-err-${i}`);
+      }
+
+      const rejected = warn.mock.calls.filter(
+        ([record]) =>
+          (record as { event?: string }).event === 'ws_auth_rejected',
+      );
+      expect(rejected).toHaveLength(20);
+    });
+
     it('classifies engine upgrade failures without logging raw request data', () => {
       const warn = jest
         .spyOn((gateway as any).logger, 'warn')
@@ -281,6 +335,34 @@ describe('ChatGateway', () => {
       expect(log).toHaveBeenCalledWith({
         event: 'ws_connection_closed',
         stage: 'ready',
+        reason: 'transport_error',
+        traceId: 'ws-header-trace',
+      });
+    });
+
+    it('does not label a rejected connection as ready when it closes', async () => {
+      // disconnect 监听器在全局配额校验和入房之前就装上了。一律记 'ready' 的话,
+      // 被拒的 socket 在生命周期分析里会显示成「接纳成功之后才断开」。
+      const log = jest
+        .spyOn((gateway as any).logger, 'log')
+        .mockImplementation(() => undefined);
+      jest
+        .spyOn((gateway as any).logger, 'error')
+        .mockImplementation(() => undefined);
+      const socket = fakeSocket({ conn: { transport: { name: 'websocket' } } });
+      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.('transport error');
+
+      expect(log).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'ws_connection_ready',
+        }),
+      );
+      expect(log).toHaveBeenCalledWith({
+        event: 'ws_connection_closed',
+        stage: 'pre_ready',
         reason: 'transport_error',
         traceId: 'ws-header-trace',
       });

@@ -188,6 +188,19 @@ export class ChatGateway implements OnModuleDestroy {
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
+  /**
+   * /chat-ws 是公网端点,过期 token 的自动重连客户端和分布式的无效握手流量
+   * 都能无限制地触发认证失败。指标是有界的(固定基数的计数器),日志不是:
+   * 每条失败都 warn 一次,后端 30MB 的日志配额会被迅速轮转掉,真正有用的
+   * 运维记录反而被挤没。按原因采样,压掉的条数在窗口结束时汇总补报一次。
+   * key 空间是 CHAT_AUTH_FAILURE_REASONS 的固定集合,不会无界增长。
+   */
+  private static readonly AUTH_WARN_WINDOW_MS = 60_000;
+  private static readonly AUTH_WARN_PER_WINDOW = 5;
+  private readonly authWarnWindows = new Map<
+    ChatAuthFailureReason,
+    { until: number; emitted: number; suppressed: number }
+  >();
   private revocationSubscribed = false;
   private revocationRetryAttempt = 0;
   private revocationRetryTimer: NodeJS.Timeout | null = null;
@@ -362,7 +375,43 @@ export class ChatGateway implements OnModuleDestroy {
 
   private observeAuthRejection(socket: Socket, traceId: string): void {
     const reason = this.authFailureReason(socket);
+    // 指标每条都记:它基数固定,是「到底发生了多少次」的权威来源。
     this.metrics.observeAuthFailure(reason);
+    // 'error' 是服务端内部/配置故障,客户端触发不了,不能采样掉。
+    if (reason === 'error') {
+      this.logger.warn({
+        event: 'ws_auth_rejected',
+        stage: 'auth',
+        reason,
+        traceId,
+      });
+      return;
+    }
+    const now = Date.now();
+    let window = this.authWarnWindows.get(reason);
+    if (!window || window.until <= now) {
+      // 上一窗口压掉的条数在这里补报一次 —— 采样可以,静默丢弃不行。
+      if (window && window.suppressed > 0) {
+        this.logger.warn({
+          event: 'ws_auth_rejected_suppressed',
+          stage: 'auth',
+          reason,
+          suppressed: window.suppressed,
+          windowMs: ChatGateway.AUTH_WARN_WINDOW_MS,
+        });
+      }
+      window = {
+        until: now + ChatGateway.AUTH_WARN_WINDOW_MS,
+        emitted: 0,
+        suppressed: 0,
+      };
+      this.authWarnWindows.set(reason, window);
+    }
+    if (window.emitted >= ChatGateway.AUTH_WARN_PER_WINDOW) {
+      window.suppressed += 1;
+      return;
+    }
+    window.emitted += 1;
     this.logger.warn({
       event: 'ws_auth_rejected',
       stage: 'auth',
@@ -653,6 +702,11 @@ export class ChatGateway implements OnModuleDestroy {
     // Redis/数据库拖慢；这段窗口里的首条消息要等 ready 后处理,不能被 Socket.IO
     // 当成无人监听的事件直接丢掉。
     let admissionState: 'pending' | 'ready' | 'failed' = 'pending';
+    /**
+     * 关闭日志用的「曾经就绪过吗」。不能拿 admissionState 判断:disconnect
+     * 处理器第一件事就是 failAdmission(),到打日志时它必然是 'failed'。
+     */
+    let reachedReady = false;
     const preReadyQueue: Array<() => Promise<void>> = [];
     let drainingPreReadyQueue = false;
     let conversationIds: string[] = [];
@@ -807,7 +861,11 @@ export class ChatGateway implements OnModuleDestroy {
       this.editLimiter.pruneExpired(userId);
       this.logger.log({
         event: 'ws_connection_closed',
-        stage: 'ready',
+        // 这个监听器在全局配额校验和入房之前就装上了:被 per_user_limit 拒掉、
+        // pre-ready 队列溢出或入房失败的 socket 一样会走到这里。一律记成
+        // 'ready' 会让被拒的连接在生命周期分析里显示成「成功接纳后才断开」,
+        // 从而把接纳成功率算高。
+        stage: reachedReady ? 'ready' : 'pre_ready',
         reason: boundedDisconnectReason(reason),
         traceId,
       });
@@ -884,6 +942,7 @@ export class ChatGateway implements OnModuleDestroy {
       return;
     }
     admissionState = 'ready';
+    reachedReady = true;
     this.logger.log({
       event: 'ws_connection_ready',
       stage: 'ready',
