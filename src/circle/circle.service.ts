@@ -8,6 +8,10 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  isUrlFromStorage,
+  storagePublicObjectBaseFromConfig,
+} from 'src/utils/storage-url';
+import {
   CircleErrorCode,
   MembershipErrorCode,
 } from 'src/common/app-error-codes';
@@ -51,7 +55,7 @@ const MY_CIRCLES_DEFAULT_LIMIT = 100;
 export class CircleService {
   private readonly logger = new Logger(CircleService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly minioPublicUrl: string | null;
+  private readonly storagePublicObjectBase: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -62,7 +66,9 @@ export class CircleService {
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
   ) {
-    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
   }
 
   /**
@@ -72,9 +78,8 @@ export class CircleService {
    * is unconfigured (upload disabled anyway).
    */
   private assertAvatarUrlIsSafe(avatarUrl: string | null | undefined): void {
-    if (!this.minioPublicUrl || !avatarUrl) return;
-    const prefix = this.minioPublicUrl.replace(/\/$/, '');
-    if (avatarUrl !== prefix && !avatarUrl.startsWith(`${prefix}/`)) {
+    if (!this.storagePublicObjectBase || !avatarUrl) return;
+    if (!isUrlFromStorage(avatarUrl, this.storagePublicObjectBase)) {
       throw new BadRequestException({
         message: "avatarUrl must be served from this application's storage",
         errorCode: CircleErrorCode.AvatarUrlInvalid,

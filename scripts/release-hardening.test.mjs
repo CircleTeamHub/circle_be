@@ -71,13 +71,65 @@ test('production carries no OpenIM routing or env residue (self-hosted chat)', (
   assert.match(caddy, apiFallbackHandle);
 });
 
+test('production app env access uses recoverable group-read transactions', () => {
+  const compose = read('docker-compose.prod.yml');
+  const generator = read('deploy/gen-env.sh');
+  const release = read('deploy/release-deploy.sh');
+  const admin = read('deploy/admin-web-deploy.sh');
+  const ci = read('.github/workflows/ci.yml');
+  const deployDocs = read('DEPLOY.md');
+  const runtimeCompatibility = read(
+    'deploy/RELEASE_RUNTIME_COMPATIBILITY',
+  ).trim();
+
+  assert.match(compose, /group_add:[\s\S]*APP_ENV_GID/);
+  assert.equal(runtimeCompatibility, '2');
+  assert.ok(
+    deployDocs.includes(`当前 \`compatibility=${runtimeCompatibility}\``),
+    'rollback docs must name the current runtime compatibility baseline',
+  );
+  assert.match(generator, /validate_private_gid "\$DEPLOY_APP_ENV_GID"/);
+  assert.match(generator, /prepare_empty_secret_file "\$tmp"/);
+  assert.match(generator, /chgrp "\$DEPLOY_APP_ENV_GID" \.env\.production/);
+  assert.match(generator, /chmod 640 \.env\.production/);
+  assert.match(generator, /尚未完成可恢复权限迁移/);
+  assert.match(release, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(release, /\. deploy\/app-env-transaction\.sh/);
+  assert.match(
+    release,
+    /initialize_app_env_transaction[\s\S]*prepare_compose_app_env_gid[\s\S]*recover_interrupted_app_env_transaction/,
+  );
+  assert.match(release, /stage_app_env_for_new_container/);
+  assert.match(release, /restore_legacy_app_env_access/);
+  assert.match(release, /commit_app_env_transaction/);
+  assert.match(admin, /\. deploy\/app-env-preflight\.sh/);
+  assert.match(admin, /prepare_compose_app_env_gid "\$COMPOSE_ENV_FILE"/);
+  assert.match(ci, /Verify both non-root app colors can read the protected env/);
+  assert.match(ci, /fs\.accessSync\('\/app\/\.env\.production',fs\.constants\.R_OK\)/);
+});
+
 test('Caddy switches only between unique blue-green container endpoints', () => {
   const caddy = read('deploy/Caddyfile.admin');
   const deploy = read('deploy/release-deploy.sh');
   const productionCompose = read('docker-compose.prod.yml');
   const releaseCompose = read('docker-compose.release.yml');
   const healthGate = deploy.indexOf('if ! wait_healthy "$standby" 300; then');
-  const cutover = deploy.indexOf('if ! switch_proxy "$standby"; then');
+  const cutover = deploy.indexOf(
+    'switch_proxy "$standby" || switch_proxy_status=$?',
+  );
+  const activeColorPersist = deploy.indexOf(
+    'if ! persist_active_color "$standby"',
+    cutover,
+  );
+  const smokeDecision = deploy.indexOf('if smoke; then', cutover);
+  const transactionCommit = deploy.indexOf(
+    'commit_app_env_transaction',
+    smokeDecision,
+  );
+  const restoreSignals = deploy.indexOf(
+    'restore_release_signals',
+    transactionCommit,
+  );
 
   assert.doesNotMatch(productionCompose, /circle-be-app/);
   assert.doesNotMatch(releaseCompose, /circle-be-app/);
@@ -97,6 +149,15 @@ test('Caddy switches only between unique blue-green container endpoints', () => 
   assert.ok(
     healthGate >= 0 && healthGate < cutover,
     'standby health must precede cutover',
+  );
+  assert.match(
+    deploy.slice(cutover, activeColorPersist),
+    /switch_proxy[\s\S]*cutover_activated=1/,
+  );
+  assert.doesNotMatch(deploy.slice(cutover, smokeDecision), /restore_release_signals/);
+  assert.ok(
+    smokeDecision < transactionCommit && transactionCommit < restoreSignals,
+    'signals must remain deferred until public smoke commits or rolls back',
   );
 });
 
@@ -147,7 +208,7 @@ test('backend release never rebuilds tags and deploys immutable digests', () => 
   assert.match(release, /needs_promotion/);
   assert.match(
     release,
-    /if: \$\{\{ needs\.resolve\.outputs\.needs_promotion == 'true' \}\}/,
+    /needs\.resolve\.outputs\.needs_promotion == 'true' \|\| needs\.resolve\.outputs\.needs_legacy_promotion == 'true'/,
   );
   assert.match(release, /image_ref=\$repo@\$digest/);
   assert.match(
@@ -171,13 +232,14 @@ test('backend release gate actions are pinned to full commit SHAs', () => {
   }
 });
 
-test('releasable ARM64 image is scanned before either registry push', () => {
+test('the configured single-platform release image is scanned before either registry push', () => {
   const workflow = read('.github/workflows/build-image.yml');
-  const build = workflow.indexOf('- name: Build and load ARM64 image');
-  const scan = workflow.indexOf('- name: Scan releasable ARM64 image');
+  const build = workflow.indexOf('- name: Build and load release image');
+  const scan = workflow.indexOf('- name: Scan releasable image');
   const push = workflow.indexOf('- name: Push scanned image tags');
 
-  assert.match(workflow, /platforms: linux\/arm64/);
+  assert.match(workflow, /linux\/amd64\|linux\/arm64/);
+  assert.match(workflow, /platforms: \$\{\{ steps\.meta\.outputs\.platform \}\}/);
   assert.match(workflow, /push: false/);
   assert.match(workflow, /load: true/);
   assert.match(
@@ -186,11 +248,11 @@ test('releasable ARM64 image is scanned before either registry push', () => {
   );
   assert.match(
     workflow,
-    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}/,
+    /image-ref: \$\{\{ steps\.meta\.outputs\.repo \}\}:sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/,
   );
   assert.ok(
     build >= 0 && build < scan,
-    'the ARM64 image must be built before scanning',
+    'the release image must be built before scanning',
   );
   assert.ok(
     scan < push,
@@ -293,6 +355,11 @@ test('manual dispatch promotes the commit image when the version image is absent
     `#!/bin/sh
 if [ "$1" = "login" ]; then exit 0; fi
 ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
 case "$ref" in
   *:sha-*) printf '{"digest":"sha256:%064d"}\\n' 0 ;;
   *) exit 1 ;;
@@ -311,6 +378,7 @@ esac
       SHA: 'a'.repeat(40),
       RELEASE_TAG: 'v1.2.3',
       GHCR_TOKEN: 'token',
+      RELEASE_PLATFORM: 'linux/arm64',
       GITHUB_REPOSITORY: 'circleteamhub/circle_be',
       GITHUB_ACTOR: 'release-test',
       GITHUB_OUTPUT: output,
@@ -321,7 +389,212 @@ esac
   const outputs = readFileSync(output, 'utf8');
   assert.match(outputs, /digest=sha256:0{64}/);
   assert.match(outputs, /needs_promotion=true/);
+  assert.match(outputs, /sha_image=.*:sha-a{40}-arm64/);
+  assert.match(outputs, /release_image=.*:v1\.2\.3-arm64/);
   assert.match(outputs, /image_ref=ghcr\.io\/circleteamhub\/circle_be@sha256:0{64}/);
+});
+
+test('tag push resolves each platform image and never overwrites a mismatched version tag', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-tag-push-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const expectedDigest = `sha256:${'1'.repeat(64)}`;
+  const conflictingDigest = `sha256:${'2'.repeat(64)}`;
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+format="$6"
+if printf '%s' "$format" | grep -q 'Image'; then
+  printf '{"os":"linux","architecture":"%s"}\n' "$RELEASE_ARCH"
+  exit 0
+fi
+case "$ref" in
+  *:sha-*) printf '{"digest":"${expectedDigest}"}\\n' ;;
+  *:v*)
+    case "\${TAG_STATE:-absent}" in
+      absent) exit 1 ;;
+      same) printf '{"digest":"${expectedDigest}"}\\n' ;;
+      mismatch) printf '{"digest":"${conflictingDigest}"}\\n' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (arch, tagState) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'push',
+        SHA: 'a'.repeat(40),
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: `linux/${arch}`,
+        RELEASE_ARCH: arch,
+        TAG_STATE: tagState,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, `${arch}-${tagState}-output`),
+      },
+    });
+
+  for (const arch of ['arm64', 'amd64']) {
+    const absent = run(arch, 'absent');
+    assert.equal(absent.status, 0, absent.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-absent-output`), 'utf8'),
+      new RegExp(
+        `release_image=.*:v1\\.2\\.3-${arch}\\n[\\s\\S]*needs_promotion=true[\\s\\S]*legacy_release_image=.*:v1\\.2\\.3[\\s\\S]*needs_legacy_promotion=true`,
+      ),
+    );
+
+    const same = run(arch, 'same');
+    assert.equal(same.status, 0, same.stderr);
+    assert.match(
+      readFileSync(join(directory, `${arch}-same-output`), 'utf8'),
+      /needs_promotion=false/,
+    );
+
+    const mismatch = run(arch, 'mismatch');
+    assert.notEqual(mismatch.status, 0);
+    assert.match(mismatch.stderr, /Refusing to overwrite/);
+  }
+});
+
+test('platform changes cannot overwrite commit or version image tags', () => {
+  const build = read('.github/workflows/build-image.yml');
+  const release = read('.github/workflows/release.yml');
+
+  assert.match(build, /sha-\$\{\{ github\.sha \}\}-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /main-\$\{\{ steps\.meta\.outputs\.arch \}\}/);
+  assert.match(build, /\$\{\{ steps\.meta\.outputs\.repo \}\}:main\n/);
+  assert.match(build, /docker push "\$LEGACY_MAIN_IMAGE"/);
+  assert.match(release, /sha_image="\$repo:sha-\$SHA-\$arch"/);
+  assert.match(release, /release_image="\$repo:\$RELEASE_TAG-\$arch"/);
+  assert.match(release, /legacy_release_image="\$repo:\$RELEASE_TAG"/);
+  assert.match(release, /NEEDS_LEGACY_PROMOTION/);
+
+  const cleanup = read('.github/workflows/cleanup-images.yml');
+  assert.match(cleanup, /\.tags \| index\("main"\) \| not/);
+
+  const sha = 'a'.repeat(40);
+  const refs = ['arm64', 'amd64'].map((arch) => ({
+    commit: `sha-${sha}-${arch}`,
+    version: `v1.2.3-${arch}`,
+  }));
+  assert.notEqual(refs[0].commit, refs[1].commit);
+  assert.notEqual(refs[0].version, refs[1].version);
+});
+
+test('manual dispatch accepts only platform-compatible legacy image tags', (t) => {
+  const release = read('.github/workflows/release.yml');
+  const { script: workflowScript } = workflowRunScript(
+    release,
+    'Resolve immutable image',
+    '\n  promote:',
+  );
+  const script = workflowScript.replace(
+    '${GITHUB_REPOSITORY,,}',
+    '$GITHUB_REPOSITORY',
+  );
+  const directory = mkdtempSync(join(tmpdir(), 'circle-legacy-release-image-'));
+  const bin = join(directory, 'bin');
+  mkdirSync(bin);
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const sha = 'a'.repeat(40);
+
+  writeFileSync(
+    join(bin, 'docker'),
+    `#!/bin/sh
+if [ "$1" = "login" ]; then exit 0; fi
+ref="$4"
+format="$6"
+case "$ref" in
+  *:v1.2.3) [ "\${LEGACY_AVAILABLE:-both}" != "sha" ] || exit 1 ;;
+  *:sha-${sha}) [ "\${LEGACY_AVAILABLE:-both}" != "release" ] || exit 1 ;;
+  *) exit 1 ;;
+esac
+case "$format" in
+  *Image*) printf '{"os":"linux","architecture":"%s"}\n' "\${LEGACY_ARCH:-arm64}" ;;
+  *)
+    case "$ref" in
+      *:sha-${sha}) digest="\${LEGACY_SHA_DIGEST:-7}" ;;
+      *) digest="\${LEGACY_RELEASE_DIGEST:-7}" ;;
+    esac
+    printf '{"digest":"sha256:%064d"}\n' "$digest"
+    ;;
+esac
+`,
+  );
+  chmodSync(join(bin, 'docker'), 0o755);
+
+  const run = (legacyArch, outputName, overrides = {}) =>
+    spawnSync('/bin/bash', ['-c', script], {
+      cwd: directory,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        EVENT_NAME: 'workflow_dispatch',
+        SHA: sha,
+        RELEASE_TAG: 'v1.2.3',
+        GHCR_TOKEN: 'token',
+        RELEASE_PLATFORM: 'linux/arm64',
+        LEGACY_ARCH: legacyArch,
+        GITHUB_REPOSITORY: 'circleteamhub/circle_be',
+        GITHUB_ACTOR: 'release-test',
+        GITHUB_OUTPUT: join(directory, outputName),
+        ...overrides,
+      },
+    });
+
+  const compatible = run('arm64', 'compatible-output');
+  assert.equal(compatible.status, 0, compatible.stderr);
+  const outputs = readFileSync(join(directory, 'compatible-output'), 'utf8');
+  assert.match(outputs, /release_image=.*:v1\.2\.3$/m);
+  assert.match(outputs, /needs_promotion=false/);
+
+  const shaOnly = run('arm64', 'sha-only-output', {
+    LEGACY_AVAILABLE: 'sha',
+  });
+  assert.equal(shaOnly.status, 0, shaOnly.stderr);
+  const shaOnlyOutputs = readFileSync(
+    join(directory, 'sha-only-output'),
+    'utf8',
+  );
+  assert.match(shaOnlyOutputs, new RegExp(`sha_image=.*:sha-${sha}$`, 'm'));
+  assert.match(shaOnlyOutputs, /release_image=.*:v1\.2\.3-arm64$/m);
+  assert.match(shaOnlyOutputs, /needs_promotion=true/);
+
+  const mismatch = run('arm64', 'mismatch-output', {
+    LEGACY_RELEASE_DIGEST: '7',
+    LEGACY_SHA_DIGEST: '8',
+  });
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /Refusing mismatched legacy release image/);
+
+  const incompatible = run('amd64', 'incompatible-output');
+  assert.notEqual(incompatible.status, 0);
+  assert.match(incompatible.stderr, /is linux\/amd64, expected linux\/arm64/);
 });
 
 test('workflow stages and activates only through the restricted release protocol', () => {
@@ -332,6 +605,8 @@ test('workflow stages and activates only through the restricted release protocol
     /circle-release stage-v2 \$STAGED_RELEASE_NAME \$manifest_b64 \$signature_b64/,
   );
   assert.match(release, /circle-release activate-v2 \$STAGED_RELEASE_NAME/);
+  assert.match(release, /circle-release capabilities/);
+  assert.match(release, /release-gate=1 launcher-runtime=1/);
   // 签名是这一版的信任根:少了它,服务器只能凭"谁连上来"判断发布包真伪。
   assert.match(release, /openssl dgst -sha256 -sign/);
   assert.match(release, /archive_sha256=/);
@@ -351,6 +626,7 @@ test('server ForceCommand accepts no general shell or launcher replacement comma
   assert.match(gate, /command_parts\[0\].*circle-release/);
   assert.match(gate, /stage-v2\) stage_release/);
   assert.match(gate, /activate-v2\) activate_release/);
+  assert.match(gate, /capabilities\) release_capabilities/);
   assert.match(gate, /! -w "\$LAUNCHER"/);
   assert.match(gate, /exec env -i/);
   assert.doesNotMatch(gate, /eval /);
@@ -434,6 +710,9 @@ test('backend CI blocks release contract regressions', () => {
   assert.match(ci, /node --test scripts\/release-hardening\.test\.mjs/);
   assert.match(ci, /bash test\/release-deploy\.spec\.sh/);
   assert.match(ci, /bash test\/release-launcher\.spec\.sh/);
+  assert.match(ci, /bash test\/app-env-primitives\.spec\.sh/);
+  assert.match(ci, /bash test\/gen-env-legacy-guard\.spec\.sh/);
+  assert.match(ci, /bash test\/gen-env-existing\.spec\.sh/);
   assert.match(ci, /bash test\/release-force-command\.spec\.sh/);
 });
 
@@ -448,6 +727,12 @@ test('every main push creates the exact-SHA CI run required by release', () => {
   assert.match(push, /branches:\s*\n\s*- main/);
   assert.doesNotMatch(push, /paths-ignore:/);
   assert.match(pullRequest, /paths-ignore:/);
+});
+
+test('the mounted Caddy entrypoint is always checked out with Linux line endings', () => {
+  const attributes = read('.gitattributes');
+
+  assert.match(attributes, /^deploy\/caddy-entrypoint\.sh text eol=lf$/m);
 });
 
 test('release selection and active-color state fail closed', () => {

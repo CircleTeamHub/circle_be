@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import type { ObjectStoreStatus } from 'src/utils/storage-url';
 
 const logger = new Logger('HealthEndpoint');
 
@@ -28,7 +29,7 @@ export interface HealthRedis {
  * as if the fix were live. Nothing else surfaces that gap.
  */
 export interface HealthObjectStore {
-  objectStoreStatus(): 'ok' | 'policy-unconfirmed' | 'disabled';
+  objectStoreStatus(): ObjectStoreStatus;
 }
 
 export interface ReadinessDependencies {

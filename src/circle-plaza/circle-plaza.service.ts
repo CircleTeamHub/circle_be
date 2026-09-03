@@ -7,6 +7,10 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  isUrlFromStorage,
+  storagePublicObjectBaseFromConfig,
+} from 'src/utils/storage-url';
+import {
   CirclePost,
   Prisma,
   ReportReviewStatus,
@@ -88,7 +92,7 @@ const CIRCLE_POST_PUBLISH_FANOUT_CAP = 500;
 export class CirclePlazaService {
   private readonly logger = new Logger(CirclePlazaService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly minioPublicUrl: string | null;
+  private readonly storagePublicObjectBase: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -99,7 +103,9 @@ export class CirclePlazaService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly avatarFrames: AvatarFrameService,
   ) {
-    this.minioPublicUrl = this.config.get<string>('MINIO_PUBLIC_URL') ?? null;
+    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
   }
 
   // 逗号分隔的过滤列表最多接受这么多项，防止恶意超长入参生成超大 IN 子句。
@@ -185,10 +191,9 @@ export class CirclePlazaService {
    * a cross-user tracking / phishing vector. Skipped when MinIO is unconfigured.
    */
   private assertImagesAreSafe(images: string[] | undefined): void {
-    if (!this.minioPublicUrl || !images?.length) return;
-    const prefix = this.minioPublicUrl.replace(/\/$/, '');
+    if (!this.storagePublicObjectBase || !images?.length) return;
     for (const image of images) {
-      if (image !== prefix && !image.startsWith(`${prefix}/`)) {
+      if (!isUrlFromStorage(image, this.storagePublicObjectBase)) {
         throw new BadRequestException(
           "post images must be served from this application's storage",
         );

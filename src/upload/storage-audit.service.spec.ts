@@ -23,6 +23,7 @@ describe('StorageAuditService', () => {
       traceComment: emptyRows(),
       circlePost: emptyRows(),
       chatMessage: emptyRows(),
+      supportRechargePaymentCode: emptyRows(),
     };
     for (const [model, rows] of Object.entries(options.referenced ?? {})) {
       (prisma as Record<string, { findMany: jest.Mock }>)[model].findMany = jest
@@ -32,10 +33,12 @@ describe('StorageAuditService', () => {
     const listObjects = jest.fn(async (prefix: string) => ({
       objects: options.objects?.[prefix] ?? [],
     }));
+    const objectKeyFromPublicUrl = jest.fn(() => null);
     const service = new StorageAuditService(
       prisma as never,
       {
         listObjects,
+        objectKeyFromPublicUrl,
       } as never,
     );
     return { service, listObjects, prisma };
@@ -80,6 +83,26 @@ describe('StorageAuditService', () => {
     expect(
       scannedPrefixes.some((p: string) => p.startsWith('note-exports')),
     ).toBe(false);
+  });
+
+  it('keeps configured recharge payment codes out of the orphan list', async () => {
+    const { service } = harness({
+      objects: {
+        'chat/': [
+          { key: 'chat/admin-1/payment.png', size: 20, lastModified: old },
+        ],
+      },
+      referenced: {
+        supportRechargePaymentCode: [
+          {
+            id: 'code-1',
+            objectKey: 'chat/admin-1/payment.png',
+          },
+        ],
+      },
+    });
+
+    expect((await service.audit(now))?.orphanCount).toBe(0);
   });
 
   it('media types without a field map never leak keys into the reference set', async () => {
@@ -136,6 +159,26 @@ describe('StorageAuditService', () => {
         user: [
           {
             avatarUrl: 'http://192.168.1.65:9000/circle/avatars/a.jpg',
+            avatarFrame: null,
+            cover: null,
+          },
+        ],
+      },
+    });
+
+    expect((await service.audit(now))?.orphanCount).toBe(0);
+  });
+
+  it('keeps the first path segment for virtual-hosted COS URLs', async () => {
+    const { service } = harness({
+      objects: {
+        'avatars/': [{ key: 'avatars/u1/a.jpg', size: 1, lastModified: old }],
+      },
+      referenced: {
+        user: [
+          {
+            avatarUrl:
+              'https://windnote-123.cos.ap-tokyo.myqcloud.com/avatars/u1/a.jpg',
             avatarFrame: null,
             cover: null,
           },

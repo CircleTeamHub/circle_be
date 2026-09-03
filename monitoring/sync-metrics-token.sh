@@ -23,6 +23,8 @@ TOKEN_FILE="${TOKEN_FILE:-monitoring/prometheus/metrics_token}"
 PROM_UID="${PROM_UID:-65534}"
 PROM_GID="${PROM_GID:-$PROM_UID}"
 SUDO="${SUDO:-sudo}"
+DOCKER="${DOCKER:-docker}"
+METRICS_SYNC_MARKER="${METRICS_SYNC_MARKER:-.release/metrics-token-sync-required}"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "❌ $ENV_FILE not found. Run deploy/gen-env.sh first (see DEPLOY.md §4)." >&2
@@ -122,7 +124,42 @@ if [ "$unprivileged" = "1" ]; then
   echo "⚠️  Prometheus runs as uid $PROM_UID and cannot read a 0600 file owned by"
   echo "    $(id -un). Unless your Docker maps users (Docker Desktop does), run:"
   echo "      sudo chown $PROM_UID:$PROM_GID $TOKEN_FILE"
+  echo "⚠️  保留 ${METRICS_SYNC_MARKER}；修复权限后重新运行本脚本。"
+  exit 0
 fi
 
-echo "   Recreate Prometheus to bind the rotated token inode:"
-echo "     docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml up -d --force-recreate prometheus"
+if ! "$DOCKER" info >/dev/null 2>&1; then
+  echo "❌ Docker is unavailable; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+fi
+prometheus_container_id="$("$DOCKER" ps -aq --filter 'name=^/circle-prometheus$')" || {
+  echo "❌ Could not query the Prometheus container; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+}
+if [ -z "$prometheus_container_id" ]; then
+  rm -f "$METRICS_SYNC_MARKER"
+  echo "✅ Prometheus is not installed yet; the first start will bind the new token inode"
+  exit 0
+fi
+
+echo "==> Recreating Prometheus to bind the rotated token inode"
+if ! "$DOCKER" compose \
+  -f monitoring/docker-compose.yml \
+  -f monitoring/docker-compose.prod.yml \
+  up -d --force-recreate prometheus; then
+  echo "❌ Prometheus recreate failed; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+fi
+prometheus_id="$("$DOCKER" compose \
+  -f monitoring/docker-compose.yml \
+  -f monitoring/docker-compose.prod.yml \
+  ps --status running -q prometheus)" || {
+  echo "❌ Could not verify Prometheus after recreate; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+}
+if [ -z "$prometheus_id" ]; then
+  echo "❌ Prometheus is not running after recreate; preserving $METRICS_SYNC_MARKER." >&2
+  exit 1
+fi
+rm -f "$METRICS_SYNC_MARKER"
+echo "✅ Prometheus recreated; cleared metrics sync marker"

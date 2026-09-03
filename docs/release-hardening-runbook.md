@@ -98,6 +98,23 @@ sudo install -o root -g root -m 0555 \
   "$DEPLOY_ROOT/.release/release-launcher.sh"
 ```
 
+When these two root-owned files change, upgrade them atomically before enabling
+the matching release workflow. The workflow now calls `circle-release capabilities`
+before uploading anything, so an old installation fails without touching the live tree.
+
+```bash
+sudo install -o root -g root -m 0555 \
+  "$REPO/deploy/release-force-command.sh" \
+  /usr/local/bin/circle-release-force-command.next
+sudo install -o root -g root -m 0555 \
+  "$REPO/deploy/release-launcher.sh" \
+  "$DEPLOY_ROOT/.release/release-launcher.sh.next"
+sudo mv /usr/local/bin/circle-release-force-command.next \
+  /usr/local/bin/circle-release-force-command
+sudo mv "$DEPLOY_ROOT/.release/release-launcher.sh.next" \
+  "$DEPLOY_ROOT/.release/release-launcher.sh"
+```
+
 ### 3. 配置 GitHub 的密钥与变量
 
 在仓库 *Settings → Secrets and variables → Actions*。`RELEASE_SIGNING_PRIVATE_KEY` 是这次

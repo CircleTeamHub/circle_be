@@ -12,7 +12,11 @@ type AuditSnapshot = Record<string, unknown> | Record<string, unknown>[];
  * 之前只有写入端认识 support_agents、读取端签名写死 'user',结果是客服配置的审计
  * 只进不出。新增一类审计目标时,这个联合类型会同时把两端带上。
  */
-export type AuditTargetType = 'user' | 'support_agents';
+export type AuditTargetType =
+  | 'user'
+  | 'support_agents'
+  | 'support_recharge_payment_code'
+  | 'support_recharge_order';
 
 export type AuditInput = {
   actorId: string;

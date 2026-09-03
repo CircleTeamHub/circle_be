@@ -232,6 +232,11 @@ export function createEnvValidationSchema(
     MINIO_SECRET_KEY: Joi.string().optional(),
     MINIO_BUCKET: Joi.string().optional(),
     MINIO_PUBLIC_URL: Joi.string().uri().optional(),
+    OBJECT_STORAGE_REGION: Joi.string()
+      .pattern(/^[a-z0-9-]+$/)
+      .default('us-east-1'),
+    OBJECT_STORAGE_FORCE_PATH_STYLE: Joi.boolean().default(true),
+    OBJECT_STORAGE_MANAGE_BUCKET: Joi.boolean().default(true),
     // Comma-separated list of allowed CORS origins. Required in production.
     ALLOWED_ORIGINS: Joi.when('NODE_ENV', {
       is: 'production',

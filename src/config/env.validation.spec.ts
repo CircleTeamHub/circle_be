@@ -42,6 +42,44 @@ describe('createEnvValidationSchema', () => {
     expect(value.CALL_ENABLE_VIDEO).toBe(true);
   });
 
+  it('normalizes backwards-compatible object storage defaults', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value.OBJECT_STORAGE_REGION).toBe('us-east-1');
+    expect(value.OBJECT_STORAGE_FORCE_PATH_STYLE).toBe(true);
+    expect(value.OBJECT_STORAGE_MANAGE_BUCKET).toBe(true);
+  });
+
+  it('accepts Tencent COS virtual-hosted object storage configuration', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+      MINIO_ACCESS_KEY: 'cos-secret-id',
+      MINIO_SECRET_KEY: 'cos-secret-key',
+      MINIO_BUCKET: 'windnote-1234567890',
+      MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+      OBJECT_STORAGE_REGION: 'ap-tokyo',
+      OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+      OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+    };
+
+    const { error, value } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+    expect(value).toMatchObject({
+      OBJECT_STORAGE_REGION: 'ap-tokyo',
+      OBJECT_STORAGE_FORCE_PATH_STYLE: false,
+      OBJECT_STORAGE_MANAGE_BUCKET: false,
+    });
+  });
+
   it('normalizes referral reward defaults', () => {
     const env = {
       ...baseEnv,

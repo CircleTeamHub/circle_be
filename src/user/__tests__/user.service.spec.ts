@@ -612,13 +612,58 @@ describe('UserService', () => {
 
     it('passes the update through when URL fields match the storage prefix', async () => {
       const guarded = await buildService({
-        configGet: () => 'http://10.0.0.195:9000',
+        configGet: (key) =>
+          ({
+            MINIO_PUBLIC_URL: 'http://10.0.0.195:9000',
+            MINIO_BUCKET: 'circle',
+            OBJECT_STORAGE_FORCE_PATH_STYLE: 'true',
+          })[key] ?? null,
       });
 
       await guarded.update('user-1', {
         avatarUrl: 'http://10.0.0.195:9000/circle/avatars/me.png',
       });
       expect(prisma.user.update).toHaveBeenCalled();
+    });
+
+    it('accepts the virtual-hosted COS URL returned by presign', async () => {
+      const guarded = await buildService({
+        configGet: (key) =>
+          ({
+            MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+            MINIO_BUCKET: 'windnote-1234567890',
+            OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          })[key] ?? null,
+      });
+
+      await guarded.update('user-1', {
+        avatarUrl:
+          'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/avatars/user-1/me.png',
+      });
+
+      expect(prisma.user.update).toHaveBeenCalled();
+    });
+
+    it('keeps URL validation enabled when public URL falls back to the endpoint', async () => {
+      const guarded = await buildService({
+        configGet: (key) =>
+          ({
+            MINIO_ENDPOINT: 'http://10.0.0.195:9000',
+            MINIO_BUCKET: 'circle',
+            OBJECT_STORAGE_FORCE_PATH_STYLE: 'true',
+          })[key] ?? null,
+      });
+
+      await expect(
+        guarded.update('user-1', {
+          avatarUrl: 'https://evil.example.com/avatars/me.png',
+        }),
+      ).rejects.toThrow(BadRequestException);
+      await guarded.update('user-1', {
+        avatarUrl: 'http://10.0.0.195:9000/circle/avatars/me.png',
+      });
+
+      expect(prisma.user.update).toHaveBeenCalledTimes(1);
     });
 
     it('skips URL safety check when MINIO is not configured', async () => {

@@ -9,9 +9,9 @@ RUN apt-get update \
 
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
-# The migrate service runs this build stage directly with `npx prisma migrate
-# deploy`, so its bundled npm must receive the same CVE fixes as the runtime
-# image. Pin the CLI for reproducible builds.
+# The migrate service runs the lockfile-installed Prisma binary from this stage.
+# Pin npm so dependency installation stays reproducible while this build-only
+# stage exists.
 RUN npm install -g npm@12.0.2 --no-audit --no-fund
 # npm ci also runs the postinstall `prisma generate` step.
 RUN npm ci
@@ -25,8 +25,15 @@ FROM node:22-slim AS production-stage
 ENV NODE_ENV=production
 WORKDIR /app
 
+# Prisma detects the OpenSSL ABI at runtime for migrations and query engines.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Run as non-root.
-RUN groupadd --system app && useradd --system --gid app --shell /usr/sbin/nologin app
+RUN groupadd --system app \
+    && useradd --system --gid app --shell /usr/sbin/nologin app \
+    && install -d -o app -g app /app/logs
 
 COPY --from=build-stage --chown=app:app /app/package.json /app/package-lock.json ./
 COPY --from=build-stage --chown=app:app /app/node_modules ./node_modules
@@ -35,19 +42,16 @@ COPY --from=build-stage --chown=app:app /app/prisma ./prisma
 COPY --from=build-stage --chown=app:app /app/prisma.config.ts ./
 COPY --from=build-stage --chown=app:app /app/src/generated ./src/generated
 
-# Drop devDependencies, then restore just the lockfile-pinned Prisma CLI: the
-# release overlay (docker-compose.release.yml) runs `npx prisma migrate deploy`
-# from this exact image, and deploys must not download tooling from npm at
-# runtime. Installing at build time also fetches the schema engine through the
-# package's postinstall, so migrations on the server stay npm-offline.
+# Drop devDependencies, then restore just the lockfile-pinned Prisma CLI.
+# Migrations execute its local binary directly, so the final image can remove
+# npm/npx after the build and keep the server fully offline during deployment.
+# Installing Prisma here also fetches its schema engine through postinstall.
 RUN npm prune --omit=dev \
     && npm install --no-save --omit=dev \
         "prisma@$(node -p "require('./package-lock.json').packages['node_modules/prisma'].version")" \
-    # 基础镜像自带的 npm CLI 捆绑着带 CVE 的 tar/brace-expansion（Trivy 扫
-    # /usr/local/lib/node_modules/npm）。镜像里 npm/npx 必须保留（release
-    # overlay 用本镜像跑 `npx prisma migrate deploy`），所以就地升级 npm 到
-    # 固定到已验证版本，让捆绑依赖吃到修复版且保持构建可复现。
-    && npm install -g npm@12.0.2 --no-audit --no-fund
+    && ./node_modules/.bin/prisma --version \
+    && rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 
 USER app
 

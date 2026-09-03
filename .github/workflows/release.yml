@@ -1,11 +1,12 @@
 # Promote half of the build-once-promote release architecture.
 #
 # Pushing a `v*` tag (or dispatching this workflow with an existing tag)
-# releases that commit to the Oracle ARM server:
+# releases that commit to the configured server platform:
 #
 #   resolve   — pin the tag to a commit, require it to be on main with a green
 #               CI run, and resolve an existing immutable registry manifest
-#   promote   — on tag push only, stamp the prebuilt sha image with the version tag
+#   promote   — stamp the prebuilt platform-specific sha image with a matching
+#               platform-specific version image tag
 #               (`buildx imagetools create` — a manifest copy, no rebuild), so
 #               the deployed artifact is byte-identical to what CI validated
 #   deploy    — stage the tagged repo through the server ForceCommand protocol,
@@ -16,8 +17,10 @@
 #   publish   — GitHub Release with generated notes (tag pushes only)
 #   notify    — Discord, success or failure, always
 #
-# Rollback / redeploy: run this workflow manually (workflow_dispatch) with any
-# previously released tag. `downtime: true` switches the server script to
+# Rollback / redeploy: run this workflow manually with a tag whose
+# RELEASE_RUNTIME_COMPATIBILITY meets the trusted main contract. Pre-contract
+# tags require restoring their matching host/database backup instead.
+# `downtime: true` switches the server script to
 # stop-first mode for migrations that are not backward-compatible.
 #
 # One-time setup (repo Settings) is documented in DEPLOY.md §6:
@@ -33,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing v* tag to (re)deploy — rollback = dispatch an older tag"
+        description: "Compatible v* tag to (re)deploy; pre-runtime-contract tags are rejected"
         required: true
         type: string
       downtime:
@@ -69,11 +72,14 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       sha: ${{ steps.verify.outputs.sha }}
+      main_sha: ${{ steps.verify.outputs.main_sha }}
       sha_image: ${{ steps.image.outputs.sha_image }}
       release_image: ${{ steps.image.outputs.release_image }}
       digest: ${{ steps.image.outputs.digest }}
       image_ref: ${{ steps.image.outputs.image_ref }}
       needs_promotion: ${{ steps.image.outputs.needs_promotion }}
+      legacy_release_image: ${{ steps.image.outputs.legacy_release_image }}
+      needs_legacy_promotion: ${{ steps.image.outputs.needs_legacy_promotion }}
       schema_compatibility: ${{ steps.compatibility.outputs.level }}
     steps:
       - name: Determine release tag
@@ -155,12 +161,30 @@ jobs:
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
+          MAIN_SHA="$(git rev-parse origin/main)"
           if ! git merge-base --is-ancestor "$SHA" origin/main; then
             echo "Tag ${{ steps.tag.outputs.tag }} ($SHA) is not an ancestor of origin/main." >&2
             echo "Releases must point at commits that went through main (PR + full CI)." >&2
             exit 1
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manual rollback runtime compatibility
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          target_runtime="$(cat deploy/RELEASE_RUNTIME_COMPATIBILITY 2>/dev/null || printf 0)"
+          trusted_runtime="$(git show origin/main:deploy/RELEASE_RUNTIME_COMPATIBILITY 2>/dev/null || printf 0)"
+          if [[ ! "$target_runtime" =~ ^[0-9]+$ ]] || [[ ! "$trusted_runtime" =~ ^[0-9]+$ ]]; then
+            echo "Invalid release runtime compatibility metadata." >&2
+            exit 1
+          fi
+          if (( target_runtime < trusted_runtime )); then
+            echo "Target runtime compatibility $target_runtime is below trusted tooling requirement $trusted_runtime." >&2
+            echo "The target image cannot safely use the current Compose, health-check, and proxy contract." >&2
+            exit 1
+          fi
 
       - name: Verify CI succeeded for this commit
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.force) }}
@@ -178,6 +202,26 @@ jobs:
           fi
           echo "CI is green for $SHA"
 
+      # Manual rollback overlays operational files from origin/main. Unlike the
+      # historical target tag, this exact tooling commit must always have a
+      # successful main-push CI run; force only handles expired CI history for
+      # the old application commit and must never authorize unverified tooling.
+      - name: Verify CI succeeded for trusted deployment tooling
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.verify.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&status=completed&per_page=1" \
+            --jq '.workflow_runs[0].conclusion // ""')"
+          if [ "$conclusion" != "success" ]; then
+            echo "CI for trusted deployment tooling $SHA is '${conclusion:-not found}', not 'success'." >&2
+            echo "Wait for or fix main CI before deploying a manual rollback." >&2
+            exit 1
+          fi
+          echo "CI is green for trusted deployment tooling $SHA"
+
       - name: Resolve immutable image
         id: image
         env:
@@ -185,16 +229,41 @@ jobs:
           SHA: ${{ steps.verify.outputs.sha }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PLATFORM: ${{ vars.RELEASE_PLATFORM || 'linux/arm64' }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY,,}"
-          sha_image="$repo:sha-$SHA"
-          release_image="$repo:$RELEASE_TAG"
+          case "$RELEASE_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *) echo "Unsupported RELEASE_PLATFORM: $RELEASE_PLATFORM" >&2; exit 1 ;;
+          esac
+          arch="${RELEASE_PLATFORM#linux/}"
+          sha_image="$repo:sha-$SHA-$arch"
+          release_image="$repo:$RELEASE_TAG-$arch"
+          legacy_sha_image="$repo:sha-$SHA"
+          legacy_release_image="$repo:$RELEASE_TAG"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
           digest_of() {
             docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
               jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+          }
+
+          platform_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
+              jq -er '"\(.os)/\(.architecture)"'
+          }
+
+          require_release_platform() {
+            local image="$1" actual
+            actual="$(platform_of "$image")" || {
+              echo "Could not determine platform for legacy image $image." >&2
+              return 1
+            }
+            if [ "$actual" != "$RELEASE_PLATFORM" ]; then
+              echo "Legacy image $image is $actual, expected $RELEASE_PLATFORM." >&2
+              return 1
+            fi
           }
 
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -205,11 +274,27 @@ jobs:
               fi
               needs_promotion=false
             else
-              if ! digest="$(digest_of "$sha_image")"; then
-                echo "Neither release image $release_image nor prebuilt commit image $sha_image exists." >&2
+              if digest="$(digest_of "$sha_image" 2>/dev/null)"; then
+                needs_promotion=true
+              elif digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_release_image"
+                if legacy_sha_digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                  require_release_platform "$legacy_sha_image"
+                  if [ "$legacy_sha_digest" != "$digest" ]; then
+                    echo "Refusing mismatched legacy release image: $legacy_release_image ($digest != $legacy_sha_digest)." >&2
+                    exit 1
+                  fi
+                fi
+                release_image="$legacy_release_image"
+                needs_promotion=false
+              elif digest="$(digest_of "$legacy_sha_image" 2>/dev/null)"; then
+                require_release_platform "$legacy_sha_image"
+                sha_image="$legacy_sha_image"
+                needs_promotion=true
+              else
+                echo "No platform-specific or compatible legacy image exists for $RELEASE_TAG ($SHA)." >&2
                 exit 1
               fi
-              needs_promotion=true
             fi
           else
             if ! digest="$(digest_of "$sha_image")"; then
@@ -228,12 +313,27 @@ jobs:
             fi
           fi
 
+          needs_legacy_promotion=false
+          if [ "$release_image" != "$legacy_release_image" ]; then
+            if legacy_release_digest="$(digest_of "$legacy_release_image" 2>/dev/null)"; then
+              require_release_platform "$legacy_release_image"
+              if [ "$legacy_release_digest" != "$digest" ]; then
+                echo "Refusing to overwrite legacy release alias: $legacy_release_image ($legacy_release_digest != $digest)." >&2
+                exit 1
+              fi
+            else
+              needs_legacy_promotion=true
+            fi
+          fi
+
           {
             echo "sha_image=$sha_image"
             echo "release_image=$release_image"
             echo "digest=$digest"
             echo "image_ref=$repo@$digest"
             echo "needs_promotion=$needs_promotion"
+            echo "legacy_release_image=$legacy_release_image"
+            echo "needs_legacy_promotion=$needs_legacy_promotion"
           } >> "$GITHUB_OUTPUT"
 
   # Stamp the sha image with the immutable version tag. A manifest copy inside
@@ -243,7 +343,7 @@ jobs:
     runs-on: ubuntu-latest
     name: "Promote image to version tag"
     needs: [resolve]
-    if: ${{ needs.resolve.outputs.needs_promotion == 'true' }}
+    if: ${{ needs.resolve.outputs.needs_promotion == 'true' || needs.resolve.outputs.needs_legacy_promotion == 'true' }}
     timeout-minutes: 10
     permissions:
       packages: write
@@ -260,14 +360,23 @@ jobs:
           EXPECTED_DIGEST: ${{ needs.resolve.outputs.digest }}
           SHA_IMAGE: ${{ needs.resolve.outputs.sha_image }}
           RELEASE_IMAGE: ${{ needs.resolve.outputs.release_image }}
+          LEGACY_RELEASE_IMAGE: ${{ needs.resolve.outputs.legacy_release_image }}
+          NEEDS_PROMOTION: ${{ needs.resolve.outputs.needs_promotion }}
+          NEEDS_LEGACY_PROMOTION: ${{ needs.resolve.outputs.needs_legacy_promotion }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create -t "$RELEASE_IMAGE" "$SHA_IMAGE"
-          actual="$(docker buildx imagetools inspect "$RELEASE_IMAGE" --format '{{json .Manifest}}' | jq -er '.digest')"
-          if [ "$actual" != "$EXPECTED_DIGEST" ]; then
-            echo "Promoted digest mismatch: $actual != $EXPECTED_DIGEST" >&2
-            exit 1
-          fi
+          for promotion in \
+            "$NEEDS_PROMOTION:$RELEASE_IMAGE" \
+            "$NEEDS_LEGACY_PROMOTION:$LEGACY_RELEASE_IMAGE"; do
+            [ "${promotion%%:*}" = "true" ] || continue
+            target="${promotion#*:}"
+            docker buildx imagetools create -t "$target" "$SHA_IMAGE"
+            actual="$(docker buildx imagetools inspect "$target" --format '{{json .Manifest}}' | jq -er '.digest')"
+            if [ "$actual" != "$EXPECTED_DIGEST" ]; then
+              echo "Promoted digest mismatch for $target: $actual != $EXPECTED_DIGEST" >&2
+              exit 1
+            fi
+          done
 
   deploy:
     runs-on: ubuntu-latest
@@ -287,6 +396,43 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ needs.resolve.outputs.tag }}
+
+      # A manual rollback intentionally checks out old application source and
+      # deploys its old immutable image, but must not downgrade the server-side
+      # deployment contract. In particular, pre-group_add Compose revisions
+      # cannot read the current 0640 .env.production bind mount. Pin the exact
+      # main commit verified by the resolve job and overlay only operational
+      # tooling; the target tag keeps its own schema compatibility metadata.
+      - name: Checkout trusted deployment tooling for manual rollback
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.main_sha }}
+          path: .trusted-release-tooling
+          sparse-checkout: |
+            deploy/release-deploy.sh
+            deploy/gen-env.sh
+            deploy/admin-web-deploy.sh
+            deploy/caddy-entrypoint.sh
+            deploy/overlay-trusted-release-tooling.sh
+            deploy/app-env-preflight.sh
+            deploy/app-env-transaction.sh
+            deploy/offsite-backup.sh
+            deploy/Caddyfile.admin
+            monitoring/sync-metrics-token.sh
+            Dockerfile.caddy
+            docker-compose.prod.yml
+            docker-compose.release.yml
+            docker-compose.admin-release.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Overlay trusted deployment tooling for manual rollback
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          bash .trusted-release-tooling/deploy/overlay-trusted-release-tooling.sh \
+            .trusted-release-tooling .
+          rm -rf -- .trusted-release-tooling
 
       - name: Configure SSH
         env:
@@ -310,6 +456,20 @@ jobs:
       # The deployment key has a server-side ForceCommand. It accepts only this
       # bounded stage protocol and the activate protocol below; historical
       # workflow revisions cannot obtain a shell or replace the trusted launcher.
+      - name: Verify server release gate contract
+        env:
+          DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          capabilities="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" "circle-release capabilities")"
+          if [ "$capabilities" != "release-gate=1 launcher-runtime=1" ]; then
+            echo "Server release gate is not upgraded for runtime compatibility: $capabilities" >&2
+            echo "Install the root-owned gate and launcher from DEPLOY.md before releasing." >&2
+            exit 1
+          fi
+
       - name: Stage release on server
         id: stage
         env:

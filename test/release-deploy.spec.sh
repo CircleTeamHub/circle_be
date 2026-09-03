@@ -17,13 +17,16 @@ last_arg() {
 }
 
 new_case() {
-  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH APP_ENV_FILE ENV_STAMP_FAIL MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
+  unset RELEASE_DOWNTIME RELEASE_IRREVERSIBLE_MIGRATION RELEASE_MARKER_PATH RELEASE_SCHEMA_COMPATIBILITY SCHEMA_COMPATIBILITY_PATH RUNTIME_COMPATIBILITY_PATH COMPOSE_ENV_FILE APP_ENV_FILE APP_ENV_GID ENV_STAMP_FAIL KILL_AFTER_ENV_STAGE KILL_BEFORE_CADDY_RELOAD KILL_AFTER_CUTOVER_COMPLETE KILL_AFTER_CADDY_RELOAD KILL_AFTER_CADDY_RELOAD_TARGET TERM_AFTER_CADDY_RELOAD TERM_AFTER_CADDY_RELOAD_TARGET EXPECTED_SMOKE_UPSTREAM IMAGE_MISSING MIGRATE_FAIL CONTRACT_PROBE_STATE START_FAIL HEALTH_FAIL SMOKE_CODE SMOKE_CONTENT_TYPE CADDY_RELOAD_FAIL_TARGET PERSIST_FAIL_COLOR CADDY_NO_RATE_LIMIT || true
   CASE_DIR="$(mktemp -d)"
   export CASE_DIR
   export TEST_STATE_DIR="$CASE_DIR/services"
   export RELEASE_STATE_DIR="$CASE_DIR/release-state"
   export TEST_COMMAND_LOG="$CASE_DIR/commands.log"
+  export COMPOSE_ENV_FILE="$CASE_DIR/.env"
   mkdir -p "$TEST_STATE_DIR" "$RELEASE_STATE_DIR" "$CASE_DIR/bin"
+  printf 'DB_PASSWORD=test-only\n' > "$COMPOSE_ENV_FILE"
+  chmod 600 "$COMPOSE_ENV_FILE"
 
   cat > "$CASE_DIR/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
@@ -100,6 +103,37 @@ if [ "${1:-}" = "compose" ]; then
         printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=$CADDY_RELOAD_FAIL_TARGET"; then
         exit 43
       fi
+      if printf '%s\n' "$*" | grep -q 'caddy reload'; then
+        for arg in "$@"; do
+          case "$arg" in
+            CIRCLE_BE_UPSTREAM=*)
+              printf '%s\n' "${arg#CIRCLE_BE_UPSTREAM=}" > "$CASE_DIR/caddy-upstream"
+              printf 'reload %s\n' "${arg#CIRCLE_BE_UPSTREAM=}" >> "$TEST_COMMAND_LOG"
+              ;;
+          esac
+        done
+      fi
+      if [ "${TERM_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
+        printf '%s\n' "$*" | grep -q 'caddy reload' &&
+        printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=${TERM_AFTER_CADDY_RELOAD_TARGET:-circle-be-green:3000}" &&
+        [ ! -e "$CASE_DIR/term-injected" ]; then
+        if [ "${TERM_AFTER_CADDY_RELOAD_TARGET:-}" != "circle-be-blue:3000" ] ||
+          grep -q '^rollback-pending:' "$RELEASE_STATE_DIR/app-env-transaction/state" 2>/dev/null; then
+          : > "$CASE_DIR/term-injected"
+          kill -TERM "$PPID"
+        fi
+      fi
+      if [ "${KILL_AFTER_CADDY_RELOAD:-0}" = "1" ] &&
+        printf '%s\n' "$*" | grep -q 'caddy reload' &&
+        printf '%s\n' "$*" | grep -q "CIRCLE_BE_UPSTREAM=${KILL_AFTER_CADDY_RELOAD_TARGET:-circle-be-green:3000}" &&
+        [ ! -e "$CASE_DIR/kill-after-cutover-injected" ]; then
+        if [ "${KILL_AFTER_CADDY_RELOAD_TARGET:-}" != "circle-be-blue:3000" ] ||
+          grep -q '^rollback-pending:' "$RELEASE_STATE_DIR/app-env-transaction/state" 2>/dev/null; then
+          : > "$CASE_DIR/kill-after-cutover-injected"
+          kill -KILL "$PPID"
+          exit 137
+        fi
+      fi
       ;;
     *)
       echo "unexpected docker compose command: $subcommand $*" >&2
@@ -109,7 +143,10 @@ if [ "${1:-}" = "compose" ]; then
   exit 0
 fi
 
-if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then exit 0; fi
+if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then
+  [ "${IMAGE_MISSING:-0}" != "1" ]
+  exit
+fi
 if [ "${1:-}" = "inspect" ]; then
   container="$(last_arg "$@")"
   service="${container#cid-}"
@@ -164,6 +201,12 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
+[ -z "${EXPECTED_SMOKE_UPSTREAM:-}" ] ||
+  [ "$(cat "$CASE_DIR/caddy-upstream" 2>/dev/null || true)" = "$EXPECTED_SMOKE_UPSTREAM" ] || {
+    printf '599'
+    exit 0
+  }
+printf 'smoke %s\n' "$(cat "$CASE_DIR/caddy-upstream" 2>/dev/null || true)" >> "$TEST_COMMAND_LOG"
 [ -z "$headers" ] || printf 'HTTP/2 %s\r\ncontent-type: %s\r\n\r\n' \
   "${SMOKE_CODE:-401}" "${SMOKE_CONTENT_TYPE:-application/json}" > "$headers"
 [ -z "$body" ] || printf '%s' "${SMOKE_BODY:-{\"statusCode\":401}}" > "$body"
@@ -182,6 +225,7 @@ fi
 # 生产密钥,而目标文件本身是 0600。这是唯一能观察到那个窗口的时刻。
 case "${@: -1}" in
   *.env.production)
+    printf 'mv %s %s\n' "${@: -2:1}" "${@: -1}" >> "$TEST_COMMAND_LOG"
     # GNU 的 -c 与 BSD 的 -f 互不认;先试 GNU(Linux CI),失败再退 BSD(macOS)。
     # BSD stat 见到 -c 会直接报错退出,不会误判成成功。
     stat -c '%a' "${@: -2:1}" 2>/dev/null > "$CASE_DIR/env-tmp-mode" ||
@@ -192,12 +236,36 @@ esac
 # 可能挂)。脚本开头是 set -e,所以这一步必须是 best-effort,否则会在迁移之后
 # 直接退出 —— 停机模式下旧色已经停了,API 就那样一直下线。
 if [ "${ENV_STAMP_FAIL:-0}" = "1" ]; then
-  # mv 桩是独立脚本,没有外层的 last_arg helper,直接取最后一个参数。
-  case "${@: -1}" in
-    *.env.production) exit 47 ;;
-  esac
+  # Only fail the best-effort Sentry stamp. The earlier access.tmp rename is
+  # the mandatory secure env installation and must still succeed.
+  if [ "${@: -2:1}" = "${APP_ENV_FILE}.tmp" ] &&
+    [ "${@: -1}" = "$APP_ENV_FILE" ]; then
+    exit 47
+  fi
 fi
-exec "$REAL_MV" "$@"
+if [ "${KILL_BEFORE_CADDY_RELOAD:-0}" = "1" ] &&
+  [ "${@: -1}" = "$RELEASE_STATE_DIR/app-env-transaction/state" ] &&
+  grep -q '^cutover-pending:' "${@: -2:1}" &&
+  [ ! -e "$CASE_DIR/kill-before-cutover-injected" ]; then
+  : > "$CASE_DIR/kill-before-cutover-injected"
+  "$REAL_MV" "$@"
+  kill -KILL "$PPID"
+  exit 137
+fi
+"$REAL_MV" "$@"
+if [ "${KILL_AFTER_CUTOVER_COMPLETE:-0}" = "1" ] &&
+  [ "${@: -1}" = "$RELEASE_STATE_DIR/app-env-transaction/state" ] &&
+  grep -q '^cutover:' "${@: -1}" &&
+  [ ! -e "$CASE_DIR/kill-after-cutover-complete-injected" ]; then
+  : > "$CASE_DIR/kill-after-cutover-complete-injected"
+  kill -KILL "$PPID"
+  exit 137
+fi
+if [ "${KILL_AFTER_ENV_STAGE:-0}" = "1" ] &&
+  [ "${@: -2:1}" = "$RELEASE_STATE_DIR/app-env-transaction/access.tmp" ] &&
+  [ "${@: -1}" = "$APP_ENV_FILE" ]; then
+  kill -KILL "$PPID"
+fi
 MV
   chmod +x "$CASE_DIR/bin/mv"
 }
@@ -212,6 +280,7 @@ run_release() {
     RELEASE_IRREVERSIBLE_MIGRATION="${RELEASE_IRREVERSIBLE_MIGRATION:-0}" \
     RELEASE_SCHEMA_COMPATIBILITY="${RELEASE_SCHEMA_COMPATIBILITY:-$REPO_SCHEMA_COMPATIBILITY}" \
     SCHEMA_COMPATIBILITY_PATH="${SCHEMA_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY}" \
+    RUNTIME_COMPATIBILITY_PATH="${RUNTIME_COMPATIBILITY_PATH:-$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY}" \
     RELEASE_MARKER_PATH="${RELEASE_MARKER_PATH:-$CASE_DIR/no-marker}" \
     MIGRATE_FAIL="${MIGRATE_FAIL:-0}" \
     CONTRACT_PROBE_STATE="${CONTRACT_PROBE_STATE:-none}" \
@@ -222,8 +291,18 @@ run_release() {
     CADDY_RELOAD_FAIL_TARGET="${CADDY_RELOAD_FAIL_TARGET:-}" \
     PERSIST_FAIL_COLOR="${PERSIST_FAIL_COLOR:-}" \
     CADDY_NO_RATE_LIMIT="${CADDY_NO_RATE_LIMIT:-0}" \
+    COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
     APP_ENV_FILE="${APP_ENV_FILE:-$CASE_DIR/no-env-file}" \
     ENV_STAMP_FAIL="${ENV_STAMP_FAIL:-0}" \
+    KILL_AFTER_ENV_STAGE="${KILL_AFTER_ENV_STAGE:-0}" \
+    KILL_BEFORE_CADDY_RELOAD="${KILL_BEFORE_CADDY_RELOAD:-0}" \
+    KILL_AFTER_CUTOVER_COMPLETE="${KILL_AFTER_CUTOVER_COMPLETE:-0}" \
+    KILL_AFTER_CADDY_RELOAD="${KILL_AFTER_CADDY_RELOAD:-0}" \
+    KILL_AFTER_CADDY_RELOAD_TARGET="${KILL_AFTER_CADDY_RELOAD_TARGET:-}" \
+    TERM_AFTER_CADDY_RELOAD="${TERM_AFTER_CADDY_RELOAD:-0}" \
+    TERM_AFTER_CADDY_RELOAD_TARGET="${TERM_AFTER_CADDY_RELOAD_TARGET:-}" \
+    EXPECTED_SMOKE_UPSTREAM="${EXPECTED_SMOKE_UPSTREAM:-}" \
+    IMAGE_MISSING="${IMAGE_MISSING:-0}" \
     bash "$DEPLOY_SCRIPT" >"$CASE_DIR/release.log" 2>&1
 }
 
@@ -246,6 +325,10 @@ assert_absent() {
 # CI 在 Linux 跑 —— 先试 GNU,失败再退 BSD(BSD stat 见到 -c 会直接报错)。
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+file_inode() {
+  stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"
 }
 
 assert_mode() {
@@ -404,11 +487,11 @@ test_release_never_widens_permissions_on_the_secrets_it_rewrites() {
 
   run_release || return 1
 
-  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "600" ] || {
-    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 600" >&2
+  [ "$(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || true)" = "640" ] || {
+    echo "temp secrets file was mode $(cat "$CASE_DIR/env-tmp-mode" 2>/dev/null || echo '<never created>') at mv time, expected 640" >&2
     return 1
   }
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   [ ! -e "${APP_ENV_FILE}.tmp" ] || {
     echo "expected the temp secrets copy to be gone after a successful stamp" >&2
     return 1
@@ -435,8 +518,9 @@ test_failed_sentry_stamp_leaves_no_readable_copy_of_the_secrets() {
     echo "mv failure left a $(file_mode "${APP_ENV_FILE}.tmp") copy of the secrets behind" >&2
     return 1
   }
-  # 原文件必须原封不动(内容和权限都是),打标签失败不该动到它。
-  assert_mode "$APP_ENV_FILE" 600 || return 1
+  # The access transaction has already installed the group-readable inode;
+  # a failed observability stamp must preserve its contents and permissions.
+  assert_mode "$APP_ENV_FILE" 640 || return 1
   grep -q '^JWT_SECRET=s3cr3t$' "$APP_ENV_FILE" || {
     echo "expected the original env file to survive a failed stamp untouched" >&2
     return 1
@@ -514,6 +598,276 @@ test_downtime_switch_failure_restores_previous_color_first() {
     assert_command_before 'start circle_be' 'rm -sf circle_be_green'
 }
 
+test_startup_failure_restores_legacy_env_before_live_restart() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=legacy\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  legacy_inode="$(file_inode "$APP_ENV_FILE")"
+  RELEASE_DOWNTIME=1 START_FAIL=1
+
+  ! run_release || return 1
+
+  [ "$(file_inode "$APP_ENV_FILE")" = "$legacy_inode" ] || {
+    echo "expected rollback to restore the original app env inode" >&2
+    return 1
+  }
+  assert_mode "$APP_ENV_FILE" 600 || return 1
+  [ "$(cat "$APP_ENV_FILE")" = 'SECRET=legacy' ] || return 1
+  assert_command_before \
+    "mv $RELEASE_STATE_DIR/app-env-transaction/legacy-rollback $APP_ENV_FILE" \
+    'start circle_be'
+}
+
+run_staged_release_through_launcher() {
+  local staged_name="$1"
+  PATH="$CASE_DIR/bin:$PATH" \
+    REAL_MV="$REAL_MV" \
+    TARGET_SCHEMA_COMPATIBILITY="$REPO_SCHEMA_COMPATIBILITY" \
+    RELEASE_TAG=v1.2.3 \
+    CIRCLE_BE_IMAGE="$DIGEST_IMAGE" \
+    RELEASE_DOWNTIME=0 \
+    RELEASE_IRREVERSIBLE_MIGRATION=0 \
+    RELEASE_MARKER_PATH="$CASE_DIR/no-marker" \
+    COMPOSE_ENV_FILE="$COMPOSE_ENV_FILE" \
+    APP_ENV_FILE="$APP_ENV_FILE" \
+    KILL_AFTER_ENV_STAGE=0 \
+    bash "$RELEASE_STATE_DIR/release-launcher.sh" "$staged_name" \
+      >>"$CASE_DIR/release.log" 2>&1
+}
+
+test_interrupted_env_stage_recovers_through_launcher() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+
+  live_root="$CASE_DIR/live"
+  RELEASE_STATE_DIR="$live_root/.release"
+  export RELEASE_STATE_DIR
+  mkdir -p "$RELEASE_STATE_DIR"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  mkdir -p "$live_root/deploy"
+  cp "$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY" "$live_root/deploy/"
+
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=survives-crash\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  legacy_inode="$(file_inode "$APP_ENV_FILE")"
+  KILL_AFTER_ENV_STAGE=1
+
+  ! run_release || return 1
+  [ "$(cat "$RELEASE_STATE_DIR/app-env-transaction/state")" = "staged" ] || return 1
+  [ "$(file_inode "$RELEASE_STATE_DIR/app-env-transaction/legacy-rollback")" = "$legacy_inode" ] || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+
+  staged_name="next-release"
+  staged_root="$RELEASE_STATE_DIR/incoming/$staged_name"
+  mkdir -p "$staged_root/deploy"
+  cp "$ROOT_DIR/deploy/release-launcher.sh" "$RELEASE_STATE_DIR/release-launcher.sh"
+  cp "$ROOT_DIR/deploy/release-deploy.sh" \
+    "$ROOT_DIR/deploy/app-env-preflight.sh" \
+    "$ROOT_DIR/deploy/app-env-transaction.sh" \
+    "$ROOT_DIR/deploy/SCHEMA_COMPATIBILITY" \
+    "$ROOT_DIR/deploy/RELEASE_RUNTIME_COMPATIBILITY" \
+    "$staged_root/deploy/"
+  cp "$ROOT_DIR/docker-compose.prod.yml" "$ROOT_DIR/docker-compose.release.yml" "$staged_root/"
+
+  run_staged_release_through_launcher "$staged_name" || return 1
+
+  grep -q 'Recovered legacy app env access from an interrupted release' "$CASE_DIR/release.log" || return 1
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
+  [ ! -e "$staged_root" ] || return 1
+  assert_mode "$APP_ENV_FILE" 640 && assert_running circle_be_green
+}
+
+test_term_after_cutover_finalizes_new_env_and_active_color() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=cutover\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  TERM_AFTER_CADDY_RELOAD=1
+
+  ! run_release || return 1
+
+  [ -e "$CASE_DIR/term-injected" ] || return 1
+  assert_active_color circle_be_green || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+  grep -q '^SECRET=cutover$' "$APP_ENV_FILE" || return 1
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
+  assert_running circle_be_green
+}
+
+prepare_cutover_recovery_case() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=cutover-recovery\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  printf 'circle-be-blue:3000\n' > "$CASE_DIR/caddy-upstream"
+}
+
+test_sigkill_after_complete_marker_recovers_forward_and_smokes_new_color() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-after-cutover-complete-injected" ] || return 1
+  grep -q '^cutover:circle_be_green:circle_be$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  EXPECTED_SMOKE_UPSTREAM=circle-be-green:3000
+  IMAGE_MISSING=1
+  ! run_release || return 1
+
+  grep -q '^smoke circle-be-green:3000$' "$TEST_COMMAND_LOG" || return 1
+  assert_active_color circle_be_green && assert_mode "$APP_ENV_FILE" 640 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  EXPECTED_SMOKE_UPSTREAM=circle-be-green:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+
+  grep -q '^smoke circle-be-green:3000$' "$TEST_COMMAND_LOG" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_pending_cutover_rolls_back_when_recovery_color_is_unhealthy() {
+  prepare_cutover_recovery_case
+  KILL_BEFORE_CADDY_RELOAD=1
+  ! run_release || return 1
+  KILL_BEFORE_CADDY_RELOAD=0
+  HEALTH_FAIL=1
+  ! run_release || return 1
+
+  grep -q 'because circle_be_green was unhealthy' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_complete_cutover_rolls_back_when_recovery_color_is_unhealthy() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CUTOVER_COMPLETE=1
+  ! run_release || return 1
+  KILL_AFTER_CUTOVER_COMPLETE=0
+  HEALTH_FAIL=1
+  ! run_release || return 1
+
+  grep -q 'because circle_be_green was unhealthy' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_after_cutover_recovers_forward_before_early_failure() {
+  new_case
+  printf 'running\n' > "$TEST_STATE_DIR/circle_be"
+  printf 'running\n' > "$TEST_STATE_DIR/caddy"
+  printf 'circle_be\n' > "$RELEASE_STATE_DIR/active-color"
+  APP_ENV_FILE="$CASE_DIR/.env.production"
+  printf 'SECRET=cutover-kill\n' > "$APP_ENV_FILE"
+  chmod 600 "$APP_ENV_FILE"
+  export APP_ENV_FILE
+  KILL_AFTER_CADDY_RELOAD=1
+
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-after-cutover-injected" ] || return 1
+  grep -q '^cutover-pending:circle_be_green:circle_be$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+
+  KILL_AFTER_CADDY_RELOAD=0
+  IMAGE_MISSING=1
+  ! run_release || return 1
+
+  grep -q 'Finalized interrupted cutover to circle_be_green' "$CASE_DIR/release.log" || return 1
+  grep -q 'Image not available locally' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be_green || return 1
+  assert_mode "$APP_ENV_FILE" 640 || return 1
+  grep -q '^SECRET=cutover-kill$' "$APP_ENV_FILE" || return 1
+  [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ] || return 1
+  assert_running circle_be_green
+}
+
+test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CADDY_RELOAD=1
+  ! run_release || return 1
+  KILL_AFTER_CADDY_RELOAD=0
+  SMOKE_CODE=500
+  ! run_release || return 1
+  grep -q 'Rolled interrupted cutover back to circle_be' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails() {
+  prepare_cutover_recovery_case
+  KILL_BEFORE_CADDY_RELOAD=1
+  ! run_release || return 1
+  [ -e "$CASE_DIR/kill-before-cutover-injected" ] || return 1
+  KILL_BEFORE_CADDY_RELOAD=0
+  SMOKE_CODE=500
+  ! run_release || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_term_during_failed_smoke_completes_rollback() {
+  prepare_cutover_recovery_case
+  TERM_AFTER_CADDY_RELOAD=1
+  SMOKE_CODE=500
+  ! run_release || return 1
+  [ -e "$CASE_DIR/term-injected" ] || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_sigkill_during_rollback_recovers_before_early_failure() {
+  prepare_cutover_recovery_case
+  KILL_AFTER_CADDY_RELOAD=1
+  KILL_AFTER_CADDY_RELOAD_TARGET=circle-be-blue:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+  grep -q '^rollback-pending:circle_be:circle_be_green$' \
+    "$RELEASE_STATE_DIR/app-env-transaction/state" || return 1
+  KILL_AFTER_CADDY_RELOAD=0
+  IMAGE_MISSING=1
+  ! run_release || return 1
+  grep -q 'Finalized interrupted rollback to circle_be' "$CASE_DIR/release.log" || return 1
+  grep -q 'Image not available locally' "$CASE_DIR/release.log" || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
+test_term_during_rollback_completes_state_before_exit() {
+  prepare_cutover_recovery_case
+  TERM_AFTER_CADDY_RELOAD=1
+  TERM_AFTER_CADDY_RELOAD_TARGET=circle-be-blue:3000
+  SMOKE_CODE=500
+  ! run_release || return 1
+  [ -e "$CASE_DIR/term-injected" ] || return 1
+  assert_active_color circle_be && assert_mode "$APP_ENV_FILE" 600 &&
+    [ ! -e "$RELEASE_STATE_DIR/app-env-transaction/state" ]
+}
+
 test_state_write_failure_rolls_proxy_back_before_cleanup() {
   new_case
   printf 'running\n' > "$TEST_STATE_DIR/circle_be"
@@ -565,6 +919,14 @@ test_marker_requires_irreversible_confirmation() {
   RELEASE_MARKER_PATH="$ROOT_DIR/deploy/REQUIRES_IRREVERSIBLE_MIGRATION"
   ! run_release || return 1
   grep -q 'requires RELEASE_IRREVERSIBLE_MIGRATION=1' "$CASE_DIR/release.log"
+}
+
+test_pre_contract_release_is_rejected_before_any_deployment_action() {
+  new_case
+  RUNTIME_COMPATIBILITY_PATH="$CASE_DIR/no-runtime-compatibility"
+  ! run_release || return 1
+  grep -q 'below the trusted deployment contract minimum' "$CASE_DIR/release.log" || return 1
+  [ ! -s "$TEST_COMMAND_LOG" ]
 }
 
 test_pre_marker_release_is_rejected_after_boundary_is_recorded() {
@@ -680,9 +1042,23 @@ for test_name in \
   test_smoke_failure_restores_proxy_before_removing_standby \
   test_spa_html_response_restores_proxy_before_removing_standby \
   test_downtime_switch_failure_restores_previous_color_first \
+  test_startup_failure_restores_legacy_env_before_live_restart \
+  test_interrupted_env_stage_recovers_through_launcher \
+  test_term_after_cutover_finalizes_new_env_and_active_color \
+  test_sigkill_after_complete_marker_recovers_forward_and_smokes_new_color \
+  test_sigkill_after_complete_marker_rolls_back_when_new_color_smoke_fails \
+  test_pending_cutover_rolls_back_when_recovery_color_is_unhealthy \
+  test_complete_cutover_rolls_back_when_recovery_color_is_unhealthy \
+  test_sigkill_after_cutover_recovers_forward_before_early_failure \
+  test_sigkill_after_cutover_rolls_back_when_recovery_smoke_fails \
+  test_sigkill_before_cutover_rolls_back_when_recovery_smoke_fails \
+  test_term_during_failed_smoke_completes_rollback \
+  test_sigkill_during_rollback_recovers_before_early_failure \
+  test_term_during_rollback_completes_state_before_exit \
   test_state_write_failure_rolls_proxy_back_before_cleanup \
   test_irreversible_confirmation_requires_downtime \
   test_marker_requires_irreversible_confirmation \
+  test_pre_contract_release_is_rejected_before_any_deployment_action \
   test_pre_marker_release_is_rejected_after_boundary_is_recorded \
   test_release_cannot_understate_checked_out_schema_compatibility \
   test_irreversible_release_records_minimum_schema_compatibility \
