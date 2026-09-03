@@ -185,11 +185,20 @@ ssh -i deploy_key_new ubuntu@$DEPLOY_HOST "circle-release stage-v2"
 
 **三、launcher 必须真实满足执行前置**
 
-用独立的管理员/root 登录服务器执行:
+用独立的管理员/root 登录服务器执行。部署根目录**必须从 `authorized_keys` 里 `command=`
+的第一个参数读出来** —— 那是 ForceCommand 真正使用的根;第 2 步给的 `/home/ubuntu/circle_be`
+只是示例值,照抄会在自定义根目录的机器上检查到另一个路径,于是要么无故失败,
+要么因为那个路径下碰巧也有个合法 launcher 而通过,真正的发布路径反而没被验证。
 
 ```bash
 DEPLOY_USER=ubuntu
-DEPLOY_ROOT=/home/$DEPLOY_USER/circle_be
+DEPLOY_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+
+DEPLOY_ROOT="$(sudo awk -F'"' '
+  /circle-release-force-command/ { split($2, parts, " "); print parts[2]; exit }
+' "$DEPLOY_HOME/.ssh/authorized_keys")"
+
+test -n "$DEPLOY_ROOT"
 launcher="$DEPLOY_ROOT/.release/release-launcher.sh"
 
 sudo test -f "$launcher"
@@ -199,8 +208,9 @@ sudo -u "$DEPLOY_USER" test ! -w "$launcher"
 sudo stat -c '%U %G %a %n' "$launcher"
 ```
 
-前四条 `test` 预期没有输出且全部返回 0;`stat` 预期显示 `root root 555` 和 launcher 路径。
-若任一条失败,回第 2 步重新安装 launcher。
+`test -n "$DEPLOY_ROOT"` 失败说明 `authorized_keys` 里根本没有那行 ForceCommand,
+先回第 2 步。之后四条 `test` 预期没有输出且全部返回 0;`stat` 预期显示 `root root 555`
+和 launcher 路径。若任一条失败,回第 2 步重新安装 launcher。
 
 不能用一个不存在的 stage 来验证 launcher:ForceCommand 会先返回 `staged release not found`,
 根本还没有执行到 launcher 的存在、符号链接和可写性检查。前两项能进入协议参数校验,

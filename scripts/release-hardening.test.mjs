@@ -649,6 +649,14 @@ test('release hardening runbook verifies the trusted launcher directly', () => {
     /sudo -u "\$DEPLOY_USER" test ! -w "\$launcher"/,
   );
   assert.doesNotMatch(selfChecks, /circle-release activate-v2/);
+
+  // ForceCommand 的部署根目录是 command= 的第一个参数，可以是任意绝对路径
+  // （release-force-command.sh 只校验绝对且存在）。自检必须从 authorized_keys
+  // 读出真实值：写死示例路径会在自定义根目录的机器上验到另一个 launcher。
+  assert.match(selfChecks, /authorized_keys/);
+  assert.match(selfChecks, /circle-release-force-command/);
+  assert.match(selfChecks, /test -n "\$DEPLOY_ROOT"/);
+  assert.doesNotMatch(selfChecks, /DEPLOY_ROOT=\/home\//);
 });
 
 test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
