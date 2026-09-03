@@ -40,6 +40,13 @@ const DELETE_BACKOFF_MAX_MS = 60 * 60_000;
 const DELETE_SWEEP_INTERVAL_MS = 60_000;
 /** 单轮重投的条数上限(存储长时间不可用时不要一口气打爆)。 */
 const DELETE_SWEEP_BATCH = 200;
+/**
+ * 认领租约:事务内把 nextAttemptAt 推后这么久,再到事务外去删对象。
+ * 期间别的 sweeper 实例查不到这一条,不会重复删。租约要长于一次对象存储
+ * 删除的最坏耗时;真失败了下面的 catch 会立刻按退避改写 nextAttemptAt,
+ * 进程中途挂掉最多也就是这一条晚 5 分钟被重投。
+ */
+const DELETE_CLAIM_LEASE_MS = 5 * 60_000;
 const FORWARD_COPY_RESERVATION_MS = 15 * 60_000;
 
 @Injectable()
@@ -318,7 +325,11 @@ export class ChatMediaService implements OnModuleDestroy {
         take: DELETE_SWEEP_BATCH,
       });
       for (const row of due) {
-        await this.prisma.$transaction(async (tx) => {
+        // 一、事务内认领。只做数据库的事:复核、按引用计数销行、否则把
+        // nextAttemptAt 推后一个租约把这条占住。对象存储调用绝不能放进来 ——
+        // Prisma 交互事务默认只有几秒超时,一次慢的 MinIO/S3 删除会让整个事务
+        // 超时回滚,行既没删掉也没记下重试状态,还白占一个连接和 advisory lock。
+        const claimed = await this.prisma.$transaction(async (tx) => {
           await this.lockNoteImportKeys(tx, [row.objectKey]);
           const current = await tx.chatMediaDeletion.findUnique({
             where: { id: row.id },
@@ -328,42 +339,57 @@ export class ChatMediaService implements OnModuleDestroy {
             current.attempts >= DELETE_MAX_ATTEMPTS ||
             current.nextAttemptAt.getTime() > Date.now()
           ) {
-            return;
+            return null;
           }
           const referenceCount = await tx.chatMediaReference.count({
             where: { objectKey: current.objectKey },
           });
           if (referenceCount > 0) {
             await tx.chatMediaDeletion.delete({ where: { id: current.id } });
-            return;
+            return null;
           }
-          try {
-            await this.uploadService.deleteObjectByKey(current.objectKey);
-            await tx.chatMediaDeletion.delete({ where: { id: current.id } });
-          } catch (error) {
-            const attempts = current.attempts + 1;
-            const backoff = Math.min(
-              DELETE_BACKOFF_BASE_MS * 2 ** current.attempts,
-              DELETE_BACKOFF_MAX_MS,
-            );
-            await tx.chatMediaDeletion.update({
-              where: { id: current.id },
-              data: {
-                attempts,
-                lastError: (error instanceof Error
-                  ? error.message
-                  : String(error)
-                ).slice(0, 500),
-                nextAttemptAt: new Date(Date.now() + backoff),
-              },
-            });
-            if (attempts >= DELETE_MAX_ATTEMPTS) {
-              this.logger.error(
-                `chat media delete dead-lettered key=${current.objectKey} after ${attempts} attempts`,
-              );
-            }
-          }
+          // 租约:并发 sweeper 的 due 查询按 nextAttemptAt <= now 过滤,推后之后
+          // 别的实例就不会在本次删除还在飞的时候重复删同一个 key。
+          await tx.chatMediaDeletion.update({
+            where: { id: current.id },
+            data: {
+              nextAttemptAt: new Date(Date.now() + DELETE_CLAIM_LEASE_MS),
+            },
+          });
+          return current;
         });
+        if (!claimed) continue;
+
+        // 二、事务外做对象存储删除,再用条件写回落库结果。用 deleteMany/updateMany
+        // 而不是 delete/update:行若被并发销掉,这里应当是无操作而不是抛 P2025。
+        try {
+          await this.uploadService.deleteObjectByKey(claimed.objectKey);
+          await this.prisma.chatMediaDeletion.deleteMany({
+            where: { id: claimed.id },
+          });
+        } catch (error) {
+          const attempts = claimed.attempts + 1;
+          const backoff = Math.min(
+            DELETE_BACKOFF_BASE_MS * 2 ** claimed.attempts,
+            DELETE_BACKOFF_MAX_MS,
+          );
+          await this.prisma.chatMediaDeletion.updateMany({
+            where: { id: claimed.id },
+            data: {
+              attempts,
+              lastError: (error instanceof Error
+                ? error.message
+                : String(error)
+              ).slice(0, 500),
+              nextAttemptAt: new Date(Date.now() + backoff),
+            },
+          });
+          if (attempts >= DELETE_MAX_ATTEMPTS) {
+            this.logger.error(
+              `chat media delete dead-lettered key=${claimed.objectKey} after ${attempts} attempts`,
+            );
+          }
+        }
       }
     } catch (error) {
       this.logger.warn(

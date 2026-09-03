@@ -2076,6 +2076,22 @@ export class NoteService {
               });
             });
             await uploadService.copyObjectToKey(row.objectKey, destKey);
+            // 预留是一行 chatMediaDeletion(不是随事务释放的 advisory lock),所以
+            // 复制期间它一直有效。但复制本身要花时间,如果不续租,「写消息 + 建
+            // 引用」这一段就得跟复制共用同一个到期时间;复制慢一点就会贴着边缘跑。
+            // 复制成功后重新计时,让后续步骤拿到完整窗口。只续我们自己那一行:
+            // lastError 不再是预留标记,说明它已经变成一条真的待删记录。
+            await this.prisma.chatMediaDeletion.updateMany({
+              where: {
+                objectKey: destKey,
+                lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+              },
+              data: {
+                nextAttemptAt: new Date(
+                  Date.now() + CHAT_NOTE_IMPORT_RESERVATION_MS,
+                ),
+              },
+            });
           } catch (error) {
             firstCopyError ??= error;
             this.logger.warn(

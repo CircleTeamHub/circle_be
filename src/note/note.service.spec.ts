@@ -10,6 +10,7 @@ import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { CHAT_NOTE_IMPORT_RESERVATION_REASON } from 'src/chat/chat.constants';
 import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
@@ -68,6 +69,7 @@ describe('NoteService', () => {
     },
     chatMediaDeletion: {
       upsert: jest.fn(),
+      updateMany: jest.fn(),
     },
   };
 
@@ -3633,6 +3635,8 @@ describe('NoteService', () => {
       uploadService.copyObjectToKey.mockResolvedValue(undefined);
       prisma.chatMediaDeletion.upsert.mockReset();
       prisma.chatMediaDeletion.upsert.mockResolvedValue({});
+      prisma.chatMediaDeletion.updateMany.mockReset();
+      prisma.chatMediaDeletion.updateMany.mockResolvedValue({ count: 1 });
     });
 
     it('copies media-section objects into the viewer chat namespace', async () => {
@@ -3686,6 +3690,41 @@ describe('NoteService', () => {
       expect(
         prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
       ).toBeLessThan(uploadService.copyObjectToKey.mock.invocationCallOrder[0]);
+    });
+
+    it('renews the reservation after the copy so the message insert gets a full window', async () => {
+      // 预留是一行 chatMediaDeletion,复制期间一直有效(advisory lock 才是随事务
+      // 释放的)。但复制本身要花时间:不续租的话「写消息 + 建引用」就得跟复制
+      // 共用同一个到期时间,复制慢一点就贴着边缘跑,清理 worker 可能在消息落库
+      // 之前把目标对象删掉。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const destination = uploadService.copyObjectToKey.mock.calls[0][1];
+      expect(prisma.chatMediaDeletion.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ objectKey: destination }),
+          data: expect.objectContaining({ nextAttemptAt: expect.any(Date) }),
+        }),
+      );
+      // 必须发生在复制之后 —— 复制之前续租等于没续。
+      expect(
+        uploadService.copyObjectToKey.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        prisma.chatMediaDeletion.updateMany.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not renew a reservation that has become a real pending deletion', async () => {
+      // 续租的 where 里带 lastError 判定:该行若已不是预留标记,说明它变成了
+      // 一条真的待删记录,这时候把它的 nextAttemptAt 往后推会拖住真正的清理。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const [call] = prisma.chatMediaDeletion.updateMany.mock.calls;
+      expect(call[0].where.lastError).toBe(CHAT_NOTE_IMPORT_RESERVATION_REASON);
     });
 
     it('does not copy an object when its durable cleanup reservation fails', async () => {

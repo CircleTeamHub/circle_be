@@ -30,6 +30,7 @@ describe('ChatMediaService', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
       delete: jest.fn(),
       deleteMany: jest.fn(),
     },
@@ -53,6 +54,7 @@ describe('ChatMediaService', () => {
     prisma.chatMediaDeletion.upsert.mockResolvedValue({});
     prisma.chatMediaDeletion.findMany.mockResolvedValue([]);
     prisma.chatMediaDeletion.update.mockResolvedValue({});
+    prisma.chatMediaDeletion.updateMany.mockResolvedValue({ count: 1 });
     prisma.chatMediaDeletion.delete.mockResolvedValue({});
     prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
     prisma.chatMediaDeletion.findUnique.mockResolvedValue(null);
@@ -94,7 +96,9 @@ describe('ChatMediaService', () => {
 
     // 次数用尽只是停止自动重试,行必须留着 —— 删了就再也无从得知这个 key。
     expect(prisma.chatMediaDeletion.delete).not.toHaveBeenCalled();
-    expect(prisma.chatMediaDeletion.update).toHaveBeenCalledWith(
+    expect(prisma.chatMediaDeletion.deleteMany).not.toHaveBeenCalled();
+    // 失败结果写在事务外,用条件 updateMany:行被并发销掉时应无操作而非抛 P2025。
+    expect(prisma.chatMediaDeletion.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 'd1' },
         data: expect.objectContaining({ attempts: 8 }),
@@ -114,9 +118,54 @@ describe('ChatMediaService', () => {
 
     await service.drainPendingDeletions();
 
-    expect(prisma.chatMediaDeletion.delete).toHaveBeenCalledWith({
+    expect(prisma.chatMediaDeletion.deleteMany).toHaveBeenCalledWith({
       where: { id: 'd1' },
     });
+  });
+
+  it('deletes from the object store outside the claiming transaction', async () => {
+    // Prisma 交互事务默认只有几秒超时。把对象存储删除放进事务里,一次慢的
+    // MinIO/S3 调用就会让事务超时回滚:行既没删掉、也没记下重试状态,
+    // 而且整段外部调用期间还白占着一个数据库连接和 advisory lock。
+    const due = {
+      id: 'd1',
+      objectKey: 'chat/u1/a.jpg',
+      attempts: 0,
+      nextAttemptAt: new Date(0),
+    };
+    prisma.chatMediaDeletion.findMany.mockResolvedValue([due]);
+    prisma.chatMediaDeletion.findUnique.mockResolvedValue(due);
+
+    let insideTransaction = false;
+    prisma.$transaction.mockImplementation(
+      async (callback: (tx: typeof prisma) => unknown) => {
+        insideTransaction = true;
+        try {
+          return await callback(prisma);
+        } finally {
+          insideTransaction = false;
+        }
+      },
+    );
+    const observed: boolean[] = [];
+    uploadService.deleteObjectByKey.mockImplementation(async () => {
+      observed.push(insideTransaction);
+    });
+
+    await service.drainPendingDeletions();
+
+    expect(observed).toEqual([false]);
+    // 事务里只做认领:把 nextAttemptAt 推后一个租约占住这一条,
+    // 让并发 sweeper 的 due 查询(nextAttemptAt <= now)看不到它。
+    expect(prisma.chatMediaDeletion.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'd1' },
+        data: expect.objectContaining({ nextAttemptAt: expect.any(Date) }),
+      }),
+    );
+    expect(
+      prisma.chatMediaDeletion.update.mock.invocationCallOrder[0],
+    ).toBeLessThan(uploadService.deleteObjectByKey.mock.invocationCallOrder[0]);
   });
 
   it('cancels a stale deletion without touching an object that is still referenced', async () => {
