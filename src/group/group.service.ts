@@ -27,6 +27,9 @@ import {
   UpdateGroupMemberRoleDto,
 } from './dto/group-member.dto';
 import { ReportGroupDto } from './dto/group-report.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 type GroupMemberSyncResult = { handled: boolean };
 type CircleGroupLookup = {
@@ -46,6 +49,7 @@ type CircleGroupMemberLookup = {
 export class GroupService {
   private readonly logger = new Logger(GroupService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
@@ -215,6 +219,16 @@ export class GroupService {
       // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
     });
 
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'group_member_role_updated',
+      actorId: actorId,
+      targetId: normalizedTargetUserID,
+      result: 'success',
+      entityType: 'circle',
+      entityId: circle.id,
+      metadata: { newRole: dto.role },
+    });
     return { handled: true, role: dto.role };
   }
 
@@ -297,6 +311,11 @@ export class GroupService {
               error instanceof Error ? error.message : String(error)
             }`,
           );
+          reportOperationalError(error, {
+            component: 'GroupService',
+            operation: 'inviteGroupMembers',
+            kind: 'chat_sync',
+          });
         });
     }
 
@@ -404,6 +423,15 @@ export class GroupService {
       );
     }
 
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'group_member_removed',
+      actorId: actorId,
+      targetId: normalizedTargetUserID,
+      result: 'success',
+      entityType: 'group',
+      entityId: normalizedGroupID,
+    });
     return { handled: true };
   }
 
@@ -487,6 +515,14 @@ export class GroupService {
     }
 
     this.logger.log(`Group leave cleanup completed: ${userId} -> ${groupID}`);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'group_left',
+      actorId: userId,
+      result: 'success',
+      entityType: 'group',
+      entityId: groupID,
+    });
   }
 
   async reportGroup(
@@ -591,6 +627,15 @@ export class GroupService {
     this.logger.warn(
       `Group report submitted: ${reporterId} -> ${reportGroupID} (${dto.category})`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'group_reported',
+      actorId: reporterId,
+      result: 'success',
+      entityType: 'group',
+      entityId: reportGroupID,
+      metadata: { category: dto.category },
+    });
   }
 
   private prismaErrorCode(error: unknown): string | undefined {

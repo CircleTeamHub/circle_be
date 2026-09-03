@@ -25,6 +25,7 @@ import { randomUUID } from 'crypto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logExternalCallFailure } from 'src/logging/external-service.logger';
 import { logExternalCallSlow } from 'src/logging/performance-event.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 export interface PresignResult {
   uploadUrl: string;
@@ -643,6 +644,11 @@ export class UploadService implements OnModuleInit {
           'The private-media bucket policy may not be in force — notes/* could still be anonymously readable.',
         error instanceof Error ? error.stack : undefined,
       );
+      reportOperationalError(error, {
+        component: 'UploadService',
+        operation: 'bootstrap',
+        kind: step,
+      });
       return false;
     }
   }

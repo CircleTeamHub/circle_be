@@ -22,6 +22,8 @@ import {
 import { CreateTempChatDto } from './dto/create-temp-chat.dto';
 import { JoinTempChatDto } from './dto/join-temp-chat.dto';
 import { newGroupId, newGuestId } from './temp-chat.ids';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 export interface CreateTempChatResult {
   id: string;
@@ -87,6 +89,7 @@ export class TempChatService {
   private static readonly CLEANUP_LEASE_MS = 2 * 60 * 1000;
   private readonly logger = new Logger(TempChatService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly linkToken: LinkTokenService,
@@ -151,6 +154,15 @@ export class TempChatService {
     );
     const token = this.linkToken.sign(row.id, seconds);
     const base = this.config.get<string>('TEMP_CHAT_WEB_BASE', '');
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'temp_chat_created',
+      actorId: hostUserId,
+      result: 'success',
+      entityType: 'temp_chat',
+      entityId: row.id,
+      metadata: { maxMembers: row.maxMembers },
+    });
     return {
       id: row.id,
       groupId: row.groupId,
@@ -392,6 +404,14 @@ export class TempChatService {
       return { status: room.status };
     }
     const finalStatus = await this.teardown(room, TempChatStatus.ENDED);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'temp_chat_ended',
+      actorId: hostUserId,
+      result: 'success',
+      entityType: 'temp_chat',
+      entityId: id,
+    });
     return { status: finalStatus };
   }
 

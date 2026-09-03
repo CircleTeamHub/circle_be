@@ -3,6 +3,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationPushService } from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import type { ChatMessageDto } from './chat.types';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /**
  * 聊天离线推送(best-effort):socket 广播覆盖在线端,本服务只管离线成员。
@@ -46,6 +47,11 @@ export class ChatPushService {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      reportOperationalError(error, {
+        component: 'ChatPushService',
+        operation: 'dispatch',
+        kind: 'push',
+      });
     }
   }
 

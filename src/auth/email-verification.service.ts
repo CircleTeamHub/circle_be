@@ -12,6 +12,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import { MAILER, Mailer } from './mailer/mailer.interface';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /** SMTP 错误 → 可入日志的脱敏描述：类名 + code/responseCode + 打码正文。 */
 function describeMailerError(error: unknown): string {
@@ -197,6 +198,11 @@ export class EmailVerificationService {
                 : String(rollbackError)
             }`,
           );
+          reportOperationalError(rollbackError, {
+            component: 'EmailVerificationService',
+            operation: 'requestCode',
+            kind: 'rollback_failed',
+          });
         });
       if (error instanceof ServiceUnavailableException) throw error;
       // review 修复（round 2）：SMTP 报错常回带 RCPT 收件人全文，整棵 stack

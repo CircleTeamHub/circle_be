@@ -402,11 +402,6 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     );
   }
 
-  const httpAdapterHost = app.get(HttpAdapterHost);
-  app.useGlobalFilters(
-    new AllExceptionFilter(new Logger('Exception'), httpAdapterHost),
-    new PrismaExceptionFilter(),
-  );
   // Optional error aggregation (Sentry). A no-op unless
   // LOG_AGGREGATION_PROVIDER=sentry and SENTRY_DSN are configured; building it
   // here also runs Sentry.init() once before requests are served.
@@ -417,6 +412,19 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     ),
   );
   configureErrorAggregationProvider(errorAggregation);
+  const httpAdapterHost = app.get(HttpAdapterHost);
+  // The filters get the provider too: interceptors only wrap route handlers,
+  // so a guard / pipe / middleware failure (JwtStrategy hitting a dead
+  // database, a revoked session replay) would otherwise never reach Sentry or
+  // the security log. handled-errors markers prevent double reporting.
+  app.useGlobalFilters(
+    new AllExceptionFilter(
+      new Logger('Exception'),
+      httpAdapterHost,
+      errorAggregation,
+    ),
+    new PrismaExceptionFilter(errorAggregation),
+  );
   if (logger && loggingConfig.httpLogOn) {
     app.useGlobalInterceptors(
       new ErrorLoggingInterceptor(logger, errorAggregation),

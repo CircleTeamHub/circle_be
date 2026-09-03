@@ -4,6 +4,7 @@ import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
 import { AdminGroupOperation } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const PROCESS_INTERVAL_MS = 5_000;
 const STALE_CLAIM_MS = 5 * 60_000;
@@ -183,6 +184,13 @@ export class AdminGroupOperationProcessor {
     this.logger.warn(
       `Admin group operation ${operation.id} failed on attempt ${operation.attempts}: ${message}`,
     );
+    if (finalAttempt) {
+      reportOperationalError(error, {
+        component: 'AdminGroupOperationProcessor',
+        operation: 'process',
+        kind: 'permanent_failure',
+      });
+    }
     return runSerializableTransaction(this.prisma, async (tx) => {
       const failed = await tx.adminGroupOperation.updateMany({
         where: {

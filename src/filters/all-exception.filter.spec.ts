@@ -2,9 +2,15 @@ import {
   ArgumentsHost,
   ForbiddenException,
   LoggerService,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import { AllExceptionFilter } from './all-exception.filter';
+import { runWithRequestContext } from '../logging/request-context';
+import {
+  markErrorCaptured,
+  markSecurityEventLogged,
+} from '../logging/handled-errors';
 
 function createFilter() {
   const logger: jest.Mocked<LoggerService> = {
@@ -139,5 +145,163 @@ describe('AllExceptionFilter', () => {
 
     const [, body] = reply.mock.calls[0] as [unknown, Record<string, unknown>];
     expect(body).not.toHaveProperty('errorCode');
+  });
+});
+
+describe('AllExceptionFilter error aggregation & security events', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = {
+      ...originalEnv,
+      NODE_ENV: 'development',
+      LOG_ON: 'true',
+      SECURITY_LOG_ON: 'true',
+    };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  function createFilterWithAggregation() {
+    const logger = {
+      log: jest.fn(),
+      error: jest.fn(),
+      warn: jest.fn(),
+      debug: jest.fn(),
+      verbose: jest.fn(),
+    };
+    const reply = jest.fn();
+    const aggregation = {
+      name: 'sentry' as const,
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    const filter = new AllExceptionFilter(
+      logger as unknown as LoggerService,
+      { httpAdapter: { reply } } as unknown as HttpAdapterHost,
+      aggregation,
+    );
+    return { filter, logger, reply, aggregation };
+  }
+
+  const request = {
+    method: 'GET',
+    url: '/api/v1/secure?x=1',
+    headers: {},
+    query: {},
+  };
+
+  it('forwards a 5xx raised outside the interceptor (guard / pipe) with request context', () => {
+    const { filter, aggregation } = createFilterWithAggregation();
+    const error = new Error('database exploded');
+
+    runWithRequestContext(
+      {
+        requestId: 'req-9',
+        traceId: 'req-9',
+        method: 'GET',
+        path: '/api/v1/secure',
+        userId: 'user-9',
+      },
+      () => filter.catch(error, hostFor(request)),
+    );
+
+    expect(aggregation.captureError).toHaveBeenCalledWith(
+      error,
+      expect.objectContaining({
+        statusCode: 500,
+        requestId: 'req-9',
+        method: 'GET',
+        path: '/api/v1/secure',
+        userId: 'user-9',
+      }),
+    );
+  });
+
+  it('falls back to the raw request when no request context is active', () => {
+    const { filter, aggregation } = createFilterWithAggregation();
+
+    filter.catch(
+      new Error('boom'),
+      hostFor({ ...request, user: { userId: 'u-1' } }),
+    );
+
+    expect(aggregation.captureError).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({
+        method: 'GET',
+        path: '/api/v1/secure',
+        userId: 'u-1',
+      }),
+    );
+  });
+
+  it('does not re-report an error the interceptor already captured', () => {
+    const { filter, aggregation } = createFilterWithAggregation();
+    const error = new Error('already captured');
+    markErrorCaptured(error);
+
+    filter.catch(error, hostFor(request));
+
+    expect(aggregation.captureError).not.toHaveBeenCalled();
+  });
+
+  it('never forwards expected 4xx errors', () => {
+    const { filter, aggregation } = createFilterWithAggregation();
+
+    filter.catch(new ForbiddenException('nope'), hostFor(request));
+
+    expect(aggregation.captureError).not.toHaveBeenCalled();
+  });
+
+  it('still replies when the aggregation SDK throws', () => {
+    const { filter, reply, logger, aggregation } =
+      createFilterWithAggregation();
+    aggregation.captureError.mockImplementation(() => {
+      throw new Error('sentry down');
+    });
+
+    filter.catch(new Error('boom'), hostFor(request));
+
+    expect(reply).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ code: 500 }),
+      500,
+    );
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'error_aggregation_failed' }),
+      'HttpError',
+    );
+  });
+
+  it('logs a security event for a guard-raised 401 and skips ones the interceptor logged', () => {
+    const { filter, logger } = createFilterWithAggregation();
+
+    filter.catch(
+      new UnauthorizedException('Session revoked'),
+      hostFor(request),
+    );
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'security_event',
+        securityEvent: 'auth_unauthorized',
+        statusCode: 401,
+        reason: 'Session revoked',
+      }),
+      'SecurityEvent',
+    );
+
+    logger.warn.mockClear();
+    const alreadyLogged = new ForbiddenException('handled upstream');
+    markSecurityEventLogged(alreadyLogged);
+    filter.catch(alreadyLogged, hostFor(request));
+
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'security_event' }),
+      'SecurityEvent',
+    );
   });
 });

@@ -37,6 +37,9 @@ import {
   SelectCircleIconDto,
   UploadCircleIconDto,
 } from './dto/circle.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 // The SYSTEM icon catalogue grows with every icon ever shipped and is read
 // whole by its endpoint, so cap it instead of letting table size decide the
@@ -47,6 +50,7 @@ const MY_CIRCLES_DEFAULT_LIMIT = 100;
 @Injectable()
 export class CircleService {
   private readonly logger = new Logger(CircleService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -211,6 +215,20 @@ export class CircleService {
           e instanceof Error ? e.message : String(e)
         }`,
       );
+      reportOperationalError(e, {
+        component: 'CircleService',
+        operation: 'createCircle',
+        kind: 'chat_sync',
+      });
+    });
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'circle_created',
+      actorId: userId,
+      result: 'success',
+      entityType: 'circle',
+      entityId: circle.id,
     });
 
     return {
@@ -612,6 +630,15 @@ export class CircleService {
       }
       throw error;
     }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'circle_join_requested',
+      actorId: userId,
+      result: 'success',
+      entityType: 'circle',
+      entityId: circleId,
+      metadata: { invitationId },
+    });
     return this.circleInvitationService.getInvitationForViewer(
       userId,
       invitationId,
@@ -674,6 +701,14 @@ export class CircleService {
         'left',
       );
     }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'circle_left',
+      actorId: userId,
+      result: 'success',
+      entityType: 'circle',
+      entityId: circleId,
+    });
   }
 
   async uploadCircleIcon(

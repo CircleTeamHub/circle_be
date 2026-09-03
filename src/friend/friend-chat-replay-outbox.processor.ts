@@ -6,6 +6,7 @@ import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const REPLAY_BATCH_SIZE = 20;
 const REPLAY_STALE_LOCK_MS = 5 * 60 * 1000;
@@ -199,6 +200,11 @@ export class FriendChatReplayOutboxProcessor {
         },
       });
       this.logger.warn(`Friend chat replay failed for ${job.id}: ${message}`);
+      reportOperationalError(error, {
+        component: 'FriendChatReplayOutboxProcessor',
+        operation: 'processJob',
+        kind: 'replay',
+      });
     }
   }
 

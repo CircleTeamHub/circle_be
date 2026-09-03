@@ -44,6 +44,8 @@ import {
   AvatarFramePublicAppearance,
   AvatarFrameService,
 } from 'src/avatar-frame/avatar-frame.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 // A plaza post joined with the relations every DTO mapping needs.
 // `circleLinks` carries the full set of circles the post is shared to (M2M);
@@ -85,6 +87,7 @@ const CIRCLE_POST_PUBLISH_FANOUT_CAP = 500;
 @Injectable()
 export class CirclePlazaService {
   private readonly logger = new Logger(CirclePlazaService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -406,6 +409,15 @@ export class CirclePlazaService {
       );
     }
 
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'plaza_post_created',
+      actorId: userId,
+      result: 'success',
+      entityType: 'plaza_post',
+      entityId: post.id,
+      metadata: { circleId: primaryCircleId, circleCount: circleIds.length },
+    });
     return this.toPlazaPostDto(
       post,
       true,

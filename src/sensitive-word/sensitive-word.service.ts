@@ -5,6 +5,7 @@ import {
   normalizeSensitiveWord,
   type SensitiveWordMatcher,
 } from './sensitive-word.matcher';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /** 词表缓存刷新周期。到期后由下一次 check 触发后台刷新，不阻塞判定。 */
 const REFRESH_TTL_MS = 60_000;
@@ -53,6 +54,12 @@ export class SensitiveWordService implements OnModuleInit {
       this.logger.error(
         `敏感词词表启动加载失败，暂时放行所有消息: ${String(error)}`,
       );
+      // fail-open 是安全相关的降级：过滤器实际上被关掉了，必须有人知道。
+      reportOperationalError(error, {
+        component: 'SensitiveWordService',
+        operation: 'onModuleInit',
+        kind: 'fail_open',
+      });
     }
   }
 
@@ -136,6 +143,11 @@ export class SensitiveWordService implements OnModuleInit {
         this.logger.error(
           `敏感词词表刷新失败(第 ${this.consecutiveFailures} 次)，${delay}ms 后重试: ${String(error)}`,
         );
+        reportOperationalError(error, {
+          component: 'SensitiveWordService',
+          operation: 'reload',
+          kind: 'fail_open',
+        });
       })
       .finally(() => {
         this.reloadPromise = null;

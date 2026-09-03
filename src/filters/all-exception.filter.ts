@@ -8,6 +8,16 @@ import {
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import * as requestIp from 'request-ip';
+import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
+import {
+  markErrorCaptured,
+  markSecurityEventLogged,
+  wasErrorCaptured,
+  wasSecurityEventLogged,
+} from '../logging/handled-errors';
+import { createLoggingConfig } from '../logging/logging.config';
+import { getRequestContext } from '../logging/request-context';
+import { logSecurityEvent } from '../logging/security-event.logger';
 
 const REDACTED_KEYS = new Set([
   'password',
@@ -84,26 +94,42 @@ function exceptionCause(exception: unknown, status: number): unknown {
   return exception instanceof Error ? exception.stack : exception;
 }
 
+function readPathWithoutQuery(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  return url.split('?')[0] || '/';
+}
+
+type FilteredRequest = {
+  method?: string;
+  url?: string;
+  headers?: Record<string, unknown>;
+  body?: unknown;
+  query?: unknown;
+  user?: { userId?: string };
+};
+
 @Catch()
 export class AllExceptionFilter implements ExceptionFilter {
   private readonly isProduction = process.env.NODE_ENV === 'production';
+  private readonly loggingConfig = createLoggingConfig();
 
+  /**
+   * `errorAggregation` is optional so the filter keeps working in tests and in
+   * builds that never wire Sentry. When present it is the last line of
+   * defence for failures ErrorLoggingInterceptor cannot see (guards, pipes,
+   * middleware); handler failures the interceptor already forwarded are
+   * skipped via the handled-errors markers.
+   */
   constructor(
     private readonly logger: LoggerService,
     private readonly httpAdapterHost: HttpAdapterHost,
+    private readonly errorAggregation?: ErrorAggregationProvider,
   ) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const { httpAdapter } = this.httpAdapterHost;
     const ctx = host.switchToHttp();
-    const request = ctx.getRequest<{
-      method?: string;
-      url?: string;
-      headers?: Record<string, unknown>;
-      body?: unknown;
-      query?: unknown;
-      user?: { userId?: string };
-    }>();
+    const request = ctx.getRequest<FilteredRequest>();
     const response = ctx.getResponse();
 
     let status = HttpStatus.INTERNAL_SERVER_ERROR;
@@ -146,8 +172,13 @@ export class AllExceptionFilter implements ExceptionFilter {
 
     if (status >= 500) {
       this.logger.error(message, logPayload);
+      this.captureServerError(exception, status, request);
     } else {
       this.logger.warn(message, logPayload);
+    }
+
+    if (status === 401 || status === 403) {
+      this.logSecurityRejection(exception, status, message, request);
     }
 
     const responseBody = {
@@ -158,5 +189,69 @@ export class AllExceptionFilter implements ExceptionFilter {
     };
 
     httpAdapter.reply(response, responseBody, status);
+  }
+
+  /**
+   * Guards / pipes / middleware throw before any interceptor runs, so a
+   * database outage surfacing inside JwtStrategy or a throwing pipe would
+   * otherwise be a 500 that never reaches Sentry. Same sanitized tag set as
+   * the interceptor; never the body or headers.
+   */
+  private captureServerError(
+    exception: unknown,
+    status: number,
+    request: FilteredRequest,
+  ): void {
+    if (!this.errorAggregation || wasErrorCaptured(exception)) {
+      return;
+    }
+    const requestContext = getRequestContext();
+    try {
+      this.errorAggregation.captureError(exception, {
+        statusCode: status,
+        requestId: requestContext?.requestId,
+        traceId: requestContext?.traceId,
+        method: requestContext?.method ?? request.method,
+        path: requestContext?.path ?? readPathWithoutQuery(request.url),
+        userId: requestContext?.userId ?? request.user?.userId,
+      });
+      markErrorCaptured(exception);
+    } catch (aggregationError) {
+      this.logger.error(
+        {
+          event: 'error_aggregation_failed',
+          requestId: requestContext?.requestId,
+          message:
+            aggregationError instanceof Error
+              ? aggregationError.message
+              : String(aggregationError),
+        },
+        'HttpError',
+      );
+    }
+  }
+
+  /**
+   * 401/403 raised by guards (revoked session, wrong audience, missing role)
+   * are the security signals that matter most and the interceptor never sees
+   * them. Handler-raised ones were already logged there — skip those.
+   */
+  private logSecurityRejection(
+    exception: unknown,
+    status: number,
+    reason: string,
+    request: FilteredRequest,
+  ): void {
+    if (wasSecurityEventLogged(exception)) {
+      return;
+    }
+    logSecurityEvent(this.logger, {
+      enabled: this.loggingConfig.securityLogOn,
+      securityEvent: status === 401 ? 'auth_unauthorized' : 'access_forbidden',
+      statusCode: status,
+      reason,
+      userId: request.user?.userId,
+    });
+    markSecurityEventLogged(exception);
   }
 }

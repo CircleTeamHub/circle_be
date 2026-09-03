@@ -30,6 +30,8 @@ import {
   AvatarFramePublicAppearance,
   AvatarFrameService,
 } from 'src/avatar-frame/avatar-frame.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
@@ -64,6 +66,7 @@ const MOMENTS_POKE_MAX_PAGES = 20;
 @Injectable()
 export class TraceService {
   private readonly logger = new Logger(TraceService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly minioPublicUrl: string | null;
 
   constructor(
@@ -365,6 +368,15 @@ export class TraceService {
     // #89：发布即向可见范围广播 feed poke，客户端由 30s 轮询改为事件驱动。
     // fire-and-forget —— 广播失败绝不能反过来让发布报错。
     this.queueFeedPoke(userId, trace.visibility !== 'PRIVATE');
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'moment_created',
+      actorId: userId,
+      result: 'success',
+      entityType: 'trace',
+      entityId: trace.id,
+      metadata: { visibility: trace.visibility, images: trace.images.length },
+    });
 
     return {
       id: trace.id,

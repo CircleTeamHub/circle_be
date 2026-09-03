@@ -1,4 +1,9 @@
 import { GiftCardOutboxProcessor } from './gift-card-outbox.processor';
+import { Logger } from '@nestjs/common';
+
+jest.mock('src/logging/error-aggregation.service', () => ({
+  reportOperationalError: jest.fn(),
+}));
 
 describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
   const now = new Date('2026-07-21T12:00:00.000Z');
@@ -109,5 +114,51 @@ describe('GiftCardOutboxProcessor (#100 + PR #120 review)', () => {
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining('gift=gift-1'),
     );
+  });
+});
+
+describe('GiftCardOutboxProcessor error aggregation', () => {
+  it('forwards a permanently failed transfer card to error aggregation', async () => {
+    const { reportOperationalError } = jest.requireMock(
+      'src/logging/error-aggregation.service',
+    ) as { reportOperationalError: jest.Mock };
+    reportOperationalError.mockClear();
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const gift = {
+      id: 'gift-9',
+      senderID: 'user-1',
+      recipientID: 'user-2',
+      amount: 50,
+      message: null,
+      cardAttempts: 59, // this failure exhausts the 60-attempt budget
+      sender: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+    };
+    const prisma = {
+      coinGift: {
+        findMany: jest.fn().mockResolvedValue([gift]),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+    const chatService = {
+      ensureDirectConversationForSettlement: jest
+        .fn()
+        .mockRejectedValue(new Error('chat unavailable')),
+    };
+    const chatMessages = { insertServerMessage: jest.fn() };
+    const processor = new GiftCardOutboxProcessor(
+      prisma as never,
+      chatService as never,
+      chatMessages as never,
+    );
+
+    await processor.compensate(new Date('2026-07-21T12:00:00.000Z'));
+
+    expect(reportOperationalError).toHaveBeenCalledWith(expect.any(Error), {
+      component: 'GiftCardOutboxProcessor',
+      operation: 'compensate',
+      kind: 'permanent_failure',
+    });
+    jest.restoreAllMocks();
   });
 });

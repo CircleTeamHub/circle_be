@@ -28,6 +28,8 @@ import {
 import { mapMembershipStatus } from './membership.service';
 import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const GRANT_REPLAY_INCLUDE = {
   benefitGrants: { select: { type: true } },
@@ -47,6 +49,7 @@ type CanonicalGrantInput = {
 export class MembershipAdminService {
   private readonly logger = new Logger(MembershipAdminService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly membershipPolicy: MembershipPolicyService,
@@ -238,6 +241,18 @@ export class MembershipAdminService {
 
     if (transactionResult.created) {
       await this.runPostCommitSideEffects(targetUserId);
+    }
+    if (transactionResult.created) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'membership_granted',
+        actorId: operatorUserId,
+        targetId: targetUserId,
+        result: 'success',
+        entityType: 'user',
+        entityId: targetUserId,
+        metadata: { targetLevel: input.targetLevel },
+      });
     }
     return transactionResult.response;
   }

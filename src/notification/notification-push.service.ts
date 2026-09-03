@@ -4,6 +4,9 @@ import { CronExpression } from '@nestjs/schedule';
 import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import type { NotificationRealtimeDto } from './notification.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
@@ -65,6 +68,7 @@ const DELIVERY_MAX_ATTEMPTS = 5;
 @Injectable()
 export class NotificationPushService {
   private readonly logger = new Logger(NotificationPushService.name);
+  private readonly loggingConfig = createLoggingConfig();
   // Optional. Required only when the Expo project has "Enhanced Security for
   // Push Notifications" enabled — Expo then rejects unauthenticated sends.
   private readonly expoAccessToken: string;
@@ -287,6 +291,17 @@ export class NotificationPushService {
       this.logger.warn(
         `Expo receipt poll failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'expo_push',
+        operation: 'get_receipts',
+        error,
+      });
+      reportOperationalError(error, {
+        component: 'NotificationPushService',
+        operation: 'pollReceipts',
+        kind: 'expo_push',
+      });
       await this.reconcileCompletedOutboxes(settledOutboxIDs);
       return { processed: expired.length, done: true };
     }
@@ -502,6 +517,19 @@ export class NotificationPushService {
           this.logger.warn(
             `Expo push send failed after ${attempt} attempts: ${message}`,
           );
+          logExternalCallFailure(this.logger, {
+            enabled: this.loggingConfig.externalLogOn,
+            service: 'expo_push',
+            operation: 'send',
+            error,
+          });
+          // outbox 会退避重试,所以这不是丢推送;但 Expo 持续不可达时只有
+          // 这里能把「推送整体停摆」送进错误聚合(按签名 60s 去重)。
+          reportOperationalError(error, {
+            component: 'NotificationPushService',
+            operation: 'sendToTokens',
+            kind: 'expo_push',
+          });
           return tokens.map((token) => ({
             token,
             status: 'RETRYABLE',

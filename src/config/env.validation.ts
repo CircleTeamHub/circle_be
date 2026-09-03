@@ -144,6 +144,8 @@ export function createEnvValidationSchema(
     SENTRY_DSN: Joi.string().uri().optional(),
     SENTRY_ENVIRONMENT: Joi.string().optional(),
     SENTRY_RELEASE: Joi.string().optional(),
+    // Optional performance tracing sample rate (0..1). Unset / 0 = errors only.
+    SENTRY_TRACES_SAMPLE_RATE: Joi.number().min(0).max(1).optional(),
     // When set, /metrics requires `Authorization: Bearer <token>`. Leave unset
     // only when the metrics port is reachable from a trusted network alone.
     METRICS_AUTH_TOKEN: Joi.string().optional(),
