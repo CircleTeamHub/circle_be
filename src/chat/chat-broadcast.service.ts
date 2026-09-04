@@ -42,7 +42,12 @@ export class ChatBroadcastService {
    * 旧会话房。个人房是连接期稳定标识，收件人则每次由当前 ChatMember 校验。
    */
   async emitMessage(message: ChatMessageDto): Promise<void> {
-    await this.emitMessageToAuthorizedUsers(message, []);
+    await this.emitContentToAuthorizedUsers(
+      'emitMessage',
+      CHAT_EVENTS.message,
+      message,
+      [],
+    );
   }
 
   /** 新消息 → 当前在座成员个人房，并显式排除指定用户的全部设备。 */
@@ -52,7 +57,13 @@ export class ChatBroadcastService {
   ): Promise<void> {
     const server = this.requireServer('emitMessageExcludingUsers');
     if (!server) return;
-    await this.emitMessageToAuthorizedUsers(message, excludeUserIds, server);
+    await this.emitContentToAuthorizedUsers(
+      'emitMessageExcludingUsers',
+      CHAT_EVENTS.message,
+      message,
+      excludeUserIds,
+      server,
+    );
   }
 
   /** 已读水位推进 → 会话房。 */
@@ -177,13 +188,14 @@ export class ChatBroadcastService {
       .emit(CHAT_EVENTS.reaction, payload);
   }
 
-  /** 消息编辑 → 会话房。 */
-  emitEdit(payload: ChatEditBroadcast): void {
-    const server = this.requireServer('emitEdit');
-    if (!server) return;
-    server
-      .to(conversationRoom(payload.conversationId))
-      .emit(CHAT_EVENTS.edit, payload);
+  /** 编辑包含完整新正文，与 chat:msg 共用当前在座成员授权投递。 */
+  async emitEdit(payload: ChatEditBroadcast): Promise<void> {
+    await this.emitContentToAuthorizedUsers(
+      'emitEdit',
+      CHAT_EVENTS.edit,
+      payload,
+      [],
+    );
   }
 
   /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */
@@ -256,24 +268,26 @@ export class ChatBroadcastService {
     }
   }
 
-  private async emitMessageToAuthorizedUsers(
-    message: ChatMessageDto,
+  private async emitContentToAuthorizedUsers(
+    caller: string,
+    event: string,
+    payload: ChatMessageDto | ChatEditBroadcast,
     excludeUserIds: readonly string[],
     attachedServer?: Server,
   ): Promise<void> {
-    const server = attachedServer ?? this.requireServer('emitMessage');
+    const server = attachedServer ?? this.requireServer(caller);
     if (!server) return;
 
     let onlineUserIds: string[] | null = null;
     try {
       onlineUserIds = await this.presence.getOnlineUserIds(
-        message.conversationId,
+        payload.conversationId,
       );
     } catch (error) {
       // Registry is an optimization only. A read failure falls back to the DB
       // active-seat set; targeting empty offline user rooms is harmless.
       this.logger.warn(
-        `message presence lookup failed conversation=${message.conversationId}: ${
+        `content broadcast presence lookup failed conversation=${payload.conversationId}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
@@ -287,7 +301,7 @@ export class ChatBroadcastService {
     // ChatMember rows before selecting user rooms.
     const seats = await this.prisma.chatMember.findMany({
       where: {
-        conversationID: message.conversationId,
+        conversationID: payload.conversationId,
         leftAt: null,
         ...(candidateUserIds ? { userID: { in: candidateUserIds } } : {}),
       },
@@ -303,7 +317,7 @@ export class ChatBroadcastService {
       ),
     ];
     if (rooms.length === 0) return;
-    server.to(rooms).emit(CHAT_EVENTS.message, message);
+    server.to(rooms).emit(event, payload);
   }
 
   private requireServer(caller: string): Server | null {

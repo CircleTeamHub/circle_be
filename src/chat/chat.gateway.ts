@@ -1257,12 +1257,20 @@ export class ChatGateway implements OnModuleDestroy {
         payload?.content,
       );
       reply({ ok: true });
-      this.broadcast.emitEdit({
-        conversationId,
-        messageId,
-        content: dto.content,
-        editedAt: dto.editedAt ?? new Date().toISOString(),
-      });
+      try {
+        await this.broadcast.emitEdit({
+          conversationId,
+          messageId,
+          content: dto.content,
+          editedAt: dto.editedAt ?? new Date().toISOString(),
+        });
+      } catch (error) {
+        // 编辑已经提交且 ack 已成功。授权查询/投递失败时安全地不广播，
+        // 也不把可能含 adapter/DB 细节的错误正文写入日志。
+        this.logger.warn(
+          `edit realtime broadcast failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     } catch (error) {
       reply(this.toAckError(error, 'edit', userId, payload?.conversationId));
     }

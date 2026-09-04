@@ -590,7 +590,15 @@ export class CircleService {
     });
 
     for (const message of systemMessages) {
-      await this.systemMessage.broadcastSystemMessage(message);
+      try {
+        await this.systemMessage.broadcastSystemMessage(message);
+      } catch (error) {
+        // 设置与审计行已经提交；实时投递失败不能把成功 mutation 伪装成失败。
+        // 只记错误类型，避免 adapter/DB message 带出群名、公告或用户标识。
+        this.logger.warn(
+          `circle audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
 
     return this.getCircleDetail(userId, circleId);

@@ -1103,6 +1103,54 @@ describe('GroupService reportGroup', () => {
     expect(completed).toBe(true);
   });
 
+  it('returns committed removal success when excluded audit realtime delivery rejects', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+    chatSystemMessage.broadcastSystemMessageExcludingUsers.mockRejectedValueOnce(
+      new Error('adapter leaked target-user removal content'),
+    );
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      service.removeGroupMember('admin-1', 'group-1', 'target-user'),
+    ).resolves.toEqual({ handled: true });
+
+    expect(prisma.circleMember.delete).toHaveBeenCalled();
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).toHaveBeenCalledTimes(1);
+    expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      'group audit realtime delivery failed after commit (Error)',
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+      /admin-1|target-user|adapter leaked/,
+    );
+    warn.mockRestore();
+  });
+
   it('does not detach or broadcast when removal creates a DTO but commit rejects', async () => {
     chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
     prisma.chatConversation.findUnique.mockResolvedValue({
@@ -1544,6 +1592,58 @@ describe('GroupService reportGroup', () => {
       role: CircleMemberRole.ADMIN,
     });
     expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the committed role change when audit realtime delivery rejects', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.circleMember.update.mockResolvedValue({});
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    chatSystemMessage.broadcastSystemMessage.mockRejectedValueOnce(
+      new Error('adapter leaked target-user role content'),
+    );
+    const warn = jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+
+    await expect(
+      service.updateGroupMemberRole('owner-1', 'group-1', 'target-user', {
+        role: groupMemberDtos.GroupMemberRoleInput.ADMIN,
+      }),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(prisma.circleMember.update).toHaveBeenCalled();
+    expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'group audit realtime delivery failed after commit (Error)',
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+      /owner-1|target-user|adapter leaked/,
+    );
+    warn.mockRestore();
   });
 
   it('audits demotion with the previous and new role', async () => {

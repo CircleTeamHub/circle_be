@@ -255,7 +255,15 @@ export class GroupService {
     });
 
     if (roleResult.message) {
-      await this.systemMessage.broadcastSystemMessage(roleResult.message);
+      try {
+        await this.systemMessage.broadcastSystemMessage(roleResult.message);
+      } catch (error) {
+        // 角色与审计行已经提交；实时投递只做 best-effort，且不记录可能含
+        // 用户/群组信息的底层错误正文。
+        this.logger.warn(
+          `group audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
 
     if (roleResult.changed) {
@@ -495,10 +503,17 @@ export class GroupService {
       );
     }
     if (removalResult.message) {
-      await this.systemMessage.broadcastSystemMessageExcludingUsers(
-        removalResult.message,
-        [normalizedTargetUserID],
-      );
+      try {
+        await this.systemMessage.broadcastSystemMessageExcludingUsers(
+          removalResult.message,
+          [normalizedTargetUserID],
+        );
+      } catch (error) {
+        // 移除、座位与审计行已经提交；失败时禁止退回会话房广播。
+        this.logger.warn(
+          `group audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
 
     logBusinessEvent(this.logger, {

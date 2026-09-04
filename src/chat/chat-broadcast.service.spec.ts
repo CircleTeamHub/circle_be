@@ -21,11 +21,15 @@ function prismaWithActiveUsers(userIDs: string[]) {
   };
 }
 
-function realRemoteSocket(adapter: Record<string, unknown>, id = 'socket-1') {
+function realRemoteSocket(
+  adapter: Record<string, unknown>,
+  id = 'socket-1',
+  rooms: string[] = [id],
+) {
   return new RemoteSocket(adapter as never, {
     id,
     handshake: {} as never,
-    rooms: [id],
+    rooms,
     data: { userId: 'removed-user' },
   });
 }
@@ -365,5 +369,50 @@ describe('ChatBroadcastService member eviction', () => {
 
     expect(to).toHaveBeenCalledWith(['u:active-user']);
     expect(emit).toHaveBeenCalledWith('chat:msg', message());
+  });
+});
+
+describe('ChatBroadcastService content-bearing edit privacy', () => {
+  it('does not deliver an edit to a removed real RemoteSocket that remains in the stale conversation room', async () => {
+    const activeSocket = realRemoteSocket({}, 'active-socket', [
+      'c:conv-1',
+      'u:active-user',
+    ]);
+    const removedSocket = realRemoteSocket({}, 'removed-socket', [
+      'c:conv-1',
+      'u:removed-user',
+    ]);
+    const deliveries: string[] = [];
+    const to = jest.fn((targetRooms: string | string[]) => ({
+      emit: jest.fn(() => {
+        const rooms = Array.isArray(targetRooms) ? targetRooms : [targetRooms];
+        for (const socket of [activeSocket, removedSocket]) {
+          if (rooms.some((room) => socket.rooms.has(room))) {
+            deliveries.push(socket.id);
+          }
+        }
+      }),
+    }));
+    const presence = {
+      getOnlineUserIds: jest
+        .fn()
+        .mockResolvedValue(['active-user', 'removed-user']),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers(['active-user']) as never,
+    );
+    service.setServer({ to } as never);
+
+    await service.emitEdit({
+      conversationId: 'conv-1',
+      messageId: 'message-1',
+      content: { text: 'private edit' },
+      editedAt: '2026-09-03T00:00:00.000Z',
+    });
+
+    expect(removedSocket.rooms.has('c:conv-1')).toBe(true);
+    expect(to).toHaveBeenCalledWith(['u:active-user']);
+    expect(deliveries).toEqual(['active-socket']);
   });
 });

@@ -1348,6 +1348,51 @@ describe('CircleService', () => {
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
+    it.each([
+      {
+        label: 'rename',
+        update: { name: 'committed private name' },
+      },
+      {
+        label: 'notice',
+        update: { description: 'committed private notice' },
+      },
+    ])(
+      'returns committed success when the $label audit realtime delivery rejects',
+      async ({ update }) => {
+        prisma.circleMember.findUnique.mockResolvedValue({
+          role: 'OWNER',
+          status: 'ACTIVE',
+        });
+        chatSystemMessage.broadcastSystemMessage.mockRejectedValueOnce(
+          new Error('adapter leaked private audit content'),
+        );
+        const warn = jest
+          .spyOn((service as any).logger, 'warn')
+          .mockImplementation(() => undefined);
+
+        await expect(
+          service.updateCircle(
+            'owner-1',
+            'circle-1',
+            update as UpdateCircleDto,
+          ),
+        ).resolves.toMatchObject({ id: 'circle-1', myRole: 'OWNER' });
+
+        expect(prisma.circle.update).toHaveBeenCalled();
+        expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(
+          1,
+        );
+        expect(warn).toHaveBeenCalledWith(
+          'circle audit realtime delivery failed after commit (Error)',
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+          /owner-1|committed private|adapter leaked/,
+        );
+        warn.mockRestore();
+      },
+    );
+
     it('does not log unrelated or no-op circle updates', async () => {
       prisma.circleMember.findUnique.mockResolvedValue({
         role: 'OWNER',

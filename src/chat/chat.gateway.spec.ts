@@ -35,6 +35,7 @@ describe('ChatGateway', () => {
     listConversationIds: jest.fn(),
     sendMessage: jest.fn(),
     markRead: jest.fn(),
+    editMessage: jest.fn(),
     getActiveTempChat: jest.fn(),
     hasSeat: jest.fn(),
     filterVisiblePresenceTargets: jest.fn(),
@@ -46,6 +47,7 @@ describe('ChatGateway', () => {
     emitMessage: jest.fn(),
     emitRead: jest.fn(),
     emitTyping: jest.fn(),
+    emitEdit: jest.fn(),
     emitPresence: jest.fn(),
     isUserOnline: jest.fn().mockResolvedValue(false),
   };
@@ -1040,6 +1042,49 @@ describe('ChatGateway', () => {
       await expect(
         gateway['handleSend'](fakeSocket() as never, 'u1', payload as never),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('handleEdit', () => {
+    it('keeps the committed success ack and fails closed when authorized edit delivery rejects', async () => {
+      chatService.editMessage.mockResolvedValue({
+        content: { text: 'updated private content' },
+        editedAt: '2026-09-03T00:00:00.000Z',
+      });
+      broadcast.emitEdit.mockRejectedValueOnce(
+        new Error('private edit adapter detail'),
+      );
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      const ack = jest.fn();
+
+      await gateway['handleEdit'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          content: { text: 'updated private content' },
+        },
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(broadcast.emitEdit).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        messageId: 'message-1',
+        content: { text: 'updated private content' },
+        editedAt: '2026-09-03T00:00:00.000Z',
+      });
+      expect(broadcast.emitMessage).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        'edit realtime broadcast failed after commit (Error)',
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(
+        'private edit adapter detail',
+      );
+      warn.mockRestore();
     });
   });
 
