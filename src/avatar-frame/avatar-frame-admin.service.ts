@@ -3,6 +3,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { AvatarFrameErrorCode } from 'src/common/app-error-codes';
 import { Prisma } from 'src/generated/prisma';
@@ -22,6 +23,8 @@ import {
   CreateAvatarFrameGrantDto,
   RevokeAvatarFrameGrantDto,
 } from './dto/avatar-frame-admin.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 type GrantRow = {
   id: string;
@@ -86,6 +89,8 @@ const ADMIN_GRANT_SELECT = {
 
 @Injectable()
 export class AvatarFrameAdminService {
+  private readonly logger = new Logger(AvatarFrameAdminService.name);
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly avatarFrames: AvatarFrameService,
@@ -258,6 +263,15 @@ export class AvatarFrameAdminService {
 
     if (result.created) {
       await this.avatarFrames.publishAppearanceChanged(targetUserId);
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'avatar_frame_granted',
+        actorId: operatorUserId,
+        targetId: targetUserId,
+        result: 'success',
+        entityType: 'avatar_frame_grant',
+        entityId: result.grant.id,
+      });
     }
     return {
       replayed: !result.created,

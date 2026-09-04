@@ -11,6 +11,9 @@ import {
   WebhookReceiver,
 } from 'livekit-server-sdk';
 import type { CallType } from 'src/generated/prisma';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 type MintJoinTokenInput = {
   identity: string;
@@ -58,6 +61,7 @@ async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
 @Injectable()
 export class LiveKitCallService {
   private readonly logger = new Logger(LiveKitCallService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly url: string;
   private readonly apiKey: string;
   private readonly apiSecret: string;
@@ -96,6 +100,8 @@ export class LiveKitCallService {
       maxParticipants: input.maxParticipants,
       metadata: input.metadata,
     });
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
     try {
       await withTimeout(work, 'LiveKit createRoom');
     } catch (error) {
@@ -107,6 +113,14 @@ export class LiveKitCallService {
       ) {
         return;
       }
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'livekit',
+        operation: 'create_room',
+        durationMs: Date.now() - start,
+        error,
+      });
       // review 修复：超时 ≠ 失败 —— 竞输的 createRoom 可能仍在 LiveKit 侧
       // 成功，留下一间无人认领的孤儿房。round 2：补偿删除**链在原请求落定
       // 之后** —— 立刻删会赶在慢 create 落地之前空转，随后 create 成功照样
@@ -117,23 +131,51 @@ export class LiveKitCallService {
           .catch(() => undefined);
       }
       throw new ServiceUnavailableException('LiveKit room creation failed');
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'livekit',
+        operation: 'create_room',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
     }
   }
 
   async deleteRoom(roomName: string): Promise<void> {
     this.assertConfigured();
 
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
     try {
       await withTimeout(
         this.roomService!.deleteRoom(roomName),
         'LiveKit deleteRoom',
       );
     } catch (error) {
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'livekit',
+        operation: 'delete_room',
+        durationMs: Date.now() - start,
+        error,
+      });
       this.logger.warn(
         `Failed to delete LiveKit room ${roomName}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'livekit',
+        operation: 'delete_room',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
     }
   }
 

@@ -59,6 +59,8 @@ import {
   UpdateNoteDto,
   UpdateNoteGroupDto,
 } from './dto/note.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 // ── BlockNote inline content types ───────────────────────────────────────────
 // These mirror the BlockNote default schema as documented at
@@ -377,6 +379,7 @@ function escapeXml(value: string) {
 @Injectable()
 export class NoteService {
   private readonly logger = new Logger(NoteService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly storagePublicObjectBase: string | null;
 
   constructor(
@@ -1749,6 +1752,15 @@ export class NoteService {
           });
         });
 
+        logBusinessEvent(this.logger, {
+          enabled: this.loggingConfig.businessLogOn,
+          businessEvent: 'note_share_link_created',
+          actorId: ownerID,
+          result: 'success',
+          entityType: 'note_share_link',
+          entityId: row.id,
+          metadata: { noteCount: noteIDs.length },
+        });
         return this.mapShareLink(row);
       } catch (error) {
         if (prismaErrorCode(error) === 'P2002' && attempt < 2) continue;
@@ -1863,7 +1875,17 @@ export class NoteService {
       where: { id: linkId, ownerID, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-    if (count > 0) return;
+    if (count > 0) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'note_share_link_revoked',
+        actorId: ownerID,
+        result: 'success',
+        entityType: 'note_share_link',
+        entityId: linkId,
+      });
+      return;
+    }
 
     // count === 0 有两种可能，必须区分：已经吊销过（幂等成功）vs 不存在 / 不是
     // 你的（404）。兜底查询同样带 ownerID，所以「别人的链接」与「不存在」返回

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Logger } from '@nestjs/common';
 import { Cron, CronExpression, CronOptions } from '@nestjs/schedule';
 import { jobMetrics, type JobMetrics } from './job-metrics';
+import { reportOperationalError } from '../logging/error-aggregation.service';
 
 /**
  * 各 cron 表达式的预期周期（秒），导出成 `circle_cron_interval_seconds`。
@@ -102,7 +103,10 @@ export function reportJobSkipped(): void {
 
 /**
  * 执行一次任务并记账：成功/失败/跳过计数、耗时、成功心跳。**不吞异常** ——
- * 原样重抛，让 @sentry/node 的进程级集成照旧收到未处理 rejection。
+ * 原样重抛；但重抛之前先送进错误聚合（reportOperationalError）。之前的注释以为
+ * @sentry/node 的进程级集成会收到它：并不会 —— @nestjs/schedule 没给 cron 传
+ * errorHandler，`cron` 库把 onTick 抛出的异常直接 console.error 吞掉了，既不进
+ * Winston 也不进 Sentry。这里是定时任务异常唯一的聚合入口。
  *
  * 「正常返回但调用过 reportHandledJobFailure()」与「抛异常」记为同一种结果。
  * 调用过 reportJobSkipped() 的那一轮记成 skipped：只计数，心跳、耗时、
@@ -145,6 +149,11 @@ export async function runTracked<T>(
     return result;
   } catch (error) {
     metrics.recordRun(job, 'failure', (clock.elapsedMs() - startedAt) / 1000);
+    reportOperationalError(error, {
+      component: 'TrackedCron',
+      operation: job,
+      kind: 'cron',
+    });
     throw error;
   }
 }

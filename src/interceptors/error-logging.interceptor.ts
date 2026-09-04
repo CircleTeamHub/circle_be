@@ -1,13 +1,17 @@
 import {
   CallHandler,
   ExecutionContext,
-  HttpException,
   Injectable,
   LoggerService,
   NestInterceptor,
 } from '@nestjs/common';
 import { Observable, catchError, throwError } from 'rxjs';
 import { createLoggingConfig } from 'src/logging/logging.config';
+import { resolveErrorStatusCode } from '../filters/prisma-error-status';
+import {
+  markErrorCaptured,
+  markSecurityEventLogged,
+} from '../logging/handled-errors';
 import { getRequestContext } from '../logging/request-context';
 import { logSecurityEvent } from '../logging/security-event.logger';
 import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
@@ -31,8 +35,10 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
     return next.handle().pipe(
       catchError((error: unknown) => {
         const requestContext = getRequestContext();
-        const statusCode =
-          error instanceof HttpException ? error.getStatus() : 500;
+        // Known Prisma codes become 4xx in PrismaExceptionFilter; classifying
+        // them as 500 here would log every unique-constraint race as an
+        // incident and forward it to Sentry.
+        const statusCode = resolveErrorStatusCode(error);
         const errorObject = error instanceof Error ? error : undefined;
 
         this.logger.error(
@@ -52,14 +58,33 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
           'HttpError',
         );
 
+        // Wrapped like the aggregation call below: a throwing log transport
+        // must never replace the original error in this projection.
         if (statusCode === 401 || statusCode === 403) {
-          logSecurityEvent(this.logger, {
-            enabled: this.loggingConfig.securityLogOn,
-            securityEvent:
-              statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
-            statusCode,
-            reason: errorObject?.message ?? String(error),
-          });
+          try {
+            logSecurityEvent(this.logger, {
+              enabled: this.loggingConfig.securityLogOn,
+              securityEvent:
+                statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
+              statusCode,
+              reason: errorObject?.message ?? String(error),
+            });
+            // AllExceptionFilter sees this same exception next; the marker
+            // keeps it from logging the security event a second time.
+            markSecurityEventLogged(error);
+          } catch (loggingError) {
+            this.logger.error(
+              {
+                event: 'security_event_log_failed',
+                requestId: requestContext?.requestId,
+                message:
+                  loggingError instanceof Error
+                    ? loggingError.message
+                    : String(loggingError),
+              },
+              'HttpError',
+            );
+          }
         }
 
         // Forward only unexpected server errors to optional aggregation
@@ -76,6 +101,7 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
               path: requestContext?.path,
               userId: requestContext?.userId,
             });
+            markErrorCaptured(error);
           } catch (aggregationError) {
             this.logger.error(
               {

@@ -4,6 +4,7 @@ import { TrackedCron } from '../metrics/tracked-cron.decorator';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const GRACE_MS = 2 * 60 * 1000;
 // review 修复：5 次（≈5 分钟）就永久放弃会让一次略长的数据库抖动永久
@@ -96,6 +97,11 @@ export class GiftCardOutboxProcessor {
             `transfer card PERMANENTLY failed after ${attemptsNow} attempts ` +
               `gift=${gift.id} sender=${gift.senderID} recipient=${gift.recipientID} amount=${gift.amount}`,
           );
+          reportOperationalError(err, {
+            component: 'GiftCardOutboxProcessor',
+            operation: 'compensate',
+            kind: 'permanent_failure',
+          });
         } else {
           this.logger.warn(
             `transfer card compensation failed for gift ${gift.id}: ${

@@ -16,6 +16,7 @@ import {
   CHAT_NOTE_IMPORT_SEGMENT,
 } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 /**
  * 聊天媒体 presign-on-read(根治 OpenIM「URL 固化进不可变消息体」的 P0)。
@@ -324,6 +325,11 @@ export class ChatMediaService implements OnModuleDestroy {
           dbError instanceof Error ? dbError.message : String(dbError)
         }`,
       );
+      reportOperationalError(dbError, {
+        component: 'ChatMediaService',
+        operation: 'queueDelete',
+        kind: 'database',
+      });
     }
   }
 

@@ -3,6 +3,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { GroupExpansionErrorCode } from 'src/common/app-error-codes';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
@@ -18,6 +19,8 @@ import {
   GroupExpansionProductId,
   getGroupExpansionProduct,
 } from './group-expansion.catalog';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 interface StoredExpansionOrder {
   id: string;
@@ -79,6 +82,8 @@ export interface GroupExpansionOrdersResult {
 
 @Injectable()
 export class GroupExpansionService {
+  private readonly logger = new Logger(GroupExpansionService.name);
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly membershipPolicy: MembershipPolicyService,
@@ -411,6 +416,22 @@ export class GroupExpansionService {
             delta: -product.price,
           }),
       ]);
+    }
+    if (transactionResult.created) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'group_expansion_purchased',
+        actorId: userId,
+        result: 'success',
+        entityType: 'circle',
+        entityId: circleId,
+        metadata: {
+          orderId: transactionResult.purchase.orderId,
+          productId: product.id,
+          seats: product.seats,
+          price: product.price,
+        },
+      });
     }
     return transactionResult.purchase;
   }

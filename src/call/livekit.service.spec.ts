@@ -1,4 +1,4 @@
-import { ServiceUnavailableException } from '@nestjs/common';
+import { ServiceUnavailableException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LiveKitCallService } from './livekit.service';
 
@@ -117,5 +117,54 @@ describe('LiveKitCallService', () => {
     jest.spyOn(service, 'deleteRoom').mockResolvedValueOnce(undefined);
 
     await expect(service.deleteRoom('circle_call_1')).resolves.toBeUndefined();
+  });
+});
+
+describe('LiveKitCallService external-call logging', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = {
+      ...originalEnv,
+      NODE_ENV: 'development',
+      LOG_ON: 'true',
+      EXTERNAL_LOG_ON: 'true',
+    };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    jest.restoreAllMocks();
+  });
+
+  it('logs external_call_failed and surfaces a 503 when room creation fails', async () => {
+    const env: Record<string, string> = {
+      LIVEKIT_URL: 'wss://livekit.example.com',
+      LIVEKIT_API_KEY: 'key',
+      LIVEKIT_API_SECRET: 'secret',
+    };
+    const service = new LiveKitCallService({
+      get: jest.fn((key: string) => env[key]),
+    } as unknown as ConfigService);
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    jest
+      .spyOn((service as any).roomService, 'createRoom')
+      .mockRejectedValue(new Error('connect ECONNREFUSED 10.0.0.1:7880'));
+
+    await expect(
+      service.createRoom({ name: 'circle_call_1', maxParticipants: 4 }),
+    ).rejects.toThrow(ServiceUnavailableException);
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'external_call_failed',
+        service: 'livekit',
+        operation: 'create_room',
+        errorName: 'Error',
+      }),
+      'ExternalService',
+    );
   });
 });

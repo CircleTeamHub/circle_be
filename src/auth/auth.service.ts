@@ -61,6 +61,8 @@ import {
   readReferralRules,
   type ReferralRules,
 } from 'src/referral/referral.rules';
+import { logSecurityEvent } from 'src/logging/security-event.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const ME_SELECT = USER_ME_SELECT;
 
@@ -707,6 +709,14 @@ export class AuthService {
 
   async logoutSession(userId: string, sessionId: string): Promise<void> {
     await this.refreshTokenService.revokeSession(userId, sessionId);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_session_logout',
+      actorId: userId,
+      result: 'success',
+      entityType: 'session',
+      entityId: sessionId,
+    });
   }
 
   async logoutOtherSessions(
@@ -717,6 +727,14 @@ export class AuthService {
       userId,
       currentSessionId,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_other_sessions_logout',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   async getSingleDeviceLoginStatus(
@@ -756,6 +774,15 @@ export class AuthService {
       enabled,
       currentSessionId,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_single_device_login_changed',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+      metadata: { enabled },
+    });
   }
 
   async me(userId: string): Promise<SafeUser> {
@@ -808,6 +835,12 @@ export class AuthService {
         normalizeEmail(email),
         'RESET_PASSWORD',
       );
+      // 不带 actorId / 邮箱：请求方未认证，且邮箱是 PII；只留「发生过」。
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'auth_password_reset_requested',
+        result: 'success',
+      });
     } catch (error) {
       // review 修复（防枚举）：冷却检查先于「未注册邮箱静默成功」——60s 内
       // 重复请求时，已注册邮箱会拿到 CodeRateLimited、未注册邮箱恒静默成功，
@@ -821,6 +854,12 @@ export class AuthService {
         this.logger.error(
           'password reset code delivery failed (mailer unavailable); returning generic success to stay non-enumerable',
         );
+        // 用户侧看不出任何异常（防枚举），所以运维侧必须能看到：邮件服务挂了。
+        reportOperationalError(error, {
+          component: 'AuthService',
+          operation: 'requestPasswordReset',
+          kind: 'mailer_unavailable',
+        });
         return;
       }
       throw error;
@@ -1125,6 +1164,14 @@ export class AuthService {
         securityCodeLockedUntil: null,
       },
     });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_security_code_set',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
+    });
   }
 
   async disableLoginSecurityCode(
@@ -1164,6 +1211,14 @@ export class AuthService {
         securityCodeAttempts: 0,
         securityCodeLockedUntil: null,
       },
+    });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_security_code_disabled',
+      actorId: userId,
+      result: 'success',
+      entityType: 'user',
+      entityId: userId,
     });
   }
 
@@ -1217,6 +1272,15 @@ export class AuthService {
             ? new Date(now.getTime() + SECURITY_CODE_LOCK_MS)
             : user.securityCodeLockedUntil,
         },
+      });
+      logSecurityEvent(this.logger, {
+        enabled: this.loggingConfig.securityLogOn,
+        securityEvent: shouldLock
+          ? 'security_code_locked'
+          : 'security_code_invalid',
+        statusCode: shouldLock ? 403 : 200,
+        userId,
+        metadata: { attempts },
       });
       if (shouldLock) {
         this.logger.warn(

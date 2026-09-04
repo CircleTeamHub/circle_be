@@ -17,6 +17,8 @@ import {
   runSerializableTransaction,
 } from 'src/utils/prisma-tx';
 import { CoinTransactionDto, WalletDto } from './dto/coin.dto';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 // Max coins a user can send in a single gift
 const GIFT_MAX_SINGLE = 10_000;
@@ -28,6 +30,7 @@ const GIFT_DAILY_LIMIT = 50_000;
 export class CoinService {
   private readonly logger = new Logger(CoinService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtimeService: RealtimeService,
@@ -271,6 +274,16 @@ export class CoinService {
     this.logger.log(
       `Gift sent: ${senderId} → ${recipientId} (${amount} coins)`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'coin_gift_sent',
+      actorId: senderId,
+      targetId: recipientId,
+      result: 'success',
+      entityType: 'coin_gift',
+      entityId: giftId ?? undefined,
+      metadata: { amount },
+    });
 
     if (giftId) {
       // **不 await**(review P1)。钱已经落库,这一步只是发凭证 —— 但它要碰聊天库

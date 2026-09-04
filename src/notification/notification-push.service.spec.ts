@@ -1,6 +1,10 @@
 import { PrismaService } from 'src/prisma/prisma.service';
 import { NotificationPushService } from './notification-push.service';
 
+jest.mock('src/logging/error-aggregation.service', () => ({
+  reportOperationalError: jest.fn(),
+}));
+
 describe('NotificationPushService (#88 per-token delivery)', () => {
   const prisma = {
     devicePushToken: {
@@ -160,6 +164,25 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(outcomes[0].status).toBe('RETRYABLE');
       expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('forwards an exhausted Expo send failure to error aggregation', async () => {
+      const { reportOperationalError } = jest.requireMock(
+        'src/logging/error-aggregation.service',
+      ) as { reportOperationalError: jest.Mock };
+      reportOperationalError.mockClear();
+      fetchMock.mockRejectedValue(new Error('ECONNRESET'));
+
+      await service.sendToTokens(
+        [{ token: 'tok-a', projectId: null }],
+        payload,
+      );
+
+      expect(reportOperationalError).toHaveBeenCalledWith(expect.any(Error), {
+        component: 'NotificationPushService',
+        operation: 'sendToTokens',
+        kind: 'expo_push',
+      });
     });
 
     it('groups tokens by Expo project id into separate requests', async () => {

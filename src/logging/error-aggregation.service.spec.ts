@@ -12,6 +12,8 @@ import {
   reportOperationalError,
   type ErrorAggregationProvider,
   type SentryClientLike,
+  sanitizeAutomaticTransaction,
+  sanitizeTransactionName,
 } from './error-aggregation.service';
 import { execFileSync } from 'node:child_process';
 
@@ -31,6 +33,7 @@ describe('createErrorAggregationConfig', () => {
       dsn: undefined,
       environment: 'development',
       release: undefined,
+      tracesSampleRate: 0,
     });
   });
 
@@ -50,6 +53,7 @@ describe('createErrorAggregationConfig', () => {
       dsn: 'https://public@o0.ingest.sentry.io/1',
       environment: 'staging',
       release: 'circle-be@1.2.3',
+      tracesSampleRate: 0,
     });
   });
 
@@ -492,5 +496,107 @@ describe('NoopErrorAggregationProvider', () => {
       provider.captureError(new Error('x'), { statusCode: 500 }),
     ).not.toThrow();
     await expect(provider.flush()).resolves.toBe(true);
+  });
+});
+
+describe('performance tracing configuration', () => {
+  it('parses SENTRY_TRACES_SAMPLE_RATE and treats out-of-range values as off', () => {
+    expect(
+      createErrorAggregationConfig(
+        { SENTRY_TRACES_SAMPLE_RATE: '0.25' },
+        'production',
+      ).tracesSampleRate,
+    ).toBe(0.25);
+    expect(
+      createErrorAggregationConfig(
+        { SENTRY_TRACES_SAMPLE_RATE: '7' },
+        'production',
+      ).tracesSampleRate,
+    ).toBe(0);
+    expect(
+      createErrorAggregationConfig(
+        { SENTRY_TRACES_SAMPLE_RATE: 'lots' },
+        'production',
+      ).tracesSampleRate,
+    ).toBe(0);
+  });
+
+  it('passes the sample rate and a transaction sanitizer to Sentry.init', () => {
+    const options = createSentryInitOptions({
+      provider: 'sentry',
+      dsn: 'https://a@o/1',
+      environment: 'production',
+      tracesSampleRate: 0.1,
+    });
+
+    expect(options.tracesSampleRate).toBe(0.1);
+    expect(typeof options.beforeSendTransaction).toBe('function');
+  });
+});
+
+describe('sanitizeAutomaticTransaction', () => {
+  it('keeps only the normalized route, trace ids and span timings', () => {
+    const sanitized = sanitizeAutomaticTransaction({
+      type: 'transaction',
+      event_id: 'e1',
+      timestamp: 2,
+      start_timestamp: 1,
+      platform: 'node',
+      transaction:
+        'GET /api/v1/user/0f8fad5b-d9cb-469f-a165-70867728950e?token=abc',
+      request: {
+        url: 'https://api.example.com/x?token=abc',
+        headers: { authorization: 'Bearer secret' },
+      },
+      user: { id: 'user-1', email: 'a@b.co' },
+      breadcrumbs: [{ message: 'private blue pineapple' }],
+      contexts: {
+        trace: {
+          trace_id: 't1',
+          span_id: 's1',
+          op: 'http.server',
+          status: 'ok',
+          data: { 'http.query': 'token=abc' },
+        },
+      },
+      spans: [
+        {
+          span_id: 's2',
+          trace_id: 't1',
+          op: 'db.query',
+          description: 'SELECT * FROM "User" WHERE email = \'a@b.co\'',
+          start_timestamp: 1,
+          timestamp: 1.5,
+          data: { 'db.statement': 'SELECT 1' },
+        },
+      ],
+      transaction_info: { source: 'route' },
+    }) as Record<string, any>;
+
+    expect(sanitized.transaction).toMatch(/^GET \/api\/v1\/user\/:id$/);
+    expect(JSON.stringify(sanitized)).not.toMatch(
+      /token=abc|Bearer secret|a@b\.co|blue pineapple|SELECT|user-1/,
+    );
+    expect(sanitized.spans[0]).toEqual({
+      span_id: 's2',
+      trace_id: 't1',
+      op: 'db.query',
+      start_timestamp: 1,
+      timestamp: 1.5,
+    });
+    expect(sanitized.contexts.trace).toEqual({
+      trace_id: 't1',
+      span_id: 's1',
+      op: 'http.server',
+      status: 'ok',
+    });
+    expect(sanitized.transaction_info).toEqual({ source: 'route' });
+  });
+
+  it('redacts transaction names that are not route shaped', () => {
+    expect(sanitizeTransactionName('mailto:someone@example.com')).toBe(
+      '[REDACTED_TRANSACTION]',
+    );
+    expect(sanitizeTransactionName(42)).toBe('[REDACTED_TRANSACTION]');
   });
 });

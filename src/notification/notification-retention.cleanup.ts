@@ -1,8 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CronExpression } from '@nestjs/schedule';
-import { TrackedCron } from '../metrics/tracked-cron.decorator';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const DEFAULT_NOTIFICATION_RETENTION_DAYS = 90;
 const DEFAULT_FRIEND_ACTIVITY_RETENTION_DAYS = 180;
@@ -86,6 +90,12 @@ export class NotificationRetentionCleanup {
           'notification retention sweep failed',
           err instanceof Error ? err.stack : String(err),
         );
+        reportHandledJobFailure();
+        reportOperationalError(err, {
+          component: 'NotificationRetentionCleanup',
+          operation: 'sweep',
+          kind: 'notification',
+        });
       }
     }
 
@@ -118,6 +128,12 @@ export class NotificationRetentionCleanup {
           'friend activity retention sweep failed',
           err instanceof Error ? err.stack : String(err),
         );
+        reportHandledJobFailure();
+        reportOperationalError(err, {
+          component: 'NotificationRetentionCleanup',
+          operation: 'sweep',
+          kind: 'friend_activity',
+        });
       }
     }
   }

@@ -14,7 +14,7 @@
 
 | 工具                | 哪条线     | 检测 / 存储什么数据                         | 现状                      |
 | ------------------- | ---------- | ------------------------------------------- | ------------------------- |
-| **Sentry**          | 错误       | 异常、崩溃、堆栈、出错上下文                | 后端 ✅ 上线 · 前端待激活 |
+| **Sentry**          | 错误       | 异常、崩溃、堆栈、出错上下文；可选性能追踪  | 后端 ✅ 上线 · 前端 ✅ 代码就绪(建包配 DSN) |
 | **Prometheus**      | 指标       | 时序指标的**存储 + 抓取**（存下面所有指标） | ✅ `:9090`                |
 | 后端 `/metrics`     | 指标       | 接口 QPS/错误/延迟、业务事件、进程 CPU/内存 | ✅                        |
 | **node-exporter**   | 指标       | 机器：CPU / 内存 / 磁盘 / 网络 / 负载       | ✅（Mac 上 = Docker VM）  |
@@ -38,11 +38,22 @@
 抓**出错的瞬间**：异常、崩溃，附完整上下文，给工程师修 bug。
 
 - **后端**（`LOG_AGGREGATION_PROVIDER=sentry` + `SENTRY_DSN` 时启用）：
-  - 自动：未处理的 **5xx** 异常（`ErrorLoggingInterceptor`）
-  - 每条带：错误 + 堆栈 + **脱敏**请求上下文（requestId / route / method / userId / status）；不带 body/header/token
+  - 自动：整条 HTTP 管线里的 **5xx** —— 路由处理器（`ErrorLoggingInterceptor`）以及
+    守卫 / 管道 / 中间件 / 未知 Prisma 错误（`AllExceptionFilter`、`PrismaExceptionFilter`）；
+    `handled-errors` 标记保证一次异常只报一次，Prisma 的 P2002/P2025 这类预期内 4xx 不报
+  - 定时任务：每个 `@TrackedCron` 的失败都进 `reportOperationalError`（`cron` 库会把
+    onTick 异常直接 console.error 吞掉，进程级集成收不到）
+  - 运维性失败：聊天 / 实时网关处理失败、outbox 死信（推送、转账卡、管理台群操作、
+    好友聊天回放）、敏感词表 fail-open、桶策略未生效、Expo / SMTP / Redis / LiveKit 故障
+  - 每条带：错误 + 堆栈 + **脱敏**标签（requestId / 归一化 route / method / userId / status /
+    component / operation / kind）；不带 body/header/token
+  - 可选性能追踪：`SENTRY_TRACES_SAMPLE_RATE`（默认 0），transaction 同样按白名单重建
 - **前端**（`EXPO_PUBLIC_SENTRY_DSN` 时启用）：
-  - 自动：JS 未捕获异常、未处理 Promise rejection、**原生崩溃**、React 渲染错误 + 面包屑
-  - 带：设备型号 / OS / App 版本 / release
+  - 自动：JS 未捕获异常、未处理 Promise rejection、**原生崩溃**
+  - 手动：expo-router ErrorBoundary 接住的渲染错误（`RouteErrorBoundary`）；API 网络 / 5xx；
+    业务 catch 站点统一走 `reportHandledFailure`（去重 + 面包屑；ApiError 等预期失败不进 Sentry）：
+    启动 / 存储降级、聊天同步与本地库、通话、推送注册、应用更新、各屏幕的非 API 失败
+  - 带：设备型号 / OS / App 版本 / release；消息文本一律脱敏，不带账号标识
 - **现状**：后端已上线 sentry.io 并验证；前端代码就绪，**待重建 App 激活**
 
 ### 2. Prometheus —— 指标的存储与抓取

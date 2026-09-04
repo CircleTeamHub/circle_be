@@ -12,6 +12,7 @@ import {
   NotificationPushService,
   type ExpoPushPayload,
 } from './notification-push.service';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const BATCH_SIZE = 100;
 const STALE_LOCK_MS = 10 * 60 * 1000;
@@ -218,11 +219,21 @@ export class NotificationPushOutboxProcessor {
               where: { outboxID: job.id, status: 'SENT' },
             }),
           ]);
-          await this.finishJob(
-            job.id,
-            leaseToken,
-            exhausted > 0 && awaitingReceipt === 0 ? 'TERMINAL' : 'COMPLETED',
-          );
+          const finalStatus =
+            exhausted > 0 && awaitingReceipt === 0 ? 'TERMINAL' : 'COMPLETED';
+          if (finalStatus === 'TERMINAL') {
+            // 死信：重试已打光,这条通知再也不会送达。指标看得到积压,这里让
+            // 错误聚合也看到(按签名 60s 去重,洪水期间不会刷屏)。
+            reportOperationalError(
+              new Error('push outbox job exhausted delivery retries'),
+              {
+                component: 'NotificationPushOutboxProcessor',
+                operation: 'processPending',
+                kind: 'terminal',
+              },
+            );
+          }
+          await this.finishJob(job.id, leaseToken, finalStatus);
           processed += 1;
           continue;
         }
@@ -306,6 +317,11 @@ export class NotificationPushOutboxProcessor {
         });
         if (!(error instanceof RetryableDeliveryError)) {
           this.logger.warn(`Push outbox job ${job.id} failed: ${error}`);
+          reportOperationalError(error, {
+            component: 'NotificationPushOutboxProcessor',
+            operation: 'processJob',
+            kind: 'delivery',
+          });
         }
       }
     }

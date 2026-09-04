@@ -24,6 +24,8 @@ import {
   validateCustomFancyNumber,
 } from './fancy-number.rules';
 import { lockFancyNumberUser } from './fancy-number-user-lock';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const FANCY_NUMBER_UNIT_PRICE = 100;
 const FANCY_NUMBER_RECOMMENDATION_LIMIT = 100;
@@ -61,6 +63,7 @@ type FancyNumberTarget =
 export class FancyNumberService {
   private readonly logger = new Logger(FancyNumberService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeService,
@@ -298,6 +301,14 @@ export class FancyNumberService {
         previousExpiresAt: lease.expiresAt,
         newExpiresAt: null,
       },
+    });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'fancy_number_converted_permanent',
+      actorId: userId,
+      result: 'success',
+      entityType: 'fancy_number_lease',
+      entityId: lease.id,
     });
     return true;
   }
@@ -612,6 +623,22 @@ export class FancyNumberService {
         },
         () => this.realtime.broadcastUserProfileSummary(userId),
       ]);
+    }
+    if (!replay.replayed) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'fancy_number_purchased',
+        actorId: userId,
+        result: 'success',
+        entityType: 'fancy_number_order',
+        entityId: replay.result.orderId,
+        metadata: {
+          months: replay.result.months,
+          totalPrice: replay.result.totalPrice,
+          permanent: replay.result.permanent,
+          custom: target.kind === 'custom',
+        },
+      });
     }
     return replay.result;
   }
@@ -1104,6 +1131,17 @@ export class FancyNumberService {
             delta: -replay.result.totalPrice,
           }),
       ]);
+    }
+    if (!replay.replayed) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'fancy_number_renewed',
+        actorId: userId,
+        result: 'success',
+        entityType: 'fancy_number_order',
+        entityId: replay.result.orderId,
+        metadata: { months, totalPrice: replay.result.totalPrice },
+      });
     }
     return replay.result;
   }

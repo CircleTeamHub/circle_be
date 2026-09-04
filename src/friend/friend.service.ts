@@ -707,6 +707,15 @@ export class FriendService {
       }
       await tx.friend.delete({ where: { id: record.id } });
     });
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_removed',
+      actorId: userId,
+      targetId: friendId,
+      result: 'success',
+      entityType: 'friend',
+      entityId: record.id,
+    });
   }
 
   async reportFriend(
@@ -802,6 +811,16 @@ export class FriendService {
     this.logger.warn(
       `Friend report submitted: ${reporterId} → ${friendUserId} (${dto.category})`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_reported',
+      actorId: reporterId,
+      targetId: friendUserId,
+      result: 'success',
+      entityType: 'user',
+      entityId: friendUserId,
+      metadata: { category: dto.category },
+    });
   }
 
   // ─── Lists ────────────────────────────────────────────────────────────────────
@@ -1198,6 +1217,15 @@ export class FriendService {
       }
       throw error;
     }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'friend_unblocked',
+      actorId: blockerId,
+      targetId: targetId,
+      result: 'success',
+      entityType: 'block',
+      entityId: `${blockerId}:${targetId}`,
+    });
   }
 
   async listBlocked(userId: string, page = 1) {

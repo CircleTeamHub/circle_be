@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { EmailCodePurpose } from 'src/generated/prisma';
+import { Logger } from '@nestjs/common';
 
 const createTransportMock = jest.fn();
 const sendMailMock = jest.fn();
@@ -125,5 +126,57 @@ describe('SmtpMailer', () => {
         EmailCodePurpose.LOGIN,
       ),
     ).rejects.toThrow('454 relay refused');
+  });
+});
+
+describe('SmtpMailer external-call logging', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = {
+      ...originalEnv,
+      NODE_ENV: 'development',
+      LOG_ON: 'true',
+      EXTERNAL_LOG_ON: 'true',
+    };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    jest.restoreAllMocks();
+  });
+
+  it('logs external_call_failed without the recipient and rethrows when SMTP rejects', async () => {
+    sendMailMock.mockRejectedValueOnce(
+      new Error('421 4.7.0 too many connections'),
+    );
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const mailer = new SmtpMailer(
+      configWith({
+        SMTP_HOST: 'smtp.example.com',
+        SMTP_USER: 'bot@example.com',
+        SMTP_PASS: 'auth-code',
+      }),
+    );
+
+    await expect(
+      mailer.sendVerificationCode(
+        'person@example.com',
+        '123456',
+        EmailCodePurpose.LOGIN,
+      ),
+    ).rejects.toThrow('421');
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'external_call_failed',
+        service: 'smtp',
+        operation: 'send_verification_code',
+      }),
+      'ExternalService',
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('person@example.com');
   });
 });

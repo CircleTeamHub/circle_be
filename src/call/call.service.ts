@@ -27,6 +27,8 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { CreateDirectCallDto, CreateGroupCallDto } from './dto/call.dto';
 import { LiveKitCallService } from './livekit.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const GROUP_SESSION_TYPE = 3;
 // OpenIM 单聊 sessionType。toCallDto 一直会把非 GROUP 映射成 'single'（此前是死分支）。
@@ -84,6 +86,7 @@ const userLiteSelect = {
 export class CallService {
   private readonly logger = new Logger(CallService.name);
 
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly chatService: ChatService,
@@ -388,6 +391,15 @@ export class CallService {
     this.logger.log(
       `call.created callId=${call.id} conversationID=${conversationID} participants=${participantIDs.length}`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'call_started',
+      actorId: initiatorID,
+      result: 'success',
+      entityType: 'call',
+      entityId: call.id,
+      metadata: { callType, participants: participantIDs.length },
+    });
 
     return {
       call: this.toCallDto(call),
@@ -523,6 +535,14 @@ export class CallService {
     this.logger.log(
       `call.participant_joined callId=${callId} userID=${userID}`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'call_accepted',
+      actorId: userID,
+      result: 'success',
+      entityType: 'call',
+      entityId: callId,
+    });
 
     return {
       call: this.toCallDto(updatedCall as CallWithParticipants),
@@ -594,6 +614,14 @@ export class CallService {
     this.logger.log(
       `call.participant_rejected callId=${callId} userID=${userID}`,
     );
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'call_rejected',
+      actorId: userID,
+      result: 'success',
+      entityType: 'call',
+      entityId: callId,
+    });
     return updatedParticipant;
   }
 
@@ -812,6 +840,14 @@ export class CallService {
       }),
     );
     this.logger.log(`call.canceled callId=${callId} userID=${userID}`);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'call_cancelled',
+      actorId: userID,
+      result: 'success',
+      entityType: 'call',
+      entityId: callId,
+    });
     this.emitCallRecordMessage(canceled, CallEndReason.CANCELED, endedAt);
     return this.toCallDto(canceled);
   }

@@ -38,6 +38,8 @@ import {
   AvatarFrameService,
   PublicUserAppearance,
 } from 'src/avatar-frame/avatar-frame.service';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -198,6 +200,7 @@ function normalizeUpdateInput(input: UpdateUserInput) {
 @Injectable()
 export class UserService {
   private readonly logger = new Logger(UserService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly storagePublicObjectBase: string | null;
 
   constructor(
@@ -588,6 +591,14 @@ export class UserService {
     // A deleted user must lose every active session; otherwise an attacker
     // (or the user themselves) can keep refreshing tokens for up to 7 days.
     await this.refreshTokens.revokeAll(id);
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'user_account_removed',
+      targetId: id,
+      result: 'success',
+      entityType: 'user',
+      entityId: id,
+    });
     const displayIcons = await this.iconService.getDisplayIconsForUser(id);
     let avatarFrameAppearance: AvatarFramePublicAppearance | null = null;
     try {

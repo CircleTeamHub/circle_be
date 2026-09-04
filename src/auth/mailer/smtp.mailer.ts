@@ -3,6 +3,9 @@ import { ConfigService } from '@nestjs/config';
 import { createTransport, type Transporter } from 'nodemailer';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { Mailer } from './mailer.interface';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 
 // 连接/握手/收发同一上限：10s 内没走完某一阶段就放弃，交给上游报可控错误。
 const SMTP_TIMEOUT_MS = 10_000;
@@ -21,6 +24,7 @@ const SMTP_TIMEOUT_MS = 10_000;
 @Injectable()
 export class SmtpMailer implements Mailer {
   private readonly logger = new Logger('SmtpMailer');
+  private readonly loggingConfig = createLoggingConfig();
   private readonly transporter: Transporter;
   private readonly from: string;
 
@@ -66,19 +70,45 @@ export class SmtpMailer implements Mailer {
     purpose: EmailCodePurpose,
   ): Promise<void> {
     const subject = this.subjectFor(purpose);
-    await this.transporter.sendMail({
-      from: this.from,
-      to: email,
-      subject,
-      text: `你的验证码是 ${code}，10 分钟内有效。如果这不是你本人的操作，请忽略本邮件。`,
-      html: [
-        '<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:24px">',
-        `<h2 style="margin:0 0 16px">${subject}</h2>`,
-        `<p style="font-size:32px;font-weight:700;letter-spacing:8px;margin:16px 0">${code}</p>`,
-        '<p style="color:#666">验证码 10 分钟内有效。如果这不是你本人的操作，请忽略本邮件。</p>',
-        '</div>',
-      ].join(''),
-    });
+    const start = Date.now();
+    let result: 'success' | 'failure' = 'success';
+    try {
+      await this.transporter.sendMail({
+        from: this.from,
+        to: email,
+        subject,
+        text: `你的验证码是 ${code}，10 分钟内有效。如果这不是你本人的操作，请忽略本邮件。`,
+        html: [
+          '<div style="font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:24px">',
+          `<h2 style="margin:0 0 16px">${subject}</h2>`,
+          `<p style="font-size:32px;font-weight:700;letter-spacing:8px;margin:16px 0">${code}</p>`,
+          '<p style="color:#666">验证码 10 分钟内有效。如果这不是你本人的操作，请忽略本邮件。</p>',
+          '</div>',
+        ].join(''),
+      });
+    } catch (error) {
+      // external_call_failed 只带错误类名 + 脱敏 message（logExternalCallFailure
+      // 自带 token/secret 打码；SMTP 的 RCPT 回带收件人的情况由上游
+      // describeMailerError 处理）。原样重抛，上游把它变成用户可见的 503。
+      result = 'failure';
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'smtp',
+        operation: 'send_verification_code',
+        durationMs: Date.now() - start,
+        error,
+      });
+      throw error;
+    } finally {
+      logExternalCallSlow(this.logger, {
+        enabled: this.loggingConfig.performanceLogOn,
+        service: 'smtp',
+        operation: 'send_verification_code',
+        durationMs: Date.now() - start,
+        thresholdMs: this.loggingConfig.slowExternalMs,
+        result,
+      });
+    }
     // 不打 email 全文到日志（PII）；打脱敏域名便于排障。
     const domain = email.split('@')[1] ?? 'unknown';
     this.logger.log(`verification code sent (${purpose}) to *@${domain}`);

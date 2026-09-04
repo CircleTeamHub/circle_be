@@ -20,6 +20,8 @@ import {
   REFERRAL_SWEEP_MAX_BATCHES,
 } from './referral.constants';
 import { readReferralRules, type ReferralRules } from './referral.rules';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 type RewardedSettlement = {
   kind: 'rewarded';
@@ -36,6 +38,7 @@ type Settlement =
 @Injectable()
 export class ReferralService {
   private readonly logger = new Logger(ReferralService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly rules: ReferralRules;
   private sweepInFlight = false;
 
@@ -179,6 +182,19 @@ export class ReferralService {
               totals[settlement.kind as keyof typeof totals] += 1;
             }
             if (settlement.kind === 'rewarded') {
+              logBusinessEvent(this.logger, {
+                enabled: this.loggingConfig.businessLogOn,
+                businessEvent: 'referral_rewarded',
+                actorId: settlement.inviterId,
+                targetId: settlement.inviteeId,
+                result: 'success',
+                entityType: 'referral',
+                entityId: id,
+                metadata: {
+                  inviterReward: settlement.inviterReward,
+                  inviteeReward: settlement.inviteeReward,
+                },
+              });
               await this.notifyReward(settlement);
             }
           } catch (error) {

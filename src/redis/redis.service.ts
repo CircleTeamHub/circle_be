@@ -15,6 +15,9 @@ import {
   type RedisCommandOperation,
   type RedisFailureReason,
 } from './redis.metrics';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logExternalCallFailure } from 'src/logging/external-service.logger';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 type RedisMessageHandler = (
   channel: string,
@@ -29,6 +32,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   private static readonly VERSION_FENCE_TTL_SECONDS = 24 * 60 * 60;
 
   private readonly logger = new Logger(RedisService.name);
+  private readonly loggingConfig = createLoggingConfig();
   private readonly redisUrl: string;
   private readonly redisRequired: boolean;
   private commandClient: Redis | null = null;
@@ -754,6 +758,17 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       this.nextConnectAttemptAt =
         Date.now() + RedisService.CONNECT_FAILURE_COOLDOWN_MS;
       this.logger.warn(`Redis connection failed: ${this.formatError(error)}`);
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'redis',
+        operation: 'connect',
+        error,
+      });
+      reportOperationalError(error, {
+        component: 'RedisService',
+        operation: 'connect',
+        kind: 'redis',
+      });
       this.recordCommandFailure('connect', error);
       return null;
     } finally {

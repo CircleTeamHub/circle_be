@@ -2,6 +2,7 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { randomBytes, timingSafeEqual } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -12,6 +13,8 @@ import {
   describeQrLoginDevice,
   qrLoginVerificationCode,
 } from './qr-login-context';
+import { createLoggingConfig } from 'src/logging/logging.config';
+import { logBusinessEvent } from 'src/logging/business-event.logger';
 
 /**
  * 网页扫码登录（桌面网页版 M3）。
@@ -46,6 +49,8 @@ function safeEqual(a: string, b: string): boolean {
 
 @Injectable()
 export class QrLoginService {
+  private readonly logger = new Logger(QrLoginService.name);
+  private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
     private readonly authService: AuthService,
@@ -116,6 +121,14 @@ export class QrLoginService {
         errorCode: QrErrorCode.Invalid,
       });
     }
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_qr_login_approved',
+      actorId: userId,
+      result: 'success',
+      entityType: 'qr_login_session',
+      entityId: session.id,
+    });
     return { ok: true };
   }
 

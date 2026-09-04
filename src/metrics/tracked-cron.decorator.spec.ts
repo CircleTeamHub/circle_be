@@ -15,6 +15,10 @@ import {
 } from './tracked-cron.decorator';
 import { jobMetrics } from './job-metrics';
 
+jest.mock('../logging/error-aggregation.service', () => ({
+  reportOperationalError: jest.fn(),
+}));
+
 describe('runTracked', () => {
   it('returns the wrapped result untouched', async () => {
     const metrics = createJobMetrics();
@@ -385,5 +389,45 @@ describe('reportJobSkipped', () => {
 
   it('survives being called outside any tracked job', () => {
     expect(() => reportJobSkipped()).not.toThrow();
+  });
+});
+
+describe('runTracked error aggregation', () => {
+  it('forwards a thrown job failure to error aggregation before rethrowing', async () => {
+    const { reportOperationalError } = jest.requireMock(
+      '../logging/error-aggregation.service',
+    ) as { reportOperationalError: jest.Mock };
+    reportOperationalError.mockClear();
+    const metrics = createJobMetrics();
+    const boom = new Error('boom');
+
+    await expect(
+      runTracked(metrics, 'demo', () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+
+    // @nestjs/schedule passes no errorHandler to `cron`, which console.errors
+    // and swallows onTick exceptions — this call is the only path to Sentry.
+    expect(reportOperationalError).toHaveBeenCalledWith(boom, {
+      component: 'TrackedCron',
+      operation: 'demo',
+      kind: 'cron',
+    });
+  });
+
+  it('does not report handled failures twice (the job already returned normally)', async () => {
+    const { reportOperationalError } = jest.requireMock(
+      '../logging/error-aggregation.service',
+    ) as { reportOperationalError: jest.Mock };
+    reportOperationalError.mockClear();
+    const metrics = createJobMetrics();
+
+    await runTracked(metrics, 'demo', () => {
+      reportHandledJobFailure();
+      return 'ok';
+    });
+
+    expect(reportOperationalError).not.toHaveBeenCalled();
   });
 });

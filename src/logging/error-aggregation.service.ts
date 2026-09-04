@@ -24,6 +24,8 @@ export interface ErrorAggregationConfig {
   dsn?: string;
   environment: string;
   release?: string;
+  /** Performance tracing sample rate (0..1). 0 / unset = errors only. */
+  tracesSampleRate?: number;
 }
 
 /** Sanitized, non-sensitive request metadata attached to a captured error. */
@@ -249,6 +251,105 @@ function readString(value: unknown): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
+/** `SENTRY_TRACES_SAMPLE_RATE`: a number in [0, 1]; anything else means off. */
+export function readSampleRate(value: unknown): number {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && value.trim() !== ''
+        ? Number(value)
+        : NaN;
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0;
+}
+
+const transactionPathLimiter = createRouteCardinalityLimiter();
+
+/**
+ * Transaction names come from the http/express instrumentation as
+ * `GET /api/v1/users/<id>`; normalize the path exactly like error tags so ids
+ * and link tokens never become an indexed transaction name.
+ */
+export function sanitizeTransactionName(value: unknown): string {
+  if (typeof value !== 'string') return '[REDACTED_TRANSACTION]';
+  const match = /^([A-Z]+\s+)?(\/\S*)$/.exec(value.trim());
+  if (!match) return '[REDACTED_TRANSACTION]';
+  const path = match[2].split('?')[0];
+  return `${match[1] ?? ''}${transactionPathLimiter(normalizeRoute(path))}`;
+}
+
+function sanitizeSpan(span: unknown): Record<string, unknown> {
+  if (!span || typeof span !== 'object') return {};
+  const source = span as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+  // `description` is deliberately dropped: for db spans it is the SQL text
+  // (bound values included), for http spans the full URL.
+  for (const key of [
+    'span_id',
+    'parent_span_id',
+    'trace_id',
+    'op',
+    'status',
+    'origin',
+    'start_timestamp',
+    'timestamp',
+  ]) {
+    const value = source[key];
+    if (typeof value === 'string') safe[key] = sanitizeString(value);
+    else if (typeof value === 'number') safe[key] = value;
+  }
+  return safe;
+}
+
+/**
+ * Same allowlist philosophy as `sanitizeAutomaticEvent`, for performance
+ * transactions: keep the normalized route, trace ids, span ops and timings;
+ * never request data, span descriptions, breadcrumbs or user context.
+ */
+export function sanitizeAutomaticTransaction(event: unknown): unknown {
+  if (!event || typeof event !== 'object') return event;
+  const source = event as Record<string, unknown>;
+  const safe: Record<string, unknown> = { type: 'transaction' };
+  for (const key of [
+    'event_id',
+    'timestamp',
+    'start_timestamp',
+    'platform',
+    'release',
+    'dist',
+    'environment',
+    'server_name',
+    'sdk',
+  ]) {
+    if (key in source) safe[key] = sanitizeEventValue(source[key], 0);
+  }
+  safe.transaction = sanitizeTransactionName(source.transaction);
+  const contexts = source.contexts as Record<string, unknown> | undefined;
+  const trace = contexts?.trace;
+  if (trace && typeof trace === 'object') {
+    const traceSource = trace as Record<string, unknown>;
+    const safeTrace: Record<string, unknown> = {};
+    for (const key of [
+      'trace_id',
+      'span_id',
+      'parent_span_id',
+      'op',
+      'status',
+    ]) {
+      const value = traceSource[key];
+      if (typeof value === 'string') safeTrace[key] = sanitizeString(value);
+    }
+    safe.contexts = { trace: safeTrace };
+  }
+  if (Array.isArray(source.spans)) {
+    safe.spans = source.spans.map(sanitizeSpan);
+  }
+  const info = source.transaction_info as Record<string, unknown> | undefined;
+  if (info && typeof info.source === 'string') {
+    safe.transaction_info = { source: info.source };
+  }
+  return safe;
+}
+
 export function createErrorAggregationConfig(
   rawConfig: Record<string, unknown> = process.env,
   nodeEnv = process.env.NODE_ENV || 'development',
@@ -264,6 +365,7 @@ export function createErrorAggregationConfig(
     dsn: readString(rawConfig['SENTRY_DSN']),
     environment: readString(rawConfig['SENTRY_ENVIRONMENT']) ?? nodeEnv,
     release: readString(rawConfig['SENTRY_RELEASE']),
+    tracesSampleRate: readSampleRate(rawConfig['SENTRY_TRACES_SAMPLE_RATE']),
   };
 }
 
@@ -467,7 +569,11 @@ export function createSentryInitOptions(
     // event from an allowlist, so global events cannot include request data,
     // local variables, breadcrumbs, extras, or account identifiers.
     beforeSend: sanitizeAutomaticEvent,
-    // Error aggregation only — no performance tracing by default.
-    tracesSampleRate: 0,
+    // Performance tracing is opt-in (SENTRY_TRACES_SAMPLE_RATE, default 0).
+    // When on, transactions are rebuilt from an allowlist as well: normalized
+    // route, trace ids, span ops and timings — never span descriptions (SQL,
+    // URLs), request data, breadcrumbs or account identifiers.
+    tracesSampleRate: config.tracesSampleRate ?? 0,
+    beforeSendTransaction: sanitizeAutomaticTransaction,
   };
 }
