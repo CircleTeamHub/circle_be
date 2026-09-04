@@ -159,7 +159,26 @@ export class ChatSystemMessageService {
     if (counter.length === 0) {
       throw new Error(`conversation ${conversationId} not found`);
     }
-    const height = counter[0].nextHeight + 1;
+    return this.insertSystemMessageAfterLockedConversationInTx(
+      tx,
+      conversationId,
+      counter[0].nextHeight,
+      content,
+    );
+  }
+
+  /**
+   * 在调用方已持有 ChatConversation 行锁时落系统消息。
+   * 不再取锁;调用方必须把锁行里的 nextHeight 原样传入,避免破坏
+   * conversation-first 锁顺序。
+   */
+  async insertSystemMessageAfterLockedConversationInTx(
+    tx: Prisma.TransactionClient,
+    conversationId: string,
+    lockedNextHeight: number,
+    content: Record<string, unknown>,
+  ): Promise<ChatMessageDto> {
+    const height = lockedNextHeight + 1;
     const created = await tx.chatMessage.create({
       data: {
         conversationID: conversationId,

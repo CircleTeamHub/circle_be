@@ -68,6 +68,39 @@ describe('ChatSystemMessageService', () => {
     );
   });
 
+  it('inserts above an already locked counter without acquiring another lock', async () => {
+    await expect(
+      service.insertSystemMessageAfterLockedConversationInTx(
+        prisma as never,
+        'conv-1',
+        7,
+        {
+          kind: 'history-cleared',
+          actorId: 'u1',
+        },
+      ),
+    ).resolves.toMatchObject({ height: 8 });
+
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith({
+      data: {
+        conversationID: 'conv-1',
+        height: 8,
+        senderID: null,
+        type: 'system',
+        content: { kind: 'history-cleared', actorId: 'u1' },
+        clientMessageId: null,
+      },
+    });
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: {
+        nextHeight: 8,
+        lastMessageAt: new Date('2026-08-09T00:00:00Z'),
+      },
+    });
+  });
+
   it('can rebroadcast an idempotently reused message after a pre-broadcast failure', async () => {
     const existing = {
       id: 'message-existing',

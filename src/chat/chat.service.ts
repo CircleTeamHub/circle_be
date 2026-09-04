@@ -3300,69 +3300,121 @@ export class ChatService {
     conversationId: string,
     forEveryone = false,
   ): Promise<{ clearedBeforeHeight: number }> {
-    const { conversation } = await this.requireMembershipSeat(
-      conversationId,
-      userId,
-    );
-    const isGlobalClear =
-      forEveryone &&
-      (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
-    if (isGlobalClear && conversation.type === 'GROUP') {
-      const authorized = conversation.circleID
-        ? await this.isCircleModerator(conversation, userId)
-        : conversation.ownerID === userId;
-      if (!authorized) {
-        throw new ForbiddenException({
-          message: '仅群主或管理员可清空全群记录',
-          errorCode: GroupErrorCode.ManagerOnly,
+    const { watermark, isGlobalClear, advancedReaders, notice } =
+      await this.prisma.$transaction(async (tx) => {
+        // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
+        // 锁后的会话和座位才是授权与目标集的权威快照。
+        const locked = await tx.$queryRaw<
+          Array<{
+            id: string;
+            type: string;
+            circleID: string | null;
+            ownerID: string | null;
+            nextHeight: number;
+          }>
+        >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+          FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        if (locked.length === 0) {
+          throw new ForbiddenException({
+            message: '不是会话成员',
+            errorCode: ChatErrorCode.NotMember,
+          });
+        }
+        const conversation = locked[0];
+        const actorSeat = await tx.chatMember.findUnique({
+          where: {
+            conversationID_userID: {
+              conversationID: conversationId,
+              userID: userId,
+            },
+          },
+          select: { leftAt: true },
         });
-      }
-    }
-    const top = await this.prisma.chatMessage.aggregate({
-      where: { conversationID: conversationId },
-      _max: { height: true },
-    });
-    const watermark = top._max.height ?? 0;
-    if (watermark <= 0) return { clearedBeforeHeight: 0 };
-    const targetUserIds = isGlobalClear
-      ? (
-          await this.prisma.chatMember.findMany({
-            where: { conversationID: conversationId, leftAt: null },
-            select: { userID: true },
-          })
-        ).map((target) => target.userID)
-      : [userId];
-    const { advancedReaders, notice } = await this.prisma.$transaction(
-      async (tx) => {
+        if (!actorSeat || actorSeat.leftAt) {
+          throw new ForbiddenException({
+            message: '不是会话成员',
+            errorCode: ChatErrorCode.NotMember,
+          });
+        }
+        const globalClear =
+          forEveryone &&
+          (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
+        if (globalClear && conversation.type === 'GROUP') {
+          let authorized = conversation.ownerID === userId;
+          if (conversation.circleID) {
+            const circleMember = await tx.circleMember.findUnique({
+              where: {
+                userID_circleID: {
+                  userID: userId,
+                  circleID: conversation.circleID,
+                },
+              },
+              select: { role: true, status: true },
+            });
+            authorized =
+              circleMember?.status === 'ACTIVE' &&
+              (circleMember.role === 'OWNER' || circleMember.role === 'ADMIN');
+          }
+          if (!authorized) {
+            throw new ForbiddenException({
+              message: '仅群主或管理员可清空全群记录',
+              errorCode: GroupErrorCode.ManagerOnly,
+            });
+          }
+        }
+        const currentTop = conversation.nextHeight;
+        if (currentTop <= 0) {
+          return {
+            watermark: 0,
+            isGlobalClear: globalClear,
+            advancedReaders: [],
+            notice: null,
+          };
+        }
+        const targetUserIds = globalClear
+          ? (
+              await tx.chatMember.findMany({
+                where: { conversationID: conversationId, leftAt: null },
+                select: { userID: true },
+              })
+            ).map((target) => target.userID)
+          : [userId];
         await tx.chatMember.updateMany({
           where: {
             conversationID: conversationId,
             userID: { in: targetUserIds },
-            ...(isGlobalClear ? { leftAt: null } : {}),
-            clearedBeforeHeight: { lt: watermark },
+            ...(globalClear ? { leftAt: null } : {}),
+            clearedBeforeHeight: { lt: currentTop },
           },
-          data: { clearedBeforeHeight: watermark },
+          data: { clearedBeforeHeight: currentTop },
         });
         const readers = await tx.chatMember.updateManyAndReturn({
           where: {
             conversationID: conversationId,
             userID: { in: targetUserIds },
-            ...(isGlobalClear ? { leftAt: null } : {}),
-            lastReadHeight: { lt: watermark },
+            ...(globalClear ? { leftAt: null } : {}),
+            lastReadHeight: { lt: currentTop },
           },
-          data: { lastReadHeight: watermark },
+          data: { lastReadHeight: currentTop },
           select: { userID: true },
         });
-        const auditMessage = isGlobalClear
-          ? await this.systemMessage.insertSystemMessageInTx(
+        const auditMessage = globalClear
+          ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
               tx,
               conversationId,
+              currentTop,
               { kind: 'history-cleared', actorId: userId },
             )
           : null;
-        return { advancedReaders: readers, notice: auditMessage };
-      },
-    );
+        return {
+          watermark: currentTop,
+          isGlobalClear: globalClear,
+          advancedReaders: readers,
+          notice: auditMessage,
+        };
+      });
+    if (watermark <= 0) return { clearedBeforeHeight: 0 };
     // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
