@@ -48,7 +48,7 @@ export class ChatBroadcastService {
       .emit(CHAT_EVENTS.read, payload);
   }
 
-  /** 私聊双方历史水位推进 → 会话房内所有在线设备。 */
+  /** 会话全局历史水位推进 → 会话房内所有在线设备。 */
   emitHistoryCleared(payload: ChatHistoryClearedBroadcast): void {
     const server = this.requireServer('emitHistoryCleared');
     if (!server) return;

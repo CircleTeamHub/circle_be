@@ -1,7 +1,7 @@
 import { IsBoolean, IsOptional } from 'class-validator';
 
 export class ClearHistoryDto {
-  /** 仅 DIRECT 会话允许；GROUP/TEMP 即使传 true 也只清发起者。 */
+  /** DIRECT 任一成员可用;GROUP 仅群主/管理员可用;TEMP/SUPPORT 仍仅个人。 */
   @IsOptional()
   @IsBoolean()
   forEveryone?: boolean;

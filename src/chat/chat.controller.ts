@@ -235,7 +235,7 @@ export class ChatController {
   @Post('conversations/:id/clear')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({
-    summary: '清空聊天记录(私聊可显式双方生效,群聊仅本人视图生效)',
+    summary: '清空聊天记录(默认仅本人;私聊成员或群主/管理员可显式全局生效)',
   })
   clearHistory(
     @Req() req: RequestWithUser,

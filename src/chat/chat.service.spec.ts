@@ -21,6 +21,7 @@ describe('ChatService', () => {
       count: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn(),
+      updateManyAndReturn: jest.fn(),
     },
     chatMessage: {
       findUnique: jest.fn(),
@@ -158,6 +159,7 @@ describe('ChatService', () => {
     // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
     prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
     prisma.chatMediaDeletion.deleteMany.mockResolvedValue({ count: 1 });
+    prisma.chatMember.updateManyAndReturn.mockResolvedValue([]);
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
     // 必须每个用例重置:客服豁免一旦泄漏成 true,所有陌生人开关的用例都会被无声放行。
     support.isSupportAgent.mockResolvedValue(false);
@@ -2523,6 +2525,9 @@ describe('ChatService', () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+      ]);
 
       const result = await service.clearHistory('u1', 'conv-1');
 
@@ -2537,13 +2542,14 @@ describe('ChatService', () => {
         data: { clearedBeforeHeight: 42 },
       });
       // 清空即已读:未读同时归零,底数与水位一致。
-      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      expect(prisma.chatMember.updateManyAndReturn).toHaveBeenCalledWith({
         where: {
           conversationID: 'conv-1',
           userID: { in: ['u1'] },
           lastReadHeight: { lt: 42 },
         },
         data: { lastReadHeight: 42 },
+        select: { userID: true },
       });
     });
 
@@ -2577,6 +2583,9 @@ describe('ChatService', () => {
         { userID: 'u2' },
       ]);
       prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+      ]);
 
       await service.clearHistory('u1', 'conv-1', true);
 
@@ -2584,6 +2593,7 @@ describe('ChatService', () => {
         where: {
           conversationID: 'conv-1',
           userID: { in: ['u1', 'u2'] },
+          leftAt: null,
           clearedBeforeHeight: { lt: 42 },
         },
         data: { clearedBeforeHeight: 42 },
@@ -2593,7 +2603,18 @@ describe('ChatService', () => {
         clearedBeforeHeight: 42,
         clearedBy: 'u1',
       });
-      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitRead).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        userId: 'u1',
+        height: 42,
+      });
+      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+        expect.anything(),
+        'conv-1',
+        { kind: 'history-cleared', actorId: 'u1' },
+      );
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
     it('keeps direct-chat clearing personal unless explicitly requested', async () => {
@@ -2624,6 +2645,276 @@ describe('ChatService', () => {
         data: { clearedBeforeHeight: 42 },
       });
       expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+    });
+
+    it('lets a standalone group owner clear every active seat and broadcasts the global clear', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u1',
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+
+      const result = await service.clearHistory('u1', 'conv-1', true);
+
+      expect(result).toEqual({ clearedBeforeHeight: 42 });
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', leftAt: null },
+        select: { userID: true },
+      });
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['u1', 'u2'] },
+          leftAt: null,
+          clearedBeforeHeight: { lt: 42 },
+        },
+        data: { clearedBeforeHeight: 42 },
+      });
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+      expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        clearedBeforeHeight: 42,
+        clearedBy: 'u1',
+      });
+      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+        expect.anything(),
+        'conv-1',
+        { kind: 'history-cleared', actorId: 'u1' },
+      );
+      expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('forbids a standalone non-owner without moving any watermarks', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u2',
+            lastMessageAt: null,
+          },
+        }),
+      );
+
+      await expect(
+        service.clearHistory('u1', 'conv-1', true),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      });
+
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      expect(systemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+    });
+
+    it.each(['OWNER', 'ADMIN'] as const)(
+      'lets an active circle %s clear every active seat',
+      async (role) => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            conversation: {
+              id: 'conv-1',
+              type: 'GROUP',
+              directKey: null,
+              circleID: 'circle-1',
+              tempChatID: null,
+              ownerID: null,
+              lastMessageAt: null,
+            },
+          }),
+        );
+        prisma.circleMember.findUnique.mockResolvedValue({
+          role,
+          status: 'ACTIVE',
+        });
+        prisma.chatMessage.aggregate.mockResolvedValue({
+          _max: { height: 42 },
+        });
+        prisma.chatMember.findMany.mockResolvedValue([
+          { userID: 'u1' },
+          { userID: 'u2' },
+        ]);
+        prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+        prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+          { userID: 'u1' },
+          { userID: 'u2' },
+        ]);
+
+        await service.clearHistory('u1', 'conv-1', true);
+
+        expect(prisma.circleMember.findUnique).toHaveBeenCalledWith({
+          where: {
+            userID_circleID: { userID: 'u1', circleID: 'circle-1' },
+          },
+          select: { role: true, status: true },
+        });
+        expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              userID: { in: ['u1', 'u2'] },
+            }),
+          }),
+        );
+        expect(broadcast.emitHistoryCleared).toHaveBeenCalledTimes(1);
+        expect(systemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('forbids an ordinary circle member from clearing the group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: 'circle-1',
+            tempChatID: null,
+            ownerID: null,
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.clearHistory('u1', 'conv-1', true),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      });
+
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+    });
+
+    it('excludes seats that have left from a group-wide clear', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u1',
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.findMany.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 2 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+        { userID: 'u2' },
+      ]);
+
+      await service.clearHistory('u1', 'conv-1', true);
+
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { conversationID: 'conv-1', leftAt: null },
+        select: { userID: true },
+      });
+      for (const [args] of [
+        ...prisma.chatMember.updateMany.mock.calls,
+        ...prisma.chatMember.updateManyAndReturn.mock.calls,
+      ]) {
+        expect(args.where.userID).toEqual({ in: ['u1', 'u2'] });
+      }
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+      expect(broadcast.emitRead).not.toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'u3' }),
+      );
+    });
+
+    it('keeps a group clear personal unless explicitly requested', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u2',
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 42 } });
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.clearHistory('u1', 'conv-1', false);
+
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
+      expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+        where: {
+          conversationID: 'conv-1',
+          userID: { in: ['u1'] },
+          clearedBeforeHeight: { lt: 42 },
+        },
+        data: { clearedBeforeHeight: 42 },
+      });
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      expect(systemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not write an audit message when a group-wide clear is empty', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u1',
+            lastMessageAt: null,
+          },
+        }),
+      );
+      prisma.chatMessage.aggregate.mockResolvedValue({
+        _max: { height: null },
+      });
+
+      await expect(service.clearHistory('u1', 'conv-1', true)).resolves.toEqual(
+        { clearedBeforeHeight: 0 },
+      );
+
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      expect(systemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -3015,6 +3306,9 @@ describe('ChatService', () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([
+        { userID: 'u1' },
+      ]);
 
       await service.clearHistory('u1', 'conv-1');
 

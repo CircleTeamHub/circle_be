@@ -3291,65 +3291,95 @@ export class ChatService {
   }
 
   /**
-   * G-14 清空聊天记录:私聊推进双方成员水位,群聊仅推进发起者水位；都只前进
-   * 不后退。消息行保留用于审计/合规,但目标成员的所有设备都无法再读到旧记录。
-   * 清空即已读:lastReadHeight 同步推到同一高度。
+   * G-14 清空聊天记录:默认只推进发起者水位；显式全局清空时,
+   * DIRECT 由任一在座成员发起,GROUP 仅独立群群主或圈子群 OWNER/ADMIN 可发起。
+   * 消息行保留用于审计/合规;水位只前进不后退,且清空即已读。
    */
   async clearHistory(
     userId: string,
     conversationId: string,
     forEveryone = false,
   ): Promise<{ clearedBeforeHeight: number }> {
-    const member = await this.requireMembershipSeat(conversationId, userId);
+    const { conversation } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    const isGlobalClear =
+      forEveryone &&
+      (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
+    if (isGlobalClear && conversation.type === 'GROUP') {
+      const authorized = conversation.circleID
+        ? await this.isCircleModerator(conversation, userId)
+        : conversation.ownerID === userId;
+      if (!authorized) {
+        throw new ForbiddenException({
+          message: '仅群主或管理员可清空全群记录',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
+    }
     const top = await this.prisma.chatMessage.aggregate({
       where: { conversationID: conversationId },
       _max: { height: true },
     });
     const watermark = top._max.height ?? 0;
     if (watermark <= 0) return { clearedBeforeHeight: 0 };
-    const targetUserIds =
-      forEveryone && member.conversation.type === 'DIRECT'
-        ? (
-            await this.prisma.chatMember.findMany({
-              where: { conversationID: conversationId, leftAt: null },
-              select: { userID: true },
-            })
-          ).map((target) => target.userID)
-        : [userId];
-    await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: conversationId,
-        userID: { in: targetUserIds },
-        clearedBeforeHeight: { lt: watermark },
+    const targetUserIds = isGlobalClear
+      ? (
+          await this.prisma.chatMember.findMany({
+            where: { conversationID: conversationId, leftAt: null },
+            select: { userID: true },
+          })
+        ).map((target) => target.userID)
+      : [userId];
+    const { advancedReaders, notice } = await this.prisma.$transaction(
+      async (tx) => {
+        await tx.chatMember.updateMany({
+          where: {
+            conversationID: conversationId,
+            userID: { in: targetUserIds },
+            ...(isGlobalClear ? { leftAt: null } : {}),
+            clearedBeforeHeight: { lt: watermark },
+          },
+          data: { clearedBeforeHeight: watermark },
+        });
+        const readers = await tx.chatMember.updateManyAndReturn({
+          where: {
+            conversationID: conversationId,
+            userID: { in: targetUserIds },
+            ...(isGlobalClear ? { leftAt: null } : {}),
+            lastReadHeight: { lt: watermark },
+          },
+          data: { lastReadHeight: watermark },
+          select: { userID: true },
+        });
+        const auditMessage = isGlobalClear
+          ? await this.systemMessage.insertSystemMessageInTx(
+              tx,
+              conversationId,
+              { kind: 'history-cleared', actorId: userId },
+            )
+          : null;
+        return { advancedReaders: readers, notice: auditMessage };
       },
-      data: { clearedBeforeHeight: watermark },
-    });
-    const read = await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: conversationId,
-        userID: { in: targetUserIds },
-        lastReadHeight: { lt: watermark },
-      },
-      data: { lastReadHeight: watermark },
-    });
+    );
     // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
-    if (read.count > 0) {
-      for (const targetUserId of targetUserIds) {
-        this.broadcast.emitRead({
-          conversationId,
-          userId: targetUserId,
-          height: watermark,
-        });
-      }
+    for (const target of advancedReaders) {
+      this.broadcast.emitRead({
+        conversationId,
+        userId: target.userID,
+        height: watermark,
+      });
     }
-    if (forEveryone && member.conversation.type === 'DIRECT') {
+    if (isGlobalClear) {
       this.broadcast.emitHistoryCleared({
         conversationId,
         clearedBeforeHeight: watermark,
         clearedBy: userId,
       });
+      this.systemMessage.broadcastSystemMessage(notice!);
     }
     return { clearedBeforeHeight: watermark };
   }

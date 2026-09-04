@@ -148,7 +148,7 @@ export interface ChatReadBroadcast {
   height: number;
 }
 
-/** 私聊双方清空广播；群聊的个人清空不会发送该事件。 */
+/** 会话全局清空广播；个人清空不会发送该事件。 */
 export interface ChatHistoryClearedBroadcast {
   conversationId: string;
   clearedBeforeHeight: number;
