@@ -3,6 +3,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ConfigEnum } from 'src/enum/config.enum';
+import { markSecurityEventLogged } from 'src/logging/handled-errors';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { setRequestUserId } from 'src/logging/request-context';
 import { logSecurityEvent } from 'src/logging/security-event.logger';
@@ -47,7 +48,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         userId: payload.sub,
         metadata: { sessionId: payload.sid, audience: payload.aud },
       });
-      throw new UnauthorizedException('Session revoked');
+      // That event *is* the security record for this rejection; mark it so
+      // AllExceptionFilter does not add a generic `auth_unauthorized` on top.
+      const exception = new UnauthorizedException('Session revoked');
+      markSecurityEventLogged(exception);
+      throw exception;
     }
     return {
       userId: payload.sub,

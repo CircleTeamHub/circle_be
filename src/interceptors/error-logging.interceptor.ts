@@ -58,17 +58,33 @@ export class ErrorLoggingInterceptor implements NestInterceptor {
           'HttpError',
         );
 
+        // Wrapped like the aggregation call below: a throwing log transport
+        // must never replace the original error in this projection.
         if (statusCode === 401 || statusCode === 403) {
-          logSecurityEvent(this.logger, {
-            enabled: this.loggingConfig.securityLogOn,
-            securityEvent:
-              statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
-            statusCode,
-            reason: errorObject?.message ?? String(error),
-          });
-          // AllExceptionFilter sees this same exception next; the marker keeps
-          // it from logging the security event a second time.
-          markSecurityEventLogged(error);
+          try {
+            logSecurityEvent(this.logger, {
+              enabled: this.loggingConfig.securityLogOn,
+              securityEvent:
+                statusCode === 401 ? 'auth_unauthorized' : 'access_forbidden',
+              statusCode,
+              reason: errorObject?.message ?? String(error),
+            });
+            // AllExceptionFilter sees this same exception next; the marker
+            // keeps it from logging the security event a second time.
+            markSecurityEventLogged(error);
+          } catch (loggingError) {
+            this.logger.error(
+              {
+                event: 'security_event_log_failed',
+                requestId: requestContext?.requestId,
+                message:
+                  loggingError instanceof Error
+                    ? loggingError.message
+                    : String(loggingError),
+              },
+              'HttpError',
+            );
+          }
         }
 
         // Forward only unexpected server errors to optional aggregation

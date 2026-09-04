@@ -140,6 +140,35 @@ describe('ErrorLoggingInterceptor', () => {
     );
   });
 
+  it('still propagates the original error when the security logger throws', async () => {
+    const logger = {
+      error: jest.fn(),
+      warn: jest.fn(() => {
+        throw new Error('transport down');
+      }),
+    };
+    const interceptor = new ErrorLoggingInterceptor(logger as any);
+    const error = new HttpException('Forbidden', HttpStatus.FORBIDDEN);
+    const next = { handle: () => throwError(() => error) };
+
+    await expect(
+      runWithRequestContext(requestContext, () =>
+        lastValueFrom(interceptor.intercept({} as any, next)),
+      ),
+    ).rejects.toBe(error);
+
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'security_event_log_failed',
+        requestId: 'req-1',
+        message: 'transport down',
+      }),
+      'HttpError',
+    );
+    // Nothing was logged, so the filter must still be allowed to try.
+    expect(wasSecurityEventLogged(error)).toBe(false);
+  });
+
   it('does not forward expected 4xx errors to error aggregation', async () => {
     const logger = { error: jest.fn(), warn: jest.fn() };
     const aggregation = createAggregationSpy();

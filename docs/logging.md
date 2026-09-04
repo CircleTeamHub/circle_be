@@ -155,9 +155,20 @@ denylist (`password`, `token`, `code`, …) before logging.
 Emitted through `logSecurityEvent` (enabled by `SECURITY_LOG_ON`), always with
 the request context and a sanitized `reason`:
 
-- `auth_unauthorized` — any 401. Handler-raised ones are logged by
-  `ErrorLoggingInterceptor`; guard-raised ones (revoked session, missing or
-  malformed token) by `AllExceptionFilter`, which the interceptor cannot see.
+- `auth_unauthorized` — a 401 that is a signal rather than routine token
+  churn. Handler-raised 401s are logged by `ErrorLoggingInterceptor`.
+  Guard-raised ones are classified by `JwtGuard` from passport's rejection
+  reason and logged by `AllExceptionFilter` (which the interceptor cannot see)
+  with `metadata.authFailureReason`:
+  - logged: `token_invalid` (malformed, bad signature, wrong audience or
+    issuer) and `token_not_active` (`nbf` in the future);
+  - **not** logged: `token_missing` (no bearer header — public scans,
+    unauthenticated clients) and `token_expired` (normal access-token
+    rotation). These still appear as a status-401 warn line and in
+    `http_access`, just not in the security log;
+  - a revoked session is not logged here either — it already has its own
+    `session_revoked_token_used` event.
+  A 401 with no classification (a non-JWT guard) is always logged.
 - `access_forbidden` — any 403 (wrong audience, missing role, ownership check).
 - `rate_limit_hit` — a named limiter rejected the request.
 - `session_revoked_token_used` — a validly signed access token whose session
@@ -165,6 +176,11 @@ the request context and a sanitized `reason`:
 - `security_code_invalid` — a wrong login security code (with the running
   attempt count).
 - `security_code_locked` — the account hit the security-code lockout.
+
+The security-log call in `AllExceptionFilter` and `ErrorLoggingInterceptor`
+is wrapped like the Sentry capture: if the log transport throws, an
+error-level `security_event_log_failed` is emitted (with `requestId`) and the
+HTTP response is unaffected.
 
 ## External services
 

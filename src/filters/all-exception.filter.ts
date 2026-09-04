@@ -10,6 +10,8 @@ import { HttpAdapterHost } from '@nestjs/core';
 import * as requestIp from 'request-ip';
 import type { ErrorAggregationProvider } from '../logging/error-aggregation.service';
 import {
+  getAuthFailureReason,
+  isRoutineAuthFailure,
   markErrorCaptured,
   markSecurityEventLogged,
   wasErrorCaptured,
@@ -232,9 +234,14 @@ export class AllExceptionFilter implements ExceptionFilter {
   }
 
   /**
-   * 401/403 raised by guards (revoked session, wrong audience, missing role)
+   * 401/403 raised by guards (malformed token, wrong audience, missing role)
    * are the security signals that matter most and the interceptor never sees
-   * them. Handler-raised ones were already logged there — skip those.
+   * them. Handler-raised ones were already logged there — skip those. A 401
+   * JwtGuard classified as routine (no bearer header, expired access token) is
+   * client churn, not a signal: it stays in the warn line above and in
+   * `http_access`, but never becomes a security event. Like Sentry capture,
+   * the logging path is wrapped so a throwing transport cannot change the
+   * response.
    */
   private logSecurityRejection(
     exception: unknown,
@@ -245,13 +252,33 @@ export class AllExceptionFilter implements ExceptionFilter {
     if (wasSecurityEventLogged(exception)) {
       return;
     }
-    logSecurityEvent(this.logger, {
-      enabled: this.loggingConfig.securityLogOn,
-      securityEvent: status === 401 ? 'auth_unauthorized' : 'access_forbidden',
-      statusCode: status,
-      reason,
-      userId: request.user?.userId,
-    });
-    markSecurityEventLogged(exception);
+    if (status === 401 && isRoutineAuthFailure(exception)) {
+      return;
+    }
+    const authFailureReason = getAuthFailureReason(exception);
+    try {
+      logSecurityEvent(this.logger, {
+        enabled: this.loggingConfig.securityLogOn,
+        securityEvent:
+          status === 401 ? 'auth_unauthorized' : 'access_forbidden',
+        statusCode: status,
+        reason,
+        userId: request.user?.userId,
+        metadata: authFailureReason ? { authFailureReason } : undefined,
+      });
+      markSecurityEventLogged(exception);
+    } catch (loggingError) {
+      this.logger.error(
+        {
+          event: 'security_event_log_failed',
+          requestId: getRequestContext()?.requestId,
+          message:
+            loggingError instanceof Error
+              ? loggingError.message
+              : String(loggingError),
+        },
+        'HttpError',
+      );
+    }
   }
 }

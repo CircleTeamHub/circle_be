@@ -2,6 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { UnauthorizedException, Logger } from '@nestjs/common';
 import { JwtStrategy } from '../auth.strategy';
 import type { SessionRevocationService } from '../session-revocation.service';
+import { wasSecurityEventLogged } from 'src/logging/handled-errors';
 import {
   getRequestContext,
   runWithRequestContext,
@@ -111,5 +112,18 @@ describe('JwtStrategy request context & security events', () => {
       }),
       'SecurityEvent',
     );
+  });
+
+  it('marks the revoked-session exception so the filter does not add a generic auth_unauthorized', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const revocation = {
+      isRevoked: jest.fn().mockResolvedValue(true),
+    } as unknown as SessionRevocationService;
+    const strategy = new JwtStrategy(config, revocation);
+
+    const rejection = await strategy.validate(payload).catch((e) => e);
+
+    expect(rejection).toBeInstanceOf(UnauthorizedException);
+    expect(wasSecurityEventLogged(rejection)).toBe(true);
   });
 });
