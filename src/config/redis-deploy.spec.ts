@@ -290,7 +290,10 @@ exec "$REAL_CAT" "$@"
       '--replace golang.org/x/text=golang.org/x/text@v0.39.0',
     );
     expect(caddyDockerfile).toContain(
-      '--replace google.golang.org/grpc=google.golang.org/grpc@v1.82.1',
+      '--replace golang.org/x/crypto=golang.org/x/crypto@v0.55.0',
+    );
+    expect(caddyDockerfile).toContain(
+      '--replace google.golang.org/grpc=google.golang.org/grpc@v1.83.1',
     );
     expect(caddyDockerfile).toContain('RUN apk upgrade --no-cache');
     expect(compose).toContain('dockerfile: Dockerfile.caddy');
