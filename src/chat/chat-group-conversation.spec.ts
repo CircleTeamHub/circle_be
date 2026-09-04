@@ -51,6 +51,7 @@ describe('ChatService standalone group conversations', () => {
     broadcast as never,
     systemMessage as never,
     { isSupportAgent: jest.fn() } as never,
+    { lock: jest.fn() } as never,
   );
 
   const conversationDto = { id: 'conv-1' };
