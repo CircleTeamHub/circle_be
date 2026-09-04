@@ -14,6 +14,9 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { PlazaErrorCode } from 'src/common/app-error-codes';
 import { CirclePlazaService } from './circle-plaza.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { plainToInstance } from 'class-transformer';
+import { validate } from 'class-validator';
+import { CreatePlazaPostDto } from './dto/circle-plaza.dto';
 
 describe('CirclePlazaService', () => {
   let service: CirclePlazaService;
@@ -1378,7 +1381,7 @@ describe('CirclePlazaService', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('eligible>500'));
   });
 
-  it('defaults to a 24h expiry when expiresInHours is omitted', async () => {
+  it('defaults to a 6h expiry when expiresInHours is omitted', async () => {
     jest
       .useFakeTimers()
       .setSystemTime(new Date('2026-06-29T12:00:00Z').getTime());
@@ -1420,7 +1423,7 @@ describe('CirclePlazaService', () => {
       },
       circle: { id: 'circle-1', name: 'Board games' },
       createdAt: new Date('2026-06-29T12:00:00Z'),
-      expiresAt: new Date('2026-06-30T12:00:00Z'),
+      expiresAt: new Date('2026-06-29T18:00:00Z'),
     });
     prisma.circle.update.mockResolvedValue({});
 
@@ -1432,12 +1435,26 @@ describe('CirclePlazaService', () => {
     expect(prisma.circlePost.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          // 24h after the mocked "now"
-          expiresAt: new Date('2026-06-30T12:00:00.000Z'),
+          // 6h after the mocked "now"
+          expiresAt: new Date('2026-06-29T18:00:00.000Z'),
         }),
       }),
     );
     jest.useRealTimers();
+  });
+
+  it('accepts a 6h expiry and rejects values below 6h', async () => {
+    const accepted = await validate(
+      plainToInstance(CreatePlazaPostDto, { content: 'hi', expiresInHours: 6 }),
+    );
+    const rejected = await validate(
+      plainToInstance(CreatePlazaPostDto, { content: 'hi', expiresInHours: 5 }),
+    );
+
+    expect(accepted).toHaveLength(0);
+    expect(rejected.some((error) => error.property === 'expiresInHours')).toBe(
+      true,
+    );
   });
 
   describe('signupForPost', () => {
