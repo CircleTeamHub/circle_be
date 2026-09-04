@@ -66,6 +66,15 @@ Current events:
 - `chat_media_claim_lost`: warning from the chat media deletion sweeper when its conditional write-back after an object delete matched no row — the claimed `ChatMediaDeletion` row was replaced (typically turned into a note import reservation) or removed while the delete was in flight. Carries `objectKey` and `outcome` (`deleted` / `failed`).
 - `note_import_reservation_lost`: warning from note media import when the post-copy reservation renewal matched no row (the copy outlasted the 15 minute reservation window). The request fails with a retryable 409. Carries `noteId` and `mediaId`.
 
+Chat WebSocket lifecycle events (`ChatGateway`, correlated by the client's random `ws-...` trace ID; see `docs/metrics.md` for the lookup flow):
+
+- `ws_proxy_access`: Caddy access entry for a `/chat-ws` handshake with query, headers, and IPs removed.
+- `ws_auth_rejected`: a handshake failed authentication; `reason` is a bounded enum, sampled per reason per minute.
+- `ws_auth_rejected_suppressed`: summary emitted when `ws_auth_rejected` warnings were sampled away in the previous window, with the suppressed count.
+- `ws_connection_rejected`: an authenticated socket was refused admission (global or per-user cap, join failure); `reason` is a bounded enum.
+- `ws_connection_ready`: the socket joined its rooms and is fully admitted.
+- `ws_connection_closed`: the socket closed; `stage` says whether it had reached `ready`.
+
 Deferred production events:
 
 - `audit_event`

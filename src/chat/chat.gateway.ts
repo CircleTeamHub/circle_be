@@ -17,6 +17,7 @@ import {
 import { RedisService } from 'src/redis/redis.service';
 import { ChatErrorCode, type AppErrorCode } from 'src/common/app-error-codes';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import { resolveRequestId } from 'src/logging/request-context';
 import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
@@ -34,6 +35,8 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
 import { ChatService } from './chat.service';
 import {
   chatMetrics as defaultChatMetrics,
+  type ChatAuthFailureReason,
+  type ChatConnectionRejectionReason,
   type ChatMetrics,
 } from './chat-metrics';
 import type {
@@ -76,6 +79,82 @@ export function buildChatCorsOptions(corsOrigin: CorsOrigin) {
 
 type AckFn<T> = (response: T) => void;
 
+type EngineConnectionError = {
+  req?: IncomingMessage;
+  code?: number;
+  context?: { status?: unknown };
+};
+
+const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
+const SAFE_CONNECTION_TRACE_ID = /^ws-[a-z0-9-]{8,96}$/i;
+const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
+  'missing_token',
+  'invalid_token',
+  'invalid_claims',
+  'wrong_audience',
+  'revoked',
+  'guest_secret_missing',
+  'guest_invalid_token',
+  'guest_invalid_claims',
+  'guest_inactive',
+  'guest_no_seat',
+  'error',
+]);
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function safeConnectionTraceId(value: unknown): string | undefined {
+  return typeof value === 'string' && SAFE_CONNECTION_TRACE_ID.test(value)
+    ? value
+    : undefined;
+}
+
+function resolveConnectionTraceId(value: unknown): string {
+  return resolveRequestId(safeConnectionTraceId(value));
+}
+
+function engineRejectionReason(code: unknown): ChatConnectionRejectionReason {
+  switch (code) {
+    case 0:
+      return 'engine_transport_unknown';
+    case 1:
+      return 'engine_session_unknown';
+    case 2:
+      return 'engine_bad_handshake_method';
+    case 3:
+      return 'engine_bad_request';
+    case 4:
+      return 'engine_forbidden';
+    case 5:
+      return 'engine_unsupported_protocol';
+    default:
+      return 'engine_unknown';
+  }
+}
+
+function boundedDisconnectReason(value: unknown): string {
+  switch (value) {
+    case 'io server disconnect':
+      return 'server_disconnect';
+    case 'io client disconnect':
+      return 'client_disconnect';
+    case 'ping timeout':
+      return 'ping_timeout';
+    case 'transport close':
+      return 'transport_close';
+    case 'transport error':
+      return 'transport_error';
+    default:
+      return 'unknown';
+  }
+}
+
+function boundedTransportName(value: unknown): string {
+  return value === 'websocket' || value === 'polling' ? value : 'unknown';
+}
+
 /** 毫秒级签发时间:优先显式声明,回退 iat;与 RealtimeGateway 同一取法。 */
 function issuedAtMsOf(payload: JwtPayload): number | null {
   if (typeof payload.issuedAtMs === 'number') return payload.issuedAtMs;
@@ -109,6 +188,19 @@ export class ChatGateway implements OnModuleDestroy {
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
+  /**
+   * /chat-ws 是公网端点,过期 token 的自动重连客户端和分布式的无效握手流量
+   * 都能无限制地触发认证失败。指标是有界的(固定基数的计数器),日志不是:
+   * 每条失败都 warn 一次,后端 30MB 的日志配额会被迅速轮转掉,真正有用的
+   * 运维记录反而被挤没。按原因采样,压掉的条数在窗口结束时汇总补报一次。
+   * key 空间是 CHAT_AUTH_FAILURE_REASONS 的固定集合,不会无界增长。
+   */
+  private static readonly AUTH_WARN_WINDOW_MS = 60_000;
+  private static readonly AUTH_WARN_PER_WINDOW = 5;
+  private readonly authWarnWindows = new Map<
+    ChatAuthFailureReason,
+    { until: number; emitted: number; suppressed: number }
+  >();
   private revocationSubscribed = false;
   private revocationRetryAttempt = 0;
   private revocationRetryTimer: NodeJS.Timeout | null = null;
@@ -191,14 +283,18 @@ export class ChatGateway implements OnModuleDestroy {
       // 单条 socket 报文上限,与 content 8KB 上限同数量级留余量。
       maxHttpBufferSize: 64 * 1024,
     });
+    io.engine.on('connection_error', (error) => {
+      this.observeEngineConnectionError(error);
+    });
     // G-04:Redis adapter 让房间广播跨实例;未配 Redis 保持单实例语义。
     void this.attachRedisAdapter(io);
 
     io.use((socket, next) => {
+      const traceId = this.connectionTraceId(socket);
       void this.authenticate(socket)
         .then((userId) => {
           if (!userId) {
-            this.metrics.observeAuthFailure('rejected');
+            this.observeAuthRejection(socket, traceId);
             next(new Error('unauthorized'));
             return;
           }
@@ -212,9 +308,12 @@ export class ChatGateway implements OnModuleDestroy {
             operation: 'handshakeAuth',
             kind: 'websocket',
           });
-          this.logger.warn(
-            `handshake auth errored: ${error instanceof Error ? error.message : String(error)}`,
-          );
+          this.logger.warn({
+            event: 'ws_auth_rejected',
+            stage: 'auth',
+            reason: 'error',
+            traceId,
+          });
           next(new Error('unauthorized'));
         });
     });
@@ -227,6 +326,106 @@ export class ChatGateway implements OnModuleDestroy {
     this.broadcast.setServer(io);
     this.ensureRevocationSubscription();
     this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
+  }
+
+  private connectionTraceId(socket: Socket): string {
+    const existing = socket.data.connectionTraceId;
+    if (typeof existing === 'string') return existing;
+    const header = firstHeader(
+      socket.handshake.headers[CONNECTION_TRACE_HEADER],
+    );
+    const authTrace = (
+      socket.handshake.auth as Record<string, unknown> | undefined
+    )?.traceId;
+    const traceId = resolveConnectionTraceId(
+      safeConnectionTraceId(header) ?? safeConnectionTraceId(authTrace),
+    );
+    socket.data.connectionTraceId = traceId;
+    return traceId;
+  }
+
+  private observeEngineConnectionError(error: EngineConnectionError): void {
+    const reason = engineRejectionReason(error.code);
+    const traceId = resolveConnectionTraceId(
+      firstHeader(error.req?.headers[CONNECTION_TRACE_HEADER]),
+    );
+    const statusCode =
+      typeof error.context?.status === 'number' &&
+      error.context.status >= 100 &&
+      error.context.status <= 599
+        ? error.context.status
+        : undefined;
+    this.metrics.observeConnectionRejected(reason);
+    this.logger.warn({
+      event: 'ws_connection_rejected',
+      stage: 'upgrade',
+      reason,
+      errorCode: typeof error.code === 'number' ? error.code : undefined,
+      statusCode,
+      traceId,
+    });
+  }
+
+  private authFailureReason(socket: Socket): ChatAuthFailureReason {
+    const reason = socket.data.authFailureReason;
+    return CHAT_AUTH_FAILURE_REASONS.has(reason as ChatAuthFailureReason)
+      ? (reason as ChatAuthFailureReason)
+      : 'invalid_token';
+  }
+
+  private observeAuthRejection(socket: Socket, traceId: string): void {
+    const reason = this.authFailureReason(socket);
+    // 指标每条都记:它基数固定,是「到底发生了多少次」的权威来源。
+    this.metrics.observeAuthFailure(reason);
+    // 'error' 是服务端内部/配置故障,客户端触发不了,不能采样掉。
+    if (reason === 'error') {
+      this.logger.warn({
+        event: 'ws_auth_rejected',
+        stage: 'auth',
+        reason,
+        traceId,
+      });
+      return;
+    }
+    const now = Date.now();
+    let window = this.authWarnWindows.get(reason);
+    if (!window || window.until <= now) {
+      // 上一窗口压掉的条数在这里补报一次 —— 采样可以,静默丢弃不行。
+      if (window && window.suppressed > 0) {
+        this.logger.warn({
+          event: 'ws_auth_rejected_suppressed',
+          stage: 'auth',
+          reason,
+          suppressed: window.suppressed,
+          windowMs: ChatGateway.AUTH_WARN_WINDOW_MS,
+        });
+      }
+      window = {
+        until: now + ChatGateway.AUTH_WARN_WINDOW_MS,
+        emitted: 0,
+        suppressed: 0,
+      };
+      this.authWarnWindows.set(reason, window);
+    }
+    if (window.emitted >= ChatGateway.AUTH_WARN_PER_WINDOW) {
+      window.suppressed += 1;
+      return;
+    }
+    window.emitted += 1;
+    this.logger.warn({
+      event: 'ws_auth_rejected',
+      stage: 'auth',
+      reason,
+      traceId,
+    });
+  }
+
+  private rejectAuth(
+    socket: Socket,
+    reason: Exclude<ChatAuthFailureReason, 'error'>,
+  ): null {
+    socket.data.authFailureReason = reason;
+    return null;
   }
 
   /**
@@ -331,7 +530,9 @@ export class ChatGateway implements OnModuleDestroy {
   private async authenticate(socket: Socket): Promise<string | null> {
     const token = (socket.handshake.auth as Record<string, unknown> | undefined)
       ?.token;
-    if (typeof token !== 'string' || token.length === 0) return null;
+    if (typeof token !== 'string' || token.length === 0) {
+      return this.rejectAuth(socket, 'missing_token');
+    }
     if (this.claimsGuestKind(token)) {
       return this.authenticateGuest(socket, token);
     }
@@ -339,16 +540,24 @@ export class ChatGateway implements OnModuleDestroy {
     try {
       payload = this.jwtService.verify<JwtPayload>(token);
     } catch {
-      return null;
+      return this.rejectAuth(socket, 'invalid_token');
     }
-    if (typeof payload?.sub !== 'string') return null;
-    if (typeof payload?.accountId !== 'string') return null;
+    if (
+      typeof payload?.sub !== 'string' ||
+      typeof payload?.accountId !== 'string'
+    ) {
+      return this.rejectAuth(socket, 'invalid_claims');
+    }
     // 管理台走 /auth/admin/login 拿的是 ADMIN audience,它同样能过签名校验 ——
     // 而管理台压根没有消息 UI。拆 OpenIM 之前这道闸在 /auth/im-token 里(显式拒
     // ADMIN),自研栈直接复用 app JWT 连 socket,闸随端点一起没了。这是迁移带回来
     // 的能力扩张,不是新需求。REST 侧同源判定见 AppAudienceGuard。
-    if (payload.aud !== 'APP') return null;
-    if (await this.sessionRevocation.isRevoked(payload)) return null;
+    if (payload.aud !== 'APP') {
+      return this.rejectAuth(socket, 'wrong_audience');
+    }
+    if (await this.sessionRevocation.isRevoked(payload)) {
+      return this.rejectAuth(socket, 'revoked');
+    }
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
     socket.data.issuedAtMs = issuedAtMsOf(payload);
@@ -411,7 +620,7 @@ export class ChatGateway implements OnModuleDestroy {
     const secret = this.configService.get<string>('TEMP_CHAT_LINK_SECRET');
     if (!secret) {
       this.logger.warn('TEMP_CHAT_LINK_SECRET 未配置,访客握手一律拒绝');
-      return null;
+      return this.rejectAuth(socket, 'guest_secret_missing');
     }
     let payload: GuestChatTokenPayload;
     try {
@@ -419,7 +628,7 @@ export class ChatGateway implements OnModuleDestroy {
         secret,
       });
     } catch {
-      return null;
+      return this.rejectAuth(socket, 'guest_invalid_token');
     }
     if (
       payload?.kind !== TEMP_CHAT_GUEST_TOKEN_KIND ||
@@ -427,13 +636,15 @@ export class ChatGateway implements OnModuleDestroy {
       typeof payload.tcId !== 'string' ||
       typeof payload.conversationId !== 'string'
     ) {
-      return null;
+      return this.rejectAuth(socket, 'guest_invalid_claims');
     }
-    if (!(await this.chatService.getActiveTempChat(payload.tcId))) return null;
+    if (!(await this.chatService.getActiveTempChat(payload.tcId))) {
+      return this.rejectAuth(socket, 'guest_inactive');
+    }
     if (
       !(await this.chatService.hasSeat(payload.conversationId, payload.guestId))
     )
-      return null;
+      return this.rejectAuth(socket, 'guest_no_seat');
     socket.data.guestConversationId = payload.conversationId;
     socket.data.sessionId = null;
     socket.data.issuedAtMs = null;
@@ -464,6 +675,7 @@ export class ChatGateway implements OnModuleDestroy {
   }
 
   private async handleConnection(socket: Socket): Promise<void> {
+    const traceId = this.connectionTraceId(socket);
     const userId = socket.data.userId as string;
     const guestConversationId =
       typeof socket.data.guestConversationId === 'string'
@@ -472,9 +684,12 @@ export class ChatGateway implements OnModuleDestroy {
 
     if (!this.claimConnectionSlot(userId, socket)) {
       this.metrics.observeConnectionRejected('per_user_limit');
-      this.logger.warn(
-        `connection cap reached for user ${userId}; rejecting new socket`,
-      );
+      this.logger.warn({
+        event: 'ws_connection_rejected',
+        stage: 'admission',
+        reason: 'per_user_limit',
+        traceId,
+      });
       socket.disconnect(true);
       return;
     }
@@ -487,6 +702,11 @@ export class ChatGateway implements OnModuleDestroy {
     // Redis/数据库拖慢；这段窗口里的首条消息要等 ready 后处理,不能被 Socket.IO
     // 当成无人监听的事件直接丢掉。
     let admissionState: 'pending' | 'ready' | 'failed' = 'pending';
+    /**
+     * 关闭日志用的「曾经就绪过吗」。不能拿 admissionState 判断:disconnect
+     * 处理器第一件事就是 failAdmission(),到打日志时它必然是 'failed'。
+     */
+    let reachedReady = false;
     const preReadyQueue: Array<() => Promise<void>> = [];
     let drainingPreReadyQueue = false;
     let conversationIds: string[] = [];
@@ -620,7 +840,7 @@ export class ChatGateway implements OnModuleDestroy {
         }
       },
     );
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason: string) => {
       failAdmission();
       this.releaseConnectionSlot(userId, socket);
       void this.presence.socketDisconnected(userId, socket.id);
@@ -639,6 +859,16 @@ export class ChatGateway implements OnModuleDestroy {
       this.deliveredLimiter.pruneExpired(userId);
       this.reactionLimiter.pruneExpired(userId);
       this.editLimiter.pruneExpired(userId);
+      this.logger.log({
+        event: 'ws_connection_closed',
+        // 这个监听器在全局配额校验和入房之前就装上了:被 per_user_limit 拒掉、
+        // pre-ready 队列溢出或入房失败的 socket 一样会走到这里。一律记成
+        // 'ready' 会让被拒的连接在生命周期分析里显示成「成功接纳后才断开」,
+        // 从而把接纳成功率算高。
+        stage: reachedReady ? 'ready' : 'pre_ready',
+        reason: boundedDisconnectReason(reason),
+        traceId,
+      });
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
       void this.broadcast.isUserOnline(userId).then((online) => {
         if (online) return;
@@ -667,9 +897,13 @@ export class ChatGateway implements OnModuleDestroy {
       globalCount !== null &&
       globalCount > ChatGateway.MAX_SOCKETS_PER_USER
     ) {
-      this.logger.warn(
-        `global connection cap reached for user ${userId} (${globalCount}); rejecting`,
-      );
+      this.logger.warn({
+        event: 'ws_connection_rejected',
+        stage: 'admission',
+        reason: 'per_user_limit',
+        traceId,
+      });
+      this.metrics.observeConnectionRejected('per_user_limit');
       void this.presence.socketDisconnected(userId, socket.id);
       this.releaseConnectionSlot(userId, socket);
       failAdmission();
@@ -696,15 +930,25 @@ export class ChatGateway implements OnModuleDestroy {
         operation: 'joinRooms',
         kind: 'websocket',
       });
-      this.logger.error(
-        `join rooms failed for user ${userId}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      this.logger.error({
+        event: 'ws_connection_rejected',
+        stage: 'room_join',
+        reason: 'join_failed',
+        traceId,
+      });
       this.metrics.observeConnectionRejected('join_failed');
       failAdmission();
       socket.disconnect(true);
       return;
     }
     admissionState = 'ready';
+    reachedReady = true;
+    this.logger.log({
+      event: 'ws_connection_ready',
+      stage: 'ready',
+      transport: boundedTransportName(socket.conn?.transport?.name),
+      traceId,
+    });
     void drainPreReadyQueue();
     // 会话房派生完成 → 挂进跨实例在线集合(推送分流/在线判定的数据源)。
     void this.presence.registerConversations(userId, conversationIds);

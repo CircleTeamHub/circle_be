@@ -13,7 +13,10 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
     // 网关会往 data 上钉 guestConversationId / sessionId / issuedAtMs。
     data: { userId: 'u1' } as Record<string, unknown>,
     rooms: new Set<string>(['socket-1', 'c:conv-1']),
-    handshake: { auth: { token: 'jwt' } },
+    handshake: {
+      auth: { token: 'jwt', traceId: 'ws-auth-trace' },
+      headers: { 'x-connection-trace-id': 'ws-header-trace' },
+    },
     join: jest.fn().mockResolvedValue(undefined),
     disconnect: jest.fn(),
     disconnected: false,
@@ -119,24 +122,28 @@ describe('ChatGateway', () => {
     });
 
     it('rejects missing/invalid/revoked tokens', async () => {
+      const missing = fakeSocket({ handshake: { auth: {}, headers: {} } });
       await expect(
-        gateway['authenticate'](
-          fakeSocket({ handshake: { auth: {} } }) as never,
-        ),
+        gateway['authenticate'](missing as never),
       ).resolves.toBeNull();
+      expect(missing.data.authFailureReason).toBe('missing_token');
 
       jwtService.verify.mockImplementation(() => {
         throw new Error('bad signature');
       });
+      const invalid = fakeSocket();
       await expect(
-        gateway['authenticate'](fakeSocket() as never),
+        gateway['authenticate'](invalid as never),
       ).resolves.toBeNull();
+      expect(invalid.data.authFailureReason).toBe('invalid_token');
 
       // 缺 accountId = 非 access token(如伪造载荷),同样拒绝。
       jwtService.verify.mockReturnValue({ sub: 'u1' });
+      const claims = fakeSocket();
       await expect(
-        gateway['authenticate'](fakeSocket() as never),
+        gateway['authenticate'](claims as never),
       ).resolves.toBeNull();
+      expect(claims.data.authFailureReason).toBe('invalid_claims');
 
       jwtService.verify.mockReturnValue({
         sub: 'u1',
@@ -144,9 +151,11 @@ describe('ChatGateway', () => {
         aud: 'APP',
       });
       sessionRevocation.isRevoked.mockResolvedValue(true);
+      const revoked = fakeSocket();
       await expect(
-        gateway['authenticate'](fakeSocket() as never),
+        gateway['authenticate'](revoked as never),
       ).resolves.toBeNull();
+      expect(revoked.data.authFailureReason).toBe('revoked');
     });
 
     // 管理台走 /auth/admin/login 拿的是 ADMIN audience,它同样能过签名校验,
@@ -158,9 +167,11 @@ describe('ChatGateway', () => {
         accountId: 'acc-admin',
         aud: 'ADMIN',
       });
+      const socket = fakeSocket();
       await expect(
-        gateway['authenticate'](fakeSocket() as never),
+        gateway['authenticate'](socket as never),
       ).resolves.toBeNull();
+      expect(socket.data.authFailureReason).toBe('wrong_audience');
       // 连吊销检查都不该走到 —— 这类 token 根本不该进入聊天面。
       expect(sessionRevocation.isRevoked).not.toHaveBeenCalled();
     });
@@ -170,6 +181,191 @@ describe('ChatGateway', () => {
       await expect(
         gateway['authenticate'](fakeSocket() as never),
       ).resolves.toBeNull();
+    });
+  });
+
+  describe('connection observability', () => {
+    it('uses the same validated connection trace from the proxy header', () => {
+      const socket = fakeSocket();
+      expect(gateway['connectionTraceId'](socket as never)).toBe(
+        'ws-header-trace',
+      );
+      expect(socket.data.connectionTraceId).toBe('ws-header-trace');
+    });
+
+    it('ignores an unsafe proxy trace and falls back to the validated auth copy', () => {
+      const socket = fakeSocket({
+        handshake: {
+          auth: { token: 'jwt', traceId: 'ws-safe-auth-trace' },
+          headers: {
+            'x-connection-trace-id': 'Bearer attacker-controlled-secret',
+          },
+        },
+      });
+
+      expect(gateway['connectionTraceId'](socket as never)).toBe(
+        'ws-safe-auth-trace',
+      );
+    });
+
+    it('records a bounded auth rejection without user or token data', () => {
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      const socket = fakeSocket();
+      socket.data.authFailureReason = 'wrong_audience';
+
+      gateway['observeAuthRejection'](socket as never, 'ws-auth-rejected');
+
+      expect(metrics.observeAuthFailure).toHaveBeenCalledWith('wrong_audience');
+      expect(warn).toHaveBeenCalledWith({
+        event: 'ws_auth_rejected',
+        stage: 'auth',
+        reason: 'wrong_audience',
+        traceId: 'ws-auth-rejected',
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/jwt|u1|account/i);
+    });
+
+    it('bounds auth-rejection warnings while still counting every failure', () => {
+      // /chat-ws 是公网端点:过期 token 的自动重连客户端能无限触发认证失败。
+      // 指标必须条条都计,日志不能 —— 否则 30MB 日志配额会被冲掉。
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      for (let i = 0; i < 50; i += 1) {
+        const socket = fakeSocket();
+        socket.data.authFailureReason = 'revoked';
+        gateway['observeAuthRejection'](socket as never, `ws-trace-${i}`);
+      }
+
+      expect(metrics.observeAuthFailure).toHaveBeenCalledTimes(50);
+      const rejected = warn.mock.calls.filter(
+        ([record]) =>
+          (record as { event?: string }).event === 'ws_auth_rejected',
+      );
+      expect(rejected).toHaveLength(5);
+      // 压掉的不能无声消失:窗口翻页时汇总补报一次。
+      const base = Date.now();
+      jest.spyOn(Date, 'now').mockReturnValue(base + 61_000);
+      const socket = fakeSocket();
+      socket.data.authFailureReason = 'revoked';
+      gateway['observeAuthRejection'](socket as never, 'ws-next-window');
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'ws_auth_rejected_suppressed',
+          reason: 'revoked',
+          suppressed: 45,
+        }),
+      );
+      (Date.now as jest.Mock).mockRestore();
+    });
+
+    it('never samples away an internal auth error', () => {
+      // 'error' 是服务端内部/配置故障,客户端触发不了,条条都要记。
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      for (let i = 0; i < 20; i += 1) {
+        const socket = fakeSocket();
+        socket.data.authFailureReason = 'error';
+        gateway['observeAuthRejection'](socket as never, `ws-err-${i}`);
+      }
+
+      const rejected = warn.mock.calls.filter(
+        ([record]) =>
+          (record as { event?: string }).event === 'ws_auth_rejected',
+      );
+      expect(rejected).toHaveLength(20);
+    });
+
+    it('classifies engine upgrade failures without logging raw request data', () => {
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      gateway['observeEngineConnectionError']({
+        req: {
+          headers: {
+            'x-connection-trace-id': 'ws-upgrade-trace',
+            authorization: 'Bearer private-token',
+          },
+        },
+        code: 4,
+        message: 'Forbidden private-token',
+        context: { status: 403 },
+      } as never);
+
+      expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
+        'engine_forbidden',
+      );
+      expect(warn).toHaveBeenCalledWith({
+        event: 'ws_connection_rejected',
+        stage: 'upgrade',
+        reason: 'engine_forbidden',
+        errorCode: 4,
+        statusCode: 403,
+        traceId: 'ws-upgrade-trace',
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /private-token|authorization/i,
+      );
+    });
+
+    it('logs ready and disconnect lifecycle events with one trace id', async () => {
+      const log = jest
+        .spyOn((gateway as any).logger, 'log')
+        .mockImplementation(() => undefined);
+      const socket = fakeSocket({
+        conn: { transport: { name: 'websocket' } },
+      });
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.('transport error');
+
+      expect(log).toHaveBeenCalledWith({
+        event: 'ws_connection_ready',
+        stage: 'ready',
+        transport: 'websocket',
+        traceId: 'ws-header-trace',
+      });
+      expect(log).toHaveBeenCalledWith({
+        event: 'ws_connection_closed',
+        stage: 'ready',
+        reason: 'transport_error',
+        traceId: 'ws-header-trace',
+      });
+    });
+
+    it('does not label a rejected connection as ready when it closes', async () => {
+      // disconnect 监听器在全局配额校验和入房之前就装上了。一律记 'ready' 的话,
+      // 被拒的 socket 在生命周期分析里会显示成「接纳成功之后才断开」。
+      const log = jest
+        .spyOn((gateway as any).logger, 'log')
+        .mockImplementation(() => undefined);
+      jest
+        .spyOn((gateway as any).logger, 'error')
+        .mockImplementation(() => undefined);
+      const socket = fakeSocket({ conn: { transport: { name: 'websocket' } } });
+      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.('transport error');
+
+      expect(log).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          event: 'ws_connection_ready',
+        }),
+      );
+      expect(log).toHaveBeenCalledWith({
+        event: 'ws_connection_closed',
+        stage: 'pre_ready',
+        reason: 'transport_error',
+        traceId: 'ws-header-trace',
+      });
     });
   });
 

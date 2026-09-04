@@ -1337,10 +1337,18 @@ api.interceptors.response.use(
 ```typescript
 import { io } from 'socket.io-client';
 
+// 每次连接生成一个随机的连接追踪 ID(不含账号信息),同时放进 auth 和请求头:
+// 请求头那份让 Caddy 的接入日志记下同一个 ID,auth 那份是网关侧的兜底来源。
+// 两边都带上,握手失败时才能把代理层记录和网关记录对起来查;只发 auth.token
+// 的老客户端仍可正常连接,只是排查时关联不上代理层那条。
+// 格式必须匹配 ^ws-[a-zA-Z0-9-]{8,96}$,否则代理与网关都会忽略它。
+const connectionTraceId = `ws-${crypto.randomUUID()}`;
+
 const socket = io(API_BASE, {
   path: '/chat-ws',
   transports: ['websocket'],
-  auth: { token: accessToken },
+  auth: { token: accessToken, traceId: connectionTraceId },
+  extraHeaders: { 'x-connection-trace-id': connectionTraceId },
 });
 ```
 

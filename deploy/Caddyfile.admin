@@ -12,11 +12,38 @@
 # 直接映射到本机、前面没有 CDN/代理，所以 {remote_host} 就是真实客户端 IP；哪天
 # 挪到 Cloudflare 之类后面，必须同时配 trusted_proxies，否则所有人会共用一个桶。
 #
-# ⚠️ 不要给下面的站点开 access log（`log` 指令）。历史上曾有把凭证放进 WS 握手
-#    URL query 的通道经此反代;自研栈 token 走 socket.io auth payload 不落 URL，
-#    但媒体预签名 URL 仍带签名 query —— 开日志前务必先过滤 query。
+# ⚠️ 不要给下面的整个站点开 access log（`log` 指令）。API 域只给 /chat-ws 分配
+#    no_hostname 的专用 logger，并在输出前移除 query、请求头和 IP；媒体预签名 URL
+#    及普通 API 请求仍不会进入 Caddy access log。
 
 {$API_DOMAIN} {
+	# 只记录 chat WebSocket 握手。连接追踪 ID 由客户端随机生成，不含账号；
+	# query、全部请求头和 IP 在编码前删除，避免 token、签名 URL 或设备信息落盘。
+	@chat_ws path /chat-ws /chat-ws/*
+	@chat_ws_traced {
+		path /chat-ws /chat-ws/*
+		header_regexp connection_trace X-Connection-Trace-Id ^ws-[a-zA-Z0-9-]{8,96}$
+	}
+	log chat_ws {
+		no_hostname
+		output stdout
+		# filter 编码器的字段过滤必须放在 fields 块里(Caddy 2.8+ 语法);直接写在
+		# format filter 下的旧写法会被 caddy validate 拒绝,release-deploy.sh 每次
+		# 切流前都会跑 validate,配置不合法就等于发布被卡死。
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp \?.*$ ""
+				request>headers delete
+				request>remote_ip delete
+				request>client_ip delete
+			}
+		}
+	}
+	log_name @chat_ws chat_ws
+	log_append @chat_ws event ws_proxy_access
+	log_append @chat_ws_traced traceId {http.request.header.X-Connection-Trace-Id}
+
 	@metrics path /metrics /metrics/*
 	handle @metrics {
 		respond 404

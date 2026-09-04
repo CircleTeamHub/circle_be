@@ -3,19 +3,37 @@ import { Counter, Gauge, Histogram, Registry } from 'prom-client';
 export type ChatAction = 'send' | 'read' | 'typing' | 'presence';
 export type ChatEventResult = 'success' | 'failure' | 'rate_limited';
 export type ChatBroadcastAction = 'message' | 'read' | 'typing' | 'presence';
+export type ChatConnectionRejectionReason =
+  | 'per_user_limit'
+  | 'join_failed'
+  | 'pre_ready_overflow'
+  | 'drain_backlog_overflow'
+  | 'engine_transport_unknown'
+  | 'engine_session_unknown'
+  | 'engine_bad_handshake_method'
+  | 'engine_bad_request'
+  | 'engine_forbidden'
+  | 'engine_unsupported_protocol'
+  | 'engine_unknown';
+export type ChatAuthFailureReason =
+  | 'missing_token'
+  | 'invalid_token'
+  | 'invalid_claims'
+  | 'wrong_audience'
+  | 'revoked'
+  | 'guest_secret_missing'
+  | 'guest_invalid_token'
+  | 'guest_invalid_claims'
+  | 'guest_inactive'
+  | 'guest_no_seat'
+  | 'error';
 
 export interface ChatMetrics {
   readonly registry: Registry;
   observeConnectionOpened(activeUsers: number): void;
   observeConnectionClosed(activeUsers: number): void;
-  observeConnectionRejected(
-    reason:
-      | 'per_user_limit'
-      | 'join_failed'
-      | 'pre_ready_overflow'
-      | 'drain_backlog_overflow',
-  ): void;
-  observeAuthFailure(reason: 'rejected' | 'error'): void;
+  observeConnectionRejected(reason: ChatConnectionRejectionReason): void;
+  observeAuthFailure(reason: ChatAuthFailureReason): void;
   observeEvent(action: ChatAction, result: ChatEventResult): void;
   observeAckDuration(
     action: 'send' | 'read' | 'presence',
