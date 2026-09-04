@@ -305,18 +305,22 @@ if [ "$(id -u)" != "0" ] && [ -e "$foreign_file" ] && [ ! -O "$foreign_file" ]; 
   fi
 fi
 
-# (2) Token absent or already ours: local development. Docker Desktop maps uids
-# so Prometheus can still read it; failing here only blocks bringing monitoring
-# up locally. Write it, warn loudly, exit 0.
+# (2) Token absent or already ours: fail by default because a real Linux host
+# cannot serve metrics from the resulting current-user-owned 0600 file.
 local_file="$tmp_dir/local_token"
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-token' > "$env_file"
 : > "$sync_marker"
-local_out="$(ENV_FILE="$env_file" \
+if local_out="$(ALLOW_UNPRIVILEGED_METRICS_TOKEN=0 \
+  PATH="$least_bin:$PATH" \
+  ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
-  PROM_UID="$prom_uid" \
-  PROM_GID="$prom_gid" \
+  PROM_UID=65534 \
+  PROM_GID=65534 \
   SUDO=false \
-  bash "$script")"
+  bash "$script" 2>&1)"; then
+  echo 'expected unprivileged sync to fail without an explicit local-development override' >&2
+  exit 1
+fi
 
 test "$(cat "$local_file")" = 'local-dev-token'
 case "$(uname -s)" in
@@ -324,18 +328,73 @@ case "$(uname -s)" in
   *) test "$(file_mode "$local_file")" = '600' ;;
 esac
 printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+printf '%s' "$local_out" | grep -F 'ALLOW_UNPRIVILEGED_METRICS_TOKEN=1' >/dev/null
+printf '%s' "$local_out" | grep -F 'Configure passwordless sudo for install and mv, or run this script as root.' >/dev/null
+printf '%s' "$local_out" | grep -F '修复权限后重新运行本脚本' >/dev/null
+if printf '%s' "$local_out" | grep -F 'sudo chown' >/dev/null; then
+  echo 'sync failure must not recommend a chown that makes the next unprivileged run fail' >&2
+  exit 1
+fi
 test -e "$sync_marker"
 
-# Rotation still has to work on the following run — the file is ours now, which
-# must not be mistaken for the "owned by somebody else" case above.
+# Docker Desktop maps uids for local development. Keep that compatibility only
+# behind an explicit opt-in, including subsequent rotations.
 printf '%s\n' 'METRICS_AUTH_TOKEN=local-dev-rotated' > "$env_file"
-ENV_FILE="$env_file" \
+local_out="$(ALLOW_UNPRIVILEGED_METRICS_TOKEN=1 \
+  PATH="$least_bin:$PATH" \
+  ENV_FILE="$env_file" \
   TOKEN_FILE="$local_file" \
-  PROM_UID="$prom_uid" \
-  PROM_GID="$prom_gid" \
+  PROM_UID=65534 \
+  PROM_GID=65534 \
   SUDO=false \
-  bash "$script" >/dev/null
+  bash "$script")"
 
 test "$(cat "$local_file")" = 'local-dev-rotated'
+printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null
+test -e "$sync_marker"
+# Nothing is broken on the opt-in path, so it must not tell the operator to fix
+# permissions; it must say the marker is kept and the override is per-rotation.
+printf '%s' "$local_out" | grep -F 'intentionally retained' >/dev/null
+printf '%s' "$local_out" | grep -F 'again on every rotation' >/dev/null
+if printf '%s' "$local_out" | grep -F '修复权限后重新运行本脚本' >/dev/null; then
+  echo 'opt-in success must not instruct the operator to fix permissions' >&2
+  exit 1
+fi
+
+# (3) Deploy uid equals PROM_UID (rootless Podman, or a container run as the
+# host user). A 0600 file is readable by exactly its owner uid, so this is a
+# complete sync: exit 0 with no override, Prometheus recreated, marker cleared.
+# The fake id on $least_bin reports uid 1000, which keeps this deterministic
+# whether or not the suite itself runs as root.
+matching_uid_file="$tmp_dir/matching-uid-token"
+matching_uid_log="$tmp_dir/matching-uid-docker.log"
+printf '%s\n' 'METRICS_AUTH_TOKEN=matching-uid-token' > "$env_file"
+: > "$sync_marker"
+local_out="$(ALLOW_UNPRIVILEGED_METRICS_TOKEN=0 \
+  PATH="$least_bin:$PATH" \
+  DOCKER_LOG="$matching_uid_log" \
+  ENV_FILE="$env_file" \
+  TOKEN_FILE="$matching_uid_file" \
+  PROM_UID=1000 \
+  PROM_GID=1000 \
+  SUDO=false \
+  bash "$script" 2>&1)"
+
+test "$(cat "$matching_uid_file")" = 'matching-uid-token'
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) ;;
+  *) test "$(file_mode "$matching_uid_file")" = '600' ;;
+esac
+test ! -e "$sync_marker"
+grep -F 'up -d --force-recreate prometheus' "$matching_uid_log" >/dev/null
+printf '%s' "$local_out" | grep -F 'uid 1000' >/dev/null
+if printf '%s' "$local_out" | grep -F 'cannot read a 0600 file' >/dev/null; then
+  echo 'a deploy uid equal to PROM_UID must not be reported as unreadable' >&2
+  exit 1
+fi
+if printf '%s' "$local_out" | grep -F 'ALLOW_UNPRIVILEGED_METRICS_TOKEN' >/dev/null; then
+  echo 'a deploy uid equal to PROM_UID must not require the local-development override' >&2
+  exit 1
+fi
 
 echo 'sync-metrics-token regression tests passed'

@@ -159,9 +159,18 @@ Run these on the server, from the repo root, **after** the app stack is up.
    ```
 
    This atomically replaces the gitignored
-   `monitoring/prometheus/metrics_token` as uid `65534` with mode `0600`.
-   Passwordless sudo for `install` and `mv` (or running the script as root) is
-   required so repeated rotations never try to overwrite a Prometheus-owned file.
+   `monitoring/prometheus/metrics_token` as uid `65534` (`PROM_UID`) with mode
+   `0600`. Passwordless sudo for `install` and `mv` (or running the script as
+   root) is required so repeated rotations never try to overwrite a
+   Prometheus-owned file. The one exception is a deploy user whose own uid
+   already equals `PROM_UID` (rootless Podman, or a container deliberately run
+   as the host user): the script detects the match and completes the sync
+   without privilege escalation or any override, because the `0600` file that
+   user owns is exactly the one Prometheus can read.
+   Docker Desktop users whose containers map the host user may explicitly set
+   `ALLOW_UNPRIVILEGED_METRICS_TOKEN=1`; never use that override on a Linux host.
+   The override is not persisted — pass it again on every rotation — and the
+   script intentionally keeps `.release/metrics-token-sync-required` in place.
 
 3. **Publish the database/Redis credentials to the exporters.** They are derived
    from `.env.production`, never hand-copied — `DATABASE_URL` carries Prisma's
