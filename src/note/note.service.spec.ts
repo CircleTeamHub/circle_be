@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
   ConflictException,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -10,6 +11,10 @@ import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  CHAT_MEDIA_DELETE_CLAIM_REASON,
+  CHAT_NOTE_IMPORT_RESERVATION_REASON,
+} from 'src/chat/chat.constants';
 import { UploadService } from 'src/upload/upload.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { MembershipProgramService } from 'src/membership/membership-program.service';
@@ -64,6 +69,11 @@ describe('NoteService', () => {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
       findMany: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    chatMediaDeletion: {
+      findUnique: jest.fn(),
+      upsert: jest.fn(),
       updateMany: jest.fn(),
     },
   };
@@ -3628,6 +3638,12 @@ describe('NoteService', () => {
       prisma.note.findFirst.mockReset();
       uploadService.copyObjectToKey.mockReset();
       uploadService.copyObjectToKey.mockResolvedValue(undefined);
+      prisma.chatMediaDeletion.findUnique.mockReset();
+      prisma.chatMediaDeletion.findUnique.mockResolvedValue(null);
+      prisma.chatMediaDeletion.upsert.mockReset();
+      prisma.chatMediaDeletion.upsert.mockResolvedValue({});
+      prisma.chatMediaDeletion.updateMany.mockReset();
+      prisma.chatMediaDeletion.updateMany.mockResolvedValue({ count: 1 });
     });
 
     it('copies media-section objects into the viewer chat namespace', async () => {
@@ -3656,6 +3672,158 @@ describe('NoteService', () => {
         },
       ]);
       expect(result.failedCount).toBe(0);
+    });
+
+    it('persists a cleanup reservation before copying each note import object', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const destination = uploadService.copyObjectToKey.mock.calls[0][1];
+      expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { objectKey: destination },
+          create: expect.objectContaining({
+            objectKey: destination,
+            attempts: 0,
+            nextAttemptAt: expect.any(Date),
+          }),
+        }),
+      );
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
+      );
+      expect(
+        prisma.chatMediaDeletion.upsert.mock.invocationCallOrder[0],
+      ).toBeLessThan(uploadService.copyObjectToKey.mock.invocationCallOrder[0]);
+    });
+
+    it('renews the reservation after the copy so the message insert gets a full window', async () => {
+      // 预留是一行 chatMediaDeletion,复制期间一直有效(advisory lock 才是随事务
+      // 释放的)。但复制本身要花时间:不续租的话「写消息 + 建引用」就得跟复制
+      // 共用同一个到期时间,复制慢一点就贴着边缘跑,清理 worker 可能在消息落库
+      // 之前把目标对象删掉。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const destination = uploadService.copyObjectToKey.mock.calls[0][1];
+      expect(prisma.chatMediaDeletion.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ objectKey: destination }),
+          data: expect.objectContaining({ nextAttemptAt: expect.any(Date) }),
+        }),
+      );
+      // 必须发生在复制之后 —— 复制之前续租等于没续。
+      expect(
+        uploadService.copyObjectToKey.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        prisma.chatMediaDeletion.updateMany.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not renew a reservation that has become a real pending deletion', async () => {
+      // 续租的 where 里带 lastError 判定:该行若已不是预留标记,说明它变成了
+      // 一条真的待删记录,这时候把它的 nextAttemptAt 往后推会拖住真正的清理。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+
+      await service.copyNoteMediaForChat('owner-1', 'note-1', ['media']);
+
+      const [call] = prisma.chatMediaDeletion.updateMany.mock.calls;
+      expect(call[0].where.lastError).toBe(CHAT_NOTE_IMPORT_RESERVATION_REASON);
+    });
+
+    it('does not copy an object when its durable cleanup reservation fails', async () => {
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.upsert.mockRejectedValueOnce(
+        new Error('database unavailable'),
+      );
+
+      await expect(
+        service.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+      ).rejects.toThrow('database unavailable');
+      expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
+    });
+
+    it('refuses to reuse a key the deletion worker is still recycling', async () => {
+      // worker 在事务里认领(标记 + 5 分钟租约)后到事务外删对象,锁已放掉。
+      // 此刻把同一行改写成预留并开始复制,飞行中的删除会把刚复制好的对象删掉,
+      // 所以在锁内看到活着的认领就以可重试的 409 拒绝,一个字节都不复制。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce({
+        lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
+        nextAttemptAt: new Date(Date.now() + 60_000),
+      });
+
+      await expect(
+        service.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.chatMediaDeletion.upsert).not.toHaveBeenCalled();
+      expect(uploadService.copyObjectToKey).not.toHaveBeenCalled();
+      // 检查发生在同一把 key 锁之内。
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.chatMediaDeletion.findUnique.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('reuses a key whose worker claim has already expired', async () => {
+      // 租约到期还挂着标记 = worker 中途挂了,没有在飞的删除;照常改写成预留。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce({
+        lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
+        nextAttemptAt: new Date(Date.now() - 1_000),
+      });
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(result.items).toHaveLength(1);
+      expect(prisma.chatMediaDeletion.upsert).toHaveBeenCalledTimes(1);
+    });
+
+    it('reuses a key whose earlier delete is only waiting out its backoff', async () => {
+      // 退避中的失败记录 nextAttemptAt 也在未来,但删除已经返回、没有在飞的
+      // 操作;把它当成活认领拒绝会让这条笔记媒体一小时内都发不进聊天。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.findUnique.mockResolvedValueOnce({
+        lastError: 'minio down',
+        nextAttemptAt: new Date(Date.now() + 30 * 60_000),
+      });
+
+      const result = await service.copyNoteMediaForChat('owner-1', 'note-1', [
+        'media',
+      ]);
+
+      expect(result.items).toHaveLength(1);
+      expect(uploadService.copyObjectToKey).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed when the reservation vanished while the copy ran', async () => {
+      // 复制拖过 15 分钟窗口:这行到期后被 worker 认领/回收,续租一行都没命中。
+      // 返回一个没有可靠预留的 key 只会让发消息撞上「import has expired」,
+      // 不如现在就以可重试的 409 失败,并留一条有界告警。
+      prisma.note.findFirst.mockResolvedValueOnce(noteRow());
+      prisma.chatMediaDeletion.updateMany.mockResolvedValueOnce({ count: 0 });
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+
+      try {
+        await expect(
+          service.copyNoteMediaForChat('owner-1', 'note-1', ['media']),
+        ).rejects.toBeInstanceOf(ConflictException);
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: 'note_import_reservation_lost',
+            noteId: 'note-1',
+            mediaId: 'media-1',
+          }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it('reuses the same destination key when an import request is retried', async () => {

@@ -7,7 +7,14 @@ import {
 import { randomUUID } from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
-import { CHAT_MEDIA_KEY_FIELDS, CHAT_MEDIA_KEY_PREFIX } from './chat.constants';
+import type { Prisma } from 'src/generated/prisma';
+import {
+  CHAT_MEDIA_DELETE_CLAIM_REASON,
+  CHAT_MEDIA_KEY_FIELDS,
+  CHAT_MEDIA_KEY_PREFIX,
+  CHAT_NOTE_IMPORT_RESERVATION_REASON,
+  CHAT_NOTE_IMPORT_SEGMENT,
+} from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 
 /**
@@ -34,6 +41,13 @@ const DELETE_BACKOFF_MAX_MS = 60 * 60_000;
 const DELETE_SWEEP_INTERVAL_MS = 60_000;
 /** 单轮重投的条数上限(存储长时间不可用时不要一口气打爆)。 */
 const DELETE_SWEEP_BATCH = 200;
+/**
+ * 认领租约:事务内把 nextAttemptAt 推后这么久,再到事务外去删对象。
+ * 期间别的 sweeper 实例查不到这一条,不会重复删。租约要长于一次对象存储
+ * 删除的最坏耗时;真失败了下面的 catch 会立刻按退避改写 nextAttemptAt,
+ * 进程中途挂掉最多也就是这一条晚 5 分钟被重投。
+ */
+const DELETE_CLAIM_LEASE_MS = 5 * 60_000;
 const FORWARD_COPY_RESERVATION_MS = 15 * 60_000;
 
 @Injectable()
@@ -57,6 +71,106 @@ export class ChatMediaService implements OnModuleDestroy {
     if (this.retryTimer) {
       clearInterval(this.retryTimer);
       this.retryTimer = null;
+    }
+  }
+
+  private noteImportKeys(keys: string[]): string[] {
+    return [...new Set(keys)]
+      .filter((key) => key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`))
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private async lockNoteImportKeys(
+    tx: Prisma.TransactionClient,
+    keys: string[],
+  ): Promise<void> {
+    for (const key of this.noteImportKeys(keys)) {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+    }
+  }
+
+  async attachNoteImportReferences(
+    tx: Prisma.TransactionClient,
+    messageId: string,
+    keys: string[],
+  ): Promise<void> {
+    const noteKeys = this.noteImportKeys(keys);
+    if (noteKeys.length === 0) return;
+    await this.lockNoteImportKeys(tx, noteKeys);
+    const now = Date.now();
+    for (const objectKey of noteKeys) {
+      const [referenceCount, reservation] = await Promise.all([
+        tx.chatMediaReference.count({ where: { objectKey } }),
+        tx.chatMediaDeletion.findUnique({
+          where: { objectKey },
+          select: { attempts: true, lastError: true, nextAttemptAt: true },
+        }),
+      ]);
+      const liveReservation =
+        reservation?.attempts === 0 &&
+        reservation.lastError === CHAT_NOTE_IMPORT_RESERVATION_REASON &&
+        reservation.nextAttemptAt.getTime() > now;
+      if (referenceCount === 0 && !liveReservation) {
+        throw new BadRequestException('Note media import has expired');
+      }
+    }
+    await tx.chatMediaReference.createMany({
+      data: noteKeys.map((objectKey) => ({ messageID: messageId, objectKey })),
+      skipDuplicates: true,
+    });
+    await tx.chatMediaDeletion.deleteMany({
+      where: { objectKey: { in: noteKeys } },
+    });
+  }
+
+  async releaseNoteImportReferences(
+    tx: Prisma.TransactionClient,
+    messageIds: string[],
+    keys: string[],
+  ): Promise<void> {
+    const noteKeys = this.noteImportKeys(keys);
+    if (noteKeys.length === 0 || messageIds.length === 0) return;
+    await this.lockNoteImportKeys(tx, noteKeys);
+    await tx.chatMediaReference.deleteMany({
+      where: {
+        messageID: { in: messageIds },
+        objectKey: { in: noteKeys },
+      },
+    });
+    for (const objectKey of noteKeys) {
+      const referenceCount = await tx.chatMediaReference.count({
+        where: { objectKey },
+      });
+      if (referenceCount > 0) {
+        await tx.chatMediaDeletion.deleteMany({ where: { objectKey } });
+        continue;
+      }
+      const reservation = await tx.chatMediaDeletion.findUnique({
+        where: { objectKey },
+        select: { attempts: true, lastError: true, nextAttemptAt: true },
+      });
+      if (
+        reservation?.attempts === 0 &&
+        reservation.lastError === CHAT_NOTE_IMPORT_RESERVATION_REASON &&
+        reservation.nextAttemptAt.getTime() > Date.now()
+      ) {
+        continue;
+      }
+      const nextAttemptAt = new Date();
+      await tx.chatMediaDeletion.upsert({
+        where: { objectKey },
+        create: {
+          objectKey,
+          attempts: 0,
+          lastError: 'last note import reference removed',
+          nextAttemptAt,
+        },
+        update: {
+          attempts: 0,
+          lastError: 'last note import reference removed',
+          nextAttemptAt,
+        },
+      });
     }
   }
 
@@ -168,6 +282,21 @@ export class ChatMediaService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * 认领后的条件写回一行都没命中:这行在对象删除飞行期间被改写成了导入预留
+   * (或被并发销掉)。不是错误 —— 正是条件写回要挡住的情形 —— 但值得留痕:
+   * `outcome=deleted` 时新预留复制出来的对象可能已被我们删掉,导入方会在
+   * 发消息时撞上过期并重试。
+   */
+  private warnClaimLost(objectKey: string, outcome: 'deleted' | 'failed') {
+    this.logger.warn({
+      message: 'chat media delete claim lost before write-back',
+      event: 'chat_media_claim_lost',
+      objectKey,
+      outcome,
+    });
+  }
+
   /** 落一条待删记录(幂等:同 key 重复入队只刷新失败原因)。 */
   private async enqueueDeletion(key: string, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
@@ -212,17 +341,72 @@ export class ChatMediaService implements OnModuleDestroy {
         take: DELETE_SWEEP_BATCH,
       });
       for (const row of due) {
+        // 一、事务内认领。只做数据库的事:复核、按引用计数销行、否则把
+        // nextAttemptAt 推后一个租约把这条占住。对象存储调用绝不能放进来 ——
+        // Prisma 交互事务默认只有几秒超时,一次慢的 MinIO/S3 删除会让整个事务
+        // 超时回滚,行既没删掉也没记下重试状态,还白占一个连接和 advisory lock。
+        const claimed = await this.prisma.$transaction(async (tx) => {
+          await this.lockNoteImportKeys(tx, [row.objectKey]);
+          const current = await tx.chatMediaDeletion.findUnique({
+            where: { id: row.id },
+          });
+          if (
+            !current ||
+            current.attempts >= DELETE_MAX_ATTEMPTS ||
+            current.nextAttemptAt.getTime() > Date.now()
+          ) {
+            return null;
+          }
+          const referenceCount = await tx.chatMediaReference.count({
+            where: { objectKey: current.objectKey },
+          });
+          if (referenceCount > 0) {
+            await tx.chatMediaDeletion.delete({ where: { id: current.id } });
+            return null;
+          }
+          // 租约:并发 sweeper 的 due 查询按 nextAttemptAt <= now 过滤,推后之后
+          // 别的实例就不会在本次删除还在飞的时候重复删同一个 key。
+          // lastError 同时写成认领标记:事务提交后 advisory lock 已经放掉,
+          // note-import 的确定性 key 可能被一次导入重试重新预留并复制 ——
+          // 预留路径看到「标记 + 未到期租约」会拒绝复用;下面的写回也只认
+          // 同一对 (标记, 租约) 的行,行一旦被改写成预留就绝不再碰。
+          const leaseUntil = new Date(Date.now() + DELETE_CLAIM_LEASE_MS);
+          await tx.chatMediaDeletion.update({
+            where: { id: current.id },
+            data: {
+              nextAttemptAt: leaseUntil,
+              lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
+            },
+          });
+          return { ...current, leaseUntil };
+        });
+        if (!claimed) continue;
+
+        // 二、事务外做对象存储删除,再用条件写回落库结果。用 deleteMany/updateMany
+        // 而不是 delete/update:行若被并发销掉,这里应当是无操作而不是抛 P2025。
+        // where 带上认领时写下的 (lastError, nextAttemptAt):只有仍是我们自己认领
+        // 的那一行才会被销掉/改写,已经变成导入预留的行一个字段都不能动。
+        const ownClaim = {
+          id: claimed.id,
+          nextAttemptAt: claimed.leaseUntil,
+          lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
+        };
         try {
-          await this.uploadService.deleteObjectByKey(row.objectKey);
-          await this.prisma.chatMediaDeletion.delete({ where: { id: row.id } });
+          await this.uploadService.deleteObjectByKey(claimed.objectKey);
+          const cleared = await this.prisma.chatMediaDeletion.deleteMany({
+            where: ownClaim,
+          });
+          if (cleared.count === 0) {
+            this.warnClaimLost(claimed.objectKey, 'deleted');
+          }
         } catch (error) {
-          const attempts = row.attempts + 1;
+          const attempts = claimed.attempts + 1;
           const backoff = Math.min(
-            DELETE_BACKOFF_BASE_MS * 2 ** row.attempts,
+            DELETE_BACKOFF_BASE_MS * 2 ** claimed.attempts,
             DELETE_BACKOFF_MAX_MS,
           );
-          await this.prisma.chatMediaDeletion.update({
-            where: { id: row.id },
+          const recorded = await this.prisma.chatMediaDeletion.updateMany({
+            where: ownClaim,
             data: {
               attempts,
               lastError: (error instanceof Error
@@ -232,11 +416,12 @@ export class ChatMediaService implements OnModuleDestroy {
               nextAttemptAt: new Date(Date.now() + backoff),
             },
           });
+          if (recorded.count === 0) {
+            this.warnClaimLost(claimed.objectKey, 'failed');
+          }
           if (attempts >= DELETE_MAX_ATTEMPTS) {
-            // 死信:停止自动重试,但**留在表里** —— 删掉这一行,那个 key 就
-            // 再也无从得知了。
             this.logger.error(
-              `chat media delete dead-lettered key=${row.objectKey} after ${attempts} attempts`,
+              `chat media delete dead-lettered key=${claimed.objectKey} after ${attempts} attempts`,
             );
           }
         }

@@ -7,7 +7,10 @@ import {
 } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatMediaService } from './chat-media.service';
-import { MEDIA_MESSAGE_TYPES } from './chat.constants';
+import {
+  CHAT_NOTE_IMPORT_SEGMENT,
+  MEDIA_MESSAGE_TYPES,
+} from './chat.constants';
 
 /**
  * S-01 会话级阅后即焚的真删器:每分钟扫描开了焚毁的会话,把超龄消息软删
@@ -107,7 +110,7 @@ export class ChatBurnSweeperService {
         take: SWEEP_BATCH,
       });
       if (rows.length === 0) return;
-      const mediaKeys = rows
+      const allMediaKeys = rows
         .filter((row) => MEDIA_MESSAGE_TYPES.includes(row.type))
         .flatMap((row) => {
           const content = (row.content ?? {}) as Record<string, unknown>;
@@ -115,15 +118,32 @@ export class ChatBurnSweeperService {
             .map((field) => content[field])
             .filter((v): v is string => typeof v === 'string' && v.length > 0);
         });
-      await this.prisma.chatMessage.updateMany({
-        where: { id: { in: rows.map((row) => row.id) } },
-        // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
-        // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
-        data: { deleted: true, content: {}, contentHistory: [] },
+      const messageIds = rows.map((row) => row.id);
+      const noteImportKeys = allMediaKeys.filter((key) =>
+        key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+      );
+      const ownedMediaKeys = allMediaKeys.filter(
+        (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+      );
+      await this.prisma.$transaction(async (tx) => {
+        await tx.chatMessage.updateMany({
+          where: { id: { in: messageIds } },
+          // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
+          // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
+          data: { deleted: true, content: {}, contentHistory: [] },
+        });
+        await this.media.releaseNoteImportReferences(
+          tx,
+          messageIds,
+          noteImportKeys,
+        );
       });
-      if (mediaKeys.length > 0) {
+      if (ownedMediaKeys.length > 0) {
         // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
-        void this.media.deleteObjects(mediaKeys);
+        void this.media.deleteObjects(ownedMediaKeys);
+      }
+      if (noteImportKeys.length > 0) {
+        void this.media.drainPendingDeletions();
       }
       this.logger.log(
         `burned ${rows.length} messages conversation=${conversationId}`,

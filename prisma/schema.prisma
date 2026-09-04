@@ -2108,6 +2108,7 @@ model ChatMessage {
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
   reactions    ChatMessageReaction[]
+  mediaReferences ChatMediaReference[]
 
   @@unique([conversationID, height])
   @@unique([conversationID, senderID, clientMessageId])
@@ -2119,6 +2120,18 @@ model ChatMessage {
   /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
   @@index([conversationID, revokedAt])
   @@index([conversationID, editedAt])
+}
+
+model ChatMediaReference {
+  id        String   @id @default(uuid())
+  messageID String
+  objectKey String
+  createdAt DateTime @default(now())
+
+  message ChatMessage @relation(fields: [messageID], references: [id], onDelete: Cascade)
+
+  @@unique([messageID, objectKey])
+  @@index([objectKey])
 }
 
 /// 消息表情回应（G-07）。不进 height 坐标系：不是消息、不推进未读、
