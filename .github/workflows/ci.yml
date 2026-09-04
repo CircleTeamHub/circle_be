@@ -322,6 +322,19 @@ jobs:
           docker run --rm circle-caddy:ci caddy list-modules \
             | grep -Fx 'http.handlers.rate_limit'
 
+      # release-deploy.sh runs `caddy validate` before every cutover, so a
+      # Caddyfile the built image rejects blocks releases. Catch that here with
+      # the same binary and adapter; the regex assertions in
+      # scripts/release-hardening.test.mjs cannot tell valid syntax from invalid.
+      - name: Validate the edge Caddyfile with the built image
+        run: |
+          docker run --rm \
+            -e API_DOMAIN=api.example.test \
+            -e ADMIN_DOMAIN=admin.example.test \
+            -e ACME_EMAIL=ops@example.test \
+            -v "$PWD/deploy/Caddyfile.admin:/etc/caddy/Caddyfile:ro" \
+            circle-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:

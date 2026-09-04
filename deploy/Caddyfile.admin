@@ -27,11 +27,17 @@
 	log chat_ws {
 		no_hostname
 		output stdout
+		# filter 编码器的字段过滤必须放在 fields 块里(Caddy 2.8+ 语法);直接写在
+		# format filter 下的旧写法会被 caddy validate 拒绝,release-deploy.sh 每次
+		# 切流前都会跑 validate,配置不合法就等于发布被卡死。
 		format filter {
-			request>uri regexp \?.*$ ""
-			request>headers delete
-			request>remote_ip delete
-			request>client_ip delete
+			wrap json
+			fields {
+				request>uri regexp \?.*$ ""
+				request>headers delete
+				request>remote_ip delete
+				request>client_ip delete
+			}
 		}
 	}
 	log_name @chat_ws chat_ws

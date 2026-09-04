@@ -64,6 +64,15 @@ Current events:
 - `security_event`: currently used for 401, 403, and rate limit hits.
 - `external_call_slow`: warning event for slow MinIO calls.
 
+Chat WebSocket lifecycle events (`ChatGateway`, correlated by the client's random `ws-...` trace ID; see `docs/metrics.md` for the lookup flow):
+
+- `ws_proxy_access`: Caddy access entry for a `/chat-ws` handshake with query, headers, and IPs removed.
+- `ws_auth_rejected`: a handshake failed authentication; `reason` is a bounded enum, sampled per reason per minute.
+- `ws_auth_rejected_suppressed`: summary emitted when `ws_auth_rejected` warnings were sampled away in the previous window, with the suppressed count.
+- `ws_connection_rejected`: an authenticated socket was refused admission (global or per-user cap, join failure); `reason` is a bounded enum.
+- `ws_connection_ready`: the socket joined its rooms and is fully admitted.
+- `ws_connection_closed`: the socket closed; `stage` says whether it had reached `ready`.
+
 Deferred production events:
 
 - `audit_event`

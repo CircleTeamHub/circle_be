@@ -92,10 +92,28 @@ test('Caddy emits privacy-safe access logs only for websocket handshakes', () =>
     apiBlock,
     /log_append @chat_ws_traced traceId \{http\.request\.header\.X-Connection-Trace-Id\}/,
   );
-  assert.match(apiBlock, /request>uri regexp \\\?\.\*\$ ""/);
-  assert.match(apiBlock, /request>headers delete/);
-  assert.match(apiBlock, /request>remote_ip delete/);
-  assert.match(apiBlock, /request>client_ip delete/);
+  // filter 编码器要求 wrap 一个底层编码器,并把字段过滤放进 fields 块;把过滤
+  // 直接写在 format filter 下会被 caddy validate 拒绝,而 release-deploy.sh 每次
+  // 切流前都跑 validate —— 语法错就是发布被卡死。正文还是纯文本比对,真正的
+  // 语法校验在 CI 的 docker 作业里用构建出来的镜像跑 caddy validate。
+  assert.match(
+    apiBlock,
+    /format filter \{\s*\n\s*wrap json\s*\n\s*fields \{[\s\S]*?\n\s*\}\s*\n\s*\}/,
+  );
+  const filterFields = apiBlock.slice(
+    apiBlock.indexOf('fields {'),
+    apiBlock.indexOf('log_name @chat_ws'),
+  );
+  assert.match(filterFields, /request>uri regexp \\\?\.\*\$ ""/);
+  assert.match(filterFields, /request>headers delete/);
+  assert.match(filterFields, /request>remote_ip delete/);
+  assert.match(filterFields, /request>client_ip delete/);
+
+  const ci = read('.github/workflows/ci.yml');
+  assert.match(
+    ci,
+    /circle-caddy:ci caddy validate --config \/etc\/caddy\/Caddyfile --adapter caddyfile/,
+  );
 });
 
 test('production app env access uses recoverable group-read transactions', () => {

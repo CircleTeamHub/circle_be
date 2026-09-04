@@ -103,7 +103,10 @@ docker logs --since 10m circle-be-blue 2>&1 | grep -E 'ws_(auth|connection)'
 
 Search the copied trace ID in both outputs. Expected event names are
 `ws_proxy_access`, `ws_auth_rejected`, `ws_connection_rejected`,
-`ws_connection_ready`, and `ws_connection_closed`. Rejection reason values are
+`ws_connection_ready`, and `ws_connection_closed`. Authentication warnings are
+sampled per reason per minute; when some were dropped, a
+`ws_auth_rejected_suppressed` summary carries the suppressed count (the
+Prometheus counter always counts every rejection). Rejection reason values are
 closed enums; raw exception messages and handshake credentials are deliberately
 excluded.
 
