@@ -13,6 +13,17 @@ function deferredJoin(id: string, completed: string[], delayMs: number) {
   );
 }
 
+function deferredSocketAction(id: string, completed: string[]) {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = () => {
+      completed.push(id);
+      done();
+    };
+  });
+  return { action: jest.fn(() => promise), resolve };
+}
+
 describe('ChatBroadcastService.joinUserToConversation', () => {
   function buildHarness(joinDelayMs = 0) {
     const completed: string[] = [];
@@ -80,5 +91,93 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
       clearedBeforeHeight: 42,
       clearedBy: 'u1',
     });
+  });
+});
+
+describe('ChatBroadcastService member eviction', () => {
+  it('awaits every remote leave before resolving', async () => {
+    const completed: string[] = [];
+    const first = deferredSocketAction('s1', completed);
+    const second = deferredSocketAction('s2', completed);
+    const sockets = [{ leave: first.action }, { leave: second.action }];
+    const server = {
+      in: jest.fn(() => ({
+        fetchSockets: jest.fn().mockResolvedValue(sockets),
+      })),
+    };
+    const presence = { conversationLeft: jest.fn() };
+    const service = new ChatBroadcastService(presence as never);
+    service.setServer(server as never);
+
+    let resolved = false;
+    const removal = service
+      .removeUserFromConversation('u1', 'conv-1')
+      .then(() => {
+        resolved = true;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(resolved).toBe(false);
+    first.resolve();
+    second.resolve();
+    await removal;
+
+    expect(completed).toEqual(['s1', 's2']);
+    expect(sockets[0].leave).toHaveBeenCalledWith('c:conv-1');
+    expect(sockets[1].leave).toHaveBeenCalledWith('c:conv-1');
+  });
+
+  it('awaits every remote disconnect fallback before resolving', async () => {
+    const completed: string[] = [];
+    const first = deferredSocketAction('s1', completed);
+    const second = deferredSocketAction('s2', completed);
+    const sockets = [
+      { disconnect: first.action },
+      { disconnect: second.action },
+    ];
+    const server = {
+      in: jest.fn(() => ({
+        fetchSockets: jest.fn().mockResolvedValue(sockets),
+      })),
+    };
+    const service = new ChatBroadcastService({} as never);
+    service.setServer(server as never);
+
+    let resolved = false;
+    const disconnect = service.disconnectUserSockets('u1').then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(resolved).toBe(false);
+    first.resolve();
+    second.resolve();
+    await disconnect;
+
+    expect(completed).toEqual(['s1', 's2']);
+    expect(sockets[0].disconnect).toHaveBeenCalledWith(true);
+    expect(sockets[1].disconnect).toHaveBeenCalledWith(true);
+  });
+
+  it('broadcasts a message to the conversation room except excluded user rooms', () => {
+    const emit = jest.fn();
+    const except = jest.fn(() => ({ emit }));
+    const to = jest.fn(() => ({ except }));
+    const service = new ChatBroadcastService({} as never);
+    service.setServer({ to } as never);
+    const message = {
+      id: 'message-1',
+      conversationId: 'conv-1',
+      type: 'system',
+      content: { kind: 'member-removed' },
+    } as never;
+
+    (service as any).emitMessageExcludingUsers(message, ['removed-user']);
+
+    expect(to).toHaveBeenCalledWith('c:conv-1');
+    expect(except).toHaveBeenCalledWith(['u:removed-user']);
+    expect(emit).toHaveBeenCalledWith('chat:msg', message);
   });
 });

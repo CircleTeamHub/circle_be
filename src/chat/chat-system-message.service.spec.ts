@@ -10,7 +10,10 @@ describe('ChatSystemMessageService', () => {
     $queryRaw: jest.fn(),
     $transaction: jest.fn(),
   };
-  const broadcast = { emitMessage: jest.fn() };
+  const broadcast = {
+    emitMessage: jest.fn(),
+    emitMessageExcludingUsers: jest.fn(),
+  };
   const push = { onMessageBroadcast: jest.fn().mockResolvedValue(undefined) };
   const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
 
@@ -66,6 +69,24 @@ describe('ChatSystemMessageService', () => {
     expect(broadcast.emitMessage).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', type: 'system' }),
     );
+  });
+
+  it('can broadcast a system message while excluding specific user rooms', () => {
+    const message = {
+      id: 'sys-1',
+      conversationId: 'conv-1',
+      type: 'system',
+      content: { kind: 'member-removed' },
+    } as never;
+
+    (service as any).broadcastSystemMessageExcludingUsers(message, [
+      'removed-user',
+    ]);
+
+    expect(broadcast.emitMessageExcludingUsers).toHaveBeenCalledWith(message, [
+      'removed-user',
+    ]);
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
   });
 
   it('inserts above an already locked counter without acquiring another lock', async () => {

@@ -69,6 +69,7 @@ describe('CircleService', () => {
       findUnique: jest.fn(),
     },
     $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -83,6 +84,7 @@ describe('CircleService', () => {
   };
   const chatSystemMessage = {
     insertSystemMessageInTx: jest.fn(),
+    insertSystemMessageAfterLockedConversationInTx: jest.fn(),
     broadcastSystemMessage: jest.fn(),
   };
   const directChatCircleSync = chatCircleSync as any;
@@ -122,10 +124,24 @@ describe('CircleService', () => {
     // 同理:退圈路径要 await 它的返回值,undefined 会让 releasedConversationId 判断失真。
     chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
     prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.$queryRaw.mockResolvedValue([{ id: 'conv-1', nextHeight: 7 }]);
     chatSystemMessage.insertSystemMessageInTx.mockImplementation(
       async (_tx: unknown, conversationId: string, content: unknown) => ({
         id: `message-${chatSystemMessage.insertSystemMessageInTx.mock.calls.length}`,
         conversationId,
+        content,
+      }),
+    );
+    chatSystemMessage.insertSystemMessageAfterLockedConversationInTx.mockImplementation(
+      async (
+        _tx: unknown,
+        conversationId: string,
+        lockedNextHeight: number,
+        content: unknown,
+      ) => ({
+        id: `message-${chatSystemMessage.insertSystemMessageAfterLockedConversationInTx.mock.calls.length}`,
+        conversationId,
+        height: lockedNextHeight + 1,
         content,
       }),
     );
@@ -1271,18 +1287,19 @@ describe('CircleService', () => {
         data: { name: '新名字', description: '' },
       });
       expect(result.myRole).toBe('OWNER');
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenNthCalledWith(
-        1,
-        prisma,
-        'conv-1',
-        { kind: 'group-renamed', actorId: 'owner-1', name: '新名字' },
-      );
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenNthCalledWith(
-        2,
-        prisma,
-        'conv-1',
-        { kind: 'group-notice-updated', actorId: 'owner-1' },
-      );
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenNthCalledWith(1, prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '新名字',
+      });
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenNthCalledWith(2, prisma, 'conv-1', 8, {
+        kind: 'group-notice-updated',
+        actorId: 'owner-1',
+      });
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(2);
     });
 
@@ -1296,14 +1313,16 @@ describe('CircleService', () => {
         name: '只改名字',
       } as UpdateCircleDto);
 
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledTimes(
-        1,
-      );
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-        prisma,
-        'conv-1',
-        { kind: 'group-renamed', actorId: 'owner-1', name: '只改名字' },
-      );
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '只改名字',
+      });
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
@@ -1317,14 +1336,15 @@ describe('CircleService', () => {
         description: '只改公告',
       } as UpdateCircleDto);
 
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledTimes(
-        1,
-      );
-      expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-        prisma,
-        'conv-1',
-        { kind: 'group-notice-updated', actorId: 'owner-1' },
-      );
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-notice-updated',
+        actorId: 'owner-1',
+      });
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
@@ -1337,7 +1357,9 @@ describe('CircleService', () => {
       await service.updateCircle('owner-1', 'circle-1', {
         memberCanPost: false,
       } as UpdateCircleDto);
-      expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
 
       jest.clearAllMocks();
       prisma.circle.findFirst.mockResolvedValue(circleRow);
@@ -1352,7 +1374,9 @@ describe('CircleService', () => {
         description: circleRow.description,
       } as UpdateCircleDto);
 
-      expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
       expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
@@ -1370,7 +1394,9 @@ describe('CircleService', () => {
       ).resolves.toBeDefined();
 
       expect(prisma.circle.update).toHaveBeenCalled();
-      expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
       expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
@@ -1396,6 +1422,33 @@ describe('CircleService', () => {
       expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
     });
 
+    it('locks an existing chat conversation before taking circle member locks', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: '统一锁顺序',
+      } as UpdateCircleDto);
+
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(
+        (prisma.$queryRaw.mock.calls[0][0] as readonly string[]).join(' '),
+      ).toContain('ChatConversation');
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        memberLock.lock.mock.invocationCallOrder[0],
+      );
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '统一锁顺序',
+      });
+      expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+    });
+
     it('does not broadcast a system event when the transaction fails', async () => {
       prisma.circleMember.findUnique.mockResolvedValue({
         role: 'OWNER',
@@ -1409,6 +1462,28 @@ describe('CircleService', () => {
         } as UpdateCircleDto),
       ).rejects.toThrow('write failed');
 
+      expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not broadcast when the transaction callback creates a DTO but commit rejects', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.$transaction.mockImplementationOnce(async (callback: any) => {
+        await callback(prisma);
+        throw new Error('commit rejected');
+      });
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          name: '回滚名字',
+        } as UpdateCircleDto),
+      ).rejects.toThrow('commit rejected');
+
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
       expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 

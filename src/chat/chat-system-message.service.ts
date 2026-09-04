@@ -219,6 +219,14 @@ export class ChatSystemMessageService {
     this.broadcast.emitMessage(dto);
   }
 
+  /** Post-commit system broadcast with user-room exclusion for removals. */
+  broadcastSystemMessageExcludingUsers(
+    dto: ChatMessageDto,
+    excludeUserIds: readonly string[],
+  ): void {
+    this.broadcast.emitMessageExcludingUsers(dto, excludeUserIds);
+  }
+
   /** 落库(height 同一坐标系)并广播;失败只记日志(提示消息可丢)。 */
   async emit(
     conversationId: string,

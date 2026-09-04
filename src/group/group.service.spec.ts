@@ -53,7 +53,9 @@ describe('GroupService reportGroup', () => {
   };
   let chatSystemMessage: {
     insertSystemMessageInTx: jest.Mock;
+    insertSystemMessageAfterLockedConversationInTx: jest.Mock;
     broadcastSystemMessage: jest.Mock;
+    broadcastSystemMessageExcludingUsers: jest.Mock;
   };
   let service: GroupService;
 
@@ -62,9 +64,14 @@ describe('GroupService reportGroup', () => {
       $transaction: jest.fn(async (callback) => callback(prisma)),
       $executeRaw: jest.fn(),
       // 事务内的 SELECT ... FOR UPDATE 复查:默认返回「未停用」。
-      $queryRaw: jest
-        .fn()
-        .mockResolvedValue([{ id: 'circle-1', deleted: false }]),
+      $queryRaw: jest.fn((query: readonly string[], ...values: unknown[]) => {
+        const sql = query[0] ?? '';
+        return Promise.resolve(
+          sql.includes('ChatConversation')
+            ? [{ id: values[0] as string, nextHeight: 7 }]
+            : [{ id: 'circle-1', deleted: false }],
+        );
+      }),
       circle: {
         findFirst: jest.fn(),
         findUnique: jest.fn(),
@@ -108,7 +115,21 @@ describe('GroupService reportGroup', () => {
           content,
         }),
       ),
+      insertSystemMessageAfterLockedConversationInTx: jest.fn(
+        async (
+          _tx: unknown,
+          conversationId: string,
+          lockedNextHeight: number,
+          content: unknown,
+        ) => ({
+          id: 'system-message-1',
+          conversationId,
+          height: lockedNextHeight + 1,
+          content,
+        }),
+      ),
       broadcastSystemMessage: jest.fn(),
+      broadcastSystemMessageExcludingUsers: jest.fn(),
     };
     service = new GroupService(
       prisma as any,
@@ -954,25 +975,125 @@ describe('GroupService reportGroup', () => {
       'circle-1',
       'target-user',
     );
+    expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      memberLock.lock.mock.invocationCallOrder[0],
+    );
+    expect(
+      (prisma.$queryRaw.mock.calls[0][0] as readonly string[]).join(' '),
+    ).toContain('ChatConversation');
     expect(chatCircleSync.detachSeat).toHaveBeenCalledWith(
       'target-user',
       'conversation-1',
       'removed',
       false,
     );
-    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-      prisma,
-      'conversation-1',
-      {
-        kind: 'member-removed',
-        actorId: 'admin-1',
-        targetUserId: 'target-user',
-      },
-    );
-    expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).toHaveBeenCalledWith(prisma, 'conversation-1', 7, {
+      kind: 'member-removed',
+      actorId: 'admin-1',
+      targetUserId: 'target-user',
+    });
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).toHaveBeenCalledWith(expect.any(Object), ['target-user']);
+    expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     expect(chatCircleSync.detachSeat.mock.invocationCallOrder[0]).toBeLessThan(
-      chatSystemMessage.broadcastSystemMessage.mock.invocationCallOrder[0],
+      chatSystemMessage.broadcastSystemMessageExcludingUsers.mock
+        .invocationCallOrder[0],
     );
+  });
+
+  it('waits for detach and excludes the removed user room from the detailed broadcast', async () => {
+    let finishDetach!: () => void;
+    const detachGate = new Promise<void>((resolve) => {
+      finishDetach = resolve;
+    });
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    chatCircleSync.detachSeat.mockReturnValueOnce(detachGate);
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+
+    let resolved = false;
+    const removal = service
+      .removeGroupMember('admin-1', 'group-1', 'target-user')
+      .then(() => {
+        resolved = true;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(resolved).toBe(false);
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).not.toHaveBeenCalled();
+    finishDetach();
+    await removal;
+
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).toHaveBeenCalledWith(expect.any(Object), ['target-user']);
+  });
+
+  it('does not detach or broadcast when removal creates a DTO but commit rejects', async () => {
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+    prisma.$transaction.mockImplementationOnce(async (callback) => {
+      await callback(prisma);
+      throw new Error('commit rejected');
+    });
+
+    await expect(
+      service.removeGroupMember('admin-1', 'group-1', 'target-user'),
+    ).rejects.toThrow('commit rejected');
+
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).toHaveBeenCalledTimes(1);
+    expect(chatCircleSync.detachSeat).not.toHaveBeenCalled();
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).not.toHaveBeenCalled();
+    expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
   });
 
   it('does not detach a socket when the removed member held no seat', async () => {
@@ -1341,6 +1462,12 @@ describe('GroupService reportGroup', () => {
       'owner-1',
       'target-user',
     ]);
+    expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      memberLock.lock.mock.invocationCallOrder[0],
+    );
+    expect(
+      (prisma.$queryRaw.mock.calls[0][0] as readonly string[]).join(' '),
+    ).toContain('ChatConversation');
     expect(prisma.circleMember.update).toHaveBeenCalledWith({
       where: { id: 'target-member' },
       data: { role: CircleMemberRole.ADMIN },
@@ -1359,16 +1486,14 @@ describe('GroupService reportGroup', () => {
         }),
       }),
     });
-    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-      prisma,
-      'conv-1',
-      {
-        kind: 'member-role-changed',
-        actorId: 'owner-1',
-        targetUserId: 'target-user',
-        role: CircleMemberRole.ADMIN,
-      },
-    );
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+      kind: 'member-role-changed',
+      actorId: 'owner-1',
+      targetUserId: 'target-user',
+      role: CircleMemberRole.ADMIN,
+    });
     expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -1423,16 +1548,14 @@ describe('GroupService reportGroup', () => {
         }),
       }),
     });
-    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
-      prisma,
-      'conv-1',
-      {
-        kind: 'member-role-changed',
-        actorId: 'owner-1',
-        targetUserId: 'target-user',
-        role: CircleMemberRole.MEMBER,
-      },
-    );
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+      kind: 'member-role-changed',
+      actorId: 'owner-1',
+      targetUserId: 'target-user',
+      role: CircleMemberRole.MEMBER,
+    });
   });
 
   it('does not update, audit, or log when the member already has the requested role', async () => {
@@ -1467,7 +1590,9 @@ describe('GroupService reportGroup', () => {
 
     expect(prisma.circleMember.update).not.toHaveBeenCalled();
     expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
-    expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).not.toHaveBeenCalled();
     expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
   });
 
@@ -1506,7 +1631,9 @@ describe('GroupService reportGroup', () => {
     });
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(2);
-    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledTimes(1);
+    expect(
+      chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+    ).toHaveBeenCalledTimes(1);
     expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
   });
 

@@ -39,6 +39,20 @@ export class ChatBroadcastService {
       .emit(CHAT_EVENTS.message, message);
   }
 
+  /** 新消息 → 会话房，但显式排除指定用户的全部设备房。 */
+  emitMessageExcludingUsers(
+    message: ChatMessageDto,
+    excludeUserIds: readonly string[],
+  ): void {
+    const server = this.requireServer('emitMessageExcludingUsers');
+    if (!server) return;
+    const target = server.to(conversationRoom(message.conversationId));
+    const scoped = excludeUserIds.length
+      ? target.except(excludeUserIds.map(userRoom))
+      : target;
+    scoped.emit(CHAT_EVENTS.message, message);
+  }
+
   /** 已读水位推进 → 会话房。 */
   emitRead(payload: ChatReadBroadcast): void {
     const server = this.requireServer('emitRead');
@@ -215,9 +229,11 @@ export class ChatBroadcastService {
     const server = this.requireServer('removeUserFromConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
-    for (const socket of sockets) {
-      socket.leave(conversationRoom(conversationId));
-    }
+    // RemoteSocket.leave() is an adapter RPC. Do not resolve until every
+    // process has acknowledged eviction; callers may broadcast immediately.
+    await Promise.all(
+      sockets.map((socket) => socket.leave(conversationRoom(conversationId))),
+    );
   }
 
   /**
@@ -229,7 +245,9 @@ export class ChatBroadcastService {
     const server = this.requireServer('disconnectUserSockets');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
-    for (const socket of sockets) socket.disconnect(true);
+    // Local Socket.disconnect() is synchronous while RemoteSocket.disconnect()
+    // may be a Promise-backed adapter command. await handles both shapes.
+    await Promise.all(sockets.map((socket) => socket.disconnect(true)));
   }
 
   private requireServer(caller: string): Server | null {

@@ -130,6 +130,17 @@ export class GroupService {
         });
       }
 
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circle.id },
+        select: { id: true },
+      });
+      const [lockedConversation] = conversation
+        ? await tx.$queryRaw<Array<{ id: string; nextHeight: number }>>`
+            SELECT "id", "nextHeight" FROM "ChatConversation"
+            WHERE "id" = ${conversation.id} FOR UPDATE
+          `
+        : [];
+
       await this.memberLock.lock(tx, circle.id, [
         actorId,
         normalizedTargetUserID,
@@ -225,21 +236,19 @@ export class GroupService {
         },
       });
       let message: ChatMessageDto | null = null;
-      const conversation = await tx.chatConversation.findUnique({
-        where: { circleID: circle.id },
-        select: { id: true },
-      });
-      if (conversation) {
-        message = await this.systemMessage.insertSystemMessageInTx(
-          tx,
-          conversation.id,
-          {
-            kind: 'member-role-changed',
-            actorId,
-            targetUserId: normalizedTargetUserID,
-            role: nextRole,
-          },
-        );
+      if (lockedConversation) {
+        message =
+          await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+            tx,
+            lockedConversation.id,
+            lockedConversation.nextHeight,
+            {
+              kind: 'member-role-changed',
+              actorId,
+              targetUserId: normalizedTargetUserID,
+              role: nextRole,
+            },
+          );
       }
       // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
       return { changed: true, message };
@@ -387,6 +396,16 @@ export class GroupService {
     }>(this.prisma, async (tx) => {
       let conversationId: string | null = null;
       let message: ChatMessageDto | null = null;
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circle.id },
+        select: { id: true },
+      });
+      const [lockedConversation] = conversation
+        ? await tx.$queryRaw<Array<{ id: string; nextHeight: number }>>`
+            SELECT "id", "nextHeight" FROM "ChatConversation"
+            WHERE "id" = ${conversation.id} FOR UPDATE
+          `
+        : [];
       await this.memberLock.lock(tx, circle.id, [
         actorId,
         normalizedTargetUserID,
@@ -439,21 +458,19 @@ export class GroupService {
           });
         }
 
-        const conversation = await tx.chatConversation.findUnique({
-          where: { circleID: circle.id },
-          select: { id: true },
-        });
-        if (conversation) {
-          conversationId = conversation.id;
-          message = await this.systemMessage.insertSystemMessageInTx(
-            tx,
-            conversation.id,
-            {
-              kind: 'member-removed',
-              actorId,
-              targetUserId: normalizedTargetUserID,
-            },
-          );
+        if (lockedConversation) {
+          conversationId = lockedConversation.id;
+          message =
+            await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+              tx,
+              lockedConversation.id,
+              lockedConversation.nextHeight,
+              {
+                kind: 'member-removed',
+                actorId,
+                targetUserId: normalizedTargetUserID,
+              },
+            );
         }
       }
 
@@ -478,7 +495,10 @@ export class GroupService {
       );
     }
     if (removalResult.message) {
-      this.systemMessage.broadcastSystemMessage(removalResult.message);
+      this.systemMessage.broadcastSystemMessageExcludingUsers(
+        removalResult.message,
+        [normalizedTargetUserID],
+      );
     }
 
     logBusinessEvent(this.logger, {

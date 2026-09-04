@@ -276,6 +276,36 @@ describe('ChatCircleSyncService', () => {
     expect(broadcast.disconnectUserSockets).toHaveBeenCalledWith('u1');
   });
 
+  it('waits for failed-leave disconnect fallback before completing manager detach', async () => {
+    let finishDisconnect!: () => void;
+    broadcast.removeUserFromConversation.mockRejectedValueOnce(
+      new Error('adapter down'),
+    );
+    broadcast.disconnectUserSockets.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDisconnect = resolve;
+        }),
+    );
+
+    let resolved = false;
+    const detach = service
+      .detachSeat('u1', 'conv-1', 'removed', false)
+      .then(() => {
+        resolved = true;
+      });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(resolved).toBe(false);
+    expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
+    finishDisconnect();
+    await detach;
+
+    expect(broadcast.emitConversationChange).toHaveBeenCalled();
+    expect(systemMessage.emit).not.toHaveBeenCalled();
+  });
+
   it('tells the leaver own devices with kind left instead of removed', async () => {
     await service.detachSeat('u1', 'conv-1', 'left');
 
