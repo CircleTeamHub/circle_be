@@ -679,6 +679,60 @@ test('server ForceCommand accepts no general shell or launcher replacement comma
   assert.doesNotMatch(gate, /install-launcher/);
 });
 
+test('release hardening runbook verifies the trusted launcher directly', () => {
+  const runbook = read('docs/release-hardening-runbook.md');
+  const selfChecks = runbook.slice(
+    runbook.indexOf('## 自检'),
+    runbook.indexOf('## 故障对照'),
+  );
+
+  assert.match(selfChecks, /sudo test -f "\$launcher"/);
+  assert.match(selfChecks, /sudo test -x "\$launcher"/);
+  assert.match(selfChecks, /sudo test ! -L "\$launcher"/);
+  assert.match(
+    selfChecks,
+    /sudo -u "\$DEPLOY_USER" test ! -w "\$launcher"/,
+  );
+  assert.doesNotMatch(selfChecks, /circle-release activate-v2/);
+
+  // ForceCommand 的部署根目录是 command= 的第一个参数，可以是任意绝对路径
+  // （release-force-command.sh 只校验绝对且存在）。自检必须从 authorized_keys
+  // 读出真实值：写死示例路径会在自定义根目录的机器上验到另一个 launcher。
+  assert.match(selfChecks, /authorized_keys/);
+  assert.match(selfChecks, /circle-release-force-command/);
+  assert.match(selfChecks, /test -n "\$DEPLOY_ROOT"/);
+  assert.doesNotMatch(selfChecks, /DEPLOY_ROOT=\/home\//);
+
+  // 部署账号也是配置项(GitHub Variables 的 DEPLOY_USER),自检不能写死 ubuntu。
+  assert.doesNotMatch(selfChecks, /DEPLOY_USER=ubuntu/);
+  assert.match(selfChecks, /DEPLOY_USER="\$\{DEPLOY_USER:\?/);
+
+  // authorized_keys 解析要锚定在受限条目的行首,且恰好匹配一行:注释掉的旧条目、
+  // 轮换期并存的第二把密钥都不能被悄悄选中。
+  assert.match(
+    selfChecks,
+    /\/\^restrict,command="\\\/usr\\\/local\\\/bin\\\/circle-release-force-command \//,
+  );
+  assert.match(selfChecks, /if \(n != 1\) exit 1/);
+
+  // 四条 test 没有输出,单独敲的话中间失败会被最后一条 stat 的正常输出盖住。
+  // 必须 && 串联并以显式的成功/失败信息收尾。
+  for (const check of [
+    'test -n "$DEPLOY_ROOT"',
+    'sudo test -f "$launcher"',
+    'sudo test -x "$launcher"',
+    'sudo test ! -L "$launcher"',
+    'sudo -u "$DEPLOY_USER" test ! -w "$launcher"',
+    "sudo stat -c '%U %G %a %n' \"$launcher\"",
+  ]) {
+    assert.ok(
+      selfChecks.includes(`${check} &&`),
+      `self-check must chain "${check}" with &&`,
+    );
+  }
+  assert.match(selfChecks, /echo "launcher OK" \|\| echo "LAUNCHER CHECK FAILED"/);
+});
+
 test('persistent launcher holds one lock across floor check, activation, and target execution', () => {
   const launcher = read('deploy/release-launcher.sh');
   const lock = launcher.indexOf('flock -x 201');

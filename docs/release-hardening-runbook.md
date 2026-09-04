@@ -159,7 +159,8 @@ restrict,command="/usr/local/bin/circle-release-force-command /home/ubuntu/circl
 
 ## 自检
 
-用**新密钥**跑这三项。三项都符合预期,才算装对了。
+前两项用**新密钥**执行;第三项用独立的管理员/root 登录直接检查服务器文件。
+三项都符合预期,才算装对了。
 
 **一、通用 shell 必须被拒**
 
@@ -182,18 +183,53 @@ ssh -i deploy_key_new ubuntu@$DEPLOY_HOST "circle-release stage-v2"
 这条说明脚本装到位、两个参数都收到了。若看到
 `server deploy root or signing public key is not configured`,是 `command=` 里少传了第二个参数。
 
-**三、launcher 与公钥的权限正确**
+**三、launcher 必须真实满足执行前置**
+
+用独立的管理员/root 登录服务器执行。部署根目录**必须从 `authorized_keys` 里 `command=`
+的第一个参数读出来** —— 那是 ForceCommand 真正使用的根;第 2 步给的 `/home/ubuntu/circle_be`
+只是示例值,照抄会在自定义根目录的机器上检查到另一个路径,于是要么无故失败,
+要么因为那个路径下碰巧也有个合法 launcher 而通过,真正的发布路径反而没被验证。
+
+部署账号同样不能照抄示例:`DEPLOY_USER` 必须填 GitHub Variables 里 `DEPLOY_USER` 的实际值
+(默认 `ubuntu`)。填错会去读另一个账号的 `authorized_keys`,要么无故失败,要么验到一个
+无关的 launcher。
+
+整段用 `&&` 串起来:`test` 失败时没有任何输出,单独一行行敲的话,中间某条失败了、
+最后的 `stat` 照样打印出一行好看的 `root root 555`,肉眼根本看不出来。串起来之后任一条
+失败就立刻停下并打印 `LAUNCHER CHECK FAILED`。
 
 ```bash
-ssh -i deploy_key_new ubuntu@$DEPLOY_HOST \
-  "circle-release activate-v2 1-1-0000000000000000000000000000000000000000"
+DEPLOY_USER="${DEPLOY_USER:?set DEPLOY_USER to the deployment account}"
+DEPLOY_HOME="$(getent passwd "$DEPLOY_USER" | cut -d: -f6)"
+
+# 只认以 restrict,command="/usr/local/bin/circle-release-force-command 开头的那一行,
+# 而且必须恰好一行:注释掉的旧条目或轮换期间并存的第二把受限密钥都不能被悄悄选中。
+DEPLOY_ROOT="$(sudo awk -F'"' '
+  /^restrict,command="\/usr\/local\/bin\/circle-release-force-command / {
+    n++; split($2, parts, " "); root = parts[2]
+  }
+  END { if (n != 1) exit 1; print root }
+' "$DEPLOY_HOME/.ssh/authorized_keys")" &&
+test -n "$DEPLOY_ROOT" &&
+launcher="$DEPLOY_ROOT/.release/release-launcher.sh" &&
+sudo test -f "$launcher" &&
+sudo test -x "$launcher" &&
+sudo test ! -L "$launcher" &&
+sudo -u "$DEPLOY_USER" test ! -w "$launcher" &&
+sudo stat -c '%U %G %a %n' "$launcher" &&
+echo "launcher OK" || echo "LAUNCHER CHECK FAILED"
 ```
 
-预期:`release command rejected: staged release not found`
+预期输出恰好两行:`stat` 的 `root root 555` 加 launcher 路径,然后是 `launcher OK`。
+看到 `LAUNCHER CHECK FAILED` 时:如果前面没有 `stat` 输出,先看 `authorized_keys` ——
+`awk` 在找不到、或找到不止一行 ForceCommand 条目时都会失败,回第 2 步;`stat` 有输出
+但仍然 FAILED 不可能发生(`stat` 是最后一条检查)。其余情况都是 launcher 四个执行前置里
+有一条不满足(不存在 / 不可执行 / 是符号链接 / 部署账号可写 —— 最后这条 `stat` 的
+权限位看不出来,ACL 或附加组授的写权限只有 `test -w` 能测到),回第 2 步重新安装 launcher。
 
-走到「找不到发布包」说明公钥和 launcher 的权限校验都过了。若报
-`must not be writable by the deployment account`,回第 2 步把对应文件的属主改成 root、
-权限改成 `0555`/`0444`。
+不能用一个不存在的 stage 来验证 launcher:ForceCommand 会先返回 `staged release not found`,
+根本还没有执行到 launcher 的存在、符号链接和可写性检查。前两项能进入协议参数校验,
+已经同时证明签名公钥存在且部署账号不可写;本项再直接覆盖 launcher 的四个执行前置。
 
 ---
 
