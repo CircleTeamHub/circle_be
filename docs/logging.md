@@ -63,6 +63,8 @@ Current events:
 - `external_call_failed`: currently used for MinIO presign failures.
 - `security_event`: currently used for 401, 403, and rate limit hits.
 - `external_call_slow`: warning event for slow MinIO calls.
+- `chat_media_claim_lost`: warning from the chat media deletion sweeper when its conditional write-back after an object delete matched no row — the claimed `ChatMediaDeletion` row was replaced (typically turned into a note import reservation) or removed while the delete was in flight. Carries `objectKey` and `outcome` (`deleted` / `failed`).
+- `note_import_reservation_lost`: warning from note media import when the post-copy reservation renewal matched no row (the copy outlasted the 15 minute reservation window). The request fails with a retryable 409. Carries `noteId` and `mediaId`.
 
 Deferred production events:
 

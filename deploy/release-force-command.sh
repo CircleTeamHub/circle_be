@@ -152,6 +152,7 @@ stage_release() {
   [[ "$manifest_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || fail 'invalid encoded release manifest'
   [[ "$signature_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || fail 'invalid encoded release signature'
 
+  mkdir -p "$RELEASE_STATE_DIR" || fail 'release state directory is unavailable'
   exec 202>"$RELEASE_STATE_DIR/deploy.lock" || fail 'release lock is unavailable'
   /usr/bin/flock -n 202 || fail 'another release operation is in progress'
   mkdir -p "$INCOMING_DIR"

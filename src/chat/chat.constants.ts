@@ -121,6 +121,14 @@ export const CHAT_NOTE_IMPORT_SEGMENT = 'note-import/';
 export const CHAT_NOTE_IMPORT_RESERVATION_MS = 15 * 60_000;
 export const CHAT_NOTE_IMPORT_RESERVATION_REASON =
   'note import pending message reference';
+/**
+ * 删除 worker 认领一行时写进 lastError 的标记。认领在事务里提交、对象删除在
+ * 事务外进行,advisory lock 一释放就护不住那段窗口:同一个确定性 key 的导入
+ * 重试若此时把这行改写成活的预留并开始复制,飞行中的删除会把刚复制好的对象
+ * 删掉。所以两边都靠这个标记 + 租约到期时间互认:预留路径看到活着的认领就
+ * 拒绝复用(客户端稍后重试),worker 只清理/改写「仍是自己认领」的那一行。
+ */
+export const CHAT_MEDIA_DELETE_CLAIM_REASON = 'chat media delete in progress';
 
 /**
  * 媒体消息 content 里的 object-key 字段表(key 字段名 → 读路径补的 URL 字段名)。

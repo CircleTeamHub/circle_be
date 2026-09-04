@@ -9,6 +9,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { UploadService } from 'src/upload/upload.service';
 import type { Prisma } from 'src/generated/prisma';
 import {
+  CHAT_MEDIA_DELETE_CLAIM_REASON,
   CHAT_MEDIA_KEY_FIELDS,
   CHAT_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_RESERVATION_REASON,
@@ -281,6 +282,21 @@ export class ChatMediaService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * 认领后的条件写回一行都没命中:这行在对象删除飞行期间被改写成了导入预留
+   * (或被并发销掉)。不是错误 —— 正是条件写回要挡住的情形 —— 但值得留痕:
+   * `outcome=deleted` 时新预留复制出来的对象可能已被我们删掉,导入方会在
+   * 发消息时撞上过期并重试。
+   */
+  private warnClaimLost(objectKey: string, outcome: 'deleted' | 'failed') {
+    this.logger.warn({
+      message: 'chat media delete claim lost before write-back',
+      event: 'chat_media_claim_lost',
+      objectKey,
+      outcome,
+    });
+  }
+
   /** 落一条待删记录(幂等:同 key 重复入队只刷新失败原因)。 */
   private async enqueueDeletion(key: string, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
@@ -350,31 +366,47 @@ export class ChatMediaService implements OnModuleDestroy {
           }
           // 租约:并发 sweeper 的 due 查询按 nextAttemptAt <= now 过滤,推后之后
           // 别的实例就不会在本次删除还在飞的时候重复删同一个 key。
+          // lastError 同时写成认领标记:事务提交后 advisory lock 已经放掉,
+          // note-import 的确定性 key 可能被一次导入重试重新预留并复制 ——
+          // 预留路径看到「标记 + 未到期租约」会拒绝复用;下面的写回也只认
+          // 同一对 (标记, 租约) 的行,行一旦被改写成预留就绝不再碰。
+          const leaseUntil = new Date(Date.now() + DELETE_CLAIM_LEASE_MS);
           await tx.chatMediaDeletion.update({
             where: { id: current.id },
             data: {
-              nextAttemptAt: new Date(Date.now() + DELETE_CLAIM_LEASE_MS),
+              nextAttemptAt: leaseUntil,
+              lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
             },
           });
-          return current;
+          return { ...current, leaseUntil };
         });
         if (!claimed) continue;
 
         // 二、事务外做对象存储删除,再用条件写回落库结果。用 deleteMany/updateMany
         // 而不是 delete/update:行若被并发销掉,这里应当是无操作而不是抛 P2025。
+        // where 带上认领时写下的 (lastError, nextAttemptAt):只有仍是我们自己认领
+        // 的那一行才会被销掉/改写,已经变成导入预留的行一个字段都不能动。
+        const ownClaim = {
+          id: claimed.id,
+          nextAttemptAt: claimed.leaseUntil,
+          lastError: CHAT_MEDIA_DELETE_CLAIM_REASON,
+        };
         try {
           await this.uploadService.deleteObjectByKey(claimed.objectKey);
-          await this.prisma.chatMediaDeletion.deleteMany({
-            where: { id: claimed.id },
+          const cleared = await this.prisma.chatMediaDeletion.deleteMany({
+            where: ownClaim,
           });
+          if (cleared.count === 0) {
+            this.warnClaimLost(claimed.objectKey, 'deleted');
+          }
         } catch (error) {
           const attempts = claimed.attempts + 1;
           const backoff = Math.min(
             DELETE_BACKOFF_BASE_MS * 2 ** claimed.attempts,
             DELETE_BACKOFF_MAX_MS,
           );
-          await this.prisma.chatMediaDeletion.updateMany({
-            where: { id: claimed.id },
+          const recorded = await this.prisma.chatMediaDeletion.updateMany({
+            where: ownClaim,
             data: {
               attempts,
               lastError: (error instanceof Error
@@ -384,6 +416,9 @@ export class ChatMediaService implements OnModuleDestroy {
               nextAttemptAt: new Date(Date.now() + backoff),
             },
           });
+          if (recorded.count === 0) {
+            this.warnClaimLost(claimed.objectKey, 'failed');
+          }
           if (attempts >= DELETE_MAX_ATTEMPTS) {
             this.logger.error(
               `chat media delete dead-lettered key=${claimed.objectKey} after ${attempts} attempts`,
