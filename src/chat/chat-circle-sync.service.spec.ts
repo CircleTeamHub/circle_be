@@ -290,6 +290,35 @@ describe('ChatCircleSyncService', () => {
     });
   });
 
+  it('can detach a manager-removed member without emitting a duplicate member-left notice', async () => {
+    await service.detachSeat('u1', 'conv-1', 'removed', false);
+
+    expect(broadcast.removeUserFromConversation).toHaveBeenCalledWith(
+      'u1',
+      'conv-1',
+    );
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
+    expect(systemMessage.emit).not.toHaveBeenCalled();
+  });
+
+  it('fails a privacy-sensitive manager detach when neither room removal nor disconnect succeeds', async () => {
+    broadcast.removeUserFromConversation.mockRejectedValueOnce(
+      new Error('adapter down'),
+    );
+    broadcast.disconnectUserSockets.mockRejectedValueOnce(
+      new Error('disconnect down'),
+    );
+
+    await expect(
+      service.detachSeat('u1', 'conv-1', 'removed', false),
+    ).rejects.toThrow('disconnect down');
+    expect(systemMessage.emit).not.toHaveBeenCalled();
+  });
+
   it('is a no-op returning null for a missing circle', async () => {
     prisma.circle.findUnique.mockResolvedValue(null);
     await expect(service.ensureCircleConversation('gone')).resolves.toBeNull();

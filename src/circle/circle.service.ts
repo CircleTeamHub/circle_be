@@ -29,6 +29,7 @@ import {
   GROUP_CAPACITY_HARD_LIMIT,
 } from './circle-limits';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleMemberLockService } from './circle-member-lock';
 import {
   CircleDetailDto,
@@ -65,6 +66,7 @@ export class CircleService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
+    private readonly systemMessage: ChatSystemMessageService,
   ) {
     this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
       this.config,
@@ -444,10 +446,10 @@ export class CircleService {
         ? this.normalizeStringList(dto.tags, 'tag')
         : undefined;
 
-    await this.prisma.$transaction(async (tx) => {
+    const systemMessages = await this.prisma.$transaction(async (tx) => {
       const circle = await tx.circle.findFirst({
         where: { id: circleId, deleted: false },
-        select: { id: true, ownerID: true },
+        select: { id: true, ownerID: true, name: true, description: true },
       });
       if (!circle) {
         throw new NotFoundException({
@@ -542,7 +544,43 @@ export class CircleService {
       if (Object.keys(data).length > 0) {
         await tx.circle.update({ where: { id: circleId }, data });
       }
+
+      const nameChanged = dto.name !== undefined && dto.name !== circle.name;
+      const descriptionChanged =
+        dto.description !== undefined && dto.description !== circle.description;
+      if (!nameChanged && !descriptionChanged) return [];
+
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circleId },
+        select: { id: true },
+      });
+      if (!conversation) return [];
+
+      const messages = [];
+      if (nameChanged) {
+        messages.push(
+          await this.systemMessage.insertSystemMessageInTx(
+            tx,
+            conversation.id,
+            { kind: 'group-renamed', actorId: userId, name: dto.name },
+          ),
+        );
+      }
+      if (descriptionChanged) {
+        messages.push(
+          await this.systemMessage.insertSystemMessageInTx(
+            tx,
+            conversation.id,
+            { kind: 'group-notice-updated', actorId: userId },
+          ),
+        );
+      }
+      return messages;
     });
+
+    for (const message of systemMessages) {
+      this.systemMessage.broadcastSystemMessage(message);
+    }
 
     return this.getCircleDetail(userId, circleId);
   }

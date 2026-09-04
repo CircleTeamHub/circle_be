@@ -32,6 +32,7 @@ describe('GroupService reportGroup', () => {
     };
     conversationGroupMembership: { deleteMany: jest.Mock };
     circleInvitation: { updateMany: jest.Mock };
+    chatConversation: { findUnique: jest.Mock };
     adminAuditLog: { create: jest.Mock };
     groupReport: {
       findFirst: jest.Mock;
@@ -49,6 +50,10 @@ describe('GroupService reportGroup', () => {
     releaseSeatInTx: jest.Mock;
     detachSeat: jest.Mock;
     ensureCircleConversation: jest.Mock;
+  };
+  let chatSystemMessage: {
+    insertSystemMessageInTx: jest.Mock;
+    broadcastSystemMessage: jest.Mock;
   };
   let service: GroupService;
 
@@ -76,6 +81,7 @@ describe('GroupService reportGroup', () => {
       },
       conversationGroupMembership: { deleteMany: jest.fn() },
       circleInvitation: { updateMany: jest.fn() },
+      chatConversation: { findUnique: jest.fn().mockResolvedValue(null) },
       adminAuditLog: { create: jest.fn().mockResolvedValue(undefined) },
       groupReport: {
         findFirst: jest.fn(),
@@ -94,11 +100,22 @@ describe('GroupService reportGroup', () => {
       detachSeat: jest.fn(),
       ensureCircleConversation: jest.fn().mockResolvedValue('conv-1'),
     };
+    chatSystemMessage = {
+      insertSystemMessageInTx: jest.fn(
+        async (_tx: unknown, conversationId: string, content: unknown) => ({
+          id: 'system-message-1',
+          conversationId,
+          content,
+        }),
+      ),
+      broadcastSystemMessage: jest.fn(),
+    };
     service = new GroupService(
       prisma as any,
       admissionPolicy as any,
       memberLock as any,
       chatCircleSync as any,
+      chatSystemMessage as any,
     );
   });
 
@@ -907,6 +924,9 @@ describe('GroupService reportGroup', () => {
   // 被踢的人座位仍是 leftAt=null:照样能拉历史、能发言、还继续收群消息。
   it('releases the chat seat inside the removal transaction and detaches the socket', async () => {
     chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
@@ -938,6 +958,20 @@ describe('GroupService reportGroup', () => {
       'target-user',
       'conversation-1',
       'removed',
+      false,
+    );
+    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+      prisma,
+      'conversation-1',
+      {
+        kind: 'member-removed',
+        actorId: 'admin-1',
+        targetUserId: 'target-user',
+      },
+    );
+    expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    expect(chatCircleSync.detachSeat.mock.invocationCallOrder[0]).toBeLessThan(
+      chatSystemMessage.broadcastSystemMessage.mock.invocationCallOrder[0],
     );
   });
 
@@ -1255,6 +1289,15 @@ describe('GroupService reportGroup', () => {
 
   it('lets a circle owner promote an active member', async () => {
     expect(typeof (service as any).updateGroupMemberRole).toBe('function');
+    let committed = false;
+    prisma.$transaction.mockImplementationOnce(async (callback) => {
+      const result = await callback(prisma);
+      committed = true;
+      return result;
+    });
+    chatSystemMessage.broadcastSystemMessage.mockImplementation(() => {
+      expect(committed).toBe(true);
+    });
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
@@ -1283,6 +1326,7 @@ describe('GroupService reportGroup', () => {
         status: CircleMemberStatus.ACTIVE,
       });
     prisma.circleMember.update.mockResolvedValue({});
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
 
     await expect(
       (service as any).updateGroupMemberRole(
@@ -1315,6 +1359,17 @@ describe('GroupService reportGroup', () => {
         }),
       }),
     });
+    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+      prisma,
+      'conv-1',
+      {
+        kind: 'member-role-changed',
+        actorId: 'owner-1',
+        targetUserId: 'target-user',
+        role: CircleMemberRole.ADMIN,
+      },
+    );
+    expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
   });
 
   it('audits demotion with the previous and new role', async () => {
@@ -1345,6 +1400,7 @@ describe('GroupService reportGroup', () => {
         status: CircleMemberStatus.ACTIVE,
       });
     prisma.circleMember.update.mockResolvedValue({});
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
 
     await expect(
       (service as any).updateGroupMemberRole(
@@ -1367,6 +1423,91 @@ describe('GroupService reportGroup', () => {
         }),
       }),
     });
+    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+      prisma,
+      'conv-1',
+      {
+        kind: 'member-role-changed',
+        actorId: 'owner-1',
+        targetUserId: 'target-user',
+        role: CircleMemberRole.MEMBER,
+      },
+    );
+  });
+
+  it('does not update, audit, or log when the member already has the requested role', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'owner-member',
+        role: CircleMemberRole.OWNER,
+        status: CircleMemberStatus.ACTIVE,
+      })
+      .mockResolvedValueOnce({
+        id: 'target-member',
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+
+    await expect(
+      service.updateGroupMemberRole('owner-1', 'group-1', 'target-user', {
+        role: groupMemberDtos.GroupMemberRoleInput.ADMIN,
+      }),
+    ).resolves.toEqual({ handled: true, role: 'ADMIN' });
+
+    expect(prisma.circleMember.update).not.toHaveBeenCalled();
+    expect(prisma.adminAuditLog.create).not.toHaveBeenCalled();
+    expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+    expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not broadcast a rolled-back role event when a retry becomes a no-op', async () => {
+    let attempt = 0;
+    prisma.$transaction.mockImplementation(async (callback) => {
+      attempt += 1;
+      const result = await callback(prisma);
+      if (attempt === 1) throw { code: 'P2034' };
+      return result;
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) => {
+      const userId = where.userID_circleID.userID;
+      if (userId === 'owner-1') {
+        return Promise.resolve({
+          id: 'owner-member',
+          role: CircleMemberRole.OWNER,
+          status: CircleMemberStatus.ACTIVE,
+        });
+      }
+      return Promise.resolve({
+        id: 'target-member',
+        role: attempt === 1 ? CircleMemberRole.MEMBER : CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+    });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+
+    await service.updateGroupMemberRole('owner-1', 'group-1', 'target-user', {
+      role: groupMemberDtos.GroupMemberRoleInput.ADMIN,
+    });
+
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(chatSystemMessage.insertSystemMessageInTx).toHaveBeenCalledTimes(1);
+    expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
   });
 
   it('rejects administrator attempts to grant administrator role', async () => {

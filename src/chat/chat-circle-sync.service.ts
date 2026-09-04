@@ -350,6 +350,7 @@ export class ChatCircleSyncService {
     userId: string,
     conversationId: string,
     kind: 'left' | 'removed',
+    emitMemberLeftNotice = true,
   ): Promise<void> {
     // 先离房,再发个人事件。
     //
@@ -357,6 +358,7 @@ export class ChatCircleSyncService {
     // 还在 await fetchSockets —— 这中间广播到会话房的消息,那位已经被移出的
     // 成员照样收得到(广播不会再查一次 ChatMember)。离房失败时更糟:他会一直
     // 留在房里收群消息,直到自己重连。所以失败要踢连接,让他重连时按座位重新派生。
+    let evictionFailure: unknown = null;
     try {
       await this.broadcast.removeUserFromConversation(userId, conversationId);
     } catch (error: unknown) {
@@ -367,17 +369,18 @@ export class ChatCircleSyncService {
       );
       // 离不了房就断连接:重连时 handleConnection 会按当前座位重新派生房间,
       // 而他已经没有这个会话的座位了。
-      await this.broadcast
-        .disconnectUserSockets(userId)
-        .catch((disconnectError: unknown) =>
-          this.logger.error(
-            `detach seat could not evict sockets user=${userId}: ${
-              disconnectError instanceof Error
-                ? disconnectError.message
-                : String(disconnectError)
-            }`,
-          ),
+      try {
+        await this.broadcast.disconnectUserSockets(userId);
+      } catch (disconnectError: unknown) {
+        evictionFailure = disconnectError;
+        this.logger.error(
+          `detach seat could not evict sockets user=${userId}: ${
+            disconnectError instanceof Error
+              ? disconnectError.message
+              : String(disconnectError)
+          }`,
         );
+      }
     }
     // 个人事件:UI 收走会话靠它。left 与 removed 的区别只在客户端文案。
     this.broadcast.emitConversationChange(userId, {
@@ -385,15 +388,21 @@ export class ChatCircleSyncService {
       conversationId,
       userId,
     });
-    void this.systemMessage
-      .emit(conversationId, { kind: 'member-left' })
-      .catch((error: unknown) =>
-        this.logger.warn(
-          `member-left notice failed conversation=${conversationId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        ),
-      );
+    if (emitMemberLeftNotice) {
+      void this.systemMessage
+        .emit(conversationId, { kind: 'member-left' })
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `member-left notice failed conversation=${conversationId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
+    // Manager removal broadcasts identify the actor and target. If both room
+    // eviction mechanisms failed, let the caller withhold that detailed event
+    // instead of knowingly sending it to the removed member's stale socket.
+    if (!emitMemberLeftNotice && evictionFailure) throw evictionFailure;
   }
 
   /**

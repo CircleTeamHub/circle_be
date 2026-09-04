@@ -15,6 +15,8 @@ import {
 } from 'src/generated/prisma';
 import { GroupErrorCode } from 'src/common/app-error-codes';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
+import type { ChatMessageDto } from 'src/chat/chat.types';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
@@ -55,6 +57,7 @@ export class GroupService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
+    private readonly systemMessage: ChatSystemMessageService,
   ) {}
 
   async updateGroupMemberRole(
@@ -92,7 +95,10 @@ export class GroupService {
     }
 
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
-    await runSerializableTransaction(this.prisma, async (tx) => {
+    const roleResult = await runSerializableTransaction<{
+      changed: boolean;
+      message: ChatMessageDto | null;
+    }>(this.prisma, async (tx) => {
       // 先鉴权,再取锁、再查目标。反过来的话:非群主也能让服务端为任意 userID
       // 取一遍成员锁并做一次存在性查询,错误信息的差异就成了「此人是否在群里」
       // 的探测接口,顺带还能拿锁竞争当侧信道。
@@ -196,6 +202,8 @@ export class GroupService {
         dto.role === GroupMemberRoleInput.ADMIN
           ? CircleMemberRole.ADMIN
           : CircleMemberRole.MEMBER;
+      if (target.role === nextRole) return { changed: false, message: null };
+
       await tx.circleMember.update({
         where: { id: target.id },
         data: { role: nextRole },
@@ -216,19 +224,43 @@ export class GroupService {
           },
         },
       });
+      let message: ChatMessageDto | null = null;
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circle.id },
+        select: { id: true },
+      });
+      if (conversation) {
+        message = await this.systemMessage.insertSystemMessageInTx(
+          tx,
+          conversation.id,
+          {
+            kind: 'member-role-changed',
+            actorId,
+            targetUserId: normalizedTargetUserID,
+            role: nextRole,
+          },
+        );
+      }
       // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
+      return { changed: true, message };
     });
 
-    logBusinessEvent(this.logger, {
-      enabled: this.loggingConfig.businessLogOn,
-      businessEvent: 'group_member_role_updated',
-      actorId: actorId,
-      targetId: normalizedTargetUserID,
-      result: 'success',
-      entityType: 'circle',
-      entityId: circle.id,
-      metadata: { newRole: dto.role },
-    });
+    if (roleResult.message) {
+      this.systemMessage.broadcastSystemMessage(roleResult.message);
+    }
+
+    if (roleResult.changed) {
+      logBusinessEvent(this.logger, {
+        enabled: this.loggingConfig.businessLogOn,
+        businessEvent: 'group_member_role_updated',
+        actorId: actorId,
+        targetId: normalizedTargetUserID,
+        result: 'success',
+        entityType: 'circle',
+        entityId: circle.id,
+        metadata: { newRole: dto.role },
+      });
+    }
     return { handled: true, role: dto.role };
   }
 
@@ -349,8 +381,12 @@ export class GroupService {
     }
 
     const auditGroupID = this.auditGroupID(circle, normalizedGroupID);
-    let releasedConversationId: string | null = null;
-    await runSerializableTransaction(this.prisma, async (tx) => {
+    const removalResult = await runSerializableTransaction<{
+      conversationId: string | null;
+      message: ChatMessageDto | null;
+    }>(this.prisma, async (tx) => {
+      let conversationId: string | null = null;
+      let message: ChatMessageDto | null = null;
       await this.memberLock.lock(tx, circle.id, [
         actorId,
         normalizedTargetUserID,
@@ -390,7 +426,7 @@ export class GroupService {
         await tx.circleMember.delete({ where: { id: target.id } });
         // 踢人走 delete,对账的 updatedAt 窗口扫不到被删的行 —— 座位必须在同一
         // 事务里收掉,否则被踢的人照样能读能发、还继续收群消息。
-        releasedConversationId = await this.chatCircleSync.releaseSeatInTx(
+        conversationId = await this.chatCircleSync.releaseSeatInTx(
           tx,
           circle.id,
           normalizedTargetUserID,
@@ -402,6 +438,23 @@ export class GroupService {
             data: { memberCount: { decrement: 1 } },
           });
         }
+
+        const conversation = await tx.chatConversation.findUnique({
+          where: { circleID: circle.id },
+          select: { id: true },
+        });
+        if (conversation) {
+          conversationId = conversation.id;
+          message = await this.systemMessage.insertSystemMessageInTx(
+            tx,
+            conversation.id,
+            {
+              kind: 'member-removed',
+              actorId,
+              targetUserId: normalizedTargetUserID,
+            },
+          );
+        }
       }
 
       await tx.conversationGroupMembership.deleteMany({
@@ -412,15 +465,20 @@ export class GroupService {
           group: { ownerID: normalizedTargetUserID },
         },
       });
+      return { conversationId, message };
     });
-    if (releasedConversationId) {
+    if (removalResult.conversationId) {
       // await:离房完成之前不能宣布移除,否则这中间广播到会话房的消息
       // 那位已被移出的成员照样收得到(广播不会再查一次 ChatMember)。
       await this.chatCircleSync.detachSeat(
         normalizedTargetUserID,
-        releasedConversationId,
+        removalResult.conversationId,
         'removed',
+        false,
       );
+    }
+    if (removalResult.message) {
+      this.systemMessage.broadcastSystemMessage(removalResult.message);
     }
 
     logBusinessEvent(this.logger, {
