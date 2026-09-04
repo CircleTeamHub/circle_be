@@ -1071,11 +1071,21 @@ export class ChatGateway implements OnModuleDestroy {
       });
       // 幂等复用(断线重发撞库)不再广播,首次投递时房间里已经收到过了。
       if (!result.reused) {
-        this.observeBroadcast('message', () =>
-          this.broadcast.emitMessage(result.message),
-        );
         // 离线成员推送:best-effort,不阻塞发送方 ack 路径。
         void this.chatPush.onMessageBroadcast(result.message);
+        try {
+          await this.observeAsyncBroadcast('message', () =>
+            this.broadcast.emitMessage(result.message),
+          );
+        } catch (error) {
+          // 消息已提交且 ack 已成功；授权收件人查询失败时实时投递安全地
+          // fail closed，但不能连带跳过 push 或 durable support job。
+          this.logger.warn(
+            `message realtime broadcast failed conversation=${result.message.conversationId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       // 原消息和 durable job 已在同一事务提交。这里做低延迟 kick；若本次进程
       // 恰好退出或数据库短暂失败，processor 的定时扫描会继续补消费。
@@ -1321,6 +1331,21 @@ export class ChatGateway implements OnModuleDestroy {
     const startedAt = process.hrtime.bigint();
     try {
       callback();
+    } finally {
+      this.metrics.observeBroadcast(
+        action,
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
+    }
+  }
+
+  private async observeAsyncBroadcast(
+    action: 'message',
+    callback: () => Promise<void>,
+  ): Promise<void> {
+    const startedAt = process.hrtime.bigint();
+    try {
+      await callback();
     } finally {
       this.metrics.observeBroadcast(
         action,

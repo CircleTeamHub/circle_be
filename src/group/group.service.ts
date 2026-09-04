@@ -255,7 +255,7 @@ export class GroupService {
     });
 
     if (roleResult.message) {
-      this.systemMessage.broadcastSystemMessage(roleResult.message);
+      await this.systemMessage.broadcastSystemMessage(roleResult.message);
     }
 
     if (roleResult.changed) {
@@ -485,8 +485,8 @@ export class GroupService {
       return { conversationId, message };
     });
     if (removalResult.conversationId) {
-      // await:离房完成之前不能宣布移除,否则这中间广播到会话房的消息
-      // 那位已被移出的成员照样收得到(广播不会再查一次 ChatMember)。
+      // 先派发旧会话房清理、再通知本人 UI；跨节点清理没有 adapter ack，
+      // 所以后续 chat:msg 仍会按 active ChatMember 重新授权并投个人房。
       await this.chatCircleSync.detachSeat(
         normalizedTargetUserID,
         removalResult.conversationId,
@@ -495,7 +495,7 @@ export class GroupService {
       );
     }
     if (removalResult.message) {
-      this.systemMessage.broadcastSystemMessageExcludingUsers(
+      await this.systemMessage.broadcastSystemMessageExcludingUsers(
         removalResult.message,
         [normalizedTargetUserID],
       );

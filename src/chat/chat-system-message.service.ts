@@ -126,8 +126,9 @@ export class ChatSystemMessageService {
     // 和历史读取一样现签 URL，否则图片要等用户重进会话后才显示出来。
     await this.media.attachMediaUrls([dto]);
     if (!reused || input.rebroadcastOnReplay) {
-      this.broadcast.emitMessage(dto);
+      const realtimeDelivery = this.broadcast.emitMessage(dto);
       if (!reused && input.push) void this.chatPush.onMessageBroadcast(dto);
+      await realtimeDelivery;
     }
     return dto;
   }
@@ -215,16 +216,16 @@ export class ChatSystemMessageService {
   }
 
   /** 事务提交之后再播,别在事务里播(回滚了消息却已经发出去)。 */
-  broadcastSystemMessage(dto: ChatMessageDto): void {
-    this.broadcast.emitMessage(dto);
+  async broadcastSystemMessage(dto: ChatMessageDto): Promise<void> {
+    await this.broadcast.emitMessage(dto);
   }
 
   /** Post-commit system broadcast with user-room exclusion for removals. */
-  broadcastSystemMessageExcludingUsers(
+  async broadcastSystemMessageExcludingUsers(
     dto: ChatMessageDto,
     excludeUserIds: readonly string[],
-  ): void {
-    this.broadcast.emitMessageExcludingUsers(dto, excludeUserIds);
+  ): Promise<void> {
+    await this.broadcast.emitMessageExcludingUsers(dto, excludeUserIds);
   }
 
   /** 落库(height 同一坐标系)并广播;失败只记日志(提示消息可丢)。 */
@@ -236,7 +237,7 @@ export class ChatSystemMessageService {
       const dto = await this.prisma.$transaction((tx) =>
         this.insertSystemMessageInTx(tx, conversationId, content),
       );
-      this.broadcastSystemMessage(dto);
+      await this.broadcastSystemMessage(dto);
     } catch (error) {
       this.logger.warn(
         `system message emit failed conversation=${conversationId}: ${

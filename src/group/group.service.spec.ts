@@ -1054,6 +1054,55 @@ describe('GroupService reportGroup', () => {
     ).toHaveBeenCalledWith(expect.any(Object), ['target-user']);
   });
 
+  it('awaits the authorization-filtered detailed broadcast after detach completes', async () => {
+    let finishBroadcast!: () => void;
+    chatSystemMessage.broadcastSystemMessageExcludingUsers.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishBroadcast = resolve;
+      }),
+    );
+    chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conversation-1',
+    });
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockImplementation(({ where }) =>
+      Promise.resolve({
+        id:
+          where.userID_circleID.userID === 'admin-1'
+            ? 'actor-member'
+            : 'target-member',
+        role:
+          where.userID_circleID.userID === 'admin-1'
+            ? CircleMemberRole.ADMIN
+            : CircleMemberRole.MEMBER,
+        status: CircleMemberStatus.ACTIVE,
+      }),
+    );
+
+    let completed = false;
+    const removal = service
+      .removeGroupMember('admin-1', 'group-1', 'target-user')
+      .then(() => {
+        completed = true;
+      });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(chatCircleSync.detachSeat).toHaveBeenCalled();
+    expect(
+      chatSystemMessage.broadcastSystemMessageExcludingUsers,
+    ).toHaveBeenCalledWith(expect.any(Object), ['target-user']);
+    expect(completed).toBe(false);
+
+    finishBroadcast();
+    await removal;
+    expect(completed).toBe(true);
+  });
+
   it('does not detach or broadcast when removal creates a DTO but commit rejects', async () => {
     chatCircleSync.releaseSeatInTx.mockResolvedValue('conversation-1');
     prisma.chatConversation.findUnique.mockResolvedValue({

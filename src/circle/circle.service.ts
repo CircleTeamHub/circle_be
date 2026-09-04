@@ -590,7 +590,7 @@ export class CircleService {
     });
 
     for (const message of systemMessages) {
-      this.systemMessage.broadcastSystemMessage(message);
+      await this.systemMessage.broadcastSystemMessage(message);
     }
 
     return this.getCircleDetail(userId, circleId);

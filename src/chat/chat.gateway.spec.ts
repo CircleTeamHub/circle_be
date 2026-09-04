@@ -848,6 +848,32 @@ describe('ChatGateway', () => {
       );
     });
 
+    it('keeps push and durable follow-up after authorized realtime delivery fails closed', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
+      });
+      broadcast.emitMessage.mockRejectedValueOnce(
+        new Error('membership read failed'),
+      );
+      const ack = jest.fn();
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({ ok: true, messageId: 'msg-1' }),
+      );
+      expect(chatPush.onMessageBroadcast).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'msg-1' }),
+      );
+      expect(supportRecharge.processMessage).toHaveBeenCalledWith('msg-1');
+    });
+
     it('does not rebroadcast idempotent replays', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: true,

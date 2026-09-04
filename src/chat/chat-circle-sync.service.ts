@@ -354,11 +354,9 @@ export class ChatCircleSyncService {
   ): Promise<void> {
     // 先离房,再发个人事件。
     //
-    // 反过来的话(原来的顺序):emitConversationChange 立刻返回,而离房内部
-    // 还在 await fetchSockets —— 这中间广播到会话房的消息,那位已经被移出的
-    // 成员照样收得到(广播不会再查一次 ChatMember)。离房失败时更糟:他会一直
-    // 留在房里收群消息,直到自己重连。所以失败要踢连接,让他重连时按座位重新派生。
-    let evictionFailure: unknown = null;
+    // 先派发清理再通知本人的 UI，减少旧会话房收敛窗口。跨节点 RemoteSocket
+    // 清理没有 adapter ack，因此这只是 best-effort；chat:msg 的隐私边界是
+    // 广播时重新查询 active ChatMember 并投个人房，不依赖这里完成。
     try {
       await this.broadcast.removeUserFromConversation(userId, conversationId);
     } catch (error: unknown) {
@@ -372,7 +370,6 @@ export class ChatCircleSyncService {
       try {
         await this.broadcast.disconnectUserSockets(userId);
       } catch (disconnectError: unknown) {
-        evictionFailure = disconnectError;
         this.logger.error(
           `detach seat could not evict sockets user=${userId}: ${
             disconnectError instanceof Error
@@ -399,10 +396,9 @@ export class ChatCircleSyncService {
           ),
         );
     }
-    // Manager removal broadcasts identify the actor and target. If both room
-    // eviction mechanisms failed, let the caller withhold that detailed event
-    // instead of knowingly sending it to the removed member's stale socket.
-    if (!emitMemberLeftNotice && evictionFailure) throw evictionFailure;
+    // Manager removal can continue even if both cleanup dispatches failed:
+    // its detailed log explicitly excludes the target and all chat:msg
+    // delivery is independently filtered by the authoritative active seats.
   }
 
   /**

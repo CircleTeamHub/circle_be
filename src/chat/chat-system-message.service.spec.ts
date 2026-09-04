@@ -71,7 +71,7 @@ describe('ChatSystemMessageService', () => {
     );
   });
 
-  it('can broadcast a system message while excluding specific user rooms', () => {
+  it('can broadcast a system message while excluding specific user rooms', async () => {
     const message = {
       id: 'sys-1',
       conversationId: 'conv-1',
@@ -79,7 +79,7 @@ describe('ChatSystemMessageService', () => {
       content: { kind: 'member-removed' },
     } as never;
 
-    (service as any).broadcastSystemMessageExcludingUsers(message, [
+    await (service as any).broadcastSystemMessageExcludingUsers(message, [
       'removed-user',
     ]);
 
@@ -87,6 +87,29 @@ describe('ChatSystemMessageService', () => {
       'removed-user',
     ]);
     expect(broadcast.emitMessage).not.toHaveBeenCalled();
+  });
+
+  it('awaits authorization-filtered realtime delivery after the transaction commits', async () => {
+    let finishDelivery!: () => void;
+    broadcast.emitMessage.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDelivery = resolve;
+        }),
+    );
+
+    let completed = false;
+    const pending = service.emit('conv-1', { kind: 'member-left' }).then(() => {
+      completed = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(broadcast.emitMessage).toHaveBeenCalled();
+    expect(completed).toBe(false);
+
+    finishDelivery();
+    await pending;
+    expect(completed).toBe(true);
   });
 
   it('inserts above an already locked counter without acquiring another lock', async () => {

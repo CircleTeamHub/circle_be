@@ -1,37 +1,42 @@
+/* eslint-disable sonarjs/no-internal-api-use -- This contract regression intentionally executes the installed Socket.IO RemoteSocket implementation. */
+import { RemoteSocket } from '../../node_modules/socket.io/dist/broadcast-operator';
 import { ChatBroadcastService } from './chat-broadcast.service';
 
-/** 延迟兑现的 join —— 用来暴露「没 await」的时序缺陷。 */
-function deferredJoin(id: string, completed: string[], delayMs: number) {
-  return jest.fn(
-    () =>
-      new Promise<void>((resolve) => {
-        setTimeout(() => {
-          completed.push(id);
-          resolve();
-        }, delayMs);
-      }),
-  );
+function message(conversationId = 'conv-1') {
+  return {
+    id: 'message-1',
+    conversationId,
+    type: 'system',
+    content: { kind: 'member-removed' },
+  } as never;
 }
 
-function deferredSocketAction(id: string, completed: string[]) {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
-    resolve = () => {
-      completed.push(id);
-      done();
-    };
+function prismaWithActiveUsers(userIDs: string[]) {
+  return {
+    chatMember: {
+      findMany: jest
+        .fn()
+        .mockResolvedValue(userIDs.map((userID) => ({ userID }))),
+    },
+  };
+}
+
+function realRemoteSocket(adapter: Record<string, unknown>, id = 'socket-1') {
+  return new RemoteSocket(adapter as never, {
+    id,
+    handshake: {} as never,
+    rooms: [id],
+    data: { userId: 'removed-user' },
   });
-  return { action: jest.fn(() => promise), resolve };
 }
 
 describe('ChatBroadcastService.joinUserToConversation', () => {
-  function buildHarness(joinDelayMs = 0) {
-    const completed: string[] = [];
-    // 多副本部署下 fetchSockets() 拿到的是 RemoteSocket —— join() 是跨节点
-    // 异步调用,返回 Promise。
+  function buildHarness() {
+    // This is the real RemoteSocket contract: join dispatches adapter work and
+    // returns void, so callers cannot treat it as an acknowledgement.
     const sockets = [
-      { join: deferredJoin('s1', completed, joinDelayMs) },
-      { join: deferredJoin('s2', completed, joinDelayMs) },
+      { join: jest.fn(() => undefined) },
+      { join: jest.fn(() => undefined) },
     ];
     const server = {
       in: jest.fn(() => ({
@@ -43,27 +48,30 @@ describe('ChatBroadcastService.joinUserToConversation', () => {
       isOnline: jest.fn(),
       getOnlineUserIds: jest.fn(),
     };
-    const service = new ChatBroadcastService(presence as never);
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
     service.setServer(server as never);
-    return { service, sockets, completed, presence };
+    return { service, sockets, presence };
   }
 
-  it('awaits every remote join before resolving', async () => {
-    // 不等的话本方法会在对方真正入房之前返回,调用方紧接着广播的第一条消息
-    // 直接丢空 —— 结算卡片就是这么丢的:客户端连 chat:msg 都收不到,
-    // 也就没有任何东西能触发它自愈补拉。
-    const { service, sockets, completed } = buildHarness(5);
+  it('uses the real void RemoteSocket join contract', async () => {
+    const { service, sockets, presence } = buildHarness();
 
     await service.joinUserToConversation('u1', 'conv-1');
 
+    expect(presence.conversationJoined).toHaveBeenCalledWith('u1', 'conv-1');
     expect(sockets[0].join).toHaveBeenCalledWith('c:conv-1');
     expect(sockets[1].join).toHaveBeenCalledWith('c:conv-1');
-    expect(completed).toEqual(['s1', 's2']);
   });
 
   it('is a no-op without an attached server', async () => {
     const presence = { conversationJoined: jest.fn() };
-    const service = new ChatBroadcastService(presence as never);
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
 
     await expect(
       service.joinUserToConversation('u1', 'conv-1'),
@@ -76,7 +84,10 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
     const emit = jest.fn();
     const to = jest.fn(() => ({ emit }));
     const presence = {};
-    const service = new ChatBroadcastService(presence as never);
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
     service.setServer({ to } as never);
 
     service.emitHistoryCleared({
@@ -95,89 +106,264 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
 });
 
 describe('ChatBroadcastService member eviction', () => {
-  it('awaits every remote leave before resolving', async () => {
-    const completed: string[] = [];
-    const first = deferredSocketAction('s1', completed);
-    const second = deferredSocketAction('s2', completed);
-    const sockets = [{ leave: first.action }, { leave: second.action }];
+  it('uses the real void RemoteSocket leave contract without pretending it is an acknowledgement', async () => {
+    const adapter = { delSockets: jest.fn() };
+    const socket = realRemoteSocket(adapter);
+    expect(socket.leave('contract-probe')).toBeUndefined();
+    adapter.delSockets.mockClear();
     const server = {
       in: jest.fn(() => ({
-        fetchSockets: jest.fn().mockResolvedValue(sockets),
+        fetchSockets: jest.fn().mockResolvedValue([socket]),
       })),
     };
-    const presence = { conversationLeft: jest.fn() };
-    const service = new ChatBroadcastService(presence as never);
+    const presence = {
+      conversationLeft: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
     service.setServer(server as never);
 
-    let resolved = false;
-    const removal = service
-      .removeUserFromConversation('u1', 'conv-1')
-      .then(() => {
-        resolved = true;
-      });
-    await Promise.resolve();
-    await Promise.resolve();
+    await service.removeUserFromConversation('u1', 'conv-1');
 
-    expect(resolved).toBe(false);
-    first.resolve();
-    second.resolve();
-    await removal;
-
-    expect(completed).toEqual(['s1', 's2']);
-    expect(sockets[0].leave).toHaveBeenCalledWith('c:conv-1');
-    expect(sockets[1].leave).toHaveBeenCalledWith('c:conv-1');
+    expect(presence.conversationLeft).toHaveBeenCalledWith('u1', 'conv-1');
+    expect(adapter.delSockets).toHaveBeenCalledTimes(1);
   });
 
-  it('awaits every remote disconnect fallback before resolving', async () => {
-    const completed: string[] = [];
-    const first = deferredSocketAction('s1', completed);
-    const second = deferredSocketAction('s2', completed);
-    const sockets = [
-      { disconnect: first.action },
-      { disconnect: second.action },
-    ];
+  it('uses the real RemoteSocket disconnect contract, which returns the socket rather than a promise', async () => {
+    const adapter = { disconnectSockets: jest.fn() };
+    const socket = realRemoteSocket(adapter);
+    expect(socket.disconnect(true)).toBe(socket);
+    adapter.disconnectSockets.mockClear();
     const server = {
       in: jest.fn(() => ({
-        fetchSockets: jest.fn().mockResolvedValue(sockets),
+        fetchSockets: jest.fn().mockResolvedValue([socket]),
       })),
     };
-    const service = new ChatBroadcastService({} as never);
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers([]) as never,
+    );
     service.setServer(server as never);
 
-    let resolved = false;
-    const disconnect = service.disconnectUserSockets('u1').then(() => {
-      resolved = true;
-    });
-    await Promise.resolve();
-    await Promise.resolve();
+    await service.disconnectUserSockets('u1');
 
-    expect(resolved).toBe(false);
-    first.resolve();
-    second.resolve();
-    await disconnect;
-
-    expect(completed).toEqual(['s1', 's2']);
-    expect(sockets[0].disconnect).toHaveBeenCalledWith(true);
-    expect(sockets[1].disconnect).toHaveBeenCalledWith(true);
+    expect(adapter.disconnectSockets).toHaveBeenCalledTimes(1);
   });
 
-  it('broadcasts a message to the conversation room except excluded user rooms', () => {
+  it('targets only DB-active members even when presence still contains a removed user', async () => {
     const emit = jest.fn();
-    const except = jest.fn(() => ({ emit }));
-    const to = jest.fn(() => ({ except }));
-    const service = new ChatBroadcastService({} as never);
+    const to = jest.fn(() => ({ emit }));
+    const presence = {
+      getOnlineUserIds: jest
+        .fn()
+        .mockResolvedValue(['active-user', 'removed-user']),
+    };
+    const prisma = prismaWithActiveUsers(['active-user']);
+    const service = new ChatBroadcastService(
+      presence as never,
+      prisma as never,
+    );
     service.setServer({ to } as never);
-    const message = {
-      id: 'message-1',
-      conversationId: 'conv-1',
-      type: 'system',
-      content: { kind: 'member-removed' },
-    } as never;
 
-    (service as any).emitMessageExcludingUsers(message, ['removed-user']);
+    await service.emitMessage(message());
 
-    expect(to).toHaveBeenCalledWith('c:conv-1');
-    expect(except).toHaveBeenCalledWith(['u:removed-user']);
-    expect(emit).toHaveBeenCalledWith('chat:msg', message);
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+      where: {
+        conversationID: 'conv-1',
+        leftAt: null,
+        userID: { in: ['active-user', 'removed-user'] },
+      },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:active-user']);
+    expect(to).not.toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:msg', message());
+  });
+
+  it('waits for delayed presence resolution and falls back to all DB-active members when unavailable', async () => {
+    let resolvePresence!: (value: null) => void;
+    const presence = {
+      getOnlineUserIds: jest.fn(
+        () =>
+          new Promise<null>((resolve) => {
+            resolvePresence = resolve;
+          }),
+      ),
+    };
+    const prisma = prismaWithActiveUsers(['direct-member', 'temp-guest']);
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const service = new ChatBroadcastService(
+      presence as never,
+      prisma as never,
+    );
+    service.setServer({ to } as never);
+
+    const pending = service.emitMessage(message('direct-or-temp'));
+    await Promise.resolve();
+    expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    expect(emit).not.toHaveBeenCalled();
+
+    resolvePresence(null);
+    await pending;
+
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'direct-or-temp', leftAt: null },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:direct-member', 'u:temp-guest']);
+  });
+
+  it('keeps future messages private while a void remote leave is still delayed', async () => {
+    jest.useFakeTimers();
+    try {
+      let remoteEvicted = false;
+      const adapter = {
+        delSockets: jest.fn(() => {
+          return new Promise<void>((resolve) => {
+            setTimeout(() => {
+              remoteEvicted = true;
+              resolve();
+            }, 100);
+          });
+        }),
+      };
+      const socket = realRemoteSocket(adapter);
+      const emit = jest.fn();
+      const to = jest.fn(() => ({ emit }));
+      const server = {
+        in: jest.fn(() => ({
+          fetchSockets: jest.fn().mockResolvedValue([socket]),
+        })),
+        to,
+      };
+      const presence = {
+        conversationLeft: jest.fn().mockResolvedValue(undefined),
+        getOnlineUserIds: jest
+          .fn()
+          .mockResolvedValue(['active-user', 'removed-user']),
+      };
+      const service = new ChatBroadcastService(
+        presence as never,
+        prismaWithActiveUsers(['active-user']) as never,
+      );
+      service.setServer(server as never);
+
+      await service.removeUserFromConversation('removed-user', 'conv-1');
+      expect(remoteEvicted).toBe(false);
+      await service.emitMessage(message());
+
+      expect(to).toHaveBeenCalledWith(['u:active-user']);
+      expect(to).not.toHaveBeenCalledWith('c:conv-1');
+      jest.advanceTimersByTime(100);
+      expect(remoteEvicted).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps future messages private when leave fails and void disconnect fallback cannot acknowledge completion', async () => {
+    const leaveAdapter = {
+      delSockets: jest.fn(() => {
+        throw new Error('adapter unavailable');
+      }),
+    };
+    const disconnectAdapter = { disconnectSockets: jest.fn() };
+    const leavingRemote = realRemoteSocket(leaveAdapter, 'leaving-remote');
+    const disconnectRemote = realRemoteSocket(
+      disconnectAdapter,
+      'disconnect-remote',
+    );
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const fetchSockets = jest
+      .fn()
+      .mockResolvedValueOnce([leavingRemote])
+      .mockResolvedValueOnce([disconnectRemote]);
+    const server = { in: jest.fn(() => ({ fetchSockets })), to };
+    const presence = {
+      conversationLeft: jest.fn().mockResolvedValue(undefined),
+      getOnlineUserIds: jest
+        .fn()
+        .mockResolvedValue(['active-user', 'removed-user']),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers(['active-user']) as never,
+    );
+    service.setServer(server as never);
+
+    await expect(
+      service.removeUserFromConversation('removed-user', 'conv-1'),
+    ).rejects.toThrow('adapter unavailable');
+    await service.disconnectUserSockets('removed-user');
+    await service.emitMessage(message());
+
+    expect(disconnectAdapter.disconnectSockets).toHaveBeenCalledTimes(1);
+    expect(to).toHaveBeenCalledWith(['u:active-user']);
+    expect(to).not.toHaveBeenCalledWith('c:conv-1');
+  });
+
+  it('keeps future messages private when the real void leave hides a later adapter rejection', async () => {
+    let rejectAdapter!: (error: Error) => void;
+    const adapterResult = new Promise<void>((_resolve, reject) => {
+      rejectAdapter = reject;
+    });
+    // Socket.IO cannot observe this through RemoteSocket.leave(); attach a
+    // test-only rejection observer so Jest does not treat it as unhandled.
+    void adapterResult.catch(() => undefined);
+    const leaveAdapter = {
+      delSockets: jest.fn(() => adapterResult),
+    };
+    const socket = realRemoteSocket(leaveAdapter);
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const server = {
+      in: jest.fn(() => ({
+        fetchSockets: jest.fn().mockResolvedValue([socket]),
+      })),
+      to,
+    };
+    const presence = {
+      conversationLeft: jest.fn().mockResolvedValue(undefined),
+      getOnlineUserIds: jest
+        .fn()
+        .mockResolvedValue(['active-user', 'removed-user']),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers(['active-user']) as never,
+    );
+    service.setServer(server as never);
+
+    await service.removeUserFromConversation('removed-user', 'conv-1');
+    rejectAdapter(new Error('redis publish failed later'));
+    await Promise.resolve();
+    await service.emitMessage(message());
+
+    expect(to).toHaveBeenCalledWith(['u:active-user']);
+    expect(to).not.toHaveBeenCalledWith('c:conv-1');
+  });
+
+  it('explicitly excludes the removed user from the current log even if the active-seat snapshot contains them', async () => {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const presence = {
+      getOnlineUserIds: jest
+        .fn()
+        .mockResolvedValue(['active-user', 'removed-user']),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers(['active-user', 'removed-user']) as never,
+    );
+    service.setServer({ to } as never);
+
+    await service.emitMessageExcludingUsers(message(), ['removed-user']);
+
+    expect(to).toHaveBeenCalledWith(['u:active-user']);
+    expect(emit).toHaveBeenCalledWith('chat:msg', message());
   });
 });

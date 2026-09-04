@@ -3224,7 +3224,7 @@ export class ChatService {
       return { updated: row, notice: dto };
     });
     // 广播放在提交之后:事务回滚了却已经播出去,客户端会显示一条并不存在的提示。
-    this.systemMessage.broadcastSystemMessage(notice);
+    await this.systemMessage.broadcastSystemMessage(notice);
     return { burnDurationSec: updated.burnDurationSec ?? null };
   }
 
@@ -3438,7 +3438,7 @@ export class ChatService {
         clearedBeforeHeight: watermark,
         clearedBy: userId,
       });
-      this.systemMessage.broadcastSystemMessage(notice!);
+      await this.systemMessage.broadcastSystemMessage(notice!);
     }
     return { clearedBeforeHeight: watermark };
   }

@@ -265,8 +265,8 @@ describe('ChatCircleSyncService', () => {
   });
 
   it('disconnects the socket when the room leave fails', async () => {
-    // 离不了房 = 他会一直留在房里收群消息,直到自己重连。断连接是唯一兜底:
-    // 重连时 handleConnection 按当前座位重新派生房间,而他已经没有座位了。
+    // 断连接帮助旧会话房尽快收敛；消息隐私本身由每次广播的 active-seat
+    // 过滤保证，不再把这个无 adapter ack 的动作当授权边界。
     broadcast.removeUserFromConversation.mockRejectedValueOnce(
       new Error('adapter down'),
     );
@@ -335,7 +335,7 @@ describe('ChatCircleSyncService', () => {
     expect(systemMessage.emit).not.toHaveBeenCalled();
   });
 
-  it('fails a privacy-sensitive manager detach when neither room removal nor disconnect succeeds', async () => {
+  it('does not block manager removal when neither best-effort room cleanup command dispatches', async () => {
     broadcast.removeUserFromConversation.mockRejectedValueOnce(
       new Error('adapter down'),
     );
@@ -345,7 +345,12 @@ describe('ChatCircleSyncService', () => {
 
     await expect(
       service.detachSeat('u1', 'conv-1', 'removed', false),
-    ).rejects.toThrow('disconnect down');
+    ).resolves.toBeUndefined();
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+      kind: 'removed',
+      conversationId: 'conv-1',
+      userId: 'u1',
+    });
     expect(systemMessage.emit).not.toHaveBeenCalled();
   });
 
