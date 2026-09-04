@@ -18,8 +18,11 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { MembershipPolicyService } from 'src/membership/membership-policy.service';
 import { UploadService } from 'src/upload/upload.service';
 import {
+  CHAT_MEDIA_DELETE_CLAIM_REASON,
   CHAT_MEDIA_KEY_PREFIX,
   CHAT_NOTE_IMPORT_SEGMENT,
+  CHAT_NOTE_IMPORT_RESERVATION_MS,
+  CHAT_NOTE_IMPORT_RESERVATION_REASON,
 } from 'src/chat/chat.constants';
 import {
   assertUrlsFromStorage,
@@ -106,6 +109,14 @@ function toPrismaJson(
     result = value as Prisma.InputJsonValue;
   }
   return result;
+}
+
+// 笔记媒体导入撞上删除 worker 仍在回收同一个确定性 key:可重试的 409。
+// 文案保持笼统,不把 worker 的内部状态透给客户端。
+function noteImportRecyclingConflict(): ConflictException {
+  return new ConflictException(
+    'Note media is being recycled, please retry shortly',
+  );
 }
 
 // ── Typed row shapes returned by queries that use NOTE_INCLUDE ────────────────
@@ -2073,7 +2084,72 @@ export class NoteService {
             ext ? `.${ext.toLowerCase()}` : ''
           }`;
           try {
+            const nextAttemptAt = new Date(
+              Date.now() + CHAT_NOTE_IMPORT_RESERVATION_MS,
+            );
+            await this.prisma.$transaction(async (tx) => {
+              // 与删除 worker 共用同一把 key 锁。若过期 reservation 正被清理,
+              // 先等它结束再续租并复制；否则「刚复制完」的对象可能被旧 worker 删掉。
+              await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${destKey}))`;
+              // 锁只覆盖 worker 的认领事务,不覆盖它随后在事务外做的对象删除。
+              // 认领行带着「删除中」标记和一段未到期租约:此刻复用这行、开始复制,
+              // 飞行中的删除就可能把刚复制好的对象删掉。所以直接拒绝,让客户端
+              // 稍后重试(租约最多 5 分钟)。已到期的认领说明 worker 中途挂了,
+              // 退避中的失败记录则没有在飞的删除,两者都可以照常改写成预留。
+              const existing = await tx.chatMediaDeletion.findUnique({
+                where: { objectKey: destKey },
+                select: { lastError: true, nextAttemptAt: true },
+              });
+              if (
+                existing?.lastError === CHAT_MEDIA_DELETE_CLAIM_REASON &&
+                existing.nextAttemptAt.getTime() > Date.now()
+              ) {
+                throw noteImportRecyclingConflict();
+              }
+              await tx.chatMediaDeletion.upsert({
+                where: { objectKey: destKey },
+                create: {
+                  objectKey: destKey,
+                  attempts: 0,
+                  lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+                  nextAttemptAt,
+                },
+                update: {
+                  attempts: 0,
+                  lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+                  nextAttemptAt,
+                },
+              });
+            });
             await uploadService.copyObjectToKey(row.objectKey, destKey);
+            // 预留是一行 chatMediaDeletion(不是随事务释放的 advisory lock),所以
+            // 复制期间它一直有效。但复制本身要花时间,如果不续租,「写消息 + 建
+            // 引用」这一段就得跟复制共用同一个到期时间;复制慢一点就会贴着边缘跑。
+            // 复制成功后重新计时,让后续步骤拿到完整窗口。只续我们自己那一行:
+            // lastError 不再是预留标记,说明它已经变成一条真的待删记录。
+            const renewed = await this.prisma.chatMediaDeletion.updateMany({
+              where: {
+                objectKey: destKey,
+                lastError: CHAT_NOTE_IMPORT_RESERVATION_REASON,
+              },
+              data: {
+                nextAttemptAt: new Date(
+                  Date.now() + CHAT_NOTE_IMPORT_RESERVATION_MS,
+                ),
+              },
+            });
+            if (renewed.count === 0) {
+              // 复制拖过了预留窗口(15 分钟),这行已经到期并被 worker 认领/回收。
+              // 返回一个没有可靠预留兜底的 key 只会让随后的发消息撞上
+              // 「Note media import has expired」;不如现在就以可重试的冲突失败。
+              this.logger.warn({
+                message: 'note import reservation lost during copy',
+                event: 'note_import_reservation_lost',
+                noteId,
+                mediaId: row.id,
+              });
+              throw noteImportRecyclingConflict();
+            }
           } catch (error) {
             firstCopyError ??= error;
             this.logger.warn(

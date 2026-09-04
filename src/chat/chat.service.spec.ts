@@ -58,6 +58,9 @@ describe('ChatService', () => {
     attachMediaUrls: jest.fn().mockResolvedValue(undefined),
     copyForForward: jest.fn(),
     deleteObjects: jest.fn().mockResolvedValue(undefined),
+    attachNoteImportReferences: jest.fn().mockResolvedValue(undefined),
+    releaseNoteImportReferences: jest.fn().mockResolvedValue(undefined),
+    drainPendingDeletions: jest.fn().mockResolvedValue(undefined),
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
@@ -1987,6 +1990,30 @@ describe('ChatService', () => {
     });
   });
 
+  it('commits note-import object references with the new message', async () => {
+    const key = 'chat/u1/note-import/abc123.jpg';
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.chatMessage.create.mockResolvedValue({
+      ...createdRow,
+      type: 'image',
+      content: { key },
+    });
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
+
+    await service.sendMessage(
+      'u1',
+      sendPayload({ type: 'image', content: { key } }),
+    );
+
+    expect(media.attachNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      'msg-1',
+      [key],
+    );
+  });
+
   describe('revokeMessage(G-02)', () => {
     const revokableRow = (overrides: Record<string, unknown> = {}) => ({
       id: 'm1',
@@ -2028,6 +2055,11 @@ describe('ChatService', () => {
       await service.revokeMessage('u1', 'conv-1', 'm1');
 
       expect(prisma.chatMessage.updateMany).toHaveBeenCalled();
+      expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+        prisma,
+        ['m1'],
+        ['chat/u1/note-import/abc123.jpg', 'chat/u1/note-import/abc123.t.jpg'],
+      );
       expect(media.deleteObjects).not.toHaveBeenCalled();
     });
 

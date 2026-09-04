@@ -313,6 +313,10 @@ export class ChatService {
           ? stripMediaPresentationFields(effectivePayload.content)
           : effectivePayload.content
       ) as Prisma.InputJsonObject;
+      const noteImportKeys = this.collectNoteImportMediaKeys({
+        type: effectivePayload.type,
+        content,
+      });
       const created = await this.prisma.$transaction(async (tx) => {
         // G-05:会话行锁替 advisory lock —— 同会话串行,跨会话零互扰
         // (hashtext 碰撞让无关会话互等的问题消失),也不再做 MAX(height) 聚合扫描。
@@ -361,6 +365,7 @@ export class ChatService {
             replyToID: replyToId,
           },
         });
+        await this.media.attachNoteImportReferences(tx, row.id, noteImportKeys);
         if (copiedKeys.length > 0) {
           const claimed = await tx.chatMediaDeletion.deleteMany({
             where: { objectKey: { in: copiedKeys } },
@@ -2813,17 +2818,28 @@ export class ChatService {
     }
 
     const mediaKeys = this.collectMediaKeys(row);
+    const noteImportKeys = this.collectNoteImportMediaKeys(row);
     // 条件更新替无条件 update:上面那次 revokedAt 读取和这次写入之间有窗口,
     // 双端并发撤回(或发送者与管理员同时动手)会两个都读到 null、两个都写、
     // 两个都广播,revokedBy 归后写者 —— 幂等承诺和审计归属一起破。
     // 谓词带上 revokedAt: null,只有赢家 count>0,输家走幂等分支重读。
-    const claimed = await this.prisma.chatMessage.updateMany({
-      where: { id: messageId, revokedAt: null },
-      data: { content: {}, revokedAt: new Date(), revokedBy: userId },
-    });
-    const updated = await this.prisma.chatMessage.findUniqueOrThrow({
-      where: { id: messageId },
-      omit: MESSAGE_READ_OMIT,
+    const { claimed, updated } = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.chatMessage.updateMany({
+        where: { id: messageId, revokedAt: null },
+        data: { content: {}, revokedAt: new Date(), revokedBy: userId },
+      });
+      if (claimed.count > 0) {
+        await this.media.releaseNoteImportReferences(
+          tx,
+          [messageId],
+          noteImportKeys,
+        );
+      }
+      const updated = await tx.chatMessage.findUniqueOrThrow({
+        where: { id: messageId },
+        omit: MESSAGE_READ_OMIT,
+      });
+      return { claimed, updated };
     });
     if (claimed.count === 0) {
       const senders = await this.resolveSenders(
@@ -2834,6 +2850,9 @@ export class ChatService {
     if (mediaKeys.length > 0) {
       // 尽力而为:删失败只留孤儿对象,不让撤回失败(deleteObjects 内部逐个 catch)。
       void this.media.deleteObjects(mediaKeys);
+    }
+    if (noteImportKeys.length > 0) {
+      void this.media.drainPendingDeletions();
     }
     this.broadcast.emitRevoke({
       conversationId,
@@ -3234,18 +3253,32 @@ export class ChatService {
         take: RELAX_PURGE_BATCH,
       });
       if (expired.length === 0) return;
-      await this.prisma.chatMessage.updateMany({
-        where: { id: { in: expired.map((row) => row.id) } },
-        // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
-        // 只清 content 等于「烧掉的只是最后一版」。
-        data: {
-          deleted: true,
-          content: {},
-          contentHistory: [] as Prisma.InputJsonValue,
-        },
-      });
+      const messageIds = expired.map((row) => row.id);
       const mediaKeys = expired.flatMap((row) => this.collectMediaKeys(row));
+      const noteImportKeys = expired.flatMap((row) =>
+        this.collectNoteImportMediaKeys(row),
+      );
+      await this.prisma.$transaction(async (tx) => {
+        await tx.chatMessage.updateMany({
+          where: { id: { in: messageIds } },
+          // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
+          // 只清 content 等于「烧掉的只是最后一版」。
+          data: {
+            deleted: true,
+            content: {},
+            contentHistory: [] as Prisma.InputJsonValue,
+          },
+        });
+        await this.media.releaseNoteImportReferences(
+          tx,
+          messageIds,
+          noteImportKeys,
+        );
+      });
       if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
+      if (noteImportKeys.length > 0) {
+        void this.media.drainPendingDeletions();
+      }
       if (expired.length < RELAX_PURGE_BATCH) return;
     }
     // 批次上限也没清完(异常量级的积压):设置**不放宽**,让读路径继续按旧
@@ -3356,6 +3389,23 @@ export class ChatService {
       .map((field) => content[field])
       .filter((v): v is string => typeof v === 'string' && v.length > 0)
       .filter((key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`));
+  }
+
+  /** 笔记导入对象可能被多条消息共享,只交给引用计数生命周期处理。 */
+  private collectNoteImportMediaKeys(row: {
+    type: string;
+    content: unknown;
+  }): string[] {
+    if (!MEDIA_MESSAGE_TYPES.includes(row.type)) return [];
+    const content = (row.content ?? {}) as Record<string, unknown>;
+    return ['key', 'thumbKey']
+      .map((field) => content[field])
+      .filter(
+        (value): value is string =>
+          typeof value === 'string' &&
+          value.length > 0 &&
+          value.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
+      );
   }
 
   private isUniqueViolation(error: unknown): boolean {

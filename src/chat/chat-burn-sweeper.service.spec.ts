@@ -2,16 +2,25 @@ import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
 
 describe('ChatBurnSweeperService', () => {
   const prisma = {
+    $transaction: jest.fn(),
     chatConversation: { findMany: jest.fn(), findUnique: jest.fn() },
     chatMessage: { findMany: jest.fn(), updateMany: jest.fn() },
   };
-  const media = { deleteObjects: jest.fn().mockResolvedValue(undefined) };
+  const media = {
+    deleteObjects: jest.fn().mockResolvedValue(undefined),
+    releaseNoteImportReferences: jest.fn().mockResolvedValue(undefined),
+    drainPendingDeletions: jest.fn().mockResolvedValue(undefined),
+  };
   const service = new ChatBurnSweeperService(prisma as never, media as never);
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     prisma.chatMessage.updateMany.mockResolvedValue({ count: 0 });
     media.deleteObjects.mockResolvedValue(undefined);
+    media.releaseNoteImportReferences.mockResolvedValue(undefined);
+    prisma.$transaction.mockImplementation(
+      async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
+    );
     // 每批删除前都重读当前策略(防「扫描中途策略被改长/关掉」)。
     prisma.chatConversation.findUnique.mockImplementation(
       ({ where }: { where: { id: string } }) =>
@@ -32,16 +41,14 @@ describe('ChatBurnSweeperService', () => {
       { id: 'conv-1', burnDurationSec: 3600 },
     ]);
     conversationPolicies.set('conv-1', { burnDurationSec: 3600 });
-    prisma.chatMessage.findMany
-      .mockResolvedValueOnce([
-        { id: 'm1', type: 'text', content: { text: 'old' } },
-        {
-          id: 'm2',
-          type: 'image',
-          content: { key: 'chat/u1/a.jpg', thumbKey: 'chat/u1/a.t.jpg' },
-        },
-      ])
-      .mockResolvedValueOnce([]);
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'm1', type: 'text', content: { text: 'old' } },
+      {
+        id: 'm2',
+        type: 'image',
+        content: { key: 'chat/u1/a.jpg', thumbKey: 'chat/u1/a.t.jpg' },
+      },
+    ]);
 
     await service.sweep();
 
@@ -69,6 +76,27 @@ describe('ChatBurnSweeperService', () => {
     prisma.chatConversation.findMany.mockResolvedValue([]);
     await service.sweep();
     expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+  });
+
+  it('releases shared note-import references instead of deleting them directly', async () => {
+    const shared = 'chat/u1/note-import/shared.jpg';
+    const owned = 'chat/u1/owned.jpg';
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-1', burnDurationSec: 60 },
+    ]);
+    conversationPolicies.set('conv-1', { burnDurationSec: 60 });
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'm1', type: 'image', content: { key: shared, thumbKey: owned } },
+    ]);
+
+    await service.sweep();
+
+    expect(media.releaseNoteImportReferences).toHaveBeenCalledWith(
+      prisma,
+      ['m1'],
+      [shared],
+    );
+    expect(media.deleteObjects).toHaveBeenCalledWith([owned]);
   });
 
   it('stops the per-conversation loop on a short batch', async () => {

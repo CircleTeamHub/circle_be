@@ -84,6 +84,8 @@ Use the request id to correlate:
   `SLOW_EXTERNAL_MS`.
 - `security_event`: authentication / authorization signals — see the
   [catalogue](#security-event-catalogue).
+- `chat_media_claim_lost`: warning from the chat media deletion sweeper when its conditional write-back after an object delete matched no row — the claimed `ChatMediaDeletion` row was replaced (typically turned into a note import reservation) or removed while the delete was in flight. Carries `objectKey` and `outcome` (`deleted` / `failed`).
+- `note_import_reservation_lost`: warning from note media import when the post-copy reservation renewal matched no row (the copy outlasted the 15 minute reservation window). The request fails with a retryable 409. Carries `noteId` and `mediaId`.
 
 Deferred production events:
 
