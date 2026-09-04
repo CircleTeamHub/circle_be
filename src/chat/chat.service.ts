@@ -11,6 +11,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SupportService } from 'src/support/support.service';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
@@ -100,6 +101,7 @@ export class ChatService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly support: SupportService,
+    private readonly circleMemberLock: CircleMemberLockService,
   ) {}
 
   /**
@@ -3343,6 +3345,11 @@ export class ChatService {
         if (globalClear && conversation.type === 'GROUP') {
           let authorized = conversation.ownerID === userId;
           if (conversation.circleID) {
+            // GroupService 的降权/移除/退群也持有这把成员锁。会话锁先拿,
+            // 再等成员锁,确保授权读取发生在已提交的成员变更之后。
+            await this.circleMemberLock.lock(tx, conversation.circleID, [
+              userId,
+            ]);
             const circleMember = await tx.circleMember.findUnique({
               where: {
                 userID_circleID: {

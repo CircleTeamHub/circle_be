@@ -8,6 +8,8 @@ import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { SupportModule } from 'src/support/support.module';
+import { MembershipPolicyModule } from 'src/membership/membership-policy.module';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatController } from './chat.controller';
@@ -30,6 +32,7 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
     PrivacySettingsModule,
     UploadModule,
     SupportModule,
+    MembershipPolicyModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
@@ -50,6 +53,7 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
     ChatBurnSweeperService,
     ChatPresenceRegistry,
     ChatSupportRechargeProcessor,
+    CircleMemberLockService,
   ],
   exports: [
     ChatService,

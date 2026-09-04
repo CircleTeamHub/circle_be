@@ -87,6 +87,9 @@ describe('ChatService', () => {
   const support = {
     isSupportAgent: jest.fn().mockResolvedValue(false),
   };
+  const circleMemberLock = {
+    lock: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatService(
     prisma as never,
@@ -97,6 +100,7 @@ describe('ChatService', () => {
     broadcast as never,
     systemMessage as never,
     support as never,
+    circleMemberLock as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -164,6 +168,7 @@ describe('ChatService', () => {
     privacySettings.canReceiveStrangerMessage.mockResolvedValue(true);
     // 必须每个用例重置:客服豁免一旦泄漏成 true,所有陌生人开关的用例都会被无声放行。
     support.isSupportAgent.mockResolvedValue(false);
+    circleMemberLock.lock.mockResolvedValue(undefined);
     privacySettings.getSettings.mockResolvedValue({
       messageSelfDestructDays: 0,
     });
@@ -3128,6 +3133,71 @@ describe('ChatService', () => {
       expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
       expect(tx.chatMember.updateMany).not.toHaveBeenCalled();
       expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+    });
+
+    it('waits for the shared circle-member lock before reading revoked moderator state', async () => {
+      const txCircleMember = {
+        findUnique: jest.fn().mockResolvedValue({
+          role: 'OWNER',
+          status: 'ACTIVE',
+        }),
+        findMany: jest.fn(),
+      };
+      const tx = {
+        ...prisma,
+        $queryRaw: jest.fn().mockResolvedValue([
+          {
+            id: 'conv-1',
+            type: 'GROUP',
+            circleID: 'circle-1',
+            ownerID: null,
+            nextHeight: 42,
+          },
+        ]),
+        chatMember: {
+          ...prisma.chatMember,
+          findUnique: jest.fn().mockResolvedValue({ leftAt: null }),
+          findMany: jest.fn().mockResolvedValue([{ userID: 'u1' }]),
+          updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+          updateManyAndReturn: jest.fn().mockResolvedValue([]),
+        },
+        circleMember: txCircleMember,
+      };
+      prisma.$transaction.mockImplementation(
+        async (callback: (client: typeof tx) => unknown) => callback(tx),
+      );
+      // 模拟角色变更事务先拿到同一把锁,在 clear 等到锁时已提交降权。
+      circleMemberLock.lock.mockImplementation(async () => {
+        txCircleMember.findUnique.mockResolvedValue({
+          role: 'MEMBER',
+          status: 'ACTIVE',
+        });
+      });
+
+      await expect(
+        service.clearHistory('u1', 'conv-1', true),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      });
+
+      expect(circleMemberLock.lock).toHaveBeenCalledWith(tx, 'circle-1', [
+        'u1',
+      ]);
+      expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        circleMemberLock.lock.mock.invocationCallOrder[0],
+      );
+      expect(circleMemberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        txCircleMember.findUnique.mock.invocationCallOrder[0],
+      );
+      expect(tx.chatMember.findMany).not.toHaveBeenCalled();
+      expect(tx.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(tx.chatMember.updateManyAndReturn).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(broadcast.emitRead).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
     it('locks first, discovers active targets in-transaction, and broadcasts in commit order', async () => {
