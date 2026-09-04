@@ -1,5 +1,13 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsIn, IsInt, IsOptional } from 'class-validator';
+import { Transform } from 'class-transformer';
+import {
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
 
 export const SELF_DESTRUCT_DAY_OPTIONS = [0, 1, 2, 7, 30] as const;
 export const MOMENTS_VISIBILITY_OPTIONS = [
@@ -27,6 +35,8 @@ export class PrivacySettingsDto {
   addMeByGroup: boolean;
   callPermission: PrivacyPermission;
   groupInvitePermission: PrivacyPermission;
+  directMessageAutoReplyEnabled: boolean;
+  directMessageAutoReplyText: string;
 }
 
 export class UpdatePrivacySettingsDto {
@@ -95,4 +105,23 @@ export class UpdatePrivacySettingsDto {
   @IsOptional()
   @IsIn(PERMISSION_OPTIONS)
   groupInvitePermission?: PrivacyPermission;
+
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) =>
+      obj.directMessageAutoReplyEnabled,
+  )
+  @IsBoolean()
+  directMessageAutoReplyEnabled?: boolean;
+
+  @ApiPropertyOptional({ default: '', maxLength: 200 })
+  @IsOptional()
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => {
+    const value = obj.directMessageAutoReplyText;
+    return typeof value === 'string' ? value.trim() : value;
+  })
+  @IsString()
+  @MaxLength(200)
+  directMessageAutoReplyText?: string;
 }

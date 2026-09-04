@@ -35,7 +35,7 @@ describe('ChatService', () => {
       updateMany: jest.fn(),
     },
     user: { findUnique: jest.fn(), findMany: jest.fn() },
-    tempChat: { findMany: jest.fn() },
+    tempChat: { findUnique: jest.fn(), findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
     chatMessageReaction: {
@@ -49,6 +49,7 @@ describe('ChatService', () => {
     friend: { findFirst: jest.fn() },
     supportAgent: { findFirst: jest.fn().mockResolvedValue(null) },
     supportRechargeJob: { create: jest.fn() },
+    chatDirectAutoReplyJob: { create: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
@@ -157,8 +158,13 @@ describe('ChatService', () => {
       { id: 'u1', nickname: '一波', avatarUrl: null },
     ]);
     prisma.supportAgent.findFirst.mockResolvedValue(null);
+    prisma.chatDirectAutoReplyJob.create.mockResolvedValue(undefined);
     prisma.circle.findMany.mockResolvedValue([]);
     prisma.tempChat.findMany.mockResolvedValue([]);
+    prisma.tempChat.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      expiresAt: new Date(Date.now() + 60_000),
+    });
     prisma.tempChatGuest.findMany.mockResolvedValue([]);
     // 默认返回发号计数器行(G-05 行锁读)。列表类集合查询($queryRaw 复用同一 mock)
     // 读不到 conversationID 字段时得到 undefined 键,查找自然落空,等价「无行」。
@@ -756,6 +762,106 @@ describe('ChatService', () => {
       // G-05:height 分配走会话行锁读(SELECT..FOR UPDATE),advisory lock 退役。
       expect(prisma.$queryRaw).toHaveBeenCalled();
       expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+    });
+
+    it('enqueues one durable auto-reply job in the direct-message transaction', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      await service.sendMessage('u1', sendPayload());
+
+      expect(prisma.chatDirectAutoReplyJob.create).toHaveBeenCalledWith({
+        data: { sourceMessageID: 'msg-1' },
+      });
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(
+        prisma.chatMessage.create.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        prisma.chatDirectAutoReplyJob.create.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not enqueue auto-reply jobs for replayed or group messages', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(createdRow);
+
+      await service.sendMessage('u1', sendPayload());
+      expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+
+      jest.clearAllMocks();
+      prisma.$transaction.mockImplementation(runTx as never);
+      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.sendMessage('u1', sendPayload());
+      expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+    });
+
+    it.each(['GROUP', 'TEMP', 'SUPPORT'] as const)(
+      'does not enqueue auto-reply jobs for %s conversations',
+      async (type) => {
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            conversation: {
+              ...membership().conversation,
+              type,
+              ...(type === 'TEMP' ? { tempChatID: 'temp-1' } : {}),
+            },
+          }),
+        );
+        prisma.chatMessage.findUnique.mockResolvedValue(null);
+        prisma.chatMessage.create.mockResolvedValue(createdRow);
+        prisma.chatConversation.update.mockResolvedValue({});
+
+        await service.sendMessage('u1', sendPayload());
+
+        expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+      },
+    );
+
+    it('fails the direct send transaction when its durable job cannot be written', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+      prisma.chatDirectAutoReplyJob.create.mockRejectedValue(
+        new Error('queue unavailable'),
+      );
+
+      await expect(service.sendMessage('u1', sendPayload())).rejects.toThrow(
+        'queue unavailable',
+      );
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
     it('returns the existing row on clientMessageId replay without re-persisting', async () => {

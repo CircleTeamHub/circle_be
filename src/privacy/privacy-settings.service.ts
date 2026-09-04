@@ -29,6 +29,8 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   addMeByGroup: true,
   callPermission: 'EVERYONE',
   groupInvitePermission: 'EVERYONE',
+  directMessageAutoReplyEnabled: false,
+  directMessageAutoReplyText: '',
 };
 
 type StoredPrivacySettings = PrivacySettingsDto & {
@@ -210,9 +212,14 @@ export class PrivacySettingsService {
   }
 
   private compactUpdate(input: UpdatePrivacySettingsDto) {
-    return Object.fromEntries(
+    const compact = Object.fromEntries(
       Object.entries(input).filter(([, value]) => value !== undefined),
     );
+    if (typeof compact.directMessageAutoReplyText === 'string') {
+      compact.directMessageAutoReplyText =
+        compact.directMessageAutoReplyText.trim();
+    }
+    return compact;
   }
 
   private assertValid(input: UpdatePrivacySettingsDto) {
@@ -252,6 +259,24 @@ export class PrivacySettingsService {
         errorCode: PrivacyErrorCode.InvitePermissionInvalid,
       });
     }
+    if (
+      input.directMessageAutoReplyEnabled !== undefined &&
+      typeof input.directMessageAutoReplyEnabled !== 'boolean'
+    ) {
+      throw new BadRequestException({
+        message: 'Invalid direct-message auto reply setting',
+      });
+    }
+    if (
+      input.directMessageAutoReplyText !== undefined &&
+      (typeof input.directMessageAutoReplyText !== 'string' ||
+        Array.from(input.directMessageAutoReplyText.trim()).length > 200)
+    ) {
+      throw new BadRequestException({
+        message:
+          'Direct-message auto reply text must be at most 200 characters',
+      });
+    }
   }
 
   private toDto(settings: StoredPrivacySettings): PrivacySettingsDto {
@@ -282,6 +307,12 @@ export class PrivacySettingsService {
       groupInvitePermission:
         settings.groupInvitePermission ??
         DEFAULT_PRIVACY_SETTINGS.groupInvitePermission,
+      directMessageAutoReplyEnabled:
+        settings.directMessageAutoReplyEnabled ??
+        DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyEnabled,
+      directMessageAutoReplyText:
+        settings.directMessageAutoReplyText ??
+        DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyText,
     };
   }
 }

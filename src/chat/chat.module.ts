@@ -21,6 +21,7 @@ import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { ChatService } from './chat.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
+import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 
 // PrismaService 与 SessionRevocationService 来自 @Global 模块(Prisma/Auth);
 // JwtModule 仿 RealtimeModule 各自注册(verify 用);敏感词/上传服务显式 import。
@@ -53,6 +54,7 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
     ChatBurnSweeperService,
     ChatPresenceRegistry,
     ChatSupportRechargeProcessor,
+    ChatDirectAutoReplyProcessor,
     CircleMemberLockService,
   ],
   exports: [

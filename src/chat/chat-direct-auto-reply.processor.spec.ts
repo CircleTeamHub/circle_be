@@ -1,0 +1,386 @@
+import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
+
+describe('ChatDirectAutoReplyProcessor', () => {
+  const createdAt = new Date('2026-09-04T05:00:00.000Z');
+  const source = (id = 'source-1') => ({
+    id,
+    conversationID: 'conv-1',
+    height: 4,
+    senderID: 'u1',
+    type: 'text',
+    content: { text: 'hello' },
+    clientMessageId: `client-${id}`,
+    replyToID: null,
+    deleted: false,
+    revokedAt: null,
+    createdAt,
+    conversation: { id: 'conv-1', type: 'DIRECT' },
+  });
+  const reply = {
+    id: 'reply-1',
+    conversationID: 'conv-1',
+    height: 5,
+    senderID: 'u2',
+    type: 'text',
+    content: { text: '稍后回复', autoReply: true },
+    clientMessageId: 'dm-auto:source-1:u2',
+    replyToID: null,
+    deleted: false,
+    revokedAt: null,
+    createdAt,
+  };
+
+  const prisma = {
+    chatDirectAutoReplyJob: {
+      create: jest.fn(),
+      findUnique: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
+      findMany: jest.fn(),
+      updateMany: jest.fn(),
+      update: jest.fn(),
+    },
+    chatMessage: { findUnique: jest.fn(), create: jest.fn() },
+    chatConversation: { update: jest.fn() },
+    chatMember: { findMany: jest.fn(), updateMany: jest.fn() },
+    chatDirectAutoReplyState: { findUnique: jest.fn(), upsert: jest.fn() },
+    userPrivacySetting: { findUnique: jest.fn() },
+    user: { findUnique: jest.fn() },
+    $queryRaw: jest.fn(),
+    $transaction: jest.fn(),
+  };
+  const broadcast = { emitMessage: jest.fn() };
+  const push = { onMessageBroadcast: jest.fn() };
+  let processor: ChatDirectAutoReplyProcessor;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$transaction.mockImplementation(async (callback: any) =>
+      callback(prisma),
+    );
+    prisma.chatDirectAutoReplyJob.findUnique.mockResolvedValue({ id: 'job-1' });
+    prisma.chatDirectAutoReplyJob.findUniqueOrThrow.mockResolvedValue({
+      sourceMessageID: 'source-1',
+      attempts: 1,
+    });
+    prisma.chatDirectAutoReplyJob.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatDirectAutoReplyJob.update.mockResolvedValue({});
+    prisma.chatMessage.findUnique.mockImplementation(async (args: any) =>
+      args.where.id ? source(args.where.id) : null,
+    );
+    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4, now: createdAt }]);
+    prisma.chatMember.findMany.mockResolvedValue([
+      { userID: 'u1' },
+      { userID: 'u2' },
+    ]);
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '  稍后回复  ',
+    });
+    prisma.chatDirectAutoReplyState.findUnique.mockResolvedValue(null);
+    prisma.chatMessage.create.mockResolvedValue(reply);
+    prisma.chatConversation.update.mockResolvedValue({});
+    prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
+    prisma.chatDirectAutoReplyState.upsert.mockResolvedValue({});
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'u2',
+      nickname: 'Responder',
+      avatarUrl: null,
+    });
+    broadcast.emitMessage.mockResolvedValue(undefined);
+    push.onMessageBroadcast.mockResolvedValue(undefined);
+    processor = new ChatDirectAutoReplyProcessor(
+      prisma as never,
+      broadcast as never,
+      push as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it.each([
+    [false, '稍后回复'],
+    [true, '   '],
+  ])(
+    'completes without replying when enabled=%s and text=%p',
+    async (enabled, text) => {
+      prisma.userPrivacySetting.findUnique.mockResolvedValue({
+        directMessageAutoReplyEnabled: enabled,
+        directMessageAutoReplyText: text,
+      });
+
+      await processor.processMessage('source-1');
+
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+      expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+        where: { id: 'job-1' },
+        data: expect.objectContaining({ status: 'COMPLETED', lockedAt: null }),
+      });
+      expect(broadcast.emitMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it('uses current active members to send a trimmed deterministic reply as the peer', async () => {
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith({
+      data: {
+        conversationID: 'conv-1',
+        height: 5,
+        senderID: 'u2',
+        type: 'text',
+        content: { text: '稍后回复', autoReply: true },
+        clientMessageId: 'dm-auto:source-1:u2',
+        replyToID: null,
+      },
+    });
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { nextHeight: 5, lastMessageAt: createdAt },
+    });
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', hiddenAt: { not: null } },
+      data: { hiddenAt: null },
+    });
+    expect(prisma.chatDirectAutoReplyState.upsert).toHaveBeenCalledWith({
+      where: {
+        conversationID_responderID: {
+          conversationID: 'conv-1',
+          responderID: 'u2',
+        },
+      },
+      create: {
+        conversationID: 'conv-1',
+        responderID: 'u2',
+        lastRepliedAt: createdAt,
+      },
+      update: { lastRepliedAt: createdAt },
+    });
+  });
+
+  it('does not duplicate a reply when its deterministic message already exists', async () => {
+    prisma.chatMessage.findUnique.mockImplementation(async (args: any) =>
+      args.where.id ? source(args.where.id) : reply,
+    );
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyState.upsert).not.toHaveBeenCalled();
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
+    expect(push.onMessageBroadcast).not.toHaveBeenCalled();
+  });
+
+  it('completes an accidentally queued server auto reply without creating a loop', async () => {
+    prisma.chatMessage.findUnique.mockImplementation(async (args: any) =>
+      args.where.id
+        ? {
+            ...source(args.where.id),
+            content: { text: '稍后回复', autoReply: true },
+          }
+        : null,
+    );
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({ status: 'COMPLETED' }),
+    });
+  });
+
+  it('suppresses a second reply inside the per-responder conversation cooldown', async () => {
+    prisma.chatDirectAutoReplyState.findUnique.mockResolvedValue({
+      lastRepliedAt: new Date(createdAt.getTime() - 29_000),
+    });
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyState.upsert).not.toHaveBeenCalled();
+  });
+
+  it('uses the database clock for cooldown decisions across app instances', async () => {
+    jest
+      .spyOn(Date, 'now')
+      .mockReturnValue(createdAt.getTime() + 24 * 60 * 60_000);
+    prisma.chatDirectAutoReplyState.findUnique.mockResolvedValue({
+      lastRepliedAt: new Date(createdAt.getTime() - 29_000),
+    });
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+  });
+
+  it('broadcasts and pushes only after the reply transaction commits', async () => {
+    const events: string[] = [];
+    prisma.$transaction.mockImplementation(async (callback: any) => {
+      const result = await callback(prisma);
+      events.push('commit');
+      return result;
+    });
+    broadcast.emitMessage.mockImplementation(async () => {
+      events.push('broadcast');
+    });
+    push.onMessageBroadcast.mockImplementation(async () => {
+      events.push('push');
+    });
+
+    await processor.processMessage('source-1');
+
+    expect(events).toEqual(['commit', 'broadcast', 'push']);
+    expect(broadcast.emitMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'reply-1',
+        conversationId: 'conv-1',
+        sender: { id: 'u2', nickname: 'Responder', avatarUrl: null },
+        content: { text: '稍后回复', autoReply: true },
+      }),
+    );
+  });
+
+  it('does not retry a committed reply when realtime delivery fails closed', async () => {
+    broadcast.emitMessage.mockRejectedValue(new Error('adapter offline'));
+
+    await expect(processor.processMessage('source-1')).resolves.toBeUndefined();
+
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({ status: 'COMPLETED' }),
+    });
+    expect(prisma.chatDirectAutoReplyJob.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'PENDING' }),
+      }),
+    );
+    expect(push.onMessageBroadcast).toHaveBeenCalled();
+  });
+
+  it('backs off failed work with a fixed redacted error category', async () => {
+    const now = Date.now();
+    jest.spyOn(Date, 'now').mockReturnValue(now);
+    const warn = jest
+      .spyOn((processor as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    prisma.$transaction.mockRejectedValue(
+      new Error('private body from user u1 with secret-token'),
+    );
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenLastCalledWith({
+      where: { id: 'job-1' },
+      data: {
+        status: 'PENDING',
+        lockedAt: null,
+        nextAttemptAt: new Date(now + 2_000),
+        lastError: 'PROCESSING_FAILED',
+      },
+    });
+    expect(
+      JSON.stringify(prisma.chatDirectAutoReplyJob.update.mock.calls),
+    ).not.toContain('secret-token');
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+      /private body|user u1|secret-token/,
+    );
+  });
+
+  it('dead-letters the fifth failed attempt instead of retrying forever', async () => {
+    prisma.chatDirectAutoReplyJob.findUniqueOrThrow.mockResolvedValue({
+      sourceMessageID: 'source-1',
+      attempts: 5,
+    });
+    prisma.$transaction.mockRejectedValue(new Error('database unavailable'));
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenLastCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({
+        status: 'FAILED',
+        lockedAt: null,
+        lastError: 'PROCESSING_FAILED',
+      }),
+    });
+  });
+
+  it('recovers stale processing jobs during the cron sweep', async () => {
+    prisma.chatDirectAutoReplyJob.findMany.mockResolvedValue([]);
+
+    await processor.sweep();
+
+    expect(prisma.chatDirectAutoReplyJob.updateMany).toHaveBeenCalledWith({
+      where: {
+        status: 'PROCESSING',
+        attempts: { lt: 5 },
+        lockedAt: { lt: expect.any(Date) },
+      },
+      data: {
+        status: 'PENDING',
+        lockedAt: null,
+        nextAttemptAt: expect.any(Date),
+      },
+    });
+  });
+
+  it('serializes concurrent jobs so only one reply wins the cooldown', async () => {
+    let transactionTail = Promise.resolve();
+    let lastRepliedAt: Date | null = null;
+    let replies = 0;
+    prisma.chatDirectAutoReplyJob.findUnique.mockImplementation(
+      async ({ where }: any) => ({ id: `job-${where.sourceMessageID}` }),
+    );
+    prisma.chatDirectAutoReplyJob.findUniqueOrThrow.mockImplementation(
+      async ({ where }: any) => ({
+        sourceMessageID: where.id.replace('job-', ''),
+        attempts: 1,
+      }),
+    );
+    prisma.chatDirectAutoReplyState.findUnique.mockImplementation(async () =>
+      lastRepliedAt ? { lastRepliedAt } : null,
+    );
+    prisma.chatDirectAutoReplyState.upsert.mockImplementation(
+      async ({ create }: any) => {
+        lastRepliedAt = create.lastRepliedAt;
+        return {};
+      },
+    );
+    prisma.chatMessage.create.mockImplementation(async ({ data }: any) => {
+      replies += 1;
+      return {
+        ...reply,
+        ...data,
+        id: `reply-${replies}`,
+        createdAt: new Date(),
+      };
+    });
+    prisma.$queryRaw.mockImplementation(async () => [
+      { nextHeight: 4, now: new Date() },
+    ]);
+    prisma.$transaction.mockImplementation((callback: any) => {
+      const run = transactionTail.then(() => callback(prisma));
+      transactionTail = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    });
+
+    await Promise.all([
+      processor.processMessage('source-a'),
+      processor.processMessage('source-b'),
+    ]);
+
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(
+      (prisma.$queryRaw.mock.calls[0][0] as TemplateStringsArray).join(' '),
+    ).toContain('FOR UPDATE');
+    expect(prisma.chatMessage.create).toHaveBeenCalledTimes(1);
+  });
+});

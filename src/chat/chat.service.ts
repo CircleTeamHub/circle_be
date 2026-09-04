@@ -381,6 +381,7 @@ export class ChatService {
           where: { id: effectivePayload.conversationId },
           data: { nextHeight: height, lastMessageAt: row.createdAt },
         });
+        await this.enqueueDirectAutoReplyInTx(tx, conversation, row);
         await this.enqueueRechargeAutomationInTx(
           tx,
           conversation,
@@ -514,6 +515,18 @@ export class ChatService {
       });
     }
     return { type: row.type, content: content as Record<string, unknown> };
+  }
+
+  /** 每条首次落库的普通 DIRECT 客户端消息都在同一事务写一个唯一任务。 */
+  private async enqueueDirectAutoReplyInTx(
+    tx: Prisma.TransactionClient,
+    conversation: ChatConversation,
+    message: Pick<ChatMessage, 'id'>,
+  ): Promise<void> {
+    if (conversation.type !== 'DIRECT') return;
+    await tx.chatDirectAutoReplyJob.create({
+      data: { sourceMessageID: message.id },
+    });
   }
 
   /**

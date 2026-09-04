@@ -32,6 +32,7 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
+import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 import { ChatService } from './chat.service';
 import {
   chatMetrics as defaultChatMetrics,
@@ -229,6 +230,7 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly configService: ConfigService,
     private readonly presence: ChatPresenceRegistry,
     private readonly supportRecharge: ChatSupportRechargeProcessor,
+    private readonly directAutoReply: ChatDirectAutoReplyProcessor,
   ) {
     const make = (
       name: keyof typeof CHAT_RATE_LIMITS,
@@ -1098,6 +1100,12 @@ export class ChatGateway implements OnModuleDestroy {
             }`,
           ),
         );
+      void this.directAutoReply.processMessage(result.message.id).catch(() =>
+        this.logger.warn({
+          event: 'direct_auto_reply_immediate_kick_failed',
+          category: 'PROCESSING_FAILED',
+        }),
+      );
     } catch (error) {
       this.metrics.observeEvent('send', 'failure');
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));
