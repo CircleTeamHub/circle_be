@@ -109,12 +109,21 @@ elif [ -e "$TOKEN_FILE" ] && [ ! -O "$TOKEN_FILE" ]; then
   exit 1
 else
   # Local development, or the very first sync: still replace atomically, just
-  # owned by the current user. The result is unsafe on a real host, so the
-  # success path below requires an explicit Docker Desktop opt-in.
+  # owned by the current user.
   install -m 600 "$temp_file" "$staged_file"
   mv -f "$staged_file" "$TOKEN_FILE"
-  owner_label="$(id -un)"
-  unprivileged=1
+  if [ "$(id -u)" = "$PROM_UID" ]; then
+    # The deploying user *is* the uid Prometheus runs as (rootless Podman, or a
+    # container deliberately run as the host user). Readability of a 0600 file
+    # is decided by its owner uid alone, so this is a complete sync — no
+    # privilege escalation and no override needed.
+    owner_label="$(id -un), uid $PROM_UID — the uid Prometheus runs as"
+  else
+    # The result is unsafe on a real host, so the success path below requires
+    # an explicit Docker Desktop opt-in.
+    owner_label="$(id -un)"
+    unprivileged=1
+  fi
 fi
 
 echo "✅ wrote $TOKEN_FILE (0600, owned by $owner_label)"
@@ -122,11 +131,12 @@ echo "✅ wrote $TOKEN_FILE (0600, owned by $owner_label)"
 if [ "$unprivileged" = "1" ]; then
   echo "⚠️  Prometheus runs as uid $PROM_UID and cannot read a 0600 file owned by"
   echo "    $(id -un). Configure passwordless sudo for install and mv, or run this script as root."
-  echo "⚠️  保留 ${METRICS_SYNC_MARKER}；修复权限后重新运行本脚本。"
   if [ "${ALLOW_UNPRIVILEGED_METRICS_TOKEN:-0}" = "1" ]; then
     echo "⚠️  ALLOW_UNPRIVILEGED_METRICS_TOKEN=1; assuming a local Docker user mapping."
+    echo "⚠️  ${METRICS_SYNC_MARKER} is intentionally retained; the override is not persisted, so pass ALLOW_UNPRIVILEGED_METRICS_TOKEN=1 again on every rotation."
     exit 0
   fi
+  echo "⚠️  保留 ${METRICS_SYNC_MARKER}；修复权限后重新运行本脚本。"
   echo "❌ Refusing to report a successful sync while Prometheus cannot read the token." >&2
   echo "   For Docker Desktop local development only, explicitly set:" >&2
   echo "     ALLOW_UNPRIVILEGED_METRICS_TOKEN=1" >&2
