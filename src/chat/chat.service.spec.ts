@@ -912,6 +912,19 @@ describe('ChatService', () => {
       });
     });
 
+    it('rejects the server-reserved autoReply marker from client content', async () => {
+      await expect(
+        service.sendMessage(
+          'u1',
+          sendPayload({ content: { text: 'hello', autoReply: true } }),
+        ),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+      expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+    });
+
     it('rejects media payloads that carry URLs instead of object keys', async () => {
       await expect(
         service.sendMessage(

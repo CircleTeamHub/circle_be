@@ -3,6 +3,7 @@ import { CronExpression } from '@nestjs/schedule';
 import type { ChatMessage, Prisma } from 'src/generated/prisma';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import type { ChatMessageDto } from './chat.types';
@@ -146,10 +147,8 @@ export class ChatDirectAutoReplyProcessor {
       const message = source as SourceMessage;
 
       // Serialize all jobs for one conversation before reading members/cooldown.
-      const counter = await tx.$queryRaw<
-        Array<{ nextHeight: number; now: Date }>
-      >`
-        SELECT "nextHeight", CURRENT_TIMESTAMP AS "now" FROM "ChatConversation"
+      const counter = await tx.$queryRaw<Array<{ nextHeight: number }>>`
+        SELECT "nextHeight" FROM "ChatConversation"
         WHERE "id" = ${message.conversationID} FOR UPDATE`;
       if (counter.length === 0) {
         await this.completeJob(tx, jobId);
@@ -171,6 +170,51 @@ export class ChatDirectAutoReplyProcessor {
         return null;
       }
       const responderID = responders[0].userID;
+
+      // Block/unblock and privacy updates use these same stable-order locks.
+      // Holding the conversation row lock at the same time keeps membership and
+      // authorization fixed through the reply insert.
+      await lockUserRelationshipState(tx, [message.senderID, responderID]);
+      const currentSeats = await tx.chatMember.findMany({
+        where: { conversationID: message.conversationID, leftAt: null },
+        select: { userID: true },
+      });
+      if (
+        currentSeats.length !== 2 ||
+        !currentSeats.some((seat) => seat.userID === message.senderID) ||
+        !currentSeats.some((seat) => seat.userID === responderID)
+      ) {
+        await this.completeJob(tx, jobId);
+        return null;
+      }
+      const blocked = await tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: message.senderID, blockedID: responderID },
+            { blockerID: responderID, blockedID: message.senderID },
+          ],
+        },
+        select: { id: true },
+      });
+      if (blocked) {
+        await this.completeJob(tx, jobId);
+        return null;
+      }
+      const respondersByStatus = await tx.$queryRaw<
+        Array<{
+          id: string;
+          nickname: string;
+          avatarUrl: string | null;
+          status: string;
+        }>
+      >`
+        SELECT "id", "nickname", "avatarUrl", "status"
+        FROM "User" WHERE "id" = ${responderID} FOR UPDATE`;
+      const responder = respondersByStatus[0];
+      if (!responder || responder.status !== 'ACTIVE') {
+        await this.completeJob(tx, jobId);
+        return null;
+      }
 
       const settings = await tx.userPrivacySetting.findUnique({
         where: { userID: responderID },
@@ -209,10 +253,13 @@ export class ChatDirectAutoReplyProcessor {
         },
         select: { lastRepliedAt: true },
       });
+      const clock = await tx.$queryRaw<Array<{ now: Date }>>`
+        SELECT clock_timestamp() AS "now"`;
+      if (clock.length === 0) throw new Error('database clock unavailable');
+      const now = clock[0].now;
       if (
         state &&
-        counter[0].now.getTime() - state.lastRepliedAt.getTime() <
-          AUTO_REPLY_COOLDOWN_MS
+        now.getTime() - state.lastRepliedAt.getTime() < AUTO_REPLY_COOLDOWN_MS
       ) {
         await this.completeJob(tx, jobId);
         return null;
@@ -229,11 +276,12 @@ export class ChatDirectAutoReplyProcessor {
           content: content as Prisma.InputJsonObject,
           clientMessageId,
           replyToID: null,
+          createdAt: now,
         },
       });
       await tx.chatConversation.update({
         where: { id: message.conversationID },
-        data: { nextHeight: height, lastMessageAt: created.createdAt },
+        data: { nextHeight: height, lastMessageAt: now },
       });
       await tx.chatMember.updateMany({
         where: {
@@ -252,13 +300,9 @@ export class ChatDirectAutoReplyProcessor {
         create: {
           conversationID: message.conversationID,
           responderID,
-          lastRepliedAt: created.createdAt,
+          lastRepliedAt: now,
         },
-        update: { lastRepliedAt: created.createdAt },
-      });
-      const sender = await tx.user.findUnique({
-        where: { id: responderID },
-        select: { id: true, nickname: true, avatarUrl: true },
+        update: { lastRepliedAt: now },
       });
       await this.completeJob(tx, jobId);
       return {
@@ -267,7 +311,11 @@ export class ChatDirectAutoReplyProcessor {
         height: created.height,
         type: created.type,
         content,
-        sender,
+        sender: {
+          id: responder.id,
+          nickname: responder.nickname,
+          avatarUrl: responder.avatarUrl,
+        },
         replyToId: null,
         d: created.clientMessageId,
         createdAt: created.createdAt.toISOString(),

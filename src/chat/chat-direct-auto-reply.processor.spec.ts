@@ -42,10 +42,12 @@ describe('ChatDirectAutoReplyProcessor', () => {
     chatMessage: { findUnique: jest.fn(), create: jest.fn() },
     chatConversation: { update: jest.fn() },
     chatMember: { findMany: jest.fn(), updateMany: jest.fn() },
+    block: { findFirst: jest.fn() },
     chatDirectAutoReplyState: { findUnique: jest.fn(), upsert: jest.fn() },
     userPrivacySetting: { findUnique: jest.fn() },
     user: { findUnique: jest.fn() },
     $queryRaw: jest.fn(),
+    $executeRaw: jest.fn(),
     $transaction: jest.fn(),
   };
   const broadcast = { emitMessage: jest.fn() };
@@ -67,11 +69,29 @@ describe('ChatDirectAutoReplyProcessor', () => {
     prisma.chatMessage.findUnique.mockImplementation(async (args: any) =>
       args.where.id ? source(args.where.id) : null,
     );
-    prisma.$queryRaw.mockResolvedValue([{ nextHeight: 4, now: createdAt }]);
+    prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray) => {
+      const sql = query.join(' ');
+      if (sql.includes('FROM "ChatConversation"')) {
+        return [{ nextHeight: 4 }];
+      }
+      if (sql.includes('FROM "User"')) {
+        return [
+          {
+            id: 'u2',
+            nickname: 'Responder',
+            avatarUrl: null,
+            status: 'ACTIVE',
+          },
+        ];
+      }
+      return [{ now: createdAt }];
+    });
     prisma.chatMember.findMany.mockResolvedValue([
       { userID: 'u1' },
       { userID: 'u2' },
     ]);
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.$executeRaw.mockResolvedValue(1);
     prisma.userPrivacySetting.findUnique.mockResolvedValue({
       directMessageAutoReplyEnabled: true,
       directMessageAutoReplyText: '  稍后回复  ',
@@ -85,6 +105,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
       id: 'u2',
       nickname: 'Responder',
       avatarUrl: null,
+      status: 'ACTIVE',
     });
     broadcast.emitMessage.mockResolvedValue(undefined);
     push.onMessageBroadcast.mockResolvedValue(undefined);
@@ -135,6 +156,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
         content: { text: '稍后回复', autoReply: true },
         clientMessageId: 'dm-auto:source-1:u2',
         replyToID: null,
+        createdAt,
       },
     });
     expect(prisma.chatConversation.update).toHaveBeenCalledWith({
@@ -159,6 +181,85 @@ describe('ChatDirectAutoReplyProcessor', () => {
       },
       update: { lastRepliedAt: createdAt },
     });
+  });
+
+  it('serializes with relationship changes and skips a reply after either user blocks', async () => {
+    prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    expect(prisma.$executeRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      prisma.block.findFirst.mock.invocationCallOrder[0],
+    );
+    expect(prisma.block.findFirst).toHaveBeenCalledWith({
+      where: {
+        OR: [
+          { blockerID: 'u1', blockedID: 'u2' },
+          { blockerID: 'u2', blockedID: 'u1' },
+        ],
+      },
+      select: { id: true },
+    });
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
+    expect(push.onMessageBroadcast).not.toHaveBeenCalled();
+  });
+
+  it('skips a reply when the responder account is no longer active', async () => {
+    prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray) => {
+      const sql = query.join(' ');
+      if (sql.includes('FROM "ChatConversation"')) {
+        return [{ nextHeight: 4 }];
+      }
+      if (sql.includes('FROM "User"')) {
+        return [
+          {
+            id: 'u2',
+            nickname: 'Responder',
+            avatarUrl: null,
+            status: 'BANNED',
+          },
+        ];
+      }
+      return [{ now: createdAt }];
+    });
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
+    expect(push.onMessageBroadcast).not.toHaveBeenCalled();
+  });
+
+  it('locks the responder user row so a concurrent ban is serialized', async () => {
+    prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray) => {
+      const sql = query.join(' ');
+      if (sql.includes('FROM "ChatConversation"')) {
+        return [{ nextHeight: 4 }];
+      }
+      if (sql.includes('FROM "User"')) {
+        return [
+          {
+            id: 'u2',
+            nickname: 'Responder',
+            avatarUrl: null,
+            status: 'BANNED',
+          },
+        ];
+      }
+      return [{ now: createdAt }];
+    });
+
+    await processor.processMessage('source-1');
+
+    expect(
+      prisma.$queryRaw.mock.calls.some(([query]) => {
+        const sql = (query as TemplateStringsArray).join(' ');
+        return sql.includes('FROM "User"') && sql.includes('FOR UPDATE');
+      }),
+    ).toBe(true);
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
   });
 
   it('does not duplicate a reply when its deterministic message already exists', async () => {
@@ -216,6 +317,39 @@ describe('ChatDirectAutoReplyProcessor', () => {
     await processor.processMessage('source-1');
 
     expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+  });
+
+  it('records reply and cooldown timestamps from a post-lock database clock', async () => {
+    const transactionStartedAt = new Date('2026-09-04T05:00:00.000Z');
+    const lockAcquiredAt = new Date('2026-09-04T05:01:00.000Z');
+    prisma.$queryRaw
+      .mockResolvedValueOnce([{ nextHeight: 4, now: transactionStartedAt }])
+      .mockResolvedValueOnce([
+        {
+          id: 'u2',
+          nickname: 'Responder',
+          avatarUrl: null,
+          status: 'ACTIVE',
+        },
+      ])
+      .mockResolvedValueOnce([{ now: lockAcquiredAt }]);
+    prisma.chatMessage.create.mockImplementation(async ({ data }: any) => ({
+      ...reply,
+      ...data,
+    }));
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(3);
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ createdAt: lockAcquiredAt }),
+    });
+    expect(prisma.chatDirectAutoReplyState.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ lastRepliedAt: lockAcquiredAt }),
+        update: { lastRepliedAt: lockAcquiredAt },
+      }),
+    );
   });
 
   it('broadcasts and pushes only after the reply transaction commits', async () => {
@@ -360,9 +494,23 @@ describe('ChatDirectAutoReplyProcessor', () => {
         createdAt: new Date(),
       };
     });
-    prisma.$queryRaw.mockImplementation(async () => [
-      { nextHeight: 4, now: new Date() },
-    ]);
+    prisma.$queryRaw.mockImplementation(async (query: TemplateStringsArray) => {
+      const sql = query.join(' ');
+      if (sql.includes('FROM "ChatConversation"')) {
+        return [{ nextHeight: 4 }];
+      }
+      if (sql.includes('FROM "User"')) {
+        return [
+          {
+            id: 'u2',
+            nickname: 'Responder',
+            avatarUrl: null,
+            status: 'ACTIVE',
+          },
+        ];
+      }
+      return [{ now: new Date() }];
+    });
     prisma.$transaction.mockImplementation((callback: any) => {
       const run = transactionTail.then(() => callback(prisma));
       transactionTail = run.then(
@@ -377,10 +525,14 @@ describe('ChatDirectAutoReplyProcessor', () => {
       processor.processMessage('source-b'),
     ]);
 
-    expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(6);
     expect(
-      (prisma.$queryRaw.mock.calls[0][0] as TemplateStringsArray).join(' '),
-    ).toContain('FOR UPDATE');
+      prisma.$queryRaw.mock.calls.filter(([query]) =>
+        (query as TemplateStringsArray)
+          .join(' ')
+          .includes('FROM "ChatConversation"'),
+      ),
+    ).toHaveLength(2);
     expect(prisma.chatMessage.create).toHaveBeenCalledTimes(1);
   });
 });

@@ -151,6 +151,12 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
+    if (Object.prototype.hasOwnProperty.call(payload.content, 'autoReply')) {
+      throw new BadRequestException({
+        message: 'autoReply 是服务端保留字段',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
     if (
       payload.replyToId !== undefined &&
       typeof payload.replyToId !== 'string'
