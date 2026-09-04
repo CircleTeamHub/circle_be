@@ -1,6 +1,8 @@
 import { LoggerService } from '@nestjs/common';
 import { getRequestContext } from './request-context';
 
+const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+
 export interface ExternalCallFailurePayload {
   enabled: boolean;
   service: string;
@@ -18,10 +20,9 @@ function getSafeErrorMessage(error: unknown): string {
     return 'External service call failed';
   }
 
-  return error.message.replace(
-    /(token|secret|password|authorization)=\S+/gi,
-    '$1=[redacted]',
-  );
+  return error.message
+    .replace(/(token|secret|password|authorization)=\S+/gi, '$1=[redacted]')
+    .replace(EMAIL_PATTERN, '[redacted-email]');
 }
 
 export function logExternalCallFailure(

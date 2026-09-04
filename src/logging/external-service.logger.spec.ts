@@ -26,4 +26,23 @@ describe('logExternalCallFailure', () => {
       'token=secret',
     );
   });
+
+  it('redacts recipient addresses echoed by external services', () => {
+    const logger = { warn: jest.fn() };
+
+    logExternalCallFailure(logger as any, {
+      enabled: true,
+      service: 'smtp',
+      operation: 'send_verification_code',
+      error: new Error(
+        '550 5.1.1 <private.user@example.com>: Recipient address rejected',
+      ),
+    });
+
+    const loggedPayload = logger.warn.mock.calls[0]?.[0];
+    expect(loggedPayload.message).toContain('[redacted-email]');
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(
+      'private.user@example.com',
+    );
+  });
 });
