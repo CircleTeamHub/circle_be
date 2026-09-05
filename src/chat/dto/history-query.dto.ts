@@ -10,7 +10,10 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-import { CLIENT_MESSAGE_TYPES, HISTORY_PAGE_MAX } from '../chat.constants';
+import {
+  HISTORY_FILTER_MESSAGE_TYPES,
+  HISTORY_PAGE_MAX,
+} from '../chat.constants';
 
 export class HistoryQueryDto {
   @ApiPropertyOptional({ description: '取该 height 之前的消息(键集分页游标)' })
@@ -49,7 +52,7 @@ export class HistoryQueryDto {
       ? value.split(',').filter((v: string) => v.length > 0)
       : value,
   )
-  @IsIn(CLIENT_MESSAGE_TYPES, { each: true })
+  @IsIn(HISTORY_FILTER_MESSAGE_TYPES, { each: true })
   types?: string[];
 
   @ApiPropertyOptional({ description: '文本关键词(content.text 包含匹配)' })
