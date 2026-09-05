@@ -58,7 +58,7 @@ export class ChatPushService {
   private async dispatch(message: ChatMessageDto): Promise<void> {
     const senderId = message.sender?.id ?? null;
     const [seats, conversation, onlineIds] = await Promise.all([
-      this.listSeats(message.conversationId, senderId),
+      this.listSeats(message.conversationId, senderId, message.height),
       this.prisma.chatConversation.findUnique({
         where: { id: message.conversationId },
         select: {
@@ -135,11 +135,15 @@ export class ChatPushService {
   private async listSeats(
     conversationId: string,
     senderId: string | null,
+    messageHeight: number,
   ): Promise<Array<{ userID: string; muted: boolean }>> {
     const seats = await this.prisma.chatMember.findMany({
       where: {
         conversationID: conversationId,
         leftAt: null,
+        // Push previews carry message content and cannot rely on a client-side
+        // watermark to discard a delayed delivery after history was cleared.
+        clearedBeforeHeight: { lt: messageHeight },
         ...(senderId ? { userID: { not: senderId } } : {}),
       },
       select: { userID: true, muted: true },

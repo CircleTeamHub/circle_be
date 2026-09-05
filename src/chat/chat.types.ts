@@ -109,6 +109,7 @@ export interface ChatEditPayload {
 export interface ChatEditBroadcast {
   conversationId: string;
   messageId: string;
+  height: number;
   content: Record<string, unknown>;
   editedAt: string;
 }

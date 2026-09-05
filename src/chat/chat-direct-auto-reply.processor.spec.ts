@@ -1,3 +1,4 @@
+import * as trackedCron from 'src/metrics/tracked-cron.decorator';
 import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 
 describe('ChatDirectAutoReplyProcessor', () => {
@@ -46,6 +47,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
     block: { findFirst: jest.fn() },
     chatDirectAutoReplyState: {
       deleteMany: jest.fn(),
+      findMany: jest.fn(),
       findUnique: jest.fn(),
       upsert: jest.fn(),
     },
@@ -486,20 +488,110 @@ describe('ChatDirectAutoReplyProcessor', () => {
 
   it('cleans up expired terminal jobs and stale cooldown state', async () => {
     const now = new Date('2026-09-20T00:00:00.000Z');
+    prisma.chatDirectAutoReplyJob.findMany.mockResolvedValue([{ id: 'job-1' }]);
+    prisma.chatDirectAutoReplyState.findMany.mockResolvedValue([
+      { id: 'state-1' },
+    ]);
     prisma.chatDirectAutoReplyJob.deleteMany.mockResolvedValue({ count: 4 });
     prisma.chatDirectAutoReplyState.deleteMany.mockResolvedValue({ count: 2 });
 
     await processor.cleanupExpired(now);
 
-    expect(prisma.chatDirectAutoReplyJob.deleteMany).toHaveBeenCalledWith({
+    expect(prisma.chatDirectAutoReplyJob.findMany).toHaveBeenCalledWith({
       where: {
         status: { in: ['COMPLETED', 'FAILED'] },
         updatedAt: { lt: new Date('2026-09-13T00:00:00.000Z') },
       },
+      orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+      take: 1000,
+      select: { id: true },
+    });
+    expect(prisma.chatDirectAutoReplyJob.deleteMany).toHaveBeenCalledWith({
+      where: {
+        id: { in: ['job-1'] },
+        status: { in: ['COMPLETED', 'FAILED'] },
+        updatedAt: { lt: new Date('2026-09-13T00:00:00.000Z') },
+      },
+    });
+    expect(prisma.chatDirectAutoReplyState.findMany).toHaveBeenCalledWith({
+      where: { updatedAt: { lt: new Date('2026-09-19T00:00:00.000Z') } },
+      orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+      take: 1000,
+      select: { id: true },
     });
     expect(prisma.chatDirectAutoReplyState.deleteMany).toHaveBeenCalledWith({
-      where: { updatedAt: { lt: new Date('2026-09-19T00:00:00.000Z') } },
+      where: {
+        id: { in: ['state-1'] },
+        updatedAt: { lt: new Date('2026-09-19T00:00:00.000Z') },
+      },
     });
+  });
+
+  it('splits retention cleanup into bounded delete batches', async () => {
+    const fullBatch = Array.from({ length: 1000 }, (_, index) => ({
+      id: `job-${index}`,
+    }));
+    prisma.chatDirectAutoReplyJob.findMany
+      .mockResolvedValueOnce(fullBatch)
+      .mockResolvedValueOnce([{ id: 'job-final' }]);
+    prisma.chatDirectAutoReplyState.findMany.mockResolvedValue([]);
+    prisma.chatDirectAutoReplyJob.deleteMany.mockResolvedValue({ count: 1000 });
+
+    await processor.cleanupExpired(new Date('2026-09-20T00:00:00.000Z'));
+
+    expect(prisma.chatDirectAutoReplyJob.findMany).toHaveBeenCalledTimes(2);
+    expect(prisma.chatDirectAutoReplyJob.deleteMany).toHaveBeenCalledTimes(2);
+    expect(prisma.chatDirectAutoReplyJob.deleteMany).toHaveBeenLastCalledWith({
+      where: {
+        id: { in: ['job-final'] },
+        status: { in: ['COMPLETED', 'FAILED'] },
+        updatedAt: { lt: new Date('2026-09-13T00:00:00.000Z') },
+      },
+    });
+  });
+
+  it('reports an overlapping cleanup as skipped without refreshing its heartbeat', async () => {
+    const skipped = jest.spyOn(trackedCron, 'reportJobSkipped');
+    let releaseFirst!: () => void;
+    prisma.chatDirectAutoReplyJob.findMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () => resolve([]);
+        }),
+    );
+
+    const first = processor.cleanupExpired(
+      new Date('2026-09-20T00:00:00.000Z'),
+    );
+    await Promise.resolve();
+    await processor.cleanupExpired(new Date('2026-09-20T00:00:01.000Z'));
+
+    expect(skipped).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await first;
+    skipped.mockRestore();
+  });
+
+  it('reports an overlapping job sweep as skipped without refreshing its heartbeat', async () => {
+    const skipped = jest.spyOn(trackedCron, 'reportJobSkipped');
+    let releaseFirst!: () => void;
+    prisma.chatDirectAutoReplyJob.updateMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = () => resolve({ count: 0 });
+        }),
+    );
+
+    const first = processor.sweep();
+    await Promise.resolve();
+    await processor.sweep();
+
+    expect(skipped).toHaveBeenCalledTimes(1);
+
+    releaseFirst();
+    await first;
+    skipped.mockRestore();
   });
 
   it('serializes concurrent jobs so only one reply wins the cooldown', async () => {

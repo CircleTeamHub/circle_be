@@ -286,6 +286,9 @@ export class ChatBroadcastService {
       where: {
         conversationID: payload.conversationId,
         leftAt: null,
+        // A delayed post-commit broadcast must not replay content below a
+        // member's already-committed clear watermark.
+        clearedBeforeHeight: { lt: payload.height },
       },
       select: { userID: true },
     });

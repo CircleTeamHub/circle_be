@@ -6,6 +6,7 @@ function message(conversationId = 'conv-1') {
   return {
     id: 'message-1',
     conversationId,
+    height: 5,
     type: 'system',
     content: { kind: 'member-removed' },
   } as never;
@@ -177,6 +178,7 @@ describe('ChatBroadcastService member eviction', () => {
       where: {
         conversationID: 'conv-1',
         leftAt: null,
+        clearedBeforeHeight: { lt: 5 },
       },
       select: { userID: true },
     });
@@ -199,7 +201,11 @@ describe('ChatBroadcastService member eviction', () => {
     await service.emitMessage(message());
 
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
-      where: { conversationID: 'conv-1', leftAt: null },
+      where: {
+        conversationID: 'conv-1',
+        leftAt: null,
+        clearedBeforeHeight: { lt: 5 },
+      },
       select: { userID: true },
     });
     expect(to).toHaveBeenCalledWith(['u:ready-user']);
@@ -227,7 +233,11 @@ describe('ChatBroadcastService member eviction', () => {
 
     expect(presence.getOnlineUserIds).not.toHaveBeenCalled();
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
-      where: { conversationID: 'direct-or-temp', leftAt: null },
+      where: {
+        conversationID: 'direct-or-temp',
+        leftAt: null,
+        clearedBeforeHeight: { lt: 5 },
+      },
       select: { userID: true },
     });
     expect(to).toHaveBeenCalledWith(['u:direct-member', 'u:temp-guest']);
@@ -408,12 +418,17 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
     await service.emitEdit({
       conversationId: 'conv-1',
       messageId: 'message-1',
+      height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
     });
 
     expect(findMany).toHaveBeenCalledWith({
-      where: { conversationID: 'conv-1', leftAt: null },
+      where: {
+        conversationID: 'conv-1',
+        leftAt: null,
+        clearedBeforeHeight: { lt: 5 },
+      },
       select: { userID: true },
     });
     expect(to).toHaveBeenCalledWith(['u:registered-user', 'u:late-user']);
@@ -454,6 +469,7 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
     await service.emitEdit({
       conversationId: 'conv-1',
       messageId: 'message-1',
+      height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
     });

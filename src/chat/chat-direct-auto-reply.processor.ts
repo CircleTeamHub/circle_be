@@ -1,7 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import type { ChatMessage, Prisma } from 'src/generated/prisma';
-import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
+import {
+  reportJobSkipped,
+  TrackedCron,
+} from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
@@ -18,6 +21,7 @@ const AUTO_REPLY_COOLDOWN_MS = 30_000;
 const PROCESSING_FAILED = 'PROCESSING_FAILED';
 const TERMINAL_JOB_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const COOLDOWN_STATE_RETENTION_MS = 24 * 60 * 60_000;
+const CLEANUP_BATCH = 1000;
 
 type SourceMessage = ChatMessage & {
   conversation: { id: string; type: string };
@@ -28,6 +32,7 @@ type SourceMessage = ChatMessage & {
 export class ChatDirectAutoReplyProcessor {
   private readonly logger = new Logger(ChatDirectAutoReplyProcessor.name);
   private sweeping = false;
+  private cleaning = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -47,7 +52,10 @@ export class ChatDirectAutoReplyProcessor {
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_direct_auto_reply_jobs')
   async sweep(): Promise<void> {
-    if (this.sweeping) return;
+    if (this.sweeping) {
+      reportJobSkipped();
+      return;
+    }
     this.sweeping = true;
     try {
       const now = new Date();
@@ -93,21 +101,60 @@ export class ChatDirectAutoReplyProcessor {
     'chat_direct_auto_reply_cleanup',
   )
   async cleanupExpired(now = new Date()): Promise<void> {
-    await this.prisma.chatDirectAutoReplyJob.deleteMany({
-      where: {
-        status: { in: ['COMPLETED', 'FAILED'] },
-        updatedAt: {
-          lt: new Date(now.getTime() - TERMINAL_JOB_RETENTION_MS),
-        },
-      },
-    });
-    await this.prisma.chatDirectAutoReplyState.deleteMany({
-      where: {
-        updatedAt: {
-          lt: new Date(now.getTime() - COOLDOWN_STATE_RETENTION_MS),
-        },
-      },
-    });
+    if (this.cleaning) {
+      reportJobSkipped();
+      return;
+    }
+    this.cleaning = true;
+    try {
+      const terminalCutoff = new Date(
+        now.getTime() - TERMINAL_JOB_RETENTION_MS,
+      );
+      let jobsBatchSize = 0;
+      do {
+        const jobs = await this.prisma.chatDirectAutoReplyJob.findMany({
+          where: {
+            status: { in: ['COMPLETED', 'FAILED'] },
+            updatedAt: { lt: terminalCutoff },
+          },
+          orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+          take: CLEANUP_BATCH,
+          select: { id: true },
+        });
+        jobsBatchSize = jobs.length;
+        if (jobsBatchSize > 0) {
+          await this.prisma.chatDirectAutoReplyJob.deleteMany({
+            where: {
+              id: { in: jobs.map((job) => job.id) },
+              status: { in: ['COMPLETED', 'FAILED'] },
+              updatedAt: { lt: terminalCutoff },
+            },
+          });
+        }
+      } while (jobsBatchSize === CLEANUP_BATCH);
+
+      const stateCutoff = new Date(now.getTime() - COOLDOWN_STATE_RETENTION_MS);
+      let statesBatchSize = 0;
+      do {
+        const states = await this.prisma.chatDirectAutoReplyState.findMany({
+          where: { updatedAt: { lt: stateCutoff } },
+          orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }],
+          take: CLEANUP_BATCH,
+          select: { id: true },
+        });
+        statesBatchSize = states.length;
+        if (statesBatchSize > 0) {
+          await this.prisma.chatDirectAutoReplyState.deleteMany({
+            where: {
+              id: { in: states.map((state) => state.id) },
+              updatedAt: { lt: stateCutoff },
+            },
+          });
+        }
+      } while (statesBatchSize === CLEANUP_BATCH);
+    } finally {
+      this.cleaning = false;
+    }
   }
 
   private async processJob(jobId: string): Promise<void> {

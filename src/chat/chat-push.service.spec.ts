@@ -92,7 +92,10 @@ describe('ChatPushService', () => {
 
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ userID: { not: 'u-sender' } }),
+        where: expect.objectContaining({
+          userID: { not: 'u-sender' },
+          clearedBeforeHeight: { lt: 5 },
+        }),
       }),
     );
     expect(push.listActiveTokens).toHaveBeenCalledWith('u-peer');

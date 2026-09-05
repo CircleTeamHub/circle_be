@@ -2920,6 +2920,53 @@ describe('ChatService', () => {
       expect(broadcast.emitHistoryCleared).toHaveBeenCalledTimes(1);
     });
 
+    it('keeps an explicit zero target pinned when a newer message arrives before retry', async () => {
+      prisma.$queryRaw
+        .mockResolvedValueOnce([
+          {
+            id: 'conv-1',
+            type: 'DIRECT',
+            circleID: null,
+            ownerID: null,
+            nextHeight: 0,
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            id: 'conv-1',
+            type: 'DIRECT',
+            circleID: null,
+            ownerID: null,
+            nextHeight: 1,
+          },
+        ]);
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+          },
+        }),
+      );
+
+      await expect(
+        service.clearHistory('u1', 'conv-1', true, 0),
+      ).resolves.toEqual({ clearedBeforeHeight: 0 });
+      await expect(
+        service.clearHistory('u1', 'conv-1', true, 0),
+      ).resolves.toEqual({ clearedBeforeHeight: 0 });
+
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+    });
+
     it('keeps direct-chat clearing personal unless explicitly requested', async () => {
       mockClearLock({ type: 'DIRECT' });
       prisma.chatMember.findUnique.mockResolvedValue(

@@ -27,4 +27,21 @@ describe('direct auto reply data lifecycle migration', () => {
       'FOREIGN KEY ("responderID") REFERENCES "User"("id") ON DELETE CASCADE',
     );
   });
+
+  it('indexes both retention cleanup scans', () => {
+    const schema = readFileSync('prisma/schema.prisma', 'utf8');
+    const migration = readFileSync(
+      'prisma/migrations/20260904050000_add_direct_auto_reply/migration.sql',
+      'utf8',
+    );
+
+    expect(schema).toMatch(/@@index\(\[status, updatedAt\]\)/);
+    expect(schema).toMatch(/@@index\(\[updatedAt\]\)/);
+    expect(migration).toContain(
+      'CREATE INDEX "ChatDirectAutoReplyJob_status_updatedAt_idx"',
+    );
+    expect(migration).toContain(
+      'CREATE INDEX "ChatDirectAutoReplyState_updatedAt_idx"',
+    );
+  });
 });

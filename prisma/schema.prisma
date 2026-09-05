@@ -2151,6 +2151,7 @@ model ChatDirectAutoReplyJob {
   sourceMessage ChatMessage @relation("directAutoReplySource", fields: [sourceMessageID], references: [id], onDelete: Cascade)
 
   @@index([status, nextAttemptAt, createdAt])
+  @@index([status, updatedAt])
 }
 
 /// 同一回复者在同一 DIRECT 会话的持久化冷却水位。
@@ -2167,6 +2168,7 @@ model ChatDirectAutoReplyState {
 
   @@unique([conversationID, responderID])
   @@index([responderID, lastRepliedAt])
+  @@index([updatedAt])
 }
 
 model ChatMediaReference {

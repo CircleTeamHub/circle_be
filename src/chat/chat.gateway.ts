@@ -1269,6 +1269,7 @@ export class ChatGateway implements OnModuleDestroy {
         await this.broadcast.emitEdit({
           conversationId,
           messageId,
+          height: dto.height,
           content: dto.content,
           editedAt: dto.editedAt ?? new Date().toISOString(),
         });
