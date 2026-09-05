@@ -2,6 +2,7 @@ import { Prisma } from 'src/generated/prisma';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
   MOMENTS_VISIBILITY_OPTIONS,
@@ -29,6 +30,8 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   addMeByGroup: true,
   callPermission: 'EVERYONE',
   groupInvitePermission: 'EVERYONE',
+  directMessageAutoReplyEnabled: false,
+  directMessageAutoReplyText: '',
 };
 
 type StoredPrivacySettings = PrivacySettingsDto & {
@@ -42,7 +45,10 @@ type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
 
 @Injectable()
 export class PrivacySettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sensitiveWords: SensitiveWordService,
+  ) {}
 
   /**
    * `client` 默认走 this.prisma。需要与一次授权判定串行的调用方必须在共享
@@ -210,9 +216,14 @@ export class PrivacySettingsService {
   }
 
   private compactUpdate(input: UpdatePrivacySettingsDto) {
-    return Object.fromEntries(
+    const compact = Object.fromEntries(
       Object.entries(input).filter(([, value]) => value !== undefined),
     );
+    if (typeof compact.directMessageAutoReplyText === 'string') {
+      compact.directMessageAutoReplyText =
+        compact.directMessageAutoReplyText.trim();
+    }
+    return compact;
   }
 
   private assertValid(input: UpdatePrivacySettingsDto) {
@@ -252,6 +263,30 @@ export class PrivacySettingsService {
         errorCode: PrivacyErrorCode.InvitePermissionInvalid,
       });
     }
+    if (
+      input.directMessageAutoReplyEnabled !== undefined &&
+      typeof input.directMessageAutoReplyEnabled !== 'boolean'
+    ) {
+      throw new BadRequestException({
+        message: 'Invalid direct-message auto reply setting',
+      });
+    }
+    if (
+      input.directMessageAutoReplyText !== undefined &&
+      (typeof input.directMessageAutoReplyText !== 'string' ||
+        Array.from(input.directMessageAutoReplyText.trim()).length > 200)
+    ) {
+      throw new BadRequestException({
+        message:
+          'Direct-message auto reply text must be at most 200 characters',
+      });
+    }
+    const autoReplyText = input.directMessageAutoReplyText?.trim();
+    if (autoReplyText && this.sensitiveWords.check(autoReplyText).blocked) {
+      throw new BadRequestException({
+        message: 'Direct-message auto reply text contains disallowed content',
+      });
+    }
   }
 
   private toDto(settings: StoredPrivacySettings): PrivacySettingsDto {
@@ -282,6 +317,12 @@ export class PrivacySettingsService {
       groupInvitePermission:
         settings.groupInvitePermission ??
         DEFAULT_PRIVACY_SETTINGS.groupInvitePermission,
+      directMessageAutoReplyEnabled:
+        settings.directMessageAutoReplyEnabled ??
+        DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyEnabled,
+      directMessageAutoReplyText:
+        settings.directMessageAutoReplyText ??
+        DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyText,
     };
   }
 }

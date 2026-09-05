@@ -4,6 +4,7 @@ import { NotificationPushService } from 'src/notification/notification-push.serv
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { TraceService } from './trace.service';
 
 describe('trace comment mention notification flow', () => {
@@ -76,6 +77,7 @@ describe('trace comment mention notification flow', () => {
 
     const privacySettings = new PrivacySettingsService(
       prisma as unknown as PrismaService,
+      { check: jest.fn(() => false) } as unknown as SensitiveWordService,
     );
     const notificationService = new NotificationService(
       prisma as unknown as PrismaService,

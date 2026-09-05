@@ -46,6 +46,13 @@ enum SupportRechargeJobStatus {
   FAILED
 }
 
+enum ChatDirectAutoReplyJobStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 enum SupportRechargeAutomationMode {
   BOT
   HUMAN
@@ -463,6 +470,7 @@ model User {
   groupExpansionOrders              GroupExpansionOrder[]
   supportAgentRoles                 SupportAgent[]
   qrTokensIssued                    QrToken[]                   @relation("qrTokenIssuer")
+  chatDirectAutoReplyStates         ChatDirectAutoReplyState[]
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -1328,6 +1336,8 @@ model UserPrivacySetting {
   addMeByGroup            Boolean  @default(true)
   callPermission          String   @default("EVERYONE")
   groupInvitePermission   String   @default("EVERYONE")
+  directMessageAutoReplyEnabled Boolean  @default(false)
+  directMessageAutoReplyText    String   @default("") @db.VarChar(200)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
   user                    User     @relation(fields: [userID], references: [id], onDelete: Cascade)
@@ -2053,6 +2063,7 @@ model ChatConversation {
 
   members  ChatMember[]
   messages ChatMessage[]
+  directAutoReplyStates ChatDirectAutoReplyState[]
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
@@ -2109,6 +2120,7 @@ model ChatMessage {
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
   reactions    ChatMessageReaction[]
   mediaReferences ChatMediaReference[]
+  directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
 
   @@unique([conversationID, height])
   @@unique([conversationID, senderID, clientMessageId])
@@ -2120,6 +2132,43 @@ model ChatMessage {
   /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
   @@index([conversationID, revokedAt])
   @@index([conversationID, editedAt])
+}
+
+/// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过
+/// ChatService.sendMessage，因此不会反向生成任务造成自动回复循环。
+model ChatDirectAutoReplyJob {
+  id              String                       @id @default(uuid())
+  sourceMessageID String                       @unique
+  status          ChatDirectAutoReplyJobStatus @default(PENDING)
+  attempts        Int                          @default(0)
+  nextAttemptAt   DateTime                     @default(now())
+  lockedAt        DateTime?
+  /// 仅存固定脱敏类别，不存异常正文、消息内容或用户 ID。
+  lastError       String?                      @db.VarChar(64)
+  createdAt       DateTime                     @default(now())
+  updatedAt       DateTime                     @updatedAt
+
+  sourceMessage ChatMessage @relation("directAutoReplySource", fields: [sourceMessageID], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([status, updatedAt])
+}
+
+/// 同一回复者在同一 DIRECT 会话的持久化冷却水位。
+model ChatDirectAutoReplyState {
+  id             String   @id @default(uuid())
+  conversationID String
+  responderID    String
+  lastRepliedAt  DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  responder    User             @relation(fields: [responderID], references: [id], onDelete: Cascade)
+
+  @@unique([conversationID, responderID])
+  @@index([responderID, lastRepliedAt])
+  @@index([updatedAt])
 }
 
 model ChatMediaReference {

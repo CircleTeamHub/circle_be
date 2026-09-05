@@ -8,6 +8,8 @@ import { PrivacySettingsModule } from 'src/privacy/privacy-settings.module';
 import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { SupportModule } from 'src/support/support.module';
+import { MembershipPolicyModule } from 'src/membership/membership-policy.module';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatController } from './chat.controller';
@@ -19,6 +21,7 @@ import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { ChatService } from './chat.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
+import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 
 // PrismaService 与 SessionRevocationService 来自 @Global 模块(Prisma/Auth);
 // JwtModule 仿 RealtimeModule 各自注册(verify 用);敏感词/上传服务显式 import。
@@ -30,6 +33,7 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
     PrivacySettingsModule,
     UploadModule,
     SupportModule,
+    MembershipPolicyModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
@@ -50,6 +54,8 @@ import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor'
     ChatBurnSweeperService,
     ChatPresenceRegistry,
     ChatSupportRechargeProcessor,
+    ChatDirectAutoReplyProcessor,
+    CircleMemberLockService,
   ],
   exports: [
     ChatService,

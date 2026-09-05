@@ -11,6 +11,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SupportService } from 'src/support/support.service';
+import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
@@ -100,6 +101,7 @@ export class ChatService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly support: SupportService,
+    private readonly circleMemberLock: CircleMemberLockService,
   ) {}
 
   /**
@@ -146,6 +148,12 @@ export class ChatService {
     ) {
       throw new BadRequestException({
         message: '消息体超限',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    if (Object.prototype.hasOwnProperty.call(payload.content, 'autoReply')) {
+      throw new BadRequestException({
+        message: 'autoReply 是服务端保留字段',
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
@@ -379,6 +387,7 @@ export class ChatService {
           where: { id: effectivePayload.conversationId },
           data: { nextHeight: height, lastMessageAt: row.createdAt },
         });
+        await this.enqueueDirectAutoReplyInTx(tx, conversation, row);
         await this.enqueueRechargeAutomationInTx(
           tx,
           conversation,
@@ -512,6 +521,18 @@ export class ChatService {
       });
     }
     return { type: row.type, content: content as Record<string, unknown> };
+  }
+
+  /** 每条首次落库的普通 DIRECT 客户端消息都在同一事务写一个唯一任务。 */
+  private async enqueueDirectAutoReplyInTx(
+    tx: Prisma.TransactionClient,
+    conversation: ChatConversation,
+    message: Pick<ChatMessage, 'id'>,
+  ): Promise<void> {
+    if (conversation.type !== 'DIRECT') return;
+    await tx.chatDirectAutoReplyJob.create({
+      data: { sourceMessageID: message.id },
+    });
   }
 
   /**
@@ -3222,7 +3243,13 @@ export class ChatService {
       return { updated: row, notice: dto };
     });
     // 广播放在提交之后:事务回滚了却已经播出去,客户端会显示一条并不存在的提示。
-    this.systemMessage.broadcastSystemMessage(notice);
+    try {
+      await this.systemMessage.broadcastSystemMessage(notice);
+    } catch (error) {
+      this.logger.warn(
+        `burn audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+      );
+    }
     return { burnDurationSec: updated.burnDurationSec ?? null };
   }
 
@@ -3291,65 +3318,183 @@ export class ChatService {
   }
 
   /**
-   * G-14 清空聊天记录:私聊推进双方成员水位,群聊仅推进发起者水位；都只前进
-   * 不后退。消息行保留用于审计/合规,但目标成员的所有设备都无法再读到旧记录。
-   * 清空即已读:lastReadHeight 同步推到同一高度。
+   * G-14 清空聊天记录:默认只推进发起者水位；显式全局清空时,
+   * DIRECT 由任一在座成员发起,GROUP 仅独立群群主或圈子群 OWNER/ADMIN 可发起。
+   * 消息行保留用于审计/合规;水位只前进不后退,且清空即已读。
    */
   async clearHistory(
     userId: string,
     conversationId: string,
     forEveryone = false,
+    targetHeight?: number,
   ): Promise<{ clearedBeforeHeight: number }> {
-    const member = await this.requireMembershipSeat(conversationId, userId);
-    const top = await this.prisma.chatMessage.aggregate({
-      where: { conversationID: conversationId },
-      _max: { height: true },
-    });
-    const watermark = top._max.height ?? 0;
+    if (
+      targetHeight !== undefined &&
+      (!Number.isSafeInteger(targetHeight) || targetHeight < 0)
+    ) {
+      throw new BadRequestException({
+        message: '无效的清空目标水位',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    const { watermark, isGlobalClear, advancedReaders, notice } =
+      await this.prisma.$transaction(async (tx) => {
+        // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
+        // 锁后的会话和座位才是授权与目标集的权威快照。
+        const locked = await tx.$queryRaw<
+          Array<{
+            id: string;
+            type: string;
+            circleID: string | null;
+            ownerID: string | null;
+            nextHeight: number;
+          }>
+        >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+          FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        if (locked.length === 0) {
+          throw new ForbiddenException({
+            message: '不是会话成员',
+            errorCode: ChatErrorCode.NotMember,
+          });
+        }
+        const conversation = locked[0];
+        const actorSeat = await tx.chatMember.findUnique({
+          where: {
+            conversationID_userID: {
+              conversationID: conversationId,
+              userID: userId,
+            },
+          },
+          select: { leftAt: true },
+        });
+        if (!actorSeat || actorSeat.leftAt) {
+          throw new ForbiddenException({
+            message: '不是会话成员',
+            errorCode: ChatErrorCode.NotMember,
+          });
+        }
+        const globalClear =
+          forEveryone &&
+          (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
+        if (globalClear && conversation.type === 'GROUP') {
+          let authorized = conversation.ownerID === userId;
+          if (conversation.circleID) {
+            // GroupService 的降权/移除/退群也持有这把成员锁。会话锁先拿,
+            // 再等成员锁,确保授权读取发生在已提交的成员变更之后。
+            await this.circleMemberLock.lock(tx, conversation.circleID, [
+              userId,
+            ]);
+            const circleMember = await tx.circleMember.findUnique({
+              where: {
+                userID_circleID: {
+                  userID: userId,
+                  circleID: conversation.circleID,
+                },
+              },
+              select: { role: true, status: true },
+            });
+            authorized =
+              circleMember?.status === 'ACTIVE' &&
+              (circleMember.role === 'OWNER' || circleMember.role === 'ADMIN');
+          }
+          if (!authorized) {
+            throw new ForbiddenException({
+              message: '仅群主或管理员可清空全群记录',
+              errorCode: GroupErrorCode.ManagerOnly,
+            });
+          }
+        }
+        const currentTop = conversation.nextHeight;
+        const clearThrough = Math.min(currentTop, targetHeight ?? currentTop);
+        if (clearThrough <= 0) {
+          return {
+            watermark: 0,
+            isGlobalClear: globalClear,
+            advancedReaders: [],
+            notice: null,
+          };
+        }
+        const targetUserIds = globalClear
+          ? (
+              await tx.chatMember.findMany({
+                where: { conversationID: conversationId, leftAt: null },
+                select: { userID: true },
+              })
+            ).map((target) => target.userID)
+          : [userId];
+        const cleared = await tx.chatMember.updateMany({
+          where: {
+            conversationID: conversationId,
+            userID: { in: targetUserIds },
+            ...(globalClear ? { leftAt: null } : {}),
+            clearedBeforeHeight: { lt: clearThrough },
+          },
+          data: { clearedBeforeHeight: clearThrough },
+        });
+        const readers = await tx.chatMember.updateManyAndReturn({
+          where: {
+            conversationID: conversationId,
+            userID: { in: targetUserIds },
+            ...(globalClear ? { leftAt: null } : {}),
+            lastReadHeight: { lt: clearThrough },
+          },
+          data: { lastReadHeight: clearThrough },
+          select: { userID: true },
+        });
+        const changed = (cleared?.count ?? 0) > 0 || readers.length > 0;
+        const auditMessage =
+          globalClear && changed
+            ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+                tx,
+                conversationId,
+                currentTop,
+                { kind: 'history-cleared', actorId: userId },
+              )
+            : null;
+        return {
+          watermark: clearThrough,
+          isGlobalClear: globalClear,
+          advancedReaders: readers,
+          notice: auditMessage,
+        };
+      });
     if (watermark <= 0) return { clearedBeforeHeight: 0 };
-    const targetUserIds =
-      forEveryone && member.conversation.type === 'DIRECT'
-        ? (
-            await this.prisma.chatMember.findMany({
-              where: { conversationID: conversationId, leftAt: null },
-              select: { userID: true },
-            })
-          ).map((target) => target.userID)
-        : [userId];
-    await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: conversationId,
-        userID: { in: targetUserIds },
-        clearedBeforeHeight: { lt: watermark },
-      },
-      data: { clearedBeforeHeight: watermark },
-    });
-    const read = await this.prisma.chatMember.updateMany({
-      where: {
-        conversationID: conversationId,
-        userID: { in: targetUserIds },
-        lastReadHeight: { lt: watermark },
-      },
-      data: { lastReadHeight: watermark },
-    });
     // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
-    if (read.count > 0) {
-      for (const targetUserId of targetUserIds) {
+    for (const target of advancedReaders) {
+      try {
         this.broadcast.emitRead({
           conversationId,
-          userId: targetUserId,
+          userId: target.userID,
           height: watermark,
         });
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
       }
     }
-    if (forEveryone && member.conversation.type === 'DIRECT') {
-      this.broadcast.emitHistoryCleared({
-        conversationId,
-        clearedBeforeHeight: watermark,
-        clearedBy: userId,
-      });
+    if (isGlobalClear && notice) {
+      try {
+        this.broadcast.emitHistoryCleared({
+          conversationId,
+          clearedBeforeHeight: watermark,
+          clearedBy: userId,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
+      try {
+        await this.systemMessage.broadcastSystemMessage(notice);
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
     return { clearedBeforeHeight: watermark };
   }

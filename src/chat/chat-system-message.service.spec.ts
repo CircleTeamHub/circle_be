@@ -10,7 +10,10 @@ describe('ChatSystemMessageService', () => {
     $queryRaw: jest.fn(),
     $transaction: jest.fn(),
   };
-  const broadcast = { emitMessage: jest.fn() };
+  const broadcast = {
+    emitMessage: jest.fn(),
+    emitMessageExcludingUsers: jest.fn(),
+  };
   const push = { onMessageBroadcast: jest.fn().mockResolvedValue(undefined) };
   const media = { attachMediaUrls: jest.fn().mockResolvedValue(undefined) };
 
@@ -66,6 +69,80 @@ describe('ChatSystemMessageService', () => {
     expect(broadcast.emitMessage).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', type: 'system' }),
     );
+  });
+
+  it('can broadcast a system message while excluding specific user rooms', async () => {
+    const message = {
+      id: 'sys-1',
+      conversationId: 'conv-1',
+      type: 'system',
+      content: { kind: 'member-removed' },
+    } as never;
+
+    await (service as any).broadcastSystemMessageExcludingUsers(message, [
+      'removed-user',
+    ]);
+
+    expect(broadcast.emitMessageExcludingUsers).toHaveBeenCalledWith(message, [
+      'removed-user',
+    ]);
+    expect(broadcast.emitMessage).not.toHaveBeenCalled();
+  });
+
+  it('awaits authorization-filtered realtime delivery after the transaction commits', async () => {
+    let finishDelivery!: () => void;
+    broadcast.emitMessage.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishDelivery = resolve;
+        }),
+    );
+
+    let completed = false;
+    const pending = service.emit('conv-1', { kind: 'member-left' }).then(() => {
+      completed = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(broadcast.emitMessage).toHaveBeenCalled();
+    expect(completed).toBe(false);
+
+    finishDelivery();
+    await pending;
+    expect(completed).toBe(true);
+  });
+
+  it('inserts above an already locked counter without acquiring another lock', async () => {
+    await expect(
+      service.insertSystemMessageAfterLockedConversationInTx(
+        prisma as never,
+        'conv-1',
+        7,
+        {
+          kind: 'history-cleared',
+          actorId: 'u1',
+        },
+      ),
+    ).resolves.toMatchObject({ height: 8 });
+
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.create).toHaveBeenCalledWith({
+      data: {
+        conversationID: 'conv-1',
+        height: 8,
+        senderID: null,
+        type: 'system',
+        content: { kind: 'history-cleared', actorId: 'u1' },
+        clientMessageId: null,
+      },
+    });
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: {
+        nextHeight: 8,
+        lastMessageAt: new Date('2026-08-09T00:00:00Z'),
+      },
+    });
   });
 
   it('can rebroadcast an idempotently reused message after a pre-broadcast failure', async () => {

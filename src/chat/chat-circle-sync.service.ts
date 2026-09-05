@@ -350,13 +350,13 @@ export class ChatCircleSyncService {
     userId: string,
     conversationId: string,
     kind: 'left' | 'removed',
+    emitMemberLeftNotice = true,
   ): Promise<void> {
     // 先离房,再发个人事件。
     //
-    // 反过来的话(原来的顺序):emitConversationChange 立刻返回,而离房内部
-    // 还在 await fetchSockets —— 这中间广播到会话房的消息,那位已经被移出的
-    // 成员照样收得到(广播不会再查一次 ChatMember)。离房失败时更糟:他会一直
-    // 留在房里收群消息,直到自己重连。所以失败要踢连接,让他重连时按座位重新派生。
+    // 先派发清理再通知本人的 UI，减少旧会话房收敛窗口。跨节点 RemoteSocket
+    // 清理没有 adapter ack，因此这只是 best-effort；chat:msg 的隐私边界是
+    // 广播时重新查询 active ChatMember 并投个人房，不依赖这里完成。
     try {
       await this.broadcast.removeUserFromConversation(userId, conversationId);
     } catch (error: unknown) {
@@ -367,17 +367,17 @@ export class ChatCircleSyncService {
       );
       // 离不了房就断连接:重连时 handleConnection 会按当前座位重新派生房间,
       // 而他已经没有这个会话的座位了。
-      await this.broadcast
-        .disconnectUserSockets(userId)
-        .catch((disconnectError: unknown) =>
-          this.logger.error(
-            `detach seat could not evict sockets user=${userId}: ${
-              disconnectError instanceof Error
-                ? disconnectError.message
-                : String(disconnectError)
-            }`,
-          ),
+      try {
+        await this.broadcast.disconnectUserSockets(userId);
+      } catch (disconnectError: unknown) {
+        this.logger.error(
+          `detach seat could not evict sockets user=${userId}: ${
+            disconnectError instanceof Error
+              ? disconnectError.message
+              : String(disconnectError)
+          }`,
         );
+      }
     }
     // 个人事件:UI 收走会话靠它。left 与 removed 的区别只在客户端文案。
     this.broadcast.emitConversationChange(userId, {
@@ -385,15 +385,20 @@ export class ChatCircleSyncService {
       conversationId,
       userId,
     });
-    void this.systemMessage
-      .emit(conversationId, { kind: 'member-left' })
-      .catch((error: unknown) =>
-        this.logger.warn(
-          `member-left notice failed conversation=${conversationId}: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        ),
-      );
+    if (emitMemberLeftNotice) {
+      void this.systemMessage
+        .emit(conversationId, { kind: 'member-left' })
+        .catch((error: unknown) =>
+          this.logger.warn(
+            `member-left notice failed conversation=${conversationId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
+    // Manager removal can continue even if both cleanup dispatches failed:
+    // its detailed log explicitly excludes the target and all chat:msg
+    // delivery is independently filtered by the authoritative active seats.
   }
 
   /**

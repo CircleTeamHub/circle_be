@@ -35,6 +35,7 @@ describe('ChatGateway', () => {
     listConversationIds: jest.fn(),
     sendMessage: jest.fn(),
     markRead: jest.fn(),
+    editMessage: jest.fn(),
     getActiveTempChat: jest.fn(),
     hasSeat: jest.fn(),
     filterVisiblePresenceTargets: jest.fn(),
@@ -46,6 +47,7 @@ describe('ChatGateway', () => {
     emitMessage: jest.fn(),
     emitRead: jest.fn(),
     emitTyping: jest.fn(),
+    emitEdit: jest.fn(),
     emitPresence: jest.fn(),
     isUserOnline: jest.fn().mockResolvedValue(false),
   };
@@ -73,6 +75,9 @@ describe('ChatGateway', () => {
   const supportRecharge = {
     processMessage: jest.fn().mockResolvedValue(undefined),
   };
+  const directAutoReply = {
+    processMessage: jest.fn().mockResolvedValue(undefined),
+  };
   const metrics: jest.Mocked<ChatMetrics> = {
     registry: {} as ChatMetrics['registry'],
     observeConnectionOpened: jest.fn(),
@@ -94,6 +99,7 @@ describe('ChatGateway', () => {
     configService as never,
     presence as never,
     supportRecharge as never,
+    directAutoReply as never,
   );
   (gateway as any).metrics = metrics;
 
@@ -848,6 +854,66 @@ describe('ChatGateway', () => {
       );
     });
 
+    it('keeps push and durable follow-up after authorized realtime delivery fails closed', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
+      });
+      broadcast.emitMessage.mockRejectedValueOnce(
+        new Error('membership read failed'),
+      );
+      const ack = jest.fn();
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({ ok: true, messageId: 'msg-1' }),
+      );
+      expect(chatPush.onMessageBroadcast).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'msg-1' }),
+      );
+      expect(supportRecharge.processMessage).toHaveBeenCalledWith('msg-1');
+      expect(directAutoReply.processMessage).toHaveBeenCalledWith('msg-1');
+    });
+
+    it('keeps the successful ack and redacts an immediate auto-reply kick failure', async () => {
+      chatService.sendMessage.mockResolvedValue({
+        reused: false,
+        message: { id: 'msg-1', conversationId: 'conv-1', height: 7, d: 'd1' },
+      });
+      directAutoReply.processMessage.mockRejectedValueOnce(
+        new Error('private message body for user u2'),
+      );
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      const ack = jest.fn();
+
+      await gateway['handleSend'](
+        fakeSocket() as never,
+        'u1',
+        payload as never,
+        ack,
+      );
+      await Promise.resolve();
+
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({ ok: true, messageId: 'msg-1' }),
+      );
+      expect(warn).toHaveBeenCalledWith({
+        event: 'direct_auto_reply_immediate_kick_failed',
+        category: 'PROCESSING_FAILED',
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+        /private message body|user u2/,
+      );
+    });
+
     it('does not rebroadcast idempotent replays', async () => {
       chatService.sendMessage.mockResolvedValue({
         reused: true,
@@ -1014,6 +1080,49 @@ describe('ChatGateway', () => {
       await expect(
         gateway['handleSend'](fakeSocket() as never, 'u1', payload as never),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('handleEdit', () => {
+    it('keeps the committed success ack and fails closed when authorized edit delivery rejects', async () => {
+      chatService.editMessage.mockResolvedValue({
+        content: { text: 'updated private content' },
+        editedAt: '2026-09-03T00:00:00.000Z',
+      });
+      broadcast.emitEdit.mockRejectedValueOnce(
+        new Error('private edit adapter detail'),
+      );
+      const warn = jest
+        .spyOn((gateway as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      const ack = jest.fn();
+
+      await gateway['handleEdit'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          content: { text: 'updated private content' },
+        },
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(broadcast.emitEdit).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        messageId: 'message-1',
+        content: { text: 'updated private content' },
+        editedAt: '2026-09-03T00:00:00.000Z',
+      });
+      expect(broadcast.emitMessage).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(
+        'edit realtime broadcast failed after commit (Error)',
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(
+        'private edit adapter detail',
+      );
+      warn.mockRestore();
     });
   });
 

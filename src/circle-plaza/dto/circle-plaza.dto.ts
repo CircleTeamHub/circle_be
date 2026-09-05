@@ -89,12 +89,12 @@ export class CreatePlazaPostDto {
   isHorn?: boolean;
 
   @ApiPropertyOptional({
-    description: 'Post lifetime in hours. Min 24h, max 168h.',
-    default: 24,
+    description: 'Post lifetime in hours. Min 6h, max 168h.',
+    default: 6,
   })
   @Type(() => Number)
   @IsInt()
-  @Min(24)
+  @Min(6)
   @Max(168)
   @IsOptional()
   expiresInHours?: number;

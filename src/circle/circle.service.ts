@@ -29,6 +29,7 @@ import {
   GROUP_CAPACITY_HARD_LIMIT,
 } from './circle-limits';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleMemberLockService } from './circle-member-lock';
 import {
   CircleDetailDto,
@@ -65,6 +66,7 @@ export class CircleService {
     private readonly admissionPolicy: CircleAdmissionPolicy,
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
+    private readonly systemMessage: ChatSystemMessageService,
   ) {
     this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
       this.config,
@@ -444,10 +446,10 @@ export class CircleService {
         ? this.normalizeStringList(dto.tags, 'tag')
         : undefined;
 
-    await this.prisma.$transaction(async (tx) => {
+    const systemMessages = await this.prisma.$transaction(async (tx) => {
       const circle = await tx.circle.findFirst({
         where: { id: circleId, deleted: false },
-        select: { id: true, ownerID: true },
+        select: { id: true, ownerID: true, name: true, description: true },
       });
       if (!circle) {
         throw new NotFoundException({
@@ -455,6 +457,17 @@ export class CircleService {
           errorCode: CircleErrorCode.NotFound,
         });
       }
+
+      const conversation = await tx.chatConversation.findUnique({
+        where: { circleID: circleId },
+        select: { id: true },
+      });
+      const [lockedConversation] = conversation
+        ? await tx.$queryRaw<Array<{ id: string; nextHeight: number }>>`
+            SELECT "id", "nextHeight" FROM "ChatConversation"
+            WHERE "id" = ${conversation.id} FOR UPDATE
+          `
+        : [];
 
       // 权限读必须与成员变更串行化：不拿锁的话，一次“退员/降为普通成员”与本事务
       // 可以各自提交，已经被撑下管理权的人仍然改得掉招新策略。圈主一并锁：
@@ -542,7 +555,51 @@ export class CircleService {
       if (Object.keys(data).length > 0) {
         await tx.circle.update({ where: { id: circleId }, data });
       }
+
+      const nameChanged = dto.name !== undefined && dto.name !== circle.name;
+      const descriptionChanged =
+        dto.description !== undefined && dto.description !== circle.description;
+      if (!nameChanged && !descriptionChanged) return [];
+
+      if (!lockedConversation) return [];
+
+      const messages = [];
+      let nextHeight = lockedConversation.nextHeight;
+      if (nameChanged) {
+        const message =
+          await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+            tx,
+            lockedConversation.id,
+            nextHeight,
+            { kind: 'group-renamed', actorId: userId, name: dto.name },
+          );
+        messages.push(message);
+        nextHeight = message.height;
+      }
+      if (descriptionChanged) {
+        const message =
+          await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+            tx,
+            lockedConversation.id,
+            nextHeight,
+            { kind: 'group-notice-updated', actorId: userId },
+          );
+        messages.push(message);
+      }
+      return messages;
     });
+
+    for (const message of systemMessages) {
+      try {
+        await this.systemMessage.broadcastSystemMessage(message);
+      } catch (error) {
+        // 设置与审计行已经提交；实时投递失败不能把成功 mutation 伪装成失败。
+        // 只记错误类型，避免 adapter/DB message 带出群名、公告或用户标识。
+        this.logger.warn(
+          `circle audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
+    }
 
     return this.getCircleDetail(userId, circleId);
   }

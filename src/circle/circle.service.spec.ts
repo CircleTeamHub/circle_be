@@ -11,6 +11,7 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
   CreateCircleDto,
   MyCirclesQueryDto,
@@ -64,7 +65,11 @@ describe('CircleService', () => {
       create: jest.fn(),
       updateMany: jest.fn(),
     },
+    chatConversation: {
+      findUnique: jest.fn(),
+    },
     $executeRaw: jest.fn(),
+    $queryRaw: jest.fn(),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
 
@@ -76,6 +81,11 @@ describe('CircleService', () => {
     ensureCircleConversation: jest.fn().mockResolvedValue('conv-x'),
     releaseSeatInTx: jest.fn().mockResolvedValue(null),
     detachSeat: jest.fn(),
+  };
+  const chatSystemMessage = {
+    insertSystemMessageInTx: jest.fn(),
+    insertSystemMessageAfterLockedConversationInTx: jest.fn(),
+    broadcastSystemMessage: jest.fn(),
   };
   const directChatCircleSync = chatCircleSync as any;
   const directMembershipPolicy = new MembershipPolicyService(prisma as any);
@@ -100,6 +110,7 @@ describe('CircleService', () => {
         CircleAdmissionPolicy,
         { provide: CircleMemberLockService, useValue: memberLock },
         { provide: ChatCircleSyncService, useValue: chatCircleSync },
+        { provide: ChatSystemMessageService, useValue: chatSystemMessage },
       ],
     }).compile();
 
@@ -112,6 +123,28 @@ describe('CircleService', () => {
     chatCircleSync.ensureCircleConversation.mockResolvedValue('conv-x');
     // 同理:退圈路径要 await 它的返回值,undefined 会让 releasedConversationId 判断失真。
     chatCircleSync.releaseSeatInTx.mockResolvedValue(null);
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.$queryRaw.mockResolvedValue([{ id: 'conv-1', nextHeight: 7 }]);
+    chatSystemMessage.insertSystemMessageInTx.mockImplementation(
+      async (_tx: unknown, conversationId: string, content: unknown) => ({
+        id: `message-${chatSystemMessage.insertSystemMessageInTx.mock.calls.length}`,
+        conversationId,
+        content,
+      }),
+    );
+    chatSystemMessage.insertSystemMessageAfterLockedConversationInTx.mockImplementation(
+      async (
+        _tx: unknown,
+        conversationId: string,
+        lockedNextHeight: number,
+        content: unknown,
+      ) => ({
+        id: `message-${chatSystemMessage.insertSystemMessageAfterLockedConversationInTx.mock.calls.length}`,
+        conversationId,
+        height: lockedNextHeight + 1,
+        content,
+      }),
+    );
     circleInvitationService.getInvitationForViewer.mockResolvedValue({
       id: 'inv-1',
       status: 'PENDING',
@@ -405,6 +438,7 @@ describe('CircleService', () => {
       directAdmissionPolicy,
       directMemberLock,
       directChatCircleSync,
+      chatSystemMessage as any,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -855,6 +889,7 @@ describe('CircleService', () => {
       directAdmissionPolicy,
       directMemberLock,
       directChatCircleSync,
+      chatSystemMessage as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -885,6 +920,7 @@ describe('CircleService', () => {
       directAdmissionPolicy,
       directMemberLock,
       directChatCircleSync,
+      chatSystemMessage as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -919,6 +955,7 @@ describe('CircleService', () => {
       directAdmissionPolicy,
       directMemberLock,
       directChatCircleSync,
+      chatSystemMessage as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -1250,6 +1287,249 @@ describe('CircleService', () => {
         data: { name: '新名字', description: '' },
       });
       expect(result.myRole).toBe('OWNER');
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenNthCalledWith(1, prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '新名字',
+      });
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenNthCalledWith(2, prisma, 'conv-1', 8, {
+        kind: 'group-notice-updated',
+        actorId: 'owner-1',
+      });
+      expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('persists and broadcasts only a rename event for a name-only change', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: '只改名字',
+      } as UpdateCircleDto);
+
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '只改名字',
+      });
+      expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('persists and broadcasts only a notice event for a description-only change', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        description: '只改公告',
+      } as UpdateCircleDto);
+
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-notice-updated',
+        actorId: 'owner-1',
+      });
+      expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      {
+        label: 'rename',
+        update: { name: 'committed private name' },
+      },
+      {
+        label: 'notice',
+        update: { description: 'committed private notice' },
+      },
+    ])(
+      'returns committed success when the $label audit realtime delivery rejects',
+      async ({ update }) => {
+        prisma.circleMember.findUnique.mockResolvedValue({
+          role: 'OWNER',
+          status: 'ACTIVE',
+        });
+        chatSystemMessage.broadcastSystemMessage.mockRejectedValueOnce(
+          new Error('adapter leaked private audit content'),
+        );
+        const warn = jest
+          .spyOn((service as any).logger, 'warn')
+          .mockImplementation(() => undefined);
+
+        await expect(
+          service.updateCircle(
+            'owner-1',
+            'circle-1',
+            update as UpdateCircleDto,
+          ),
+        ).resolves.toMatchObject({ id: 'circle-1', myRole: 'OWNER' });
+
+        expect(prisma.circle.update).toHaveBeenCalled();
+        expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(
+          1,
+        );
+        expect(warn).toHaveBeenCalledWith(
+          'circle audit realtime delivery failed after commit (Error)',
+        );
+        expect(JSON.stringify(warn.mock.calls)).not.toMatch(
+          /owner-1|committed private|adapter leaked/,
+        );
+        warn.mockRestore();
+      },
+    );
+
+    it('does not log unrelated or no-op circle updates', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        memberCanPost: false,
+      } as UpdateCircleDto);
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+
+      jest.clearAllMocks();
+      prisma.circle.findFirst.mockResolvedValue(circleRow);
+      prisma.iconAsset.findMany.mockResolvedValue([]);
+      prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: circleRow.name,
+        description: circleRow.description,
+      } as UpdateCircleDto);
+
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('keeps the circle mutation when no chat conversation exists', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          name: '没有群聊也能改',
+        } as UpdateCircleDto),
+      ).resolves.toBeDefined();
+
+      expect(prisma.circle.update).toHaveBeenCalled();
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('broadcasts only after the update transaction commits', async () => {
+      let committed = false;
+      prisma.$transaction.mockImplementationOnce(async (callback: any) => {
+        const result = await callback(prisma);
+        committed = true;
+        return result;
+      });
+      chatSystemMessage.broadcastSystemMessage.mockImplementation(() => {
+        expect(committed).toBe(true);
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: '提交后广播',
+      } as UpdateCircleDto);
+
+      expect(chatSystemMessage.broadcastSystemMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('locks an existing chat conversation before taking circle member locks', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await service.updateCircle('owner-1', 'circle-1', {
+        name: '统一锁顺序',
+      } as UpdateCircleDto);
+
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(
+        (prisma.$queryRaw.mock.calls[0][0] as readonly string[]).join(' '),
+      ).toContain('ChatConversation');
+      expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        memberLock.lock.mock.invocationCallOrder[0],
+      );
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledWith(prisma, 'conv-1', 7, {
+        kind: 'group-renamed',
+        actorId: 'owner-1',
+        name: '统一锁顺序',
+      });
+      expect(chatSystemMessage.insertSystemMessageInTx).not.toHaveBeenCalled();
+    });
+
+    it('does not broadcast a system event when the transaction fails', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.circle.update.mockRejectedValueOnce(new Error('write failed'));
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          name: '不会提交',
+        } as UpdateCircleDto),
+      ).rejects.toThrow('write failed');
+
+      expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
+    });
+
+    it('does not broadcast when the transaction callback creates a DTO but commit rejects', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.$transaction.mockImplementationOnce(async (callback: any) => {
+        await callback(prisma);
+        throw new Error('commit rejected');
+      });
+
+      await expect(
+        service.updateCircle('owner-1', 'circle-1', {
+          name: '回滚名字',
+        } as UpdateCircleDto),
+      ).rejects.toThrow('commit rejected');
+
+      expect(
+        chatSystemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).toHaveBeenCalledTimes(1);
+      expect(chatSystemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
 
     // 不拿锁的话,「把这个管理员降为普通成员」与本事务可以各自提交,
@@ -1466,6 +1746,7 @@ describe('CircleService', () => {
         directAdmissionPolicy,
         directMemberLock,
         directChatCircleSync,
+        chatSystemMessage as any,
       );
 
       await expect(

@@ -24,7 +24,7 @@ export const CHAT_EVENTS = {
   reaction: 'chat:reaction',
   /** 双向:消息编辑(客户端带 ack;服务端广播到会话房) */
   edit: 'chat:edit',
-  /** 服务端 → 客户端:私聊任一方清空后,双方设备同步清空到该水位 */
+  /** 服务端 → 客户端:会话全局清空后,在线设备同步清空到该水位 */
   historyCleared: 'chat:history_cleared',
 } as const;
 
@@ -92,6 +92,20 @@ export const SERVER_MESSAGE_TYPES: readonly string[] = [
   'transfer-card',
   'verification-card',
   'call-record',
+];
+
+/**
+ * 历史查询的 `types` 过滤白名单 —— 与「客户端能发什么」是两码事。
+ *
+ * 发送白名单(CLIENT_MESSAGE_TYPES)是安全边界:放进去就等于允许客户端凭空
+ * 捏造那类消息。读路径不是:能读到哪些消息已经由成员资格 + clearedBeforeHeight
+ * 水位决定了,`types` 只是在已授权的结果集里再筛一道,放宽它不会多露出任何一条
+ * 消息。两者共用一份清单的话,「按群管理日志筛 system」这种正当查询会被发送
+ * 边界顺手拒掉。
+ */
+export const HISTORY_FILTER_MESSAGE_TYPES: readonly string[] = [
+  ...CLIENT_MESSAGE_TYPES,
+  ...SERVER_MESSAGE_TYPES,
 ];
 
 /** 携带 object key 的媒体消息类型(读路径由 ChatMediaService 补签名 URL)。 */

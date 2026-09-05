@@ -32,6 +32,7 @@ import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
+import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 import { ChatService } from './chat.service';
 import {
   chatMetrics as defaultChatMetrics,
@@ -229,6 +230,7 @@ export class ChatGateway implements OnModuleDestroy {
     private readonly configService: ConfigService,
     private readonly presence: ChatPresenceRegistry,
     private readonly supportRecharge: ChatSupportRechargeProcessor,
+    private readonly directAutoReply: ChatDirectAutoReplyProcessor,
   ) {
     const make = (
       name: keyof typeof CHAT_RATE_LIMITS,
@@ -1071,11 +1073,24 @@ export class ChatGateway implements OnModuleDestroy {
       });
       // 幂等复用(断线重发撞库)不再广播,首次投递时房间里已经收到过了。
       if (!result.reused) {
-        this.observeBroadcast('message', () =>
-          this.broadcast.emitMessage(result.message),
-        );
         // 离线成员推送:best-effort,不阻塞发送方 ack 路径。
         void this.chatPush.onMessageBroadcast(result.message);
+        try {
+          await this.observeAsyncBroadcast('message', () =>
+            this.broadcast.emitMessage(result.message),
+          );
+        } catch (error) {
+          // 消息已提交且 ack 已成功；授权收件人查询失败时实时投递安全地
+          // fail closed，但不能连带跳过 push 或 durable support job。
+          // 与下面的 edit 分支同一条口径：只记错误类名。这里的 error 来自
+          // Prisma 或 socket.io adapter，message 里常带查询片段、参数值和
+          // 连接串。conversationId 足够定位到会话。
+          this.logger.warn(
+            `message realtime broadcast failed conversation=${
+              result.message.conversationId
+            } (${error instanceof Error ? error.name : 'unknown error'})`,
+          );
+        }
       }
       // 原消息和 durable job 已在同一事务提交。这里做低延迟 kick；若本次进程
       // 恰好退出或数据库短暂失败，processor 的定时扫描会继续补消费。
@@ -1088,6 +1103,12 @@ export class ChatGateway implements OnModuleDestroy {
             }`,
           ),
         );
+      void this.directAutoReply.processMessage(result.message.id).catch(() =>
+        this.logger.warn({
+          event: 'direct_auto_reply_immediate_kick_failed',
+          category: 'PROCESSING_FAILED',
+        }),
+      );
     } catch (error) {
       this.metrics.observeEvent('send', 'failure');
       reply(this.toAckError(error, 'send', userId, payload?.conversationId));
@@ -1247,12 +1268,21 @@ export class ChatGateway implements OnModuleDestroy {
         payload?.content,
       );
       reply({ ok: true });
-      this.broadcast.emitEdit({
-        conversationId,
-        messageId,
-        content: dto.content,
-        editedAt: dto.editedAt ?? new Date().toISOString(),
-      });
+      try {
+        await this.broadcast.emitEdit({
+          conversationId,
+          messageId,
+          height: dto.height,
+          content: dto.content,
+          editedAt: dto.editedAt ?? new Date().toISOString(),
+        });
+      } catch (error) {
+        // 编辑已经提交且 ack 已成功。授权查询/投递失败时安全地不广播，
+        // 也不把可能含 adapter/DB 细节的错误正文写入日志。
+        this.logger.warn(
+          `edit realtime broadcast failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     } catch (error) {
       reply(this.toAckError(error, 'edit', userId, payload?.conversationId));
     }
@@ -1321,6 +1351,21 @@ export class ChatGateway implements OnModuleDestroy {
     const startedAt = process.hrtime.bigint();
     try {
       callback();
+    } finally {
+      this.metrics.observeBroadcast(
+        action,
+        Number(process.hrtime.bigint() - startedAt) / 1e9,
+      );
+    }
+  }
+
+  private async observeAsyncBroadcast(
+    action: 'message',
+    callback: () => Promise<void>,
+  ): Promise<void> {
+    const startedAt = process.hrtime.bigint();
+    try {
+      await callback();
     } finally {
       this.metrics.observeBroadcast(
         action,

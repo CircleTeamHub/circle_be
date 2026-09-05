@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { Server } from 'socket.io';
+import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
@@ -24,19 +25,45 @@ export class ChatBroadcastService {
   private readonly logger = new Logger(ChatBroadcastService.name);
   private server: Server | null = null;
 
-  constructor(private readonly presence: ChatPresenceRegistry) {}
+  constructor(
+    private readonly presence: ChatPresenceRegistry,
+    private readonly prisma: PrismaService,
+  ) {}
 
   setServer(server: Server): void {
     this.server = server;
   }
 
-  /** 新消息 → 会话房(发送者自己也收,靠 d 对账去重本地乐观消息)。 */
-  emitMessage(message: ChatMessageDto): void {
-    const server = this.requireServer('emitMessage');
+  /**
+   * 新消息只投递给当前仍在座成员的个人房。
+   *
+   * 不能再把 conversation room 当授权边界：跨节点 RemoteSocket.leave()
+   * 返回 void，没有 adapter ack 可等；被移除用户的远端 socket 可能暂时还留在
+   * 旧会话房。个人房是连接期稳定标识，收件人则每次由当前 ChatMember 校验。
+   */
+  async emitMessage(message: ChatMessageDto): Promise<void> {
+    await this.emitContentToAuthorizedUsers(
+      'emitMessage',
+      CHAT_EVENTS.message,
+      message,
+      [],
+    );
+  }
+
+  /** 新消息 → 当前在座成员个人房，并显式排除指定用户的全部设备。 */
+  async emitMessageExcludingUsers(
+    message: ChatMessageDto,
+    excludeUserIds: readonly string[],
+  ): Promise<void> {
+    const server = this.requireServer('emitMessageExcludingUsers');
     if (!server) return;
-    server
-      .to(conversationRoom(message.conversationId))
-      .emit(CHAT_EVENTS.message, message);
+    await this.emitContentToAuthorizedUsers(
+      'emitMessageExcludingUsers',
+      CHAT_EVENTS.message,
+      message,
+      excludeUserIds,
+      server,
+    );
   }
 
   /** 已读水位推进 → 会话房。 */
@@ -48,7 +75,7 @@ export class ChatBroadcastService {
       .emit(CHAT_EVENTS.read, payload);
   }
 
-  /** 私聊双方历史水位推进 → 会话房内所有在线设备。 */
+  /** 会话全局历史水位推进 → 会话房内所有在线设备。 */
   emitHistoryCleared(payload: ChatHistoryClearedBroadcast): void {
     const server = this.requireServer('emitHistoryCleared');
     if (!server) return;
@@ -161,13 +188,14 @@ export class ChatBroadcastService {
       .emit(CHAT_EVENTS.reaction, payload);
   }
 
-  /** 消息编辑 → 会话房。 */
-  emitEdit(payload: ChatEditBroadcast): void {
-    const server = this.requireServer('emitEdit');
-    if (!server) return;
-    server
-      .to(conversationRoom(payload.conversationId))
-      .emit(CHAT_EVENTS.edit, payload);
+  /** 编辑包含完整新正文，与 chat:msg 共用当前在座成员授权投递。 */
+  async emitEdit(payload: ChatEditBroadcast): Promise<void> {
+    await this.emitContentToAuthorizedUsers(
+      'emitEdit',
+      CHAT_EVENTS.edit,
+      payload,
+      [],
+    );
   }
 
   /** 消息撤回 → 会话房(发起者也收,靠它把本地气泡翻成灰条)。 */
@@ -193,17 +221,16 @@ export class ChatBroadcastService {
     conversationId: string,
   ): Promise<void> {
     // 注册表联动:座位变化时在线集合同步(内部会先确认该用户全局在线)。
-    void this.presence.conversationJoined(userId, conversationId);
+    await this.presence.conversationJoined(userId, conversationId);
     const server = this.requireServer('joinUserToConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
-    // 必须 await。多副本部署下 fetchSockets() 拿到的是 RemoteSocket,它的
-    // join() 是跨节点异步调用 —— 不等的话本方法会在对方真正入房之前就返回,
-    // 调用方紧接着广播的第一条消息直接丢空(结算卡片就是这么丢的:客户端
-    // 连 chat:msg 都收不到,也就没有任何东西能触发它自愈补拉)。
-    await Promise.all(
-      sockets.map((socket) => socket.join(conversationRoom(conversationId))),
-    );
+    // fetchSockets() exposes RemoteSocket.join(): void. Dispatching the room
+    // update is best-effort; first-message delivery no longer depends on its
+    // completion because chat:msg targets authorized personal rooms.
+    for (const socket of sockets) {
+      socket.join(conversationRoom(conversationId));
+    }
   }
 
   /** 成员被移出后把其在线 socket 撤出会话房(座位收回即时生效,不等重连)。 */
@@ -211,10 +238,14 @@ export class ChatBroadcastService {
     userId: string,
     conversationId: string,
   ): Promise<void> {
-    void this.presence.conversationLeft(userId, conversationId);
+    await this.presence.conversationLeft(userId, conversationId);
     const server = this.requireServer('removeUserFromConversation');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
+    // Socket.IO RemoteSocket.leave() returns void: calling it dispatches the
+    // adapter command but provides no acknowledgement to await. Message
+    // privacy therefore does not depend on this best-effort room cleanup;
+    // emitMessage re-authorizes recipients against active ChatMember rows.
     for (const socket of sockets) {
       socket.leave(conversationRoom(conversationId));
     }
@@ -229,7 +260,49 @@ export class ChatBroadcastService {
     const server = this.requireServer('disconnectUserSockets');
     if (!server) return;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
-    for (const socket of sockets) socket.disconnect(true);
+    // RemoteSocket.disconnect() returns the socket itself, not an adapter ack.
+    // Dispatch every fallback command; authorized user-room message delivery
+    // remains the durable privacy boundary while remote cleanup converges.
+    for (const socket of sockets) {
+      socket.disconnect(true);
+    }
+  }
+
+  private async emitContentToAuthorizedUsers(
+    caller: string,
+    event: string,
+    payload: ChatMessageDto | ChatEditBroadcast,
+    excludeUserIds: readonly string[],
+    attachedServer?: Server,
+  ): Promise<void> {
+    const server = attachedServer ?? this.requireServer(caller);
+    if (!server) return;
+
+    // Presence registration happens after a socket becomes ready and may be
+    // temporarily incomplete during Redis recovery. It is therefore never an
+    // authorization or recipient filter. Empty user rooms are harmless; the
+    // active ChatMember set is the durable delivery boundary.
+    const seats = await this.prisma.chatMember.findMany({
+      where: {
+        conversationID: payload.conversationId,
+        leftAt: null,
+        // A delayed post-commit broadcast must not replay content below a
+        // member's already-committed clear watermark.
+        clearedBeforeHeight: { lt: payload.height },
+      },
+      select: { userID: true },
+    });
+    const excluded = new Set(excludeUserIds);
+    const rooms = [
+      ...new Set(
+        seats
+          .map((seat) => seat.userID)
+          .filter((userId) => !excluded.has(userId))
+          .map(userRoom),
+      ),
+    ];
+    if (rooms.length === 0) return;
+    server.to(rooms).emit(event, payload);
   }
 
   private requireServer(caller: string): Server | null {

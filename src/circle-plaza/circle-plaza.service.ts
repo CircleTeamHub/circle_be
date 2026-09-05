@@ -83,7 +83,7 @@ type SignupRestrictionFields = Pick<
 const MAX_COLLABORATION_RECOGNITIONS_PER_POST = 3;
 const CIRCLE_POST_AUTO_END_MS = 24 * 60 * 60 * 1000;
 const CIRCLE_POST_AUTO_END_BATCH_SIZE = 100;
-const DEFAULT_CIRCLE_POST_EXPIRY_HOURS = 24;
+const DEFAULT_CIRCLE_POST_EXPIRY_HOURS = 6;
 // 发帖扇出通知的收件人上限：正常测试期圈子远小于此，作为超大圈的安全阀，
 // 命中时记日志而非静默截断。
 const CIRCLE_POST_PUBLISH_FANOUT_CAP = 500;

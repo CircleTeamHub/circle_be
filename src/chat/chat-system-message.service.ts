@@ -126,8 +126,9 @@ export class ChatSystemMessageService {
     // 和历史读取一样现签 URL，否则图片要等用户重进会话后才显示出来。
     await this.media.attachMediaUrls([dto]);
     if (!reused || input.rebroadcastOnReplay) {
-      this.broadcast.emitMessage(dto);
+      const realtimeDelivery = this.broadcast.emitMessage(dto);
       if (!reused && input.push) void this.chatPush.onMessageBroadcast(dto);
+      await realtimeDelivery;
     }
     return dto;
   }
@@ -159,7 +160,26 @@ export class ChatSystemMessageService {
     if (counter.length === 0) {
       throw new Error(`conversation ${conversationId} not found`);
     }
-    const height = counter[0].nextHeight + 1;
+    return this.insertSystemMessageAfterLockedConversationInTx(
+      tx,
+      conversationId,
+      counter[0].nextHeight,
+      content,
+    );
+  }
+
+  /**
+   * 在调用方已持有 ChatConversation 行锁时落系统消息。
+   * 不再取锁;调用方必须把锁行里的 nextHeight 原样传入,避免破坏
+   * conversation-first 锁顺序。
+   */
+  async insertSystemMessageAfterLockedConversationInTx(
+    tx: Prisma.TransactionClient,
+    conversationId: string,
+    lockedNextHeight: number,
+    content: Record<string, unknown>,
+  ): Promise<ChatMessageDto> {
+    const height = lockedNextHeight + 1;
     const created = await tx.chatMessage.create({
       data: {
         conversationID: conversationId,
@@ -196,8 +216,16 @@ export class ChatSystemMessageService {
   }
 
   /** 事务提交之后再播,别在事务里播(回滚了消息却已经发出去)。 */
-  broadcastSystemMessage(dto: ChatMessageDto): void {
-    this.broadcast.emitMessage(dto);
+  async broadcastSystemMessage(dto: ChatMessageDto): Promise<void> {
+    await this.broadcast.emitMessage(dto);
+  }
+
+  /** Post-commit system broadcast with user-room exclusion for removals. */
+  async broadcastSystemMessageExcludingUsers(
+    dto: ChatMessageDto,
+    excludeUserIds: readonly string[],
+  ): Promise<void> {
+    await this.broadcast.emitMessageExcludingUsers(dto, excludeUserIds);
   }
 
   /** 落库(height 同一坐标系)并广播;失败只记日志(提示消息可丢)。 */
@@ -209,7 +237,7 @@ export class ChatSystemMessageService {
       const dto = await this.prisma.$transaction((tx) =>
         this.insertSystemMessageInTx(tx, conversationId, content),
       );
-      this.broadcastSystemMessage(dto);
+      await this.broadcastSystemMessage(dto);
     } catch (error) {
       this.logger.warn(
         `system message emit failed conversation=${conversationId}: ${

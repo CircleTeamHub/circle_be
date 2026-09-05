@@ -1,4 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
+import { plainToInstance } from 'class-transformer';
+import { validateSync } from 'class-validator';
+import { UpdatePrivacySettingsDto } from './privacy-settings.dto';
 import { PrivacySettingsService } from './privacy-settings.service';
 
 describe('PrivacySettingsService', () => {
@@ -12,13 +15,15 @@ describe('PrivacySettingsService', () => {
     $executeRaw: jest.fn().mockResolvedValue(0),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
+  const sensitiveWords = { check: jest.fn() };
 
   let service: PrivacySettingsService;
 
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
-    service = new PrivacySettingsService(prisma as any);
+    sensitiveWords.check.mockReturnValue({ blocked: false });
+    service = new PrivacySettingsService(prisma as any, sensitiveWords as any);
   });
 
   it('returns default account privacy settings without writing when none exist', async () => {
@@ -40,11 +45,125 @@ describe('PrivacySettingsService', () => {
       addMeByGroup: true,
       callPermission: 'EVERYONE',
       groupInvitePermission: 'EVERYONE',
+      directMessageAutoReplyEnabled: false,
+      directMessageAutoReplyText: '',
     });
 
     // A read must never write: lazily creating a row here would let any
     // stranger viewing a profile trigger a write to the target's row.
     expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('trims and persists account-synced direct-message auto reply settings', async () => {
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '稍后回复',
+    });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: '  稍后回复  ',
+      }),
+    ).resolves.toMatchObject({
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '稍后回复',
+    });
+
+    expect(prisma.userPrivacySetting.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          directMessageAutoReplyEnabled: true,
+          directMessageAutoReplyText: '稍后回复',
+        }),
+      }),
+    );
+  });
+
+  it('validates direct-message auto reply text at both DTO and service boundaries', async () => {
+    const tooLong = 'x'.repeat(201);
+    const dtoErrors = validateSync(
+      plainToInstance(UpdatePrivacySettingsDto, {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: tooLong,
+      }),
+    );
+
+    expect(
+      dtoErrors.some(
+        (error) => error.property === 'directMessageAutoReplyText',
+      ),
+    ).toBe(true);
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyText: tooLong,
+      }),
+    ).rejects.toThrow(BadRequestException);
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: 'yes' as never,
+      }),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('rejects sensitive direct-message auto reply text before persistence', async () => {
+    sensitiveWords.check.mockReturnValue({ blocked: true, word: 'blocked' });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: 'contains blocked content',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects string booleans under the production implicit-conversion pipe', () => {
+    for (const raw of ['false', 'true', '0', '1', '']) {
+      const dto = plainToInstance(
+        UpdatePrivacySettingsDto,
+        { directMessageAutoReplyEnabled: raw },
+        { enableImplicitConversion: true },
+      );
+      expect(
+        validateSync(dto).some(
+          (error) => error.property === 'directMessageAutoReplyEnabled',
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('rejects non-string reply text under the production implicit-conversion pipe', () => {
+    for (const raw of [123, false, { text: 'hello' }]) {
+      const dto = plainToInstance(
+        UpdatePrivacySettingsDto,
+        { directMessageAutoReplyText: raw },
+        { enableImplicitConversion: true },
+      );
+      expect(
+        validateSync(dto).some(
+          (error) => error.property === 'directMessageAutoReplyText',
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('counts Unicode code points consistently with varchar(200)', async () => {
+    const twoHundredEmoji = '😀'.repeat(200);
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: twoHundredEmoji,
+    });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: twoHundredEmoji,
+      }),
+    ).resolves.toMatchObject({ directMessageAutoReplyText: twoHundredEmoji });
   });
 
   it('patches only supplied settings and rejects unsupported enum values', async () => {
