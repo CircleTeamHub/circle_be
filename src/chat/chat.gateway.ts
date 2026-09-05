@@ -1082,10 +1082,13 @@ export class ChatGateway implements OnModuleDestroy {
         } catch (error) {
           // 消息已提交且 ack 已成功；授权收件人查询失败时实时投递安全地
           // fail closed，但不能连带跳过 push 或 durable support job。
+          // 与下面的 edit 分支同一条口径：只记错误类名。这里的 error 来自
+          // Prisma 或 socket.io adapter，message 里常带查询片段、参数值和
+          // 连接串。conversationId 足够定位到会话。
           this.logger.warn(
-            `message realtime broadcast failed conversation=${result.message.conversationId}: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+            `message realtime broadcast failed conversation=${
+              result.message.conversationId
+            } (${error instanceof Error ? error.name : 'unknown error'})`,
           );
         }
       }
