@@ -3,6 +3,7 @@ import { CronExpression } from '@nestjs/schedule';
 import type { ChatMessage, Prisma } from 'src/generated/prisma';
 import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatPushService } from './chat-push.service';
@@ -15,6 +16,8 @@ const JOB_BACKOFF_BASE_MS = 2_000;
 const JOB_BACKOFF_MAX_MS = 60_000;
 const AUTO_REPLY_COOLDOWN_MS = 30_000;
 const PROCESSING_FAILED = 'PROCESSING_FAILED';
+const TERMINAL_JOB_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const COOLDOWN_STATE_RETENTION_MS = 24 * 60 * 60_000;
 
 type SourceMessage = ChatMessage & {
   conversation: { id: string; type: string };
@@ -30,6 +33,7 @@ export class ChatDirectAutoReplyProcessor {
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
     private readonly push: ChatPushService,
+    private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
   /** Low-latency post-commit kick; the cron sweep remains the durable fallback. */
@@ -82,6 +86,28 @@ export class ChatDirectAutoReplyProcessor {
     } finally {
       this.sweeping = false;
     }
+  }
+
+  @TrackedCron(
+    CronExpression.EVERY_DAY_AT_4AM,
+    'chat_direct_auto_reply_cleanup',
+  )
+  async cleanupExpired(now = new Date()): Promise<void> {
+    await this.prisma.chatDirectAutoReplyJob.deleteMany({
+      where: {
+        status: { in: ['COMPLETED', 'FAILED'] },
+        updatedAt: {
+          lt: new Date(now.getTime() - TERMINAL_JOB_RETENTION_MS),
+        },
+      },
+    });
+    await this.prisma.chatDirectAutoReplyState.deleteMany({
+      where: {
+        updatedAt: {
+          lt: new Date(now.getTime() - COOLDOWN_STATE_RETENTION_MS),
+        },
+      },
+    });
   }
 
   private async processJob(jobId: string): Promise<void> {
@@ -225,6 +251,10 @@ export class ChatDirectAutoReplyProcessor {
       });
       const text = settings?.directMessageAutoReplyText.trim() ?? '';
       if (!settings?.directMessageAutoReplyEnabled || !text) {
+        await this.completeJob(tx, jobId);
+        return null;
+      }
+      if (this.sensitiveWords.check(text).blocked) {
         await this.completeJob(tx, jobId);
         return null;
       }

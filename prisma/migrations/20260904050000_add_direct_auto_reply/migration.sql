@@ -31,3 +31,15 @@ CREATE UNIQUE INDEX "ChatDirectAutoReplyJob_sourceMessageID_key" ON "ChatDirectA
 CREATE INDEX "ChatDirectAutoReplyJob_status_nextAttemptAt_createdAt_idx" ON "ChatDirectAutoReplyJob"("status", "nextAttemptAt", "createdAt");
 CREATE UNIQUE INDEX "ChatDirectAutoReplyState_conversationID_responderID_key" ON "ChatDirectAutoReplyState"("conversationID", "responderID");
 CREATE INDEX "ChatDirectAutoReplyState_responderID_lastRepliedAt_idx" ON "ChatDirectAutoReplyState"("responderID", "lastRepliedAt");
+
+ALTER TABLE "ChatDirectAutoReplyJob"
+ADD CONSTRAINT "ChatDirectAutoReplyJob_sourceMessageID_fkey"
+FOREIGN KEY ("sourceMessageID") REFERENCES "ChatMessage"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE "ChatDirectAutoReplyState"
+ADD CONSTRAINT "ChatDirectAutoReplyState_conversationID_fkey"
+FOREIGN KEY ("conversationID") REFERENCES "ChatConversation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE "ChatDirectAutoReplyState"
+ADD CONSTRAINT "ChatDirectAutoReplyState_responderID_fkey"
+FOREIGN KEY ("responderID") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;

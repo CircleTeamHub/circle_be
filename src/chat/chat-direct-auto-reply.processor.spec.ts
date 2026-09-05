@@ -33,6 +33,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
   const prisma = {
     chatDirectAutoReplyJob: {
       create: jest.fn(),
+      deleteMany: jest.fn(),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
       findMany: jest.fn(),
@@ -43,7 +44,11 @@ describe('ChatDirectAutoReplyProcessor', () => {
     chatConversation: { update: jest.fn() },
     chatMember: { findMany: jest.fn(), updateMany: jest.fn() },
     block: { findFirst: jest.fn() },
-    chatDirectAutoReplyState: { findUnique: jest.fn(), upsert: jest.fn() },
+    chatDirectAutoReplyState: {
+      deleteMany: jest.fn(),
+      findUnique: jest.fn(),
+      upsert: jest.fn(),
+    },
     userPrivacySetting: { findUnique: jest.fn() },
     user: { findUnique: jest.fn() },
     $queryRaw: jest.fn(),
@@ -52,6 +57,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
   };
   const broadcast = { emitMessage: jest.fn() };
   const push = { onMessageBroadcast: jest.fn() };
+  const sensitiveWords = { check: jest.fn() };
   let processor: ChatDirectAutoReplyProcessor;
 
   beforeEach(() => {
@@ -109,10 +115,12 @@ describe('ChatDirectAutoReplyProcessor', () => {
     });
     broadcast.emitMessage.mockResolvedValue(undefined);
     push.onMessageBroadcast.mockResolvedValue(undefined);
+    sensitiveWords.check.mockReturnValue({ blocked: false });
     processor = new ChatDirectAutoReplyProcessor(
       prisma as never,
       broadcast as never,
       push as never,
+      sensitiveWords as never,
     );
   });
 
@@ -139,6 +147,19 @@ describe('ChatDirectAutoReplyProcessor', () => {
       expect(broadcast.emitMessage).not.toHaveBeenCalled();
     },
   );
+
+  it('does not send a stored auto reply that matches the current sensitive-word list', async () => {
+    sensitiveWords.check.mockReturnValue({ blocked: true, word: 'blocked' });
+
+    await processor.processMessage('source-1');
+
+    expect(sensitiveWords.check).toHaveBeenCalledWith('稍后回复');
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({ status: 'COMPLETED', lockedAt: null }),
+    });
+  });
 
   it('uses current active members to send a trimmed deterministic reply as the peer', async () => {
     await processor.processMessage('source-1');
@@ -460,6 +481,24 @@ describe('ChatDirectAutoReplyProcessor', () => {
         lockedAt: null,
         nextAttemptAt: expect.any(Date),
       },
+    });
+  });
+
+  it('cleans up expired terminal jobs and stale cooldown state', async () => {
+    const now = new Date('2026-09-20T00:00:00.000Z');
+    prisma.chatDirectAutoReplyJob.deleteMany.mockResolvedValue({ count: 4 });
+    prisma.chatDirectAutoReplyState.deleteMany.mockResolvedValue({ count: 2 });
+
+    await processor.cleanupExpired(now);
+
+    expect(prisma.chatDirectAutoReplyJob.deleteMany).toHaveBeenCalledWith({
+      where: {
+        status: { in: ['COMPLETED', 'FAILED'] },
+        updatedAt: { lt: new Date('2026-09-13T00:00:00.000Z') },
+      },
+    });
+    expect(prisma.chatDirectAutoReplyState.deleteMany).toHaveBeenCalledWith({
+      where: { updatedAt: { lt: new Date('2026-09-19T00:00:00.000Z') } },
     });
   });
 

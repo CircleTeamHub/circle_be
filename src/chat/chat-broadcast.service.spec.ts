@@ -177,7 +177,6 @@ describe('ChatBroadcastService member eviction', () => {
       where: {
         conversationID: 'conv-1',
         leftAt: null,
-        userID: { in: ['active-user', 'removed-user'] },
       },
       select: { userID: true },
     });
@@ -186,13 +185,32 @@ describe('ChatBroadcastService member eviction', () => {
     expect(emit).toHaveBeenCalledWith('chat:msg', message());
   });
 
-  it('waits for delayed presence resolution and falls back to all DB-active members when unavailable', async () => {
-    let resolvePresence!: (value: null) => void;
+  it('delivers to DB-active members when the presence registry is temporarily empty', async () => {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const presence = { getOnlineUserIds: jest.fn().mockResolvedValue([]) };
+    const prisma = prismaWithActiveUsers(['ready-user']);
+    const service = new ChatBroadcastService(
+      presence as never,
+      prisma as never,
+    );
+    service.setServer({ to } as never);
+
+    await service.emitMessage(message());
+
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:ready-user']);
+  });
+
+  it('does not wait for delayed presence before querying all DB-active members', async () => {
     const presence = {
       getOnlineUserIds: jest.fn(
         () =>
-          new Promise<null>((resolve) => {
-            resolvePresence = resolve;
+          new Promise<null>(() => {
+            // Deliberately unresolved: content delivery must not depend on it.
           }),
       ),
     };
@@ -205,14 +223,9 @@ describe('ChatBroadcastService member eviction', () => {
     );
     service.setServer({ to } as never);
 
-    const pending = service.emitMessage(message('direct-or-temp'));
-    await Promise.resolve();
-    expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
-    expect(emit).not.toHaveBeenCalled();
+    await service.emitMessage(message('direct-or-temp'));
 
-    resolvePresence(null);
-    await pending;
-
+    expect(presence.getOnlineUserIds).not.toHaveBeenCalled();
     expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
       where: { conversationID: 'direct-or-temp', leftAt: null },
       select: { userID: true },
@@ -373,6 +386,40 @@ describe('ChatBroadcastService member eviction', () => {
 });
 
 describe('ChatBroadcastService content-bearing edit privacy', () => {
+  it('does not let an incomplete presence registry exclude an active edit recipient', async () => {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const findMany = jest.fn(async ({ where }: any) => {
+      const active = ['registered-user', 'late-user'];
+      const candidates = where.userID?.in as string[] | undefined;
+      return active
+        .filter((userID) => !candidates || candidates.includes(userID))
+        .map((userID) => ({ userID }));
+    });
+    const presence = {
+      getOnlineUserIds: jest.fn().mockResolvedValue(['registered-user']),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      { chatMember: { findMany } } as never,
+    );
+    service.setServer({ to } as never);
+
+    await service.emitEdit({
+      conversationId: 'conv-1',
+      messageId: 'message-1',
+      content: { text: 'private edit' },
+      editedAt: '2026-09-03T00:00:00.000Z',
+    });
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:registered-user', 'u:late-user']);
+    expect(emit).toHaveBeenCalledWith('chat:edit', expect.any(Object));
+  });
+
   it('does not deliver an edit to a removed real RemoteSocket that remains in the stale conversation room', async () => {
     const activeSocket = realRemoteSocket({}, 'active-socket', [
       'c:conv-1',

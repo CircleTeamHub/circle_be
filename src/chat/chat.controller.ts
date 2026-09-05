@@ -246,6 +246,7 @@ export class ChatController {
       req.user.userId,
       conversationId,
       body?.forEveryone ?? false,
+      body?.targetHeight,
     );
   }
 

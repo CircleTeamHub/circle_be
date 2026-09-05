@@ -3243,7 +3243,13 @@ export class ChatService {
       return { updated: row, notice: dto };
     });
     // 广播放在提交之后:事务回滚了却已经播出去,客户端会显示一条并不存在的提示。
-    await this.systemMessage.broadcastSystemMessage(notice);
+    try {
+      await this.systemMessage.broadcastSystemMessage(notice);
+    } catch (error) {
+      this.logger.warn(
+        `burn audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+      );
+    }
     return { burnDurationSec: updated.burnDurationSec ?? null };
   }
 
@@ -3320,7 +3326,17 @@ export class ChatService {
     userId: string,
     conversationId: string,
     forEveryone = false,
+    targetHeight?: number,
   ): Promise<{ clearedBeforeHeight: number }> {
+    if (
+      targetHeight !== undefined &&
+      (!Number.isSafeInteger(targetHeight) || targetHeight < 0)
+    ) {
+      throw new BadRequestException({
+        message: '无效的清空目标水位',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
     const { watermark, isGlobalClear, advancedReaders, notice } =
       await this.prisma.$transaction(async (tx) => {
         // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
@@ -3390,7 +3406,8 @@ export class ChatService {
           }
         }
         const currentTop = conversation.nextHeight;
-        if (currentTop <= 0) {
+        const clearThrough = Math.min(currentTop, targetHeight ?? currentTop);
+        if (clearThrough <= 0) {
           return {
             watermark: 0,
             isGlobalClear: globalClear,
@@ -3406,35 +3423,37 @@ export class ChatService {
               })
             ).map((target) => target.userID)
           : [userId];
-        await tx.chatMember.updateMany({
+        const cleared = await tx.chatMember.updateMany({
           where: {
             conversationID: conversationId,
             userID: { in: targetUserIds },
             ...(globalClear ? { leftAt: null } : {}),
-            clearedBeforeHeight: { lt: currentTop },
+            clearedBeforeHeight: { lt: clearThrough },
           },
-          data: { clearedBeforeHeight: currentTop },
+          data: { clearedBeforeHeight: clearThrough },
         });
         const readers = await tx.chatMember.updateManyAndReturn({
           where: {
             conversationID: conversationId,
             userID: { in: targetUserIds },
             ...(globalClear ? { leftAt: null } : {}),
-            lastReadHeight: { lt: currentTop },
+            lastReadHeight: { lt: clearThrough },
           },
-          data: { lastReadHeight: currentTop },
+          data: { lastReadHeight: clearThrough },
           select: { userID: true },
         });
-        const auditMessage = globalClear
-          ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
-              tx,
-              conversationId,
-              currentTop,
-              { kind: 'history-cleared', actorId: userId },
-            )
-          : null;
+        const changed = (cleared?.count ?? 0) > 0 || readers.length > 0;
+        const auditMessage =
+          globalClear && changed
+            ? await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
+                tx,
+                conversationId,
+                currentTop,
+                { kind: 'history-cleared', actorId: userId },
+              )
+            : null;
         return {
-          watermark: currentTop,
+          watermark: clearThrough,
           isGlobalClear: globalClear,
           advancedReaders: readers,
           notice: auditMessage,
@@ -3445,19 +3464,37 @@ export class ChatService {
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
     for (const target of advancedReaders) {
-      this.broadcast.emitRead({
-        conversationId,
-        userId: target.userID,
-        height: watermark,
-      });
+      try {
+        this.broadcast.emitRead({
+          conversationId,
+          userId: target.userID,
+          height: watermark,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
-    if (isGlobalClear) {
-      this.broadcast.emitHistoryCleared({
-        conversationId,
-        clearedBeforeHeight: watermark,
-        clearedBy: userId,
-      });
-      await this.systemMessage.broadcastSystemMessage(notice!);
+    if (isGlobalClear && notice) {
+      try {
+        this.broadcast.emitHistoryCleared({
+          conversationId,
+          clearedBeforeHeight: watermark,
+          clearedBy: userId,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
+      try {
+        await this.systemMessage.broadcastSystemMessage(notice);
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
     }
     return { clearedBeforeHeight: watermark };
   }

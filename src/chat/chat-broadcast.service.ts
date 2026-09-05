@@ -278,32 +278,14 @@ export class ChatBroadcastService {
     const server = attachedServer ?? this.requireServer(caller);
     if (!server) return;
 
-    let onlineUserIds: string[] | null = null;
-    try {
-      onlineUserIds = await this.presence.getOnlineUserIds(
-        payload.conversationId,
-      );
-    } catch (error) {
-      // Registry is an optimization only. A read failure falls back to the DB
-      // active-seat set; targeting empty offline user rooms is harmless.
-      this.logger.warn(
-        `content broadcast presence lookup failed conversation=${payload.conversationId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-
-    const candidateUserIds = onlineUserIds ? [...new Set(onlineUserIds)] : null;
-    if (candidateUserIds?.length === 0) return;
-
-    // Even a non-null registry result may contain a stale removed user after a
-    // failed Redis removal. Always intersect it with authoritative active
-    // ChatMember rows before selecting user rooms.
+    // Presence registration happens after a socket becomes ready and may be
+    // temporarily incomplete during Redis recovery. It is therefore never an
+    // authorization or recipient filter. Empty user rooms are harmless; the
+    // active ChatMember set is the durable delivery boundary.
     const seats = await this.prisma.chatMember.findMany({
       where: {
         conversationID: payload.conversationId,
         leftAt: null,
-        ...(candidateUserIds ? { userID: { in: candidateUserIds } } : {}),
       },
       select: { userID: true },
     });

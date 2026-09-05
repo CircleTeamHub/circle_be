@@ -2,6 +2,7 @@ import { Prisma } from 'src/generated/prisma';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
   MOMENTS_VISIBILITY_OPTIONS,
@@ -44,7 +45,10 @@ type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
 
 @Injectable()
 export class PrivacySettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sensitiveWords: SensitiveWordService,
+  ) {}
 
   /**
    * `client` 默认走 this.prisma。需要与一次授权判定串行的调用方必须在共享
@@ -275,6 +279,12 @@ export class PrivacySettingsService {
       throw new BadRequestException({
         message:
           'Direct-message auto reply text must be at most 200 characters',
+      });
+    }
+    const autoReplyText = input.directMessageAutoReplyText?.trim();
+    if (autoReplyText && this.sensitiveWords.check(autoReplyText).blocked) {
+      throw new BadRequestException({
+        message: 'Direct-message auto reply text contains disallowed content',
       });
     }
   }

@@ -15,13 +15,15 @@ describe('PrivacySettingsService', () => {
     $executeRaw: jest.fn().mockResolvedValue(0),
     $transaction: jest.fn(async (input: any) => input(prisma)),
   };
+  const sensitiveWords = { check: jest.fn() };
 
   let service: PrivacySettingsService;
 
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
-    service = new PrivacySettingsService(prisma as any);
+    sensitiveWords.check.mockReturnValue({ blocked: false });
+    service = new PrivacySettingsService(prisma as any, sensitiveWords as any);
   });
 
   it('returns default account privacy settings without writing when none exist', async () => {
@@ -103,6 +105,19 @@ describe('PrivacySettingsService', () => {
         directMessageAutoReplyEnabled: 'yes' as never,
       }),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  it('rejects sensitive direct-message auto reply text before persistence', async () => {
+    sensitiveWords.check.mockReturnValue({ blocked: true, word: 'blocked' });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: 'contains blocked content',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
   });
 
   it('rejects string booleans under the production implicit-conversion pipe', () => {

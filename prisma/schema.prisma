@@ -470,6 +470,7 @@ model User {
   groupExpansionOrders              GroupExpansionOrder[]
   supportAgentRoles                 SupportAgent[]
   qrTokensIssued                    QrToken[]                   @relation("qrTokenIssuer")
+  chatDirectAutoReplyStates         ChatDirectAutoReplyState[]
 
   @@index([invitedByUserId])
   @@index([selectedAvatarFrameID])
@@ -2062,6 +2063,7 @@ model ChatConversation {
 
   members  ChatMember[]
   messages ChatMessage[]
+  directAutoReplyStates ChatDirectAutoReplyState[]
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
@@ -2118,6 +2120,7 @@ model ChatMessage {
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
   reactions    ChatMessageReaction[]
   mediaReferences ChatMediaReference[]
+  directAutoReplyJob ChatDirectAutoReplyJob? @relation("directAutoReplySource")
 
   @@unique([conversationID, height])
   @@unique([conversationID, senderID, clientMessageId])
@@ -2145,6 +2148,8 @@ model ChatDirectAutoReplyJob {
   createdAt       DateTime                     @default(now())
   updatedAt       DateTime                     @updatedAt
 
+  sourceMessage ChatMessage @relation("directAutoReplySource", fields: [sourceMessageID], references: [id], onDelete: Cascade)
+
   @@index([status, nextAttemptAt, createdAt])
 }
 
@@ -2156,6 +2161,9 @@ model ChatDirectAutoReplyState {
   lastRepliedAt  DateTime
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+  responder    User             @relation(fields: [responderID], references: [id], onDelete: Cascade)
 
   @@unique([conversationID, responderID])
   @@index([responderID, lastRepliedAt])
