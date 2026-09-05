@@ -87,9 +87,9 @@ export class SmtpMailer implements Mailer {
         ].join(''),
       });
     } catch (error) {
-      // external_call_failed 只带错误类名 + 脱敏 message（logExternalCallFailure
-      // 自带 token/secret 打码；SMTP 的 RCPT 回带收件人的情况由上游
-      // describeMailerError 处理）。原样重抛，上游把它变成用户可见的 503。
+      // external_call_failed 只带错误类名 + 脱敏 message；统一日志边界会打码
+      // token/secret 和 SMTP RCPT 可能回带的收件人地址。原样重抛，上游把它
+      // 变成用户可见的 503。
       result = 'failure';
       logExternalCallFailure(this.logger, {
         enabled: this.loggingConfig.externalLogOn,
