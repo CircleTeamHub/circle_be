@@ -13,7 +13,7 @@ import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import {
   assertUrlsFromStorage,
-  storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
 import {
@@ -70,7 +70,7 @@ const MOMENTS_POKE_MAX_PAGES = 20;
 export class TraceService {
   private readonly logger = new Logger(TraceService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly storagePublicObjectBase: string | null;
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -80,7 +80,7 @@ export class TraceService {
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
   ) {
-    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
     );
   }
@@ -343,7 +343,7 @@ export class TraceService {
   async createTrace(userId: string, dto: CreateTraceDto): Promise<TraceDto> {
     assertUrlsFromStorage(
       dto.images ?? [],
-      this.storagePublicObjectBase,
+      this.storagePublicObjectBases,
       'trace image',
     );
 
@@ -693,7 +693,7 @@ export class TraceService {
     }
     assertUrlsFromStorage(
       images,
-      this.storagePublicObjectBase,
+      this.storagePublicObjectBases,
       'comment image',
     );
 

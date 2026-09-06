@@ -140,6 +140,36 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 
 ---
 
+## 5. 外部对象存储切到 CDN 投递域名时,前后端必须同批发布
+
+**当前**:无影响(自管 MinIO,`OBJECT_STORAGE_MANAGE_BUCKET=true`)。
+**上线后**:P1 —— 配置不同步会让**全站媒体**在客户端整片消失。
+
+外部桶(`OBJECT_STORAGE_MANAGE_BUCKET=false`)必须配 `OBJECT_STORAGE_DELIVERY_URL`,
+永久媒体地址由它拼出,而 PUT/GET 签名仍走 `MINIO_PUBLIC_URL`。启动期会验:
+投递域名是 HTTPS、不等于签名端点、且不落在已知服务商后缀下;桶的 CORS 允许
+每个 `ALLOWED_ORIGINS` 带 `content-type` / `if-none-match` 发 PUT;
+`note-exports/` 有 1 天过期规则。任何一条不满足 —— 生产不启动。
+
+**跨仓库的那一条没有任何自动校验:**
+
+前端 [`src/constants/config.ts`](https://github.com/CircleTeamHub/Circle_frontend/blob/main/src/constants/config.ts)
+的 `MEDIA_ORIGINS` 来自构建期的 `EXPO_PUBLIC_MEDIA_ORIGINS`,
+`allowPeerMediaUrl` 只放行 `API_URL` + 这个白名单里的 origin。
+后端切到新投递域名、App 构建没同步加该 origin 时,**每一个合法媒体地址都会被
+客户端拒绝**:图片全空、语音放不了、封面消失 —— 而后端一切正常,监控无异常。
+
+**切换清单:**
+
+- [ ] `OBJECT_STORAGE_DELIVERY_URL` 指向自己可控的 CDN/WAF 域名(不是服务商源站)。
+- [ ] 该域名已加进 App 构建的 `EXPO_PUBLIC_MEDIA_ORIGINS`,**与后端同批发布**。
+- [ ] 桶 CORS 覆盖全部 `ALLOWED_ORIGINS`(启动会验,验不过就起不来)。
+- [ ] 灰度后实测:发一张图 + 一条语音 + 换一次封面,确认客户端能渲染。
+- [ ] 若桶内已有切换前的对象:它们的 url 仍指向直连域名,后端两个前缀都认;
+      但客户端只认白名单 —— 直连域名要么保留在白名单里,要么先回填 url。
+
+---
+
 ## 已闭合(仍需补强回归测试)
 
 - **icon 资格分页截断已选圈子 / Circle Builder 资格**(原 P2):与生产数据无关的代码正确性缺陷,

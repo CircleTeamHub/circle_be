@@ -69,15 +69,57 @@ export function storagePublicObjectBaseFromConfig(
 }
 
 /**
- * True if `url` is served from `publicUrl`'s origin.
+ * 这个部署下「属于我们自己的存储」的所有地址前缀,新地址在前。
+ *
+ * 配了 OBJECT_STORAGE_DELIVERY_URL 之后,新对象走 CDN 域名,而**切换之前**
+ * 存进库里的 url 仍指向直连域名。只认新前缀会让那些历史地址一夜之间
+ * 「不是本站存储」:编辑旧笔记/旧头像直接 400,存储审计还会把它们当成孤儿。
+ * 所以写入用单一 canonical base(第 0 个),识别用整个列表。
+ */
+export function storagePublicObjectBasesFromConfig(
+  config: Pick<ConfigService, 'get'>,
+): string[] {
+  const canonical = storagePublicObjectBaseFromConfig(config);
+  const publicUrl =
+    config.get<string>('MINIO_PUBLIC_URL') ??
+    config.get<string>('MINIO_ENDPOINT');
+  const bases = canonical ? [canonical] : [];
+  if (!publicUrl) return bases;
+  const bucket = config.get<string>('MINIO_BUCKET') ?? 'circle';
+  const configuredPathStyle = config.get<boolean | string>(
+    'OBJECT_STORAGE_FORCE_PATH_STYLE',
+  );
+  let forcePathStyle = true;
+  if (typeof configuredPathStyle === 'boolean') {
+    forcePathStyle = configuredPathStyle;
+  } else if (typeof configuredPathStyle === 'string') {
+    forcePathStyle = configuredPathStyle.toLowerCase() === 'true';
+  }
+  const direct = buildStoragePublicObjectBase(
+    publicUrl,
+    bucket,
+    forcePathStyle,
+  );
+  if (!bases.includes(direct)) bases.push(direct);
+  return bases;
+}
+
+/**
+ * True if `url` is served from one of `publicUrl`'s origins.
  *
  * The prefix must be followed by `/` (or match exactly) — a bare
  * `startsWith` check would let `https://host.attacker.com` pass when the
  * storage origin is `https://host`.
  */
-export function isUrlFromStorage(url: string, publicUrl: string): boolean {
-  const prefix = publicUrl.replace(/\/$/, '');
-  return url === prefix || url.startsWith(`${prefix}/`);
+export function isUrlFromStorage(
+  url: string,
+  publicUrl: string | readonly string[],
+): boolean {
+  const bases = typeof publicUrl === 'string' ? [publicUrl] : publicUrl;
+  return bases.some((base) => {
+    const prefix = base.replace(/\/$/, '');
+    return url === prefix || url.startsWith(`${prefix}/`);
+  });
 }
 
 /**
@@ -91,10 +133,12 @@ export function isUrlFromStorage(url: string, publicUrl: string): boolean {
  */
 export function assertUrlsFromStorage(
   urls: ReadonlyArray<string | null | undefined>,
-  publicUrl: string | null | undefined,
+  publicUrl: string | readonly string[] | null | undefined,
   label = 'url',
 ): void {
-  if (!publicUrl) return;
+  if (!publicUrl || (Array.isArray(publicUrl) && publicUrl.length === 0)) {
+    return;
+  }
   for (const url of urls) {
     if (typeof url === 'string' && url && !isUrlFromStorage(url, publicUrl)) {
       throw new BadRequestException(
