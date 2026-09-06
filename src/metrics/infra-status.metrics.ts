@@ -1,5 +1,9 @@
 import { Gauge, Registry } from 'prom-client';
 import type { ObjectStoreStatus } from 'src/utils/storage-url';
+import {
+  describeEmailCodeBypass,
+  type EmailCodeBypassState,
+} from 'src/auth/email-code-bypass';
 
 /**
  * 基建状态 gauge（#87 / #102-confirm 的告警面）。
@@ -18,6 +22,8 @@ export interface InfraStatusDeps {
   objectStoreStatus?: (() => ObjectStoreStatus) | null;
   /** RedisService.ping；Redis 未配置时传 null（不注册该指标，避免误报）。 */
   redisPing?: (() => Promise<boolean>) | null;
+  /** 固定验证码旁路状态。默认读 process.env；注入只为测试。 */
+  emailCodeBypass?: () => EmailCodeBypassState;
 }
 
 export function createInfraStatusMetrics(deps: InfraStatusDeps): {
@@ -64,6 +70,39 @@ export function createInfraStatusMetrics(deps: InfraStatusDeps): {
       },
     });
   }
+
+  // 无条件注册：这个指标的价值恰恰在「本来不该开的东西开着」，
+  // 因此没有「没配就不挂」的余地 —— 恒 0 才是常态，非 0 就该有人被叫醒。
+  const emailCodeBypass = deps.emailCodeBypass ?? describeEmailCodeBypass;
+  new Gauge({
+    name: 'circle_email_code_bypass_active',
+    help:
+      '1 when a fixed email verification code can authenticate someone ' +
+      '(2 when production opted in but the configuration is rejected), else 0. ' +
+      'Non-zero in production means allowlisted accounts need no password.',
+    registers: [registry],
+    collect() {
+      const state = emailCodeBypass();
+      this.set(
+        state.status === 'active' || state.status === 'non-production'
+          ? 1
+          : state.status === 'misconfigured'
+            ? 2
+            : 0,
+      );
+    },
+  });
+  new Gauge({
+    name: 'circle_email_code_bypass_identities',
+    help:
+      'Number of allowlisted (purpose, email) identities that can authenticate ' +
+      'with the fixed email code in production. 0 unless the bypass is live.',
+    registers: [registry],
+    collect() {
+      const state = emailCodeBypass();
+      this.set(state.status === 'active' ? state.identities : 0);
+    },
+  });
 
   return { registry };
 }

@@ -412,6 +412,18 @@ groups:
         annotations:
           summary: 'Private-media bucket policy unconfirmed — notes/* may be anonymously readable'
 
+      # 固定验证码旁路在 production 生效 = 允许名单里的账号免密可登。
+      # 它只靠三个环境变量开启，没有任何请求路径会暴露它，因此除了启动日志
+      # 就只有这条告警能发现「预生产测试窗口结束后忘了关」。
+      # max 而不是 min：只要有一个实例带着旁路在服务就必须响。
+      - alert: EmailCodeBypassActive
+        expr: max(circle_email_code_bypass_active) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Fixed email verification code is live — allowlisted accounts need no password'
+
       # #102：会话撤销 fail-open 依赖 Redis。Redis 挂掉期间登出/封禁/盗号撤销
       # 全部静默失效（HTTP 与 WS 同步失效），必须有人处理。
       - alert: RedisDown
