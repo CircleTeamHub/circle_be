@@ -22,6 +22,7 @@ import {
   PutBucketPolicyCommand,
   ListObjectsV2Command,
   type BucketLocationConstraint,
+  type CORSRule,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
@@ -31,7 +32,7 @@ import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
   buildStoragePublicObjectBase,
-  storagePublicObjectBaseFromConfig,
+  normalizeStorageDeliveryBase,
   type ObjectStoreStatus,
 } from 'src/utils/storage-url';
 
@@ -185,6 +186,68 @@ function readBooleanConfig(
   return typeof value === 'boolean' ? value : value.toLowerCase() === 'true';
 }
 
+function matchesCorsWildcard(pattern: string, value: string): boolean {
+  const normalizedPattern = pattern.toLowerCase();
+  const normalizedValue = value.toLowerCase();
+  if (!normalizedPattern.includes('*')) {
+    return normalizedPattern === normalizedValue;
+  }
+
+  const parts = normalizedPattern.split('*');
+  let cursor = 0;
+  if (!normalizedPattern.startsWith('*')) {
+    if (!normalizedValue.startsWith(parts[0])) return false;
+    cursor = parts[0].length;
+  }
+  const firstSearchPart = normalizedPattern.startsWith('*') ? 0 : 1;
+  for (let index = firstSearchPart; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) continue;
+    const match = normalizedValue.indexOf(part, cursor);
+    if (match === -1) return false;
+    const matchEnd = match + part.length;
+    if (
+      index === parts.length - 1 &&
+      !normalizedPattern.endsWith('*') &&
+      matchEnd !== normalizedValue.length
+    ) {
+      return false;
+    }
+    cursor = matchEnd;
+  }
+  return true;
+}
+
+const REQUIRED_UPLOAD_CORS_HEADERS = ['content-type', 'if-none-match'];
+
+function corsRuleAllowsBrowserPut(rule: CORSRule, origin: string): boolean {
+  const methods = (rule.AllowedMethods ?? []).map((method) =>
+    method.toUpperCase(),
+  );
+  if (!methods.includes('PUT')) return false;
+  if (
+    !(rule.AllowedOrigins ?? []).some((pattern) =>
+      matchesCorsWildcard(pattern, origin),
+    )
+  ) {
+    return false;
+  }
+  const headers = (rule.AllowedHeaders ?? []).map((header) =>
+    header.toLowerCase(),
+  );
+  return REQUIRED_UPLOAD_CORS_HEADERS.every((header) =>
+    headers.some((pattern) => matchesCorsWildcard(pattern, header)),
+  );
+}
+
+function storageOrigin(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
@@ -234,11 +297,19 @@ export class UploadService implements OnModuleInit {
       this.bucket,
       forcePathStyle,
     );
-    this.publicObjectBase =
-      storagePublicObjectBaseFromConfig(this.config) ?? directPublicObjectBase;
+    const configuredDeliveryUrl = this.config.get<string>(
+      'OBJECT_STORAGE_DELIVERY_URL',
+    );
+    const deliveryBase = configuredDeliveryUrl
+      ? normalizeStorageDeliveryBase(configuredDeliveryUrl)
+      : null;
+    this.publicObjectBase = deliveryBase ?? directPublicObjectBase;
+    const deliveryOrigin = deliveryBase ? storageOrigin(deliveryBase) : null;
     this.externalDeliveryConfigured = Boolean(
-      this.config.get<string>('OBJECT_STORAGE_DELIVERY_URL')?.trim() &&
-      this.publicObjectBase !== directPublicObjectBase,
+      deliveryBase &&
+      new URL(deliveryBase).protocol === 'https:' &&
+      deliveryOrigin !== storageOrigin(this.publicUrl) &&
+      deliveryOrigin !== storageOrigin(directPublicObjectBase),
     );
     this.production =
       (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
@@ -800,25 +871,11 @@ export class UploadService implements OnModuleInit {
     const response = await this.client.send(
       new GetBucketCorsCommand({ Bucket: this.bucket }),
     );
-    const requiredHeaders = ['content-type', 'if-none-match'];
     const missingOrigins = this.allowedOrigins.filter(
       (origin) =>
-        !(response.CORSRules ?? []).some((rule) => {
-          const methods = (rule.AllowedMethods ?? []).map((method) =>
-            method.toUpperCase(),
-          );
-          const origins = rule.AllowedOrigins ?? [];
-          const headers = (rule.AllowedHeaders ?? []).map((header) =>
-            header.toLowerCase(),
-          );
-          return (
-            methods.includes('PUT') &&
-            origins.includes(origin) &&
-            requiredHeaders.every(
-              (header) => headers.includes(header) || headers.includes('*'),
-            )
-          );
-        }),
+        !(response.CORSRules ?? []).some((rule) =>
+          corsRuleAllowsBrowserPut(rule, origin),
+        ),
     );
     if (missingOrigins.length > 0) {
       throw new Error(

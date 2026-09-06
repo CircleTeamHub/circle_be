@@ -399,9 +399,9 @@ describe('UploadService', () => {
       .mockResolvedValueOnce({
         CORSRules: [
           {
-            AllowedOrigins: ['https://app.example.com'],
+            AllowedOrigins: ['https://*.example.com'],
             AllowedMethods: ['PUT'],
-            AllowedHeaders: ['content-type', 'if-none-match'],
+            AllowedHeaders: ['content-*', 'if-none-match'],
           },
         ],
       });
@@ -483,6 +483,33 @@ describe('UploadService', () => {
     (service as any).client = { send };
 
     await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+  });
+
+  it.each([
+    'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com:443',
+    'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/media',
+    'https://cos.ap-tokyo.myqcloud.com/circle',
+  ])('rejects provider-equivalent delivery URL %s', async (deliveryUrl) => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({
+      status: 503,
+    });
   });
 
   it('rejects production startup when external storage lacks browser upload CORS', async () => {

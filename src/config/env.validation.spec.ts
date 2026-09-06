@@ -94,6 +94,28 @@ describe('createEnvValidationSchema', () => {
     expect(error?.message).toContain('OBJECT_STORAGE_DELIVERY_URL');
   });
 
+  it.each([
+    'http://media.example.com/circle',
+    'ftp://media.example.com/circle',
+    'https://user:password@media.example.com/circle',
+    'https://media.example.com/circle?token=secret',
+    'https://media.example.com/circle#fragment',
+  ])('rejects unsafe production object delivery URL %s', (deliveryUrl) => {
+    const env = {
+      ...baseEnv,
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      ALLOWED_ORIGINS: 'https://app.example.com',
+      SECRET: 'x'.repeat(32),
+      TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
+      OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('OBJECT_STORAGE_DELIVERY_URL');
+  });
+
   it('normalizes referral reward defaults', () => {
     const env = {
       ...baseEnv,

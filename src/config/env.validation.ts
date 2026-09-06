@@ -58,6 +58,19 @@ export function createEnvValidationSchema(
     ? Joi.string().allow('').optional()
     : Joi.string().required();
   const redisUrlSchema = Joi.string().uri({ scheme: ['redis', 'rediss'] });
+  const objectDeliveryUrlSchema = (schemes: string[]) =>
+    Joi.string()
+      .uri({ scheme: schemes })
+      .custom((value, helpers) => {
+        const url = new URL(value);
+        if (url.username || url.password || url.search || url.hash) {
+          return helpers.message({
+            custom:
+              'OBJECT_STORAGE_DELIVERY_URL must not include credentials, a query, or a fragment',
+          });
+        }
+        return value;
+      });
   const productionRedisUrlSchema = redisUrlSchema.custom((value, helpers) => {
     const url = new URL(value);
     const queryPasswords = url.searchParams.getAll('password');
@@ -237,7 +250,11 @@ export function createEnvValidationSchema(
       .default('us-east-1'),
     OBJECT_STORAGE_FORCE_PATH_STYLE: Joi.boolean().default(true),
     OBJECT_STORAGE_MANAGE_BUCKET: Joi.boolean().default(true),
-    OBJECT_STORAGE_DELIVERY_URL: Joi.string().uri().optional(),
+    OBJECT_STORAGE_DELIVERY_URL: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: objectDeliveryUrlSchema(['https']).optional(),
+      otherwise: objectDeliveryUrlSchema(['http', 'https']).optional(),
+    }),
     // Comma-separated list of allowed CORS origins. Required in production.
     ALLOWED_ORIGINS: Joi.when('NODE_ENV', {
       is: 'production',
