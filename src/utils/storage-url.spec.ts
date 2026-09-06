@@ -47,4 +47,20 @@ describe('storage URL helpers', () => {
       'http://minio:9000/circle',
     );
   });
+
+  it('prefers an exact rate-limited delivery base over the signing endpoint', () => {
+    const config = {
+      get: (key: string) =>
+        ({
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_BUCKET: 'windnote-1234567890',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: false,
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle/',
+        })[key],
+    };
+
+    expect(storagePublicObjectBaseFromConfig(config as never)).toBe(
+      'https://media.example.com/circle',
+    );
+  });
 });

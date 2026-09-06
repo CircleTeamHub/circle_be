@@ -31,6 +31,7 @@ import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
   buildStoragePublicObjectBase,
+  storagePublicObjectBaseFromConfig,
   type ObjectStoreStatus,
 } from 'src/utils/storage-url';
 
@@ -196,6 +197,7 @@ export class UploadService implements OnModuleInit {
   private readonly region: string;
   private readonly manageBucket: boolean;
   private readonly allowedOrigins: string[];
+  private readonly externalDeliveryConfigured: boolean;
   private readonly enabled: boolean;
   private readonly production: boolean;
   private ready = false;
@@ -227,10 +229,16 @@ export class UploadService implements OnModuleInit {
       .split(',')
       .map((origin) => origin.trim())
       .filter(Boolean);
-    this.publicObjectBase = buildStoragePublicObjectBase(
+    const directPublicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
       forcePathStyle,
+    );
+    this.publicObjectBase =
+      storagePublicObjectBaseFromConfig(this.config) ?? directPublicObjectBase;
+    this.externalDeliveryConfigured = Boolean(
+      this.config.get<string>('OBJECT_STORAGE_DELIVERY_URL')?.trim() &&
+      this.publicObjectBase !== directPublicObjectBase,
     );
     this.production =
       (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
@@ -266,6 +274,15 @@ export class UploadService implements OnModuleInit {
         'MinIO is not configured (MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY missing). Upload features will be skipped.',
       );
       return;
+    }
+    if (
+      this.production &&
+      !this.manageBucket &&
+      !this.externalDeliveryConfigured
+    ) {
+      throw new ServiceUnavailableException(
+        'External media must use an explicitly configured rate-limited delivery URL',
+      );
     }
     // Bucket bootstrap must not crash the whole app: if MinIO is unreachable
     // at boot, log and continue — `presign` surfaces a clean 503 to callers,

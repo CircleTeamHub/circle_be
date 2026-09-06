@@ -68,6 +68,7 @@ describe('createEnvValidationSchema', () => {
       OBJECT_STORAGE_REGION: 'ap-tokyo',
       OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
       OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
     };
 
     const { error, value } = createEnvValidationSchema(env).validate(env);
@@ -77,7 +78,20 @@ describe('createEnvValidationSchema', () => {
       OBJECT_STORAGE_REGION: 'ap-tokyo',
       OBJECT_STORAGE_FORCE_PATH_STYLE: false,
       OBJECT_STORAGE_MANAGE_BUCKET: false,
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
     });
+  });
+
+  it('rejects a malformed external object delivery URL', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      OBJECT_STORAGE_DELIVERY_URL: 'not a URL',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('OBJECT_STORAGE_DELIVERY_URL');
   });
 
   it('normalizes referral reward defaults', () => {

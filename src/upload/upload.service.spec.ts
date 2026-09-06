@@ -351,6 +351,7 @@ describe('UploadService', () => {
       OBJECT_STORAGE_REGION: 'ap-tokyo',
       OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
       OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
     };
     const service = new UploadService({
       get: (key: string) => (config as Record<string, string>)[key] ?? null,
@@ -372,8 +373,11 @@ describe('UploadService', () => {
 
     await expect(signingClient.config.region()).resolves.toBe('ap-tokyo');
     expect(signingClient.config.forcePathStyle).toBe(false);
+    expect(result.uploadUrl).toContain(
+      'windnote-1234567890.cos.ap-tokyo.myqcloud.com/',
+    );
     expect(result.fileUrl).toBe(
-      `https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/${result.key}`,
+      `https://media.example.com/circle/${result.key}`,
     );
     expect(service.objectKeyFromPublicUrl(result.fileUrl)).toBe(result.key);
   });
@@ -413,6 +417,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
           ALLOWED_ORIGINS: 'https://app.example.com',
         })[key] ?? null,
     } as any);
@@ -436,6 +441,48 @@ describe('UploadService', () => {
       expect.stringContaining('cannot verify externally managed bucket policy'),
     );
     expect(service.objectStoreStatus()).toBe('external-unverified');
+  });
+
+  it('rejects production external storage that exposes direct provider URLs', async () => {
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        Rules: [
+          {
+            Status: 'Enabled',
+            Filter: { Prefix: 'note-exports/' },
+            Expiration: { Days: 1 },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        CORSRules: [
+          {
+            AllowedOrigins: ['https://app.example.com'],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['*'],
+          },
+        ],
+      });
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
   });
 
   it('rejects production startup when external storage lacks browser upload CORS', async () => {
@@ -464,6 +511,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
           ALLOWED_ORIGINS: 'https://app.example.com',
         })[key] ?? null,
     } as any);
@@ -495,6 +543,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
@@ -555,6 +604,7 @@ describe('UploadService', () => {
             OBJECT_STORAGE_REGION: 'ap-tokyo',
             OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
             OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+            OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
           })[key] ?? null,
       } as any);
       (service as any).client = { send };
@@ -588,6 +638,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };

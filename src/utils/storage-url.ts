@@ -31,6 +31,8 @@ export function buildStoragePublicObjectBase(
 export function storagePublicObjectBaseFromConfig(
   config: Pick<ConfigService, 'get'>,
 ): string | null {
+  const deliveryUrl = config.get<string>('OBJECT_STORAGE_DELIVERY_URL');
+  if (deliveryUrl?.trim()) return stripTrailingSlashes(deliveryUrl.trim());
   const publicUrl =
     config.get<string>('MINIO_PUBLIC_URL') ??
     config.get<string>('MINIO_ENDPOINT');
