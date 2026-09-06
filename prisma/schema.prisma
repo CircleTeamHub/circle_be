@@ -2098,6 +2098,11 @@ model ChatMember {
 
   @@unique([conversationID, userID])
   @@index([userID])
+  // 消息扇出的收件人查询覆盖索引。广播与推送两条路径都按
+  // conversationID + leftAt IS NULL + clearedBeforeHeight < height 取收件人；
+  // 尾部的 userID / muted 不参与过滤，只为让两条查询走 index-only scan。
+  // 详见 migrations/20260906010000_add_chat_member_fanout_index。
+  @@index([conversationID, leftAt, clearedBeforeHeight, userID, muted], map: "ChatMember_fanout_idx")
 }
 
 /// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，

@@ -6,6 +6,62 @@ describe('createEnvValidationSchema', () => {
     SECRET: 'test-secret',
   };
 
+  const productionBypassEnv = {
+    NODE_ENV: 'production',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    ALLOWED_ORIGINS: 'https://app.example.com',
+    SECRET: 'x'.repeat(32),
+    TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
+    EMAIL_CODE_DEV_BYPASS: 'Zq7mK2xR9vT4sPwL8bN3',
+    EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+    EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'LOGIN:tester@example.com',
+  };
+
+  it('accepts a fully configured production email-code bypass', () => {
+    const { error } =
+      createEnvValidationSchema(productionBypassEnv).validate(
+        productionBypassEnv,
+      );
+
+    expect(error).toBeUndefined();
+  });
+
+  it('rejects a guessable production email-code bypass instead of silently disabling it', () => {
+    const env = { ...productionBypassEnv, EMAIL_CODE_DEV_BYPASS: '999999' };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('EMAIL_CODE_DEV_BYPASS');
+  });
+
+  it.each([undefined, 'LOGIN:not-an-email', 'RESET_PASSWORD:a@example.com'])(
+    'rejects the production bypass opt-in with allowlist %s',
+    (allowlist) => {
+      const env = {
+        ...productionBypassEnv,
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: allowlist,
+      };
+
+      const { error } = createEnvValidationSchema(env).validate(env);
+
+      expect(error?.message).toContain(
+        'EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST',
+      );
+    },
+  );
+
+  it('leaves a non-production fixed code alone', () => {
+    const env = {
+      ...baseEnv,
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+      EMAIL_CODE_DEV_BYPASS: '999999',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+  });
+
   it('requires DATABASE_URL by default', () => {
     const { error } = createEnvValidationSchema({
       ...baseEnv,

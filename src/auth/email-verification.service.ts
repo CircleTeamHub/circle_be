@@ -3,17 +3,21 @@ import {
   Inject,
   Injectable,
   Logger,
+  type OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
-import { isEmail } from 'class-validator';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
 import { MAILER, Mailer } from './mailer/mailer.interface';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import {
+  describeEmailCodeBypass,
+  resolveEmailBypassCode,
+} from './email-code-bypass';
 
 /** SMTP 错误 → 可入日志的脱敏描述：类名 + code/responseCode + 打码正文。 */
 function describeMailerError(error: unknown): string {
@@ -43,7 +47,7 @@ const RESEND_COOLDOWN_MS = 60 * 1000; // 60 秒
 const MAX_ATTEMPTS = 5;
 
 @Injectable()
-export class EmailVerificationService {
+export class EmailVerificationService implements OnModuleInit {
   private readonly logger = new Logger(EmailVerificationService.name);
 
   constructor(
@@ -56,46 +60,31 @@ export class EmailVerificationService {
   }
 
   /**
-   * 固定验证码只在显式配置时启用，没有内置默认码。
-   * production 还需第二个显式开关和 email+purpose 白名单，避免只因为
-   * 遗留了本地变量就把共享环境变成公开后门；密码重置永不允许旁路。
+   * 启动时把旁路状态吼出来。
+   *
+   * 这三个变量此前不进 env 校验、不进 /readyz、不进 /metrics：生产环境的旁路
+   * 可以一直开着而没有任何信号。日志横幅是最后一道「有人会看见」的保障，
+   * 可告警的硬指标见 metrics/infra-status.metrics.ts。
    */
-  private getDevBypassCode(
-    email: string,
-    purpose: EmailCodePurpose,
-  ): string | null {
-    const value = process.env.EMAIL_CODE_DEV_BYPASS?.trim();
-    if (!value || value.toLowerCase() === 'off') return null;
-    if (process.env.NODE_ENV === 'production') {
-      if (
-        process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS !== 'true' ||
-        purpose === 'RESET_PASSWORD'
-      ) {
-        return null;
-      }
-      const allowed = this.parseProductionBypassAllowlist();
-      if (!allowed) return null;
-      if (!allowed.has(`${purpose}:${email}`)) return null;
+  onModuleInit(): void {
+    const bypass = describeEmailCodeBypass();
+    if (bypass.status === 'active') {
+      this.logger.error(
+        `[SECURITY] production email code bypass is LIVE for ${bypass.identities} allowlisted identity/identities — anyone holding EMAIL_CODE_DEV_BYPASS can authenticate as them without a password; unset EMAIL_CODE_* before a formal release`,
+      );
+      return;
     }
-    return value;
-  }
-
-  private parseProductionBypassAllowlist(): Set<string> | null {
-    const raw = process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
-    if (!raw?.trim()) return null;
-
-    const allowed = new Set<string>();
-    for (const rawEntry of raw.split(',')) {
-      const parts = rawEntry.split(':');
-      if (parts.length !== 2) return null;
-      const purpose = parts[0].trim().toUpperCase();
-      const email = normalizeEmail(parts[1]);
-      if ((purpose !== 'REGISTER' && purpose !== 'LOGIN') || !isEmail(email)) {
-        return null;
-      }
-      allowed.add(`${purpose}:${email}`);
+    if (bypass.status === 'misconfigured') {
+      this.logger.error(
+        `[SECURITY] production email code bypass is opted in but disabled (fail closed): ${bypass.reason}`,
+      );
+      return;
     }
-    return allowed;
+    if (bypass.status === 'non-production') {
+      this.logger.warn(
+        '[DEV] a fixed email verification code is enabled for every purpose in this non-production environment',
+      );
+    }
   }
 
   async requestCode(
@@ -250,7 +239,7 @@ export class EmailVerificationService {
     const email = normalizeEmail(rawEmail);
 
     // 显式开启时，固定码可直接通过（无需先请求验证码）。
-    const bypass = this.getDevBypassCode(email, purpose);
+    const bypass = resolveEmailBypassCode(email, purpose);
     if (bypass && code === bypass) {
       this.logger.warn(
         `[DEV] email code bypass used (${purpose}) — disable in production`,
