@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
+import { isEmail } from 'class-validator';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
@@ -56,19 +57,45 @@ export class EmailVerificationService {
 
   /**
    * 固定验证码只在显式配置时启用，没有内置默认码。
-   * production 还需第二个显式开关，避免只因为遗留了本地变量就把
-   * 共享环境变成公开后门。
+   * production 还需第二个显式开关和 email+purpose 白名单，避免只因为
+   * 遗留了本地变量就把共享环境变成公开后门；密码重置永不允许旁路。
    */
-  private getDevBypassCode(): string | null {
+  private getDevBypassCode(
+    email: string,
+    purpose: EmailCodePurpose,
+  ): string | null {
     const value = process.env.EMAIL_CODE_DEV_BYPASS?.trim();
     if (!value || value.toLowerCase() === 'off') return null;
-    if (
-      process.env.NODE_ENV === 'production' &&
-      process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS !== 'true'
-    ) {
-      return null;
+    if (process.env.NODE_ENV === 'production') {
+      if (
+        process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS !== 'true' ||
+        purpose === 'RESET_PASSWORD'
+      ) {
+        return null;
+      }
+      const allowed = this.parseProductionBypassAllowlist();
+      if (!allowed) return null;
+      if (!allowed.has(`${purpose}:${email}`)) return null;
     }
     return value;
+  }
+
+  private parseProductionBypassAllowlist(): Set<string> | null {
+    const raw = process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
+    if (!raw?.trim()) return null;
+
+    const allowed = new Set<string>();
+    for (const rawEntry of raw.split(',')) {
+      const parts = rawEntry.split(':');
+      if (parts.length !== 2) return null;
+      const purpose = parts[0].trim().toUpperCase();
+      const email = normalizeEmail(parts[1]);
+      if ((purpose !== 'REGISTER' && purpose !== 'LOGIN') || !isEmail(email)) {
+        return null;
+      }
+      allowed.add(`${purpose}:${email}`);
+    }
+    return allowed;
   }
 
   async requestCode(
@@ -223,7 +250,7 @@ export class EmailVerificationService {
     const email = normalizeEmail(rawEmail);
 
     // 显式开启时，固定码可直接通过（无需先请求验证码）。
-    const bypass = this.getDevBypassCode();
+    const bypass = this.getDevBypassCode(email, purpose);
     if (bypass && code === bypass) {
       this.logger.warn(
         `[DEV] email code bypass used (${purpose}) — disable in production`,
