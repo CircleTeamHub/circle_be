@@ -27,12 +27,34 @@ export interface EmailCodeBypassEnv {
   EMAIL_CODE_DEV_BYPASS?: string;
   EMAIL_CODE_ALLOW_PRODUCTION_BYPASS?: string | boolean;
   EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST?: string;
+  /** jest 在每个 worker（含 --runInBand）都会设它；线上进程永远没有。 */
+  JEST_WORKER_ID?: string;
+}
+
+/**
+ * 无限制旁路只认两种进程：本机 development，以及跑在 jest 里的测试进程。
+ *
+ * 「不是 production 就放开」是 fail-open 的判法：NODE_ENV 没设的时候它同样成立，
+ * 而没设恰恰是共享机器上最常见的情况 —— 裸跑一次 `node dist/main.js`，或者一个
+ * 一次性的冒烟脚本，都不会带上 NODE_ENV。env.validation 只放行
+ * development|production|test，所以「写错成 staging」会启动失败；但「压根没设」
+ * 一路绿灯，而且 Joi 的 .default('development') 落在 ConfigService 对象上，不会
+ * 写回 process.env，这里读的正是 process.env。
+ *
+ * NODE_ENV=test 单独也不够：它是 env.validation 允许的三个值之一，部署时同样
+ * 可能被选中。再要求 JEST_WORKER_ID 才算数 —— e2e 把 Nest 应用起在 jest 进程内
+ * （test/app.factory.ts 用 Test.createTestingModule + app.listen(0)），所以 CI 的
+ * E2E 任务照常能用固定码注册；而一台服务器无论如何都拿不到这个变量。
+ */
+function isUnrestrictedBypassEnv(env: EmailCodeBypassEnv): boolean {
+  if (env.NODE_ENV === 'development') return true;
+  return env.NODE_ENV === 'test' && Boolean(env.JEST_WORKER_ID);
 }
 
 export type EmailCodeBypassStatus =
-  /** 未配置固定码，或 production 缺少显式开关 —— 没有旁路。 */
+  /** 未配置固定码，或受限环境缺少显式开关 —— 没有旁路。 */
   | 'off'
-  /** 非 production：固定码对所有用途有效（含 RESET_PASSWORD），按设计如此。 */
+  /** development 或 jest 进程：固定码对所有用途有效（含 RESET_PASSWORD）。 */
   | 'non-production'
   /** production：固定码对允许名单里的 (purpose, email) 生效。 */
   | 'active'
@@ -92,7 +114,7 @@ export function describeEmailCodeBypass(
 ): EmailCodeBypassState {
   const code = trimmedBypassCode(env);
   if (!code) return { status: 'off', identities: 0 };
-  if (env.NODE_ENV !== 'production') {
+  if (isUnrestrictedBypassEnv(env)) {
     return { status: 'non-production', identities: 0 };
   }
   if (!productionOptInEnabled(env)) return { status: 'off', identities: 0 };
@@ -127,7 +149,7 @@ export function resolveEmailBypassCode(
 ): string | null {
   const code = trimmedBypassCode(env);
   if (!code) return null;
-  if (env.NODE_ENV !== 'production') return code;
+  if (isUnrestrictedBypassEnv(env)) return code;
   if (!(BYPASSABLE_PURPOSES as readonly string[]).includes(purpose))
     return null;
   if (!productionOptInEnabled(env)) return null;
