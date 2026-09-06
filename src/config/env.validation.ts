@@ -7,6 +7,7 @@ import {
   REFERRAL_MAX_REWARD,
 } from 'src/referral/referral.constants';
 import { parseDurationMilliseconds } from 'src/utils/duration';
+import { describeEmailCodeBypass } from 'src/auth/email-code-bypass';
 
 type EnvLike = NodeJS.ProcessEnv | Record<string, unknown>;
 
@@ -191,6 +192,13 @@ export function createEnvValidationSchema(
     // FE#119 拍板：测试期默认开视频（LiveKit 免费额度内）；流量成本可观时
     // 用 env 显式关闭。
     CALL_ENABLE_VIDEO: Joi.boolean().default(true),
+    // 固定验证码旁路。三个变量此前完全不进 env 校验，于是 production 的旁路
+    // 可以带着 6 位数字的示例码悄悄开着 —— 声明在这里，配错就在启动期炸掉。
+    // 具体规则（production 需要显式开关 + 足够长的码 + PURPOSE:email 允许名单）
+    // 见下方 custom 与 auth/email-code-bypass.ts。
+    EMAIL_CODE_DEV_BYPASS: Joi.string().allow('').optional(),
+    EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: Joi.boolean().optional(),
+    EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: Joi.string().allow('').optional(),
     // 真实邮件投递（#82）。SMTP_HOST 未设 = 受支持的开发态（ConsoleMailer，
     // 验证码打日志）；设了 host 就必须配齐凭据 —— production 半配置要在启动期
     // 炸掉，而不是运行时静默不发信。465 → 隐式 TLS；587 → SMTP_SECURE=false
@@ -272,6 +280,21 @@ export function createEnvValidationSchema(
   })
     .unknown(true)
     .custom((value, helpers) => {
+      // 显式开了 production 旁路却配不合格时，宁可启动失败也不要静默降级：
+      // 运行时 fail closed（见 email-code-bypass.ts）会让运维以为旁路生效，
+      // 拿着一个永远不通过的码排查半天。
+      const bypass = describeEmailCodeBypass({
+        NODE_ENV: value.NODE_ENV,
+        EMAIL_CODE_DEV_BYPASS: value.EMAIL_CODE_DEV_BYPASS,
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS:
+          value.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS,
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST:
+          value.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST,
+      });
+      if (bypass.status === 'misconfigured' && bypass.reason) {
+        return helpers.message({ custom: bypass.reason });
+      }
+
       const accessTtl = parseDurationMilliseconds(value.JWT_EXPIRES_IN);
       const refreshTtl = parseRefreshDurationMilliseconds(
         value.REFRESH_EXPIRES_IN ?? value.REFRESH_EXPIRES_IN_DAYS ?? '7d',

@@ -140,6 +140,35 @@ program 未启用期间,一个 `maxMembers` 落在 **401–3000** 的建圈请�
 
 ---
 
+## 4. 预生产测试窗口结束后,固定验证码旁路必须确认关闭
+
+**当前**:预生产窗口内可控开启。**上线后**:P0 —— 允许名单里的每个 `LOGIN` 条目
+都等于那个账号可以免密登录。
+
+`EMAIL_CODE_DEV_BYPASS` + `EMAIL_CODE_ALLOW_PRODUCTION_BYPASS=true` +
+`EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST` 三者齐备时,允许名单里的
+`(用途, 邮箱)` 只要提交那个固定码就通过验证,**不需要请求验证码、不需要密码**。
+`RESET_PASSWORD` 永不允许旁路,但 `LOGIN` 允许 —— 这是它对预生产有用的原因,
+也是它上线后必须关掉的原因。
+
+判定、校验、上报共用
+[`auth/email-code-bypass.ts`](../src/auth/email-code-bypass.ts)。
+
+**上线前逐条确认:**
+
+- [ ] 生产 `.env.production` 里三个 `EMAIL_CODE_*` 全部删除(不是设成空字符串)。
+- [ ] 启动日志中**没有** `[SECURITY] production email code bypass is LIVE` 横幅。
+- [ ] `circle_email_code_bypass_active` 为 `0`,且 `EmailCodeBypassActive` 告警未触发。
+- [ ] 窗口期内曾被列入允许名单的账号,确认都是测试账号(真实用户地址绝不能进名单)。
+
+**已有的防呆(不能替代上面的人工确认):** 配置不合格不会静默降级 ——
+码短于 16 位、名单畸形/缺失、用途非 `REGISTER`/`LOGIN` 都会让**启动失败**;
+生效期间启动日志有 `[SECURITY]` 横幅,`/metrics` 有可告警的硬指标。
+探针 `/readyz` **有意不暴露**该状态:它未鉴权,把「此处有固定码」写进公开响应
+等于给攻击者发请柬。
+
+---
+
 ## 已闭合(仍需补强回归测试)
 
 - **icon 资格分页截断已选圈子 / Circle Builder 资格**(原 P2):与生产数据无关的代码正确性缺陷,
