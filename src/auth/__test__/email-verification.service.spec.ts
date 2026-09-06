@@ -8,6 +8,27 @@ import { EmailVerificationService } from '../email-verification.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAILER } from '../mailer/mailer.interface';
 
+async function withProcessEnv(
+  values: Record<string, string | undefined>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const previous = new Map(
+    Object.keys(values).map((key) => [key, process.env[key]]),
+  );
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    await run();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 describe('EmailVerificationService', () => {
   let service: EmailVerificationService;
   let codes: any[];
@@ -375,9 +396,12 @@ describe('EmailVerificationService', () => {
     const prevNodeEnv = process.env.NODE_ENV;
     const prevBypass = process.env.EMAIL_CODE_DEV_BYPASS;
     const prevProductionOptIn = process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS;
+    const prevAllowlist = process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
     process.env.NODE_ENV = 'production';
     process.env.EMAIL_CODE_DEV_BYPASS = '999999';
     process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = 'true';
+    process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST =
+      'REGISTER:nobody@b.com';
     try {
       await expect(
         service.verifyCode('nobody@b.com', 'REGISTER', '999999'),
@@ -392,19 +416,82 @@ describe('EmailVerificationService', () => {
       } else {
         process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = prevProductionOptIn;
       }
+      if (prevAllowlist === undefined) {
+        delete process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
+      } else {
+        process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST = prevAllowlist;
+      }
     }
+  });
+
+  it('keeps the production bypass disabled without an email-purpose allowlist', async () => {
+    await withProcessEnv(
+      {
+        NODE_ENV: 'production',
+        EMAIL_CODE_DEV_BYPASS: '999999',
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: undefined,
+      },
+      async () => {
+        await expect(
+          service.verifyCode('nobody@b.com', 'REGISTER', '999999'),
+        ).resolves.toBe(false);
+      },
+    );
+  });
+
+  it('limits the production bypass to the exact normalized email and purpose', async () => {
+    await withProcessEnv(
+      {
+        NODE_ENV: 'production',
+        EMAIL_CODE_DEV_BYPASS: '999999',
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'REGISTER:allowed@example.com',
+      },
+      async () => {
+        await expect(
+          service.verifyCode('other@example.com', 'REGISTER', '999999'),
+        ).resolves.toBe(false);
+        await expect(
+          service.verifyCode('allowed@example.com', 'LOGIN', '999999'),
+        ).resolves.toBe(false);
+        await expect(
+          service.verifyCode(' Allowed@Example.com ', 'REGISTER', '999999'),
+        ).resolves.toBe(true);
+      },
+    );
+  });
+
+  it('never allows the production bypass for password reset', async () => {
+    await withProcessEnv(
+      {
+        NODE_ENV: 'production',
+        EMAIL_CODE_DEV_BYPASS: '999999',
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST:
+          'RESET_PASSWORD:allowed@example.com',
+      },
+      async () => {
+        await expect(
+          service.verifyCode('allowed@example.com', 'RESET_PASSWORD', '999999'),
+        ).resolves.toBe(false);
+      },
+    );
   });
 
   it('does not write the verified email address to logs when the bypass is used', async () => {
     const prevNodeEnv = process.env.NODE_ENV;
     const prevBypass = process.env.EMAIL_CODE_DEV_BYPASS;
     const prevProductionOptIn = process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS;
+    const prevAllowlist = process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
     const warn = jest
       .spyOn((service as any).logger, 'warn')
       .mockImplementation(() => undefined);
     process.env.NODE_ENV = 'production';
     process.env.EMAIL_CODE_DEV_BYPASS = '999999';
     process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = 'true';
+    process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST =
+      'LOGIN:private.user@example.com';
     try {
       await expect(
         service.verifyCode('private.user@example.com', 'LOGIN', '999999'),
@@ -423,6 +510,11 @@ describe('EmailVerificationService', () => {
         delete process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS;
       } else {
         process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS = prevProductionOptIn;
+      }
+      if (prevAllowlist === undefined) {
+        delete process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
+      } else {
+        process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST = prevAllowlist;
       }
     }
   });

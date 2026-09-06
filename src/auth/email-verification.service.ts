@@ -56,17 +56,29 @@ export class EmailVerificationService {
 
   /**
    * 固定验证码只在显式配置时启用，没有内置默认码。
-   * production 还需第二个显式开关，避免只因为遗留了本地变量就把
-   * 共享环境变成公开后门。
+   * production 还需第二个显式开关和 email+purpose 白名单，避免只因为
+   * 遗留了本地变量就把共享环境变成公开后门；密码重置永不允许旁路。
    */
-  private getDevBypassCode(): string | null {
+  private getDevBypassCode(
+    email: string,
+    purpose: EmailCodePurpose,
+  ): string | null {
     const value = process.env.EMAIL_CODE_DEV_BYPASS?.trim();
     if (!value || value.toLowerCase() === 'off') return null;
-    if (
-      process.env.NODE_ENV === 'production' &&
-      process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS !== 'true'
-    ) {
-      return null;
+    if (process.env.NODE_ENV === 'production') {
+      if (
+        process.env.EMAIL_CODE_ALLOW_PRODUCTION_BYPASS !== 'true' ||
+        purpose === 'RESET_PASSWORD'
+      ) {
+        return null;
+      }
+      const allowed = new Set(
+        (process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST ?? '')
+          .split(',')
+          .map((entry) => entry.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      if (!allowed.has(`${purpose}:${email}`.toLowerCase())) return null;
     }
     return value;
   }
@@ -223,7 +235,7 @@ export class EmailVerificationService {
     const email = normalizeEmail(rawEmail);
 
     // 显式开启时，固定码可直接通过（无需先请求验证码）。
-    const bypass = this.getDevBypassCode();
+    const bypass = this.getDevBypassCode(email, purpose);
     if (bypass && code === bypass) {
       this.logger.warn(
         `[DEV] email code bypass used (${purpose}) — disable in production`,
