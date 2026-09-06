@@ -20,6 +20,17 @@ const JOB_STALE_MS = 2 * 60_000;
 const JOB_BACKOFF_BASE_MS = 2_000;
 const JOB_BACKOFF_MAX_MS = 60_000;
 const AUTO_REPLY_COOLDOWN_MS = 30_000;
+/**
+ * 每会话冷却之外的**全局**上限：同一个应答者在这个窗口内最多向这么多个不同
+ * 会话自动回复。
+ *
+ * 30 秒的每会话冷却只挡得住一个人反复戳。1000 个号各发一条私聊，就是 1000 条
+ * 自动回复 —— 每条都是一次取会话行锁、两把关系锁和用户行锁的写事务，外加一次
+ * 广播和一次推送，而发起方的成本是发一条消息。上限打满后这一轮直接把 job 收掉：
+ * 自动回复是礼貌，不是投递保证，丢掉一条远好过让别人用你的账号当放大器。
+ */
+const AUTO_REPLY_WINDOW_MS = 60_000;
+const AUTO_REPLY_MAX_CONVERSATIONS_PER_WINDOW = 20;
 const PROCESSING_FAILED = 'PROCESSING_FAILED';
 const TERMINAL_JOB_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const COOLDOWN_STATE_RETENTION_MS = 24 * 60 * 60_000;
@@ -356,6 +367,32 @@ export class ChatDirectAutoReplyProcessor {
         state &&
         now.getTime() - state.lastRepliedAt.getTime() < AUTO_REPLY_COOLDOWN_MS
       ) {
+        await this.completeJob(tx, jobId);
+        return null;
+      }
+
+      // 数的是「窗口内有多少个不同会话被这个应答者回过」。每个会话本来就有 30 秒
+      // 冷却，所以这个数与实际回复条数在同一量级，而 @@index([responderID,
+      // lastRepliedAt]) 已经在 schema 里，这一查是走索引的计数。
+      //
+      // 咨询锁只到会话粒度，不同会话的 job 会并发跑，因此这是个**软**上限：
+      // 并发下可能溢出几条。限流够用了 —— 它不是正确性不变量，真正要挡的是
+      // 「一个账号被当成无限放大器」这个量级差。
+      const recentConversations = await tx.chatDirectAutoReplyState.count({
+        where: {
+          responderID,
+          lastRepliedAt: {
+            gte: new Date(now.getTime() - AUTO_REPLY_WINDOW_MS),
+          },
+        },
+      });
+      if (recentConversations >= AUTO_REPLY_MAX_CONVERSATIONS_PER_WINDOW) {
+        this.logger.warn({
+          event: 'direct_auto_reply_rate_limited',
+          responderID,
+          recentConversations,
+          windowMs: AUTO_REPLY_WINDOW_MS,
+        });
         await this.completeJob(tx, jobId);
         return null;
       }
