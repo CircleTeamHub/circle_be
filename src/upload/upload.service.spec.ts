@@ -1,4 +1,8 @@
-import { UploadService, buildPublicReadBucketPolicy } from './upload.service';
+import {
+  UploadService,
+  buildPublicReadBucketPolicy,
+  matchesCorsWildcard,
+} from './upload.service';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
@@ -967,4 +971,46 @@ describe('UploadService', () => {
       });
     },
   );
+
+  it('refuses to start when a configured delivery URL is unusable', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'http://minio:9000',
+          MINIO_ACCESS_KEY: 'key',
+          MINIO_SECRET_KEY: 'secret',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'http://minio:9000',
+          OBJECT_STORAGE_DELIVERY_URL:
+            'https://media.example.com/circle?token=secret',
+        })[key] ?? null,
+    } as any);
+
+    // 不能静默回落到直连域名 —— 那正是这份契约要禁掉的地址。
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe('matchesCorsWildcard', () => {
+  it.each([
+    ['https://*.example.com', 'https://app.example.com'],
+    ['https://app.example.com', 'https://app.example.com'],
+    ['*', 'https://anything.example.com'],
+    ['content-*', 'content-type'],
+    // 需要回溯的两例：逐段扫描会少匹配，云厂商实际放行。
+    ['https://*.co', 'https://evil.co.co'],
+    ['https://*.example.com', 'https://a.example.com.example.com'],
+  ])('matches provider wildcard %s against %s', (pattern, value) => {
+    expect(matchesCorsWildcard(pattern, value)).toBe(true);
+  });
+
+  it.each([
+    ['https://app.example.com', 'https://app.example.com.evil.com'],
+    ['https://*.example.com', 'https://example.com'],
+    ['content-type', 'if-none-match'],
+    // 模式里的 `.` 必须按字面量匹配，不能当成正则的任意字符。
+    ['https://a.example.com', 'https://axexample.com'],
+  ])('does not match %s against %s', (pattern, value) => {
+    expect(matchesCorsWildcard(pattern, value)).toBe(false);
+  });
 });
