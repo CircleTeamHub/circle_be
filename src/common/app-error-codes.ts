@@ -352,6 +352,9 @@ export const CollectionErrorCode = {
   NotFound: 'COLLECTION_NOT_FOUND',
   // #104 审查发现：无每用户上限，客户端循环可无界造行。
   Limit: 'COLLECTION_LIMIT',
+  // 阅后即焚会话里别人发的消息不可收藏 —— 与 CHAT_FORWARD_FORBIDDEN 同一条理由，
+  // 但收藏走的是另一扇门（客户端拼快照直接 POST），那道闸管不到它。
+  EphemeralForbidden: 'COLLECTION_EPHEMERAL_FORBIDDEN',
 } as const;
 
 // 展示图标 / 系统图标 / 圈子图标选择。(注:图标页暂未接入 getApiErrorMessage,待前端接线。)
