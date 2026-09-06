@@ -120,6 +120,58 @@ describe('PrivacySettingsService', () => {
     expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
   });
 
+  it('rejects enabling direct-message auto reply with blank text', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: '   ',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('validates partial auto-reply updates against the stored final state', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      directMessageAutoReplyEnabled: false,
+      directMessageAutoReplyText: '',
+    });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: true,
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+  });
+
+  it('allows disabling auto reply and clearing its draft text', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      directMessageAutoReplyEnabled: true,
+      directMessageAutoReplyText: '稍后回复',
+    });
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      directMessageAutoReplyEnabled: false,
+      directMessageAutoReplyText: '',
+    });
+
+    await expect(
+      service.updateSettings('user-1', {
+        directMessageAutoReplyEnabled: false,
+        directMessageAutoReplyText: '',
+      }),
+    ).resolves.toMatchObject({
+      directMessageAutoReplyEnabled: false,
+      directMessageAutoReplyText: '',
+    });
+  });
+
   it('rejects string booleans under the production implicit-conversion pipe', () => {
     for (const raw of ['false', 'true', '0', '1', '']) {
       const dto = plainToInstance(
