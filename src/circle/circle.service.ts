@@ -458,6 +458,26 @@ export class CircleService {
         });
       }
 
+      // 先鉴权,再取锁。这把会话行锁正是发消息取号要的那一把,不设前置闸的话
+      // 任何人 PATCH 一下这个圈子就能占着它,而且改的哪怕只是头像、连一条审计
+      // 消息都不会写。下面锁后那次复查是权威判定(它要与成员变更串行),两者
+      // 职责不同,都要留。
+      const preflightMembership = await tx.circleMember.findUnique({
+        where: { userID_circleID: { userID: userId, circleID: circleId } },
+        select: { role: true, status: true },
+      });
+      if (
+        !preflightMembership ||
+        preflightMembership.status !== 'ACTIVE' ||
+        (preflightMembership.role !== 'OWNER' &&
+          preflightMembership.role !== 'ADMIN')
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the circle owner or admin can edit circle settings',
+          errorCode: CircleErrorCode.EditForbidden,
+        });
+      }
+
       const conversation = await tx.chatConversation.findUnique({
         where: { circleID: circleId },
         select: { id: true },

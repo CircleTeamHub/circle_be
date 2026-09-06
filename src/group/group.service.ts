@@ -404,6 +404,30 @@ export class GroupService {
     }>(this.prisma, async (tx) => {
       let conversationId: string | null = null;
       let message: ChatMessageDto | null = null;
+      // 先鉴权,再取锁。反过来的话:任何拿得到 groupID 的人都能让服务端先给这个
+      // 圈子的会话行上一把排他锁,而发消息取号要的正是同一把锁 —— 一串注定
+      // 403 的请求就能卡住整个群的消息投递,顺带还能拿锁竞争当侧信道。
+      // updateGroupMemberRole 早就是这个顺序并写明了理由,这里补齐。
+      //
+      // 这只是前置闸:能不能动某个具体目标还要看目标的角色,那个判定必须在锁后
+      // 用一致的快照做,所以下面的 assertCanManageCircleGroup 一条不少地保留。
+      const preflightActor = await tx.circleMember.findUnique({
+        where: {
+          userID_circleID: { userID: actorId, circleID: circle.id },
+        },
+        select: { role: true, status: true },
+      });
+      if (
+        !preflightActor ||
+        preflightActor.status !== CircleMemberStatus.ACTIVE ||
+        (preflightActor.role !== CircleMemberRole.OWNER &&
+          preflightActor.role !== CircleMemberRole.ADMIN)
+      ) {
+        throw new ForbiddenException({
+          message: 'Only active group managers can do this',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
       const conversation = await tx.chatConversation.findUnique({
         where: { circleID: circle.id },
         select: { id: true },
@@ -467,7 +491,10 @@ export class GroupService {
         }
 
         if (lockedConversation) {
-          conversationId = lockedConversation.id;
+          // 注意不要在这里覆盖 conversationId:它是 releaseSeatInTx 的返回值,
+          // null 表示「这个人本来就没有座位」。覆盖掉的话,提交后会对一个他从没
+          // 进过的会话跑一遍 detachSeat —— 跨节点抓一次 socket,并给他推一条
+          // 「已被移出该会话」。系统提示用锁行自己的 id,与座位有没有收回无关。
           message =
             await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
               tx,
