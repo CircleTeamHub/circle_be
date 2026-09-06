@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
+import { isEmail } from 'class-validator';
 import { EmailCodePurpose } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
@@ -72,15 +73,29 @@ export class EmailVerificationService {
       ) {
         return null;
       }
-      const allowed = new Set(
-        (process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST ?? '')
-          .split(',')
-          .map((entry) => entry.trim().toLowerCase())
-          .filter(Boolean),
-      );
-      if (!allowed.has(`${purpose}:${email}`.toLowerCase())) return null;
+      const allowed = this.parseProductionBypassAllowlist();
+      if (!allowed) return null;
+      if (!allowed.has(`${purpose}:${email}`)) return null;
     }
     return value;
+  }
+
+  private parseProductionBypassAllowlist(): Set<string> | null {
+    const raw = process.env.EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST;
+    if (!raw?.trim()) return null;
+
+    const allowed = new Set<string>();
+    for (const rawEntry of raw.split(',')) {
+      const parts = rawEntry.split(':');
+      if (parts.length !== 2) return null;
+      const purpose = parts[0].trim().toUpperCase();
+      const email = normalizeEmail(parts[1]);
+      if ((purpose !== 'REGISTER' && purpose !== 'LOGIN') || !isEmail(email)) {
+        return null;
+      }
+      allowed.add(`${purpose}:${email}`);
+    }
+    return allowed;
   }
 
   async requestCode(

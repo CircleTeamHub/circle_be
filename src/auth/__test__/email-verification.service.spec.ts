@@ -440,6 +440,50 @@ describe('EmailVerificationService', () => {
     );
   });
 
+  it.each([
+    'malformed,REGISTER:allowed@example.com',
+    'REGISTER:',
+    ':allowed@example.com',
+    'REGISTER:allowed@example.com:extra',
+    'UNKNOWN:allowed@example.com',
+    'REGISTER:not-an-email',
+    'REGISTER:allowed@example.com,',
+  ])(
+    'fails the entire production bypass closed for malformed allowlist %s',
+    async (allowlist) => {
+      await withProcessEnv(
+        {
+          NODE_ENV: 'production',
+          EMAIL_CODE_DEV_BYPASS: '999999',
+          EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+          EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: allowlist,
+        },
+        async () => {
+          await expect(
+            service.verifyCode('allowed@example.com', 'REGISTER', '999999'),
+          ).resolves.toBe(false);
+        },
+      );
+    },
+  );
+
+  it('normalizes each production allowlist email', async () => {
+    await withProcessEnv(
+      {
+        NODE_ENV: 'production',
+        EMAIL_CODE_DEV_BYPASS: '999999',
+        EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
+        EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST:
+          ' REGISTER : Allowed@Example.com ',
+      },
+      async () => {
+        await expect(
+          service.verifyCode('allowed@example.com', 'REGISTER', '999999'),
+        ).resolves.toBe(true);
+      },
+    );
+  });
+
   it('limits the production bypass to the exact normalized email and purpose', async () => {
     await withProcessEnv(
       {
