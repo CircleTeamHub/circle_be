@@ -112,6 +112,16 @@ export class PrivacySettingsService {
       // stricter privacy setting can return success while a concurrent action
       // still commits from an older snapshot.
       await lockUserRelationshipState(tx, [userId]);
+      if (
+        input.directMessageAutoReplyEnabled !== undefined ||
+        input.directMessageAutoReplyText !== undefined
+      ) {
+        const current = await this.getSettings(userId, tx);
+        this.assertValidAutoReplyState({
+          ...current,
+          ...update,
+        } as PrivacySettingsDto);
+      }
       return tx.userPrivacySetting.upsert({
         where: { userID: userId },
         create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
@@ -285,6 +295,17 @@ export class PrivacySettingsService {
     if (autoReplyText && this.sensitiveWords.check(autoReplyText).blocked) {
       throw new BadRequestException({
         message: 'Direct-message auto reply text contains disallowed content',
+      });
+    }
+  }
+
+  private assertValidAutoReplyState(settings: PrivacySettingsDto) {
+    if (
+      settings.directMessageAutoReplyEnabled &&
+      !settings.directMessageAutoReplyText.trim()
+    ) {
+      throw new BadRequestException({
+        message: 'Direct-message auto reply text is required when enabled',
       });
     }
   }
