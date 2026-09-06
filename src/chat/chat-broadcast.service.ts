@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import type { Server } from 'socket.io';
+import type { RemoteSocket, Server } from 'socket.io';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
@@ -24,6 +24,11 @@ import type {
 export class ChatBroadcastService {
   private readonly logger = new Logger(ChatBroadcastService.name);
   private server: Server | null = null;
+
+  /** 离房收敛的重试次数。跨节点通常一轮就到,多给两轮覆盖 adapter 抖动。 */
+  private static readonly ROOM_LEAVE_ATTEMPTS = 3;
+  /** 每轮之间的等待。只在移除成员时付,最坏 3 轮共约 150ms。 */
+  private static readonly ROOM_LEAVE_RECHECK_MS = 50;
 
   constructor(
     private readonly presence: ChatPresenceRegistry,
@@ -233,7 +238,22 @@ export class ChatBroadcastService {
     }
   }
 
-  /** 成员被移出后把其在线 socket 撤出会话房(座位收回即时生效,不等重连)。 */
+  /**
+   * 成员被移出后把其在线 socket 撤出会话房(座位收回即时生效,不等重连)。
+   *
+   * RemoteSocket.leave() 返回 void:它只是把命令投给 adapter,没有任何回执可
+   * await。「发出去了」不等于「生效了」,而这两者之间没有信号 —— 于是一个没退
+   * 干净的 socket 会继续留在会话房里,收到所有按房间广播的事件(chat:read、
+   * chat:typing、chat:revoke、chat:reaction、chat:history_cleared……)。
+   * chat:msg / chat:edit 已经改成按 active ChatMember 投个人房、不受影响,
+   * 但其余那些仍是房间广播,对一个已经被移出的人来说就是一条持续的元数据流。
+   *
+   * 所以这里不再「发完就算」:发完再查一遍,确认这个人的 socket 确实不在房里
+   * 了;没收敛就重试。成本只在移除成员时付一次(低频),消息热路径一点不碰。
+   * 重试仍不收敛才断掉他的连接 —— 那是粗暴的(会断掉他所有会话),所以只当
+   * 最后一步,正常情况下永远走不到;重连时 handleConnection 会按当前座位重新
+   * 派生房间,已经没座位的会话自然不在里面。
+   */
   async removeUserFromConversation(
     userId: string,
     conversationId: string,
@@ -241,14 +261,43 @@ export class ChatBroadcastService {
     await this.presence.conversationLeft(userId, conversationId);
     const server = this.requireServer('removeUserFromConversation');
     if (!server) return;
-    const sockets = await server.in(userRoom(userId)).fetchSockets();
-    // Socket.IO RemoteSocket.leave() returns void: calling it dispatches the
-    // adapter command but provides no acknowledgement to await. Message
-    // privacy therefore does not depend on this best-effort room cleanup;
-    // emitMessage re-authorizes recipients against active ChatMember rows.
-    for (const socket of sockets) {
-      socket.leave(conversationRoom(conversationId));
+    const room = conversationRoom(conversationId);
+
+    const stillSeated = async (): Promise<RemoteSocket<never, unknown>[]> => {
+      const sockets = await server.in(userRoom(userId)).fetchSockets();
+      return sockets.filter((socket) => socket.rooms.has(room));
+    };
+
+    let stale = await stillSeated();
+    // 人不在线,或者本来就不在房里 —— 两种都是要的结果,一次等待都不用付。
+    if (stale.length === 0) return;
+
+    for (
+      let attempt = 1;
+      attempt <= ChatBroadcastService.ROOM_LEAVE_ATTEMPTS;
+      attempt += 1
+    ) {
+      for (const socket of stale) {
+        socket.leave(room);
+      }
+      // 先复查再决定要不要等:收敛了就直接返回,不空耗一个 recheck 周期。
+      stale = await stillSeated();
+      if (stale.length === 0) return;
+      if (attempt < ChatBroadcastService.ROOM_LEAVE_ATTEMPTS) {
+        await this.wait(ChatBroadcastService.ROOM_LEAVE_RECHECK_MS);
+      }
     }
+
+    this.logger.warn(
+      `room eviction did not converge conversation=${conversationId}; disconnecting the member's sockets`,
+    );
+    await this.disconnectUserSockets(userId);
+  }
+
+  private wait(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
   }
 
   /**

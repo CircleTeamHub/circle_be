@@ -113,14 +113,18 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
 describe('ChatBroadcastService member eviction', () => {
   it('uses the real void RemoteSocket leave contract without pretending it is an acknowledgement', async () => {
     const adapter = { delSockets: jest.fn() };
-    const socket = realRemoteSocket(adapter);
+    const socket = realRemoteSocket(adapter, 'socket-1', [
+      'socket-1',
+      'c:conv-1',
+    ]);
     expect(socket.leave('contract-probe')).toBeUndefined();
     adapter.delSockets.mockClear();
-    const server = {
-      in: jest.fn(() => ({
-        fetchSockets: jest.fn().mockResolvedValue([socket]),
-      })),
-    };
+    // 第一次查到人还在房里 → 派发 leave；第二次查已经不在 → 收敛，直接返回。
+    const fetchSockets = jest
+      .fn()
+      .mockResolvedValueOnce([socket])
+      .mockResolvedValueOnce([]);
+    const server = { in: jest.fn(() => ({ fetchSockets })) };
     const presence = {
       conversationLeft: jest.fn().mockResolvedValue(undefined),
     };
@@ -257,15 +261,17 @@ describe('ChatBroadcastService member eviction', () => {
           });
         }),
       };
-      const socket = realRemoteSocket(adapter);
+      const socket = realRemoteSocket(adapter, 'socket-1', [
+        'socket-1',
+        'c:conv-1',
+      ]);
       const emit = jest.fn();
       const to = jest.fn(() => ({ emit }));
-      const server = {
-        in: jest.fn(() => ({
-          fetchSockets: jest.fn().mockResolvedValue([socket]),
-        })),
-        to,
-      };
+      const fetchSockets = jest
+        .fn()
+        .mockResolvedValueOnce([socket])
+        .mockResolvedValueOnce([]);
+      const server = { in: jest.fn(() => ({ fetchSockets })), to };
       const presence = {
         conversationLeft: jest.fn().mockResolvedValue(undefined),
         getOnlineUserIds: jest
@@ -291,6 +297,69 @@ describe('ChatBroadcastService member eviction', () => {
     }
   });
 
+  // leave() 没有回执，「发出去了」不等于「生效了」。发完要复查；复查仍在房里
+  // 就重试；重试到上限还在，才动用断连这个粗暴手段（它会断掉该用户所有会话）。
+  it('retries the leave and only disconnects once the room never converges', async () => {
+    const adapter = { delSockets: jest.fn(), disconnectSockets: jest.fn() };
+    // 真实的 RemoteSocket.leave() 不会改自己的 rooms，所以「一直查得到」正是
+    // 没收敛的样子。
+    const socket = realRemoteSocket(adapter, 'stuck-socket', [
+      'stuck-socket',
+      'c:conv-1',
+    ]);
+    const server = {
+      in: jest.fn(() => ({
+        fetchSockets: jest.fn().mockResolvedValue([socket]),
+      })),
+    };
+    const presence = {
+      conversationLeft: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
+    service.setServer(server as never);
+    const warn = jest
+      .spyOn(
+        (service as unknown as { logger: { warn: jest.Mock } }).logger,
+        'warn',
+      )
+      .mockImplementation(() => undefined);
+
+    await service.removeUserFromConversation('removed-user', 'conv-1');
+
+    expect(adapter.delSockets).toHaveBeenCalledTimes(3);
+    expect(adapter.disconnectSockets).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('room eviction did not converge'),
+    );
+  });
+
+  // 人不在房里（离线，或者上一次已经退掉了）：一次 leave 都不该发，也不该等。
+  it('dispatches nothing when the member holds no socket in the room', async () => {
+    const adapter = { delSockets: jest.fn(), disconnectSockets: jest.fn() };
+    const socket = realRemoteSocket(adapter, 'elsewhere', ['elsewhere']);
+    const server = {
+      in: jest.fn(() => ({
+        fetchSockets: jest.fn().mockResolvedValue([socket]),
+      })),
+    };
+    const presence = {
+      conversationLeft: jest.fn().mockResolvedValue(undefined),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
+    service.setServer(server as never);
+
+    await service.removeUserFromConversation('removed-user', 'conv-1');
+
+    expect(adapter.delSockets).not.toHaveBeenCalled();
+    expect(adapter.disconnectSockets).not.toHaveBeenCalled();
+  });
+
   it('keeps future messages private when leave fails and void disconnect fallback cannot acknowledge completion', async () => {
     const leaveAdapter = {
       delSockets: jest.fn(() => {
@@ -298,7 +367,10 @@ describe('ChatBroadcastService member eviction', () => {
       }),
     };
     const disconnectAdapter = { disconnectSockets: jest.fn() };
-    const leavingRemote = realRemoteSocket(leaveAdapter, 'leaving-remote');
+    const leavingRemote = realRemoteSocket(leaveAdapter, 'leaving-remote', [
+      'leaving-remote',
+      'c:conv-1',
+    ]);
     const disconnectRemote = realRemoteSocket(
       disconnectAdapter,
       'disconnect-remote',
