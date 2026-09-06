@@ -46,6 +46,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
     chatMember: { findMany: jest.fn(), updateMany: jest.fn() },
     block: { findFirst: jest.fn() },
     chatDirectAutoReplyState: {
+      count: jest.fn(),
       deleteMany: jest.fn(),
       findMany: jest.fn(),
       findUnique: jest.fn(),
@@ -105,6 +106,7 @@ describe('ChatDirectAutoReplyProcessor', () => {
       directMessageAutoReplyText: '  稍后回复  ',
     });
     prisma.chatDirectAutoReplyState.findUnique.mockResolvedValue(null);
+    prisma.chatDirectAutoReplyState.count.mockResolvedValue(0);
     prisma.chatMessage.create.mockResolvedValue(reply);
     prisma.chatConversation.update.mockResolvedValue({});
     prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
@@ -327,6 +329,39 @@ describe('ChatDirectAutoReplyProcessor', () => {
 
     expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     expect(prisma.chatDirectAutoReplyState.upsert).not.toHaveBeenCalled();
+  });
+
+  // 每会话冷却挡的是一个人反复戳。1000 个号各发一条走的是 1000 个不同会话，
+  // 每个会话的冷却都是干净的 —— 于是一个开了自动回复的账号变成无限放大器：
+  // 对方发一条，这边就是一次带三把锁的写事务加一次广播加一次推送。
+  it('stops replying once the responder has hit the global window ceiling', async () => {
+    prisma.chatDirectAutoReplyState.count.mockResolvedValue(20);
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatDirectAutoReplyState.count).toHaveBeenCalledWith({
+      where: {
+        responderID: 'u2',
+        lastRepliedAt: { gte: new Date(createdAt.getTime() - 60_000) },
+      },
+    });
+    expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(prisma.chatDirectAutoReplyState.upsert).not.toHaveBeenCalled();
+    // 收掉而不是留着重试：这条自动回复被限流丢弃了，重试只会再撞一次上限。
+    expect(prisma.chatDirectAutoReplyJob.update).toHaveBeenCalledWith({
+      where: { id: 'job-1' },
+      data: expect.objectContaining({ status: 'COMPLETED' }),
+    });
+  });
+
+  // 上限是「窗口内的不同会话数」，正好卡在上限之下的那一条必须照常发出去，
+  // 否则这道闸会把正常使用的人也一起挡掉。
+  it('still replies while the responder is just under the ceiling', async () => {
+    prisma.chatDirectAutoReplyState.count.mockResolvedValue(19);
+
+    await processor.processMessage('source-1');
+
+    expect(prisma.chatMessage.create).toHaveBeenCalled();
   });
 
   it('uses the database clock for cooldown decisions across app instances', async () => {
