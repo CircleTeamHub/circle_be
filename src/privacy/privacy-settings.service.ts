@@ -5,6 +5,7 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
 import {
+  AUTO_REPLY_TEXT_MAX_CODE_POINTS,
   MOMENTS_VISIBILITY_OPTIONS,
   PERMISSION_OPTIONS,
   PrivacySettingsDto,
@@ -274,7 +275,8 @@ export class PrivacySettingsService {
     if (
       input.directMessageAutoReplyText !== undefined &&
       (typeof input.directMessageAutoReplyText !== 'string' ||
-        Array.from(input.directMessageAutoReplyText.trim()).length > 200)
+        Array.from(input.directMessageAutoReplyText.trim()).length >
+          AUTO_REPLY_TEXT_MAX_CODE_POINTS)
     ) {
       throw new BadRequestException({
         message:

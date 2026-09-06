@@ -392,7 +392,12 @@ export class ChatService {
           where: { id: effectivePayload.conversationId },
           data: { nextHeight: height, lastMessageAt: row.createdAt },
         });
-        await this.enqueueDirectAutoReplyInTx(tx, conversation, row);
+        await this.enqueueDirectAutoReplyInTx(
+          tx,
+          conversation,
+          senderUserId,
+          row,
+        );
         await this.enqueueRechargeAutomationInTx(
           tx,
           conversation,
@@ -538,9 +543,33 @@ export class ChatService {
   private async enqueueDirectAutoReplyInTx(
     tx: Prisma.TransactionClient,
     conversation: ChatConversation,
+    senderUserId: string,
     message: Pick<ChatMessage, 'id'>,
   ): Promise<void> {
     if (conversation.type !== 'DIRECT') return;
+    // 自动回复默认是关的,而此前每条私聊都无条件建一个 job:发送事务里多一次
+    // INSERT,提交后还要 kick 一次处理器,而处理器会取会话行锁、两把关系锁和
+    // 用户行锁,跑完才发现开关是关的。抢的正是发消息要的那把会话行锁,一来一回
+    // 的快速对话会被自己的空转串起来;COMPLETED 的行还要留 7 天。
+    //
+    // 入队前先看一眼对方开没开。peer 从 directKey 推,不额外查会话成员 ——
+    // 与隔壁 enqueueRechargeAutomationInTx 同一手法。
+    const responderId = conversation.directKey
+      ?.split(':')
+      .find((id) => id !== senderUserId);
+    if (!responderId) return;
+    const settings = await tx.userPrivacySetting.findUnique({
+      where: { userID: responderId },
+      select: {
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: true,
+      },
+    });
+    // 这只是一道闸,不是权威判定:开关可能在入队与处理之间改变,所以处理器仍会
+    // 在锁下重查一遍(见 chat-direct-auto-reply.processor)。这里放过的会被那边
+    // 拦下;这里拦掉的是「发消息那一刻对方确实没开」,本就不该回复。
+    if (!settings?.directMessageAutoReplyEnabled) return;
+    if (!settings.directMessageAutoReplyText.trim()) return;
     await tx.chatDirectAutoReplyJob.create({
       data: { sourceMessageID: message.id },
     });

@@ -52,6 +52,7 @@ describe('ChatService', () => {
     supportAgent: { findFirst: jest.fn().mockResolvedValue(null) },
     supportRechargeJob: { create: jest.fn() },
     chatDirectAutoReplyJob: { create: jest.fn() },
+    userPrivacySetting: { findUnique: jest.fn() },
     $transaction: jest.fn(),
     $executeRaw: jest.fn(),
     $queryRaw: jest.fn(),
@@ -784,6 +785,11 @@ describe('ChatService', () => {
       prisma.chatMessage.findUnique.mockResolvedValue(null);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
       prisma.chatConversation.update.mockResolvedValue({});
+      // 入队前会看一眼对方开没开自动回复；开着才建 job。
+      prisma.userPrivacySetting.findUnique.mockResolvedValue({
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: '稍后回复',
+      });
 
       await service.sendMessage('u1', sendPayload());
 
@@ -796,6 +802,60 @@ describe('ChatService', () => {
       ).toBeLessThan(
         prisma.chatDirectAutoReplyJob.create.mock.invocationCallOrder[0],
       );
+    });
+
+    // 自动回复默认关闭，而此前每条私聊都无条件建 job：发送事务多一次 INSERT，
+    // 提交后还要跑一整个取锁的处理器事务，跑完才发现开关是关的 —— 抢的正是发消息
+    // 要的那把会话行锁。
+    it('does not enqueue when the peer has auto reply switched off', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+      prisma.userPrivacySetting.findUnique.mockResolvedValue({
+        directMessageAutoReplyEnabled: false,
+        directMessageAutoReplyText: '',
+      });
+
+      await service.sendMessage('u1', sendPayload());
+
+      expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
+      // 查的是对端，不是发送者自己。
+      expect(prisma.userPrivacySetting.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { userID: 'u2' } }),
+      );
+    });
+
+    // 开关开着但文案是空的，处理器那边也会直接 complete —— 同样不该占一行 job。
+    it('does not enqueue when the peer left the auto reply text empty', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+          },
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+      prisma.userPrivacySetting.findUnique.mockResolvedValue({
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: '   ',
+      });
+
+      await service.sendMessage('u1', sendPayload());
+
+      expect(prisma.chatDirectAutoReplyJob.create).not.toHaveBeenCalled();
     });
 
     it('does not enqueue auto-reply jobs for replayed or group messages', async () => {
@@ -861,6 +921,11 @@ describe('ChatService', () => {
       prisma.chatMessage.findUnique.mockResolvedValue(null);
       prisma.chatMessage.create.mockResolvedValue(createdRow);
       prisma.chatConversation.update.mockResolvedValue({});
+      // 入队前会看一眼对方开没开自动回复；开着才建 job。
+      prisma.userPrivacySetting.findUnique.mockResolvedValue({
+        directMessageAutoReplyEnabled: true,
+        directMessageAutoReplyText: '稍后回复',
+      });
       prisma.chatDirectAutoReplyJob.create.mockRejectedValue(
         new Error('queue unavailable'),
       );

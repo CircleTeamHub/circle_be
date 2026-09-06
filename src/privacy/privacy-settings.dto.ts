@@ -7,7 +7,33 @@ import {
   IsOptional,
   IsString,
   MaxLength,
+  Validate,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
 } from 'class-validator';
+
+/**
+ * 自动回复文案上限，按**码点**计。
+ *
+ * 三层此前口径不一致：DTO 用 @MaxLength(200) 数的是 UTF-16 码元，而 service 用
+ * Array.from(...).length、数据库列是 VARCHAR(200)，这两处数的是码点。于是 120 个
+ * emoji（240 码元、120 码点）会被 DTO 挡在门外，尽管另外两层都认为它合法 ——
+ * 而 service 那条 spec 直接调 service、绕过了 DTO，所以 CI 里看不见这个分歧。
+ */
+export const AUTO_REPLY_TEXT_MAX_CODE_POINTS = 200;
+
+@ValidatorConstraint({ name: 'autoReplyTextLength', async: false })
+class AutoReplyTextLengthConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown) {
+    // 非字符串交给 @IsString 报，这里只管长度。
+    if (typeof value !== 'string') return true;
+    return Array.from(value).length <= AUTO_REPLY_TEXT_MAX_CODE_POINTS;
+  }
+
+  defaultMessage() {
+    return `directMessageAutoReplyText must be at most ${AUTO_REPLY_TEXT_MAX_CODE_POINTS} characters`;
+  }
+}
 
 export const SELF_DESTRUCT_DAY_OPTIONS = [0, 1, 2, 7, 30] as const;
 export const MOMENTS_VISIBILITY_OPTIONS = [
@@ -122,6 +148,6 @@ export class UpdatePrivacySettingsDto {
     return typeof value === 'string' ? value.trim() : value;
   })
   @IsString()
-  @MaxLength(200)
+  @Validate(AutoReplyTextLengthConstraint)
   directMessageAutoReplyText?: string;
 }
