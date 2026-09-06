@@ -391,6 +391,15 @@ describe('UploadService', () => {
             Expiration: { Days: 1 },
           },
         ],
+      })
+      .mockResolvedValueOnce({
+        CORSRules: [
+          {
+            AllowedOrigins: ['https://app.example.com'],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['content-type', 'if-none-match'],
+          },
+        ],
       });
     const service = new UploadService({
       get: (key: string) =>
@@ -404,6 +413,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          ALLOWED_ORIGINS: 'https://app.example.com',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
@@ -416,15 +426,56 @@ describe('UploadService', () => {
 
     await service.onModuleInit();
 
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(3);
     expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
     expect(send.mock.calls[1][0].constructor.name).toBe(
       'GetBucketLifecycleConfigurationCommand',
     );
+    expect(send.mock.calls[2][0].constructor.name).toBe('GetBucketCorsCommand');
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('cannot verify externally managed bucket policy'),
     );
     expect(service.objectStoreStatus()).toBe('external-unverified');
+  });
+
+  it('rejects production startup when external storage lacks browser upload CORS', async () => {
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        Rules: [
+          {
+            Status: 'Enabled',
+            Filter: { Prefix: 'note-exports/' },
+            Expiration: { Days: 1 },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ CORSRules: [] });
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+    (service as any).logger = {
+      error: jest.fn(),
+      log: jest.fn(),
+      warn: jest.fn(),
+    };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+    expect(send.mock.calls[2][0].constructor.name).toBe('GetBucketCorsCommand');
   });
 
   it('rejects production startup when external storage lacks note-export expiry', async () => {

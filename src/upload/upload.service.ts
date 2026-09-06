@@ -16,6 +16,7 @@ import {
   CreateBucketCommand,
   CopyObjectCommand,
   DeleteObjectCommand,
+  GetBucketCorsCommand,
   GetBucketLifecycleConfigurationCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
@@ -194,6 +195,7 @@ export class UploadService implements OnModuleInit {
   private readonly publicObjectBase: string;
   private readonly region: string;
   private readonly manageBucket: boolean;
+  private readonly allowedOrigins: string[];
   private readonly enabled: boolean;
   private readonly production: boolean;
   private ready = false;
@@ -221,6 +223,10 @@ export class UploadService implements OnModuleInit {
       'OBJECT_STORAGE_MANAGE_BUCKET',
       true,
     );
+    this.allowedOrigins = (this.config.get<string>('ALLOWED_ORIGINS') ?? '')
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean);
     this.publicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
@@ -679,7 +685,8 @@ export class UploadService implements OnModuleInit {
     let step:
       | 'ensure_bucket_exists'
       | 'put_bucket_policy'
-      | 'verify_export_lifecycle' = 'ensure_bucket_exists';
+      | 'verify_export_lifecycle'
+      | 'verify_upload_cors' = 'ensure_bucket_exists';
     try {
       await this.ensureBucketExists();
       if (this.manageBucket) {
@@ -691,6 +698,8 @@ export class UploadService implements OnModuleInit {
         // 启动时不改 ACL/策略，因此 objectStoreStatus 保持 external-unverified。
         step = 'verify_export_lifecycle';
         await this.ensureExternalExportLifecycle();
+        step = 'verify_upload_cors';
+        await this.ensureExternalUploadCors();
         this.logger.warn(
           'Application cannot verify externally managed bucket policy; audit notes/ and chat/ anonymous access in the provider console.',
         );
@@ -766,6 +775,37 @@ export class UploadService implements OnModuleInit {
     if (!hasExpiry) {
       throw new Error(
         'External object storage must expire note-exports/ objects within 1 day',
+      );
+    }
+  }
+
+  private async ensureExternalUploadCors(): Promise<void> {
+    const response = await this.client.send(
+      new GetBucketCorsCommand({ Bucket: this.bucket }),
+    );
+    const requiredHeaders = ['content-type', 'if-none-match'];
+    const missingOrigins = this.allowedOrigins.filter(
+      (origin) =>
+        !(response.CORSRules ?? []).some((rule) => {
+          const methods = (rule.AllowedMethods ?? []).map((method) =>
+            method.toUpperCase(),
+          );
+          const origins = rule.AllowedOrigins ?? [];
+          const headers = (rule.AllowedHeaders ?? []).map((header) =>
+            header.toLowerCase(),
+          );
+          return (
+            methods.includes('PUT') &&
+            origins.includes(origin) &&
+            requiredHeaders.every(
+              (header) => headers.includes(header) || headers.includes('*'),
+            )
+          );
+        }),
+    );
+    if (missingOrigins.length > 0) {
+      throw new Error(
+        'External object storage CORS does not allow browser uploads from every ALLOWED_ORIGINS entry',
       );
     }
   }
