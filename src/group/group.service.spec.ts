@@ -845,17 +845,20 @@ describe('GroupService reportGroup', () => {
       groupID: 'group-1',
       ownerID: 'owner-1',
     });
-    prisma.circleMember.findUnique
-      .mockResolvedValueOnce({
-        id: 'actor-member',
-        role: CircleMemberRole.ADMIN,
-        status: CircleMemberStatus.ACTIVE,
-      })
-      .mockResolvedValueOnce({
-        id: 'target-member',
-        role: CircleMemberRole.MEMBER,
-        status: CircleMemberStatus.ACTIVE,
-      });
+    prisma.circleMember.findUnique.mockImplementation(
+      ({ where }: { where: { userID_circleID: { userID: string } } }) =>
+        where.userID_circleID.userID === 'admin-1'
+          ? {
+              id: 'actor-member',
+              role: CircleMemberRole.ADMIN,
+              status: CircleMemberStatus.ACTIVE,
+            }
+          : {
+              id: 'target-member',
+              role: CircleMemberRole.MEMBER,
+              status: CircleMemberStatus.ACTIVE,
+            },
+    );
     prisma.userDisplayIcon.deleteMany.mockResolvedValue({});
     prisma.circleMember.delete.mockResolvedValue({});
     prisma.circle.update.mockResolvedValue({});
@@ -869,10 +872,14 @@ describe('GroupService reportGroup', () => {
       'admin-1',
       'target-user',
     ]);
+    // 权威判定读的必须是锁之后的快照。最前面那次是不持锁的前置闸（它把没
+    // 资格的人挡在取锁之前），所以这里比的是锁之后那两次。
+    const authorizationReads =
+      prisma.circleMember.findUnique.mock.invocationCallOrder.slice(-2);
     expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-      prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+      Math.min(...authorizationReads),
     );
-    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(2);
+    expect(prisma.circleMember.findUnique).toHaveBeenCalledTimes(3);
     expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
       where: { userID: 'target-user', circleID: 'circle-1' },
     });
@@ -1219,23 +1226,49 @@ describe('GroupService reportGroup', () => {
     expect(chatCircleSync.detachSeat).not.toHaveBeenCalled();
   });
 
+  // 这把会话行锁正是发消息取号要的那一把。不设前置闸的话，任何拿得到 groupID
+  // 的人都能让服务端先给它上一把排他锁 —— 一串注定 403 的请求就能卡住整个群的
+  // 消息投递，顺带还能拿锁竞争当侧信道。
+  it('rejects a non-manager before taking any lock', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      id: 'circle-1',
+      groupID: 'group-1',
+      ownerID: 'owner-1',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      id: 'actor-member',
+      role: CircleMemberRole.MEMBER,
+      status: CircleMemberStatus.ACTIVE,
+    });
+
+    await expect(
+      service.removeGroupMember('member-1', 'group-1', 'target-user'),
+    ).rejects.toThrow(ForbiddenException);
+
+    expect(memberLock.lock).not.toHaveBeenCalled();
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+  });
+
   it('does not allow a circle admin to remove another manager', async () => {
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
       groupID: 'group-1',
       ownerID: 'owner-1',
     });
-    prisma.circleMember.findUnique
-      .mockResolvedValueOnce({
-        id: 'actor-member',
-        role: CircleMemberRole.ADMIN,
-        status: CircleMemberStatus.ACTIVE,
-      })
-      .mockResolvedValueOnce({
-        id: 'target-member',
-        role: CircleMemberRole.ADMIN,
-        status: CircleMemberStatus.ACTIVE,
-      });
+    prisma.circleMember.findUnique.mockImplementation(
+      ({ where }: { where: { userID_circleID: { userID: string } } }) =>
+        where.userID_circleID.userID === 'admin-1'
+          ? {
+              id: 'actor-member',
+              role: CircleMemberRole.ADMIN,
+              status: CircleMemberStatus.ACTIVE,
+            }
+          : {
+              id: 'target-member',
+              role: CircleMemberRole.ADMIN,
+              status: CircleMemberStatus.ACTIVE,
+            },
+    );
 
     await expect(
       service.removeGroupMember('admin-1', 'group-1', 'target-user'),
@@ -1255,13 +1288,16 @@ describe('GroupService reportGroup', () => {
       groupID: 'group-1',
       ownerID: 'owner-1',
     });
-    prisma.circleMember.findUnique
-      .mockResolvedValueOnce({
-        id: 'actor-member',
-        role: CircleMemberRole.ADMIN,
-        status: CircleMemberStatus.ACTIVE,
-      })
-      .mockResolvedValueOnce(null);
+    prisma.circleMember.findUnique.mockImplementation(
+      ({ where }: { where: { userID_circleID: { userID: string } } }) =>
+        where.userID_circleID.userID === 'admin-1'
+          ? {
+              id: 'actor-member',
+              role: CircleMemberRole.ADMIN,
+              status: CircleMemberStatus.ACTIVE,
+            }
+          : null,
+    );
     prisma.conversationGroupMembership.deleteMany.mockResolvedValue({});
 
     await expect(

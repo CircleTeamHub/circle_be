@@ -1548,9 +1548,32 @@ describe('CircleService', () => {
         'admin-1',
         'owner-1',
       ]);
+      // 权威判定读的必须是锁之后的快照。前面那次是不持锁的前置闸(它的职责是
+      // 把没资格的人挡在取锁之前),所以这里比的是**最后一次**成员读。
+      const authorizationRead =
+        prisma.circleMember.findUnique.mock.invocationCallOrder.at(-1);
       expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
-        prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+        authorizationRead,
       );
+    });
+
+    // 这把会话行锁正是发消息取号要的那一把。不设前置闸的话,任何人 PATCH 一下
+    // 这个圈子就能占着它 —— 一串注定 403 的请求足以卡住整个群的消息投递。
+    it('rejects a non-manager before taking any lock', async () => {
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.updateCircle('member-1', 'circle-1', {
+          name: '改个名',
+        } as UpdateCircleDto),
+      ).rejects.toThrow();
+
+      expect(memberLock.lock).not.toHaveBeenCalled();
+      expect(memberLock.lockPolicy).not.toHaveBeenCalled();
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
 
     // 成员锁是按 (circle, user) 对取的:建单方拿申请人/邀请人那两把,这里拿
