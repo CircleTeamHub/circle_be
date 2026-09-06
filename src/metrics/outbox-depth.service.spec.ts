@@ -41,6 +41,8 @@ function fakePrisma(
     circleInvitationVerifier: delegate(
       overrides.circleInvitationVerifier ?? empty,
     ),
+    chatDirectAutoReplyJob: delegate(overrides.chatDirectAutoReplyJob ?? empty),
+    supportRechargeJob: delegate(overrides.supportRechargeJob ?? empty),
   };
 }
 
@@ -203,6 +205,8 @@ describe('collectOutboxDepths', () => {
       friendChatReplayOutbox: delegate(),
       coinGift: delegate(),
       circleInvitationVerifier: delegate(),
+      chatDirectAutoReplyJob: delegate(),
+      supportRechargeJob: delegate(),
     } as unknown as OutboxDepthSource;
 
     const samples = await collectOutboxDepths(prisma, NOW);

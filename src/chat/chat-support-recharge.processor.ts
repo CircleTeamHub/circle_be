@@ -2,7 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'node:crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { TrackedCron } from 'src/metrics/tracked-cron.decorator';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
+import {
+  reportHandledJobFailure,
+  TrackedCron,
+} from 'src/metrics/tracked-cron.decorator';
 import type {
   ChatMessage,
   SupportRechargeOrder,
@@ -163,6 +167,9 @@ export class ChatSupportRechargeProcessor {
         },
       });
     } catch (error) {
+      // 与 chat-direct-auto-reply.processor 同一处缺口：吞掉异常后正常返回，
+      // 心跳照常前进，两条告警都打不中。
+      reportHandledJobFailure();
       const terminal = job.attempts >= JOB_MAX_ATTEMPTS;
       const delay = Math.min(
         JOB_BACKOFF_BASE_MS * 2 ** Math.max(0, job.attempts - 1),
@@ -181,8 +188,14 @@ export class ChatSupportRechargeProcessor {
         },
       });
       const detail = `support recharge job=${jobId} attempt=${job.attempts}`;
-      if (terminal) this.logger.error(`${detail} dead-lettered`);
-      else this.logger.warn(`${detail} will retry`);
+      if (terminal) {
+        this.logger.error(`${detail} dead-lettered`);
+        reportOperationalError(error, {
+          component: 'chat',
+          operation: 'supportRecharge',
+          kind: 'deadLettered',
+        });
+      } else this.logger.warn(`${detail} will retry`);
     }
   }
 

@@ -666,4 +666,20 @@ describe('ChatDirectAutoReplyProcessor', () => {
     ).toHaveLength(2);
     expect(prisma.chatMessage.create).toHaveBeenCalledTimes(1);
   });
+
+  // 这个 catch 吞掉异常、改写行状态、然后正常返回 —— sweep() 因此永远 resolve，
+  // TrackedCron 的心跳在整段故障期间照常前进：CronJobFailing 打不中（没抛），
+  // CronJobStalled 也打不中（心跳新鲜），而自动回复其实已经停摆。
+  it('marks the cron run failed when a job throws', async () => {
+    const failed = jest.spyOn(trackedCron, 'reportHandledJobFailure');
+    prisma.chatDirectAutoReplyJob.updateMany.mockResolvedValue({ count: 1 });
+    prisma.chatDirectAutoReplyJob.findUniqueOrThrow.mockRejectedValue(
+      new Error('database unavailable'),
+    );
+    prisma.chatDirectAutoReplyJob.update.mockResolvedValue({});
+
+    await processor.processMessage('source-a');
+
+    expect(failed).toHaveBeenCalled();
+  });
 });

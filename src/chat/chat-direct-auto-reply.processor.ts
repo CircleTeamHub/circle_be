@@ -1,7 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import type { ChatMessage, Prisma } from 'src/generated/prisma';
+import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
+  reportHandledJobFailure,
   reportJobSkipped,
   TrackedCron,
 } from 'src/metrics/tracked-cron.decorator';
@@ -179,7 +181,13 @@ export class ChatDirectAutoReplyProcessor {
       attempts = job.attempts;
       const message = await this.createReply(jobId, job.sourceMessageID);
       if (message) await this.deliverCommittedReply(message);
-    } catch {
+    } catch (error) {
+      // 这个 catch 把异常吞掉并改写行状态，然后正常返回 —— 于是 sweep() 永远
+      // resolve，TrackedCron 的心跳在整段故障期间照常前进：CronJobFailing 打不中
+      // （没抛），CronJobStalled 也打不中（心跳新鲜），而自动回复其实已经停摆。
+      // tracked-cron.decorator 就是为这种「吞掉异常后正常返回」的任务准备的。
+      // 脱离 cron 上下文（网关的即时 kick）调用是无操作，所以两条路径都安全。
+      reportHandledJobFailure();
       const terminal = attempts >= JOB_MAX_ATTEMPTS;
       const delay = Math.min(
         JOB_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1),
@@ -201,6 +209,16 @@ export class ChatDirectAutoReplyProcessor {
         attempt: attempts,
         category: PROCESSING_FAILED,
       });
+      // 死信是「这条自动回复永远发不出去了」。只写一行 logger.error 的话，它散在
+      // 日志里，没有任何聚合信号；reportOperationalError 按 component/operation/kind
+      // 归并，一次系统性故障才看得出是一片而不是一条。
+      if (terminal) {
+        reportOperationalError(error, {
+          component: 'chat',
+          operation: 'directAutoReply',
+          kind: 'deadLettered',
+        });
+      }
     }
   }
 
