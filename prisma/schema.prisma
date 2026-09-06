@@ -2058,6 +2058,15 @@ model ChatConversation {
   /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
   /// 迁移时必须回填成 MAX(height)，默认 0 会撞 (conversationID, height) 唯一约束。
   nextHeight Int @default(0)
+  /// 「删除所有人的记录」的会话级水位：这条线以下的消息对**所有人**隐藏，
+  /// 包括清空之后才入座的新成员。
+  ///
+  /// 只有 ChatMember.clearedBeforeHeight 是不够的：那是逐座位的，全群清空只
+  /// 推进当时在座的人。新座位建出来是 schema 默认的 0，于是拉一个新号进群就能
+  /// 把「已清空」的历史全部读回来 —— 清空等于没清。新座位继承这个值，读路径
+  /// 也按 max(座位水位, 会话水位) 兜底。
+  /// 只前进不后退，与座位水位同义。
+  clearedBeforeHeight Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 

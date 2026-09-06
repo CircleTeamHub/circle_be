@@ -157,22 +157,24 @@ export class ChatCircleSyncService {
       // 也写两条。谁先拿到锁谁做,后来者在锁后重读座位,toJoin 自然是空的。
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
       let created = false;
+      // clearedBeforeHeight 要一并读出来：新座位得继承它，否则「删除所有人的
+      // 记录」藏起来的历史对圈子新成员整段可见。
       let conversation = await tx.chatConversation.findUnique({
         where: { circleID: circleId },
-        select: { id: true },
+        select: { id: true, clearedBeforeHeight: true },
       });
       if (!conversation) {
         try {
           conversation = await tx.chatConversation.create({
             data: { type: 'GROUP', circleID: circleId },
-            select: { id: true },
+            select: { id: true, clearedBeforeHeight: true },
           });
           created = true;
         } catch (error) {
           if (!isUniqueViolation(error)) throw error;
           conversation = await tx.chatConversation.findUnique({
             where: { circleID: circleId },
-            select: { id: true },
+            select: { id: true, clearedBeforeHeight: true },
           });
           if (!conversation) throw error;
         }
@@ -216,6 +218,9 @@ export class ChatCircleSyncService {
             conversationID: conversation.id,
             userID,
             lastReadHeight: watermark,
+            // 这条路径不持有会话行锁（它锁的是圈子），所以继承之外读路径还按
+            // max(座位, 会话) 兜底，覆盖「入座与清空并发」的窗口。
+            clearedBeforeHeight: conversation.clearedBeforeHeight,
           })),
         skipDuplicates: true,
       });

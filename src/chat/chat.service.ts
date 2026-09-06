@@ -761,6 +761,7 @@ export class ChatService {
             lastReadHeight: Math.max(
               m.lastReadHeight,
               m.clearedBeforeHeight ?? 0,
+              m.conversation.clearedBeforeHeight ?? 0,
             ),
           })),
           cutoffs,
@@ -786,10 +787,12 @@ export class ChatService {
     const list = memberships.map((m) => {
       const rawLast = lastMessages.get(m.conversationID) ?? null;
       // 清空水位之下的末条不给本人当预览:清空过的会话看起来就是空的。
+      const conversationFloor = Math.max(
+        m.clearedBeforeHeight ?? 0,
+        m.conversation.clearedBeforeHeight ?? 0,
+      );
       const last =
-        rawLast && rawLast.height <= (m.clearedBeforeHeight ?? 0)
-          ? null
-          : rawLast;
+        rawLast && rawLast.height <= conversationFloor ? null : rawLast;
       return {
         id: m.conversationID,
         type: m.conversation.type,
@@ -929,8 +932,14 @@ export class ChatService {
     }
     const toJoin = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
-        Array<{ id: string; type: string; circleID: string | null }>
-      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          clearedBeforeHeight: number;
+        }>
+      >`SELECT "id", "type", "circleID", "clearedBeforeHeight"
+        FROM "ChatConversation"
         WHERE "id" = ${conversation.id} FOR UPDATE`;
       if (
         locked.length === 0 ||
@@ -995,8 +1004,15 @@ export class ChatService {
             },
           });
         } else {
+          // 新座位继承会话的全群清空水位。落 schema 默认的 0 的话，被「删除
+          // 所有人的记录」藏起来的历史会对新成员整段可见 —— 拉个新号进群就能
+          // 把清空撤销。会话行锁在上面已经拿到，与 clearHistory 天然串行。
           await tx.chatMember.create({
-            data: { conversationID: conversation.id, userID: id },
+            data: {
+              conversationID: conversation.id,
+              userID: id,
+              clearedBeforeHeight: locked[0].clearedBeforeHeight,
+            },
           });
         }
       }
@@ -1034,8 +1050,14 @@ export class ChatService {
     }
     const joined = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
-        Array<{ id: string; type: string; circleID: string | null }>
-      >`SELECT "id", "type", "circleID" FROM "ChatConversation"
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          clearedBeforeHeight: number;
+        }>
+      >`SELECT "id", "type", "circleID", "clearedBeforeHeight"
+        FROM "ChatConversation"
         WHERE "id" = ${conversationId} FOR UPDATE`;
       if (
         locked.length === 0 ||
@@ -1084,8 +1106,13 @@ export class ChatService {
           },
         });
       } else {
+        // 与好友邀请路径同一条理由：新座位继承会话的全群清空水位。
         await tx.chatMember.create({
-          data: { conversationID: conversationId, userID: userId },
+          data: {
+            conversationID: conversationId,
+            userID: userId,
+            clearedBeforeHeight: locked[0].clearedBeforeHeight,
+          },
         });
       }
       return true;
@@ -1381,7 +1408,10 @@ export class ChatService {
     // 清空水位在这里同样要生效。只在 GET /chat/conversations 里过滤的话,
     // 客户端从「取或建会话」「改偏好」这两个响应回填缓存时,刚清掉的末条预览
     // (以及一条新签名的媒体 URL)就又回来了。
-    const floor = member.clearedBeforeHeight ?? 0;
+    const floor = Math.max(
+      member.clearedBeforeHeight ?? 0,
+      member.conversation.clearedBeforeHeight ?? 0,
+    );
     const viewerCutoff = await this.selfDestructCutoff(userId);
     const seconds = member.conversation.burnDurationSec;
     const cutoff = this.strictestCutoff(
@@ -1713,7 +1743,11 @@ export class ChatService {
     if (!trimmed) return [];
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null },
-      select: { conversationID: true, clearedBeforeHeight: true },
+      select: {
+        conversationID: true,
+        clearedBeforeHeight: true,
+        conversation: { select: { clearedBeforeHeight: true } },
+      },
     });
     if (memberships.length === 0) return [];
     // 搜索必须和 getHistory 用同一把尺子:否则自动销毁窗口之外的消息
@@ -1735,7 +1769,10 @@ export class ChatService {
     const heightFloors = new Map<string, number>();
     const cutoffs = new Map<string, Date | null>();
     for (const m of memberships) {
-      const floor = m.clearedBeforeHeight ?? 0;
+      const floor = Math.max(
+        m.clearedBeforeHeight ?? 0,
+        m.conversation.clearedBeforeHeight ?? 0,
+      );
       const seconds = burnById.get(m.conversationID) ?? null;
       const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
       const viewerCutoff = this.strictestCutoff(cutoff, burnCutoff);
@@ -1829,7 +1866,11 @@ export class ChatService {
     }
     const memberships = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null },
-      select: { conversationID: true, clearedBeforeHeight: true },
+      select: {
+        conversationID: true,
+        clearedBeforeHeight: true,
+        conversation: { select: { clearedBeforeHeight: true } },
+      },
     });
     if (memberships.length === 0) return empty;
 
@@ -1852,10 +1893,14 @@ export class ChatService {
     for (const m of memberships) {
       const seconds = burnById.get(m.conversationID) ?? null;
       const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
+      const floor = Math.max(
+        m.clearedBeforeHeight ?? 0,
+        m.conversation.clearedBeforeHeight ?? 0,
+      );
       ids.push(m.conversationID);
-      floors.push(m.clearedBeforeHeight ?? 0);
+      floors.push(floor);
       cutoffs.push(this.strictestCutoff(viewerCutoff, burnCutoff));
-      heightFloors.set(m.conversationID, m.clearedBeforeHeight ?? 0);
+      heightFloors.set(m.conversationID, floor);
     }
 
     // 多取一条用来判断「还有没有」。
@@ -2138,7 +2183,10 @@ export class ChatService {
       ),
     );
 
-    const clearedFloor = mine?.clearedBeforeHeight ?? 0;
+    const clearedFloor = Math.max(
+      mine?.clearedBeforeHeight ?? 0,
+      conv.clearedBeforeHeight ?? 0,
+    );
     const viewerCutoff = await this.selfDestructCutoff(userId);
     const burnSeconds = conv.burnDurationSec;
     const cutoff = this.strictestCutoff(
@@ -2381,7 +2429,21 @@ export class ChatService {
         errorCode: ChatErrorCode.NotMember,
       });
     }
-    return { conversation: member.conversation, member };
+    // 座位水位与会话水位取严者。会话水位是「删除所有人的记录」留下的，新座位
+    // 建出来时会继承它，但圈子对账那条入座路径不持有会话行锁，理论上能与一次
+    // 清空并发、把座位留在水位之下。在读的入口取一次 max，调用方就不必各自记得。
+    return {
+      conversation: member.conversation,
+      member: {
+        ...member,
+        // 两侧都要兜底：任一侧是 undefined 都会让 Math.max 得到 NaN，而
+        // `NaN > 0` 为假 —— 下限条件会整个消失，等于把清空掉的历史放回去。
+        clearedBeforeHeight: Math.max(
+          member.clearedBeforeHeight ?? 0,
+          member.conversation.clearedBeforeHeight ?? 0,
+        ),
+      },
+    };
   }
 
   /**
@@ -3509,6 +3571,20 @@ export class ChatService {
           data: { lastReadHeight: clearThrough },
           select: { userID: true },
         });
+        // 全群清空要落一条会话级水位，不能只推进当时在座的人：新座位建出来是
+        // schema 默认的 0，清空之后拉一个新号进群就能把「已清空」的历史全部读
+        // 回来。入座路径继承这一列，读路径再按 max(座位, 会话) 兜底。
+        // 只前进不后退 —— 用 targetHeight 指定一个更低的水位不该把已经藏起来
+        // 的消息放回去。
+        if (globalClear) {
+          await tx.chatConversation.updateMany({
+            where: {
+              id: conversationId,
+              clearedBeforeHeight: { lt: clearThrough },
+            },
+            data: { clearedBeforeHeight: clearThrough },
+          });
+        }
         const changed = (cleared?.count ?? 0) > 0 || readers.length > 0;
         const auditMessage =
           globalClear && changed
