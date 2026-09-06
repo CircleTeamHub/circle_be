@@ -22,6 +22,8 @@ export interface OutboxDepthSource {
   friendChatReplayOutbox: OutboxDelegateLike;
   coinGift: OutboxDelegateLike;
   circleInvitationVerifier: OutboxDelegateLike;
+  chatDirectAutoReplyJob: OutboxDelegateLike;
+  supportRechargeJob: OutboxDelegateLike;
 }
 
 interface OutboxQueueSpec {
@@ -91,6 +93,21 @@ export const OUTBOX_QUEUES: readonly OutboxQueueSpec[] = [
       cardDeliveredAt: null,
       cardAttempts: { gte: VERIFICATION_CARD_MAX_ATTEMPTS },
     },
+  },
+  // 两个聊天侧的 durable job 队列此前没登记：积压和死信在
+  // circle_outbox_pending / circle_outbox_dead 里根本看不见，而它们恰恰是
+  // 「重试到上限就永远发不出去」的那种队列。
+  {
+    name: 'chat_direct_auto_reply',
+    model: 'chatDirectAutoReplyJob',
+    pendingWhere: { status: { in: ['PENDING', 'PROCESSING'] } },
+    deadWhere: { status: 'FAILED' },
+  },
+  {
+    name: 'chat_support_recharge',
+    model: 'supportRechargeJob',
+    pendingWhere: { status: { in: ['PENDING', 'PROCESSING'] } },
+    deadWhere: { status: 'FAILED' },
   },
   {
     name: 'gift_card',
