@@ -16,11 +16,13 @@ import {
   CreateBucketCommand,
   CopyObjectCommand,
   DeleteObjectCommand,
+  GetBucketCorsCommand,
   GetBucketLifecycleConfigurationCommand,
   HeadBucketCommand,
   PutBucketPolicyCommand,
   ListObjectsV2Command,
   type BucketLocationConstraint,
+  type CORSRule,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
@@ -30,6 +32,7 @@ import { logExternalCallSlow } from 'src/logging/performance-event.logger';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 import {
   buildStoragePublicObjectBase,
+  storagePublicObjectBaseFromConfig,
   type ObjectStoreStatus,
 } from 'src/utils/storage-url';
 
@@ -183,6 +186,56 @@ function readBooleanConfig(
   return typeof value === 'boolean' ? value : value.toLowerCase() === 'true';
 }
 
+/**
+ * S3/COS 的通配语义：`*` 匹配任意字符序列，整串必须完全匹配。
+ *
+ * 逐段扫描的写法在需要回溯的模式上会少匹配 —— `https://*.co` 对
+ * `https://evil.co.co` 会判 false，而云厂商判 true。方向是「把本来放行的
+ * 来源误报成缺失」，也就是把一次合法的外部存储部署卡在启动上，所以这里
+ * 直接锚定成正则，与真实语义对齐。
+ */
+export function matchesCorsWildcard(pattern: string, value: string): boolean {
+  const escaped = pattern
+    .toLowerCase()
+    .replace(/[.*+?^${}()|[\]\\]/g, (char) =>
+      char === '*' ? '.*' : `\\${char}`,
+    );
+  // 模式来自桶自己的 CORS 配置（运维/云控制台，非用户输入），且每个元字符
+  // 都已转义、整串锚定，剩下的只有 `.*`。
+  // eslint-disable-next-line security/detect-non-literal-regexp
+  return new RegExp(`^${escaped}$`).test(value.toLowerCase());
+}
+
+const REQUIRED_UPLOAD_CORS_HEADERS = ['content-type', 'if-none-match'];
+
+function corsRuleAllowsBrowserPut(rule: CORSRule, origin: string): boolean {
+  const methods = (rule.AllowedMethods ?? []).map((method) =>
+    method.toUpperCase(),
+  );
+  if (!methods.includes('PUT')) return false;
+  if (
+    !(rule.AllowedOrigins ?? []).some((pattern) =>
+      matchesCorsWildcard(pattern, origin),
+    )
+  ) {
+    return false;
+  }
+  const headers = (rule.AllowedHeaders ?? []).map((header) =>
+    header.toLowerCase(),
+  );
+  return REQUIRED_UPLOAD_CORS_HEADERS.every((header) =>
+    headers.some((pattern) => matchesCorsWildcard(pattern, header)),
+  );
+}
+
+function storageOrigin(value: string): string | null {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
+
 @Injectable()
 export class UploadService implements OnModuleInit {
   private readonly logger = new Logger(UploadService.name);
@@ -194,6 +247,9 @@ export class UploadService implements OnModuleInit {
   private readonly publicObjectBase: string;
   private readonly region: string;
   private readonly manageBucket: boolean;
+  private readonly allowedOrigins: string[];
+  private readonly externalDeliveryConfigured: boolean;
+  private readonly deliveryUrlUnusable: boolean;
   private readonly enabled: boolean;
   private readonly production: boolean;
   private ready = false;
@@ -221,10 +277,36 @@ export class UploadService implements OnModuleInit {
       'OBJECT_STORAGE_MANAGE_BUCKET',
       true,
     );
-    this.publicObjectBase = buildStoragePublicObjectBase(
+    this.allowedOrigins = (this.config.get<string>('ALLOWED_ORIGINS') ?? '')
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+    const directPublicObjectBase = buildStoragePublicObjectBase(
       this.publicUrl,
       this.bucket,
       forcePathStyle,
+    );
+    // 公共地址只推导一次。笔记、头像等同源校验走的是
+    // storagePublicObjectBaseFromConfig，这里再推一遍的话，同一个畸形投递地址
+    // 会得到两个答案：helper 返回 null（拒绝），而这里静默回落到直连域名 ——
+    // 恰好是本次要禁掉的那种地址。
+    const configuredDeliveryUrl = this.config
+      .get<string>('OBJECT_STORAGE_DELIVERY_URL')
+      ?.trim();
+    const sharedPublicObjectBase = storagePublicObjectBaseFromConfig(
+      this.config,
+    );
+    this.deliveryUrlUnusable = Boolean(
+      configuredDeliveryUrl && !sharedPublicObjectBase,
+    );
+    this.publicObjectBase = sharedPublicObjectBase ?? directPublicObjectBase;
+    const deliveryBase = configuredDeliveryUrl ? sharedPublicObjectBase : null;
+    const deliveryOrigin = deliveryBase ? storageOrigin(deliveryBase) : null;
+    this.externalDeliveryConfigured = Boolean(
+      deliveryBase &&
+      new URL(deliveryBase).protocol === 'https:' &&
+      deliveryOrigin !== storageOrigin(this.publicUrl) &&
+      deliveryOrigin !== storageOrigin(directPublicObjectBase),
     );
     this.production =
       (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
@@ -260,6 +342,22 @@ export class UploadService implements OnModuleInit {
         'MinIO is not configured (MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY missing). Upload features will be skipped.',
       );
       return;
+    }
+    // 显式配置了却解析不出可用地址，说明配置错了；静默回落到直连域名正是本次
+    // 要禁掉的行为，所以任何环境都拒绝启动，而不是只在 production 拒绝。
+    if (this.deliveryUrlUnusable) {
+      throw new ServiceUnavailableException(
+        'OBJECT_STORAGE_DELIVERY_URL is not a usable https delivery base',
+      );
+    }
+    if (
+      this.production &&
+      !this.manageBucket &&
+      !this.externalDeliveryConfigured
+    ) {
+      throw new ServiceUnavailableException(
+        'External media must use an explicitly configured rate-limited delivery URL',
+      );
     }
     // Bucket bootstrap must not crash the whole app: if MinIO is unreachable
     // at boot, log and continue — `presign` surfaces a clean 503 to callers,
@@ -679,7 +777,8 @@ export class UploadService implements OnModuleInit {
     let step:
       | 'ensure_bucket_exists'
       | 'put_bucket_policy'
-      | 'verify_export_lifecycle' = 'ensure_bucket_exists';
+      | 'verify_export_lifecycle'
+      | 'verify_upload_cors' = 'ensure_bucket_exists';
     try {
       await this.ensureBucketExists();
       if (this.manageBucket) {
@@ -691,6 +790,8 @@ export class UploadService implements OnModuleInit {
         // 启动时不改 ACL/策略，因此 objectStoreStatus 保持 external-unverified。
         step = 'verify_export_lifecycle';
         await this.ensureExternalExportLifecycle();
+        step = 'verify_upload_cors';
+        await this.ensureExternalUploadCors();
         this.logger.warn(
           'Application cannot verify externally managed bucket policy; audit notes/ and chat/ anonymous access in the provider console.',
         );
@@ -766,6 +867,23 @@ export class UploadService implements OnModuleInit {
     if (!hasExpiry) {
       throw new Error(
         'External object storage must expire note-exports/ objects within 1 day',
+      );
+    }
+  }
+
+  private async ensureExternalUploadCors(): Promise<void> {
+    const response = await this.client.send(
+      new GetBucketCorsCommand({ Bucket: this.bucket }),
+    );
+    const missingOrigins = this.allowedOrigins.filter(
+      (origin) =>
+        !(response.CORSRules ?? []).some((rule) =>
+          corsRuleAllowsBrowserPut(rule, origin),
+        ),
+    );
+    if (missingOrigins.length > 0) {
+      throw new Error(
+        'External object storage CORS does not allow browser uploads from every ALLOWED_ORIGINS entry',
       );
     }
   }

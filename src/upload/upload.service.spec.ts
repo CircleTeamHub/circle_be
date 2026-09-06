@@ -1,4 +1,8 @@
-import { UploadService, buildPublicReadBucketPolicy } from './upload.service';
+import {
+  UploadService,
+  buildPublicReadBucketPolicy,
+  matchesCorsWildcard,
+} from './upload.service';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 jest.mock('@aws-sdk/s3-request-presigner', () => ({
@@ -351,6 +355,7 @@ describe('UploadService', () => {
       OBJECT_STORAGE_REGION: 'ap-tokyo',
       OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
       OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+      OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
     };
     const service = new UploadService({
       get: (key: string) => (config as Record<string, string>)[key] ?? null,
@@ -372,8 +377,11 @@ describe('UploadService', () => {
 
     await expect(signingClient.config.region()).resolves.toBe('ap-tokyo');
     expect(signingClient.config.forcePathStyle).toBe(false);
+    expect(result.uploadUrl).toContain(
+      'windnote-1234567890.cos.ap-tokyo.myqcloud.com/',
+    );
     expect(result.fileUrl).toBe(
-      `https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/${result.key}`,
+      `https://media.example.com/circle/${result.key}`,
     );
     expect(service.objectKeyFromPublicUrl(result.fileUrl)).toBe(result.key);
   });
@@ -391,6 +399,15 @@ describe('UploadService', () => {
             Expiration: { Days: 1 },
           },
         ],
+      })
+      .mockResolvedValueOnce({
+        CORSRules: [
+          {
+            AllowedOrigins: ['https://*.example.com'],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['content-*', 'if-none-match'],
+          },
+        ],
       });
     const service = new UploadService({
       get: (key: string) =>
@@ -404,6 +421,8 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+          ALLOWED_ORIGINS: 'https://app.example.com',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
@@ -416,15 +435,126 @@ describe('UploadService', () => {
 
     await service.onModuleInit();
 
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(3);
     expect(send.mock.calls[0][0].constructor.name).toBe('HeadBucketCommand');
     expect(send.mock.calls[1][0].constructor.name).toBe(
       'GetBucketLifecycleConfigurationCommand',
     );
+    expect(send.mock.calls[2][0].constructor.name).toBe('GetBucketCorsCommand');
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('cannot verify externally managed bucket policy'),
     );
     expect(service.objectStoreStatus()).toBe('external-unverified');
+  });
+
+  it('rejects production external storage that exposes direct provider URLs', async () => {
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        Rules: [
+          {
+            Status: 'Enabled',
+            Filter: { Prefix: 'note-exports/' },
+            Expiration: { Days: 1 },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        CORSRules: [
+          {
+            AllowedOrigins: ['https://app.example.com'],
+            AllowedMethods: ['PUT'],
+            AllowedHeaders: ['*'],
+          },
+        ],
+      });
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+  });
+
+  it.each([
+    'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com:443',
+    'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/media',
+    'https://cos.ap-tokyo.myqcloud.com/circle',
+  ])('rejects provider-equivalent delivery URL %s', async (deliveryUrl) => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it('rejects production startup when external storage lacks browser upload CORS', async () => {
+    const send = jest
+      .fn()
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        Rules: [
+          {
+            Status: 'Enabled',
+            Filter: { Prefix: 'note-exports/' },
+            Expiration: { Days: 1 },
+          },
+        ],
+      })
+      .mockResolvedValueOnce({ CORSRules: [] });
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          NODE_ENV: 'production',
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+          ALLOWED_ORIGINS: 'https://app.example.com',
+        })[key] ?? null,
+    } as any);
+    (service as any).client = { send };
+    (service as any).logger = {
+      error: jest.fn(),
+      log: jest.fn(),
+      warn: jest.fn(),
+    };
+
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+    expect(send.mock.calls[2][0].constructor.name).toBe('GetBucketCorsCommand');
   });
 
   it('rejects production startup when external storage lacks note-export expiry', async () => {
@@ -444,6 +574,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
@@ -504,6 +635,7 @@ describe('UploadService', () => {
             OBJECT_STORAGE_REGION: 'ap-tokyo',
             OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
             OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+            OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
           })[key] ?? null,
       } as any);
       (service as any).client = { send };
@@ -537,6 +669,7 @@ describe('UploadService', () => {
           OBJECT_STORAGE_REGION: 'ap-tokyo',
           OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
           OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
         })[key] ?? null,
     } as any);
     (service as any).client = { send };
@@ -838,4 +971,46 @@ describe('UploadService', () => {
       });
     },
   );
+
+  it('refuses to start when a configured delivery URL is unusable', async () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'http://minio:9000',
+          MINIO_ACCESS_KEY: 'key',
+          MINIO_SECRET_KEY: 'secret',
+          MINIO_BUCKET: 'circle',
+          MINIO_PUBLIC_URL: 'http://minio:9000',
+          OBJECT_STORAGE_DELIVERY_URL:
+            'https://media.example.com/circle?token=secret',
+        })[key] ?? null,
+    } as any);
+
+    // 不能静默回落到直连域名 —— 那正是这份契约要禁掉的地址。
+    await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
+  });
+});
+
+describe('matchesCorsWildcard', () => {
+  it.each([
+    ['https://*.example.com', 'https://app.example.com'],
+    ['https://app.example.com', 'https://app.example.com'],
+    ['*', 'https://anything.example.com'],
+    ['content-*', 'content-type'],
+    // 需要回溯的两例：逐段扫描会少匹配，云厂商实际放行。
+    ['https://*.co', 'https://evil.co.co'],
+    ['https://*.example.com', 'https://a.example.com.example.com'],
+  ])('matches provider wildcard %s against %s', (pattern, value) => {
+    expect(matchesCorsWildcard(pattern, value)).toBe(true);
+  });
+
+  it.each([
+    ['https://app.example.com', 'https://app.example.com.evil.com'],
+    ['https://*.example.com', 'https://example.com'],
+    ['content-type', 'if-none-match'],
+    // 模式里的 `.` 必须按字面量匹配，不能当成正则的任意字符。
+    ['https://a.example.com', 'https://axexample.com'],
+  ])('does not match %s against %s', (pattern, value) => {
+    expect(matchesCorsWildcard(pattern, value)).toBe(false);
+  });
 });

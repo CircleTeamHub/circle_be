@@ -13,6 +13,24 @@ function stripTrailingSlashes(value: string): string {
   return value.slice(0, end);
 }
 
+export function normalizeStorageDeliveryBase(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (
+      (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    return stripTrailingSlashes(url.toString());
+  } catch {
+    return null;
+  }
+}
+
 export function buildStoragePublicObjectBase(
   publicUrl: string,
   bucket: string,
@@ -31,6 +49,8 @@ export function buildStoragePublicObjectBase(
 export function storagePublicObjectBaseFromConfig(
   config: Pick<ConfigService, 'get'>,
 ): string | null {
+  const deliveryUrl = config.get<string>('OBJECT_STORAGE_DELIVERY_URL');
+  if (deliveryUrl?.trim()) return normalizeStorageDeliveryBase(deliveryUrl);
   const publicUrl =
     config.get<string>('MINIO_PUBLIC_URL') ??
     config.get<string>('MINIO_ENDPOINT');
