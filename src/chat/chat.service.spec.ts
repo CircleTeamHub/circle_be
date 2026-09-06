@@ -3244,7 +3244,14 @@ describe('ChatService', () => {
         },
         data: { clearedBeforeHeight: 42 },
       });
-      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+      // 全群清空只播操作者自己那一条已读。逐人播是 N^2 帧,而且对一个从没打开过
+      // 会话的成员来说那是条假回执;其余成员从 chat:history_cleared 把未读清零。
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitRead).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        userId: 'u1',
+        height: 42,
+      });
       expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
         conversationId: 'conv-1',
         clearedBeforeHeight: 42,
@@ -3412,10 +3419,47 @@ describe('ChatService', () => {
       ]) {
         expect(args.where.userID).toEqual({ in: ['u1', 'u2'] });
       }
-      expect(broadcast.emitRead).toHaveBeenCalledTimes(2);
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
       expect(broadcast.emitRead).not.toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'u3' }),
       );
+    });
+
+    // emitRead 是会话房广播,不是单播。全群清空逐人播的话,N 个成员就是 N 次广播
+    // x N 个订阅者 = N^2 帧,提交后同步打出去 —— 大群里足以把事件循环和 Redis
+    // adapter 一起卡住。省掉的只是广播,DB 侧的水位推进一条不少。
+    it('does not fan out one read receipt per member on a global clear', async () => {
+      const seats = Array.from({ length: 50 }, (_, index) => ({
+        userID: `u${index + 1}`,
+      }));
+      mockClearLock({ ownerID: 'u1' });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: { ...membership().conversation, ownerID: 'u1' },
+        }),
+      );
+      prisma.chatMember.findMany.mockResolvedValue(seats);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: seats.length });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue(seats);
+
+      await service.clearHistory('u1', 'conv-1', true);
+
+      // 全部 50 个座位照常推进 lastReadHeight —— 未读数不能指向已经看不见的消息。
+      expect(prisma.chatMember.updateManyAndReturn).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { lastReadHeight: 42 } }),
+      );
+      expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitRead).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        userId: 'u1',
+        height: 42,
+      });
+      // 其余 49 个成员靠这一条把未读清零。
+      expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        clearedBeforeHeight: 42,
+        clearedBy: 'u1',
+      });
     });
 
     it('keeps a group clear personal unless explicitly requested', async () => {

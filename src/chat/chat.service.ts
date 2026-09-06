@@ -3635,7 +3635,19 @@ export class ChatService {
     // 清空即已读 —— 但这条路径绕开了网关的 chat:read 广播,于是对端的已读回执
     // 和本账号其他设备的未读红点会一直停在旧水位。既然语义上就是「读到当前最高」,
     // 那就播出和 markRead 完全一样的事件。
-    for (const target of advancedReaders) {
+    //
+    // 但全群清空时 advancedReaders 是整份在座名单,而 emitRead 每调一次都是一次
+    // **会话房广播**:N 个成员 = N 次广播 x N 个订阅者 = N^2 帧,还是提交后同步
+    // for 循环打出去的。500 人的群清一次要投 25 万帧,足以卡住事件循环和 adapter。
+    //
+    // 其余成员也不需要这条:chat:history_cleared 带着同一个 clearedBeforeHeight
+    // 广播给同一个房间,客户端据此把该会话的未读清零。而且「他读了你的消息」对一个
+    // 从没打开过会话的人来说本来就是假的 —— 是管理员把历史藏了,不是他读了。
+    // 只留操作者自己那一条,同步他的其它设备。
+    const readReceiptTargets = isGlobalClear
+      ? advancedReaders.filter((target) => target.userID === userId)
+      : advancedReaders;
+    for (const target of readReceiptTargets) {
       try {
         this.broadcast.emitRead({
           conversationId,
