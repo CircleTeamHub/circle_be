@@ -137,6 +137,16 @@ export interface ChatMessageDto {
   editedAt?: string | null;
   /** 表情回应聚合;无回应缺省。 */
   reactions?: ChatReactionSummary[];
+  /**
+   * 所属会话的阅后即焚秒数;null = 该会话未开启。
+   *
+   * 这是会话级设置,却要逐条消息带上:客户端此前只能从**会话列表缓存**里查这个
+   * 值,而推送冷启动时消息可能先于会话列表到达 —— 查不到就当成「没开焚毁」,
+   * 于是本该阅后即焚的图片按普通图片处理:原图落盘缓存、长按可存进相册。
+   * 缓存补齐之后再翻转已经晚了,文件已经写下去了。带在消息上,渲染这条消息所
+   * 需的一切就都在消息里,不再依赖任何加载顺序。
+   */
+  burnDurationSec?: number | null;
   /** 发送者本人的 ack 与广播共用此字段做本地乐观消息对账。 */
   d: string | null;
   createdAt: string;

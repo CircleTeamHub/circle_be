@@ -271,7 +271,12 @@ export class ChatService {
         },
       });
       if (existing) {
-        return this.presentSentMessage(existing, senderUserId, true);
+        return this.presentSentMessage(
+          existing,
+          senderUserId,
+          true,
+          conversation.burnDurationSec,
+        );
       }
     }
     let effectivePayload = payload;
@@ -424,7 +429,12 @@ export class ChatService {
         }
       }
 
-      return this.presentSentMessage(created.row, senderUserId, created.reused);
+      return this.presentSentMessage(
+        created.row,
+        senderUserId,
+        created.reused,
+        conversation.burnDurationSec,
+      );
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
       throw error;
@@ -436,6 +446,7 @@ export class ChatService {
     row: MessageRow,
     senderUserId: string,
     reused: boolean,
+    burnDurationSec: number | null,
   ): Promise<SendResult> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -448,7 +459,7 @@ export class ChatService {
         }`,
       );
     }
-    const message = this.toMessageDto(row, sender);
+    const message = this.toMessageDto(row, sender, burnDurationSec);
     try {
       await this.attachReplyTo([message]);
     } catch (error) {
@@ -793,7 +804,11 @@ export class ChatService {
           ? (tempChats.get(m.conversation.tempChatID) ?? null)
           : null,
         lastMessage: last
-          ? this.toMessageDto(last, this.senderFor(last, senders))
+          ? this.toMessageDto(
+              last,
+              this.senderFor(last, senders),
+              m.conversation.burnDurationSec,
+            )
           : null,
         unreadCount: unreadCounts.get(m.conversationID) ?? 0,
         pinned: m.pinned,
@@ -1399,7 +1414,11 @@ export class ChatService {
       const senders = last.senderID
         ? await this.resolveSenders([last.senderID])
         : new Map<string, ChatSenderInfo>();
-      lastMessage = this.toMessageDto(last, this.senderFor(last, senders));
+      lastMessage = this.toMessageDto(
+        last,
+        this.senderFor(last, senders),
+        seconds,
+      );
       await this.media.attachMediaUrls([lastMessage]);
     }
     const circles = member.conversation.circleID
@@ -1520,7 +1539,11 @@ export class ChatService {
     const senders = await this.resolveSenders(senderIds);
     const ascending = ascendingPull ? rows : [...rows].reverse();
     const messages = ascending.map((row) =>
-      this.toMessageDto(row, this.senderFor(row, senders)),
+      this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        conversation.burnDurationSec,
+      ),
     );
     // 引用快照必须和这一页用同一把尺子:清空水位之下、销毁窗口之外的原文
     // 不能借引用块绕回来。
@@ -1746,7 +1769,11 @@ export class ChatService {
       rows.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
     const messages = rows.map((row) =>
-      this.toMessageDto(row, this.senderFor(row, senders)),
+      this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        burnById.get(row.conversationID) ?? null,
+      ),
     );
     // quote 行的 content.quotedText 是客户端塞的原文快照:搜索之前从不过
     // attachReplyTo,于是被撤回的原文在搜索结果里原样返回。
@@ -1883,7 +1910,11 @@ export class ChatService {
       page.map((r) => r.senderID).filter((id): id is string => id !== null),
     );
     const messages = page.map((row) =>
-      this.toMessageDto(row, this.senderFor(row, senders)),
+      this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        burnById.get(row.conversationID) ?? null,
+      ),
     );
     await this.attachReplyTo(messages, { heightFloors });
     return { messages, serverTime, ...cursor, resetRequired: false };
@@ -2130,7 +2161,12 @@ export class ChatService {
       // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
       // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
-      this.loadLastMessageFor(conv.id, clearedFloor, cutoff),
+      this.loadLastMessageFor(
+        conv.id,
+        conv.burnDurationSec,
+        clearedFloor,
+        cutoff,
+      ),
     ]);
     return {
       id: conv.id,
@@ -2171,6 +2207,7 @@ export class ChatService {
   /** 单个会话的末条消息 DTO(带签名后的媒体 URL);无消息时 null。 */
   private async loadLastMessageFor(
     conversationId: string,
+    burnDurationSec: number | null,
     heightFloor = 0,
     cutoff: Date | null = null,
   ): Promise<ChatMessageDto | null> {
@@ -2188,7 +2225,11 @@ export class ChatService {
     const senders = await this.resolveSenders(
       row.senderID ? [row.senderID] : [],
     );
-    const dto = this.toMessageDto(row, this.senderFor(row, senders));
+    const dto = this.toMessageDto(
+      row,
+      this.senderFor(row, senders),
+      burnDurationSec,
+    );
     await this.media.attachMediaUrls([dto]);
     return dto;
   }
@@ -2691,9 +2732,18 @@ export class ChatService {
     return senders.get(row.senderID) ?? null;
   }
 
+  /**
+   * burnDurationSec 是**必填**参数,不是可选的。
+   *
+   * 客户端拿它决定这条消息要不要按阅后即焚渲染(不落盘缓存、禁长按保存)。漏传
+   * 一处就等于告诉客户端「这条不焚毁」—— 而那正是要修的 bug 本身,且失败方向
+   * 朝不安全一侧偏,线上完全无声。设成必填,新增调用点时由 tsc 逼着回答这个
+   * 问题,而不是靠记得。会话没开焚毁就显式传 null。
+   */
   private toMessageDto(
     row: MessageRow,
     sender: ChatSenderInfo | null,
+    burnDurationSec: number | null,
   ): ChatMessageDto {
     return {
       id: row.id,
@@ -2706,6 +2756,7 @@ export class ChatService {
       revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
       revokedBy: row.revokedBy ?? null,
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
+      burnDurationSec,
       d: row.clientMessageId,
       createdAt: row.createdAt.toISOString(),
     };
@@ -2809,7 +2860,11 @@ export class ChatService {
       const senders = await this.resolveSenders(
         row.senderID ? [row.senderID] : [],
       );
-      return this.toMessageDto(row, this.senderFor(row, senders));
+      return this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        conversation.burnDurationSec,
+      );
     }
     if (row.senderID === null) {
       // 系统消息(进退群提示、burn-changed 留痕)没有作者,下面那条
@@ -2866,7 +2921,11 @@ export class ChatService {
       const senders = await this.resolveSenders(
         updated.senderID ? [updated.senderID] : [],
       );
-      return this.toMessageDto(updated, this.senderFor(updated, senders));
+      return this.toMessageDto(
+        updated,
+        this.senderFor(updated, senders),
+        conversation.burnDurationSec,
+      );
     }
     if (mediaKeys.length > 0) {
       // 尽力而为:删失败只留孤儿对象,不让撤回失败(deleteObjects 内部逐个 catch)。
@@ -2883,7 +2942,11 @@ export class ChatService {
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],
     );
-    return this.toMessageDto(updated, this.senderFor(updated, senders));
+    return this.toMessageDto(
+      updated,
+      this.senderFor(updated, senders),
+      conversation.burnDurationSec,
+    );
   }
 
   /** G-07 送达水位:与 markRead 同款钳制与只前进语义。 */
@@ -3061,13 +3124,17 @@ export class ChatService {
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
     // 重试只会再往 contentHistory 里压一层。
-    const dto = await this.decorateCommittedMessage(updated);
+    const dto = await this.decorateCommittedMessage(
+      updated,
+      conversation.burnDurationSec,
+    );
     return dto;
   }
 
   /** 写已提交之后的装饰(昵称/引用快照):任何失败都降级,绝不抛。 */
   private async decorateCommittedMessage(
     row: MessageRow,
+    burnDurationSec: number | null,
   ): Promise<ChatMessageDto> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -3082,7 +3149,7 @@ export class ChatService {
         }`,
       );
     }
-    const dto = this.toMessageDto(row, sender);
+    const dto = this.toMessageDto(row, sender, burnDurationSec);
     try {
       await this.attachReplyTo([dto]);
     } catch (error) {

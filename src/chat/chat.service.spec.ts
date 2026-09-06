@@ -122,6 +122,9 @@ describe('ChatService', () => {
       circleID: null,
       tempChatID: null,
       lastMessageAt: null,
+      // Prisma 总会把这一列读回来，桩里漏掉的话消息 DTO 会带上 undefined，
+      // 而「缺省」在客户端正是「没开焚毁」——测试就再也测不出这个方向的错。
+      burnDurationSec: null,
     },
     ...overrides,
   });
@@ -1606,6 +1609,47 @@ describe('ChatService', () => {
       prisma.chatMessage.findMany.mockResolvedValue([createdRow]);
       const page = await service.getHistory('u1', 'conv-1', undefined, 50);
       expect(page.nextBeforeHeight).toBeNull();
+    });
+
+    // 阅后即焚是会话级设置，却必须逐条消息带上：客户端此前只能查会话列表缓存，
+    // 而推送冷启动时消息可能先于列表到达，查不到就按「没开焚毁」渲染 —— 原图
+    // 落盘、长按可存相册，等缓存补齐已经晚了。带在消息上就不依赖加载顺序。
+    it('stamps each message with its conversation burn duration', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 30,
+          },
+        }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { ...createdRow, id: 'msg-5', height: 5 },
+        { ...createdRow, id: 'msg-4', height: 4 },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      expect(page.messages).toHaveLength(2);
+      for (const message of page.messages) {
+        expect(message.burnDurationSec).toBe(30);
+      }
+    });
+
+    // 反方向同样要钉住：普通会话必须显式回 null，而不是把字段整个省掉。
+    // 省掉和 null 在客户端是同一个意思，但只有显式 null 能证明这条路走通了。
+    it('reports a null burn duration for an ordinary conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([createdRow]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      expect(page.messages[0].burnDurationSec).toBeNull();
     });
 
     // G-13 重连对账:断线窗口内的消息要能按 height 升序增量补拉。
