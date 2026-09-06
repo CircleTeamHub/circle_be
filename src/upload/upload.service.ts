@@ -228,6 +228,40 @@ function corsRuleAllowsBrowserPut(rule: CORSRule, origin: string): boolean {
   );
 }
 
+/**
+ * 常见对象存储服务商的直连域名后缀。
+ *
+ * 「投递地址不能等于签名端点」只挡住了完全同源那一种写法：同一个服务商下
+ * 换个桶名、或者用它自带的加速域名，仍然是没有限流没有 WAF 的源站,而契约
+ * 要求的是一个自己可控的 CDN/WAF 域名。这里按后缀直接拒。
+ */
+const DIRECT_PROVIDER_HOST_SUFFIXES = [
+  'myqcloud.com',
+  'amazonaws.com',
+  'aliyuncs.com',
+  'qiniucs.com',
+  'bcebos.com',
+  'ksyuncs.com',
+  'blob.core.windows.net',
+  'storage.googleapis.com',
+  'r2.cloudflarestorage.com',
+  'r2.dev',
+  'digitaloceanspaces.com',
+  'backblazeb2.com',
+];
+
+function isDirectProviderHost(value: string): boolean {
+  let host: string;
+  try {
+    host = new URL(value).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return DIRECT_PROVIDER_HOST_SUFFIXES.some(
+    (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+  );
+}
+
 function storageOrigin(value: string): string | null {
   try {
     return new URL(value).origin;
@@ -245,6 +279,8 @@ export class UploadService implements OnModuleInit {
   private readonly bucket: string;
   private readonly publicUrl: string;
   private readonly publicObjectBase: string;
+  /** 认得出 key 的所有前缀（canonical 在前，切换前的直连域名在后）。 */
+  private readonly publicObjectBases: string[];
   private readonly region: string;
   private readonly manageBucket: boolean;
   private readonly allowedOrigins: string[];
@@ -300,13 +336,20 @@ export class UploadService implements OnModuleInit {
       configuredDeliveryUrl && !sharedPublicObjectBase,
     );
     this.publicObjectBase = sharedPublicObjectBase ?? directPublicObjectBase;
+    // 写入永远用 publicObjectBase；识别要连**切换之前**存下的直连地址一起认，
+    // 否则开启投递域名的那一刻，所有历史 url 都会变成「不是本站存储」。
+    this.publicObjectBases = [this.publicObjectBase];
+    if (!this.publicObjectBases.includes(directPublicObjectBase)) {
+      this.publicObjectBases.push(directPublicObjectBase);
+    }
     const deliveryBase = configuredDeliveryUrl ? sharedPublicObjectBase : null;
     const deliveryOrigin = deliveryBase ? storageOrigin(deliveryBase) : null;
     this.externalDeliveryConfigured = Boolean(
       deliveryBase &&
       new URL(deliveryBase).protocol === 'https:' &&
       deliveryOrigin !== storageOrigin(this.publicUrl) &&
-      deliveryOrigin !== storageOrigin(directPublicObjectBase),
+      deliveryOrigin !== storageOrigin(directPublicObjectBase) &&
+      !isDirectProviderHost(deliveryBase),
     );
     this.production =
       (this.config.get<string>('NODE_ENV') ?? process.env.NODE_ENV) ===
@@ -690,9 +733,14 @@ export class UploadService implements OnModuleInit {
    */
   objectKeyFromPublicUrl(url: string | null | undefined): string | null {
     if (!url) return null;
-    const base = `${this.publicObjectBase}/`;
-    if (!url.startsWith(base)) return null;
-    return url.slice(base.length).split('?')[0];
+    // 历史地址也要认：投递域名启用之前存下的 url 指向直连域名，只认 canonical
+    // 会让「按 url 回收对象」在切换那一刻整片失效（旧笔记媒体删不掉，存储审计
+    // 反过来把它们当成孤儿）。
+    for (const candidate of this.publicObjectBases) {
+      const base = `${candidate}/`;
+      if (url.startsWith(base)) return url.slice(base.length).split('?')[0];
+    }
+    return null;
   }
 
   async downloadObjectBuffer(key: string, maxBytes?: number): Promise<Buffer> {

@@ -989,6 +989,69 @@ describe('UploadService', () => {
     // 不能静默回落到直连域名 —— 那正是这份契约要禁掉的地址。
     await expect(service.onModuleInit()).rejects.toMatchObject({ status: 503 });
   });
+
+  it('still resolves keys for URLs stored before the delivery cutover', () => {
+    const service = new UploadService({
+      get: (key: string) =>
+        ({
+          MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+          MINIO_ACCESS_KEY: 'cos-secret-id',
+          MINIO_SECRET_KEY: 'cos-secret-key',
+          MINIO_BUCKET: 'windnote-1234567890',
+          MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+          OBJECT_STORAGE_REGION: 'ap-tokyo',
+          OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+          OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+          OBJECT_STORAGE_DELIVERY_URL: 'https://media.example.com/circle',
+        })[key] ?? null,
+    } as any);
+
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://media.example.com/circle/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    // 切换之前存下的地址 —— 认不出来就意味着旧媒体删不掉、还会被审计当孤儿。
+    expect(
+      service.objectKeyFromPublicUrl(
+        'https://windnote-1234567890.cos.ap-tokyo.myqcloud.com/notes/u1/a.jpg',
+      ),
+    ).toBe('notes/u1/a.jpg');
+    expect(
+      service.objectKeyFromPublicUrl('https://evil.example.com/notes/u1/a.jpg'),
+    ).toBeNull();
+  });
+
+  it.each([
+    'https://other-bucket.cos.ap-tokyo.myqcloud.com',
+    'https://windnote-1234567890.cos.accelerate.myqcloud.com/media',
+    'https://circle-media.s3.amazonaws.com',
+    'https://pub-abc123.r2.dev',
+  ])(
+    'refuses a delivery URL that is still a direct provider origin: %s',
+    async (deliveryUrl) => {
+      const service = new UploadService({
+        get: (key: string) =>
+          ({
+            NODE_ENV: 'production',
+            MINIO_ENDPOINT: 'https://cos.ap-tokyo.myqcloud.com',
+            MINIO_ACCESS_KEY: 'cos-secret-id',
+            MINIO_SECRET_KEY: 'cos-secret-key',
+            MINIO_BUCKET: 'windnote-1234567890',
+            MINIO_PUBLIC_URL: 'https://cos.ap-tokyo.myqcloud.com',
+            OBJECT_STORAGE_REGION: 'ap-tokyo',
+            OBJECT_STORAGE_FORCE_PATH_STYLE: 'false',
+            OBJECT_STORAGE_MANAGE_BUCKET: 'false',
+            OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
+            ALLOWED_ORIGINS: 'https://app.example.com',
+          })[key] ?? null,
+      } as any);
+
+      await expect(service.onModuleInit()).rejects.toMatchObject({
+        status: 503,
+      });
+    },
+  );
 });
 
 describe('matchesCorsWildcard', () => {

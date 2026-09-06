@@ -8,7 +8,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import {
   isUrlFromStorage,
-  storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import {
   CirclePost,
@@ -92,7 +92,7 @@ const CIRCLE_POST_PUBLISH_FANOUT_CAP = 500;
 export class CirclePlazaService {
   private readonly logger = new Logger(CirclePlazaService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly storagePublicObjectBase: string | null;
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -103,7 +103,7 @@ export class CirclePlazaService {
     private readonly membershipPolicy: MembershipPolicyService,
     private readonly avatarFrames: AvatarFrameService,
   ) {
-    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
     );
   }
@@ -191,9 +191,9 @@ export class CirclePlazaService {
    * a cross-user tracking / phishing vector. Skipped when MinIO is unconfigured.
    */
   private assertImagesAreSafe(images: string[] | undefined): void {
-    if (!this.storagePublicObjectBase || !images?.length) return;
+    if (!this.storagePublicObjectBases.length || !images?.length) return;
     for (const image of images) {
-      if (!isUrlFromStorage(image, this.storagePublicObjectBase)) {
+      if (!isUrlFromStorage(image, this.storagePublicObjectBases)) {
         throw new BadRequestException(
           "post images must be served from this application's storage",
         );

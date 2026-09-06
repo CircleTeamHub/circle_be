@@ -26,7 +26,7 @@ import {
 } from 'src/chat/chat.constants';
 import {
   assertUrlsFromStorage,
-  storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import {
   prismaErrorCode,
@@ -380,7 +380,7 @@ function escapeXml(value: string) {
 export class NoteService {
   private readonly logger = new Logger(NoteService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly storagePublicObjectBase: string | null;
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -388,7 +388,7 @@ export class NoteService {
     private readonly membershipPolicy: MembershipPolicyService,
     @Optional() private readonly uploadService?: UploadService,
   ) {
-    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
     );
   }
@@ -882,7 +882,7 @@ export class NoteService {
     for (const item of media) {
       urls.push(item.url, item.posterUrl);
     }
-    assertUrlsFromStorage(urls, this.storagePublicObjectBase, 'media url');
+    assertUrlsFromStorage(urls, this.storagePublicObjectBases, 'media url');
   }
 
   private buildMediaStats(media: CreateNoteDto['media']) {

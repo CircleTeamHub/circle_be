@@ -9,7 +9,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import {
   isUrlFromStorage,
-  storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import {
   CircleErrorCode,
@@ -56,7 +56,7 @@ const MY_CIRCLES_DEFAULT_LIMIT = 100;
 export class CircleService {
   private readonly logger = new Logger(CircleService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly storagePublicObjectBase: string | null;
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -68,7 +68,7 @@ export class CircleService {
     private readonly chatCircleSync: ChatCircleSyncService,
     private readonly systemMessage: ChatSystemMessageService,
   ) {
-    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
     );
   }
@@ -80,8 +80,8 @@ export class CircleService {
    * is unconfigured (upload disabled anyway).
    */
   private assertAvatarUrlIsSafe(avatarUrl: string | null | undefined): void {
-    if (!this.storagePublicObjectBase || !avatarUrl) return;
-    if (!isUrlFromStorage(avatarUrl, this.storagePublicObjectBase)) {
+    if (!this.storagePublicObjectBases.length || !avatarUrl) return;
+    if (!isUrlFromStorage(avatarUrl, this.storagePublicObjectBases)) {
       throw new BadRequestException({
         message: "avatarUrl must be served from this application's storage",
         errorCode: CircleErrorCode.AvatarUrlInvalid,

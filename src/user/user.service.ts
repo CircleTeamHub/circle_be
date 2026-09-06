@@ -15,7 +15,7 @@ import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import {
   assertUrlsFromStorage,
-  storagePublicObjectBaseFromConfig,
+  storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
@@ -201,7 +201,7 @@ function normalizeUpdateInput(input: UpdateUserInput) {
 export class UserService {
   private readonly logger = new Logger(UserService.name);
   private readonly loggingConfig = createLoggingConfig();
-  private readonly storagePublicObjectBase: string | null;
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private prisma: PrismaService,
@@ -215,7 +215,7 @@ export class UserService {
     private privacySettings: PrivacySettingsService,
     private avatarFrames: AvatarFrameService,
   ) {
-    this.storagePublicObjectBase = storagePublicObjectBaseFromConfig(
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
     );
   }
@@ -307,7 +307,7 @@ export class UserService {
   private assertUrlsAreSafe(input: UpdateUserInput): void {
     assertUrlsFromStorage(
       URL_FIELDS.map((field) => input[field] as string | undefined),
-      this.storagePublicObjectBase,
+      this.storagePublicObjectBases,
       'profile image url',
     );
   }
