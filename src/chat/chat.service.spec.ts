@@ -14,6 +14,8 @@ describe('ChatService', () => {
       findMany: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+      // 全群清空要把会话级水位推上去。
+      updateMany: jest.fn(),
     },
     chatMember: {
       findUnique: jest.fn(),
@@ -125,6 +127,8 @@ describe('ChatService', () => {
       // Prisma 总会把这一列读回来，桩里漏掉的话消息 DTO 会带上 undefined，
       // 而「缺省」在客户端正是「没开焚毁」——测试就再也测不出这个方向的错。
       burnDurationSec: null,
+      // 同理：会话级的全群清空水位。读路径按 max(座位, 会话) 取严者。
+      clearedBeforeHeight: 0,
     },
     ...overrides,
   });
@@ -1116,7 +1120,12 @@ describe('ChatService', () => {
     it('drops users that share no conversation with the requester', async () => {
       prisma.chatMember.findMany
         // listConversationIds
-        .mockResolvedValueOnce([{ conversationID: 'conv-1' }])
+        .mockResolvedValueOnce([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ])
         // 共处会话的目标
         .mockResolvedValueOnce([{ userID: 'u2' }]);
 
@@ -1129,7 +1138,12 @@ describe('ChatService', () => {
     // 仍能互相看到在线状态,等于把「我拉黑了你」变成一个可长期追踪的信道。
     it('hides peers on either side of a block even when a seat is shared', async () => {
       prisma.chatMember.findMany
-        .mockResolvedValueOnce([{ conversationID: 'conv-1' }])
+        .mockResolvedValueOnce([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ])
         .mockResolvedValueOnce([
           { userID: 'blocked-by-me' },
           { userID: 'blocked-me' },
@@ -1894,7 +1908,7 @@ describe('ChatService', () => {
         messageSelfDestructDays: 2,
       });
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1' },
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
       ]);
       prisma.chatMessage.findMany.mockResolvedValue([]);
 
@@ -1912,8 +1926,8 @@ describe('ChatService', () => {
 
     it('scopes the search to conversations the user is seated in', async () => {
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1' },
-        { conversationID: 'conv-2' },
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+        { conversationID: 'conv-2', conversation: { clearedBeforeHeight: 0 } },
       ]);
       prisma.chatMessage.findMany.mockResolvedValue([createdRow]);
 
@@ -3042,6 +3056,87 @@ describe('ChatService', () => {
       expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
     });
 
+    // 全群清空只推进当时在座的人是不够的：新座位建出来是 schema 默认的 0，
+    // 清空之后拉一个新号进群就能把「已清空」的历史全部读回来。会话上必须留一条
+    // 水位，供入座路径继承、读路径兜底。
+    it('records a conversation-level watermark on a global clear', async () => {
+      mockClearLock({ ownerID: 'u1' });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: { ...membership().conversation, ownerID: 'u1' },
+        }),
+      );
+      prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([]);
+
+      await service.clearHistory('u1', 'conv-1', true);
+
+      expect(prisma.chatConversation.updateMany).toHaveBeenCalledWith({
+        where: { id: 'conv-1', clearedBeforeHeight: { lt: 42 } },
+        data: { clearedBeforeHeight: 42 },
+      });
+    });
+
+    // 水位只前进不后退：`clearedBeforeHeight: { lt }` 这个条件本身就是这条保证 ——
+    // 用一个更低的 targetHeight 重放不该把已经藏起来的消息放回去。
+    it('never lowers the conversation watermark', async () => {
+      mockClearLock({ ownerID: 'u1' });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: { ...membership().conversation, ownerID: 'u1' },
+        }),
+      );
+      prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMember.updateManyAndReturn.mockResolvedValue([]);
+
+      await service.clearHistory('u1', 'conv-1', true, 10);
+
+      const calls = prisma.chatConversation.updateMany.mock.calls;
+      const call = calls[calls.length - 1][0];
+      expect(call.where.clearedBeforeHeight).toEqual({ lt: 10 });
+      expect(call.data).toEqual({ clearedBeforeHeight: 10 });
+    });
+
+    // 只清自己的记录不该动会话水位 —— 那会把别人的历史一起藏掉。
+    it('leaves the conversation watermark alone for a personal clear', async () => {
+      mockClearLock({ type: 'DIRECT' });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: { ...membership().conversation, type: 'DIRECT' },
+        }),
+      );
+      prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
+
+      await service.clearHistory('u1', 'conv-1');
+
+      expect(prisma.chatConversation.updateMany).not.toHaveBeenCalled();
+    });
+
+    // 读路径按 max(座位, 会话) 取严者。圈子对账那条入座路径不持有会话行锁，
+    // 理论上能与一次清空并发、把座位留在水位之下；这一道兜底覆盖那个窗口。
+    it('floors reads on the conversation watermark when the seat lags behind', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          clearedBeforeHeight: 0,
+          conversation: {
+            ...membership().conversation,
+            clearedBeforeHeight: 30,
+          },
+        }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ height: { gt: 30 } }),
+        }),
+      );
+    });
+
     it('lets a standalone group owner clear every active seat and broadcasts the global clear', async () => {
       mockClearLock({ ownerID: 'u1' });
       prisma.chatMember.findUnique.mockResolvedValue(
@@ -4150,7 +4245,11 @@ describe('ChatService', () => {
     it('returns rows mutated after the cursor regardless of height', async () => {
       // 撤回不改 height,所以 afterHeight 补拉结构上永远看不到它。
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       prisma.$queryRaw.mockResolvedValue([mutatedRow()]);
 
@@ -4174,7 +4273,11 @@ describe('ChatService', () => {
       // 截断了还回 serverTime 的话,没返回的那些变更被永久跳过 ——
       // 撤回的正文会一直留在对方屏幕上。
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       // 时间取相对值:这一页必须整体落在安全水位**之下**,否则游标会被水位
       // 卡住(那是另一条用例在测的行为)。
@@ -4205,7 +4308,11 @@ describe('ChatService', () => {
       // 可以「时间戳很早、提交很晚」。同步把游标推到 serverTime 的话,它提交
       // 之后就永远落在游标后面 —— 那条撤回的正文会一直留在对方屏幕上。
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
@@ -4222,7 +4329,11 @@ describe('ChatService', () => {
       // 客户端刚同步过(since 很新),安全水位比它还老 —— 这时既不能倒退,
       // 也不能谎报 hasMore 让它空转。
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 
@@ -4235,7 +4346,11 @@ describe('ChatService', () => {
 
     it('stops paging rather than spinning when the whole page is too fresh', async () => {
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       const since = new Date(Date.now() - 2_000);
       // 整页都落在不安全窗口里:游标推不动。
@@ -4271,7 +4386,11 @@ describe('ChatService', () => {
       // 取回来再 filter 的话,被过滤掉的行照样占着 LIMIT 的名额:一页里真正
       // 该返回的变更变少了,而客户端游标照常前进。
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 5 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 5,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       prisma.chatConversation.findMany.mockResolvedValue([
         { id: 'conv-1', burnDurationSec: 30 },
@@ -4325,8 +4444,16 @@ describe('ChatService', () => {
   describe('searchAllMessages 的清空水位', () => {
     it('excludes the cleared segment from global search', async () => {
       prisma.chatMember.findMany.mockResolvedValue([
-        { conversationID: 'conv-1', clearedBeforeHeight: 7 },
-        { conversationID: 'conv-2', clearedBeforeHeight: 0 },
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 7,
+          conversation: { clearedBeforeHeight: 0 },
+        },
+        {
+          conversationID: 'conv-2',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
       ]);
       prisma.chatMessage.findMany.mockResolvedValue([]);
 
