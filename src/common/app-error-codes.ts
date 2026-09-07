@@ -336,6 +336,8 @@ export const ChatErrorCode = {
   GroupCircleManaged: 'CHAT_GROUP_CIRCLE_MANAGED',
   // 扫码进群放开了好友边界,没有容量闸的话一张群码等于无限进人。
   GroupFull: 'CHAT_GROUP_FULL',
+  // 解散是不可逆的全员操作(全员离座 + 全员记录消失),只有群主能按。
+  GroupOwnerOnly: 'CHAT_GROUP_OWNER_ONLY',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /
