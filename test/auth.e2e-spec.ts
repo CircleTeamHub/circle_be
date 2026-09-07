@@ -150,7 +150,7 @@ describe('Auth e2e', () => {
 
     return spec
       .post('/api/v1/auth/login')
-      .withBody({ email: EMAIL, password: PASSWORD })
+      .withBody({ identifier: EMAIL, password: PASSWORD })
       .expectStatus(201)
       .expectJsonLike({ code: 0, message: 'ok', data: { accessToken: /.+/ } });
   });
@@ -158,7 +158,7 @@ describe('Auth e2e', () => {
   it('login with unknown email returns 403', () => {
     return spec
       .post('/api/v1/auth/login')
-      .withBody({ email: 'nobody@example.com', password: PASSWORD })
+      .withBody({ identifier: 'nobody@example.com', password: PASSWORD })
       .expectStatus(403);
   });
 
@@ -167,7 +167,7 @@ describe('Auth e2e', () => {
 
     return spec
       .post('/api/v1/auth/login')
-      .withBody({ email: EMAIL, password: 'wrongpass' })
+      .withBody({ identifier: EMAIL, password: 'wrongpass' })
       .expectStatus(403);
   });
 });

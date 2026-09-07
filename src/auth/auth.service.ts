@@ -14,7 +14,6 @@ import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
-import { LoginWithCodeDto } from './dto/login-with-code.dto';
 import { EmailVerificationService } from './email-verification.service';
 import {
   generateUniqueAccountId,
@@ -27,7 +26,6 @@ import { normalizeEmail } from 'src/utils/email';
 import {
   AuthErrorCode,
   FancyNumberErrorCode,
-  QrErrorCode,
 } from 'src/common/app-error-codes';
 import {
   ACCOUNT_ID_PATTERN,
@@ -86,6 +84,10 @@ function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
       errorCode: AuthErrorCode.SecurityCodeFormat,
     });
   }
+}
+
+function loginIdentifier(dto: LoginDto): string {
+  return dto.identifier?.trim() || dto.email?.trim() || '';
 }
 
 export type SafeUser = {
@@ -205,8 +207,14 @@ export class AuthService {
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
-    const email = normalizeEmail(dto.email);
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const identifier = loginIdentifier(dto);
+    let where: Prisma.UserWhereUniqueInput | null = null;
+    if (identifier.includes('@')) {
+      where = { email: normalizeEmail(identifier) };
+    } else if (ACCOUNT_ID_PATTERN.test(identifier)) {
+      where = { accountId: identifier.toLowerCase() };
+    }
+    const user = where ? await this.prisma.user.findUnique({ where }) : null;
 
     // Use the same error for "no such user" and "inactive user" so the
     // endpoint cannot be used as an account-enumeration oracle. The actual
@@ -227,7 +235,7 @@ export class AuthService {
         },
       });
       throw new ForbiddenException({
-        message: '邮箱或密码错误',
+        message: '邮箱、用户ID或密码错误',
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
@@ -247,7 +255,7 @@ export class AuthService {
         metadata: { reason: 'account_locked' },
       });
       throw new ForbiddenException({
-        message: '邮箱或密码错误',
+        message: '邮箱、用户ID或密码错误',
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
@@ -274,7 +282,7 @@ export class AuthService {
         metadata: { reason: 'invalid_credentials' },
       });
       throw new ForbiddenException({
-        message: '邮箱或密码错误',
+        message: '邮箱、用户ID或密码错误',
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
@@ -289,7 +297,7 @@ export class AuthService {
         metadata: { reason: 'admin_must_use_admin_login' },
       });
       throw new ForbiddenException({
-        message: '邮箱或密码错误',
+        message: '邮箱、用户ID或密码错误',
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
@@ -352,7 +360,7 @@ export class AuthService {
   }
 
   async adminLogin(dto: LoginDto, sessionContext?: SessionContext) {
-    const email = normalizeEmail(dto.email);
+    const email = normalizeEmail(loginIdentifier(dto));
     const user = await this.prisma.user.findUnique({ where: { email } });
     // 管理台事件必须可追溯来源（#90）：ip/userAgent 一律进 metadata。
     const adminAuditContext = {
@@ -457,43 +465,11 @@ export class AuthService {
     return tokens;
   }
 
-  async loginWithCode(dto: LoginWithCodeDto, sessionContext?: SessionContext) {
-    const email = normalizeEmail(dto.email);
-
-    const codeOk = await this.emailVerification.verifyCode(
-      email,
-      'LOGIN',
-      dto.code,
-    );
-    if (!codeOk) {
-      throw new ForbiddenException({
-        message: '验证码错误或已过期',
-        errorCode: AuthErrorCode.CodeInvalid,
-      });
-    }
-
-    const user = await this.prisma.user.findUnique({ where: { email } });
-    if (!user || user.status !== 'ACTIVE') {
-      throw new ForbiddenException({
-        message: '验证码错误或已过期',
-        errorCode: AuthErrorCode.CodeInvalid,
-      });
-    }
-
-    return this.finishLogin(user, sessionContext, dto.platform);
+  async requestEmailCode(email: string, purpose: 'register'): Promise<void> {
+    await this.emailVerification.requestCode(email, 'REGISTER');
   }
 
-  async requestEmailCode(
-    email: string,
-    purpose: 'register' | 'login',
-  ): Promise<void> {
-    await this.emailVerification.requestCode(
-      email,
-      purpose === 'register' ? 'REGISTER' : 'LOGIN',
-    );
-  }
-
-  /** 密码登录与验证码登录共用的收尾：lastOnline、发 token、记日志。 */
+  /** 密码登录共用的收尾：lastOnline、发 token、记日志。 */
   private async finishLogin(
     user: {
       id: string;
@@ -533,36 +509,6 @@ export class AuthService {
     });
 
     return tokens;
-  }
-
-  /**
-   * 扫码登录的账号闸门：与普通登录同一政策 —— ACTIVE 且非 ADMIN
-   * （管理台自有短 TTL 会话模型，扫码不放行）。文案统一"二维码已失效"，
-   * 不泄露账号状态。
-   */
-  async assertQrLoginEligible(userId: string): Promise<void> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { status: true, role: true },
-    });
-    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
-      throw new ForbiddenException({
-        message: '二维码已失效，请刷新后重试',
-        errorCode: QrErrorCode.Invalid,
-      });
-    }
-  }
-
-  /** 扫码登录消费侧换发正式会话（QrLoginService 在 CONSUMED 抢占成功后调）。 */
-  async issueQrLoginTokens(userId: string, sessionContext?: SessionContext) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user || user.status !== 'ACTIVE' || user.role === 'ADMIN') {
-      throw new ForbiddenException({
-        message: '二维码已失效，请刷新后重试',
-        errorCode: QrErrorCode.Invalid,
-      });
-    }
-    return this.finishLogin(user, sessionContext);
   }
 
   async refresh(refreshToken: string, sessionContext?: SessionContext) {

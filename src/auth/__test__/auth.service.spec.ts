@@ -460,6 +460,23 @@ describe('AuthService', () => {
     expect(result.accessToken).toBe('access-token');
   });
 
+  it('login by user ID returns tokens with correct password', async () => {
+    const passwordHash = await argon2.hash('password1');
+    users.push({
+      id: 'uuid-account-id',
+      accountId: 'user_123',
+      email: 'id-login@example.com',
+      passwordHash,
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    const result = await service.login({
+      identifier: ' user_123 ',
+      password: 'password1',
+    } as any);
+    expect(result.accessToken).toBe('access-token');
+  });
+
   it('login throws ForbiddenException for unknown email', async () => {
     await expect(
       service.login({
@@ -481,41 +498,6 @@ describe('AuthService', () => {
     });
     await expect(
       service.login({ email: 'a@example.com', password: 'wrongpass' } as any),
-    ).rejects.toThrow(ForbiddenException);
-  });
-
-  it('loginWithCode returns tokens when code valid', async () => {
-    users.push({
-      id: 'uuid-1',
-      accountId: 'AAA111',
-      email: 'a@example.com',
-      passwordHash: 'x',
-      status: 'ACTIVE',
-      role: 'USER',
-    });
-    mockEmailVerification.verifyCode.mockResolvedValueOnce(true);
-    const result = await service.loginWithCode({
-      email: 'a@example.com',
-      code: '123456',
-    } as any);
-    expect(result.accessToken).toBe('access-token');
-  });
-
-  it('loginWithCode throws ForbiddenException when code invalid', async () => {
-    users.push({
-      id: 'uuid-1',
-      accountId: 'AAA111',
-      email: 'a@example.com',
-      passwordHash: 'x',
-      status: 'ACTIVE',
-      role: 'USER',
-    });
-    mockEmailVerification.verifyCode.mockResolvedValueOnce(false);
-    await expect(
-      service.loginWithCode({
-        email: 'a@example.com',
-        code: '000000',
-      } as any),
     ).rejects.toThrow(ForbiddenException);
   });
 
@@ -929,13 +911,13 @@ describe('AuthService', () => {
         email: 'banned@example.com',
         password: 'password1',
       } as any),
-    ).rejects.toThrow(/邮箱或密码错误/);
+    ).rejects.toThrow(/邮箱、用户ID或密码错误/);
     await expect(
       service.login({
         email: 'nosuch@example.com',
         password: 'password1',
       } as any),
-    ).rejects.toThrow(/邮箱或密码错误/);
+    ).rejects.toThrow(/邮箱、用户ID或密码错误/);
   });
 
   it('refresh blocks inactive users and revokes their sessions', async () => {

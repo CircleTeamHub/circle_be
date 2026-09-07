@@ -1,17 +1,35 @@
 import {
-  IsEmail,
   IsIn,
   IsNotEmpty,
+  IsEmail,
   IsOptional,
   IsString,
   Length,
+  ValidateIf,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class LoginDto {
-  @ApiProperty({ example: 'user@example.com' })
+  @ApiProperty({
+    example: 'user@example.com',
+    description: 'Email address or user ID',
+    required: false,
+  })
+  @ValidateIf((dto: LoginDto) => !dto.email)
+  @IsString()
+  @IsNotEmpty()
+  @Length(1, 254)
+  identifier?: string;
+
+  /** Backward-compatible alias for clients that still send the email field. */
+  @ApiPropertyOptional({
+    example: 'user@example.com',
+    deprecated: true,
+    description: 'Deprecated; use identifier instead',
+  })
+  @ValidateIf((dto: LoginDto) => !dto.identifier)
   @IsEmail()
-  email: string;
+  email?: string;
 
   @ApiProperty({ example: 'password123' })
   @IsString()

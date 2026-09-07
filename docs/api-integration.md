@@ -91,10 +91,12 @@ POST /api/v1/auth/login
 **Request Body**
 ```json
 {
-  "username": "testuser",
+  "identifier": "testuser",
   "password": "password123"
 }
 ```
+
+`identifier` 可填写邮箱或用户 ID。
 
 **Response** — 同注册，返回 `accessToken` + `refreshToken`
 
