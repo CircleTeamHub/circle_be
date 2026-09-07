@@ -1232,6 +1232,114 @@ export class ChatService {
       .catch(() => undefined);
   }
 
+  /**
+   * 独立群聊:群主解散(微信语义)。群从每个人的会话列表里消失,并且**所有人**
+   * 的聊天记录一并消失 —— 不是各删各的,是一次全群清空。
+   *
+   * 记录用水位隐藏而不是物理删消息行:与「清空全群记录」同一套机制,保留审计,
+   * 也避免在一个事务里删掉一个大群的全部消息。会话级水位配合座位水位,
+   * 让解散之后万一还有座位被建出来也读不回历史。
+   *
+   * 解散不需要额外的「已解散」标记:全员离座之后没有在座成员,而邀请/扫码进群
+   * 都要求调用方是在座成员,群不可能复活。
+   */
+  async dissolveGroupConversation(
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    const conversation = await this.requireStandaloneGroup(
+      conversationId,
+      userId,
+    );
+    const dissolvedMembers = await this.prisma.$transaction(async (tx) => {
+      // 与发消息/清空/退群同一把锁、同一个顺序:会话行锁永远最先拿。
+      const locked = await tx.$queryRaw<
+        Array<{
+          id: string;
+          type: string;
+          circleID: string | null;
+          ownerID: string | null;
+          nextHeight: number;
+        }>
+      >`SELECT "id", "type", "circleID", "ownerID", "nextHeight"
+        FROM "ChatConversation"
+        WHERE "id" = ${conversation.id} FOR UPDATE`;
+      if (
+        locked.length === 0 ||
+        locked[0].type !== 'GROUP' ||
+        locked[0].circleID !== null
+      ) {
+        throw new NotFoundException({
+          message: '群聊不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const actorSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversation.id,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true },
+      });
+      if (!actorSeat || actorSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      // 授权读的是锁后的 ownerID:退群转移群主与解散必须串行,
+      // 否则刚交出群主的人还能把群解散掉。
+      if (locked[0].ownerID !== userId) {
+        throw new ForbiddenException({
+          message: '仅群主可解散群聊',
+          errorCode: ChatErrorCode.GroupOwnerOnly,
+        });
+      }
+      const seated = await tx.chatMember.findMany({
+        where: { conversationID: conversation.id, leftAt: null },
+        select: { userID: true },
+      });
+      const clearThrough = locked[0].nextHeight;
+      if (clearThrough > 0) {
+        await tx.chatConversation.updateMany({
+          where: {
+            id: conversation.id,
+            clearedBeforeHeight: { lt: clearThrough },
+          },
+          data: { clearedBeforeHeight: clearThrough },
+        });
+      }
+      // 无条件写 clearThrough 不会让水位倒退:它是 nextHeight,也就是这个会话
+      // 可能出现的最大 height,任何座位的既有水位都 ≤ 它。
+      await tx.chatMember.updateMany({
+        where: { conversationID: conversation.id, leftAt: null },
+        data: {
+          clearedBeforeHeight: clearThrough,
+          lastReadHeight: clearThrough,
+          leftAt: new Date(),
+        },
+      });
+      return seated.map((member) => member.userID);
+    });
+
+    // 广播放事务外:清空/退群同样的做法,推送失败不该回滚已经落库的解散。
+    for (const memberId of dissolvedMembers) {
+      void this.broadcast
+        .removeUserFromConversation(memberId, conversation.id)
+        .catch(() => undefined);
+      // 解散的人自己收 left(和主动退群同一语义,客户端静默收走);其他人收
+      // removed,客户端才会提示群已经没了。给自己发 removed 的话,刚按下解散
+      // 的群主会被弹「你已被移出该群聊」。
+      this.broadcast.emitConversationChange(memberId, {
+        kind: memberId === userId ? 'left' : 'removed',
+        conversationId: conversation.id,
+        userId: memberId,
+      });
+    }
+  }
+
   /** 独立群聊改名:任一在座成员可改(微信语义);改完发系统提示留痕。 */
   async renameGroupConversation(
     userId: string,
@@ -3357,14 +3465,21 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    if (
-      conversation.type === 'GROUP' &&
-      !(await this.isCircleModerator(conversation, userId))
-    ) {
-      throw new ForbiddenException({
-        message: '仅圈主或管理员可设置',
-        errorCode: GroupErrorCode.ManagerOnly,
-      });
+    if (conversation.type === 'GROUP') {
+      // 独立群聊没有圈子角色表可查:群主之外一律拒。圈子群仍是圈主/管理员。
+      if (!conversation.circleID) {
+        if (conversation.ownerID !== userId) {
+          throw new ForbiddenException({
+            message: '仅群主可设置',
+            errorCode: ChatErrorCode.GroupOwnerOnly,
+          });
+        }
+      } else if (!(await this.isCircleModerator(conversation, userId))) {
+        throw new ForbiddenException({
+          message: '仅圈主或管理员可设置',
+          errorCode: GroupErrorCode.ManagerOnly,
+        });
+      }
     }
     // 单聊拉黑之后座位仍在,不复查的话被拉黑的一方可以把会话设成 30 秒焚毁,
     // 隔一分钟 sweeper 就替他把对方的整段历史真删了 —— 一个连消息都发不出去的
