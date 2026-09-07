@@ -77,10 +77,12 @@ POST /auth/login
 **Request Body：**
 ```json
 {
-  "username": "testuser",
+  "identifier": "testuser",
   "password": "password123"
 }
 ```
+
+`identifier` 可填写邮箱或用户 ID。
 
 **Response 201：** 同注册
 

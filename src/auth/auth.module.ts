@@ -1,7 +1,5 @@
 import { Global, Logger, Module } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { QrLoginService } from './qr-login.service';
-import { QrLoginCleanup } from './qr-login.cleanup';
 import { AuthController } from './auth.controller';
 import { PassportModule } from '@nestjs/passport';
 import { JwtModule } from '@nestjs/jwt';
@@ -43,8 +41,6 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
   ],
   providers: [
     AuthService,
-    QrLoginService,
-    QrLoginCleanup,
     RefreshTokenService,
     RefreshTokenCleanup,
     SessionRevocationService,
@@ -64,8 +60,8 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
         if (configService.get<string>('NODE_ENV') === 'production') {
           new Logger('AuthModule').error(
             'SMTP_HOST is not configured in production — email verification ' +
-              'endpoints will answer 503 and NO user can register or log ' +
-              'in by code. Set SMTP_HOST/SMTP_USER/SMTP_PASS ' +
+              'endpoints will answer 503 and users cannot register or reset ' +
+              'passwords by email. Set SMTP_HOST/SMTP_USER/SMTP_PASS ' +
               '(and optionally SMTP_PORT/SMTP_SECURE/MAIL_FROM).',
           );
           return new UnconfiguredMailer();

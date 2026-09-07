@@ -6,7 +6,7 @@ export class RequestEmailCodeDto {
   @IsEmail()
   email: string;
 
-  @ApiProperty({ example: 'register', enum: ['register', 'login'] })
-  @IsIn(['register', 'login'])
-  purpose: 'register' | 'login';
+  @ApiProperty({ example: 'register', enum: ['register'] })
+  @IsIn(['register'])
+  purpose: 'register';
 }
