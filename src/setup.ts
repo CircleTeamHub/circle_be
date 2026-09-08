@@ -461,11 +461,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/auth/admin/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
-  // Email code sends and security-code verification are the two new
+  // Password-reset code sends and security-code verification are the two
   // unauthenticated-cost / brute-force surfaces from this branch.
-  app.use('/api/v1/auth/email/request-code', emailCodeLimiter);
-  // review 修复：忘记密码的验证码发送与 request-code 同为未认证发信面，
-  // 必须共享同一个 Redis 限流池 —— 否则攻击者换个端点就绕开 10/15min 上限。
+  // Password-reset requests use the same limiter as the legacy email-code
+  // endpoint did; registration no longer sends or verifies email codes.
   app.use('/api/v1/auth/password/reset-request', emailCodeLimiter);
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);

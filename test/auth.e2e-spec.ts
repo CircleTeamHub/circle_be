@@ -3,18 +3,13 @@ import { AuthErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { getE2eApp } from './e2e-context';
 
-// Registration is gated behind an email verification code. The CI E2E job
-// explicitly opts into EMAIL_CODE_DEV_BYPASS=999999 so the suite can register
-// deterministically without minting and reading back a real code. See
-// email-verification.service.ts:getDevBypassCode.
-const BYPASS_CODE = '999999';
 const EMAIL = 'e2e-user@example.com';
 const PASSWORD = 'password1';
 
 const registerBody = (overrides: Record<string, unknown> = {}) => ({
   email: EMAIL,
-  code: BYPASS_CODE,
   password: PASSWORD,
+  confirmPassword: PASSWORD,
   nickname: 'Test User',
   ...overrides,
 });
