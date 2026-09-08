@@ -551,3 +551,74 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
     expect(deliveries).toEqual(['active-socket']);
   });
 });
+
+/**
+ * 在线判定的降级路径：Redis 配了但这一刻不可用时，绝不能再走 fetchSockets。
+ *
+ * 事故（2026-09-08 本地）：一条 WebSocket 断开就把整个后端进程打死。
+ *   Error: Connection is closed.
+ *     at RedisAdapter.serverCount / fetchSockets
+ *     at async ChatBroadcastService.isUserOnline
+ *
+ * 根因是 null 被两种情况共用：
+ *   1. Redis 压根没配（单实例部署）—— 此时 socket.io 用的是内存 adapter，
+ *      fetchSockets 是本进程操作，降级到它是对的、也便宜；
+ *   2. Redis 配了但这一刻读失败 —— 此时挂的是 RedisAdapter，fetchSockets 会变成
+ *      经 Redis 的跨节点 RPC，正是刚刚失败的那条链路。降级到它必然抛。
+ *
+ * 于是「Redis 不可用时的降级」反过来又去问了 Redis。
+ */
+describe('ChatBroadcastService presence fallback under Redis outage', () => {
+  function buildHarness(redisConfigured: boolean) {
+    const fetchSockets = jest
+      .fn()
+      .mockRejectedValue(new Error('Connection is closed.'));
+    const server = { in: jest.fn(() => ({ fetchSockets })) };
+    const presence = {
+      // 注册表答不上来（读失败或没配）
+      isOnline: jest.fn().mockResolvedValue(null),
+      getOnlineUserIds: jest.fn().mockResolvedValue(null),
+      isRedisConfigured: jest.fn().mockReturnValue(redisConfigured),
+      conversationJoined: jest.fn(),
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prismaWithActiveUsers([]) as never,
+    );
+    service.setServer(server as never);
+    return { service, presence, fetchSockets };
+  }
+
+  it('isUserOnline 不再对着已断的 Redis 发起跨节点 RPC', async () => {
+    const { service, fetchSockets } = buildHarness(true);
+
+    await expect(service.isUserOnline('u1')).resolves.toBe(true);
+    expect(fetchSockets).not.toHaveBeenCalled();
+  });
+
+  it('读不到时判为「仍在线」——宁可少推一条离线通知，也不误判成离线', async () => {
+    // 与 ChatPresenceRegistry.socketDisconnected 既有策略一致：
+    // 「null = Redis 这一刻不可用:宁可留着在线条目…也不要把人误判成离线」。
+    const { service } = buildHarness(true);
+    await expect(service.isUserOnline('u1')).resolves.toBe(true);
+  });
+
+  it('getOnlineUserIdsInConversation 读不到时返回空集——宁可重复推送也不丢消息', async () => {
+    // 这个集合在 ChatPushService 里用来**排除**收件人。返回空集 = 谁都不排除
+    // = 全员收到推送；反过来把人当在线会让他彻底收不到。
+    const { service, fetchSockets } = buildHarness(true);
+
+    await expect(
+      service.getOnlineUserIdsInConversation('conv-1'),
+    ).resolves.toEqual(new Set());
+    expect(fetchSockets).not.toHaveBeenCalled();
+  });
+
+  it('Redis 没配的单实例部署仍然走 fetchSockets（内存 adapter，本来就该降级到它）', async () => {
+    const { service, fetchSockets } = buildHarness(false);
+    fetchSockets.mockResolvedValue([{ id: 's1' }]);
+
+    await expect(service.isUserOnline('u1')).resolves.toBe(true);
+    expect(fetchSockets).toHaveBeenCalled();
+  });
+});
