@@ -26,11 +26,9 @@ import type { RequestWithUser } from 'src/auth/types';
 import { CircleService } from './circle.service';
 import {
   CircleDetailDto,
-  CircleDto,
   MyCircleDto,
   CreateCircleDto,
   UpdateCircleDto,
-  ListCirclesQueryDto,
   MyCirclesQueryDto,
   SelectCircleIconDto,
   UploadCircleIconDto,
@@ -54,17 +52,6 @@ export class CircleController {
     @Req() req: RequestWithUser,
   ): Promise<CircleDetailDto> {
     return this.circleService.createCircle(req.user.userId, dto);
-  }
-
-  @Get()
-  @ApiOperation({ summary: 'List circles available to apply for' })
-  list(@Query() query: ListCirclesQueryDto): Promise<{
-    items: CircleDto[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
-    return this.circleService.listCircles(query);
   }
 
   @Get('my')
