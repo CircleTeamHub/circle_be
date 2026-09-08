@@ -17,13 +17,13 @@ describe('CollectionService', () => {
       // #104 审查加的每用户上限检查
       count: jest.fn().mockResolvedValue(0),
     },
-    chatMessage: { findUnique: jest.fn() },
+    chatMessage: { findFirst: jest.fn() },
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
     prisma.userCollection.count.mockResolvedValue(0);
-    prisma.chatMessage.findUnique.mockResolvedValue(null);
+    prisma.chatMessage.findFirst.mockResolvedValue(null);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -126,6 +126,7 @@ describe('CollectionService', () => {
     ({
       type: 'MESSAGE',
       title: '收藏消息',
+      sourceID: messageID,
       payload: { kind: 'openim-message', messageID },
     }) as never;
 
@@ -133,8 +134,13 @@ describe('CollectionService', () => {
   // 另一扇门：客户端拼好快照直接 POST，服务端从头到尾没看过那条消息，于是
   // chat.service 里那道闸完全够不着它。
   it('refuses to collect a peer message from a burn-after-reading conversation', async () => {
-    prisma.chatMessage.findUnique.mockResolvedValue({
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: 'msg-1',
+      conversationID: 'conversation-1',
       senderID: 'peer-1',
+      type: 'text',
+      content: { text: 'peer text' },
+      createdAt: new Date('2026-09-08T08:00:00.000Z'),
       conversation: { burnDurationSec: 30 },
     });
 
@@ -150,8 +156,13 @@ describe('CollectionService', () => {
 
   // 与转发口径一致：自己的内容重发一次效果完全一样，拦下来不保护任何人。
   it('still collects your own message from a burn conversation', async () => {
-    prisma.chatMessage.findUnique.mockResolvedValue({
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: 'msg-1',
+      conversationID: 'conversation-1',
       senderID: 'user-1',
+      type: 'text',
+      content: { text: 'my text' },
+      createdAt: new Date('2026-09-08T08:00:00.000Z'),
       conversation: { burnDurationSec: 30 },
     });
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
@@ -159,11 +170,18 @@ describe('CollectionService', () => {
     await service.create('user-1', messageCollection('msg-1'));
 
     expect(prisma.userCollection.create).toHaveBeenCalled();
+    const payload = prisma.userCollection.create.mock.calls[0][0].data.payload;
+    expect(payload).not.toHaveProperty('senderID');
   });
 
   it('leaves ordinary conversations alone', async () => {
-    prisma.chatMessage.findUnique.mockResolvedValue({
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: 'msg-1',
+      conversationID: 'conversation-1',
       senderID: 'peer-1',
+      type: 'text',
+      content: { text: 'ordinary text' },
+      createdAt: new Date('2026-09-08T08:00:00.000Z'),
       conversation: { burnDurationSec: null },
     });
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
@@ -173,15 +191,117 @@ describe('CollectionService', () => {
     expect(prisma.userCollection.create).toHaveBeenCalled();
   });
 
-  // 客户端本地占位 id（`local:<d>`）还没换成服务端 id 就点了收藏 —— 查不到不能拦，
-  // 那样会误伤用户自己刚发出去的消息。
-  it('does not block a collection whose message is not in the database yet', async () => {
-    prisma.chatMessage.findUnique.mockResolvedValue(null);
+  it('rejects a message collection without an authoritative message id', async () => {
+    await expect(
+      service.create('user-1', {
+        type: 'MESSAGE',
+        title: 'copied text',
+        payload: { kind: 'openim-message', text: 'peer secret' },
+      } as never),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'COLLECTION_INVALID_MESSAGE_SOURCE',
+      }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects other message-backed collection types without an authoritative message id', async () => {
+    await expect(
+      service.create('user-1', {
+        type: 'VIDEO',
+        title: 'copied video',
+        payload: { url: 'https://attacker.invalid/video.mp4' },
+      } as never),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'COLLECTION_INVALID_MESSAGE_SOURCE',
+      }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects a message collection whose message cannot be verified for this user', async () => {
+    await expect(
+      service.create('user-1', messageCollection('missing-msg')),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'COLLECTION_INVALID_MESSAGE_SOURCE',
+      }),
+    });
+    expect(prisma.userCollection.create).not.toHaveBeenCalled();
+  });
+
+  it('persists content-bearing message fields from the verified row, not the client snapshot', async () => {
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: 'msg-1',
+      conversationID: 'conversation-1',
+      senderID: 'peer-1',
+      type: 'text',
+      content: { text: 'verified text' },
+      createdAt: new Date('2026-09-08T08:00:00.000Z'),
+      conversation: { burnDurationSec: null },
+    });
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
 
-    await service.create('user-1', messageCollection('local:d-9'));
+    await service.create('user-1', {
+      type: 'MESSAGE',
+      title: '收藏消息',
+      summary: 'client summary',
+      sourceID: 'msg-1',
+      payload: {
+        kind: 'openim-message',
+        messageID: 'msg-1',
+        messageType: 'received',
+        conversationID: 'forged-conversation',
+        senderID: 'forged-sender',
+        time: 'forged-time',
+        text: 'peer secret from another message',
+      },
+    } as never);
 
-    expect(prisma.userCollection.create).toHaveBeenCalled();
+    expect(prisma.userCollection.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        sourceID: 'msg-1',
+        payload: expect.objectContaining({
+          kind: 'openim-message',
+          messageID: 'msg-1',
+          messageType: 'received',
+          conversationID: 'conversation-1',
+          senderID: 'peer-1',
+          time: '2026-09-08T08:00:00.000Z',
+          text: 'verified text',
+        }),
+      }),
+    });
+  });
+
+  it('does not put undefined media fields into the Prisma JSON snapshot', async () => {
+    prisma.chatMessage.findFirst.mockResolvedValue({
+      id: 'msg-image',
+      conversationID: 'conversation-1',
+      senderID: null,
+      type: 'image',
+      content: { key: 'chat/peer-1/image.jpg' },
+      createdAt: new Date('2026-09-08T08:00:00.000Z'),
+      conversation: { burnDurationSec: null },
+    });
+    prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
+
+    await service.create('user-1', {
+      type: 'MESSAGE',
+      title: '图片消息',
+      sourceID: 'msg-image',
+      payload: {
+        kind: 'openim-message',
+        messageID: 'msg-image',
+        messageType: 'image',
+      },
+    } as never);
+
+    const data = prisma.userCollection.create.mock.calls[0][0].data;
+    expect(data.payload).not.toHaveProperty('senderID');
+    expect(data.payload.image).toEqual({});
   });
 
   // 笔记、纯文本片段等不带 messageID 的收藏不该产生一次多余查询。
@@ -190,7 +310,7 @@ describe('CollectionService', () => {
 
     await service.create('user-1', { type: 'NOTE', title: 't' } as never);
 
-    expect(prisma.chatMessage.findUnique).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.findFirst).not.toHaveBeenCalled();
     expect(prisma.userCollection.create).toHaveBeenCalled();
   });
 });

@@ -13,6 +13,13 @@ import { CreateCollectionDto, UserCollectionDto } from './dto/collection.dto';
 export class CollectionService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private invalidMessageSource(): never {
+    throw new BadRequestException({
+      message: '收藏的消息来源无效或不可访问',
+      errorCode: CollectionErrorCode.InvalidMessageSource,
+    });
+  }
+
   list(userId: string, type?: CollectionType): Promise<UserCollectionDto[]> {
     return this.prisma.userCollection.findMany({
       where: { userID: userId, ...(type ? { type } : {}) },
@@ -26,52 +33,135 @@ export class CollectionService {
    * 成立：阅后即焚会话的短暂性是**发送者对收件人的承诺**，把别人发的内容复制进
    * 一个不会过期的地方，副本就活得比源消息久。
    *
-   * 但收藏走的是另一扇门：客户端拼好快照直接 POST，服务端从头到尾没看过那条
-   * 消息，于是 chat.service 里的 CHAT_FORWARD_FORBIDDEN 完全够不着它 —— 对端在
-   * 焚毁会话里发的图，点一下「收藏」就永久留下了。这里按 payload 带回来的
-   * messageID 把消息捞回来，补上同一条判定。
+   * 但收藏走的是另一扇门：客户端拼好快照直接 POST，chat.service 里的
+   * CHAT_FORWARD_FORBIDDEN 完全够不着它。这里把 messageID 当作引用而不是证据：
+   * 只查询当前用户仍可访问的服务端消息，并从那一行重建所有内容字段，避免客户端
+   * 用一条普通消息的 id 搭配另一条焚毁消息的快照蒙混过关。
    *
-   * 三种情况刻意放行：
-   * - payload 里没有 messageID（笔记、纯文本片段等）：不在这条规则的射程内。
-   * - 库里查不到那个 id：客户端本地占位（`local:<d>`）还没换成服务端 id，
-   *   拦它只会误伤自己刚发出去的消息。
-   * - 自己发的：与转发口径一致，那是你自己的内容，重发一次效果完全一样。
+   * 非聊天收藏不走这条校验。聊天收藏缺 id、id 不存在/不可见、sourceID 不一致时
+   * 一律失败关闭；自己的焚毁消息仍允许收藏，与转发口径一致。
    */
-  private async assertCollectable(
+  private async verifiedMessageSnapshot(
     userId: string,
     dto: CreateCollectionDto,
-  ): Promise<void> {
+  ): Promise<{
+    sourceID: string | undefined;
+    payload: Prisma.InputJsonValue | undefined;
+  }> {
+    const rawPayload = dto.payload;
     const rawMessageId = dto.payload?.['messageID'];
-    if (typeof rawMessageId !== 'string' || rawMessageId.length === 0) return;
+    const isMessageCollection =
+      dto.type !== CollectionType.NOTE ||
+      rawPayload?.['kind'] === 'openim-message';
+    if (!isMessageCollection) {
+      return {
+        sourceID: dto.sourceID,
+        payload: rawPayload as Prisma.InputJsonValue | undefined,
+      };
+    }
+    if (
+      rawPayload?.['kind'] !== 'openim-message' ||
+      typeof rawMessageId !== 'string' ||
+      rawMessageId.length === 0 ||
+      dto.sourceID !== rawMessageId
+    ) {
+      return this.invalidMessageSource();
+    }
 
-    const row = await this.prisma.chatMessage.findUnique({
-      where: { id: rawMessageId },
+    const row = await this.prisma.chatMessage.findFirst({
+      where: {
+        id: rawMessageId,
+        deleted: false,
+        revokedAt: null,
+        conversation: {
+          members: { some: { userID: userId, leftAt: null } },
+        },
+      },
       select: {
+        id: true,
+        conversationID: true,
         senderID: true,
+        type: true,
+        content: true,
+        createdAt: true,
         conversation: { select: { burnDurationSec: true } },
       },
     });
-    if (!row || row.senderID === userId) return;
-    if (!row.conversation?.burnDurationSec) return;
+    if (!row) return this.invalidMessageSource();
 
-    throw new ForbiddenException({
-      message: '阅后即焚会话中的消息不可收藏',
-      errorCode: CollectionErrorCode.EphemeralForbidden,
-    });
+    if (row.senderID !== userId && Boolean(row.conversation?.burnDurationSec)) {
+      throw new ForbiddenException({
+        message: '阅后即焚会话中的消息不可收藏',
+        errorCode: CollectionErrorCode.EphemeralForbidden,
+      });
+    }
+
+    const content = (row.content ?? {}) as Record<string, unknown>;
+    let messageType = row.type;
+    if (row.type === 'text' || row.type === 'quote') {
+      messageType = row.senderID === userId ? 'sent' : 'received';
+    }
+    const payload: Record<string, unknown> = {
+      kind: 'openim-message',
+      messageID: row.id,
+      messageType,
+      conversationID: row.conversationID,
+      time: row.createdAt.toISOString(),
+    };
+    if (row.senderID && row.senderID !== userId) {
+      payload.senderID = row.senderID;
+    }
+
+    for (const key of [
+      'conversationTitle',
+      'sourceID',
+      'conversationType',
+      'senderName',
+    ]) {
+      const value = rawPayload[key];
+      if (typeof value === 'string') payload[key] = value;
+    }
+
+    if (row.type === 'text' || row.type === 'quote') {
+      payload.text = typeof content['text'] === 'string' ? content['text'] : '';
+    } else if (row.type === 'image') {
+      const image: Record<string, unknown> = {};
+      if (typeof content['width'] === 'number') image.width = content['width'];
+      if (typeof content['height'] === 'number')
+        image.height = content['height'];
+      payload.image = image;
+    } else if (row.type === 'voice') {
+      const voice: Record<string, unknown> = {};
+      if (typeof content['key'] === 'string') voice.key = content['key'];
+      if (typeof content['duration'] === 'number') {
+        voice.duration = content['duration'];
+      }
+      if (typeof content['size'] === 'number') voice.dataSize = content['size'];
+      payload.voice = voice;
+    } else if (row.type === 'friend-card') {
+      payload.friendCard = content;
+    } else if (row.type === 'transfer-card') {
+      payload.transferCard = content;
+    }
+
+    return {
+      sourceID: row.id,
+      payload: payload as Prisma.InputJsonValue,
+    };
   }
 
   async create(
     userId: string,
     dto: CreateCollectionDto,
   ): Promise<UserCollectionDto> {
-    await this.assertCollectable(userId, dto);
+    const verified = await this.verifiedMessageSnapshot(userId, dto);
     const data: Prisma.UserCollectionUncheckedCreateInput = {
       userID: userId,
       type: dto.type,
       title: dto.title,
       summary: dto.summary,
-      sourceID: dto.sourceID,
-      payload: dto.payload as Prisma.InputJsonValue | undefined,
+      sourceID: verified.sourceID,
+      payload: verified.payload,
     };
 
     // #104 审查发现：与 share-link 同类的无界增长面。500 远超正常收藏量，
