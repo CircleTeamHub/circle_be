@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
- * 自动销毁默认值的两处必须同时改，否则改了也没用：
+ * 全局阅后即焚默认值的两处必须同时改，否则改了也没用：
  *
  * - DEFAULT_PRIVACY_SETTINGS：影响**绝大多数**用户 —— getSettings 读到没有行时
  *   不写库，所以从没进过隐私设置的人一直走这份内存默认值，列默认值根本轮不到它
@@ -33,8 +33,10 @@ describe('message self-destruct default', () => {
     ).replace(/\r\n/g, '\n');
     const sql = readFileSync(migrationPath, 'utf8').replace(/\r\n/g, '\n');
 
-    expect(schema).toMatch(/messageSelfDestructDays\s+Int\s+@default\(0\)/);
-    expect(service).toMatch(/messageSelfDestructDays:\s*0,/);
+    // 20260907120000 把这个设置从「天」改存「秒」(与会话级焚毁共用一张档位表)。
+    // 默认关闭的语义不变，钉住的列换成新的那一列；旧列还在 schema 里等下一版删除。
+    expect(schema).toMatch(/messageSelfDestructSec\s+Int\s+@default\(0\)/);
+    expect(service).toMatch(/messageSelfDestructSec:\s*0,/);
     expect(sql).toContain(
       'ALTER COLUMN "messageSelfDestructDays" SET DEFAULT 0',
     );
@@ -58,11 +60,13 @@ describe('message self-destruct default', () => {
   });
 
   it('keeps 0 as a selectable option so "off" is reachable from the UI', () => {
-    const dto = readFileSync(
-      join(__dirname, 'privacy-settings.dto.ts'),
+    // 档位表已经收敛到 common/burn-durations.ts —— 全局设置和会话级焚毁共用它。
+    const choices = readFileSync(
+      join(root, 'src/common/burn-durations.ts'),
       'utf8',
     ).replace(/\r\n/g, '\n');
 
-    expect(dto).toMatch(/SELF_DESTRUCT_DAY_OPTIONS = \[\s*0\s*,/);
+    expect(choices).toMatch(/BURN_DURATION_OFF = 0;/);
+    expect(choices).toMatch(/BURN_DURATION_CHOICES = \[\s*BURN_DURATION_OFF,/);
   });
 });

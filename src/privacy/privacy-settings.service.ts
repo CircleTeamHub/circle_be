@@ -9,16 +9,16 @@ import {
   MOMENTS_VISIBILITY_OPTIONS,
   PERMISSION_OPTIONS,
   PrivacySettingsDto,
-  SELF_DESTRUCT_DAY_OPTIONS,
   UpdatePrivacySettingsDto,
 } from './privacy-settings.dto';
+import { isBurnDurationChoice } from 'src/common/burn-durations';
 
 const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   // 0 = 关闭。getSettings 读到没有行时不写库,所以从没进过隐私设置的用户
   // 一律走这份默认值 —— 默认非 0 等于替他们全体开了「历史只看得到最近 N 天」,
   // 而这是个查看者侧的读过滤(chat.service.ts selfDestructCutoff),开着不会有
   // 任何报错或提示,只是消息安静地翻不到。自毁是隐私功能,应当由用户主动开启。
-  messageSelfDestructDays: 0,
+  messageSelfDestructSec: 0,
   momentsVisibility: 'ALL',
   allowStrangerMessages: true,
   showPhone: false,
@@ -239,8 +239,8 @@ export class PrivacySettingsService {
 
   private assertValid(input: UpdatePrivacySettingsDto) {
     if (
-      input.messageSelfDestructDays !== undefined &&
-      !SELF_DESTRUCT_DAY_OPTIONS.includes(input.messageSelfDestructDays)
+      input.messageSelfDestructSec !== undefined &&
+      !isBurnDurationChoice(input.messageSelfDestructSec)
     ) {
       throw new BadRequestException({
         message: 'Unsupported self-destruct duration',
@@ -314,9 +314,9 @@ export class PrivacySettingsService {
 
   private toDto(settings: StoredPrivacySettings): PrivacySettingsDto {
     return {
-      messageSelfDestructDays:
-        settings.messageSelfDestructDays ??
-        DEFAULT_PRIVACY_SETTINGS.messageSelfDestructDays,
+      messageSelfDestructSec:
+        settings.messageSelfDestructSec ??
+        DEFAULT_PRIVACY_SETTINGS.messageSelfDestructSec,
       momentsVisibility:
         settings.momentsVisibility ??
         DEFAULT_PRIVACY_SETTINGS.momentsVisibility,

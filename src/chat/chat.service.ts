@@ -1617,19 +1617,22 @@ export class ChatService {
   }
 
   /**
-   * 查看者自己的「消息自动销毁」截止时间。
+   * 查看者自己的全局阅后即焚截止时间。
    *
-   * 这是每个用户对自己的设置(UserPrivacySetting.messageSelfDestructDays,
-   * 默认 2 天):超过窗口的消息在**他自己的**客户端上不再出现。不是双方协商的
-   * 阅后即焚,所以只按查看者过滤,不动库里的行。
+   * 这是每个用户对自己的设置(UserPrivacySetting.messageSelfDestructSec,默认
+   * 关闭):超过窗口的消息在**他自己的**客户端上不再出现。不是双方协商的会话级
+   * 焚毁,所以只按查看者过滤,不动库里的行。
    *
-   * 返回 null 表示该用户关掉了自动销毁(0/未设置),不做任何过滤。
+   * 档位与会话级焚毁共用 BURN_DURATION_CHOICES;此前这里存的是天数,于是同一个
+   * 功能在两个入口给出两张不同的档位表。
+   *
+   * 返回 null 表示该用户关掉了它(0/未设置),不做任何过滤。
    */
   private async selfDestructCutoff(userId: string): Promise<Date | null> {
-    const { messageSelfDestructDays } =
+    const { messageSelfDestructSec } =
       await this.privacySettings.getSettings(userId);
-    if (!messageSelfDestructDays) return null;
-    return new Date(Date.now() - messageSelfDestructDays * 24 * 60 * 60 * 1000);
+    if (!messageSelfDestructSec) return null;
+    return new Date(Date.now() - messageSelfDestructSec * 1000);
   }
 
   /** 历史分页:height 键集向前翻,页内升序返回。 */
