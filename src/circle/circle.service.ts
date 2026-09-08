@@ -793,6 +793,117 @@ export class CircleService {
     });
   }
 
+  /**
+   * DELETE /circle/:id —— 圈主解散圈子(微信「解散群聊」的圈子版)。
+   *
+   * 圈主退不了圈(OwnerCannotLeave),此前 FE 的圈子信息页却照样给圈主渲染
+   * 「退出」,按下去只能吃一个 403。圈主真正要的是把圈子整个撤掉。
+   *
+   * 语义与管理台 DISMISS 对齐,只是不走异步队列:deleted=true 之后圈子从
+   * 所有列表/详情/广场里消失(全仓一律 `deleted: false` 过滤),群聊座位由
+   * ensureCircleConversation 收掉并给每个人广播 removed。CircleMember 行
+   * 保留不删 —— 与管理台一致,留作追溯,反正没有一个读路径看得见它们。
+   *
+   * adminState 不动:那是管理台的停用溯源字段(hasAdminDisableProvenance
+   * 靠它判断能不能恢复),圈主解散写进去会让管理台误以为是自己停用的。
+   */
+  async dissolveCircle(userId: string, circleId: string): Promise<void> {
+    await runSerializableTransaction(this.prisma, async (tx) => {
+      // 先鉴权再取锁,和 updateCircle 同一理由:不设前置闸的话任何人都能
+      // 用一次解散请求占住圈子的锁。锁后那次复查才是权威判定。
+      const circle = await tx.circle.findFirst({
+        where: { id: circleId, deleted: false },
+        select: { id: true, ownerID: true },
+      });
+      if (!circle) {
+        throw new NotFoundException({
+          message: 'Circle not found',
+          errorCode: CircleErrorCode.NotFound,
+        });
+      }
+      if (circle.ownerID !== userId) {
+        throw new ForbiddenException({
+          message: 'Only the circle owner can dissolve the circle',
+          errorCode: CircleErrorCode.OwnerOnlyDissolve,
+        });
+      }
+
+      await this.memberLock.lock(tx, circleId, [userId]);
+      // 招新策略锁:解散必须与「在飞的担保单」串行,否则一张读到解散前状态
+      // 的建单可以在解散提交之后才落库,给一个已经没了的圈子放人进来。
+      await this.memberLock.lockPolicy(tx, circleId);
+
+      const membership = await tx.circleMember.findUnique({
+        where: { userID_circleID: { userID: userId, circleID: circleId } },
+        select: { role: true, status: true },
+      });
+      if (
+        !membership ||
+        membership.status !== 'ACTIVE' ||
+        membership.role !== 'OWNER'
+      ) {
+        throw new ForbiddenException({
+          message: 'Only the circle owner can dissolve the circle',
+          errorCode: CircleErrorCode.OwnerOnlyDissolve,
+        });
+      }
+
+      // 锁后复查:并发的第二次解散(或管理台停用)可能已经赢了这一局。
+      // 幂等地当成功返回会让第二个请求也广播一遍解散,这里直接判 404 ——
+      // 圈子确实已经不在了。
+      const locked = await tx.circle.findFirst({
+        where: { id: circleId, deleted: false },
+        select: { id: true },
+      });
+      if (!locked) {
+        throw new NotFoundException({
+          message: 'Circle not found',
+          errorCode: CircleErrorCode.NotFound,
+        });
+      }
+
+      // 在飞的入圈担保单必须一起作废:它们只查 PENDING + 成员数,不看圈子
+      // 死活,留着的话解散之后仍会在申请人的「我的申请」里挂着。
+      await tx.circleInvitation.updateMany({
+        where: { circleID: circleId, status: 'PENDING' },
+        data: { status: 'CANCELLED' },
+      });
+      // 圈子图标是佩戴态,圈子没了就不该继续挂在任何人的名片上。
+      await tx.userDisplayIcon.deleteMany({ where: { circleID: circleId } });
+      await tx.circle.update({
+        where: { id: circleId },
+        data: { deleted: true },
+      });
+    });
+
+    // 座位是从圈子状态派生的:ensureCircleConversation 读到 deleted 就把在座
+    // 的人全部离座、踢出会话房并逐个广播 removed。放事务外与退圈/管理台停用
+    // 同款做法 —— 推送失败不该回滚已经落库的解散,漏掉的座位下一轮对账收敛。
+    try {
+      await this.chatCircleSync.ensureCircleConversation(circleId);
+    } catch (error) {
+      this.logger.warn(
+        `dissolve seat eviction failed circle=${circleId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      reportOperationalError(error, {
+        component: 'CircleService',
+        operation: 'dissolveCircle',
+        kind: 'seat_eviction_failed',
+      });
+    }
+
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'circle_dissolved',
+      actorId: userId,
+      result: 'success',
+      entityType: 'circle',
+      entityId: circleId,
+    });
+  }
+
   async uploadCircleIcon(
     userId: string,
     circleId: string,
