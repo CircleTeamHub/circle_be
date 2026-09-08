@@ -15,6 +15,7 @@ import {
 } from 'src/generated/prisma';
 import { GroupErrorCode } from 'src/common/app-error-codes';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import type { ChatMessageDto } from 'src/chat/chat.types';
 import { CircleAdmissionPolicy } from 'src/circle/circle-admission-policy';
@@ -58,6 +59,7 @@ export class GroupService {
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
     private readonly systemMessage: ChatSystemMessageService,
+    private readonly groupEvents: ChatGroupEventService,
   ) {}
 
   async updateGroupMemberRole(
@@ -249,6 +251,13 @@ export class GroupService {
               role: nextRole,
             },
           );
+        // 群日志与角色写同事务(与系统提示一样:要么都成、要么都不成)。
+        await this.groupEvents.recordInTx(tx, lockedConversation.id, {
+          kind: 'member-role-changed',
+          actorId,
+          targetIds: [normalizedTargetUserID],
+          payload: { role: nextRole },
+        });
       }
       // 角色真值只在 CircleMember;聊天侧权限按圈子角色读时派生,无需外推。
       return { changed: true, message };
@@ -506,6 +515,11 @@ export class GroupService {
                 targetUserId: normalizedTargetUserID,
               },
             );
+          await this.groupEvents.recordInTx(tx, lockedConversation.id, {
+            kind: 'member-removed',
+            actorId,
+            targetIds: [normalizedTargetUserID],
+          });
         }
       }
 

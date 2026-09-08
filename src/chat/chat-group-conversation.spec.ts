@@ -27,7 +27,7 @@ describe('ChatService standalone group conversations', () => {
       updateMany: jest.fn(),
     },
     chatMessage: { aggregate: jest.fn() },
-    user: { findMany: jest.fn(), count: jest.fn() },
+    user: { findMany: jest.fn(), findUnique: jest.fn(), count: jest.fn() },
     friend: { findMany: jest.fn() },
     userPrivacySetting: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
@@ -41,6 +41,10 @@ describe('ChatService standalone group conversations', () => {
     emitConversationChange: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatService(
     prisma as never,
@@ -52,6 +56,7 @@ describe('ChatService standalone group conversations', () => {
     systemMessage as never,
     { isSupportAgent: jest.fn() } as never,
     { lock: jest.fn() } as never,
+    groupEvents as never,
   );
 
   const conversationDto = { id: 'conv-1' };
@@ -352,20 +357,31 @@ describe('ChatService standalone group conversations', () => {
     expect(seatedCount).toBe(200);
   });
 
-  it('owner leaving hands the group to the earliest seated member', async () => {
+  it('owner leaving hands the group to the earliest seated member when no admin exists', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(seat());
-    prisma.chatMember.findFirst.mockResolvedValue({ userID: 'f1' });
+    prisma.chatMember.findFirst
+      // 先找最早入群的管理员:没有
+      .mockResolvedValueOnce(null)
+      // 再找最早入群的任意在座成员
+      .mockResolvedValueOnce({ id: 'seat-f1', userID: 'f1' });
+    prisma.user.findUnique.mockResolvedValue({ nickname: '小方' });
 
     await service.leaveGroupConversation('owner-1', 'conv-1');
 
+    // 座位关闭时管理员标记归零。
     expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', userID: 'owner-1', leftAt: null },
-      data: { leftAt: expect.any(Date) },
+      data: { leftAt: expect.any(Date), role: 'MEMBER' },
     });
-    expect(prisma.chatMember.findFirst).toHaveBeenCalledWith({
+    expect(prisma.chatMember.findFirst).toHaveBeenNthCalledWith(1, {
+      where: { conversationID: 'conv-1', leftAt: null, role: 'ADMIN' },
+      orderBy: { joinedAt: 'asc' },
+      select: { id: true, userID: true },
+    });
+    expect(prisma.chatMember.findFirst).toHaveBeenNthCalledWith(2, {
       where: { conversationID: 'conv-1', leftAt: null },
       orderBy: { joinedAt: 'asc' },
-      select: { userID: true },
+      select: { id: true, userID: true },
     });
     expect(prisma.chatConversation.update).toHaveBeenCalledWith({
       where: { id: 'conv-1' },
@@ -378,6 +394,44 @@ describe('ChatService standalone group conversations', () => {
     });
     expect(systemMessage.emit).toHaveBeenCalledWith('conv-1', {
       kind: 'member-left',
+    });
+    // 群日志:退群 + 转让两条;新群主收 updated 刷新群设置入口。
+    expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
+      kind: 'member-left',
+      actorId: 'owner-1',
+      targetIds: ['owner-1'],
+    });
+    expect(groupEvents.record).toHaveBeenCalledWith('conv-1', {
+      kind: 'owner-transferred',
+      actorId: 'owner-1',
+      targetIds: ['f1'],
+    });
+    expect(broadcast.emitConversationChange).toHaveBeenCalledWith('f1', {
+      kind: 'updated',
+      conversationId: 'conv-1',
+      userId: 'f1',
+    });
+  });
+
+  it('owner leaving prefers the earliest admin and clears that admin flag', async () => {
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.chatMember.findFirst.mockResolvedValueOnce({
+      id: 'seat-admin-1',
+      userID: 'admin-1',
+    });
+    prisma.user.findUnique.mockResolvedValue({ nickname: '管理员甲' });
+
+    await service.leaveGroupConversation('owner-1', 'conv-1');
+
+    expect(prisma.chatMember.findFirst).toHaveBeenCalledTimes(1);
+    expect(prisma.chatConversation.update).toHaveBeenCalledWith({
+      where: { id: 'conv-1' },
+      data: { ownerID: 'admin-1' },
+    });
+    // 群主身份只由 ownerID 表达,座位上的管理员标记归零。
+    expect(prisma.chatMember.update).toHaveBeenCalledWith({
+      where: { id: 'seat-admin-1' },
+      data: { role: 'MEMBER' },
     });
   });
 

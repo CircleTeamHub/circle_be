@@ -29,6 +29,7 @@ import {
   GROUP_CAPACITY_HARD_LIMIT,
 } from './circle-limits';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleMemberLockService } from './circle-member-lock';
 import {
@@ -67,6 +68,7 @@ export class CircleService {
     private readonly memberLock: CircleMemberLockService,
     private readonly chatCircleSync: ChatCircleSyncService,
     private readonly systemMessage: ChatSystemMessageService,
+    private readonly groupEvents: ChatGroupEventService,
   ) {
     this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
       this.config,
@@ -595,6 +597,11 @@ export class CircleService {
           );
         messages.push(message);
         nextHeight = message.height;
+        await this.groupEvents.recordInTx(tx, lockedConversation.id, {
+          kind: 'group-renamed',
+          actorId: userId,
+          payload: { name: dto.name },
+        });
       }
       if (descriptionChanged) {
         const message =
@@ -605,6 +612,10 @@ export class CircleService {
             { kind: 'group-notice-updated', actorId: userId },
           );
         messages.push(message);
+        await this.groupEvents.recordInTx(tx, lockedConversation.id, {
+          kind: 'group-notice-updated',
+          actorId: userId,
+        });
       }
       return messages;
     });

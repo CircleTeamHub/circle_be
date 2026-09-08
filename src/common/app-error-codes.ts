@@ -336,6 +336,18 @@ export const ChatErrorCode = {
   GroupCircleManaged: 'CHAT_GROUP_CIRCLE_MANAGED',
   // 扫码进群放开了好友边界,没有容量闸的话一张群码等于无限进人。
   GroupFull: 'CHAT_GROUP_FULL',
+  // 独立群聊的群主专属操作(设/撤管理员)。
+  GroupOwnerOnly: 'CHAT_GROUP_OWNER_ONLY',
+  // 群管理(设管理员/移出/禁言):仅群主或管理员;管理员只能动普通成员;
+  // 不能对自己操作;目标必须在座。禁言时长有上下限。
+  GroupManagerOnly: 'CHAT_GROUP_MANAGER_ONLY',
+  GroupMemberNotFound: 'CHAT_GROUP_MEMBER_NOT_FOUND',
+  GroupTargetProtected: 'CHAT_GROUP_TARGET_PROTECTED',
+  GroupSelfTarget: 'CHAT_GROUP_SELF_TARGET',
+  // 发消息时本人处于禁言(逐人禁言;与全员禁言 CHAT_CONVERSATION_MUTED 区分,
+  // 客户端文案是「你已被禁言」而不是「该群已被禁言」)。
+  MemberSilenced: 'CHAT_MEMBER_SILENCED',
+  SilenceDurationInvalid: 'CHAT_SILENCE_DURATION_INVALID',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /

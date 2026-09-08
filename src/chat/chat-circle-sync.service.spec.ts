@@ -27,11 +27,16 @@ describe('ChatCircleSyncService', () => {
     disconnectUserSockets: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatCircleSyncService(
     prisma as never,
     broadcast as never,
     systemMessage as never,
+    groupEvents as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
 
