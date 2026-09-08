@@ -37,7 +37,6 @@ import {
   MyCircleDto,
   CreateCircleDto,
   UpdateCircleDto,
-  ListCirclesQueryDto,
   MyCirclesQueryDto,
   SelectCircleIconDto,
   UploadCircleIconDto,
@@ -243,39 +242,6 @@ export class CircleService {
       groupID,
       myRole: 'OWNER',
       myStatus: 'ACTIVE',
-    };
-  }
-
-  async listCircles(query: ListCirclesQueryDto): Promise<{
-    items: CircleDto[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
-    const page = query.page ?? 1;
-    const limit = query.limit ?? 20;
-    const skip = (page - 1) * limit;
-
-    const where: any = { deleted: false };
-    if (query.city) {
-      where.cities = { has: query.city };
-    }
-
-    const [circles, total] = await Promise.all([
-      this.prisma.circle.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-      this.prisma.circle.count({ where }),
-    ]);
-
-    return {
-      items: circles.map((c) => this.toCircleDto(c)),
-      total,
-      page,
-      limit,
     };
   }
 
