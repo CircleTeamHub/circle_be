@@ -17,6 +17,7 @@ export const AuthErrorCode = {
   // 避免非中文用户在改密码 / 改账号 / 安全码校验等流程看到中文兜底。
   SecurityCodeFormat: 'AUTH_SECURITY_CODE_FORMAT',
   PasswordIncorrect: 'AUTH_PASSWORD_INCORRECT',
+  PasswordMismatch: 'AUTH_PASSWORD_MISMATCH',
   AccountDisabled: 'AUTH_ACCOUNT_DISABLED',
   AccountIdUnchanged: 'AUTH_ACCOUNT_ID_UNCHANGED',
   AccountIdInvalid: 'AUTH_ACCOUNT_ID_INVALID',

@@ -1,7 +1,6 @@
 import {
   IsEmail,
   IsIn,
-  IsNumberString,
   IsOptional,
   IsString,
   Length,
@@ -19,15 +18,15 @@ export class RegisterDto {
   @IsEmail()
   email: string;
 
-  @ApiProperty({ example: '123456' })
-  @IsNumberString()
-  @Length(6, 6)
-  code: string;
-
   @ApiProperty({ example: 'password123' })
   @IsString()
   @Length(6, 64)
   password: string;
+
+  @ApiProperty({ example: 'password123' })
+  @IsString()
+  @Length(6, 64)
+  confirmPassword: string;
 
   @ApiProperty({ example: 'Jimmy' })
   @IsString()
