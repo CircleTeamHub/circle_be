@@ -15,7 +15,9 @@ export class LoginDto {
     description: 'Email address or user ID',
     required: false,
   })
-  @ValidateIf((dto: LoginDto) => !dto.email)
+  @ValidateIf(
+    (dto: LoginDto) => dto.identifier !== undefined || dto.email === undefined,
+  )
   @IsString()
   @IsNotEmpty()
   @Length(1, 254)
