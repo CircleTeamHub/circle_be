@@ -22,6 +22,9 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   momentsVisibility: 'ALL',
   allowStrangerMessages: true,
   showPhone: false,
+  // 注册邮箱是账号找回入口 —— 归 showPhone 那档「主动公开」,不是 showWechat/showQQ
+  // 那档「默认公开」。收紧存量的理由见 20260907000000_add_show_email_privacy。
+  showEmail: false,
   showWechat: true,
   showQQ: true,
   showWhatsup: true,
@@ -42,7 +45,12 @@ type StoredPrivacySettings = PrivacySettingsDto & {
   updatedAt?: Date;
 };
 
-type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
+type ProfilePrivacyField =
+  | 'phoneNumber'
+  | 'email'
+  | 'wechat'
+  | 'qq'
+  | 'whatsup';
 
 @Injectable()
 export class PrivacySettingsService {
@@ -151,6 +159,7 @@ export class PrivacySettingsService {
 
     const settings = await this.getSettings(targetUserId);
     if (field === 'phoneNumber') return settings.showPhone;
+    if (field === 'email') return settings.showEmail;
     if (field === 'wechat') return settings.showWechat;
     if (field === 'qq') return settings.showQQ;
     if (field === 'whatsup') return settings.showWhatsup;
@@ -324,6 +333,7 @@ export class PrivacySettingsService {
         settings.allowStrangerMessages ??
         DEFAULT_PRIVACY_SETTINGS.allowStrangerMessages,
       showPhone: settings.showPhone ?? DEFAULT_PRIVACY_SETTINGS.showPhone,
+      showEmail: settings.showEmail ?? DEFAULT_PRIVACY_SETTINGS.showEmail,
       showWechat: settings.showWechat ?? DEFAULT_PRIVACY_SETTINGS.showWechat,
       showQQ: settings.showQQ ?? DEFAULT_PRIVACY_SETTINGS.showQQ,
       showWhatsup: settings.showWhatsup ?? DEFAULT_PRIVACY_SETTINGS.showWhatsup,

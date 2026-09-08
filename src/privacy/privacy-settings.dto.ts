@@ -52,6 +52,7 @@ export class PrivacySettingsDto {
   momentsVisibility: MomentsVisibility;
   allowStrangerMessages: boolean;
   showPhone: boolean;
+  showEmail: boolean;
   showWechat: boolean;
   showQQ: boolean;
   showWhatsup: boolean;
@@ -86,6 +87,11 @@ export class UpdatePrivacySettingsDto {
   @IsOptional()
   @IsBoolean()
   showPhone?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  showEmail?: boolean;
 
   @ApiPropertyOptional()
   @IsOptional()

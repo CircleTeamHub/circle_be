@@ -1327,6 +1327,8 @@ model UserPrivacySetting {
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)
   showPhone               Boolean  @default(false)
+  /// 注册邮箱是账号找回入口,默认不外露 —— 与 showPhone 同档,而不是 showWechat 那档。
+  showEmail               Boolean  @default(false)
   showWechat              Boolean  @default(true)
   showQQ                  Boolean  @default(true)
   showWhatsup             Boolean  @default(true)
