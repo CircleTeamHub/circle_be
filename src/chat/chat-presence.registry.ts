@@ -154,6 +154,17 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
     return this.redis.getLiveSetMembers(onlineKey(conversationId));
   }
 
+  /**
+   * Redis 是否配置。区分两种「答不上来」:
+   *   false = 压根没配(单实例) —— socket.io 用内存 adapter,调用方降级到
+   *           fetchSockets 是本进程操作,合法且便宜;
+   *   true  = 配了但这一刻读失败 —— 挂的是 RedisAdapter,fetchSockets 会变成
+   *           经 Redis 的跨节点 RPC,正是刚失败的那条链路,降级到它必然抛。
+   */
+  isRedisConfigured(): boolean {
+    return this.redis.isEnabled();
+  }
+
   /** 全局在线判定;null = Redis 不可用。 */
   async isOnline(userId: string): Promise<boolean | null> {
     if (!this.redis.isEnabled()) return null;

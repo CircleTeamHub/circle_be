@@ -8,6 +8,7 @@ import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
 import * as errorAggregation from './logging/error-aggregation.service';
+import * as rejectionGuard from './logging/unhandled-rejection-guard';
 
 function buildAppMock(
   redisService?: Pick<RedisService, 'createRateLimitStore'> &
@@ -40,6 +41,21 @@ describe('setupApp', () => {
     getServerConfigMock.mockReturnValue({
       LOG_ON: 'false',
     });
+  });
+
+  // 回归：Node 15 起未捕获的 promise rejection 默认终止进程 —— 代码库里
+  // fire-and-forget 有几十处，漏一个 .catch 就能停服（实测过一次：Redis 抖动
+  // + WebSocket 断开）。兜底必须在引导期装上，而不是指望人逐个记得写 .catch。
+  it('引导期装上未捕获 rejection 的进程级兜底', () => {
+    const install = jest
+      .spyOn(rejectionGuard, 'installUnhandledRejectionGuard')
+      .mockReturnValue(() => undefined);
+    const app = buildAppMock();
+
+    setupApp(app as any);
+
+    expect(install).toHaveBeenCalled();
+    install.mockRestore();
   });
 
   it('registers the global response interceptor', () => {

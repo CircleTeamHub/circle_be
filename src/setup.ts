@@ -38,6 +38,7 @@ import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
+import { installUnhandledRejectionGuard } from './logging/unhandled-rejection-guard';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -198,6 +199,9 @@ const groupReportLimiterOptions = {
  * fallback rate.
  */
 export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
+  // 尽早装：未捕获 rejection 默认会终止进程，而引导之后的任何 fire-and-forget
+  // 都可能触发它。兜底只上报不静默，见 unhandled-rejection-guard.ts。
+  installUnhandledRejectionGuard();
   const isProduction = process.env.NODE_ENV === 'production';
   const config = getServerConfig();
   const loggingConfig = createLoggingConfig(
