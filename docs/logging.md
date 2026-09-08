@@ -135,7 +135,7 @@ Friends & blocks:
 
 Circles & groups:
 
-- `circle_created`, `circle_join_requested`, `circle_left`
+- `circle_created`, `circle_join_requested`, `circle_left`, `circle_dissolved`
 - `group_member_role_updated`, `group_member_removed`, `group_left`, `group_reported`
 
 Money, credits & commerce:

@@ -120,6 +120,19 @@ export class CircleController {
     return this.circleService.leaveCircle(req.user.userId, id);
   }
 
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: '圈主解散圈子(圈子从所有成员的列表消失 + 群聊全员离座,不可逆)',
+  })
+  @ApiNoContentResponse()
+  dissolve(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.circleService.dissolveCircle(req.user.userId, id);
+  }
+
   @Post(':id/icon/upload')
   @ApiOperation({ summary: 'Upload a circle icon asset' })
   uploadIcon(
