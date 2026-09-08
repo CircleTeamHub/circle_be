@@ -69,8 +69,8 @@ describe('ChatService', () => {
   };
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
-    // 默认关掉自动销毁,让既有用例不受时间窗口影响;需要时逐例覆盖。
-    getSettings: jest.fn().mockResolvedValue({ messageSelfDestructDays: 0 }),
+    // 默认关掉全局阅后即焚,让既有用例不受时间窗口影响;需要时逐例覆盖。
+    getSettings: jest.fn().mockResolvedValue({ messageSelfDestructSec: 0 }),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -184,7 +184,7 @@ describe('ChatService', () => {
     support.isSupportAgent.mockResolvedValue(false);
     circleMemberLock.lock.mockResolvedValue(undefined);
     privacySettings.getSettings.mockResolvedValue({
-      messageSelfDestructDays: 0,
+      messageSelfDestructSec: 0,
     });
     broadcast.joinUserToConversation.mockResolvedValue(undefined);
     prisma.friend.findFirst.mockResolvedValue(null);
@@ -216,12 +216,12 @@ describe('ChatService', () => {
     );
   });
 
-  // 访客(临时房)没有 User 行:查隐私设置只会拿到 2 天默认值,而房间可以开
-  // 3 天甚至 7 天 —— 活着的房间里超过 2 天的消息对访客凭空消失,他还没有任何
-  // 地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
+  // 访客(临时房)没有 User 行:查隐私设置只会拿到默认窗口,而房间可以开更长
+  // —— 活着的房间里超过那个窗口的消息对访客凭空消失,他还没有任何地方能改这个
+  // 设置。访客的保留边界是房间寿命,不是用户偏好。
   it('does not apply viewer retention to guest history', async () => {
     privacySettings.getSettings.mockResolvedValue({
-      messageSelfDestructDays: 2,
+      messageSelfDestructSec: 172800,
     });
     prisma.chatMember.findUnique.mockResolvedValue(membership());
     prisma.chatMessage.findMany.mockResolvedValue([]);
@@ -507,7 +507,7 @@ describe('ChatService', () => {
             conversation: {
               ...membership().conversation,
               id: 'source-conv',
-              burnDurationSec: 30,
+              burnDurationSec: 60,
             },
           }),
         );
@@ -1703,7 +1703,7 @@ describe('ChatService', () => {
             circleID: null,
             tempChatID: null,
             lastMessageAt: null,
-            burnDurationSec: 30,
+            burnDurationSec: 60,
           },
         }),
       );
@@ -1716,7 +1716,7 @@ describe('ChatService', () => {
 
       expect(page.messages).toHaveLength(2);
       for (const message of page.messages) {
-        expect(message.burnDurationSec).toBe(30);
+        expect(message.burnDurationSec).toBe(60);
       }
     });
 
@@ -1784,7 +1784,7 @@ describe('ChatService', () => {
     // 客户端带上 date 就能翻出窗口之外的消息。两者必须同时成立。
     it('keeps the self-destruct cutoff when a date filter is also supplied', async () => {
       privacySettings.getSettings.mockResolvedValue({
-        messageSelfDestructDays: 2,
+        messageSelfDestructSec: 172800,
       });
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findMany.mockResolvedValue([]);
@@ -1970,7 +1970,7 @@ describe('ChatService', () => {
     // 看不到、一搜就出来的话,这个设置等于形同虚设。
     it('applies the same self-destruct cutoff as history', async () => {
       privacySettings.getSettings.mockResolvedValue({
-        messageSelfDestructDays: 2,
+        messageSelfDestructSec: 172800,
       });
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
@@ -2016,7 +2016,7 @@ describe('ChatService', () => {
   describe('listConversations', () => {
     it('pushes viewer retention into preview and unread queries', async () => {
       privacySettings.getSettings.mockResolvedValue({
-        messageSelfDestructDays: 2,
+        messageSelfDestructSec: 172800,
       });
       prisma.chatMember.findMany.mockResolvedValueOnce([
         {
@@ -3946,7 +3946,7 @@ describe('ChatService', () => {
 
     it('tightens retention to the stricter of viewer setting and conversation burn', async () => {
       privacySettings.getSettings.mockResolvedValue({
-        messageSelfDestructDays: 7,
+        messageSelfDestructSec: 604800,
       });
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
@@ -3970,7 +3970,7 @@ describe('ChatService', () => {
       ];
       const cutoff = args.where.AND?.[0]?.createdAt?.gte;
       expect(cutoff).toBeInstanceOf(Date);
-      // 更严 = 更晚的截止:1 小时焚毁窗口应覆盖 7 天的查看者设置。
+      // 更严 = 更晚的截止:1 小时焚毁窗口应覆盖 1 周的查看者设置。
       expect(Date.now() - (cutoff as Date).getTime()).toBeLessThan(
         2 * 60 * 60 * 1000,
       );
@@ -4502,7 +4502,7 @@ describe('ChatService', () => {
         },
       ]);
       prisma.chatConversation.findMany.mockResolvedValue([
-        { id: 'conv-1', burnDurationSec: 30 },
+        { id: 'conv-1', burnDurationSec: 60 },
       ]);
       prisma.$queryRaw.mockResolvedValue([]);
 

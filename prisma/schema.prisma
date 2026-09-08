@@ -1322,7 +1322,11 @@ model UserTracePreference {
 model UserPrivacySetting {
   id                      String   @id @default(uuid())
   userID                  String   @unique
-  /// 0 = 关闭自动销毁。与 DEFAULT_PRIVACY_SETTINGS 保持一致。
+  /// 全局阅后即焚窗口(秒),0 = 关闭。档位见 src/common/burn-durations.ts。
+  /// messageSelfDestructDays(天)是它的前身,只能选整天,与会话级焚毁的秒数
+  /// 白名单是两张表;20260907120000 迁移已按 *86400 回填到这一列。
+  /// 旧列留到下一版再删(expand/contract:蓝绿窗口里旧二进制还在读它)。
+  messageSelfDestructSec  Int      @default(0)
   messageSelfDestructDays Int      @default(0)
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)
