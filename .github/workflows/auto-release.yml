@@ -1,0 +1,138 @@
+name: Auto Release
+
+# main 更新 → 自动发到服务器。
+#
+# Build Image 成功即说明该 commit 的不可变镜像已经在 GHCR 里；本工作流给它打一个
+# 补丁位版本 tag，再派发 Release 工作流走完整链路(备份 → 迁移 → 起备用色 → 健康门
+# → 切换 → 公网烟测，失败自动回滚)。发布仍然只认 v 版本 tag，自动发版与手动发版
+# 产出的回滚点完全同构。
+#
+# 下列情况**跳过**而不是失败:
+#   - 未设置 vars.DEPLOY_HOST: 还没有服务器,无处可发
+#   - vars.AUTO_RELEASE == 'off': 临时停用自动发版
+#   - 该 commit 已不是 main 顶端: 让更新的提交去发,不发陈旧版本
+#   - 该 commit 的 CI 不是绿的(含等待超时)
+#   - 存在 deploy/REQUIRES_IRREVERSIBLE_MIGRATION: 不可逆迁移按设计必须人工确认
+#     downtime + irreversible,只能手动跑 Release
+#
+# 为什么派发 workflow_dispatch 而不是靠 tag push 触发: 用 GITHUB_TOKEN 推的 tag 不会
+# 触发别的工作流(GitHub 防递归),而 workflow_dispatch 是官方例外。代价是自动发版不
+# 生成 GitHub Release 说明(release.yml 的 publish_release 只跑 push 事件);tag 本身
+# 照常存在,回滚不受影响。需要发布说明的里程碑版本,手工推 tag 即可。
+
+on:
+  workflow_run:
+    workflows: ["Build Image"]
+    types: [completed]
+
+# 一次只发一版;新提交排队,不取消进行中的发布。
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  auto_release:
+    name: "Tag main and dispatch Release"
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # 推版本 tag
+      actions: write # 派发 Release 工作流
+    steps:
+      - name: Checkout built commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # 需要 origin/main 与全部 tag
+
+      - name: Check release preconditions
+        id: gate
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          AUTO_RELEASE: ${{ vars.AUTO_RELEASE }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          skip() {
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::auto-release skipped: $1"
+            exit 0
+          }
+
+          [ -n "$DEPLOY_HOST" ] || skip "vars.DEPLOY_HOST 未配置,还没有部署目标(见 DEPLOY.md §6)"
+          [ "${AUTO_RELEASE:-on}" != "off" ] || skip "vars.AUTO_RELEASE=off,自动发版已停用"
+
+          if [ -e deploy/REQUIRES_IRREVERSIBLE_MIGRATION ]; then
+            echo "::warning::存在 deploy/REQUIRES_IRREVERSIBLE_MIGRATION,需要人工在 Actions → Release 勾选 downtime + irreversible_migration 发版"
+            skip "该版本带不可逆迁移标记"
+          fi
+
+          if [ "$(git rev-parse origin/main)" != "$SHA" ]; then
+            skip "$SHA 已不是 main 顶端,交给更新的提交发版"
+          fi
+
+          # CI 与 Build Image 并行跑,镜像先绿也要等 CI;Release 的 resolve 会再验一次。
+          conclusion=""
+          for _ in $(seq 1 20); do
+            conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&status=completed&per_page=1" --jq '.workflow_runs[0].conclusion // ""')"
+            [ -z "$conclusion" ] || break
+            sleep 30
+          done
+          case "$conclusion" in
+            success) ;;
+            "") skip "等待 10 分钟后 $SHA 的 CI 仍未完成" ;;
+            *) skip "$SHA 的 CI 结论是 '$conclusion',不发版" ;;
+          esac
+
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next patch version
+        id: version
+        if: ${{ steps.gate.outputs.skipped == 'false' }}
+        run: |
+          set -euo pipefail
+          latest="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -z "$latest" ]; then
+            major=0; minor=1; patch=0
+          else
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            patch=$((patch + 1))
+          fi
+          tag="v$major.$minor.$patch"
+          while git rev-parse -q --verify "refs/tags/$tag" >/dev/null; do
+            patch=$((patch + 1))
+            tag="v$major.$minor.$patch"
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "上一个版本: ${latest:-无} → 本次: $tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag the commit
+        if: ${{ steps.gate.outputs.skipped == 'false' }}
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Auto release of main $SHA" "$SHA"
+          git push origin "refs/tags/$TAG"
+
+      - name: Dispatch Release
+        if: ${{ steps.gate.outputs.skipped == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --ref main -f tag="$TAG"
+          echo "已派发 Release: $TAG" >> "$GITHUB_STEP_SUMMARY"
