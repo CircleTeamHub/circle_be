@@ -5,8 +5,8 @@ import { RegisterDto } from './register.dto';
 
 const validPayload = {
   email: 'user@example.com',
-  code: '123456',
   password: 'password1',
+  confirmPassword: 'password1',
   nickname: 'User',
 };
 
@@ -62,8 +62,8 @@ describe('RegisterDto existing fields', () => {
   function base(): RegisterDto {
     const dto = new RegisterDto();
     dto.email = 'user@example.com';
-    dto.code = '123456';
     dto.password = validPassword;
+    dto.confirmPassword = validPassword;
     dto.nickname = 'Jimmy';
     return dto;
   }
@@ -72,18 +72,23 @@ describe('RegisterDto existing fields', () => {
     expect(await validate(base())).toHaveLength(0);
   });
 
+  it('requires a confirmation password', async () => {
+    const dto = plainToInstance(RegisterDto, {
+      email: 'user@example.com',
+      password: validPassword,
+      nickname: 'Jimmy',
+    });
+    const errors = await validate(dto);
+    expect(errors.some((error) => error.property === 'confirmPassword')).toBe(
+      true,
+    );
+  });
+
   it('rejects an invalid email', async () => {
     const dto = base();
     dto.email = 'not-an-email';
     const errors = await validate(dto);
     expect(errors.some((error) => error.property === 'email')).toBe(true);
-  });
-
-  it('rejects a non-6-digit code', async () => {
-    const dto = base();
-    dto.code = '12ab';
-    const errors = await validate(dto);
-    expect(errors.some((error) => error.property === 'code')).toBe(true);
   });
 
   it('rejects a missing nickname', async () => {

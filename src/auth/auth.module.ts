@@ -59,9 +59,8 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
         }
         if (configService.get<string>('NODE_ENV') === 'production') {
           new Logger('AuthModule').error(
-            'SMTP_HOST is not configured in production — email verification ' +
-              'endpoints will answer 503 and users cannot register or reset ' +
-              'passwords by email. Set SMTP_HOST/SMTP_USER/SMTP_PASS ' +
+            'SMTP_HOST is not configured in production — password reset by ' +
+              'email will answer 503. Set SMTP_HOST/SMTP_USER/SMTP_PASS ' +
               '(and optionally SMTP_PORT/SMTP_SECURE/MAIL_FROM).',
           );
           return new UnconfiguredMailer();

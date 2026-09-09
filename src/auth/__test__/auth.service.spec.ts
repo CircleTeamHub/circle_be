@@ -225,7 +225,7 @@ describe('AuthService', () => {
   it('register creates user with auto accountId and returns tokens', async () => {
     const result = await service.register({
       email: 'new@example.com',
-      code: '123456',
+      confirmPassword: 'password1',
       password: 'password1',
       nickname: 'Test User',
     } as any);
@@ -234,6 +234,24 @@ describe('AuthService', () => {
     expect(users[0].accountId).toMatch(/^\d{6}$/);
     expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
+  });
+
+  it('register rejects mismatched confirmation passwords', async () => {
+    await expect(
+      service.register({
+        email: 'mismatch@example.com',
+        password: 'password1',
+        confirmPassword: 'password2',
+        nickname: 'Mismatch',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({
+        errorCode: 'AUTH_PASSWORD_MISMATCH',
+      }),
+    });
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalledWith({
+      where: { email: 'mismatch@example.com' },
+    });
   });
 
   it('register records the active inviter for a normalized invite code', async () => {
@@ -247,7 +265,7 @@ describe('AuthService', () => {
 
     await service.register({
       email: 'invitee@example.com',
-      code: '123456',
+      confirmPassword: 'password1',
       password: 'password1',
       nickname: 'Invitee',
       inviteCode: '  abc123  ',
@@ -270,7 +288,7 @@ describe('AuthService', () => {
     await expect(
       service.register({
         email: 'invitee@example.com',
-        code: '123456',
+        confirmPassword: 'password1',
         password: 'password1',
         nickname: 'Invitee',
         inviteCode: 'missing',
@@ -295,7 +313,7 @@ describe('AuthService', () => {
     await expect(
       service.register({
         email: 'invitee@example.com',
-        code: '123456',
+        confirmPassword: 'password1',
         password: 'password1',
         nickname: 'Invitee',
         inviteCode: 'abc123',
@@ -319,7 +337,7 @@ describe('AuthService', () => {
 
     const result = await service.register({
       email: 'race@example.com',
-      code: '123456',
+      confirmPassword: 'password1',
       password: 'password1',
       nickname: 'Race',
     } as any);
@@ -345,7 +363,7 @@ describe('AuthService', () => {
 
     const result = await service.register({
       email: 'trigger-race@example.com',
-      code: '123456',
+      confirmPassword: 'password1',
       password: 'password1',
       nickname: 'TriggerRace',
     } as any);
@@ -368,7 +386,7 @@ describe('AuthService', () => {
 
     const result = await service.register({
       email: 'trigger-invite@example.com',
-      code: '123456',
+      confirmPassword: 'password1',
       password: 'password1',
       nickname: 'TriggerInvite',
     } as any);
@@ -386,7 +404,7 @@ describe('AuthService', () => {
     await expect(
       service.register({
         email: 'db-down@example.com',
-        code: '123456',
+        confirmPassword: 'password1',
         password: 'password1',
         nickname: 'DbDown',
       } as any),
@@ -406,24 +424,12 @@ describe('AuthService', () => {
     await expect(
       service.register({
         email: 'exhausted@example.com',
-        code: '123456',
+        confirmPassword: 'password1',
         password: 'password1',
         nickname: 'Exhausted',
       } as any),
     ).rejects.toThrow(ServiceUnavailableException);
     expect(mockPrisma.user.create).toHaveBeenCalledTimes(10);
-  });
-
-  it('register throws BadRequest when code invalid', async () => {
-    mockEmailVerification.verifyCode.mockResolvedValueOnce(false);
-    await expect(
-      service.register({
-        email: 'x@example.com',
-        code: '000000',
-        password: 'password1',
-        nickname: 'X',
-      } as any),
-    ).rejects.toThrow(BadRequestException);
   });
 
   it('register throws Conflict when email already used', async () => {
@@ -436,7 +442,7 @@ describe('AuthService', () => {
     await expect(
       service.register({
         email: 'dupe@example.com',
-        code: '123456',
+        confirmPassword: 'password1',
         password: 'password1',
         nickname: 'Dupe',
       } as any),
