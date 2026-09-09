@@ -419,11 +419,11 @@ describe('NoteService', () => {
     expect(coverUpdate.data.coverMediaID).not.toBe(video.id);
   });
 
-  it('derives title, content, media, and contentJson from block documents', async () => {
+  it('preserves the explicit title while deriving content and media from blocks', async () => {
     prisma.note.create.mockResolvedValueOnce({
       id: 'note-2',
       ownerID: 'user-1',
-      title: '块标题',
+      title: '手填标题',
       content: '块标题 正文第一段 列表项一',
       status: 'ACTIVE',
       available: true,
@@ -447,7 +447,7 @@ describe('NoteService', () => {
     prisma.note.update.mockResolvedValueOnce({
       id: 'note-2',
       ownerID: 'user-1',
-      title: '块标题',
+      title: '手填标题',
       content: '块标题 正文第一段 列表项一',
       status: 'ACTIVE',
       available: true,
@@ -550,7 +550,7 @@ describe('NoteService', () => {
     ];
 
     const result = await service.createNote('user-1', {
-      title: '旧标题',
+      title: '手填标题',
       content: '旧正文',
       contentJson,
       media: [],
@@ -559,7 +559,7 @@ describe('NoteService', () => {
     expect(prisma.note.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          title: '块标题',
+          title: '手填标题',
           content: '块标题 正文第一段 列表项一',
           contentJson,
           imageCount: 1,
@@ -584,7 +584,7 @@ describe('NoteService', () => {
       ]),
     });
     expect(result).toMatchObject({
-      title: '块标题',
+      title: '手填标题',
       content: '块标题 正文第一段 列表项一',
       imageCount: 1,
       videoCount: 1,
@@ -2514,6 +2514,173 @@ describe('NoteService', () => {
     ).resolves.toBeDefined();
   });
 
+  describe('manual titles and table text', () => {
+    const row = {
+      id: 'note-rich',
+      ownerID: 'user-1',
+      title: '旧标题',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date('2026-09-09T00:00:00.000Z'),
+      updatedAt: new Date('2026-09-09T00:00:00.000Z'),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    };
+    const table = {
+      type: 'table',
+      content: {
+        type: 'tableContent',
+        rows: [
+          {
+            cells: [
+              [{ type: 'text', text: '星期一' }],
+              [
+                {
+                  type: 'link',
+                  href: 'https://example.com',
+                  content: [{ type: 'text', text: '东京' }],
+                },
+              ],
+            ],
+          },
+          {
+            cells: [
+              {
+                type: 'tableCell',
+                content: [{ type: 'text', text: '星期二' }],
+              },
+              {
+                type: 'tableCell',
+                content: [
+                  { type: 'text', text: '京' },
+                  { type: 'text', text: '都', styles: { bold: true } },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    };
+
+    it.each([
+      ['create', 'legacy'],
+      ['create', 'sections'],
+      ['update', 'legacy'],
+      ['update', 'sections'],
+    ])(
+      '%s preserves the manual title and %s table text in storage and responses',
+      async (operation, shape) => {
+        const blocks = [
+          {
+            type: 'paragraph',
+            content: [{ type: 'text', text: '正文引言' }],
+            children: [table],
+          },
+        ];
+        if (operation === 'create') {
+          prisma.note.create.mockResolvedValueOnce({ id: row.id });
+        } else {
+          prisma.note.findFirst.mockResolvedValueOnce(row);
+        }
+        prisma.note.update.mockImplementationOnce(async ({ data }) => ({
+          ...row,
+          ...(prisma.note.create.mock.calls[0]?.[0].data ?? {}),
+          ...data,
+        }));
+        const input = {
+          title: '  我的旅行计划  ',
+          media: [],
+          ...(shape === 'sections'
+            ? { sections: { text: { contentJson: blocks } } }
+            : { contentJson: blocks }),
+        };
+
+        const result =
+          operation === 'create'
+            ? await service.createNote('user-1', input)
+            : await service.updateNote('user-1', row.id, input);
+        const saved =
+          operation === 'create'
+            ? prisma.note.create.mock.calls[0][0].data
+            : prisma.note.update.mock.calls[0][0].data;
+        const content = '正文引言 星期一\t东京\n星期二\t京都';
+
+        expect(saved.title).toBe('我的旅行计划');
+        expect(saved.content).toBe(content);
+        expect(saved.contentJson).toEqual(blocks);
+        expect(saved.sections.text).toEqual({ content, contentJson: blocks });
+        expect(result).toMatchObject({
+          title: '我的旅行计划',
+          content,
+          contentPreview: content,
+          sections: { text: { content, contentJson: blocks } },
+        });
+        expect(result.content).not.toContain('https://');
+      },
+    );
+
+    it('keeps a table-only note readable and safely skips malformed cells', async () => {
+      const malformedTable = {
+        ...table,
+        content: {
+          ...table.content,
+          rows: [
+            null,
+            { cells: null },
+            ...table.content.rows,
+            { cells: [null, 123, { content: null }] },
+          ],
+        },
+      };
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const result = await service.createNote('user-1', {
+        title: '表格笔记',
+        media: [],
+        contentJson: [malformedTable],
+      });
+
+      expect(result.title).toBe('表格笔记');
+      expect(result.content).toBe('星期一\t东京\n星期二\t京都');
+    });
+
+    it('bounds malformed deeply nested cell content while keeping neighboring text', async () => {
+      let nested: unknown = { type: 'text', text: '超深内容' };
+      for (let i = 0; i < 30; i += 1) nested = { content: [nested] };
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const result = await service.createNote('user-1', {
+        title: '安全表格',
+        media: [],
+        contentJson: [
+          {
+            type: 'table',
+            content: {
+              type: 'tableContent',
+              rows: [{ cells: [nested, [{ type: 'text', text: '正常内容' }]] }],
+            },
+          },
+        ],
+      });
+
+      expect(result.content).toBe('正常内容');
+    });
+  });
+
   it('ignores malformed contentJson nodes instead of throwing runtime errors', async () => {
     prisma.note.create.mockResolvedValueOnce({ id: 'note-malformed' });
     prisma.note.update.mockResolvedValueOnce({
@@ -2548,43 +2715,56 @@ describe('NoteService', () => {
     ).resolves.toBeDefined();
   });
 
-  it('truncates contentJson-derived title and content to the DTO caps', async () => {
-    const hugeText = 'x'.repeat(50_000);
-    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
-    prisma.note.update.mockResolvedValueOnce({
-      id: 'note-1',
-      title: 't',
-      content: 'c',
-      status: 'ACTIVE',
-      available: true,
-      pinned: false,
-      imageCount: 0,
-      videoCount: 0,
-      mediaCount: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      coverMedia: null,
-      groupMemberships: [],
-      media: [],
-    });
+  it.each(['paragraph', 'table'])(
+    'caps explicit titles and %s-derived text at the DTO limits',
+    async (type) => {
+      const hugeText = 'x'.repeat(50_000);
+      prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+      prisma.note.update.mockResolvedValueOnce({
+        id: 'note-1',
+        title: 't',
+        content: 'c',
+        status: 'ACTIVE',
+        available: true,
+        pinned: false,
+        imageCount: 0,
+        videoCount: 0,
+        mediaCount: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        coverMedia: null,
+        groupMemberships: [],
+        media: [],
+      });
 
-    await service.createNote('user-1', {
-      title: 'ignored when contentJson present',
-      contentJson: [
+      const contentJson = [
         {
-          type: 'paragraph',
-          content: [{ type: 'text', text: hugeText, styles: {} }],
+          type,
+          content:
+            type === 'table'
+              ? {
+                  type: 'tableContent',
+                  rows: [
+                    { cells: [[{ type: 'text', text: hugeText, styles: {} }]] },
+                  ],
+                }
+              : [{ type: 'text', text: hugeText, styles: {} }],
         },
-      ] as any,
-      media: [],
-    });
+      ];
+      await service.createNote('user-1', {
+        title: '手'.repeat(150),
+        contentJson,
+        media: [],
+      });
 
-    const createArg = prisma.note.create.mock.calls[0][0];
-    expect(createArg.data.title).toHaveLength(120);
-    expect(createArg.data.content).toHaveLength(20_000);
-  });
+      const createArg = prisma.note.create.mock.calls[0][0];
+      expect(createArg.data.title).toHaveLength(120);
+      expect(createArg.data.content).toHaveLength(20_000);
+      expect(createArg.data.contentJson).toEqual(contentJson);
+    },
+  );
 
-  it('falls back to the dto title when every content block is blank', async () => {
+  it('preserves the dto title when every content block is blank', async () => {
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
       id: 'note-1',
@@ -2614,9 +2794,7 @@ describe('NoteService', () => {
       media: [],
     });
 
-    // extractBlockText 会丢掉纯空白片段，于是 extractedText[0] 是 undefined、
-    // derivedTitle 的 `??` 回退到 dto.title。这条不变式是 DTO 侧空白校验够用的
-    // 前提：若这里改成能产出空串，标题就能绕过 DTO 变空。
+    // 标题独立于正文；空白正文不应清空手填标题。
     const createArg = prisma.note.create.mock.calls[0][0];
     expect(createArg.data.title).toBe('我的标题');
   });

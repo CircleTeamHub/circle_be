@@ -86,7 +86,12 @@ type BNInlineContent = BNStyledText | BNLink;
 type BNTableContent = {
   type: 'tableContent';
   columnWidths?: (number | undefined)[];
-  rows: { cells: BNInlineContent[][] }[];
+  rows: {
+    cells: (
+      | BNInlineContent[]
+      | { type: 'tableCell'; content: BNInlineContent[] }
+    )[];
+  }[];
 };
 
 type NoteContentBlock = {
@@ -1050,6 +1055,19 @@ export class NoteService {
     return content.length > 120 ? `${content.slice(0, 120)}...` : content;
   }
 
+  private extractTableCellText(content: unknown, depth = 0): string {
+    if (depth > 10) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((item) => this.extractTableCellText(item, depth + 1))
+        .join('');
+    }
+    if (!this.isRecord(content)) return '';
+    if (typeof content.text === 'string') return content.text;
+    return this.extractTableCellText(content.content, depth + 1);
+  }
+
   private extractBlockText(
     blocks: NoteContentBlock[] | undefined,
     depth = 0,
@@ -1060,7 +1078,28 @@ export class NoteService {
 
     for (const block of blocks) {
       if (!this.isRecord(block)) continue;
-      // Table blocks have a BNTableContent object, not an array — skip for text
+      if (
+        block.type === 'table' &&
+        this.isRecord(block.content) &&
+        !Array.isArray(block.content)
+      ) {
+        const rows = Array.isArray(block.content.rows)
+          ? block.content.rows
+          : [];
+        const tableText = rows
+          .map((row) => {
+            if (!this.isRecord(row) || !Array.isArray(row.cells)) return '';
+            // Support both legacy inline arrays and newer tableCell objects.
+            return row.cells
+              .map((cell) => this.extractTableCellText(cell))
+              .join('\t')
+              .trim();
+          })
+          .filter(Boolean)
+          .join('\n');
+        if (tableText) fragments.push(tableText);
+      }
+
       const inlines = Array.isArray(block.content) ? block.content : [];
 
       for (const node of inlines) {
@@ -1183,10 +1222,7 @@ export class NoteService {
         ? extractedText.join(' ').trim() ||
           (sectionText?.content ?? input.content ?? '').trim()
         : (sectionText?.content ?? input.content ?? '').trim();
-    const derivedTitle =
-      blocks.length > 0
-        ? (extractedText[0] ?? input.title).trim()
-        : input.title.trim();
+    const derivedTitle = input.title.trim();
     const normalized = {
       contentJson: blocks.length > 0 ? blocks : null,
       title: derivedTitle.slice(0, MAX_NOTE_TITLE_LENGTH),
