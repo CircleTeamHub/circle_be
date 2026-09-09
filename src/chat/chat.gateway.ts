@@ -872,16 +872,29 @@ export class ChatGateway implements OnModuleDestroy {
         traceId,
       });
       // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
-      void this.broadcast.isUserOnline(userId).then((online) => {
-        if (online) return;
-        this.observeBroadcast('presence', () =>
-          this.broadcast.emitPresence(
-            conversationIds,
-            { userId, online: false },
-            blockedPeers,
-          ),
-        );
-      });
+      //
+      // .catch 不是可选的:这是 fire-and-forget,少了它一次 reject 就是未捕获
+      // rejection,Node 直接终止进程 —— 实测 Redis 抖一下 + 有人断开 WebSocket
+      // 就能把整个后端打死。「尽力而为」必须自己兜住失败才算数。
+      void this.broadcast
+        .isUserOnline(userId)
+        .then((online) => {
+          if (online) return;
+          this.observeBroadcast('presence', () =>
+            this.broadcast.emitPresence(
+              conversationIds,
+              { userId, online: false },
+              blockedPeers,
+            ),
+          );
+        })
+        .catch((error: unknown) => {
+          reportOperationalError(error, {
+            component: 'ChatGateway',
+            operation: 'presenceOnDisconnect',
+            kind: 'websocket',
+          });
+        });
     });
 
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。

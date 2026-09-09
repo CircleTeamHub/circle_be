@@ -102,12 +102,17 @@ export class ChatBroadcastService {
 
   /**
    * 某用户当前是否有在线 socket(个人房占用判定)。
-   * G-04:优先问跨实例注册表;Redis 不可用回退本实例 fetchSockets
-   * (多实例 + adapter 下 fetchSockets 是跨节点 RPC,大群里很贵)。
+   * G-04:优先问跨实例注册表;注册表答不上来时**只有单实例部署**才回退
+   * fetchSockets —— 配了 Redis 就挂着 RedisAdapter,那条路是跨节点 RPC,
+   * 恰恰经过刚刚失败的 Redis(见 isRedisConfigured 注释)。
    */
   async isUserOnline(userId: string): Promise<boolean> {
     const viaRegistry = await this.presence.isOnline(userId);
     if (viaRegistry !== null) return viaRegistry;
+    // Redis 配了却读不到:判为「仍在线」。与 ChatPresenceRegistry
+    // .socketDisconnected 的既有策略一致 —— 宁可少推一条离线通知,
+    // 也不要在读失败时把人误判成离线。
+    if (this.presence.isRedisConfigured()) return true;
     const server = this.requireServer('isUserOnline');
     if (!server) return false;
     const sockets = await server.in(userRoom(userId)).fetchSockets();
@@ -120,6 +125,10 @@ export class ChatBroadcastService {
   ): Promise<Set<string>> {
     const viaRegistry = await this.presence.getOnlineUserIds(conversationId);
     if (viaRegistry !== null) return new Set(viaRegistry);
+    // Redis 配了却读不到:返回空集。这个集合在 ChatPushService 里用来**排除**
+    // 收件人 —— 空集 = 谁都不排除 = 全员收到推送。反过来把人当在线会让他
+    // 彻底收不到消息:重复推送好过丢消息。
+    if (this.presence.isRedisConfigured()) return new Set();
     const server = this.requireServer('getOnlineUserIdsInConversation');
     if (!server) return new Set();
     const sockets = await server

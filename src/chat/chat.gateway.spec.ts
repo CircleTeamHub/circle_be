@@ -320,6 +320,36 @@ describe('ChatGateway', () => {
       );
     });
 
+    // 回归：断开时的在线判定是 fire-and-forget，注释写着「尽力而为」，但
+    // `void p.then(...)` 少了 .catch —— 一旦 reject 就是未捕获 rejection，
+    // Node 直接终止进程。2026-09-08 本地实测：Redis 抖一下 + 有人断开
+    // WebSocket = 整个后端退出。
+    it('断开时的在线判定失败不能变成未捕获 rejection（会打死进程）', async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        const socket = fakeSocket({
+          conn: { transport: { name: 'websocket' } },
+        });
+        chatService.listConversationIds.mockResolvedValue(['conv-1']);
+        broadcast.isUserOnline.mockRejectedValue(
+          new Error('Connection is closed.'),
+        );
+
+        await gateway['handleConnection'](socket as never);
+        socket.handlers.get('disconnect')?.('transport error');
+
+        // 跨一次宏任务，让 Node 有机会判定「这个 rejection 没人接」。
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+
+      expect(unhandled).toEqual([]);
+    });
+
     it('logs ready and disconnect lifecycle events with one trace id', async () => {
       const log = jest
         .spyOn((gateway as any).logger, 'log')
