@@ -30,9 +30,9 @@ describe('PrivacySettingsService', () => {
     prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
 
     await expect(service.getSettings('user-1')).resolves.toMatchObject({
-      // 自动销毁默认关闭:绝大多数用户库里没有这行,走的就是这份默认值。
+      // 全局阅后即焚默认关闭:绝大多数用户库里没有这行,走的就是这份默认值。
       // 默认非 0 等于替所有从没进过隐私设置的人开了「只看得到最近 N 天」。
-      messageSelfDestructDays: 0,
+      messageSelfDestructSec: 0,
       momentsVisibility: 'ALL',
       allowStrangerMessages: true,
       showPhone: false,
@@ -239,13 +239,13 @@ describe('PrivacySettingsService', () => {
 
     prisma.userPrivacySetting.upsert.mockResolvedValue({
       userID: 'user-1',
-      messageSelfDestructDays: 7,
+      messageSelfDestructSec: 604800,
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
     });
 
     await service.updateSettings('user-1', {
-      messageSelfDestructDays: 7,
+      messageSelfDestructSec: 604800,
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
     });
@@ -254,12 +254,12 @@ describe('PrivacySettingsService', () => {
       where: { userID: 'user-1' },
       create: expect.objectContaining({
         userID: 'user-1',
-        messageSelfDestructDays: 7,
+        messageSelfDestructSec: 604800,
         momentsVisibility: 'FRIENDS_ONLY',
         allowStrangerMessages: false,
       }),
       update: {
-        messageSelfDestructDays: 7,
+        messageSelfDestructSec: 604800,
         momentsVisibility: 'FRIENDS_ONLY',
         allowStrangerMessages: false,
       },

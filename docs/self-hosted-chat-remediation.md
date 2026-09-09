@@ -225,7 +225,7 @@ OpenIM 推送侧累加系统角标。新推送 payload 只有 `{title, body, dat
 
 | 项 | 旧（OpenIM） | 新 | 差异 |
 |---|---|---|---|
-| **S-01 阅后即焚** | `setConversationBurnDuration`：会话级、单方设置双方生效、真删 | `UserPrivacySetting.messageSelfDestructDays`：查看者自己的界面过滤，默认 2 天，库里不删、对端不受影响 | 完全两回事 |
+| **S-01 阅后即焚** | `setConversationBurnDuration`：会话级、单方设置双方生效、真删 | `UserPrivacySetting.messageSelfDestructSec`（原 `...Days`）：查看者自己的界面过滤，默认关闭，库里不删、对端不受影响 | 完全两回事 |
 | **S-02 群成员管理** | OpenIM group API，实时 | Circle 表 + 每分钟对账 | 一致性更强（单一事实源），实时性更差 |
 | **S-03 在线状态** | `subscribeUsersStatus` 订阅任意用户 | `chat:presence` 仅广播到**会话房** | 无共同会话的人拿不到推送 |
 | **S-04 引用消息** | 真引用（见 G-09） | 文本快照 | 见 G-09 |
@@ -389,8 +389,11 @@ REST。避免本地库无限膨胀。
 - 开关变更**发一条系统消息留痕**（微信 / Signal 的做法，避免「对方偷偷开了焚毁」）
 - 真删走定时任务：软删 `deleted = true` **+ 媒体对象一并删**
   （只软删不删对象存储 = 焚毁只焚了个寂寞）
-- **保留** `messageSelfDestructDays`：它是「我自己的界面保留期」，与会话级焚毁不冲突，
-  两者**取更严的**
+- **保留**「我自己的界面保留期」这一项：它与会话级焚毁不冲突，两者**取更严的**
+  - 后续（`20260907120000_unify_burn_durations`）它从 `messageSelfDestructDays`（天）
+    改存 `messageSelfDestructSec`（秒），与会话级焚毁共用同一张档位表
+    `src/common/burn-durations.ts`。此前同一个功能在两个入口给出两张不同的表：
+    「10 分钟」只有单会话有，「30 天」只有全局有
 - 访客（临时房）没有 User 行，保留边界仍是房间寿命，不受本项影响
   （见 `chat.service.ts` `getHistory` 里 `applyViewerRetention` 的处理）
 

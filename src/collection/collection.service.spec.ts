@@ -135,7 +135,7 @@ describe('CollectionService', () => {
   it('refuses to collect a peer message from a burn-after-reading conversation', async () => {
     prisma.chatMessage.findUnique.mockResolvedValue({
       senderID: 'peer-1',
-      conversation: { burnDurationSec: 30 },
+      conversation: { burnDurationSec: 60 },
     });
 
     await expect(
@@ -152,7 +152,7 @@ describe('CollectionService', () => {
   it('still collects your own message from a burn conversation', async () => {
     prisma.chatMessage.findUnique.mockResolvedValue({
       senderID: 'user-1',
-      conversation: { burnDurationSec: 30 },
+      conversation: { burnDurationSec: 60 },
     });
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
 
