@@ -36,6 +36,9 @@ describe('PrivacySettingsService', () => {
       momentsVisibility: 'ALL',
       allowStrangerMessages: true,
       showPhone: false,
+      // 注册邮箱是账号找回入口 —— 存量行没有这一列时也必须落到隐藏,
+      // 否则一次「读默认值」就把 email 重新放回所有陌生人的资料页。
+      showEmail: false,
       showWechat: true,
       showQQ: true,
       showWhatsup: true,
@@ -52,6 +55,14 @@ describe('PrivacySettingsService', () => {
     // A read must never write: lazily creating a row here would let any
     // stranger viewing a profile trigger a write to the target's row.
     expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+
+    // 默认值必须一路走到字段闸门,不只是 DTO 上好看。
+    await expect(
+      service.canViewProfileField('user-1', 'email', false, false),
+    ).resolves.toBe(false);
+    await expect(
+      service.canViewProfileField('user-1', 'email', true, false),
+    ).resolves.toBe(true);
   });
 
   it('trims and persists account-synced direct-message auto reply settings', async () => {
@@ -281,6 +292,7 @@ describe('PrivacySettingsService', () => {
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
       showPhone: false,
+      showEmail: false,
       showWechat: true,
       showQQ: false,
       showWhatsup: false,
@@ -293,6 +305,9 @@ describe('PrivacySettingsService', () => {
     ).resolves.toBe(false);
     await expect(
       service.canViewProfileField('target-1', 'phoneNumber', false, false),
+    ).resolves.toBe(false);
+    await expect(
+      service.canViewProfileField('target-1', 'email', false, false),
     ).resolves.toBe(false);
     await expect(
       service.canViewProfileField('target-1', 'wechat', false, false),

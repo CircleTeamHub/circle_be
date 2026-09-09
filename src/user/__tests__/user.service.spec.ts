@@ -566,6 +566,7 @@ describe('UserService', () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'target-1',
         phoneNumber: '13800000000',
+        email: 'target@example.com',
         wechat: 'wxid_target',
         qq: '10001',
       });
@@ -578,11 +579,22 @@ describe('UserService', () => {
       ).resolves.toMatchObject({
         id: 'target-1',
         phoneNumber: null,
+        // email 长期是唯一没过隐私闸的联系方式:USER_PROFILE_SELECT 选了它,
+        // applyProfilePrivacy 却不过滤,于是任何登录用户都能读到对方注册邮箱。
+        // 之所以没炸,只是因为客户端从来没渲染过 —— 资料页要展示联系方式了,
+        // 这一条就是那个口子已经堵上的守卫。
+        email: null,
         wechat: 'wxid_target',
         qq: null,
         displayIcons: [],
         likedByMeToday: false,
       });
+      expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+        'target-1',
+        'email',
+        false,
+        false,
+      );
     });
 
     it('throws NotFoundException when missing', async () => {
