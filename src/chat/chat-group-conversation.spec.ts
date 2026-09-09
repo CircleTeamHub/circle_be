@@ -431,7 +431,7 @@ describe('ChatService standalone group conversations', () => {
     // 群主身份只由 ownerID 表达,座位上的管理员标记归零。
     expect(prisma.chatMember.update).toHaveBeenCalledWith({
       where: { id: 'seat-admin-1' },
-      data: { role: 'MEMBER' },
+      data: { role: 'MEMBER', silencedAt: null, silencedUntil: null },
     });
   });
 

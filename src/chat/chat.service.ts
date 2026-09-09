@@ -1263,7 +1263,11 @@ export class ChatService {
       // 群主身份由 ownerID 表达,座位上的管理员标记归零,免得两处真值并存。
       await tx.chatMember.update({
         where: { id: successor.id },
-        data: { role: 'MEMBER' },
+        // The new owner must be able to speak and manage the group even if they
+        // were silenced before the transfer. Keeping the old silence state
+        // would leave a permanent owner lock: owners cannot target themselves
+        // through the admin endpoints to clear it.
+        data: { role: 'MEMBER', silencedAt: null, silencedUntil: null },
       });
       return successor.userID;
     });
