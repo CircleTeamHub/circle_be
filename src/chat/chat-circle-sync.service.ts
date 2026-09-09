@@ -7,6 +7,7 @@ import {
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 
 /**
@@ -55,6 +56,7 @@ export class ChatCircleSyncService {
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
+    private readonly groupEvents: ChatGroupEventService,
   ) {}
 
   /**
@@ -391,6 +393,12 @@ export class ChatCircleSyncService {
       userId,
     });
     if (emitMemberLeftNotice) {
+      // 群日志:主动退出记本人;被移出的那条由 GroupService 在事务里记(带操作者)。
+      void this.groupEvents.record(conversationId, {
+        kind: 'member-left',
+        actorId: userId,
+        targetIds: [userId],
+      });
       void this.systemMessage
         .emit(conversationId, { kind: 'member-left' })
         .catch((error: unknown) =>
@@ -451,6 +459,12 @@ export class ChatCircleSyncService {
   ): Promise<void> {
     try {
       if (joined.length > 0) {
+        // 对账入座没有邀请人:群日志的操作者留空(客户端显示「加入群聊」)。
+        await this.groupEvents.record(conversationId, {
+          kind: 'member-joined',
+          actorId: null,
+          targetIds: joined,
+        });
         const users = await this.prisma.user.findMany({
           where: { id: { in: joined } },
           select: { nickname: true },
@@ -462,6 +476,13 @@ export class ChatCircleSyncService {
             names,
           });
         }
+      }
+      if (removed.length > 0) {
+        await this.groupEvents.record(conversationId, {
+          kind: 'member-left',
+          actorId: null,
+          targetIds: removed,
+        });
       }
       // 对账器分不清退出还是被移出,统一「有成员退出群聊」措辞。
       for (let i = 0; i < removed.length; i += 1) {

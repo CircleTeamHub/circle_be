@@ -11,6 +11,7 @@ import { MembershipProgramService } from 'src/membership/membership-program.serv
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
 import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
   CreateCircleDto,
@@ -82,6 +83,10 @@ describe('CircleService', () => {
     releaseSeatInTx: jest.fn().mockResolvedValue(null),
     detachSeat: jest.fn(),
   };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
   const chatSystemMessage = {
     insertSystemMessageInTx: jest.fn(),
     insertSystemMessageAfterLockedConversationInTx: jest.fn(),
@@ -111,6 +116,7 @@ describe('CircleService', () => {
         { provide: CircleMemberLockService, useValue: memberLock },
         { provide: ChatCircleSyncService, useValue: chatCircleSync },
         { provide: ChatSystemMessageService, useValue: chatSystemMessage },
+        { provide: ChatGroupEventService, useValue: groupEvents },
       ],
     }).compile();
 
@@ -439,6 +445,7 @@ describe('CircleService', () => {
       directMemberLock,
       directChatCircleSync,
       chatSystemMessage as any,
+      groupEvents as any,
     );
     prisma.user.findUnique.mockResolvedValue({
       vipLevel: 3,
@@ -890,6 +897,7 @@ describe('CircleService', () => {
       directMemberLock,
       directChatCircleSync,
       chatSystemMessage as any,
+      groupEvents as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -921,6 +929,7 @@ describe('CircleService', () => {
       directMemberLock,
       directChatCircleSync,
       chatSystemMessage as any,
+      groupEvents as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -956,6 +965,7 @@ describe('CircleService', () => {
       directMemberLock,
       directChatCircleSync,
       chatSystemMessage as any,
+      groupEvents as any,
     );
     prisma.circle.findFirst.mockResolvedValue({
       id: 'circle-1',
@@ -1770,6 +1780,7 @@ describe('CircleService', () => {
         directMemberLock,
         directChatCircleSync,
         chatSystemMessage as any,
+        groupEvents as any,
       );
 
       await expect(

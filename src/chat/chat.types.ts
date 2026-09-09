@@ -193,12 +193,62 @@ export interface ChatConversationBroadcast {
   userId: string;
 }
 
-/** 会话成员 DTO(GET /chat/conversations/:id/members)。role 仅 GROUP 有值。 */
+/**
+ * 会话成员 DTO(GET /chat/conversations/:id/members)。
+ * role 仅 GROUP 有值:圈子群来自 CircleMember;独立群聊 = ownerID / ChatMember.role。
+ */
 export interface ChatMemberDto {
   userId: string;
   nickname: string;
   avatarUrl: string | null;
   role: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
+  /** 禁言中(不能发言;与免打扰无关)。 */
+  silenced: boolean;
+  /** 禁言到期时刻;silenced 且为 null = 直到解除。 */
+  silencedUntil: string | null;
+}
+
+/** 禁言/解除禁言的响应:目标成员的最新禁言状态。 */
+export interface ChatMemberSilenceDto {
+  userId: string;
+  silenced: boolean;
+  silencedUntil: string | null;
+}
+
+/**
+ * 群事件账本的种类。与系统消息 kind 同一词表(前端 im.notification.* /
+ * 群日志文案按它分支),加种类不改表结构。
+ */
+export type ChatGroupEventKind =
+  | 'group-created'
+  | 'member-joined'
+  | 'member-left'
+  | 'member-removed'
+  | 'member-role-changed'
+  | 'member-silenced'
+  | 'member-unsilenced'
+  | 'owner-transferred'
+  | 'group-renamed'
+  | 'group-notice-updated'
+  | 'history-cleared';
+
+/** 群日志一条(GET /chat/conversations/:id/events)。 */
+export interface ChatGroupEventDto {
+  id: string;
+  kind: ChatGroupEventKind;
+  /** 操作者;null = 系统/圈子对账。已注销账号昵称为空串。 */
+  actor: ChatSenderInfo | null;
+  /** 受影响成员(进群可多人)。 */
+  targets: ChatSenderInfo[];
+  /** {name} / {role} / {durationSec} / {via}。 */
+  payload: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface ChatGroupEventsPageDto {
+  events: ChatGroupEventDto[];
+  /** 继续向更早翻页的游标;到头为 null。 */
+  nextCursor: string | null;
 }
 
 /** chat:presence 客户端查询载荷(带 ack:{[userId]: boolean})。 */
@@ -231,6 +281,10 @@ export interface ChatConversationDto {
   unreadCount: number;
   pinned: boolean;
   muted: boolean;
+  /** 本人在该会话被禁言(仅 GROUP 会有 true)。 */
+  silenced: boolean;
+  /** 本人禁言到期时刻;silenced 且为 null = 直到解除。 */
+  silencedUntil: string | null;
   /** 会话级阅后即焚秒数(S-01);null=关。 */
   burnDurationSec?: number | null;
   lastMessageAt: string | null;
