@@ -2889,7 +2889,7 @@ describe('ChatService', () => {
       expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
     });
 
-    it('standalone GROUP rejects a plain member (owner-only)', async () => {
+    it('standalone GROUP rejects a plain member', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({
           userID: 'u2',
@@ -2909,7 +2909,7 @@ describe('ChatService', () => {
       await expect(
         service.setBurnDuration('u2', 'conv-1', 3600),
       ).rejects.toMatchObject({
-        response: { errorCode: 'CHAT_GROUP_OWNER_ONLY' },
+        response: { errorCode: 'CHAT_GROUP_MANAGER_ONLY' },
       });
     });
 
