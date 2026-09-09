@@ -285,6 +285,66 @@ describe('ChatService standalone group conversations', () => {
     expect(prisma.chatMember.create).not.toHaveBeenCalled();
   });
 
+  it('blocks ordinary members from inviting once memberCanInvite is off, owner still can', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'conv-1',
+        type: 'GROUP',
+        circleID: null,
+        ownerID: 'owner-1',
+        memberCanInvite: false,
+        clearedBeforeHeight: 0,
+      },
+    ]);
+    prisma.chatMember.findUnique.mockResolvedValue(seat({ userID: 'f1' }));
+
+    await expect(
+      service.inviteToGroupConversation('f1', 'conv-1', ['f2']),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupInviteDisabled },
+    });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+
+    // 群主不受「成员邀请」开关限制。
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f2']));
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.chatMember.count.mockResolvedValue(2);
+    prisma.chatMember.create.mockResolvedValue({});
+    prisma.user.findMany.mockResolvedValue([{ nickname: '小方' }]);
+    await expect(
+      service.inviteToGroupConversation('owner-1', 'conv-1', ['f2']),
+    ).resolves.toEqual(conversationDto);
+    expect(prisma.chatMember.create).toHaveBeenCalled();
+  });
+
+  it('refuses QR joins once the owner turns qrJoinEnabled off', async () => {
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      type: 'GROUP',
+      circleID: null,
+    });
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'conv-1',
+        type: 'GROUP',
+        circleID: null,
+        qrJoinEnabled: false,
+        clearedBeforeHeight: 0,
+      },
+    ]);
+
+    await expect(
+      service.joinStandaloneGroupViaQr('scanner-1', 'conv-1'),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+    });
+    expect(prisma.chatMember.findFirst).not.toHaveBeenCalled();
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+  });
+
   it('rejects invitations that would exceed the 200-member cap', async () => {
     prisma.chatMember.findUnique.mockResolvedValue(seat());
     prisma.friend.findMany.mockResolvedValue(

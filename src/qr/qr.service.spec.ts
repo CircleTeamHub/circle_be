@@ -4,6 +4,7 @@ import {
   GoneException,
   NotFoundException,
 } from '@nestjs/common';
+import { ChatErrorCode } from 'src/common/app-error-codes';
 import { QrService } from './qr.service';
 
 describe('QrService', () => {
@@ -153,6 +154,44 @@ describe('QrService', () => {
       await expect(
         service.issueToken('u1', 'CIRCLE', 'circle-1'),
       ).resolves.toMatchObject({ type: 'CIRCLE' });
+    });
+
+    it('refuses to issue GROUP and CIRCLE tokens once QR joining is switched off', async () => {
+      prisma.qrToken.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        type: 'GROUP',
+        circleID: null,
+        qrJoinEnabled: false,
+      });
+      prisma.chatMember.findFirst.mockResolvedValue({ id: 'seat' });
+      await expect(
+        service.issueToken('u1', 'GROUP', 'conv-1'),
+      ).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+      });
+
+      // 圈子群:开关记在圈子的会话行上,签发圈码同样拒绝。
+      prisma.circle.findUnique.mockResolvedValue({
+        deleted: false,
+        adminState: 'ACTIVE',
+        memberCanInvite: true,
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        qrJoinEnabled: false,
+      });
+      await expect(
+        service.issueToken('u1', 'CIRCLE', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+      });
+      expect(prisma.qrToken.create).not.toHaveBeenCalled();
+      // clearAllMocks 不清 mockResolvedValue:别把关闭态留给后面的用例。
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
     });
 
     it('rejects CIRCLE tokens for disabled circles', async () => {
@@ -395,6 +434,25 @@ describe('QrService', () => {
         'u1',
         'conv-1',
       );
+    });
+
+    it('refuses circle QR joins once the circle conversation switched QR joining off', async () => {
+      prisma.qrToken.findUnique.mockResolvedValue({
+        type: 'CIRCLE',
+        targetID: 'circle-1',
+        issuerID: 'issuer-1',
+        revokedAt: null,
+        expiresAt: new Date(Date.now() + 1000_000),
+      });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        qrJoinEnabled: false,
+      });
+
+      await expect(service.joinByToken('u1', 'tok')).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+      });
+      expect(circleInvitation.invite).not.toHaveBeenCalled();
+      prisma.chatConversation.findUnique.mockResolvedValue(null);
     });
 
     it('joins a circle through the invitation flow with issuer as inviter', async () => {

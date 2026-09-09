@@ -71,6 +71,19 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
   60s–30d,null = 直到解除)。发消息时命中 `CHAT_MEMBER_SILENCED`。
   词汇:代码里 mute = 免打扰,silence = 禁言;`muteAllAt` 是更早的管理台全员禁言。
 
+### 群设置第二批(2026-09-09)
+
+- `PATCH /api/v1/chat/conversations/:id/mute-all` `{enabled}` — 全员禁言开关(两种群;群主/管理员豁免,
+  独立群按 ownerID + 座位管理员)。
+- `POST /api/v1/chat/conversations/:id/owner` `{userId}` — 独立群群主转让(新群主座位 role/禁言清零,原群主降为普通成员)。
+- `PATCH /api/v1/chat/conversations/:id/notice` `{notice}` / `PATCH …/avatar` `{avatarUrl}` — 独立群公告与头像
+  (圈子群走圈子详情;头像 URL 必须来自本应用存储)。
+- `PATCH /api/v1/chat/conversations/:id/policies` `{memberCanInvite?, qrJoinEnabled?, membersCanViewProfiles?, membersCanAddFriends?}`
+  — 群策略开关;圈子群的 memberCanInvite 写在 Circle。闸门:独立群邀请 `CHAT_GROUP_INVITE_DISABLED`、
+  群码签发与扫码入群 `CHAT_GROUP_QR_JOIN_DISABLED`、加好友请求带 `viaConversationId` 时 `FRIEND_GROUP_ADD_FORBIDDEN`。
+- 会话 DTO 新增 `muteAll` / `notice` / `avatarUrl` / `memberLimit` / `myRole` / `policies`;圈子会话的
+  `membersCanViewProfiles` 默认 false(圈子成员目录原本只对圈主/管理员开放)。
+
 ## 防刷
 
 每 socket 滑动窗口:send 20/10s、read 30/10s、typing 10/5s

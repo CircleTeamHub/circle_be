@@ -995,6 +995,37 @@ describe('ChatService', () => {
       });
     });
 
+    it('mute-all blocks ordinary standalone members but not the owner or admins', async () => {
+      const mutedGroup = (overrides: Record<string, unknown>) =>
+        membership({
+          ...overrides,
+          conversation: {
+            ...membership().conversation,
+            muteAllAt: new Date(),
+            ownerID: 'owner-9',
+          },
+        });
+      prisma.chatMember.findUnique.mockResolvedValue(
+        mutedGroup({ role: 'MEMBER' }),
+      );
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.ConversationMuted },
+      });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+
+      prisma.chatMember.findUnique.mockResolvedValue(
+        mutedGroup({ role: 'ADMIN' }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+      const result = await service.sendMessage('u1', sendPayload());
+      expect(result.message.id).toBe('msg-1');
+    });
+
     it('lets an expired timed silence send again', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({

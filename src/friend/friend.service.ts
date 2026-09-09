@@ -174,6 +174,8 @@ export class FriendService {
       photos?: string[];
       permission?: FriendPermission;
       qrToken?: string;
+      /** 从群成员资料发起:该群关闭「成员可添加好友」且申请人不是群主/管理员时拒绝。 */
+      viaConversationId?: string;
     },
   ): Promise<void> {
     if (senderId === targetId) {
@@ -181,6 +183,12 @@ export class FriendService {
         message: 'You cannot add yourself as a friend',
         errorCode: FriendErrorCode.SelfAdd,
       });
+    }
+    if (extras?.viaConversationId) {
+      await this.assertGroupAllowsFriendRequests(
+        extras.viaConversationId,
+        senderId,
+      );
     }
 
     // Make sure the target user exists and is active
@@ -2073,6 +2081,62 @@ export class FriendService {
       throw new ForbiddenException({
         message: `Friend limit reached (${limit}). Upgrade to MEMBER for a higher limit.`,
         errorCode: FriendErrorCode.LimitReached,
+      });
+    }
+  }
+
+  /**
+   * 「成员可添加好友」是群策略:申请人经由某个群的成员资料发起加好友时,
+   * 该群关着这个开关且申请人不是群主/管理员 → 拒绝。不在座/不是群会话则与群无关,
+   * 按普通加好友处理(不额外放行也不额外拦截)。
+   */
+  private async assertGroupAllowsFriendRequests(
+    conversationId: string,
+    senderId: string,
+  ): Promise<void> {
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: senderId,
+        },
+      },
+      select: {
+        role: true,
+        leftAt: true,
+        conversation: {
+          select: {
+            type: true,
+            circleID: true,
+            ownerID: true,
+            membersCanAddFriends: true,
+          },
+        },
+      },
+    });
+    if (!seat || seat.leftAt || seat.conversation.type !== 'GROUP') return;
+    if (seat.conversation.membersCanAddFriends) return;
+    let manager: boolean;
+    if (seat.conversation.circleID) {
+      const membership = await this.prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: senderId,
+            circleID: seat.conversation.circleID,
+          },
+        },
+        select: { role: true, status: true },
+      });
+      manager =
+        membership?.status === 'ACTIVE' &&
+        (membership.role === 'OWNER' || membership.role === 'ADMIN');
+    } else {
+      manager = seat.conversation.ownerID === senderId || seat.role === 'ADMIN';
+    }
+    if (!manager) {
+      throw new ForbiddenException({
+        message: '该群不允许成员互加好友',
+        errorCode: FriendErrorCode.GroupAddForbidden,
       });
     }
   }

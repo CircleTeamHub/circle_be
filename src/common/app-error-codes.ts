@@ -238,6 +238,8 @@ export const FriendErrorCode = {
   RequestMessageInvalid: 'FRIEND_REQUEST_MESSAGE_INVALID',
   RequestMessageLimit: 'FRIEND_REQUEST_MESSAGE_LIMIT',
   RequestNotPending: 'FRIEND_REQUEST_NOT_PENDING',
+  // 从群里加好友:该群关闭了「成员可添加好友」,且申请人不是群主/管理员。
+  GroupAddForbidden: 'FRIEND_GROUP_ADD_FORBIDDEN',
   RequestAlreadyHandled: 'FRIEND_REQUEST_ALREADY_HANDLED',
   // 对方开放的「可通过 X 添加我」路径，没有一条对本次请求成立。与
   // FRIEND_STRANGER_MSG_NOT_ALLOWED 分开：那个是「不收陌生人消息」，这个是
@@ -352,6 +354,11 @@ export const ChatErrorCode = {
   // 客户端文案是「你已被禁言」而不是「该群已被禁言」)。
   MemberSilenced: 'CHAT_MEMBER_SILENCED',
   SilenceDurationInvalid: 'CHAT_SILENCE_DURATION_INVALID',
+  // 进群允许方式:群主关掉了成员邀请 / 群二维码入群。
+  GroupInviteDisabled: 'CHAT_GROUP_INVITE_DISABLED',
+  GroupQrJoinDisabled: 'CHAT_GROUP_QR_JOIN_DISABLED',
+  // 独立群头像只接受本应用存储的 URL(与圈子头像同一条线)。
+  GroupAvatarUrlInvalid: 'CHAT_GROUP_AVATAR_URL_INVALID',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /

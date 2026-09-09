@@ -2064,8 +2064,21 @@ model ChatConversation {
   ownerID    String?
   /// 会话列表排序依据；发送事务内更新。
   lastMessageAt DateTime?
-  /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
+  /// 全员禁言（管理台或群主/管理员开启;圈主/管理员、独立群群主/管理员豁免）；null=未禁言。
   muteAllAt     DateTime?
+  /// 独立群聊公告（圈子群走 Circle.description）。
+  notice        String?
+  /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
+  avatarUrl     String?
+  /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
+  memberCanInvite Boolean @default(true)
+  /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
+  qrJoinEnabled Boolean @default(true)
+  /// 普通成员能否从群里打开其他成员的资料（两种群;群主/管理员不受限）。
+  /// 圈子群建会话时置 false:圈子成员目录原本只对圈主/管理员开放,默认不放宽。
+  membersCanViewProfiles Boolean @default(true)
+  /// 普通成员能否通过群加其他成员为好友（两种群;群主/管理员不受限）。
+  membersCanAddFriends Boolean @default(true)
   /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
   burnDurationSec Int?
   /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；

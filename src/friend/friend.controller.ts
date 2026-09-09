@@ -161,6 +161,7 @@ export class FriendController {
         photos: dto.photos,
         permission: dto.permission,
         qrToken: dto.qrToken,
+        viaConversationId: dto.viaConversationId,
       },
     );
   }

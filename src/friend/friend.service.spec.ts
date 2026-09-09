@@ -88,7 +88,11 @@ describe('FriendService', () => {
       count: jest.fn().mockResolvedValue(0),
     },
     // addMeByGroup 的服务端佐证：双方是否同在一个圈子。
+    chatMember: {
+      findUnique: jest.fn(),
+    },
     circleMember: {
+      findUnique: jest.fn(),
       findFirst: jest.fn().mockResolvedValue(null),
     },
     $executeRaw: jest.fn(),
@@ -268,6 +272,72 @@ describe('FriendService', () => {
         where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
       }),
     );
+  });
+
+  it('refuses a request routed through a group that forbids member friend requests', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.chatMember.findUnique.mockResolvedValue({
+      role: 'MEMBER',
+      leftAt: null,
+      conversation: {
+        type: 'GROUP',
+        circleID: null,
+        ownerID: 'owner-9',
+        membersCanAddFriends: false,
+      },
+    });
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello', undefined, undefined, {
+        viaConversationId: 'conv-1',
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: FriendErrorCode.GroupAddForbidden },
+    });
+    expect(prisma.friend.create).not.toHaveBeenCalled();
+
+    // 群主/管理员不受这个开关限制;圈子群按圈子角色判。
+    prisma.chatMember.findUnique.mockResolvedValue({
+      role: 'MEMBER',
+      leftAt: null,
+      conversation: {
+        type: 'GROUP',
+        circleID: 'circle-1',
+        ownerID: null,
+        membersCanAddFriends: false,
+      },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      role: 'ADMIN',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    await service.sendRequest(
+      'user-1',
+      'user-2',
+      'hello',
+      undefined,
+      undefined,
+      {
+        viaConversationId: 'conv-1',
+      },
+    );
+    expect(prisma.friend.create).toHaveBeenCalled();
   });
 
   it('creates mirrored friend activities when sending a request', async () => {

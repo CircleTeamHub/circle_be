@@ -19,6 +19,8 @@ import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import {
+  circleGroupRole,
+  type GroupRole,
   isGroupManager,
   isSeatSilenced,
   silencedUntilOf,
@@ -54,6 +56,7 @@ import {
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
+  ChatGroupPoliciesDto,
   ChatMemberDto,
   ChatMutationsPageDto,
   HistoryFilters,
@@ -61,6 +64,28 @@ import type {
   ChatSenderInfo,
   ChatSendPayload,
 } from './chat.types';
+
+/** 圈子群在会话 DTO 上的展示信息(+ 成员邀请开关,策略 DTO 要用)。 */
+type CircleInfo = {
+  id: string;
+  name: string;
+  avatarUrl: string | null;
+  memberCanInvite: boolean;
+};
+
+/** 会话 DTO 上只有 GROUP 才有的那组字段(全员禁言/公告/头像/上限/本人角色/策略)。 */
+type GroupFacets = Pick<
+  ChatConversationDto,
+  'muteAll' | 'notice' | 'avatarUrl' | 'memberLimit' | 'myRole' | 'policies'
+>;
+const NON_GROUP_FACETS: GroupFacets = {
+  muteAll: false,
+  notice: null,
+  avatarUrl: null,
+  memberLimit: null,
+  myRole: null,
+  policies: null,
+};
 
 interface SendResult {
   message: ChatMessageDto;
@@ -270,7 +295,7 @@ export class ChatService {
       });
     }
     if (conversation.type === 'GROUP' && conversation.muteAllAt) {
-      await this.assertNotMutedAll(conversation, senderUserId);
+      await this.assertNotMutedAll(conversation, senderUserId, senderSeat);
     }
     if (conversation.type === 'TEMP') {
       await this.assertTempChatActive(conversation);
@@ -792,7 +817,10 @@ export class ChatService {
       return this.strictestCutoff(viewerCutoff, burnCutoff);
     });
 
-    const [lastMessages, unreadCounts, peers, circles, tempChats] =
+    const circleIds = memberships
+      .map((m) => m.conversation.circleID)
+      .filter((id): id is string => id !== null);
+    const [lastMessages, unreadCounts, peers, circles, tempChats, circleRoles] =
       await Promise.all([
         this.loadLastMessages(conversationIds, cutoffs),
         this.loadUnreadCounts(
@@ -809,16 +837,13 @@ export class ChatService {
           cutoffs,
         ),
         this.loadDirectPeers(userId, directIds),
-        this.loadCircleInfos(
-          memberships
-            .map((m) => m.conversation.circleID)
-            .filter((id): id is string => id !== null),
-        ),
+        this.loadCircleInfos(circleIds),
         this.loadTempChatInfos(
           memberships
             .map((m) => m.conversation.tempChatID)
             .filter((id): id is string => id !== null),
         ),
+        this.loadCircleRoles(userId, circleIds),
       ]);
 
     const senderIds = [...lastMessages.values()]
@@ -860,6 +885,16 @@ export class ChatService {
         muted: m.muted,
         silenced: isSeatSilenced(m),
         silencedUntil: silencedUntilOf(m),
+        ...this.groupFacets(
+          m.conversation,
+          m,
+          m.conversation.circleID
+            ? (circles.get(m.conversation.circleID) ?? null)
+            : null,
+          m.conversation.circleID
+            ? (circleRoles.get(m.conversation.circleID) ?? null)
+            : null,
+        ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
       };
@@ -985,9 +1020,11 @@ export class ChatService {
           id: string;
           type: string;
           circleID: string | null;
+          ownerID: string | null;
+          memberCanInvite: boolean;
           clearedBeforeHeight: number;
         }>
-      >`SELECT "id", "type", "circleID", "clearedBeforeHeight"
+      >`SELECT "id", "type", "circleID", "ownerID", "memberCanInvite", "clearedBeforeHeight"
         FROM "ChatConversation"
         WHERE "id" = ${conversation.id} FOR UPDATE`;
       if (
@@ -1008,12 +1045,28 @@ export class ChatService {
             userID: userId,
           },
         },
-        select: { leftAt: true },
+        select: { leftAt: true, role: true },
       });
       if (!actorSeat || actorSeat.leftAt) {
         throw new ForbiddenException({
           message: '不是会话成员',
           errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      // 「成员邀请」关着时只有群主/管理员能拉人(锁后快照,与策略写串行)。
+      if (
+        locked[0].memberCanInvite === false &&
+        !isGroupManager(
+          standaloneGroupRole(locked[0].ownerID ?? null, {
+            userID: userId,
+            role: actorSeat.role,
+            leftAt: actorSeat.leftAt,
+          }),
+        )
+      ) {
+        throw new ForbiddenException({
+          message: '该群已关闭成员邀请',
+          errorCode: ChatErrorCode.GroupInviteDisabled,
         });
       }
       await this.assertInviteTargetsAllowed(tx, userId, invitees);
@@ -1108,9 +1161,10 @@ export class ChatService {
           id: string;
           type: string;
           circleID: string | null;
+          qrJoinEnabled: boolean;
           clearedBeforeHeight: number;
         }>
-      >`SELECT "id", "type", "circleID", "clearedBeforeHeight"
+      >`SELECT "id", "type", "circleID", "qrJoinEnabled", "clearedBeforeHeight"
         FROM "ChatConversation"
         WHERE "id" = ${conversationId} FOR UPDATE`;
       if (
@@ -1121,6 +1175,13 @@ export class ChatService {
         throw new NotFoundException({
           message: '群聊不存在',
           errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      // 群主关掉「二维码入群」后,已签发的群码一并失效(闸在入群这一侧,锁后读)。
+      if (locked[0].qrJoinEnabled === false) {
+        throw new ForbiddenException({
+          message: '该群已关闭二维码入群',
+          errorCode: ChatErrorCode.GroupQrJoinDisabled,
         });
       }
       const existing = await tx.chatMember.findFirst({
@@ -1689,12 +1750,12 @@ export class ChatService {
       );
       await this.media.attachMediaUrls([lastMessage]);
     }
-    const circles = member.conversation.circleID
-      ? await this.loadCircleInfos([member.conversation.circleID])
-      : new Map<
-          string,
-          { id: string; name: string; avatarUrl: string | null }
-        >();
+    const [circles, circleRoles] = member.conversation.circleID
+      ? await Promise.all([
+          this.loadCircleInfos([member.conversation.circleID]),
+          this.loadCircleRoles(userId, [member.conversation.circleID]),
+        ])
+      : [new Map<string, CircleInfo>(), new Map<string, GroupRole>()];
     return {
       id: conversationId,
       type: member.conversation.type,
@@ -1714,9 +1775,77 @@ export class ChatService {
       muted: member.muted,
       silenced: isSeatSilenced(member),
       silencedUntil: silencedUntilOf(member),
+      ...this.groupFacets(
+        member.conversation,
+        member,
+        member.conversation.circleID
+          ? (circles.get(member.conversation.circleID) ?? null)
+          : null,
+        member.conversation.circleID
+          ? (circleRoles.get(member.conversation.circleID) ?? null)
+          : null,
+      ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
     };
+  }
+
+  /**
+   * GROUP 会话独有的那组字段。独立群聊全部读会话行;圈子群的公告/头像/上限走圈子
+   * 详情(这里给 null),成员邀请开关读 Circle.memberCanInvite,本人角色读 CircleMember。
+   */
+  private groupFacets(
+    conversation: ChatConversation,
+    seat: { userID: string; role: ChatMember['role']; leftAt: Date | null },
+    circle: { memberCanInvite: boolean } | null,
+    circleRole: GroupRole | null,
+  ): GroupFacets {
+    if (conversation.type !== 'GROUP') return NON_GROUP_FACETS;
+    const standalone = conversation.circleID === null;
+    const policies: ChatGroupPoliciesDto = {
+      memberCanInvite: standalone
+        ? conversation.memberCanInvite
+        : (circle?.memberCanInvite ?? true),
+      qrJoinEnabled: conversation.qrJoinEnabled,
+      membersCanViewProfiles: conversation.membersCanViewProfiles,
+      membersCanAddFriends: conversation.membersCanAddFriends,
+    };
+    return {
+      muteAll: conversation.muteAllAt !== null,
+      notice: standalone ? (conversation.notice ?? null) : null,
+      avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
+      memberLimit: standalone ? STANDALONE_GROUP_MAX_MEMBERS : null,
+      myRole: standalone
+        ? standaloneGroupRole(conversation.ownerID, seat)
+        : circleRole,
+      policies,
+    };
+  }
+
+  /** 本人在这些圈子里的 ACTIVE 角色(圈子群的 myRole)。 */
+  private async loadCircleRoles(
+    userId: string,
+    circleIds: string[],
+  ): Promise<Map<string, GroupRole>> {
+    const unique = [...new Set(circleIds)];
+    if (unique.length === 0) return new Map();
+    const rows = await this.prisma.circleMember.findMany({
+      where: { userID: userId, circleID: { in: unique }, status: 'ACTIVE' },
+      select: { circleID: true, role: true },
+    });
+    return new Map(
+      rows
+        .map(
+          (row) =>
+            [
+              row.circleID,
+              circleGroupRole({ role: row.role, status: 'ACTIVE' }),
+            ] as const,
+        )
+        .filter(
+          (entry): entry is readonly [string, GroupRole] => entry[1] !== null,
+        ),
+    );
   }
 
   /**
@@ -2472,9 +2601,10 @@ export class ChatService {
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
       muted: mine?.muted ?? false,
-      // 单聊没有禁言。
+      // 单聊没有禁言,也没有群那组字段。
       silenced: false,
       silencedUntil: null,
+      ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
     };
@@ -2737,8 +2867,24 @@ export class ChatService {
   private async assertNotMutedAll(
     conversation: ChatConversation,
     senderUserId: string,
+    senderSeat: {
+      userID: string;
+      role: ChatMember['role'];
+      leftAt: Date | null;
+    },
   ): Promise<void> {
-    if (!conversation.circleID) return;
+    if (!conversation.circleID) {
+      // 独立群聊:群主与座位上的管理员豁免。
+      if (
+        !isGroupManager(standaloneGroupRole(conversation.ownerID, senderSeat))
+      ) {
+        throw new ForbiddenException({
+          message: '该群已被禁言',
+          errorCode: ChatErrorCode.ConversationMuted,
+        });
+      }
+      return;
+    }
     const membership = await this.prisma.circleMember.findUnique({
       where: {
         userID_circleID: {
@@ -2841,23 +2987,26 @@ export class ChatService {
       }
     }
 
-    if (
-      conversation.type === 'GROUP' &&
-      conversation.muteAllAt &&
-      conversation.circleID
-    ) {
-      const membership = await tx.circleMember.findUnique({
-        where: {
-          userID_circleID: {
-            userID: senderUserId,
-            circleID: conversation.circleID,
+    if (conversation.type === 'GROUP' && conversation.muteAllAt) {
+      let exempt: boolean;
+      if (conversation.circleID) {
+        const membership = await tx.circleMember.findUnique({
+          where: {
+            userID_circleID: {
+              userID: senderUserId,
+              circleID: conversation.circleID,
+            },
           },
-        },
-        select: { role: true, status: true },
-      });
-      const exempt =
-        membership?.status === 'ACTIVE' &&
-        (membership.role === 'OWNER' || membership.role === 'ADMIN');
+          select: { role: true, status: true },
+        });
+        exempt =
+          membership?.status === 'ACTIVE' &&
+          (membership.role === 'OWNER' || membership.role === 'ADMIN');
+      } else {
+        exempt = isGroupManager(
+          standaloneGroupRole(conversation.ownerID, seat),
+        );
+      }
       if (!exempt) {
         throw new ForbiddenException({
           message: '该群已被禁言',
@@ -2993,19 +3142,22 @@ export class ChatService {
   /** GROUP 会话的圈子展示信息(群名/群头像来源)。 */
   private async loadCircleInfos(
     circleIds: string[],
-  ): Promise<
-    Map<string, { id: string; name: string; avatarUrl: string | null }>
-  > {
+  ): Promise<Map<string, CircleInfo>> {
     const unique = [...new Set(circleIds)];
     if (unique.length === 0) return new Map();
     const circles = await this.prisma.circle.findMany({
       where: { id: { in: unique } },
-      select: { id: true, name: true, avatarUrl: true },
+      select: { id: true, name: true, avatarUrl: true, memberCanInvite: true },
     });
     return new Map(
       circles.map((c) => [
         c.id,
-        { id: c.id, name: c.name, avatarUrl: c.avatarUrl },
+        {
+          id: c.id,
+          name: c.name,
+          avatarUrl: c.avatarUrl,
+          memberCanInvite: c.memberCanInvite,
+        },
       ]),
     );
   }
