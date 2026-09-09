@@ -18,7 +18,6 @@ import {
   ValidateIf,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { MAX_PAGE } from 'src/common/pagination';
 
 const MY_CIRCLE_TABS = ['joined', 'created', 'applied'] as const;
 const URL_VALIDATION_OPTIONS = {
@@ -264,29 +263,6 @@ export class UpdateCircleDto {
   @IsBoolean()
   @ValidateIf((_object, value) => value !== undefined)
   memberCanInvite?: boolean;
-}
-
-export class ListCirclesQueryDto {
-  @ApiPropertyOptional()
-  @IsString()
-  @IsOptional()
-  city?: string;
-
-  @ApiPropertyOptional({ default: 1 })
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(MAX_PAGE)
-  @IsOptional()
-  page?: number;
-
-  @ApiPropertyOptional({ default: 20 })
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(100)
-  @IsOptional()
-  limit?: number;
 }
 
 export class MyCirclesQueryDto {
