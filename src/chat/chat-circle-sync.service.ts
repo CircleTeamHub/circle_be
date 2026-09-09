@@ -15,7 +15,7 @@ import { ChatSystemMessageService } from './chat-system-message.service';
  * 默认拒绝(宁可晚一分钟恢复,也不要在停用窗口里把门开着)。
  */
 /** 圈子座位对账的 advisory lock 命名空间(与 chat 的其它锁不撞)。 */
-const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
+export const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
 
 const DISABLED_ADMIN_STATES = new Set<string>([
   'DISABLING',

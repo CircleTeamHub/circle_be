@@ -28,7 +28,10 @@ import {
   CIRCLE_CREATE_LIMIT,
   GROUP_CAPACITY_HARD_LIMIT,
 } from './circle-limits';
-import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import {
+  CIRCLE_SYNC_LOCK_NAMESPACE,
+  ChatCircleSyncService,
+} from 'src/chat/chat-circle-sync.service';
 import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import { CircleMemberLockService } from './circle-member-lock';
@@ -498,6 +501,11 @@ export class CircleService {
       // 招新策略的写与建单方的读串行化:成员锁两边不相交,不加这把的话
       // 「收严已返回成功」之后仍会有读到旧策略的担保单提交进来。
       await this.memberLock.lockPolicy(tx, circleId);
+      // Serialize with ChatCircleSyncService.ensureCircleConversation. The
+      // policy lock alone is different from the sync lock, so without this
+      // shared lock an ensure that already read ACTIVE could re-seat members
+      // after this transaction marks the circle deleted.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
 
       const membership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },
