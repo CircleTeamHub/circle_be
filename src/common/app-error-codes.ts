@@ -107,6 +107,9 @@ export const CircleErrorCode = {
   AvatarUrlInvalid: 'CIRCLE_AVATAR_URL_INVALID',
   AlreadyMemberOrPending: 'CIRCLE_ALREADY_MEMBER_OR_PENDING',
   OwnerCannotLeave: 'CIRCLE_OWNER_CANNOT_LEAVE',
+  // 解散是不可逆的全圈操作(圈子从所有成员的列表里消失、群聊全员离座),
+  // 只有圈主能按 —— 管理员连同普通成员一律拒绝。
+  OwnerOnlyDissolve: 'CIRCLE_OWNER_ONLY_DISSOLVE',
   JoinVipRequired: 'CIRCLE_JOIN_VIP_REQUIRED',
   JoinCreditRequired: 'CIRCLE_JOIN_CREDIT_REQUIRED',
   JoinFancyNumberRequired: 'CIRCLE_JOIN_FANCY_NUMBER_REQUIRED',

@@ -2861,6 +2861,58 @@ describe('ChatService', () => {
       });
     });
 
+    it('standalone GROUP lets the owner set it (no circle role exists there)', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u1',
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: 3600,
+      });
+
+      const result = await service.setBurnDuration('u1', 'conv-1', 3600);
+
+      expect(result).toEqual({ burnDurationSec: 3600 });
+      // 独立群聊没有 CircleMember 表可查,不该去查。
+      expect(prisma.circleMember.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('standalone GROUP rejects a plain member', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          userID: 'u2',
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            ownerID: 'u1',
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+
+      await expect(
+        service.setBurnDuration('u2', 'conv-1', 3600),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
+      });
+    });
+
     it('TEMP conversations reject the toggle (guest retention = room lifetime)', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({

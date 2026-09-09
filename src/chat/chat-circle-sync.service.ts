@@ -15,7 +15,7 @@ import { ChatSystemMessageService } from './chat-system-message.service';
  * 默认拒绝(宁可晚一分钟恢复,也不要在停用窗口里把门开着)。
  */
 /** 圈子座位对账的 advisory lock 命名空间(与 chat 的其它锁不撞)。 */
-const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
+export const CIRCLE_SYNC_LOCK_NAMESPACE = 7302;
 
 const DISABLED_ADMIN_STATES = new Set<string>([
   'DISABLING',
@@ -158,6 +158,20 @@ export class ChatCircleSyncService {
       // 快照里把同一个人算进 toJoin —— 于是 joined 事件播两遍、进群系统提示
       // 也写两条。谁先拿到锁谁做,后来者在锁后重读座位,toJoin 自然是空的。
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
+      // The initial read is only a fast path. Recheck after taking the same
+      // per-circle lock used by dissolve/disable so a concurrent state change
+      // cannot let ACTIVE members re-seat into a deleted circle.
+      const lockedCircle = await tx.circle.findUnique({
+        where: { id: circleId },
+        select: { deleted: true, adminState: true },
+      });
+      if (
+        !lockedCircle ||
+        lockedCircle.deleted ||
+        DISABLED_ADMIN_STATES.has(lockedCircle.adminState)
+      ) {
+        return null;
+      }
       let created = false;
       // clearedBeforeHeight 要一并读出来：新座位得继承它，否则「删除所有人的
       // 记录」藏起来的历史对圈子新成员整段可见。
@@ -249,6 +263,14 @@ export class ChatCircleSyncService {
 
       return { conversationId: conversation.id, toJoin, toRemove, created };
     });
+
+    if (!result) {
+      // State changed while waiting for the lock. Evict seats after the
+      // transaction commits, using the same idempotent cleanup as the fast
+      // path above.
+      await this.evictAllSeats(circleId);
+      return null;
+    }
 
     // 座位变更后的在线房间对齐(尽力而为;掉线成员重连时按座位重新派生)。
     //

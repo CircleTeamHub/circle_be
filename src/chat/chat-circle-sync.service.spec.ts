@@ -106,6 +106,31 @@ describe('ChatCircleSyncService', () => {
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
+  it('rechecks circle state after the lock before re-seating members', async () => {
+    prisma.circle.findUnique
+      .mockResolvedValueOnce({
+        id: 'circle-1',
+        deleted: false,
+        adminState: 'ACTIVE',
+      })
+      .mockResolvedValueOnce({
+        id: 'circle-1',
+        deleted: true,
+        adminState: 'ACTIVE',
+      });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+
+    await expect(
+      service.ensureCircleConversation('circle-1'),
+    ).resolves.toBeNull();
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      data: { leftAt: expect.any(Date) },
+    });
+    expect(prisma.chatMember.createMany).not.toHaveBeenCalled();
+  });
+
   it('creates the conversation and seats every ACTIVE member', async () => {
     prisma.circle.findUnique.mockResolvedValue({
       id: 'circle-1',

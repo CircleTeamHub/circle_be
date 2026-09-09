@@ -141,6 +141,21 @@ export class ChatController {
     );
   }
 
+  @Post('conversations/:id/dissolve')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '独立群聊:群主解散(全员离座 + 全员聊天记录一并清空,不可逆)',
+  })
+  dissolveGroupConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<void> {
+    return this.chatService.dissolveGroupConversation(
+      req.user.userId,
+      conversationId,
+    );
+  }
+
   @Patch('conversations/:id/name')
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
   @ApiOperation({ summary: '独立群聊:改群名(任一在座成员)' })

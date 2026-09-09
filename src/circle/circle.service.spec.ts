@@ -433,6 +433,148 @@ describe('CircleService', () => {
     });
   });
 
+  // ——— DELETE /circle/:id(圈主解散) ———————————————————————————————
+
+  describe('dissolveCircle', () => {
+    // circle.findFirst 在这条路径上被调用两次(鉴权前 + 锁后复查),用例之间
+    // 靠 mockResolvedValueOnce 排队。外层的 clearAllMocks 只清调用记录、不清
+    // 排队里没被消费掉的返回值 —— 一个提前抛错的用例会把剩下的那一个漏给
+    // 下一个用例。这里显式 reset,保证用例互不影响、与顺序无关。
+    beforeEach(() => {
+      prisma.circle.findFirst.mockReset();
+      prisma.circleMember.findUnique.mockReset();
+    });
+
+    /** 圈主 + 圈子仍在:两次 findFirst 都放行。 */
+    function stubOwnedLiveCircle() {
+      prisma.circle.findFirst
+        .mockResolvedValueOnce({ id: 'circle-1', ownerID: 'user-1' })
+        .mockResolvedValueOnce({ id: 'circle-1' });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+    }
+
+    it('dissolves a circle for its owner and evicts every chat seat', async () => {
+      stubOwnedLiveCircle();
+
+      await service.dissolveCircle('user-1', 'circle-1');
+
+      expect(prisma.circle.update).toHaveBeenCalledWith({
+        where: { id: 'circle-1' },
+        data: { deleted: true },
+      });
+      // 在飞担保单作废 + 佩戴中的圈子图标摘掉。
+      expect(prisma.circleInvitation.updateMany).toHaveBeenCalledWith({
+        where: { circleID: 'circle-1', status: 'PENDING' },
+        data: { status: 'CANCELLED' },
+      });
+      expect(prisma.userDisplayIcon.deleteMany).toHaveBeenCalledWith({
+        where: { circleID: 'circle-1' },
+      });
+      // 座位是派生态:deleted 落库之后靠它把全员离座并广播 removed。
+      expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
+        'circle-1',
+      );
+    });
+
+    // adminState 是管理台的停用溯源字段(恢复接口靠它判定「是不是管理员停的」)。
+    // 圈主解散写进去,管理台就会把一个自愿解散的圈子当成自己停用的、允许恢复。
+    it('leaves adminState untouched when the owner dissolves', async () => {
+      stubOwnedLiveCircle();
+
+      await service.dissolveCircle('user-1', 'circle-1');
+
+      const [update] = prisma.circle.update.mock.calls;
+      expect(Object.keys(update[0].data)).toEqual(['deleted']);
+    });
+
+    it('rejects a dissolve from someone who is not the owner', async () => {
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        ownerID: 'owner-9',
+      });
+
+      await expect(
+        service.dissolveCircle('user-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.OwnerOnlyDissolve },
+      });
+      expect(prisma.circle.update).not.toHaveBeenCalled();
+      expect(chatCircleSync.ensureCircleConversation).not.toHaveBeenCalled();
+    });
+
+    // 圈主身份要在锁后复查:不复查的话「转让圈主」与「解散」可以各自提交,
+    // 刚交出圈主的人仍然把圈子解散得掉。
+    it('re-reads membership under the lock before dissolving', async () => {
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        ownerID: 'user-1',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'ADMIN',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.dissolveCircle('user-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.OwnerOnlyDissolve },
+      });
+      expect(memberLock.lock).toHaveBeenCalledWith(prisma, 'circle-1', [
+        'user-1',
+      ]);
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circleMember.findUnique.mock.invocationCallOrder[0],
+      );
+      expect(prisma.circle.update).not.toHaveBeenCalled();
+    });
+
+    it('404s when the circle is already gone', async () => {
+      prisma.circle.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.dissolveCircle('user-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.NotFound },
+      });
+    });
+
+    // 锁后复查圈子本身:并发的第二次解散(或管理台停用)已经赢了这一局时,
+    // 不能再落一次 deleted、再广播一轮 removed。
+    it('404s when a concurrent dissolve won the race', async () => {
+      prisma.circle.findFirst
+        .mockResolvedValueOnce({ id: 'circle-1', ownerID: 'user-1' })
+        .mockResolvedValueOnce(null);
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+
+      await expect(
+        service.dissolveCircle('user-1', 'circle-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: CircleErrorCode.NotFound },
+      });
+      expect(prisma.circle.update).not.toHaveBeenCalled();
+    });
+
+    // 座位清理是尽力而为:它失败不能把已经落库的解散反吐成 500 —— 客户端
+    // 会以为没解散成功而重试,而圈子其实已经没了。
+    it('still succeeds when seat eviction fails after the commit', async () => {
+      stubOwnedLiveCircle();
+      chatCircleSync.ensureCircleConversation.mockRejectedValueOnce(
+        new Error('broadcast down'),
+      );
+
+      await expect(
+        service.dissolveCircle('user-1', 'circle-1'),
+      ).resolves.toBeUndefined();
+      expect(prisma.circle.update).toHaveBeenCalled();
+    });
+  });
+
   it('rejects createCircle with an off-origin avatarUrl when MinIO is configured', async () => {
     const guarded = new CircleService(
       prisma as any,
