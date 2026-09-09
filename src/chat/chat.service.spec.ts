@@ -2909,7 +2909,7 @@ describe('ChatService', () => {
       await expect(
         service.setBurnDuration('u2', 'conv-1', 3600),
       ).rejects.toMatchObject({
-        response: { errorCode: 'CHAT_GROUP_MANAGER_ONLY' },
+        response: { errorCode: 'GROUP_MANAGER_ONLY' },
       });
     });
 
