@@ -31,6 +31,7 @@ import {
   SetGroupAvatarDto,
   SetGroupMuteAllDto,
   SetGroupNoticeDto,
+  SetMyGroupAliasDto,
   TransferGroupOwnerDto,
   UpdateGroupPoliciesDto,
 } from './dto/group-settings.dto';
@@ -321,6 +322,23 @@ export class ChatController {
       req.user.userId,
       conversationId,
       targetUserId,
+    );
+  }
+
+  @Patch('conversations/:id/my-alias')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '群昵称:改自己在本群的显示名(任一在座成员;空串清除,回落账号昵称)',
+  })
+  setMyGroupAlias(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetMyGroupAliasDto,
+  ): Promise<{ alias: string | null }> {
+    return this.chatService.setMyGroupAlias(
+      req.user.userId,
+      conversationId,
+      body.alias,
     );
   }
 

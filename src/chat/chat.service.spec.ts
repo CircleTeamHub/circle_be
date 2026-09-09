@@ -2286,6 +2286,79 @@ describe('ChatService', () => {
     });
   });
 
+  describe('setMyGroupAlias', () => {
+    const groupSeat = (overrides: Record<string, unknown> = {}) =>
+      membership({
+        id: 'member-1',
+        alias: null,
+        conversation: { ...membership().conversation, type: 'GROUP' },
+        ...overrides,
+      });
+
+    it('stores a trimmed alias on the caller own seat', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(groupSeat());
+      await expect(
+        service.setMyGroupAlias('u1', 'conv-1', '  小方  '),
+      ).resolves.toEqual({ alias: '小方' });
+      expect(prisma.chatMember.update).toHaveBeenCalledWith({
+        where: { id: 'member-1' },
+        data: { alias: '小方' },
+      });
+      // 自助的装饰性改动:不写系统提示、不记群日志。
+      expect(systemMessage.emit).not.toHaveBeenCalled();
+      expect(groupEvents.record).not.toHaveBeenCalled();
+    });
+
+    it('clears the alias on an empty string and is idempotent', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        groupSeat({ alias: '小方' }),
+      );
+      await expect(
+        service.setMyGroupAlias('u1', 'conv-1', '   '),
+      ).resolves.toEqual({
+        alias: null,
+      });
+      expect(prisma.chatMember.update).toHaveBeenCalledWith({
+        where: { id: 'member-1' },
+        data: { alias: null },
+      });
+
+      jest.clearAllMocks();
+      prisma.chatMember.findUnique.mockResolvedValue(
+        groupSeat({ alias: '小方' }),
+      );
+      await expect(
+        service.setMyGroupAlias('u1', 'conv-1', '小方'),
+      ).resolves.toEqual({
+        alias: '小方',
+      });
+      expect(prisma.chatMember.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects non-members and non-group conversations', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+      await expect(
+        service.setMyGroupAlias('u1', 'conv-1', '小方'),
+      ).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.NotMember },
+      });
+
+      prisma.chatMember.findUnique.mockResolvedValue(
+        groupSeat({
+          conversation: { ...membership().conversation, type: 'DIRECT' },
+        }),
+      );
+      await expect(
+        service.setMyGroupAlias('u1', 'conv-1', '小方'),
+      ).rejects.toMatchObject({
+        constructor: BadRequestException,
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+      expect(prisma.chatMember.update).not.toHaveBeenCalled();
+    });
+  });
+
   describe('setConversationPreferences', () => {
     it('updates pinned/muted for the caller seat only', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());

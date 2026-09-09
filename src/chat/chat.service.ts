@@ -1652,6 +1652,40 @@ export class ChatService {
     }
   }
 
+  /**
+   * 群昵称(群备注):本人在这个群里的显示名,对全群可见。空串 = 清除,回落账号昵称。
+   *
+   * 与置顶/免打扰同属「自己座位上的字段」,所以放在这里而不是群管理服务 ——
+   * 它不是管理动作,任何在座成员都能改自己的,不需要群主/管理员。
+   *
+   * 刻意不写系统提示、也不记群日志:改自己的显示名是自助的装饰性操作,
+   * 不是需要复盘的治理事件,逐次广播只会把群日志和时间线刷满。
+   */
+  async setMyGroupAlias(
+    userId: string,
+    conversationId: string,
+    alias: string,
+  ): Promise<{ alias: string | null }> {
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    if (conversation.type !== 'GROUP') {
+      throw new BadRequestException({
+        message: '只有群聊可以设置群昵称',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    const trimmed = alias.trim();
+    const next = trimmed.length > 0 ? trimmed : null;
+    if ((member.alias ?? null) === next) return { alias: next };
+    await this.prisma.chatMember.update({
+      where: { id: member.id },
+      data: { alias: next },
+    });
+    return { alias: next };
+  }
+
   /** 会话偏好(置顶/免打扰/隐藏):每成员独立,替代 OpenIM 的会话属性。 */
   async setConversationPreferences(
     userId: string,
@@ -2692,6 +2726,7 @@ export class ChatService {
         userID: true,
         role: true,
         leftAt: true,
+        alias: true,
         silencedAt: true,
         silencedUntil: true,
       },
@@ -2722,6 +2757,7 @@ export class ChatService {
         return {
           userId: seat.userID,
           nickname: user.nickname,
+          alias: seat.alias ?? null,
           avatarUrl: user.avatarUrl,
           role: roleOf(seat),
           silenced: isSeatSilenced(seat),

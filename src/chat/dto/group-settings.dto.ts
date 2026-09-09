@@ -40,6 +40,19 @@ export class SetGroupAvatarDto {
   avatarUrl!: string;
 }
 
+export const GROUP_ALIAS_MAX_LENGTH = 30;
+
+export class SetMyGroupAliasDto {
+  @ApiProperty({
+    description: '本人在该群的昵称;空串 = 清除,回落账号昵称',
+    maxLength: GROUP_ALIAS_MAX_LENGTH,
+  })
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @MaxLength(GROUP_ALIAS_MAX_LENGTH)
+  alias!: string;
+}
+
 export class UpdateGroupPoliciesDto {
   @ApiPropertyOptional({ description: '普通成员能否拉人进群' })
   @IsOptional()

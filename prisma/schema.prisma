@@ -2119,6 +2119,10 @@ model ChatMember {
   muted          Boolean   @default(false)
   /// 独立群聊的管理员标记(圈子群忽略,见 ChatMemberRole)。退群/被移出时复位。
   role           ChatMemberRole @default(MEMBER)
+  /// 本人在这个群里的昵称（群备注），对全群可见；null = 用账号昵称。
+  /// 与好友备注不同：好友备注是「我给对方起的名字、只有我看得见」，
+  /// 这个是「我给自己起的名字、群里所有人看见」。两者可并存，展示时好友备注优先。
+  alias          String?
   /// 禁言(不能发言;群主/管理员对成员施加)。silencedAt 非空 = 处于禁言,
   /// silencedUntil 空 = 直到解除。词汇约定:代码里 mute = 免打扰,silence = 禁言;
   /// 只有会话上的 muteAllAt / 错误码 CHAT_CONVERSATION_MUTED 是更早的遗留命名。
