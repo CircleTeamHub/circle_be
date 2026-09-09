@@ -17,6 +17,13 @@ import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
+import { ChatGroupEventService } from './chat-group-event.service';
+import {
+  isGroupManager,
+  isSeatSilenced,
+  silencedUntilOf,
+  standaloneGroupRole,
+} from './chat-group-roles';
 import type {
   ChatConversation,
   ChatMember,
@@ -102,6 +109,7 @@ export class ChatService {
     private readonly systemMessage: ChatSystemMessageService,
     private readonly support: SupportService,
     private readonly circleMemberLock: CircleMemberLockService,
+    private readonly groupEvents: ChatGroupEventService,
   ) {}
 
   /**
@@ -249,12 +257,17 @@ export class ChatService {
     payload: ChatSendPayload,
   ): Promise<SendResult> {
     this.validateSendPayload(senderUserId, payload);
-    const conversation = await this.requireMembership(
-      payload.conversationId,
-      senderUserId,
-    );
+    const { conversation, member: senderSeat } =
+      await this.requireMembershipSeat(payload.conversationId, senderUserId);
     if (conversation.type === 'DIRECT') {
       await this.assertDirectNotBlocked(conversation, senderUserId);
+    }
+    // 逐人禁言(群主/管理员对某个成员);全员禁言是下面那道管理台的闸。
+    if (conversation.type === 'GROUP' && isSeatSilenced(senderSeat)) {
+      throw new ForbiddenException({
+        message: '你已被禁言',
+        errorCode: ChatErrorCode.MemberSilenced,
+      });
     }
     if (conversation.type === 'GROUP' && conversation.muteAllAt) {
       await this.assertNotMutedAll(conversation, senderUserId);
@@ -845,6 +858,8 @@ export class ChatService {
         unreadCount: unreadCounts.get(m.conversationID) ?? 0,
         pinned: m.pinned,
         muted: m.muted,
+        silenced: isSeatSilenced(m),
+        silencedUntil: silencedUntilOf(m),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
       };
@@ -939,6 +954,11 @@ export class ChatService {
     void this.systemMessage
       .emit(conversation.id, { kind: 'group-created' })
       .catch(() => undefined);
+    void this.groupEvents.record(conversation.id, {
+      kind: 'group-created',
+      actorId: userId,
+      targetIds: memberIds,
+    });
     return this.buildConversationDto(userId, conversation.id);
   }
 
@@ -1052,6 +1072,11 @@ export class ChatService {
     }
     await this.seatMembersIntoRoom(conversation.id, toJoin);
     void this.emitGroupJoinNotice(conversation.id, toJoin);
+    void this.groupEvents.record(conversation.id, {
+      kind: 'member-joined',
+      actorId: userId,
+      targetIds: toJoin,
+    });
     return this.buildConversationDto(userId, conversation.id);
   }
 
@@ -1149,6 +1174,12 @@ export class ChatService {
     if (!joined) return this.buildConversationDto(userId, conversationId);
     await this.seatMembersIntoRoom(conversationId, [userId]);
     void this.emitGroupJoinNotice(conversationId, [userId]);
+    void this.groupEvents.record(conversationId, {
+      kind: 'member-joined',
+      actorId: userId,
+      targetIds: [userId],
+      payload: { via: 'qr' },
+    });
     return this.buildConversationDto(userId, conversationId);
   }
 
@@ -1161,7 +1192,7 @@ export class ChatService {
       conversationId,
       userId,
     );
-    await this.prisma.$transaction(async (tx) => {
+    const successorId = await this.prisma.$transaction(async (tx) => {
       const locked = await tx.$queryRaw<
         Array<{
           id: string;
@@ -1196,28 +1227,49 @@ export class ChatService {
           errorCode: ChatErrorCode.NotMember,
         });
       }
+      // 座位关闭时复位管理员标记(再被拉回来是普通成员);禁言不复位,
+      // 否则退群再扫码回来等于自助解禁。
       await tx.chatMember.updateMany({
         where: {
           conversationID: conversation.id,
           userID: userId,
           leftAt: null,
         },
-        data: { leftAt: new Date() },
+        data: { leftAt: new Date(), role: 'MEMBER' },
       });
-      if (locked[0].ownerID === userId) {
-        const successor = await tx.chatMember.findFirst({
+      if (locked[0].ownerID !== userId) return null;
+      // 群主退群:优先转给最早入群的管理员,没有管理员再转给最早入群的成员。
+      const successor =
+        (await tx.chatMember.findFirst({
+          where: {
+            conversationID: conversation.id,
+            leftAt: null,
+            role: 'ADMIN',
+          },
+          orderBy: { joinedAt: 'asc' },
+          select: { id: true, userID: true },
+        })) ??
+        (await tx.chatMember.findFirst({
           where: { conversationID: conversation.id, leftAt: null },
           orderBy: { joinedAt: 'asc' },
-          select: { userID: true },
-        });
-        // 最后一人退群:群主字段留着(会话已无在座成员,等价于死会话)。
-        if (successor) {
-          await tx.chatConversation.update({
-            where: { id: conversation.id },
-            data: { ownerID: successor.userID },
-          });
-        }
-      }
+          select: { id: true, userID: true },
+        }));
+      // 最后一人退群:群主字段留着(会话已无在座成员,等价于死会话)。
+      if (!successor) return null;
+      await tx.chatConversation.update({
+        where: { id: conversation.id },
+        data: { ownerID: successor.userID },
+      });
+      // 群主身份由 ownerID 表达,座位上的管理员标记归零,免得两处真值并存。
+      await tx.chatMember.update({
+        where: { id: successor.id },
+        // The new owner must be able to speak and manage the group even if they
+        // were silenced before the transfer. Keeping the old silence state
+        // would leave a permanent owner lock: owners cannot target themselves
+        // through the admin endpoints to clear it.
+        data: { role: 'MEMBER', silencedAt: null, silencedUntil: null },
+      });
+      return successor.userID;
     });
     void this.broadcast
       .removeUserFromConversation(userId, conversation.id)
@@ -1230,6 +1282,25 @@ export class ChatService {
     void this.systemMessage
       .emit(conversation.id, { kind: 'member-left' })
       .catch(() => undefined);
+    void this.groupEvents.record(conversation.id, {
+      kind: 'member-left',
+      actorId: userId,
+      targetIds: [userId],
+    });
+    if (successorId) {
+      void this.emitOwnerTransferredNotice(conversation.id, successorId);
+      void this.groupEvents.record(conversation.id, {
+        kind: 'owner-transferred',
+        actorId: userId,
+        targetIds: [successorId],
+      });
+      // 新群主的会话 DTO 没变,但群设置页的入口要刷新。
+      this.broadcast.emitConversationChange(successorId, {
+        kind: 'updated',
+        conversationId: conversation.id,
+        userId: successorId,
+      });
+    }
   }
 
   /**
@@ -1364,6 +1435,11 @@ export class ChatService {
     void this.systemMessage
       .emit(conversation.id, { kind: 'group-renamed', name: trimmed })
       .catch(() => undefined);
+    void this.groupEvents.record(conversation.id, {
+      kind: 'group-renamed',
+      actorId: userId,
+      payload: { name: trimmed },
+    });
     return this.buildConversationDto(userId, conversation.id);
   }
 
@@ -1462,6 +1538,31 @@ export class ChatService {
         });
       }),
     );
+  }
+
+  /** 群主转让提示(带新群主昵称;查不到就不发,与进群提示同一取舍)。 */
+  private async emitOwnerTransferredNotice(
+    conversationId: string,
+    successorId: string,
+  ): Promise<void> {
+    try {
+      const successor = await this.prisma.user.findUnique({
+        where: { id: successorId },
+        select: { nickname: true },
+      });
+      if (!successor?.nickname) return;
+      await this.systemMessage.emit(conversationId, {
+        kind: 'owner-transferred',
+        targetUserId: successorId,
+        name: successor.nickname,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `owner transfer notice failed conversation=${conversationId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** 进群系统提示(带昵称;查不到昵称就不发,不发空名单刷屏)。 */
@@ -1611,6 +1712,8 @@ export class ChatService {
       unreadCount: unread.get(conversationId) ?? 0,
       pinned: member.pinned,
       muted: member.muted,
+      silenced: isSeatSilenced(member),
+      silencedUntil: silencedUntilOf(member),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
     };
@@ -2366,6 +2469,9 @@ export class ChatService {
       unreadCount: unread.get(conv.id) ?? 0,
       pinned: mine?.pinned ?? false,
       muted: mine?.muted ?? false,
+      // 单聊没有禁言。
+      silenced: false,
+      silencedUntil: null,
       burnDurationSec: conv.burnDurationSec ?? null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
     };
@@ -2449,7 +2555,13 @@ export class ChatService {
     }
     const seats = await this.prisma.chatMember.findMany({
       where: { conversationID: conversationId, leftAt: null },
-      select: { userID: true },
+      select: {
+        userID: true,
+        role: true,
+        leftAt: true,
+        silencedAt: true,
+        silencedUntil: true,
+      },
     });
     const userIds = seats.map((s) => s.userID);
     const [users, roles] = await Promise.all([
@@ -2463,15 +2575,24 @@ export class ChatService {
             .then((rows) => new Map(rows.map((r) => [r.userID, r.role])))
         : Promise.resolve(new Map<string, 'OWNER' | 'ADMIN' | 'MEMBER'>()),
     ]);
-    return userIds
-      .map((id) => {
-        const user = users.get(id);
+    // 角色:圈子群读 CircleMember;独立群聊 = 群主字段 + 座位上的管理员标记;
+    // 单聊/临时房没有角色。禁言状态两种群都在座位上。
+    const roleOf = (seat: (typeof seats)[number]) => {
+      if (conversation.type !== 'GROUP') return null;
+      if (conversation.circleID) return roles.get(seat.userID) ?? null;
+      return standaloneGroupRole(conversation.ownerID, seat);
+    };
+    return seats
+      .map((seat) => {
+        const user = users.get(seat.userID);
         if (!user) return null;
         return {
-          userId: id,
+          userId: seat.userID,
           nickname: user.nickname,
           avatarUrl: user.avatarUrl,
-          role: roles.get(id) ?? null,
+          role: roleOf(seat),
+          silenced: isSeatSilenced(seat),
+          silencedUntil: silencedUntilOf(seat),
         };
       })
       .filter((m): m is ChatMemberDto => m !== null);
@@ -2684,6 +2805,15 @@ export class ChatService {
       });
     }
     const conversation = seat.conversation;
+
+    // 逐人禁言与全员禁言一样要在锁后复查:管理员按下禁言与这条消息落库之间
+    // 是真实窗口,禁言的语义就是「立刻生效」。
+    if (conversation.type === 'GROUP' && isSeatSilenced(seat)) {
+      throw new ForbiddenException({
+        message: '你已被禁言',
+        errorCode: ChatErrorCode.MemberSilenced,
+      });
+    }
 
     if (conversation.type === 'DIRECT') {
       const peerId = conversation.directKey
@@ -3454,7 +3584,7 @@ export class ChatService {
     conversationId: string,
     seconds: number | null,
   ): Promise<{ burnDurationSec: number | null }> {
-    const { conversation } = await this.requireMembershipSeat(
+    const { conversation, member } = await this.requireMembershipSeat(
       conversationId,
       userId,
     );
@@ -3466,17 +3596,13 @@ export class ChatService {
       });
     }
     if (conversation.type === 'GROUP') {
-      // 独立群聊没有圈子角色表可查:群主之外一律拒。圈子群仍是圈主/管理员。
-      if (!conversation.circleID) {
-        if (conversation.ownerID !== userId) {
-          throw new ForbiddenException({
-            message: '仅群主可设置',
-            errorCode: ChatErrorCode.GroupOwnerOnly,
-          });
-        }
-      } else if (!(await this.isCircleModerator(conversation, userId))) {
+      // 圈子群:圈主/管理员;独立群聊:群主或管理员(角色在座位行上)。
+      const authorized = conversation.circleID
+        ? await this.isCircleModerator(conversation, userId)
+        : isGroupManager(standaloneGroupRole(conversation.ownerID, member));
+      if (!authorized) {
         throw new ForbiddenException({
-          message: '仅圈主或管理员可设置',
+          message: '仅群主或管理员可设置',
           errorCode: GroupErrorCode.ManagerOnly,
         });
       }
@@ -3639,7 +3765,7 @@ export class ChatService {
               userID: userId,
             },
           },
-          select: { leftAt: true },
+          select: { leftAt: true, role: true },
         });
         if (!actorSeat || actorSeat.leftAt) {
           throw new ForbiddenException({
@@ -3651,7 +3777,10 @@ export class ChatService {
           forEveryone &&
           (conversation.type === 'DIRECT' || conversation.type === 'GROUP');
         if (globalClear && conversation.type === 'GROUP') {
-          let authorized = conversation.ownerID === userId;
+          // 独立群聊:群主或管理员(管理员标记在锁后的座位行上,与圈子群的
+          // 圈主/管理员同一档);圈子群:下面按 CircleMember 判。
+          let authorized =
+            conversation.ownerID === userId || actorSeat.role === 'ADMIN';
           if (conversation.circleID) {
             // GroupService 的降权/移除/退群也持有这把成员锁。会话锁先拿,
             // 再等成员锁,确保授权读取发生在已提交的成员变更之后。
@@ -3739,6 +3868,12 @@ export class ChatService {
                 { kind: 'history-cleared', actorId: userId },
               )
             : null;
+        if (auditMessage && conversation.type === 'GROUP') {
+          await this.groupEvents.recordInTx(tx, conversationId, {
+            kind: 'history-cleared',
+            actorId: userId,
+          });
+        }
         return {
           watermark: clearThrough,
           isGlobalClear: globalClear,

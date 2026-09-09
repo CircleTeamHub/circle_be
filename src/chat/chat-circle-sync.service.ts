@@ -7,6 +7,7 @@ import {
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 
 /**
@@ -55,6 +56,7 @@ export class ChatCircleSyncService {
     private readonly prisma: PrismaService,
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
+    private readonly groupEvents: ChatGroupEventService,
   ) {}
 
   /**
@@ -156,6 +158,20 @@ export class ChatCircleSyncService {
       // 快照里把同一个人算进 toJoin —— 于是 joined 事件播两遍、进群系统提示
       // 也写两条。谁先拿到锁谁做,后来者在锁后重读座位,toJoin 自然是空的。
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
+      // The initial read is only a fast path. Recheck after taking the same
+      // per-circle lock used by dissolve/disable so a concurrent state change
+      // cannot let ACTIVE members re-seat into a deleted circle.
+      const lockedCircle = await tx.circle.findUnique({
+        where: { id: circleId },
+        select: { deleted: true, adminState: true },
+      });
+      if (
+        !lockedCircle ||
+        lockedCircle.deleted ||
+        DISABLED_ADMIN_STATES.has(lockedCircle.adminState)
+      ) {
+        return null;
+      }
       let created = false;
       // clearedBeforeHeight 要一并读出来：新座位得继承它，否则「删除所有人的
       // 记录」藏起来的历史对圈子新成员整段可见。
@@ -247,6 +263,14 @@ export class ChatCircleSyncService {
 
       return { conversationId: conversation.id, toJoin, toRemove, created };
     });
+
+    if (!result) {
+      // State changed while waiting for the lock. Evict seats after the
+      // transaction commits, using the same idempotent cleanup as the fast
+      // path above.
+      await this.evictAllSeats(circleId);
+      return null;
+    }
 
     // 座位变更后的在线房间对齐(尽力而为;掉线成员重连时按座位重新派生)。
     //
@@ -391,6 +415,12 @@ export class ChatCircleSyncService {
       userId,
     });
     if (emitMemberLeftNotice) {
+      // 群日志:主动退出记本人;被移出的那条由 GroupService 在事务里记(带操作者)。
+      void this.groupEvents.record(conversationId, {
+        kind: 'member-left',
+        actorId: userId,
+        targetIds: [userId],
+      });
       void this.systemMessage
         .emit(conversationId, { kind: 'member-left' })
         .catch((error: unknown) =>
@@ -451,6 +481,12 @@ export class ChatCircleSyncService {
   ): Promise<void> {
     try {
       if (joined.length > 0) {
+        // 对账入座没有邀请人:群日志的操作者留空(客户端显示「加入群聊」)。
+        await this.groupEvents.record(conversationId, {
+          kind: 'member-joined',
+          actorId: null,
+          targetIds: joined,
+        });
         const users = await this.prisma.user.findMany({
           where: { id: { in: joined } },
           select: { nickname: true },
@@ -462,6 +498,13 @@ export class ChatCircleSyncService {
             names,
           });
         }
+      }
+      if (removed.length > 0) {
+        await this.groupEvents.record(conversationId, {
+          kind: 'member-left',
+          actorId: null,
+          targetIds: removed,
+        });
       }
       // 对账器分不清退出还是被移出,统一「有成员退出群聊」措辞。
       for (let i = 0; i < removed.length; i += 1) {

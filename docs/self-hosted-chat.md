@@ -57,6 +57,20 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 - `GET /api/v1/chat/conversations/:id/messages?beforeHeight&limit` —
   height 键集分页,页内升序,`nextBeforeHeight=null` 表示到头。
 
+### 群管理 + 群日志(2026-09-08)
+
+- `GET /api/v1/chat/conversations/:id/events?cursor&limit` — 群日志(`ChatGroupEvent`
+  表,独立于聊天记录,不受清空/焚毁影响),倒序 `(createdAt, id)` 游标分页;
+  圈子群与成员目录同闸(圈主/管理员),独立群聊全员可读。
+- `PATCH /api/v1/chat/conversations/:id/members/:userId/role` `{role:'ADMIN'|'MEMBER'}` —
+  独立群聊群主设/撤管理员(角色在 `ChatMember.role`;群主仍看 `ownerID`)。
+- `DELETE /api/v1/chat/conversations/:id/members/:userId` — 独立群聊群主/管理员移出
+  成员(管理员只能移普通成员)。圈子群的设角色/移出仍走 `/group/:id/members/...`。
+- `PUT /api/v1/chat/conversations/:id/members/:userId/silence` `{durationSec:int|null}` /
+  `DELETE …/silence` — 逐人禁言/解除(两种群;群主/管理员,只能对低于自己的角色;
+  60s–30d,null = 直到解除)。发消息时命中 `CHAT_MEMBER_SILENCED`。
+  词汇:代码里 mute = 免打扰,silence = 禁言;`muteAllAt` 是更早的管理台全员禁言。
+
 ## 防刷
 
 每 socket 滑动窗口:send 20/10s、read 30/10s、typing 10/5s

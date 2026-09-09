@@ -78,6 +78,10 @@ describe('ChatService', () => {
     emitRead: jest.fn(),
     emitHistoryCleared: jest.fn(),
   };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
   const systemMessage = {
     emit: jest.fn().mockResolvedValue(undefined),
     // 设置变更的留痕必须与设置本身同事务落地(emit 内部吞异常,await 它无用)。
@@ -105,6 +109,7 @@ describe('ChatService', () => {
     systemMessage as never,
     support as never,
     circleMemberLock as never,
+    groupEvents as never,
   );
 
   // tx 即 prisma 本身,tx.* 委托到同一批 mock。
@@ -963,6 +968,64 @@ describe('ChatService', () => {
       await expect(service.sendMessage('u1', sendPayload())).rejects.toThrow(
         ForbiddenException,
       );
+    });
+
+    it('rejects a silenced group member before the transaction', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ silencedAt: new Date(), silencedUntil: null }),
+      );
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.MemberSilenced },
+      });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          silencedAt: new Date(),
+          silencedUntil: new Date(Date.now() + 60_000),
+        }),
+      );
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MemberSilenced },
+      });
+    });
+
+    it('lets an expired timed silence send again', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          silencedAt: new Date(Date.now() - 120_000),
+          silencedUntil: new Date(Date.now() - 60_000),
+        }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      const result = await service.sendMessage('u1', sendPayload());
+      expect(result.message.id).toBe('msg-1');
+    });
+
+    it('rejects when silenced between the pre-check and the transaction', async () => {
+      prisma.chatMember.findUnique
+        // 锁外:还能发
+        .mockResolvedValueOnce(membership())
+        // 锁后复查:管理员刚按下禁言
+        .mockResolvedValueOnce(
+          membership({ silencedAt: new Date(), silencedUntil: null }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MemberSilenced },
+      });
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
     });
 
     it('blocks sensitive words before any DB write', async () => {

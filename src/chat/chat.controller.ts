@@ -1,11 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   ParseUUIDPipe,
   Patch,
   Post,
+  Put,
   Query,
   Req,
   UseGuards,
@@ -15,8 +17,15 @@ import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { ChatGroupAdminService } from './chat-group-admin.service';
+import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatService } from './chat.service';
 import { ClearHistoryDto } from './dto/clear-history.dto';
+import {
+  GroupEventsQueryDto,
+  SetGroupMemberRoleDto,
+  SilenceGroupMemberDto,
+} from './dto/group-admin.dto';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
@@ -32,8 +41,10 @@ import { MessageDaysQueryDto } from './dto/message-days-query.dto';
 import { MutationsQueryDto } from './dto/mutations-query.dto';
 import type {
   ChatConversationDto,
+  ChatGroupEventsPageDto,
   ChatHistoryPageDto,
   ChatMemberDto,
+  ChatMemberSilenceDto,
   ChatMessageDto,
   ChatMutationsPageDto,
 } from './chat.types';
@@ -48,7 +59,11 @@ import type {
 @ApiTags('Chat')
 @ApiBearerAuth()
 export class ChatController {
-  constructor(private readonly chatService: ChatService) {}
+  constructor(
+    private readonly chatService: ChatService,
+    private readonly groupAdmin: ChatGroupAdminService,
+    private readonly groupEvents: ChatGroupEventService,
+  ) {}
 
   @Get('conversations')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
@@ -204,12 +219,99 @@ export class ChatController {
 
   @Get('conversations/:id/members')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @ApiOperation({ summary: '会话成员目录(GROUP 附圈子角色)' })
+  @ApiOperation({ summary: '会话成员目录(GROUP 附角色与禁言状态)' })
   listMembers(
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
   ): Promise<ChatMemberDto[]> {
     return this.chatService.listMembers(req.user.userId, conversationId);
+  }
+
+  @Get('conversations/:id/events')
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '群日志(进退群/移出/角色/禁言/改名/公告/清空/转让),倒序游标分页;圈子群仅圈主/管理员',
+  })
+  listGroupEvents(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Query() query: GroupEventsQueryDto,
+  ): Promise<ChatGroupEventsPageDto> {
+    return this.groupEvents.listEvents(req.user.userId, conversationId, query);
+  }
+
+  @Patch('conversations/:id/members/:userId/role')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '独立群聊:群主设/撤管理员(圈子群走 PATCH /group/:id/members/:userId/role)',
+  })
+  setGroupMemberRole(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('userId', ParseUUIDPipe) targetUserId: string,
+    @Body() body: SetGroupMemberRoleDto,
+  ): Promise<{ userId: string; role: 'ADMIN' | 'MEMBER' }> {
+    return this.groupAdmin.setStandaloneMemberRole(
+      req.user.userId,
+      conversationId,
+      targetUserId,
+      body.role,
+    );
+  }
+
+  @Delete('conversations/:id/members/:userId')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '独立群聊:群主/管理员移出成员(管理员只能移普通成员;圈子群走 DELETE /group/:id/members/:userId)',
+  })
+  removeGroupMember(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('userId', ParseUUIDPipe) targetUserId: string,
+  ): Promise<void> {
+    return this.groupAdmin.removeStandaloneMember(
+      req.user.userId,
+      conversationId,
+      targetUserId,
+    );
+  }
+
+  @Put('conversations/:id/members/:userId/silence')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '禁言成员(两种群;群主/管理员;durationSec=null 直到解除;重复调用覆盖时长)',
+  })
+  silenceGroupMember(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('userId', ParseUUIDPipe) targetUserId: string,
+    @Body() body: SilenceGroupMemberDto,
+  ): Promise<ChatMemberSilenceDto> {
+    return this.groupAdmin.silenceMember(
+      req.user.userId,
+      conversationId,
+      targetUserId,
+      body.durationSec,
+    );
+  }
+
+  @Delete('conversations/:id/members/:userId/silence')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '解除禁言(两种群;群主/管理员;未禁言时幂等)' })
+  unsilenceGroupMember(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Param('userId', ParseUUIDPipe) targetUserId: string,
+  ): Promise<ChatMemberSilenceDto> {
+    return this.groupAdmin.unsilenceMember(
+      req.user.userId,
+      conversationId,
+      targetUserId,
+    );
   }
 
   @Get('conversations/:id/message-days')
