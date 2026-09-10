@@ -158,6 +158,21 @@ export class NotificationPushOutboxProcessor {
           });
         }
 
+        // 圈子通知「离线提醒」：用户关掉后不再向他投递 CIRCLE_* 推送。
+        // 在这里读而不是在入队时读——偏好按投递时刻的最新值生效，也不给
+        // 创建通知的热路径（事务内）多加一次查询。
+        if (
+          job.notification.type?.startsWith('CIRCLE_') &&
+          userId &&
+          !(await this.isCircleOfflinePushEnabled(userId))
+        ) {
+          await this.finishJob(job.id, leaseToken, 'COMPLETED');
+          // 这一轮确实处理掉了一个任务（用户主动关的，不是失败），要计数，
+          // 否则调度器会以为这批没干活。
+          processed += 1;
+          continue;
+        }
+
         // 为当前活跃 token 惰性建投递行（幂等：唯一键 + skipDuplicates）。
         // 注册于「创建后、本次重试前」的新设备也能被补上。
         const tokens = await this.pushService.listActiveTokens(userId);
@@ -326,6 +341,15 @@ export class NotificationPushOutboxProcessor {
       }
     }
     return processed;
+  }
+
+  /** 用户是否还接收圈子离线推送。查不到用户时按默认（收）处理，不静默丢推送。 */
+  private async isCircleOfflinePushEnabled(userId: string): Promise<boolean> {
+    const row = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { circleOfflinePushEnabled: true },
+    });
+    return row?.circleOfflinePushEnabled ?? true;
   }
 
   private async finishJob(

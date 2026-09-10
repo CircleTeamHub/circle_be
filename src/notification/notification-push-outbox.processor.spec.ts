@@ -63,11 +63,13 @@ function buildHarness({
   pendingDeliveries,
   outcomes,
   tokens = [{ token: 'tok-a', projectId: null }],
+  circleOfflinePushEnabled = true,
 }: {
   jobs: any[];
   pendingDeliveries: any[];
   outcomes: any[];
   tokens?: Array<{ token: string; projectId: string | null }>;
+  circleOfflinePushEnabled?: boolean;
 }) {
   const prisma = {
     // 名额分配现在跨整个队列用 PARTITION BY 排名(见 processor 注释),
@@ -86,6 +88,9 @@ function buildHarness({
       updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       // 打光判定（review 修复）：默认无耗尽行 → COMPLETED
       count: jest.fn().mockResolvedValue(0),
+    },
+    user: {
+      findUnique: jest.fn().mockResolvedValue({ circleOfflinePushEnabled }),
     },
   };
   const push = {
@@ -413,5 +418,77 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+
+describe('圈子离线推送开关', () => {
+  const circleNotification = { ...notification, type: 'CIRCLE_POST_PUBLISHED' };
+
+  const circleJob = {
+    id: 'job-circle',
+    notificationID: 'notification-1',
+    status: 'PENDING',
+    attempts: 0,
+    payload: { title: 'T', body: 'B', data: {} },
+    notification: circleNotification,
+  };
+
+  it('关掉「离线提醒」后不再向该用户投递 CIRCLE_* 推送', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [circleJob],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+      circleOfflinePushEnabled: false,
+    });
+
+    const processed = await processor.processPending();
+
+    expect(processed).toBe(1);
+    // 连投递行都不建，更不会发出去。
+    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(prisma.notificationPushDelivery.createMany).not.toHaveBeenCalled();
+    // 任务收尾成 COMPLETED —— 用户主动关的，不是失败，不该反复重试。
+    expect(prisma.notificationPushOutbox.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: 'COMPLETED' }),
+      }),
+    );
+  });
+
+  it('开着的时候照常投递', async () => {
+    const { push, processor } = buildHarness({
+      jobs: [circleJob],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+      circleOfflinePushEnabled: true,
+    });
+
+    await processor.processPending();
+
+    expect(push.sendToTokens).toHaveBeenCalled();
+  });
+
+  it('非圈子通知不读这个开关', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-system',
+          notificationID: 'notification-1',
+          status: 'PENDING',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+      circleOfflinePushEnabled: false,
+    });
+
+    await processor.processPending();
+
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(push.sendToTokens).toHaveBeenCalled();
   });
 });

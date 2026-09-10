@@ -6,6 +6,7 @@ import {
 } from './notification.constants';
 import { Transform, Type } from 'class-transformer';
 import {
+  IsBoolean,
   IsIn,
   IsNotEmpty,
   IsOptional,
@@ -203,4 +204,18 @@ export function mapNotificationRealtimeDto(
       : null,
     requestId: n.fromFriendRequest?.id ?? null,
   };
+}
+
+/**
+ * 圈子通知偏好里唯一需要服务端执行的一档：离线推送。
+ * 横幅 / 声音 / 红点全是客户端展示，留在本地即可，不进这个接口。
+ */
+export class UpdateCirclePushPreferenceDto {
+  @ApiProperty({
+    example: true,
+    description:
+      'APP 离线时是否接收圈子推送（关闭后服务端不再投递 CIRCLE_* 推送）',
+  })
+  @IsBoolean()
+  circleOfflinePushEnabled: boolean;
 }
