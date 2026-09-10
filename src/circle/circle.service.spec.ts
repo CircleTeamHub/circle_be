@@ -10,7 +10,10 @@ import { MembershipPolicyService } from 'src/membership/membership-policy.servic
 import { MembershipProgramService } from 'src/membership/membership-program.service';
 import { CircleAdmissionPolicy } from './circle-admission-policy';
 import { CircleMemberLockService } from './circle-member-lock';
-import { ChatCircleSyncService } from 'src/chat/chat-circle-sync.service';
+import {
+  CIRCLE_SYNC_LOCK_NAMESPACE,
+  ChatCircleSyncService,
+} from 'src/chat/chat-circle-sync.service';
 import { ChatGroupEventService } from 'src/chat/chat-group-event.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
@@ -476,6 +479,23 @@ describe('CircleService', () => {
       // 座位是派生态:deleted 落库之后靠它把全员离座并广播 removed。
       expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
         'circle-1',
+      );
+    });
+
+    it('serializes deletion with circle chat seat reconciliation', async () => {
+      stubOwnedLiveCircle();
+
+      await service.dissolveCircle('user-1', 'circle-1');
+
+      expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+      const [strings, namespace, circleId] = prisma.$executeRaw.mock.calls[0];
+      expect(Array.from(strings as TemplateStringsArray).join('')).toContain(
+        'pg_advisory_xact_lock',
+      );
+      expect(namespace).toBe(CIRCLE_SYNC_LOCK_NAMESPACE);
+      expect(circleId).toBe('circle-1');
+      expect(prisma.$executeRaw.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.circle.update.mock.invocationCallOrder[0],
       );
     });
 
