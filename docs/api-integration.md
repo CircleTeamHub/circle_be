@@ -62,9 +62,11 @@ x-device-name: iPhone 15
 **Request Body**
 ```json
 {
-  "username": "testuser",    // 4-20 字符，必填
-  "password": "password123", // 6-64 字符，必填
-  "nickname": "Test User"    // 1-30 字符，可选
+  "email": "user@example.com",       // 必填
+  "password": "password123",         // 6-64 字符，必填
+  "confirmPassword": "password123",  // 必须与 password 一致
+  "nickname": "Test User",            // 1-50 字符，必填
+  "inviteCode": "ABC123"              // 可选
 }
 ```
 

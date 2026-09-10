@@ -11,6 +11,10 @@ import {
   ValidatorConstraint,
   ValidatorConstraintInterface,
 } from 'class-validator';
+import {
+  BURN_DURATION_CHOICES,
+  type BurnDurationSec,
+} from '../common/burn-durations';
 
 /**
  * 自动回复文案上限，按**码点**计。
@@ -35,7 +39,13 @@ class AutoReplyTextLengthConstraint implements ValidatorConstraintInterface {
   }
 }
 
-export const SELF_DESTRUCT_DAY_OPTIONS = [0, 1, 2, 7, 30] as const;
+/**
+ * 全局阅后即焚档位。以前这里是**天数**白名单 [0,1,2,7,30],而会话级焚毁用的是
+ * 另一张秒数表 —— 同一个功能在两个入口给用户看两张不同的档位表(「10 分钟」
+ * 只有单会话有,「30 天」只有全局有)。现在两处都读 BURN_DURATION_CHOICES。
+ */
+export { BURN_DURATION_CHOICES, type BurnDurationSec };
+
 export const MOMENTS_VISIBILITY_OPTIONS = [
   'ALL',
   'FRIENDS_ONLY',
@@ -43,15 +53,15 @@ export const MOMENTS_VISIBILITY_OPTIONS = [
 ] as const;
 export const PERMISSION_OPTIONS = ['EVERYONE', 'FRIENDS_ONLY', 'NONE'] as const;
 
-export type SelfDestructDays = (typeof SELF_DESTRUCT_DAY_OPTIONS)[number];
 export type MomentsVisibility = (typeof MOMENTS_VISIBILITY_OPTIONS)[number];
 export type PrivacyPermission = (typeof PERMISSION_OPTIONS)[number];
 
 export class PrivacySettingsDto {
-  messageSelfDestructDays: SelfDestructDays;
+  messageSelfDestructSec: BurnDurationSec;
   momentsVisibility: MomentsVisibility;
   allowStrangerMessages: boolean;
   showPhone: boolean;
+  showEmail: boolean;
   showWechat: boolean;
   showQQ: boolean;
   showWhatsup: boolean;
@@ -66,11 +76,11 @@ export class PrivacySettingsDto {
 }
 
 export class UpdatePrivacySettingsDto {
-  @ApiPropertyOptional({ enum: SELF_DESTRUCT_DAY_OPTIONS })
+  @ApiPropertyOptional({ enum: BURN_DURATION_CHOICES })
   @IsOptional()
   @IsInt()
-  @IsIn(SELF_DESTRUCT_DAY_OPTIONS)
-  messageSelfDestructDays?: SelfDestructDays;
+  @IsIn(BURN_DURATION_CHOICES as readonly number[])
+  messageSelfDestructSec?: BurnDurationSec;
 
   @ApiPropertyOptional({ enum: MOMENTS_VISIBILITY_OPTIONS })
   @IsOptional()
@@ -86,6 +96,11 @@ export class UpdatePrivacySettingsDto {
   @IsOptional()
   @IsBoolean()
   showPhone?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  showEmail?: boolean;
 
   @ApiPropertyOptional()
   @IsOptional()

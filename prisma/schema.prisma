@@ -1322,11 +1322,17 @@ model UserTracePreference {
 model UserPrivacySetting {
   id                      String   @id @default(uuid())
   userID                  String   @unique
-  /// 0 = 关闭自动销毁。与 DEFAULT_PRIVACY_SETTINGS 保持一致。
+  /// 全局阅后即焚窗口(秒),0 = 关闭。档位见 src/common/burn-durations.ts。
+  /// messageSelfDestructDays(天)是它的前身,只能选整天,与会话级焚毁的秒数
+  /// 白名单是两张表;20260907120000 迁移已按 *86400 回填到这一列。
+  /// 旧列留到下一版再删(expand/contract:蓝绿窗口里旧二进制还在读它)。
+  messageSelfDestructSec  Int      @default(0)
   messageSelfDestructDays Int      @default(0)
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)
   showPhone               Boolean  @default(false)
+  /// 注册邮箱是账号找回入口,默认不外露 —— 与 showPhone 同档,而不是 showWechat 那档。
+  showEmail               Boolean  @default(false)
   showWechat              Boolean  @default(true)
   showQQ                  Boolean  @default(true)
   showWhatsup             Boolean  @default(true)
@@ -2031,6 +2037,13 @@ enum ChatConversationType {
   SUPPORT
 }
 
+/// 独立群聊的成员角色。群主不在这里：群主看 ChatConversation.ownerID（退群自动转让
+/// 只改那一个字段，两处真值必然漂移）。圈子群忽略此列 —— 角色真值在 CircleMember。
+enum ChatMemberRole {
+  MEMBER
+  ADMIN
+}
+
 /// 聊天会话。消息序协议参考 squady：每会话维护单调递增 height 序号，
 /// 排序、已读水位、增量补拉共用同一坐标系。
 /// userID 类字段一律不建 User 外键 —— 聊天行是高频写入的历史数据，
@@ -2073,6 +2086,7 @@ model ChatConversation {
   members  ChatMember[]
   messages ChatMessage[]
   directAutoReplyStates ChatDirectAutoReplyState[]
+  groupEvents ChatGroupEvent[]
 }
 
 /// 会话成员。成员行的存在即成员资格（发送/收取的授权来源）；
@@ -2088,7 +2102,16 @@ model ChatMember {
   /// 清空聊天记录水位（G-14）：本人只看得到 height 大于该值的消息；只前进。
   clearedBeforeHeight Int  @default(0)
   pinned         Boolean   @default(false)
+  /// 免打扰(只影响推送)。**不是禁言** —— 禁言看下面的 silenced*。
   muted          Boolean   @default(false)
+  /// 独立群聊的管理员标记(圈子群忽略,见 ChatMemberRole)。退群/被移出时复位。
+  role           ChatMemberRole @default(MEMBER)
+  /// 禁言(不能发言;群主/管理员对成员施加)。silencedAt 非空 = 处于禁言,
+  /// silencedUntil 空 = 直到解除。词汇约定:代码里 mute = 免打扰,silence = 禁言;
+  /// 只有会话上的 muteAllAt / 错误码 CHAT_CONVERSATION_MUTED 是更早的遗留命名。
+  /// 退群/被移出**不**清除:否则退群再扫码回来就等于自助解禁。
+  silencedAt     DateTime?
+  silencedUntil  DateTime?
   /// 从列表隐藏(swipe hide);新消息落库时清空,会话重新浮出(微信式语义)。
   hiddenAt       DateTime?
   joinedAt       DateTime  @default(now())
@@ -2108,6 +2131,29 @@ model ChatMember {
 /// 聊天消息。height 在发送事务内于 pg_advisory_xact_lock 下分配，
 /// (conversationID, height) 唯一约束兜底乱序；
 /// (conversationID, senderID, clientMessageId) 唯一约束兜底断线重发幂等。
+/// 群事件账本(群日志):谁进群/退群/被移出、谁被设为/取消管理员、谁被禁言/解除、
+/// 改群名/公告、清空全群记录、群主转让。与 type='system' 的聊天提示成对写,
+/// 但**独立于聊天记录**:不受清空水位/焚毁影响,后入群的人也能翻到入群前的记录。
+/// userID 类字段同 ChatMessage.senderID,不建 User 外键。
+model ChatGroupEvent {
+  id             String   @id @default(uuid())
+  conversationID String
+  /// 事件种类(字符串而非枚举:与系统消息 kind 同一词表,加种类不必迁移)。
+  kind           String
+  /// 操作者;null = 系统/圈子对账。
+  actorID        String?
+  /// 受影响的成员(进群可一次多人)。
+  targetIDs      String[] @default([])
+  /// 事件参数:{name} / {role} / {durationSec} / {via}。
+  payload        Json?
+  createdAt      DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
+
+  /// 群日志按会话倒序 keyset 分页((createdAt, id) 复合游标)。
+  @@index([conversationID, createdAt, id])
+}
+
 model ChatMessage {
   id              String   @id @default(uuid())
   conversationID  String

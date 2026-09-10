@@ -26,11 +26,9 @@ import type { RequestWithUser } from 'src/auth/types';
 import { CircleService } from './circle.service';
 import {
   CircleDetailDto,
-  CircleDto,
   MyCircleDto,
   CreateCircleDto,
   UpdateCircleDto,
-  ListCirclesQueryDto,
   MyCirclesQueryDto,
   SelectCircleIconDto,
   UploadCircleIconDto,
@@ -54,17 +52,6 @@ export class CircleController {
     @Req() req: RequestWithUser,
   ): Promise<CircleDetailDto> {
     return this.circleService.createCircle(req.user.userId, dto);
-  }
-
-  @Get()
-  @ApiOperation({ summary: 'List circles available to apply for' })
-  list(@Query() query: ListCirclesQueryDto): Promise<{
-    items: CircleDto[];
-    total: number;
-    page: number;
-    limit: number;
-  }> {
-    return this.circleService.listCircles(query);
   }
 
   @Get('my')
@@ -118,6 +105,19 @@ export class CircleController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.circleService.leaveCircle(req.user.userId, id);
+  }
+
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: '圈主解散圈子(圈子从所有成员的列表消失 + 群聊全员离座,不可逆)',
+  })
+  @ApiNoContentResponse()
+  dissolve(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ): Promise<void> {
+    return this.circleService.dissolveCircle(req.user.userId, id);
   }
 
   @Post(':id/icon/upload')

@@ -146,15 +146,10 @@ export class AuthService {
   async register(dto: RegisterDto, sessionContext?: SessionContext) {
     const email = normalizeEmail(dto.email);
 
-    const codeOk = await this.emailVerification.verifyCode(
-      email,
-      'REGISTER',
-      dto.code,
-    );
-    if (!codeOk) {
+    if (dto.password !== dto.confirmPassword) {
       throw new BadRequestException({
-        message: '验证码错误或已过期',
-        errorCode: AuthErrorCode.CodeInvalid,
+        message: '两次输入的密码不一致',
+        errorCode: AuthErrorCode.PasswordMismatch,
       });
     }
 
@@ -463,10 +458,6 @@ export class AuthService {
     });
 
     return tokens;
-  }
-
-  async requestEmailCode(email: string, purpose: 'register'): Promise<void> {
-    await this.emailVerification.requestCode(email, 'REGISTER');
   }
 
   /** 密码登录共用的收尾：lastOnline、发 token、记日志。 */

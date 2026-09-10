@@ -30,12 +30,15 @@ describe('PrivacySettingsService', () => {
     prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
 
     await expect(service.getSettings('user-1')).resolves.toMatchObject({
-      // 自动销毁默认关闭:绝大多数用户库里没有这行,走的就是这份默认值。
+      // 全局阅后即焚默认关闭:绝大多数用户库里没有这行,走的就是这份默认值。
       // 默认非 0 等于替所有从没进过隐私设置的人开了「只看得到最近 N 天」。
-      messageSelfDestructDays: 0,
+      messageSelfDestructSec: 0,
       momentsVisibility: 'ALL',
       allowStrangerMessages: true,
       showPhone: false,
+      // 注册邮箱是账号找回入口 —— 存量行没有这一列时也必须落到隐藏,
+      // 否则一次「读默认值」就把 email 重新放回所有陌生人的资料页。
+      showEmail: false,
       showWechat: true,
       showQQ: true,
       showWhatsup: true,
@@ -52,6 +55,14 @@ describe('PrivacySettingsService', () => {
     // A read must never write: lazily creating a row here would let any
     // stranger viewing a profile trigger a write to the target's row.
     expect(prisma.userPrivacySetting.upsert).not.toHaveBeenCalled();
+
+    // 默认值必须一路走到字段闸门,不只是 DTO 上好看。
+    await expect(
+      service.canViewProfileField('user-1', 'email', false, false),
+    ).resolves.toBe(false);
+    await expect(
+      service.canViewProfileField('user-1', 'email', true, false),
+    ).resolves.toBe(true);
   });
 
   it('trims and persists account-synced direct-message auto reply settings', async () => {
@@ -228,13 +239,13 @@ describe('PrivacySettingsService', () => {
 
     prisma.userPrivacySetting.upsert.mockResolvedValue({
       userID: 'user-1',
-      messageSelfDestructDays: 7,
+      messageSelfDestructSec: 604800,
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
     });
 
     await service.updateSettings('user-1', {
-      messageSelfDestructDays: 7,
+      messageSelfDestructSec: 604800,
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
     });
@@ -243,12 +254,12 @@ describe('PrivacySettingsService', () => {
       where: { userID: 'user-1' },
       create: expect.objectContaining({
         userID: 'user-1',
-        messageSelfDestructDays: 7,
+        messageSelfDestructSec: 604800,
         momentsVisibility: 'FRIENDS_ONLY',
         allowStrangerMessages: false,
       }),
       update: {
-        messageSelfDestructDays: 7,
+        messageSelfDestructSec: 604800,
         momentsVisibility: 'FRIENDS_ONLY',
         allowStrangerMessages: false,
       },
@@ -281,6 +292,7 @@ describe('PrivacySettingsService', () => {
       momentsVisibility: 'FRIENDS_ONLY',
       allowStrangerMessages: false,
       showPhone: false,
+      showEmail: false,
       showWechat: true,
       showQQ: false,
       showWhatsup: false,
@@ -293,6 +305,9 @@ describe('PrivacySettingsService', () => {
     ).resolves.toBe(false);
     await expect(
       service.canViewProfileField('target-1', 'phoneNumber', false, false),
+    ).resolves.toBe(false);
+    await expect(
+      service.canViewProfileField('target-1', 'email', false, false),
     ).resolves.toBe(false);
     await expect(
       service.canViewProfileField('target-1', 'wechat', false, false),

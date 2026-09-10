@@ -38,6 +38,7 @@ import { businessMetrics } from './metrics/business-metrics';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
+import { installUnhandledRejectionGuard } from './logging/unhandled-rejection-guard';
 
 /** Strict limit for sensitive auth endpoints: 10 requests / 15 min per IP. */
 const authLimiterOptions = {
@@ -198,6 +199,9 @@ const groupReportLimiterOptions = {
  * fallback rate.
  */
 export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
+  // 尽早装：未捕获 rejection 默认会终止进程，而引导之后的任何 fire-and-forget
+  // 都可能触发它。兜底只上报不静默，见 unhandled-rejection-guard.ts。
+  installUnhandledRejectionGuard();
   const isProduction = process.env.NODE_ENV === 'production';
   const config = getServerConfig();
   const loggingConfig = createLoggingConfig(
@@ -461,11 +465,10 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/auth/admin/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
-  // Email code sends and security-code verification are the two new
+  // Password-reset code sends and security-code verification are the two
   // unauthenticated-cost / brute-force surfaces from this branch.
-  app.use('/api/v1/auth/email/request-code', emailCodeLimiter);
-  // review 修复：忘记密码的验证码发送与 request-code 同为未认证发信面，
-  // 必须共享同一个 Redis 限流池 —— 否则攻击者换个端点就绕开 10/15min 上限。
+  // Password-reset requests use the same limiter as the legacy email-code
+  // endpoint did; registration no longer sends or verifies email codes.
   app.use('/api/v1/auth/password/reset-request', emailCodeLimiter);
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);

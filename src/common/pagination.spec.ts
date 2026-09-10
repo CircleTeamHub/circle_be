@@ -3,7 +3,6 @@ import { plainToInstance } from 'class-transformer';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { ClampPagePipe, MAX_PAGE } from './pagination';
-import { ListCirclesQueryDto } from '../circle/dto/circle.dto';
 import { PlazaFeedQueryDto } from '../circle-plaza/dto/circle-plaza.dto';
 import { TraceFeedQueryDto } from '../trace/dto/trace.dto';
 
@@ -12,7 +11,6 @@ import { TraceFeedQueryDto } from '../trace/dto/trace.dto';
 // 昂贵。limit 一直有 @Max，page 长期漏了。
 describe('offset pagination bounds', () => {
   it.each([
-    ['ListCirclesQueryDto', ListCirclesQueryDto],
     ['PlazaFeedQueryDto', PlazaFeedQueryDto],
     ['TraceFeedQueryDto', TraceFeedQueryDto],
   ])('%s rejects a page beyond MAX_PAGE', async (_name, Dto) => {
@@ -37,8 +35,9 @@ describe('offset pagination bounds', () => {
   it('every page field in the codebase carries a @Max', () => {
     // 断言的是「不再有漏网的 page」，而不是某几个文件 —— 新增列表接口时若忘了加
     // @Max，这条会红。DTO 里 page 的两种写法都覆盖：`page?: number` 与 `page = 1`。
+    // circle.dto.ts 已不在清单里：唯一的 offset 分页 DTO（ListCirclesQueryDto）
+    // 随「列出全站圈子」端点一起删除，圈子改为纯邀请制，那里已无 page 字段。
     const files = [
-      'src/circle/dto/circle.dto.ts',
       'src/circle-plaza/dto/circle-plaza.dto.ts',
       'src/note/dto/note.dto.ts',
       'src/trace/dto/trace.dto.ts',

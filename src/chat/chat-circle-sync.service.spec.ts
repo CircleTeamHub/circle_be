@@ -27,11 +27,16 @@ describe('ChatCircleSyncService', () => {
     disconnectUserSockets: jest.fn(),
   };
   const systemMessage = { emit: jest.fn().mockResolvedValue(undefined) };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new ChatCircleSyncService(
     prisma as never,
     broadcast as never,
     systemMessage as never,
+    groupEvents as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
 
@@ -99,6 +104,31 @@ describe('ChatCircleSyncService', () => {
       service.ensureCircleConversation('circle-1'),
     ).resolves.toBeNull();
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+  });
+
+  it('rechecks circle state after the lock before re-seating members', async () => {
+    prisma.circle.findUnique
+      .mockResolvedValueOnce({
+        id: 'circle-1',
+        deleted: false,
+        adminState: 'ACTIVE',
+      })
+      .mockResolvedValueOnce({
+        id: 'circle-1',
+        deleted: true,
+        adminState: 'ACTIVE',
+      });
+    prisma.chatConversation.findUnique.mockResolvedValue({ id: 'conv-1' });
+    prisma.chatMember.findMany.mockResolvedValue([{ userID: 'u1' }]);
+
+    await expect(
+      service.ensureCircleConversation('circle-1'),
+    ).resolves.toBeNull();
+    expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      data: { leftAt: expect.any(Date) },
+    });
+    expect(prisma.chatMember.createMany).not.toHaveBeenCalled();
   });
 
   it('creates the conversation and seats every ACTIVE member', async () => {

@@ -9,19 +9,22 @@ import {
   MOMENTS_VISIBILITY_OPTIONS,
   PERMISSION_OPTIONS,
   PrivacySettingsDto,
-  SELF_DESTRUCT_DAY_OPTIONS,
   UpdatePrivacySettingsDto,
 } from './privacy-settings.dto';
+import { isBurnDurationChoice } from 'src/common/burn-durations';
 
 const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   // 0 = 关闭。getSettings 读到没有行时不写库,所以从没进过隐私设置的用户
   // 一律走这份默认值 —— 默认非 0 等于替他们全体开了「历史只看得到最近 N 天」,
   // 而这是个查看者侧的读过滤(chat.service.ts selfDestructCutoff),开着不会有
   // 任何报错或提示,只是消息安静地翻不到。自毁是隐私功能,应当由用户主动开启。
-  messageSelfDestructDays: 0,
+  messageSelfDestructSec: 0,
   momentsVisibility: 'ALL',
   allowStrangerMessages: true,
   showPhone: false,
+  // 注册邮箱是账号找回入口 —— 归 showPhone 那档「主动公开」,不是 showWechat/showQQ
+  // 那档「默认公开」。收紧存量的理由见 20260907000000_add_show_email_privacy。
+  showEmail: false,
   showWechat: true,
   showQQ: true,
   showWhatsup: true,
@@ -42,7 +45,12 @@ type StoredPrivacySettings = PrivacySettingsDto & {
   updatedAt?: Date;
 };
 
-type ProfilePrivacyField = 'phoneNumber' | 'wechat' | 'qq' | 'whatsup';
+type ProfilePrivacyField =
+  | 'phoneNumber'
+  | 'email'
+  | 'wechat'
+  | 'qq'
+  | 'whatsup';
 
 @Injectable()
 export class PrivacySettingsService {
@@ -151,6 +159,7 @@ export class PrivacySettingsService {
 
     const settings = await this.getSettings(targetUserId);
     if (field === 'phoneNumber') return settings.showPhone;
+    if (field === 'email') return settings.showEmail;
     if (field === 'wechat') return settings.showWechat;
     if (field === 'qq') return settings.showQQ;
     if (field === 'whatsup') return settings.showWhatsup;
@@ -239,8 +248,8 @@ export class PrivacySettingsService {
 
   private assertValid(input: UpdatePrivacySettingsDto) {
     if (
-      input.messageSelfDestructDays !== undefined &&
-      !SELF_DESTRUCT_DAY_OPTIONS.includes(input.messageSelfDestructDays)
+      input.messageSelfDestructSec !== undefined &&
+      !isBurnDurationChoice(input.messageSelfDestructSec)
     ) {
       throw new BadRequestException({
         message: 'Unsupported self-destruct duration',
@@ -314,9 +323,9 @@ export class PrivacySettingsService {
 
   private toDto(settings: StoredPrivacySettings): PrivacySettingsDto {
     return {
-      messageSelfDestructDays:
-        settings.messageSelfDestructDays ??
-        DEFAULT_PRIVACY_SETTINGS.messageSelfDestructDays,
+      messageSelfDestructSec:
+        settings.messageSelfDestructSec ??
+        DEFAULT_PRIVACY_SETTINGS.messageSelfDestructSec,
       momentsVisibility:
         settings.momentsVisibility ??
         DEFAULT_PRIVACY_SETTINGS.momentsVisibility,
@@ -324,6 +333,7 @@ export class PrivacySettingsService {
         settings.allowStrangerMessages ??
         DEFAULT_PRIVACY_SETTINGS.allowStrangerMessages,
       showPhone: settings.showPhone ?? DEFAULT_PRIVACY_SETTINGS.showPhone,
+      showEmail: settings.showEmail ?? DEFAULT_PRIVACY_SETTINGS.showEmail,
       showWechat: settings.showWechat ?? DEFAULT_PRIVACY_SETTINGS.showWechat,
       showQQ: settings.showQQ ?? DEFAULT_PRIVACY_SETTINGS.showQQ,
       showWhatsup: settings.showWhatsup ?? DEFAULT_PRIVACY_SETTINGS.showWhatsup,

@@ -141,7 +141,7 @@ describe('CollectionService', () => {
       type: 'text',
       content: { text: 'peer text' },
       createdAt: new Date('2026-09-08T08:00:00.000Z'),
-      conversation: { burnDurationSec: 30 },
+      conversation: { burnDurationSec: 60 },
     });
 
     await expect(
@@ -163,7 +163,7 @@ describe('CollectionService', () => {
       type: 'text',
       content: { text: 'my text' },
       createdAt: new Date('2026-09-08T08:00:00.000Z'),
-      conversation: { burnDurationSec: 30 },
+      conversation: { burnDurationSec: 60 },
     });
     prisma.userCollection.create.mockResolvedValue({ id: 'c-1' });
 

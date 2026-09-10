@@ -19,9 +19,6 @@ describe('AuthController', () => {
     register: (_dto: RegisterDto) => Promise.resolve(mockTokenPayload as any),
     login: (_dto: LoginDto) => Promise.resolve(mockTokenPayload as any),
     adminLogin: (_dto: LoginDto) => Promise.resolve(mockTokenPayload as any),
-    requestEmailCode: jest.fn((_email: string, _purpose: string) =>
-      Promise.resolve(),
-    ),
     refresh: (_token: string) => Promise.resolve(mockTokenPayload as any),
     adminRefresh: (_token: string) => Promise.resolve(mockTokenPayload as any),
     logout: (_token: string) => Promise.resolve(),
@@ -126,8 +123,8 @@ describe('AuthController', () => {
   it('register returns tokens', async () => {
     const result = await controller.register({
       email: 'user@example.com',
-      code: '123456',
       password: 'password1',
+      confirmPassword: 'password1',
       nickname: 'Test User',
     } as any);
     expect(result).toEqual(mockTokenPayload);
@@ -148,17 +145,6 @@ describe('AuthController', () => {
     } as any);
 
     expect(result).toEqual(mockTokenPayload);
-  });
-
-  it('requestEmailCode maps purpose and delegates to service', async () => {
-    await controller.requestEmailCode({
-      email: 'user@example.com',
-      purpose: 'register',
-    });
-    expect(mockAuthService.requestEmailCode).toHaveBeenCalledWith(
-      'user@example.com',
-      'register',
-    );
   });
 
   it('refresh returns tokens', async () => {

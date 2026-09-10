@@ -51,6 +51,10 @@ describe('GroupService reportGroup', () => {
     detachSeat: jest.Mock;
     ensureCircleConversation: jest.Mock;
   };
+  const groupEvents = {
+    record: jest.fn().mockResolvedValue(undefined),
+    recordInTx: jest.fn().mockResolvedValue(undefined),
+  };
   let chatSystemMessage: {
     insertSystemMessageInTx: jest.Mock;
     insertSystemMessageAfterLockedConversationInTx: jest.Mock;
@@ -137,6 +141,7 @@ describe('GroupService reportGroup', () => {
       memberLock as any,
       chatCircleSync as any,
       chatSystemMessage as any,
+      groupEvents as any,
     );
   });
 
