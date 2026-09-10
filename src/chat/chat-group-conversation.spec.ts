@@ -111,6 +111,7 @@ describe('ChatService standalone group conversations', () => {
   it('rejects group creation with fewer than 2 other members', async () => {
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         // 自己混进名单也不算数。
         memberIds: ['owner-1', 'f1'],
       }),
@@ -121,11 +122,28 @@ describe('ChatService standalone group conversations', () => {
     expect(prisma.chatConversation.create).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, '   '])(
+    'rejects a missing or blank group name before creating any group data',
+    async (name) => {
+      await expect(
+        service.createGroupConversation('owner-1', {
+          name,
+          memberIds: ['f1', 'f2'],
+        }),
+      ).rejects.toMatchObject({
+        constructor: BadRequestException,
+        response: { errorCode: ChatErrorCode.GroupNameRequired },
+      });
+      expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects group creation when any invitee is not a friend', async () => {
     prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f1']));
 
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         memberIds: ['f1', 'stranger-1'],
       }),
     ).rejects.toMatchObject({
@@ -146,6 +164,7 @@ describe('ChatService standalone group conversations', () => {
 
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         memberIds: ['f1', 'f2'],
       }),
     ).rejects.toMatchObject({
@@ -159,7 +178,7 @@ describe('ChatService standalone group conversations', () => {
     const memberIds = Array.from({ length: 200 }, (_, index) => `f${index}`);
 
     await expect(
-      service.createGroupConversation('owner-1', { memberIds }),
+      service.createGroupConversation('owner-1', { name: '测试群', memberIds }),
     ).rejects.toMatchObject({
       constructor: ConflictException,
       response: { errorCode: ChatErrorCode.GroupFull },
