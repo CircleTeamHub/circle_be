@@ -2359,6 +2359,127 @@ describe('ChatService', () => {
     });
   });
 
+  describe('setMyGroupRemark', () => {
+    const groupSeat = (overrides: Record<string, unknown> = {}) =>
+      membership({
+        id: 'member-1',
+        remark: null,
+        conversation: { ...membership().conversation, type: 'GROUP' },
+        ...overrides,
+      });
+
+    it('stores my private label for the group and clears it on an empty string', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(groupSeat());
+      await expect(
+        service.setMyGroupRemark('u1', 'conv-1', '  玫瑰刺  '),
+      ).resolves.toEqual({ remark: '玫瑰刺' });
+      expect(prisma.chatMember.update).toHaveBeenCalledWith({
+        where: { id: 'member-1' },
+        data: { remark: '玫瑰刺' },
+      });
+
+      jest.clearAllMocks();
+      prisma.chatMember.findUnique.mockResolvedValue(
+        groupSeat({ remark: '玫瑰刺' }),
+      );
+      await expect(
+        service.setMyGroupRemark('u1', 'conv-1', '  '),
+      ).resolves.toEqual({
+        remark: null,
+      });
+      expect(prisma.chatMember.update).toHaveBeenCalledWith({
+        where: { id: 'member-1' },
+        data: { remark: null },
+      });
+    });
+
+    it('never touches the shared group name and refuses single chats', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(groupSeat());
+      await service.setMyGroupRemark('u1', 'conv-1', '玫瑰刺');
+      // 群备注只写自己的座位:改到会话行上就变成了全群共享的群名。
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+
+      prisma.chatMember.findUnique.mockResolvedValue(
+        groupSeat({
+          conversation: { ...membership().conversation, type: 'DIRECT' },
+        }),
+      );
+      await expect(
+        service.setMyGroupRemark('u1', 'conv-1', '玫瑰刺'),
+      ).rejects.toMatchObject({
+        constructor: BadRequestException,
+        response: { errorCode: ChatErrorCode.InvalidPayload },
+      });
+    });
+  });
+
+  describe('listMembers roster switch', () => {
+    const rosterSeat = (conversation: Record<string, unknown>) =>
+      membership({
+        conversation: {
+          ...membership().conversation,
+          type: 'GROUP',
+          membersCanViewRoster: false,
+          ...conversation,
+        },
+      });
+
+    it('hides the roster from ordinary members of a standalone group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        rosterSeat({ ownerID: 'owner-9' }),
+      );
+      await expect(service.listMembers('u1', 'conv-1')).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.MemberDirectoryForbidden },
+      });
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it('still lets the standalone owner and admins read it', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        rosterSeat({ ownerID: 'u1' }),
+      );
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      await expect(service.listMembers('u1', 'conv-1')).resolves.toEqual([]);
+
+      jest.clearAllMocks();
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          role: 'ADMIN',
+          conversation: {
+            ...membership().conversation,
+            type: 'GROUP',
+            membersCanViewRoster: false,
+            ownerID: 'owner-9',
+          },
+        }),
+      );
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      await expect(service.listMembers('u1', 'conv-1')).resolves.toEqual([]);
+    });
+
+    it('reads the circle role when the roster is closed on a circle group', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        rosterSeat({ circleID: 'circle-1', ownerID: null }),
+      );
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+      await expect(service.listMembers('u1', 'conv-1')).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MemberDirectoryForbidden },
+      });
+
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'OWNER',
+        status: 'ACTIVE',
+      });
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      prisma.circleMember.findMany.mockResolvedValue([]);
+      await expect(service.listMembers('u1', 'conv-1')).resolves.toEqual([]);
+    });
+  });
+
   describe('setConversationPreferences', () => {
     it('updates pinned/muted for the caller seat only', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());

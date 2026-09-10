@@ -76,6 +76,9 @@ describe('ChatService standalone group conversations', () => {
       name: '周末爬山',
       ownerID: 'owner-1',
       lastMessageAt: null,
+      // 独立群聊默认开放成员名单(圈子会话建出来时才是关的)。桩里漏掉的话
+      // undefined 会被当成「关闭」,listMembers 全线 403。
+      membersCanViewRoster: true,
     },
     ...overrides,
   });
@@ -159,7 +162,7 @@ describe('ChatService standalone group conversations', () => {
     const memberIds = Array.from({ length: 200 }, (_, index) => `f${index}`);
 
     await expect(
-      service.createGroupConversation('owner-1', { memberIds }),
+      service.createGroupConversation('owner-1', { name: '测试群', memberIds }),
     ).rejects.toMatchObject({
       constructor: ConflictException,
       response: { errorCode: ChatErrorCode.GroupFull },

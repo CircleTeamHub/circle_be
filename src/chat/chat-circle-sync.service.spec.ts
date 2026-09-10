@@ -154,6 +154,7 @@ describe('ChatCircleSyncService', () => {
           type: 'GROUP',
           circleID: 'circle-1',
           membersCanViewProfiles: false,
+          membersCanViewRoster: false,
         },
       }),
     );

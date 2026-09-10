@@ -44,6 +44,31 @@ describe('group settings batch-2 migration', () => {
     expect(sync).toMatch(/membersCanViewProfiles: false/);
   });
 
+  it('keeps the roster closed on existing circle groups and adds the private remark', () => {
+    const sql = read(
+      resolve(
+        process.cwd(),
+        'prisma/migrations/20260911000000_add_group_remark_and_roster_switch/migration.sql',
+      ),
+    );
+    // 群备注是「我给这个群起的名字、只有我看得见」,写在座位上而不是会话行上 ——
+    // 写到会话行就变成全群共享的群名了。
+    expect(sql).toMatch(
+      /ALTER TABLE "ChatMember"\s+ADD COLUMN IF NOT EXISTS "remark" TEXT/,
+    );
+    expect(sql).toMatch(
+      /ADD COLUMN IF NOT EXISTS "membersCanViewRoster" BOOLEAN NOT NULL DEFAULT true/,
+    );
+    // 圈子群的成员目录此前是硬门槛,不回填就等于这次上线把它对全员放开。
+    expect(sql).toMatch(
+      /UPDATE "ChatConversation"\s+SET "membersCanViewRoster" = false\s+WHERE "circleID" IS NOT NULL/,
+    );
+    const sync = read(
+      resolve(process.cwd(), 'src/chat/chat-circle-sync.service.ts'),
+    );
+    expect(sync).toMatch(/membersCanViewRoster: false/);
+  });
+
   it('is expand-only and matches the prisma schema', () => {
     const sql = read(migrationPath);
     expect(sql).not.toMatch(/DROP (TABLE|COLUMN|TYPE)/i);
@@ -54,5 +79,7 @@ describe('group settings batch-2 migration', () => {
     expect(schema).toMatch(/qrJoinEnabled Boolean @default\(true\)/);
     expect(schema).toMatch(/membersCanViewProfiles Boolean @default\(true\)/);
     expect(schema).toMatch(/membersCanAddFriends Boolean @default\(true\)/);
+    expect(schema).toMatch(/membersCanViewRoster Boolean @default\(true\)/);
+    expect(schema).toMatch(/remark\s+String\?/);
   });
 });

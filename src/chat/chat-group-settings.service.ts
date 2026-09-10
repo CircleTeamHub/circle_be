@@ -35,15 +35,17 @@ interface LockedGroupRow {
   notice: string | null;
   memberCanInvite: boolean;
   qrJoinEnabled: boolean;
+  membersCanViewRoster: boolean;
   membersCanViewProfiles: boolean;
   membersCanAddFriends: boolean;
 }
 
-/** PATCH /policies 可改的四个键;圈子群的 memberCanInvite 写在 Circle 上。 */
+/** PATCH /policies 可改的键;圈子群的 memberCanInvite 写在 Circle 上。 */
 export type GroupPolicyKey = keyof ChatGroupPoliciesDto;
 const POLICY_KEYS: readonly GroupPolicyKey[] = [
   'memberCanInvite',
   'qrJoinEnabled',
+  'membersCanViewRoster',
   'membersCanViewProfiles',
   'membersCanAddFriends',
 ];
@@ -439,7 +441,8 @@ export class ChatGroupSettingsService {
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
       SELECT "id", "type", "circleID", "ownerID", "nextHeight", "muteAllAt", "notice",
-             "memberCanInvite", "qrJoinEnabled", "membersCanViewProfiles", "membersCanAddFriends"
+             "memberCanInvite", "qrJoinEnabled", "membersCanViewRoster",
+             "membersCanViewProfiles", "membersCanAddFriends"
       FROM "ChatConversation"
       WHERE "id" = ${conversationId} FOR UPDATE`;
     if (locked.length === 0 || locked[0].type !== 'GROUP') {
@@ -488,6 +491,7 @@ export class ChatGroupSettingsService {
     return {
       memberCanInvite,
       qrJoinEnabled: locked.qrJoinEnabled,
+      membersCanViewRoster: locked.membersCanViewRoster,
       membersCanViewProfiles: locked.membersCanViewProfiles,
       membersCanAddFriends: locked.membersCanAddFriends,
     };

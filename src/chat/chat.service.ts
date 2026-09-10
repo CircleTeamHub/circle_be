@@ -76,9 +76,16 @@ type CircleInfo = {
 /** 会话 DTO 上只有 GROUP 才有的那组字段(全员禁言/公告/头像/上限/本人角色/策略)。 */
 type GroupFacets = Pick<
   ChatConversationDto,
-  'muteAll' | 'notice' | 'avatarUrl' | 'memberLimit' | 'myRole' | 'policies'
+  | 'myRemark'
+  | 'muteAll'
+  | 'notice'
+  | 'avatarUrl'
+  | 'memberLimit'
+  | 'myRole'
+  | 'policies'
 >;
 const NON_GROUP_FACETS: GroupFacets = {
+  myRemark: null,
   muteAll: false,
   notice: null,
   avatarUrl: null,
@@ -1653,7 +1660,39 @@ export class ChatService {
   }
 
   /**
-   * 群昵称(群备注):本人在这个群里的显示名,对全群可见。空串 = 清除,回落账号昵称。
+   * 群备注:我给这个群起的名字,**只有我看得见**(对应单聊的好友备注)。
+   * 空串 = 清除,回落群名。与群昵称(alias)方向相反,两者互不影响。
+   *
+   * 单聊不走这里:那边已经有好友备注(Friend.remark),再来一套会出现两个
+   * 都叫「备注」、改哪个生效说不清的入口。
+   */
+  async setMyGroupRemark(
+    userId: string,
+    conversationId: string,
+    remark: string,
+  ): Promise<{ remark: string | null }> {
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    if (conversation.type !== 'GROUP') {
+      throw new BadRequestException({
+        message: '只有群聊可以设置群备注',
+        errorCode: ChatErrorCode.InvalidPayload,
+      });
+    }
+    const trimmed = remark.trim();
+    const next = trimmed.length > 0 ? trimmed : null;
+    if ((member.remark ?? null) === next) return { remark: next };
+    await this.prisma.chatMember.update({
+      where: { id: member.id },
+      data: { remark: next },
+    });
+    return { remark: next };
+  }
+
+  /**
+   * 群昵称:本人在这个群里的显示名,对全群可见。空串 = 清除,回落账号昵称。
    *
    * 与置顶/免打扰同属「自己座位上的字段」,所以放在这里而不是群管理服务 ——
    * 它不是管理动作,任何在座成员都能改自己的,不需要群主/管理员。
@@ -1830,7 +1869,12 @@ export class ChatService {
    */
   private groupFacets(
     conversation: ChatConversation,
-    seat: { userID: string; role: ChatMember['role']; leftAt: Date | null },
+    seat: {
+      userID: string;
+      role: ChatMember['role'];
+      leftAt: Date | null;
+      remark?: string | null;
+    },
     circle: { memberCanInvite: boolean } | null,
     circleRole: GroupRole | null,
   ): GroupFacets {
@@ -1841,10 +1885,12 @@ export class ChatService {
         ? conversation.memberCanInvite
         : (circle?.memberCanInvite ?? true),
       qrJoinEnabled: conversation.qrJoinEnabled,
+      membersCanViewRoster: conversation.membersCanViewRoster,
       membersCanViewProfiles: conversation.membersCanViewProfiles,
       membersCanAddFriends: conversation.membersCanAddFriends,
     };
     return {
+      myRemark: seat.remark ?? null,
       muteAll: conversation.muteAllAt !== null,
       notice: standalone ? (conversation.notice ?? null) : null,
       avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
@@ -2697,25 +2743,30 @@ export class ChatService {
     userId: string,
     conversationId: string,
   ): Promise<ChatMemberDto[]> {
-    const conversation = await this.requireMembership(conversationId, userId);
-    // 圈子群的目录只开放给圈主/管理员;独立群聊(无 circleID)是微信群语义,
-    // 成员就是彼此拉进来的好友网络,全员可见目录(邀请选人也依赖它)。
-    if (conversation.type === 'GROUP' && conversation.circleID) {
-      const membership = await this.prisma.circleMember.findUnique({
-        where: {
-          userID_circleID: {
-            userID: userId,
-            circleID: conversation.circleID,
-          },
-        },
-        select: { role: true, status: true },
-      });
-      const canViewDirectory =
-        membership?.status === 'ACTIVE' &&
-        (membership.role === 'OWNER' || membership.role === 'ADMIN');
-      if (!canViewDirectory) {
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    // 「是否显示群成员」:关掉后普通成员看不到名单,群主/管理员不受限。
+    // 圈子会话建出来时该开关就是关的(圈子目录原本只对圈主/管理员开放),
+    // 独立群聊默认开(微信群语义,成员就是彼此拉进来的好友网络,邀请选人也依赖它)。
+    if (conversation.type === 'GROUP' && !conversation.membersCanViewRoster) {
+      const role = conversation.circleID
+        ? circleGroupRole(
+            await this.prisma.circleMember.findUnique({
+              where: {
+                userID_circleID: {
+                  userID: userId,
+                  circleID: conversation.circleID,
+                },
+              },
+              select: { role: true, status: true },
+            }),
+          )
+        : standaloneGroupRole(conversation.ownerID, member);
+      if (!isGroupManager(role)) {
         throw new ForbiddenException({
-          message: '仅圈主和管理员可查看群成员目录',
+          message: '该群未开放群成员名单',
           errorCode: ChatErrorCode.MemberDirectoryForbidden,
         });
       }

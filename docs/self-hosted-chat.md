@@ -81,8 +81,13 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 - `PATCH /api/v1/chat/conversations/:id/policies` `{memberCanInvite?, qrJoinEnabled?, membersCanViewProfiles?, membersCanAddFriends?}`
   — 群策略开关;圈子群的 memberCanInvite 写在 Circle。闸门:独立群邀请 `CHAT_GROUP_INVITE_DISABLED`、
   群码签发与扫码入群 `CHAT_GROUP_QR_JOIN_DISABLED`、加好友请求带 `viaConversationId` 时 `FRIEND_GROUP_ADD_FORBIDDEN`。
-- 会话 DTO 新增 `muteAll` / `notice` / `avatarUrl` / `memberLimit` / `myRole` / `policies`;圈子会话的
-  `membersCanViewProfiles` 默认 false(圈子成员目录原本只对圈主/管理员开放)。
+- `PATCH /api/v1/chat/conversations/:id/my-alias` `{alias}` — 群昵称:我在这个群里的显示名,**全群可见**
+  (任一在座成员;空串清除回落账号昵称)。
+- `PATCH /api/v1/chat/conversations/:id/my-remark` `{remark}` — 群备注:我给这个群起的名字,**只有我看得见**
+  (对应单聊的好友备注;写在 ChatMember 上,与全群共享的群名无关)。alias 与 remark 方向相反,互不影响。
+- 会话 DTO 新增 `muteAll` / `notice` / `avatarUrl` / `memberLimit` / `myRole` / `myRemark` / `policies`;
+  成员 DTO 新增 `alias`。策略里的 `membersCanViewRoster`(是否显示群成员)与 `membersCanViewProfiles`
+  对圈子会话都默认 false —— 圈子成员目录原本只对圈主/管理员开放,这两个开关不能借上线悄悄放宽。
 
 ## 防刷
 

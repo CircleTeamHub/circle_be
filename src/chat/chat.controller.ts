@@ -32,6 +32,7 @@ import {
   SetGroupMuteAllDto,
   SetGroupNoticeDto,
   SetMyGroupAliasDto,
+  SetMyGroupRemarkDto,
   TransferGroupOwnerDto,
   UpdateGroupPoliciesDto,
 } from './dto/group-settings.dto';
@@ -119,7 +120,7 @@ export class ChatController {
     @Body() body: CreateGroupConversationDto,
   ): Promise<ChatConversationDto> {
     return this.chatService.createGroupConversation(req.user.userId, {
-      name: body.name ?? null,
+      name: body.name,
       memberIds: body.memberIds,
     });
   }
@@ -322,6 +323,24 @@ export class ChatController {
       req.user.userId,
       conversationId,
       targetUserId,
+    );
+  }
+
+  @Patch('conversations/:id/my-remark')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '群备注:我给这个群起的名字,只有我看得见(任一在座成员;空串清除,回落群名)',
+  })
+  setMyGroupRemark(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetMyGroupRemarkDto,
+  ): Promise<{ remark: string | null }> {
+    return this.chatService.setMyGroupRemark(
+      req.user.userId,
+      conversationId,
+      body.remark,
     );
   }
 

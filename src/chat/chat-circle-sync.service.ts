@@ -188,6 +188,7 @@ export class ChatCircleSyncService {
               type: 'GROUP',
               circleID: circleId,
               membersCanViewProfiles: false,
+              membersCanViewRoster: false,
             },
             select: { id: true, clearedBeforeHeight: true },
           });
