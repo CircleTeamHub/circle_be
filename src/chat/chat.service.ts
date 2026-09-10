@@ -909,6 +909,13 @@ export class ChatService {
     userId: string,
     input: { name?: string | null; memberIds: string[] },
   ): Promise<ChatConversationDto> {
+    const name = input.name?.trim();
+    if (!name) {
+      throw new BadRequestException({
+        message: '请填写群聊名称',
+        errorCode: ChatErrorCode.GroupNameRequired,
+      });
+    }
     const memberIds = [...new Set(input.memberIds)].filter(
       (id) => id !== userId,
     );
@@ -924,7 +931,6 @@ export class ChatService {
         errorCode: ChatErrorCode.GroupFull,
       });
     }
-    const name = input.name?.trim() || null;
     const conversation = await this.prisma.$transaction(async (tx) => {
       await lockUserRelationshipState(tx, [userId, ...memberIds]);
       await this.assertInviteTargetsAllowed(tx, userId, memberIds);
