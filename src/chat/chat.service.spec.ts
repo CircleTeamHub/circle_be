@@ -2606,6 +2606,41 @@ describe('ChatService', () => {
       ...overrides,
     });
 
+    it('rejects an already-silenced group member before editing', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ silencedAt: new Date(), silencedUntil: null }),
+      );
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue(editableRow());
+
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_MEMBER_SILENCED' },
+      });
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('rechecks silence after locking when an admin silences during preflight', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({ silencedAt: new Date(), silencedUntil: null }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+      prisma.chatMessage.findUniqueOrThrow.mockResolvedValue(editableRow());
+
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_MEMBER_SILENCED' },
+      });
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
     it('lets the sender edit text within the window and keeps a history trail', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(editableRow());

@@ -23,6 +23,7 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/auth/admin/refresh',
   '/api/v1/auth/change-account-id',
   '/api/v1/auth/change-password',
+  '/api/v1/auth/email/request-code',
   '/api/v1/auth/login',
   '/api/v1/auth/logout',
   '/api/v1/auth/logout-all',

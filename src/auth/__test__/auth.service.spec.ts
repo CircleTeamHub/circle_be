@@ -225,6 +225,7 @@ describe('AuthService', () => {
   it('register creates user with auto accountId and returns tokens', async () => {
     const result = await service.register({
       email: 'new@example.com',
+      code: '123456',
       confirmPassword: 'password1',
       password: 'password1',
       nickname: 'Test User',
@@ -234,6 +235,28 @@ describe('AuthService', () => {
     expect(users[0].accountId).toMatch(/^\d{6}$/);
     expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
+    expect(mockEmailVerification.verifyCode).toHaveBeenCalledWith(
+      'new@example.com',
+      'REGISTER',
+      '123456',
+    );
+  });
+
+  it('register refuses to create an account when email ownership is unverified', async () => {
+    mockEmailVerification.verifyCode.mockResolvedValueOnce(false);
+
+    await expect(
+      service.register({
+        email: 'victim@example.com',
+        code: '000000',
+        password: 'password1',
+        confirmPassword: 'password1',
+        nickname: 'Attacker',
+      } as any),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ errorCode: 'AUTH_CODE_INVALID' }),
+    });
+    expect(mockPrisma.user.create).not.toHaveBeenCalled();
   });
 
   it('register rejects mismatched confirmation passwords', async () => {

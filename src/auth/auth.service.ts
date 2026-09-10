@@ -153,6 +153,18 @@ export class AuthService {
       });
     }
 
+    const codeOk = await this.emailVerification.verifyCode(
+      email,
+      'REGISTER',
+      dto.code,
+    );
+    if (!codeOk) {
+      throw new BadRequestException({
+        message: '验证码错误或已过期',
+        errorCode: AuthErrorCode.CodeInvalid,
+      });
+    }
+
     const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
       throw new ConflictException({
@@ -297,6 +309,10 @@ export class AuthService {
       });
     }
     return this.finishLogin(user, sessionContext, dto.platform);
+  }
+
+  async requestEmailCode(email: string, purpose: 'register'): Promise<void> {
+    await this.emailVerification.requestCode(email, 'REGISTER');
   }
 
   /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */

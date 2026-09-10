@@ -25,14 +25,19 @@ const reportMock = reportOperationalError as jest.MockedFunction<
 
 describe('installUnhandledRejectionGuard', () => {
   let uninstall: (() => void) | undefined;
+  let exitSpy: jest.SpiedFunction<typeof process.exit>;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    exitSpy = jest
+      .spyOn(process, 'exit')
+      .mockImplementation((() => undefined) as never);
   });
 
   afterEach(() => {
     uninstall?.();
     uninstall = undefined;
+    exitSpy.mockRestore();
   });
 
   function emitRejection(reason: unknown) {
@@ -44,7 +49,7 @@ describe('installUnhandledRejectionGuard', () => {
     );
   }
 
-  it('把未捕获 rejection 上报出去，而不是让进程死掉', () => {
+  it('reports an unhandled rejection and terminates for a clean restart', () => {
     const before = process.listenerCount('unhandledRejection');
     uninstall = installUnhandledRejectionGuard();
     expect(process.listenerCount('unhandledRejection')).toBe(before + 1);
@@ -59,6 +64,7 @@ describe('installUnhandledRejectionGuard', () => {
       operation: 'unhandledRejection',
       kind: 'process',
     });
+    expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it('重复安装不会叠加监听器（模块可能被多次引导）', () => {
@@ -84,12 +90,13 @@ describe('installUnhandledRejectionGuard', () => {
     expect(reportMock).not.toHaveBeenCalled();
   });
 
-  it('上报本身抛错也不能把兜底变成新的崩溃源', () => {
+  it('terminates even when operational-error reporting itself throws', () => {
     reportMock.mockImplementation(() => {
       throw new Error('reporter exploded');
     });
     uninstall = installUnhandledRejectionGuard();
 
     expect(() => emitRejection(new Error('boom'))).not.toThrow();
+    expect(exitSpy).toHaveBeenCalledWith(1);
   });
 });

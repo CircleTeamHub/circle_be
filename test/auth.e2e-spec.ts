@@ -3,11 +3,13 @@ import { AuthErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { getE2eApp } from './e2e-context';
 
+const BYPASS_CODE = '999999';
 const EMAIL = 'e2e-user@example.com';
 const PASSWORD = 'password1';
 
 const registerBody = (overrides: Record<string, unknown> = {}) => ({
   email: EMAIL,
+  code: BYPASS_CODE,
   password: PASSWORD,
   confirmPassword: PASSWORD,
   nickname: 'Test User',

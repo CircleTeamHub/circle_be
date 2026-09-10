@@ -465,10 +465,9 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/auth/refresh', refreshLimiter);
   app.use('/api/v1/auth/admin/refresh', refreshLimiter);
   app.use('/api/v1/auth/logout', logoutLimiter);
-  // Password-reset code sends and security-code verification are the two
-  // unauthenticated-cost / brute-force surfaces from this branch.
-  // Password-reset requests use the same limiter as the legacy email-code
-  // endpoint did; registration no longer sends or verifies email codes.
+  // Registration and password-reset email sends share the same unauthenticated
+  // cost limiter so switching endpoints cannot bypass the send budget.
+  app.use('/api/v1/auth/email/request-code', emailCodeLimiter);
   app.use('/api/v1/auth/password/reset-request', emailCodeLimiter);
   app.use('/api/v1/auth/security-code/verify', securityCodeVerifyLimiter);
   app.use('/api/v1/user/search/account', accountSearchLimiter);

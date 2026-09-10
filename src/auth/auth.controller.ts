@@ -28,6 +28,7 @@ import { AuthService } from './auth.service';
 import { AuthSessionDto } from './dto/auth-session.dto';
 import { AuthTokensDto } from './dto/auth-tokens.dto';
 import { LoginDto } from './dto/login.dto';
+import { RequestEmailCodeDto } from './dto/request-email-code.dto';
 import {
   RequestPasswordResetDto,
   ResetPasswordDto,
@@ -119,6 +120,16 @@ export class AuthController {
   })
   adminLogin(@Body() dto: LoginDto, @Req() req?: Request) {
     return this.authService.adminLogin(dto, getSessionContext(req));
+  }
+
+  @Post('email/request-code')
+  @ApiOperation({ summary: 'Request a registration email verification code' })
+  @ApiBody({ type: RequestEmailCodeDto })
+  @ApiCreatedResponse({
+    description: 'Verification code sent (or silently ignored)',
+  })
+  requestEmailCode(@Body() dto: RequestEmailCodeDto) {
+    return this.authService.requestEmailCode(dto.email, dto.purpose);
   }
 
   @Post('refresh')

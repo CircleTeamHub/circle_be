@@ -3390,7 +3390,16 @@ export class ChatService {
         errorCode: ChatErrorCode.SensitiveWord,
       });
     }
-    const conversation = await this.requireMembership(conversationId, userId);
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    if (conversation.type === 'GROUP' && isSeatSilenced(member)) {
+      throw new ForbiddenException({
+        message: '你已被禁言',
+        errorCode: ChatErrorCode.MemberSilenced,
+      });
+    }
     await this.assertDirectMutationAllowed(conversation, userId);
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
@@ -3435,23 +3444,59 @@ export class ChatService {
     // 或被焚毁扫走。按 id 无条件写会把正文塞回一条 revokedAt 非空的行 ——
     // 库里成了「已撤回但有内容」,随后的 chat:edit 广播还会在客户端盖掉
     // 撤回事件,搜索也能搜出那段本该消失的文本。输了就当消息不存在。
-    const applied = await this.prisma.chatMessage.updateMany({
-      where: { id: messageId, revokedAt: null, deleted: false },
-      data: {
-        content: nextContent,
-        editedAt: new Date(),
-        contentHistory: history as Prisma.InputJsonValue,
-      },
-    });
-    if (applied.count === 0) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Group silence changes take this same row lock before updating the seat.
+      // Re-reading after the lock makes an edit and a concurrent silence obey
+      // one total order: whichever acquires the lock first wins completely.
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (locked.length === 0) {
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      const currentSeat = await tx.chatMember.findUnique({
+        where: {
+          conversationID_userID: {
+            conversationID: conversationId,
+            userID: userId,
+          },
+        },
+        select: { leftAt: true, silencedAt: true, silencedUntil: true },
       });
-    }
-    const updated = await this.prisma.chatMessage.findUniqueOrThrow({
-      where: { id: messageId },
-      omit: MESSAGE_READ_OMIT,
+      if (!currentSeat || currentSeat.leftAt) {
+        throw new ForbiddenException({
+          message: '不是会话成员',
+          errorCode: ChatErrorCode.NotMember,
+        });
+      }
+      if (conversation.type === 'GROUP' && isSeatSilenced(currentSeat)) {
+        throw new ForbiddenException({
+          message: '你已被禁言',
+          errorCode: ChatErrorCode.MemberSilenced,
+        });
+      }
+
+      const applied = await tx.chatMessage.updateMany({
+        where: { id: messageId, revokedAt: null, deleted: false },
+        data: {
+          content: nextContent,
+          editedAt: new Date(),
+          contentHistory: history as Prisma.InputJsonValue,
+        },
+      });
+      if (applied.count === 0) {
+        throw new NotFoundException({
+          message: '消息不存在',
+          errorCode: ChatErrorCode.MessageNotFound,
+        });
+      }
+      return tx.chatMessage.findUniqueOrThrow({
+        where: { id: messageId },
+        omit: MESSAGE_READ_OMIT,
+      });
     });
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
