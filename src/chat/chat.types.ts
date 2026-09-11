@@ -46,6 +46,12 @@ export interface ChatSenderInfo {
   id: string;
   nickname: string;
   avatarUrl: string | null;
+  /**
+   * 发送者在**这个会话**里的群昵称(ChatMember.alias,对全群可见);null = 用账号昵称。
+   * 只有在会话上下文里解析出来的发送者才会带值(气泡/群日志/系统提示);
+   * 单聊对端、跨会话的引用快照一律 null。
+   */
+  alias: string | null;
 }
 
 /** chat:msg 广播 / 历史接口共用的消息 DTO。 */
@@ -294,6 +300,8 @@ export interface ChatConversationDto {
   muteAll: boolean;
   /** 我给这个群起的备注,只有我看得见;null = 用群名(仅 GROUP)。 */
   myRemark: string | null;
+  /** 我在这个群里的群昵称(全群可见);null = 用账号昵称(仅 GROUP)。 */
+  myAlias: string | null;
   /** 独立群聊公告;圈子群/其他类型为 null(圈子群公告走圈子详情)。 */
   notice: string | null;
   /** 独立群聊头像;圈子群走 circle.avatarUrl;其他类型为 null。 */
