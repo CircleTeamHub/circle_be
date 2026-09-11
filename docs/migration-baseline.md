@@ -62,3 +62,37 @@ migrations still present in `_prisma_migrations` (they are reported as
 > ⚠️ Before running on prod, take a snapshot and ideally rehearse on a restored
 > copy. The fresh-DB path is fully validated; the existing-DB path was validated
 > against a simulated state, not your actual prod `_prisma_migrations` table.
+
+## CONCURRENTLY 索引：失败残骸要人工清
+
+热表上的索引用 `CREATE INDEX CONCURRENTLY` 建，避免构建期间停写（例：
+`20260906010000_add_chat_member_fanout_index` 之于 `ChatMember`）。
+
+它的失败模式是留下一个 `indisvalid = false` 的同名索引：占着名字、吃着写入开销，
+却永远不会被规划器选中。而迁移文件里写的是 `IF NOT EXISTS`，重跑会直接跳过并把
+迁移标成已应用 —— 索引从此不存在，且没有任何信号。
+
+**不要在迁移文件里加 `DROP INDEX CONCURRENTLY IF EXISTS` 来自愈。** 实测会失败：
+
+```
+ERROR: DROP INDEX CONCURRENTLY cannot run inside a transaction block  (SQLSTATE 25001)
+```
+
+同一个文件里纯 `CREATE INDEX CONCURRENTLY` 是可以的（见
+`20260729131000_admin_dashboard_indexes`，一个文件里 10 条都正常应用），
+但只要混进 `DROP ... CONCURRENTLY` 整个迁移就红。
+
+所以处置放在部署自检里，每次 `migrate deploy` 之后跑一遍：
+
+```sql
+SELECT c.relname
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE NOT i.indisvalid;
+```
+
+有输出就说明上一次 CONCURRENTLY 建索引被中断了。人工处置（两句都在事务外单独执行）：
+
+```sql
+DROP INDEX CONCURRENTLY "<名字>";
+-- 然后把该迁移对应的 CREATE INDEX CONCURRENTLY 语句手动补跑一次
+```

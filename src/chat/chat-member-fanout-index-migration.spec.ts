@@ -23,7 +23,9 @@ describe('chat member fanout index migration', () => {
     expect(existsSync(migrationPath)).toBe(true);
     const sql = read(migrationPath);
 
-    expect(sql).toMatch(/CREATE INDEX "ChatMember_fanout_idx"/);
+    expect(sql).toMatch(
+      /CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatMember_fanout_idx"/,
+    );
     // 顺序即语义：等值(conversationID) -> NULL 条件(leftAt) -> 范围
     // (clearedBeforeHeight)，范围列之后的列不能再当索引条件用，所以两个
     // 覆盖列必须排在最后。

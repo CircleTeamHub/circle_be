@@ -381,6 +381,8 @@ export const CollectionErrorCode = {
   // 阅后即焚会话里别人发的消息不可收藏 —— 与 CHAT_FORWARD_FORBIDDEN 同一条理由，
   // 但收藏走的是另一扇门（客户端拼快照直接 POST），那道闸管不到它。
   EphemeralForbidden: 'COLLECTION_EPHEMERAL_FORBIDDEN',
+  // 聊天收藏必须绑定当前用户可访问的服务端消息；不能信任客户端自报的快照。
+  InvalidMessageSource: 'COLLECTION_INVALID_MESSAGE_SOURCE',
 } as const;
 
 // 展示图标 / 系统图标 / 圈子图标选择。(注:图标页暂未接入 getApiErrorMessage,待前端接线。)

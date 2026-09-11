@@ -57,6 +57,7 @@ import {
   RELAX_PURGE_BATCH,
   RELAX_PURGE_BATCHES_MAX,
 } from './chat.constants';
+import { messagePreviewText } from './chat-message-preview';
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
@@ -65,6 +66,7 @@ import type {
   ChatMutationsPageDto,
   HistoryFilters,
   ChatMessageDto,
+  VisibleChatMessage,
   ChatSenderInfo,
   ChatSendPayload,
 } from './chat.types';
@@ -550,29 +552,70 @@ export class ChatService {
     return { message, reused };
   }
 
-  private async resolveForwardableMedia(
+  /**
+   * 「这条消息此刻对该用户可见」的唯一判定 —— 转发与收藏共用同一把尺子,
+   * 别再各自复制一份弱化版(收藏曾只看 member.leftAt,漏掉清空水位与销毁/焚毁窗口)。
+   *
+   * 逐项:消息存在且未删/未撤回 → 查看者仍在座(requireMembershipSeat:未退群,
+   * 座位与会话的清空水位取严者)→ height 高于清空水位 → createdAt 不早于本人
+   * 自动销毁与会话焚毁两条截止时间中更严的一条。
+   *
+   * 焚毁会话里自己发的消息也走这里:「自己的」这个口子不能顺带放行自己早就
+   * 烧掉的消息,所以烧毁水位对谁都参与判定。
+   *
+   * 不看 hiddenAt:那只是把会话从列表里划走(swipe hide),点进去照样能看,
+   * getHistory 同样不把它当可见性条件。
+   *
+   * 抛错口径与读路径一致:不存在/不可见 → CHAT_MESSAGE_NOT_FOUND(404),
+   * 不在座 → CHAT_NOT_MEMBER(403)。调用方只需要按这两种处理。
+   */
+  async requireVisibleMessage(
     userId: string,
     messageId: string,
-  ): Promise<{ type: string; content: Record<string, unknown> }> {
+  ): Promise<VisibleChatMessage> {
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
       omit: MESSAGE_READ_OMIT,
     });
-    if (
-      !row ||
-      row.deleted ||
-      row.revokedAt ||
-      !MEDIA_MESSAGE_TYPES.includes(row.type)
-    ) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
-      });
+    if (!row || row.deleted || row.revokedAt) {
+      throw this.messageNotFound();
     }
     const { conversation, member } = await this.requireMembershipSeat(
       row.conversationID,
       userId,
     );
+    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const burnCutoff = conversation.burnDurationSec
+      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
+      : null;
+    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
+    if (
+      row.height <= (member.clearedBeforeHeight ?? 0) ||
+      (cutoff !== null && row.createdAt < cutoff)
+    ) {
+      throw this.messageNotFound();
+    }
+    return { row, conversation, member };
+  }
+
+  private messageNotFound(): NotFoundException {
+    return new NotFoundException({
+      message: '消息不存在',
+      errorCode: ChatErrorCode.MessageNotFound,
+    });
+  }
+
+  private async resolveForwardableMedia(
+    userId: string,
+    messageId: string,
+  ): Promise<{ type: string; content: Record<string, unknown> }> {
+    const { row, conversation } = await this.requireVisibleMessage(
+      userId,
+      messageId,
+    );
+    if (!MEDIA_MESSAGE_TYPES.includes(row.type)) {
+      throw this.messageNotFound();
+    }
     // 可见性只回答「你现在能不能看见」,回答不了「你能不能让别人永远看见」。
     // 阅后即焚会话的短暂性是**发送者对收件人的承诺**:把别人发的对象复制进一个
     // 没有 burn 的会话,等于绕开那条承诺把它永久化,副本还活得比源消息久。
@@ -585,28 +628,9 @@ export class ChatService {
         errorCode: ChatErrorCode.ForwardForbidden,
       });
     }
-    // burn 会话现在还能走到这儿(自己发的),所以烧毁水位必须重新参与判定 ——
-    // 否则「自己的」这个口子会顺带放行自己早就烧掉的消息。
-    const viewerCutoff = await this.selfDestructCutoff(userId);
-    const burnCutoff = conversation.burnDurationSec
-      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
-      : null;
-    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
-    if (
-      row.height <= (member.clearedBeforeHeight ?? 0) ||
-      (cutoff !== null && row.createdAt < cutoff)
-    ) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
-      });
-    }
     const content = row.content;
     if (!content || typeof content !== 'object' || Array.isArray(content)) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
-      });
+      throw this.messageNotFound();
     }
     return { type: row.type, content: content as Record<string, unknown> };
   }
@@ -3450,7 +3474,7 @@ export class ChatService {
         height: row.height,
         senderNickname: this.senderFor(row, senders)?.nickname ?? '',
         type: row.type,
-        preview: revoked ? '' : previewOfContent(row.type, row.content),
+        preview: revoked ? '' : messagePreviewText(row.type, row.content),
         revoked,
       };
     }
@@ -4322,37 +4346,4 @@ export class ChatService {
       (error as { code?: unknown }).code === 'P2002'
     );
   }
-}
-
-/**
- * 被引用消息的短摘要(服务端生成,进 replyTo 快照)。
- * 与 chat-push 的预览同一取向:文本截断,媒体/卡片用类型标签,
- * 具体文案的本地化仍由前端词表负责,这里只是兜底展示。
- */
-const REPLY_PREVIEW_MAX = 40;
-const REPLY_PREVIEW_LABELS: Record<string, string> = {
-  image: '[图片]',
-  video: '[视频]',
-  voice: '[语音]',
-  file: '[文件]',
-  location: '[位置]',
-  'note-card': '[笔记]',
-  'friend-card': '[名片]',
-  'circle-card': '[圈子]',
-  'plaza-post-card': '[帖子]',
-  'qr-card': '[二维码]',
-  'transfer-card': '[转账]',
-  'verification-card': '[验证]',
-  'call-record': '[通话]',
-};
-
-function previewOfContent(type: string, content: unknown): string {
-  const record = (content ?? {}) as Record<string, unknown>;
-  if (type === 'text' || type === 'quote') {
-    const text = typeof record['text'] === 'string' ? record['text'] : '';
-    return text.length > REPLY_PREVIEW_MAX
-      ? `${text.slice(0, REPLY_PREVIEW_MAX)}…`
-      : text;
-  }
-  return REPLY_PREVIEW_LABELS[type] ?? '[消息]';
 }

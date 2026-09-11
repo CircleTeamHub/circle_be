@@ -12,5 +12,7 @@
 -- 写入侧的代价是可控的：ChatMember 上最频繁的更新是 lastReadHeight /
 -- lastDeliveredHeight / hiddenAt，三者都不在这个索引里，HOT update 仍然成立。
 -- 索引里的 leftAt / clearedBeforeHeight / muted 都是低频变更。
-CREATE INDEX "ChatMember_fanout_idx"
+-- ChatMember 是收发消息与成员变更的热表；普通 CREATE INDEX 会在构建期间
+-- 阻塞写入。CONCURRENTLY 避免发布窗口停写，IF NOT EXISTS 让已预建或重跑安全。
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatMember_fanout_idx"
 ON "ChatMember"("conversationID", "leftAt", "clearedBeforeHeight", "userID", "muted");
