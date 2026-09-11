@@ -9,7 +9,7 @@ import { ChatGroupEventService } from './chat-group-event.service';
  */
 describe('ChatGroupEventService', () => {
   const prisma = {
-    chatMember: { findUnique: jest.fn() },
+    chatMember: { findUnique: jest.fn(), findMany: jest.fn() },
     circleMember: { findUnique: jest.fn() },
     chatGroupEvent: { findMany: jest.fn(), create: jest.fn() },
     user: { findMany: jest.fn() },
@@ -35,6 +35,8 @@ describe('ChatGroupEventService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.chatMember.findUnique.mockResolvedValue(seat());
+    // 群日志的人名与气泡同口径:默认没人设群昵称。
+    prisma.chatMember.findMany.mockResolvedValue([]);
     prisma.chatGroupEvent.findMany.mockResolvedValue([]);
     prisma.user.findMany.mockResolvedValue([]);
   });
@@ -86,12 +88,34 @@ describe('ChatGroupEventService', () => {
     expect(page.events[0]).toMatchObject({
       id: 'event-1',
       kind: 'member-joined',
-      actor: { id: 'owner-1', nickname: 'Owner' },
+      actor: { id: 'owner-1', nickname: 'Owner', alias: null },
       // 查不到的账号保留 id、昵称空串,由客户端兜底文案。
-      targets: [{ id: 'u-2', nickname: '', avatarUrl: null }],
+      targets: [{ id: 'u-2', nickname: '', avatarUrl: null, alias: null }],
       payload: null,
     });
     expect(page.nextCursor).toBeNull();
+  });
+
+  it('shows the group nickname of the people in the log', async () => {
+    prisma.chatGroupEvent.findMany.mockResolvedValue([row(1)]);
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'owner-1', nickname: 'Owner', avatarUrl: null },
+    ]);
+    prisma.chatMember.findMany.mockResolvedValue([
+      { conversationID: 'conv-1', userID: 'owner-1', alias: '群主本人' },
+    ]);
+    const page = await service.listEvents('u-2', 'conv-1', {});
+    expect(page.events[0].actor).toMatchObject({
+      id: 'owner-1',
+      nickname: 'Owner',
+      alias: '群主本人',
+    });
+    // 群昵称按 (会话, 用户) 取:只查本会话、只取设了昵称的座位。
+    expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ alias: { not: null } }),
+      }),
+    );
   });
 
   it('paginates with a (createdAt, id) keyset cursor', async () => {

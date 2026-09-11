@@ -19,6 +19,7 @@ import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
+import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { ChatService } from './chat.service';
 import { ClearHistoryDto } from './dto/clear-history.dto';
 import {
@@ -26,6 +27,15 @@ import {
   SetGroupMemberRoleDto,
   SilenceGroupMemberDto,
 } from './dto/group-admin.dto';
+import {
+  SetGroupAvatarDto,
+  SetGroupMuteAllDto,
+  SetGroupNoticeDto,
+  SetMyGroupAliasDto,
+  SetMyGroupRemarkDto,
+  TransferGroupOwnerDto,
+  UpdateGroupPoliciesDto,
+} from './dto/group-settings.dto';
 import { ConversationPreferencesDto } from './dto/conversation-preferences.dto';
 import { CreateCircleConversationDto } from './dto/create-circle-conversation.dto';
 import { CreateDirectConversationDto } from './dto/create-direct-conversation.dto';
@@ -42,6 +52,7 @@ import { MutationsQueryDto } from './dto/mutations-query.dto';
 import type {
   ChatConversationDto,
   ChatGroupEventsPageDto,
+  ChatGroupPoliciesDto,
   ChatHistoryPageDto,
   ChatMemberDto,
   ChatMemberSilenceDto,
@@ -63,6 +74,7 @@ export class ChatController {
     private readonly chatService: ChatService,
     private readonly groupAdmin: ChatGroupAdminService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly groupSettings: ChatGroupSettingsService,
   ) {}
 
   @Get('conversations')
@@ -311,6 +323,125 @@ export class ChatController {
       req.user.userId,
       conversationId,
       targetUserId,
+    );
+  }
+
+  @Patch('conversations/:id/my-remark')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '群备注:我给这个群起的名字,只有我看得见(任一在座成员;空串清除,回落群名)',
+  })
+  setMyGroupRemark(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetMyGroupRemarkDto,
+  ): Promise<{ remark: string | null }> {
+    return this.chatService.setMyGroupRemark(
+      req.user.userId,
+      conversationId,
+      body.remark,
+    );
+  }
+
+  @Patch('conversations/:id/my-alias')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '群昵称:改自己在本群的显示名(任一在座成员;空串清除,回落账号昵称)',
+  })
+  setMyGroupAlias(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetMyGroupAliasDto,
+  ): Promise<{ alias: string | null }> {
+    return this.chatService.setMyGroupAlias(
+      req.user.userId,
+      conversationId,
+      body.alias,
+    );
+  }
+
+  @Patch('conversations/:id/mute-all')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '全员禁言开关(两种群;群主/管理员;管理员与群主豁免)',
+  })
+  setGroupMuteAll(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetGroupMuteAllDto,
+  ): Promise<{ muteAll: boolean }> {
+    return this.groupSettings.setMuteAll(
+      req.user.userId,
+      conversationId,
+      body.enabled,
+    );
+  }
+
+  @Post('conversations/:id/owner')
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '独立群聊:群主转让(新群主座位的管理员标记与禁言清零)',
+  })
+  transferGroupOwner(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: TransferGroupOwnerDto,
+  ): Promise<void> {
+    return this.groupSettings.transferOwnership(
+      req.user.userId,
+      conversationId,
+      body.userId,
+    );
+  }
+
+  @Patch('conversations/:id/notice')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({ summary: '独立群聊:群公告(群主/管理员;空串清空)' })
+  setGroupNotice(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetGroupNoticeDto,
+  ): Promise<{ notice: string | null }> {
+    return this.groupSettings.setNotice(
+      req.user.userId,
+      conversationId,
+      body.notice,
+    );
+  }
+
+  @Patch('conversations/:id/avatar')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '独立群聊:群头像(群主/管理员;URL 必须来自本应用存储)',
+  })
+  setGroupAvatar(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: SetGroupAvatarDto,
+  ): Promise<{ avatarUrl: string }> {
+    return this.groupSettings.setAvatar(
+      req.user.userId,
+      conversationId,
+      body.avatarUrl,
+    );
+  }
+
+  @Patch('conversations/:id/policies')
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '群策略开关(两种群;群主/管理员):成员邀请 / 二维码入群 / 成员可查看资料 / 成员可加好友',
+  })
+  updateGroupPolicies(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Body() body: UpdateGroupPoliciesDto,
+  ): Promise<ChatGroupPoliciesDto> {
+    return this.groupSettings.updatePolicies(
+      req.user.userId,
+      conversationId,
+      body,
     );
   }
 

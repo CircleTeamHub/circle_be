@@ -447,6 +447,8 @@ export class ChatDirectAutoReplyProcessor {
           id: responder.id,
           nickname: responder.nickname,
           avatarUrl: responder.avatarUrl,
+          // 自动回复只发生在单聊(上面刚断言过恰好两个座位),没有群昵称可言。
+          alias: null,
         },
         replyToId: null,
         d: created.clientMessageId,

@@ -89,6 +89,66 @@ describe('NotificationController', () => {
     );
   });
 
+  // 这两条端点读写的是 per-user 的推送开关：路由上没有 userId，唯一的收件人
+  // 身份来自 JWT。controller 若从 body/query 取 id，一个人就能改别人的推送设置。
+  it('reads the circle push preference for the authenticated user only', async () => {
+    const notificationService = {
+      getCirclePushPreference: jest
+        .fn()
+        .mockResolvedValue({ circleOfflinePushEnabled: false }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await expect(
+      controller.getCirclePushPreference({
+        user: { userId: 'user-1' },
+      } as any),
+    ).resolves.toEqual({ circleOfflinePushEnabled: false });
+
+    expect(notificationService.getCirclePushPreference).toHaveBeenCalledWith(
+      'user-1',
+    );
+  });
+
+  it('writes the circle push preference for the authenticated user only', async () => {
+    const notificationService = {
+      setCirclePushPreference: jest
+        .fn()
+        .mockResolvedValue({ circleOfflinePushEnabled: false }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await expect(
+      controller.setCirclePushPreference(
+        { user: { userId: 'user-1' } } as any,
+        { circleOfflinePushEnabled: false },
+      ),
+    ).resolves.toEqual({ circleOfflinePushEnabled: false });
+
+    expect(notificationService.setCirclePushPreference).toHaveBeenCalledWith(
+      'user-1',
+      false,
+    );
+  });
+
+  // 回显必须是服务端写完之后的真值：客户端拿它对账本地镜像，回显请求体
+  // 等于「无论写没写成都说写成了」。
+  it('echoes the stored value rather than the request body', async () => {
+    const notificationService = {
+      setCirclePushPreference: jest
+        .fn()
+        .mockResolvedValue({ circleOfflinePushEnabled: true }),
+    };
+    const controller = new NotificationController(notificationService as any);
+
+    await expect(
+      controller.setCirclePushPreference(
+        { user: { userId: 'user-1' } } as any,
+        { circleOfflinePushEnabled: false },
+      ),
+    ).resolves.toEqual({ circleOfflinePushEnabled: true });
+  });
+
   it('checks notification ownership using the authenticated user and route id', async () => {
     const notificationService = {
       getNotificationOpenOwnership: jest

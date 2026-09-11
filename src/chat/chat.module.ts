@@ -16,6 +16,7 @@ import { ChatController } from './chat.controller';
 import { ChatGateway } from './chat.gateway';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
+import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { ChatMediaService } from './chat-media.service';
 import { ChatPushService } from './chat-push.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
@@ -52,6 +53,7 @@ import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor
     ChatCircleSyncService,
     ChatGroupAdminService,
     ChatGroupEventService,
+    ChatGroupSettingsService,
     ChatMediaService,
     ChatPushService,
     ChatSystemMessageService,

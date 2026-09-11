@@ -362,6 +362,10 @@ model User {
   adminLoginAttempts           Int        @default(0)
   adminLoginLockedUntil        DateTime?
   singleDeviceLoginEnabled     Boolean    @default(false)
+  /// 圈子通知「离线提醒」：APP 离线时是否向该用户投递 CIRCLE_* 推送。
+  /// 默认 true —— 与既有行为一致（此前推送不读任何用户偏好，人人都收）。
+  /// 客户端的总闸关掉时也会把这里同步成 false，服务端只认这一个值。
+  circleOfflinePushEnabled     Boolean    @default(true)
   nickname                     String
   avatarUrl                    String?
   avatarFrame                  String?
@@ -2064,8 +2068,27 @@ model ChatConversation {
   ownerID    String?
   /// 会话列表排序依据；发送事务内更新。
   lastMessageAt DateTime?
-  /// 管理台群禁言（全员禁言，圈主/管理员豁免）；null=未禁言。
+  /// 全员禁言（管理台或群主/管理员开启;圈主/管理员、独立群群主/管理员豁免）；null=未禁言。
   muteAllAt     DateTime?
+  /// 独立群聊公告（圈子群走 Circle.description）。
+  notice        String?
+  /// 独立群聊头像（圈子群走 Circle.avatarUrl）；只接受本应用存储的 URL。
+  avatarUrl     String?
+  /// 独立群聊:普通成员能否拉好友进群（圈子群看 Circle.memberCanInvite）。
+  memberCanInvite Boolean @default(true)
+  /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
+  qrJoinEnabled Boolean @default(true)
+  /// 普通成员能否从群里打开其他成员的资料（两种群;群主/管理员不受限）。
+  /// DB 默认**关**:圈子成员目录原本只对圈主/管理员开放,漏写的行只能更严不能更松
+  /// (蓝绿窗口里老二进制建的圈子会话也会落在这个默认上)。
+  /// 独立群聊在 createGroupConversation 里显式写 true。
+  membersCanViewProfiles Boolean @default(false)
+  /// 普通成员能否看到群成员名单本身（两种群;群主/管理员不受限）。
+  /// 与 membersCanViewProfiles 分开:看不到名单的人仍可能在聊天里点到某人的头像,
+  /// 那一层由 membersCanViewProfiles 单独把关。默认同样是关,理由同上。
+  membersCanViewRoster Boolean @default(false)
+  /// 普通成员能否通过群加其他成员为好友（两种群;群主/管理员不受限）。
+  membersCanAddFriends Boolean @default(true)
   /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。
   burnDurationSec Int?
   /// height 计数器（G-05）：最后已分配的 height。取号 = SELECT..FOR UPDATE 行锁下 +1；
@@ -2106,6 +2129,13 @@ model ChatMember {
   muted          Boolean   @default(false)
   /// 独立群聊的管理员标记(圈子群忽略,见 ChatMemberRole)。退群/被移出时复位。
   role           ChatMemberRole @default(MEMBER)
+  /// 本人在这个群里的昵称，对全群可见；null = 用账号昵称。
+  /// 这是「我给自己起的名字、群里所有人看见」。
+  alias          String?
+  /// 群备注：我给这个群起的名字，**只有我看得见**（对应单聊的好友备注）。
+  /// 与 alias 正好相反，也与 ChatConversation.name / Circle.name 无关 ——
+  /// 那两个是全群共享的群名，改了所有人都看到。null = 用群名。
+  remark         String?
   /// 禁言(不能发言;群主/管理员对成员施加)。silencedAt 非空 = 处于禁言,
   /// silencedUntil 空 = 直到解除。词汇约定:代码里 mute = 免打扰,silence = 禁言;
   /// 只有会话上的 muteAllAt / 错误码 CHAT_CONVERSATION_MUTED 是更早的遗留命名。

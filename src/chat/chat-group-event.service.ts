@@ -13,6 +13,7 @@ import {
   GROUP_EVENTS_PAGE_MAX,
   isGroupManager,
 } from './chat-group-roles';
+import { loadSeatAliases, seatKey } from './chat-seat-alias';
 import type {
   ChatGroupEventDto,
   ChatGroupEventKind,
@@ -117,6 +118,7 @@ export class ChatGroupEventService {
     });
     const page = rows.slice(0, limit);
     const users = await this.resolveUsers(
+      conversationId,
       page.flatMap((row) => [
         ...(row.actorID ? [row.actorID] : []),
         ...row.targetIDs,
@@ -193,19 +195,32 @@ export class ChatGroupEventService {
     }
   }
 
+  /** 群日志里的人名与气泡同一口径:本群的群昵称优先,没设才回落账号昵称。 */
   private async resolveUsers(
+    conversationId: string,
     userIds: string[],
   ): Promise<Map<string, ChatSenderInfo>> {
     const unique = [...new Set(userIds)];
     if (unique.length === 0) return new Map();
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: unique } },
-      select: { id: true, nickname: true, avatarUrl: true },
-    });
+    const [users, aliases] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { id: { in: unique } },
+        select: { id: true, nickname: true, avatarUrl: true },
+      }),
+      loadSeatAliases(
+        this.prisma,
+        unique.map((userId) => ({ conversationId, userId })),
+      ),
+    ]);
     return new Map(
       users.map((user) => [
         user.id,
-        { id: user.id, nickname: user.nickname, avatarUrl: user.avatarUrl },
+        {
+          id: user.id,
+          nickname: user.nickname,
+          avatarUrl: user.avatarUrl,
+          alias: aliases.get(seatKey(conversationId, user.id)) ?? null,
+        },
       ]),
     );
   }
@@ -213,7 +228,7 @@ export class ChatGroupEventService {
 
 /** 已注销/查不到的账号:保留 id、昵称空串,由客户端兜底文案。 */
 function ghost(id: string): ChatSenderInfo {
-  return { id, nickname: '', avatarUrl: null };
+  return { id, nickname: '', avatarUrl: null, alias: null };
 }
 
 function encodeCursor(cursor: EventCursor): string {

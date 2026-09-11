@@ -13,7 +13,11 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { JwtGuard } from 'src/guards/jwt.guard';
-import { DeletePushTokenDto, RegisterPushTokenDto } from './notification.dto';
+import {
+  DeletePushTokenDto,
+  RegisterPushTokenDto,
+  UpdateCirclePushPreferenceDto,
+} from './notification.dto';
 import {
   NotificationDomainQueryDto,
   NotificationListQueryDto,
@@ -34,6 +38,26 @@ export class NotificationController {
   })
   getUnreadSummary(@Req() req: any) {
     return this.notificationService.getUnreadSummary(req.user.userId);
+  }
+
+  @Get('circle-push-preference')
+  @ApiOperation({
+    summary: '读圈子离线推送开关（「圈子通知设置 → 离线提醒」的服务端那一半）',
+  })
+  getCirclePushPreference(@Req() req: any) {
+    return this.notificationService.getCirclePushPreference(req.user.userId);
+  }
+
+  @Put('circle-push-preference')
+  @ApiOperation({ summary: '设置圈子离线推送开关' })
+  setCirclePushPreference(
+    @Req() req: any,
+    @Body() dto: UpdateCirclePushPreferenceDto,
+  ) {
+    return this.notificationService.setCirclePushPreference(
+      req.user.userId,
+      dto.circleOfflinePushEnabled,
+    );
   }
 
   @Get('list')

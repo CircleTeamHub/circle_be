@@ -30,6 +30,7 @@ import {
   ReportFriendDto,
 } from './dto/friend.dto';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 // Members (paid) get 5 000, regular users get 1 000.
 const FRIEND_REQUEST_PAGE_SIZE = 500;
@@ -174,6 +175,8 @@ export class FriendService {
       photos?: string[];
       permission?: FriendPermission;
       qrToken?: string;
+      /** 从群成员资料发起:该群关闭「成员可添加好友」且申请人不是群主/管理员时拒绝。 */
+      viaConversationId?: string;
     },
   ): Promise<void> {
     if (senderId === targetId) {
@@ -182,6 +185,20 @@ export class FriendService {
         errorCode: FriendErrorCode.SelfAdd,
       });
     }
+    if (extras?.viaConversationId) {
+      await this.assertGroupAllowsFriendRequests(
+        extras.viaConversationId,
+        senderId,
+      );
+    }
+    // 上面那条快路径只在客户端**自己**说「我是从某个群点进来的」时才跑,不传字段
+    // 等于开关不存在。真正的 enforcement 必须从双方关系里推:两个人只通过关着
+    // 「成员可添加好友」的独立群认识时,不管请求怎么拼都拒绝。
+    await this.assertStandaloneGroupPolicyAllows(
+      senderId,
+      targetId,
+      'membersCanAddFriends',
+    );
 
     // Make sure the target user exists and is active
     const target = await this.prisma.user.findUnique({
@@ -2073,6 +2090,85 @@ export class FriendService {
       throw new ForbiddenException({
         message: `Friend limit reached (${limit}). Upgrade to MEMBER for a higher limit.`,
         errorCode: FriendErrorCode.LimitReached,
+      });
+    }
+  }
+
+  /**
+   * 「成员可添加好友」是群策略:申请人经由某个群的成员资料发起加好友时,
+   * 该群关着这个开关且申请人不是群主/管理员 → 拒绝。不在座/不是群会话则与群无关,
+   * 按普通加好友处理(不额外放行也不额外拦截)。
+   */
+  private async assertGroupAllowsFriendRequests(
+    conversationId: string,
+    senderId: string,
+  ): Promise<void> {
+    const seat = await this.prisma.chatMember.findUnique({
+      where: {
+        conversationID_userID: {
+          conversationID: conversationId,
+          userID: senderId,
+        },
+      },
+      select: {
+        role: true,
+        leftAt: true,
+        conversation: {
+          select: {
+            type: true,
+            circleID: true,
+            ownerID: true,
+            membersCanAddFriends: true,
+          },
+        },
+      },
+    });
+    if (!seat || seat.leftAt || seat.conversation.type !== 'GROUP') return;
+    if (seat.conversation.membersCanAddFriends) return;
+    let manager: boolean;
+    if (seat.conversation.circleID) {
+      const membership = await this.prisma.circleMember.findUnique({
+        where: {
+          userID_circleID: {
+            userID: senderId,
+            circleID: seat.conversation.circleID,
+          },
+        },
+        select: { role: true, status: true },
+      });
+      manager =
+        membership?.status === 'ACTIVE' &&
+        (membership.role === 'OWNER' || membership.role === 'ADMIN');
+    } else {
+      manager = seat.conversation.ownerID === senderId || seat.role === 'ADMIN';
+    }
+    if (!manager) {
+      throw new ForbiddenException({
+        message: '该群不允许成员互加好友',
+        errorCode: FriendErrorCode.GroupAddForbidden,
+      });
+    }
+  }
+
+  /**
+   * 「成员可添加好友」的服务端推导版(不依赖客户端自报来源)。判定见
+   * standalone-group-policy-gate:只有当双方**仅仅**通过关着开关的独立群认识时才拒。
+   */
+  private async assertStandaloneGroupPolicyAllows(
+    senderId: string,
+    targetId: string,
+    policy: 'membersCanAddFriends',
+  ): Promise<void> {
+    const blocked = await isBlockedByStandaloneGroupPolicy(
+      this.prisma,
+      senderId,
+      targetId,
+      policy,
+    );
+    if (blocked) {
+      throw new ForbiddenException({
+        message: '该群不允许成员互加好友',
+        errorCode: FriendErrorCode.GroupAddForbidden,
       });
     }
   }

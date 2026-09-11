@@ -30,6 +30,10 @@ describe('UserService', () => {
     userLike: {
       findUnique: jest.fn(),
     },
+    // 「成员可查看他人资料」的服务端推导(见 standalone-group-policy-gate)。
+    chatMember: { findMany: jest.fn() },
+    friend: { findFirst: jest.fn() },
+    circleMember: { findFirst: jest.fn() },
     accountIdentifier: {
       findUnique: jest.fn(),
       findMany: jest.fn(),
@@ -80,6 +84,10 @@ describe('UserService', () => {
     // clearAllMocks 只清调用记录、不清实现，逐个用例覆盖过的返回值会漏给下一个。
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: true });
     prisma.userLike.findUnique.mockResolvedValue(null);
+    // 默认两人没有共同的独立群 —— 资料可见性与群策略无关。
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    prisma.circleMember.findFirst.mockResolvedValue(null);
     prisma.accountIdentifier.findUnique.mockResolvedValue(null);
     // 邀请码分配改成批量候选查询：默认没有任何候选被占用。
     prisma.user.findMany.mockResolvedValue([]);

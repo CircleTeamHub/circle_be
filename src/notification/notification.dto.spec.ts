@@ -1,6 +1,10 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { RegisterPushTokenDto, RevokePushTokenDto } from './notification.dto';
+import {
+  RegisterPushTokenDto,
+  RevokePushTokenDto,
+  UpdateCirclePushPreferenceDto,
+} from './notification.dto';
 
 describe('push token DTOs', () => {
   const registration = (overrides: Record<string, unknown> = {}) =>
@@ -87,5 +91,52 @@ describe('push token shape validation (#98)', () => {
         'token',
       );
     }
+  });
+});
+
+describe('UpdateCirclePushPreferenceDto', () => {
+  // 全局 ValidationPipe 开着 enableImplicitConversion（src/setup.ts），它跑在
+  // 校验之前，会把任意非空字符串转成 true。plainToInstance 带上同一个选项，
+  // 测的才是线上那条路径。
+  const parse = (value: unknown) =>
+    plainToInstance(
+      UpdateCirclePushPreferenceDto,
+      { circleOfflinePushEnabled: value },
+      { enableImplicitConversion: true },
+    );
+
+  it('接受真正的布尔值', () => {
+    for (const value of [true, false]) {
+      const dto = parse(value);
+      expect(validateSync(dto)).toHaveLength(0);
+      expect(dto.circleOfflinePushEnabled).toBe(value);
+    }
+  });
+
+  // 这才是这个开关最要命的输入：`"false"` 被隐式转换成 true，用户以为关掉了
+  // 离线提醒、服务端照推不误 —— 而关掉它正是这个接口存在的唯一理由。
+  it('拒绝会被隐式转换成 true 的字符串', () => {
+    for (const value of ['false', '0', 'true', '1', 'no']) {
+      expect(
+        validateSync(parse(value)).map((error) => error.property),
+      ).toContain('circleOfflinePushEnabled');
+    }
+  });
+
+  it('拒绝数字、null 与缺字段', () => {
+    for (const value of [0, 1, null, undefined]) {
+      expect(
+        validateSync(parse(value)).map((error) => error.property),
+      ).toContain('circleOfflinePushEnabled');
+    }
+    expect(
+      validateSync(
+        plainToInstance(
+          UpdateCirclePushPreferenceDto,
+          {},
+          { enableImplicitConversion: true },
+        ),
+      ).map((error) => error.property),
+    ).toContain('circleOfflinePushEnabled');
   });
 });

@@ -29,6 +29,14 @@ export class SendFriendRequestDto {
   @IsUUID()
   targetId: string;
 
+  @ApiPropertyOptional({
+    description:
+      '从哪个群的成员资料发起的加好友;该群关闭了「成员可添加好友」且申请人不是群主/管理员时拒绝',
+  })
+  @IsOptional()
+  @IsUUID()
+  viaConversationId?: string;
+
   @ApiPropertyOptional({ example: "Hey, let's be friends!" })
   @IsOptional()
   @IsString()

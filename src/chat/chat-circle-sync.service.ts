@@ -182,7 +182,14 @@ export class ChatCircleSyncService {
       if (!conversation) {
         try {
           conversation = await tx.chatConversation.create({
-            data: { type: 'GROUP', circleID: circleId },
+            // 圈子成员目录只对圈主/管理员开放(review R2):「成员可查看他人资料」
+            // 对圈子群默认关闭,由圈主自己决定放开。
+            data: {
+              type: 'GROUP',
+              circleID: circleId,
+              membersCanViewProfiles: false,
+              membersCanViewRoster: false,
+            },
             select: { id: true, clearedBeforeHeight: true },
           });
           created = true;

@@ -5,6 +5,7 @@ import { SYSTEM_MESSAGE_TYPE } from './chat.constants';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatMediaService } from './chat-media.service';
 import { ChatPushService } from './chat-push.service';
+import { loadSeatAliases, seatKey } from './chat-seat-alias';
 import type { ChatMessageDto, ChatSenderInfo } from './chat.types';
 
 export interface ServerMessageInput {
@@ -100,7 +101,7 @@ export class ChatSystemMessageService {
     let sender: ChatSenderInfo | null = null;
     if (input.senderID) {
       try {
-        sender = await this.resolveSender(input.senderID);
+        sender = await this.resolveSender(conversationId, input.senderID);
       } catch (error) {
         // 消息已经提交，昵称/头像只是装饰。查询失败不能把一次可重试调用变成
         // 「数据库里有消息、实时端永远没收到」的半成功状态。
@@ -133,13 +134,25 @@ export class ChatSystemMessageService {
     return dto;
   }
 
-  private async resolveSender(userId: string): Promise<ChatSenderInfo | null> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, nickname: true, avatarUrl: true },
-    });
+  /** 服务端代发的卡片也要按气泡口径显示:本会话的群昵称优先。 */
+  private async resolveSender(
+    conversationId: string,
+    userId: string,
+  ): Promise<ChatSenderInfo | null> {
+    const [user, aliases] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, nickname: true, avatarUrl: true },
+      }),
+      loadSeatAliases(this.prisma, [{ conversationId, userId }]),
+    ]);
     return user
-      ? { id: user.id, nickname: user.nickname, avatarUrl: user.avatarUrl }
+      ? {
+          id: user.id,
+          nickname: user.nickname,
+          avatarUrl: user.avatarUrl,
+          alias: aliases.get(seatKey(conversationId, user.id)) ?? null,
+        }
       : null;
   }
 

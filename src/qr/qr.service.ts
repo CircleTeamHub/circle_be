@@ -6,7 +6,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { QrErrorCode } from 'src/common/app-error-codes';
+import { ChatErrorCode, QrErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatService } from 'src/chat/chat.service';
 import { CircleInvitationService } from 'src/circle-invitation/circle-invitation.service';
@@ -232,6 +232,7 @@ export class QrService {
     }
 
     if (row.type === 'GROUP') {
+      // 群主关掉「二维码入群」后,已经签出去的码也一并失效(闸在入群这一侧)。
       const conversation = await this.chatService.joinStandaloneGroupViaQr(
         viewerId,
         row.targetID,
@@ -243,6 +244,8 @@ export class QrService {
       };
     }
 
+    // 圈子群关掉「二维码入群」后,圈码同样失效(圈子的会话行上记着这个开关)。
+    await this.assertCircleQrJoinEnabled(row.targetID);
     // 圈子:签发人立场的邀请。快照语义(requiredVerifierCount=1 且签发人可担保)
     // 直接入圈;严格模式建担保单等验证人凑齐。策略、容量、拉黑、签发人失权
     // 都由 invite() 内的事务闸把关。
@@ -322,7 +325,7 @@ export class QrService {
     if (type === 'GROUP') {
       const conversation = await this.prisma.chatConversation.findUnique({
         where: { id: targetId },
-        select: { type: true, circleID: true },
+        select: { type: true, circleID: true, qrJoinEnabled: true },
       });
       // 圈子群不发 GROUP 码 —— 圈子群的准入由圈子管理,发 CIRCLE 码。
       if (
@@ -331,6 +334,10 @@ export class QrService {
         conversation.circleID
       ) {
         throw this.issueForbidden();
+      }
+      // 「二维码入群」关着就不签发:签出去也扫不进,别给用户一张必然失效的码。
+      if (conversation.qrJoinEnabled === false) {
+        throw this.qrJoinDisabled();
       }
       const seat = await this.prisma.chatMember.findFirst({
         where: { conversationID: targetId, userID: userId, leftAt: null },
@@ -357,7 +364,26 @@ export class QrService {
         membership.role === 'ADMIN' ||
         circle.memberCanInvite);
     if (!canInvite) throw this.issueForbidden();
+    await this.assertCircleQrJoinEnabled(targetId);
     return targetId;
+  }
+
+  /** 圈子群的「二维码入群」开关记在圈子的会话行上;会话还没建时视为开启。 */
+  private async assertCircleQrJoinEnabled(circleId: string): Promise<void> {
+    const conversation = await this.prisma.chatConversation.findUnique({
+      where: { circleID: circleId },
+      select: { qrJoinEnabled: true },
+    });
+    if (conversation?.qrJoinEnabled === false) {
+      throw this.qrJoinDisabled();
+    }
+  }
+
+  private qrJoinDisabled(): ForbiddenException {
+    return new ForbiddenException({
+      message: '该群已关闭二维码入群',
+      errorCode: ChatErrorCode.GroupQrJoinDisabled,
+    });
   }
 
   private issueForbidden(): ForbiddenException {

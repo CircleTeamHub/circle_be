@@ -431,7 +431,12 @@ describe('ChatDirectAutoReplyProcessor', () => {
       expect.objectContaining({
         id: 'reply-1',
         conversationId: 'conv-1',
-        sender: { id: 'u2', nickname: 'Responder', avatarUrl: null },
+        sender: {
+          id: 'u2',
+          nickname: 'Responder',
+          avatarUrl: null,
+          alias: null,
+        },
         content: { text: '稍后回复', autoReply: true },
       }),
     );
