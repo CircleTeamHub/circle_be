@@ -362,6 +362,10 @@ model User {
   adminLoginAttempts           Int        @default(0)
   adminLoginLockedUntil        DateTime?
   singleDeviceLoginEnabled     Boolean    @default(false)
+  /// 圈子通知「离线提醒」：APP 离线时是否向该用户投递 CIRCLE_* 推送。
+  /// 默认 true —— 与既有行为一致（此前推送不读任何用户偏好，人人都收）。
+  /// 客户端的总闸关掉时也会把这里同步成 false，服务端只认这一个值。
+  circleOfflinePushEnabled     Boolean    @default(true)
   nickname                     String
   avatarUrl                    String?
   avatarFrame                  String?

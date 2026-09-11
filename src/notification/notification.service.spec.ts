@@ -19,6 +19,8 @@ describe('NotificationService', () => {
   const prisma = {
     user: {
       findMany: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
     },
     notification: {
       findFirst: jest.fn(),
@@ -1238,6 +1240,60 @@ describe('NotificationService', () => {
       expect(
         realtimeService.broadcastSystemNotificationUnread,
       ).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('圈子离线推送开关', () => {
+    it('只读当前用户自己的那一行，且只取这一列', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        circleOfflinePushEnabled: false,
+      });
+
+      await expect(service.getCirclePushPreference('user-1')).resolves.toEqual({
+        circleOfflinePushEnabled: false,
+      });
+      // 显式 select：User 行上挂着密码哈希、邮箱、管理员标志，读一整行再取一个
+      // 字段等于把它们拉进进程。where 只认 JWT 里的 id，不接受任何外部入参。
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { circleOfflinePushEnabled: true },
+      });
+    });
+
+    // 老账号在迁移之前没有这一行/这一列时按默认值「收」处理 —— 与该开关上线前
+    // 的行为一致，不能因为读不到就静默把人家的推送关掉。
+    it('查不到用户行时回落到默认值 true', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.getCirclePushPreference('user-1')).resolves.toEqual({
+        circleOfflinePushEnabled: true,
+      });
+    });
+
+    it('写入也只落在当前用户自己的那一行，并回显库里的值', async () => {
+      prisma.user.update.mockResolvedValue({ circleOfflinePushEnabled: false });
+
+      await expect(
+        service.setCirclePushPreference('user-1', false),
+      ).resolves.toEqual({ circleOfflinePushEnabled: false });
+      expect(prisma.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { circleOfflinePushEnabled: false },
+        select: { circleOfflinePushEnabled: true },
+      });
+    });
+
+    it('开回来也走同一条路径', async () => {
+      prisma.user.update.mockResolvedValue({ circleOfflinePushEnabled: true });
+
+      await expect(
+        service.setCirclePushPreference('user-1', true),
+      ).resolves.toEqual({ circleOfflinePushEnabled: true });
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { circleOfflinePushEnabled: true },
+        }),
+      );
     });
   });
 });

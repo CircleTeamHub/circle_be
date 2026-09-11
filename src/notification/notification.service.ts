@@ -112,6 +112,29 @@ export class NotificationService {
     });
   }
 
+  /** 读圈子推送偏好。只有「离线提醒」需要服务端执行，其余全是客户端展示。 */
+  async getCirclePushPreference(
+    userId: string,
+  ): Promise<{ circleOfflinePushEnabled: boolean }> {
+    const row = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { circleOfflinePushEnabled: true },
+    });
+    return { circleOfflinePushEnabled: row?.circleOfflinePushEnabled ?? true };
+  }
+
+  async setCirclePushPreference(
+    userId: string,
+    circleOfflinePushEnabled: boolean,
+  ): Promise<{ circleOfflinePushEnabled: boolean }> {
+    const row = await this.prisma.user.update({
+      where: { id: userId },
+      data: { circleOfflinePushEnabled },
+      select: { circleOfflinePushEnabled: true },
+    });
+    return row;
+  }
+
   async registerPushToken(
     userId: string,
     dto: RegisterPushTokenDto,
