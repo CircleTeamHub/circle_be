@@ -13,3 +13,11 @@ export function normalizeUserIdAlias(id: string): string {
   }
   return id;
 }
+
+/**
+ * DTO 层可接受的用户 id 形态:标准 UUID(不限版本)或上面那种 32-hex 别名。
+ * 别名只在这里放行;查库前必须先过 normalizeUserIdAlias,否则和库里的
+ * UUID 比对永远不相等。
+ */
+export const USER_ID_OR_ALIAS_PATTERN =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$/i;
