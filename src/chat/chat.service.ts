@@ -18,12 +18,15 @@ import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
 import { ChatGroupEventService } from './chat-group-event.service';
+import { loadSeatAliases, type SeatRef, seatKey } from './chat-seat-alias';
 import {
   circleGroupRole,
   type GroupRole,
   isGroupManager,
   isSeatSilenced,
   silencedUntilOf,
+  type SilenceStateLike,
+  type StandaloneSeatLike,
   standaloneGroupRole,
 } from './chat-group-roles';
 import type {
@@ -77,6 +80,7 @@ type CircleInfo = {
 type GroupFacets = Pick<
   ChatConversationDto,
   | 'myRemark'
+  | 'myAlias'
   | 'muteAll'
   | 'notice'
   | 'avatarUrl'
@@ -86,6 +90,7 @@ type GroupFacets = Pick<
 >;
 const NON_GROUP_FACETS: GroupFacets = {
   myRemark: null,
+  myAlias: null,
   muteAll: false,
   notice: null,
   avatarUrl: null,
@@ -108,6 +113,17 @@ interface SendResult {
  * 地方(editMessage)单独把它读回来。
  */
 type MessageRow = Omit<ChatMessage, 'contentHistory'>;
+
+/** 多会话消息列表里每条消息的发送者座位(系统消息 senderID 为空,跳过)。 */
+function senderSeatRefs(
+  rows: ReadonlyArray<Pick<MessageRow, 'conversationID' | 'senderID'>>,
+): SeatRef[] {
+  return rows.flatMap((row) =>
+    row.senderID
+      ? [{ conversationId: row.conversationID, userId: row.senderID }]
+      : [],
+  );
+}
 const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
@@ -294,16 +310,13 @@ export class ChatService {
     if (conversation.type === 'DIRECT') {
       await this.assertDirectNotBlocked(conversation, senderUserId);
     }
-    // 逐人禁言(群主/管理员对某个成员);全员禁言是下面那道管理台的闸。
-    if (conversation.type === 'GROUP' && isSeatSilenced(senderSeat)) {
-      throw new ForbiddenException({
-        message: '你已被禁言',
-        errorCode: ChatErrorCode.MemberSilenced,
-      });
-    }
-    if (conversation.type === 'GROUP' && conversation.muteAllAt) {
-      await this.assertNotMutedAll(conversation, senderUserId, senderSeat);
-    }
+    // 逐人禁言与全员禁言(锁外预检;事务里 assertStillSendable 用同一道闸复查)。
+    await this.assertGroupSpeechAllowed(
+      this.prisma,
+      conversation,
+      senderSeat,
+      senderUserId,
+    );
     if (conversation.type === 'TEMP') {
       await this.assertTempChatActive(conversation);
     }
@@ -501,7 +514,9 @@ export class ChatService {
     let sender: ChatSenderInfo | null = null;
     try {
       sender =
-        (await this.resolveSenders([senderUserId])).get(senderUserId) ?? null;
+        (await this.resolveSenders([senderUserId], row.conversationID)).get(
+          senderUserId,
+        ) ?? null;
     } catch (error) {
       this.logger.warn(
         `sender enrichment failed after commit message=${row.id}: ${
@@ -853,10 +868,15 @@ export class ChatService {
         this.loadCircleRoles(userId, circleIds),
       ]);
 
-    const senderIds = [...lastMessages.values()]
+    const lastRows = [...lastMessages.values()];
+    const senderIds = lastRows
       .map((m) => m.senderID)
       .filter((id): id is string => id !== null);
-    const senders = await this.resolveSenders(senderIds);
+    // 末条消息跨多个会话:账号信息按用户取一次,群昵称按 (会话, 发送者) 逐对取。
+    const [senders, aliases] = await Promise.all([
+      this.resolveSenders(senderIds, null),
+      loadSeatAliases(this.prisma, senderSeatRefs(lastRows)),
+    ]);
 
     const list = memberships.map((m) => {
       const rawLast = lastMessages.get(m.conversationID) ?? null;
@@ -883,7 +903,7 @@ export class ChatService {
         lastMessage: last
           ? this.toMessageDto(
               last,
-              this.senderFor(last, senders),
+              this.senderFor(last, senders, aliases),
               m.conversation.burnDurationSec,
             )
           : null,
@@ -984,6 +1004,10 @@ export class ChatService {
           type: 'GROUP',
           name,
           ownerID: userId,
+          // 独立群聊(微信群语义)默认开放名单与资料;DB 默认是 false ——
+          // 那是给圈子会话与蓝绿窗口里老代码建的行兜底的,这里必须显式写 true。
+          membersCanViewRoster: true,
+          membersCanViewProfiles: true,
           members: {
             create: [userId, ...memberIds].map((id) => ({ userID: id })),
           },
@@ -1814,7 +1838,7 @@ export class ChatService {
     let lastMessage: ChatMessageDto | null = null;
     if (last) {
       const senders = last.senderID
-        ? await this.resolveSenders([last.senderID])
+        ? await this.resolveSenders([last.senderID], conversationId)
         : new Map<string, ChatSenderInfo>();
       lastMessage = this.toMessageDto(
         last,
@@ -1874,6 +1898,7 @@ export class ChatService {
       role: ChatMember['role'];
       leftAt: Date | null;
       remark?: string | null;
+      alias?: string | null;
     },
     circle: { memberCanInvite: boolean } | null,
     circleRole: GroupRole | null,
@@ -1891,6 +1916,7 @@ export class ChatService {
     };
     return {
       myRemark: seat.remark ?? null,
+      myAlias: seat.alias ?? null,
       muteAll: conversation.muteAllAt !== null,
       notice: standalone ? (conversation.notice ?? null) : null,
       avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
@@ -2018,7 +2044,7 @@ export class ChatService {
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
-    const senders = await this.resolveSenders(senderIds);
+    const senders = await this.resolveSenders(senderIds, conversationId);
     const ascending = ascendingPull ? rows : [...rows].reverse();
     const messages = ascending.map((row) =>
       this.toMessageDto(
@@ -2254,13 +2280,17 @@ export class ChatService {
       orderBy: { createdAt: 'desc' },
       take: Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX),
     });
-    const senders = await this.resolveSenders(
-      rows.map((r) => r.senderID).filter((id): id is string => id !== null),
-    );
+    const [senders, aliases] = await Promise.all([
+      this.resolveSenders(
+        rows.map((r) => r.senderID).filter((id): id is string => id !== null),
+        null,
+      ),
+      loadSeatAliases(this.prisma, senderSeatRefs(rows)),
+    ]);
     const messages = rows.map((row) =>
       this.toMessageDto(
         row,
-        this.senderFor(row, senders),
+        this.senderFor(row, senders, aliases),
         burnById.get(row.conversationID) ?? null,
       ),
     );
@@ -2403,13 +2433,17 @@ export class ChatService {
     const page = hasMore ? rows.slice(0, take) : rows;
     if (page.length === 0) return empty;
     const cursor = this.nextMutationCursor(since, sinceId, page, hasMore);
-    const senders = await this.resolveSenders(
-      page.map((r) => r.senderID).filter((id): id is string => id !== null),
-    );
+    const [senders, aliases] = await Promise.all([
+      this.resolveSenders(
+        page.map((r) => r.senderID).filter((id): id is string => id !== null),
+        null,
+      ),
+      loadSeatAliases(this.prisma, senderSeatRefs(page)),
+    ]);
     const messages = page.map((row) =>
       this.toMessageDto(
         row,
-        this.senderFor(row, senders),
+        this.senderFor(row, senders, aliases),
         burnById.get(row.conversationID) ?? null,
       ),
     );
@@ -2671,7 +2705,12 @@ export class ChatService {
     return {
       id: conv.id,
       type: conv.type,
-      peer: { id: peer.id, nickname: peer.nickname, avatarUrl: peer.avatarUrl },
+      peer: {
+        id: peer.id,
+        nickname: peer.nickname,
+        avatarUrl: peer.avatarUrl,
+        alias: null,
+      },
       circleId: null,
       circle: null,
       name: null,
@@ -2728,6 +2767,7 @@ export class ChatService {
     if (!row) return null;
     const senders = await this.resolveSenders(
       row.senderID ? [row.senderID] : [],
+      conversationId,
     );
     const dto = this.toMessageDto(
       row,
@@ -2784,7 +2824,7 @@ export class ChatService {
     });
     const userIds = seats.map((s) => s.userID);
     const [users, roles] = await Promise.all([
-      this.resolveSenders(userIds),
+      this.resolveSenders(userIds, null),
       conversation.circleID
         ? this.prisma.circleMember
             .findMany({
@@ -2950,41 +2990,46 @@ export class ChatService {
     await this.assertNotBlockedBetween(senderUserId, peerId);
   }
 
-  /** 管理台群禁言:全员禁言时仅圈主/管理员可发。 */
-  private async assertNotMutedAll(
-    conversation: ChatConversation,
-    senderUserId: string,
-    senderSeat: {
-      userID: string;
-      role: ChatMember['role'];
-      leftAt: Date | null;
-    },
+  /**
+   * 群里「能不能开口」的两道闸,发送 / 编辑 / 表情回应共用一份判定:
+   * 逐人禁言(座位上的 silenced*)与全员禁言(会话 muteAllAt;圈子群圈主/管理员豁免,
+   * 独立群群主与座位管理员豁免)。非 GROUP 会话直接放行。
+   *
+   * 圈子角色用调用方给的客户端查:发送事务里传 tx(行锁之后的复查),锁外预检与
+   * 编辑 / 回应传 this.prisma。编辑旧消息、给消息刷表情都是往群里发新内容,
+   * 只在 sendMessage 拦等于给被禁言的人留了两条后门。
+   */
+  private async assertGroupSpeechAllowed(
+    client: Pick<Prisma.TransactionClient, 'circleMember'>,
+    conversation: Pick<
+      ChatConversation,
+      'type' | 'circleID' | 'ownerID' | 'muteAllAt'
+    >,
+    seat: StandaloneSeatLike & SilenceStateLike,
+    userId: string,
   ): Promise<void> {
-    if (!conversation.circleID) {
-      // 独立群聊:群主与座位上的管理员豁免。
-      if (
-        !isGroupManager(standaloneGroupRole(conversation.ownerID, senderSeat))
-      ) {
-        throw new ForbiddenException({
-          message: '该群已被禁言',
-          errorCode: ChatErrorCode.ConversationMuted,
-        });
-      }
-      return;
+    if (conversation.type !== 'GROUP') return;
+    if (isSeatSilenced(seat)) {
+      throw new ForbiddenException({
+        message: '你已被禁言',
+        errorCode: ChatErrorCode.MemberSilenced,
+      });
     }
-    const membership = await this.prisma.circleMember.findUnique({
-      where: {
-        userID_circleID: {
-          userID: senderUserId,
-          circleID: conversation.circleID,
-        },
-      },
-      select: { role: true, status: true },
-    });
-    const exempt =
-      membership?.status === 'ACTIVE' &&
-      (membership.role === 'OWNER' || membership.role === 'ADMIN');
-    if (!exempt) {
+    if (!conversation.muteAllAt) return;
+    const role = conversation.circleID
+      ? circleGroupRole(
+          await client.circleMember.findUnique({
+            where: {
+              userID_circleID: {
+                userID: userId,
+                circleID: conversation.circleID,
+              },
+            },
+            select: { role: true, status: true },
+          }),
+        )
+      : standaloneGroupRole(conversation.ownerID, seat);
+    if (!isGroupManager(role)) {
       throw new ForbiddenException({
         message: '该群已被禁言',
         errorCode: ChatErrorCode.ConversationMuted,
@@ -3042,14 +3087,9 @@ export class ChatService {
     }
     const conversation = seat.conversation;
 
-    // 逐人禁言与全员禁言一样要在锁后复查:管理员按下禁言与这条消息落库之间
+    // 逐人禁言与全员禁言都要在锁后复查:管理员按下禁言与这条消息落库之间
     // 是真实窗口,禁言的语义就是「立刻生效」。
-    if (conversation.type === 'GROUP' && isSeatSilenced(seat)) {
-      throw new ForbiddenException({
-        message: '你已被禁言',
-        errorCode: ChatErrorCode.MemberSilenced,
-      });
-    }
+    await this.assertGroupSpeechAllowed(tx, conversation, seat, senderUserId);
 
     if (conversation.type === 'DIRECT') {
       const peerId = conversation.directKey
@@ -3071,34 +3111,6 @@ export class ChatService {
             errorCode: ChatErrorCode.Blocked,
           });
         }
-      }
-    }
-
-    if (conversation.type === 'GROUP' && conversation.muteAllAt) {
-      let exempt: boolean;
-      if (conversation.circleID) {
-        const membership = await tx.circleMember.findUnique({
-          where: {
-            userID_circleID: {
-              userID: senderUserId,
-              circleID: conversation.circleID,
-            },
-          },
-          select: { role: true, status: true },
-        });
-        exempt =
-          membership?.status === 'ACTIVE' &&
-          (membership.role === 'OWNER' || membership.role === 'ADMIN');
-      } else {
-        exempt = isGroupManager(
-          standaloneGroupRole(conversation.ownerID, seat),
-        );
-      }
-      if (!exempt) {
-        throw new ForbiddenException({
-          message: '该群已被禁言',
-          errorCode: ChatErrorCode.ConversationMuted,
-        });
       }
     }
 
@@ -3217,7 +3229,10 @@ export class ChatService {
       },
       select: { conversationID: true, userID: true },
     });
-    const users = await this.resolveSenders(others.map((o) => o.userID));
+    const users = await this.resolveSenders(
+      others.map((o) => o.userID),
+      null,
+    );
     const map = new Map<string, ChatSenderInfo>();
     others.forEach((o) => {
       const user = users.get(o.userID);
@@ -3262,19 +3277,40 @@ export class ChatService {
     return new Map(rooms.map((room) => [room.id, room]));
   }
 
+  /**
+   * 发送者展示信息。conversationId 给了就顺带取他们在**这个会话**里的群昵称
+   * (ChatMember.alias,全群可见);跨会话的列表传 null,再用 loadSeatAliases
+   * 按 (会话, 用户) 逐对补。
+   */
   private async resolveSenders(
     userIds: string[],
+    conversationId: string | null,
   ): Promise<Map<string, ChatSenderInfo>> {
     const unique = [...new Set(userIds)];
     if (unique.length === 0) return new Map();
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: unique } },
-      select: { id: true, nickname: true, avatarUrl: true },
-    });
+    const [users, aliases] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { id: { in: unique } },
+        select: { id: true, nickname: true, avatarUrl: true },
+      }),
+      conversationId
+        ? loadSeatAliases(
+            this.prisma,
+            unique.map((userId) => ({ conversationId, userId })),
+          )
+        : Promise.resolve(new Map<string, string>()),
+    ]);
     const resolved = new Map<string, ChatSenderInfo>(
       users.map((u) => [
         u.id,
-        { id: u.id, nickname: u.nickname, avatarUrl: u.avatarUrl },
+        {
+          id: u.id,
+          nickname: u.nickname,
+          avatarUrl: u.avatarUrl,
+          alias: conversationId
+            ? (aliases.get(seatKey(conversationId, u.id)) ?? null)
+            : null,
+        },
       ]),
     );
     // 临时房访客不是 User 行:剩余 id 兜底查 TempChatGuest(展示名,无头像)。
@@ -3289,18 +3325,24 @@ export class ChatService {
           id: guest.imUserId,
           nickname: guest.displayName,
           avatarUrl: null,
+          alias: null,
         });
       }
     }
     return resolved;
   }
 
+  /** 跨会话列表用 aliases 把该会话的群昵称贴到按用户解析出来的发送者上。 */
   private senderFor(
     row: MessageRow,
     senders: Map<string, ChatSenderInfo>,
+    aliases?: Map<string, string>,
   ): ChatSenderInfo | null {
     if (!row.senderID) return null;
-    return senders.get(row.senderID) ?? null;
+    const sender = senders.get(row.senderID) ?? null;
+    if (!sender || !aliases) return sender;
+    const alias = aliases.get(seatKey(row.conversationID, row.senderID));
+    return alias === undefined ? sender : { ...sender, alias };
   }
 
   /**
@@ -3368,7 +3410,7 @@ export class ChatService {
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
-    const senders = await this.resolveSenders(senderIds);
+    const senders = await this.resolveSenders(senderIds, null);
     const byId = new Map(rows.map((r) => [r.id, r]));
     for (const message of messages) {
       if (!message.replyToId) continue;
@@ -3430,6 +3472,7 @@ export class ChatService {
       // 幂等:双端并发撤回/重试不再广播第二次。
       const senders = await this.resolveSenders(
         row.senderID ? [row.senderID] : [],
+        conversationId,
       );
       return this.toMessageDto(
         row,
@@ -3491,6 +3534,7 @@ export class ChatService {
     if (claimed.count === 0) {
       const senders = await this.resolveSenders(
         updated.senderID ? [updated.senderID] : [],
+        conversationId,
       );
       return this.toMessageDto(
         updated,
@@ -3512,6 +3556,7 @@ export class ChatService {
     });
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],
+      conversationId,
     );
     return this.toMessageDto(
       updated,
@@ -3569,10 +3614,20 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    const conversation = await this.requireMembership(conversationId, userId);
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
     // 单聊拉黑不摘座位(两边的 ChatMember 都留着),所以只查在座是不够的:
     // 被拉黑的一方发不了消息,却能靠回应和编辑继续往对方房间里推事件。
     await this.assertDirectMutationAllowed(conversation, userId);
+    // 群里同理:被禁言 / 全员禁言的人发不了消息,也不该能靠刷表情往群里推事件。
+    await this.assertGroupSpeechAllowed(
+      this.prisma,
+      conversation,
+      member,
+      userId,
+    );
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
       select: { conversationID: true, deleted: true, revokedAt: true },
@@ -3629,8 +3684,18 @@ export class ChatService {
         errorCode: ChatErrorCode.SensitiveWord,
       });
     }
-    const conversation = await this.requireMembership(conversationId, userId);
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
     await this.assertDirectMutationAllowed(conversation, userId);
+    // 编辑旧消息就是往群里发新正文:禁言 / 全员禁言与 sendMessage 同一道闸。
+    await this.assertGroupSpeechAllowed(
+      this.prisma,
+      conversation,
+      member,
+      userId,
+    );
     const row = await this.prisma.chatMessage.findUnique({
       where: { id: messageId },
     });
@@ -3710,8 +3775,9 @@ export class ChatService {
     let sender: ChatSenderInfo | null = null;
     try {
       sender = row.senderID
-        ? ((await this.resolveSenders([row.senderID])).get(row.senderID) ??
-          null)
+        ? ((await this.resolveSenders([row.senderID], row.conversationID)).get(
+            row.senderID,
+          ) ?? null)
         : null;
     } catch (error) {
       this.logger.warn(
@@ -3779,7 +3845,10 @@ export class ChatService {
       // 「200 人已读」,前端也没法判断该不该提示还有更多。
       this.prisma.chatMember.count({ where }),
     ]);
-    const senders = await this.resolveSenders(seats.map((s) => s.userID));
+    const senders = await this.resolveSenders(
+      seats.map((s) => s.userID),
+      conversationId,
+    );
     const readers = seats
       .map((s) => senders.get(s.userID))
       .filter((s): s is ChatSenderInfo => Boolean(s));
