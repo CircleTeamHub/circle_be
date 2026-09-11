@@ -1,4 +1,7 @@
-import { reportOperationalError } from './error-aggregation.service';
+import {
+  flushOperationalErrors,
+  reportOperationalError,
+} from './error-aggregation.service';
 
 /**
  * 进程级兜底：未捕获的 promise rejection 上报后终止，由编排器重启干净进程。
@@ -16,23 +19,30 @@ import { reportOperationalError } from './error-aggregation.service';
  */
 let installed: (() => void) | null = null;
 
+/** 退出前给上报链的排空预算，与 main.ts 的优雅关闭同档。 */
+export const REJECTION_GUARD_FLUSH_TIMEOUT_MS = 2000;
+
 export function installUnhandledRejectionGuard(): () => void {
   if (installed) return installed;
 
   const handler = (reason: unknown): void => {
-    // 即使上报链自身异常，也不能阻止进程退出。未知 rejection 发生后唯一
-    // 可靠的恢复路径是让编排器以干净状态重启。
-    try {
-      reportOperationalError(reason, {
-        component: 'process',
-        operation: 'unhandledRejection',
-        kind: 'process',
-      });
-    } catch {
-      // 上报失败时仍执行 finally 中的退出。
-    } finally {
-      process.exit(1);
-    }
+    // reportOperationalError 只是入队，传输是异步的 —— 紧接着同步 exit 等于
+    // 把这份报告扔掉，偏偏这是最需要它的一次（运维只会看到无故重启）。
+    // 先排空再退出；排空自身有界且永不抛，绝不能挡住退出。
+    void (async () => {
+      try {
+        reportOperationalError(reason, {
+          component: 'process',
+          operation: 'unhandledRejection',
+          kind: 'process',
+        });
+        await flushOperationalErrors(REJECTION_GUARD_FLUSH_TIMEOUT_MS);
+      } catch {
+        // 上报链自身异常也不能阻止进程退出。
+      } finally {
+        process.exit(1);
+      }
+    })();
   };
 
   process.on('unhandledRejection', handler);

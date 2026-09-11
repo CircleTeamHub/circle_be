@@ -9,6 +9,7 @@ import {
   createErrorAggregationConfig,
   createErrorAggregationProvider,
   createSentryInitOptions,
+  flushOperationalErrors,
   reportOperationalError,
   type ErrorAggregationProvider,
   type SentryClientLike,
@@ -496,6 +497,52 @@ describe('NoopErrorAggregationProvider', () => {
       provider.captureError(new Error('x'), { statusCode: 500 }),
     ).not.toThrow();
     await expect(provider.flush()).resolves.toBe(true);
+  });
+});
+
+/**
+ * 退出路径专用的排空口。reportOperationalError 只是入队，传输是异步的；
+ * 进程级兜底报告完就 exit，不先排空等于把报告扔掉。这里守两条：
+ * 预算传得下去，以及「排空失败/卡死绝不能变成新的故障或挂住退出」。
+ */
+describe('flushOperationalErrors', () => {
+  afterEach(() => {
+    configureErrorAggregationProvider(new NoopErrorAggregationProvider());
+  });
+
+  it('forwards the timeout budget to the configured provider', async () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'none',
+      captureError: jest.fn(),
+      flush: jest.fn().mockResolvedValue(true),
+    };
+    configureErrorAggregationProvider(provider);
+
+    await expect(flushOperationalErrors(1234)).resolves.toBe(true);
+    expect(provider.flush).toHaveBeenCalledWith(1234);
+  });
+
+  it('resolves false instead of rejecting when the transport fails', async () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'none',
+      captureError: jest.fn(),
+      flush: jest.fn().mockRejectedValue(new Error('transport down')),
+    };
+    configureErrorAggregationProvider(provider);
+
+    await expect(flushOperationalErrors(10)).resolves.toBe(false);
+  });
+
+  it('gives up on a provider that ignores its own budget', async () => {
+    const provider: ErrorAggregationProvider = {
+      name: 'none',
+      captureError: jest.fn(),
+      // 卡死的传输层不能把「上报后退出」变成「永远卡在要逃离的状态里」。
+      flush: jest.fn().mockReturnValue(new Promise<boolean>(() => {})),
+    };
+    configureErrorAggregationProvider(provider);
+
+    await expect(flushOperationalErrors(5)).resolves.toBe(false);
   });
 });
 

@@ -516,6 +516,38 @@ export function reportOperationalError(
 }
 
 /**
+ * Drains the configured provider's buffer for non-HTTP exit paths.
+ *
+ * `reportOperationalError` only enqueues — the transport is asynchronous. A
+ * caller that reports and then exits the process synchronously throws the
+ * report away, which is exactly the case where it matters most (the fatal
+ * path). Bounded by `timeoutMs` so a wedged transport cannot hold the exit,
+ * and never rejects: a failed flush must not replace the original failure.
+ */
+export async function flushOperationalErrors(
+  timeoutMs = 2000,
+): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    // The provider takes the same budget, but honouring it is its own promise
+    // to keep. A wedged transport must not turn "report then exit" into
+    // "hang forever in the state the exit exists to escape".
+    const deadline = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+      timer.unref?.();
+    });
+    return await Promise.race([
+      activeErrorAggregationProvider.flush(timeoutMs),
+      deadline,
+    ]);
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Builds the aggregation provider from resolved config. Returns a no-op unless
  * the sentry provider is selected, a dsn is present, and a client is created —
  * so misconfiguration degrades to silence rather than a boot crash.

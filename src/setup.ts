@@ -200,7 +200,8 @@ const groupReportLimiterOptions = {
  */
 export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // 尽早装：未捕获 rejection 默认会终止进程，而引导之后的任何 fire-and-forget
-  // 都可能触发它。兜底只上报不静默，见 unhandled-rejection-guard.ts。
+  // 都可能触发它。兜底不静默 —— 先把报告排空出去再退出，让运维看得见原因，
+  // 而不是只看到一次无故重启。见 unhandled-rejection-guard.ts。
   installUnhandledRejectionGuard();
   const isProduction = process.env.NODE_ENV === 'production';
   const config = getServerConfig();
