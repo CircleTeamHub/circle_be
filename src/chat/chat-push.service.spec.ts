@@ -8,7 +8,12 @@ function msg(overrides: Partial<ChatMessageDto> = {}): ChatMessageDto {
     height: 5,
     type: 'text',
     content: { text: 'hello world' },
-    sender: { id: 'u-sender', nickname: '发送者', avatarUrl: null },
+    sender: {
+      id: 'u-sender',
+      nickname: '发送者',
+      avatarUrl: null,
+      alias: null,
+    },
     replyToId: null,
     d: 'd1',
     createdAt: '2026-08-06T12:00:00.000Z',

@@ -13,6 +13,7 @@ describe('StorageAuditService', () => {
     referenced?: Record<string, unknown[]>;
   }) {
     const prisma = {
+      chatConversation: emptyRows(),
       user: emptyRows(),
       avatarFrameAsset: emptyRows(),
       iconAsset: emptyRows(),

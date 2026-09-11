@@ -76,6 +76,9 @@ describe('ChatService standalone group conversations', () => {
       name: '周末爬山',
       ownerID: 'owner-1',
       lastMessageAt: null,
+      // 独立群聊默认开放成员名单(圈子会话建出来时才是关的)。桩里漏掉的话
+      // undefined 会被当成「关闭」,listMembers 全线 403。
+      membersCanViewRoster: true,
     },
     ...overrides,
   });
@@ -206,6 +209,10 @@ describe('ChatService standalone group conversations', () => {
         type: 'GROUP',
         name: '周末爬山',
         ownerID: 'owner-1',
+        // DB 默认是关(给圈子会话与蓝绿窗口里老代码建的行兜底):
+        // 独立群聊的「微信群」语义必须在这里显式写开,不能靠默认值。
+        membersCanViewRoster: true,
+        membersCanViewProfiles: true,
         members: {
           create: [{ userID: 'owner-1' }, { userID: 'f1' }, { userID: 'f2' }],
         },
@@ -348,6 +355,66 @@ describe('ChatService standalone group conversations', () => {
       constructor: ForbiddenException,
       response: { errorCode: ChatErrorCode.NotMember },
     });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+  });
+
+  it('blocks ordinary members from inviting once memberCanInvite is off, owner still can', async () => {
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'conv-1',
+        type: 'GROUP',
+        circleID: null,
+        ownerID: 'owner-1',
+        memberCanInvite: false,
+        clearedBeforeHeight: 0,
+      },
+    ]);
+    prisma.chatMember.findUnique.mockResolvedValue(seat({ userID: 'f1' }));
+
+    await expect(
+      service.inviteToGroupConversation('f1', 'conv-1', ['f2']),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupInviteDisabled },
+    });
+    expect(prisma.chatMember.create).not.toHaveBeenCalled();
+
+    // 群主不受「成员邀请」开关限制。
+    prisma.chatMember.findUnique.mockResolvedValue(seat());
+    prisma.friend.findMany.mockResolvedValue(friendRows('owner-1', ['f2']));
+    prisma.chatMember.findMany.mockResolvedValue([]);
+    prisma.chatMember.count.mockResolvedValue(2);
+    prisma.chatMember.create.mockResolvedValue({});
+    prisma.user.findMany.mockResolvedValue([{ nickname: '小方' }]);
+    await expect(
+      service.inviteToGroupConversation('owner-1', 'conv-1', ['f2']),
+    ).resolves.toEqual(conversationDto);
+    expect(prisma.chatMember.create).toHaveBeenCalled();
+  });
+
+  it('refuses QR joins once the owner turns qrJoinEnabled off', async () => {
+    prisma.chatConversation.findUnique.mockResolvedValue({
+      id: 'conv-1',
+      type: 'GROUP',
+      circleID: null,
+    });
+    prisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'conv-1',
+        type: 'GROUP',
+        circleID: null,
+        qrJoinEnabled: false,
+        clearedBeforeHeight: 0,
+      },
+    ]);
+
+    await expect(
+      service.joinStandaloneGroupViaQr('scanner-1', 'conv-1'),
+    ).rejects.toMatchObject({
+      constructor: ForbiddenException,
+      response: { errorCode: ChatErrorCode.GroupQrJoinDisabled },
+    });
+    expect(prisma.chatMember.findFirst).not.toHaveBeenCalled();
     expect(prisma.chatMember.create).not.toHaveBeenCalled();
   });
 

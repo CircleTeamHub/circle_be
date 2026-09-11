@@ -150,7 +150,12 @@ describe('ChatCircleSyncService', () => {
     expect(id).toBe('conv-1');
     expect(prisma.chatConversation.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: { type: 'GROUP', circleID: 'circle-1' },
+        data: {
+          type: 'GROUP',
+          circleID: 'circle-1',
+          membersCanViewProfiles: false,
+          membersCanViewRoster: false,
+        },
       }),
     );
     expect(prisma.chatMember.createMany).toHaveBeenCalledWith({

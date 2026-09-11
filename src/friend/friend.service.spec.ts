@@ -88,7 +88,13 @@ describe('FriendService', () => {
       count: jest.fn().mockResolvedValue(0),
     },
     // addMeByGroup 的服务端佐证：双方是否同在一个圈子。
+    // findMany 是「成员可添加好友」服务端推导用的共同独立群查询。
+    chatMember: {
+      findUnique: jest.fn(),
+      findMany: jest.fn(),
+    },
     circleMember: {
+      findUnique: jest.fn(),
       findFirst: jest.fn().mockResolvedValue(null),
     },
     $executeRaw: jest.fn(),
@@ -165,6 +171,8 @@ describe('FriendService', () => {
         : Promise.all(operations),
     );
     prisma.friend.updateMany.mockResolvedValue({ count: 1 });
+    // 默认「两人没有共同的独立群」——「成员可添加好友」的推导与本次请求无关。
+    prisma.chatMember.findMany.mockResolvedValue([]);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -268,6 +276,165 @@ describe('FriendService', () => {
         where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
       }),
     );
+  });
+
+  it('refuses a request routed through a group that forbids member friend requests', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.chatMember.findUnique.mockResolvedValue({
+      role: 'MEMBER',
+      leftAt: null,
+      conversation: {
+        type: 'GROUP',
+        circleID: null,
+        ownerID: 'owner-9',
+        membersCanAddFriends: false,
+      },
+    });
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello', undefined, undefined, {
+        viaConversationId: 'conv-1',
+      }),
+    ).rejects.toMatchObject({
+      response: { errorCode: FriendErrorCode.GroupAddForbidden },
+    });
+    expect(prisma.friend.create).not.toHaveBeenCalled();
+
+    // 群主/管理员不受这个开关限制;圈子群按圈子角色判。
+    prisma.chatMember.findUnique.mockResolvedValue({
+      role: 'MEMBER',
+      leftAt: null,
+      conversation: {
+        type: 'GROUP',
+        circleID: 'circle-1',
+        ownerID: null,
+        membersCanAddFriends: false,
+      },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      role: 'ADMIN',
+      status: 'ACTIVE',
+    });
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    await service.sendRequest(
+      'user-1',
+      'user-2',
+      'hello',
+      undefined,
+      undefined,
+      {
+        viaConversationId: 'conv-1',
+      },
+    );
+    expect(prisma.friend.create).toHaveBeenCalled();
+  });
+
+  it('refuses a request between two people who only share a closed standalone group, with no viaConversationId', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    // 客户端**不传** viaConversationId —— 老的快路径整条不跑。
+    prisma.chatMember.findMany.mockResolvedValue([
+      {
+        role: 'MEMBER',
+        conversation: {
+          ownerID: 'owner-9',
+          membersCanViewProfiles: false,
+          membersCanAddFriends: false,
+        },
+      },
+    ]);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    prisma.circleMember.findFirst.mockResolvedValue(null);
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hello'),
+    ).rejects.toMatchObject({
+      response: { errorCode: FriendErrorCode.GroupAddForbidden },
+    });
+    expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
+    expect(prisma.friend.create).not.toHaveBeenCalled();
+  });
+
+  it('lets the request through when a shared circle or an open group explains the acquaintance', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    // 同一个群开着开关 → 放行,连好友/圈子那两次查询都不必跑。
+    prisma.chatMember.findMany.mockResolvedValue([
+      {
+        role: 'MEMBER',
+        conversation: {
+          ownerID: 'owner-9',
+          membersCanViewProfiles: false,
+          membersCanAddFriends: true,
+        },
+      },
+    ]);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    await service.sendRequest('user-1', 'user-2', 'hello');
+    expect(prisma.friend.create).toHaveBeenCalled();
+    expect(prisma.circleMember.findFirst).not.toHaveBeenCalled();
+
+    // 群关着,但两人同在一个圈子 → 与群策略无关,照常放行。
+    jest.clearAllMocks();
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-2',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+      message: 'hello',
+    });
+    prisma.chatMember.findMany.mockResolvedValue([
+      {
+        role: 'MEMBER',
+        conversation: {
+          ownerID: 'owner-9',
+          membersCanViewProfiles: false,
+          membersCanAddFriends: false,
+        },
+      },
+    ]);
+    prisma.friend.findFirst.mockResolvedValue(null);
+    prisma.circleMember.findFirst.mockResolvedValue({ id: 'cm-1' });
+    await service.sendRequest('user-1', 'user-2', 'hello');
+    expect(prisma.friend.create).toHaveBeenCalled();
   });
 
   it('creates mirrored friend activities when sending a request', async () => {

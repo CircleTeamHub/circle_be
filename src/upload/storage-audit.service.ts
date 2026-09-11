@@ -249,6 +249,18 @@ export class StorageAuditService {
         add(row.cover);
       },
     );
+    // 独立群聊的群头像(圈子群的头像在 Circle 上,上面已经收了)。
+    await this.collectFrom(
+      (cursor, take) =>
+        this.prisma.chatConversation.findMany({
+          where: { avatarUrl: { not: null } },
+          select: { id: true, avatarUrl: true },
+          orderBy: { id: 'asc' },
+          take,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        }),
+      (row) => add(row.avatarUrl),
+    );
     await this.collectFrom(
       (cursor, take) =>
         this.prisma.noteMedia.findMany({
