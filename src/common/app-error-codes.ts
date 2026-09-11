@@ -321,6 +321,8 @@ export const ChatErrorCode = {
   ConversationNotFound: 'CHAT_CONVERSATION_NOT_FOUND',
   NotMember: 'CHAT_NOT_MEMBER',
   MemberDirectoryForbidden: 'CHAT_MEMBER_DIRECTORY_FORBIDDEN',
+  // 「成员可查看他人资料」关着的独立群:只通过这种群认识的人打开对方资料页时拒绝。
+  MemberProfileForbidden: 'CHAT_MEMBER_PROFILE_FORBIDDEN',
   PeerNotFound: 'CHAT_PEER_NOT_FOUND',
   SelfConversation: 'CHAT_SELF_CONVERSATION',
   Blocked: 'CHAT_BLOCKED',

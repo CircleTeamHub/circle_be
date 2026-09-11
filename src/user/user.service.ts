@@ -1,12 +1,17 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { AuthErrorCode, UserErrorCode } from 'src/common/app-error-codes';
+import {
+  AuthErrorCode,
+  ChatErrorCode,
+  UserErrorCode,
+} from 'src/common/app-error-codes';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -40,6 +45,7 @@ import {
 } from 'src/avatar-frame/avatar-frame.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'avatarUrl',
@@ -391,6 +397,10 @@ export class UserService {
   }
 
   async findOne(id: string, viewerId?: string) {
+    // 「成员可查看他人资料」的 enforcement 点。开关存在会话行上,但资料页是
+    // 用户域的端点,客户端只要知道 userId 就能直接打 —— 群设置里关掉之后
+    // 前端隐藏入口只是装饰,真正的门必须在这里。
+    if (viewerId) await this.assertProfileVisibleTo(viewerId, id);
     const [user, displayIcons, appearances] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id },
@@ -422,6 +432,29 @@ export class UserService {
       likeCount: user.receivedLikeCount,
       likedByMeToday,
     };
+  }
+
+  /**
+   * 只通过关着「成员可查看他人资料」的独立群认识的两个人之间,资料页不可见。
+   * 本人、好友、对方先发过好友申请、同圈子成员、任一共同群开着开关、
+   * 本人是某个共同群的群主/管理员 —— 都放行(判定见 standalone-group-policy-gate)。
+   */
+  private async assertProfileVisibleTo(
+    viewerId: string,
+    targetId: string,
+  ): Promise<void> {
+    const blocked = await isBlockedByStandaloneGroupPolicy(
+      this.prisma,
+      viewerId,
+      targetId,
+      'membersCanViewProfiles',
+    );
+    if (blocked) {
+      throw new ForbiddenException({
+        message: '该群不允许查看成员资料',
+        errorCode: ChatErrorCode.MemberProfileForbidden,
+      });
+    }
   }
 
   private async applyProfilePrivacy<T extends ProfilePrivacyUser>(
