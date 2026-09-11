@@ -108,7 +108,7 @@ export class ChatController {
     @Body() body: CreateGroupConversationDto,
   ): Promise<ChatConversationDto> {
     return this.chatService.createGroupConversation(req.user.userId, {
-      name: body.name ?? null,
+      name: body.name,
       memberIds: body.memberIds,
     });
   }

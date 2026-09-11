@@ -13,6 +13,7 @@ import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { SupportService } from 'src/support/support.service';
 import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { lockUserRelationshipState } from 'src/utils/user-relationship-lock';
+import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
@@ -81,6 +82,17 @@ const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
 // 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
 const STANDALONE_GROUP_MAX_MEMBERS = 200;
+
+/**
+ * 建群/邀请的成员名单收口:32-hex 别名归一成 UUID(旧客户端缓存形态)、去重、
+ * 剔除操作者本人。必须在好友表/用户表比对之前做,否则合法好友的别名会被
+ * 当成陌生人打回 CHAT_GROUP_FRIENDS_ONLY。
+ */
+function normalizeMemberIds(userId: string, memberIds: string[]): string[] {
+  return [...new Set(memberIds.map(normalizeUserIdAlias))].filter(
+    (id) => id !== userId,
+  );
+}
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
 
@@ -907,11 +919,16 @@ export class ChatService {
    */
   async createGroupConversation(
     userId: string,
-    input: { name?: string | null; memberIds: string[] },
+    input: { name?: string; memberIds: string[] },
   ): Promise<ChatConversationDto> {
-    const memberIds = [...new Set(input.memberIds)].filter(
-      (id) => id !== userId,
-    );
+    const name = input.name?.trim();
+    if (!name) {
+      throw new BadRequestException({
+        message: '请填写群聊名称',
+        errorCode: ChatErrorCode.GroupNameRequired,
+      });
+    }
+    const memberIds = normalizeMemberIds(userId, input.memberIds);
     if (memberIds.length < 2) {
       throw new BadRequestException({
         message: '至少选择 2 位好友',
@@ -924,7 +941,6 @@ export class ChatService {
         errorCode: ChatErrorCode.GroupFull,
       });
     }
-    const name = input.name?.trim() || null;
     const conversation = await this.prisma.$transaction(async (tx) => {
       await lockUserRelationshipState(tx, [userId, ...memberIds]);
       await this.assertInviteTargetsAllowed(tx, userId, memberIds);
@@ -972,7 +988,7 @@ export class ChatService {
       conversationId,
       userId,
     );
-    const invitees = [...new Set(memberIds)].filter((id) => id !== userId);
+    const invitees = normalizeMemberIds(userId, memberIds);
     if (invitees.length === 0) {
       throw new BadRequestException({
         message: '未选择邀请对象',
