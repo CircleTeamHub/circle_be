@@ -108,9 +108,28 @@ describe('ChatService standalone group conversations', () => {
       .mockResolvedValue(conversationDto);
   });
 
+  // 群名的真闸门在这里而不是 DTO:ValidationPipe 打回的 400 不带 errorCode,
+  // 客户端只能显示通用文案。空名/缺名都要走到这一层才拿得到 CHAT_GROUP_NAME_REQUIRED。
+  it.each<[string, string | undefined]>([
+    ['a blank group name', '   '],
+    ['a missing group name', undefined],
+  ])('rejects %s before creating any group data', async (_case, name) => {
+    await expect(
+      service.createGroupConversation('owner-1', {
+        name,
+        memberIds: ['f1', 'f2'],
+      }),
+    ).rejects.toMatchObject({
+      constructor: BadRequestException,
+      response: { errorCode: ChatErrorCode.GroupNameRequired },
+    });
+    expect(prisma.chatConversation.create).not.toHaveBeenCalled();
+  });
+
   it('rejects group creation with fewer than 2 other members', async () => {
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         // 自己混进名单也不算数。
         memberIds: ['owner-1', 'f1'],
       }),
@@ -126,6 +145,7 @@ describe('ChatService standalone group conversations', () => {
 
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         memberIds: ['f1', 'stranger-1'],
       }),
     ).rejects.toMatchObject({
@@ -146,6 +166,7 @@ describe('ChatService standalone group conversations', () => {
 
     await expect(
       service.createGroupConversation('owner-1', {
+        name: '测试群',
         memberIds: ['f1', 'f2'],
       }),
     ).rejects.toMatchObject({
@@ -159,7 +180,7 @@ describe('ChatService standalone group conversations', () => {
     const memberIds = Array.from({ length: 200 }, (_, index) => `f${index}`);
 
     await expect(
-      service.createGroupConversation('owner-1', { memberIds }),
+      service.createGroupConversation('owner-1', { name: '测试群', memberIds }),
     ).rejects.toMatchObject({
       constructor: ConflictException,
       response: { errorCode: ChatErrorCode.GroupFull },
@@ -198,6 +219,51 @@ describe('ChatService standalone group conversations', () => {
       kind: 'group-created',
     });
     expect(result).toBe(conversationDto);
+  });
+
+  // 旧客户端缓存里的成员 id 是去连字符的 32-hex 别名。归一必须发生在查好友表/
+  // 用户表之前,否则合法好友会被当成陌生人打回 CHAT_GROUP_FRIENDS_ONLY。
+  it('normalizes 32-hex member aliases before the friend and user checks', async () => {
+    const friendId = '2f7c1d9e-8b3a-4c5d-9e1f-0a1b2c3d4e5f';
+    const friendAlias = '2F7C1D9E8B3A4C5D9E1F0A1B2C3D4E5F';
+    prisma.friend.findMany.mockResolvedValue(
+      friendRows('owner-1', [friendId, 'f2']),
+    );
+    prisma.user.count.mockResolvedValue(2);
+    prisma.chatConversation.create.mockResolvedValue({ id: 'conv-1' });
+
+    await service.createGroupConversation('owner-1', {
+      name: '周末爬山',
+      // 同一个人的别名与 UUID 各来一次:归一后只该留下一个座位。
+      memberIds: [friendAlias, 'f2', friendId],
+    });
+
+    expect(prisma.friend.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [
+            { userID: 'owner-1', friendID: { in: [friendId, 'f2'] } },
+            { friendID: 'owner-1', userID: { in: [friendId, 'f2'] } },
+          ],
+        }),
+      }),
+    );
+    expect(prisma.user.count).toHaveBeenCalledWith({
+      where: { id: { in: [friendId, 'f2'] }, status: 'ACTIVE' },
+    });
+    expect(prisma.chatConversation.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          members: {
+            create: [
+              { userID: 'owner-1' },
+              { userID: friendId },
+              { userID: 'f2' },
+            ],
+          },
+        }),
+      }),
+    );
   });
 
   it('rejects standalone-group operations on circle-managed groups', async () => {
