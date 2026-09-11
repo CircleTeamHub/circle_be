@@ -1,7 +1,22 @@
 // 自研聊天的线上契约类型:socket 载荷 / ack / 广播 DTO。
 // 与前端 src/chat-core/protocol.ts 镜像,字段名即协议,改动需两仓同步。
 import type { AppErrorCode } from 'src/common/app-error-codes';
+import type {
+  ChatConversation,
+  ChatMember,
+  ChatMessage,
+} from 'src/generated/prisma';
 import type { TEMP_CHAT_GUEST_TOKEN_KIND } from './chat.constants';
+
+/**
+ * ChatService.requireVisibleMessage 的返回:消息行(不含编辑留痕)、所在会话与
+ * 查看者的座位(clearedBeforeHeight 已取座位/会话两侧的严者)。
+ */
+export interface VisibleChatMessage {
+  row: Omit<ChatMessage, 'contentHistory'>;
+  conversation: ChatConversation;
+  member: ChatMember;
+}
 
 /** chat:send 客户端载荷。d = 客户端生成的幂等键(deliveryId)。 */
 export interface ChatSendPayload {

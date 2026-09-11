@@ -4693,4 +4693,168 @@ describe('ChatService', () => {
       ]);
     });
   });
+
+  // 转发与收藏共用的那把尺子。收藏一度自己写了个只看 leftAt 的弱化版,
+  // 于是清空过的历史、早该烧掉的消息都还能被永久收藏 —— 每条拒绝路径都要有用例,
+  // 否则「复用同一个判定」这句话在测试里没有任何抓手。
+  describe('requireVisibleMessage(转发/收藏共用的可见性判定)', () => {
+    const visibleRow = (overrides: Record<string, unknown> = {}) => ({
+      id: 'msg-1',
+      conversationID: 'conv-1',
+      height: 9,
+      senderID: 'peer-1',
+      type: 'text',
+      content: { text: 'hello' },
+      deleted: false,
+      revokedAt: null,
+      createdAt: new Date(Date.now() - 1000),
+      ...overrides,
+    });
+
+    const expectMessageNotFound = async (promise: Promise<unknown>) => {
+      await expect(promise).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: ChatErrorCode.MessageNotFound,
+        }),
+      });
+    };
+
+    beforeEach(() => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+    });
+
+    it('returns the row, conversation and seat for a visible message', async () => {
+      const row = visibleRow();
+      prisma.chatMessage.findUnique.mockResolvedValue(row);
+
+      const result = await service.requireVisibleMessage('u1', 'msg-1');
+
+      expect(result.row).toBe(row);
+      expect(result.conversation.id).toBe('conv-1');
+      expect(result.member.userID).toBe('u1');
+    });
+
+    it('rejects a message that is not in the database', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+      // 不存在的消息不该再去查座位。
+      expect(prisma.chatMember.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('rejects a deleted message', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({ deleted: true }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+
+    it('rejects a revoked message', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({ revokedAt: new Date() }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+
+    it('rejects a viewer who never had a seat', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(visibleRow());
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.requireVisibleMessage('u1', 'msg-1'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: ChatErrorCode.NotMember,
+        }),
+      });
+    });
+
+    it('rejects a viewer who has left the conversation', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(visibleRow());
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ leftAt: new Date() }),
+      );
+
+      await expect(
+        service.requireVisibleMessage('u1', 'msg-1'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          errorCode: ChatErrorCode.NotMember,
+        }),
+      });
+    });
+
+    it('rejects a message below the viewer own cleared floor', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({ height: 5 }),
+      );
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({ clearedBeforeHeight: 5 }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+
+    it('rejects a message below the conversation-wide cleared floor', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({ height: 5 }),
+      );
+      // 座位水位是 0,会话水位是 7 —— 取严者才拦得住。
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          clearedBeforeHeight: 0,
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: null,
+            clearedBeforeHeight: 7,
+          },
+        }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+
+    it('rejects a message past the viewer self-destruct window', async () => {
+      privacySettings.getSettings.mockResolvedValue({
+        messageSelfDestructSec: 60,
+      });
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({ createdAt: new Date(Date.now() - 5 * 60_000) }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+
+    it('rejects a message past the conversation burn window even for its own sender', async () => {
+      prisma.chatMessage.findUnique.mockResolvedValue(
+        visibleRow({
+          senderID: 'u1',
+          createdAt: new Date(Date.now() - 5 * 60_000),
+        }),
+      );
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'peer-1:u1',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 60,
+            clearedBeforeHeight: 0,
+          },
+        }),
+      );
+
+      await expectMessageNotFound(service.requireVisibleMessage('u1', 'msg-1'));
+    });
+  });
 });
