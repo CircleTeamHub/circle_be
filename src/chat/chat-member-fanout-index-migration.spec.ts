@@ -26,6 +26,15 @@ describe('chat member fanout index migration', () => {
     expect(sql).toMatch(
       /CREATE INDEX CONCURRENTLY IF NOT EXISTS "ChatMember_fanout_idx"/,
     );
+    // CONCURRENTLY 失败会留下 indisvalid=false 的同名残骸：只有 IF NOT EXISTS
+    // 的话重跑会跳过它并把迁移标成已应用，索引从此不存在且无任何信号。
+    // 先 DROP 再 CREATE，且 DROP 必须排在 CREATE 前面。
+    expect(sql).toMatch(
+      /DROP INDEX CONCURRENTLY IF EXISTS "ChatMember_fanout_idx";/,
+    );
+    expect(sql.indexOf('DROP INDEX CONCURRENTLY')).toBeLessThan(
+      sql.indexOf('CREATE INDEX CONCURRENTLY'),
+    );
     // 顺序即语义：等值(conversationID) -> NULL 条件(leftAt) -> 范围
     // (clearedBeforeHeight)，范围列之后的列不能再当索引条件用，所以两个
     // 覆盖列必须排在最后。
