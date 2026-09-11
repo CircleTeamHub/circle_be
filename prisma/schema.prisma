@@ -2075,12 +2075,14 @@ model ChatConversation {
   /// 群二维码能否入群（两种群）；false 时签发群码与扫码入群一律拒绝。
   qrJoinEnabled Boolean @default(true)
   /// 普通成员能否从群里打开其他成员的资料（两种群;群主/管理员不受限）。
-  /// 圈子群建会话时置 false:圈子成员目录原本只对圈主/管理员开放,默认不放宽。
-  membersCanViewProfiles Boolean @default(true)
+  /// DB 默认**关**:圈子成员目录原本只对圈主/管理员开放,漏写的行只能更严不能更松
+  /// (蓝绿窗口里老二进制建的圈子会话也会落在这个默认上)。
+  /// 独立群聊在 createGroupConversation 里显式写 true。
+  membersCanViewProfiles Boolean @default(false)
   /// 普通成员能否看到群成员名单本身（两种群;群主/管理员不受限）。
   /// 与 membersCanViewProfiles 分开:看不到名单的人仍可能在聊天里点到某人的头像,
-  /// 那一层由 membersCanViewProfiles 单独把关。圈子群同样建会话时置 false。
-  membersCanViewRoster Boolean @default(true)
+  /// 那一层由 membersCanViewProfiles 单独把关。默认同样是关,理由同上。
+  membersCanViewRoster Boolean @default(false)
   /// 普通成员能否通过群加其他成员为好友（两种群;群主/管理员不受限）。
   membersCanAddFriends Boolean @default(true)
   /// 会话级阅后即焚秒数（S-01）：任一方设置双方生效；null=关。到期由 sweeper 真删。

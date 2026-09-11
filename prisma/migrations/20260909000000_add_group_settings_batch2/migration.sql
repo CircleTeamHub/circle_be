@@ -8,11 +8,19 @@ ALTER TABLE "ChatConversation"
   ADD COLUMN IF NOT EXISTS "avatarUrl" TEXT,
   ADD COLUMN IF NOT EXISTS "memberCanInvite" BOOLEAN NOT NULL DEFAULT true,
   ADD COLUMN IF NOT EXISTS "qrJoinEnabled" BOOLEAN NOT NULL DEFAULT true,
-  ADD COLUMN IF NOT EXISTS "membersCanViewProfiles" BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS "membersCanViewProfiles" BOOLEAN NOT NULL DEFAULT false,
   ADD COLUMN IF NOT EXISTS "membersCanAddFriends" BOOLEAN NOT NULL DEFAULT true;
 
--- 圈子群的成员目录原本只对圈主/管理员开放(review R2 的隐私设计),「成员可查看他人资料」
--- 默认必须延续这条线:存量圈子会话回填成关闭,由圈主自己决定放开。独立群聊保持默认开。
+-- DEFAULT 必须是「关」:圈子群的成员目录原本只对圈主/管理员开放(review R2 的隐私设计)。
+-- 把 DEFAULT 定成 true + 一次性回填 false 的写法在蓝绿窗口里是有洞的 —— 回填跑完之后、
+-- 老 pod 退役之前,老二进制的 ChatCircleSyncService 建出来的圈子会话仍会拿到 open 默认,
+-- 而回填不会再跑第二次,那个圈子的成员资料就**永久**对全员开放。
+-- 反过来定成 false 则怎么都只会「更严」:漏网的行是关着的,群主自己能打开。
+-- (ALTER COLUMN 单独再写一次:给已经跑过本迁移旧版本的库把 DEFAULT 纠正回来。)
+ALTER TABLE "ChatConversation"
+  ALTER COLUMN "membersCanViewProfiles" SET DEFAULT false;
+
+-- 独立群聊(微信群语义)本来就是「谁都能点开谁」:回填成开,保持现状。
 UPDATE "ChatConversation"
-SET "membersCanViewProfiles" = false
-WHERE "circleID" IS NOT NULL;
+SET "membersCanViewProfiles" = true
+WHERE "circleID" IS NULL;

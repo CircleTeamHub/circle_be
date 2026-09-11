@@ -188,6 +188,10 @@ describe('ChatService standalone group conversations', () => {
         type: 'GROUP',
         name: '周末爬山',
         ownerID: 'owner-1',
+        // DB 默认是关(给圈子会话与蓝绿窗口里老代码建的行兜底):
+        // 独立群聊的「微信群」语义必须在这里显式写开,不能靠默认值。
+        membersCanViewRoster: true,
+        membersCanViewProfiles: true,
         members: {
           create: [{ userID: 'owner-1' }, { userID: 'f1' }, { userID: 'f2' }],
         },
