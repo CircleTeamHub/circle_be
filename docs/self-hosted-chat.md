@@ -80,14 +80,25 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
   (圈子群走圈子详情;头像 URL 必须来自本应用存储)。
 - `PATCH /api/v1/chat/conversations/:id/policies` `{memberCanInvite?, qrJoinEnabled?, membersCanViewProfiles?, membersCanAddFriends?}`
   — 群策略开关;圈子群的 memberCanInvite 写在 Circle。闸门:独立群邀请 `CHAT_GROUP_INVITE_DISABLED`、
-  群码签发与扫码入群 `CHAT_GROUP_QR_JOIN_DISABLED`、加好友请求带 `viaConversationId` 时 `FRIEND_GROUP_ADD_FORBIDDEN`。
+  群码签发与扫码入群 `CHAT_GROUP_QR_JOIN_DISABLED`。
+- **「成员可添加好友 / 可查看他人资料」是服务端推导的,不看客户端自报的来源。**
+  `viaConversationId` 只是快路径;真正的判定在 `src/chat/standalone-group-policy-gate.ts`:
+  两个人**仅仅**通过关着该开关的独立群认识(不是好友、对方没先发申请、不同圈、
+  没有任何共同群开着它、本人也不是其中某个共同群的群主/管理员)时才拒绝 ——
+  加好友 `FRIEND_GROUP_ADD_FORBIDDEN`,`GET /api/v1/user/:id` 资料页 `CHAT_MEMBER_PROFILE_FORBIDDEN`。
+- 全员禁言 / 逐人禁言对**编辑消息**与**表情回应**同样生效(与发送共用 `assertGroupSpeechAllowed`):
+  编辑旧消息就是往群里发新正文,刷表情就是往群里推新事件,只拦 sendMessage 等于留了两条后门。
 - `PATCH /api/v1/chat/conversations/:id/my-alias` `{alias}` — 群昵称:我在这个群里的显示名,**全群可见**
   (任一在座成员;空串清除回落账号昵称)。
 - `PATCH /api/v1/chat/conversations/:id/my-remark` `{remark}` — 群备注:我给这个群起的名字,**只有我看得见**
   (对应单聊的好友备注;写在 ChatMember 上,与全群共享的群名无关)。alias 与 remark 方向相反,互不影响。
-- 会话 DTO 新增 `muteAll` / `notice` / `avatarUrl` / `memberLimit` / `myRole` / `myRemark` / `policies`;
-  成员 DTO 新增 `alias`。策略里的 `membersCanViewRoster`(是否显示群成员)与 `membersCanViewProfiles`
-  对圈子会话都默认 false —— 圈子成员目录原本只对圈主/管理员开放,这两个开关不能借上线悄悄放宽。
+- 会话 DTO 新增 `muteAll` / `notice` / `avatarUrl` / `memberLimit` / `myRole` / `myRemark` / `myAlias` / `policies`;
+  成员 DTO 与消息发送者(`ChatSenderInfo`)新增 `alias` —— 群昵称是「全群可见」的,
+  只出现在花名册里的话,「是否显示群成员」一关它就哪儿都看不见了。
+- `membersCanViewRoster`(是否显示群成员)与 `membersCanViewProfiles` 的 **DB 默认是 `false`**,
+  由迁移把独立群聊回填成 `true`、`createGroupConversation` 显式写 `true`;圈子会话
+  (`ChatCircleSyncService`)显式写 `false`。反过来写(默认 true + 一次性关圈子)在蓝绿窗口里有洞:
+  回填跑完之后、老 pod 退役之前建出来的圈子会话会永久拿着 open 默认。
 
 ## 防刷
 
