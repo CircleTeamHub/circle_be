@@ -3433,14 +3433,7 @@ export class ChatService {
         errorCode: ChatErrorCode.EditWindowExpired,
       });
     }
-    const previous = (row.content ?? {}) as Record<string, unknown>;
-    const history = Array.isArray(row.contentHistory)
-      ? [...(row.contentHistory as unknown[])]
-      : [];
-    history.push(previous);
-    // quote 只改 text,引用快照字段原样保留。
-    const nextContent = { ...previous, text } as Prisma.InputJsonObject;
-    // 谓词带上 revokedAt/deleted:上面那次读到写入之间,这条消息可能刚被撤回
+    // 谓词带上 revokedAt/deleted:锁内那次读到写入之间,这条消息可能刚被撤回
     // 或被焚毁扫走。按 id 无条件写会把正文塞回一条 revokedAt 非空的行 ——
     // 库里成了「已撤回但有内容」,随后的 chat:edit 广播还会在客户端盖掉
     // 撤回事件,搜索也能搜出那段本该消失的文本。输了就当消息不存在。
@@ -3457,27 +3450,36 @@ export class ChatService {
           errorCode: ChatErrorCode.ConversationNotFound,
         });
       }
-      const currentSeat = await tx.chatMember.findUnique({
-        where: {
-          conversationID_userID: {
-            conversationID: conversationId,
-            userID: userId,
-          },
-        },
-        select: { leftAt: true, silencedAt: true, silencedUntil: true },
+      // 与 sendMessage 同一组锁后复检,而不是就地手写两条。之前这里只重查了
+      // 座位和逐人禁言,漏掉 assertStillSendable 的全员禁言(muteAllAt)、DIRECT
+      // 拉黑和 TEMP 房过期 —— 管理员按下全员禁言时,在飞的编辑照样提交进去。
+      await this.assertStillSendable(tx, conversationId, userId);
+
+      // 锁内重读消息行。history/nextContent 若按锁外那次快照算,同一发送者
+      // 两台设备同时编辑时,后提交的那次会用 history=[原文] 覆盖掉前一次的
+      // 留痕,中间那一版就此消失。行锁让编辑串行,但只有重读才看得见前一次
+      // 的结果。
+      const current = await tx.chatMessage.findUnique({
+        where: { id: messageId },
       });
-      if (!currentSeat || currentSeat.leftAt) {
-        throw new ForbiddenException({
-          message: '不是会话成员',
-          errorCode: ChatErrorCode.NotMember,
+      if (
+        !current ||
+        current.conversationID !== conversationId ||
+        current.deleted ||
+        current.revokedAt
+      ) {
+        throw new NotFoundException({
+          message: '消息不存在',
+          errorCode: ChatErrorCode.MessageNotFound,
         });
       }
-      if (conversation.type === 'GROUP' && isSeatSilenced(currentSeat)) {
-        throw new ForbiddenException({
-          message: '你已被禁言',
-          errorCode: ChatErrorCode.MemberSilenced,
-        });
-      }
+      const previous = (current.content ?? {}) as Record<string, unknown>;
+      const history = Array.isArray(current.contentHistory)
+        ? [...(current.contentHistory as unknown[])]
+        : [];
+      history.push(previous);
+      // quote 只改 text,引用快照字段原样保留。
+      const nextContent = { ...previous, text } as Prisma.InputJsonObject;
 
       const applied = await tx.chatMessage.updateMany({
         where: { id: messageId, revokedAt: null, deleted: false },

@@ -2674,6 +2674,97 @@ describe('ChatService', () => {
       expect(dto.editedAt).toEqual(expect.any(String));
     });
 
+    /**
+     * PR #221 review 回归：锁后复检曾是就地手写的 seat + 逐人禁言两条，
+     * 漏掉了 assertStillSendable 的全员禁言 / DIRECT 拉黑 / TEMP 过期。
+     * 管理员按下全员禁言时，在飞的编辑照样能提交进去。
+     */
+    it('rechecks group-wide mute after locking (not just per-member silence)', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            ...membership().conversation,
+            muteAllAt: new Date(),
+            circleID: 'circle-1',
+          },
+        }),
+      );
+      // 发送者不是圈主/管理员 → 不豁免全员禁言。
+      prisma.circleMember.findUnique.mockResolvedValue({
+        role: 'MEMBER',
+        status: 'ACTIVE',
+      });
+      prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_CONVERSATION_MUTED' },
+      });
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
+    /**
+     * PR #221 review 回归：history/nextContent 曾从**锁外**的快照算。同一发送者
+     * 两台设备同时编辑时，第二次会用 history=[原文] 覆盖掉第一次的留痕 ——
+     * 中间那一版就此消失。锁内必须重读消息行。
+     */
+    it('recomputes the history trail from the row re-read under the lock', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      // 锁外那次读到的是原文；等拿到锁时，另一台设备的编辑已经提交。
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(editableRow())
+        .mockResolvedValue(
+          editableRow({
+            content: { text: 'edit from device A' },
+            contentHistory: [{ text: 'old text' }],
+            editedAt: new Date(),
+          }),
+        );
+      let edited: Record<string, unknown> = editableRow();
+      prisma.chatMessage.updateMany.mockImplementation(
+        async ({ data }: { data: Record<string, unknown> }) => {
+          edited = { ...editableRow(), ...data };
+          return { count: 1 };
+        },
+      );
+      prisma.chatMessage.findUniqueOrThrow.mockImplementation(
+        async () => edited,
+      );
+
+      await service.editMessage('u1', 'conv-1', 'm1', {
+        text: 'edit from device B',
+      });
+
+      expect(prisma.chatMessage.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            content: expect.objectContaining({ text: 'edit from device B' }),
+            // A 的留痕必须还在，且 A 的正文进了历史 —— 不能退回 [原文]。
+            contentHistory: [
+              { text: 'old text' },
+              { text: 'edit from device A' },
+            ],
+          }),
+        }),
+      );
+    });
+
+    it('treats a message revoked between preflight and the lock as missing', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique
+        .mockResolvedValueOnce(editableRow())
+        .mockResolvedValue(editableRow({ revokedAt: new Date() }));
+
+      await expect(
+        service.editMessage('u1', 'conv-1', 'm1', { text: 'new text' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: 'CHAT_MESSAGE_NOT_FOUND' },
+      });
+      expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    });
+
     it('rejects a non-sender with CHAT_EDIT_FORBIDDEN', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(
         membership({ userID: 'u2' }),
