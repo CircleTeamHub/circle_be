@@ -33,6 +33,7 @@ interface LockedGroupRow {
   nextHeight: number;
   muteAllAt: Date | null;
   notice: string | null;
+  avatarUrl: string | null;
   memberCanInvite: boolean;
   qrJoinEnabled: boolean;
   membersCanViewRoster: boolean;
@@ -152,6 +153,35 @@ export class ChatGroupSettingsService {
           errorCode: ChatErrorCode.GroupMemberNotFound,
         });
       }
+      // 转让是**单向不可撤销**的:交出去之后原群主就是普通成员,再也拿不回来。
+      // 所以目标必须是一个真的能管群的人 —— 封禁/注销的账号接手等于这个群
+      // 从此无人可管;互相拉黑的两个人之间也不该有这种托付关系(对端在本人的
+      // 界面里本来就不可见,多半是误点或被诱导)。
+      const target = await tx.user.findUnique({
+        where: { id: targetUserId },
+        select: { nickname: true, status: true },
+      });
+      if (!target || target.status !== 'ACTIVE') {
+        throw new NotFoundException({
+          message: '对方不存在或不可用',
+          errorCode: ChatErrorCode.PeerNotFound,
+        });
+      }
+      const block = await tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: actorId, blockedID: targetUserId },
+            { blockerID: targetUserId, blockedID: actorId },
+          ],
+        },
+        select: { id: true },
+      });
+      if (block) {
+        throw new ForbiddenException({
+          message: '对方不可用',
+          errorCode: ChatErrorCode.Blocked,
+        });
+      }
       await tx.chatConversation.update({
         where: { id: locked.id },
         data: { ownerID: targetUserId },
@@ -166,10 +196,6 @@ export class ChatGroupSettingsService {
           data: { role: 'MEMBER' },
         });
       }
-      const target = await tx.user.findUnique({
-        where: { id: targetUserId },
-        select: { nickname: true },
-      });
       const message =
         await this.systemMessage.insertSystemMessageAfterLockedConversationInTx(
           tx,
@@ -179,7 +205,7 @@ export class ChatGroupSettingsService {
             kind: 'owner-transferred',
             actorId,
             targetUserId,
-            ...(target?.nickname ? { name: target.nickname } : {}),
+            ...(target.nickname ? { name: target.nickname } : {}),
           },
         );
       await this.groupEvents.recordInTx(tx, locked.id, {
@@ -238,7 +264,11 @@ export class ChatGroupSettingsService {
     return { notice: next };
   }
 
-  /** 独立群聊头像(群主/管理员);URL 必须来自本应用存储,与圈子头像同一条线。 */
+  /**
+   * 独立群聊头像(群主/管理员);URL 必须来自本应用存储,与圈子头像同一条线。
+   * 与 setNotice/setMuteAll 一样未变化时幂等 —— 上传重试拿到同一个 key 时
+   * 再插一条「群头像已更新」提示与一条群日志,就是凭空复制治理记录。
+   */
   async setAvatar(
     actorId: string,
     conversationId: string,
@@ -262,6 +292,7 @@ export class ChatGroupSettingsService {
       const locked = await this.lockGroup(tx, conversationId);
       this.assertStandalone(locked);
       this.assertManager(await this.actorRoleInTx(tx, locked, actorId));
+      if ((locked.avatarUrl ?? null) === trimmed) return null;
       await tx.chatConversation.update({
         where: { id: locked.id },
         data: { avatarUrl: trimmed },
@@ -279,7 +310,7 @@ export class ChatGroupSettingsService {
       });
       return inserted;
     });
-    await this.broadcastAfterCommit(message);
+    if (message) await this.broadcastAfterCommit(message);
     return { avatarUrl: trimmed };
   }
 
@@ -441,7 +472,7 @@ export class ChatGroupSettingsService {
   ): Promise<LockedGroupRow> {
     const locked = await tx.$queryRaw<LockedGroupRow[]>`
       SELECT "id", "type", "circleID", "ownerID", "nextHeight", "muteAllAt", "notice",
-             "memberCanInvite", "qrJoinEnabled", "membersCanViewRoster",
+             "avatarUrl", "memberCanInvite", "qrJoinEnabled", "membersCanViewRoster",
              "membersCanViewProfiles", "membersCanAddFriends"
       FROM "ChatConversation"
       WHERE "id" = ${conversationId} FOR UPDATE`;

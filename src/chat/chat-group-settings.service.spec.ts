@@ -18,6 +18,7 @@ describe('ChatGroupSettingsService', () => {
     circleMember: { findUnique: jest.fn() },
     circle: { findUnique: jest.fn(), update: jest.fn() },
     user: { findUnique: jest.fn() },
+    block: { findFirst: jest.fn() },
     $transaction: jest.fn(),
     $queryRaw: jest.fn(),
   };
@@ -65,6 +66,7 @@ describe('ChatGroupSettingsService', () => {
     nextHeight: 10,
     muteAllAt: null,
     notice: null,
+    avatarUrl: null,
     memberCanInvite: true,
     qrJoinEnabled: true,
     membersCanViewProfiles: true,
@@ -110,6 +112,12 @@ describe('ChatGroupSettingsService', () => {
       async (cb: (tx: typeof prisma) => unknown) => cb(prisma),
     );
     prisma.circle.findUnique.mockResolvedValue({ memberCanInvite: true });
+    // 转让的目标默认是个正常账号,且与本人没有任何拉黑关系。
+    prisma.user.findUnique.mockResolvedValue({
+      nickname: '小方',
+      status: 'ACTIVE',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
   });
 
   describe('setMuteAll', () => {
@@ -221,7 +229,6 @@ describe('ChatGroupSettingsService', () => {
         seat('owner-1'),
         seat('u-2', { role: 'ADMIN', silencedAt: new Date() }),
       ]);
-      prisma.user.findUnique.mockResolvedValue({ nickname: '小方' });
       await service.transferOwnership('owner-1', 'conv-1', 'u-2');
       expect(prisma.chatConversation.update).toHaveBeenCalledWith({
         where: { id: 'conv-1' },
@@ -255,6 +262,49 @@ describe('ChatGroupSettingsService', () => {
           userId,
         });
       }
+    });
+
+    it('refuses a banned target and a target on either side of a block', async () => {
+      // 转让不可撤销:交给封禁/注销的账号 = 这个群从此无人可管。
+      arrange({ actor: seat('owner-1') });
+      prisma.chatMember.findMany.mockResolvedValue([
+        seat('owner-1'),
+        seat('u-2'),
+      ]);
+      prisma.user.findUnique.mockResolvedValue({
+        nickname: '小方',
+        status: 'BANNED',
+      });
+      await expect(
+        service.transferOwnership('owner-1', 'conv-1', 'u-2'),
+      ).rejects.toMatchObject({
+        constructor: NotFoundException,
+        response: { errorCode: ChatErrorCode.PeerNotFound },
+      });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+
+      prisma.user.findUnique.mockResolvedValue({
+        nickname: '小方',
+        status: 'ACTIVE',
+      });
+      prisma.block.findFirst.mockResolvedValue({ id: 'block-1' });
+      await expect(
+        service.transferOwnership('owner-1', 'conv-1', 'u-2'),
+      ).rejects.toMatchObject({
+        constructor: ForbiddenException,
+        response: { errorCode: ChatErrorCode.Blocked },
+      });
+      expect(prisma.block.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            OR: [
+              { blockerID: 'owner-1', blockedID: 'u-2' },
+              { blockerID: 'u-2', blockedID: 'owner-1' },
+            ],
+          },
+        }),
+      );
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
     });
   });
 
@@ -318,6 +368,21 @@ describe('ChatGroupSettingsService', () => {
         kind: 'group-avatar-updated',
         actorId: 'owner-1',
       });
+    });
+
+    it('skips the write, the notice and the log when the avatar is unchanged', async () => {
+      // 上传重试拿到同一个 key 时再插一条提示 + 一条群日志,就是凭空复制治理记录。
+      const url = 'http://10.0.0.195:9000/circle/avatars/group.jpg';
+      arrange({ actor: seat('owner-1'), row: { avatarUrl: url } });
+      await expect(
+        service.setAvatar('owner-1', 'conv-1', ` ${url} `),
+      ).resolves.toEqual({ avatarUrl: url });
+      expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+      expect(
+        systemMessage.insertSystemMessageAfterLockedConversationInTx,
+      ).not.toHaveBeenCalled();
+      expect(groupEvents.recordInTx).not.toHaveBeenCalled();
+      expect(systemMessage.broadcastSystemMessage).not.toHaveBeenCalled();
     });
   });
 
