@@ -21,6 +21,8 @@ describe('ChatService', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
+      // 群在座人数一次 groupBy 拿完；默认空集合，关心人数的用例自己覆盖。
+      groupBy: jest.fn().mockResolvedValue([]),
       update: jest.fn(),
       updateMany: jest.fn(),
       updateManyAndReturn: jest.fn(),
@@ -123,6 +125,9 @@ describe('ChatService', () => {
     pinned: false,
     muted: false,
     leftAt: null,
+    // Prisma 也总会读回入群时刻；会话 DTO 的 joinedAt 直接来自它，
+    // 桩里漏掉会让「新的群组」的排序在测试里永远测不到。
+    joinedAt: new Date('2026-01-01T00:00:00.000Z'),
     conversation: {
       id: 'conv-1',
       type: 'GROUP',
@@ -2218,6 +2223,45 @@ describe('ChatService', () => {
         where: { id: { in: ['tc-1'] } },
         select: { id: true, title: true },
       });
+    });
+
+    // 「我的群聊」和「新的群组」都吃这两个字段：入群时刻决定排序，在座人数上行。
+    it('carries the seat join time and the live member count on group rows', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        {
+          ...membership(),
+          joinedAt: new Date('2026-09-09T21:48:36Z'),
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            name: '东京旅行团',
+            ownerID: 'u1',
+            lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+          },
+        },
+      ]);
+      prisma.chatMember.groupBy.mockResolvedValueOnce([
+        { conversationID: 'conv-1', _count: { _all: 7 } },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0]).toMatchObject({
+        id: 'conv-1',
+        type: 'GROUP',
+        joinedAt: '2026-09-09T21:48:36.000Z',
+        memberCount: 7,
+      });
+      // 退群的座位不算在座。
+      expect(prisma.chatMember.groupBy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ leftAt: null }),
+        }),
+      );
     });
 
     it('keeps the query count flat as the conversation list grows', async () => {

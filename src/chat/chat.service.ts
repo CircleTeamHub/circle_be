@@ -88,6 +88,7 @@ type GroupFacets = Pick<
   | 'notice'
   | 'avatarUrl'
   | 'memberLimit'
+  | 'memberCount'
   | 'myRole'
   | 'policies'
 >;
@@ -98,6 +99,7 @@ const NON_GROUP_FACETS: GroupFacets = {
   notice: null,
   avatarUrl: null,
   memberLimit: null,
+  memberCount: null,
   myRole: null,
   policies: null,
 };
@@ -878,8 +880,18 @@ export class ChatService {
     const circleIds = memberships
       .map((m) => m.conversation.circleID)
       .filter((id): id is string => id !== null);
-    const [lastMessages, unreadCounts, peers, circles, tempChats, circleRoles] =
-      await Promise.all([
+    const groupIds = memberships
+      .filter((m) => m.conversation.type === 'GROUP')
+      .map((m) => m.conversationID);
+    const [
+      lastMessages,
+      unreadCounts,
+      peers,
+      circles,
+      tempChats,
+      circleRoles,
+      memberCounts,
+    ] = await Promise.all([
         this.loadLastMessages(conversationIds, cutoffs),
         this.loadUnreadCounts(
           userId,
@@ -902,7 +914,8 @@ export class ChatService {
             .filter((id): id is string => id !== null),
         ),
         this.loadCircleRoles(userId, circleIds),
-      ]);
+      this.loadGroupMemberCounts(groupIds),
+    ]);
 
     const lastRows = [...lastMessages.values()];
     const senderIds = lastRows
@@ -957,9 +970,11 @@ export class ChatService {
           m.conversation.circleID
             ? (circleRoles.get(m.conversation.circleID) ?? null)
             : null,
+          memberCounts.get(m.conversationID) ?? null,
         ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
+        joinedAt: m.joinedAt.toISOString(),
       };
     });
     await this.media.attachMediaUrls(
@@ -1893,6 +1908,10 @@ export class ChatService {
           this.loadCircleRoles(userId, [member.conversation.circleID]),
         ])
       : [new Map<string, CircleInfo>(), new Map<string, GroupRole>()];
+    const memberCounts =
+      member.conversation.type === 'GROUP'
+        ? await this.loadGroupMemberCounts([conversationId])
+        : new Map<string, number>();
     return {
       id: conversationId,
       type: member.conversation.type,
@@ -1921,9 +1940,11 @@ export class ChatService {
         member.conversation.circleID
           ? (circleRoles.get(member.conversation.circleID) ?? null)
           : null,
+        memberCounts.get(conversationId) ?? null,
       ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
+      joinedAt: member.joinedAt.toISOString(),
     };
   }
 
@@ -1942,6 +1963,7 @@ export class ChatService {
     },
     circle: { memberCanInvite: boolean } | null,
     circleRole: GroupRole | null,
+    memberCount: number | null,
   ): GroupFacets {
     if (conversation.type !== 'GROUP') return NON_GROUP_FACETS;
     const standalone = conversation.circleID === null;
@@ -1961,11 +1983,29 @@ export class ChatService {
       notice: standalone ? (conversation.notice ?? null) : null,
       avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
       memberLimit: standalone ? STANDALONE_GROUP_MAX_MEMBERS : null,
+      memberCount,
       myRole: standalone
         ? standaloneGroupRole(conversation.ownerID, seat)
         : circleRole,
       policies,
     };
+  }
+
+  /**
+   * 群在座人数(退群的座位有 leftAt,不计)。一次 groupBy 覆盖整页会话,
+   * 不按会话逐个 count —— 会话列表是热路径。
+   */
+  private async loadGroupMemberCounts(
+    conversationIds: string[],
+  ): Promise<Map<string, number>> {
+    const unique = [...new Set(conversationIds)];
+    if (unique.length === 0) return new Map();
+    const rows = await this.prisma.chatMember.groupBy({
+      by: ['conversationID'],
+      where: { conversationID: { in: unique }, leftAt: null },
+      _count: { _all: true },
+    });
+    return new Map(rows.map((row) => [row.conversationID, row._count._all]));
   }
 
   /** 本人在这些圈子里的 ACTIVE 角色(圈子群的 myRole)。 */
@@ -2766,6 +2806,7 @@ export class ChatService {
       ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
+      joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
   }
 
