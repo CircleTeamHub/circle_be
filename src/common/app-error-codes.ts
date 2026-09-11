@@ -341,6 +341,7 @@ export const ChatErrorCode = {
   // 独立群专属操作(邀请/退群/改名)打到圈子群上要显式拒绝而不是静默生效。
   GroupFriendsOnly: 'CHAT_GROUP_FRIENDS_ONLY',
   GroupMinMembers: 'CHAT_GROUP_MIN_MEMBERS',
+  GroupNameRequired: 'CHAT_GROUP_NAME_REQUIRED',
   GroupCircleManaged: 'CHAT_GROUP_CIRCLE_MANAGED',
   // 扫码进群放开了好友边界,没有容量闸的话一张群码等于无限进人。
   GroupFull: 'CHAT_GROUP_FULL',
