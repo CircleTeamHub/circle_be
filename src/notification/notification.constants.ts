@@ -34,6 +34,34 @@ export const CIRCLE_NOTIFICATION_TYPES = compactNotificationTypes([
 ] as const);
 
 /**
+ * 受「圈子通知设置 → 离线提醒」门控的类型 —— 圈子铃铛那几种，再加上报名通知。
+ *
+ * 门控面比铃铛面宽一项：CIRCLE_POST_SIGNUP_CREATED 的未读走
+ * CirclePostSignup.seenByAuthor、不进铃铛，但它照样是一条把人吵醒的圈子推送，
+ * 用户关掉离线提醒之后不该再收到。
+ *
+ * 之前投递处写的是 `type.startsWith('CIRCLE_')`：门控面跟着枚举**名字**漂移，
+ * 新增一个恰好叫 CIRCLE_ 开头、却不该被这个开关关掉的类型就会被静默吞掉。
+ * 显式列出来，再由 spec 钉住「CIRCLE_NOTIFICATION_TYPES 的每一项都在门控面里」，
+ * 两张表就不会各走各的。
+ */
+export const CIRCLE_OFFLINE_PUSH_TYPES = compactNotificationTypes([
+  ...CIRCLE_NOTIFICATION_TYPES,
+  NotificationType.CIRCLE_POST_SIGNUP_CREATED,
+] as const);
+
+const CIRCLE_OFFLINE_PUSH_TYPE_SET: ReadonlySet<NotificationType> = new Set(
+  CIRCLE_OFFLINE_PUSH_TYPES,
+);
+
+/** 这条通知的离线推送是否受用户的圈子开关门控。 */
+export function isCircleOfflinePushGated(
+  type: NotificationType | null | undefined,
+): boolean {
+  return type != null && CIRCLE_OFFLINE_PUSH_TYPE_SET.has(type);
+}
+
+/**
  * 好友申请事件：留在通知表里（推送渠道 + durable record 需要），但两个铃铛都不收 ——
  * 「新的朋友」收件箱才是它的规范 UI，未读走 contactsUnread。
  */

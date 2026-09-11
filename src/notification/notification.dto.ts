@@ -213,9 +213,16 @@ export function mapNotificationRealtimeDto(
 export class UpdateCirclePushPreferenceDto {
   @ApiProperty({
     example: true,
-    description:
-      'APP 离线时是否接收圈子推送（关闭后服务端不再投递 CIRCLE_* 推送）',
+    description: 'APP 离线时是否接收圈子推送（关闭后服务端不再投递圈子推送）',
   })
+  // 全局 ValidationPipe 开着 enableImplicitConversion（src/setup.ts），它会把任意
+  // 非空字符串转成 true —— `circleOfflinePushEnabled: "false"` 会被静默当成「开着」，
+  // 用户以为关掉了离线提醒、其实照收不误，而这个开关唯一的意义就是关掉它。
+  // @Transform 读转换前的原值，让 @IsBoolean 看得见真实类型并拒掉。
+  // 做法与 support.dto.ts 的 enabled / circle.dto.ts 的 memberCanInvite 一致。
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.circleOfflinePushEnabled,
+  )
   @IsBoolean()
   circleOfflinePushEnabled: boolean;
 }

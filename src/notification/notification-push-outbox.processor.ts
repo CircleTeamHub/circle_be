@@ -7,6 +7,8 @@ import {
   mapNotificationRealtimeDto,
   NOTIFICATION_REALTIME_INCLUDE,
 } from './notification.dto';
+import { isCircleOfflinePushGated } from './notification.constants';
+import type { NotificationType } from 'src/generated/prisma';
 import {
   DELIVERY_MAX_ATTEMPTS,
   NotificationPushService,
@@ -116,6 +118,11 @@ export class NotificationPushOutboxProcessor {
     const jobs = hydrated.sort(
       (a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0),
     );
+    // 圈子通知「离线提醒」的收件人偏好，整批一次查完（见下面的 loader）。
+    // 放在出队之后、投递之前：仍然是投递时刻的值，而不是入队时刻的。
+    const circleOfflinePushByUser =
+      await this.loadCircleOfflinePushPreferences(jobs);
+
     let processed = 0;
     for (const job of jobs) {
       const claimNow = new Date();
@@ -144,6 +151,22 @@ export class NotificationPushOutboxProcessor {
       try {
         const userId = job.notification.toUserID ?? '';
 
+        // 圈子通知「离线提醒」：用户关掉后不再向他投递圈子推送。这一判断要排在
+        // composeMessage 与 payload 快照**之前** —— 既然这条不发，就不该白组装
+        // 一份文案再写回一次库，那份快照还会一直挂在已 COMPLETED 的行上。
+        // 缺行（用户已删）按默认值「收」处理，不静默丢推送。
+        if (
+          isCircleOfflinePushGated(job.notification.type) &&
+          userId &&
+          circleOfflinePushByUser.get(userId) === false
+        ) {
+          await this.finishJob(job.id, leaseToken, 'COMPLETED');
+          // 这一轮确实处理掉了一个任务（用户主动关的，不是失败），要计数，
+          // 否则调度器会以为这批没干活。
+          processed += 1;
+          continue;
+        }
+
         // payload 快照：第一次组装后固化，重试永远发「当初组装的那份」。
         let payload = job.payload as ExpoPushPayload | null;
         if (!payload || typeof payload.title !== 'string') {
@@ -156,21 +179,6 @@ export class NotificationPushOutboxProcessor {
             // Prisma Json 列入参要求 InputJsonValue；payload 本身就是纯 JSON。
             data: { payload: JSON.parse(JSON.stringify(payload)) },
           });
-        }
-
-        // 圈子通知「离线提醒」：用户关掉后不再向他投递 CIRCLE_* 推送。
-        // 在这里读而不是在入队时读——偏好按投递时刻的最新值生效，也不给
-        // 创建通知的热路径（事务内）多加一次查询。
-        if (
-          job.notification.type?.startsWith('CIRCLE_') &&
-          userId &&
-          !(await this.isCircleOfflinePushEnabled(userId))
-        ) {
-          await this.finishJob(job.id, leaseToken, 'COMPLETED');
-          // 这一轮确实处理掉了一个任务（用户主动关的，不是失败），要计数，
-          // 否则调度器会以为这批没干活。
-          processed += 1;
-          continue;
         }
 
         // 为当前活跃 token 惰性建投递行（幂等：唯一键 + skipDuplicates）。
@@ -343,13 +351,35 @@ export class NotificationPushOutboxProcessor {
     return processed;
   }
 
-  /** 用户是否还接收圈子离线推送。查不到用户时按默认（收）处理，不静默丢推送。 */
-  private async isCircleOfflinePushEnabled(userId: string): Promise<boolean> {
-    const row = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { circleOfflinePushEnabled: true },
+  /**
+   * 批量读这一轮里圈子通知收件人的「离线提醒」开关。
+   *
+   * 逐条 findUnique 的话一轮最多 BATCH_SIZE(100) 次往返，而且同一个收件人会被
+   * 反复查 —— 一次发圈帖扇出给同一批人，出队时挨着排在一起。按去重后的收件人
+   * 一次查完，非圈子通知完全不进这个查询。
+   *
+   * 返回的 map 只含查到的行；缺行（用户已删）由调用方按默认值「收」处理。
+   */
+  private async loadCircleOfflinePushPreferences(
+    jobs: readonly {
+      notification: { type: NotificationType; toUserID: string | null };
+    }[],
+  ): Promise<ReadonlyMap<string, boolean>> {
+    const userIds = [
+      ...new Set(
+        jobs
+          .filter((job) => isCircleOfflinePushGated(job.notification?.type))
+          .map((job) => job.notification?.toUserID)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    if (userIds.length === 0) return new Map();
+
+    const rows = await this.prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, circleOfflinePushEnabled: true },
     });
-    return row?.circleOfflinePushEnabled ?? true;
+    return new Map(rows.map((row) => [row.id, row.circleOfflinePushEnabled]));
   }
 
   private async finishJob(

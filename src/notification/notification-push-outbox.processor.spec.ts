@@ -90,7 +90,14 @@ function buildHarness({
       count: jest.fn().mockResolvedValue(0),
     },
     user: {
-      findUnique: jest.fn().mockResolvedValue({ circleOfflinePushEnabled }),
+      // 门控是整批一次 findMany（去重收件人），不是每条一次 findUnique。
+      findMany: jest
+        .fn()
+        .mockImplementation(({ where }: { where: { id: { in: string[] } } }) =>
+          Promise.resolve(
+            where.id.in.map((id) => ({ id, circleOfflinePushEnabled })),
+          ),
+        ),
     },
   };
   const push = {
@@ -421,7 +428,6 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
   });
 });
 
-
 describe('圈子离线推送开关', () => {
   const circleNotification = { ...notification, type: 'CIRCLE_POST_PUBLISHED' };
 
@@ -488,7 +494,94 @@ describe('圈子离线推送开关', () => {
 
     await processor.processPending();
 
-    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    expect(prisma.user.findMany).not.toHaveBeenCalled();
     expect(push.sendToTokens).toHaveBeenCalled();
+  });
+
+  // 一次发圈帖扇出 500 人，出队时这些行挨着排；逐条 findUnique 等于一轮
+  // 最多 BATCH_SIZE 次往返，同一个收件人还会被反复查。
+  it('整批只查一次偏好，收件人去重', async () => {
+    const circleJobFor = (id: string, toUserID: string) => ({
+      id,
+      notificationID: 'notification-1',
+      status: 'PENDING',
+      attempts: 0,
+      payload: { title: 'T', body: 'B', data: {} },
+      notification: { ...circleNotification, toUserID },
+    });
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        circleJobFor('job-1', 'user-1'),
+        circleJobFor('job-2', 'user-2'),
+        circleJobFor('job-3', 'user-1'),
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+    });
+
+    await processor.processPending();
+
+    expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['user-1', 'user-2'] } },
+      select: { id: true, circleOfflinePushEnabled: true },
+    });
+  });
+
+  // 用户行查不到（已注销/竞态删除）时按默认值「收」处理 —— 缺一行数据
+  // 不该等于「静默丢掉这条推送」。
+  it('查不到用户行时按默认值照常投递', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [circleJob],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+    });
+    prisma.user.findMany.mockResolvedValue([]);
+
+    await processor.processPending();
+
+    expect(push.sendToTokens).toHaveBeenCalled();
+  });
+
+  // 关掉的收件人不该白组装一份文案再写回库：那份快照会永久挂在已 COMPLETED
+  // 的 outbox 行上，还多一次无谓的 UPDATE。
+  it('跳过时不组装 payload、不写 payload 快照', async () => {
+    const { prisma, push, processor } = buildHarness({
+      jobs: [{ ...circleJob, payload: null }],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+      circleOfflinePushEnabled: false,
+    });
+
+    await processor.processPending();
+
+    expect(push.composeMessage).not.toHaveBeenCalled();
+    expect(prisma.notificationPushOutbox.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ payload: expect.anything() }),
+      }),
+    );
+  });
+
+  // 报名通知不进圈子铃铛，但它照样是一条把人吵醒的圈子推送。
+  it('报名通知也受这个开关门控', async () => {
+    const { push, processor } = buildHarness({
+      jobs: [
+        {
+          ...circleJob,
+          notification: {
+            ...circleNotification,
+            type: 'CIRCLE_POST_SIGNUP_CREATED',
+          },
+        },
+      ],
+      pendingDeliveries: [{ id: 'd-a', token: 'tok-a' }],
+      outcomes: [{ token: 'tok-a', status: 'SENT', ticketId: 'ticket-a' }],
+      circleOfflinePushEnabled: false,
+    });
+
+    await processor.processPending();
+
+    expect(push.sendToTokens).not.toHaveBeenCalled();
   });
 });
