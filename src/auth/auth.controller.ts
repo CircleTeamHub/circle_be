@@ -123,6 +123,10 @@ export class AuthController {
   }
 
   @Post('email/request-code')
+  // 与 password/reset-request 同一档：未认证的发信成本面，IP 级 emailCodeLimiter
+  // 之外再加路由级节流，切换端点不能绕开发信预算。
+  @UseGuards(ThrottlerGuard)
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @ApiOperation({ summary: 'Request a registration email verification code' })
   @ApiBody({ type: RequestEmailCodeDto })
   @ApiCreatedResponse({

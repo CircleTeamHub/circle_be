@@ -10,11 +10,15 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as argon2 from 'argon2';
-import { Prisma } from 'src/generated/prisma';
+import { EmailCodePurpose, Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
-import { EmailVerificationService } from './email-verification.service';
+import { RequestEmailCodeDto } from './dto/request-email-code.dto';
+import {
+  EmailVerificationService,
+  VerifiedEmailCode,
+} from './email-verification.service';
 import {
   generateUniqueAccountId,
   generateUniqueRegistrationCode,
@@ -76,6 +80,15 @@ const SECURITY_CODE_PATTERN = /^\d{4,6}$/;
 // brute-force a 4-6 digit code.
 const MAX_SECURITY_CODE_ATTEMPTS = 5;
 const SECURITY_CODE_LOCK_MS = 15 * 60 * 1000;
+
+/**
+ * 请求体里的 purpose（对外小写）→ 库里的 EmailCodePurpose 枚举。
+ * 走一张显式映射表而不是 toUpperCase()：DTO 的白名单扩一档时，这里编译期就
+ * 会要求补一行，不会把未知 purpose 悄悄透传进库。
+ */
+const EMAIL_CODE_PURPOSES = {
+  register: 'REGISTER',
+} as const satisfies Record<RequestEmailCodeDto['purpose'], EmailCodePurpose>;
 
 function assertValidSecurityCode(value: string, fieldName = 'securityCode') {
   if (!SECURITY_CODE_PATTERN.test(value)) {
@@ -153,12 +166,17 @@ export class AuthService {
       });
     }
 
-    const codeOk = await this.emailVerification.verifyCode(
+    // 先校验、后消费。校验放在邮箱/邀请码查找之前：已注册邮箱在 requestCode
+    // 里静默不发码，于是没有有效码的人对任何邮箱都只会拿到 CodeInvalid ——
+    // 「该邮箱已注册」只对真正掌握邮箱的人可见，本端点不成为存在性探针。
+    // 真正的消费推迟到 createRegisteredUser 的事务里：邀请码填错、邮箱撞车、
+    // 发号冲突都不会把码烧掉，用户改正后用同一枚码重试即可。
+    const ownershipProof = await this.emailVerification.checkCode(
       email,
       'REGISTER',
       dto.code,
     );
-    if (!codeOk) {
+    if (!ownershipProof) {
       throw new BadRequestException({
         message: '验证码错误或已过期',
         errorCode: AuthErrorCode.CodeInvalid,
@@ -188,12 +206,15 @@ export class AuthService {
     }
 
     const passwordHash = await argon2.hash(dto.password);
-    const user = await this.createRegisteredUser({
-      passwordHash,
-      nickname: dto.nickname,
-      email,
-      ...(inviter ? { invitedByUserId: inviter.id } : {}),
-    });
+    const user = await this.createRegisteredUser(
+      {
+        passwordHash,
+        nickname: dto.nickname,
+        email,
+        ...(inviter ? { invitedByUserId: inviter.id } : {}),
+      },
+      ownershipProof,
+    );
 
     logBusinessEvent(this.logger, {
       enabled: this.loggingConfig.businessLogOn,
@@ -311,8 +332,20 @@ export class AuthService {
     return this.finishLogin(user, sessionContext, dto.platform);
   }
 
-  async requestEmailCode(email: string, purpose: 'register'): Promise<void> {
-    await this.emailVerification.requestCode(email, 'REGISTER');
+  /**
+   * 注册第一步：发送邮箱归属验证码。已注册邮箱在 email-verification 内静默不发；
+   * 冷却与邮件故障同样折成静默成功 —— 否则 60s 内连发两次，已注册邮箱 201/201、
+   * 未注册邮箱 201/400，差异本身就是账号存在性探针。
+   */
+  async requestEmailCode(
+    email: string,
+    purpose: RequestEmailCodeDto['purpose'],
+  ): Promise<void> {
+    await this.requestCodeNonEnumerable(
+      normalizeEmail(email),
+      EMAIL_CODE_PURPOSES[purpose],
+      'requestEmailCode',
+    );
   }
 
   /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
@@ -781,39 +814,54 @@ export class AuthService {
     };
   }
 
-  /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义在 email-verification 内。 */
+  /** FE#92 忘记密码第一步：发送重置验证码。防枚举语义见 requestCodeNonEnumerable。 */
   async requestPasswordReset(email: string): Promise<void> {
+    const requested = await this.requestCodeNonEnumerable(
+      normalizeEmail(email),
+      'RESET_PASSWORD',
+      'requestPasswordReset',
+    );
+    if (!requested) return;
+    // 不带 actorId / 邮箱：请求方未认证，且邮箱是 PII；只留「发生过」。
+    logBusinessEvent(this.logger, {
+      enabled: this.loggingConfig.businessLogOn,
+      businessEvent: 'auth_password_reset_requested',
+      result: 'success',
+    });
+  }
+
+  /**
+   * 发码入口共用的防枚举收口。email-verification 对「不该发」的邮箱静默早退
+   * （REGISTER 对已注册、RESET_PASSWORD 对未注册），但冷却检查和投递故障只打在
+   * 真正发信的那条分支上：
+   * - 60s 内重复请求：会发信的邮箱拿 CodeRateLimited，静默的邮箱恒成功；
+   * - 邮件服务故障：只有会发信的邮箱撞到 503。
+   * 两者都折成静默成功，差异才不成为账号存在性探针。60s 内的合法重复本来就
+   * 不该再发一封；真实滥用由 IP 级 emailCodeLimiter 与 @Throttle 兜底。
+   * 返回是否真的走完了发码，调用方据此决定要不要记业务事件。
+   */
+  private async requestCodeNonEnumerable(
+    email: string,
+    purpose: Extract<EmailCodePurpose, 'REGISTER' | 'RESET_PASSWORD'>,
+    operation: 'requestEmailCode' | 'requestPasswordReset',
+  ): Promise<boolean> {
     try {
-      await this.emailVerification.requestCode(
-        normalizeEmail(email),
-        'RESET_PASSWORD',
-      );
-      // 不带 actorId / 邮箱：请求方未认证，且邮箱是 PII；只留「发生过」。
-      logBusinessEvent(this.logger, {
-        enabled: this.loggingConfig.businessLogOn,
-        businessEvent: 'auth_password_reset_requested',
-        result: 'success',
-      });
+      await this.emailVerification.requestCode(email, purpose);
+      return true;
     } catch (error) {
-      // review 修复（防枚举）：冷却检查先于「未注册邮箱静默成功」——60s 内
-      // 重复请求时，已注册邮箱会拿到 CodeRateLimited、未注册邮箱恒静默成功，
-      // 差异本身就是账号存在性探针。把冷却也折叠成静默成功：60s 内的合法
-      // 重复请求本来就不该再发一封；真实滥用由 IP 级 emailCodeLimiter 兜底。
-      if (this.isCodeRateLimited(error)) return;
-      // round 3 review：邮件服务故障（503）同理 —— 未注册邮箱在发信前就
-      // 静默成功，已注册邮箱才会撞到 5xx，故障期间的差异同样是探针。
-      // 静默成功 + error 日志（运维可见；用户重试由前端「未收到？重发」引导）。
+      if (this.isCodeRateLimited(error)) return false;
       if (error instanceof ServiceUnavailableException) {
-        this.logger.error(
-          'password reset code delivery failed (mailer unavailable); returning generic success to stay non-enumerable',
-        );
         // 用户侧看不出任何异常（防枚举），所以运维侧必须能看到：邮件服务挂了。
+        // 用户重试由前端「未收到？重发」引导。
+        this.logger.error(
+          `${purpose} code delivery failed (mailer unavailable); returning generic success to stay non-enumerable`,
+        );
         reportOperationalError(error, {
           component: 'AuthService',
-          operation: 'requestPasswordReset',
+          operation,
           kind: 'mailer_unavailable',
         });
-        return;
+        return false;
       }
       throw error;
     }
@@ -1260,6 +1308,7 @@ export class AuthService {
 
   private async createRegisteredUser(
     data: Omit<Prisma.UserUncheckedCreateInput, 'accountId' | 'inviteCode'>,
+    ownershipProof: VerifiedEmailCode,
   ) {
     const maxAttempts = REGISTRATION_CODE_MAX_ATTEMPTS;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -1269,6 +1318,18 @@ export class AuthService {
       ]);
       try {
         return await this.prisma.$transaction(async (tx) => {
+          // 消费码与建号同生共死：发号冲突让事务回滚时消费也一起回滚，重试再
+          // 消费一次；写 0 行说明并发对手已用掉这枚码，本次建号整体作废。
+          const consumed = await this.emailVerification.consumeCode(
+            tx,
+            ownershipProof,
+          );
+          if (!consumed) {
+            throw new BadRequestException({
+              message: '验证码错误或已过期',
+              errorCode: AuthErrorCode.CodeInvalid,
+            });
+          }
           const user = await tx.user.create({
             data: {
               ...data,

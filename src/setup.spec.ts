@@ -43,9 +43,11 @@ describe('setupApp', () => {
     });
   });
 
-  // 回归：Node 15 起未捕获的 promise rejection 默认终止进程 —— 代码库里
-  // fire-and-forget 有几十处，漏一个 .catch 就能停服（实测过一次：Redis 抖动
-  // + WebSocket 断开）。兜底必须在引导期装上，而不是指望人逐个记得写 .catch。
+  // 回归：Node 15 起未捕获的 promise rejection 默认终止进程，而且是**无声**
+  // 终止 —— 代码库里 fire-and-forget 有几十处，漏一个 .catch 就能停服（实测
+  // 过一次：Redis 抖动 + WebSocket 断开）。兜底把这条路径接管过来：同样以
+  // 退出收场（未知的半完成状态不该继续服务），但退出前先把错误报告排空出去。
+  // 所以它必须在引导期装上，而不是指望人逐个记得写 .catch。
   it('引导期装上未捕获 rejection 的进程级兜底', () => {
     const install = jest
       .spyOn(rejectionGuard, 'installUnhandledRejectionGuard')
@@ -151,15 +153,23 @@ describe('setupApp', () => {
     );
   });
 
-  it('mounts reset-request behind the shared email-code limiter (PR #120 review)', () => {
+  it('mounts both email-send endpoints behind the shared email-code limiter', () => {
     const app = buildAppMock();
     setupApp(app as any);
 
-    // 未认证发信面必须共享同一个限流池，换端点不能绕开 10/15min 上限
-    expect(app.use).toHaveBeenCalledWith(
+    // 未认证发信面必须共享同一个限流池，换端点不能绕开 10/15min 上限。
+    // #221 把注册发码端点加了回来 —— 它必须和 reset-request 挂同一个限流器，
+    // 否则攻击者只要换条路由就能拿到第二份发信预算。
+    const emailSendRoutes = [
+      '/api/v1/auth/email/request-code',
       '/api/v1/auth/password/reset-request',
-      expect.any(Function),
+    ];
+    const limiters = emailSendRoutes.map(
+      (route) =>
+        app.use.mock.calls.find(([path]: [string]) => path === route)?.[1],
     );
+    expect(limiters[0]).toEqual(expect.any(Function));
+    expect(limiters[1]).toBe(limiters[0]);
   });
 
   it('adds a dedicated rate limit for trace detail reads', () => {

@@ -320,6 +320,67 @@ describe('EmailVerificationService', () => {
     ).resolves.toBe(false);
   });
 
+  /**
+   * PR #221 review 回归：校验与消费必须可以分开 —— register 要把消费挂到自己的
+   * 建号事务里，邀请码填错 / 建号失败都不该把码烧掉。
+   */
+  it('checkCode validates without consuming; consumeCode is what burns the row', async () => {
+    const codeHash = await argon2.hash('123456');
+    codes.push({
+      id: 'c0',
+      email: 'a@b.com',
+      purpose: 'REGISTER',
+      codeHash,
+      attempts: 0,
+      consumedAt: null,
+      expiresAt: new Date(Date.now() + 60000),
+      createdAt: Date.now(),
+    });
+
+    const verified = await service.checkCode('a@b.com', 'REGISTER', '123456');
+    expect(verified).toEqual({ kind: 'record', id: 'c0' });
+    expect(codes[0].consumedAt).toBeNull();
+
+    // 调用方失败后什么都不做 —— 同一枚码照样可以再次通过校验。
+    await expect(
+      service.checkCode('a@b.com', 'REGISTER', '123456'),
+    ).resolves.toEqual({ kind: 'record', id: 'c0' });
+
+    await expect(
+      service.consumeCode(mockPrisma as never, verified!),
+    ).resolves.toBe(true);
+    expect(codes[0].consumedAt).not.toBeNull();
+  });
+
+  it('consumeCode is CAS: a second consume of the same row writes nothing', async () => {
+    const codeHash = await argon2.hash('123456');
+    codes.push({
+      id: 'c0',
+      email: 'a@b.com',
+      purpose: 'REGISTER',
+      codeHash,
+      attempts: 0,
+      consumedAt: null,
+      expiresAt: new Date(Date.now() + 60000),
+      createdAt: Date.now(),
+    });
+    const verified = await service.checkCode('a@b.com', 'REGISTER', '123456');
+
+    await expect(
+      service.consumeCode(mockPrisma as never, verified!),
+    ).resolves.toBe(true);
+    await expect(
+      service.consumeCode(mockPrisma as never, verified!),
+    ).resolves.toBe(false);
+  });
+
+  it('consumeCode is a no-op for the dev bypass (there is no row to burn)', async () => {
+    await expect(
+      service.consumeCode(mockPrisma as never, { kind: 'bypass' }),
+    ).resolves.toBe(true);
+    expect(mockPrisma.emailVerificationCode.updateMany).not.toHaveBeenCalled();
+  });
+
   it('verifyCode returns false for wrong code and counts attempts', async () => {
     const codeHash = await argon2.hash('123456');
     codes.push({
