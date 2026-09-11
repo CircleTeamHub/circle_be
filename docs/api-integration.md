@@ -2,12 +2,12 @@
 
 ## 基础信息
 
-| 项目         | 值                             |
-| ------------ | ------------------------------ |
-| Base URL     | `http://localhost:3000/api/v1` |
-| 数据格式     | `application/json`             |
-| Swagger 文档 | `http://localhost:3000/docs`   |
-| 限流         | 每 IP 每分钟 300 次请求        |
+| 项目 | 值 |
+|---|---|
+| Base URL | `http://localhost:3000/api/v1` |
+| 数据格式 | `application/json` |
+| Swagger 文档 | `http://localhost:3000/docs` |
+| 限流 | 每 IP 每分钟 300 次请求 |
 
 ## 统一响应格式
 
@@ -55,26 +55,22 @@ POST /api/v1/auth/register
 ```
 
 **Request Headers（可选）**
-
 ```
 x-device-name: iPhone 15
 ```
 
 **Request Body**
-
 ```json
 {
-  "email": "user@example.com", // 必填
-  "code": "123456", // 邮箱收到的 6 位验证码
-  "password": "password123", // 6-64 字符，必填
-  "confirmPassword": "password123", // 必须与 password 一致
-  "nickname": "Test User", // 1-50 字符，必填
-  "inviteCode": "ABC123" // 可选
+  "email": "user@example.com",       // 必填
+  "password": "password123",         // 6-64 字符，必填
+  "confirmPassword": "password123",  // 必须与 password 一致
+  "nickname": "Test User",            // 1-50 字符，必填
+  "inviteCode": "ABC123"              // 可选
 }
 ```
 
 **Response**
-
 ```json
 {
   "code": 0,
@@ -95,7 +91,6 @@ POST /api/v1/auth/login
 ```
 
 **Request Body**
-
 ```json
 {
   "identifier": "testuser",
@@ -116,7 +111,6 @@ POST /api/v1/auth/refresh
 ```
 
 **Request Body**
-
 ```json
 {
   "refreshToken": "uuid-string"
@@ -134,7 +128,6 @@ POST /api/v1/auth/logout
 ```
 
 **Request Body**
-
 ```json
 {
   "refreshToken": "uuid-string"
@@ -160,7 +153,6 @@ Authorization: Bearer <token>
 ```
 
 **Response**
-
 ```json
 {
   "code": 0,
@@ -187,7 +179,6 @@ Authorization: Bearer <token>
 ```
 
 **Response**
-
 ```json
 {
   "code": 0,
@@ -231,7 +222,6 @@ PATCH /api/v1/user/:id
 ```
 
 **Request Body**
-
 ```json
 {
   "nickname": "新昵称",
@@ -250,14 +240,12 @@ DELETE /api/v1/user/:id
 ### 管理员接口（需要 ADMIN 角色）
 
 **获取用户列表**
-
 ```
 GET /api/v1/user?page=1&limit=10&username=test
 Authorization: Bearer <admin_token>
 ```
 
 **创建用户**
-
 ```
 POST /api/v1/user
 Authorization: Bearer <admin_token>
@@ -328,10 +316,10 @@ Content-Type: application/json
 
 允许的状态迁移：
 
-| 当前状态  | 目标状态             |
-| --------- | -------------------- |
-| `ACTIVE`  | `BANNED`、`DELETED`  |
-| `BANNED`  | `ACTIVE`、`DELETED`  |
+| 当前状态 | 目标状态 |
+|---|---|
+| `ACTIVE` | `BANNED`、`DELETED` |
+| `BANNED` | `ACTIVE`、`DELETED` |
 | `DELETED` | 无（终态，不可恢复） |
 
 删除时还必须传精确的 `confirmationAccountId`。管理员不能封禁或删除自己。封禁和
@@ -360,14 +348,14 @@ GET /api/v1/admin/users/:id/audit-logs?limit=20
 
 ## 错误处理
 
-| HTTP 状态码 | 含义                         |
-| ----------- | ---------------------------- |
-| `400`       | 请求参数错误（字段验证失败） |
-| `401`       | 未认证 / Token 过期          |
-| `403`       | 无权限（角色不足）           |
-| `404`       | 资源不存在                   |
-| `429`       | 请求频率超限                 |
-| `500`       | 服务器内部错误               |
+| HTTP 状态码 | 含义 |
+|---|---|
+| `400` | 请求参数错误（字段验证失败） |
+| `401` | 未认证 / Token 过期 |
+| `403` | 无权限（角色不足） |
+| `404` | 资源不存在 |
+| `429` | 请求频率超限 |
+| `500` | 服务器内部错误 |
 
 ---
 

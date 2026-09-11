@@ -5,7 +5,6 @@ import { RegisterDto } from './register.dto';
 
 const validPayload = {
   email: 'user@example.com',
-  code: '123456',
   password: 'password1',
   confirmPassword: 'password1',
   nickname: 'User',
@@ -63,7 +62,6 @@ describe('RegisterDto existing fields', () => {
   function base(): RegisterDto {
     const dto = new RegisterDto();
     dto.email = 'user@example.com';
-    dto.code = '123456';
     dto.password = validPassword;
     dto.confirmPassword = validPassword;
     dto.nickname = 'Jimmy';
@@ -77,7 +75,6 @@ describe('RegisterDto existing fields', () => {
   it('requires a confirmation password', async () => {
     const dto = plainToInstance(RegisterDto, {
       email: 'user@example.com',
-      code: '123456',
       password: validPassword,
       nickname: 'Jimmy',
     });
@@ -86,23 +83,6 @@ describe('RegisterDto existing fields', () => {
       true,
     );
   });
-
-  it('requires an exact six-digit registration code', async () => {
-    const dto = base();
-    dto.code = '12ab';
-    const errors = await validate(dto);
-    expect(errors.some((error) => error.property === 'code')).toBe(true);
-  });
-
-  it.each(['+12345', '-12345', '123.45'])(
-    'rejects numeric symbols in registration code %s',
-    async (code) => {
-      const dto = base();
-      dto.code = code;
-      const errors = await validate(dto);
-      expect(errors.some((error) => error.property === 'code')).toBe(true);
-    },
-  );
 
   it('rejects an invalid email', async () => {
     const dto = base();

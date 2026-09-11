@@ -118,14 +118,8 @@ describe('AuthService', () => {
     getDisplayIconsForUser: jest.fn(() => Promise.resolve([])),
   };
 
-  // checkCode 只校验、不消费；消费由 register 在建号事务里调 consumeCode。
-  // 拆开是为了让「邀请码填错」不再烧掉验证码（见 register-code-consumption.spec）。
   const mockEmailVerification = {
     requestCode: jest.fn(() => Promise.resolve()),
-    checkCode: jest.fn(() =>
-      Promise.resolve({ kind: 'record', id: 'code-row-1' }),
-    ),
-    consumeCode: jest.fn(() => Promise.resolve(true)),
     verifyCode: jest.fn(() => Promise.resolve(true)),
   };
   const mockFancyNumberService = {
@@ -231,7 +225,6 @@ describe('AuthService', () => {
   it('register creates user with auto accountId and returns tokens', async () => {
     const result = await service.register({
       email: 'new@example.com',
-      code: '123456',
       confirmPassword: 'password1',
       password: 'password1',
       nickname: 'Test User',
@@ -241,31 +234,6 @@ describe('AuthService', () => {
     expect(users[0].accountId).toMatch(/^\d{6}$/);
     expect(users[0].inviteCode).toMatch(/^[A-Z0-9]{6}$/);
     expect(users[0].email).toBe('new@example.com');
-    expect(mockEmailVerification.checkCode).toHaveBeenCalledWith(
-      'new@example.com',
-      'REGISTER',
-      '123456',
-    );
-    expect(mockEmailVerification.consumeCode).toHaveBeenCalledTimes(1);
-  });
-
-  it('register refuses to create an account when email ownership is unverified', async () => {
-    mockEmailVerification.checkCode.mockResolvedValueOnce(
-      null as unknown as { kind: 'record'; id: string },
-    );
-
-    await expect(
-      service.register({
-        email: 'victim@example.com',
-        code: '000000',
-        password: 'password1',
-        confirmPassword: 'password1',
-        nickname: 'Attacker',
-      } as any),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({ errorCode: 'AUTH_CODE_INVALID' }),
-    });
-    expect(mockPrisma.user.create).not.toHaveBeenCalled();
   });
 
   it('register rejects mismatched confirmation passwords', async () => {
@@ -331,89 +299,6 @@ describe('AuthService', () => {
       }),
     });
     expect(users).toHaveLength(0);
-  });
-
-  /**
-   * PR #221 review 回归：验证码曾在邮箱/邀请码查找**之前**就 CAS 消费掉。
-   * 邀请码填错一次，码就被烧了；改正后重试拿 AUTH_CODE_INVALID，而 60s 重发
-   * 冷却还在跑 —— 用户卡死。消费必须推迟到建号事务里，失败即回滚。
-   */
-  it('register leaves the email code unconsumed when the invite code is wrong', async () => {
-    await expect(
-      service.register({
-        email: 'invitee@example.com',
-        code: '123456',
-        confirmPassword: 'password1',
-        password: 'password1',
-        nickname: 'Invitee',
-        inviteCode: 'missing',
-      } as any),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({
-        errorCode: 'AUTH_INVITE_CODE_INVALID',
-      }),
-    });
-    expect(mockEmailVerification.checkCode).toHaveBeenCalled();
-    expect(mockEmailVerification.consumeCode).not.toHaveBeenCalled();
-  });
-
-  it('register succeeds on retry with the corrected invite code (same email code)', async () => {
-    await expect(
-      service.register({
-        email: 'invitee@example.com',
-        code: '123456',
-        confirmPassword: 'password1',
-        password: 'password1',
-        nickname: 'Invitee',
-        inviteCode: 'missing',
-      } as any),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({
-        errorCode: 'AUTH_INVITE_CODE_INVALID',
-      }),
-    });
-
-    users.push({
-      id: 'inviter-1',
-      accountId: 'renamed',
-      inviteCode: 'ABC123',
-      email: 'inviter@example.com',
-      status: 'ACTIVE',
-    });
-
-    // 同一枚码重试 —— 它没被上一次失败烧掉，所以这次必须走完。
-    const result = await service.register({
-      email: 'invitee@example.com',
-      code: '123456',
-      confirmPassword: 'password1',
-      password: 'password1',
-      nickname: 'Invitee',
-      inviteCode: 'abc123',
-    } as any);
-
-    expect(result.accessToken).toBe('access-token');
-    expect(mockEmailVerification.consumeCode).toHaveBeenCalledTimes(1);
-    expect(users.find((u) => u.email === 'invitee@example.com')).toBeDefined();
-  });
-
-  /**
-   * 消费与建号同生共死：写 0 行说明并发对手已用掉这枚码，本次建号整体作废
-   * （事务回滚，不留半个账号）。
-   */
-  it('register aborts when the code was consumed by a concurrent registration', async () => {
-    mockEmailVerification.consumeCode.mockResolvedValueOnce(false);
-
-    await expect(
-      service.register({
-        email: 'racer@example.com',
-        code: '123456',
-        confirmPassword: 'password1',
-        password: 'password1',
-        nickname: 'Racer',
-      } as any),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({ errorCode: 'AUTH_CODE_INVALID' }),
-    });
   });
 
   it('register rejects an invite code owned by an inactive user', async () => {

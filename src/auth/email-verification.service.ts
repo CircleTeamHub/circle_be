@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { randomInt } from 'crypto';
 import * as argon2 from 'argon2';
-import { EmailCodePurpose, Prisma } from 'src/generated/prisma';
+import { EmailCodePurpose } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeEmail } from 'src/utils/email';
 import { AuthErrorCode } from 'src/common/app-error-codes';
@@ -45,20 +45,6 @@ function describeMailerError(error: unknown): string {
 const CODE_TTL_MS = 10 * 60 * 1000; // 10 分钟
 const RESEND_COOLDOWN_MS = 60 * 1000; // 60 秒
 const MAX_ATTEMPTS = 5;
-
-/**
- * checkCode 通过后的凭证：bypass 没有可消费的行；record 指向待消费的那一行，
- * 由调用方在自己的业务事务里 consumeCode。
- */
-export type VerifiedEmailCode =
-  | { kind: 'bypass' }
-  | { kind: 'record'; id: string };
-
-/** consumeCode 只碰 emailVerificationCode 一张表：事务客户端与 PrismaService 都满足。 */
-export type EmailCodeStore = Pick<
-  Prisma.TransactionClient,
-  'emailVerificationCode'
->;
 
 @Injectable()
 export class EmailVerificationService implements OnModuleInit {
@@ -245,19 +231,11 @@ export class EmailVerificationService implements OnModuleInit {
     }
   }
 
-  /**
-   * 校验但**不消费**：取最新未消费行、比对哈希、错码计失败次数。
-   *
-   * 消费拆到 consumeCode 是为了让「消费码」与调用方的业务写同一事务：register
-   * 曾经先消费再查邮箱/邀请码，邀请码填错就把码烧掉，用户重发又撞 60s 冷却。
-   * 失败计数留在这里、用事务外的客户端写 —— 放进外层事务的话回滚会把计数一起
-   * 撤掉，MAX_ATTEMPTS 锁定形同虚设。
-   */
-  async checkCode(
+  async verifyCode(
     rawEmail: string,
     purpose: EmailCodePurpose,
     code: string,
-  ): Promise<VerifiedEmailCode | null> {
+  ): Promise<boolean> {
     const email = normalizeEmail(rawEmail);
 
     // 显式开启时，固定码可直接通过（无需先请求验证码）。
@@ -266,7 +244,7 @@ export class EmailVerificationService implements OnModuleInit {
       this.logger.warn(
         `[DEV] email code bypass used (${purpose}) — disable in production`,
       );
-      return { kind: 'bypass' };
+      return true;
     }
 
     const record = await this.prisma.emailVerificationCode.findFirst({
@@ -280,7 +258,7 @@ export class EmailVerificationService implements OnModuleInit {
     });
 
     if (!record || record.attempts >= MAX_ATTEMPTS) {
-      return null;
+      return false;
     }
 
     // round 3 review：候选行还必须是该 (email, purpose) 的**整体最新**行
@@ -292,7 +270,7 @@ export class EmailVerificationService implements OnModuleInit {
       select: { id: true },
     });
     if (newest && newest.id !== record.id) {
-      return null;
+      return false;
     }
 
     const valid = await argon2.verify(record.codeHash, code);
@@ -301,39 +279,16 @@ export class EmailVerificationService implements OnModuleInit {
         where: { id: record.id },
         data: { attempts: { increment: 1 } },
       });
-      return null;
+      return false;
     }
 
-    return { kind: 'record', id: record.id };
-  }
-
-  /**
-   * CAS 消费 checkCode 通过的那一行。传业务事务的客户端进来，消费就随事务
-   * 提交/回滚：建号失败码仍可用，建号成功码才真正作废。
-   *
-   * round 3 review：消费必须 CAS —— 并发两次同码都能过读+argon2，无条件
-   * update 让一次性码在竞态下可复用。条件写 0 行 = 已被并发对手消费，按无效处理。
-   */
-  async consumeCode(
-    store: EmailCodeStore,
-    verified: VerifiedEmailCode,
-  ): Promise<boolean> {
-    if (verified.kind === 'bypass') return true;
-    const consumed = await store.emailVerificationCode.updateMany({
-      where: { id: verified.id, consumedAt: null },
+    // round 3 review：消费必须 CAS —— 并发两次同码重置都能过读+argon2，
+    // 无条件 update 让一次性码在竞态下可复用（最终密码 last-writer-wins）。
+    // 条件写 0 行 = 已被并发对手消费，按无效处理。
+    const consumed = await this.prisma.emailVerificationCode.updateMany({
+      where: { id: record.id, consumedAt: null },
       data: { consumedAt: new Date() },
     });
     return consumed.count === 1;
-  }
-
-  /** 校验并立即消费：给没有业务事务可挂靠的调用方（如改密）。 */
-  async verifyCode(
-    rawEmail: string,
-    purpose: EmailCodePurpose,
-    code: string,
-  ): Promise<boolean> {
-    const verified = await this.checkCode(rawEmail, purpose, code);
-    if (!verified) return false;
-    return this.consumeCode(this.prisma, verified);
   }
 }
