@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import PDFDocument from 'pdfkit';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
   CHAT_MEDIA_DELETE_CLAIM_REASON,
@@ -424,7 +425,7 @@ describe('NoteService', () => {
       id: 'note-2',
       ownerID: 'user-1',
       title: '手填标题',
-      content: '块标题 正文第一段 列表项一',
+      content: '块标题\n正文第一段\n列表项一',
       status: 'ACTIVE',
       available: true,
       pinned: false,
@@ -448,7 +449,7 @@ describe('NoteService', () => {
       id: 'note-2',
       ownerID: 'user-1',
       title: '手填标题',
-      content: '块标题 正文第一段 列表项一',
+      content: '块标题\n正文第一段\n列表项一',
       status: 'ACTIVE',
       available: true,
       pinned: false,
@@ -560,7 +561,7 @@ describe('NoteService', () => {
       expect.objectContaining({
         data: expect.objectContaining({
           title: '手填标题',
-          content: '块标题 正文第一段 列表项一',
+          content: '块标题\n正文第一段\n列表项一',
           contentJson,
           imageCount: 1,
           videoCount: 1,
@@ -585,7 +586,7 @@ describe('NoteService', () => {
     });
     expect(result).toMatchObject({
       title: '手填标题',
-      content: '块标题 正文第一段 列表项一',
+      content: '块标题\n正文第一段\n列表项一',
       imageCount: 1,
       videoCount: 1,
       mediaCount: 2,
@@ -2609,7 +2610,8 @@ describe('NoteService', () => {
           operation === 'create'
             ? prisma.note.create.mock.calls[0][0].data
             : prisma.note.update.mock.calls[0][0].data;
-        const content = '正文引言 星期一\t东京\n星期二\t京都';
+        // 块之间用 \n 接：表格片段是多行的，用空格接会把后面的段落粘到最后一行。
+        const content = '正文引言\n星期一\t东京\n星期二\t京都';
 
         expect(saved.title).toBe('我的旅行计划');
         expect(saved.content).toBe(content);
@@ -2618,7 +2620,8 @@ describe('NoteService', () => {
         expect(result).toMatchObject({
           title: '我的旅行计划',
           content,
-          contentPreview: content,
+          // 卡片预览是单行文案：段落分隔 \n 与单元格分隔 \t 一律折成空格。
+          contentPreview: '正文引言 星期一 东京 星期二 京都',
           sections: { text: { content, contentJson: blocks } },
         });
         expect(result.content).not.toContain('https://');
@@ -2654,9 +2657,16 @@ describe('NoteService', () => {
       expect(result.content).toBe('星期一\t东京\n星期二\t京都');
     });
 
-    it('bounds malformed deeply nested cell content while keeping neighboring text', async () => {
+    it('bounds malformed deeply nested cell content while keeping the neighbouring column', async () => {
+      // 行内遍历只会往 link 里下钻，所以用 30 层 link 套 text 去撞深度上限。
       let nested: unknown = { type: 'text', text: '超深内容' };
-      for (let i = 0; i < 30; i += 1) nested = { content: [nested] };
+      for (let i = 0; i < 30; i += 1) {
+        nested = {
+          type: 'link',
+          href: 'https://example.com',
+          content: [nested],
+        };
+      }
       prisma.note.create.mockResolvedValueOnce({ id: row.id });
       prisma.note.update.mockImplementationOnce(async () => ({
         ...row,
@@ -2677,7 +2687,234 @@ describe('NoteService', () => {
         ],
       });
 
-      expect(result.content).toBe('正常内容');
+      // 超深单元格按空处理，但它的列位（\t）保留，不吃掉邻格的列。
+      expect(result.content).toBe('\t正常内容');
+    });
+
+    it.each([
+      [
+        'keeps the tab of edge-empty cells so columns stay aligned',
+        [
+          { cells: [[], [{ type: 'text', text: 'B' }], []] },
+          {
+            cells: [
+              [{ type: 'text', text: 'A' }],
+              [],
+              [{ type: 'text', text: 'C' }],
+            ],
+          },
+        ],
+        '\tB\t\nA\t\tC',
+      ],
+      [
+        'keeps two columns when the first column is empty on every row',
+        [
+          { cells: [[], [{ type: 'text', text: 'B' }]] },
+          { cells: [[], [{ type: 'text', text: 'D' }]] },
+        ],
+        '\tB\n\tD',
+      ],
+      [
+        'trims each cell on its own and drops rows whose every cell is empty',
+        [
+          { cells: [[], [{ type: 'text', text: '   ' }]] },
+          {
+            cells: [
+              [{ type: 'text', text: ' A ' }],
+              { type: 'tableCell', content: [{ type: 'text', text: '  B  ' }] },
+            ],
+          },
+        ],
+        'A\tB',
+      ],
+    ])('%s', async (_name, rows, expected) => {
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const result = await service.createNote('user-1', {
+        title: '对齐表格',
+        media: [],
+        contentJson: [
+          { type: 'table', content: { type: 'tableContent', rows } },
+        ],
+      });
+
+      expect(result.content).toBe(expected);
+    });
+
+    it('shares one inline walker between paragraphs and table cells', async () => {
+      const inline = [
+        { type: 'text', text: 'Hi ' },
+        // mention 一类未知行内节点：两边都当空字符串，不把 text/props 漏进正文。
+        { type: 'mention', props: { user: 'u1' }, text: '@alice' },
+        { type: 'text', text: '! 京' },
+        // 相邻样式片段直接拼接，不插空格（以前段落会拼成「京 都」）。
+        { type: 'text', text: '都', styles: { bold: true } },
+      ];
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const result = await service.createNote('user-1', {
+        title: '同一套行内语义',
+        media: [],
+        contentJson: [
+          { type: 'paragraph', content: inline },
+          {
+            type: 'table',
+            content: {
+              type: 'tableContent',
+              rows: [
+                { cells: [inline, { type: 'tableCell', content: inline }] },
+              ],
+            },
+          },
+        ],
+      });
+
+      expect(result.content).toBe('Hi ! 京都\nHi ! 京都\tHi ! 京都');
+      expect(result.content).not.toContain('@alice');
+    });
+
+    it('separates a table from the following paragraph with a newline and keeps it out of the last row in exports', async () => {
+      const blocks = [
+        {
+          type: 'table',
+          content: {
+            type: 'tableContent',
+            rows: [
+              {
+                cells: [
+                  [{ type: 'text', text: 'A' }],
+                  [{ type: 'text', text: 'B' }],
+                ],
+              },
+              {
+                cells: [
+                  [{ type: 'text', text: 'C' }],
+                  [{ type: 'text', text: 'D' }],
+                ],
+              },
+            ],
+          },
+        },
+        { type: 'paragraph', content: [{ type: 'text', text: '总结' }] },
+      ];
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const created = await service.createNote('user-1', {
+        title: '表格加总结',
+        media: [],
+        contentJson: blocks,
+      });
+      expect(created.content).toBe('A\tB\nC\tD\n总结');
+
+      // 导出读的是库里的行：把刚存下来的正文原样喂回去，串起「存 → 导出」两步。
+      const exportRow = {
+        ...row,
+        title: '表格加总结',
+        content: created.content,
+        contentJson: blocks,
+        sections: prisma.note.create.mock.calls[0][0].data.sections,
+      };
+      const uploaded = {
+        url: 'https://cdn.example.com/note-exports/user-1/note-rich/x',
+        key: 'note-exports/user-1/note-rich/x',
+        size: 1,
+        expiresAt: new Date('2026-09-09T00:15:00.000Z'),
+      };
+      prisma.note.findFirst
+        .mockResolvedValueOnce(exportRow)
+        .mockResolvedValueOnce(exportRow);
+      uploadService.uploadBuffer
+        .mockResolvedValueOnce(uploaded)
+        .mockResolvedValueOnce(uploaded);
+
+      await service.createNoteExport('user-1', row.id, {
+        format: 'IMAGE',
+        scope: 'ALL',
+      } as never);
+      const svg = (
+        uploadService.uploadBuffer.mock.calls[0][0].body as Buffer
+      ).toString();
+      const textNodes = [...svg.matchAll(/<text[^>]*>([^<]*)<\/text>/g)].map(
+        (match) => match[1],
+      );
+      // 长图导出一行一个 <text>：SVG 默认 xml:space 会把 <text> 里的换行整个吞掉
+      //（不是换成空格），不拆行的话「总结」会直接粘在 D 后面。
+      expect(textNodes).toEqual(
+        expect.arrayContaining(['A\tB', 'C\tD', '总结']),
+      );
+      expect(textNodes.indexOf('总结')).toBe(textNodes.indexOf('C\tD') + 1);
+      expect(textNodes.filter((node) => node.includes('\n'))).toEqual([]);
+
+      const pdfText = jest.spyOn(PDFDocument.prototype, 'text');
+      try {
+        await service.createNoteExport('user-1', row.id, {
+          format: 'PDF',
+          scope: 'ALL',
+        } as never);
+        const pdf = uploadService.uploadBuffer.mock.calls[1][0].body as Buffer;
+        expect(pdf.subarray(0, 5).toString()).toBe('%PDF-');
+        // PDF 正文整段交给 pdfkit（它按 \n 换行）：段落独占一行，而不是被 \t 接到
+        // 最后一行当成第三格。断言必须在 mockRestore 之前 —— restore 会连 mock.calls 一起清掉。
+        expect(pdfText).toHaveBeenCalledWith(
+          'A\tB\nC\tD\n总结',
+          expect.objectContaining({ width: 500 }),
+        );
+      } finally {
+        pdfText.mockRestore();
+      }
+    });
+
+    it('collapses tabs, newlines and control characters into single spaces in contentPreview before the 120-char cut', async () => {
+      const filler = 'x'.repeat(130);
+      prisma.note.create.mockResolvedValueOnce({ id: row.id });
+      prisma.note.update.mockImplementationOnce(async () => ({
+        ...row,
+        ...prisma.note.create.mock.calls[0][0].data,
+      }));
+
+      const result = await service.createNote('user-1', {
+        title: '预览折叠',
+        media: [],
+        contentJson: [
+          {
+            type: 'table',
+            content: {
+              type: 'tableContent',
+              rows: [
+                {
+                  cells: [
+                    [{ type: 'text', text: 'A' }],
+                    [{ type: 'text', text: 'B' }],
+                  ],
+                },
+              ],
+            },
+          },
+          // \u0007（BEL）是控制字符却不落在 \s 里，预览同样要把它折成空格。
+          {
+            type: 'paragraph',
+            content: [{ type: 'text', text: 'C\u0007D' }],
+          },
+          { type: 'paragraph', content: [{ type: 'text', text: filler }] },
+        ],
+      });
+
+      // 正文原样保留结构（\t / \n / 控制字符），只有预览折叠。
+      expect(result.content).toBe(`A\tB\nC\u0007D\n${filler}`);
+      expect(result.contentPreview).toBe(`A B C D ${'x'.repeat(112)}...`);
+      expect(result.contentPreview).toHaveLength(123);
     });
   });
 

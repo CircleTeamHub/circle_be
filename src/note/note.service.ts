@@ -227,6 +227,24 @@ const MAX_GROUPS_PER_USER = 50;
 // extracted from contentJson blocks otherwise bypasses DTO validation.
 const MAX_NOTE_TITLE_LENGTH = 120;
 const MAX_NOTE_CONTENT_LENGTH = 20_000;
+const MAX_NOTE_PREVIEW_LENGTH = 120;
+/** 递归下钻块/行内节点的层数上限，挡住恶意构造的深层嵌套。 */
+const MAX_NOTE_BLOCK_DEPTH = 10;
+/**
+ * Note.content 的行分隔符：块与块之间、表格的行与行之间都用它。
+ * 块之间用换行接而不是空格 —— 表格片段本身就是多行的，用空格接会把表格后面的
+ * 段落粘到最后一行末尾，导出时被当成多出来的一格。
+ */
+const NOTE_LINE_SEPARATOR = '\n';
+/** 表格同一行内的列分隔符。 */
+const NOTE_TABLE_CELL_SEPARATOR = '\t';
+/**
+ * 预览折叠用：空白 + \s 之外的 C0/C1 控制字符。
+ * \t/\n/\v/\f/\r 本来就在 \s 里，所以 C0 只补 \u0000-\u0008 与 \u000e-\u001f。
+ */
+
+const NOTE_PREVIEW_WHITESPACE_PATTERN =
+  /[\s\u0000-\u0008\u000e-\u001f\u007f-\u009f]+/g;
 const NOTE_EXPORT_TTL_SECONDS = 15 * 60;
 // 读取时给笔记媒体现签短时 URL。signingDate 舍入到 WINDOW → 同窗口内同一对象签出字节相同的
 // URL，客户端(expo-image)按-URL 缓存才命中；TTL = 窗口 + buffer，保证窗口内始终有效。
@@ -546,7 +564,9 @@ export class NoteService {
     const lines = [
       note.title,
       '',
-      sections.text.content ?? '',
+      // 一个换行一个 <text>：SVG 默认 xml:space 会把 <text> 里的换行整个**吞掉**
+      // （不是换成空格），整段塞一个 <text> 会让表格行和后面的段落首尾粘在一起。
+      ...(sections.text.content ?? '').split(NOTE_LINE_SEPARATOR),
       '',
       ...exportMedia.map((item: any, index) => {
         const type = item.type === 'VIDEO' ? '视频' : '图片';
@@ -1050,76 +1070,91 @@ export class NoteService {
     };
   }
 
+  /**
+   * 卡片预览是**单行**文案（客户端 numberOfLines=2）。正文里的 \t（表格列分隔）、
+   * \n（块分隔）和任何控制字符一律先折成一个空格再切 —— 否则表格开头的笔记预览
+   * 会被换行撑掉，两行里看不到任何有效内容。
+   */
   private buildPreview(content: string | null | undefined) {
     if (!content) return null;
-    return content.length > 120 ? `${content.slice(0, 120)}...` : content;
+    const flattened = content
+      .replace(NOTE_PREVIEW_WHITESPACE_PATTERN, ' ')
+      .trim();
+    if (!flattened) return null;
+    return flattened.length > MAX_NOTE_PREVIEW_LENGTH
+      ? `${flattened.slice(0, MAX_NOTE_PREVIEW_LENGTH)}...`
+      : flattened;
   }
 
-  private extractTableCellText(content: unknown, depth = 0): string {
-    if (depth > 10) return '';
-    if (typeof content === 'string') return content;
-    if (Array.isArray(content)) {
-      return content
-        .map((item) => this.extractTableCellText(item, depth + 1))
+  /**
+   * 行内节点 → 可见文本，段落与表格单元格共用这一套语义。
+   * 只认 BlockNote 的两种行内节点：`text` 取 text，`link` 只取内文（href 不进正文）；
+   * mention 之类的未知节点一律空串，免得把 props/href 漏进正文。
+   * 相邻片段直接拼接不补空格 —— 它们本来就是同一段文字的连续样式片段。
+   */
+  private extractInlineText(node: unknown, depth = 0): string {
+    if (depth > MAX_NOTE_BLOCK_DEPTH) return '';
+    if (Array.isArray(node)) {
+      return node
+        .map((item) => this.extractInlineText(item, depth + 1))
         .join('');
     }
-    if (!this.isRecord(content)) return '';
-    if (typeof content.text === 'string') return content.text;
-    return this.extractTableCellText(content.content, depth + 1);
+    if (!this.isRecord(node)) return '';
+    // BNStyledText: { type: 'text', text: string, styles: {...} }
+    if (node.type === 'text') {
+      return typeof node.text === 'string' ? node.text : '';
+    }
+    // BNLink: { type: 'link', href: string, content: BNStyledText[] }
+    if (node.type === 'link') {
+      return this.extractInlineText(node.content, depth + 1);
+    }
+    return '';
   }
 
+  /** 单元格既可能是行内数组（旧结构），也可能是 tableCell 包装（新结构）。 */
+  private extractTableCellText(cell: unknown): string {
+    const inline =
+      this.isRecord(cell) && cell.type === 'tableCell' ? cell.content : cell;
+    return this.extractInlineText(inline).trim();
+  }
+
+  /**
+   * 表格 → 一行一个 \t 分隔的文本行。**逐格 trim，每个 \t 都留着**：整行 trim 会
+   * 吃掉首/尾空单元格的分隔符，两列表就退化成一列，导出与预览全部错位。
+   * 整行皆空才丢掉这一行。
+   */
+  private extractTableText(content: unknown): string {
+    if (!this.isRecord(content)) return '';
+    const rows = Array.isArray(content.rows) ? content.rows : [];
+    const lines: string[] = [];
+
+    for (const row of rows) {
+      if (!this.isRecord(row) || !Array.isArray(row.cells)) continue;
+      const cells = row.cells.map((cell) => this.extractTableCellText(cell));
+      if (cells.some(Boolean)) {
+        lines.push(cells.join(NOTE_TABLE_CELL_SEPARATOR));
+      }
+    }
+
+    return lines.join(NOTE_LINE_SEPARATOR);
+  }
+
+  /** 每个块产出至多一个片段，调用方按 \n 拼接（见 {@link NOTE_LINE_SEPARATOR}）。 */
   private extractBlockText(
     blocks: NoteContentBlock[] | undefined,
     depth = 0,
   ): string[] {
-    if (!blocks?.length || depth > 10) return [];
+    if (!blocks?.length || depth > MAX_NOTE_BLOCK_DEPTH) return [];
 
     const fragments: string[] = [];
 
     for (const block of blocks) {
       if (!this.isRecord(block)) continue;
-      if (
-        block.type === 'table' &&
-        this.isRecord(block.content) &&
-        !Array.isArray(block.content)
-      ) {
-        const rows = Array.isArray(block.content.rows)
-          ? block.content.rows
-          : [];
-        const tableText = rows
-          .map((row) => {
-            if (!this.isRecord(row) || !Array.isArray(row.cells)) return '';
-            // Support both legacy inline arrays and newer tableCell objects.
-            return row.cells
-              .map((cell) => this.extractTableCellText(cell))
-              .join('\t')
-              .trim();
-          })
-          .filter(Boolean)
-          .join('\n');
-        if (tableText) fragments.push(tableText);
-      }
-
-      const inlines = Array.isArray(block.content) ? block.content : [];
-
-      for (const node of inlines) {
-        if (!this.isRecord(node)) continue;
-        if (node.type === 'text') {
-          // BNStyledText: { type: 'text', text: string, styles: {...} }
-          const trimmed = typeof node.text === 'string' ? node.text.trim() : '';
-          if (trimmed) fragments.push(trimmed);
-        } else if (node.type === 'link') {
-          // BNLink: { type: 'link', href: string, content: BNStyledText[] }
-          // Extract the visible text from the link's inner StyledText nodes
-          const linkContent = Array.isArray(node.content) ? node.content : [];
-          for (const inner of linkContent) {
-            if (!this.isRecord(inner)) continue;
-            const trimmed =
-              typeof inner.text === 'string' ? inner.text.trim() : '';
-            if (trimmed) fragments.push(trimmed);
-          }
-        }
-      }
+      const text =
+        block.type === 'table'
+          ? this.extractTableText(block.content)
+          : this.extractInlineText(block.content).trim();
+      if (text) fragments.push(text);
 
       if (Array.isArray(block.children) && block.children.length > 0) {
         fragments.push(...this.extractBlockText(block.children, depth + 1));
@@ -1217,10 +1252,12 @@ export class NoteService {
         : {}),
     }));
 
+    // 片段本身已逐块/逐格 trim 过，这里**不能**再 trim 整段：首个单元格为空时正文
+    // 以 \t 开头，整段 trim 会把它的列位吃掉，两列表退化成一列。
+    const blockContent = extractedText.join(NOTE_LINE_SEPARATOR);
     const derivedContent =
       blocks.length > 0
-        ? extractedText.join(' ').trim() ||
-          (sectionText?.content ?? input.content ?? '').trim()
+        ? blockContent || (sectionText?.content ?? input.content ?? '').trim()
         : (sectionText?.content ?? input.content ?? '').trim();
     const derivedTitle = input.title.trim();
     const normalized = {
