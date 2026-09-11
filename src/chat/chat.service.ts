@@ -3768,34 +3768,72 @@ export class ChatService {
         errorCode: ChatErrorCode.EditWindowExpired,
       });
     }
-    const previous = (row.content ?? {}) as Record<string, unknown>;
-    const history = Array.isArray(row.contentHistory)
-      ? [...(row.contentHistory as unknown[])]
-      : [];
-    history.push(previous);
-    // quote 只改 text,引用快照字段原样保留。
-    const nextContent = { ...previous, text } as Prisma.InputJsonObject;
-    // 谓词带上 revokedAt/deleted:上面那次读到写入之间,这条消息可能刚被撤回
+    // 谓词带上 revokedAt/deleted:锁内那次读到写入之间,这条消息可能刚被撤回
     // 或被焚毁扫走。按 id 无条件写会把正文塞回一条 revokedAt 非空的行 ——
     // 库里成了「已撤回但有内容」,随后的 chat:edit 广播还会在客户端盖掉
     // 撤回事件,搜索也能搜出那段本该消失的文本。输了就当消息不存在。
-    const applied = await this.prisma.chatMessage.updateMany({
-      where: { id: messageId, revokedAt: null, deleted: false },
-      data: {
-        content: nextContent,
-        editedAt: new Date(),
-        contentHistory: history as Prisma.InputJsonValue,
-      },
-    });
-    if (applied.count === 0) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Group silence changes take this same row lock before updating the seat.
+      // Re-reading after the lock makes an edit and a concurrent silence obey
+      // one total order: whichever acquires the lock first wins completely.
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (locked.length === 0) {
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
+        });
+      }
+      // 与 sendMessage 同一组锁后复检,而不是就地手写两条。之前这里只重查了
+      // 座位和逐人禁言,漏掉 assertStillSendable 的全员禁言(muteAllAt)、DIRECT
+      // 拉黑和 TEMP 房过期 —— 管理员按下全员禁言时,在飞的编辑照样提交进去。
+      await this.assertStillSendable(tx, conversationId, userId);
+
+      // 锁内重读消息行。history/nextContent 若按锁外那次快照算,同一发送者
+      // 两台设备同时编辑时,后提交的那次会用 history=[原文] 覆盖掉前一次的
+      // 留痕,中间那一版就此消失。行锁让编辑串行,但只有重读才看得见前一次
+      // 的结果。
+      const current = await tx.chatMessage.findUnique({
+        where: { id: messageId },
       });
-    }
-    const updated = await this.prisma.chatMessage.findUniqueOrThrow({
-      where: { id: messageId },
-      omit: MESSAGE_READ_OMIT,
+      if (
+        !current ||
+        current.conversationID !== conversationId ||
+        current.deleted ||
+        current.revokedAt
+      ) {
+        throw new NotFoundException({
+          message: '消息不存在',
+          errorCode: ChatErrorCode.MessageNotFound,
+        });
+      }
+      const previous = (current.content ?? {}) as Record<string, unknown>;
+      const history = Array.isArray(current.contentHistory)
+        ? [...(current.contentHistory as unknown[])]
+        : [];
+      history.push(previous);
+      // quote 只改 text,引用快照字段原样保留。
+      const nextContent = { ...previous, text } as Prisma.InputJsonObject;
+
+      const applied = await tx.chatMessage.updateMany({
+        where: { id: messageId, revokedAt: null, deleted: false },
+        data: {
+          content: nextContent,
+          editedAt: new Date(),
+          contentHistory: history as Prisma.InputJsonValue,
+        },
+      });
+      if (applied.count === 0) {
+        throw new NotFoundException({
+          message: '消息不存在',
+          errorCode: ChatErrorCode.MessageNotFound,
+        });
+      }
+      return tx.chatMessage.findUniqueOrThrow({
+        where: { id: messageId },
+        omit: MESSAGE_READ_OMIT,
+      });
     });
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,

@@ -817,6 +817,9 @@ export class CircleService {
       // 招新策略锁:解散必须与「在飞的担保单」串行,否则一张读到解散前状态
       // 的建单可以在解散提交之后才落库,给一个已经没了的圈子放人进来。
       await this.memberLock.lockPolicy(tx, circleId);
+      // 与座位对账共用同一把圈子锁。否则一个已经读到 ACTIVE 的 ensure 可以在
+      // 解散后的清理快照之后才重新入座,让已删除圈子的群聊继续可见、可发言。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${CIRCLE_SYNC_LOCK_NAMESPACE}, hashtext(${circleId}))`;
 
       const membership = await tx.circleMember.findUnique({
         where: { userID_circleID: { userID: userId, circleID: circleId } },
