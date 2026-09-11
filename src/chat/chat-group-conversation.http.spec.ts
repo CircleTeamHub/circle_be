@@ -15,6 +15,7 @@ import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
+import { ChatGroupSettingsService } from './chat-group-settings.service';
 import { ChatController } from './chat.controller';
 import { ChatService } from './chat.service';
 
@@ -57,6 +58,7 @@ describe('POST /chat/conversations/group HTTP pipeline', () => {
         { provide: ChatService, useValue: chatService },
         { provide: ChatGroupAdminService, useValue: {} },
         { provide: ChatGroupEventService, useValue: {} },
+        { provide: ChatGroupSettingsService, useValue: {} },
       ],
     })
       .overrideGuard(JwtGuard)
