@@ -286,7 +286,13 @@ export interface ChatPresenceQuery {
   detail?: boolean;
 }
 
-/** detail 查询的单人结果。 */
+/**
+ * detail 查询的单人结果。
+ *
+ * detail 查询会为**每个被请求的 userId** 都给一个条目,不可见的人显式回 null ——
+ * 从结果里省略的话,客户端没法把「对方刚关掉显示在线时间」和「这次限流/出错
+ * 没答上来」(两者都是 ack({}))区分开,只能把旧的在线状态一直挂在界面上。
+ */
 export interface ChatPresenceDetail {
   online: boolean;
   /** 最近在线时刻(ISO);在线时为 null,没记录过也为 null。 */

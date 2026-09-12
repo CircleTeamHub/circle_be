@@ -23,3 +23,13 @@ export interface PresenceVisibilityChangedEvent {
 export const privacySettingsEvents = new EventEmitter();
 
 export const PRESENCE_VISIBILITY_CHANGED = 'presence-visibility-changed';
+
+/**
+ * 隐私设置变更的跨实例通知频道(载荷 = userId)。
+ *
+ * 「正在输入」的开关在网关里按用户缓存,只靠进程内事件的话,PATCH 落在实例 A
+ * 而 socket 连在实例 B 时,B 的缓存要等 TTL 到期才追平 —— 那段窗口里 B 仍在
+ * 转发本该被挡掉的 typing。沿用 SESSION_REVOCATION_CHANNEL 那套 publish /
+ * psubscribe,让每个实例收到就丢掉自己那一份。
+ */
+export const PRIVACY_SETTINGS_CHANGED_CHANNEL = 'circle:privacy:changed';

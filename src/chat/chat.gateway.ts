@@ -27,6 +27,7 @@ import {
   userRoom,
 } from './chat.constants';
 import { DistributedRateLimiter } from './chat-rate-limiter';
+import { PRIVACY_SETTINGS_CHANGED_CHANNEL } from 'src/privacy/privacy-events';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -232,6 +233,7 @@ export class ChatGateway implements OnModuleDestroy {
   /** 会话类型缓存。类型不可变,只需要一个上限防止无界增长。 */
   private readonly conversationTypeCache = new Map<string, string>();
   private static readonly CONVERSATION_TYPE_CACHE_MAX = 5_000;
+  private privacySubscribed = false;
 
   constructor(
     private readonly jwtService: JwtService,
@@ -340,6 +342,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.io = io;
     this.broadcast.setServer(io);
     this.ensureRevocationSubscription();
+    this.ensurePrivacySubscription();
     this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
   }
 
@@ -497,6 +500,33 @@ export class ChatGateway implements OnModuleDestroy {
    * 启动瞬间 Redis 恰好不可用,订阅就永久缺失,被封禁的人直到自己断线为止
    * 都能继续收发。改成认返回值 + 退避重试(照搬 RealtimeService 的做法)。
    */
+  /**
+   * 隐私设置变更 → 丢掉该用户缓存的「正在输入」开关。
+   *
+   * 与吊销订阅同样的语义:subscribePattern 从不 reject,失败只是返回 false。
+   * 订阅不上时退回 TTL 追平(最坏 30 秒),所以这里不做重试,只记一次。
+   */
+  private ensurePrivacySubscription(): void {
+    if (this.privacySubscribed || !this.redisService.isEnabled()) return;
+    void this.redisService
+      .subscribePattern(
+        PRIVACY_SETTINGS_CHANGED_CHANNEL,
+        (_channel, message) => {
+          if (typeof message === 'string' && message.length > 0) {
+            this.typingPolicyCache.delete(message);
+          }
+        },
+      )
+      .then((subscribed) => {
+        this.privacySubscribed = subscribed;
+        if (!subscribed) {
+          this.logger.warn(
+            'privacy settings subscription unavailable; typing policy falls back to its TTL',
+          );
+        }
+      });
+  }
+
   private ensureRevocationSubscription(): void {
     if (this.revocationSubscribed || this.revocationRetryTimer) return;
     // Redis 未配置是部署形态(单实例),不是故障:不重试、不刷日志。
@@ -528,6 +558,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.revocationRetryTimer = setTimeout(() => {
       this.revocationRetryTimer = null;
       this.ensureRevocationSubscription();
+      this.ensurePrivacySubscription();
     }, delay);
     // 重试计时器不应拖住进程退出。
     this.revocationRetryTimer.unref?.();
@@ -853,7 +884,7 @@ export class ChatGateway implements OnModuleDestroy {
       CHAT_EVENTS.presence,
       (
         payload: ChatPresenceQuery,
-        ack?: AckFn<Record<string, boolean | ChatPresenceDetail>>,
+        ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
       ) => {
         if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
           if (typeof ack === 'function') ack({});
@@ -1058,7 +1089,7 @@ export class ChatGateway implements OnModuleDestroy {
   private async handlePresenceQuery(
     socket: Socket,
     payload: ChatPresenceQuery,
-    ack?: AckFn<Record<string, boolean | ChatPresenceDetail>>,
+    ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
     const startedAt = process.hrtime.bigint();
@@ -1101,12 +1132,17 @@ export class ChatGateway implements OnModuleDestroy {
       const lastSeen = await this.chatService.getLastSeenAt(
         entries.filter(([, online]) => !online).map(([id]) => id),
       );
+      const visibleDetail = new Map(
+        entries.map(([id, online]) => [
+          id,
+          { online, lastSeenAt: online ? null : (lastSeen.get(id) ?? null) },
+        ]),
+      );
+      // 为每个**被请求**的 id 都给条目:不可见的显式回 null。省略的话客户端分不清
+      // 「对方关掉了显示在线时间」和「这次没答上来」,旧状态会一直挂着。
       ack(
         Object.fromEntries(
-          entries.map(([id, online]) => [
-            id,
-            { online, lastSeenAt: online ? null : (lastSeen.get(id) ?? null) },
-          ]),
+          requested.map((id) => [id, visibleDetail.get(id) ?? null]),
         ),
       );
       this.metrics.observeEvent('presence', 'success');
@@ -1446,8 +1482,11 @@ export class ChatGateway implements OnModuleDestroy {
     try {
       policy = await this.resolveTypingPolicy(userId);
     } catch {
-      // 读不到设置时放行:typing 是尽力而为的提示,不值得因为一次抖动而消失。
-      return true;
+      // 读不到设置就不转发。这是隐私闸,答不上来时唯一安全的答案是「不透出」——
+      // 与 presence 查询失败时 ack({}) 同一条规则。放行的代价是:一次数据库抖动
+      // 就让关掉开关的人重新开始泄漏「正在输入」,而且没人会注意到。
+      // 代价这边只是抖动期间大家都看不到输入提示,纯观感,可接受。
+      return false;
     }
     if (policy.direct && policy.group) return true;
     if (!policy.direct && !policy.group) return false;
@@ -1457,7 +1496,8 @@ export class ChatGateway implements OnModuleDestroy {
         type =
           (await this.chatService.getConversationType(conversationId)) ?? '';
       } catch {
-        return true;
+        // 同上:类型查不到就无法判断该用哪个开关,不转发。
+        return false;
       }
       if (
         this.conversationTypeCache.size >=

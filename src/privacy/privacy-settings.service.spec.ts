@@ -27,7 +27,11 @@ describe('PrivacySettingsService', () => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     sensitiveWords.check.mockReturnValue({ blocked: false });
-    service = new PrivacySettingsService(prisma as any, sensitiveWords as any);
+    service = new PrivacySettingsService(
+      prisma as any,
+      sensitiveWords as any,
+      { isEnabled: () => false, publish: async () => true } as any,
+    );
   });
 
   it('returns default account privacy settings without writing when none exist', async () => {
@@ -406,7 +410,11 @@ describe('PrivacySettingsService presence visibility', () => {
     privacySettingsEvents.on(PRESENCE_VISIBILITY_CHANGED, (event) =>
       events.push(event),
     );
-    service = new PrivacySettingsService(prisma as any, sensitiveWords as any);
+    service = new PrivacySettingsService(
+      prisma as any,
+      sensitiveWords as any,
+      { isEnabled: () => false, publish: async () => true } as any,
+    );
   });
 
   afterAll(() => {

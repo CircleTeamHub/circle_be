@@ -950,6 +950,27 @@ describe('ChatGateway', () => {
         u2: { online: true, lastSeenAt: null },
         u3: { online: false, lastSeenAt: '2026-09-11T08:00:00.000Z' },
       });
+    });
+
+    // 不可见的人要显式回 null:省略的话客户端分不清「对方关了显示在线时间」
+    // 和「这次限流/出错没答上来」(两者都是 ack({})),旧状态会一直挂着。
+    it('answers null for requested users that are not visible', async () => {
+      chatService.filterVisiblePresenceTargets.mockResolvedValue(['u2']);
+      broadcast.isUserOnline.mockResolvedValue(true);
+      const ack = jest.fn();
+
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: ['u2', 'hidden', 'stranger'], detail: true } as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({
+        u2: { online: true, lastSeenAt: null },
+        hidden: null,
+        stranger: null,
+      });
+      broadcast.isUserOnline.mockResolvedValue(false);
       broadcast.isUserOnline.mockResolvedValue(false);
     });
 
@@ -1395,15 +1416,58 @@ describe('ChatGateway', () => {
       expect(broadcast.emitTyping).toHaveBeenCalledTimes(5);
     });
 
-    // 读设置失败时放行:typing 是尽力而为的提示,不值得因为一次抖动而消失。
-    it('forwards typing when the policy lookup fails', async () => {
+    // 隐私闸读不出来时不转发:放行的代价是一次数据库抖动就让关掉开关的人重新
+    // 开始泄漏「正在输入」,而且没人会注意到。与 presence 查询失败 ack({}) 同规则。
+    it('drops typing when the policy lookup fails', async () => {
       chatService.getTypingPolicy.mockRejectedValue(new Error('db down'));
 
       await gateway['handleTyping'](fakeSocket() as never, 'u-policy-fail', {
         conversationId: 'conv-1',
       });
 
-      expect(broadcast.emitTyping).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    it('drops typing when the conversation type cannot be resolved', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u-type-fail', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 缓存靠 TTL 追平的话,PATCH 落在别的实例时会留出一段仍在转发的窗口。
+    // 隐私变更通过 Redis 频道广播失效,收到就丢掉那个用户那一份。
+    it('drops the cached policy when a privacy change arrives from another instance', async () => {
+      let handler: ((channel: string, message: string) => void) | null = null;
+      redisService.isEnabled.mockReturnValue(true);
+      redisService.subscribePattern.mockImplementation(
+        async (_pattern: string, cb: (c: string, m: string) => void) => {
+          handler = cb;
+          return true;
+        },
+      );
+      (gateway as any).privacySubscribed = false;
+      gateway['ensurePrivacySubscription']();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      (gateway as any).typingPolicyCache.set('u9', {
+        direct: true,
+        group: true,
+        expiresAt: Date.now() + 30_000,
+      });
+      handler?.('circle:privacy:changed', 'u9');
+
+      expect((gateway as any).typingPolicyCache.has('u9')).toBe(false);
+      redisService.isEnabled.mockReturnValue(false);
+      redisService.subscribePattern.mockResolvedValue(true);
     });
   });
 });

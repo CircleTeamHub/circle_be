@@ -12,8 +12,10 @@ import {
   UpdatePrivacySettingsDto,
 } from './privacy-settings.dto';
 import { isBurnDurationChoice } from 'src/common/burn-durations';
+import { RedisService } from 'src/redis/redis.service';
 import {
   PRESENCE_VISIBILITY_CHANGED,
+  PRIVACY_SETTINGS_CHANGED_CHANNEL,
   type PresenceVisibilityChangedEvent,
   privacySettingsEvents,
 } from './privacy-events';
@@ -70,6 +72,7 @@ export class PrivacySettingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly sensitiveWords: SensitiveWordService,
+    private readonly redis: RedisService,
   ) {}
 
   /**
@@ -157,6 +160,9 @@ export class PrivacySettingsService {
       });
     });
     const updated = this.toDto(saved as StoredPrivacySettings);
+    // 网关按用户缓存了「正在输入」两个开关,靠 TTL 追平的话 PATCH 落在别的实例
+    // 时会留出一段仍在转发的窗口。提交后立刻广播一次失效,让各实例丢掉缓存。
+    await this.publishSettingsChanged(userId);
     if (
       presenceWasVisible !== null &&
       presenceWasVisible !== updated.shareOnlineStatus
@@ -164,6 +170,23 @@ export class PrivacySettingsService {
       await this.announcePresenceVisibility(userId);
     }
     return updated;
+  }
+
+  /**
+   * 跨实例失效通知。Redis 没配就是单实例部署,不是故障;publish 自己吞掉失败,
+   * 最坏退回 TTL 追平,所以这里不让它影响已经提交的设置。
+   */
+  private async publishSettingsChanged(userId: string): Promise<void> {
+    if (!this.redis.isEnabled()) return;
+    try {
+      await this.redis.publish(PRIVACY_SETTINGS_CHANGED_CHANNEL, userId);
+    } catch (error) {
+      this.logger.warn(
+        `privacy settings change publish failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
