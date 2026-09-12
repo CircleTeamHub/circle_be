@@ -202,6 +202,43 @@ describe('FriendService', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
+  // 好友与好友关系都已经查出来了,不该因为这条**附加**的隐私查询失败就让整个
+  // 列表请求挂掉;退到「都不显示最近在线」是隐私安全的那一侧。
+  it('still returns the friend list when the privacy lookup fails, with last-online hidden', async () => {
+    const when = new Date('2026-07-24T07:59:51.066Z');
+    prisma.friend.findMany.mockResolvedValue([
+      {
+        id: 'friendship-1',
+        userID: 'user-1',
+        friendID: 'user-2',
+        state: FriendState.ACCEPTED,
+        updatedAt: when,
+        remarkA: null,
+        remarkB: null,
+      },
+    ]);
+    prisma.user.findMany.mockResolvedValue([
+      {
+        id: 'user-2',
+        accountId: 'bob02',
+        nickname: 'Bob',
+        avatarUrl: null,
+        avatarFrame: null,
+        gender: 'unset',
+        lastOnline: new Date('2026-09-11T08:00:00.000Z'),
+      },
+    ]);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+    privacySettings.getSettingsForUsers.mockRejectedValueOnce(
+      new Error('db down'),
+    );
+
+    const friends = await service.listFriends('user-1');
+
+    expect(friends).toHaveLength(1);
+    expect(friends[0]).toMatchObject({ id: 'user-2', lastOnline: null });
+  });
+
   it('deduplicates accepted friendship rows by friend user in the friend list', async () => {
     const newer = new Date('2026-07-24T07:59:51.066Z');
     const older = new Date('2026-06-26T08:06:52.906Z');

@@ -864,10 +864,26 @@ export class ChatService {
     return row?.type ?? null;
   }
 
-  /** 该用户是否允许别人看到自己的在线状态(上下线广播前的门禁)。 */
+  /**
+   * 该用户是否允许别人看到自己的在线状态(上下线广播前的门禁)。
+   *
+   * 读失败时返回 false 而不是抛:这是**附加**读,调用方是连接建立与下线广播
+   * 这两条主流程 —— 让它抛出去,一次隐私表抖动就会把所有人的 chat 连接踢掉
+   * (入房那段是 Promise.all,任何一个 reject 都走 joinRooms 的 catch 断连)。
+   * 退到 false 是隐私安全的那一侧:这一刻不广播,状态仍可由查询侧补上。
+   */
   async isPresenceVisible(userId: string): Promise<boolean> {
-    const settings = await this.privacySettings.getSettings(userId);
-    return settings.shareOnlineStatus !== false;
+    try {
+      const settings = await this.privacySettings.getSettings(userId);
+      return settings.shareOnlineStatus !== false;
+    } catch (error) {
+      this.logger.warn(
+        `presence visibility lookup failed for ${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
   }
 
   /** 一批用户的最近在线时刻(ISO);没记录过的为 null。 */
@@ -892,8 +908,14 @@ export class ChatService {
   async touchLastOnline(userId: string, at = new Date()): Promise<void> {
     try {
       // updateMany:访客与已注销账号没有 User 行,update 会抛 P2025。
+      // 只在库里的值更旧时才写:连接就绪与末个连接断开两条写入都是
+      // fire-and-forget,快速重连时先发的那次可能后落库,把新的时刻盖回去,
+      // 于是「最近在线」倒退回更早的时间。
       await this.prisma.user.updateMany({
-        where: { id: userId },
+        where: {
+          id: userId,
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
         data: { lastOnline: at },
       });
     } catch (error) {

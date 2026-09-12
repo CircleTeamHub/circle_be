@@ -846,6 +846,28 @@ export class FriendService {
   // 正常用户远够不到；够到的说明该端点需要真分页（届时按 trace/plaza 的
   // cursor 模式补）。FriendActivity 表不参与清理（见 refresh-token.cleanup
   // 注释），listActivities 的 take 同时是这张只增表的读路径止血带。
+  /**
+   * 好友列表的「显示在线时间」附加读。
+   *
+   * 读失败时返回 null,调用方把所有 lastOnline 抹成 null —— 好友与好友关系都
+   * 已经查出来了,不该因为这条附加查询失败就让整个列表请求挂掉;而退到
+   * 「都不显示」是隐私安全的那一侧,不会把关掉开关的人漏出去。
+   */
+  private async readPresencePrivacy(
+    userIds: string[],
+  ): Promise<Map<string, { shareOnlineStatus?: boolean }> | null> {
+    try {
+      return await this.privacySettings.getSettingsForUsers(userIds);
+    } catch (error) {
+      this.logger.warn(
+        `friend presence privacy lookup failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
+  }
+
   async listFriends(userId: string): Promise<FriendProfileDto[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -867,7 +889,7 @@ export class FriendService {
       this.avatarFrames.resolvePublicAppearances(friendIds),
       // 关了「显示在线时间」的好友,列表里的 lastOnline 一并抹掉 —— 资料页与
       // 聊天 presence 都收口了,好友列表不收口就是第三条信道。
-      this.privacySettings.getSettingsForUsers(friendIds),
+      this.readPresencePrivacy(friendIds),
     ]);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
@@ -881,7 +903,9 @@ export class FriendService {
         return {
           ...u,
           lastOnline:
-            privacy.get(fid)?.shareOnlineStatus === false ? null : u.lastOnline,
+            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
+              ? null
+              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: r.updatedAt,
           remark,
@@ -1469,7 +1493,7 @@ export class FriendService {
     });
     const [appearances, privacy] = await Promise.all([
       this.avatarFrames.resolvePublicAppearances(friendUserIds),
-      this.privacySettings.getSettingsForUsers(friendUserIds),
+      this.readPresencePrivacy(friendUserIds),
     ]);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
@@ -1482,7 +1506,9 @@ export class FriendService {
         return {
           ...u,
           lastOnline:
-            privacy.get(fid)?.shareOnlineStatus === false ? null : u.lastOnline,
+            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
+              ? null
+              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: f.updatedAt,
           remark,

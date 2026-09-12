@@ -1404,7 +1404,10 @@ describe('ChatService', () => {
       prisma.user.updateMany.mockResolvedValueOnce({ count: 1 });
       await service.touchLastOnline('u1', at);
       expect(prisma.user.updateMany).toHaveBeenCalledWith({
-        where: { id: 'u1' },
+        where: {
+          id: 'u1',
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
         data: { lastOnline: at },
       });
 
@@ -1419,6 +1422,28 @@ describe('ChatService', () => {
       await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
       privacySettings.getSettings.mockResolvedValueOnce({});
       await expect(service.isPresenceVisible('u1')).resolves.toBe(true);
+    });
+
+    // 这是附加读,调用方是连接建立与下线广播两条主流程。抛出去的话一次隐私表
+    // 抖动就会把所有人的 chat 连接踢掉(入房那段 Promise.all 任何 reject 都
+    // 走 joinRooms 的 catch 断连)。退到「不可见」是隐私安全的那一侧。
+    it('falls back to hidden instead of throwing when the privacy read fails', async () => {
+      privacySettings.getSettings.mockRejectedValueOnce(new Error('db down'));
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+    });
+
+    // 两条写入都是 fire-and-forget,快速重连时先发的那次可能后落库。
+    it('only advances lastOnline, never moves it backwards', async () => {
+      const at = new Date('2026-09-11T08:00:00.000Z');
+      prisma.user.updateMany.mockResolvedValueOnce({ count: 1 });
+      await service.touchLastOnline('u1', at);
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'u1',
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
+        data: { lastOnline: at },
+      });
     });
   });
 
