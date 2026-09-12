@@ -21,6 +21,8 @@ describe('ChatService', () => {
       findUnique: jest.fn(),
       findMany: jest.fn(),
       count: jest.fn(),
+      // 群在座人数一次 groupBy 拿完；默认空集合，关心人数的用例自己覆盖。
+      groupBy: jest.fn().mockResolvedValue([]),
       update: jest.fn(),
       updateMany: jest.fn(),
       updateManyAndReturn: jest.fn(),
@@ -36,7 +38,7 @@ describe('ChatService', () => {
       update: jest.fn(),
       updateMany: jest.fn(),
     },
-    user: { findUnique: jest.fn(), findMany: jest.fn() },
+    user: { findUnique: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
     tempChat: { findUnique: jest.fn(), findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
@@ -71,6 +73,8 @@ describe('ChatService', () => {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
     // 默认关掉全局阅后即焚,让既有用例不受时间窗口影响;需要时逐例覆盖。
     getSettings: jest.fn().mockResolvedValue({ messageSelfDestructSec: 0 }),
+    // 在线状态可见范围要按对方的「显示在线时间」再筛一遍;默认没人关。
+    getSettingsForUsers: jest.fn().mockResolvedValue(new Map()),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -123,6 +127,9 @@ describe('ChatService', () => {
     pinned: false,
     muted: false,
     leftAt: null,
+    // Prisma 也总会读回入群时刻；会话 DTO 的 joinedAt 直接来自它，
+    // 桩里漏掉会让「新的群组」的排序在测试里永远测不到。
+    joinedAt: new Date('2026-01-01T00:00:00.000Z'),
     conversation: {
       id: 'conv-1',
       type: 'GROUP',
@@ -1324,6 +1331,34 @@ describe('ChatService', () => {
       ).resolves.toEqual(['ok']);
     });
 
+    // 关了「显示在线时间」的人在查询侧摘掉;广播侧(网关上下线 / 隐私翻转事件)
+    // 是同一条规则的另一半,少一半就是另一条免费信道。
+    it('hides users who turned off shareOnlineStatus even when a seat is shared', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ])
+        .mockResolvedValueOnce([{ userID: 'hidden' }, { userID: 'shown' }]);
+      prisma.block.findMany.mockResolvedValue([]);
+      privacySettings.getSettingsForUsers.mockResolvedValueOnce(
+        new Map([
+          ['hidden', { shareOnlineStatus: false }],
+          ['shown', { shareOnlineStatus: true }],
+        ]),
+      );
+
+      await expect(
+        service.filterVisiblePresenceTargets('u1', ['hidden', 'shown']),
+      ).resolves.toEqual(['shown']);
+      expect(privacySettings.getSettingsForUsers).toHaveBeenCalledWith([
+        'hidden',
+        'shown',
+      ]);
+    });
+
     it('always allows the requester itself and short-circuits', async () => {
       await expect(
         service.filterVisiblePresenceTargets('u1', ['u1']),
@@ -1336,6 +1371,79 @@ describe('ChatService', () => {
       await expect(
         service.filterVisiblePresenceTargets('u1', ['u2']),
       ).resolves.toEqual([]);
+    });
+  });
+
+  describe('last seen', () => {
+    it('reads lastOnline as ISO strings and reports never-seen users as null', async () => {
+      prisma.user.findMany.mockResolvedValueOnce([
+        { id: 'u2', lastOnline: new Date('2026-09-11T08:00:00.000Z') },
+        { id: 'u3', lastOnline: null },
+      ]);
+
+      const seen = await service.getLastSeenAt(['u2', 'u3']);
+
+      expect([...seen.entries()]).toEqual([
+        ['u2', '2026-09-11T08:00:00.000Z'],
+        ['u3', null],
+      ]);
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['u2', 'u3'] } },
+        select: { id: true, lastOnline: true },
+      });
+    });
+
+    it('skips the query for an empty batch', async () => {
+      await expect(service.getLastSeenAt([])).resolves.toEqual(new Map());
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+    });
+
+    // 访客与已注销账号没有 User 行:update 会抛 P2025,updateMany 静默 0 行。
+    it('touches lastOnline with updateMany and swallows failures', async () => {
+      const at = new Date('2026-09-11T08:00:00.000Z');
+      prisma.user.updateMany.mockResolvedValueOnce({ count: 1 });
+      await service.touchLastOnline('u1', at);
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'u1',
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
+        data: { lastOnline: at },
+      });
+
+      prisma.user.updateMany.mockRejectedValueOnce(new Error('db down'));
+      await expect(service.touchLastOnline('u1')).resolves.toBeUndefined();
+    });
+
+    it('reads the presence switch with the default open', async () => {
+      privacySettings.getSettings.mockResolvedValueOnce({
+        shareOnlineStatus: false,
+      });
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+      privacySettings.getSettings.mockResolvedValueOnce({});
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(true);
+    });
+
+    // 这是附加读,调用方是连接建立与下线广播两条主流程。抛出去的话一次隐私表
+    // 抖动就会把所有人的 chat 连接踢掉(入房那段 Promise.all 任何 reject 都
+    // 走 joinRooms 的 catch 断连)。退到「不可见」是隐私安全的那一侧。
+    it('falls back to hidden instead of throwing when the privacy read fails', async () => {
+      privacySettings.getSettings.mockRejectedValueOnce(new Error('db down'));
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+    });
+
+    // 两条写入都是 fire-and-forget,快速重连时先发的那次可能后落库。
+    it('only advances lastOnline, never moves it backwards', async () => {
+      const at = new Date('2026-09-11T08:00:00.000Z');
+      prisma.user.updateMany.mockResolvedValueOnce({ count: 1 });
+      await service.touchLastOnline('u1', at);
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'u1',
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
+        data: { lastOnline: at },
+      });
     });
   });
 
@@ -2218,6 +2326,45 @@ describe('ChatService', () => {
         where: { id: { in: ['tc-1'] } },
         select: { id: true, title: true },
       });
+    });
+
+    // 「我的群聊」和「新的群组」都吃这两个字段：入群时刻决定排序，在座人数上行。
+    it('carries the seat join time and the live member count on group rows', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        {
+          ...membership(),
+          joinedAt: new Date('2026-09-09T21:48:36Z'),
+          conversation: {
+            id: 'conv-1',
+            type: 'GROUP',
+            directKey: null,
+            circleID: null,
+            tempChatID: null,
+            name: '东京旅行团',
+            ownerID: 'u1',
+            lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+          },
+        },
+      ]);
+      prisma.chatMember.groupBy.mockResolvedValueOnce([
+        { conversationID: 'conv-1', _count: { _all: 7 } },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0]).toMatchObject({
+        id: 'conv-1',
+        type: 'GROUP',
+        joinedAt: '2026-09-09T21:48:36.000Z',
+        memberCount: 7,
+      });
+      // 退群的座位不算在座。
+      expect(prisma.chatMember.groupBy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ leftAt: null }),
+        }),
+      );
     });
 
     it('keeps the query count flat as the conversation list grows', async () => {

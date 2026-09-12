@@ -73,6 +73,12 @@ export class PrivacySettingsDto {
   groupInvitePermission: PrivacyPermission;
   directMessageAutoReplyEnabled: boolean;
   directMessageAutoReplyText: string;
+  /** 对他人显示在线状态与最近在线时间(在线点 / 「N 分钟前在线」)。 */
+  shareOnlineStatus: boolean;
+  /** 单聊里向对方上报「正在输入」。 */
+  shareTypingInDirect: boolean;
+  /** 群聊里向群成员上报「正在输入」。 */
+  shareTypingInGroup: boolean;
 }
 
 export class UpdatePrivacySettingsDto {
@@ -165,4 +171,19 @@ export class UpdatePrivacySettingsDto {
   @IsString()
   @Validate(AutoReplyTextLengthConstraint)
   directMessageAutoReplyText?: string;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  shareOnlineStatus?: boolean;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  shareTypingInDirect?: boolean;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  shareTypingInGroup?: boolean;
 }

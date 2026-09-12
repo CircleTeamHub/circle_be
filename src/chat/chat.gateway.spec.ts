@@ -41,6 +41,13 @@ describe('ChatGateway', () => {
     filterVisiblePresenceTargets: jest.fn(),
     // 上下线广播要剔掉互相拉黑的人;默认无拉黑关系。
     listBlockedCounterparties: jest.fn().mockResolvedValue([]),
+    // 「显示在线时间」默认开着;最近在线的读写默认空。
+    isPresenceVisible: jest.fn().mockResolvedValue(true),
+    touchLastOnline: jest.fn().mockResolvedValue(undefined),
+    getLastSeenAt: jest.fn().mockResolvedValue(new Map()),
+    // 「正在输入」的服务端闸门;默认两个开关都开。
+    getTypingPolicy: jest.fn().mockResolvedValue({ direct: true, group: true }),
+    getConversationType: jest.fn().mockResolvedValue('DIRECT'),
   };
   const broadcast = {
     setServer: jest.fn(),
@@ -111,6 +118,17 @@ describe('ChatGateway', () => {
     jwtService.decode.mockReturnValue({ sub: 'u1' });
     // clearAllMocks 会连实现一起清掉,这里重设默认「无拉黑关系」。
     chatService.listBlockedCounterparties.mockResolvedValue([]);
+    chatService.isPresenceVisible.mockResolvedValue(true);
+    chatService.touchLastOnline.mockResolvedValue(undefined);
+    chatService.getLastSeenAt.mockResolvedValue(new Map());
+    chatService.getTypingPolicy.mockResolvedValue({
+      direct: true,
+      group: true,
+    });
+    chatService.getConversationType.mockResolvedValue('DIRECT');
+    // 开关与会话类型都有缓存,逐例之间要清掉,否则上一条用例的值会漏过来。
+    (gateway as any).typingPolicyCache.clear();
+    (gateway as any).conversationTypeCache.clear();
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -513,6 +531,80 @@ describe('ChatGateway', () => {
     // 发的第一条消息石沉大海」。所以监听必须先于第一个 await 注册。
     // 查询侧已经按拉黑收口了,广播侧不收口等于换个通道把同一份信息免费送出去,
     // 而且是推的、连轮询都不用。拉黑不动 ChatMember,座位一直在。
+    // 关了「显示在线时间」的人:上线不广播,下线也不广播,但最近在线照记
+    // (开关翻回来时要有数可显示)。
+    it('stays silent on connect and disconnect when the user hid presence', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.isPresenceVisible.mockResolvedValue(false);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      expect(broadcast.emitPresence).not.toHaveBeenCalled();
+      expect(chatService.touchLastOnline).toHaveBeenCalledWith('u1');
+
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(chatService.touchLastOnline).toHaveBeenCalledWith(
+        'u1',
+        expect.any(Date),
+      );
+      expect(broadcast.emitPresence).not.toHaveBeenCalled();
+    });
+
+    it('records last-seen and broadcasts offline with that timestamp on the last disconnect', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      broadcast.emitPresence.mockClear();
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const [, payload] = broadcast.emitPresence.mock.calls[0] as [
+        string[],
+        { userId: string; online: boolean; lastSeenAt: string },
+        string[],
+      ];
+      expect(payload).toEqual({
+        userId: 'u1',
+        online: false,
+        lastSeenAt: expect.any(String),
+      });
+      // 广播里的时刻就是落库的那一刻,两边不能各取一次 now。
+      const touched = chatService.touchLastOnline.mock.calls.find(
+        ([, at]) => at instanceof Date,
+      ) as [string, Date];
+      expect(touched[1].toISOString()).toBe(payload.lastSeenAt);
+    });
+
+    // 访客不是 User 行:下线照常广播,但没有 lastOnline 可记。
+    it('never touches lastOnline for temp-chat guests', async () => {
+      const socket = fakeSocket({
+        data: { userId: 'guest-1', guestConversationId: 'temp-1' },
+      });
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(chatService.touchLastOnline).not.toHaveBeenCalled();
+      expect(chatService.isPresenceVisible).not.toHaveBeenCalled();
+      // 访客没有 User 行,不落库也就没有「最近在线」—— 带时间戳会让客户端渲染出
+      // 看着像真的「刚刚在线」,而下一次查询拿到的是 null。
+      expect(broadcast.emitPresence).toHaveBeenLastCalledWith(
+        ['temp-1'],
+        { userId: 'guest-1', online: false, lastSeenAt: null },
+        [],
+      );
+    });
+
     it('excludes blocked counterparties from the online broadcast', async () => {
       const socket = fakeSocket();
       chatService.listConversationIds.mockResolvedValue(['conv-1']);
@@ -836,6 +928,52 @@ describe('ChatGateway', () => {
       );
       // 不过滤的话,任何登录账号都能拿 UUID 长期轮询陌生人的在线状态。
       expect(ack).toHaveBeenCalledWith({ u2: true });
+    });
+
+    // 旧客户端只认 boolean,形状由请求方的 detail 声明;最近在线只查离线那几位。
+    it('returns online flag plus last-seen when the client asks for detail', async () => {
+      chatService.filterVisiblePresenceTargets.mockResolvedValue(['u2', 'u3']);
+      broadcast.isUserOnline.mockImplementation(
+        async (id: string) => id === 'u2',
+      );
+      chatService.getLastSeenAt.mockResolvedValue(
+        new Map([['u3', '2026-09-11T08:00:00.000Z']]),
+      );
+      const ack = jest.fn();
+
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: ['u2', 'u3'], detail: true } as never,
+        ack,
+      );
+
+      expect(chatService.getLastSeenAt).toHaveBeenCalledWith(['u3']);
+      expect(ack).toHaveBeenCalledWith({
+        u2: { online: true, lastSeenAt: null },
+        u3: { online: false, lastSeenAt: '2026-09-11T08:00:00.000Z' },
+      });
+    });
+
+    // 不可见的人要显式回 null:省略的话客户端分不清「对方关了显示在线时间」
+    // 和「这次限流/出错没答上来」(两者都是 ack({})),旧状态会一直挂着。
+    it('answers null for requested users that are not visible', async () => {
+      chatService.filterVisiblePresenceTargets.mockResolvedValue(['u2']);
+      broadcast.isUserOnline.mockResolvedValue(true);
+      const ack = jest.fn();
+
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: ['u2', 'hidden', 'stranger'], detail: true } as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({
+        u2: { online: true, lastSeenAt: null },
+        hidden: null,
+        stranger: null,
+      });
+      broadcast.isUserOnline.mockResolvedValue(false);
+      broadcast.isUserOnline.mockResolvedValue(false);
     });
 
     it('answers empty without touching presence when nothing was requested', async () => {
@@ -1200,6 +1338,138 @@ describe('ChatGateway', () => {
         conversationId: 'conv-other',
       });
       expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 客户端已经按同一份设置门禁过一次,但设置存在服务端、还能多端登录:
+    // 在 A 设备关掉之后 B 设备的缓存到下次连接才追平,这中间它照样上报。
+    it('drops typing in a direct chat once the direct switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockResolvedValue('DIRECT');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    it('still forwards group typing while only the direct switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockResolvedValue('GROUP');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops typing in a group once the group switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: true,
+        group: false,
+      });
+      chatService.getConversationType.mockResolvedValue('GROUP');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 两个开关同为开 / 同为关时不需要知道类型 —— 绝大多数用户落在第一种,
+    // 常态下一次类型查询都不该发生。
+    it('never looks up the conversation type when both switches agree', async () => {
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+      expect(chatService.getConversationType).not.toHaveBeenCalled();
+
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: false,
+      });
+      (gateway as any).typingPolicyCache.clear();
+      broadcast.emitTyping.mockClear();
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+      expect(chatService.getConversationType).not.toHaveBeenCalled();
+    });
+
+    // 这两条各用自己的 userId:typing 限流器按 userId 记额度,而 gateway 实例是
+    // 整个 describe 共用的,沿用 'u1' 会把前面用例消耗掉的额度算进来。
+    it('caches the policy so typing bursts do not hit the database per event', async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await gateway['handleTyping'](fakeSocket() as never, 'u-burst', {
+          conversationId: 'conv-1',
+        });
+      }
+      expect(chatService.getTypingPolicy).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitTyping).toHaveBeenCalledTimes(5);
+    });
+
+    // 隐私闸读不出来时不转发:放行的代价是一次数据库抖动就让关掉开关的人重新
+    // 开始泄漏「正在输入」,而且没人会注意到。与 presence 查询失败 ack({}) 同规则。
+    it('drops typing when the policy lookup fails', async () => {
+      chatService.getTypingPolicy.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u-policy-fail', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    it('drops typing when the conversation type cannot be resolved', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u-type-fail', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 缓存靠 TTL 追平的话,PATCH 落在别的实例时会留出一段仍在转发的窗口。
+    // 隐私变更通过 Redis 频道广播失效,收到就丢掉那个用户那一份。
+    it('drops the cached policy when a privacy change arrives from another instance', async () => {
+      let handler: ((channel: string, message: string) => void) | null = null;
+      redisService.isEnabled.mockReturnValue(true);
+      redisService.subscribePattern.mockImplementation(
+        async (_pattern: string, cb: (c: string, m: string) => void) => {
+          handler = cb;
+          return true;
+        },
+      );
+      (gateway as any).privacySubscribed = false;
+      gateway['ensurePrivacySubscription']();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      (gateway as any).typingPolicyCache.set('u9', {
+        direct: true,
+        group: true,
+        expiresAt: Date.now() + 30_000,
+      });
+      handler?.('circle:privacy:changed', 'u9');
+
+      expect((gateway as any).typingPolicyCache.has('u9')).toBe(false);
+      redisService.isEnabled.mockReturnValue(false);
+      redisService.subscribePattern.mockResolvedValue(true);
     });
   });
 });

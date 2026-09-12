@@ -88,6 +88,7 @@ type GroupFacets = Pick<
   | 'notice'
   | 'avatarUrl'
   | 'memberLimit'
+  | 'memberCount'
   | 'myRole'
   | 'policies'
 >;
@@ -98,6 +99,7 @@ const NON_GROUP_FACETS: GroupFacets = {
   notice: null,
   avatarUrl: null,
   memberLimit: null,
+  memberCount: null,
   myRole: null,
   policies: null,
 };
@@ -817,7 +819,112 @@ export class ChatService {
     for (const row of shared) {
       if (!blocked.has(row.userID)) allowed.add(row.userID);
     }
-    return [...allowed];
+    return this.dropPresenceOptOuts(userId, [...allowed]);
+  }
+
+  /**
+   * 关了「显示在线时间」的人从可见集里摘掉(本人除外)。查询侧与广播侧
+   * (网关上下线 / 隐私翻转事件)是同一条规则的两半,少一半就是另一条免费信道。
+   */
+  private async dropPresenceOptOuts(
+    viewerId: string,
+    candidates: string[],
+  ): Promise<string[]> {
+    const others = candidates.filter((id) => id !== viewerId);
+    if (others.length === 0) return candidates;
+    const settings = await this.privacySettings.getSettingsForUsers(others);
+    return candidates.filter(
+      (id) => id === viewerId || settings.get(id)?.shareOnlineStatus !== false,
+    );
+  }
+
+  /**
+   * 本人向外上报「正在输入」的两个开关。网关按会话类型取其一。
+   *
+   * 与在线状态不同,这两项不是「别人能不能看」的授权判定,而是「我自己往外
+   * 漏什么」。但设置存在服务端、还能多端登录:在 A 设备关掉之后,B 设备的缓存
+   * 到下次连接才会追平,这中间它照样上报。所以服务端也要有一道闸。
+   */
+  async getTypingPolicy(
+    userId: string,
+  ): Promise<{ direct: boolean; group: boolean }> {
+    const settings = await this.privacySettings.getSettings(userId);
+    return {
+      direct: settings.shareTypingInDirect !== false,
+      group: settings.shareTypingInGroup !== false,
+    };
+  }
+
+  /** 会话类型。类型建好就不变,调用方可以放心缓存。 */
+  async getConversationType(conversationId: string): Promise<string | null> {
+    const row = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationId },
+      select: { type: true },
+    });
+    return row?.type ?? null;
+  }
+
+  /**
+   * 该用户是否允许别人看到自己的在线状态(上下线广播前的门禁)。
+   *
+   * 读失败时返回 false 而不是抛:这是**附加**读,调用方是连接建立与下线广播
+   * 这两条主流程 —— 让它抛出去,一次隐私表抖动就会把所有人的 chat 连接踢掉
+   * (入房那段是 Promise.all,任何一个 reject 都走 joinRooms 的 catch 断连)。
+   * 退到 false 是隐私安全的那一侧:这一刻不广播,状态仍可由查询侧补上。
+   */
+  async isPresenceVisible(userId: string): Promise<boolean> {
+    try {
+      const settings = await this.privacySettings.getSettings(userId);
+      return settings.shareOnlineStatus !== false;
+    } catch (error) {
+      this.logger.warn(
+        `presence visibility lookup failed for ${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
+  }
+
+  /** 一批用户的最近在线时刻(ISO);没记录过的为 null。 */
+  async getLastSeenAt(userIds: string[]): Promise<Map<string, string | null>> {
+    const out = new Map<string, string | null>();
+    if (userIds.length === 0) return out;
+    const rows = await this.prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, lastOnline: true },
+    });
+    for (const row of rows) {
+      out.set(row.id, row.lastOnline ? row.lastOnline.toISOString() : null);
+    }
+    return out;
+  }
+
+  /**
+   * 记一笔最近在线:连接就绪与末个连接断开时各打一次。此前 lastOnline 只在
+   * 登录 / 刷新 token 时更新,拿来算「N 分钟前在线」会差出几天。尽力而为,
+   * 失败只记日志 —— 它不在任何请求的关键路径上,调用方一律 void 掉。
+   */
+  async touchLastOnline(userId: string, at = new Date()): Promise<void> {
+    try {
+      // updateMany:访客与已注销账号没有 User 行,update 会抛 P2025。
+      // 只在库里的值更旧时才写:连接就绪与末个连接断开两条写入都是
+      // fire-and-forget,快速重连时先发的那次可能后落库,把新的时刻盖回去,
+      // 于是「最近在线」倒退回更早的时间。
+      await this.prisma.user.updateMany({
+        where: {
+          id: userId,
+          OR: [{ lastOnline: null }, { lastOnline: { lt: at } }],
+        },
+        data: { lastOnline: at },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `lastOnline touch failed for ${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
@@ -878,31 +985,42 @@ export class ChatService {
     const circleIds = memberships
       .map((m) => m.conversation.circleID)
       .filter((id): id is string => id !== null);
-    const [lastMessages, unreadCounts, peers, circles, tempChats, circleRoles] =
-      await Promise.all([
-        this.loadLastMessages(conversationIds, cutoffs),
-        this.loadUnreadCounts(
-          userId,
-          // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
-          memberships.map((m) => ({
-            conversationID: m.conversationID,
-            lastReadHeight: Math.max(
-              m.lastReadHeight,
-              m.clearedBeforeHeight ?? 0,
-              m.conversation.clearedBeforeHeight ?? 0,
-            ),
-          })),
-          cutoffs,
-        ),
-        this.loadDirectPeers(userId, directIds),
-        this.loadCircleInfos(circleIds),
-        this.loadTempChatInfos(
-          memberships
-            .map((m) => m.conversation.tempChatID)
-            .filter((id): id is string => id !== null),
-        ),
-        this.loadCircleRoles(userId, circleIds),
-      ]);
+    const groupIds = memberships
+      .filter((m) => m.conversation.type === 'GROUP')
+      .map((m) => m.conversationID);
+    const [
+      lastMessages,
+      unreadCounts,
+      peers,
+      circles,
+      tempChats,
+      circleRoles,
+      memberCounts,
+    ] = await Promise.all([
+      this.loadLastMessages(conversationIds, cutoffs),
+      this.loadUnreadCounts(
+        userId,
+        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+        memberships.map((m) => ({
+          conversationID: m.conversationID,
+          lastReadHeight: Math.max(
+            m.lastReadHeight,
+            m.clearedBeforeHeight ?? 0,
+            m.conversation.clearedBeforeHeight ?? 0,
+          ),
+        })),
+        cutoffs,
+      ),
+      this.loadDirectPeers(userId, directIds),
+      this.loadCircleInfos(circleIds),
+      this.loadTempChatInfos(
+        memberships
+          .map((m) => m.conversation.tempChatID)
+          .filter((id): id is string => id !== null),
+      ),
+      this.loadCircleRoles(userId, circleIds),
+      this.loadGroupMemberCounts(groupIds),
+    ]);
 
     const lastRows = [...lastMessages.values()];
     const senderIds = lastRows
@@ -957,9 +1075,11 @@ export class ChatService {
           m.conversation.circleID
             ? (circleRoles.get(m.conversation.circleID) ?? null)
             : null,
+          memberCounts.get(m.conversationID) ?? null,
         ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
+        joinedAt: m.joinedAt.toISOString(),
       };
     });
     await this.media.attachMediaUrls(
@@ -1893,6 +2013,10 @@ export class ChatService {
           this.loadCircleRoles(userId, [member.conversation.circleID]),
         ])
       : [new Map<string, CircleInfo>(), new Map<string, GroupRole>()];
+    const memberCounts =
+      member.conversation.type === 'GROUP'
+        ? await this.loadGroupMemberCounts([conversationId])
+        : new Map<string, number>();
     return {
       id: conversationId,
       type: member.conversation.type,
@@ -1921,9 +2045,11 @@ export class ChatService {
         member.conversation.circleID
           ? (circleRoles.get(member.conversation.circleID) ?? null)
           : null,
+        memberCounts.get(conversationId) ?? null,
       ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
+      joinedAt: member.joinedAt.toISOString(),
     };
   }
 
@@ -1942,6 +2068,7 @@ export class ChatService {
     },
     circle: { memberCanInvite: boolean } | null,
     circleRole: GroupRole | null,
+    memberCount: number | null,
   ): GroupFacets {
     if (conversation.type !== 'GROUP') return NON_GROUP_FACETS;
     const standalone = conversation.circleID === null;
@@ -1961,11 +2088,29 @@ export class ChatService {
       notice: standalone ? (conversation.notice ?? null) : null,
       avatarUrl: standalone ? (conversation.avatarUrl ?? null) : null,
       memberLimit: standalone ? STANDALONE_GROUP_MAX_MEMBERS : null,
+      memberCount,
       myRole: standalone
         ? standaloneGroupRole(conversation.ownerID, seat)
         : circleRole,
       policies,
     };
+  }
+
+  /**
+   * 群在座人数(退群的座位有 leftAt,不计)。一次 groupBy 覆盖整页会话,
+   * 不按会话逐个 count —— 会话列表是热路径。
+   */
+  private async loadGroupMemberCounts(
+    conversationIds: string[],
+  ): Promise<Map<string, number>> {
+    const unique = [...new Set(conversationIds)];
+    if (unique.length === 0) return new Map();
+    const rows = await this.prisma.chatMember.groupBy({
+      by: ['conversationID'],
+      where: { conversationID: { in: unique }, leftAt: null },
+      _count: { _all: true },
+    });
+    return new Map(rows.map((row) => [row.conversationID, row._count._all]));
   }
 
   /** 本人在这些圈子里的 ACTIVE 角色(圈子群的 myRole)。 */
@@ -2766,6 +2911,7 @@ export class ChatService {
       ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
+      joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
   }
 

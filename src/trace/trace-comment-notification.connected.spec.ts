@@ -78,6 +78,8 @@ describe('trace comment mention notification flow', () => {
     const privacySettings = new PrivacySettingsService(
       prisma as unknown as PrismaService,
       { check: jest.fn(() => false) } as unknown as SensitiveWordService,
+      // Redis 未配置 = 单实例语义,与这组用例原有的假设一致。
+      { isEnabled: () => false, publish: async () => true } as never,
     );
     const notificationService = new NotificationService(
       prisma as unknown as PrismaService,
