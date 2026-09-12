@@ -446,10 +446,10 @@ describe('PrivacySettingsService presence visibility', () => {
       service.updateSettings('user-1', { shareOnlineStatus: false }),
     ).resolves.toMatchObject({ shareOnlineStatus: false });
 
+    // 事件只说「这个人的开关变了」,值由广播侧现读 —— 见 privacy-events 的注释。
     expect(events).toEqual([
       {
         userId: 'user-1',
-        visible: false,
         conversationIds: ['conv-1'],
         excludeUserIds: ['blocked-by-me', 'blocked-me'],
       },

@@ -161,7 +161,7 @@ export class PrivacySettingsService {
       presenceWasVisible !== null &&
       presenceWasVisible !== updated.shareOnlineStatus
     ) {
-      await this.announcePresenceVisibility(userId, updated.shareOnlineStatus);
+      await this.announcePresenceVisibility(userId);
     }
     return updated;
   }
@@ -171,10 +171,7 @@ export class PrivacySettingsService {
    * 从对方界面收回,打开则把此刻的真实状态补发出去。只在事务提交后发,并且
    * 自己兜住失败 —— 设置已经落库,实时收回是体验增强,不能把成功保存伪装成失败。
    */
-  private async announcePresenceVisibility(
-    userId: string,
-    visible: boolean,
-  ): Promise<void> {
+  private async announcePresenceVisibility(userId: string): Promise<void> {
     try {
       const [memberships, blocks] = await Promise.all([
         this.prisma.chatMember.findMany({
@@ -189,7 +186,6 @@ export class PrivacySettingsService {
       ]);
       const event: PresenceVisibilityChangedEvent = {
         userId,
-        visible,
         conversationIds: memberships.map((m) => m.conversationID),
         excludeUserIds: [
           ...new Set(

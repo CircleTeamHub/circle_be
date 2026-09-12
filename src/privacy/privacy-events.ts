@@ -8,9 +8,13 @@ import { EventEmitter } from 'node:events';
  */
 export interface PresenceVisibilityChangedEvent {
   userId: string;
-  /** 翻转后的值:false = 从此对所有人隐藏在线状态与最近在线时间。 */
-  visible: boolean;
-  /** 该用户当前在座的全部会话 —— 上下线广播的收件面。 */
+  /**
+   * 该用户当前在座的全部会话 —— 上下线广播的收件面。
+   *
+   * 刻意**不**带翻转后的值:两次快拨的事件准备是并发的,谁先 emit 不受事务提交
+   * 顺序保护,带着值走就可能把 off→on 播成 on→off,留下「库里是开、客户端却被
+   * 隐藏」或者反过来的泄漏。消费端现读当前设置,于是最后落地的那条必然是真值。
+   */
   conversationIds: string[];
   /** 与之互相拉黑的人;广播侧要剔掉,与网关上下线广播同一条规则。 */
   excludeUserIds: string[];

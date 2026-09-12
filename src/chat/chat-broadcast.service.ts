@@ -226,7 +226,10 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
   private async emitPresenceVisibility(
     event: PresenceVisibilityChangedEvent,
   ): Promise<void> {
-    if (!event.visible) {
+    // 现读当前设置,不用事件里的值:两次快拨的事件准备是并发的,谁先到不受事务
+    // 提交顺序保护。队列把处理串起来,现读让最后落地的那条必然播出真值。
+    const visible = await this.readPresenceVisibility(event.userId);
+    if (!visible) {
       this.emitPresence(
         event.conversationIds,
         { userId: event.userId, online: false, lastSeenAt: null, hidden: true },
@@ -241,6 +244,15 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       { userId: event.userId, online, lastSeenAt },
       event.excludeUserIds,
     );
+  }
+
+  /** 没有隐私行时按默认值(对外可见)——与 DEFAULT_PRIVACY_SETTINGS 一致。 */
+  private async readPresenceVisibility(userId: string): Promise<boolean> {
+    const row = await this.prisma.userPrivacySetting.findUnique({
+      where: { userID: userId },
+      select: { shareOnlineStatus: true },
+    });
+    return row?.shareOnlineStatus !== false;
   }
 
   private async readLastSeenAt(userId: string): Promise<string | null> {
