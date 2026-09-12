@@ -1,5 +1,5 @@
 import { Prisma } from 'src/generated/prisma';
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
@@ -12,6 +12,13 @@ import {
   UpdatePrivacySettingsDto,
 } from './privacy-settings.dto';
 import { isBurnDurationChoice } from 'src/common/burn-durations';
+import { RedisService } from 'src/redis/redis.service';
+import {
+  PRESENCE_VISIBILITY_CHANGED,
+  PRIVACY_SETTINGS_CHANGED_CHANNEL,
+  type PresenceVisibilityChangedEvent,
+  privacySettingsEvents,
+} from './privacy-events';
 
 const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   // 0 = 关闭。getSettings 读到没有行时不写库,所以从没进过隐私设置的用户
@@ -36,6 +43,11 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   groupInvitePermission: 'EVERYONE',
   directMessageAutoReplyEnabled: false,
   directMessageAutoReplyText: '',
+  // 在线状态与「正在输入」默认照旧外露 —— 这三项上线前本来就对所有会话成员
+  // 可见,默认收紧等于替存量用户全体改了行为;想藏的人自己关。
+  shareOnlineStatus: true,
+  shareTypingInDirect: true,
+  shareTypingInGroup: true,
 };
 
 type StoredPrivacySettings = PrivacySettingsDto & {
@@ -50,13 +62,17 @@ type ProfilePrivacyField =
   | 'email'
   | 'wechat'
   | 'qq'
-  | 'whatsup';
+  | 'whatsup'
+  | 'lastOnline';
 
 @Injectable()
 export class PrivacySettingsService {
+  private readonly logger = new Logger(PrivacySettingsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly sensitiveWords: SensitiveWordService,
+    private readonly redis: RedisService,
   ) {}
 
   /**
@@ -115,6 +131,7 @@ export class PrivacySettingsService {
   ): Promise<PrivacySettingsDto> {
     this.assertValid(input);
     const update = this.compactUpdate(input);
+    let presenceWasVisible: boolean | null = null;
     const saved = await this.prisma.$transaction(async (tx) => {
       // Call creation, circle admission, friend removal and blocking all make
       // authorization decisions under this same per-user lock. Without it a
@@ -131,13 +148,113 @@ export class PrivacySettingsService {
           ...update,
         } as PrivacySettingsDto);
       }
+      if (input.shareOnlineStatus !== undefined) {
+        // 翻转前的值要在同一把锁里读:事务提交后再去比,读到的可能已是本次写入。
+        presenceWasVisible = (await this.getSettings(userId, tx))
+          .shareOnlineStatus;
+      }
       return tx.userPrivacySetting.upsert({
         where: { userID: userId },
         create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
         update,
       });
     });
-    return this.toDto(saved as StoredPrivacySettings);
+    const updated = this.toDto(saved as StoredPrivacySettings);
+    // 网关按用户缓存了「正在输入」两个开关,靠 TTL 追平的话 PATCH 落在别的实例
+    // 时会留出一段仍在转发的窗口。提交后立刻广播一次失效,让各实例丢掉缓存。
+    await this.publishSettingsChanged(userId);
+    if (
+      presenceWasVisible !== null &&
+      presenceWasVisible !== updated.shareOnlineStatus
+    ) {
+      await this.announcePresenceVisibility(userId);
+    }
+    return updated;
+  }
+
+  /**
+   * 跨实例失效通知。Redis 没配就是单实例部署,不是故障;publish 自己吞掉失败,
+   * 最坏退回 TTL 追平,所以这里不让它影响已经提交的设置。
+   */
+  private async publishSettingsChanged(userId: string): Promise<void> {
+    if (!this.redis.isEnabled()) return;
+    try {
+      await this.redis.publish(PRIVACY_SETTINGS_CHANGED_CHANNEL, userId);
+    } catch (error) {
+      this.logger.warn(
+        `privacy settings change publish failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * 「显示在线时间」翻转后通知聊天广播层:关掉要立刻把在线点/「N 分钟前在线」
+   * 从对方界面收回,打开则把此刻的真实状态补发出去。只在事务提交后发,并且
+   * 自己兜住失败 —— 设置已经落库,实时收回是体验增强,不能把成功保存伪装成失败。
+   */
+  private static readonly ANNOUNCE_ATTEMPTS = 3;
+  private static readonly ANNOUNCE_BACKOFF_MS = 100;
+
+  private async announcePresenceVisibility(userId: string): Promise<void> {
+    for (
+      let attempt = 1;
+      attempt <= PrivacySettingsService.ANNOUNCE_ATTEMPTS;
+      attempt += 1
+    ) {
+      const delivered = await this.tryAnnouncePresenceVisibility(userId);
+      if (delivered) return;
+      if (attempt < PrivacySettingsService.ANNOUNCE_ATTEMPTS) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, PrivacySettingsService.ANNOUNCE_BACKOFF_MS),
+        );
+      }
+    }
+    // 重试也没成的话只能留给下一次查询/重连追平:查询侧读的是实时库,所以
+    // 设置本身是生效的,只是还连着的客户端界面上那一份要晚一点才收敛。
+    this.logger.warn(
+      `presence visibility announcement gave up for ${userId} after ${PrivacySettingsService.ANNOUNCE_ATTEMPTS} attempts`,
+    );
+  }
+
+  /** 返回是否真的把事件发出去了。失败只记一次日志,由调用方决定重试。 */
+  private async tryAnnouncePresenceVisibility(
+    userId: string,
+  ): Promise<boolean> {
+    try {
+      const [memberships, blocks] = await Promise.all([
+        this.prisma.chatMember.findMany({
+          where: { userID: userId, leftAt: null },
+          select: { conversationID: true },
+        }),
+        // 与网关上下线广播同一条规则:互相拉黑的人不收(拉黑不动 ChatMember)。
+        this.prisma.block.findMany({
+          where: { OR: [{ blockerID: userId }, { blockedID: userId }] },
+          select: { blockerID: true, blockedID: true },
+        }),
+      ]);
+      const event: PresenceVisibilityChangedEvent = {
+        userId,
+        conversationIds: memberships.map((m) => m.conversationID),
+        excludeUserIds: [
+          ...new Set(
+            blocks.map((b) =>
+              b.blockerID === userId ? b.blockedID : b.blockerID,
+            ),
+          ),
+        ],
+      };
+      privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, event);
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `presence visibility event preparation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
+    }
   }
 
   async canReceiveStrangerMessage(
@@ -163,6 +280,7 @@ export class PrivacySettingsService {
     if (field === 'wechat') return settings.showWechat;
     if (field === 'qq') return settings.showQQ;
     if (field === 'whatsup') return settings.showWhatsup;
+    if (field === 'lastOnline') return settings.shareOnlineStatus;
     return isFriend;
   }
 
@@ -356,6 +474,15 @@ export class PrivacySettingsService {
       directMessageAutoReplyText:
         settings.directMessageAutoReplyText ??
         DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyText,
+      shareOnlineStatus:
+        settings.shareOnlineStatus ??
+        DEFAULT_PRIVACY_SETTINGS.shareOnlineStatus,
+      shareTypingInDirect:
+        settings.shareTypingInDirect ??
+        DEFAULT_PRIVACY_SETTINGS.shareTypingInDirect,
+      shareTypingInGroup:
+        settings.shareTypingInGroup ??
+        DEFAULT_PRIVACY_SETTINGS.shareTypingInGroup,
     };
   }
 }

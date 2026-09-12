@@ -88,6 +88,7 @@ type ProfilePrivacyUser = {
   wechat?: string | null;
   qq?: string | null;
   whatsup?: string | null;
+  lastOnline?: Date | null;
 };
 
 type ProfileMembershipUser = {
@@ -472,6 +473,7 @@ export class UserService {
       canViewWechat,
       canViewQQ,
       canViewWhatsup,
+      canViewLastOnline,
     ] = await Promise.all([
       this.privacySettings.canViewProfileField(
         user.id,
@@ -493,6 +495,14 @@ export class UserService {
         isSelf,
         false,
       ),
+      // 「显示在线时间」关着时资料页的 lastOnline 也要抹掉:聊天 presence 通道
+      // 已经收口,REST 这边不收就是第二条信道。
+      this.privacySettings.canViewProfileField(
+        user.id,
+        'lastOnline',
+        isSelf,
+        false,
+      ),
     ]);
 
     return {
@@ -502,6 +512,7 @@ export class UserService {
       wechat: canViewWechat ? user.wechat : null,
       qq: canViewQQ ? user.qq : null,
       whatsup: canViewWhatsup ? user.whatsup : null,
+      lastOnline: canViewLastOnline ? user.lastOnline : null,
     };
   }
 

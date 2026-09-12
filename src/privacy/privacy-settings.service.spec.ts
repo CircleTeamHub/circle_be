@@ -3,6 +3,10 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import { UpdatePrivacySettingsDto } from './privacy-settings.dto';
 import { PrivacySettingsService } from './privacy-settings.service';
+import {
+  PRESENCE_VISIBILITY_CHANGED,
+  privacySettingsEvents,
+} from './privacy-events';
 
 describe('PrivacySettingsService', () => {
   const prisma = {
@@ -23,7 +27,11 @@ describe('PrivacySettingsService', () => {
     jest.clearAllMocks();
     prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
     sensitiveWords.check.mockReturnValue({ blocked: false });
-    service = new PrivacySettingsService(prisma as any, sensitiveWords as any);
+    service = new PrivacySettingsService(
+      prisma as any,
+      sensitiveWords as any,
+      { isEnabled: () => false, publish: async () => true } as any,
+    );
   });
 
   it('returns default account privacy settings without writing when none exist', async () => {
@@ -50,6 +58,10 @@ describe('PrivacySettingsService', () => {
       groupInvitePermission: 'EVERYONE',
       directMessageAutoReplyEnabled: false,
       directMessageAutoReplyText: '',
+      // 在线状态与输入状态默认外露 —— 上线前本来就对所有会话成员可见。
+      shareOnlineStatus: true,
+      shareTypingInDirect: true,
+      shareTypingInGroup: true,
     });
 
     // A read must never write: lazily creating a row here would let any
@@ -364,5 +376,145 @@ describe('PrivacySettingsService', () => {
       expect(service.momentsVisibleFor(settings, false, true)).toBe(true);
       expect(service.momentsVisibleFor(settings, false, false)).toBe(false);
     });
+  });
+});
+
+describe('PrivacySettingsService presence visibility', () => {
+  const prisma = {
+    userPrivacySetting: {
+      findUnique: jest.fn(),
+      upsert: jest.fn(),
+      findMany: jest.fn(),
+    },
+    chatMember: { findMany: jest.fn() },
+    block: { findMany: jest.fn() },
+    $queryRaw: jest.fn(),
+    $executeRaw: jest.fn().mockResolvedValue(0),
+    $transaction: jest.fn(async (input: any) => input(prisma)),
+  };
+  const sensitiveWords = {
+    check: jest.fn().mockReturnValue({ blocked: false }),
+  };
+  let service: PrivacySettingsService;
+  let events: unknown[];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$transaction.mockImplementation(async (input: any) => input(prisma));
+    prisma.chatMember.findMany.mockResolvedValue([
+      { conversationID: 'conv-1' },
+    ]);
+    prisma.block.findMany.mockResolvedValue([]);
+    privacySettingsEvents.removeAllListeners(PRESENCE_VISIBILITY_CHANGED);
+    events = [];
+    privacySettingsEvents.on(PRESENCE_VISIBILITY_CHANGED, (event) =>
+      events.push(event),
+    );
+    service = new PrivacySettingsService(
+      prisma as any,
+      sensitiveWords as any,
+      { isEnabled: () => false, publish: async () => true } as any,
+    );
+  });
+
+  afterAll(() => {
+    privacySettingsEvents.removeAllListeners(PRESENCE_VISIBILITY_CHANGED);
+  });
+
+  it('gates lastOnline behind shareOnlineStatus like the other profile fields', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: false,
+    });
+    await expect(
+      service.canViewProfileField('user-1', 'lastOnline', false, true),
+    ).resolves.toBe(false);
+    await expect(
+      service.canViewProfileField('user-1', 'lastOnline', true, false),
+    ).resolves.toBe(true);
+  });
+
+  // 关掉要立刻把在线点从对方界面收回,所以翻转必须在事务提交后广播出去;
+  // 收件面 = 在座会话,互相拉黑的人剔掉 —— 与网关上下线广播同一条规则。
+  it('emits a committed visibility change with the seat rooms and blocked peers', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: true,
+    });
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: false,
+    });
+    prisma.block.findMany.mockResolvedValue([
+      { blockerID: 'user-1', blockedID: 'blocked-by-me' },
+      { blockerID: 'blocked-me', blockedID: 'user-1' },
+    ]);
+
+    await expect(
+      service.updateSettings('user-1', { shareOnlineStatus: false }),
+    ).resolves.toMatchObject({ shareOnlineStatus: false });
+
+    // 事件只说「这个人的开关变了」,值由广播侧现读 —— 见 privacy-events 的注释。
+    expect(events).toEqual([
+      {
+        userId: 'user-1',
+        conversationIds: ['conv-1'],
+        excludeUserIds: ['blocked-by-me', 'blocked-me'],
+      },
+    ]);
+  });
+
+  it('stays silent when the switch is re-saved with the same value', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: true,
+    });
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: true,
+    });
+
+    await service.updateSettings('user-1', { shareOnlineStatus: true });
+
+    expect(events).toEqual([]);
+    expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+  });
+
+  // 准备事件的查询抖一下就把整条撤回丢掉的话,设置已提交、而还连着的客户端会
+  // 一直挂着旧的在线状态。有界重试把瞬时失败救回来。
+  it('retries event preparation so a transient failure still reaches clients', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: true,
+    });
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: false,
+    });
+    prisma.chatMember.findMany
+      .mockRejectedValueOnce(new Error('db hiccup'))
+      .mockResolvedValue([{ conversationID: 'conv-1' }]);
+
+    await service.updateSettings('user-1', { shareOnlineStatus: false });
+
+    expect(events).toEqual([
+      { userId: 'user-1', conversationIds: ['conv-1'], excludeUserIds: [] },
+    ]);
+  });
+
+  // 持续失败(不是抖一下)时:设置已经提交,不能把它伪装成失败;撤回留给下一次
+  // 查询/重连追平 —— 查询侧读的是实时库,所以设置本身是生效的。
+  it('does not turn a committed setting into an error when event preparation keeps failing', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: false,
+    });
+    prisma.chatMember.findMany.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      service.updateSettings('user-1', { shareOnlineStatus: false }),
+    ).resolves.toMatchObject({ shareOnlineStatus: false });
+    expect(events).toEqual([]);
   });
 });
