@@ -41,7 +41,7 @@ describe('ChatService', () => {
     tempChatGuest: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
     chatMessageReaction: {
-      create: jest.fn(),
+      createMany: jest.fn(),
       deleteMany: jest.fn(),
       findMany: jest.fn().mockResolvedValue([]),
     },
@@ -2870,18 +2870,42 @@ describe('ChatService', () => {
     it('adds once and treats duplicate adds as no-change', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
-      prisma.chatMessageReaction.create.mockResolvedValueOnce({});
+      prisma.chatMessageReaction.createMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 0 });
 
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).resolves.toEqual({ changed: true });
 
-      prisma.chatMessageReaction.create.mockRejectedValueOnce({
-        code: 'P2002',
-      });
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).resolves.toEqual({ changed: false });
+    });
+
+    it('rechecks silence after locking when an admin silences during preflight', async () => {
+      prisma.chatMember.findUnique
+        .mockResolvedValueOnce(membership())
+        .mockResolvedValueOnce(
+          membership({ silencedAt: new Date(), silencedUntil: null }),
+        );
+      prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
+      prisma.chatMessageReaction.createMany.mockResolvedValue({ count: 1 });
+
+      const rejection = await service
+        .toggleReaction('u1', 'conv-1', 'm1', '👍', 'add')
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      // The unfixed path only consumes the first one-shot result. Reset before
+      // asserting so that the queued "silenced" seat cannot leak into the next test.
+      prisma.chatMember.findUnique.mockReset();
+      expect(rejection).toMatchObject({
+        response: { errorCode: ChatErrorCode.MemberSilenced },
+      });
+      expect(prisma.$queryRaw).toHaveBeenCalled();
+      expect(prisma.chatMessageReaction.createMany).not.toHaveBeenCalled();
     });
 
     it('silently ignores reactions on revoked messages', async () => {
@@ -2893,7 +2917,7 @@ describe('ChatService', () => {
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).resolves.toEqual({ changed: false });
-      expect(prisma.chatMessageReaction.create).not.toHaveBeenCalled();
+      expect(prisma.chatMessageReaction.createMany).not.toHaveBeenCalled();
     });
 
     it('removes an existing reaction', async () => {
@@ -3183,7 +3207,7 @@ describe('ChatService', () => {
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.MemberSilenced },
       });
-      expect(prisma.chatMessageReaction.create).not.toHaveBeenCalled();
+      expect(prisma.chatMessageReaction.createMany).not.toHaveBeenCalled();
     });
 
     it('refuses an ordinary member under mute-all on both paths', async () => {
@@ -3210,7 +3234,7 @@ describe('ChatService', () => {
       ).rejects.toMatchObject({
         response: { errorCode: ChatErrorCode.ConversationMuted },
       });
-      expect(prisma.chatMessageReaction.create).not.toHaveBeenCalled();
+      expect(prisma.chatMessageReaction.createMany).not.toHaveBeenCalled();
     });
 
     it('keeps the standalone owner exempt under mute-all', async () => {
@@ -3229,7 +3253,7 @@ describe('ChatService', () => {
       ).resolves.toMatchObject({ id: 'm1' });
 
       prisma.chatMessage.findUnique.mockResolvedValue(reactableRow);
-      prisma.chatMessageReaction.create.mockResolvedValueOnce({});
+      prisma.chatMessageReaction.createMany.mockResolvedValueOnce({ count: 1 });
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).resolves.toEqual({ changed: true });
@@ -3261,7 +3285,7 @@ describe('ChatService', () => {
         role: 'ADMIN',
         status: 'ACTIVE',
       });
-      prisma.chatMessageReaction.create.mockResolvedValueOnce({});
+      prisma.chatMessageReaction.createMany.mockResolvedValueOnce({ count: 1 });
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).resolves.toEqual({ changed: true });
@@ -4911,7 +4935,7 @@ describe('ChatService', () => {
       await expect(
         service.toggleReaction('u1', 'conv-1', 'm1', '👍', 'add'),
       ).rejects.toMatchObject({ response: { errorCode: 'CHAT_BLOCKED' } });
-      expect(prisma.chatMessageReaction.create).not.toHaveBeenCalled();
+      expect(prisma.chatMessageReaction.createMany).not.toHaveBeenCalled();
     });
 
     it('blocks edits from a blocked peer', async () => {
