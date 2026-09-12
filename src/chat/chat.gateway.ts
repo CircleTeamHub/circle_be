@@ -1046,7 +1046,13 @@ export class ChatGateway implements OnModuleDestroy {
       this.observeBroadcast('presence', () =>
         this.broadcast.emitPresence(
           conversationIds,
-          { userId, online: false, lastSeenAt: lastSeenAt.toISOString() },
+          {
+            userId,
+            online: false,
+            // 访客没有 User 行,上面也就没落库 —— 带一个此刻的时间戳会让客户端
+            // 渲染出看着像真的「刚刚在线」,而下一次查询拿到的是 null。
+            lastSeenAt: isGuest ? null : lastSeenAt.toISOString(),
+          },
           excludeUserIds,
         ),
       );

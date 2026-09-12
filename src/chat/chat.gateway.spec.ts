@@ -596,9 +596,11 @@ describe('ChatGateway', () => {
 
       expect(chatService.touchLastOnline).not.toHaveBeenCalled();
       expect(chatService.isPresenceVisible).not.toHaveBeenCalled();
+      // 访客没有 User 行,不落库也就没有「最近在线」—— 带时间戳会让客户端渲染出
+      // 看着像真的「刚刚在线」,而下一次查询拿到的是 null。
       expect(broadcast.emitPresence).toHaveBeenLastCalledWith(
         ['temp-1'],
-        expect.objectContaining({ userId: 'guest-1', online: false }),
+        { userId: 'guest-1', online: false, lastSeenAt: null },
         [],
       );
     });

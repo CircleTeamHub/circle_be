@@ -480,13 +480,37 @@ describe('PrivacySettingsService presence visibility', () => {
     expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
   });
 
-  it('does not turn a committed setting into an error when event preparation fails', async () => {
+  // 准备事件的查询抖一下就把整条撤回丢掉的话,设置已提交、而还连着的客户端会
+  // 一直挂着旧的在线状态。有界重试把瞬时失败救回来。
+  it('retries event preparation so a transient failure still reaches clients', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: true,
+    });
+    prisma.userPrivacySetting.upsert.mockResolvedValue({
+      userID: 'user-1',
+      shareOnlineStatus: false,
+    });
+    prisma.chatMember.findMany
+      .mockRejectedValueOnce(new Error('db hiccup'))
+      .mockResolvedValue([{ conversationID: 'conv-1' }]);
+
+    await service.updateSettings('user-1', { shareOnlineStatus: false });
+
+    expect(events).toEqual([
+      { userId: 'user-1', conversationIds: ['conv-1'], excludeUserIds: [] },
+    ]);
+  });
+
+  // 持续失败(不是抖一下)时:设置已经提交,不能把它伪装成失败;撤回留给下一次
+  // 查询/重连追平 —— 查询侧读的是实时库,所以设置本身是生效的。
+  it('does not turn a committed setting into an error when event preparation keeps failing', async () => {
     prisma.userPrivacySetting.findUnique.mockResolvedValue(null);
     prisma.userPrivacySetting.upsert.mockResolvedValue({
       userID: 'user-1',
       shareOnlineStatus: false,
     });
-    prisma.chatMember.findMany.mockRejectedValueOnce(new Error('db down'));
+    prisma.chatMember.findMany.mockRejectedValue(new Error('db down'));
 
     await expect(
       service.updateSettings('user-1', { shareOnlineStatus: false }),

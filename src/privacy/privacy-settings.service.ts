@@ -194,7 +194,34 @@ export class PrivacySettingsService {
    * 从对方界面收回,打开则把此刻的真实状态补发出去。只在事务提交后发,并且
    * 自己兜住失败 —— 设置已经落库,实时收回是体验增强,不能把成功保存伪装成失败。
    */
+  private static readonly ANNOUNCE_ATTEMPTS = 3;
+  private static readonly ANNOUNCE_BACKOFF_MS = 100;
+
   private async announcePresenceVisibility(userId: string): Promise<void> {
+    for (
+      let attempt = 1;
+      attempt <= PrivacySettingsService.ANNOUNCE_ATTEMPTS;
+      attempt += 1
+    ) {
+      const delivered = await this.tryAnnouncePresenceVisibility(userId);
+      if (delivered) return;
+      if (attempt < PrivacySettingsService.ANNOUNCE_ATTEMPTS) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, PrivacySettingsService.ANNOUNCE_BACKOFF_MS),
+        );
+      }
+    }
+    // 重试也没成的话只能留给下一次查询/重连追平:查询侧读的是实时库,所以
+    // 设置本身是生效的,只是还连着的客户端界面上那一份要晚一点才收敛。
+    this.logger.warn(
+      `presence visibility announcement gave up for ${userId} after ${PrivacySettingsService.ANNOUNCE_ATTEMPTS} attempts`,
+    );
+  }
+
+  /** 返回是否真的把事件发出去了。失败只记一次日志,由调用方决定重试。 */
+  private async tryAnnouncePresenceVisibility(
+    userId: string,
+  ): Promise<boolean> {
     try {
       const [memberships, blocks] = await Promise.all([
         this.prisma.chatMember.findMany({
@@ -219,12 +246,14 @@ export class PrivacySettingsService {
         ],
       };
       privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, event);
+      return true;
     } catch (error) {
       this.logger.warn(
         `presence visibility event preparation failed: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
+      return false;
     }
   }
 
