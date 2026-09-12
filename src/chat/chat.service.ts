@@ -949,28 +949,28 @@ export class ChatService {
       circleRoles,
       memberCounts,
     ] = await Promise.all([
-        this.loadLastMessages(conversationIds, cutoffs),
-        this.loadUnreadCounts(
-          userId,
-          // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
-          memberships.map((m) => ({
-            conversationID: m.conversationID,
-            lastReadHeight: Math.max(
-              m.lastReadHeight,
-              m.clearedBeforeHeight ?? 0,
-              m.conversation.clearedBeforeHeight ?? 0,
-            ),
-          })),
-          cutoffs,
-        ),
-        this.loadDirectPeers(userId, directIds),
-        this.loadCircleInfos(circleIds),
-        this.loadTempChatInfos(
-          memberships
-            .map((m) => m.conversation.tempChatID)
-            .filter((id): id is string => id !== null),
-        ),
-        this.loadCircleRoles(userId, circleIds),
+      this.loadLastMessages(conversationIds, cutoffs),
+      this.loadUnreadCounts(
+        userId,
+        // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
+        memberships.map((m) => ({
+          conversationID: m.conversationID,
+          lastReadHeight: Math.max(
+            m.lastReadHeight,
+            m.clearedBeforeHeight ?? 0,
+            m.conversation.clearedBeforeHeight ?? 0,
+          ),
+        })),
+        cutoffs,
+      ),
+      this.loadDirectPeers(userId, directIds),
+      this.loadCircleInfos(circleIds),
+      this.loadTempChatInfos(
+        memberships
+          .map((m) => m.conversation.tempChatID)
+          .filter((id): id is string => id !== null),
+      ),
+      this.loadCircleRoles(userId, circleIds),
       this.loadGroupMemberCounts(groupIds),
     ]);
 
