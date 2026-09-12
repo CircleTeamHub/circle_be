@@ -220,6 +220,18 @@ export class ChatGateway implements OnModuleDestroy {
   /** 初始化期间只保留一个小型 FIFO；超过它说明客户端正在洪泛而不是正常抢发。 */
   private static readonly MAX_PRE_READY_EVENTS = 64;
   private readonly connectionsByUser = new Map<string, Set<Socket>>();
+  /**
+   * 「正在输入」开关的短 TTL 缓存。typing 每人每 5 秒最多 10 条,30 秒的 TTL 把
+   * 数据库读压到「每人每 30 秒一次」,同时把多端改设置的追平窗口收在 30 秒内。
+   */
+  private readonly typingPolicyCache = new Map<
+    string,
+    { direct: boolean; group: boolean; expiresAt: number }
+  >();
+  private static readonly TYPING_POLICY_TTL_MS = 30_000;
+  /** 会话类型缓存。类型不可变,只需要一个上限防止无界增长。 */
+  private readonly conversationTypeCache = new Map<string, string>();
+  private static readonly CONVERSATION_TYPE_CACHE_MAX = 5_000;
 
   constructor(
     private readonly jwtService: JwtService,
@@ -863,6 +875,9 @@ export class ChatGateway implements OnModuleDestroy {
       this.readLimiter.pruneExpired(userId);
       this.typingLimiter.pruneExpired(userId);
       this.presenceLimiter.pruneExpired(userId);
+      if (!this.connectionsByUser.has(userId)) {
+        this.typingPolicyCache.delete(userId);
+      }
       this.revokeLimiter.pruneExpired(userId);
       this.deliveredLimiter.pruneExpired(userId);
       this.reactionLimiter.pruneExpired(userId);
@@ -1406,10 +1421,70 @@ export class ChatGateway implements OnModuleDestroy {
       this.metrics.observeEvent('typing', 'failure');
       return;
     }
+    if (!(await this.mayReportTyping(userId, conversationId))) {
+      this.metrics.observeEvent('typing', 'rate_limited');
+      return;
+    }
     this.metrics.observeEvent('typing', 'success');
     this.observeBroadcast('typing', () =>
       this.broadcast.emitTyping({ conversationId, userId }, socket.id),
     );
+  }
+
+  /**
+   * 本人这条 typing 能不能往外转发。客户端已经按同一份设置门禁过一次,这里是
+   * 多端与改过客户端的兜底。
+   *
+   * 两个开关同为开 / 同为关时不需要知道会话类型,直接放行或直接丢 —— 绝大多数
+   * 用户都落在第一种,常态下连一次类型查询都不会发生。
+   */
+  private async mayReportTyping(
+    userId: string,
+    conversationId: string,
+  ): Promise<boolean> {
+    let policy: { direct: boolean; group: boolean };
+    try {
+      policy = await this.resolveTypingPolicy(userId);
+    } catch {
+      // 读不到设置时放行:typing 是尽力而为的提示,不值得因为一次抖动而消失。
+      return true;
+    }
+    if (policy.direct && policy.group) return true;
+    if (!policy.direct && !policy.group) return false;
+    let type = this.conversationTypeCache.get(conversationId);
+    if (type === undefined) {
+      try {
+        type =
+          (await this.chatService.getConversationType(conversationId)) ?? '';
+      } catch {
+        return true;
+      }
+      if (
+        this.conversationTypeCache.size >=
+        ChatGateway.CONVERSATION_TYPE_CACHE_MAX
+      ) {
+        this.conversationTypeCache.clear();
+      }
+      this.conversationTypeCache.set(conversationId, type);
+    }
+    // DIRECT 与 TEMP 都是一对一的单聊语义;其余(GROUP)走群聊那个开关。
+    return type === 'DIRECT' || type === 'TEMP' ? policy.direct : policy.group;
+  }
+
+  private async resolveTypingPolicy(
+    userId: string,
+  ): Promise<{ direct: boolean; group: boolean }> {
+    const cached = this.typingPolicyCache.get(userId);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return { direct: cached.direct, group: cached.group };
+    }
+    const policy = await this.chatService.getTypingPolicy(userId);
+    this.typingPolicyCache.set(userId, {
+      ...policy,
+      expiresAt: now + ChatGateway.TYPING_POLICY_TTL_MS,
+    });
+    return policy;
   }
 
   private observeBroadcast(

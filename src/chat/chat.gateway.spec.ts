@@ -45,6 +45,9 @@ describe('ChatGateway', () => {
     isPresenceVisible: jest.fn().mockResolvedValue(true),
     touchLastOnline: jest.fn().mockResolvedValue(undefined),
     getLastSeenAt: jest.fn().mockResolvedValue(new Map()),
+    // 「正在输入」的服务端闸门;默认两个开关都开。
+    getTypingPolicy: jest.fn().mockResolvedValue({ direct: true, group: true }),
+    getConversationType: jest.fn().mockResolvedValue('DIRECT'),
   };
   const broadcast = {
     setServer: jest.fn(),
@@ -118,6 +121,14 @@ describe('ChatGateway', () => {
     chatService.isPresenceVisible.mockResolvedValue(true);
     chatService.touchLastOnline.mockResolvedValue(undefined);
     chatService.getLastSeenAt.mockResolvedValue(new Map());
+    chatService.getTypingPolicy.mockResolvedValue({
+      direct: true,
+      group: true,
+    });
+    chatService.getConversationType.mockResolvedValue('DIRECT');
+    // 开关与会话类型都有缓存,逐例之间要清掉,否则上一条用例的值会漏过来。
+    (gateway as any).typingPolicyCache.clear();
+    (gateway as any).conversationTypeCache.clear();
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -1304,6 +1315,95 @@ describe('ChatGateway', () => {
         conversationId: 'conv-other',
       });
       expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 客户端已经按同一份设置门禁过一次,但设置存在服务端、还能多端登录:
+    // 在 A 设备关掉之后 B 设备的缓存到下次连接才追平,这中间它照样上报。
+    it('drops typing in a direct chat once the direct switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockResolvedValue('DIRECT');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    it('still forwards group typing while only the direct switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: true,
+      });
+      chatService.getConversationType.mockResolvedValue('GROUP');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops typing in a group once the group switch is off', async () => {
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: true,
+        group: false,
+      });
+      chatService.getConversationType.mockResolvedValue('GROUP');
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+    });
+
+    // 两个开关同为开 / 同为关时不需要知道类型 —— 绝大多数用户落在第一种,
+    // 常态下一次类型查询都不该发生。
+    it('never looks up the conversation type when both switches agree', async () => {
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+      expect(chatService.getConversationType).not.toHaveBeenCalled();
+
+      chatService.getTypingPolicy.mockResolvedValue({
+        direct: false,
+        group: false,
+      });
+      (gateway as any).typingPolicyCache.clear();
+      broadcast.emitTyping.mockClear();
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u1', {
+        conversationId: 'conv-1',
+      });
+      expect(broadcast.emitTyping).not.toHaveBeenCalled();
+      expect(chatService.getConversationType).not.toHaveBeenCalled();
+    });
+
+    // 这两条各用自己的 userId:typing 限流器按 userId 记额度,而 gateway 实例是
+    // 整个 describe 共用的,沿用 'u1' 会把前面用例消耗掉的额度算进来。
+    it('caches the policy so typing bursts do not hit the database per event', async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await gateway['handleTyping'](fakeSocket() as never, 'u-burst', {
+          conversationId: 'conv-1',
+        });
+      }
+      expect(chatService.getTypingPolicy).toHaveBeenCalledTimes(1);
+      expect(broadcast.emitTyping).toHaveBeenCalledTimes(5);
+    });
+
+    // 读设置失败时放行:typing 是尽力而为的提示,不值得因为一次抖动而消失。
+    it('forwards typing when the policy lookup fails', async () => {
+      chatService.getTypingPolicy.mockRejectedValue(new Error('db down'));
+
+      await gateway['handleTyping'](fakeSocket() as never, 'u-policy-fail', {
+        conversationId: 'conv-1',
+      });
+
+      expect(broadcast.emitTyping).toHaveBeenCalledTimes(1);
     });
   });
 });

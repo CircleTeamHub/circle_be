@@ -838,6 +838,32 @@ export class ChatService {
     );
   }
 
+  /**
+   * 本人向外上报「正在输入」的两个开关。网关按会话类型取其一。
+   *
+   * 与在线状态不同,这两项不是「别人能不能看」的授权判定,而是「我自己往外
+   * 漏什么」。但设置存在服务端、还能多端登录:在 A 设备关掉之后,B 设备的缓存
+   * 到下次连接才会追平,这中间它照样上报。所以服务端也要有一道闸。
+   */
+  async getTypingPolicy(
+    userId: string,
+  ): Promise<{ direct: boolean; group: boolean }> {
+    const settings = await this.privacySettings.getSettings(userId);
+    return {
+      direct: settings.shareTypingInDirect !== false,
+      group: settings.shareTypingInGroup !== false,
+    };
+  }
+
+  /** 会话类型。类型建好就不变,调用方可以放心缓存。 */
+  async getConversationType(conversationId: string): Promise<string | null> {
+    const row = await this.prisma.chatConversation.findUnique({
+      where: { id: conversationId },
+      select: { type: true },
+    });
+    return row?.type ?? null;
+  }
+
   /** 该用户是否允许别人看到自己的在线状态(上下线广播前的门禁)。 */
   async isPresenceVisible(userId: string): Promise<boolean> {
     const settings = await this.privacySettings.getSettings(userId);
