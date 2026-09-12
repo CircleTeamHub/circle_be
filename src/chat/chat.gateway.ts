@@ -27,6 +27,7 @@ import {
   userRoom,
 } from './chat.constants';
 import { DistributedRateLimiter } from './chat-rate-limiter';
+import { PRIVACY_SETTINGS_CHANGED_CHANNEL } from 'src/privacy/privacy-events';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { ChatBroadcastService } from './chat-broadcast.service';
@@ -43,6 +44,7 @@ import {
 import type {
   ChatAckError,
   GuestChatTokenPayload,
+  ChatPresenceDetail,
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
@@ -219,6 +221,19 @@ export class ChatGateway implements OnModuleDestroy {
   /** 初始化期间只保留一个小型 FIFO；超过它说明客户端正在洪泛而不是正常抢发。 */
   private static readonly MAX_PRE_READY_EVENTS = 64;
   private readonly connectionsByUser = new Map<string, Set<Socket>>();
+  /**
+   * 「正在输入」开关的短 TTL 缓存。typing 每人每 5 秒最多 10 条,30 秒的 TTL 把
+   * 数据库读压到「每人每 30 秒一次」,同时把多端改设置的追平窗口收在 30 秒内。
+   */
+  private readonly typingPolicyCache = new Map<
+    string,
+    { direct: boolean; group: boolean; expiresAt: number }
+  >();
+  private static readonly TYPING_POLICY_TTL_MS = 30_000;
+  /** 会话类型缓存。类型不可变,只需要一个上限防止无界增长。 */
+  private readonly conversationTypeCache = new Map<string, string>();
+  private static readonly CONVERSATION_TYPE_CACHE_MAX = 5_000;
+  private privacySubscribed = false;
 
   constructor(
     private readonly jwtService: JwtService,
@@ -327,6 +342,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.io = io;
     this.broadcast.setServer(io);
     this.ensureRevocationSubscription();
+    this.ensurePrivacySubscription();
     this.logger.log(`chat gateway attached at ${CHAT_WS_PATH}`);
   }
 
@@ -484,6 +500,33 @@ export class ChatGateway implements OnModuleDestroy {
    * 启动瞬间 Redis 恰好不可用,订阅就永久缺失,被封禁的人直到自己断线为止
    * 都能继续收发。改成认返回值 + 退避重试(照搬 RealtimeService 的做法)。
    */
+  /**
+   * 隐私设置变更 → 丢掉该用户缓存的「正在输入」开关。
+   *
+   * 与吊销订阅同样的语义:subscribePattern 从不 reject,失败只是返回 false。
+   * 订阅不上时退回 TTL 追平(最坏 30 秒),所以这里不做重试,只记一次。
+   */
+  private ensurePrivacySubscription(): void {
+    if (this.privacySubscribed || !this.redisService.isEnabled()) return;
+    void this.redisService
+      .subscribePattern(
+        PRIVACY_SETTINGS_CHANGED_CHANNEL,
+        (_channel, message) => {
+          if (typeof message === 'string' && message.length > 0) {
+            this.typingPolicyCache.delete(message);
+          }
+        },
+      )
+      .then((subscribed) => {
+        this.privacySubscribed = subscribed;
+        if (!subscribed) {
+          this.logger.warn(
+            'privacy settings subscription unavailable; typing policy falls back to its TTL',
+          );
+        }
+      });
+  }
+
   private ensureRevocationSubscription(): void {
     if (this.revocationSubscribed || this.revocationRetryTimer) return;
     // Redis 未配置是部署形态(单实例),不是故障:不重试、不刷日志。
@@ -515,6 +558,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.revocationRetryTimer = setTimeout(() => {
       this.revocationRetryTimer = null;
       this.ensureRevocationSubscription();
+      this.ensurePrivacySubscription();
     }, delay);
     // 重试计时器不应拖住进程退出。
     this.revocationRetryTimer.unref?.();
@@ -714,6 +758,8 @@ export class ChatGateway implements OnModuleDestroy {
     let conversationIds: string[] = [];
     // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
     let blockedPeers: string[] = [];
+    // 本人的「显示在线时间」开关:关着就不广播上线(下线那侧现读,见 announceOffline)。
+    let presenceVisible = true;
 
     const failAdmission = (): void => {
       admissionState = 'failed';
@@ -836,7 +882,10 @@ export class ChatGateway implements OnModuleDestroy {
     );
     socket.on(
       CHAT_EVENTS.presence,
-      (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
+      (
+        payload: ChatPresenceQuery,
+        ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
+      ) => {
         if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
           if (typeof ack === 'function') ack({});
         }
@@ -857,6 +906,9 @@ export class ChatGateway implements OnModuleDestroy {
       this.readLimiter.pruneExpired(userId);
       this.typingLimiter.pruneExpired(userId);
       this.presenceLimiter.pruneExpired(userId);
+      if (!this.connectionsByUser.has(userId)) {
+        this.typingPolicyCache.delete(userId);
+      }
       this.revokeLimiter.pruneExpired(userId);
       this.deliveredLimiter.pruneExpired(userId);
       this.reactionLimiter.pruneExpired(userId);
@@ -871,30 +923,16 @@ export class ChatGateway implements OnModuleDestroy {
         reason: boundedDisconnectReason(reason),
         traceId,
       });
-      // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
-      //
-      // .catch 不是可选的:这是 fire-and-forget,少了它一次 reject 就是未捕获
-      // rejection,Node 直接终止进程 —— 实测 Redis 抖一下 + 有人断开 WebSocket
-      // 就能把整个后端打死。「尽力而为」必须自己兜住失败才算数。
-      void this.broadcast
-        .isUserOnline(userId)
-        .then((online) => {
-          if (online) return;
-          this.observeBroadcast('presence', () =>
-            this.broadcast.emitPresence(
-              conversationIds,
-              { userId, online: false },
-              blockedPeers,
-            ),
-          );
-        })
-        .catch((error: unknown) => {
-          reportOperationalError(error, {
-            component: 'ChatGateway',
-            operation: 'presenceOnDisconnect',
-            kind: 'websocket',
-          });
-        });
+      // 末个 socket 断开 = 用户下线:记一笔最近在线,再广播到其会话房(尽力而为)。
+      // announceOffline 自己兜住全部失败 —— 这是 fire-and-forget,漏一次 reject
+      // 就是未捕获 rejection,Node 直接终止进程(实测 Redis 抖一下 + 有人断开
+      // WebSocket 就能把整个后端打死)。
+      void this.announceOffline(
+        userId,
+        conversationIds,
+        blockedPeers,
+        guestConversationId !== null,
+      );
     });
 
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
@@ -931,9 +969,10 @@ export class ChatGateway implements OnModuleDestroy {
       if (guestConversationId) {
         conversationIds = [guestConversationId];
       } else {
-        [conversationIds, blockedPeers] = await Promise.all([
+        [conversationIds, blockedPeers, presenceVisible] = await Promise.all([
           this.chatService.listConversationIds(userId),
           this.chatService.listBlockedCounterparties(userId),
+          this.chatService.isPresenceVisible(userId),
         ]);
       }
       await socket.join(userRoom(userId));
@@ -967,15 +1006,63 @@ export class ChatGateway implements OnModuleDestroy {
     void drainPreReadyQueue();
     // 会话房派生完成 → 挂进跨实例在线集合(推送分流/在线判定的数据源)。
     void this.presence.registerConversations(userId, conversationIds);
+    // 「最近在线」从这一刻起算;访客不是 User 行,没有可记的地方。
+    if (!guestConversationId) void this.chatService.touchLastOnline(userId);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
-    this.observeBroadcast('presence', () =>
-      this.broadcast.emitPresence(
-        conversationIds,
-        { userId, online: true },
-        blockedPeers,
-      ),
-    );
+    // 关了「显示在线时间」的人不广播 —— 查询侧(filterVisiblePresenceTargets)
+    // 已经把他摘掉了,广播侧再推就是换个通道把同一份信息送出去。
+    if (presenceVisible) {
+      this.observeBroadcast('presence', () =>
+        this.broadcast.emitPresence(
+          conversationIds,
+          { userId, online: true },
+          blockedPeers,
+        ),
+      );
+    }
+  }
+
+  /**
+   * 末个连接断开后的收尾:先落一笔 lastOnline(「N 分钟前在线」的数据源),
+   * 再按本人此刻的「显示在线时间」决定要不要广播下线。开关现读现用而不是连接
+   * 时缓存:多实例下隐私 PATCH 落在哪个实例与这条 socket 无关,缓存会读到旧值。
+   *
+   * 全部失败都收在这里:调用方是 fire-and-forget。
+   */
+  private async announceOffline(
+    userId: string,
+    conversationIds: string[],
+    excludeUserIds: string[],
+    isGuest: boolean,
+  ): Promise<void> {
+    try {
+      if (await this.broadcast.isUserOnline(userId)) return;
+      const lastSeenAt = new Date();
+      if (!isGuest) {
+        await this.chatService.touchLastOnline(userId, lastSeenAt);
+        if (!(await this.chatService.isPresenceVisible(userId))) return;
+      }
+      this.observeBroadcast('presence', () =>
+        this.broadcast.emitPresence(
+          conversationIds,
+          {
+            userId,
+            online: false,
+            // 访客没有 User 行,上面也就没落库 —— 带一个此刻的时间戳会让客户端
+            // 渲染出看着像真的「刚刚在线」,而下一次查询拿到的是 null。
+            lastSeenAt: isGuest ? null : lastSeenAt.toISOString(),
+          },
+          excludeUserIds,
+        ),
+      );
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'ChatGateway',
+        operation: 'presenceOnDisconnect',
+        kind: 'websocket',
+      });
+    }
   }
 
   /**
@@ -1000,11 +1087,15 @@ export class ChatGateway implements OnModuleDestroy {
     if (sockets.size === 0) this.connectionsByUser.delete(userId);
   }
 
-  /** 在线状态查询:一次最多 50 个 userId,ack 回 {userId: online}。 */
+  /**
+   * 在线状态查询:一次最多 50 个 userId。ack 回 {userId: online};带 detail=true
+   * 的新客户端回 {userId: {online, lastSeenAt}} —— 旧客户端只认 boolean,直接换
+   * 形状会让它们的在线点全灭,所以按请求方声明分两种形状。
+   */
   private async handlePresenceQuery(
     socket: Socket,
     payload: ChatPresenceQuery,
-    ack?: AckFn<Record<string, boolean>>,
+    ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
     const startedAt = process.hrtime.bigint();
@@ -1038,7 +1129,28 @@ export class ChatGateway implements OnModuleDestroy {
           async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
         ),
       );
-      ack(Object.fromEntries(entries));
+      if (payload?.detail !== true) {
+        ack(Object.fromEntries(entries));
+        this.metrics.observeEvent('presence', 'success');
+        return;
+      }
+      // 只查离线那几位的最近在线;在线的人 lastSeenAt 恒为 null。
+      const lastSeen = await this.chatService.getLastSeenAt(
+        entries.filter(([, online]) => !online).map(([id]) => id),
+      );
+      const visibleDetail = new Map(
+        entries.map(([id, online]) => [
+          id,
+          { online, lastSeenAt: online ? null : (lastSeen.get(id) ?? null) },
+        ]),
+      );
+      // 为每个**被请求**的 id 都给条目:不可见的显式回 null。省略的话客户端分不清
+      // 「对方关掉了显示在线时间」和「这次没答上来」,旧状态会一直挂着。
+      ack(
+        Object.fromEntries(
+          requested.map((id) => [id, visibleDetail.get(id) ?? null]),
+        ),
+      );
       this.metrics.observeEvent('presence', 'success');
     } catch (error) {
       this.metrics.observeEvent('presence', 'failure');
@@ -1351,10 +1463,74 @@ export class ChatGateway implements OnModuleDestroy {
       this.metrics.observeEvent('typing', 'failure');
       return;
     }
+    if (!(await this.mayReportTyping(userId, conversationId))) {
+      this.metrics.observeEvent('typing', 'rate_limited');
+      return;
+    }
     this.metrics.observeEvent('typing', 'success');
     this.observeBroadcast('typing', () =>
       this.broadcast.emitTyping({ conversationId, userId }, socket.id),
     );
+  }
+
+  /**
+   * 本人这条 typing 能不能往外转发。客户端已经按同一份设置门禁过一次,这里是
+   * 多端与改过客户端的兜底。
+   *
+   * 两个开关同为开 / 同为关时不需要知道会话类型,直接放行或直接丢 —— 绝大多数
+   * 用户都落在第一种,常态下连一次类型查询都不会发生。
+   */
+  private async mayReportTyping(
+    userId: string,
+    conversationId: string,
+  ): Promise<boolean> {
+    let policy: { direct: boolean; group: boolean };
+    try {
+      policy = await this.resolveTypingPolicy(userId);
+    } catch {
+      // 读不到设置就不转发。这是隐私闸,答不上来时唯一安全的答案是「不透出」——
+      // 与 presence 查询失败时 ack({}) 同一条规则。放行的代价是:一次数据库抖动
+      // 就让关掉开关的人重新开始泄漏「正在输入」,而且没人会注意到。
+      // 代价这边只是抖动期间大家都看不到输入提示,纯观感,可接受。
+      return false;
+    }
+    if (policy.direct && policy.group) return true;
+    if (!policy.direct && !policy.group) return false;
+    let type = this.conversationTypeCache.get(conversationId);
+    if (type === undefined) {
+      try {
+        type =
+          (await this.chatService.getConversationType(conversationId)) ?? '';
+      } catch {
+        // 同上:类型查不到就无法判断该用哪个开关,不转发。
+        return false;
+      }
+      if (
+        this.conversationTypeCache.size >=
+        ChatGateway.CONVERSATION_TYPE_CACHE_MAX
+      ) {
+        this.conversationTypeCache.clear();
+      }
+      this.conversationTypeCache.set(conversationId, type);
+    }
+    // DIRECT 与 TEMP 都是一对一的单聊语义;其余(GROUP)走群聊那个开关。
+    return type === 'DIRECT' || type === 'TEMP' ? policy.direct : policy.group;
+  }
+
+  private async resolveTypingPolicy(
+    userId: string,
+  ): Promise<{ direct: boolean; group: boolean }> {
+    const cached = this.typingPolicyCache.get(userId);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return { direct: cached.direct, group: cached.group };
+    }
+    const policy = await this.chatService.getTypingPolicy(userId);
+    this.typingPolicyCache.set(userId, {
+      ...policy,
+      expiresAt: now + ChatGateway.TYPING_POLICY_TTL_MS,
+    });
+    return policy;
   }
 
   private observeBroadcast(

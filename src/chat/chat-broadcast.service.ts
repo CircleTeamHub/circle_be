@@ -1,6 +1,16 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import type { RemoteSocket, Server } from 'socket.io';
 import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  PRESENCE_VISIBILITY_CHANGED,
+  type PresenceVisibilityChangedEvent,
+  privacySettingsEvents,
+} from 'src/privacy/privacy-events';
 import { ChatPresenceRegistry } from './chat-presence.registry';
 import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
 import type {
@@ -9,6 +19,7 @@ import type {
   ChatEditBroadcast,
   ChatHistoryClearedBroadcast,
   ChatMessageDto,
+  ChatPresenceBroadcast,
   ChatReactionBroadcast,
   ChatReadBroadcast,
   ChatRevokeBroadcast,
@@ -21,9 +32,25 @@ import type {
  * 经此服务下发,不直接持有 io。
  */
 @Injectable()
-export class ChatBroadcastService {
+export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ChatBroadcastService.name);
   private server: Server | null = null;
+  /** 「显示在线时间」翻转的广播串行化:同一用户连拨两次不能乱序落地。 */
+  private presenceVisibilityQueue: Promise<void> = Promise.resolve();
+
+  private readonly onPresenceVisibilityChanged = (
+    event: PresenceVisibilityChangedEvent,
+  ): void => {
+    this.presenceVisibilityQueue = this.presenceVisibilityQueue
+      .then(() => this.emitPresenceVisibility(event))
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `presence visibility broadcast failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+  };
 
   /** 离房收敛的重试次数。跨节点通常一轮就到,多给两轮覆盖 adapter 抖动。 */
   private static readonly ROOM_LEAVE_ATTEMPTS = 3;
@@ -34,6 +61,20 @@ export class ChatBroadcastService {
     private readonly presence: ChatPresenceRegistry,
     private readonly prisma: PrismaService,
   ) {}
+
+  onModuleInit(): void {
+    privacySettingsEvents.on(
+      PRESENCE_VISIBILITY_CHANGED,
+      this.onPresenceVisibilityChanged,
+    );
+  }
+
+  onModuleDestroy(): void {
+    privacySettingsEvents.off(
+      PRESENCE_VISIBILITY_CHANGED,
+      this.onPresenceVisibilityChanged,
+    );
+  }
 
   setServer(server: Server): void {
     this.server = server;
@@ -165,7 +206,7 @@ export class ChatBroadcastService {
    */
   emitPresence(
     conversationIds: string[],
-    payload: { userId: string; online: boolean },
+    payload: ChatPresenceBroadcast,
     excludeUserIds: readonly string[] = [],
   ): void {
     const server = this.requireServer('emitPresence');
@@ -175,6 +216,51 @@ export class ChatBroadcastService {
       ? target.except(excludeUserIds.map(userRoom))
       : target;
     scoped.emit(CHAT_EVENTS.presence, payload);
+  }
+
+  /**
+   * 隐私页拨了「显示在线时间」:关掉 → 向其全部会话房发一条 hidden,让对方界面
+   * 把在线点与「N 分钟前在线」一起收掉(不是改成「离线」—— 那仍是信息);
+   * 打开 → 把此刻的真实状态补发出去,否则要等下一次上下线才有人看得到。
+   */
+  private async emitPresenceVisibility(
+    event: PresenceVisibilityChangedEvent,
+  ): Promise<void> {
+    // 现读当前设置,不用事件里的值:两次快拨的事件准备是并发的,谁先到不受事务
+    // 提交顺序保护。队列把处理串起来,现读让最后落地的那条必然播出真值。
+    const visible = await this.readPresenceVisibility(event.userId);
+    if (!visible) {
+      this.emitPresence(
+        event.conversationIds,
+        { userId: event.userId, online: false, lastSeenAt: null, hidden: true },
+        event.excludeUserIds,
+      );
+      return;
+    }
+    const online = await this.isUserOnline(event.userId);
+    const lastSeenAt = online ? null : await this.readLastSeenAt(event.userId);
+    this.emitPresence(
+      event.conversationIds,
+      { userId: event.userId, online, lastSeenAt },
+      event.excludeUserIds,
+    );
+  }
+
+  /** 没有隐私行时按默认值(对外可见)——与 DEFAULT_PRIVACY_SETTINGS 一致。 */
+  private async readPresenceVisibility(userId: string): Promise<boolean> {
+    const row = await this.prisma.userPrivacySetting.findUnique({
+      where: { userID: userId },
+      select: { shareOnlineStatus: true },
+    });
+    return row?.shareOnlineStatus !== false;
+  }
+
+  private async readLastSeenAt(userId: string): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { lastOnline: true },
+    });
+    return user?.lastOnline ? user.lastOnline.toISOString() : null;
   }
 
   /** 定向下发(如会话新建/成员变更时通知个人房)。 */

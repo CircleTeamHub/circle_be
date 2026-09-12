@@ -277,15 +277,36 @@ export interface ChatGroupEventsPageDto {
   nextCursor: string | null;
 }
 
-/** chat:presence 客户端查询载荷(带 ack:{[userId]: boolean})。 */
+/**
+ * chat:presence 客户端查询载荷。ack 默认回 {[userId]: boolean};带 detail=true
+ * 时回 {[userId]: ChatPresenceDetail}。旧客户端只认 boolean,所以形状由请求方声明。
+ */
 export interface ChatPresenceQuery {
   userIds: string[];
+  detail?: boolean;
+}
+
+/**
+ * detail 查询的单人结果。
+ *
+ * detail 查询会为**每个被请求的 userId** 都给一个条目,不可见的人显式回 null ——
+ * 从结果里省略的话,客户端没法把「对方刚关掉显示在线时间」和「这次限流/出错
+ * 没答上来」(两者都是 ack({}))区分开,只能把旧的在线状态一直挂在界面上。
+ */
+export interface ChatPresenceDetail {
+  online: boolean;
+  /** 最近在线时刻(ISO);在线时为 null,没记录过也为 null。 */
+  lastSeenAt: string | null;
 }
 
 /** chat:presence 服务端广播:某用户上/下线。 */
 export interface ChatPresenceBroadcast {
   userId: string;
   online: boolean;
+  /** 下线时刻(ISO)。在线广播与旧版服务端不带这一项。 */
+  lastSeenAt?: string | null;
+  /** 对方刚关掉「显示在线时间」:客户端应当忘掉此人的在线/最近在线显示。 */
+  hidden?: boolean;
 }
 
 /** 会话列表项 DTO(REST GET /chat/conversations)。 */
@@ -323,6 +344,8 @@ export interface ChatConversationDto {
   avatarUrl: string | null;
   /** 独立群聊的成员上限;圈子群/其他类型为 null(圈子容量走圈子详情)。 */
   memberLimit: number | null;
+  /** 在座成员数(仅 GROUP;不含已退群的座位)。「我的群聊」列表按它显示 N 人。 */
+  memberCount: number | null;
   /** 本人在该群的角色(仅 GROUP);圈子群来自 CircleMember,独立群 = ownerId / 座位管理员。 */
   myRole: 'OWNER' | 'ADMIN' | 'MEMBER' | null;
   /** 群策略(仅 GROUP);其他类型为 null。 */
@@ -330,6 +353,12 @@ export interface ChatConversationDto {
   /** 会话级阅后即焚秒数(S-01);null=关。 */
   burnDurationSec?: number | null;
   lastMessageAt: string | null;
+  /**
+   * 本人加入该会话的时刻(ChatMember.joinedAt)。「新的群组」按它倒序 ——
+   * 群聊没有入群申请模型(拉人即进),这是唯一能判断「这个群对我是新的」的依据。
+   * 取或建单聊的响应里没有成员行时为 null。
+   */
+  joinedAt: string | null;
 }
 
 /** 群策略开关(群主/管理员可改;PATCH /chat/conversations/:id/policies)。 */
