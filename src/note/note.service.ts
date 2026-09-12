@@ -227,6 +227,10 @@ const MAX_GROUPS_PER_USER = 50;
 // extracted from contentJson blocks otherwise bypasses DTO validation.
 const MAX_NOTE_TITLE_LENGTH = 120;
 const MAX_NOTE_CONTENT_LENGTH = 20_000;
+
+function sliceByCodePoints(value: string, maxLength: number): string {
+  return Array.from(value).slice(0, maxLength).join('');
+}
 const MAX_NOTE_PREVIEW_LENGTH = 120;
 /** 递归下钻块/行内节点的层数上限，挡住恶意构造的深层嵌套。 */
 const MAX_NOTE_BLOCK_DEPTH = 10;
@@ -1262,9 +1266,9 @@ export class NoteService {
     const derivedTitle = input.title.trim();
     const normalized = {
       contentJson: blocks.length > 0 ? blocks : null,
-      title: derivedTitle.slice(0, MAX_NOTE_TITLE_LENGTH),
+      title: sliceByCodePoints(derivedTitle, MAX_NOTE_TITLE_LENGTH),
       content: derivedContent
-        ? derivedContent.slice(0, MAX_NOTE_CONTENT_LENGTH)
+        ? sliceByCodePoints(derivedContent, MAX_NOTE_CONTENT_LENGTH)
         : null,
       media: derivedMedia,
     };
