@@ -1348,6 +1348,13 @@ model UserPrivacySetting {
   groupInvitePermission   String   @default("EVERYONE")
   directMessageAutoReplyEnabled Boolean  @default(false)
   directMessageAutoReplyText    String   @default("") @db.VarChar(200)
+  /// 是否让别人看到我的在线状态与最近在线时间(chat:presence 查询/上下线广播、
+  /// 资料页与好友列表里的 lastOnline)。关掉后这几条通道一律不再透出。
+  shareOnlineStatus       Boolean  @default(true)
+  /// 单聊 / 群聊里是否向对方上报「正在输入」。上报由客户端按它门禁;它只影响
+  /// 本人向外泄露的信息,服务端不为每条 typing 事件再查一次库。
+  shareTypingInDirect     Boolean  @default(true)
+  shareTypingInGroup      Boolean  @default(true)
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
   user                    User     @relation(fields: [userID], references: [id], onDelete: Cascade)

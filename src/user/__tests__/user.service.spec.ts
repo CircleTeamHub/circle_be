@@ -577,6 +577,7 @@ describe('UserService', () => {
         email: 'target@example.com',
         wechat: 'wxid_target',
         qq: '10001',
+        lastOnline: new Date('2026-09-11T08:00:00.000Z'),
       });
       privacySettings.canViewProfileField.mockImplementation(
         async (_targetId: string, field: string) => field === 'wechat',
@@ -594,6 +595,9 @@ describe('UserService', () => {
         email: null,
         wechat: 'wxid_target',
         qq: null,
+        // 「显示在线时间」关着:资料页的最近在线一并抹掉,聊天 presence 收口了
+        // REST 不收口就是第二条信道。
+        lastOnline: null,
         displayIcons: [],
         likedByMeToday: false,
       });

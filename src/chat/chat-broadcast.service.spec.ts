@@ -1,6 +1,10 @@
 /* eslint-disable sonarjs/no-internal-api-use -- This contract regression intentionally executes the installed Socket.IO RemoteSocket implementation. */
 import { RemoteSocket } from '../../node_modules/socket.io/dist/broadcast-operator';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import {
+  PRESENCE_VISIBILITY_CHANGED,
+  privacySettingsEvents,
+} from 'src/privacy/privacy-events';
 
 function message(conversationId = 'conv-1') {
   return {
@@ -620,5 +624,101 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
 
     await expect(service.isUserOnline('u1')).resolves.toBe(true);
     expect(fetchSockets).toHaveBeenCalled();
+  });
+});
+
+describe('ChatBroadcastService presence visibility events', () => {
+  function harness(online: boolean, lastOnline: Date | null) {
+    const emit = jest.fn();
+    const except = jest.fn(() => ({ emit }));
+    const server = { to: jest.fn(() => ({ emit, except })) };
+    const presence = {
+      isOnline: jest.fn().mockResolvedValue(online),
+      isRedisConfigured: jest.fn().mockReturnValue(true),
+    };
+    const prisma = {
+      user: { findUnique: jest.fn().mockResolvedValue({ lastOnline }) },
+    };
+    const service = new ChatBroadcastService(
+      presence as never,
+      prisma as never,
+    );
+    service.setServer(server as never);
+    service.onModuleInit();
+    return { service, server, emit, except, prisma };
+  }
+
+  afterEach(() => {
+    privacySettingsEvents.removeAllListeners(PRESENCE_VISIBILITY_CHANGED);
+  });
+
+  // 关掉 → hidden:对方界面要把在线点与「N 分钟前在线」一起收掉,
+  // 而不是改成「离线」—— 那仍然是信息。
+  it('tells every seat room to forget the user when presence is switched off', async () => {
+    const { service, server, emit, prisma } = harness(true, null);
+
+    privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, {
+      userId: 'u1',
+      visible: false,
+      conversationIds: ['conv-1', 'conv-2'],
+      excludeUserIds: [],
+    });
+    await service['presenceVisibilityQueue'];
+
+    expect(server.to).toHaveBeenCalledWith(['c:conv-1', 'c:conv-2']);
+    expect(emit).toHaveBeenCalledWith('chat:presence', {
+      userId: 'u1',
+      online: false,
+      lastSeenAt: null,
+      hidden: true,
+    });
+    expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    service.onModuleDestroy();
+  });
+
+  it('re-announces the live state with last-seen when presence is switched back on', async () => {
+    const { service, emit, except } = harness(
+      false,
+      new Date('2026-09-11T08:00:00.000Z'),
+    );
+
+    privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, {
+      userId: 'u1',
+      visible: true,
+      conversationIds: ['conv-1'],
+      excludeUserIds: ['blocked'],
+    });
+    await service['presenceVisibilityQueue'];
+
+    // 互相拉黑的人照旧剔掉,与网关上下线广播同一条规则。
+    expect(except).toHaveBeenCalledWith(['u:blocked']);
+    expect(emit).toHaveBeenCalledWith('chat:presence', {
+      userId: 'u1',
+      online: false,
+      lastSeenAt: '2026-09-11T08:00:00.000Z',
+    });
+    service.onModuleDestroy();
+  });
+
+  it('announces online without a last-seen when the user is currently connected', async () => {
+    const { service, emit } = harness(
+      true,
+      new Date('2026-09-11T08:00:00.000Z'),
+    );
+
+    privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, {
+      userId: 'u1',
+      visible: true,
+      conversationIds: ['conv-1'],
+      excludeUserIds: [],
+    });
+    await service['presenceVisibilityQueue'];
+
+    expect(emit).toHaveBeenCalledWith('chat:presence', {
+      userId: 'u1',
+      online: true,
+      lastSeenAt: null,
+    });
+    service.onModuleDestroy();
   });
 });

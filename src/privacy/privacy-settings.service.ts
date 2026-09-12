@@ -1,5 +1,5 @@
 import { Prisma } from 'src/generated/prisma';
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { PrivacyErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
@@ -12,6 +12,11 @@ import {
   UpdatePrivacySettingsDto,
 } from './privacy-settings.dto';
 import { isBurnDurationChoice } from 'src/common/burn-durations';
+import {
+  PRESENCE_VISIBILITY_CHANGED,
+  type PresenceVisibilityChangedEvent,
+  privacySettingsEvents,
+} from './privacy-events';
 
 const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   // 0 = 关闭。getSettings 读到没有行时不写库,所以从没进过隐私设置的用户
@@ -36,6 +41,11 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   groupInvitePermission: 'EVERYONE',
   directMessageAutoReplyEnabled: false,
   directMessageAutoReplyText: '',
+  // 在线状态与「正在输入」默认照旧外露 —— 这三项上线前本来就对所有会话成员
+  // 可见,默认收紧等于替存量用户全体改了行为;想藏的人自己关。
+  shareOnlineStatus: true,
+  shareTypingInDirect: true,
+  shareTypingInGroup: true,
 };
 
 type StoredPrivacySettings = PrivacySettingsDto & {
@@ -50,10 +60,13 @@ type ProfilePrivacyField =
   | 'email'
   | 'wechat'
   | 'qq'
-  | 'whatsup';
+  | 'whatsup'
+  | 'lastOnline';
 
 @Injectable()
 export class PrivacySettingsService {
+  private readonly logger = new Logger(PrivacySettingsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly sensitiveWords: SensitiveWordService,
@@ -115,6 +128,7 @@ export class PrivacySettingsService {
   ): Promise<PrivacySettingsDto> {
     this.assertValid(input);
     const update = this.compactUpdate(input);
+    let presenceWasVisible: boolean | null = null;
     const saved = await this.prisma.$transaction(async (tx) => {
       // Call creation, circle admission, friend removal and blocking all make
       // authorization decisions under this same per-user lock. Without it a
@@ -131,13 +145,68 @@ export class PrivacySettingsService {
           ...update,
         } as PrivacySettingsDto);
       }
+      if (input.shareOnlineStatus !== undefined) {
+        // 翻转前的值要在同一把锁里读:事务提交后再去比,读到的可能已是本次写入。
+        presenceWasVisible = (await this.getSettings(userId, tx))
+          .shareOnlineStatus;
+      }
       return tx.userPrivacySetting.upsert({
         where: { userID: userId },
         create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
         update,
       });
     });
-    return this.toDto(saved as StoredPrivacySettings);
+    const updated = this.toDto(saved as StoredPrivacySettings);
+    if (
+      presenceWasVisible !== null &&
+      presenceWasVisible !== updated.shareOnlineStatus
+    ) {
+      await this.announcePresenceVisibility(userId, updated.shareOnlineStatus);
+    }
+    return updated;
+  }
+
+  /**
+   * 「显示在线时间」翻转后通知聊天广播层:关掉要立刻把在线点/「N 分钟前在线」
+   * 从对方界面收回,打开则把此刻的真实状态补发出去。只在事务提交后发,并且
+   * 自己兜住失败 —— 设置已经落库,实时收回是体验增强,不能把成功保存伪装成失败。
+   */
+  private async announcePresenceVisibility(
+    userId: string,
+    visible: boolean,
+  ): Promise<void> {
+    try {
+      const [memberships, blocks] = await Promise.all([
+        this.prisma.chatMember.findMany({
+          where: { userID: userId, leftAt: null },
+          select: { conversationID: true },
+        }),
+        // 与网关上下线广播同一条规则:互相拉黑的人不收(拉黑不动 ChatMember)。
+        this.prisma.block.findMany({
+          where: { OR: [{ blockerID: userId }, { blockedID: userId }] },
+          select: { blockerID: true, blockedID: true },
+        }),
+      ]);
+      const event: PresenceVisibilityChangedEvent = {
+        userId,
+        visible,
+        conversationIds: memberships.map((m) => m.conversationID),
+        excludeUserIds: [
+          ...new Set(
+            blocks.map((b) =>
+              b.blockerID === userId ? b.blockedID : b.blockerID,
+            ),
+          ),
+        ],
+      };
+      privacySettingsEvents.emit(PRESENCE_VISIBILITY_CHANGED, event);
+    } catch (error) {
+      this.logger.warn(
+        `presence visibility event preparation failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async canReceiveStrangerMessage(
@@ -163,6 +232,7 @@ export class PrivacySettingsService {
     if (field === 'wechat') return settings.showWechat;
     if (field === 'qq') return settings.showQQ;
     if (field === 'whatsup') return settings.showWhatsup;
+    if (field === 'lastOnline') return settings.shareOnlineStatus;
     return isFriend;
   }
 
@@ -356,6 +426,15 @@ export class PrivacySettingsService {
       directMessageAutoReplyText:
         settings.directMessageAutoReplyText ??
         DEFAULT_PRIVACY_SETTINGS.directMessageAutoReplyText,
+      shareOnlineStatus:
+        settings.shareOnlineStatus ??
+        DEFAULT_PRIVACY_SETTINGS.shareOnlineStatus,
+      shareTypingInDirect:
+        settings.shareTypingInDirect ??
+        DEFAULT_PRIVACY_SETTINGS.shareTypingInDirect,
+      shareTypingInGroup:
+        settings.shareTypingInGroup ??
+        DEFAULT_PRIVACY_SETTINGS.shareTypingInGroup,
     };
   }
 }

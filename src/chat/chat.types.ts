@@ -277,15 +277,30 @@ export interface ChatGroupEventsPageDto {
   nextCursor: string | null;
 }
 
-/** chat:presence 客户端查询载荷(带 ack:{[userId]: boolean})。 */
+/**
+ * chat:presence 客户端查询载荷。ack 默认回 {[userId]: boolean};带 detail=true
+ * 时回 {[userId]: ChatPresenceDetail}。旧客户端只认 boolean,所以形状由请求方声明。
+ */
 export interface ChatPresenceQuery {
   userIds: string[];
+  detail?: boolean;
+}
+
+/** detail 查询的单人结果。 */
+export interface ChatPresenceDetail {
+  online: boolean;
+  /** 最近在线时刻(ISO);在线时为 null,没记录过也为 null。 */
+  lastSeenAt: string | null;
 }
 
 /** chat:presence 服务端广播:某用户上/下线。 */
 export interface ChatPresenceBroadcast {
   userId: string;
   online: boolean;
+  /** 下线时刻(ISO)。在线广播与旧版服务端不带这一项。 */
+  lastSeenAt?: string | null;
+  /** 对方刚关掉「显示在线时间」:客户端应当忘掉此人的在线/最近在线显示。 */
+  hidden?: boolean;
 }
 
 /** 会话列表项 DTO(REST GET /chat/conversations)。 */

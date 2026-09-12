@@ -43,6 +43,7 @@ import {
 import type {
   ChatAckError,
   GuestChatTokenPayload,
+  ChatPresenceDetail,
   ChatPresenceQuery,
   ChatReadAck,
   ChatReadPayload,
@@ -714,6 +715,8 @@ export class ChatGateway implements OnModuleDestroy {
     let conversationIds: string[] = [];
     // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
     let blockedPeers: string[] = [];
+    // 本人的「显示在线时间」开关:关着就不广播上线(下线那侧现读,见 announceOffline)。
+    let presenceVisible = true;
 
     const failAdmission = (): void => {
       admissionState = 'failed';
@@ -836,7 +839,10 @@ export class ChatGateway implements OnModuleDestroy {
     );
     socket.on(
       CHAT_EVENTS.presence,
-      (payload: ChatPresenceQuery, ack?: AckFn<Record<string, boolean>>) => {
+      (
+        payload: ChatPresenceQuery,
+        ack?: AckFn<Record<string, boolean | ChatPresenceDetail>>,
+      ) => {
         if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
           if (typeof ack === 'function') ack({});
         }
@@ -871,30 +877,16 @@ export class ChatGateway implements OnModuleDestroy {
         reason: boundedDisconnectReason(reason),
         traceId,
       });
-      // 末个 socket 断开 = 用户下线,广播到其会话房(尽力而为)。
-      //
-      // .catch 不是可选的:这是 fire-and-forget,少了它一次 reject 就是未捕获
-      // rejection,Node 直接终止进程 —— 实测 Redis 抖一下 + 有人断开 WebSocket
-      // 就能把整个后端打死。「尽力而为」必须自己兜住失败才算数。
-      void this.broadcast
-        .isUserOnline(userId)
-        .then((online) => {
-          if (online) return;
-          this.observeBroadcast('presence', () =>
-            this.broadcast.emitPresence(
-              conversationIds,
-              { userId, online: false },
-              blockedPeers,
-            ),
-          );
-        })
-        .catch((error: unknown) => {
-          reportOperationalError(error, {
-            component: 'ChatGateway',
-            operation: 'presenceOnDisconnect',
-            kind: 'websocket',
-          });
-        });
+      // 末个 socket 断开 = 用户下线:记一笔最近在线,再广播到其会话房(尽力而为)。
+      // announceOffline 自己兜住全部失败 —— 这是 fire-and-forget,漏一次 reject
+      // 就是未捕获 rejection,Node 直接终止进程(实测 Redis 抖一下 + 有人断开
+      // WebSocket 就能把整个后端打死)。
+      void this.announceOffline(
+        userId,
+        conversationIds,
+        blockedPeers,
+        guestConversationId !== null,
+      );
     });
 
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
@@ -931,9 +923,10 @@ export class ChatGateway implements OnModuleDestroy {
       if (guestConversationId) {
         conversationIds = [guestConversationId];
       } else {
-        [conversationIds, blockedPeers] = await Promise.all([
+        [conversationIds, blockedPeers, presenceVisible] = await Promise.all([
           this.chatService.listConversationIds(userId),
           this.chatService.listBlockedCounterparties(userId),
+          this.chatService.isPresenceVisible(userId),
         ]);
       }
       await socket.join(userRoom(userId));
@@ -967,15 +960,57 @@ export class ChatGateway implements OnModuleDestroy {
     void drainPreReadyQueue();
     // 会话房派生完成 → 挂进跨实例在线集合(推送分流/在线判定的数据源)。
     void this.presence.registerConversations(userId, conversationIds);
+    // 「最近在线」从这一刻起算;访客不是 User 行,没有可记的地方。
+    if (!guestConversationId) void this.chatService.touchLastOnline(userId);
 
     // 上线广播到其会话房(多设备重复连入时会重复广播 online=true,幂等无害)。
-    this.observeBroadcast('presence', () =>
-      this.broadcast.emitPresence(
-        conversationIds,
-        { userId, online: true },
-        blockedPeers,
-      ),
-    );
+    // 关了「显示在线时间」的人不广播 —— 查询侧(filterVisiblePresenceTargets)
+    // 已经把他摘掉了,广播侧再推就是换个通道把同一份信息送出去。
+    if (presenceVisible) {
+      this.observeBroadcast('presence', () =>
+        this.broadcast.emitPresence(
+          conversationIds,
+          { userId, online: true },
+          blockedPeers,
+        ),
+      );
+    }
+  }
+
+  /**
+   * 末个连接断开后的收尾:先落一笔 lastOnline(「N 分钟前在线」的数据源),
+   * 再按本人此刻的「显示在线时间」决定要不要广播下线。开关现读现用而不是连接
+   * 时缓存:多实例下隐私 PATCH 落在哪个实例与这条 socket 无关,缓存会读到旧值。
+   *
+   * 全部失败都收在这里:调用方是 fire-and-forget。
+   */
+  private async announceOffline(
+    userId: string,
+    conversationIds: string[],
+    excludeUserIds: string[],
+    isGuest: boolean,
+  ): Promise<void> {
+    try {
+      if (await this.broadcast.isUserOnline(userId)) return;
+      const lastSeenAt = new Date();
+      if (!isGuest) {
+        await this.chatService.touchLastOnline(userId, lastSeenAt);
+        if (!(await this.chatService.isPresenceVisible(userId))) return;
+      }
+      this.observeBroadcast('presence', () =>
+        this.broadcast.emitPresence(
+          conversationIds,
+          { userId, online: false, lastSeenAt: lastSeenAt.toISOString() },
+          excludeUserIds,
+        ),
+      );
+    } catch (error) {
+      reportOperationalError(error, {
+        component: 'ChatGateway',
+        operation: 'presenceOnDisconnect',
+        kind: 'websocket',
+      });
+    }
   }
 
   /**
@@ -1000,11 +1035,15 @@ export class ChatGateway implements OnModuleDestroy {
     if (sockets.size === 0) this.connectionsByUser.delete(userId);
   }
 
-  /** 在线状态查询:一次最多 50 个 userId,ack 回 {userId: online}。 */
+  /**
+   * 在线状态查询:一次最多 50 个 userId。ack 回 {userId: online};带 detail=true
+   * 的新客户端回 {userId: {online, lastSeenAt}} —— 旧客户端只认 boolean,直接换
+   * 形状会让它们的在线点全灭,所以按请求方声明分两种形状。
+   */
   private async handlePresenceQuery(
     socket: Socket,
     payload: ChatPresenceQuery,
-    ack?: AckFn<Record<string, boolean>>,
+    ack?: AckFn<Record<string, boolean | ChatPresenceDetail>>,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
     const startedAt = process.hrtime.bigint();
@@ -1038,7 +1077,23 @@ export class ChatGateway implements OnModuleDestroy {
           async (id) => [id, await this.broadcast.isUserOnline(id)] as const,
         ),
       );
-      ack(Object.fromEntries(entries));
+      if (payload?.detail !== true) {
+        ack(Object.fromEntries(entries));
+        this.metrics.observeEvent('presence', 'success');
+        return;
+      }
+      // 只查离线那几位的最近在线;在线的人 lastSeenAt 恒为 null。
+      const lastSeen = await this.chatService.getLastSeenAt(
+        entries.filter(([, online]) => !online).map(([id]) => id),
+      );
+      ack(
+        Object.fromEntries(
+          entries.map(([id, online]) => [
+            id,
+            { online, lastSeenAt: online ? null : (lastSeen.get(id) ?? null) },
+          ]),
+        ),
+      );
       this.metrics.observeEvent('presence', 'success');
     } catch (error) {
       this.metrics.observeEvent('presence', 'failure');

@@ -121,6 +121,8 @@ describe('FriendService', () => {
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
     getSettings: jest.fn(),
+    // 好友列表按它抹掉关了「显示在线时间」的人的 lastOnline;默认没人关。
+    getSettingsForUsers: jest.fn().mockResolvedValue(new Map()),
   };
   const creditService = {
     applyDeltaInTransaction: jest.fn(),

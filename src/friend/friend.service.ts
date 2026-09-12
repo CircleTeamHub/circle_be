@@ -863,8 +863,12 @@ export class FriendService {
       where: { id: { in: friendIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const appearances =
-      await this.avatarFrames.resolvePublicAppearances(friendIds);
+    const [appearances, privacy] = await Promise.all([
+      this.avatarFrames.resolvePublicAppearances(friendIds),
+      // 关了「显示在线时间」的好友,列表里的 lastOnline 一并抹掉 —— 资料页与
+      // 聊天 presence 都收口了,好友列表不收口就是第三条信道。
+      this.privacySettings.getSettingsForUsers(friendIds),
+    ]);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueRecords
@@ -876,6 +880,8 @@ export class FriendService {
         const remark = r.userID === userId ? r.remarkA : r.remarkB;
         return {
           ...u,
+          lastOnline:
+            privacy.get(fid)?.shareOnlineStatus === false ? null : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: r.updatedAt,
           remark,
@@ -1461,8 +1467,10 @@ export class FriendService {
       where: { id: { in: friendUserIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const appearances =
-      await this.avatarFrames.resolvePublicAppearances(friendUserIds);
+    const [appearances, privacy] = await Promise.all([
+      this.avatarFrames.resolvePublicAppearances(friendUserIds),
+      this.privacySettings.getSettingsForUsers(friendUserIds),
+    ]);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueLinks
@@ -1473,6 +1481,8 @@ export class FriendService {
         const remark = f.userID === userId ? f.remarkA : f.remarkB;
         return {
           ...u,
+          lastOnline:
+            privacy.get(fid)?.shareOnlineStatus === false ? null : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: f.updatedAt,
           remark,

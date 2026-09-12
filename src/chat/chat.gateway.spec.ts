@@ -41,6 +41,10 @@ describe('ChatGateway', () => {
     filterVisiblePresenceTargets: jest.fn(),
     // 上下线广播要剔掉互相拉黑的人;默认无拉黑关系。
     listBlockedCounterparties: jest.fn().mockResolvedValue([]),
+    // 「显示在线时间」默认开着;最近在线的读写默认空。
+    isPresenceVisible: jest.fn().mockResolvedValue(true),
+    touchLastOnline: jest.fn().mockResolvedValue(undefined),
+    getLastSeenAt: jest.fn().mockResolvedValue(new Map()),
   };
   const broadcast = {
     setServer: jest.fn(),
@@ -111,6 +115,9 @@ describe('ChatGateway', () => {
     jwtService.decode.mockReturnValue({ sub: 'u1' });
     // clearAllMocks 会连实现一起清掉,这里重设默认「无拉黑关系」。
     chatService.listBlockedCounterparties.mockResolvedValue([]);
+    chatService.isPresenceVisible.mockResolvedValue(true);
+    chatService.touchLastOnline.mockResolvedValue(undefined);
+    chatService.getLastSeenAt.mockResolvedValue(new Map());
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -513,6 +520,78 @@ describe('ChatGateway', () => {
     // 发的第一条消息石沉大海」。所以监听必须先于第一个 await 注册。
     // 查询侧已经按拉黑收口了,广播侧不收口等于换个通道把同一份信息免费送出去,
     // 而且是推的、连轮询都不用。拉黑不动 ChatMember,座位一直在。
+    // 关了「显示在线时间」的人:上线不广播,下线也不广播,但最近在线照记
+    // (开关翻回来时要有数可显示)。
+    it('stays silent on connect and disconnect when the user hid presence', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.isPresenceVisible.mockResolvedValue(false);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      expect(broadcast.emitPresence).not.toHaveBeenCalled();
+      expect(chatService.touchLastOnline).toHaveBeenCalledWith('u1');
+
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(chatService.touchLastOnline).toHaveBeenCalledWith(
+        'u1',
+        expect.any(Date),
+      );
+      expect(broadcast.emitPresence).not.toHaveBeenCalled();
+    });
+
+    it('records last-seen and broadcasts offline with that timestamp on the last disconnect', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      broadcast.emitPresence.mockClear();
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const [, payload] = broadcast.emitPresence.mock.calls[0] as [
+        string[],
+        { userId: string; online: boolean; lastSeenAt: string },
+        string[],
+      ];
+      expect(payload).toEqual({
+        userId: 'u1',
+        online: false,
+        lastSeenAt: expect.any(String),
+      });
+      // 广播里的时刻就是落库的那一刻,两边不能各取一次 now。
+      const touched = chatService.touchLastOnline.mock.calls.find(
+        ([, at]) => at instanceof Date,
+      ) as [string, Date];
+      expect(touched[1].toISOString()).toBe(payload.lastSeenAt);
+    });
+
+    // 访客不是 User 行:下线照常广播,但没有 lastOnline 可记。
+    it('never touches lastOnline for temp-chat guests', async () => {
+      const socket = fakeSocket({
+        data: { userId: 'guest-1', guestConversationId: 'temp-1' },
+      });
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(chatService.touchLastOnline).not.toHaveBeenCalled();
+      expect(chatService.isPresenceVisible).not.toHaveBeenCalled();
+      expect(broadcast.emitPresence).toHaveBeenLastCalledWith(
+        ['temp-1'],
+        expect.objectContaining({ userId: 'guest-1', online: false }),
+        [],
+      );
+    });
+
     it('excludes blocked counterparties from the online broadcast', async () => {
       const socket = fakeSocket();
       chatService.listConversationIds.mockResolvedValue(['conv-1']);
@@ -836,6 +915,31 @@ describe('ChatGateway', () => {
       );
       // 不过滤的话,任何登录账号都能拿 UUID 长期轮询陌生人的在线状态。
       expect(ack).toHaveBeenCalledWith({ u2: true });
+    });
+
+    // 旧客户端只认 boolean,形状由请求方的 detail 声明;最近在线只查离线那几位。
+    it('returns online flag plus last-seen when the client asks for detail', async () => {
+      chatService.filterVisiblePresenceTargets.mockResolvedValue(['u2', 'u3']);
+      broadcast.isUserOnline.mockImplementation(
+        async (id: string) => id === 'u2',
+      );
+      chatService.getLastSeenAt.mockResolvedValue(
+        new Map([['u3', '2026-09-11T08:00:00.000Z']]),
+      );
+      const ack = jest.fn();
+
+      await gateway['handlePresenceQuery'](
+        fakeSocket() as never,
+        { userIds: ['u2', 'u3'], detail: true } as never,
+        ack,
+      );
+
+      expect(chatService.getLastSeenAt).toHaveBeenCalledWith(['u3']);
+      expect(ack).toHaveBeenCalledWith({
+        u2: { online: true, lastSeenAt: null },
+        u3: { online: false, lastSeenAt: '2026-09-11T08:00:00.000Z' },
+      });
+      broadcast.isUserOnline.mockResolvedValue(false);
     });
 
     it('answers empty without touching presence when nothing was requested', async () => {

@@ -38,7 +38,7 @@ describe('ChatService', () => {
       update: jest.fn(),
       updateMany: jest.fn(),
     },
-    user: { findUnique: jest.fn(), findMany: jest.fn() },
+    user: { findUnique: jest.fn(), findMany: jest.fn(), updateMany: jest.fn() },
     tempChat: { findUnique: jest.fn(), findMany: jest.fn() },
     tempChatGuest: { findMany: jest.fn() },
     circleMember: { findUnique: jest.fn(), findMany: jest.fn() },
@@ -73,6 +73,8 @@ describe('ChatService', () => {
     canReceiveStrangerMessage: jest.fn().mockResolvedValue(true),
     // 默认关掉全局阅后即焚,让既有用例不受时间窗口影响;需要时逐例覆盖。
     getSettings: jest.fn().mockResolvedValue({ messageSelfDestructSec: 0 }),
+    // 在线状态可见范围要按对方的「显示在线时间」再筛一遍;默认没人关。
+    getSettingsForUsers: jest.fn().mockResolvedValue(new Map()),
   };
   const broadcast = {
     joinUserToConversation: jest.fn().mockResolvedValue(undefined),
@@ -1329,6 +1331,34 @@ describe('ChatService', () => {
       ).resolves.toEqual(['ok']);
     });
 
+    // 关了「显示在线时间」的人在查询侧摘掉;广播侧(网关上下线 / 隐私翻转事件)
+    // 是同一条规则的另一半,少一半就是另一条免费信道。
+    it('hides users who turned off shareOnlineStatus even when a seat is shared', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            conversationID: 'conv-1',
+            conversation: { clearedBeforeHeight: 0 },
+          },
+        ])
+        .mockResolvedValueOnce([{ userID: 'hidden' }, { userID: 'shown' }]);
+      prisma.block.findMany.mockResolvedValue([]);
+      privacySettings.getSettingsForUsers.mockResolvedValueOnce(
+        new Map([
+          ['hidden', { shareOnlineStatus: false }],
+          ['shown', { shareOnlineStatus: true }],
+        ]),
+      );
+
+      await expect(
+        service.filterVisiblePresenceTargets('u1', ['hidden', 'shown']),
+      ).resolves.toEqual(['shown']);
+      expect(privacySettings.getSettingsForUsers).toHaveBeenCalledWith([
+        'hidden',
+        'shown',
+      ]);
+    });
+
     it('always allows the requester itself and short-circuits', async () => {
       await expect(
         service.filterVisiblePresenceTargets('u1', ['u1']),
@@ -1341,6 +1371,54 @@ describe('ChatService', () => {
       await expect(
         service.filterVisiblePresenceTargets('u1', ['u2']),
       ).resolves.toEqual([]);
+    });
+  });
+
+  describe('last seen', () => {
+    it('reads lastOnline as ISO strings and reports never-seen users as null', async () => {
+      prisma.user.findMany.mockResolvedValueOnce([
+        { id: 'u2', lastOnline: new Date('2026-09-11T08:00:00.000Z') },
+        { id: 'u3', lastOnline: null },
+      ]);
+
+      const seen = await service.getLastSeenAt(['u2', 'u3']);
+
+      expect([...seen.entries()]).toEqual([
+        ['u2', '2026-09-11T08:00:00.000Z'],
+        ['u3', null],
+      ]);
+      expect(prisma.user.findMany).toHaveBeenCalledWith({
+        where: { id: { in: ['u2', 'u3'] } },
+        select: { id: true, lastOnline: true },
+      });
+    });
+
+    it('skips the query for an empty batch', async () => {
+      await expect(service.getLastSeenAt([])).resolves.toEqual(new Map());
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+    });
+
+    // 访客与已注销账号没有 User 行:update 会抛 P2025,updateMany 静默 0 行。
+    it('touches lastOnline with updateMany and swallows failures', async () => {
+      const at = new Date('2026-09-11T08:00:00.000Z');
+      prisma.user.updateMany.mockResolvedValueOnce({ count: 1 });
+      await service.touchLastOnline('u1', at);
+      expect(prisma.user.updateMany).toHaveBeenCalledWith({
+        where: { id: 'u1' },
+        data: { lastOnline: at },
+      });
+
+      prisma.user.updateMany.mockRejectedValueOnce(new Error('db down'));
+      await expect(service.touchLastOnline('u1')).resolves.toBeUndefined();
+    });
+
+    it('reads the presence switch with the default open', async () => {
+      privacySettings.getSettings.mockResolvedValueOnce({
+        shareOnlineStatus: false,
+      });
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(false);
+      privacySettings.getSettings.mockResolvedValueOnce({});
+      await expect(service.isPresenceVisible('u1')).resolves.toBe(true);
     });
   });
 

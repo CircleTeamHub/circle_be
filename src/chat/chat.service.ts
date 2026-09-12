@@ -819,7 +819,64 @@ export class ChatService {
     for (const row of shared) {
       if (!blocked.has(row.userID)) allowed.add(row.userID);
     }
-    return [...allowed];
+    return this.dropPresenceOptOuts(userId, [...allowed]);
+  }
+
+  /**
+   * 关了「显示在线时间」的人从可见集里摘掉(本人除外)。查询侧与广播侧
+   * (网关上下线 / 隐私翻转事件)是同一条规则的两半,少一半就是另一条免费信道。
+   */
+  private async dropPresenceOptOuts(
+    viewerId: string,
+    candidates: string[],
+  ): Promise<string[]> {
+    const others = candidates.filter((id) => id !== viewerId);
+    if (others.length === 0) return candidates;
+    const settings = await this.privacySettings.getSettingsForUsers(others);
+    return candidates.filter(
+      (id) => id === viewerId || settings.get(id)?.shareOnlineStatus !== false,
+    );
+  }
+
+  /** 该用户是否允许别人看到自己的在线状态(上下线广播前的门禁)。 */
+  async isPresenceVisible(userId: string): Promise<boolean> {
+    const settings = await this.privacySettings.getSettings(userId);
+    return settings.shareOnlineStatus !== false;
+  }
+
+  /** 一批用户的最近在线时刻(ISO);没记录过的为 null。 */
+  async getLastSeenAt(userIds: string[]): Promise<Map<string, string | null>> {
+    const out = new Map<string, string | null>();
+    if (userIds.length === 0) return out;
+    const rows = await this.prisma.user.findMany({
+      where: { id: { in: userIds } },
+      select: { id: true, lastOnline: true },
+    });
+    for (const row of rows) {
+      out.set(row.id, row.lastOnline ? row.lastOnline.toISOString() : null);
+    }
+    return out;
+  }
+
+  /**
+   * 记一笔最近在线:连接就绪与末个连接断开时各打一次。此前 lastOnline 只在
+   * 登录 / 刷新 token 时更新,拿来算「N 分钟前在线」会差出几天。尽力而为,
+   * 失败只记日志 —— 它不在任何请求的关键路径上,调用方一律 void 掉。
+   */
+  async touchLastOnline(userId: string, at = new Date()): Promise<void> {
+    try {
+      // updateMany:访客与已注销账号没有 User 行,update 会抛 P2025。
+      await this.prisma.user.updateMany({
+        where: { id: userId },
+        data: { lastOnline: at },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `lastOnline touch failed for ${userId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
