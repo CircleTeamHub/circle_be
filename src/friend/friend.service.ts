@@ -29,7 +29,6 @@ import {
   FriendProfileDto,
   FriendActivityDto,
   FriendActivityUnreadCountDto,
-  FriendRequestDto,
   FriendSettingsDto,
   FriendStatusDto,
   ReportFriendDto,
@@ -38,7 +37,6 @@ import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 // Members (paid) get 5 000, regular users get 1 000.
-const FRIEND_REQUEST_PAGE_SIZE = 500;
 const BLOCKED_PAGE_SIZE = 1000;
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
@@ -970,67 +968,6 @@ export class FriendService {
     };
   }
 
-  async listIncomingRequests(
-    userId: string,
-    page = 1,
-  ): Promise<FriendRequestDto[]> {
-    // round 2 review：500 条护栏之外的旧请求此前完全不可达（接受/拒绝都需要
-    // 列表里的 requestId）。加 page 参数（默认第 1 页，行为不变）让公开账号
-    // 被刷爆时也能翻到并处理更早的请求。
-    const records = await this.prisma.friend.findMany({
-      where: { friendID: userId, state: FriendState.PENDING },
-      orderBy: { createdAt: 'desc' },
-      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
-      take: FRIEND_REQUEST_PAGE_SIZE,
-    });
-
-    const senderIds = records.map((r) => r.userID);
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: senderIds }, status: 'ACTIVE' },
-      select: MINI_USER_SELECT,
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    return records
-      .filter((r) => userMap.has(r.userID))
-      .map((r) => ({
-        id: r.id,
-        state: r.state,
-        createdAt: r.createdAt,
-        message: r.message,
-        user: userMap.get(r.userID)!,
-      }));
-  }
-
-  async listOutgoingRequests(
-    userId: string,
-    page = 1,
-  ): Promise<FriendRequestDto[]> {
-    const records = await this.prisma.friend.findMany({
-      where: { userID: userId, state: FriendState.PENDING },
-      orderBy: { createdAt: 'desc' },
-      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
-      take: FRIEND_REQUEST_PAGE_SIZE,
-    });
-
-    const targetIds = records.map((r) => r.friendID);
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: targetIds }, status: 'ACTIVE' },
-      select: MINI_USER_SELECT,
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    return records
-      .filter((r) => userMap.has(r.friendID))
-      .map((r) => ({
-        id: r.id,
-        state: r.state,
-        createdAt: r.createdAt,
-        message: r.message,
-        user: userMap.get(r.friendID)!,
-      }));
-  }
-
   async listActivities(userId: string): Promise<FriendActivityDto[]> {
     await this.backfillLegacyActivitiesForViewer(userId);
 
@@ -1044,27 +981,6 @@ export class FriendService {
     });
 
     return activities.map((activity) => this.toFriendActivityDto(activity));
-  }
-
-  /**
-   * 一键全部已读（review 修复）：listActivities 有 200 条护栏后，更老的未读
-   * 无法逐条到达 —— 未读数会永远不归零。批量置读是唯一不需要分页的出口。
-   */
-  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
-    // review 修复（round 2）：先补历史 —— 老账号的活动行由 list/unread-count
-    // 惰性回填；用户第一步就点全部已读的话，不回填等于 0 行被置读，下一次
-    // unread-count 又把旧请求回填成未读，计数永远清不掉。
-    await this.backfillLegacyActivitiesForViewer(userId);
-    const result = await this.prisma.friendActivity.updateMany({
-      where: { viewerId: userId, readAt: null },
-      data: { readAt: new Date() },
-    });
-    // review 修复（round 2）：与 markActivityRead 一致地广播未读数变化，
-    // 同账号其它在线设备的角标即时归零。
-    if (result.count > 0) {
-      await this.broadcastFriendUnreadUpdates([userId]);
-    }
-    return { count: result.count };
   }
 
   async getUnreadActivityCount(

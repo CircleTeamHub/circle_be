@@ -204,19 +204,6 @@ export class FriendSettingsDto {
   @ApiProperty({ enum: FRIEND_PERMISSIONS }) permission: FriendPermission;
 }
 
-export class FriendRequestDto {
-  @ApiProperty() id: string;
-  @ApiProperty() state: string;
-  @ApiProperty() createdAt: Date;
-  @ApiPropertyOptional() message: string | null;
-  @ApiProperty() user: {
-    id: string;
-    accountId: string;
-    nickname: string;
-    avatarUrl: string | null;
-  };
-}
-
 export class FriendStatusDto {
   @ApiProperty({
     enum: ['NONE', 'PENDING_SENT', 'PENDING_RECEIVED', 'ACCEPTED', 'BLOCKED'],

@@ -1,11 +1,13 @@
 import {
   Body,
   Controller,
+  DefaultValuePipe,
   Delete,
   Get,
   HttpCode,
   HttpStatus,
   Param,
+  ParseIntPipe,
   ParseUUIDPipe,
   Patch,
   Post,
@@ -23,6 +25,7 @@ import {
 import { FriendState } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
+import { ClampPagePipe } from 'src/common/pagination';
 import {
   AssignTagDto,
   BlockUserDto,
@@ -31,7 +34,6 @@ import {
   FriendSettingsDto,
   CreateFriendTagDto,
   FriendProfileDto,
-  FriendRequestDto,
   ReportFriendDto,
   FriendStatusDto,
   SendFriendRequestDto,
@@ -39,17 +41,6 @@ import {
   SetRemarkDto,
 } from './dto/friend.dto';
 import { FriendService } from './friend.service';
-
-/**
- * 查询参数页码：非法/缺省回落默认值，恒 ≥1 且封顶（round 3 review：
- * 无上界的 page 会被拼成天文数字 offset，一次手滑就是全表偏移扫描）。
- */
-const MAX_PAGE = 10_000;
-function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(raw ?? '', 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
-  return Math.min(parsed, MAX_PAGE);
-}
 
 @ApiTags('Friend')
 @ApiBearerAuth()
@@ -86,28 +77,6 @@ export class FriendController {
     @Req() req: RequestWithUser,
   ): Promise<void> {
     return this.friendService.removeFriend(req.user.userId, friendUserId);
-  }
-
-  @Post(':friendUserId/blacklist')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Add a friend to the blacklist' })
-  @ApiNoContentResponse()
-  blacklistFriend(
-    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: RequestWithUser,
-  ): Promise<void> {
-    return this.friendService.blockUser(req.user.userId, friendUserId);
-  }
-
-  @Delete(':friendUserId/blacklist')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Remove a friend from the blacklist' })
-  @ApiNoContentResponse()
-  removeFriendFromBlacklist(
-    @Param('friendUserId', ParseUUIDPipe) friendUserId: string,
-    @Req() req: RequestWithUser,
-  ): Promise<void> {
-    return this.friendService.unblockUser(req.user.userId, friendUserId);
   }
 
   @Post(':friendUserId/report')
@@ -163,32 +132,6 @@ export class FriendController {
         qrToken: dto.qrToken,
         viaConversationId: dto.viaConversationId,
       },
-    );
-  }
-
-  @Get('requests/incoming')
-  @ApiOperation({ summary: 'Incoming friend requests (500/page)' })
-  @ApiOkResponse({ type: [FriendRequestDto] })
-  listIncoming(
-    @Req() req: RequestWithUser,
-    @Query('page') page?: string,
-  ): Promise<FriendRequestDto[]> {
-    return this.friendService.listIncomingRequests(
-      req.user.userId,
-      parsePositiveInt(page, 1),
-    );
-  }
-
-  @Get('requests/outgoing')
-  @ApiOperation({ summary: 'Outgoing friend requests (500/page)' })
-  @ApiOkResponse({ type: [FriendRequestDto] })
-  listOutgoing(
-    @Req() req: RequestWithUser,
-    @Query('page') page?: string,
-  ): Promise<FriendRequestDto[]> {
-    return this.friendService.listOutgoingRequests(
-      req.user.userId,
-      parsePositiveInt(page, 1),
     );
   }
 
@@ -282,13 +225,6 @@ export class FriendController {
     @Req() req: RequestWithUser,
   ): Promise<FriendActivityDto> {
     return this.friendService.getActivity(req.user.userId, activityId);
-  }
-
-  // 固定路径先于 :activityId 参数路由声明。
-  @Post('activities/read-all')
-  @ApiOperation({ summary: 'Mark ALL friend activities as read' })
-  markAllActivitiesRead(@Req() req: RequestWithUser) {
-    return this.friendService.markAllActivitiesRead(req.user.userId);
   }
 
   @Post('activities/:activityId/read')
@@ -407,10 +343,12 @@ export class FriendController {
 
   @Get('blocked')
   @ApiOperation({ summary: 'My blocked users list' })
-  listBlocked(@Req() req: RequestWithUser, @Query('page') page?: string) {
-    return this.friendService.listBlocked(
-      req.user.userId,
-      parsePositiveInt(page, 1),
-    );
+  listBlocked(
+    @Req() req: RequestWithUser,
+    // 与 plaza 的 me/posts 同一口径:缺省第 1 页,越界夹到 src/common/pagination 的 MAX_PAGE。
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe, ClampPagePipe)
+    page: number,
+  ) {
+    return this.friendService.listBlocked(req.user.userId, page);
   }
 }

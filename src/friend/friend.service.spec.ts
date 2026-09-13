@@ -1628,32 +1628,6 @@ describe('FriendService', () => {
     });
   });
 
-  it('supports the restful blacklist controller route', async () => {
-    const serviceMock = {
-      blockUser: jest.fn().mockResolvedValue(undefined),
-    };
-    const controller = new FriendController(serviceMock as any);
-
-    await controller.blacklistFriend('user-2', {
-      user: { userId: 'user-1' },
-    } as any);
-
-    expect(serviceMock.blockUser).toHaveBeenCalledWith('user-1', 'user-2');
-  });
-
-  it('supports the restful unblacklist controller route', async () => {
-    const serviceMock = {
-      unblockUser: jest.fn().mockResolvedValue(undefined),
-    };
-    const controller = new FriendController(serviceMock as any);
-
-    await controller.removeFriendFromBlacklist('user-2', {
-      user: { userId: 'user-1' },
-    } as any);
-
-    expect(serviceMock.unblockUser).toHaveBeenCalledWith('user-1', 'user-2');
-  });
-
   it('marks a pending request as withdrawn and notifies the recipient', async () => {
     prisma.friend.findUnique.mockResolvedValue({
       id: 'request-1',

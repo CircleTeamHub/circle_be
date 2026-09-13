@@ -276,8 +276,15 @@ describe('route allowlist consistency', () => {
 // 已删除的路由不能留在白名单里:否则一个永远 404 的路径占着常驻标签,也掩盖了
 // 「这条路由已经没了」。命中它们应当和其它未知路由一样计入未知路由预算。
 describe('removed routes stay out of the allowlists', () => {
-  const removedStaticRoutes: string[] = [];
-  const removedTemplates = ['/api/v1/circle-plaza/posts/:id/signups'];
+  const removedStaticRoutes: string[] = [
+    '/api/v1/friend/activities/read-all',
+    '/api/v1/friend/requests/incoming',
+    '/api/v1/friend/requests/outgoing',
+  ];
+  const removedTemplates = [
+    '/api/v1/circle-plaza/posts/:id/signups',
+    '/api/v1/friend/:friendUserId/blacklist',
+  ];
 
   it('has no static entry or template for a deleted route', () => {
     for (const route of removedStaticRoutes) {

@@ -454,23 +454,6 @@ await api.patch(`/user/${userId}`, { avatarUrl: fileUrl });
 }
 ```
 
-#### FriendRequest 对象（申请条目）
-
-```json
-{
-  "id": "uuid",
-  "state": "PENDING",
-  "createdAt": "2026-04-09T00:00:00.000Z",
-  "message": "我是张三，加个好友吧",
-  "user": {
-    "id": "uuid",
-    "accountId": "ab12cd",
-    "nickname": "张三",
-    "avatarUrl": "http://10.0.0.195:9000/circle/avatars/xxx.jpg"
-  }
-}
-```
-
 #### FriendStatus 对象（关系状态）
 
 ```json
@@ -576,31 +559,13 @@ POST /friend/requests
 
 ---
 
-### 收到的好友申请
-
-```
-GET /friend/requests/incoming
-```
-
-**Response 200：** `FriendRequest[]`
-
----
-
-### 发出的好友申请
-
-```
-GET /friend/requests/outgoing
-```
-
-**Response 200：** `FriendRequest[]`
-
----
-
 ### 好友动态列表
 
 ```
 GET /friend/activities
 ```
+
+> 「新朋友」收件箱的唯一数据源：收到的申请（`REQUEST_RECEIVED`）、我发出的申请（`REQUEST_SENT`）以及通过/拒绝/撤回的结果都在这条动态流里。`requestState` 为 `PENDING` 时用 `requestId` 调接受 / 拒绝 / 撤回。旧的 `GET /friend/requests/incoming`、`GET /friend/requests/outgoing` 已删除。
 
 **Response 200：**
 ```json
@@ -850,9 +815,9 @@ GET /friend/blocked
   → POST /friend/requests              # 发送申请
   ← 204
 
-用户 B 收到通知，查看申请列表
-  → GET /friend/requests/incoming
-  ← [{ id: "req_uuid", user: { ... } }]
+用户 B 收到通知，打开「新朋友」动态流
+  → GET /friend/activities
+  ← [{ type: "REQUEST_RECEIVED", requestId: "req_uuid", requestState: "PENDING", counterparty: { ... } }]
 
 用户 B 点击"接受"
   → POST /friend/requests/:req_uuid/accept
