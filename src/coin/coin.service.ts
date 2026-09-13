@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -19,6 +20,18 @@ import {
 import { CoinTransactionDto, WalletDto } from './dto/coin.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
+
+// 幂等快路径 / 撞键回查时用来比对指纹的列。
+const IDEMPOTENT_GIFT_SELECT = {
+  senderID: true,
+  recipientID: true,
+  amount: true,
+} as const;
+type IdempotentGiftFingerprint = {
+  senderID: string;
+  recipientID: string;
+  amount: number;
+};
 
 // Max coins a user can send in a single gift
 const GIFT_MAX_SINGLE = 10_000;
@@ -56,6 +69,17 @@ export class CoinService {
       where: { userID: userId },
       orderBy: { createdAt: 'desc' },
       take: 50,
+      // 只回 CoinTransactionDto 声明的列：idempotencyKey 带着内部格式
+      // （fancy-number:client:<userId>:<key> / 充值单 id），不是用户契约的一部分。
+      select: {
+        id: true,
+        type: true,
+        amount: true,
+        balance: true,
+        note: true,
+        relatedID: true,
+        createdAt: true,
+      },
     });
   }
 
@@ -106,6 +130,28 @@ export class CoinService {
 
   // ─── Gift ─────────────────────────────────────────────────────────────────────
 
+  /**
+   * 同一个 Idempotency-Key 命中的那笔礼物必须与本次请求同发送者、同收款人、同金额，
+   * 否则静默返回会把一笔没发生的转账报成成功（客户端 bug 或别人的 key）。
+   */
+  private assertIdempotentReplayMatches(
+    prior: IdempotentGiftFingerprint,
+    senderId: string,
+    recipientId: string,
+    amount: number,
+  ): void {
+    if (
+      prior.senderID !== senderId ||
+      prior.recipientID !== recipientId ||
+      prior.amount !== amount
+    ) {
+      throw new ConflictException({
+        message: 'Idempotency-Key has already been used for a different gift',
+        errorCode: CoinErrorCode.IdempotencyConflict,
+      });
+    }
+  }
+
   async sendGift(
     senderId: string,
     recipientId: string,
@@ -154,13 +200,22 @@ export class CoinService {
       });
     }
 
-    // Idempotency fast path: if this key was already used, the gift already
-    // happened — return success without charging again.
+    // Idempotency fast path: if this key was already used for THIS gift, it
+    // already happened — return success without charging again. The key is
+    // globally unique but not prefixed by sender (stored format unchanged), so
+    // a hit must be fingerprint-checked: another sender's key, or the same key
+    // with a different recipient/amount, must not be reported as success.
     const priorGift = await this.prisma.coinGift.findUnique({
       where: { idempotencyKey },
-      select: { id: true },
+      select: IDEMPOTENT_GIFT_SELECT,
     });
     if (priorGift) {
+      this.assertIdempotentReplayMatches(
+        priorGift,
+        senderId,
+        recipientId,
+        amount,
+      );
       this.logger.log(`Duplicate gift suppressed (idempotencyKey reused)`);
       return;
     }
@@ -260,9 +315,22 @@ export class CoinService {
       });
     } catch (error) {
       // Lost the race against a concurrent request reusing the same key —
-      // the unique index rejected the second coinGift insert. The other
-      // request already charged; treat this one as an idempotent success.
+      // the unique index rejected the second coinGift insert. Only an
+      // idempotent success if the winner is the same gift; a key collision
+      // from another sender / different params is a conflict, and a P2002
+      // that did not come from this key is somebody else's constraint.
       if (prismaErrorCode(error) === 'P2002') {
+        const winner = await this.prisma.coinGift.findUnique({
+          where: { idempotencyKey },
+          select: IDEMPOTENT_GIFT_SELECT,
+        });
+        if (!winner) throw error;
+        this.assertIdempotentReplayMatches(
+          winner,
+          senderId,
+          recipientId,
+          amount,
+        );
         this.logger.log(
           `Concurrent duplicate gift suppressed (idempotencyKey)`,
         );

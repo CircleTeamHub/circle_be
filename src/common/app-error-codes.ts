@@ -34,6 +34,8 @@ export const CoinErrorCode = {
   DailyLimit: 'COIN_DAILY_LIMIT',
   RecipientNotFound: 'COIN_RECIPIENT_NOT_FOUND',
   UserNotFound: 'COIN_USER_NOT_FOUND',
+  /** 同一个 Idempotency-Key 被换了收款人/金额，或本来就属于别的发送者。 */
+  IdempotencyConflict: 'COIN_IDEMPOTENCY_CONFLICT',
 } as const;
 
 export const MembershipErrorCode = {

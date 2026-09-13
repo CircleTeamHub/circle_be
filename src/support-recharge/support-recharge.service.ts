@@ -367,7 +367,12 @@ export class SupportRechargeService {
       clientMessageId: `sr-${order.id}-rejected`,
       push: true,
     });
-    return order;
+    // 与 list / approve 同一形状：剥掉私有的 evidenceObjectKey，换成预签名 URL。
+    const selected = await this.prisma.supportRechargeOrder.findUniqueOrThrow({
+      where: { id: order.id },
+      select: ORDER_SELECT,
+    });
+    return (await this.presentOrders([selected]))[0];
   }
 
   private canonicalizeFulfillment(
@@ -513,7 +518,10 @@ export class SupportRechargeService {
           userId: order.userID,
           amount: input.coinAmount!,
           type: 'RECHARGE',
-          note: input.note ?? `充值申请 ${order.orderNo}`,
+          // 流水 note 会随 GET /coin/transactions 回给用户；管理台的「审核备注」
+          // 是内部判断，只进下面的审计 metadata（与 MEMBERSHIP 分支只写
+          // MembershipGrant.note 的口径一致）。
+          note: `充值申请 ${order.orderNo}`,
           relatedId: order.id,
           idempotencyKey: order.id,
         });
@@ -530,7 +538,7 @@ export class SupportRechargeService {
         targetId: approved.id,
         before: this.orderAudit(current),
         after: this.orderAudit(approved),
-        metadata: { fulfillmentType: 'COIN' },
+        metadata: { fulfillmentType: 'COIN', note: input.note ?? null },
       });
       await tx.supportRechargeConversationState.updateMany({
         where: { conversationID: order.conversationID },

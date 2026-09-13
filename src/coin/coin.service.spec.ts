@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   NotFoundException,
 } from '@nestjs/common';
@@ -12,6 +13,12 @@ import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 
 const IDEM = 'idem-key-1';
+// 幂等快路径命中时 select 出来的指纹;与 arrangeHealthyGift 那笔转账一致。
+const PRIOR_GIFT = {
+  senderID: 'sender-1',
+  recipientID: 'recipient-1',
+  amount: 100,
+};
 
 // 卡片签发已从请求路径脱钩(review P1:不能让聊天投递挡住钱的响应),
 // 所以断言之前要把这一拍排空。
@@ -250,7 +257,7 @@ describe('CoinService', () => {
 
   it('is idempotent: a reused idempotencyKey does not charge again', async () => {
     arrangeHealthyGift();
-    prisma.coinGift.findUnique.mockResolvedValue({ id: 'gift-prior' });
+    prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
 
     await service.sendGift('sender-1', 'recipient-1', 100, IDEM, 'retry');
 
@@ -425,12 +432,184 @@ describe('CoinService', () => {
     it('does not re-issue a card for a suppressed duplicate gift', async () => {
       // 幂等快路径:这一枚 key 的卡片由原始那次请求(或 cron)负责。
       arrangeHealthyGift();
-      prisma.coinGift.findUnique.mockResolvedValue({ id: 'gift-prior' });
+      prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
 
       await service.sendGift('sender-1', 'recipient-1', 100, IDEM);
       await flush();
 
       expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  // ─── 幂等键归属校验 ───────────────────────────────────────────────────────
+  //
+  // 键全局唯一但不带 userId 前缀(存量格式不动),所以「命中」不等于「重试」:
+  // 别人的 key、同 key 换收款人/金额,静默返回会把一笔没发生的转账报成成功。
+  describe('idempotency key ownership', () => {
+    const select = { senderID: true, recipientID: true, amount: true };
+    const p2002 = Object.assign(new Error('unique violation'), {
+      code: 'P2002',
+    });
+
+    async function expectIdempotencyConflict(promise: Promise<unknown>) {
+      const error = await promise.then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(error).toBeInstanceOf(ConflictException);
+      expect((error as ConflictException).getResponse()).toMatchObject({
+        errorCode: 'COIN_IDEMPOTENCY_CONFLICT',
+      });
+    }
+
+    it('replays silently when the prior gift matches sender, recipient and amount', async () => {
+      arrangeHealthyGift();
+      prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
+
+      await expect(
+        service.sendGift('sender-1', 'recipient-1', 100, IDEM),
+      ).resolves.toBeUndefined();
+
+      expect(prisma.coinGift.findUnique).toHaveBeenCalledWith({
+        where: { idempotencyKey: IDEM },
+        select,
+      });
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects the same key reused for a different recipient', async () => {
+      arrangeHealthyGift();
+      prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
+
+      await expectIdempotencyConflict(
+        service.sendGift('sender-1', 'recipient-2', 100, IDEM),
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects the same key reused for a different amount', async () => {
+      arrangeHealthyGift();
+      prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
+
+      await expectIdempotencyConflict(
+        service.sendGift('sender-1', 'recipient-1', 250, IDEM),
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('rejects a key that belongs to another sender', async () => {
+      arrangeHealthyGift();
+      prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
+
+      await expectIdempotencyConflict(
+        service.sendGift('sender-2', 'recipient-1', 100, IDEM),
+      );
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('treats a lost P2002 race as a replay when the winner matches', async () => {
+      arrangeHealthyGift();
+      // 插入撞唯一键的那一刻,赢家的行已经在库里了。
+      prisma.$transaction.mockImplementationOnce(async () => {
+        prisma.coinGift.findUnique.mockResolvedValue(PRIOR_GIFT);
+        throw p2002;
+      });
+
+      await expect(
+        service.sendGift('sender-1', 'recipient-1', 100, IDEM),
+      ).resolves.toBeUndefined();
+
+      // 快路径一次 + 撞键后回查一次
+      expect(prisma.coinGift.findUnique).toHaveBeenCalledTimes(2);
+      expect(prisma.coinGift.findUnique).toHaveBeenLastCalledWith({
+        where: { idempotencyKey: IDEM },
+        select,
+      });
+      await flush();
+      expect(chatMessages.insertServerMessage).not.toHaveBeenCalled();
+    });
+
+    it('rejects a lost P2002 race whose winner has different params', async () => {
+      arrangeHealthyGift();
+      prisma.$transaction.mockImplementationOnce(async () => {
+        prisma.coinGift.findUnique.mockResolvedValue({
+          ...PRIOR_GIFT,
+          recipientID: 'recipient-9',
+        });
+        throw p2002;
+      });
+
+      await expectIdempotencyConflict(
+        service.sendGift('sender-1', 'recipient-1', 100, IDEM),
+      );
+    });
+
+    it('rethrows a P2002 that did not come from this idempotency key', async () => {
+      // 唯一冲突却查不到这把 key 的行:撞的是别的约束,不能报成幂等成功。
+      arrangeHealthyGift();
+      prisma.$transaction.mockRejectedValueOnce(p2002);
+
+      await expect(
+        service.sendGift('sender-1', 'recipient-1', 100, IDEM),
+      ).rejects.toBe(p2002);
+    });
+  });
+
+  describe('getTransactions', () => {
+    it('selects only the user-facing ledger columns', async () => {
+      const stored = {
+        id: 'tx-1',
+        userID: 'user-1',
+        type: 'GIFT_SENT',
+        amount: -100,
+        balance: 900,
+        note: null,
+        relatedID: 'gift-1',
+        idempotencyKey: 'client:user-1:abc',
+        createdAt: new Date('2026-09-13T00:00:00.000Z'),
+      };
+      // Prisma 没给 select 就返回全部标量列;镜像这一点,让断言落在查询本身上。
+      const project = (select?: Record<string, boolean>) =>
+        select
+          ? Object.keys(stored)
+              .filter((key) => select[key])
+              .reduce((acc, key) => ({ ...acc, [key]: stored[key] }), {})
+          : stored;
+      prisma.coinTransaction.findMany.mockImplementation(
+        async ({ select }: { select?: Record<string, boolean> }) => [
+          project(select),
+        ],
+      );
+
+      const rows = await service.getTransactions('user-1');
+
+      expect(prisma.coinTransaction.findMany).toHaveBeenCalledWith({
+        where: { userID: 'user-1' },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+        select: {
+          id: true,
+          type: true,
+          amount: true,
+          balance: true,
+          note: true,
+          relatedID: true,
+          createdAt: true,
+        },
+      });
+      expect(rows).toEqual([
+        {
+          id: 'tx-1',
+          type: 'GIFT_SENT',
+          amount: -100,
+          balance: 900,
+          note: null,
+          relatedID: 'gift-1',
+          createdAt: stored.createdAt,
+        },
+      ]);
+      expect(rows[0]).not.toHaveProperty('idempotencyKey');
+      expect(rows[0]).not.toHaveProperty('userID');
     });
   });
 });

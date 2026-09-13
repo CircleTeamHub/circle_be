@@ -220,3 +220,179 @@ describe('SupportRechargeService order pagination', () => {
     );
   });
 });
+
+// 管理台把 ApproveSupportRechargeOrderDto.note 标成「审核备注」，MEMBERSHIP 分支只把它
+// 写进 MembershipGrant.note（仅管理员可见）；COIN 分支却曾原样写进用户可读的
+// CoinTransaction.note（GET /coin/transactions）。流水固定用单号，备注只进审计。
+describe('SupportRechargeService coin fulfillment note', () => {
+  const operator = { userId: 'admin-1', accountId: 'admin' };
+  const input = {
+    fulfillmentType: 'COIN' as const,
+    paymentTransactionId: 'pay-1',
+    coinAmount: 100,
+    note: 'internal remark',
+  };
+  const order = {
+    id: 'order-1',
+    orderNo: 'SR-20260913-0001',
+    conversationID: 'conv-1',
+    userID: 'user-1',
+    agentUserID: 'agent-1',
+    requestKind: 'COIN',
+    status: 'PROCESSING',
+    evidenceMessageID: null,
+    evidenceObjectKey: null,
+    submittedAt: new Date('2026-09-13T00:00:00.000Z'),
+    fulfillmentType: 'COIN',
+    fulfillmentPayload: { ...input },
+    paymentTransactionID: 'pay-1',
+    reviewedBy: 'admin-1',
+    reviewedAt: null,
+    rejectionReason: null,
+    createdAt: new Date('2026-09-13T00:00:00.000Z'),
+    updatedAt: new Date('2026-09-13T00:00:00.000Z'),
+  };
+
+  it('keeps the admin review note out of the user-visible ledger and records it in the audit trail', async () => {
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      supportRechargeOrder: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue(order),
+        update: jest.fn().mockResolvedValue({
+          ...order,
+          status: 'APPROVED',
+          reviewedAt: new Date('2026-09-13T01:00:00.000Z'),
+        }),
+      },
+      coinTransaction: { findUnique: jest.fn().mockResolvedValue(null) },
+      supportRechargeConversationState: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    const prisma = { $transaction: jest.fn((callback) => callback(tx)) };
+    const audit = { recordInTransaction: jest.fn() };
+    const coins = { creditInTransaction: jest.fn().mockResolvedValue(1100) };
+    const service = new SupportRechargeService(
+      prisma as never,
+      audit as never,
+      {} as never,
+      {} as never,
+      coins as never,
+      {} as never,
+      {} as never,
+    );
+
+    await (service as any).fulfillCoins(operator, order, input);
+
+    expect(coins.creditInTransaction).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        userId: 'user-1',
+        amount: 100,
+        type: 'RECHARGE',
+        note: '充值申请 SR-20260913-0001',
+        idempotencyKey: 'order-1',
+      }),
+    );
+    expect(audit.recordInTransaction).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        action: 'support.recharge.order.approve',
+        targetId: 'order-1',
+        metadata: { fulfillmentType: 'COIN', note: 'internal remark' },
+      }),
+    );
+  });
+});
+
+// list / approve 都经 presentOrders 剥掉私有对象键、换成 15 分钟预签名 URL；
+// reject 曾直接回原始行，把 evidenceObjectKey 交给管理台，形状也与其它两条不一致。
+describe('SupportRechargeService rejectOrder response shape', () => {
+  it('returns the presented order without the private evidence object key', async () => {
+    const before = {
+      id: 'order-1',
+      orderNo: 'SR-20260913-0002',
+      conversationID: 'conv-1',
+      userID: 'user-1',
+      agentUserID: 'agent-1',
+      requestKind: 'COIN',
+      status: 'PENDING',
+      evidenceMessageID: 'msg-1',
+      evidenceObjectKey: 'chat/user-1/evidence.png',
+      submittedAt: new Date('2026-09-13T00:00:00.000Z'),
+      fulfillmentType: null,
+      fulfillmentPayload: null,
+      paymentTransactionID: null,
+      reviewedBy: null,
+      reviewedAt: null,
+      rejectionReason: null,
+      createdAt: new Date('2026-09-13T00:00:00.000Z'),
+      updatedAt: new Date('2026-09-13T00:00:00.000Z'),
+    };
+    const after = {
+      ...before,
+      status: 'REJECTED',
+      rejectionReason: 'no matching payment',
+      reviewedBy: 'admin-1',
+      reviewedAt: new Date('2026-09-13T01:00:00.000Z'),
+    };
+    const tx = {
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      supportRechargeOrder: {
+        findUnique: jest.fn().mockResolvedValue(before),
+        update: jest.fn().mockResolvedValue(after),
+      },
+      supportRechargeConversationState: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    const prisma = {
+      $transaction: jest.fn((callback) => callback(tx)),
+      supportRechargeOrder: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue(after),
+      },
+      user: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'user-1', accountId: 'u1', nickname: 'User' },
+          { id: 'agent-1', accountId: 'a1', nickname: 'Agent' },
+        ]),
+      },
+    };
+    const audit = { recordInTransaction: jest.fn() };
+    const upload = {
+      createPresignedGetUrl: jest
+        .fn()
+        .mockResolvedValue({ url: 'https://example.test/evidence.png' }),
+    };
+    const messages = { insertServerMessage: jest.fn().mockResolvedValue(null) };
+    const service = new SupportRechargeService(
+      prisma as never,
+      audit as never,
+      upload as never,
+      messages as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    const result = await service.rejectOrder(
+      { userId: 'admin-1', accountId: 'admin' },
+      'order-1',
+      'no matching payment',
+    );
+
+    expect(result).not.toHaveProperty('evidenceObjectKey');
+    expect(result).toMatchObject({
+      id: 'order-1',
+      status: 'REJECTED',
+      rejectionReason: 'no matching payment',
+      evidenceUrl: 'https://example.test/evidence.png',
+      user: { id: 'user-1', accountId: 'u1', nickname: 'User' },
+      agent: { id: 'agent-1', accountId: 'a1', nickname: 'Agent' },
+    });
+    expect(messages.insertServerMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.objectContaining({ clientMessageId: 'sr-order-1-rejected' }),
+    );
+  });
+});
