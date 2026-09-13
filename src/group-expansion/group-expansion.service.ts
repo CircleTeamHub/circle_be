@@ -64,22 +64,6 @@ export interface GroupExpansionProductsResult {
   }>;
 }
 
-export interface GroupExpansionOrdersResult {
-  items: Array<{
-    orderId: string;
-    circleId: string;
-    productId: string;
-    productName: string;
-    seats: number;
-    price: number;
-    previousMaxMembers: number;
-    newMaxMembers: number;
-    walletBalanceAfter: number;
-    createdAt: Date;
-  }>;
-  nextCursor: string | null;
-}
-
 @Injectable()
 export class GroupExpansionService {
   private readonly logger = new Logger(GroupExpansionService.name);
@@ -149,51 +133,6 @@ export class GroupExpansionService {
           resultingMaxMembers: nextEffectiveCapacity,
         };
       }),
-    };
-  }
-
-  async getOrders(
-    userId: string,
-    circleId: string,
-    cursor?: string,
-    limit = 20,
-  ): Promise<GroupExpansionOrdersResult> {
-    const circle = await this.prisma.circle.findFirst({
-      where: { id: circleId, ownerID: userId, deleted: false },
-      select: { id: true },
-    });
-    if (!circle) {
-      throw new NotFoundException({
-        message: '群不存在',
-        errorCode: GroupExpansionErrorCode.CircleNotFound,
-      });
-    }
-
-    const rows = await this.prisma.groupExpansionOrder.findMany({
-      where: { userID: userId, circleID: circleId },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: limit + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    });
-    const hasMore = rows.length > limit;
-    const visibleRows = rows.slice(0, limit);
-    return {
-      items: visibleRows.map((order) => ({
-        orderId: order.id,
-        circleId: order.circleID,
-        productId: order.productID,
-        productName: order.productName,
-        seats: order.seats,
-        price: order.price,
-        previousMaxMembers: order.previousMaxMembers,
-        newMaxMembers: order.newMaxMembers,
-        walletBalanceAfter: order.walletBalanceAfter,
-        createdAt: order.createdAt,
-      })),
-      nextCursor:
-        hasMore && visibleRows.length > 0
-          ? visibleRows[visibleRows.length - 1].id
-          : null,
     };
   }
 

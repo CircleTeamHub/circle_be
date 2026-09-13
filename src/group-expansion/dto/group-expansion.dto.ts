@@ -1,10 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
 import {
   IsDefined,
   IsIn,
   IsInt,
-  IsOptional,
   IsUUID,
   Max,
   Min,
@@ -56,21 +54,6 @@ export class GroupExpansionCircleQueryDto {
   circleId: string;
 }
 
-export class ListGroupExpansionOrdersQueryDto extends GroupExpansionCircleQueryDto {
-  @ApiProperty({ required: false, format: 'uuid' })
-  @IsOptional()
-  @IsUUID()
-  cursor?: string;
-
-  @ApiProperty({ required: false, minimum: 1, maximum: 50, default: 20 })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(50)
-  limit = 20;
-}
-
 export class GroupExpansionProductDto {
   @ApiProperty({ enum: GROUP_EXPANSION_PRODUCT_IDS })
   id: GroupExpansionProductId;
@@ -103,14 +86,4 @@ export class GroupExpansionPurchaseResultDto {
   @ApiProperty() previousMaxMembers: number;
   @ApiProperty() newMaxMembers: number;
   @ApiProperty() walletBalanceAfter: number;
-}
-
-export class GroupExpansionOrderDto extends GroupExpansionPurchaseResultDto {
-  @ApiProperty() createdAt: Date;
-}
-
-export class GroupExpansionOrdersResultDto {
-  @ApiProperty({ type: [GroupExpansionOrderDto] })
-  items: GroupExpansionOrderDto[];
-  @ApiProperty({ nullable: true }) nextCursor: string | null;
 }

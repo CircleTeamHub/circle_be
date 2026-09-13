@@ -346,43 +346,4 @@ describe('GroupExpansionService', () => {
       resultingMaxMembers: 3000,
     });
   });
-
-  it('returns the owner purchase history with cursor pagination', async () => {
-    tx.groupExpansionOrder.findMany.mockResolvedValue([
-      {
-        id: 'order-2',
-        circleID: 'circle-1',
-        productID: 'advanced',
-        productName: '进阶扩群卡',
-        seats: 200,
-        price: 1100,
-        previousMaxMembers: 200,
-        newMaxMembers: 400,
-        walletBalanceAfter: 400,
-        createdAt: new Date('2026-07-28T12:00:00.000Z'),
-      },
-      {
-        id: 'order-1',
-        circleID: 'circle-1',
-        productID: 'light',
-        productName: '轻量扩群卡',
-        seats: 100,
-        price: 600,
-        previousMaxMembers: 100,
-        newMaxMembers: 200,
-        walletBalanceAfter: 1500,
-        createdAt: new Date('2026-07-27T12:00:00.000Z'),
-      },
-    ]);
-
-    const result = await service.getOrders('user-1', 'circle-1', undefined, 1);
-
-    expect(tx.groupExpansionOrder.findMany).toHaveBeenCalledWith({
-      where: { userID: 'user-1', circleID: 'circle-1' },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: 2,
-    });
-    expect(result.items).toHaveLength(1);
-    expect(result.nextCursor).toBe('order-2');
-  });
 });

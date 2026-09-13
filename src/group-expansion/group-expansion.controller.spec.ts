@@ -7,7 +7,6 @@ describe('GroupExpansionController', () => {
   const service = {
     getProducts: jest.fn(),
     purchase: jest.fn(),
-    getOrders: jest.fn(),
   };
   const controller = new GroupExpansionController(
     service as unknown as GroupExpansionService,
@@ -68,24 +67,17 @@ describe('GroupExpansionController', () => {
     ).toBe(200);
   });
 
-  it('passes pagination inputs to owner order history', async () => {
-    service.getOrders.mockResolvedValue({ items: [], nextCursor: null });
-
-    await controller.getOrders(
-      {
-        circleId: '54a43f3e-4df0-4d58-bcec-952214502ee4',
-        cursor: 'order-1',
-        limit: 10,
-      },
-      request,
-    );
-
-    expect(service.getOrders).toHaveBeenCalledWith(
-      'user-1',
-      '54a43f3e-4df0-4d58-bcec-952214502ee4',
-      'order-1',
-      10,
-    );
+  // GET /group-expansions/orders 没有任何客户端调用(circle-im 只用 products 与
+  // purchases,管理台不涉及扩容卡)。连同 service.getOrders 与查询/响应 DTO 一起删掉。
+  it('no longer exposes the owner order-history listing', () => {
+    expect(
+      (GroupExpansionController.prototype as unknown as Record<string, unknown>)
+        .getOrders,
+    ).toBeUndefined();
+    expect(
+      (GroupExpansionService.prototype as unknown as Record<string, unknown>)
+        .getOrders,
+    ).toBeUndefined();
   });
 
   it('passes the selected circle to product listing', async () => {

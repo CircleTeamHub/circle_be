@@ -24,11 +24,9 @@ import { GroupExpansionErrorCode } from 'src/common/app-error-codes';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
-  GroupExpansionOrdersResultDto,
   GroupExpansionCircleQueryDto,
   GroupExpansionProductsResultDto,
   GroupExpansionPurchaseResultDto,
-  ListGroupExpansionOrdersQueryDto,
   PurchaseGroupExpansionDto,
 } from './dto/group-expansion.dto';
 import { GroupExpansionService } from './group-expansion.service';
@@ -48,21 +46,6 @@ export class GroupExpansionController {
     @Req() req: RequestWithUser,
   ) {
     return this.service.getProducts(req.user.userId, query.circleId);
-  }
-
-  @Get('orders')
-  @ApiOperation({ summary: 'List expansion purchases for an owned group' })
-  @ApiOkResponse({ type: GroupExpansionOrdersResultDto })
-  getOrders(
-    @Query() query: ListGroupExpansionOrdersQueryDto,
-    @Req() req: RequestWithUser,
-  ) {
-    return this.service.getOrders(
-      req.user.userId,
-      query.circleId,
-      query.cursor,
-      query.limit,
-    );
   }
 
   @Post('purchases')
