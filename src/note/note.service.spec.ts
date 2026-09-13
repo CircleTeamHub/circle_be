@@ -3605,6 +3605,78 @@ describe('NoteService', () => {
     expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
+  /** 收藏写入成功路径的最小 mock：只关心写进 collectedFrom 的内容。 */
+  const mockCollectWrites = () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce(null);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async () => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      pinned: false,
+      media: [],
+      coverMedia: null,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    }));
+  };
+
+  it('collectNote stores source avatars only when they are served from own storage', async () => {
+    // 来源名片的头像由客户端上报，会原样展示在收藏者的笔记上。不拒绝请求（群 / 好友
+    // 头像历史上可能来自任何地方），但只存本站存储的地址；外链头像是追踪 / 钓鱼载体，
+    // 存成 null，客户端回落默认头像。
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+      uploadService as any,
+    );
+    mockCollectWrites();
+
+    await guarded.collectNote('user-1', {
+      noteId: 'note-src',
+      source: {
+        ...collectSource,
+        sender: {
+          ...collectSource.sender,
+          faceURL: 'https://tracker.example.com/w.jpg',
+        },
+        group: {
+          ...collectSource.group,
+          faceURL: 'http://10.0.0.195:9000/circle/avatars/g.jpg',
+        },
+      },
+    });
+
+    const collectedFrom =
+      prisma.note.create.mock.calls[0][0].data.collectedFrom;
+    expect(collectedFrom.sender.faceURL).toBeNull();
+    expect(collectedFrom.group.faceURL).toBe(
+      'http://10.0.0.195:9000/circle/avatars/g.jpg',
+    );
+  });
+
+  it('collectNote keeps source avatars as-is when object storage is not configured', async () => {
+    mockCollectWrites();
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const collectedFrom =
+      prisma.note.create.mock.calls[0][0].data.collectedFrom;
+    expect(collectedFrom.sender.faceURL).toBe('https://cdn.example.com/w.jpg');
+    expect(collectedFrom.group.faceURL).toBe('https://cdn.example.com/g.jpg');
+  });
+
   it('collectNote surfaces collectedFrom in list/detail mapping', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       ...otherUsersNote,

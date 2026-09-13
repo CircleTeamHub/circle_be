@@ -133,7 +133,7 @@ export class NoteController {
   updateNoteGroupIds(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateNoteGroupIdsDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.noteService.updateNoteGroupIds(
       req.user.userId,

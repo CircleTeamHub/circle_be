@@ -26,6 +26,7 @@ import {
 } from 'src/chat/chat.constants';
 import {
   assertUrlsFromStorage,
+  isUrlFromStorage,
   storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
 import {
@@ -2361,6 +2362,18 @@ export class NoteService {
     return this.mapDetailResolved(note, SHARE_LINK_GUEST_VIEWER);
   }
 
+  /**
+   * 来源名片的头像由客户端上报，会原样展示在收藏者的笔记上。不拒绝请求（群 / 好友
+   * 头像可能来自任何地方），但只保留本站存储的地址：外链头像是追踪 / 钓鱼载体，
+   * 存 null 让客户端回落默认头像。存储未配置时无从判断，原样保留 —— 与
+   * assertUrlsFromStorage 的口径一致。
+   */
+  private storageFaceUrlOrNull(url: string | undefined): string | null {
+    if (!url) return null;
+    if (this.storagePublicObjectBases.length === 0) return url;
+    return isUrlFromStorage(url, this.storagePublicObjectBases) ? url : null;
+  }
+
   private buildCollectedFrom(
     source: NoteCollectSourceDto,
     note: Pick<NoteRow, 'id' | 'ownerID'>,
@@ -2373,13 +2386,13 @@ export class NoteService {
       sender: {
         id: source.sender.id,
         name: source.sender.name,
-        faceURL: source.sender.faceURL ?? null,
+        faceURL: this.storageFaceUrlOrNull(source.sender.faceURL),
       },
       group: source.group
         ? {
             id: source.group.id,
             name: source.group.name,
-            faceURL: source.group.faceURL ?? null,
+            faceURL: this.storageFaceUrlOrNull(source.group.faceURL),
           }
         : null,
       sourceNoteId: note.id,

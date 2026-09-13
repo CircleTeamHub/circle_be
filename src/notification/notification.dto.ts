@@ -5,6 +5,7 @@ import {
   type NotificationDomain,
 } from './notification.constants';
 import { Transform, Type } from 'class-transformer';
+import { MAX_PAGE } from 'src/common/pagination';
 import {
   IsBoolean,
   IsIn,
@@ -23,8 +24,8 @@ export class NotificationPageQueryDto {
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(10_000)
-  @ApiPropertyOptional({ minimum: 1, maximum: 10_000, default: 1 })
+  @Max(MAX_PAGE)
+  @ApiPropertyOptional({ minimum: 1, maximum: MAX_PAGE, default: 1 })
   @IsOptional()
   page = 1;
 }
