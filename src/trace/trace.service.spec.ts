@@ -309,6 +309,48 @@ describe('TraceService', () => {
     expect(detailQuery.include.comments.take).toBe(100);
   });
 
+  it('getTraceById selects only the replied-to id and nickname and still threads replies', async () => {
+    prisma.trace.findFirst.mockResolvedValue({
+      id: 'trace-1',
+      fromID: 'author-1',
+      deleted: false,
+      visibility: 'FRIENDS_ONLY',
+      content: 'hello world',
+      images: [],
+      likeCount: 0,
+      replyCount: 1,
+      createdAt: new Date('2026-06-08T00:00:00.000Z'),
+      from: { id: 'author-1', nickname: 'Author', avatarUrl: null },
+      likeStats: [],
+      comments: [
+        {
+          id: 'comment-2',
+          content: 'thanks',
+          userID: 'author-1',
+          createdAt: new Date('2026-06-08T02:00:00.000Z'),
+          user: { id: 'author-1', nickname: 'Author' },
+          replyTo: { id: 'comment-1', user: { nickname: 'Viewer' } },
+        },
+      ],
+    });
+    prisma.friend.findMany.mockResolvedValue([
+      { userID: 'viewer-1', friendID: 'author-1' },
+    ]);
+    prisma.traceLikeStat.findFirst.mockResolvedValue(null);
+
+    const result = await service.getTraceById('viewer-1', 'trace-1');
+
+    const detailQuery = prisma.trace.findFirst.mock.calls[1][0];
+    expect(detailQuery.include.comments.include.replyTo).toEqual({
+      select: { id: true, user: { select: { nickname: true } } },
+    });
+    // 客户端按父评论 id 串楼，这个 id 必须仍是被回复的那条评论。
+    expect(result.comments[0].replyTo).toEqual({
+      id: 'comment-1',
+      nickname: 'Viewer',
+    });
+  });
+
   it('getTraceById throws NotFound when the moment is missing or deleted', async () => {
     prisma.trace.findFirst.mockResolvedValue(null);
 
@@ -837,6 +879,43 @@ describe('TraceService', () => {
         }),
       }),
     );
+  });
+
+  // 预览评论的 replyTo 此前 include 整条被回复的评论（content / images / 外键）再加
+  // user，映射只读 replyTo.id 与 replyTo.user.nickname。
+  it('selects only the replied-to comment id and author nickname in the feed', async () => {
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    const [feedQuery] = prisma.trace.findMany.mock.calls[0];
+    expect(feedQuery.include.comments.include.replyTo).toEqual({
+      select: { id: true, user: { select: { nickname: true } } },
+    });
+  });
+
+  // getAcceptedFriendIds 每个 feed 页都要跑，此前不设上限。按好友业务上限（会员 5000，
+  // FriendService 的 FRIEND_LIMIT_MEMBER）收口，排序与 listFriends 一致。
+  it('bounds the accepted-friend scope query at the friend business cap', async () => {
+    prisma.friend.findMany.mockResolvedValue([]);
+    prisma.trace.findMany.mockResolvedValue([]);
+    prisma.trace.count.mockResolvedValue(0);
+    prisma.traceLikeStat.findMany.mockResolvedValue([]);
+
+    await service.getFeed('viewer-1', { page: 1, limit: 20 });
+
+    expect(prisma.friend.findMany).toHaveBeenCalledWith({
+      where: {
+        OR: [{ userID: 'viewer-1' }, { friendID: 'viewer-1' }],
+        state: 'ACCEPTED',
+      },
+      select: { userID: true, friendID: true },
+      orderBy: { updatedAt: 'desc' },
+      take: 5000,
+    });
   });
 
   it('resolves feed author appearances in one deduped batch', async () => {
