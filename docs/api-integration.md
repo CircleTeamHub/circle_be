@@ -248,7 +248,8 @@ DELETE /api/v1/user/:id
 GET /api/v1/admin/users?keyword=jim&status=ACTIVE&role=USER&page=1&limit=20
 ```
 
-支持参数：`keyword`（账号 ID、昵称、邮箱或手机号的部分匹配）、`status`、
+支持参数：`keyword`（账号 ID、昵称按部分匹配；邮箱与手机号只按完整值匹配，
+邮箱不区分大小写、两端空白忽略——防止用部分匹配逐字符还原遮罩后的联系方式）、`status`、
 `role`、`createdFrom`、`createdTo`、`page` 和 `limit`（1..100）。响应只包含
 遮罩后的 `maskedEmail` 与 `maskedPhoneNumber`，不返回联系方式原文、密码字段或
 旧 `vipLevel`。

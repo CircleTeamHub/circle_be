@@ -100,8 +100,8 @@ describe('AdminUserService', () => {
         OR: [
           { accountId: { contains: 'jim', mode: 'insensitive' } },
           { nickname: { contains: 'jim', mode: 'insensitive' } },
-          { email: { contains: 'jim', mode: 'insensitive' } },
-          { phoneNumber: { contains: 'jim' } },
+          { email: 'jim' },
+          { phoneNumber: 'jim' },
         ],
       };
       expect(prisma.user.findMany).toHaveBeenCalledWith({
@@ -144,6 +144,33 @@ describe('AdminUserService', () => {
       });
       expect(JSON.stringify(result)).not.toContain('jim@example.com');
       expect(JSON.stringify(result)).not.toContain('15512345678');
+    });
+
+    it('matches contact fields only on full equality so masked values cannot be reconstructed', async () => {
+      // 列表只回遮罩后的邮箱/手机号。keyword 若对 email / phoneNumber 做子串匹配，
+      // 管理员逐字符试探「有没有命中」就能还原原文，且完全绕开敏感字段查看的审计。
+      // 子串匹配只留给账号 ID 与昵称；联系方式必须整值相等，邮箱按 auth 的口径归一。
+      prisma.user.findMany.mockResolvedValue([]);
+      prisma.user.count.mockResolvedValue(0);
+
+      await service.listUsers({
+        keyword: '  Jim@Example.COM  ',
+        page: 1,
+        limit: 20,
+      });
+
+      const where = {
+        OR: [
+          { accountId: { contains: 'Jim@Example.COM', mode: 'insensitive' } },
+          { nickname: { contains: 'Jim@Example.COM', mode: 'insensitive' } },
+          { email: 'jim@example.com' },
+          { phoneNumber: 'Jim@Example.COM' },
+        ],
+      };
+      expect(prisma.user.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where }),
+      );
+      expect(prisma.user.count).toHaveBeenCalledWith({ where });
     });
 
     it('omits empty keyword and optional filters', async () => {
