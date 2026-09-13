@@ -245,7 +245,7 @@ export class NoteController {
 
   @Get(':id')
   @ApiOperation({
-    summary: 'Note detail (own note, or any note marked available)',
+    summary: 'Note detail (own note, or any ACTIVE note marked available)',
   })
   @ApiOkResponse({ type: NoteDetailDto })
   getNote(

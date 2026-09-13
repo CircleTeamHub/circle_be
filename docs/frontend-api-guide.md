@@ -1100,6 +1100,9 @@ Authorization: Bearer <accessToken>
 
 **Response 200：** `NoteDetail`
 
+- 主人可读自己任何未删除的笔记（含 `UNLISTED`）；其他人只能读 `available=true` 且 `status=ACTIVE` 的笔记，否则 404 `NOTE_NOT_FOUND`。收藏（`POST /note/collect`）、导出（`POST /note/:id/exports`）、复制媒体（`POST /note/:id/chat-media`）与临时聊天访客读 note-card 同一口径。
+- 非主人视角：`canEdit=false`，`remark` / `collectedFrom` 为 `null`，`pinned` 恒为 `false`，`groups` 恒为 `[]`（置顶与分组是主人的私人整理标记，不随笔记外发）。
+
 ---
 
 ### 创建笔记

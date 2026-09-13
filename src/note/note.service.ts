@@ -1397,10 +1397,16 @@ export class NoteService {
     viewerID: string,
     presignedUrls?: Map<string, string>,
   ): NoteSummaryDto {
-    const groups = (note.groupMemberships ?? []).map((membership: any) => ({
-      id: membership.group.id,
-      name: membership.group.name,
-    }));
+    // 置顶与分组是主人整理自己笔记本的私人标记，与 remark / collectedFrom 一样
+    // 不随笔记内容外发：非主人（含分享链接的访客 viewer）恒为 pinned=false、
+    // groups=[]。字段名保留，DTO 形状不变。
+    const isOwner = note.ownerID === viewerID;
+    const groups = isOwner
+      ? (note.groupMemberships ?? []).map((membership: any) => ({
+          id: membership.group.id,
+          name: membership.group.name,
+        }))
+      : [];
     const fallbackCoverMedia = note.media?.[0] ?? null;
     const coverMedia = note.coverMedia ?? fallbackCoverMedia;
     const sections = this.buildSectionsFromRow(note, presignedUrls);
@@ -1409,14 +1415,14 @@ export class NoteService {
     return {
       id: note.id,
       ownerId: note.ownerID,
-      canEdit: note.ownerID === viewerID,
+      canEdit: isOwner,
       title: note.title,
       contentPreview: this.buildPreview(note.content),
       status: note.status,
       available: note.available,
-      pinned: note.pinned,
+      pinned: isOwner ? note.pinned : false,
       // 备注与来源名片同属笔记主人的私人标注，绝不随分享/访客视图外发。
-      remark: note.ownerID === viewerID ? (note.remark ?? null) : null,
+      remark: isOwner ? (note.remark ?? null) : null,
       groups,
       cover: coverMedia
         ? {
@@ -1435,7 +1441,7 @@ export class NoteService {
       // 来源名片是收藏者的私人定位标记：available=true 的笔记任何人都能打开，
       // 但「从哪个群/谁那里收藏的」不能跟着泄漏 —— 只回给笔记主人本人。
       collectedFrom:
-        note.ownerID === viewerID && this.isRecord(note.collectedFrom)
+        isOwner && this.isRecord(note.collectedFrom)
           ? note.collectedFrom
           : null,
       createdAt: note.createdAt,
@@ -2046,12 +2052,25 @@ export class NoteService {
     };
   }
 
+  /**
+   * 「谁能凭 UUID 读到这条笔记」的唯一口径：主人读自己的任何未删笔记；其他人
+   * 只能读 available 且 ACTIVE 的。UNLISTED 以前只是「不出现在列表里」——
+   * available=true 的 UNLISTED 笔记任何人拿到 UUID 就能读、能收藏、能导出、
+   * 能复制媒体，主人特意隐藏的内容其实并没有藏住。四条读路径共用这一片段，
+   * 免得日后某一条又悄悄放宽。
+   */
+  private readableByViewer(viewerID: string): Prisma.NoteWhereInput {
+    return {
+      OR: [{ ownerID: viewerID }, { available: true, status: 'ACTIVE' }],
+    };
+  }
+
   async getNote(ownerID: string, noteId: string): Promise<NoteDetailDto> {
     const note = await this.prisma.note.findFirst({
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID }, { available: true }],
+        ...this.readableByViewer(ownerID),
       },
       include: NOTE_INCLUDE,
     });
@@ -2072,7 +2091,7 @@ export class NoteService {
    * 给他人私有对象无限续签」),所以转发笔记媒体必须真实拷贝而不是引用。
    * 单请求最多 ~100 个对象(两个分区各 50 上限),复制按下方常量限并发。
    *
-   * 读取授权与 getNote 完全一致(自己的笔记,或 available=true 的笔记)。
+   * 读取授权与 getNote 完全一致(readableByViewer:自己的笔记,或 available 且 ACTIVE 的笔记)。
    * sections JSON 里的 item 只有 objectKey 能对回本笔记 media 行时才算数 ——
    * 行在写入侧做过属主/豁免校验,挡住把外部 key 冻进 JSON 借拷贝洗白的路。
    * 拷贝出的对象生命周期归聊天侧:撤回/焚毁按消息 key 删,与笔记原件互不影响。
@@ -2093,7 +2112,7 @@ export class NoteService {
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: viewerID }, { available: true }],
+        ...this.readableByViewer(viewerID),
       },
       include: NOTE_INCLUDE,
     });
@@ -2269,10 +2288,12 @@ export class NoteService {
    * 笔记主人仍可随时通过 available=false 或删除让旧卡片失效。
    */
   async getSharedNoteForGuest(noteId: string): Promise<NoteDetailDto> {
+    // 访客没有「自己的笔记」分支：与 readableByViewer 的非主人分支同口径，
+    // 只放行 ACTIVE 且 available 的笔记，UNLISTED 不可读。
     const note = await this.prisma.note.findFirst({
       where: {
         id: noteId,
-        status: { not: 'DELETED' },
+        status: 'ACTIVE',
         available: true,
       },
       include: NOTE_INCLUDE,
@@ -2391,7 +2412,7 @@ export class NoteService {
       where: {
         id: dto.noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: userID }, { available: true }],
+        ...this.readableByViewer(userID),
       },
       include: NOTE_INCLUDE,
     });
@@ -2533,7 +2554,7 @@ export class NoteService {
       where: {
         id: noteId,
         status: { not: 'DELETED' },
-        OR: [{ ownerID: viewerID }, { available: true }],
+        ...this.readableByViewer(viewerID),
       },
       include: NOTE_INCLUDE,
     });

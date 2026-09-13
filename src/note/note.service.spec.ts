@@ -1144,7 +1144,7 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-1' }, { available: true }],
+          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
         },
       }),
     );
@@ -1155,7 +1155,7 @@ describe('NoteService', () => {
     });
   });
 
-  it('lets non-owners read available notes without edit permission', async () => {
+  it('lets non-owners read available notes without edit permission or private organisation', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
       ownerID: 'user-1',
@@ -1163,11 +1163,13 @@ describe('NoteService', () => {
       content: '完整正文',
       status: 'ACTIVE',
       available: true,
-      pinned: false,
+      // 置顶与分组是主人整理自己笔记本的私人标记，与 remark / collectedFrom 一样
+      // 不随笔记内容外发：非主人视角恒为 pinned=false、groups=[]。
+      pinned: true,
       imageCount: 0,
       videoCount: 0,
       mediaCount: 0,
-      groupMemberships: [],
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
       media: [],
       coverMedia: null,
       createdAt: new Date(),
@@ -1181,7 +1183,7 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-2' }, { available: true }],
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
         },
       }),
     );
@@ -1189,7 +1191,81 @@ describe('NoteService', () => {
       id: 'note-1',
       ownerId: 'user-1',
       canEdit: false,
+      pinned: false,
+      groups: [],
     });
+  });
+
+  it('hides an unlisted note from non-owners even when it is marked available', async () => {
+    // UNLISTED 以前只是「不出现在列表里」：available=true 的 UNLISTED 笔记任何人
+    // 拿到 UUID 就能读。非主人分支必须同时要求 ACTIVE；主人分支保持不变。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(service.getNote('user-2', 'note-1')).rejects.toThrow(
+      NotFoundException,
+    );
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+  });
+
+  it('lets the owner read an unlisted note with its real groups and pinned flag', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: '隐藏的笔记',
+      content: '完整正文',
+      status: 'UNLISTED',
+      available: true,
+      pinned: true,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getNote('user-1', 'note-1');
+
+    expect(result).toMatchObject({
+      id: 'note-1',
+      canEdit: true,
+      status: 'UNLISTED',
+      pinned: true,
+      groups: [{ id: 'group-1', name: '主人的私人分组' }],
+    });
+  });
+
+  it('refuses to export another user unlisted note even when it is marked available', async () => {
+    // 导出与 getNote 共用 readableByViewer：非主人只能导出 available 且 ACTIVE 的笔记，
+    // 否则主人隐藏（UNLISTED）的内容换个入口仍能被整份打包带走。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.createNoteExport('user-2', 'note-1', {
+        format: 'PDF',
+        scope: 'ALL',
+      }),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+    expect(uploadService.uploadBuffer).not.toHaveBeenCalled();
   });
 
   it('returns an available shared note to an authorized chat guest without private metadata', async () => {
@@ -1202,12 +1278,12 @@ describe('NoteService', () => {
       sections: null,
       status: 'ACTIVE',
       available: true,
-      pinned: false,
+      pinned: true,
       imageCount: 0,
       videoCount: 0,
       mediaCount: 0,
       collectedFrom: { conversationID: 'owner-private-location' },
-      groupMemberships: [],
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
       media: [],
       coverMedia: null,
       createdAt: new Date(),
@@ -1216,11 +1292,13 @@ describe('NoteService', () => {
 
     const result = await service.getSharedNoteForGuest('note-shared');
 
+    // 访客没有「自己的笔记」分支：只放行 ACTIVE 且 available 的笔记，UNLISTED
+    // 与 getNote 的非主人分支同口径地不可读。
     expect(prisma.note.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
           id: 'note-shared',
-          status: { not: 'DELETED' },
+          status: 'ACTIVE',
           available: true,
         },
       }),
@@ -1229,6 +1307,8 @@ describe('NoteService', () => {
       id: 'note-shared',
       canEdit: false,
       collectedFrom: null,
+      pinned: false,
+      groups: [],
     });
   });
 
@@ -3394,6 +3474,28 @@ describe('NoteService', () => {
     expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
+  it('collectNote only snapshots another user note that is available and ACTIVE', async () => {
+    // UNLISTED 笔记拿到 UUID 也不能被他人收藏成自己的副本：与 getNote 同一条放行规则。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.collectNote('user-1', {
+        noteId: 'note-unlisted',
+        source: collectSource,
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-unlisted',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+    expect(prisma.note.create).not.toHaveBeenCalled();
+  });
+
   it('collectNote surfaces collectedFrom in list/detail mapping', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       ...otherUsersNote,
@@ -4288,17 +4390,22 @@ describe('NoteService', () => {
       );
     });
 
-    it('scopes the lookup to readable notes (own or available)', async () => {
+    it('scopes the lookup to readable notes (own, or available and ACTIVE)', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(noteRow());
 
       await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
 
+      // 与 getNote 同一条放行规则：非主人只能碰 ACTIVE 且 available 的笔记，
+      // 否则 UNLISTED 笔记的媒体仍可经此路径被复制出去。
       expect(prisma.note.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
             id: 'note-1',
             status: { not: 'DELETED' },
-            OR: [{ ownerID: 'viewer-2' }, { available: true }],
+            OR: [
+              { ownerID: 'viewer-2' },
+              { available: true, status: 'ACTIVE' },
+            ],
           }),
         }),
       );
