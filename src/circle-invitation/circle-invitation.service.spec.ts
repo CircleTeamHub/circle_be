@@ -156,6 +156,60 @@ describe('CircleInvitationService', () => {
     ).rejects.toThrow(ForbiddenException);
   });
 
+  // 验证人的 respondedAt 在 APP 与管理台都没有读取路径（APP 只在类型里声明），
+  // 连同 INVITATION_INCLUDE 里专为它选出的列一起去掉。
+  it('does not return verifier respondedAt in the invitation view', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      requiredCount: 10,
+      approvedCount: 1,
+      status: 'PENDING',
+      createdAt: new Date('2026-04-21T00:00:00.000Z'),
+      circle: { id: 'circle-1', name: 'Trusted Circle' },
+      applicant: {
+        id: 'applicant-1',
+        nickname: 'Applicant',
+        avatarUrl: null,
+        accountId: 'applicant',
+      },
+      inviter: {
+        id: 'inviter-1',
+        nickname: 'Inviter',
+        avatarUrl: null,
+        accountId: 'inviter',
+      },
+      verifiers: [
+        {
+          id: 'ver-1',
+          verifierID: 'verifier-1',
+          status: 'APPROVED',
+          respondedAt: new Date('2026-04-22T00:00:00.000Z'),
+          verifier: {
+            id: 'verifier-1',
+            nickname: 'Verifier',
+            avatarUrl: null,
+            accountId: 'verifier',
+          },
+        },
+      ],
+    });
+
+    const view = await service.getInvitationForViewer('applicant-1', 'inv-1');
+
+    expect(view.verifiers).toHaveLength(1);
+    expect(view.verifiers[0]).toMatchObject({
+      id: 'ver-1',
+      status: 'APPROVED',
+      verifier: { id: 'verifier-1', accountId: 'verifier' },
+    });
+    expect(view.verifiers[0]).not.toHaveProperty('respondedAt');
+    const [args] = prisma.circleInvitation.findUnique.mock.calls[0];
+    expect(args.include.verifiers.select).not.toHaveProperty('respondedAt');
+  });
+
   it('rejects circle invites blocked by the applicant privacy setting', async () => {
     prisma.circleMember.findUnique
       .mockResolvedValueOnce({ status: 'ACTIVE' })
@@ -399,7 +453,16 @@ describe('CircleInvitationService', () => {
 
     expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
       where: { id: 'good' },
-      include: { circle: true },
+      select: {
+        id: true,
+        status: true,
+        approvedCount: true,
+        requiredCount: true,
+        circleID: true,
+        applicantID: true,
+        inviterID: true,
+        circle: { select: { groupID: true } },
+      },
     });
     // The permanently-blocked 'bad' row is deferred (touched) so it rotates to
     // the back of the updatedAt-ordered batch instead of re-filling it forever.
@@ -614,6 +677,47 @@ describe('CircleInvitationService', () => {
     );
   });
 
+  // respond / adminApprove / reconcile 此前 include 整行 circle，却只读 groupID；
+  // respond 的第一次读连 circle 都不需要。只选判定与收尾真正用到的列。
+  it('respond reads only the invitation columns it decides and admits on', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      approvedCount: 10,
+      requiredCount: 10,
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleInvitationVerifier.findFirst.mockResolvedValue({
+      id: 'ver-1',
+      status: 'PENDING',
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({ status: 'ACTIVE' });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.respond('verifier-1', 'inv-1', true);
+
+    expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
+      where: { id: 'inv-1' },
+      select: { status: true, circleID: true, applicantID: true },
+    });
+    expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
+      where: { id: 'inv-1' },
+      select: {
+        approvedCount: true,
+        requiredCount: true,
+        circleID: true,
+        applicantID: true,
+        circle: { select: { groupID: true } },
+      },
+    });
+    expect(prisma.circleInvitation.findUnique).not.toHaveBeenCalledWith(
+      expect.objectContaining({ include: { circle: true } }),
+    );
+  });
+
   it('uses the admission policy for admin-approved activation', async () => {
     prisma.circleInvitation.findUnique.mockResolvedValue({
       id: 'inv-1',
@@ -647,6 +751,37 @@ describe('CircleInvitationService', () => {
     // 座位不等对账:激活提交后立刻触发一次幂等 ensure。
     expect(chatCircleSync.ensureCircleConversation).toHaveBeenCalledWith(
       'circle-1',
+    );
+  });
+
+  it('adminApprove selects only the invitation columns it needs', async () => {
+    prisma.circleInvitation.findUnique.mockResolvedValue({
+      id: 'inv-1',
+      circleID: 'circle-1',
+      applicantID: 'applicant-1',
+      inviterID: 'inviter-1',
+      status: 'PENDING',
+      circle: { groupID: 'group-1' },
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      status: 'ACTIVE',
+      role: 'ADMIN',
+    });
+    prisma.circleInvitation.updateMany.mockResolvedValue({ count: 1 });
+
+    await service.adminApprove('admin-1', 'inv-1');
+
+    expect(prisma.circleInvitation.findUnique).toHaveBeenCalledWith({
+      where: { id: 'inv-1' },
+      select: {
+        status: true,
+        circleID: true,
+        applicantID: true,
+        circle: { select: { groupID: true } },
+      },
+    });
+    expect(prisma.circleInvitation.findUnique).not.toHaveBeenCalledWith(
+      expect.objectContaining({ include: { circle: true } }),
     );
   });
 
@@ -1637,6 +1772,24 @@ describe('CircleInvitationService', () => {
       expect(
         realtimeService.broadcastCircleInvitationReviewed,
       ).not.toHaveBeenCalled();
+    });
+
+    // 建单时 include 了整行 circle / applicant / inviter（后两者是 User 全部列，含
+    // 邮箱、手机号），事务里却只读 id / approvedCount / requiredCount / circle.groupID；
+    // 响应另由 fetchInvitationDto 按窄 select 重读。
+    it('invite creates the row selecting only what the transaction reads', async () => {
+      arrangeInviteFlow();
+
+      await service.invite('inviter-1', 'applicant-1', 'circle-1');
+
+      const [args] = prisma.circleInvitation.create.mock.calls[0];
+      expect(args.select).toEqual({
+        id: true,
+        approvedCount: true,
+        requiredCount: true,
+        circle: { select: { groupID: true } },
+      });
+      expect(args).not.toHaveProperty('include');
     });
 
     it('invite admits immediately when the inviter first vote satisfies the policy', async () => {

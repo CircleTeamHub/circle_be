@@ -71,7 +71,6 @@ export class InvitationVerifierDto {
   id: string;
   verifier: InvitationUserDto;
   status: 'PENDING' | 'APPROVED' | 'REJECTED';
-  respondedAt: string | null;
 }
 
 export class InvitationDto {
