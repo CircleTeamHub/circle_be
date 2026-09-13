@@ -388,11 +388,150 @@ describe('SupportRechargeService rejectOrder response shape', () => {
       rejectionReason: 'no matching payment',
       evidenceUrl: 'https://example.test/evidence.png',
       user: { id: 'user-1', accountId: 'u1', nickname: 'User' },
-      agent: { id: 'agent-1', accountId: 'a1', nickname: 'Agent' },
     });
+    expect(result).not.toHaveProperty('agent');
     expect(messages.insertServerMessage).toHaveBeenCalledWith(
       'conv-1',
       expect.objectContaining({ clientMessageId: 'sr-order-1-rejected' }),
     );
+  });
+});
+
+// 管理台（circle_admin_web api/support-recharge.ts + SupportRechargePage）实际读取的列：
+// 收款码不读 createdBy（管理员 userId，属于审计信息）；申请单不读 conversationID /
+// evidenceMessageID / updatedAt，也不读 agent（列表只渲染 user）。响应按列显式映射。
+describe('SupportRechargeService admin response contract', () => {
+  const operator = { userId: 'admin-1', accountId: 'admin' };
+  const upload = {
+    createPresignedGetUrl: jest
+      .fn()
+      .mockResolvedValue({ url: 'https://example.test/signed.png' }),
+  };
+  const buildService = (prisma: unknown) =>
+    new SupportRechargeService(
+      prisma as never,
+      { recordInTransaction: jest.fn() } as never,
+      upload as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+  it('returns payment codes without createdBy on every read/write path', async () => {
+    const row = {
+      id: 'code-1',
+      label: '收款码',
+      objectKey: 'chat/admin-1/code.png',
+      validFrom: new Date('2026-08-01T00:00:00.000Z'),
+      validUntil: null,
+      enabled: true,
+      createdBy: 'admin-1',
+      createdAt: new Date('2026-08-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-08-02T00:00:00.000Z'),
+    };
+    const presented = {
+      id: 'code-1',
+      label: '收款码',
+      objectKey: 'chat/admin-1/code.png',
+      validFrom: row.validFrom,
+      validUntil: null,
+      enabled: true,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      previewUrl: 'https://example.test/signed.png',
+    };
+    const tx = {
+      supportRechargePaymentCode: {
+        findUnique: jest.fn().mockResolvedValue(row),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        create: jest.fn().mockResolvedValue(row),
+        update: jest.fn().mockResolvedValue(row),
+      },
+    };
+    const prisma = {
+      $transaction: jest.fn((callback) => callback(tx)),
+      supportRechargePaymentCode: {
+        findMany: jest.fn().mockResolvedValue([row]),
+      },
+    };
+    const service = buildService(prisma);
+
+    await expect(service.listPaymentCodes()).resolves.toEqual([presented]);
+    await expect(
+      service.createPaymentCode(operator, {
+        label: '收款码',
+        objectKey: 'chat/admin-1/code.png',
+        validFrom: '2026-08-01T00:00:00.000Z',
+      }),
+    ).resolves.toEqual(presented);
+    await expect(
+      service.updatePaymentCode(operator, 'code-1', { label: '收款码' }),
+    ).resolves.toEqual(presented);
+    await expect(
+      service.setPaymentCodeEnabled(operator, 'code-1', true),
+    ).resolves.toEqual(presented);
+  });
+
+  it('presents orders without conversation/evidence-message ids, updatedAt or an agent join', async () => {
+    const createdAt = new Date('2026-09-13T00:00:00.000Z');
+    const row = {
+      id: 'order-1',
+      orderNo: 'SR-20260913-0003',
+      conversationID: 'conv-1',
+      userID: 'user-1',
+      agentUserID: 'agent-1',
+      requestKind: 'COIN',
+      status: 'WAITING_REVIEW',
+      evidenceMessageID: 'msg-1',
+      evidenceObjectKey: 'chat/user-1/evidence.png',
+      submittedAt: createdAt,
+      fulfillmentType: null,
+      fulfillmentPayload: null,
+      paymentTransactionID: null,
+      reviewedBy: null,
+      reviewedAt: null,
+      rejectionReason: null,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    const prisma = {
+      supportRechargeOrder: { findMany: jest.fn().mockResolvedValue([row]) },
+      user: {
+        findMany: jest
+          .fn()
+          .mockResolvedValue([{ id: 'user-1', accountId: 'u1', nickname: 'User' }]),
+      },
+    };
+    const service = buildService(prisma);
+
+    const [order] = await service.listOrders({ limit: 20 });
+
+    const { select } = prisma.supportRechargeOrder.findMany.mock.calls[0][0];
+    for (const column of ['conversationID', 'evidenceMessageID', 'updatedAt']) {
+      expect(select).not.toHaveProperty(column);
+    }
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['user-1'] } },
+      select: { id: true, accountId: true, nickname: true },
+    });
+    expect(order).toEqual({
+      id: 'order-1',
+      orderNo: 'SR-20260913-0003',
+      userID: 'user-1',
+      agentUserID: 'agent-1',
+      requestKind: 'COIN',
+      status: 'WAITING_REVIEW',
+      submittedAt: createdAt,
+      fulfillmentType: null,
+      fulfillmentPayload: null,
+      paymentTransactionID: null,
+      reviewedBy: null,
+      reviewedAt: null,
+      rejectionReason: null,
+      createdAt,
+      user: { id: 'user-1', accountId: 'u1', nickname: 'User' },
+      evidenceUrl: 'https://example.test/signed.png',
+    });
   });
 });
