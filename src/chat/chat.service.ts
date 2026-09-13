@@ -4087,6 +4087,15 @@ export class ChatService {
         errorCode: ChatErrorCode.MessageNotFound,
       });
     }
+    // 已读名单只给发送者本人:App 只在自己发出的消息上开这个入口(ChatDetailScreen
+    // 限 message.outgoing)。只查在座的话,任何成员都能逐条探查别人的消息被谁读过;
+    // 系统消息没有作者,同样不给。
+    if (row.senderID !== userId) {
+      throw new ForbiddenException({
+        message: '只能查看自己消息的已读成员',
+        errorCode: ChatErrorCode.ReadersForbidden,
+      });
+    }
     // 新入群/重新入群的座位,lastReadHeight 是按「当前最高」初始化的(否则新人
     // 一进来就背着全群历史未读)。那个初始水位不是回执:不排掉的话,一个刚进群
     // 的人会显示成群里每一条老消息的已读者。座位的 joinedAt 之后才算数。
@@ -4095,7 +4104,7 @@ export class ChatService {
       leftAt: null,
       lastReadHeight: { gte: row.height },
       joinedAt: { lte: row.createdAt },
-      ...(row.senderID ? { userID: { not: row.senderID } } : {}),
+      userID: { not: userId },
     };
     const [seats, total] = await Promise.all([
       this.prisma.chatMember.findMany({

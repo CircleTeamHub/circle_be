@@ -377,7 +377,7 @@ REST。避免本地库无限膨胀。
 
 | 能力 | 方案 | 备注 |
 |---|---|---|
-| **逐条已读回执** | `GET /chat/messages/:id/readers`：读者 = `ChatMember.lastReadHeight >= 该消息 height` | **不需要新表**。这是自研栈的红利 —— OpenIM 反倒要单独存回执行 |
+| **逐条已读回执** | `GET /chat/messages/:id/readers`：读者 = `ChatMember.lastReadHeight >= 该消息 height`；只有消息发送者本人可查（其余 403 `CHAT_READERS_FORBIDDEN`） | **不需要新表**。这是自研栈的红利 —— OpenIM 反倒要单独存回执行 |
 | **已送达回执** | `ChatMember` 加 `lastDeliveredHeight`；客户端收到 `chat:msg` 后回 `chat:delivered {conversationId, height}` | 复用现有 pending 已读的节流队列 |
 | **表情回复** | 新表 `ChatMessageReaction(messageID, userID, emoji)` + 唯一约束；事件 `chat:reaction` | **不进 height 坐标系** —— 不是消息，不推进未读、不改 `lastMessageAt` |
 | **消息编辑** | `ChatMessage` 加 `editedAt` + `contentHistory Json?`；事件 `chat:edit` | 仅发送者、仅 text/quote、2 分钟窗口；**不改 height**（否则排序坐标系要重算） |

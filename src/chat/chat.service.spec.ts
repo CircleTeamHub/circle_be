@@ -3554,6 +3554,49 @@ describe('ChatService', () => {
       expect(result.total).toBe(2);
       expect(result.readers.map((r) => r.nickname)).toEqual(['B', 'C']);
     });
+
+    // 已读名单只给发送者本人:App 也只在自己发出的群消息上开这个入口
+    // (ChatDetailScreen 限 message.outgoing)。只查在座的话,任何成员都能逐条
+    // 探查别人的消息被谁读过。
+    it.each([
+      ["another member's message", 'u2'],
+      ['a system notice without an author', null],
+    ])('refuses to list readers of %s', async (_case, senderID) => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        conversationID: 'conv-1',
+        height: 5,
+        senderID,
+        createdAt: new Date(),
+      });
+
+      const error: unknown = await service
+        .listMessageReaders('u1', 'conv-1', 'm1')
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ForbiddenException);
+      expect((error as ForbiddenException).getResponse()).toMatchObject({
+        errorCode: ChatErrorCode.ReadersForbidden,
+      });
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.count).not.toHaveBeenCalled();
+    });
+
+    it('keeps reporting a message from another conversation as not found', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        conversationID: 'conv-other',
+        height: 5,
+        senderID: 'u1',
+        createdAt: new Date(),
+      });
+
+      await expect(
+        service.listMessageReaders('u1', 'conv-1', 'm1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MessageNotFound },
+      });
+    });
   });
 
   describe('getBurnPolicy(私聊页进入时读当前焚毁档位)', () => {

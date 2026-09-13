@@ -342,6 +342,8 @@ export const ChatErrorCode = {
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
   ForwardForbidden: 'CHAT_FORWARD_FORBIDDEN',
+  // 逐条已读名单只给消息发送者本人(其他成员的消息、无作者的系统消息一律拒)。
+  ReadersForbidden: 'CHAT_READERS_FORBIDDEN',
   // 独立群聊(不挂圈子的 GROUP):建群/邀请只能选好友;圈子群的成员由圈子管理,
   // 独立群专属操作(邀请/退群/改名)打到圈子群上要显式拒绝而不是静默生效。
   GroupFriendsOnly: 'CHAT_GROUP_FRIENDS_ONLY',
