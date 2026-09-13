@@ -151,13 +151,37 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async getJsonMany<T>(keys: string[]): Promise<Array<T | null>> {
+  /**
+   * Reads several JSON values in one MGET. By default a Redis that cannot answer
+   * (unconfigured, unreachable, MGET failure) degrades to an array of nulls,
+   * indistinguishable from absent keys. Pass `{ strict: true }` to get `null`
+   * instead: revocation checks need that distinction, because a marker that
+   * could not be read must not pass as a marker that does not exist.
+   */
+  async getJsonMany<T>(keys: string[]): Promise<Array<T | null>>;
+  async getJsonMany<T>(
+    keys: string[],
+    options: { strict: true },
+  ): Promise<Array<T | null> | null>;
+  async getJsonMany<T>(
+    keys: string[],
+    options?: { strict?: boolean },
+  ): Promise<Array<T | null> | null> {
+    const values = await this.readJsonMany<T>(keys);
+    if (values !== null) return values;
+    return options?.strict ? null : keys.map(() => null);
+  }
+
+  /** MGET + JSON parse; null when Redis could not answer at all. */
+  private async readJsonMany<T>(
+    keys: string[],
+  ): Promise<Array<T | null> | null> {
     if (keys.length === 0) return [];
 
     const client = await this.getCommandClient();
     if (!client) {
       this.recordUnavailable('get');
-      return keys.map(() => null);
+      return null;
     }
 
     try {
@@ -176,7 +200,7 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     } catch (error) {
       this.recordCommandFailure('get', error);
       this.logger.warn(`Redis JSON MGET failed: ${this.formatError(error)}`);
-      return keys.map(() => null);
+      return null;
     }
   }
 

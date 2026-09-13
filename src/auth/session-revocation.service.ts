@@ -26,6 +26,13 @@ type RevocablePayload = {
   issuedAtMs?: unknown;
 };
 
+/**
+ * - `revoked`: a session or user marker kills this token;
+ * - `active`: Redis answered and holds no marker for it;
+ * - `unknown`: Redis is disabled or could not answer.
+ */
+export type RevocationState = 'revoked' | 'active' | 'unknown';
+
 function getIssuedAtMs(payload: RevocablePayload): number | null {
   if (typeof payload.issuedAtMs === 'number') return payload.issuedAtMs;
   if (typeof payload.iat === 'number') return payload.iat * 1000;
@@ -44,10 +51,12 @@ function getIssuedAtMs(payload: RevocablePayload): number | null {
  *   (logout-all, ban, password change, refresh-token reuse);
  * - per-session flag — kills one session's access token (single logout).
  *
- * **Fail-open by design.** Redis is optional in this deployment; when it is
- * off or unreachable, `isRevoked` returns false and auth degrades to the
- * token's own TTL (exactly the prior behavior) instead of locking everyone
- * out. So enabling Redis strengthens revocation; losing it never breaks login.
+ * **Tri-state, not silently fail-open.** Redis is optional in this deployment
+ * (`.env.production.example` ships REDIS_REQUIRED=false), so a marker may be
+ * unreadable. `checkRevocation` reports that as `unknown` instead of pretending
+ * no marker exists, and JwtStrategy then checks the database (account status +
+ * session row). `isRevoked` keeps the boolean fail-open view for callers that
+ * have no database fallback (the WebSocket gateways).
  */
 @Injectable()
 export class SessionRevocationService {
@@ -134,12 +143,12 @@ export class SessionRevocationService {
   }
 
   /**
-   * Whether this access token has been revoked. Fail-open: with Redis off or
-   * erroring, returns false so auth degrades to the token's own TTL rather than
-   * locking everyone out.
+   * Tri-state revocation check for one access token (see RevocationState).
+   * `unknown` leaves the decision to the caller: JwtStrategy consults the
+   * database instead of letting the token through.
    */
-  async isRevoked(payload: RevocablePayload): Promise<boolean> {
-    if (!this.redis.isEnabled()) return false;
+  async checkRevocation(payload: RevocablePayload): Promise<RevocationState> {
+    if (!this.redis.isEnabled()) return 'unknown';
 
     const sid = typeof payload.sid === 'string' ? payload.sid : null;
     const sub = typeof payload.sub === 'string' ? payload.sub : null;
@@ -148,21 +157,36 @@ export class SessionRevocationService {
     const keys: string[] = [];
     if (sid) keys.push(this.sessionKey(sid));
     if (sub && issuedAtMs !== null) keys.push(this.userKey(sub));
-    if (keys.length === 0) return false;
+    if (keys.length === 0) return 'active';
 
-    const markers = await this.redis.getJsonMany<number>(keys);
+    const markers = await this.redis.getJsonMany<number>(keys, {
+      strict: true,
+    });
+    if (markers === null) return 'unknown';
+
     let markerIndex = 0;
-    if (sid && markers[markerIndex++]) return true;
+    if (sid && markers[markerIndex++]) return 'revoked';
 
     if (sub && issuedAtMs !== null) {
       const revokedAfter = markers[markerIndex];
-      if (typeof revokedAfter !== 'number') return false;
-      // Markers written before millisecond precision used epoch seconds.
-      const revokedAtMs =
-        revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
-      if (issuedAtMs <= revokedAtMs) return true;
+      if (typeof revokedAfter === 'number') {
+        // Markers written before millisecond precision used epoch seconds.
+        const revokedAtMs =
+          revokedAfter < 1_000_000_000_000 ? revokedAfter * 1000 : revokedAfter;
+        if (issuedAtMs <= revokedAtMs) return 'revoked';
+      }
     }
 
-    return false;
+    return 'active';
+  }
+
+  /**
+   * Boolean, fail-open view of checkRevocation for callers without a database
+   * fallback (the WebSocket gateways): `unknown` counts as not revoked, so a
+   * Redis outage degrades them to the token's own TTL instead of disconnecting
+   * everyone.
+   */
+  async isRevoked(payload: RevocablePayload): Promise<boolean> {
+    return (await this.checkRevocation(payload)) === 'revoked';
   }
 }

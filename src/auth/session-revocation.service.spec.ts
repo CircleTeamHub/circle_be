@@ -142,10 +142,11 @@ describe('SessionRevocationService', () => {
       ).resolves.toBe(true);
 
       expect(redis.getJsonMany).toHaveBeenCalledTimes(1);
-      expect(redis.getJsonMany).toHaveBeenCalledWith([
-        'authrev:s:s1',
-        'authrev:u:u1',
-      ]);
+      // strict：Redis 没答时回 null 而不是一组 null，才分得清「没有标记」与「查不到」。
+      expect(redis.getJsonMany).toHaveBeenCalledWith(
+        ['authrev:s:s1', 'authrev:u:u1'],
+        { strict: true },
+      );
       expect(redis.getJson).not.toHaveBeenCalled();
     });
 
@@ -284,5 +285,61 @@ describe('SessionRevocationService', () => {
         new Date(1_700_000_000_500 + 2 * 24 * 60 * 60 * 1000),
       );
     });
+  });
+});
+
+describe('SessionRevocationService.checkRevocation (tri-state)', () => {
+  // JwtStrategy 要区分「Redis 答了：没有吊销标记」（放行）与「Redis 没答」（回落
+  // 数据库）。isRevoked 保留布尔 fail-open 语义，给没有数据库回落的 WebSocket 网关。
+  const redis = {
+    isEnabled: jest.fn(),
+    getJsonMany: jest.fn(),
+  };
+  const svc = new SessionRevocationService(
+    redis as never,
+    { get: jest.fn() } as never,
+  );
+  const payload = { sub: 'u1', sid: 's1', iat: 100 };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    redis.isEnabled.mockReturnValue(true);
+  });
+
+  it('is unknown when Redis is disabled, without reading it', async () => {
+    redis.isEnabled.mockReturnValue(false);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('unknown');
+    expect(redis.getJsonMany).not.toHaveBeenCalled();
+  });
+
+  it('is unknown when the marker read fails', async () => {
+    redis.getJsonMany.mockResolvedValue(null);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('unknown');
+  });
+
+  it('is revoked when the session marker is set', async () => {
+    redis.getJsonMany.mockResolvedValue([1, null]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('revoked');
+  });
+
+  it('is revoked when the token predates the user revoke-after stamp', async () => {
+    redis.getJsonMany.mockResolvedValue([null, 200]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('revoked');
+  });
+
+  it('is active when Redis answered without markers', async () => {
+    redis.getJsonMany.mockResolvedValue([null, null]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('active');
+  });
+
+  it('keeps isRevoked fail-open for callers without a database fallback', async () => {
+    redis.getJsonMany.mockResolvedValue(null);
+
+    await expect(svc.isRevoked(payload)).resolves.toBe(false);
   });
 });
