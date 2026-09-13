@@ -41,9 +41,15 @@ describe('UserService', () => {
     invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
   const privacySettings = {
-    canViewProfileField: jest.fn(),
+    canViewProfileFields: jest.fn(),
     getSettings: jest.fn().mockResolvedValue({ addMeByAccount: true }),
   };
+  /** 按字段给出可见性，替身 PrivacySettingsService.canViewProfileFields。 */
+  const allowProfileFields = (visible: (field: string) => boolean) =>
+    privacySettings.canViewProfileFields.mockImplementation(
+      async (_targetId: string, fields: readonly string[]) =>
+        Object.fromEntries(fields.map((field) => [field, visible(field)])),
+    );
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
@@ -69,7 +75,7 @@ describe('UserService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    privacySettings.canViewProfileField.mockResolvedValue(true);
+    allowProfileFields(() => true);
     // clearAllMocks 只清调用记录、不清实现，逐个用例覆盖过的返回值会漏给下一个。
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: true });
     prisma.userLike.findUnique.mockResolvedValue(null);
@@ -300,7 +306,7 @@ describe('UserService', () => {
       nickname: 'Jimmy',
     });
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: false });
-    privacySettings.canViewProfileField.mockResolvedValue(true);
+    allowProfileFields(() => true);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
 
     await expect(
@@ -318,9 +324,7 @@ describe('UserService', () => {
       qq: '10001',
     });
     // Target set wechat/qq to private; phone stays visible.
-    privacySettings.canViewProfileField.mockImplementation(
-      (_id: string, field: string) => Promise.resolve(field === 'phoneNumber'),
-    );
+    allowProfileFields((field) => field === 'phoneNumber');
 
     const result = await service.findByExactAccountId('jimmy', 'viewer-1');
 
@@ -332,9 +336,9 @@ describe('UserService', () => {
       qq: null,
       phoneNumber: '13800000000',
     });
-    expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+    expect(privacySettings.canViewProfileFields).toHaveBeenCalledWith(
       'user-9',
-      'wechat',
+      expect.arrayContaining(['wechat']),
       false,
       false,
     );
@@ -409,9 +413,7 @@ describe('UserService', () => {
         qq: '10001',
         lastOnline: new Date('2026-09-11T08:00:00.000Z'),
       });
-      privacySettings.canViewProfileField.mockImplementation(
-        async (_targetId: string, field: string) => field === 'wechat',
-      );
+      allowProfileFields((field) => field === 'wechat');
 
       await expect(
         service.findOne('target-1', 'viewer-1'),
@@ -430,11 +432,33 @@ describe('UserService', () => {
         lastOnline: null,
         displayIcons: [],
       });
-      expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+      expect(privacySettings.canViewProfileFields).toHaveBeenCalledWith(
         'target-1',
-        'email',
+        expect.arrayContaining(['email']),
         false,
         false,
+      );
+    });
+
+    // 资料页一次要判六个字段，此前逐个调 canViewProfileField = 六条相同的
+    // userPrivacySetting 查询；现在整组交给一次 canViewProfileFields。
+    it('gates all six profile fields through one batched privacy evaluation', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'target-1' });
+
+      await service.findOne('target-1', 'viewer-1');
+
+      expect(privacySettings.canViewProfileFields).toHaveBeenCalledTimes(1);
+      const [, fields] = privacySettings.canViewProfileFields.mock.calls[0];
+      expect(fields).toHaveLength(6);
+      expect(fields).toEqual(
+        expect.arrayContaining([
+          'phoneNumber',
+          'email',
+          'wechat',
+          'qq',
+          'whatsup',
+          'lastOnline',
+        ]),
       );
     });
 
@@ -578,6 +602,30 @@ describe('UserService', () => {
       expect(result).not.toHaveProperty('storedVipLevel');
       expect(result).not.toHaveProperty('vipExpiresAt');
       expect(result).not.toHaveProperty('membership');
+    });
+
+    // update 只为判 404 就把整条资料流水线（隐私判定、图标、头像框）跑一遍，
+    // 一次 PATCH 平白多出隐私读取与第二轮图标/头像框查询。
+    it('checks existence with a bare id lookup instead of the profile pipeline', async () => {
+      await service.update('user-1', { nickname: 'jimmy' });
+
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { id: true },
+      });
+      expect(privacySettings.canViewProfileFields).not.toHaveBeenCalled();
+      expect(iconService.getDisplayIconsForUser).toHaveBeenCalledTimes(1);
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
+    });
+
+    it('still answers an unknown id with the user-not-found 404 and writes nothing', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.update('missing', { nickname: 'jimmy' }),
+      ).rejects.toThrow('User missing not found');
+      expect(prisma.user.update).not.toHaveBeenCalled();
     });
   });
 

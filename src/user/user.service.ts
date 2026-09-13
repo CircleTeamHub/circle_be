@@ -66,6 +66,16 @@ type ProfilePrivacyUser = {
   lastOnline?: Date | null;
 };
 
+// applyProfilePrivacy 遮蔽的字段，整组交给一次 canViewProfileFields 判定。
+const PROFILE_PRIVACY_FIELDS = [
+  'phoneNumber',
+  'email',
+  'wechat',
+  'qq',
+  'whatsup',
+  'lastOnline',
+] as const;
+
 type ProfileMembershipUser = {
   vipLevel?: number;
   vipExpiresAt?: Date | null;
@@ -382,58 +392,42 @@ export class UserService {
     // visibility is a global show/hide switch in the current model, not
     // friend-aware. If a "friends-only" profile tier is ever added, thread the
     // real friendship status through instead of this literal.
-    const [
-      canViewPhone,
-      canViewEmail,
-      canViewWechat,
-      canViewQQ,
-      canViewWhatsup,
-      canViewLastOnline,
-    ] = await Promise.all([
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'phoneNumber',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(user.id, 'email', isSelf, false),
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'wechat',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(user.id, 'qq', isSelf, false),
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'whatsup',
-        isSelf,
-        false,
-      ),
-      // 「显示在线时间」关着时资料页的 lastOnline 也要抹掉:聊天 presence 通道
-      // 已经收口,REST 这边不收就是第二条信道。
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'lastOnline',
-        isSelf,
-        false,
-      ),
-    ]);
+    // 六个字段只读一次对方的隐私设置（canViewProfileFields），规则与单字段版同一份。
+    // 「显示在线时间」关着时资料页的 lastOnline 也要抹掉:聊天 presence 通道
+    // 已经收口,REST 这边不收就是第二条信道。
+    const visible = await this.privacySettings.canViewProfileFields(
+      user.id,
+      PROFILE_PRIVACY_FIELDS,
+      isSelf,
+      false,
+    );
 
     return {
       ...user,
-      phoneNumber: canViewPhone ? user.phoneNumber : null,
-      email: canViewEmail ? user.email : null,
-      wechat: canViewWechat ? user.wechat : null,
-      qq: canViewQQ ? user.qq : null,
-      whatsup: canViewWhatsup ? user.whatsup : null,
-      lastOnline: canViewLastOnline ? user.lastOnline : null,
+      phoneNumber: visible.phoneNumber ? user.phoneNumber : null,
+      email: visible.email ? user.email : null,
+      wechat: visible.wechat ? user.wechat : null,
+      qq: visible.qq ? user.qq : null,
+      whatsup: visible.whatsup ? user.whatsup : null,
+      lastOnline: visible.lastOnline ? user.lastOnline : null,
     };
+  }
+
+  /**
+   * update 只需要知道这个 id 存在。此前为了判 404 把 findOne 的整条资料流水线
+   * （隐私判定、图标、头像框）跑一遍，结果全部丢掉。
+   */
+  private async assertUserExists(id: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException(`User ${id} not found`);
   }
 
   async update(id: string, input: UpdateUserInput) {
     this.assertUrlsAreSafe(input);
-    await this.findOne(id);
+    await this.assertUserExists(id);
     const normalizedInput = normalizeUpdateInput(input);
     const user = await this.prisma.$transaction(async (tx) => {
       // 响应按 SelfUserDto 序列化：与 /auth/me 同一份本人视图的列。
