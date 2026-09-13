@@ -5,6 +5,7 @@ import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { RedisService } from 'src/redis/redis.service';
 import {
   IconService,
+  JS_TRIM_CHARACTERS,
   MAX_ELIGIBILITY_CIRCLE_MEMBERSHIPS,
 } from './icon.service';
 
@@ -61,6 +62,7 @@ describe('IconService', () => {
 
   // Eligibility memberships load in two steps: $queryRaw picks the ids that
   // survive the per-user cap, then circleMember.findMany hydrates them.
+  let cappedMembershipIds: Array<{ id: string }> = [];
   const mockMemberships = (
     memberships: Array<Record<string, unknown> & { id?: string }>,
   ) => {
@@ -68,9 +70,37 @@ describe('IconService', () => {
       id: membership.id ?? `member-${index}`,
       ...membership,
     }));
-    prisma.$queryRaw.mockResolvedValue(rows.map(({ id }) => ({ id })));
+    cappedMembershipIds = rows.map(({ id }) => ({ id }));
     prisma.circleMember.findMany.mockResolvedValue(rows);
   };
+
+  // Contact columns reach eligibility only as has-a-value booleans from a
+  // second $queryRaw. Answer it from whichever user fixture this test put on
+  // user.findUnique / user.findMany (same trim rule as hasText), so tests keep
+  // describing the user with plain verifiedUser({ ... }) overrides.
+  const hasText = (value: unknown) =>
+    typeof value === 'string' && value.trim().length > 0;
+  const contactPresenceRows = async () => {
+    const users: unknown[] =
+      prisma.user.findUnique.mock.calls.length > 0
+        ? [await prisma.user.findUnique.getMockImplementation()?.()]
+        : ((await prisma.user.findMany.getMockImplementation()?.()) ?? []);
+    return users
+      .filter((user): user is Record<string, unknown> => Boolean(user))
+      .map((user) => ({
+        id: user.id,
+        hasEmail: hasText(user.email),
+        hasPhoneNumber: hasText(user.phoneNumber),
+        hasWechat: hasText(user.wechat),
+        hasQQ: hasText(user.qq),
+      }));
+  };
+  const isContactPresenceQuery = (sql: TemplateStringsArray) =>
+    sql.join('?').includes('"hasEmail"');
+  const answerQueryRaw = (sql: TemplateStringsArray) =>
+    isContactPresenceQuery(sql)
+      ? contactPresenceRows()
+      : Promise.resolve(cappedMembershipIds);
 
   const realtimeService = {
     broadcastUserProfileSummary: jest.fn(),
@@ -90,6 +120,7 @@ describe('IconService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    prisma.$queryRaw.mockImplementation(answerQueryRaw);
     // Sensible defaults: no circles, no likes, default privacy.
     mockMemberships([]);
     privacySettings.getSettings.mockResolvedValue({ ...DEFAULT_PRIVACY });
@@ -315,6 +346,69 @@ describe('IconService', () => {
     expect(
       result.systemIcons.some((icon) => icon.systemKey === 'VERIFIED_PROFILE'),
     ).toBe(false);
+  });
+
+  it('treats a whitespace-only contact as not filled in', async () => {
+    prisma.user.findUnique.mockResolvedValue(
+      verifiedUser({ wechat: ' \u3000 ', qq: null }),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    const result = await service.getIconOptions('user-1');
+
+    expect(
+      result.systemIcons.some((icon) => icon.systemKey === 'VERIFIED_PROFILE'),
+    ).toBe(false);
+  });
+
+  // 资格判定对 feed 页上的每个作者都跑一遍，此前把邮箱、手机号、微信、QQ 的明文整列
+  // 读进内存，只为判断「有没有填」。改成数据库里的布尔投影，值本身不出库。
+  it('never loads raw contact columns for eligibility (single and batch paths)', async () => {
+    prisma.user.findUnique.mockResolvedValue(verifiedUser());
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+    await service.getIconOptions('user-1');
+
+    prisma.user.findMany.mockResolvedValue([verifiedUser({ id: 'user-2' })]);
+    privacySettings.getSettingsForUsers.mockResolvedValue(
+      new Map([['user-2', { ...DEFAULT_PRIVACY }]]),
+    );
+    await service.getDisplayIconsForUsers(['user-2']);
+
+    const selects = [
+      prisma.user.findUnique.mock.calls[0][0].select,
+      prisma.user.findMany.mock.calls[0][0].select,
+    ];
+    for (const select of selects) {
+      for (const column of ['email', 'phoneNumber', 'wechat', 'qq']) {
+        expect(select).not.toHaveProperty(column);
+      }
+    }
+  });
+
+  it('asks the database only whether each contact method is filled in', async () => {
+    prisma.user.findMany.mockResolvedValue([verifiedUser({ id: 'user-1' })]);
+    privacySettings.getSettingsForUsers.mockResolvedValue(
+      new Map([['user-1', { ...DEFAULT_PRIVACY }]]),
+    );
+    prisma.userDisplayIcon.findMany.mockResolvedValue([]);
+
+    await service.getDisplayIconsForUsers(['user-1']);
+
+    const contactQuery = prisma.$queryRaw.mock.calls.find(([sql]) =>
+      isContactPresenceQuery(sql),
+    );
+    expect(contactQuery).toBeDefined();
+    const sql = (contactQuery as [TemplateStringsArray])[0].join('?');
+    for (const [column, flag] of [
+      ['email', 'hasEmail'],
+      ['phoneNumber', 'hasPhoneNumber'],
+      ['wechat', 'hasWechat'],
+      ['qq', 'hasQQ'],
+    ]) {
+      expect(sql).toContain(
+        `("${column}" IS NOT NULL AND btrim("${column}", ?) <> '') AS "${flag}"`,
+      );
+    }
   });
 
   it('awards Circle Builder for an owner/admin of a mature, >100-member circle', async () => {
@@ -800,5 +894,22 @@ describe('IconService', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+// SQL 侧用 btrim(col, JS_TRIM_CHARACTERS) 复刻 hasText 的 value.trim()：Postgres 的
+// btrim 默认只去 ASCII 空格，JS 的 trim 还会去掉 NBSP、全角空格、行分隔符等。字符集
+// 必须与运行时的 trim 完全一致，否则「只填了全角空格的微信」两条路径会判出不同结果。
+describe('JS_TRIM_CHARACTERS', () => {
+  it('is exactly the set of code points String.prototype.trim strips', () => {
+    const trimmed = new Set(JS_TRIM_CHARACTERS);
+    const mismatches: string[] = [];
+    for (let code = 0; code <= 0xffff; code += 1) {
+      const char = String.fromCharCode(code);
+      if (trimmed.has(char) !== (char.trim() === '')) {
+        mismatches.push(code.toString(16));
+      }
+    }
+    expect(mismatches).toEqual([]);
   });
 });
