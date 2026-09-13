@@ -52,7 +52,6 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 // The SYSTEM icon catalogue grows with every icon ever shipped and is read
 // whole by its endpoint, so cap it instead of letting table size decide the
 // response size.
-const MAX_AVAILABLE_ICON_ASSETS = 100;
 const MY_CIRCLES_DEFAULT_LIMIT = 100;
 
 @Injectable()
@@ -362,27 +361,10 @@ export class CircleService {
       where: { userID_circleID: { userID: userId, circleID: circleId } },
     });
 
-    const availableIconAssets = await this.prisma.iconAsset.findMany({
-      where: {
-        OR: [
-          { sourceType: 'SYSTEM' },
-          { sourceType: 'CIRCLE', circleID: circleId },
-        ],
-      },
-      select: {
-        id: true,
-        name: true,
-        imageUrl: true,
-      },
-      orderBy: [{ sourceType: 'asc' }, { createdAt: 'desc' }],
-      take: MAX_AVAILABLE_ICON_ASSETS,
-    });
-
     return {
       ...this.toCircleDto(circle),
       myRole: membership?.role ?? null,
       myStatus: membership?.status ?? null,
-      availableIconAssets,
     };
   }
 
@@ -896,7 +878,7 @@ export class CircleService {
     userId: string,
     circleId: string,
     dto: UploadCircleIconDto,
-  ) {
+  ): Promise<{ id: string; name: string; imageUrl: string | null }> {
     await this.assertOwner(userId, circleId);
     // The icon is equippable as a badge and rendered to every plaza viewer, so
     // it is at least as exposed as the avatar and gets the same origin guard.
@@ -926,7 +908,12 @@ export class CircleService {
         },
       });
 
-      return created;
+      // 只回客户端读的列:整行里的 sourceType / circleID / createdByID 是内部实现。
+      return {
+        id: created.id,
+        name: created.name,
+        imageUrl: created.imageUrl,
+      };
     });
   }
 
@@ -1036,8 +1023,6 @@ export class CircleService {
       name: circle.name,
       description: circle.description,
       avatarUrl: circle.avatarUrl,
-      ownerID: circle.ownerID,
-      currentIconAssetID: circle.currentIconAssetID ?? null,
       currentIconUrl: circle.currentIconAsset?.imageUrl ?? null,
       cover: circle.cover ?? null,
       cities: circle.cities,

@@ -319,8 +319,6 @@ export class CircleDto {
   name: string;
   description: string;
   avatarUrl: string | null;
-  ownerID: string;
-  currentIconAssetID: string | null;
   currentIconUrl: string | null;
   cover: string | null;
   cities: string[];
@@ -354,9 +352,4 @@ export class MyCircleDto extends CircleDto {
 export class CircleDetailDto extends CircleDto {
   myRole: CircleRole | null;
   myStatus: 'ACTIVE' | 'PENDING' | 'REJECTED' | null;
-  availableIconAssets?: Array<{
-    id: string;
-    name: string;
-    imageUrl: string | null;
-  }>;
 }

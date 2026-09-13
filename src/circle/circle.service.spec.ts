@@ -1190,12 +1190,13 @@ describe('CircleService', () => {
       name: 'new icon',
     });
 
-    expect(result).toEqual(
-      expect.objectContaining({
-        id: 'asset-new',
-        imageUrl: 'http://localhost:9000/avatars/new.png',
-      }),
-    );
+    // 只回客户端读的三列(circle-im uploadCircleIcon 的返回类型),
+    // 不把 sourceType / circleID / createdByID 等整行内部列透出去。
+    expect(result).toEqual({
+      id: 'asset-new',
+      name: 'new icon',
+      imageUrl: 'http://localhost:9000/avatars/new.png',
+    });
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(prisma.iconAsset.create).toHaveBeenCalledWith({
       data: {
@@ -1265,6 +1266,39 @@ describe('CircleService', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].myRole).toBe('OWNER');
+  });
+
+  // 圈子详情对每个访客都会打一次。ownerID / currentIconAssetID 客户端只声明不读
+  //(circle-im 的 Circle 类型),availableIconAssets 是图标选择器的数据源,可选择
+  // 图标的只有圈主而 App 早已不再渲染这个选择器 —— 为它每次多扫一遍 IconAsset 纯属浪费。
+  it('getCircleDetail omits owner/icon-asset internals and skips the icon picker query', async () => {
+    prisma.circle.findFirst.mockResolvedValue({
+      ...circleRow('circle-1'),
+      currentIconAssetID: 'asset-1',
+      currentIconAsset: { id: 'asset-1', imageUrl: 'http://cdn.test/icon.png' },
+      requiredVerifierCount: 1,
+      memberCanInvite: true,
+    });
+    prisma.circleMember.findUnique.mockResolvedValue({
+      role: 'MEMBER',
+      status: 'ACTIVE',
+    });
+    prisma.iconAsset.findMany.mockResolvedValue([
+      { id: 'asset-1', name: 'icon', imageUrl: 'http://cdn.test/icon.png' },
+    ]);
+
+    const detail = await service.getCircleDetail('viewer-1', 'circle-1');
+
+    expect(detail).toMatchObject({
+      id: 'circle-1',
+      currentIconUrl: 'http://cdn.test/icon.png',
+      myRole: 'MEMBER',
+      myStatus: 'ACTIVE',
+    });
+    expect(detail).not.toHaveProperty('ownerID');
+    expect(detail).not.toHaveProperty('currentIconAssetID');
+    expect(detail).not.toHaveProperty('availableIconAssets');
+    expect(prisma.iconAsset.findMany).not.toHaveBeenCalled();
   });
 
   it('caps created circles when pagination is omitted', async () => {
