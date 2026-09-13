@@ -38,7 +38,6 @@ docker compose -f monitoring/docker-compose.yml up -d
 | Grafana      | http://localhost:3001 | from `monitoring/.env` |
 | Prometheus   | http://localhost:9090 | —                      |
 | Alertmanager | http://localhost:9093 | —                      |
-| Uptime-Kuma  | http://localhost:3002 | set on first visit     |
 
 In Grafana the **Prometheus** datasource and two dashboards are auto-provisioned:
 
@@ -89,8 +88,8 @@ It takes effect immediately, with no restart. Then put the same value in
 it just keeps compose from refusing to start).
 
 > **Do not use `down -v` as the reset path.** It wipes every volume in the
-> stack, not just Grafana's: you also lose all your **Uptime-Kuma monitors and
-> notification setup** and your **Prometheus history**. Reset in place instead.
+> stack, not just Grafana's: you also lose your **Prometheus history**. Reset in
+> place instead.
 
 Stop / wipe:
 
@@ -98,8 +97,7 @@ Stop / wipe:
 docker compose -f monitoring/docker-compose.yml down       # keep data
 docker compose -f monitoring/docker-compose.yml down -v    # wipe volumes — this
                                                            # also destroys your
-                                                           # Uptime-Kuma monitors
-                                                           # and Prometheus history
+                                                           # Prometheus history
 ```
 
 ## ⚠️ Restart the backend first (dev)
@@ -196,14 +194,28 @@ Run these on the server, from the repo root, **after** the app stack is up.
    Skipping this leaves the single biggest blind spot open: nothing alerts when
    the monitoring host itself goes down.
 
-6. **Start it:**
+6. **Point the public probes at this deployment's domains.** The blackbox
+   exporter requests the public entry points the way a user does. The target
+   list is per deployment and gitignored:
+
+   ```bash
+   cp monitoring/prometheus/probe-targets/public.yml.example \
+      monitoring/prometheus/probe-targets/public.yml
+   # replace the two example hosts with API_DOMAIN / ADMIN_DOMAIN from .env
+   ```
+
+   Skipping this is not silent: `PublicProbeNotConfigured` fires once the
+   exporter has run for 10 minutes with nothing to probe. See
+   [Public reachability probes](#public-reachability-probes-blackbox_exporter).
+
+7. **Start it:**
 
    ```bash
    docker compose -f monitoring/docker-compose.yml \
                   -f monitoring/docker-compose.prod.yml up -d
    ```
 
-7. **Verify — do not skip this.** The whole failure mode here is monitoring that
+8. **Verify — do not skip this.** The whole failure mode here is monitoring that
    looks installed and reports nothing:
 
    ```bash
@@ -215,6 +227,16 @@ Run these on the server, from the repo root, **after** the app stack is up.
    `"0"` means it is reachable but rejecting you — check `lastError` on
    **Status → Targets**; `401 Unauthorized` means step 2 is wrong or stale. An
    empty `result` means no backend container exists at all.
+
+   Then check the public probes — every target should report `"1"`:
+
+   ```bash
+   docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+     exec prometheus wget -qO- 'http://localhost:9090/api/v1/query?query=probe_success'
+   ```
+
+   An empty `result` means step 6 is missing; `"0"` means the probe itself fails —
+   see [debugging a failing probe](#public-reachability-probes-blackbox_exporter).
 
 ### After rotating `METRICS_AUTH_TOKEN`
 
@@ -260,8 +282,8 @@ release), and a `color` label is added so you can tell them apart mid-release.
 
 - **Grafana is on host port 3001** (the backend owns 3000).
 - **Management UIs bind to `127.0.0.1` only** (Grafana `3001`,
-  Prometheus `9090`, Alertmanager `9093`, Uptime-Kuma `3002`). Use an SSH tunnel
-  or an authenticated reverse proxy for remote access.
+  Prometheus `9090`, Alertmanager `9093`). Use an SSH tunnel or an authenticated
+  reverse proxy for remote access.
 - **`host.docker.internal`** lets the containers reach the backend on the host;
   it works on Docker Desktop and (via `extra_hosts: host-gateway`) on Linux.
 - **macOS:** `node-exporter` measures the Docker Desktop **Linux VM**, not macOS
@@ -306,8 +328,8 @@ curl -XPOST http://localhost:9093/api/v2/alerts -H 'Content-Type: application/js
 
 Everything else here runs on the same machine as the thing it watches. When that
 machine goes down — hard crash, disk full, network cut, someone's `down -v` —
-Prometheus, Alertmanager and Uptime-Kuma all go with it and **Discord gets
-nothing**. `HostDiskFilling` and `HighMemory` are precisely the alerts whose
+Prometheus, Alertmanager and the blackbox exporter all go with it and **Discord
+gets nothing**. `HostDiskFilling` and `HighMemory` are precisely the alerts whose
 firing means the host is close to unusable, and they are delivered by the host
 that is about to become unusable.
 
@@ -363,8 +385,13 @@ at that file.
 Inhibition suppresses the alerts a known upstream failure is *guaranteed* to
 cause, so one incident is not reported five different ways:
 
-- `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox
+- `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox, and
+  the public API probe (`PublicEndpointDown` with `component="api"`)
 - `PostgresDown` → suppresses cron / outbox / 5xx
+- `TlsCertificateExpiryImminent` → suppresses `TlsCertificateExpiringSoon` for the
+  **same certificate only** (`equal: ['instance']`). The two tiers deliberately
+  have different names: under the shared-name rule below, one domain's critical
+  would mute another domain's unrelated warning.
 - any `critical` → suppresses the `warning` **with the same `alertname`**
   (the `equal: ['alertname']` there is load-bearing: without it, a single
   critical would mute every warning in the system)
@@ -372,21 +399,64 @@ cause, so one incident is not reported five different ways:
 CI asserts the three key routing paths with `amtool config routes test`, because
 a mis-routed alert fails *silently* — it just goes somewhere useless.
 
-## Uptime monitoring (Uptime-Kuma)
+## Public reachability probes (blackbox_exporter)
 
-Covers the gap Prometheus can't: **"is the service even reachable?"** Configured
-in its own UI (data persists in a volume).
+Every other job here reaches its target from **inside** the compose network, so
+it cannot see the failures that only exist on the way in: DNS pointing at the
+wrong place, an expired certificate, a broken Caddyfile, the entry point being
+blocked. Internally everything stays green while no user can connect.
 
-1. Open **http://localhost:3002**, create the admin account immediately on first
-   visit. The compose file binds this UI to `127.0.0.1` so the first-run setup is
-   not exposed to the LAN.
-2. **Add New Monitor** for each thing to watch, e.g.:
-   - Backend — `http://host.docker.internal:3000/metrics` (HTTP, accept 200)
-   - Grafana — `http://grafana:3000` · Prometheus — `http://prometheus:9090/-/healthy`
-   - OpenIM / your public API URL
-3. **Settings → Notifications → Setup Notification → Discord**, paste the same
-   webhook URL → assign it to the monitors. Uptime-Kuma pings Discord directly
-   (no Alertmanager involved).
+The blackbox exporter closes that gap by requesting the public URLs the way a
+user does — DNS, TLS, Caddy, then the service. It replaced Uptime-Kuma: the
+probe list lives in the repository instead of a web UI's volume, and failures go
+through the same Alertmanager tiers and inhibition as every other alert instead
+of posting to Discord on their own.
+
+It runs **only in the prod overlay** — a dev machine has no public domain to
+probe.
+
+| Piece | Where |
+| ----- | ----- |
+| Probe module `http_2xx` (HTTPS required, only `200` counts, IPv4 first) | [`blackbox/blackbox.yml`](blackbox/blackbox.yml) |
+| Scrape jobs `blackbox-http` and `blackbox-exporter` | [`prometheus/prometheus.prod.yml`](prometheus/prometheus.prod.yml) |
+| Targets (per deployment, gitignored) | `prometheus/probe-targets/public.yml`, from [`public.yml.example`](prometheus/probe-targets/public.yml.example) |
+
+Probe `/healthz`, not `/readyz`: Caddy deliberately answers `/readyz` with `404`
+on the public side, and `/healthz` exists for exactly this. Keep the `component`
+label — Alertmanager uses `component="api"` to mute the API probe while the
+whole backend is absent (the same incident), while the admin site keeps
+alerting. Prometheus notices edits to the targets file on its own; no restart
+needed.
+
+| Alert | Severity | Fires when |
+| ----- | -------- | ---------- |
+| `PublicEndpointDown` | critical | a probe keeps failing for 2m |
+| `TlsCertificateExpiringSoon` | warning | a certificate has < 14 days left. Caddy renews at ~30 days, so this means renewal keeps failing |
+| `TlsCertificateExpiryImminent` | critical | a certificate has < 3 days left. Mutes that same certificate's `TlsCertificateExpiringSoon` (matched on `instance`), never another domain's |
+| `PublicProbeNotConfigured` | warning | the exporter has run for 10m with nothing to probe |
+
+To see **why** a probe fails, ask the exporter for its debug trace:
+
+```bash
+docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+  exec prometheus wget -qO- \
+  'http://blackbox-exporter:9115/probe?module=http_2xx&debug=true&target=https://api.example.com/healthz'
+```
+
+> **This does not cover the host going down.** The exporter runs on the same
+> machine as everything it probes — a dead host takes it along. That is the
+> [external heartbeat](#external-heartbeat-dead-mans-switch)'s job.
+
+### Migrating from Uptime-Kuma
+
+The service is gone from both compose files. On a server that ran it, remove the
+orphaned container, and its volume once you no longer need the history:
+
+```bash
+docker compose -f monitoring/docker-compose.yml -f monitoring/docker-compose.prod.yml \
+  up -d --remove-orphans
+docker volume rm monitoring_uptime_kuma_data
+```
 
 ## Production
 
@@ -397,9 +467,10 @@ in its own UI (data persists in a volume).
   the overlay. Bump the pins deliberately, one image at a time, reading release
   notes; a surprise major upgrade tends to land while you are already debugging
   something else.
-- Keep `/metrics`, Prometheus, Grafana, Alertmanager, and Uptime-Kuma on an
-  internal network — do not expose them publicly (see the security note in
-  `../docs/metrics.md`).
+- Keep `/metrics`, Prometheus, Grafana, Alertmanager, and the blackbox exporter
+  on an internal network — do not expose them publicly (see the security note in
+  `../docs/metrics.md`). The exporter in particular requests whatever `target=`
+  it is handed, so a published port would turn it into an open proxy.
 - Supply `GRAFANA_ADMIN_PASSWORD` from a secret manager rather than a
   `monitoring/.env` file on the box.
 - **The base compose file targets the dev backend.** Scraping production needs
@@ -413,5 +484,3 @@ in its own UI (data persists in a volume).
   monitoring UIs; do not publish the compose ports directly.
 - Provide `alertmanager/discord.url` through a secret manager or secure runtime
   mount instead of copying a webhook file onto the server manually.
-- Keep Uptime-Kuma behind a private network or reverse proxy with authentication;
-  do not expose the first-run setup publicly.

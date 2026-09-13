@@ -218,3 +218,64 @@ test('OutboxProbeStale covers the queue whose probe silently keeps failing', () 
   assert.match(expr, /circle_outbox_last_probe_timestamp_seconds/);
   assert.match(expr, /time\(\) -/);
 });
+
+/** 同名的所有告警块（同一个告警名按严重度分档时会有多条）。 */
+function alertExprs(name) {
+  const blocks = [
+    ...RULES.matchAll(
+      new RegExp(`- alert: ${name}\\n([\\s\\S]*?)(?=\\n {6}- alert:|\\n {2}- name:|$)`, 'g'),
+    ),
+  ].map((m) => m[1]);
+  assert.ok(blocks.length > 0, `alert ${name} not found`);
+  return blocks;
+}
+
+test('a broken public entry point pages, but a single probe blip does not', () => {
+  // 其余告警都来自 compose 内网里的直连：DNS 指错、证书过期、Caddy 配坏时它们
+  // 一切正常，而用户已经进不来。这条是唯一从用户的路径看服务的信号。
+  const expr = alertExpr('PublicEndpointDown');
+  assert.match(expr, /probe_success\{job="blackbox-http"\} == 0/);
+  assert.match(expr, /for: 2m/);
+  assert.match(expr, /severity: critical/);
+});
+
+test('certificate expiry escalates per certificate, never across domains', () => {
+  // Caddy 在剩 ~30 天时续期：剩 14 天说明续期已经连续失败两周多。
+  const warning = alertExpr('TlsCertificateExpiringSoon');
+  const critical = alertExpr('TlsCertificateExpiryImminent');
+  for (const expr of [warning, critical]) {
+    assert.match(expr, /probe_ssl_earliest_cert_expiry\{job="blackbox-http"\} - time\(\)/);
+  }
+  assert.match(warning, /< 14 \* 86400/);
+  assert.match(warning, /severity: warning/);
+  assert.match(critical, /< 3 \* 86400/);
+  assert.match(critical, /severity: critical/);
+
+  // 两档必须是不同的告警名。共用一个名字时，通用的「critical 压掉同名 warning」
+  // 抑制只比 alertname：api 证书的 critical 会把 admin 证书那条毫不相干的 warning
+  // 一起静音 —— 两个域名各自续期，同时出问题完全可能。
+  assert.equal(alertExprs('TlsCertificateExpiringSoon').length, 1);
+  // 同一张证书两档都响时只留 critical：这条抑制必须按 instance 配对。
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "TlsCertificateExpiryImminent"\n\s*target_matchers:\n\s*- alertname = "TlsCertificateExpiringSoon"\n\s*equal: \['instance'\]/,
+  );
+});
+
+test('an empty probe list is loud, but only where the blackbox exporter runs', () => {
+  const expr = alertExpr('PublicProbeNotConfigured');
+  // 目标文件漏配时 probe_success 根本不存在，上面两条永远不会响。
+  assert.match(expr, /absent\(probe_success\{job="blackbox-http"\}\)/);
+  // exporter 只在生产 overlay 里：少了这个前提，每台开发机上都会常年红。
+  assert.match(expr, /and on\(\) \(up\{job="blackbox-exporter"\} == 1\)/);
+  assert.match(expr, /severity: warning/);
+});
+
+test('a missing backend mutes the API probe it necessarily breaks, but not the admin site', () => {
+  // 后端一个副本都不在时，公网 API 探测必然失败 —— 同一件事不报两遍。管理后台是
+  // 另一个容器，它的探测失败和后端无关，必须照常报，所以只压 component="api"。
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "CircleBeNoTarget"\n\s*target_matchers:\n\s*- alertname = "PublicEndpointDown"\n\s*- component = "api"/,
+  );
+});

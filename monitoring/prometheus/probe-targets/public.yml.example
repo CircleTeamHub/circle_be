@@ -1,0 +1,22 @@
+# 公网可达性探测目标（Prometheus file_sd 格式），由 prometheus.prod.yml 的
+# blackbox-http job 读取。
+#
+#   cp monitoring/prometheus/probe-targets/public.yml.example \
+#      monitoring/prometheus/probe-targets/public.yml
+#
+# 然后把两个示例域名换成 .env 里的 API_DOMAIN / ADMIN_DOMAIN。public.yml 被
+# gitignore，不进仓库。Prometheus 会自己发现文件改动，不用重启。
+#
+# API 探 /healthz：它只回存活、不带依赖信息，公网本来就是为外部探测留着它的；
+# 带依赖状态的就绪探针被 Caddy 对公网返回 404，探它等于常年红。
+#
+# component 标签不是装饰：后端整个不在时，Alertmanager 靠 component="api" 压掉
+# API 这一路的探测告警（那是同一件事），管理后台的探测照常报。
+- targets:
+    - https://api.example.com/healthz
+  labels:
+    component: api
+- targets:
+    - https://admin.example.com/
+  labels:
+    component: admin

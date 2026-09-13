@@ -1,0 +1,25 @@
+# blackbox_exporter 的探测模块（monitoring/docker-compose.prod.yml 把它挂进容器）。
+#
+# 目标列表不在这里，在 monitoring/prometheus/probe-targets/*.yml：Prometheus 把
+# 每个目标地址作为 ?target= 参数交给 exporter，由它按下面的模块去探测。
+#
+# 字段名对照的是 blackbox_exporter v0.28.0 的 CONFIGURATION.md。CI 用同一版本跑
+# --config.check；本地校验：
+#
+#   docker run --rm -v "$PWD/monitoring/blackbox:/cfg:ro" \
+#     prom/blackbox-exporter:v0.28.0 --config.file=/cfg/blackbox.yml --config.check
+modules:
+  # 公网 HTTPS 入口：只认 200，而且必须走 TLS。证书出问题时如果退回明文、或者
+  # 返回一个错误页，这里都要判失败，不能被 3xx/4xx 糊弄过去。
+  http_2xx:
+    prober: http
+    # 必须小于 Prometheus 的 scrape_timeout（默认 10s）：否则一次慢响应会被当成
+    # 抓取失败（报 TargetDown），而不是探测失败（报 PublicEndpointDown）。
+    timeout: 5s
+    http:
+      method: GET
+      valid_status_codes: [200]
+      fail_if_not_ssl: true
+      # blackbox 默认优先 IPv6。服务器和不少出口网络没有可用的 IPv6，先试一轮
+      # 再回落只会拖慢探测、制造假失败。
+      preferred_ip_protocol: ip4

@@ -45,6 +45,25 @@ inhibit_rules:
     # 所以 equal 留空 —— 只要 source 在 firing 就抑制，不做标签配对。
     equal: []
 
+  # 同理，后端一个副本都不在时，经公网访问 API 的探测必然失败 —— 同一件事不报
+  # 两遍。只压 component="api"：管理后台是另一个容器，它的探测失败和后端无关，
+  # 必须照常报。component 标签来自 monitoring/prometheus/probe-targets/public.yml。
+  - source_matchers:
+      - alertname = "CircleBeNoTarget"
+    target_matchers:
+      - alertname = "PublicEndpointDown"
+      - component = "api"
+    equal: []
+
+  # 同一张证书剩不到 3 天时只留 critical。必须按 instance 配对：探测的是好几个
+  # 域名、各自续期，只比告警名的话，一张证书的 critical 会静音另一张的 warning。
+  # 也正因如此两档用了不同的告警名，文件末尾那条通用的同名抑制管不到它们。
+  - source_matchers:
+      - alertname = "TlsCertificateExpiryImminent"
+    target_matchers:
+      - alertname = "TlsCertificateExpiringSoon"
+    equal: ['instance']
+
   # 数据库挂了 → 所有依赖它的任务/队列都会积压，别再各报一遍。
   #
   # OutboxProbeStale 也在内：探测本身就是读 Postgres，库一挂**五个队列**的

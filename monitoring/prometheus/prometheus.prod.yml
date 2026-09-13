@@ -15,7 +15,10 @@
 #   - the postgres/redis exporter jobs, which exist only here. On a dev machine
 #     Postgres and Redis often are not in Docker (or not running at all), so
 #     putting them in the base file would mean two permanently DOWN targets —
-#     which just teaches everyone to ignore red.
+#     which just teaches everyone to ignore red;
+#   - the blackbox-http / blackbox-exporter jobs (public reachability probes),
+#     which exist only here for the same reason: a dev machine has no public
+#     domain to probe.
 
 global:
   scrape_interval: 15s
@@ -110,3 +113,38 @@ scrape_configs:
   - job_name: redis-exporter
     static_configs:
       - targets: ['redis-exporter:9121']
+
+  # ── 公网可达性探测（blackbox-exporter）────────────────────────────────
+  # 上面的 job 都在 compose 内网里直连容器，看不到只发生在「进来的路上」的故障：
+  # DNS 指错、证书过期、Caddy 配坏、入口被拦 —— 内网一切正常，用户却进不来。
+  # 这里让 exporter 按用户的路径去请求公网地址（DNS → TLS → Caddy → 服务）。
+  #
+  # 目标按部署填写、不进仓库：从 probe-targets/public.yml.example 复制出
+  # public.yml。文件不存在时这个 job 没有目标、probe_success 根本不存在 ——
+  # PublicProbeNotConfigured 专门抓这种「看着装好了、其实什么都没探」的状态。
+  # file_sd 会监视文件改动，改完不用重启。
+  #
+  # 30s 一次足够：可达性故障以分钟计，没必要按 15s 的全局频率去打公网入口。
+  - job_name: blackbox-http
+    metrics_path: /probe
+    scrape_interval: 30s
+    params:
+      module: [http_2xx]
+    file_sd_configs:
+      - files: ['/etc/prometheus/probe-targets/*.yml']
+    relabel_configs:
+      # 目标地址不是抓取对象，而是交给 exporter 的 ?target= 参数。
+      - source_labels: [__address__]
+        target_label: __param_target
+      # instance 用被探测的 URL，告警里才看得出是哪个入口。
+      - source_labels: [__param_target]
+        target_label: instance
+      # 真正被抓取的是 exporter 自己。
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # exporter 本身也要抓：它挂了 TargetDown 才会响，PublicProbeNotConfigured 也靠
+  # 这里的 up 判断「exporter 确实在跑」。
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ['blackbox-exporter:9115']
