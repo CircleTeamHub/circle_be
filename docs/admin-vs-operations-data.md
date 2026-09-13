@@ -48,7 +48,8 @@ Admin data is for moderators, support, and business operators. It should answer:
 
 - `GET /api/v1/admin/friend-reports`
 - `POST /api/v1/admin/friend-reports/:reportId/review`
-- `GET /api/v1/user`
+- `GET /api/v1/admin/users`（脱敏列表；原先明文返回联系方式、不经隐私开关的
+  `GET /api/v1/user` / `POST /api/v1/user` 已移除）
 - `PATCH /api/v1/admin/users/:id/status`（唯一的状态变更入口，带审计留痕；
   原先无审计的 `PATCH /api/v1/user/:id/status` 已随 #121 移除）
 - `GET /api/v1/auth/me`

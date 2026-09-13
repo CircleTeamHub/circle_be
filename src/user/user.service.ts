@@ -1,18 +1,11 @@
 import {
   BadRequestException,
-  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
-  ServiceUnavailableException,
 } from '@nestjs/common';
-import {
-  AuthErrorCode,
-  ChatErrorCode,
-  UserErrorCode,
-} from 'src/common/app-error-codes';
-import * as argon2 from 'argon2';
+import { ChatErrorCode, UserErrorCode } from 'src/common/app-error-codes';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { normalizeUserIdAlias } from './user-id-alias';
@@ -22,17 +15,11 @@ import {
   assertUrlsFromStorage,
   storagePublicObjectBasesFromConfig,
 } from 'src/utils/storage-url';
-import { GetUserDto } from './dto/get-user.dto';
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { USER_PROFILE_SELECT } from './user.select';
 import { likedOnToday } from '../like/like.util';
-import {
-  generateUniqueRegistrationCode,
-  isInviteCodeUniqueCollision,
-  REGISTRATION_CODE_MAX_ATTEMPTS,
-} from 'src/auth/account-id.unique';
 import {
   resolveMembershipAppearance,
   toPublicMembershipAppearance,
@@ -53,18 +40,11 @@ const URL_FIELDS: (keyof UpdateUserInput)[] = [
   'cover',
 ];
 
-export interface CreateUserInput {
-  accountId: string;
-  password: string;
-  nickname?: string;
-}
-
 export interface UpdateUserInput {
   nickname?: string;
   avatarUrl?: string;
   avatarFrame?: string;
   cover?: string;
-  email?: string;
   phoneNumber?: string;
   wechat?: string;
   qq?: string;
@@ -168,8 +148,10 @@ function normalizeBirthdayInput(value: string | null | undefined) {
 
 // Optional text fields where a blank (empty / whitespace-only) value means
 // "clear it" — persisted as null instead of an empty string. Excludes required
-// fields (nickname) and format-validated fields (email, avatar URLs), which the
-// DTO layer rejects when blank so they never reach here empty.
+// fields (nickname) and format-validated fields (avatar URLs), which the DTO
+// layer rejects when blank so they never reach here empty. email is deliberately
+// absent from UpdateUserInput altogether: it is the login identity, not profile
+// data, and changing it is the first step of a password-reset account takeover.
 const BLANKABLE_TEXT_FIELDS: ReadonlySet<keyof UpdateUserInput> = new Set([
   'phoneNumber',
   'wechat',
@@ -318,36 +300,6 @@ export class UserService {
       this.storagePublicObjectBases,
       'profile image url',
     );
-  }
-
-  async findAll(query: GetUserDto) {
-    const { limit = 10, page = 1, accountId, status } = query;
-    const take = limit;
-    const skip = (page - 1) * take;
-    const where =
-      accountId || status
-        ? {
-            ...(accountId ? { accountId: { contains: accountId } } : {}),
-            ...(status ? { status } : {}),
-          }
-        : undefined;
-
-    const [data, total] = await Promise.all([
-      this.prisma.user.findMany({ where, select: PUBLIC_SELECT, take, skip }),
-      this.prisma.user.count({ where }),
-    ]);
-
-    const appearances = await this.avatarFrames.resolvePublicAppearances(
-      data.map((user) => user.id),
-    );
-    return {
-      data: data.map((user) =>
-        toPublicUser(user, appearances.get(user.id)?.avatarFrame ?? null),
-      ),
-      total,
-      page,
-      limit: take,
-    };
   }
 
   async findByExactAccountId(accountId: string | undefined, viewerId?: string) {
@@ -514,98 +466,6 @@ export class UserService {
       whatsup: canViewWhatsup ? user.whatsup : null,
       lastOnline: canViewLastOnline ? user.lastOnline : null,
     };
-  }
-
-  async create(input: CreateUserInput) {
-    const normalizedAccountId = input.accountId.trim().toLowerCase();
-    const identifierClaim = await this.prisma.accountIdentifier.findUnique({
-      where: { value: normalizedAccountId },
-      select: {
-        currentUserID: true,
-        reservedForUserID: true,
-        inviteOwnerUserID: true,
-        fancyNumber: { select: { id: true } },
-      },
-    });
-    if (
-      identifierClaim &&
-      (identifierClaim.currentUserID !== null ||
-        identifierClaim.reservedForUserID !== null ||
-        identifierClaim.inviteOwnerUserID !== null ||
-        identifierClaim.fancyNumber !== null)
-    ) {
-      throw this.accountIdTaken();
-    }
-
-    const passwordHash = await argon2.hash(input.password);
-    for (
-      let attempt = 0;
-      attempt < REGISTRATION_CODE_MAX_ATTEMPTS;
-      attempt += 1
-    ) {
-      const inviteCode = await generateUniqueRegistrationCode(this.prisma);
-      try {
-        const user = await this.prisma.user.create({
-          data: {
-            accountId: input.accountId,
-            inviteCode,
-            passwordHash,
-            nickname: input.nickname || input.accountId,
-          },
-          select: PUBLIC_SELECT,
-        });
-        let appearances = new Map<string, PublicUserAppearance>();
-        try {
-          appearances = await this.avatarFrames.resolvePublicAppearances([
-            user.id,
-          ]);
-        } catch {
-          this.logger.warn(
-            'Avatar-frame appearance lookup failed after user creation',
-          );
-        }
-        return toPublicUser(
-          user,
-          appearances.get(user.id)?.avatarFrame ?? null,
-        );
-      } catch (error) {
-        if (this.isAccountIdentifierCollision(error, normalizedAccountId)) {
-          throw this.accountIdTaken();
-        }
-        if (this.isAccountIdentifierCollision(error, inviteCode)) {
-          if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
-          break;
-        }
-        if (isInviteCodeUniqueCollision(error)) {
-          if (attempt < REGISTRATION_CODE_MAX_ATTEMPTS - 1) continue;
-          break;
-        }
-        throw error;
-      }
-    }
-
-    throw new ServiceUnavailableException(
-      'Failed to create a user with a unique invite code',
-    );
-  }
-
-  private accountIdTaken() {
-    return new ConflictException({
-      message: '该账号已被占用',
-      errorCode: AuthErrorCode.AccountIdTaken,
-    });
-  }
-
-  private isAccountIdentifierCollision(error: unknown, value: string): boolean {
-    const message =
-      error instanceof Error
-        ? error.message
-        : typeof error === 'object' && error !== null && 'message' in error
-          ? String(error.message)
-          : String(error);
-    return message
-      .toLowerCase()
-      .includes(`account identifier collision: ${value.toLowerCase()}`);
   }
 
   async update(id: string, input: UpdateUserInput) {

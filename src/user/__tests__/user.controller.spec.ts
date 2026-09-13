@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { Role } from 'src/enum/roles.enum';
@@ -9,9 +9,9 @@ import { UserService } from '../user.service';
 describe('UserController', () => {
   let controller: UserController;
   const userService = {
-    findAll: jest.fn(),
     findByExactAccountId: jest.fn(),
     getAppearances: jest.fn(),
+    update: jest.fn(),
     updateStatus: jest.fn((id: string, status: string) => ({ id, status })),
     remove: jest.fn((id: string) => ({ id })),
   };
@@ -35,6 +35,18 @@ describe('UserController', () => {
     expect(controller).toBeDefined();
   });
 
+  // 管理台只用 /admin/users（脱敏 + 审计留痕）。旧的 GET/POST /user 把每个用户的
+  // 邮箱/手机/微信/QQ/生日明文交给任何 role=ADMIN 的 token，不经隐私开关也不留痕，
+  // 所以是删掉而不是再加一层守卫。
+  it('no longer exposes the legacy admin list/create routes', () => {
+    const proto = UserController.prototype as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(proto.getUsers).toBeUndefined();
+    expect(proto.addUser).toBeUndefined();
+  });
+
   it('allows authenticated users to search by exact accountId', async () => {
     userService.findByExactAccountId.mockResolvedValue({
       id: 'user-2',
@@ -55,6 +67,42 @@ describe('UserController', () => {
       'jimmy',
       'viewer-1',
     );
+  });
+
+  // U5: `?accountId=a&accountId=b` 到达 handler 时是 string[]，service 里的
+  // .trim() 会抛 TypeError → 500 + Sentry 噪音，而这本是客户端传错参数。
+  it('rejects a non-string or overlong accountId query with 400 instead of a 500', () => {
+    const req = { user: { userId: 'viewer-1' } } as never;
+    expect(() =>
+      controller.searchUserByAccountId(['a', 'b'] as unknown as string, req),
+    ).toThrow(BadRequestException);
+    expect(() => controller.searchUserByAccountId('x'.repeat(65), req)).toThrow(
+      BadRequestException,
+    );
+    expect(userService.findByExactAccountId).not.toHaveBeenCalled();
+  });
+
+  // U3: 任何 role=ADMIN 的 token（不分 audience）都能改别人的资料且不写
+  // AdminAuditLog；#121 已经因为同样的理由删掉了同级的 admin status 路由。
+  it('rejects an ADMIN token patching another user profile (self only)', () => {
+    expect(() =>
+      controller.updateUser({ nickname: 'pwned' } as never, 'user-2', {
+        user: { userId: 'user-1', accountId: 'admin', role: Role.Admin },
+      } as never),
+    ).toThrow(ForbiddenException);
+    expect(userService.update).not.toHaveBeenCalled();
+  });
+
+  it('still lets a user patch their own profile', () => {
+    userService.update.mockReturnValue({ id: 'user-1', nickname: 'me' });
+    expect(
+      controller.updateUser({ nickname: 'me' } as never, 'user-1', {
+        user: { userId: 'user-1', accountId: 'self', role: Role.User },
+      } as never),
+    ).toEqual({ id: 'user-1', nickname: 'me' });
+    expect(userService.update).toHaveBeenCalledWith('user-1', {
+      nickname: 'me',
+    });
   });
 
   it('allows a user to delete their own account', () => {
@@ -98,18 +146,6 @@ describe('UserController', () => {
         user: { userId: 'user-1', accountId: 'self', role: Role.User },
       } as any),
     ).toThrow(ForbiddenException);
-  });
-
-  it('passes admin user-list queries through to the service', () => {
-    userService.findAll.mockReturnValue({ data: [], total: 0 });
-
-    expect(
-      controller.getUsers({ accountId: 'foo', status: 'BANNED' as any }),
-    ).toEqual({ data: [], total: 0 });
-    expect(userService.findAll).toHaveBeenCalledWith({
-      accountId: 'foo',
-      status: 'BANNED',
-    });
   });
 
   it('delegates appearance batches and preserves 200 response semantics', async () => {

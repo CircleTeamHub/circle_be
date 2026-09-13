@@ -1,4 +1,6 @@
+import { plainToInstance } from 'class-transformer';
 import { ChatErrorCode } from 'src/common/app-error-codes';
+import { ProfileUserDto, PublicUserDto } from './dto/public-user.dto';
 import { UserService } from './user.service';
 
 /**
@@ -104,6 +106,37 @@ describe('UserService.findOne profile visibility', () => {
     });
   });
 
+  it('nulls email for other viewers unless the target enabled showEmail', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'target',
+      nickname: '目标',
+      avatarUrl: null,
+      phoneNumber: null,
+      email: 'target@example.com',
+      wechat: null,
+      qq: null,
+      whatsup: null,
+      receivedLikeCount: 3,
+    });
+
+    await expect(service.findOne('target', 'viewer')).resolves.toMatchObject({
+      email: null,
+    });
+
+    privacySettings.canViewProfileField.mockImplementation(
+      async (_id: string, field: string) => field === 'email',
+    );
+    await expect(service.findOne('target', 'viewer')).resolves.toMatchObject({
+      email: 'target@example.com',
+    });
+    expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+      'target',
+      'email',
+      false,
+      false,
+    );
+  });
+
   it('never gates the user against themselves, and skips the gate for anonymous reads', async () => {
     prisma.chatMember.findMany.mockResolvedValue(closedSharedGroup);
     await expect(service.findOne('target', 'target')).resolves.toMatchObject({
@@ -115,5 +148,27 @@ describe('UserService.findOne profile visibility', () => {
       id: 'target',
     });
     expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+  });
+});
+
+// 「显示邮箱」开关此前是个空操作：service 已按 showEmail 把 email 置空/保留，
+// 但 GET /user/:id 序列化用的 ProfileUserDto 根本没有 email 字段，开了也看不到。
+describe('ProfileUserDto email exposure (showEmail toggle)', () => {
+  it('keeps email on the profile view so the privacy toggle has an effect', () => {
+    const dto = plainToInstance(
+      ProfileUserDto,
+      { id: 'target', email: 'target@example.com' },
+      { excludeExtraneousValues: true },
+    );
+    expect(dto.email).toBe('target@example.com');
+  });
+
+  it('still strips email from PublicUserDto (account search must stay email-free)', () => {
+    const dto = plainToInstance(
+      PublicUserDto,
+      { id: 'target', email: 'target@example.com' },
+      { excludeExtraneousValues: true },
+    );
+    expect((dto as unknown as Record<string, unknown>).email).toBeUndefined();
   });
 });

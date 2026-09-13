@@ -18,6 +18,7 @@ import { EmailVerificationService } from '../email-verification.service';
 import { Prisma } from 'src/generated/prisma';
 import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { AuthErrorCode } from 'src/common/app-error-codes';
 
 describe('AuthService', () => {
   let service: AuthService;
@@ -751,6 +752,34 @@ describe('AuthService', () => {
       }),
     );
     expect(users[0].lastOnline.getTime()).toBeGreaterThanOrEqual(beforeRefresh);
+    // A plain USER session is never revoked by the role gate below.
+    expect(mockRefreshTokenService.revokeAll).not.toHaveBeenCalled();
+  });
+
+  it('refresh rejects ADMIN accounts on the APP audience and revokes their sessions', async () => {
+    // 晋升成 ADMIN 之前签发的 APP refresh token 否则会一直续签出 role=ADMIN 的
+    // APP access token，绕开 /auth/admin/* 的短 TTL 与审计模型。拒绝文案与 login()
+    // 对 ADMIN 账号的处理完全一致，不给「这是管理员账号」的探测器。
+    users.push({
+      id: 'uuid-1',
+      accountId: 'admin',
+      passwordHash: 'hash',
+      status: 'ACTIVE',
+      role: 'ADMIN',
+      lastOnline: null,
+    });
+
+    const error: unknown = await service
+      .refresh('refresh-token')
+      .catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ForbiddenException);
+    expect((error as ForbiddenException).getResponse()).toMatchObject({
+      message: '邮箱、用户ID或密码错误',
+      errorCode: AuthErrorCode.InvalidCredentials,
+    });
+    expect(mockRefreshTokenService.revokeAll).toHaveBeenCalledWith('uuid-1');
+    expect(mockJwt.signAsync).not.toHaveBeenCalled();
   });
 
   it('adminRefresh rotates only admin refresh sessions and returns an admin-audience token', async () => {

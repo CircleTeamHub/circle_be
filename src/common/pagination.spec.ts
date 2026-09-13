@@ -41,7 +41,6 @@ describe('offset pagination bounds', () => {
       'src/circle-plaza/dto/circle-plaza.dto.ts',
       'src/note/dto/note.dto.ts',
       'src/trace/dto/trace.dto.ts',
-      'src/user/dto/get-user.dto.ts',
       'src/friend/dto/friend-report-admin.dto.ts',
       'src/admin-community/admin-community.dto.ts',
       'src/admin-user/dto/admin-user.dto.ts',
