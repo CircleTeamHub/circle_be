@@ -3814,35 +3814,48 @@ export class ChatService {
       member,
       userId,
     );
-    const row = await this.prisma.chatMessage.findUnique({
-      where: { id: messageId },
-      select: { conversationID: true, deleted: true, revokedAt: true },
-    });
-    if (!row || row.conversationID !== conversationId || row.deleted) {
-      throw new NotFoundException({
-        message: '消息不存在',
-        errorCode: ChatErrorCode.MessageNotFound,
-      });
-    }
-    if (row.revokedAt) {
-      // 已撤回的消息不接受新回应;静默无变化,不给撤回消息续热度。
-      return { changed: false };
-    }
-    if (op === 'add') {
-      try {
-        await this.prisma.chatMessageReaction.create({
-          data: { messageID: messageId, userID: userId, emoji },
+    return this.prisma.$transaction(async (tx) => {
+      // 禁言、全员禁言和表情写入共用会话行锁。拿锁后再跑权威校验，
+      // 让并发变更有明确顺序：先提交的状态决定后拿锁的操作能否继续。
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
+      if (locked.length === 0) {
+        throw new NotFoundException({
+          message: '会话不存在',
+          errorCode: ChatErrorCode.ConversationNotFound,
         });
-        return { changed: true };
-      } catch (error) {
-        if (this.isUniqueViolation(error)) return { changed: false };
-        throw error;
       }
-    }
-    const removed = await this.prisma.chatMessageReaction.deleteMany({
-      where: { messageID: messageId, userID: userId, emoji },
+      await this.assertStillSendable(tx, conversationId, userId);
+
+      const row = await tx.chatMessage.findUnique({
+        where: { id: messageId },
+        select: { conversationID: true, deleted: true, revokedAt: true },
+      });
+      if (!row || row.conversationID !== conversationId || row.deleted) {
+        throw new NotFoundException({
+          message: '消息不存在',
+          errorCode: ChatErrorCode.MessageNotFound,
+        });
+      }
+      if (row.revokedAt) {
+        // 已撤回的消息不接受新回应;静默无变化,不给撤回消息续热度。
+        return { changed: false };
+      }
+      if (op === 'add') {
+        // 不能在 PostgreSQL 事务里捕获唯一约束错误后继续提交：语句错误会
+        // 把整个事务置为 aborted。skipDuplicates 保留幂等语义且不破坏事务。
+        const added = await tx.chatMessageReaction.createMany({
+          data: { messageID: messageId, userID: userId, emoji },
+          skipDuplicates: true,
+        });
+        return { changed: added.count > 0 };
+      }
+      const removed = await tx.chatMessageReaction.deleteMany({
+        where: { messageID: messageId, userID: userId, emoji },
+      });
+      return { changed: removed.count > 0 };
     });
-    return { changed: removed.count > 0 };
   }
 
   /**

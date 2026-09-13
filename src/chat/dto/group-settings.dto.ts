@@ -12,6 +12,9 @@ export const GROUP_NOTICE_MAX_LENGTH = 500;
 
 export class SetGroupMuteAllDto {
   @ApiProperty({ description: 'true=开启全员禁言;false=解除' })
+  // 全局 ValidationPipe 开着 enableImplicitConversion，会把字符串 "false"
+  // 转成 true。读取转换前的原值，让 IsBoolean 拒绝非 JSON boolean。
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.enabled)
   @IsBoolean()
   enabled!: boolean;
 }
@@ -66,26 +69,37 @@ export class SetMyGroupAliasDto {
 
 export class UpdateGroupPoliciesDto {
   @ApiPropertyOptional({ description: '普通成员能否拉人进群' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.memberCanInvite)
   @IsOptional()
   @IsBoolean()
   memberCanInvite?: boolean;
 
   @ApiPropertyOptional({ description: '群二维码能否入群' })
+  @Transform(({ obj }: { obj: Record<string, unknown> }) => obj.qrJoinEnabled)
   @IsOptional()
   @IsBoolean()
   qrJoinEnabled?: boolean;
 
   @ApiPropertyOptional({ description: '普通成员能否看到群成员名单' })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.membersCanViewRoster,
+  )
   @IsOptional()
   @IsBoolean()
   membersCanViewRoster?: boolean;
 
   @ApiPropertyOptional({ description: '普通成员能否从群里打开其他成员资料' })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.membersCanViewProfiles,
+  )
   @IsOptional()
   @IsBoolean()
   membersCanViewProfiles?: boolean;
 
   @ApiPropertyOptional({ description: '普通成员能否通过群加其他成员为好友' })
+  @Transform(
+    ({ obj }: { obj: Record<string, unknown> }) => obj.membersCanAddFriends,
+  )
   @IsOptional()
   @IsBoolean()
   membersCanAddFriends?: boolean;

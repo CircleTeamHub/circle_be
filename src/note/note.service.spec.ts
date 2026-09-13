@@ -3001,6 +3001,39 @@ describe('NoteService', () => {
     },
   );
 
+  it('caps derived content by Unicode code points without splitting or dropping emoji', async () => {
+    const emojiContent = '😀'.repeat(20_000);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-emoji' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-emoji',
+      title: 'emoji',
+      content: emojiContent,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await service.createNote('user-1', {
+      title: 'emoji',
+      contentJson: [
+        { type: 'paragraph', content: [{ type: 'text', text: emojiContent }] },
+      ],
+      media: [],
+    });
+
+    const saved = prisma.note.create.mock.calls[0][0].data.content;
+    expect(Array.from(saved)).toHaveLength(20_000);
+    expect(saved).toBe(emojiContent);
+  });
+
   it('preserves the dto title when every content block is blank', async () => {
     prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
     prisma.note.update.mockResolvedValueOnce({
