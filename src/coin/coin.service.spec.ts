@@ -613,3 +613,14 @@ describe('CoinService', () => {
     });
   });
 });
+
+// notifyRecharge 是旧「积分充值到账」通知的残留:充值改为客服审核,由
+// SupportRechargeService 发放积分并自行广播到账事件,全仓没有任何调用方。
+describe('CoinService dead code', () => {
+  it('no longer carries the uncalled notifyRecharge helper', () => {
+    expect(
+      (CoinService.prototype as unknown as Record<string, unknown>)
+        .notifyRecharge,
+    ).toBeUndefined();
+  });
+});

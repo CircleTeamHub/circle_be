@@ -420,44 +420,4 @@ export class CoinService {
       );
     }
   }
-
-  private async notifyRecharge(userId: string, amount: number): Promise<void> {
-    let notification = null;
-    try {
-      notification = await this.notificationService.createSystemNotification(
-        userId,
-        userId,
-        `积分已到账 ${amount}`,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Failed to create recharge notification for ${userId}: ${error instanceof Error ? error.message : error}`,
-      );
-    }
-
-    await this.realtimeService.safeBroadcastAll([
-      () =>
-        this.realtimeService.broadcastWalletBalanceChanged(userId, {
-          reason: 'RECHARGE',
-          delta: amount,
-        }),
-      () =>
-        this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
-      () =>
-        this.realtimeService.broadcastSystemNotificationCreated(
-          userId,
-          `积分已到账 ${amount}`,
-        ),
-      ...(notification
-        ? [
-            () =>
-              this.realtimeService.broadcastNotificationCreated(
-                userId,
-                notification,
-              ),
-          ]
-        : []),
-      () => this.realtimeService.broadcastSystemNotificationUnread(userId),
-    ]);
-  }
 }
