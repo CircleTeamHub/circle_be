@@ -886,7 +886,9 @@ export class ChatGateway implements OnModuleDestroy {
       CHAT_EVENTS.presence,
       (
         payload: ChatPresenceQuery,
-        ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
+        ack?: AckFn<
+          Record<string, boolean | ChatPresenceDetail | null> | ChatAckError
+        >,
       ) => {
         if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
           if (typeof ack === 'function') ack({});
@@ -1097,9 +1099,19 @@ export class ChatGateway implements OnModuleDestroy {
   private async handlePresenceQuery(
     socket: Socket,
     payload: ChatPresenceQuery,
-    ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
+    ack?: AckFn<
+      Record<string, boolean | ChatPresenceDetail | null> | ChatAckError
+    >,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
+    // 访客凭证(临时房 chatToken)只该看得见自己那间房。在线状态说的是 App 用户之间
+    // 「同处在座会话」的关系,访客页也从不发这个事件 —— 按 socket 身份在入口拒掉:
+    // 不进限流、不查可见性、不碰在线注册表。
+    if (typeof socket.data.guestConversationId === 'string') {
+      this.metrics.observeEvent('presence', 'failure');
+      ack(this.ackError(ChatErrorCode.InvalidPayload, '访客不能查询在线状态'));
+      return;
+    }
     const startedAt = process.hrtime.bigint();
     const userId = socket.data.userId as string;
     try {

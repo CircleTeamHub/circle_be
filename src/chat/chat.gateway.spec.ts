@@ -976,6 +976,29 @@ describe('ChatGateway', () => {
       broadcast.isUserOnline.mockResolvedValue(false);
     });
 
+    // 访客凭证只该看得见自己那间临时房。在线状态查询直接按 socket 身份在网关拒掉,
+    // 不进限流、不查可见性、不碰在线注册表 —— 访客页(temp-chat-web)也从不发这个事件。
+    it('refuses temp-chat guests before any presence lookup', async () => {
+      const ack = jest.fn();
+      const socket = fakeSocket();
+      socket.data.guestConversationId = 'conv-temp';
+
+      await gateway['handlePresenceQuery'](
+        socket as never,
+        { userIds: ['host-1'], detail: true } as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({
+        ok: false,
+        code: ChatErrorCode.InvalidPayload,
+        message: expect.any(String),
+      });
+      expect(chatService.filterVisiblePresenceTargets).not.toHaveBeenCalled();
+      expect(chatService.getLastSeenAt).not.toHaveBeenCalled();
+      expect(broadcast.isUserOnline).not.toHaveBeenCalled();
+    });
+
     it('answers empty without touching presence when nothing was requested', async () => {
       const ack = jest.fn();
       await gateway['handlePresenceQuery'](

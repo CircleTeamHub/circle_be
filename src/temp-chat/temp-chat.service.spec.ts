@@ -5,6 +5,7 @@ import {
   GoneException,
   NotFoundException,
 } from '@nestjs/common';
+import { ChatErrorCode } from 'src/common/app-error-codes';
 import { TempChatService } from './temp-chat.service';
 
 describe('TempChatService', () => {
@@ -54,6 +55,9 @@ describe('TempChatService', () => {
   const noteService = {
     getSharedNoteForGuest: jest.fn(),
   };
+  const sensitiveWords = {
+    check: jest.fn().mockReturnValue({ blocked: false }),
+  };
 
   const service = new TempChatService(
     prisma as never,
@@ -62,6 +66,7 @@ describe('TempChatService', () => {
     chatBroadcast as never,
     chatService as never,
     noteService as never,
+    sensitiveWords as never,
   );
 
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
@@ -268,6 +273,7 @@ describe('TempChatService', () => {
       prisma.tempChatGuest.count.mockResolvedValue(0);
       prisma.tempChatGuest.create.mockResolvedValue({ id: 'guest-row' });
       prisma.chatMember.create.mockResolvedValue({});
+      sensitiveWords.check.mockReturnValue({ blocked: false });
     });
 
     it('seats the guest atomically and returns chat-core credentials', async () => {
@@ -289,6 +295,51 @@ describe('TempChatService', () => {
         wsPath: '/chat-ws',
       });
       expect(result.guestId.startsWith('g')).toBe(true);
+    });
+
+    // 访客昵称会原样进房主的离线推送(chat-push 用 sender.nickname 拼标题/正文),
+    // 与聊天正文、编辑走同一条敏感词闸:命中直接拒,不落座。
+    it('rejects a display name that trips the sensitive-word filter before seating', async () => {
+      sensitiveWords.check.mockReturnValue({ blocked: true, word: '违规' });
+
+      await expect(
+        service.join('tok', { displayName: '违规昵称' }),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.SensitiveWord },
+      });
+      expect(sensitiveWords.check).toHaveBeenCalledWith('违规昵称');
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+      expect(prisma.chatMember.create).not.toHaveBeenCalled();
+    });
+
+    // 换行/控制符会把推送标题折成多行,双向覆盖符能把「管理员」之类的字样倒序伪装出来。
+    it('strips control and bidi-override characters before storing the name', async () => {
+      const result = await service.join('tok', {
+        displayName: ' \u202E路人\u0007甲\u2066\n',
+      });
+
+      expect(result.displayName).toBe('路人甲');
+      expect(prisma.tempChatGuest.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ displayName: '路人甲' }),
+      });
+      expect(sensitiveWords.check).toHaveBeenCalledWith('路人甲');
+    });
+
+    it('falls back to a generated name when nothing printable is left', async () => {
+      const result = await service.join('tok', {
+        displayName: '\u0000\u202E \u200F',
+      });
+
+      expect(result.displayName).toMatch(/^访客\d{4}$/);
+    });
+
+    // 零宽连接符是 emoji 家族序列与部分文字的一部分,不是控制符。
+    it('keeps emoji joiners intact', async () => {
+      const family = '👨\u200D👩\u200D👧';
+
+      const result = await service.join('tok', { displayName: family });
+
+      expect(result.displayName).toBe(family);
     });
 
     it('rejects when the room is full', async () => {
