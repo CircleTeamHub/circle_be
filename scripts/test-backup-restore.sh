@@ -93,7 +93,7 @@ EOF
 cat > "$tmp_override" <<EOF
 services:
   backup-s3:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     environment:
       MINIO_ROOT_USER: $s3_key
       MINIO_ROOT_PASSWORD: $s3_secret
@@ -110,7 +110,7 @@ services:
       retries: 20
 
   backup-s3-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       backup-s3: { condition: service_healthy }
     environment:

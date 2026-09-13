@@ -1,6 +1,7 @@
 services:
   minio:
-    image: minio/minio:latest
+    # MinIO 自 2025-10 起不再向 Docker Hub 发布，minio/* 仓库已被删除；官方仍在 quay.io 发布同一批标签。
+    image: quay.io/minio/minio:latest
     restart: always
     ports:
       - '9000:9000'   # S3 API
