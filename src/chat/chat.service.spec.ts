@@ -81,6 +81,7 @@ describe('ChatService', () => {
     emitRevoke: jest.fn(),
     emitRead: jest.fn(),
     emitHistoryCleared: jest.fn(),
+    emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
   };
   const groupEvents = {
     record: jest.fn().mockResolvedValue(undefined),
@@ -1631,6 +1632,24 @@ describe('ChatService', () => {
       expect(privacySettings.canReceiveStrangerMessage).not.toHaveBeenCalled();
     });
 
+    it("carries the peer seat's read watermark", async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        ...conversationRow,
+        members: [
+          conversationRow.members[0],
+          { ...conversationRow.members[1], lastReadHeight: 9 },
+        ],
+      });
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(dto.peerReadHeight).toBe(9);
+    });
+
     it("joins both members' live sockets to the conversation room", async () => {
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
@@ -2291,7 +2310,9 @@ describe('ChatService', () => {
           },
         ])
         // loadDirectPeers 的对端成员查询。
-        .mockResolvedValueOnce([{ conversationID: 'conv-1', userID: 'u2' }]);
+        .mockResolvedValueOnce([
+          { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 7 },
+        ]);
       // 末条消息与未读数各一次集合查询(不再每会话一次往返)。
       prisma.$queryRaw
         .mockResolvedValueOnce([createdRow])
@@ -2310,6 +2331,8 @@ describe('ChatService', () => {
         id: 'conv-1',
         type: 'DIRECT',
         peer: { id: 'u2' },
+        // chat:read 只在水位推进时广播;冷启动靠快照里的对端水位恢复「已读」。
+        peerReadHeight: 7,
         tempChat: null,
         unreadCount: 2,
         lastMessage: { id: 'msg-1' },
@@ -2343,6 +2366,7 @@ describe('ChatService', () => {
         id: 'conv-temp',
         type: 'TEMP',
         peer: null,
+        peerReadHeight: null,
         circle: null,
         tempChat: { id: 'tc-1', title: '周末临时群' },
       });
@@ -2764,6 +2788,37 @@ describe('ChatService', () => {
         },
         data: { pinned: true },
       });
+    });
+
+    it('returns the direct peer and its read watermark in the refreshed row', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+      prisma.chatMember.update.mockResolvedValue({});
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 4 },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u2', nickname: '对方', avatarUrl: null },
+      ]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {
+        pinned: true,
+      });
+
+      expect(dto).toMatchObject({ peer: { id: 'u2' }, peerReadHeight: 4 });
     });
 
     it('maps hidden boolean onto the hiddenAt timestamp', async () => {
@@ -3672,6 +3727,66 @@ describe('ChatService', () => {
         'conv-1',
         { kind: 'burn-changed', seconds: 0 },
       );
+    });
+
+    // 放宽前的兜底真删同样是墓碑:不通知的话,对端设备上这批已经烧掉的正文还留在本地。
+    it('announces the ids tombstoned before a relax, after they commit', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 60,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: null,
+      });
+      prisma.chatMessage.findMany.mockResolvedValueOnce([
+        { id: 'expired-1', type: 'text', content: { text: 'gone' } },
+        { id: 'expired-2', type: 'text', content: { text: 'gone too' } },
+      ]);
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 2 });
+
+      await service.setBurnDuration('u1', 'conv-1', 0);
+
+      expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
+        'expired-1',
+        'expired-2',
+      ]);
+      expect(
+        prisma.chatMessage.updateMany.mock.invocationCallOrder[0],
+      ).toBeLessThan(broadcast.emitBurnedMessages.mock.invocationCallOrder[0]);
+    });
+
+    it('announces nothing when the duration only gets stricter', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 3600,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: 60,
+      });
+
+      await service.setBurnDuration('u1', 'conv-1', 60);
+
+      expect(broadcast.emitBurnedMessages).not.toHaveBeenCalled();
     });
 
     it('GROUP requires a circle owner/admin', async () => {

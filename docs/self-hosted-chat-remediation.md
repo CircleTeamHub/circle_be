@@ -461,11 +461,13 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | `chat:delivered` | C→S | `{conversationId, height}` | §2.6 |
 | `chat:reaction` | 双向 | `{conversationId, messageId, emoji, userId, op}` | §2.6 |
 | `chat:edit` | 双向 | `{conversationId, messageId, content}` | §2.6 |
+| `chat:burned_messages` | S→C | `{conversationId, messageIds}`（墓碑提交后发往在座成员个人房；每条 ≤500 个 id，超出分片） | §10.4 |
 
 ### REST / 推送变更
 
 - `GET /chat/conversations/:id/messages` 增 `afterHeight` 参数，升序增量拉取（§2.9）
 - `POST /chat/conversations/:id/clear`（§2.10）
+- `GET /chat/conversations/:id/burn`：读当前会话级焚毁档位，与 POST 回执同形 `{burnDurationSec}`，仅在座成员（§2.7）
 - Expo push payload 增可选 `badge`（§2.12，批 5）
 
 ### DTO 变更
@@ -473,6 +475,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 - `ChatMessageDto` 增 `replyTo?: {id, height, senderNickname, type, preview}`（§2.3）
 - `ChatMessageDto` 增 `revokedAt?: string | null`、`editedAt?: string | null`
 - `ChatConversationDto` 增 `burnDurationSec?: number | null`（§2.7）
+- `ChatConversationDto` 增 `peerReadHeight: number | null`：DIRECT 对端座位的已读水位，其余类型 null（冷启动恢复「已读」）
 
 ### 新增错误码（`ChatErrorCode`，需补 5 语种 `serverErrors.*` 词条）
 
@@ -656,6 +659,10 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 时间轴）。焚毁的物理删除没有对应的时间戳列，同一条通道带不上 ——
 离线设备上那些已被 sweeper 删掉的消息，要等重新进会话拉历史才消失。
 补它需要给 `ChatMessage` 加 `updatedAt` + 索引，留到需要时再做。
+
+在线设备这一半已补：sweeper 与「放宽焚毁前的兜底真删」每批墓碑**提交之后**发
+`chat:burned_messages {conversationId, messageIds}` 到在座成员个人房（每条 ≤500 个 id，
+超出分片；广播失败只记日志，不中断焚毁）。离线设备仍按上面的限制。
 
 ---
 

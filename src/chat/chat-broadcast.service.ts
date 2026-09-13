@@ -12,8 +12,14 @@ import {
   privacySettingsEvents,
 } from 'src/privacy/privacy-events';
 import { ChatPresenceRegistry } from './chat-presence.registry';
-import { CHAT_EVENTS, conversationRoom, userRoom } from './chat.constants';
+import {
+  BURNED_MESSAGES_BROADCAST_MAX,
+  CHAT_EVENTS,
+  conversationRoom,
+  userRoom,
+} from './chat.constants';
 import type {
+  ChatBurnedMessagesBroadcast,
   ChatConversationBroadcast,
   ChatDeliveredBroadcast,
   ChatEditBroadcast,
@@ -128,6 +134,49 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     server
       .to(conversationRoom(payload.conversationId))
       .emit(CHAT_EVENTS.historyCleared, payload);
+  }
+
+  /**
+   * 阅后即焚墓碑已提交 → 当前在座成员的个人房(与 chat:msg 同一条授权边界)。
+   *
+   * 不走会话房:被移出成员的旧 socket 可能还没离房(见 removeUserFromConversation),
+   * 而「哪些消息刚被烧掉」仍是会话元数据。删除已经提交,这里只是加速各端收敛 ——
+   * 查询失败只记日志,不能冒泡成调用方(sweeper / 放宽焚毁)的失败;没收到通知的
+   * 设备下次拉历史仍以 deleted=true 为准。
+   */
+  async emitBurnedMessages(
+    conversationId: string,
+    messageIds: readonly string[],
+  ): Promise<void> {
+    const ids = [...new Set(messageIds)].filter((id) => id.length > 0);
+    if (ids.length === 0) return;
+    const server = this.requireServer('emitBurnedMessages');
+    if (!server) return;
+    try {
+      const seats = await this.prisma.chatMember.findMany({
+        where: { conversationID: conversationId, leftAt: null },
+        select: { userID: true },
+      });
+      const rooms = [...new Set(seats.map((seat) => userRoom(seat.userID)))];
+      if (rooms.length === 0) return;
+      for (
+        let start = 0;
+        start < ids.length;
+        start += BURNED_MESSAGES_BROADCAST_MAX
+      ) {
+        const payload: ChatBurnedMessagesBroadcast = {
+          conversationId,
+          messageIds: ids.slice(start, start + BURNED_MESSAGES_BROADCAST_MAX),
+        };
+        server.to(rooms).emit(CHAT_EVENTS.burnedMessages, payload);
+      }
+    } catch (error) {
+      this.logger.warn(
+        `burned-message broadcast failed conversation=${conversationId}: ${
+          error instanceof Error ? error.name : 'unknown error'
+        }`,
+      );
+    }
   }
 
   /** 正在输入 → 会话房内除本人外的成员。 */

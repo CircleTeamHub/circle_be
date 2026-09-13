@@ -26,7 +26,15 @@ export const CHAT_EVENTS = {
   edit: 'chat:edit',
   /** 服务端 → 客户端:会话全局清空后,在线设备同步清空到该水位 */
   historyCleared: 'chat:history_cleared',
+  /** 服务端 → 客户端(在座成员个人房):阅后即焚到期消息的墓碑已提交,删本地副本 */
+  burnedMessages: 'chat:burned_messages',
 } as const;
+
+/**
+ * chat:burned_messages 单条载荷的 id 上限。App 的 dispatcher 拒收超过 500 个 id
+ * 的载荷(防一条畸形事件清空本地库),超出的按这个尺寸分片发送。
+ */
+export const BURNED_MESSAGES_BROADCAST_MAX = 500;
 
 /** 消息编辑的时间窗(仅发送者本人;与撤回同窗)。 */
 export const CHAT_EDIT_WINDOW_MS = 2 * 60_000;

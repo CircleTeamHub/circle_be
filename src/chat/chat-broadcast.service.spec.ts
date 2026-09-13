@@ -766,3 +766,99 @@ describe('ChatBroadcastService presence visibility events', () => {
     service.onModuleDestroy();
   });
 });
+
+describe('ChatBroadcastService.emitBurnedMessages', () => {
+  function harness(findMany: jest.Mock) {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      { chatMember: { findMany } } as never,
+    );
+    service.setServer({ to } as never);
+    return { service, to, emit };
+  }
+
+  // 焚毁通知只带 id、不带正文,但「哪些消息刚被烧掉」仍是会话元数据:与 chat:msg
+  // 同一条授权边界 —— 只投当前在座成员的个人房,不走可能残留旧 socket 的会话房。
+  it('tells every seated member which message ids burned via their personal rooms', async () => {
+    const findMany = jest
+      .fn()
+      .mockResolvedValue([{ userID: 'u1' }, { userID: 'u2' }]);
+    const { service, to, emit } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', ['m1', 'm2', 'm1']);
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:u1', 'u:u2']);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith('chat:burned_messages', {
+      conversationId: 'conv-1',
+      messageIds: ['m1', 'm2'],
+    });
+  });
+
+  // App 的 dispatcher 拒收超过 500 个 id 的载荷(防一条畸形事件清空本地库)。
+  it('splits large announcements into payloads the app accepts', async () => {
+    const findMany = jest.fn().mockResolvedValue([{ userID: 'u1' }]);
+    const { service, emit } = harness(findMany);
+    const ids = Array.from({ length: 1001 }, (_, i) => `m${i}`);
+
+    await service.emitBurnedMessages('conv-1', ids);
+
+    expect(findMany).toHaveBeenCalledTimes(1);
+    const payloads = emit.mock.calls.map(
+      ([, payload]) => payload as { messageIds: string[] },
+    );
+    expect(payloads.map((payload) => payload.messageIds.length)).toEqual([
+      500, 500, 1,
+    ]);
+    expect(payloads.flatMap((payload) => payload.messageIds)).toEqual(ids);
+  });
+
+  it('emits nothing for an empty batch', async () => {
+    const findMany = jest.fn();
+    const { service, to } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', []);
+
+    expect(findMany).not.toHaveBeenCalled();
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  it('emits nothing when nobody is seated any more', async () => {
+    const findMany = jest.fn().mockResolvedValue([]);
+    const { service, to } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', ['m1']);
+
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  // 删除已经提交;实时通知只是加速各端收敛。查询失败不能冒泡成 sweeper 的失败。
+  it('swallows a seat-query failure because the tombstones are already committed', async () => {
+    const findMany = jest.fn().mockRejectedValue(new Error('db down'));
+    const { service, to } = harness(findMany);
+
+    await expect(
+      service.emitBurnedMessages('conv-1', ['m1']),
+    ).resolves.toBeUndefined();
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op before the gateway attaches', async () => {
+    const findMany = jest.fn();
+    const service = new ChatBroadcastService(
+      {} as never,
+      { chatMember: { findMany } } as never,
+    );
+
+    await expect(
+      service.emitBurnedMessages('conv-1', ['m1']),
+    ).resolves.toBeUndefined();
+    expect(findMany).not.toHaveBeenCalled();
+  });
+});

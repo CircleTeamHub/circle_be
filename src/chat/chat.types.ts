@@ -187,6 +187,15 @@ export interface ChatHistoryClearedBroadcast {
   clearedBy: string;
 }
 
+/**
+ * chat:burned_messages:阅后即焚到期消息的墓碑已提交(sweeper / 放宽焚毁前的兜底真删)。
+ * 只带 id 不带正文;在座成员据此删掉本地缓存里的副本。
+ */
+export interface ChatBurnedMessagesBroadcast {
+  conversationId: string;
+  messageIds: string[];
+}
+
 /** chat:typing 服务端广播。 */
 export interface ChatTypingBroadcast {
   conversationId: string;
@@ -352,6 +361,13 @@ export interface ChatConversationDto {
   policies: ChatGroupPoliciesDto | null;
   /** 会话级阅后即焚秒数(S-01);null=关。 */
   burnDurationSec?: number | null;
+  /**
+   * DIRECT 会话对端座位的已读水位(ChatMember.lastReadHeight);其余类型为 null。
+   * chat:read 只在水位推进时广播,对端在本机连上之前读过的话,本机永远等不到那次
+   * 事件 —— 客户端冷启动靠它恢复「已读」。不多透露信息:同一个值本来就经 chat:read
+   * 广播给会话房。
+   */
+  peerReadHeight: number | null;
   lastMessageAt: string | null;
   /**
    * 本人加入该会话的时刻(ChatMember.joinedAt)。「新的群组」按它倒序 ——

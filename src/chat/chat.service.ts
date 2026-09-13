@@ -92,6 +92,12 @@ type GroupFacets = Pick<
   | 'myRole'
   | 'policies'
 >;
+/** loadDirectPeers 的结果:会话 id → 对端展示信息 / 对端已读水位。 */
+interface DirectPeers {
+  info: Map<string, ChatSenderInfo>;
+  readHeights: Map<string, number>;
+}
+
 const NON_GROUP_FACETS: GroupFacets = {
   myRemark: null,
   myAlias: null,
@@ -991,7 +997,7 @@ export class ChatService {
     const [
       lastMessages,
       unreadCounts,
-      peers,
+      directPeers,
       circles,
       tempChats,
       circleRoles,
@@ -1044,7 +1050,7 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
-        peer: peers.get(m.conversationID) ?? null,
+        peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
           ? (circles.get(m.conversation.circleID) ?? null)
@@ -1078,6 +1084,7 @@ export class ChatService {
           memberCounts.get(m.conversationID) ?? null,
         ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
+        peerReadHeight: directPeers.readHeights.get(m.conversationID) ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
       };
@@ -1974,7 +1981,7 @@ export class ChatService {
       viewerCutoff,
       seconds ? new Date(Date.now() - seconds * 1000) : null,
     );
-    const [lastMessages, unread, peers, tempChats] = await Promise.all([
+    const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
       this.loadLastMessages([conversationId], [cutoff]),
       this.loadUnreadCounts(
         userId,
@@ -1988,7 +1995,10 @@ export class ChatService {
       ),
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
-        : Promise.resolve(new Map<string, ChatSenderInfo>()),
+        : Promise.resolve<DirectPeers>({
+            info: new Map(),
+            readHeights: new Map(),
+          }),
       member.conversation.tempChatID
         ? this.loadTempChatInfos([member.conversation.tempChatID])
         : Promise.resolve(new Map<string, { id: string; title: string }>()),
@@ -2020,7 +2030,7 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
-      peer: peers.get(conversationId) ?? null,
+      peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
         ? (circles.get(member.conversation.circleID) ?? null)
@@ -2048,6 +2058,7 @@ export class ChatService {
         memberCounts.get(conversationId) ?? null,
       ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
+      peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
     };
@@ -2910,6 +2921,9 @@ export class ChatService {
       silencedUntil: null,
       ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
+      peerReadHeight:
+        conv.members.find((m) => m.userID === peerUserId)?.lastReadHeight ??
+        null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
@@ -3407,28 +3421,36 @@ export class ChatService {
   }
 
   /** DIRECT 会话的对端信息:conversationId → 对端用户。 */
+  /**
+   * DIRECT 会话的对端:展示信息 + 对端座位的已读水位。两张表分开填 ——
+   * 账号解析不到(注销/封禁)只影响 peer,不影响水位。
+   */
   private async loadDirectPeers(
     userId: string,
     conversationIds: string[],
-  ): Promise<Map<string, ChatSenderInfo>> {
-    if (conversationIds.length === 0) return new Map();
+  ): Promise<DirectPeers> {
+    if (conversationIds.length === 0) {
+      return { info: new Map(), readHeights: new Map() };
+    }
     const others = await this.prisma.chatMember.findMany({
       where: {
         conversationID: { in: conversationIds },
         userID: { not: userId },
       },
-      select: { conversationID: true, userID: true },
+      select: { conversationID: true, userID: true, lastReadHeight: true },
     });
     const users = await this.resolveSenders(
       others.map((o) => o.userID),
       null,
     );
-    const map = new Map<string, ChatSenderInfo>();
+    const info = new Map<string, ChatSenderInfo>();
+    const readHeights = new Map<string, number>();
     others.forEach((o) => {
       const user = users.get(o.userID);
-      if (user) map.set(o.conversationID, user);
+      if (user) info.set(o.conversationID, user);
+      readHeights.set(o.conversationID, o.lastReadHeight);
     });
-    return map;
+    return { info, readHeights };
   }
 
   /** GROUP 会话的圈子展示信息(群名/群头像来源)。 */
@@ -4272,6 +4294,9 @@ export class ChatService {
           noteImportKeys,
         );
       });
+      // 墓碑提交后通知在座成员(与 sweeper 同一条通道):读路径不会再放它们回来,
+      // 但对端设备上的本地副本得靠这条通知才删得掉。emitBurnedMessages 自己兜住失败。
+      await this.broadcast.emitBurnedMessages(conversationId, messageIds);
       if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
       if (noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();
