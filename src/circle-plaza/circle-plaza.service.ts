@@ -1356,8 +1356,6 @@ export class CirclePlazaService {
         post.status === 'ENDED' && post.collaborationRecognizedAt === null,
       items: signups.map((s) => ({
         userId: s.user.id,
-        // 兼容字段:OpenIM 时代的去连字符形态已弃用,直接回传 UUID。
-        imUserId: s.user.id,
         nickname: s.user.nickname,
         avatarUrl: s.user.avatarUrl,
         accountId: s.user.accountId,
@@ -1744,7 +1742,6 @@ export class CirclePlazaService {
         creditScore: post.creditRestriction,
         fancyNumber: post.fancyRestriction,
       },
-      viewCount: post.viewCount,
       signupCount: post.signupCount ?? 0,
       signedByMe,
       signupRestrictions: {

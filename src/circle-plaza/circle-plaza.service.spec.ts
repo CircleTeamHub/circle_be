@@ -1800,7 +1800,7 @@ describe('CirclePlazaService', () => {
       expect(result.items[0].expiresAt).toBe('2026-06-02T00:00:00.000Z');
     });
 
-    it('returns signers with OpenIM ids for my own post', async () => {
+    it('returns signers for my own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         id: 'post-1',
         status: 'ACTIVE',
@@ -1842,14 +1842,14 @@ describe('CirclePlazaService', () => {
       expect(result.items[0]).toEqual(
         expect.objectContaining({
           userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
-          // 兼容字段:OpenIM 去连字符形态已弃用,直接回传 UUID。
-          imUserId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
           nickname: 'meiguici',
           seen: false,
           displayIcons,
           recognized: false,
         }),
       );
+      // OpenIM 时代的 imUserId 别名已无读者(客户端 normalizer 缺省归一成 '')。
+      expect(result.items[0]).not.toHaveProperty('imUserId');
       expect(result.recognitionOpen).toBe(false);
     });
 
@@ -2514,6 +2514,8 @@ describe('CirclePlazaService', () => {
 
       expect(dto.signupCount).toBe(2);
       expect(dto.signedByMe).toBe(true);
+      // viewCount 没有任何写入方(恒为 0),客户端也不读 —— 不再下发。
+      expect(dto).not.toHaveProperty('viewCount');
     });
 
     it('getPost blocks regular viewers before reading the post', async () => {

@@ -329,7 +329,6 @@ export class PlazaPostDto {
     creditScore: number | null;
     fancyNumber: boolean;
   };
-  viewCount: number;
   signupCount: number;
   signedByMe: boolean;
   signupRestrictions: {
@@ -362,7 +361,6 @@ export class MyCirclePostDto {
 
 export class PostSignupItemDto {
   userId: string;
-  imUserId: string;
   nickname: string;
   avatarUrl: string | null;
   accountId: string;
