@@ -23,9 +23,8 @@ export class NoteShareLinkPublicController {
   /**
    * 公开端点，刻意不挂 JwtGuard —— 凭据是 token 本身（18 字节随机数 = 144 bit，
    * 枚举不可行）。限流对齐 temp-chat 的访客落地页 `by-token/:token/meta`：
-   * 30 次/分钟。注意 setup.ts 里 `app.use('/api/v1/note', noteWriteLimiter)` 是
-   * Express 前缀挂载且不筛方法，本路由已被它覆盖（60 次/15 分钟/IP），
-   * 这里的 @Throttle 是叠加的第二道，只作用于本路由。
+   * 30 次/分钟。setup.ts 里 note 的 express 限流只挂写方法（POST/PATCH/PUT/DELETE），
+   * 本路由是 GET，不在其覆盖范围内，这里的 @Throttle 是唯一一道路由级限流。
    */
   @Get('share-links/:token')
   @UseGuards(ThrottlerGuard)

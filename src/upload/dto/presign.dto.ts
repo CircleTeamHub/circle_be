@@ -6,6 +6,7 @@ import {
   IsString,
   Matches,
   Max,
+  MaxLength,
   Min,
 } from 'class-validator';
 
@@ -72,6 +73,8 @@ export type UploadFolder = (typeof ALLOWED_FOLDERS)[number];
 export class PresignDto {
   @ApiProperty({ example: 'avatar.jpg', description: '原始文件名' })
   @IsString()
+  // 与访客侧 GuestPresignDto 的 255 对齐：文件名只用来取扩展名，不该无上限往下传。
+  @MaxLength(255)
   @Matches(/^[\w\-. ]+$/, { message: 'filename contains invalid characters' })
   filename: string;
 
