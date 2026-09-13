@@ -178,8 +178,11 @@ export class AvatarFrameAdminService {
 
     try {
       result = await runSerializableTransaction(this.prisma, async (tx) => {
+        // 所有返回给管理台的 grant 都走 ADMIN_GRANT_SELECT(与 getUserInventory 同形,
+        // 带 frame),新建 / 重放 / 撤销不能一条路径有 frame、另一条是 undefined。
         const replay = await tx.userAvatarFrameGrant.findUnique({
           where: { idempotencyKey: input.idempotencyKey },
+          select: ADMIN_GRANT_SELECT,
         });
         if (replay) {
           return {
@@ -221,6 +224,7 @@ export class AvatarFrameAdminService {
             reason: input.reason,
             expiresAt: input.expiresAt,
           },
+          select: ADMIN_GRANT_SELECT,
         });
 
         await this.audit.recordStrict(tx, {
@@ -246,6 +250,7 @@ export class AvatarFrameAdminService {
       }
       const replay = await this.prisma.userAvatarFrameGrant.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
+        select: ADMIN_GRANT_SELECT,
       });
       if (!replay) {
         throw error;
@@ -290,6 +295,7 @@ export class AvatarFrameAdminService {
     const result = await runSerializableTransaction(this.prisma, async (tx) => {
       const existing = await tx.userAvatarFrameGrant.findUnique({
         where: { id: grantId },
+        select: ADMIN_GRANT_SELECT,
       });
       if (!existing) {
         throw new NotFoundException({
@@ -319,6 +325,7 @@ export class AvatarFrameAdminService {
           revokedByUserID: operatorUserId,
           revokeReason: reason,
         },
+        select: ADMIN_GRANT_SELECT,
       });
       await this.audit.recordStrict(tx, {
         actorID: operatorUserId,
