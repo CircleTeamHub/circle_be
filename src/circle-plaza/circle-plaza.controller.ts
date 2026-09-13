@@ -158,25 +158,6 @@ export class CirclePlazaController {
     return this.plazaService.cancelSignup(req.user.userId, id);
   }
 
-  @Get('posts/:id/signups')
-  @Throttle({ default: { limit: 60, ttl: 60_000 } })
-  @ApiOperation({ summary: 'List users who signed up for my post' })
-  @ApiTooManyRequestsResponse({ description: 'Too many signup-list reads' })
-  signups(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: RequestWithUser,
-  ): Promise<{
-    items: {
-      id: string;
-      nickname: string;
-      avatarUrl: string | null;
-      accountId: string;
-      signedAt: string;
-    }[];
-  }> {
-    return this.plazaService.getPostSignups(req.user.userId, id);
-  }
-
   // ─── Signup management (报名管理) — author-scoped ───────────────────────────
 
   @Get('me/posts')

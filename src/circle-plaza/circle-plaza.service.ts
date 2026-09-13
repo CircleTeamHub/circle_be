@@ -1021,7 +1021,7 @@ export class CirclePlazaService {
         await tx.circlePostSignup.create({
           data: { postID: postId, userID: userId },
         });
-        // signupCount 是去规范化的软缓存；getPostSignups / COUNT(*) 才是真实来源。
+        // signupCount 是去规范化的软缓存；报名行的 COUNT(*) 才是真实来源。
         const p = await tx.circlePost.update({
           where: { id: postId },
           data: { signupCount: { increment: 1 } },
@@ -1116,45 +1116,6 @@ export class CirclePlazaService {
     }
 
     return { signed: false, signupCount: Math.max(0, result.signupCount) };
-  }
-
-  async getPostSignups(
-    authorId: string,
-    postId: string,
-  ): Promise<{
-    items: {
-      id: string;
-      nickname: string;
-      avatarUrl: string | null;
-      accountId: string;
-      signedAt: string;
-    }[];
-  }> {
-    await this.requireOwnPost(authorId, postId);
-    const signups = await this.prisma.circlePostSignup.findMany({
-      where: { postID: postId },
-      include: {
-        user: {
-          select: {
-            id: true,
-            nickname: true,
-            avatarUrl: true,
-            accountId: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 200,
-    });
-    return {
-      items: signups.map((s) => ({
-        id: s.user.id,
-        nickname: s.user.nickname,
-        avatarUrl: s.user.avatarUrl,
-        accountId: s.user.accountId,
-        signedAt: s.createdAt.toISOString(),
-      })),
-    };
   }
 
   // ─── Signup management (报名管理) ───────────────────────────────────────────

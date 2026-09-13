@@ -116,7 +116,6 @@ export const DYNAMIC_ROUTE_TEMPLATES = [
   '/api/v1/circle-plaza/me/posts/:id/signups/read',
   '/api/v1/circle-plaza/posts/:id',
   '/api/v1/circle-plaza/posts/:id/signup',
-  '/api/v1/circle-plaza/posts/:id/signups',
   '/api/v1/collections/:id',
   '/api/v1/conversation-groups/:id',
   '/api/v1/conversation-groups/:id/members',

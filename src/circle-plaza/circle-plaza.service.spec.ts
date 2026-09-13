@@ -2442,39 +2442,6 @@ describe('CirclePlazaService', () => {
     });
   });
 
-  describe('getPostSignups', () => {
-    it('maps signups to public user shape', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
-      prisma.circlePostSignup.findMany.mockResolvedValue([
-        {
-          createdAt: new Date('2026-06-05T00:00:00Z'),
-          user: { id: 'u1', nickname: 'A', avatarUrl: null, accountId: '100' },
-        },
-      ]);
-
-      const result = await service.getPostSignups('author-1', 'post-1');
-
-      expect(result.items).toEqual([
-        {
-          id: 'u1',
-          nickname: 'A',
-          avatarUrl: null,
-          accountId: '100',
-          signedAt: '2026-06-05T00:00:00.000Z',
-        },
-      ]);
-    });
-
-    it('rejects reading signups for a post the caller does not own', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue(null);
-
-      await expect(service.getPostSignups('user-2', 'post-1')).rejects.toThrow(
-        NotFoundException,
-      );
-      expect(prisma.circlePostSignup.findMany).not.toHaveBeenCalled();
-    });
-  });
-
   describe('signedByMe in DTO', () => {
     it('getPost returns signedByMe=true when viewer has signed up', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
