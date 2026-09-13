@@ -33,6 +33,17 @@ import type {
 } from './chat.types';
 
 /**
+ * 带发送者幂等键(d)的消息 → 发送者的个人房;编辑广播、系统消息等不带 d 的载荷
+ * 返回 null(整房同一份载荷)。
+ */
+function deliveryIdOwnerRoom(
+  payload: ChatMessageDto | ChatEditBroadcast,
+): string | null {
+  if (!('d' in payload) || !payload.d || !payload.sender) return null;
+  return userRoom(payload.sender.id);
+}
+
+/**
  * 聊天广播出口(squady socket-broadcast.service 的移植)。
  * 网关 attach 时注入 io Server;其它模块(temp-chat 接线、系统消息)统一
  * 经此服务下发,不直接持有 io。
@@ -495,7 +506,21 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       ),
     ];
     if (rooms.length === 0) return;
-    server.to(rooms).emit(event, payload);
+    const ownerRoom = deliveryIdOwnerRoom(payload);
+    if (!ownerRoom) {
+      server.to(rooms).emit(event, payload);
+      return;
+    }
+    // d 是发送者本机生成的幂等键:只有发送者自己的设备要靠它把乐观气泡换成服务端
+    // 消息(回显先于 ack 到达时就靠它对账)。其他成员拿到它毫无用处 —— 只发给发送者
+    // 的个人房,其余在座成员收 d:null(已装机 App 对他人消息的 null d 按缺省处理,
+    // 本地库与去重都按消息 id 走)。
+    const ownerRooms = rooms.filter((room) => room === ownerRoom);
+    const otherRooms = rooms.filter((room) => room !== ownerRoom);
+    if (ownerRooms.length > 0) server.to(ownerRooms).emit(event, payload);
+    if (otherRooms.length > 0) {
+      server.to(otherRooms).emit(event, { ...payload, d: null });
+    }
   }
 
   private requireServer(caller: string): Server | null {

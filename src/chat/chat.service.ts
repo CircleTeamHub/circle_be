@@ -2607,6 +2607,8 @@ export class ChatService {
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
         AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        -- 焚毁/删除的墓碑正文已清空:当成「编辑」回放会拿空正文覆盖对端缓存。
+        AND m."deleted" = false
         AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since})
         AND (
           GREATEST(

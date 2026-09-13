@@ -5490,6 +5490,29 @@ describe('ChatService', () => {
       );
     });
 
+    // 焚毁墓碑的 content 已被清空:当成「编辑」回放出去,等于拿一条空正文覆盖对端的
+    // 本地缓存。墓碑本身由 chat:burned_messages 与历史拉取收敛,不归这条通道。
+    it('never replays tombstoned rows as mutations', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.listMutationsSince('u1', new Date(Date.now() - 60_000));
+
+      const mutationQuery = (
+        prisma.$queryRaw.mock.calls as Array<[TemplateStringsArray]>
+      )
+        .map(([strings]) => strings.join('?'))
+        .find((sql) => sql.includes('"mutatedAt"'));
+      expect(mutationQuery).toBeDefined();
+      expect(mutationQuery).toMatch(/AND m\."deleted" = false/);
+    });
+
     it('stops the cursor at the last returned mutation when truncated', async () => {
       // 截断了还回 serverTime 的话,没返回的那些变更被永久跳过 ——
       // 撤回的正文会一直留在对方屏幕上。

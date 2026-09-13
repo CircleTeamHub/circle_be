@@ -663,6 +663,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 在线设备这一半已补：sweeper 与「放宽焚毁前的兜底真删」每批墓碑**提交之后**发
 `chat:burned_messages {conversationId, messageIds}` 到在座成员个人房（每条 ≤500 个 id，
 超出分片；广播失败只记日志，不中断焚毁）。离线设备仍按上面的限制。
+mutations 查询同时排除 `deleted = true` 的墓碑：正文已清空，当成「编辑」回放会拿空正文覆盖对端缓存。
 
 ---
 

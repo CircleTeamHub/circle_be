@@ -862,3 +862,95 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     expect(findMany).not.toHaveBeenCalled();
   });
 });
+
+describe('ChatBroadcastService delivery id privacy', () => {
+  function harness(userIDs: string[]) {
+    const emits: Array<{ rooms: unknown; event: string; payload: unknown }> =
+      [];
+    const to = jest.fn((rooms: unknown) => ({
+      emit: (event: string, payload: unknown) => {
+        emits.push({ rooms, event, payload });
+      },
+    }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers(userIDs) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, emits };
+  }
+
+  const userMessage = {
+    id: 'message-7',
+    conversationId: 'conv-1',
+    height: 7,
+    type: 'text',
+    content: { text: 'hi' },
+    sender: { id: 'sender-1', nickname: 'S', avatarUrl: null, alias: null },
+    replyToId: null,
+    revokedAt: null,
+    revokedBy: null,
+    burnDurationSec: null,
+    d: 'client-delivery-id',
+    createdAt: '2026-09-13T00:00:00.000Z',
+  };
+
+  // d 是发送者本机生成的幂等键:只有发送者自己的设备要靠它把乐观气泡换成服务端
+  // 消息(回显先于 ack 到达时就靠它对账)。其他成员拿到它毫无用处。
+  it("keeps the delivery id for the sender's own devices only", async () => {
+    const { service, emits } = harness(['sender-1', 'peer-1', 'peer-2']);
+
+    await service.emitMessage(userMessage as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1'], event: 'chat:msg', payload: userMessage },
+      {
+        rooms: ['u:peer-1', 'u:peer-2'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('strips the delivery id for everyone once the sender is no longer seated', async () => {
+    const { service, emits } = harness(['peer-1']);
+
+    await service.emitMessage(userMessage as never);
+
+    expect(emits).toEqual([
+      {
+        rooms: ['u:peer-1'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('applies the same split when some members are excluded', async () => {
+    const { service, emits } = harness(['sender-1', 'peer-1', 'blocked-1']);
+
+    await service.emitMessageExcludingUsers(userMessage as never, [
+      'blocked-1',
+    ]);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1'], event: 'chat:msg', payload: userMessage },
+      {
+        rooms: ['u:peer-1'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('sends system notices (no author, no delivery id) in a single emit', async () => {
+    const notice = { ...userMessage, type: 'system', sender: null, d: null };
+    const { service, emits } = harness(['sender-1', 'peer-1']);
+
+    await service.emitMessage(notice as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1', 'u:peer-1'], event: 'chat:msg', payload: notice },
+    ]);
+  });
+});
