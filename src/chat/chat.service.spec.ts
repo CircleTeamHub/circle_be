@@ -289,6 +289,30 @@ describe('ChatService', () => {
         service.getNoteCardNoteId('u1', 'conv-1', 'msg-1'),
       ).rejects.toThrow(NotFoundException);
     });
+
+    // 访客读笔记的纵深防御:即使网关的类型闸门被绕过,访客自己(或另一名访客)
+    // 发的 note-card 也不能成为读取入口 —— 只认房主发出的卡片。
+    it('pins the card to the required sender when one is given', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValueOnce({
+        content: { noteId: 'note-1' },
+      });
+
+      await expect(
+        service.getNoteCardNoteId('u1', 'conv-1', 'msg-1', 'host-1'),
+      ).resolves.toBe('note-1');
+      expect(prisma.chatMessage.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: 'msg-1',
+          conversationID: 'conv-1',
+          type: 'note-card',
+          deleted: false,
+          revokedAt: null,
+          senderID: 'host-1',
+        },
+        select: { content: true },
+      });
+    });
   });
 
   // 事务已提交,之后的富化只是装饰。抛出去的话 handleSend 既不广播也不推送,

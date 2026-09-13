@@ -8,6 +8,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   MinLength,
 } from 'class-validator';
@@ -66,6 +67,8 @@ export class CreateConversationGroupDto {
   })
   @IsOptional()
   @IsInt()
+  // int4 上界:越界会穿过 @IsInt 变成未映射的 Prisma 错误 → 500。
+  @Max(2_147_483_647)
   sortOrder?: number;
 }
 
@@ -85,6 +88,8 @@ export class UpdateConversationGroupDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsInt()
+  // int4 上界:越界会穿过 @IsInt 变成未映射的 Prisma 错误 → 500。
+  @Max(2_147_483_647)
   sortOrder?: number;
 }
 

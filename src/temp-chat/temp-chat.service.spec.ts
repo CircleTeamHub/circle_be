@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   GoneException,
+  NotFoundException,
 } from '@nestjs/common';
 import { TempChatService } from './temp-chat.service';
 
@@ -84,7 +85,7 @@ describe('TempChatService', () => {
     noteService.getSharedNoteForGuest.mockResolvedValue({ id: 'note-1' });
   });
 
-  it('resolves a guest note through the authorized card in that conversation', async () => {
+  describe('getGuestNote', () => {
     const guest = {
       kind: 'temp-chat-guest' as const,
       guestId: 'guest-1',
@@ -92,15 +93,36 @@ describe('TempChatService', () => {
       conversationId: 'conv-1',
     };
 
-    await expect(service.getGuestNote(guest, 'msg-1')).resolves.toEqual({
-      id: 'note-1',
+    // 只认房主发出的卡片:访客自己伪造的 note-card 不能成为读任意笔记的入口。
+    it('resolves a guest note only through a card the host sent', async () => {
+      prisma.tempChat.findUnique.mockResolvedValue({ hostUserId: 'host-1' });
+
+      await expect(service.getGuestNote(guest, 'msg-1')).resolves.toEqual({
+        id: 'note-1',
+      });
+      expect(prisma.tempChat.findUnique).toHaveBeenCalledWith({
+        where: { id: 'tc-1' },
+        select: { hostUserId: true },
+      });
+      expect(chatService.getNoteCardNoteId).toHaveBeenCalledWith(
+        'guest-1',
+        'conv-1',
+        'msg-1',
+        'host-1',
+      );
+      expect(noteService.getSharedNoteForGuest).toHaveBeenCalledWith('note-1');
     });
-    expect(chatService.getNoteCardNoteId).toHaveBeenCalledWith(
-      'guest-1',
-      'conv-1',
-      'msg-1',
-    );
-    expect(noteService.getSharedNoteForGuest).toHaveBeenCalledWith('note-1');
+
+    // 房间行没了就没有「房主」可比对 —— 必须 fail closed,不能退化成不限发送者。
+    it('resolves nothing when the room row is gone', async () => {
+      prisma.tempChat.findUnique.mockResolvedValue(null);
+
+      await expect(service.getGuestNote(guest, 'msg-1')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      expect(chatService.getNoteCardNoteId).not.toHaveBeenCalled();
+      expect(noteService.getSharedNoteForGuest).not.toHaveBeenCalled();
+    });
   });
 
   describe('create', () => {
