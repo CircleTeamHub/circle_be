@@ -10,6 +10,7 @@ import {
   MaxLength,
 } from 'class-validator';
 import { Gender } from 'src/generated/prisma';
+import { IsOptionalNotNull } from 'src/common/validation';
 
 const URL_VALIDATION_OPTIONS = {
   require_protocol: true,
@@ -17,8 +18,9 @@ const URL_VALIDATION_OPTIONS = {
 } as const;
 
 export class UpdateUserDto {
+  // 非空列：省略 = 不改；显式 null 在校验层就回 400，不再落到 Prisma 成 500。
   @ApiPropertyOptional({ example: 'My Nickname' })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsString()
   @Transform(({ value }: { value: unknown }) =>
     typeof value === 'string' ? value.trim() : value,
@@ -83,7 +85,7 @@ export class UpdateUserDto {
   birthday?: string;
 
   @ApiPropertyOptional({ enum: Gender, example: Gender.unset })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsEnum(Gender)
   gender?: Gender;
 

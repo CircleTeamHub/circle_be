@@ -108,3 +108,47 @@ describe('UpdateUserDto', () => {
     expect(target?.constraints).toHaveProperty('isString');
   });
 });
+
+// 与全局 ValidationPipe 同一组选项（src/setup.ts）：隐式转换对 null 原样放行。
+function validateLikePipe(payload: Record<string, unknown>) {
+  return validateSync(
+    plainToInstance(UpdateUserDto, payload, { enableImplicitConversion: true }),
+    { whitelist: true, forbidNonWhitelisted: true },
+  );
+}
+
+// nickname / gender 是非空列：@IsOptional 让 { "nickname": null } 过了管道，
+// 落到 Prisma 才炸成 PrismaClientValidationError → 500（外加一条 Sentry）。
+describe('UpdateUserDto null handling', () => {
+  it.each(['nickname', 'gender'])(
+    'rejects an explicit null %s at the validation layer',
+    (property) => {
+      const target = validateLikePipe({ [property]: null }).find(
+        (error) => error.property === property,
+      );
+      expect(target?.constraints).toHaveProperty('isDefined');
+    },
+  );
+
+  it('still treats an omitted nickname / gender as "leave unchanged"', () => {
+    expect(validateLikePipe({ persona: 'hi' })).toHaveLength(0);
+  });
+
+  // 可空列上 null 就是「清空」（空串同理，见 service 的 BLANKABLE_TEXT_FIELDS）。
+  it.each([
+    'avatarUrl',
+    'avatarFrame',
+    'cover',
+    'phoneNumber',
+    'wechat',
+    'qq',
+    'whatsup',
+    'persona',
+    'helloWords',
+    'birthday',
+    'city',
+    'region',
+  ])('keeps accepting null for the nullable column %s', (property) => {
+    expect(validateLikePipe({ [property]: null })).toHaveLength(0);
+  });
+});
