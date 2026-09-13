@@ -104,11 +104,4 @@ export class AdminCommunityController {
       ...dto,
     });
   }
-
-  @Get('operations/:id')
-  @ApiOperation({ summary: 'Get an admin group-operation status' })
-  @ApiOkResponse()
-  getOperation(@Param('id', ParseUUIDPipe) id: string) {
-    return this.community.getOperation(id);
-  }
 }

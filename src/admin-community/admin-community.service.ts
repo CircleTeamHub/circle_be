@@ -302,14 +302,6 @@ export class AdminCommunityService {
     }
   }
 
-  async getOperation(id: string) {
-    const operation = await this.prisma.adminGroupOperation.findUnique({
-      where: { id },
-    });
-    if (!operation) throw new NotFoundException('管理操作不存在');
-    return operation;
-  }
-
   private async queueCircleOperation(
     input: CircleAction,
     type: 'MUTE' | 'UNMUTE',

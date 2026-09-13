@@ -1,4 +1,5 @@
 import { ConflictException } from '@nestjs/common';
+import { AdminCommunityController } from './admin-community.controller';
 import { AdminCommunityService } from './admin-community.service';
 
 describe('AdminCommunityService', () => {
@@ -577,5 +578,18 @@ describe('AdminCommunityService', () => {
     expect(prisma.circle.findMany.mock.calls[0][0].select).not.toHaveProperty(
       'avatarUrl',
     );
+  });
+
+  // GET /admin/community/operations/:id 管理台从不调用 —— 圈子/群列表自带
+  // latestOperation / pendingOperation 并 10 秒轮询。路由与 service 方法一起删掉。
+  it('no longer exposes the single-operation status lookup', () => {
+    expect(
+      (AdminCommunityController.prototype as unknown as Record<string, unknown>)
+        .getOperation,
+    ).toBeUndefined();
+    expect(
+      (AdminCommunityService.prototype as unknown as Record<string, unknown>)
+        .getOperation,
+    ).toBeUndefined();
   });
 });
