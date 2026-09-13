@@ -290,6 +290,20 @@ describe('RealtimeService', () => {
     });
   });
 
+  // call.participant.missed 从来没有生产者:未接由 call.ended(endReason NO_ANSWER /
+  // TIMEOUT)表达。留着白名单项与广播方法,只会让人以为这条事件是契约的一部分。
+  it('does not declare the never-produced call.participant.missed event', () => {
+    const allowList = (
+      RealtimeService as unknown as {
+        REALTIME_EVENT_TYPES: ReadonlySet<string>;
+      }
+    ).REALTIME_EVENT_TYPES;
+
+    expect(allowList.has('call.participant.missed')).toBe(false);
+    expect(allowList.has('call.participant.rejected')).toBe(true);
+    expect('broadcastCallParticipantMissed' in service).toBe(false);
+  });
+
   it('broadcastCallEnded emits terminal call state', () => {
     const broadcast = jest.spyOn(service, 'broadcast').mockImplementation();
 

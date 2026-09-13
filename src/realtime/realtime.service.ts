@@ -134,7 +134,6 @@ type RealtimeEvent =
   | { type: 'call.participant.joined'; payload: CallParticipantPayload }
   | { type: 'call.participant.left'; payload: CallParticipantPayload }
   | { type: 'call.participant.rejected'; payload: CallParticipantPayload }
-  | { type: 'call.participant.missed'; payload: CallParticipantPayload }
   | { type: 'call.canceled'; payload: CallStatePayload }
   | { type: 'call.ended'; payload: CallStatePayload }
   | {
@@ -229,7 +228,6 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
     'call.participant.joined',
     'call.participant.left',
     'call.participant.rejected',
-    'call.participant.missed',
     'call.canceled',
     'call.ended',
     'friend.activity.unread.changed',
@@ -804,16 +802,6 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
   ) {
     this.broadcast(userId, {
       type: 'call.participant.rejected',
-      payload,
-    });
-  }
-
-  broadcastCallParticipantMissed(
-    userId: string,
-    payload: CallParticipantPayload,
-  ) {
-    this.broadcast(userId, {
-      type: 'call.participant.missed',
       payload,
     });
   }

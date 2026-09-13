@@ -554,7 +554,10 @@ export class CallService {
   async rejectCall(userID: string, callId: string) {
     const participant = await this.findParticipantForUser(callId, userID);
     if (participant.status === CallParticipantStatus.REJECTED) {
-      return participant;
+      return this.toRejectResponse(
+        participant.call as CallWithParticipants,
+        participant,
+      );
     }
     if (participant.status !== CallParticipantStatus.INVITED) {
       throw new ConflictException({
@@ -580,7 +583,13 @@ export class CallService {
         include: { user: { select: userLiteSelect } },
       });
       if (current?.status === CallParticipantStatus.REJECTED) {
-        return current;
+        return this.toRejectResponse(
+          await this.reloadCall(
+            callId,
+            participant.call as CallWithParticipants,
+          ),
+          current,
+        );
       }
       throw new ConflictException({
         message: 'CALL_NOT_INVITED',
@@ -622,7 +631,37 @@ export class CallService {
       entityType: 'call',
       entityId: callId,
     });
-    return updatedParticipant;
+    return this.toRejectResponse(
+      await this.reloadCall(callId, participant.call as CallWithParticipants),
+      updatedParticipant,
+    );
+  }
+
+  /**
+   * 拒接回执:与接听 / 当前通话同形({call, selfParticipant})。此前原样返回 Prisma
+   * participant 行 —— call.metadata 里是发起方的幂等键,行上还有内部列。App 不读
+   * 这个响应体,形状收口不影响已装机版本。
+   */
+  private toRejectResponse(
+    call: CallWithParticipants,
+    participant: CallParticipantWithUser,
+  ) {
+    return {
+      call: this.toCallDto(call),
+      selfParticipant: this.toParticipantDto(participant),
+    };
+  }
+
+  /** 拒接可能刚把振铃中的通话收成 MISSED:回执按落库后的状态出。 */
+  private async reloadCall(
+    callId: string,
+    fallback: CallWithParticipants,
+  ): Promise<CallWithParticipants> {
+    const fresh = (await this.prisma.callSession.findUnique({
+      where: { id: callId },
+      include: this.callInclude(),
+    })) as CallWithParticipants | null;
+    return fresh ?? fallback;
   }
 
   async leaveCall(userID: string, callId: string) {
@@ -1522,7 +1561,6 @@ export class CallService {
       sessionType: call.sessionType === GROUP_SESSION_TYPE ? 'group' : 'single',
       callType: call.callType,
       status: call.status,
-      livekitRoomName: call.livekitRoomName,
       initiator: call.initiator,
       startedAt: call.startedAt?.toISOString() ?? null,
       endedAt: call.endedAt?.toISOString() ?? null,
