@@ -280,6 +280,7 @@ describe('removed routes stay out of the allowlists', () => {
     '/api/v1/friend/activities/read-all',
     '/api/v1/friend/requests/incoming',
     '/api/v1/friend/requests/outgoing',
+    '/api/v1/membership/me',
   ];
   const removedTemplates = [
     '/api/v1/circle-plaza/posts/:id/signups',
