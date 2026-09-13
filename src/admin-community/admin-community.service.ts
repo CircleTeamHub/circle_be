@@ -4,7 +4,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import {
+  AdminGroupOperation,
   AdminGroupOperationType,
+  Circle,
   CircleAdminState,
   Prisma,
 } from 'src/generated/prisma';
@@ -30,6 +32,52 @@ type GroupAction = {
   confirmation: string;
   idempotencyKey: string;
 };
+
+/**
+ * 管理动作的响应只回摘要。管理台 CommunityPage 丢弃这些响应体、提交后整表重拉；
+ * 操作与列表里的 latestOperation 同形，不透出幂等键、申请人、重试调度等内部列。
+ */
+function toOperationSummary(
+  operation: Pick<
+    AdminGroupOperation,
+    'id' | 'groupID' | 'type' | 'status' | 'lastError' | 'createdAt'
+  >,
+) {
+  return {
+    id: operation.id,
+    groupID: operation.groupID,
+    type: operation.type,
+    status: operation.status,
+    lastError: operation.lastError,
+    createdAt: operation.createdAt,
+  };
+}
+
+/** 圈子只回管理态相关列，不把整行 Circle 透给管理台。 */
+function toCircleAdminView(
+  circle: Pick<
+    Circle,
+    | 'id'
+    | 'name'
+    | 'groupID'
+    | 'deleted'
+    | 'adminState'
+    | 'adminDisabledAt'
+    | 'adminDisabledBy'
+    | 'adminDisableReason'
+  >,
+) {
+  return {
+    id: circle.id,
+    name: circle.name,
+    groupID: circle.groupID,
+    deleted: circle.deleted,
+    adminState: circle.adminState,
+    adminDisabledAt: circle.adminDisabledAt,
+    adminDisabledBy: circle.adminDisabledBy,
+    adminDisableReason: circle.adminDisableReason,
+  };
+}
 
 @Injectable()
 export class AdminCommunityService {
@@ -134,7 +182,6 @@ export class AdminCommunityService {
           id: true,
           name: true,
           groupID: true,
-          avatarUrl: true,
           memberCount: true,
           ownerID: true,
           owner: { select: { nickname: true } },
@@ -158,7 +205,6 @@ export class AdminCommunityService {
         return {
           groupId,
           name: circle.name,
-          faceUrl: circle.avatarUrl ?? null,
           status: mutedByCircle.get(circle.id) ? 3 : 0,
           muted: mutedByCircle.get(circle.id) ?? false,
           memberCount: circle.memberCount,
@@ -218,7 +264,7 @@ export class AdminCommunityService {
             type: input.type,
             reason: input.reason,
           });
-          return duplicate;
+          return toOperationSummary(duplicate);
         }
         if (linkedCircle && input.type !== 'DISMISS') {
           throw new ConflictException(
@@ -249,7 +295,7 @@ export class AdminCommunityService {
           },
         });
         await this.auditQueued(tx, operation, input.actorId);
-        return operation;
+        return toOperationSummary(operation);
       });
     } catch (error) {
       this.rethrowOperationConflict(error);
@@ -305,7 +351,10 @@ export class AdminCommunityService {
             type,
             reason: input.reason,
           });
-          return { circle, operation: duplicate };
+          return {
+            circle: toCircleAdminView(circle),
+            operation: toOperationSummary(duplicate),
+          };
         }
         await this.assertNoActiveOperation(tx, circle.groupID);
 
@@ -348,7 +397,10 @@ export class AdminCommunityService {
           },
         });
         await this.auditQueued(tx, operation, input.actorId);
-        return { circle: updatedCircle, operation };
+        return {
+          circle: toCircleAdminView(updatedCircle),
+          operation: toOperationSummary(operation),
+        };
       });
     } catch (error) {
       this.rethrowOperationConflict(error);
@@ -399,7 +451,7 @@ export class AdminCommunityService {
       ) {
         throw new ConflictException('Idempotency-Key 已用于其他管理操作');
       }
-      return { circle, operation: null };
+      return { circle: toCircleAdminView(circle), operation: null };
     }
 
     if (type === 'MUTE' && circle.deleted) {
@@ -453,7 +505,7 @@ export class AdminCommunityService {
         requestId: input.idempotencyKey,
       },
     });
-    return { circle: updatedCircle, operation: null };
+    return { circle: toCircleAdminView(updatedCircle), operation: null };
   }
 
   private hasAdminDisableProvenance(circle: {
