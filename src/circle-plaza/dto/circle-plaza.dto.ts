@@ -34,6 +34,9 @@ export class CreatePlazaPostDto {
   @ApiPropertyOptional({ type: [String] })
   @IsArray()
   @IsString({ each: true })
+  // 逐项限长：这些数组原样落库，无上限时超长值会在写入事务里以未映射的
+  // Prisma 错误炸成 500（city 有 btree 索引、cities 有 GIN 索引，尤其如此）。
+  @MaxLength(500, { each: true })
   @ArrayMaxSize(9)
   @IsOptional()
   images?: string[];
@@ -41,6 +44,7 @@ export class CreatePlazaPostDto {
   @ApiPropertyOptional({ type: [String] })
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(30, { each: true })
   @ArrayUnique()
   @ArrayMaxSize(5)
   @IsOptional()
@@ -64,6 +68,8 @@ export class CreatePlazaPostDto {
 
   @ApiPropertyOptional({ description: 'Legacy single city (= cities[0])' })
   @IsString()
+  // 与 PlazaFeedQueryDto.city / PlazaFeedSearchDto.cities 的 100 对齐。
+  @MaxLength(100)
   @IsOptional()
   city?: string;
 
@@ -73,6 +79,7 @@ export class CreatePlazaPostDto {
   })
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(100, { each: true })
   @ArrayUnique()
   @ArrayMaxSize(50)
   @IsOptional()

@@ -135,3 +135,47 @@ describe('VIP restriction fields advertise the 0..4 cap in OpenAPI metadata', ()
     expect(meta.maximum).toBe(4);
   });
 });
+
+describe('CreatePlazaPostDto bounds string items before they reach indexed columns', () => {
+  // city 有 btree 索引、cities 有 GIN 索引：超长值不会被校验层拦下，而是在写入事务里
+  // 以未映射的 Prisma 错误炸成 500。上限与 PlazaFeedQueryDto.city / PlazaFeedSearchDto.cities
+  // 已有的 100 对齐；tags 30、images 500 按现有客户端实际长度收口。
+  const constraintsOf = (
+    payload: Record<string, unknown>,
+    property: string,
+  ): Record<string, string> =>
+    validateSync(
+      plainToInstance(CreatePlazaPostDto, {
+        content: 'hello plaza',
+        ...payload,
+      }),
+    ).find((error) => error.property === property)?.constraints ?? {};
+
+  it('rejects a tag longer than 30 chars and accepts one at the cap', () => {
+    expect(constraintsOf({ tags: ['x'.repeat(31)] }, 'tags')).toHaveProperty(
+      'maxLength',
+    );
+    expect(constraintsOf({ tags: ['x'.repeat(30)] }, 'tags')).toEqual({});
+  });
+
+  it('rejects a legacy city longer than 100 chars', () => {
+    expect(constraintsOf({ city: 'x'.repeat(101) }, 'city')).toHaveProperty(
+      'maxLength',
+    );
+    expect(constraintsOf({ city: 'x'.repeat(100) }, 'city')).toEqual({});
+  });
+
+  it('rejects a cities item longer than 100 chars', () => {
+    expect(
+      constraintsOf({ cities: ['x'.repeat(101)] }, 'cities'),
+    ).toHaveProperty('maxLength');
+    expect(constraintsOf({ cities: ['x'.repeat(100)] }, 'cities')).toEqual({});
+  });
+
+  it('rejects an image URL longer than 500 chars', () => {
+    expect(
+      constraintsOf({ images: ['x'.repeat(501)] }, 'images'),
+    ).toHaveProperty('maxLength');
+    expect(constraintsOf({ images: ['x'.repeat(500)] }, 'images')).toEqual({});
+  });
+});

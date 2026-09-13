@@ -51,15 +51,30 @@ import {
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
 
-// A plaza post joined with the relations every DTO mapping needs.
+// The relations every DTO mapping needs, narrowed to the columns it reads.
+// `include: { author: true }` pulled the whole User row (passwordHash, email,
+// phoneNumber …) for every post on a feed page; the mapper only ever needed
+// these seven columns, and a select keeps a future branch from leaking the rest.
 // `circleLinks` carries the full set of circles the post is shared to (M2M);
 // `circle` remains the primary circle for backward compatibility.
+const PLAZA_POST_INCLUDE = {
+  author: {
+    select: {
+      id: true,
+      nickname: true,
+      avatarUrl: true,
+      avatarFrame: true,
+      accountId: true,
+      vipLevel: true,
+      vipExpiresAt: true,
+    },
+  },
+  circle: { select: { id: true, name: true } },
+  circleLinks: { select: { circle: { select: { id: true, name: true } } } },
+} as const satisfies Prisma.CirclePostInclude;
+
 type PlazaPostWithRelations = Prisma.CirclePostGetPayload<{
-  include: {
-    author: true;
-    circle: true;
-    circleLinks: { include: { circle: true } };
-  };
+  include: typeof PLAZA_POST_INCLUDE;
 }>;
 
 // The viewer fields that gate post interaction / signup eligibility.
@@ -357,11 +372,7 @@ export class CirclePlazaService {
               })),
             },
           },
-          include: {
-            author: true,
-            circle: true,
-            circleLinks: { include: { circle: true } },
-          },
+          include: PLAZA_POST_INCLUDE,
         });
 
         // 每个圈子的 postCount 都 +1。
@@ -575,11 +586,7 @@ export class CirclePlazaService {
     const [rows, total] = await Promise.all([
       this.prisma.circlePost.findMany({
         where,
-        include: {
-          author: true,
-          circle: true,
-          circleLinks: { include: { circle: true } },
-        },
+        include: PLAZA_POST_INCLUDE,
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         ...(useKeyset ? { take: limit + 1 } : { skip, take: limit }),
       }),
@@ -668,11 +675,7 @@ export class CirclePlazaService {
         // 否则 findFirst 不命中 → 抛 404，避免凭 id 直读到非本圈私密动态。
         circleLinks: { some: { circle: this.memberCircleScope(viewerId) } },
       },
-      include: {
-        author: true,
-        circle: true,
-        circleLinks: { include: { circle: true } },
-      },
+      include: PLAZA_POST_INCLUDE,
     });
 
     if (!post) {

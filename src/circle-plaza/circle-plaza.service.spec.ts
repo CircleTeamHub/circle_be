@@ -151,6 +151,48 @@ describe('CirclePlazaService', () => {
   });
 
   describe('getFeed', () => {
+    // 广场每行曾 include 整行 User（含 passwordHash/email）与整行 Circle，而
+    // mapper 只用作者 7 列、圈子 2 列。include 必须是显式 select：既省 DB→应用
+    // 的传输，也避免某个分支一次手滑就把敏感列送出去。
+    it('narrows author and circle to the columns the DTO needs', async () => {
+      prisma.circlePost.findMany.mockResolvedValue([]);
+      prisma.circlePost.count.mockResolvedValue(0);
+      prisma.user.findUnique.mockResolvedValue({
+        vipLevel: 1,
+        vipExpiresAt: new Date('2030-01-01T00:00:00.000Z'),
+        creditScore: 100,
+        fancyNumber: false,
+      });
+
+      await service.getFeed('viewer-1', {});
+
+      const include = prisma.circlePost.findMany.mock.calls[0][0].include;
+      expect(include.author).not.toBe(true);
+      expect(include.author.select).toEqual(
+        expect.objectContaining({ id: true, nickname: true, avatarUrl: true }),
+      );
+      for (const column of [
+        'passwordHash',
+        'loginSecurityCodeHash',
+        'email',
+        'phoneNumber',
+        'wechat',
+        'qq',
+        'birthday',
+        'inviteCode',
+        'creditScore',
+      ]) {
+        expect(include.author.select).not.toHaveProperty(column);
+      }
+      expect(include.circle).not.toBe(true);
+      expect(include.circle.select).toEqual(
+        expect.objectContaining({ id: true, name: true }),
+      );
+      expect(include.circleLinks.select.circle.select).toEqual(
+        expect.objectContaining({ id: true, name: true }),
+      );
+    });
+
     it('only returns posts from circles the viewer has actively joined', async () => {
       jest
         .useFakeTimers()
