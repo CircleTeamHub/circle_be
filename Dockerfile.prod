@@ -26,7 +26,12 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 # Prisma detects the OpenSSL ABI at runtime for migrations and query engines.
+# node:22-slim lags behind bookworm-security, and the Trivy gates in CI and the
+# release workflow block every fixable HIGH/CRITICAL, so pull the Debian
+# security updates into the runtime image (same approach as `apk upgrade` in
+# Dockerfile.caddy).
 RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
 

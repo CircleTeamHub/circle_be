@@ -63,7 +63,7 @@ services:
     # 仅供 compose 内网访问,不向宿主机发布 6379
 
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     profiles: ['bundled-storage']
     restart: unless-stopped
     logging: *default-logging
@@ -87,7 +87,7 @@ services:
 
   # 一次性:确保 bucket 存在；最小公开读策略由应用启动时安装。
   minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     profiles: ['bundled-storage']
     logging: *default-logging
     depends_on:

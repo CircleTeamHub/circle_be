@@ -68,7 +68,7 @@ chmod 644 "$certs_dir/private.key"
 cat > "$tmp_override" <<EOF
 services:
   backup-s3:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     environment:
       MINIO_ROOT_USER: $s3_key
       MINIO_ROOT_PASSWORD: $s3_secret
