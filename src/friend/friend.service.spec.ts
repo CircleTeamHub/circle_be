@@ -122,7 +122,7 @@ describe('FriendService', () => {
   const privacySettings = {
     canReceiveStrangerMessage: jest.fn(),
     getSettings: jest.fn(),
-    // 好友列表按它抹掉关了「显示在线时间」的人的 lastOnline;默认没人关。
+    // 好友列表已不下发 lastOnline,也就不再读这个批量开关;留着 mock 断言它不被调用。
     getSettingsForUsers: jest.fn().mockResolvedValue(new Map()),
   };
   const creditService = {
@@ -212,7 +212,10 @@ describe('FriendService', () => {
 
   // 好友与好友关系都已经查出来了,不该因为这条**附加**的隐私查询失败就让整个
   // 列表请求挂掉;退到「都不显示最近在线」是隐私安全的那一侧。
-  it('still returns the friend list when the privacy lookup fails, with last-online hidden', async () => {
+  // 好友列表只下发客户端真正读的列:gender / avatarFrame(旧纯 URL,已被
+  // avatarFrameAppearance 取代)/ lastOnline 在 circle-im 里只被 normalizer 透传、
+  // 没有页面读取 —— lastOnline 还要为它额外查一次「显示在线时间」隐私开关。
+  it('lists friends with only the client-read profile columns and no presence-privacy lookup', async () => {
     const when = new Date('2026-07-24T07:59:51.066Z');
     prisma.friend.findMany.mockResolvedValue([
       {
@@ -221,30 +224,91 @@ describe('FriendService', () => {
         friendID: 'user-2',
         state: FriendState.ACCEPTED,
         updatedAt: when,
-        remarkA: null,
+        remarkA: 'bob remark',
         remarkB: null,
       },
     ]);
     prisma.user.findMany.mockResolvedValue([
+      { id: 'user-2', accountId: 'bob02', nickname: 'Bob', avatarUrl: null },
+    ]);
+    avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
+
+    const friends = await service.listFriends('user-1');
+
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
+      select: { id: true, accountId: true, nickname: true, avatarUrl: true },
+    });
+    expect(privacySettings.getSettingsForUsers).not.toHaveBeenCalled();
+    expect(friends).toEqual([
       {
         id: 'user-2',
         accountId: 'bob02',
         nickname: 'Bob',
         avatarUrl: null,
-        avatarFrame: null,
-        gender: 'unset',
-        lastOnline: new Date('2026-09-11T08:00:00.000Z'),
+        avatarFrameAppearance: null,
+        friendsSince: when,
+        remark: 'bob remark',
       },
     ]);
+    expect(friends[0]).not.toHaveProperty('lastOnline');
+  });
+
+  it('lists friends under a tag reading only the friendship columns it needs', async () => {
+    const when = new Date('2026-08-01T00:00:00.000Z');
+    prisma.friendTag.findUnique.mockResolvedValue({
+      id: 'tag-1',
+      ownerID: 'user-1',
+    });
+    prisma.friendTagOnFriend.findMany.mockResolvedValue([
+      {
+        friendship: {
+          userID: 'user-2',
+          friendID: 'user-1',
+          updatedAt: when,
+          remarkA: null,
+          remarkB: 'colleague',
+        },
+      },
+    ]);
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'user-2', accountId: 'bob02', nickname: 'Bob', avatarUrl: null },
+    ]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
-    privacySettings.getSettingsForUsers.mockRejectedValueOnce(
-      new Error('db down'),
-    );
 
-    const friends = await service.listFriends('user-1');
+    const friends = await service.listFriendsByTag('user-1', 'tag-1');
 
-    expect(friends).toHaveLength(1);
-    expect(friends[0]).toMatchObject({ id: 'user-2', lastOnline: null });
+    expect(prisma.friendTagOnFriend.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1', tagID: 'tag-1' },
+      select: {
+        friendship: {
+          select: {
+            userID: true,
+            friendID: true,
+            updatedAt: true,
+            remarkA: true,
+            remarkB: true,
+          },
+        },
+      },
+    });
+    expect(prisma.user.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['user-2'] }, status: 'ACTIVE' },
+      select: { id: true, accountId: true, nickname: true, avatarUrl: true },
+    });
+    expect(privacySettings.getSettingsForUsers).not.toHaveBeenCalled();
+    expect(friends).toEqual([
+      {
+        id: 'user-2',
+        accountId: 'bob02',
+        nickname: 'Bob',
+        avatarUrl: null,
+        avatarFrameAppearance: null,
+        friendsSince: when,
+        remark: 'colleague',
+      },
+    ]);
+    expect(friends[0]).not.toHaveProperty('lastOnline');
   });
 
   it('deduplicates accepted friendship rows by friend user in the friend list', async () => {
@@ -276,9 +340,6 @@ describe('FriendService', () => {
         accountId: 'bob02',
         nickname: 'Bob',
         avatarUrl: null,
-        avatarFrame: null,
-        gender: 'unset',
-        lastOnline: null,
       },
     ]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(
@@ -957,14 +1018,11 @@ describe('FriendService', () => {
       permissionB: 'FULL',
     });
     prisma.friendTag.findMany.mockResolvedValue([
-      { id: 'tag-1', ownerID: 'user-1', name: '同事', color: '#3B82F6' },
-      { id: 'tag-2', ownerID: 'user-1', name: '健身', color: null },
+      { id: 'tag-1', name: '同事', color: '#3B82F6' },
+      { id: 'tag-2', name: '健身', color: null },
     ]);
     prisma.friendTagOnFriend.findMany.mockResolvedValue([
-      {
-        id: 'link-1',
-        tag: { id: 'tag-2', ownerID: 'user-1', name: '健身', color: null },
-      },
+      { tag: { id: 'tag-2', name: '健身', color: null } },
     ]);
 
     await expect(
@@ -974,13 +1032,23 @@ describe('FriendService', () => {
       description: '设计大会认识的',
       photos: ['friends/user-1/a.jpg'],
       permission: 'CHAT_ONLY',
-      assignedTags: [
-        { id: 'tag-2', ownerID: 'user-1', name: '健身', color: null },
-      ],
+      assignedTags: [{ id: 'tag-2', name: '健身', color: null }],
       availableTags: [
-        { id: 'tag-1', ownerID: 'user-1', name: '同事', color: '#3B82F6' },
-        { id: 'tag-2', ownerID: 'user-1', name: '健身', color: null },
+        { id: 'tag-1', name: '同事', color: '#3B82F6' },
+        { id: 'tag-2', name: '健身', color: null },
       ],
+    });
+    // 标签只回客户端读的 id/name/color,不带 ownerID/createdAt 等整行列。
+    expect(prisma.friendTag.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1' },
+      select: { id: true, name: true, color: true },
+      orderBy: { name: 'asc' },
+      take: 500,
+    });
+    expect(prisma.friendTagOnFriend.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1', friendID: 'friendship-1' },
+      select: { tag: { select: { id: true, name: true, color: true } } },
+      orderBy: { createdAt: 'asc' },
     });
   });
 
@@ -2288,7 +2356,28 @@ describe('FriendService', () => {
     await service.createTag('user-1', 'classmates', '#FF0000');
 
     expect(prisma.friendTag.count).not.toHaveBeenCalled();
-    expect(prisma.friendTag.upsert).toHaveBeenCalled();
+    expect(prisma.friendTag.upsert).toHaveBeenCalledWith({
+      where: { ownerID_name: { ownerID: 'user-1', name: 'classmates' } },
+      update: { color: '#FF0000' },
+      create: { ownerID: 'user-1', name: 'classmates', color: '#FF0000' },
+      select: { id: true, name: true, color: true },
+    });
+  });
+
+  it('listMyTags returns only id/name/color', async () => {
+    prisma.friendTag.findMany.mockResolvedValue([
+      { id: 'tag-1', name: '同事', color: null },
+    ]);
+
+    await expect(service.listMyTags('user-1')).resolves.toEqual([
+      { id: 'tag-1', name: '同事', color: null },
+    ]);
+    expect(prisma.friendTag.findMany).toHaveBeenCalledWith({
+      where: { ownerID: 'user-1' },
+      select: { id: true, name: true, color: true },
+      orderBy: { name: 'asc' },
+      take: 500,
+    });
   });
 
   it('assignTag rejects a tag that does not belong to the user', async () => {

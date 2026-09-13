@@ -83,15 +83,22 @@ const MINI_USER_SELECT = {
   avatarUrl: true,
 } as const;
 
-// Full profile shape returned in the friend list
+// Profile columns returned in the friend list. Only what clients read:
+// gender / avatarFrame (superseded by avatarFrameAppearance) / lastOnline were
+// passed through circle-im's normalizer but never rendered.
 const FRIEND_PROFILE_SELECT = {
   id: true,
   accountId: true,
   nickname: true,
   avatarUrl: true,
-  avatarFrame: true,
-  gender: true,
-  lastOnline: true,
+} as const;
+
+// Friend tags go out as { id, name, color } — ownerID is always the caller and
+// createdAt is never read.
+const FRIEND_TAG_SELECT = {
+  id: true,
+  name: true,
+  color: true,
 } as const;
 
 const FRIEND_ACTIVITY_TYPE = {
@@ -868,28 +875,6 @@ export class FriendService {
   // 正常用户远够不到；够到的说明该端点需要真分页（届时按 trace/plaza 的
   // cursor 模式补）。FriendActivity 表不参与清理（见 refresh-token.cleanup
   // 注释），listActivities 的 take 同时是这张只增表的读路径止血带。
-  /**
-   * 好友列表的「显示在线时间」附加读。
-   *
-   * 读失败时返回 null,调用方把所有 lastOnline 抹成 null —— 好友与好友关系都
-   * 已经查出来了,不该因为这条附加查询失败就让整个列表请求挂掉;而退到
-   * 「都不显示」是隐私安全的那一侧,不会把关掉开关的人漏出去。
-   */
-  private async readPresencePrivacy(
-    userIds: string[],
-  ): Promise<Map<string, { shareOnlineStatus?: boolean }> | null> {
-    try {
-      return await this.privacySettings.getSettingsForUsers(userIds);
-    } catch (error) {
-      this.logger.warn(
-        `friend presence privacy lookup failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return null;
-    }
-  }
-
   async listFriends(userId: string): Promise<FriendProfileDto[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -907,12 +892,8 @@ export class FriendService {
       where: { id: { in: friendIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const [appearances, privacy] = await Promise.all([
-      this.avatarFrames.resolvePublicAppearances(friendIds),
-      // 关了「显示在线时间」的好友,列表里的 lastOnline 一并抹掉 —— 资料页与
-      // 聊天 presence 都收口了,好友列表不收口就是第三条信道。
-      this.readPresencePrivacy(friendIds),
-    ]);
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueRecords
@@ -924,10 +905,6 @@ export class FriendService {
         const remark = r.userID === userId ? r.remarkA : r.remarkB;
         return {
           ...u,
-          lastOnline:
-            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
-              ? null
-              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: r.updatedAt,
           remark,
@@ -960,6 +937,7 @@ export class FriendService {
     const [availableTags, assignedLinks] = await Promise.all([
       this.prisma.friendTag.findMany({
         where: { ownerID: userId },
+        select: FRIEND_TAG_SELECT,
         orderBy: { name: 'asc' },
         take: 500,
       }),
@@ -968,9 +946,7 @@ export class FriendService {
           ownerID: userId,
           friendID: friendship.id,
         },
-        include: {
-          tag: true,
-        },
+        select: { tag: { select: FRIEND_TAG_SELECT } },
         orderBy: {
           createdAt: 'asc',
         },
@@ -1352,6 +1328,7 @@ export class FriendService {
   async listMyTags(userId: string) {
     return this.prisma.friendTag.findMany({
       where: { ownerID: userId },
+      select: FRIEND_TAG_SELECT,
       orderBy: { name: 'asc' },
       take: 500,
     });
@@ -1387,6 +1364,7 @@ export class FriendService {
       where: { ownerID_name: { ownerID: userId, name: trimmed } },
       update: { color: color ?? undefined },
       create: { ownerID: userId, name: trimmed, color: color ?? null },
+      select: FRIEND_TAG_SELECT,
     });
   }
 
@@ -1498,7 +1476,18 @@ export class FriendService {
 
     const links = await this.prisma.friendTagOnFriend.findMany({
       where: { ownerID: userId, tagID: tagId },
-      include: { friendship: true },
+      // 只取去重、备注与 friendsSince 真正读到的列。
+      select: {
+        friendship: {
+          select: {
+            userID: true,
+            friendID: true,
+            updatedAt: true,
+            remarkA: true,
+            remarkB: true,
+          },
+        },
+      },
     });
 
     const uniqueLinks = latestFriendRecordsByCounterparty(
@@ -1513,10 +1502,8 @@ export class FriendService {
       where: { id: { in: friendUserIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const [appearances, privacy] = await Promise.all([
-      this.avatarFrames.resolvePublicAppearances(friendUserIds),
-      this.readPresencePrivacy(friendUserIds),
-    ]);
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendUserIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueLinks
@@ -1527,10 +1514,6 @@ export class FriendService {
         const remark = f.userID === userId ? f.remarkA : f.remarkB;
         return {
           ...u,
-          lastOnline:
-            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
-              ? null
-              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: f.updatedAt,
           remark,

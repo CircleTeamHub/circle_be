@@ -181,11 +181,8 @@ export class FriendProfileDto {
   @ApiProperty() accountId: string;
   @ApiProperty() nickname: string;
   @ApiPropertyOptional() avatarUrl: string | null;
-  @ApiPropertyOptional() avatarFrame: string | null;
   @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
   avatarFrameAppearance: AvatarFrameAppearanceDto | null;
-  @ApiProperty() gender: string;
-  @ApiPropertyOptional() lastOnline: Date | null;
   /** When this friendship was accepted */
   @ApiProperty() friendsSince: Date;
   /** The viewer's private remark (备注) for this friend, if set. */
@@ -194,7 +191,6 @@ export class FriendProfileDto {
 
 export class FriendTagDto {
   @ApiProperty() id: string;
-  @ApiProperty() ownerID: string;
   @ApiProperty() name: string;
   @ApiPropertyOptional() color: string | null;
 }
