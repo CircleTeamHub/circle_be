@@ -58,6 +58,7 @@ import {
   SharedNoteListDto,
   UpdateNoteDto,
   UpdateNoteGroupDto,
+  NOTE_LIST_DEFAULT_LIMIT,
 } from './dto/note.dto';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { logBusinessEvent } from 'src/logging/business-event.logger';
@@ -401,6 +402,15 @@ function escapeXml(value: string) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/**
+ * 笔记列表的一页。hasMore 由多取的一行判断，controller 放进 X-Has-More 响应头 ——
+ * 响应体本身仍是 items 数组（app 依赖这个形状）。
+ */
+export interface NoteSummaryPage {
+  items: NoteSummaryDto[];
+  hasMore: boolean;
 }
 
 @Injectable()
@@ -1713,10 +1723,13 @@ export class NoteService {
   async listNotes(
     ownerID: string,
     query: ListNotesQueryDto,
-  ): Promise<NoteSummaryDto[]> {
+  ): Promise<NoteSummaryPage> {
     if (query.groupId) {
       await this.requireOwnedGroup(ownerID, query.groupId);
     }
+
+    const limit = query.limit ?? NOTE_LIST_DEFAULT_LIMIT;
+    const page = query.page ?? 1;
 
     const notes = await this.prisma.note.findMany({
       where: {
@@ -1755,11 +1768,26 @@ export class NoteService {
       },
       include: NOTE_INCLUDE,
       orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
-      take: query.limit ?? 50,
-      skip: ((query.page ?? 1) - 1) * (query.limit ?? 50),
+      // 多取一行只为判断 hasMore，不返回给调用方。
+      take: limit + 1,
+      skip: (page - 1) * limit,
     });
 
-    return this.mapSummaryListResolved(notes, ownerID);
+    return this.toSummaryPage(notes, limit, ownerID);
+  }
+
+  /** 多取的那一行先截掉再映射：它不返回，也不必为它签名媒体 URL。 */
+  private async toSummaryPage(
+    notes: NoteRow[],
+    limit: number,
+    viewerID: string,
+  ): Promise<NoteSummaryPage> {
+    const hasMore = notes.length > limit;
+    const items = await this.mapSummaryListResolved(
+      hasMore ? notes.slice(0, limit) : notes,
+      viewerID,
+    );
+    return { items, hasMore };
   }
 
   async createShareLink(
@@ -2919,17 +2947,18 @@ export class NoteService {
   async listDeletedNotes(
     ownerID: string,
     page = 1,
-    limit = 50,
-  ): Promise<NoteSummaryDto[]> {
-    const take = Math.min(limit, 200);
+    limit = NOTE_LIST_DEFAULT_LIMIT,
+  ): Promise<NoteSummaryPage> {
+    const take = Math.min(limit, NOTE_LIST_DEFAULT_LIMIT);
     const notes = await this.prisma.note.findMany({
       where: { ownerID, status: 'DELETED' },
       orderBy: { updatedAt: 'desc' },
-      take,
+      // 多取一行只为判断 hasMore，不返回给调用方。
+      take: take + 1,
       skip: (page - 1) * take,
       include: NOTE_INCLUDE,
     });
-    return this.mapSummaryListResolved(notes, ownerID);
+    return this.toSummaryPage(notes, take, ownerID);
   }
 
   /**

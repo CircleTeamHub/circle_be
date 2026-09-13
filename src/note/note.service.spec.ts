@@ -1054,7 +1054,8 @@ describe('NoteService', () => {
       },
     ]);
 
-    const result = await service.listNotes('user-1', { status: 'ACTIVE' });
+    const result = (await service.listNotes('user-1', { status: 'ACTIVE' }))
+      .items;
 
     expect(prisma.note.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1074,6 +1075,73 @@ describe('NoteService', () => {
       videoCount: 1,
       groups: [{ id: 'group-1', name: '上海' }],
     });
+  });
+
+  // app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit，而响应体必须保持数组：
+  // 以前默认 take 50，第 51 条起被静默截掉。默认页放到 500，多取一行判断 hasMore，
+  // 由 controller 放进 X-Has-More 响应头。
+  const listRow = (index: number, status = 'ACTIVE') => ({
+    id: `note-${index}`,
+    ownerID: 'user-1',
+    title: `笔记 ${index}`,
+    content: null,
+    sections: null,
+    status,
+    available: true,
+    pinned: false,
+    imageCount: 0,
+    videoCount: 0,
+    mediaCount: 0,
+    groupMemberships: [],
+    media: [],
+    coverMedia: null,
+    createdAt: new Date('2026-04-09T00:00:00.000Z'),
+    updatedAt: new Date('2026-04-09T00:00:00.000Z'),
+  });
+
+  it('lists up to 500 notes by default and reports hasMore from one extra row', async () => {
+    prisma.note.findMany.mockResolvedValueOnce(
+      Array.from({ length: 501 }, (_, index) => listRow(index)),
+    );
+
+    const page = await service.listNotes('user-1', {});
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 501, skip: 0 }),
+    );
+    expect(page.items).toHaveLength(500);
+    expect(page.items[499].id).toBe('note-499');
+    expect(page.hasMore).toBe(true);
+  });
+
+  it('reports hasMore=false when an explicit page is not full', async () => {
+    prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+
+    const page = await service.listNotes('user-1', { page: 2, limit: 20 });
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 21, skip: 20 }),
+    );
+    expect(page.items.map((note) => note.id)).toEqual(['note-0', 'note-1']);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('lists up to 500 recycle-bin notes by default and reports hasMore', async () => {
+    prisma.note.findMany.mockResolvedValueOnce(
+      Array.from({ length: 501 }, (_, index) => listRow(index, 'DELETED')),
+    );
+
+    const page = await service.listDeletedNotes('user-1');
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { ownerID: 'user-1', status: 'DELETED' },
+        take: 501,
+        skip: 0,
+      }),
+    );
+    expect(page.items).toHaveLength(500);
+    expect(page.hasMore).toBe(true);
   });
 
   it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {

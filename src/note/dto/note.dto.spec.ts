@@ -7,7 +7,9 @@ import {
   CreateNoteMediaDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
+  ListNotesQueryDto,
   NOTE_REMARK_MAX_LENGTH,
+  RecycleBinQueryDto,
   ReorderNoteGroupsDto,
   SetNoteRemarkDto,
   UpdateNoteGroupDto,
@@ -367,4 +369,38 @@ describe('CreateNoteMediaDto integer fields stay within Postgres int4', () => {
       expect(errorFor(property, INT4_MAX)).toBeUndefined();
     },
   );
+});
+
+// app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit：默认页必须装得下整本笔记，
+// 否则超过默认页（以前 50）的笔记被静默截掉。显式上限同样放到 500。
+describe('note list query limits', () => {
+  it('ListNotesQueryDto defaults limit to 500 and caps it at 500', () => {
+    const parse = (query: Record<string, unknown>) =>
+      plainToInstance(ListNotesQueryDto, query, {
+        enableImplicitConversion: true,
+      });
+
+    const empty = parse({});
+    expect(validateSync(empty)).toHaveLength(0);
+    expect(empty.limit).toBe(500);
+    expect(validateSync(parse({ limit: '500' }))).toHaveLength(0);
+    expect(
+      validateSync(parse({ limit: '501' })).map((error) => error.property),
+    ).toContain('limit');
+  });
+
+  it('RecycleBinQueryDto defaults limit to 500 and caps it at 500', () => {
+    const parse = (query: Record<string, unknown>) =>
+      plainToInstance(RecycleBinQueryDto, query, {
+        enableImplicitConversion: true,
+      });
+
+    const empty = parse({});
+    expect(validateSync(empty)).toHaveLength(0);
+    expect(empty.limit).toBe(500);
+    expect(validateSync(parse({ limit: '500' }))).toHaveLength(0);
+    expect(
+      validateSync(parse({ limit: '501' })).map((error) => error.property),
+    ).toContain('limit');
+  });
 });

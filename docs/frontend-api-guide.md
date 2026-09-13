@@ -1068,6 +1068,10 @@ Authorization: Bearer <accessToken>
 - `status` 可选，默认返回非 `DELETED` 的笔记
 - `groupId` 可选，只看某个分组
 - `search` 可选，按标题/正文模糊搜索
+- `page` 可选，默认 1（上限 500）
+- `limit` 可选，默认 500，上限 500
+
+**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。`GET /note/recycle-bin`（回收站）同一分页口径与同一响应头。
 
 **Response 200：**
 ```json
