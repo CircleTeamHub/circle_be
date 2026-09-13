@@ -388,6 +388,10 @@ cause, so one incident is not reported five different ways:
 - `CircleBeNoTarget` → suppresses 5xx / latency / event-loop / cron / outbox, and
   the public API probe (`PublicEndpointDown` with `component="api"`)
 - `PostgresDown` → suppresses cron / outbox / 5xx
+- `TlsCertificateExpiryImminent` → suppresses `TlsCertificateExpiringSoon` for the
+  **same certificate only** (`equal: ['instance']`). The two tiers deliberately
+  have different names: under the shared-name rule below, one domain's critical
+  would mute another domain's unrelated warning.
 - any `critical` → suppresses the `warning` **with the same `alertname`**
   (the `equal: ['alertname']` there is load-bearing: without it, a single
   critical would mute every warning in the system)
@@ -427,7 +431,8 @@ needed.
 | Alert | Severity | Fires when |
 | ----- | -------- | ---------- |
 | `PublicEndpointDown` | critical | a probe keeps failing for 2m |
-| `TlsCertificateExpiringSoon` | warning / critical | a certificate has < 14 days / < 3 days left. Caddy renews at ~30 days, so either tier means renewal keeps failing |
+| `TlsCertificateExpiringSoon` | warning | a certificate has < 14 days left. Caddy renews at ~30 days, so this means renewal keeps failing |
+| `TlsCertificateExpiryImminent` | critical | a certificate has < 3 days left. Mutes that same certificate's `TlsCertificateExpiringSoon` (matched on `instance`), never another domain's |
 | `PublicProbeNotConfigured` | warning | the exporter has run for 10m with nothing to probe |
 
 To see **why** a probe fails, ask the exporter for its debug trace:

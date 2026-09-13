@@ -79,8 +79,12 @@ groups:
           summary: 'Public endpoint {{ $labels.instance }} is failing its probe (DNS, TLS, Caddy or the service behind it)'
 
       # Caddy 在证书剩 ~30 天时自动续期。剩不到 14 天说明续期已经连续失败两周多，
-      # 剩不到 3 天再不处理，客户端就会拒绝连接。两档用同一个告警名：Alertmanager
-      # 里「critical 压掉同名 warning」那条抑制规则是按 alertname 配对的。
+      # 剩不到 3 天再不处理，客户端就会拒绝连接。
+      #
+      # 两档故意用不同的告警名。通用的「critical 压掉同名 warning」抑制只比对
+      # alertname，而这里探的是好几个域名、各自续期：共用一个名字时，api 证书的
+      # critical 会把 admin 证书那条毫不相干的 warning 一起静音。同一张证书两档都
+      # 响时只留 critical，由 alertmanager.yml 里按 instance 配对的专门规则负责。
       - alert: TlsCertificateExpiringSoon
         expr: probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time() < 14 * 86400
         for: 30m
@@ -89,7 +93,7 @@ groups:
         annotations:
           summary: 'TLS certificate for {{ $labels.instance }} expires in less than 14 days — automatic renewal has been failing'
 
-      - alert: TlsCertificateExpiringSoon
+      - alert: TlsCertificateExpiryImminent
         expr: probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time() < 3 * 86400
         for: 10m
         labels:

@@ -55,6 +55,15 @@ inhibit_rules:
       - component = "api"
     equal: []
 
+  # 同一张证书剩不到 3 天时只留 critical。必须按 instance 配对：探测的是好几个
+  # 域名、各自续期，只比告警名的话，一张证书的 critical 会静音另一张的 warning。
+  # 也正因如此两档用了不同的告警名，文件末尾那条通用的同名抑制管不到它们。
+  - source_matchers:
+      - alertname = "TlsCertificateExpiryImminent"
+    target_matchers:
+      - alertname = "TlsCertificateExpiringSoon"
+    equal: ['instance']
+
   # 数据库挂了 → 所有依赖它的任务/队列都会积压，别再各报一遍。
   #
   # OutboxProbeStale 也在内：探测本身就是读 Postgres，库一挂**五个队列**的

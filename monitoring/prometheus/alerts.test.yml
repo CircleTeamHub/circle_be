@@ -240,7 +240,7 @@ tests:
         exp_alerts: []
 
   - interval: 1m
-    name: 证书剩不到 14 天先 warning，剩不到 3 天再升 critical
+    name: 证书剩不到 14 天先 warning，剩不到 3 天另发一条 critical
     input_series:
       # promtool 的时间轴从 Unix 纪元开始，time() 在第 t 分钟就是 60t 秒，
       # 所以这里直接写「从现在算起还剩多少秒」。
@@ -249,10 +249,10 @@ tests:
       - series: 'probe_ssl_earliest_cert_expiry{job="blackbox-http",instance="https://admin.example.com/",component="admin"}'
         values: '172800+0x60'
     alert_rule_test:
+      # 剩 10 天和剩 2 天的证书都低于 14 天：各自一条 warning。
       - eval_time: 45m
         alertname: TlsCertificateExpiringSoon
         exp_alerts:
-          # 剩 10 天：只有 warning。
           - exp_labels:
               severity: warning
               job: blackbox-http
@@ -260,7 +260,6 @@ tests:
               component: api
             exp_annotations:
               summary: 'TLS certificate for https://api.example.com/healthz expires in less than 14 days — automatic renewal has been failing'
-          # 剩 2 天：两档都在响，Alertmanager 里 critical 会压掉同名的 warning。
           - exp_labels:
               severity: warning
               job: blackbox-http
@@ -268,6 +267,11 @@ tests:
               component: admin
             exp_annotations:
               summary: 'TLS certificate for https://admin.example.com/ expires in less than 14 days — automatic renewal has been failing'
+      # 只有剩 2 天的那张升级。Alertmanager 按 instance 用它压掉同一张证书的
+      # warning；api 那张的 warning 照常发出，不会被别的域名连带静音。
+      - eval_time: 45m
+        alertname: TlsCertificateExpiryImminent
+        exp_alerts:
           - exp_labels:
               severity: critical
               job: blackbox-http

@@ -207,7 +207,8 @@ Caddy → 服务。API 探 `/healthz`（只回存活、不带依赖信息，公�
 | 告警 | 级别 | 含义 |
 | ---- | ---- | ---- |
 | `PublicEndpointDown` | critical | 某个公网入口连续 2 分钟探测失败 |
-| `TlsCertificateExpiringSoon` | warning / critical | 证书剩不到 14 天 / 3 天。Caddy 在剩 ~30 天时自动续期，任何一档响都说明续期一直在失败 |
+| `TlsCertificateExpiringSoon` | warning | 证书剩不到 14 天。Caddy 在剩 ~30 天时自动续期，响了就说明续期一直在失败 |
+| `TlsCertificateExpiryImminent` | critical | 证书剩不到 3 天；同一张证书（按 `instance` 配对）的 warning 会被它压掉，不影响其他域名 |
 | `PublicProbeNotConfigured` | warning | exporter 在跑却一个目标都没有（漏配了目标文件） |
 
 它替代了原来的 Uptime-Kuma：探测配置进仓库，告警走同一套 Alertmanager 分级和

@@ -239,20 +239,27 @@ test('a broken public entry point pages, but a single probe blip does not', () =
   assert.match(expr, /severity: critical/);
 });
 
-test('certificate expiry escalates under one alert name so critical mutes its warning', () => {
-  const rules = alertExprs('TlsCertificateExpiringSoon');
-  const bySeverity = Object.fromEntries(
-    rules.map((block) => [block.match(/severity: (\w+)/)[1], block]),
-  );
-  assert.deepEqual(Object.keys(bySeverity).sort(), ['critical', 'warning']);
-  for (const block of rules) {
-    assert.match(block, /probe_ssl_earliest_cert_expiry\{job="blackbox-http"\} - time\(\)/);
-  }
+test('certificate expiry escalates per certificate, never across domains', () => {
   // Caddy 在剩 ~30 天时续期：剩 14 天说明续期已经连续失败两周多。
-  assert.match(bySeverity.warning, /< 14 \* 86400/);
-  assert.match(bySeverity.critical, /< 3 \* 86400/);
-  // 两档必须同名，Alertmanager 里「critical 压掉同名 warning」才配对得上。
-  assert.match(ALERTMANAGER, /equal: \['alertname'\]/);
+  const warning = alertExpr('TlsCertificateExpiringSoon');
+  const critical = alertExpr('TlsCertificateExpiryImminent');
+  for (const expr of [warning, critical]) {
+    assert.match(expr, /probe_ssl_earliest_cert_expiry\{job="blackbox-http"\} - time\(\)/);
+  }
+  assert.match(warning, /< 14 \* 86400/);
+  assert.match(warning, /severity: warning/);
+  assert.match(critical, /< 3 \* 86400/);
+  assert.match(critical, /severity: critical/);
+
+  // 两档必须是不同的告警名。共用一个名字时，通用的「critical 压掉同名 warning」
+  // 抑制只比 alertname：api 证书的 critical 会把 admin 证书那条毫不相干的 warning
+  // 一起静音 —— 两个域名各自续期，同时出问题完全可能。
+  assert.equal(alertExprs('TlsCertificateExpiringSoon').length, 1);
+  // 同一张证书两档都响时只留 critical：这条抑制必须按 instance 配对。
+  assert.match(
+    ALERTMANAGER,
+    /alertname = "TlsCertificateExpiryImminent"\n\s*target_matchers:\n\s*- alertname = "TlsCertificateExpiringSoon"\n\s*equal: \['instance'\]/,
+  );
 });
 
 test('an empty probe list is loud, but only where the blackbox exporter runs', () => {
