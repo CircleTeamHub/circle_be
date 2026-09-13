@@ -822,6 +822,16 @@ export class NoteService {
     };
   }
 
+  /**
+   * 分享链接功能开关：只认 NOTE_SHARE_WEB_BASE。`/s/{token}` 落地页必须由它指向的
+   * 站点提供；TEMP_CHAT_WEB_BASE 那个站（temp-chat-web）只路由 /t/:token，拿它兜底
+   * 只会生成打不开的链接，所以不算「已配置」。
+   */
+  private shareLinksEnabled(): boolean {
+    const base = this.config.get<string>('NOTE_SHARE_WEB_BASE');
+    return typeof base === 'string' && base.trim().length > 0;
+  }
+
   private buildShareUrl(token: string): string {
     const base =
       this.config.get<string>('NOTE_SHARE_WEB_BASE') ??
@@ -1756,6 +1766,14 @@ export class NoteService {
     ownerID: string,
     dto: CreateNoteShareLinkDto,
   ): Promise<NoteShareLinkDto> {
+    // 功能未配置时在写库之前直接 404：不留下一堆打不开的链接行。
+    if (!this.shareLinksEnabled()) {
+      throw new NotFoundException({
+        message: 'Share links are unavailable',
+        errorCode: NoteErrorCode.ShareLinkUnavailable,
+      });
+    }
+
     if (dto.group && dto.groupId) {
       throw new BadRequestException(
         'group and groupId cannot be used together',
@@ -1869,8 +1887,11 @@ export class NoteService {
       where: { token },
     });
 
-    // 不存在 / 已吊销 / 已过期 → 同一个 404，且都在查笔记之前短路。
+    // 不存在 / 已吊销 / 已过期 / 分享功能未配置 → 同一个 404，且都在查笔记之前短路。
+    // 功能开关放在查链接之后判断：关闭时与未知 token 走同一条路径（同样一次按 token
+    // 的查找、同样的响应体），公开端点探测不出部署是否开了分享。
     if (
+      !this.shareLinksEnabled() ||
       !link ||
       link.revokedAt !== null ||
       (link.expiresAt !== null && link.expiresAt.getTime() <= Date.now())
@@ -1881,7 +1902,9 @@ export class NoteService {
     const notes = await this.prisma.note.findMany({
       where: this.buildShareLinkNoteFilter(link),
       include: NOTE_INCLUDE,
-      orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
+      // 只按新近排序：置顶是主人的私人标记，访客摘要里 pinned 恒为 false；若仍按
+      // pinned desc 排，配合摘要里的 updatedAt 就能反推出哪些被置顶。
+      orderBy: [{ updatedAt: 'desc' }],
       take: SHARE_LINK_MAX_NOTES,
     });
 

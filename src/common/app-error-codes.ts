@@ -273,6 +273,9 @@ export const NoteErrorCode = {
   ShareLinkInvalidCursor: 'NOTE_SHARE_LINK_INVALID_CURSOR',
   // #94：每用户活跃分享链接达到上限。
   ShareLinkLimit: 'NOTE_SHARE_LINK_LIMIT',
+  // 分享链接功能未开启（部署没配 NOTE_SHARE_WEB_BASE，没有能打开的落地页）。
+  // 只用于主人侧创建；访客侧解析在功能关闭时仍回 ShareLinkInvalid，不暴露部署配置。
+  ShareLinkUnavailable: 'NOTE_SHARE_LINK_UNAVAILABLE',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。

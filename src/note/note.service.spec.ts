@@ -119,7 +119,16 @@ describe('NoteService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: UploadService, useValue: uploadService },
         // No MINIO_PUBLIC_URL configured → media-url origin check is skipped.
-        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        // NOTE_SHARE_WEB_BASE is set: share links are gated on it, and the
+        // disabled path gets its own dedicated tests below.
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
+            ),
+          },
+        },
       ],
     }).compile();
 
@@ -2473,6 +2482,38 @@ describe('NoteService', () => {
     expect(result.token).toBe('token-789');
   });
 
+  it('refuses to create a share link with 404 NOTE_SHARE_LINK_UNAVAILABLE when NOTE_SHARE_WEB_BASE is unset', async () => {
+    // 没配分享落地页时生成的链接无处可开：temp-chat-web 只路由 /t/:token，
+    // 回退到 TEMP_CHAT_WEB_BASE 只会发出死链。功能关闭就在写库之前直接 404。
+    const isolatedPrisma = {
+      $transaction: jest.fn(),
+      $queryRaw: jest.fn(),
+      note: { findMany: jest.fn() },
+      noteGroup: { findFirst: jest.fn() },
+      noteShareLink: { count: jest.fn(), create: jest.fn() },
+    };
+    const serviceWithoutBase = new NoteService(
+      isolatedPrisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'TEMP_CHAT_WEB_BASE' ? 'https://chat.example.com' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(isolatedPrisma as any),
+    );
+
+    const rejection = await serviceWithoutBase
+      .createShareLink('user-1', { title: '我的笔记' })
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(NotFoundException);
+    expect((rejection as NotFoundException).getResponse()).toMatchObject({
+      errorCode: 'NOTE_SHARE_LINK_UNAVAILABLE',
+    });
+    expect(isolatedPrisma.$transaction).not.toHaveBeenCalled();
+    expect(isolatedPrisma.noteShareLink.create).not.toHaveBeenCalled();
+  });
+
   it('reorders custom groups by rewriting sortOrder from ordered ids', async () => {
     // Exhaustive-list count check
     prisma.noteGroup.count.mockResolvedValueOnce(2);
@@ -3652,7 +3693,16 @@ describe('NoteService', () => {
         ...shareLinkRow,
         noteIDs: ['note-1'],
       });
-      prisma.note.findMany.mockResolvedValueOnce([sharedNoteRow]);
+      prisma.note.findMany.mockResolvedValueOnce([
+        {
+          ...sharedNoteRow,
+          // 置顶与分组是主人的私人整理标记，访客视角恒为 pinned=false、groups=[]。
+          pinned: true,
+          groupMemberships: [
+            { group: { id: 'group-1', name: '主人的私人分组' } },
+          ],
+        },
+      ]);
 
       const result = await service.resolveShareLink('tok-abc');
 
@@ -3661,13 +3711,60 @@ describe('NoteService', () => {
       });
       expect(result.title).toBe('我的笔记');
       expect(result.notes).toHaveLength(1);
-      // 访客不是笔记主人：canEdit=false，collectedFrom 被抹掉。
+      // 访客不是笔记主人：canEdit=false，collectedFrom 被抹掉，置顶与分组不外发。
       expect(result.notes[0]).toMatchObject({
         id: 'note-1',
         ownerId: 'user-1',
         canEdit: false,
         collectedFrom: null,
+        pinned: false,
+        groups: [],
       });
+    });
+
+    it('orders guest results by recency only so the owner pinned flag cannot be inferred', async () => {
+      // 摘要里带 updatedAt：若仍按 pinned desc 排，访客看到「更旧的排在更新的前面」
+      // 就能反推出哪些是置顶，pinned=false 形同虚设。
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(shareLinkRow);
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      expect(prisma.note.findMany.mock.calls[0][0].orderBy).toEqual([
+        { updatedAt: 'desc' },
+      ]);
+    });
+
+    it('answers exactly like an unknown token when NOTE_SHARE_WEB_BASE is unset', async () => {
+      // 功能未配置时，连一条真实有效的链接也必须答成「链接无效」：响应体与未知
+      // token 逐字节一致，公开端点探测不出部署是否开了分享。独立的 prisma mock，
+      // 漏掉开关的实现会成功读出笔记，失败信息直指缺失的校验。
+      const isolatedPrisma = {
+        noteShareLink: {
+          findUnique: jest.fn().mockResolvedValue(shareLinkRow),
+        },
+        note: { findMany: jest.fn().mockResolvedValue([sharedNoteRow]) },
+      };
+      const serviceWithoutBase = new NoteService(
+        isolatedPrisma as any,
+        { get: jest.fn(() => null) } as any,
+        new MembershipPolicyService(isolatedPrisma as any),
+      );
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(null as never);
+
+      const unknown = await service
+        .resolveShareLink('tok-nope')
+        .catch((error: unknown) => error);
+      const disabled = await serviceWithoutBase
+        .resolveShareLink('tok-abc')
+        .catch((error: unknown) => error);
+
+      expect(unknown).toBeInstanceOf(NotFoundException);
+      expect(disabled).toBeInstanceOf(NotFoundException);
+      expect((disabled as NotFoundException).getResponse()).toEqual(
+        (unknown as NotFoundException).getResponse(),
+      );
+      expect(isolatedPrisma.note.findMany).not.toHaveBeenCalled();
     });
 
     it('rejects an expired token', async () => {
