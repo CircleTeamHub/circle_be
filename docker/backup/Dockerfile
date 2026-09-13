@@ -10,7 +10,7 @@
 # Tools and why:
 #   pgbackrest     Postgres full/incr backup + WAL archive to S3 (encrypted).
 #   mc             MinIO's own client; mirrors the object bucket off-host.
-FROM minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc
+FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc
 
 FROM postgres:16-alpine
 

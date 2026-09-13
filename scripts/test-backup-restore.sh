@@ -110,7 +110,7 @@ services:
       retries: 20
 
   backup-s3-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       backup-s3: { condition: service_healthy }
     environment:

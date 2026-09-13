@@ -1,15 +1,19 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const root = process.cwd();
 const read = (rel: string): string => readFileSync(join(root, rel), 'utf8');
 
-/** 会拉 MinIO 镜像的地方：compose、脚本、CI 工作流。 */
+/** 会拉镜像的地方：compose、Dockerfile、脚本、CI 工作流。 */
 function imageReferenceFiles(): string[] {
   return [
-    ...readdirSync(root).filter((name) =>
-      /^docker-compose.*\.ya?ml$/.test(name),
+    ...readdirSync(root).filter(
+      (name) =>
+        /^docker-compose.*\.ya?ml$/.test(name) || /^Dockerfile/.test(name),
     ),
+    ...readdirSync(join(root, 'docker'))
+      .map((dir) => `docker/${dir}/Dockerfile`)
+      .filter((file) => existsSync(join(root, file))),
     ...readdirSync(join(root, 'scripts'))
       .filter((name) => name.endsWith('.sh'))
       .map((name) => `scripts/${name}`),
@@ -35,19 +39,27 @@ describe('container image sources', () => {
     );
   });
 
-  it('pulls MinIO from quay.io, not the removed Docker Hub repository', () => {
-    // Docker Hub 上的 minio/minio 已下架（pull 报 repository does not exist），
-    // 真实 MinIO 集成测试与 bundled-storage 部署都会卡在拉镜像这一步。
+  it('pulls MinIO images from quay.io, not the removed Docker Hub repositories', () => {
+    // Docker Hub 上的 minio/minio 与 minio/mc 都已下架（pull 报 repository does
+    // not exist）：真实 MinIO 集成测试、bundled-storage 部署（含 minio-init）
+    // 和备份镜像构建都会卡在拉镜像这一步。
     const offenders = imageReferenceFiles().filter((file) =>
-      /(^|[\s"'=])minio\/minio:/m.test(read(file)),
+      /(^|[\s"'=])minio\/(minio|mc):/m.test(read(file)),
     );
 
     expect(offenders).toEqual([]);
     expect(read('scripts/test-minio-integration.sh')).toContain(
       'quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z',
     );
-    expect(read('docker-compose.prod.yml')).toContain(
+    const compose = read('docker-compose.prod.yml');
+    expect(compose).toContain(
       'image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z',
+    );
+    expect(compose).toContain(
+      'image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z',
+    );
+    expect(read('docker/backup/Dockerfile')).toContain(
+      'FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc',
     );
   });
 });

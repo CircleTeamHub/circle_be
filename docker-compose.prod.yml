@@ -87,7 +87,7 @@ services:
 
   # 一次性:确保 bucket 存在；最小公开读策略由应用启动时安装。
   minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     profiles: ['bundled-storage']
     logging: *default-logging
     depends_on:
