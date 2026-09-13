@@ -277,6 +277,9 @@ export function createEnvValidationSchema(
       otherwise: Joi.string().min(8).optional(),
     }),
     NOTE_SHARE_WEB_BASE: Joi.string().uri().optional(),
+    // 高德 Web 服务密钥。不配则地名反查与地点搜索静默关闭，位置消息退回显示
+    // 经纬度——和接高德之前的行为一致，所以这里是可选的。
+    AMAP_WEB_SERVICE_KEY: Joi.string().optional(),
   })
     .unknown(true)
     .custom((value, helpers) => {
