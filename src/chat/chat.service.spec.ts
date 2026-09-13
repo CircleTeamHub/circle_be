@@ -3501,6 +3501,67 @@ describe('ChatService', () => {
     });
   });
 
+  describe('getBurnPolicy(私聊页进入时读当前焚毁档位)', () => {
+    const directSeat = (
+      burnDurationSec: number | null,
+      seat: Record<string, unknown> = {},
+    ) =>
+      membership({
+        ...seat,
+        conversation: {
+          id: 'conv-1',
+          type: 'DIRECT',
+          directKey: 'u1:u2',
+          circleID: null,
+          tempChatID: null,
+          lastMessageAt: null,
+          burnDurationSec,
+        },
+      });
+
+    // 已装机的 App 每次打开私聊都会 GET 这个路径;此前只有 POST,每开一次一个 404。
+    it('returns the current conversation policy in the POST response shape', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat(3600));
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).resolves.toEqual({
+        burnDurationSec: 3600,
+      });
+      // 对端的全局阅后即焚只是他自己视图上的读过滤(selfDestructCutoff),
+      // 不是会话策略:不读,也不外露给会话另一方。
+      expect(privacySettings.getSettings).not.toHaveBeenCalled();
+    });
+
+    it('reports null when burn-after-reading is off', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat(null));
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).resolves.toEqual({
+        burnDurationSec: null,
+      });
+    });
+
+    it('refuses a caller without a seat', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.getBurnPolicy('u1', 'conv-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.NotMember },
+      });
+    });
+
+    it('refuses a caller who already left the conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        directSeat(60, { leftAt: new Date('2026-09-01T00:00:00.000Z') }),
+      );
+
+      await expect(
+        service.getBurnPolicy('u1', 'conv-1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.NotMember },
+      });
+    });
+  });
+
   describe('setBurnDuration(S-01 会话级阅后即焚)', () => {
     it('any DIRECT member sets it for both sides and a notice is left', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(

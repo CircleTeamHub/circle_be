@@ -463,6 +463,18 @@ export class ChatController {
     );
   }
 
+  @Get('conversations/:id/burn')
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  @ApiOperation({
+    summary: '读取会话级阅后即焚档位(与 POST 回执同形;私聊页进入时拉取)',
+  })
+  getBurnPolicy(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+  ): Promise<{ burnDurationSec: number | null }> {
+    return this.chatService.getBurnPolicy(req.user.userId, conversationId);
+  }
+
   @Post('conversations/:id/burn')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   @ApiOperation({

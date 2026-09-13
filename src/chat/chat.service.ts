@@ -4128,6 +4128,25 @@ export class ChatService {
   }
 
   /**
+   * 读当前会话级阅后即焚档位(与 POST /burn 回执同形)。
+   *
+   * 已装机的 App 每次打开私聊都会 GET 这个路径 —— 深链/联系人入口可能先于会话
+   * 列表打开聊天页,靠它补齐档位。只回会话策略:对端的全局阅后即焚
+   * (UserPrivacySetting.messageSelfDestructSec)是他自己视图上的读过滤,
+   * 不是会话策略,既不影响本人能读到什么,也不该外露给会话另一方。
+   */
+  async getBurnPolicy(
+    userId: string,
+    conversationId: string,
+  ): Promise<{ burnDurationSec: number | null }> {
+    const { conversation } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    return { burnDurationSec: conversation.burnDurationSec ?? null };
+  }
+
+  /**
    * S-01 会话级阅后即焚:任一方(DIRECT)或圈主/管理员(GROUP)设置,双方生效。
    * 变更留系统消息痕迹;真删由每分钟 sweeper 执行,读路径过滤盖住间隙。
    */
