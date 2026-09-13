@@ -419,7 +419,10 @@ export class NotificationService {
           const rows = await tx.notification.createManyAndReturn({
             data: recipientIds.map((toUserID) => ({
               toUserID,
-              fromUserID: operatorId,
+              // 自发自收（同 createSystemNotification）：fromUser 会随
+              // GET /notification/profile/list 原样回给每个收件人，挂操作者就等于
+              // 把发布公告的管理员身份泄露给全站。操作者只记在 SystemAnnouncement 上。
+              fromUserID: toUserID,
               type: NotificationType.SYSTEM,
               content: dto.content,
               systemAnnouncementID: announcement.id,

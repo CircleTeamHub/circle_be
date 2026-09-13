@@ -272,14 +272,14 @@ describe('NotificationService', () => {
       data: [
         {
           toUserID: 'user-1',
-          fromUserID: 'admin-1',
+          fromUserID: 'user-1',
           type: NotificationType.SYSTEM,
           content: 'Maintenance starts at 22:00.',
           systemAnnouncementID: 'announcement-1',
         },
         {
           toUserID: 'user-2',
-          fromUserID: 'admin-1',
+          fromUserID: 'user-2',
           type: NotificationType.SYSTEM,
           content: 'Maintenance starts at 22:00.',
           systemAnnouncementID: 'announcement-1',
@@ -312,6 +312,47 @@ describe('NotificationService', () => {
       ip: '127.0.0.1',
       userAgent: 'jest',
     });
+  });
+
+  // 公告行的 fromUser 会随 GET /notification/profile/list 原样回给每个收件人,
+  // 客户端从不渲染它;挂管理员等于把「谁发的公告」泄露给全站。沿用
+  // createSystemNotification 的自发自收约定,操作者只记在 SystemAnnouncement 上。
+  it('fans out announcement rows with the recipient as sender, never the publishing admin', async () => {
+    prisma.systemAnnouncement.upsert.mockResolvedValue({
+      id: 'announcement-1',
+      requestFingerprint: 'admin-1:Maintenance starts at 22:00.',
+      createdAt: new Date('2026-07-29T12:00:00.000Z'),
+      auditRecordedAt: null,
+    });
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'user-1' },
+      { id: 'user-2' },
+    ]);
+    prisma.notification.createManyAndReturn.mockResolvedValue([
+      { id: 'notification-1', toUserID: 'user-1' },
+      { id: 'notification-2', toUserID: 'user-2' },
+    ]);
+    prisma.notification.count.mockResolvedValue(2);
+
+    await (service.publishSystemAnnouncement as any)(
+      'admin-1',
+      { content: 'Maintenance starts at 22:00.' },
+      'announcement-request-1',
+    );
+
+    const rows = prisma.notification.createManyAndReturn.mock.calls.flatMap(
+      ([args]) => args.data as Array<{ toUserID: string; fromUserID: string }>,
+    );
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.fromUserID).toBe(row.toUserID);
+      expect(row.fromUserID).not.toBe('admin-1');
+    }
+    expect(prisma.systemAnnouncement.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ operatorID: 'admin-1' }),
+      }),
+    );
   });
 
   it('resumes a partially committed announcement without duplicating prior recipients', async () => {
