@@ -7,6 +7,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   CircleMemberRole,
   CircleMemberStatus,
@@ -23,6 +24,10 @@ import { CircleMemberLockService } from 'src/circle/circle-member-lock';
 import { normalizeUserIdAlias } from 'src/user/user-id-alias';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { runSerializableTransaction } from 'src/utils/prisma-tx';
+import {
+  assertUrlsFromStorage,
+  storagePublicObjectBasesFromConfig,
+} from 'src/utils/storage-url';
 import {
   GroupMemberRoleInput,
   GroupMemberRoleResultDto,
@@ -48,11 +53,15 @@ type CircleGroupMemberLookup = {
   status: CircleMemberStatus;
 };
 
+// 只有 http(s) 项才需要钉源；对象 key（reports/xxx.png）不是 URL，原样放行。
+const isHttpUrl = (value: string): boolean => /^https?:\/\//i.test(value);
+
 @Injectable()
 export class GroupService {
   private readonly logger = new Logger(GroupService.name);
 
   private readonly loggingConfig = createLoggingConfig();
+  private readonly storagePublicObjectBases: readonly string[];
   constructor(
     private readonly prisma: PrismaService,
     private readonly admissionPolicy: CircleAdmissionPolicy,
@@ -60,7 +69,12 @@ export class GroupService {
     private readonly chatCircleSync: ChatCircleSyncService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
+      this.config,
+    );
+  }
 
   async updateGroupMemberRole(
     actorId: string,
@@ -736,6 +750,14 @@ export class GroupService {
       });
     }
 
+    // 举报证据会在管理后台按链接渲染：外链等于塞给审核员的钓鱼/追踪入口，
+    // http(s) 项必须钉在本站存储；对象 key 原样放行。
+    assertUrlsFromStorage(
+      (dto.evidence ?? []).filter(isHttpUrl),
+      this.storagePublicObjectBases,
+      'evidence',
+    );
+
     try {
       await this.prisma.groupReport.create({
         data: {
@@ -849,7 +871,7 @@ export class GroupService {
     inviterId: string,
     targetUserIDs: string[],
   ): Promise<void> {
-    const [friendships, privacyRows] = await Promise.all([
+    const [friendships, privacyRows, blockRow] = await Promise.all([
       tx.friend.findMany({
         where: {
           state: 'ACCEPTED',
@@ -864,7 +886,25 @@ export class GroupService {
         where: { userID: { in: targetUserIDs } },
         select: { userID: true, groupInvitePermission: true },
       }),
+      // 拉黑是比邀请权限更硬的意愿表达，两个方向都拦（同 circle-invitation）。
+      // 读在事务内、取锁之后，与并发拉黑严格串行。
+      tx.block.findFirst({
+        where: {
+          OR: [
+            { blockerID: inviterId, blockedID: { in: targetUserIDs } },
+            { blockedID: inviterId, blockerID: { in: targetUserIDs } },
+          ],
+        },
+        select: { id: true },
+      }),
     ]);
+    // 与隐私拒绝共用同一个错误码：单独一个码就把这个接口做成了「他拉黑了你」的探针。
+    if (blockRow) {
+      throw new ForbiddenException({
+        message: 'User does not allow group invites',
+        errorCode: GroupErrorCode.InviteNotAllowed,
+      });
+    }
     const friendSet = new Set(
       friendships.map((record) =>
         record.userID === inviterId ? record.friendID : record.userID,

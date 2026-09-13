@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import {
   BadRequestException,
   ConflictException,
@@ -131,6 +132,12 @@ describe('FriendService', () => {
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
+  // 举报证据的本站存储前缀:path-style 默认桶 circle → http://10.0.0.195:9000/circle
+  const config = {
+    get: jest.fn((key: string) =>
+      key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+    ),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -185,6 +192,7 @@ describe('FriendService', () => {
         { provide: PrivacySettingsService, useValue: privacySettings },
         { provide: CreditService, useValue: creditService },
         { provide: AvatarFrameService, useValue: avatarFrames },
+        { provide: ConfigService, useValue: config },
       ],
     }).compile();
 
@@ -1375,6 +1383,84 @@ describe('FriendService', () => {
     // approval (see FriendReportAdminService).
     expect(creditService.applyDeltaInTransaction).not.toHaveBeenCalled();
     expect(creditService.broadcastCreditProfileChanged).not.toHaveBeenCalled();
+  });
+
+  // 举报证据会在管理后台按链接渲染:外链就是塞给审核员的钓鱼/追踪入口,
+  // http(s) 项必须钉在本站存储;对象 key / 其他 scheme 原样放行。
+  describe('report evidence urls', () => {
+    const activeFriendship = () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'user-2',
+        status: 'ACTIVE',
+      });
+      prisma.friend.findFirst.mockResolvedValue({
+        id: 'friendship-1',
+        state: FriendState.ACCEPTED,
+        userID: 'user-1',
+        friendID: 'user-2',
+      });
+      prisma.friendReport.findFirst.mockResolvedValue(null);
+      prisma.friendReport.create.mockResolvedValue({ id: 'report-1' });
+    };
+    const report = (evidence: string[], target: FriendService = service) =>
+      target.reportFriend('user-1', 'user-2', {
+        category: 'harassment',
+        description: 'abusive language',
+        evidence,
+      });
+
+    it('rejects an evidence url that is not served from own storage', async () => {
+      activeFriendship();
+
+      await expect(
+        report(['https://evil.example.com/proof.png']),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.friendReport.create).not.toHaveBeenCalled();
+    });
+
+    it('accepts an evidence url served from own storage', async () => {
+      activeFriendship();
+
+      await report(['http://10.0.0.195:9000/circle/reports/chat-1.png']);
+
+      expect(prisma.friendReport.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            evidence: ['http://10.0.0.195:9000/circle/reports/chat-1.png'],
+          }),
+        }),
+      );
+    });
+
+    it('passes plain object keys through unchanged', async () => {
+      activeFriendship();
+
+      await report(['reports/chat-1.png']);
+
+      expect(prisma.friendReport.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ evidence: ['reports/chat-1.png'] }),
+        }),
+      );
+    });
+
+    // 存储没配 = 上传关着,沿用 assertUrlsFromStorage 的短路,不把举报一并堵死。
+    it('skips the origin check when storage is not configured', async () => {
+      activeFriendship();
+      const unguarded = new FriendService(
+        prisma as any,
+        realtimeService as any,
+        notificationService as any,
+        privacySettings as any,
+        avatarFrames as any,
+        { get: jest.fn(() => null) } as any,
+      );
+
+      await report(['https://cdn.example/proof.png'], unguarded);
+
+      expect(prisma.friendReport.create).toHaveBeenCalled();
+    });
   });
 
   it('rejects a duplicate report for the same reporter/target/category', async () => {

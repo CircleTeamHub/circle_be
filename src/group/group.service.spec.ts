@@ -9,6 +9,7 @@ import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
+import { GroupErrorCode } from 'src/common/app-error-codes';
 import { CircleMemberRole, CircleMemberStatus } from 'src/generated/prisma';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { GroupController } from './group.controller';
@@ -39,6 +40,7 @@ describe('GroupService reportGroup', () => {
       create: jest.Mock;
     };
     friend: { findMany: jest.Mock };
+    block: { findFirst: jest.Mock };
     userPrivacySetting: { findMany: jest.Mock };
     userDisplayIcon: { deleteMany: jest.Mock };
   };
@@ -62,6 +64,12 @@ describe('GroupService reportGroup', () => {
     broadcastSystemMessageExcludingUsers: jest.Mock;
   };
   let service: GroupService;
+  // 举报证据的本站存储前缀:path-style 默认桶 circle → http://10.0.0.195:9000/circle
+  const config = {
+    get: jest.fn((key: string) =>
+      key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+    ),
+  };
 
   beforeEach(() => {
     prisma = {
@@ -99,6 +107,7 @@ describe('GroupService reportGroup', () => {
         create: jest.fn(),
       },
       friend: { findMany: jest.fn().mockResolvedValue([]) },
+      block: { findFirst: jest.fn().mockResolvedValue(null) },
       userPrivacySetting: { findMany: jest.fn().mockResolvedValue([]) },
       userDisplayIcon: { deleteMany: jest.fn() },
     };
@@ -142,7 +151,84 @@ describe('GroupService reportGroup', () => {
       chatCircleSync as any,
       chatSystemMessage as any,
       groupEvents as any,
+      config as any,
     );
+  });
+
+  // 举报证据会在管理后台按链接渲染:外链就是塞给审核员的钓鱼/追踪入口,
+  // http(s) 项必须钉在本站存储;对象 key 原样放行。
+  describe('report evidence urls', () => {
+    const reportableCircle = () => {
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        groupID: 'group-1',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        status: CircleMemberStatus.ACTIVE,
+      });
+      prisma.groupReport.findFirst.mockResolvedValue(null);
+      prisma.groupReport.create.mockResolvedValue({ id: 'report-1' });
+    };
+    const report = (evidence: string[], target: GroupService = service) =>
+      target.reportGroup('user-1', 'group-1', {
+        category: 'spam',
+        description: 'spam links',
+        evidence,
+      });
+
+    it('rejects an evidence url that is not served from own storage', async () => {
+      reportableCircle();
+
+      await expect(
+        report(['https://evil.example.com/proof.png']),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.groupReport.create).not.toHaveBeenCalled();
+    });
+
+    it('accepts an evidence url served from own storage', async () => {
+      reportableCircle();
+
+      await report(['http://10.0.0.195:9000/circle/reports/group-1.png']);
+
+      expect(prisma.groupReport.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            evidence: ['http://10.0.0.195:9000/circle/reports/group-1.png'],
+          }),
+        }),
+      );
+    });
+
+    it('passes plain object keys through unchanged', async () => {
+      reportableCircle();
+
+      await report(['reports/group-1.png']);
+
+      expect(prisma.groupReport.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ evidence: ['reports/group-1.png'] }),
+        }),
+      );
+    });
+
+    // 存储没配 = 上传关着,沿用 assertUrlsFromStorage 的短路,不把举报一并堵死。
+    it('skips the origin check when storage is not configured', async () => {
+      reportableCircle();
+      const unguarded = new GroupService(
+        prisma as any,
+        admissionPolicy as any,
+        memberLock as any,
+        chatCircleSync as any,
+        chatSystemMessage as any,
+        groupEvents as any,
+        { get: jest.fn(() => null) } as any,
+      );
+
+      await report(['https://cdn.example/proof.png'], unguarded);
+
+      expect(prisma.groupReport.create).toHaveBeenCalled();
+    });
   });
 
   it('creates a group report for an active circle member', async () => {
@@ -747,6 +833,111 @@ describe('GroupService reportGroup', () => {
     ).rejects.toThrow(ForbiddenException);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  // 拉黑是比邀请权限更硬的意愿表达:两个方向都拦。错误必须与隐私拒绝同一条
+  // (GROUP_INVITE_NOT_ALLOWED)—— 单独一个码就把这个接口做成了「他拉黑了你」的探针。
+  describe('invite block relationships', () => {
+    const adminInvitingNewUser = () => {
+      prisma.circle.findFirst.mockResolvedValue({
+        id: 'circle-1',
+        groupID: 'group-1',
+        ownerID: 'owner-1',
+      });
+      prisma.circleMember.findUnique.mockResolvedValue({
+        id: 'actor-member',
+        role: CircleMemberRole.ADMIN,
+        status: CircleMemberStatus.ACTIVE,
+      });
+      prisma.circleMember.findMany.mockResolvedValue([]);
+    };
+    type BlockCond = string | { in: string[] };
+    type BlockWhere = {
+      OR: Array<{ blockerID: BlockCond; blockedID: BlockCond }>;
+    };
+    const matches = (cond: BlockCond, value: string) =>
+      typeof cond === 'string' ? cond === value : cond.in.includes(value);
+    // 按 where.OR 模拟 Block 表语义,用例才真的验证了「两个方向都查了」,
+    // 而不只是「查过 block 表」。
+    const simulateBlockTable = (
+      rows: Array<{ blockerID: string; blockedID: string }>,
+    ) => {
+      prisma.block.findFirst.mockImplementation(
+        async ({ where }: { where: BlockWhere }) =>
+          rows.some((row) =>
+            where.OR.some(
+              (branch) =>
+                matches(branch.blockerID, row.blockerID) &&
+                matches(branch.blockedID, row.blockedID),
+            ),
+          )
+            ? { id: 'block-1' }
+            : null,
+      );
+    };
+
+    it('rejects the invite when the target has blocked the inviter', async () => {
+      adminInvitingNewUser();
+      simulateBlockTable([{ blockerID: 'new-user', blockedID: 'admin-1' }]);
+
+      const attempt = service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      });
+
+      await expect(attempt).rejects.toThrow(ForbiddenException);
+      await expect(attempt).rejects.toMatchObject({
+        response: { errorCode: GroupErrorCode.InviteNotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    it('rejects the invite when the inviter has blocked the target', async () => {
+      adminInvitingNewUser();
+      simulateBlockTable([{ blockerID: 'admin-1', blockedID: 'new-user' }]);
+
+      const attempt = service.inviteGroupMembers('admin-1', 'group-1', {
+        userIDs: ['new-user'],
+      });
+
+      await expect(attempt).rejects.toThrow(ForbiddenException);
+      await expect(attempt).rejects.toMatchObject({
+        response: { errorCode: GroupErrorCode.InviteNotAllowed },
+      });
+      expect(admissionPolicy.activateMembers).not.toHaveBeenCalled();
+    });
+
+    it('proceeds as before when neither side has blocked the other', async () => {
+      adminInvitingNewUser();
+      // 与本次邀请无关的拉黑不能误伤。
+      simulateBlockTable([{ blockerID: 'admin-1', blockedID: 'someone-else' }]);
+
+      await expect(
+        service.inviteGroupMembers('admin-1', 'group-1', {
+          userIDs: ['new-user'],
+        }),
+      ).resolves.toEqual({ handled: true });
+
+      expect(prisma.block.findFirst).toHaveBeenCalledTimes(1);
+      expect(prisma.block.findFirst).toHaveBeenCalledWith({
+        where: {
+          OR: [
+            { blockerID: 'admin-1', blockedID: { in: ['new-user'] } },
+            { blockedID: 'admin-1', blockerID: { in: ['new-user'] } },
+          ],
+        },
+        select: { id: true },
+      });
+      // 读在事务内、取锁之后:与并发拉黑严格串行(同 circle-invitation 的理由)。
+      expect(memberLock.lock.mock.invocationCallOrder[0]).toBeLessThan(
+        prisma.block.findFirst.mock.invocationCallOrder[0],
+      );
+      expect(admissionPolicy.activateMembers).toHaveBeenCalledWith(
+        prisma,
+        'circle-1',
+        ['new-user'],
+        { locksHeld: true, actor: 'third-party' },
+      );
+    });
   });
 
   it('allows FRIENDS_ONLY invites when the locked bulk friendship read finds the inviter', async () => {
