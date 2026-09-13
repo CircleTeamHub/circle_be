@@ -1,0 +1,3 @@
+# 这台部署真实的探测目标（公网域名）—— 不进仓库。
+# 从 public.yml.example 复制出 public.yml 再填。
+*.yml

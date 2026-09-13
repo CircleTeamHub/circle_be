@@ -12,7 +12,7 @@ The backend and monitoring stack currently include:
 - Grafana with the provisioned `circle_be - RED` dashboard.
 - Alertmanager routing Prometheus alerts.
 - Discord notifications through Alertmanager using `monitoring/alertmanager/discord.url`.
-- Uptime Kuma for reachability checks, with optional direct Discord notifications.
+- blackbox_exporter probing the public entry points (production overlay), alerting through Alertmanager like every other alert.
 - Optional Sentry aggregation for unexpected backend 5xx errors.
 - Structured logging for HTTP access, slow requests, security events, rate-limit hits, external-call failures, and business events.
 
@@ -89,6 +89,8 @@ Prometheus should own:
 - Raw metric storage.
 - PromQL queries.
 - Target health checks for `circle-be`, `node-exporter`, `cadvisor`, and Prometheus.
+- Public reachability and TLS certificate expiry, probed by blackbox_exporter
+  along the same DNS/TLS/Caddy path users take.
 
 Alertmanager should own:
 
@@ -96,12 +98,6 @@ Alertmanager should own:
 - Alert deduplication.
 - Alert routing.
 - Discord notifications.
-
-Uptime Kuma should own:
-
-- Reachability monitoring.
-- Basic uptime status for backend, Grafana, Prometheus, and other endpoints.
-- Direct Discord notifications for uptime failures.
 
 Sentry should own:
 
@@ -119,6 +115,7 @@ Defined in `monitoring/prometheus/alerts.yml`:
 - `BackendHighLatencyP95`: backend p95 latency greater than 1s for 5 minutes.
 - `TargetDown`: any scrape target down for 2 minutes.
 - `HighMemory`: host memory usage greater than 85% for 5 minutes.
+- `PublicEndpointDown`: a public entry point failing its probe for 2 minutes.
 
 ### Operations Data That Should Not Be In Admin MVP
 
@@ -130,8 +127,8 @@ Defined in `monitoring/prometheus/alerts.yml`:
 - Alertmanager routing configuration.
 - Discord webhook configuration.
 
-The admin app may link to Grafana, Sentry, Alertmanager, and Uptime Kuma, but it
-should not become the primary observability UI.
+The admin app may link to Grafana, Sentry, and Alertmanager, but it should not
+become the primary observability UI.
 
 ## Boundary Recommendation
 
@@ -147,7 +144,7 @@ Use the operations stack for system health and incident response:
 - Grafana for dashboards.
 - Prometheus for metrics and target health.
 - Alertmanager and Discord for alert delivery.
-- Uptime Kuma for reachability.
+- blackbox_exporter (through Prometheus and Alertmanager) for public reachability.
 - Sentry for backend exception debugging.
 
 For the first admin web version, include only a small system-status section:
@@ -156,6 +153,5 @@ For the first admin web version, include only a small system-status section:
 - Outbox failed/pending counts.
 - Link to Grafana.
 - Link to Sentry.
-- Link to Uptime Kuma.
 
 Keep deep operational analysis outside the admin console.

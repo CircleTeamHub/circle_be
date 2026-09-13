@@ -26,6 +26,7 @@
 | **postgres-exporter** | 指标     | 连接数、事务、锁、idle-in-transaction       | ✅（仅生产 overlay）      |
 | pg 连接池           | 指标       | 排队等连接数、已建立/空闲/上限              | ✅（应用内，见下）        |
 | **redis-exporter**  | 指标       | 存活、内存占用、客户端数、被拒连接          | ✅（仅生产 overlay）      |
+| **blackbox-exporter** | 可达性   | 按用户的路径探测公网入口（DNS/TLS/Caddy/`/healthz`）、证书剩余天数 | ✅（仅生产 overlay）      |
 | **外部心跳**        | 元监控     | 监控栈自身是否还活着                        | ✅ Watchdog → 外部服务    |
 | **PostHog** 等      | 业务分析   | 用户行为、漏斗、留存、转化                  | ❌ 未做                   |
 
@@ -193,10 +194,32 @@ node-postgres `Pool`，`waitingCount` 就是这个读数。`PrismaService` 自�
 > **不要去找 Prisma 自带的 `$metrics`。** 它在 Prisma 7 已被移除，
 > `previewFeatures = ["metrics"]` 会直接报 P1012 —— 那条路是死的。
 
-### 11. 元监控 —— 监控自己死了怎么办
+### 11. 公网可达性探测 —— 内网一切正常，用户却进不来
+
+上面所有指标都是 Prometheus 在 compose 内网里直连容器拿到的。DNS 指错、证书
+过期、Caddy 配置坏、入口被拦时，它们照样全绿，而用户已经完全进不来。
+
+blackbox-exporter（仅生产 overlay）按用户的路径去请求公网地址：DNS → TLS →
+Caddy → 服务。API 探 `/healthz`（只回存活、不带依赖信息，公网本来就为外部探测
+留着它），管理后台探首页；目标写在 gitignored 的
+`monitoring/prometheus/probe-targets/public.yml` 里。
+
+| 告警 | 级别 | 含义 |
+| ---- | ---- | ---- |
+| `PublicEndpointDown` | critical | 某个公网入口连续 2 分钟探测失败 |
+| `TlsCertificateExpiringSoon` | warning / critical | 证书剩不到 14 天 / 3 天。Caddy 在剩 ~30 天时自动续期，任何一档响都说明续期一直在失败 |
+| `PublicProbeNotConfigured` | warning | exporter 在跑却一个目标都没有（漏配了目标文件） |
+
+它替代了原来的 Uptime-Kuma：探测配置进仓库，告警走同一套 Alertmanager 分级和
+抑制（后端整个不在时，API 入口的探测告警会被 `CircleBeNoTarget` 压掉），而不是
+在一个 Web UI 里单独配置、直连 Discord。
+
+它和被监控对象在同一台机器上，**发现不了整机宕机** —— 那是下一节外部心跳的事。
+
+### 12. 元监控 —— 监控自己死了怎么办
 
 整套监控栈和被监控对象在**同一台机器**上。机器宕机、磁盘写满、网络断开时，
-Prometheus / Alertmanager / Uptime-Kuma 一起没了，Discord 一条消息都不会有 ——
+Prometheus / Alertmanager / blackbox-exporter 一起没了，Discord 一条消息都不会有 ——
 而 `HostDiskFilling`、`HighMemory` 这些恰恰是「真触发时离整机不可用不远了」的
 告警。
 
@@ -204,7 +227,7 @@ Prometheus / Alertmanager / Uptime-Kuma 一起没了，Discord 一条消息都�
 （healthchecks.io 等）。方向和其他所有告警相反：外部服务**收不到**心跳才报警。
 配置见 [../monitoring/README.md](../monitoring/README.md) 的「外部心跳」一节。
 
-### 12. 产品分析 / 业务埋点（❌ 未做）
+### 13. 产品分析 / 业务埋点（❌ 未做）
 
 用户行为事件、**漏斗、留存、转化**——给产品 / 增长。和 Prometheus 不同：**per-user**，不是聚合，Prometheus 存不了。推荐 PostHog（免费云起步）。这是独立的一套系统。
 
@@ -220,10 +243,11 @@ Prometheus / Alertmanager / Uptime-Kuma 一起没了，Discord 一条消息都�
 指标线:
   后端 /metrics ─────┐   (RED + 业务 + 聊天 + 定时任务/outbox + 基建状态)
   node-exporter ─────┤
-  cAdvisor      ─────┼─► Prometheus ─┬─► Grafana       (大盘)
-  postgres-exporter ─┤   (存 + 查)    └─► Alertmanager ─┬─► Discord (warning, 4h)
-  redis-exporter ────┘                                  ├─► Discord (critical, 1h)
-                                                        └─► 外部心跳服务 (Watchdog)
+  cAdvisor      ─────┤
+  postgres-exporter ─┼─► Prometheus ─┬─► Grafana       (大盘)
+  redis-exporter ────┤   (存 + 查)    └─► Alertmanager ─┬─► Discord (warning, 4h)
+  blackbox-exporter ─┘                                  ├─► Discord (critical, 1h)
+  (公网入口探测)                                        └─► 外部心跳服务 (Watchdog)
 
 业务分析线(未做):
   前端/后端 ─────► PostHog 等   (漏斗/留存/转化)

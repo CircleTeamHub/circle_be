@@ -81,6 +81,34 @@ jobs:
             -v "$PWD/monitoring/prometheus:/rules:ro" \
             prom/prometheus:v3.7.3 test rules /rules/alerts.test.yml
 
+      # check rules 管不到 prometheus.yml 本身：抓取配置写错（relabel、file_sd
+      # 路径、缩进）同样会让 Prometheus 拒绝启动，所有监控一起消失。生产配置
+      # 引用的 metrics_token 是 gitignored 的，这里在临时副本里放一个占位文件，
+      # 并用示例文件充当探测目标，让 promtool 顺带校验 file_sd 文件的格式。
+      # 容器以 nobody 运行，临时目录必须对其他用户可读。
+      - name: Validate Prometheus configs (promtool)
+        run: |
+          cfg="$(mktemp -d)"
+          cp -R monitoring/prometheus/. "$cfg/"
+          printf 'ci-placeholder' > "$cfg/metrics_token"
+          cp "$cfg/probe-targets/public.yml.example" "$cfg/probe-targets/public.yml"
+          chmod -R a+rX "$cfg"
+          docker run --rm --entrypoint promtool \
+            -v "$cfg:/etc/prometheus:ro" \
+            prom/prometheus:v3.7.3 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint promtool \
+            -v "$cfg:/etc/prometheus:ro" \
+            prom/prometheus:v3.7.3 check config /etc/prometheus/prometheus.prod.yml
+
+      # 探测模块写错时 blackbox-exporter 启动即退出，所有公网探测一起消失。
+      # 版本与 monitoring/docker-compose.prod.yml 里锁定的保持一致。
+      - name: Validate blackbox exporter config
+        run: |
+          docker run --rm \
+            -v "$PWD/monitoring/blackbox:/cfg:ro" \
+            prom/blackbox-exporter:v0.28.0 \
+            --config.file=/cfg/blackbox.yml --config.check
+
       # 路由树写错不会报错,只会把告警**静悄悄地**送去错误的接收者 —— 最坏的
       # 情况是 critical 落进 warning 的节流里,或者 Watchdog 被并进普通频道从而
       # 完全失去 dead-man's switch 的作用。这里直接断言三条关键路径的落点。

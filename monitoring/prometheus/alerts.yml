@@ -59,6 +59,60 @@ groups:
         annotations:
           summary: 'No circle-be scrape target exists (no backend container is running)'
 
+  # 公网可达性 —— 从用户的路径看服务（blackbox-exporter，仅生产 overlay）。
+  #
+  # 上面那组都来自 Prometheus 在 compose 内网里直连容器：DNS 指错、证书过期、
+  # Caddy 配坏、入口被拦时它们一切正常，而用户已经完全进不来。这里的探测按用户
+  # 的路径请求公网地址（DNS → TLS → Caddy → 服务）。
+  #
+  # 它和被监控对象在同一台机器上：整机宕机或断网时它也一起没了，那种情况只能靠
+  # meta 组的 Watchdog 外部心跳。
+  - name: reachability
+    rules:
+      # 30s 探一次、for: 2m = 连续失败好几次才叫人，单次网络抖动不报。
+      - alert: PublicEndpointDown
+        expr: probe_success{job="blackbox-http"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Public endpoint {{ $labels.instance }} is failing its probe (DNS, TLS, Caddy or the service behind it)'
+
+      # Caddy 在证书剩 ~30 天时自动续期。剩不到 14 天说明续期已经连续失败两周多，
+      # 剩不到 3 天再不处理，客户端就会拒绝连接。两档用同一个告警名：Alertmanager
+      # 里「critical 压掉同名 warning」那条抑制规则是按 alertname 配对的。
+      - alert: TlsCertificateExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time() < 14 * 86400
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'TLS certificate for {{ $labels.instance }} expires in less than 14 days — automatic renewal has been failing'
+
+      - alert: TlsCertificateExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry{job="blackbox-http"} - time() < 3 * 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'TLS certificate for {{ $labels.instance }} expires in less than 3 days — renew it now or clients will refuse to connect'
+
+      # 探测目标按部署写在 gitignored 的 probe-targets/public.yml 里。漏配时这个
+      # job 一个目标都没有、probe_success 根本不存在 —— 上面几条永远不会响，
+      # 看起来却像「装好了、一切正常」。
+      #
+      # 只在 blackbox-exporter 真的在跑时才判断：它只存在于生产 overlay，不加这个
+      # 前提的话，每台开发机上都会常年红。
+      - alert: PublicProbeNotConfigured
+        expr: |
+          absent(probe_success{job="blackbox-http"})
+            and on() (up{job="blackbox-exporter"} == 1)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'blackbox-exporter is running but nothing is being probed — create monitoring/prometheus/probe-targets/public.yml'
+
   # 定时任务与 outbox 队列 —— 「什么都没发生」这一类故障。
   #
   # 这一组补的是此前完全无信号的盲区：Sentry 的 captureError 只在
@@ -188,8 +242,8 @@ groups:
       # 永远 firing，专门路由到**外部**心跳服务（healthchecks.io 等）。
       #
       # 整套监控栈和被监控对象在同一台机器上：机器宕机、磁盘写满、网络断开时，
-      # Prometheus / Alertmanager / Uptime-Kuma 一起没了，Discord 一条消息都不会
-      # 有 —— 而 HostDiskFilling、HighMemory 这些恰恰是「真触发时离整机不可用
+      # Prometheus / Alertmanager / blackbox-exporter 一起没了，Discord 一条消息
+      # 都不会有 —— 而 HostDiskFilling、HighMemory 这些恰恰是「真触发时离整机不可用
       # 不远了」的告警。这条是唯一能覆盖「监控自己死了」的机制：外部服务**收不到**
       # 心跳就报警，方向和其他所有告警相反。
       #

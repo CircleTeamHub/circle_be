@@ -6,19 +6,23 @@
 # Without it, the stack scrapes the DEV backend (host.docker.internal:3000) and
 # monitors nothing in production — see README.md "Scraping production".
 #
-# It changes Prometheus in three ways:
+# It changes Prometheus in four ways:
 #   1. joins it to the circle-be compose network, the only place the backend is
 #      reachable (docker-compose.prod.yml only does `expose: 3000`);
 #   2. swaps in prometheus.prod.yml (blue-green DNS discovery + bearer auth);
-#   3. mounts the METRICS_AUTH_TOKEN credentials file.
+#   3. mounts the METRICS_AUTH_TOKEN credentials file;
+#   4. mounts the public probe targets for the blackbox exporter.
 #
-# It also PINS every image and adds the postgres/redis exporters — see the two
-# sections below for why neither belongs in the base file.
+# It also PINS every image and adds the blackbox and postgres/redis exporters —
+# see the sections below for why none of them belongs in the base file.
 #
 # Prerequisites:
 #   - the circle-be stack is up, so its network exists;
 #   - monitoring/prometheus/metrics_token exists — run monitoring/sync-metrics-token.sh;
-#   - monitoring/.env.exporters exists — run monitoring/sync-exporter-env.sh.
+#   - monitoring/.env.exporters exists — run monitoring/sync-exporter-env.sh;
+#   - monitoring/prometheus/probe-targets/public.yml exists — copy it from
+#     public.yml.example and fill in this deployment's domains (without it,
+#     PublicProbeNotConfigured fires).
 
 # ── Pinned image versions ─────────────────────────────────────────────────────
 # The base file uses :latest for a frictionless local start. On a server that is
@@ -52,6 +56,10 @@ services:
       # Gitignored, 0600, owned by uid 65534 (the `nobody` user Prometheus runs
       # as) — otherwise the container cannot read it and every scrape 401s.
       - ./prometheus/metrics_token:/etc/prometheus/metrics_token:ro
+      # Public probe targets for this deployment (gitignored public.yml, created
+      # from public.yml.example). The whole directory is mounted so file_sd picks
+      # up edits without a restart.
+      - ./prometheus/probe-targets:/etc/prometheus/probe-targets:ro
 
   node-exporter:
     image: prom/node-exporter:v1.11.0
@@ -65,8 +73,26 @@ services:
   grafana:
     image: grafana/grafana:13.1.0
 
-  uptime-kuma:
-    image: louislam/uptime-kuma:1.23.16
+  # ── 公网可达性探测 ────────────────────────────────────────────────────
+  # 按用户的路径请求公网入口（DNS → TLS → Caddy → 服务），补上内网直连看不到的
+  # 那一面。探测配置在仓库里，告警走 Alertmanager 的分级与抑制，不在某个 Web UI
+  # 里单独配置、直连 Discord。
+  #
+  # 只在生产 overlay 里定义，理由同下面两个 exporter：开发机没有公网域名，放进
+  # 基础文件只会得到一个永远没有目标的探测器。
+  #
+  # 不加入 circle-be 网络，也不发布端口：它走公网访问目标，只给 Prometheus 在
+  # 监控网络里调用。端口发布出去的话，任何人都能让它替自己去请求任意 target=。
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0
+    container_name: circle-blackbox-exporter
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 64m
+    command:
+      - '--config.file=/etc/blackbox_exporter/config.yml'
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
 
   # ── 数据库与缓存指标 ────────────────────────────────────────────────────
   # 只在生产 overlay 里定义,不进基础文件:开发机上 Postgres/Redis 常常不在
