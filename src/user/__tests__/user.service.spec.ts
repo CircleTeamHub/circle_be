@@ -9,6 +9,7 @@ import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { USER_ME_SELECT } from '../user.select';
 
 describe('UserService', () => {
   let service: UserService;
@@ -340,29 +341,63 @@ describe('UserService', () => {
   });
 
   describe('findOne', () => {
-    it('returns the user (with like status) when found', async () => {
+    it('returns the profile view with the effective vipLevel and like count', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         receivedLikeCount: 4,
         vipLevel: 2,
         vipExpiresAt: new Date(Date.now() - 1),
       });
-      // Self-view: likedByMeToday is always false and no like lookup is made.
       await expect(service.findOne('user-1')).resolves.toMatchObject({
         id: 'user-1',
         displayIcons: [],
         likeCount: 4,
-        likedByMeToday: false,
         vipLevel: 0,
-        membership: {
-          effectiveLevel: 0,
-          key: 'regular',
-          appearance: { nameColor: 'default', badge: null },
-        },
       });
       const result = await service.findOne('user-1');
       expect(result).not.toHaveProperty('vipExpiresAt');
+    });
+
+    // likedByMeToday / membership 不在任何客户端的读取路径上（点赞状态走 like 模块），
+    // 资料页不该为它们每次多打一条 userLike 查询、多拼一个会员外观对象。
+    it("does not look up today's like or build a membership object for other viewers", async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'target-1',
+        receivedLikeCount: 4,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.findOne('target-1', 'viewer-1');
+
+      expect(result).toMatchObject({
+        id: 'target-1',
+        likeCount: 4,
+        vipLevel: 3,
+      });
+      expect(result).not.toHaveProperty('likedByMeToday');
+      expect(result).not.toHaveProperty('membership');
       expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
+    });
+
+    // 账号搜索只返回 ACTIVE；资料页此前连 DELETED 都照常返回，注销账号仍能被
+    // 任何拿到 userId 的人读出资料。对外与「不存在」同一个 404，本人不挡。
+    it('answers a deleted account with the user-not-found 404 for everyone but its owner', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'gone-1',
+        status: UserStatus.DELETED,
+        receivedLikeCount: 0,
+      });
+
+      await expect(service.findOne('gone-1', 'viewer-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      await expect(service.findOne('gone-1', 'viewer-1')).rejects.toThrow(
+        'User gone-1 not found',
+      );
+      await expect(service.findOne('gone-1', 'gone-1')).resolves.toMatchObject({
+        id: 'gone-1',
+      });
     });
 
     it('filters contact fields according to target privacy settings for other viewers', async () => {
@@ -394,7 +429,6 @@ describe('UserService', () => {
         // REST 不收口就是第二条信道。
         lastOnline: null,
         displayIcons: [],
-        likedByMeToday: false,
       });
       expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
         'target-1',
@@ -518,6 +552,33 @@ describe('UserService', () => {
         service.update('user-1', { birthday: 'not-a-date' as any }),
       ).rejects.toThrow(BadRequestException);
     });
+
+    // PATCH 声明的是 SelfUserDto，却一直按他人视图的列去选，inviteCode / creditScore /
+    // fancyNumber 在响应里恒缺；与 /auth/me 共用同一份 USER_ME_SELECT。
+    it('answers PATCH with the owner-view columns SelfUserDto declares', async () => {
+      prisma.user.update.mockResolvedValue({
+        id: 'user-1',
+        inviteCode: 'invite1',
+        creditScore: 100,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.update('user-1', { nickname: 'jimmy' });
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ select: USER_ME_SELECT }),
+      );
+      expect(result).toMatchObject({
+        id: 'user-1',
+        inviteCode: 'invite1',
+        creditScore: 100,
+        vipLevel: 0,
+      });
+      expect(result).not.toHaveProperty('storedVipLevel');
+      expect(result).not.toHaveProperty('vipExpiresAt');
+      expect(result).not.toHaveProperty('membership');
+    });
   });
 
   describe('remove', () => {
@@ -557,11 +618,11 @@ describe('UserService', () => {
 
       const result = await service.remove('user-1');
 
-      // Expired level 3 → effective 0 and the membership object is present, so
-      // the deletion body matches every other public-user response instead of
-      // leaking the stored paid tier.
+      // Expired level 3 → effective 0, so the deletion body matches every other
+      // public-user response instead of leaking the stored paid tier or its expiry.
       expect(result.vipLevel).toBe(0);
-      expect(result.membership.effectiveLevel).toBe(0);
+      expect(result).not.toHaveProperty('vipExpiresAt');
+      expect(result).not.toHaveProperty('membership');
     });
   });
 });
