@@ -10,6 +10,8 @@
 # Tools and why:
 #   pgbackrest     Postgres full/incr backup + WAL archive to S3 (encrypted).
 #   mc             MinIO's own client; mirrors the object bucket off-host.
+# MinIO stopped publishing to Docker Hub in 2025-10 and the minio/* repositories
+# were removed; the same tags are still published on quay.io.
 FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc
 
 FROM postgres:16-alpine

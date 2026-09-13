@@ -11,6 +11,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# MinIO stopped publishing to Docker Hub in 2025-10 and the minio/* repositories
+# were removed; the same tags are still published on quay.io.
 docker run --detach --rm \
   --name "$container" \
   --publish 127.0.0.1::9000 \
