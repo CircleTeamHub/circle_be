@@ -500,7 +500,9 @@ describe('SupportRechargeService admin response contract', () => {
       user: {
         findMany: jest
           .fn()
-          .mockResolvedValue([{ id: 'user-1', accountId: 'u1', nickname: 'User' }]),
+          .mockResolvedValue([
+            { id: 'user-1', accountId: 'u1', nickname: 'User' },
+          ]),
       },
     };
     const service = buildService(prisma);

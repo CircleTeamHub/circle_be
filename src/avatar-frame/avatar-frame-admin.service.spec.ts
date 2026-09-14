@@ -596,9 +596,7 @@ describe('AvatarFrameAdminService', () => {
   it('returns the same grant shape with frame on grant replay and revoke replay', async () => {
     const { service, tx } = buildHarness();
     tx.userAvatarFrameGrant.findUnique.mockImplementation(({ select }) =>
-      Promise.resolve(
-        grant(select?.frame ? { frame: frameSummary } : {}),
-      ),
+      Promise.resolve(grant(select?.frame ? { frame: frameSummary } : {})),
     );
 
     await expect(
