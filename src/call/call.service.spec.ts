@@ -885,7 +885,10 @@ describe('CallService', () => {
     prisma.callParticipant.count.mockResolvedValue(1);
     prisma.callSession.findUnique.mockResolvedValue({
       ...callRow,
-      participants: [participants[0], { ...participants[1], status: 'REJECTED' }],
+      participants: [
+        participants[0],
+        { ...participants[1], status: 'REJECTED' },
+      ],
     });
 
     const result = await service.rejectCall('user-2', 'call-1');

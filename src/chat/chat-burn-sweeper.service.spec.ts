@@ -211,11 +211,9 @@ describe('ChatBurnSweeperService', () => {
       'conv-1',
       fullBatch.map((row) => row.id),
     );
-    expect(broadcast.emitBurnedMessages).toHaveBeenNthCalledWith(
-      2,
-      'conv-1',
-      ['tail'],
-    );
+    expect(broadcast.emitBurnedMessages).toHaveBeenNthCalledWith(2, 'conv-1', [
+      'tail',
+    ]);
   });
 
   it('keeps sweeping other conversations when an announcement fails', async () => {

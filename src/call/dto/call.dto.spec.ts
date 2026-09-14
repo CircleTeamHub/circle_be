@@ -82,7 +82,10 @@ describe('CreateGroupCallDto', () => {
     ['a 32-hex alias', USER_B.replace(/-/g, '')],
   ])('rejects %s among inviteeIDs', (_case, invitee) => {
     expect(
-      errorsFor(CreateGroupCallDto, { ...valid, inviteeIDs: [USER_B, invitee] }),
+      errorsFor(CreateGroupCallDto, {
+        ...valid,
+        inviteeIDs: [USER_B, invitee],
+      }),
     ).toContain('inviteeIDs');
   });
 });
@@ -95,7 +98,10 @@ describe('CreateDirectCallDto', () => {
   });
 
   it.each([
-    ['a 32-hex alias the call service never normalizes', USER_B.replace(/-/g, '')],
+    [
+      'a 32-hex alias the call service never normalizes',
+      USER_B.replace(/-/g, ''),
+    ],
     ['an arbitrary string', 'user-2'],
   ])('rejects %s', (_case, calleeID) => {
     expect(

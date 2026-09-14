@@ -201,7 +201,8 @@ describe('UploadController', () => {
       expect(description).toContain(folder);
     }
     const privateFolders = UPLOAD_FOLDERS.filter(
-      (folder) => !(PUBLIC_READ_UPLOAD_FOLDERS as readonly string[]).includes(folder),
+      (folder) =>
+        !(PUBLIC_READ_UPLOAD_FOLDERS as readonly string[]).includes(folder),
     );
     expect(privateFolders).toEqual(['notes', 'chat']);
     for (const folder of privateFolders) {

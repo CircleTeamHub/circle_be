@@ -1,8 +1,5 @@
 import { ParseUUIDPipe } from '@nestjs/common';
-import {
-  GUARDS_METADATA,
-  ROUTE_ARGS_METADATA,
-} from '@nestjs/common/constants';
+import { GUARDS_METADATA, ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
@@ -87,9 +84,7 @@ describe('CallController', () => {
       CallController,
       handler,
     ) as Record<string, { data?: unknown; pipes?: unknown[] }>;
-    const callIdArg = Object.values(args).find(
-      (arg) => arg.data === 'callId',
-    );
+    const callIdArg = Object.values(args).find((arg) => arg.data === 'callId');
 
     expect(callIdArg?.pipes).toContain(ParseUUIDPipe);
   });

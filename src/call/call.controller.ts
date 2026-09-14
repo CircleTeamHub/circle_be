@@ -67,13 +67,19 @@ export class CallController {
 
   @Post(':callId/accept')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  acceptCall(@Param('callId', ParseUUIDPipe) callId: string, @Req() req: RequestWithUser) {
+  acceptCall(
+    @Param('callId', ParseUUIDPipe) callId: string,
+    @Req() req: RequestWithUser,
+  ) {
     return this.callService.acceptCall(req.user.userId, callId);
   }
 
   @Post(':callId/reject')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  rejectCall(@Param('callId', ParseUUIDPipe) callId: string, @Req() req: RequestWithUser) {
+  rejectCall(
+    @Param('callId', ParseUUIDPipe) callId: string,
+    @Req() req: RequestWithUser,
+  ) {
     return this.callService.rejectCall(req.user.userId, callId);
   }
 
@@ -89,7 +95,10 @@ export class CallController {
 
   @Post(':callId/cancel')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  cancelCall(@Param('callId', ParseUUIDPipe) callId: string, @Req() req: RequestWithUser) {
+  cancelCall(
+    @Param('callId', ParseUUIDPipe) callId: string,
+    @Req() req: RequestWithUser,
+  ) {
     return this.callService.cancelCall(req.user.userId, callId);
   }
 

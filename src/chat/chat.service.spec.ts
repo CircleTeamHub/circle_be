@@ -3640,11 +3640,11 @@ describe('ChatService', () => {
     it('refuses a caller without a seat', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(null);
 
-      await expect(
-        service.getBurnPolicy('u1', 'conv-1'),
-      ).rejects.toMatchObject({
-        response: { errorCode: ChatErrorCode.NotMember },
-      });
+      await expect(service.getBurnPolicy('u1', 'conv-1')).rejects.toMatchObject(
+        {
+          response: { errorCode: ChatErrorCode.NotMember },
+        },
+      );
     });
 
     it('refuses a caller who already left the conversation', async () => {
@@ -3652,11 +3652,11 @@ describe('ChatService', () => {
         directSeat(60, { leftAt: new Date('2026-09-01T00:00:00.000Z') }),
       );
 
-      await expect(
-        service.getBurnPolicy('u1', 'conv-1'),
-      ).rejects.toMatchObject({
-        response: { errorCode: ChatErrorCode.NotMember },
-      });
+      await expect(service.getBurnPolicy('u1', 'conv-1')).rejects.toMatchObject(
+        {
+          response: { errorCode: ChatErrorCode.NotMember },
+        },
+      );
     });
   });
 
