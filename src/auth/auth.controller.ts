@@ -4,6 +4,7 @@ import {
   Delete,
   Get,
   Param,
+  ParseUUIDPipe,
   Post,
   Put,
   Req,
@@ -193,7 +194,7 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiOkResponse({ description: 'Selected session revoked' })
   logoutSession(
-    @Param('sessionId') sessionId: string,
+    @Param('sessionId', ParseUUIDPipe) sessionId: string,
     @Req() req: RequestWithUser,
   ) {
     return this.authService.logoutSession(req.user.userId, sessionId);

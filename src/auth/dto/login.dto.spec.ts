@@ -100,3 +100,49 @@ describe('LoginDto identifier / email fallback', () => {
     ).toContain('email');
   });
 });
+
+// platform 是装机的旧版 APP 仍在发的字段（登录、注册都带 getClientPlatformID()，
+// 取值 1/2/5）。服务端早就不读它；可在 forbidNonWhitelisted 下属性一删，这些安装包的
+// 登录就会 400。所以属性保留、照旧校验，只从 OpenAPI 里隐藏。
+describe('LoginDto platform (deprecated: accepted and ignored)', () => {
+  // 与全局 ValidationPipe 同一组选项（src/setup.ts）。
+  const validateLikePipe = (input: Record<string, unknown>) =>
+    validate(
+      plainToInstance(LoginDto, input, { enableImplicitConversion: true }),
+      { whitelist: true, forbidNonWhitelisted: true },
+    );
+
+  it.each([1, 2, 5])(
+    'still accepts platform %s from installed app builds',
+    async (platform) => {
+      expect(
+        await validateLikePipe({
+          identifier: 'user@example.com',
+          password: 'password1',
+          platform,
+        }),
+      ).toHaveLength(0);
+    },
+  );
+
+  it('keeps validating the value as before', async () => {
+    const errors = await validateLikePipe({
+      identifier: 'user@example.com',
+      password: 'password1',
+      platform: 3,
+    });
+    expect(
+      errors.find((error) => error.property === 'platform')?.constraints,
+    ).toHaveProperty('isIn');
+  });
+
+  it('is no longer documented in the OpenAPI schema', () => {
+    const documented: string[] =
+      Reflect.getMetadata(
+        'swagger/apiModelPropertiesArray',
+        LoginDto.prototype,
+      ) ?? [];
+    expect(documented).toContain(':password');
+    expect(documented).not.toContain(':platform');
+  });
+});

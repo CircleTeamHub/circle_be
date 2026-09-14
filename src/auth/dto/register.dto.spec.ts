@@ -117,3 +117,39 @@ describe('RegisterDto existing fields', () => {
     expect(dto.nickname).toBe('Jimmy');
   });
 });
+
+// 与 LoginDto.platform 同理：旧安装包注册时仍带 platform，属性保留、照旧校验、不进文档。
+describe('RegisterDto platform (deprecated: accepted and ignored)', () => {
+  // 与全局 ValidationPipe 同一组选项（src/setup.ts）。
+  const validateLikePipe = (input: Record<string, unknown>) =>
+    validate(
+      plainToInstance(RegisterDto, input, { enableImplicitConversion: true }),
+      { whitelist: true, forbidNonWhitelisted: true },
+    );
+
+  it.each([1, 2, 5])(
+    'still accepts platform %s from installed app builds',
+    async (platform) => {
+      expect(
+        await validateLikePipe({ ...validPayload, platform }),
+      ).toHaveLength(0);
+    },
+  );
+
+  it('keeps validating the value as before', async () => {
+    const errors = await validateLikePipe({ ...validPayload, platform: 3 });
+    expect(
+      errors.find((error) => error.property === 'platform')?.constraints,
+    ).toHaveProperty('isIn');
+  });
+
+  it('is no longer documented in the OpenAPI schema', () => {
+    const documented: string[] =
+      Reflect.getMetadata(
+        'swagger/apiModelPropertiesArray',
+        RegisterDto.prototype,
+      ) ?? [];
+    expect(documented).toContain(':nickname');
+    expect(documented).not.toContain(':platform');
+  });
+});

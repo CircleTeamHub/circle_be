@@ -216,6 +216,24 @@ describe('RefreshTokenService', () => {
     expect(sessions[0].id).toBe('active');
   });
 
+  // GET /auth/sessions 此前不设上限。按最近使用从新到旧，同一时刻再按创建时间、
+  // id 兜底，保证每次返回同一个顺序、同一批前 100 条。
+  it('lists at most 100 active sessions, most recently used first with a stable tie-break', async () => {
+    await service.listActiveSessions('user-1');
+
+    expect(prisma.refreshToken.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ userId: 'user-1', revokedAt: null }),
+        orderBy: [
+          { lastUsedAt: 'desc' },
+          { createdAt: 'desc' },
+          { id: 'desc' },
+        ],
+        take: 100,
+      }),
+    );
+  });
+
   it('revokes all active sessions for a user', async () => {
     const now = new Date();
     records.push({

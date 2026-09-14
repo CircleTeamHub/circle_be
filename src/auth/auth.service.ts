@@ -192,13 +192,7 @@ export class AuthService {
       entityId: user.id,
     });
 
-    return this.issueTokens(
-      user.id,
-      user.accountId,
-      user.role,
-      sessionContext,
-      dto.platform,
-    );
+    return this.issueTokens(user.id, user.accountId, user.role, sessionContext);
   }
 
   async login(dto: LoginDto, sessionContext?: SessionContext) {
@@ -296,7 +290,7 @@ export class AuthService {
         errorCode: AuthErrorCode.InvalidCredentials,
       });
     }
-    return this.finishLogin(user, sessionContext, dto.platform);
+    return this.finishLogin(user, sessionContext);
   }
 
   /** ADMIN 账号当前是否处于登录锁定期。锁死期间不做密码比对。 */
@@ -441,7 +435,6 @@ export class AuthService {
       user.accountId,
       user.role,
       sessionContext,
-      undefined,
       {
         audience: 'ADMIN',
       },
@@ -471,7 +464,6 @@ export class AuthService {
       singleDeviceLoginEnabled: boolean;
     },
     sessionContext?: SessionContext,
-    platform?: 1 | 2 | 5,
   ) {
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
     this.prisma.user
@@ -487,7 +479,6 @@ export class AuthService {
       user.accountId,
       user.role,
       sessionContext,
-      platform,
     );
 
     logBusinessEvent(this.logger, {
@@ -1310,7 +1301,6 @@ export class AuthService {
     accountId: string,
     role: string,
     sessionContext?: SessionContext,
-    platformID?: 1 | 2 | 5,
     options?: {
       audience?: RefreshTokenAudience;
     },
