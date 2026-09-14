@@ -4007,7 +4007,23 @@ describe('NoteService', () => {
 
       const where = prisma.note.findMany.mock.calls[0][0].where;
       expect(where.available).toBe(true);
-      expect(where.status).toEqual({ not: 'DELETED' });
+      // 没存状态快照的链接只露 ACTIVE：UNLISTED 是主人藏起来的笔记，与 getNote 的
+      // 非主人分支、访客读卡片同一口径。
+      expect(where.status).toBe('ACTIVE');
+    });
+
+    it('honours an explicit UNLISTED snapshot the owner chose to share', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        status: 'UNLISTED',
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      expect(prisma.note.findMany.mock.calls[0][0].where.status).toBe(
+        'UNLISTED',
+      );
     });
 
     it('filters to ungrouped notes when the link snapshot stores group=ungrouped', async () => {

@@ -1967,9 +1967,10 @@ export class NoteService {
     const search = link.search?.trim();
     return {
       ownerID: link.ownerID,
-      // status 快照只可能是 ACTIVE / UNLISTED（NOTE_WRITABLE_STATUS），
-      // 两者都已排除 DELETED；未设置时显式排除。
-      status: link.status ?? { not: 'DELETED' as const },
+      // status 快照只可能是 ACTIVE / UNLISTED（NOTE_WRITABLE_STATUS）。没存快照时只露
+      // ACTIVE：UNLISTED 是主人藏起来的笔记，与 getNote 的非主人分支、访客读卡片同一
+      // 口径；主人显式存了 UNLISTED 快照才按快照放行。
+      status: link.status ?? ('ACTIVE' as const),
       available: true,
       ...(link.noteIDs.length > 0 ? { id: { in: link.noteIDs } } : {}),
       // group 与 groupID 在 createShareLink 里互斥，两个分支不会同时命中。
