@@ -1853,6 +1853,62 @@ describe('CirclePlazaService', () => {
       expect(result.recognitionOpen).toBe(false);
     });
 
+    // 报名列表此前硬截 200 条且不告知截断：第 201 位起在「报名管理」里看不见，也进不了
+    // 合作认可候选。默认仍取 200（已装机 App 不传 limit），多取一条判断 hasMore。
+    it('reports hasMore when the post has more signers than the page limit', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ACTIVE',
+        collaborationRecognizedAt: null,
+      });
+      const signup = (n: number) => ({
+        createdAt: new Date(`2026-06-0${n}T00:00:00Z`),
+        seenByAuthor: true,
+        user: {
+          id: `user-${n}`,
+          nickname: `u${n}`,
+          avatarUrl: null,
+          accountId: `${n}`,
+        },
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        signup(3),
+        signup(2),
+        signup(1),
+      ]);
+      prisma.collaborationRecognition.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getMyPostSignups('author-1', 'post-1', 2);
+
+      expect(prisma.circlePostSignup.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 3 }),
+      );
+      expect(result.hasMore).toBe(true);
+      expect(result.items.map((item) => item.userId)).toEqual([
+        'user-3',
+        'user-2',
+      ]);
+    });
+
+    it('keeps the 200-signer default page for clients that send no limit', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ACTIVE',
+        collaborationRecognizedAt: null,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      prisma.collaborationRecognition.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getMyPostSignups('author-1', 'post-1');
+
+      expect(prisma.circlePostSignup.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 201 }),
+      );
+      expect(result.hasMore).toBe(false);
+    });
+
     it('opens recognition selection for ended unrecognized posts and marks already recognized signers', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         id: 'post-1',

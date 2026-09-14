@@ -31,6 +31,7 @@ import {
   CollaborationRecognitionResultDto,
   CreatePlazaPostDto,
   MyCirclePostDto,
+  MyPostSignupsQueryDto,
   PlazaFeedQueryDto,
   PlazaFeedResponseDto,
   PlazaFeedSearchDto,
@@ -206,8 +207,13 @@ export class CirclePlazaController {
   myPostSignups(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
-  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
-    return this.plazaService.getMyPostSignups(req.user.userId, id);
+    @Query() query: MyPostSignupsQueryDto,
+  ): Promise<{
+    items: PostSignupItemDto[];
+    recognitionOpen: boolean;
+    hasMore: boolean;
+  }> {
+    return this.plazaService.getMyPostSignups(req.user.userId, id, query.limit);
   }
 
   @Post('me/posts/:id/signups/read')

@@ -161,6 +161,25 @@ export class CreatePlazaPostDto {
   signupFancyRestriction?: boolean;
 }
 
+/** 帖子报名列表默认页大小（已装机 App 不传 limit）。 */
+export const MY_POST_SIGNUPS_PAGE_DEFAULT = 200;
+/** 帖子报名列表单页上限。 */
+export const MY_POST_SIGNUPS_LIMIT_MAX = 500;
+
+export class MyPostSignupsQueryDto {
+  @ApiPropertyOptional({
+    description: `本页最多返回的报名数（默认 ${MY_POST_SIGNUPS_PAGE_DEFAULT}，上限 ${MY_POST_SIGNUPS_LIMIT_MAX}）；响应体 hasMore 标出是否被截断。`,
+    minimum: 1,
+    maximum: MY_POST_SIGNUPS_LIMIT_MAX,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MY_POST_SIGNUPS_LIMIT_MAX)
+  limit?: number;
+}
+
 export class RecognizePostCollaboratorsDto {
   @ApiProperty({ type: [String], minItems: 1, maxItems: 3 })
   @IsArray()
