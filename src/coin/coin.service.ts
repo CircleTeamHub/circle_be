@@ -8,9 +8,7 @@ import {
 } from '@nestjs/common';
 import { CoinTxType, FriendState, Prisma } from 'src/generated/prisma';
 import { CoinErrorCode } from 'src/common/app-error-codes';
-import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
@@ -46,8 +44,6 @@ export class CoinService {
   private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
-    private readonly realtimeService: RealtimeService,
-    private readonly notificationService: NotificationService,
     private readonly chatService: ChatService,
     private readonly chatMessages: ChatSystemMessageService,
   ) {}

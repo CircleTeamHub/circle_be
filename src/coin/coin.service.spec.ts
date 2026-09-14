@@ -7,8 +7,6 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { CoinService } from './coin.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
-import { NotificationService } from 'src/notification/notification.service';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 
@@ -71,20 +69,6 @@ describe('CoinService', () => {
     ),
   };
 
-  const realtimeService = {
-    broadcastWalletBalanceChanged: jest.fn(),
-    broadcastWalletRechargeCompleted: jest.fn(),
-    broadcastSystemNotificationCreated: jest.fn(),
-    broadcastSystemNotificationUnread: jest.fn(),
-    safeBroadcastAll: jest.fn((fns: Array<() => void | Promise<void>>) =>
-      Promise.allSettled(fns.map((fn) => fn())),
-    ),
-  };
-
-  const notificationService = {
-    createSystemNotification: jest.fn(),
-  };
-
   const chatService = {
     ensureDirectConversationForSettlement: jest.fn(),
   };
@@ -100,8 +84,6 @@ describe('CoinService', () => {
       providers: [
         CoinService,
         { provide: PrismaService, useValue: prisma },
-        { provide: RealtimeService, useValue: realtimeService },
-        { provide: NotificationService, useValue: notificationService },
         { provide: ChatService, useValue: chatService },
         { provide: ChatSystemMessageService, useValue: chatMessages },
       ],
