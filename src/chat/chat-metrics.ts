@@ -21,6 +21,7 @@ export type ChatAuthFailureReason =
   | 'invalid_claims'
   | 'wrong_audience'
   | 'revoked'
+  | 'session_unverifiable'
   | 'guest_secret_missing'
   | 'guest_invalid_token'
   | 'guest_invalid_claims'
