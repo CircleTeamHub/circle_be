@@ -55,20 +55,45 @@ Admin data is for moderators, support, and business operators. It should answer:
 - `GET /api/v1/auth/me`
 - `GET /api/v1/outbox/health`
 
+### Admin Routes Without Admin-Console UI
+
+These routes exist behind `JwtGuard + AdminGuard`, but `circle_admin_web` has no
+page that calls them yet. Operate them with curl / ops scripts and an admin
+access token.
+
+- `GET /api/v1/admin/moderation/group-reports`, `GET /api/v1/admin/moderation/post-reports`: list group / circle-post reports (`status` defaults to `PENDING`, `page` ≤ 500, `limit` ≤ 100); no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/moderation/group-reports/:reportId/review`, `POST /api/v1/admin/moderation/post-reports/:reportId/review`: approve or reject a pending report (`{ approve, note? }`, `note` ≤ 500); the PENDING → final transition is claimed atomically and a second review gets 409; no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/moderation/posts/:postId/takedown`: take a circle post down (→ `DELETED`, optional `note` ≤ 500, audited in the same transaction); calling it on an already deleted post returns the current status; no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/moderation/posts/:postId/restore`: restore a moderation takedown (→ `ENDED`, not `ACTIVE`); refuses posts deleted by their own author (409), and a post that is not deleted is returned unchanged; no admin-console UI yet (curl / ops).
+- `GET /api/v1/admin/sensitive-words`, `POST /api/v1/admin/sensitive-words/add`, `POST /api/v1/admin/sensitive-words/remove`: list / bulk-add / bulk-remove chat sensitive words (`words`: 1–1000 items, each ≤ 64 chars; add and remove are audited); no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/system-announcements`: publish a system announcement to active users (`content` 1–5000); requires the `Idempotency-Key` header (≤ 128 chars, reuse it when retrying) and is throttled to 2 requests/min per admin; no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/memberships/users/:userId/grants`: audited membership activation / upgrade (`targetLevel` 1–4, `note` ≤ 500); idempotent through the body field `idempotencyKey` (UUID, not a header); no admin-console UI yet (curl / ops).
+- `POST /api/v1/admin/memberships/program/enable`: permanently enable membership enforcement; replay-safe (a repeated call returns `replayed: true` with the existing status); no admin-console UI yet (curl / ops).
+- `GET /api/v1/admin/mall/fancy-numbers`: list the fancy-number inventory; no admin-console UI yet (curl / ops; the console only manages `/recommendations`).
+- `POST /api/v1/admin/mall/fancy-numbers/batch`: add 1–100 available fancy numbers (trimmed, lower-cased, deduplicated); not idempotent — the whole batch is rejected with 409 if any value is already taken, including by an earlier attempt; no admin-console UI yet (curl / ops).
+- `PATCH /api/v1/admin/mall/fancy-numbers/:id/status`: enable or disable an available fancy number (`{ enabled }`); no admin-console UI yet (curl / ops).
+- `GET /api/v1/admin/support/agents/audit-logs`: history of whole-table support-agent configuration writes (`limit`, default 20); no admin-console UI yet (curl / ops).
+
 ### Admin Data That Needs Backend Work
 
-- Group report review: `GroupReport` exists, but it has no review status fields
-  and no admin review endpoints.
-- Global content moderation: moments, plaza posts, notes, circles, and comments
-  do not currently have system-admin list/remove/restore endpoints.
+- Group / plaza-post report review and post takedown: the backend routes exist
+  (`/api/v1/admin/moderation/*`, listed above), but the admin console has no page
+  for them yet.
+- Global content moderation: moments, notes, and comments still have no
+  system-admin list/remove/restore endpoints. Plaza posts can be taken down and
+  restored under `/api/v1/admin/moderation/posts/:postId/*`; circles can be
+  disabled and restored under `/api/v1/admin/community/circles/:id/*`.
 - Wallet and coin adjustments: there is no free-form admin top-up
   (`CoinService.adminTopUp` no longer exists). Coins are only credited by approving
   a support recharge order (`POST /api/v1/admin/support/recharge/orders/:id/approve`),
   which goes through `CoinService.creditInTransaction` with the order id as the
   idempotency key and writes an admin audit entry. A manual adjustment endpoint
   would still need its own audit note and idempotency key.
-- Admin audit history: moderation actions are logged in application logs, but
-  there is no queryable admin-audit table yet.
+- Admin audit history: moderation, sensitive-word, community and avatar-frame
+  actions are written to the `AdminAuditLog` table, but it can only be read per
+  target (`GET /api/v1/admin/users/:id/audit-logs`,
+  `GET /api/v1/admin/support/agents/audit-logs`); there is no global audit
+  browser yet.
 - Aggregated business/admin stats: Prometheus has counters, but the admin app
   should consume dedicated backend summary endpoints instead of raw PromQL.
 
