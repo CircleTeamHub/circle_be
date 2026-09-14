@@ -1,4 +1,5 @@
 import {
+  PUBLIC_READ_UPLOAD_FOLDERS,
   UploadService,
   buildPublicReadBucketPolicy,
   matchesCorsWildcard,
@@ -12,6 +13,30 @@ jest.mock('@aws-sdk/s3-request-presigner', () => ({
 describe('UploadService', () => {
   const privateMinioHost = ['10', '0', '0', '195'].join('.');
   const privateMinioUrl = `http://${privateMinioHost}:9000`;
+
+  // 公开目录只有一份事实源:桶策略与 presign 接口文档都从它派生。此前文档对所有目录
+  // 都说 fileUrl 是「永久访问地址」,而 chat/notes 早已移出匿名可读 —— 直连只会 403。
+  it('derives the public-read bucket policy from the single public folder list', () => {
+    expect([...PUBLIC_READ_UPLOAD_FOLDERS]).toEqual([
+      'avatars',
+      'covers',
+      'posts',
+      'friends',
+      'uploads',
+    ]);
+    expect(PUBLIC_READ_UPLOAD_FOLDERS).not.toContain('chat');
+    expect(PUBLIC_READ_UPLOAD_FOLDERS).not.toContain('notes');
+
+    const policy = JSON.parse(buildPublicReadBucketPolicy('circle')) as {
+      Statement: Array<{ Resource: string[] }>;
+    };
+
+    expect(policy.Statement[0].Resource).toEqual(
+      PUBLIC_READ_UPLOAD_FOLDERS.map(
+        (folder) => `arn:aws:s3:::circle/${folder}/*`,
+      ),
+    );
+  });
 
   it('builds a bucket policy that allows public reads for uploaded objects', () => {
     const policy = JSON.parse(buildPublicReadBucketPolicy('circle'));

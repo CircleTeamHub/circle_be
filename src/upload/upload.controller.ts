@@ -17,8 +17,14 @@ import {
   uploadMetrics,
   type UploadPresignLimitStore,
 } from 'src/metrics/upload-metrics';
-import { PresignDto } from './dto/presign.dto';
-import { UploadService } from './upload.service';
+import { PresignDto, UPLOAD_FOLDERS } from './dto/presign.dto';
+import { PUBLIC_READ_UPLOAD_FOLDERS, UploadService } from './upload.service';
+
+/** App 可选但不在匿名可读白名单里的目录(notes、chat):对象只能凭 key 签名读取。 */
+const PRIVATE_UPLOAD_FOLDERS = UPLOAD_FOLDERS.filter(
+  (folder) =>
+    !(PUBLIC_READ_UPLOAD_FOLDERS as readonly string[]).includes(folder),
+);
 
 @ApiTags('upload')
 @ApiBearerAuth()
@@ -63,7 +69,10 @@ export class UploadController {
   @ApiOperation({
     summary: '获取预签名上传 URL',
     description:
-      '返回 uploadUrl（PUT 文件用，5 分钟有效）和 fileUrl（上传后的永久访问地址）',
+      `返回 uploadUrl（PUT 上传用；图片 5 分钟、视频 30 分钟有效）、key 与 fileUrl。` +
+      `fileUrl 只对公开目录（${PUBLIC_READ_UPLOAD_FOLDERS.join('、')}）可直接读取；` +
+      `私有目录（${PRIVATE_UPLOAD_FOLDERS.join('、')}）的对象直连会被拒绝，须保存 key，` +
+      `由对应读路径（聊天消息 / 笔记详情）按 key 签发短时 GET URL 读取。`,
   })
   async presign(@Body() dto: PresignDto, @Req() req: RequestWithUser) {
     await this.checkUserPresignLimit(req.user.userId, dto.sizeBytes);

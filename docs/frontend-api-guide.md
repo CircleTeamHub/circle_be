@@ -381,11 +381,17 @@ video/mp4 | video/quicktime | video/x-m4v
 
 **folder 允许值：**
 ```
-avatars   — 用户头像
-covers    — 封面图（用户/Squad）
-posts     — 帖子图片/视频
-notes     — 笔记图片/视频
+avatars   — 用户头像（公开）
+covers    — 封面图（公开）
+posts     — 帖子 / 动态图片视频（公开）
+friends   — 好友申请照片（公开）
+notes     — 笔记图片/视频（私有）
+chat      — 聊天媒体（私有）
 ```
+
+> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）可直接读取、可直接写进资料/圈子/帖子。
+> `notes`、`chat` 是私有目录：直连 `fileUrl` 会被拒绝，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
+> 私有目录目前仍返回 `fileUrl` 只是为了兼容已装机 App 的必填校验，客户端不要依赖它。
 
 **Response 201：**
 ```json
