@@ -42,7 +42,6 @@ Admin data is for moderators, support, and business operators. It should answer:
 - Banned users.
 - Recent login failure trend.
 - Rate-limit hit summary for sensitive actions.
-- Outbox failed count.
 
 ### Admin Data Sources Available Now
 
@@ -53,7 +52,7 @@ Admin data is for moderators, support, and business operators. It should answer:
 - `PATCH /api/v1/admin/users/:id/status`（唯一的状态变更入口，带审计留痕；
   原先无审计的 `PATCH /api/v1/user/:id/status` 已随 #121 移除）
 - `GET /api/v1/auth/me`
-- `GET /api/v1/outbox/health`
+- `GET /api/v1/admin/dashboard`（system 段只含 API / 数据库 / Redis 探针；OpenIM 同步 outbox 已拆除，`/outbox/health` 不存在）
 
 ### Admin Routes Without Admin-Console UI
 
