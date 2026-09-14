@@ -439,3 +439,65 @@ describe('setupApp circle limiter mount', () => {
     expect(read.next).toHaveBeenCalledWith();
   });
 });
+
+// POST /circle-plaza/feed/search 是读（条件太长才用请求体），此前与发帖、报名、举报一起
+// 吃 40 次/15 分钟的广场写配额：翻几页搜索就把发帖额度耗光，反过来也一样。它自己有
+// 路由级 @Throttle（60 次/分钟）和全局兜底。
+describe('setupApp circle-plaza limiter mount', () => {
+  beforeEach(() => {
+    getServerConfigMock.mockReturnValue({ LOG_ON: 'false' });
+  });
+
+  const hit = async (
+    mount: (req: any, res: any, next: any) => unknown,
+    method: string,
+    path: string,
+  ) => {
+    const next = jest.fn();
+    const res = {
+      setHeader: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn(),
+      headersSent: false,
+      writableEnded: false,
+    };
+    await mount(
+      {
+        method,
+        path,
+        url: path,
+        ip: '203.0.113.9',
+        headers: {},
+        app: { get: () => false },
+        socket: {},
+      },
+      res,
+      next,
+    );
+    return { next, res };
+  };
+
+  it('does not count feed search against the plaza write limiter', async () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const mounts = app.use.mock.calls.filter(
+      ([mountPath]) => mountPath === '/api/v1/circle-plaza',
+    );
+    expect(mounts).toHaveLength(1);
+    const mount = mounts[0][1];
+
+    // circleWriteLimiterOptions.max = 40：搜索打满也不占写配额。
+    for (let i = 0; i < 45; i += 1) {
+      const { next } = await hit(mount, 'POST', '/feed/search');
+      expect(next).toHaveBeenCalledWith();
+    }
+    for (let i = 0; i < 40; i += 1) {
+      const { next } = await hit(mount, 'POST', '/posts');
+      expect(next).toHaveBeenCalledWith();
+    }
+    const blocked = await hit(mount, 'POST', '/posts');
+    expect(blocked.next).not.toHaveBeenCalled();
+    expect(blocked.res.status).toHaveBeenCalledWith(429);
+  });
+});

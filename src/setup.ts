@@ -515,6 +515,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     next();
   });
   app.use('/api/v1/circle-plaza', (req: any, res: any, next: any) => {
+    // POST /feed/search 是读（筛选条件太长才走请求体）：不能吃发帖/报名/举报的写配额，
+    // 它有路由级 @Throttle（60 次/分钟）与全局兜底。
+    const path = String(req.path ?? '').replace(/\/+$/, '');
+    if (req.method === 'POST' && path === '/feed/search') {
+      return next();
+    }
     if (req.method === 'POST' || req.method === 'DELETE') {
       return circlePlazaWriteLimiter(req, res, next);
     }
