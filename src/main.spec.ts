@@ -151,6 +151,14 @@ describe('buildNestFactoryOptions', () => {
   it('enables raw body support for signed webhooks', () => {
     expect(buildNestFactoryOptions().rawBody).toBe(true);
   });
+
+  // GET /note 与 /note/recycle-bin 用 X-Has-More 告知截断（响应体保持数组）。移动端
+  // 不受 CORS 约束，但浏览器跨域时读不到未列入 Access-Control-Expose-Headers 的头。
+  it('exposes the X-Has-More pagination header to browser clients', () => {
+    expect(buildNestFactoryOptions().cors.exposedHeaders).toEqual(
+      expect.arrayContaining(['X-Has-More']),
+    );
+  });
 });
 
 describe('createGracefulShutdownHandler', () => {
