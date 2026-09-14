@@ -180,6 +180,7 @@ export class UpdateDisplayIconsDto {
 export class UploadCircleIconDto {
   @ApiProperty()
   @IsUrl(URL_VALIDATION_OPTIONS)
+  @MaxLength(500)
   imageUrl: string;
 
   @ApiPropertyOptional()

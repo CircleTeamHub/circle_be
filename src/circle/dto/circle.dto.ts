@@ -53,9 +53,13 @@ export class CreateCircleDto {
   @MaxLength(500)
   description: string;
 
+  // 与 SetCircleAvatarDto 同口径:渲染给每个访客的图片地址必须是带协议的 URL 且有上界。
+  // App 只发 presign 返回的 fileUrl;是否来自本站存储由 service 的 assertAvatarUrlIsSafe 把关。
   @ApiPropertyOptional()
   @IsString()
   @IsOptional()
+  @IsUrl(URL_VALIDATION_OPTIONS)
+  @MaxLength(500)
   avatarUrl?: string;
 
   @ApiPropertyOptional({ type: [String] })
@@ -179,6 +183,7 @@ export class UpdateCircleDto {
 
   @ApiPropertyOptional()
   @IsString()
+  @IsUrl(URL_VALIDATION_OPTIONS)
   @MaxLength(500)
   @ValidateIf((_object, value) => value !== undefined)
   avatarUrl?: string;
