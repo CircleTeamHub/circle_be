@@ -10,6 +10,7 @@ import { CaslAbilityService } from './casl-ability.service';
 import { RefreshTokenService } from './refresh-token.service';
 import { RefreshTokenCleanup } from './refresh-token.cleanup';
 import { SessionRevocationService } from './session-revocation.service';
+import { SessionVerifier } from './session-verifier.service';
 import { EmailVerificationService } from './email-verification.service';
 import { MAILER } from './mailer/mailer.interface';
 import { ConsoleMailer } from './mailer/console.mailer';
@@ -44,6 +45,7 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
     RefreshTokenService,
     RefreshTokenCleanup,
     SessionRevocationService,
+    SessionVerifier,
     EmailVerificationService,
     {
       // 真实投递 vs 开发态自动切换（#82）：SMTP_HOST 存在即用 SmtpMailer
@@ -74,8 +76,14 @@ import { AvatarFrameModule } from 'src/avatar-frame/avatar-frame.module';
   controllers: [AuthController],
   // RefreshTokenService is exported so other modules (e.g. UserService when
   // BAN/DELETE happens) can revoke a user's sessions without going through
-  // AuthService. SessionRevocationService is exported so the realtime gateway
-  // can run the same revocation check on WebSocket auth that HTTP runs.
-  exports: [CaslAbilityService, RefreshTokenService, SessionRevocationService],
+  // AuthService. SessionRevocationService and SessionVerifier are exported so
+  // the WebSocket gateways reach the same revocation verdict on connect that
+  // HTTP reaches per request (including the database fallback without Redis).
+  exports: [
+    CaslAbilityService,
+    RefreshTokenService,
+    SessionRevocationService,
+    SessionVerifier,
+  ],
 })
 export class AuthModule {}

@@ -10,10 +10,10 @@ import { RealtimeModule } from './realtime.module';
 import { RealtimeGateway } from './realtime.gateway';
 
 describe('RealtimeModule wiring', () => {
-  // Guards the AuthModule export: the gateway resolves SessionRevocationService
-  // through the global AuthModule, which unit tests (which construct the gateway
-  // by hand) cannot catch.
-  it('constructs RealtimeGateway with SessionRevocationService injected', async () => {
+  // Guards the AuthModule export: the gateway resolves SessionVerifier (and,
+  // through it, SessionRevocationService + PrismaService) from the global
+  // AuthModule, which unit tests that construct the gateway by hand cannot catch.
+  it('constructs RealtimeGateway with SessionVerifier injected', async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [
         ConfigModule.forRoot({ isGlobal: true, ignoreEnvFile: true }),

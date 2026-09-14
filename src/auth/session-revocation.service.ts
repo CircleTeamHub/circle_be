@@ -54,9 +54,9 @@ function getIssuedAtMs(payload: RevocablePayload): number | null {
  * **Tri-state, not silently fail-open.** Redis is optional in this deployment
  * (`.env.production.example` ships REDIS_REQUIRED=false), so a marker may be
  * unreadable. `checkRevocation` reports that as `unknown` instead of pretending
- * no marker exists, and JwtStrategy then checks the database (account status +
- * session row). `isRevoked` keeps the boolean fail-open view for callers that
- * have no database fallback (the WebSocket gateways).
+ * no marker exists; SessionVerifier then checks the database (account status +
+ * session row) for JwtStrategy and the WebSocket gateways. `isRevoked` is the
+ * legacy boolean, fail-open view — prefer SessionVerifier.
  */
 @Injectable()
 export class SessionRevocationService {
@@ -144,7 +144,7 @@ export class SessionRevocationService {
 
   /**
    * Tri-state revocation check for one access token (see RevocationState).
-   * `unknown` leaves the decision to the caller: JwtStrategy consults the
+   * `unknown` leaves the decision to the caller: SessionVerifier consults the
    * database instead of letting the token through.
    */
   async checkRevocation(payload: RevocablePayload): Promise<RevocationState> {
@@ -181,10 +181,9 @@ export class SessionRevocationService {
   }
 
   /**
-   * Boolean, fail-open view of checkRevocation for callers without a database
-   * fallback (the WebSocket gateways): `unknown` counts as not revoked, so a
-   * Redis outage degrades them to the token's own TTL instead of disconnecting
-   * everyone.
+   * Legacy boolean, fail-open view of checkRevocation: `unknown` counts as not
+   * revoked, so a Redis outage lets a revoked token through until it expires.
+   * New callers should use SessionVerifier, which checks the database instead.
    */
   async isRevoked(payload: RevocablePayload): Promise<boolean> {
     return (await this.checkRevocation(payload)) === 'revoked';

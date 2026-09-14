@@ -29,7 +29,7 @@ describe('websocket upgrade coexistence (/realtime + /chat-ws)', () => {
     gateway = new RealtimeGateway(
       { verify: jest.fn() } as never,
       { registerSocket: jest.fn() } as never,
-      { isRevoked: jest.fn() } as never,
+      { verify: jest.fn() } as never,
     );
 
     httpServer = createServer();
