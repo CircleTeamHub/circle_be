@@ -26,6 +26,16 @@ export type VerifiableToken = {
   issuedAtMs?: unknown;
 };
 
+function issuedAtMs(token: VerifiableToken): number | null {
+  if (typeof token.issuedAtMs === 'number' && Number.isFinite(token.issuedAtMs)) {
+    return token.issuedAtMs;
+  }
+  if (typeof token.iat === 'number' && Number.isFinite(token.iat)) {
+    return token.iat * 1000;
+  }
+  return null;
+}
+
 /**
  * The single answer to "may this access token still be used?", shared by
  * JwtStrategy and the WebSocket gateways so no entry point quietly fails open.
@@ -42,11 +52,10 @@ export type VerifiableToken = {
  *   deletes expired rows, and the refresh TTL may be configured shorter than
  *   the access TTL.
  *
- * Known gap vs. the Redis path: logout-all / password change / token-family
- * reuse revoke each family's live row, but earlier ROTATED rows keep their
- * ROTATED reason, so an access token still carrying such an older sid stays
- * valid on the database path until it expires (<= JWT_EXPIRES_IN). Closing it
- * needs a per-user "revoked after" timestamp in the database.
+ * The user-level accessTokensRevokedAt timestamp closes the gap where a rotated
+ * refresh-token row remains marked ROTATED after logout-all/password change or
+ * token-family reuse. It is checked before the session-row fallback so Redis
+ * outages do not turn a broad revocation into a fail-open path.
  */
 @Injectable()
 export class SessionVerifier {
@@ -75,7 +84,7 @@ export class SessionVerifier {
     const lookup = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
-        select: { status: true },
+        select: { status: true, accessTokensRevokedAt: true },
       }),
       sessionId
         ? this.prisma.refreshToken.findUnique({
@@ -98,6 +107,14 @@ export class SessionVerifier {
 
     const [user, session] = lookup;
     if (user?.status !== UserStatus.ACTIVE) return 'revoked';
+    const tokenIssuedAt = issuedAtMs(token);
+    if (
+      user.accessTokensRevokedAt != null &&
+      (tokenIssuedAt === null ||
+        tokenIssuedAt <= user.accessTokensRevokedAt.getTime())
+    ) {
+      return 'revoked';
+    }
     if (
       session !== null &&
       (session.userId !== userId ||

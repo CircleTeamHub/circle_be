@@ -81,7 +81,7 @@ describe('SessionVerifier', () => {
       await expect(verifier.verify(payload)).resolves.toBe('active');
       expect(prisma.user.findUnique).toHaveBeenCalledWith({
         where: { id: 'user-1' },
-        select: { status: true },
+        select: { status: true, accessTokensRevokedAt: true },
       });
       // sid 就是 RefreshToken 的主键（refresh-token.service 的 revoke 注释）。
       expect(prisma.refreshToken.findUnique).toHaveBeenCalledWith({
@@ -129,6 +129,23 @@ describe('SessionVerifier', () => {
       });
 
       await expect(verifier.verify(payload)).resolves.toBe('active');
+    });
+
+    it('rejects a rotated session after a durable user-wide revocation', async () => {
+      const revokedAt = new Date('2026-09-01T00:00:00.000Z');
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: revokedAt,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        ...liveSession,
+        revokedAt: new Date('2026-08-31T23:59:00.000Z'),
+        revocationReason: 'ROTATED',
+      });
+
+      await expect(
+        verifier.verify({ ...payload, iat: revokedAt.getTime() / 1000 - 1 }),
+      ).resolves.toBe('revoked');
     });
 
     it('stays active when the session row was already cleaned up and the user is ACTIVE', async () => {

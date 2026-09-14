@@ -132,7 +132,12 @@ export class ChatBurnSweeperService {
           where: { id: { in: messageIds } },
           // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
           // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
-          data: { deleted: true, content: {}, contentHistory: [] },
+          data: {
+            deleted: true,
+            deletedAt: new Date(),
+            content: {},
+            contentHistory: [],
+          },
         });
         await this.media.releaseNoteImportReferences(
           tx,

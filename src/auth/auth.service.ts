@@ -849,7 +849,7 @@ export class AuthService {
     await this.prisma.$transaction([
       this.prisma.user.update({
         where: { id: user.id },
-        data: { passwordHash },
+        data: { passwordHash, accessTokensRevokedAt: new Date() },
       }),
       this.prisma.refreshToken.updateMany({
         where: { userId: user.id, revokedAt: null },

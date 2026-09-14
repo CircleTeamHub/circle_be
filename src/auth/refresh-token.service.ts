@@ -384,6 +384,10 @@ export class RefreshTokenService {
             revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
           },
         });
+        await tx.user.update({
+          where: { id: record.userId },
+          data: { accessTokensRevokedAt: now },
+        });
         return {
           kind: 'reuse' as const,
           userId: record.userId,
@@ -529,13 +533,20 @@ export class RefreshTokenService {
   }
 
   async revokeAll(userId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { userId, revokedAt: null },
-      data: {
-        revokedAt: new Date(),
-        revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
-      },
-    });
+    const revokedAt = new Date();
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: {
+          revokedAt,
+          revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+        },
+      }),
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { accessTokensRevokedAt: revokedAt },
+      }),
+    ]);
     // Kill every access token this user already holds (logout-all / ban /
     // password change / reuse detection), not just their refresh tokens (F-02).
     await this.revocation.revokeUser(userId);

@@ -15,7 +15,9 @@ describe('RefreshTokenService', () => {
 
   const prisma = {
     $executeRaw: jest.fn().mockResolvedValue(0),
-    $transaction: jest.fn(async (callback) => callback(prisma)),
+    $transaction: jest.fn(async (callback) =>
+      Array.isArray(callback) ? Promise.all(callback) : callback(prisma),
+    ),
     user: {
       findUnique: jest.fn(({ where }) =>
         Promise.resolve(

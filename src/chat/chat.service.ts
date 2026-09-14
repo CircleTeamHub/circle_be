@@ -2609,29 +2609,32 @@ export class ChatService {
     >`
       SELECT m."id", m."conversationID", m."height", m."senderID", m."type",
              m."content", m."clientMessageId", m."replyToID", m."deleted",
-             m."revokedAt", m."revokedBy", m."editedAt", m."createdAt",
+             m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."createdAt",
              GREATEST(
                COALESCE(m."revokedAt", to_timestamp(0)),
-               COALESCE(m."editedAt", to_timestamp(0))
+               COALESCE(m."editedAt", to_timestamp(0)),
+               COALESCE(m."deletedAt", to_timestamp(0))
              ) AS "mutatedAt"
       FROM "ChatMessage" AS m
       JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
         AS w("conversationID", floor, cutoff)
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
-        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
-        -- 焚毁/删除的墓碑正文已清空:当成「编辑」回放会拿空正文覆盖对端缓存。
-        AND m."deleted" = false
-        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since})
+        -- 删除墓碑必须跨过焚毁时间窗返回;否则离线设备无法清掉早于当前
+        -- burn cutoff 的本地正文。清空水位仍由 height floor 限制。
+        AND (m."deleted" = true OR w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since} OR m."deletedAt" >= ${since})
         AND (
           GREATEST(
             COALESCE(m."revokedAt", to_timestamp(0)),
-            COALESCE(m."editedAt", to_timestamp(0))
+            COALESCE(m."editedAt", to_timestamp(0)),
+            COALESCE(m."deletedAt", to_timestamp(0))
           ) > ${since}
           OR (
             GREATEST(
               COALESCE(m."revokedAt", to_timestamp(0)),
-              COALESCE(m."editedAt", to_timestamp(0))
+              COALESCE(m."editedAt", to_timestamp(0)),
+              COALESCE(m."deletedAt", to_timestamp(0))
             ) = ${since}
             AND m."id" > ${sinceId}
           )
@@ -3387,7 +3390,7 @@ export class ChatService {
       SELECT DISTINCT ON (m."conversationID")
         m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
         m."clientMessageId", m."replyToID", m."deleted", m."revokedAt", m."revokedBy",
-        m."editedAt", m."createdAt"
+        m."editedAt", m."deletedAt", m."createdAt"
       FROM "ChatMessage" AS m
       JOIN unnest(${conversationIds}::text[], ${cutoffs}::timestamptz[])
         AS w("conversationID", cutoff)
@@ -3595,6 +3598,7 @@ export class ChatService {
       replyToId: row.replyToID,
       revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
       revokedBy: row.revokedBy ?? null,
+      ...(row.deleted ? { deleted: true } : {}),
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       burnDurationSec,
       d: row.clientMessageId,
@@ -4308,6 +4312,7 @@ export class ChatService {
           // 只清 content 等于「烧掉的只是最后一版」。
           data: {
             deleted: true,
+            deletedAt: new Date(),
             content: {},
             contentHistory: [] as Prisma.InputJsonValue,
           },

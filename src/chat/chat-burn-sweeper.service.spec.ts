@@ -71,7 +71,12 @@ describe('ChatBurnSweeperService', () => {
     expect(prisma.chatMessage.updateMany).toHaveBeenCalledWith({
       where: { id: { in: ['m1', 'm2'] } },
       // contentHistory 一起清:只清 content 的话,编辑过的旧正文还完整留在库里。
-      data: { deleted: true, content: {}, contentHistory: [] },
+      data: {
+        deleted: true,
+        deletedAt: expect.any(Date),
+        content: {},
+        contentHistory: [],
+      },
     });
     // 只软删不删对象 = 焚毁只焚了个寂寞。
     expect(media.deleteObjects).toHaveBeenCalledWith([

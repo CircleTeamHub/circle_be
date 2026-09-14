@@ -5545,7 +5545,8 @@ describe('ChatService', () => {
         .map(([strings]) => strings.join('?'))
         .find((sql) => sql.includes('"mutatedAt"'));
       expect(mutationQuery).toBeDefined();
-      expect(mutationQuery).toMatch(/AND m\."deleted" = false/);
+      expect(mutationQuery).toMatch(/m\."deleted" = true OR w\.cutoff IS NULL/);
+      expect(mutationQuery).toMatch(/m\."deletedAt" >=/);
     });
 
     it('stops the cursor at the last returned mutation when truncated', async () => {

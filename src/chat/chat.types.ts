@@ -154,6 +154,8 @@ export interface ChatMessageDto {
   /** 撤回时间(ISO);未撤回为 null。撤回消息仍占 height,content 为空对象。 */
   revokedAt?: string | null;
   revokedBy?: string | null;
+  /** 焚毁墓碑;仅 mutations 增量使用,正文始终为空。 */
+  deleted?: boolean;
   /** 编辑时间(ISO);未编辑缺省。height 不变。 */
   editedAt?: string | null;
   /** 表情回应聚合;无回应缺省。 */
