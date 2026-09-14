@@ -118,3 +118,26 @@ describe('ReplaceSupportAgentsDto', () => {
     });
   });
 });
+
+// revision 是 supportAgentsRevision 算出的 32 位 hex,管理台原样回传。给回传值一个
+// 64 字符上界,整表覆盖接口不再收任意长度的字符串。
+describe('ReplaceSupportAgentsDto.expectedRevision', () => {
+  const revisionErrors = (expectedRevision: string) =>
+    validateSync(
+      plainToInstance(
+        ReplaceSupportAgentsDto,
+        { agents: [], expectedRevision },
+        PIPE_OPTIONS.transformOptions,
+      ),
+      { whitelist: true, forbidNonWhitelisted: true },
+    ).filter((error) => error.property === 'expectedRevision');
+
+  it('rejects a revision longer than 64 chars', () => {
+    expect(revisionErrors('a'.repeat(65)).length).toBeGreaterThan(0);
+  });
+
+  it('still accepts the 32-char revision the admin console echoes back', () => {
+    expect(revisionErrors('0123456789abcdef0123456789abcdef')).toHaveLength(0);
+    expect(revisionErrors('a'.repeat(64))).toHaveLength(0);
+  });
+});
