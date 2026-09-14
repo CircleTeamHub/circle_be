@@ -9,6 +9,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
+import {
+  TEMP_CHAT_HOST_ALIAS,
+  isGuestUserId,
+  toGuestMessageView,
+} from 'src/chat/chat-guest-view';
+import type { ChatHistoryPageDto } from 'src/chat/chat.types';
 import { TempChatStatus } from 'src/generated/prisma';
 import { ChatErrorCode, TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -409,11 +415,43 @@ export class TempChatService {
       this.chatService.listMembers(guest.guestId, guest.conversationId),
     ]);
     return members.map((member) => ({
-      userId: member.userId,
+      // 访客页靠 isHost 认房主；账号成员（只有房主）的 UUID 换成房间内别名，
+      // 与 chat:msg、访客历史的访客视图一致。
+      userId: isGuestUserId(member.userId)
+        ? member.userId
+        : TEMP_CHAT_HOST_ALIAS,
       nickname: member.nickname,
       avatarUrl: member.avatarUrl,
       isHost: member.userId === room?.hostUserId,
     }));
+  }
+
+  /**
+   * 访客历史(冷路径)。与 chat:msg 的访客视图同一口径:账号成员(只有房主)的 id 换成
+   * 房间内别名;d 是发送者本机的幂等键,只有访客自己发的消息保留。
+   */
+  async getGuestHistory(
+    guest: GuestChatTokenPayload,
+    query: { beforeHeight?: number; limit?: number; afterHeight?: number },
+  ): Promise<ChatHistoryPageDto> {
+    const page = await this.chatService.getHistory(
+      guest.guestId,
+      guest.conversationId,
+      query.beforeHeight,
+      query.limit,
+      // afterHeight 是重连增量补拉的游标:访客断线期间的消息靠它追平。
+      { afterHeight: query.afterHeight },
+      // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
+      // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
+      { applyViewerRetention: false },
+    );
+    return {
+      ...page,
+      messages: page.messages.map((message) => ({
+        ...toGuestMessageView(message),
+        d: message.sender?.id === guest.guestId ? message.d : null,
+      })),
+    };
   }
 
   async getGuestNote(

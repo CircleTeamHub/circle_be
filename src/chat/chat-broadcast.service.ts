@@ -31,6 +31,7 @@ import type {
   ChatRevokeBroadcast,
   ChatTypingBroadcast,
 } from './chat.types';
+import { isGuestUserId, toGuestMessageView } from './chat-guest-view';
 
 /**
  * 带发送者幂等键(d)的消息 → 发送者的个人房;编辑广播、系统消息等不带 d 的载荷
@@ -497,29 +498,43 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       select: { userID: true },
     });
     const excluded = new Set(excludeUserIds);
-    const rooms = [
+    const recipients = [
       ...new Set(
         seats
           .map((seat) => seat.userID)
-          .filter((userId) => !excluded.has(userId))
-          .map(userRoom),
+          .filter((userId) => !excluded.has(userId)),
       ),
     ];
-    if (rooms.length === 0) return;
+    if (recipients.length === 0) return;
     const ownerRoom = deliveryIdOwnerRoom(payload);
-    if (!ownerRoom) {
-      server.to(rooms).emit(event, payload);
-      return;
+    // 收件人按两个维度分四组、各发一份载荷(空组不发),顺序固定:
+    // - d 是发送者本机生成的幂等键:只有发送者自己的设备要靠它把乐观气泡换成服务端
+    //   消息(回显先于 ack 到达时就靠它对账)。其他成员拿到它毫无用处 —— 只发给发送者
+    //   的个人房,其余在座成员收 d:null(已装机 App 对他人消息的 null d 按缺省处理,
+    //   本地库与去重都按消息 id 走)。
+    // - 临时房访客收访客视图:账号成员(只有房主)的 id 换成房间内别名,匿名访客拿不到
+    //   房主的账号 UUID(见 chat-guest-view.ts)。
+    const groups: Array<{ rooms: string[]; guest: boolean; own: boolean }> = [
+      { rooms: [], guest: false, own: true },
+      { rooms: [], guest: false, own: false },
+      { rooms: [], guest: true, own: true },
+      { rooms: [], guest: true, own: false },
+    ];
+    for (const userId of recipients) {
+      const room = userRoom(userId);
+      const own = room === ownerRoom;
+      groups[(isGuestUserId(userId) ? 2 : 0) + (own ? 0 : 1)].rooms.push(room);
     }
-    // d 是发送者本机生成的幂等键:只有发送者自己的设备要靠它把乐观气泡换成服务端
-    // 消息(回显先于 ack 到达时就靠它对账)。其他成员拿到它毫无用处 —— 只发给发送者
-    // 的个人房,其余在座成员收 d:null(已装机 App 对他人消息的 null d 按缺省处理,
-    // 本地库与去重都按消息 id 走)。
-    const ownerRooms = rooms.filter((room) => room === ownerRoom);
-    const otherRooms = rooms.filter((room) => room !== ownerRoom);
-    if (ownerRooms.length > 0) server.to(ownerRooms).emit(event, payload);
-    if (otherRooms.length > 0) {
-      server.to(otherRooms).emit(event, { ...payload, d: null });
+    for (const group of groups) {
+      if (group.rooms.length === 0) continue;
+      let shaped = payload;
+      if (ownerRoom && !group.own && 'd' in shaped) {
+        shaped = { ...shaped, d: null };
+      }
+      if (group.guest && 'sender' in shaped) {
+        shaped = toGuestMessageView(shaped);
+      }
+      server.to(group.rooms).emit(event, shaped);
     }
   }
 

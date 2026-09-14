@@ -980,7 +980,12 @@ export class ChatGateway implements OnModuleDestroy {
         ]);
       }
       await socket.join(userRoom(userId));
-      await socket.join(conversationIds.map(conversationRoom));
+      // 访客只进个人房:消息/编辑按在座成员逐个个人房投递,照样送得到;会话房里的
+      // 已读、正在输入、在线状态、表情、撤回广播都带着房主真实 userId,访客页一个都
+      // 不消费,进房只会把房主账号 UUID 与在线规律交给匿名访客。
+      if (!guestConversationId) {
+        await socket.join(conversationIds.map(conversationRoom));
+      }
     } catch (error) {
       // 房间加入失败的连接是"在线但收不到任何推送"的哑连接,直接断开让客户端重连。
       reportOperationalError(error, {

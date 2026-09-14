@@ -900,13 +900,17 @@ describe('ChatGateway', () => {
       expect(metrics.observeConnectionClosed).toHaveBeenCalledTimes(1);
     });
 
-    it('confines a guest socket to its own room and skips the membership lookup', async () => {
+    // 访客只进自己的个人房：消息与编辑按在座成员逐个个人房投递，照样送得到。会话房里
+    // 的已读 / 正在输入 / 在线状态 / 表情 / 撤回广播都带着房主真实 userId，访客页一个
+    // 都不消费，却会把房主账号 UUID 与在线规律交给匿名访客。
+    it('confines a guest socket to its personal room and keeps it out of the conversation room', async () => {
       const socket = fakeSocket({
         data: { userId: 'g1', guestConversationId: 'conv-9' },
       });
       await gateway['handleConnection'](socket as never);
       expect(chatService.listConversationIds).not.toHaveBeenCalled();
-      expect(socket.join).toHaveBeenCalledWith(['c:conv-9']);
+      expect(socket.join).toHaveBeenCalledWith('u:g1');
+      expect(socket.join).not.toHaveBeenCalledWith(['c:conv-9']);
     });
   });
 

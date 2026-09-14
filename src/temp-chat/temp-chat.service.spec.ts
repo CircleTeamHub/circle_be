@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { TempChatService } from './temp-chat.service';
+import { TEMP_CHAT_HOST_ALIAS } from 'src/chat/chat-guest-view';
 
 describe('TempChatService', () => {
   const prisma = {
@@ -51,6 +52,7 @@ describe('TempChatService', () => {
   const chatService = {
     listMembers: jest.fn().mockResolvedValue([]),
     getNoteCardNoteId: jest.fn(),
+    getHistory: jest.fn(),
   };
   const noteService = {
     getSharedNoteForGuest: jest.fn(),
@@ -438,9 +440,11 @@ describe('TempChatService', () => {
   });
 
   describe('listGuestMembers', () => {
+    // 访客 id 的真实形态（temp-chat.ids.ts newGuestId）：g + 32 位 hex。
+    const GUEST_ID = 'g0123456789abcdef0123456789abcdef';
     const guest = {
       kind: 'temp-chat-guest' as const,
-      guestId: 'guest-1',
+      guestId: GUEST_ID,
       tcId: 'tc-1',
       conversationId: 'conv-1',
     };
@@ -449,32 +453,33 @@ describe('TempChatService', () => {
       prisma.tempChat.findUnique.mockResolvedValue({ hostUserId: 'host-1' });
       chatService.listMembers.mockResolvedValue([
         { userId: 'host-1', nickname: '房主', avatarUrl: 'a.png', role: null },
-        { userId: 'guest-1', nickname: '我', avatarUrl: null, role: null },
+        { userId: GUEST_ID, nickname: '我', avatarUrl: null, role: null },
       ]);
 
       const members = await service.listGuestMembers(guest);
 
-      expect(chatService.listMembers).toHaveBeenCalledWith('guest-1', 'conv-1');
+      expect(chatService.listMembers).toHaveBeenCalledWith(GUEST_ID, 'conv-1');
       expect(members).toEqual([
+        // 房主的账号 UUID 不外发给匿名访客，只给房间内别名；isHost 照旧标出。
         {
-          userId: 'host-1',
+          userId: TEMP_CHAT_HOST_ALIAS,
           nickname: '房主',
           avatarUrl: 'a.png',
           isHost: true,
         },
-        { userId: 'guest-1', nickname: '我', avatarUrl: null, isHost: false },
+        { userId: GUEST_ID, nickname: '我', avatarUrl: null, isHost: false },
       ]);
     });
 
     it('still lists members when the room row is gone (nobody flagged host)', async () => {
       prisma.tempChat.findUnique.mockResolvedValue(null);
       chatService.listMembers.mockResolvedValue([
-        { userId: 'guest-1', nickname: '我', avatarUrl: null, role: null },
+        { userId: GUEST_ID, nickname: '我', avatarUrl: null, role: null },
       ]);
 
       const members = await service.listGuestMembers(guest);
       expect(members).toEqual([
-        { userId: 'guest-1', nickname: '我', avatarUrl: null, isHost: false },
+        { userId: GUEST_ID, nickname: '我', avatarUrl: null, isHost: false },
       ]);
     });
 
@@ -485,6 +490,85 @@ describe('TempChatService', () => {
       await expect(service.listGuestMembers(guest)).rejects.toBeInstanceOf(
         ForbiddenException,
       );
+    });
+  });
+
+  describe('getGuestHistory', () => {
+    const GUEST_ID = 'g0123456789abcdef0123456789abcdef';
+    const guest = {
+      kind: 'temp-chat-guest' as const,
+      guestId: GUEST_ID,
+      tcId: 'tc-1',
+      conversationId: 'conv-1',
+    };
+    const base = {
+      conversationId: 'conv-1',
+      type: 'text',
+      content: { text: 'hi' },
+      replyToId: null,
+      revokedAt: null,
+      revokedBy: null,
+      burnDurationSec: null,
+      createdAt: '2026-09-13T00:00:00.000Z',
+    };
+    const hostSender = {
+      id: '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+      nickname: '房主',
+      avatarUrl: null,
+      alias: null,
+    };
+    const ownSender = {
+      id: GUEST_ID,
+      nickname: '我',
+      avatarUrl: null,
+      alias: null,
+    };
+
+    // 与 chat:msg 的访客视图同一口径：房主 id 换成房间内别名；d 只有访客自己发的保留。
+    it('serves the room history with the host id aliased and foreign delivery ids stripped', async () => {
+      const hostMessage = {
+        ...base,
+        id: 'm-1',
+        height: 1,
+        sender: hostSender,
+        d: 'host-delivery-id',
+      };
+      const ownMessage = {
+        ...base,
+        id: 'm-2',
+        height: 2,
+        sender: ownSender,
+        d: 'own-delivery-id',
+      };
+      chatService.getHistory.mockResolvedValue({
+        messages: [hostMessage, ownMessage],
+        nextBeforeHeight: null,
+      });
+
+      const page = await service.getGuestHistory(guest, {
+        beforeHeight: 10,
+        limit: 20,
+      });
+
+      expect(chatService.getHistory).toHaveBeenCalledWith(
+        GUEST_ID,
+        'conv-1',
+        10,
+        20,
+        { afterHeight: undefined },
+        { applyViewerRetention: false },
+      );
+      expect(page).toEqual({
+        messages: [
+          {
+            ...hostMessage,
+            d: null,
+            sender: { ...hostSender, id: TEMP_CHAT_HOST_ALIAS },
+          },
+          ownMessage,
+        ],
+        nextBeforeHeight: null,
+      });
     });
   });
 });

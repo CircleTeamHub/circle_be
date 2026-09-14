@@ -954,3 +954,96 @@ describe('ChatBroadcastService delivery id privacy', () => {
     ]);
   });
 });
+
+// 临时房访客只看到「房主」这个房间内别名，拿不到房主的账号 UUID；房主和其他账号成员
+// 照旧收到真实 id。d 的分流规则不变：只有发送者自己的个人房保留。
+describe('ChatBroadcastService temp-chat guest view', () => {
+  const GUEST_A = `g${'a'.repeat(32)}`;
+  const GUEST_B = `g${'b'.repeat(32)}`;
+
+  function harness(userIDs: string[]) {
+    const emits: Array<{ rooms: unknown; event: string; payload: unknown }> =
+      [];
+    const to = jest.fn((rooms: unknown) => ({
+      emit: (event: string, payload: unknown) => {
+        emits.push({ rooms, event, payload });
+      },
+    }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers(userIDs) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, emits };
+  }
+
+  const hostSender = {
+    id: 'host-1',
+    nickname: '房主',
+    avatarUrl: null,
+    alias: null,
+  };
+  const base = {
+    id: 'message-9',
+    conversationId: 'conv-temp',
+    height: 9,
+    type: 'text',
+    content: { text: 'hi' },
+    replyToId: null,
+    revokedAt: null,
+    revokedBy: null,
+    burnDurationSec: null,
+    createdAt: '2026-09-13T00:00:00.000Z',
+  };
+
+  it('aliases the host id for guest rooms while the host keeps the real payload', async () => {
+    const hostMessage = { ...base, sender: hostSender, d: 'host-delivery-id' };
+    const { service, emits } = harness(['host-1', GUEST_A, GUEST_B]);
+
+    await service.emitMessage(hostMessage as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:host-1'], event: 'chat:msg', payload: hostMessage },
+      {
+        rooms: [`u:${GUEST_A}`, `u:${GUEST_B}`],
+        event: 'chat:msg',
+        payload: {
+          ...hostMessage,
+          d: null,
+          sender: { ...hostSender, id: 'host' },
+        },
+      },
+    ]);
+  });
+
+  it("keeps a guest's own delivery id and strips it for everyone else", async () => {
+    const guestSender = {
+      id: GUEST_A,
+      nickname: '访客A',
+      avatarUrl: null,
+      alias: null,
+    };
+    const guestMessage = {
+      ...base,
+      sender: guestSender,
+      d: 'guest-delivery-id',
+    };
+    const { service, emits } = harness(['host-1', GUEST_A, GUEST_B]);
+
+    await service.emitMessage(guestMessage as never);
+
+    expect(emits).toEqual([
+      {
+        rooms: ['u:host-1'],
+        event: 'chat:msg',
+        payload: { ...guestMessage, d: null },
+      },
+      { rooms: [`u:${GUEST_A}`], event: 'chat:msg', payload: guestMessage },
+      {
+        rooms: [`u:${GUEST_B}`],
+        event: 'chat:msg',
+        payload: { ...guestMessage, d: null },
+      },
+    ]);
+  });
+});
