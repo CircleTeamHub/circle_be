@@ -4325,7 +4325,11 @@ export class ChatService {
       const dto = await this.systemMessage.insertSystemMessageInTx(
         tx,
         conversationId,
-        { kind: 'burn-changed', seconds: normalized ?? 0 },
+        {
+          kind: 'burn-changed',
+          seconds: normalized ?? 0,
+          burnStartedAt: nextStartedAt?.toISOString() ?? null,
+        },
       );
       return { updated: row, notice: dto };
     });

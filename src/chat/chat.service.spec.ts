@@ -3793,7 +3793,11 @@ describe('ChatService', () => {
       expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
         expect.anything(),
         'conv-1',
-        { kind: 'burn-changed', seconds: 3600 },
+        {
+          kind: 'burn-changed',
+          seconds: 3600,
+          burnStartedAt: expect.any(String),
+        },
       );
       // 广播在提交之后,否则事务回滚了客户端却已经收到那条提示。
       expect(systemMessage.broadcastSystemMessage).toHaveBeenCalled();
@@ -3829,6 +3833,15 @@ describe('ChatService', () => {
         where: { id: 'conv-1' },
         data: { burnDurationSec: 60, burnStartedAt },
       });
+      expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
+        expect.anything(),
+        'conv-1',
+        {
+          kind: 'burn-changed',
+          seconds: 60,
+          burnStartedAt: burnStartedAt.toISOString(),
+        },
+      );
     });
 
     it('returns the committed burn setting when post-commit audit delivery fails', async () => {
@@ -3905,7 +3918,7 @@ describe('ChatService', () => {
       expect(systemMessage.insertSystemMessageInTx).toHaveBeenCalledWith(
         expect.anything(),
         'conv-1',
-        { kind: 'burn-changed', seconds: 0 },
+        { kind: 'burn-changed', seconds: 0, burnStartedAt: null },
       );
     });
 
