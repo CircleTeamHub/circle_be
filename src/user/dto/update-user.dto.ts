@@ -2,7 +2,6 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsDateString,
-  IsEmail,
   IsEnum,
   IsOptional,
   IsString,
@@ -41,11 +40,6 @@ export class UpdateUserDto {
   @IsOptional()
   @IsUrl(URL_VALIDATION_OPTIONS)
   cover?: string;
-
-  @ApiPropertyOptional({ example: 'user@example.com' })
-  @IsOptional()
-  @IsEmail()
-  email?: string;
 
   @ApiPropertyOptional({ example: '+8613800138000' })
   @IsOptional()

@@ -22,6 +22,7 @@ import {
   CHAT_EVENTS,
   CHAT_RATE_LIMITS,
   CHAT_WS_PATH,
+  GUEST_CLIENT_MESSAGE_TYPES,
   TEMP_CHAT_GUEST_TOKEN_KIND,
   conversationRoom,
   userRoom,
@@ -89,6 +90,7 @@ type EngineConnectionError = {
 };
 
 const CONNECTION_TRACE_HEADER = 'x-connection-trace-id';
+const GUEST_CLIENT_TYPE_SET = new Set<string>(GUEST_CLIENT_MESSAGE_TYPES);
 const SAFE_CONNECTION_TRACE_ID = /^ws-[a-z0-9-]{8,96}$/i;
 const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'missing_token',
@@ -1188,6 +1190,19 @@ export class ChatGateway implements OnModuleDestroy {
         reply(this.ackError(ChatErrorCode.RateLimited, '发送太频繁'));
         return;
       }
+      // 访客只能发 text/image/video:卡片类是指针,一张自铸的 note-card 就能顺着
+      // guest/messages/:id/note 读任意笔记。按 socket 身份收口,不靠 service 的
+      // 通用类型白名单(它对所有发送者一视同仁)。
+      if (
+        typeof socket.data.guestConversationId === 'string' &&
+        !GUEST_CLIENT_TYPE_SET.has(payload?.type)
+      ) {
+        this.metrics.observeEvent('send', 'failure');
+        reply(
+          this.ackError(ChatErrorCode.InvalidPayload, '访客不能发送该类型消息'),
+        );
+        return;
+      }
       const result = await this.chatService.sendMessage(userId, payload);
       this.metrics.observeEvent('send', 'success');
       reply({
@@ -1261,6 +1276,13 @@ export class ChatGateway implements OnModuleDestroy {
       }
       const conversationId = payload?.conversationId;
       const height = Number(payload?.height);
+      // 与 revoke/reaction/delivered 同款前置校验:非字符串原样进 Prisma 会变成
+      // PrismaClientValidationError → 500 分支 + 每条事件一次 Sentry 上报。
+      if (typeof conversationId !== 'string' || conversationId.length === 0) {
+        this.metrics.observeEvent('read', 'failure');
+        reply(this.ackError(ChatErrorCode.InvalidPayload));
+        return;
+      }
       const result = await this.chatService.markRead(
         userId,
         conversationId,

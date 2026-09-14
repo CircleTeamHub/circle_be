@@ -207,13 +207,20 @@ export class SelfUserDto extends PublicUserDto {
 }
 
 /**
- * Profile detail view for GET /user/:id. `phoneNumber` is included only after
- * UserService applies the target user's privacy setting.
+ * Profile detail view for GET /user/:id. `phoneNumber` and `email` are
+ * included only after UserService applies the target user's privacy settings
+ * (showPhone / showEmail, both opt-in and off by default) — they are nulled
+ * for viewers the target has not permitted. Not on PublicUserDto: the account
+ * search endpoint must stay contact-free.
  */
 export class ProfileUserDto extends PublicUserDto {
   @ApiPropertyOptional({ example: '+8613800138000' })
   @Expose()
   phoneNumber: string | null;
+
+  @ApiPropertyOptional({ example: 'user@example.com', nullable: true })
+  @Expose()
+  email: string | null;
 
   @ApiProperty({ example: 12, description: '收到的累计点赞总数' })
   @Expose()

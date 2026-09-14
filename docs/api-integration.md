@@ -237,29 +237,6 @@ DELETE /api/v1/user/:id
 
 ---
 
-### 管理员接口（需要 ADMIN 角色）
-
-**获取用户列表**
-```
-GET /api/v1/user?page=1&limit=10&username=test
-Authorization: Bearer <admin_token>
-```
-
-**创建用户**
-```
-POST /api/v1/user
-Authorization: Bearer <admin_token>
-Content-Type: application/json
-
-{
-  "username": "newuser",
-  "password": "password123",
-  "nickname": "New User"
-}
-```
-
----
-
 ## Admin 用户管理 `/api/v1/admin/users`
 
 > 所有接口都要求 `Authorization: Bearer <admin_access_token>`。Token 必须由

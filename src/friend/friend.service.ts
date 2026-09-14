@@ -6,6 +6,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { FriendErrorCode } from 'src/common/app-error-codes';
 import {
   CircleMemberStatus,
@@ -15,6 +16,10 @@ import {
   NotificationType,
 } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import {
+  assertUrlsFromStorage,
+  storagePublicObjectBasesFromConfig,
+} from 'src/utils/storage-url';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { NotificationService } from 'src/notification/notification.service';
 import { createLoggingConfig } from 'src/logging/logging.config';
@@ -149,10 +154,14 @@ function latestFriendRecordsByCounterparty<T extends FriendListRecord>(
   );
 }
 
+// 只有 http(s) 项才需要钉源；对象 key（reports/xxx.png）不是 URL，原样放行。
+const isHttpUrl = (value: string): boolean => /^https?:\/\//i.test(value);
+
 @Injectable()
 export class FriendService {
   private readonly logger = new Logger(FriendService.name);
   private readonly loggingConfig = createLoggingConfig();
+  private readonly storagePublicObjectBases: readonly string[];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -160,7 +169,12 @@ export class FriendService {
     private readonly notificationService: NotificationService,
     private readonly privacySettings: PrivacySettingsService,
     private readonly avatarFrames: AvatarFrameService,
-  ) {}
+    private readonly config: ConfigService,
+  ) {
+    this.storagePublicObjectBases = storagePublicObjectBasesFromConfig(
+      this.config,
+    );
+  }
 
   // ─── Send request ────────────────────────────────────────────────────────────
 
@@ -799,6 +813,14 @@ export class FriendService {
         errorCode: FriendErrorCode.ReportDuplicate,
       });
     }
+
+    // 举报证据会在管理后台按链接渲染：外链等于塞给审核员的钓鱼/追踪入口，
+    // http(s) 项必须钉在本站存储；对象 key 原样放行。
+    assertUrlsFromStorage(
+      (dto.evidence ?? []).filter(isHttpUrl),
+      this.storagePublicObjectBases,
+      'evidence',
+    );
 
     // Reports no longer deduct credit on submission — they are queued as
     // PENDING and only affect the target's credit once an admin approves them

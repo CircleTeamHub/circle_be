@@ -3070,11 +3070,14 @@ export class ChatService {
   /**
    * 访客打开笔记卡片前的授权解析：必须仍在本会话座位上，消息必须属于本会话、
    * 未删除/未撤回且确实是 note-card。只返回指针，不在聊天层读取笔记正文。
+   * requiredSenderId 是纵深防御：临时房只认房主发出的卡片，访客（哪怕绕过了
+   * 网关的类型闸门）自己铸的 note-card 解析不出任何笔记。
    */
   async getNoteCardNoteId(
     userId: string,
     conversationId: string,
     messageId: string,
+    requiredSenderId?: string,
   ): Promise<string> {
     await this.requireMembership(conversationId, userId);
     const row = await this.prisma.chatMessage.findFirst({
@@ -3084,6 +3087,7 @@ export class ChatService {
         type: 'note-card',
         deleted: false,
         revokedAt: null,
+        ...(requiredSenderId ? { senderID: requiredSenderId } : {}),
       },
       select: { content: true },
     });

@@ -1249,6 +1249,89 @@ describe('ChatGateway', () => {
         gateway['handleSend'](fakeSocket() as never, 'u1', payload as never),
       ).resolves.toBeUndefined();
     });
+
+    // 访客页只会产出 text/image/video。卡片类消息是指针:一条伪造的 note-card
+    // 会让访客经 GET /temp-chat/guest/messages/:id/note 读到任意 available 笔记。
+    // 类型闸门必须在网关按 socket 身份收口,不能指望 validateSendPayload。
+    describe('temp-chat guest sockets', () => {
+      const guestSocket = () =>
+        fakeSocket({
+          data: { userId: 'guest-send-1', guestConversationId: 'conv-9' },
+        });
+
+      it('rejects a card type from a guest before it reaches the service', async () => {
+        const ack = jest.fn();
+        await gateway['handleSend'](
+          guestSocket() as never,
+          'guest-send-1',
+          {
+            conversationId: 'conv-9',
+            type: 'note-card',
+            content: { noteId: 'note-1' },
+            d: 'd1',
+          } as never,
+          ack,
+        );
+        expect(ack).toHaveBeenCalledWith(
+          expect.objectContaining({
+            ok: false,
+            code: ChatErrorCode.InvalidPayload,
+          }),
+        );
+        expect(chatService.sendMessage).not.toHaveBeenCalled();
+      });
+
+      it('still lets a guest send plain text', async () => {
+        chatService.sendMessage.mockResolvedValue({
+          reused: false,
+          message: {
+            id: 'msg-g',
+            conversationId: 'conv-9',
+            height: 1,
+            d: 'd1',
+          },
+        });
+        const ack = jest.fn();
+        await gateway['handleSend'](
+          guestSocket() as never,
+          'guest-send-1',
+          { ...payload, conversationId: 'conv-9' } as never,
+          ack,
+        );
+        expect(chatService.sendMessage).toHaveBeenCalledTimes(1);
+        expect(ack).toHaveBeenCalledWith(
+          expect.objectContaining({ ok: true, messageId: 'msg-g' }),
+        );
+      });
+
+      it('does not narrow the type list for an app member', async () => {
+        chatService.sendMessage.mockResolvedValue({
+          reused: false,
+          message: {
+            id: 'msg-m',
+            conversationId: 'conv-1',
+            height: 1,
+            d: 'd1',
+          },
+        });
+        const ack = jest.fn();
+        await gateway['handleSend'](
+          fakeSocket({ data: { userId: 'member-send-1' } }) as never,
+          'member-send-1',
+          {
+            conversationId: 'conv-1',
+            type: 'note-card',
+            content: { noteId: 'note-1' },
+            d: 'd1',
+          } as never,
+          ack,
+        );
+        expect(chatService.sendMessage).toHaveBeenCalledTimes(1);
+        expect(ack).toHaveBeenCalledWith(
+          expect.objectContaining({ ok: true, messageId: 'msg-m' }),
+        );
+      });
+    });
   });
 
   describe('handleEdit', () => {
@@ -1320,6 +1403,26 @@ describe('ChatGateway', () => {
         jest.fn(),
       );
       expect(broadcast.emitRead).not.toHaveBeenCalled();
+    });
+
+    // 其他带 ack 的处理器都先做 typeof 校验;read 把 payload.conversationId 原样
+    // 塞进 Prisma,一个数字就换来 PrismaClientValidationError → 500 分支 + 每条
+    // 事件一次 Sentry 上报。
+    it('acks InvalidPayload for a non-string conversationId without touching the service', async () => {
+      const ack = jest.fn();
+      await gateway['handleRead'](
+        fakeSocket() as never,
+        'u-read-bad',
+        { conversationId: 123, height: 1 } as never,
+        ack,
+      );
+      expect(ack).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ok: false,
+          code: ChatErrorCode.InvalidPayload,
+        }),
+      );
+      expect(chatService.markRead).not.toHaveBeenCalled();
     });
   });
 

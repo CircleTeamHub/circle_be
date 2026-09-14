@@ -5,6 +5,7 @@ import {
   GoneException,
   Injectable,
   Logger,
+  NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
@@ -382,10 +383,24 @@ export class TempChatService {
     guest: GuestChatTokenPayload,
     messageId: string,
   ): Promise<NoteDetailDto> {
+    // 只认房主发出的卡片:访客自己铸的 note-card 不能成为读任意笔记的入口。
+    // 房间行没了就没有房主可比对 —— fail closed,与守卫的「链接无效」同口径,
+    // 不能退化成「不限发送者」。
+    const room = await this.prisma.tempChat.findUnique({
+      where: { id: guest.tcId },
+      select: { hostUserId: true },
+    });
+    if (!room) {
+      throw new NotFoundException({
+        message: '链接无效',
+        errorCode: TempChatErrorCode.LinkInvalid,
+      });
+    }
     const noteId = await this.chatService.getNoteCardNoteId(
       guest.guestId,
       guest.conversationId,
       messageId,
+      room.hostUserId,
     );
     return this.noteService.getSharedNoteForGuest(noteId);
   }

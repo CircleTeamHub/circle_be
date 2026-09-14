@@ -3,7 +3,7 @@ import { PrismaExceptionFilter } from './filters/prisma-exception.filter';
 import { ResponseInterceptor } from './interceptors/response.interceptor';
 import { ErrorLoggingInterceptor } from './interceptors/error-logging.interceptor';
 import { RedisService } from './redis/redis.service';
-import { setupApp } from './setup';
+import { createWriteMethodLimiterMount, setupApp } from './setup';
 import { redisMetrics } from './redis/redis.metrics';
 import { uploadMetrics } from './metrics/upload-metrics';
 import { chatMetrics } from './chat/chat-metrics';
@@ -336,5 +336,47 @@ describe('setupApp', () => {
     expect(express.set).toHaveBeenCalledWith('trust proxy', 1);
     if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = originalNodeEnv;
+  });
+});
+
+// note 的 express 限流曾是不分方法的前缀挂载：60 次/15 分钟/IP 的「写」配额把
+// GET 详情/列表也算进去，运营商 NAT 后的一群用户翻 60 次笔记就集体 429。
+describe('createWriteMethodLimiterMount', () => {
+  it('passes reads straight through and sends writes to the limiter', () => {
+    const limiter = jest.fn();
+    const mount = createWriteMethodLimiterMount(limiter as any);
+    const res = {} as any;
+
+    for (const method of ['GET', 'HEAD', 'OPTIONS']) {
+      const next = jest.fn();
+      mount({ method } as any, res, next);
+      expect(limiter).not.toHaveBeenCalled();
+      expect(next).toHaveBeenCalledTimes(1);
+    }
+
+    for (const method of ['POST', 'PATCH', 'PUT', 'DELETE']) {
+      limiter.mockClear();
+      const next = jest.fn();
+      const req = { method } as any;
+      mount(req, res, next);
+      expect(limiter).toHaveBeenCalledWith(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('setupApp note limiter mount', () => {
+  it('mounts /api/v1/note behind a method filter so GET reads are not throttled as writes', () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const noteMounts = app.use.mock.calls.filter(
+      ([path]) => path === '/api/v1/note',
+    );
+    expect(noteMounts).toHaveLength(1);
+    const next = jest.fn();
+    // 读请求必须同步放行：limiter 一旦被调用就会走异步 store，next 不会同步触发。
+    noteMounts[0][1]({ method: 'GET', path: '/abc' }, {}, next);
+    expect(next).toHaveBeenCalledTimes(1);
   });
 });

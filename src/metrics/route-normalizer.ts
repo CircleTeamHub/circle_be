@@ -85,7 +85,6 @@ export const STATIC_ROUTES = new Set([
   '/api/v1/trace/feed',
   '/api/v1/trace/feed/new-count',
   '/api/v1/upload/presign',
-  '/api/v1/user',
   '/api/v1/user/search/account',
 ]);
 export const DYNAMIC_ROUTE_TEMPLATES = [

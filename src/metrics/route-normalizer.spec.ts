@@ -174,6 +174,19 @@ describe('createRouteCardinalityLimiter', () => {
     expect(limit('/api/v1/circle/:id')).toBe('/api/v1/circle/:id');
   });
 
+  it('treats the removed admin GET/POST /user route as unknown', () => {
+    // GET/POST /api/v1/user were deleted (the admin console only uses
+    // /admin/users), so a stray hit must count against the unknown-route
+    // budget like any other 404 instead of keeping a permanent label.
+    expect(STATIC_ROUTES.has('/api/v1/user')).toBe(false);
+    expect(createRouteCardinalityLimiter(0)('/api/v1/user')).toBe(OTHER_ROUTE);
+    // The surviving sibling routes stay recognized.
+    expect(STATIC_ROUTES.has('/api/v1/user/search/account')).toBe(true);
+    expect(
+      normalizeRoute('/api/v1/user/3fa85f64-5717-4562-b3fc-2c963f66afa6'),
+    ).toBe('/api/v1/user/:id');
+  });
+
   it('admits unknown routes up to the budget, then buckets the rest', () => {
     const limit = createRouteCardinalityLimiter(2);
     expect(limit('/api/v1/unknown-a')).toBe('/api/v1/unknown-a');

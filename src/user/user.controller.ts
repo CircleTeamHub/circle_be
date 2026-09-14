@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Controller,
   Delete,
   Get,
@@ -19,20 +20,15 @@ import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { UserErrorCode } from 'src/common/app-error-codes';
 import {
   ApiBearerAuth,
-  ApiBody,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
-  ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { UserService } from './user.service';
-import { GetUserDto } from './dto/get-user.dto';
-import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { VipLevelsDto } from './dto/vip-levels.dto';
 import { AppearancesDto } from './dto/appearances.dto';
 import type { PublicUserAppearance } from 'src/avatar-frame/avatar-frame.service';
-import { AdminGuard } from 'src/guards/admin.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { Serialize } from 'src/decorators/serialize.decorator';
 import {
@@ -43,6 +39,11 @@ import {
 import { Role } from 'src/enum/roles.enum';
 import type { RequestWithUser } from 'src/auth/types';
 
+// accountId 走裸 @Query()，重复参数（?accountId=a&accountId=b）会以 string[] 到达，
+// service 里的 .trim() 直接 TypeError → 500 + Sentry 噪音。真实账号最长 32 位
+// （ACCOUNT_ID_PATTERN），64 已留足余量，再长的只可能是探测/误用，直接 400。
+const ACCOUNT_ID_QUERY_MAX_LENGTH = 64;
+
 @Controller('user')
 @UseGuards(JwtGuard)
 @ApiTags('User')
@@ -50,16 +51,9 @@ import type { RequestWithUser } from 'src/auth/types';
 export class UserController {
   constructor(private userService: UserService) {}
 
-  @Get()
-  @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'List users with pagination (admin only)' })
-  @ApiOkResponse({ description: 'Paginated user list' })
-  @ApiUnauthorizedResponse({
-    description: 'Missing token or insufficient permissions',
-  })
-  getUsers(@Query() query: GetUserDto) {
-    return this.userService.findAll(query);
-  }
+  // GET /user（分页列表）与 POST /user（建号）已删除：管理台只用 /admin/users。
+  // 旧列表把每个用户的邮箱/手机/微信/QQ/生日明文交给任何 role=ADMIN 的 token，
+  // 不经隐私开关也不写 AdminAuditLog，留着就是一条绕过脱敏与审计的后门。
 
   @Get('search/account')
   @Serialize(PublicUserDto)
@@ -71,21 +65,15 @@ export class UserController {
     @Query('accountId') accountId: string,
     @Req() req: RequestWithUser,
   ) {
+    if (
+      typeof accountId !== 'string' ||
+      accountId.length > ACCOUNT_ID_QUERY_MAX_LENGTH
+    ) {
+      throw new BadRequestException(
+        `accountId must be a single string of at most ${ACCOUNT_ID_QUERY_MAX_LENGTH} characters`,
+      );
+    }
     return this.userService.findByExactAccountId(accountId, req.user.userId);
-  }
-
-  @Post()
-  @UseGuards(AdminGuard)
-  @Serialize(PublicUserDto)
-  @ApiOperation({ summary: 'Create a user (admin only)' })
-  @ApiBody({ type: CreateUserDto })
-  @ApiOkResponse({ description: 'Created user', type: PublicUserDto })
-  addUser(@Body() dto: CreateUserDto) {
-    return this.userService.create({
-      accountId: dto.accountId,
-      password: dto.password,
-      nickname: dto.nickname,
-    });
   }
 
   @Post('vip-levels')
@@ -167,14 +155,16 @@ export class UserController {
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Serialize(SelfUserDto)
-  @ApiOperation({ summary: 'Update a user (self or admin)' })
+  @ApiOperation({ summary: 'Update a user (self only)' })
   @ApiOkResponse({ description: 'Updated user', type: SelfUserDto })
   updateUser(
     @Body() dto: UpdateUserDto,
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
   ) {
-    if (id !== req.user?.userId && req.user?.role !== Role.Admin) {
+    // 只能改自己：此前 role=ADMIN 的 token（不分 audience）能改任何人的资料，
+    // 且不写 AdminAuditLog —— #121 已因同样的理由删掉同级的 admin status 路由。
+    if (id !== req.user?.userId) {
       throw new ForbiddenException({
         message: 'You can only update your own profile',
         errorCode: UserErrorCode.UpdateOwnOnly,

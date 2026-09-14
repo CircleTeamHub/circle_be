@@ -1,4 +1,11 @@
-import { IsArray, IsEnum, IsString, ArrayMaxSize } from 'class-validator';
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsEnum,
+  IsOptional,
+  IsString,
+  MaxLength,
+} from 'class-validator';
 import { CallType } from 'src/generated/prisma';
 
 export class CreateGroupCallDto {
@@ -24,6 +31,12 @@ export class CreateDirectCallDto {
 }
 
 export class LeaveCallDto {
+  /**
+   * 客户端的挂断原因标签(App 发 'NORMAL'),服务端从不读它。
+   * 类型标注就是可选的,缺了 @IsOptional 时空 body 会被拒成 400,通话挂不断。
+   */
+  @IsOptional()
   @IsString()
+  @MaxLength(32)
   reason?: string;
 }

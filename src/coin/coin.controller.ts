@@ -23,6 +23,9 @@ import type { RequestWithUser } from 'src/auth/types';
 import { CoinService } from './coin.service';
 import { CoinTransactionDto, SendGiftDto, WalletDto } from './dto/coin.dto';
 
+// 与 fancy-number / group-expansion 的 requireIdempotencyKey 同上限。
+const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+
 @ApiTags('Coin')
 @ApiBearerAuth()
 @UseGuards(JwtGuard)
@@ -59,14 +62,21 @@ export class CoinController {
     @Headers('idempotency-key') idempotencyKey: string,
     @Req() req: RequestWithUser,
   ): Promise<void> {
-    if (!idempotencyKey || idempotencyKey.trim().length === 0) {
+    const key = idempotencyKey?.trim() ?? '';
+    if (key.length === 0) {
       throw new BadRequestException('idempotency-key header is required');
+    }
+    // 键直接落库当唯一索引；不封顶等于让客户端决定索引行宽。与 fancy-number 同上限。
+    if (key.length > IDEMPOTENCY_KEY_MAX_LENGTH) {
+      throw new BadRequestException(
+        `idempotency-key header must be at most ${IDEMPOTENCY_KEY_MAX_LENGTH} characters`,
+      );
     }
     return this.coinService.sendGift(
       req.user.userId,
       dto.recipientId,
       dto.amount,
-      idempotencyKey.trim(),
+      key,
       dto.message,
     );
   }

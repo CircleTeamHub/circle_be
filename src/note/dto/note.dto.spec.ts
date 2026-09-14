@@ -4,6 +4,7 @@ import { validateSync } from 'class-validator';
 import {
   CreateNoteDto,
   CreateNoteGroupDto,
+  CreateNoteMediaDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
   NOTE_REMARK_MAX_LENGTH,
@@ -340,4 +341,30 @@ describe('ListNoteShareLinksQueryDto', () => {
 
     expect(errors.some((error) => error.property === 'limit')).toBe(true);
   });
+});
+
+describe('CreateNoteMediaDto integer fields stay within Postgres int4', () => {
+  // NoteMedia.size/width/height/durationMs/sortOrder 都是 Int 列：超过 2^31-1 的值
+  // 会穿过 DTO 直达 Prisma，写入时抛未映射错误 → 500，而不是 400。
+  const INT4_MAX = 2_147_483_647;
+  const errorFor = (property: string, value: number) =>
+    validateSync(
+      plainToInstance(CreateNoteMediaDto, {
+        type: 'IMAGE',
+        objectKey: 'notes/user-1/1.jpg',
+        url: 'https://cdn.example.com/1.jpg',
+        sortOrder: 0,
+        [property]: value,
+      }),
+    ).find((error) => error.property === property);
+
+  it.each(['size', 'width', 'height', 'durationMs', 'sortOrder'])(
+    'rejects %s above int4 max and accepts the max itself',
+    (property) => {
+      expect(errorFor(property, INT4_MAX + 1)).toHaveProperty(
+        'constraints.max',
+      );
+      expect(errorFor(property, INT4_MAX)).toBeUndefined();
+    },
+  );
 });

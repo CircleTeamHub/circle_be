@@ -535,6 +535,21 @@ export class AuthService {
       });
     }
 
+    // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
+    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而 /roles 等
+    // JwtGuard+RoleGuard 端点会接受它，等于绕开短 TTL/审计的管理会话模型。像
+    // adminRefresh 一样撤销全部会话；文案与普通登录失败一致（不泄露该账号是管理员）。
+    if (user.role === 'ADMIN') {
+      this.logger.warn(
+        `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
+      );
+      await this.refreshTokenService.revokeAll(user.id);
+      throw new ForbiddenException({
+        message: '邮箱、用户ID或密码错误',
+        errorCode: AuthErrorCode.InvalidCredentials,
+      });
+    }
+
     // Fire-and-forget: lastOnline is best-effort and must never block token issuance.
     this.prisma.user
       .update({ where: { id: user.id }, data: { lastOnline: new Date() } })

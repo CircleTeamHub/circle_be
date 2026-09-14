@@ -41,6 +41,10 @@ export type NoteMediaType = (typeof NOTE_MEDIA_TYPE)[number];
 export const NOTE_EXPORT_FORMAT = ['IMAGE', 'PDF', 'IMAGES', 'VIDEOS'] as const;
 export type NoteExportFormat = (typeof NOTE_EXPORT_FORMAT)[number];
 
+// Postgres int4 上限。NoteMedia 的 size/width/height/durationMs/sortOrder 都是 Int 列，
+// 只有 @Min 时 2^31 及以上的值会穿过 DTO 直达 Prisma，写入时抛未映射错误 → 500。
+const INT4_MAX = 2_147_483_647;
+
 @ValidatorConstraint({ name: 'uniqueMediaSortOrder', async: false })
 class UniqueMediaSortOrderConstraint implements ValidatorConstraintInterface {
   validate(value: CreateNoteMediaDto[] | undefined) {
@@ -83,24 +87,28 @@ export class CreateNoteMediaDto {
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(INT4_MAX)
   size?: number;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(INT4_MAX)
   width?: number;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(INT4_MAX)
   height?: number;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(INT4_MAX)
   durationMs?: number;
 
   @ApiPropertyOptional()
@@ -111,6 +119,7 @@ export class CreateNoteMediaDto {
   @ApiProperty()
   @IsInt()
   @Min(0)
+  @Max(INT4_MAX)
   sortOrder: number;
 }
 

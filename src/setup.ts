@@ -193,6 +193,31 @@ const groupReportLimiterOptions = {
   message: { message: 'Too many reports submitted, please try again later.' },
 } satisfies Partial<RateLimitOptions>;
 
+const WRITE_METHODS: ReadonlySet<string> = new Set([
+  'POST',
+  'PATCH',
+  'PUT',
+  'DELETE',
+]);
+
+/**
+ * 只把写方法交给限流器，读方法直接放行。
+ *
+ * express 的 `app.use(prefix, limiter)` 是不分方法的前缀挂载：note 的「写」配额
+ * （60 次/15 分钟/IP）曾把 GET 详情/列表也算进去，运营商 NAT 后的一群用户翻 60 次
+ * 笔记就集体 429。读请求同步 next()，不会碰限流器的异步 store。
+ */
+export function createWriteMethodLimiterMount(
+  limiter: (req: any, res: any, next: any) => unknown,
+) {
+  return (req: any, res: any, next: any) => {
+    if (WRITE_METHODS.has(req.method)) {
+      return limiter(req, res, next);
+    }
+    return next();
+  };
+}
+
 /**
  * Account lookup limiter. Without this, any authenticated user can probe the
  * /user/search/account endpoint to enumerate accountIds at the global 300/min
@@ -477,7 +502,7 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   // 路径一起删了（卡片改由 CoinService 结算后服务端签发），前缀挂载不会再
   // 误把回执算进 20/15min 配额里。
   app.use('/api/v1/coin/gift', coinGiftLimiter);
-  app.use('/api/v1/note', noteWriteLimiter);
+  app.use('/api/v1/note', createWriteMethodLimiterMount(noteWriteLimiter));
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
     if (req.method === 'POST' || req.method === 'DELETE') {
       return circleWriteLimiter(req, res, next);

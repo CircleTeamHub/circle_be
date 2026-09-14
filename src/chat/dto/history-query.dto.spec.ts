@@ -38,3 +38,36 @@ describe('HistoryQueryDto types filter', () => {
     expect(HISTORY_FILTER_MESSAGE_TYPES).toContain(SYSTEM_MESSAGE_TYPE);
   });
 });
+
+async function validateQuery(input: Record<string, unknown>) {
+  return validate(plainToInstance(HistoryQueryDto, input));
+}
+
+describe('HistoryQueryDto bounds', () => {
+  // height 落库是 int4。没有上界时 2^31 会穿过 @IsInt 直达 Prisma,变成一个
+  // 未映射的引擎错误 → 500;这个 DTO 同时给 GET /temp-chat/guest/messages 用,
+  // 一个访客 token 就够触发。
+  it('rejects a beforeHeight above the int4 range', async () => {
+    const errors = await validateQuery({ beforeHeight: 2_147_483_648 });
+    expect(errors.some((e) => e.property === 'beforeHeight')).toBe(true);
+  });
+
+  it('accepts the int4 maximum as beforeHeight', async () => {
+    expect(await validateQuery({ beforeHeight: 2_147_483_647 })).toHaveLength(
+      0,
+    );
+  });
+
+  it('rejects an afterHeight above the int4 range', async () => {
+    const errors = await validateQuery({ afterHeight: 2_147_483_648 });
+    expect(errors.some((e) => e.property === 'afterHeight')).toBe(true);
+  });
+
+  it('caps the types filter list', async () => {
+    expect(await validateQuery({ types: Array(32).fill('text') })).toHaveLength(
+      0,
+    );
+    const errors = await validateQuery({ types: Array(33).fill('text') });
+    expect(errors.some((e) => e.property === 'types')).toBe(true);
+  });
+});

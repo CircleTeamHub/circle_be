@@ -80,6 +80,14 @@ export const CLIENT_MESSAGE_TYPES = [
   'qr-card',
 ] as const;
 
+/**
+ * 临时房访客能发的子集。访客页只产出 text/image/video;卡片类消息是「指针」,
+ * 而访客读笔记的入口(GET /temp-chat/guest/messages/:id/note)正是顺着卡片里的
+ * noteId 走的 —— 让访客自己铸一张 note-card,就等于让他读任意一篇 available 笔记。
+ * 网关按 socket 身份(guestConversationId)收口,不依赖 validateSendPayload。
+ */
+export const GUEST_CLIENT_MESSAGE_TYPES = ['text', 'image', 'video'] as const;
+
 export const SYSTEM_MESSAGE_TYPE = 'system';
 
 /**

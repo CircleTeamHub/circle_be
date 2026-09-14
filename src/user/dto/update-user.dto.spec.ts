@@ -6,6 +6,15 @@ function build(payload: Record<string, unknown>) {
   return validateSync(plainToInstance(UpdateUserDto, payload));
 }
 
+// Mirrors the global ValidationPipe options (src/setup.ts): unknown properties
+// are rejected, not silently stripped.
+function buildStrict(payload: Record<string, unknown>) {
+  return validateSync(plainToInstance(UpdateUserDto, payload), {
+    whitelist: true,
+    forbidNonWhitelisted: true,
+  });
+}
+
 describe('UpdateUserDto', () => {
   it('accepts local development asset URLs for avatar fields', () => {
     const errors = build({
@@ -53,10 +62,16 @@ describe('UpdateUserDto', () => {
     expect(dto.nickname).toBe('Jim');
   });
 
-  it('rejects malformed email', () => {
-    const errors = build({ email: 'not-an-email' });
+  // email 是登录身份而非资料字段：能改邮箱就能走找回密码接管账号。
+  // 前端资料编辑本来就不发它；服务端必须把它当成未知属性拒绝。
+  it('rejects email as a non-whitelisted property under the global pipe options', () => {
+    const errors = buildStrict({ email: 'a@b.co' });
     const target = errors.find((e) => e.property === 'email');
-    expect(target?.constraints).toHaveProperty('isEmail');
+    expect(target?.constraints).toHaveProperty('whitelistValidation');
+  });
+
+  it('still accepts whitelisted profile fields under the strict pipe options', () => {
+    expect(buildStrict({ nickname: 'ok' })).toHaveLength(0);
   });
 
   it('rejects malformed birthday string', () => {

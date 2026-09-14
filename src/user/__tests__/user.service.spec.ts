@@ -1,11 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import {
-  BadRequestException,
-  ConflictException,
-  NotFoundException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
-import { Prisma } from 'src/generated/prisma';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { UserStatus } from 'src/generated/prisma';
@@ -23,8 +17,6 @@ describe('UserService', () => {
       findFirst: jest.fn(),
       findMany: jest.fn(),
       findUnique: jest.fn(),
-      count: jest.fn(),
-      create: jest.fn(),
       update: jest.fn(),
     },
     userLike: {
@@ -34,10 +26,6 @@ describe('UserService', () => {
     chatMember: { findMany: jest.fn() },
     friend: { findFirst: jest.fn() },
     circleMember: { findFirst: jest.fn() },
-    accountIdentifier: {
-      findUnique: jest.fn(),
-      findMany: jest.fn(),
-    },
     $transaction: jest.fn(async (operation: any) => operation(prisma)),
   };
   const refreshTokens = {
@@ -88,10 +76,7 @@ describe('UserService', () => {
     prisma.chatMember.findMany.mockResolvedValue([]);
     prisma.friend.findFirst.mockResolvedValue(null);
     prisma.circleMember.findFirst.mockResolvedValue(null);
-    prisma.accountIdentifier.findUnique.mockResolvedValue(null);
-    // 邀请码分配改成批量候选查询：默认没有任何候选被占用。
     prisma.user.findMany.mockResolvedValue([]);
-    prisma.accountIdentifier.findMany.mockResolvedValue([]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
     service = await buildService();
   });
@@ -266,114 +251,6 @@ describe('UserService', () => {
     ]);
   });
 
-  it('creates an independent canonical invite code with an explicit account ID', async () => {
-    prisma.user.create.mockResolvedValue({ id: 'user-1' });
-
-    await service.create({
-      accountId: 'Alice_01',
-      password: 'password1',
-      nickname: 'Alice',
-    });
-
-    expect(prisma.user.create).toHaveBeenCalledWith({
-      data: {
-        accountId: 'Alice_01',
-        inviteCode: expect.stringMatching(/^[A-Z0-9]{6}$/),
-        passwordHash: expect.any(String),
-        nickname: 'Alice',
-      },
-      select: expect.any(Object),
-    });
-  });
-
-  it('returns the committed user when the optional avatar-frame lookup fails', async () => {
-    prisma.user.create.mockResolvedValue({ id: 'user-1' });
-    avatarFrames.resolvePublicAppearances.mockRejectedValue(
-      new Error('database timeout'),
-    );
-
-    await expect(
-      service.create({
-        accountId: 'Alice_04',
-        password: 'password1',
-        nickname: 'Alice',
-      }),
-    ).resolves.toMatchObject({
-      id: 'user-1',
-      avatarFrameAppearance: null,
-    });
-
-    expect(prisma.user.create).toHaveBeenCalledTimes(1);
-  });
-
-  it('returns service unavailable when admin-user invite-code collisions are exhausted', async () => {
-    prisma.user.create.mockRejectedValue(
-      new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
-        code: 'P2002',
-        clientVersion: 'test',
-        meta: { target: ['inviteCode'] },
-      }),
-    );
-
-    await expect(
-      service.create({
-        accountId: 'Alice_02',
-        password: 'password1',
-        nickname: 'Alice',
-      }),
-    ).rejects.toThrow(ServiceUnavailableException);
-    expect(prisma.user.create).toHaveBeenCalledTimes(10);
-  });
-
-  it('does not retry when the explicit account ID is already taken', async () => {
-    const accountIdCollision = new Prisma.PrismaClientKnownRequestError(
-      'Unique constraint failed',
-      {
-        code: 'P2002',
-        clientVersion: 'test',
-        meta: { target: ['accountId'] },
-      },
-    );
-    prisma.user.create.mockRejectedValue(accountIdCollision);
-
-    await expect(
-      service.create({
-        accountId: 'Alice_03',
-        password: 'password1',
-        nickname: 'Alice',
-      }),
-    ).rejects.toBe(accountIdCollision);
-    expect(prisma.user.create).toHaveBeenCalledTimes(1);
-  });
-
-  it('rejects an account ID claimed by fancy-number inventory before creating an admin user', async () => {
-    prisma.accountIdentifier.findUnique.mockResolvedValue({
-      currentUserID: null,
-      reservedForUserID: null,
-      inviteOwnerUserID: null,
-      fancyNumber: { id: 'fancy-1' },
-    });
-
-    await expect(
-      service.create({
-        accountId: 'ABC123',
-        password: 'password1',
-        nickname: 'Alice',
-      }),
-    ).rejects.toBeInstanceOf(ConflictException);
-
-    expect(prisma.accountIdentifier.findUnique).toHaveBeenCalledWith({
-      where: { value: 'abc123' },
-      select: {
-        currentUserID: true,
-        reservedForUserID: true,
-        inviteOwnerUserID: true,
-        fancyNumber: { select: { id: true } },
-      },
-    });
-    expect(prisma.user.create).not.toHaveBeenCalled();
-  });
-
   it('finds an active user by exact accountId without exposing admin pagination', async () => {
     prisma.user.findFirst.mockResolvedValue({
       id: 'user-1',
@@ -460,88 +337,6 @@ describe('UserService', () => {
       false,
       false,
     );
-  });
-
-  describe('findAll', () => {
-    it('paginates with the supplied limit and skip', async () => {
-      prisma.user.findMany.mockResolvedValue([{ id: 'user-1' }]);
-      prisma.user.count.mockResolvedValue(7);
-
-      const result = await service.findAll({ page: 2, limit: 5 });
-
-      expect(prisma.user.findMany).toHaveBeenCalledWith({
-        where: undefined,
-        select: expect.any(Object),
-        take: 5,
-        skip: 5,
-      });
-      expect(prisma.user.count).toHaveBeenCalledWith({ where: undefined });
-      expect(result).toEqual({
-        data: [
-          {
-            id: 'user-1',
-            avatarFrameAppearance: null,
-            vipLevel: 0,
-            membership: {
-              effectiveLevel: 0,
-              key: 'regular',
-              appearance: { nameColor: 'default', badge: null },
-            },
-          },
-        ],
-        total: 7,
-        page: 2,
-        limit: 5,
-      });
-    });
-
-    it('filters by accountId substring when supplied', async () => {
-      prisma.user.findMany.mockResolvedValue([]);
-      prisma.user.count.mockResolvedValue(0);
-
-      await service.findAll({ accountId: 'foo' });
-
-      expect(prisma.user.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { accountId: { contains: 'foo' } },
-        }),
-      );
-    });
-
-    it('filters by status when supplied', async () => {
-      prisma.user.findMany.mockResolvedValue([]);
-      prisma.user.count.mockResolvedValue(0);
-
-      await service.findAll({ status: UserStatus.BANNED });
-
-      expect(prisma.user.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { status: UserStatus.BANNED },
-        }),
-      );
-      expect(prisma.user.count).toHaveBeenCalledWith({
-        where: { status: UserStatus.BANNED },
-      });
-    });
-
-    it('filters by accountId substring and status together', async () => {
-      prisma.user.findMany.mockResolvedValue([]);
-      prisma.user.count.mockResolvedValue(0);
-
-      await service.findAll({
-        accountId: 'foo',
-        status: UserStatus.ACTIVE,
-      });
-
-      expect(prisma.user.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: {
-            accountId: { contains: 'foo' },
-            status: UserStatus.ACTIVE,
-          },
-        }),
-      );
-    });
   });
 
   describe('findOne', () => {
