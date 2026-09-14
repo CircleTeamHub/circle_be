@@ -93,7 +93,6 @@ type CallParticipantPayload = {
   joinedAt?: string;
   leftAt?: string;
   rejectedAt?: string;
-  missedAt?: string;
   changedAt: string;
 };
 
