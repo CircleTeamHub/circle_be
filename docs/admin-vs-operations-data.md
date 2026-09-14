@@ -61,8 +61,12 @@ Admin data is for moderators, support, and business operators. It should answer:
   and no admin review endpoints.
 - Global content moderation: moments, plaza posts, notes, circles, and comments
   do not currently have system-admin list/remove/restore endpoints.
-- Wallet and coin adjustments: `CoinService.adminTopUp` exists, but there is no
-  admin controller endpoint. This should require an audit note and idempotency.
+- Wallet and coin adjustments: there is no free-form admin top-up
+  (`CoinService.adminTopUp` no longer exists). Coins are only credited by approving
+  a support recharge order (`POST /api/v1/admin/support/recharge/orders/:id/approve`),
+  which goes through `CoinService.creditInTransaction` with the order id as the
+  idempotency key and writes an admin audit entry. A manual adjustment endpoint
+  would still need its own audit note and idempotency key.
 - Admin audit history: moderation actions are logged in application logs, but
   there is no queryable admin-audit table yet.
 - Aggregated business/admin stats: Prometheus has counters, but the admin app
