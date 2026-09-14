@@ -885,17 +885,15 @@ describe('AuthService', () => {
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
-      storedVipLevel: 3,
+      // 存量 vipLevel=3 但已过期：对外只给有效档位。
       vipLevel: 0,
       vipExpiresAt,
-      membership: {
-        key: 'regular',
-        appearance: { nameColor: 'default', badge: null },
-        active: false,
-        lifetime: false,
-      },
       creditScore: 128,
     });
+    // SelfUserDto 早已不暴露 storedVipLevel / membership（App 与管理台都不读），
+    // me() 不再为它们多算一遍会员外观。
+    expect(me).not.toHaveProperty('storedVipLevel');
+    expect(me).not.toHaveProperty('membership');
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
   });

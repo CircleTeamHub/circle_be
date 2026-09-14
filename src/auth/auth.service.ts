@@ -43,10 +43,7 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { IconService } from 'src/icon/icon.service';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
 import { USER_ME_SELECT } from 'src/user/user.select';
-import {
-  EffectiveMembershipAppearance,
-  resolveMembershipAppearance,
-} from 'src/membership/membership-appearance';
+import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 import { FancyNumberService } from 'src/fancy-number/fancy-number.service';
 import {
   AvatarFramePublicAppearance,
@@ -111,9 +108,7 @@ export type SafeUser = {
   city: string | null;
   region: string | null;
   vipLevel: number;
-  storedVipLevel: number;
   vipExpiresAt: Date | null;
-  membership: EffectiveMembershipAppearance;
   creditScore: number;
   receivedLikeCount: number;
   role: string;
@@ -230,10 +225,10 @@ export class AuthService {
     }
 
     // round 3 review（P1）：ADMIN 账号整体拒绝走普通登录 —— 即使密码正确，
-    // 这里发出的是 APP audience 的长 TTL 会话 + IM token，而 /roles 等管理
-    // 端点（JwtGuard+RoleGuard）会接受它，等于绕开短 TTL/审计的管理会话
-    // 模型。管理台请走 /auth/admin/login。对外文案与普通失败一致（不泄露
-    // 该邮箱是管理员）。锁定检查仍在其前（锁死期间不做密码比对）。
+    // 这里发出的是 APP audience 的长 TTL 会话，而任何只看 role、不看 audience
+    // 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的管理会话模型。
+    // 管理台请走 /auth/admin/login。对外文案与普通失败一致（不泄露该邮箱是
+    // 管理员）。锁定检查仍在其前（锁死期间不做密码比对）。
     const now = new Date();
     if (this.isAdminLockedNow(user, now)) {
       logBusinessEvent(this.logger, {
@@ -527,9 +522,10 @@ export class AuthService {
     }
 
     // 与 login() 一致：ADMIN 账号不能持有 APP audience 会话。晋升前签发的 APP
-    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而 /roles 等
-    // JwtGuard+RoleGuard 端点会接受它，等于绕开短 TTL/审计的管理会话模型。像
-    // adminRefresh 一样撤销全部会话；文案与普通登录失败一致（不泄露该账号是管理员）。
+    // refresh token 否则会一直续签出 role=ADMIN 的 APP access token，而任何只看
+    // role、不看 audience 的授权判断都会把它当成管理员，等于绕开短 TTL/审计的
+    // 管理会话模型。像 adminRefresh 一样撤销全部会话；文案与普通登录失败一致
+    // （不泄露该账号是管理员）。
     if (user.role === 'ADMIN') {
       this.logger.warn(
         `Refresh blocked for ADMIN account ${user.id} on the APP audience; revoking sessions.`,
@@ -757,14 +753,10 @@ export class AuthService {
         ),
       );
 
-    const membership = resolveMembershipAppearance(user, now);
-    const { vipLevel: storedVipLevel, ...safeUser } = user;
-
     return {
-      ...safeUser,
-      storedVipLevel,
-      vipLevel: membership.effectiveLevel,
-      membership,
+      ...user,
+      // 对外只给有效档位：存量 vipLevel 在会员过期后仍留在列上，直到清扫任务回写。
+      vipLevel: resolveEffectiveMembershipLevel(user, now),
       avatarFrameAppearance: appearances.get(userId)?.avatarFrame ?? null,
       lastOnline: now,
       displayIcons,
