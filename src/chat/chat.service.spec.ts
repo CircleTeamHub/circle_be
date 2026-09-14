@@ -2261,6 +2261,41 @@ describe('ChatService', () => {
   });
 
   describe('listConversations', () => {
+    // 一页最多 limit 条（默认 100）：多取一条判断截断，响应体仍是数组，由控制器写
+    // X-Has-More。此前超过 100 个会话的用户在 App 里静默少一截。
+    it('reports hasMore when more conversations exist than the page limit', async () => {
+      const row = (id: string) =>
+        membership({
+          id: `member-${id}`,
+          conversationID: id,
+          conversation: { ...membership().conversation, id },
+        });
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        row('conv-1'),
+        row('conv-2'),
+        row('conv-3'),
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const page = await service.listConversationsPage('u1', 2);
+
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 3 }),
+      );
+      expect(page.hasMore).toBe(true);
+      expect(page.conversations).toHaveLength(2);
+    });
+
+    it('reports no more conversations when the page is not full', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const page = await service.listConversationsPage('u1', 2);
+
+      expect(page.hasMore).toBe(false);
+      expect(page.conversations).toHaveLength(1);
+    });
+
     it('pushes viewer retention into preview and unread queries', async () => {
       privacySettings.getSettings.mockResolvedValue({
         messageSelfDestructSec: 172800,

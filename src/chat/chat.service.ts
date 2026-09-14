@@ -963,7 +963,18 @@ export class ChatService {
 
   /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数;隐藏的不出。 */
   async listConversations(userId: string): Promise<ChatConversationDto[]> {
-    const memberships = await this.prisma.chatMember.findMany({
+    return (await this.listConversationsPage(userId)).conversations;
+  }
+
+  /**
+   * 会话列表一页：置顶优先、再按末条消息时间倒序，取前 limit 条。多取一条判断是否被
+   * 截断 —— 响应体保持数组（已装机 App 按数组解析），hasMore 由控制器写进 X-Has-More。
+   */
+  async listConversationsPage(
+    userId: string,
+    limit: number = CONVERSATION_LIST_MAX,
+  ): Promise<{ conversations: ChatConversationDto[]; hasMore: boolean }> {
+    const rows = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null, hiddenAt: null },
       include: { conversation: true },
       // pinned 必须排在 take 之前参与排序。只按 lastMessageAt 取前 N 的话,
@@ -973,9 +984,11 @@ export class ChatService {
         { pinned: 'desc' },
         { conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } } },
       ],
-      take: CONVERSATION_LIST_MAX,
+      take: limit + 1,
     });
-    if (memberships.length === 0) return [];
+    const hasMore = rows.length > limit;
+    const memberships = hasMore ? rows.slice(0, limit) : rows;
+    if (memberships.length === 0) return { conversations: [], hasMore };
 
     const conversationIds = memberships.map((m) => m.conversationID);
     const directIds = memberships
@@ -1094,7 +1107,7 @@ export class ChatService {
         .map((c) => c.lastMessage)
         .filter((m): m is ChatMessageDto => m !== null),
     );
-    return list;
+    return { conversations: list, hasMore };
   }
 
   /**

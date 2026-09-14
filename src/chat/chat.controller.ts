@@ -10,8 +10,10 @@ import {
   Put,
   Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
@@ -47,6 +49,7 @@ import {
 import { GlobalSearchQueryDto } from './dto/global-search-query.dto';
 import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
+import { ListConversationsQueryDto } from './dto/list-conversations-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
 import { MutationsQueryDto } from './dto/mutations-query.dto';
 import type {
@@ -79,11 +82,22 @@ export class ChatController {
 
   @Get('conversations')
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @ApiOperation({ summary: '会话列表(带末条消息与未读数)' })
-  listConversations(
+  @ApiOperation({
+    summary: '会话列表(带末条消息与未读数)',
+    description:
+      '响应体为数组(置顶优先、再按末条消息时间倒序)。默认每页 100 条,可用 limit 调到 500;被截断时响应头 X-Has-More: true。',
+  })
+  async listConversations(
     @Req() req: RequestWithUser,
+    @Query() query: ListConversationsQueryDto,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<ChatConversationDto[]> {
-    return this.chatService.listConversations(req.user.userId);
+    const page = await this.chatService.listConversationsPage(
+      req.user.userId,
+      query.limit,
+    );
+    res.setHeader('X-Has-More', String(page.hasMore));
+    return page.conversations;
   }
 
   @Post('conversations/direct')

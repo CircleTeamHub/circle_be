@@ -220,6 +220,8 @@ export const HISTORY_PAGE_DEFAULT = 50;
 
 /** 会话列表单次返回上限(Phase 1 无分页,超过则取最近活跃的前 N 个)。 */
 export const CONVERSATION_LIST_MAX = 100;
+/** 客户端单页可请求的会话数上限（ListConversationsQueryDto.limit）。 */
+export const CONVERSATION_LIST_LIMIT_MAX = 500;
 
 /**
  * 放宽/关闭焚毁前的兜底真删:分批处理的批量与批次上限。
