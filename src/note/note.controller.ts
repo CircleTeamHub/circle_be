@@ -11,6 +11,7 @@ import {
   Post,
   Query,
   Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -21,6 +22,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import type { Response } from 'express';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import type { RequestWithUser } from 'src/auth/types';
 import {
@@ -51,6 +53,22 @@ import {
 } from './dto/note.dto';
 import { NoteService } from './note.service';
 
+/**
+ * GET /note 与 GET /note/recycle-bin 的截断信号。app 依赖响应体是数组，「后面还有」
+ * 只能走响应头而不能把响应体改成 { items, hasMore }。
+ */
+const HAS_MORE_HEADER = 'X-Has-More';
+const HAS_MORE_DESCRIPTION =
+  'The response body stays a JSON array. The `X-Has-More: true|false` response header ' +
+  'reports whether more rows exist beyond this page (limit defaults to 500, max 500; ' +
+  'request the next `page` to read them).';
+const HAS_MORE_RESPONSE_HEADERS = {
+  [HAS_MORE_HEADER]: {
+    description: 'Whether more rows exist beyond this page',
+    schema: { type: 'string', enum: ['true', 'false'] },
+  },
+};
+
 @ApiTags('Note')
 @ApiBearerAuth()
 @UseGuards(JwtGuard)
@@ -59,13 +77,19 @@ export class NoteController {
   constructor(private readonly noteService: NoteService) {}
 
   @Get()
-  @ApiOperation({ summary: 'My note list' })
-  @ApiOkResponse({ type: [NoteSummaryDto] })
-  listNotes(
+  @ApiOperation({ summary: 'My note list', description: HAS_MORE_DESCRIPTION })
+  @ApiOkResponse({
+    type: [NoteSummaryDto],
+    headers: HAS_MORE_RESPONSE_HEADERS,
+  })
+  async listNotes(
     @Query() query: ListNotesQueryDto,
     @Req() req: RequestWithUser,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<NoteSummaryDto[]> {
-    return this.noteService.listNotes(req.user.userId, query);
+    const page = await this.noteService.listNotes(req.user.userId, query);
+    res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
+    return page.items;
   }
 
   @Post()
@@ -109,7 +133,7 @@ export class NoteController {
   updateNoteGroupIds(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateNoteGroupIdsDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.noteService.updateNoteGroupIds(
       req.user.userId,
@@ -164,13 +188,26 @@ export class NoteController {
 
   // 必须先于 @Get(':id') / @Patch(':id') 声明（同 share-links 的顺序注释）。
   @Get('recycle-bin')
-  @ApiOperation({ summary: 'List soft-deleted notes (FE#92 recycle bin)' })
-  listDeleted(@Query() query: RecycleBinQueryDto, @Req() req: RequestWithUser) {
-    return this.noteService.listDeletedNotes(
+  @ApiOperation({
+    summary: 'List soft-deleted notes (FE#92 recycle bin)',
+    description: HAS_MORE_DESCRIPTION,
+  })
+  @ApiOkResponse({
+    type: [NoteSummaryDto],
+    headers: HAS_MORE_RESPONSE_HEADERS,
+  })
+  async listDeleted(
+    @Query() query: RecycleBinQueryDto,
+    @Req() req: RequestWithUser,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<NoteSummaryDto[]> {
+    const page = await this.noteService.listDeletedNotes(
       req.user.userId,
       query.page,
       query.limit,
     );
+    res.setHeader(HAS_MORE_HEADER, String(page.hasMore));
+    return page.items;
   }
 
   @Post(':id/restore')
@@ -245,7 +282,7 @@ export class NoteController {
 
   @Get(':id')
   @ApiOperation({
-    summary: 'Note detail (own note, or any note marked available)',
+    summary: 'Note detail (own note, or any ACTIVE note marked available)',
   })
   @ApiOkResponse({ type: NoteDetailDto })
   getNote(

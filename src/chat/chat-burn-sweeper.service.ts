@@ -6,6 +6,7 @@ import {
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatMediaService } from './chat-media.service';
 import {
   CHAT_NOTE_IMPORT_SEGMENT,
@@ -40,6 +41,7 @@ export class ChatBurnSweeperService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly media: ChatMediaService,
+    private readonly broadcast: ChatBroadcastService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_burn_sweeper')
@@ -130,7 +132,12 @@ export class ChatBurnSweeperService {
           where: { id: { in: messageIds } },
           // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
           // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
-          data: { deleted: true, content: {}, contentHistory: [] },
+          data: {
+            deleted: true,
+            deletedAt: new Date(),
+            content: {},
+            contentHistory: [],
+          },
         });
         await this.media.releaseNoteImportReferences(
           tx,
@@ -138,6 +145,8 @@ export class ChatBurnSweeperService {
           noteImportKeys,
         );
       });
+      // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
+      await this.announceBurned(conversationId, messageIds);
       if (ownedMediaKeys.length > 0) {
         // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
         void this.media.deleteObjects(ownedMediaKeys);
@@ -149,6 +158,26 @@ export class ChatBurnSweeperService {
         `burned ${rows.length} messages conversation=${conversationId}`,
       );
       if (rows.length < SWEEP_BATCH) return;
+    }
+  }
+
+  /**
+   * 告诉在座成员这一批烧掉了哪些 id。服务端只清正文、在线设备无从得知的话,
+   * 本地缓存、冷启动水合与本地搜索仍会端出本该烧掉的内容。通知只是加速收敛:
+   * 失败不中断焚毁,没收到的设备下次拉历史以 deleted=true 为准。
+   */
+  private async announceBurned(
+    conversationId: string,
+    messageIds: string[],
+  ): Promise<void> {
+    try {
+      await this.broadcast.emitBurnedMessages(conversationId, messageIds);
+    } catch (error) {
+      this.logger.warn(
+        `burned-message announcement failed conversation=${conversationId}: ${
+          error instanceof Error ? error.name : 'unknown error'
+        }`,
+      );
     }
   }
 }

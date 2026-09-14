@@ -518,3 +518,114 @@ describe('PrivacySettingsService presence visibility', () => {
     expect(events).toEqual([]);
   });
 });
+
+// 资料页一次要判六个字段；逐个调 canViewProfileField 就是六条一模一样的
+// userPrivacySetting 查询。批量版只读一次，判定规则与单字段版必须是同一份。
+describe('PrivacySettingsService.canViewProfileFields', () => {
+  const prisma = { userPrivacySetting: { findUnique: jest.fn() } };
+  const service = new PrivacySettingsService(
+    prisma as any,
+    { check: jest.fn() } as any,
+    { isEnabled: () => false, publish: async () => true } as any,
+  );
+  const FIELDS = [
+    'phoneNumber',
+    'email',
+    'wechat',
+    'qq',
+    'whatsup',
+    'lastOnline',
+  ] as const;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('reads the target settings once and answers every requested field', async () => {
+    prisma.userPrivacySetting.findUnique.mockResolvedValue({
+      userID: 'target-1',
+      showPhone: true,
+      showEmail: false,
+      showWechat: false,
+      showQQ: true,
+      showWhatsup: false,
+      shareOnlineStatus: false,
+    });
+
+    await expect(
+      service.canViewProfileFields('target-1', FIELDS, false, false),
+    ).resolves.toEqual({
+      phoneNumber: true,
+      email: false,
+      wechat: false,
+      qq: true,
+      whatsup: false,
+      lastOnline: false,
+    });
+    expect(prisma.userPrivacySetting.findUnique).toHaveBeenCalledTimes(1);
+    expect(prisma.userPrivacySetting.findUnique).toHaveBeenCalledWith({
+      where: { userID: 'target-1' },
+    });
+  });
+
+  it.each([
+    ['no settings row (defaults)', null],
+    [
+      'everything shared',
+      {
+        userID: 'target-1',
+        showPhone: true,
+        showEmail: true,
+        showWechat: true,
+        showQQ: true,
+        showWhatsup: true,
+        shareOnlineStatus: true,
+      },
+    ],
+    [
+      'everything hidden',
+      {
+        userID: 'target-1',
+        showPhone: false,
+        showEmail: false,
+        showWechat: false,
+        showQQ: false,
+        showWhatsup: false,
+        shareOnlineStatus: false,
+      },
+    ],
+  ])(
+    'agrees with canViewProfileField field by field: %s',
+    async (_label, row) => {
+      prisma.userPrivacySetting.findUnique.mockResolvedValue(row);
+
+      for (const isFriend of [false, true]) {
+        const batch = await service.canViewProfileFields(
+          'target-1',
+          FIELDS,
+          false,
+          isFriend,
+        );
+        for (const field of FIELDS) {
+          await expect(
+            service.canViewProfileField('target-1', field, false, isFriend),
+          ).resolves.toBe(batch[field]);
+        }
+      }
+    },
+  );
+
+  it('never reads settings when the viewer is the owner', async () => {
+    await expect(
+      service.canViewProfileFields('me', FIELDS, true, false),
+    ).resolves.toEqual({
+      phoneNumber: true,
+      email: true,
+      wechat: true,
+      qq: true,
+      whatsup: true,
+      lastOnline: true,
+    });
+    expect(prisma.userPrivacySetting.findUnique).not.toHaveBeenCalled();
+  });
+});

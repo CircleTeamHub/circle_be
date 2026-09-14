@@ -58,13 +58,13 @@ describe('SessionRevocationService', () => {
     redis.publish.mockResolvedValue(true);
   });
 
-  describe('fail-open when Redis is disabled', () => {
+  describe('when Redis is disabled', () => {
     beforeEach(() => redis.isEnabled.mockReturnValue(false));
 
-    it('isRevoked returns false and never reads Redis', async () => {
+    it('reports revocation as unknown and never reads Redis', async () => {
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 100 }),
-      ).resolves.toBe(false);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 100 }),
+      ).resolves.toBe('unknown');
       expect(redis.getJson).not.toHaveBeenCalled();
       expect(redis.getJsonMany).not.toHaveBeenCalled();
     });
@@ -96,56 +96,57 @@ describe('SessionRevocationService', () => {
     it('flags a token whose session was revoked (single logout)', async () => {
       redis.getJsonMany.mockResolvedValue([1, null]);
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 100 }),
-      ).resolves.toBe(true);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 100 }),
+      ).resolves.toBe('revoked');
     });
 
     it('flags a token issued before the user revoke-after stamp', async () => {
       redis.getJsonMany.mockResolvedValue([null, 200]);
       // iat 100 < revokedAfter 200 → revoked.
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 100 }),
-      ).resolves.toBe(true);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 100 }),
+      ).resolves.toBe('revoked');
     });
 
     it('uses millisecond issuance time so a fresh same-second token survives', async () => {
       redis.getJsonMany.mockResolvedValue([null, 1_700_000_000_500]);
       await expect(
-        svc.isRevoked({
+        svc.checkRevocation({
           sub: 'u1',
           sid: 's1',
           iat: 1_700_000_000,
           issuedAtMs: 1_700_000_000_600,
         } as never),
-      ).resolves.toBe(false);
+      ).resolves.toBe('active');
     });
 
     it('flags a legacy token issued in the same second as user revocation', async () => {
       redis.getJsonMany.mockResolvedValue([null, 1_700_000_000_500]);
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 1_700_000_000 }),
-      ).resolves.toBe(true);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 1_700_000_000 }),
+      ).resolves.toBe('revoked');
     });
 
     it('does NOT flag when no markers exist', async () => {
       redis.getJsonMany.mockResolvedValue([null, null]);
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 100 }),
-      ).resolves.toBe(false);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 100 }),
+      ).resolves.toBe('active');
     });
 
     it('reads session and user markers in one Redis round trip', async () => {
       redis.getJsonMany.mockResolvedValue([null, 200]);
 
       await expect(
-        svc.isRevoked({ sub: 'u1', sid: 's1', iat: 100 }),
-      ).resolves.toBe(true);
+        svc.checkRevocation({ sub: 'u1', sid: 's1', iat: 100 }),
+      ).resolves.toBe('revoked');
 
       expect(redis.getJsonMany).toHaveBeenCalledTimes(1);
-      expect(redis.getJsonMany).toHaveBeenCalledWith([
-        'authrev:s:s1',
-        'authrev:u:u1',
-      ]);
+      // strict：Redis 没答时回 null 而不是一组 null，才分得清「没有标记」与「查不到」。
+      expect(redis.getJsonMany).toHaveBeenCalledWith(
+        ['authrev:s:s1', 'authrev:u:u1'],
+        { strict: true },
+      );
       expect(redis.getJson).not.toHaveBeenCalled();
     });
 
@@ -284,5 +285,55 @@ describe('SessionRevocationService', () => {
         new Date(1_700_000_000_500 + 2 * 24 * 60 * 60 * 1000),
       );
     });
+  });
+});
+
+describe('SessionRevocationService.checkRevocation (tri-state)', () => {
+  // SessionVerifier 要区分「Redis 答了：没有吊销标记」（放行）与「Redis 没答」
+  // （回落数据库）。
+  const redis = {
+    isEnabled: jest.fn(),
+    getJsonMany: jest.fn(),
+  };
+  const svc = new SessionRevocationService(
+    redis as never,
+    { get: jest.fn() } as never,
+  );
+  const payload = { sub: 'u1', sid: 's1', iat: 100 };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    redis.isEnabled.mockReturnValue(true);
+  });
+
+  it('is unknown when Redis is disabled, without reading it', async () => {
+    redis.isEnabled.mockReturnValue(false);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('unknown');
+    expect(redis.getJsonMany).not.toHaveBeenCalled();
+  });
+
+  it('is unknown when the marker read fails', async () => {
+    redis.getJsonMany.mockResolvedValue(null);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('unknown');
+  });
+
+  it('is revoked when the session marker is set', async () => {
+    redis.getJsonMany.mockResolvedValue([1, null]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('revoked');
+  });
+
+  it('is revoked when the token predates the user revoke-after stamp', async () => {
+    redis.getJsonMany.mockResolvedValue([null, 200]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('revoked');
+  });
+
+  it('is active when Redis answered without markers', async () => {
+    redis.getJsonMany.mockResolvedValue([null, null]);
+
+    await expect(svc.checkRevocation(payload)).resolves.toBe('active');
   });
 });

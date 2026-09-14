@@ -10,7 +10,6 @@ describe('TempChatController guest media uploads', () => {
   const uploadQuota = { consume: jest.fn() };
   const controller = new TempChatController(
     {} as never,
-    {} as never,
     uploadService as never,
     uploadQuota as never,
   );
@@ -58,5 +57,28 @@ describe('TempChatController guest media uploads', () => {
       'chat',
       'guest-1',
     );
+  });
+});
+
+describe('TempChatController guest history', () => {
+  it('serves guest history through the service guest view', async () => {
+    const page = { messages: [], nextBeforeHeight: null };
+    const service = { getGuestHistory: jest.fn().mockResolvedValue(page) };
+    const controller = new TempChatController(
+      service as never,
+      {} as never,
+      {} as never,
+    );
+    const tempChatGuest = {
+      guestId: 'g0123456789abcdef0123456789abcdef',
+      tcId: 'temp-1',
+      conversationId: 'conv-1',
+    };
+    const query = { beforeHeight: 5, limit: 20 };
+
+    await expect(
+      controller.guestHistory({ tempChatGuest } as never, query as never),
+    ).resolves.toEqual(page);
+    expect(service.getGuestHistory).toHaveBeenCalledWith(tempChatGuest, query);
   });
 });

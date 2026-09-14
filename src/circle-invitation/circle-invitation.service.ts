@@ -80,7 +80,6 @@ const INVITATION_INCLUDE = {
       id: true,
       verifierID: true,
       status: true,
-      respondedAt: true,
       verifier: { select: INVITATION_USER_SELECT },
     },
     orderBy: { createdAt: 'asc' },
@@ -324,10 +323,13 @@ export class CircleInvitationService {
           // 在途申请(进度条/成结判定读的都是 invitation.requiredCount)。
           requiredCount: circlePolicy.requiredVerifierCount,
         },
-        include: {
-          circle: true,
-          applicant: true,
-          inviter: true,
+        // 事务里只读这几列；响应由 fetchInvitationDto 按窄 select 另读。此前
+        // include 了整行 circle 与 applicant / inviter 的 User 全部列。
+        select: {
+          id: true,
+          approvedCount: true,
+          requiredCount: true,
+          circle: { select: { groupID: true } },
         },
       });
 
@@ -910,7 +912,7 @@ export class CircleInvitationService {
         }),
         tx.circleInvitation.findUnique({
           where: { id: invitationId },
-          include: { circle: true },
+          select: { status: true, circleID: true, applicantID: true },
         }),
       ]);
       if (!verifierRecord) {
@@ -995,7 +997,13 @@ export class CircleInvitationService {
 
       const updatedInvitation = await tx.circleInvitation.findUnique({
         where: { id: invitationId },
-        include: { circle: true },
+        select: {
+          approvedCount: true,
+          requiredCount: true,
+          circleID: true,
+          applicantID: true,
+          circle: { select: { groupID: true } },
+        },
       });
       if (!updatedInvitation) {
         throw new NotFoundException({
@@ -1100,7 +1108,12 @@ export class CircleInvitationService {
       const [pendingInvitation, membership] = await Promise.all([
         tx.circleInvitation.findUnique({
           where: { id: invitationId },
-          include: { circle: true },
+          select: {
+            status: true,
+            circleID: true,
+            applicantID: true,
+            circle: { select: { groupID: true } },
+          },
         }),
         tx.circleMember.findUnique({
           where: {
@@ -1227,7 +1240,16 @@ export class CircleInvitationService {
 
           const invitation = await tx.circleInvitation.findUnique({
             where: { id: candidate.id },
-            include: { circle: true },
+            select: {
+              id: true,
+              status: true,
+              approvedCount: true,
+              requiredCount: true,
+              circleID: true,
+              applicantID: true,
+              inviterID: true,
+              circle: { select: { groupID: true } },
+            },
           });
           if (
             !invitation ||
@@ -1475,7 +1497,6 @@ export class CircleInvitationService {
             accountId: v.verifier.accountId,
           },
           status: v.status,
-          respondedAt: v.respondedAt?.toISOString() ?? null,
         }),
       ),
       createdAt: inv.createdAt.toISOString(),

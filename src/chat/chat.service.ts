@@ -92,6 +92,12 @@ type GroupFacets = Pick<
   | 'myRole'
   | 'policies'
 >;
+/** loadDirectPeers 的结果:会话 id → 对端展示信息 / 对端已读水位。 */
+interface DirectPeers {
+  info: Map<string, ChatSenderInfo>;
+  readHeights: Map<string, number>;
+}
+
 const NON_GROUP_FACETS: GroupFacets = {
   myRemark: null,
   myAlias: null,
@@ -957,7 +963,18 @@ export class ChatService {
 
   /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数;隐藏的不出。 */
   async listConversations(userId: string): Promise<ChatConversationDto[]> {
-    const memberships = await this.prisma.chatMember.findMany({
+    return (await this.listConversationsPage(userId)).conversations;
+  }
+
+  /**
+   * 会话列表一页：置顶优先、再按末条消息时间倒序，取前 limit 条。多取一条判断是否被
+   * 截断 —— 响应体保持数组（已装机 App 按数组解析），hasMore 由控制器写进 X-Has-More。
+   */
+  async listConversationsPage(
+    userId: string,
+    limit: number = CONVERSATION_LIST_MAX,
+  ): Promise<{ conversations: ChatConversationDto[]; hasMore: boolean }> {
+    const rows = await this.prisma.chatMember.findMany({
       where: { userID: userId, leftAt: null, hiddenAt: null },
       include: { conversation: true },
       // pinned 必须排在 take 之前参与排序。只按 lastMessageAt 取前 N 的话,
@@ -967,9 +984,11 @@ export class ChatService {
         { pinned: 'desc' },
         { conversation: { lastMessageAt: { sort: 'desc', nulls: 'last' } } },
       ],
-      take: CONVERSATION_LIST_MAX,
+      take: limit + 1,
     });
-    if (memberships.length === 0) return [];
+    const hasMore = rows.length > limit;
+    const memberships = hasMore ? rows.slice(0, limit) : rows;
+    if (memberships.length === 0) return { conversations: [], hasMore };
 
     const conversationIds = memberships.map((m) => m.conversationID);
     const directIds = memberships
@@ -991,7 +1010,7 @@ export class ChatService {
     const [
       lastMessages,
       unreadCounts,
-      peers,
+      directPeers,
       circles,
       tempChats,
       circleRoles,
@@ -1044,7 +1063,7 @@ export class ChatService {
       return {
         id: m.conversationID,
         type: m.conversation.type,
-        peer: peers.get(m.conversationID) ?? null,
+        peer: directPeers.info.get(m.conversationID) ?? null,
         circleId: m.conversation.circleID,
         circle: m.conversation.circleID
           ? (circles.get(m.conversation.circleID) ?? null)
@@ -1078,6 +1097,7 @@ export class ChatService {
           memberCounts.get(m.conversationID) ?? null,
         ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
+        peerReadHeight: directPeers.readHeights.get(m.conversationID) ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
       };
@@ -1087,7 +1107,7 @@ export class ChatService {
         .map((c) => c.lastMessage)
         .filter((m): m is ChatMessageDto => m !== null),
     );
-    return list;
+    return { conversations: list, hasMore };
   }
 
   /**
@@ -1974,7 +1994,7 @@ export class ChatService {
       viewerCutoff,
       seconds ? new Date(Date.now() - seconds * 1000) : null,
     );
-    const [lastMessages, unread, peers, tempChats] = await Promise.all([
+    const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
       this.loadLastMessages([conversationId], [cutoff]),
       this.loadUnreadCounts(
         userId,
@@ -1988,7 +2008,10 @@ export class ChatService {
       ),
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
-        : Promise.resolve(new Map<string, ChatSenderInfo>()),
+        : Promise.resolve<DirectPeers>({
+            info: new Map(),
+            readHeights: new Map(),
+          }),
       member.conversation.tempChatID
         ? this.loadTempChatInfos([member.conversation.tempChatID])
         : Promise.resolve(new Map<string, { id: string; title: string }>()),
@@ -2020,7 +2043,7 @@ export class ChatService {
     return {
       id: conversationId,
       type: member.conversation.type,
-      peer: peers.get(conversationId) ?? null,
+      peer: directPeers.info.get(conversationId) ?? null,
       circleId: member.conversation.circleID,
       circle: member.conversation.circleID
         ? (circles.get(member.conversation.circleID) ?? null)
@@ -2048,6 +2071,7 @@ export class ChatService {
         memberCounts.get(conversationId) ?? null,
       ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
+      peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
     };
@@ -2585,27 +2609,32 @@ export class ChatService {
     >`
       SELECT m."id", m."conversationID", m."height", m."senderID", m."type",
              m."content", m."clientMessageId", m."replyToID", m."deleted",
-             m."revokedAt", m."revokedBy", m."editedAt", m."createdAt",
+             m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."createdAt",
              GREATEST(
                COALESCE(m."revokedAt", to_timestamp(0)),
-               COALESCE(m."editedAt", to_timestamp(0))
+               COALESCE(m."editedAt", to_timestamp(0)),
+               COALESCE(m."deletedAt", to_timestamp(0))
              ) AS "mutatedAt"
       FROM "ChatMessage" AS m
       JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
         AS w("conversationID", floor, cutoff)
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
-        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
-        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since})
+        -- 删除墓碑必须跨过焚毁时间窗返回;否则离线设备无法清掉早于当前
+        -- burn cutoff 的本地正文。清空水位仍由 height floor 限制。
+        AND (m."deleted" = true OR w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since} OR m."deletedAt" >= ${since})
         AND (
           GREATEST(
             COALESCE(m."revokedAt", to_timestamp(0)),
-            COALESCE(m."editedAt", to_timestamp(0))
+            COALESCE(m."editedAt", to_timestamp(0)),
+            COALESCE(m."deletedAt", to_timestamp(0))
           ) > ${since}
           OR (
             GREATEST(
               COALESCE(m."revokedAt", to_timestamp(0)),
-              COALESCE(m."editedAt", to_timestamp(0))
+              COALESCE(m."editedAt", to_timestamp(0)),
+              COALESCE(m."deletedAt", to_timestamp(0))
             ) = ${since}
             AND m."id" > ${sinceId}
           )
@@ -2910,6 +2939,9 @@ export class ChatService {
       silencedUntil: null,
       ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
+      peerReadHeight:
+        conv.members.find((m) => m.userID === peerUserId)?.lastReadHeight ??
+        null,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
@@ -3358,7 +3390,7 @@ export class ChatService {
       SELECT DISTINCT ON (m."conversationID")
         m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
         m."clientMessageId", m."replyToID", m."deleted", m."revokedAt", m."revokedBy",
-        m."editedAt", m."createdAt"
+        m."editedAt", m."deletedAt", m."createdAt"
       FROM "ChatMessage" AS m
       JOIN unnest(${conversationIds}::text[], ${cutoffs}::timestamptz[])
         AS w("conversationID", cutoff)
@@ -3407,28 +3439,36 @@ export class ChatService {
   }
 
   /** DIRECT 会话的对端信息:conversationId → 对端用户。 */
+  /**
+   * DIRECT 会话的对端:展示信息 + 对端座位的已读水位。两张表分开填 ——
+   * 账号解析不到(注销/封禁)只影响 peer,不影响水位。
+   */
   private async loadDirectPeers(
     userId: string,
     conversationIds: string[],
-  ): Promise<Map<string, ChatSenderInfo>> {
-    if (conversationIds.length === 0) return new Map();
+  ): Promise<DirectPeers> {
+    if (conversationIds.length === 0) {
+      return { info: new Map(), readHeights: new Map() };
+    }
     const others = await this.prisma.chatMember.findMany({
       where: {
         conversationID: { in: conversationIds },
         userID: { not: userId },
       },
-      select: { conversationID: true, userID: true },
+      select: { conversationID: true, userID: true, lastReadHeight: true },
     });
     const users = await this.resolveSenders(
       others.map((o) => o.userID),
       null,
     );
-    const map = new Map<string, ChatSenderInfo>();
+    const info = new Map<string, ChatSenderInfo>();
+    const readHeights = new Map<string, number>();
     others.forEach((o) => {
       const user = users.get(o.userID);
-      if (user) map.set(o.conversationID, user);
+      if (user) info.set(o.conversationID, user);
+      readHeights.set(o.conversationID, o.lastReadHeight);
     });
-    return map;
+    return { info, readHeights };
   }
 
   /** GROUP 会话的圈子展示信息(群名/群头像来源)。 */
@@ -3558,6 +3598,7 @@ export class ChatService {
       replyToId: row.replyToID,
       revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
       revokedBy: row.revokedBy ?? null,
+      ...(row.deleted ? { deleted: true } : {}),
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       burnDurationSec,
       d: row.clientMessageId,
@@ -4065,6 +4106,15 @@ export class ChatService {
         errorCode: ChatErrorCode.MessageNotFound,
       });
     }
+    // 已读名单只给发送者本人:App 只在自己发出的消息上开这个入口(ChatDetailScreen
+    // 限 message.outgoing)。只查在座的话,任何成员都能逐条探查别人的消息被谁读过;
+    // 系统消息没有作者,同样不给。
+    if (row.senderID !== userId) {
+      throw new ForbiddenException({
+        message: '只能查看自己消息的已读成员',
+        errorCode: ChatErrorCode.ReadersForbidden,
+      });
+    }
     // 新入群/重新入群的座位,lastReadHeight 是按「当前最高」初始化的(否则新人
     // 一进来就背着全群历史未读)。那个初始水位不是回执:不排掉的话,一个刚进群
     // 的人会显示成群里每一条老消息的已读者。座位的 joinedAt 之后才算数。
@@ -4073,7 +4123,7 @@ export class ChatService {
       leftAt: null,
       lastReadHeight: { gte: row.height },
       joinedAt: { lte: row.createdAt },
-      ...(row.senderID ? { userID: { not: row.senderID } } : {}),
+      userID: { not: userId },
     };
     const [seats, total] = await Promise.all([
       this.prisma.chatMember.findMany({
@@ -4125,6 +4175,25 @@ export class ChatService {
         userIds,
       }));
     }
+  }
+
+  /**
+   * 读当前会话级阅后即焚档位(与 POST /burn 回执同形)。
+   *
+   * 已装机的 App 每次打开私聊都会 GET 这个路径 —— 深链/联系人入口可能先于会话
+   * 列表打开聊天页,靠它补齐档位。只回会话策略:对端的全局阅后即焚
+   * (UserPrivacySetting.messageSelfDestructSec)是他自己视图上的读过滤,
+   * 不是会话策略,既不影响本人能读到什么,也不该外露给会话另一方。
+   */
+  async getBurnPolicy(
+    userId: string,
+    conversationId: string,
+  ): Promise<{ burnDurationSec: number | null }> {
+    const { conversation } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    return { burnDurationSec: conversation.burnDurationSec ?? null };
   }
 
   /**
@@ -4243,6 +4312,7 @@ export class ChatService {
           // 只清 content 等于「烧掉的只是最后一版」。
           data: {
             deleted: true,
+            deletedAt: new Date(),
             content: {},
             contentHistory: [] as Prisma.InputJsonValue,
           },
@@ -4253,6 +4323,9 @@ export class ChatService {
           noteImportKeys,
         );
       });
+      // 墓碑提交后通知在座成员(与 sweeper 同一条通道):读路径不会再放它们回来,
+      // 但对端设备上的本地副本得靠这条通知才删得掉。emitBurnedMessages 自己兜住失败。
+      await this.broadcast.emitBurnedMessages(conversationId, messageIds);
       if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
       if (noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();

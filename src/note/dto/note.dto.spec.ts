@@ -3,11 +3,15 @@ import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 import {
   CreateNoteDto,
+  CreateNoteExportDto,
   CreateNoteGroupDto,
   CreateNoteMediaDto,
   CreateNoteShareLinkDto,
   ListNoteShareLinksQueryDto,
+  ListNotesQueryDto,
   NOTE_REMARK_MAX_LENGTH,
+  NoteLocationSectionDto,
+  RecycleBinQueryDto,
   ReorderNoteGroupsDto,
   SetNoteRemarkDto,
   UpdateNoteGroupDto,
@@ -367,4 +371,81 @@ describe('CreateNoteMediaDto integer fields stay within Postgres int4', () => {
       expect(errorFor(property, INT4_MAX)).toBeUndefined();
     },
   );
+});
+
+// app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit：默认页必须装得下整本笔记，
+// 否则超过默认页（以前 50）的笔记被静默截掉。显式上限同样放到 500。
+describe('note list query limits', () => {
+  it('ListNotesQueryDto defaults limit to 500 and caps it at 500', () => {
+    const parse = (query: Record<string, unknown>) =>
+      plainToInstance(ListNotesQueryDto, query, {
+        enableImplicitConversion: true,
+      });
+
+    const empty = parse({});
+    expect(validateSync(empty)).toHaveLength(0);
+    expect(empty.limit).toBe(500);
+    expect(validateSync(parse({ limit: '500' }))).toHaveLength(0);
+    expect(
+      validateSync(parse({ limit: '501' })).map((error) => error.property),
+    ).toContain('limit');
+  });
+
+  it('RecycleBinQueryDto defaults limit to 500 and caps it at 500', () => {
+    const parse = (query: Record<string, unknown>) =>
+      plainToInstance(RecycleBinQueryDto, query, {
+        enableImplicitConversion: true,
+      });
+
+    const empty = parse({});
+    expect(validateSync(empty)).toHaveLength(0);
+    expect(empty.limit).toBe(500);
+    expect(validateSync(parse({ limit: '500' }))).toHaveLength(0);
+    expect(
+      validateSync(parse({ limit: '501' })).map((error) => error.property),
+    ).toContain('limit');
+  });
+});
+
+describe('NoteLocationSectionDto coordinate bounds', () => {
+  // 位置选择器只会给出真实经纬度；越界值只可能是伪造或脏数据，落库后地图渲染出错。
+  const errorsFor = (location: Record<string, unknown>) =>
+    validateSync(plainToInstance(NoteLocationSectionDto, location)).map(
+      (error) => error.property,
+    );
+
+  it('accepts real coordinates, the exact edges, and null / missing values', () => {
+    expect(errorsFor({ latitude: 37.7749, longitude: -122.4194 })).toEqual([]);
+    expect(errorsFor({ latitude: -90, longitude: 180 })).toEqual([]);
+    expect(errorsFor({ latitude: 90, longitude: -180 })).toEqual([]);
+    // app 的 EditNoteScreen 只选了地址时会发 latitude / longitude: null。
+    expect(
+      errorsFor({ title: '咖啡馆', latitude: null, longitude: null }),
+    ).toEqual([]);
+    expect(errorsFor({ title: '咖啡馆' })).toEqual([]);
+  });
+
+  it('rejects latitude outside [-90, 90] and longitude outside [-180, 180]', () => {
+    expect(errorsFor({ latitude: 90.0001, longitude: 0 })).toEqual([
+      'latitude',
+    ]);
+    expect(errorsFor({ latitude: -91, longitude: 0 })).toEqual(['latitude']);
+    expect(errorsFor({ latitude: 0, longitude: 180.5 })).toEqual(['longitude']);
+    expect(errorsFor({ latitude: 0, longitude: -181 })).toEqual(['longitude']);
+  });
+});
+
+describe('CreateNoteExportDto scope', () => {
+  // app 只发 scope: 'ALL'；另一种合法值是媒体 id（UUID）。给自由字符串一个上界。
+  const errorsFor = (scope: string) =>
+    validateSync(
+      plainToInstance(CreateNoteExportDto, { format: 'IMAGES', scope }),
+    ).map((error) => error.property);
+
+  it('accepts ALL, a media id, and 64 characters; rejects longer scopes', () => {
+    expect(errorsFor('ALL')).toEqual([]);
+    expect(errorsFor('11111111-1111-4111-8111-111111111111')).toEqual([]);
+    expect(errorsFor('x'.repeat(64))).toEqual([]);
+    expect(errorsFor('x'.repeat(65))).toEqual(['scope']);
+  });
 });

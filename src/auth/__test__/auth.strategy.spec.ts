@@ -1,12 +1,25 @@
 import { ConfigService } from '@nestjs/config';
-import { UnauthorizedException, Logger } from '@nestjs/common';
+import {
+  Logger,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { JwtStrategy } from '../auth.strategy';
-import type { SessionRevocationService } from '../session-revocation.service';
+import type {
+  SessionVerdict,
+  SessionVerifier,
+} from '../session-verifier.service';
 import { wasSecurityEventLogged } from 'src/logging/handled-errors';
 import {
   getRequestContext,
   runWithRequestContext,
 } from 'src/logging/request-context';
+
+function verifierReturning(verdict: SessionVerdict) {
+  return {
+    verify: jest.fn().mockResolvedValue(verdict),
+  } as unknown as SessionVerifier & { verify: jest.Mock };
+}
 
 describe('JwtStrategy', () => {
   const config = {
@@ -22,10 +35,8 @@ describe('JwtStrategy', () => {
   };
 
   it('maps token audience onto the authenticated request user', async () => {
-    const revocation = {
-      isRevoked: jest.fn().mockResolvedValue(false),
-    } as unknown as SessionRevocationService;
-    const strategy = new JwtStrategy(config, revocation);
+    const verifier = verifierReturning('active');
+    const strategy = new JwtStrategy(config, verifier);
 
     await expect(strategy.validate(payload)).resolves.toEqual({
       userId: 'user-1',
@@ -34,17 +45,33 @@ describe('JwtStrategy', () => {
       sessionId: 'session-1',
       audience: 'ADMIN',
     });
+    expect(verifier.verify).toHaveBeenCalledWith(payload);
   });
 
-  it('rejects a revoked session (F-02)', async () => {
-    const revocation = {
-      isRevoked: jest.fn().mockResolvedValue(true),
-    } as unknown as SessionRevocationService;
-    const strategy = new JwtStrategy(config, revocation);
+  it('rejects a revoked session (F-02) with 401', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const strategy = new JwtStrategy(config, verifierReturning('revoked'));
 
     await expect(strategy.validate(payload)).rejects.toThrow(
       UnauthorizedException,
     );
+    jest.restoreAllMocks();
+  });
+
+  // Redis 与数据库都答不上来时，结论是「暂时核验不了」而不是「会话被吊销」。
+  // circle-im 的 services/api/client.ts 把 401/403 当成认证结论：先刷新、刷新再
+  // 401 就清会话。若这里回 401，一次 Redis+数据库同时抖动会把所有在线用户登出；
+  // 503 只让这一次请求失败，登录态保留。
+  it('answers 503, not 401, and logs no security event when the session cannot be verified', async () => {
+    const strategy = new JwtStrategy(config, verifierReturning('unavailable'));
+
+    const rejection = await strategy
+      .validate(payload)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(ServiceUnavailableException);
+    expect(rejection).not.toBeInstanceOf(UnauthorizedException);
+    expect(wasSecurityEventLogged(rejection)).toBe(false);
   });
 });
 
@@ -67,10 +94,7 @@ describe('JwtStrategy request context & security events', () => {
   });
 
   it('binds the token subject to the request context before the revocation check', async () => {
-    const revocation = {
-      isRevoked: jest.fn().mockResolvedValue(true),
-    } as unknown as SessionRevocationService;
-    const strategy = new JwtStrategy(config, revocation);
+    const strategy = new JwtStrategy(config, verifierReturning('revoked'));
 
     await runWithRequestContext(
       { requestId: 'r-1', traceId: 'r-1', method: 'GET', path: '/api/v1/me' },
@@ -93,10 +117,7 @@ describe('JwtStrategy request context & security events', () => {
     const warn = jest
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
-    const revocation = {
-      isRevoked: jest.fn().mockResolvedValue(true),
-    } as unknown as SessionRevocationService;
-    const strategy = new JwtStrategy(config, revocation);
+    const strategy = new JwtStrategy(config, verifierReturning('revoked'));
 
     await expect(strategy.validate(payload)).rejects.toThrow(
       UnauthorizedException,
@@ -116,10 +137,7 @@ describe('JwtStrategy request context & security events', () => {
 
   it('marks the revoked-session exception so the filter does not add a generic auth_unauthorized', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    const revocation = {
-      isRevoked: jest.fn().mockResolvedValue(true),
-    } as unknown as SessionRevocationService;
-    const strategy = new JwtStrategy(config, revocation);
+    const strategy = new JwtStrategy(config, verifierReturning('revoked'));
 
     const rejection = await strategy.validate(payload).catch((e) => e);
 

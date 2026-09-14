@@ -2,6 +2,7 @@ import { plainToInstance } from 'class-transformer';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ProfileUserDto, PublicUserDto } from './dto/public-user.dto';
 import { UserService } from './user.service';
+import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 
 /**
  * 「成员可查看他人资料」的服务端门:GET /user/:id 是资料页唯一的数据源,
@@ -21,7 +22,13 @@ describe('UserService.findOne profile visibility', () => {
   const config = { get: jest.fn().mockReturnValue(undefined) };
   const iconService = { getDisplayIconsForUser: jest.fn() };
   const avatarFrames = { resolvePublicAppearances: jest.fn() };
-  const privacySettings = { canViewProfileField: jest.fn() };
+  const privacySettings = { canViewProfileFields: jest.fn() };
+  /** 按字段给出可见性，替身 PrivacySettingsService.canViewProfileFields。 */
+  const allowProfileFields = (visible: (field: string) => boolean) =>
+    privacySettings.canViewProfileFields.mockImplementation(
+      async (_id: string, fields: readonly string[]) =>
+        Object.fromEntries(fields.map((field) => [field, visible(field)])),
+    );
 
   const service = new UserService(
     prisma as never,
@@ -64,7 +71,7 @@ describe('UserService.findOne profile visibility', () => {
     });
     iconService.getDisplayIconsForUser.mockResolvedValue([]);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
-    privacySettings.canViewProfileField.mockResolvedValue(false);
+    allowProfileFields(() => false);
   });
 
   it('refuses the read when the only shared context is a group with profiles turned off', async () => {
@@ -123,15 +130,13 @@ describe('UserService.findOne profile visibility', () => {
       email: null,
     });
 
-    privacySettings.canViewProfileField.mockImplementation(
-      async (_id: string, field: string) => field === 'email',
-    );
+    allowProfileFields((field) => field === 'email');
     await expect(service.findOne('target', 'viewer')).resolves.toMatchObject({
       email: 'target@example.com',
     });
-    expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+    expect(privacySettings.canViewProfileFields).toHaveBeenCalledWith(
       'target',
-      'email',
+      expect.arrayContaining(['email']),
       false,
       false,
     );
@@ -170,5 +175,67 @@ describe('ProfileUserDto email exposure (showEmail toggle)', () => {
       { excludeExtraneousValues: true },
     );
     expect((dto as unknown as Record<string, unknown>).email).toBeUndefined();
+  });
+});
+
+// 资料页每次要判六个隐私字段。用真实的 PrivacySettingsService 数 userPrivacySetting
+// 的读取次数，钉住「一次资料访问只读一次对方的隐私设置」，同时核对判定结果不变。
+describe('UserService.findOne privacy settings reads', () => {
+  it('loads the target privacy settings once per profile view', async () => {
+    const prisma = {
+      user: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'target',
+          nickname: '目标',
+          phoneNumber: '13800000000',
+          email: 'target@example.com',
+          wechat: 'wx-target',
+          qq: '10001',
+          whatsup: 'hi',
+          lastOnline: new Date('2026-09-11T08:00:00.000Z'),
+          receivedLikeCount: 3,
+        }),
+      },
+      userPrivacySetting: {
+        findUnique: jest.fn().mockResolvedValue({
+          userID: 'target',
+          showPhone: true,
+          showEmail: false,
+          showWechat: true,
+          showQQ: false,
+          showWhatsup: true,
+          shareOnlineStatus: false,
+        }),
+      },
+      chatMember: { findMany: jest.fn().mockResolvedValue([]) },
+      friend: { findFirst: jest.fn().mockResolvedValue(null) },
+      circleMember: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    const privacySettings = new PrivacySettingsService(
+      prisma as never,
+      {} as never,
+      {} as never,
+    );
+    const service = new UserService(
+      prisma as never,
+      { get: jest.fn().mockReturnValue(undefined) } as never,
+      {} as never,
+      { getDisplayIconsForUser: jest.fn().mockResolvedValue([]) } as never,
+      {} as never,
+      privacySettings,
+      {
+        resolvePublicAppearances: jest.fn().mockResolvedValue(new Map()),
+      } as never,
+    );
+
+    await expect(service.findOne('target', 'viewer')).resolves.toMatchObject({
+      phoneNumber: '13800000000',
+      email: null,
+      wechat: 'wx-target',
+      qq: null,
+      whatsup: 'hi',
+      lastOnline: null,
+    });
+    expect(prisma.userPrivacySetting.findUnique).toHaveBeenCalledTimes(1);
   });
 });

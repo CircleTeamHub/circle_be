@@ -18,6 +18,7 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CollectionService } from './collection.service';
 import {
@@ -38,7 +39,7 @@ export class CollectionController {
   @ApiOkResponse({ type: [UserCollectionDto] })
   list(
     @Query() query: ListCollectionsQueryDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<UserCollectionDto[]> {
     return this.collectionService.list(req.user.userId, query.type);
   }
@@ -48,7 +49,7 @@ export class CollectionController {
   @ApiOkResponse({ type: UserCollectionDto })
   create(
     @Body() dto: CreateCollectionDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ): Promise<UserCollectionDto> {
     return this.collectionService.create(req.user.userId, dto);
   }
@@ -57,7 +58,7 @@ export class CollectionController {
   @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete one of my collection items' })
   @ApiNoContentResponse()
-  remove(@Param('id') id: string, @Req() req: any): Promise<void> {
+  remove(@Param('id') id: string, @Req() req: RequestWithUser): Promise<void> {
     return this.collectionService.remove(req.user.userId, id);
   }
 }

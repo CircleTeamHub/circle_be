@@ -380,3 +380,124 @@ describe('setupApp note limiter mount', () => {
     expect(next).toHaveBeenCalledTimes(1);
   });
 });
+
+// /api/v1/circle 的挂载曾只把 POST/DELETE 交给写限流器:PATCH /circle/:id(编辑圈子、
+// 改群名/群公告)与 PUT 落进读限流器(600 次/15 分钟),写配额(40 次/15 分钟)对它们
+// 形同虚设。这里用真实的 express-rate-limit 实例按方法打满写配额来验证分流。
+describe('setupApp circle limiter mount', () => {
+  beforeEach(() => {
+    getServerConfigMock.mockReturnValue({ LOG_ON: 'false' });
+  });
+
+  const hit = async (
+    mount: (req: any, res: any, next: any) => unknown,
+    method: string,
+  ) => {
+    const next = jest.fn();
+    const res = {
+      setHeader: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn(),
+      headersSent: false,
+      writableEnded: false,
+    };
+    await mount(
+      {
+        method,
+        ip: '203.0.113.7',
+        headers: {},
+        app: { get: () => false },
+        socket: {},
+      },
+      res,
+      next,
+    );
+    return { next, res };
+  };
+
+  it('counts PATCH and PUT against the circle write limiter, not the read limiter', async () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const circleMounts = app.use.mock.calls.filter(
+      ([path]) => path === '/api/v1/circle',
+    );
+    expect(circleMounts).toHaveLength(1);
+    const mount = circleMounts[0][1];
+
+    // circleWriteLimiterOptions.max = 40
+    for (let i = 0; i < 40; i += 1) {
+      const { next } = await hit(mount, i % 2 === 0 ? 'PATCH' : 'PUT');
+      expect(next).toHaveBeenCalledWith();
+    }
+    const blocked = await hit(mount, 'PATCH');
+    expect(blocked.next).not.toHaveBeenCalled();
+    expect(blocked.res.status).toHaveBeenCalledWith(429);
+
+    // 读请求仍走独立的读配额,不被打满的写配额连坐。
+    const read = await hit(mount, 'GET');
+    expect(read.next).toHaveBeenCalledWith();
+  });
+});
+
+// POST /circle-plaza/feed/search 是读（条件太长才用请求体），此前与发帖、报名、举报一起
+// 吃 40 次/15 分钟的广场写配额：翻几页搜索就把发帖额度耗光，反过来也一样。它自己有
+// 路由级 @Throttle（60 次/分钟）和全局兜底。
+describe('setupApp circle-plaza limiter mount', () => {
+  beforeEach(() => {
+    getServerConfigMock.mockReturnValue({ LOG_ON: 'false' });
+  });
+
+  const hit = async (
+    mount: (req: any, res: any, next: any) => unknown,
+    method: string,
+    path: string,
+  ) => {
+    const next = jest.fn();
+    const res = {
+      setHeader: jest.fn(),
+      status: jest.fn().mockReturnThis(),
+      send: jest.fn(),
+      headersSent: false,
+      writableEnded: false,
+    };
+    await mount(
+      {
+        method,
+        path,
+        url: path,
+        ip: '203.0.113.9',
+        headers: {},
+        app: { get: () => false },
+        socket: {},
+      },
+      res,
+      next,
+    );
+    return { next, res };
+  };
+
+  it('does not count feed search against the plaza write limiter', async () => {
+    const app = buildAppMock();
+    setupApp(app as any);
+
+    const mounts = app.use.mock.calls.filter(
+      ([mountPath]) => mountPath === '/api/v1/circle-plaza',
+    );
+    expect(mounts).toHaveLength(1);
+    const mount = mounts[0][1];
+
+    // circleWriteLimiterOptions.max = 40：搜索打满也不占写配额。
+    for (let i = 0; i < 45; i += 1) {
+      const { next } = await hit(mount, 'POST', '/feed/search');
+      expect(next).toHaveBeenCalledWith();
+    }
+    for (let i = 0; i < 40; i += 1) {
+      const { next } = await hit(mount, 'POST', '/posts');
+      expect(next).toHaveBeenCalledWith();
+    }
+    const blocked = await hit(mount, 'POST', '/posts');
+    expect(blocked.next).not.toHaveBeenCalled();
+    expect(blocked.res.status).toHaveBeenCalledWith(429);
+  });
+});

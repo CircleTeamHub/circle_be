@@ -94,6 +94,40 @@ describe('RedisService', () => {
     expect(client.mget).toHaveBeenCalledWith('one', 'missing', 'obj');
   });
 
+  it('tells an unanswered MGET apart from keys that are simply missing', async () => {
+    // 吊销检查要区分「Redis 答了：没有标记」与「Redis 没答」—— 后者必须是 null，
+    // 而不是一组 null；否则查不到标记会被当成没有标记放行。
+    process.env.REDIS_URL = 'redis://localhost:6379';
+    const service = new RedisService();
+    jest
+      .spyOn((service as any).logger, 'warn')
+      .mockImplementation(() => undefined);
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue({
+      mget: jest.fn().mockRejectedValue(new Error('timeout')),
+    });
+
+    await expect(
+      service.getJsonMany(['a', 'b'], { strict: true }),
+    ).resolves.toBeNull();
+    // 老调用方的降级语义不变：失败时 getJsonMany 仍回一组 null。
+    await expect(service.getJsonMany(['a', 'b'])).resolves.toEqual([
+      null,
+      null,
+    ]);
+
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(null);
+    await expect(
+      service.getJsonMany(['a'], { strict: true }),
+    ).resolves.toBeNull();
+
+    jest.spyOn(service as any, 'getCommandClient').mockResolvedValue({
+      mget: jest.fn().mockResolvedValue(['1', null]),
+    });
+    await expect(
+      service.getJsonMany(['one', 'missing'], { strict: true }),
+    ).resolves.toEqual([1, null]);
+  });
+
   it('reports ping failures as unreachable instead of throwing at the probe', async () => {
     process.env.REDIS_URL = 'redis://localhost:6379';
     const service = new RedisService();

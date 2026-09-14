@@ -4,9 +4,7 @@ import {
   IsBoolean,
   IsIn,
   IsInt,
-  IsOptional,
   IsString,
-  MaxLength,
   Validate,
   ValidatorConstraint,
   ValidatorConstraintInterface,
@@ -15,6 +13,7 @@ import {
   BURN_DURATION_CHOICES,
   type BurnDurationSec,
 } from '../common/burn-durations';
+import { IsOptionalNotNull } from '../common/validation';
 
 /**
  * 自动回复文案上限，按**码点**计。
@@ -81,80 +80,82 @@ export class PrivacySettingsDto {
   shareTypingInGroup: boolean;
 }
 
+// UserPrivacySetting 的每一列都是非空列：省略 = 不改，显式 null 在校验层回 400，
+// 不再穿过 @IsOptional 落到 upsert 成 PrismaClientValidationError（500）。
 export class UpdatePrivacySettingsDto {
   @ApiPropertyOptional({ enum: BURN_DURATION_CHOICES })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsInt()
   @IsIn(BURN_DURATION_CHOICES as readonly number[])
   messageSelfDestructSec?: BurnDurationSec;
 
   @ApiPropertyOptional({ enum: MOMENTS_VISIBILITY_OPTIONS })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsIn(MOMENTS_VISIBILITY_OPTIONS)
   momentsVisibility?: MomentsVisibility;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   allowStrangerMessages?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   showPhone?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   showEmail?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   showWechat?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   showQQ?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   showWhatsup?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   addMeByAccount?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   addMeByPhone?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   addMeByQrCode?: boolean;
 
   @ApiPropertyOptional()
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   addMeByGroup?: boolean;
 
   @ApiPropertyOptional({ enum: PERMISSION_OPTIONS })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsIn(PERMISSION_OPTIONS)
   callPermission?: PrivacyPermission;
 
   @ApiPropertyOptional({ enum: PERMISSION_OPTIONS })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsIn(PERMISSION_OPTIONS)
   groupInvitePermission?: PrivacyPermission;
 
   @ApiPropertyOptional({ default: false })
-  @IsOptional()
+  @IsOptionalNotNull()
   @Transform(
     ({ obj }: { obj: Record<string, unknown> }) =>
       obj.directMessageAutoReplyEnabled,
@@ -163,7 +164,7 @@ export class UpdatePrivacySettingsDto {
   directMessageAutoReplyEnabled?: boolean;
 
   @ApiPropertyOptional({ default: '', maxLength: 200 })
-  @IsOptional()
+  @IsOptionalNotNull()
   @Transform(({ obj }: { obj: Record<string, unknown> }) => {
     const value = obj.directMessageAutoReplyText;
     return typeof value === 'string' ? value.trim() : value;
@@ -173,17 +174,17 @@ export class UpdatePrivacySettingsDto {
   directMessageAutoReplyText?: string;
 
   @ApiPropertyOptional({ default: true })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   shareOnlineStatus?: boolean;
 
   @ApiPropertyOptional({ default: true })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   shareTypingInDirect?: boolean;
 
   @ApiPropertyOptional({ default: true })
-  @IsOptional()
+  @IsOptionalNotNull()
   @IsBoolean()
   shareTypingInGroup?: boolean;
 }

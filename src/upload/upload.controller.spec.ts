@@ -1,7 +1,9 @@
 import { HttpStatus } from '@nestjs/common';
 import { uploadMetrics } from 'src/metrics/upload-metrics';
 import { RedisService } from 'src/redis/redis.service';
+import { UPLOAD_FOLDERS } from './dto/presign.dto';
 import { UploadController } from './upload.controller';
+import { PUBLIC_READ_UPLOAD_FOLDERS } from './upload.service';
 
 jest.mock('src/metrics/upload-metrics', () => ({
   uploadMetrics: {
@@ -184,5 +186,29 @@ describe('UploadController', () => {
       status: HttpStatus.TOO_MANY_REQUESTS,
     });
     expect(uploadService.presign).not.toHaveBeenCalled();
+  });
+
+  // 已装机 App 把 fileUrl 当必填字段校验,所以私有目录暂时仍返回它;但文档不能再说它是
+  // 「永久访问地址」—— chat/notes 对象不在匿名可读白名单里,直连 403,读取要凭 key。
+  it('documents fileUrl as directly readable only for public folders', () => {
+    const operation = Reflect.getMetadata(
+      'swagger/apiOperation',
+      UploadController.prototype.presign,
+    ) as { description?: string } | undefined;
+    const description = operation?.description ?? '';
+
+    for (const folder of PUBLIC_READ_UPLOAD_FOLDERS) {
+      expect(description).toContain(folder);
+    }
+    const privateFolders = UPLOAD_FOLDERS.filter(
+      (folder) =>
+        !(PUBLIC_READ_UPLOAD_FOLDERS as readonly string[]).includes(folder),
+    );
+    expect(privateFolders).toEqual(['notes', 'chat']);
+    for (const folder of privateFolders) {
+      expect(description).toContain(folder);
+    }
+    expect(description).toContain('key');
+    expect(description).not.toContain('永久访问地址');
   });
 });

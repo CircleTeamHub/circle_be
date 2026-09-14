@@ -29,10 +29,14 @@ export class CreateTraceDto {
   @MaxLength(5000)
   content: string;
 
-  @ApiPropertyOptional({ type: [String] })
+  // 与评论图片同一口径：单个 URL ≤ 500（存储签发的远短于此）；APP 每张图单独
+  // presign、key 带 randomUUID，不会发重复 URL，重复只可能来自构造的请求。
+  @ApiPropertyOptional({ type: [String], maxItems: 9, uniqueItems: true })
   @IsArray()
   @IsString({ each: true })
+  @MaxLength(500, { each: true })
   @ArrayMaxSize(9)
+  @ArrayUnique()
   @IsOptional()
   images?: string[];
 

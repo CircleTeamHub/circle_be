@@ -1,4 +1,5 @@
 import { ConflictException } from '@nestjs/common';
+import { AdminCommunityController } from './admin-community.controller';
 import { AdminCommunityService } from './admin-community.service';
 
 describe('AdminCommunityService', () => {
@@ -45,14 +46,38 @@ describe('AdminCommunityService', () => {
       deleted: false,
       adminState: 'ACTIVE',
     });
+    const queuedAt = new Date('2026-09-13T00:00:00.000Z');
     tx.circle.update.mockResolvedValue({
       id: 'circle-1',
+      name: '摄影爱好者',
+      description: '圈子简介',
+      ownerID: 'owner-1',
+      groupID: 'group-1',
+      deleted: true,
       adminState: 'DISABLING',
+      adminDisabledAt: queuedAt,
+      adminDisabledBy: 'admin-1',
+      adminDisableReason: '违规内容',
+      memberCount: 12,
+      updatedAt: queuedAt,
     });
     tx.adminGroupOperation.create.mockResolvedValue({
       id: 'operation-1',
-      status: 'PENDING',
+      idempotencyKey: 'request-1',
+      groupID: 'group-1',
+      circleID: 'circle-1',
       type: 'MUTE',
+      status: 'PENDING',
+      requestedByID: 'admin-1',
+      reason: '违规内容',
+      attempts: 0,
+      maxAttempts: 5,
+      nextAttemptAt: queuedAt,
+      claimedAt: null,
+      completedAt: null,
+      lastError: null,
+      createdAt: queuedAt,
+      updatedAt: queuedAt,
     });
 
     const result = await service.disableCircle({
@@ -80,7 +105,28 @@ describe('AdminCommunityService', () => {
         idempotencyKey: 'request-1',
       }),
     });
-    expect(result.operation.id).toBe('operation-1');
+    // 管理台丢弃响应体(CommunityPage onSuccess 只用 action 本身)。只回圈子的管理态
+    // 与列表 latestOperation 同形的操作摘要,不透出幂等键、申请人、重试调度等内部列。
+    expect(result).toEqual({
+      circle: {
+        id: 'circle-1',
+        name: '摄影爱好者',
+        groupID: 'group-1',
+        deleted: true,
+        adminState: 'DISABLING',
+        adminDisabledAt: queuedAt,
+        adminDisabledBy: 'admin-1',
+        adminDisableReason: '违规内容',
+      },
+      operation: {
+        id: 'operation-1',
+        groupID: 'group-1',
+        type: 'MUTE',
+        status: 'PENDING',
+        lastError: null,
+        createdAt: queuedAt,
+      },
+    });
   });
 
   it('restores a disabled circle only after the queued unmute succeeds', async () => {
@@ -218,12 +264,18 @@ describe('AdminCommunityService', () => {
       deleted: false,
       adminState: 'ACTIVE',
     });
+    const disabledAt = new Date('2026-09-13T00:00:00.000Z');
     tx.circle.update.mockResolvedValue({
       id: 'circle-1',
       name: '摄影爱好者',
+      description: '圈子简介',
+      ownerID: 'owner-1',
       groupID: null,
       deleted: true,
       adminState: 'DISABLED',
+      adminDisabledAt: disabledAt,
+      adminDisabledBy: 'admin-1',
+      adminDisableReason: '违规内容',
     });
 
     const result = await service.disableCircle({
@@ -255,10 +307,16 @@ describe('AdminCommunityService', () => {
       }),
     });
     expect(result).toEqual({
-      circle: expect.objectContaining({
+      circle: {
         id: 'circle-1',
+        name: '摄影爱好者',
+        groupID: null,
+        deleted: true,
         adminState: 'DISABLED',
-      }),
+        adminDisabledAt: disabledAt,
+        adminDisabledBy: 'admin-1',
+        adminDisableReason: '违规内容',
+      },
       operation: null,
     });
   });
@@ -298,10 +356,24 @@ describe('AdminCommunityService', () => {
   });
 
   it('queues a confirmed standalone group dismissal', async () => {
+    const queuedAt = new Date('2026-09-13T00:00:00.000Z');
     tx.adminGroupOperation.create.mockResolvedValue({
       id: 'operation-3',
-      status: 'PENDING',
+      idempotencyKey: 'request-3',
+      groupID: 'group-9',
+      circleID: null,
       type: 'DISMISS',
+      status: 'PENDING',
+      requestedByID: 'admin-1',
+      reason: '诈骗群',
+      attempts: 0,
+      maxAttempts: 5,
+      nextAttemptAt: queuedAt,
+      claimedAt: null,
+      completedAt: null,
+      lastError: null,
+      createdAt: queuedAt,
+      updatedAt: queuedAt,
     });
 
     const result = await service.requestGroupOperation({
@@ -320,7 +392,14 @@ describe('AdminCommunityService', () => {
         circleID: null,
       }),
     });
-    expect(result.id).toBe('operation-3');
+    expect(result).toEqual({
+      id: 'operation-3',
+      groupID: 'group-9',
+      type: 'DISMISS',
+      status: 'PENDING',
+      lastError: null,
+      createdAt: queuedAt,
+    });
   });
 
   it('closes a linked circle when its OpenIM group is dismissed', async () => {
@@ -396,14 +475,19 @@ describe('AdminCommunityService', () => {
   );
 
   it('returns the original operation when the same request is retried', async () => {
+    const queuedAt = new Date('2026-09-13T00:00:00.000Z');
     tx.adminGroupOperation.findUnique.mockResolvedValue({
       id: 'operation-3',
+      idempotencyKey: 'request-3',
       groupID: 'group-9',
       circleID: null,
       type: 'DISMISS',
       requestedByID: 'admin-1',
       reason: '诈骗群',
       status: 'PENDING',
+      lastError: null,
+      createdAt: queuedAt,
+      updatedAt: queuedAt,
     });
 
     const result = await service.requestGroupOperation({
@@ -415,7 +499,14 @@ describe('AdminCommunityService', () => {
       idempotencyKey: 'request-3',
     });
 
-    expect(result.id).toBe('operation-3');
+    expect(result).toEqual({
+      id: 'operation-3',
+      groupID: 'group-9',
+      type: 'DISMISS',
+      status: 'PENDING',
+      lastError: null,
+      createdAt: queuedAt,
+    });
     expect(tx.adminGroupOperation.create).not.toHaveBeenCalled();
   });
 
@@ -450,7 +541,6 @@ describe('AdminCommunityService', () => {
         id: 'circle-1',
         groupID: 'group-1',
         name: '摄影圈',
-        avatarUrl: null,
         memberCount: 10,
         ownerID: 'owner-1',
         owner: { nickname: 'Alice' },
@@ -483,5 +573,23 @@ describe('AdminCommunityService', () => {
       linkedCircle: { id: 'circle-1', name: '摄影圈' },
       pendingOperation: { id: 'operation-1', type: 'MUTE' },
     });
+    // 管理台群列表不渲染头像,faceUrl 只在类型里声明 —— 不再下发也不再查 avatarUrl。
+    expect(result.items[0]).not.toHaveProperty('faceUrl');
+    expect(prisma.circle.findMany.mock.calls[0][0].select).not.toHaveProperty(
+      'avatarUrl',
+    );
+  });
+
+  // GET /admin/community/operations/:id 管理台从不调用 —— 圈子/群列表自带
+  // latestOperation / pendingOperation 并 10 秒轮询。路由与 service 方法一起删掉。
+  it('no longer exposes the single-operation status lookup', () => {
+    expect(
+      (AdminCommunityController.prototype as unknown as Record<string, unknown>)
+        .getOperation,
+    ).toBeUndefined();
+    expect(
+      (AdminCommunityService.prototype as unknown as Record<string, unknown>)
+        .getOperation,
+    ).toBeUndefined();
   });
 });

@@ -385,6 +385,9 @@ model User {
   gender                       Gender     @default(unset)
   role                         UserRole   @default(USER)
   status                       UserStatus @default(ACTIVE)
+  /// Timestamp of the last operation that invalidated every access token.
+  /// This is the durable fallback when Redis revocation markers are unavailable.
+  accessTokensRevokedAt        DateTime?
   vipLevel                     Int        @default(0)
   vipExpiresAt                 DateTime?
   creditScore                  Int        @default(100)
@@ -2204,6 +2207,9 @@ model ChatMessage {
   clientMessageId String?  @db.VarChar(128)
   replyToID       String?
   deleted         Boolean  @default(false)
+  /// Timestamp when the message was burned. Unlike revokedAt/editedAt this is
+  /// the mutation clock for durable deletion tombstones delivered to offline clients.
+  deletedAt       DateTime?
   /// 撤回时间；撤回的消息仍占 height（坐标系不塌陷），content 已清空。
   revokedAt       DateTime?
   /// 执行撤回的人（发送者本人或圈主/管理员）。
@@ -2229,6 +2235,7 @@ model ChatMessage {
   /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
   @@index([conversationID, revokedAt])
   @@index([conversationID, editedAt])
+  @@index([conversationID, deletedAt])
 }
 
 /// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过

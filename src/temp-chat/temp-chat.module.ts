@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { ChatModule } from 'src/chat/chat.module';
 import { NoteModule } from 'src/note/note.module';
+import { SensitiveWordModule } from 'src/sensitive-word/sensitive-word.module';
 import { UploadModule } from 'src/upload/upload.module';
 import { LinkTokenService } from './link-token.service';
 import { TempChatCleanup } from './temp-chat.cleanup';
@@ -15,6 +16,7 @@ import { TempChatUploadQuota } from './temp-chat-upload-quota';
   imports: [
     ChatModule,
     NoteModule,
+    SensitiveWordModule,
     UploadModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

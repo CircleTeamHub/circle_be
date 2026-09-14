@@ -1,22 +1,9 @@
 import { MembershipBenefitType } from 'src/generated/prisma';
 import { MembershipPolicyService } from './membership-policy.service';
-import { MembershipService } from './membership.service';
+import { mapMembershipStatus, MembershipService } from './membership.service';
 
 describe('MembershipService', () => {
-  const prisma = {
-    user: { findUnique: jest.fn() },
-  };
-  const policy = {
-    resolve: jest.fn((membership, now) =>
-      new MembershipPolicyService({} as never).resolve(membership, now),
-    ),
-  };
-  const service = new (MembershipService as any)(prisma, policy) as {
-    getPlans: MembershipService['getPlans'];
-    getMe: (userId: string, now?: Date) => Promise<any>;
-  };
-
-  beforeEach(() => jest.clearAllMocks());
+  const service = new MembershipService();
 
   it('returns the exact four paid plans from the catalog using display quotas', () => {
     expect(service.getPlans()).toEqual([
@@ -174,105 +161,101 @@ describe('MembershipService', () => {
     expect(plans.some(({ level }) => level === 5)).toBe(false);
   });
 
-  it('returns an active timed membership and one-time benefit status', async () => {
-    const expiresAt = new Date('2026-08-31T12:00:00.000Z');
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 3,
-      vipExpiresAt: expiresAt,
-      membershipBenefitGrants: [
-        { type: MembershipBenefitType.STANDARD_FANCY_NUMBER },
-      ],
+  // GET /membership/me 已删除;mapMembershipStatus 仍是管理员授予接口的响应映射,
+  // 原 getMe 的四个档位用例改为直接钉在它上面。
+  describe('mapMembershipStatus', () => {
+    const policy = new MembershipPolicyService({} as never);
+    const statusFor = (
+      membership: { vipLevel: number; vipExpiresAt: Date | null },
+      issued: MembershipBenefitType[],
+      now = new Date('2026-07-21T12:00:00.000Z'),
+    ) => {
+      const effective = policy.resolve(membership, now);
+      return mapMembershipStatus(
+        membership,
+        effective.tier,
+        effective.level,
+        issued,
+      );
+    };
+
+    it('maps an active timed membership and one-time benefit status', () => {
+      const expiresAt = new Date('2026-08-31T12:00:00.000Z');
+
+      expect(
+        statusFor({ vipLevel: 3, vipExpiresAt: expiresAt }, [
+          MembershipBenefitType.STANDARD_FANCY_NUMBER,
+        ]),
+      ).toMatchObject({
+        storedLevel: 3,
+        effectiveLevel: 3,
+        key: 'diamond',
+        vipExpiresAt: expiresAt,
+        lifetime: false,
+        active: true,
+        quotas: { joinedCircles: { actual: 1000, display: '1000' } },
+        appearance: { nameColor: 'rainbow', badge: 'diamond' },
+        benefits: {
+          fancyNumberVoucher: null,
+          permanentFancyNumber: false,
+        },
+        benefitGrants: {
+          standardFancyNumber: { available: false, issued: true },
+          premiumFancyNumber: { available: false, issued: false },
+        },
+      });
     });
 
-    const result = await service.getMe(
-      'user-1',
-      new Date('2026-07-21T12:00:00.000Z'),
-    );
+    it('resolves an expired stored membership to regular', () => {
+      const expiresAt = new Date('2026-07-20T12:00:00.000Z');
 
-    expect(result).toMatchObject({
-      storedLevel: 3,
-      effectiveLevel: 3,
-      key: 'diamond',
-      vipExpiresAt: expiresAt,
-      lifetime: false,
-      active: true,
-      quotas: { joinedCircles: { actual: 1000, display: '1000' } },
-      appearance: { nameColor: 'rainbow', badge: 'diamond' },
-      benefits: {
-        fancyNumberVoucher: null,
-        permanentFancyNumber: false,
-      },
-      benefitGrants: {
-        standardFancyNumber: { available: false, issued: true },
-        premiumFancyNumber: { available: false, issued: false },
-      },
-    });
-  });
-
-  it('resolves an expired stored membership to regular without mutating it', async () => {
-    const expiresAt = new Date('2026-07-20T12:00:00.000Z');
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 2,
-      vipExpiresAt: expiresAt,
-      membershipBenefitGrants: [],
+      expect(
+        statusFor({ vipLevel: 2, vipExpiresAt: expiresAt }, []),
+      ).toMatchObject({
+        storedLevel: 2,
+        effectiveLevel: 0,
+        key: 'regular',
+        vipExpiresAt: expiresAt,
+        lifetime: false,
+        active: false,
+        quotas: {
+          groupMembers: { actual: 100, display: '100' },
+        },
+      });
     });
 
-    const result = await service.getMe(
-      'user-1',
-      new Date('2026-07-21T12:00:00.000Z'),
-    );
-
-    expect(result).toMatchObject({
-      storedLevel: 2,
-      effectiveLevel: 0,
-      key: 'regular',
-      vipExpiresAt: expiresAt,
-      lifetime: false,
-      active: false,
-      quotas: {
-        groupMembers: { actual: 100, display: '100' },
-      },
-    });
-    expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps legacy timed memberships with null expiry active', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 1,
-      vipExpiresAt: null,
-      membershipBenefitGrants: [],
+    it('keeps legacy timed memberships with null expiry active', () => {
+      expect(
+        statusFor({ vipLevel: 1, vipExpiresAt: null }, [], new Date()),
+      ).toMatchObject({
+        storedLevel: 1,
+        effectiveLevel: 1,
+        key: 'silver',
+        vipExpiresAt: null,
+        lifetime: false,
+        active: true,
+      });
     });
 
-    await expect(service.getMe('user-1')).resolves.toMatchObject({
-      storedLevel: 1,
-      effectiveLevel: 1,
-      key: 'silver',
-      vipExpiresAt: null,
-      lifetime: false,
-      active: true,
-    });
-  });
-
-  it('returns super as an active lifetime membership', async () => {
-    prisma.user.findUnique.mockResolvedValue({
-      vipLevel: 4,
-      vipExpiresAt: null,
-      membershipBenefitGrants: [
-        { type: MembershipBenefitType.PREMIUM_FANCY_NUMBER },
-      ],
-    });
-
-    await expect(service.getMe('user-1')).resolves.toMatchObject({
-      storedLevel: 4,
-      effectiveLevel: 4,
-      key: 'super',
-      vipExpiresAt: null,
-      lifetime: true,
-      active: true,
-      benefitGrants: {
-        standardFancyNumber: { available: false, issued: false },
-        premiumFancyNumber: { available: false, issued: true },
-      },
+    it('maps super as an active lifetime membership', () => {
+      expect(
+        statusFor(
+          { vipLevel: 4, vipExpiresAt: null },
+          [MembershipBenefitType.PREMIUM_FANCY_NUMBER],
+          new Date(),
+        ),
+      ).toMatchObject({
+        storedLevel: 4,
+        effectiveLevel: 4,
+        key: 'super',
+        vipExpiresAt: null,
+        lifetime: true,
+        active: true,
+        benefitGrants: {
+          standardFancyNumber: { available: false, issued: false },
+          premiumFancyNumber: { available: false, issued: true },
+        },
+      });
     });
   });
 });

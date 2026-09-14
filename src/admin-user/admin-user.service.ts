@@ -15,6 +15,7 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 import { createLoggingConfig } from 'src/logging/logging.config';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
+import { normalizeEmail } from 'src/utils/email';
 import { AdminUserAuditService } from './admin-user-audit.service';
 import {
   AdminAuditAction,
@@ -94,11 +95,15 @@ export class AdminUserService {
         : {}),
       ...(keyword
         ? {
+            // 子串匹配只留给账号 ID 与昵称。列表只回遮罩后的邮箱/手机号：若对联系方式
+            // 也做 contains，管理员逐字符试探「有没有命中」就能还原原文，且完全绕开
+            // 敏感字段查看（sensitive-access）的审计。联系方式只认整值相等，邮箱按
+            // 注册/登录同一口径归一（normalizeEmail）。
             OR: [
               { accountId: { contains: keyword, mode: 'insensitive' } },
               { nickname: { contains: keyword, mode: 'insensitive' } },
-              { email: { contains: keyword, mode: 'insensitive' } },
-              { phoneNumber: { contains: keyword } },
+              { email: normalizeEmail(keyword) },
+              { phoneNumber: keyword },
             ],
           }
         : {}),

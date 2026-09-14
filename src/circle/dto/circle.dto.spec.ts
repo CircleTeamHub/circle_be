@@ -1,6 +1,10 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
-import { CreateCircleDto, UpdateCircleDto } from './circle.dto';
+import {
+  CreateCircleDto,
+  UpdateCircleDto,
+  UploadCircleIconDto,
+} from './circle.dto';
 
 describe('CreateCircleDto join VIP restriction caps at the top tier (4)', () => {
   const hasJoinVipError = (payload: Record<string, unknown>) =>
@@ -181,8 +185,12 @@ describe('UpdateCircleDto', () => {
   // MINIO_PUBLIC_URL 没配时 assertAvatarUrlIsSafe 直接短路,不设长度上限的话
   // 任意长的字符串会入库,再被圈子列表/详情原样发出去。
   it('bounds the avatar url length', () => {
-    expect(failed({ avatarUrl: 'a'.repeat(501) }, 'avatarUrl')).toBe(true);
-    expect(parse({ avatarUrl: 'a'.repeat(500) }).errors).toHaveLength(0);
+    // avatarUrl 现在还要求是带协议的 URL,用 URL 形态的值单独钉长度上界。
+    const urlOfLength = (length: number) =>
+      `https://cdn.example.com/${'a'.repeat(length - 28)}.png`;
+    expect(urlOfLength(500)).toHaveLength(500);
+    expect(failed({ avatarUrl: urlOfLength(501) }, 'avatarUrl')).toBe(true);
+    expect(parse({ avatarUrl: urlOfLength(500) }).errors).toHaveLength(0);
   });
 
   // PATCH 语义:没传的字段一律不校验、不写。
@@ -190,5 +198,44 @@ describe('UpdateCircleDto', () => {
     expect(parse({}).errors).toHaveLength(0);
     // 自研栈下「群公告即圈子简介」,清空公告是合法操作。
     expect(parse({ description: '' }).errors).toHaveLength(0);
+  });
+});
+
+// 圈子头像与圈子图标最终渲染给每个访客,与 SetCircleAvatarDto 同一口径:必须是带协议
+// 的 URL,且有 500 字符上界。App 在建圈/编辑圈/上传图标时只发 presign 返回的 fileUrl。
+describe('circle image URL fields', () => {
+  const storageUrl = 'http://10.0.0.195:9000/circle/avatars/user-1/a.png';
+  const overlongUrl = `https://cdn.example.com/${'a'.repeat(490)}.png`;
+  const errorsOn = (errors: { property: string }[], property: string) =>
+    errors.filter((error) => error.property === property);
+
+  it('CreateCircleDto.avatarUrl requires an absolute URL of at most 500 chars', () => {
+    const avatarErrors = (avatarUrl: string) =>
+      errorsOn(
+        validateSync(plainToInstance(CreateCircleDto, { avatarUrl })),
+        'avatarUrl',
+      );
+
+    expect(avatarErrors('avatars/user-1/a.png').length).toBeGreaterThan(0);
+    expect(avatarErrors(overlongUrl).length).toBeGreaterThan(0);
+    expect(avatarErrors(storageUrl)).toHaveLength(0);
+  });
+
+  it('UpdateCircleDto.avatarUrl requires an absolute URL', () => {
+    expect(failed({ avatarUrl: 'avatars/user-1/a.png' }, 'avatarUrl')).toBe(
+      true,
+    );
+    expect(failed({ avatarUrl: storageUrl }, 'avatarUrl')).toBe(false);
+  });
+
+  it('UploadCircleIconDto.imageUrl is capped at 500 chars', () => {
+    const imageErrors = (imageUrl: string) =>
+      errorsOn(
+        validateSync(plainToInstance(UploadCircleIconDto, { imageUrl })),
+        'imageUrl',
+      );
+
+    expect(imageErrors(overlongUrl).length).toBeGreaterThan(0);
+    expect(imageErrors(storageUrl)).toHaveLength(0);
   });
 });

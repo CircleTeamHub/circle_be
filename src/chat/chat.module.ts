@@ -26,7 +26,7 @@ import { ChatService } from './chat.service';
 import { ChatSupportRechargeProcessor } from './chat-support-recharge.processor';
 import { ChatDirectAutoReplyProcessor } from './chat-direct-auto-reply.processor';
 
-// PrismaService 与 SessionRevocationService 来自 @Global 模块(Prisma/Auth);
+// PrismaService 与 SessionVerifier 来自 @Global 模块(Prisma/Auth);
 // JwtModule 仿 RealtimeModule 各自注册(verify 用);敏感词/上传服务显式 import。
 @Module({
   imports: [

@@ -26,7 +26,6 @@ export enum DisplayIconTypeDto {
 export enum SystemIconKeyDto {
   VIP = 'VIP',
   NEW_USER = 'NEW_USER',
-  PARTNER = 'PARTNER',
   TOP_COLLABORATOR = 'TOP_COLLABORATOR',
   VERIFIED_PROFILE = 'VERIFIED_PROFILE',
   CIRCLE_BUILDER = 'CIRCLE_BUILDER',
@@ -181,6 +180,7 @@ export class UpdateDisplayIconsDto {
 export class UploadCircleIconDto {
   @ApiProperty()
   @IsUrl(URL_VALIDATION_OPTIONS)
+  @MaxLength(500)
   imageUrl: string;
 
   @ApiPropertyOptional()

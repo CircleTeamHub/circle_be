@@ -1800,7 +1800,7 @@ describe('CirclePlazaService', () => {
       expect(result.items[0].expiresAt).toBe('2026-06-02T00:00:00.000Z');
     });
 
-    it('returns signers with OpenIM ids for my own post', async () => {
+    it('returns signers for my own post', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
         id: 'post-1',
         status: 'ACTIVE',
@@ -1842,15 +1842,71 @@ describe('CirclePlazaService', () => {
       expect(result.items[0]).toEqual(
         expect.objectContaining({
           userId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
-          // 兼容字段:OpenIM 去连字符形态已弃用,直接回传 UUID。
-          imUserId: '0a9ad3d6-ef1d-47bd-9cbc-cda1cee57547',
           nickname: 'meiguici',
           seen: false,
           displayIcons,
           recognized: false,
         }),
       );
+      // OpenIM 时代的 imUserId 别名已无读者(客户端 normalizer 缺省归一成 '')。
+      expect(result.items[0]).not.toHaveProperty('imUserId');
       expect(result.recognitionOpen).toBe(false);
+    });
+
+    // 报名列表此前硬截 200 条且不告知截断：第 201 位起在「报名管理」里看不见，也进不了
+    // 合作认可候选。默认仍取 200（已装机 App 不传 limit），多取一条判断 hasMore。
+    it('reports hasMore when the post has more signers than the page limit', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ACTIVE',
+        collaborationRecognizedAt: null,
+      });
+      const signup = (n: number) => ({
+        createdAt: new Date(`2026-06-0${n}T00:00:00Z`),
+        seenByAuthor: true,
+        user: {
+          id: `user-${n}`,
+          nickname: `u${n}`,
+          avatarUrl: null,
+          accountId: `${n}`,
+        },
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([
+        signup(3),
+        signup(2),
+        signup(1),
+      ]);
+      prisma.collaborationRecognition.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getMyPostSignups('author-1', 'post-1', 2);
+
+      expect(prisma.circlePostSignup.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 3 }),
+      );
+      expect(result.hasMore).toBe(true);
+      expect(result.items.map((item) => item.userId)).toEqual([
+        'user-3',
+        'user-2',
+      ]);
+    });
+
+    it('keeps the 200-signer default page for clients that send no limit', async () => {
+      prisma.circlePost.findFirst.mockResolvedValue({
+        id: 'post-1',
+        status: 'ACTIVE',
+        collaborationRecognizedAt: null,
+      });
+      prisma.circlePostSignup.findMany.mockResolvedValue([]);
+      prisma.collaborationRecognition.findMany.mockResolvedValue([]);
+      iconService.getDisplayIconsForUsers.mockResolvedValue(new Map());
+
+      const result = await service.getMyPostSignups('author-1', 'post-1');
+
+      expect(prisma.circlePostSignup.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 201 }),
+      );
+      expect(result.hasMore).toBe(false);
     });
 
     it('opens recognition selection for ended unrecognized posts and marks already recognized signers', async () => {
@@ -2442,39 +2498,6 @@ describe('CirclePlazaService', () => {
     });
   });
 
-  describe('getPostSignups', () => {
-    it('maps signups to public user shape', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue({ id: 'post-1' });
-      prisma.circlePostSignup.findMany.mockResolvedValue([
-        {
-          createdAt: new Date('2026-06-05T00:00:00Z'),
-          user: { id: 'u1', nickname: 'A', avatarUrl: null, accountId: '100' },
-        },
-      ]);
-
-      const result = await service.getPostSignups('author-1', 'post-1');
-
-      expect(result.items).toEqual([
-        {
-          id: 'u1',
-          nickname: 'A',
-          avatarUrl: null,
-          accountId: '100',
-          signedAt: '2026-06-05T00:00:00.000Z',
-        },
-      ]);
-    });
-
-    it('rejects reading signups for a post the caller does not own', async () => {
-      prisma.circlePost.findFirst.mockResolvedValue(null);
-
-      await expect(service.getPostSignups('user-2', 'post-1')).rejects.toThrow(
-        NotFoundException,
-      );
-      expect(prisma.circlePostSignup.findMany).not.toHaveBeenCalled();
-    });
-  });
-
   describe('signedByMe in DTO', () => {
     it('getPost returns signedByMe=true when viewer has signed up', async () => {
       prisma.circlePost.findFirst.mockResolvedValue({
@@ -2514,6 +2537,8 @@ describe('CirclePlazaService', () => {
 
       expect(dto.signupCount).toBe(2);
       expect(dto.signedByMe).toBe(true);
+      // viewCount 没有任何写入方(恒为 0),客户端也不读 —— 不再下发。
+      expect(dto).not.toHaveProperty('viewCount');
     });
 
     it('getPost blocks regular viewers before reading the post', async () => {

@@ -1,6 +1,10 @@
-import { Expose, Type } from 'class-transformer';
+import { Expose, Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { DisplayIconDto } from 'src/icon/dto/icon.dto';
+import {
+  type FancyNumberStatusSnapshot,
+  resolveEffectiveFancyNumber,
+} from 'src/fancy-number/fancy-number-status';
 
 export class MembershipNameAppearanceDto {
   @ApiProperty({
@@ -32,16 +36,6 @@ export class PublicMembershipAppearanceDto {
   appearance: MembershipNameAppearanceDto;
 }
 
-export class SelfMembershipAppearanceDto extends PublicMembershipAppearanceDto {
-  @ApiProperty()
-  @Expose()
-  active: boolean;
-
-  @ApiProperty()
-  @Expose()
-  lifetime: boolean;
-}
-
 export class AvatarFrameAppearanceDto {
   @ApiProperty()
   @Expose()
@@ -60,7 +54,12 @@ export class AvatarFrameAppearanceDto {
   imageUrl: string | null;
 }
 
-/** Safe public profile — no PII. Used for GET /user/:id viewed by other users. */
+/**
+ * Safe public profile — no PII, no account role/status. Used as-is for the
+ * account search (GET /user/search/account) and as the base of the profile and
+ * self views. role/status live on SelfUserDto only: on this view they let any
+ * signed-in user pick out admin accounts.
+ */
 export class PublicUserDto {
   @ApiProperty({ example: '7f6dcb5e-0d94-463c-b6b3-165b1aa77845' })
   @Expose()
@@ -123,18 +122,6 @@ export class PublicUserDto {
   @Expose()
   city: string | null;
 
-  @ApiPropertyOptional({ example: '上海' })
-  @Expose()
-  region: string | null;
-
-  @ApiProperty({ example: 'USER', enum: ['USER', 'ADMIN'] })
-  @Expose()
-  role: string;
-
-  @ApiProperty({ example: 'ACTIVE' })
-  @Expose()
-  status: string;
-
   @ApiPropertyOptional({ example: '2026-04-06T00:00:00.000Z' })
   @Expose()
   lastOnline: Date | null;
@@ -160,11 +147,6 @@ export class PublicUserDto {
   })
   @Expose()
   vipLevel: number;
-
-  @ApiProperty({ type: PublicMembershipAppearanceDto })
-  @Expose()
-  @Type(() => PublicMembershipAppearanceDto)
-  membership: PublicMembershipAppearanceDto;
 }
 
 /**
@@ -184,18 +166,26 @@ export class SelfUserDto extends PublicUserDto {
   @Expose()
   phoneNumber: string | null;
 
-  @ApiProperty({ example: 3 })
+  // 管理台登录门（RequireAdmin / LoginPage）只从 /auth/me 读这两个字段。
+  @ApiProperty({ example: 'USER', enum: ['USER', 'ADMIN'] })
   @Expose()
-  storedVipLevel: number;
+  role: string;
 
-  @ApiPropertyOptional({ example: '2026-08-22T00:00:00.000Z', nullable: true })
+  @ApiProperty({ example: 'ACTIVE' })
   @Expose()
-  vipExpiresAt: Date | null;
+  status: string;
 
-  @ApiProperty({ type: SelfMembershipAppearanceDto })
+  // 靓号租约到期由 fancy-number 流程惰性回收（每分钟一轮 sweep），回收前列上仍是
+  // true。与广场 / 圈子准入同一条判定，只外露结果；租期两列不外露。
+  @ApiProperty({
+    example: false,
+    description: '当前是否持有有效靓号（租约已过期即为 false）',
+  })
   @Expose()
-  @Type(() => SelfMembershipAppearanceDto)
-  declare membership: SelfMembershipAppearanceDto;
+  @Transform(({ obj }: { obj: FancyNumberStatusSnapshot }) =>
+    resolveEffectiveFancyNumber(obj),
+  )
+  fancyNumber: boolean;
 
   @ApiProperty({ example: 100 })
   @Expose()
@@ -225,11 +215,4 @@ export class ProfileUserDto extends PublicUserDto {
   @ApiProperty({ example: 12, description: '收到的累计点赞总数' })
   @Expose()
   likeCount: number;
-
-  @ApiProperty({
-    example: false,
-    description: '当前登录用户今天是否已为其点赞（看自己时恒为 false）',
-  })
-  @Expose()
-  likedByMeToday: boolean;
 }

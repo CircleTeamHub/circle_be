@@ -34,9 +34,16 @@ export const USER_PROFILE_SELECT = {
   updatedAt: true,
 } as const;
 
-/** `/me` view — the profile fields plus the owner-only account economy fields. */
+/**
+ * `/me` view (also the PATCH /user/:id response) — the profile fields plus the
+ * owner-only account fields. The fancy-number lease columns only feed
+ * SelfUserDto's effective `fancyNumber`; the lease itself is never exposed.
+ */
 export const USER_ME_SELECT = {
   ...USER_PROFILE_SELECT,
   inviteCode: true,
   creditScore: true,
+  fancyNumber: true,
+  fancyNumberExpiresAt: true,
+  fancyNumberPermanent: true,
 } as const;

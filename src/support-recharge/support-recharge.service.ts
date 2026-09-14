@@ -12,6 +12,7 @@ import {
   Prisma,
   SupportRechargeFulfillmentType,
   SupportRechargeOrder,
+  SupportRechargePaymentCode,
 } from 'src/generated/prisma';
 import { MembershipAdminService } from 'src/membership/membership-admin.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -40,15 +41,15 @@ type CanonicalFulfillment = {
   note: string | null;
 };
 
+// 管理台申请列表读取的列。conversationID / evidenceMessageID / updatedAt 管理台
+// 不读；evidenceObjectKey 只用来签预览 URL，不随响应出去（见 presentOrders）。
 const ORDER_SELECT = {
   id: true,
   orderNo: true,
-  conversationID: true,
   userID: true,
   agentUserID: true,
   requestKind: true,
   status: true,
-  evidenceMessageID: true,
   evidenceObjectKey: true,
   submittedAt: true,
   fulfillmentType: true,
@@ -58,7 +59,6 @@ const ORDER_SELECT = {
   reviewedAt: true,
   rejectionReason: true,
   createdAt: true,
-  updatedAt: true,
 } as const;
 
 @Injectable()
@@ -81,12 +81,7 @@ export class SupportRechargeService {
         { createdAt: 'desc' },
       ],
     });
-    return Promise.all(
-      rows.map(async (row) => ({
-        ...row,
-        previewUrl: await this.signEvidence(row.objectKey),
-      })),
-    );
+    return Promise.all(rows.map((row) => this.presentPaymentCode(row)));
   }
 
   async createPaymentCode(
@@ -136,10 +131,7 @@ export class SupportRechargeService {
       });
       return row;
     });
-    return {
-      ...created,
-      previewUrl: await this.signEvidence(created.objectKey),
-    };
+    return this.presentPaymentCode(created);
   }
 
   async updatePaymentCode(
@@ -202,7 +194,7 @@ export class SupportRechargeService {
       });
       return updated;
     });
-    return { ...after, previewUrl: await this.signEvidence(after.objectKey) };
+    return this.presentPaymentCode(after);
   }
 
   async setPaymentCodeEnabled(
@@ -241,7 +233,7 @@ export class SupportRechargeService {
       });
       return after;
     });
-    return { ...after, previewUrl: await this.signEvidence(after.objectKey) };
+    return this.presentPaymentCode(after);
   }
 
   async listOrders(query: ListSupportRechargeOrdersQueryDto) {
@@ -262,26 +254,35 @@ export class SupportRechargeService {
       }>
     >,
   ) {
-    const userIds = [
-      ...new Set(orders.flatMap((order) => [order.userID, order.agentUserID])),
-    ];
+    // 管理台只渲染申请人（user），客服（agent）那一侧不再 join。
+    const userIds = [...new Set(orders.map((order) => order.userID))];
     const users = await this.prisma.user.findMany({
       where: { id: { in: userIds } },
       select: { id: true, accountId: true, nickname: true },
     });
     const byId = new Map(users.map((user) => [user.id, user]));
     return Promise.all(
-      orders.map(async (order) => {
-        const { evidenceObjectKey, ...safeOrder } = order;
-        return {
-          ...safeOrder,
-          user: byId.get(order.userID) ?? null,
-          agent: byId.get(order.agentUserID) ?? null,
-          evidenceUrl: evidenceObjectKey
-            ? await this.signEvidence(evidenceObjectKey)
-            : null,
-        };
-      }),
+      orders.map(async (order) => ({
+        id: order.id,
+        orderNo: order.orderNo,
+        userID: order.userID,
+        agentUserID: order.agentUserID,
+        requestKind: order.requestKind,
+        status: order.status,
+        submittedAt: order.submittedAt,
+        fulfillmentType: order.fulfillmentType,
+        fulfillmentPayload: order.fulfillmentPayload,
+        paymentTransactionID: order.paymentTransactionID,
+        reviewedBy: order.reviewedBy,
+        reviewedAt: order.reviewedAt,
+        rejectionReason: order.rejectionReason,
+        createdAt: order.createdAt,
+        user: byId.get(order.userID) ?? null,
+        // 私有对象键不出去，换成 15 分钟预签名 URL。
+        evidenceUrl: order.evidenceObjectKey
+          ? await this.signEvidence(order.evidenceObjectKey)
+          : null,
+      })),
     );
   }
 
@@ -654,6 +655,24 @@ export class SupportRechargeService {
       message,
       errorCode: SupportErrorCode.RechargeOrderStateConflict,
     });
+  }
+
+  /**
+   * 收款码按列显式映射：createdBy（创建它的管理员 userId）只属于审计，管理台不读，
+   * 不随响应出去；其余列与管理台的 SupportRechargePaymentCode 类型一一对应。
+   */
+  private async presentPaymentCode(row: SupportRechargePaymentCode) {
+    return {
+      id: row.id,
+      label: row.label,
+      objectKey: row.objectKey,
+      validFrom: row.validFrom,
+      validUntil: row.validUntil,
+      enabled: row.enabled,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      previewUrl: await this.signEvidence(row.objectKey),
+    };
   }
 
   private async signEvidence(objectKey: string): Promise<string | null> {

@@ -377,7 +377,7 @@ REST。避免本地库无限膨胀。
 
 | 能力 | 方案 | 备注 |
 |---|---|---|
-| **逐条已读回执** | `GET /chat/messages/:id/readers`：读者 = `ChatMember.lastReadHeight >= 该消息 height` | **不需要新表**。这是自研栈的红利 —— OpenIM 反倒要单独存回执行 |
+| **逐条已读回执** | `GET /chat/messages/:id/readers`：读者 = `ChatMember.lastReadHeight >= 该消息 height`；只有消息发送者本人可查（其余 403 `CHAT_READERS_FORBIDDEN`） | **不需要新表**。这是自研栈的红利 —— OpenIM 反倒要单独存回执行 |
 | **已送达回执** | `ChatMember` 加 `lastDeliveredHeight`；客户端收到 `chat:msg` 后回 `chat:delivered {conversationId, height}` | 复用现有 pending 已读的节流队列 |
 | **表情回复** | 新表 `ChatMessageReaction(messageID, userID, emoji)` + 唯一约束；事件 `chat:reaction` | **不进 height 坐标系** —— 不是消息，不推进未读、不改 `lastMessageAt` |
 | **消息编辑** | `ChatMessage` 加 `editedAt` + `contentHistory Json?`；事件 `chat:edit` | 仅发送者、仅 text/quote、2 分钟窗口；**不改 height**（否则排序坐标系要重算） |
@@ -461,11 +461,13 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 | `chat:delivered` | C→S | `{conversationId, height}` | §2.6 |
 | `chat:reaction` | 双向 | `{conversationId, messageId, emoji, userId, op}` | §2.6 |
 | `chat:edit` | 双向 | `{conversationId, messageId, content}` | §2.6 |
+| `chat:burned_messages` | S→C | `{conversationId, messageIds}`（墓碑提交后发往在座成员个人房；每条 ≤500 个 id，超出分片） | §10.4 |
 
 ### REST / 推送变更
 
 - `GET /chat/conversations/:id/messages` 增 `afterHeight` 参数，升序增量拉取（§2.9）
 - `POST /chat/conversations/:id/clear`（§2.10）
+- `GET /chat/conversations/:id/burn`：读当前会话级焚毁档位，与 POST 回执同形 `{burnDurationSec}`，仅在座成员（§2.7）
 - Expo push payload 增可选 `badge`（§2.12，批 5）
 
 ### DTO 变更
@@ -473,6 +475,7 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 - `ChatMessageDto` 增 `replyTo?: {id, height, senderNickname, type, preview}`（§2.3）
 - `ChatMessageDto` 增 `revokedAt?: string | null`、`editedAt?: string | null`
 - `ChatConversationDto` 增 `burnDurationSec?: number | null`（§2.7）
+- `ChatConversationDto` 增 `peerReadHeight: number | null`：DIRECT 对端座位的已读水位，其余类型 null（冷启动恢复「已读」）
 
 ### 新增错误码（`ChatErrorCode`，需补 5 语种 `serverErrors.*` 词条）
 
@@ -656,6 +659,11 @@ presence 房。好友基本都有共同会话，实际影响小 —— 排最后
 时间轴）。焚毁的物理删除没有对应的时间戳列，同一条通道带不上 ——
 离线设备上那些已被 sweeper 删掉的消息，要等重新进会话拉历史才消失。
 补它需要给 `ChatMessage` 加 `updatedAt` + 索引，留到需要时再做。
+
+在线设备这一半已补：sweeper 与「放宽焚毁前的兜底真删」每批墓碑**提交之后**发
+`chat:burned_messages {conversationId, messageIds}` 到在座成员个人房（每条 ≤500 个 id，
+超出分片；广播失败只记日志，不中断焚毁）。离线设备仍按上面的限制。
+mutations 查询同时排除 `deleted = true` 的墓碑：正文已清空，当成「编辑」回放会拿空正文覆盖对端缓存。
 
 ---
 

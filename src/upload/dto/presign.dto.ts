@@ -60,7 +60,11 @@ const ALLOWED_CONTENT_TYPES = [
   ...CHAT_ONLY_CONTENT_TYPES,
 ];
 
-const ALLOWED_FOLDERS = [
+/**
+ * App 可申请上传的目录。哪些目录匿名可读由 upload.service 的
+ * PUBLIC_READ_UPLOAD_FOLDERS 决定(notes、chat 是私有目录)。
+ */
+export const UPLOAD_FOLDERS = [
   'avatars',
   'covers',
   'posts',
@@ -68,7 +72,7 @@ const ALLOWED_FOLDERS = [
   'chat',
   'friends',
 ] as const;
-export type UploadFolder = (typeof ALLOWED_FOLDERS)[number];
+export type UploadFolder = (typeof UPLOAD_FOLDERS)[number];
 
 export class PresignDto {
   @ApiProperty({ example: 'avatar.jpg', description: '原始文件名' })
@@ -99,10 +103,10 @@ export class PresignDto {
 
   @ApiPropertyOptional({
     example: 'avatars',
-    enum: ALLOWED_FOLDERS,
+    enum: UPLOAD_FOLDERS,
     description: '存储目录，默认 avatars',
   })
   @IsOptional()
-  @IsIn(ALLOWED_FOLDERS)
+  @IsIn(UPLOAD_FOLDERS)
   folder?: UploadFolder;
 }

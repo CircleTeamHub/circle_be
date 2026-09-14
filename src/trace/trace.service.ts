@@ -39,6 +39,14 @@ import { logBusinessEvent } from 'src/logging/business-event.logger';
 const TRACE_FEED_LIKE_PREVIEW_LIMIT = 20;
 const TRACE_FEED_COMMENT_PREVIEW_LIMIT = 20;
 const TRACE_DETAIL_COMMENT_LIMIT = 100;
+// 好友范围查询（每个 feed 页、详情页都要跑）的护栏，对齐好友业务上限：会员 5000，
+// 即 FriendService 里 listFriends 用的 FRIEND_LIMIT_MEMBER（该常量未导出）。低于它
+// 会静默吞掉合法好友的动态。
+const TRACE_FRIEND_SCOPE_LIMIT = 5_000;
+// 预览/详情评论的 replyTo 只给映射用：串楼要父评论 id，展示要被回复人的昵称。
+const TRACE_COMMENT_REPLY_TO_SELECT = {
+  select: { id: true, user: { select: { nickname: true } } },
+} as const;
 
 /**
  * Trace-feed keyset cursor — thin wrappers over the shared feed-cursor util so
@@ -173,9 +181,7 @@ export class TraceService {
             where: { deleted: false },
             include: {
               user: { select: { id: true, nickname: true } },
-              replyTo: {
-                include: { user: { select: { id: true, nickname: true } } },
-              },
+              replyTo: TRACE_COMMENT_REPLY_TO_SELECT,
             },
             orderBy: { createdAt: 'desc' },
             take: TRACE_FEED_COMMENT_PREVIEW_LIMIT,
@@ -298,9 +304,7 @@ export class TraceService {
           where: { deleted: false },
           include: {
             user: { select: { id: true, nickname: true } },
-            replyTo: {
-              include: { user: { select: { id: true, nickname: true } } },
-            },
+            replyTo: TRACE_COMMENT_REPLY_TO_SELECT,
           },
           orderBy: { createdAt: 'desc' },
           take: TRACE_DETAIL_COMMENT_LIMIT,
@@ -974,6 +978,8 @@ export class TraceService {
         state: 'ACCEPTED',
       },
       select: { userID: true, friendID: true },
+      orderBy: { updatedAt: 'desc' },
+      take: TRACE_FRIEND_SCOPE_LIMIT,
     });
     return records.map((r) => (r.userID === userId ? r.friendID : r.userID));
   }

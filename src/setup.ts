@@ -373,20 +373,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const metrics = createMetrics();
   app.use(createHttpMetricsMiddleware(metrics));
   // Expose HTTP RED, business, and Redis resilience metrics together.
-  // Gated by METRICS_AUTH_TOKEN when set; left open otherwise so internal-only
-  // deployments keep working without extra config.
+  // Gated by METRICS_AUTH_TOKEN when set. Production cannot boot without it (env
+  // validation), so only development/test ever serve /metrics unauthenticated.
   const metricsAuthToken =
     String(
       config['METRICS_AUTH_TOKEN'] ?? process.env.METRICS_AUTH_TOKEN ?? '',
     ).trim() || undefined;
-  if (isProduction && !metricsAuthToken) {
-    new Logger('Metrics').warn(
-      '/metrics is served without authentication (METRICS_AUTH_TOKEN unset). ' +
-        'Restrict it at the network layer or set METRICS_AUTH_TOKEN — the ' +
-        'exposition format reveals route inventory, business-event rates, and ' +
-        'process stats.',
-    );
-  }
   // 基建状态 gauge（#87/#102）：桶策略未确认、Redis 存活。抓取时求值。
   const uploadServiceForMetrics = getOptionalUploadService(app);
   const infraStatusMetrics = createInfraStatusMetrics({
@@ -504,7 +496,9 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', createWriteMethodLimiterMount(noteWriteLimiter));
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
-    if (req.method === 'POST' || req.method === 'DELETE') {
+    // 写方法与 note 挂载同一集合(POST/PATCH/PUT/DELETE):PATCH /circle/:id 编辑圈子、
+    // 改群名/群公告此前只算读配额。
+    if (WRITE_METHODS.has(req.method)) {
       return circleWriteLimiter(req, res, next);
     }
     // 读也要限：GET /circle?city= 是数组包含查询，且 service 用 Promise.all 并发发出
@@ -521,6 +515,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
     next();
   });
   app.use('/api/v1/circle-plaza', (req: any, res: any, next: any) => {
+    // POST /feed/search 是读（筛选条件太长才走请求体）：不能吃发帖/报名/举报的写配额，
+    // 它有路由级 @Throttle（60 次/分钟）与全局兜底。
+    const path = String(req.path ?? '').replace(/\/+$/, '');
+    if (req.method === 'POST' && path === '/feed/search') {
+      return next();
+    }
     if (req.method === 'POST' || req.method === 'DELETE') {
       return circlePlazaWriteLimiter(req, res, next);
     }

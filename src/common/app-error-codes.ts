@@ -273,6 +273,9 @@ export const NoteErrorCode = {
   ShareLinkInvalidCursor: 'NOTE_SHARE_LINK_INVALID_CURSOR',
   // #94：每用户活跃分享链接达到上限。
   ShareLinkLimit: 'NOTE_SHARE_LINK_LIMIT',
+  // 分享链接功能未开启（部署没配 NOTE_SHARE_WEB_BASE，没有能打开的落地页）。
+  // 只用于主人侧创建；访客侧解析在功能关闭时仍回 ShareLinkInvalid，不暴露部署配置。
+  ShareLinkUnavailable: 'NOTE_SHARE_LINK_UNAVAILABLE',
 } as const;
 
 // 实时通话:会在通话 UI 弹给用户的错误。
@@ -339,6 +342,8 @@ export const ChatErrorCode = {
   EditWindowExpired: 'CHAT_EDIT_WINDOW_EXPIRED',
   EditForbidden: 'CHAT_EDIT_FORBIDDEN',
   ForwardForbidden: 'CHAT_FORWARD_FORBIDDEN',
+  // 逐条已读名单只给消息发送者本人(其他成员的消息、无作者的系统消息一律拒)。
+  ReadersForbidden: 'CHAT_READERS_FORBIDDEN',
   // 独立群聊(不挂圈子的 GROUP):建群/邀请只能选好友;圈子群的成员由圈子管理,
   // 独立群专属操作(邀请/退群/改名)打到圈子群上要显式拒绝而不是静默生效。
   GroupFriendsOnly: 'CHAT_GROUP_FRIENDS_ONLY',

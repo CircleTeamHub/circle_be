@@ -766,3 +766,284 @@ describe('ChatBroadcastService presence visibility events', () => {
     service.onModuleDestroy();
   });
 });
+
+describe('ChatBroadcastService.emitBurnedMessages', () => {
+  function harness(findMany: jest.Mock) {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      { chatMember: { findMany } } as never,
+    );
+    service.setServer({ to } as never);
+    return { service, to, emit };
+  }
+
+  // 焚毁通知只带 id、不带正文,但「哪些消息刚被烧掉」仍是会话元数据:与 chat:msg
+  // 同一条授权边界 —— 只投当前在座成员的个人房,不走可能残留旧 socket 的会话房。
+  it('tells every seated member which message ids burned via their personal rooms', async () => {
+    const findMany = jest
+      .fn()
+      .mockResolvedValue([{ userID: 'u1' }, { userID: 'u2' }]);
+    const { service, to, emit } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', ['m1', 'm2', 'm1']);
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { conversationID: 'conv-1', leftAt: null },
+      select: { userID: true },
+    });
+    expect(to).toHaveBeenCalledWith(['u:u1', 'u:u2']);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(emit).toHaveBeenCalledWith('chat:burned_messages', {
+      conversationId: 'conv-1',
+      messageIds: ['m1', 'm2'],
+    });
+  });
+
+  // App 的 dispatcher 拒收超过 500 个 id 的载荷(防一条畸形事件清空本地库)。
+  it('splits large announcements into payloads the app accepts', async () => {
+    const findMany = jest.fn().mockResolvedValue([{ userID: 'u1' }]);
+    const { service, emit } = harness(findMany);
+    const ids = Array.from({ length: 1001 }, (_, i) => `m${i}`);
+
+    await service.emitBurnedMessages('conv-1', ids);
+
+    expect(findMany).toHaveBeenCalledTimes(1);
+    const payloads = emit.mock.calls.map(
+      ([, payload]) => payload as { messageIds: string[] },
+    );
+    expect(payloads.map((payload) => payload.messageIds.length)).toEqual([
+      500, 500, 1,
+    ]);
+    expect(payloads.flatMap((payload) => payload.messageIds)).toEqual(ids);
+  });
+
+  it('emits nothing for an empty batch', async () => {
+    const findMany = jest.fn();
+    const { service, to } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', []);
+
+    expect(findMany).not.toHaveBeenCalled();
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  it('emits nothing when nobody is seated any more', async () => {
+    const findMany = jest.fn().mockResolvedValue([]);
+    const { service, to } = harness(findMany);
+
+    await service.emitBurnedMessages('conv-1', ['m1']);
+
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  // 删除已经提交;实时通知只是加速各端收敛。查询失败不能冒泡成 sweeper 的失败。
+  it('swallows a seat-query failure because the tombstones are already committed', async () => {
+    const findMany = jest.fn().mockRejectedValue(new Error('db down'));
+    const { service, to } = harness(findMany);
+
+    await expect(
+      service.emitBurnedMessages('conv-1', ['m1']),
+    ).resolves.toBeUndefined();
+    expect(to).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op before the gateway attaches', async () => {
+    const findMany = jest.fn();
+    const service = new ChatBroadcastService(
+      {} as never,
+      { chatMember: { findMany } } as never,
+    );
+
+    await expect(
+      service.emitBurnedMessages('conv-1', ['m1']),
+    ).resolves.toBeUndefined();
+    expect(findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('ChatBroadcastService delivery id privacy', () => {
+  function harness(userIDs: string[]) {
+    const emits: Array<{ rooms: unknown; event: string; payload: unknown }> =
+      [];
+    const to = jest.fn((rooms: unknown) => ({
+      emit: (event: string, payload: unknown) => {
+        emits.push({ rooms, event, payload });
+      },
+    }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers(userIDs) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, emits };
+  }
+
+  const userMessage = {
+    id: 'message-7',
+    conversationId: 'conv-1',
+    height: 7,
+    type: 'text',
+    content: { text: 'hi' },
+    sender: { id: 'sender-1', nickname: 'S', avatarUrl: null, alias: null },
+    replyToId: null,
+    revokedAt: null,
+    revokedBy: null,
+    burnDurationSec: null,
+    d: 'client-delivery-id',
+    createdAt: '2026-09-13T00:00:00.000Z',
+  };
+
+  // d 是发送者本机生成的幂等键:只有发送者自己的设备要靠它把乐观气泡换成服务端
+  // 消息(回显先于 ack 到达时就靠它对账)。其他成员拿到它毫无用处。
+  it("keeps the delivery id for the sender's own devices only", async () => {
+    const { service, emits } = harness(['sender-1', 'peer-1', 'peer-2']);
+
+    await service.emitMessage(userMessage as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1'], event: 'chat:msg', payload: userMessage },
+      {
+        rooms: ['u:peer-1', 'u:peer-2'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('strips the delivery id for everyone once the sender is no longer seated', async () => {
+    const { service, emits } = harness(['peer-1']);
+
+    await service.emitMessage(userMessage as never);
+
+    expect(emits).toEqual([
+      {
+        rooms: ['u:peer-1'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('applies the same split when some members are excluded', async () => {
+    const { service, emits } = harness(['sender-1', 'peer-1', 'blocked-1']);
+
+    await service.emitMessageExcludingUsers(userMessage as never, [
+      'blocked-1',
+    ]);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1'], event: 'chat:msg', payload: userMessage },
+      {
+        rooms: ['u:peer-1'],
+        event: 'chat:msg',
+        payload: { ...userMessage, d: null },
+      },
+    ]);
+  });
+
+  it('sends system notices (no author, no delivery id) in a single emit', async () => {
+    const notice = { ...userMessage, type: 'system', sender: null, d: null };
+    const { service, emits } = harness(['sender-1', 'peer-1']);
+
+    await service.emitMessage(notice as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:sender-1', 'u:peer-1'], event: 'chat:msg', payload: notice },
+    ]);
+  });
+});
+
+// 临时房访客只看到「房主」这个房间内别名，拿不到房主的账号 UUID；房主和其他账号成员
+// 照旧收到真实 id。d 的分流规则不变：只有发送者自己的个人房保留。
+describe('ChatBroadcastService temp-chat guest view', () => {
+  const GUEST_A = `g${'a'.repeat(32)}`;
+  const GUEST_B = `g${'b'.repeat(32)}`;
+
+  function harness(userIDs: string[]) {
+    const emits: Array<{ rooms: unknown; event: string; payload: unknown }> =
+      [];
+    const to = jest.fn((rooms: unknown) => ({
+      emit: (event: string, payload: unknown) => {
+        emits.push({ rooms, event, payload });
+      },
+    }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers(userIDs) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, emits };
+  }
+
+  const hostSender = {
+    id: 'host-1',
+    nickname: '房主',
+    avatarUrl: null,
+    alias: null,
+  };
+  const base = {
+    id: 'message-9',
+    conversationId: 'conv-temp',
+    height: 9,
+    type: 'text',
+    content: { text: 'hi' },
+    replyToId: null,
+    revokedAt: null,
+    revokedBy: null,
+    burnDurationSec: null,
+    createdAt: '2026-09-13T00:00:00.000Z',
+  };
+
+  it('aliases the host id for guest rooms while the host keeps the real payload', async () => {
+    const hostMessage = { ...base, sender: hostSender, d: 'host-delivery-id' };
+    const { service, emits } = harness(['host-1', GUEST_A, GUEST_B]);
+
+    await service.emitMessage(hostMessage as never);
+
+    expect(emits).toEqual([
+      { rooms: ['u:host-1'], event: 'chat:msg', payload: hostMessage },
+      {
+        rooms: [`u:${GUEST_A}`, `u:${GUEST_B}`],
+        event: 'chat:msg',
+        payload: {
+          ...hostMessage,
+          d: null,
+          sender: { ...hostSender, id: 'host' },
+        },
+      },
+    ]);
+  });
+
+  it("keeps a guest's own delivery id and strips it for everyone else", async () => {
+    const guestSender = {
+      id: GUEST_A,
+      nickname: '访客A',
+      avatarUrl: null,
+      alias: null,
+    };
+    const guestMessage = {
+      ...base,
+      sender: guestSender,
+      d: 'guest-delivery-id',
+    };
+    const { service, emits } = harness(['host-1', GUEST_A, GUEST_B]);
+
+    await service.emitMessage(guestMessage as never);
+
+    expect(emits).toEqual([
+      {
+        rooms: ['u:host-1'],
+        event: 'chat:msg',
+        payload: { ...guestMessage, d: null },
+      },
+      { rooms: [`u:${GUEST_A}`], event: 'chat:msg', payload: guestMessage },
+      {
+        rooms: [`u:${GUEST_B}`],
+        event: 'chat:msg',
+        payload: { ...guestMessage, d: null },
+      },
+    ]);
+  });
+});

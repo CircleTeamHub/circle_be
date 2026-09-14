@@ -12,6 +12,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import {
   DeletePushTokenDto,
@@ -36,7 +37,7 @@ export class NotificationController {
   @ApiOperation({
     summary: 'Get unread notification summary for discover/profile domains',
   })
-  getUnreadSummary(@Req() req: any) {
+  getUnreadSummary(@Req() req: RequestWithUser) {
     return this.notificationService.getUnreadSummary(req.user.userId);
   }
 
@@ -44,14 +45,14 @@ export class NotificationController {
   @ApiOperation({
     summary: '读圈子离线推送开关（「圈子通知设置 → 离线提醒」的服务端那一半）',
   })
-  getCirclePushPreference(@Req() req: any) {
+  getCirclePushPreference(@Req() req: RequestWithUser) {
     return this.notificationService.getCirclePushPreference(req.user.userId);
   }
 
   @Put('circle-push-preference')
   @ApiOperation({ summary: '设置圈子离线推送开关' })
   setCirclePushPreference(
-    @Req() req: any,
+    @Req() req: RequestWithUser,
     @Body() dto: UpdateCirclePushPreferenceDto,
   ) {
     return this.notificationService.setCirclePushPreference(
@@ -65,7 +66,7 @@ export class NotificationController {
     summary:
       'Paginated interactive notification list, optionally scoped to one bell domain',
   })
-  list(@Query() query: NotificationListQueryDto, @Req() req: any) {
+  list(@Query() query: NotificationListQueryDto, @Req() req: RequestWithUser) {
     return this.notificationService.getNotifications(
       req.user.userId,
       query.page,
@@ -77,7 +78,10 @@ export class NotificationController {
   @ApiOperation({
     summary: 'Paginated profile-domain system notification list',
   })
-  profileList(@Query() query: NotificationPageQueryDto, @Req() req: any) {
+  profileList(
+    @Query() query: NotificationPageQueryDto,
+    @Req() req: RequestWithUser,
+  ) {
     return this.notificationService.getProfileNotifications(
       req.user.userId,
       query.page,
@@ -89,7 +93,10 @@ export class NotificationController {
     summary:
       'Mark all interactive notifications as read, optionally within one bell domain',
   })
-  readAll(@Query() query: NotificationDomainQueryDto, @Req() req: any) {
+  readAll(
+    @Query() query: NotificationDomainQueryDto,
+    @Req() req: RequestWithUser,
+  ) {
     return this.notificationService.markAllNotificationsRead(
       req.user.userId,
       query.domain,
@@ -100,19 +107,28 @@ export class NotificationController {
   @ApiOperation({
     summary: 'Register or refresh the current device push token',
   })
-  registerPushToken(@Body() dto: RegisterPushTokenDto, @Req() req: any) {
+  registerPushToken(
+    @Body() dto: RegisterPushTokenDto,
+    @Req() req: RequestWithUser,
+  ) {
     return this.notificationService.registerPushToken(req.user.userId, dto);
   }
 
   @Delete('push-token')
   @ApiOperation({ summary: 'Delete the current device push token' })
-  deletePushToken(@Body() dto: DeletePushTokenDto, @Req() req: any) {
+  deletePushToken(
+    @Body() dto: DeletePushTokenDto,
+    @Req() req: RequestWithUser,
+  ) {
     return this.notificationService.deletePushToken(req.user.userId, dto.token);
   }
 
   @Get(':id/open-ownership')
   @ApiOperation({ summary: 'Check whether a push notification belongs to me' })
-  openOwnership(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
+  openOwnership(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: RequestWithUser,
+  ) {
     return this.notificationService.getNotificationOpenOwnership(
       req.user.userId,
       id,
@@ -121,19 +137,19 @@ export class NotificationController {
 
   @Put(':id/read')
   @ApiOperation({ summary: 'Mark one notification as read' })
-  read(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
+  read(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
     return this.notificationService.markNotificationRead(req.user.userId, id);
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Soft-delete one notification' })
-  remove(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
+  remove(@Param('id', ParseUUIDPipe) id: string, @Req() req: RequestWithUser) {
     return this.notificationService.deleteNotification(req.user.userId, id);
   }
 
   @Post('profile/read-all')
   @ApiOperation({ summary: 'Mark profile-domain notifications as read' })
-  markProfileRead(@Req() req: any) {
+  markProfileRead(@Req() req: RequestWithUser) {
     return this.notificationService.markProfileNotificationsRead(
       req.user.userId,
     );

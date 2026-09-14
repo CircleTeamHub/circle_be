@@ -1,10 +1,15 @@
+import { Logger } from '@nestjs/common';
 import { createServer, type Server } from 'http';
 import { EventEmitter } from 'events';
 import type { AddressInfo } from 'net';
 import { WebSocket } from 'ws';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { RedisService } from 'src/redis/redis.service';
-import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import {
+  SessionRevocationService,
+  type RevocationState,
+} from 'src/auth/session-revocation.service';
+import { SessionVerifier } from 'src/auth/session-verifier.service';
 import { SESSION_REVOCATION_CHANNEL } from 'src/auth/session-revocation.broadcast';
 import { RealtimeGateway } from './realtime.gateway';
 import { RealtimeService } from './realtime.service';
@@ -92,6 +97,17 @@ function createPrismaStub() {
   };
 }
 
+/**
+ * The database view SessionVerifier falls back to when Redis cannot answer.
+ * Defaults to an ACTIVE account whose session row was already cleaned up.
+ */
+function createVerifierPrismaStub() {
+  return {
+    user: { findUnique: jest.fn().mockResolvedValue({ status: 'ACTIVE' }) },
+    refreshToken: { findUnique: jest.fn().mockResolvedValue(null) },
+  };
+}
+
 type ClosePayload = { code: number; reason: string };
 
 function waitForClose(socket: WebSocket): Promise<ClosePayload> {
@@ -121,6 +137,7 @@ describe('RealtimeGateway session revocation', () => {
   let gateway: RealtimeGateway;
   let realtime: RealtimeService;
   let revocation: SessionRevocationService;
+  let verifierPrisma: ReturnType<typeof createVerifierPrismaStub>;
   let redis: ReturnType<typeof createRedisBus>;
   let port: number;
   const openSockets: WebSocket[] = [];
@@ -148,10 +165,14 @@ describe('RealtimeGateway session revocation', () => {
       } as never,
     );
 
+    verifierPrisma = createVerifierPrismaStub();
     gateway = new RealtimeGateway(
       jwtService as never,
       realtime,
-      revocation as never,
+      new SessionVerifier(
+        revocation,
+        verifierPrisma as unknown as PrismaService,
+      ),
     );
 
     httpServer = createServer();
@@ -394,11 +415,13 @@ describe('RealtimeGateway session revocation', () => {
       // which would burn one of its user's connection slots for good.
       let releaseCheck = () => {};
       const checkStarted = new Promise<void>((resolve) => {
-        jest.spyOn(revocation, 'isRevoked').mockImplementation(async () => {
-          resolve();
-          await new Promise<void>((r) => (releaseCheck = r));
-          return false;
-        });
+        jest
+          .spyOn(revocation, 'checkRevocation')
+          .mockImplementation(async (): Promise<RevocationState> => {
+            resolve();
+            await new Promise<void>((r) => (releaseCheck = r));
+            return 'active';
+          });
       });
 
       const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
@@ -427,17 +450,17 @@ describe('RealtimeGateway session revocation', () => {
       // Reproduce the ordering that loses a broadcast: the Redis GET has already
       // observed "not revoked", but its promise has not resumed registration yet.
       // The revoke SET + publish therefore arrives while no local socket is tracked.
-      const originalIsRevoked = revocation.isRevoked.bind(revocation);
+      const originalCheck = revocation.checkRevocation.bind(revocation);
       let releaseCheck = () => {};
       const checkStarted = new Promise<void>((resolve) => {
         jest
-          .spyOn(revocation, 'isRevoked')
-          .mockImplementationOnce(async () => {
+          .spyOn(revocation, 'checkRevocation')
+          .mockImplementationOnce(async (): Promise<RevocationState> => {
             resolve();
             await new Promise<void>((r) => (releaseCheck = r));
-            return false;
+            return 'active';
           })
-          .mockImplementation(originalIsRevoked);
+          .mockImplementation(originalCheck);
       });
 
       const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
@@ -475,10 +498,12 @@ describe('RealtimeGateway session revocation', () => {
     });
 
     it('unregisters a token that expires during the revocation lookup', async () => {
-      jest.spyOn(revocation, 'isRevoked').mockImplementation(async () => {
-        await tick(80);
-        return false;
-      });
+      jest
+        .spyOn(revocation, 'checkRevocation')
+        .mockImplementation(async (): Promise<RevocationState> => {
+          await tick(80);
+          return 'active';
+        });
 
       const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
       openSockets.push(socket);
@@ -509,17 +534,19 @@ describe('RealtimeGateway session revocation', () => {
     });
 
     it('does not deliver private events while the final revocation check is pending', async () => {
-      let releaseFinalCheck = (_revoked: boolean) => {};
+      let releaseFinalCheck = (_state: RevocationState) => {};
       let callCount = 0;
       const finalCheckStarted = new Promise<void>((resolve) => {
-        jest.spyOn(revocation, 'isRevoked').mockImplementation(async () => {
-          callCount += 1;
-          if (callCount === 1) return false;
-          resolve();
-          return new Promise<boolean>((release) => {
-            releaseFinalCheck = release;
+        jest
+          .spyOn(revocation, 'checkRevocation')
+          .mockImplementation(async (): Promise<RevocationState> => {
+            callCount += 1;
+            if (callCount === 1) return 'active';
+            resolve();
+            return new Promise<RevocationState>((release) => {
+              releaseFinalCheck = release;
+            });
           });
-        });
       });
 
       const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
@@ -550,7 +577,7 @@ describe('RealtimeGateway session revocation', () => {
       await tick();
       expect(received).toEqual([]);
 
-      releaseFinalCheck(true);
+      releaseFinalCheck('revoked');
       await expect(closed).resolves.toEqual({
         code: 1008,
         reason: 'Session revoked',
@@ -561,8 +588,8 @@ describe('RealtimeGateway session revocation', () => {
       jest.useFakeTimers();
       try {
         jest
-          .spyOn(revocation, 'isRevoked')
-          .mockImplementation(() => new Promise<boolean>(() => {}));
+          .spyOn(revocation, 'checkRevocation')
+          .mockImplementation(() => new Promise<RevocationState>(() => {}));
         const socket = new EventEmitter() as EventEmitter & {
           close: jest.Mock;
           readyState: number;
@@ -598,7 +625,7 @@ describe('RealtimeGateway session revocation', () => {
     });
 
     it('keeps a session established after the revoke stamp (re-login race)', async () => {
-      // Mirrors `isRevoked`: the per-user marker only kills tokens issued at or
+      // Mirrors `checkRevocation`: the per-user marker only kills tokens issued at or
       // before the revoke instant. A device that logged back in afterwards must
       // survive, otherwise "log out all devices" would kick the new session.
       await revocation.revokeUser('user-6');
@@ -613,12 +640,26 @@ describe('RealtimeGateway session revocation', () => {
     });
   });
 
-  describe('fail-open when Redis is disabled', () => {
+  // Redis 没配或故障时吊销标记读不到。以前这里一律放行（fail-open）；现在与 HTTP
+  // 共用 SessionVerifier：回落数据库核对账号状态与会话行。
+  describe('database fallback when Redis is disabled', () => {
     beforeEach(async () => {
       await boot(createRedisBus(false));
     });
 
-    it('still accepts connections and closes nothing on revoke', async () => {
+    async function authenticate(payload: Record<string, unknown>) {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/realtime`);
+      openSockets.push(socket);
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', () => resolve());
+        socket.once('error', reject);
+      });
+      const closed = waitForClose(socket);
+      socket.send(JSON.stringify({ type: 'auth', token: signToken(payload) }));
+      return closed;
+    }
+
+    it('accepts an ACTIVE account and closes nothing on a Redis-only revoke', async () => {
       const socket = await connectAuthenticated({
         sub: 'user-7',
         sid: 'session-7',
@@ -634,6 +675,36 @@ describe('RealtimeGateway session revocation', () => {
         ([channel]) => channel === SESSION_REVOCATION_CHANNEL,
       );
       expect(revocationPublishes).toHaveLength(0);
+    });
+
+    it('rejects a banned account at connect time with the revoked frame', async () => {
+      verifierPrisma.user.findUnique.mockResolvedValue({ status: 'BANNED' });
+
+      await expect(
+        authenticate({
+          sub: 'user-banned',
+          sid: 'session-banned',
+          issuedAtMs: Date.now() - 5_000,
+        }),
+      ).resolves.toEqual({ code: 1008, reason: 'Session revoked' });
+      expect(realtime.getConnectionCount('user-banned')).toBe(0);
+    });
+
+    // 数据库也答不上来不是「吊销」：用 1013（Try Again Later）关闭。circle-im 的
+    // src/realtime/client.ts 只把 1008 + 'Session revoked' 当终态，其余一律退避重连，
+    // 登录态保留；若这里发撤销帧，一次 Redis+数据库同时抖动会把所有在线用户登出。
+    it('closes with a retryable 1013 when the session cannot be verified', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      verifierPrisma.user.findUnique.mockRejectedValue(new Error('db down'));
+
+      await expect(
+        authenticate({
+          sub: 'user-unverifiable',
+          sid: 'session-unverifiable',
+          issuedAtMs: Date.now() - 5_000,
+        }),
+      ).resolves.toEqual({ code: 1013, reason: 'Try again later' });
+      expect(realtime.getConnectionCount('user-unverifiable')).toBe(0);
     });
   });
 });

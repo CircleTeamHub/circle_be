@@ -82,10 +82,6 @@ type EligibilityUserRow = {
   avatarUrl: string | null;
   nickname: string | null;
   city: string | null;
-  email: string | null;
-  phoneNumber: string | null;
-  wechat: string | null;
-  qq: string | null;
   persona: string | null;
   helloWords: string | null;
   whatsup: string | null;
@@ -112,7 +108,34 @@ type StoredSelection = {
   sortOrder: number;
 };
 
-// Prisma select shared by every user fetch feeding eligibility.
+// Whether a user filled in each contact method. Computed in the database (see
+// fetchContactPresence) so email / phone / wechat / qq never reach this process
+// just to be tested for non-emptiness on every feed author.
+type ContactPresence = {
+  hasEmail: boolean;
+  hasPhoneNumber: boolean;
+  hasWechat: boolean;
+  hasQQ: boolean;
+};
+
+const NO_CONTACT_PRESENCE: ContactPresence = {
+  hasEmail: false,
+  hasPhoneNumber: false,
+  hasWechat: false,
+  hasQQ: false,
+};
+
+/**
+ * Exactly the code points String.prototype.trim() strips (ECMAScript WhiteSpace
+ * and LineTerminator). Postgres btrim() only strips ASCII spaces by default, so
+ * the contact-presence projection passes this set to match hasText().
+ */
+export const JS_TRIM_CHARACTERS =
+  '\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007' +
+  '\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff';
+
+// Prisma select shared by every user fetch feeding eligibility. Contact columns
+// are deliberately absent: they arrive as booleans from fetchContactPresence.
 const ELIGIBILITY_USER_SELECT = {
   id: true,
   vipLevel: true,
@@ -123,10 +146,6 @@ const ELIGIBILITY_USER_SELECT = {
   avatarUrl: true,
   nickname: true,
   city: true,
-  email: true,
-  phoneNumber: true,
-  wechat: true,
-  qq: true,
   persona: true,
   helloWords: true,
   whatsup: true,
@@ -351,7 +370,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
     }
     if (uncached.length === 0) return result;
 
-    const [users, membershipsByUser, privacyByUser, selections] =
+    const [users, membershipsByUser, privacyByUser, selections, contacts] =
       await Promise.all([
         this.prisma.user.findMany({
           where: { id: { in: uncached } },
@@ -363,6 +382,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
           where: { userID: { in: uncached } },
           orderBy: { sortOrder: 'asc' },
         }),
+        this.fetchContactPresence(uncached),
       ]);
 
     const selectionsByUser = new Map<string, StoredSelection[]>();
@@ -379,6 +399,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
         // getSettingsForUsers returns an entry (defaults included) for every
         // requested id, so this is always defined for a user in `uncached`.
         privacyByUser.get(user.id) as PrivacySettingsDto,
+        contacts.get(user.id) ?? NO_CONTACT_PRESENCE,
       );
       const display = this.computeReadonlyDisplayIcons(
         user.id,
@@ -513,13 +534,14 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async resolveEligibility(userId: string): Promise<Eligibility> {
-    const [user, membershipsByUser, privacy] = await Promise.all([
+    const [user, membershipsByUser, privacy, contacts] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
         select: ELIGIBILITY_USER_SELECT,
       }),
       this.fetchEligibilityMemberships([userId]),
       this.privacySettings.getSettings(userId),
+      this.fetchContactPresence([userId]),
     ]);
 
     if (!user) {
@@ -530,6 +552,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
       user,
       membershipsByUser.get(userId) ?? [],
       privacy,
+      contacts.get(userId) ?? NO_CONTACT_PRESENCE,
     );
   }
 
@@ -594,12 +617,42 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
     return byUser;
   }
 
+  /**
+   * Whether each user filled in email / phone / wechat / qq, answered by the
+   * database so the values never enter this process. Same rule as hasText():
+   * non-null and not blank after trimming JS_TRIM_CHARACTERS. Both the
+   * single-user and batch paths go through here.
+   */
+  private async fetchContactPresence(
+    userIds: string[],
+  ): Promise<Map<string, ContactPresence>> {
+    const byUser = new Map<string, ContactPresence>();
+    if (userIds.length === 0) return byUser;
+
+    const rows = await this.prisma.$queryRaw<
+      Array<ContactPresence & { id: string }>
+    >`
+      SELECT "id",
+             ("email" IS NOT NULL AND btrim("email", ${JS_TRIM_CHARACTERS}) <> '') AS "hasEmail",
+             ("phoneNumber" IS NOT NULL AND btrim("phoneNumber", ${JS_TRIM_CHARACTERS}) <> '') AS "hasPhoneNumber",
+             ("wechat" IS NOT NULL AND btrim("wechat", ${JS_TRIM_CHARACTERS}) <> '') AS "hasWechat",
+             ("qq" IS NOT NULL AND btrim("qq", ${JS_TRIM_CHARACTERS}) <> '') AS "hasQQ"
+      FROM "User"
+      WHERE "id" = ANY(ARRAY[${Prisma.join(userIds)}]::text[])
+    `;
+    for (const { id, hasEmail, hasPhoneNumber, hasWechat, hasQQ } of rows) {
+      byUser.set(id, { hasEmail, hasPhoneNumber, hasWechat, hasQQ });
+    }
+    return byUser;
+  }
+
   // Pure eligibility assembly from prefetched rows. Kept side-effect-free so the
   // single-user and batch paths produce identical results from identical data.
   private buildEligibility(
     user: EligibilityUserRow,
     circleMemberships: EligibilityCircleMembership[],
     privacy: PrivacySettingsDto,
+    contacts: ContactPresence,
   ): Eligibility {
     const systemIcons: EligibleSystemIcon[] = buildLeveledSystemIcons({
       vipLevel: user.vipLevel,
@@ -616,7 +669,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
-    if (this.isVerifiedProfileEligible(user, privacy)) {
+    if (this.isVerifiedProfileEligible(user, contacts, privacy)) {
       systemIcons.push({
         systemKey: SystemIconKeyDto.VERIFIED_PROFILE,
         systemVariant: SystemIconKeyDto.VERIFIED_PROFILE,
@@ -660,14 +713,15 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
   // city, email, a real bio) and at least one publicly-shown contact method.
   private isVerifiedProfileEligible(
     user: EligibilityUserRow,
+    contacts: ContactPresence,
     privacy: PrivacySettingsDto,
   ): boolean {
     if (user.status !== 'ACTIVE') return false;
 
     const hasPublicContact =
-      (this.hasText(user.phoneNumber) && privacy.showPhone) ||
-      (this.hasText(user.wechat) && privacy.showWechat) ||
-      (this.hasText(user.qq) && privacy.showQQ);
+      (contacts.hasPhoneNumber && privacy.showPhone) ||
+      (contacts.hasWechat && privacy.showWechat) ||
+      (contacts.hasQQ && privacy.showQQ);
     const hasBio = [user.persona, user.helloWords, user.whatsup].some((value) =>
       this.hasText(value, VERIFIED_PROFILE_MIN_BIO_LENGTH),
     );
@@ -676,7 +730,7 @@ export class IconService implements OnModuleInit, OnModuleDestroy {
       this.hasText(user.avatarUrl) &&
       this.hasText(user.nickname) &&
       this.hasText(user.city) &&
-      this.hasText(user.email) &&
+      contacts.hasEmail &&
       hasBio &&
       hasPublicContact
     );

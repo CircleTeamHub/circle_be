@@ -9,12 +9,19 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomInt } from 'crypto';
+import {
+  TEMP_CHAT_HOST_ALIAS,
+  isGuestUserId,
+  toGuestMessageView,
+} from 'src/chat/chat-guest-view';
+import type { ChatHistoryPageDto } from 'src/chat/chat.types';
 import { TempChatStatus } from 'src/generated/prisma';
-import { TempChatErrorCode } from 'src/common/app-error-codes';
+import { ChatErrorCode, TempChatErrorCode } from 'src/common/app-error-codes';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { ChatBroadcastService } from 'src/chat/chat-broadcast.service';
 import { ChatService } from 'src/chat/chat.service';
 import { NoteService } from 'src/note/note.service';
+import { SensitiveWordService } from 'src/sensitive-word/sensitive-word.service';
 import type { NoteDetailDto } from 'src/note/dto/note.dto';
 import {
   LinkTokenService,
@@ -85,6 +92,18 @@ const MAX_ACTIVE_ROOMS_PER_HOST = 200;
  * 访客以 TempChatGuest 身份(非 User 行)入座 ChatMember;凭证与实时通道
  * 全部走自研 chat —— OpenIM 的注册/建群/发token/强退在本模块已出清。
  */
+/** 访客昵称上限(与 JoinTempChatDto 的 MaxLength 一致)。 */
+const GUEST_DISPLAY_NAME_MAX = 20;
+
+/**
+ * 访客昵称里要剥掉的字符:C0/C1 控制符(\p{Cc},含换行/制表)、行/段分隔符,以及
+ * 改写显示方向的双向格式符(ALM、LRM/RLM、嵌入/覆盖 U+202A–U+202E、隔离
+ * U+2066–U+2069)。零宽连接符 U+200C/U+200D 不在其列:它们是 emoji 序列与部分
+ * 文字的组成部分,不是控制符。
+ */
+const UNSAFE_GUEST_NAME_CHARACTERS =
+  /[\p{Cc}\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+
 @Injectable()
 export class TempChatService {
   private static readonly CLEANUP_LEASE_MS = 2 * 60 * 1000;
@@ -98,6 +117,7 @@ export class TempChatService {
     private readonly chatBroadcast: ChatBroadcastService,
     private readonly chatService: ChatService,
     private readonly noteService: NoteService,
+    private readonly sensitiveWords: SensitiveWordService,
   ) {}
 
   async create(
@@ -284,9 +304,7 @@ export class TempChatService {
 
   async join(token: string, dto: JoinTempChatDto): Promise<JoinTempChatResult> {
     const { tcId } = this.linkToken.verify(token);
-    const displayName = (
-      dto.displayName?.trim() || `访客${randomInt(1000, 10000)}`
-    ).slice(0, 20);
+    const displayName = this.resolveGuestDisplayName(dto.displayName);
     const guestId = newGuestId();
 
     // 原子占座：Serializable 事务内复查房间状态 + 人数后建 guest 行与座位。
@@ -355,6 +373,31 @@ export class TempChatService {
   }
 
   /**
+   * 访客昵称:剥掉控制符与双向格式符、过敏感词闸;什么都不剩就随机生成。
+   *
+   * 这个名字会原样进房主的离线推送(chat-push 用 sender.nickname 拼标题/正文)与
+   * 在座成员的界面:换行/控制符会把推送标题折成多行,双向覆盖符(U+202E 等)能把
+   * 字样倒序伪装。敏感词与聊天正文/编辑同一条闸 —— 命中直接拒、不打码,错误码沿用
+   * CHAT_SENSITIVE_WORD_BLOCKED。随机兜底名不是用户输入,不过闸。
+   * 必须在占座事务之前判定:拒掉的访客不能先占掉一个座位。
+   */
+  private resolveGuestDisplayName(raw: string | undefined): string {
+    const cleaned = (raw ?? '')
+      .replace(UNSAFE_GUEST_NAME_CHARACTERS, '')
+      .trim()
+      .slice(0, GUEST_DISPLAY_NAME_MAX)
+      .trim();
+    if (!cleaned) return `访客${randomInt(1000, 10000)}`;
+    if (this.sensitiveWords.check(cleaned).blocked) {
+      throw new BadRequestException({
+        message: '昵称包含敏感词',
+        errorCode: ChatErrorCode.SensitiveWord,
+      });
+    }
+    return cleaned;
+  }
+
+  /**
    * 访客成员目录:复用会话成员目录(在座 + 展示名,访客走 TempChatGuest 兜底),
    * 再按 TempChat.hostUserId 标出房主 —— TEMP 会话没有 circleID,
    * ChatMemberDto.role 恒为 null,房主身份只有这里知道。
@@ -372,11 +415,43 @@ export class TempChatService {
       this.chatService.listMembers(guest.guestId, guest.conversationId),
     ]);
     return members.map((member) => ({
-      userId: member.userId,
+      // 访客页靠 isHost 认房主；账号成员（只有房主）的 UUID 换成房间内别名，
+      // 与 chat:msg、访客历史的访客视图一致。
+      userId: isGuestUserId(member.userId)
+        ? member.userId
+        : TEMP_CHAT_HOST_ALIAS,
       nickname: member.nickname,
       avatarUrl: member.avatarUrl,
       isHost: member.userId === room?.hostUserId,
     }));
+  }
+
+  /**
+   * 访客历史(冷路径)。与 chat:msg 的访客视图同一口径:账号成员(只有房主)的 id 换成
+   * 房间内别名;d 是发送者本机的幂等键,只有访客自己发的消息保留。
+   */
+  async getGuestHistory(
+    guest: GuestChatTokenPayload,
+    query: { beforeHeight?: number; limit?: number; afterHeight?: number },
+  ): Promise<ChatHistoryPageDto> {
+    const page = await this.chatService.getHistory(
+      guest.guestId,
+      guest.conversationId,
+      query.beforeHeight,
+      query.limit,
+      // afterHeight 是重连增量补拉的游标:访客断线期间的消息靠它追平。
+      { afterHeight: query.afterHeight },
+      // 访客没有 User 行,套用户级「消息自动销毁」只会吃到 2 天默认值,
+      // 把 3 天/7 天房间里的历史凭空砍掉。访客的保留边界是房间寿命。
+      { applyViewerRetention: false },
+    );
+    return {
+      ...page,
+      messages: page.messages.map((message) => ({
+        ...toGuestMessageView(message),
+        d: message.sender?.id === guest.guestId ? message.d : null,
+      })),
+    };
   }
 
   async getGuestNote(

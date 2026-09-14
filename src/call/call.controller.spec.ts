@@ -1,4 +1,5 @@
-import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { ParseUUIDPipe } from '@nestjs/common';
+import { GUARDS_METADATA, ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
@@ -67,5 +68,24 @@ describe('CallController', () => {
     expect(service.leaveCall).toHaveBeenCalledWith('user-2', 'call-1');
     expect(service.cancelCall).toHaveBeenCalledWith('user-2', 'call-1');
     expect(service.createJoinToken).toHaveBeenCalledWith('user-2', 'call-1');
+  });
+
+  // CallSession.id 只由 startCall 的 randomUUID() 生成:非 uuid 的 callId 不可能命中
+  // 任何通话,在参数层拒掉,不为它打库。
+  it.each([
+    'acceptCall',
+    'rejectCall',
+    'leaveCall',
+    'cancelCall',
+    'createJoinToken',
+  ] as const)('%s parses callId as a uuid', (handler) => {
+    const args = Reflect.getMetadata(
+      ROUTE_ARGS_METADATA,
+      CallController,
+      handler,
+    ) as Record<string, { data?: unknown; pipes?: unknown[] }>;
+    const callIdArg = Object.values(args).find((arg) => arg.data === 'callId');
+
+    expect(callIdArg?.pipes).toContain(ParseUUIDPipe);
   });
 });

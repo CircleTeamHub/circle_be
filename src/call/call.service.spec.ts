@@ -202,6 +202,8 @@ describe('CallService', () => {
       maxParticipants: 10,
       metadata: expect.stringContaining('callId'),
     });
+    // 客户端靠 livekit.url + token 入房,房间名只是服务端内部标识。
+    expect(result.call).not.toHaveProperty('livekitRoomName');
     expect(prisma.callSession.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -822,6 +824,90 @@ describe('CallService', () => {
     expect(livekit.mintJoinToken).not.toHaveBeenCalled();
   });
 
+  // 拒接回执与接听/当前通话同形({call, selfParticipant}),不再把 Prisma 行原样吐回:
+  // call.metadata 里存着发起方的幂等键,participant 行上还有内部列。
+  it('returns call and participant DTOs instead of raw rows when rejecting', async () => {
+    const participants = [
+      {
+        userID: 'user-1',
+        status: 'JOINED',
+        invitedAt: now,
+        joinedAt: now,
+        leftAt: null,
+        user: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      },
+      {
+        userID: 'user-2',
+        status: 'INVITED',
+        invitedAt: now,
+        joinedAt: null,
+        leftAt: null,
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+      },
+    ];
+    const callRow = {
+      id: 'call-1',
+      conversationID: 'conv-1',
+      callType: 'AUDIO',
+      status: 'RINGING',
+      livekitRoomName: 'circle_call_1',
+      metadata: { idempotencyKey: 'initiator-secret-key' },
+      initiator: { id: 'user-1', nickname: 'Alice', avatarUrl: null },
+      startedAt: null,
+      endedAt: null,
+      expiresAt: now,
+      endReason: null,
+      participants,
+    };
+    const rejected = {
+      id: 'participant-2',
+      callID: 'call-1',
+      userID: 'user-2',
+      status: 'REJECTED',
+      invitedAt: now,
+      joinedAt: null,
+      leftAt: null,
+      rejectedAt: now,
+      missedAt: null,
+      lastTokenAt: null,
+      user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+    };
+    prisma.callParticipant.findUnique
+      .mockResolvedValueOnce({
+        callID: 'call-1',
+        userID: 'user-2',
+        status: 'INVITED',
+        call: callRow,
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+      })
+      .mockResolvedValue(rejected);
+    prisma.callParticipant.updateMany.mockResolvedValue({ count: 1 });
+    prisma.callParticipant.count.mockResolvedValue(1);
+    prisma.callSession.findUnique.mockResolvedValue({
+      ...callRow,
+      participants: [
+        participants[0],
+        { ...participants[1], status: 'REJECTED' },
+      ],
+    });
+
+    const result = await service.rejectCall('user-2', 'call-1');
+
+    expect(result).toEqual({
+      call: expect.objectContaining({ id: 'call-1', status: 'RINGING' }),
+      selfParticipant: {
+        user: { id: 'user-2', nickname: 'Bob', avatarUrl: null },
+        status: 'REJECTED',
+        invitedAt: now.toISOString(),
+        joinedAt: null,
+        leftAt: null,
+      },
+    });
+    expect(result.call).not.toHaveProperty('metadata');
+    expect(result.call).not.toHaveProperty('livekitRoomName');
+    expect(JSON.stringify(result)).not.toContain('initiator-secret-key');
+  });
+
   it('broadcasts when an invited participant rejects', async () => {
     const invited = {
       callID: 'call-1',
@@ -883,7 +969,8 @@ describe('CallService', () => {
     const result = await service.rejectCall('user-2', 'call-1');
 
     expect(prisma.callParticipant.update).not.toHaveBeenCalled();
-    expect(result.status).toBe('REJECTED');
+    expect(result.selfParticipant?.status).toBe('REJECTED');
+    expect(result.call).toMatchObject({ id: 'call-1', status: 'RINGING' });
   });
 
   it('rejects reject-call with a stable error code when the participant is not invited', async () => {

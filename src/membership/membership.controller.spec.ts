@@ -9,10 +9,8 @@ import { MembershipProgramService } from './membership-program.service';
 describe('MembershipController', () => {
   let app: INestApplication;
   const plans = [1, 2, 3, 4].map((level) => ({ level }));
-  const membership = { storedLevel: 3, effectiveLevel: 3, key: 'diamond' };
   const service = {
     getPlans: jest.fn(() => plans),
-    getMe: jest.fn().mockResolvedValue(membership),
   };
   const programService = {
     getStatus: jest.fn().mockResolvedValue({
@@ -68,16 +66,18 @@ describe('MembershipController', () => {
       .expect(404);
   });
 
-  it('returns membership state for the authenticated user', async () => {
-    const controller = new MembershipController(
-      service as never,
-      programService as never,
-    ) as any;
+  // GET /membership/me 没有任何客户端调用:circle-im 的 membership.ts 只调
+  // /membership/plans 与 /membership/program,管理台与 temp-chat-web 不涉及会员。
+  it('no longer exposes GET /membership/me', async () => {
+    await request(app.getHttpServer()).get('/membership/me').expect(404);
 
-    await expect(
-      controller.getMe({ user: { userId: 'user-1' } } as never),
-    ).resolves.toBe(membership);
-    expect(service.getMe).toHaveBeenCalledWith('user-1');
+    expect(
+      (MembershipController.prototype as unknown as Record<string, unknown>)
+        .getMe,
+    ).toBeUndefined();
+    expect(
+      (MembershipService.prototype as unknown as Record<string, unknown>).getMe,
+    ).toBeUndefined();
   });
 
   it('does not retain an internal upgrade mutation method', () => {

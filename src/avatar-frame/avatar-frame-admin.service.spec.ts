@@ -48,6 +48,14 @@ describe('AvatarFrameAdminService', () => {
     ...overrides,
   });
 
+  // ADMIN_GRANT_SELECT 带出的 frame 摘要;mock 只在调用方真的 select 了 frame 时才附上。
+  const frameSummary = {
+    id: frameId,
+    key: 'membership-diamond',
+    name: 'Diamond',
+    imageUrl: null,
+  };
+
   function buildHarness() {
     const tx = {
       user: {
@@ -60,20 +68,22 @@ describe('AvatarFrameAdminService', () => {
       },
       userAvatarFrameGrant: {
         findUnique: jest.fn().mockResolvedValue(null),
-        create: jest.fn().mockImplementation(({ data }) =>
+        create: jest.fn().mockImplementation(({ data, select }) =>
           Promise.resolve(
             grant({
               ...data,
               createdAt: now,
               updatedAt: now,
+              ...(select?.frame ? { frame: frameSummary } : {}),
             }),
           ),
         ),
-        update: jest.fn().mockImplementation(({ data }) =>
+        update: jest.fn().mockImplementation(({ data, select }) =>
           Promise.resolve(
             grant({
               ...data,
               updatedAt: now,
+              ...(select?.frame ? { frame: frameSummary } : {}),
             }),
           ),
         ),
@@ -326,6 +336,8 @@ describe('AvatarFrameAdminService', () => {
           reason: 'support case approved',
           expiresAt: expectedExpiry,
         },
+        // 与 getUserInventory 同一个 ADMIN_GRANT_SELECT:新建路径也要带出 frame。
+        select: expect.objectContaining({ frame: expect.anything() }),
       });
       expect(audit.recordStrict).toHaveBeenCalledWith(
         tx,
@@ -352,6 +364,7 @@ describe('AvatarFrameAdminService', () => {
           id: grantId,
           userId: targetId,
           frameId,
+          frame: frameSummary,
           expiresAt: expectedExpiry,
           status: 'ACTIVE',
         },
@@ -541,6 +554,7 @@ describe('AvatarFrameAdminService', () => {
         revokedByUserID: operatorId,
         revokeReason: 'issued in error',
       },
+      select: expect.objectContaining({ frame: expect.anything() }),
     });
     expect(audit.recordStrict).toHaveBeenCalledWith(
       tx,
@@ -569,10 +583,49 @@ describe('AvatarFrameAdminService', () => {
       replayed: false,
       grant: {
         id: grantId,
+        frame: frameSummary,
         status: 'REVOKED',
         revokedByUserId: operatorId,
         revokeReason: 'issued in error',
       },
+    });
+  });
+
+  // 管理台授予/撤销后展示的 grant 行与 getUserInventory 的同一形状:新建、幂等重放、
+  // 撤销与撤销重放都必须带出 frame,不能一条路径有、另一条路径是 undefined。
+  it('returns the same grant shape with frame on grant replay and revoke replay', async () => {
+    const { service, tx } = buildHarness();
+    tx.userAvatarFrameGrant.findUnique.mockImplementation(({ select }) =>
+      Promise.resolve(grant(select?.frame ? { frame: frameSummary } : {})),
+    );
+
+    await expect(
+      service.grant(operatorId, targetId, {
+        frameId,
+        reason: 'support case approved',
+        idempotencyKey,
+      }),
+    ).resolves.toMatchObject({
+      replayed: true,
+      grant: { id: grantId, frame: frameSummary },
+    });
+
+    tx.userAvatarFrameGrant.findUnique.mockImplementation(({ select }) =>
+      Promise.resolve(
+        grant({
+          revokedAt: now,
+          revokedByUserID: operatorId,
+          revokeReason: 'issued in error',
+          ...(select?.frame ? { frame: frameSummary } : {}),
+        }),
+      ),
+    );
+
+    await expect(
+      service.revoke(operatorId, grantId, { reason: 'issued in error' }),
+    ).resolves.toMatchObject({
+      replayed: true,
+      grant: { id: grantId, status: 'REVOKED', frame: frameSummary },
     });
   });
 

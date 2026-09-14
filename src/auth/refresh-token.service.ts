@@ -16,6 +16,9 @@ const MAX_DEVICE_NAME_LENGTH = 64;
 const MAX_USER_AGENT_LENGTH = 256;
 const MAX_IP_LENGTH = 64;
 const REVOCATION_BATCH_SIZE = 25;
+// GET /auth/sessions 的上限：正常账号只有个位数设备，100 足够列全真实会话，又不让
+// 一个刷出成千上万条会话的账号每次打开设备管理都把它们全拉回来。
+const ACTIVE_SESSION_LIST_LIMIT = 100;
 
 const MS_PER_MINUTE = 60_000;
 const MS_PER_HOUR = 3_600_000;
@@ -381,6 +384,10 @@ export class RefreshTokenService {
             revocationReason: RefreshTokenRevocationReason.TOKEN_FAMILY_REUSE,
           },
         });
+        await tx.user.update({
+          where: { id: record.userId },
+          data: { accessTokensRevokedAt: now },
+        });
         return {
           kind: 'reuse' as const,
           userId: record.userId,
@@ -514,9 +521,9 @@ export class RefreshTokenService {
         lastUsedAt: true,
         expiredAt: true,
       },
-      orderBy: {
-        lastUsedAt: 'desc',
-      },
+      // 最近使用的在前；同一时刻按创建时间、再按 id 兜底，顺序与截断结果都稳定。
+      orderBy: [{ lastUsedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      take: ACTIVE_SESSION_LIST_LIMIT,
     });
   }
 
@@ -526,13 +533,20 @@ export class RefreshTokenService {
   }
 
   async revokeAll(userId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { userId, revokedAt: null },
-      data: {
-        revokedAt: new Date(),
-        revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
-      },
-    });
+    const revokedAt = new Date();
+    await this.prisma.$transaction([
+      this.prisma.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: {
+          revokedAt,
+          revocationReason: RefreshTokenRevocationReason.LOGOUT_ALL,
+        },
+      }),
+      this.prisma.user.update({
+        where: { id: userId },
+        data: { accessTokensRevokedAt: revokedAt },
+      }),
+    ]);
     // Kill every access token this user already holds (logout-all / ban /
     // password change / reuse detection), not just their refresh tokens (F-02).
     await this.revocation.revokeUser(userId);
@@ -546,6 +560,10 @@ export class RefreshTokenService {
         revocationReason: RefreshTokenRevocationReason.SESSION_REVOKED,
       },
     });
+    // 0 行（已撤销 / 已过期 / 不是本人的会话）照旧按成功返回，不改成 404：APP 的设备
+    // 管理页把任何错误都显示成「移除失败」且不刷新列表，列表加载后会话恰好过期、另一台
+    // 设备先把它登出这类良性竞态都会被报成失败；撤销当前会话时还会卡住「清本地会话 →
+    // 回登录页」。同样的回应也不给「这个 id 是否属于别人」留探测口。
     if (result.count === 1) {
       await this.revocation.revokeSession(sessionId);
     }

@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { ParseUUIDPipe } from '@nestjs/common';
+import { ROUTE_ARGS_METADATA } from '@nestjs/common/constants';
 import { AuthController } from '../auth.controller';
 import { AuthService } from '../auth.service';
 import { RegisterDto } from '../dto/register.dto';
@@ -85,15 +87,7 @@ describe('AuthController', () => {
         city: null,
         region: null,
         vipLevel: 0,
-        storedVipLevel: 0,
         vipExpiresAt: null,
-        membership: {
-          effectiveLevel: 0,
-          key: 'regular',
-          appearance: { nameColor: 'default', badge: null },
-          active: false,
-          lifetime: false,
-        },
         creditScore: 0,
         receivedLikeCount: 0,
         role: 'USER',
@@ -187,6 +181,20 @@ describe('AuthController', () => {
       'uuid-1',
       'session-2',
     );
+  });
+
+  // 会话 id 就是 RefreshToken.id（@default(uuid())），APP 只回传 GET /auth/sessions
+  // 给出的 id；非 UUID 直接 400，不再落成一次静默的 0 行 updateMany。
+  it('parses the session id to revoke as a UUID', () => {
+    const metadata = Reflect.getMetadata(
+      ROUTE_ARGS_METADATA,
+      AuthController,
+      'logoutSession',
+    );
+    const pipes = Object.values(metadata).flatMap(
+      (entry: { pipes?: unknown[] }) => entry.pipes ?? [],
+    );
+    expect(pipes).toContain(ParseUUIDPipe);
   });
 
   it('logoutOtherSessions keeps the current session and revokes the rest', async () => {

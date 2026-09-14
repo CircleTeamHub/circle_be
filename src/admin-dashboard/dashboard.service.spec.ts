@@ -48,7 +48,9 @@ describe('DashboardService', () => {
     community.getMetrics.mockRejectedValue(new Error('database timeout'));
     commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
     moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
-    system.getMetrics.mockResolvedValue({ failed: 0 });
+    system.getMetrics.mockResolvedValue({
+      services: { api: 'healthy' },
+    });
 
     const result = await service.getDashboard(DashboardRange.Today, now);
 
@@ -69,7 +71,9 @@ describe('DashboardService', () => {
     community.getMetrics.mockResolvedValue({ totalCircles: 3 });
     commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
     moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
-    system.getMetrics.mockResolvedValue({ failed: 0 });
+    system.getMetrics.mockResolvedValue({
+      services: { api: 'healthy' },
+    });
     redis.setJson.mockResolvedValue(true);
 
     const result = await service.getDashboard(DashboardRange.ThirtyDays, now);
@@ -88,7 +92,9 @@ describe('DashboardService', () => {
     community.getMetrics.mockResolvedValue({ totalCircles: 3 });
     commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
     moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
-    system.getMetrics.mockResolvedValue({ failed: 0 });
+    system.getMetrics.mockResolvedValue({
+      services: { api: 'healthy' },
+    });
     redis.setJson.mockResolvedValue(true);
 
     await expect(
@@ -107,7 +113,9 @@ describe('DashboardService', () => {
     community.getMetrics.mockResolvedValue({ totalCircles: 3 });
     commerce.getMetrics.mockResolvedValue({ pointSpend: 100 });
     moderation.getMetrics.mockResolvedValue({ pendingTotal: 2 });
-    system.getMetrics.mockResolvedValue({ failed: 0 });
+    system.getMetrics.mockResolvedValue({
+      services: { api: 'healthy' },
+    });
     redis.setJson.mockRejectedValue(new Error('redis unavailable'));
 
     await expect(

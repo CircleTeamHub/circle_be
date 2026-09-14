@@ -7,6 +7,7 @@ import {
 import { ThrottlerGuard } from '@nestjs/throttler';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { CirclePlazaController } from './circle-plaza.controller';
+import { CirclePlazaService } from './circle-plaza.service';
 
 describe('CirclePlazaController', () => {
   it('requires authentication and throttling for plaza routes', () => {
@@ -32,17 +33,17 @@ describe('CirclePlazaController', () => {
     ).toBe(60);
   });
 
-  it('passes the current user when reading the legacy signup list', async () => {
-    const service = {
-      getPostSignups: jest.fn().mockResolvedValue({ items: [] }),
-    };
-    const controller = new CirclePlazaController(service as any);
-
-    await controller.signups('post-1', {
-      user: { userId: 'author-1' },
-    } as any);
-
-    expect(service.getPostSignups).toHaveBeenCalledWith('author-1', 'post-1');
+  // GET /circle-plaza/posts/:id/signups 没有任何客户端调用 —— App 的报名管理走
+  // GET /me/posts/:id/signups(带未读/认可状态)。旧路由连同 service 方法一起删掉。
+  it('no longer exposes the legacy GET /posts/:id/signups list', () => {
+    expect(
+      (CirclePlazaController.prototype as unknown as Record<string, unknown>)
+        .signups,
+    ).toBeUndefined();
+    expect(
+      (CirclePlazaService.prototype as unknown as Record<string, unknown>)
+        .getPostSignups,
+    ).toBeUndefined();
   });
 
   it('exposes authenticated POST /feed/search and delegates to the feed query', async () => {

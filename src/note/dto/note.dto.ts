@@ -161,14 +161,20 @@ export class NoteLocationSectionDto {
   @MaxLength(500)
   address?: string;
 
-  @ApiPropertyOptional()
+  // 位置选择器只会给出真实经纬度；越界值只可能是伪造或脏数据。null / 缺省仍合法
+  // （只选了地址时 app 发 null，@IsOptional 跳过校验）。
+  @ApiPropertyOptional({ minimum: -90, maximum: 90 })
   @IsOptional()
   @IsNumber()
+  @Min(-90)
+  @Max(90)
   latitude?: number;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ minimum: -180, maximum: 180 })
   @IsOptional()
   @IsNumber()
+  @Min(-180)
+  @Max(180)
   longitude?: number;
 }
 
@@ -295,6 +301,14 @@ export class SetNoteStatusDto {
   status: NoteWritableStatus;
 }
 
+/**
+ * GET /note 与 GET /note/recycle-bin 的默认页大小，同时是 limit 的上限。
+ *
+ * app 从不传 page/limit，且依赖响应体是数组：默认页必须装得下整本笔记 —— 以前默认
+ * 50，第 51 条起被静默截掉。仍然装不下时由 controller 的 X-Has-More 响应头告知。
+ */
+export const NOTE_LIST_DEFAULT_LIMIT = 500;
+
 export class RecycleBinQueryDto {
   @ApiPropertyOptional({ default: 1 })
   @IsOptional()
@@ -304,13 +318,16 @@ export class RecycleBinQueryDto {
   @Max(MAX_PAGE)
   page = 1;
 
-  @ApiPropertyOptional({ default: 50, maximum: 200 })
+  @ApiPropertyOptional({
+    default: NOTE_LIST_DEFAULT_LIMIT,
+    maximum: NOTE_LIST_DEFAULT_LIMIT,
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(200)
-  limit = 50;
+  @Max(NOTE_LIST_DEFAULT_LIMIT)
+  limit = NOTE_LIST_DEFAULT_LIMIT;
 }
 
 export class ListNotesQueryDto {
@@ -337,12 +354,15 @@ export class ListNotesQueryDto {
   @Max(MAX_PAGE)
   page?: number;
 
-  @ApiPropertyOptional({ default: 50 })
+  @ApiPropertyOptional({
+    default: NOTE_LIST_DEFAULT_LIMIT,
+    maximum: NOTE_LIST_DEFAULT_LIMIT,
+  })
   @IsOptional()
   @IsInt()
   @Min(1)
-  @Max(200)
-  limit?: number;
+  @Max(NOTE_LIST_DEFAULT_LIMIT)
+  limit?: number = NOTE_LIST_DEFAULT_LIMIT;
 }
 
 export class CreateNoteShareLinkDto {
@@ -631,9 +651,12 @@ export class CreateNoteExportDto {
 
   @ApiPropertyOptional({
     description: '`ALL` for all media in the requested format, or a media id.',
+    maxLength: 64,
   })
   @IsOptional()
   @IsString()
+  // 合法值只有 'ALL' 与媒体 id（UUID，36 字符）；给自由字符串一个上界。
+  @MaxLength(64)
   scope?: 'ALL' | string;
 }
 

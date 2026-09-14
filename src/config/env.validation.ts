@@ -160,9 +160,16 @@ export function createEnvValidationSchema(
     SENTRY_RELEASE: Joi.string().optional(),
     // Optional performance tracing sample rate (0..1). Unset / 0 = errors only.
     SENTRY_TRACES_SAMPLE_RATE: Joi.number().min(0).max(1).optional(),
-    // When set, /metrics requires `Authorization: Bearer <token>`. Leave unset
-    // only when the metrics port is reachable from a trusted network alone.
-    METRICS_AUTH_TOKEN: Joi.string().optional(),
+    // /metrics requires `Authorization: Bearer <token>` when this is set. It
+    // exposes route inventory, business-event rates and pool usage, and
+    // deploy/gen-env.sh always writes a random token — so in production a missing
+    // token (or the unfilled .env.production.example placeholder) is a
+    // misconfiguration that fails boot instead of serving metrics openly.
+    METRICS_AUTH_TOKEN: Joi.when('NODE_ENV', {
+      is: 'production',
+      then: Joi.string().invalid('__REPLACE_RANDOM__').required(),
+      otherwise: Joi.string().optional(),
+    }),
     REDIS_REQUIRED: Joi.boolean().default(false),
     REDIS_ALLOW_INSECURE: Joi.boolean().default(false),
     REDIS_URL: Joi.when('REDIS_REQUIRED', {

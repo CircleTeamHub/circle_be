@@ -9,7 +9,7 @@ import { JwtService } from '@nestjs/jwt';
 import type { IncomingMessage, Server as HttpServer } from 'http';
 import { Server, type Socket } from 'socket.io';
 import type { JwtPayload } from 'src/auth/types';
-import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import { SessionVerifier } from 'src/auth/session-verifier.service';
 import {
   SESSION_REVOCATION_CHANNEL,
   parseSessionRevocationBroadcast,
@@ -98,6 +98,7 @@ const CHAT_AUTH_FAILURE_REASONS: ReadonlySet<ChatAuthFailureReason> = new Set([
   'invalid_claims',
   'wrong_audience',
   'revoked',
+  'session_unverifiable',
   'guest_secret_missing',
   'guest_invalid_token',
   'guest_invalid_claims',
@@ -239,7 +240,7 @@ export class ChatGateway implements OnModuleDestroy {
 
   constructor(
     private readonly jwtService: JwtService,
-    private readonly sessionRevocation: SessionRevocationService,
+    private readonly sessionVerifier: SessionVerifier,
     private readonly chatService: ChatService,
     private readonly broadcast: ChatBroadcastService,
     private readonly chatPush: ChatPushService,
@@ -314,7 +315,7 @@ export class ChatGateway implements OnModuleDestroy {
         .then((userId) => {
           if (!userId) {
             this.observeAuthRejection(socket, traceId);
-            next(new Error('unauthorized'));
+            next(this.handshakeError(socket));
             return;
           }
           socket.data.userId = userId;
@@ -391,6 +392,20 @@ export class ChatGateway implements OnModuleDestroy {
     return CHAT_AUTH_FAILURE_REASONS.has(reason as ChatAuthFailureReason)
       ? (reason as ChatAuthFailureReason)
       : 'invalid_token';
+  }
+
+  /**
+   * 握手被拒时交给客户端的错误（connect_error）。会话暂时无法校验是可重试的服务端
+   * 故障，不能和 unauthorized 混为一谈；socket.io 会把 Error.data 原样带到客户端的
+   * err.data，status 503 与 REST 同义。
+   */
+  private handshakeError(socket: Socket): Error {
+    if (this.authFailureReason(socket) === 'session_unverifiable') {
+      return Object.assign(new Error('service_unavailable'), {
+        data: { status: 503 },
+      });
+    }
+    return new Error('unauthorized');
   }
 
   private observeAuthRejection(socket: Socket, traceId: string): void {
@@ -603,8 +618,15 @@ export class ChatGateway implements OnModuleDestroy {
     if (payload.aud !== 'APP') {
       return this.rejectAuth(socket, 'wrong_audience');
     }
-    if (await this.sessionRevocation.isRevoked(payload)) {
+    // Redis 不可用时回退查库（SessionVerifier）。库也查不到才判「无法校验」：
+    // 不放行可能已吊销的会话，也不把可重试的服务端故障说成未授权 ——
+    // 与 REST（503）和 /realtime（close 1013）同一口径。
+    const verdict = await this.sessionVerifier.verify(payload);
+    if (verdict === 'revoked') {
       return this.rejectAuth(socket, 'revoked');
+    }
+    if (verdict === 'unavailable') {
+      return this.rejectAuth(socket, 'session_unverifiable');
     }
     socket.data.sessionId =
       typeof payload.sid === 'string' ? payload.sid : null;
@@ -886,7 +908,9 @@ export class ChatGateway implements OnModuleDestroy {
       CHAT_EVENTS.presence,
       (
         payload: ChatPresenceQuery,
-        ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
+        ack?: AckFn<
+          Record<string, boolean | ChatPresenceDetail | null> | ChatAckError
+        >,
       ) => {
         if (!whenReady(() => this.handlePresenceQuery(socket, payload, ack))) {
           if (typeof ack === 'function') ack({});
@@ -978,7 +1002,12 @@ export class ChatGateway implements OnModuleDestroy {
         ]);
       }
       await socket.join(userRoom(userId));
-      await socket.join(conversationIds.map(conversationRoom));
+      // 访客只进个人房:消息/编辑按在座成员逐个个人房投递,照样送得到;会话房里的
+      // 已读、正在输入、在线状态、表情、撤回广播都带着房主真实 userId,访客页一个都
+      // 不消费,进房只会把房主账号 UUID 与在线规律交给匿名访客。
+      if (!guestConversationId) {
+        await socket.join(conversationIds.map(conversationRoom));
+      }
     } catch (error) {
       // 房间加入失败的连接是"在线但收不到任何推送"的哑连接,直接断开让客户端重连。
       reportOperationalError(error, {
@@ -1097,9 +1126,19 @@ export class ChatGateway implements OnModuleDestroy {
   private async handlePresenceQuery(
     socket: Socket,
     payload: ChatPresenceQuery,
-    ack?: AckFn<Record<string, boolean | ChatPresenceDetail | null>>,
+    ack?: AckFn<
+      Record<string, boolean | ChatPresenceDetail | null> | ChatAckError
+    >,
   ): Promise<void> {
     if (typeof ack !== 'function') return;
+    // 访客凭证(临时房 chatToken)只该看得见自己那间房。在线状态说的是 App 用户之间
+    // 「同处在座会话」的关系,访客页也从不发这个事件 —— 按 socket 身份在入口拒掉:
+    // 不进限流、不查可见性、不碰在线注册表。
+    if (typeof socket.data.guestConversationId === 'string') {
+      this.metrics.observeEvent('presence', 'failure');
+      ack(this.ackError(ChatErrorCode.InvalidPayload, '访客不能查询在线状态'));
+      return;
+    }
     const startedAt = process.hrtime.bigint();
     const userId = socket.data.userId as string;
     try {

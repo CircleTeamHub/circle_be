@@ -14,8 +14,13 @@
 5. [Friend 接口](#friend-接口)
 6. [Coin 接口](#coin-接口)
 7. [Note 接口](#note-接口)
-8. [错误处理](#错误处理)
-9. [前端集成建议](#前端集成建议)
+8. [Circle 接口](#circle-接口)
+9. [Circle Plaza 接口](#circle-plaza-接口)
+10. [Circle Invitation 接口](#circle-invitation-接口)
+11. [Group 接口](#group-接口)
+12. [Collections 接口](#collections-接口)
+13. [错误处理](#错误处理)
+14. [前端集成建议](#前端集成建议)
 
 ---
 
@@ -376,11 +381,17 @@ video/mp4 | video/quicktime | video/x-m4v
 
 **folder 允许值：**
 ```
-avatars   — 用户头像
-covers    — 封面图（用户/Squad）
-posts     — 帖子图片/视频
-notes     — 笔记图片/视频
+avatars   — 用户头像（公开）
+covers    — 封面图（公开）
+posts     — 帖子 / 动态图片视频（公开）
+friends   — 好友申请照片（公开）
+notes     — 笔记图片/视频（私有）
+chat      — 聊天媒体（私有）
 ```
+
+> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）可直接读取、可直接写进资料/圈子/帖子。
+> `notes`、`chat` 是私有目录：直连 `fileUrl` 会被拒绝，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
+> 私有目录目前仍返回 `fileUrl` 只是为了兼容已装机 App 的必填校验，客户端不要依赖它。
 
 **Response 201：**
 ```json
@@ -451,23 +462,6 @@ await api.patch(`/user/${userId}`, { avatarUrl: fileUrl });
   "gender": "male",
   "lastOnline": "2026-04-09T10:00:00.000Z",
   "friendsSince": "2026-04-01T00:00:00.000Z"
-}
-```
-
-#### FriendRequest 对象（申请条目）
-
-```json
-{
-  "id": "uuid",
-  "state": "PENDING",
-  "createdAt": "2026-04-09T00:00:00.000Z",
-  "message": "我是张三，加个好友吧",
-  "user": {
-    "id": "uuid",
-    "accountId": "ab12cd",
-    "nickname": "张三",
-    "avatarUrl": "http://10.0.0.195:9000/circle/avatars/xxx.jpg"
-  }
 }
 ```
 
@@ -576,31 +570,13 @@ POST /friend/requests
 
 ---
 
-### 收到的好友申请
-
-```
-GET /friend/requests/incoming
-```
-
-**Response 200：** `FriendRequest[]`
-
----
-
-### 发出的好友申请
-
-```
-GET /friend/requests/outgoing
-```
-
-**Response 200：** `FriendRequest[]`
-
----
-
 ### 好友动态列表
 
 ```
 GET /friend/activities
 ```
+
+> 「新朋友」收件箱的唯一数据源：收到的申请（`REQUEST_RECEIVED`）、我发出的申请（`REQUEST_SENT`）以及通过/拒绝/撤回的结果都在这条动态流里。`requestState` 为 `PENDING` 时用 `requestId` 调接受 / 拒绝 / 撤回。旧的 `GET /friend/requests/incoming`、`GET /friend/requests/outgoing` 已删除。
 
 **Response 200：**
 ```json
@@ -850,9 +826,9 @@ GET /friend/blocked
   → POST /friend/requests              # 发送申请
   ← 204
 
-用户 B 收到通知，查看申请列表
-  → GET /friend/requests/incoming
-  ← [{ id: "req_uuid", user: { ... } }]
+用户 B 收到通知，打开「新朋友」动态流
+  → GET /friend/activities
+  ← [{ type: "REQUEST_RECEIVED", requestId: "req_uuid", requestState: "PENDING", counterparty: { ... } }]
 
 用户 B 点击"接受"
   → POST /friend/requests/:req_uuid/accept
@@ -1068,6 +1044,10 @@ Authorization: Bearer <accessToken>
 - `status` 可选，默认返回非 `DELETED` 的笔记
 - `groupId` 可选，只看某个分组
 - `search` 可选，按标题/正文模糊搜索
+- `page` 可选，默认 1（上限 500）
+- `limit` 可选，默认 500，上限 500
+
+**响应头：** `X-Has-More: true|false` —— 本页之后是否还有笔记。响应体始终是数组；为 `true` 时用下一个 `page` 继续拉取。`GET /note/recycle-bin`（回收站）同一分页口径与同一响应头。
 
 **Response 200：**
 ```json
@@ -1099,6 +1079,9 @@ Authorization: Bearer <accessToken>
 ```
 
 **Response 200：** `NoteDetail`
+
+- 主人可读自己任何未删除的笔记（含 `UNLISTED`）；其他人只能读 `available=true` 且 `status=ACTIVE` 的笔记，否则 404 `NOTE_NOT_FOUND`。收藏（`POST /note/collect`）、导出（`POST /note/:id/exports`）、复制媒体（`POST /note/:id/chat-media`）与临时聊天访客读 note-card 同一口径。
+- 非主人视角：`canEdit=false`，`remark` / `collectedFrom` 为 `null`，`pinned` 恒为 `false`，`groups` 恒为 `[]`（置顶与分组是主人的私人整理标记，不随笔记外发）。
 
 ---
 
@@ -1265,6 +1248,266 @@ Authorization: Bearer <accessToken>
 > 删除分组时，该分组下的笔记会自动变为未分组（`groupId = null`）
 
 **Response 204：** 无内容
+
+---
+
+## Circle 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/circle`
+> 下文「响应」均指统一信封 `{ code, message, data }` 中的 `data`；业务错误带 `errorCode`。
+> 限流（按 IP）：写方法（POST / PATCH / PUT / DELETE）40 次 / 15 分钟，读方法 600 次 / 15 分钟，另有全局 300 次 / 分钟兜底。
+
+### Circle 对象
+
+```json
+{
+  "id": "uuid",
+  "name": "周末露营",
+  "description": "圈子简介（同时是群公告）",
+  "avatarUrl": "http://localhost:9000/circle/avatars/user-1/xxx.jpg",
+  "currentIconUrl": null,
+  "cover": null,
+  "cities": ["上海"],
+  "categories": ["outdoor"],
+  "rules": "",
+  "tags": ["露营"],
+  "joinVipRestriction": null,
+  "joinCreditRestriction": null,
+  "joinFancyRestriction": false,
+  "maxMembers": 500,
+  "memberCanPost": true,
+  "requiredVerifierCount": 1,
+  "memberCanInvite": true,
+  "groupID": "uuid",
+  "memberCount": 12,
+  "postCount": 3,
+  "createdAt": "2026-09-01T00:00:00.000Z"
+}
+```
+
+- `GET /circle/my` 的每一项额外带 `myRole`：`OWNER` | `ADMIN` | `MEMBER` | `null`。
+- 圈子详情（`POST /circle`、`GET /circle/:id`、`PATCH /circle/:id` 的响应）额外带 `myRole` 与 `myStatus`：`ACTIVE` | `PENDING` | `REJECTED` | `null`。
+
+### 路由
+
+| 方法 | 路径 | 请求 | 响应 | 关键规则 |
+|---|---|---|---|---|
+| POST | `/circle` | 建圈字段（见下） | 圈子详情 | 会员体系开启后普通用户不可建圈（`CIRCLE_VIP_REQUIRED`）；每人最多建 20 个（`CIRCLE_CREATE_LIMIT_REACHED`）；`avatarUrl` 必须来自本站存储（`CIRCLE_AVATAR_URL_INVALID`） |
+| GET | `/circle/my` | query：`tab` 必填，`joined` \| `created` \| `applied`；`cursor` 为上一页最后一个圈子 id；`limit` 1–100 | Circle 数组（带 `myRole`） | 游标翻页；不传 `limit` 时带 `cursor` 默认 50，否则 100 |
+| GET | `/circle/:id` | — | 圈子详情 | 按 id 查看未删除的圈子（不存在时 `CIRCLE_NOT_FOUND`） |
+| PATCH | `/circle/:id` | 编辑字段（见下），只写传了的字段 | 圈子详情 | 仅 ACTIVE 的圈主 / 管理员（`CIRCLE_EDIT_FORBIDDEN`）；`joinVipRestriction` 不能高于圈主的会员等级（`CIRCLE_JOIN_VIP_RESTRICTION_EXCEEDS_CREATOR`） |
+| POST | `/circle/:id/join` | — | `202`，申请单（见 Circle Invitation 接口） | 所有入圈都走审核 / 担保；已是成员 `CIRCLE_ALREADY_MEMBER`，已有申请 `CIRCLE_ALREADY_MEMBER_OR_PENDING`；门槛或加入额度不满足时返回 `CIRCLE_JOIN_*` |
+| DELETE | `/circle/:id/leave` | — | `204` | 圈主不能退圈（`CIRCLE_OWNER_CANNOT_LEAVE`） |
+| DELETE | `/circle/:id` | — | `204` | 圈主解散圈子，不可逆（`CIRCLE_OWNER_ONLY_DISSOLVE`） |
+| POST | `/circle/:id/icon/upload` | `{ imageUrl, name? }`：`imageUrl` 为带协议的 URL（≤ 500），`name` ≤ 50 | `{ id, name, imageUrl }` | 仅圈主（`CIRCLE_ICON_OWNER_ONLY`）；地址必须来自本站存储；上传后即为当前图标，并替换本圈旧的自定义图标 |
+| POST | `/circle/:id/icon/select` | `{ iconAssetId }`（UUID） | — | 仅圈主；只能选系统图标或本圈图标（`CIRCLE_ICON_ASSET_NOT_FOUND`） |
+| POST | `/circle/:id/cover` | `{ cover }`：带协议的 URL（≤ 500） | `204` | 仅圈主；地址必须来自本站存储 |
+| POST | `/circle/:id/avatar` | `{ avatarUrl }`：带协议的 URL（≤ 500） | `204` | 仅圈主；地址必须来自本站存储 |
+
+**建圈字段**（`POST /circle`）
+
+| 字段 | 必填 | 约束 |
+|---|---|---|
+| `name` | 是 | 2–20 字 |
+| `categories` | 是 | 数组 ≤ 5，去重，每项 ≤ 20 字 |
+| `description` | 是 | 10–500 字 |
+| `avatarUrl` | 否 | 带协议的 URL，≤ 500 字符，须为本站存储地址（presign 返回的 `fileUrl`） |
+| `cities` | 否 | 数组 ≤ 10，去重，每项 ≤ 50 字 |
+| `rules` | 否 | ≤ 1000 字 |
+| `tags` | 否 | 数组 ≤ 3，去重，每项 ≤ 30 字 |
+| `joinVipRestriction` | 否 | 0–4，或 `null` 表示不限 |
+| `joinCreditRestriction` | 否 | 0–100 |
+| `joinFancyRestriction` | 否 | 布尔，默认 `false` |
+| `maxMembers` | 否 | 10–3000；不传则按会员容量 |
+| `memberCanPost` | 否 | 布尔，默认 `true` |
+| `requiredVerifierCount` | 否 | 1–10；1 = 不需要担保；每张申请单创建时快照 |
+
+**编辑字段**（`PATCH /circle/:id`）：`name`（先 trim）、`categories`、`avatarUrl`、`cities`、`rules`、`tags`、`joinVipRestriction`、`joinCreditRestriction`、`joinFancyRestriction`、`memberCanPost`、`requiredVerifierCount` 与建圈同约束，另有 `memberCanInvite`（`false` = 仅圈主 / 管理员可邀请）。区别：`description` 允许空串（0–500，用于清空群公告）；不含 `maxMembers`（容量走会员配额 / 扩容卡）；除 `joinVipRestriction`、`joinCreditRestriction` 可传 `null` 表示不限外，显式 `null` 一律 400；布尔字段必须是 JSON 布尔，`"false"` 这类字符串会被拒绝。
+
+---
+
+## Circle Plaza 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/circle-plaza`
+> 响应均指统一信封中的 `data`；业务错误带 `errorCode`。
+> 限流：每条路由有按 IP 的每分钟上限（见下表）；另外所有 POST / DELETE（包括 `feed/search` 与 `signups/read`）都计入 40 次 / 15 分钟 / IP 的广场写配额。
+> 有效会员等级为 0 的普通用户看帖、发帖、报名都会被拒（`PLAZA_MEMBERSHIP_REQUIRED`）。
+
+### PlazaPost 对象
+
+```json
+{
+  "id": "uuid",
+  "content": "周六一起去露营",
+  "images": ["http://localhost:9000/circle/posts/user-1/xxx.jpg"],
+  "tags": ["露营"],
+  "city": "上海",
+  "cities": ["上海"],
+  "isHorn": false,
+  "noteId": null,
+  "restrictions": { "vipLevel": null, "creditScore": null, "fancyNumber": false },   // 互动门槛
+  "signupCount": 3,
+  "signedByMe": false,
+  "signupRestrictions": { "vipLevel": null, "creditScore": null, "fancyNumber": false },   // 报名门槛
+  "canSignup": true,
+  "author": {
+    "id": "uuid",
+    "nickname": "Alice",
+    "avatarUrl": null,
+    "avatarFrame": null,
+    "avatarFrameAppearance": null,
+    "accountId": "ab12cd",
+    "vipLevel": 2,                // 有效会员等级（按到期算）
+    "membership": { },            // 公开会员外观（tier key / 名字色 / 徽章）
+    "displayIcons": []
+  },
+  "circle": { "id": "uuid", "name": "周末露营" },
+  "circles": [{ "id": "uuid", "name": "周末露营" }],
+  "canInteract": true,
+  "createdAt": "2026-09-01T00:00:00.000Z",
+  "expiresAt": "2026-09-01T06:00:00.000Z"
+}
+```
+
+`MyCirclePost`：`{ id, circleId, excerpt, firstImage, signupCount, unreadSignupCount, status, createdAt, expiresAt }`。
+`PostSignupItem`：`{ userId, nickname, avatarUrl, accountId, signedAt, seen, displayIcons, recognized }`。
+
+### 路由
+
+| 方法 | 路径 | 请求 | 响应 | 关键规则 |
+|---|---|---|---|---|
+| GET | `/circle-plaza/feed` | query：`circleId`；`circleIds`（逗号分隔）；`city`（≤ 100）；`cities`（逗号分隔，≤ 4096 字符）；`page` 1–500；`limit` 1–100（默认 20）；`cursor`（≤ 200） | `{ items: PlazaPost[], total, page, limit, hasMore, nextCursor }` | 60 次 / 分钟；只返回我是 ACTIVE 成员的圈子里未过期的 ACTIVE 帖子，按没加入的圈子筛选得到空列表；城市数超过会员配额 `CITY_FILTER_QUOTA_REACHED`；带 `cursor` 时忽略 `page`，`total` 为 `null` |
+| POST | `/circle-plaza/feed/search` | body：`circleId?`；`circleIds?`（≤ 50）；`cities`（必填，≤ 1000，每项 ≤ 100）；`page`、`limit`、`cursor` 同上 | 同 feed | `200`，60 次 / 分钟；城市很多时用它代替 query，规则同 feed |
+| POST | `/circle-plaza/posts` | 发帖字段（见下） | PlazaPost | 10 次 / 分钟；每个目标圈子都必须是 ACTIVE 成员（`PLAZA_NOT_ACTIVE_MEMBER`）；圈子关闭成员发帖时仅圈主 / 管理员可发（`PLAZA_ADMIN_ONLY_POST`）；互动 / 报名门槛不能高于作者自己的有效等级（`PLAZA_VIP_RESTRICTION_EXCEEDS_AUTHOR`） |
+| GET | `/circle-plaza/posts/:id` | — | PlazaPost | 60 次 / 分钟；不是帖子所属圈子的成员时 `PLAZA_NOT_CIRCLE_MEMBER` |
+| DELETE | `/circle-plaza/posts/:id` | — | `204` | 10 次 / 分钟；仅作者（`PLAZA_DELETE_AUTHOR_ONLY`），软删除 |
+| POST | `/circle-plaza/posts/:id/report` | `{ reason? }`（≤ 500） | `{ reported }` | 10 次 / 分钟；不能举报自己的帖子（`PLAZA_REPORT_SELF`） |
+| POST | `/circle-plaza/posts/:id/signup` | — | `{ signed: true, signupCount }` | 30 次 / 分钟；不能报名自己的帖子（`PLAZA_SIGNUP_SELF`）；不满足报名门槛 `PLAZA_SIGNUP_INELIGIBLE` |
+| DELETE | `/circle-plaza/posts/:id/signup` | — | `{ signed: false, signupCount }` | 30 次 / 分钟 |
+| GET | `/circle-plaza/me/posts` | query：`page`（缺省 1，越界夹到 500） | `{ items: MyCirclePost[], total, page, limit, hasMore }` | 60 次 / 分钟；我发的帖子，带每帖未读报名数 |
+| GET | `/circle-plaza/me/signups/unread-count` | — | `{ count }` | 60 次 / 分钟；报名红点 |
+| GET | `/circle-plaza/me/posts/:id/signups` | — | `{ items: PostSignupItem[], recognitionOpen }` | 60 次 / 分钟；只能看自己的帖子；最多 200 条；`recognitionOpen` = 帖子已结束且尚未做过合作认可 |
+| POST | `/circle-plaza/me/posts/:id/signups/read` | — | `{ count }` | 60 次 / 分钟；把该帖所有未读报名标为已读 |
+| POST | `/circle-plaza/me/posts/:id/collaboration-recognitions` | `{ recipientIds }`：1–3 个，去重，每项 ≤ 64 | `{ count, recognizedUserIds }` | `200`，10 次 / 分钟；给该帖报名者合作认可，不满足条件时返回 `PLAZA_RECOGNIZE_*` |
+
+**发帖字段**（`POST /circle-plaza/posts`）
+
+| 字段 | 必填 | 约束 |
+|---|---|---|
+| `content` | 是 | 1–5000 字 |
+| `images` | 否 | ≤ 9 张，每项 ≤ 500 字符，须为本站存储地址 |
+| `tags` | 否 | ≤ 5，去重，每项 ≤ 30 字 |
+| `circleIds` | 是（或旧字段 `circleId`） | UUID 数组 ≤ 50，去重，至少 1 个；第一个为主圈子 |
+| `cities` | 否（或旧字段 `city`） | ≤ 50，去重，每项 ≤ 100 字 |
+| `noteId` | 否 | UUID，关联笔记（无效时 `PLAZA_NOTE_INVALID`） |
+| `isHorn` | 否 | 布尔，默认 `false` |
+| `expiresInHours` | 否 | 6–168，默认 6 |
+| `vipRestriction` / `signupVipRestriction` | 否 | 0–4，互动 / 报名的会员门槛 |
+| `creditRestriction` / `signupCreditRestriction` | 否 | 0–100 |
+| `fancyRestriction` / `signupFancyRestriction` | 否 | 布尔，默认 `false` |
+
+---
+
+## Circle Invitation 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/circle-invitation`
+> 响应均指统一信封中的 `data`；业务错误带 `errorCode`。
+> 限流：所有 POST 计入 40 次 / 15 分钟 / IP 的邀请写配额；`invite` 另有 20 次 / 分钟 / IP。
+
+### Invitation 对象
+
+```json
+{
+  "id": "uuid",
+  "circleId": "uuid",
+  "circleName": "周末露营",
+  "applicant": { "id": "uuid", "nickname": "Bob", "avatarUrl": null, "accountId": "bob02" },
+  "inviter": { "id": "uuid", "nickname": "Alice", "avatarUrl": null, "accountId": "ab12cd" },
+  "requiredCount": 1,         // 建单时快照的圈子 requiredVerifierCount
+  "approvedCount": 0,
+  "status": "PENDING",
+  "verifiers": [
+    {
+      "id": "uuid",
+      "verifier": { "id": "uuid", "nickname": "Carol", "avatarUrl": null, "accountId": "carol03" },
+      "status": "PENDING",
+      "respondedAt": null
+    }
+  ],
+  "createdAt": "2026-09-01T00:00:00.000Z"
+}
+```
+
+**status 枚举值：** `PENDING` | `APPROVED` | `REJECTED` | `ADMIN_APPROVED` | `CANCELLED`；担保人 `status`：`PENDING` | `APPROVED` | `REJECTED`
+
+### 路由
+
+| 方法 | 路径 | 请求 | 响应 | 关键规则 |
+|---|---|---|---|---|
+| POST | `/circle-invitation/invite` | `{ circleId, applicantId }`（UUID） | Invitation | 20 次 / 分钟；邀请人须是圈子成员（`INVITATION_INVITER_NOT_MEMBER`）；圈子关闭成员邀请时仅圈主 / 管理员可邀请（`INVITATION_MEMBER_INVITE_DISABLED`）；对方已有进行中的申请 `INVITATION_ALREADY_PENDING`；`requiredCount` 为 1 时当场入圈 |
+| GET | `/circle-invitation/pending` | query：`cursor`（上一页最后一条的 id）；`limit` 1–100（默认 50） | Invitation 数组 | 我作为担保人待处理的申请 |
+| GET | `/circle-invitation/my-applications` | 同上 | Invitation 数组 | 我作为申请人的申请 |
+| GET | `/circle-invitation/circle/:circleId/pending` | 同上 | Invitation 数组 | 仅 ACTIVE 的圈主 / 管理员（`INVITATION_OWNER_ADMIN_ONLY`） |
+| GET | `/circle-invitation/:id` | — | Invitation | 无权查看时 `INVITATION_VIEW_FORBIDDEN` |
+| GET | `/circle-invitation/:id/eligible-verifiers` | — | `{ id, nickname, avatarUrl, accountId }[]` | 仅申请人（`INVITATION_APPLICANT_ONLY`）；返回既是我好友、又是该圈 ACTIVE 成员的人 |
+| POST | `/circle-invitation/:id/add-verifier` | `{ verifierId }`（UUID） | `204` | 仅申请人；担保人须是好友（`INVITATION_VERIFIER_NOT_FRIEND`）且是圈子成员（`INVITATION_VERIFIER_NOT_MEMBER`）；名额已满 `INVITATION_SLOTS_FILLED`；重复添加 `INVITATION_ALREADY_VERIFIER` |
+| POST | `/circle-invitation/:id/respond` | `{ approve }`（布尔） | `204` | 担保人同意 / 拒绝；我没有待处理的担保 `INVITATION_NO_PENDING_VERIFICATION`；申请已结束 `INVITATION_NOT_PENDING` |
+| POST | `/circle-invitation/:id/admin-approve` | — | `204` | ACTIVE 的圈主 / 管理员跳过担保直接通过（`INVITATION_OWNER_ADMIN_ONLY`） |
+
+---
+
+## Group 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/group`
+> 响应均指统一信封中的 `data`；业务错误带 `errorCode`。
+> `:groupID` 是圈子群聊的 id（`Circle.groupID`）；解析不到对应的圈子群时，邀请与移除接口返回 `{ handled: false }`。
+> 限流：POST / DELETE 计入 60 次 / 15 分钟 / IP，举报另计 10 次 / 小时 / IP；各路由还有按 IP 的每分钟上限（见下表）。
+
+| 方法 | 路径 | 请求 | 响应 | 关键规则 |
+|---|---|---|---|---|
+| DELETE | `/group/:groupID/leave` | — | `204` | 30 次 / 分钟；群主不能退群（`GROUP_OWNER_CANNOT_LEAVE`） |
+| POST | `/group/:groupID/members/invite` | `{ userIDs }`：≤ 100，去重，每项 1–128 字符 | `{ handled }` | 20 次 / 分钟；仅 ACTIVE 的群主 / 管理员（`GROUP_MANAGER_ONLY`）；已是成员的自动跳过；对方隐私设置不允许被拉群或双方存在拉黑时 `GROUP_INVITE_NOT_ALLOWED` |
+| DELETE | `/group/:groupID/members/:userID` | — | `{ handled }` | 30 次 / 分钟；群主可移除任何成员，管理员只能移除普通成员（`GROUP_MANAGER_ONLY`）；移除自己请用 leave（`GROUP_USE_LEAVE_ENDPOINT`） |
+| PATCH | `/group/:groupID/members/:userID/role` | `{ role }`：`ADMIN` \| `MEMBER` | `{ handled: true, role }` | 20 次 / 分钟；仅群主（`GROUP_MANAGER_ONLY`），不能改自己的角色 |
+| POST | `/group/:groupID/report` | 举报字段（见下） | `204` | 10 次 / 分钟；仅 ACTIVE 群成员可举报（`GROUP_REPORT_NOT_ACTIVE`）；同一类别已有待处理举报时 `GROUP_REPORT_DUPLICATE` |
+
+**举报字段**：`category` = `harassment` | `spam` | `impersonation` | `fraud` | `other`；`description` 1–500 字；`evidence` 可选，≤ 5 项、去重、每项 ≤ 500 字符且不含 `<` `>`，http(s) 形式的证据必须来自本站存储（对象 key 原样放行）。
+
+---
+
+## Collections 接口
+
+> 所有接口均需 `Authorization: Bearer <accessToken>`
+> Base path: `/collections`
+> 响应均指统一信封中的 `data`；业务错误带 `errorCode`。
+
+### UserCollection 对象
+
+```json
+{
+  "id": "uuid",
+  "userID": "uuid",
+  "type": "NOTE",
+  "title": "收藏的笔记",
+  "summary": null,
+  "sourceID": "uuid",
+  "payload": {},
+  "createdAt": "2026-09-01T00:00:00.000Z",
+  "updatedAt": "2026-09-01T00:00:00.000Z"
+}
+```
+
+**type 枚举值：** `CHAT` | `VIDEO` | `VOICE` | `MESSAGE` | `NOTE`
+
+| 方法 | 路径 | 请求 | 响应 | 关键规则 |
+|---|---|---|---|---|
+| GET | `/collections` | query：`type`（可选） | UserCollection 数组 | 按创建时间倒序，最多 100 条 |
+| POST | `/collections` | `{ type, title, summary?, sourceID?, payload? }`：`title` ≤ 80，`summary` ≤ 240，`sourceID` ≤ 120，`payload` 为对象 | UserCollection | 每人最多 500 条（`COLLECTION_LIMIT`）；收藏聊天消息时服务端按 `sourceID` 校验这条消息我仍可见，不信任客户端自报的快照（`COLLECTION_INVALID_MESSAGE_SOURCE`）；阅后即焚会话里别人发的消息不可收藏（`COLLECTION_EPHEMERAL_FORBIDDEN`） |
+| DELETE | `/collections/:id` | — | `204` | 只能删自己的收藏，否则 `COLLECTION_NOT_FOUND` |
 
 ---
 

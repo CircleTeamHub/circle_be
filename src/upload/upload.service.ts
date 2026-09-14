@@ -38,6 +38,12 @@ import {
 
 export interface PresignResult {
   uploadUrl: string;
+  /**
+   * 对象直链。只有 PUBLIC_READ_UPLOAD_FOLDERS 里的目录能凭它直连读取;notes/、chat/
+   * 是私有对象(直连 403),读取要凭 key 走各自读路径的短时签名 GET。私有目录暂时仍
+   * 返回它,只因已装机 App 的 presign 校验把它当必填字段 —— 最低支持的 App 版本不再
+   * 要求之后,私有目录可改回 null。
+   */
   fileUrl: string;
   key: string;
   requiredHeaders: Record<string, string>;
@@ -62,21 +68,27 @@ export interface PresignedDownloadResult {
   expiresAt: Date;
 }
 
+/**
+ * 匿名可读的上传目录 —— 唯一事实源:桶策略(buildPublicReadBucketPolicy)与 presign
+ * 接口文档都从它派生,免得文档把私有目录的 fileUrl 说成「永久访问地址」。
+ * 'uploads' 不是 App 可选目录(PresignDto 不放行),是服务端内部上传的默认目录。
+ */
+export const PUBLIC_READ_UPLOAD_FOLDERS = [
+  'avatars',
+  'covers',
+  'posts',
+  // 'notes' 已移除：私有笔记(available:false)的媒体不再匿名可读，改由 note.service
+  // 读取时发短时签名 URL(presign-on-read)。历史直链 url 仍在库里但不再被读取路径返回。
+  // 'chat' 已移除：原先保留的唯一理由是「图 URL 固化在 OpenIM 消息体、无法迁移历史」，
+  // 而自研聊天栈落地后 OpenIM 已出清，ChatMessage 存的是 key 而不是 URL，读取一律走
+  // ChatMediaService 的 presign-on-read。留着 chat/* 匿名可读的话，发送侧的归属校验
+  // (chat/{senderId}/ 命名空间)和读取侧的短时签名就全是摆设 —— 拿到过 key 的人可以
+  // 无限期直连对象存储，绕过所有会话成员校验。
+  'friends',
+  'uploads',
+] as const;
+
 export function buildPublicReadBucketPolicy(bucket: string) {
-  const publicPrefixes = [
-    'avatars',
-    'covers',
-    'posts',
-    // 'notes' 已移除：私有笔记(available:false)的媒体不再匿名可读，改由 note.service
-    // 读取时发短时签名 URL(presign-on-read)。历史直链 url 仍在库里但不再被读取路径返回。
-    // 'chat' 已移除：原先保留的唯一理由是「图 URL 固化在 OpenIM 消息体、无法迁移历史」，
-    // 而自研聊天栈落地后 OpenIM 已出清，ChatMessage 存的是 key 而不是 URL，读取一律走
-    // ChatMediaService 的 presign-on-read。留着 chat/* 匿名可读的话，发送侧的归属校验
-    // (chat/{senderId}/ 命名空间)和读取侧的短时签名就全是摆设 —— 拿到过 key 的人可以
-    // 无限期直连对象存储，绕过所有会话成员校验。
-    'friends',
-    'uploads',
-  ];
   return JSON.stringify({
     Version: '2012-10-17',
     Statement: [
@@ -85,7 +97,7 @@ export function buildPublicReadBucketPolicy(bucket: string) {
         Effect: 'Allow',
         Principal: '*',
         Action: ['s3:GetObject'],
-        Resource: publicPrefixes.map(
+        Resource: PUBLIC_READ_UPLOAD_FOLDERS.map(
           (prefix) => `arn:aws:s3:::${bucket}/${prefix}/*`,
         ),
       },

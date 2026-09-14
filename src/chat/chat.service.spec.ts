@@ -81,6 +81,7 @@ describe('ChatService', () => {
     emitRevoke: jest.fn(),
     emitRead: jest.fn(),
     emitHistoryCleared: jest.fn(),
+    emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
   };
   const groupEvents = {
     record: jest.fn().mockResolvedValue(undefined),
@@ -1631,6 +1632,24 @@ describe('ChatService', () => {
       expect(privacySettings.canReceiveStrangerMessage).not.toHaveBeenCalled();
     });
 
+    it("carries the peer seat's read watermark", async () => {
+      prisma.user.findUnique.mockResolvedValue(peer);
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        ...conversationRow,
+        members: [
+          conversationRow.members[0],
+          { ...conversationRow.members[1], lastReadHeight: 9 },
+        ],
+      });
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(dto.peerReadHeight).toBe(9);
+    });
+
     it("joins both members' live sockets to the conversation room", async () => {
       prisma.user.findUnique.mockResolvedValue(peer);
       prisma.block.findFirst.mockResolvedValue(null);
@@ -2242,6 +2261,41 @@ describe('ChatService', () => {
   });
 
   describe('listConversations', () => {
+    // 一页最多 limit 条（默认 100）：多取一条判断截断，响应体仍是数组，由控制器写
+    // X-Has-More。此前超过 100 个会话的用户在 App 里静默少一截。
+    it('reports hasMore when more conversations exist than the page limit', async () => {
+      const row = (id: string) =>
+        membership({
+          id: `member-${id}`,
+          conversationID: id,
+          conversation: { ...membership().conversation, id },
+        });
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        row('conv-1'),
+        row('conv-2'),
+        row('conv-3'),
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const page = await service.listConversationsPage('u1', 2);
+
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 3 }),
+      );
+      expect(page.hasMore).toBe(true);
+      expect(page.conversations).toHaveLength(2);
+    });
+
+    it('reports no more conversations when the page is not full', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const page = await service.listConversationsPage('u1', 2);
+
+      expect(page.hasMore).toBe(false);
+      expect(page.conversations).toHaveLength(1);
+    });
+
     it('pushes viewer retention into preview and unread queries', async () => {
       privacySettings.getSettings.mockResolvedValue({
         messageSelfDestructSec: 172800,
@@ -2291,7 +2345,9 @@ describe('ChatService', () => {
           },
         ])
         // loadDirectPeers 的对端成员查询。
-        .mockResolvedValueOnce([{ conversationID: 'conv-1', userID: 'u2' }]);
+        .mockResolvedValueOnce([
+          { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 7 },
+        ]);
       // 末条消息与未读数各一次集合查询(不再每会话一次往返)。
       prisma.$queryRaw
         .mockResolvedValueOnce([createdRow])
@@ -2310,6 +2366,8 @@ describe('ChatService', () => {
         id: 'conv-1',
         type: 'DIRECT',
         peer: { id: 'u2' },
+        // chat:read 只在水位推进时广播;冷启动靠快照里的对端水位恢复「已读」。
+        peerReadHeight: 7,
         tempChat: null,
         unreadCount: 2,
         lastMessage: { id: 'msg-1' },
@@ -2343,6 +2401,7 @@ describe('ChatService', () => {
         id: 'conv-temp',
         type: 'TEMP',
         peer: null,
+        peerReadHeight: null,
         circle: null,
         tempChat: { id: 'tc-1', title: '周末临时群' },
       });
@@ -2764,6 +2823,37 @@ describe('ChatService', () => {
         },
         data: { pinned: true },
       });
+    });
+
+    it('returns the direct peer and its read watermark in the refreshed row', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'u1:u2',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: null,
+          },
+        }),
+      );
+      prisma.chatMember.update.mockResolvedValue({});
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 4 },
+      ]);
+      prisma.user.findMany.mockResolvedValue([
+        { id: 'u2', nickname: '对方', avatarUrl: null },
+      ]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {
+        pinned: true,
+      });
+
+      expect(dto).toMatchObject({ peer: { id: 'u2' }, peerReadHeight: 4 });
     });
 
     it('maps hidden boolean onto the hiddenAt timestamp', async () => {
@@ -3499,6 +3589,110 @@ describe('ChatService', () => {
       expect(result.total).toBe(2);
       expect(result.readers.map((r) => r.nickname)).toEqual(['B', 'C']);
     });
+
+    // 已读名单只给发送者本人:App 也只在自己发出的群消息上开这个入口
+    // (ChatDetailScreen 限 message.outgoing)。只查在座的话,任何成员都能逐条
+    // 探查别人的消息被谁读过。
+    it.each([
+      ["another member's message", 'u2'],
+      ['a system notice without an author', null],
+    ])('refuses to list readers of %s', async (_case, senderID) => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        conversationID: 'conv-1',
+        height: 5,
+        senderID,
+        createdAt: new Date(),
+      });
+
+      const error: unknown = await service
+        .listMessageReaders('u1', 'conv-1', 'm1')
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ForbiddenException);
+      expect((error as ForbiddenException).getResponse()).toMatchObject({
+        errorCode: ChatErrorCode.ReadersForbidden,
+      });
+      expect(prisma.chatMember.findMany).not.toHaveBeenCalled();
+      expect(prisma.chatMember.count).not.toHaveBeenCalled();
+    });
+
+    it('keeps reporting a message from another conversation as not found', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        conversationID: 'conv-other',
+        height: 5,
+        senderID: 'u1',
+        createdAt: new Date(),
+      });
+
+      await expect(
+        service.listMessageReaders('u1', 'conv-1', 'm1'),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.MessageNotFound },
+      });
+    });
+  });
+
+  describe('getBurnPolicy(私聊页进入时读当前焚毁档位)', () => {
+    const directSeat = (
+      burnDurationSec: number | null,
+      seat: Record<string, unknown> = {},
+    ) =>
+      membership({
+        ...seat,
+        conversation: {
+          id: 'conv-1',
+          type: 'DIRECT',
+          directKey: 'u1:u2',
+          circleID: null,
+          tempChatID: null,
+          lastMessageAt: null,
+          burnDurationSec,
+        },
+      });
+
+    // 已装机的 App 每次打开私聊都会 GET 这个路径;此前只有 POST,每开一次一个 404。
+    it('returns the current conversation policy in the POST response shape', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat(3600));
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).resolves.toEqual({
+        burnDurationSec: 3600,
+      });
+      // 对端的全局阅后即焚只是他自己视图上的读过滤(selfDestructCutoff),
+      // 不是会话策略:不读,也不外露给会话另一方。
+      expect(privacySettings.getSettings).not.toHaveBeenCalled();
+    });
+
+    it('reports null when burn-after-reading is off', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(directSeat(null));
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).resolves.toEqual({
+        burnDurationSec: null,
+      });
+    });
+
+    it('refuses a caller without a seat', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(null);
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).rejects.toMatchObject(
+        {
+          response: { errorCode: ChatErrorCode.NotMember },
+        },
+      );
+    });
+
+    it('refuses a caller who already left the conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        directSeat(60, { leftAt: new Date('2026-09-01T00:00:00.000Z') }),
+      );
+
+      await expect(service.getBurnPolicy('u1', 'conv-1')).rejects.toMatchObject(
+        {
+          response: { errorCode: ChatErrorCode.NotMember },
+        },
+      );
+    });
   });
 
   describe('setBurnDuration(S-01 会话级阅后即焚)', () => {
@@ -3611,6 +3805,66 @@ describe('ChatService', () => {
         'conv-1',
         { kind: 'burn-changed', seconds: 0 },
       );
+    });
+
+    // 放宽前的兜底真删同样是墓碑:不通知的话,对端设备上这批已经烧掉的正文还留在本地。
+    it('announces the ids tombstoned before a relax, after they commit', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 60,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: null,
+      });
+      prisma.chatMessage.findMany.mockResolvedValueOnce([
+        { id: 'expired-1', type: 'text', content: { text: 'gone' } },
+        { id: 'expired-2', type: 'text', content: { text: 'gone too' } },
+      ]);
+      prisma.chatMessage.updateMany.mockResolvedValue({ count: 2 });
+
+      await service.setBurnDuration('u1', 'conv-1', 0);
+
+      expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
+        'expired-1',
+        'expired-2',
+      ]);
+      expect(
+        prisma.chatMessage.updateMany.mock.invocationCallOrder[0],
+      ).toBeLessThan(broadcast.emitBurnedMessages.mock.invocationCallOrder[0]);
+    });
+
+    it('announces nothing when the duration only gets stricter', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(
+        membership({
+          conversation: {
+            id: 'conv-1',
+            type: 'DIRECT',
+            directKey: 'a:b',
+            circleID: null,
+            tempChatID: null,
+            lastMessageAt: null,
+            burnDurationSec: 3600,
+          },
+        }),
+      );
+      prisma.chatConversation.update.mockResolvedValue({
+        id: 'conv-1',
+        burnDurationSec: 60,
+      });
+
+      await service.setBurnDuration('u1', 'conv-1', 60);
+
+      expect(broadcast.emitBurnedMessages).not.toHaveBeenCalled();
     });
 
     it('GROUP requires a circle owner/admin', async () => {
@@ -5269,6 +5523,30 @@ describe('ChatService', () => {
       expect(Date.parse(result.nextSince)).toBeLessThan(
         Date.parse(result.serverTime),
       );
+    });
+
+    // 焚毁墓碑的 content 已被清空:当成「编辑」回放出去,等于拿一条空正文覆盖对端的
+    // 本地缓存。墓碑本身由 chat:burned_messages 与历史拉取收敛,不归这条通道。
+    it('never replays tombstoned rows as mutations', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.listMutationsSince('u1', new Date(Date.now() - 60_000));
+
+      const mutationQuery = (
+        prisma.$queryRaw.mock.calls as Array<[TemplateStringsArray]>
+      )
+        .map(([strings]) => strings.join('?'))
+        .find((sql) => sql.includes('"mutatedAt"'));
+      expect(mutationQuery).toBeDefined();
+      expect(mutationQuery).toMatch(/m\."deleted" = true OR w\.cutoff IS NULL/);
+      expect(mutationQuery).toMatch(/m\."deletedAt" >=/);
     });
 
     it('stops the cursor at the last returned mutation when truncated', async () => {

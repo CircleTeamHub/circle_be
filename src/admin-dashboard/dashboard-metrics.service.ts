@@ -174,15 +174,9 @@ export class DashboardSystemMetrics {
       this.prisma.$queryRaw(Prisma.sql`SELECT 1 AS "ok"`),
       this.redis.ping(),
     ]);
+    // 只回真实探针。OpenIM 同步 outbox 早已拆除,此前保形置零的 pending/processing/
+    // failed/oldest*/friend/group 只会在面板上显示一排永远为 0 的假队列。
     return {
-      // OpenIM 同步 outbox 已拆除:字段保形置零,admin_web 面板无需同步升级。
-      pending: 0,
-      processing: 0,
-      failed: 0,
-      oldestPendingAt: null,
-      oldestFailedAt: null,
-      friend: null,
-      group: null,
       services: {
         api: 'healthy',
         database: databaseResult.status === 'fulfilled' ? 'healthy' : 'down',

@@ -9,6 +9,7 @@ import { IconService } from 'src/icon/icon.service';
 import { RealtimeService } from 'src/realtime/realtime.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
 import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
+import { USER_ME_SELECT } from '../user.select';
 
 describe('UserService', () => {
   let service: UserService;
@@ -40,9 +41,15 @@ describe('UserService', () => {
     invalidateUserProfileSummaryCache: jest.fn(() => Promise.resolve()),
   };
   const privacySettings = {
-    canViewProfileField: jest.fn(),
+    canViewProfileFields: jest.fn(),
     getSettings: jest.fn().mockResolvedValue({ addMeByAccount: true }),
   };
+  /** 按字段给出可见性，替身 PrivacySettingsService.canViewProfileFields。 */
+  const allowProfileFields = (visible: (field: string) => boolean) =>
+    privacySettings.canViewProfileFields.mockImplementation(
+      async (_targetId: string, fields: readonly string[]) =>
+        Object.fromEntries(fields.map((field) => [field, visible(field)])),
+    );
   const avatarFrames = {
     resolvePublicAppearances: jest.fn(),
   };
@@ -68,7 +75,7 @@ describe('UserService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    privacySettings.canViewProfileField.mockResolvedValue(true);
+    allowProfileFields(() => true);
     // clearAllMocks 只清调用记录、不清实现，逐个用例覆盖过的返回值会漏给下一个。
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: true });
     prisma.userLike.findUnique.mockResolvedValue(null);
@@ -299,7 +306,7 @@ describe('UserService', () => {
       nickname: 'Jimmy',
     });
     privacySettings.getSettings.mockResolvedValue({ addMeByAccount: false });
-    privacySettings.canViewProfileField.mockResolvedValue(true);
+    allowProfileFields(() => true);
     avatarFrames.resolvePublicAppearances.mockResolvedValue(new Map());
 
     await expect(
@@ -317,9 +324,7 @@ describe('UserService', () => {
       qq: '10001',
     });
     // Target set wechat/qq to private; phone stays visible.
-    privacySettings.canViewProfileField.mockImplementation(
-      (_id: string, field: string) => Promise.resolve(field === 'phoneNumber'),
-    );
+    allowProfileFields((field) => field === 'phoneNumber');
 
     const result = await service.findByExactAccountId('jimmy', 'viewer-1');
 
@@ -331,38 +336,72 @@ describe('UserService', () => {
       qq: null,
       phoneNumber: '13800000000',
     });
-    expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+    expect(privacySettings.canViewProfileFields).toHaveBeenCalledWith(
       'user-9',
-      'wechat',
+      expect.arrayContaining(['wechat']),
       false,
       false,
     );
   });
 
   describe('findOne', () => {
-    it('returns the user (with like status) when found', async () => {
+    it('returns the profile view with the effective vipLevel and like count', async () => {
       prisma.user.findUnique.mockResolvedValue({
         id: 'user-1',
         receivedLikeCount: 4,
         vipLevel: 2,
         vipExpiresAt: new Date(Date.now() - 1),
       });
-      // Self-view: likedByMeToday is always false and no like lookup is made.
       await expect(service.findOne('user-1')).resolves.toMatchObject({
         id: 'user-1',
         displayIcons: [],
         likeCount: 4,
-        likedByMeToday: false,
         vipLevel: 0,
-        membership: {
-          effectiveLevel: 0,
-          key: 'regular',
-          appearance: { nameColor: 'default', badge: null },
-        },
       });
       const result = await service.findOne('user-1');
       expect(result).not.toHaveProperty('vipExpiresAt');
+    });
+
+    // likedByMeToday / membership 不在任何客户端的读取路径上（点赞状态走 like 模块），
+    // 资料页不该为它们每次多打一条 userLike 查询、多拼一个会员外观对象。
+    it("does not look up today's like or build a membership object for other viewers", async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'target-1',
+        receivedLikeCount: 4,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2999-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.findOne('target-1', 'viewer-1');
+
+      expect(result).toMatchObject({
+        id: 'target-1',
+        likeCount: 4,
+        vipLevel: 3,
+      });
+      expect(result).not.toHaveProperty('likedByMeToday');
+      expect(result).not.toHaveProperty('membership');
       expect(prisma.userLike.findUnique).not.toHaveBeenCalled();
+    });
+
+    // 账号搜索只返回 ACTIVE；资料页此前连 DELETED 都照常返回，注销账号仍能被
+    // 任何拿到 userId 的人读出资料。对外与「不存在」同一个 404，本人不挡。
+    it('answers a deleted account with the user-not-found 404 for everyone but its owner', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'gone-1',
+        status: UserStatus.DELETED,
+        receivedLikeCount: 0,
+      });
+
+      await expect(service.findOne('gone-1', 'viewer-1')).rejects.toThrow(
+        NotFoundException,
+      );
+      await expect(service.findOne('gone-1', 'viewer-1')).rejects.toThrow(
+        'User gone-1 not found',
+      );
+      await expect(service.findOne('gone-1', 'gone-1')).resolves.toMatchObject({
+        id: 'gone-1',
+      });
     });
 
     it('filters contact fields according to target privacy settings for other viewers', async () => {
@@ -374,9 +413,7 @@ describe('UserService', () => {
         qq: '10001',
         lastOnline: new Date('2026-09-11T08:00:00.000Z'),
       });
-      privacySettings.canViewProfileField.mockImplementation(
-        async (_targetId: string, field: string) => field === 'wechat',
-      );
+      allowProfileFields((field) => field === 'wechat');
 
       await expect(
         service.findOne('target-1', 'viewer-1'),
@@ -394,13 +431,34 @@ describe('UserService', () => {
         // REST 不收口就是第二条信道。
         lastOnline: null,
         displayIcons: [],
-        likedByMeToday: false,
       });
-      expect(privacySettings.canViewProfileField).toHaveBeenCalledWith(
+      expect(privacySettings.canViewProfileFields).toHaveBeenCalledWith(
         'target-1',
-        'email',
+        expect.arrayContaining(['email']),
         false,
         false,
+      );
+    });
+
+    // 资料页一次要判六个字段，此前逐个调 canViewProfileField = 六条相同的
+    // userPrivacySetting 查询；现在整组交给一次 canViewProfileFields。
+    it('gates all six profile fields through one batched privacy evaluation', async () => {
+      prisma.user.findUnique.mockResolvedValue({ id: 'target-1' });
+
+      await service.findOne('target-1', 'viewer-1');
+
+      expect(privacySettings.canViewProfileFields).toHaveBeenCalledTimes(1);
+      const [, fields] = privacySettings.canViewProfileFields.mock.calls[0];
+      expect(fields).toHaveLength(6);
+      expect(fields).toEqual(
+        expect.arrayContaining([
+          'phoneNumber',
+          'email',
+          'wechat',
+          'qq',
+          'whatsup',
+          'lastOnline',
+        ]),
       );
     });
 
@@ -518,6 +576,57 @@ describe('UserService', () => {
         service.update('user-1', { birthday: 'not-a-date' as any }),
       ).rejects.toThrow(BadRequestException);
     });
+
+    // PATCH 声明的是 SelfUserDto，却一直按他人视图的列去选，inviteCode / creditScore /
+    // fancyNumber 在响应里恒缺；与 /auth/me 共用同一份 USER_ME_SELECT。
+    it('answers PATCH with the owner-view columns SelfUserDto declares', async () => {
+      prisma.user.update.mockResolvedValue({
+        id: 'user-1',
+        inviteCode: 'invite1',
+        creditScore: 100,
+        vipLevel: 3,
+        vipExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+      });
+
+      const result = await service.update('user-1', { nickname: 'jimmy' });
+
+      expect(prisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({ select: USER_ME_SELECT }),
+      );
+      expect(result).toMatchObject({
+        id: 'user-1',
+        inviteCode: 'invite1',
+        creditScore: 100,
+        vipLevel: 0,
+      });
+      expect(result).not.toHaveProperty('storedVipLevel');
+      expect(result).not.toHaveProperty('vipExpiresAt');
+      expect(result).not.toHaveProperty('membership');
+    });
+
+    // update 只为判 404 就把整条资料流水线（隐私判定、图标、头像框）跑一遍，
+    // 一次 PATCH 平白多出隐私读取与第二轮图标/头像框查询。
+    it('checks existence with a bare id lookup instead of the profile pipeline', async () => {
+      await service.update('user-1', { nickname: 'jimmy' });
+
+      expect(prisma.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        select: { id: true },
+      });
+      expect(privacySettings.canViewProfileFields).not.toHaveBeenCalled();
+      expect(iconService.getDisplayIconsForUser).toHaveBeenCalledTimes(1);
+      expect(avatarFrames.resolvePublicAppearances).toHaveBeenCalledTimes(1);
+    });
+
+    it('still answers an unknown id with the user-not-found 404 and writes nothing', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.update('missing', { nickname: 'jimmy' }),
+      ).rejects.toThrow('User missing not found');
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('remove', () => {
@@ -557,11 +666,11 @@ describe('UserService', () => {
 
       const result = await service.remove('user-1');
 
-      // Expired level 3 → effective 0 and the membership object is present, so
-      // the deletion body matches every other public-user response instead of
-      // leaking the stored paid tier.
+      // Expired level 3 → effective 0, so the deletion body matches every other
+      // public-user response instead of leaking the stored paid tier or its expiry.
       expect(result.vipLevel).toBe(0);
-      expect(result.membership.effectiveLevel).toBe(0);
+      expect(result).not.toHaveProperty('vipExpiresAt');
+      expect(result).not.toHaveProperty('membership');
     });
   });
 });

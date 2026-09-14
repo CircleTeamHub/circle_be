@@ -108,7 +108,7 @@ describe('normalizeRoute', () => {
     ).toBe('/api/v1/note/share-links/:token');
   });
 
-  it('collapses non-uuid string ids in group and chat-history routes', () => {
+  it('collapses non-uuid string ids in group routes', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2')).toBe(
       '/api/v1/group/:groupID/members/:userID',
     );
@@ -117,11 +117,6 @@ describe('normalizeRoute', () => {
     expect(normalizeRoute('/api/v1/group/sg_group-1/members/user-2/role')).toBe(
       '/api/v1/group/:groupID/members/:userID/role',
     );
-    expect(
-      normalizeRoute(
-        '/api/v1/chat-history/conversations/si_user-a_user-b/messages',
-      ),
-    ).toBe('/api/v1/chat-history/conversations/:conversationID/messages');
   });
 
   it('leaves fully static routes unchanged', () => {
@@ -269,6 +264,36 @@ describe('route allowlist consistency', () => {
         .map((seg, i) => (seg.startsWith(':') ? `sample${i}` : seg))
         .join('/');
       expect(normalizeRoute(concrete)).toBe(template);
+    }
+  });
+});
+
+// 已删除的路由不能留在白名单里:否则一个永远 404 的路径占着常驻标签,也掩盖了
+// 「这条路由已经没了」。命中它们应当和其它未知路由一样计入未知路由预算。
+describe('removed routes stay out of the allowlists', () => {
+  // /logs、/roles、/roles/:id、/chat-history/... 没有对应的控制器(旧脚手架与 OpenIM
+  // 时代的残留),其余是本轮删除的无消费者路由。
+  const removedStaticRoutes: string[] = [
+    '/api/v1/friend/activities/read-all',
+    '/api/v1/friend/requests/incoming',
+    '/api/v1/friend/requests/outgoing',
+    '/api/v1/logs',
+    '/api/v1/membership/me',
+    '/api/v1/roles',
+  ];
+  const removedTemplates = [
+    '/api/v1/chat-history/conversations/:conversationID/messages',
+    '/api/v1/circle-plaza/posts/:id/signups',
+    '/api/v1/friend/:friendUserId/blacklist',
+    '/api/v1/roles/:id',
+  ];
+
+  it('has no static entry or template for a deleted route', () => {
+    for (const route of removedStaticRoutes) {
+      expect(STATIC_ROUTES.has(route)).toBe(false);
+    }
+    for (const template of removedTemplates) {
+      expect(DYNAMIC_ROUTE_TEMPLATES).not.toContain(template);
     }
   });
 });

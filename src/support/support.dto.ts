@@ -11,6 +11,7 @@ import {
   IsString,
   IsUUID,
   Max,
+  MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
@@ -124,9 +125,14 @@ export class ReplaceSupportAgentsDto {
   // 过渡期先做成可选:后端与管理台是分开部署的,一上来就必填会让「新后端 + 旧管理台」
   // 这段窗口里的每一次保存都 400。缺省时退回旧行为(不做并发校验),等管理台版本铺开后
   // 再由后续一个后端版本改成必填。带上它的客户端立刻就受保护。
-  @ApiPropertyOptional({ description: 'GET 返回的 revision，原样回传' })
+  // revision 是 supportAgentsRevision 算出的 32 位 hex;64 是给回传值的宽松上界。
+  @ApiPropertyOptional({
+    description: 'GET 返回的 revision，原样回传',
+    maxLength: 64,
+  })
   @IsOptional()
   @IsString()
   @IsNotEmpty()
+  @MaxLength(64)
   expectedRevision?: string;
 }

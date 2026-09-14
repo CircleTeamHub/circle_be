@@ -30,7 +30,7 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
-  const sessionRevocation = { isRevoked: jest.fn() };
+  const sessionVerifier = { verify: jest.fn() };
   const chatService = {
     listConversationIds: jest.fn(),
     sendMessage: jest.fn(),
@@ -98,7 +98,7 @@ describe('ChatGateway', () => {
 
   const gateway = new ChatGateway(
     jwtService as never,
-    sessionRevocation as never,
+    sessionVerifier as never,
     chatService as never,
     broadcast as never,
     chatPush as never,
@@ -112,7 +112,7 @@ describe('ChatGateway', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    sessionRevocation.isRevoked.mockResolvedValue(false);
+    sessionVerifier.verify.mockResolvedValue('active');
     configService.get.mockReturnValue('guest-secret');
     // 默认不是访客 token:app 分支的既有用例不受分流影响。
     jwtService.decode.mockReturnValue({ sub: 'u1' });
@@ -174,12 +174,47 @@ describe('ChatGateway', () => {
         accountId: 'acc1',
         aud: 'APP',
       });
-      sessionRevocation.isRevoked.mockResolvedValue(true);
+      sessionVerifier.verify.mockResolvedValue('revoked');
       const revoked = fakeSocket();
       await expect(
         gateway['authenticate'](revoked as never),
       ).resolves.toBeNull();
       expect(revoked.data.authFailureReason).toBe('revoked');
+    });
+
+    // Redis 与数据库都答不上来：不是吊销，而是暂时核验不了。握手照样拒绝，但原因单列，
+    // 回给客户端的错误带 data.status 503 —— circle-im 的 socket-manager 据此归为
+    // server_error，而不是 unauthorized。
+    it('rejects an unverifiable session with its own reason and a retryable 503 error', async () => {
+      jwtService.verify.mockReturnValue({
+        sub: 'u1',
+        accountId: 'acc1',
+        aud: 'APP',
+      });
+      sessionVerifier.verify.mockResolvedValue('unavailable');
+      const socket = fakeSocket();
+
+      await expect(
+        gateway['authenticate'](socket as never),
+      ).resolves.toBeNull();
+      expect(socket.data.authFailureReason).toBe('session_unverifiable');
+
+      const error = gateway['handshakeError'](socket as never) as Error & {
+        data?: { status?: number };
+      };
+      expect(error.message).toBe('service_unavailable');
+      expect(error.data).toEqual({ status: 503 });
+    });
+
+    it('keeps the plain unauthorized handshake error for revoked sessions', () => {
+      const socket = fakeSocket();
+      socket.data.authFailureReason = 'revoked';
+
+      const error = gateway['handshakeError'](socket as never) as Error & {
+        data?: unknown;
+      };
+      expect(error.message).toBe('unauthorized');
+      expect(error.data).toBeUndefined();
     });
 
     // 管理台走 /auth/admin/login 拿的是 ADMIN audience,它同样能过签名校验,
@@ -197,7 +232,7 @@ describe('ChatGateway', () => {
       ).resolves.toBeNull();
       expect(socket.data.authFailureReason).toBe('wrong_audience');
       // 连吊销检查都不该走到 —— 这类 token 根本不该进入聊天面。
-      expect(sessionRevocation.isRevoked).not.toHaveBeenCalled();
+      expect(sessionVerifier.verify).not.toHaveBeenCalled();
     });
 
     it('rejects a token with no audience claim at all', async () => {
@@ -451,7 +486,7 @@ describe('ChatGateway', () => {
       // 访客没有 app 会话,吊销广播的两个判据都不该命中它。
       expect(socket.data.sessionId).toBeNull();
       expect(socket.data.issuedAtMs).toBeNull();
-      expect(sessionRevocation.isRevoked).not.toHaveBeenCalled();
+      expect(sessionVerifier.verify).not.toHaveBeenCalled();
     });
 
     it('rejects once the room is no longer active', async () => {
@@ -900,13 +935,17 @@ describe('ChatGateway', () => {
       expect(metrics.observeConnectionClosed).toHaveBeenCalledTimes(1);
     });
 
-    it('confines a guest socket to its own room and skips the membership lookup', async () => {
+    // 访客只进自己的个人房：消息与编辑按在座成员逐个个人房投递，照样送得到。会话房里
+    // 的已读 / 正在输入 / 在线状态 / 表情 / 撤回广播都带着房主真实 userId，访客页一个
+    // 都不消费，却会把房主账号 UUID 与在线规律交给匿名访客。
+    it('confines a guest socket to its personal room and keeps it out of the conversation room', async () => {
       const socket = fakeSocket({
         data: { userId: 'g1', guestConversationId: 'conv-9' },
       });
       await gateway['handleConnection'](socket as never);
       expect(chatService.listConversationIds).not.toHaveBeenCalled();
-      expect(socket.join).toHaveBeenCalledWith(['c:conv-9']);
+      expect(socket.join).toHaveBeenCalledWith('u:g1');
+      expect(socket.join).not.toHaveBeenCalledWith(['c:conv-9']);
     });
   });
 
@@ -974,6 +1013,29 @@ describe('ChatGateway', () => {
       });
       broadcast.isUserOnline.mockResolvedValue(false);
       broadcast.isUserOnline.mockResolvedValue(false);
+    });
+
+    // 访客凭证只该看得见自己那间临时房。在线状态查询直接按 socket 身份在网关拒掉,
+    // 不进限流、不查可见性、不碰在线注册表 —— 访客页(temp-chat-web)也从不发这个事件。
+    it('refuses temp-chat guests before any presence lookup', async () => {
+      const ack = jest.fn();
+      const socket = fakeSocket();
+      socket.data.guestConversationId = 'conv-temp';
+
+      await gateway['handlePresenceQuery'](
+        socket as never,
+        { userIds: ['host-1'], detail: true } as never,
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({
+        ok: false,
+        code: ChatErrorCode.InvalidPayload,
+        message: expect.any(String),
+      });
+      expect(chatService.filterVisiblePresenceTargets).not.toHaveBeenCalled();
+      expect(chatService.getLastSeenAt).not.toHaveBeenCalled();
+      expect(broadcast.isUserOnline).not.toHaveBeenCalled();
     });
 
     it('answers empty without touching presence when nothing was requested', async () => {

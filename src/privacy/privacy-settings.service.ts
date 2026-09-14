@@ -57,7 +57,7 @@ type StoredPrivacySettings = PrivacySettingsDto & {
   updatedAt?: Date;
 };
 
-type ProfilePrivacyField =
+export type ProfilePrivacyField =
   | 'phoneNumber'
   | 'email'
   | 'wechat'
@@ -275,6 +275,44 @@ export class PrivacySettingsService {
     if (isSelf) return true;
 
     const settings = await this.getSettings(targetUserId);
+    return this.profileFieldVisibleFor(settings, field, isFriend);
+  }
+
+  /**
+   * Batch variant of {@link canViewProfileField}: one settings read for any
+   * number of fields of the same target. A profile view gates six fields, and
+   * calling the single-field version per field meant six identical
+   * userPrivacySetting queries. Same rules via profileFieldVisibleFor; the
+   * owner sees every field without a read.
+   */
+  async canViewProfileFields<F extends ProfilePrivacyField>(
+    targetUserId: string,
+    fields: readonly F[],
+    isSelf: boolean,
+    isFriend: boolean,
+  ): Promise<Record<F, boolean>> {
+    if (isSelf) {
+      return Object.fromEntries(fields.map((field) => [field, true])) as Record<
+        F,
+        boolean
+      >;
+    }
+
+    const settings = await this.getSettings(targetUserId);
+    return Object.fromEntries(
+      fields.map((field) => [
+        field,
+        this.profileFieldVisibleFor(settings, field, isFriend),
+      ]),
+    ) as Record<F, boolean>;
+  }
+
+  /** Per-field decision over already-loaded settings, for a non-owner viewer. */
+  private profileFieldVisibleFor(
+    settings: PrivacySettingsDto,
+    field: ProfilePrivacyField,
+    isFriend: boolean,
+  ): boolean {
     if (field === 'phoneNumber') return settings.showPhone;
     if (field === 'email') return settings.showEmail;
     if (field === 'wechat') return settings.showWechat;

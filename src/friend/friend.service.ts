@@ -29,7 +29,6 @@ import {
   FriendProfileDto,
   FriendActivityDto,
   FriendActivityUnreadCountDto,
-  FriendRequestDto,
   FriendSettingsDto,
   FriendStatusDto,
   ReportFriendDto,
@@ -38,7 +37,6 @@ import { AvatarFrameService } from 'src/avatar-frame/avatar-frame.service';
 import { isBlockedByStandaloneGroupPolicy } from 'src/chat/standalone-group-policy-gate';
 
 // Members (paid) get 5 000, regular users get 1 000.
-const FRIEND_REQUEST_PAGE_SIZE = 500;
 const BLOCKED_PAGE_SIZE = 1000;
 const FRIEND_LIMIT_USER = 1_000;
 const FRIEND_LIMIT_MEMBER = 5_000;
@@ -83,15 +81,22 @@ const MINI_USER_SELECT = {
   avatarUrl: true,
 } as const;
 
-// Full profile shape returned in the friend list
+// Profile columns returned in the friend list. Only what clients read:
+// gender / avatarFrame (superseded by avatarFrameAppearance) / lastOnline were
+// passed through circle-im's normalizer but never rendered.
 const FRIEND_PROFILE_SELECT = {
   id: true,
   accountId: true,
   nickname: true,
   avatarUrl: true,
-  avatarFrame: true,
-  gender: true,
-  lastOnline: true,
+} as const;
+
+// Friend tags go out as { id, name, color } — ownerID is always the caller and
+// createdAt is never read.
+const FRIEND_TAG_SELECT = {
+  id: true,
+  name: true,
+  color: true,
 } as const;
 
 const FRIEND_ACTIVITY_TYPE = {
@@ -199,6 +204,14 @@ export class FriendService {
         errorCode: FriendErrorCode.SelfAdd,
       });
     }
+    // 描述照片在对方通过后进入发送者的联系人卡片并被渲染。App 只发 presign 返回的本站
+    // fileUrl;外站 http(s) 链接等于往卡片里塞追踪像素。与举报证据同一口径:http(s) 项
+    // 必须来自本站存储,对象 key 原样放行(不在这里拒绝旧形态的值)。
+    assertUrlsFromStorage(
+      (extras?.photos ?? []).filter(isHttpUrl),
+      this.storagePublicObjectBases,
+      'photos',
+    );
     if (extras?.viaConversationId) {
       await this.assertGroupAllowsFriendRequests(
         extras.viaConversationId,
@@ -868,28 +881,6 @@ export class FriendService {
   // 正常用户远够不到；够到的说明该端点需要真分页（届时按 trace/plaza 的
   // cursor 模式补）。FriendActivity 表不参与清理（见 refresh-token.cleanup
   // 注释），listActivities 的 take 同时是这张只增表的读路径止血带。
-  /**
-   * 好友列表的「显示在线时间」附加读。
-   *
-   * 读失败时返回 null,调用方把所有 lastOnline 抹成 null —— 好友与好友关系都
-   * 已经查出来了,不该因为这条附加查询失败就让整个列表请求挂掉;而退到
-   * 「都不显示」是隐私安全的那一侧,不会把关掉开关的人漏出去。
-   */
-  private async readPresencePrivacy(
-    userIds: string[],
-  ): Promise<Map<string, { shareOnlineStatus?: boolean }> | null> {
-    try {
-      return await this.privacySettings.getSettingsForUsers(userIds);
-    } catch (error) {
-      this.logger.warn(
-        `friend presence privacy lookup failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return null;
-    }
-  }
-
   async listFriends(userId: string): Promise<FriendProfileDto[]> {
     const records = await this.prisma.friend.findMany({
       where: {
@@ -907,12 +898,8 @@ export class FriendService {
       where: { id: { in: friendIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const [appearances, privacy] = await Promise.all([
-      this.avatarFrames.resolvePublicAppearances(friendIds),
-      // 关了「显示在线时间」的好友,列表里的 lastOnline 一并抹掉 —— 资料页与
-      // 聊天 presence 都收口了,好友列表不收口就是第三条信道。
-      this.readPresencePrivacy(friendIds),
-    ]);
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueRecords
@@ -924,10 +911,6 @@ export class FriendService {
         const remark = r.userID === userId ? r.remarkA : r.remarkB;
         return {
           ...u,
-          lastOnline:
-            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
-              ? null
-              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: r.updatedAt,
           remark,
@@ -960,6 +943,7 @@ export class FriendService {
     const [availableTags, assignedLinks] = await Promise.all([
       this.prisma.friendTag.findMany({
         where: { ownerID: userId },
+        select: FRIEND_TAG_SELECT,
         orderBy: { name: 'asc' },
         take: 500,
       }),
@@ -968,9 +952,7 @@ export class FriendService {
           ownerID: userId,
           friendID: friendship.id,
         },
-        include: {
-          tag: true,
-        },
+        select: { tag: { select: FRIEND_TAG_SELECT } },
         orderBy: {
           createdAt: 'asc',
         },
@@ -994,67 +976,6 @@ export class FriendService {
     };
   }
 
-  async listIncomingRequests(
-    userId: string,
-    page = 1,
-  ): Promise<FriendRequestDto[]> {
-    // round 2 review：500 条护栏之外的旧请求此前完全不可达（接受/拒绝都需要
-    // 列表里的 requestId）。加 page 参数（默认第 1 页，行为不变）让公开账号
-    // 被刷爆时也能翻到并处理更早的请求。
-    const records = await this.prisma.friend.findMany({
-      where: { friendID: userId, state: FriendState.PENDING },
-      orderBy: { createdAt: 'desc' },
-      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
-      take: FRIEND_REQUEST_PAGE_SIZE,
-    });
-
-    const senderIds = records.map((r) => r.userID);
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: senderIds }, status: 'ACTIVE' },
-      select: MINI_USER_SELECT,
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    return records
-      .filter((r) => userMap.has(r.userID))
-      .map((r) => ({
-        id: r.id,
-        state: r.state,
-        createdAt: r.createdAt,
-        message: r.message,
-        user: userMap.get(r.userID)!,
-      }));
-  }
-
-  async listOutgoingRequests(
-    userId: string,
-    page = 1,
-  ): Promise<FriendRequestDto[]> {
-    const records = await this.prisma.friend.findMany({
-      where: { userID: userId, state: FriendState.PENDING },
-      orderBy: { createdAt: 'desc' },
-      skip: (Math.max(1, page) - 1) * FRIEND_REQUEST_PAGE_SIZE,
-      take: FRIEND_REQUEST_PAGE_SIZE,
-    });
-
-    const targetIds = records.map((r) => r.friendID);
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: targetIds }, status: 'ACTIVE' },
-      select: MINI_USER_SELECT,
-    });
-    const userMap = new Map(users.map((u) => [u.id, u]));
-
-    return records
-      .filter((r) => userMap.has(r.friendID))
-      .map((r) => ({
-        id: r.id,
-        state: r.state,
-        createdAt: r.createdAt,
-        message: r.message,
-        user: userMap.get(r.friendID)!,
-      }));
-  }
-
   async listActivities(userId: string): Promise<FriendActivityDto[]> {
     await this.backfillLegacyActivitiesForViewer(userId);
 
@@ -1068,27 +989,6 @@ export class FriendService {
     });
 
     return activities.map((activity) => this.toFriendActivityDto(activity));
-  }
-
-  /**
-   * 一键全部已读（review 修复）：listActivities 有 200 条护栏后，更老的未读
-   * 无法逐条到达 —— 未读数会永远不归零。批量置读是唯一不需要分页的出口。
-   */
-  async markAllActivitiesRead(userId: string): Promise<{ count: number }> {
-    // review 修复（round 2）：先补历史 —— 老账号的活动行由 list/unread-count
-    // 惰性回填；用户第一步就点全部已读的话，不回填等于 0 行被置读，下一次
-    // unread-count 又把旧请求回填成未读，计数永远清不掉。
-    await this.backfillLegacyActivitiesForViewer(userId);
-    const result = await this.prisma.friendActivity.updateMany({
-      where: { viewerId: userId, readAt: null },
-      data: { readAt: new Date() },
-    });
-    // review 修复（round 2）：与 markActivityRead 一致地广播未读数变化，
-    // 同账号其它在线设备的角标即时归零。
-    if (result.count > 0) {
-      await this.broadcastFriendUnreadUpdates([userId]);
-    }
-    return { count: result.count };
   }
 
   async getUnreadActivityCount(
@@ -1352,6 +1252,7 @@ export class FriendService {
   async listMyTags(userId: string) {
     return this.prisma.friendTag.findMany({
       where: { ownerID: userId },
+      select: FRIEND_TAG_SELECT,
       orderBy: { name: 'asc' },
       take: 500,
     });
@@ -1387,6 +1288,7 @@ export class FriendService {
       where: { ownerID_name: { ownerID: userId, name: trimmed } },
       update: { color: color ?? undefined },
       create: { ownerID: userId, name: trimmed, color: color ?? null },
+      select: FRIEND_TAG_SELECT,
     });
   }
 
@@ -1498,7 +1400,18 @@ export class FriendService {
 
     const links = await this.prisma.friendTagOnFriend.findMany({
       where: { ownerID: userId, tagID: tagId },
-      include: { friendship: true },
+      // 只取去重、备注与 friendsSince 真正读到的列。
+      select: {
+        friendship: {
+          select: {
+            userID: true,
+            friendID: true,
+            updatedAt: true,
+            remarkA: true,
+            remarkB: true,
+          },
+        },
+      },
     });
 
     const uniqueLinks = latestFriendRecordsByCounterparty(
@@ -1513,10 +1426,8 @@ export class FriendService {
       where: { id: { in: friendUserIds }, status: 'ACTIVE' },
       select: FRIEND_PROFILE_SELECT,
     });
-    const [appearances, privacy] = await Promise.all([
-      this.avatarFrames.resolvePublicAppearances(friendUserIds),
-      this.readPresencePrivacy(friendUserIds),
-    ]);
+    const appearances =
+      await this.avatarFrames.resolvePublicAppearances(friendUserIds);
     const userMap = new Map(users.map((u) => [u.id, u]));
 
     return uniqueLinks
@@ -1527,10 +1438,6 @@ export class FriendService {
         const remark = f.userID === userId ? f.remarkA : f.remarkB;
         return {
           ...u,
-          lastOnline:
-            privacy === null || privacy.get(fid)?.shareOnlineStatus === false
-              ? null
-              : u.lastOnline,
           avatarFrameAppearance: appearances.get(fid)?.avatarFrame ?? null,
           friendsSince: f.updatedAt,
           remark,

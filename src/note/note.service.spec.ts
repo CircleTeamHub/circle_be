@@ -119,7 +119,16 @@ describe('NoteService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: UploadService, useValue: uploadService },
         // No MINIO_PUBLIC_URL configured → media-url origin check is skipped.
-        { provide: ConfigService, useValue: { get: jest.fn(() => null) } },
+        // NOTE_SHARE_WEB_BASE is set: share links are gated on it, and the
+        // disabled path gets its own dedicated tests below.
+        {
+          provide: ConfigService,
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'NOTE_SHARE_WEB_BASE' ? 'https://circle.im' : null,
+            ),
+          },
+        },
       ],
     }).compile();
 
@@ -1045,7 +1054,8 @@ describe('NoteService', () => {
       },
     ]);
 
-    const result = await service.listNotes('user-1', { status: 'ACTIVE' });
+    const result = (await service.listNotes('user-1', { status: 'ACTIVE' }))
+      .items;
 
     expect(prisma.note.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1065,6 +1075,73 @@ describe('NoteService', () => {
       videoCount: 1,
       groups: [{ id: 'group-1', name: '上海' }],
     });
+  });
+
+  // app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit，而响应体必须保持数组：
+  // 以前默认 take 50，第 51 条起被静默截掉。默认页放到 500，多取一行判断 hasMore，
+  // 由 controller 放进 X-Has-More 响应头。
+  const listRow = (index: number, status = 'ACTIVE') => ({
+    id: `note-${index}`,
+    ownerID: 'user-1',
+    title: `笔记 ${index}`,
+    content: null,
+    sections: null,
+    status,
+    available: true,
+    pinned: false,
+    imageCount: 0,
+    videoCount: 0,
+    mediaCount: 0,
+    groupMemberships: [],
+    media: [],
+    coverMedia: null,
+    createdAt: new Date('2026-04-09T00:00:00.000Z'),
+    updatedAt: new Date('2026-04-09T00:00:00.000Z'),
+  });
+
+  it('lists up to 500 notes by default and reports hasMore from one extra row', async () => {
+    prisma.note.findMany.mockResolvedValueOnce(
+      Array.from({ length: 501 }, (_, index) => listRow(index)),
+    );
+
+    const page = await service.listNotes('user-1', {});
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 501, skip: 0 }),
+    );
+    expect(page.items).toHaveLength(500);
+    expect(page.items[499].id).toBe('note-499');
+    expect(page.hasMore).toBe(true);
+  });
+
+  it('reports hasMore=false when an explicit page is not full', async () => {
+    prisma.note.findMany.mockResolvedValueOnce([listRow(0), listRow(1)]);
+
+    const page = await service.listNotes('user-1', { page: 2, limit: 20 });
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ take: 21, skip: 20 }),
+    );
+    expect(page.items.map((note) => note.id)).toEqual(['note-0', 'note-1']);
+    expect(page.hasMore).toBe(false);
+  });
+
+  it('lists up to 500 recycle-bin notes by default and reports hasMore', async () => {
+    prisma.note.findMany.mockResolvedValueOnce(
+      Array.from({ length: 501 }, (_, index) => listRow(index, 'DELETED')),
+    );
+
+    const page = await service.listDeletedNotes('user-1');
+
+    expect(prisma.note.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { ownerID: 'user-1', status: 'DELETED' },
+        take: 501,
+        skip: 0,
+      }),
+    );
+    expect(page.items).toHaveLength(500);
+    expect(page.hasMore).toBe(true);
   });
 
   it('fails note reads with 503 instead of exposing an unsigned media URL', async () => {
@@ -1144,7 +1221,7 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-1' }, { available: true }],
+          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
         },
       }),
     );
@@ -1155,7 +1232,7 @@ describe('NoteService', () => {
     });
   });
 
-  it('lets non-owners read available notes without edit permission', async () => {
+  it('lets non-owners read available notes without edit permission or private organisation', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       id: 'note-1',
       ownerID: 'user-1',
@@ -1163,11 +1240,13 @@ describe('NoteService', () => {
       content: '完整正文',
       status: 'ACTIVE',
       available: true,
-      pinned: false,
+      // 置顶与分组是主人整理自己笔记本的私人标记，与 remark / collectedFrom 一样
+      // 不随笔记内容外发：非主人视角恒为 pinned=false、groups=[]。
+      pinned: true,
       imageCount: 0,
       videoCount: 0,
       mediaCount: 0,
-      groupMemberships: [],
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
       media: [],
       coverMedia: null,
       createdAt: new Date(),
@@ -1181,7 +1260,7 @@ describe('NoteService', () => {
         where: {
           id: 'note-1',
           status: { not: 'DELETED' },
-          OR: [{ ownerID: 'user-2' }, { available: true }],
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
         },
       }),
     );
@@ -1189,7 +1268,81 @@ describe('NoteService', () => {
       id: 'note-1',
       ownerId: 'user-1',
       canEdit: false,
+      pinned: false,
+      groups: [],
     });
+  });
+
+  it('hides an unlisted note from non-owners even when it is marked available', async () => {
+    // UNLISTED 以前只是「不出现在列表里」：available=true 的 UNLISTED 笔记任何人
+    // 拿到 UUID 就能读。非主人分支必须同时要求 ACTIVE；主人分支保持不变。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(service.getNote('user-2', 'note-1')).rejects.toThrow(
+      NotFoundException,
+    );
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+  });
+
+  it('lets the owner read an unlisted note with its real groups and pinned flag', async () => {
+    prisma.note.findFirst.mockResolvedValueOnce({
+      id: 'note-1',
+      ownerID: 'user-1',
+      title: '隐藏的笔记',
+      content: '完整正文',
+      status: 'UNLISTED',
+      available: true,
+      pinned: true,
+      imageCount: 0,
+      videoCount: 0,
+      mediaCount: 0,
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
+      media: [],
+      coverMedia: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.getNote('user-1', 'note-1');
+
+    expect(result).toMatchObject({
+      id: 'note-1',
+      canEdit: true,
+      status: 'UNLISTED',
+      pinned: true,
+      groups: [{ id: 'group-1', name: '主人的私人分组' }],
+    });
+  });
+
+  it('refuses to export another user unlisted note even when it is marked available', async () => {
+    // 导出与 getNote 共用 readableByViewer：非主人只能导出 available 且 ACTIVE 的笔记，
+    // 否则主人隐藏（UNLISTED）的内容换个入口仍能被整份打包带走。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.createNoteExport('user-2', 'note-1', {
+        format: 'PDF',
+        scope: 'ALL',
+      }),
+    ).rejects.toThrow(NotFoundException);
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-1',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-2' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+    expect(uploadService.uploadBuffer).not.toHaveBeenCalled();
   });
 
   it('returns an available shared note to an authorized chat guest without private metadata', async () => {
@@ -1202,12 +1355,12 @@ describe('NoteService', () => {
       sections: null,
       status: 'ACTIVE',
       available: true,
-      pinned: false,
+      pinned: true,
       imageCount: 0,
       videoCount: 0,
       mediaCount: 0,
       collectedFrom: { conversationID: 'owner-private-location' },
-      groupMemberships: [],
+      groupMemberships: [{ group: { id: 'group-1', name: '主人的私人分组' } }],
       media: [],
       coverMedia: null,
       createdAt: new Date(),
@@ -1216,11 +1369,13 @@ describe('NoteService', () => {
 
     const result = await service.getSharedNoteForGuest('note-shared');
 
+    // 访客没有「自己的笔记」分支：只放行 ACTIVE 且 available 的笔记，UNLISTED
+    // 与 getNote 的非主人分支同口径地不可读。
     expect(prisma.note.findFirst).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
           id: 'note-shared',
-          status: { not: 'DELETED' },
+          status: 'ACTIVE',
           available: true,
         },
       }),
@@ -1229,6 +1384,8 @@ describe('NoteService', () => {
       id: 'note-shared',
       canEdit: false,
       collectedFrom: null,
+      pinned: false,
+      groups: [],
     });
   });
 
@@ -2393,6 +2550,38 @@ describe('NoteService', () => {
     expect(result.token).toBe('token-789');
   });
 
+  it('refuses to create a share link with 404 NOTE_SHARE_LINK_UNAVAILABLE when NOTE_SHARE_WEB_BASE is unset', async () => {
+    // 没配分享落地页时生成的链接无处可开：temp-chat-web 只路由 /t/:token，
+    // 回退到 TEMP_CHAT_WEB_BASE 只会发出死链。功能关闭就在写库之前直接 404。
+    const isolatedPrisma = {
+      $transaction: jest.fn(),
+      $queryRaw: jest.fn(),
+      note: { findMany: jest.fn() },
+      noteGroup: { findFirst: jest.fn() },
+      noteShareLink: { count: jest.fn(), create: jest.fn() },
+    };
+    const serviceWithoutBase = new NoteService(
+      isolatedPrisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'TEMP_CHAT_WEB_BASE' ? 'https://chat.example.com' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(isolatedPrisma as any),
+    );
+
+    const rejection = await serviceWithoutBase
+      .createShareLink('user-1', { title: '我的笔记' })
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(NotFoundException);
+    expect((rejection as NotFoundException).getResponse()).toMatchObject({
+      errorCode: 'NOTE_SHARE_LINK_UNAVAILABLE',
+    });
+    expect(isolatedPrisma.$transaction).not.toHaveBeenCalled();
+    expect(isolatedPrisma.noteShareLink.create).not.toHaveBeenCalled();
+  });
+
   it('reorders custom groups by rewriting sortOrder from ordered ids', async () => {
     // Exhaustive-list count check
     prisma.noteGroup.count.mockResolvedValueOnce(2);
@@ -3394,6 +3583,100 @@ describe('NoteService', () => {
     expect(prisma.note.create).not.toHaveBeenCalled();
   });
 
+  it('collectNote only snapshots another user note that is available and ACTIVE', async () => {
+    // UNLISTED 笔记拿到 UUID 也不能被他人收藏成自己的副本：与 getNote 同一条放行规则。
+    prisma.note.findFirst.mockResolvedValueOnce(null);
+
+    await expect(
+      service.collectNote('user-1', {
+        noteId: 'note-unlisted',
+        source: collectSource,
+      }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(prisma.note.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: 'note-unlisted',
+          status: { not: 'DELETED' },
+          OR: [{ ownerID: 'user-1' }, { available: true, status: 'ACTIVE' }],
+        },
+      }),
+    );
+    expect(prisma.note.create).not.toHaveBeenCalled();
+  });
+
+  /** 收藏写入成功路径的最小 mock：只关心写进 collectedFrom 的内容。 */
+  const mockCollectWrites = () => {
+    prisma.note.findFirst
+      .mockResolvedValueOnce(otherUsersNote)
+      .mockResolvedValueOnce(null);
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-copy' });
+    prisma.noteMedia.createMany.mockResolvedValueOnce({ count: 2 });
+    prisma.note.update.mockImplementationOnce(async () => ({
+      ...otherUsersNote,
+      id: 'note-copy',
+      ownerID: 'user-1',
+      pinned: false,
+      media: [],
+      coverMedia: null,
+      collectedFrom: { kind: 'chat' },
+      collectedFromNoteID: 'note-src',
+    }));
+  };
+
+  it('collectNote stores source avatars only when they are served from own storage', async () => {
+    // 来源名片的头像由客户端上报，会原样展示在收藏者的笔记上。不拒绝请求（群 / 好友
+    // 头像历史上可能来自任何地方），但只存本站存储的地址；外链头像是追踪 / 钓鱼载体，
+    // 存成 null，客户端回落默认头像。
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+      uploadService as any,
+    );
+    mockCollectWrites();
+
+    await guarded.collectNote('user-1', {
+      noteId: 'note-src',
+      source: {
+        ...collectSource,
+        sender: {
+          ...collectSource.sender,
+          faceURL: 'https://tracker.example.com/w.jpg',
+        },
+        group: {
+          ...collectSource.group,
+          faceURL: 'http://10.0.0.195:9000/circle/avatars/g.jpg',
+        },
+      },
+    });
+
+    const collectedFrom =
+      prisma.note.create.mock.calls[0][0].data.collectedFrom;
+    expect(collectedFrom.sender.faceURL).toBeNull();
+    expect(collectedFrom.group.faceURL).toBe(
+      'http://10.0.0.195:9000/circle/avatars/g.jpg',
+    );
+  });
+
+  it('collectNote keeps source avatars as-is when object storage is not configured', async () => {
+    mockCollectWrites();
+
+    await service.collectNote('user-1', {
+      noteId: 'note-src',
+      source: collectSource,
+    });
+
+    const collectedFrom =
+      prisma.note.create.mock.calls[0][0].data.collectedFrom;
+    expect(collectedFrom.sender.faceURL).toBe('https://cdn.example.com/w.jpg');
+    expect(collectedFrom.group.faceURL).toBe('https://cdn.example.com/g.jpg');
+  });
+
   it('collectNote surfaces collectedFrom in list/detail mapping', async () => {
     prisma.note.findFirst.mockResolvedValueOnce({
       ...otherUsersNote,
@@ -3550,7 +3833,16 @@ describe('NoteService', () => {
         ...shareLinkRow,
         noteIDs: ['note-1'],
       });
-      prisma.note.findMany.mockResolvedValueOnce([sharedNoteRow]);
+      prisma.note.findMany.mockResolvedValueOnce([
+        {
+          ...sharedNoteRow,
+          // 置顶与分组是主人的私人整理标记，访客视角恒为 pinned=false、groups=[]。
+          pinned: true,
+          groupMemberships: [
+            { group: { id: 'group-1', name: '主人的私人分组' } },
+          ],
+        },
+      ]);
 
       const result = await service.resolveShareLink('tok-abc');
 
@@ -3559,13 +3851,60 @@ describe('NoteService', () => {
       });
       expect(result.title).toBe('我的笔记');
       expect(result.notes).toHaveLength(1);
-      // 访客不是笔记主人：canEdit=false，collectedFrom 被抹掉。
+      // 访客不是笔记主人：canEdit=false，collectedFrom 被抹掉，置顶与分组不外发。
       expect(result.notes[0]).toMatchObject({
         id: 'note-1',
         ownerId: 'user-1',
         canEdit: false,
         collectedFrom: null,
+        pinned: false,
+        groups: [],
       });
+    });
+
+    it('orders guest results by recency only so the owner pinned flag cannot be inferred', async () => {
+      // 摘要里带 updatedAt：若仍按 pinned desc 排，访客看到「更旧的排在更新的前面」
+      // 就能反推出哪些是置顶，pinned=false 形同虚设。
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(shareLinkRow);
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      expect(prisma.note.findMany.mock.calls[0][0].orderBy).toEqual([
+        { updatedAt: 'desc' },
+      ]);
+    });
+
+    it('answers exactly like an unknown token when NOTE_SHARE_WEB_BASE is unset', async () => {
+      // 功能未配置时，连一条真实有效的链接也必须答成「链接无效」：响应体与未知
+      // token 逐字节一致，公开端点探测不出部署是否开了分享。独立的 prisma mock，
+      // 漏掉开关的实现会成功读出笔记，失败信息直指缺失的校验。
+      const isolatedPrisma = {
+        noteShareLink: {
+          findUnique: jest.fn().mockResolvedValue(shareLinkRow),
+        },
+        note: { findMany: jest.fn().mockResolvedValue([sharedNoteRow]) },
+      };
+      const serviceWithoutBase = new NoteService(
+        isolatedPrisma as any,
+        { get: jest.fn(() => null) } as any,
+        new MembershipPolicyService(isolatedPrisma as any),
+      );
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce(null as never);
+
+      const unknown = await service
+        .resolveShareLink('tok-nope')
+        .catch((error: unknown) => error);
+      const disabled = await serviceWithoutBase
+        .resolveShareLink('tok-abc')
+        .catch((error: unknown) => error);
+
+      expect(unknown).toBeInstanceOf(NotFoundException);
+      expect(disabled).toBeInstanceOf(NotFoundException);
+      expect((disabled as NotFoundException).getResponse()).toEqual(
+        (unknown as NotFoundException).getResponse(),
+      );
+      expect(isolatedPrisma.note.findMany).not.toHaveBeenCalled();
     });
 
     it('rejects an expired token', async () => {
@@ -3668,7 +4007,23 @@ describe('NoteService', () => {
 
       const where = prisma.note.findMany.mock.calls[0][0].where;
       expect(where.available).toBe(true);
-      expect(where.status).toEqual({ not: 'DELETED' });
+      // 没存状态快照的链接只露 ACTIVE：UNLISTED 是主人藏起来的笔记，与 getNote 的
+      // 非主人分支、访客读卡片同一口径。
+      expect(where.status).toBe('ACTIVE');
+    });
+
+    it('honours an explicit UNLISTED snapshot the owner chose to share', async () => {
+      prisma.noteShareLink.findUnique.mockResolvedValueOnce({
+        ...shareLinkRow,
+        status: 'UNLISTED',
+      });
+      prisma.note.findMany.mockResolvedValueOnce([]);
+
+      await service.resolveShareLink('tok-abc');
+
+      expect(prisma.note.findMany.mock.calls[0][0].where.status).toBe(
+        'UNLISTED',
+      );
     });
 
     it('filters to ungrouped notes when the link snapshot stores group=ungrouped', async () => {
@@ -4288,17 +4643,22 @@ describe('NoteService', () => {
       );
     });
 
-    it('scopes the lookup to readable notes (own or available)', async () => {
+    it('scopes the lookup to readable notes (own, or available and ACTIVE)', async () => {
       prisma.note.findFirst.mockResolvedValueOnce(noteRow());
 
       await service.copyNoteMediaForChat('viewer-2', 'note-1', ['media']);
 
+      // 与 getNote 同一条放行规则：非主人只能碰 ACTIVE 且 available 的笔记，
+      // 否则 UNLISTED 笔记的媒体仍可经此路径被复制出去。
       expect(prisma.note.findFirst).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
             id: 'note-1',
             status: { not: 'DELETED' },
-            OR: [{ ownerID: 'viewer-2' }, { available: true }],
+            OR: [
+              { ownerID: 'viewer-2' },
+              { available: true, status: 'ACTIVE' },
+            ],
           }),
         }),
       );

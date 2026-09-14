@@ -18,12 +18,7 @@ import {
 import { Gender, UserStatus } from 'src/generated/prisma';
 import { IconService } from 'src/icon/icon.service';
 import { PrivacySettingsService } from 'src/privacy/privacy-settings.service';
-import { USER_PROFILE_SELECT } from './user.select';
-import { likedOnToday } from '../like/like.util';
-import {
-  resolveMembershipAppearance,
-  toPublicMembershipAppearance,
-} from 'src/membership/membership-appearance';
+import { USER_ME_SELECT, USER_PROFILE_SELECT } from './user.select';
 import { resolveEffectiveMembershipLevel } from 'src/membership/membership.catalog';
 import {
   AvatarFramePublicAppearance,
@@ -71,45 +66,33 @@ type ProfilePrivacyUser = {
   lastOnline?: Date | null;
 };
 
+// applyProfilePrivacy 遮蔽的字段，整组交给一次 canViewProfileFields 判定。
+const PROFILE_PRIVACY_FIELDS = [
+  'phoneNumber',
+  'email',
+  'wechat',
+  'qq',
+  'whatsup',
+  'lastOnline',
+] as const;
+
 type ProfileMembershipUser = {
   vipLevel?: number;
   vipExpiresAt?: Date | null;
 };
 
-function toPublicUser<T extends ProfileMembershipUser>(
-  user: T,
-  avatarFrameAppearance: AvatarFramePublicAppearance | null = null,
-) {
-  const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
-  const membership = toPublicMembershipAppearance({ vipLevel, vipExpiresAt });
-  return {
-    ...profile,
-    vipLevel: membership.effectiveLevel,
-    membership,
-    avatarFrameAppearance,
-  };
-}
-
-// 自视图映射：保留 storedVipLevel / vipExpiresAt 与含 active·lifetime 的完整 appearance，
-// 供序列化成 SelfUserDto 的路径（如 PATCH /user/:id）用。toPublicUser 是「无 PII」的他人
-// 视图、会剥掉这些自有字段；PATCH 若用它，SelfUserDto 的新契约字段就会全部缺失（与
-// /auth/me 不一致）。
-function toSelfUser<T extends ProfileMembershipUser>(
+// 搜索 / 资料页 / 本人（PATCH、注销）共用的映射：vipLevel 只给按到期折算后的有效档，
+// 存储档与 vipExpiresAt 在这里剥掉，不靠 DTO 兜底。会员外观对象（membership）与
+// storedVipLevel 不在 APP / 管理台任何读取路径上，已从三个视图的契约里去掉，不再拼装。
+function toUserView<T extends ProfileMembershipUser>(
   user: T,
   avatarFrameAppearance: AvatarFramePublicAppearance | null = null,
   now = new Date(),
 ) {
   const { vipLevel = 0, vipExpiresAt = null, ...profile } = user;
-  const membership = resolveMembershipAppearance(
-    { vipLevel, vipExpiresAt },
-    now,
-  );
   return {
     ...profile,
-    storedVipLevel: vipLevel,
-    vipExpiresAt,
-    vipLevel: membership.effectiveLevel,
-    membership,
+    vipLevel: resolveEffectiveMembershipLevel({ vipLevel, vipExpiresAt }, now),
     avatarFrameAppearance,
   };
 }
@@ -343,7 +326,7 @@ export class UserService {
       this.applyProfilePrivacy(user, viewerId),
       this.avatarFrames.resolvePublicAppearances([user.id]),
     ]);
-    return toPublicUser(
+    return toUserView(
       filteredUser,
       appearances.get(user.id)?.avatarFrame ?? null,
     );
@@ -363,27 +346,17 @@ export class UserService {
       this.avatarFrames.resolvePublicAppearances([id]),
     ]);
     if (!user) throw new NotFoundException(`User ${id} not found`);
+    // 与账号搜索（只认 ACTIVE）对齐：注销账号对他人就是不存在，回同一个 404，
+    // 不给「注销过」和「从没有过」留可区分的差异。本人不挡。
+    if (user.status === UserStatus.DELETED && viewerId !== id) {
+      throw new NotFoundException(`User ${id} not found`);
+    }
     const filteredUser = await this.applyProfilePrivacy(user, viewerId);
-    // 资料页携带「被赞总数 + 我今天赞过没」（看自己时 likedByMeToday 恒为 false）。
-    const likedByMeToday =
-      viewerId && viewerId !== id
-        ? Boolean(
-            await this.prisma.userLike.findUnique({
-              where: {
-                fromUserID_toUserID_likedOn: {
-                  fromUserID: viewerId,
-                  toUserID: id,
-                  likedOn: likedOnToday(),
-                },
-              },
-            }),
-          )
-        : false;
+    // 「我今天赞过没」走 like 模块自己的状态接口，资料页只带被赞总数。
     return {
-      ...toPublicUser(filteredUser, appearances.get(id)?.avatarFrame ?? null),
+      ...toUserView(filteredUser, appearances.get(id)?.avatarFrame ?? null),
       displayIcons,
       likeCount: user.receivedLikeCount,
-      likedByMeToday,
     };
   }
 
@@ -419,64 +392,49 @@ export class UserService {
     // visibility is a global show/hide switch in the current model, not
     // friend-aware. If a "friends-only" profile tier is ever added, thread the
     // real friendship status through instead of this literal.
-    const [
-      canViewPhone,
-      canViewEmail,
-      canViewWechat,
-      canViewQQ,
-      canViewWhatsup,
-      canViewLastOnline,
-    ] = await Promise.all([
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'phoneNumber',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(user.id, 'email', isSelf, false),
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'wechat',
-        isSelf,
-        false,
-      ),
-      this.privacySettings.canViewProfileField(user.id, 'qq', isSelf, false),
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'whatsup',
-        isSelf,
-        false,
-      ),
-      // 「显示在线时间」关着时资料页的 lastOnline 也要抹掉:聊天 presence 通道
-      // 已经收口,REST 这边不收就是第二条信道。
-      this.privacySettings.canViewProfileField(
-        user.id,
-        'lastOnline',
-        isSelf,
-        false,
-      ),
-    ]);
+    // 六个字段只读一次对方的隐私设置（canViewProfileFields），规则与单字段版同一份。
+    // 「显示在线时间」关着时资料页的 lastOnline 也要抹掉:聊天 presence 通道
+    // 已经收口,REST 这边不收就是第二条信道。
+    const visible = await this.privacySettings.canViewProfileFields(
+      user.id,
+      PROFILE_PRIVACY_FIELDS,
+      isSelf,
+      false,
+    );
 
     return {
       ...user,
-      phoneNumber: canViewPhone ? user.phoneNumber : null,
-      email: canViewEmail ? user.email : null,
-      wechat: canViewWechat ? user.wechat : null,
-      qq: canViewQQ ? user.qq : null,
-      whatsup: canViewWhatsup ? user.whatsup : null,
-      lastOnline: canViewLastOnline ? user.lastOnline : null,
+      phoneNumber: visible.phoneNumber ? user.phoneNumber : null,
+      email: visible.email ? user.email : null,
+      wechat: visible.wechat ? user.wechat : null,
+      qq: visible.qq ? user.qq : null,
+      whatsup: visible.whatsup ? user.whatsup : null,
+      lastOnline: visible.lastOnline ? user.lastOnline : null,
     };
+  }
+
+  /**
+   * update 只需要知道这个 id 存在。此前为了判 404 把 findOne 的整条资料流水线
+   * （隐私判定、图标、头像框）跑一遍，结果全部丢掉。
+   */
+  private async assertUserExists(id: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!user) throw new NotFoundException(`User ${id} not found`);
   }
 
   async update(id: string, input: UpdateUserInput) {
     this.assertUrlsAreSafe(input);
-    await this.findOne(id);
+    await this.assertUserExists(id);
     const normalizedInput = normalizeUpdateInput(input);
     const user = await this.prisma.$transaction(async (tx) => {
+      // 响应按 SelfUserDto 序列化：与 /auth/me 同一份本人视图的列。
       const updated = await tx.user.update({
         where: { id },
         data: normalizedInput,
-        select: PUBLIC_SELECT,
+        select: USER_ME_SELECT,
       });
       return updated;
     });
@@ -488,7 +446,7 @@ export class UserService {
     await this.realtimeService.broadcastUserProfileSummary(id);
 
     return {
-      ...toSelfUser(user, appearances.get(id)?.avatarFrame ?? null),
+      ...toUserView(user, appearances.get(id)?.avatarFrame ?? null),
       displayIcons,
     };
   }
@@ -525,11 +483,11 @@ export class UserService {
         }`,
       );
     }
-    // Map through toPublicUser like every other public-user response: resolve
-    // the effective (expiry-aware) vipLevel and attach the membership object,
-    // so an expired paid tier can't leak its stored level in the deletion body.
+    // Map through toUserView like every other user response: resolve the
+    // effective (expiry-aware) vipLevel, so an expired paid tier can't leak its
+    // stored level or expiry in the deletion body.
     return {
-      ...toPublicUser(user, avatarFrameAppearance),
+      ...toUserView(user, avatarFrameAppearance),
       displayIcons,
     };
   }

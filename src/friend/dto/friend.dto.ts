@@ -86,7 +86,8 @@ export class SendFriendRequestDto {
   @ApiPropertyOptional({
     type: [String],
     description:
-      'Sender-owned description photo urls/keys, promoted on accept (max 9)',
+      'Sender-owned description photo urls/keys, promoted on accept (max 9). ' +
+      "http(s) URLs must be served from this application's storage.",
     example: ['https://cdn.example.com/friends/abc.jpg'],
   })
   @IsOptional()
@@ -181,11 +182,8 @@ export class FriendProfileDto {
   @ApiProperty() accountId: string;
   @ApiProperty() nickname: string;
   @ApiPropertyOptional() avatarUrl: string | null;
-  @ApiPropertyOptional() avatarFrame: string | null;
   @ApiProperty({ type: AvatarFrameAppearanceDto, nullable: true })
   avatarFrameAppearance: AvatarFrameAppearanceDto | null;
-  @ApiProperty() gender: string;
-  @ApiPropertyOptional() lastOnline: Date | null;
   /** When this friendship was accepted */
   @ApiProperty() friendsSince: Date;
   /** The viewer's private remark (备注) for this friend, if set. */
@@ -194,7 +192,6 @@ export class FriendProfileDto {
 
 export class FriendTagDto {
   @ApiProperty() id: string;
-  @ApiProperty() ownerID: string;
   @ApiProperty() name: string;
   @ApiPropertyOptional() color: string | null;
 }
@@ -206,19 +203,6 @@ export class FriendSettingsDto {
   @ApiPropertyOptional() description: string | null;
   @ApiProperty({ type: [String] }) photos: string[];
   @ApiProperty({ enum: FRIEND_PERMISSIONS }) permission: FriendPermission;
-}
-
-export class FriendRequestDto {
-  @ApiProperty() id: string;
-  @ApiProperty() state: string;
-  @ApiProperty() createdAt: Date;
-  @ApiPropertyOptional() message: string | null;
-  @ApiProperty() user: {
-    id: string;
-    accountId: string;
-    nickname: string;
-    avatarUrl: string | null;
-  };
 }
 
 export class FriendStatusDto {

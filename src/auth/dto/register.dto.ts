@@ -6,7 +6,11 @@ import {
   Length,
   Matches,
 } from 'class-validator';
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import {
+  ApiHideProperty,
+  ApiProperty,
+  ApiPropertyOptional,
+} from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   ACCOUNT_ID_PATTERN,
@@ -47,8 +51,12 @@ export class RegisterDto {
   @Matches(ACCOUNT_ID_PATTERN, { message: ACCOUNT_ID_RULE_MESSAGE })
   inviteCode?: string;
 
-  /** OpenIM platform ID — see LoginDto.platform. */
-  @ApiPropertyOptional({ example: 1 })
+  /**
+   * @deprecated accepted and ignored — installed app builds still send it;
+   * remove once the minimum supported app version no longer does.
+   * Same field as LoginDto.platform.
+   */
+  @ApiHideProperty()
   @IsOptional()
   @IsIn([1, 2, 5])
   platform?: 1 | 2 | 5;

@@ -8,9 +8,7 @@ import {
 } from '@nestjs/common';
 import { CoinTxType, FriendState, Prisma } from 'src/generated/prisma';
 import { CoinErrorCode } from 'src/common/app-error-codes';
-import { NotificationService } from 'src/notification/notification.service';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { RealtimeService } from 'src/realtime/realtime.service';
 import { ChatService } from 'src/chat/chat.service';
 import { ChatSystemMessageService } from 'src/chat/chat-system-message.service';
 import {
@@ -46,8 +44,6 @@ export class CoinService {
   private readonly loggingConfig = createLoggingConfig();
   constructor(
     private readonly prisma: PrismaService,
-    private readonly realtimeService: RealtimeService,
-    private readonly notificationService: NotificationService,
     private readonly chatService: ChatService,
     private readonly chatMessages: ChatSystemMessageService,
   ) {}
@@ -419,45 +415,5 @@ export class CoinService {
         }`,
       );
     }
-  }
-
-  private async notifyRecharge(userId: string, amount: number): Promise<void> {
-    let notification = null;
-    try {
-      notification = await this.notificationService.createSystemNotification(
-        userId,
-        userId,
-        `积分已到账 ${amount}`,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Failed to create recharge notification for ${userId}: ${error instanceof Error ? error.message : error}`,
-      );
-    }
-
-    await this.realtimeService.safeBroadcastAll([
-      () =>
-        this.realtimeService.broadcastWalletBalanceChanged(userId, {
-          reason: 'RECHARGE',
-          delta: amount,
-        }),
-      () =>
-        this.realtimeService.broadcastWalletRechargeCompleted(userId, amount),
-      () =>
-        this.realtimeService.broadcastSystemNotificationCreated(
-          userId,
-          `积分已到账 ${amount}`,
-        ),
-      ...(notification
-        ? [
-            () =>
-              this.realtimeService.broadcastNotificationCreated(
-                userId,
-                notification,
-              ),
-          ]
-        : []),
-      () => this.realtimeService.broadcastSystemNotificationUnread(userId),
-    ]);
   }
 }

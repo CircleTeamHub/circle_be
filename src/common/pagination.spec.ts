@@ -45,6 +45,7 @@ describe('offset pagination bounds', () => {
       'src/admin-community/admin-community.dto.ts',
       'src/admin-user/dto/admin-user.dto.ts',
       'src/moderation/moderation-admin.controller.ts',
+      'src/notification/notification.dto.ts',
     ];
     for (const file of files) {
       const source = readFileSync(join(process.cwd(), file), 'utf8');

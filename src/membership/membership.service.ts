@@ -1,13 +1,10 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { MembershipBenefitType } from 'src/generated/prisma';
-import { MembershipErrorCode } from 'src/common/app-error-codes';
-import { PrismaService } from 'src/prisma/prisma.service';
 import {
   MembershipPlanDto,
   MembershipQuotasDto,
   MembershipStatusDto,
 } from './dto/membership.dto';
-import { MembershipPolicyService } from './membership-policy.service';
 import {
   MEMBERSHIP_CATALOG,
   MembershipTier,
@@ -72,11 +69,6 @@ export function mapMembershipStatus(
 
 @Injectable()
 export class MembershipService {
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly membershipPolicy: MembershipPolicyService,
-  ) {}
-
   getPlans(): MembershipPlanDto[] {
     return MEMBERSHIP_CATALOG.slice(1).map((tier) => {
       const key = tier.key as MembershipPlanDto['key'];
@@ -95,30 +87,5 @@ export class MembershipService {
         benefits: { ...tier.benefits },
       };
     });
-  }
-
-  async getMe(userId: string, now = new Date()): Promise<MembershipStatusDto> {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        vipLevel: true,
-        vipExpiresAt: true,
-        membershipBenefitGrants: { select: { type: true } },
-      },
-    });
-    if (!user) {
-      throw new NotFoundException({
-        message: 'User not found',
-        errorCode: MembershipErrorCode.UserNotFound,
-      });
-    }
-
-    const effective = this.membershipPolicy.resolve(user, now);
-    return mapMembershipStatus(
-      user,
-      effective.tier,
-      effective.level,
-      user.membershipBenefitGrants.map((grant) => grant.type),
-    );
   }
 }

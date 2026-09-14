@@ -43,6 +43,7 @@ import {
   PlazaFeedSearchDto,
   PlazaPostDto,
   PostSignupItemDto,
+  MY_POST_SIGNUPS_PAGE_DEFAULT,
 } from './dto/circle-plaza.dto';
 import {
   AvatarFramePublicAppearance,
@@ -1021,7 +1022,7 @@ export class CirclePlazaService {
         await tx.circlePostSignup.create({
           data: { postID: postId, userID: userId },
         });
-        // signupCount 是去规范化的软缓存；getPostSignups / COUNT(*) 才是真实来源。
+        // signupCount 是去规范化的软缓存；报名行的 COUNT(*) 才是真实来源。
         const p = await tx.circlePost.update({
           where: { id: postId },
           data: { signupCount: { increment: 1 } },
@@ -1116,45 +1117,6 @@ export class CirclePlazaService {
     }
 
     return { signed: false, signupCount: Math.max(0, result.signupCount) };
-  }
-
-  async getPostSignups(
-    authorId: string,
-    postId: string,
-  ): Promise<{
-    items: {
-      id: string;
-      nickname: string;
-      avatarUrl: string | null;
-      accountId: string;
-      signedAt: string;
-    }[];
-  }> {
-    await this.requireOwnPost(authorId, postId);
-    const signups = await this.prisma.circlePostSignup.findMany({
-      where: { postID: postId },
-      include: {
-        user: {
-          select: {
-            id: true,
-            nickname: true,
-            avatarUrl: true,
-            accountId: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 200,
-    });
-    return {
-      items: signups.map((s) => ({
-        id: s.user.id,
-        nickname: s.user.nickname,
-        avatarUrl: s.user.avatarUrl,
-        accountId: s.user.accountId,
-        signedAt: s.createdAt.toISOString(),
-      })),
-    };
   }
 
   // ─── Signup management (报名管理) ───────────────────────────────────────────
@@ -1305,7 +1267,12 @@ export class CirclePlazaService {
   async getMyPostSignups(
     authorId: string,
     postId: string,
-  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
+    limit: number = MY_POST_SIGNUPS_PAGE_DEFAULT,
+  ): Promise<{
+    items: PostSignupItemDto[];
+    recognitionOpen: boolean;
+    hasMore: boolean;
+  }> {
     const post = await this.prisma.circlePost.findFirst({
       where: { id: postId, authorID: authorId },
       select: {
@@ -1320,7 +1287,7 @@ export class CirclePlazaService {
         errorCode: PlazaErrorCode.PostNotFound,
       });
     }
-    const signups = await this.prisma.circlePostSignup.findMany({
+    const rows = await this.prisma.circlePostSignup.findMany({
       where: { postID: postId },
       include: {
         user: {
@@ -1333,8 +1300,12 @@ export class CirclePlazaService {
         },
       },
       orderBy: { createdAt: 'desc' },
-      take: 200,
+      // 多取一条判断截断：此前硬截 200 条，第 201 位起在「报名管理」里看不见，
+      // 也进不了合作认可候选，客户端却无从得知。
+      take: limit + 1,
     });
+    const hasMore = rows.length > limit;
+    const signups = hasMore ? rows.slice(0, limit) : rows;
     const signerIds = signups.map((signup) => signup.user.id);
     const recognizedRows =
       signerIds.length > 0
@@ -1352,12 +1323,11 @@ export class CirclePlazaService {
     );
     const displayIconsByUser = await this.getDisplayIconsByAuthorIds(signerIds);
     return {
+      hasMore,
       recognitionOpen:
         post.status === 'ENDED' && post.collaborationRecognizedAt === null,
       items: signups.map((s) => ({
         userId: s.user.id,
-        // 兼容字段:OpenIM 时代的去连字符形态已弃用,直接回传 UUID。
-        imUserId: s.user.id,
         nickname: s.user.nickname,
         avatarUrl: s.user.avatarUrl,
         accountId: s.user.accountId,
@@ -1744,7 +1714,6 @@ export class CirclePlazaService {
         creditScore: post.creditRestriction,
         fancyNumber: post.fancyRestriction,
       },
-      viewCount: post.viewCount,
       signupCount: post.signupCount ?? 0,
       signedByMe,
       signupRestrictions: {

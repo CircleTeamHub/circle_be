@@ -31,6 +31,7 @@ import {
   CollaborationRecognitionResultDto,
   CreatePlazaPostDto,
   MyCirclePostDto,
+  MyPostSignupsQueryDto,
   PlazaFeedQueryDto,
   PlazaFeedResponseDto,
   PlazaFeedSearchDto,
@@ -158,25 +159,6 @@ export class CirclePlazaController {
     return this.plazaService.cancelSignup(req.user.userId, id);
   }
 
-  @Get('posts/:id/signups')
-  @Throttle({ default: { limit: 60, ttl: 60_000 } })
-  @ApiOperation({ summary: 'List users who signed up for my post' })
-  @ApiTooManyRequestsResponse({ description: 'Too many signup-list reads' })
-  signups(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: RequestWithUser,
-  ): Promise<{
-    items: {
-      id: string;
-      nickname: string;
-      avatarUrl: string | null;
-      accountId: string;
-      signedAt: string;
-    }[];
-  }> {
-    return this.plazaService.getPostSignups(req.user.userId, id);
-  }
-
   // ─── Signup management (报名管理) — author-scoped ───────────────────────────
 
   @Get('me/posts')
@@ -225,8 +207,13 @@ export class CirclePlazaController {
   myPostSignups(
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: RequestWithUser,
-  ): Promise<{ items: PostSignupItemDto[]; recognitionOpen: boolean }> {
-    return this.plazaService.getMyPostSignups(req.user.userId, id);
+    @Query() query: MyPostSignupsQueryDto,
+  ): Promise<{
+    items: PostSignupItemDto[];
+    recognitionOpen: boolean;
+    hasMore: boolean;
+  }> {
+    return this.plazaService.getMyPostSignups(req.user.userId, id, query.limit);
   }
 
   @Post('me/posts/:id/signups/read')

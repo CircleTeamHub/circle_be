@@ -1,4 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { AuthService } from '../auth.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -655,6 +657,17 @@ describe('AuthService', () => {
     expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
   });
 
+  // platform 只在 DTO 上保留（旧安装包还在发，见 LoginDto.platform 的 @deprecated）：
+  // 服务端从来不读它，注册 / 登录 / 签发令牌都不该再往下传。
+  it('does not thread the deprecated platform field into token issuance', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'src/auth/auth.service.ts'),
+      'utf8',
+    );
+    expect(source).not.toMatch(/dto\.platform\b/);
+    expect(source).not.toMatch(/\bplatform(?:ID)?\?:/);
+  });
+
   it('returns the active sessions for a user', async () => {
     mockRefreshTokenService.listActiveSessions.mockResolvedValueOnce([
       { id: 'session-1' },
@@ -872,17 +885,15 @@ describe('AuthService', () => {
     expect(me).toMatchObject({
       city: '杭州',
       gender: 'male',
-      storedVipLevel: 3,
+      // 存量 vipLevel=3 但已过期：对外只给有效档位。
       vipLevel: 0,
       vipExpiresAt,
-      membership: {
-        key: 'regular',
-        appearance: { nameColor: 'default', badge: null },
-        active: false,
-        lifetime: false,
-      },
       creditScore: 128,
     });
+    // SelfUserDto 早已不暴露 storedVipLevel / membership（App 与管理台都不读），
+    // me() 不再为它们多算一遍会员外观。
+    expect(me).not.toHaveProperty('storedVipLevel');
+    expect(me).not.toHaveProperty('membership');
     expect(me.lastOnline).toBeInstanceOf(Date);
     expect(me.lastOnline.getTime()).toBeGreaterThanOrEqual(beforeMe);
   });

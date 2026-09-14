@@ -1,6 +1,9 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
+import { MAX_PAGE } from 'src/common/pagination';
 import {
+  NotificationListQueryDto,
+  NotificationPageQueryDto,
   RegisterPushTokenDto,
   RevokePushTokenDto,
   UpdateCirclePushPreferenceDto,
@@ -138,5 +141,24 @@ describe('UpdateCirclePushPreferenceDto', () => {
         ),
       ).map((error) => error.property),
     ).toContain('circleOfflinePushEnabled');
+  });
+});
+
+describe('notification page bound', () => {
+  // OFFSET 的代价随页码线性增长（src/common/pagination.ts）。app 每页 20 条、只会
+  // 逐页加载系统通知：500 页 = 1 万条，远超 90 天保留期内的真实量。
+  const errorsFor = (
+    Dto: typeof NotificationPageQueryDto | typeof NotificationListQueryDto,
+    page: string,
+  ) =>
+    validateSync(
+      plainToInstance(Dto, { page }, { enableImplicitConversion: true }),
+    ).map((error) => error.property);
+
+  it('accepts MAX_PAGE and rejects MAX_PAGE + 1 on both list query DTOs', () => {
+    for (const Dto of [NotificationPageQueryDto, NotificationListQueryDto]) {
+      expect(errorsFor(Dto, String(MAX_PAGE))).toEqual([]);
+      expect(errorsFor(Dto, String(MAX_PAGE + 1))).toEqual(['page']);
+    }
   });
 });

@@ -149,21 +149,15 @@ describe('dashboard metric providers', () => {
     });
   });
 
-  it('reports service health with zeroed legacy outbox fields', async () => {
+  // OpenIM 同步 outbox 早已拆除,置零的 pending/processing/failed 等字段只会让面板显示
+  // 一排永远为 0 的假队列、把「失败 0」算进告警。admin_web 同批删除了渲染。
+  it('reports only the live service probes, without retired outbox fields', async () => {
     const prisma = { $queryRaw: jest.fn().mockResolvedValue([{ ok: 1 }]) };
     const redis = { ping: jest.fn().mockResolvedValue(true) };
 
     await expect(
       new DashboardSystemMetrics(prisma as never, redis as never).getMetrics(),
-    ).resolves.toMatchObject({
-      // OpenIM 同步 outbox 已拆除:字段保形置零,admin_web 面板无需同步升级。
-      pending: 0,
-      processing: 0,
-      failed: 0,
-      oldestPendingAt: null,
-      oldestFailedAt: null,
-      friend: null,
-      group: null,
+    ).resolves.toEqual({
       services: {
         api: 'healthy',
         database: 'healthy',

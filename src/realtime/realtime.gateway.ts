@@ -3,7 +3,10 @@ import { JwtService } from '@nestjs/jwt';
 import type { IncomingMessage, Server } from 'http';
 import type { Duplex } from 'stream';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { SessionRevocationService } from 'src/auth/session-revocation.service';
+import {
+  SessionVerifier,
+  type SessionVerdict,
+} from 'src/auth/session-verifier.service';
 import {
   REVOKED_CLOSE_CODE,
   REVOKED_CLOSE_REASON,
@@ -16,6 +19,14 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_CONNECTIONS_PER_USER = 5;
 const AUTH_TIMEOUT_MS = 10_000;
 const REALTIME_PATH = '/realtime';
+/**
+ * RFC 6455 "Try Again Later". Sent when neither Redis nor the database can say
+ * whether the token was revoked. The app client (circle-im src/realtime/client.ts)
+ * treats only 1008 + 'Session revoked' as terminal and reconnects with backoff
+ * on anything else, so the session survives a joint Redis + database outage.
+ */
+const UNVERIFIABLE_CLOSE_CODE = 1013;
+const UNVERIFIABLE_CLOSE_REASON = 'Try again later';
 
 /** 与 ws 的 shouldHandle 同一套取法:只切掉 query,不做任何归一化。 */
 function pathnameOf(url: string | undefined): string {
@@ -70,7 +81,7 @@ export class RealtimeGateway implements OnModuleDestroy {
   constructor(
     private readonly jwtService: JwtService,
     private readonly realtimeService: RealtimeService,
-    private readonly revocation: SessionRevocationService,
+    private readonly sessions: SessionVerifier,
   ) {}
 
   attach(httpServer: Server) {
@@ -222,11 +233,12 @@ export class RealtimeGateway implements OnModuleDestroy {
       }
     });
 
-    // Same check the HTTP strategy runs (F-02), so a banned or logged-out token
-    // cannot open a new stream. Fail-open exactly like HTTP: with Redis off this
-    // resolves false rather than locking every user out of realtime.
-    if (await this.revocation.isRevoked(verified.payload)) {
-      socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+    // Same verdict the HTTP strategy reaches (F-02, via SessionVerifier), so a
+    // banned or logged-out token cannot open a new stream — including when Redis
+    // is off, where the verifier consults the database instead of failing open.
+    const admission = await this.sessions.verify(verified.payload);
+    if (admission !== 'active') {
+      this.closeUnverifiedSocket(socket, admission);
       return;
     }
 
@@ -272,8 +284,9 @@ export class RealtimeGateway implements OnModuleDestroy {
     // local map, that broadcast could not find it. Once registered, check the
     // marker again: earlier revocations are caught here, later ones find the
     // registered socket through pub/sub.
-    if (await this.revocation.isRevoked(verified.payload)) {
-      socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+    const finalVerdict = await this.sessions.verify(verified.payload);
+    if (finalVerdict !== 'active') {
+      this.closeUnverifiedSocket(socket, finalVerdict);
       return;
     }
 
@@ -298,6 +311,18 @@ export class RealtimeGateway implements OnModuleDestroy {
         `Failed to emit initial snapshot for ${userId}: ${error instanceof Error ? error.message : error}`,
       );
     }
+  }
+
+  /** Revoked sessions get the terminal frame; an unverifiable one a retryable close. */
+  private closeUnverifiedSocket(
+    socket: WebSocket,
+    verdict: Exclude<SessionVerdict, 'active'>,
+  ): void {
+    if (verdict === 'revoked') {
+      socket.close(REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON);
+      return;
+    }
+    socket.close(UNVERIFIABLE_CLOSE_CODE, UNVERIFIABLE_CLOSE_REASON);
   }
 
   private parseAuthMessage(data: RawData): AuthMessage | null {
