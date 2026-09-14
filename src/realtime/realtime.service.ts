@@ -46,7 +46,7 @@ export const REVOKED_CLOSE_REASON = 'Session revoked';
 
 /**
  * Per-socket claims needed to decide whether a revocation applies, mirroring
- * what `SessionRevocationService.isRevoked` reads off the JWT.
+ * what `SessionRevocationService.checkRevocation` reads off the JWT.
  */
 export type RealtimeSocketIdentity = {
   /** `sid` claim; null when the token predates session ids. */
@@ -1174,10 +1174,11 @@ export class RealtimeService implements OnModuleInit, OnModuleDestroy {
 
     return [...group].filter((socket) => {
       const issuedAtMs = this.socketIdentities.get(socket)?.issuedAtMs ?? null;
-      // Mirrors `isRevoked`: the per-user stamp only kills tokens issued at or
-      // before it, so a device that logged back in after a "log out everywhere"
-      // keeps its socket. A token with no issuance claim is left alone for the
-      // same reason HTTP leaves it alone — it still dies at its own expiry.
+      // Mirrors `checkRevocation`: the per-user stamp only kills tokens issued
+      // at or before it, so a device that logged back in after a "log out
+      // everywhere" keeps its socket. A token with no issuance claim is left
+      // alone for the same reason HTTP leaves it alone — it still dies at its
+      // own expiry.
       return issuedAtMs !== null && issuedAtMs <= revokedAtMs;
     });
   }

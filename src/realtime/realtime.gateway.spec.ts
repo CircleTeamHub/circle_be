@@ -625,7 +625,7 @@ describe('RealtimeGateway session revocation', () => {
     });
 
     it('keeps a session established after the revoke stamp (re-login race)', async () => {
-      // Mirrors `isRevoked`: the per-user marker only kills tokens issued at or
+      // Mirrors `checkRevocation`: the per-user marker only kills tokens issued at or
       // before the revoke instant. A device that logged back in afterwards must
       // survive, otherwise "log out all devices" would kick the new session.
       await revocation.revokeUser('user-6');
