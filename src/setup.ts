@@ -496,7 +496,9 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   app.use('/api/v1/coin/gift', coinGiftLimiter);
   app.use('/api/v1/note', createWriteMethodLimiterMount(noteWriteLimiter));
   app.use('/api/v1/circle', (req: any, res: any, next: any) => {
-    if (req.method === 'POST' || req.method === 'DELETE') {
+    // 写方法与 note 挂载同一集合(POST/PATCH/PUT/DELETE):PATCH /circle/:id 编辑圈子、
+    // 改群名/群公告此前只算读配额。
+    if (WRITE_METHODS.has(req.method)) {
       return circleWriteLimiter(req, res, next);
     }
     // 读也要限：GET /circle?city= 是数组包含查询，且 service 用 Promise.all 并发发出
