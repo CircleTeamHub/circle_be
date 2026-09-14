@@ -125,7 +125,7 @@ export class CircleController {
   uploadIcon(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UploadCircleIconDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.circleService.uploadCircleIcon(req.user.userId, id, dto);
   }
@@ -135,7 +135,7 @@ export class CircleController {
   selectIcon(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SelectCircleIconDto,
-    @Req() req: any,
+    @Req() req: RequestWithUser,
   ) {
     return this.circleService.selectCircleIcon(req.user.userId, id, dto);
   }
