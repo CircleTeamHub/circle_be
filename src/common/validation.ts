@@ -1,5 +1,11 @@
 import { applyDecorators } from '@nestjs/common';
-import { IsDefined, ValidateIf } from 'class-validator';
+import {
+  buildMessage,
+  IsDefined,
+  ValidateBy,
+  ValidateIf,
+  type ValidationOptions,
+} from 'class-validator';
 
 /**
  * `@IsOptional()` for properties backed by a non-nullable column: an omitted
@@ -16,5 +22,40 @@ export function IsOptionalNotNull(): PropertyDecorator {
   return applyDecorators(
     ValidateIf((_object: object, value: unknown) => value !== undefined),
     IsDefined(),
+  );
+}
+
+/**
+ * Caps the serialized size of a free-form JSON property: `JSON.stringify(value)`
+ * must be at most `max` characters (UTF-16 code units — the unit of
+ * String#length and of the chat text limit). A value JSON cannot serialize
+ * (circular, BigInt) fails instead of throwing; presence and shape stay with
+ * @IsOptional / @IsObject.
+ */
+export function MaxJsonLength(
+  max: number,
+  validationOptions?: ValidationOptions,
+): PropertyDecorator {
+  return ValidateBy(
+    {
+      name: 'maxJsonLength',
+      constraints: [max],
+      validator: {
+        validate: (value: unknown): boolean => {
+          try {
+            const serialized = JSON.stringify(value);
+            return serialized === undefined || serialized.length <= max;
+          } catch {
+            return false;
+          }
+        },
+        defaultMessage: buildMessage(
+          (eachPrefix) =>
+            `${eachPrefix}$property must serialize to at most $constraint1 characters of JSON`,
+          validationOptions,
+        ),
+      },
+    },
+    validationOptions,
   );
 }

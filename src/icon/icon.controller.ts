@@ -6,6 +6,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import type { RequestWithUser } from 'src/auth/types';
 import { JwtGuard } from 'src/guards/jwt.guard';
 import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import {
@@ -27,7 +28,7 @@ export class IconController {
     summary: 'Get all eligible user icons and current selections',
   })
   @ApiOkResponse({ type: IconOptionsResponseDto })
-  options(@Req() req: any) {
+  options(@Req() req: RequestWithUser) {
     return this.iconService.getIconOptions(req.user.userId);
   }
 
@@ -39,7 +40,10 @@ export class IconController {
   @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @ApiOperation({ summary: 'Update currently displayed user icons' })
   @ApiOkResponse({ type: [DisplayIconDto] })
-  updateDisplay(@Req() req: any, @Body() dto: UpdateDisplayIconsDto) {
+  updateDisplay(
+    @Req() req: RequestWithUser,
+    @Body() dto: UpdateDisplayIconsDto,
+  ) {
     return this.iconService.updateDisplayIcons(req.user.userId, dto.items);
   }
 }

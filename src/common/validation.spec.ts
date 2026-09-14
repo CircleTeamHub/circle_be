@@ -6,7 +6,7 @@ import {
   validateSync,
   type ValidationError,
 } from 'class-validator';
-import { IsOptionalNotNull } from './validation';
+import { IsOptionalNotNull, MaxJsonLength } from './validation';
 
 class NotNullProbe {
   @IsOptionalNotNull()
@@ -68,5 +68,46 @@ describe('IsOptionalNotNull', () => {
     expect(error.property).toBe('mode');
     expect(error.constraints).toHaveProperty('isIn');
     expect(error.constraints).not.toHaveProperty('isDefined');
+  });
+});
+
+class JsonProbe {
+  @IsOptional()
+  @MaxJsonLength(20)
+  payload?: unknown;
+}
+
+// 自由形状的 JSON 属性（如收藏的 payload）只有 @IsObject，大小不设防：一条请求就能往
+// 一行 JSONB 里塞进任意大的文档。上限按 JSON.stringify 之后的长度算（UTF-16 码元，
+// 与 String#length、聊天正文上限同一把尺子）。
+describe('MaxJsonLength', () => {
+  it('accepts JSON up to the limit and rejects one character more', () => {
+    // {"a":"xxxxxxxxxxxx"} is exactly 20 characters.
+    expect(
+      errorsFor(JsonProbe, { payload: { a: 'x'.repeat(12) } }),
+    ).toHaveLength(0);
+
+    const [error] = errorsFor(JsonProbe, { payload: { a: 'x'.repeat(13) } });
+    expect(error.property).toBe('payload');
+    expect(error.constraints).toHaveProperty('maxJsonLength');
+  });
+
+  it('measures the escaped JSON, not the raw characters', () => {
+    // Eight quotes are 8 characters of text but 16 once escaped: 24 in total.
+    const [error] = errorsFor(JsonProbe, { payload: { a: '"'.repeat(8) } });
+    expect(error.constraints).toHaveProperty('maxJsonLength');
+  });
+
+  it('rejects a value that cannot be serialized instead of throwing', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const dto = Object.assign(new JsonProbe(), { payload: circular });
+
+    const [error] = validateSync(dto);
+    expect(error.constraints).toHaveProperty('maxJsonLength');
+  });
+
+  it('leaves an omitted value to @IsOptional', () => {
+    expect(errorsFor(JsonProbe, {})).toHaveLength(0);
   });
 });
