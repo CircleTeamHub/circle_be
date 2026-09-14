@@ -12,6 +12,7 @@ describe('createEnvValidationSchema', () => {
     ALLOWED_ORIGINS: 'https://app.example.com',
     SECRET: 'x'.repeat(32),
     TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
+    METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
     EMAIL_CODE_DEV_BYPASS: 'Zq7mK2xR9vT4sPwL8bN3',
     EMAIL_CODE_ALLOW_PRODUCTION_BYPASS: 'true',
     EMAIL_CODE_PRODUCTION_BYPASS_ALLOWLIST: 'LOGIN:tester@example.com',
@@ -164,6 +165,7 @@ describe('createEnvValidationSchema', () => {
       ALLOWED_ORIGINS: 'https://app.example.com',
       SECRET: 'x'.repeat(32),
       TEMP_CHAT_LINK_SECRET: 'x'.repeat(32),
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       OBJECT_STORAGE_DELIVERY_URL: deliveryUrl,
     };
 
@@ -298,6 +300,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
     };
 
     const { error } = createEnvValidationSchema(env).validate(env);
@@ -312,6 +315,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_REQUIRED: 'true',
     };
 
@@ -339,6 +343,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'redis://default:secret@redis:6379',
       REDIS_ALLOW_INSECURE: 'true',
     };
@@ -368,6 +373,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'redis://redis:6379',
     };
 
@@ -383,6 +389,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'redis://default:secret@cache.example.com:6379',
     };
 
@@ -398,6 +405,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'rediss://default:secret@cache.example.com:6380',
     };
 
@@ -413,6 +421,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'rediss://cache.example.com:6380?password=secret',
     };
 
@@ -428,6 +437,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL: 'rediss://cache.example.com:6380?password=secret&password=',
     };
 
@@ -443,6 +453,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_URL:
         'rediss://default:authority@cache.example.com:6380?password=query',
     };
@@ -459,6 +470,7 @@ describe('createEnvValidationSchema', () => {
       SECRET: 'a-production-secret-that-is-over-32-characters',
       ALLOWED_ORIGINS: 'https://app.example.com',
       TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+      METRICS_AUTH_TOKEN: 'a-production-metrics-scrape-token',
       REDIS_ALLOW_INSECURE: 'true',
       REDIS_URL: 'redis://default:secret@redis.default.svc.cluster.local:6379',
     };
@@ -524,5 +536,56 @@ describe('createEnvValidationSchema', () => {
       });
       expect(error).toBeUndefined();
     });
+  });
+});
+
+// /metrics 暴露路由清单、业务事件速率与连接池占用。deploy/gen-env.sh 总会写入随机
+// token，缺它（或仍是 .env.production.example 的占位符）的生产部署只可能是配置
+// 事故 —— 启动期失败，而不是悄悄把指标对能连到端口的所有人敞开。
+describe('METRICS_AUTH_TOKEN', () => {
+  const productionEnv = {
+    NODE_ENV: 'production',
+    DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    SECRET: 'a-production-secret-that-is-over-32-characters',
+    ALLOWED_ORIGINS: 'https://app.example.com',
+    TEMP_CHAT_LINK_SECRET: 'a-temp-chat-secret-that-is-over-32-characters',
+  };
+
+  it('is required in production', () => {
+    const { error } =
+      createEnvValidationSchema(productionEnv).validate(productionEnv);
+
+    expect(error?.message).toContain('"METRICS_AUTH_TOKEN" is required');
+  });
+
+  it('rejects the unfilled .env.production.example placeholder in production', () => {
+    const env = { ...productionEnv, METRICS_AUTH_TOKEN: '__REPLACE_RANDOM__' };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error?.message).toContain('METRICS_AUTH_TOKEN');
+  });
+
+  it('accepts a configured token in production', () => {
+    const env = {
+      ...productionEnv,
+      METRICS_AUTH_TOKEN: 'short-existing-token',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
+  });
+
+  it('stays optional outside production', () => {
+    const env = {
+      NODE_ENV: 'development',
+      SECRET: 'test-secret',
+      DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
+    };
+
+    const { error } = createEnvValidationSchema(env).validate(env);
+
+    expect(error).toBeUndefined();
   });
 });

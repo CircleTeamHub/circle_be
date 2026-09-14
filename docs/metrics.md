@@ -25,10 +25,11 @@ controller guards — a scraper cannot hold a JWT anyway. Instead it has an
 
 - Set **`METRICS_AUTH_TOKEN`** and the endpoint requires
   `Authorization: Bearer <token>`, compared in constant time.
-- Leave it unset and the endpoint is **open** — the `Authorization` header is
-  ignored entirely. In production this logs a startup warning.
-- `.env.production.example` ships `METRICS_AUTH_TOKEN=__REPLACE_RANDOM__`, so
-  production is expected to run with the token set.
+- **In production the token is required**: env validation fails boot when it is
+  missing or still the `.env.production.example` placeholder
+  (`__REPLACE_RANDOM__`).
+- Outside production it stays optional; leave it unset and the endpoint is
+  **open** — the `Authorization` header is ignored entirely.
 
 The token is a second layer, not a substitute for network isolation. Also:
 

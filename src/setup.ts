@@ -373,20 +373,12 @@ export const setupApp = (app: INestApplication): ErrorAggregationProvider => {
   const metrics = createMetrics();
   app.use(createHttpMetricsMiddleware(metrics));
   // Expose HTTP RED, business, and Redis resilience metrics together.
-  // Gated by METRICS_AUTH_TOKEN when set; left open otherwise so internal-only
-  // deployments keep working without extra config.
+  // Gated by METRICS_AUTH_TOKEN when set. Production cannot boot without it (env
+  // validation), so only development/test ever serve /metrics unauthenticated.
   const metricsAuthToken =
     String(
       config['METRICS_AUTH_TOKEN'] ?? process.env.METRICS_AUTH_TOKEN ?? '',
     ).trim() || undefined;
-  if (isProduction && !metricsAuthToken) {
-    new Logger('Metrics').warn(
-      '/metrics is served without authentication (METRICS_AUTH_TOKEN unset). ' +
-        'Restrict it at the network layer or set METRICS_AUTH_TOKEN — the ' +
-        'exposition format reveals route inventory, business-event rates, and ' +
-        'process stats.',
-    );
-  }
   // 基建状态 gauge（#87/#102）：桶策略未确认、Redis 存活。抓取时求值。
   const uploadServiceForMetrics = getOptionalUploadService(app);
   const infraStatusMetrics = createInfraStatusMetrics({
