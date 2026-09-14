@@ -27,7 +27,10 @@ export type VerifiableToken = {
 };
 
 function issuedAtMs(token: VerifiableToken): number | null {
-  if (typeof token.issuedAtMs === 'number' && Number.isFinite(token.issuedAtMs)) {
+  if (
+    typeof token.issuedAtMs === 'number' &&
+    Number.isFinite(token.issuedAtMs)
+  ) {
     return token.issuedAtMs;
   }
   if (typeof token.iat === 'number' && Number.isFinite(token.iat)) {
