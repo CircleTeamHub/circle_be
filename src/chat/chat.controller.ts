@@ -485,7 +485,10 @@ export class ChatController {
   getBurnPolicy(
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
-  ): Promise<{ burnDurationSec: number | null }> {
+  ): Promise<{
+    burnDurationSec: number | null;
+    burnStartedAt: string | null;
+  }> {
     return this.chatService.getBurnPolicy(req.user.userId, conversationId);
   }
 
@@ -498,7 +501,10 @@ export class ChatController {
     @Req() req: RequestWithUser,
     @Param('id', ParseUUIDPipe) conversationId: string,
     @Body() body: SetBurnDurationDto,
-  ): Promise<{ burnDurationSec: number | null }> {
+  ): Promise<{
+    burnDurationSec: number | null;
+    burnStartedAt: string | null;
+  }> {
     return this.chatService.setBurnDuration(
       req.user.userId,
       conversationId,

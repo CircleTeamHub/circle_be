@@ -1,6 +1,7 @@
 import {
   buildChatRetentionWindow,
   chatRetentionWhere,
+  effectiveBurnDurationForMessage,
   isChatMessageVisible,
 } from './chat-retention';
 
@@ -15,9 +16,9 @@ describe('chat retention window', () => {
       now,
     );
 
-    expect(isChatMessageVisible(new Date('2020-01-01T00:00:00.000Z'), window)).toBe(
-      true,
-    );
+    expect(
+      isChatMessageVisible(new Date('2020-01-01T00:00:00.000Z'), window),
+    ).toBe(true);
     expect(chatRetentionWhere(window)).toEqual({});
   });
 
@@ -28,12 +29,12 @@ describe('chat retention window', () => {
       now,
     );
 
-    expect(isChatMessageVisible(new Date('2026-09-14T10:30:00.000Z'), window)).toBe(
-      false,
-    );
-    expect(isChatMessageVisible(new Date('2026-09-14T11:30:00.000Z'), window)).toBe(
-      true,
-    );
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T10:30:00.000Z'), window),
+    ).toBe(false);
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T11:30:00.000Z'), window),
+    ).toBe(true);
   });
 
   it('preserves messages from before burn was enabled', () => {
@@ -43,9 +44,9 @@ describe('chat retention window', () => {
       now,
     );
 
-    expect(isChatMessageVisible(new Date('2026-09-14T09:59:59.000Z'), window)).toBe(
-      true,
-    );
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T09:59:59.000Z'), window),
+    ).toBe(true);
     expect(chatRetentionWhere(window)).toEqual({
       AND: [
         {
@@ -66,14 +67,31 @@ describe('chat retention window', () => {
       now,
     );
 
-    expect(isChatMessageVisible(new Date('2026-09-14T10:30:00.000Z'), window)).toBe(
-      false,
-    );
-    expect(isChatMessageVisible(new Date('2026-09-14T11:30:00.000Z'), window)).toBe(
-      true,
-    );
-    expect(isChatMessageVisible(new Date('2026-09-14T07:59:59.000Z'), window)).toBe(
-      false,
-    );
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T10:30:00.000Z'), window),
+    ).toBe(false);
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T11:30:00.000Z'), window),
+    ).toBe(true);
+    expect(
+      isChatMessageVisible(new Date('2026-09-14T07:59:59.000Z'), window),
+    ).toBe(false);
+  });
+
+  it('marks only post-start messages as ephemeral in response DTOs', () => {
+    const policy = { burnDurationSec: 3600, burnStartedAt: startedAt };
+
+    expect(
+      effectiveBurnDurationForMessage(
+        policy,
+        new Date('2026-09-14T09:00:00.000Z'),
+      ),
+    ).toBeNull();
+    expect(
+      effectiveBurnDurationForMessage(
+        policy,
+        new Date('2026-09-14T10:00:00.000Z'),
+      ),
+    ).toBe(3600);
   });
 });

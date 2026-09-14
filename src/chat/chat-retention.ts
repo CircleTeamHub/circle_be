@@ -23,9 +23,7 @@ export function buildChatRetentionWindow(
   return {
     viewerCutoff,
     burnStartedAt: seconds ? (policy.burnStartedAt ?? null) : null,
-    burnCutoff: seconds
-      ? new Date(now.getTime() - seconds * 1000)
-      : null,
+    burnCutoff: seconds ? new Date(now.getTime() - seconds * 1000) : null,
   };
 }
 
@@ -37,6 +35,19 @@ export function isChatMessageVisible(
   if (!window.burnCutoff) return true;
   if (window.burnStartedAt && createdAt < window.burnStartedAt) return true;
   return createdAt >= window.burnCutoff;
+}
+
+export function effectiveBurnDurationForMessage(
+  policy: ChatBurnPolicy,
+  createdAt: Date,
+): number | null {
+  const seconds =
+    typeof policy.burnDurationSec === 'number' && policy.burnDurationSec > 0
+      ? policy.burnDurationSec
+      : null;
+  if (!seconds) return null;
+  if (policy.burnStartedAt && createdAt < policy.burnStartedAt) return null;
+  return seconds;
 }
 
 export function chatRetentionWhere(

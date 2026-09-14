@@ -59,7 +59,7 @@ export class ChatBurnSweeperService {
           burnDurationSec: { not: null },
           ...(this.cursor ? { id: { gt: this.cursor } } : {}),
         },
-        select: { id: true, burnDurationSec: true },
+        select: { id: true, burnDurationSec: true, burnStartedAt: true },
         orderBy: { id: 'asc' },
         take: SWEEP_CONVERSATIONS_MAX,
       });
@@ -92,7 +92,7 @@ export class ChatBurnSweeperService {
       // 删掉的就是用户刚刚决定要留下的消息,而且不可逆。
       const current = await this.prisma.chatConversation.findUnique({
         where: { id: conversationId },
-        select: { burnDurationSec: true },
+        select: { burnDurationSec: true, burnStartedAt: true },
       });
       const live = current?.burnDurationSec ?? null;
       if (!live || live <= 0) return;
@@ -106,7 +106,10 @@ export class ChatBurnSweeperService {
         where: {
           conversationID: conversationId,
           deleted: false,
-          createdAt: { lt: cutoff },
+          createdAt: {
+            ...(current?.burnStartedAt ? { gte: current.burnStartedAt } : {}),
+            lt: cutoff,
+          },
         },
         select: { id: true, type: true, content: true },
         take: SWEEP_BATCH,
