@@ -144,8 +144,8 @@ export class SessionRevocationService {
 
   /**
    * Tri-state revocation check for one access token (see RevocationState).
- * Both `active` and `unknown` leave the allow decision to SessionVerifier's
- * database check. Only `revoked` is authoritative by itself.
+   * Both `active` and `unknown` leave the allow decision to SessionVerifier's
+   * database check. Only `revoked` is authoritative by itself.
    */
   async checkRevocation(payload: RevocablePayload): Promise<RevocationState> {
     if (!this.redis.isEnabled()) return 'unknown';
