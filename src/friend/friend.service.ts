@@ -204,6 +204,14 @@ export class FriendService {
         errorCode: FriendErrorCode.SelfAdd,
       });
     }
+    // 描述照片在对方通过后进入发送者的联系人卡片并被渲染。App 只发 presign 返回的本站
+    // fileUrl;外站 http(s) 链接等于往卡片里塞追踪像素。与举报证据同一口径:http(s) 项
+    // 必须来自本站存储,对象 key 原样放行(不在这里拒绝旧形态的值)。
+    assertUrlsFromStorage(
+      (extras?.photos ?? []).filter(isHttpUrl),
+      this.storagePublicObjectBases,
+      'photos',
+    );
     if (extras?.viaConversationId) {
       await this.assertGroupAllowsFriendRequests(
         extras.viaConversationId,

@@ -86,7 +86,8 @@ export class SendFriendRequestDto {
   @ApiPropertyOptional({
     type: [String],
     description:
-      'Sender-owned description photo urls/keys, promoted on accept (max 9)',
+      'Sender-owned description photo urls/keys, promoted on accept (max 9). ' +
+      "http(s) URLs must be served from this application's storage.",
     example: ['https://cdn.example.com/friends/abc.jpg'],
   })
   @IsOptional()

@@ -1096,6 +1096,75 @@ describe('FriendService', () => {
     expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function));
   });
 
+  // 申请附带的描述照片在对方通过后进入发送者的联系人卡片并被渲染。circle-im 只发
+  // presign(folder: friends)返回的本站 fileUrl;外站 http(s) 链接等于往联系人卡片里
+  // 塞追踪像素。与举报证据同一口径:http(s) 项必须来自本站存储,对象 key 原样放行。
+  it('rejects friend-request photos served from outside this app storage', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friendTag.findMany.mockResolvedValue([]);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+    });
+
+    await expect(
+      service.sendRequest('user-1', 'user-2', 'hi', undefined, [], {
+        photos: [
+          'http://10.0.0.195:9000/circle/friends/user-1/a.jpg',
+          'https://tracker.example.com/pixel.png',
+        ],
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(prisma.friend.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps storage-served photo URLs and object keys', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      id: 'user-2',
+      status: 'ACTIVE',
+      role: 'USER',
+    });
+    prisma.block.findFirst.mockResolvedValue(null);
+    prisma.friend.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null);
+    prisma.friend.count.mockResolvedValue(0);
+    prisma.friendTag.findMany.mockResolvedValue([]);
+    prisma.friend.create.mockResolvedValue({
+      id: 'request-1',
+      userID: 'user-1',
+      friendID: 'user-2',
+      state: FriendState.PENDING,
+    });
+
+    await service.sendRequest('user-1', 'user-2', 'hi', undefined, [], {
+      photos: [
+        'http://10.0.0.195:9000/circle/friends/user-1/a.jpg',
+        'friends/user-1/b.jpg',
+      ],
+    });
+
+    expect(prisma.friend.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        pendingPhotosBySender: [
+          'http://10.0.0.195:9000/circle/friends/user-1/a.jpg',
+          'friends/user-1/b.jpg',
+        ],
+      }),
+    });
+  });
+
   it('stages description, photos and permission on the pending request', async () => {
     prisma.user.findUnique.mockResolvedValue({
       id: 'user-2',
