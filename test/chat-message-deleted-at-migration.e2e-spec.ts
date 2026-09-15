@@ -42,8 +42,10 @@ describePostgres('chat tombstone migration PostgreSQL integration', () => {
           'utf8',
         ),
       );
+      // Model a cursor from before deployment. deletedAt stores milliseconds,
+      // while CURRENT_TIMESTAMP has microseconds and may round above the row.
       const tombstones = await client.query(`SELECT "id" FROM "ChatMessage"
-        WHERE "deleted" = true AND "deletedAt" >= CURRENT_TIMESTAMP`);
+        WHERE "deleted" = true AND "deletedAt" >= CURRENT_TIMESTAMP - INTERVAL '1 second'`);
       expect(tombstones.rows).toEqual([{ id: 'deleted-before-deploy' }]);
       const live = await client.query(
         `SELECT "deletedAt" FROM "ChatMessage" WHERE "id" = 'still-visible'`,
