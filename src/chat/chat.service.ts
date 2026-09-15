@@ -4093,17 +4093,14 @@ export class ChatService {
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
     // 重试只会再往 contentHistory 里压一层。
-    const dto = await this.decorateCommittedMessage(
-      updated,
-      conversation.burnDurationSec,
-    );
+    const dto = await this.decorateCommittedMessage(updated, conversation);
     return dto;
   }
 
   /** 写已提交之后的装饰(昵称/引用快照):任何失败都降级,绝不抛。 */
   private async decorateCommittedMessage(
     row: MessageRow,
-    burnDurationSec: number | null,
+    burnPolicy: ChatBurnPolicy,
   ): Promise<ChatMessageDto> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -4119,7 +4116,7 @@ export class ChatService {
         }`,
       );
     }
-    const dto = this.toMessageDto(row, sender, burnDurationSec);
+    const dto = this.toMessageDto(row, sender, burnPolicy);
     try {
       await this.attachReplyTo([dto]);
     } catch (error) {

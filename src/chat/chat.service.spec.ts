@@ -3301,6 +3301,41 @@ describe('ChatService', () => {
       expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
     });
 
+    it.each([
+      [-1000, null],
+      [0, 3600],
+      [1000, 3600],
+    ])(
+      'preserves the activation boundary when editing at offset %i',
+      async (offset, expectedDuration) => {
+        const burnStartedAt = new Date(Date.now() - 2000);
+        const seat = membership();
+        prisma.chatMember.findUnique.mockResolvedValue(
+          membership({
+            conversation: {
+              ...seat.conversation,
+              burnDurationSec: 3600,
+              burnStartedAt,
+            },
+          }),
+        );
+        const row = editableRow({
+          createdAt: new Date(burnStartedAt.getTime() + offset),
+        });
+        prisma.chatMessage.findUnique.mockResolvedValue(row);
+        prisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+        prisma.chatMessage.findUniqueOrThrow.mockResolvedValue({
+          ...row,
+          content: { text: 'edited' },
+          editedAt: new Date(),
+        });
+        const dto = await service.editMessage('u1', 'conv-1', 'm1', {
+          text: 'edited',
+        });
+        expect(dto.burnDurationSec).toBe(expectedDuration);
+      },
+    );
+
     it('lets the sender edit text within the window and keeps a history trail', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findUnique.mockResolvedValue(editableRow());
