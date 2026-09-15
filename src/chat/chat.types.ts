@@ -363,6 +363,8 @@ export interface ChatConversationDto {
   policies: ChatGroupPoliciesDto | null;
   /** 会话级阅后即焚秒数(S-01);null=关。 */
   burnDurationSec?: number | null;
+  /** 本轮会话级焚毁的开启时刻；此前消息永久排除在本轮焚毁之外。 */
+  burnStartedAt?: string | null;
   /**
    * DIRECT 会话对端座位的已读水位(ChatMember.lastReadHeight);其余类型为 null。
    * chat:read 只在水位推进时广播,对端在本机连上之前读过的话,本机永远等不到那次

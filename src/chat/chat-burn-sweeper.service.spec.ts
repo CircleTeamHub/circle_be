@@ -41,7 +41,7 @@ describe('ChatBurnSweeperService', () => {
   /** conversationId → findUnique 返回的当前策略。 */
   const conversationPolicies = new Map<
     string,
-    { burnDurationSec: number | null }
+    { burnDurationSec: number | null; burnStartedAt?: Date | null }
   >();
 
   it('soft-deletes expired rows, clears content and deletes media objects', async () => {
@@ -89,6 +89,28 @@ describe('ChatBurnSweeperService', () => {
     prisma.chatConversation.findMany.mockResolvedValue([]);
     await service.sweep();
     expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+  });
+
+  it('never tombstones messages from before the current burn activation', async () => {
+    const burnStartedAt = new Date('2026-09-14T10:00:00.000Z');
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-1', burnDurationSec: 60, burnStartedAt },
+    ]);
+    conversationPolicies.set('conv-1', { burnDurationSec: 60, burnStartedAt });
+    prisma.chatMessage.findMany.mockResolvedValueOnce([]);
+
+    await service.sweep();
+
+    expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          createdAt: {
+            gte: burnStartedAt,
+            lt: expect.any(Date),
+          },
+        }),
+      }),
+    );
   });
 
   it('releases shared note-import references instead of deleting them directly', async () => {

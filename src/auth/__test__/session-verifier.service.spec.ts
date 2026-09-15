@@ -52,15 +52,29 @@ describe('SessionVerifier', () => {
   });
 
   describe('when Redis answers', () => {
-    it.each(['active', 'revoked'] as const)(
-      'returns the Redis verdict (%s) without touching the database',
-      async (state) => {
-        await expect(verifierWith(state).verify(payload)).resolves.toBe(state);
-        // 热路径：Redis 有结论就不多一次数据库查询。
-        expect(prisma.user.findUnique).not.toHaveBeenCalled();
-        expect(prisma.refreshToken.findUnique).not.toHaveBeenCalled();
-      },
-    );
+    it('returns a Redis revocation without touching the database', async () => {
+      await expect(verifierWith('revoked').verify(payload)).resolves.toBe(
+        'revoked',
+      );
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(prisma.refreshToken.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('does not let a missing Redis marker override a durable logout', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        status: 'ACTIVE',
+        accessTokensRevokedAt: null,
+      });
+      prisma.refreshToken.findUnique.mockResolvedValue({
+        userId: 'user-1',
+        revokedAt: new Date('2026-09-14T00:00:00.000Z'),
+        revocationReason: 'LOGOUT',
+      });
+
+      await expect(verifierWith('active').verify(payload)).resolves.toBe(
+        'revoked',
+      );
+    });
   });
 
   // Redis 在生产里是可选的（.env.production.example 发的是 REDIS_REQUIRED=false）。

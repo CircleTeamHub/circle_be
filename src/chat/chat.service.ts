@@ -58,6 +58,14 @@ import {
   RELAX_PURGE_BATCHES_MAX,
 } from './chat.constants';
 import { messagePreviewText } from './chat-message-preview';
+import {
+  buildChatRetentionWindow,
+  chatRetentionWhere,
+  effectiveBurnDurationForMessage,
+  isChatMessageVisible,
+  type ChatBurnPolicy,
+  type ChatRetentionWindow,
+} from './chat-retention';
 import type {
   ChatConversationDto,
   ChatHistoryPageDto,
@@ -114,6 +122,8 @@ interface SendResult {
   message: ChatMessageDto;
   reused: boolean;
 }
+
+type ChatBurnPolicyInput = ChatBurnPolicy | number | null;
 
 /**
  * 读路径拿到的消息行。
@@ -355,7 +365,7 @@ export class ChatService {
           existing,
           senderUserId,
           true,
-          conversation.burnDurationSec,
+          conversation,
         );
       }
     }
@@ -518,7 +528,7 @@ export class ChatService {
         created.row,
         senderUserId,
         created.reused,
-        conversation.burnDurationSec,
+        conversation,
       );
     } catch (error) {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
@@ -531,7 +541,7 @@ export class ChatService {
     row: MessageRow,
     senderUserId: string,
     reused: boolean,
-    burnDurationSec: number | null,
+    burnPolicy: ChatBurnPolicyInput,
   ): Promise<SendResult> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -546,7 +556,7 @@ export class ChatService {
         }`,
       );
     }
-    const message = this.toMessageDto(row, sender, burnDurationSec);
+    const message = this.toMessageDto(row, sender, burnPolicy);
     try {
       await this.attachReplyTo([message]);
     } catch (error) {
@@ -593,13 +603,10 @@ export class ChatService {
       userId,
     );
     const viewerCutoff = await this.selfDestructCutoff(userId);
-    const burnCutoff = conversation.burnDurationSec
-      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
-      : null;
-    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
+    const retention = buildChatRetentionWindow(conversation, viewerCutoff);
     if (
       row.height <= (member.clearedBeforeHeight ?? 0) ||
-      (cutoff !== null && row.createdAt < cutoff)
+      !isChatMessageVisible(row.createdAt, retention)
     ) {
       throw this.messageNotFound();
     }
@@ -630,7 +637,11 @@ export class ChatService {
     //
     // 自己发的除外。那是你自己的内容、key 本来就在你自己的命名空间里,你打开
     // 相册重发一次效果完全一样 —— 拦下来不保护任何人,只是让你多走一步。
-    if (conversation.burnDurationSec && row.senderID !== userId) {
+    const burnAppliesToMessage =
+      !!conversation.burnDurationSec &&
+      (!conversation.burnStartedAt ||
+        row.createdAt >= conversation.burnStartedAt);
+    if (burnAppliesToMessage && row.senderID !== userId) {
       throw new ForbiddenException({
         message: '阅后即焚会话中的消息不可转发',
         errorCode: ChatErrorCode.ForwardForbidden,
@@ -995,11 +1006,9 @@ export class ChatService {
       .filter((m) => m.conversation.type === 'DIRECT')
       .map((m) => m.conversationID);
     const viewerCutoff = await this.selfDestructCutoff(userId);
-    const cutoffs = memberships.map((m) => {
-      const seconds = m.conversation.burnDurationSec;
-      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
-      return this.strictestCutoff(viewerCutoff, burnCutoff);
-    });
+    const retentionWindows = memberships.map((m) =>
+      buildChatRetentionWindow(m.conversation, viewerCutoff),
+    );
 
     const circleIds = memberships
       .map((m) => m.conversation.circleID)
@@ -1016,7 +1025,7 @@ export class ChatService {
       circleRoles,
       memberCounts,
     ] = await Promise.all([
-      this.loadLastMessages(conversationIds, cutoffs),
+      this.loadLastMessages(conversationIds, retentionWindows),
       this.loadUnreadCounts(
         userId,
         // G-14:未读底数取已读水位与清空水位的更高者,清空过的段落不再计数。
@@ -1028,7 +1037,7 @@ export class ChatService {
             m.conversation.clearedBeforeHeight ?? 0,
           ),
         })),
-        cutoffs,
+        retentionWindows,
       ),
       this.loadDirectPeers(userId, directIds),
       this.loadCircleInfos(circleIds),
@@ -1077,7 +1086,7 @@ export class ChatService {
           ? this.toMessageDto(
               last,
               this.senderFor(last, senders, aliases),
-              m.conversation.burnDurationSec,
+              m.conversation,
             )
           : null,
         unreadCount: unreadCounts.get(m.conversationID) ?? 0,
@@ -1097,6 +1106,7 @@ export class ChatService {
           memberCounts.get(m.conversationID) ?? null,
         ),
         burnDurationSec: m.conversation.burnDurationSec ?? null,
+        burnStartedAt: m.conversation.burnStartedAt?.toISOString() ?? null,
         peerReadHeight: directPeers.readHeights.get(m.conversationID) ?? null,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
@@ -1989,13 +1999,12 @@ export class ChatService {
       member.conversation.clearedBeforeHeight ?? 0,
     );
     const viewerCutoff = await this.selfDestructCutoff(userId);
-    const seconds = member.conversation.burnDurationSec;
-    const cutoff = this.strictestCutoff(
+    const retention = buildChatRetentionWindow(
+      member.conversation,
       viewerCutoff,
-      seconds ? new Date(Date.now() - seconds * 1000) : null,
     );
     const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
-      this.loadLastMessages([conversationId], [cutoff]),
+      this.loadLastMessages([conversationId], [retention]),
       this.loadUnreadCounts(
         userId,
         [
@@ -2004,7 +2013,7 @@ export class ChatService {
             lastReadHeight: Math.max(member.lastReadHeight, floor),
           },
         ],
-        [cutoff],
+        [retention],
       ),
       member.conversation.type === 'DIRECT'
         ? this.loadDirectPeers(userId, [conversationId])
@@ -2026,7 +2035,7 @@ export class ChatService {
       lastMessage = this.toMessageDto(
         last,
         this.senderFor(last, senders),
-        seconds,
+        member.conversation,
       );
       await this.media.attachMediaUrls([lastMessage]);
     }
@@ -2071,6 +2080,7 @@ export class ChatService {
         memberCounts.get(conversationId) ?? null,
       ),
       burnDurationSec: member.conversation.burnDurationSec ?? null,
+      burnStartedAt: member.conversation.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
@@ -2221,10 +2231,7 @@ export class ChatService {
         : await this.selfDestructCutoff(userId);
     // S-01 会话级焚毁:与查看者保留期取更严(更晚的截止时间)。sweeper 每分钟
     // 真删,这里的过滤盖住「已到期、尚未被扫掉」的窗口。
-    const burnCutoff = conversation.burnDurationSec
-      ? new Date(Date.now() - conversation.burnDurationSec * 1000)
-      : null;
-    const cutoff = this.strictestCutoff(viewerCutoff, burnCutoff);
+    const retention = buildChatRetentionWindow(conversation, viewerCutoff);
     const heightCondition: Prisma.IntFilter = {
       ...(heightFloor > 0 ? { gt: heightFloor } : {}),
       ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
@@ -2240,9 +2247,7 @@ export class ChatService {
     // 必须用 AND 追加,不能并进同一层 —— 按日期过滤同样写 createdAt,
     // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
     // 之外的消息,等于给这个设置留了个后门。
-    if (cutoff) {
-      where.AND = [{ createdAt: { gte: cutoff } }];
-    }
+    Object.assign(where, chatRetentionWhere(retention));
     const rows = await this.prisma.chatMessage.findMany({
       where,
       omit: MESSAGE_READ_OMIT,
@@ -2256,11 +2261,7 @@ export class ChatService {
     const senders = await this.resolveSenders(senderIds, conversationId);
     const ascending = ascendingPull ? rows : [...rows].reverse();
     const messages = ascending.map((row) =>
-      this.toMessageDto(
-        row,
-        this.senderFor(row, senders),
-        conversation.burnDurationSec,
-      ),
+      this.toMessageDto(row, this.senderFor(row, senders), conversation),
     );
     // 引用快照必须和这一页用同一把尺子:清空水位之下、销毁窗口之外的原文
     // 不能借引用块绕回来。
@@ -2268,7 +2269,7 @@ export class ChatService {
       heightFloors: new Map([
         [conversationId, member.clearedBeforeHeight ?? 0],
       ]),
-      cutoff,
+      retention,
     });
     await this.attachReactions(messages);
     await this.media.attachMediaUrls(messages);
@@ -2354,23 +2355,26 @@ export class ChatService {
     // 日历同样要按 getHistory 的尺子上色:清空/销毁/焚毁之后那些天点进去是空的,
     // 日历却还标着有记录。
     const floor = member.clearedBeforeHeight ?? 0;
-    const cutoff = this.strictestCutoff(
+    const retention = buildChatRetentionWindow(
+      conversation,
       await this.selfDestructCutoff(userId),
-      conversation.burnDurationSec
-        ? new Date(Date.now() - conversation.burnDurationSec * 1000)
-        : null,
     );
     const lowerBound = new Date(monthStart);
-    const rows = await this.prisma.chatMessage.findMany({
-      where: {
-        conversationID: conversationId,
-        deleted: false,
-        ...(floor > 0 ? { height: { gt: floor } } : {}),
-        createdAt: {
-          gte: cutoff && cutoff > lowerBound ? cutoff : lowerBound,
-          lt: new Date(monthEnd),
-        },
+    const messageWhere: Prisma.ChatMessageWhereInput = {
+      conversationID: conversationId,
+      deleted: false,
+      ...(floor > 0 ? { height: { gt: floor } } : {}),
+      createdAt: {
+        gte: lowerBound,
+        lt: new Date(monthEnd),
       },
+    };
+    const retentionWhere = chatRetentionWhere(retention);
+    if (retentionWhere.AND) {
+      messageWhere.AND = retentionWhere.AND;
+    }
+    const rows = await this.prisma.chatMessage.findMany({
+      where: messageWhere,
       select: { createdAt: true },
       take: 5000,
     });
@@ -2446,33 +2450,39 @@ export class ChatService {
         id: { in: memberships.map((m) => m.conversationID) },
         burnDurationSec: { not: null },
       },
-      select: { id: true, burnDurationSec: true },
+      select: { id: true, burnDurationSec: true, burnStartedAt: true },
     });
-    const burnById = new Map(burning.map((c) => [c.id, c.burnDurationSec]));
+    const burnById = new Map(burning.map((c) => [c.id, c]));
     // 大多数会话既没清空过也没开焚毁 —— 那些合成一个 IN,只有带水位/焚毁的
     // 才各自展开一支,OR 的分支数因此正比于「特殊会话数」而不是会话总数。
     const plain: string[] = [];
     const scoped: Prisma.ChatMessageWhereInput[] = [];
     const heightFloors = new Map<string, number>();
-    const cutoffs = new Map<string, Date | null>();
+    const retentionWindows = new Map<string, ChatRetentionWindow>();
     for (const m of memberships) {
       const floor = Math.max(
         m.clearedBeforeHeight ?? 0,
         m.conversation.clearedBeforeHeight ?? 0,
       );
-      const seconds = burnById.get(m.conversationID) ?? null;
-      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
-      const viewerCutoff = this.strictestCutoff(cutoff, burnCutoff);
+      const policy = burnById.get(m.conversationID) ?? {
+        burnDurationSec: null,
+        burnStartedAt: null,
+      };
+      const retention = buildChatRetentionWindow(policy, cutoff);
       heightFloors.set(m.conversationID, floor);
-      cutoffs.set(m.conversationID, viewerCutoff);
-      if (floor <= 0 && !burnCutoff) {
+      retentionWindows.set(m.conversationID, retention);
+      if (floor <= 0 && !retention.burnCutoff) {
         plain.push(m.conversationID);
         continue;
       }
+      const burnWhere = chatRetentionWhere({
+        ...retention,
+        viewerCutoff: null,
+      });
       scoped.push({
         conversationID: m.conversationID,
         ...(floor > 0 ? { height: { gt: floor } } : {}),
-        ...(burnCutoff ? { createdAt: { gte: burnCutoff } } : {}),
+        ...(burnWhere.AND ? { AND: burnWhere.AND } : {}),
       });
     }
     const scope: Prisma.ChatMessageWhereInput[] = [];
@@ -2505,7 +2515,7 @@ export class ChatService {
     );
     // quote 行的 content.quotedText 是客户端塞的原文快照:搜索之前从不过
     // attachReplyTo,于是被撤回的原文在搜索结果里原样返回。
-    await this.attachReplyTo(messages, { heightFloors, cutoffs });
+    await this.attachReplyTo(messages, { heightFloors, retentionWindows });
     return messages;
   }
 
@@ -2573,25 +2583,34 @@ export class ChatService {
         id: { in: memberships.map((m) => m.conversationID) },
         burnDurationSec: { not: null },
       },
-      select: { id: true, burnDurationSec: true },
+      select: { id: true, burnDurationSec: true, burnStartedAt: true },
     });
-    const burnById = new Map(burning.map((c) => [c.id, c.burnDurationSec]));
+    const burnById = new Map(burning.map((c) => [c.id, c]));
     const viewerCutoff = await this.selfDestructCutoff(userId);
     const ids: string[] = [];
     const floors: number[] = [];
-    const cutoffs: (Date | null)[] = [];
+    const viewerCutoffs: (Date | null)[] = [];
+    const burnStarts: (Date | null)[] = [];
+    const burnCutoffs: (Date | null)[] = [];
     const heightFloors = new Map<string, number>();
+    const retentionWindows = new Map<string, ChatRetentionWindow>();
     for (const m of memberships) {
-      const seconds = burnById.get(m.conversationID) ?? null;
-      const burnCutoff = seconds ? new Date(Date.now() - seconds * 1000) : null;
+      const policy = burnById.get(m.conversationID) ?? {
+        burnDurationSec: null,
+        burnStartedAt: null,
+      };
+      const retention = buildChatRetentionWindow(policy, viewerCutoff);
       const floor = Math.max(
         m.clearedBeforeHeight ?? 0,
         m.conversation.clearedBeforeHeight ?? 0,
       );
       ids.push(m.conversationID);
       floors.push(floor);
-      cutoffs.push(this.strictestCutoff(viewerCutoff, burnCutoff));
+      viewerCutoffs.push(retention.viewerCutoff);
+      burnStarts.push(retention.burnStartedAt);
+      burnCutoffs.push(retention.burnCutoff);
       heightFloors.set(m.conversationID, floor);
+      retentionWindows.set(m.conversationID, retention);
     }
 
     // 多取一条用来判断「还有没有」。
@@ -2616,13 +2635,28 @@ export class ChatService {
                COALESCE(m."deletedAt", to_timestamp(0))
              ) AS "mutatedAt"
       FROM "ChatMessage" AS m
-      JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
-        AS w("conversationID", floor, cutoff)
+      JOIN unnest(
+        ${ids}::text[],
+        ${floors}::int[],
+        ${viewerCutoffs}::timestamptz[],
+        ${burnStarts}::timestamptz[],
+        ${burnCutoffs}::timestamptz[]
+      ) AS w("conversationID", floor, "viewerCutoff", "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
         -- 删除墓碑必须跨过焚毁时间窗返回;否则离线设备无法清掉早于当前
         -- burn cutoff 的本地正文。清空水位仍由 height floor 限制。
-        AND (m."deleted" = true OR w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND (
+          m."deleted" = true
+          OR w."viewerCutoff" IS NULL
+          OR m."createdAt" >= w."viewerCutoff"
+        )
+        AND (
+          m."deleted" = true
+          OR w."burnCutoff" IS NULL
+          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
+          OR m."createdAt" >= w."burnCutoff"
+        )
         AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since} OR m."deletedAt" >= ${since})
         AND (
           GREATEST(
@@ -2661,7 +2695,7 @@ export class ChatService {
         burnById.get(row.conversationID) ?? null,
       ),
     );
-    await this.attachReplyTo(messages, { heightFloors });
+    await this.attachReplyTo(messages, { heightFloors, retentionWindows });
     return { messages, serverTime, ...cursor, resetRequired: false };
   }
 
@@ -2702,12 +2736,6 @@ export class ChatService {
       nextSinceId: landedOnRow ? last.id : '',
       hasMore: truncated,
     };
-  }
-
-  /** 两个「不早于」截止时间取更严的一个(更晚者);都为空则不过滤。 */
-  private strictestCutoff(a: Date | null, b: Date | null): Date | null {
-    if (a && b) return a > b ? a : b;
-    return a ?? b;
   }
 
   /**
@@ -2888,11 +2916,7 @@ export class ChatService {
       conv.clearedBeforeHeight ?? 0,
     );
     const viewerCutoff = await this.selfDestructCutoff(userId);
-    const burnSeconds = conv.burnDurationSec;
-    const cutoff = this.strictestCutoff(
-      viewerCutoff,
-      burnSeconds ? new Date(Date.now() - burnSeconds * 1000) : null,
-    );
+    const retention = buildChatRetentionWindow(conv, viewerCutoff);
     const [unread, lastMessage] = await Promise.all([
       mine
         ? this.loadUnreadCounts(
@@ -2903,18 +2927,13 @@ export class ChatService {
                 lastReadHeight: Math.max(mine.lastReadHeight, clearedFloor),
               },
             ],
-            [cutoff],
+            [retention],
           )
         : Promise.resolve(new Map<string, number>()),
       // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
       // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
-      this.loadLastMessageFor(
-        conv.id,
-        conv.burnDurationSec,
-        clearedFloor,
-        cutoff,
-      ),
+      this.loadLastMessageFor(conv.id, conv, clearedFloor, retention),
     ]);
     return {
       id: conv.id,
@@ -2939,6 +2958,7 @@ export class ChatService {
       silencedUntil: null,
       ...NON_GROUP_FACETS,
       burnDurationSec: conv.burnDurationSec ?? null,
+      burnStartedAt: conv.burnStartedAt?.toISOString() ?? null,
       peerReadHeight:
         conv.members.find((m) => m.userID === peerUserId)?.lastReadHeight ??
         null,
@@ -2968,17 +2988,18 @@ export class ChatService {
   /** 单个会话的末条消息 DTO(带签名后的媒体 URL);无消息时 null。 */
   private async loadLastMessageFor(
     conversationId: string,
-    burnDurationSec: number | null,
+    burnPolicy: ChatBurnPolicyInput,
     heightFloor = 0,
-    cutoff: Date | null = null,
+    retention?: ChatRetentionWindow,
   ): Promise<ChatMessageDto | null> {
+    const where: Prisma.ChatMessageWhereInput = {
+      conversationID: conversationId,
+      deleted: false,
+      ...(heightFloor > 0 ? { height: { gt: heightFloor } } : {}),
+    };
+    if (retention) Object.assign(where, chatRetentionWhere(retention));
     const row = await this.prisma.chatMessage.findFirst({
-      where: {
-        conversationID: conversationId,
-        deleted: false,
-        ...(heightFloor > 0 ? { height: { gt: heightFloor } } : {}),
-        ...(cutoff ? { createdAt: { gte: cutoff } } : {}),
-      },
+      where,
       omit: MESSAGE_READ_OMIT,
       orderBy: { height: 'desc' },
     });
@@ -2990,7 +3011,7 @@ export class ChatService {
     const dto = this.toMessageDto(
       row,
       this.senderFor(row, senders),
-      burnDurationSec,
+      burnPolicy,
     );
     await this.media.attachMediaUrls([dto]);
     return dto;
@@ -3381,9 +3402,12 @@ export class ChatService {
    */
   private async loadLastMessages(
     conversationIds: string[],
-    cutoffs: (Date | null)[],
+    retentionWindows: ChatRetentionWindow[],
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
+    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
+    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
+    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
     // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写。
     const rows = await this.prisma.$queryRaw<MessageRow[]>`
@@ -3392,11 +3416,20 @@ export class ChatService {
         m."clientMessageId", m."replyToID", m."deleted", m."revokedAt", m."revokedBy",
         m."editedAt", m."deletedAt", m."createdAt"
       FROM "ChatMessage" AS m
-      JOIN unnest(${conversationIds}::text[], ${cutoffs}::timestamptz[])
-        AS w("conversationID", cutoff)
+      JOIN unnest(
+        ${conversationIds}::text[],
+        ${viewerCutoffs}::timestamptz[],
+        ${burnStarts}::timestamptz[],
+        ${burnCutoffs}::timestamptz[]
+      ) AS w("conversationID", "viewerCutoff", "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
-        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND (w."viewerCutoff" IS NULL OR m."createdAt" >= w."viewerCutoff")
+        AND (
+          w."burnCutoff" IS NULL
+          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
+          OR m."createdAt" >= w."burnCutoff"
+        )
       ORDER BY m."conversationID", m."height" DESC
     `;
     const map = new Map<string, MessageRow>();
@@ -3411,7 +3444,7 @@ export class ChatService {
   private async loadUnreadCounts(
     userId: string,
     memberships: Array<{ conversationID: string; lastReadHeight: number }>,
-    cutoffs: (Date | null)[],
+    retentionWindows: ChatRetentionWindow[],
   ): Promise<Map<string, number>> {
     const map = new Map<string, number>(
       memberships.map((m) => [m.conversationID, 0]),
@@ -3419,17 +3452,30 @@ export class ChatService {
     if (memberships.length === 0) return map;
     const ids = memberships.map((m) => m.conversationID);
     const floors = memberships.map((m) => m.lastReadHeight);
+    const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
+    const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
+    const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     const rows = await this.prisma.$queryRaw<
       Array<{ conversationID: string; count: bigint }>
     >`
       SELECT m."conversationID", COUNT(*)::bigint AS count
       FROM "ChatMessage" AS m
-      JOIN unnest(${ids}::text[], ${floors}::int[], ${cutoffs}::timestamptz[])
-        AS w("conversationID", floor, cutoff)
+      JOIN unnest(
+        ${ids}::text[],
+        ${floors}::int[],
+        ${viewerCutoffs}::timestamptz[],
+        ${burnStarts}::timestamptz[],
+        ${burnCutoffs}::timestamptz[]
+      ) AS w("conversationID", floor, "viewerCutoff", "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
         AND m."height" > w.floor
-        AND (w.cutoff IS NULL OR m."createdAt" >= w.cutoff)
+        AND (w."viewerCutoff" IS NULL OR m."createdAt" >= w."viewerCutoff")
+        AND (
+          w."burnCutoff" IS NULL
+          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
+          OR m."createdAt" >= w."burnCutoff"
+        )
         -- 自己发的消息不计未读。
         AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
       GROUP BY m."conversationID"
@@ -3576,7 +3622,7 @@ export class ChatService {
   }
 
   /**
-   * burnDurationSec 是**必填**参数,不是可选的。
+   * burnPolicy 是**必填**参数,不是可选的。
    *
    * 客户端拿它决定这条消息要不要按阅后即焚渲染(不落盘缓存、禁长按保存)。漏传
    * 一处就等于告诉客户端「这条不焚毁」—— 而那正是要修的 bug 本身,且失败方向
@@ -3586,8 +3632,16 @@ export class ChatService {
   private toMessageDto(
     row: MessageRow,
     sender: ChatSenderInfo | null,
-    burnDurationSec: number | null,
+    burnPolicy: ChatBurnPolicy | number | null,
   ): ChatMessageDto {
+    const normalizedPolicy: ChatBurnPolicy =
+      typeof burnPolicy === 'number'
+        ? { burnDurationSec: burnPolicy }
+        : (burnPolicy ?? { burnDurationSec: null });
+    const burnDurationSec = effectiveBurnDurationForMessage(
+      normalizedPolicy,
+      row.createdAt,
+    );
     return {
       id: row.id,
       conversationId: row.conversationID,
@@ -3622,8 +3676,8 @@ export class ChatService {
     messages: ChatMessageDto[],
     visibility: {
       heightFloors?: Map<string, number>;
-      cutoffs?: Map<string, Date | null>;
-      cutoff?: Date | null;
+      retentionWindows?: Map<string, ChatRetentionWindow>;
+      retention?: ChatRetentionWindow;
     } = {},
   ): Promise<void> {
     const ids = [
@@ -3646,15 +3700,16 @@ export class ChatService {
     for (const message of messages) {
       if (!message.replyToId) continue;
       const row = byId.get(message.replyToId);
-      const cutoff =
-        visibility.cutoffs?.get(message.conversationId) ?? visibility.cutoff;
+      const retention =
+        visibility.retentionWindows?.get(message.conversationId) ??
+        visibility.retention;
       const visible =
         !!row &&
         !row.deleted &&
         row.conversationID === message.conversationId &&
         row.height >
           (visibility.heightFloors?.get(message.conversationId) ?? 0) &&
-        (!cutoff || row.createdAt >= cutoff);
+        (!retention || isChatMessageVisible(row.createdAt, retention));
       if (!visible || row.revokedAt !== null) {
         this.stripQuotedText(message);
       }
@@ -3705,11 +3760,7 @@ export class ChatService {
         row.senderID ? [row.senderID] : [],
         conversationId,
       );
-      return this.toMessageDto(
-        row,
-        this.senderFor(row, senders),
-        conversation.burnDurationSec,
-      );
+      return this.toMessageDto(row, this.senderFor(row, senders), conversation);
     }
     if (row.senderID === null) {
       // 系统消息(进退群提示、burn-changed 留痕)没有作者,下面那条
@@ -3770,7 +3821,7 @@ export class ChatService {
       return this.toMessageDto(
         updated,
         this.senderFor(updated, senders),
-        conversation.burnDurationSec,
+        conversation,
       );
     }
     if (mediaKeys.length > 0) {
@@ -3792,7 +3843,7 @@ export class ChatService {
     return this.toMessageDto(
       updated,
       this.senderFor(updated, senders),
-      conversation.burnDurationSec,
+      conversation,
     );
   }
 
@@ -4042,17 +4093,14 @@ export class ChatService {
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
     // 重试只会再往 contentHistory 里压一层。
-    const dto = await this.decorateCommittedMessage(
-      updated,
-      conversation.burnDurationSec,
-    );
+    const dto = await this.decorateCommittedMessage(updated, conversation);
     return dto;
   }
 
   /** 写已提交之后的装饰(昵称/引用快照):任何失败都降级,绝不抛。 */
   private async decorateCommittedMessage(
     row: MessageRow,
-    burnDurationSec: number | null,
+    burnPolicy: ChatBurnPolicy,
   ): Promise<ChatMessageDto> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -4068,7 +4116,7 @@ export class ChatService {
         }`,
       );
     }
-    const dto = this.toMessageDto(row, sender, burnDurationSec);
+    const dto = this.toMessageDto(row, sender, burnPolicy);
     try {
       await this.attachReplyTo([dto]);
     } catch (error) {
@@ -4188,12 +4236,18 @@ export class ChatService {
   async getBurnPolicy(
     userId: string,
     conversationId: string,
-  ): Promise<{ burnDurationSec: number | null }> {
+  ): Promise<{
+    burnDurationSec: number | null;
+    burnStartedAt: string | null;
+  }> {
     const { conversation } = await this.requireMembershipSeat(
       conversationId,
       userId,
     );
-    return { burnDurationSec: conversation.burnDurationSec ?? null };
+    return {
+      burnDurationSec: conversation.burnDurationSec ?? null,
+      burnStartedAt: conversation.burnStartedAt?.toISOString() ?? null,
+    };
   }
 
   /**
@@ -4204,7 +4258,10 @@ export class ChatService {
     userId: string,
     conversationId: string,
     seconds: number | null,
-  ): Promise<{ burnDurationSec: number | null }> {
+  ): Promise<{
+    burnDurationSec: number | null;
+    burnStartedAt: string | null;
+  }> {
     const { conversation, member } = await this.requireMembershipSeat(
       conversationId,
       userId,
@@ -4236,6 +4293,9 @@ export class ChatService {
       seconds !== null && Number.isInteger(seconds) && seconds > 0
         ? seconds
         : null;
+    const nextStartedAt = normalized
+      ? (conversation.burnStartedAt ?? new Date())
+      : null;
     // 放宽/关闭之前,先把旧策略下**已经到期**的消息落成真删。
     // 读路径的过滤是按「当前 burnDurationSec」算的,一旦放宽,那些已经过期、
     // 只是还没轮到 sweeper 的消息会连同签名的媒体 URL 一起重新可读 ——
@@ -4243,6 +4303,7 @@ export class ChatService {
     await this.tombstoneExpiredBeforeRelax(
       conversationId,
       conversation.burnDurationSec,
+      conversation.burnStartedAt,
       normalized,
     );
     // 微信/Signal 式留痕:开关变化必须双方可见,防「对方偷偷开了焚毁」。
@@ -4253,12 +4314,19 @@ export class ChatService {
     const { updated, notice } = await this.prisma.$transaction(async (tx) => {
       const row = await tx.chatConversation.update({
         where: { id: conversationId },
-        data: { burnDurationSec: normalized },
+        data: {
+          burnDurationSec: normalized,
+          burnStartedAt: nextStartedAt,
+        },
       });
       const dto = await this.systemMessage.insertSystemMessageInTx(
         tx,
         conversationId,
-        { kind: 'burn-changed', seconds: normalized ?? 0 },
+        {
+          kind: 'burn-changed',
+          seconds: normalized ?? 0,
+          burnStartedAt: nextStartedAt?.toISOString() ?? null,
+        },
       );
       return { updated: row, notice: dto };
     });
@@ -4270,7 +4338,10 @@ export class ChatService {
         `burn audit realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
       );
     }
-    return { burnDurationSec: updated.burnDurationSec ?? null };
+    return {
+      burnDurationSec: updated.burnDurationSec ?? null,
+      burnStartedAt: updated.burnStartedAt?.toISOString() ?? null,
+    };
   }
 
   /**
@@ -4281,6 +4352,7 @@ export class ChatService {
   private async tombstoneExpiredBeforeRelax(
     conversationId: string,
     previousSeconds: number | null,
+    previousStartedAt: Date | null,
     nextSeconds: number | null,
   ): Promise<void> {
     if (!previousSeconds || previousSeconds <= 0) return;
@@ -4294,7 +4366,10 @@ export class ChatService {
         where: {
           conversationID: conversationId,
           deleted: false,
-          createdAt: { lt: cutoff },
+          createdAt: {
+            ...(previousStartedAt ? { gte: previousStartedAt } : {}),
+            lt: cutoff,
+          },
         },
         select: { id: true, type: true, content: true },
         take: RELAX_PURGE_BATCH,

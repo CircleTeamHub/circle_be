@@ -28,7 +28,8 @@ type RevocablePayload = {
 
 /**
  * - `revoked`: a session or user marker kills this token;
- * - `active`: Redis answered and holds no marker for it;
+ * - `active`: Redis answered and holds no marker for it; callers must still
+ *   consult durable state because Redis may have lost its keys;
  * - `unknown`: Redis is disabled or could not answer.
  */
 export type RevocationState = 'revoked' | 'active' | 'unknown';
@@ -143,8 +144,8 @@ export class SessionRevocationService {
 
   /**
    * Tri-state revocation check for one access token (see RevocationState).
-   * `unknown` leaves the decision to the caller: SessionVerifier consults the
-   * database instead of letting the token through.
+   * Both `active` and `unknown` leave the allow decision to SessionVerifier's
+   * database check. Only `revoked` is authoritative by itself.
    */
   async checkRevocation(payload: RevocablePayload): Promise<RevocationState> {
     if (!this.redis.isEnabled()) return 'unknown';

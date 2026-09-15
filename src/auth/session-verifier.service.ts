@@ -43,10 +43,11 @@ function issuedAtMs(token: VerifiableToken): number | null {
  * The single answer to "may this access token still be used?", shared by
  * JwtStrategy and the WebSocket gateways so no entry point quietly fails open.
  *
- * Redis revocation markers are authoritative and cost no query. Redis is
- * optional in production (`.env.production.example` ships
- * REDIS_REQUIRED=false), so when it is disabled or cannot answer, the database
- * decides: the account must be ACTIVE and the session row must not be revoked.
+ * Redis revocation markers are an authoritative early deny, but their absence
+ * is not an authoritative allow: a restart, eviction, or flush is
+ * indistinguishable from "never revoked". PostgreSQL therefore decides every
+ * non-revoked Redis result. The account must be ACTIVE and the session row must
+ * not be revoked.
  *
  * - ROTATED is not a revocation: refresh rotation retires the row id while the
  *   session lives on under a new sid, and the Redis path writes no marker for
@@ -71,7 +72,7 @@ export class SessionVerifier {
 
   async verify(token: VerifiableToken): Promise<SessionVerdict> {
     const state = await this.revocation.checkRevocation(token);
-    if (state !== 'unknown') return state;
+    if (state === 'revoked') return 'revoked';
     return this.verifyInDatabase(token);
   }
 
