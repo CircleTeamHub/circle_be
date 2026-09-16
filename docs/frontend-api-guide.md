@@ -28,7 +28,7 @@
 
 ### Token 说明
 
-登录/注册成功后会返回三个 token：
+登录/注册成功后会返回两个 token：
 
 | Token | 用途 | 有效期 |
 |---|---|---|
@@ -54,11 +54,31 @@ Authorization: Bearer <accessToken>
 
 ---
 
-nickname": "Test User",       // 可选，1-30位，默认同username
-  "email": "user@example.com",   // 可选
-  "phoneNumber": "+8613800138000" // 可选
+## Auth 接口
+
+### 注册
+
+```
+POST /auth/register
+```
+
+**Request Headers（可选）：**
+```
+x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
+```
+
+**Request Body：**
+```json
+{
+  "email": "user@example.com",        // 必填，登录邮箱
+  "password": "password123",          // 必填，6-64 位
+  "confirmPassword": "password123",   // 必填，与 password 一致
+  "nickname": "Test User",            // 必填，1-50 位，首尾空格会被去掉
+  "inviteCode": "ABC123"              // 可选，邀请人的账号 ID
 }
 ```
+
+> 请求体只接受以上字段。全局校验开着 forbidNonWhitelisted，多送任何字段都会 400。
 
 **Response 201：**
 ```json
@@ -199,25 +219,7 @@ Authorization: Bearer <accessToken>
 ```
 
 **Response 200：** `{}`
-## Auth 接口
 
-### 注册
-
-```
-POST /auth/register
-```
-
-**Request Headers（可选）：**
-```
-x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
-```
-
-**Request Body：**
-```json
-{
-  "username": "testuser",        // 必填，4-20位
-  "password": "password123",     // 必填，6-64位
-  "
 ---
 
 ## User 接口
@@ -228,7 +230,6 @@ x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
 {
   "id": "3f2a1b4c-8d9e-4f5a-b6c7-d8e9f0a1b2c3",
   "accountId": "ab12cd",
-  "username": "testuser",
   "nickname": "Test User",
   "avatarUrl": "http://localhost:9000/circle/avatars/xxx.jpg",
   "avatarFrame": null,
