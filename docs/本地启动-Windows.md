@@ -1,6 +1,6 @@
 # 本地启动指南（Windows）
 
-适用于 Windows 11 + PowerShell。本项目是 NestJS 11 + Prisma 7 + PostgreSQL 16，使用 pnpm 管理依赖。
+适用于 Windows 11 + PowerShell。本项目是 NestJS 11 + Prisma 7 + PostgreSQL 16，使用 npm 管理依赖（仓库只提交 `package-lock.json`，CI 全部走 `npm ci`）。
 
 > 官方 README 的命令是 macOS/Linux 写法，部分在 Windows PowerShell 下不能直接用（设置环境变量的语法不同，且 `build` / `start:dev` 脚本依赖 `ln -sfn`、`mkdir -p` 等 Unix 命令）。本文给出 Windows 下可直接执行的版本。
 
@@ -9,18 +9,19 @@
 | 工具 | 版本 | 验证命令 |
 |------|------|----------|
 | Node.js | 20+（推荐 LTS） | `node --version` |
-| pnpm | 10+ | `pnpm --version` |
+| npm | 10+（随 Node 20 一起装） | `npm --version` |
 | Docker Desktop | 已启动 | `docker --version` |
 
-> 没装 pnpm：`npm install -g pnpm`
 
 ## 一、安装依赖
 
 ```powershell
-pnpm install
+npm ci
 ```
 
 > `postinstall` 会自动执行 `prisma generate` 生成 Prisma Client。
+>
+> 用 `npm ci` 而不是 `npm install`：前者严格按 `package-lock.json` 还原，装出来和 CI 一致。
 
 ## 二、准备环境变量（README 未提，必做）
 
@@ -65,13 +66,13 @@ docker compose ps
 PowerShell 设置环境变量的写法与 README（`NODE_ENV=development ...`）不同：
 
 ```powershell
-$env:NODE_ENV="development"; pnpm exec prisma db push
+$env:NODE_ENV="development"; npx prisma db push
 ```
 
 ## 五、启动项目
 
 ```powershell
-pnpm start
+npm start
 ```
 
 启动后默认地址：
@@ -79,14 +80,14 @@ pnpm start
 - API：http://localhost:3000
 - Swagger 文档：http://localhost:3000/docs
 
-> **不要用 `pnpm start:dev` / `pnpm build`**（除非在 Git Bash / WSL 里）。它们的 `prestart:dev`、`postbuild` 脚本用了 `ln -sfn`、`mkdir -p`，在原生 PowerShell / cmd 下会失败。`pnpm start` 走 `ts-node`，不受影响。
+> **不要用 `npm run start:dev` / `npm run build`**（除非在 Git Bash / WSL 里）。它们的 `prestart:dev`、`postbuild` 脚本用了 `ln -sfn`、`mkdir -p`，在原生 PowerShell / cmd 下会失败。`npm start` 走 `ts-node`，不受影响。
 >
-> 如果确实需要热重载，请在 **Git Bash** 或 **WSL** 终端里运行 `pnpm start:dev`。
+> 如果确实需要热重载，请在 **Git Bash** 或 **WSL** 终端里运行 `npm run start:dev`。
 
 ## 查看数据库（Prisma Studio）
 
 ```powershell
-$env:NODE_ENV="development"; pnpm run prisma:studio
+$env:NODE_ENV="development"; npm run prisma:studio
 ```
 
 打开：http://localhost:5555
@@ -97,16 +98,16 @@ $env:NODE_ENV="development"; pnpm run prisma:studio
 |------|-------------|
 | 启动报 `DATABASE_URL` / `SECRET` 缺失 | 没创建 `.env.development`，见「二」 |
 | 连接数据库失败 | Docker 容器没起来或没健康，`docker compose ps` 检查；端口 5432 被占用则改 compose 映射 |
-| `start:dev` / `build` 报 `ln` / `mkdir` 不是命令 | 用了 Unix 脚本，改用 `pnpm start`，或切到 Git Bash / WSL |
-| 改了 `prisma/schema.prisma` 后类型不对 | 重新生成：`pnpm exec prisma generate` |
+| `start:dev` / `build` 报 `ln` / `mkdir` 不是命令 | 用了 Unix 脚本，改用 `npm start`，或切到 Git Bash / WSL |
+| 改了 `prisma/schema.prisma` 后类型不对 | 重新生成：`npx prisma generate` |
 
 ## 快捷命令速查（PowerShell）
 
 ```powershell
-pnpm install                                                  # 装依赖
+npm ci                                                        # 装依赖
 docker compose up -d postgres                                 # 起数据库
-$env:NODE_ENV="development"; pnpm exec prisma db push         # 同步表结构
-pnpm start                                                    # 启动服务
-$env:NODE_ENV="development"; pnpm run prisma:studio           # 数据库可视化
+$env:NODE_ENV="development"; npx prisma db push         # 同步表结构
+npm start                                                     # 启动服务
+$env:NODE_ENV="development"; npm run prisma:studio           # 数据库可视化
 docker compose down                                           # 停掉容器（加 -v 连数据一起删）
 ```
