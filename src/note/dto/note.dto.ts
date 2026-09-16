@@ -73,9 +73,15 @@ export class CreateNoteMediaDto {
   })
   objectKey: string;
 
-  @ApiProperty()
+  /**
+   * 对象直链。presign 对私有目录(notes/)不再返回 fileUrl,客户端只拿得到 objectKey,
+   * 所以这里可省：缺省时服务端按 objectKey 拼出持久 base url 落库(NoteMedia.url 是
+   * 非空列),读取本来就按 objectKey 现签短时 GET。传了就仍按本站存储地址校验。
+   */
+  @ApiPropertyOptional()
+  @IsOptional()
   @IsUrl({ require_tld: false })
-  url: string;
+  url?: string;
 
   @ApiPropertyOptional()
   @IsOptional()

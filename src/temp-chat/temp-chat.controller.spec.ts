@@ -58,6 +58,20 @@ describe('TempChatController guest media uploads', () => {
       'guest-1',
     );
   });
+
+  // 访客也只发 chat 目录 —— 私有,fileUrl 是 null。访客页(temp-chat-web)只存 key,
+  // 文档得照实说,免得下一个接入方照着老契约把 fileUrl 当必填直链存进消息体。
+  it('documents that the guest grant carries no direct link', () => {
+    const operation = Reflect.getMetadata(
+      'swagger/apiOperation',
+      TempChatController.prototype.guestUploadPresign,
+    ) as { description?: string } | undefined;
+    const description = operation?.description ?? '';
+
+    expect(description).toContain('chat');
+    expect(description).toContain('null');
+    expect(description).toContain('key');
+  });
 });
 
 describe('TempChatController guest history', () => {
