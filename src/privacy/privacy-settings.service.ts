@@ -50,6 +50,12 @@ const DEFAULT_PRIVACY_SETTINGS: PrivacySettingsDto = {
   shareTypingInGroup: true,
 };
 
+/** 查看者侧消息可见性过滤所需的最小设置集。 */
+export interface SelfDestructPolicy {
+  sec: number;
+  startedAt: Date | null;
+}
+
 type StoredPrivacySettings = PrivacySettingsDto & {
   id?: string;
   userID?: string;
@@ -96,6 +102,27 @@ export class PrivacySettingsService {
     // read would let any viewer trigger a write to the target's row (write
     // amplification). The row is created lazily on the first updateSettings().
     return { ...DEFAULT_PRIVACY_SETTINGS };
+  }
+
+  /**
+   * 全局阅后即焚的窗口与开启边界 —— 只给需要做消息可见性过滤的调用方。
+   *
+   * 不走 getSettings:开启时间是服务端自己维护的内部状态,客户端既改不了也
+   * 不需要看见,没有理由挂到公开的隐私设置响应上。
+   */
+  async getSelfDestructPolicy(
+    userId: string,
+    client: Pick<Prisma.TransactionClient, 'userPrivacySetting'> = this.prisma,
+  ): Promise<SelfDestructPolicy> {
+    const row = await client.userPrivacySetting.findUnique({
+      where: { userID: userId },
+    });
+    return {
+      sec:
+        row?.messageSelfDestructSec ??
+        DEFAULT_PRIVACY_SETTINGS.messageSelfDestructSec,
+      startedAt: row?.messageSelfDestructStartedAt ?? null,
+    };
   }
 
   /**
@@ -153,10 +180,20 @@ export class PrivacySettingsService {
         presenceWasVisible = (await this.getSettings(userId, tx))
           .shareOnlineStatus;
       }
+      const finalUpdate = await this.withSelfDestructBoundary(
+        update,
+        input,
+        userId,
+        tx,
+      );
       return tx.userPrivacySetting.upsert({
         where: { userID: userId },
-        create: { userID: userId, ...DEFAULT_PRIVACY_SETTINGS, ...update },
-        update,
+        create: {
+          userID: userId,
+          ...DEFAULT_PRIVACY_SETTINGS,
+          ...finalUpdate,
+        },
+        update: finalUpdate,
       });
     });
     const updated = this.toDto(saved as StoredPrivacySettings);
@@ -475,6 +512,33 @@ export class PrivacySettingsService {
         message: 'Direct-message auto reply text is required when enabled',
       });
     }
+  }
+
+  /**
+   * 给写入补上全局阅后即焚的开启边界。
+   *
+   * 这个窗口是查看者侧的读过滤:只有下沿而没有开启时间的话,用户打开开关的那
+   * 一刻,此前的全部历史就一次性翻不到了。语义与会话级 burnStartedAt 一致 ——
+   * 开启时落一个边界(已有则沿用,改档位不算重新开启),关闭时清掉,免得下次
+   * 开启沿用一个早已过时的时间点。
+   *
+   * 返回新对象:调用方传进来的 update 不被改写。
+   */
+  private async withSelfDestructBoundary(
+    update: Record<string, unknown>,
+    input: UpdatePrivacySettingsDto,
+    userId: string,
+    tx: Pick<Prisma.TransactionClient, 'userPrivacySetting'>,
+  ): Promise<Record<string, unknown>> {
+    if (input.messageSelfDestructSec === undefined) return update;
+    if (!input.messageSelfDestructSec) {
+      return { ...update, messageSelfDestructStartedAt: null };
+    }
+    const current = await this.getSelfDestructPolicy(userId, tx);
+    return {
+      ...update,
+      messageSelfDestructStartedAt: current.startedAt ?? new Date(),
+    };
   }
 
   private toDto(settings: StoredPrivacySettings): PrivacySettingsDto {
