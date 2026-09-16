@@ -2118,14 +2118,17 @@ model ChatConversation {
   /// 也按 max(座位水位, 会话水位) 兜底。
   /// 只前进不后退，与座位水位同义。
   clearedBeforeHeight Int @default(0)
-  /// 会话变更序号流的计数器：最后已分配的 revision。
+  /// 会话变更序号流的计数器：触发器最后一次分配的 revision。
   ///
   /// 新消息、撤回、编辑、表情回应、焚毁墓碑都在这里取号，由数据库触发器
   /// `chat_message_assign_revision` / `chat_message_reaction_bump_revision`
   /// 在同一事务里分配（迁移 20260916000000_add_chat_revision_stream）。
   /// 行锁持有到提交，所以任何读者都看不到「小号未提交、大号已可见」——
   /// 客户端只凭一个 afterRevision 游标就能追平所有变更，不再需要按时间戳扫的增量通道。
-  /// 应用代码不要手写这一列。
+  ///
+  /// 会话的序号水位是 max(nextRevision, nextHeight)，不是这一列本身：存量消息回填成
+  /// revision = height，计数器没有整表初始化（取号用的也是 GREATEST）。读侧一律走
+  /// ChatService 的 conversationSyncRevision。应用代码不要手写这一列。
   nextRevision Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
@@ -2249,6 +2252,12 @@ model ChatMessage {
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
+  /// 旧重连追平（GET /chat/messages/mutations）按变更时刻扫的三条索引。接口已被
+  /// 增量同步取代，但蓝绿发布的回滚目标（旧二进制）还在用它们：按 expand/contract
+  /// 留到下一个版本再删。
+  @@index([conversationID, revokedAt])
+  @@index([conversationID, editedAt])
+  @@index([conversationID, deletedAt])
   /// 增量同步（GET /chat/conversations/:id/sync）按序号区间扫。
   @@index([conversationID, revision])
 }

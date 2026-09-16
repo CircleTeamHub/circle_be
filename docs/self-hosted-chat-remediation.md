@@ -830,5 +830,8 @@ DATABASE_STATEMENT_TIMEOUT_MS 默认 15s，超时的写会被 Postgres 掐掉，
   (含完整回应列表)重新下发 —— 原通道的 DTO 不带回应,编辑补同步会冲掉本地回应。
 - 清空聊天记录到不了离线设备:会话 DTO 与同步响应都带 `clearedBeforeHeight`。
 
-对应的三条索引 `[conversationID, revokedAt|editedAt|deletedAt]` 在同一迁移里删除。
+对应的三条索引 `[conversationID, revokedAt|editedAt|deletedAt]` 按 expand/contract
+留到下一个版本删除:蓝绿发布的回滚目标(旧二进制)在迁移之后仍会服务
+`GET /chat/messages/mutations`。删除时 `DROP INDEX CONCURRENTLY` 每条单独一个迁移文件
+(见 `docs/migration-baseline.md`)。
 

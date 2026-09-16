@@ -13,25 +13,32 @@
 -- 撤回、编辑、焚毁清扫、放宽焚毁，加上 30 多处系统/服务端消息的调用方，漏掉任何
 -- 一处都是一类变更永远同步不到；蓝绿发布窗口里旧版本实例的写入也一样被覆盖。
 
-ALTER TABLE "ChatConversation" ADD COLUMN "nextRevision" INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE "ChatMessage" ADD COLUMN "revision" INTEGER NOT NULL DEFAULT 0;
+-- 发布方式（蓝绿，旧色在迁移期间照常服务）：拆成三个迁移。
+-- prisma migrate deploy 对含 $$ 的迁移文件整份放进一个隐式事务执行（实测：同文件里的
+-- CREATE INDEX CONCURRENTLY 报 cannot run inside a transaction block、DO 块里 COMMIT 报
+-- invalid transaction termination，出错时前面的语句一起回滚）；不含 $$ 的文件逐条语句
+-- 自动提交。所以本文件只放瞬时 DDL（加列、函数、触发器，持锁到文件结束也只有毫秒级），
+-- 存量回填与建索引放到后面两个不含 $$ 的迁移里分批做：
+--   20260916000100_backfill_chat_message_revision  分批回填，每批独立提交
+--   20260916000200_add_chat_message_revision_index CREATE INDEX CONCURRENTLY
+-- 原来一个文件里加列 + 全表 UPDATE + 普通建索引，整段持有 ChatMessage/ChatConversation
+-- 的排他锁，迁移多久聊天就停多久（连读都停）。
+--
+-- 触发器先于回填生效：取号用 GREATEST(nextRevision, nextHeight) + 1。存量消息回填成
+-- revision = height，而 height 从不超过会话的 nextHeight —— 新分配的号永远大于任何
+-- 存量号，回填跑完之前、之中、之后的写入都不会撞号，也不必为了初始化计数器整表
+-- 更新会话行（那会在更新期间挡住所有会话的发消息）。读侧的水位同样取
+-- max(nextRevision, nextHeight)，见 conversationSyncRevision。
+--
+-- 旧增量通道的三条索引（revokedAt/editedAt/deletedAt）这一版不删：回滚目标（旧二进制）
+-- 还在用 GET /chat/messages/mutations。按 expand/contract 留到后续版本删除。
+--
+-- 触发器对旧二进制兼容：旧代码从不改 id/conversationID/height，也不恢复撤回或焚毁
+-- （revokedAt: null / deleted: false 只出现在 where 条件里），下面的不变量检查不会
+-- 让旧色的写入报错；旧色写入的消息同样由触发器取号。
 
--- 存量：每条消息的当前状态就是它的最新版本，序号沿用 height（同会话内唯一、递增）。
--- 已撤回/已编辑/已焚毁的历史行也一样 —— 同步返回的是当前状态，不是变更日志。
-UPDATE "ChatMessage" SET "revision" = "height";
-UPDATE "ChatConversation" c
-SET "nextRevision" = GREATEST(
-  c."nextHeight",
-  COALESCE((SELECT MAX(m."revision") FROM "ChatMessage" m WHERE m."conversationID" = c."id"), 0)
-);
-
-CREATE INDEX "ChatMessage_conversationID_revision_idx"
-ON "ChatMessage"("conversationID", "revision");
-
--- 旧增量通道专用的三条索引随通道一起退役（列保留：deletedAt 仍是焚毁时刻的留痕）。
-DROP INDEX IF EXISTS "ChatMessage_conversationID_revokedAt_idx";
-DROP INDEX IF EXISTS "ChatMessage_conversationID_editedAt_idx";
-DROP INDEX IF EXISTS "ChatMessage_conversationID_deletedAt_idx";
+ALTER TABLE "ChatConversation" ADD COLUMN IF NOT EXISTS "nextRevision" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "ChatMessage" ADD COLUMN IF NOT EXISTS "revision" INTEGER NOT NULL DEFAULT 0;
 
 CREATE OR REPLACE FUNCTION chat_message_assign_revision()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -62,8 +69,12 @@ BEGIN
     END IF;
   END IF;
 
+  -- GREATEST 带上 nextHeight：存量消息回填成 revision = height，会话计数器没有整表
+  -- 初始化，从没变过的会话 nextRevision 还是 0。自动回复/系统消息是先插消息、后推
+  -- nextHeight，插入这一刻 nextHeight 可能比新行的 height 小 1 —— 分到的号仍然大于
+  -- 所有已提交消息的 height 与 revision，不会撞号。
   UPDATE "ChatConversation"
-  SET "nextRevision" = "nextRevision" + 1
+  SET "nextRevision" = GREATEST("nextRevision", "nextHeight") + 1
   WHERE "id" = NEW."conversationID"
   RETURNING "nextRevision" INTO allocated;
   IF allocated IS NULL THEN
@@ -96,7 +107,7 @@ BEGIN
     RETURN NULL;
   END IF;
   UPDATE "ChatConversation"
-  SET "nextRevision" = "nextRevision" + 1
+  SET "nextRevision" = GREATEST("nextRevision", "nextHeight") + 1
   WHERE "id" = target_conversation
   RETURNING "nextRevision" INTO allocated;
   UPDATE "ChatMessage" SET "revision" = allocated WHERE "id" = target_message;
@@ -108,3 +119,30 @@ DROP TRIGGER IF EXISTS chat_message_reaction_bump_revision ON "ChatMessageReacti
 CREATE TRIGGER chat_message_reaction_bump_revision
 AFTER INSERT OR DELETE ON "ChatMessageReaction"
 FOR EACH ROW EXECUTE FUNCTION chat_message_reaction_bump_revision();
+
+-- 存量回填用的过程：按主键分批，每批独立提交（下一个迁移 CALL 完即删）。
+-- 只填 revision = 0 的行：触发器生效之后被撤回/编辑/加了回应的存量消息已经分到了
+-- 新号，不能被回填盖回 height。
+CREATE OR REPLACE PROCEDURE chat_message_backfill_revision(batch_size integer)
+LANGUAGE plpgsql AS $$
+DECLARE
+  last_id text := '';
+  batch_last text;
+BEGIN
+  LOOP
+    SELECT max(b."id") INTO batch_last
+    FROM (
+      SELECT "id" FROM "ChatMessage"
+      WHERE "id" > last_id
+      ORDER BY "id"
+      LIMIT batch_size
+    ) b;
+    EXIT WHEN batch_last IS NULL;
+    UPDATE "ChatMessage"
+    SET "revision" = "height"
+    WHERE "id" > last_id AND "id" <= batch_last AND "revision" = 0;
+    last_id := batch_last;
+    COMMIT;
+  END LOOP;
+END;
+$$;

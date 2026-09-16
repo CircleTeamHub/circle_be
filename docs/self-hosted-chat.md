@@ -78,9 +78,19 @@ REST 与 socket ack 共用;敏感词命中 = `CHAT_SENSITIVE_WORD_BLOCKED`
 
 - **取号**:迁移 `20260916000000_add_chat_revision_stream` 的两个触发器。
   `ChatMessage` 的 INSERT 与客户端可见列(content/deleted/revokedAt/editedAt)变化时
-  从 `ChatConversation.nextRevision` 取号;`ChatMessageReaction` 增删时给所属消息取号。
-  应用代码不写 `revision`/`nextRevision`。计数器更新拿会话行锁到提交:读到计数器 = N,
-  <= N 的变更一定都已可见 —— 旧时间戳通道那种「早时间戳、晚提交」被游标越过的行不再存在。
+  取 `GREATEST(nextRevision, nextHeight) + 1` 写回 `ChatConversation.nextRevision`;
+  `ChatMessageReaction` 增删时给所属消息同样取号。应用代码不写 `revision`/`nextRevision`。
+  计数器更新拿会话行锁到提交:读到水位 = N,<= N 的变更一定都已可见 —— 旧时间戳通道
+  那种「早时间戳、晚提交」被游标越过的行不再存在。
+- **水位**:会话的序号水位是 `max(nextRevision, nextHeight)`(`conversationSyncRevision`),
+  同步接口的 `throughRevision` 与会话 DTO 的 `syncRevision` 都用它。存量消息回填成
+  `revision = height`,计数器没有整表初始化 —— 从没变过的会话 `nextRevision` 还是 0。
+- **发布**:拆成三个迁移,蓝绿窗口旧色照常写入。`…000000` 加列 + 触发器 + 回填过程
+  (瞬时 DDL,一个事务);`…000100` 分批回填,每 5000 行提交一次;`…000200`
+  `CREATE INDEX CONCURRENTLY`。本地 150 万条消息实测:迁移约 16 秒,期间模拟旧色发消息/
+  撤回/加回应 1.6 万次 0 报错、最慢一条 42ms,迁移后无漏填、无重号。为什么这样拆见
+  `docs/migration-baseline.md`「迁移文件是不是一个事务」。旧 mutations 通道的三条索引
+  (revokedAt/editedAt/deletedAt)这一版保留:回滚目标(旧二进制)还在用,下一个版本删。
 - **锁顺序**:任何改消息行的事务必须**先**锁会话行(撤回、焚毁清扫、放宽焚毁都补了
   `SELECT … FOR UPDATE`),否则与「先锁会话行再改消息」的编辑/回应交叉死锁。
 - **同步语义**:返回 `(afterRevision, throughRevision]` 里变过的消息的当前状态,

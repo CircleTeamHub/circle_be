@@ -63,6 +63,32 @@ migrations still present in `_prisma_migrations` (they are reported as
 > copy. The fresh-DB path is fully validated; the existing-DB path was validated
 > against a simulated state, not your actual prod `_prisma_migrations` table.
 
+## 迁移文件是不是一个事务：看 Prisma 能不能把它切开
+
+`prisma migrate deploy` 不会给迁移文件包 `BEGIN/COMMIT`。它先用自己的切分器把文件拆成
+单条语句，**逐条自动提交**；切不开的文件整份作为一条多语句查询发出去，PostgreSQL 把它
+当成**一个隐式事务**执行。2026-09-16 在本地 PostgreSQL 16 + Prisma 7.9 上逐项实测：
+
+| 文件内容 | 执行方式 | 现象 |
+|---|---|---|
+| 普通 DDL/DML 混写（含 `CREATE INDEX CONCURRENTLY`） | 逐条自动提交 | 后面的语句报错，前面的已经提交、不回滚；`CONCURRENTLY` 正常 |
+| 只有一条 `DROP INDEX CONCURRENTLY` | 逐条自动提交 | 正常 |
+| 含 `$$` 函数体（`CREATE FUNCTION` / `CREATE PROCEDURE` / `DO`） | 整份一个事务 | `CONCURRENTLY` 报 cannot run inside a transaction block；`DO` 里 `COMMIT` 报 invalid transaction termination；出错整份回滚 |
+| `DROP INDEX CONCURRENTLY` 后面还有别的语句 | 整份一个事务 | 报 cannot run inside a transaction block（下一节的旧结论就是这个） |
+
+由此得出的写法：
+
+- **整份一个事务的文件里，锁一直持有到文件结束。** `ALTER TABLE ... ADD COLUMN` 拿的是
+  排他锁（连读都挡），后面再跟一条全表 `UPDATE` 或普通建索引，热表就停多久。只放瞬时
+  DDL（加列、函数、触发器），大改动挪到切得开的文件里。
+- **热表回填要分批提交。** 在含函数体的迁移里建一个每批 `COMMIT` 的过程，下一个迁移
+  文件（不含 `$`）里 `CALL` 它再 `DROP PROCEDURE`：`CALL` 在自己的事务里执行，过程才能
+  提交。例：`20260916000000_add_chat_revision_stream` 建过程、
+  `20260916000100_backfill_chat_message_revision` 调用。
+- **`CREATE/DROP INDEX CONCURRENTLY` 放进不含 `$` 的文件**，`DROP ... CONCURRENTLY`
+  单独一个文件。
+- 拿不准时在本地起一个空库跑一遍：只要能复现上面某一行，就知道这份文件会怎么执行。
+
 ## CONCURRENTLY 索引：失败残骸要人工清
 
 热表上的索引用 `CREATE INDEX CONCURRENTLY` 建，避免构建期间停写（例：
@@ -80,7 +106,8 @@ ERROR: DROP INDEX CONCURRENTLY cannot run inside a transaction block  (SQLSTATE 
 
 同一个文件里纯 `CREATE INDEX CONCURRENTLY` 是可以的（见
 `20260729131000_admin_dashboard_indexes`，一个文件里 10 条都正常应用），
-但只要混进 `DROP ... CONCURRENTLY` 整个迁移就红。
+但只要混进 `DROP ... CONCURRENTLY` 整个迁移就红（原因见上一节：这种文件 Prisma 切不开，
+整份退回成一个事务）。
 
 所以处置放在部署自检里，每次 `migrate deploy` 之后跑一遍：
 

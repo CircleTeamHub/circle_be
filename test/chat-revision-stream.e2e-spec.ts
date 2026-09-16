@@ -128,6 +128,52 @@ describePostgres('chat revision stream PostgreSQL integration', () => {
     });
   });
 
+  it('never reuses a backfilled revision in a conversation whose counter was never initialized', async () => {
+    // 迁移只把存量消息回填成 revision = height,不整表初始化会话计数器:
+    // 从没变过的会话 nextRevision 还是 0、nextHeight 是消息条数。取号必须越过它们。
+    await inRollback(async () => {
+      await createConversation('rev-conv-legacy');
+      for (let height = 1; height <= 3; height += 1) {
+        await insertMessage('rev-conv-legacy', `rev-legacy-${height}`, height);
+      }
+      await client.query(
+        `UPDATE "ChatMessage" SET "revision" = "height"
+         WHERE "conversationID" = 'rev-conv-legacy'`,
+      );
+      await client.query(
+        `UPDATE "ChatConversation" SET "nextRevision" = 0, "nextHeight" = 3
+         WHERE "id" = 'rev-conv-legacy'`,
+      );
+
+      // 自动回复/系统消息先插消息、后推 nextHeight:插入这一刻 nextHeight 还是 3。
+      expect(await insertMessage('rev-conv-legacy', 'rev-legacy-4', 4)).toBe(4);
+      await client.query(
+        `UPDATE "ChatConversation" SET "nextHeight" = 4 WHERE "id" = 'rev-conv-legacy'`,
+      );
+      // 撤回一条存量消息、给另一条加回应:都分到比所有存量号更大的新号。
+      await client.query(
+        `UPDATE "ChatMessage" SET "content" = '{}', "revokedAt" = CURRENT_TIMESTAMP
+         WHERE "id" = 'rev-legacy-2'`,
+      );
+      await client.query(
+        `INSERT INTO "ChatMessageReaction" ("id", "messageID", "userID", "emoji")
+         VALUES ('rev-legacy-r', 'rev-legacy-1', 'u2', '👍')`,
+      );
+
+      const rows = await client.query<{ id: string; revision: number }>(
+        `SELECT "id", "revision" FROM "ChatMessage"
+         WHERE "conversationID" = 'rev-conv-legacy' ORDER BY "revision"`,
+      );
+      expect(rows.rows).toEqual([
+        { id: 'rev-legacy-3', revision: 3 },
+        { id: 'rev-legacy-4', revision: 4 },
+        { id: 'rev-legacy-2', revision: 5 },
+        { id: 'rev-legacy-1', revision: 6 },
+      ]);
+      expect(await counterOf('rev-conv-legacy')).toBe(6);
+    });
+  });
+
   it('does not spend a revision on invisible changes', async () => {
     await inRollback(async () => {
       await createConversation('rev-conv');

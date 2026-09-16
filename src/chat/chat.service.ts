@@ -152,6 +152,23 @@ function senderSeatRefs(
 }
 const MESSAGE_READ_OMIT = { contentHistory: true } as const;
 
+/**
+ * 会话变更序号流的水位:已分配出去的最高 revision,<= 它的变更都已提交。
+ *
+ * 不是 nextRevision 本身:存量消息在迁移里回填成 revision = height,会话计数器没有
+ * 整表初始化(那会在更新期间挡住所有会话的发消息),触发器取号用的是
+ * GREATEST(nextRevision, nextHeight) + 1。从没变过的会话 nextRevision 还是 0,
+ * 它的消息序号上限是 nextHeight。两列在同一行、由同一批事务在会话行锁下推进,
+ * 取 max 仍满足「读到 N 时 <= N 的都已可见」。
+ */
+export function conversationSyncRevision(conversation: {
+  nextRevision: number;
+  nextHeight: number;
+}): number {
+  // 单测替身常常只给其中一列:缺哪列都不能让 Math.max 变成 NaN。
+  return Math.max(conversation.nextRevision ?? 0, conversation.nextHeight ?? 0);
+}
+
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
 // 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
 const STANDALONE_GROUP_MAX_MEMBERS = 200;
@@ -1133,7 +1150,7 @@ export class ChatService {
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
         readHeight: m.lastReadHeight,
         clearedBeforeHeight: conversationFloor,
-        syncRevision: m.conversation.nextRevision,
+        syncRevision: conversationSyncRevision(m.conversation),
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
       };
@@ -2111,7 +2128,7 @@ export class ChatService {
         directPeers.deliveredHeights.get(conversationId) ?? null,
       readHeight: member.lastReadHeight,
       clearedBeforeHeight: floor,
-      syncRevision: member.conversation.nextRevision,
+      syncRevision: conversationSyncRevision(member.conversation),
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
     };
@@ -2604,7 +2621,7 @@ export class ChatService {
       conversationId,
       userId,
     );
-    const throughRevision = conversation.nextRevision;
+    const throughRevision = conversationSyncRevision(conversation);
     const base = {
       throughRevision,
       readHeight: member.lastReadHeight,
@@ -2912,7 +2929,7 @@ export class ChatService {
           ?.lastDeliveredHeight ?? null,
       readHeight: mine?.lastReadHeight ?? 0,
       clearedBeforeHeight: clearedFloor,
-      syncRevision: conv.nextRevision,
+      syncRevision: conversationSyncRevision(conv),
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };

@@ -4,7 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
-import { ChatService } from './chat.service';
+import { ChatService, conversationSyncRevision } from './chat.service';
 import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
 
@@ -6022,6 +6022,43 @@ describe('ChatService', () => {
         nextRevision: 3,
       });
       expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
+    });
+
+    it('bounds the page by max(nextRevision, nextHeight) for a conversation untouched since the backfill', async () => {
+      // 迁移把存量消息回填成 revision = height,会话计数器没有整表初始化:
+      // 这类会话 nextRevision 还是 0,只看它的话水位是 0,存量消息一条都同步不到,
+      // 客户端还会被当成「游标超前」要求重置。
+      prisma.chatMember.findUnique.mockResolvedValue(
+        seatAt(0, { conversation: { nextHeight: 12 } }),
+      );
+      prisma.chatMessage.findMany.mockResolvedValue([
+        syncRow({ id: 'm-legacy', height: 11, revision: 11 }),
+      ]);
+
+      const page = await service.syncConversation('u1', 'conv-1', 10);
+
+      expect(prisma.chatMessage.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            conversationID: 'conv-1',
+            revision: { gt: 10, lte: 12 },
+          },
+        }),
+      );
+      expect(page).toMatchObject({
+        resetRequired: false,
+        throughRevision: 12,
+        nextRevision: 12,
+      });
+    });
+
+    it('reports the same watermark as the conversation snapshot', () => {
+      expect(
+        conversationSyncRevision({ nextRevision: 0, nextHeight: 40 }),
+      ).toBe(40);
+      expect(
+        conversationSyncRevision({ nextRevision: 41, nextHeight: 40 }),
+      ).toBe(41);
     });
 
     it('carries the viewer read position so other devices converge', async () => {
