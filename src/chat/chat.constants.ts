@@ -28,6 +28,18 @@ export const CHAT_EVENTS = {
   historyCleared: 'chat:history_cleared',
   /** 服务端 → 客户端(在座成员个人房):阅后即焚到期消息的墓碑已提交,删本地副本 */
   burnedMessages: 'chat:burned_messages',
+  /**
+   * 客户端 → 服务端(可带 ack):App 退到后台。连接不断,但这条连接收不到投递,
+   * 推送要把它当离线(见 ChatPresenceRegistry.setSocketBackground)。
+   */
+  background: 'chat:background',
+  /** 客户端 → 服务端(可带 ack):App 回到前台,这条连接重新算「收得到」。 */
+  foreground: 'chat:foreground',
+  /**
+   * 服务端 → 客户端:access token 到期,紧接着断开。服务端主动断开的连接
+   * socket.io 客户端不会自己重连,App 靠这条区分「刷新 token 再连」与「被踢」。
+   */
+  sessionExpired: 'chat:session_expired',
 } as const;
 
 /**
@@ -202,6 +214,7 @@ export const CHAT_RATE_LIMITS = {
   delivered: { limit: 30, windowMs: 10_000 },
   reaction: { limit: 20, windowMs: 10_000 },
   edit: { limit: 10, windowMs: 10_000 },
+  appState: { limit: 30, windowMs: 10_000 },
 } as const;
 
 /**

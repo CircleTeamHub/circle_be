@@ -18,6 +18,7 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
       headers: { 'x-connection-trace-id': 'ws-header-trace' },
     },
     join: jest.fn().mockResolvedValue(undefined),
+    emit: jest.fn(),
     disconnect: jest.fn(),
     disconnected: false,
     on: jest.fn((event: string, handler: Handler) => {
@@ -74,6 +75,7 @@ describe('ChatGateway', () => {
     registerSocket: jest.fn().mockResolvedValue(null),
     registerConversations: jest.fn().mockResolvedValue(undefined),
     socketDisconnected: jest.fn().mockResolvedValue(undefined),
+    setSocketBackground: jest.fn().mockResolvedValue(undefined),
     conversationJoined: jest.fn().mockResolvedValue(undefined),
     conversationLeft: jest.fn().mockResolvedValue(undefined),
     getOnlineUserIds: jest.fn().mockResolvedValue(null),
@@ -455,6 +457,162 @@ describe('ChatGateway', () => {
         reason: 'transport_error',
         traceId: 'ws-header-trace',
       });
+    });
+  });
+
+  describe('app state (background / foreground)', () => {
+    const settle = async () => {
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    };
+
+    // 网关实例在整个文件里共用,每个用户有连接数上限:不断开就会占掉后面用例的名额。
+    const opened: Array<ReturnType<typeof fakeSocket>> = [];
+    afterEach(() => {
+      for (const socket of opened.splice(0)) {
+        socket.handlers.get('disconnect')?.('client namespace disconnect');
+      }
+    });
+
+    async function connect(overrides: Record<string, unknown> = {}) {
+      const socket = fakeSocket({
+        conn: { transport: { name: 'websocket' } },
+        ...overrides,
+      });
+      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      await gateway['handleConnection'](socket as never);
+      opened.push(socket);
+      return socket;
+    }
+
+    it('marks the connection backgrounded, then foregrounded again, and acks both', async () => {
+      const socket = await connect();
+      const ack = jest.fn();
+
+      socket.handlers.get('chat:background')?.({}, ack);
+      await settle();
+      expect(presence.setSocketBackground).toHaveBeenCalledWith(
+        'u1',
+        'socket-1',
+        true,
+      );
+      expect(socket.data.background).toBe(true);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+
+      socket.handlers.get('chat:foreground')?.({}, ack);
+      await settle();
+      expect(presence.setSocketBackground).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        false,
+      );
+      expect(socket.data.background).toBe(false);
+    });
+
+    it('applies rapid switches in arrival order so the last one wins', async () => {
+      const socket = await connect();
+      let release: () => void = () => undefined;
+      presence.setSocketBackground.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      );
+
+      socket.handlers.get('chat:background')?.({});
+      socket.handlers.get('chat:foreground')?.({});
+      await settle();
+      // 第一次写还卡着:第二次不能抢先落地,否则慢的那次后写会把状态改回后台。
+      expect(presence.setSocketBackground).toHaveBeenCalledTimes(1);
+
+      release();
+      await settle();
+      expect(presence.setSocketBackground.mock.calls).toEqual([
+        ['u1', 'socket-1', true],
+        ['u1', 'socket-1', false],
+      ]);
+    });
+
+    it('accepts an ack passed without a payload', async () => {
+      const socket = await connect();
+      const ack = jest.fn();
+
+      socket.handlers.get('chat:background')?.(ack);
+      await settle();
+
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+    });
+
+    it('registers a connection opened in the background as backgrounded before it joins any online set', async () => {
+      const socket = await connect({
+        handshake: {
+          auth: {
+            token: 'jwt',
+            traceId: 'ws-auth-trace',
+            appState: 'background',
+          },
+          headers: { 'x-connection-trace-id': 'ws-header-trace' },
+        },
+      });
+      await settle();
+
+      expect(socket.data.background).toBe(true);
+      expect(presence.setSocketBackground).toHaveBeenCalledWith(
+        'u1',
+        'socket-1',
+        true,
+      );
+      expect(
+        presence.setSocketBackground.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        presence.registerConversations.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('keeps a normal connection in the foreground', async () => {
+      const socket = await connect();
+      await settle();
+
+      expect(socket.data.background).toBeUndefined();
+      expect(presence.setSocketBackground).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('access token expiry', () => {
+    afterEach(() => jest.useRealTimers());
+
+    it('tells the client the session expired before disconnecting it', () => {
+      jest.useFakeTimers();
+      const socket = fakeSocket({
+        data: { userId: 'u1', expMs: Date.now() + 1_000 },
+      });
+
+      gateway['scheduleExpiryDisconnect'](socket as never);
+      jest.advanceTimersByTime(1_000);
+
+      // 服务端主动断开的连接 socket.io 客户端不会自动重连;只给一个 disconnect,
+      // App 分不清「token 过期、刷新后重连」和「被踢」。
+      expect(socket.emit).toHaveBeenCalledWith('chat:session_expired', {
+        reason: 'token_expired',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
+      expect(socket.emit.mock.invocationCallOrder[0]).toBeLessThan(
+        socket.disconnect.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('says the same thing when the token is already expired at connect', () => {
+      const socket = fakeSocket({
+        data: { userId: 'u1', expMs: Date.now() - 1 },
+      });
+
+      gateway['scheduleExpiryDisconnect'](socket as never);
+
+      expect(socket.emit).toHaveBeenCalledWith('chat:session_expired', {
+        reason: 'token_expired',
+      });
+      expect(socket.disconnect).toHaveBeenCalledWith(true);
     });
   });
 

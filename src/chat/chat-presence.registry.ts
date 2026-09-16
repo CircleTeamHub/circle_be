@@ -5,7 +5,8 @@ import { RedisService } from 'src/redis/redis.service';
  * G-04/G-06:跨实例在线注册表。
  *
  * - `chat:conn:z:{userId}`   该用户所有活着的连接租约(连接数上限判据)
- * - `chat:online:z:{convId}` 会话在线成员集合(推送分流 / 在线判定用)
+ * - `chat:online:z:{convId}` 会话在线成员集合(在线判定用)
+ * - `chat:bg:z:{userId}`     其中退到后台的那些租约(连着、但收不到投递)
  *
  * Redis 未配置时所有读方法返回 null,调用方回退单实例 fetchSockets 语义。
  *
@@ -29,14 +30,19 @@ const REFRESH_MS = 20 * 60 * 1000;
 const connKey = (userId: string): string => `chat:conn:z:${userId}`;
 const onlineKey = (conversationId: string): string =>
   `chat:online:z:${conversationId}`;
+const backgroundKey = (userId: string): string => `chat:bg:z:${userId}`;
 
 @Injectable()
 export class ChatPresenceRegistry implements OnModuleDestroy {
   private readonly logger = new Logger(ChatPresenceRegistry.name);
-  /** 本实例在线用户 → 其连接租约 id 与会话集合(续期与断连清理的依据)。 */
+  /** 本实例在线用户 → 其连接租约、其中退到后台的租约与会话集合(续期与断连清理的依据)。 */
   private readonly localUsers = new Map<
     string,
-    { leases: Set<string>; conversations: Set<string> }
+    {
+      leases: Set<string>;
+      background: Set<string>;
+      conversations: Set<string>;
+    }
   >();
   private refreshTimer: NodeJS.Timeout | null = null;
 
@@ -66,6 +72,7 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
   ): Promise<number | null> {
     const local = this.localUsers.get(userId) ?? {
       leases: new Set<string>(),
+      background: new Set<string>(),
       conversations: new Set<string>(),
     };
     local.leases.add(leaseId);
@@ -106,10 +113,12 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
     const local = this.localUsers.get(userId);
     if (local) {
       local.leases.delete(leaseId);
+      local.background.delete(leaseId);
       if (local.leases.size === 0) this.localUsers.delete(userId);
     }
     if (!this.redis.isEnabled()) return;
     await this.redis.removeFromExpiringSet(connKey(userId), leaseId);
+    await this.redis.removeFromExpiringSet(backgroundKey(userId), leaseId);
     const live = await this.redis.getLiveSetMembers(connKey(userId));
     // null = Redis 这一刻不可用:宁可留着在线条目(最坏少推几条离线通知),
     // 也不要在读失败时把人误判成离线。
@@ -119,6 +128,41 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
       await this.redis.removeFromExpiringSet(onlineKey(id), userId);
     }
     await this.redis.deleteKey(connKey(userId));
+    await this.redis.deleteKey(backgroundKey(userId));
+  }
+
+  /**
+   * App 退到后台 / 回到前台。
+   *
+   * 连接本身不断(回前台不用重连、不用补拉),但后台的连接什么都收不到 ——
+   * iOS 挂起之后要等 ping 超时(约 45 秒)服务端才发现它没了,安卓进程没被杀
+   * 之前连接一直在。推送若把这种连接当在线,锁屏期间的消息就既不推送、也没人看见。
+   * 所以「在线」(isOnline / 在线集合,决定对端看到的在线状态)与「收得到」
+   * (getDeliverableUserIds,决定要不要推送)是两件事,这里只动后者。
+   *
+   * 断开之后才到的切换:本实例不再记它(否则会被续期成一条永不过期的死租约);
+   * Redis 里那一条最迟 TTL 到期,而死租约不在连接集合里,本来就不影响判定。
+   */
+  async setSocketBackground(
+    userId: string,
+    leaseId: string,
+    background: boolean,
+  ): Promise<void> {
+    const local = this.localUsers.get(userId);
+    if (local?.leases.has(leaseId)) {
+      if (background) local.background.add(leaseId);
+      else local.background.delete(leaseId);
+    }
+    if (!this.redis.isEnabled()) return;
+    if (background) {
+      await this.redis.addToExpiringSet(
+        backgroundKey(userId),
+        leaseId,
+        KEY_TTL_SECONDS,
+      );
+    } else {
+      await this.redis.removeFromExpiringSet(backgroundKey(userId), leaseId);
+    }
   }
 
   /** 座位变化联动(拉入会话房/被移出会话房时同步集合)。 */
@@ -155,6 +199,31 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
   }
 
   /**
+   * 会话里此刻至少有一条**前台**连接的成员(推送分流用);null = Redis 不可用。
+   *
+   * 逐人读租约集合时读不到的,按「收不到」算:宁可多推一条,也不把人当成
+   * 正盯着屏幕而一条都不推。
+   */
+  async getDeliverableUserIds(
+    conversationId: string,
+  ): Promise<string[] | null> {
+    const online = await this.getOnlineUserIds(conversationId);
+    if (online === null) return null;
+    const verdicts = await Promise.all(
+      online.map(async (userId) => {
+        const [leases, background] = await Promise.all([
+          this.redis.getLiveSetMembers(connKey(userId)),
+          this.redis.getLiveSetMembers(backgroundKey(userId)),
+        ]);
+        if (leases === null || background === null) return null;
+        const backgrounded = new Set(background);
+        return leases.some((lease) => !backgrounded.has(lease)) ? userId : null;
+      }),
+    );
+    return verdicts.filter((userId): userId is string => userId !== null);
+  }
+
+  /**
    * Redis 是否配置。区分两种「答不上来」:
    *   false = 压根没配(单实例) —— socket.io 用内存 adapter,调用方降级到
    *           fetchSockets 是本进程操作,合法且便宜;
@@ -180,6 +249,13 @@ export class ChatPresenceRegistry implements OnModuleDestroy {
           // 该到期照样到期。
           await this.redis.addToExpiringSet(
             connKey(userId),
+            leaseId,
+            KEY_TTL_SECONDS,
+          );
+        }
+        for (const leaseId of local.background) {
+          await this.redis.addToExpiringSet(
+            backgroundKey(userId),
             leaseId,
             KEY_TTL_SECONDS,
           );

@@ -221,25 +221,32 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     return sockets.length > 0;
   }
 
-  /** 会话房内当前在线的 userId 集合(离线推送分流用);注册表优先。 */
-  async getOnlineUserIdsInConversation(
+  /**
+   * 会话房里此刻「收得到」的 userId 集合(离线推送分流用);注册表优先。
+   *
+   * 只看有没有连接是不够的:App 退到后台之后连接还挂着,却什么都收不到。
+   * 这类连接由客户端报 chat:background 标记出来,这里不算数。
+   */
+  async getDeliverableUserIdsInConversation(
     conversationId: string,
   ): Promise<Set<string>> {
-    const viaRegistry = await this.presence.getOnlineUserIds(conversationId);
+    const viaRegistry =
+      await this.presence.getDeliverableUserIds(conversationId);
     if (viaRegistry !== null) return new Set(viaRegistry);
     // Redis 配了却读不到:返回空集。这个集合在 ChatPushService 里用来**排除**
     // 收件人 —— 空集 = 谁都不排除 = 全员收到推送。反过来把人当在线会让他
     // 彻底收不到消息:重复推送好过丢消息。
     if (this.presence.isRedisConfigured()) return new Set();
-    const server = this.requireServer('getOnlineUserIdsInConversation');
+    const server = this.requireServer('getDeliverableUserIdsInConversation');
     if (!server) return new Set();
     const sockets = await server
       .in(conversationRoom(conversationId))
       .fetchSockets();
     const ids = new Set<string>();
     for (const socket of sockets) {
-      const userId = (socket.data as { userId?: unknown })?.userId;
-      if (typeof userId === 'string') ids.add(userId);
+      const data = socket.data as { userId?: unknown; background?: unknown };
+      if (data?.background === true) continue;
+      if (typeof data?.userId === 'string') ids.add(data.userId);
     }
     return ids;
   }

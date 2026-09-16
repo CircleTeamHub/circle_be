@@ -178,8 +178,99 @@ describe('ChatPresenceRegistry', () => {
 
     expect(await registry.registerSocket('u1', 'sock-1')).toBeNull();
     expect(await registry.getOnlineUserIds('c1')).toBeNull();
+    expect(await registry.getDeliverableUserIds('c1')).toBeNull();
     expect(await registry.isOnline('u1')).toBeNull();
     expect(redis.addToExpiringSet).not.toHaveBeenCalled();
     registry.onModuleDestroy();
+  });
+
+  describe('backgrounded connections', () => {
+    it('stay online but stop counting as deliverable', async () => {
+      const registry = new ChatPresenceRegistry(redis as never);
+      await registry.registerSocket('u1', 'sock-1');
+      await registry.registerConversations('u1', ['c1']);
+      expect(await registry.getDeliverableUserIds('c1')).toEqual(['u1']);
+
+      await registry.setSocketBackground('u1', 'sock-1', true);
+      // 锁屏的那部手机连接还在,但什么都收不到 —— 推送必须照发。
+      expect(await registry.getDeliverableUserIds('c1')).toEqual([]);
+      expect(await registry.isOnline('u1')).toBe(true);
+
+      await registry.setSocketBackground('u1', 'sock-1', false);
+      expect(await registry.getDeliverableUserIds('c1')).toEqual(['u1']);
+      registry.onModuleDestroy();
+    });
+
+    it('keep a user deliverable while any other device is in the foreground', async () => {
+      const registry = new ChatPresenceRegistry(redis as never);
+      await registry.registerSocket('u1', 'phone');
+      await registry.registerSocket('u1', 'desktop');
+      await registry.registerConversations('u1', ['c1']);
+
+      await registry.setSocketBackground('u1', 'phone', true);
+      expect(await registry.getDeliverableUserIds('c1')).toEqual(['u1']);
+
+      await registry.setSocketBackground('u1', 'desktop', true);
+      expect(await registry.getDeliverableUserIds('c1')).toEqual([]);
+      registry.onModuleDestroy();
+    });
+
+    it('drop the background mark on disconnect and ignore a late switch', async () => {
+      const registry = new ChatPresenceRegistry(redis as never);
+      await registry.registerSocket('u1', 'sock-1');
+      await registry.registerSocket('u1', 'sock-2');
+      await registry.setSocketBackground('u1', 'sock-1', true);
+
+      await registry.socketDisconnected('u1', 'sock-1');
+      expect(sets.get('chat:bg:z:u1')?.has('sock-1')).toBe(false);
+
+      // 断开之后才到的切换:不能被本实例续期续成一条永不过期的死租约。
+      await registry.setSocketBackground('u1', 'sock-1', true);
+      redis.addToExpiringSet.mockClear();
+      await (
+        registry as unknown as { refreshLocal(): Promise<void> }
+      ).refreshLocal();
+      expect(redis.addToExpiringSet).not.toHaveBeenCalledWith(
+        'chat:bg:z:u1',
+        'sock-1',
+        expect.any(Number),
+      );
+      registry.onModuleDestroy();
+    });
+
+    it('refreshes this instance background marks with its leases', async () => {
+      const registry = new ChatPresenceRegistry(redis as never);
+      await registry.registerSocket('u1', 'sock-1');
+      await registry.setSocketBackground('u1', 'sock-1', true);
+      redis.addToExpiringSet.mockClear();
+
+      await (
+        registry as unknown as { refreshLocal(): Promise<void> }
+      ).refreshLocal();
+
+      expect(redis.addToExpiringSet).toHaveBeenCalledWith(
+        'chat:bg:z:u1',
+        'sock-1',
+        expect.any(Number),
+      );
+      registry.onModuleDestroy();
+    });
+
+    it('treat an unreadable lease set as not deliverable (push rather than stay silent)', async () => {
+      const registry = new ChatPresenceRegistry(redis as never);
+      await registry.registerSocket('u1', 'sock-1');
+      await registry.registerConversations('u1', ['c1']);
+      redis.getLiveSetMembers.mockImplementation((key: string) =>
+        key === 'chat:bg:z:u1'
+          ? Promise.resolve(null as never)
+          : Promise.resolve([...(sets.get(key) ?? [])]),
+      );
+
+      expect(await registry.getDeliverableUserIds('c1')).toEqual([]);
+      redis.getLiveSetMembers.mockImplementation((key: string) =>
+        Promise.resolve([...(sets.get(key) ?? [])]),
+      );
+      registry.onModuleDestroy();
+    });
   });
 });

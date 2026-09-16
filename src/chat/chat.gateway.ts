@@ -191,6 +191,13 @@ export class ChatGateway implements OnModuleDestroy {
   private readonly deliveredLimiter: DistributedRateLimiter;
   private readonly reactionLimiter: DistributedRateLimiter;
   private readonly editLimiter: DistributedRateLimiter;
+  private readonly appStateLimiter: DistributedRateLimiter;
+  /**
+   * 同一连接上的前后台切换串行生效。两次切换的 Redis 写交错时,慢的那次后落地
+   * 会把状态改回去 —— 回到前台的人被当成还在后台(多推),或者反过来锁屏的人
+   * 一条推送都收不到。
+   */
+  private readonly appStateChains = new WeakMap<Socket, Promise<void>>();
 
   private static readonly SUBSCRIBE_RETRY_BASE_MS = 1_000;
   private static readonly SUBSCRIBE_RETRY_MAX_MS = 30_000;
@@ -267,6 +274,7 @@ export class ChatGateway implements OnModuleDestroy {
     this.deliveredLimiter = make('delivered');
     this.reactionLimiter = make('reaction');
     this.editLimiter = make('edit');
+    this.appStateLimiter = make('appState');
   }
 
   /**
@@ -649,14 +657,22 @@ export class ChatGateway implements OnModuleDestroy {
   private scheduleExpiryDisconnect(socket: Socket): void {
     const expMs = socket.data.expMs as number | null | undefined;
     if (typeof expMs !== 'number') return;
+    // 先说原因再断开。服务端主动断开的连接 socket.io 客户端不会自动重连,
+    // 只收到一个 disconnect 的话 App 分不清「token 过期、刷新后重连」和「被踢」,
+    // 于是停在断开状态,直到下一次 REST 请求碰巧触发刷新。engine.io 关闭前会
+    // 先把写缓冲刷完,这一帧一定排在断开之前送达。
+    const expire = (): void => {
+      socket.emit(CHAT_EVENTS.sessionExpired, { reason: 'token_expired' });
+      socket.disconnect(true);
+    };
     const ttl = expMs - Date.now();
     if (ttl <= 0) {
-      socket.disconnect(true);
+      expire();
       return;
     }
     const timer = setTimeout(() => {
       this.expiryTimers.delete(socket);
-      socket.disconnect(true);
+      expire();
     }, ttl);
     timer.unref?.();
     this.expiryTimers.set(socket, timer);
@@ -904,6 +920,24 @@ export class ChatGateway implements OnModuleDestroy {
         }
       },
     );
+    const onAppState =
+      (background: boolean) =>
+      (payload?: unknown, maybeAck?: AckFn<ChatReadAck>): void => {
+        // 客户端不带载荷直接传 ack 时,ack 落在第一个参数上。
+        const ack =
+          typeof payload === 'function'
+            ? (payload as AckFn<ChatReadAck>)
+            : maybeAck;
+        if (
+          !whenReady(() => this.handleAppState(socket, userId, background, ack))
+        ) {
+          this.ackOnce(ack)(
+            this.ackError(ChatErrorCode.RateLimited, '连接初始化请求过多'),
+          );
+        }
+      };
+    socket.on(CHAT_EVENTS.background, onAppState(true));
+    socket.on(CHAT_EVENTS.foreground, onAppState(false));
     socket.on(
       CHAT_EVENTS.presence,
       (
@@ -990,6 +1024,11 @@ export class ChatGateway implements OnModuleDestroy {
       return;
     }
     this.scheduleExpiryDisconnect(socket);
+    // 在后台建立的连接(安卓后台重连、iOS 后台唤醒)一开始就按后台登记。等连上
+    // 之后客户端再补发 chat:background 的话,中间这一段它会被当成收得到、不推送。
+    if (this.handshakeAppState(socket) === 'background') {
+      void this.applyAppState(socket, userId, true);
+    }
 
     try {
       if (guestConversationId) {
@@ -1502,6 +1541,49 @@ export class ChatGateway implements OnModuleDestroy {
     } catch (error) {
       reply(this.toAckError(error, 'revoke', userId, payload?.conversationId));
     }
+  }
+
+  private handshakeAppState(socket: Socket): 'background' | 'foreground' {
+    const auth = socket.handshake.auth as Record<string, unknown> | undefined;
+    return auth?.appState === 'background' ? 'background' : 'foreground';
+  }
+
+  private async handleAppState(
+    socket: Socket,
+    userId: string,
+    background: boolean,
+    ack?: AckFn<ChatReadAck>,
+  ): Promise<void> {
+    const reply = this.ackOnce(ack);
+    if (!(await this.appStateLimiter.tryAcquire(userId))) {
+      reply(this.ackError(ChatErrorCode.RateLimited));
+      return;
+    }
+    await this.applyAppState(socket, userId, background);
+    reply({ ok: true });
+  }
+
+  /** 记下期望状态并排进这条连接的切换队列;失败只记日志(最坏多推或少推几条)。 */
+  private applyAppState(
+    socket: Socket,
+    userId: string,
+    background: boolean,
+  ): Promise<void> {
+    socket.data.background = background;
+    const previous = this.appStateChains.get(socket) ?? Promise.resolve();
+    const next = previous
+      .then(() =>
+        this.presence.setSocketBackground(userId, socket.id, background),
+      )
+      .catch((error: unknown) => {
+        reportOperationalError(error, {
+          component: 'ChatGateway',
+          operation: 'appState',
+          kind: 'websocket',
+        });
+      });
+    this.appStateChains.set(socket, next);
+    return next;
   }
 
   private async handleTyping(
