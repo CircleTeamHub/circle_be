@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from './chat.service';
+import { chatSendRequestHash } from './chat-send-request-hash';
 import type { ChatSendPayload } from './chat.types';
 
 // 「早就开启过」的边界:让查看者窗口真正生效,又不干扰用例本身要断言的 cutoff。
@@ -1071,6 +1072,67 @@ describe('ChatService', () => {
       expect(result.message.id).toBe('msg-1');
       expect(prisma.chatMessage.create).not.toHaveBeenCalled();
       expect(prisma.chatConversation.update).not.toHaveBeenCalled();
+    });
+
+    it('refuses a replay of the same delivery id carrying different content', async () => {
+      // 发送方以为「发送成功」,收件人收到的却是库里那条旧内容 —— 两边对不上
+      // 还没有任何报错。指纹不同就拒收。
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...createdRow,
+        requestHash: chatSendRequestHash(
+          sendPayload({ content: { text: 'what was actually sent' } }),
+        ),
+      });
+
+      await expect(
+        service.sendMessage('u1', sendPayload()),
+      ).rejects.toMatchObject({
+        response: { errorCode: ChatErrorCode.DeliveryIdConflict },
+      });
+      expect(prisma.chatMessage.create).not.toHaveBeenCalled();
+    });
+
+    it('still treats an identical replay as the same message', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...createdRow,
+        requestHash: chatSendRequestHash(sendPayload()),
+      });
+
+      const result = await service.sendMessage('u1', sendPayload());
+
+      expect(result.reused).toBe(true);
+    });
+
+    it('accepts replays of rows written before request fingerprints existed', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue({
+        ...createdRow,
+        requestHash: null,
+      });
+
+      const result = await service.sendMessage('u1', sendPayload());
+
+      expect(result.reused).toBe(true);
+    });
+
+    it('stores the request fingerprint with a new message', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findUnique.mockResolvedValue(null);
+      prisma.$queryRaw.mockResolvedValue([{ nextHeight: 3 }]);
+      prisma.chatMessage.create.mockResolvedValue(createdRow);
+      prisma.chatConversation.update.mockResolvedValue({});
+
+      await service.sendMessage('u1', sendPayload());
+
+      expect(prisma.chatMessage.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            requestHash: chatSendRequestHash(sendPayload()),
+          }),
+        }),
+      );
     });
 
     it('rejects senders that are not members', async () => {

@@ -19,6 +19,10 @@ import { ChatSystemMessageService } from './chat-system-message.service';
 import { ChatCircleSyncService } from './chat-circle-sync.service';
 import { ChatMediaService } from './chat-media.service';
 import { ChatGroupEventService } from './chat-group-event.service';
+import {
+  chatSendRequestHash,
+  stripMediaPresentationFields,
+} from './chat-send-request-hash';
 import { loadSeatAliases, type SeatRef, seatKey } from './chat-seat-alias';
 import {
   circleGroupRole,
@@ -164,17 +168,6 @@ function normalizeMemberIds(userId: string, memberIds: string[]): string[] {
 }
 
 const CLIENT_TYPE_SET = new Set<string>(CLIENT_MESSAGE_TYPES);
-
-/** 媒体 content 里只应持久化 object key;展示地址一律由读路径现签。 */
-const MEDIA_PRESENTATION_FIELDS = ['url', 'thumbUrl', 'localUri'] as const;
-
-function stripMediaPresentationFields(
-  content: Record<string, unknown>,
-): Record<string, unknown> {
-  const cleaned = { ...content };
-  for (const field of MEDIA_PRESENTATION_FIELDS) delete cleaned[field];
-  return cleaned;
-}
 
 @Injectable()
 export class ChatService {
@@ -338,6 +331,8 @@ export class ChatService {
     payload: ChatSendPayload,
   ): Promise<SendResult> {
     this.validateSendPayload(senderUserId, payload);
+    // 取客户端声明的意图,必须在转发解析(每次复制出新 key)之前算。
+    const requestHash = chatSendRequestHash(payload);
     const { conversation, member: senderSeat } =
       await this.requireMembershipSeat(payload.conversationId, senderUserId);
     if (conversation.type === 'DIRECT') {
@@ -362,6 +357,7 @@ export class ChatService {
         },
       });
       if (existing) {
+        this.assertSameSendRequest(existing, requestHash);
         return this.presentSentMessage(
           existing,
           senderUserId,
@@ -453,6 +449,7 @@ export class ChatService {
           },
         });
         if (existing) {
+          this.assertSameSendRequest(existing, requestHash);
           return { row: existing, reused: true };
         }
 
@@ -467,6 +464,7 @@ export class ChatService {
             content,
             clientMessageId: effectivePayload.d,
             replyToID: replyToId,
+            requestHash,
           },
         });
         await this.media.attachNoteImportReferences(tx, row.id, noteImportKeys);
@@ -535,6 +533,27 @@ export class ChatService {
       if (copiedKeys.length > 0) await this.media.deleteObjects(copiedKeys);
       throw error;
     }
+  }
+
+  /**
+   * 同一个 d 的重发必须是同一份请求。历史行(加指纹之前写入)没有指纹可比,
+   * 保持原来的「原样返回」。
+   */
+  private assertSameSendRequest(
+    existing: { requestHash?: string | null },
+    requestHash: string,
+  ): void {
+    if (
+      existing.requestHash === null ||
+      existing.requestHash === undefined ||
+      existing.requestHash === requestHash
+    ) {
+      return;
+    }
+    throw new ConflictException({
+      message: '这个消息标识已经用于另一条内容',
+      errorCode: ChatErrorCode.DeliveryIdConflict,
+    });
   }
 
   /** 把已提交消息装饰成发送结果；装饰失败绝不能反转持久化成功。 */

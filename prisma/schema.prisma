@@ -2219,6 +2219,9 @@ model ChatMessage {
   content         Json
   /// 客户端幂等键；系统消息为 null（null 不参与唯一约束冲突）。
   clientMessageId String?  @db.VarChar(128)
+  /// 客户端发送请求的指纹（chatSendRequestHash，sha256 hex）。同一个 d 带着不同内容
+  /// 重发时拒收；服务端/系统消息与本列加上之前的历史行为 null（不比对）。
+  requestHash     String?  @db.VarChar(64)
   replyToID       String?
   deleted         Boolean  @default(false)
   /// Timestamp when the message was burned. Unlike revokedAt/editedAt this is

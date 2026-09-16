@@ -369,6 +369,8 @@ export const ChatErrorCode = {
   GroupQrJoinDisabled: 'CHAT_GROUP_QR_JOIN_DISABLED',
   // 独立群头像只接受本应用存储的 URL(与圈子头像同一条线)。
   GroupAvatarUrlInvalid: 'CHAT_GROUP_AVATAR_URL_INVALID',
+  // 客户端幂等键 d 已经用于另一份内容:不能把旧内容当成这次发送的结果返回。
+  DeliveryIdConflict: 'CHAT_DELIVERY_ID_CONFLICT',
 } as const;
 
 // 二维码令牌:无效(不存在/已撤销/目标已不可用) / 已过期 / 该类型不支持此操作 /
