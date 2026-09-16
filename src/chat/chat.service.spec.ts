@@ -6207,7 +6207,9 @@ describe('ChatService', () => {
 
     it('keeps the viewer own key on the single-conversation dto', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.$queryRaw.mockResolvedValueOnce([createdRow]).mockResolvedValue([]);
+      prisma.$queryRaw
+        .mockResolvedValueOnce([createdRow])
+        .mockResolvedValue([]);
 
       const dto = await service.setConversationPreferences('u1', 'conv-1', {});
 
