@@ -1334,6 +1334,9 @@ model UserPrivacySetting {
   /// 白名单是两张表;20260907120000 迁移已按 *86400 回填到这一列。
   /// 旧列留到下一版再删(expand/contract:蓝绿窗口里旧二进制还在读它)。
   messageSelfDestructSec  Int      @default(0)
+  /// 全局阅后即焚的开启时间；仅该时间之后发出的消息受 messageSelfDestructSec 约束。
+  /// NULL = 从未开启过。不带它的窗口会把开关打开之前的历史一次性隐藏。
+  messageSelfDestructStartedAt DateTime?
   messageSelfDestructDays Int      @default(0)
   momentsVisibility       String   @default("ALL")
   allowStrangerMessages   Boolean  @default(true)

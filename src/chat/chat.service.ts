@@ -63,8 +63,10 @@ import {
   chatRetentionWhere,
   effectiveBurnDurationForMessage,
   isChatMessageVisible,
+  NO_VIEWER_RETENTION,
   type ChatBurnPolicy,
   type ChatRetentionWindow,
+  type ChatViewerPolicy,
 } from './chat-retention';
 import type {
   ChatConversationDto,
@@ -602,8 +604,8 @@ export class ChatService {
       row.conversationID,
       userId,
     );
-    const viewerCutoff = await this.selfDestructCutoff(userId);
-    const retention = buildChatRetentionWindow(conversation, viewerCutoff);
+    const viewer = await this.selfDestructWindow(userId);
+    const retention = buildChatRetentionWindow(conversation, viewer);
     if (
       row.height <= (member.clearedBeforeHeight ?? 0) ||
       !isChatMessageVisible(row.createdAt, retention)
@@ -1005,9 +1007,9 @@ export class ChatService {
     const directIds = memberships
       .filter((m) => m.conversation.type === 'DIRECT')
       .map((m) => m.conversationID);
-    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const viewer = await this.selfDestructWindow(userId);
     const retentionWindows = memberships.map((m) =>
-      buildChatRetentionWindow(m.conversation, viewerCutoff),
+      buildChatRetentionWindow(m.conversation, viewer),
     );
 
     const circleIds = memberships
@@ -1998,11 +2000,8 @@ export class ChatService {
       member.clearedBeforeHeight ?? 0,
       member.conversation.clearedBeforeHeight ?? 0,
     );
-    const viewerCutoff = await this.selfDestructCutoff(userId);
-    const retention = buildChatRetentionWindow(
-      member.conversation,
-      viewerCutoff,
-    );
+    const viewer = await this.selfDestructWindow(userId);
+    const retention = buildChatRetentionWindow(member.conversation, viewer);
     const [lastMessages, unread, directPeers, tempChats] = await Promise.all([
       this.loadLastMessages([conversationId], [retention]),
       this.loadUnreadCounts(
@@ -2183,13 +2182,24 @@ export class ChatService {
    * 档位与会话级焚毁共用 BURN_DURATION_CHOICES;此前这里存的是天数,于是同一个
    * 功能在两个入口给出两张不同的档位表。
    *
-   * 返回 null 表示该用户关掉了它(0/未设置),不做任何过滤。
+   * cutoff 为 null 表示该用户关掉了它(0/未设置),不做任何过滤。
+   *
+   * startedAt 是开关的开启时间:早于它发出的消息不受这个窗口约束。缺了它,
+   * 打开开关的那一刻此前的全部历史就会一次性消失 —— 会话级焚毁的
+   * burnStartedAt 解决的是同一个问题,这里是查看者侧的对应物。
    */
-  private async selfDestructCutoff(userId: string): Promise<Date | null> {
-    const { messageSelfDestructSec } =
-      await this.privacySettings.getSettings(userId);
-    if (!messageSelfDestructSec) return null;
-    return new Date(Date.now() - messageSelfDestructSec * 1000);
+  private async selfDestructWindow(userId: string): Promise<ChatViewerPolicy> {
+    const { sec, startedAt } =
+      await this.privacySettings.getSelfDestructPolicy(userId);
+    if (!sec) return NO_VIEWER_RETENTION;
+    const activatedAt = startedAt ? new Date(startedAt) : null;
+    return {
+      cutoff: new Date(Date.now() - sec * 1000),
+      startedAt:
+        activatedAt && Number.isFinite(activatedAt.getTime())
+          ? activatedAt
+          : null,
+    };
   }
 
   /** 历史分页:height 键集向前翻,页内升序返回。 */
@@ -2225,13 +2235,13 @@ export class ChatService {
     // 访客(临时房)没有 User 行,查隐私设置只会拿到 2 天的默认值 —— 而临时房
     // 本身可以开 3 天甚至 7 天,于是活着的房间里超过 2 天的消息对访客凭空消失,
     // 他还没有任何地方能改这个设置。访客的保留边界是房间寿命,不是用户偏好。
-    const viewerCutoff =
+    const viewer =
       options.applyViewerRetention === false
-        ? null
-        : await this.selfDestructCutoff(userId);
+        ? NO_VIEWER_RETENTION
+        : await this.selfDestructWindow(userId);
     // S-01 会话级焚毁:与查看者保留期取更严(更晚的截止时间)。sweeper 每分钟
     // 真删,这里的过滤盖住「已到期、尚未被扫掉」的窗口。
-    const retention = buildChatRetentionWindow(conversation, viewerCutoff);
+    const retention = buildChatRetentionWindow(conversation, viewer);
     const heightCondition: Prisma.IntFilter = {
       ...(heightFloor > 0 ? { gt: heightFloor } : {}),
       ...(beforeHeight !== undefined ? { lt: beforeHeight } : {}),
@@ -2357,7 +2367,7 @@ export class ChatService {
     const floor = member.clearedBeforeHeight ?? 0;
     const retention = buildChatRetentionWindow(
       conversation,
-      await this.selfDestructCutoff(userId),
+      await this.selfDestructWindow(userId),
     );
     const lowerBound = new Date(monthStart);
     const messageWhere: Prisma.ChatMessageWhereInput = {
@@ -2444,7 +2454,7 @@ export class ChatService {
     // 搜索必须和 getHistory 用同一把尺子:否则自动销毁窗口之外的消息
     // 在历史里看不到、一搜就出来了,等于开了后门。清空水位与会话焚毁同理 ——
     // 「清空聊天记录」之后原文一搜即出,这个功能就等于没做。
-    const cutoff = await this.selfDestructCutoff(userId);
+    const viewer = await this.selfDestructWindow(userId);
     const burning = await this.prisma.chatConversation.findMany({
       where: {
         id: { in: memberships.map((m) => m.conversationID) },
@@ -2468,7 +2478,7 @@ export class ChatService {
         burnDurationSec: null,
         burnStartedAt: null,
       };
-      const retention = buildChatRetentionWindow(policy, cutoff);
+      const retention = buildChatRetentionWindow(policy, viewer);
       heightFloors.set(m.conversationID, floor);
       retentionWindows.set(m.conversationID, retention);
       if (floor <= 0 && !retention.burnCutoff) {
@@ -2486,6 +2496,14 @@ export class ChatService {
       });
     }
     const scope: Prisma.ChatMessageWhereInput[] = [];
+    // 查看者窗口在顶层统一施加一次(每会话的 burnWhere 已把它置空)。必须走
+    // 同一个构造,否则这里又会退回「只有下沿、没有开启边界」的老样子。
+    const viewerWhere = chatRetentionWhere({
+      viewerCutoff: viewer.cutoff,
+      viewerStartedAt: viewer.startedAt,
+      burnStartedAt: null,
+      burnCutoff: null,
+    });
     if (plain.length > 0) scope.push({ conversationID: { in: plain } });
     scope.push(...scoped);
     const rows = await this.prisma.chatMessage.findMany({
@@ -2494,7 +2512,7 @@ export class ChatService {
         deleted: false,
         type: { in: ['text', 'quote'] },
         content: { path: ['text'], string_contains: trimmed },
-        ...(cutoff ? { createdAt: { gte: cutoff } } : {}),
+        ...(viewerWhere.AND ? { AND: viewerWhere.AND } : {}),
       },
       orderBy: { createdAt: 'desc' },
       take: Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX),
@@ -2586,10 +2604,11 @@ export class ChatService {
       select: { id: true, burnDurationSec: true, burnStartedAt: true },
     });
     const burnById = new Map(burning.map((c) => [c.id, c]));
-    const viewerCutoff = await this.selfDestructCutoff(userId);
+    const viewer = await this.selfDestructWindow(userId);
     const ids: string[] = [];
     const floors: number[] = [];
     const viewerCutoffs: (Date | null)[] = [];
+    const viewerStarts: (Date | null)[] = [];
     const burnStarts: (Date | null)[] = [];
     const burnCutoffs: (Date | null)[] = [];
     const heightFloors = new Map<string, number>();
@@ -2599,7 +2618,7 @@ export class ChatService {
         burnDurationSec: null,
         burnStartedAt: null,
       };
-      const retention = buildChatRetentionWindow(policy, viewerCutoff);
+      const retention = buildChatRetentionWindow(policy, viewer);
       const floor = Math.max(
         m.clearedBeforeHeight ?? 0,
         m.conversation.clearedBeforeHeight ?? 0,
@@ -2607,6 +2626,7 @@ export class ChatService {
       ids.push(m.conversationID);
       floors.push(floor);
       viewerCutoffs.push(retention.viewerCutoff);
+      viewerStarts.push(retention.viewerStartedAt);
       burnStarts.push(retention.burnStartedAt);
       burnCutoffs.push(retention.burnCutoff);
       heightFloors.set(m.conversationID, floor);
@@ -2639,9 +2659,11 @@ export class ChatService {
         ${ids}::text[],
         ${floors}::int[],
         ${viewerCutoffs}::timestamptz[],
+        ${viewerStarts}::timestamptz[],
         ${burnStarts}::timestamptz[],
         ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", floor, "viewerCutoff", "burnStartedAt", "burnCutoff")
+      ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
+             "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."height" > w.floor
         -- 删除墓碑必须跨过焚毁时间窗返回;否则离线设备无法清掉早于当前
@@ -2649,6 +2671,7 @@ export class ChatService {
         AND (
           m."deleted" = true
           OR w."viewerCutoff" IS NULL
+          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
           OR m."createdAt" >= w."viewerCutoff"
         )
         AND (
@@ -2915,8 +2938,8 @@ export class ChatService {
       mine?.clearedBeforeHeight ?? 0,
       conv.clearedBeforeHeight ?? 0,
     );
-    const viewerCutoff = await this.selfDestructCutoff(userId);
-    const retention = buildChatRetentionWindow(conv, viewerCutoff);
+    const viewer = await this.selfDestructWindow(userId);
+    const retention = buildChatRetentionWindow(conv, viewer);
     const [unread, lastMessage] = await Promise.all([
       mine
         ? this.loadUnreadCounts(
@@ -3406,6 +3429,9 @@ export class ChatService {
   ): Promise<Map<string, MessageRow>> {
     if (conversationIds.length === 0) return new Map();
     const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
+    const viewerStarts = retentionWindows.map(
+      (window) => window.viewerStartedAt,
+    );
     const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
     const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
@@ -3419,12 +3445,18 @@ export class ChatService {
       JOIN unnest(
         ${conversationIds}::text[],
         ${viewerCutoffs}::timestamptz[],
+        ${viewerStarts}::timestamptz[],
         ${burnStarts}::timestamptz[],
         ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", "viewerCutoff", "burnStartedAt", "burnCutoff")
+      ) AS w("conversationID", "viewerCutoff", "viewerStartedAt",
+             "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
-        AND (w."viewerCutoff" IS NULL OR m."createdAt" >= w."viewerCutoff")
+        AND (
+          w."viewerCutoff" IS NULL
+          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
+          OR m."createdAt" >= w."viewerCutoff"
+        )
         AND (
           w."burnCutoff" IS NULL
           OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
@@ -3453,6 +3485,9 @@ export class ChatService {
     const ids = memberships.map((m) => m.conversationID);
     const floors = memberships.map((m) => m.lastReadHeight);
     const viewerCutoffs = retentionWindows.map((window) => window.viewerCutoff);
+    const viewerStarts = retentionWindows.map(
+      (window) => window.viewerStartedAt,
+    );
     const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
     const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     const rows = await this.prisma.$queryRaw<
@@ -3464,13 +3499,19 @@ export class ChatService {
         ${ids}::text[],
         ${floors}::int[],
         ${viewerCutoffs}::timestamptz[],
+        ${viewerStarts}::timestamptz[],
         ${burnStarts}::timestamptz[],
         ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", floor, "viewerCutoff", "burnStartedAt", "burnCutoff")
+      ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
+             "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
         AND m."height" > w.floor
-        AND (w."viewerCutoff" IS NULL OR m."createdAt" >= w."viewerCutoff")
+        AND (
+          w."viewerCutoff" IS NULL
+          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
+          OR m."createdAt" >= w."viewerCutoff"
+        )
         AND (
           w."burnCutoff" IS NULL
           OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
