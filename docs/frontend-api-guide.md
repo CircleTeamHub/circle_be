@@ -2,6 +2,8 @@
 
 > Base URL: `http://localhost:3000`（开发环境）
 > 所有请求和响应均为 `application/json`
+> 所有响应都包一层统一信封 `{ code, message, data }`：成功时 `code` 为 `0`、`message` 为 `ok`，
+> 业务数据在 `data` 里。下文各节的「Response」展示的就是 `data` 的内容。
 
 ---
 
@@ -88,6 +90,10 @@ x-device-name: iPhone 15 Pro    // 设备名，用于会话管理
 }
 ```
 
+**错误：**
+- `409` `AUTH_EMAIL_TAKEN` — 该邮箱已注册
+- `400` — 字段缺失或格式不对，也包括多送了上表以外的字段
+
 > 聊天不再需要独立的 IM token：`/chat-ws` 用同一个 `accessToken` 握手（见
 > [self-hosted-chat.md](self-hosted-chat.md)）。
 
@@ -107,12 +113,13 @@ POST /auth/login
 }
 ```
 
-`identifier` 可填写邮箱或用户 ID。
+`identifier` 填邮箱或账号 ID（账号 ID 为 4-32 位字母、数字、下划线或短横线）。旧客户端用的
+`email` 字段仍然接受，但已废弃，新代码一律用 `identifier`。
 
 **Response 201：** 同注册
 
 **错误：**
-- `403` — 用户名/密码错误，或账号未激活
+- `403` `AUTH_INVALID_CREDENTIALS` — 账号不存在、密码不对或账号未激活。三种情况回同一个错误，避免被用来探测某个邮箱是否注册过。
 
 ---
 
@@ -128,6 +135,8 @@ POST /auth/refresh
   "refreshToken": "c8c1f46b2b9c..."
 }
 ```
+
+> `refreshToken` 是 128 位十六进制字符串，长度不符会直接 400。登出用同一个请求体。
 
 **Response 201：**
 ```json
@@ -1526,15 +1535,19 @@ Authorization: Bearer <accessToken>
 
 ## 错误处理
 
-所有错误响应格式：
+错误与成功共用同一个信封：
 
 ```json
 {
-  "statusCode": 400,
-  "message": "错误描述",
-  "error": "Bad Request"
+  "code": 403,                                  // 与 HTTP 状态码相同
+  "message": "邮箱或密码错误",                   // 面向用户的文案，可能调整
+  "data": null,                                 // 个别错误在这里带细节
+  "errorCode": "AUTH_INVALID_CREDENTIALS"       // 稳定错误码，只有部分错误带
 }
 ```
+
+判断具体原因请认 `errorCode`，它是稳定契约；没有 `errorCode` 时再退回 HTTP 状态码。
+`message` 只用于展示，不要拿来做分支。
 
 | HTTP 状态码 | 含义 | 常见场景 |
 |---|---|---|
@@ -1542,7 +1555,7 @@ Authorization: Bearer <accessToken>
 | `401` | 未授权 | accessToken 缺失或过期 |
 | `403` | 无权限 | 密码错误、账号禁用、操作他人数据 |
 | `404` | 资源不存在 | 用户不存在 |
-| `409` | 冲突 | 用户名已被注册 |
+| `409` | 冲突 | 邮箱已被注册 |
 
 ---
 
