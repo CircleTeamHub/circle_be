@@ -87,6 +87,7 @@ describe('ChatService', () => {
     emitRevoke: jest.fn(),
     emitRead: jest.fn(),
     emitHistoryCleared: jest.fn(),
+    emitHistoryClearedToUser: jest.fn(),
     emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
   };
   const groupEvents = {
@@ -2470,7 +2471,12 @@ describe('ChatService', () => {
         ])
         // loadDirectPeers 的对端成员查询。
         .mockResolvedValueOnce([
-          { conversationID: 'conv-1', userID: 'u2', lastReadHeight: 7 },
+          {
+            conversationID: 'conv-1',
+            userID: 'u2',
+            lastReadHeight: 7,
+            lastDeliveredHeight: 9,
+          },
         ]);
       // 末条消息与未读数各一次集合查询(不再每会话一次往返)。
       prisma.$queryRaw
@@ -2492,10 +2498,44 @@ describe('ChatService', () => {
         peer: { id: 'u2' },
         // chat:read 只在水位推进时广播;冷启动靠快照里的对端水位恢复「已读」。
         peerReadHeight: 7,
+        // chat:delivered 同理:离线期间对端送达的推进,只能从快照里补回来。
+        peerDeliveredHeight: 9,
         tempChat: null,
         unreadCount: 2,
         lastMessage: { id: 'msg-1' },
       });
+    });
+
+    it('carries the viewer read position and clear floor so other devices converge', async () => {
+      // 另一台设备读过/清空过,本机只能从快照里知道:不带的话,本机红点与
+      // 本地缓存里清空前的旧记录都会一直留着。
+      prisma.chatMember.findMany.mockResolvedValueOnce([
+        membership({
+          lastReadHeight: 12,
+          clearedBeforeHeight: 5,
+          conversation: {
+            ...membership().conversation,
+            clearedBeforeHeight: 8,
+          },
+        }),
+      ]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0]).toMatchObject({ readHeight: 12, clearedBeforeHeight: 8 });
+    });
+
+    it('does not count recalled messages as unread', async () => {
+      prisma.chatMember.findMany.mockResolvedValueOnce([membership()]);
+      prisma.$queryRaw.mockResolvedValue([]);
+
+      await service.listConversations('u1');
+
+      const unreadSql = (prisma.$queryRaw.mock.calls as unknown[][])
+        .map((call) => (call[0] as TemplateStringsArray).join('?'))
+        .find((sql) => sql.includes('COUNT(*)'));
+      expect(unreadSql).toContain('m."revokedAt" IS NULL');
     });
 
     it('returns the stable room title for TEMP conversations', async () => {
@@ -3129,6 +3169,10 @@ describe('ChatService', () => {
         conversationId: 'conv-1',
         messageId: 'm1',
         revokedBy: 'u1',
+        // 没打开过这个会话的设备手里没有这条消息:不带位置与作者的话,
+        // 它判断不了这条撤回要不要从未读里扣掉。
+        height: 5,
+        senderId: 'u1',
       });
       expect(dto.revokedBy).toBe('u1');
       expect(dto.content).toEqual({});
@@ -4488,6 +4532,13 @@ describe('ChatService', () => {
         data: { clearedBeforeHeight: 42 },
       });
       expect(broadcast.emitHistoryCleared).not.toHaveBeenCalled();
+      // 只清自己的记录也得让本人其它在线设备跟着清:原来只广播一条 chat:read,
+      // 另一台手机上清空前的记录原样留着。
+      expect(broadcast.emitHistoryClearedToUser).toHaveBeenCalledWith('u1', {
+        conversationId: 'conv-1',
+        clearedBeforeHeight: 42,
+        clearedBy: 'u1',
+      });
     });
 
     // 全群清空只推进当时在座的人是不够的：新座位建出来是 schema 默认的 0，

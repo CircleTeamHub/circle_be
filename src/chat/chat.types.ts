@@ -92,6 +92,12 @@ export interface ChatRevokeBroadcast {
   conversationId: string;
   messageId: string;
   revokedBy: string;
+  /**
+   * 被撤回消息的位置与作者。没加载过这个会话的设备手里没有这条消息,
+   * 靠它们判断这条撤回要不要从本机未读里扣掉(别人发的、在已读位之上才算过未读)。
+   */
+  height: number;
+  senderId: string | null;
 }
 
 /** chat:delivered:C→S 上报载荷与 S→C 广播同形。 */
@@ -182,7 +188,10 @@ export interface ChatReadBroadcast {
   height: number;
 }
 
-/** 会话全局清空广播；个人清空不会发送该事件。 */
+/**
+ * 清空聊天记录广播。全群清空发到会话房;只清自己的发到本人个人房
+ * (同步本人其它在线设备)。离线设备靠会话快照里的 clearedBeforeHeight 追平。
+ */
 export interface ChatHistoryClearedBroadcast {
   conversationId: string;
   clearedBeforeHeight: number;
@@ -372,6 +381,21 @@ export interface ChatConversationDto {
    * 广播给会话房。
    */
   peerReadHeight: number | null;
+  /**
+   * DIRECT 会话对端座位的送达水位(ChatMember.lastDeliveredHeight);其余类型为 null。
+   * chat:delivered 只在线广播,离线期间对端的送达推进只能从这里补回来。
+   */
+  peerDeliveredHeight: number | null;
+  /**
+   * 本人的已读水位(ChatMember.lastReadHeight)。另一台设备读过时,本机靠它收敛
+   * 红点;客户端按它与本机已知值取大,只前进。
+   */
+  readHeight: number;
+  /**
+   * 本人视角的清空水位 = max(座位, 会话级)。另一台设备清空过、或清空时本机离线,
+   * 本机本地缓存里水位之下的记录要据此删掉。
+   */
+  clearedBeforeHeight: number;
   lastMessageAt: string | null;
   /**
    * 本人加入该会话的时刻(ChatMember.joinedAt)。「新的群组」按它倒序 ——

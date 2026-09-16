@@ -148,6 +148,14 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       .emit(CHAT_EVENTS.historyCleared, payload);
   }
 
+  /** 只清自己的记录 → 本人个人房(其它在线设备跟着清本地缓存)。 */
+  emitHistoryClearedToUser(
+    userId: string,
+    payload: ChatHistoryClearedBroadcast,
+  ): void {
+    this.emitToUser(userId, CHAT_EVENTS.historyCleared, payload);
+  }
+
   /**
    * 阅后即焚墓碑已提交 → 当前在座成员的个人房(与 chat:msg 同一条授权边界)。
    *

@@ -106,6 +106,7 @@ type GroupFacets = Pick<
 interface DirectPeers {
   info: Map<string, ChatSenderInfo>;
   readHeights: Map<string, number>;
+  deliveredHeights: Map<string, number>;
 }
 
 const NON_GROUP_FACETS: GroupFacets = {
@@ -1111,6 +1112,10 @@ export class ChatService {
         burnDurationSec: m.conversation.burnDurationSec ?? null,
         burnStartedAt: m.conversation.burnStartedAt?.toISOString() ?? null,
         peerReadHeight: directPeers.readHeights.get(m.conversationID) ?? null,
+        peerDeliveredHeight:
+          directPeers.deliveredHeights.get(m.conversationID) ?? null,
+        readHeight: m.lastReadHeight,
+        clearedBeforeHeight: conversationFloor,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
       };
@@ -2020,6 +2025,7 @@ export class ChatService {
         : Promise.resolve<DirectPeers>({
             info: new Map(),
             readHeights: new Map(),
+            deliveredHeights: new Map(),
           }),
       member.conversation.tempChatID
         ? this.loadTempChatInfos([member.conversation.tempChatID])
@@ -2083,6 +2089,10 @@ export class ChatService {
       burnDurationSec: member.conversation.burnDurationSec ?? null,
       burnStartedAt: member.conversation.burnStartedAt?.toISOString() ?? null,
       peerReadHeight: directPeers.readHeights.get(conversationId) ?? null,
+      peerDeliveredHeight:
+        directPeers.deliveredHeights.get(conversationId) ?? null,
+      readHeight: member.lastReadHeight,
+      clearedBeforeHeight: floor,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
     };
@@ -2999,6 +3009,11 @@ export class ChatService {
       peerReadHeight:
         conv.members.find((m) => m.userID === peerUserId)?.lastReadHeight ??
         null,
+      peerDeliveredHeight:
+        conv.members.find((m) => m.userID === peerUserId)
+          ?.lastDeliveredHeight ?? null,
+      readHeight: mine?.lastReadHeight ?? 0,
+      clearedBeforeHeight: clearedFloor,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
@@ -3522,6 +3537,8 @@ export class ChatService {
              "burnStartedAt", "burnCutoff")
         ON w."conversationID" = m."conversationID"
       WHERE m."deleted" = false
+        -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
+        AND m."revokedAt" IS NULL
         AND m."height" > w.floor
         AND (
           w."viewerCutoff" IS NULL
@@ -3551,14 +3568,23 @@ export class ChatService {
     conversationIds: string[],
   ): Promise<DirectPeers> {
     if (conversationIds.length === 0) {
-      return { info: new Map(), readHeights: new Map() };
+      return {
+        info: new Map(),
+        readHeights: new Map(),
+        deliveredHeights: new Map(),
+      };
     }
     const others = await this.prisma.chatMember.findMany({
       where: {
         conversationID: { in: conversationIds },
         userID: { not: userId },
       },
-      select: { conversationID: true, userID: true, lastReadHeight: true },
+      select: {
+        conversationID: true,
+        userID: true,
+        lastReadHeight: true,
+        lastDeliveredHeight: true,
+      },
     });
     const users = await this.resolveSenders(
       others.map((o) => o.userID),
@@ -3566,12 +3592,17 @@ export class ChatService {
     );
     const info = new Map<string, ChatSenderInfo>();
     const readHeights = new Map<string, number>();
+    const deliveredHeights = new Map<string, number>();
     others.forEach((o) => {
       const user = users.get(o.userID);
       if (user) info.set(o.conversationID, user);
       readHeights.set(o.conversationID, o.lastReadHeight);
+      // 老桩/老行没有这一列时不瞎报 0:0 会被当成「从没送达」覆盖掉实时值。
+      if (typeof o.lastDeliveredHeight === 'number') {
+        deliveredHeights.set(o.conversationID, o.lastDeliveredHeight);
+      }
     });
-    return { info, readHeights };
+    return { info, readHeights, deliveredHeights };
   }
 
   /** GROUP 会话的圈子展示信息(群名/群头像来源)。 */
@@ -3912,6 +3943,8 @@ export class ChatService {
       conversationId,
       messageId,
       revokedBy: userId,
+      height: updated.height,
+      senderId: updated.senderID,
     });
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],
@@ -4707,6 +4740,22 @@ export class ChatService {
       }
       try {
         await this.systemMessage.broadcastSystemMessage(notice);
+      } catch (error) {
+        this.logger.warn(
+          `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
+        );
+      }
+    }
+    if (!isGlobalClear) {
+      // 只清自己的记录:本人其它在线设备也要跟着清本地缓存。上面那条 chat:read
+      // 只动红点,清空前的记录会原样留在另一台手机上;离线设备靠会话快照里的
+      // clearedBeforeHeight 追平。
+      try {
+        this.broadcast.emitHistoryClearedToUser(userId, {
+          conversationId,
+          clearedBeforeHeight: watermark,
+          clearedBy: userId,
+        });
       } catch (error) {
         this.logger.warn(
           `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,
