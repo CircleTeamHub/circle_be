@@ -6194,6 +6194,76 @@ describe('ChatService', () => {
       expect(list[0].lastMessage?.d).toBe('client-msg-1');
     });
 
+    // 单会话 DTO 供「取或建会话」「改偏好」「建群 / 入群 / 改名」等一批响应复用，
+    // 客户端拿它回填会话缓存 —— 它和会话列表是两条独立的构建路径。
+    it('nulls another member d on the single-conversation dto', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.$queryRaw.mockResolvedValueOnce([peerRow]).mockResolvedValue([]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {});
+
+      expect(dto.lastMessage).toHaveProperty('d', null);
+    });
+
+    it('keeps the viewer own key on the single-conversation dto', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.$queryRaw.mockResolvedValueOnce([createdRow]).mockResolvedValue([]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {});
+
+      expect(dto.lastMessage?.d).toBe('client-msg-1');
+    });
+
+    // viewerId 排在 heightFloor / retention 这些带默认值的形参前面，传错位置不会有
+    // 类型错误（strictNullChecks 是关的），只会让作者本人也拿不到自己的键。用「取或
+    // 建单聊」这条唯一调用点把参数顺序钉住。
+    it('keeps the viewer own key on the direct-conversation preview', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'u2',
+        nickname: '对方',
+        avatarUrl: null,
+        status: 'ACTIVE',
+      });
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ id: 'f1' });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        type: 'DIRECT',
+        directKey: 'u1:u2',
+        circleID: null,
+        tempChatID: null,
+        lastMessageAt: new Date(),
+        clearedBeforeHeight: 0,
+        burnDurationSec: null,
+        burnStartedAt: null,
+        members: [
+          {
+            id: 'm1',
+            userID: 'u1',
+            leftAt: null,
+            pinned: false,
+            muted: false,
+            lastReadHeight: 0,
+            clearedBeforeHeight: 0,
+          },
+          {
+            id: 'm2',
+            userID: 'u2',
+            leftAt: null,
+            pinned: false,
+            muted: false,
+            lastReadHeight: 0,
+            clearedBeforeHeight: 0,
+          },
+        ],
+      });
+      prisma.chatMessage.findFirst.mockResolvedValue(createdRow);
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(dto.lastMessage?.d).toBe('client-msg-1');
+    });
+
     // 离线增量补拉是这条口径最容易漏的一处：它走原始 SQL，不经过 findMany 那条路径。
     it('nulls another member d in the offline mutation delta', async () => {
       prisma.chatMember.findMany.mockResolvedValue([
