@@ -2704,6 +2704,144 @@ describe('NoteService', () => {
     ).resolves.toBeDefined();
   });
 
+  // presign 对私有目录(notes/)不再返回 fileUrl,客户端只拿得到 objectKey。NoteMedia.url
+  // 仍是非空列,缺省时由服务端按 objectKey 拼出持久 base url —— 读取路径本来就按
+  // objectKey 现签短时 GET,这个值只用于归一与去重。客户端给了 url 的照旧(仍要钉本站存储)。
+  it('derives the stored media url from objectKey when the client sends none', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+    );
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 2,
+      videoCount: 0,
+      mediaCount: 2,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'keyless note',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/keyless.jpg',
+            sortOrder: 0,
+          },
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/with-url.jpg',
+            url: 'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg?X-Amz-Signature=abc',
+            sortOrder: 1,
+          },
+          // App 原样透传 presign.fileUrl 时私有目录上就是显式 null,与省略同一条分支。
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/null-url.jpg',
+            url: null,
+            sortOrder: 2,
+          },
+        ],
+      } as any),
+    ).resolves.toBeDefined();
+
+    const rows = prisma.noteMedia.createMany.mock.calls.at(-1)?.[0].data;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        objectKey: 'notes/user-1/keyless.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/keyless.jpg',
+      }),
+      expect.objectContaining({
+        objectKey: 'notes/user-1/with-url.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
+      }),
+      expect.objectContaining({
+        objectKey: 'notes/user-1/null-url.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
+      }),
+    ]);
+    // sections 里冻结的那份要跟媒体行同一条 url,否则读取时按 url 换签名 URL 会对不上。
+    const sections = prisma.note.create.mock.calls.at(-1)?.[0].data.sections;
+    expect(
+      sections.media.items.map((item: { url: string }) => item.url),
+    ).toEqual([
+      'http://10.0.0.195:9000/circle/notes/user-1/keyless.jpg',
+      'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
+      'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
+    ]);
+  });
+
+  // 同一条口径必须覆盖正文块：App 把 presign.fileUrl 原样塞进块 props 时，私有目录上
+  // 就是 null。deriveMediaFromBlocks 此前要求 url 与 objectKey 同时非空，于是这类块的
+  // 媒体被整条丢掉 —— 请求照样 201，笔记里一张图都没有，客户端也收不到任何错误。
+  it('derives block-derived media urls from objectKey as well', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+    );
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 'block media',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'block media',
+        contentJson: [
+          {
+            id: 'image-1',
+            type: 'image',
+            props: { objectKey: 'notes/user-1/block.jpg', url: null },
+          },
+        ],
+        media: [],
+      } as any),
+    ).resolves.toBeDefined();
+
+    const rows = prisma.noteMedia.createMany.mock.calls.at(-1)?.[0].data;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        type: 'IMAGE',
+        objectKey: 'notes/user-1/block.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/block.jpg',
+      }),
+    ]);
+  });
+
   describe('manual titles and table text', () => {
     const row = {
       id: 'note-rich',

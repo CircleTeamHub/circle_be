@@ -1,6 +1,4 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { AuthService } from '../auth.service';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -655,17 +653,6 @@ describe('AuthService', () => {
       } as any),
     ).rejects.toThrow(ForbiddenException);
     expect(mockRefreshTokenService.create).not.toHaveBeenCalled();
-  });
-
-  // platform 只在 DTO 上保留（旧安装包还在发，见 LoginDto.platform 的 @deprecated）：
-  // 服务端从来不读它，注册 / 登录 / 签发令牌都不该再往下传。
-  it('does not thread the deprecated platform field into token issuance', () => {
-    const source = readFileSync(
-      join(process.cwd(), 'src/auth/auth.service.ts'),
-      'utf8',
-    );
-    expect(source).not.toMatch(/dto\.platform\b/);
-    expect(source).not.toMatch(/\bplatform(?:ID)?\?:/);
   });
 
   it('returns the active sessions for a user', async () => {

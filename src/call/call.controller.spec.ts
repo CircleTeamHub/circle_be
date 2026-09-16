@@ -59,7 +59,7 @@ describe('CallController', () => {
 
     await controller.acceptCall('call-1', req);
     await controller.rejectCall('call-1', req);
-    await controller.leaveCall('call-1', { reason: 'NORMAL' }, req);
+    await controller.leaveCall('call-1', req);
     await controller.cancelCall('call-1', req);
     await controller.createJoinToken('call-1', req);
 
@@ -68,6 +68,25 @@ describe('CallController', () => {
     expect(service.leaveCall).toHaveBeenCalledWith('user-2', 'call-1');
     expect(service.cancelCall).toHaveBeenCalledWith('user-2', 'call-1');
     expect(service.createJoinToken).toHaveBeenCalledWith('user-2', 'call-1');
+  });
+
+  // 挂断是通话里最不能失败的一步:挂不断的那一方会把通话卡在 ACTIVE。所以这条路由
+  // 不声明 @Body() —— 全局 ValidationPipe 只校验被装饰器登记过的参数,没有 body 参数
+  // 就没有 body 校验,forbidNonWhitelisted 也就打不到旧客户端多发的任何字段上
+  // (历史上是 reason)。谁把 @Body() 加回来,旧安装包的挂断就会被拒成 400。
+  it('leaveCall takes only the call id and the request', () => {
+    const paramTypesOf = (handler: 'leaveCall' | 'acceptCall') =>
+      Object.keys(
+        (Reflect.getMetadata(ROUTE_ARGS_METADATA, CallController, handler) ??
+          {}) as Record<string, unknown>,
+      )
+        // key 形如 `<RouteParamtypes>:<参数下标>`,取前半段即参数种类。
+        .map((key) => key.split(':')[0])
+        .sort((a, b) => a.localeCompare(b));
+
+    // acceptCall 就是「只收 callId + req」的样板。
+    expect(paramTypesOf('leaveCall')).toEqual(paramTypesOf('acceptCall'));
+    expect(CallController.prototype.leaveCall).toHaveLength(2);
   });
 
   // CallSession.id 只由 startCall 的 randomUUID() 生成:非 uuid 的 callId 不可能命中

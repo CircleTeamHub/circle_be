@@ -935,6 +935,30 @@ export class NoteService {
     assertUrlsFromStorage(urls, this.storagePublicObjectBases, 'media url');
   }
 
+  /**
+   * 落库用的持久 url。NoteMedia.url 是非空列，而 presign 对私有目录（notes/）不再返回
+   * fileUrl —— 客户端只拿得到 objectKey，这里按站内对象基址（写入恒用 canonical，即
+   * storagePublicObjectBases[0]，与 UploadService 的 publicObjectBase 同源）补出来。
+   * 读取路径本来就按 objectKey 现签短时 GET，这个值只用于归一、去重与存量数据兼容。
+   *
+   * 客户端给了 url 就照旧，只 strip 掉 edit 回传的签名 query；来源校验仍归
+   * {@link assertMediaUrlsAreSafe}，归属校验仍归 {@link assertMediaOwnership}。
+   */
+  private resolveMediaUrl(item: { url?: string; objectKey?: string }): string {
+    if (typeof item.url === 'string' && item.url) {
+      return item.url.split('?')[0];
+    }
+    const base = this.storagePublicObjectBases[0];
+    // 对象存储没配时上传本来就是关的，拿不到合法 objectKey —— 与其写一条拼不出来的
+    // 地址进非空列，不如当场 400 说清楚。
+    if (!base || typeof item.objectKey !== 'string' || !item.objectKey) {
+      throw new BadRequestException(
+        'media url is required when it cannot be derived from objectKey',
+      );
+    }
+    return `${base}/${item.objectKey}`;
+  }
+
   private buildMediaStats(media: CreateNoteDto['media']) {
     const imageCount = media.filter((item) => item.type === 'IMAGE').length;
     const videoCount = media.filter((item) => item.type === 'VIDEO').length;
@@ -1205,11 +1229,14 @@ export class NoteService {
           const objectKey =
             typeof props.objectKey === 'string' ? props.objectKey : '';
 
-          if (url && objectKey) {
+          // 只要有 objectKey 就收下：url 缺省或为 null（App 把私有目录的
+          // presign.fileUrl 原样透传时就是 null）由 resolveMediaUrl 按 key 推导，
+          // 与 media[] 同一条口径。没有 objectKey 的块无从校验归属，照旧跳过。
+          if (objectKey) {
             media.push({
               type: block.type === 'video' ? 'VIDEO' : 'IMAGE',
               objectKey,
-              url,
+              url: url || undefined,
               mimeType:
                 typeof props.mimeType === 'string' ? props.mimeType : undefined,
               size: typeof props.size === 'number' ? props.size : undefined,
@@ -1266,10 +1293,11 @@ export class NoteService {
     }
 
     // 客户端 edit 时会回传读到的签名 url；写入前 strip 掉 query，只存持久 base url
-    //（读取时才现签短时 URL）。base url 本无 query，strip 无副作用。
+    //（读取时才现签短时 URL）。base url 本无 query，strip 无副作用。没带 url 的按
+    // objectKey 补出来，见 resolveMediaUrl。
     derivedMedia = derivedMedia.map((item) => ({
       ...item,
-      url: typeof item.url === 'string' ? item.url.split('?')[0] : item.url,
+      url: this.resolveMediaUrl(item),
       ...(typeof (item as { posterUrl?: unknown }).posterUrl === 'string'
         ? {
             posterUrl: (item as { posterUrl: string }).posterUrl.split('?')[0],

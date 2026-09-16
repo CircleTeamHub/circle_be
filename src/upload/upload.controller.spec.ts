@@ -188,9 +188,9 @@ describe('UploadController', () => {
     expect(uploadService.presign).not.toHaveBeenCalled();
   });
 
-  // 已装机 App 把 fileUrl 当必填字段校验,所以私有目录暂时仍返回它;但文档不能再说它是
-  // 「永久访问地址」—— chat/notes 对象不在匿名可读白名单里,直连 403,读取要凭 key。
-  it('documents fileUrl as directly readable only for public folders', () => {
+  // chat/notes 对象不在匿名可读白名单里,直连 403 —— 私有目录的 fileUrl 是 null,文档
+  // 必须照实说清楚(既不能再叫「永久访问地址」,也不能让客户端以为还有链接可存)。
+  it('documents fileUrl as null outside the public folders', () => {
     const operation = Reflect.getMetadata(
       'swagger/apiOperation',
       UploadController.prototype.presign,
@@ -209,6 +209,7 @@ describe('UploadController', () => {
       expect(description).toContain(folder);
     }
     expect(description).toContain('key');
+    expect(description).toContain('null');
     expect(description).not.toContain('永久访问地址');
   });
 });

@@ -710,8 +710,8 @@ describe('UploadService', () => {
   });
 
   // 访客那份 filename 正则为了放行 Unicode 名称,只禁路径分隔符与控制字符 ——
-  // `?`/`#`/空格照样能进来。扩展名会裸拼进 object key 与 fileUrl,不在这里收口
-  // 就会造出解析错位的 URL。
+  // `?`/`#`/空格照样能进来。扩展名会裸拼进 object key(公开目录还会拼进 fileUrl),
+  // 不在这里收口就会造出解析错位的 URL。
   it('sanitizes the filename extension before it reaches the object key', async () => {
     const service = new UploadService({
       get: (key: string) =>
@@ -733,8 +733,19 @@ describe('UploadService', () => {
       'guest-1',
     );
     expect(hostile.key).toMatch(/^chat\/guest-1\/[0-9a-f-]{36}\.mp4x1frag$/);
-    expect(hostile.fileUrl).toBe(
-      `https://api.example.com/circle/${hostile.key}`,
+    // chat 是私有目录 —— 没有直链可发。同一个名字进公开目录时,收口后的扩展名
+    // 才会原样出现在 fileUrl 里。
+    expect(hostile.fileUrl).toBeNull();
+
+    const publicGrant = await service.presign(
+      '\u6d4b\u8bd5 clip.mp4?x=1#frag',
+      'video/mp4',
+      1024,
+      'posts',
+      'user-1',
+    );
+    expect(publicGrant.fileUrl).toBe(
+      `https://api.example.com/circle/${publicGrant.key}`,
     );
 
     const noExtension = await service.presign(
@@ -1077,6 +1088,52 @@ describe('UploadService', () => {
       });
     },
   );
+
+  // 私有目录(notes/、chat/)不在匿名可读白名单里 —— 直连对象一定 403。给出一条必然
+  // 坏掉的地址比给 null 更糟:客户端会把它当持久地址存进笔记/消息体,坏在读取那天。
+  // 私有目录读取一律凭 key 走各自读路径的短时签名 GET。
+  it('returns fileUrl only for publicly readable folders', async () => {
+    jest
+      .mocked(getSignedUrl)
+      .mockResolvedValue(`${privateMinioUrl}/circle/put?signature=1`);
+    const service = new UploadService({
+      get: (key: string) =>
+        (
+          ({
+            MINIO_ENDPOINT: 'http://localhost:9000',
+            MINIO_ACCESS_KEY: 'minioadmin',
+            MINIO_SECRET_KEY: 'minioadmin123',
+            MINIO_BUCKET: 'circle',
+            MINIO_PUBLIC_URL: privateMinioUrl,
+          }) as Record<string, string>
+        )[key] ?? null,
+    } as any);
+    (service as any).ready = true;
+
+    const publicGrant = await service.presign(
+      'photo.jpg',
+      'image/jpeg',
+      1024,
+      'posts',
+      'user-1',
+    );
+    expect(publicGrant.fileUrl).toBe(
+      `${privateMinioUrl}/circle/${publicGrant.key}`,
+    );
+
+    for (const folder of ['notes', 'chat']) {
+      const privateGrant = await service.presign(
+        'photo.jpg',
+        'image/jpeg',
+        1024,
+        folder,
+        'user-1',
+      );
+      expect(privateGrant.fileUrl).toBeNull();
+      // key 仍然带用户命名空间 —— 私有目录的读取和归属校验全靠它。
+      expect(privateGrant.key.startsWith(`${folder}/user-1/`)).toBe(true);
+    }
+  });
 });
 
 describe('matchesCorsWildcard', () => {

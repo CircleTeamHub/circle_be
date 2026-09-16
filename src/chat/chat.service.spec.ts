@@ -6123,4 +6123,184 @@ describe('ChatService', () => {
       ).resolves.toMatchObject({ row });
     });
   });
+
+  /**
+   * d 是**发送者本机**生成的幂等键(deliveryId):只有他自己的设备拿它把乐观气泡
+   * 换成服务端消息。实时路径早就按这个语义收口了 —— chat-broadcast.service 只把
+   * 带 d 的载荷发给发送者的个人房,其余在座成员收 d:null。REST 读路径却把库里的
+   * clientMessageId 原样发给所有人:历史分页、全局搜索、会话列表末条,每一处都在
+   * 把别人设备生成的键交给旁观者。同一个字段两套口径,漏的那一套还是默认路径。
+   */
+  describe('客户端幂等键 d 的可见范围(REST 读路径)', () => {
+    const peerRow = {
+      ...createdRow,
+      id: 'msg-peer',
+      senderID: 'u2',
+      clientMessageId: 'u2-device-key',
+    };
+
+    it('nulls another member d in history but keeps the viewer own key', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { ...createdRow, id: 'msg-own', height: 5 },
+        { ...peerRow, height: 4 },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      const byId = new Map(page.messages.map((m) => [m.id, m]));
+      // 字段仍在、只是为 null:已装机 App 的协议校验允许 null d,只对非 null 建索引。
+      expect(byId.get('msg-peer')).toHaveProperty('d', null);
+      expect(byId.get('msg-own')?.d).toBe('client-msg-1');
+    });
+
+    it('nulls another member d on the conversation list preview', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            ...membership(),
+            conversation: {
+              ...membership().conversation,
+              lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+            },
+          },
+        ])
+        .mockResolvedValueOnce([]);
+      prisma.$queryRaw.mockResolvedValueOnce([peerRow]).mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0].lastMessage).toHaveProperty('d', null);
+    });
+
+    it('keeps the viewer own key on the conversation list preview', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            ...membership(),
+            conversation: {
+              ...membership().conversation,
+              lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+            },
+          },
+        ])
+        .mockResolvedValueOnce([]);
+      prisma.$queryRaw
+        .mockResolvedValueOnce([createdRow])
+        .mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0].lastMessage?.d).toBe('client-msg-1');
+    });
+
+    // 单会话 DTO 供「取或建会话」「改偏好」「建群 / 入群 / 改名」等一批响应复用，
+    // 客户端拿它回填会话缓存 —— 它和会话列表是两条独立的构建路径。
+    it('nulls another member d on the single-conversation dto', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.$queryRaw.mockResolvedValueOnce([peerRow]).mockResolvedValue([]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {});
+
+      expect(dto.lastMessage).toHaveProperty('d', null);
+    });
+
+    it('keeps the viewer own key on the single-conversation dto', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.$queryRaw
+        .mockResolvedValueOnce([createdRow])
+        .mockResolvedValue([]);
+
+      const dto = await service.setConversationPreferences('u1', 'conv-1', {});
+
+      expect(dto.lastMessage?.d).toBe('client-msg-1');
+    });
+
+    // viewerId 排在 heightFloor / retention 这些带默认值的形参前面，传错位置不会有
+    // 类型错误（strictNullChecks 是关的），只会让作者本人也拿不到自己的键。用「取或
+    // 建单聊」这条唯一调用点把参数顺序钉住。
+    it('keeps the viewer own key on the direct-conversation preview', async () => {
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'u2',
+        nickname: '对方',
+        avatarUrl: null,
+        status: 'ACTIVE',
+      });
+      prisma.block.findFirst.mockResolvedValue(null);
+      prisma.friend.findFirst.mockResolvedValue({ id: 'f1' });
+      prisma.chatConversation.findUnique.mockResolvedValue({
+        id: 'conv-1',
+        type: 'DIRECT',
+        directKey: 'u1:u2',
+        circleID: null,
+        tempChatID: null,
+        lastMessageAt: new Date(),
+        clearedBeforeHeight: 0,
+        burnDurationSec: null,
+        burnStartedAt: null,
+        members: [
+          {
+            id: 'm1',
+            userID: 'u1',
+            leftAt: null,
+            pinned: false,
+            muted: false,
+            lastReadHeight: 0,
+            clearedBeforeHeight: 0,
+          },
+          {
+            id: 'm2',
+            userID: 'u2',
+            leftAt: null,
+            pinned: false,
+            muted: false,
+            lastReadHeight: 0,
+            clearedBeforeHeight: 0,
+          },
+        ],
+      });
+      prisma.chatMessage.findFirst.mockResolvedValue(createdRow);
+
+      const dto = await service.getOrCreateDirectConversation('u1', 'u2');
+
+      expect(dto.lastMessage?.d).toBe('client-msg-1');
+    });
+
+    // 离线增量补拉是这条口径最容易漏的一处：它走原始 SQL，不经过 findMany 那条路径。
+    it('nulls another member d in the offline mutation delta', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          ...peerRow,
+          mutatedAt: new Date(),
+          revokedAt: new Date(),
+          revokedBy: 'u2',
+        },
+      ]);
+
+      const result = await service.listMutationsSince(
+        'u1',
+        new Date(Date.now() - 60_000),
+      );
+
+      expect(result.messages[0]).toHaveProperty('d', null);
+    });
+
+    it('nulls another member d in global search results', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+      ]);
+      prisma.chatMessage.findMany.mockResolvedValue([peerRow]);
+
+      const rows = await service.searchAllMessages('u1', 'hello');
+
+      expect(rows[0]).toHaveProperty('d', null);
+    });
+  });
 });

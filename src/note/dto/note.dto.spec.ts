@@ -373,6 +373,42 @@ describe('CreateNoteMediaDto integer fields stay within Postgres int4', () => {
   );
 });
 
+// presign 对私有目录(notes/)不再返回 fileUrl,客户端只拿得到 objectKey。url 因此
+// 必须可省 —— 否则 App 为了过校验只能自己拼一条直链,那正是要消掉的东西。
+describe('CreateNoteMediaDto url is optional', () => {
+  const errorsFor = (payload: Record<string, unknown>) =>
+    validateSync(
+      plainToInstance(CreateNoteMediaDto, {
+        type: 'IMAGE',
+        objectKey: 'notes/user-1/1.jpg',
+        sortOrder: 0,
+        ...payload,
+      }),
+    );
+
+  it('accepts media that carries only an objectKey', () => {
+    expect(errorsFor({})).toEqual([]);
+  });
+
+  // App 把 presign 的 fileUrl 原样透传时,私有目录上就是显式 null。@IsOptional 放行
+  // null,服务端走同一条按 objectKey 推导的分支 —— 客户端一行不改也不会 400。
+  it('accepts an explicit null url', () => {
+    expect(errorsFor({ url: null })).toEqual([]);
+  });
+
+  // 省略合法、乱填不合法:传上来的 url 仍要是 URL(服务端还会再钉到本站存储)。
+  it('still rejects a url that is not a URL', () => {
+    expect(
+      errorsFor({ url: 'not a url' }).some((error) => error.property === 'url'),
+    ).toBe(true);
+    expect(
+      errorsFor({ url: 'https://cdn.example.com/1.jpg' }).some(
+        (error) => error.property === 'url',
+      ),
+    ).toBe(false);
+  });
+});
+
 // app 的 fetchNotes / fetchDeletedNotes 从不传 page/limit：默认页必须装得下整本笔记，
 // 否则超过默认页（以前 50）的笔记被静默截掉。显式上限同样放到 500。
 describe('note list query limits', () => {
