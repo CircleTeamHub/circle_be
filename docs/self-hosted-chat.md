@@ -42,6 +42,10 @@
 | `chat:read` | `{conversationId, userId, height}` |
 | `chat:typing` | `{conversationId, userId}` |
 
+`d` 只发给它的作者本人:实时投递按收件人逐份塑形(发送者的个人房收原值,其余成员收
+`null`),REST 的历史、搜索、会话末条与离线增量同一口径。字段保持存在且可空,客户端
+只对非 `null` 的键建索引,去重仍按消息 id。
+
 房间:连接即入个人房 `u:{userId}` + 按 `ChatMember` 派生的全部会话房
 `c:{conversationId}`(服务端派生,客户端无法自选)。
 

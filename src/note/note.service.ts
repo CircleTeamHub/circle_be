@@ -1229,11 +1229,14 @@ export class NoteService {
           const objectKey =
             typeof props.objectKey === 'string' ? props.objectKey : '';
 
-          if (url && objectKey) {
+          // 只要有 objectKey 就收下：url 缺省或为 null（App 把私有目录的
+          // presign.fileUrl 原样透传时就是 null）由 resolveMediaUrl 按 key 推导，
+          // 与 media[] 同一条口径。没有 objectKey 的块无从校验归属，照旧跳过。
+          if (objectKey) {
             media.push({
               type: block.type === 'video' ? 'VIDEO' : 'IMAGE',
               objectKey,
-              url,
+              url: url || undefined,
               mimeType:
                 typeof props.mimeType === 'string' ? props.mimeType : undefined,
               size: typeof props.size === 'number' ? props.size : undefined,

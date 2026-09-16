@@ -6194,6 +6194,32 @@ describe('ChatService', () => {
       expect(list[0].lastMessage?.d).toBe('client-msg-1');
     });
 
+    // 离线增量补拉是这条口径最容易漏的一处：它走原始 SQL，不经过 findMany 那条路径。
+    it('nulls another member d in the offline mutation delta', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        {
+          conversationID: 'conv-1',
+          clearedBeforeHeight: 0,
+          conversation: { clearedBeforeHeight: 0 },
+        },
+      ]);
+      prisma.$queryRaw.mockResolvedValue([
+        {
+          ...peerRow,
+          mutatedAt: new Date(),
+          revokedAt: new Date(),
+          revokedBy: 'u2',
+        },
+      ]);
+
+      const result = await service.listMutationsSince(
+        'u1',
+        new Date(Date.now() - 60_000),
+      );
+
+      expect(result.messages[0]).toHaveProperty('d', null);
+    });
+
     it('nulls another member d in global search results', async () => {
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },

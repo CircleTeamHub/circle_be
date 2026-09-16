@@ -1800,9 +1800,9 @@ describe('NoteService', () => {
       status: 'ACTIVE',
       available: true,
       pinned: false,
-      imageCount: 3,
+      imageCount: 2,
       videoCount: 0,
-      mediaCount: 3,
+      mediaCount: 2,
       groupMemberships: [],
       coverMedia: null,
       media: [
@@ -2784,6 +2784,61 @@ describe('NoteService', () => {
       'http://10.0.0.195:9000/circle/notes/user-1/keyless.jpg',
       'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
       'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
+    ]);
+  });
+
+  // 同一条口径必须覆盖正文块：App 把 presign.fileUrl 原样塞进块 props 时，私有目录上
+  // 就是 null。deriveMediaFromBlocks 此前要求 url 与 objectKey 同时非空，于是这类块的
+  // 媒体被整条丢掉 —— 请求照样 201，笔记里一张图都没有，客户端也收不到任何错误。
+  it('derives block-derived media urls from objectKey as well', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+    );
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 'block media',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 1,
+      videoCount: 0,
+      mediaCount: 1,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'block media',
+        contentJson: [
+          {
+            id: 'image-1',
+            type: 'image',
+            props: { objectKey: 'notes/user-1/block.jpg', url: null },
+          },
+        ],
+        media: [],
+      } as any),
+    ).resolves.toBeDefined();
+
+    const rows = prisma.noteMedia.createMany.mock.calls.at(-1)?.[0].data;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        type: 'IMAGE',
+        objectKey: 'notes/user-1/block.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/block.jpg',
+      }),
     ]);
   });
 
