@@ -389,16 +389,25 @@ notes     — 笔记图片/视频（私有）
 chat      — 聊天媒体（私有）
 ```
 
-> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）可直接读取、可直接写进资料/圈子/帖子。
-> `notes`、`chat` 是私有目录：直连 `fileUrl` 会被拒绝，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
-> 私有目录目前仍返回 `fileUrl` 只是为了兼容已装机 App 的必填校验，客户端不要依赖它。
+> `fileUrl` 只对公开目录（与桶策略同源：`PUBLIC_READ_UPLOAD_FOLDERS`）有值，可直接读取、可直接写进资料/圈子/帖子。
+> `notes`、`chat` 是私有目录：对象直连会被拒绝，`fileUrl` **固定为 `null`**，必须保存 `key`，读取走对应接口按 key 签发的短时 URL。
+> 客户端解析 presign 响应时 `fileUrl` 要按可空处理（私有目录不再有任何可存的直链）。
 
-**Response 201：**
+**Response 201（公开目录）：**
 ```json
 {
   "uploadUrl": "http://localhost:9000/circle/avatars/uuid.jpg?X-Amz-Algorithm=...（5分钟内有效，视频30分钟）",
   "fileUrl": "http://localhost:9000/circle/avatars/uuid.jpg",
   "key": "avatars/uuid.jpg"
+}
+```
+
+**Response 201（私有目录 `notes` / `chat`）：**
+```json
+{
+  "uploadUrl": "http://localhost:9000/circle/notes/user-1/uuid.jpg?X-Amz-Algorithm=...",
+  "fileUrl": null,
+  "key": "notes/user-1/uuid.jpg"
 }
 ```
 

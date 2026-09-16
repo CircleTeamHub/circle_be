@@ -138,7 +138,12 @@ export class TempChatController {
   @Post('guest/upload-presign')
   @UseGuards(TempChatGuestGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @ApiOperation({ summary: '访客聊天媒体上传预签名' })
+  @ApiOperation({
+    summary: '访客聊天媒体上传预签名',
+    description:
+      'chat 是私有目录：对象直连会被拒绝，fileUrl 固定为 null。' +
+      '访客端只保存 key，读取由聊天媒体读路径按 key 签发短时 GET URL。',
+  })
   async guestUploadPresign(
     @Req() req: RequestWithTempChatGuest,
     @Body() dto: GuestPresignDto,
