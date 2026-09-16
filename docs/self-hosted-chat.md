@@ -21,6 +21,7 @@
 |---|---|
 | 乱序 | `ChatMessage @@unique(conversationID, height)`;height 在事务内会话行锁(`SELECT..FOR UPDATE`)下由 `nextHeight` 计数器分配(批4 起;此前为 advisory lock + max 聚合) |
 | 断线重发重复 | `@@unique(conversationID, senderID, clientMessageId)`;撞库返回原行(`reused`),不重广播 |
+| 同一个 d 换了内容 | 落库时记下请求指纹 `requestHash`(type / content / 引用 / 转发源的规范化 sha256);撞库而指纹不同 → `CHAT_DELIVERY_ID_CONFLICT`,不再把库里那条当成功返回。媒体的 object key 与展示地址不进指纹(重发时重新上传会换 key,那仍是同一条);迁移前的行 `requestHash` 为空,一律放行 |
 | 丢消息 | 先落库后 ack:ack 返回 = 已持久化;客户端超时未 ack 可安全重发(幂等兜底) |
 | 已读回退 | `ChatMember.lastReadHeight` 只前进不后退(`updateMany` 带 `lt` 条件) |
 | 离线变更丢失 | 变更序号流(2026-09-16):新消息、撤回、编辑、表情回应、焚毁墓碑都由触发器在会话行锁下从 `nextRevision` 取号写进 `ChatMessage.revision`;客户端凭一个 `afterRevision` 游标追平,见下文 |

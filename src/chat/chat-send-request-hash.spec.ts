@@ -59,4 +59,48 @@ describe('chatSendRequestHash', () => {
       ),
     );
   });
+
+  it('treats a re-uploaded copy of the same media as the same request', () => {
+    // 首发已落库、ack 丢了:客户端重发时重新上传,拿到的是新 key。
+    const first = payload({
+      type: 'image',
+      content: {
+        key: 'chat/u1/a.jpg',
+        thumbKey: 'chat/u1/a-t.jpg',
+        width: 800,
+      },
+    });
+    const reuploaded = payload({
+      type: 'image',
+      content: {
+        key: 'chat/u1/b.jpg',
+        thumbKey: 'chat/u1/b-t.jpg',
+        width: 800,
+      },
+    });
+    expect(chatSendRequestHash(reuploaded)).toBe(chatSendRequestHash(first));
+
+    // 别的字段变了仍然是另一条。
+    expect(
+      chatSendRequestHash(
+        payload({
+          type: 'voice',
+          content: { key: 'chat/u1/v.m4a', duration: 3 },
+        }),
+      ),
+    ).not.toBe(
+      chatSendRequestHash(
+        payload({
+          type: 'voice',
+          content: { key: 'chat/u1/v.m4a', duration: 9 },
+        }),
+      ),
+    );
+    // 文本类型里恰好叫 key 的字段不受影响。
+    expect(
+      chatSendRequestHash(payload({ content: { text: 'a', key: 'x' } })),
+    ).not.toBe(
+      chatSendRequestHash(payload({ content: { text: 'a', key: 'y' } })),
+    );
+  });
 });

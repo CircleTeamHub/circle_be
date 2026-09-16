@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { MEDIA_MESSAGE_TYPES } from './chat.constants';
+import { CHAT_MEDIA_KEY_FIELDS, MEDIA_MESSAGE_TYPES } from './chat.constants';
 import type { ChatSendPayload } from './chat.types';
 
 /** 媒体 content 里只应持久化 object key;展示地址一律由读路径现签。 */
@@ -40,6 +40,22 @@ function canonicalJson(value: unknown): string {
 }
 
 /**
+ * 媒体 content 去掉 object key 之后剩下的部分(尺寸、时长、大小……)。
+ *
+ * 同一份媒体每上传一次就是一个新 key(presign 现生成)。首发其实已经落库、只是
+ * ack 丢了,客户端重发时重新上传(图片/语音一直是这么重发的)—— 这是同一条消息的
+ * 合法重发,key 不同不能算「内容不同」。
+ */
+function mediaFingerprintContent(
+  type: string,
+  content: Record<string, unknown>,
+): Record<string, unknown> {
+  const cleaned = stripMediaPresentationFields(content);
+  for (const { key } of CHAT_MEDIA_KEY_FIELDS[type] ?? []) delete cleaned[key];
+  return cleaned;
+}
+
+/**
  * 一次客户端发送请求的指纹(存进 ChatMessage.requestHash)。
  *
  * 客户端幂等键 d 撞库时,原来一律把库里那条当成「同一条消息的重发」原样返回。
@@ -49,11 +65,12 @@ function canonicalJson(value: unknown): string {
  *
  * 指纹取客户端声明的意图(type / content / 引用 / 转发源),不取服务端加工后的
  * 结果:转发每次都会复制出新的 object key,拿落库内容比会把合法重发误判成冲突。
- * 展示字段本来就不落库,不参与;d 本身是查重的键,也不参与。
+ * 展示字段本来就不落库,不参与;媒体的 object key 见 mediaFingerprintContent;
+ * d 本身是查重的键,也不参与。
  */
 export function chatSendRequestHash(payload: ChatSendPayload): string {
   const content = MEDIA_MESSAGE_TYPES.includes(payload.type)
-    ? stripMediaPresentationFields(payload.content)
+    ? mediaFingerprintContent(payload.type, payload.content)
     : payload.content;
   return createHash('sha256')
     .update(
