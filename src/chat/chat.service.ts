@@ -50,9 +50,7 @@ import {
   CHAT_REACTION_EMOJIS,
   CHAT_REVOKE_WINDOW_MS,
   MEDIA_MESSAGE_TYPES,
-  MUTATION_LOOKBACK_MS,
-  MUTATION_PAGE_MAX,
-  MUTATION_SAFETY_LAG_MS,
+  SYNC_PAGE_MAX,
   READERS_PAGE_MAX,
   RELAX_PURGE_BATCH,
   RELAX_PURGE_BATCHES_MAX,
@@ -73,7 +71,7 @@ import type {
   ChatHistoryPageDto,
   ChatGroupPoliciesDto,
   ChatMemberDto,
-  ChatMutationsPageDto,
+  ChatSyncPageDto,
   HistoryFilters,
   ChatMessageDto,
   VisibleChatMessage,
@@ -1116,6 +1114,7 @@ export class ChatService {
           directPeers.deliveredHeights.get(m.conversationID) ?? null,
         readHeight: m.lastReadHeight,
         clearedBeforeHeight: conversationFloor,
+        syncRevision: m.conversation.nextRevision,
         lastMessageAt: m.conversation.lastMessageAt?.toISOString() ?? null,
         joinedAt: m.joinedAt.toISOString(),
       };
@@ -2093,6 +2092,7 @@ export class ChatService {
         directPeers.deliveredHeights.get(conversationId) ?? null,
       readHeight: member.lastReadHeight,
       clearedBeforeHeight: floor,
+      syncRevision: member.conversation.nextRevision,
       lastMessageAt: member.conversation.lastMessageAt?.toISOString() ?? null,
       joinedAt: member.joinedAt.toISOString(),
     };
@@ -2561,227 +2561,106 @@ export class ChatService {
   }
 
   /**
-   * 离线期间发生过的撤回/编辑增量(重连后一次追平)。
+   * 会话变更序号流的一页(GET /chat/conversations/:id/sync)。
    *
-   * 重连补拉走的是 `height > afterHeight` —— 撤回**不改 height**,所以那条路径
-   * 结构上永远看不到它:设备离线时被撤回的那条消息,本地缓存里一直是原文,
-   * 只有等它恰好落进某次历史分页才会被覆盖。会话热闹一点就永远等不到。
-   * 于是这里按 revokedAt/editedAt 时间轴单独给一条增量通道。
+   * 撤回、编辑、表情回应、焚毁都不改 height,按 height 补拉结构上看不到它们。这里按
+   * ChatMessage.revision 扫 (afterRevision, throughRevision] 区间,回每条变过的消息的
+   * **当前状态**(中间变过几次只回最后一版)。
    *
-   * 只回本人在座会话;仍旧套清空水位与销毁/焚毁窗口(不可见的行连撤回状态
-   * 都不必回,客户端本来就该看不到)。
+   * throughRevision 取自会话行上的计数器:触发器在会话行锁下取号、与消息行同事务
+   * 提交,读到计数器 = N 时,<= N 的变更一定都已可见 —— 不存在旧增量通道那种
+   * 「时间戳早、提交晚」被游标越过的行,也就不需要安全水位与回溯窗口。
+   *
+   * 可见性(清空水位、查看者保留期、会话焚毁窗口)只决定回不回这一行,**不决定游标**:
+   * 被过滤掉的行照样推进 nextRevision,否则整页都被过滤时游标原地打转。
+   * 焚毁墓碑无论落在哪个窗口都要回:它就是让本地副本被删掉的那个信号。
    */
-  async listMutationsSince(
+  async syncConversation(
     userId: string,
-    since: Date,
-    limit = MUTATION_PAGE_MAX,
-    sinceId = '',
-  ): Promise<ChatMutationsPageDto> {
-    const serverTime = new Date().toISOString();
-    const lookbackFloor = new Date(Date.now() - MUTATION_LOOKBACK_MS);
-    // 空响应的游标同样不能推到 serverTime —— 「一次什么都没查到的同步」正是
-    // 未提交写最容易被跨过去的时刻:那条撤回的时间戳已经生成、行还没可见,
-    // 游标一旦越过它,它提交之后就永远追不到了。同样卡在安全水位上,
-    // 且绝不倒退到 since 之前。
-    const safeCursor = new Date(
-      Math.max(since.getTime(), Date.now() - MUTATION_SAFETY_LAG_MS),
-    ).toISOString();
-    const empty: ChatMutationsPageDto = {
-      messages: [],
-      serverTime,
-      nextSince: safeCursor,
-      nextSinceId: '',
-      hasMore: false,
-      resetRequired: false,
+    conversationId: string,
+    afterRevision: number,
+    limit: number = SYNC_PAGE_MAX,
+  ): Promise<ChatSyncPageDto> {
+    const { conversation, member } = await this.requireMembershipSeat(
+      conversationId,
+      userId,
+    );
+    const throughRevision = conversation.nextRevision;
+    const base = {
+      throughRevision,
+      readHeight: member.lastReadHeight,
+      clearedBeforeHeight: member.clearedBeforeHeight,
     };
-    // 游标比保留窗口还老:这段时间里的撤回/编辑已经查不到了。
-    // 原来是默默把游标抬到窗口下沿 —— 客户端于是以为自己追平了,而那段区间里
-    // 被撤回的消息在它的缓存里永远是原文(撤回不改 height,历史补拉够不着)。
-    // 如实告诉它「缓存作废,重新拉」。
-    if (since < lookbackFloor) {
+    if (afterRevision > throughRevision) {
+      // 游标比服务端当前序号还大:数据库被恢复/重建过,本地缓存里的撤回/焚毁
+      // 已经对不上号。只能让客户端丢掉这个会话的缓存从头来。
       return {
-        ...empty,
-        // 全量重建之后的第一段增量同样从安全水位起算。
-        nextSince: new Date(Date.now() - MUTATION_SAFETY_LAG_MS).toISOString(),
+        ...base,
+        messages: [],
+        nextRevision: throughRevision,
+        hasMore: false,
         resetRequired: true,
       };
     }
-    const memberships = await this.prisma.chatMember.findMany({
-      where: { userID: userId, leftAt: null },
-      select: {
-        conversationID: true,
-        clearedBeforeHeight: true,
-        conversation: { select: { clearedBeforeHeight: true } },
-      },
-    });
-    if (memberships.length === 0) return empty;
-
-    // 每会话的可见边界:清空水位 + 焚毁/自动销毁截止。必须进 SQL 的 WHERE ——
-    // 取回来再 filter 的话,被过滤掉的行照样占着 LIMIT 的名额,一页里真正
-    // 该返回的变更就少了,而客户端游标照常前进,那些变更从此再也追不到。
-    const burning = await this.prisma.chatConversation.findMany({
+    const take = Math.min(Math.max(limit, 1), SYNC_PAGE_MAX);
+    const rows = await this.prisma.chatMessage.findMany({
       where: {
-        id: { in: memberships.map((m) => m.conversationID) },
-        burnDurationSec: { not: null },
+        conversationID: conversationId,
+        revision: { gt: afterRevision, lte: throughRevision },
       },
-      select: { id: true, burnDurationSec: true, burnStartedAt: true },
+      omit: MESSAGE_READ_OMIT,
+      orderBy: { revision: 'asc' },
+      take: take + 1,
     });
-    const burnById = new Map(burning.map((c) => [c.id, c]));
-    const viewer = await this.selfDestructWindow(userId);
-    const ids: string[] = [];
-    const floors: number[] = [];
-    const viewerCutoffs: (Date | null)[] = [];
-    const viewerStarts: (Date | null)[] = [];
-    const burnStarts: (Date | null)[] = [];
-    const burnCutoffs: (Date | null)[] = [];
-    const heightFloors = new Map<string, number>();
-    const retentionWindows = new Map<string, ChatRetentionWindow>();
-    for (const m of memberships) {
-      const policy = burnById.get(m.conversationID) ?? {
-        burnDurationSec: null,
-        burnStartedAt: null,
-      };
-      const retention = buildChatRetentionWindow(policy, viewer);
-      const floor = Math.max(
-        m.clearedBeforeHeight ?? 0,
-        m.conversation.clearedBeforeHeight ?? 0,
-      );
-      ids.push(m.conversationID);
-      floors.push(floor);
-      viewerCutoffs.push(retention.viewerCutoff);
-      viewerStarts.push(retention.viewerStartedAt);
-      burnStarts.push(retention.burnStartedAt);
-      burnCutoffs.push(retention.burnCutoff);
-      heightFloors.set(m.conversationID, floor);
-      retentionWindows.set(m.conversationID, retention);
-    }
-
-    // 多取一条用来判断「还有没有」。
-    //
-    // 游标是 (mutatedAt, id) 复合键,不是单一时间戳:DateTime 只有毫秒精度,
-    // 一批同毫秒的变更跨在页边界上时,单时间戳游标配 `> from` 会把剩下那些
-    // 同刻的行永久跳过。撤回与编辑各有各的时间戳,统一成 GREATEST 才排得出
-    // 单调序 —— Prisma 的多字段 orderBy 做不到这件事,所以走原始 SQL。
-    //
-    // WHERE 里那条 `revokedAt >= ... OR editedAt >= ...` 是给索引用的粗筛
-    // (GREATEST 表达式本身走不了索引);精确的 keyset 判定叠在它上面。
-    const take = Math.min(Math.max(limit, 1), MUTATION_PAGE_MAX);
-    const rows = await this.prisma.$queryRaw<
-      Array<MessageRow & { mutatedAt: Date }>
-    >`
-      SELECT m."id", m."conversationID", m."height", m."senderID", m."type",
-             m."content", m."clientMessageId", m."replyToID", m."deleted",
-             m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."createdAt",
-             GREATEST(
-               COALESCE(m."revokedAt", to_timestamp(0)),
-               COALESCE(m."editedAt", to_timestamp(0)),
-               COALESCE(m."deletedAt", to_timestamp(0))
-             ) AS "mutatedAt"
-      FROM "ChatMessage" AS m
-      JOIN unnest(
-        ${ids}::text[],
-        ${floors}::int[],
-        ${viewerCutoffs}::timestamptz[],
-        ${viewerStarts}::timestamptz[],
-        ${burnStarts}::timestamptz[],
-        ${burnCutoffs}::timestamptz[]
-      ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
-             "burnStartedAt", "burnCutoff")
-        ON w."conversationID" = m."conversationID"
-      WHERE m."height" > w.floor
-        -- 删除墓碑必须跨过焚毁时间窗返回;否则离线设备无法清掉早于当前
-        -- burn cutoff 的本地正文。清空水位仍由 height floor 限制。
-        AND (
-          m."deleted" = true
-          OR w."viewerCutoff" IS NULL
-          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-          OR m."createdAt" >= w."viewerCutoff"
-        )
-        AND (
-          m."deleted" = true
-          OR w."burnCutoff" IS NULL
-          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-          OR m."createdAt" >= w."burnCutoff"
-        )
-        AND (m."revokedAt" >= ${since} OR m."editedAt" >= ${since} OR m."deletedAt" >= ${since})
-        AND (
-          GREATEST(
-            COALESCE(m."revokedAt", to_timestamp(0)),
-            COALESCE(m."editedAt", to_timestamp(0)),
-            COALESCE(m."deletedAt", to_timestamp(0))
-          ) > ${since}
-          OR (
-            GREATEST(
-              COALESCE(m."revokedAt", to_timestamp(0)),
-              COALESCE(m."editedAt", to_timestamp(0)),
-              COALESCE(m."deletedAt", to_timestamp(0))
-            ) = ${since}
-            AND m."id" > ${sinceId}
-          )
-        )
-      ORDER BY "mutatedAt" ASC, m."id" ASC
-      LIMIT ${take + 1}
-    `;
-
     const hasMore = rows.length > take;
     const page = hasMore ? rows.slice(0, take) : rows;
-    if (page.length === 0) return empty;
-    const cursor = this.nextMutationCursor(since, sinceId, page, hasMore);
-    const [senders, aliases] = await Promise.all([
-      this.resolveSenders(
-        page.map((r) => r.senderID).filter((id): id is string => id !== null),
-        null,
-      ),
-      loadSeatAliases(this.prisma, senderSeatRefs(page)),
-    ]);
-    const messages = page.map((row) =>
+    const nextRevision = hasMore
+      ? page[page.length - 1].revision
+      : throughRevision;
+
+    const floor = member.clearedBeforeHeight;
+    const viewer = await this.selfDestructWindow(userId);
+    const retention = buildChatRetentionWindow(conversation, viewer);
+    const tombstones = page.filter((row) => row.deleted && row.height > floor);
+    const visible = page.filter(
+      (row) =>
+        !row.deleted &&
+        row.height > floor &&
+        isChatMessageVisible(row.createdAt, retention),
+    );
+    const senders = await this.resolveSenders(
+      visible
+        .map((row) => row.senderID)
+        .filter((id): id is string => id !== null),
+      conversationId,
+    );
+    const liveMessages = visible.map((row) =>
       this.toMessageDto(
         row,
-        this.senderFor(row, senders, aliases),
-        burnById.get(row.conversationID) ?? null,
+        this.senderFor(row, senders),
+        conversation,
         userId,
       ),
     );
-    await this.attachReplyTo(messages, { heightFloors, retentionWindows });
-    return { messages, serverTime, ...cursor, resetRequired: false };
-  }
-
-  /**
-   * 下一次请求该用的游标。
-   *
-   * 两条约束叠在一起:
-   * ① 截断了就停在本页最后一条上(回 serverTime 会把没返回的那些永久跳过);
-   * ② 无论如何不越过安全水位 `now - MUTATION_SAFETY_LAG_MS` —— 时间戳在写语句
-   *    构造时生成、行到 COMMIT 才可见,一次被锁住的撤回完全可能「时间戳很早、
-   *    提交很晚」,游标越过它的时间戳它就永远追不到了(见常量处的说明)。
-   *
-   * ② 会让游标推不动(整页都落在不安全窗口里、且水位不比 since 新):那就报
-   * 「已追平」让客户端停手 —— 本页已经投递过了,剩下的下次同步再来。谎报
-   * hasMore 而游标原地不动会让客户端空转。
-   */
-  private nextMutationCursor(
-    since: Date,
-    sinceId: string,
-    page: Array<MessageRow & { mutatedAt: Date }>,
-    truncated: boolean,
-  ): { nextSince: string; nextSinceId: string; hasMore: boolean } {
-    const last = page[page.length - 1];
-    const safeCeiling = Date.now() - MUTATION_SAFETY_LAG_MS;
-    const desired = truncated ? last.mutatedAt.getTime() : Date.now();
-    const capped = Math.min(desired, safeCeiling);
-    if (capped <= since.getTime()) {
-      return {
-        nextSince: since.toISOString(),
-        nextSinceId: sinceId,
-        hasMore: false,
-      };
-    }
-    // 游标正好落在某一行上时才带 id(复合 keyset);落在水位上则没有对应行。
-    const landedOnRow = truncated && capped === last.mutatedAt.getTime();
+    // 引用快照与这一页同一把尺子:清空水位之下、销毁窗口之外的原文不能借引用绕回来。
+    await this.attachReplyTo(liveMessages, {
+      heightFloors: new Map([[conversationId, floor]]),
+      retention,
+    });
+    await this.attachReactions(liveMessages);
+    await this.media.attachMediaUrls(liveMessages);
+    const tombstoneMessages = tombstones.map((row) =>
+      this.toMessageDto({ ...row, content: {} }, null, conversation, userId),
+    );
+    const messages = [...liveMessages, ...tombstoneMessages].sort(
+      (a, b) => a.revision - b.revision,
+    );
     return {
-      nextSince: new Date(capped).toISOString(),
-      nextSinceId: landedOnRow ? last.id : '',
-      hasMore: truncated,
+      ...base,
+      messages,
+      nextRevision,
+      hasMore,
+      resetRequired: false,
     };
   }
 
@@ -3014,6 +2893,7 @@ export class ChatService {
           ?.lastDeliveredHeight ?? null,
       readHeight: mine?.lastReadHeight ?? 0,
       clearedBeforeHeight: clearedFloor,
+      syncRevision: conv.nextRevision,
       lastMessageAt: conv.lastMessageAt?.toISOString() ?? null,
       joinedAt: mine?.joinedAt?.toISOString() ?? null,
     };
@@ -3750,6 +3630,7 @@ export class ChatService {
       revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
       revokedBy: row.revokedBy ?? null,
       ...(row.deleted ? { deleted: true } : {}),
+      revision: row.revision,
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       burnDurationSec,
       // d 只发给它的作者本人。字段保留(可空),不是省略:已装机 App 的协议
@@ -3903,6 +3784,11 @@ export class ChatService {
     // 两个都广播,revokedBy 归后写者 —— 幂等承诺和审计归属一起破。
     // 谓词带上 revokedAt: null,只有赢家 count>0,输家走幂等分支重读。
     const { claimed, updated } = await this.prisma.$transaction(async (tx) => {
+      // 会话行锁先拿:消息行上的触发器会去更新会话计数器。先锁消息行再等会话行,
+      // 与「先锁会话行再改消息」的编辑/回应并发时就是经典的交叉等待死锁。
+      await tx.$queryRaw`
+        SELECT "id" FROM "ChatConversation"
+        WHERE "id" = ${conversationId} FOR UPDATE`;
       const claimed = await tx.chatMessage.updateMany({
         where: { id: messageId, revokedAt: null },
         data: { content: {}, revokedAt: new Date(), revokedBy: userId },
@@ -3945,6 +3831,7 @@ export class ChatService {
       revokedBy: userId,
       height: updated.height,
       senderId: updated.senderID,
+      revision: updated.revision,
     });
     const senders = await this.resolveSenders(
       updated.senderID ? [updated.senderID] : [],
@@ -4000,7 +3887,7 @@ export class ChatService {
     messageId: string,
     emoji: string,
     op: 'add' | 'remove',
-  ): Promise<{ changed: boolean }> {
+  ): Promise<{ changed: boolean; revision: number | null }> {
     if (!CHAT_REACTION_EMOJIS.includes(emoji)) {
       throw new BadRequestException({
         message: '不支持的表情',
@@ -4047,21 +3934,30 @@ export class ChatService {
       }
       if (row.revokedAt) {
         // 已撤回的消息不接受新回应;静默无变化,不给撤回消息续热度。
-        return { changed: false };
+        return { changed: false, revision: null };
       }
-      if (op === 'add') {
-        // 不能在 PostgreSQL 事务里捕获唯一约束错误后继续提交：语句错误会
-        // 把整个事务置为 aborted。skipDuplicates 保留幂等语义且不破坏事务。
-        const added = await tx.chatMessageReaction.createMany({
-          data: { messageID: messageId, userID: userId, emoji },
-          skipDuplicates: true,
-        });
-        return { changed: added.count > 0 };
-      }
-      const removed = await tx.chatMessageReaction.deleteMany({
-        where: { messageID: messageId, userID: userId, emoji },
+      const changed =
+        op === 'add'
+          ? // 不能在 PostgreSQL 事务里捕获唯一约束错误后继续提交：语句错误会
+            // 把整个事务置为 aborted。skipDuplicates 保留幂等语义且不破坏事务。
+            (
+              await tx.chatMessageReaction.createMany({
+                data: { messageID: messageId, userID: userId, emoji },
+                skipDuplicates: true,
+              })
+            ).count > 0
+          : (
+              await tx.chatMessageReaction.deleteMany({
+                where: { messageID: messageId, userID: userId, emoji },
+              })
+            ).count > 0;
+      if (!changed) return { changed: false, revision: null };
+      // 回应触发器已经在同一事务里给消息换了新号;读回来随广播下发。
+      const current = await tx.chatMessage.findUniqueOrThrow({
+        where: { id: messageId },
+        select: { revision: true },
       });
-      return { changed: removed.count > 0 };
+      return { changed: true, revision: current.revision };
     });
   }
 
@@ -4496,8 +4392,13 @@ export class ChatService {
       const noteImportKeys = expired.flatMap((row) =>
         this.collectNoteImportMediaKeys(row),
       );
-      await this.prisma.$transaction(async (tx) => {
-        await tx.chatMessage.updateMany({
+      const burned = await this.prisma.$transaction(async (tx) => {
+        // 会话行锁先拿(触发器要更新会话计数器;先锁消息行会与编辑/回应交叉死锁)。
+        await tx.$queryRaw`
+          SELECT "id" FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        // RETURNING 带回触发器刚分配的 revision,随焚毁通知下发。
+        const tombstones = await tx.chatMessage.updateManyAndReturn({
           where: { id: { in: messageIds } },
           // contentHistory 一并清空:编辑过的消息,历次旧正文都还完整躺在这里,
           // 只清 content 等于「烧掉的只是最后一版」。
@@ -4507,16 +4408,18 @@ export class ChatService {
             content: {},
             contentHistory: [] as Prisma.InputJsonValue,
           },
+          select: { id: true, revision: true },
         });
         await this.media.releaseNoteImportReferences(
           tx,
           messageIds,
           noteImportKeys,
         );
+        return tombstones;
       });
       // 墓碑提交后通知在座成员(与 sweeper 同一条通道):读路径不会再放它们回来,
       // 但对端设备上的本地副本得靠这条通知才删得掉。emitBurnedMessages 自己兜住失败。
-      await this.broadcast.emitBurnedMessages(conversationId, messageIds);
+      await this.broadcast.emitBurnedMessages(conversationId, burned);
       if (mediaKeys.length > 0) void this.media.deleteObjects(mediaKeys);
       if (noteImportKeys.length > 0) {
         void this.media.drainPendingDeletions();

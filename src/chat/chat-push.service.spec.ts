@@ -6,6 +6,7 @@ function msg(overrides: Partial<ChatMessageDto> = {}): ChatMessageDto {
     id: 'msg-1',
     conversationId: 'conv-1',
     height: 5,
+    revision: 5,
     type: 'text',
     content: { text: 'hello world' },
     sender: {

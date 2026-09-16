@@ -497,6 +497,7 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
       height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
+      revision: 6,
     });
 
     expect(findMany).toHaveBeenCalledWith({
@@ -548,6 +549,7 @@ describe('ChatBroadcastService content-bearing edit privacy', () => {
       height: 5,
       content: { text: 'private edit' },
       editedAt: '2026-09-03T00:00:00.000Z',
+      revision: 6,
     });
 
     expect(removedSocket.rooms.has('c:conv-1')).toBe(true);
@@ -800,7 +802,11 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
       .mockResolvedValue([{ userID: 'u1' }, { userID: 'u2' }]);
     const { service, to, emit } = harness(findMany);
 
-    await service.emitBurnedMessages('conv-1', ['m1', 'm2', 'm1']);
+    await service.emitBurnedMessages('conv-1', [
+      { id: 'm1', revision: 11 },
+      { id: 'm2', revision: 12 },
+      { id: 'm1', revision: 11 },
+    ]);
 
     expect(findMany).toHaveBeenCalledWith({
       where: { conversationID: 'conv-1', leftAt: null },
@@ -811,6 +817,8 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     expect(emit).toHaveBeenCalledWith('chat:burned_messages', {
       conversationId: 'conv-1',
       messageIds: ['m1', 'm2'],
+      // 与 messageIds 一一对应:客户端据此推进本会话的同步游标。
+      revisions: [11, 12],
     });
   });
 
@@ -820,16 +828,23 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const { service, emit } = harness(findMany);
     const ids = Array.from({ length: 1001 }, (_, i) => `m${i}`);
 
-    await service.emitBurnedMessages('conv-1', ids);
+    await service.emitBurnedMessages(
+      'conv-1',
+      ids.map((id, index) => ({ id, revision: index + 1 })),
+    );
 
     expect(findMany).toHaveBeenCalledTimes(1);
     const payloads = emit.mock.calls.map(
-      ([, payload]) => payload as { messageIds: string[] },
+      ([, payload]) => payload as { messageIds: string[]; revisions: number[] },
     );
     expect(payloads.map((payload) => payload.messageIds.length)).toEqual([
       500, 500, 1,
     ]);
     expect(payloads.flatMap((payload) => payload.messageIds)).toEqual(ids);
+    // 分片不能把 id 与序号的对应关系打乱。
+    expect(payloads.flatMap((payload) => payload.revisions)).toEqual(
+      ids.map((_, index) => index + 1),
+    );
   });
 
   it('emits nothing for an empty batch', async () => {
@@ -846,7 +861,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const findMany = jest.fn().mockResolvedValue([]);
     const { service, to } = harness(findMany);
 
-    await service.emitBurnedMessages('conv-1', ['m1']);
+    await service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]);
 
     expect(to).not.toHaveBeenCalled();
   });
@@ -857,7 +872,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     const { service, to } = harness(findMany);
 
     await expect(
-      service.emitBurnedMessages('conv-1', ['m1']),
+      service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]),
     ).resolves.toBeUndefined();
     expect(to).not.toHaveBeenCalled();
   });
@@ -870,7 +885,7 @@ describe('ChatBroadcastService.emitBurnedMessages', () => {
     );
 
     await expect(
-      service.emitBurnedMessages('conv-1', ['m1']),
+      service.emitBurnedMessages('conv-1', [{ id: 'm1', revision: 3 }]),
     ).resolves.toBeUndefined();
     expect(findMany).not.toHaveBeenCalled();
   });

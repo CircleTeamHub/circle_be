@@ -2118,6 +2118,15 @@ model ChatConversation {
   /// 也按 max(座位水位, 会话水位) 兜底。
   /// 只前进不后退，与座位水位同义。
   clearedBeforeHeight Int @default(0)
+  /// 会话变更序号流的计数器：最后已分配的 revision。
+  ///
+  /// 新消息、撤回、编辑、表情回应、焚毁墓碑都在这里取号，由数据库触发器
+  /// `chat_message_assign_revision` / `chat_message_reaction_bump_revision`
+  /// 在同一事务里分配（迁移 20260916000000_add_chat_revision_stream）。
+  /// 行锁持有到提交，所以任何读者都看不到「小号未提交、大号已可见」——
+  /// 客户端只凭一个 afterRevision 游标就能追平所有变更，不再需要按时间戳扫的增量通道。
+  /// 应用代码不要手写这一列。
+  nextRevision Int @default(0)
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
 
@@ -2223,6 +2232,9 @@ model ChatMessage {
   editedAt        DateTime?
   /// 编辑前的历史 content 数组（留痕，不外发）。
   contentHistory  Json?
+  /// 这条消息最近一次客户端可见变更占用的会话序号（见 ChatConversation.nextRevision）。
+  /// 创建时即分配；height 是它在时间线上的位置，永不改变。由触发器维护，应用代码不写。
+  revision        Int      @default(0)
   createdAt       DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationID], references: [id], onDelete: Cascade)
@@ -2234,13 +2246,8 @@ model ChatMessage {
   @@unique([conversationID, senderID, clientMessageId])
   // 按日期查聊天记录（chat-history 模块 Phase 2 将从 OpenIM 迁到此索引）。
   @@index([conversationID, createdAt])
-  /// 重连追平（GET /chat/messages/mutations）按变更时刻扫。没有这两条的话，
-  /// 高频群里每次重连都要全表扫那个会话的整段历史，只为捞出几条撤回/编辑。
-  /// 查询里的粗筛写成 `revokedAt >= x OR editedAt >= x` 正是为了走它们
-  /// （GREATEST 表达式本身走不了索引，只用于排序与游标）。
-  @@index([conversationID, revokedAt])
-  @@index([conversationID, editedAt])
-  @@index([conversationID, deletedAt])
+  /// 增量同步（GET /chat/conversations/:id/sync）按序号区间扫。
+  @@index([conversationID, revision])
 }
 
 /// 普通 DIRECT 客户端消息同事务写入的 durable inbox。服务端自动回复绕过

@@ -130,8 +130,14 @@ export class ChatBurnSweeperService {
       const ownedMediaKeys = allMediaKeys.filter(
         (key) => !key.includes(`/${CHAT_NOTE_IMPORT_SEGMENT}`),
       );
-      await this.prisma.$transaction(async (tx) => {
-        await tx.chatMessage.updateMany({
+      const burned = await this.prisma.$transaction(async (tx) => {
+        // 会话行锁先拿:消息行上的触发器要更新会话计数器。先锁一批消息行再等会话行,
+        // 与「先锁会话行再改消息」的编辑/回应并发就会交叉死锁。
+        await tx.$queryRaw`
+          SELECT "id" FROM "ChatConversation"
+          WHERE "id" = ${conversationId} FOR UPDATE`;
+        // RETURNING 带回触发器刚分配的 revision,随焚毁通知下发。
+        const tombstones = await tx.chatMessage.updateManyAndReturn({
           where: { id: { in: messageIds } },
           // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
           // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
@@ -141,15 +147,17 @@ export class ChatBurnSweeperService {
             content: {},
             contentHistory: [],
           },
+          select: { id: true, revision: true },
         });
         await this.media.releaseNoteImportReferences(
           tx,
           messageIds,
           noteImportKeys,
         );
+        return tombstones;
       });
       // 墓碑已提交才通知:事务回滚了却已经播出去,对端会删掉服务端其实还留着的消息。
-      await this.announceBurned(conversationId, messageIds);
+      await this.announceBurned(conversationId, burned);
       if (ownedMediaKeys.length > 0) {
         // deleteObjects 内部逐 key 尽力而为;失败只留孤儿对象,不中断焚毁。
         void this.media.deleteObjects(ownedMediaKeys);
@@ -171,10 +179,10 @@ export class ChatBurnSweeperService {
    */
   private async announceBurned(
     conversationId: string,
-    messageIds: string[],
+    burned: Array<{ id: string; revision: number }>,
   ): Promise<void> {
     try {
-      await this.broadcast.emitBurnedMessages(conversationId, messageIds);
+      await this.broadcast.emitBurnedMessages(conversationId, burned);
     } catch (error) {
       this.logger.warn(
         `burned-message announcement failed conversation=${conversationId}: ${

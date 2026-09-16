@@ -1452,13 +1452,14 @@ export class ChatGateway implements OnModuleDestroy {
         op,
       );
       reply({ ok: true });
-      if (result.changed) {
+      if (result.changed && result.revision !== null) {
         this.broadcast.emitReaction({
           conversationId,
           messageId,
           emoji,
           op,
           userId,
+          revision: result.revision,
         });
       }
     } catch (error) {
@@ -1500,6 +1501,7 @@ export class ChatGateway implements OnModuleDestroy {
           height: dto.height,
           content: dto.content,
           editedAt: dto.editedAt ?? new Date().toISOString(),
+          revision: dto.revision,
         });
       } catch (error) {
         // 编辑已经提交且 ack 已成功。授权查询/投递失败时安全地不广播，

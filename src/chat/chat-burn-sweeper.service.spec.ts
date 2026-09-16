@@ -3,8 +3,9 @@ import { ChatBurnSweeperService } from './chat-burn-sweeper.service';
 describe('ChatBurnSweeperService', () => {
   const prisma = {
     $transaction: jest.fn(),
+    $queryRaw: jest.fn(),
     chatConversation: { findMany: jest.fn(), findUnique: jest.fn() },
-    chatMessage: { findMany: jest.fn(), updateMany: jest.fn() },
+    chatMessage: { findMany: jest.fn(), updateManyAndReturn: jest.fn() },
   };
   const media = {
     deleteObjects: jest.fn().mockResolvedValue(undefined),
@@ -22,13 +23,20 @@ describe('ChatBurnSweeperService', () => {
 
   beforeEach(() => {
     jest.resetAllMocks();
-    prisma.chatMessage.updateMany.mockResolvedValue({ count: 0 });
+    // RETURNING 带回触发器分配的序号:按 id 顺序编号。
+    prisma.chatMessage.updateManyAndReturn.mockImplementation(
+      (args: { where: { id: { in: string[] } } }) =>
+        Promise.resolve(
+          args.where.id.in.map((id, index) => ({ id, revision: index + 1 })),
+        ),
+    );
     media.deleteObjects.mockResolvedValue(undefined);
     media.releaseNoteImportReferences.mockResolvedValue(undefined);
     broadcast.emitBurnedMessages.mockResolvedValue(undefined);
     prisma.$transaction.mockImplementation(
       async (callback: (tx: typeof prisma) => unknown) => callback(prisma),
     );
+    prisma.$queryRaw.mockResolvedValue([{ id: 'locked' }]);
     // 每批删除前都重读当前策略(防「扫描中途策略被改长/关掉」)。
     prisma.chatConversation.findUnique.mockImplementation(
       ({ where }: { where: { id: string } }) =>
@@ -43,6 +51,25 @@ describe('ChatBurnSweeperService', () => {
     string,
     { burnDurationSec: number | null; burnStartedAt?: Date | null }
   >();
+
+  // 触发器会去更新会话计数器:先锁一批消息行再等会话行,与「先锁会话行再改消息」
+  // 的编辑/回应并发就会交叉死锁。所以批事务的第一条语句必须是会话行锁。
+  it('locks the conversation row before tombstoning a batch', async () => {
+    prisma.chatConversation.findMany.mockResolvedValue([
+      { id: 'conv-1', burnDurationSec: 60 },
+    ]);
+    conversationPolicies.set('conv-1', { burnDurationSec: 60 });
+    prisma.chatMessage.findMany.mockResolvedValueOnce([
+      { id: 'm1', type: 'text', content: { text: 'old' } },
+    ]);
+
+    await service.sweep();
+
+    expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      prisma.chatMessage.updateManyAndReturn.mock.invocationCallOrder[0],
+    );
+  });
 
   it('soft-deletes expired rows, clears content and deletes media objects', async () => {
     prisma.chatConversation.findMany.mockResolvedValue([
@@ -68,7 +95,7 @@ describe('ChatBurnSweeperService', () => {
       Math.abs(Date.now() - 3600_000 - query.where.createdAt.lt.getTime()),
     ).toBeLessThan(5_000);
     // 软删 + 清 content:height 坐标保留,读路径靠 deleted 过滤。
-    expect(prisma.chatMessage.updateMany).toHaveBeenCalledWith({
+    expect(prisma.chatMessage.updateManyAndReturn).toHaveBeenCalledWith({
       where: { id: { in: ['m1', 'm2'] } },
       // contentHistory 一起清:只清 content 的话,编辑过的旧正文还完整留在库里。
       data: {
@@ -77,6 +104,7 @@ describe('ChatBurnSweeperService', () => {
         content: {},
         contentHistory: [],
       },
+      select: { id: true, revision: true },
     });
     // 只软删不删对象 = 焚毁只焚了个寂寞。
     expect(media.deleteObjects).toHaveBeenCalledWith([
@@ -159,7 +187,7 @@ describe('ChatBurnSweeperService', () => {
     await service.sweep();
 
     expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
-    expect(prisma.chatMessage.updateMany).not.toHaveBeenCalled();
+    expect(prisma.chatMessage.updateManyAndReturn).not.toHaveBeenCalled();
   });
 
   // 服务端把正文清空了,在线设备却无从得知 —— 本地缓存、冷启动水合与本地 FTS
@@ -178,11 +206,11 @@ describe('ChatBurnSweeperService', () => {
 
     expect(broadcast.emitBurnedMessages).toHaveBeenCalledTimes(1);
     expect(broadcast.emitBurnedMessages).toHaveBeenCalledWith('conv-1', [
-      'm1',
-      'm2',
+      { id: 'm1', revision: 1 },
+      { id: 'm2', revision: 2 },
     ]);
     expect(
-      prisma.chatMessage.updateMany.mock.invocationCallOrder[0],
+      prisma.chatMessage.updateManyAndReturn.mock.invocationCallOrder[0],
     ).toBeLessThan(broadcast.emitBurnedMessages.mock.invocationCallOrder[0]);
   });
 
@@ -236,10 +264,10 @@ describe('ChatBurnSweeperService', () => {
     expect(broadcast.emitBurnedMessages).toHaveBeenNthCalledWith(
       1,
       'conv-1',
-      fullBatch.map((row) => row.id),
+      fullBatch.map((row, index) => ({ id: row.id, revision: index + 1 })),
     );
     expect(broadcast.emitBurnedMessages).toHaveBeenNthCalledWith(2, 'conv-1', [
-      'tail',
+      { id: 'tail', revision: 1 },
     ]);
   });
 
@@ -259,9 +287,9 @@ describe('ChatBurnSweeperService', () => {
 
     await service.sweep();
 
-    expect(prisma.chatMessage.updateMany).toHaveBeenCalledTimes(2);
+    expect(prisma.chatMessage.updateManyAndReturn).toHaveBeenCalledTimes(2);
     expect(broadcast.emitBurnedMessages).toHaveBeenLastCalledWith('conv-2', [
-      'm2',
+      { id: 'm2', revision: 1 },
     ]);
   });
 });

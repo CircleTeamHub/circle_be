@@ -166,10 +166,15 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
    */
   async emitBurnedMessages(
     conversationId: string,
-    messageIds: readonly string[],
+    burned: ReadonlyArray<{ id: string; revision: number }>,
   ): Promise<void> {
-    const ids = [...new Set(messageIds)].filter((id) => id.length > 0);
-    if (ids.length === 0) return;
+    const seen = new Set<string>();
+    const items = burned.filter((item) => {
+      if (item.id.length === 0 || seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+    if (items.length === 0) return;
     const server = this.requireServer('emitBurnedMessages');
     if (!server) return;
     try {
@@ -181,12 +186,14 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
       if (rooms.length === 0) return;
       for (
         let start = 0;
-        start < ids.length;
+        start < items.length;
         start += BURNED_MESSAGES_BROADCAST_MAX
       ) {
+        const chunk = items.slice(start, start + BURNED_MESSAGES_BROADCAST_MAX);
         const payload: ChatBurnedMessagesBroadcast = {
           conversationId,
-          messageIds: ids.slice(start, start + BURNED_MESSAGES_BROADCAST_MAX),
+          messageIds: chunk.map((item) => item.id),
+          revisions: chunk.map((item) => item.revision),
         };
         server.to(rooms).emit(CHAT_EVENTS.burnedMessages, payload);
       }

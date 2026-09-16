@@ -37,6 +37,7 @@ describe('ChatGateway', () => {
     sendMessage: jest.fn(),
     markRead: jest.fn(),
     editMessage: jest.fn(),
+    toggleReaction: jest.fn(),
     getActiveTempChat: jest.fn(),
     hasSeat: jest.fn(),
     filterVisiblePresenceTargets: jest.fn(),
@@ -56,6 +57,7 @@ describe('ChatGateway', () => {
     emitRead: jest.fn(),
     emitTyping: jest.fn(),
     emitEdit: jest.fn(),
+    emitReaction: jest.fn(),
     emitPresence: jest.fn(),
     isUserOnline: jest.fn().mockResolvedValue(false),
   };
@@ -1557,8 +1559,10 @@ describe('ChatGateway', () => {
   describe('handleEdit', () => {
     it('keeps the committed success ack and fails closed when authorized edit delivery rejects', async () => {
       chatService.editMessage.mockResolvedValue({
+        height: 3,
         content: { text: 'updated private content' },
         editedAt: '2026-09-03T00:00:00.000Z',
+        revision: 8,
       });
       broadcast.emitEdit.mockRejectedValueOnce(
         new Error('private edit adapter detail'),
@@ -1583,8 +1587,11 @@ describe('ChatGateway', () => {
       expect(broadcast.emitEdit).toHaveBeenCalledWith({
         conversationId: 'conv-1',
         messageId: 'message-1',
+        height: 3,
         content: { text: 'updated private content' },
         editedAt: '2026-09-03T00:00:00.000Z',
+        // 客户端据此推进本会话的同步游标。
+        revision: 8,
       });
       expect(broadcast.emitMessage).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith(
@@ -1594,6 +1601,57 @@ describe('ChatGateway', () => {
         'private edit adapter detail',
       );
       warn.mockRestore();
+    });
+  });
+
+  describe('handleReaction', () => {
+    it('broadcasts the new revision the reaction was assigned', async () => {
+      chatService.toggleReaction.mockResolvedValue({
+        changed: true,
+        revision: 12,
+      });
+      const ack = jest.fn();
+
+      await gateway['handleReaction'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          emoji: '👍',
+          op: 'add',
+        },
+        ack,
+      );
+
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(broadcast.emitReaction).toHaveBeenCalledWith({
+        conversationId: 'conv-1',
+        messageId: 'message-1',
+        emoji: '👍',
+        op: 'add',
+        userId: 'u1',
+        revision: 12,
+      });
+    });
+
+    it('stays silent when nothing changed', async () => {
+      chatService.toggleReaction.mockResolvedValue({
+        changed: false,
+        revision: null,
+      });
+
+      await gateway['handleReaction'](
+        'u1',
+        {
+          conversationId: 'conv-1',
+          messageId: 'message-1',
+          emoji: '👍',
+          op: 'add',
+        },
+        jest.fn(),
+      );
+
+      expect(broadcast.emitReaction).not.toHaveBeenCalled();
     });
   });
 

@@ -51,7 +51,7 @@ import { SetBurnDurationDto } from './dto/set-burn-duration.dto';
 import { HistoryQueryDto } from './dto/history-query.dto';
 import { ListConversationsQueryDto } from './dto/list-conversations-query.dto';
 import { MessageDaysQueryDto } from './dto/message-days-query.dto';
-import { MutationsQueryDto } from './dto/mutations-query.dto';
+import { SyncQueryDto } from './dto/sync-query.dto';
 import type {
   ChatConversationDto,
   ChatGroupEventsPageDto,
@@ -60,7 +60,7 @@ import type {
   ChatMemberDto,
   ChatMemberSilenceDto,
   ChatMessageDto,
-  ChatMutationsPageDto,
+  ChatSyncPageDto,
 } from './chat.types';
 
 /**
@@ -223,23 +223,6 @@ export class ChatController {
       req.user.userId,
       query.keyword,
       query.limit,
-    );
-  }
-
-  @Get('messages/mutations')
-  @Throttle({ default: { limit: 30, ttl: 60_000 } })
-  @ApiOperation({
-    summary: '离线期间的撤回/编辑增量(重连追平;撤回不改 height,补拉够不着)',
-  })
-  listMutations(
-    @Req() req: RequestWithUser,
-    @Query() query: MutationsQueryDto,
-  ): Promise<ChatMutationsPageDto> {
-    return this.chatService.listMutationsSince(
-      req.user.userId,
-      new Date(query.since),
-      query.limit,
-      query.sinceId,
     );
   }
 
@@ -544,6 +527,30 @@ export class ChatController {
       req.user.userId,
       conversationId,
       messageId,
+    );
+  }
+
+  /**
+   * 会话变更序号流的增量同步。重连/回前台时客户端对「本地游标落后于会话列表里
+   * syncRevision」的每个会话各拉一次(同会话串行、全局并发有限),所以配额比
+   * 翻历史宽:长时间离线后几十个会话同时追平是正常形态。
+   */
+  @Get('conversations/:id/sync')
+  @Throttle({ default: { limit: 240, ttl: 60_000 } })
+  @ApiOperation({
+    summary:
+      '增量同步:afterRevision 之后变过的消息的当前状态(新消息/撤回/编辑/回应/焚毁墓碑)',
+  })
+  syncConversation(
+    @Req() req: RequestWithUser,
+    @Param('id', ParseUUIDPipe) conversationId: string,
+    @Query() query: SyncQueryDto,
+  ): Promise<ChatSyncPageDto> {
+    return this.chatService.syncConversation(
+      req.user.userId,
+      conversationId,
+      query.afterRevision,
+      query.limit,
     );
   }
 
