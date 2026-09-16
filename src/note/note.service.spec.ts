@@ -1800,9 +1800,9 @@ describe('NoteService', () => {
       status: 'ACTIVE',
       available: true,
       pinned: false,
-      imageCount: 2,
+      imageCount: 3,
       videoCount: 0,
-      mediaCount: 2,
+      mediaCount: 3,
       groupMemberships: [],
       coverMedia: null,
       media: [
@@ -2702,6 +2702,89 @@ describe('NoteService', () => {
         ],
       } as any),
     ).resolves.toBeDefined();
+  });
+
+  // presign 对私有目录(notes/)不再返回 fileUrl,客户端只拿得到 objectKey。NoteMedia.url
+  // 仍是非空列,缺省时由服务端按 objectKey 拼出持久 base url —— 读取路径本来就按
+  // objectKey 现签短时 GET,这个值只用于归一与去重。客户端给了 url 的照旧(仍要钉本站存储)。
+  it('derives the stored media url from objectKey when the client sends none', async () => {
+    const guarded = new NoteService(
+      prisma as any,
+      {
+        get: jest.fn((key: string) =>
+          key === 'MINIO_PUBLIC_URL' ? 'http://10.0.0.195:9000' : null,
+        ),
+      } as any,
+      new MembershipPolicyService(prisma as any),
+    );
+    prisma.note.create.mockResolvedValueOnce({ id: 'note-1' });
+    prisma.note.update.mockResolvedValueOnce({
+      id: 'note-1',
+      title: 't',
+      content: null,
+      status: 'ACTIVE',
+      available: true,
+      pinned: false,
+      imageCount: 2,
+      videoCount: 0,
+      mediaCount: 2,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      coverMedia: null,
+      groupMemberships: [],
+      media: [],
+    });
+
+    await expect(
+      guarded.createNote('user-1', {
+        title: 'keyless note',
+        media: [
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/keyless.jpg',
+            sortOrder: 0,
+          },
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/with-url.jpg',
+            url: 'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg?X-Amz-Signature=abc',
+            sortOrder: 1,
+          },
+          // App 原样透传 presign.fileUrl 时私有目录上就是显式 null,与省略同一条分支。
+          {
+            type: 'IMAGE',
+            objectKey: 'notes/user-1/null-url.jpg',
+            url: null,
+            sortOrder: 2,
+          },
+        ],
+      } as any),
+    ).resolves.toBeDefined();
+
+    const rows = prisma.noteMedia.createMany.mock.calls.at(-1)?.[0].data;
+    expect(rows).toEqual([
+      expect.objectContaining({
+        objectKey: 'notes/user-1/keyless.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/keyless.jpg',
+      }),
+      expect.objectContaining({
+        objectKey: 'notes/user-1/with-url.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
+      }),
+      expect.objectContaining({
+        objectKey: 'notes/user-1/null-url.jpg',
+        url: 'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
+      }),
+    ]);
+    // sections 里冻结的那份要跟媒体行同一条 url,否则读取时按 url 换签名 URL 会对不上。
+    const sections = prisma.note.create.mock.calls.at(-1)?.[0].data.sections;
+    expect(
+      sections.media.items.map((item: { url: string }) => item.url),
+    ).toEqual([
+      'http://10.0.0.195:9000/circle/notes/user-1/keyless.jpg',
+      'http://10.0.0.195:9000/circle/notes/user-1/with-url.jpg',
+      'http://10.0.0.195:9000/circle/notes/user-1/null-url.jpg',
+    ]);
   });
 
   describe('manual titles and table text', () => {

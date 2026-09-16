@@ -1123,7 +1123,6 @@ Authorization: Bearer <accessToken>
     {
       "type": "VIDEO",
       "objectKey": "notes/user-1/file.mp4",
-      "url": "http://localhost:9000/circle/notes/user-1/file.mp4",
       "mimeType": "video/mp4",
       "size": 3456789,
       "durationMs": 12000,
@@ -1133,6 +1132,10 @@ Authorization: Bearer <accessToken>
   ]
 }
 ```
+
+> `media[].url` 可省：`notes` 是私有目录，presign 的 `fileUrl` 是 `null`，只需回传 `objectKey`，
+> 服务端按它拼出落库用的持久地址（读取一律按 `objectKey` 现签短时 URL）。
+> 传了的话仍须是本站存储地址（编辑时回传读到的签名 URL 也可以，服务端会去掉签名 query）。
 
 **Response 201/200：** `NoteDetail`
 
