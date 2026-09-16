@@ -2193,12 +2193,17 @@ export class ChatService {
       await this.privacySettings.getSelfDestructPolicy(userId);
     if (!sec) return NO_VIEWER_RETENTION;
     const activatedAt = startedAt ? new Date(startedAt) : null;
+    // 开着窗口却没有边界,只可能来自还没写这一列的旧二进制(蓝绿/滚动发布期间
+    // 旧实例仍能改 messageSelfDestructSec)。把它当作「从头生效」正是本次要
+    // 消灭的回归 —— 一开开关,此前的历史全部消失。宁可这段窗口里不过滤:这是
+    // 查看者自己视图上的读过滤,失效只是他多看见自己的旧消息,不外泄给任何人;
+    // 反过来则是把证明不了发送时间的历史一次性抹掉。
+    if (!activatedAt || !Number.isFinite(activatedAt.getTime())) {
+      return NO_VIEWER_RETENTION;
+    }
     return {
       cutoff: new Date(Date.now() - sec * 1000),
-      startedAt:
-        activatedAt && Number.isFinite(activatedAt.getTime())
-          ? activatedAt
-          : null,
+      startedAt: activatedAt,
     };
   }
 

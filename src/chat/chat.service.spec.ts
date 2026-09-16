@@ -7,6 +7,9 @@ import { ChatErrorCode } from 'src/common/app-error-codes';
 import { ChatService } from './chat.service';
 import type { ChatSendPayload } from './chat.types';
 
+// 「早就开启过」的边界:让查看者窗口真正生效,又不干扰用例本身要断言的 cutoff。
+const LONG_AGO = new Date('2019-01-01T00:00:00.000Z');
+
 describe('ChatService', () => {
   const prisma = {
     chatConversation: {
@@ -264,6 +267,26 @@ describe('ChatService', () => {
     expect(args.where.AND).toBeUndefined();
     // 隐私设置压根不该被查 —— 访客 id 不对应任何 User。
     expect(privacySettings.getSettings).not.toHaveBeenCalled();
+  });
+
+  // 蓝绿/滚动发布期间,旧二进制仍能改 messageSelfDestructSec 而不写开启边界。
+  // 新版本读到「开着窗口但没有边界」时若按窗口过滤,就会把此前的历史一次性
+  // 隐藏 —— 正是本次修复要消灭的那个回归,只不过换了个触发路径。
+  it('does not retro-hide history when a legacy writer enabled self-destruct without a boundary', async () => {
+    privacySettings.getSelfDestructPolicy.mockResolvedValue({
+      sec: 172800,
+      startedAt: null,
+    });
+    prisma.chatMember.findUnique.mockResolvedValue(membership());
+    prisma.chatMessage.findMany.mockResolvedValue([]);
+
+    await service.getHistory('u1', 'conv-1');
+
+    const [[args]] = prisma.chatMessage.findMany.mock.calls as [
+      [{ where: Record<string, unknown> }],
+    ];
+    // 边界缺失时宁可不过滤:这是查看者自己视图上的读过滤,失效不外泄给任何人。
+    expect(args.where.AND).toBeUndefined();
   });
 
   describe('getNoteCardNoteId', () => {
@@ -2093,7 +2116,7 @@ describe('ChatService', () => {
     it('keeps the self-destruct cutoff when a date filter is also supplied', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 172800,
-        startedAt: null,
+        startedAt: LONG_AGO,
       });
       prisma.chatMember.findUnique.mockResolvedValue(membership());
       prisma.chatMessage.findMany.mockResolvedValue([]);
@@ -2113,7 +2136,12 @@ describe('ChatService', () => {
       });
       // ……而销毁截止作为独立的 AND 条件仍然在,没有被它顶掉。
       expect(args.where.AND).toEqual([
-        { createdAt: { gte: expect.any(Date) } },
+        {
+          OR: [
+            { createdAt: { lt: LONG_AGO } },
+            { createdAt: { gte: expect.any(Date) } },
+          ],
+        },
       ]);
     });
 
@@ -2280,7 +2308,7 @@ describe('ChatService', () => {
     it('applies the same self-destruct cutoff as history', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 172800,
-        startedAt: null,
+        startedAt: LONG_AGO,
       });
       prisma.chatMember.findMany.mockResolvedValue([
         { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
@@ -2292,9 +2320,15 @@ describe('ChatService', () => {
       // 查看者窗口现在由 chatRetentionWhere 统一构造,落在 where.AND 上 ——
       // 和 getHistory 走的是同一个函数,这正是本用例要钉住的「同一把尺子」。
       const [[args]] = prisma.chatMessage.findMany.mock.calls as [
-        [{ where: { AND?: Array<{ createdAt?: { gte: Date } }> } }],
+        [
+          {
+            where: {
+              AND?: Array<{ OR?: Array<{ createdAt?: { gte?: Date } }> }>;
+            };
+          },
+        ],
       ];
-      const gte = args.where.AND?.[0]?.createdAt?.gte;
+      const gte = args.where.AND?.[0]?.OR?.[1]?.createdAt?.gte;
       expect(gte).toBeInstanceOf(Date);
       const ageMs = Date.now() - (gte as Date).getTime();
       expect(ageMs).toBeGreaterThan(47 * 60 * 60 * 1000);
@@ -2387,7 +2421,7 @@ describe('ChatService', () => {
     it('pushes viewer retention into preview and unread queries', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 172800,
-        startedAt: null,
+        startedAt: LONG_AGO,
       });
       prisma.chatMember.findMany.mockResolvedValueOnce([
         {
@@ -2415,7 +2449,8 @@ describe('ChatService', () => {
           (param): param is (Date | null)[] =>
             Array.isArray(param) && param[0] instanceof Date,
         );
-      expect(cutoffParams).toHaveLength(2);
+      // preview / unread 两条查询各贡献 viewerCutoffs 与 viewerStarts 两个数组。
+      expect(cutoffParams).toHaveLength(4);
     });
 
     it('returns dtos with unread counts excluding own messages', async () => {
@@ -6097,7 +6132,7 @@ describe('ChatService', () => {
     it('rejects a message past the viewer self-destruct window', async () => {
       privacySettings.getSelfDestructPolicy.mockResolvedValue({
         sec: 60,
-        startedAt: null,
+        startedAt: LONG_AGO,
       });
       prisma.chatMessage.findUnique.mockResolvedValue(
         visibleRow({ createdAt: new Date(Date.now() - 5 * 60_000) }),

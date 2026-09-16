@@ -123,6 +123,9 @@ describe('chat retention window', () => {
     ).toBe(true);
   });
 
+  // 窗口函数本身在没有下界时只按 cutoff 过滤 —— 这是纯函数语义,和会话焚毁那
+  // 支一致。真实调用里「开着窗口却没有边界」由 selfDestructWindow 在上游拦掉
+  // (见 chat.service.ts:「不能当作从头生效」),不会走到这里。
   it('keeps cutoff-only behavior for a viewer without a start', () => {
     const viewerCutoff = new Date('2026-09-14T11:00:00.000Z');
     const window = buildChatRetentionWindow(
