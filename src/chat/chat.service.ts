@@ -556,7 +556,7 @@ export class ChatService {
         }`,
       );
     }
-    const message = this.toMessageDto(row, sender, burnPolicy);
+    const message = this.toMessageDto(row, sender, burnPolicy, senderUserId);
     try {
       await this.attachReplyTo([message]);
     } catch (error) {
@@ -1087,6 +1087,7 @@ export class ChatService {
               last,
               this.senderFor(last, senders, aliases),
               m.conversation,
+              userId,
             )
           : null,
         unreadCount: unreadCounts.get(m.conversationID) ?? 0,
@@ -2036,6 +2037,7 @@ export class ChatService {
         last,
         this.senderFor(last, senders),
         member.conversation,
+        userId,
       );
       await this.media.attachMediaUrls([lastMessage]);
     }
@@ -2261,7 +2263,12 @@ export class ChatService {
     const senders = await this.resolveSenders(senderIds, conversationId);
     const ascending = ascendingPull ? rows : [...rows].reverse();
     const messages = ascending.map((row) =>
-      this.toMessageDto(row, this.senderFor(row, senders), conversation),
+      this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        conversation,
+        userId,
+      ),
     );
     // 引用快照必须和这一页用同一把尺子:清空水位之下、销毁窗口之外的原文
     // 不能借引用块绕回来。
@@ -2511,6 +2518,7 @@ export class ChatService {
         row,
         this.senderFor(row, senders, aliases),
         burnById.get(row.conversationID) ?? null,
+        userId,
       ),
     );
     // quote 行的 content.quotedText 是客户端塞的原文快照:搜索之前从不过
@@ -2693,6 +2701,7 @@ export class ChatService {
         row,
         this.senderFor(row, senders, aliases),
         burnById.get(row.conversationID) ?? null,
+        userId,
       ),
     );
     await this.attachReplyTo(messages, { heightFloors, retentionWindows });
@@ -2933,7 +2942,7 @@ export class ChatService {
       // 命中已有会话时必须回真实末条:客户端拿这个响应回填会话缓存,
       // 恒 null 会把已有会话的预览抹成空白,与 GET /chat/conversations 打架。
       // 但清空水位之下的末条不算「真实末条」——(见 buildConversationDto)。
-      this.loadLastMessageFor(conv.id, conv, clearedFloor, retention),
+      this.loadLastMessageFor(conv.id, conv, userId, clearedFloor, retention),
     ]);
     return {
       id: conv.id,
@@ -2989,6 +2998,7 @@ export class ChatService {
   private async loadLastMessageFor(
     conversationId: string,
     burnPolicy: ChatBurnPolicyInput,
+    viewerId: string | null,
     heightFloor = 0,
     retention?: ChatRetentionWindow,
   ): Promise<ChatMessageDto | null> {
@@ -3012,6 +3022,7 @@ export class ChatService {
       row,
       this.senderFor(row, senders),
       burnPolicy,
+      viewerId,
     );
     await this.media.attachMediaUrls([dto]);
     return dto;
@@ -3628,11 +3639,20 @@ export class ChatService {
    * 一处就等于告诉客户端「这条不焚毁」—— 而那正是要修的 bug 本身,且失败方向
    * 朝不安全一侧偏,线上完全无声。设成必填,新增调用点时由 tsc 逼着回答这个
    * 问题,而不是靠记得。会话没开焚毁就显式传 null。
+   *
+   * viewerId 同理必填:`d` 是发送者**本机**生成的幂等键(deliveryId),只有他
+   * 自己的设备拿它把乐观气泡换成服务端消息。实时路径早就按这个语义收口了 ——
+   * chat-broadcast.service 只把带 d 的载荷发给发送者的个人房,其余在座成员收
+   * d:null。REST 读路径却把库里的 clientMessageId 原样发给所有人:历史分页、
+   * 全局搜索、会话列表末条、离线增量,每一处都在把别人设备生成的键交给旁观者。
+   * 收口在这里而不是各个读路径上,新增调用点时由 tsc 逼着回答「这份 DTO 是给谁
+   * 看的」。没有查看者的构建(系统/广播)显式传 null。
    */
   private toMessageDto(
     row: MessageRow,
     sender: ChatSenderInfo | null,
     burnPolicy: ChatBurnPolicy | number | null,
+    viewerId: string | null,
   ): ChatMessageDto {
     const normalizedPolicy: ChatBurnPolicy =
       typeof burnPolicy === 'number'
@@ -3655,7 +3675,12 @@ export class ChatService {
       ...(row.deleted ? { deleted: true } : {}),
       ...(row.editedAt ? { editedAt: row.editedAt.toISOString() } : {}),
       burnDurationSec,
-      d: row.clientMessageId,
+      // d 只发给它的作者本人。字段保留(可空),不是省略:已装机 App 的协议
+      // 校验允许 null d,且只对非 null 的键建本地索引。
+      d:
+        row.senderID !== null && row.senderID === viewerId
+          ? row.clientMessageId
+          : null,
       createdAt: row.createdAt.toISOString(),
     };
   }
@@ -3760,7 +3785,12 @@ export class ChatService {
         row.senderID ? [row.senderID] : [],
         conversationId,
       );
-      return this.toMessageDto(row, this.senderFor(row, senders), conversation);
+      return this.toMessageDto(
+        row,
+        this.senderFor(row, senders),
+        conversation,
+        userId,
+      );
     }
     if (row.senderID === null) {
       // 系统消息(进退群提示、burn-changed 留痕)没有作者,下面那条
@@ -3822,6 +3852,7 @@ export class ChatService {
         updated,
         this.senderFor(updated, senders),
         conversation,
+        userId,
       );
     }
     if (mediaKeys.length > 0) {
@@ -3844,6 +3875,7 @@ export class ChatService {
       updated,
       this.senderFor(updated, senders),
       conversation,
+      userId,
     );
   }
 
@@ -4093,7 +4125,11 @@ export class ChatService {
     // 与 sendMessage 同样的理由:写已经提交了,装饰失败不能让这次编辑
     // 「对外没发生过」—— 网关不广播,客户端还看着旧文本,而且编辑没有幂等键,
     // 重试只会再往 contentHistory 里压一层。
-    const dto = await this.decorateCommittedMessage(updated, conversation);
+    const dto = await this.decorateCommittedMessage(
+      updated,
+      conversation,
+      userId,
+    );
     return dto;
   }
 
@@ -4101,6 +4137,7 @@ export class ChatService {
   private async decorateCommittedMessage(
     row: MessageRow,
     burnPolicy: ChatBurnPolicy,
+    viewerId: string | null,
   ): Promise<ChatMessageDto> {
     let sender: ChatSenderInfo | null = null;
     try {
@@ -4116,7 +4153,7 @@ export class ChatService {
         }`,
       );
     }
-    const dto = this.toMessageDto(row, sender, burnPolicy);
+    const dto = this.toMessageDto(row, sender, burnPolicy, viewerId);
     try {
       await this.attachReplyTo([dto]);
     } catch (error) {

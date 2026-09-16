@@ -6123,4 +6123,86 @@ describe('ChatService', () => {
       ).resolves.toMatchObject({ row });
     });
   });
+
+  /**
+   * d 是**发送者本机**生成的幂等键(deliveryId):只有他自己的设备拿它把乐观气泡
+   * 换成服务端消息。实时路径早就按这个语义收口了 —— chat-broadcast.service 只把
+   * 带 d 的载荷发给发送者的个人房,其余在座成员收 d:null。REST 读路径却把库里的
+   * clientMessageId 原样发给所有人:历史分页、全局搜索、会话列表末条,每一处都在
+   * 把别人设备生成的键交给旁观者。同一个字段两套口径,漏的那一套还是默认路径。
+   */
+  describe('客户端幂等键 d 的可见范围(REST 读路径)', () => {
+    const peerRow = {
+      ...createdRow,
+      id: 'msg-peer',
+      senderID: 'u2',
+      clientMessageId: 'u2-device-key',
+    };
+
+    it('nulls another member d in history but keeps the viewer own key', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findMany.mockResolvedValue([
+        { ...createdRow, id: 'msg-own', height: 5 },
+        { ...peerRow, height: 4 },
+      ]);
+
+      const page = await service.getHistory('u1', 'conv-1', undefined, 50);
+
+      const byId = new Map(page.messages.map((m) => [m.id, m]));
+      // 字段仍在、只是为 null:已装机 App 的协议校验允许 null d,只对非 null 建索引。
+      expect(byId.get('msg-peer')).toHaveProperty('d', null);
+      expect(byId.get('msg-own')?.d).toBe('client-msg-1');
+    });
+
+    it('nulls another member d on the conversation list preview', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            ...membership(),
+            conversation: {
+              ...membership().conversation,
+              lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+            },
+          },
+        ])
+        .mockResolvedValueOnce([]);
+      prisma.$queryRaw.mockResolvedValueOnce([peerRow]).mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0].lastMessage).toHaveProperty('d', null);
+    });
+
+    it('keeps the viewer own key on the conversation list preview', async () => {
+      prisma.chatMember.findMany
+        .mockResolvedValueOnce([
+          {
+            ...membership(),
+            conversation: {
+              ...membership().conversation,
+              lastMessageAt: new Date('2026-08-05T12:00:00Z'),
+            },
+          },
+        ])
+        .mockResolvedValueOnce([]);
+      prisma.$queryRaw
+        .mockResolvedValueOnce([createdRow])
+        .mockResolvedValue([]);
+
+      const list = await service.listConversations('u1');
+
+      expect(list[0].lastMessage?.d).toBe('client-msg-1');
+    });
+
+    it('nulls another member d in global search results', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+      ]);
+      prisma.chatMessage.findMany.mockResolvedValue([peerRow]);
+
+      const rows = await service.searchAllMessages('u1', 'hello');
+
+      expect(rows[0]).toHaveProperty('d', null);
+    });
+  });
 });
