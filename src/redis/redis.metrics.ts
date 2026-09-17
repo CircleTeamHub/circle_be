@@ -10,7 +10,8 @@ export type RedisCommandOperation =
   | 'delete'
   | 'increment'
   | 'subscribe'
-  | 'rate_limit';
+  | 'rate_limit'
+  | 'lease';
 
 export type RedisFailureReason = 'timeout' | 'unavailable' | 'error';
 

@@ -6,6 +6,8 @@ import {
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { runWithJobLease } from 'src/redis/job-lease';
+import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatMediaService } from './chat-media.service';
 import {
@@ -30,43 +32,73 @@ const SWEEP_BATCHES_MAX = 4;
  * 跨轮次轮转,长期覆盖不丢会话。
  */
 const SWEEP_CONVERSATIONS_MAX = 200;
+/**
+ * 多实例时只让一个实例扫。持有者崩溃后别的实例最多等这么久;扫得比它久时可能与
+ * 下一个实例短暂重叠 —— 墓碑更新带 deleted=false,重叠不会重复改、重复播。
+ */
+const SWEEP_LEASE_MS = 2 * 60_000;
+const SWEEP_JOB = 'chat_burn_sweeper';
+/** 轮转游标在各实例间共享:换了实例拿到租约也接着往后扫,而不是从头开始。 */
+const SWEEP_CURSOR_KEY = `job-cursor:${SWEEP_JOB}`;
+const SWEEP_CURSOR_TTL_SECONDS = 60 * 60;
 
 @Injectable()
 export class ChatBurnSweeperService {
   private readonly logger = new Logger(ChatBurnSweeperService.name);
   private running = false;
-  /** 上一轮扫到的最后一个会话 id(轮转游标);扫完一圈回到开头。 */
+  /**
+   * 上一轮扫到的最后一个会话 id(轮转游标);扫完一圈回到开头。Redis 可用时以共享的
+   * 那份为准,这里是 Redis 不可用时的本机兜底。
+   */
   private cursor: string | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly media: ChatMediaService,
     private readonly broadcast: ChatBroadcastService,
+    private readonly redis: RedisService,
   ) {}
 
   @TrackedCron(CronExpression.EVERY_MINUTE, 'chat_burn_sweeper')
   async sweep(): Promise<void> {
-    // 跳过不是成功 —— 详见 temp-chat.cleanup 里同一处守卫的注释：卡死的那一轮
-    // 会被后续每一次跳过持续刷新心跳，两条 cron 告警一起失明。
+    // 跳过不是成功 —— 详见 temp-chat.cleanup 里同一处守卫的注释:卡死的那一轮
+    // 会被后续每一次跳过持续刷新心跳,两条 cron 告警一起失明。
     if (this.running) {
       reportJobSkipped();
       return;
     }
     this.running = true;
     try {
+      const ran = await runWithJobLease(
+        this.redis,
+        SWEEP_JOB,
+        SWEEP_LEASE_MS,
+        () => this.sweepOnce(),
+      );
+      // 别的实例正在扫。
+      if (!ran) reportJobSkipped();
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private async sweepOnce(): Promise<void> {
+    try {
+      const cursor = await this.readCursor();
       const burning = await this.prisma.chatConversation.findMany({
         where: {
           burnDurationSec: { not: null },
-          ...(this.cursor ? { id: { gt: this.cursor } } : {}),
+          ...(cursor ? { id: { gt: cursor } } : {}),
         },
         select: { id: true, burnDurationSec: true, burnStartedAt: true },
         orderBy: { id: 'asc' },
         take: SWEEP_CONVERSATIONS_MAX,
       });
-      this.cursor =
+      await this.writeCursor(
         burning.length === SWEEP_CONVERSATIONS_MAX
           ? burning[burning.length - 1].id
-          : null;
+          : null,
+      );
       for (const conversation of burning) {
         const seconds = conversation.burnDurationSec;
         if (!seconds || seconds <= 0) continue;
@@ -77,9 +109,21 @@ export class ChatBurnSweeperService {
         `burn sweep failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       reportHandledJobFailure();
-    } finally {
-      this.running = false;
     }
+  }
+
+  /** 共享游标;Redis 答不上来(或没配)时用本机那份。 */
+  private async readCursor(): Promise<string | null> {
+    const shared = await this.redis.getJsonMany<string>([SWEEP_CURSOR_KEY], {
+      strict: true,
+    });
+    if (shared === null) return this.cursor;
+    return typeof shared[0] === 'string' ? shared[0] : null;
+  }
+
+  private async writeCursor(next: string | null): Promise<void> {
+    this.cursor = next;
+    await this.redis.setJson(SWEEP_CURSOR_KEY, next, SWEEP_CURSOR_TTL_SECONDS);
   }
 
   private async sweepConversation(
@@ -138,7 +182,9 @@ export class ChatBurnSweeperService {
           WHERE "id" = ${conversationId} FOR UPDATE`;
         // RETURNING 带回触发器刚分配的 revision,随焚毁通知下发。
         const tombstones = await tx.chatMessage.updateManyAndReturn({
-          where: { id: { in: messageIds } },
+          // deleted=false:租约过期后两个实例可能扫到同一批,已经烧掉的行不能再改
+          // 一遍(白花一次变更序号)、再播一遍。
+          where: { id: { in: messageIds }, deleted: false },
           // contentHistory 一起清:编辑过的消息把每一版旧正文都留在这里,只清
           // content 的话,「烧掉」的其实只有最后一版,前面几版连同备份长期留在库里。
           data: {
@@ -181,6 +227,8 @@ export class ChatBurnSweeperService {
     conversationId: string,
     burned: Array<{ id: string; revision: number }>,
   ): Promise<void> {
+    // 这一批已被别的实例烧掉(更新了 0 行):没有新墓碑,不播。
+    if (burned.length === 0) return;
     try {
       await this.broadcast.emitBurnedMessages(conversationId, burned);
     } catch (error) {
