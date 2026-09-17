@@ -130,12 +130,25 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  /** 已读水位推进 → 会话房。 */
-  emitRead(payload: ChatReadBroadcast): void {
+  /**
+   * 已读水位推进 → 会话房(单聊对端据此渲染「已读」)。
+   *
+   * readerOnly:只发给读者本人的个人房,同步他其它设备上的未读。群聊用这个 ——
+   * 群里没人渲染「谁读到了哪」(逐条已读是按需查询),发到会话房就是每读一次
+   * 向每个在线成员投一帧,千人在线的群是平方级的帧数。
+   */
+  emitRead(
+    payload: ChatReadBroadcast,
+    options: { readerOnly?: boolean } = {},
+  ): void {
     const server = this.requireServer('emitRead');
     if (!server) return;
     server
-      .to(conversationRoom(payload.conversationId))
+      .to(
+        options.readerOnly
+          ? userRoom(payload.userId)
+          : conversationRoom(payload.conversationId),
+      )
       .emit(CHAT_EVENTS.read, payload);
   }
 

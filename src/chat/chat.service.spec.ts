@@ -157,6 +157,12 @@ describe('ChatService', () => {
     ...overrides,
   });
 
+  /** 已读 / 送达回执的钳位读会话行上的 nextHeight。 */
+  const seatAt = (nextHeight: number, type = 'GROUP') =>
+    membership({
+      conversation: { ...membership().conversation, type, nextHeight },
+    });
+
   const sendPayload = (
     overrides: Partial<ChatSendPayload> = {},
   ): ChatSendPayload => ({
@@ -1396,13 +1402,15 @@ describe('ChatService', () => {
   });
 
   describe('markRead', () => {
+    // 钳位用会话行上的 nextHeight(已提交的最高序号),随成员校验一起读回来,
+    // 不再为每条回执单独跑一次 MAX(height)。
     it('advances the watermark and reports advancement', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9));
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
       await expect(service.markRead('u1', 'conv-1', 5)).resolves.toEqual({
         advanced: true,
         height: 5,
+        conversationType: 'GROUP',
       });
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith({
         where: {
@@ -1412,40 +1420,42 @@ describe('ChatService', () => {
         },
         data: { lastReadHeight: 5 },
       });
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
     });
 
     it('reports no advancement for stale watermarks (forward-only)', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
       prisma.chatMember.updateMany.mockResolvedValue({ count: 0 });
       await expect(service.markRead('u1', 'conv-1', 1)).resolves.toEqual({
         advanced: false,
         height: 1,
+        conversationType: 'DIRECT',
       });
     });
 
     it('clamps a future watermark to the conversation height', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9));
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
 
       // height=2e9 未钳位的话会永久压掉后续所有未读,并广播一条假已读。
       await expect(
         service.markRead('u1', 'conv-1', 2_000_000_000),
-      ).resolves.toEqual({ advanced: true, height: 9 });
+      ).resolves.toEqual({
+        advanced: true,
+        height: 9,
+        conversationType: 'GROUP',
+      });
       expect(prisma.chatMember.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: { lastReadHeight: 9 } }),
       );
     });
 
     it('is a no-op on an empty conversation', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.aggregate.mockResolvedValue({
-        _max: { height: null },
-      });
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(0));
       await expect(service.markRead('u1', 'conv-1', 5)).resolves.toEqual({
         advanced: false,
         height: 0,
+        conversationType: 'GROUP',
       });
       expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
     });
@@ -1454,6 +1464,27 @@ describe('ChatService', () => {
       await expect(service.markRead('u1', 'conv-1', 1.5)).rejects.toThrow(
         BadRequestException,
       );
+    });
+  });
+
+  describe('listConversationSeats', () => {
+    it('returns every live seat with its conversation type in one query', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'dm-1', conversation: { type: 'DIRECT' } },
+        { conversationID: 'group-1', conversation: { type: 'GROUP' } },
+      ]);
+
+      await expect(service.listConversationSeats('u1')).resolves.toEqual([
+        { conversationId: 'dm-1', type: 'DIRECT' },
+        { conversationId: 'group-1', type: 'GROUP' },
+      ]);
+      expect(prisma.chatMember.findMany).toHaveBeenCalledWith({
+        where: { userID: 'u1', leftAt: null },
+        select: {
+          conversationID: true,
+          conversation: { select: { type: true } },
+        },
+      });
     });
   });
 
@@ -3351,8 +3382,7 @@ describe('ChatService', () => {
 
   describe('markDelivered(G-07 送达水位)', () => {
     it('clamps to the conversation ceiling and only moves forward', async () => {
-      prisma.chatMember.findUnique.mockResolvedValue(membership());
-      prisma.chatMessage.aggregate.mockResolvedValue({ _max: { height: 9 } });
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'DIRECT'));
       prisma.chatMember.updateMany.mockResolvedValue({ count: 1 });
 
       const result = await service.markDelivered('u1', 'conv-1', 2_000_000);
@@ -3366,6 +3396,20 @@ describe('ChatService', () => {
         },
         data: { lastDeliveredHeight: 9 },
       });
+      expect(prisma.chatMessage.aggregate).not.toHaveBeenCalled();
+    });
+
+    // 「已送达」只在单聊里渲染,群里没人读这个水位。3000 人的群每条消息都让每个
+    // 在线成员写一行、再向全群广播一次,是平方级的写入和帧数 —— 老客户端还会报,
+    // 这里直接丢掉。
+    it('records nothing for group conversations', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(seatAt(9, 'GROUP'));
+
+      await expect(service.markDelivered('u1', 'conv-1', 5)).resolves.toEqual({
+        advanced: false,
+        height: 0,
+      });
+      expect(prisma.chatMember.updateMany).not.toHaveBeenCalled();
     });
   });
 
@@ -4433,11 +4477,10 @@ describe('ChatService', () => {
         clearedBy: 'u1',
       });
       expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 42,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 42 },
+        { readerOnly: false },
+      );
       expect(
         systemMessage.insertSystemMessageAfterLockedConversationInTx,
       ).toHaveBeenCalledWith(expect.anything(), 'conv-1', 42, {
@@ -4767,11 +4810,10 @@ describe('ChatService', () => {
       // 全群清空只播操作者自己那一条已读。逐人播是 N^2 帧,而且对一个从没打开过
       // 会话的成员来说那是条假回执;其余成员从 chat:history_cleared 把未读清零。
       expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 42,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 42 },
+        { readerOnly: true },
+      );
       expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
         conversationId: 'conv-1',
         clearedBeforeHeight: 42,
@@ -4969,11 +5011,10 @@ describe('ChatService', () => {
         expect.objectContaining({ data: { lastReadHeight: 42 } }),
       );
       expect(broadcast.emitRead).toHaveBeenCalledTimes(1);
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 42,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 42 },
+        { readerOnly: true },
+      );
       // 其余 49 个成员靠这一条把未读清零。
       expect(broadcast.emitHistoryCleared).toHaveBeenCalledWith({
         conversationId: 'conv-1',
@@ -5871,11 +5912,10 @@ describe('ChatService', () => {
       await service.clearHistory('u1', 'conv-1');
 
       // 不播的话,对端的已读回执和本账号其他设备的红点会一直停在旧水位。
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 9,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 9 },
+        { readerOnly: false },
+      );
     });
   });
 

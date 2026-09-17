@@ -796,6 +796,10 @@ export class ChatGateway implements OnModuleDestroy {
     const preReadyQueue: Array<() => Promise<void>> = [];
     let drainingPreReadyQueue = false;
     let conversationIds: string[] = [];
+    // 上下线广播只发往这些会话房:群房间不播。在线状态只在单聊头部和资料页用
+    // (资料页打开时另查一次),每次上下线都向全部群房间广播,千人在线的群就是
+    // 在线人数平方级的帧数。群房间照常入房,消息/输入状态不受影响。
+    let presenceConversationIds: string[] = [];
     // 上下线广播要剔掉互相拉黑的人 —— 座位还在,不剔就等于换个通道继续推送。
     let blockedPeers: string[] = [];
     // 本人的「显示在线时间」开关:关着就不广播上线(下线那侧现读,见 announceOffline)。
@@ -989,7 +993,7 @@ export class ChatGateway implements OnModuleDestroy {
       // WebSocket 就能把整个后端打死)。
       void this.announceOffline(
         userId,
-        conversationIds,
+        presenceConversationIds,
         blockedPeers,
         guestConversationId !== null,
       );
@@ -1033,12 +1037,19 @@ export class ChatGateway implements OnModuleDestroy {
     try {
       if (guestConversationId) {
         conversationIds = [guestConversationId];
+        presenceConversationIds = [guestConversationId];
       } else {
-        [conversationIds, blockedPeers, presenceVisible] = await Promise.all([
-          this.chatService.listConversationIds(userId),
+        let seats: Awaited<ReturnType<ChatService['listConversationSeats']>> =
+          [];
+        [seats, blockedPeers, presenceVisible] = await Promise.all([
+          this.chatService.listConversationSeats(userId),
           this.chatService.listBlockedCounterparties(userId),
           this.chatService.isPresenceVisible(userId),
         ]);
+        conversationIds = seats.map((seat) => seat.conversationId);
+        presenceConversationIds = seats
+          .filter((seat) => seat.type !== 'GROUP')
+          .map((seat) => seat.conversationId);
       }
       await socket.join(userRoom(userId));
       // 访客只进个人房:消息/编辑按在座成员逐个个人房投递,照样送得到;会话房里的
@@ -1085,7 +1096,7 @@ export class ChatGateway implements OnModuleDestroy {
     if (presenceVisible) {
       this.observeBroadcast('presence', () =>
         this.broadcast.emitPresence(
-          conversationIds,
+          presenceConversationIds,
           { userId, online: true },
           blockedPeers,
         ),
@@ -1370,12 +1381,12 @@ export class ChatGateway implements OnModuleDestroy {
       reply({ ok: true });
       if (result.advanced) {
         // 播落库后的高度,不是客户端报的那个 —— 后者可能被钳过。
+        // 群聊只同步读者自己的其它设备,见 emitRead。
         this.observeBroadcast('read', () =>
-          this.broadcast.emitRead({
-            conversationId,
-            userId,
-            height: result.height,
-          }),
+          this.broadcast.emitRead(
+            { conversationId, userId, height: result.height },
+            { readerOnly: result.conversationType === 'GROUP' },
+          ),
         );
       }
     } catch (error) {

@@ -169,6 +169,15 @@ export function conversationSyncRevision(conversation: {
   return Math.max(conversation.nextRevision ?? 0, conversation.nextHeight ?? 0);
 }
 
+/**
+ * 已读 / 送达水位的上限:会话行上已提交的最高消息序号。成员校验时整行已经读回来,
+ * 不用再为每条回执跑一次 MAX(height)。末尾几条被焚毁时它比「最高的可见消息」大,
+ * 水位钳到那里无害 —— 未读本来就不算已删的行。
+ */
+function receiptCeiling(conversation: { nextHeight: number }): number {
+  return conversation.nextHeight ?? 0;
+}
+
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
 // 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
 const STANDALONE_GROUP_MAX_MEMBERS = 200;
@@ -801,24 +810,29 @@ export class ChatService {
     userId: string,
     conversationId: string,
     height: number,
-  ): Promise<{ advanced: boolean; height: number }> {
+  ): Promise<{
+    advanced: boolean;
+    height: number;
+    conversationType: ChatConversation['type'];
+  }> {
     if (!Number.isInteger(height) || height < 0) {
       throw new BadRequestException({
         message: '已读水位非法',
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    await this.requireMembership(conversationId, userId);
+    const conversation = await this.requireMembership(conversationId, userId);
     // 钳到会话当前最大 height:客户端可以报任意非负整数,直接落库的话
     // 一条 height=2e9 的 chat:read 会永久压掉后续所有未读,还会广播一条
     // 假的已读回执,直到会话真的涨到那个高度为止。
-    const top = await this.prisma.chatMessage.aggregate({
-      where: { conversationID: conversationId, deleted: false },
-      _max: { height: true },
-    });
-    const ceiling = top._max.height ?? 0;
-    const clamped = Math.min(height, ceiling);
-    if (clamped <= 0) return { advanced: false, height: 0 };
+    const clamped = Math.min(height, receiptCeiling(conversation));
+    if (clamped <= 0) {
+      return {
+        advanced: false,
+        height: 0,
+        conversationType: conversation.type,
+      };
+    }
     const updated = await this.prisma.chatMember.updateMany({
       where: {
         conversationID: conversationId,
@@ -827,7 +841,11 @@ export class ChatService {
       },
       data: { lastReadHeight: clamped },
     });
-    return { advanced: updated.count > 0, height: clamped };
+    return {
+      advanced: updated.count > 0,
+      height: clamped,
+      conversationType: conversation.type,
+    };
   }
 
   /**
@@ -1007,6 +1025,28 @@ export class ChatService {
       select: { conversationID: true },
     });
     return rows.map((r) => r.conversationID);
+  }
+
+  /**
+   * 连接建立时用:全部在座会话连同类型,一次查询。入房要全部,在线状态广播
+   * 要按类型挑(群房间不播,见网关)。
+   */
+  async listConversationSeats(
+    userId: string,
+  ): Promise<
+    Array<{ conversationId: string; type: ChatConversation['type'] }>
+  > {
+    const rows = await this.prisma.chatMember.findMany({
+      where: { userID: userId, leftAt: null },
+      select: {
+        conversationID: true,
+        conversation: { select: { type: true } },
+      },
+    });
+    return rows.map((row) => ({
+      conversationId: row.conversationID,
+      type: row.conversation.type,
+    }));
   }
 
   /** 会话列表:最近活跃前 N 个,带对端信息 / 末条消息 / 未读数;隐藏的不出。 */
@@ -3895,12 +3935,12 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    await this.requireMembership(conversationId, userId);
-    const top = await this.prisma.chatMessage.aggregate({
-      where: { conversationID: conversationId, deleted: false },
-      _max: { height: true },
-    });
-    const clamped = Math.min(height, top._max.height ?? 0);
+    const conversation = await this.requireMembership(conversationId, userId);
+    // 「已送达」只在单聊里渲染,读这个水位的也只有单聊对端座位。群里每个在线成员
+    // 每收一条都写一行、再向全群广播一次,是平方级的写入和帧数;已装机的老客户端
+    // 还会继续报,在这里丢掉。
+    if (conversation.type === 'GROUP') return { advanced: false, height: 0 };
+    const clamped = Math.min(height, receiptCeiling(conversation));
     if (clamped <= 0) return { advanced: false, height: 0 };
     const updated = await this.prisma.chatMember.updateMany({
       where: {
@@ -4493,7 +4533,7 @@ export class ChatService {
         errorCode: ChatErrorCode.InvalidPayload,
       });
     }
-    const { watermark, isGlobalClear, advancedReaders, notice } =
+    const { watermark, isGlobalClear, advancedReaders, notice, isGroup } =
       await this.prisma.$transaction(async (tx) => {
         // 与发消息/进群/退群保持同一顺序:会话行锁永远最先。
         // 锁后的会话和座位才是授权与目标集的权威快照。
@@ -4572,6 +4612,7 @@ export class ChatService {
             isGlobalClear: globalClear,
             advancedReaders: [],
             notice: null,
+            isGroup: conversation.type === 'GROUP',
           };
         }
         const targetUserIds = globalClear
@@ -4632,6 +4673,7 @@ export class ChatService {
           });
         }
         return {
+          isGroup: conversation.type === 'GROUP',
           watermark: clearThrough,
           isGlobalClear: globalClear,
           advancedReaders: readers,
@@ -4656,11 +4698,11 @@ export class ChatService {
       : advancedReaders;
     for (const target of readReceiptTargets) {
       try {
-        this.broadcast.emitRead({
-          conversationId,
-          userId: target.userID,
-          height: watermark,
-        });
+        // 群里别人不渲染「谁读到了哪」,只同步操作者自己的其它设备(见 emitRead)。
+        this.broadcast.emitRead(
+          { conversationId, userId: target.userID, height: watermark },
+          { readerOnly: isGroup },
+        );
       } catch (error) {
         this.logger.warn(
           `history clear realtime delivery failed after commit (${error instanceof Error ? error.name : 'unknown error'})`,

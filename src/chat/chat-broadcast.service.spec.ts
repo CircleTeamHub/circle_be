@@ -114,6 +114,36 @@ describe('ChatBroadcastService.emitHistoryCleared', () => {
   });
 });
 
+describe('ChatBroadcastService.emitRead', () => {
+  const read = { conversationId: 'conv-1', userId: 'u1', height: 7 };
+
+  function serviceWithServer() {
+    const emit = jest.fn();
+    const to = jest.fn(() => ({ emit }));
+    const service = new ChatBroadcastService(
+      {} as never,
+      prismaWithActiveUsers([]) as never,
+    );
+    service.setServer({ to } as never);
+    return { service, to, emit };
+  }
+
+  it('goes to the conversation room by default (the peer renders 已读)', () => {
+    const { service, to, emit } = serviceWithServer();
+    service.emitRead(read);
+    expect(to).toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:read', read);
+  });
+
+  it('goes only to the reader personal room when readerOnly', () => {
+    const { service, to, emit } = serviceWithServer();
+    service.emitRead(read, { readerOnly: true });
+    expect(to).toHaveBeenCalledWith('u:u1');
+    expect(to).not.toHaveBeenCalledWith('c:conv-1');
+    expect(emit).toHaveBeenCalledWith('chat:read', read);
+  });
+});
+
 describe('ChatBroadcastService member eviction', () => {
   it('uses the real void RemoteSocket leave contract without pretending it is an acknowledgement', async () => {
     const adapter = { delSockets: jest.fn() };

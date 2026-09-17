@@ -32,8 +32,11 @@ function fakeSocket(overrides: Record<string, unknown> = {}) {
 describe('ChatGateway', () => {
   const jwtService = { verify: jest.fn(), decode: jest.fn() };
   const sessionVerifier = { verify: jest.fn() };
+  // 连接时一次读回全部在座会话和它们的类型(在线状态不进群房间);默认都是单聊。
+  const seats = (...ids: string[]) =>
+    ids.map((conversationId) => ({ conversationId, type: 'DIRECT' }));
   const chatService = {
-    listConversationIds: jest.fn(),
+    listConversationSeats: jest.fn(),
     sendMessage: jest.fn(),
     markRead: jest.fn(),
     editMessage: jest.fn(),
@@ -389,7 +392,7 @@ describe('ChatGateway', () => {
         const socket = fakeSocket({
           conn: { transport: { name: 'websocket' } },
         });
-        chatService.listConversationIds.mockResolvedValue(['conv-1']);
+        chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
         broadcast.isUserOnline.mockRejectedValue(
           new Error('Connection is closed.'),
         );
@@ -414,7 +417,7 @@ describe('ChatGateway', () => {
       const socket = fakeSocket({
         conn: { transport: { name: 'websocket' } },
       });
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
 
       await gateway['handleConnection'](socket as never);
       socket.handlers.get('disconnect')?.('transport error');
@@ -443,7 +446,7 @@ describe('ChatGateway', () => {
         .spyOn((gateway as any).logger, 'error')
         .mockImplementation(() => undefined);
       const socket = fakeSocket({ conn: { transport: { name: 'websocket' } } });
-      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+      chatService.listConversationSeats.mockRejectedValue(new Error('db down'));
 
       await gateway['handleConnection'](socket as never);
       socket.handlers.get('disconnect')?.('transport error');
@@ -482,7 +485,7 @@ describe('ChatGateway', () => {
         conn: { transport: { name: 'websocket' } },
         ...overrides,
       });
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       await gateway['handleConnection'](socket as never);
       opened.push(socket);
       return socket;
@@ -685,7 +688,9 @@ describe('ChatGateway', () => {
   describe('handleConnection', () => {
     it('joins the personal room plus every membership conversation room', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1', 'conv-2']);
+      chatService.listConversationSeats.mockResolvedValue(
+        seats('conv-1', 'conv-2'),
+      );
       await gateway['handleConnection'](socket as never);
       expect(socket.join).toHaveBeenCalledWith('u:u1');
       expect(socket.join).toHaveBeenCalledWith(['c:conv-1', 'c:conv-2']);
@@ -700,7 +705,7 @@ describe('ChatGateway', () => {
         .spyOn(errorAggregation, 'reportOperationalError')
         .mockImplementation(() => undefined);
       const socket = fakeSocket();
-      chatService.listConversationIds.mockRejectedValue(new Error('db down'));
+      chatService.listConversationSeats.mockRejectedValue(new Error('db down'));
       await gateway['handleConnection'](socket as never);
       expect(socket.disconnect).toHaveBeenCalledWith(true);
       expect(metrics.observeConnectionRejected).toHaveBeenCalledWith(
@@ -730,7 +735,7 @@ describe('ChatGateway', () => {
     // (开关翻回来时要有数可显示)。
     it('stays silent on connect and disconnect when the user hid presence', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       chatService.isPresenceVisible.mockResolvedValue(false);
       broadcast.isUserOnline.mockResolvedValue(false);
 
@@ -751,7 +756,7 @@ describe('ChatGateway', () => {
 
     it('records last-seen and broadcasts offline with that timestamp on the last disconnect', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       broadcast.isUserOnline.mockResolvedValue(false);
 
       await gateway['handleConnection'](socket as never);
@@ -800,9 +805,43 @@ describe('ChatGateway', () => {
       );
     });
 
+    // 在线状态只在单聊头部和资料页用(资料页打开时另查一次)。每次上下线都向
+    // 所有群房间广播,千人在线的群就是在线人数平方级的帧;群房间只照常入房。
+    it('keeps group rooms out of online and offline presence broadcasts', async () => {
+      const socket = fakeSocket();
+      chatService.listConversationSeats.mockResolvedValue([
+        { conversationId: 'dm-1', type: 'DIRECT' },
+        { conversationId: 'group-1', type: 'GROUP' },
+        { conversationId: 'support-1', type: 'SUPPORT' },
+      ]);
+      broadcast.isUserOnline.mockResolvedValue(false);
+
+      await gateway['handleConnection'](socket as never);
+      expect(socket.join).toHaveBeenCalledWith([
+        'c:dm-1',
+        'c:group-1',
+        'c:support-1',
+      ]);
+      expect(broadcast.emitPresence).toHaveBeenCalledWith(
+        ['dm-1', 'support-1'],
+        { userId: 'u1', online: true },
+        [],
+      );
+
+      broadcast.emitPresence.mockClear();
+      socket.handlers.get('disconnect')?.('transport close');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(broadcast.emitPresence).toHaveBeenCalledWith(
+        ['dm-1', 'support-1'],
+        expect.objectContaining({ userId: 'u1', online: false }),
+        [],
+      );
+    });
+
     it('excludes blocked counterparties from the online broadcast', async () => {
       const socket = fakeSocket();
-      chatService.listConversationIds.mockResolvedValue(['conv-1']);
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
       chatService.listBlockedCounterparties.mockResolvedValue(['blocked-1']);
 
       await gateway['handleConnection'](socket as never);
@@ -817,9 +856,9 @@ describe('ChatGateway', () => {
     it('registers event handlers before awaiting room setup', async () => {
       const socket = fakeSocket();
       let handlersAtLookup = 0;
-      chatService.listConversationIds.mockImplementation(() => {
+      chatService.listConversationSeats.mockImplementation(() => {
         handlersAtLookup = socket.handlers.size;
-        return Promise.resolve(['conv-1']);
+        return Promise.resolve(seats('conv-1'));
       });
       await gateway['handleConnection'](socket as never);
       expect(handlersAtLookup).toBeGreaterThan(0);
@@ -1103,7 +1142,7 @@ describe('ChatGateway', () => {
         data: { userId: 'g1', guestConversationId: 'conv-9' },
       });
       await gateway['handleConnection'](socket as never);
-      expect(chatService.listConversationIds).not.toHaveBeenCalled();
+      expect(chatService.listConversationSeats).not.toHaveBeenCalled();
       expect(socket.join).toHaveBeenCalledWith('u:g1');
       expect(socket.join).not.toHaveBeenCalledWith(['c:conv-9']);
     });
@@ -1657,7 +1696,11 @@ describe('ChatGateway', () => {
 
   describe('handleRead', () => {
     it('acks and broadcasts only when the watermark advanced', async () => {
-      chatService.markRead.mockResolvedValue({ advanced: true, height: 5 });
+      chatService.markRead.mockResolvedValue({
+        advanced: true,
+        height: 5,
+        conversationType: 'DIRECT',
+      });
       const ack = jest.fn();
       await gateway['handleRead'](
         fakeSocket() as never,
@@ -1666,14 +1709,17 @@ describe('ChatGateway', () => {
         ack,
       );
       expect(ack).toHaveBeenCalledWith({ ok: true });
-      expect(broadcast.emitRead).toHaveBeenCalledWith({
-        conversationId: 'conv-1',
-        userId: 'u1',
-        height: 5,
-      });
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'conv-1', userId: 'u1', height: 5 },
+        { readerOnly: false },
+      );
 
       broadcast.emitRead.mockClear();
-      chatService.markRead.mockResolvedValue({ advanced: false, height: 4 });
+      chatService.markRead.mockResolvedValue({
+        advanced: false,
+        height: 4,
+        conversationType: 'DIRECT',
+      });
       await gateway['handleRead'](
         fakeSocket() as never,
         'u1',
@@ -1681,6 +1727,26 @@ describe('ChatGateway', () => {
         jest.fn(),
       );
       expect(broadcast.emitRead).not.toHaveBeenCalled();
+    });
+
+    // 群聊的「已读」只在本人的未读和逐条已读(按需查询)里用,别人的界面不渲染
+    // 谁读到了哪 —— 广播给全群就是每读一次向每个在线成员投一帧。只同步本人的其它设备。
+    it('sends group read receipts only to the reader own devices', async () => {
+      chatService.markRead.mockResolvedValue({
+        advanced: true,
+        height: 7,
+        conversationType: 'GROUP',
+      });
+      await gateway['handleRead'](
+        fakeSocket() as never,
+        'u1',
+        { conversationId: 'group-1', height: 7 },
+        jest.fn(),
+      );
+      expect(broadcast.emitRead).toHaveBeenCalledWith(
+        { conversationId: 'group-1', userId: 'u1', height: 7 },
+        { readerOnly: true },
+      );
     });
 
     // 其他带 ack 的处理器都先做 typeof 校验;read 把 payload.conversationId 原样
