@@ -455,6 +455,64 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * 租约锁:SET key token NX PX ttlMs。
+   *
+   * - 拿到了:返回 token,释放时凭它(releaseLease);
+   * - 别人持有:返回 null;
+   * - Redis 没配置,或这一刻答不上来:返回 undefined —— 没有协调可用,由调用方决定
+   *   怎么办(定时任务照跑:宁可重复做一次,也不能让协调层故障把任务整个停掉)。
+   */
+  async tryAcquireLease(
+    key: string,
+    ttlMs: number,
+  ): Promise<string | null | undefined> {
+    if (!this.isEnabled()) return undefined;
+    const client = await this.getCommandClient();
+    if (!client) {
+      this.recordUnavailable('lease');
+      return undefined;
+    }
+    const token = randomUUID();
+    try {
+      const result = await client.set(key, token, 'PX', ttlMs, 'NX');
+      return result === 'OK' ? token : null;
+    } catch (error) {
+      this.recordCommandFailure('lease', error);
+      this.logger.warn(
+        `Redis lease acquire failed for ${key}: ${this.formatError(error)}`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * 释放自己持有的租约:比对 token 再删。过期后被别的实例拿走的租约不会被晚回来的
+   * 原持有者误删。尽力而为,失败只等它自然过期。
+   */
+  async releaseLease(key: string, token: string): Promise<void> {
+    const client = await this.getCommandClient();
+    if (!client) return;
+    try {
+      await client.eval(
+        [
+          "if redis.call('GET', KEYS[1]) == ARGV[1] then",
+          "  return redis.call('DEL', KEYS[1])",
+          'end',
+          'return 0',
+        ].join('\n'),
+        1,
+        key,
+        token,
+      );
+    } catch (error) {
+      this.recordCommandFailure('lease', error);
+      this.logger.warn(
+        `Redis lease release failed for ${key}: ${this.formatError(error)}`,
+      );
+    }
+  }
+
   async deleteKey(key: string): Promise<boolean> {
     const client = await this.getCommandClient();
     if (!client) {

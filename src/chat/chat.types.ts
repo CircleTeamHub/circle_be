@@ -29,6 +29,21 @@ export interface ChatSendPayload {
   forwardFromMessageId?: string;
 }
 
+/**
+ * 聊天 socket 握手的 auth 帧(跨仓契约,与前端 src/chat-core/socket-manager.ts 里
+ * connectChat 的 auth 回调逐字段对应)。字段都当不可信输入读,网关逐个校验。
+ */
+export interface ChatHandshakeAuth {
+  /** 访问令牌:走握手帧,绝不进 URL。 */
+  token: string;
+  /** 连接追踪 id(网页端带不了自定义头时的副本)。 */
+  traceId?: string;
+  /** 发起握手时 App 在不在前台:后台建立的连接一开始就按后台登记。 */
+  appState?: 'foreground' | 'background';
+  /** 这台设备登记过的 Expo 推送 token:它正开着 App 时推送只跳过它。 */
+  pushToken?: string;
+}
+
 /** chat:read 客户端载荷:上报某会话的已读水位。 */
 export interface ChatReadPayload {
   conversationId: string;
@@ -92,6 +107,14 @@ export interface ChatRevokeBroadcast {
   conversationId: string;
   messageId: string;
   revokedBy: string;
+  /**
+   * 被撤回消息的位置与作者。没加载过这个会话的设备手里没有这条消息,
+   * 靠它们判断这条撤回要不要从本机未读里扣掉(别人发的、在已读位之上才算过未读)。
+   */
+  height: number;
+  senderId: string | null;
+  /** 撤回后消息的 revision。 */
+  revision: number;
 }
 
 /** chat:delivered:C→S 上报载荷与 S→C 广播同形。 */
@@ -117,6 +140,8 @@ export interface ChatReactionPayload {
 /** chat:reaction 服务端广播。 */
 export interface ChatReactionBroadcast extends ChatReactionPayload {
   userId: string;
+  /** 这次回应变动给消息分配的新 revision(客户端推进同步游标用)。 */
+  revision: number;
 }
 
 /** chat:edit 客户端载荷(带 ack);content 仅允许 {text}。 */
@@ -133,6 +158,8 @@ export interface ChatEditBroadcast {
   height: number;
   content: Record<string, unknown>;
   editedAt: string;
+  /** 编辑后消息的 revision。 */
+  revision: number;
 }
 
 /** 消息上的表情回应聚合(读路径批量附带)。 */
@@ -154,8 +181,13 @@ export interface ChatMessageDto {
   /** 撤回时间(ISO);未撤回为 null。撤回消息仍占 height,content 为空对象。 */
   revokedAt?: string | null;
   revokedBy?: string | null;
-  /** 焚毁墓碑;仅 mutations 增量使用,正文始终为空。 */
+  /** 焚毁墓碑;只出现在增量同步(GET /chat/conversations/:id/sync)里,正文始终为空。 */
   deleted?: boolean;
+  /**
+   * 这条消息最近一次客户端可见变更占用的会话序号(创建即分配)。实时事件与增量
+   * 同步都带它:客户端据此推进本会话的同步游标,也据此拒绝比本地更旧的快照。
+   */
+  revision: number;
   /** 编辑时间(ISO);未编辑缺省。height 不变。 */
   editedAt?: string | null;
   /** 表情回应聚合;无回应缺省。 */
@@ -182,7 +214,10 @@ export interface ChatReadBroadcast {
   height: number;
 }
 
-/** 会话全局清空广播；个人清空不会发送该事件。 */
+/**
+ * 清空聊天记录广播。全群清空发到会话房;只清自己的发到本人个人房
+ * (同步本人其它在线设备)。离线设备靠会话快照里的 clearedBeforeHeight 追平。
+ */
 export interface ChatHistoryClearedBroadcast {
   conversationId: string;
   clearedBeforeHeight: number;
@@ -196,6 +231,8 @@ export interface ChatHistoryClearedBroadcast {
 export interface ChatBurnedMessagesBroadcast {
   conversationId: string;
   messageIds: string[];
+  /** 与 messageIds 一一对应:每条墓碑的 revision。 */
+  revisions: number[];
 }
 
 /** chat:typing 服务端广播。 */
@@ -372,6 +409,26 @@ export interface ChatConversationDto {
    * 广播给会话房。
    */
   peerReadHeight: number | null;
+  /**
+   * DIRECT 会话对端座位的送达水位(ChatMember.lastDeliveredHeight);其余类型为 null。
+   * chat:delivered 只在线广播,离线期间对端的送达推进只能从这里补回来。
+   */
+  peerDeliveredHeight: number | null;
+  /**
+   * 本人的已读水位(ChatMember.lastReadHeight)。另一台设备读过时,本机靠它收敛
+   * 红点;客户端按它与本机已知值取大,只前进。
+   */
+  readHeight: number;
+  /**
+   * 本人视角的清空水位 = max(座位, 会话级)。另一台设备清空过、或清空时本机离线,
+   * 本机本地缓存里水位之下的记录要据此删掉。
+   */
+  clearedBeforeHeight: number;
+  /**
+   * 会话当前已提交的最高 revision。客户端本地游标比它小,就说明离线期间这个会话
+   * 有过变更(新消息、撤回、编辑、回应、焚毁),据此只对这些会话做增量同步。
+   */
+  syncRevision: number;
   lastMessageAt: string | null;
   /**
    * 本人加入该会话的时刻(ChatMember.joinedAt)。「新的群组」按它倒序 ——
@@ -436,31 +493,31 @@ export interface ChatHistoryPageDto {
 }
 
 /**
- * GET /chat/messages/mutations 的响应:离线期间的撤回/编辑增量。
+ * GET /chat/conversations/:id/sync 的响应:会话变更序号流的一页。
  *
- * 撤回不改 height,所以重连的 afterHeight 补拉结构上永远看不到它 ——
- * 这条通道按 max(revokedAt, editedAt) 的时间轴补。客户端拿 nextSince 当下一次
- * 的游标(截断时它停在本页最后一次变更上,而不是 serverTime),hasMore 为 true
- * 时应当立刻再拉一页,直到追平。
+ * 新消息、撤回、编辑、表情回应、焚毁墓碑都在会话计数器上占一个 revision
+ * (见 ChatConversation.nextRevision)。客户端带上次的 nextRevision 来要
+ * (afterRevision, throughRevision] 区间里每条变过的消息的**当前状态**:同一条消息
+ * 中间变过几次只回最后一版,墓碑只带 id 与 deleted=true。
+ *
+ * 游标只由扫描进度决定,与可见性无关:清空水位之下、焚毁窗口之外的行照样推进
+ * nextRevision,只是不出现在 messages 里 —— 否则被过滤掉的行会让游标原地打转。
  */
-export interface ChatMutationsPageDto {
+export interface ChatSyncPageDto {
   messages: ChatMessageDto[];
-  /** 本次响应的服务端时刻。 */
-  serverTime: string;
-  /** 下一次请求应当传的 since。 */
-  nextSince: string;
-  /**
-   * 与 nextSince 配对的 id 游标(复合 keyset)。
-   * DateTime 只有毫秒精度:一批同毫秒的变更跨在页边界上时,只带时间戳的游标
-   * 会把剩下那些同刻的行永久跳过。未截断时为空串。
-   */
-  nextSinceId: string;
-  /** 还有没追完的变更(被单页上限截断)。 */
+  /** 下一次请求的 afterRevision。 */
+  nextRevision: number;
+  /** 本次请求时会话已提交的最高 revision;nextRevision 追到它就算追平。 */
+  throughRevision: number;
+  /** 被单页上限截断,还有没扫完的区间。 */
   hasMore: boolean;
   /**
-   * 请求的 since 比服务端保留窗口(MUTATION_LOOKBACK_MS)还老 ——
-   * 那段区间的变更已经查不到了。客户端必须丢掉本地消息缓存重新拉,
-   * 否则那段时间里被撤回的消息会永远显示原文。
+   * 游标超出服务端当前序号(数据库被恢复/重建过)。客户端必须丢掉这个会话的
+   * 本地缓存,从最新一页重新开始 —— 旧缓存里的撤回/焚毁已经对不上号了。
    */
   resetRequired: boolean;
+  /** 本人已读水位(另一台设备读过时本机据此收敛红点)。 */
+  readHeight: number;
+  /** 本人视角的清空水位 = max(座位, 会话级);水位之下的本地缓存要删掉。 */
+  clearedBeforeHeight: number;
 }

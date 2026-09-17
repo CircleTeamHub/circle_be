@@ -28,6 +28,18 @@ export const CHAT_EVENTS = {
   historyCleared: 'chat:history_cleared',
   /** 服务端 → 客户端(在座成员个人房):阅后即焚到期消息的墓碑已提交,删本地副本 */
   burnedMessages: 'chat:burned_messages',
+  /**
+   * 客户端 → 服务端(可带 ack):App 退到后台。连接不断,但这条连接收不到投递,
+   * 推送要把它当离线(见 ChatPresenceRegistry.setSocketBackground)。
+   */
+  background: 'chat:background',
+  /** 客户端 → 服务端(可带 ack):App 回到前台,这条连接重新算「收得到」。 */
+  foreground: 'chat:foreground',
+  /**
+   * 服务端 → 客户端:access token 到期,紧接着断开。服务端主动断开的连接
+   * socket.io 客户端不会自己重连,App 靠这条区分「刷新 token 再连」与「被踢」。
+   */
+  sessionExpired: 'chat:session_expired',
 } as const;
 
 /**
@@ -176,8 +188,8 @@ export const CHAT_MEDIA_KEY_FIELDS: Record<
   ],
   video: [
     { key: 'key', url: 'url' },
-    // 封面帧目前没有生产者(App/访客页都不上传),但读路径必须先支持:
-    // 否则将来补上 thumbKey 的那一版,历史消息与新消息的签名行为会不一致。
+    // 封面帧:App 发视频时截一帧上传;访客网页不传,更早的消息也没有 ——
+    // 有就签,没有客户端退回黑底。
     { key: 'thumbKey', url: 'thumbUrl' },
   ],
   voice: [{ key: 'key', url: 'url' }],
@@ -202,6 +214,7 @@ export const CHAT_RATE_LIMITS = {
   delivered: { limit: 30, windowMs: 10_000 },
   reaction: { limit: 20, windowMs: 10_000 },
   edit: { limit: 10, windowMs: 10_000 },
+  appState: { limit: 30, windowMs: 10_000 },
 } as const;
 
 /**
@@ -231,28 +244,11 @@ export const CONVERSATION_LIST_LIMIT_MAX = 500;
 export const RELAX_PURGE_BATCH = 500;
 export const RELAX_PURGE_BATCHES_MAX = 20;
 
-/** 离线撤回/编辑增量单次返回上限(重连后一次追平)。 */
-export const MUTATION_PAGE_MAX = 200;
-/** 增量最多回溯多久:超过这个跨度的离线,客户端本地缓存本来也已经翻篇。 */
-export const MUTATION_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+/** 增量同步(GET /chat/conversations/:id/sync)单页上限。 */
+export const SYNC_PAGE_MAX = 200;
 
 /**
- * 增量游标的安全滞后。
- *
- * revokedAt/editedAt 是**写语句构造时**在 Node 侧生成的,而行要到 COMMIT 才对
- * 别的事务可见 —— 中间隔着锁等待。于是可以出现「时间戳很早、提交很晚」的行:
- * 一次同步在它提交前跑完、把游标推到更晚的 serverTime,它提交之后就永远落在
- * 游标后面,再也追不到(那条撤回的正文会一直留在对方屏幕上)。
- *
- * 所以游标绝不越过 `now - MUTATION_SAFETY_LAG_MS`。这个值必须严格大于
- * DATABASE_STATEMENT_TIMEOUT_MS(默认 15s)—— 超时的写会被 Postgres 掐掉,
- * 不可能悬挂得比它更久,所以 60s 有充分余量。
- *
- * 代价只是重叠区间被重复投递一次,而 ingest 本来就是幂等的。
- *
- * 为什么不按 reviewer 建议改成「提交序」的 outbox/sequence:普通序列同样不保证
- * 提交序(拿到 6 的事务可能先于拿到 5 的提交),真要做得靠 pg_current_snapshot()
- * 的 xmin 逐行记录——那是 CDC 级别的机制,与这条通道的收益不成比例。
- * 在 statement_timeout 有界的前提下,安全水位是**充分**的。
+ * 聊天推送走的安卓通知渠道 id(跨仓契约):前端 src/chat-core/chat-notifications.ts
+ * 用同一个 id 建高重要性渠道;老版本 App 没建时 expo-notifications 回落到默认渠道。
  */
-export const MUTATION_SAFETY_LAG_MS = 60_000;
+export const CHAT_PUSH_CHANNEL_ID = 'chat';

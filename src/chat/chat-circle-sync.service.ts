@@ -2,10 +2,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CronExpression } from '@nestjs/schedule';
 import {
   reportHandledJobFailure,
+  reportJobSkipped,
   TrackedCron,
 } from '../metrics/tracked-cron.decorator';
 import { Prisma } from 'src/generated/prisma';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { runWithJobLease } from 'src/redis/job-lease';
+import { RedisService } from 'src/redis/redis.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatSystemMessageService } from './chat-system-message.service';
@@ -45,6 +48,11 @@ export class ChatCircleSyncService {
   /** 单轮扫描上限,纯粹是失控查询的兜底(正常量级远低于此)。 */
   private static readonly RECONCILE_SCAN_MAX = 10_000;
   private static readonly RETRY_QUEUE_MAX = 1000;
+  /**
+   * 多实例时只让一个实例扫窗口。要短于扫描周期:持有者崩溃后租约若残留超过
+   * 2 分钟窗口,期间的成员变更会滑出窗口、再也扫不到。
+   */
+  private static readonly RECONCILE_LEASE_MS = 50_000;
 
   /**
    * 上轮失败、需要继续重试的圈子。进程内保存:重启会丢,但重启后任一成员
@@ -57,6 +65,7 @@ export class ChatCircleSyncService {
     private readonly broadcast: ChatBroadcastService,
     private readonly systemMessage: ChatSystemMessageService,
     private readonly groupEvents: ChatGroupEventService,
+    private readonly redis: RedisService,
   ) {}
 
   /**
@@ -77,17 +86,37 @@ export class ChatCircleSyncService {
     const since = new Date(
       Date.now() - ChatCircleSyncService.RECONCILE_WINDOW_MS,
     );
-    let changed: string[];
-    try {
-      changed = await this.scanChangedCircles(since);
-    } catch (error) {
-      this.logger.error(
-        `reconcile scan failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      // 扫描失败 = 这一轮一个圈子都没对账。不上报的话包装器会记成成功。
-      reportHandledJobFailure();
+    // 窗口扫描是全表按 updatedAt 找变更,各实例扫的是同一份数据:只让租约持有者扫。
+    const leased = await runWithJobLease(
+      this.redis,
+      'chat_circle_sync',
+      ChatCircleSyncService.RECONCILE_LEASE_MS,
+      async () => {
+        let changed: string[];
+        try {
+          changed = await this.scanChangedCircles(since);
+        } catch (error) {
+          this.logger.error(
+            `reconcile scan failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          // 扫描失败 = 这一轮一个圈子都没对账。不上报的话包装器会记成成功。
+          reportHandledJobFailure();
+          return;
+        }
+        await this.reconcileCircles(changed);
+      },
+    );
+    if (leased) return;
+    // 别的实例在扫窗口。重试队列只在本机内存里,只有本机知道,照常处理 ——
+    // 否则排在这台机器上的失败圈子永远轮不到。
+    if (this.retryQueue.size === 0) {
+      reportJobSkipped();
       return;
     }
+    await this.reconcileCircles([]);
+  }
+
+  private async reconcileCircles(changed: string[]): Promise<void> {
     // 上轮失败的圈子跟着重试:只靠窗口重叠的话,连续失败超过 2 分钟就永远
     // 掉出扫描范围,被踢成员的座位会一直留着(还能读能发)。
     const pending = [...this.retryQueue];

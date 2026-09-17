@@ -203,6 +203,151 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
     });
   });
 
+  describe('listActiveTokensForUsers', () => {
+    it('loads every recipient token in one query and keeps the 20 newest per user', async () => {
+      prisma.devicePushToken.findMany.mockResolvedValue([
+        ...Array.from({ length: 22 }, (_, i) => ({
+          userID: 'u1',
+          token: `u1-${i}`,
+          projectId: null,
+        })),
+        { userID: 'u2', token: 'u2-0', projectId: 'proj' },
+      ]);
+
+      const byUser = await service.listActiveTokensForUsers(['u1', 'u2', 'u3']);
+
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith({
+        where: {
+          userID: { in: ['u1', 'u2', 'u3'] },
+          provider: 'expo',
+          disabledAt: null,
+        },
+        select: { userID: true, token: true, projectId: true },
+        orderBy: { updatedAt: 'desc' },
+      });
+      expect(byUser.get('u1')).toHaveLength(20);
+      expect(byUser.get('u1')?.[0]).toEqual({ token: 'u1-0', projectId: null });
+      expect(byUser.get('u2')).toEqual([{ token: 'u2-0', projectId: 'proj' }]);
+      expect(byUser.has('u3')).toBe(false);
+    });
+
+    it('does not query for an empty recipient list', async () => {
+      await expect(service.listActiveTokensForUsers([])).resolves.toEqual(
+        new Map(),
+      );
+      expect(prisma.devicePushToken.findMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sendMessages', () => {
+    const okForEveryMessage = () =>
+      fetchMock.mockImplementation((_url: string, init: { body: string }) => {
+        const body = JSON.parse(init.body) as unknown[];
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              data: body.map((_, i) => ({ status: 'ok', id: `ticket-${i}` })),
+            }),
+        });
+      });
+
+    // 大群一条消息:原来每个收件人一次 HTTPS 请求,Expo 一次收得下 100 条。
+    it('sends up to 100 messages per request, each with its own payload', async () => {
+      okForEveryMessage();
+      const messages = Array.from({ length: 250 }, (_, i) => ({
+        token: `tok-${i}`,
+        projectId: null,
+        payload: { ...payload, badge: i },
+      }));
+
+      const outcomes = await service.sendMessages(messages);
+
+      const bodies = fetchMock.mock.calls.map(
+        ([, init]: [string, { body: string }]) =>
+          JSON.parse(init.body) as Array<Record<string, unknown>>,
+      );
+      expect(bodies.map((body) => body.length)).toEqual([100, 100, 50]);
+      expect(bodies[2][49]).toEqual(
+        expect.objectContaining({ to: 'tok-249', badge: 249, title: 'T' }),
+      );
+      expect(outcomes).toHaveLength(250);
+      expect(outcomes.every((outcome) => outcome.status === 'SENT')).toBe(true);
+    });
+
+    it('forwards delivery options into the Expo message only when they are set', async () => {
+      okForEveryMessage();
+
+      await service.sendMessages([
+        {
+          token: 'tok-chat',
+          projectId: null,
+          payload: {
+            ...payload,
+            priority: 'high',
+            channelId: 'chat',
+            tag: 'conv-1',
+            threadId: 'conv-1',
+            ttl: 300,
+          },
+        },
+        { token: 'tok-plain', projectId: null, payload },
+      ]);
+
+      const [chat, plain] = JSON.parse(
+        (fetchMock.mock.calls[0][1] as { body: string }).body,
+      ) as Array<Record<string, unknown>>;
+      expect(chat).toEqual(
+        expect.objectContaining({
+          to: 'tok-chat',
+          priority: 'high',
+          channelId: 'chat',
+          tag: 'conv-1',
+          threadId: 'conv-1',
+          ttl: 300,
+        }),
+      );
+      // 系统通知 outbox 不带这些字段,发出去的消息与原来一致。
+      for (const key of ['priority', 'channelId', 'tag', 'threadId', 'ttl']) {
+        expect(plain).not.toHaveProperty(key);
+      }
+    });
+
+    it('never mixes Expo projects in one request and still reaps dead tokens', async () => {
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: [
+              { status: 'error', details: { error: 'DeviceNotRegistered' } },
+            ],
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ data: [{ status: 'ok', id: 't' }] }),
+        });
+
+      const outcomes = await service.sendMessages([
+        { token: 'tok-a', projectId: 'proj-1', payload },
+        { token: 'tok-b', projectId: 'proj-2', payload },
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(outcomes).toEqual(
+        expect.arrayContaining([
+          { token: 'tok-a', status: 'TERMINAL', error: 'DeviceNotRegistered' },
+          { token: 'tok-b', status: 'SENT', ticketId: 't' },
+        ]),
+      );
+      expect(prisma.devicePushToken.updateMany).toHaveBeenCalledWith({
+        where: { token: { in: ['tok-a'] } },
+        data: { disabledAt: expect.any(Date) },
+      });
+    });
+  });
+
   describe('pollReceipts', () => {
     const now = new Date('2026-07-21T12:00:00.000Z');
     const sentAt = new Date(now.getTime() - 30 * 60 * 1000);

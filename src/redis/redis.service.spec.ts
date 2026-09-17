@@ -47,6 +47,63 @@ describe('RedisService', () => {
     expect(service.createRateLimitStore('global')).toBeUndefined();
   });
 
+  describe('job leases', () => {
+    it('reports no coordination (undefined) when Redis is not configured', async () => {
+      const service = new RedisService();
+      await expect(service.tryAcquireLease('job-lease:x', 1000)).resolves.toBe(
+        undefined,
+      );
+    });
+
+    it('grants the lease once and refuses it while held', async () => {
+      process.env.REDIS_URL = 'redis://localhost:6379';
+      const service = new RedisService();
+      const client = {
+        set: jest.fn().mockResolvedValueOnce('OK').mockResolvedValueOnce(null),
+      };
+      jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+      const token = await service.tryAcquireLease('job-lease:x', 5000);
+      expect(typeof token).toBe('string');
+      expect(client.set).toHaveBeenCalledWith(
+        'job-lease:x',
+        token,
+        'PX',
+        5000,
+        'NX',
+      );
+      await expect(service.tryAcquireLease('job-lease:x', 5000)).resolves.toBe(
+        null,
+      );
+    });
+
+    it('reports no coordination when Redis cannot answer', async () => {
+      process.env.REDIS_URL = 'redis://localhost:6379';
+      const service = new RedisService();
+      const client = { set: jest.fn().mockRejectedValue(new Error('down')) };
+      jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+      jest.spyOn((service as any).logger, 'warn').mockImplementation(() => {});
+
+      await expect(service.tryAcquireLease('job-lease:x', 5000)).resolves.toBe(
+        undefined,
+      );
+    });
+
+    // 租约过期后被别的实例拿走了,晚回来的持有者不能把人家的删掉。
+    it('releases only a lease it still holds', async () => {
+      process.env.REDIS_URL = 'redis://localhost:6379';
+      const service = new RedisService();
+      const client = { eval: jest.fn().mockResolvedValue(0) };
+      jest.spyOn(service as any, 'getCommandClient').mockResolvedValue(client);
+
+      await service.releaseLease('job-lease:x', 'my-token');
+
+      const [script, keyCount, key, token] = client.eval.mock.calls[0];
+      expect(script).toContain("redis.call('GET', KEYS[1]) == ARGV[1]");
+      expect([keyCount, key, token]).toEqual([1, 'job-lease:x', 'my-token']);
+    });
+  });
+
   it('creates distinct rate-limit stores when Redis is configured', () => {
     process.env.REDIS_URL = 'redis://localhost:6379';
     const service = new RedisService();

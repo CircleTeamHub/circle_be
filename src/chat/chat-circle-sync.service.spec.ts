@@ -32,11 +32,17 @@ describe('ChatCircleSyncService', () => {
     recordInTx: jest.fn().mockResolvedValue(undefined),
   };
 
+  // 默认:没配 Redis(单实例),租约协调不可用 → 照常跑。
+  const redis = {
+    tryAcquireLease: jest.fn(),
+    releaseLease: jest.fn(),
+  };
   const service = new ChatCircleSyncService(
     prisma as never,
     broadcast as never,
     systemMessage as never,
     groupEvents as never,
+    redis as never,
   );
   const runTx = async (cb: (tx: typeof prisma) => unknown) => cb(prisma);
 
@@ -52,6 +58,8 @@ describe('ChatCircleSyncService', () => {
     systemMessage.emit.mockResolvedValue(undefined);
     prisma.user.findMany.mockResolvedValue([]);
     prisma.$queryRaw.mockResolvedValue([]);
+    redis.tryAcquireLease.mockResolvedValue(undefined);
+    redis.releaseLease.mockResolvedValue(undefined);
   });
 
   it('default-denies a dismissed circle and clears every seat', async () => {
@@ -451,6 +459,42 @@ describe('ChatCircleSyncService', () => {
       await service.reconcileRecent();
       expect(ensure).toHaveBeenCalledTimes(2);
       ensure.mockRestore();
+    });
+
+    // 多实例下只让一个实例扫窗口(每分钟一次全表扫 CircleMember.updatedAt,N 个
+    // 实例就是 N 倍);但重试队列只在本机内存里,拿不到租约也得处理,否则排在
+    // 这台机器上的失败圈子永远轮不到。
+    it('leaves the window scan to the lease holder but still retries its own failed circles', async () => {
+      prisma.$queryRaw.mockResolvedValueOnce([{ circleID: 'c-local-fail' }]);
+      const ensure = jest
+        .spyOn(service, 'ensureCircleConversation')
+        .mockRejectedValueOnce(new Error('boom'));
+      await service.reconcileRecent();
+
+      redis.tryAcquireLease.mockResolvedValue(null);
+      prisma.$queryRaw.mockClear();
+      ensure.mockResolvedValueOnce('conv');
+      await service.reconcileRecent();
+
+      expect(prisma.$queryRaw).not.toHaveBeenCalled();
+      expect(ensure).toHaveBeenLastCalledWith('c-local-fail');
+      expect(ensure).toHaveBeenCalledTimes(2);
+      ensure.mockRestore();
+    });
+
+    it('releases the lease after reconciling', async () => {
+      redis.tryAcquireLease.mockResolvedValue('lease-token');
+
+      await service.reconcileRecent();
+
+      expect(redis.tryAcquireLease).toHaveBeenCalledWith(
+        'job-lease:chat_circle_sync',
+        expect.any(Number),
+      );
+      expect(redis.releaseLease).toHaveBeenCalledWith(
+        'job-lease:chat_circle_sync',
+        'lease-token',
+      );
     });
 
     it('scans without a row cap that could silently drop circles', async () => {
