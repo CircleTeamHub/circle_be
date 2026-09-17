@@ -250,33 +250,41 @@ export class ChatBroadcastService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * 会话房里此刻「收得到」的 userId 集合(离线推送分流用);注册表优先。
+   * 会话成员里正开着 App 的设备 → 这些设备登记的推送 token(推送时跳过它们)。
    *
-   * 只看有没有连接是不够的:App 退到后台之后连接还挂着,却什么都收不到。
-   * 这类连接由客户端报 chat:background 标记出来,这里不算数。
+   * 按设备而不是按人:电脑上开着网页版(没有推送 token)不挡手机的推送;只有手机
+   * 自己正开着 App 时才不推给这台手机。
    */
-  async getDeliverableUserIdsInConversation(
+  async getForegroundPushTokensInConversation(
     conversationId: string,
-  ): Promise<Set<string>> {
+  ): Promise<Map<string, Set<string>>> {
     const viaRegistry =
-      await this.presence.getDeliverableUserIds(conversationId);
-    if (viaRegistry !== null) return new Set(viaRegistry);
-    // Redis 配了却读不到:返回空集。这个集合在 ChatPushService 里用来**排除**
-    // 收件人 —— 空集 = 谁都不排除 = 全员收到推送。反过来把人当在线会让他
-    // 彻底收不到消息:重复推送好过丢消息。
-    if (this.presence.isRedisConfigured()) return new Set();
-    const server = this.requireServer('getDeliverableUserIdsInConversation');
-    if (!server) return new Set();
+      await this.presence.getForegroundPushTokens(conversationId);
+    if (viaRegistry !== null) return viaRegistry;
+    // Redis 配了却读不到:谁都不排除。这个结果在 ChatPushService 里用来**排除**
+    // 推送目标 —— 空 = 全员收到推送。反过来把设备当前台会让人彻底收不到消息:
+    // 重复推送好过丢消息。
+    if (this.presence.isRedisConfigured()) return new Map();
+    const server = this.requireServer('getForegroundPushTokensInConversation');
+    if (!server) return new Map();
     const sockets = await server
       .in(conversationRoom(conversationId))
       .fetchSockets();
-    const ids = new Set<string>();
+    const tokensByUser = new Map<string, Set<string>>();
     for (const socket of sockets) {
-      const data = socket.data as { userId?: unknown; background?: unknown };
+      const data = socket.data as {
+        userId?: unknown;
+        background?: unknown;
+        pushToken?: unknown;
+      };
       if (data?.background === true) continue;
-      if (typeof data?.userId === 'string') ids.add(data.userId);
+      if (typeof data?.userId !== 'string') continue;
+      if (typeof data?.pushToken !== 'string') continue;
+      const tokens = tokensByUser.get(data.userId) ?? new Set<string>();
+      tokens.add(data.pushToken);
+      tokensByUser.set(data.userId, tokens);
     }
-    return ids;
+    return tokensByUser;
   }
 
   /** 断开某用户全部在线 socket(临时房结束/访客清退用)。 */

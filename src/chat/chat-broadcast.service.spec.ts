@@ -614,7 +614,7 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
       // 注册表答不上来（读失败或没配）
       isOnline: jest.fn().mockResolvedValue(null),
       getOnlineUserIds: jest.fn().mockResolvedValue(null),
-      getDeliverableUserIds: jest.fn().mockResolvedValue(null),
+      getForegroundPushTokens: jest.fn().mockResolvedValue(null),
       isRedisConfigured: jest.fn().mockReturnValue(redisConfigured),
       conversationJoined: jest.fn(),
     };
@@ -640,27 +640,40 @@ describe('ChatBroadcastService presence fallback under Redis outage', () => {
     await expect(service.isUserOnline('u1')).resolves.toBe(true);
   });
 
-  it('getDeliverableUserIdsInConversation 读不到时返回空集——宁可重复推送也不丢消息', async () => {
-    // 这个集合在 ChatPushService 里用来**排除**收件人。返回空集 = 谁都不排除
-    // = 全员收到推送；反过来把人当在线会让他彻底收不到。
+  it('getForegroundPushTokensInConversation 读不到时谁都不排除——宁可重复推送也不丢消息', async () => {
+    // 这个结果在 ChatPushService 里用来**排除**推送目标。空 = 谁都不排除
+    // = 全员收到推送；反过来把设备当前台会让人彻底收不到。
     const { service, fetchSockets } = buildHarness(true);
 
     await expect(
-      service.getDeliverableUserIdsInConversation('conv-1'),
-    ).resolves.toEqual(new Set());
+      service.getForegroundPushTokensInConversation('conv-1'),
+    ).resolves.toEqual(new Map());
     expect(fetchSockets).not.toHaveBeenCalled();
   });
 
-  it('单实例回退时跳过退到后台的连接——连着但收不到，照样要推送', async () => {
+  it('单实例回退时只算开着 App 的设备——后台连接和没带推送 token 的网页版都不挡推送', async () => {
     const { service, fetchSockets } = buildHarness(false);
     fetchSockets.mockResolvedValue([
-      { id: 's1', data: { userId: 'u-front' } },
-      { id: 's2', data: { userId: 'u-back', background: true } },
+      {
+        id: 's1',
+        data: { userId: 'u1', pushToken: 'ExponentPushToken[phone]' },
+      },
+      {
+        id: 's2',
+        data: {
+          userId: 'u1',
+          pushToken: 'ExponentPushToken[tablet]',
+          background: true,
+        },
+      },
+      { id: 's3', data: { userId: 'u2' } },
     ]);
 
     await expect(
-      service.getDeliverableUserIdsInConversation('conv-1'),
-    ).resolves.toEqual(new Set(['u-front']));
+      service.getForegroundPushTokensInConversation('conv-1'),
+    ).resolves.toEqual(
+      new Map([['u1', new Set(['ExponentPushToken[phone]'])]]),
+    );
   });
 
   it('Redis 没配的单实例部署仍然走 fetchSockets（内存 adapter，本来就该降级到它）', async () => {

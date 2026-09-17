@@ -839,6 +839,43 @@ describe('ChatGateway', () => {
       );
     });
 
+    // 推送按设备跳过「正开着 App 的那台」,靠的是握手里带上的推送 token。只收 Expo
+    // token 的形状:它会写进在线登记表的租约成员(用 | 分隔)。
+    it('registers the device push token from the handshake, rejecting anything else', async () => {
+      chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));
+      const phone = fakeSocket({
+        handshake: {
+          auth: { token: 'jwt', pushToken: 'ExponentPushToken[abc-123_x]' },
+          headers: {},
+        },
+      });
+      await gateway['handleConnection'](phone as never);
+      expect(presence.registerSocket).toHaveBeenLastCalledWith(
+        'u1',
+        'socket-1',
+        'ExponentPushToken[abc-123_x]',
+      );
+      phone.handlers.get('disconnect')?.('client namespace disconnect');
+
+      for (const pushToken of [
+        'ExponentPushToken[a|b]',
+        'not-a-token',
+        42,
+        `ExponentPushToken[${'x'.repeat(300)}]`,
+      ]) {
+        const socket = fakeSocket({
+          handshake: { auth: { token: 'jwt', pushToken }, headers: {} },
+        });
+        await gateway['handleConnection'](socket as never);
+        expect(presence.registerSocket).toHaveBeenLastCalledWith(
+          'u1',
+          'socket-1',
+          null,
+        );
+        socket.handlers.get('disconnect')?.('client namespace disconnect');
+      }
+    });
+
     it('excludes blocked counterparties from the online broadcast', async () => {
       const socket = fakeSocket();
       chatService.listConversationSeats.mockResolvedValue(seats('conv-1'));

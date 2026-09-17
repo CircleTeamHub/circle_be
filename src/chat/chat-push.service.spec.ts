@@ -68,7 +68,7 @@ describe('ChatPushService', () => {
       ([messages]: [Array<{ payload: Record<string, unknown> }>]) =>
         messages.map((message) => message.payload),
     );
-  const broadcast = { getDeliverableUserIdsInConversation: jest.fn() };
+  const broadcast = { getForegroundPushTokensInConversation: jest.fn() };
 
   let service: ChatPushService;
 
@@ -97,7 +97,9 @@ describe('ChatPushService', () => {
           where.id.in.map((id) => ({ id, revokedAt: null, deleted: false })),
         ),
     );
-    broadcast.getDeliverableUserIdsInConversation.mockResolvedValue(new Set());
+    broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+      new Map(),
+    );
     push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
       Promise.resolve(
         new Map(
@@ -200,19 +202,54 @@ describe('ChatPushService', () => {
     ]);
   });
 
-  it('skips members with a foreground connection but still pushes to backgrounded ones', async () => {
+  // 按设备判断:只有正开着 App 的那台设备不推。电脑上开着网页版(没有推送 token)
+  // 不能让手机也收不到;锁屏的手机照推。
+  it('skips only the devices that have the app open', async () => {
+    push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+      Promise.resolve(
+        new Map(
+          userIds.map((userId) => [
+            userId,
+            [
+              { token: `${userId}-phone`, projectId: null },
+              { token: `${userId}-tablet`, projectId: null },
+            ],
+          ]),
+        ),
+      ),
+    );
     prisma.chatMember.findMany.mockResolvedValue([
-      seat('u-watching'),
+      seat('u-watching-on-phone'),
       seat('u-locked-screen'),
     ]);
-    // 注册表只把前台连接算「收得到」:锁屏那台手机不在集合里。
-    broadcast.getDeliverableUserIdsInConversation.mockResolvedValue(
-      new Set(['u-watching']),
+    broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+      new Map([
+        ['u-watching-on-phone', new Set(['u-watching-on-phone-phone'])],
+      ]),
     );
 
     await pushNow(msg());
 
-    expect(pushedUserIds()).toEqual(['u-locked-screen']);
+    const tokens = push.sendMessages.mock.calls.flatMap(
+      ([messages]: [Array<{ token: string }>]) =>
+        messages.map((message) => message.token),
+    );
+    expect([...tokens].sort((a, b) => a.localeCompare(b))).toEqual([
+      'u-locked-screen-phone',
+      'u-locked-screen-tablet',
+      'u-watching-on-phone-tablet',
+    ]);
+  });
+
+  it('sends nothing to a member whose only device has the app open', async () => {
+    prisma.chatMember.findMany.mockResolvedValue([seat('u-watching')]);
+    broadcast.getForegroundPushTokensInConversation.mockResolvedValue(
+      new Map([['u-watching', new Set(['ExponentPushToken[a]'])]]),
+    );
+
+    await pushNow(msg());
+
+    expect(push.sendMessages).not.toHaveBeenCalled();
   });
 
   it('respects mute but lets mentions and atAll pierce it', async () => {

@@ -29,6 +29,21 @@ export interface ChatSendPayload {
   forwardFromMessageId?: string;
 }
 
+/**
+ * 聊天 socket 握手的 auth 帧(跨仓契约,与前端 src/chat-core/socket-manager.ts 里
+ * connectChat 的 auth 回调逐字段对应)。字段都当不可信输入读,网关逐个校验。
+ */
+export interface ChatHandshakeAuth {
+  /** 访问令牌:走握手帧,绝不进 URL。 */
+  token: string;
+  /** 连接追踪 id(网页端带不了自定义头时的副本)。 */
+  traceId?: string;
+  /** 发起握手时 App 在不在前台:后台建立的连接一开始就按后台登记。 */
+  appState?: 'foreground' | 'background';
+  /** 这台设备登记过的 Expo 推送 token:它正开着 App 时推送只跳过它。 */
+  pushToken?: string;
+}
+
 /** chat:read 客户端载荷:上报某会话的已读水位。 */
 export interface ChatReadPayload {
   conversationId: string;

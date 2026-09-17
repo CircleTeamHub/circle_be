@@ -189,25 +189,27 @@ export class ChatPushService implements OnModuleDestroy {
   private async dispatchWindow(window: PendingPushWindow): Promise<void> {
     const { latest } = window;
     const conversationId = latest.conversationId;
-    const [seats, conversation, deliverable, stillVisible] = await Promise.all([
-      this.listSeats(conversationId, latest.height),
-      this.prisma.chatConversation.findUnique({
-        where: { id: conversationId },
-        select: {
-          type: true,
-          circleID: true,
-          tempChatID: true,
-          name: true,
-        },
-      }),
-      this.broadcast.getDeliverableUserIdsInConversation(conversationId),
-      this.loadStillVisibleMessageIds(window),
-    ]);
+    const [seats, conversation, foregroundTokens, stillVisible] =
+      await Promise.all([
+        this.listSeats(conversationId, latest.height),
+        this.prisma.chatConversation.findUnique({
+          where: { id: conversationId },
+          select: {
+            type: true,
+            circleID: true,
+            tempChatID: true,
+            name: true,
+          },
+        }),
+        this.broadcast.getForegroundPushTokensInConversation(conversationId),
+        this.loadStillVisibleMessageIds(window),
+      ]);
     if (!conversation || seats.length === 0) return;
 
     const chosen = new Map<string, ChatMessageDto>();
+    // 正开着 App 的设备不在这里排除,而是在发送时按 token 跳过(见 sendToRecipients):
+    // 电脑上开着网页版不该让手机收不到推送。
     for (const member of seats) {
-      if (deliverable.has(member.userID)) continue;
       const message = this.messageFor(window, member);
       if (!message || !stillVisible.has(message.id)) continue;
       if (message.sender?.id === member.userID) continue;
@@ -245,7 +247,13 @@ export class ChatPushService implements OnModuleDestroy {
         ...(await this.composePayload(message, conversation)),
         ...deliveryOptions(message, mention),
       };
-      await this.sendToRecipients(message, recipients, payload, badges);
+      await this.sendToRecipients(
+        message,
+        recipients,
+        payload,
+        badges,
+        foregroundTokens,
+      );
     }
   }
 
@@ -323,6 +331,7 @@ export class ChatPushService implements OnModuleDestroy {
     recipients: string[],
     payload: ExpoPushPayload,
     badges: Map<string, number>,
+    foregroundTokens: Map<string, Set<string>>,
   ): Promise<void> {
     // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
     // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
@@ -345,10 +354,14 @@ export class ChatPushService implements OnModuleDestroy {
     const messages = recipients.flatMap((userId) => {
       const badge = badges.get(userId);
       const perUser = badge !== undefined ? { ...payload, badge } : payload;
-      return (tokensByUser.get(userId) ?? []).map((token) => {
-        owners.push(userId);
-        return { ...token, payload: perUser };
-      });
+      // 这台设备正开着 App:不推(消息已经实时送到它上面了)。
+      const onScreen = foregroundTokens.get(userId);
+      return (tokensByUser.get(userId) ?? [])
+        .filter((token) => !onScreen?.has(token.token))
+        .map((token) => {
+          owners.push(userId);
+          return { ...token, payload: perUser };
+        });
     });
     if (messages.length === 0) return;
     const attempted = new Set(owners);

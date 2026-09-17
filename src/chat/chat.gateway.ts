@@ -50,6 +50,7 @@ import type {
   ChatReadAck,
   ChatReadPayload,
   ChatDeliveredPayload,
+  ChatHandshakeAuth,
   ChatEditPayload,
   ChatReactionPayload,
   ChatRevokePayload,
@@ -57,6 +58,9 @@ import type {
   ChatSendPayload,
   ChatTypingPayload,
 } from './chat.types';
+
+/** 握手 auth 帧的字段名来自共享类型(改名会编译失败),值一律当不可信输入读。 */
+type UntrustedHandshakeAuth = { [K in keyof ChatHandshakeAuth]?: unknown };
 
 type CorsOrigin = (
   origin: string | undefined,
@@ -364,7 +368,7 @@ export class ChatGateway implements OnModuleDestroy {
       socket.handshake.headers[CONNECTION_TRACE_HEADER],
     );
     const authTrace = (
-      socket.handshake.auth as Record<string, unknown> | undefined
+      socket.handshake.auth as UntrustedHandshakeAuth | undefined
     )?.traceId;
     const traceId = resolveConnectionTraceId(
       safeConnectionTraceId(header) ?? safeConnectionTraceId(authTrace),
@@ -599,7 +603,7 @@ export class ChatGateway implements OnModuleDestroy {
    * 只会被另一把钥匙拒掉,不构成绕过。
    */
   private async authenticate(socket: Socket): Promise<string | null> {
-    const token = (socket.handshake.auth as Record<string, unknown> | undefined)
+    const token = (socket.handshake.auth as UntrustedHandshakeAuth | undefined)
       ?.token;
     if (typeof token !== 'string' || token.length === 0) {
       return this.rejectAuth(socket, 'missing_token');
@@ -1002,7 +1006,14 @@ export class ChatGateway implements OnModuleDestroy {
     // G-04:上限还要按**全局**计一遍 —— 本实例的 Map 在多实例下会放大成 10×N。
     // 租约 id 用 socket.id:断开时按它精确摘除,不会误伤同一用户在别处
     // 那条活着的连接(共享标量 DECR 会)。
-    const globalCount = await this.presence.registerSocket(userId, socket.id);
+    // 这台设备登记的推送 token:它正开着 App 时,推送只跳过它(按设备,不按人)。
+    const pushToken = this.handshakePushToken(socket);
+    socket.data.pushToken = pushToken;
+    const globalCount = await this.presence.registerSocket(
+      userId,
+      socket.id,
+      pushToken,
+    );
     // presence 注册期间断开时,上面的监听器先清理一次；await 返回后再清一次,
     // 覆盖“删除先于注册落地”的时序,避免留下跨实例在线脏数据。
     if (socket.disconnected) {
@@ -1557,8 +1568,22 @@ export class ChatGateway implements OnModuleDestroy {
   }
 
   private handshakeAppState(socket: Socket): 'background' | 'foreground' {
-    const auth = socket.handshake.auth as Record<string, unknown> | undefined;
+    const auth = socket.handshake.auth as UntrustedHandshakeAuth | undefined;
     return auth?.appState === 'background' ? 'background' : 'foreground';
+  }
+
+  /**
+   * 握手里带的 Expo 推送 token(App 登记过推送才有;网页版没有)。只接受 Expo token
+   * 的形状:它会写进在线登记表的租约成员,那里用 | 分隔。
+   */
+  private handshakePushToken(socket: Socket): string | null {
+    const auth = socket.handshake.auth as UntrustedHandshakeAuth | undefined;
+    const token = auth?.pushToken;
+    return typeof token === 'string' &&
+      token.length <= 256 &&
+      /^Expo(?:nent)?PushToken\[[^\]|]+\]$/.test(token)
+      ? token
+      : null;
   }
 
   private async handleAppState(
