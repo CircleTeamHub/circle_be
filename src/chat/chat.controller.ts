@@ -15,10 +15,11 @@ import {
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { Throttle } from '@nestjs/throttler';
 import type { RequestWithUser } from 'src/auth/types';
 import { AppAudienceGuard } from 'src/guards/app-audience.guard';
 import { JwtGuard } from 'src/guards/jwt.guard';
+import { UserThrottlerGuard } from 'src/guards/user-throttler.guard';
 import { ChatGroupAdminService } from './chat-group-admin.service';
 import { ChatGroupEventService } from './chat-group-event.service';
 import { ChatGroupSettingsService } from './chat-group-settings.service';
@@ -69,7 +70,9 @@ import type {
  */
 @Controller('chat')
 // AppAudienceGuard:聊天是普通用户能力,管理台的 ADMIN token 不该能收发消息。
-@UseGuards(JwtGuard, AppAudienceGuard, ThrottlerGuard)
+// 限流按用户计数(UserThrottlerGuard):按 IP 的话同一运营商 NAT / 公司出口后面的
+// 人共享一份额度,发版后一波重连就互相挤出 429。放在 JwtGuard 之后才拿得到用户。
+@UseGuards(JwtGuard, AppAudienceGuard, UserThrottlerGuard)
 @ApiTags('Chat')
 @ApiBearerAuth()
 export class ChatController {
