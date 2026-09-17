@@ -235,6 +235,77 @@ describe('ChatPushService', () => {
     expect(pushedUserIds()).toHaveLength(2);
   });
 
+  describe('delivery options', () => {
+    it('uses the high-priority chat channel with one notification stream per conversation', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+
+      await pushNow(msg());
+
+      // 安卓默认 normal 优先级在省电模式下会被延后;tag 让同一会话的新通知
+      // 替换旧的,threadId 让 iOS 按会话分组;过期的聊天通知不再补发。
+      expect(sentPayloads()).toEqual([
+        expect.objectContaining({
+          priority: 'high',
+          channelId: 'chat',
+          tag: 'conv-1',
+          threadId: 'conv-1',
+          ttl: 24 * 60 * 60,
+          data: expect.objectContaining({ messageId: 'msg-1' }),
+        }),
+      ]);
+    });
+
+    it('never puts the text of a disappearing message on the lock screen', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
+
+      await pushNow(
+        msg({ burnDurationSec: 300, content: { text: '只给你看的内容' } }),
+      );
+
+      const [payload] = sentPayloads();
+      // 焚毁之后通知栏里的原文还在,等于没烧;过了焚毁时限也不该再补发。
+      expect(payload).toEqual(
+        expect.objectContaining({ body: '[阅后即焚消息]', ttl: 300 }),
+      );
+      expect(JSON.stringify(payload)).not.toContain('只给你看的内容');
+    });
+
+    it('keeps a mention in its own notification so later chatter cannot replace it', async () => {
+      push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+        Promise.resolve(
+          new Map(
+            userIds.map((userId) => [
+              userId,
+              [{ token: `tok-${userId}`, projectId: null }],
+            ]),
+          ),
+        ),
+      );
+      prisma.chatMember.findMany.mockResolvedValue([
+        seat('u-mentioned'),
+        seat('u-other'),
+      ]);
+
+      await pushNow(
+        msg({
+          content: {
+            text: '@小方 看一下',
+            mentions: [{ userId: 'u-mentioned' }],
+          },
+        }),
+      );
+
+      const tags = new Map(
+        push.sendMessages.mock.calls.flatMap(
+          ([messages]: [Array<{ token: string; payload: { tag: string } }>]) =>
+            messages.map((message) => [message.token, message.payload.tag]),
+        ),
+      );
+      expect(tags.get('tok-u-mentioned')).toBe('conv-1:mention');
+      expect(tags.get('tok-u-other')).toBe('conv-1');
+    });
+  });
+
   describe('coalescing', () => {
     it('turns a burst in one conversation into a single push of the newest message', async () => {
       jest.useFakeTimers();

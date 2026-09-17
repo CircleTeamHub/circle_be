@@ -55,6 +55,19 @@ export type ExpoPushPayload = {
   data: Record<string, unknown>;
   /** iOS 图标角标数(G-18);缺省不改角标。 */
   badge?: number;
+  /**
+   * 以下是 Expo 的投递选项,缺省时不出现在消息里(沿用各平台默认)。
+   * priority:安卓默认 normal,省电模式下会被延后;即时消息要 high。
+   */
+  priority?: 'default' | 'normal' | 'high';
+  /** 安卓通知渠道;设备上没建这个渠道时 expo-notifications 回落到默认渠道。 */
+  channelId?: string;
+  /** 安卓:同 tag 的新通知替换已显示的旧通知。 */
+  tag?: string;
+  /** iOS:按线程分组显示。 */
+  threadId?: string;
+  /** 设备离线时服务商保留多久(秒);缺省为服务商默认的 4 周。 */
+  ttl?: number;
 };
 
 const RETRYABLE_TICKET_ERRORS = new Set([
@@ -532,6 +545,13 @@ export class NotificationPushService {
       body: payload.body,
       data: payload.data,
       ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+      ...(payload.priority !== undefined ? { priority: payload.priority } : {}),
+      ...(payload.channelId !== undefined
+        ? { channelId: payload.channelId }
+        : {}),
+      ...(payload.tag !== undefined ? { tag: payload.tag } : {}),
+      ...(payload.threadId !== undefined ? { threadId: payload.threadId } : {}),
+      ...(payload.ttl !== undefined ? { ttl: payload.ttl } : {}),
     }));
 
     for (let attempt = 1; attempt <= EXPO_MAX_ATTEMPTS; attempt += 1) {

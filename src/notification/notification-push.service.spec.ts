@@ -276,6 +276,44 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
       expect(outcomes.every((outcome) => outcome.status === 'SENT')).toBe(true);
     });
 
+    it('forwards delivery options into the Expo message only when they are set', async () => {
+      okForEveryMessage();
+
+      await service.sendMessages([
+        {
+          token: 'tok-chat',
+          projectId: null,
+          payload: {
+            ...payload,
+            priority: 'high',
+            channelId: 'chat',
+            tag: 'conv-1',
+            threadId: 'conv-1',
+            ttl: 300,
+          },
+        },
+        { token: 'tok-plain', projectId: null, payload },
+      ]);
+
+      const [chat, plain] = JSON.parse(
+        (fetchMock.mock.calls[0][1] as { body: string }).body,
+      ) as Array<Record<string, unknown>>;
+      expect(chat).toEqual(
+        expect.objectContaining({
+          to: 'tok-chat',
+          priority: 'high',
+          channelId: 'chat',
+          tag: 'conv-1',
+          threadId: 'conv-1',
+          ttl: 300,
+        }),
+      );
+      // 系统通知 outbox 不带这些字段,发出去的消息与原来一致。
+      for (const key of ['priority', 'channelId', 'tag', 'threadId', 'ttl']) {
+        expect(plain).not.toHaveProperty(key);
+      }
+    });
+
     it('never mixes Expo projects in one request and still reaps dead tokens', async () => {
       fetchMock
         .mockResolvedValueOnce({

@@ -1,10 +1,12 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import {
+  type ExpoPushPayload,
   NotificationPushService,
   type TokenDeliveryOutcome,
 } from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
+import { CHAT_PUSH_CHANNEL_ID } from './chat.constants';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
@@ -19,6 +21,10 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
  * 但 @提及/@所有人 穿透免打扰。
  */
 const PREVIEW_MAX_LENGTH = 60;
+/** 设备离线超过一天,消息通知就不再补发了 —— 打开 App 看未读即可。 */
+const CHAT_PUSH_TTL_SECONDS = 24 * 60 * 60;
+/** 阅后即焚消息的推送正文:通知栏里留着原文,焚毁就形同虚设。 */
+const BURN_PREVIEW = '[阅后即焚消息]';
 /**
  * 一条消息最多考虑多少个在座成员。圈子扩容上限 3000,留一倍余量;
  * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
@@ -43,6 +49,31 @@ const BADGE_TARGETS_MAX = 200;
  * 进程退出时 onModuleDestroy 把积压的窗口推掉。
  */
 export const CHAT_PUSH_COALESCE_MS = 1_000;
+
+/**
+ * 聊天推送的投递选项:高优先级走聊天渠道;安卓同一会话的新通知替换旧的(tag),
+ * iOS 按会话分组(threadId);点名的通知单独一个 tag。阅后即焚的消息过了焚毁时限
+ * 就不再补发。
+ */
+function deliveryOptions(
+  message: ChatMessageDto,
+  mention: boolean,
+): Pick<
+  ExpoPushPayload,
+  'priority' | 'channelId' | 'tag' | 'threadId' | 'ttl'
+> {
+  const burnSeconds = message.burnDurationSec ?? 0;
+  return {
+    priority: 'high',
+    channelId: CHAT_PUSH_CHANNEL_ID,
+    tag: mention ? `${message.conversationId}:mention` : message.conversationId,
+    threadId: message.conversationId,
+    ttl:
+      burnSeconds > 0
+        ? Math.min(CHAT_PUSH_TTL_SECONDS, burnSeconds)
+        : CHAT_PUSH_TTL_SECONDS,
+  };
+}
 
 interface PendingPushWindow {
   latest: ChatMessageDto;
@@ -185,24 +216,35 @@ export class ChatPushService implements OnModuleDestroy {
     if (chosen.size === 0) return;
     // 合并窗口里另一台设备可能已经读到/清掉了这一条。
     const caughtUp = await this.loadCaughtUpUserIds(conversationId, chosen);
-    const recipientsByMessage = new Map<ChatMessageDto, string[]>();
+    // 按「推哪条 + 是不是点名他的」分组:点名的通知单独一个 tag,免得被同一
+    // 会话里后面的普通消息替换掉。
+    const groups = new Map<
+      string,
+      { message: ChatMessageDto; mention: boolean; recipients: string[] }
+    >();
     for (const [userId, message] of chosen) {
       if (caughtUp.has(userId)) continue;
-      const recipients = recipientsByMessage.get(message) ?? [];
-      recipients.push(userId);
-      recipientsByMessage.set(message, recipients);
+      const mention =
+        window.mentioned.get(userId) === message || window.atAll === message;
+      const key = `${message.id}:${mention ? 'mention' : 'stream'}`;
+      const group = groups.get(key) ?? { message, mention, recipients: [] };
+      group.recipients.push(userId);
+      groups.set(key, group);
     }
-    if (recipientsByMessage.size === 0) return;
+    if (groups.size === 0) return;
 
-    const everyone = [...recipientsByMessage.values()].flat();
+    const everyone = [...groups.values()].flatMap((group) => group.recipients);
     // G-18:小规模扇出附 per-recipient 角标(iOS 杀后台也有数字)。大群跳过 ——
     // 逐人聚合未读的代价与收益不成比;拿不到就不带 badge,推送照发。
     const badges =
       everyone.length <= BADGE_TARGETS_MAX
         ? await this.loadUnreadBadges(everyone)
         : new Map<string, number>();
-    for (const [message, recipients] of recipientsByMessage) {
-      const payload = await this.composePayload(message, conversation);
+    for (const { message, mention, recipients } of groups.values()) {
+      const payload = {
+        ...(await this.composePayload(message, conversation)),
+        ...deliveryOptions(message, mention),
+      };
       await this.sendToRecipients(message, recipients, payload, badges);
     }
   }
@@ -279,7 +321,7 @@ export class ChatPushService implements OnModuleDestroy {
   private async sendToRecipients(
     message: ChatMessageDto,
     recipients: string[],
-    payload: { title: string; body: string; data: Record<string, unknown> },
+    payload: ExpoPushPayload,
     badges: Map<string, number>,
   ): Promise<void> {
     // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
@@ -451,6 +493,7 @@ export class ChatPushService implements OnModuleDestroy {
         data: {
           type: 'chat',
           conversationId: message.conversationId,
+          messageId: message.id,
           sourceID: conversation.circleID,
           conversationType: 'group',
           title,
@@ -471,6 +514,7 @@ export class ChatPushService implements OnModuleDestroy {
         data: {
           type: 'chat',
           conversationId: message.conversationId,
+          messageId: message.id,
           sourceID: message.conversationId,
           conversationType: 'group',
           conversationKind: 'temp',
@@ -487,6 +531,7 @@ export class ChatPushService implements OnModuleDestroy {
         data: {
           type: 'chat',
           conversationId: message.conversationId,
+          messageId: message.id,
           sourceID: message.conversationId,
           conversationType: 'group',
           title,
@@ -501,6 +546,8 @@ export class ChatPushService implements OnModuleDestroy {
       data: {
         type: 'chat',
         conversationId: message.conversationId,
+        // 撤回/焚毁/已读后前端据此收起这条通知。
+        messageId: message.id,
         ...(message.sender ? { sourceID: message.sender.id } : {}),
         conversationType: 'private',
         title,
@@ -510,6 +557,7 @@ export class ChatPushService implements OnModuleDestroy {
 
   /** 推送预览:与前端 im.preview.* 同语义;服务端推送文案与既有推送同为中文。 */
   private previewFor(message: ChatMessageDto): string {
+    if ((message.burnDurationSec ?? 0) > 0) return BURN_PREVIEW;
     switch (message.type) {
       case 'text':
       case 'quote': {
