@@ -178,6 +178,12 @@ function receiptCeiling(conversation: { nextHeight: number }): number {
   return conversation.nextHeight ?? 0;
 }
 
+/**
+ * 会话列表里单个会话的未读数最多数到这里。界面(会话行、消息 tab)超过 99 一律显示
+ * 99+,数到 100 就足够判断;再往后数只是替大群逐行回表。
+ */
+const UNREAD_COUNT_CAP = 100;
+
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
 // 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
 const STANDALONE_GROUP_MAX_MEMBERS = 200;
@@ -3428,17 +3434,16 @@ export class ChatService {
     );
     const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
     const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
+    // 每个会话只沿 (conversationID, height) 唯一索引倒着找第一条可见的消息。原来的
+    // DISTINCT ON 在 PG16 上没有 skip scan:要把每个会话的全部历史读出来、连正文
+    // 一起排序,几个十万条的大群就是每次拉列表上百万行。
+    //
     // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
     // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写 ——
     // 也绕过了类型检查,漏一列 tsc 照过,chat-last-message-columns.spec 兜着。
     const rows = await this.prisma.$queryRaw<MessageRow[]>`
-      SELECT DISTINCT ON (m."conversationID")
-        m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
-        m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
-        m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
-        m."createdAt"
-      FROM "ChatMessage" AS m
-      JOIN unnest(
+      SELECT latest.*
+      FROM unnest(
         ${conversationIds}::text[],
         ${viewerCutoffs}::timestamptz[],
         ${viewerStarts}::timestamptz[],
@@ -3446,19 +3451,28 @@ export class ChatService {
         ${burnCutoffs}::timestamptz[]
       ) AS w("conversationID", "viewerCutoff", "viewerStartedAt",
              "burnStartedAt", "burnCutoff")
-        ON w."conversationID" = m."conversationID"
-      WHERE m."deleted" = false
-        AND (
-          w."viewerCutoff" IS NULL
-          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-          OR m."createdAt" >= w."viewerCutoff"
-        )
-        AND (
-          w."burnCutoff" IS NULL
-          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-          OR m."createdAt" >= w."burnCutoff"
-        )
-      ORDER BY m."conversationID", m."height" DESC
+      CROSS JOIN LATERAL (
+        SELECT
+          m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
+          m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
+          m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
+          m."createdAt"
+        FROM "ChatMessage" AS m
+        WHERE m."conversationID" = w."conversationID"
+          AND m."deleted" = false
+          AND (
+            w."viewerCutoff" IS NULL
+            OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
+            OR m."createdAt" >= w."viewerCutoff"
+          )
+          AND (
+            w."burnCutoff" IS NULL
+            OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
+            OR m."createdAt" >= w."burnCutoff"
+          )
+        ORDER BY m."height" DESC
+        LIMIT 1
+      ) AS latest
     `;
     const map = new Map<string, MessageRow>();
     for (const row of rows) map.set(row.conversationID, row);
@@ -3466,8 +3480,12 @@ export class ChatService {
   }
 
   /**
-   * 每个会话的未读数,一次 GROUP BY 取回(每会话各自的 lastReadHeight 水位)。
-   * 同上:原来每会话一次 count。
+   * 每个会话的未读数,一次查询取回(每会话各自的 lastReadHeight 水位)。原来每会话
+   * 一次 count。
+   *
+   * 数到 UNREAD_COUNT_CAP 就停:界面最多显示 99+,而不封顶的 COUNT 对一个积了上万条
+   * 未读的大群要逐行回表(deleted/revokedAt/createdAt/senderID 都不在索引里),每次
+   * 拉会话列表都来一遍。
    */
   private async loadUnreadCounts(
     userId: string,
@@ -3489,9 +3507,8 @@ export class ChatService {
     const rows = await this.prisma.$queryRaw<
       Array<{ conversationID: string; count: bigint }>
     >`
-      SELECT m."conversationID", COUNT(*)::bigint AS count
-      FROM "ChatMessage" AS m
-      JOIN unnest(
+      SELECT w."conversationID", unread.count
+      FROM unnest(
         ${ids}::text[],
         ${floors}::int[],
         ${viewerCutoffs}::timestamptz[],
@@ -3500,24 +3517,32 @@ export class ChatService {
         ${burnCutoffs}::timestamptz[]
       ) AS w("conversationID", floor, "viewerCutoff", "viewerStartedAt",
              "burnStartedAt", "burnCutoff")
-        ON w."conversationID" = m."conversationID"
-      WHERE m."deleted" = false
-        -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
-        AND m."revokedAt" IS NULL
-        AND m."height" > w.floor
-        AND (
-          w."viewerCutoff" IS NULL
-          OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
-          OR m."createdAt" >= w."viewerCutoff"
-        )
-        AND (
-          w."burnCutoff" IS NULL
-          OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
-          OR m."createdAt" >= w."burnCutoff"
-        )
-        -- 自己发的消息不计未读。
-        AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
-      GROUP BY m."conversationID"
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::bigint AS count
+        FROM (
+          SELECT 1
+          FROM "ChatMessage" AS m
+          WHERE m."conversationID" = w."conversationID"
+            AND m."height" > w.floor
+            AND m."deleted" = false
+            -- 撤回的消息不计未读:对方发了又撤回,红点不该还挂着一条看不到内容的「新消息」。
+            AND m."revokedAt" IS NULL
+            AND (
+              w."viewerCutoff" IS NULL
+              OR (w."viewerStartedAt" IS NOT NULL AND m."createdAt" < w."viewerStartedAt")
+              OR m."createdAt" >= w."viewerCutoff"
+            )
+            AND (
+              w."burnCutoff" IS NULL
+              OR (w."burnStartedAt" IS NOT NULL AND m."createdAt" < w."burnStartedAt")
+              OR m."createdAt" >= w."burnCutoff"
+            )
+            -- 自己发的消息不计未读。
+            AND (m."senderID" IS NULL OR m."senderID" <> ${userId})
+          LIMIT ${UNREAD_COUNT_CAP}
+        ) AS capped
+      ) AS unread
+      WHERE unread.count > 0
     `;
     for (const row of rows) map.set(row.conversationID, Number(row.count));
     return map;

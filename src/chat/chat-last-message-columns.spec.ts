@@ -3,7 +3,7 @@ import { resolve } from 'path';
 import { Prisma } from 'src/generated/prisma';
 
 /**
- * 会话列表里每个会话的「最后一条消息」是手写 SQL(DISTINCT ON 取最高 height),
+ * 会话列表里每个会话的「最后一条消息」是手写 SQL(每会话倒序取最高 height 的一条),
  * 结果按 MessageRow(= ChatMessage 去掉 contentHistory)交给 toMessageDto。
  * 原始 SQL 绕过 Prisma 的类型检查:漏选一列 tsc 照过,DTO 上对应字段静默变成
  * undefined。revision 就这样漏过一次 —— 会话列表的 lastMessage 不带变更序号,
@@ -25,7 +25,7 @@ describe('loadLastMessages raw SELECT', () => {
     const start = source.indexOf('private async loadLastMessages(');
     expect(start).toBeGreaterThan(-1);
     const select =
-      /SELECT DISTINCT ON \(m\."conversationID"\)([\s\S]*?)FROM "ChatMessage" AS m/.exec(
+      /CROSS JOIN LATERAL \(\s*SELECT([\s\S]*?)FROM "ChatMessage" AS m/.exec(
         source.slice(start),
       );
     expect(select).not.toBeNull();
