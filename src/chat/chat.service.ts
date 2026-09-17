@@ -3382,12 +3382,14 @@ export class ChatService {
     const burnStarts = retentionWindows.map((window) => window.burnStartedAt);
     const burnCutoffs = retentionWindows.map((window) => window.burnCutoff);
     // 列名逐个写出而不是 SELECT *:唯一的目的是别把 contentHistory 拖进来
-    // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写。
+    // (见 MessageRow 上的注释)。原始 SQL 绕过 Prisma 的 omit,只能手写 ——
+    // 也绕过了类型检查,漏一列 tsc 照过,chat-last-message-columns.spec 兜着。
     const rows = await this.prisma.$queryRaw<MessageRow[]>`
       SELECT DISTINCT ON (m."conversationID")
         m."id", m."conversationID", m."height", m."senderID", m."type", m."content",
-        m."clientMessageId", m."replyToID", m."deleted", m."revokedAt", m."revokedBy",
-        m."editedAt", m."deletedAt", m."createdAt"
+        m."clientMessageId", m."requestHash", m."replyToID", m."deleted",
+        m."revokedAt", m."revokedBy", m."editedAt", m."deletedAt", m."revision",
+        m."createdAt"
       FROM "ChatMessage" AS m
       JOIN unnest(
         ${conversationIds}::text[],
