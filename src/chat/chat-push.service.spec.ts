@@ -52,10 +52,22 @@ describe('ChatPushService', () => {
     circle: { findUnique: jest.fn() },
     tempChat: { findUnique: jest.fn() },
   };
+  // 一次查回全部收件人的 token、按 100 条一批发给 Expo(见 sendToRecipients)。
   const push = {
-    listActiveTokens: jest.fn(),
-    sendToTokens: jest.fn(),
+    listActiveTokensForUsers: jest.fn(),
+    sendMessages: jest.fn(),
   };
+  /** 这次扇出实际去查了 token 的收件人。 */
+  const pushedUserIds = (): string[] =>
+    push.listActiveTokensForUsers.mock.calls.flatMap(
+      ([userIds]: [string[]]) => userIds,
+    );
+  /** 发给 Expo 的每一条消息的载荷。 */
+  const sentPayloads = (): Array<Record<string, unknown>> =>
+    push.sendMessages.mock.calls.flatMap(
+      ([messages]: [Array<{ payload: Record<string, unknown> }>]) =>
+        messages.map((message) => message.payload),
+    );
   const broadcast = { getDeliverableUserIdsInConversation: jest.fn() };
 
   let service: ChatPushService;
@@ -86,10 +98,21 @@ describe('ChatPushService', () => {
         ),
     );
     broadcast.getDeliverableUserIdsInConversation.mockResolvedValue(new Set());
-    push.listActiveTokens.mockResolvedValue([
-      { token: 'ExponentPushToken[a]', projectId: null },
-    ]);
-    push.sendToTokens.mockResolvedValue([]);
+    push.listActiveTokensForUsers.mockImplementation((userIds: string[]) =>
+      Promise.resolve(
+        new Map(
+          userIds.map((userId) => [
+            userId,
+            [{ token: 'ExponentPushToken[a]', projectId: null }],
+          ]),
+        ),
+      ),
+    );
+    push.sendMessages.mockImplementation((messages: Array<{ token: string }>) =>
+      Promise.resolve(
+        messages.map((message) => ({ token: message.token, status: 'SENT' })),
+      ),
+    );
   });
 
   afterEach(() => {
@@ -105,10 +128,7 @@ describe('ChatPushService', () => {
 
     await pushNow(msg());
 
-    expect(push.sendToTokens).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ badge: 7 }),
-    );
+    expect(sentPayloads()).toEqual([expect.objectContaining({ badge: 7 })]);
   });
 
   it('counts neither recalled messages nor muted conversations in the badge', async () => {
@@ -134,7 +154,11 @@ describe('ChatPushService', () => {
       1,
       expect.objectContaining({ take: 6000 }),
     );
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(1120);
+    // token 一次查完、消息一次交给推送服务分批,不再每个收件人各查各发。
+    expect(push.listActiveTokensForUsers).toHaveBeenCalledTimes(1);
+    expect(pushedUserIds()).toHaveLength(1120);
+    expect(push.sendMessages).toHaveBeenCalledTimes(1);
+    expect(push.sendMessages.mock.calls[0][0]).toHaveLength(1120);
   });
 
   it('pushes to members who have neither read nor cleared past the message, never to the sender', async () => {
@@ -157,21 +181,23 @@ describe('ChatPushService', () => {
         select: { userID: true, muted: true },
       }),
     );
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(1);
-    expect(push.listActiveTokens).toHaveBeenCalledWith('u-peer');
-    expect(push.sendToTokens).toHaveBeenCalledWith(
-      [{ token: 'ExponentPushToken[a]', projectId: null }],
-      expect.objectContaining({
-        title: '发送者',
-        body: 'hello world',
-        data: expect.objectContaining({
-          type: 'chat',
-          conversationId: 'conv-1',
-          sourceID: 'u-sender',
-          conversationType: 'private',
+    expect(pushedUserIds()).toEqual(['u-peer']);
+    expect(push.sendMessages).toHaveBeenCalledWith([
+      {
+        token: 'ExponentPushToken[a]',
+        projectId: null,
+        payload: expect.objectContaining({
+          title: '发送者',
+          body: 'hello world',
+          data: expect.objectContaining({
+            type: 'chat',
+            conversationId: 'conv-1',
+            sourceID: 'u-sender',
+            conversationType: 'private',
+          }),
         }),
-      }),
-    );
+      },
+    ]);
   });
 
   it('skips members with a foreground connection but still pushes to backgrounded ones', async () => {
@@ -186,8 +212,7 @@ describe('ChatPushService', () => {
 
     await pushNow(msg());
 
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(1);
-    expect(push.listActiveTokens).toHaveBeenCalledWith('u-locked-screen');
+    expect(pushedUserIds()).toEqual(['u-locked-screen']);
   });
 
   it('respects mute but lets mentions and atAll pierce it', async () => {
@@ -201,14 +226,13 @@ describe('ChatPushService', () => {
         content: { text: 'hi', mentions: [{ userId: 'u-muted-mentioned' }] },
       }),
     );
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(1);
-    expect(push.listActiveTokens).toHaveBeenCalledWith('u-muted-mentioned');
+    expect(pushedUserIds()).toEqual(['u-muted-mentioned']);
 
-    push.listActiveTokens.mockClear();
+    push.listActiveTokensForUsers.mockClear();
     await pushNow(
       msg({ id: 'msg-2', content: { text: 'all hands', atAll: true } }),
     );
-    expect(push.listActiveTokens).toHaveBeenCalledTimes(2);
+    expect(pushedUserIds()).toHaveLength(2);
   });
 
   describe('coalescing', () => {
@@ -229,11 +253,10 @@ describe('ChatPushService', () => {
       jest.advanceTimersByTime(1);
       await service.flushPending();
 
-      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
-      expect(push.sendToTokens).toHaveBeenCalledWith(
-        expect.anything(),
+      expect(push.sendMessages).toHaveBeenCalledTimes(1);
+      expect(sentPayloads()).toEqual([
         expect.objectContaining({ body: 'third' }),
-      );
+      ]);
     });
 
     it('does not slide the window, so a busy chat still pushes about once a window', async () => {
@@ -245,11 +268,11 @@ describe('ChatPushService', () => {
       await service.onMessageBroadcast(msg({ id: 'm6', height: 6 }));
       jest.advanceTimersByTime(100);
       await service.flushPending();
-      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
+      expect(push.sendMessages).toHaveBeenCalledTimes(1);
 
       await service.onMessageBroadcast(msg({ id: 'm7', height: 7 }));
       await service.flushPending();
-      expect(push.sendToTokens).toHaveBeenCalledTimes(2);
+      expect(push.sendMessages).toHaveBeenCalledTimes(2);
     });
 
     it('keeps separate windows per conversation', async () => {
@@ -263,7 +286,7 @@ describe('ChatPushService', () => {
       );
       await service.flushPending();
 
-      expect(push.sendToTokens).toHaveBeenCalledTimes(2);
+      expect(push.sendMessages).toHaveBeenCalledTimes(2);
     });
 
     it('still tells a muted member they were mentioned earlier in the window', async () => {
@@ -284,11 +307,10 @@ describe('ChatPushService', () => {
       await service.flushPending();
 
       // 预览必须是点名他的那条:被后面一句「好的」盖掉,等于没通知。
-      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
-      expect(push.sendToTokens).toHaveBeenCalledWith(
-        expect.anything(),
+      expect(push.sendMessages).toHaveBeenCalledTimes(1);
+      expect(sentPayloads()).toEqual([
         expect.objectContaining({ body: '@你 看一下' }),
-      );
+      ]);
     });
 
     it('skips members who read or cleared the message elsewhere before the window closed', async () => {
@@ -300,8 +322,7 @@ describe('ChatPushService', () => {
 
       await pushNow(msg({ height: 5 }));
 
-      expect(push.listActiveTokens).toHaveBeenCalledTimes(1);
-      expect(push.listActiveTokens).toHaveBeenCalledWith('u-behind');
+      expect(pushedUserIds()).toEqual(['u-behind']);
     });
 
     it('never pushes the content of a message recalled before the window closed', async () => {
@@ -312,7 +333,7 @@ describe('ChatPushService', () => {
 
       await pushNow(msg());
 
-      expect(push.sendToTokens).not.toHaveBeenCalled();
+      expect(push.sendMessages).not.toHaveBeenCalled();
     });
 
     it('flushes pending windows on shutdown', async () => {
@@ -322,7 +343,7 @@ describe('ChatPushService', () => {
       await service.onMessageBroadcast(msg());
       await service.onModuleDestroy();
 
-      expect(push.sendToTokens).toHaveBeenCalledTimes(1);
+      expect(push.sendMessages).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -336,8 +357,7 @@ describe('ChatPushService', () => {
 
     await pushNow(msg({ type: 'image', content: { key: 'k' } }));
 
-    expect(push.sendToTokens).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(sentPayloads()).toEqual([
       expect.objectContaining({
         title: '登山圈',
         body: '发送者: [图片]',
@@ -346,7 +366,7 @@ describe('ChatPushService', () => {
           conversationType: 'group',
         }),
       }),
-    );
+    ]);
   });
 
   it('routes TEMP pushes back into the temporary group conversation', async () => {
@@ -360,8 +380,7 @@ describe('ChatPushService', () => {
 
     await pushNow(msg());
 
-    expect(push.sendToTokens).toHaveBeenCalledWith(
-      expect.anything(),
+    expect(sentPayloads()).toEqual([
       expect.objectContaining({
         title: '周末临时群',
         body: '发送者: hello world',
@@ -372,20 +391,20 @@ describe('ChatPushService', () => {
           conversationKind: 'temp',
         }),
       }),
-    );
+    ]);
   });
 
   it('never throws upward even when the pipeline fails', async () => {
     prisma.chatMember.findMany.mockRejectedValue(new Error('db down'));
     await expect(pushNow(msg())).resolves.toBeUndefined();
-    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(push.sendMessages).not.toHaveBeenCalled();
   });
 
   it('skips members without any active token', async () => {
     prisma.chatMember.findMany.mockResolvedValue([seat('u-peer')]);
-    push.listActiveTokens.mockResolvedValue([]);
+    push.listActiveTokensForUsers.mockResolvedValue(new Map());
     await pushNow(msg());
-    expect(push.sendToTokens).not.toHaveBeenCalled();
+    expect(push.sendMessages).not.toHaveBeenCalled();
   });
 
   // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
@@ -393,7 +412,15 @@ describe('ChatPushService', () => {
   // 静默蒸发,运维侧没有任何信号。
   it('logs a bounded summary when every recipient fails', async () => {
     prisma.chatMember.findMany.mockResolvedValueOnce([seat('u2'), seat('u3')]);
-    push.listActiveTokens.mockRejectedValue(new Error('provider down'));
+    push.sendMessages.mockImplementation((messages: Array<{ token: string }>) =>
+      Promise.resolve(
+        messages.map((message) => ({
+          token: message.token,
+          status: 'RETRYABLE',
+          error: 'provider down',
+        })),
+      ),
+    );
     const logger = { warn: jest.fn(), error: jest.fn(), log: jest.fn() };
     (service as unknown as { logger: typeof logger }).logger = logger;
 
@@ -404,5 +431,19 @@ describe('ChatPushService', () => {
     );
     // 3000 人的群失败不能刷 3000 行:只汇总一条。
     expect(logger.error).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs the whole fanout as failed when the token lookup itself fails', async () => {
+    prisma.chatMember.findMany.mockResolvedValueOnce([seat('u2'), seat('u3')]);
+    push.listActiveTokensForUsers.mockRejectedValue(new Error('db down'));
+    const logger = { warn: jest.fn(), error: jest.fn(), log: jest.fn() };
+    (service as unknown as { logger: typeof logger }).logger = logger;
+
+    await expect(pushNow(msg())).resolves.toBeUndefined();
+
+    expect(push.sendMessages).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('2/2 recipients failed'),
+    );
   });
 });

@@ -11,6 +11,11 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
 const EXPO_BATCH_SIZE = 100;
+// 一次扇出里同时在途的 Expo 请求数:3000 人的群是 30 批,串行发太慢,全并发又会
+// 撞 Expo 的速率限制。
+const EXPO_SEND_CONCURRENCY = 4;
+// 每个用户最多推几台设备(按最近注册的算)。
+const ACTIVE_TOKENS_PER_USER = 20;
 const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. Node's global fetch (undici) applies no response
 // timeout by default — a hung Expo endpoint would stall the outbox sweep.
@@ -138,9 +143,36 @@ export class NotificationPushService {
       where: { userID: userId, provider: 'expo', disabledAt: null },
       select: { token: true, projectId: true },
       orderBy: { updatedAt: 'desc' },
-      take: 20,
+      take: ACTIVE_TOKENS_PER_USER,
     });
     return rows;
+  }
+
+  /**
+   * 多个用户的活跃 token 一次查回(每人最近的 ACTIVE_TOKENS_PER_USER 个)。聊天大群
+   * 扇出用:原来每个收件人一次查询,3000 人的群一条消息就是 3000 次往返。
+   * 没有活跃 token 的用户不出现在结果里。
+   */
+  async listActiveTokensForUsers(
+    userIds: string[],
+  ): Promise<Map<string, Array<{ token: string; projectId: string | null }>>> {
+    const byUser = new Map<
+      string,
+      Array<{ token: string; projectId: string | null }>
+    >();
+    if (userIds.length === 0) return byUser;
+    const rows = await this.prisma.devicePushToken.findMany({
+      where: { userID: { in: userIds }, provider: 'expo', disabledAt: null },
+      select: { userID: true, token: true, projectId: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    for (const row of rows) {
+      const tokens = byUser.get(row.userID) ?? [];
+      if (tokens.length >= ACTIVE_TOKENS_PER_USER) continue;
+      tokens.push({ token: row.token, projectId: row.projectId });
+      byUser.set(row.userID, tokens);
+    }
+    return byUser;
   }
 
   /**
@@ -152,29 +184,50 @@ export class NotificationPushService {
     tokens: Array<{ token: string; projectId: string | null }>,
     payload: ExpoPushPayload,
   ): Promise<TokenDeliveryOutcome[]> {
-    if (tokens.length === 0) return [];
+    return this.sendMessages(tokens.map((token) => ({ ...token, payload })));
+  }
+
+  /**
+   * 每条消息各带载荷(聊天扇出里每个收件人的角标不同),按 Expo 单次上限 100 条
+   * 分批、有限并发发出。结论与入参一一对应(同一下标);死令牌就地停用。
+   */
+  async sendMessages(
+    messages: Array<{
+      token: string;
+      projectId: string | null;
+      payload: ExpoPushPayload;
+    }>,
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (messages.length === 0) return [];
 
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
-    const byProject = new Map<string, typeof tokens>();
-    for (const token of tokens) {
-      const key = token.projectId ?? '';
+    type Indexed = { index: number; token: string; payload: ExpoPushPayload };
+    const byProject = new Map<string, Indexed[]>();
+    messages.forEach((message, index) => {
+      const key = message.projectId ?? '';
       const group = byProject.get(key) ?? [];
-      group.push(token);
+      group.push({ index, token: message.token, payload: message.payload });
       byProject.set(key, group);
+    });
+    const batches: Indexed[][] = [];
+    for (const projectMessages of byProject.values()) {
+      for (let i = 0; i < projectMessages.length; i += EXPO_BATCH_SIZE) {
+        batches.push(projectMessages.slice(i, i + EXPO_BATCH_SIZE));
+      }
     }
 
-    const outcomes: TokenDeliveryOutcome[] = [];
-    for (const projectTokens of byProject.values()) {
-      for (let i = 0; i < projectTokens.length; i += EXPO_BATCH_SIZE) {
-        const batch = projectTokens.slice(i, i + EXPO_BATCH_SIZE);
-        outcomes.push(
-          ...(await this.sendBatch(
-            batch.map((row) => row.token),
-            payload,
-          )),
-        );
-      }
+    const outcomes = new Array<TokenDeliveryOutcome>(messages.length);
+    for (let i = 0; i < batches.length; i += EXPO_SEND_CONCURRENCY) {
+      const chunk = batches.slice(i, i + EXPO_SEND_CONCURRENCY);
+      const settled = await Promise.all(
+        chunk.map((batch) => this.sendBatch(batch)),
+      );
+      chunk.forEach((batch, batchIndex) => {
+        batch.forEach((entry, entryIndex) => {
+          outcomes[entry.index] = settled[batchIndex][entryIndex];
+        });
+      });
     }
 
     // 只有「令牌已死」类错误才停用 token —— MessageTooBig 等消息级终态
@@ -469,10 +522,10 @@ export class NotificationPushService {
 
   /** 单批发送：HTTP 层重试后返回逐 token 结论（ticket 顺序与请求一一对应）。 */
   private async sendBatch(
-    tokens: string[],
-    payload: ExpoPushPayload,
+    batch: Array<{ token: string; payload: ExpoPushPayload }>,
   ): Promise<TokenDeliveryOutcome[]> {
-    const messages = tokens.map((token) => ({
+    const tokens = batch.map((entry) => entry.token);
+    const messages = batch.map(({ token, payload }) => ({
       to: token,
       sound: 'default',
       title: payload.title,

@@ -1,6 +1,9 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
-import { NotificationPushService } from 'src/notification/notification-push.service';
+import {
+  NotificationPushService,
+  type TokenDeliveryOutcome,
+} from 'src/notification/notification-push.service';
 import { ChatBroadcastService } from './chat-broadcast.service';
 import type { ChatMessageDto } from './chat.types';
 import { reportOperationalError } from 'src/logging/error-aggregation.service';
@@ -21,8 +24,6 @@ const PREVIEW_MAX_LENGTH = 60;
  * 这是失控兜底而不是常规截断 —— 触顶会打 warn。
  */
 const PUSH_TARGET_CAP = 6000;
-/** 单批并发的推送数,给连接池和推送供应商留背压。 */
-const PUSH_SEND_CONCURRENCY = 50;
 /** 附带 badge 的最大扇出规模:超过则跳过逐人未读聚合(照常推送,只是无数字)。 */
 const BADGE_TARGETS_MAX = 200;
 
@@ -281,42 +282,71 @@ export class ChatPushService implements OnModuleDestroy {
     payload: { title: string; body: string; data: Record<string, unknown> },
     badges: Map<string, number>,
   ): Promise<void> {
-    // 分批并发发送:扩容后的圈子可到 3000 人,一次性 allSettled 三千个
-    // listActiveTokens 会把连接池和推送供应商同时打满。
-    let failed = 0;
+    // 收件人的 token 一次查回、消息整批交给推送服务按 100 条一批发。原来是每个
+    // 收件人各查一次 token、各发一次 HTTPS:3000 人的群一条消息就是 3000 + 3000 次。
+    let tokensByUser: Map<
+      string,
+      Array<{ token: string; projectId: string | null }>
+    >;
+    try {
+      tokensByUser = await this.push.listActiveTokensForUsers(recipients);
+    } catch (error) {
+      this.logFanoutFailure(
+        message,
+        recipients.length,
+        recipients.length,
+        error,
+      );
+      return;
+    }
+    const owners: string[] = [];
+    const messages = recipients.flatMap((userId) => {
+      const badge = badges.get(userId);
+      const perUser = badge !== undefined ? { ...payload, badge } : payload;
+      return (tokensByUser.get(userId) ?? []).map((token) => {
+        owners.push(userId);
+        return { ...token, payload: perUser };
+      });
+    });
+    if (messages.length === 0) return;
+    const attempted = new Set(owners);
+
+    let outcomes: TokenDeliveryOutcome[];
+    try {
+      outcomes = await this.push.sendMessages(messages);
+    } catch (error) {
+      this.logFanoutFailure(message, attempted.size, recipients.length, error);
+      return;
+    }
+    // 结论与消息一一对应,失败按人数:一个人任何一台设备收下了就不算失败。
+    // 不汇总的话,供应商整体故障时扇出静默蒸发,运维侧没有任何信号。
+    const delivered = new Set<string>();
     let firstError: string | null = null;
-    for (let i = 0; i < recipients.length; i += PUSH_SEND_CONCURRENCY) {
-      const batch = recipients.slice(i, i + PUSH_SEND_CONCURRENCY);
-      const settled = await Promise.allSettled(
-        batch.map(async (userId) => {
-          const tokens = await this.push.listActiveTokens(userId);
-          if (tokens.length === 0) return;
-          const badge = badges.get(userId);
-          await this.push.sendToTokens(
-            tokens,
-            badge !== undefined ? { ...payload, badge } : payload,
-          );
-        }),
-      );
-      // allSettled 会把每个收件人的失败原样吞掉:不看返回值的话,供应商或数据库
-      // 整体故障时这里照样"成功"返回,外层的失败日志一次都不会触发 —— 整场扇出
-      // 静默蒸发,而运维侧没有任何信号。逐批统计,最后汇总一条。
-      for (const outcome of settled) {
-        if (outcome.status !== 'rejected') continue;
-        failed += 1;
-        firstError ??=
-          outcome.reason instanceof Error
-            ? outcome.reason.message
-            : String(outcome.reason);
-      }
-    }
+    outcomes.forEach((outcome, index) => {
+      if (outcome?.status === 'SENT') delivered.add(owners[index]);
+      else firstError ??= outcome?.error ?? outcome?.status ?? 'unknown';
+    });
+    const failed = [...attempted].filter(
+      (userId) => !delivered.has(userId),
+    ).length;
     if (failed > 0) {
-      // 只记数量与首条原因,不逐条刷屏(3000 人的群失败就是 3000 行)。
-      const level = failed === recipients.length ? 'error' : 'warn';
-      this.logger[level](
-        `chat push fanout: ${failed}/${recipients.length} recipients failed message=${message.id} firstError=${firstError}`,
-      );
+      this.logFanoutFailure(message, failed, recipients.length, firstError);
     }
+  }
+
+  /** 只记数量与首条原因,不逐条刷屏(3000 人的群失败就是 3000 行)。 */
+  private logFanoutFailure(
+    message: ChatMessageDto,
+    failed: number,
+    total: number,
+    reason: unknown,
+  ): void {
+    const level = failed === total ? 'error' : 'warn';
+    const firstError =
+      reason instanceof Error ? reason.message : String(reason ?? 'unknown');
+    this.logger[level](
+      `chat push fanout: ${failed}/${total} recipients failed message=${message.id} firstError=${firstError}`,
+    );
   }
 
   /**
