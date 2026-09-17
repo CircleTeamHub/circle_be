@@ -91,6 +91,7 @@ describe('ChatService', () => {
     emitHistoryCleared: jest.fn(),
     emitHistoryClearedToUser: jest.fn(),
     emitBurnedMessages: jest.fn().mockResolvedValue(undefined),
+    emitConversationChange: jest.fn(),
   };
   const groupEvents = {
     record: jest.fn().mockResolvedValue(undefined),
@@ -3135,6 +3136,37 @@ describe('ChatService', () => {
       expect(prisma.chatMember.update).toHaveBeenLastCalledWith(
         expect.objectContaining({ data: { hiddenAt: null } }),
       );
+    });
+
+    // 置顶/免打扰/隐藏是跟着账号走的:手机上置顶了,电脑上要跟着变,
+    // 不能等下一次重连或下拉刷新。
+    it('tells the caller other devices to refresh the conversation', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMember.update.mockResolvedValue({});
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.setConversationPreferences('u1', 'conv-1', { muted: true });
+
+      expect(broadcast.emitConversationChange).toHaveBeenCalledWith('u1', {
+        kind: 'updated',
+        conversationId: 'conv-1',
+        userId: 'u1',
+      });
+    });
+
+    it('stays silent when nothing was changed', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.chatMessage.findFirst.mockResolvedValue(null);
+      prisma.chatMessage.count.mockResolvedValue(0);
+      prisma.chatMember.findMany.mockResolvedValue([]);
+      prisma.user.findMany.mockResolvedValue([]);
+
+      await service.setConversationPreferences('u1', 'conv-1', {});
+
+      expect(broadcast.emitConversationChange).not.toHaveBeenCalled();
     });
   });
 

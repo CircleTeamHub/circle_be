@@ -2050,6 +2050,13 @@ export class ChatService {
             : {}),
         },
       });
+      // 偏好跟着账号走:本人其它在线设备据此刷新会话行(置顶顺序、免打扰铃铛、
+      // 隐藏后从列表消失),不必等下一次重连或下拉刷新。
+      this.broadcast.emitConversationChange(userId, {
+        kind: 'updated',
+        conversationId,
+        userId,
+      });
     }
     return this.buildConversationDto(userId, conversationId);
   }
