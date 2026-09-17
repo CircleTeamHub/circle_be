@@ -184,6 +184,23 @@ function receiptCeiling(conversation: { nextHeight: number }): number {
  */
 const UNREAD_COUNT_CAP = 100;
 
+/**
+ * 关键词搜索每轮从二元组索引取多少条候选,再交给可见性过滤(清空水位、阅后即焚、
+ * 查看者窗口)。被过滤掉的多时接着取下一轮。
+ */
+const TEXT_SEARCH_CANDIDATE_PAGE = 200;
+/**
+ * 最多取几轮候选(即最多检查 2000 条匹配)。只有在匹配极多、又几乎全被可见性过滤掉时
+ * 才会触顶 —— 那一页少返回几条,分页到此为止;防的是无界扫描。
+ */
+const TEXT_SEARCH_CANDIDATE_ROUNDS = 10;
+
+/** LIKE '%词%' 的模式:词里的 % _ \ 按字面匹配(配 ESCAPE '\')。 */
+function likeContainsPattern(keyword: string): string {
+  const escaped = keyword.replace(/[\\%_]/g, (char) => '\\' + char);
+  return `%${escaped}%`;
+}
+
 // 独立群聊人数上限。好友邀请路径有好友数天然封顶,扫码进群放开了好友边界,
 // 一张群码等于无限进人 —— 容量闸必须在服务端(微信同义:大群不再开放扫码)。
 const STANDALONE_GROUP_MAX_MEMBERS = 200;
@@ -2364,13 +2381,23 @@ export class ChatService {
     // 平铺展开会被它整个盖掉:客户端只要带上 date 参数就能翻出销毁窗口
     // 之外的消息,等于给这个设置留了个后门。
     Object.assign(where, chatRetentionWhere(retention));
-    const rows = await this.prisma.chatMessage.findMany({
-      where,
-      omit: MESSAGE_READ_OMIT,
-      // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
-      orderBy: { height: ascendingPull ? 'asc' : 'desc' },
-      take,
-    });
+    const rows = filters.keyword
+      ? await this.findHistoryKeywordRows({
+          conversationId,
+          keyword: filters.keyword,
+          where,
+          ascending: ascendingPull,
+          heightFloor,
+          beforeHeight,
+          take,
+        })
+      : await this.prisma.chatMessage.findMany({
+          where,
+          omit: MESSAGE_READ_OMIT,
+          // 增量补拉从缺口低端往高处追;向旧翻页照旧取最近一段再反转。
+          orderBy: { height: ascendingPull ? 'asc' : 'desc' },
+          take,
+        });
     const senderIds = rows
       .map((r) => r.senderID)
       .filter((id): id is string => id !== null);
@@ -2410,9 +2437,96 @@ export class ChatService {
   }
 
   /**
-   * 历史过滤条件(聊天记录搜索/媒体/按日期共用):
-   * keyword 走 jsonb path 包含(大小写敏感,CJK 主场景无损;拉丁小写化随
-   * 后续全文索引批次);date 按客户端时区解释成当天 [00:00, 24:00) 的 UTC 区间。
+   * 会话内关键词搜索的一页:先按二元组索引取候选(见 20260917000100 迁移),再把
+   * getHistory 的全部条件(类型、日期、清空水位、阅后即焚与查看者窗口)套在候选上。
+   * 候选按 height 键集翻,过滤掉的多就接着取,直到凑够一页或没有更多匹配。
+   */
+  private async findHistoryKeywordRows(params: {
+    conversationId: string;
+    keyword: string;
+    where: Prisma.ChatMessageWhereInput;
+    ascending: boolean;
+    heightFloor: number;
+    beforeHeight: number | undefined;
+    take: number;
+  }): Promise<MessageRow[]> {
+    const { conversationId, keyword, where, ascending, take } = params;
+    const pattern = likeContainsPattern(keyword);
+    const rows: MessageRow[] = [];
+    // 键集游标:向旧翻是「height < 游标」,向新追是「height > 游标」。
+    let cursor: number | null = ascending
+      ? params.heightFloor
+      : (params.beforeHeight ?? null);
+    for (
+      let round = 0;
+      round < TEXT_SEARCH_CANDIDATE_ROUNDS && rows.length < take;
+      round += 1
+    ) {
+      const candidates = await this.prisma.$queryRaw<
+        Array<{ id: string; height: number }>
+      >`
+        SELECT m."id", m."height"
+        FROM "ChatMessage" AS m
+        WHERE m."conversationID" = ${conversationId}
+          AND m."deleted" = false
+          AND m."type" IN ('text', 'quote')
+          AND chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(${keyword})
+          AND (m."content" ->> 'text') LIKE ${pattern} ESCAPE '\\'
+          AND m."height" > ${params.heightFloor}
+          AND (
+            ${cursor}::int IS NULL
+            OR (${ascending} AND m."height" > ${cursor}::int)
+            OR (NOT ${ascending} AND m."height" < ${cursor}::int)
+          )
+        ORDER BY
+          CASE WHEN ${ascending} THEN m."height" END ASC,
+          CASE WHEN NOT ${ascending} THEN m."height" END DESC
+        LIMIT ${TEXT_SEARCH_CANDIDATE_PAGE}
+      `;
+      if (candidates.length === 0) break;
+      const visible = await this.prisma.chatMessage.findMany({
+        where: { ...where, id: { in: candidates.map((row) => row.id) } },
+        omit: MESSAGE_READ_OMIT,
+        orderBy: { height: ascending ? 'asc' : 'desc' },
+      });
+      rows.push(...visible);
+      if (candidates.length < TEXT_SEARCH_CANDIDATE_PAGE) break;
+      cursor = candidates[candidates.length - 1].height;
+    }
+    return rows.slice(0, take);
+  }
+
+  /**
+   * 全局搜索的候选:本人在座会话里、正文包含关键词的文本消息 id,最新在前,
+   * (createdAt, id) 键集翻页。走二元组索引,LIKE 复核相邻与顺序。
+   */
+  private findTextMatchesByTime(
+    conversationIds: string[],
+    keyword: string,
+    before: { createdAt: Date; id: string } | null,
+  ): Promise<Array<{ id: string; createdAt: Date }>> {
+    const pattern = likeContainsPattern(keyword);
+    return this.prisma.$queryRaw<Array<{ id: string; createdAt: Date }>>`
+      SELECT m."id", m."createdAt"
+      FROM "ChatMessage" AS m
+      WHERE m."conversationID" = ANY(${conversationIds}::text[])
+        AND m."deleted" = false
+        AND m."type" IN ('text', 'quote')
+        AND chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(${keyword})
+        AND (m."content" ->> 'text') LIKE ${pattern} ESCAPE '\\'
+        AND (
+          ${before?.createdAt ?? null}::timestamptz IS NULL
+          OR (m."createdAt", m."id") < (${before?.createdAt ?? null}::timestamptz, ${before?.id ?? null}::text)
+        )
+      ORDER BY m."createdAt" DESC, m."id" DESC
+      LIMIT ${TEXT_SEARCH_CANDIDATE_PAGE}
+    `;
+  }
+
+  /**
+   * 历史过滤条件(聊天记录搜索/媒体/按日期共用):date 按客户端时区解释成当天
+   * [00:00, 24:00) 的 UTC 区间。keyword 不在这里:它先走二元组索引取候选
+   * (findHistoryKeywordRows),这里的条件再套在候选上。
    */
   private buildHistoryFilterWhere(
     filters: HistoryFilters,
@@ -2420,9 +2534,6 @@ export class ChatService {
     const where: Prisma.ChatMessageWhereInput = {};
     if (filters.types?.length) {
       where.type = { in: filters.types };
-    }
-    if (filters.keyword) {
-      where.content = { path: ['text'], string_contains: filters.keyword };
     }
     if (filters.date) {
       const tzOffset = filters.tzOffsetMinutes ?? 0;
@@ -2617,17 +2728,40 @@ export class ChatService {
     });
     if (plain.length > 0) scope.push({ conversationID: { in: plain } });
     scope.push(...scoped);
-    const rows = await this.prisma.chatMessage.findMany({
-      where: {
-        OR: scope,
-        deleted: false,
-        type: { in: ['text', 'quote'] },
-        content: { path: ['text'], string_contains: trimmed },
-        ...(viewerWhere.AND ? { AND: viewerWhere.AND } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      take: Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX),
-    });
+    // 先按二元组索引取候选,再把可见性条件套在候选上;过滤掉的多就接着翻下一批。
+    // 原来是 jsonb 路径上的 LIKE,没有索引可用,罕见词要把本人所有会话的消息逐行读一遍。
+    const take = Math.min(Math.max(limit, 1), HISTORY_PAGE_MAX);
+    const conversationIds = memberships.map((m) => m.conversationID);
+    const matched: MessageRow[] = [];
+    let before: { createdAt: Date; id: string } | null = null;
+    for (
+      let round = 0;
+      round < TEXT_SEARCH_CANDIDATE_ROUNDS && matched.length < take;
+      round += 1
+    ) {
+      const candidates = await this.findTextMatchesByTime(
+        conversationIds,
+        trimmed,
+        before,
+      );
+      if (candidates.length === 0) break;
+      const visible = await this.prisma.chatMessage.findMany({
+        where: {
+          OR: scope,
+          deleted: false,
+          type: { in: ['text', 'quote'] },
+          id: { in: candidates.map((candidate) => candidate.id) },
+          ...(viewerWhere.AND ? { AND: viewerWhere.AND } : {}),
+        },
+        omit: MESSAGE_READ_OMIT,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      });
+      matched.push(...visible);
+      if (candidates.length < TEXT_SEARCH_CANDIDATE_PAGE) break;
+      const last = candidates[candidates.length - 1];
+      before = { createdAt: last.createdAt, id: last.id };
+    }
+    const rows = matched.slice(0, take);
     const [senders, aliases] = await Promise.all([
       this.resolveSenders(
         rows.map((r) => r.senderID).filter((id): id is string => id !== null),

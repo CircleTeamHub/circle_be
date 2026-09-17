@@ -2243,6 +2243,8 @@ describe('ChatService', () => {
 
     it('applies type/keyword/date filters onto the where clause', async () => {
       prisma.chatMember.findUnique.mockResolvedValue(membership());
+      // 关键词先走二元组索引取候选,其余条件再套在候选上(候选的 SQL 在真库上验)。
+      prisma.$queryRaw.mockResolvedValue([{ id: 'msg-1', height: 5 }]);
       prisma.chatMessage.findMany.mockResolvedValue([]);
 
       // 东八区(getTimezoneOffset = -480)的 2026-08-05:UTC 前一日 16:00 起算。
@@ -2257,7 +2259,7 @@ describe('ChatService', () => {
         expect.objectContaining({
           where: expect.objectContaining({
             type: { in: ['image'] },
-            content: { path: ['text'], string_contains: '合同' },
+            id: { in: ['msg-1'] },
             createdAt: {
               gte: new Date('2026-08-04T16:00:00.000Z'),
               lt: new Date('2026-08-05T16:00:00.000Z'),
@@ -2265,6 +2267,33 @@ describe('ChatService', () => {
           }),
         }),
       );
+      const [strings, ...values] = prisma.$queryRaw.mock.calls[0] as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      expect(strings.join('?')).toContain(
+        `chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(`,
+      );
+      expect(values).toEqual(expect.arrayContaining(['合同', '%合同%']));
+    });
+
+    it('escapes LIKE wildcards in the keyword', async () => {
+      prisma.chatMember.findUnique.mockResolvedValue(membership());
+      prisma.$queryRaw.mockResolvedValue([]);
+      prisma.chatMessage.findMany.mockResolvedValue([]);
+
+      await service.getHistory('u1', 'conv-1', undefined, 50, {
+        keyword: '100%_ok\\',
+      });
+
+      const [, ...values] = prisma.$queryRaw.mock.calls[0] as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      // 「100%」要搜到的是带百分号的那几条,不是所有以 100 开头的消息。
+      expect(values).toContain('%100\\%\\_ok\\\\%');
+      // 没有候选就不再查可见性。
+      expect(prisma.chatMessage.findMany).not.toHaveBeenCalled();
     });
 
     it('uses the next local-midnight offset on a DST transition day', async () => {
@@ -2459,6 +2488,9 @@ describe('ChatService', () => {
         { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
         { conversationID: 'conv-2', conversation: { clearedBeforeHeight: 0 } },
       ]);
+      prisma.$queryRaw.mockResolvedValue([
+        { id: 'msg-1', createdAt: new Date('2026-08-06T12:00:00.000Z') },
+      ]);
       prisma.chatMessage.findMany.mockResolvedValue([createdRow]);
 
       const rows = await service.searchAllMessages('u1', 'hello');
@@ -2469,12 +2501,52 @@ describe('ChatService', () => {
             // 没清空过、没开焚毁的会话合成一支 IN;带水位/焚毁的各自展开。
             OR: [{ conversationID: { in: ['conv-1', 'conv-2'] } }],
             type: { in: ['text', 'quote'] },
-            content: { path: ['text'], string_contains: 'hello' },
+            id: { in: ['msg-1'] },
           }),
-          orderBy: { createdAt: 'desc' },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
       );
+      const [strings, ...values] = prisma.$queryRaw.mock.calls[0] as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      expect(strings.join('?')).toContain(
+        `chat_text_bigrams(m."content" ->> 'text') @> chat_text_bigrams(`,
+      );
+      expect(values).toEqual(
+        expect.arrayContaining([['conv-1', 'conv-2'], 'hello', '%hello%']),
+      );
       expect(rows).toHaveLength(1);
+    });
+
+    // 候选被可见性过滤掉(清空过、已到期)时要接着翻下一批,不能少返回一截。
+    it('keeps paging candidates until the page is full', async () => {
+      prisma.chatMember.findMany.mockResolvedValue([
+        { conversationID: 'conv-1', conversation: { clearedBeforeHeight: 0 } },
+      ]);
+      const page = (offset: number) =>
+        Array.from({ length: 200 }, (_, i) => ({
+          id: `m-${offset + i}`,
+          createdAt: new Date(2026, 0, 1, 0, 0, 10_000 - offset - i),
+        }));
+      prisma.$queryRaw
+        .mockResolvedValueOnce(page(0))
+        .mockResolvedValueOnce(page(200))
+        .mockResolvedValueOnce([]);
+      prisma.chatMessage.findMany
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([createdRow]);
+
+      const rows = await service.searchAllMessages('u1', 'hello', 1);
+
+      expect(rows).toHaveLength(1);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(2);
+      const [, ...second] = prisma.$queryRaw.mock.calls[1] as [
+        TemplateStringsArray,
+        ...unknown[],
+      ];
+      // 第二批从第一批最后一条之后接着取((createdAt, id) 键集)。
+      expect(second).toEqual(expect.arrayContaining(['m-199']));
     });
   });
 
