@@ -25,6 +25,7 @@ const RECEIPT_BATCH_SIZE = 300;
 // review 修复：单轮最多抽多少批 —— 300×20=6000 行/轮，远超预期峰值；
 // 有上限只是防御性兜底（雪崩恢复时不至于一轮跑穿全表）。
 const RECEIPT_MAX_BATCHES_PER_RUN = 20;
+const MAX_ACTIVE_TOKENS_PER_PROVIDER = 20;
 
 type ExpoPushTicket = {
   status?: string;
@@ -92,6 +93,10 @@ export class NotificationPushService {
       : this.config.get<string>('NODE_ENV') === 'production';
   }
 
+  isJPushConfigured(): boolean {
+    return Boolean(this.jpushAppKey && this.jpushMasterSecret);
+  }
+
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
   composeMessage(
     userId: string,
@@ -147,17 +152,26 @@ export class NotificationPushService {
   ): Promise<
     Array<{ token: string; projectId: string | null; provider: string }>
   > {
-    const rowsByProvider = await Promise.all(
-      (['expo', 'jpush'] as const).map((provider) =>
-        this.prisma.devicePushToken.findMany({
-          where: { userID: userId, provider, disabledAt: null },
-          select: { token: true, projectId: true, provider: true },
-          orderBy: { updatedAt: 'desc' },
-          take: 20,
-        }),
-      ),
-    );
-    return rowsByProvider.flat();
+    const rows = await this.prisma.devicePushToken.findMany({
+      where: {
+        userID: userId,
+        provider: {
+          in: this.isJPushConfigured() ? ['expo', 'jpush'] : ['expo'],
+        },
+        disabledAt: null,
+      },
+      select: { token: true, projectId: true, provider: true },
+      orderBy: { updatedAt: 'desc' },
+    });
+    const rowsByProvider = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const providerRows = rowsByProvider.get(row.provider) ?? [];
+      if (providerRows.length < MAX_ACTIVE_TOKENS_PER_PROVIDER) {
+        providerRows.push(row);
+        rowsByProvider.set(row.provider, providerRows);
+      }
+    }
+    return [...rowsByProvider.values()].flat();
   }
 
   /**
@@ -237,7 +251,7 @@ export class NotificationPushService {
     tokens: string[],
     payload: ExpoPushPayload,
   ): Promise<TokenDeliveryOutcome[]> {
-    if (!this.jpushAppKey || !this.jpushMasterSecret) {
+    if (!this.isJPushConfigured()) {
       return tokens.map((token) => ({
         token,
         status: 'RETRYABLE',

@@ -80,27 +80,38 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
   describe('sendToTokens', () => {
     it('keeps up to twenty active tokens per provider', async () => {
-      prisma.devicePushToken.findMany
-        .mockResolvedValueOnce(
-          Array.from({ length: 20 }, (_, index) => ({
-            token: `expo-${index}`,
-            projectId: null,
-            provider: 'expo',
-          })),
-        )
-        .mockResolvedValueOnce([
-          { token: 'jpush-0', projectId: null, provider: 'jpush' },
-        ]);
+      configValues.JPUSH_APP_KEY = 'jpush-app';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      prisma.devicePushToken.findMany.mockResolvedValue([
+        ...Array.from({ length: 20 }, (_, index) => ({
+          token: `expo-${index}`,
+          projectId: null,
+          provider: 'expo',
+        })),
+        ...Array.from({ length: 20 }, (_, index) => ({
+          token: `jpush-${index}`,
+          projectId: null,
+          provider: 'jpush',
+        })),
+        { token: 'expo-old', projectId: null, provider: 'expo' },
+        { token: 'jpush-old', projectId: null, provider: 'jpush' },
+      ]);
 
       await expect(service.listActiveTokens('user-1')).resolves.toHaveLength(
-        21,
+        40,
       );
-      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(2);
-      expect(prisma.devicePushToken.findMany).toHaveBeenNthCalledWith(
-        2,
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(1);
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { userID: 'user-1', provider: 'jpush', disabledAt: null },
-          take: 20,
+          where: {
+            userID: 'user-1',
+            provider: { in: ['expo', 'jpush'] },
+            disabledAt: null,
+          },
         }),
       );
     });
