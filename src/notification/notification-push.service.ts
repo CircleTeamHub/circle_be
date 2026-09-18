@@ -10,6 +10,7 @@ import { reportOperationalError } from 'src/logging/error-aggregation.service';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 const EXPO_RECEIPT_URL = 'https://exp.host/--/api/v2/push/getReceipts';
+const JPUSH_PUSH_URL = 'https://api.jpush.cn/v3/push';
 const EXPO_BATCH_SIZE = 100;
 const EXPO_MAX_ATTEMPTS = 3;
 // Hard cap on the Expo call. Node's global fetch (undici) applies no response
@@ -72,6 +73,9 @@ export class NotificationPushService {
   // Optional. Required only when the Expo project has "Enhanced Security for
   // Push Notifications" enabled — Expo then rejects unauthenticated sends.
   private readonly expoAccessToken: string;
+  private readonly jpushAppKey: string;
+  private readonly jpushMasterSecret: string;
+  private readonly jpushApnsProduction: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -79,6 +83,13 @@ export class NotificationPushService {
   ) {
     this.expoAccessToken =
       this.config.get<string>('EXPO_ACCESS_TOKEN')?.trim() ?? '';
+    this.jpushAppKey = this.config.get<string>('JPUSH_APP_KEY')?.trim() ?? '';
+    this.jpushMasterSecret =
+      this.config.get<string>('JPUSH_MASTER_SECRET')?.trim() ?? '';
+    const apnsProduction = this.config.get<string>('JPUSH_APNS_PRODUCTION');
+    this.jpushApnsProduction = apnsProduction
+      ? apnsProduction.trim().toLowerCase() === 'true'
+      : this.config.get<string>('NODE_ENV') === 'production';
   }
 
   /** 组装推送 payload。外置成公开方法：outbox 第一次处理时快照进 DB（#88）。 */
@@ -130,13 +141,19 @@ export class NotificationPushService {
     };
   }
 
-  /** 当前活跃 token 清单（含 Expo projectId 分组信息），供 outbox 建投递行。 */
+  /** 当前活跃 token 清单（含 provider/projectId 元数据），供 outbox 建投递行。 */
   async listActiveTokens(
     userId: string,
-  ): Promise<Array<{ token: string; projectId: string | null }>> {
+  ): Promise<
+    Array<{ token: string; projectId: string | null; provider: string }>
+  > {
     const rows = await this.prisma.devicePushToken.findMany({
-      where: { userID: userId, provider: 'expo', disabledAt: null },
-      select: { token: true, projectId: true },
+      where: {
+        userID: userId,
+        provider: { in: ['expo', 'jpush'] },
+        disabledAt: null,
+      },
+      select: { token: true, projectId: true, provider: true },
       orderBy: { updatedAt: 'desc' },
       take: 20,
     });
@@ -149,22 +166,38 @@ export class NotificationPushService {
    * 返回每 token 的结论 + Expo ticket id。
    */
   async sendToTokens(
-    tokens: Array<{ token: string; projectId: string | null }>,
+    tokens: Array<{
+      token: string;
+      projectId: string | null;
+      provider?: string;
+    }>,
     payload: ExpoPushPayload,
   ): Promise<TokenDeliveryOutcome[]> {
     if (tokens.length === 0) return [];
 
+    const jpushTokens = tokens.filter((token) => token.provider === 'jpush');
+    const expoTokens = tokens.filter((token) => token.provider !== 'jpush');
+    const outcomes: TokenDeliveryOutcome[] = [];
+    if (jpushTokens.length > 0) {
+      outcomes.push(
+        ...(await this.sendJPush(
+          jpushTokens.map((row) => row.token),
+          payload,
+        )),
+      );
+    }
+    if (expoTokens.length === 0) return outcomes;
+
     // Expo project IDs must not be mixed in a single request when enhanced
     // security is enabled. Group first, then batch each project independently.
-    const byProject = new Map<string, typeof tokens>();
-    for (const token of tokens) {
+    const byProject = new Map<string, typeof expoTokens>();
+    for (const token of expoTokens) {
       const key = token.projectId ?? '';
       const group = byProject.get(key) ?? [];
       group.push(token);
       byProject.set(key, group);
     }
 
-    const outcomes: TokenDeliveryOutcome[] = [];
     for (const projectTokens of byProject.values()) {
       for (let i = 0; i < projectTokens.length; i += EXPO_BATCH_SIZE) {
         const batch = projectTokens.slice(i, i + EXPO_BATCH_SIZE);
@@ -193,6 +226,83 @@ export class NotificationPushService {
       });
     }
     return outcomes;
+  }
+
+  /**
+   * JPush 接受 registration_id 数组后返回一个 msg_id，但没有 Expo 那种
+   * 每设备 receipt。这里成功只标记当前批次 SENT，不写 ticketID，避免
+   * Expo receipt poller 把 JPush msg_id 当成 Expo receipt 查询。
+   */
+  private async sendJPush(
+    tokens: string[],
+    payload: ExpoPushPayload,
+  ): Promise<TokenDeliveryOutcome[]> {
+    if (!this.jpushAppKey || !this.jpushMasterSecret) {
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: 'JPushCredentialsMissing',
+      }));
+    }
+
+    const message = {
+      platform: 'all',
+      audience: { registration_id: tokens },
+      notification: {
+        alert: payload.body,
+        android: {
+          alert: payload.body,
+          title: payload.title,
+          extras: payload.data,
+        },
+        ios: {
+          alert: { title: payload.title, body: payload.body },
+          sound: 'default',
+          ...(payload.badge !== undefined ? { badge: payload.badge } : {}),
+          extras: payload.data,
+        },
+      },
+      options: {
+        apns_production: this.jpushApnsProduction,
+      },
+    };
+
+    try {
+      const response = await fetch(JPUSH_PUSH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Basic ${Buffer.from(
+            `${this.jpushAppKey}:${this.jpushMasterSecret}`,
+          ).toString('base64')}`,
+        },
+        body: JSON.stringify(message),
+        signal: AbortSignal.timeout(EXPO_PUSH_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await response.json();
+      return tokens.map((token) => ({ token, status: 'SENT' }));
+    } catch (error) {
+      const messageText =
+        error instanceof Error ? error.message : String(error);
+      this.logger.warn(`JPush send failed: ${messageText}`);
+      logExternalCallFailure(this.logger, {
+        enabled: this.loggingConfig.externalLogOn,
+        service: 'jpush',
+        operation: 'send',
+        error,
+      });
+      reportOperationalError(error, {
+        component: 'NotificationPushService',
+        operation: 'sendToTokens',
+        kind: 'jpush',
+      });
+      return tokens.map((token) => ({
+        token,
+        status: 'RETRYABLE',
+        error: messageText,
+      }));
+    }
   }
 
   /**

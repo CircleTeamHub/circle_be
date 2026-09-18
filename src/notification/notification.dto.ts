@@ -59,24 +59,23 @@ export class PublishSystemAnnouncementResponseDto {
 }
 
 export const PUSH_TOKEN_PLATFORMS = ['ios', 'android', 'web'] as const;
-export const PUSH_TOKEN_PROVIDERS = ['expo'] as const;
+export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush'] as const;
 
 export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
 
 export class RegisterPushTokenDto {
-  // #98：provider 目前只有 expo，Expo push token 有公开的稳定形状 ——
-  // ExponentPushToken[...]（旧版 ExpoPushToken[...] 同被接受）。在边界拒绝
-  // 杂讯，而不是等到投递时被 Expo 以 DeviceNotRegistered 打回。
+  // Expo token 使用 ExponentPushToken[...]；JPush token 是 SDK 分配的
+  // Registration ID，格式可能随版本和平台变化，只要求无空白。
   @ApiProperty({
     maxLength: 512,
-    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]',
+    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx] or 190e35e4f...',
   })
   @IsString()
   @IsNotEmpty()
   @MaxLength(512)
-  @Matches(/^Expo(nent)?PushToken\[[^\s\]]+\]$/, {
-    message: 'token must be an Expo push token (ExponentPushToken[...])',
+  @Matches(/^\S+$/, {
+    message: 'token must not contain whitespace',
   })
   token: string;
 

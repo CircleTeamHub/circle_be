@@ -201,6 +201,35 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+
+    it('sends JPush registration ids without entering the Expo receipt flow', async () => {
+      configValues.JPUSH_APP_KEY = 'jpush-app';
+      configValues.JPUSH_MASTER_SECRET = 'jpush-secret';
+      service = new NotificationPushService(
+        prisma as unknown as PrismaService,
+        config as any,
+      );
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ msg_id: 'jpush-message-1' }),
+      });
+
+      const outcomes = await service.sendToTokens(
+        [{ token: 'registration-1', projectId: null, provider: 'jpush' }],
+        payload,
+      );
+
+      expect(outcomes).toEqual([{ token: 'registration-1', status: 'SENT' }]);
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://api.jpush.cn/v3/push',
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: `Basic ${Buffer.from('jpush-app:jpush-secret').toString('base64')}`,
+          }),
+        }),
+      );
+      expect(prisma.devicePushToken.updateMany).not.toHaveBeenCalled();
+    });
   });
 
   describe('pollReceipts', () => {

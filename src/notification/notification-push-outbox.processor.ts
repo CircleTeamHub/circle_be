@@ -261,13 +261,12 @@ export class NotificationPushOutboxProcessor {
           continue;
         }
 
-        const projectByToken = new Map(
-          tokens.map((row) => [row.token, row.projectId]),
-        );
+        const tokenMetaByToken = new Map(tokens.map((row) => [row.token, row]));
         const outcomes = await this.pushService.sendToTokens(
           pendingDeliveries.map((delivery) => ({
             token: delivery.token,
-            projectId: projectByToken.get(delivery.token) ?? null,
+            projectId: tokenMetaByToken.get(delivery.token)?.projectId ?? null,
+            provider: tokenMetaByToken.get(delivery.token)?.provider,
           })),
           payload,
         );
