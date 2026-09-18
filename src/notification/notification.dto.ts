@@ -12,12 +12,15 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
-  Matches,
   MaxLength,
   MinLength,
   IsInt,
   Min,
   Max,
+  Validate,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
+  ValidationArguments,
 } from 'class-validator';
 
 export class NotificationPageQueryDto {
@@ -64,8 +67,28 @@ export const PUSH_TOKEN_PROVIDERS = ['expo', 'jpush'] as const;
 export type PushTokenPlatform = (typeof PUSH_TOKEN_PLATFORMS)[number];
 export type PushTokenProvider = (typeof PUSH_TOKEN_PROVIDERS)[number];
 
+const EXPO_PUSH_TOKEN_PATTERN = /^Expo(nent)?PushToken\[[^\s\]]+\]$/;
+
+@ValidatorConstraint({ name: 'pushTokenShape', async: false })
+class PushTokenShapeConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown, args: ValidationArguments) {
+    if (typeof value !== 'string') return true;
+    const provider = (args.object as { provider?: PushTokenProvider }).provider;
+    return provider === 'expo'
+      ? EXPO_PUSH_TOKEN_PATTERN.test(value)
+      : /^\S+$/.test(value);
+  }
+
+  defaultMessage(args: ValidationArguments) {
+    const provider = (args.object as { provider?: PushTokenProvider }).provider;
+    return provider === 'expo'
+      ? 'token must be an Expo push token (ExponentPushToken[...])'
+      : 'token must not contain whitespace';
+  }
+}
+
 export class RegisterPushTokenDto {
-  // Expo token 使用 ExponentPushToken[...]；JPush token 是 SDK 分配的
+  // Expo token 使用稳定的 Expo 格式；JPush token 是 SDK 分配的
   // Registration ID，格式可能随版本和平台变化，只要求无空白。
   @ApiProperty({
     maxLength: 512,
@@ -74,9 +97,7 @@ export class RegisterPushTokenDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(512)
-  @Matches(/^\S+$/, {
-    message: 'token must not contain whitespace',
-  })
+  @Validate(PushTokenShapeConstraint)
   token: string;
 
   @ApiProperty({ enum: PUSH_TOKEN_PLATFORMS })
