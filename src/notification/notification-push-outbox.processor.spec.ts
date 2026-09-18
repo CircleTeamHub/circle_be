@@ -62,13 +62,17 @@ function buildHarness({
   jobs,
   pendingDeliveries,
   outcomes,
-  tokens = [{ token: 'tok-a', projectId: null }],
+  tokens = [{ token: 'tok-a', projectId: null, provider: 'expo' }],
   circleOfflinePushEnabled = true,
 }: {
   jobs: any[];
   pendingDeliveries: any[];
   outcomes: any[];
-  tokens?: Array<{ token: string; projectId: string | null }>;
+  tokens?: Array<{
+    token: string;
+    projectId: string | null;
+    provider?: string;
+  }>;
   circleOfflinePushEnabled?: boolean;
 }) {
   const prisma = {
@@ -254,6 +258,51 @@ describe('NotificationPushOutboxProcessor (#88 per-token)', () => {
       .find((input) => input.data.status === 'FAILED');
     expect(failWrite).toBeDefined();
     expect(failWrite.data.nextAttemptAt).toBeInstanceOf(Date);
+  });
+
+  it('settles JPush success before an exhausted Expo delivery becomes terminal', async () => {
+    const { prisma, processor } = buildHarness({
+      jobs: [
+        {
+          id: 'job-1',
+          notificationID: 'notification-1',
+          status: 'PENDING',
+          attempts: 0,
+          payload: { title: 'T', body: 'B', data: {} },
+          notification,
+        },
+      ],
+      pendingDeliveries: [
+        { id: 'd-jpush', token: 'registration-1' },
+        { id: 'd-expo', token: 'tok-expo' },
+      ],
+      outcomes: [
+        { token: 'registration-1', status: 'CONFIRMED' },
+        { token: 'tok-expo', status: 'RETRYABLE', error: 'ExpoServerError' },
+      ],
+      tokens: [
+        { token: 'registration-1', projectId: null, provider: 'jpush' },
+        { token: 'tok-expo', projectId: null, provider: 'expo' },
+      ],
+    });
+
+    await processor.processPending();
+
+    expect(prisma.notificationPushDelivery.update).toHaveBeenCalledWith({
+      where: { id: 'd-jpush' },
+      data: expect.objectContaining({ status: 'CONFIRMED' }),
+    });
+
+    prisma.notificationPushDelivery.findMany.mockResolvedValue([]);
+    prisma.notificationPushDelivery.count.mockImplementation(({ where }: any) =>
+      Promise.resolve(where.status === 'SENT' ? 0 : 1),
+    );
+    await processor.processPending();
+
+    const terminal = prisma.notificationPushOutbox.updateMany.mock.calls
+      .map(([input]: any[]) => input)
+      .find((input: any) => input.data.status === 'TERMINAL');
+    expect(terminal).toBeDefined();
   });
 
   it('completes immediately when nothing is pending (all delivered/terminal)', async () => {

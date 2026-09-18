@@ -79,6 +79,32 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
   });
 
   describe('sendToTokens', () => {
+    it('keeps up to twenty active tokens per provider', async () => {
+      prisma.devicePushToken.findMany
+        .mockResolvedValueOnce(
+          Array.from({ length: 20 }, (_, index) => ({
+            token: `expo-${index}`,
+            projectId: null,
+            provider: 'expo',
+          })),
+        )
+        .mockResolvedValueOnce([
+          { token: 'jpush-0', projectId: null, provider: 'jpush' },
+        ]);
+
+      await expect(service.listActiveTokens('user-1')).resolves.toHaveLength(
+        21,
+      );
+      expect(prisma.devicePushToken.findMany).toHaveBeenCalledTimes(2);
+      expect(prisma.devicePushToken.findMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: { userID: 'user-1', provider: 'jpush', disabledAt: null },
+          take: 20,
+        }),
+      );
+    });
+
     it('maps tickets per token and keeps SENT ticket ids', async () => {
       fetchMock.mockResolvedValue({
         ok: true,
@@ -219,7 +245,9 @@ describe('NotificationPushService (#88 per-token delivery)', () => {
         payload,
       );
 
-      expect(outcomes).toEqual([{ token: 'registration-1', status: 'SENT' }]);
+      expect(outcomes).toEqual([
+        { token: 'registration-1', status: 'CONFIRMED' },
+      ]);
       expect(fetchMock).toHaveBeenCalledWith(
         'https://api.jpush.cn/v3/push',
         expect.objectContaining({

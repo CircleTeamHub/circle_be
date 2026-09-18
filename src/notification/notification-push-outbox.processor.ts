@@ -279,11 +279,11 @@ export class NotificationPushOutboxProcessor {
         for (const outcome of outcomes) {
           const deliveryId = deliveryByToken.get(outcome.token);
           if (!deliveryId) continue;
-          if (outcome.status === 'SENT') {
+          if (outcome.status === 'SENT' || outcome.status === 'CONFIRMED') {
             await this.prisma.notificationPushDelivery.update({
               where: { id: deliveryId },
               data: {
-                status: 'SENT',
+                status: outcome.status,
                 ticketID: outcome.ticketId ?? null,
                 sentAt,
                 attempts: { increment: 1 },

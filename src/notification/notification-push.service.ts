@@ -40,7 +40,7 @@ type ExpoPushReceipt = {
 /** 单 token 的一次投递结果（#88：不再聚合成整通知一个结论）。 */
 export type TokenDeliveryOutcome = {
   token: string;
-  status: 'SENT' | 'RETRYABLE' | 'TERMINAL';
+  status: 'SENT' | 'CONFIRMED' | 'RETRYABLE' | 'TERMINAL';
   ticketId?: string;
   error?: string;
 };
@@ -147,17 +147,17 @@ export class NotificationPushService {
   ): Promise<
     Array<{ token: string; projectId: string | null; provider: string }>
   > {
-    const rows = await this.prisma.devicePushToken.findMany({
-      where: {
-        userID: userId,
-        provider: { in: ['expo', 'jpush'] },
-        disabledAt: null,
-      },
-      select: { token: true, projectId: true, provider: true },
-      orderBy: { updatedAt: 'desc' },
-      take: 20,
-    });
-    return rows;
+    const rowsByProvider = await Promise.all(
+      (['expo', 'jpush'] as const).map((provider) =>
+        this.prisma.devicePushToken.findMany({
+          where: { userID: userId, provider, disabledAt: null },
+          select: { token: true, projectId: true, provider: true },
+          orderBy: { updatedAt: 'desc' },
+          take: 20,
+        }),
+      ),
+    );
+    return rowsByProvider.flat();
   }
 
   /**
@@ -230,7 +230,7 @@ export class NotificationPushService {
 
   /**
    * JPush 接受 registration_id 数组后返回一个 msg_id，但没有 Expo 那种
-   * 每设备 receipt。这里成功只标记当前批次 SENT，不写 ticketID，避免
+   * 每设备 receipt。这里成功直接标记 CONFIRMED，不写 ticketID，避免
    * Expo receipt poller 把 JPush msg_id 当成 Expo receipt 查询。
    */
   private async sendJPush(
@@ -281,7 +281,7 @@ export class NotificationPushService {
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       await response.json();
-      return tokens.map((token) => ({ token, status: 'SENT' }));
+      return tokens.map((token) => ({ token, status: 'CONFIRMED' }));
     } catch (error) {
       const messageText =
         error instanceof Error ? error.message : String(error);
