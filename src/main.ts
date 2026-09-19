@@ -3,6 +3,7 @@
 // This software is released under the MIT License.
 // https://opensource.org/licenses/MIT
 import 'module-alias/register';
+import { inspect } from 'node:util';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
@@ -131,6 +132,51 @@ export function createGracefulShutdownHandler(
   };
 }
 
+/** Where a failed start reports to — injectable so the fatal path is unit-testable. */
+export interface BootstrapFailureSinks {
+  logError(message: string): void;
+  exit(code: number): void;
+}
+
+const processSinks: BootstrapFailureSinks = {
+  // console, not the Nest/Winston logger: a start can fail before that logger
+  // exists, and this line is the only trace the failure leaves in `docker logs`.
+  logError: (message) => console.error(message),
+  exit: (code) => process.exit(code),
+};
+
+/**
+ * Runs the bootstrap and makes a failed start loud and fatal.
+ *
+ * Unawaited, a rejected bootstrap reaches the process-wide unhandled-rejection
+ * guard, which reports and keeps running — right for a stray runtime promise,
+ * wrong for a start that never reached `listen`. On the test server that left a
+ * process with no HTTP listener and no log line (a missing
+ * OBJECT_STORAGE_DELIVERY_URL made UploadService.onModuleInit throw), and it was
+ * worked around by swapping `app.listen` for a raw `server.listen`: that skips
+ * `app.init()`, so every /api/v1 route answered 404 while /healthz stayed green.
+ *
+ * Exiting non-zero lets the orchestrator restart the container and surface the
+ * failure, and the log line says why.
+ */
+export async function runBootstrap(
+  start: () => Promise<void>,
+  sinks: BootstrapFailureSinks = processSinks,
+): Promise<void> {
+  try {
+    await start();
+  } catch (error) {
+    try {
+      sinks.logError(
+        `[bootstrap] Application failed to start; exiting with code 1.\n${inspect(error)}`,
+      );
+    } catch {
+      // Nowhere left to write the reason; exiting is what still matters.
+    }
+    sinks.exit(1);
+  }
+}
+
 async function bootstrap() {
   const config = getServerConfig();
   const isProduction = process.env.NODE_ENV === 'production';
@@ -168,5 +214,5 @@ async function bootstrap() {
 }
 
 if (require.main === module) {
-  bootstrap();
+  void runBootstrap(bootstrap);
 }
